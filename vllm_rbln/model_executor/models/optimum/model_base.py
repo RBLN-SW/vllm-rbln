@@ -238,10 +238,10 @@ class RBLNOptimumModelBase(nn.Module):
                 prefill_chunk_size=self.vllm_config.scheduler_config.max_num_batched_tokens,
                 memory_budget=self.vllm_config.cache_config.gpu_memory_utilization,
                 rbln_overrides=rbln_overrides,
-                num_speculative_tokens=(
-                    self.vllm_config.speculative_config.num_speculative_tokens
+                decoder_query_length=(
+                    self.vllm_config.speculative_config.num_speculative_tokens + 1
                     if self.vllm_config.speculative_config is not None
-                    else 0
+                    else 1
                 ),
             )
             logger.info(

@@ -57,7 +57,7 @@ class RBLNOptimumForCausalLM(
             if decoder is None:
                 raise RuntimeError(
                     "The compiled model has no multi_token_decoder. "
-                    "Recompile with num_speculative_tokens enabled."
+                    "Recompile with decoder_query_length > 1."
                 )
         else:
             decoder = self.model.decoders[model_input.padded_batch_size]

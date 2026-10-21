@@ -17,7 +17,7 @@
 By default, generate from four text prompts and print the results.
 N-gram and suffix drafting reuse token sequences.
 Suffix requires arctic-inference and treats num-spec-tokens as an upper bound.
-Compiled models must include a multi-token decoder matching num-spec-tokens.
+Compiled models need decoder_query_length = num-spec-tokens + 1.
 """
 
 from argparse import BooleanOptionalAction

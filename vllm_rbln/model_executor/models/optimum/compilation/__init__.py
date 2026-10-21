@@ -106,7 +106,7 @@ class RBLNCompileSpec:
         memory_budget: float,
         prefill_chunk_size: int | None = None,
         rbln_overrides: dict[str, Any] | None = None,
-        num_speculative_tokens: int = 0,
+        decoder_query_length: int = 1,
     ) -> "RBLNCompileSpec":
         """Build a compile spec from vllm-rbln inputs, dispatched by architecture."""
         if is_generation_arch(config):
@@ -150,8 +150,8 @@ class RBLNCompileSpec:
                 f"Compilation is not implemented for architecture {architectures[0]}"
             )
 
-        if num_speculative_tokens:
-            spec.rbln_config["num_speculative_tokens"] = num_speculative_tokens
+        if decoder_query_length > 1:
+            spec.rbln_config["decoder_query_length"] = decoder_query_length
 
         # rbln_overrides must not overwrite fields vllm derives from its own
         # config (batch_size, max_seq_len, memory_budget, ...); a silent

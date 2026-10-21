@@ -88,8 +88,8 @@ def _generate_model_path_name(
         "memory_budget": memory_budget,
     }
     if vllm_config.speculative_config is not None:
-        config_dict["num_speculative_tokens"] = (
-            vllm_config.speculative_config.num_speculative_tokens
+        config_dict["decoder_query_length"] = (
+            vllm_config.speculative_config.num_speculative_tokens + 1
         )
     stripped_config = _strip_runtime_only_keys(rbln_overrides) if rbln_overrides else {}
     if stripped_config:
