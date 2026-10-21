@@ -27,6 +27,7 @@ from vllm_rbln.patches.registry import (
 from . import (
     attention,
     axk2,
+    axk3,
     deepseek_mtp,
     deepseek_v2,
     distributed_utils,
@@ -41,6 +42,7 @@ from . import (
     minimax_m2,
     minimax_m3,
     mla,
+    model_arch_config,
     modelopt_mixed_config,
     models_utils,
     multi_connector,
