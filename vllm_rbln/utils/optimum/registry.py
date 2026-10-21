@@ -34,6 +34,7 @@ _RBLN_GENERATION_MODELS: dict[str, tuple[str, str]] = {
     "Qwen3ForCausalLM": ("qwen3", "RBLNQwen3ForCausalLM"),
     "Qwen3MoeForCausalLM": ("qwen3_moe", "RBLNQwen3MoeForCausalLM"),
     "GptOssForCausalLM": ("gpt-oss", "RBLNGptOssForCausalLM"),
+    "Starcoder2ForCausalLM": ("starcoder2", "RBLNStarcoder2ForCausalLM"),
     # Qwen3-Reranker is served by score() but reads its score off two vocabulary
     # logits, so it runs the generation graph -- as upstream vLLM does, resolving
     # it to Qwen3ForCausalLM. Classing it as pooling would compile
