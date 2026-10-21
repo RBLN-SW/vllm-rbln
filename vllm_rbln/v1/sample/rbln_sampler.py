@@ -27,7 +27,7 @@ from vllm.v1.sample.sampler import Sampler as VLLMSampler
 import vllm_rbln.envs as envs
 from vllm_rbln.compilation import compile, create_compile_context
 from vllm_rbln.logger import init_logger
-from vllm_rbln.platform import USE_DEVICE_TENSOR
+from vllm_rbln.platform import use_device_tensor
 from vllm_rbln.v1.sample.ops.top_k_top_p import build_op_top_k_top_p
 
 logger = init_logger(__name__)
@@ -100,7 +100,7 @@ def compile_sampler(
         or create_compile_context(
             use_global_ctx=True,
         )
-        if not USE_DEVICE_TENSOR
+        if not use_device_tensor()
         else None
     )
     return compile(
@@ -108,11 +108,11 @@ def compile_sampler(
         dynamic=False,
         fullgraph=True,
         compile_context=compile_context,
-        num_devices=1 if USE_DEVICE_TENSOR else None,
-        model_trace_method="export" if USE_DEVICE_TENSOR else "",
+        num_devices=1 if use_device_tensor() else None,
+        model_trace_method="export" if use_device_tensor() else "",
         mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
-        use_global_ctx=True if not USE_DEVICE_TENSOR else None,
-        global_device_id=0 if not USE_DEVICE_TENSOR else None,
+        use_global_ctx=True if not use_device_tensor() else None,
+        global_device_id=0 if not use_device_tensor() else None,
         # FIXME: Currently, sampler ops do not support caching.
         # Reusing seed buffer is not supported when the compiled sampler is loaded.
         use_cache=False,
@@ -177,7 +177,7 @@ class RBLNSampler(VLLMSampler):
             or create_compile_context(
                 use_global_ctx=True,
             )
-            if not USE_DEVICE_TENSOR
+            if not use_device_tensor()
             else None
         )
         if logprobs_mode in ("raw_logprobs", "raw_logits"):

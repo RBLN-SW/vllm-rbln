@@ -122,8 +122,7 @@ def pytest_addoption(parser):
         help=(
             "VLLM_RBLN_USE_DEVICE_TENSOR for the whole session. "
             "platform/__init__.py resolves it at module scope into "
-            "RblnPlatform.device_type and friends, and eight modules copy "
-            "USE_DEVICE_TENSOR into their own namespace, so it cannot be "
+            "RblnPlatform.device_type and friends, so it cannot be "
             "parametrized per test -- run the suite once per value instead. "
             "Left unset by default so the source's own default is what gets "
             "exercised."
@@ -421,8 +420,6 @@ def pytest_configure(config):
     envs.INHERITED_MODEL_IMPL = "vllm"
     _apply_model_impl("vllm")
 
-    # Imported only now: it copies USE_DEVICE_TENSOR into its own namespace, as
-    # seven other modules do, and the call above is what settles that value.
     from vllm_rbln.platform import vllm_impl
 
     vllm_impl.patch_upstream()
