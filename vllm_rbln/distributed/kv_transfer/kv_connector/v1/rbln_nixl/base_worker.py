@@ -189,9 +189,9 @@ class RblnNixlWorkerBase(
         # drops the entry without releasing what other peers still use.
         self._borrowed_src_handles: set[tuple[str, int, int]] = set()
         self._shard_region_group_ids: dict[tuple[str, int], tuple[int, ...]] = {}
-        # How many descriptors each of that shard's regions is cut into
-        # (_head_split).
-        self._shard_descs_per_block: dict[tuple[str, int], int] = {}
+        # How many descriptors a block of each of that shard's regions is: the
+        # pieces a peer of another TP degree pairs it in (`pair_area`), else one.
+        self._shard_descs_per_block: dict[tuple[str, int], tuple[int, ...]] = {}
         # Per peer shard, the grid its chunk range was built over, or None
         # where its lists carry no such range. See `_shard_chunk_grid`.
         self._shard_chunk_grids: dict[tuple[str, int], ChunkGrid | None] = {}

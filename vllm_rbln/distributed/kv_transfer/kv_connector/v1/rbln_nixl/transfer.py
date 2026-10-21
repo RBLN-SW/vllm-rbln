@@ -36,7 +36,7 @@ def _chunk_desc_ids(
     cuts: Sequence[tuple[int, int, int]],
     num_blocks: int,
     block_id: int,
-    per_block: int,
+    per_block: int | Sequence[int],
     chunk_span: tuple[int, int],
     partial_only: bool = False,
 ) -> np.ndarray:
@@ -47,8 +47,8 @@ def _chunk_desc_ids(
     each region takes the part of it that falls in its own window.
     `partial_only` leaves out a region the span covers whole, which a
     whole-block descriptor carried instead. A region of no runs holds at most
-    one chunk, and its whole-block descriptor -- from 0, `per_block` a block --
-    is what names it.
+    one chunk, named by its whole-block descriptor from 0, `per_block` a block:
+    one count for every region, or one per region in the order of `cuts`.
 
     `start` is where the chunk range begins: one whole-block range before it on
     a shard's lists, and a window range as well on the whole-engine lists. The
@@ -58,11 +58,14 @@ def _chunk_desc_ids(
     """
     lo, hi = chunk_span
     first, runs, chunks = np.asarray(cuts, dtype=np.int64).reshape(-1, 3).T
-    per_region = per_block * runs * chunks
+    pieces = np.broadcast_to(np.asarray(per_block, dtype=np.int64), first.shape)
+    per_region = pieces * runs * chunks
     starts = start + (np.cumsum(per_region) - per_region) * num_blocks
     starts += block_id * per_region
     whole = runs == 0
-    starts[whole] = (np.flatnonzero(whole) * num_blocks + block_id) * per_block
+    starts[whole] = (np.cumsum(pieces) - pieces)[whole] * num_blocks + (
+        block_id * pieces[whole]
+    )
     begin = np.maximum(lo, first) - first
     end = np.minimum(hi, first + chunks) - first
     take = begin < end
@@ -71,13 +74,13 @@ def _chunk_desc_ids(
     # Regions cut alike share one offset pattern, and an engine has few cuts
     # however many regions it has. The window leads the key so the ids come
     # area by area, region by region inside one.
-    keys = np.stack([first, runs, chunks, begin, end], axis=1)[take]
+    keys = np.stack([first, runs, chunks, begin, end, pieces], axis=1)[take]
     out = []
     for key in np.unique(keys, axis=0):
-        _, k_runs, k_chunks, k_begin, k_end = (int(v) for v in key)
+        _, k_runs, k_chunks, k_begin, k_end, k_pieces = (int(v) for v in key)
         k_runs = max(k_runs, 1)
         within = (
-            np.arange(per_block, dtype=np.int64)[:, None, None] * (k_runs * k_chunks)
+            np.arange(k_pieces, dtype=np.int64)[:, None, None] * (k_runs * k_chunks)
             + np.arange(k_runs, dtype=np.int64)[None, :, None] * k_chunks
             + np.arange(k_begin, k_end, dtype=np.int64)[None, None, :]
         ).ravel()
@@ -320,6 +323,7 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
                     for span in self._shard_region_spans[(engine_id, global_rank)]
                 ]
             )
+        offsets = np.cumsum((0, *per_block))
         # Converted once, not once per region: this runs per request, and every
         # region of a layer names the same group.
         group_arrays = [np.asarray(g, dtype=np.int64) for g in block_ids]
@@ -330,16 +334,16 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
                 group_arr = group_arr[:-1]
             if group_arr.size == 0:
                 continue
-            block_ix = region_id * num_blocks + group_arr
-            if per_block == 1:
-                desc_ids.append(block_ix)
-                continue
             # Both dlists are laid out region-major, then block, then piece, so
-            # one block becomes `per_block` consecutive descriptors on each side.
+            # one block becomes `pieces` consecutive descriptors on each side,
+            # after every block of the regions before it.
+            pieces = per_block[region_id]
+            first = offsets[region_id] * num_blocks + group_arr * pieces
+            if pieces == 1:
+                desc_ids.append(first)
+                continue
             desc_ids.append(
-                (
-                    block_ix[:, None] * per_block + np.arange(per_block, dtype=np.int64)
-                ).ravel()
+                (first[:, None] + np.arange(pieces, dtype=np.int64)).ravel()
             )
         if not desc_ids:
             return np.empty(0, dtype=np.int64)
@@ -384,7 +388,7 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
         return _chunk_desc_ids(
             # Where the chunk range starts: the whole-block range covers every
             # region, block and piece once.
-            start=len(region_group_ids) * num_blocks * per_block,
+            start=sum(per_block) * num_blocks,
             cuts=grid.regions,
             num_blocks=num_blocks,
             block_id=block_id,

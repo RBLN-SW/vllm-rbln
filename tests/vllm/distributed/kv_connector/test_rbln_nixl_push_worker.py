@@ -57,6 +57,9 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import
     ChipletSplitAxis,
     RblnNixlConnectorMetadata,
 )
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
+    pair_area,
+)
 
 
 class _FakeThread:
@@ -301,7 +304,7 @@ class TestPerShardWrite:
         w._shard_region_group_ids = {("eng", r): (0, 0) for r in range(ranks)}
         # Written together with the group ids by _register_shard_xfer_state, so a
         # shard the write path can reach always has both.
-        w._shard_descs_per_block = {("eng", r): 1 for r in range(ranks)}
+        w._shard_descs_per_block = {("eng", r): (1, 1) for r in range(ranks)}
         w._shard_chunk_grids = {("eng", r): None for r in range(ranks)}
         w._shard_region_spans = {("eng", r): (0, 0) for r in range(ranks)}
         w.src_xfer_handles_by_remote = {("eng", r, 16): 100 + r for r in range(ranks)}
@@ -359,6 +362,7 @@ class TestPerShardWrite:
         )
         worker._shard_region_spans = {("eng", 0): (0, 1, 0, 0)}
         worker._shard_region_group_ids = {("eng", 0): (0, 0, 0, 0)}
+        worker._shard_descs_per_block = {("eng", 0): (1,) * 4}
         coverage = []
 
         def record(notif_id, span, cpb):
@@ -384,6 +388,7 @@ class TestPerShardWrite:
             ("eng", 1): uniform_grid(1, 2, regions=1),
         }
         worker._shard_region_group_ids[("eng", 1)] = (0,)
+        worker._shard_descs_per_block[("eng", 1)] = (1,)
         worker._shard_region_spans[("eng", 1)] = (0,)
         coverage = []
 
@@ -1028,56 +1033,37 @@ class TestReplicaFanOut:
         meta.block_lens = [1024] * areas
         return meta
 
+    # Our area holds heads 0-1; the peer holds them one per slice, each slice
+    # on two of its areas (regions 0,1 and 2,3).
+    PEER = [(r, (r // 2, r // 2 + 1), 1024) for r in range(4)]
+
+    def _pieces(self, cls, peer=PEER):
+        return pair_area(
+            (0, 2),
+            1024,
+            peer,
+            kv_per_block=1,
+            every_holder=cls._writes_into_peer,
+            region_id=0,
+        )
+
     def test_the_read_path_names_one_copy(self):
-        worker = self._worker(RblnNixlPullConnectorWorker)
-        assert worker._peer_replica_fanout(self._peer_meta(), 4) == 1
+        pieces = self._pieces(RblnNixlPullConnectorWorker)
+        assert [p.remote_region for p in pieces] == [0, 2]
 
     def test_the_write_path_names_every_copy(self):
-        worker = self._worker(RblnNixlPushConnectorWorker)
-        assert worker._peer_replica_fanout(self._peer_meta(), 4) == 2
+        pieces = self._pieces(RblnNixlPushConnectorWorker)
+        assert [p.remote_region for p in pieces] == [0, 1, 2, 3]
+        # The same local bytes go to both copies of a slice.
+        assert [p.local_offset for p in pieces] == [0, 0, 512, 512]
 
     def test_a_peer_without_copies_is_the_same_either_way(self):
         # areas == slices: nothing is duplicated, so there is only one place to
         # put the bytes and the two directions agree.
-        for cls in (RblnNixlPullConnectorWorker, RblnNixlPushConnectorWorker):
-            worker = self._worker(cls)
-            assert worker._peer_replica_fanout(self._peer_meta(slices=4), 4) == 1
-
-    def test_host_staging_has_no_copies_to_fan_out_to(self):
-        worker = self._worker(RblnNixlPushConnectorWorker)
-        worker.use_host_buffer = True
-        assert worker._peer_replica_fanout(self._peer_meta(), 4) == 1
-
-    @pytest.mark.parametrize(
-        "cls, expected_regions",
-        [
-            # The peer's areas holding slice 0 are its regions 0 and 1.
-            # Reading takes the first; writing takes both.
-            (RblnNixlPullConnectorWorker, [1000]),
-            (RblnNixlPushConnectorWorker, [1000, 2000]),
-        ],
-    )
-    def test_descriptors_land_on_those_copies(self, cls, expected_regions):
-        worker = self._worker(cls)
-        fanout = worker._peer_replica_fanout(self._peer_meta(), 4)
-        meta = self._peer_meta()
-
-        descs = worker._head_matched_desc(
-            region_id=0,
-            head=0,  # our area carries heads 0-1
-            per_slice_l=2,
-            # Peer: heads from 0, 2 per slice, each slice on two of its areas.
-            peer=(0, 2, [[0, 1], [2, 3]]),
-            remote_bases=meta.kv_caches_base_addr,
-            remote_lens=meta.block_lens,
-            device_id=0,
-            num_blocks=1,
-            # Both sides cut heads the same number of ways here, so one piece.
-            split=1,
+        peer = [(r, (r // 2, r // 2 + 1), 1024) for r in (0, 2)]
+        assert self._pieces(RblnNixlPullConnectorWorker, peer) == self._pieces(
+            RblnNixlPushConnectorWorker, peer
         )
-
-        assert [addr for addr, _len, _dev in descs] == expected_regions
-        assert len(descs) == fanout
 
 
 class TestTheThreeListsAgree:
@@ -1148,16 +1134,16 @@ class TestTheThreeListsAgree:
         worker = self._worker(cls)
         set_mock_connector_options(worker.vllm_config, chunk_tokens=8)
         peer = self._peer()
-        fanout = worker._peer_replica_fanout(peer, 4)
-        split = worker._peer_head_split(peer, 4)
+        fanout = 2 if cls._writes_into_peer else 1
         areas = worker._fan_in_peer_areas(0, 4)
+        region_ids, pieces = worker._head_matched_plan(peer, 0, 4, peer_areas=areas)
 
         # The two builders derive the grid rather than take it, so this is
         # what `_register_shard_xfer_state` passes the local one, not a knob.
         grid = worker._shard_chunk_grid(
-            worker._shard_local_region_ids(("l0",), peer_areas=areas),
+            region_ids,
             block_size=worker.block_size,
-            split=split,
+            rows=[p[0].rows for p in pieces],
         )
 
         remote = worker._build_head_matched_remote(peer, 0, 4, peer_areas=areas)
@@ -1165,9 +1151,8 @@ class TestTheThreeListsAgree:
             worker.block_size,
             ("l0",),
             chunk_grid=grid,
-            peer_areas=areas,
-            split=split,
-            replica_fanout=fanout,
+            region_ids=region_ids,
+            pieces=pieces,
         )
 
         assert len(remote) == len(local)
