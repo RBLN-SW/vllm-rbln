@@ -82,3 +82,20 @@ def is_qwen3_reranker(model_config: "ModelConfig") -> bool:
             "examples/optimum/pooling_models/qwen3_reranker_score_offline.py."
         )
     return has_reranker_flags
+
+
+def is_phi3_full_attention(model_config: "ModelConfig") -> bool:
+    """Return True for a Phi-3 whose ``sliding_window`` covers ``max_model_len``.
+
+    Phi-3.5-mini and Phi-4-mini ship a window wider than any context they serve.
+    optimum-rbln compiles such a checkpoint with a static cache, so it has to
+    run as a full-attention model here as well.
+    """
+    hf_config = model_config.hf_config
+    architectures = getattr(hf_config, "architectures", None) or []
+    sliding_window = getattr(hf_config, "sliding_window", None)
+    return (
+        "Phi3ForCausalLM" in architectures
+        and sliding_window is not None
+        and sliding_window >= model_config.max_model_len
+    )

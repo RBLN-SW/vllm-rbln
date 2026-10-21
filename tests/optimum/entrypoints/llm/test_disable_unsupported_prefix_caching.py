@@ -38,6 +38,12 @@ QUANTIZED_LINEARS_ONLY = [
 
 HYBRID = ["Qwen/Qwen3.5-0.8B"]
 
+# Phi-3 checkpoints whose sliding_window is wider than their context.
+PHI3_FULL_ATTENTION = [
+    "microsoft/Phi-3.5-mini-instruct",
+    "microsoft/Phi-4-mini-instruct",
+]
+
 
 def _vllm_config(model_id: str) -> SimpleNamespace:
     """The fields the guard reads, around the ModelConfig vLLM would build."""
@@ -56,6 +62,13 @@ def test_quantized_kv_cache_disables_prefix_caching(model_id):
 
 @pytest.mark.parametrize("model_id", QUANTIZED_LINEARS_ONLY)
 def test_quantized_linears_alone_keep_prefix_caching(model_id):
+    vllm_config = _vllm_config(model_id)
+    disable_unsupported_prefix_caching(vllm_config)
+    assert vllm_config.cache_config.enable_prefix_caching is True
+
+
+@pytest.mark.parametrize("model_id", PHI3_FULL_ATTENTION)
+def test_phi3_full_attention_keeps_prefix_caching(model_id):
     vllm_config = _vllm_config(model_id)
     disable_unsupported_prefix_caching(vllm_config)
     assert vllm_config.cache_config.enable_prefix_caching is True

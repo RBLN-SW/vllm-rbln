@@ -25,6 +25,7 @@ _RBLN_GENERATION_MODELS: dict[str, tuple[str, str]] = {
     "GemmaForCausalLM": ("gemma", "RBLNGemmaForCausalLM"),
     "Gemma2ForCausalLM": ("gemma2", "RBLNGemma2ForCausalLM"),
     "PhiForCausalLM": ("phi", "RBLNPhiForCausalLM"),
+    "Phi3ForCausalLM": ("phi3", "RBLNPhi3ForCausalLM"),
     "GPT2LMHeadModel": ("gpt2", "RBLNGPT2LMHeadModel"),
     "MidmLMHeadModel": ("midm", "RBLNMidmLMHeadModel"),
     "MistralForCausalLM": ("mistral", "RBLNMistralForCausalLM"),

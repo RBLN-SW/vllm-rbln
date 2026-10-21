@@ -135,6 +135,7 @@ def _uses_sliding_window(hf_config) -> bool:
 
 def disable_unsupported_prefix_caching(vllm_config: "VllmConfig") -> None:
     from vllm_rbln.utils.optimum.predicates import (
+        is_phi3_full_attention,
         is_qwen3_embedding,
         is_qwen3_reranker,
     )
@@ -163,7 +164,7 @@ def disable_unsupported_prefix_caching(vllm_config: "VllmConfig") -> None:
         _disable_prefix_caching(vllm_config, "encoder-decoder models")
     elif is_pooling_arch(hf_config):
         _disable_prefix_caching(vllm_config, "pooling models")
-    elif _uses_sliding_window(hf_config):
+    elif _uses_sliding_window(hf_config) and not is_phi3_full_attention(model_config):
         _disable_prefix_caching(vllm_config, "sliding window models")
     elif model_config.is_hybrid:
         _disable_prefix_caching(vllm_config, "hybrid models")
