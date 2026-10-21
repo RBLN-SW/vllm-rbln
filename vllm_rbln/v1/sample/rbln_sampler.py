@@ -94,6 +94,7 @@ def rbln_greedy_sample(logits: torch.Tensor) -> torch.Tensor:
 def compile_sampler(
     op: Callable[..., torch.Tensor],
     compile_context: rebel.CompileContext | None,
+    use_cache: bool = False,
 ) -> Callable[..., torch.Tensor]:
     compile_context = (
         compile_context
@@ -113,9 +114,7 @@ def compile_sampler(
         mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
         use_global_ctx=True if not USE_DEVICE_TENSOR else None,
         global_device_id=0 if not USE_DEVICE_TENSOR else None,
-        # FIXME: Currently, sampler ops do not support caching.
-        # Reusing seed buffer is not supported when the compiled sampler is loaded.
-        use_cache=False,
+        use_cache=use_cache,
     )
 
 
@@ -124,6 +123,7 @@ class RBLNTopKTopPSampler(nn.Module):
         self,
         logprobs_mode: LogprobsMode = "raw_logprobs",
         compile_context: rebel.CompileContext | None = None,
+        use_cache: bool = False,
     ):
         # TODO(rbln): Merge more ops to rbln context.
         #       Currently, we only have softmax in rbln context.
@@ -135,7 +135,7 @@ class RBLNTopKTopPSampler(nn.Module):
         )
 
         self._compiled_rbln_topk_topp_sampler = compile_sampler(
-            rbln_top_k_top_p_sample, compile_context
+            rbln_top_k_top_p_sample, compile_context, use_cache=use_cache
         )
 
     def forward(
@@ -169,6 +169,7 @@ class RBLNSampler(VLLMSampler):
         logprobs_mode: LogprobsMode = "raw_logprobs",
         use_fp64_gumbel: bool = False,
         compile_context: rebel.CompileContext | None = None,
+        use_cache: bool = False,
     ):
         super().__init__(logprobs_mode=logprobs_mode, use_fp64_gumbel=use_fp64_gumbel)
 
@@ -182,7 +183,9 @@ class RBLNSampler(VLLMSampler):
         )
         if logprobs_mode in ("raw_logprobs", "raw_logits"):
             self.topk_topp_sampler = RBLNTopKTopPSampler(
-                logprobs_mode=logprobs_mode, compile_context=compile_context
+                logprobs_mode=logprobs_mode,
+                compile_context=compile_context,
+                use_cache=use_cache,
             )
         else:
             logger.warning_once(
@@ -191,7 +194,7 @@ class RBLNSampler(VLLMSampler):
             )
 
         self._compiled_greedy_sample = compile_sampler(
-            rbln_greedy_sample, compile_context
+            rbln_greedy_sample, compile_context, use_cache=use_cache
         )
 
     def greedy_sample(
@@ -408,13 +411,15 @@ WARM_UP_CONFIGS: list[dict[str, Any]] = [
         "all_random": False,
         "temperature": 0.0,
     },
-    {
-        "name": "random",
-        "no_penalties": True,
-        "all_greedy": False,
-        "all_random": True,
-        "temperature": 0.5,
-    },
+    # FIXME: Restore after checking repeated mega-cache lookups: the temporary
+    # TOP_P_CLAMP fallback can make random and topp produce the same graph.
+    # {
+    #     "name": "random",
+    #     "no_penalties": True,
+    #     "all_greedy": False,
+    #     "all_random": True,
+    #     "temperature": 0.5,
+    # },
     {
         "name": "topp",
         "no_penalties": True,
@@ -423,14 +428,16 @@ WARM_UP_CONFIGS: list[dict[str, Any]] = [
         "top_p": 0.9,
         "temperature": 0.5,
     },
-    {
-        "name": "topk",
-        "no_penalties": True,
-        "all_greedy": False,
-        "all_random": True,
-        "top_k": 1.0,
-        "temperature": 0.5,
-    },
+    # FIXME: Restore after repeated mega-cache lookups are supported: the
+    # TOP_P_CLAMP fallback makes topk and topp_topk produce the same graph.
+    # {
+    #     "name": "topk",
+    #     "no_penalties": True,
+    #     "all_greedy": False,
+    #     "all_random": True,
+    #     "top_k": 1.0,
+    #     "temperature": 0.5,
+    # },
     {
         "name": "topp_topk",
         "no_penalties": True,

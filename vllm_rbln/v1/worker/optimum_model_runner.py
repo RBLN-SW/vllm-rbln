@@ -98,6 +98,7 @@ from vllm_rbln.v1.metrics.performance import (
 from vllm_rbln.v1.sample import WARM_UP_CONFIGS, RBLNSampler
 from vllm_rbln.v1.sample.ops.top_k_top_p import TOP_P_CLAMP
 from vllm_rbln.v1.sample.rbln_logits_processor import build_rbln_logitsprocs
+from vllm_rbln.v1.worker import mega_cache
 from vllm_rbln.v1.worker.optimum_input_batch import RBLNInputBatch
 
 if TYPE_CHECKING:
@@ -194,6 +195,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             sampler = RBLNSampler(
                 logprobs_mode=self.model_config.logprobs_mode,
                 use_fp64_gumbel=False,
+                use_cache=True,
             )
         else:
             logger.info("Using default vLLM sampler.")
@@ -1291,6 +1293,10 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
 
                 clear_reqs(input_batch)
 
+        sig = mega_cache.sampler_bundle_signature(
+            self.input_batch.vocab_size, self.dtype, self.bucket_sizes
+        )
+        mega_cache.load("sampler", sig)
         for config in WARM_UP_CONFIGS:
             logger.info("Running dummy sampler config: %s", config["name"])
 
@@ -1305,6 +1311,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             )
 
             dummy_run_batches(config)
+        mega_cache.save("sampler", sig)
 
     def set_active_loras(self, input_batch: RBLNInputBatch, is_prefill: bool) -> None:
         num_reqs = self.input_batch.num_reqs

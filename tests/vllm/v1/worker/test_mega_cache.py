@@ -87,19 +87,19 @@ class TestSignatureComposition:
         monkeypatch.setattr(mega_cache, "_compile_env_factors", lambda: "envhash")
 
     def test_vllm_config_hash_invalidates(self):
-        assert mega_cache.config_signature(
+        assert mega_cache.model_bundle_signature(
             _stub_config("h1")
-        ) != mega_cache.config_signature(_stub_config("h2"))
+        ) != mega_cache.model_bundle_signature(_stub_config("h2"))
 
     def test_env_factors_invalidate(self, monkeypatch):
-        before = mega_cache.config_signature(_stub_config())
+        before = mega_cache.model_bundle_signature(_stub_config())
         monkeypatch.setattr(mega_cache, "_compile_env_factors", lambda: "other")
-        assert mega_cache.config_signature(_stub_config()) != before
+        assert mega_cache.model_bundle_signature(_stub_config()) != before
 
     def test_rebel_minor_bump_invalidates(self, monkeypatch):
-        before = mega_cache.config_signature(_stub_config())
+        before = mega_cache.model_bundle_signature(_stub_config())
         monkeypatch.setattr(mega_cache, "_rebel_major_minor", lambda: "0.12")
-        assert mega_cache.config_signature(_stub_config()) != before
+        assert mega_cache.model_bundle_signature(_stub_config()) != before
 
     def test_resolved_dynamic_kv_decision_invalidates(self, monkeypatch):
         enabled = True
@@ -108,9 +108,9 @@ class TestSignatureComposition:
             "dynamic_kv_enabled",
             lambda config: enabled,
         )
-        dynamic = mega_cache.config_signature(_stub_config())
+        dynamic = mega_cache.model_bundle_signature(_stub_config())
         enabled = False
-        static = mega_cache.config_signature(_stub_config())
+        static = mega_cache.model_bundle_signature(_stub_config())
         assert dynamic != static
 
 
@@ -153,7 +153,7 @@ class TestSignatureEnv:
         monkeypatch.setattr(mega_cache, "_rebel_major_minor", lambda: "0.11")
 
     def _sig(self) -> str:
-        return mega_cache.config_signature(_stub_config())
+        return mega_cache.model_bundle_signature(_stub_config())
 
     @pytest.mark.parametrize(("name", "before", "after"), GRAPH_ENV)
     def test_graph_env_invalidates(self, monkeypatch, name, before, after):
@@ -172,11 +172,15 @@ class TestSignatureEnv:
 
         monkeypatch.setenv("VLLM_RBLN_USE_W8A8", "1")
         via_env = build_rbln_config(None)
-        env_sig = mega_cache.config_signature(_stub_config(via_env.compute_hash()))
+        env_sig = mega_cache.model_bundle_signature(
+            _stub_config(via_env.compute_hash())
+        )
 
         monkeypatch.delenv("VLLM_RBLN_USE_W8A8")
         via_flag = build_rbln_config({"use_w8a8": True})
-        flag_sig = mega_cache.config_signature(_stub_config(via_flag.compute_hash()))
+        flag_sig = mega_cache.model_bundle_signature(
+            _stub_config(via_flag.compute_hash())
+        )
 
         assert via_env == via_flag
         assert env_sig == flag_sig
@@ -217,9 +221,9 @@ class TestSignatureVllmConfig:
     """Against a real engine-built VllmConfig, not a stand-in."""
 
     def test_launch_stable(self):
-        assert mega_cache.config_signature(
+        assert mega_cache.model_bundle_signature(
             make_vllm_config()
-        ) == mega_cache.config_signature(make_vllm_config())
+        ) == mega_cache.model_bundle_signature(make_vllm_config())
 
     @pytest.mark.parametrize(
         "overrides",
@@ -232,8 +236,8 @@ class TestSignatureVllmConfig:
         ids=["block_size", "max_model_len", "tp", "dtype"],
     )
     def test_graph_relevant_config_invalidates(self, overrides):
-        base = mega_cache.config_signature(make_vllm_config())
-        assert mega_cache.config_signature(make_vllm_config(**overrides)) != base
+        base = mega_cache.model_bundle_signature(make_vllm_config())
+        assert mega_cache.model_bundle_signature(make_vllm_config(**overrides)) != base
 
     @pytest.mark.parametrize(
         "overrides",
@@ -247,8 +251,8 @@ class TestSignatureVllmConfig:
     def test_warmup_graph_set_config_invalidates(self, overrides):
         # compute_hash() drops all three, but each moves a warm-up graph shape,
         # and a partly-hitting bundle costs a duplicate weight set on device.
-        base = mega_cache.config_signature(make_vllm_config())
-        assert mega_cache.config_signature(make_vllm_config(**overrides)) != base
+        base = mega_cache.model_bundle_signature(make_vllm_config())
+        assert mega_cache.model_bundle_signature(make_vllm_config(**overrides)) != base
 
     def test_speculative_tokens_invalidate(self):
         # num_spec_tokens sets the decode query_len the warm-up compiles, and
@@ -259,11 +263,13 @@ class TestSignatureVllmConfig:
             "prompt_lookup_max": 5,
             "prompt_lookup_min": 2,
         }
-        base = mega_cache.config_signature(make_vllm_config(speculative_config=spec))
+        base = mega_cache.model_bundle_signature(
+            make_vllm_config(speculative_config=spec)
+        )
         other = make_vllm_config(
             speculative_config={**spec, "num_speculative_tokens": 5}
         )
-        assert mega_cache.config_signature(other) != base
+        assert mega_cache.model_bundle_signature(other) != base
 
     def test_npu_name_invalidates(self, monkeypatch):
         # The per-graph hash stamps meta=npu:...; the bundle file must split too.
@@ -271,9 +277,9 @@ class TestSignatureVllmConfig:
 
         monkeypatch.setattr(rebel, "get_npu_name", lambda device_id=0: None)
         monkeypatch.setenv("RBLN_FORCE_NPU_NAME", "RBLN-CR03")
-        cr03 = mega_cache.config_signature(make_vllm_config())
+        cr03 = mega_cache.model_bundle_signature(make_vllm_config())
         monkeypatch.setenv("RBLN_FORCE_NPU_NAME", "RBLN-CR13")
-        assert mega_cache.config_signature(make_vllm_config()) != cr03
+        assert mega_cache.model_bundle_signature(make_vllm_config()) != cr03
 
     def test_every_factor_is_a_real_field(self):
         # A getattr default would drop an axis from the key on an upstream rename.
@@ -304,24 +310,59 @@ class TestSignatureVllmConfig:
             if "port" in f.name.lower()
         ]
         assert fields
-        base = mega_cache.config_signature(config)
+        base = mega_cache.model_bundle_signature(config)
         for name in fields:
             original = getattr(config.parallel_config, name)
             probe = [50001, 50002] if isinstance(original, list) else 50000
             object.__setattr__(config.parallel_config, name, probe)
-            assert mega_cache.config_signature(config) == base, name
+            assert mega_cache.model_bundle_signature(config) == base, name
             object.__setattr__(config.parallel_config, name, original)
 
     def test_port_fields_restored(self):
         config = make_vllm_config()
         object.__setattr__(config.parallel_config, "_coord_store_port", 38735)
-        mega_cache.config_signature(config)
+        mega_cache.model_bundle_signature(config)
         assert config.parallel_config._coord_store_port == 38735
 
     def test_signature_shape(self):
         # It becomes one directory name in bundle_path().
-        sig = mega_cache.config_signature(make_vllm_config())
+        sig = mega_cache.model_bundle_signature(make_vllm_config())
         assert re.fullmatch(r"[0-9a-f]{16}", sig)
+
+
+class TestSamplerSignature:
+    def _sig(self, vocab_size=32000, dtype="bfloat16", bucket_sizes=(1, 4)):
+        return mega_cache.sampler_bundle_signature(vocab_size, dtype, bucket_sizes)
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"vocab_size": 50257},
+            {"dtype": "float16"},
+            {"bucket_sizes": (1, 4, 8)},
+        ],
+        ids=["vocab_size", "dtype", "bucket_sizes"],
+    )
+    def test_graph_input_invalidates(self, overrides):
+        # Each is a logits-shape or specialization axis; a partly-hitting bundle
+        # trips the stale-bundle guard on load.
+        assert self._sig(**overrides) != self._sig()
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            # Keys the model bundle, not the sampler's.
+            "VLLM_RBLN_NUM_HIDDEN_LAYERS",
+            # Sampler compile options read platform.USE_DEVICE_TENSOR, which is
+            # False on the optimum path whatever this variable says.
+            "VLLM_RBLN_USE_DEVICE_TENSOR",
+        ],
+    )
+    def test_compile_env_is_ignored(self, monkeypatch, name):
+        monkeypatch.setenv(name, "0")
+        before = self._sig()
+        monkeypatch.setenv(name, "1")
+        assert self._sig() == before
 
 
 class TestBundlePath:
@@ -467,8 +508,8 @@ class TestSaveLoad:
     def test_a_run_does_not_read_another_max_num_seqs_bundle(self, bundle):
         # The reported failure: two runs differing only here shared a bundle,
         # so prefill hit while decode missed.
-        sig1 = mega_cache.config_signature(make_vllm_config(max_num_seqs=1))
-        sig4 = mega_cache.config_signature(make_vllm_config(max_num_seqs=4))
+        sig1 = mega_cache.model_bundle_signature(make_vllm_config(max_num_seqs=1))
+        sig4 = mega_cache.model_bundle_signature(make_vllm_config(max_num_seqs=4))
         mega_cache.save(MODEL, sig1)
         mega_cache.load(MODEL, sig4)
         assert bundle.loaded == []
