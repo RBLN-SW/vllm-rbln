@@ -41,6 +41,9 @@ def _ensure_torch_dynamo_configured() -> None:
     # If this flag is set, nn.modules parameters are treated as model input.
     torch._dynamo.config.inline_inbuilt_nn_modules = False
     torch._dynamo.config.cache_size_limit = 64
+    if envs.VLLM_RBLN_NESTED_COMPILE_REGION:
+        # Preserve decoder boundaries even when Dynamo cannot reuse their bodies.
+        torch._dynamo.config.inline_single_use_invoke_subgraph = False
 
     _DYNAMO_CONFIGURED = True
 
