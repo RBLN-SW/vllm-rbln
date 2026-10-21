@@ -644,11 +644,10 @@ wheels = [
 
 [[package]]
 name = "diffusers"
-version = "0.38.0"
+version = "0.41.0"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
 dependencies = [
     { name = "filelock" },
-    { name = "httpx" },
     { name = "huggingface-hub" },
     { name = "importlib-metadata" },
     { name = "numpy" },
@@ -657,9 +656,9 @@ dependencies = [
     { name = "requests" },
     { name = "safetensors" },
 ]
-sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/diffusers/0.38.0/diffusers-0.38.0.tar.gz", hash = "sha256:1e094ec5c16f18c42fb89d37f07a94cf9aab3ebbe527ab059c609597b8857626" }
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/diffusers/0.41.0/diffusers-0.41.0.tar.gz", hash = "sha256:69dcced7230b6bc0b70b5c6cfdff1aa62da487ab52ae74b642e46b1b9bfacc47" }
 wheels = [
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/diffusers/0.38.0/diffusers-0.38.0-py3-none-any.whl", hash = "sha256:18e53f9e539096320470f62c6360a6fd5727ff28cffda566265316e13fcdb612" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/diffusers/0.41.0/diffusers-0.41.0-py3-none-any.whl", hash = "sha256:ea8918b7dfd92ce793b6db689a551b8cd25d52c6c0fcd3ade0706a5fd2a25990" },
 ]
 
 [[package]]
@@ -2027,7 +2026,7 @@ wheels = [
 
 [[package]]
 name = "optimum-rbln"
-version = "0.12.1a2"
+version = "0.12.1a3"
 source = { registry = "https://pypi.org/simple/" }
 dependencies = [
     { name = "accelerate" },
@@ -2041,9 +2040,9 @@ dependencies = [
     { name = "transformers" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/ae/c8/b3b96e0ea06b629110de24d749e139c0a9fb59e1fa6c27cda52030ac8552/optimum_rbln-0.12.1a2.tar.gz", hash = "sha256:b7c5dd6d8cc9d8cb2be242af92e96048c17a0cc0296f4cc860f89badb58302b0", size = 686815, upload-time = "2026-10-16T05:38:31.862Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/e6/81/33e4bb9cd7237911d34bc37caccc6c4c2597c9305910e8dc4989e37185ec/optimum_rbln-0.12.1a3.tar.gz", hash = "sha256:406d7450968af5107a6f401d9e12bb67fbab95a2704e2b45989536c07e222c2b", size = 687623, upload-time = "2026-10-21T07:35:36.653Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/00/c0/9c4816ae65b89173a0986915a943966ac1729eeabbd606dd94b30bf751ac/optimum_rbln-0.12.1a2-py3-none-any.whl", hash = "sha256:854f0ff0a78d4f4eae13933e6c14881cd538ebc791444e37dd63ee57b0845607", size = 736070, upload-time = "2026-10-16T05:38:29.641Z" },
+    { url = "https://files.pythonhosted.org/packages/b5/45/4c11c8754dab9f9f575e3ab9a15754fb57f1402586512eac1a808ce8b686/optimum_rbln-0.12.1a3-py3-none-any.whl", hash = "sha256:6bf1d0e238900349f816af8d382b316c716111dd4cd5acfc3e88a7f25fbdfe9b", size = 750612, upload-time = "2026-10-21T07:35:34.554Z" },
 ]
 
 [[package]]
@@ -3670,7 +3669,7 @@ requires-dist = [
     { name = "huggingface-hub", marker = "extra == 'dev'" },
     { name = "lmcache-rbln", marker = "extra == 'kv-connectors'", specifier = ">=0.12.0rc1,<0.12.1" },
     { name = "nixl-rbln", marker = "extra == 'kv-connectors'", specifier = ">=0.12.0rc1,<0.12.1" },
-    { name = "optimum-rbln", specifier = ">=0.12.1a2,<0.12.2", index = "https://pypi.org/simple/" },
+    { name = "optimum-rbln", specifier = ">=0.12.1a3,<0.12.2", index = "https://pypi.org/simple/" },
     { name = "packaging", marker = "extra == 'dev'" },
     { name = "pynvml", marker = "extra == 'dev'" },
     { name = "pytest", marker = "extra == 'test'" },
