@@ -98,8 +98,6 @@ def test_config_unpickles_where_vllm_rbln_has_not_been_imported(tmp_path):
 
 
 def test_axk3_registers_its_mla_convertor(monkeypatch):
-    from types import SimpleNamespace
-
     from vllm.model_executor.models import ModelRegistry
     from vllm.transformers_utils.config import _CONFIG_REGISTRY
     from vllm.transformers_utils.model_arch_config_convertor import (
@@ -109,9 +107,8 @@ def test_axk3_registers_its_mla_convertor(monkeypatch):
     from vllm_rbln.patches.axk3 import register_axk3
     from vllm_rbln.patches.model_arch_config import KvLoraRankMLAConvertor
 
-    # The registration may already have run in this process; it refuses to
-    # shadow an architecture the registry knows, so hide that for the call.
-    monkeypatch.setattr(ModelRegistry, "get_supported_archs", lambda: set())
+    # The registration may already have run in this process, and re-running it
+    # has to stay harmless; only the registry writes are undone per test.
     monkeypatch.setattr(ModelRegistry, "register_model", lambda *a, **k: None)
     monkeypatch.delitem(_CONFIG_REGISTRY, "axk3", raising=False)
     monkeypatch.delitem(MODEL_ARCH_CONFIG_CONVERTORS, "axk3", raising=False)
