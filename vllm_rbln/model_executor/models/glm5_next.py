@@ -213,8 +213,7 @@ class _RBLNGlm5Cache(nn.Module, AttentionLayerBase):
 class RBLNGlm5StateCache(_RBLNGlm5Cache):
     """A KDA head group's recurrent state, one block a request (``MambaSpec``,
     block_size = max_model_len): R1's bytes, uint8 ``[rows, 512]``, the size of an MLA
-    latent block, whose extent it shares (the KDA ops' ``_r1`` kernels reinterpret
-    them)."""
+    latent block, whose extent it shares (the KDA kernels reinterpret them)."""
 
     def __init__(self, prefix: str, rows: int) -> None:
         super().__init__(prefix)
