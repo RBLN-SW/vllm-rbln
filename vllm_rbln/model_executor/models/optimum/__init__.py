@@ -20,10 +20,7 @@ from vllm.logger import init_logger
 from vllm_rbln.model_executor.models.optimum.base import (
     ModelInputForRBLN,
 )
-from vllm_rbln.utils.optimum.predicates import (
-    is_phi3_full_attention,
-    is_qwen3_reranker,
-)
+from vllm_rbln.utils.optimum.predicates import is_qwen3_reranker
 from vllm_rbln.utils.optimum.registry import (
     _RBLN_MULTIMODAL_MODELS,
     is_enc_dec_arch,
@@ -105,11 +102,9 @@ def load_model(vllm_config: VllmConfig) -> nn.Module:
         )
         rbln_model = RBLNOptimumForEncoderModel(vllm_config)
     else:
-        if (
-            getattr(model_config.hf_config, "sliding_window", None) is not None
-            and getattr(model_config.hf_config, "use_sliding_window", True)
-            and not is_phi3_full_attention(model_config)
-        ):
+        if getattr(
+            model_config.hf_config, "sliding_window", None
+        ) is not None and getattr(model_config.hf_config, "use_sliding_window", True):
             logger.info("The model is initialized with Sliding Window Attention.")
             assert vllm_config.cache_config.enable_prefix_caching in (False, None), (
                 "Prefix caching is not supported with sliding window "

@@ -21,11 +21,12 @@ from vllm_rbln import envs
 from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.logger import init_logger
 from vllm_rbln.utils.optimum.paths import is_compiled_dir
+from vllm_rbln.utils.optimum.registry import is_generation_arch
 
 from .common import get_user_max_num_batched_tokens
 from .from_optimum import sync_from_optimum
 from .from_vllm import sync_from_vllm
-from .params import load_compiled_rbln_config
+from .params import RBLNParams, load_compiled_rbln_config
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -124,6 +125,38 @@ def _resolve_rbln_config(vllm_config: VllmConfig) -> dict | None:
         vllm_config.model_config.model = cached_model_path
         return load_compiled_rbln_config(vllm_config)
     return None
+
+
+def disable_redundant_sliding_window(vllm_config: VllmConfig) -> None:
+    """Run a decoder whose sliding window covers its context as full attention.
+
+    Such a window never masks a token. Dropping it, as --disable-sliding-window
+    does, keeps the model on the paged-KV path with prefix caching, and the
+    compile that reads this config then builds a static cache. A compiled model
+    keeps the cache it was built with.
+    """
+    model_config = vllm_config.model_config
+    text_config = model_config.hf_text_config
+    window = getattr(text_config, "sliding_window", None)
+    if (
+        window is None
+        or not getattr(text_config, "use_sliding_window", True)
+        or not is_generation_arch(model_config.hf_config)
+    ):
+        return
+
+    compiled_rbln_config = _resolve_rbln_config(vllm_config)
+    if compiled_rbln_config is not None:
+        if compiled_rbln_config.get("cache_impl", "static") != "static":
+            return
+    else:
+        rbln_config: OptimumRBLNConfig = vllm_config.additional_config
+        params = RBLNParams.from_rbln_config(vllm_config, rbln_config.optimum_overrides)
+        if window < (params.max_seq_len or model_config.max_model_len):
+            return
+
+    model_config.disable_sliding_window = True
+    text_config.sliding_window = None
 
 
 def sync_vllm_and_optimum(vllm_config: VllmConfig) -> None:

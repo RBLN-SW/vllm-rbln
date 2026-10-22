@@ -38,12 +38,6 @@ QUANTIZED_LINEARS_ONLY = [
 
 HYBRID = ["Qwen/Qwen3.5-0.8B"]
 
-# Phi-3 checkpoints whose sliding_window is wider than their context.
-PHI3_FULL_ATTENTION = [
-    "microsoft/Phi-3.5-mini-instruct",
-    "microsoft/Phi-4-mini-instruct",
-]
-
 
 def _vllm_config(model_id: str) -> SimpleNamespace:
     """The fields the guard reads, around the ModelConfig vLLM would build."""
@@ -62,13 +56,6 @@ def test_quantized_kv_cache_disables_prefix_caching(model_id):
 
 @pytest.mark.parametrize("model_id", QUANTIZED_LINEARS_ONLY)
 def test_quantized_linears_alone_keep_prefix_caching(model_id):
-    vllm_config = _vllm_config(model_id)
-    disable_unsupported_prefix_caching(vllm_config)
-    assert vllm_config.cache_config.enable_prefix_caching is True
-
-
-@pytest.mark.parametrize("model_id", PHI3_FULL_ATTENTION)
-def test_phi3_full_attention_keeps_prefix_caching(model_id):
     vllm_config = _vllm_config(model_id)
     disable_unsupported_prefix_caching(vllm_config)
     assert vllm_config.cache_config.enable_prefix_caching is True
@@ -95,3 +82,16 @@ def test_hybrid_engine_config_builds_with_prefix_caching_off(model_id):
         max_num_seqs=1,
     ).create_engine_config()
     assert vllm_config.cache_config.enable_prefix_caching is False
+
+
+def test_window_covering_the_context_keeps_prefix_caching():
+    # Phi-3.5-mini ships sliding_window=262144, wider than any context it serves.
+    vllm_config = EngineArgs(
+        model="microsoft/Phi-3.5-mini-instruct",
+        model_impl="optimum",
+        block_size=8192,
+        max_model_len=8192,
+        max_num_seqs=1,
+    ).create_engine_config()
+    assert vllm_config.model_config.hf_text_config.sliding_window is None
+    assert vllm_config.cache_config.enable_prefix_caching is True

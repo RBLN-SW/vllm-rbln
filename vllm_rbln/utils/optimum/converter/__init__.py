@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .dispatch import sync_vllm_and_optimum
+from .dispatch import disable_redundant_sliding_window, sync_vllm_and_optimum
 from .from_optimum import update_num_blocks
 from .params import RBLNParams, load_compiled_rbln_config
 
 __all__ = [
     "RBLNParams",
+    "disable_redundant_sliding_window",
     "load_compiled_rbln_config",
     "sync_vllm_and_optimum",
     "update_num_blocks",
