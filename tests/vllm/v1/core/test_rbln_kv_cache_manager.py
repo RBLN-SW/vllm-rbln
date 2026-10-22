@@ -265,6 +265,15 @@ class TestSubBlockIndex:
         idx.update(1, h[:2])
         assert idx.longest_match(h) == (1, 2)
 
+    @pytest.mark.parametrize("held", [1, 2])
+    def test_longest_match_prefers_held_block(self, held):
+        # Of two blocks matching the same depth, the held one is returned.
+        idx = SubBlockIndex()
+        h = _hashes(2)
+        idx.update(1, h)
+        idx.update(2, h)
+        assert idx.longest_match(h, is_held=lambda b: b == held) == (held, 2)
+
     def test_longest_match_empty_query(self):
         # An empty query -> (None, 0).
         assert SubBlockIndex().longest_match([]) == (None, 0)
@@ -378,6 +387,26 @@ class TestGetComputedBlocksSubBlock:
         match = manager.get_computed_blocks_sub_block(req1, num_computed)
         assert match is not None
         assert match.num_tokens == 4
+        manager.release_sub_block_match(match)
+
+    def test_prefers_source_held_by_a_running_request(self):
+        # Two indexed blocks share the first sub-block: one free and cached, one
+        # held by a running request. Touching the held one takes nothing from
+        # the free queue.
+        manager = make_manager(8, 4, 10)
+        finished = make_request("finished", list(range(8)), 8)
+        prefill_request(manager, finished)
+        running = make_request("running", list(range(4)) + [700] * 8, 8)
+        prefill_request(manager, running)
+        manager.release_copy_ops(manager.drain_pending_copy_ops())
+        manager.free(finished)
+        held_block_id = manager.get_block_ids("running")[0][0]
+
+        req = make_request("1", list(range(4)) + [900] * 8, 8)
+        _, num_computed, _ = manager.get_computed_blocks(req)
+        match = manager.get_computed_blocks_sub_block(req, num_computed)
+        assert match is not None
+        assert match.group_matches[0].src_block.block_id == held_block_id
         manager.release_sub_block_match(match)
 
     def test_no_partial_match_when_full_block_matches(self):

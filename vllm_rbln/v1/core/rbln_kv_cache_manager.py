@@ -209,24 +209,34 @@ class SubBlockIndex:
         return block_id in self._block_hashes
 
     def longest_match(
-        self, sub_block_hashes: Sequence[BlockHash]
+        self,
+        sub_block_hashes: Sequence[BlockHash],
+        is_held: Callable[[int], bool] | None = None,
     ) -> tuple[int | None, int]:
         """Find a block with the longest prefix match.
 
+        Among the blocks matching that prefix, prefers one for which
+        ``is_held`` returns True.
+
         Returns:
-            ``(block_id, num_matched)`` where ``block_id`` is any block
+            ``(block_id, num_matched)`` where ``block_id`` is a block
             matching that prefix, or ``(None, 0)`` if no match.
         """
-        best_block_id: int | None = None
+        best_blocks: set[int] | None = None
         best_depth = 0
         for depth, h in enumerate(sub_block_hashes, start=1):
             blocks = self._hash_to_blocks.get(h)
             if not blocks:
                 break
-            # Pick an arbitrary block_id from the set.
-            best_block_id = next(iter(blocks))
+            best_blocks = blocks
             best_depth = depth
-        return best_block_id, best_depth
+        if best_blocks is None:
+            return None, 0
+        if is_held is not None:
+            for block_id in best_blocks:
+                if is_held(block_id):
+                    return block_id, best_depth
+        return next(iter(best_blocks)), best_depth
 
 
 # ---------------------------------------------------------------------------
@@ -410,7 +420,11 @@ class RBLNKVCacheManager(KVCacheManager):
                 min_matched = 0
                 break
 
-            src_block_id, num_matched = gi.sub_block_index.longest_match(query)
+            # Prefer a source another request holds: touching a free one takes
+            # it out of the free queue for the rest of this allocation.
+            src_block_id, num_matched = gi.sub_block_index.longest_match(
+                query, is_held=lambda b: self.block_pool.blocks[b].ref_cnt > 0
+            )
             if src_block_id is None:
                 min_matched = 0
                 break
