@@ -98,8 +98,8 @@ def check_and_update(vllm_config: "VllmConfig") -> None:
         with contextlib.suppress(KeyError):
             del model_config.__dict__["is_encoder_decoder"]
 
-    # optimum-rbln compiles a Phi-3 whose window covers max_seq_len with a static
-    # cache (RBLNPhi3ForCausalLM). Drop the window as --disable-sliding-window does.
+    # When the sliding window is at least max_model_len, drop it as
+    # --disable-sliding-window does. This keeps vLLM in sync with optimum-rbln
     text_config = model_config.hf_text_config
     window = getattr(text_config, "sliding_window", None)
     if (
