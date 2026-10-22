@@ -483,8 +483,6 @@ class RBLNScheduler(Scheduler):
                     step_skipped_waiting.appendleft(request_to_skip)
 
             sub_block_match = None
-            # NOTE(RBLN): a request whose allocation failed with a sub-block
-            # match is retried once in this pass without one.
             no_sub_block_req_id: str | None = None
 
             while token_budget > 0:
