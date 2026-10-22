@@ -60,11 +60,11 @@ from vllm_rbln.v1.worker.utils import canonical_kv_layers
 
 logger = init_logger(__name__)
 
-# Chiplets the converter picks a shard mode for, and the lane group a CP
-# shard's columns have to tile: `RSD_SHARDS` and the 64 in the test `_can_tp`
-# reads, in rebel's `.../custom_converter/_pt_packed_kv_attention.py` (:697,
-# :397 the sliding window, :847 packed GQA). The dim each op cuts is its
-# `getShardAxesFor` contract (`mlir/.../RTOSACustomOpsInterfaces.cpp:1418`).
+# Chiplets the compiler picks an attention op's shard mode for, and the lane
+# group a context-cut shard's columns have to tile. `_region_geometries`
+# mirrors the rule the pinned rebel-compiler applies to its packed-KV attention
+# ops; that rule is not an interface the compiler exports, so re-check it when
+# the pin moves.
 RSD_SHARDS = 4
 _LANES = 64
 
