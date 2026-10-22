@@ -96,6 +96,7 @@ from vllm_rbln.v1.attention.backends.glm5_next import (
     RBLNGlm5IndexerBackend,
     RBLNGlm5LatentBackend,
     RBLNGlm5StateBackend,
+    RBLNGlm5StateMetadata,
 )
 from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
 
@@ -230,13 +231,23 @@ class RBLNGlm5StateCache(_RBLNGlm5Cache):
     def get_attn_backend(self) -> type[RBLNGlm5StateBackend]:
         return RBLNGlm5StateBackend
 
-    def inputs(self) -> tuple[torch.Tensor, torch.Tensor, RBLNFlashAttentionMetadata]:
-        """(state [N, rows, 512], block [B, 1], metadata). Read only the metadata fields
-        an op takes: a graph input nothing uses is pruned from the compiled module, and
-        the runtime then binds the inputs out of step."""
+    def inputs(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, RBLNGlm5StateMetadata]:
+        """(state [N, rows, 512], the blocks read [B], the blocks written [B],
+        metadata). Read only the metadata fields an op takes: a graph input nothing
+        uses is pruned from the compiled module, and the runtime then binds the inputs
+        out of step."""
         metadata = _metadata(self.prefix)
+        assert isinstance(metadata, RBLNGlm5StateMetadata), type(metadata)
+        assert metadata.load_blocks is not None and metadata.store_blocks is not None
         state = _resolve_kv_cache(metadata, self.layer_index)
-        return state, metadata.block_tables.reshape(-1, 1).to(torch.int32), metadata
+        return (
+            state,
+            metadata.load_blocks.view(-1),
+            metadata.store_blocks.view(-1),
+            metadata,
+        )
 
 
 class RBLNGlm5PagedCache(_RBLNGlm5Cache):
@@ -580,12 +591,13 @@ class RBLNGlm5KDA(nn.Module):
         shape = (batch, tokens, self.num_heads, self.head_dim)
 
         group_states = [state.inputs() for state in self.states]
-        metadata = group_states[0][2]
+        metadata = group_states[0][3]
         positions = _metadata(self.positions_from) if self.positions_from else metadata
         seq_idx = positions.seq_lens.to(torch.int32)
         query_len = (positions.cache_offsets - positions.cache_seq_lens).to(torch.int32)
         has_initial_state = (seq_idx > 0).to(torch.int32).view(-1)
-        conv_slot = group_states[0][1].view(-1)
+        # The conv ring sits on head group 0's blocks.
+        conv_load, conv_store = group_states[0][1:3]
 
         qkv = tuple(
             proj(hidden_states)[0] for proj in (self.q_proj, self.k_proj, self.v_proj)
@@ -607,12 +619,13 @@ class RBLNGlm5KDA(nn.Module):
             torch.stack(inputs, dim=2),
             self.conv_weight,
             self.conv_ring.inputs(),
-            conv_slot,
+            conv_load,
             seq_idx.view(-1),
             query_len.view(-1),
             has_initial_state,
             KDA_CONV_RING,
             2 * self.num_groups,
+            conv_store,
         ).unbind(2)
         group_qkv = [
             tuple(
@@ -651,10 +664,9 @@ class RBLNGlm5KDA(nn.Module):
 
         gate = F.linear(hidden_states, self.g_weight).view(shape)
         outs = []
-        for j, ((state, slot, _), (qj, kj, vj)) in enumerate(
+        for j, ((state, load, store, _), (qj, kj, vj)) in enumerate(
             zip(group_states, group_qkv)
         ):
-            slot = slot.view(-1)
             channels = slice(j * group_channels, (j + 1) * group_channels)
             heads = slice(j * self.group_heads, (j + 1) * self.group_heads)
             gj, bj = g[:, heads], beta[:, heads]
@@ -663,7 +675,7 @@ class RBLNGlm5KDA(nn.Module):
                 bj = F.pad(bj, (0, pad))
             if metadata.is_prefill:
                 o = torch.ops.rbln_custom_ops.kda_prefill(
-                    qj, kj, vj, gj, bj, state, slot, has_initial_state
+                    qj, kj, vj, gj, bj, state, load, has_initial_state, None, store
                 )[:, :, :tokens]
             elif tokens > 1 and self.drafts is not None:
                 # An MTP verify step: token 0 always accepted, tokens 1 .. K the drafts.
@@ -675,14 +687,16 @@ class RBLNGlm5KDA(nn.Module):
                     bj,
                     state,
                     self.drafts[j].inputs(),
-                    slot,
+                    load,
                     metadata.num_accepted.view(-1),
                     None,
-                    slot,
+                    load,
+                    store,
+                    store,
                 )
             else:
                 o = torch.ops.rbln_custom_ops.kda_decode(
-                    qj, kj, vj, gj, bj, state, slot
+                    qj, kj, vj, gj, bj, state, load, None, store
                 )
             # Gated and projected a group at a time (o_proj's columns of the group,
             # summed), so that no op concatenates heads RSD has cut.

@@ -26,11 +26,13 @@ The q / k / v conv rings, the MTP draft buffer and the kpool tail ring are block
 caches (``RBLNBlockAuxSpec``) addressed by their owner's block ids.
 """
 
+from dataclasses import dataclass, fields
 from typing import ClassVar
 
 import torch
 from vllm.v1.attention.backend import AttentionBackend, MultipleOf
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
+from vllm.v1.kv_cache_interface import MambaSpec
 
 import vllm_rbln.utils as rbln_utils
 
@@ -38,6 +40,15 @@ from .flash_attention import (
     RBLNFlashAttentionMetadata,
     RBLNFlashAttentionMetadataBuilder,
 )
+
+
+@dataclass
+class RBLNGlm5StateMetadata(RBLNFlashAttentionMetadata):
+    """A KDA state group's metadata: the block each request's state (and the block-aux
+    caches on it) is read from and the one it is written to, ``[B, 1]`` int32."""
+
+    load_blocks: torch.Tensor | None = None
+    store_blocks: torch.Tensor | None = None
 
 
 class RBLNGlm5MetadataBuilder(RBLNFlashAttentionMetadataBuilder):
@@ -80,7 +91,52 @@ class RBLNGlm5MetadataBuilder(RBLNFlashAttentionMetadataBuilder):
             seq_lens = rbln_utils.pad(seq_lens, 0, batch_pad)
         metadata.cache_seq_lens = self._stage(num_computed_tokens, "cache_seq_lens")
         metadata.cache_offsets = self._stage(seq_lens, "cache_offsets")
-        return metadata
+        if not isinstance(self.kv_cache_spec, MambaSpec):
+            return metadata
+        load_blocks, store_blocks = self._state_blocks(
+            common_attn_metadata.block_table_tensor[:num_reqs],
+            num_computed_tokens[:num_reqs],
+            seq_lens[:num_reqs],
+            None if is_prefill else kwargs.get("num_accepted"),
+            is_prefill,
+        )
+        if not is_prefill:
+            load_blocks = rbln_utils.pad(load_blocks, 0, batch_pad)
+            store_blocks = rbln_utils.pad(store_blocks, 0, batch_pad)
+        return RBLNGlm5StateMetadata(
+            **{f.name: getattr(metadata, f.name) for f in fields(metadata)},
+            load_blocks=self._stage(load_blocks, "load_blocks"),
+            store_blocks=self._stage(store_blocks, "store_blocks"),
+        )
+
+    def _state_blocks(
+        self,
+        block_table: torch.Tensor,
+        num_computed_tokens: torch.Tensor,
+        seq_lens: torch.Tensor,
+        num_accepted: torch.Tensor | None,
+        is_prefill: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The state blocks a step reads and writes, both one block a request when the
+        spec's block holds the whole sequence. A step reads where the previous one
+        wrote: a verify step writes the state after token 0 (position
+        ``num_computed_tokens``), so the next one reads behind its accepted drafts,
+        which it replays. A prefill writes at its last token, a decode or verify step
+        at token 0."""
+        block_size = self.kv_cache_spec.block_size
+        accepted = (
+            0 if num_accepted is None else num_accepted[: len(seq_lens)].view(-1, 1)
+        )
+        load_pos = num_computed_tokens - 1 - accepted
+        store_pos = seq_lens - 1 if is_prefill else num_computed_tokens
+        # A fresh request (no computed token) and a padding one (0 tokens) take column
+        # 0; neither reads its state.
+        load_col = torch.div(load_pos.clamp(min=0), block_size, rounding_mode="floor")
+        store_col = torch.div(store_pos.clamp(min=0), block_size, rounding_mode="floor")
+        return (
+            torch.gather(block_table, 1, load_col.long()).to(torch.int32),
+            torch.gather(block_table, 1, store_col.long()).to(torch.int32),
+        )
 
 
 class _RBLNGlm5CacheBackend(AttentionBackend):

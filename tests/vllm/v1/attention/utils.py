@@ -75,8 +75,10 @@ def make_builder(
     spec: Any = None,
     layer_names: tuple[str, ...] = ("model.layers.0.self_attn",),
     device: str = "cpu",
+    builder_cls: Any = None,
 ) -> Any:
-    """Construct the real builder. is_causal comes from `vllm_config`, so pass a
+    """Construct the real builder (RBLNFlashAttentionMetadataBuilder unless
+    `builder_cls` names a subclass). is_causal comes from `vllm_config`, so pass a
     config built with `attention_config.use_non_causal` on for a non-causal builder."""
     from vllm.config import set_current_vllm_config
 
@@ -86,10 +88,10 @@ def make_builder(
 
     if spec is None:
         spec = make_attention_spec(sliding_window=sliding_window, appends_kv=appends_kv)
+    if builder_cls is None:
+        builder_cls = RBLNFlashAttentionMetadataBuilder
     with set_current_vllm_config(vllm_config):
-        return RBLNFlashAttentionMetadataBuilder(
-            spec, list(layer_names), vllm_config, torch.device(device)
-        )
+        return builder_cls(spec, list(layer_names), vllm_config, torch.device(device))
 
 
 def make_impl(vllm_config: Any, **overrides) -> Any:
