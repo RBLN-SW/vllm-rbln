@@ -36,10 +36,7 @@ def patch_upstream() -> None:
 
 def check_and_update(vllm_config: "VllmConfig") -> None:
     from vllm_rbln.config import build_optimum_rbln_config
-    from vllm_rbln.utils.optimum.converter import (
-        disable_redundant_sliding_window,
-        sync_vllm_and_optimum,
-    )
+    from vllm_rbln.utils.optimum.converter import sync_vllm_and_optimum
     from vllm_rbln.utils.optimum.predicates import forces_fp32_dtype
     from vllm_rbln.utils.optimum.registry import is_pooling_arch
 
@@ -101,7 +98,17 @@ def check_and_update(vllm_config: "VllmConfig") -> None:
         with contextlib.suppress(KeyError):
             del model_config.__dict__["is_encoder_decoder"]
 
-    disable_redundant_sliding_window(vllm_config)
+    # optimum-rbln compiles a Phi-3 whose window covers max_seq_len with a static
+    # cache (RBLNPhi3ForCausalLM). Drop the window as --disable-sliding-window does.
+    text_config = model_config.hf_text_config
+    window = getattr(text_config, "sliding_window", None)
+    if (
+        "Phi3ForCausalLM" in (model_config.architectures or [])
+        and window is not None
+        and window >= model_config.max_model_len
+    ):
+        text_config.sliding_window = None
+
     disable_unsupported_prefix_caching(vllm_config)
     sync_vllm_and_optimum(vllm_config)
 

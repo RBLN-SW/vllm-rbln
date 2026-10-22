@@ -41,8 +41,6 @@ class TestQwen3Reranker(DecoderSmoke.Test):
 class TestGemma2(DecoderSmoke.Test):
     # Hybrid (sliding-window) attention decoder.
     MODEL_ID = "hf-internal-testing/tiny-random-Gemma2ForCausalLM"
-    # Below max_model_len: a window covering the context compiles a static cache.
-    HF_OVERRIDES = {"sliding_window": 512}
     NUM_DEVICES = 1
     LLM_KWARGS = {"block_size": 1024, "max_model_len": 1024, "max_num_seqs": 4}
 
