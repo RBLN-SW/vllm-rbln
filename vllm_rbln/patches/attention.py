@@ -257,9 +257,11 @@ def patched_get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
     # Should not be called for enc-dec or encoder-only attention.
     assert self.attn_type == AttentionType.DECODER
     if self.sliding_window is not None:
-        if vllm_config.model_config.use_mla:
+        # Support for swa drafter
+        if vllm_config.model_config.use_mla and not current_platform.is_cr13():
             raise NotImplementedError(
-                "MLA is not supported with sliding window attention."
+                "Sliding-window drafting with an MLA target requires REBEL "
+                "CR13's append attention kernel."
             )
         spec_cls = (
             SlidingWindowSpec if current_platform.is_cr13() else RBLNSlidingWindowSpec
