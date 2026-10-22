@@ -22,6 +22,9 @@ from __future__ import annotations
 
 import copy
 import os
+import subprocess
+import sys
+import textwrap
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -54,10 +57,9 @@ _ENGINE_ARGS = dict(
     enable_chunked_prefill=True,
 )
 
-# Modules that bind platform.USE_DEVICE_TENSOR into their own namespace at
-# import. _apply_model_impl cannot reach them, so none may be imported before
-# the model path is resolved.
-_DEVICE_FLAG_COPIERS = frozenset(
+# Modules that read the device flag. The DP launcher of vllm-rbln-executor
+# imports them before the model path is resolved.
+_DEVICE_FLAG_READERS = frozenset(
     {
         "vllm_rbln.patches.deepseek_mtp",
         "vllm_rbln.platform.vllm_impl",
@@ -114,6 +116,233 @@ def reconfigure(configured):
 @pytest.fixture(autouse=True)
 def isolated_standalone_env(monkeypatch):
     monkeypatch.setenv(_STANDALONE, _UNTOUCHED)
+
+
+@pytest.fixture
+def run_logging_probe(tmp_path):
+    def run(probe, bootstrap_logging, color):
+        result = subprocess.run(
+            [sys.executable, "-c", textwrap.dedent(probe), str(tmp_path)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={
+                **os.environ,
+                "VLLM_CONFIGURE_LOGGING": bootstrap_logging,
+                "VLLM_LOGGING_LEVEL": "INFO",
+                "VLLM_LOGGING_CONFIG_PATH": "",
+                "VLLM_LOGGING_COLOR": color,
+                "NO_COLOR": "",
+            },
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+
+    return run
+
+
+@pytest.mark.parametrize("bootstrap_logging", ["0", "1"])
+@pytest.mark.parametrize("color", ["0", "1"])
+def test_logging_initialization_honors_upstream_config(
+    run_logging_probe, bootstrap_logging, color
+):
+    run_logging_probe(
+        r"""
+        import logging
+        import os
+        import re
+        import sys
+        from copy import deepcopy
+
+        from vllm.config.logging import LoggingConfig
+        from vllm.logger import configure_logging
+
+        configure_logging(LoggingConfig(configure_logging=True, log_level="ERROR"))
+        import vllm_rbln.platform
+        import vllm_rbln.logger as rbln_logger
+
+        assert logging.getLogger("vllm_rbln").getEffectiveLevel() == logging.ERROR
+        defaults = deepcopy(rbln_logger.DEFAULT_LOGGIN_CONFIG)
+        os.environ["VLLM_CONFIGURE_LOGGING"] = "1"
+        os.environ["VLLM_LOGGING_LEVEL"] = "DEBUG"
+        rbln_logger._configure_vllm_root_logger()
+        assert rbln_logger.DEFAULT_LOGGIN_CONFIG == defaults
+        source = sys.modules[LoggingConfig.__module__].__file__
+        record = logging.LogRecord(
+            "vllm_rbln.logging_test", logging.ERROR, source, 7, "path marker", (), None
+        )
+        root = logging.getLogger("vllm_rbln")
+        rendered = root.handlers[0].formatter.format(record)
+        assert "[config/logging.py:7]" in re.sub(r"\x1b\[[0-9;]*m", "", rendered)
+        """,
+        bootstrap_logging,
+        color,
+    )
+
+
+@pytest.mark.parametrize("bootstrap_logging", ["0", "1"])
+@pytest.mark.parametrize("color", ["0", "1"])
+def test_logging_reconfiguration_preserves_rbln_output(
+    run_logging_probe, bootstrap_logging, color
+):
+    run_logging_probe(
+        r"""
+        import io
+        import logging
+        import re
+        import sys
+        from contextlib import closing
+        from pathlib import Path
+
+        from vllm.config.logging import LoggingConfig
+        from vllm.logger import configure_logging, init_logger
+
+        import vllm_rbln.platform
+        from vllm_rbln.logger import make_file_handler
+
+        root = logging.getLogger("vllm_rbln")
+        source = sys.modules[LoggingConfig.__module__].__file__
+        record = logging.LogRecord(
+            "vllm_rbln.logging_test", logging.ERROR, source, 7, "path marker", (), None
+        )
+        configure_logging(LoggingConfig(configure_logging=True, log_level="INFO"))
+        console, = root.handlers
+        output = io.StringIO()
+        console.setStream(output)
+        formatter = console.formatter
+        logger = init_logger("vllm_rbln.logging_test")
+        file_path = Path(sys.argv[1]) / "metrics.log"
+        file_handler = make_file_handler(str(file_path))
+        logger.addHandler(file_handler)
+
+        for level in ("INFO", "ERROR", "DEBUG", "INFO"):
+            configure_logging(LoggingConfig(configure_logging=True, log_level=level))
+            assert root.getEffectiveLevel() == getattr(logging, level)
+            assert root.handlers == [console]
+            assert type(console.formatter) is type(formatter)
+            assert console.stream is output
+            assert logger.handlers == [file_handler]
+            output.seek(0)
+            output.truncate()
+            logger.debug("debug marker")
+            logger.info("info marker")
+            logger.error("error marker")
+            logger.handle(record)
+            text = re.sub(r"\x1b\[[0-9;]*m", "", output.getvalue())
+            assert ("debug marker" in text) == (level == "DEBUG"), text
+            assert ("info marker" in text) == (level != "ERROR"), text
+            assert text.count("error marker") == 1, text
+            assert all(line.startswith("[vllm-rbln] ") for line in text.splitlines())
+            assert "pid=" not in text
+            location = "config/logging.py" if level == "DEBUG" else "logging.py"
+            assert f"[{location}:7]" in text, text
+            assert f"[{location}:7]" in file_path.read_text().splitlines()[-1]
+            level_path = Path(sys.argv[1]) / f"{level}.log"
+            with closing(make_file_handler(str(level_path))) as level_handler:
+                level_handler.handle(record)
+            assert f"[{location}:7]" in level_path.read_text()
+
+        configure_logging(LoggingConfig(configure_logging=False, log_level="ERROR"))
+        assert root.getEffectiveLevel() == logging.INFO
+        logger.info("file marker")
+        file_handler.flush()
+        assert "[vllm-rbln] INFO" in file_path.read_text()
+        assert "file marker" in file_path.read_text()
+        logger.removeHandler(file_handler)
+        file_handler.close()
+        """,
+        bootstrap_logging,
+        color,
+    )
+
+
+@pytest.mark.parametrize("bootstrap_logging", ["0", "1"])
+@pytest.mark.parametrize("color", ["0", "1"])
+def test_logging_custom_config_and_default_transition(
+    run_logging_probe, bootstrap_logging, color
+):
+    run_logging_probe(
+        r"""
+        import io
+        import json
+        import logging
+        import re
+        import sys
+        from contextlib import redirect_stdout
+        from pathlib import Path
+
+        from vllm.config.logging import LoggingConfig
+        from vllm.logger import configure_logging, init_logger
+
+        import vllm_rbln.platform
+        from vllm_rbln.logger import make_file_handler
+
+        configure_logging(LoggingConfig(configure_logging=True, log_level="INFO"))
+        root = logging.getLogger("vllm_rbln")
+        output = io.StringIO()
+        root.handlers[0].setStream(output)
+        logger = init_logger("vllm_rbln.logging_test")
+
+        custom_path = Path(sys.argv[1]) / "logging.json"
+        custom_path.write_text(json.dumps({
+            "version": 1,
+            "incremental": True,
+            "handlers": {"vllm_rbln": {"level": "ERROR"}},
+            "loggers": {"vllm_rbln": {"level": "WARNING"}},
+        }))
+        configure_logging(LoggingConfig(
+            configure_logging=True,
+            log_level="DEBUG",
+            pylogging_config_file=str(custom_path),
+        ))
+        assert root.getEffectiveLevel() == logging.WARNING
+        output.seek(0)
+        output.truncate()
+        logger.warning("filtered marker")
+        logger.error("incremental marker")
+        assert "filtered marker" not in output.getvalue()
+        assert output.getvalue().count("incremental marker") == 1
+
+        for name in ("application_console", "vllm_rbln"):
+            custom_path.write_text(json.dumps({
+                "version": 1,
+                "disable_existing_loggers": False,
+                "formatters": {"custom": {"format": "[custom] %(message)s"}},
+                "handlers": {name: {
+                    "class": "logging.StreamHandler",
+                    "stream": "ext://sys.stdout",
+                    "formatter": "custom",
+                }},
+                "loggers": {"vllm_rbln": {
+                    "handlers": [name], "level": "INFO", "propagate": False,
+                }},
+            }))
+            output = io.StringIO()
+            with redirect_stdout(output):
+                configure_logging(LoggingConfig(
+                    configure_logging=True, pylogging_config_file=str(custom_path),
+                ))
+                persistent_path = Path(sys.argv[1]) / f"{name}.log"
+                persistent = make_file_handler(str(persistent_path))
+                root.addHandler(persistent)
+                logger.info("custom marker")
+                assert output.getvalue().strip() == "[custom] custom marker"
+                output.seek(0)
+                output.truncate()
+                configure_logging(LoggingConfig(
+                    configure_logging=True, log_level="INFO",
+                ))
+                logger.info("transition marker")
+            text = re.sub(r"\x1b\[[0-9;]*m", "", output.getvalue())
+            assert text.count("transition marker") == 1, text
+            assert text.startswith("[vllm-rbln] "), text
+            assert persistent in root.handlers
+            assert "transition marker" in persistent_path.read_text()
+            root.removeHandler(persistent)
+            persistent.close()
+        """,
+        bootstrap_logging,
+        color,
+    )
 
 
 class TestPlatformIdentity:
@@ -214,14 +443,6 @@ class TestRejectedConfigs:
         ):
             _build(block_size=16384, max_num_batched_tokens=16385)
 
-    def test_v2_model_runner(self, monkeypatch, reconfigure):
-        # The refusal reads VllmConfig.use_v2_model_runner, and how upstream
-        # resolves that from the env or from a feature that forces V2 is its
-        # own business. Set the property it reads, not the env behind it.
-        monkeypatch.setattr(VllmConfig, "use_v2_model_runner", True)
-        with pytest.raises(ValueError, match="VLLM_USE_V2_MODEL_RUNNER"):
-            reconfigure(lambda config: None)
-
     def test_an_explicit_dynamic_kv_on_an_unsizable_config(self, reconfigure):
         def custom_kernel(dynamic):
             def mutate(config):
@@ -237,6 +458,28 @@ class TestRejectedConfigs:
     def test_lora(self, reconfigure):
         with pytest.raises(ValueError, match="LoRA"):
             reconfigure(lambda config: setattr(config, "lora_config", object()))
+
+    def test_msa_models_need_bfloat16(self, reconfigure):
+        def msa(dtype):
+            def mutate(config):
+                config.model_config.hf_text_config.sparse_attention_config = {
+                    "sparse_attention_freq": [0, 1]
+                }
+                config.model_config.dtype = dtype
+
+            return mutate
+
+        for dtype in (torch.float16, torch.float32):
+            with pytest.raises(ValueError, match="bfloat16 only"):
+                reconfigure(msa(dtype))
+        reconfigure(msa(torch.bfloat16))
+
+    def test_mrope_models_are_rejected(self, reconfigure, monkeypatch):
+        from vllm.config import ModelConfig
+
+        monkeypatch.setattr(ModelConfig, "uses_mrope", property(lambda self: True))
+        with pytest.raises(ValueError, match="M-RoPE"):
+            reconfigure(lambda config: None)
 
     def test_chunked_prefill_off(self, reconfigure):
         with pytest.raises(ValueError, match="chunked prefill"):
@@ -396,6 +639,38 @@ class TestCompileDtype:
 
 
 class TestWorkerAndScheduler:
+    @pytest.mark.parametrize("selection", [None, "0", "1"])
+    def test_runner_selection_ignores_upstream_env(self, monkeypatch, selection):
+        import vllm.config.vllm as upstream_config
+
+        monkeypatch.setattr(upstream_config, "HAS_TRITON", True)
+        if selection is None:
+            monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
+        else:
+            monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", selection)
+        with patch.object(platform.logger, "warning_once") as warning:
+            config = _build()
+            assert config.use_v2_model_runner is False
+        assert config.parallel_config.worker_cls == (
+            "vllm_rbln.v1.worker.rbln_worker.RBLNWorker"
+        )
+        assert os.environ.get("VLLM_USE_V2_MODEL_RUNNER") == selection
+        assert warning.called is (selection != "0")
+        if warning.called:
+            assert "V2 selection is ignored" in warning.call_args.args[0]
+
+    def test_v2_scoring_is_rejected(self, monkeypatch):
+        from vllm.exceptions import VLLMValidationError
+        from vllm.sampling_params import SamplingParams
+        from vllm.v1.engine.input_processor import InputProcessor
+
+        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+        processor = InputProcessor(_build())
+        with pytest.raises(VLLMValidationError, match="requires the V2 model runner"):
+            processor._validate_params(
+                SamplingParams(prompt_logprob_token_ids=[1]), ("generate",)
+            )
+
     def test_auto_worker_becomes_the_rbln_worker(self, configured):
         assert (
             configured.parallel_config.worker_cls
@@ -1153,13 +1428,7 @@ class TestModelImpl:
             )
         assert os.environ[platform.envs.RESOLVED_MODEL_IMPL_ENV] == _UNTOUCHED
 
-    def test_the_modules_that_copy_the_device_flag_import_late(self):
-        """They bind USE_DEVICE_TENSOR at their own import.
-
-        That is only correct while none of them is imported before the path is
-        resolved, so the platform module is the only one _apply_model_impl has
-        to reach. A new early import here would silently pin a stale value.
-        """
+    def test_register_ops_applies_no_patch_before_the_path_is_resolved(self):
         import subprocess
         import sys
 
@@ -1170,10 +1439,7 @@ class TestModelImpl:
             "vllm_rbln.register_model();"
             "vllm_rbln.register_ops();"
             "applied = sys.modules.get('vllm_rbln.patches.registry');"
-            "print(applied and applied._applied_patch_keys,"
-            " [m for m in sys.modules if m in COPIERS])".replace(
-                "COPIERS", repr(_DEVICE_FLAG_COPIERS)
-            )
+            "print(applied and applied._applied_patch_keys)"
         )
         out = subprocess.run(
             [sys.executable, "-c", probe],
@@ -1187,6 +1453,31 @@ class TestModelImpl:
             },
         )
         assert out.returncode == 0, out.stderr[-2000:]
-        # "None []": the registry was never imported, so nothing was applied and
-        # no module bound a stale USE_DEVICE_TENSOR.
-        assert out.stdout.strip().endswith("None []"), out.stdout
+        assert out.stdout.strip().endswith("None"), out.stdout
+
+    def test_a_module_imported_before_resolution_reads_the_resolved_flag(self):
+        import subprocess
+        import sys
+
+        probe = (
+            "import importlib, sys;"
+            "from vllm.platforms import current_platform;"
+            "from vllm_rbln import platform;"
+            "mods = [importlib.import_module(m) for m in sorted(READERS)];"
+            "platform._apply_model_impl('vllm');"
+            "print(platform.USE_DEVICE_TENSOR,"
+            " [m.__name__ for m in mods if hasattr(m, 'USE_DEVICE_TENSOR')])"
+        ).replace("READERS", repr(_DEVICE_FLAG_READERS))
+        out = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env={
+                k: v
+                for k, v in os.environ.items()
+                if not k.startswith("VLLM_RBLN")
+                and k != platform.envs.RESOLVED_MODEL_IMPL_ENV
+            },
+        )
+        assert out.returncode == 0, out.stderr[-2000:]
+        assert out.stdout.strip().endswith("True []"), out.stdout

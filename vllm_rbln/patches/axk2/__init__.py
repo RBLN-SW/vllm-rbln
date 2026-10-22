@@ -7,6 +7,7 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 #
 
+from vllm_rbln.patches.model_arch_config import register_mla_convertor
 from vllm_rbln.patches.registry import add_registration
 
 ARCH = "AXK2ForCausalLM"
@@ -44,39 +45,9 @@ def register_axk2() -> None:
 
     _CONFIG_REGISTRY[MODEL_TYPE] = AXK2Config
     ModelRegistry.register_model(ARCH, MODEL_CLASS_PATH)
+    # Upstream decides MLA-ness from a hardcoded model_type tuple; register the
+    # convertor that answers for this model instead of patching the base one.
+    register_mla_convertor(MODEL_TYPE)
 
-
-def _register_is_deepseek_mla_patch() -> None:
-    from vllm.transformers_utils.model_arch_config_convertor import (
-        ModelArchConfigConvertorBase,
-    )
-
-    from vllm_rbln.patches import register_patch
-
-    original = ModelArchConfigConvertorBase.is_deepseek_mla
-
-    @register_patch(
-        target=(
-            "vllm.transformers_utils.model_arch_config_convertor"
-            ".ModelArchConfigConvertorBase.is_deepseek_mla"
-        ),
-        reason=(
-            "axk2 is an MLA model but upstream decides MLA-ness from a hardcoded "
-            "model_type tuple that does not list it"
-        ),
-    )
-    def is_deepseek_mla(self) -> bool:
-        hf_text_config = self.hf_text_config
-        model_type = getattr(hf_text_config, "model_type", None)
-        if model_type == MODEL_TYPE:
-            return getattr(hf_text_config, "kv_lora_rank", None) is not None
-        if model_type == "eagle":
-            inner = getattr(hf_text_config, "model", None)
-            if getattr(inner, "model_type", None) == MODEL_TYPE:
-                return getattr(hf_text_config, "kv_lora_rank", None) is not None
-        return original(self)
-
-
-_register_is_deepseek_mla_patch()
 
 __all__ = ["ARCH", "MODEL_CLASS_PATH", "MODEL_TYPE"]

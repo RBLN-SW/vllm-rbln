@@ -33,7 +33,7 @@ from vllm_rbln.compilation import (
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.logger import init_logger
-from vllm_rbln.platform import USE_DEVICE_TENSOR
+from vllm_rbln.platform import use_device_tensor
 from vllm_rbln.v1.attention.kv_cache_bindings import (
     attach_kv_cache_bindings,
     build_kv_cache_forward_context_kwargs,
@@ -69,8 +69,6 @@ class RBLNEagleProposer(EagleProposer):
         super().__init__(vllm_config, torch.device("cpu"), runner)
         self.device = device
 
-        if self.supports_mm_inputs:
-            raise NotImplementedError
         if self.needs_extra_input_slots:
             raise NotImplementedError(
                 "vllm-rbln does not support EAGLE extra input slots required for "
@@ -129,6 +127,7 @@ class RBLNEagleProposer(EagleProposer):
                 is_prefill=is_prefill,
                 batch_pad=num_reqs_padded,
                 back_pad=self.runner.decode_back_pad,
+                is_prompt_sorted=self.runner.sort_batch_by_length,
             )
             attach_kv_cache_bindings(
                 attn_metadata,
@@ -243,6 +242,7 @@ class RBLNEagleProposer(EagleProposer):
                     positions=positions,
                     is_prefill=False,
                     batch_pad=num_reqs_padded,
+                    is_prompt_sorted=self.runner.sort_batch_by_length,
                 )
                 attach_kv_cache_bindings(
                     attn_metadata,
@@ -385,6 +385,10 @@ class RBLNEagleProposer(EagleProposer):
 
     def load_model(self, target_model: nn.Module) -> None:
         super().load_model(target_model)
+        if self.supports_mm_inputs:
+            raise NotImplementedError(
+                "vllm-rbln does not pass multimodal embeddings to the drafter yet."
+            )
 
         self.draft_id_to_target_id = getattr(self.model, "draft_id_to_target_id", None)
         if self.draft_id_to_target_id is not None:
@@ -455,8 +459,8 @@ class RBLNEagleProposer(EagleProposer):
                 dynamic=False,
                 fullgraph=True,
                 compile_context=self.runner.compile_context,
-                num_devices=rbln_config.num_devices_per_local_rank,
-                model_trace_method="export" if USE_DEVICE_TENSOR else "",
+                num_devices=1,
+                model_trace_method="export" if use_device_tensor() else "",
                 process_group_dict=build_process_group_dict(),
                 guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
                 runtime_holder=self.runner.runtime_holder,
@@ -539,6 +543,7 @@ class RBLNEagleProposer(EagleProposer):
                 positions=self.positions[:num_tokens],
                 is_prefill=is_prefill,
                 batch_pad=num_reqs_padded,
+                is_prompt_sorted=self.runner.sort_batch_by_length,
             )
             attach_kv_cache_bindings(
                 attn_metadata,
@@ -606,6 +611,7 @@ class RBLNEagleProposer(EagleProposer):
                 positions=self.positions[:num_reqs],
                 is_prefill=False,
                 batch_pad=num_reqs_padded,
+                is_prompt_sorted=self.runner.sort_batch_by_length,
             )
             attach_kv_cache_bindings(
                 attn_metadata,

@@ -26,7 +26,7 @@ from vllm_rbln.compilation import (
     create_compile_context,
 )
 from vllm_rbln.config import RBLNConfig
-from vllm_rbln.platform import USE_DEVICE_TENSOR
+from vllm_rbln.platform import use_device_tensor
 
 if TYPE_CHECKING:
     from rebel.compile_context import CompileContext
@@ -51,7 +51,7 @@ class RBLNMedusaProposer(MedusaProposer):
                 use_weight_sharing=True,
                 use_global_ctx=True,
             )
-            if not USE_DEVICE_TENSOR
+            if not use_device_tensor()
             else None
         )
 
@@ -72,8 +72,8 @@ class RBLNMedusaProposer(MedusaProposer):
                 dynamic=False,
                 fullgraph=True,
                 compile_context=self.compile_context,
-                num_devices=rbln_config.num_devices_per_local_rank,
-                model_trace_method="export" if USE_DEVICE_TENSOR else "",
+                num_devices=1,
+                model_trace_method="export" if use_device_tensor() else "",
                 process_group_dict=build_process_group_dict(),
                 guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
                 mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",

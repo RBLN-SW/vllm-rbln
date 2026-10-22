@@ -25,6 +25,7 @@ from typing import Any
 import torch
 from vllm.config import (
     CacheConfig,
+    KVEventsConfig,
     KVTransferConfig,
     ModelConfig,
     ParallelConfig,
@@ -136,9 +137,11 @@ def create_rbln_scheduler(
     *,
     model: str = "facebook/opt-125m",
     max_num_seqs: int = 16,
+    max_num_active_seqs: int | None = None,
     max_num_batched_tokens: int = 16,
     enable_chunked_prefill: bool = True,
     enable_prefix_caching: bool = False,
+    enable_kv_cache_events: bool = False,
     long_prefill_token_threshold: int = 0,
     num_blocks: int = 10000,
     block_size: int = 16,
@@ -160,6 +163,7 @@ def create_rbln_scheduler(
         max_model_len = max_num_batched_tokens
     scheduler_config = SchedulerConfig(
         max_num_seqs=max_num_seqs,
+        max_num_active_seqs=max_num_active_seqs,
         max_num_batched_tokens=max_num_batched_tokens,
         max_model_len=max_model_len,
         long_prefill_token_threshold=long_prefill_token_threshold,
@@ -196,6 +200,9 @@ def create_rbln_scheduler(
         parallel_config=ParallelConfig(pipeline_parallel_size=pipeline_parallel_size),
         speculative_config=speculative_config,
         kv_transfer_config=kv_transfer_config,
+        kv_events_config=KVEventsConfig(
+            enable_kv_cache_events=enable_kv_cache_events, publisher="null"
+        ),
         additional_config={
             # RBLNConfig takes a size above zero or nothing at all.
             **({"sub_block_size": sub_block_size} if sub_block_size else {}),

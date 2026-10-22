@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import contextlib
 import logging
 import time
 from collections.abc import Sequence
@@ -19,7 +18,6 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Any, NamedTuple, Union, cast
 
 import numpy as np
-import rebel
 import torch
 import torch.distributed
 import torch.nn as nn
@@ -34,7 +32,6 @@ from vllm.model_executor.models.interfaces_base import (
     is_pooling_model,
     is_text_generation_model,
 )
-from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
     BatchedTensorInputs,
     MultiModalFeatureSpec,
@@ -87,14 +84,20 @@ from vllm_rbln.model_executor.models.optimum.model_base import (
     RBLNOptimumDecoderMixin,
     RBLNOptimumMultimodalMixin,
 )
+from vllm_rbln.platform.optimum_impl import patch_upstream
 from vllm_rbln.utils.optimum.bucket import select_bucket_size
 from vllm_rbln.utils.optimum.predicates import is_qwen3_embedding, is_qwen3_reranker
 from vllm_rbln.utils.optimum.registry import get_rbln_model_info
 from vllm_rbln.v1.core.optimum_scheduler import RBLNSchedulerOutput
+from vllm_rbln.v1.metrics.performance import (
+    PerformanceContext,
+    Phase,
+    get_performance_context,
+    metrics_enabled,
+)
 from vllm_rbln.v1.sample import WARM_UP_CONFIGS, RBLNSampler
 from vllm_rbln.v1.sample.ops.top_k_top_p import TOP_P_CLAMP
 from vllm_rbln.v1.sample.rbln_logits_processor import build_rbln_logitsprocs
-from vllm_rbln.v1.worker.metrics import PerformanceTracker, collect_metrics
 from vllm_rbln.v1.worker.optimum_input_batch import RBLNInputBatch
 
 if TYPE_CHECKING:
@@ -112,7 +115,6 @@ class ExecuteModelState(NamedTuple):
 
     scheduler_output: "SchedulerOutput"
     logits: torch.Tensor
-    hidden_states: torch.Tensor
     is_prompt: bool
     ec_connector_output: "ECConnectorOutput | None" = None
 
@@ -121,6 +123,8 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
     input_batch: RBLNInputBatch
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+        patch_upstream()
+
         # Raises if the architecture has no optimum-rbln counterpart. Must run
         # before the remap below, which rewrites it to an optimum-rbln-internal
         # name. vLLM has already rejected anything it cannot resolve itself, so
@@ -174,14 +178,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         self.max_num_reqs = self.scheduler_config.max_num_seqs
         self.inputs_embeds_size = self.model_config.get_inputs_embeds_size()
 
-        # # Multi-modal data support
-        # # NOTE There is a bug in vLLM MM registry internally in v0.10.X.
-        # # As a workaround, VLLM_WORKER_MULTIPROC_METHOD should be set "spawn"
-        # # in case of multi-modal encoder-decoder models.
-        self.mm_registry = MULTIMODAL_REGISTRY
-        self.supports_mm_inputs = self.mm_registry.supports_multimodal_inputs(
-            model_config
-        )
+        self.supports_mm_inputs = model_config.supports_multimodal_inputs
 
         # Sampler
         rbln_config: OptimumRBLNConfig = vllm_config.additional_config
@@ -211,7 +208,6 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
 
         # # Request states.
         self.requests: dict[str, CachedRequestState] = {}
-        self.num_prompt_logprobs: dict[str, int] = {}
         # Input Batch
         # NOTE(Chen): Ideally, we should initialize the input batch inside
         # `initialize_kv_cache` based on the kv cache config. However, as in
@@ -283,9 +279,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                 "VLLM_COMPUTE_NANS_IN_LOGITS is not supported on the optimum "
                 "model path."
             )
-        if envs.VLLM_RBLN_METRICS:
-            self.model_performance_tracker = PerformanceTracker("MODEL")
-            self.sampler_performance_tracker = PerformanceTracker("SAMPLER")
+        self._metrics_ctx: PerformanceContext | None = None
 
         # Encoder output of every multimodal item by mm_hash, filled by
         # _execute_mm_encoder (or the EC connector) and read by
@@ -374,6 +368,10 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
+        metrics = None
+        if metrics_enabled():
+            metrics = get_performance_context(self)
+            metrics.start_pass()
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with record_function_or_nullcontext("rbln_model_runner: preprocess"):
             # with self.synchronize_input_prep():
@@ -392,6 +390,8 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                             0,
                             len(new_req.prompt_token_ids),
                         )
+                    if metrics is not None:
+                        metrics.end_pass()
                     return make_empty_encoder_model_runner_output(scheduler_output)
 
             if not num_scheduled_tokens:
@@ -404,6 +404,8 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                 if getattr(self.model, "attention_manager", None):
                     self.model.attention_manager.clear()
                 # Return empty ModelRunnerOutput if there's no work to do.
+                if metrics is not None:
+                    metrics.end_pass()
                 return EMPTY_MODEL_RUNNER_OUTPUT
 
             model_input, num_scheduled_tokens_np = self._prepare_inputs(
@@ -420,34 +422,27 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                 )
 
         with record_function_or_nullcontext("rbln_model_runner: forward"):
-            if hasattr(rebel, "capture_reports"):
-                capture_ctx = rebel.capture_reports()
-            else:
-                # use a dummy context manager that does nothing
-                capture_ctx = contextlib.nullcontext()
-            model_start_time = time.perf_counter()
-            with capture_ctx as model_reports:
-                hidden_states = self.model(model_input)
+            if metrics is not None:
+                metrics.mark_phase(
+                    Phase.PREFILL if model_input.is_prompt else Phase.DECODE
+                )
+                model_start_time = time.perf_counter()
+            hidden_states = self.model(model_input)
+            if metrics is not None:
+                metrics.add_graph_time(time.perf_counter() - model_start_time)
             if not model_input.is_prompt:
                 # The decode graph returns every row of the padded batch;
                 # keep the running requests' rows in running order.
                 hidden_states = hidden_states[model_input.batch_rows]
-            if envs.VLLM_RBLN_METRICS and self.model_performance_tracker is not None:
-                collect_metrics(
-                    self.model_performance_tracker,
-                    model_input.is_prompt,
-                    start_time=model_start_time,
-                    end_time=time.perf_counter(),
-                    reports=model_reports,
-                    token_count=0,
-                    # the performance of sampler doesn't depend on token count
-                )
 
         with record_function_or_nullcontext("rbln_model_runner: postprocess"):
             if self.is_pooling_model:
-                return self._pool(
+                output = self._pool(
                     hidden_states, num_scheduled_tokens, num_scheduled_tokens_np
                 )
+                if metrics is not None:
+                    metrics.end_pass()
+                return output
             # [batch_size, 1, vocab_size] -> [batch_size, vocab_size]
             hidden_states = hidden_states.squeeze(1)
             logits = self.model.compute_logits(hidden_states, None)
@@ -455,7 +450,6 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         self.execute_model_state = ExecuteModelState(
             scheduler_output=scheduler_output,
             logits=logits,
-            hidden_states=hidden_states,
             is_prompt=model_input.is_prompt,
             ec_connector_output=ec_connector_output,
         )
@@ -945,7 +939,6 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                 )
 
             self.requests.pop(req_id, None)
-            self.num_prompt_logprobs.pop(req_id, None)
 
             # Gemma3's attention manager still keeps per-request state the
             # model forward produces (attention mask, pad length); free it
@@ -1008,6 +1001,15 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             sampling_params = new_req_data.sampling_params
             pooling_params = new_req_data.pooling_params
 
+            if sampling_params and (
+                sampling_params.prompt_logprobs is not None
+                or sampling_params.prompt_logprob_token_ids is not None
+            ):
+                raise NotImplementedError(
+                    "prompt_logprobs, prompt_logprob_token_ids, and "
+                    "prompt_logprob_start are not supported on the optimum model path."
+                )
+
             if (
                 sampling_params
                 and sampling_params.sampling_type == SamplingType.RANDOM_SEED
@@ -1052,13 +1054,6 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             )
             self._init_mrope_positions(req_state)
             self.requests[req_id] = req_state
-
-            if sampling_params and sampling_params.prompt_logprobs is not None:
-                self.num_prompt_logprobs[req_id] = (
-                    self.input_batch.vocab_size
-                    if sampling_params.prompt_logprobs == -1
-                    else sampling_params.prompt_logprobs
-                )
 
             # Only relevant for models using XD-RoPE (e.g, HunYuan-VL)
             # if self.uses_xdrope_dim > 0:
@@ -1359,7 +1354,6 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             req_id_to_index=self.input_batch.req_id_to_index.copy(),
             sampled_token_ids=[],
             logprobs=None,
-            prompt_logprobs_dict={},
             pooler_output=pooler_output,
         )
 
@@ -1411,18 +1405,14 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
 
     def _bookkeeping_sync(
         self,
-        scheduler_output: "SchedulerOutput",
         sampler_output: SamplerOutput,
         logits: torch.Tensor | None,
-        hidden_states: torch.Tensor,
-        num_scheduled_tokens: int,
         use_padding: bool,
         spec_decode_metadata: SpecDecodeMetadata | None,
     ) -> tuple[
         dict[str, int],
         LogprobsLists | None,
         list[list[int]],
-        dict[str, LogprobsTensors | None],
         list[str],
         dict[str, int],
         list[int],
@@ -1488,17 +1478,10 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             req_state = self.requests[req_id]
             req_state.output_token_ids.extend(sampled_ids)
 
-        # Compute prompt logprobs if needed.
-        prompt_logprobs_dict = self._get_prompt_logprobs_dict(
-            hidden_states[:num_scheduled_tokens],
-            scheduler_output.num_scheduled_tokens,
-        )
-
         return (
             num_nans_in_logits,
             logprobs_lists,
             valid_sampled_token_ids,
-            prompt_logprobs_dict,
             req_ids_output_copy,
             req_id_to_index_output_copy,
             invalid_req_indices,
@@ -1590,7 +1573,6 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         (
             scheduler_output,
             logits,
-            hidden_states,
             is_prompt,
             ec_connector_output,
         ) = self.execute_model_state
@@ -1618,44 +1600,33 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                 padded_logits = logits.reshape(1, -1)
             else:
                 padded_logits = logits
-            sampler_start_time = time.perf_counter()
-            if hasattr(rebel, "capture_reports"):
-                capture_ctx = rebel.capture_reports()
-            else:
-                # use a dummy context manager that does nothing
-                capture_ctx = contextlib.nullcontext()
-            with capture_ctx as sampler_reports:
-                sampler_output = self._sample(padded_logits, spec_decode_metadata=None)
-            if envs.VLLM_RBLN_METRICS and self.sampler_performance_tracker is not None:
-                collect_metrics(
-                    self.sampler_performance_tracker,
-                    is_prompt,
-                    start_time=sampler_start_time,
-                    end_time=time.perf_counter(),
-                    reports=sampler_reports,
-                    token_count=0,
-                    # the performance of sampler doesn't depend on token count
-                )
+            metrics = self._metrics_ctx
+            if metrics is not None:
+                sampler_start_time = time.perf_counter()
+            sampler_output = self._sample(padded_logits, spec_decode_metadata=None)
+            if metrics is not None:
+                metrics.add_graph_time(time.perf_counter() - sampler_start_time)
         self.input_batch.prev_sampled_token_ids = None
 
         with record_function_or_nullcontext("rbln_model_runner: bookkeep"):
+            if metrics is not None:
+                bookkeeping_start_time = time.perf_counter()
             (
                 num_nans_in_logits,
                 logprobs_lists,
                 valid_sampled_token_ids,
-                prompt_logprobs_dict,
                 req_ids_output_copy,
                 req_id_to_index_output_copy,
                 invalid_req_indices,
             ) = self._bookkeeping_sync(
-                scheduler_output,
                 sampler_output,
                 logits,
-                hidden_states,
-                scheduler_output.total_num_scheduled_tokens,
                 use_padding,
                 spec_decode_metadata=None,
             )
+
+            if metrics is not None:
+                metrics.add_graph_time(time.perf_counter() - bookkeeping_start_time)
 
         with record_function_or_nullcontext("rbln_model_runner: ModelRunnerOutput"):
             output = ModelRunnerOutput(
@@ -1663,7 +1634,6 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                 req_id_to_index=req_id_to_index_output_copy,
                 sampled_token_ids=valid_sampled_token_ids,
                 logprobs=logprobs_lists,
-                prompt_logprobs_dict=prompt_logprobs_dict,
                 pooler_output=[],
                 # kv_connector_output=kv_connector_output,
                 ec_connector_output=(
@@ -1673,6 +1643,8 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             )
         # FIXME: enable async scheduling
         assert not self.use_async_scheduling
+        if metrics is not None:
+            metrics.end_pass()
         return output
 
     def _sample(
@@ -1689,110 +1661,6 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             logits=logits,
             sampling_metadata=sampling_metadata,
         )
-
-    def _get_prompt_logprobs_dict(
-        self,
-        hidden_states: torch.Tensor,
-        num_scheduled_tokens: dict[str, int],
-    ) -> dict[str, LogprobsTensors | None]:
-        num_prompt_logprobs_dict = self.num_prompt_logprobs
-        if not num_prompt_logprobs_dict:
-            return {}
-
-        prompt_logprobs_dict: dict[str, LogprobsTensors | None] = {}
-
-        # Since prompt logprobs are a rare feature, prioritize simple,
-        # maintainable loop over optimal performance.
-        completed_prefill_reqs = []
-        for req_id, num_prompt_logprobs in num_prompt_logprobs_dict.items():
-            num_tokens = num_scheduled_tokens.get(req_id)
-            if num_tokens is None:
-                # This can happen if the request was preempted in prefill stage.
-                continue
-
-            # Get metadata for this request.
-            request = self.requests[req_id]
-            if request.prompt_token_ids is None:
-                # Prompt logprobs is incompatible with prompt embeddings
-                continue
-
-            num_prompt_tokens = len(request.prompt_token_ids)
-            prompt_token_ids = torch.tensor(request.prompt_token_ids).to(
-                self.device, non_blocking=True
-            )
-
-            # Set up target LogprobsTensors object.
-            logprobs_tensors = request.in_progress_prompt_logprobs_cpu
-            if logprobs_tensors is None:
-                # Create empty logprobs CPU tensors for the entire prompt.
-                # If chunked, we'll copy in slice by slice.
-                logprobs_tensors = LogprobsTensors.empty_cpu(
-                    num_prompt_tokens - 1, num_prompt_logprobs + 1
-                )
-                request.in_progress_prompt_logprobs_cpu = logprobs_tensors
-
-            # Determine number of logits to retrieve.
-            start_idx = request.num_computed_tokens
-            start_tok = start_idx + 1
-            num_remaining_tokens = num_prompt_tokens - start_tok
-            if num_tokens <= num_remaining_tokens:
-                # This is a chunk, more tokens remain.
-                # In the == case, there are no more prompt logprobs to produce
-                # but we want to defer returning them to the next step where we
-                # have new generated tokens to return.
-                num_logits = num_tokens
-            else:
-                # This is the last chunk of prompt tokens to return.
-                num_logits = num_remaining_tokens
-                completed_prefill_reqs.append(req_id)
-                prompt_logprobs_dict[req_id] = logprobs_tensors
-
-            if num_logits <= 0:
-                # This can happen for the final chunk if we prefilled exactly
-                # (num_prompt_tokens - 1) tokens for this request in the prior
-                # step. There are no more prompt logprobs to produce.
-                continue
-
-            # Get the logits corresponding to this req's prompt tokens.
-            # If this is a partial request (i.e. chunked prefill),
-            # then there is prompt logprob generated for each index.
-            req_idx = self.input_batch.req_id_to_index[req_id]
-            offset = self.query_start_loc.np[req_idx].item()
-            prompt_hidden_states = hidden_states[offset : offset + num_logits]
-            logits = self.model.compute_logits(prompt_hidden_states)
-
-            # Get the "target" tokens for each index. For prompt at index i,
-            # the token at prompt index i+1 is the "sampled" token we want
-            # to gather the logprob for.
-            tgt_token_ids = prompt_token_ids[start_tok : start_tok + num_logits]
-
-            # Compute prompt logprobs.
-            logprobs = self.sampler.compute_logprobs(logits)
-            token_ids, logprobs, ranks = self.sampler.gather_logprobs(
-                logprobs, num_prompt_logprobs, tgt_token_ids
-            )
-
-            # Transfer GPU->CPU async.
-            chunk_slice = slice(start_idx, start_idx + num_logits)
-            logprobs_tensors.logprob_token_ids[chunk_slice].copy_(
-                token_ids, non_blocking=True
-            )
-            logprobs_tensors.logprobs[chunk_slice].copy_(logprobs, non_blocking=True)
-            logprobs_tensors.selected_token_ranks[chunk_slice].copy_(
-                ranks, non_blocking=True
-            )
-
-        # Remove requests that have completed prefill from the batch
-        # num_prompt_logprobs_dict.
-        for req_id in completed_prefill_reqs:
-            del num_prompt_logprobs_dict[req_id]
-            self.requests[req_id].in_progress_prompt_logprobs_cpu = None
-
-        # Must synchronize the non-blocking GPU->CPU transfers.
-        # if prompt_logprobs_dict:
-        #     self._sync_device()
-
-        return prompt_logprobs_dict
 
     def postprocess_sampler_output(
         self, sampler_output: SamplerOutput, num_reqs: int

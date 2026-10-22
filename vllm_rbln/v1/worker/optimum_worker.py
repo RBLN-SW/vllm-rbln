@@ -215,6 +215,8 @@ class RBLNOptimumWorker(WorkerBase):
             return nullcontext()
 
         self.profiler.step()
+        if not self.profiler.should_annotate:
+            return nullcontext()
 
         num_new = len(scheduler_output.scheduled_new_reqs)
         num_cached = len(scheduler_output.scheduled_cached_reqs.req_ids)
@@ -329,13 +331,15 @@ class RBLNOptimumWorker(WorkerBase):
     def pin_lora(self, lora_id: int) -> bool:
         raise RuntimeError("It is not required in vLLM RBLN.")
 
+    def discard(self, tags: tuple[str, ...]) -> None:
+        raise RuntimeError("Selective discard is not supported on RBLN.")
+
     def shutdown(self) -> None:
         logger.info("v1 optimum_worker shutdown called")
-        if envs.VLLM_RBLN_METRICS:
-            if self.model_runner.model_performance_tracker:
-                self.model_runner.model_performance_tracker.print_final_stats()
-            if self.model_runner.sampler_performance_tracker:
-                self.model_runner.sampler_performance_tracker.print_final_stats()
+        runner = getattr(self, "model_runner", None)
+        metrics = getattr(runner, "_metrics_ctx", None)
+        if metrics is not None:
+            metrics.print_stats()
         if self.profiler is not None:
             self.profiler.shutdown()
 

@@ -21,7 +21,7 @@ import torch
 from vllm.logger import init_logger
 
 from vllm_rbln import envs
-from vllm_rbln.platform import USE_DEVICE_TENSOR
+from vllm_rbln.platform import use_device_tensor
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -74,6 +74,28 @@ def _validate(vllm_config: "VllmConfig") -> None:
 
     if vllm_config.lora_config is not None:
         raise ValueError("LoRA is not supported on RBLN.")
+
+    if model_config.uses_mrope:
+        # The RBLN RoPE override covers `RotaryEmbedding` and takes
+        # `[batch, seq]` positions; `MRotaryEmbedding` is a sibling class with
+        # no RBLN forward, and its native one reads a 2-D tensor as `[3, N]`.
+        raise ValueError(
+            "M-RoPE models (e.g. the Qwen2-VL family) are not supported on the "
+            "RBLN vLLM path yet. Use the optimum path."
+        )
+
+    text_config = getattr(model_config, "hf_text_config", model_config.hf_config)
+    if (
+        getattr(text_config, "sparse_attention_config", None)
+        and model_config.dtype != torch.bfloat16
+    ):
+        # The MSA indexer kernel is instantiated in one dtype for the index
+        # queries, keys and key cache, and it is validated in bf16 (and KV8)
+        # only; the model's index-key cache is bf16 for that reason.
+        raise ValueError(
+            "MiniMax-M3 sparse attention (MSA) is supported in bfloat16 only on "
+            f"RBLN; got dtype={model_config.dtype}. Pass --dtype bfloat16."
+        )
 
     if rbln_config.compile_dtype:
         from vllm_rbln.compilation import check_dtype_option_supported
@@ -197,7 +219,7 @@ def _validate(vllm_config: "VllmConfig") -> None:
 
     # FIXME(jiwoo.park) This is a temporary workaround.
     if model_config.enforce_eager:
-        if not USE_DEVICE_TENSOR:
+        if not use_device_tensor():
             raise ValueError(
                 "enforce_eager=True requires VLLM_RBLN_USE_DEVICE_TENSOR=1. "
                 "Eager mode bypasses torch.compile, so ops must dispatch "

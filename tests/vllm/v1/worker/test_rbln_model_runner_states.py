@@ -15,10 +15,13 @@
 # _update_states on a real runner: the block table, the CPU token buffers and the
 # pipeline-parallel branches, none of which a bare stub can reach.
 
+from collections.abc import Iterable
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
+from vllm.v1.sample.logits_processor import AdapterLogitsProcessor
 
 import vllm_rbln.v1.worker.rbln_model_runner as mr
 from tests.vllm.v1.worker.utils import (
@@ -108,6 +111,160 @@ class TestBlockTableMaintenance:
         assert sorted(runner.input_batch.req_id_to_index.values()) == [0, 1]
         for req_id in ("a", "c"):
             assert block_table_matches_state(runner, req_id)
+
+
+class TestPromptRowReAdd:
+    def test_re_add_fills_the_row_from_the_first_prompt_array(
+        self, make_model_runner, monkeypatch
+    ):
+        # A decode evicted by a prefill-only step is re-added from the int32 array
+        # made on its first add, and a logits processor still keeps the prompt list.
+        _last_rank(monkeypatch)
+        runner = make_model_runner()
+        runner._update_states(schedule_new("a"))
+        prompt = runner.requests["a"].prompt_token_ids
+        array = runner.prompt_token_arrays["a"]
+        assert isinstance(array, np.ndarray) and array.dtype == np.int32
+        runner._update_states(make_scheduler_output(num_scheduled_tokens={}))
+        assert not is_in_batch(runner, "a")
+
+        handed_in: list[object] = []
+        add_request = runner.input_batch.add_request
+
+        def record_handed_in(request):
+            handed_in.append(request.prompt_token_ids)
+            return add_request(request)
+
+        class KeepsPrompt(AdapterLogitsProcessor):
+            # A per-request processor that takes the prompt, the way a user's does.
+            # The adapter holds that prompt for as long as the request runs.
+            def is_argmax_invariant(self):
+                return False
+
+            def new_req_logits_processor(self, params):
+                return lambda prompt_ids, output_ids, logits: logits
+
+        logitsproc = KeepsPrompt(runner.vllm_config, torch.device("cpu"), False)
+        runner.input_batch.logitsprocs.non_argmax_invariant.append(logitsproc)
+        monkeypatch.setattr(runner.input_batch, "add_request", record_handed_in)
+        runner._update_states(schedule_cached(req_ids=["a"], num_computed_tokens=[3]))
+
+        assert runner.prompt_token_arrays["a"] is array
+        assert len(handed_in) == 1 and handed_in[0] is array
+        assert runner.requests["a"].prompt_token_ids is prompt
+        req_index = runner.input_batch.req_id_to_index["a"]
+        assert logitsproc.req_info[req_index].args[0] is prompt
+        assert (
+            runner.input_batch.token_ids_cpu[req_index, : len(prompt)].tolist()
+            == prompt
+        )
+
+    def test_finished_request_drops_its_prompt_array(
+        self, make_model_runner, monkeypatch
+    ):
+        _last_rank(monkeypatch)
+        runner = make_model_runner()
+        runner._update_states(schedule_new("a"))
+        runner._update_states(make_scheduler_output(finished_req_ids={"a"}))
+        assert "a" not in runner.prompt_token_arrays
+
+    def test_re_add_leaves_the_array_nowhere_in_the_batch(
+        self, make_model_runner, monkeypatch
+    ):
+        # The array is only lent to add_request. If upstream starts keeping the
+        # prompt it is handed, the array would stay behind without any error.
+        _last_rank(monkeypatch)
+        runner = make_model_runner()
+        runner._update_states(schedule_new("a"))
+        array = runner.prompt_token_arrays["a"]
+        runner._update_states(make_scheduler_output(num_scheduled_tokens={}))
+        runner._update_states(schedule_cached(req_ids=["a"], num_computed_tokens=[3]))
+
+        seen: set[int] = set()
+        pending: list[tuple[object, int]] = [(runner.input_batch, 0)]
+        while pending:
+            obj, depth = pending.pop()
+            assert obj is not array
+            if (
+                depth == 3
+                or id(obj) in seen
+                or isinstance(obj, (np.ndarray, torch.Tensor))
+            ):
+                continue
+            seen.add(id(obj))
+            children: Iterable[object]
+            if isinstance(obj, dict):
+                children = obj.values()
+            elif isinstance(obj, (list, tuple, set)):
+                children = obj
+            else:
+                children = getattr(obj, "__dict__", {}).values()
+            pending.extend((child, depth + 1) for child in children)
+
+    def test_streaming_update_refills_the_row_from_the_grown_prompt(
+        self, make_model_runner, monkeypatch
+    ):
+        # Under the uni executor the scheduler extends this same list in place for
+        # a streaming update, so the list identity does not change.
+        _last_rank(monkeypatch)
+        runner = make_model_runner()
+        prompt = [1, 2, 3]
+        runner._update_states(schedule_new("a", prompt_token_ids=[prompt]))
+        prompt.extend([4, 5])
+        runner._update_states(schedule_new("a", prompt_token_ids=[prompt]))
+
+        req_index = runner.input_batch.req_id_to_index["a"]
+        assert runner.input_batch.num_prompt_tokens[req_index] == len(prompt)
+        assert (
+            runner.input_batch.token_ids_cpu[req_index, : len(prompt)].tolist()
+            == prompt
+        )
+
+
+class TestWritebackBeforeReAdd:
+    def test_evicted_decode_comes_back_with_its_sampled_token(
+        self, make_model_runner, monkeypatch
+    ):
+        # Async scheduling leaves a -1 for the token still being sampled. If a
+        # prefill-only step evicts the request first, only the writeback repairs
+        # its cached state, as all_token_ids no longer arrives; the re-add then
+        # rebuilds the row from that state.
+        _last_rank(monkeypatch)
+        runner = make_model_runner()
+        runner._update_states(schedule_new("a"))
+        state = runner.requests["a"]
+        n = state.num_prompt_tokens
+        state.output_token_ids.append(-1)
+        runner._pending_token_writeback.append((["a"], [[42]], {"a": n}))
+        runner._update_states(make_scheduler_output(num_scheduled_tokens={}))
+        assert not is_in_batch(runner, "a")
+
+        runner._apply_pending_token_writeback()
+        runner._update_states(
+            schedule_cached(
+                req_ids=["a"], num_computed_tokens=[n], num_output_tokens=[1]
+            )
+        )
+
+        req_index = runner.input_batch.req_id_to_index["a"]
+        assert runner.input_batch.token_ids_cpu[req_index, n] == 42
+
+
+class TestEncoderCache:
+    def test_only_scheduler_released_images_are_evicted(
+        self, make_model_runner, monkeypatch
+    ):
+        _last_rank(monkeypatch)
+        runner = make_model_runner()
+        retained = torch.ones(2, 4)
+        runner.encoder_cache.update(released=torch.zeros(2, 4), retained=retained)
+        step = make_scheduler_output()
+        step.free_encoder_mm_hashes = ["released"]
+
+        runner._update_states(step)
+
+        assert list(runner.encoder_cache) == ["retained"]
+        assert runner.encoder_cache["retained"] is retained
 
 
 class TestOutputTokenAlignment:

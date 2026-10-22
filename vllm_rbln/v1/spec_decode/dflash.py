@@ -42,7 +42,7 @@ import vllm_rbln.utils as rbln_utils
 from vllm_rbln.compilation import build_process_group_dict, compile
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.forward_context import set_forward_context
-from vllm_rbln.platform import USE_DEVICE_TENSOR
+from vllm_rbln.platform import use_device_tensor
 from vllm_rbln.v1.attention.kv_cache_bindings import (
     attach_kv_cache_bindings,
     attention_block_axis,
@@ -83,7 +83,7 @@ class RBLNDFlashProposer(DFlashProposer):
                 "write goes through an attention op that only exists as a "
                 "compiled kernel."
             )
-        if not USE_DEVICE_TENSOR:
+        if not use_device_tensor():
             # The cache is allocated on the meta device then, and the context
             # write is a host copy -- which meta accepts and discards.
             raise NotImplementedError(
@@ -296,8 +296,8 @@ class RBLNDFlashProposer(DFlashProposer):
             dynamic=False,
             fullgraph=True,
             compile_context=self.runner.compile_context,
-            num_devices=rbln_config.num_devices_per_local_rank,
-            model_trace_method="export" if USE_DEVICE_TENSOR else "",
+            num_devices=1,
+            model_trace_method="export" if use_device_tensor() else "",
             process_group_dict=build_process_group_dict(),
             guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
             runtime_holder=self.runner.runtime_holder,

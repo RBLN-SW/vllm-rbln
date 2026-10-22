@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from concurrent.futures import Future
+from unittest.mock import Mock
 
 import pytest
 from vllm.v1.request import RequestStatus
@@ -41,6 +43,42 @@ def test_finish_request():
         assert len(scheduler.waiting) == 9 - i
 
 
+@pytest.mark.parametrize("policy", ["fcfs", "priority"])
+@pytest.mark.parametrize("abort", [False, True])
+def test_blocked_request_requeued_until_grammar_ready(policy, abort):
+    scheduler = create_scheduler(policy=policy)
+    blocked, ready = create_requests(
+        num_requests=2, sample_json_schema='{"type":"object"}'
+    )
+    grammar: Future[Mock] = Future()
+    blocked.structured_output_request.grammar = grammar
+    ready.status = RequestStatus.WAITING
+    ready.structured_output_request = None
+    for request in (blocked, ready):
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    assert [req.req_id for req in output.scheduled_new_reqs] == [ready.request_id]
+    assert scheduler.get_request_counts() == (1, 1)
+    assert list(scheduler.waiting) == [blocked]
+    assert scheduler.deferred_waiting == {blocked}
+    stats = scheduler.make_stats()
+    assert stats.num_waiting_reqs == 0
+    assert stats.num_skipped_waiting_reqs == 1
+
+    if abort:
+        scheduler.finish_requests(blocked.request_id, RequestStatus.FINISHED_ABORTED)
+        assert scheduler.get_request_counts() == (1, 0)
+        assert blocked.request_id not in scheduler.requests
+    else:
+        grammar.set_result(Mock())
+        output = scheduler.schedule()
+        assert [req.req_id for req in output.scheduled_new_reqs] == [blocked.request_id]
+        assert output.cache_slot_id_dict == {blocked.request_id: 1}
+        assert scheduler.get_request_counts() == (2, 0)
+    assert not scheduler.deferred_waiting
+
+
 def test_get_num_unfinished_requests():
     scheduler = create_scheduler()
     requests = create_requests(num_requests=10)
@@ -50,6 +88,34 @@ def test_get_num_unfinished_requests():
     for i, request in enumerate(requests):
         scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_STOPPED)
         assert scheduler.get_num_unfinished_requests() == len(requests) - i - 1
+
+
+@pytest.mark.parametrize("active_cap", [1, 2, None])
+def test_active_request_limit_preserves_capacity_and_admits_waiting_requests(
+    active_cap,
+):
+    scheduler = create_scheduler(
+        max_num_seqs=4, max_num_active_seqs=active_cap, num_blocks=32
+    )
+    requests = create_requests(num_requests=5, max_tokens=2)
+    for request in requests:
+        scheduler.add_request(request)
+
+    expected_cap = active_cap if active_cap is not None else 4
+    peak = 0
+    for _ in range(20):
+        if not scheduler.get_num_unfinished_requests():
+            break
+        output = scheduler.schedule()
+        active = len(scheduler.running)
+        assert active <= expected_cap
+        peak = max(peak, active)
+        scheduler.update_from_output(output, create_model_runner_output(output))
+
+    assert peak == expected_cap
+    assert all(request.is_finished() for request in requests)
+    assert scheduler.max_num_running_reqs == 4
+    assert not scheduler._cache_slot_ids
 
 
 def test_schedule_single_seq():

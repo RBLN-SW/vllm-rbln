@@ -930,9 +930,8 @@ class TestEvictionHook:
 
 
 class TestKVEvents:
-    # An external router re-hashes the emitted token_ids in sub_block_size chunks
-    # from parent_block_hash and matches them against our block_hashes, so the
-    # payload must be exact. RBLN re-emits at sub_block granularity.
+    # Hashes use tagged keys, while event extra_keys keep the untagged format
+    # consumed by routers. RBLN emits both at sub-block granularity.
 
     R = BLOCK_SIZE // SUB_BLOCK_SIZE  # sub-blocks per block
 
@@ -994,6 +993,118 @@ class TestKVEvents:
             assert len(e.token_ids) == len(e.block_hashes) * e.block_size
             flat_tokens.extend(e.token_ids)
         assert flat_tokens == tokens
+
+    def test_remotely_loaded_blocks_are_announced_from_the_first(self):
+        # KV received over a connector is counted as computed before its blocks
+        # are cached, as RBLNScheduler does for WAITING_FOR_REMOTE_KVS; every full
+        # block it fills must still be announced, not only those after it.
+        manager = make_manager(8, 4, 10, enable_kv_cache_events=True)
+        tokens = list(range(2 * 8 + 4))
+        request = make_request("0", tokens, 8)
+        manager.allocate_slots(
+            request,
+            0,
+            num_external_computed_tokens=len(tokens),
+            delay_cache_blocks=True,
+        )
+        request.num_computed_tokens = len(tokens)
+        # The load finished: cache what arrived, then step back one token to
+        # sample, as _update_waiting_for_remote_kv does.
+        manager.cache_blocks(request, request.num_computed_tokens)
+        request.num_computed_tokens = len(tokens) - 1
+        manager.schedule_sub_block_indexing(request)
+        manager.do_pending_indexing()
+
+        flat_tokens = [t for e in self._stored(manager) for t in e.token_ids]
+        assert flat_tokens == tokens[: 2 * 8]
+
+    def test_remote_load_indexing_resumes_without_duplicate_events(self):
+        manager = make_manager(8, 4, 10, enable_kv_cache_events=True)
+        tokens = list(range(32))
+        request = make_request("0", tokens, 8)
+        assert (
+            manager.allocate_slots(
+                request, 0, num_external_computed_tokens=16, delay_cache_blocks=True
+            )
+            is not None
+        )
+        request.num_computed_tokens = 16
+        manager.cache_blocks(request, 16)
+        manager.schedule_sub_block_indexing(request)
+        manager.do_pending_indexing()
+        assert [t for e in self._stored(manager) for t in e.token_ids] == tokens[:16]
+
+        manager.schedule_sub_block_indexing(request)
+        manager.do_pending_indexing()
+        assert manager.take_events() == []
+
+        assert manager.allocate_slots(request, 8) is not None
+        request.num_computed_tokens = 24
+        manager.do_pending_indexing()
+        assert [t for e in self._stored(manager) for t in e.token_ids] == tokens[16:24]
+
+    def test_two_pending_steps_keep_remotely_loaded_prefix(self):
+        manager = make_manager(8, 4, 10, enable_kv_cache_events=True)
+        tokens = list(range(40))
+        request = make_request("0", tokens, 8)
+        assert (
+            manager.allocate_slots(
+                request, 0, num_external_computed_tokens=16, delay_cache_blocks=True
+            )
+            is not None
+        )
+        request.num_computed_tokens = 16
+        manager.cache_blocks(request, 16)
+        for _ in range(2):
+            assert manager.allocate_slots(request, 8) is not None
+            request.num_computed_tokens += 8
+
+        manager.do_pending_indexing()
+
+        assert [t for e in self._stored(manager) for t in e.token_ids] == tokens[:32]
+        manager.schedule_sub_block_indexing(request)
+        manager.do_pending_indexing()
+        assert manager.take_events() == []
+
+    def test_remote_load_progress_is_independent_per_group(self):
+        manager = RBLNKVCacheManager(
+            kv_cache_config=make_kv_cache_config(
+                [full_attention_spec(16), sliding_window_spec(8, 128)], 30
+            ),
+            max_model_len=128,
+            scheduler_block_size=16,
+            hash_block_size=8,
+            sub_block_size=4,
+            hash_fn=sha256,
+            enable_kv_cache_events=True,
+        )
+        tokens = list(range(48))
+        request = make_request("0", tokens, 8)
+        assert (
+            manager.allocate_slots(
+                request, 0, num_external_computed_tokens=32, delay_cache_blocks=True
+            )
+            is not None
+        )
+        request.num_computed_tokens = 32
+        manager.cache_blocks(request, 32)
+        manager.schedule_sub_block_indexing(request)
+        manager.do_pending_indexing()
+        expected, _, _ = SubBlockHasher(sha256, 4).hash_tokens(tokens, request)
+
+        for lo, hi in [(0, 32), (32, 48)]:
+            events = self._stored(manager)
+            assert {e.group_idx for e in events} == {0, 1}
+            for gid in range(2):
+                group_events = [e for e in events if e.group_idx == gid]
+                assert [t for e in group_events for t in e.token_ids] == tokens[lo:hi]
+                assert [h for e in group_events for h in e.block_hashes] == [
+                    maybe_convert_block_hash(h) for h in expected[lo // 4 : hi // 4]
+                ]
+            if hi == 32:
+                assert manager.allocate_slots(request, 16) is not None
+                request.num_computed_tokens = 48
+                manager.do_pending_indexing()
 
     def test_dedup_on_multi_turn_same_prefix(self):
         # A second request caching the same prefix skips already-indexed hashes
@@ -1119,9 +1230,19 @@ class TestKVEvents:
         assert len(removed) == 1
         assert removed[0].block_hashes == stored[0].block_hashes
 
-    def test_extra_keys_round_trip_multimodal(self):
-        # Re-hashing the emitted token_ids + extra_keys + parent_block_hash must
-        # reproduce the emitted block_hashes, with mm_idx advancing mid-chain.
+    def test_cache_salt_event_extra_keys_are_untagged(self):
+        manager = make_manager(8, 4, 10, enable_kv_cache_events=True)
+        req = make_request("salted", list(range(8)), 8, cache_salt="salt")
+        prefill_request(manager, req)
+        stored = self._stored(manager)
+        assert stored
+        event_extra_keys = []
+        for event in stored:
+            assert event.extra_keys is not None
+            event_extra_keys.extend(event.extra_keys)
+        assert event_extra_keys == [("salt",), None]
+
+    def test_multimodal_event_extra_keys_are_untagged(self):
         # Images at [0,4), [8,14), [16,20) over sub_block_size=4, block_size=8.
         mm_features = [
             MultiModalFeatureSpec(
@@ -1152,27 +1273,24 @@ class TestKVEvents:
         stored = self._stored(manager)
         assert stored
 
-        prev_bare_hash = None
+        previous_hash = None
+        event_extra_keys = []
         for e in stored:
-            expected_parent = (
-                maybe_convert_block_hash(prev_bare_hash)
-                if prev_bare_hash is not None
-                else None
-            )
-            assert e.parent_block_hash == expected_parent
+            assert e.parent_block_hash == previous_hash
             assert e.extra_keys is not None
             assert len(e.extra_keys) == len(e.block_hashes)
             assert len(e.token_ids) == len(e.block_hashes) * e.block_size
-            parent = prev_bare_hash
-            for i, emitted_hash in enumerate(e.block_hashes):
-                sub_tokens = e.token_ids[i * e.block_size : (i + 1) * e.block_size]
-                bare = hash_block_tokens(sha256, parent, sub_tokens, e.extra_keys[i])
-                assert maybe_convert_block_hash(bare) == emitted_hash
-                parent = bare
-            prev_bare_hash = parent
+            previous_hash = e.block_hashes[-1]
+            event_extra_keys.extend(e.extra_keys)
 
-        # The reconstructed chain matches what generate_block_hash_extra_keys
-        # produces for the same prompt (mm_idx threaded through event boundaries).
+        assert event_extra_keys == [
+            (("hash_img_a", 0), "sprinkle"),
+            None,
+            (("hash_img_b", 0),),
+            (("hash_img_b", -4),),
+            (("hash_img_c", 0),),
+        ]
+
         mm_idx = 0
         parent = None
         expected_chain: list = []
@@ -1192,9 +1310,7 @@ class TestKVEvents:
             flat_emitted.extend(e.block_hashes)
         assert flat_emitted == expected_chain[: len(flat_emitted)]
 
-    def test_extra_keys_round_trip_lora(self):
-        # LoRA + cache_salt: re-hashing the extras reproduces the emitted hash and
-        # the lora_id / lora_name fields surface on the event.
+    def test_lora_event_extra_keys_are_untagged(self):
         lora = LoRARequest(lora_name="sales_bot", lora_int_id=42, lora_path="/tmp/x")
         manager = make_manager(8, 4, 10, enable_kv_cache_events=True)
         req = make_request(
@@ -1203,17 +1319,17 @@ class TestKVEvents:
         prefill_request(manager, req)
         stored = self._stored(manager)
         assert stored
+        event_extra_keys = []
         for e in stored:
             assert e.lora_id == 42
             assert e.lora_name == "sales_bot"
             assert e.extra_keys is not None
-        parent = None
-        for e in stored:
-            for i, emitted_hash in enumerate(e.block_hashes):
-                sub_tokens = e.token_ids[i * e.block_size : (i + 1) * e.block_size]
-                bare = hash_block_tokens(sha256, parent, sub_tokens, e.extra_keys[i])
-                assert maybe_convert_block_hash(bare) == emitted_hash
-                parent = bare
+            event_extra_keys.extend(e.extra_keys)
+        assert event_extra_keys == [("sales_bot", "pepper"), ("sales_bot",)]
+        hashes, _, _ = _hasher().hash_tokens(req.all_token_ids, req)
+        assert [h for e in stored for h in e.block_hashes] == [
+            maybe_convert_block_hash(h) for h in hashes
+        ]
 
 
 class TestResetPrefixCache:

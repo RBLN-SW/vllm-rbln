@@ -35,7 +35,6 @@ if TYPE_CHECKING:
     VLLM_RBLN_SAMPLER: bool = True
     VLLM_RBLN_ENABLE_WARM_UP: bool = True
     VLLM_RBLN_METRICS: bool = False
-    VLLM_RBLN_METRICS_FILE: str = ""
     VLLM_RBLN_METRICS_DIR: str = ""
     VLLM_RBLN_NUMA: bool = True
 
@@ -216,10 +215,6 @@ environment_variables = {
     "VLLM_RBLN_METRICS": (
         lambda: os.environ.get("VLLM_RBLN_METRICS", "False").lower() in ("true", "1")
     ),
-    # Mirror the final performance report to this file (in addition to stdout).
-    # The worker pid is appended before the extension to keep TP/DP workers
-    # from clobbering each other. Empty disables file output.
-    "VLLM_RBLN_METRICS_FILE": lambda: os.environ.get("VLLM_RBLN_METRICS_FILE", ""),
     # Directory for per-worker JSON performance reports (empty disables).
     "VLLM_RBLN_METRICS_DIR": lambda: os.environ.get("VLLM_RBLN_METRICS_DIR", ""),
     # Enable NUMA-based CPU affinity binding for OpenMP threads
@@ -255,8 +250,10 @@ environment_variables = {
     # Experimental decoder boundaries for MiniMax-M2 and GPT-OSS.
     # Requires nested-region support in rebel-compiler; this does not emit loops.
     "VLLM_RBLN_NESTED_COMPILE_REGION": (
-        lambda: os.environ.get("VLLM_RBLN_NESTED_COMPILE_REGION", "False").lower()
-        in ("true", "1")
+        lambda: (
+            os.environ.get("VLLM_RBLN_NESTED_COMPILE_REGION", "False").lower()
+            in ("true", "1")
+        )
     ),
     # Build only the first N decoder layers and leave the rest as
     # `PPMissingLayer`, to cut compile time during bring-up. 0 disables the
@@ -287,10 +284,10 @@ environment_variables = {
         )
     ),
     # Disable only for debugging worker failures without terminating the worker.
-    "VLLM_RBLN_DISABLE_WORKER_FAIL_FAST": lambda: os.environ.get(
-        "VLLM_RBLN_DISABLE_WORKER_FAIL_FAST", "False"
-    ).lower()
-    in ("true", "1"),
+    "VLLM_RBLN_DISABLE_WORKER_FAIL_FAST": lambda: (
+        os.environ.get("VLLM_RBLN_DISABLE_WORKER_FAIL_FAST", "False").lower()
+        in ("true", "1")
+    ),
     # Auto port
     "VLLM_RBLN_AUTO_PORT": use_auto_port,
     # enforce model data type into fp32 not model_config.dtype
@@ -407,7 +404,6 @@ RBLN_NON_COMPILE_ENV = frozenset(
         "VLLM_RBLN_COMPILE_STRICT_MODE",
         "VLLM_RBLN_ENABLE_WARM_UP",
         "VLLM_RBLN_METRICS",
-        "VLLM_RBLN_METRICS_FILE",
         "VLLM_RBLN_METRICS_DIR",
         "VLLM_RBLN_NUMA",
         "VLLM_RBLN_COMPILE_ONLY",

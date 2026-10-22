@@ -39,32 +39,6 @@ uv pip install vllm-rbln --extra-index-url https://wheels.vllm.ai/0.30.0/cpu --t
 pip install vllm-rbln --extra-index-url https://wheels.vllm.ai/0.30.0/cpu --extra-index-url https://download.pytorch.org/whl/cpu
 ```
 
-> **⚠️ Installing on Ubuntu 22.04 or Enterprise Linux 9**
->
-> If installation fails with an error like the following, use the installation command below:
->
-> ```text
-> vllm==0.30.0+cpu has no wheels with a matching platform tag
-> (e.g., `manylinux_2_35_x86_64`)
->
-> hint: Wheels are available for `vllm` (v0.30.0+cpu) on the following platforms:
-> `manylinux_2_39_aarch64`, `manylinux_2_39_x86_64`
-> ```
->
-> This error means that the upstream vLLM CPU wheel requires a newer glibc version than your system provides.
-> The wheel requires glibc 2.39 or later and libstdc++ from GCC 14 or later (`CXXABI_1.3.15`). Ubuntu 22.04 (glibc 2.35, GCC 12) and Enterprise Linux 9 (RHEL, AlmaLinux, and Rocky Linux 9.x; glibc 2.34, GCC 11) do not meet these requirements.
->
-> The following command uses `--find-links` to install a compatible vLLM wheel from the [vllm-rbln v0.12.0 release assets](https://github.com/RBLN-SW/vllm-rbln/releases/tag/v0.12.0):
->
-> ```bash
-> pip3 install \
->   --extra-index-url https://wheels.vllm.ai/0.30.0/cpu \
->   --extra-index-url https://pypi.rbln.ai/simple \
->   --extra-index-url https://download.pytorch.org/whl/cpu \
->   --find-links https://github.com/RBLN-SW/vllm-rbln/releases/expanded_assets/v0.12.0 \
->   "vllm-rbln[kv-connectors]==0.12.0"
-> ```
-
 #### Or from source
 
 ##### Using uv
@@ -81,14 +55,37 @@ cd vllm-rbln
 pip install -e . --extra-index-url https://wheels.vllm.ai/0.30.0/cpu --extra-index-url https://download.pytorch.org/whl/cpu
 ```
 
+#### ⚠️ Installing on Ubuntu 22.04 or Enterprise Linux 9
+
+If installation fails with an error like the following, add the option below to your installation command:
+
+```text
+vllm==0.30.0+cpu has no wheels with a matching platform tag
+(e.g., `manylinux_2_35_x86_64`)
+
+hint: Wheels are available for `vllm` (v0.30.0+cpu) on the following platforms:
+`manylinux_2_39_aarch64`, `manylinux_2_39_x86_64`
+```
+
+This error means that the upstream vLLM CPU wheel requires a newer glibc version than your system provides.
+The wheel requires glibc 2.39 or later and libstdc++ from GCC 14 or later (`CXXABI_1.3.15`). Ubuntu 22.04 (glibc 2.35, GCC 12) and Enterprise Linux 9 (RHEL, AlmaLinux, and Rocky Linux 9.x; glibc 2.34, GCC 11) do not meet these requirements.
+
+The `--find-links` option makes compatible vLLM wheels from the [vllm-rbln v0.12.0 release assets](https://github.com/RBLN-SW/vllm-rbln/releases/tag/v0.12.0) available to the installer:
+
+```text
+--find-links https://github.com/RBLN-SW/vllm-rbln/releases/expanded_assets/v0.12.0
+```
+
+When using `uv`, also add `--no-sources-package vllm` to allow installation of the compatible wheel.
+
 ### 🛠️ Development setup
 
 Building from source? See **[DEVELOPMENT.md](./DEVELOPMENT.md)** for the `uv` dev workflow.
 
 ### 📚 Documentation
 
-- [Overview & Supported Models](https://docs.rbln.ai/software/model_serving/vllm_support/vllm-rbln.html)
-- [API Tutorial](https://docs.rbln.ai/software/model_serving/vllm_support/tutorial/vllm_llama3-8b.html)
+- [Overview & Supported Models](https://docs.rbln.ai/latest/software/model_serving/vllm_support/index.html)
+- [Recipes](https://docs.rbln.ai/latest/software/model_serving/vllm_support/recipes/index.html)
 
 
 ## 🤝 Contributing
