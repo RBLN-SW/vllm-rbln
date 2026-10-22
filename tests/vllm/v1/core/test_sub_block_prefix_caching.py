@@ -16,6 +16,8 @@
 # ops into RBLNSchedulerOutput and releasing them, plus arbitration against a KV
 # connector. Matching itself is in test_rbln_kv_cache_manager.py.
 
+import random
+
 import pytest
 from vllm.v1.request import RequestStatus
 
@@ -319,3 +321,80 @@ class TestSubBlockMatchAgainstFullPool:
         # Admitted without the match: the donor's block is evicted for it.
         assert out.num_scheduled_tokens == {"1": BLOCK_SIZE}
         assert out.kv_cache_copy_ops == []
+
+
+class TestSubBlockSchedulingFuzz:
+    # Random workloads whose prompts share prefixes at sub-block granularity,
+    # on pools small enough that admissions often need every free block. Every
+    # request must finish, and every block must come back to the free queue.
+    STALL_LIMIT = 30
+    MAX_STEPS = 4000
+
+    @staticmethod
+    def _workload(rng, capacity):
+        bases = [[rng.randrange(50) for _ in range(capacity)] for _ in range(3)]
+        reqs = []
+        for i in range(rng.randrange(4, 14)):
+            max_tokens = rng.randrange(1, 12)
+            length = rng.randrange(SUB_BLOCK_SIZE + 1, capacity - max_tokens + 1)
+            shared = rng.randrange(length // SUB_BLOCK_SIZE + 1) * SUB_BLOCK_SIZE
+            tail = [rng.randrange(100, 1000) for _ in range(length - shared)]
+            prompt = rng.choice(bases)[:shared] + tail
+            reqs.append((rng.randrange(40), str(i), prompt, max_tokens))
+        return sorted(reqs)
+
+    @staticmethod
+    def _runner_output(sched, out, rng):
+        # A partial prefill samples nothing; only a complete prompt does.
+        output = make_model_runner_output(out)
+        output.sampled_token_ids = [
+            [rng.randrange(2000, 2008)]
+            if sched.requests[rid].num_computed_tokens >= sched.requests[rid].num_tokens
+            else []
+            for rid in output.req_ids
+        ]
+        return output
+
+    @pytest.mark.parametrize("seed", range(50))
+    def test_every_request_finishes_and_frees_its_blocks(self, seed):
+        rng = random.Random(seed)
+        num_blocks = rng.randrange(5, 14)
+        capacity = (num_blocks - 1) * BLOCK_SIZE
+        sched = create_rbln_scheduler(
+            enable_prefix_caching=True,
+            block_size=BLOCK_SIZE,
+            sub_block_size=SUB_BLOCK_SIZE,
+            max_num_batched_tokens=BLOCK_SIZE,
+            max_model_len=capacity,
+            num_blocks=num_blocks,
+            max_num_seqs=rng.choice([1, 2, 4]),
+        )
+        pool = sched.kv_cache_manager.block_pool
+        pending = self._workload(rng, capacity)
+        stall = 0
+        for step in range(self.MAX_STEPS):
+            while pending and pending[0][0] <= step:
+                _, rid, prompt, max_tokens = pending.pop(0)
+                sched.add_request(
+                    make_request(rid, prompt, BLOCK_SIZE, max_tokens=max_tokens)
+                )
+            if not pending and not sched.requests:
+                break
+            out = sched.schedule()
+            for op in out.kv_cache_copy_ops:
+                assert op.src_block_id != op.dst_block_id
+                assert 0 < op.num_tokens < BLOCK_SIZE
+            stall = 0 if out.num_scheduled_tokens or not sched.requests else stall + 1
+            assert stall < self.STALL_LIMIT, (
+                f"no progress: {len(sched.waiting)} waiting, "
+                f"{len(sched.running)} running, {pool.get_num_free_blocks()} free"
+            )
+            sched.update_from_output(out, self._runner_output(sched, out, rng))
+        else:
+            pytest.fail(f"not finished in {self.MAX_STEPS} steps")
+
+        # One more step releases the last copy ops.
+        out = sched.schedule()
+        sched.update_from_output(out, self._runner_output(sched, out, rng))
+        assert sched.kv_cache_manager.pending_copy_ops == []
+        assert pool.get_num_free_blocks() == num_blocks - 1
