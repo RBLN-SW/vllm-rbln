@@ -33,14 +33,24 @@ You can install this project using `pip` or from source.
 
 The vLLM CPU wheel depends on `triton` through a direct URL, which `uv` only accepts when the URL is also given as a constraint:
 
-```bash
-cat > constraints.txt <<'EOF'
-triton @ https://github.com/triton-lang/triton-cpu/releases/download/v3.8.0/triton-3.8.0+cpu-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl ; python_version == '3.10'
-triton @ https://github.com/triton-lang/triton-cpu/releases/download/v3.8.0/triton-3.8.0+cpu-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl ; python_version == '3.11'
-triton @ https://github.com/triton-lang/triton-cpu/releases/download/v3.8.0/triton-3.8.0+cpu-cp312-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl ; python_version >= '3.12'
-EOF
-uv pip install vllm-rbln -c constraints.txt --extra-index-url https://wheels.vllm.ai/0.31.0/cpu --torch-backend cpu
-```
+1. Create `constraints.txt` with the Triton CPU wheel URLs. Copy all three entries. uv automatically selects the one matching your Python version.
+
+   ```bash
+   cat > constraints.txt <<'EOF'
+   triton @ https://github.com/triton-lang/triton-cpu/releases/download/v3.8.0/triton-3.8.0+cpu-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl ; python_version == '3.10'
+   triton @ https://github.com/triton-lang/triton-cpu/releases/download/v3.8.0/triton-3.8.0+cpu-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl ; python_version == '3.11'
+   triton @ https://github.com/triton-lang/triton-cpu/releases/download/v3.8.0/triton-3.8.0+cpu-cp312-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl ; python_version >= '3.12'
+   EOF
+   ```
+
+2. Install `vllm-rbln` using the constraints file.
+
+   ```bash
+   uv pip install vllm-rbln \
+     -c constraints.txt \
+     --extra-index-url https://wheels.vllm.ai/0.31.0/cpu \
+     --torch-backend cpu
+   ```
 
 ##### Using pip
 ```bash
