@@ -483,6 +483,9 @@ class RBLNScheduler(Scheduler):
                     step_skipped_waiting.appendleft(request_to_skip)
 
             sub_block_match = None
+            # NOTE(RBLN): a request whose allocation failed with a sub-block
+            # match is retried once in this pass without one.
+            no_sub_block_req_id: str | None = None
 
             while token_budget > 0:
                 num_running = len(self.running) + self.num_waiting_for_streaming_input
@@ -577,7 +580,10 @@ class RBLNScheduler(Scheduler):
                         self.connector is not None
                         and request.status == RequestStatus.PREEMPTED
                     )
-                    if not resuming_with_connector:
+                    if (
+                        not resuming_with_connector
+                        and request_id != no_sub_block_req_id
+                    ):
                         sub_block_match, num_sub_block_tokens = (
                             self._try_sub_block_match(
                                 request,
@@ -757,6 +763,17 @@ class RBLNScheduler(Scheduler):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
+
+                    # NOTE(RBLN): the match touched its source block, which takes
+                    # it out of the free queue when no request holds it. Without
+                    # the match that block is evictable, so a request that needs
+                    # every free block fits only without it. Breaking here instead
+                    # repeats the same match and failure every step.
+                    if sub_block_match is not None:
+                        self.kv_cache_manager.release_sub_block_match(sub_block_match)
+                        sub_block_match = None
+                        no_sub_block_req_id = request_id
+                        continue
                     break
 
                 # NOTE(RBLN): Apply sub-block match now that blocks are

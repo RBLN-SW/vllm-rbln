@@ -281,3 +281,41 @@ class TestSubBlockIndexingUnderAsyncScheduling:
         out = self._sharer_schedule_after_donor_prefill(async_scheduling)
         assert len(out.kv_cache_copy_ops) == 1
         assert out.kv_cache_copy_ops[0].num_tokens == 8
+
+
+class TestSubBlockMatchAgainstFullPool:
+    # A match touches its source block before allocation. When no request holds
+    # that block, the touch takes it out of the free queue, so the match must
+    # not cost a request that needs every free block its admission.
+    NUM_BLOCKS = 10
+
+    def _scheduler_with_free_cached_block(self):
+        sched = create_rbln_scheduler(
+            enable_prefix_caching=True,
+            block_size=BLOCK_SIZE,
+            sub_block_size=SUB_BLOCK_SIZE,
+            max_num_batched_tokens=BLOCK_SIZE,
+            max_model_len=BLOCK_SIZE * self.NUM_BLOCKS,
+            num_blocks=self.NUM_BLOCKS,
+        )
+        # The donor finishes, so its block is free but still cached and indexed.
+        donor = make_request("0", list(range(BLOCK_SIZE)), BLOCK_SIZE, max_tokens=1)
+        sched.add_request(donor)
+        while sched.requests:
+            out = sched.schedule()
+            sched.update_from_output(out, make_model_runner_output(out, 0))
+        return sched
+
+    def test_request_needing_every_free_block_is_admitted(self):
+        sched = self._scheduler_with_free_cached_block()
+        pool = sched.kv_cache_manager.block_pool
+        num_tokens = pool.get_num_free_blocks() * BLOCK_SIZE
+        # The first two sub-blocks match the donor's block.
+        tokens = list(range(8)) + [900 + i for i in range(num_tokens - 8)]
+        sched.add_request(make_request("1", tokens, BLOCK_SIZE, max_tokens=1))
+
+        out = sched.schedule()
+
+        # Admitted without the match: the donor's block is evicted for it.
+        assert out.num_scheduled_tokens == {"1": BLOCK_SIZE}
+        assert out.kv_cache_copy_ops == []
