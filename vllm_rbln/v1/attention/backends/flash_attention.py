@@ -29,7 +29,11 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_b
 from vllm.v1.attention.backends.utils import (
     CommonAttentionMetadata,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec, SlidingWindowSpec
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    FullAttentionSpec,
+    SlidingWindowSpec,
+)
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
 if TYPE_CHECKING:
@@ -142,7 +146,7 @@ class RBLNFlashAttentionBackend(AttentionBackend):
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
-        return [32, 64, 80, 96, 128, 160, 192, 224, 256]
+        return [32, 64, 80, 96, 112, 128, 160, 192, 224, 256]
 
 
 @dataclass
@@ -213,9 +217,11 @@ class RBLNFlashAttentionMetadataBuilder(
         # coexist in one process.
         self.is_causal = not vllm_config.attention_config.use_non_causal
 
-        self.swa_appends = isinstance(
-            kv_cache_spec, SlidingWindowSpec
-        ) and not isinstance(kv_cache_spec, RBLNSlidingWindowSpec)
+        self.swa_appends = (
+            isinstance(kv_cache_spec, (SlidingWindowSpec, FullAttentionSpec))
+            and kv_cache_spec.sliding_window is not None
+            and not isinstance(kv_cache_spec, RBLNSlidingWindowSpec)
+        )
         if self.swa_appends and self.use_custom_kernel:
             raise NotImplementedError(
                 "Sliding window attention on REBEL CR13 is not supported with "
@@ -580,6 +586,8 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     attn_metadata.block_tables,
                     self.sliding_window,
                     self.sinks,
+                    is_causal=self.is_causal,
+                    attn_mask=attn_metadata.attn_masks,
                     is_prompt_sorted=attn_metadata.is_prompt_sorted,
                 )
             else:
@@ -762,7 +770,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
             attn_output = attn_output.view(
                 b_size, self.num_heads, q_len, self.head_size
             ).transpose(1, 2)
-            attn_output = attn_output.view(
+            attn_output = attn_output.reshape(
                 b_size * q_len, self.num_heads, self.head_size
             )
 

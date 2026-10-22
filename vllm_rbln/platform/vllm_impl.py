@@ -173,13 +173,13 @@ def _validate(vllm_config: "VllmConfig") -> None:
 
     if (
         vllm_config.speculative_config is not None
-        and vllm_config.speculative_config.method == "dflash"
+        and vllm_config.speculative_config.method in ("dflash", "dspark")
         and scheduler_config.max_num_scheduled_tokens
         != scheduler_config.max_num_batched_tokens
     ):
-        # DFlash reserves no slots (see patches/speculative_config.py),
-        # so the auto-computed budget is the whole of
-        # max_num_batched_tokens and any other value was set explicitly.
+        # DFlash reserves no slots, and DSpark drafts through it (see
+        # patches/speculative_config.py), so the auto-computed budget is the
+        # whole of max_num_batched_tokens and any other value was set explicitly.
         raise ValueError(
             "DFlash needs max_num_scheduled_tokens left auto-computed "
             f"(expected {scheduler_config.max_num_batched_tokens}, got "
