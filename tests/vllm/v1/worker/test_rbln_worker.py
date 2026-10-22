@@ -1072,6 +1072,9 @@ class TestEnsureRblnHostThreadsBeforeCompile:
         monkeypatch.setattr(
             wm, "set_omp_num_threads", lambda r, lr, n: captured.append(n)
         )
+        monkeypatch.setattr(
+            "vllm_rbln.v1.worker.utils.get_cgroup_cpu_quota", lambda: None
+        )
         # Neutralise the numba<->torch thread juggling (global-state side effect).
         monkeypatch.setattr(
             wm,
