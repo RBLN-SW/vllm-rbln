@@ -415,8 +415,14 @@ def _make_padded_weight_loader(native_shape, pad_fn, original_loader):
 #     The kernel below uses these PyTorch-native shapes directly.
 # ============================================================================
 
-import triton
-import triton.language as tl
+try:
+    import triton
+    import triton.language as tl
+except ImportError:
+    # RBLN images ship no upstream triton; the fused kernel below only runs on CUDA
+    # (AXK2GatedRMSNorm2), so rebel.triton is enough to define it at import time.
+    from rebel import triton
+    from rebel.triton import language as tl
 from typing import Optional, Tuple
 
 
