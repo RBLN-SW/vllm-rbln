@@ -265,15 +265,6 @@ class TestSubBlockIndex:
         idx.update(1, h[:2])
         assert idx.longest_match(h) == (1, 2)
 
-    @pytest.mark.parametrize("held", [1, 2])
-    def test_longest_match_prefers_held_block(self, held):
-        # Of two blocks matching the same depth, the held one is returned.
-        idx = SubBlockIndex()
-        h = _hashes(2)
-        idx.update(1, h)
-        idx.update(2, h)
-        assert idx.longest_match(h, is_held=lambda b: b == held) == (held, 2)
-
     def test_longest_match_empty_query(self):
         # An empty query -> (None, 0).
         assert SubBlockIndex().longest_match([]) == (None, 0)

@@ -232,11 +232,8 @@ class SubBlockIndex:
             best_depth = depth
         if best_blocks is None:
             return None, 0
-        if is_held is not None:
-            for block_id in best_blocks:
-                if is_held(block_id):
-                    return block_id, best_depth
-        return next(iter(best_blocks)), best_depth
+        held = (b for b in best_blocks if is_held is not None and is_held(b))
+        return next(held, next(iter(best_blocks))), best_depth
 
 
 # ---------------------------------------------------------------------------
