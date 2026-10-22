@@ -25,7 +25,7 @@ from vllm_rbln.model_executor.models.optimum.compilation import RBLNCompileSpec
     [(GptOssConfig, "GptOssForCausalLM"), (Qwen3Config, "Qwen3ForCausalLM")],
 )
 def test_decoder_region_model_selection(monkeypatch, enabled, config_cls, architecture):
-    monkeypatch.setenv("VLLM_RBLN_NESTED_COMPILE_REGION", str(int(enabled)))
+    monkeypatch.setenv("VLLM_RBLN_USE_NESTED_COMPILE_REGION", str(int(enabled)))
     config = config_cls(architectures=[architecture])
     spec = RBLNCompileSpec.for_architecture(
         config,
@@ -49,7 +49,7 @@ def test_decoder_region_model_selection(monkeypatch, enabled, config_cls, archit
     ],
 )
 def test_multimodal_decoder_option(monkeypatch, architecture, key):
-    monkeypatch.setenv("VLLM_RBLN_NESTED_COMPILE_REGION", "1")
+    monkeypatch.setenv("VLLM_RBLN_USE_NESTED_COMPILE_REGION", "1")
     config = PretrainedConfig(architectures=[architecture])
     spec = RBLNCompileSpec.for_architecture(
         config,
@@ -67,7 +67,7 @@ def test_multimodal_decoder_option(monkeypatch, architecture, key):
 
 
 def test_flag_conflicts_with_decoder_override(monkeypatch):
-    monkeypatch.setenv("VLLM_RBLN_NESTED_COMPILE_REGION", "1")
+    monkeypatch.setenv("VLLM_RBLN_USE_NESTED_COMPILE_REGION", "1")
     with pytest.raises(ValueError, match="nested_compile_region"):
         RBLNCompileSpec.for_architecture(
             Qwen3Config(architectures=["Qwen3ForCausalLM"]),

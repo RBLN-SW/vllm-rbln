@@ -150,7 +150,7 @@ class RBLNCompileSpec:
                 f"Compilation is not implemented for architecture {architectures[0]}"
             )
 
-        if envs.VLLM_RBLN_NESTED_COMPILE_REGION and (
+        if envs.VLLM_RBLN_USE_NESTED_COMPILE_REGION and (
             is_generation_arch(config) or is_multi_modal(config)
         ):
             decoder_config = spec.rbln_config

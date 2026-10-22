@@ -37,7 +37,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_METRICS: bool = False
     VLLM_RBLN_METRICS_DIR: str = ""
     VLLM_RBLN_NUMA: bool = True
-    VLLM_RBLN_NESTED_COMPILE_REGION: bool = False
+    VLLM_RBLN_USE_NESTED_COMPILE_REGION: bool = False
 
     # ====================================================================
     # Read only when VLLM_RBLN_USE_VLLM_MODEL=False
@@ -202,8 +202,8 @@ environment_variables = {
     # ====================================================================
     # Experimental decoder boundaries in both model paths.
     # Requires nested-region support in rebel-compiler; this does not emit loops.
-    "VLLM_RBLN_NESTED_COMPILE_REGION": (
-        lambda: os.environ.get("VLLM_RBLN_NESTED_COMPILE_REGION", "False").lower()
+    "VLLM_RBLN_USE_NESTED_COMPILE_REGION": (
+        lambda: os.environ.get("VLLM_RBLN_USE_NESTED_COMPILE_REGION", "False").lower()
         in ("true", "1")
     ),
     # Number of NPU devices per local rank (was VLLM_RBLN_TP_SIZE).
@@ -389,7 +389,7 @@ RBLN_COMPILE_ENV = frozenset(
     {
         "VLLM_RBLN_USE_VLLM_MODEL",
         "VLLM_RBLN_NUM_HIDDEN_LAYERS",
-        "VLLM_RBLN_NESTED_COMPILE_REGION",
+        "VLLM_RBLN_USE_NESTED_COMPILE_REGION",
         "VLLM_RBLN_USE_DEVICE_TENSOR",
     }
 )
