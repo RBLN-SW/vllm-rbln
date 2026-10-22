@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections import Counter
 from collections.abc import Iterable
 from typing import Any
 
@@ -32,6 +33,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
+    FullAttentionSpec,
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
@@ -41,12 +43,14 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
-    KVSplitAxis,
+    ChipletSplitAxis,
     RblnNixlAgentMetadata,
     rbln_compat_hash,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
+    AreaPlace,
     RblnNixlWorkerState,
+    RegionGeometry,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_transfer_topology import (
     RblnTransferTopology,
@@ -55,6 +59,14 @@ from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.worker.utils import canonical_kv_layers
 
 logger = init_logger(__name__)
+
+# Chiplets the compiler picks an attention op's shard mode for, and the lane
+# group a context-cut shard's columns have to tile. `_region_geometries`
+# mirrors the rule the pinned rebel-compiler applies to its packed-KV attention
+# ops; that rule is not an interface the compiler exports, so re-check it when
+# the pin moves.
+RSD_SHARDS = 4
+_LANES = 64
 
 
 class RblnNixlRegistrationMixin(RblnNixlWorkerState):
@@ -173,9 +185,11 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
             pcp_size=base_meta.pcp_size,
             pp_rank=pp_rank,
             pp_size=pp_size,
-            kv_areas=self._kv_areas,
-            kv_slices=self._kv_slices,
-            kv_split_axis=self._kv_split_axis,
+            kv_area_slices=[
+                [place.slice_id for place in geometry.areas]
+                for geometry in self._logical_region_geometry
+            ],
+            kv_split_axes=[geometry.axis for geometry in self._logical_region_geometry],
             kv_per_block=self._kv_per_block,
             # Zero where this shard holds no sliding-window group, and where its
             # groups disagree -- neither cuts a window range of its own. A peer
@@ -202,10 +216,9 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
 
     def _register_kv_caches_impl(self, kv_caches: dict[str, torch.Tensor]) -> None:
         """Direct variant of NixlConnectorWorker.register_kv_caches:
-        build the upstream topology, hand the logical K/V regions to
-        `nixl_rbln.register_kv_regions` (address translation, sharding,
-        MR reg), and feed the returned transfer tables into upstream's
-        transfer state.
+        build the upstream topology, lay each logical K/V region over the
+        chiplet areas its entry's storage is held in, register one MR per area,
+        and feed the resulting transfer tables into upstream's transfer state.
         """
         import nixl_rbln
 
@@ -277,14 +290,15 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
                 f"layer, got {sorted(page_sizes)}."
             )
 
-        # Logical K/V regions (entry_tensor, byte_offset, full_block_len)
-        # for nixl-rbln.
-        regions: list[tuple[Any, int, int]] = []
+        # Logical K/V regions (entry_tensor, layer_spec, byte_offset,
+        # full_block_len), which `_region_geometries` lays over the chiplet
+        # areas its entry's storage sits in.
+        regions: list[tuple[Any, Any, int, int]] = []
         # REPLICATE flag per logical region, expanded to the chiplet-expanded
-        # transfer table below (see _region_is_mla).
+        # transfer table (see `_region_is_mla`).
         logical_mla: list[bool] = []
-        # None where a region has no head axis to compare against, which the
-        # derivation below can never read as a non-head cut.
+        # This rank's share, not the model-wide band; None where the layer has
+        # no attention heads.
         logical_kv_heads: list[int | None] = []
         # How many logical regions each layer contributes, for the head bands.
         layer_regions: list[tuple[str, int]] = []
@@ -361,7 +375,9 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
                         f"layer {layer_name} region of {region_bytes}B is not "
                         f"{num_blocks} blocks of {full_block_len}B"
                     )
-                regions.append((cache_or_caches, region_offset, full_block_len))
+                regions.append(
+                    (cache_or_caches, layer_spec, region_offset, full_block_len)
+                )
                 logical_mla.append(is_mla_region)
                 logical_kv_heads.append(
                     layer_spec.num_kv_heads
@@ -371,49 +387,52 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
 
         rbln_ctx_ptr = rebel.context_of(sample_kv_cache).rbln_ctx_ptr
 
-        # Delegate sharding and MR registration to nixl-rbln. It registers
-        # one whole-entry MR per shard and returns the transfer tables
-        # (base addrs + block lens), already shard-expanded so upstream's
-        # connector's descriptor math is correct without this connector
-        # knowing the shard count.
-
-        xfer = nixl_rbln.register_kv_regions(
+        nixl_rbln.ensure_rbln_backend(
             self.nixl_wrapper,
-            regions,
             device_id,
-            mem=self.nixl_memory_type,
             rbln_ctx_ptr=rbln_ctx_ptr,
             **self._backend_extra,
         )
-        self.device_id = device_id
-        self.block_len_per_layer = list(xfer.block_lens)
-        # The adapter hands back one contiguous run of blocks per area, so a
-        # block's stride is its own length. Upstream keeps the two apart because
-        # a region can be a strided window into a larger tensor; on RBLN it
-        # never is, and the D2D descriptor builder already reads addresses as
-        # `base + block * block_len`.
-        self.block_stride_per_layer = list(xfer.block_lens)
-        self.kv_caches_base_addr[self.engine_id][self.tp_rank] = xfer.base_addrs
-        self._registered_descs.append(xfer.reg_handle)
-        assert len(self.block_len_per_layer) == len(xfer.base_addrs), (
-            f"RBLN NIXL: the adapter returned {len(xfer.base_addrs)} region "
-            f"address(es) for {len(self.block_len_per_layer)} block length(s); "
-            "every descriptor here is (address, length) by position"
+        geometries, area_descs = self._region_geometries(regions)
+        self._registered_descs.append(
+            self.nixl_wrapper.register_memory(
+                [(addr, size, device_id, "") for addr, size in area_descs],
+                mem_type=self.nixl_memory_type,
+                backends=["RBLN"],
+            )
         )
+        self.device_id = device_id
+        self._logical_region_geometry = geometries
+        places = [place for geometry in geometries for place in geometry.areas]
+        self.block_len_per_layer = [place.block_len for place in places]
+        # An area holds one contiguous run of blocks, so a block's stride is
+        # its own length. Upstream keeps the two apart because a region can be
+        # a strided window into a larger tensor; on RBLN it never is, and the
+        # D2D descriptor builder already reads addresses as
+        # `base + block * block_len`.
+        self.block_stride_per_layer = list(self.block_len_per_layer)
+        self.kv_caches_base_addr[self.engine_id][self.tp_rank] = [
+            place.device_addr for place in places
+        ]
+        # Transfer region `logical * areas + area` is one area of one logical
+        # region, which needs every entry over the same number of areas.
+        area_counts = {len(geometry.areas) for geometry in geometries}
+        if len(area_counts) != 1:
+            raise RuntimeError(
+                "RBLN NIXL (D2D): KV entries are laid over different chiplet "
+                f"area counts {sorted(area_counts)}; a transfer region is "
+                "numbered by one."
+            )
+        (areas,) = area_counts
+        self._kv_areas = areas
 
         # Upstream keys REPLICATE vs SPLIT off this list and indexes it 1:1 with
         # block_len_per_layer, which is chiplet-expanded here -- so the flags are
         # too, every area of a logical region carrying the same latent.
-        areas = max(xfer.n_shards, 1)
         self._region_is_mla = [is_mla for is_mla in logical_mla for _ in range(areas)]
-        assert len(self._region_is_mla) == len(self.block_len_per_layer), (
-            f"{len(logical_mla)} logical region(s) over {areas} area(s) do not "
-            f"account for {len(self.block_len_per_layer)} transfer region(s); "
-            "mislabelling one would silently pick the wrong descriptor layout."
-        )
         # vllm 0.30.0 added four per-region lists upstream builds while walking
-        # the caches. This path registers through the adapter instead, so they
-        # are filled here, in the same logical-major, area-minor order as
+        # the caches. This path registers the areas itself, so they are filled
+        # here, in the same logical-major, area-minor order as
         # `_region_is_mla`. Every RBLN region is one area of one layer's cache,
         # so they hold the whole block count and one memory type.
         self.region_names = [
@@ -428,14 +447,9 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         self.region_group_ids = [group_of[name] for name in self.region_names]
 
         self._logical_region_kv_heads = self._logical_head_bands(layer_regions)
-        # `slice_ids` is per area, and replicas of one slice share an id, so
-        # the DISTINCT ids over a region's areas are its own slice count.
-        self._logical_region_slices = [
-            len(set(xfer.slice_ids[r * areas : (r + 1) * areas]))
-            for r in range(len(logical_mla))
-        ]
+        self._logical_region_local_heads = list(logical_kv_heads)
 
-        self.num_regions = len(xfer.base_addrs)
+        self.num_regions = len(places)
         if self.topo.virtually_split_kv_in_blocks:
             # A Mamba state indexes its two regions separately, which doubles
             # the count -- except for key-only MLA regions, which have no second
@@ -447,47 +461,12 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
             )
         self.num_descs = self.num_regions * self.num_blocks
 
-        # Areas vs slices: see RblnNixlAgentMetadata. Held for the descriptor
-        # arithmetic and the region-pairing guard.
-        self._kv_areas = xfer.n_shards
-        self._kv_slices = xfer.slices
-        # Downstream divides by this.
-        assert self._kv_slices > 0, (
-            f"the plugin reported {self._kv_slices} logical slice(s) per shard"
-        )
-
-        # A rank's head axis of extent one cannot be cut, so the compiler
-        # replicates instead and more than one slice there has no other
-        # explanation. Above one head it is a head band: nothing here
-        # context-cuts a rank holding several, and the adapter's return could
-        # not say so anyway -- both cuts give the same length and slice count.
-        region_cut = [
-            (heads, self._logical_region_slices[r])
-            for r, heads in enumerate(logical_kv_heads)
-        ]
-        region_non_head = {heads == 1 and slices > 1 for heads, slices in region_cut}
-        if len(region_non_head) > 1:
-            raise RuntimeError(
-                "RBLN NIXL (D2D): this engine's KV regions were not all cut on "
-                "the same axis, which one advertised geometry cannot describe. "
-                f"(head count, distinct slice ids) per logical region: {region_cut}."
-            )
-        self._kv_split_axis = (
-            KVSplitAxis.NON_HEAD if region_non_head == {True} else KVSplitAxis.HEAD
-        )
-        # The cut is derived from a region holding one head, which is what
-        # makes a token range one run of its bytes. It says nothing about
-        # whether K and V share the block, so the two have to be asked
-        # separately.
-        if self._kv_split_axis is KVSplitAxis.NON_HEAD and self._kv_per_block > 1:
-            raise RuntimeError(
-                "RBLN NIXL (D2D): a context-cut KV cache whose block packs K "
-                "and V is not supported."
-            )
-        # Read here rather than in `__init__`: the runner binds the views this
-        # asks about while initializing the KV cache, which is after the
-        # connector exists.
-        self._swa_kernel_blocks = self._observe_swa_kernel_block()
+        # The spec carries `block_size` and `sliding_window`; which of the two
+        # the kernel addresses the cache in is a property of the compiled
+        # graph, and the view the runner handed over is the frame it reads.
+        self._swa_kernel_blocks = {
+            view[self.topo.kv_token_dim] for _, view in self._swa_group_views
+        }
         if self._shape.has_swa:
             logger.info(
                 "RBLN NIXL: the sliding-window kernel addresses this cache in "
@@ -516,44 +495,33 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         # there without naming which span holds the request's last token -- so
         # a block cut into several spans would send chunks past the request's
         # own blocks. A head cut leaves one span a block.
+        region_axes = [geometry.axis for geometry in geometries]
         if (
             self._shape.writes_part_of_a_block
             and self._own_engine_layout
-            and self._kv_split_axis is KVSplitAxis.NON_HEAD
+            and ChipletSplitAxis.TOKEN in region_axes
         ):
             raise RuntimeError(
                 f"RBLN NIXL (D2D): {cutter} on a sliding-window engine needs "
                 "a head cut, which leaves one token range a block. This cache "
-                f"is cut on the {self._kv_split_axis.name} axis into "
-                f"{self._kv_areas} area(s)."
+                f"is cut on the axes {[a.name for a in region_axes]} into "
+                f"{areas} area(s)."
             )
-        # On a context cut a region's position is what names the span its
-        # chunks belong to, so the areas have to be unreplicated and divide
-        # the block. A head cut gives every area every token, and reads no
-        # span out of a position at all.
-        if (
-            self._shape.writes_part_of_a_block
-            and self._kv_split_axis is KVSplitAxis.NON_HEAD
-            and not (
-                self._kv_areas == self._kv_slices
-                and self.block_size % self._kv_areas == 0
-            )
-        ):
-            raise RuntimeError(
-                "RBLN NIXL (D2D): cutting a block on a context-cut KV "
-                "cache needs unreplicated chiplet areas that divide the "
-                f"block. Got areas={self._kv_areas}, "
-                f"slices={self._kv_slices}, block_size={self.block_size}."
-            )
+        cut_on = Counter(axis.name for axis in region_axes)
+        slice_counts = sorted({geometry.slices for geometry in geometries})
         logger.info(
             "RBLN NIXL (D2D): registered %d transfer region(s) across %d chiplet "
-            "area(s), %d logical slice(s), cut on the %s axis%s.",
+            "area(s), %s logical slice(s), cut on the %s%s.",
             self.num_regions,
-            xfer.n_shards,
-            xfer.slices,
-            self._kv_split_axis.name,
-            " -- KV heads are replicated across chiplets"
-            if xfer.n_shards != xfer.slices
+            areas,
+            "/".join(map(str, slice_counts)),
+            f"{next(iter(cut_on))} axis"
+            if len(cut_on) == 1
+            else " and ".join(
+                f"{name} axis for {n} logical region(s)" for name, n in cut_on.items()
+            ),
+            " -- some chiplet areas hold replicas of a slice"
+            if slice_counts != [areas]
             else "",
         )
 
@@ -562,20 +530,22 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         # a transfer reads back, and they have to answer for the list it
         # selects in. The window range has no such parameter, so the builders
         # read the value parked here rather than ask twice.
-        self._chunk_grid = self._shard_chunk_grid(block_size=self.block_size, split=1)
+        self._chunk_grid = self._shard_chunk_grid(
+            range(self.num_regions), block_size=self.block_size, split=1
+        )
         self._window_grid_cut = self._window_grid()
-        if self._shape.chunk_mode and self._chunk_grid is None:
-            # Said once here rather than per peer: every list is cut by the
-            # same two numbers, and a peer whose block holds a different
-            # count is refused at the handshake.
+        # Said once here rather than per peer: every list counts a block in
+        # the same chunks, and a peer whose block holds a different count is
+        # refused at the handshake.
+        if self._shape.chunk_mode:
+            chunks_per_block = self._chunks_per_block(self._chunk_grid)
             logger.info(
-                "RBLN NIXL (D2D): chunk_mode registered no chunk range. A span "
-                "holds %d token(s) against a %d-token prefill step, and a chunk "
-                "is never narrower than a step; a grid is also refused where "
-                "the regions disagree on the head band.",
-                self.block_size // self._spans_per_block,
-                self.vllm_config.scheduler_config.max_num_batched_tokens,
+                "RBLN NIXL (D2D): chunk_mode on: %d-token chunks, %d a block.",
+                self.block_size // chunks_per_block,
+                chunks_per_block,
             )
+        else:
+            logger.info("RBLN NIXL (D2D): chunk_mode off.")
 
         self.device_kv_caches = kv_caches
         self.dst_num_blocks[self.engine_id] = self.num_blocks
@@ -624,6 +594,162 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         )
         # Republish with the chiplet geometry the region ledger cannot express.
         self._publish_handshake_metadata(agent_metadata)
+
+    def _region_geometries(
+        self, regions: list[tuple[torch.Tensor, Any, int, int]]
+    ) -> tuple[list[RegionGeometry], list[tuple[int, int]]]:
+        """Lay every logical region over the chiplet areas its storage sits in.
+
+        The device answers one buffer per chiplet and says nothing about how
+        they were cut, so the areas, their addresses and the slice count are
+        read while only the dim is derived -- from the predicate the attention
+        op picks its shard mode by, over every frame an op reads the storage
+        in. A storage is walked once: a layer's K and V, and the layers that
+        alias it, share its cut. Returns the geometries in `regions` order and
+        one (address, size) per distinct area, which is the memory-region list
+        only this walk knows.
+        """
+        import nixl_rbln
+
+        head_dim, token_dim = self.topo.kv_head_dim, self.topo.kv_token_dim
+        cuts: dict[int, tuple[ChipletSplitAxis, int, tuple[tuple[int, int], ...]]] = {}
+        areas: list[tuple[int, int]] = []
+        for entry, spec, _, _ in regions:
+            base_addr = entry.data_ptr()
+            if base_addr in cuts:
+                continue
+            shape = tuple(entry.shape)
+            if entry.storage_offset() != 0:
+                raise RuntimeError(
+                    f"RBLN NIXL (D2D): a KV entry of shape {shape} starts "
+                    f"{entry.storage_offset()} element(s) into its storage, "
+                    "whose areas are read from its first byte."
+                )
+            # The adapter's own call: it settles the entry on the device
+            # before asking, and names the rebel version that answers.
+            buffers = nixl_rbln.entry_areas(base_addr)
+            sizes = {buffer.size for buffer in buffers}
+            if len(sizes) != 1:
+                raise RuntimeError(
+                    f"RBLN NIXL (D2D): a KV entry of shape {shape} sits on "
+                    f"chiplet areas of {sorted(sizes)}B; a cut of it gives "
+                    "every area the same."
+                )
+            (area_size,) = sizes
+            shards = len(buffers)
+            if shards not in (1, RSD_SHARDS):
+                raise RuntimeError(
+                    f"RBLN NIXL (D2D): a KV entry of shape {shape} sits on "
+                    f"{shards} chiplet area(s), and the compiler picks its "
+                    f"shard mode for {RSD_SHARDS}, so which piece an area "
+                    "holds does not follow."
+                )
+            entry_bytes = entry.numel() * entry.element_size()
+            slices, remainder = divmod(entry_bytes, area_size)
+            if remainder or not slices or shards % slices:
+                raise RuntimeError(
+                    f"RBLN NIXL (D2D): a KV entry of {entry_bytes}B sits on "
+                    f"{shards} chiplet area(s) of {area_size}B, which do not "
+                    "cut it evenly."
+                )
+            axis, slice_ids = ChipletSplitAxis.HEAD, (0,) * shards
+            if slices > 1:
+                if not isinstance(spec, (FullAttentionSpec, SlidingWindowSpec)):
+                    raise RuntimeError(
+                        f"RBLN NIXL (D2D): a KV entry of shape {shape} is cut "
+                        f"into {slices} piece(s), and {type(spec).__name__} is "
+                        "not an op whose shard contract this path holds."
+                    )
+                # Every frame an op reads this storage in: the entry's own,
+                # then the window views the runner handed over. They share one
+                # cut, so they have to agree on the dim and on its length.
+                frames = [(shape, isinstance(spec, SlidingWindowSpec))] + [
+                    (view, True)
+                    for addr, view in self._swa_group_views
+                    if addr == base_addr and view != shape
+                ]
+                axes = set()
+                for frame, reads_a_window in frames:
+                    if head_dim is None:
+                        # A latent has no head to cut: CP is the op's only mode.
+                        axes.add(ChipletSplitAxis.TOKEN)
+                        continue
+                    heads, tokens = frame[head_dim], frame[token_dim]
+                    if reads_a_window:
+                        cols = tokens // shards
+                        cp_cuts = (
+                            bool(cols)
+                            and tokens % shards == 0
+                            and (cols % _LANES == 0 or _LANES % cols == 0)
+                        )
+                        can_tp = heads >= shards or not cp_cuts
+                    else:
+                        # The QK matmul carries its output channels in 64-wide
+                        # blocks, so a shard of the partition has to hold one.
+                        can_tp = heads >= shards or not tokens >= shards * _LANES
+                    axes.add(
+                        ChipletSplitAxis.HEAD if can_tp else ChipletSplitAxis.TOKEN
+                    )
+                if len(axes) != 1:
+                    raise RuntimeError(
+                        f"RBLN NIXL (D2D): the ops reading the storage of a KV "
+                        f"entry of shape {shape} cut it on "
+                        f"{'/'.join(sorted(a.name for a in axes))}, and the "
+                        f"frames they read it in are {[f for f, _ in frames]}."
+                    )
+                (axis,) = axes
+                dim = token_dim if axis is ChipletSplitAxis.TOKEN else head_dim
+                # A latent has no head dim, and that is the branch that forced
+                # TOKEN above, so a head cut here always has one.
+                assert dim is not None, "a head cut over a cache with no head dim"
+                lengths = {frame[dim] for frame, _ in frames}
+                if len(lengths) != 1:
+                    raise RuntimeError(
+                        f"RBLN NIXL (D2D): the frames {[f for f, _ in frames]} "
+                        f"an op reads the storage of a KV entry of shape "
+                        f"{shape} in hold {sorted(lengths)} on the cut dim "
+                        f"{dim}, so one cut of it does not name the same bytes "
+                        "in both."
+                    )
+                if shape[dim] % slices:
+                    raise RuntimeError(
+                        f"RBLN NIXL (D2D): a KV entry of shape {shape} is cut "
+                        f"into {slices} piece(s) on dim {dim}, which does not "
+                        f"tile its {shape[dim]} evenly."
+                    )
+                # The areas arrive in chiplet order, and a slice's copies sit
+                # side by side: a shard's nodes are a contiguous block of ids,
+                # which is the residency the compiler's mesh plan treats as
+                # aligned. That is its convention, not a contract it offers.
+                replicas = shards // slices
+                slice_ids = tuple(i // replicas for i in range(shards))
+            cuts[base_addr] = (
+                axis,
+                slices,
+                tuple(zip((buffer.device_addr for buffer in buffers), slice_ids)),
+            )
+            areas += [(buffer.device_addr, area_size) for buffer in buffers]
+
+        assert not {addr for addr, _ in self._swa_group_views} - cuts.keys(), (
+            "a sliding-window group reads a storage no registered KV entry "
+            "holds, although `canonical_kv_layers` keeps one layer per buffer"
+        )
+        geometries = []
+        for entry, _, offset, block_len in regions:
+            axis, slices, placed = cuts[entry.data_ptr()]
+            geometries.append(
+                RegionGeometry(
+                    axis,
+                    slices,
+                    tuple(
+                        AreaPlace(addr + offset // slices, block_len // slices, slice)
+                        for addr, slice in placed
+                    ),
+                )
+            )
+        # One MR per chiplet area: an area is an allocation of its own, so no
+        # MR can span two.
+        return geometries, list(dict.fromkeys(areas))
 
     def _unwrapped_layer_spec(self, layer_name: str) -> Any:
         """This layer's own spec.
@@ -728,6 +854,15 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         # The runner allocates from its own copy of the connector's config.
         missing = canonical - kv_caches.keys()
         assert not missing, f"Canonical layers missing from kv_caches: {missing}"
+        # Which view the sliding-window kernel reads a block in, taken before
+        # `canonical_kv_layers` drops the layer that names it. The registered
+        # entry is another view of the same storage.
+        self._swa_group_views = [
+            (kv_caches[name].data_ptr(), tuple(kv_caches[name].shape))
+            for group in self.kv_cache_config.transfer_groups
+            if isinstance(group.kv_cache_spec, SlidingWindowSpec)
+            for name in group.layer_names
+        ]
         # Preserve the caller's layer order: iterating the canonical set varies
         # with PYTHONHASHSEED and can mismatch the P/D region-to-layer mapping.
         kv_caches = {name: kv for name, kv in kv_caches.items() if name in canonical}
@@ -785,6 +920,14 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         self._logical_region_kv_heads = self._logical_head_bands(
             [(name, per_layer) for name in names]
         )
+        # A whole buffer a region: one area holding all of it.
+        self._logical_region_geometry = [
+            RegionGeometry(ChipletSplitAxis.HEAD, 1, (AreaPlace(base, length, 0),))
+            for base, length in zip(
+                self.kv_caches_base_addr[self.engine_id][self.tp_rank],
+                self.block_len_per_layer,
+            )
+        ]
         # Re-wrap upstream's published handshake metadata with this stage's PP
         # identity and chiplet geometry (no-op degrade for pp_size == 1).
         if self.xfer_handshake_metadata is not None:

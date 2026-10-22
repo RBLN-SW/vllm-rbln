@@ -11,4 +11,4 @@ section ":chart_with_upwards_trend: perf"
 # rather than there because only this side knows where the caller was.
 export PERF_OUTPUT_DIR="${PERF_OUTPUT_DIR:-${LANE_PWD}/perf-results}"
 
-uv run --no-sync python "${_here}/run_perf.py" "$@"
+uv run --no-sync python "${_here}/run_perf.py" run "$@"

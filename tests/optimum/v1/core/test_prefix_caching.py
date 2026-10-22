@@ -166,13 +166,13 @@ def test_prefix_cache_hit_same_prompt(
         pytest.param(
             31,
             1,
-            [0, 1, 2, -1],
+            [0, 1, 2, 0],
             id="decode_1_step_and_eviction",
         ),
         pytest.param(
             25,
             7,
-            [0, 1, 2, -1],
+            [0, 1, 2, 0],
             id="decode_7_steps_eviction",
         ),
     ],
@@ -308,7 +308,7 @@ def test_cache_hit_child_block(limited_6blocks_scheduler):
     output = limited_6blocks_scheduler.schedule()
     model_runner_output = create_model_runner_output(output)
     limited_6blocks_scheduler.update_from_output(output, model_runner_output)
-    answer = torch.tensor([4, 5, -1, -1], dtype=torch.int16)
+    answer = torch.tensor([4, 5, 0, 0], dtype=torch.int16)
     assert torch.allclose(output.block_table_dict[req4_id], answer)
     assert output.cached_block_table == [2, 3]
 
@@ -351,14 +351,14 @@ def test_allocated_blocks_excluded_from_cache_hit(limited_6blocks_scheduler):
     model_runner_output = create_model_runner_output(output)
     limited_6blocks_scheduler.update_from_output(output, model_runner_output)
     assert output.cached_block_table == []
-    assert output.block_table_dict[req0_id].tolist() == [0, 1, -1, -1]
+    assert output.block_table_dict[req0_id].tolist() == [0, 1, 0, 0]
 
     # Schedule req1 [2, 3]
     output = limited_6blocks_scheduler.schedule()
     model_runner_output = create_model_runner_output(output)
     limited_6blocks_scheduler.update_from_output(output, model_runner_output)
     assert output.cached_block_table == [0, 1]
-    assert output.block_table_dict[req1_id].tolist() == [2, 3, -1, -1]
+    assert output.block_table_dict[req1_id].tolist() == [2, 3, 0, 0]
 
     # Schedule req2 [4, 5]
     limited_6blocks_scheduler.finish_requests(req0_id, RequestStatus.FINISHED_ABORTED)
@@ -366,7 +366,7 @@ def test_allocated_blocks_excluded_from_cache_hit(limited_6blocks_scheduler):
     model_runner_output = create_model_runner_output(output)
     limited_6blocks_scheduler.update_from_output(output, model_runner_output)
     assert output.cached_block_table == [2, 3]
-    assert output.block_table_dict[req2_id].tolist() == [4, 5, -1, -1]
+    assert output.block_table_dict[req2_id].tolist() == [4, 5, 0, 0]
 
     # Finish Schedule req0, req1 and schedule req3 [0, 1]
     # 1. To get enough freed inner blocks
@@ -380,7 +380,7 @@ def test_allocated_blocks_excluded_from_cache_hit(limited_6blocks_scheduler):
     model_runner_output = create_model_runner_output(output)
     limited_6blocks_scheduler.update_from_output(output, model_runner_output)
     assert output.cached_block_table == [4, 5]
-    assert output.block_table_dict[req3_id].tolist() == [0, 1, -1, -1]
+    assert output.block_table_dict[req3_id].tolist() == [0, 1, 0, 0]
 
 
 def test_finish_request(scheduler):

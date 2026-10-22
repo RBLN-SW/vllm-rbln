@@ -38,7 +38,7 @@ from tests.vllm.distributed.kv_connector.utils import (
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl import metadata as md
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
     RBLN_NIXL_CONNECTOR_VERSION,
-    KVSplitAxis,
+    ChipletSplitAxis,
     RblnNixlAgentMetadata,
     RblnNixlConnectorMetadata,
     connector_option,
@@ -118,9 +118,10 @@ class TestRblnNixlAgentMetadata:
         m = _make()
         assert (m.pp_rank, m.pp_size) == (0, 1)
         assert m.registered_layer_names == []
-        assert (m.kv_areas, m.kv_slices) == (1, 1)
-        # The axis default is what the two counts above used to mean on their own.
-        assert m.kv_split_axis is KVSplitAxis.HEAD
+        # Every engine publishes one of each a logical region, host staging
+        # included, so empty is only what a peer that never sent them decodes to.
+        assert m.kv_area_slices == []
+        assert m.kv_split_axes == []
         # Separate K and V regions is what every version through 4 registered.
         assert m.kv_per_block == 1
 
@@ -145,24 +146,25 @@ class TestRblnNixlAgentMetadata:
         # A blob encoded with the RBLN type decodes cleanly as upstream's
         # ``NixlAgentMetadata`` (PP fields ignored) — backward compatible.
         enc = msgspec.msgpack.Encoder().encode(
-            _make(pp_rank=1, pp_size=2, kv_areas=4, kv_slices=2)
+            _make(pp_rank=1, pp_size=2, kv_area_slices=[[0, 0, 1, 1]] * 2)
         )
         base = msgspec.msgpack.Decoder(NixlAgentMetadata).decode(enc)
         assert base.engine_id == "engine-0"
         assert base.num_blocks == 64
         assert base.block_lens == [8192, 8192]
         assert not hasattr(base, "pp_rank")
-        assert not hasattr(base, "kv_areas")
+        assert not hasattr(base, "kv_area_slices")
 
     def test_roundtrip_preserves_chiplet_geometry(self):
         # The head axis rides the same blob as the layer axis. Replication is the
-        # case that matters: areas > slices has to survive, or the peer reads the
-        # byte arithmetic off the wrong divisor.
-        m = _make(kv_areas=4, kv_slices=2)
+        # case that matters: which areas copy which slice has to survive, or the
+        # peer pairs areas by an order it guessed. Interleaved here on purpose.
+        geometry = [[0, 1, 0, 1], [0, 0, 1, 1]]
+        m = _make(kv_area_slices=geometry)
         back = msgspec.msgpack.Decoder(RblnNixlAgentMetadata).decode(
             msgspec.msgpack.Encoder().encode(m)
         )
-        assert (back.kv_areas, back.kv_slices) == (4, 2)
+        assert back.kv_area_slices == geometry
 
     def test_registered_layer_names_order_preserved(self):
         names = [f"model.layers.{i}" for i in range(14, 28)]
@@ -181,15 +183,18 @@ class TestRblnNixlAgentMetadata:
         )
         assert back.kv_per_block == 2
 
-    def test_roundtrip_preserves_the_split_axis(self):
-        # The axis crosses the wire as an enum member, and it is the one field a
-        # peer cannot recompute from the rest -- decoding it as anything else
-        # would put a context cut back under the head-band arithmetic.
-        m = _make(kv_areas=4, kv_slices=4, kv_split_axis=KVSplitAxis.NON_HEAD)
+    def test_roundtrip_preserves_the_split_axes(self):
+        # The axes cross the wire as enum members, in region order: a slice id
+        # reads the same under either cut, so decoding an axis as anything else
+        # would put a context cut back under the head-band arithmetic. A target
+        # and its draft, cut differently.
+        axes = [ChipletSplitAxis.TOKEN, ChipletSplitAxis.HEAD]
+        m = _make(kv_area_slices=[[0, 1, 2, 3]] * 2, kv_split_axes=axes)
         back = msgspec.msgpack.Decoder(RblnNixlAgentMetadata).decode(
             msgspec.msgpack.Encoder().encode(m)
         )
-        assert back.kv_split_axis is KVSplitAxis.NON_HEAD
+        assert back.kv_split_axes == axes
+        assert all(isinstance(a, ChipletSplitAxis) for a in back.kv_split_axes)
 
 
 class TestRblnCompatHash:
