@@ -242,6 +242,21 @@ class TestSelectKvInputGroups:
         assert [len(specs) for specs, _ in groups] == [2, 1]
         assert [program.name for _, program in groups] == ["0/0", "1/0"]
 
+    def test_a_renamed_symbol_is_still_the_same_tensor(self):
+        s40 = ("symbol", "s40")
+        renamed = _placement(
+            [2, s40, 8, 1, 1024, 128],
+            [
+                _shard(1, 0, [2, s40, 4, 1, 1024, 128]),
+                _shard(0, 0, [2, s40, 4, 1, 1024, 128]),
+            ],
+        )
+        prefill = _program([HEAD_SHARDED, HEAD_SHARDED], name="0/0")
+        decode = _program([renamed, renamed], name="0/1")
+        drafter = _program([HEAD_SHARDED], name="1/0")
+        groups = select_kv_input_groups([prefill, decode, drafter])
+        assert [program.name for _, program in groups] == ["0/0", "1/0"]
+
     def test_the_same_tensors_placed_two_ways_are_refused(self):
         with pytest.raises(RuntimeError, match="disagree"):
             select_kv_input_groups([_program([HEAD_SHARDED]), _program([REPLICATED])])
