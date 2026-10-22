@@ -280,7 +280,7 @@ def measured_pipeline(
             template
             | {
                 "label": " / ".join(case),
-                "key": f"{prefix}-{'-'.join(case)}",
+                "key": f"{prefix}-{'-'.join(case)}".replace(".", "_"),
                 "resources": {
                     "npu": {
                         "count": devices_needed(serve, target_env(target)),
