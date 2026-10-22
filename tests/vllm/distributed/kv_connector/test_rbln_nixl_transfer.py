@@ -415,9 +415,12 @@ class TestTailChunks:
 
         assert w._tail_chunks(3, num_valid_tokens, chunk_grid=grid) == expected
 
-    def test_chunk_mode_being_off_keeps_every_chunk(self, monkeypatch):
-        # The same input the table answers 1 for.
+    @pytest.mark.parametrize("streams", [False, True])
+    def test_chunk_mode_being_off_keeps_every_chunk(self, monkeypatch, streams):
+        # The same input the table answers 1 for. A streamed write cuts no
+        # block either: it sends the last one whole at the handover.
         w = self._worker(monkeypatch, chunked=False)
+        set_shape(w, streams_prefix=streams)
         assert w._tail_chunks(3, 129, chunk_grid=self._context_cut(1)) is None
 
     @pytest.mark.parametrize("num_valid_tokens", [128, 300])

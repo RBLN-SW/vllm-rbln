@@ -409,16 +409,8 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
         same bytes in more descriptors is a loss.
 
         Rounds up, because every token counted has to reach the peer.
-
-        Asked of whatever may name part of a block rather than of chunk mode
-        alone: a streamed batch closes a block the forward pass is still
-        filling, and the chunks above the count hold KV nobody has written.
         """
-        if (
-            not self._shape.writes_part_of_a_block
-            or not num_valid_tokens
-            or num_blocks <= 0
-        ):
+        if not self._shape.cuts_a_block or not num_valid_tokens or num_blocks <= 0:
             return None
         rem = num_valid_tokens - (num_blocks - 1) * self.block_size
         if not 1 <= rem <= self.block_size:

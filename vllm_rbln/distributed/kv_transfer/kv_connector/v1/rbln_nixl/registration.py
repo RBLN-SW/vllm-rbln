@@ -476,14 +476,15 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         full_groups = sum(
             not isinstance(spec, SlidingWindowSpec) for spec in self._group_specs
         )
-        # Streaming names part of a block for its own reason and needs the
+        # Streaming names part of a request for its own reason and needs the
         # same shape to do it: one group whose blocks it counts in, and any
         # other group described by a range of its own.
         cutter = "chunk_mode" if self._shape.chunk_mode else "a streamed write"
         # One group is all it asks: `_own_engine_layout` is already true for
-        # every multi-group engine that writes part of a block, and both counts
-        # come off `transfer_groups`, so a second term could only repeat this.
-        if self._shape.writes_part_of_a_block and full_groups != 1:
+        # every multi-group engine that writes part of a request, and both
+        # counts come off `transfer_groups`, so a second term could only repeat
+        # this.
+        if self._shape.writes_part_of_a_request and full_groups != 1:
             raise RuntimeError(
                 f"RBLN NIXL (D2D): {cutter} needs one full-attention KV-cache "
                 "group, and any other group to be a sliding window whose view "
@@ -491,13 +492,14 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
                 f"full={full_groups}, swa={self._shape.has_swa}, "
                 f"sw_ratio={self._shape.window_ratio}."
             )
-        # An engine that owns the whole-engine lists names a block's chunks
-        # there without naming which span holds the request's last token -- so
-        # a block cut into several spans would send chunks past the request's
-        # own blocks. A head cut leaves one span a block.
+        # The whole-engine lists name a block's chunks without naming which
+        # span holds the request's last token, so a block cut into several
+        # spans would send chunks past the request's own blocks. A streamed
+        # write cuts no block but still counts its coverage in those spans,
+        # which these lists were never shown to place. A head cut has one span.
         region_axes = [geometry.axis for geometry in geometries]
         if (
-            self._shape.writes_part_of_a_block
+            self._shape.writes_part_of_a_request
             and self._own_engine_layout
             and ChipletSplitAxis.TOKEN in region_axes
         ):

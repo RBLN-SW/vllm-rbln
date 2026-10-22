@@ -236,6 +236,13 @@ class RblnNixlWorkerBase(
                 "engine has no window to cut by -- no sliding-window group, or "
                 "one as wide as its block."
             )
+        chunk_tokens = connector_option(vllm_config, "chunk_tokens", 0)
+        if chunk_tokens and not self._shape.cuts_a_block:
+            logger.info(
+                "RBLN NIXL: chunk_tokens=%d has no effect without chunk_mode, "
+                "the only knob that cuts a block into chunks.",
+                chunk_tokens,
+            )
         if (
             self._shape.wants_stream
             and self._shape.writes_into_peer

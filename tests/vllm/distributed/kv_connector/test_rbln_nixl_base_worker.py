@@ -365,6 +365,30 @@ class TestSwaWindowRatio:
             )
 
 
+class TestAnInertChunkSize:
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("chunk_mode", [False, True])
+    def test_a_chunk_size_without_chunk_mode_says_it_does_nothing(
+        self, monkeypatch, caplog, chunk_mode, stream
+    ):
+        # A streamed write cuts no block either, so streaming alone leaves the
+        # size as unused as having neither knob.
+        with caplog.at_level("INFO"):
+            worker = build_worker(
+                monkeypatch,
+                kv_buffer_device="rbln",
+                chunk_mode=chunk_mode,
+                chunk_tokens=512,
+                push_stream=stream,
+                specs=[MagicMock()],
+                cls=RblnNixlPushConnectorWorker,
+            )
+
+        assert worker._shape.streams_prefix is stream
+        said = [r for r in caplog.records if "has no effect without" in r.getMessage()]
+        assert bool(said) is not chunk_mode
+
+
 class TestSwaWindowDelegation:
     # Both collapse to the upstream Full-only implementation when window_ratio is
     # None; the SWA dual-range paths are exercised in the Swa classes below.

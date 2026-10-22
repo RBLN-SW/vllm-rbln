@@ -478,10 +478,10 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         The runs are `_block_runs`; the chunk is what a prefill step leaves of
         the block, at a width that cuts every region's span or takes several
         whole. None where every region's span is one chunk -- what a step at
-        or above one asks for -- so neither list grows. A side that writes a
-        request in pieces asks for a grid as the knob does.
+        or above one asks for -- so neither list grows. None off chunk mode
+        too: a streamed write on its own sends whole blocks.
         """
-        if not self._shape.writes_part_of_a_block:
+        if not self._shape.cuts_a_block:
             return None
         cuts = self._block_runs(split=split, kv_runs=kv_runs)
         if cuts is None:

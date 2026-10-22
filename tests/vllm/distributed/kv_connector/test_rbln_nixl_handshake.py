@@ -2395,13 +2395,13 @@ class TestChunkSizing:
 
         assert self._grid(w) is None
 
-    def test_a_side_that_writes_in_pieces_gets_a_grid_without_the_knob(self):
-        # Streaming names a range of a block whether or not the knob is on, so
-        # it asks for the same grid the knob would have built.
+    def test_a_side_that_streams_alone_gets_no_grid(self):
+        # Streaming writes whole blocks: the ones the prefill closed, and the
+        # last one whole at the handover. Only chunk mode cuts a block.
         w = self._grid_worker(block_len=2048 * 256, cls=RblnNixlPushConnectorWorker)
         w._shape = shape(chunk_mode=False, streams_prefix=True)
 
-        assert self._grid(w) == uniform_grid(1, 4, regions=4, spans=4)
+        assert self._grid(w) is None
 
 
 class TestBaseFanInHandle:
@@ -5473,7 +5473,7 @@ class TestSplitAxisConstraints:
             kv_split_axes=[ChipletSplitAxis.TOKEN] * 4,
             block_size=32,
         )
-        with pytest.raises(RuntimeError, match="cut one the same way"):
+        with pytest.raises(RuntimeError, match="count a block the same way"):
             w._check_split_axis_constraints(meta, 2)
 
     def test_a_windowed_peer_must_size_its_block_the_same(self):
@@ -5482,7 +5482,7 @@ class TestSplitAxisConstraints:
         # and the descriptor counts match either way, so nothing reports it.
         w = self._worker(axis=ChipletSplitAxis.HEAD, sw_ratio=4, block_size=16)
         meta = _agent_meta(block_size=32, kv_split_axes=[ChipletSplitAxis.HEAD] * 4)
-        with pytest.raises(RuntimeError, match="cut one the same way"):
+        with pytest.raises(RuntimeError, match="count a block the same way"):
             w._check_split_axis_constraints(meta, 1)
 
     def test_a_streaming_peer_must_size_its_block_the_same(self):
@@ -5499,7 +5499,7 @@ class TestSplitAxisConstraints:
             kv_split_axes=[ChipletSplitAxis.TOKEN] * 4,
             block_size=32,
         )
-        with pytest.raises(RuntimeError, match="cut one the same way"):
+        with pytest.raises(RuntimeError, match="count a block the same way"):
             w._check_split_axis_constraints(meta, 2)
 
     def test_a_matching_block_size_passes_while_trimming(self):

@@ -509,16 +509,16 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
             )
         # Both ranges that name less than a block cut it by a number derived
         # from OUR block size -- the chunk grid from it, the window range from
-        # `_window_grid` -- and both lists are cut by that one number. A peer whose
-        # block holds a different count is then cut into pieces that are not its
-        # own, while every byte count still fits.
-        if (self._shape.writes_part_of_a_block or self._own_engine_layout) and (
+        # `_window_grid` -- and a streamed write places its blocks by counting
+        # them on both sides. A peer whose block holds a different count is
+        # then cut or counted in pieces that are not its own.
+        if (self._shape.writes_part_of_a_request or self._own_engine_layout) and (
             nixl_agent_meta.block_size != self.block_size
         ):
             raise RuntimeError(
-                "RBLN NIXL D2D: naming less than a whole block needs both "
-                "sides to cut one the same way, but the peer's block holds "
-                f"{nixl_agent_meta.block_size} tokens and this worker's holds "
+                "RBLN NIXL D2D: naming less than a whole block or request needs "
+                "both sides to count a block the same way, but the peer's block "
+                f"holds {nixl_agent_meta.block_size} tokens and this worker's holds "
                 f"{self.block_size}."
             )
 
@@ -1391,7 +1391,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
             or split > 1
             or fanout > 1
             or kv_runs > 1
-            or (self._shape.writes_part_of_a_block and not self._own_engine_layout)
+            or (self._shape.writes_part_of_a_request and not self._own_engine_layout)
         )
 
     def _register_shard_xfer_state(
