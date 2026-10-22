@@ -33,10 +33,12 @@ import torch
 from vllm.v1.attention.backend import AttentionBackend, MultipleOf
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.kv_cache_layout import KVCacheLayout
 
 import vllm_rbln.utils as rbln_utils
 
 from .flash_attention import (
+    RBLNFlashAttentionBackend,
     RBLNFlashAttentionMetadata,
     RBLNFlashAttentionMetadataBuilder,
 )
@@ -151,6 +153,12 @@ class _RBLNGlm5CacheBackend(AttentionBackend):
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
         return [MultipleOf(1)]
+
+    @classmethod
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+        # As the flash-attention backend's, so pipeline stages agree on one layout
+        # (MiniMax-M3's caches do the same, #1317).
+        return RBLNFlashAttentionBackend.supported_kv_cache_layouts()
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:

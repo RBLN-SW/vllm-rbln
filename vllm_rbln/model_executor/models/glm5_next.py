@@ -73,10 +73,14 @@ from vllm.model_executor.models.glm4_1v import Glm4vDummyInputsBuilder
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
     SupportsMultiModal,
+    SupportsPP,
 )
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
+    PPMissingLayer,
     WeightsMapper,
+    is_pp_missing_parameter,
+    make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
 )
@@ -1139,9 +1143,15 @@ class RBLNGlm5Model(nn.Module):
         quant_config = vllm_config.quant_config
         self.n = config.mhc_num_residual_streams
 
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size, config.hidden_size, prefix=f"{prefix}.embed_tokens"
-        )
+        # Pipeline parallel: the embedding on the first stage, the final norm on the
+        # last; a stage hands the next its n residual streams as one [B, T, n * H]
+        # tensor (the runner keeps intermediates as [B, T, -1]).
+        if get_pp_group().is_first_rank:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size, config.hidden_size, prefix=f"{prefix}.embed_tokens"
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: RBLNGlm5DecoderLayer(
@@ -1149,7 +1159,13 @@ class RBLNGlm5Model(nn.Module):
             ),
             prefix=f"{prefix}.layers",
         )
-        self.norm = RBLNRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        if get_pp_group().is_last_rank:
+            self.norm = RBLNRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            self.norm = PPMissingLayer()
+        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
+            ["streams"], self.n * config.hidden_size
+        )
         # The KDA layers read the step's positions off the first one's KV cache group
         # (RBLNGlm5KDA.positions_from).
         kda = [
@@ -1169,18 +1185,28 @@ class RBLNGlm5Model(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        x = (
-            inputs_embeds
-            if inputs_embeds is not None
-            else self.embed_input_ids(input_ids)
-        )
-        batch, tokens, hidden = x.shape
-        streams = x.unsqueeze(1).expand(batch, self.n, tokens, hidden).contiguous()
+    ) -> torch.Tensor | IntermediateTensors:
+        if get_pp_group().is_first_rank:
+            x = (
+                inputs_embeds
+                if inputs_embeds is not None
+                else self.embed_input_ids(input_ids)
+            )
+            batch, tokens, hidden = x.shape
+            streams = x.unsqueeze(1).expand(batch, self.n, tokens, hidden).contiguous()
+        else:
+            assert intermediate_tensors is not None
+            flat = intermediate_tensors["streams"]  # [B, T, n * H]
+            batch, tokens, _ = flat.shape
+            streams = flat.view(batch, tokens, self.n, -1).transpose(1, 2).contiguous()
         # islice, not a slice: slicing a ModuleList builds a new one each call, whose
         # modules dynamo then lifts as graph inputs instead of constant weights.
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             streams = layer(streams)
+        if not get_pp_group().is_last_rank:
+            return IntermediateTensors(
+                {"streams": streams.transpose(1, 2).reshape(batch, tokens, -1)}
+            )
         return self.norm(streams.mean(dim=1))
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -1190,8 +1216,11 @@ class RBLNGlm5Model(nn.Module):
             self.config,
             weights,
             lambda name: (
-                not name.startswith("layers.")
-                or self.start_layer <= int(name.split(".", 2)[1]) < self.end_layer
+                (
+                    not name.startswith("layers.")
+                    or self.start_layer <= int(name.split(".", 2)[1]) < self.end_layer
+                )
+                and not is_pp_missing_parameter(name, self)
             ),
         )
         for layer in islice(self.layers, self.start_layer, self.end_layer):
@@ -1204,7 +1233,7 @@ class RBLNGlm5Model(nn.Module):
         return loaded_params
 
 
-class RBLNGlm5NextForCausalLM(nn.Module):
+class RBLNGlm5NextForCausalLM(nn.Module, SupportsPP):
     """The text model of ``Glm5NextForConditionalGeneration`` checkpoints."""
 
     hf_to_vllm_mapper = WeightsMapper(
@@ -1221,12 +1250,18 @@ class RBLNGlm5NextForCausalLM(nn.Module):
         self.model = RBLNGlm5Model(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            prefix=maybe_prefix(prefix, "lm_head"),
-        )
+        if get_pp_group().is_last_rank:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                prefix=maybe_prefix(prefix, "lm_head"),
+            )
+        else:
+            self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config.vocab_size)
+        self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
+            self.model.make_empty_intermediate_tensors
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
