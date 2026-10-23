@@ -53,15 +53,18 @@ def _output(req_ids):
 
 
 def _async_output(
-    tokens, *, invalid_req_indices=(), fail_fast=False, rank=None, dp_rank=None
+    tokens: torch.Tensor,
+    *,
+    invalid_req_indices=(),
+    fail_fast=False,
+    rank=None,
+    dp_rank=None,
 ):
     req_ids = [f"r{i}" for i in range(len(tokens))]
     queue: PendingTokenWriteback = deque()
     async_out = AsyncRBLNModelRunnerOutput(
         model_runner_output=_output(req_ids),
-        sampled_token_ids=tokens
-        if isinstance(tokens, torch.Tensor)
-        else torch.tensor(tokens, dtype=torch.int32),
+        sampled_token_ids=tokens,
         invalid_req_indices=list(invalid_req_indices),
         pending_token_writeback=queue,
         req_ids=req_ids,
@@ -87,7 +90,9 @@ class TestGetOutput:
     def test_output_thread_failure_uses_worker_exit_policy(
         self, monkeypatch, failure_stage, fail_fast, disabled, should_exit
     ):
-        async_out, _ = _async_output([[7]], fail_fast=fail_fast)
+        async_out, _ = _async_output(
+            torch.tensor([[7]], dtype=torch.int32), fail_fast=fail_fast
+        )
         error = RuntimeError("device output failed")
         if failure_stage == "copy":
             monkeypatch.setattr(
@@ -121,7 +126,9 @@ class TestGetOutput:
     def test_output_thread_failure_names_its_rank(self, monkeypatch, capfd):
         # The decorator's receiver here is the output, not the worker, so the
         # ranks must travel with the output for the event to name them.
-        async_out, _ = _async_output([[7]], fail_fast=True, rank=2, dp_rank=1)
+        async_out, _ = _async_output(
+            torch.tensor([[7]], dtype=torch.int32), fail_fast=True, rank=2, dp_rank=1
+        )
         monkeypatch.setattr(
             async_out._sampled_token_ids_cpu,
             "copy_",
@@ -148,9 +155,12 @@ class TestGetOutput:
                     from threading import Thread
                     from unittest.mock import Mock
 
+                    import torch
+
                     from tests.vllm.v1.worker.test_async_output import _async_output
 
-                    output, _ = _async_output([[7]], fail_fast=True)
+                    tokens = torch.tensor([[7]], dtype=torch.int32)
+                    output, _ = _async_output(tokens, fail_fast=True)
                     output._sampled_token_ids_cpu.copy_ = Mock(
                         side_effect=RuntimeError("subprocess output copy failed")
                     )
@@ -173,7 +183,7 @@ class TestGetOutput:
         assert "subprocess output copy failed" in result.stdout + result.stderr
 
     def test_returns_the_sampled_tokens(self):
-        async_out, _ = _async_output([[7], [8]])
+        async_out, _ = _async_output(torch.tensor([[7], [8]], dtype=torch.int32))
         assert async_out.get_output().sampled_token_ids == [[7], [8]]
 
     @pytest.mark.use_device
@@ -188,11 +198,13 @@ class TestGetOutput:
         assert async_out.get_output().sampled_token_ids == [[1], [0]]
 
     def test_clears_the_rows_the_sampler_discarded(self):
-        async_out, _ = _async_output([[7], [8]], invalid_req_indices=[1])
+        async_out, _ = _async_output(
+            torch.tensor([[7], [8]], dtype=torch.int32), invalid_req_indices=[1]
+        )
         assert async_out.get_output().sampled_token_ids == [[7], []]
 
     def test_queues_the_tokens_for_the_writeback(self):
-        async_out, queue = _async_output([[7], [8]])
+        async_out, queue = _async_output(torch.tensor([[7], [8]], dtype=torch.int32))
         async_out.get_output()
         req_ids, tokens, placeholder_pos = queue.popleft()
         assert req_ids == ["r0", "r1"]
@@ -203,7 +215,7 @@ class TestGetOutput:
         # The scheduler trims sampled_token_ids[i] in place once a request stops
         # (Scheduler._update_request_with_output), and under world_size == 1 the
         # output reaches it by reference -- UniProcExecutor does not serialise.
-        async_out, queue = _async_output([[7], [8]])
+        async_out, queue = _async_output(torch.tensor([[7], [8]], dtype=torch.int32))
         output = async_out.get_output()
         for ids in output.sampled_token_ids:
             del ids[0:]
