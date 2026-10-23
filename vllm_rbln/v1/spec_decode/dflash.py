@@ -30,12 +30,15 @@ from itertools import chain
 
 import torch
 import torch.nn.functional as F
-from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config import VllmConfig, get_layers_from_vllm_config, set_current_vllm_config
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
+from vllm.v1.kv_cache_interface import KVCacheConfig, UniformTypeKVCacheSpecs
 from vllm.v1.spec_decode.dflash import DFlashProposer
+from vllm.v1.worker.utils import AttentionGroup
 
 import vllm_rbln.envs as envs
 import vllm_rbln.utils as rbln_utils
@@ -48,6 +51,7 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
     attention_block_axis,
     build_kv_cache_forward_context_kwargs,
 )
+from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.worker.dp_utils import determine_batch_execution_and_padding
 
@@ -92,25 +96,11 @@ class RBLNDFlashProposer(DFlashProposer):
                 "the drafter's context K/V write is silently dropped."
             )
         super().__init__(vllm_config=vllm_config, device=device, runner=runner)
-        if self.dflash_causal:
-            # `_create_draft_vllm_config` turns this into
-            # `use_non_causal=False`, which resolves the drafter onto the causal
-            # kernel family -- and that family takes no mask, which is the only
-            # place the draft block and its window are expressed.
-            raise NotImplementedError(
-                "The DFlash drafter must be non-causal on RBLN: the draft pass "
-                "carries its block geometry in an explicit mask, which the "
-                "causal kernels do not take. Unset `causal` in the draft "
-                "model's dflash config."
-            )
         self.runner = runner
         # `self.arange` is on the device. The RBLN metadata builder reads
         # `query_start_loc` and `seq_lens` on the host and stages them itself.
         self.arange_cpu = torch.arange(self.arange.shape[0], dtype=torch.int32)
-
-        # The drafter is a mixed stack: sliding-window layers then one full
-        # attention layer. The window is carried by the mask alone -- see
-        # `_build_draft_attn_metadata`.
+        self.num_query_per_req = 1 + self.num_speculative_tokens
         hf_config = vllm_config.speculative_config.draft_model_config.hf_config
         layer_types = getattr(hf_config, "layer_types", None) or []
         self.sliding_window = (
@@ -134,6 +124,8 @@ class RBLNDFlashProposer(DFlashProposer):
         common_attn_metadata: CommonAttentionMetadata,
         mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         num_rejected_tokens: torch.Tensor | None = None,
+        *,
+        block_tables: dict[int, torch.Tensor],
     ) -> torch.Tensor | list[list[int]]:
         """Draft `num_speculative_tokens` tokens in one forward.
 
@@ -145,7 +137,7 @@ class RBLNDFlashProposer(DFlashProposer):
         assert self.runner is not None
         assert not self.supports_mm_inputs
         num_reqs = self.runner.input_batch.num_reqs
-        num_query_per_req = 1 + self.num_speculative_tokens
+        num_query_per_req = self.num_query_per_req
         num_query_total = num_reqs * num_query_per_req
 
         # The runner already reduced the aux states with the drafter's own
@@ -162,7 +154,7 @@ class RBLNDFlashProposer(DFlashProposer):
 
         self._write_context_kv(
             target_hidden_states,
-            common_attn_metadata,
+            block_tables,
             num_reqs,
             num_context,
             valid_ctx_lens,
@@ -175,6 +167,7 @@ class RBLNDFlashProposer(DFlashProposer):
             num_query_total,
             ctx_starts,
             valid_ctx_lens,
+            block_tables=block_tables,
         )
         # One draft id per mask position: the flat result holds
         # `num_reqs_padded * num_speculative_tokens` ids, real rows first, so
@@ -197,7 +190,9 @@ class RBLNDFlashProposer(DFlashProposer):
             ]
         return draft_ids
 
-    def initialize_attn_backend(self, kv_cache_config, kernel_block_sizes=None) -> None:
+    def initialize_attn_backend(
+        self, kv_cache_config: KVCacheConfig, kernel_block_sizes=None
+    ) -> None:
         """Build the draft metadata builders under the draft config.
 
         Impl and builder both read causality from the config they are built
@@ -207,11 +202,50 @@ class RBLNDFlashProposer(DFlashProposer):
         """
         draft_vllm_config = self._create_draft_vllm_config()
         with set_current_vllm_config(draft_vllm_config):
-            original, self.vllm_config = self.vllm_config, draft_vllm_config
-            try:
-                super().initialize_attn_backend(kv_cache_config, kernel_block_sizes)
-            finally:
-                self.vllm_config = original
+            layers = get_layers_from_vllm_config(draft_vllm_config, AttentionLayerBase)
+            attention_groups = {}
+            self.draft_block_sizes: dict[int, int] = {}
+            self.draft_blocks_per_kv_block: dict[int, int] = {}
+            self.layer_kv_cache_group_ids: dict[str, int] = {}
+            for gid, group in enumerate(kv_cache_config.kv_cache_groups):
+                names = sorted(
+                    self._draft_attn_layer_names.intersection(group.layer_names)
+                )
+                if not names:
+                    continue
+                block_size = (
+                    kernel_block_sizes[gid]
+                    if kernel_block_sizes is not None
+                    else group.kv_cache_spec.block_size
+                )
+                self.draft_block_sizes[gid] = block_size
+                self.draft_blocks_per_kv_block[gid] = (
+                    group.kv_cache_spec.block_size // block_size
+                )
+                for name in names:
+                    self.layer_kv_cache_group_ids[name] = gid
+                    spec = group.kv_cache_spec
+                    if isinstance(spec, UniformTypeKVCacheSpecs):
+                        spec = spec.kv_cache_specs[name]
+                    backend = layers[name].get_attn_backend()
+                    key = (gid, backend.full_cls_name(), spec)
+                    if key not in attention_groups:
+                        attention_groups[key] = AttentionGroup(
+                            backend=backend,
+                            layer_names=[],
+                            kv_cache_spec=spec,
+                            kv_cache_group_id=gid,
+                        )
+                    attention_groups[key].layer_names.append(name)
+
+            self.draft_attn_groups = list(attention_groups.values())
+            for group in self.draft_attn_groups:
+                group.create_metadata_builders(
+                    draft_vllm_config,
+                    self.device,
+                    kernel_block_size=self.draft_block_sizes[group.kv_cache_group_id],
+                )
+        self.kv_cache_gid = next(iter(self.draft_block_sizes))
 
     def load_model(self, target_model) -> None:
         super().load_model(target_model)
@@ -279,17 +313,7 @@ class RBLNDFlashProposer(DFlashProposer):
             hidden_states = hidden_states.view(-1, self.hidden_size)[
                 token_indices_to_sample
             ]
-            if self.model.draft_id_to_target_id is not None:
-                # Upstream widens the draft logits to the target vocabulary
-                # by scattering at `arange(draft_vocab) + d2t`. That index is
-                # input-independent, so it const-folds to an anonymous constant
-                # weight-free apply cannot fill, and the write goes out of
-                # bounds. Stay in draft-vocab space and map after the argmax.
-                logits = self.model.logits_processor(self.model.lm_head, hidden_states)
-            else:
-                logits = self.model.compute_logits(hidden_states)
-            # NOTE(RBLN): the greedy pick belongs in the graph.
-            return torch.ops.rbln.argmax(logits)
+            return self._draft_token_ids(hidden_states, input_ids)
 
         rbln_config: RBLNConfig = self.vllm_config.additional_config
         compile_kwargs = dict(
@@ -307,6 +331,17 @@ class RBLNDFlashProposer(DFlashProposer):
         )
         self.model_executable = compile(model_wrapper, **compile_kwargs)
         self._project_context_kv = compile(project_context_kv, **compile_kwargs)
+
+    def _draft_token_ids(
+        self, hidden_states: torch.Tensor, input_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Draft-vocabulary ids for the sampled positions, inside the graph."""
+        if self.model.draft_id_to_target_id is not None:
+            logits = self.model.logits_processor(self.model.lm_head, hidden_states)
+        else:
+            logits = self.model.compute_logits(hidden_states)
+        # NOTE(RBLN): the greedy pick belongs in the graph.
+        return torch.ops.rbln.argmax(logits)
 
     def _check_rope_style(self, target_model) -> None:
         """Refuse a drafter whose RoPE style differs from the target's.
@@ -367,14 +402,13 @@ class RBLNDFlashProposer(DFlashProposer):
             )
 
         # 2) The query pass, at the only shape it ever runs: one draft block
-        # (`1 + num_speculative_tokens` queries) per request.
-        num_query_per_req = 1 + self.num_speculative_tokens
+        # (`num_query_per_req` queries) per request.
+        num_query_per_req = self.num_query_per_req
         num_query_total = num_reqs * num_query_per_req
         if num_query_total > self.max_num_tokens:
             return
         cad = self._build_dummy_attn_metadata(num_reqs, num_query_per_req)
-        # Start every request at block 0 so no block spans a page and the
-        # give-up path stays out of the warmup.
+        # Warmup uses dummy blocks even when the query spans several pages.
         ctx_starts = torch.zeros(num_reqs, dtype=torch.int32)
         valid_ctx_lens = torch.zeros(num_reqs, dtype=torch.int32)
         self._run_query_pass(
@@ -384,6 +418,13 @@ class RBLNDFlashProposer(DFlashProposer):
             num_query_total,
             ctx_starts,
             valid_ctx_lens,
+            block_tables={
+                gid: self.runner.input_batch.block_table[gid].get_cpu_tensor()[
+                    :num_reqs
+                ]
+                for gid in self.draft_block_sizes
+            },
+            is_dummy=True,
         )
 
     def _fill_first_pass_inputs(
@@ -462,12 +503,16 @@ class RBLNDFlashProposer(DFlashProposer):
         positions: torch.Tensor,
         num_reqs: int,
         num_reqs_padded: int,
+        *,
+        block_tables: dict[int, torch.Tensor],
     ) -> dict[str, object]:
         per_layer: dict[str, object] = {}
         for attn_group in self.draft_attn_groups:
             builder = attn_group.get_metadata_builder()
+            group_cad = copy(cad)
+            group_cad.block_table_tensor = block_tables[attn_group.kv_cache_group_id]
             attn_metadata = builder.build(
-                common_attn_metadata=cad,
+                common_attn_metadata=group_cad,
                 positions=positions,
                 is_prefill=False,
                 batch_pad=num_reqs_padded,
@@ -482,19 +527,40 @@ class RBLNDFlashProposer(DFlashProposer):
                 self.runner.kv_cache_bases,
                 self.runner.kv_cache_view_infos,
             )
-            # `initialize_attn_backend` builds under the draft config, so a
-            # causal builder here means that scoping came undone.
-            assert not builder.is_causal, (
-                "the draft metadata builder was built causal; it takes no mask"
-            )
+            assert builder.is_causal == self.dflash_causal
+            if self.dflash_causal:
+                if isinstance(builder.kv_cache_spec, RBLNSlidingWindowSpec):
+                    raise NotImplementedError(
+                        "Causal sliding-window drafting requires REBEL CR13's "
+                        "append attention kernel: context K/V uses absolute slots."
+                    )
+                for layer_name in attn_group.layer_names:
+                    per_layer[layer_name] = attn_metadata
+                continue
             # What the builder would have produced, without producing it.
             max_seq_len = builder.model_config.max_model_len
             mask_dtype = torch.float16 if builder.enforce_eager else torch.float32
             mask_device = builder.device
 
-            # One attention group covers the whole drafter -- groups are keyed by
-            # backend class -- so the two attention types are separated by the
-            # mask here, not by the grouping.
+            if builder.swa_appends:
+                window = builder.kv_cache_spec.sliding_window
+                block_size = builder.block_size
+                chunk = self.num_query_per_req
+                num_blocks = (window + chunk - 2) // block_size + 2
+                start = cad.seq_lens[:num_reqs].view(-1, 1, 1)
+                origin = (start - window + 1).clamp(min=0) // block_size * block_size
+                keys = origin + torch.arange(num_blocks * block_size)
+                queries = start + torch.arange(chunk).view(1, -1, 1)
+                visible = ((queries - keys).abs() < window) & (keys < start + chunk)
+                mask = rbln_utils.pad(visible[:, None], 0, num_reqs_padded)
+                attn_metadata.attn_masks = (
+                    mask.to(mask_dtype).contiguous().to(mask_device)
+                )
+                for layer_name in attn_group.layer_names:
+                    per_layer[layer_name] = attn_metadata
+                continue
+
+            # Non-causal DFlash represents its layer windows in explicit masks.
             sliding = self._sliding_layer_names(attn_group)
             full_metadata = copy(attn_metadata)
             full_metadata.attn_masks = (
@@ -509,12 +575,8 @@ class RBLNDFlashProposer(DFlashProposer):
                 per_layer[layer_name] = full_metadata
             if not sliding:
                 continue
-            # The window travels in `attn_masks`, not `swa_attn_masks`:
-            # `DFlashQwen3Attention` never declares `layer_types`, so every
-            # draft layer gets a `FullAttentionSpec` and a kernel that ignores
-            # the SWA fields. Per-layer `seq_lens` would need a second dynamic
-            # index on an already-indexed partition, which the compiler
-            # refuses with a segfault rather than a diagnostic.
+            # Non-causal DFlash uses the mask-taking full-attention kernel,
+            # so its block window travels in attn_masks, not swa_attn_masks.
             window_metadata = copy(attn_metadata)
             window_metadata.attn_masks = (
                 self._draft_block_mask(
@@ -556,10 +618,11 @@ class RBLNDFlashProposer(DFlashProposer):
         """A mask for a whole draft block, optionally bounded by the window.
 
         Full layers see the whole context plus the block's own keys; sliding
-        layers see the window ending at their own position. Built on the host:
+        layers see the window ending at their own position and the draft block.
+        Built on the host:
         each eager device op here would compile its own graph.
         """
-        num_query_per_req = 1 + self.num_speculative_tokens
+        num_query_per_req = self.num_query_per_req
         key_pos = torch.arange(max_seq_len)
         query_pos = seq_lens[:num_reqs].view(-1, 1) + torch.arange(
             num_query_per_req
@@ -592,7 +655,7 @@ class RBLNDFlashProposer(DFlashProposer):
     def _write_context_kv(
         self,
         target_hidden_states: torch.Tensor,
-        cad: CommonAttentionMetadata,
+        block_tables: dict[int, torch.Tensor],
         num_reqs: int,
         num_context: int,
         valid_ctx_lens: torch.Tensor,
@@ -605,30 +668,32 @@ class RBLNDFlashProposer(DFlashProposer):
         alternating the two rematerialises every cache view per proposal.
         """
         model = self.model.model
-        block_size = self.block_size
         positions = self._ctx_positions_cpu
-        block_table = cad.block_table_tensor.cpu()
 
         # Per-token destination, then maximal runs: the copy target has to be a
         # contiguous span inside one physical block.
         req_of_token = torch.repeat_interleave(
             torch.arange(num_reqs), valid_ctx_lens.to(torch.int64)
         )
-        blocks = block_table[req_of_token, positions // block_size].tolist()
-        offsets = (positions % block_size).tolist()
         reqs = req_of_token.tolist()
-        runs: list[tuple[int, int, int, int]] = []
-        start = 0
-        for i in range(1, num_context + 1):
-            if (
-                i < num_context
-                and reqs[i] == reqs[i - 1]
-                and blocks[i] == blocks[i - 1]
-                and offsets[i] == offsets[i - 1] + 1
-            ):
-                continue
-            runs.append((start, i - start, blocks[start], offsets[start]))
-            start = i
+        group_runs: dict[int, list[tuple[int, int, int, int]]] = {}
+        for gid, block_size in self.draft_block_sizes.items():
+            block_table = block_tables[gid].cpu()
+            blocks = block_table[req_of_token, positions // block_size].tolist()
+            offsets = (positions % block_size).tolist()
+            runs = []
+            start = 0
+            for i in range(1, num_context + 1):
+                if (
+                    i < num_context
+                    and reqs[i] == reqs[i - 1]
+                    and blocks[i] == blocks[i - 1]
+                    and offsets[i] == offsets[i - 1] + 1
+                ):
+                    continue
+                runs.append((start, i - start, blocks[start], offsets[start]))
+                start = i
+            group_runs[gid] = runs
 
         # One call, not a loop: `_project_context_kv` is compiled with static
         # output buffers, so two calls would hand back views of the same storage
@@ -660,10 +725,12 @@ class RBLNDFlashProposer(DFlashProposer):
         rbln_config: RBLNConfig = self.vllm_config.additional_config
         block_axis = attention_block_axis(rbln_config.use_custom_kernel)
         for layer_index, layer in enumerate(model.layers):
-            cache = layer.self_attn.attn.kv_cache
+            attn = layer.self_attn.attn
+            cache = attn.kv_cache
+            gid = self.layer_kv_cache_group_ids[attn.layer_name]
             k_layer = keys[layer_index]
             v_layer = values[layer_index]
-            for token_start, count, block, offset in runs:
+            for token_start, count, block, offset in group_runs[gid]:
                 token_slice = slice(token_start, token_start + count)
                 cache_slice = slice(offset, offset + count)
                 one_block = cache.select(block_axis, block)
@@ -684,12 +751,12 @@ class RBLNDFlashProposer(DFlashProposer):
         num_query_total: int,
         ctx_starts: torch.Tensor,
         valid_ctx_lens: torch.Tensor,
+        *,
+        block_tables: dict[int, torch.Tensor],
+        is_dummy: bool = False,
     ) -> torch.Tensor:
-        # The context length BEFORE the query block: the kernel scatters the
-        # block's own K/V at that offset. It reads the offset out of
-        # `positions`, not out of this field, so this is only what the draft
-        # mask is built from -- and the mask has to name the same slots the
-        # block really occupies.
+        # The context length BEFORE the query block. Both the kernel's write
+        # offset (from positions) and a non-causal block mask start here.
         seq_lens = ctx_starts + valid_ctx_lens
         query_cad = CommonAttentionMetadata(
             query_start_loc=self.arange_cpu[: num_reqs + 1] * num_query_per_req,
@@ -706,17 +773,19 @@ class RBLNDFlashProposer(DFlashProposer):
         )
 
         self._dropped_rows = torch.zeros(num_reqs, dtype=torch.bool)
-        spanning = (seq_lens % self.block_size) + num_query_per_req > self.block_size
-        if bool(spanning.any()):
-            last_page = ((seq_lens + num_query_per_req - 1) // self.block_size).to(
-                torch.int64
-            )
-            table = cad.block_table_tensor
-            if int(last_page.max()) >= table.shape[-1] or bool(
-                (table.cpu()[torch.arange(num_reqs), last_page] == 0).any()
-            ):
-                self._dropped_rows = torch.ones(num_reqs, dtype=torch.bool)
-                return self.positions.new_zeros(num_query_total)
+        if not is_dummy:
+            query_positions = seq_lens[:, None] + torch.arange(num_query_per_req)
+            rows = torch.arange(num_reqs)[:, None]
+            for gid, block_size in self.draft_block_sizes.items():
+                pages = (query_positions // block_size).to(torch.int64)
+                table = block_tables[gid]
+                if int(pages.max()) >= table.shape[-1] or bool(
+                    (
+                        table.cpu()[rows, pages] < self.draft_blocks_per_kv_block[gid]
+                    ).any()
+                ):
+                    self._dropped_rows = torch.ones(num_reqs, dtype=torch.bool)
+                    return self.positions.new_zeros(num_query_total)
 
         # The builder reads one thing out of the positions it is given --
         # `positions[query_start_loc_cpu[:num_reqs]]` -- and that becomes the
@@ -770,6 +839,7 @@ class RBLNDFlashProposer(DFlashProposer):
             block_starts,
             num_reqs,
             num_reqs_padded,
+            block_tables=block_tables,
         )
         with set_forward_context(
             per_layer,
@@ -796,7 +866,8 @@ class RBLNDFlashProposer(DFlashProposer):
             )
 
     def _sample_indices(self, num_reqs: int, num_query_per_req: int) -> torch.Tensor:
-        """The mask positions -- the ones the target verifies."""
+        """The block's last `num_speculative_tokens` slots, one per draft."""
+        first = num_query_per_req - self.num_speculative_tokens
         rows = torch.arange(num_reqs)[:, None]
         cols = torch.arange(self.num_speculative_tokens)[None, :]
-        return (rows * num_query_per_req + 1 + cols).reshape(-1).to(self.device)
+        return (rows * num_query_per_req + first + cols).reshape(-1).to(self.device)
