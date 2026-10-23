@@ -514,11 +514,11 @@ class DynamicKvSizer:
     ) -> list[Any]:
         """The KV inputs the slope is summed over: every cache once.
 
-        A group is one program's KV input set. Two programs binding the same
-        caches (prefill and decode) form two groups, because dynamo names the
-        symbols and the arg positions differently; summing both would charge
-        every cache twice. `InputSpec` carries no identity, so the number of
-        caches vllm allocated is what says which case this is.
+        A group is one distinct KV input set (`select_kv_input_groups`): the
+        target's, and a drafter's next to it. If one set ever still splits into
+        two groups, summing both would charge every cache twice. `InputSpec`
+        carries no identity, so the number of caches vllm allocated is what says
+        which case this is.
         """
         flat = [spec for group_specs, _ in groups for spec in group_specs]
         if len(flat) == num_caches:
