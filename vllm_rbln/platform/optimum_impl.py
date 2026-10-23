@@ -22,6 +22,8 @@ from vllm.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.pooling_params import PoolingParams
+    from vllm.sampling_params import SamplingParams
 
 logger = init_logger(__name__)
 
@@ -32,6 +34,10 @@ def patch_upstream() -> None:
     # Upstream selects Triton filtering without a platform dispatch hook.
     # The optimum path does not apply the vllm path's patch registry.
     topk_topp_sampler.apply_top_k_top_p = topk_topp_sampler.apply_top_k_top_p_pytorch
+
+
+def validate_request(params: "SamplingParams | PoolingParams") -> None:
+    pass
 
 
 def check_and_update(vllm_config: "VllmConfig") -> None:

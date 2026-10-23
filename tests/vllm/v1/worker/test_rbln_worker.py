@@ -42,8 +42,6 @@ import vllm_rbln.v1.worker.rbln_worker as wm
 import vllm_rbln.v1.worker.utils as worker_utils
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.platform import RblnPlatform
-from vllm_rbln.v1.spec_decode.dflash import RBLNDFlashProposer
-from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
 from vllm_rbln.v1.worker.rbln_worker import (
     RBLNWorker,
@@ -349,11 +347,10 @@ class TestWorkerFailFast:
         worker = make_worker(vllm_config=_make_vllm_config(backend=backend))
         error = RuntimeError("worker step failed")
         step = Mock(side_effect=error)
-        # is_strict_kv_producer and max_num_tokens are read before the step the
-        # failure policy is about; __init__ always sets them.
+        # is_strict_kv_producer is read before the step the failure policy is
+        # about; __init__ always sets it.
         worker.model_runner = SimpleNamespace(
             is_strict_kv_producer=False,
-            max_num_tokens=512,
             **{runner_method: step},
         )
         monkeypatch.setattr(wm, "set_current_vllm_config", lambda _: nullcontext())
@@ -739,14 +736,14 @@ class TestDetermineAvailableMemory:
         cap = self._capture(make_worker, monkeypatch, device_name="RBLN-CR13")
         assert "chiplet_memory" not in cap
 
-    def test_num_runtimes_from_buckets_and_moe(self, make_worker, monkeypatch):
-        # Non-spec with specialized-MoE decode: 3 buckets at one query length
-        # plus the MoE fallback = 4 decode graphs, and the prefill makes 5.
+    def test_num_runtimes_counts_each_decode_graph_and_the_prefill(
+        self, make_worker, monkeypatch
+    ):
+        # The runner owns which shapes it compiles; the worker reserves one
+        # runtime for each of them and one for the prefill graph.
         cap = self._capture(
             make_worker,
             monkeypatch,
-            specialized_moe_decode=True,
-            decode_buckets=3,
             decode_graph_shapes=[(b, 1, None) for b in (1, 2, 4)] + [(4, 1, 512)],
         )
         assert cap["num_runtimes"] == 5
@@ -831,21 +828,12 @@ class TestDetermineAvailableMemory:
         # 1 + buckets(3)*1 = 4 (no MoE); draft = 1 + buckets(3) = 4. Total 8.
         assert cap["num_runtimes"] == 8
 
-    def test_no_proposer_class_can_join_without_answering(self):
-        # The medusa crash was one class missing the attribute, and a stub cannot
-        # catch that. The runner picks the drafter from these three, and a fourth
-        # would reach the same bare read on a producer.
-        for cls in (RBLNEagleProposer, RBLNDFlashProposer, RBLNMedusaProposer):
-            assert isinstance(cls.warms_up_decode_graphs_on_a_producer, bool), (
-                cls.__name__
-            )
-
-    def test_every_drafter_the_runner_builds_answers_the_producer_question(
+    def test_medusa_on_a_producer_reserves_one_draft_runtime(
         self, make_worker, monkeypatch
     ):
         # The stubs above supply the attribute, so they cannot catch a drafter
         # class that lacks it. On a producer the left operand is empty, so the
-        # attribute is read, and medusa reaches this block like the other two.
+        # real medusa class's attribute is read.
         drafter = RBLNMedusaProposer.__new__(RBLNMedusaProposer)
         drafter.model = SimpleNamespace(
             parameters=lambda: iter([torch.zeros(20, dtype=torch.float16)])
@@ -1512,7 +1500,6 @@ class TestExecuteDummyBatch:
         calls = []
         worker.model_runner = SimpleNamespace(
             is_strict_kv_producer=strict_kv_producer,
-            max_num_tokens=512,
             _dummy_run=lambda *a, **kw: calls.append((a, kw)),
         )
         worker.execute_dummy_batch()

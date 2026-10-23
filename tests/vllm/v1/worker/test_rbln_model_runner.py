@@ -423,6 +423,37 @@ def test_pooling_warmup_runs_without_language_model_head(monkeypatch):
     cache.save.assert_called_once_with("pooling", cache.config_signature.return_value)
 
 
+@pytest.mark.parametrize(
+    ("strict_kv_producer", "sampled", "verifies"),
+    [(True, [1], False), (False, [1, 2, 4], True)],
+)
+def test_a_producer_warms_the_sampler_at_one_request(
+    monkeypatch, strict_kv_producer, sampled, verifies
+):
+    # A producer step carries one request and verifies no drafts; a width or
+    # sampler warm-up skips is one serving would compile on first use.
+    cache = SimpleNamespace(config_signature=Mock(), load=Mock(), save=Mock())
+    monkeypatch.setattr(mr, "mega_cache", cache)
+    monkeypatch.setattr(mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True))
+    runner = _make_runner_stub(
+        is_strict_kv_producer=strict_kv_producer,
+        vllm_config=None,
+        model_config=SimpleNamespace(model="m"),
+        is_pooling_model=False,
+        run_model_graphs=Mock(),
+        offload_context=nullcontext,
+        bucketing_manager=SimpleNamespace(batch_buckets=[1, 2, 4]),
+        drafter=None,
+        _dummy_sampler_run=Mock(),
+        _warmup_sampler_decode_batches=Mock(),
+    )
+
+    runner.warmup_model()
+
+    assert [c.args[0] for c in runner._dummy_sampler_run.call_args_list] == sampled
+    assert runner._warmup_sampler_decode_batches.called is verifies
+
+
 @pytest.mark.parametrize("num_reqs", [1, 2])
 def test_reference_sampler_warmup_finishes(num_reqs):
     runner = _make_runner_stub(
@@ -1886,6 +1917,13 @@ class TestDummyRunDraftParticipation:
         runner._dummy_run(1, 1, is_prefill=False, warmup=False)
         drafter.dummy_run.assert_called_once_with(1, 1, False)
 
+    def test_an_idle_producer_runs_its_draft_as_a_prefill(self, monkeypatch):
+        # A producer's idle rank runs the prefill graph beside prefilling peers,
+        # so its draft has to report the same phase to the DP decision.
+        runner, drafter = self._runner(monkeypatch, has_drafter=True)
+        runner._dummy_run(1, 1, is_prefill=True, warmup=False)
+        drafter.dummy_run.assert_called_once_with(1, 1, True)
+
     @pytest.mark.parametrize("requested", [1, 1 + NUM_SPEC])
     def test_warmup_compiles_the_draft_at_the_window_length(
         self, monkeypatch, requested
@@ -1991,6 +2029,31 @@ class TestDummyRunPPIntermediateTensors:
         _, width = captured["layout"].shape
         assert width == runner.max_num_tokens
         assert captured["intermediate_tensors"]["h"].shape == (1, width, self.HIDDEN)
+
+
+@pytest.mark.parametrize("strict_kv_producer", [True, False])
+def test_a_one_token_step_is_a_prefill_only_on_a_producer(
+    monkeypatch, strict_kv_producer
+):
+    # The stamp picks the graph, and a producer compiled only the prefill one.
+    monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: False)
+    runner = _make_runner_stub(
+        is_strict_kv_producer=strict_kv_producer,
+        execute_model_state=None,
+        use_async_scheduling=False,
+        _update_states=lambda so: None,
+        kv_connector_no_forward=lambda so, cfg: "OUTPUT",
+        vllm_config=None,
+    )
+    runner.execute_model(
+        SimpleNamespace(
+            num_scheduled_tokens={"a": 1},
+            scheduled_spec_decode_tokens={},
+            total_num_scheduled_tokens=0,
+            kv_cache_copy_ops=None,
+        )
+    )
+    assert runner.is_prefill is strict_kv_producer
 
 
 class TestExecuteModelRecoversADeferredLoad:
@@ -2147,6 +2210,25 @@ class TestExecuteModelFlushesAfterTheSubmission:
         # The entry flush recovers a stale hold, then this step's read goes out
         # only after its own submission.
         assert order == ["flush", "submit", "flush"]
+
+
+@pytest.mark.maybe_use_device
+@pytest.mark.parametrize(
+    ("kv_role", "decodes"), [("kv_producer", False), ("kv_both", True)]
+)
+def test_a_runner_built_for_a_producer_has_no_decode_graph(
+    make_model_runner, kv_role, decodes
+):
+    # The role is read once, when the runner is built.
+    from vllm.config import KVTransferConfig
+
+    runner = make_model_runner(
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="RblnNixlConnector", kv_role=kv_role
+        ),
+        init_kv_cache=False,
+    )
+    assert bool(runner.decode_graph_shapes()) is decodes
 
 
 class TestDecodeGraphShapes:

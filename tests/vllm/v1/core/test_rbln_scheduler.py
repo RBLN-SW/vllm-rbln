@@ -1024,7 +1024,7 @@ class TestAsyncMaxTokensSkip:
     """
 
     @staticmethod
-    def _drain_async(sched, token=7, max_steps=50):
+    def _drain_async(sched, token=7, max_steps=50, per_step=None):
         """One output in flight, the way the engine's batch queue drives async:
         schedule() runs a step ahead of the update_from_output() for the step
         before it. That lag is what leaves num_output_placeholders above zero,
@@ -1036,6 +1036,8 @@ class TestAsyncMaxTokensSkip:
             scheduled = bool(out.num_scheduled_tokens)
             if scheduled:
                 steps += 1
+                if per_step is not None:
+                    per_step(out)
             if pending is not None:
                 sched.update_from_output(*pending)
             pending = (out, make_model_runner_output(out, token)) if scheduled else None
@@ -1251,16 +1253,26 @@ class TestFullRunInvariants:
         assert all(r.is_finished() for r in reqs)
         assert sched.running == []
 
-    def test_a_producer_reads_prefill_at_every_step_of_a_full_drain(self):
-        # v1/core/utils.py names this sweep as what pins the two phase views
-        # together; until now it only ever ran for the roles that decode.
+    @pytest.mark.parametrize("async_scheduling", [False, True])
+    @pytest.mark.parametrize("max_tokens", [1, 4])
+    # 17 against a 16-token step chunks the prompt and leaves a one-token tail.
+    @pytest.mark.parametrize("num_tokens", [10, 17])
+    def test_a_producer_reads_prefill_at_every_step_of_a_full_drain(
+        self, async_scheduling, max_tokens, num_tokens
+    ):
+        # The scheduler's and the runner's phase views agree, one request per
+        # step, across a whole run. Async schedules each step with the last
+        # one's output still in flight.
         sched = create_rbln_scheduler(
+            async_scheduling=async_scheduling,
             max_num_seqs=4,
             block_size=16,
             num_blocks=10000,
+            max_num_batched_tokens=16,
+            max_model_len=64,
             use_kv_connector=MockKVConfig(matched_tokens=0, kv_role="kv_producer"),
         )
-        reqs = create_requests(6, num_tokens=10, max_tokens=4)
+        reqs = create_requests(6, num_tokens=num_tokens, max_tokens=max_tokens)
         for r in reqs:
             sched.add_request(r)
 
@@ -1268,7 +1280,10 @@ class TestFullRunInvariants:
             assert _check_phase_agrees(sched, out, strict_kv_producer=True)
             assert len(list(out.num_scheduled_tokens)) == 1
 
-        _drain(sched, per_step=check)
+        if async_scheduling:
+            TestAsyncMaxTokensSkip._drain_async(sched, per_step=check)
+        else:
+            _drain(sched, per_step=check)
         assert all(r.is_finished() for r in reqs)
 
     @pytest.mark.parametrize(

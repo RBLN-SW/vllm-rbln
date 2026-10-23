@@ -318,11 +318,6 @@ class TestSignatureVllmConfig:
         for name in ("num_speculative_tokens", "method", "draft_tensor_parallel_size"):
             assert hasattr(spec, name), name
 
-        assert hasattr(
-            KVTransferConfig(kv_connector="RblnNixlConnector", kv_role="kv_both"),
-            "kv_role",
-        )
-
     def test_every_port_field_is_swept(self):
         # Ports are auto-queried per launch; one reaching the hash moves the
         # signature every restart. The empty guard catches an upstream rename

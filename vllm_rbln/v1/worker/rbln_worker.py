@@ -213,9 +213,11 @@ class RBLNWorker(WorkerBase):
         that warm-up's compiled runtimes reserve.
 
         One per decode graph the runner will compile, plus the prefill. A draft
-        model, when present, adds one, and a bucket's worth more wherever the
-        runner compiles decode graphs. Counting all of them keeps the KV-block
-        estimate from over-reserving and OOMing at runtime.
+        model, when present, adds one, and a bucket's worth more (plus the
+        specialized-MoE fallback) wherever the runner compiles decode graphs --
+        or one more on a producer whose drafter still warms its decode pass.
+        Counting all of them keeps the KV-block estimate from over-reserving and
+        OOMing at runtime.
         """
         params_dict = dict(self.model_runner.model.named_parameters())
         device_name = current_platform.get_device_name().lower()

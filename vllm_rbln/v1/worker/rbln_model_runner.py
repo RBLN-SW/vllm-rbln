@@ -2845,11 +2845,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 # step decided -- what it stages then fits the dimension the group
                 # settled on, whichever route decided it.
                 draft_query_len = query_len
-                if (
-                    not is_prefill
-                    and self.uses_fixed_decode_window
-                    and self.num_spec_tokens == 1
-                ):
+                if self.uses_fixed_decode_window and self.num_spec_tokens == 1:
                     draft_query_len = target_query_len
                 self.drafter.dummy_run(num_reqs, draft_query_len, is_prefill)
 

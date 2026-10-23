@@ -21,6 +21,9 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.config.logging import LoggingConfig
+    from vllm.inputs import EngineInput
+    from vllm.pooling_params import PoolingParams
+    from vllm.sampling_params import SamplingParams
     from vllm.utils.argparse_utils import FlexibleArgumentParser
     from vllm.v1.attention.selector import AttentionSelectorConfig
 
@@ -381,6 +384,14 @@ class RblnPlatform(Platform):
                 "executor backend; use 'mp' for supported multi-worker execution.",
                 parallel_config.distributed_executor_backend,
             )
+
+    @classmethod
+    def validate_request(
+        cls,
+        processed_inputs: "EngineInput",
+        params: "SamplingParams | PoolingParams",
+    ) -> None:
+        _impl().validate_request(params)
 
     @classmethod
     def register_custom_kv_cache_specs(cls, vllm_config: "VllmConfig") -> None:

@@ -1208,6 +1208,53 @@ class TestDflashTokenBudget:
         assert reconfigure(mutate).scheduler_config.max_num_scheduled_tokens == 8
 
 
+class TestStrictProducerRequests:
+    # The config is built right before validating, since the hook keeps the
+    # last config built in this process and reads its role per request.
+    @staticmethod
+    def _validate(kv_role, max_tokens, **engine_kwargs):
+        from vllm.config import KVTransferConfig
+        from vllm.sampling_params import SamplingParams
+
+        _build(
+            kv_transfer_config=KVTransferConfig(
+                kv_connector="RblnNixlConnector", kv_role=kv_role
+            ),
+            **engine_kwargs,
+        )
+        RblnPlatform.validate_request(None, SamplingParams(max_tokens=max_tokens))
+
+    @pytest.mark.parametrize("max_tokens", [2, None])
+    def test_a_producer_refuses_more_than_one_output_token(self, max_tokens):
+        from vllm.exceptions import VLLMValidationError
+
+        # A client error, so the API server returns the message to the caller.
+        with pytest.raises(VLLMValidationError, match=f"got max_tokens={max_tokens}"):
+            self._validate("kv_producer", max_tokens)
+
+    def test_a_producer_accepts_the_prefill_leg(self):
+        self._validate("kv_producer", 1)
+
+    def test_a_producer_leaves_pooling_alone(self):
+        from vllm.config import KVTransferConfig
+        from vllm.pooling_params import PoolingParams
+
+        _build(
+            kv_transfer_config=KVTransferConfig(
+                kv_connector="RblnNixlConnector", kv_role="kv_producer"
+            )
+        )
+        RblnPlatform.validate_request(None, PoolingParams())
+
+    @pytest.mark.parametrize("kv_role", ["kv_both", "kv_consumer"])
+    def test_a_role_that_decodes_accepts_any_length(self, kv_role):
+        self._validate(kv_role, None)
+
+    def test_kv_offloading_turns_a_producer_into_a_role_that_decodes(self):
+        # Upstream rewrites the role to kv_both after the platform hook runs.
+        self._validate("kv_producer", 4, kv_offloading_size=1)
+
+
 # Resolving the vllm path reads the host's device now that RBLN-CA* refuses it,
 # so the chip is named here rather than inherited from whatever card ran this.
 @pytest.mark.usefixtures("cr13")
