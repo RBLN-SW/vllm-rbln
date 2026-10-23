@@ -346,8 +346,11 @@ class TestSubBlockSchedulingFuzz:
         ]
         return output
 
+    @pytest.mark.parametrize("num_speculative_tokens", [None, 3])
     @pytest.mark.parametrize("seed", range(50))
-    def test_every_request_finishes_and_frees_its_blocks(self, seed):
+    def test_every_request_finishes_and_frees_its_blocks(
+        self, seed, num_speculative_tokens
+    ):
         rng = random.Random(seed)
         num_blocks = rng.randrange(5, 14)
         capacity = (num_blocks - 1) * BLOCK_SIZE
@@ -359,8 +362,11 @@ class TestSubBlockSchedulingFuzz:
             max_model_len=capacity,
             num_blocks=num_blocks,
             max_num_seqs=rng.choice([1, 2, 4]),
+            num_speculative_tokens=num_speculative_tokens,
         )
-        pending = self._workload(rng, capacity)
+        # The pool, not max_model_len, bounds a request here, so leave room for
+        # the spec decode lookahead its last decode window allocates.
+        pending = self._workload(rng, capacity - 3)
         for step in range(self.MAX_STEPS):
             while pending and pending[0][0] <= step:
                 _, rid, prompt, max_tokens = pending.pop(0)
