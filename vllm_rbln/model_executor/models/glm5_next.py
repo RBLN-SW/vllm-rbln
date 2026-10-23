@@ -568,11 +568,16 @@ class RBLNGlm5KDA(nn.Module):
         # or store moves all of them and RSD cuts each input's channels as it cuts the
         # heads (no op slices the heads of a tensor RSD has already cut). On head
         # group 0's block.
+        spec = vllm_config.speculative_config
+        self.num_drafts = spec.num_speculative_tokens if spec is not None else 0
+        # The conv ring indexes by position: it must hold the 3 taps before a verify
+        # step's tokens, so K drafts need 3 + K slots.
+        self.conv_ring_width = max(KDA_CONV_RING, 3 + self.num_drafts)
         self.conv_ring = RBLNGlm5AuxCache(
             f"{prefix}.attn.{self.num_groups}",
             self.states[0].prefix,
             (
-                KDA_CONV_RING,
+                self.conv_ring_width,
                 KDA_CONV_INPUTS * self.num_groups,
                 proj // self.num_groups // 64,
                 64,
@@ -583,15 +588,8 @@ class RBLNGlm5KDA(nn.Module):
         # drafts' (k, v, exp(g), beta) in this buffer; the next step replays the
         # accepted ones (kda_verify, design README 2.5 method 2). One a head group, on
         # that group's block.
-        spec = vllm_config.speculative_config
-        self.num_drafts = spec.num_speculative_tokens if spec is not None else 0
         self.drafts = None
         if self.num_drafts:
-            # The conv ring indexes by position: it must hold the 3 taps before a
-            # verify step's tokens.
-            assert self.num_drafts <= KDA_CONV_RING - 3, (
-                f"KDA conv ring {KDA_CONV_RING} holds {KDA_CONV_RING - 3} draft(s)"
-            )
             self.drafts = nn.ModuleList(
                 RBLNGlm5AuxCache(
                     f"{prefix}.attn.{self.num_groups + KDA_CONV_SLOTS + j}",
@@ -659,7 +657,7 @@ class RBLNGlm5KDA(nn.Module):
             seq_idx.view(-1),
             query_len.view(-1),
             has_initial_state,
-            KDA_CONV_RING,
+            self.conv_ring_width,
             2 * self.num_groups,
             conv_store,
         ).unbind(2)
