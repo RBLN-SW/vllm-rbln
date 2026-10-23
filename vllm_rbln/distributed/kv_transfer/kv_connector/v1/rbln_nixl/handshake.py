@@ -124,6 +124,18 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                 "side would hold part of one of the other's. The two sides must "
                 "cut heads at commensurate granularities."
             )
+        # A peer rank has to hold whole areas of ours: its T / remote_tp heads
+        # a multiple of an area's T / cuts_l. A coarser peer always does, its
+        # TP dividing ours.
+        if cuts_l % remote_tp_size:
+            raise RuntimeError(
+                f"RBLN NIXL D2D: the peer runs TP {remote_tp_size}, which does "
+                f"not divide this engine's {cuts_l} head cut(s) (TP "
+                f"{self.topo.tp_size} x {slices_l} chiplet slice(s)), so one "
+                "chiplet area would straddle several peers. Run the peer at a "
+                f"tensor-parallel size dividing {cuts_l}, or use "
+                "kv_buffer_device='cpu'."
+            )
         self._register_remote_engine_prelude(
             nixl_agent_meta, remote_tp_size, remote_dcp_size
         )
@@ -752,15 +764,10 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
             side="local",
         )
         heads_per_remote = total_heads // remote_tp_size
-        if per_slice_l > heads_per_remote:
-            raise RuntimeError(
-                "RBLN NIXL D2D: this rank's chiplet area spans "
-                f"{per_slice_l} KV heads but each peer rank owns only "
-                f"{heads_per_remote}, so one area would straddle several "
-                "peers. Reduce the prefill tensor-parallel size (the ratio "
-                "must not exceed the smaller of the chiplet count and this "
-                "rank's head count) or use kv_buffer_device='cpu'."
-            )
+        assert heads_per_remote % per_slice_l == 0, (
+            f"a peer rank's {heads_per_remote} heads split an area of "
+            f"{per_slice_l}; the handshake refuses that before registering"
+        )
         return [
             area_l
             for area_l in range(areas_l)

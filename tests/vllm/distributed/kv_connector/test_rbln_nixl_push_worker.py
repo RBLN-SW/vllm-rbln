@@ -1030,12 +1030,12 @@ class TestReplicaFanOut:
         meta.kv_area_slices = area_slices(areas, slices, 1)
         meta.num_blocks = 1
         meta.kv_caches_base_addr = [1000 * (i + 1) for i in range(areas)]
-        meta.block_lens = [1024] * areas
+        meta.block_lens = [512] * areas
         return meta
 
     # Our area holds heads 0-1; the peer holds them one per slice, each slice
     # on two of its areas (regions 0,1 and 2,3).
-    PEER = [(r, (r // 2, r // 2 + 1), 1024) for r in range(4)]
+    PEER = [(r, (r // 2, r // 2 + 1), 512) for r in range(4)]
 
     def _pieces(self, cls, peer=PEER):
         return pair_area(
@@ -1060,7 +1060,7 @@ class TestReplicaFanOut:
     def test_a_peer_without_copies_is_the_same_either_way(self):
         # areas == slices: nothing is duplicated, so there is only one place to
         # put the bytes and the two directions agree.
-        peer = [(r, (r // 2, r // 2 + 1), 1024) for r in (0, 2)]
+        peer = [(r, (r // 2, r // 2 + 1), 512) for r in (0, 2)]
         assert self._pieces(RblnNixlPullConnectorWorker, peer) == self._pieces(
             RblnNixlPushConnectorWorker, peer
         )
@@ -1124,7 +1124,7 @@ class TestTheThreeListsAgree:
         meta.device_id = 0
         # Same shape as ours: K and V, each across its four areas.
         meta.kv_caches_base_addr = [100_000 * (i + 1) for i in range(8)]
-        meta.block_lens = [512] * 8
+        meta.block_lens = [256] * 8
         return meta
 
     @pytest.mark.parametrize(

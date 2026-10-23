@@ -3548,14 +3548,15 @@ class TestHeadBandMatching:
 
     def test_a_region_longer_than_the_peer_leaves_at_that_offset_raises(self):
         # Our rank holds heads 2..3, which start halfway into the peer's area,
-        # so only half of it is ours to read; a longer local region would run
-        # past its end. _validate_head_matched_handshake rejects the same
-        # geometry from the advertised lengths, before any descriptor is built.
+        # so only half of it is ours to read; a longer local region holds wider
+        # heads, which would run past its end. _validate_head_matched_handshake
+        # rejects the same geometry from the advertised lengths, before any
+        # descriptor is built.
         w = self._worker(
             tp_rank=1, tp_size=4, areas=4, slices=2, n_logical=1, block_len=384
         )
         meta = self._meta(areas=4, slices=2, n_logical=1, block_len=512)
-        with pytest.raises(RuntimeError, match=r"wants 384B at \+256B"):
+        with pytest.raises(RuntimeError, match="a KV head is 384B .* and 128B"):
             w._build_head_matched_remote(meta, remote_tp_rank=0, remote_tp_size=1)
 
 
@@ -4606,13 +4607,6 @@ class TestFanInAreaPartition:
         ]
         assert sorted(seen) == [0, 1, 2, 3]
 
-    def test_area_straddling_two_peers_raises(self):
-        """P TP8 -> D TP1: an area holds heads {2a, 2a+1} but each peer owns a
-        single head, so the area would have to be split across two agents."""
-        w = self._worker(tp_rank=0, tp_size=1, areas=4, slices=4)
-        with pytest.raises(RuntimeError, match="straddle several"):
-            w._fan_in_peer_areas(0, remote_tp_size=8)
-
     def test_host_bounce_never_fans_in(self):
         # Host-bounce registers one logical full-shape buffer per layer, so
         # upstream's model holds and base handles the whole engine.
@@ -4695,7 +4689,7 @@ class TestADecodeContextParallelPeerIsRefused:
         w.nixl_wrapper = MagicMock()
         w.transfer_topo = MagicMock(tp_size=1)
         w._logical_region_kv_heads = [8]
-        fill_region_geometry(w, areas=1, axes=[ChipletSplitAxis.HEAD])
+        fill_region_geometry(w, areas=2, axes=[ChipletSplitAxis.HEAD], slices=2)
         w._is_head_matched_peer = MagicMock(return_value=True)
         w._register_remote_engine_prelude = MagicMock()
         w._check_d2d_region_pairing = MagicMock()
@@ -4795,6 +4789,56 @@ class TestARefusedPeerLeavesNothingBehind:
         assert w.dst_num_blocks == {}
         assert w.kv_caches_base_addr == {}
         w.nixl_wrapper.add_remote_agent.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "tp, areas, slices, peer_tp",
+        [(1, 1, 1, 2), (1, 4, 2, 4), (2, 6, 3, 4)],
+    )
+    def test_an_area_straddling_finer_peers_is_refused_unregistered(
+        self, tp, areas, slices, peer_tp
+    ):
+        # Commensurate cuts, but a peer rank holds less than one of our areas,
+        # or (TP 2, 3 slices against TP 4) not a whole number of them.
+        w = self._straddle_worker(tp, areas, slices, peer_tp)
+        meta = _agent_meta(engine_id="peer")
+
+        with pytest.raises(RuntimeError, match="straddle several peers"):
+            w.add_remote_agent(meta, 0, peer_tp, meta.dcp_size)
+
+        w.transfer_topo.register_remote_engine.assert_not_called()
+        w.nixl_wrapper.add_remote_agent.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "tp, areas, slices, peer_tp",
+        [(1, 4, 4, 2), (2, 8, 4, 4)],
+    )
+    def test_a_finer_peer_holding_several_whole_areas_registers(
+        self, tp, areas, slices, peer_tp
+    ):
+        # The other side of the same condition: a peer rank holding two of our
+        # areas is not a straddle.
+        w = self._straddle_worker(tp, areas, slices, peer_tp)
+        meta = _agent_meta(engine_id="peer")
+
+        w.add_remote_agent(meta, 0, peer_tp, meta.dcp_size)
+
+        w.transfer_topo.register_remote_engine.assert_called_once()
+
+    def _straddle_worker(self, tp, areas, slices, peer_tp):
+        # The real _fan_in_peer_areas, which refused a straddle after the peer
+        # was registered.
+        w = self._worker()
+        del w._fan_in_peer_areas
+        w._validate_remote_agent_handshake = MagicMock()
+        w.use_host_buffer = False
+        w.tp_rank = 0
+        w.transfer_topo.tp_size = tp
+        w.transfer_topo.total_num_kv_heads = 12 * tp
+        w.transfer_topo.tp_ratio = MagicMock(return_value=-(peer_tp // tp))
+        ids = [a * slices // areas for a in range(areas)]
+        w._local_band = MagicMock(return_value=(areas, slices, ids))
+        w._peer_band = MagicMock(return_value=(slices, slices))
+        return w
 
     @pytest.mark.parametrize(
         "check",
@@ -4897,6 +4941,8 @@ class TestARefusedPeerLeavesNothingBehind:
         # does not pass it describes every peer as DCP-1 -- and upstream's own
         # validation asserts the topology agrees with the argument.
         w = self._worker()
+        # Two areas, so the peer's TP 2 holds whole ones.
+        fill_region_geometry(w, areas=2, axes=[ChipletSplitAxis.HEAD], slices=2)
         w._validate_remote_agent_handshake = MagicMock()
         meta = _agent_meta(engine_id="peer", dcp_size=1)
 
@@ -4963,7 +5009,7 @@ class TestTheRemoteRegionLedger:
         w.nixl_memory_type = "VRAM"
         w.nixl_wrapper = MagicMock()
         w._logical_region_kv_heads = [8]
-        fill_region_geometry(w, areas=1, axes=[ChipletSplitAxis.HEAD])
+        fill_region_geometry(w, areas=2, axes=[ChipletSplitAxis.HEAD], slices=2)
         w._kv_per_block = 1
         w.transfer_topo = MagicMock(tp_size=1)
         w._register_remote_engine_prelude = MagicMock()
@@ -5076,7 +5122,8 @@ class TestD2DRegionPairing:
     def test_peer_with_more_tp_ranks_allowed(self):
         # Fan-in: our band spreads over several peer ranks and
         # _fan_in_peer_areas splits our areas between them. Whether an area
-        # straddles two peers needs the measured geometry, so it is checked there.
+        # straddles two peers needs the chiplet cuts, so
+        # _add_remote_agent_head_matched checks it before registering the peer.
         w = self._worker(host_buffer=False, tp_ratio=-2, n_local=56, tp_size=2)
         w._check_d2d_region_pairing(self._meta(56), remote_tp_size=4)  # no raise
 
@@ -6317,6 +6364,12 @@ class TestPairArea:
         # end; in a longer one, it lays them out in a way we do not know.
         with pytest.raises(RuntimeError, match=f"{page_r}B a block, against 256B here"):
             self._pair((0, 2), [(0, (0, 2), 256), (1, (0, 2), page_r)], write=True)
+
+    def test_a_peer_head_of_another_width_is_refused(self):
+        # The handshake compares area 0 of a region only; a later area whose
+        # heads are wider would be read short, from the start of its head.
+        with pytest.raises(RuntimeError, match="128B a block .* and 256B"):
+            self._pair((0, 1), [(0, (0, 2), 512)], page=128)
 
     def test_a_packed_block_stays_one_range_at_equal_cuts(self):
         # Both sides name whole blocks, and K and V are adjacent inside one.

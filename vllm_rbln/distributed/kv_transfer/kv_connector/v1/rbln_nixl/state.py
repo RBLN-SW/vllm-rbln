@@ -160,14 +160,14 @@ def pair_area(
                     f"split into {rh1 - rh0} heads."
                 )
             head_l, head_r = half_l // (lh1 - lh0), half_r // (rh1 - rh0)
+            if head_l != head_r:
+                raise RuntimeError(
+                    f"RBLN NIXL D2D: a KV head is {head_l}B a block in local "
+                    f"region {region_id} and {head_r}B in peer region "
+                    f"{remote_region}."
+                )
             length = (h1 - h0) * head_l
             off_l, off_r = (h0 - lh0) * head_l, (h0 - rh0) * head_r
-            if off_r + length > half_r:
-                raise RuntimeError(
-                    f"RBLN NIXL D2D: local region {region_id} wants {length}B "
-                    f"at +{off_r}B, past the end of the peer's {half_r}B half "
-                    f"of region {remote_region}."
-                )
             for kv in range(kv_per_block):
                 pieces.append(
                     Piece(
@@ -864,7 +864,9 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
             region_ids = self._shard_local_region_ids(
                 registered_layer_names, peer_areas=peer_areas
             )
-        assert pieces is None or len(pieces) == len(region_ids)
+        if pieces is not None:
+            assert len(pieces) == len(region_ids)
+            assert block_size_ratio == 1
 
         # Per region, `(offset, length)` of each piece of a block.
         ranges: list[np.ndarray] = []
