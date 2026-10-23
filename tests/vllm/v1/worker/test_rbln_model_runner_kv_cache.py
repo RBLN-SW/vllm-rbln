@@ -218,6 +218,42 @@ class TestRegisterKvCachesWithConnector:
     cache, and again after a dynamic-KV resize has rebuilt every tensor.
     """
 
+    def test_descriptors_follow_shared_layers_and_rebuilt_caches(
+        self, make_model_runner, monkeypatch, kv_layout_registration_api
+    ):
+        registered = []
+        monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: True)
+        monkeypatch.setattr(
+            mr,
+            "get_kv_transfer_group",
+            lambda: SimpleNamespace(
+                register_kv_caches_with_layouts=lambda caches,
+                layouts: registered.append((caches, layouts)),
+                set_host_xfer_buffer_ops=lambda _op: None,
+            ),
+        )
+        runner = make_model_runner(
+            layers=("layer.0", "layer.1"),
+            kv_sharing={"layer.1": "layer.0"},
+        )
+        runner.register_kv_caches_with_connector()
+        runner.initialize_kv_cache_tensors(
+            runner.kv_cache_config, runner._kernel_block_sizes
+        )
+        runner.register_kv_caches_with_connector()
+
+        first, second = registered
+        assert first[0]["layer.0"] is not second[0]["layer.0"]
+        for caches, layouts in registered:
+            assert set(layouts) == set(caches) == {"layer.0", "layer.1"}
+            assert caches["layer.0"] is caches["layer.1"]
+            assert layouts["layer.0"] is layouts["layer.1"]
+            for name, layout in layouts.items():
+                assert (
+                    caches[name].shape[layout.axes.index(kv_layout_registration_api.KV)]
+                    == 2
+                )
+
     @staticmethod
     def _registrations(monkeypatch) -> list[dict]:
         registered: list[dict] = []

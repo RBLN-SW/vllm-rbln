@@ -34,6 +34,7 @@ from vllm.v1.kv_cache_layout import KVCacheLayout
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
+    from vllm.v1.kv_cache_layout import KVCacheTensorLayout
     from vllm.v1.worker.gpu_input_batch import InputBatch
 
 import vllm_rbln.utils as rbln_utils
@@ -127,6 +128,22 @@ class RBLNFlashAttentionBackend(AttentionBackend):
         axis = attention_block_axis(get_rbln_config().use_custom_kernel)
         shape.insert(axis, num_blocks)
         return tuple(shape)
+
+    @staticmethod
+    def get_kv_cache_tensor_layout() -> "KVCacheTensorLayout":
+        """Describe the registered view, including its separate K/V axis.
+
+        Called only by connectors supporting the proposed typed registration
+        API; released vLLM versions keep the tensor-only registration path.
+        """
+        from vllm.v1.kv_cache_layout import KVCacheAxis as Axis
+        from vllm.v1.kv_cache_layout import KVCacheTensorLayout
+
+        axes = [Axis.KV, Axis.HEAD, Axis.SINGLETON, Axis.TOKEN, Axis.HEAD_DIM]
+        axes.insert(
+            attention_block_axis(get_rbln_config().use_custom_kernel), Axis.BLOCK
+        )
+        return KVCacheTensorLayout(tuple(axes))
 
     @classmethod
     def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:

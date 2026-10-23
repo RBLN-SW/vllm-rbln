@@ -32,6 +32,35 @@ from tests.vllm.utils import (
 
 _DEFAULT_NUM_HIDDEN_LAYERS = 3
 
+
+@pytest.fixture
+def kv_layout_registration_api(monkeypatch):
+    """Stand in for the proposed registration types on pinned vLLM releases."""
+    from enum import IntEnum
+    from typing import NamedTuple
+
+    import vllm.v1.kv_cache_layout as layouts
+
+    class Axis(IntEnum):
+        BLOCK = 0
+        KV = 1
+        HEAD = 2
+        TOKEN = 3
+        HEAD_DIM = 4
+        CONTENT = 5
+        SINGLETON = 6
+
+    class Layout(NamedTuple):
+        axes: tuple[Axis, ...]
+
+        def validate_shape(self, shape):
+            assert len(self.axes) == len(shape)
+
+    monkeypatch.setattr(layouts, "KVCacheAxis", Axis, raising=False)
+    monkeypatch.setattr(layouts, "KVCacheTensorLayout", Layout, raising=False)
+    return Axis
+
+
 _scrubbed: dict[str, str] = {}
 
 # module file -> its (possibly still running) batch spawn.
