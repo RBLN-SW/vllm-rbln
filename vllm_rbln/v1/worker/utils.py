@@ -1069,7 +1069,7 @@ def get_default_num_threads(allocated_cpus: int) -> int:
     excluding HT siblings), capped by the cgroup CPU quota."""
     quota = get_cgroup_cpu_quota()
     if quota is not None:
-        allocated_cpus = min(allocated_cpus, math.ceil(quota))
+        allocated_cpus = min(allocated_cpus, math.floor(quota))
     return max(2, allocated_cpus // 2)
 
 
