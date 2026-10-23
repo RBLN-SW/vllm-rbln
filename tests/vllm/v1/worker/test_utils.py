@@ -1677,6 +1677,7 @@ class TestDynamicKvUnsupportedReason:
             "RblnNixlPullConnector",
             "RblnNixlPushConnector",
             "RBLNLMCacheConnectorV1",
+            "LMCacheMPConnector",
         ],
     )
     def test_connectors_registered_after_the_resize_are_supported(self, connector):

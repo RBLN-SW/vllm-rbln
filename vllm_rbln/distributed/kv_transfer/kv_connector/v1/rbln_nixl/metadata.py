@@ -30,7 +30,7 @@ are RBLN, so folding a private version tag into that hash
 """
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, TypeVar
 
@@ -55,8 +55,8 @@ if TYPE_CHECKING:
 # upstream does with ``NIXL_CONNECTOR_VERSION``. Folded into the NIXL compat
 # hash so an RBLN peer on another schema fails the handshake cleanly; earlier
 # bumps are `git log -L` on this line.
-#   9: a coverage range on a push notification, and the unit it counts in
-RBLN_NIXL_CONNECTOR_VERSION: int = 9
+#   10: per logical region, its cut axis and the slice each chiplet area holds
+RBLN_NIXL_CONNECTOR_VERSION: int = 10
 
 # Prefix a push completion notification carries when it names the half-open
 # range this write filled: ``RBLNS:<writer>:<lo>:<hi>:<per_block>:`` ahead of
@@ -66,15 +66,15 @@ RBLN_NIXL_CONNECTOR_VERSION: int = 9
 RBLN_COVERAGE_NOTIF_PREFIX: bytes = b"RBLNS:"
 
 
-class KVSplitAxis(Enum):
+class ChipletSplitAxis(Enum):
     """Which axis the compiler cut a KV entry on across the chiplets.
 
     ``HEAD`` means an area holds some of the shard's KV heads over every token
-    of a block; ``NON_HEAD`` means every head over some of the tokens.
+    of a block; ``TOKEN`` means every head over some of the tokens.
     """
 
     HEAD = 0
-    NON_HEAD = 1
+    TOKEN = 1
 
 
 @dataclass
@@ -89,13 +89,13 @@ class RblnNixlAgentMetadata(NixlAgentMetadata):
 
     pp_rank: int = 0
     pp_size: int = 1
-    # Physical areas one logical region expanded into, and how many of them are
-    # DISTINCT rather than replicas (see `_slice_head_bounds`).
-    kv_areas: int = 1
-    kv_slices: int = 1
-    # The default keeps a blob without this field meaning what versions 2 and 3
-    # meant by the two counts above.
-    kv_split_axis: KVSplitAxis = KVSplitAxis.HEAD
+    # Per logical region, in region order: the slice each of its chiplet areas
+    # holds, read off the device layout. Areas sharing an id are replicas, so
+    # a region's area count is the list's length and its slice count the ids'.
+    kv_area_slices: list[list[int]] = field(default_factory=list)
+    # Per logical region, in region order: a speculative draft can be cut on
+    # another axis than its target.
+    kv_split_axes: list[ChipletSplitAxis] = field(default_factory=list)
     # What a block holds (`_kv_per_block`). A process picks the layout, not the
     # build, so two peers off one build can differ and the version cannot tell
     # them apart. The default is the layout every version through 4 had.

@@ -38,11 +38,14 @@ from vllm.v1.kv_cache_interface import SlidingWindowSpec
 
 import vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.push_worker as pw
 from tests.vllm.distributed.kv_connector.utils import (
+    area_slices,
+    fill_region_geometry,
     mock_vllm_config,
     set_mock_connector_options,
     set_shape,
     setattr_in_package,
     shape,
+    uniform_grid,
     window_mode,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl import (
@@ -51,7 +54,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl import (
     RblnNixlWorkerBase,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
-    KVSplitAxis,
+    ChipletSplitAxis,
     RblnNixlConnectorMetadata,
 )
 
@@ -119,10 +122,8 @@ def _push_worker():
     w._engines_to_rehandshake = set()
     # Off, as the connector option is; the trim tests turn it on.
     set_shape(w, chunk_mode=False)
-    # The geometry `__init__` leaves until registration reports one, which is
-    # also the permanent value on host staging. `_spans_per_block` reads both.
-    w._kv_areas = 1
-    w._kv_split_axis = KVSplitAxis.HEAD
+    # The geometry `__init__` leaves until registration reports one.
+    fill_region_geometry(w, areas=1, axes=[])
     w._valid_tokens = {}
     w._physical_blocks_per_logical_kv_block = 1
     w._recving_metadata = {}
@@ -226,32 +227,6 @@ class TestMlaOnTheWritePath:
         with pytest.raises(RuntimeError, match="heterogeneous tensor"):
             worker._check_mla_constraints(SimpleNamespace(), remote_tp_size=2)
 
-    def test_a_peer_whose_chiplet_geometry_differs_is_refused(self):
-        # Positional pairing needs both sides to expand a logical region the
-        # same way; each derives it from its own device buffers, so a mismatch
-        # moves the wrong bytes without failing.
-        worker = _push_worker()
-        worker.use_mla = True
-        worker.transfer_topo = SimpleNamespace(tp_ratio=lambda peer: 1, tp_size=1)
-        worker._kv_areas, worker._kv_slices = 4, 1
-        worker._kv_per_block = 1
-
-        with pytest.raises(RuntimeError, match="chiplet geometry"):
-            worker._check_mla_constraints(
-                SimpleNamespace(kv_areas=2, kv_slices=1), remote_tp_size=1
-            )
-
-    def test_a_matching_peer_passes(self):
-        worker = _push_worker()
-        worker.use_mla = True
-        worker.transfer_topo = SimpleNamespace(tp_ratio=lambda peer: 1, tp_size=1)
-        worker._kv_areas, worker._kv_slices = 4, 1
-        worker._kv_per_block = 1
-
-        worker._check_mla_constraints(
-            SimpleNamespace(kv_areas=4, kv_slices=1), remote_tp_size=1
-        )
-
 
 class TestPushWriterStart:
     def test_finalize_starts_the_writer_after_the_deferred_registration(
@@ -328,6 +303,7 @@ class TestPerShardWrite:
         # shard the write path can reach always has both.
         w._shard_descs_per_block = {("eng", r): 1 for r in range(ranks)}
         w._shard_chunk_grids = {("eng", r): None for r in range(ranks)}
+        w._shard_region_spans = {("eng", r): (0, 0) for r in range(ranks)}
         w.src_xfer_handles_by_remote = {("eng", r, 16): 100 + r for r in range(ranks)}
         w.dst_xfer_side_handles = {"eng": {r: 200 + r for r in range(ranks)}}
         topo = MagicMock()
@@ -370,14 +346,65 @@ class TestPerShardWrite:
         # The request settles only once every WRITE it issued has completed.
         assert len(worker._sending_transfers["r0"]) == 2
 
+    def test_a_mixed_axis_engine_writes_whole_blocks_without_a_chunk_range(self):
+        # A target cut on tokens beside a draft cut on heads spreads a block
+        # over different spans, so with no chunk range the block itself is the
+        # unit -- a pipelined peer reaches this write with no knob on.
+        worker = self._writing_worker(ranks=1)
+        fill_region_geometry(
+            worker,
+            areas=2,
+            axes=[ChipletSplitAxis.TOKEN, ChipletSplitAxis.HEAD],
+            slices=[2, 2],
+        )
+        worker._shard_region_spans = {("eng", 0): (0, 1, 0, 0)}
+        worker._shard_region_group_ids = {("eng", 0): (0, 0, 0, 0)}
+        coverage = []
+
+        def record(notif_id, span, cpb):
+            coverage.append(cpb)
+            return notif_id
+
+        worker._with_coverage = record
+
+        worker._xfer_blocks_for_req("r0", self._meta(([1, 2],), ([3, 4],)))
+
+        assert worker.nixl_wrapper.make_prepped_xfer.called
+        assert coverage == [1]
+
+    def test_peers_whose_grids_cut_the_same_unit_share_it(self):
+        # Two peer ranks serving different regions hold different grids over
+        # the same chunk width; the window counts in that width for both, and
+        # only a different width would leave them none.
+        worker = self._writing_worker(ranks=2)
+        set_shape(worker, chunk_mode=True)
+        worker._valid_tokens = {"r0": 17}
+        worker._shard_chunk_grids = {
+            ("eng", 0): uniform_grid(1, 2, regions=2),
+            ("eng", 1): uniform_grid(1, 2, regions=1),
+        }
+        worker._shard_region_group_ids[("eng", 1)] = (0,)
+        worker._shard_region_spans[("eng", 1)] = (0,)
+        coverage = []
+
+        def record(notif_id, span, cpb):
+            coverage.append(cpb)
+            return notif_id
+
+        worker._with_coverage = record
+
+        worker._xfer_blocks_for_req("r0", self._meta(([1, 2],), ([3, 4],)))
+
+        assert coverage == [2]
+
     @classmethod
     def _trimming_worker(cls):
         # 2 regions over 2 areas, 16-token blocks: area 0 holds the first 8
         # in-block positions and area 1 the rest.
         w = cls._writing_worker(ranks=1)
         set_shape(w, chunk_mode=True)
-        w._kv_areas = 2
-        w._kv_split_axis = KVSplitAxis.NON_HEAD
+        fill_region_geometry(w, areas=2, axes=[ChipletSplitAxis.TOKEN], slices=2)
+        w._shard_region_spans = {("eng", 0): (0, 1)}
         w.block_size = 16
         w._valid_tokens = {"r0": 17}
         return w
@@ -953,10 +980,10 @@ class TestReplicaFanOut:
     what was there before. Reading takes one copy, writing takes them all."""
 
     @staticmethod
-    def _worker(cls, *, areas=4, slices=4):
+    def _worker(cls, *, areas=4):
         w = object.__new__(cls)
         w.shutdown = lambda: None
-        w._kv_areas, w._kv_slices = areas, slices
+        w._kv_areas = areas
         w._kv_per_block = 1
         window_mode(w, None)
         w.use_host_buffer = False
@@ -977,7 +1004,7 @@ class TestReplicaFanOut:
         # A TP4 rank of an 8-head model: 2 heads, each duplicated across two of
         # the four chiplet areas -> two copies of every slice.
         meta = MagicMock()
-        meta.kv_areas, meta.kv_slices = areas, slices
+        meta.kv_area_slices = area_slices(areas, slices, 1)
         meta.num_blocks = 1
         meta.kv_caches_base_addr = [1000 * (i + 1) for i in range(areas)]
         meta.block_lens = [1024] * areas
@@ -1006,8 +1033,8 @@ class TestReplicaFanOut:
     @pytest.mark.parametrize(
         "cls, expected_regions",
         [
-            # Peer regions are (logical * areas + slice * replicas + copy).
-            # Reading takes copy 0 of the slice; writing takes 0 and 1.
+            # The peer's areas holding slice 0 are its regions 0 and 1.
+            # Reading takes the first; writing takes both.
             (RblnNixlPullConnectorWorker, [1000]),
             (RblnNixlPushConnectorWorker, [1000, 2000]),
         ],
@@ -1019,11 +1046,10 @@ class TestReplicaFanOut:
 
         descs = worker._head_matched_desc(
             region_id=0,
-            logical_r=0,
-            area_l=0,
-            geom=(0, 2, 1),  # our area carries heads 0-1, no duplication
-            peer=(0, 2, 2, 2),  # peer: heads from 0, 2 per slice, 2 copies, 2 slices
-            areas_r=4,
+            head=0,  # our area carries heads 0-1
+            per_slice_l=2,
+            # Peer: heads from 0, 2 per slice, each slice on two of its areas.
+            peer=(0, 2, [[0, 1], [2, 3]]),
             remote_bases=meta.kv_caches_base_addr,
             remote_lens=meta.block_lens,
             device_id=0,
@@ -1048,7 +1074,6 @@ class TestTheThreeListsAgree:
         regions = 8
         w = object.__new__(cls)
         w.shutdown = lambda: None
-        w._kv_areas, w._kv_slices = 4, 4
         w._kv_per_block = 1
         window_mode(w, None)
         w.use_host_buffer = False
@@ -1062,6 +1087,8 @@ class TestTheThreeListsAgree:
         w.block_len_per_layer = [512] * regions
         # Two logical regions (K and V of the one layer), both the target's width.
         w._logical_region_kv_heads = [8, 8]
+        w._logical_region_local_heads = [8, 8]
+        fill_region_geometry(w, areas=4, axes=[ChipletSplitAxis.HEAD] * 2, slices=4)
         w.local_seen_layer_names = ["l0"]
         w.kv_caches_base_addr = {
             "eng-local": {0: [10_000 * (i + 1) for i in range(regions)]}
@@ -1079,7 +1106,6 @@ class TestTheThreeListsAgree:
         # A block of 16 tokens whose 2-head region costs 16B a token: a 128B
         # descriptor target is 8 tokens, so a block is two chunks.
         set_shape(w, chunk_mode=True)
-        w._kv_split_axis = KVSplitAxis.HEAD
         w.vllm_config = mock_vllm_config()
         w.vllm_config.scheduler_config.max_num_batched_tokens = 8
         return w
@@ -1088,7 +1114,7 @@ class TestTheThreeListsAgree:
     def _peer():
         # A TP4 rank: 2 heads, each duplicated across two of its four areas.
         meta = MagicMock()
-        meta.kv_areas, meta.kv_slices = 4, 2
+        meta.kv_area_slices = area_slices(4, 2, 2)
         meta.num_blocks = 2
         meta.block_size = 16
         meta.device_id = 0
@@ -1110,7 +1136,11 @@ class TestTheThreeListsAgree:
 
         # The two builders derive the grid rather than take it, so this is
         # what `_register_shard_xfer_state` passes the local one, not a knob.
-        grid = worker._shard_chunk_grid(block_size=worker.block_size, split=split)
+        grid = worker._shard_chunk_grid(
+            worker._shard_local_region_ids(("l0",), peer_areas=areas),
+            block_size=worker.block_size,
+            split=split,
+        )
 
         remote = worker._build_head_matched_remote(peer, 0, 4, peer_areas=areas)
         _handle, local = worker._register_shard_local_xfer_handler(
@@ -1128,7 +1158,44 @@ class TestTheThreeListsAgree:
         assert (cls is RblnNixlPushConnectorWorker) == (fanout == 2)
         # This shape has to be one that carries a chunk range -- without it
         # the two lists agree trivially and say nothing about the range.
-        assert grid == (1, 2)
+        assert grid == uniform_grid(1, 2, regions=len(grid.regions))
+
+    def test_a_peers_interleaved_copies_are_found_by_their_slice(self):
+        # The peer names which of its areas holds which slice; the copies of
+        # one need not sit side by side.
+        worker = self._worker(RblnNixlPushConnectorWorker)
+        peer = self._peer()
+        peer.kv_area_slices = [[0, 1, 0, 1]] * 2
+        areas = worker._fan_in_peer_areas(0, 4)
+
+        remote = worker._build_head_matched_remote(peer, 0, 4, peer_areas=areas)
+
+        # Our first area's two heads are the peer's slices 0 and 1, one a
+        # piece; each piece goes to every area holding its slice.
+        first_block = [addr // 100_000 - 1 for addr, _len, _dev in remote[:4]]
+        assert first_block == [0, 2, 1, 3]
+
+    def test_our_areas_are_placed_by_the_slice_they_hold(self):
+        # Our layout, too, names the slice each area holds; an area's heads
+        # follow from that, not from where it sits.
+        worker = self._worker(RblnNixlPushConnectorWorker)
+        worker._logical_region_geometry = [
+            g._replace(
+                areas=tuple(
+                    p._replace(slice_id=s) for p, s in zip(g.areas, (1, 0, 3, 2))
+                )
+            )
+            for g in worker._logical_region_geometry
+        ]
+        peer = self._peer()
+        areas = worker._fan_in_peer_areas(1, 4)
+
+        remote = worker._build_head_matched_remote(peer, 1, 4, peer_areas=areas)
+
+        # Heads 2-3 are our area 0's, and all of peer rank 1's.
+        assert areas == [0]
+        first_block = [addr // 100_000 - 1 for addr, _len, _dev in remote[:4]]
+        assert first_block == [0, 1, 2, 3]
 
 
 class TestTheCompletionHookUpstreamActuallyCalls:
@@ -1200,12 +1267,11 @@ class TestStreamedEngineHandleWrite:
         w = TestPerShardWrite._writing_worker(ranks=1)
         w._overlapping_ranks = {}  # nothing narrowed: the engine handle
         window_mode(w, 2, chunk_mode=True)
-        w._chunk_grid = grid
+        w._chunk_grid = None if grid is None else uniform_grid(*grid, regions=2)
         w._request_tail = None
         w.num_regions = 2
         w._kv_per_block = kv_per_block
-        w._kv_areas = 1
-        w._kv_split_axis = KVSplitAxis.HEAD
+        fill_region_geometry(w, areas=1, axes=[ChipletSplitAxis.HEAD] * 2)
         w._physical_blocks_per_logical_kv_block = 1
         w._recving_metadata = {}
         w._group_specs = [
@@ -1332,6 +1398,38 @@ class TestStreamedEngineHandleWrite:
         # pairs by length -- it writes whatever KV sits at those block ids.
         assert first_local == [2, 10, 60, 62, 92, 94]
         assert second_local == [30, 46]
+
+    def test_a_handover_pairs_the_window_group_from_its_end(self):
+        # Once the window fits one block, the producer's window group leads
+        # with a null block while the consumer registers only the live one.
+        sent = []
+        for window_group in ([7], [0, 7]):
+            worker = self._worker()
+            worker._valid_tokens = {"r0": 3 * 16 + 8}
+            meta = self._offer(worker, ([0, 1, 2, 3], window_group), ([4, 5], [6]), 0)
+            worker._xfer_blocks_for_req("r0", meta)
+            call = worker.nixl_wrapper.make_prepped_xfer.call_args
+            sent.append((list(call.args[2]), list(call.args[4])))
+
+        assert sent[1] == sent[0]
+
+    def test_a_handover_short_of_a_registered_window_block_is_refused(self):
+        worker = self._worker()
+        worker._valid_tokens = {"r0": 3 * 16 + 8}
+        meta = self._offer(worker, ([0, 1, 2, 3], [7]), ([4, 5], [6, 8]), 0)
+
+        with pytest.raises(RuntimeError, match="pairs block lists"):
+            worker._xfer_blocks_for_req("r0", meta)
+
+    def test_a_handover_into_a_window_group_with_no_registered_block_is_refused(
+        self,
+    ):
+        worker = self._worker()
+        worker._valid_tokens = {"r0": 3 * 16 + 8}
+        meta = self._offer(worker, ([0, 1, 2, 3], [7]), ([4, 5], []), 0)
+
+        with pytest.raises(RuntimeError, match="pairs block lists"):
+            worker._xfer_blocks_for_req("r0", meta)
 
     def test_a_hybrid_whose_window_comes_first_counts_the_other_group(self):
         # The prompt's block count comes off the full-attention group, and
@@ -3083,20 +3181,19 @@ class TestStreamWindow:
         w = self._worker(total=total)
         w.block_size = 16
         w._physical_blocks_per_logical_kv_block = expand
-        w._kv_areas = areas
-        w._kv_split_axis = KVSplitAxis.NON_HEAD if areas > 1 else KVSplitAxis.HEAD
+        grid = uniform_grid(2, gpb, regions=areas, spans=areas)
         send = w._streamed["r0"]
         send.issued_hwm = hwm
         send.issued_chunks = chunks
         tail = None
         if valid is not None:
             set_shape(w, chunk_mode=True)
-            tail = w._tail_chunks(total, valid, chunks_per_span=gpb)
+            tail = w._tail_chunks(total, valid, chunk_grid=grid)
         return w, w._stream_window(
             "r0",
             (list(range(have)),),
             (list(range(100, 100 + registered)),),
-            chunk_grid=(2, gpb),
+            chunk_grid=grid,
             offered_tokens=offered,
             tail=tail,
             remote_expand=expand,
@@ -3126,7 +3223,7 @@ class TestStreamWindow:
         )
         _local, _remote, _span, pieces = out
 
-        assert pieces == ((1, 101, None, (1, 2)),)
+        assert pieces == ((1, 101, (1, 2)),)
 
     def test_an_offer_past_the_whole_prompt_is_refused(self):
         # Upstream truncates a P-side request so no decode step is scheduled,
@@ -3158,18 +3255,19 @@ class TestStreamWindow:
         w, out = self._chunked(total=4, offered=3 * 16 + 8, have=4, gpb=2, areas=2)
         _, _, span, pieces = out
 
-        assert pieces == ((3, 101, 0, (0, 2)),)
+        assert pieces == ((3, 101, (0, 2)),)
         assert span == (0, 1 * 4 + 2)
         assert w._streamed["r0"].issued_chunks == 2
 
-    def test_a_context_cut_splits_a_piece_that_crosses_an_area(self):
+    def test_a_context_cut_names_a_piece_that_crosses_an_area_once(self):
         # Twelve of sixteen tokens is three of the block's four chunks, which
-        # is area 0 whole and the first chunk of area 1. One range cannot name
-        # both, since each is indexed inside its own area.
+        # is area 0 whole and the first chunk of area 1. The piece counts in
+        # the block's chunks, and which regions hold them is the descriptor
+        # builders' to say.
         _, out = self._chunked(total=4, offered=3 * 16 + 12, have=4, gpb=2, areas=2)
         _, _, _, pieces = out
 
-        assert pieces == ((3, 101, 0, (0, 2)), (3, 101, 1, (0, 1)))
+        assert pieces == ((3, 101, (0, 3)),)
 
     def test_a_partial_last_block_leaves_as_chunks(self):
         # Four blocks held, three closed and the fourth holding 8 of 16 tokens.
@@ -3180,7 +3278,7 @@ class TestStreamWindow:
 
         assert local == ([2],) and remote == ([100],)
         assert span == (0, 1 * 2 + 1)
-        assert pieces == ((3, 101, None, (0, 1)),)  # block 3, their 101, chunk 0
+        assert pieces == ((3, 101, (0, 1)),)  # block 3, their 101, chunk 0
         assert w._streamed["r0"].issued_chunks == 1
 
     def test_the_next_batch_only_advances_the_chunks(self):
@@ -3195,7 +3293,7 @@ class TestStreamWindow:
         assert local == ([],) and remote == ([],)
         assert span == (1 * 4 + 2, 1 * 4 + 3)
         # Picks up where the last batch stopped.
-        assert pieces == ((3, 101, None, (2, 3)),)
+        assert pieces == ((3, 101, (2, 3)),)
 
     def test_a_block_that_closes_sends_only_the_chunks_still_missing(self):
         # Half of the consumer's block 1 went out as a chunk last batch. It has
@@ -3206,7 +3304,7 @@ class TestStreamWindow:
         local, remote, span, pieces = out
 
         assert local == ([],) and remote == ([],)
-        assert pieces == ((3, 101, None, (1, 2)),)  # chunk 1 only, not the block
+        assert pieces == ((3, 101, (1, 2)),)  # chunk 1 only, not the block
         assert span == (1 * 2 + 1, 2 * 2)
         assert w._streamed["r0"].issued_hwm == 2
         assert w._streamed["r0"].issued_chunks == 0
@@ -3231,7 +3329,7 @@ class TestStreamWindow:
         )
         _local, _remote, span, pieces = out
 
-        assert pieces == ((3, 101, None, (1, 2)),)  # chunk 1 only, not chunks 1..4
+        assert pieces == ((3, 101, (1, 2)),)  # chunk 1 only, not chunks 1..4
         # The range still names the whole request: it says what the write is
         # responsible for, not which descriptors went out.
         assert span == (1 * 4 + 1, 2 * 4)
@@ -3259,7 +3357,7 @@ class TestStreamWindow:
         # would be a second notification for one offer.
         worker = self._worker(total=4)
         worker.block_size = 16
-        worker._shard_chunk_grids = {("eng", 0): (2, 2)}
+        worker._shard_chunk_grids = {("eng", 0): uniform_grid(2, 2, regions=2)}
         meta = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
         meta.local_block_ids = pw.OfferedBlocks(
             meta.local_block_ids, 3 * 16 + 8, worker._streamed["r0"].serial
@@ -3284,9 +3382,8 @@ class TestStreamWindow:
         # its descriptors must not go out.
         worker = self._worker(total=4)
         worker.block_size = 16
-        worker._kv_areas = 2
-        worker._kv_split_axis = KVSplitAxis.NON_HEAD
-        worker._shard_chunk_grids = {("eng", 0): (1, 2)}
+        fill_region_geometry(worker, areas=2, axes=[ChipletSplitAxis.TOKEN], slices=2)
+        worker._shard_chunk_grids = {("eng", 0): uniform_grid(1, 2, regions=2, spans=2)}
         meta = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
         meta.local_block_ids = pw.OfferedBlocks(
             meta.local_block_ids, 3 * 16 + 8, worker._streamed["r0"].serial
@@ -3307,9 +3404,8 @@ class TestStreamWindow:
         # the span index -- every area holds chunk 0 of this block.
         worker = self._worker(total=4)
         worker.block_size = 16
-        worker._kv_areas = 2
-        worker._kv_split_axis = KVSplitAxis.NON_HEAD
-        worker._shard_chunk_grids = {("eng", 0): (1, 2)}
+        fill_region_geometry(worker, areas=2, axes=[ChipletSplitAxis.TOKEN], slices=2)
+        worker._shard_chunk_grids = {("eng", 0): uniform_grid(1, 2, regions=2, spans=2)}
         meta = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
         meta.local_block_ids = pw.OfferedBlocks(
             meta.local_block_ids, 3 * 16 + 12, worker._streamed["r0"].serial
@@ -3329,7 +3425,7 @@ class TestStreamWindow:
         prefill chunk is narrower than a block -- so it would be every block."""
         worker = self._worker(total=4)
         worker.block_size = 16
-        worker._shard_chunk_grids = {("eng", 0): (2, 2)}
+        worker._shard_chunk_grids = {("eng", 0): uniform_grid(2, 2, regions=2)}
 
         first = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
         first.local_block_ids = pw.OfferedBlocks(
@@ -3359,7 +3455,7 @@ class TestStreamWindow:
         worker = self._worker(total=4)
         worker.block_size = 16
         set_shape(worker, chunk_mode=True)
-        worker._shard_chunk_grids = {("eng", 0): (2, 2)}
+        worker._shard_chunk_grids = {("eng", 0): uniform_grid(2, 2, regions=2)}
         worker._valid_tokens = {"r0": 3 * 16 + 8}
 
         first = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
@@ -3385,7 +3481,7 @@ class TestStreamWindow:
         worker = self._worker(total=4)
         worker.block_size = 16
         set_shape(worker, chunk_mode=True)
-        worker._shard_chunk_grids = {("eng", 0): (2, 4)}
+        worker._shard_chunk_grids = {("eng", 0): uniform_grid(2, 4, regions=2)}
         worker._valid_tokens = {"r0": 3 * 16 + 12}
 
         first = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
@@ -3414,7 +3510,7 @@ class TestStreamWindow:
         worker = self._worker(total=4)
         worker.block_size = 16
         set_shape(worker, streams_prefix=True)
-        worker._shard_chunk_grids = {("eng", 0): (2, 2)}
+        worker._shard_chunk_grids = {("eng", 0): uniform_grid(2, 2, regions=2)}
         worker._valid_tokens = {"r0": 3 * 16 + 8}
 
         first = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
@@ -3438,7 +3534,7 @@ class TestStreamWindow:
         # consumer computes from that unit, and the request never settles.
         gpb, heads = 2, 2
         worker = self._worker()
-        worker._shard_chunk_grids = {("eng", 0): (heads, gpb)}
+        worker._shard_chunk_grids = {("eng", 0): uniform_grid(heads, gpb, regions=2)}
 
         worker._xfer_blocks_for_req(
             "r0", TestPerShardWrite._meta(([0, 1, 2],), ([4, 5, 6],))
@@ -3459,7 +3555,7 @@ class TestStreamWindow:
         gpb, heads = 2, 2
         worker = self._worker(total=4)
         worker.block_size = 16
-        worker._shard_chunk_grids = {("eng", 0): (heads, gpb)}
+        worker._shard_chunk_grids = {("eng", 0): uniform_grid(heads, gpb, regions=2)}
         meta = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5, 6, 7],))
         meta.local_block_ids = pw.OfferedBlocks(
             meta.local_block_ids, 49, worker._streamed["r0"].serial
@@ -3487,7 +3583,7 @@ class TestStreamWindow:
         gpb, heads, regions = 2, 2, 2
         worker = self._worker(total=4)
         worker.block_size = 16
-        worker._shard_chunk_grids = {("eng", 0): (heads, gpb)}
+        worker._shard_chunk_grids = {("eng", 0): uniform_grid(heads, gpb, regions=2)}
         whole_descs = regions * worker.num_blocks
 
         def decode(desc: int) -> set[tuple[int, int, int, int]]:
@@ -3563,7 +3659,10 @@ class TestStreamWindow:
         worker._recving_metadata = {}
         _send(worker, total=4)
         worker.block_size = 16
-        worker._shard_chunk_grids = {("eng", 0): (2, 2), ("eng", 1): second}
+        worker._shard_chunk_grids = {
+            ("eng", 0): uniform_grid(2, 2, regions=2),
+            ("eng", 1): None if second is None else uniform_grid(*second, regions=2),
+        }
         meta = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
         meta.local_block_ids = pw.OfferedBlocks(
             meta.local_block_ids, 3 * 16 + 8, worker._streamed["r0"].serial

@@ -98,6 +98,18 @@ def check_and_update(vllm_config: "VllmConfig") -> None:
         with contextlib.suppress(KeyError):
             del model_config.__dict__["is_encoder_decoder"]
 
+    # When the sliding window is at least max_model_len, drop it as
+    # --disable-sliding-window does. This keeps vLLM in sync with optimum-rbln's
+    # RBLNPhi3ForCausalLM
+    text_config = model_config.hf_text_config
+    window = getattr(text_config, "sliding_window", None)
+    if (
+        "Phi3ForCausalLM" in (model_config.architectures or [])
+        and window is not None
+        and window >= model_config.max_model_len
+    ):
+        text_config.sliding_window = None
+
     disable_unsupported_prefix_caching(vllm_config)
     sync_vllm_and_optimum(vllm_config)
 
