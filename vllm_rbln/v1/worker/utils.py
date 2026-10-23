@@ -1043,7 +1043,7 @@ def get_cgroup_cpu_quota(
     A Kubernetes CPU limit is a CFS quota, not a cpuset, so it does not show
     up in ``sched_getaffinity``.
     """
-    quotas = []
+    quotas: list[float | None] = []
     try:
         with open(proc_cgroup) as f:
             lines = f.read().splitlines()
@@ -1060,8 +1060,8 @@ def get_cgroup_cpu_quota(
                 path = os.path.dirname(path)
     for v1_dir in ("cpu", "cpu,cpuacct"):
         quotas.append(_read_cgroup_v1_quota(os.path.join(cgroup_root, v1_dir)))
-    quotas = [q for q in quotas if q is not None]
-    return min(quotas) if quotas else None
+    limits = [q for q in quotas if q is not None]
+    return min(limits) if limits else None
 
 
 def get_default_num_threads(allocated_cpus: int) -> int:
