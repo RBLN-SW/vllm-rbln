@@ -2228,10 +2228,10 @@ class TestChunkModeWithASlidingWindow:
             )
 
     def test_a_streamed_hybrid_on_a_context_cut_is_refused(self, monkeypatch):
-        # A hybrid stays on the whole-engine lists whichever asked for the
-        # chunks, and those lists name every region's chunks with no way to say
-        # which span holds the last token. Streaming reaches them without the
-        # knob, so the refusal cannot be the knob's alone.
+        # A hybrid that writes part of a request stays on the whole-engine
+        # lists. Streaming alone cuts no block but still counts its coverage in
+        # spans those lists were never shown to place, so the refusal cannot be
+        # the knob's alone.
         with pytest.raises(RuntimeError, match="needs a head cut"):
             self._register(
                 monkeypatch,
@@ -2252,7 +2252,7 @@ class TestChunkModeWithASlidingWindow:
             )
 
     def test_a_streamed_engine_with_no_full_group_is_refused(self, monkeypatch):
-        # Streaming names part of a block without the knob, so the refusal
+        # Streaming writes part of a request without the knob, so the refusal
         # cannot be the knob's: this engine registers, and the write path's
         # asserts then name a group it has none of, mid-transfer.
         with pytest.raises(RuntimeError, match="one full-attention"):

@@ -59,7 +59,7 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
         super().__init__(vllm_config, engine_id, kv_cache_config)
 
         # Tokens of each request's prefix already offered, so a step that
-        # closes nothing new offers nothing.
+        # releases nothing new offers nothing.
         self._released_tokens: dict[str, int] = {}
         # Requests offered early, kept until either the lease takes over
         # (terminal finish) or their blocks go back to the allocator without

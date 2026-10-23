@@ -253,11 +253,11 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         """Whether the whole-engine lists carry a range upstream has no room for.
 
         Upstream names a region's block once. A window range cuts that block
-        again; naming part of a block needs a list that can name both KV
+        again; writing part of a request needs a list that can name both KV
         groups, which a per-shard list cannot since each names one. So a hybrid
-        belongs here whether a knob or a streamed write cuts that block, while
-        a single-group engine's chunk range rides the shard lists. A window as
-        wide as the block adds no range at all.
+        belongs here whether chunk mode or a streamed write writes that part,
+        while a single-group engine's chunk range rides the shard lists. A
+        window as wide as the block adds no range at all.
         """
         return self._shape.owns_engine_lists
 

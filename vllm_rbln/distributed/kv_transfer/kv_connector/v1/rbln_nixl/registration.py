@@ -479,14 +479,14 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         # Streaming names part of a request for its own reason and needs the
         # same shape to do it: one group whose blocks it counts in, and any
         # other group described by a range of its own.
-        cutter = "chunk_mode" if self._shape.chunk_mode else "a streamed write"
+        writer = "chunk_mode" if self._shape.chunk_mode else "a streamed write"
         # One group is all it asks: `_own_engine_layout` is already true for
         # every multi-group engine that writes part of a request, and both
         # counts come off `transfer_groups`, so a second term could only repeat
         # this.
         if self._shape.writes_part_of_a_request and full_groups != 1:
             raise RuntimeError(
-                f"RBLN NIXL (D2D): {cutter} needs one full-attention KV-cache "
+                f"RBLN NIXL (D2D): {writer} needs one full-attention KV-cache "
                 "group, and any other group to be a sliding window whose view "
                 f"it can extend. Got groups={len(self._group_specs)}, "
                 f"full={full_groups}, swa={self._shape.has_swa}, "
@@ -504,7 +504,7 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
             and ChipletSplitAxis.TOKEN in region_axes
         ):
             raise RuntimeError(
-                f"RBLN NIXL (D2D): {cutter} on a sliding-window engine needs "
+                f"RBLN NIXL (D2D): {writer} on a sliding-window engine needs "
                 "a head cut, which leaves one token range a block. This cache "
                 f"is cut on the axes {[a.name for a in region_axes]} into "
                 f"{areas} area(s)."

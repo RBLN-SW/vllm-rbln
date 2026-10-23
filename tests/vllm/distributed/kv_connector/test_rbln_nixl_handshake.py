@@ -5486,9 +5486,9 @@ class TestSplitAxisConstraints:
             w._check_split_axis_constraints(meta, 1)
 
     def test_a_streaming_peer_must_size_its_block_the_same(self):
-        # Streaming names part of the block a prefill is filling, by the same
-        # grid the knob cuts a last block with -- so it needs the peer to hold
-        # the same count, whether or not that knob is on.
+        # Streaming alone cuts no block, but it places the blocks a prefill
+        # closes by counting them on both sides -- so it needs the peer to hold
+        # the same count, whether or not chunk mode is on.
         w = self._worker(
             axis=ChipletSplitAxis.TOKEN,
             stream=True,

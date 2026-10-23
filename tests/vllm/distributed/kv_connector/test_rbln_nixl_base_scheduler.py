@@ -578,8 +578,8 @@ class TestEarlyOfferOnTheWritePath:
         assert meta.reqs_to_save["prefill"].local_block_ids == ([1],)
 
     def test_a_step_that_closes_no_block_offers_nothing(self):
-        # Each offer wakes the writer, and a step inside a block has nothing
-        # new for it.
+        # Each offer wakes the writer, and a step inside a block short of the
+        # last has nothing new for it.
         sched = self._chunking_scheduler(8)
         req = _Request("prefill", num_prompt_tokens=512)
         sched._reqs_need_save["prefill"] = req
