@@ -188,8 +188,9 @@ class TestGetOutput:
 
     @pytest.mark.use_device
     def test_device_tokens_are_copied_behind_the_sampler(self):
-        # A compiled sampler output stays on the device, so this is a real async D2H;
-        # a tensor moved over with .to("rbln") would be copied back synchronously.
+        # The D2H is async only if the source lives on the device. A sampler
+        # output does, hence the compiled sampler; a tensor fresh from .to("rbln")
+        # is still host-resident.
         greedy = compile_sampler(rbln_greedy_sample, None)
         logits = torch.tensor([[0.0, 5.0, 1.0], [9.0, 0.0, 2.0]], dtype=torch.float16)
         src = greedy(logits.to("rbln")).unsqueeze(-1)

@@ -64,6 +64,7 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
             sampled_token_ids.shape,
             dtype=sampled_token_ids.dtype,
             device="cpu",
+            # Pinned, or torch-rbln turns the non_blocking copy below into a sync one.
             pin_memory=not sampled_token_ids.is_cpu,
         )
         # Start the D2H right behind the sampler, as AsyncGPUModelRunnerOutput
