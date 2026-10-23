@@ -156,7 +156,7 @@ def _split_kv(num_blocks):
 
 
 def _patch_worker_nixl_symbols(
-    topo, *, mamba_spec=None, uniform_spec=None, topology_cls=None
+    topo, *, mamba_spec=None, uniform_spec=None, topology_cls=None, hash_fn=None
 ):
     # The isinstance() targets get a dummy class, which the Full-attention specs
     # cannot match; a test that wants one of those branches passes the real
@@ -167,7 +167,7 @@ def _patch_worker_nixl_symbols(
     msgspec_mock.msgpack.Encoder.return_value.encode.return_value = b"meta"
     return patch_in_package(
         RblnTransferTopology=topology_cls or MagicMock(return_value=topo),
-        compute_nixl_compatibility_hash=MagicMock(return_value="hash"),
+        compute_nixl_compatibility_hash=hash_fn or MagicMock(return_value="hash"),
         MambaSpec=mamba_spec or type("MambaSpec", (), {}),
         UniformTypeKVCacheSpecs=uniform_spec or type("UniformTypeKVCacheSpecs", (), {}),
         NixlAgentMetadata=MagicMock(),
@@ -192,6 +192,10 @@ _STAGES = (
     ("BACKEND_B", ("BACKEND_B",)),
     ("BACKEND_A", ("BACKEND_A",)),
 )
+
+
+def _hash_by_backend():
+    return MagicMock(side_effect=lambda cfg, name, **kw: f"hash:{name}")
 
 
 def _backends(names):
@@ -490,7 +494,8 @@ class TestRegisterKvCaches:
 
     def test_host_staging_publishes_one_hash_across_pipeline_stages(self, monkeypatch):
         # This path keeps upstream's registration, whose hash takes the rank's
-        # first backend; what it publishes must not.
+        # first backend; what it publishes must not. Upstream's registration is
+        # stubbed out, so the hash and payload it would leave are seeded here.
         names, published = [], []
         for backend_name, backends in _STAGES:
             worker = build_worker(
@@ -517,7 +522,7 @@ class TestRegisterKvCaches:
             monkeypatch.setattr(
                 NixlBaseConnectorWorker, "register_kv_caches", lambda self, kv: None
             )
-            with _patch_worker_nixl_symbols(MagicMock()):
+            with _patch_worker_nixl_symbols(MagicMock(), hash_fn=_hash_by_backend()):
                 worker.register_kv_caches({"layer0": "tensor"})
                 names.append(_hashed_backend_name())
             published.append(worker.compat_hash)
@@ -717,7 +722,11 @@ class TestRegisterKvCachesImpl:
             spec = _impl_layer_spec()
             worker._layer_specs = {"l0": spec, "l1": spec}
             kv_caches = _impl_kv_caches(num_blocks=worker.num_blocks)
-            with _registering(worker, _impl_topo(_split_kv(worker.num_blocks))):
+            with _registering(
+                worker,
+                _impl_topo(_split_kv(worker.num_blocks)),
+                hash_fn=_hash_by_backend(),
+            ):
                 worker._register_kv_caches_impl(kv_caches)
                 names.append(_hashed_backend_name())
             published.append(worker.compat_hash)
