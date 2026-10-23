@@ -420,6 +420,7 @@ class RBLNGlm5MoE(nn.Module):
     ) -> None:
         super().__init__()
         assert config.hidden_act == "silu"
+        self.tp_size = get_tensor_model_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
         self.gate = GateLinear(
             config.hidden_size,
@@ -438,8 +439,8 @@ class RBLNGlm5MoE(nn.Module):
             config.moe_intermediate_size * config.n_shared_experts,
             config.swiglu_limit,
             quant_config,
-            # TP: the routed experts reduce their own output; reduce this one too.
-            reduce_results=True,
+            # forward reduces the shared and routed experts' sum over the TP ranks.
+            reduce_results=False,
             prefix=f"{prefix}.shared_experts",
         )
         self.experts = FusedMoEFactory(
@@ -466,7 +467,10 @@ class RBLNGlm5MoE(nn.Module):
             hidden_states=hidden_states,
             router=lambda x: self.gate(x.to(torch.float32))[0],
         )
-        return routed * self.routed_scaling_factor + self.shared_experts(hidden_states)
+        out = routed * self.routed_scaling_factor + self.shared_experts(hidden_states)
+        # The RBLN MoE runner combines over the DP group only: a TP rank's routed
+        # output is its share of the experts (EP) or of their intermediate (no EP).
+        return tensor_model_parallel_all_reduce(out) if self.tp_size > 1 else out
 
 
 class RBLNGlm5KDA(nn.Module):
