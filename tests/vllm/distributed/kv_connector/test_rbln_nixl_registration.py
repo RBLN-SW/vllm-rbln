@@ -74,6 +74,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.push_worker imp
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
     AreaPlace,
     ChunkGrid,
+    Piece,
     RegionGeometry,
 )
 
@@ -2034,7 +2035,19 @@ class TestTheLayoutReachesTheDescriptors:
         topo.tp_size = 1
         topo.tp_ratio.return_value = 2
         w.transfer_topo = topo
+        w.tp_rank = 0
+        w.block_len_per_layer = [256]
         return w
+
+    @staticmethod
+    def _peer(areas):
+        # A TP1 peer: our one area's 8 heads over `areas` areas of its own.
+        return SimpleNamespace(
+            kv_area_slices=area_slices(areas, areas, 1),
+            kv_split_axes=[ChipletSplitAxis.HEAD],
+            block_size=16,
+            block_lens=[256 // areas] * areas,
+        )
 
     @pytest.mark.parametrize(
         "kv_per_block, expected",
@@ -2043,17 +2056,16 @@ class TestTheLayoutReachesTheDescriptors:
     def test_a_peer_of_a_different_width_takes_the_layout_s_kv_count(
         self, kv_per_block, expected
     ):
+        # A band read out of a packed block sits once in K and once in V.
         w = self._worker(kv_per_block)
-        meta = MagicMock()
-        meta.kv_area_slices = area_slices(2, 2, 1)
-        assert w._peer_kv_runs(meta, remote_tp_size=1) == expected
+        _, pieces = w._head_matched_plan(self._peer(2), 0, 1)
+        assert len(pieces[0]) == 2 * expected
 
     def test_a_peer_of_our_own_width_never_splits(self):
         # Both sides name whole blocks, so the layout does not matter.
         w = self._worker(PACKED)
-        meta = MagicMock()
-        meta.kv_area_slices = area_slices(1, 1, 1)
-        assert w._peer_kv_runs(meta, remote_tp_size=1) == 1
+        _, pieces = w._head_matched_plan(self._peer(1), 0, 1)
+        assert pieces == [[Piece(0, 0, 0, 256, 2 * 8)]]
 
     def test_a_split_alone_keeps_the_handler_off_upstream_s_fast_path(self):
         # `register_local_xfer_handler` hands a whole-engine peer to upstream's
@@ -2061,22 +2073,14 @@ class TestTheLayoutReachesTheDescriptors:
         # narrowed: upstream names a block once and our list names it per range.
         w = self._worker(PACKED)
         w.local_seen_layer_names = ["layer.0"]
+        pieces = [[Piece(0, 0, 0, 128, 8), Piece(128, 0, 128, 128, 8)]]
 
         with patch.object(
             RblnNixlPullConnectorWorker, "_register_shard_local_xfer_handler"
         ) as shard:
-            w.register_local_xfer_handler(16, kv_runs=2)
+            w.register_local_xfer_handler(16, pieces=pieces)
 
-        assert shard.call_args.kwargs["kv_runs"] == 2
-
-    def test_host_staging_never_splits(self):
-        # Host staging registers whole logical buffers and is kept off every
-        # head-matched path, so it reads a block as one range.
-        w = self._worker(PACKED)
-        w.use_host_buffer = True
-        meta = MagicMock()
-        meta.kv_area_slices = area_slices(2, 2, 1)
-        assert w._peer_kv_runs(meta, remote_tp_size=1) == 1
+        assert shard.call_args.kwargs["pieces"] == pieces
 
 
 class TestTailBlockTrim:
@@ -2133,7 +2137,7 @@ class TestTailBlockTrim:
         )
 
         assert worker._chunk_grid == worker._shard_chunk_grid(
-            range(worker.num_regions), block_size=worker.block_size, split=1
+            range(worker.num_regions), block_size=worker.block_size
         )
         assert worker._chunk_grid is not None
 

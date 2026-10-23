@@ -44,6 +44,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_worker imp
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.push_worker import (
     RblnNixlPushConnectorWorker,
 )
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import Piece
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 
 
@@ -422,7 +423,8 @@ class TestSwaWindowDelegation:
             lambda self, *args, **kwargs: "shard",
         )
 
-        assert worker.register_local_xfer_handler(64, replica_fanout=2) == "shard"
+        two_copies = [[Piece(0, 0, 0, 64, 1), Piece(0, 1, 0, 64, 1)]]
+        assert worker.register_local_xfer_handler(64, pieces=two_copies) == "shard"
 
     def test_add_remote_agent_delegates_when_no_swa(self, monkeypatch):
         worker = build_worker(monkeypatch)  # window_ratio is None

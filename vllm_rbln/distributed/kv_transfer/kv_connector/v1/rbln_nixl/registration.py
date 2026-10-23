@@ -534,7 +534,7 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         # selects in. The window range has no such parameter, so the builders
         # read the value parked here rather than ask twice.
         self._chunk_grid = self._shard_chunk_grid(
-            range(self.num_regions), block_size=self.block_size, split=1
+            range(self.num_regions), block_size=self.block_size
         )
         self._window_grid_cut = self._window_grid()
         # Said once here rather than per peer: every list counts a block in
