@@ -22,6 +22,7 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 
 from vllm_rbln.patches.registry import register_patch
 
+# TODO(vllm-project/vllm#63288): delete this module once the vllm pin has it.
 # Held at import time: the registry replaces the attributes outright.
 kv_cache_manager_original_allocate_slots = KVCacheManager.allocate_slots
 kv_cache_coordinator_original_get_num_blocks_to_allocate = (
