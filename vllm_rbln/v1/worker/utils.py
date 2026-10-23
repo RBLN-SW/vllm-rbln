@@ -1014,7 +1014,7 @@ def _read_cgroup_v2_quota(path: str) -> float | None:
     try:
         with open(os.path.join(path, "cpu.max")) as f:
             quota, period = f.read().split()[:2]
-    except (OSError, ValueError):
+    except OSError:
         return None
     if quota == "max":
         return None
@@ -1027,7 +1027,7 @@ def _read_cgroup_v1_quota(path: str) -> float | None:
             quota = int(f.read())
         with open(os.path.join(path, "cpu.cfs_period_us")) as f:
             period = int(f.read())
-    except (OSError, ValueError):
+    except OSError:
         return None
     if quota <= 0 or period <= 0:
         return None
@@ -1064,12 +1064,20 @@ def get_cgroup_cpu_quota(
     return min(limits) if limits else None
 
 
-def get_default_num_threads(allocated_cpus: int) -> int:
+def get_num_local_ranks(parallel_config: ParallelConfig) -> int:
+    """Worker processes on this node, which share the container's cgroup."""
+    return max(
+        1, parallel_config.local_world_size * parallel_config.data_parallel_size_local
+    )
+
+
+def get_default_num_threads(allocated_cpus: int, num_local_ranks: int = 1) -> int:
     """Default torch/OpenMP thread count: half the usable CPUs (physical cores,
-    excluding HT siblings), capped by the cgroup CPU quota."""
+    excluding HT siblings), capped by this rank's share of the cgroup CPU
+    quota."""
     quota = get_cgroup_cpu_quota()
     if quota is not None:
-        allocated_cpus = min(allocated_cpus, math.floor(quota))
+        allocated_cpus = min(allocated_cpus, math.floor(quota / num_local_ranks))
     return max(2, allocated_cpus // 2)
 
 

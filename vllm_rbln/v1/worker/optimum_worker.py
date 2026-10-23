@@ -45,6 +45,7 @@ from vllm_rbln.v1.worker.utils import (
     RblnProfilerWrapper,
     get_cgroup_cpu_quota,
     get_default_num_threads,
+    get_num_local_ranks,
     set_omp_num_threads,
 )
 
@@ -105,15 +106,20 @@ class RBLNOptimumWorker(WorkerBase):
         # NUMA node, which causes severe latency regression on high-core-count
         # servers (e.g. 128 core → 32x slower).
         allocated_cpus = len(os.sched_getaffinity(0))
+        num_local_ranks = get_num_local_ranks(self.vllm_config.parallel_config)
         set_omp_num_threads(
-            self.rank, self.local_rank, get_default_num_threads(allocated_cpus)
+            self.rank,
+            self.local_rank,
+            get_default_num_threads(allocated_cpus, num_local_ranks),
         )
         num_threads = torch.get_num_threads()
         logger.info(
-            "Setting threads to %d (%d CPUs in affinity, cgroup CPU quota %s).",
+            "Setting threads to %d (%d CPUs in affinity, cgroup CPU quota %s "
+            "shared by %d local ranks).",
             num_threads,
             allocated_cpus,
             get_cgroup_cpu_quota(),
+            num_local_ranks,
         )
         for var in (
             "OMP_NUM_THREADS",
