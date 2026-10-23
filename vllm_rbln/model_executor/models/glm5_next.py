@@ -47,7 +47,12 @@ from rebel.ops.torch_custom_ops import sparse_attn_glm5 as _rbln_glm5_ops
 from torch import nn
 from transformers import PretrainedConfig
 from vllm.config import VllmConfig, get_current_vllm_config
-from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_pp_group,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.distributed import utils as dist_utils
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -68,7 +73,10 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.model_loader.weight_utils import (
+    default_weight_loader,
+    sharded_weight_loader,
+)
 from vllm.model_executor.models.glm4_1v import Glm4vDummyInputsBuilder
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
@@ -144,7 +152,8 @@ def kda_head_groups(vllm_config: VllmConfig) -> int:
     block_size = vllm_config.cache_config.block_size
     state_bytes = KDA_HEAD_DIM * KDA_HEAD_DIM * vllm_config.model_config.dtype.itemsize
     latent_bytes = block_size * config.kv_lora_rank  # fp8
-    num_heads = config.linear_num_heads
+    # This TP rank's heads: tensor parallel cuts the KDA heads.
+    num_heads = config.linear_num_heads // get_tensor_model_parallel_world_size()
     if latent_bytes % state_bytes or num_heads % (latent_bytes // state_bytes):
         raise ValueError(
             f"GLM-5.3: block_size {block_size} does not split the {num_heads} KDA "
@@ -324,7 +333,8 @@ class RBLNGlm5AuxCache(_RBLNGlm5Cache):
 
 
 class _ConvWeight(nn.Module):
-    """A depthwise conv's taps as ``[channels, taps]`` (the checkpoint's ``[C, 1, taps]``)."""
+    """A depthwise conv's taps as ``[channels, taps]`` (the checkpoint's ``[C, 1, taps]``),
+    this TP rank's channels (its heads')."""
 
     def __init__(self, channels: int, taps: int) -> None:
         super().__init__()
@@ -333,7 +343,11 @@ class _ConvWeight(nn.Module):
 
     @staticmethod
     def _load(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
-        param.data.copy_(loaded_weight.reshape(param.shape))
+        channels = param.shape[0]
+        start = get_tensor_model_parallel_rank() * channels
+        param.data.copy_(
+            loaded_weight.reshape(-1, param.shape[1]).narrow(0, start, channels)
+        )
 
 
 class RBLNRMSNorm(nn.Module):
@@ -424,7 +438,8 @@ class RBLNGlm5MoE(nn.Module):
             config.moe_intermediate_size * config.n_shared_experts,
             config.swiglu_limit,
             quant_config,
-            reduce_results=False,
+            # TP: the routed experts reduce their own output; reduce this one too.
+            reduce_results=True,
             prefix=f"{prefix}.shared_experts",
         )
         self.experts = FusedMoEFactory(
@@ -460,11 +475,14 @@ class RBLNGlm5KDA(nn.Module):
     def __init__(self, config: PretrainedConfig, prefix: str) -> None:
         super().__init__()
         hidden_size = config.hidden_size
-        self.num_heads = config.linear_num_heads
+        # Tensor parallel cuts the heads (and with them the conv channels, the states).
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.num_heads = config.linear_num_heads // self.tp_size
         self.head_dim = config.linear_head_dim
         assert self.head_dim == KDA_HEAD_DIM
         self.lower_bound = config.linear_lower_bound
-        proj = self.num_heads * self.head_dim
+        proj = self.num_heads * self.head_dim  # this rank's
+        full_proj = proj * self.tp_size
         taps = config.linear_conv_kernel_dim
 
         def linear(name: str, in_size: int, out_size: int) -> ColumnParallelLinear:
@@ -472,14 +490,21 @@ class RBLNGlm5KDA(nn.Module):
                 in_size, out_size, bias=False, prefix=f"{prefix}.{name}"
             )
 
-        self.q_proj = linear("q_proj", hidden_size, proj)
-        self.k_proj = linear("k_proj", hidden_size, proj)
-        self.v_proj = linear("v_proj", hidden_size, proj)
-        self.b_proj = linear("b_proj", hidden_size, self.num_heads)
-        self.f_a_proj = linear("f_a_proj", hidden_size, self.head_dim)
-        self.f_b_proj = linear("f_b_proj", self.head_dim, proj)
-        self.g_a_proj = linear("g_a_proj", hidden_size, self.head_dim)
-        self.g_b_proj = linear("g_b_proj", self.head_dim, proj)
+        def replicated(name: str, in_size: int, out_size: int) -> ReplicatedLinear:
+            return ReplicatedLinear(
+                in_size, out_size, bias=False, prefix=f"{prefix}.{name}"
+            )
+
+        self.q_proj = linear("q_proj", hidden_size, full_proj)
+        self.k_proj = linear("k_proj", hidden_size, full_proj)
+        self.v_proj = linear("v_proj", hidden_size, full_proj)
+        self.b_proj = linear("b_proj", hidden_size, self.num_heads * self.tp_size)
+        # The low-rank a factors stay whole on every rank (fuse_low_rank multiplies
+        # this rank's rows of b by all of a).
+        self.f_a_proj = replicated("f_a_proj", hidden_size, self.head_dim)
+        self.f_b_proj = linear("f_b_proj", self.head_dim, full_proj)
+        self.g_a_proj = replicated("g_a_proj", hidden_size, self.head_dim)
+        self.g_b_proj = linear("g_b_proj", self.head_dim, full_proj)
         self.q_conv1d = _ConvWeight(proj, taps)
         self.k_conv1d = _ConvWeight(proj, taps)
         self.v_conv1d = _ConvWeight(proj, taps)
@@ -489,6 +514,8 @@ class RBLNGlm5KDA(nn.Module):
         self.dt_bias = nn.Parameter(
             torch.empty(proj, dtype=torch.float32), requires_grad=False
         )
+        for param in (self.A_log, self.dt_bias):
+            param.weight_loader = sharded_weight_loader(0)
         # f_b(f_a(x)) and g_b(g_a(x)) as one [proj, hidden] weight each (fuse_low_rank):
         # RSD cuts the rank-128 contraction 2 ways and reduces onto 2 of its 4 nodes,
         # which then strands the KDA state there.
@@ -500,10 +527,11 @@ class RBLNGlm5KDA(nn.Module):
         )
         self.o_norm = RBLNRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.o_proj = RowParallelLinear(
-            proj, hidden_size, bias=False, prefix=f"{prefix}.o_proj"
+            full_proj, hidden_size, bias=False, prefix=f"{prefix}.o_proj"
         )
-        # forward takes o_proj's columns a head group at a time: whole, unquantized.
-        assert self.o_proj.tp_size == 1 and hasattr(self.o_proj, "weight")
+        # forward takes o_proj's columns (this rank's) a head group at a time,
+        # unquantized, and reduces the sum over the TP ranks itself.
+        assert hasattr(self.o_proj, "weight")
 
         vllm_config = get_current_vllm_config()
         dtype = vllm_config.model_config.dtype
@@ -709,7 +737,8 @@ class RBLNGlm5KDA(nn.Module):
             outs.append(
                 F.linear(o.reshape(batch, tokens, -1), self.o_proj.weight[:, channels])
             )
-        return sum(outs[1:], outs[0])
+        out = sum(outs[1:], outs[0])
+        return tensor_model_parallel_all_reduce(out) if self.tp_size > 1 else out
 
 
 class RBLNGlm5Indexer(nn.Module):
@@ -838,7 +867,10 @@ class RBLNGlm5DSA(nn.Module):
         super().__init__()
         assert config.qk_rope_head_dim == 0
         hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
+        # Tensor parallel cuts the heads (q_b / kv_b columns, o_proj rows); the latent
+        # cache and the indexer stay whole on every rank.
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.num_heads = config.num_attention_heads // self.tp_size
         self.qk_nope_head_dim = config.qk_nope_head_dim
         self.v_head_dim = config.v_head_dim
         self.kv_lora_rank = config.kv_lora_rank
@@ -853,7 +885,7 @@ class RBLNGlm5DSA(nn.Module):
         self.q_a_layernorm = RBLNRMSNorm(config.q_lora_rank, eps=config.rms_norm_eps)
         self.q_b_proj = ColumnParallelLinear(
             config.q_lora_rank,
-            self.num_heads * self.qk_nope_head_dim,
+            config.num_attention_heads * self.qk_nope_head_dim,
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.q_b_proj",
@@ -868,12 +900,12 @@ class RBLNGlm5DSA(nn.Module):
         self.kv_a_layernorm = RBLNRMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
-            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+            config.num_attention_heads * (self.qk_nope_head_dim + self.v_head_dim),
             bias=False,
             prefix=f"{prefix}.kv_b_proj",
         )
         self.o_proj = RowParallelLinear(
-            self.num_heads * self.v_head_dim,
+            config.num_attention_heads * self.v_head_dim,
             hidden_size,
             bias=False,
             quant_config=quant_config,
@@ -1138,8 +1170,6 @@ class RBLNGlm5Model(nn.Module):
         config = vllm_config.model_config.hf_text_config
         self.config = config
         assert config.mhc
-        if get_tensor_model_parallel_world_size() != 1:
-            raise NotImplementedError("GLM-5.3 on RBLN runs at tensor parallel size 1")
         quant_config = vllm_config.quant_config
         self.n = config.mhc_num_residual_streams
 
