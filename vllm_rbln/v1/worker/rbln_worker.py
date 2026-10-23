@@ -74,6 +74,7 @@ from vllm_rbln.v1.worker.utils import (
     dynamic_kv_enabled,
     estimate_model_kernel_size,
     get_default_num_threads,
+    get_num_local_ranks,
     get_rbln_planned_affinity_cpu_count,
     read_rbln_card_dram_used_bytes,
     set_cpu_affinity,
@@ -767,7 +768,9 @@ class RBLNWorker(WorkerBase):
             self.local_rank,
             self.parallel_config,
         )
-        num_threads = get_default_num_threads(allocated_cpus)
+        num_threads = get_default_num_threads(
+            allocated_cpus, get_num_local_ranks(self.parallel_config)
+        )
         set_omp_num_threads(
             self.rank,
             self.local_rank,
