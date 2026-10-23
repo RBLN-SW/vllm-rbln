@@ -14,16 +14,29 @@
 
 """MiniMax-M3 sparse attention (MSA) backends for RBLN."""
 
+from copy import copy
 from typing import ClassVar
 
 import torch
+from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import AttentionBackend, MultipleOf
+from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import KVCacheSpec
 
 from .flash_attention import RBLNFlashAttentionMetadataBuilder
 
 MSA_SPARSE_BLOCK_SIZE = 128
 _MSA_KERNEL_BLOCK_SIZE = MultipleOf(4 * MSA_SPARSE_BLOCK_SIZE)
+
+
+class RBLNMiniMaxM3MetadataBuilder(RBLNFlashAttentionMetadataBuilder):
+    def build(self, common_attn_metadata: CommonAttentionMetadata, *args, **kwargs):
+        width = cdiv(self.model_config.max_model_len, self.block_size)
+        common_attn_metadata = copy(common_attn_metadata)
+        common_attn_metadata.block_table_tensor = (
+            common_attn_metadata.block_table_tensor[..., :width]
+        )
+        return super().build(common_attn_metadata, *args, **kwargs)
 
 
 class RBLNMiniMaxM3SparseBackend(AttentionBackend):
@@ -53,8 +66,8 @@ class RBLNMiniMaxM3SparseBackend(AttentionBackend):
         return [128]
 
     @staticmethod
-    def get_builder_cls() -> type["RBLNFlashAttentionMetadataBuilder"]:
-        return RBLNFlashAttentionMetadataBuilder
+    def get_builder_cls() -> type[RBLNMiniMaxM3MetadataBuilder]:
+        return RBLNMiniMaxM3MetadataBuilder
 
     @staticmethod
     def get_kv_cache_shape(
@@ -102,8 +115,8 @@ class RBLNMiniMaxM3IndexerBackend(AttentionBackend):
         return [128]
 
     @staticmethod
-    def get_builder_cls() -> type["RBLNFlashAttentionMetadataBuilder"]:
-        return RBLNFlashAttentionMetadataBuilder
+    def get_builder_cls() -> type[RBLNMiniMaxM3MetadataBuilder]:
+        return RBLNMiniMaxM3MetadataBuilder
 
     @staticmethod
     def get_kv_cache_shape(

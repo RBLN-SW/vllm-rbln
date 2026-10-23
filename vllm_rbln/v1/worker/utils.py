@@ -440,12 +440,10 @@ def dynamic_kv_unsupported_reason(vllm_config: VllmConfig) -> str | None:
             "no dynamic KV input"
         )
     speculative = vllm_config.speculative_config
-    if speculative is not None and speculative.method == "dflash":
-        # `use_non_causal` lives on the draft config only; the RBLN drafter is
-        # non-causal by requirement.
+    if speculative is not None and speculative.method in ("dflash", "dspark"):
         return (
-            "the DFlash drafter is non-causal, and its attention kernel does "
-            "not accept a dynamic KV input"
+            "DFlash/DSpark context KV writes require a statically sized cache; "
+            "dynamic KV resizing is not supported by the proposer"
         )
     if vllm_config.cache_config.block_size == vllm_config.model_config.max_model_len:
         # This selects the normal-attention kernels unless the model supplies
@@ -1121,7 +1119,13 @@ def prepare_kernel_block_sizes(
     Returns:
         List of kernel block sizes for each cache group.
     """
+    from vllm_rbln.v1.attention.backends.minimax_m3 import (
+        RBLNMiniMaxM3IndexerBackend,
+        RBLNMiniMaxM3SparseBackend,
+    )
+
     kernel_block_sizes = []
+    msa_groups = []
     for kv_cache_gid, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
         kv_cache_spec = kv_cache_group.kv_cache_spec
         if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
@@ -1136,7 +1140,10 @@ def prepare_kernel_block_sizes(
             ):
                 # The shift kernel holds one window per block; the append kernel
                 # gathers whole blocks around the window, whatever their size.
-                kernel_block_sizes.append(kv_cache_spec.sliding_window)
+                block_size = kv_cache_spec.sliding_window
+                if not isinstance(kv_cache_spec, RBLNSlidingWindowSpec):
+                    block_size = math.gcd(kv_cache_spec.block_size, block_size)
+                kernel_block_sizes.append(block_size)
             else:
                 # A sub-block copy slices the buffer the compiled graph reads,
                 # and this layer shares it with a full-attention layer on the
@@ -1150,6 +1157,13 @@ def prepare_kernel_block_sizes(
             selected_kernel_size = select_common_block_size(
                 kv_manager_block_size, group_backends
             )
+            if any(
+                issubclass(
+                    backend, (RBLNMiniMaxM3SparseBackend, RBLNMiniMaxM3IndexerBackend)
+                )
+                for backend in group_backends
+            ):
+                msa_groups.append((len(kernel_block_sizes), group_backends))
             kernel_block_sizes.append(selected_kernel_size)
         elif isinstance(kv_cache_spec, MambaSpec):
             # This is likely Mamba or other non-attention cache, no splitting.
@@ -1158,6 +1172,13 @@ def prepare_kernel_block_sizes(
             raise NotImplementedError(
                 f"unknown kv cache spec {kv_cache_group.kv_cache_spec}"
             )
+    if msa_groups:
+        shared_size = select_common_block_size(
+            math.gcd(*(kernel_block_sizes[i] for i, _ in msa_groups)),
+            [backend for _, backends in msa_groups for backend in backends],
+        )
+        for i, _ in msa_groups:
+            kernel_block_sizes[i] = shared_size
     return kernel_block_sizes
 
 
