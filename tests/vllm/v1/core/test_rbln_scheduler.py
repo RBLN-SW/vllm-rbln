@@ -1923,3 +1923,61 @@ class TestSyncKVLoads:
         # Only the 16 tokens past the hit are computed this step.
         assert output.num_scheduled_tokens[request.request_id] == 16
         assert output.has_sync_kv_loads
+
+
+class TestAdmissionCountsLookahead:
+    """A block-aligned prompt's final chunk also allocates the drafting
+    lookahead, so it needs one block more than the prompt. Admission counted the
+    prompt alone: with the rest of the pool held by decodes, the final chunk
+    preempted the prefill itself, and with no mixed batching the decodes never
+    ran to free a block, so the same cycle repeated forever."""
+
+    BLOCK = 16
+
+    @staticmethod
+    def _step(sched):
+        out = sched.schedule()
+        # A partial prefill samples nothing; a full prompt or a decode does.
+        output = make_model_runner_output(out)
+        output.sampled_token_ids = [
+            [7] if r.num_computed_tokens >= r.num_tokens else []
+            for r in (sched.requests[rid] for rid in output.req_ids)
+        ]
+        sched.update_from_output(out, output)
+
+    @pytest.mark.usefixtures("cr13")
+    @pytest.mark.parametrize("sub_block_size", [None, 4, 8])
+    @pytest.mark.parametrize("connector", [False, True])
+    def test_block_aligned_prompt_finishes_while_decodes_hold_the_pool(
+        self, sub_block_size, connector
+    ):
+        sched = create_rbln_scheduler(
+            enable_prefix_caching=True,
+            block_size=self.BLOCK,
+            sub_block_size=sub_block_size,
+            additional_config={"enable_sub_block_cache": sub_block_size is not None},
+            max_num_batched_tokens=8,
+            max_model_len=4 * self.BLOCK,
+            num_blocks=6,
+            max_num_seqs=4,
+            num_speculative_tokens=3,
+            use_kv_connector=MockKVConfig(matched_tokens=0) if connector else None,
+        )
+        # Two decodes take two blocks each, leaving one of the five free.
+        for n in range(2):
+            prompt = [100 * (n + 1) + i for i in range(self.BLOCK + 1)]
+            sched.add_request(make_request(f"d{n}", prompt, self.BLOCK, max_tokens=8))
+        while any(
+            r.num_computed_tokens < r.num_prompt_tokens for r in sched.requests.values()
+        ):
+            self._step(sched)
+
+        # Exactly one block of prompt: the final chunk needs a second block.
+        prompt = [900 + i for i in range(self.BLOCK)]
+        sched.add_request(make_request("v", prompt, self.BLOCK, max_tokens=1))
+        for _ in range(100):
+            if not sched.requests:
+                break
+            self._step(sched)
+
+        assert not sched.requests
