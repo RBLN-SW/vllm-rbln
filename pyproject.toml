@@ -38,7 +38,7 @@ dependencies = [
     "setuptools-scm>=8",
     "pyyaml",
     "datasets>=4.0.0",
-    "vllm==0.31.0+cpu",
+    "vllm==0.31.0",
     "torch",
     "torchvision",
     "torchaudio",
