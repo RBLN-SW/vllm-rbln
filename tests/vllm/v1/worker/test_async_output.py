@@ -192,9 +192,11 @@ class TestGetOutput:
         # a tensor moved over with .to("rbln") would be copied back synchronously.
         greedy = compile_sampler(rbln_greedy_sample, None)
         logits = torch.tensor([[0.0, 5.0, 1.0], [9.0, 0.0, 2.0]], dtype=torch.float16)
-        async_out, _ = _async_output(greedy(logits.to("rbln")).unsqueeze(-1))
-        # The D2H starts at construction; get_output() only waits on it.
-        assert async_out._copy_ready_event is not None
+        src = greedy(logits.to("rbln")).unsqueeze(-1)
+        async_out, _ = _async_output(src)
+        # Overwrite the source, as a later step does to the ring slot. A copy
+        # issued at construction still holds the original tokens.
+        src.copy_(torch.tensor([[5], [6]], dtype=src.dtype).to("rbln"))
         assert async_out.get_output().sampled_token_ids == [[1], [0]]
 
     def test_clears_the_rows_the_sampler_discarded(self):
