@@ -59,6 +59,8 @@ _pytest: &pytest
   secrets: *secrets
   plugins: *dshm
   timeout_in_minutes: 60
+  artifact_paths:
+    - "pytest-results/**/*"
 
 _e2e: &e2e
   <<: *pytest
