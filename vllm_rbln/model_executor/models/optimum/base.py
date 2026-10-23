@@ -26,7 +26,8 @@ class ModelInputForRBLN:
     Prefill carries one request: `input_tokens` / `input_positions` are
     `[1, seq_len]` and `block_tables` is `[num_blocks]`. Decode carries
     the running requests padded to `padded_batch_size` rows:
-    `[padded_batch_size, 1]` tokens and positions,
+    `[padded_batch_size, query_length]` tokens and positions (query_length is
+    1 for ordinary decode or K+1 for speculative verification),
     `[padded_batch_size, num_blocks]` block tables. Tokens are int64,
     positions int32, block tables and cache slot ids int16.
     """

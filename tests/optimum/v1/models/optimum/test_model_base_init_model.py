@@ -21,15 +21,16 @@ NPU-dependent operations are replaced with test doubles.
 
 import types
 
+import pytest
 import torch
-from transformers import Gemma4Config
+from transformers import Gemma4Config, LlamaConfig
 
 from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.model_executor.models.optimum import model_base
 from vllm_rbln.model_executor.models.optimum.model_base import RBLNOptimumModelBase
 
 
-def _init_model_with(monkeypatch, tmp_path, hf_config) -> dict:
+def _init_model_with(monkeypatch, tmp_path, hf_config, speculative_config=None) -> dict:
     passed = {}
 
     class FakeRBLNModel:
@@ -45,7 +46,8 @@ def _init_model_with(monkeypatch, tmp_path, hf_config) -> dict:
         "for_architecture",
         classmethod(
             lambda cls, *a, **k: types.SimpleNamespace(
-                model_cls=FakeRBLNModel, rbln_config={}
+                model_cls=FakeRBLNModel,
+                rbln_config={"decoder_query_length": k["decoder_query_length"]},
             )
         ),
     )
@@ -70,6 +72,7 @@ def _init_model_with(monkeypatch, tmp_path, hf_config) -> dict:
         scheduler_config=obj.scheduler_config,
         cache_config=types.SimpleNamespace(gpu_memory_utilization=0.9),
         ec_transfer_config=None,
+        speculative_config=speculative_config,
     )
     obj.init_model()
     return passed
@@ -120,3 +123,21 @@ def test_transformers_config_is_forwarded_as_the_config_object(monkeypatch, tmp_
     assert passed["config"] is hf_config
     assert "text_config" not in passed
     assert "num_hidden_layers" not in passed
+
+
+@pytest.mark.parametrize("num_speculative_tokens,query_length", [(None, 1), (3, 4)])
+def test_compile_forwards_decoder_query_length(
+    monkeypatch, tmp_path, num_speculative_tokens, query_length
+):
+    spec_config = (
+        types.SimpleNamespace(num_speculative_tokens=num_speculative_tokens)
+        if num_speculative_tokens is not None
+        else None
+    )
+    passed = _init_model_with(
+        monkeypatch,
+        tmp_path,
+        LlamaConfig(architectures=["LlamaForCausalLM"]),
+        speculative_config=spec_config,
+    )
+    assert passed["rbln_config"]["decoder_query_length"] == query_length
