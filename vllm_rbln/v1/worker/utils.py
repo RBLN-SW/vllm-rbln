@@ -27,6 +27,7 @@ from functools import wraps
 from typing import TYPE_CHECKING, Any, Literal, NoReturn, TypeVar
 
 import numpy as np
+import psutil
 import torch
 from rebel import profiler as rbln_profiler
 from vllm.config import ModelConfig, ParallelConfig, VllmConfig
@@ -37,6 +38,7 @@ from vllm.utils.cpu_resource_utils import (
     get_allowed_cpu_list,
     get_visible_memory_node,
 )
+from vllm.utils.numa_utils import get_libnuma
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
@@ -331,6 +333,17 @@ def get_rbln_owned_card_indices() -> list[int]:
         elif index in present:
             owned.append(index)
     return sorted(set(owned)) or present
+
+
+def rbln_device_numa_node() -> int | None:
+    """NUMA node of the cards this process owns; None when unknown or split."""
+    nodes = {
+        _read_card_attr_int(card, "device/numa_node")
+        for card in get_rbln_owned_card_indices()
+    }
+    if len(nodes) == 1 and (node := nodes.pop()) is not None and node >= 0:
+        return node
+    return None
 
 
 def _read_card_attr_int(card_index: int, attr: str) -> int | None:
@@ -894,14 +907,38 @@ def get_autobind_cpu_ids(
         )
         return "all"
 
-    numa_node_idx = rank_across_dp % len(available_numa_nodes)
-    selected_numa_node = available_numa_nodes[numa_node_idx]
+    device_numa_node = rbln_device_numa_node()
+    if (
+        world_size_across_dp == 1
+        and device_numa_node is not None
+        and device_numa_node in available_numa_nodes
+    ):
+        # A lone rank binds to its card's node. Several ranks keep the round robin:
+        # RBLN_VISIBLE_DEVICES lists only this rank's cards by now, so the cards of
+        # the ranks it shares a node with are unknown.
+        selected_numa_node = device_numa_node
+        ranks_in_same_numa = [rank_across_dp]
+        logger.debug(
+            "auto thread-binding: rank %d follows its card to NUMA node %d",
+            rank,
+            device_numa_node,
+        )
+    else:
+        if world_size_across_dp == 1:
+            logger.debug(
+                "auto thread-binding: card NUMA node %s is unknown or not in "
+                "allowed nodes %s; using round robin",
+                device_numa_node,
+                available_numa_nodes,
+            )
+        numa_node_idx = rank_across_dp % len(available_numa_nodes)
+        selected_numa_node = available_numa_nodes[numa_node_idx]
+        ranks_in_same_numa = [
+            r
+            for r in range(world_size_across_dp)
+            if r % len(available_numa_nodes) == numa_node_idx
+        ]
     numa_node_cpu_list = numa_node_to_cpus[selected_numa_node]
-    ranks_in_same_numa = [
-        r
-        for r in range(world_size_across_dp)
-        if r % len(available_numa_nodes) == numa_node_idx
-    ]
 
     # Select CPUs from each physical core via cpu_selector
     core_to_cpus: dict[int, list[LogicalCPUInfo]] = {}
@@ -991,11 +1028,7 @@ def compute_rbln_local_omp_cpuid(
     return "nobind"
 
 
-def get_rbln_planned_affinity_cpu_count(
-    rank: int,
-    local_rank: int,
-    parallel_config: ParallelConfig,
-) -> int:
+def get_rbln_planned_affinity_cpu_count(local_omp_cpuid: str) -> int:
     """Logical CPU count this rank will pin to after NUMA split (before
     ``sched_setaffinity``).
 
@@ -1003,33 +1036,35 @@ def get_rbln_planned_affinity_cpu_count(
     counts match the post-bind CPU mask. If binding is ``nobind``/``all``, uses the
     current ``sched_getaffinity`` mask.
     """
-    local_omp_cpuid = compute_rbln_local_omp_cpuid(rank, local_rank, parallel_config)
     if local_omp_cpuid not in ("all", "nobind"):
         cpu_ids = [int(x.strip()) for x in local_omp_cpuid.split(",") if x.strip()]
         return max(1, len(cpu_ids))
     return max(1, len(os.sched_getaffinity(0)))
 
 
-def set_cpu_affinity(
-    rank: int,
-    local_rank: int,
-    parallel_config: ParallelConfig,
-) -> None:
+def set_cpu_affinity(rank: int, local_rank: int, local_omp_cpuid: str) -> None:
     """Setup thread affinity based on NUMA nodes.
 
     Args:
         rank: Global rank of the worker.
         local_rank: Local rank of the worker.
-        parallel_config: Parallel configuration.
+        local_omp_cpuid: CPU set from ``compute_rbln_local_omp_cpuid``.
     """
-    local_omp_cpuid = compute_rbln_local_omp_cpuid(rank, local_rank, parallel_config)
-
     if local_omp_cpuid not in ("all", "nobind"):
         # Parse CPU IDs from string (e.g., "0,1,2,3" -> [0, 1, 2, 3])
         cpu_ids = [int(cpu_id.strip()) for cpu_id in local_omp_cpuid.split(",")]
         # Set CPU affinity for current process
         try:
             os.sched_setaffinity(0, cpu_ids)
+            # sched_setaffinity(0) binds only this thread: bind the ones already
+            # running too (compiler, runtime, torch); one may exit mid-walk.
+            threads = psutil.Process().threads()
+            exited = 0
+            for thread in threads:
+                try:
+                    os.sched_setaffinity(thread.id, cpu_ids)
+                except ProcessLookupError:
+                    exited += 1
             # Verify CPU affinity was set correctly
             actual_cpu_ids = sorted(os.sched_getaffinity(0))
             expected_cpu_ids = sorted(cpu_ids)
@@ -1044,10 +1079,13 @@ def set_cpu_affinity(
                 )
             else:
                 logger.debug(
-                    "Set CPU affinity for rank %d (local_rank %d): CPUs %s",
+                    "Set CPU affinity for rank %d (local_rank %d): CPUs %s, "
+                    "%d threads (%d exited while binding)",
                     rank,
                     local_rank,
                     local_omp_cpuid,
+                    len(threads),
+                    exited,
                 )
         except OSError as e:
             logger.error(
@@ -1063,6 +1101,28 @@ def set_cpu_affinity(
             rank,
             local_rank,
         )
+
+
+def set_preferred_memory_node(rank: int, local_rank: int, local_omp_cpuid: str) -> None:
+    """Prefer the CPU binding's NUMA node for new pages before the CPUs are pinned.
+
+    The policy applies to this thread and to the threads it starts later.
+    It is skipped when libnuma is not available.
+    """
+    if local_omp_cpuid in ("all", "nobind"):
+        return
+    libnuma = get_libnuma()
+    if libnuma is None or libnuma.numa_available() < 0:
+        logger.debug("libnuma unavailable; no preferred NUMA node for rank %d", rank)
+        return
+    cpu_ids = {int(cpu_id) for cpu_id in local_omp_cpuid.split(",")}
+    nodes = {cpu.numa_node for cpu in get_allowed_cpu_list() if cpu.id in cpu_ids}
+    assert len(nodes) == 1, f"auto-binding spans NUMA nodes {sorted(nodes)}"
+    (node,) = nodes
+    libnuma.numa_set_preferred(node)
+    logger.debug(
+        "Preferred NUMA node %d for rank %d (local_rank %d)", node, rank, local_rank
+    )
 
 
 def set_omp_num_threads(

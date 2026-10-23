@@ -16,6 +16,7 @@
 # (device DRAM, NUMA, CPU affinity) only the inputs are mocked and the real
 # computed values asserted.
 
+import ctypes
 import json
 import math
 import os
@@ -64,11 +65,13 @@ from vllm_rbln.v1.worker.utils import (
     get_rbln_visible_card_indices,
     prepare_kernel_block_sizes,
     rbln_device_dram_total_bytes,
+    rbln_device_numa_node,
     read_rbln_card_dram_used_bytes,
     reorder_input_batch,
     rescale_kv_cache_config,
     set_cpu_affinity,
     set_omp_num_threads,
+    set_preferred_memory_node,
     worker_fail_fast,
 )
 
@@ -839,7 +842,27 @@ class TestEstimateAvailableMemory:
             self._measured(self._snapshot([40 * _GB, _GB, _GB, _GB]))
 
 
+class TestRblnDeviceNumaNode:
+    # card -> sysfs numa_node; cards split across nodes or unreported are unknown.
+    @pytest.mark.parametrize(
+        "nodes, expected",
+        [({4: 1, 5: 1}, 1), ({3: 0, 4: 1}, None), ({0: None}, None), ({0: -1}, None)],
+    )
+    def test_node_of_owned_cards(self, monkeypatch, nodes, expected):
+        monkeypatch.setattr(
+            worker_utils, "get_rbln_owned_card_indices", lambda: list(nodes)
+        )
+        monkeypatch.setattr(
+            worker_utils, "_read_card_attr_int", lambda card, attr: nodes[card]
+        )
+        assert rbln_device_numa_node() == expected
+
+
 class TestGetAutobindCpuIds:
+    @pytest.fixture(autouse=True)
+    def _unknown_device_node(self, monkeypatch):
+        monkeypatch.setattr(worker_utils, "rbln_device_numa_node", lambda: None)
+
     @pytest.fixture
     def cpus(self, monkeypatch):
         cpu_list = _cpus_8()
@@ -855,6 +878,12 @@ class TestGetAutobindCpuIds:
         # rank 0 -> NUMA 0 -> all of NUMA-0's CPUs (sorted by id).
         result = get_autobind_cpu_ids(0, 0, _make_parallel_config(tp_size=1), self._all)
         assert result == "0,1,4,5"
+
+    def test_single_rank_follows_device_numa_node(self, cpus, monkeypatch):
+        # The round robin would give rank 0 NUMA 0; its card is on NUMA 1.
+        monkeypatch.setattr(worker_utils, "rbln_device_numa_node", lambda: 1)
+        result = get_autobind_cpu_ids(0, 0, _make_parallel_config(tp_size=1), self._all)
+        assert result == "2,3,6,7"
 
     def test_rank_round_robins_numa_nodes(self, cpus):
         # rank 1 -> NUMA 1 (rank_across_dp % num_numa).
@@ -929,6 +958,10 @@ class TestGetAutobindCpuIds:
 
 
 class TestComputeRblnLocalOmpCpuid:
+    @pytest.fixture(autouse=True)
+    def _unknown_device_node(self, monkeypatch):
+        monkeypatch.setattr(worker_utils, "rbln_device_numa_node", lambda: None)
+
     @pytest.fixture
     def cpus(self, monkeypatch):
         monkeypatch.setattr(worker_utils, "get_visible_memory_node", lambda: [0, 1])
@@ -974,49 +1007,34 @@ class TestComputeRblnLocalOmpCpuid:
 
 
 class TestGetRblnPlannedAffinityCpuCount:
-    def test_bound_list_counts_ids(self, monkeypatch):
-        monkeypatch.setattr(
-            worker_utils, "compute_rbln_local_omp_cpuid", lambda r, lr, pc: "0,1,2,3"
-        )
-        assert get_rbln_planned_affinity_cpu_count(0, 0, _make_parallel_config()) == 4
+    def test_bound_list_counts_ids(self):
+        assert get_rbln_planned_affinity_cpu_count("0,1,2,3") == 4
 
     def test_nobind_or_all_uses_current_affinity(self, monkeypatch):
-        monkeypatch.setattr(
-            worker_utils, "compute_rbln_local_omp_cpuid", lambda r, lr, pc: "nobind"
-        )
         monkeypatch.setattr(worker_utils.os, "sched_getaffinity", lambda pid: {0, 1, 2})
-        assert get_rbln_planned_affinity_cpu_count(0, 0, _make_parallel_config()) == 3
+        assert get_rbln_planned_affinity_cpu_count("nobind") == 3
 
 
 class TestSetCpuAffinity:
-    @staticmethod
-    def _cpuid(monkeypatch, value):
-        monkeypatch.setattr(
-            worker_utils, "compute_rbln_local_omp_cpuid", lambda r, lr, pc: value
-        )
-
     def test_nobind_makes_no_sched_call(self, monkeypatch):
         # cpuid "nobind" -> no syscall. (Its causes -- NUMA off / non-Linux /
         # unhandled arch -- are covered in TestComputeRblnLocalOmpCpuid.)
-        self._cpuid(monkeypatch, "nobind")
         calls = []
         monkeypatch.setattr(
             worker_utils.os, "sched_setaffinity", lambda *a: calls.append(a)
         )
-        set_cpu_affinity(0, 0, _make_parallel_config())
+        set_cpu_affinity(0, 0, "nobind")
         assert calls == []
 
     def test_all_result_makes_no_sched_call(self, monkeypatch):
-        self._cpuid(monkeypatch, "all")
         calls = []
         monkeypatch.setattr(
             worker_utils.os, "sched_setaffinity", lambda *a: calls.append(a)
         )
-        set_cpu_affinity(0, 0, _make_parallel_config())
+        set_cpu_affinity(0, 0, "all")
         assert calls == []
 
     def test_sets_affinity_with_computed_ids(self, monkeypatch):
-        self._cpuid(monkeypatch, "0,1,2,3")
         calls = []
         monkeypatch.setattr(
             worker_utils.os,
@@ -1026,25 +1044,84 @@ class TestSetCpuAffinity:
         monkeypatch.setattr(
             worker_utils.os, "sched_getaffinity", lambda pid: {0, 1, 2, 3}
         )
-        set_cpu_affinity(0, 0, _make_parallel_config())
-        assert calls == [(0, [0, 1, 2, 3])]
+        set_cpu_affinity(0, 0, "0,1,2,3")
+        assert calls[0] == (0, [0, 1, 2, 3])
+        assert all(ids == [0, 1, 2, 3] for _, ids in calls)
+
+    def test_binds_threads_started_before(self, monkeypatch):
+        # Threads from warm-up already exist when the binding is applied.
+        bound = []
+        monkeypatch.setattr(
+            worker_utils.os, "sched_setaffinity", lambda pid, ids: bound.append(pid)
+        )
+        monkeypatch.setattr(
+            worker_utils.os, "sched_getaffinity", lambda pid: {0, 1, 2, 3}
+        )
+        release = threading.Event()
+        started = threading.Thread(target=release.wait)
+        started.start()
+        try:
+            set_cpu_affinity(0, 0, "0,1,2,3")
+        finally:
+            release.set()
+            started.join()
+        assert started.native_id in bound
+
+    def test_thread_exiting_while_binding_is_skipped(self, monkeypatch):
+        def _exited(pid, ids):
+            if pid != 0:
+                raise ProcessLookupError(pid)
+
+        monkeypatch.setattr(worker_utils.os, "sched_setaffinity", _exited)
+        monkeypatch.setattr(
+            worker_utils.os, "sched_getaffinity", lambda pid: {0, 1, 2, 3}
+        )
+        set_cpu_affinity(0, 0, "0,1,2,3")
 
     def test_affinity_mismatch_warns(self, monkeypatch):
-        self._cpuid(monkeypatch, "0,1,2,3")
         monkeypatch.setattr(worker_utils.os, "sched_setaffinity", lambda pid, ids: None)
         # Applied mask differs from requested -> warns, does not raise.
         monkeypatch.setattr(worker_utils.os, "sched_getaffinity", lambda pid: {0, 1})
-        set_cpu_affinity(0, 0, _make_parallel_config())
+        set_cpu_affinity(0, 0, "0,1,2,3")
 
     def test_os_error_propagates(self, monkeypatch):
-        self._cpuid(monkeypatch, "0,1,2,3")
-
         def _boom(pid, ids):
             raise OSError("denied")
 
         monkeypatch.setattr(worker_utils.os, "sched_setaffinity", _boom)
         with pytest.raises(OSError):
-            set_cpu_affinity(0, 0, _make_parallel_config())
+            set_cpu_affinity(0, 0, "0,1,2,3")
+
+
+class TestSetPreferredMemoryNode:
+    @pytest.mark.skipif(
+        worker_utils.get_libnuma() is None, reason="libnuma is not installed"
+    )
+    def test_prefers_node_of_bound_cpus(self, monkeypatch):
+        monkeypatch.setattr(worker_utils, "get_allowed_cpu_list", lambda: _cpus_8())
+        mode, mask = ctypes.c_int(), (ctypes.c_ulong * 1)()
+
+        # The policy is per thread: set and read it in a thread of its own so the
+        # test process keeps its policy.
+        def run():
+            set_preferred_memory_node(0, 0, "0,1")
+            worker_utils.get_libnuma().get_mempolicy(
+                ctypes.byref(mode), mask, ctypes.c_ulong(65), None, ctypes.c_ulong(0)
+            )
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        thread.join()
+        # MPOL_PREFERRED on NUMA 0, the node of CPUs 0 and 1.
+        assert (mode.value, mask[0]) == (1, 0b1)
+
+    def test_nobind_sets_no_policy(self, monkeypatch):
+        monkeypatch.setattr(worker_utils, "get_libnuma", None)
+        set_preferred_memory_node(0, 0, "nobind")
+
+    def test_missing_libnuma_is_skipped(self, monkeypatch):
+        monkeypatch.setattr(worker_utils, "get_libnuma", lambda: None)
+        set_preferred_memory_node(0, 0, "0,1")
 
 
 class TestSetOmpNumThreads:
