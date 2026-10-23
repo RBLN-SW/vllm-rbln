@@ -153,6 +153,7 @@ from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
 from vllm_rbln.v1.sample.rbln_sampler import WARM_UP_CONFIGS, RBLNSampler
 from vllm_rbln.v1.spec_decode import DRAFT_MODEL_PROPOSERS
 from vllm_rbln.v1.spec_decode.dflash import RBLNDFlashProposer
+from vllm_rbln.v1.spec_decode.dspark import RBLNDSparkProposer
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.eagle3_pp import (
     eagle3_aux_hidden_states_enabled,
@@ -368,8 +369,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 self.drafter = SuffixDecodingProposer(self.vllm_config)
             elif self.speculative_config.method == "medusa":
                 self.drafter = RBLNMedusaProposer(self.vllm_config, self.device)
-            elif self.speculative_config.method == "dflash":
-                self.drafter = RBLNDFlashProposer(self.vllm_config, self.device, self)
+            elif self.speculative_config.method in ("dflash", "dspark"):
+                proposer = (
+                    RBLNDSparkProposer
+                    if self.speculative_config.method == "dspark"
+                    else RBLNDFlashProposer
+                )
+                self.drafter = proposer(self.vllm_config, self.device, self)
                 # Upstream turns this on unconditionally for DFlash: the
                 # drafter reduces the target's aux states through its own
                 # projection, as eagle3 does.
@@ -2359,6 +2365,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 target_token_ids = self.input_ids[:total_num_tokens]
                 target_positions = self.positions[:total_num_tokens]
 
+            draft_kwargs = {}
+            if isinstance(self.drafter, RBLNDFlashProposer):
+                draft_kwargs["block_tables"] = {
+                    gid: self.input_batch.block_table[gid].get_cpu_tensor()[:num_reqs]
+                    for gid in self.drafter.draft_block_sizes
+                }
             draft_token_ids = self.drafter.propose(
                 target_token_ids=target_token_ids,
                 target_positions=target_positions,
@@ -2368,6 +2380,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 common_attn_metadata=common_attn_metadata,
                 mm_embed_inputs=None,
                 num_rejected_tokens=num_rejected_tokens,
+                **draft_kwargs,
             )
 
         return draft_token_ids
@@ -3902,29 +3915,23 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         srcs: list[torch.Tensor] = []
         for op in copy_ops:
             group = self.kv_cache_config.kv_cache_groups[op.group_id]
-            # The op names manager blocks; the cache is addressed in kernel
-            # blocks, so the two must coincide for the group.
-            assert (
-                self._kernel_block_sizes[op.group_id] == group.kv_cache_spec.block_size
-            )
+            kernel_size = self._kernel_block_sizes[op.group_id]
+            blocks_per_manager = group.kv_cache_spec.block_size // kernel_size
             layer_names = set(group.layer_names)
-            src = op.src_block_id
-            dst = op.dst_block_id
-            nt = op.num_tokens
             for layer_name, kv_cache in zip(
                 self.kv_cache_names, self.kv_caches, strict=True
             ):
                 if layer_name not in layer_names:
                     continue
-                # An MLA-family cache is blocks-first whatever the kernel, and
-                # the indexer scale one has no axis after its tokens.
-                if self.model_config.use_mla:
-                    dsts.append(kv_cache[dst, :nt])
-                    srcs.append(kv_cache[src, :nt])
-                else:
-                    axis = self.kv_cache_block_axes[layer_name]
-                    dsts.append(kv_cache.select(axis, dst)[..., :nt, :])
-                    srcs.append(kv_cache.select(axis, src)[..., :nt, :])
+                axis = self.kv_cache_block_axes[layer_name]
+                token_axis = -1 if kv_cache.ndim == 2 else -2
+                for offset in range(0, op.num_tokens, kernel_size):
+                    block = offset // kernel_size
+                    count = min(kernel_size, op.num_tokens - offset)
+                    src = op.src_block_id * blocks_per_manager + block
+                    dst = op.dst_block_id * blocks_per_manager + block
+                    dsts.append(kv_cache.select(axis, dst).narrow(token_axis, 0, count))
+                    srcs.append(kv_cache.select(axis, src).narrow(token_axis, 0, count))
         torch._foreach_copy_(dsts, srcs)
 
 

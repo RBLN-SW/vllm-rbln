@@ -114,6 +114,8 @@ def sliding_window_attention_v1(
     window_size: int,
     sinks: torch.Tensor | None = None,
     *,
+    is_causal: bool = True,
+    attn_mask: torch.Tensor | None = None,
     is_prompt_sorted: bool = False,
 ) -> torch.Tensor:
     return torch.ops.rbln_custom_ops.sliding_window_attention_v1(
@@ -125,8 +127,8 @@ def sliding_window_attention_v1(
         scale,
         block_tables,
         window_size,
-        True,  # is_causal
-        None,  # attn_mask: derived from the window by the converter
+        is_causal,
+        attn_mask,
         sinks,
         is_prompt_sorted=is_prompt_sorted,
     )
