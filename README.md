@@ -29,6 +29,8 @@ You can install this project using `pip` or from source.
 
 #### Install via PyPI
 
+`vllm-rbln` pins the vLLM version, not its build. The `wheels.vllm.ai` index below is what selects the CPU build (`+cpu`); without it, the installer takes the CUDA build from PyPI.
+
 ##### Using uv
 
 The vLLM CPU wheel depends on `triton` through a direct URL, which `uv` only accepts when the URL is also given as a constraint:

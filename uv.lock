@@ -1227,6 +1227,25 @@ wheels = [
 ]
 
 [[package]]
+name = "intel-cmplr-lib-ur"
+version = "2024.2.1"
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+wheels = [
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/intel-cmplr-lib-ur/2024.2.1/intel_cmplr_lib_ur-2024.2.1-py2.py3-none-manylinux1_x86_64.whl", hash = "sha256:8b78d58ab501d6e5a582967be80fdbf7b03b33279135a303da36dbf11f481ed7" },
+]
+
+[[package]]
+name = "intel-openmp"
+version = "2024.2.1"
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+dependencies = [
+    { name = "intel-cmplr-lib-ur" },
+]
+wheels = [
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/intel-openmp/2024.2.1/intel_openmp-2024.2.1-py2.py3-none-manylinux1_x86_64.whl", hash = "sha256:21892ea07a9c6e164707d2b44e6f396f9f2ab6cc7e108755011fad59b596182a" },
+]
+
+[[package]]
 name = "interegular"
 version = "0.3.3"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
@@ -3503,8 +3522,8 @@ wheels = [
 
 [[package]]
 name = "vllm"
-version = "0.31.0+empty"
-source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi/simple/" }
+version = "0.31.0+cpu"
+source = { registry = "https://wheels.vllm.ai/0.31.0/cpu" }
 dependencies = [
     { name = "aiohttp" },
     { name = "anthropic" },
@@ -3519,6 +3538,7 @@ dependencies = [
     { name = "filelock" },
     { name = "huggingface-hub" },
     { name = "ijson" },
+    { name = "intel-openmp" },
     { name = "jsonschema" },
     { name = "lark" },
     { name = "llguidance" },
@@ -3528,6 +3548,7 @@ dependencies = [
     { name = "model-hosting-container-standards" },
     { name = "msgspec" },
     { name = "ninja" },
+    { name = "numba" },
     { name = "numpy" },
     { name = "openai" },
     { name = "opencv-python-headless" },
@@ -3554,19 +3575,26 @@ dependencies = [
     { name = "safetensors" },
     { name = "sentencepiece" },
     { name = "setproctitle" },
-    { name = "setuptools", marker = "python_full_version >= '3.12'" },
+    { name = "setuptools" },
     { name = "six", marker = "python_full_version >= '3.12'" },
     { name = "starlette" },
     { name = "tiktoken" },
     { name = "tokenizers" },
+    { name = "torch" },
+    { name = "torchaudio" },
+    { name = "torchcodec" },
+    { name = "torchvision" },
     { name = "tqdm" },
     { name = "transformers" },
+    { name = "triton", version = "3.8.0+cpu", source = { url = "https://github.com/triton-lang/triton-cpu/releases/download/v3.8.0/triton-3.8.0+cpu-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl" }, marker = "python_full_version < '3.11'" },
+    { name = "triton", version = "3.8.0+cpu", source = { url = "https://github.com/triton-lang/triton-cpu/releases/download/v3.8.0/triton-3.8.0+cpu-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl" }, marker = "python_full_version == '3.11.*'" },
+    { name = "triton", version = "3.8.0+cpu", source = { url = "https://github.com/triton-lang/triton-cpu/releases/download/v3.8.0/triton-3.8.0+cpu-cp312-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl" }, marker = "python_full_version >= '3.12'" },
     { name = "typing-extensions" },
     { name = "watchfiles" },
     { name = "xgrammar" },
 ]
 wheels = [
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi/packages/vllm/0.31.0+empty/vllm-0.31.0+empty-cp38-abi3-manylinux_2_34_x86_64.whl", hash = "md5:04458e8eb66343f10adc439332a06289" },
+    { url = "https://wheels.vllm.ai/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm-0.31.0%2Bcpu-cp38-abi3-manylinux_2_39_x86_64.whl" },
 ]
 
 [package.optional-dependencies]
@@ -3661,8 +3689,8 @@ requires-dist = [
     { name = "torchaudio", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torchcodec", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torchvision", index = "https://download.pytorch.org/whl/cpu" },
-    { name = "vllm", specifier = "==0.31.0+empty", index = "https://nexus.mgmt.rbln.in/repository/pypi/simple/" },
-    { name = "vllm", extras = ["audio"], marker = "extra == 'audio'", index = "https://nexus.mgmt.rbln.in/repository/pypi/simple/" },
+    { name = "vllm", specifier = "==0.31.0", index = "https://wheels.vllm.ai/0.31.0/cpu" },
+    { name = "vllm", extras = ["audio"], marker = "extra == 'audio'", index = "https://wheels.vllm.ai/0.31.0/cpu" },
 ]
 provides-extras = ["examples", "audio", "test", "build", "dev", "runtime", "kv-connectors"]
 
