@@ -61,6 +61,7 @@ from vllm_rbln.v1.worker.utils import (
     get_cgroup_cpu_quota,
     get_default_num_threads,
     get_kv_cache_names,
+    get_num_local_ranks,
     get_rbln_owned_card_indices,
     get_rbln_planned_affinity_cpu_count,
     get_rbln_visible_card_indices,
@@ -1065,6 +1066,30 @@ class TestGetDefaultNumThreads:
     ):
         monkeypatch.setattr(worker_utils, "get_cgroup_cpu_quota", lambda: quota)
         assert get_default_num_threads(allocated) == expected
+
+    @pytest.mark.parametrize(
+        "quota, ranks, expected",
+        [
+            (64.0, 4, 8),
+            (14.0, 8, 2),
+            (None, 8, 64),
+        ],
+    )
+    def test_quota_split_across_local_ranks(self, monkeypatch, quota, ranks, expected):
+        monkeypatch.setattr(worker_utils, "get_cgroup_cpu_quota", lambda: quota)
+        assert get_default_num_threads(128, ranks) == expected
+
+
+class TestGetNumLocalRanks:
+    @pytest.mark.parametrize(
+        "local_world_size, dp_local, expected",
+        [(8, 1, 8), (1, 4, 4), (2, 2, 4), (1, 0, 1)],
+    )
+    def test_product_of_tp_pp_and_local_dp(self, local_world_size, dp_local, expected):
+        pc = SimpleNamespace(
+            local_world_size=local_world_size, data_parallel_size_local=dp_local
+        )
+        assert get_num_local_ranks(pc) == expected
 
 
 class TestSetCpuAffinity:
