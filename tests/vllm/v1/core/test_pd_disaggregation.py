@@ -177,8 +177,8 @@ class TestStrictProducerPhase:
     graph."""
 
     def test_a_one_token_prompt_is_a_prefill_step(self):
-        # The case the widening exists for: without it this schedules as a
-        # decode and asks for a graph a producer does not compile.
+        # The case the widening exists for: without it both prompts schedule as
+        # one decode batch and ask for a graph a producer does not compile.
         sched = create_rbln_scheduler(
             block_size=BLOCK_SIZE,
             num_blocks=100,
@@ -187,6 +187,7 @@ class TestStrictProducerPhase:
             use_kv_connector=MockKVConfig(matched_tokens=0, kv_role="kv_producer"),
         )
         sched.add_request(_local_request("a", num_tokens=1))
+        sched.add_request(_local_request("b", num_tokens=1, base=600))
         out = sched.schedule()
         assert out.num_scheduled_tokens == {"a": 1}
         assert step_is_prefill(out, strict_kv_producer=True) is True
