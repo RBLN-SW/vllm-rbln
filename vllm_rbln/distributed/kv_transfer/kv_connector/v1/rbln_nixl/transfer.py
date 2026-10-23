@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Sequence
 from contextlib import contextmanager
 
 import numpy as np
@@ -24,6 +25,7 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
+    ChunkGrid,
     RblnNixlWorkerState,
 )
 
@@ -31,32 +33,57 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
 def _chunk_desc_ids(
     *,
     start: int,
-    positions: np.ndarray,
+    cuts: Sequence[tuple[int, int, int]],
     num_blocks: int,
     block_id: int,
     per_block: int,
-    grid: tuple[int, int],
     chunk_span: tuple[int, int],
+    partial_only: bool = False,
 ) -> np.ndarray:
-    """Descriptor ids for chunks `[lo, hi)` of one block, in `positions`.
+    """Descriptor ids for chunks `[lo, hi)` of one block, in every region
+    holding any of them.
+
+    `cuts` is `ChunkGrid.regions` and the span counts chunks of the block, so
+    each region takes the part of it that falls in its own window.
+    `partial_only` leaves out a region the span covers whole, which a
+    whole-block descriptor carried instead. A region of no runs holds at most
+    one chunk, and its whole-block descriptor -- from 0, `per_block` a block --
+    is what names it.
 
     `start` is where the chunk range begins: one whole-block range before it on
-    a shard's lists, and on the whole-engine lists a window range as well,
-    which holds the granules that tile a block where the whole-block range
-    holds the block. Each caller passes the geometry of its own lists; what
-    they share is the order inside the range, so that arithmetic lives here --
+    a shard's lists, and a window range as well on the whole-engine lists. The
+    order inside the range is what every caller's lists share, so it lives here:
     an index computed one way and a descriptor emitted the other lands on bytes
     nothing reports.
     """
-    runs, chunks = grid
     lo, hi = chunk_span
-    within = (
-        np.arange(per_block, dtype=np.int64)[:, None, None] * (runs * chunks)
-        + np.arange(runs, dtype=np.int64)[None, :, None] * chunks
-        + np.arange(lo, hi, dtype=np.int64)[None, None, :]
-    ).ravel()
-    starts = start + (positions * num_blocks + block_id) * per_block * runs * chunks
-    return (starts[:, None] + within[None, :]).ravel()
+    first, runs, chunks = np.asarray(cuts, dtype=np.int64).reshape(-1, 3).T
+    per_region = per_block * runs * chunks
+    starts = start + (np.cumsum(per_region) - per_region) * num_blocks
+    starts += block_id * per_region
+    whole = runs == 0
+    starts[whole] = (np.flatnonzero(whole) * num_blocks + block_id) * per_block
+    begin = np.maximum(lo, first) - first
+    end = np.minimum(hi, first + chunks) - first
+    take = begin < end
+    if partial_only:
+        take &= (begin > 0) | (end < chunks)
+    # Regions cut alike share one offset pattern, and an engine has few cuts
+    # however many regions it has. The window leads the key so the ids come
+    # area by area, region by region inside one.
+    keys = np.stack([first, runs, chunks, begin, end], axis=1)[take]
+    out = []
+    for key in np.unique(keys, axis=0):
+        _, k_runs, k_chunks, k_begin, k_end = (int(v) for v in key)
+        k_runs = max(k_runs, 1)
+        within = (
+            np.arange(per_block, dtype=np.int64)[:, None, None] * (k_runs * k_chunks)
+            + np.arange(k_runs, dtype=np.int64)[None, :, None] * k_chunks
+            + np.arange(k_begin, k_end, dtype=np.int64)[None, None, :]
+        ).ravel()
+        group = starts[take][(keys == key).all(axis=1)]
+        out.append((group[:, None] + within[None, :]).ravel())
+    return np.concatenate(out) if out else np.empty(0, dtype=np.int64)
 
 
 class RblnNixlTransferMixin(RblnNixlWorkerState):
@@ -73,7 +100,7 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
         self,
         valid_tokens: int | None,
         prompt_blocks: int | None,
-        pieces: tuple[tuple[int, int | None, tuple[int, int]], ...] = (),
+        pieces: tuple[tuple[int, tuple[int, int]], ...] = (),
     ):
         """Park which part of a request's blocks this transfer names.
 
@@ -186,34 +213,29 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
         # last block a whole-request write still owes.
         tail = self._request_tail
         pieces = tail[2] if tail is not None else ()
-        if tail is None or pieces or self._chunk_grid is None:
+        grid = self._chunk_grid
+        if tail is None or pieces or grid is None:
             needed = None
         else:
             # A chunk range exists only where a full-attention group does, and
             # that group is what the shape counts in.
             prompt_blocks = tail[1]
             assert prompt_blocks is not None
-            needed = self._tail_chunks(
-                prompt_blocks, tail[0], chunks_per_span=self._chunk_grid[1]
-            )
+            needed = self._tail_chunks(prompt_blocks, tail[0], chunk_grid=grid)
 
         def whole(blocks: list[int]) -> np.ndarray:
             return (region_ids * num_blocks + np.asarray(blocks)[None, :]).flatten()
 
-        def chunks_of(
-            block_id: int, span_ix: int | None, chunk_span: tuple[int, int]
-        ) -> np.ndarray:
-            assert self._chunk_grid is not None
-            # A context cut never reaches these lists: registration refuses one
-            # beside a window range, so no piece parked here names a span.
-            assert span_ix is None
+        def chunks_of(block_id: int, chunk_span: tuple[int, int]) -> np.ndarray:
+            assert grid is not None
+            # Registration refuses a context cut beside these lists, so every
+            # region holds the whole block and every one takes the span.
             return _chunk_desc_ids(
                 start=num_whole_descs * (1 + window_units),
-                positions=np.arange(self.num_regions, dtype=np.int64),
+                cuts=grid.regions,
                 num_blocks=num_blocks,
                 block_id=block_id,
                 per_block=1,
-                grid=self._chunk_grid,
                 chunk_span=chunk_span,
             )
 
@@ -265,10 +287,8 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
             if needed is not None and group:
                 # The last block leaves the whole-block range and comes back as
                 # the chunks that hold tokens, from the third range.
-                all_descs.append(chunks_of(group[-1], None, (0, needed)))
-            all_descs += [
-                chunks_of(block_id, span_ix, span) for block_id, span_ix, span in pieces
-            ]
+                all_descs.append(chunks_of(group[-1], (0, needed)))
+            all_descs += [chunks_of(block_id, span) for block_id, span in pieces]
         return np.concatenate(all_descs) if all_descs else np.empty(0, dtype=int)
 
     def _get_block_descs_ids_for_shard(
@@ -277,25 +297,36 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
         global_rank: int,
         num_blocks: int,
         block_ids: BlockIds,
-        keep_spans: int | None = None,
+        needed: int | None = None,
     ) -> np.ndarray:
+        """This shard's whole-block descriptors for `block_ids`.
+
+        `needed` is how many chunks of the last block hold tokens; a region
+        holding any chunk past them leaves that block to the chunk range.
+        """
         region_group_ids = self._shard_region_group_ids[(engine_id, global_rank)]
         per_block = self._shard_descs_per_block[(engine_id, global_rank)]
-        # Zero drops the last block from every region, whatever a position
-        # names, which is what a head cut asks for -- there the token axis is
-        # not spread over the regions at all.
-        assert not keep_spans or per_block == 1
+        # `(first chunk, chunks)` of a block each region holds: off the grid
+        # where the lists carry one, and without one a chunk is a span, so each
+        # region holds the span its area does.
+        windows: list[tuple[int, int]] = []
+        if needed is not None:
+            grid = self._shard_chunk_grids[(engine_id, global_rank)]
+            windows = (
+                [(first, chunks) for first, _, chunks in grid.regions]
+                if grid is not None
+                else [
+                    (span, 1)
+                    for span in self._shard_region_spans[(engine_id, global_rank)]
+                ]
+            )
         # Converted once, not once per region: this runs per request, and every
         # region of a layer names the same group.
         group_arrays = [np.asarray(g, dtype=np.int64) for g in block_ids]
         desc_ids: list[np.ndarray] = []
         for region_id, group_id in enumerate(region_group_ids):
             group_arr = group_arrays[group_id]
-            # Regions run area-minor within a layer, and a shard that leaves
-            # part of a block out keeps every area: the peer that would not is
-            # refused in `_check_split_axis_constraints`. So this position names
-            # the span whose token range the request's last block does not reach.
-            if keep_spans is not None and region_id % self._kv_areas >= keep_spans:
+            if needed is not None and sum(windows[region_id]) > needed:
                 group_arr = group_arr[:-1]
             if group_arr.size == 0:
                 continue
@@ -321,15 +352,14 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
         num_blocks: int,
         block_id: int,
         chunk_span: tuple[int, int],
-        span_ix: int | None = None,
+        *,
+        partial_only: bool = False,
     ) -> np.ndarray:
-        """Descriptors for chunks `[lo, hi)` of one block, in every region.
+        """Descriptors for chunks `[lo, hi)` of one block, wherever they sit.
 
-        `span_ix` narrows that to the regions holding one span of the block,
-        which is what a context cut needs: an area IS a token range there, so
-        the chunks of a partly-filled one belong to that area alone. None
-        takes every region, which is a head cut, where every region holds the
-        same token range of a different head band.
+        The span counts chunks of the block. A context cut gives each area a
+        window of them, so only the areas whose window it reaches take part;
+        a head cut gives every region all of them.
 
         Indexes the second range the shard's lists carry (see
         `_register_shard_local_xfer_handler`), which follows the whole-block
@@ -343,27 +373,24 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
         lo, hi = chunk_span
         if grid is None or hi <= lo:
             return np.empty(0, dtype=np.int64)
-        runs, chunks = grid
-        if not 0 <= lo < hi <= chunks:
+        if not 0 <= lo < hi <= grid.chunks_per_block:
             raise RuntimeError(
                 f"RBLN NIXL: chunk range [{lo}, {hi}) is outside the "
-                f"{chunks} chunk(s) a span holds"
+                f"{grid.chunks_per_block} chunk(s) a block holds"
             )
         region_group_ids = self._shard_region_group_ids[(engine_id, global_rank)]
+        assert len(grid.regions) == len(region_group_ids)
         per_block = self._shard_descs_per_block[(engine_id, global_rank)]
-        positions = np.arange(len(region_group_ids), dtype=np.int64)
-        if span_ix is not None:
-            positions = positions[positions % self._kv_areas == span_ix]
         return _chunk_desc_ids(
             # Where the chunk range starts: the whole-block range covers every
             # region, block and piece once.
             start=len(region_group_ids) * num_blocks * per_block,
-            positions=positions,
+            cuts=grid.regions,
             num_blocks=num_blocks,
             block_id=block_id,
             per_block=per_block,
-            grid=grid,
             chunk_span=chunk_span,
+            partial_only=partial_only,
         )
 
     def _tail_chunks(
@@ -371,27 +398,19 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
         num_blocks: int,
         num_valid_tokens: int | None,
         *,
-        chunks_per_span: int,
+        chunk_grid: ChunkGrid | None,
     ) -> int | None:
         """How many chunks of a request's last block hold its tokens.
 
-        A block is `spans * chunks_per_span` chunks of equal token width
-        however its spans are cut, so a last block filled to `rem` tokens has
-        nothing above cdiv(rem, chunk). None keeps the whole block: that is
-        what a full last block wants, and what one needing every chunk wants
-        -- the same bytes in more descriptors is a loss.
+        A block is `_chunks_per_block` chunks of equal token width however its
+        regions are cut, so a last block filled to `rem` tokens has nothing
+        above cdiv(rem, chunk). None keeps the whole block: that is what a
+        full last block wants, and what one needing every chunk wants -- the
+        same bytes in more descriptors is a loss.
 
         Rounds up, because every token counted has to reach the peer.
-
-        Asked of whatever may name part of a block rather than of chunk mode
-        alone: a streamed batch closes a block the forward pass is still
-        filling, and the chunks above the count hold KV nobody has written.
         """
-        if (
-            not self._shape.writes_part_of_a_block
-            or not num_valid_tokens
-            or num_blocks <= 0
-        ):
+        if not self._shape.cuts_a_block or not num_valid_tokens or num_blocks <= 0:
             return None
         rem = num_valid_tokens - (num_blocks - 1) * self.block_size
         if not 1 <= rem <= self.block_size:
@@ -400,7 +419,7 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
                 f"{self.block_size} reports {num_valid_tokens} token(s); its "
                 "block list and its token count describe different KV."
             )
-        chunks_per_block = self._spans_per_block * chunks_per_span
+        chunks_per_block = self._chunks_per_block(chunk_grid)
         needed = cdiv(rem, self.block_size // chunks_per_block)
         return needed if needed < chunks_per_block else None
 
@@ -416,30 +435,25 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
     ) -> np.ndarray:
         """This shard's descriptors for `block_ids`, cut to the tokens held.
 
-        The last block goes out as the chunks that hold tokens: the spans below
-        the one its last token falls in from the block range, and that span's
-        chunks from the chunk range. Both sides build this the same way, so the
-        two lists still pair by position.
+        The last block goes out as the chunks that hold tokens: whole from the
+        regions whose part of it they fill, and in chunks from every region the
+        last of them falls inside. Both sides build this the same way, so the two
+        lists still pair by position.
 
         `num_prompt_blocks` is the request's own block count, which is what
         the token count describes -- `block_ids` may have lost its prefix to a
         cache hit.
         """
-        grid = self._shard_chunk_grids[(engine_id, global_rank)]
-        chunks_per_span = grid[1] if grid is not None else 1
         needed = self._tail_chunks(
-            num_prompt_blocks, num_valid_tokens, chunks_per_span=chunks_per_span
+            num_prompt_blocks,
+            num_valid_tokens,
+            chunk_grid=self._shard_chunk_grids[(engine_id, global_rank)],
         )
-        keep_spans = None if needed is None else needed // chunks_per_span
         descs = self._get_block_descs_ids_for_shard(
-            engine_id, global_rank, num_blocks, block_ids, keep_spans=keep_spans
+            engine_id, global_rank, num_blocks, block_ids, needed=needed
         )
-        part = 0 if needed is None else needed % chunks_per_span
-        if not part or not block_ids[0]:
+        if needed is None or not block_ids[0]:
             return descs
-        # A head cut spreads no span axis over the regions, so every one of
-        # them holds this block's chunks.
-        span_ix = keep_spans if self._spans_per_block > 1 else None
         return np.concatenate(
             (
                 descs,
@@ -448,8 +462,8 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
                     global_rank,
                     num_blocks,
                     block_ids[0][-1],
-                    (0, part),
-                    span_ix=span_ix,
+                    (0, needed),
+                    partial_only=True,
                 ),
             )
         )

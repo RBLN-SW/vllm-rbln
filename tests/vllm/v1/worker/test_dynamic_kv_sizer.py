@@ -43,7 +43,7 @@ def _placement(shards):
 HEAD_SPLIT = _placement(tuple(_shard(0, c, (2, S0, 2, 1, 1024, 128)) for c in range(4)))
 
 # The same tensor as HEAD_SPLIT, bound by a second program: dynamo names the
-# symbol differently, which is what splits one tensor set into two groups.
+# symbol differently.
 S1 = ("symbol", "s40")
 HEAD_SPLIT_S1 = SimpleNamespace(
     shape=(2, S1, 8, 1, 1024, 128),
@@ -381,9 +381,8 @@ class TestComputeDynamicKvNumBlocks:
         assert "RBLN_DUMMY_DEVICE" in caplog.text
 
     def test_the_same_tensors_seen_twice_are_counted_once(self, caplog):
-        """Prefill and decode bind the same KV tensors, but dynamo names their
-        symbols differently, so they form two groups. Summing both would double
-        the slope and halve the count."""
+        """Prefill and decode bind the same KV tensors under differently named
+        symbols. Summing both would double the slope and halve the count."""
         programs = [
             _program([HEAD_SPLIT, HEAD_SPLIT], name="0/0"),
             _program([HEAD_SPLIT_S1, HEAD_SPLIT_S1], name="0/1"),
@@ -391,12 +390,26 @@ class TestComputeDynamicKvNumBlocks:
         sizer = self._sizer(
             programs=programs, snapshot=self._snapshot([30 * self.GIB] * 4)
         )
-        # Two programs, two groups, but vllm allocated two caches, not four.
         with caplog.at_level("INFO"):
             n = DynamicKvSizer.compute_num_blocks(sizer)
-        assert "summed over 2 KV input(s) from 2 set(s)" in caplog.text
+        assert "summed over 2 KV input(s) from 1 set(s)" in caplog.text
         # 2 MiB per block, not 4: (35 - 30) GiB / 2 MiB.
         assert n == 5 * 512
+
+    def test_a_drafter_next_to_a_target_seen_twice_is_summed_once(self, caplog):
+        programs = [
+            _program([HEAD_SPLIT, HEAD_SPLIT], name="0/0"),
+            _program([HEAD_SPLIT_S1, HEAD_SPLIT_S1], name="0/1"),
+            _program([HEAD_SPLIT], name="1/0"),
+        ]
+        sizer = self._sizer(
+            programs=programs,
+            snapshot=self._snapshot([30 * self.GIB] * 4),
+            num_caches=3,
+        )
+        with caplog.at_level("INFO"):
+            DynamicKvSizer.compute_num_blocks(sizer)
+        assert "summed over 3 KV input(s) from 2 set(s)" in caplog.text
 
     def test_disjoint_sets_are_summed(self, caplog):
         """A target's and a drafter's KV are different tensors; the sum is the

@@ -407,6 +407,7 @@ DYNAMIC_KV_SUPPORTED_CONNECTORS = (
     "RblnNixlPullConnector",
     "RblnNixlPushConnector",
     "RBLNLMCacheConnectorV1",
+    "LMCacheMPConnector",
 )
 # vLLM's wrapper for running several connectors at once. It is not itself in the
 # set above because it registers nothing of its own: `register_kv_caches` and the

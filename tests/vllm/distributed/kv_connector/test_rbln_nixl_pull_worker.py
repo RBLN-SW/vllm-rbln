@@ -33,13 +33,15 @@ from vllm.v1.kv_cache_interface import SlidingWindowSpec
 
 from tests.vllm.distributed.kv_connector.utils import (
     fake_sysfs_net,
+    fill_region_geometry,
     mock_vllm_config,
     set_shape,
     setattr_in_package,
+    uniform_grid,
     window_mode,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
-    KVSplitAxis,
+    ChipletSplitAxis,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_worker import (
     RblnNixlPullConnectorWorker,
@@ -91,14 +93,14 @@ class TestShardReadPath:
         w._shard_region_group_ids = {("eng", 1): (0, 0, 0, 0)}
         w._shard_descs_per_block = {("eng", 1): 1}
         w._shard_chunk_grids = {("eng", 1): None}
-        w._kv_areas = 2
-        w._kv_split_axis = KVSplitAxis.NON_HEAD
+        w._shard_region_spans = {("eng", 1): (0, 1, 0, 1)}
+        fill_region_geometry(w, areas=2, axes=[ChipletSplitAxis.TOKEN] * 2, slices=2)
         return w
 
     def test_the_tail_block_leaves_the_areas_above_it_out(self):
         w = self._trim_worker()
         descs = w._get_block_descs_ids_for_shard(
-            "eng", 1, num_blocks=10, block_ids=[[2, 5, 7]], keep_spans=1
+            "eng", 1, num_blocks=10, block_ids=[[2, 5, 7]], needed=1
         )
         # Area 0 keeps all three blocks; area 1 drops the last, and the list
         # stays region-major so the two sides still pair by position.
@@ -108,7 +110,7 @@ class TestShardReadPath:
         # Same input, and the descriptors a full last block still needs.
         w = self._trim_worker()
         descs = w._get_block_descs_ids_for_shard(
-            "eng", 1, num_blocks=10, block_ids=[[2, 5, 7]], keep_spans=None
+            "eng", 1, num_blocks=10, block_ids=[[2, 5, 7]], needed=None
         )
         assert list(descs) == [2, 5, 7, 12, 15, 17, 22, 25, 27, 32, 35, 37]
 
@@ -117,18 +119,26 @@ class TestShardReadPath:
         # contributes no descriptor at all rather than an empty range.
         w = self._trim_worker()
         descs = w._get_block_descs_ids_for_shard(
-            "eng", 1, num_blocks=10, block_ids=[[4]], keep_spans=1
+            "eng", 1, num_blocks=10, block_ids=[[4]], needed=1
         )
         assert list(descs) == [4, 24]
 
     @classmethod
-    def _chunk_worker(cls, grid):
+    def _chunk_worker(cls, grid, *, axis=ChipletSplitAxis.TOKEN):
         # The same 4 regions over 2 areas, now with a chunk range: a 64-token
-        # block is two 32-token areas, each cut into `grid[1]` chunks.
+        # block is two 32-token areas, each cut into `grid[1]` chunks -- or,
+        # under a head cut, one 64-token span every region holds.
         w = cls._trim_worker()
         w.block_size = 64
         set_shape(w, chunk_mode=True)
-        w._shard_chunk_grids = {("eng", 1): grid}
+        spans = 2 if axis is ChipletSplitAxis.TOKEN else 1
+        fill_region_geometry(w, areas=2, axes=[axis] * 2, slices=2)
+        w._shard_region_spans = {("eng", 1): (0, spans - 1) * 2}
+        w._shard_chunk_grids = {
+            ("eng", 1): None
+            if grid is None
+            else uniform_grid(*grid, regions=4, spans=spans)
+        }
         return w
 
     def test_the_last_block_goes_out_as_the_chunks_that_hold_tokens(self):
@@ -180,8 +190,7 @@ class TestShardReadPath:
         # chunks of a partly-filled block are in all of them and the block
         # range drops that block everywhere. Two chunks a block here, so one
         # token of the last block is its first chunk in each of two runs.
-        w = self._chunk_worker((2, 2))
-        w._kv_split_axis = KVSplitAxis.HEAD
+        w = self._chunk_worker((2, 2), axis=ChipletSplitAxis.HEAD)
 
         descs = w._shard_descs_for_tokens(
             "eng", 1, 10, [[2, 5, 7]], num_valid_tokens=129, num_prompt_blocks=3
@@ -204,19 +213,14 @@ class TestShardReadPath:
     def test_a_head_cut_never_drops_the_last_block_from_a_region(self, grid):
         """Every region carries the last block, whatever it is filled to.
 
-        A head cut spreads no span axis over the regions, so `keep_spans` has
-        to stay 0 and the block range has to drop the last block from all of
-        them or none. `_tail_chunks` is what holds it there: it answers None
-        once every chunk is needed, and `needed // chunks_per_span` is 0 for
-        every answer below that. Raise that cut by one and `keep_spans`
-        becomes 1, whose position predicate is the context-cut shape -- the
-        regions above area 0 drop the block while `part` is 0, so no chunk
-        descriptor replaces it and that KV never leaves. The pre-transfer
-        length check compares index counts, so nothing fails: the peer settles
-        on a request whose last block is partly missing.
+        A head cut gives every region the whole block, so the block range has
+        to drop the last block from all of them or none, and the chunk range
+        has to replace it wherever it went. Get either half wrong and a region
+        sends nothing of that block -- and the pre-transfer length check
+        compares index counts, so nothing fails: the peer settles on a request
+        whose last block is partly missing.
         """
-        w = self._chunk_worker(grid)
-        w._kv_split_axis = KVSplitAxis.HEAD
+        w = self._chunk_worker(grid, axis=ChipletSplitAxis.HEAD)
         runs, chunks = grid
         num_blocks, last_block = 10, 7
         regions = len(w._shard_region_group_ids[("eng", 1)])
@@ -249,8 +253,7 @@ class TestShardReadPath:
         descriptor on it rather than `runs * chunks`. This is the value the
         cut is asserting, and the case a raised cut turns into silent loss.
         """
-        w = self._chunk_worker((2, 4))
-        w._kv_split_axis = KVSplitAxis.HEAD
+        w = self._chunk_worker((2, 4), axis=ChipletSplitAxis.HEAD)
 
         descs = w._shard_descs_for_tokens(
             "eng",
@@ -273,17 +276,6 @@ class TestShardReadPath:
         )
 
         assert list(descs) == [2, 5, 7, 12, 15, 22, 25, 27, 32, 35]
-
-    def test_a_head_band_split_cannot_be_trimmed(self):
-        # With more than one descriptor per block the position no longer names
-        # an area, so the two would index different things.
-        w = self._trim_worker()
-        w._shard_descs_per_block = {("eng", 1): 2}
-        w._shard_chunk_grids = {("eng", 1): None}
-        with pytest.raises(AssertionError):
-            w._get_block_descs_ids_for_shard(
-                "eng", 1, num_blocks=10, block_ids=[[2, 5]], keep_spans=1
-            )
 
     def test_get_block_descs_ids_for_shard_empty_group(self):
         w = object.__new__(RblnNixlPullConnectorWorker)
@@ -355,6 +347,7 @@ class TestShardReadPath:
         w._shard_region_group_ids = {("eng", r): (0, 0) for r in range(pp_size)}
         w._shard_descs_per_block = {("eng", r): 1 for r in range(pp_size)}
         w._shard_chunk_grids = {("eng", r): None for r in range(pp_size)}
+        w._shard_region_spans = {("eng", r): (0, 0) for r in range(pp_size)}
         set_shape(w, chunk_mode=False)
         # Neither knob, so nothing is parked. Either one on is what the two
         # `..._parks_the_count` cases cover.
@@ -529,8 +522,8 @@ class TestShardReadPath:
         # read and each stage issues half the descriptors.
         w = self._read_worker(pp_size=2)
         set_shape(w, chunk_mode=True)
-        w._kv_areas = 2
-        w._kv_split_axis = KVSplitAxis.NON_HEAD
+        fill_region_geometry(w, areas=2, axes=[ChipletSplitAxis.TOKEN], slices=2)
+        w._shard_region_spans = {("eng", r): (0, 1) for r in range(2)}
         w.block_size = 16
 
         TestShardReadPath._read(w, "r0", self._meta([[7]], [[3, 4, 7]], num_tokens=33))

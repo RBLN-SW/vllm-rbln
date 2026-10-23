@@ -156,7 +156,7 @@ from vllm_rbln.v1.spec_decode.dflash import RBLNDFlashProposer
 from vllm_rbln.v1.spec_decode.dspark import RBLNDSparkProposer
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.eagle3_pp import (
-    eagle3_aux_hidden_states_enabled,
+    aux_hidden_states_enabled,
     install_aux_handoff_slots,
 )
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
@@ -358,7 +358,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             | RBLNDFlashProposer
             | None
         ) = None
-        self.use_aux_hidden_state_outputs = eagle3_aux_hidden_states_enabled(
+        self.use_aux_hidden_state_outputs = aux_hidden_states_enabled(
             self.speculative_config
         )
 
