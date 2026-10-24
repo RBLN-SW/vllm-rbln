@@ -75,13 +75,13 @@ def _validate(vllm_config: "VllmConfig") -> None:
     if vllm_config.lora_config is not None:
         raise ValueError("LoRA is not supported on RBLN.")
 
-    if model_config.uses_mrope:
-        # The RBLN RoPE override covers `RotaryEmbedding` and takes
-        # `[batch, seq]` positions; `MRotaryEmbedding` is a sibling class with
-        # no RBLN forward, and its native one reads a 2-D tensor as `[3, N]`.
+    if model_config.uses_mrope and model_config.supports_multimodal_inputs:
+        # The runner hands the model `[batch, seq]` positions; a multimodal
+        # prompt needs the `[3, batch, seq]` T/H/W positions it does not build.
         raise ValueError(
-            "M-RoPE models (e.g. the Qwen2-VL family) are not supported on the "
-            "RBLN vLLM path yet. Use the optimum path."
+            "Multimodal inputs to an M-RoPE model (e.g. the Qwen2-VL and Qwen3.5 "
+            "families) are not supported on the RBLN vLLM path yet. Run it "
+            "text-only with --language-model-only, or use the optimum path."
         )
 
     text_config = getattr(model_config, "hf_text_config", model_config.hf_config)
