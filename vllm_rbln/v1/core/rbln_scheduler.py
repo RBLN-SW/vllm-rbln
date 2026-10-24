@@ -70,6 +70,10 @@ class RBLNScheduler(Scheduler):
         self.num_lookahead_tokens: int = max(
             self.num_lookahead_tokens, self.num_spec_tokens
         )
+        # TODO(vllm-project/vllm#63288): upstream sets this; drop with the patch.
+        self.num_decode_step_tokens = (
+            1 + self.num_spec_tokens if self.num_spec_tokens else 0
+        )
 
         rbln_config: RBLNConfig = self.vllm_config.additional_config
 
@@ -741,6 +745,9 @@ class RBLNScheduler(Scheduler):
                     # schedule a new prefill request only if there is enough
                     # KV cache space to accommodate the full token count.
                     full_sequence_must_fit=True,
+                    # NOTE(RBLN): the gate also covers the spec decode step that
+                    # follows the prefill.
+                    num_decode_step_tokens=self.num_decode_step_tokens,
                 )
 
                 if new_blocks is None:
