@@ -3469,9 +3469,18 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             # Every layer, in layer-index order, as upstream hands them over:
             # a token-level connector (LMCache) addresses each layer through its
             # own view. RBLN NIXL registers storage and picks one layer per
-            # buffer itself.
+            # buffer itself. The DSA indexer's fp16 scale cache is allocated
+            # flat, [num_blocks, block_size], because the compiler refuses a
+            # squeeze on a dynamic input; connectors get the shape upstream
+            # allocates for that MLA spec, [num_blocks, block_size, 1], as a
+            # view of the same storage.
             kv_transfer_group.register_kv_caches(
-                dict(zip(self.kv_cache_names, self.kv_caches, strict=True))
+                {
+                    name: cache.unsqueeze(-1) if cache.dim() == 2 else cache
+                    for name, cache in zip(
+                        self.kv_cache_names, self.kv_caches, strict=True
+                    )
+                }
             )
 
         kv_transfer_group.set_host_xfer_buffer_ops(self._copy_host_device_kv_blocks)
