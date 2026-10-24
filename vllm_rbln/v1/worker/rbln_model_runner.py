@@ -1065,7 +1065,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         request count is still needed -- the decode branch of the builder pads
         the batch to it.
         """
-        if len(kv_cache_groups := self.kv_cache_config.kv_cache_groups) == 0:
+        kv_cache_groups = self.kv_cache_config.kv_cache_groups
+        if len(kv_cache_groups) == 0 and not self.gdn_groups:
             return {}, None
 
         attn_metadata: PerLayerAttnMetadata = {}
@@ -1084,7 +1085,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             num_actual_tokens=num_tokens,
             max_query_len=max_query_len,
             max_seq_len=self.seq_lens[:num_reqs].max().item(),
-            block_table_tensor=_get_block_table(0),
+            # A model truncated to linear-attention layers only has no KV cache
+            # group and so no block table; the GDN builder reads neither.
+            block_table_tensor=_get_block_table(0)
+            if kv_cache_groups
+            else torch.tensor(0),
             slot_mapping=torch.tensor(0),  # dummy
             causal=True,
         )

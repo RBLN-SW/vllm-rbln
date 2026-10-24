@@ -495,6 +495,31 @@ class TestRejectedConfigs:
         with pytest.raises(ValueError, match="M-RoPE"):
             reconfigure(lambda config: None)
 
+    def test_gdn_models_need_128_token_prefill_chunks(self, reconfigure, monkeypatch):
+        from vllm_rbln.platform import vllm_impl
+
+        monkeypatch.setattr(
+            vllm_impl, "_uses_linear_attention", lambda model_config: True
+        )
+        with pytest.raises(ValueError, match="multiple of 128"):
+            reconfigure(
+                lambda config: setattr(
+                    config.scheduler_config, "max_num_batched_tokens", 192
+                )
+            )
+        # A 128-multiple passes, and prefix caching is switched off for the model.
+        config = reconfigure(lambda config: None)
+        assert config.cache_config.enable_prefix_caching is False
+
+    def test_gdn_models_reject_speculative_decoding(self, reconfigure, monkeypatch):
+        from vllm_rbln.platform import vllm_impl
+
+        monkeypatch.setattr(
+            vllm_impl, "_uses_linear_attention", lambda model_config: True
+        )
+        with pytest.raises(ValueError, match="Speculative decoding"):
+            reconfigure(lambda config: setattr(config, "speculative_config", object()))
+
     def test_chunked_prefill_off(self, reconfigure):
         with pytest.raises(ValueError, match="chunked prefill"):
             reconfigure(

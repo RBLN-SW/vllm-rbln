@@ -37,6 +37,13 @@ _MINIMAX_BASE = CompileModelSpec(
 
 MODELS: list[CompileModelSpec] = [
     CompileModelSpec(
+        "Qwen/Qwen3.5-4B",
+        {"max_num_seqs": 2, "language_model_only": True},
+        chips=REBEL,
+        # 3 linear_attention layers then the first full_attention one
+        num_hidden_layers=4,
+    ),
+    CompileModelSpec(
         "Qwen/Qwen3-30B-A3B",
         {
             "max_num_seqs": 1,
