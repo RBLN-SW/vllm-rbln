@@ -280,6 +280,32 @@ class TestRegisterKvCachesWithConnector:
             id(t) for t in runner.kv_caches
         ]
 
+    def test_a_flat_cache_is_registered_with_a_unit_trailing_dim(
+        self, make_model_runner, monkeypatch
+    ):
+        # The DSA indexer's fp16 scale cache is allocated [num_blocks,
+        # block_size]. Connectors read every per-token cache with a trailing
+        # width, so it goes out as [num_blocks, block_size, 1] over the same
+        # storage; every other cache is handed over as is.
+        registered = self._registrations(monkeypatch)
+        runner = make_model_runner(
+            layers=("layer.0", "layer.1"),
+            init_kv_cache=False,
+            additional_config={"enable_sub_block_cache": False},
+        )
+        runner.initialize_kv_cache(
+            make_kv_cache_config(runner, groups=[("layer.0", "layer.1")])
+        )
+        flat = torch.zeros(4, 16, dtype=torch.float16)
+        runner.kv_caches[1] = flat
+
+        runner.register_kv_caches_with_connector()
+
+        attn, scale = registered[0].values()
+        assert attn is runner.kv_caches[0]
+        assert tuple(scale.shape) == (4, 16, 1)
+        assert scale.data_ptr() == flat.data_ptr()
+
     def test_a_rebuilt_cache_is_what_the_second_call_registers(
         self, make_model_runner, monkeypatch
     ):
