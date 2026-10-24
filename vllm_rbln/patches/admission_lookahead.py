@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Count the spec decode lookahead in the full-sequence admission gate."""
+"""Count the step after the prefill in the full-sequence admission gate."""
 
 import inspect
 from contextvars import ContextVar
@@ -30,10 +30,11 @@ kv_cache_coordinator_original_get_num_blocks_to_allocate = (
 )
 ALLOCATE_SLOTS_SIGNATURE = inspect.signature(kv_cache_manager_original_allocate_slots)
 
-# (lookahead, max_model_len) of the gated allocate_slots call in flight. Unset
-# elsewhere, so upstream's other admission-cap callers count what they did.
-admission_lookahead: ContextVar[tuple[int, int] | None] = ContextVar(
-    "rbln_admission_lookahead", default=None
+# (decode step tokens, lookahead, max_model_len) of the gated allocate_slots
+# call in flight. Unset elsewhere, so upstream's other admission-cap callers
+# count what they did.
+admission_margin: ContextVar[tuple[int, int, int] | None] = ContextVar(
+    "rbln_admission_margin", default=None
 )
 
 
@@ -41,27 +42,34 @@ admission_lookahead: ContextVar[tuple[int, int] | None] = ContextVar(
     target="vllm.v1.core.kv_cache_manager.KVCacheManager.allocate_slots",
     reason=(
         "upstream's full-sequence admission gate counts request.num_tokens "
-        "alone, but the final prefill chunk also allocates the spec decode "
-        "lookahead, which RBLN raises to num_spec_tokens even for ngram. With "
-        "no mixed batching, a prompt admitted one block short preempts itself "
-        "on that chunk while the decodes holding the pool never run. Upstream "
-        "has no hook for the token count the gate passes on."
+        "alone, but the last prefill chunk allocates the lookahead (RBLN raises "
+        "it to num_spec_tokens even for ngram) and the decode step after it "
+        "adds the sampled and draft tokens. With no mixed batching, a prompt "
+        "admitted short preempts itself there while the decodes holding the "
+        "pool cannot run. Upstream has no num_decode_step_tokens."
     ),
 )
 def patched_allocate_slots(
-    self: KVCacheManager, *args: Any, **kwargs: Any
+    self: KVCacheManager,
+    *args: Any,
+    num_decode_step_tokens: int = 0,
+    **kwargs: Any,
 ) -> KVCacheBlocks | None:
     # Every caller passes full_sequence_must_fit by keyword.
     if not kwargs.get("full_sequence_must_fit"):
         return kv_cache_manager_original_allocate_slots(self, *args, **kwargs)
     call = ALLOCATE_SLOTS_SIGNATURE.bind(self, *args, **kwargs).arguments
-    token = admission_lookahead.set(
-        (call.get("num_lookahead_tokens", 0), self.max_model_len)
+    token = admission_margin.set(
+        (
+            num_decode_step_tokens,
+            call.get("num_lookahead_tokens", 0),
+            self.max_model_len,
+        )
     )
     try:
         return kv_cache_manager_original_allocate_slots(self, *args, **kwargs)
     finally:
-        admission_lookahead.reset(token)
+        admission_margin.reset(token)
 
 
 @register_patch(
@@ -72,19 +80,23 @@ def patched_allocate_slots(
     reason=(
         "num_tokens is meant to include the lookahead and num_tokens_main_model "
         "to exclude it, but the admission gate passes the prompt for both. "
-        "Adds the lookahead the patched allocate_slots recorded, to the gate's "
-        "call only (apply_admission_cap=True), so upstream's block arithmetic "
-        "does the counting."
+        "Adds what the patched allocate_slots recorded, the decode step to both "
+        "and the lookahead to num_tokens, on the gate's call only "
+        "(apply_admission_cap=True), so upstream's block arithmetic counts."
     ),
 )
 def patched_get_num_blocks_to_allocate(
     self: KVCacheCoordinator, *args: Any, **kwargs: Any
 ) -> int:
-    gate = admission_lookahead.get()
-    # The gate passes every argument by keyword; a positional num_tokens raises.
-    if gate is not None and kwargs.get("apply_admission_cap"):
-        lookahead, max_model_len = gate
-        kwargs["num_tokens"] = min(kwargs["num_tokens"] + lookahead, max_model_len)
+    margin = admission_margin.get()
+    # The gate passes every argument by keyword; a positional one raises.
+    if margin is not None and kwargs.get("apply_admission_cap"):
+        num_decode_step_tokens, lookahead, max_model_len = margin
+        num_tokens_main_model = min(
+            kwargs["num_tokens_main_model"] + num_decode_step_tokens, max_model_len
+        )
+        kwargs["num_tokens_main_model"] = num_tokens_main_model
+        kwargs["num_tokens"] = min(num_tokens_main_model + lookahead, max_model_len)
     return kv_cache_coordinator_original_get_num_blocks_to_allocate(
         self, *args, **kwargs
     )

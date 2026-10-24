@@ -24,7 +24,7 @@ from vllm.distributed.kv_events import BlockStored, KVEventBatch
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.metrics.stats import PrefixCacheStats
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.request import RequestStatus
 
 from tests.vllm.v1.core.utils import (
@@ -1925,45 +1925,60 @@ class TestSyncKVLoads:
         assert output.has_sync_kv_loads
 
 
-class TestAdmissionCountsLookahead:
-    """A block-aligned prompt's final chunk also allocates the drafting
-    lookahead, so it needs one block more than the prompt. Admission counted the
-    prompt alone: with the rest of the pool held by decodes, the final chunk
-    preempted the prefill itself, and with no mixed batching the decodes never
-    ran to free a block, so the same cycle repeated forever."""
+class TestAdmissionCoversStepAfterPrefill:
+    """Admission has to cover the step after the prefill, not only the prompt:
+    the last chunk allocates the drafting lookahead, and the first decode step
+    adds the sampled and draft tokens. Admitted on the prompt alone while decodes
+    held the rest of the pool, the request preempted itself on that step after
+    its prefill ran, and with no mixed batching the decodes could not always run
+    to free a block."""
 
     BLOCK = 16
+    NUM_SPEC_TOKENS = 3
 
-    @staticmethod
-    def _step(sched):
+    @classmethod
+    def _step(cls, sched):
         out = sched.schedule()
-        # A partial prefill samples nothing; a full prompt or a decode does.
+        # A partial prefill samples nothing; a full prompt or a decode samples
+        # one token and is drafted for.
         output = make_model_runner_output(out)
-        output.sampled_token_ids = [
-            [7] if r.num_computed_tokens >= r.num_tokens else []
-            for r in (sched.requests[rid] for rid in output.req_ids)
+        sampled = [
+            sched.requests[rid].num_computed_tokens >= sched.requests[rid].num_tokens
+            for rid in output.req_ids
         ]
+        output.sampled_token_ids = [[7] if s else [] for s in sampled]
         sched.update_from_output(out, output)
+        sched.update_draft_token_ids(
+            DraftTokenIds(
+                output.req_ids,
+                [[7] * cls.NUM_SPEC_TOKENS if s else [] for s in sampled],
+            )
+        )
 
     @pytest.mark.usefixtures("cr13")
+    # Both prompts take two chunks. 32: the last chunk's lookahead needs a third
+    # block. 26: 26 + 3 fits two blocks, but the first decode step needs
+    # 26 + 1 + 3 + 3 slots.
+    @pytest.mark.parametrize("prompt_len", [32, 26])
     @pytest.mark.parametrize("sub_block_size", [None, 4, 8])
     @pytest.mark.parametrize("connector", [False, True])
-    def test_block_aligned_prompt_finishes_while_decodes_hold_the_pool(
-        self, sub_block_size, connector
+    def test_prompt_finishes_unpreempted_while_decodes_hold_the_pool(
+        self, prompt_len, sub_block_size, connector
     ):
         sched = create_rbln_scheduler(
             enable_prefix_caching=True,
             block_size=self.BLOCK,
             sub_block_size=sub_block_size,
             additional_config={"enable_sub_block_cache": sub_block_size is not None},
-            max_num_batched_tokens=8,
+            # Room for both decodes' drafted steps and an admission beside them.
+            max_num_batched_tokens=self.BLOCK,
             max_model_len=4 * self.BLOCK,
-            num_blocks=6,
+            num_blocks=7,
             max_num_seqs=4,
-            num_speculative_tokens=3,
+            num_speculative_tokens=self.NUM_SPEC_TOKENS,
             use_kv_connector=MockKVConfig(matched_tokens=0) if connector else None,
         )
-        # Two decodes take two blocks each, leaving one of the five free.
+        # Two decodes take two blocks each, leaving two of the six free.
         for n in range(2):
             prompt = [100 * (n + 1) + i for i in range(self.BLOCK + 1)]
             sched.add_request(make_request(f"d{n}", prompt, self.BLOCK, max_tokens=8))
@@ -1972,12 +1987,13 @@ class TestAdmissionCountsLookahead:
         ):
             self._step(sched)
 
-        # Exactly one block of prompt: the final chunk needs a second block.
-        prompt = [900 + i for i in range(self.BLOCK)]
-        sched.add_request(make_request("v", prompt, self.BLOCK, max_tokens=1))
+        prompt = [900 + i for i in range(prompt_len)]
+        request = make_request("v", prompt, self.BLOCK, max_tokens=4)
+        sched.add_request(request)
         for _ in range(100):
             if not sched.requests:
                 break
             self._step(sched)
 
         assert not sched.requests
+        assert request.num_preemptions == 0

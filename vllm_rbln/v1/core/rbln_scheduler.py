@@ -708,6 +708,11 @@ class RBLNScheduler(Scheduler):
                 effective_lookahead_tokens = (
                     0 if limit_lookahead_tokens else self.num_lookahead_tokens
                 )
+                # NOTE(RBLN): the full-sequence gate also covers the spec decode
+                # step that follows the prefill.
+                num_decode_step_tokens = (
+                    1 + self.num_spec_tokens if self.num_spec_tokens else 0
+                )
 
                 # Determine if we need to allocate cross-attention blocks.
                 num_encoder_tokens = 0
@@ -741,6 +746,7 @@ class RBLNScheduler(Scheduler):
                     # schedule a new prefill request only if there is enough
                     # KV cache space to accommodate the full token count.
                     full_sequence_must_fit=True,
+                    num_decode_step_tokens=num_decode_step_tokens,
                 )
 
                 if new_blocks is None:
