@@ -130,6 +130,10 @@ from vllm_rbln.platform import use_device_tensor
 from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadataBuilder,
 )
+from vllm_rbln.v1.attention.backends.gdn import (
+    RBLNGDNAttentionMetadataBuilder,
+    stateless_gdn_layers,
+)
 from vllm_rbln.v1.attention.kv_cache_bindings import (
     KVCacheViewInfo,
     attach_kv_cache_bindings,
@@ -345,6 +349,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
         # indexes: [kv_cache_group_id][attn_group]
         self.attn_groups: list[list[AttentionGroup]] = []
+        # GatedDeltaNet layers keep their state outside the KV cache groups.
+        self.gdn_groups: list[tuple[RBLNGDNAttentionMetadataBuilder, list[str]]] = []
 
         # Set up speculative decoding.
         # NOTE(Jiayi): We put the entire draft model on the last PP rank.
@@ -620,6 +626,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
     def _update_states(self, scheduler_output: RBLNSchedulerOutput) -> None:
         """Update the cached states and the persistent batch with the scheduler
         output."""
+        for gdn_builder, _ in self.gdn_groups:
+            gdn_builder.release(scheduler_output.finished_req_ids)
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
@@ -1043,9 +1051,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         num_reqs_padded: int,
         logits_indices: torch.Tensor | None = None,
         back_pad: torch.Tensor | None = None,
+        req_ids: Sequence[str] | None = None,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
+
+        `req_ids` names the request on each batch row; a dummy run passes None
+        and the GatedDeltaNet state rows of live requests are parked out of its way.
 
         Unlike upstream's runner this takes no padded token count: the metadata
         handed to the drafter is built from the unpadded counts here, where
@@ -1118,6 +1130,17 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
                 for layer_name in attn_group.layer_names:
                     attn_metadata[layer_name] = attn_metadata_i
+
+        for gdn_builder, gdn_layer_names in self.gdn_groups:
+            gdn_metadata = gdn_builder.build(
+                common_attn_metadata=cm_base,
+                positions=self.positions,
+                batch_pad=num_reqs_padded,
+                is_prefill=self.is_prefill,
+                req_ids=req_ids,
+            )
+            for layer_name in gdn_layer_names:
+                attn_metadata[layer_name] = gdn_metadata
 
         self._attach_kv_cache_bindings(attn_metadata)
 
@@ -1971,6 +1994,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     num_reqs_padded=batch_desc.num_reqs_padded,
                     logits_indices=logits_indices,
                     back_pad=self.decode_back_pad,
+                    req_ids=self.input_batch.req_ids[:num_reqs],
                 )
             )
 
@@ -3020,6 +3044,16 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     else None,
                     num_metadata_builders=1,  # not use ubatching
                 )
+
+        if gdn_layer_names := stateless_gdn_layers(self.vllm_config, kv_cache_config):
+            gdn_builder = RBLNGDNAttentionMetadataBuilder(
+                None,
+                gdn_layer_names,
+                self.vllm_config,
+                self.device,
+                max_batch_pad=max(self.bucketing_manager.batch_buckets),
+            )
+            self.gdn_groups = [(gdn_builder, gdn_layer_names)]
 
         # Initialize drafter attention backend.
         if isinstance(self.drafter, DRAFT_MODEL_PROPOSERS):

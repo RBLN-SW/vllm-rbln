@@ -57,6 +57,13 @@ def check_and_update(vllm_config: "VllmConfig") -> None:
     _setup_runtime_env(vllm_config)
 
 
+def _uses_linear_attention(model_config) -> bool:
+    """GatedDeltaNet layers (Qwen3-Next, Qwen3.5): the HF config lists them
+    as `linear_attention` in `layer_types`."""
+    text_config = getattr(model_config, "hf_text_config", model_config.hf_config)
+    return "linear_attention" in (getattr(text_config, "layer_types", None) or ())
+
+
 def _uses_model_parallel(parallel_config) -> bool:
     return (
         parallel_config.tensor_parallel_size > 1
@@ -83,6 +90,20 @@ def _validate(vllm_config: "VllmConfig") -> None:
             "families) are not supported on the RBLN vLLM path yet. Run it "
             "text-only with --language-model-only, or use the optimum path."
         )
+
+    if _uses_linear_attention(model_config):
+        if scheduler_config.max_num_batched_tokens % 128:
+            raise ValueError(
+                "The RBLN GatedDeltaNet prefill kernel runs in 128-token chunks; "
+                f"got max_num_batched_tokens="
+                f"{scheduler_config.max_num_batched_tokens}. "
+                "Set --max-num-batched-tokens to a multiple of 128."
+            )
+        if vllm_config.speculative_config is not None:
+            raise ValueError(
+                "Speculative decoding is not supported for GatedDeltaNet models on "
+                "the RBLN vLLM path yet: the decode kernel takes one token per request."
+            )
 
     text_config = getattr(model_config, "hf_text_config", model_config.hf_config)
     if (
@@ -336,6 +357,22 @@ def _override(vllm_config: "VllmConfig") -> None:
             "Overriding model_config.disable_cascade_attn to True."
         )
         model_config.disable_cascade_attn = True
+
+    if (
+        _uses_linear_attention(model_config)
+        and vllm_config.cache_config.enable_prefix_caching
+    ):
+        # A GatedDeltaNet state row belongs to one request and is not content
+        # addressable, so a cache hit could not restore it.
+        logger.warning(
+            "Prefix caching is not supported for GatedDeltaNet models on the RBLN "
+            "vLLM path. Overriding cache_config.enable_prefix_caching to False."
+        )
+        vllm_config.cache_config.enable_prefix_caching = False
+        # Upstream sizes mamba blocks for prefix caching; without it the value
+        # must go back to unset or VllmConfig rejects the pair.
+        if not vllm_config.cache_config.user_specified_mamba_block_size:
+            vllm_config.cache_config.mamba_block_size = None
 
 
 def _wire(vllm_config: "VllmConfig") -> None:

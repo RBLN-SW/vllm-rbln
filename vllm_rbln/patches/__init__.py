@@ -51,6 +51,7 @@ from . import (
     oot,
     qwen2_moe,
     qwen3_moe,
+    qwen3_next,
     rotary_embedding,
     sampler,
     speculative_config,
