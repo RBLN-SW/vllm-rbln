@@ -365,8 +365,10 @@ class TestSubBlockSchedulingFuzz:
             num_speculative_tokens=num_speculative_tokens,
         )
         # The pool, not max_model_len, bounds a request here, so leave room for
-        # the spec decode lookahead its last decode window allocates.
-        pending = self._workload(rng, capacity - 3)
+        # what admission reserves past the prompt: the first decode step's
+        # sampled and draft tokens, and the lookahead.
+        room = 1 + 2 * num_speculative_tokens if num_speculative_tokens else 0
+        pending = self._workload(rng, capacity - room)
         for step in range(self.MAX_STEPS):
             while pending and pending[0][0] <= step:
                 _, rid, prompt, max_tokens = pending.pop(0)
