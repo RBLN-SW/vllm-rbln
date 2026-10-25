@@ -16,6 +16,7 @@ from concurrent.futures import Future
 from unittest.mock import Mock
 
 import pytest
+from vllm.v1.outputs import DraftTokenIds
 from vllm.v1.request import RequestStatus
 
 from .utils import create_model_runner_output, create_requests, create_scheduler
@@ -176,6 +177,109 @@ def test_schedule_multi_seq():
 
 
 @pytest.mark.parametrize(
+    "prompt_length, drafts, max_model_len, expected_tokens",
+    [
+        (12, 3, 128, 4),
+        (13, 3, 128, 1),
+        (16, 3, 128, 4),
+        (12, 1, 128, 2),
+        (12, 0, 128, 1),
+        (12, 5, 128, 4),
+        (124, 3, 127, 1),
+    ],
+)
+def test_schedule_speculative_tokens(
+    prompt_length, drafts, max_model_len, expected_tokens
+):
+    scheduler = create_scheduler(
+        max_num_seqs=1,
+        num_blocks=16,
+        num_speculative_tokens=3,
+        max_model_len=max_model_len,
+    )
+    request = create_requests(num_requests=1, num_tokens=prompt_length)[0]
+    scheduler.add_request(request)
+    prefill = scheduler.schedule()
+    scheduler.update_from_output(prefill, create_model_runner_output(prefill))
+    draft_tokens = list(range(100, 100 + drafts))
+    scheduler.update_draft_token_ids(
+        DraftTokenIds([request.request_id], [draft_tokens])
+    )
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {request.request_id: expected_tokens}
+    expected_drafts = (
+        {request.request_id: draft_tokens[: expected_tokens - 1]}
+        if expected_tokens > 1
+        else {}
+    )
+    assert output.scheduled_spec_decode_tokens == expected_drafts
+    assert output.scheduled_cached_reqs.num_computed_tokens == [prompt_length]
+    assert request.num_computed_tokens == prompt_length + expected_tokens
+    assert request.spec_token_ids == []
+    # A single sampled token means every scheduled draft was rejected.
+    scheduler.update_from_output(output, create_model_runner_output(output))
+    assert request.num_computed_tokens == prompt_length + 1
+
+
+@pytest.mark.parametrize("boundary_drafts", [0, 3])
+def test_speculative_batch_falls_back_at_physical_block_boundary(boundary_drafts):
+    scheduler = create_scheduler(
+        max_num_seqs=2,
+        num_blocks=16,
+        block_size=16,
+        outer_block_size=32,
+        num_speculative_tokens=3,
+    )
+    requests = create_requests(num_requests=2, num_tokens=12)
+    for request in requests:
+        scheduler.add_request(request)
+        output = scheduler.schedule()
+        scheduler.update_from_output(output, create_model_runner_output(output))
+    # A shorter draft list still executes the fixed four-token physical window.
+    requests[1].append_output_token_ids(42)
+    requests[1].num_computed_tokens += 1
+    for request, drafts in zip(requests, [3, boundary_drafts]):
+        scheduler.update_draft_token_ids(
+            DraftTokenIds([request.request_id], [list(range(100, 100 + drafts))])
+        )
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {
+        request.request_id: 1 for request in requests
+    }
+    assert output.scheduled_spec_decode_tokens == {}
+    assert all(request.spec_token_ids == [] for request in requests)
+
+
+@pytest.mark.parametrize("pending_tokens", [1, 2])
+def test_speculative_schedule_respects_token_budget(pending_tokens):
+    scheduler = create_scheduler(
+        max_num_seqs=1, num_blocks=16, num_speculative_tokens=3
+    )
+    request = create_requests(num_requests=1, num_tokens=12)[0]
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+    scheduler.update_from_output(output, create_model_runner_output(output))
+    if pending_tokens == 2:
+        request.append_output_token_ids(42)
+    scheduler.update_draft_token_ids(
+        DraftTokenIds([request.request_id], [[100, 101, 102]])
+    )
+    scheduler.max_num_scheduled_tokens = 2
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {request.request_id: 2}
+    assert output.total_num_scheduled_tokens == 2
+    expected_drafts = {request.request_id: [100]} if pending_tokens == 1 else {}
+    assert output.scheduled_spec_decode_tokens == expected_drafts
+    assert request.spec_token_ids == []
+
+
+@pytest.mark.parametrize(
     "max_num_seqs, block_size, max_model_len, "
     "num_blocks, num_tokens_per_batch, "
     "exp_new_req0_blocks, exp_cached0_new, "
@@ -289,7 +393,8 @@ def test_cache_slot_id_lifecycle():
     assert output.cache_slot_id_dict == {"0": 0, "2": 1}
 
 
-def test_cache_slot_id_freed_on_preemption():
+@pytest.mark.parametrize("num_speculative_tokens", [None, 3])
+def test_cache_slot_id_freed_on_preemption(num_speculative_tokens):
     """A preempted request releases its cache slot id immediately and is
     re-admitted with a freshly allocated one."""
     # 32-token prompts fill 2 blocks each; num_blocks=6 leaves 5 usable blocks
@@ -299,6 +404,7 @@ def test_cache_slot_id_freed_on_preemption():
         max_num_seqs=2,
         max_num_batched_tokens=64,
         num_blocks=6,
+        num_speculative_tokens=num_speculative_tokens,
     )
     requests = create_requests(num_requests=2, num_tokens=32)
 
@@ -308,10 +414,13 @@ def test_cache_slot_id_freed_on_preemption():
         output = scheduler.schedule()
         scheduler.update_from_output(output, create_model_runner_output(output))
 
+    if num_speculative_tokens:
+        scheduler.update_draft_token_ids(DraftTokenIds(["1"], [[100, 101, 102]]))
     output = scheduler.schedule()
     assert output.preempted_req_ids == {"1"}
     assert output.cache_slot_id_dict == {"0": 0}
     assert scheduler._cache_slot_ids == {"0": 0}
+    assert requests[1].spec_token_ids == []
     scheduler.update_from_output(output, create_model_runner_output(output))
 
     # Once request 0 finishes, the preempted request resumes from prefill with

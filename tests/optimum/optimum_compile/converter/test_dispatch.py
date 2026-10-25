@@ -29,12 +29,21 @@ def _vllm_config(user_max_num_batched_tokens=None, dtype=torch.bfloat16):
             model="meta-llama/Llama-3.1-8B", max_model_len=8192, dtype=dtype
         ),
         scheduler_config=SimpleNamespace(max_num_seqs=4),
+        speculative_config=None,
         cache_config=SimpleNamespace(block_size=8192, gpu_memory_utilization=0.9),
         additional_config=build_optimum_rbln_config(additional_config),
     )
 
 
 class TestGenerateModelPathName:
+    def test_speculative_length_changes_hash(self):
+        cfg = _vllm_config()
+        ordinary = _generate_model_path_name(cfg)
+        cfg.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+        spec_3 = _generate_model_path_name(cfg)
+        cfg.speculative_config.num_speculative_tokens = 5
+        assert len({ordinary, spec_3, _generate_model_path_name(cfg)}) == 3
+
     def test_user_max_num_batched_tokens_changes_hash(self):
         # Two runs that would compile different prefill chunk sizes must not
         # collide on the same cache key.

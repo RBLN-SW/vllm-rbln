@@ -18,6 +18,7 @@ from vllm.config import (
     CacheConfig,
     ModelConfig,
     SchedulerConfig,
+    SpeculativeConfig,
     StructuredOutputsConfig,
     VllmConfig,
 )
@@ -59,6 +60,7 @@ def create_scheduler(
     enable_prefix_caching: bool = False,
     policy: str = "fcfs",
     max_num_active_seqs: int | None = None,
+    num_speculative_tokens: int | None = None,
 ) -> RBLNOptimumScheduler:
     """Create RBLNOptimumscheduler under test.
 
@@ -103,6 +105,13 @@ def create_scheduler(
         model_config=model_config,
         cache_config=cache_config,
         structured_outputs_config=structured_outputs_config,
+        speculative_config=(
+            SpeculativeConfig(
+                model="ngram", num_speculative_tokens=num_speculative_tokens
+            )
+            if num_speculative_tokens is not None
+            else None
+        ),
         additional_config={
             "sub_block_size": block_size,
             "optimum_overrides": {

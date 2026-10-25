@@ -34,7 +34,7 @@ from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.core.kv_cache_utils import get_uniform_page_size
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheSpec
-from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
+from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 from vllm_rbln import envs
@@ -230,6 +230,9 @@ class RBLNOptimumWorker(WorkerBase):
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
         return self.model_runner.sample_tokens(grammar_output)
+
+    def take_draft_token_ids(self) -> DraftTokenIds | None:
+        return self.model_runner.take_draft_token_ids()
 
     def execute_model(
         self,
