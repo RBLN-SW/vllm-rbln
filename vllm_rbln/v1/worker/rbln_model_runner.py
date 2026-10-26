@@ -126,7 +126,7 @@ from vllm_rbln.model_executor.models.interfaces import (
     SupportsRBLNMultiModal,
     supports_rbln_multimodal,
 )
-from vllm_rbln.platform import USE_DEVICE_TENSOR
+from vllm_rbln.platform import use_device_tensor
 from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadataBuilder,
 )
@@ -147,7 +147,6 @@ from vllm_rbln.v1.core.utils import (
     step_is_prefill,
     sub_block_size_in_use,
 )
-from vllm_rbln.v1.sample.ops.top_k_top_p import TOP_P_CLAMP
 from vllm_rbln.v1.sample.rbln_logits_processor import build_rbln_logitsprocs
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
 from vllm_rbln.v1.sample.rbln_sampler import WARM_UP_CONFIGS, RBLNSampler
@@ -155,7 +154,7 @@ from vllm_rbln.v1.spec_decode import DRAFT_MODEL_PROPOSERS
 from vllm_rbln.v1.spec_decode.dflash import RBLNDFlashProposer
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.eagle3_pp import (
-    eagle3_aux_hidden_states_enabled,
+    aux_hidden_states_enabled,
     install_aux_handoff_slots,
 )
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
@@ -303,7 +302,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # NOTE(RBLN): Compilation context for marking the KV cache address as static.
         self.compile_context = (
             create_compile_context(use_weight_sharing=True, use_global_ctx=True)
-            if not USE_DEVICE_TENSOR
+            if not use_device_tensor()
             else None
         )
         self.runtime_holder: list = []
@@ -357,7 +356,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             | RBLNDFlashProposer
             | None
         ) = None
-        self.use_aux_hidden_state_outputs = eagle3_aux_hidden_states_enabled(
+        self.use_aux_hidden_state_outputs = aux_hidden_states_enabled(
             self.speculative_config
         )
 
@@ -370,10 +369,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 self.drafter = RBLNMedusaProposer(self.vllm_config, self.device)
             elif self.speculative_config.method == "dflash":
                 self.drafter = RBLNDFlashProposer(self.vllm_config, self.device, self)
-                # Upstream turns this on unconditionally for DFlash: the
-                # drafter reduces the target's aux states through its own
-                # projection, as eagle3 does.
-                self.use_aux_hidden_state_outputs = True
             elif self.speculative_config.use_eagle():
                 self.drafter = RBLNEagleProposer(self.vllm_config, self.device, self)
             else:
@@ -530,7 +525,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         )
 
         self.offload_context = nullcontext
-        if USE_DEVICE_TENSOR and not envs.VLLM_RBLN_DISABLE_OFFLOAD:
+        if use_device_tensor() and not envs.VLLM_RBLN_DISABLE_OFFLOAD:
             self.offload_context = torch.rbln.offload
 
         # What this step's ranks reported. The draft decides its own shapes from
@@ -812,11 +807,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # Add the new or resumed requests to the persistent batch.
         # The smaller empty indices are filled first.
         for request in reqs_to_add:
-            # FIXME(huijong.jeong): remove this once our rbln.top_k_top_p gets revised.
-            if self.rbln_config.use_custom_sampler and (
-                sampling_params := request.sampling_params
-            ):
-                sampling_params.top_p = min(sampling_params.top_p, TOP_P_CLAMP)
             # A prefill-only step evicts every decode request, so each one is re-added
             # here once per prefill, and converting the prompt list is most of
             # add_request. Fill the row from an array made on the first add, and give
@@ -2494,7 +2484,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 fullgraph=True,
                 compile_context=self.compile_context,
                 num_devices=1,
-                model_trace_method="export" if USE_DEVICE_TENSOR else "",
+                model_trace_method="export" if use_device_tensor() else "",
                 process_group_dict=process_group_dict,
                 guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
                 runtime_holder=self.runtime_holder,
@@ -2513,7 +2503,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                         fullgraph=True,
                         compile_context=self.compile_context,
                         num_devices=1,
-                        model_trace_method="export" if USE_DEVICE_TENSOR else "",
+                        model_trace_method="export" if use_device_tensor() else "",
                         process_group_dict=process_group_dict,
                         guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
                         runtime_holder=self.runtime_holder,
@@ -3102,7 +3092,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # One buffer per extent, so the layers that alias one cache get one
         # tensor and the rest get their own. Not one pool the layers slice: a
         # graph input is a whole tensor, and dynamo refuses a slice's offset.
-        device = self.device if USE_DEVICE_TENSOR else "meta"
+        device = self.device if use_device_tensor() else "meta"
         extent_of = kv_cache_extents(kv_cache_config)
         buffers = {
             extent: torch.empty(extent[1], dtype=torch.int8, device=device)
@@ -3364,7 +3354,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             assert hasattr(layer, "layer_index"), layer_name
             layer.layer_index = position
 
-        if not USE_DEVICE_TENSOR and not self.model_config.enforce_eager:
+        if not use_device_tensor() and not self.model_config.enforce_eager:
             # `mark_static_address` is last-write-wins on storage->name. Pin to
             # one canonical layer per pool so the runtime, the connector's host
             # buffers, and the runtime copy path address the same name (and the
@@ -3890,7 +3880,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self,
         copy_ops: list[KVCacheCopyOp],
     ) -> None:
-        if not USE_DEVICE_TENSOR and not self.model_config.enforce_eager:
+        if not use_device_tensor() and not self.model_config.enforce_eager:
             # NOTE(RBLN): The runtime KV-copy interface is no longer actively maintained
             # in this path (--model-impl vllm).
             for op in copy_ops:

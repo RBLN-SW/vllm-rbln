@@ -25,7 +25,6 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.handshake impor
     RblnNixlHandshakeMixin,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
-    KVSplitAxis,
     connector_option,
     transfer_shape,
 )
@@ -33,6 +32,8 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.registration im
     RblnNixlRegistrationMixin,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
+    ChunkGrid,
+    RegionGeometry,
     RequestTail,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.transfer import (
@@ -143,14 +144,11 @@ class RblnNixlWorkerBase(
 
         self._pending_kv_caches: dict[str, torch.Tensor] | None = None
 
-        # --- Chiplet geometry of one KV entry (D2D only) ---
-        # Set from nixl_rbln.register_kv_regions. Host-bounce registers logical
-        # full-shape buffers and never expands per area, so the defaults below
-        # are its permanent (and correct) values.
+        # --- Chiplet geometry of the KV entries ---
+        # Set at registration: D2D from each entry's device layout, host-bounce
+        # as one area holding each logical full-shape buffer.
         self._kv_areas: int = 1
-        self._kv_slices: int = 1
-        # And which axis they came from -- the two counts alone do not say.
-        self._kv_split_axis: KVSplitAxis = KVSplitAxis.HEAD
+        self._logical_region_geometry: list[RegionGeometry] = []
         # The extent of the `kv` axis inside a region's block
         # (`get_kv_cache_shape`), which is one unless the attention cache packs
         # both. Host staging registers whole logical buffers and stays here.
@@ -158,10 +156,7 @@ class RblnNixlWorkerBase(
         # Model-wide counts, not this rank's share. None where the layer has
         # no head band (`_layer_kv_heads`).
         self._logical_region_kv_heads: list[int | None] = []
-
-        # `_kv_slices` above is only the LAST region's, which describes every
-        # region until a speculative draft gives them different geometries.
-        self._logical_region_slices: list[int] = []
+        self._logical_region_local_heads: list[int | None] = []
 
         # --- Pipeline-parallel (PP) P/D state (empty / inert for pp_size == 1) ---
         # Per remote producer shard, the ordered KV-cache layer names it owns,
@@ -194,19 +189,21 @@ class RblnNixlWorkerBase(
         # drops the entry without releasing what other peers still use.
         self._borrowed_src_handles: set[tuple[str, int, int]] = set()
         self._shard_region_group_ids: dict[tuple[str, int], tuple[int, ...]] = {}
-        # How many descriptors each of that shard's regions is cut into
-        # (_head_split).
-        self._shard_descs_per_block: dict[tuple[str, int], int] = {}
+        # How many descriptors a block of each of that shard's regions is: the
+        # pieces a peer of another TP degree pairs it in (`pair_area`), else one.
+        self._shard_descs_per_block: dict[tuple[str, int], tuple[int, ...]] = {}
         # Per peer shard, the grid its chunk range was built over, or None
         # where its lists carry no such range. See `_shard_chunk_grid`.
-        self._shard_chunk_grids: dict[tuple[str, int], tuple[int, int] | None] = {}
+        self._shard_chunk_grids: dict[tuple[str, int], ChunkGrid | None] = {}
+        self._shard_region_spans: dict[tuple[str, int], tuple[int, ...]] = {}
         # This engine's own grid, set once registration knows the geometry.
         # None wherever a chunk is the whole span (see `_shard_chunk_grid`).
-        self._chunk_grid: tuple[int, int] | None = None
+        self._chunk_grid: ChunkGrid | None = None
         # The window range's grid, and the observation it is chosen from. The
         # observation is the runner's; the grid adds this rank's own cut.
         self._window_grid_cut: tuple[int, int] | None = None
         self._swa_kernel_blocks: set[int] = set()
+        self._swa_group_views: list[tuple[int, tuple[int, ...]]] = []
         # Parked for the length of one upstream call (`_tail_viewed_as`); what
         # it carries is `RequestTail`.
         self._request_tail: RequestTail | None = None
@@ -238,6 +235,13 @@ class RblnNixlWorkerBase(
                 "RBLN NIXL: swa_window_mode registered no window range. This "
                 "engine has no window to cut by -- no sliding-window group, or "
                 "one as wide as its block."
+            )
+        chunk_tokens = connector_option(vllm_config, "chunk_tokens", 0)
+        if chunk_tokens and not self._shape.cuts_a_block:
+            logger.info(
+                "RBLN NIXL: chunk_tokens=%d has no effect without chunk_mode, "
+                "the only knob that cuts a block into chunks.",
+                chunk_tokens,
             )
         if (
             self._shape.wants_stream

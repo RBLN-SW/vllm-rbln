@@ -1,3 +1,7 @@
+notify:
+  - github_commit_status:
+      context: "[OB] vLLM-RBLN pytest"
+
 env:
   UV_CACHE_DIR: "/mnt/uv_cache"
   UV_LINK_MODE: "symlink"
@@ -63,6 +67,8 @@ steps:
     key: "vllm-rbln"
     steps:
       - label: ":sparkles: upload vllm-rbln-pr"
+        env:
+          PYTEST_COMPILER_OVERRIDE_COMMAND: "bash .buildkite/scripts/rebel-compiler-override.sh"
         checkout:
           sparse:
             paths:
@@ -70,4 +76,4 @@ steps:
         command: |
           TARGET_BRANCH=$${BUILDKITE_PULL_REQUEST_BASE_BRANCH:-dev}
           git fetch origin $$TARGET_BRANCH
-          buildkite-agent pipeline upload .buildkite/pipelines/vllm-rbln/pipeline-pr.yml --git-diff-base origin/$$TARGET_BRANCH
+          buildkite-agent pipeline upload .buildkite/pipelines/vllm-rbln/pipeline-pytest.yml --git-diff-base origin/$$TARGET_BRANCH

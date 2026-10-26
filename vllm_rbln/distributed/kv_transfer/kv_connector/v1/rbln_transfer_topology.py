@@ -49,17 +49,27 @@ class RblnTransferTopology(TransferTopology):
         self.local_physical_heads = max(1, self.total_num_kv_heads // self.tp_size)
         self._engines: dict[tuple[EngineId, int], EngineTransferInfo] = {}
         self._cross_layers_blocks = False
+        # Set before the shape probe below, which Mamba returns ahead of: its
+        # cache is upstream's own, and the connector refuses one anyway.
+        self._kv_head_dim: int | None = None
+        self._kv_token_dim = 0
         if self.is_mamba:
             # Upstream skips the shape for the same reason: a Mamba cache is a
             # (conv, ssm) pair, and the connector hands it no tensor shape.
             return
         backend = self.attn_backends[0]
-        # A num_blocks no other extent can collide with, so the shape itself
-        # says which axis carries it. Upstream's get_kv_cache_block_dim reads
-        # it the same way, but only off an AttentionBackend subclass.
-        mock_blocks = 1234567
+        # Extents no other can collide with, so the shape itself says which
+        # axis carries each. Upstream's get_kv_cache_block_dim reads the block
+        # axis the same way, but only off an AttentionBackend subclass. The
+        # probe asks for one head under MLA: a latent frame has no head axis
+        # for a distinctive count to land on.
+        mock_blocks, mock_tokens = 1234567, 7907
+        mock_heads = 1 if self.is_mla else 7919
         shape = backend.get_kv_cache_shape(
-            num_blocks=mock_blocks, block_size=16, num_kv_heads=1, head_size=1
+            num_blocks=mock_blocks,
+            block_size=mock_tokens,
+            num_kv_heads=mock_heads,
+            head_size=1,
         )
         block_dim = shape.index(mock_blocks)
         if self.is_mla:
@@ -80,6 +90,9 @@ class RblnTransferTopology(TransferTopology):
         self._cross_layers_blocks = (
             self.tensor_shape is not None and len(self.tensor_shape) == len(shape) + 1
         )
+        self._kv_token_dim = shape.index(mock_tokens)
+        if not self.is_mla:
+            self._kv_head_dim = shape.index(mock_heads)
 
     # vllm 0.30.0 dropped these three from TransferTopology along with the
     # cross-layer-block path they served. The RBLN registration path still
@@ -89,6 +102,17 @@ class RblnTransferTopology(TransferTopology):
     @property
     def cross_layers_blocks(self) -> bool:
         return self._cross_layers_blocks
+
+    @property
+    def kv_head_dim(self) -> int | None:
+        """The dim of one layer's KV entry that carries its heads; None for an
+        MLA latent."""
+        return self._kv_head_dim
+
+    @property
+    def kv_token_dim(self) -> int:
+        """The dim of one layer's KV entry that carries a block's tokens."""
+        return self._kv_token_dim
 
     @property
     def virtually_split_kv_in_blocks(self) -> bool:
@@ -121,7 +145,7 @@ class RblnTransferTopology(TransferTopology):
             return self._shared_cache_regions(cache, layer_spec)
         if self._kv_shares_a_block:
             # Nothing to iterate: the block is the unit, and the descriptor
-            # path cuts K and V out of it (`RblnNixlWorkerBase._kv_runs`).
+            # path cuts K and V out of it (`pair_area`).
             return [cache]
         # Iterating the tensor yields K and V; the caller divides the page size
         # by how many come back.

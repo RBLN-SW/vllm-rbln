@@ -21,6 +21,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import vllm_rbln.platform as platform
 import vllm_rbln.v1.spec_decode.medusa as medusa_module
 from tests.vllm.v1.spec_decode.utils import make_medusa_proposer
 
@@ -37,19 +38,19 @@ class TestInit:
 
     def test_no_compile_context_when_device_tensors_on(self, monkeypatch):
         # With device tensors the model runs on-device, so no compile context.
-        monkeypatch.setattr(medusa_module, "USE_DEVICE_TENSOR", True)
+        monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", True)
         proposer = make_medusa_proposer(compile_context=object())
         assert proposer.compile_context is None
 
     def test_uses_injected_compile_context_when_device_tensors_off(self, monkeypatch):
-        monkeypatch.setattr(medusa_module, "USE_DEVICE_TENSOR", False)
+        monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", False)
         sentinel = object()
         proposer = make_medusa_proposer(compile_context=sentinel)
         assert proposer.compile_context is sentinel
 
     def test_creates_compile_context_when_absent(self, monkeypatch):
         # Without device tensors and no injected context, one is created.
-        monkeypatch.setattr(medusa_module, "USE_DEVICE_TENSOR", False)
+        monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", False)
         marker = object()
         monkeypatch.setattr(
             medusa_module, "create_compile_context", lambda **kwargs: marker

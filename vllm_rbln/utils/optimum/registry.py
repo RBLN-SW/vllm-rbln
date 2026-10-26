@@ -24,16 +24,22 @@ _RBLN_GENERATION_MODELS: dict[str, tuple[str, str]] = {
     ),
     "GemmaForCausalLM": ("gemma", "RBLNGemmaForCausalLM"),
     "Gemma2ForCausalLM": ("gemma2", "RBLNGemma2ForCausalLM"),
+    "Glm4ForCausalLM": ("glm4", "RBLNGlm4ForCausalLM"),
     "PhiForCausalLM": ("phi", "RBLNPhiForCausalLM"),
+    "Phi3ForCausalLM": ("phi3", "RBLNPhi3ForCausalLM"),
     "GPT2LMHeadModel": ("gpt2", "RBLNGPT2LMHeadModel"),
+    "GraniteForCausalLM": ("granite", "RBLNGraniteForCausalLM"),
     "MidmLMHeadModel": ("midm", "RBLNMidmLMHeadModel"),
     "MistralForCausalLM": ("mistral", "RBLNMistralForCausalLM"),
     "ExaoneForCausalLM": ("exaone", "RBLNExaoneForCausalLM"),
     "Qwen2ForCausalLM": ("qwen2", "RBLNQwen2ForCausalLM"),
     "OPTForCausalLM": ("opt", "RBLNOPTForCausalLM"),
+    "Olmo2ForCausalLM": ("olmo2", "RBLNOlmo2ForCausalLM"),
     "Qwen3ForCausalLM": ("qwen3", "RBLNQwen3ForCausalLM"),
     "Qwen3MoeForCausalLM": ("qwen3_moe", "RBLNQwen3MoeForCausalLM"),
+    "SmolLM3ForCausalLM": ("smollm3", "RBLNSmolLM3ForCausalLM"),
     "GptOssForCausalLM": ("gpt-oss", "RBLNGptOssForCausalLM"),
+    "Starcoder2ForCausalLM": ("starcoder2", "RBLNStarcoder2ForCausalLM"),
     # Qwen3-Reranker is served by score() but reads its score off two vocabulary
     # logits, so it runs the generation graph -- as upstream vLLM does, resolving
     # it to Qwen3ForCausalLM. Classing it as pooling would compile

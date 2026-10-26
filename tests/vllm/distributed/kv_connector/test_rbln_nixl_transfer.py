@@ -26,13 +26,14 @@ from tests.vllm.distributed.kv_connector.utils import (
     build_worker,
     set_shape,
     sliding_window_spec,
+    uniform_grid,
     window_mode,
-)
-from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
-    KVSplitAxis,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_worker import (
     RblnNixlPullConnectorWorker,
+)
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.transfer import (
+    _chunk_desc_ids,
 )
 
 
@@ -125,8 +126,7 @@ class TestComputeDescIds:
         worker.num_regions = 2
         set_shape(worker, chunk_mode=True)
         worker._kv_areas = 1
-        worker._kv_split_axis = KVSplitAxis.HEAD
-        worker._chunk_grid = grid
+        worker._chunk_grid = None if grid is None else uniform_grid(*grid, regions=2)
         # A whole-request write names no pieces of its own, so the third
         # field is empty here; the streamed path is what fills it.
         worker._request_tail = None if tail is None else (*tail, ())
@@ -312,18 +312,59 @@ class TestWhichGroupTheCountDescribes:
         assert w._prompt_blocks(([90, 91],)) is None
 
 
+class TestChunkIdOrder:
+    """`_chunk_desc_ids` returns the chunks a span names in one order on both
+    sides, which is all the pairing needs. The order it picks is the block's
+    own: area by area, and region by region inside one -- the order a span
+    is cut in when pieces are split per area."""
+
+    def test_a_range_across_areas_comes_out_area_by_area(self):
+        # Four regions over two areas, two chunks an area, one run: region
+        # positions 0 and 2 hold the block's first half, 1 and 3 its second.
+        # Each region owns two consecutive ids from `2 * position`.
+        grid = uniform_grid(1, 2, regions=4, spans=2)
+
+        ids = _chunk_desc_ids(
+            start=0,
+            cuts=grid.regions,
+            num_blocks=1,
+            block_id=0,
+            per_block=1,
+            chunk_span=(0, 4),
+        )
+
+        assert ids.tolist() == [0, 1, 4, 5, 2, 3, 6, 7]
+
+    def test_a_region_of_no_runs_is_named_by_its_whole_block(self):
+        # Two areas each half of a chunk, then a head cut's region cut in two.
+        # The areas' ids are their whole-block ones, region by block, and the
+        # chunk range holds only the third region's.
+        ids = _chunk_desc_ids(
+            start=3 * 2,
+            cuts=((0, 0, 1), (0, 0, 1), (0, 1, 2)),
+            num_blocks=2,
+            block_id=1,
+            per_block=1,
+            chunk_span=(0, 1),
+        )
+
+        assert sorted(ids.tolist()) == [1, 3, 6 + 2]
+
+
 class TestTailChunks:
     # `_tail_chunks` over a 64-token block cut into 4 areas by a context cut,
     # so a chunk is 16 tokens at one per area and the boundaries the table
     # walks fall at 16 and its multiples; two per area makes it 8.
 
     @staticmethod
-    def _worker(monkeypatch, *, chunked=True, axis=KVSplitAxis.NON_HEAD):
+    def _worker(monkeypatch, *, chunked=True):
         w = build_worker(monkeypatch, block_size=64)
-        w._kv_areas = 4
-        w._kv_split_axis = axis
         set_shape(w, chunk_mode=chunked)
         return w
+
+    @staticmethod
+    def _context_cut(chunks_per_span):
+        return uniform_grid(1, chunks_per_span, regions=4, spans=4)
 
     @pytest.mark.parametrize(
         ("chunks_per_span", "num_valid_tokens", "expected"),
@@ -356,10 +397,8 @@ class TestTailChunks:
         self, monkeypatch, chunks_per_span, num_valid_tokens, expected
     ):
         w = self._worker(monkeypatch)
-        assert (
-            w._tail_chunks(3, num_valid_tokens, chunks_per_span=chunks_per_span)
-            == expected
-        )
+        grid = self._context_cut(chunks_per_span)
+        assert w._tail_chunks(3, num_valid_tokens, chunk_grid=grid) == expected
 
     @pytest.mark.parametrize(
         ("chunks_per_span", "num_valid_tokens", "expected"),
@@ -371,17 +410,18 @@ class TestTailChunks:
         # A head cut gives every area every token, so the span a chunk cuts is
         # the block itself -- the same four chunks of 16 tokens, reached
         # without the area count.
-        w = self._worker(monkeypatch, axis=KVSplitAxis.HEAD)
+        w = self._worker(monkeypatch)
+        grid = uniform_grid(1, chunks_per_span, regions=4)
 
-        assert (
-            w._tail_chunks(3, num_valid_tokens, chunks_per_span=chunks_per_span)
-            == expected
-        )
+        assert w._tail_chunks(3, num_valid_tokens, chunk_grid=grid) == expected
 
-    def test_chunk_mode_being_off_keeps_every_chunk(self, monkeypatch):
-        # The same input the table answers 1 for.
+    @pytest.mark.parametrize("streams", [False, True])
+    def test_chunk_mode_being_off_keeps_every_chunk(self, monkeypatch, streams):
+        # The same input the table answers 1 for. A streamed write cuts no
+        # block either: it sends the last one whole at the handover.
         w = self._worker(monkeypatch, chunked=False)
-        assert w._tail_chunks(3, 129, chunks_per_span=1) is None
+        set_shape(w, streams_prefix=streams)
+        assert w._tail_chunks(3, 129, chunk_grid=self._context_cut(1)) is None
 
     @pytest.mark.parametrize("num_valid_tokens", [128, 300])
     def test_a_count_that_does_not_fit_the_block_list_raises(
@@ -392,7 +432,7 @@ class TestTailChunks:
         # derived from either is safe.
         w = self._worker(monkeypatch)
         with pytest.raises(RuntimeError, match="different KV"):
-            w._tail_chunks(3, num_valid_tokens, chunks_per_span=1)
+            w._tail_chunks(3, num_valid_tokens, chunk_grid=self._context_cut(1))
 
 
 class TestTheWindowsOwnGranules:

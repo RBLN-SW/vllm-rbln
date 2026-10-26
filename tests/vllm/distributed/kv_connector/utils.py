@@ -22,7 +22,7 @@ flag. ``build_worker`` below goes further and replaces upstream's ``__init__``.
 
 ``KvGeometry`` is why that is affordable. One object produces all three views of
 a geometry -- the KVCacheConfig the worker is built with, the tensors it
-registers, and the sharding the adapter reports -- so a test varies one value
+registers, and the layout rebel reports for them -- so a test varies one value
 and the three cannot drift apart. An MLA geometry has only the last two: the
 engine config here is non-MLA, so no worker can be built over an MLA cache.
 Import lazily from a fixture: this module pulls in vllm.config.
@@ -32,6 +32,8 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import weakref
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -189,6 +191,36 @@ def draft_model_dir(dest: Any, kv_heads: int) -> str:
     return str(out)
 
 
+#: What a layer's sliding-window companion is called; `heads_of` reads through it.
+_SWA_SUFFIX = ".swa"
+
+
+#: The allocations `_on_device` made, by address. A device-side query takes an
+#: address rather than a tensor, so this is what answers one.
+_DEVICE_ALLOCS: weakref.WeakValueDictionary[int, Any] = weakref.WeakValueDictionary()
+
+
+def _on_device(shape: tuple[int, ...], dtype: torch.dtype) -> Any:
+    """A real tensor with only ``get_device`` overridden.
+
+    A real RBLN device tensor would force the ``use_device`` mark, which spawns
+    the test and blinds coverage; the D2D path asserts ``cache.get_device() >= 0``
+    and nothing else about the device. So a subclass answers that one probe and
+    leaves ``data_ptr``, ``numel``, ``element_size`` and ``shape`` to torch --
+    the region arithmetic under test then runs on real addresses and real byte
+    counts.
+    """
+
+    class _OnDevice(torch.Tensor):
+        @staticmethod
+        def get_device() -> int:  # type: ignore[override]
+            return 0
+
+    tensor = torch.zeros(shape, dtype=dtype).as_subclass(_OnDevice)
+    _DEVICE_ALLOCS[tensor.data_ptr()] = tensor
+    return tensor
+
+
 @dataclass(frozen=True)
 class KvGeometry:
     """What the device looks like, in the terms a geometry test varies.
@@ -196,8 +228,10 @@ class KvGeometry:
     ``per_layer_heads`` gives one layer a head count of its own, which is the
     speculative-draft case: the layers of one group no longer share a page
     size. ``areas`` is the chiplet count one logical region expands into and
-    ``slices`` how many distinct head bands those areas hold; ``areas >
-    slices`` would mean a replicated band, which this does not model.
+    ``slices`` how many distinct pieces those areas hold; ``areas > slices``
+    replicates, which this models only for a whole entry (``slices == 1``),
+    since that is the one case no convention decides. ``cut`` names the axis
+    for the peer alone -- the local side derives its own from the shapes.
     """
 
     layers: tuple[str, ...] = ("l0", "l1")
@@ -208,21 +242,22 @@ class KvGeometry:
     sliding_window: int | None = None
     areas: int = 1
     slices: int = 1
+    #: Which axis the PEER's regions are cut on. The local side derives its own
+    #: from the shapes in `kv_caches`, so this only shapes `peer_meta`.
+    cut: str = "head"
     per_layer_heads: dict[str, int] = field(default_factory=dict)
     draft_layers: tuple[str, ...] = ()
     #: Tokens a block holds in the view the sliding-window kernel reads, which
-    #: the runner picks independently of `block_size`. None means it reads
-    #: whole blocks. Registered tensors are unaffected -- a pool hands over its
-    #: full-attention view -- so this shapes the forward context alone.
+    #: the runner picks independently of `block_size`. None means it reads whole
+    #: blocks. Registered tensors are unaffected -- a pool hands over its
+    #: full-attention layer -- so this shapes the window layer beside it, and
+    #: the frame the device serves that layer.
     swa_kernel_block: int | None = None
 
     def __post_init__(self) -> None:
-        # The byte arithmetic here partitions one allocation, but a replicated
-        # band is a separate copy per chiplet: the adapter divides a block by
-        # the slice count, not the area count, and groups adjacent areas as
-        # replicas of one slice. The table would be one no device produces.
-        assert self.areas == self.slices, (
-            f"KvGeometry does not model a replicated head band "
+        assert self.cut in ("head", "token")
+        assert self.areas == self.slices or self.slices == 1, (
+            f"KvGeometry models a replica only of a whole entry "
             f"({self.areas} areas over {self.slices} slices)"
         )
 
@@ -244,7 +279,36 @@ class KvGeometry:
         )
 
     def heads_of(self, layer: str) -> int:
-        return self.per_layer_heads.get(layer, self.heads)
+        return self.per_layer_heads.get(layer.removesuffix(_SWA_SUFFIX), self.heads)
+
+    @property
+    def swa_layers(self) -> tuple[str, ...]:
+        """The sliding-window layer each layer's storage also serves.
+
+        A hybrid model (gpt-oss) gives its two attention types a cache group
+        each over one buffer, so a pool hands over both: the full-attention
+        layer, which is what gets registered, and the window layer, a view of
+        the same storage in the shape its kernel reads (`swa_kernel_block`).
+        """
+        return (
+            tuple(f"{name}{_SWA_SUFFIX}" for name in self.layers)
+            if (self.spec == "swa")
+            else ()
+        )
+
+    def swa_view_shape(self, layer: str) -> tuple[int, ...]:
+        """The shape a window layer reads its storage in."""
+        from vllm_rbln.v1.attention.backends.flash_attention import (
+            RBLNFlashAttentionBackend,
+        )
+
+        kernel_block = self.swa_kernel_block or self.block_size
+        return RBLNFlashAttentionBackend.get_kv_cache_shape(
+            num_blocks=self.num_blocks * (self.block_size // kernel_block),
+            block_size=kernel_block,
+            num_kv_heads=self.heads_of(layer),
+            head_size=HEAD_SIZE,
+        )
 
     # --- view 1: the config the worker is constructed with -------------------
     def kv_cache_config(self, *, dtype: torch.dtype = torch.bfloat16) -> Any:
@@ -258,7 +322,7 @@ class KvGeometry:
         )
 
         specs = {}
-        for name in self.layers:
+        for name in (*self.layers, *self.swa_layers):
             common = dict(
                 block_size=self.block_size,
                 num_kv_heads=self.heads_of(name),
@@ -269,7 +333,7 @@ class KvGeometry:
             # so `use_mla` is False and registration would split K/V against an
             # MLA tensor. The other two views model MLA; this one cannot.
             assert self.spec != "mla", "no MLA worker can be built over this config"
-            if self.spec == "swa":
+            if name in self.swa_layers:
                 assert self.sliding_window is not None, "swa needs a window"
                 specs[name] = SlidingWindowSpec(
                     **common, sliding_window=self.sliding_window
@@ -281,7 +345,7 @@ class KvGeometry:
         # Layers with differing page sizes reach it wrapped, exactly as
         # _get_kv_cache_groups_uniform_type produces -- the worker unwraps per
         # layer, and that asymmetry is a thing the tests must be able to build.
-        members = list(specs.values())
+        members = [specs[name] for name in self.layers]
         if len({s.page_size_bytes for s in members}) > 1:
             group_spec: Any = UniformTypeKVCacheSpecs(
                 block_size=self.block_size, kv_cache_specs=specs
@@ -289,31 +353,46 @@ class KvGeometry:
         else:
             group_spec = members[0]
 
+        # One group: its layers sit a page apart inside each block, and the pool
+        # spans the whole group. A window layer takes the extent of the layer it
+        # follows rather than one of its own -- the two read one buffer, which is
+        # what `canonical_kv_layers` collapses to the full-attention one.
+        pool = (
+            sum(specs[name].page_size_bytes for name in self.layers) * self.num_blocks
+        )
+        extents = {
+            name: (
+                sum(
+                    specs[earlier].page_size_bytes * self.num_blocks
+                    for earlier in list(self.layers)[:index]
+                ),
+                specs[name].page_size_bytes * self.num_blocks,
+            )
+            for index, name in enumerate(self.layers)
+        }
+        groups = [
+            KVCacheGroupSpec(layer_names=list(self.layers), kv_cache_spec=group_spec)
+        ]
+        if self.swa_layers:
+            groups.append(
+                KVCacheGroupSpec(
+                    layer_names=list(self.swa_layers),
+                    kv_cache_spec=specs[self.swa_layers[0]],
+                )
+            )
         return KVCacheConfig(
             num_blocks=self.num_blocks,
             kv_cache_tensors=[
-                # One group: its layers sit a page apart inside each block, and
-                # the pool spans the whole group.
                 KVCacheTensor(
-                    size=sum(s.page_size_bytes for s in specs.values())
-                    * self.num_blocks,
+                    size=pool,
                     layers=[name],
-                    layer_stride=specs[name].page_size_bytes * self.num_blocks,
+                    layer_stride=extents[name.removesuffix(_SWA_SUFFIX)][1],
                     block_stride=specs[name].page_size_bytes,
-                    offset=sum(
-                        specs[earlier].page_size_bytes * self.num_blocks
-                        for earlier in list(self.layers)[
-                            : list(self.layers).index(name)
-                        ]
-                    ),
+                    offset=extents[name.removesuffix(_SWA_SUFFIX)][0],
                 )
-                for name in self.layers
+                for name in (*self.layers, *self.swa_layers)
             ],
-            kv_cache_groups=[
-                KVCacheGroupSpec(
-                    layer_names=list(self.layers), kv_cache_spec=group_spec
-                )
-            ],
+            kv_cache_groups=groups,
         )
 
     # --- view 2: the tensors it registers ------------------------------------
@@ -340,20 +419,7 @@ class KvGeometry:
         return 1 if shape.index(probe) == 0 else 2
 
     def kv_caches(self, *, dtype: torch.dtype = torch.bfloat16) -> dict[str, Any]:
-        """Real tensors, with only ``get_device`` overridden.
-
-        A real RBLN device tensor would force the ``use_device`` mark, which
-        spawns the test and blinds coverage; the D2D path asserts
-        ``cache.get_device() >= 0`` and nothing else about the device. So a
-        subclass answers that one probe and leaves ``data_ptr``, ``numel``,
-        ``element_size`` and ``shape`` to torch -- the region arithmetic under
-        test then runs on real addresses and real byte counts.
-        """
-
-        class _OnDevice(torch.Tensor):
-            @staticmethod
-            def get_device() -> int:  # type: ignore[override]
-                return 0
+        """What a pool hands over for each layer, in the view it allocates."""
 
         from vllm_rbln.v1.attention.backends.flash_attention import (
             RBLNFlashAttentionBackend,
@@ -364,8 +430,9 @@ class KvGeometry:
             heads = self.heads_of(name)
             shape: tuple[int, ...]
             if self.spec == "mla":
-                # No K/V split: the whole entry is one region, block axis first.
-                shape = (self.num_blocks, 1, self.block_size, HEAD_SIZE * heads)
+                # No K/V split: the whole entry is one region, block axis first,
+                # and no head axis -- the RBLN MLA backend's shape.
+                shape = (self.num_blocks, self.block_size, HEAD_SIZE * heads)
             else:
                 # Ask the backend rather than spelling the axes out: which of
                 # them carries the blocks is what the topology reads to decide
@@ -377,83 +444,33 @@ class KvGeometry:
                     num_kv_heads=heads,
                     head_size=HEAD_SIZE,
                 )
-            out[name] = torch.zeros(shape, dtype=dtype).as_subclass(_OnDevice)
+            out[name] = _on_device(shape, dtype)
+        # The window layers read the same storage in the shape their kernel
+        # addresses it in, so a view of it is what the pool hands over.
+        for name in self.swa_layers:
+            base = out[name.removesuffix(_SWA_SUFFIX)]
+            out[name] = base.view(self.swa_view_shape(name))
         return out
 
-    def forward_context_caches(
-        self, *, dtype: torch.dtype = torch.bfloat16
-    ) -> dict[str, Any]:
-        """What the runner binds per layer, which is every layer unfiltered.
+    # --- view 3: what the device answers about an entry's storage ------------
+    def device_buffers(self, vaddr: int) -> tuple[Any, ...]:
+        """``nixl_rbln.entry_areas``: one handle per chiplet area.
 
-        A sliding-window layer's view is addressed in `swa_kernel_block` tokens
-        where the runner chose that, so the same storage carries proportionally
-        more, shorter blocks. This is the only place the two geometries differ.
+        One handle per chiplet area, with nothing about how they were cut --
+        which is all a released rebel answers, and so all the derivation that
+        lays the regions over them has to go on.
         """
-        from vllm_rbln.v1.attention.backends.flash_attention import (
-            RBLNFlashAttentionBackend,
-        )
-
-        kernel_block = self.swa_kernel_block
-        if self.spec != "swa" or kernel_block is None:
-            return self.kv_caches(dtype=dtype)
-        assert self.block_size % kernel_block == 0
-        ratio = self.block_size // kernel_block
-        return {
-            name: torch.zeros(
-                RBLNFlashAttentionBackend.get_kv_cache_shape(
-                    num_blocks=self.num_blocks * ratio,
-                    block_size=kernel_block,
-                    num_kv_heads=self.heads_of(name),
-                    head_size=HEAD_SIZE,
-                ),
-                dtype=dtype,
+        entry = _DEVICE_ALLOCS[vaddr]
+        area_bytes = entry.numel() * entry.element_size() // self.slices
+        return tuple(
+            SimpleNamespace(
+                node_id=0,
+                chiplet_id=area,
+                device_addr=vaddr + area * area_bytes,
+                size=area_bytes,
             )
-            for name in self.layers
-        }
-
-    # --- view 3: what the adapter reports back -------------------------------
-    def xfer_tables(self, kv_caches: dict[str, Any]) -> Any:
-        """``nixl_rbln.register_kv_regions``' result, from the real addresses.
-
-        Bases come from the tensors' own ``data_ptr`` so a descriptor decoded
-        back to (region, block, head offset) lands on the region it names.
-        """
-        base_addrs: list[int] = []
-        block_lens: list[int] = []
-        slice_ids: list[int] = []
-        for name in self.layers:
-            t = kv_caches[name]
-            # Blocks first means the entry IS one region: MLA is key-only, and
-            # a packed attention cache holds K and V inside a block. Read off
-            # the tensor so this cannot disagree with what was built.
-            regions_per_layer = 1 if t.shape[0] == self.num_blocks else 2
-            entry_bytes = t.numel() * t.element_size()
-            half = entry_bytes // regions_per_layer
-            for r in range(regions_per_layer):
-                # One area per chiplet, each holding 1/areas of the region.
-                area_bytes = half // self.areas
-                for a in range(self.areas):
-                    base_addrs.append(t.data_ptr() + r * half + a * area_bytes)
-                    block_lens.append(area_bytes // self.num_blocks)
-                    slice_ids.append(a)
-        return _XferTables(
-            base_addrs=base_addrs,
-            block_lens=block_lens,
-            slice_ids=slice_ids,
-            n_shards=self.areas,
-            slices=self.slices,
-            reg_handle=object(),
+            for area in range(self.areas)
         )
-
-
-@dataclass
-class _XferTables:
-    base_addrs: list[int]
-    block_lens: list[int]
-    slice_ids: list[int]
-    n_shards: int
-    slices: int
-    reg_handle: Any
 
 
 class FakeNixlAgent:
@@ -521,29 +538,59 @@ class FakeNixlAgent:
         return "DONE"
 
 
-def fake_nixl_rbln(geometry: KvGeometry, kv_caches: dict[str, Any]) -> Any:
-    """A stand-in ``nixl_rbln`` module over ``geometry``'s real addresses."""
+def area_slices(areas: int, slices: int, regions: int) -> list[list[int]]:
+    """`kv_area_slices` for `regions` logical regions of `areas` areas over
+    `slices` slices, the replicas of a slice adjacent: what a producer of one
+    such geometry publishes."""
+    replicas = areas // slices
+    return [[a // replicas for a in range(areas)] for _ in range(regions)]
+
+
+def fill_region_geometry(
+    w: Any, *, areas: int, axes: Sequence[Any], slices: int | Sequence[int] = 1
+) -> Any:
+    """The chiplet geometry registration lays out, for a worker a test built by
+    hand: one logical region per entry of `axes`, each over `areas` areas and
+    cut into `slices` (one count for every region, or one per region), the
+    replicas of a slice adjacent as in `area_slices`. Nothing that reads this
+    reads an address, so the places carry none.
+    """
+    from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
+        AreaPlace,
+        RegionGeometry,
+    )
+
+    counts = [slices] * len(axes) if isinstance(slices, int) else list(slices)
+    assert len(counts) == len(axes), (counts, axes)
+    geometries = []
+    for axis, count in zip(axes, counts):
+        assert areas % count == 0, f"{areas} areas over {count} slices"
+        (ids,) = area_slices(areas, count, 1)
+        places = tuple(AreaPlace(0, 0, slice_id) for slice_id in ids)
+        geometries.append(RegionGeometry(axis, count, places))
+    w._kv_areas = areas
+    w._logical_region_geometry = geometries
+    return w
+
+
+def fake_nixl_rbln(entry_areas: Any = None) -> Any:
+    """A stand-in ``nixl_rbln`` module: the backend lifecycle and the chiplet
+    areas of an entry, which is all the connector asks of the adapter."""
     import types
 
     module: Any = types.ModuleType("nixl_rbln")
-    module.ensure_rbln_backend = lambda *a, **k: None
-    # The connector's own answer, kept so a test can assert it. The tables come
-    # from the geometry, so nothing else here would ever read `regions` -- and
-    # the byte offset in it is the only thing telling a layer's K from its V.
-    module.regions_seen = []
     # Backend-lifecycle overrides ride this call on the D2D path, and the
     # adapter treats a missing one as "keep the plugin default", so what is
     # absent is as much the contract as what is present.
-    module.register_kwargs_seen = []
+    module.backend_kwargs_seen = []
 
-    def _register_kv_regions(wrapper: Any, regions: Any, *a: Any, **k: Any) -> Any:
-        module.regions_seen.append(list(regions))
-        module.register_kwargs_seen.append(
-            {n: v for n, v in k.items() if n not in ("mem", "rbln_ctx_ptr")}
+    def _ensure_rbln_backend(wrapper: Any, device_id: int, **k: Any) -> None:
+        module.backend_kwargs_seen.append(
+            {n: v for n, v in k.items() if n != "rbln_ctx_ptr"}
         )
-        return geometry.xfer_tables(kv_caches)
 
-    module.register_kv_regions = _register_kv_regions
+    module.ensure_rbln_backend = _ensure_rbln_backend
+    module.entry_areas = entry_areas
     return module
 
 
@@ -618,6 +665,7 @@ def peer_meta(
     )
 
     from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
+        ChipletSplitAxis,
         RblnNixlAgentMetadata,
     )
 
@@ -663,8 +711,15 @@ def peer_meta(
         region_num_blocks=[geometry.num_blocks] * n_regions,
         region_mem_types=["VRAM"] * n_regions,
         region_group_ids=[0] * n_regions,
-        kv_areas=geometry.areas,
-        kv_slices=geometry.slices,
+        kv_area_slices=area_slices(
+            geometry.areas, geometry.slices, n_regions // geometry.areas
+        ),
+        kv_split_axes=[
+            ChipletSplitAxis.TOKEN
+            if geometry.slices > 1 and geometry.cut == "token"
+            else ChipletSplitAxis.HEAD
+        ]
+        * (n_regions // geometry.areas),
     )
     return NixlHandshakePayload(
         compatibility_hash=compat_hash,
@@ -830,6 +885,23 @@ def set_shape(worker, **over) -> None:
     worker._shape = dataclasses.replace(current, **fields)
 
 
+def uniform_grid(runs: int, chunks: int, *, regions: int, spans: int = 1) -> Any:
+    """A `ChunkGrid` whose regions all cut a block alike.
+
+    `spans` areas of `chunks` chunks each, a chunk `runs` byte runs -- a
+    context cut where `spans` is the area count, a head cut at one. Region
+    positions run area-minor, as every list does.
+    """
+    from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
+        ChunkGrid,
+    )
+
+    return ChunkGrid(
+        spans * chunks,
+        tuple((p % spans * chunks, runs, chunks) for p in range(regions)),
+    )
+
+
 def sliding_window_spec(*, block_size, sliding_window):
     from unittest.mock import MagicMock
 
@@ -892,7 +964,6 @@ def build_worker(
     chunk_tokens=0,
     push_stream=False,
     cls=None,
-    swa_kernel_block=None,
     kv_role="kv_both",
     link_down_exit_s=0,
 ):
@@ -902,10 +973,6 @@ def build_worker(
     `cls` picks the direction. It is the read side by default, and the write
     side is asked for by name -- the shape puts the direction in, so a knob
     only the writer acts on is inert on the other.
-
-    ``swa_kernel_block`` is the runner's choice of how many tokens a block holds
-    in the view the sliding-window kernel reads; the default is the geometry
-    where that is the window itself.
     """
     import sys
     import types
@@ -1018,18 +1085,6 @@ def build_worker(
     kv_cache_config.kv_cache_groups = all_groups
     kv_cache_config.transfer_groups = all_groups[: len(specs or [])]
     kv_cache_config.transfer_group_ids = tuple(range(len(specs or [])))
-    # A real dict, because the connector reads a sliding-window layer's view
-    # out of it and a mock would answer every key with a mock. Only the token
-    # axis is read, so one is all the view needs to carry.
-    from vllm.v1.kv_cache_interface import SlidingWindowSpec
-
-    ctx: dict[str, Any] = {}
-    for i, spec in enumerate(all_specs):
-        if not isinstance(spec, SlidingWindowSpec):
-            continue
-        tokens = spec.sliding_window if swa_kernel_block is None else swa_kernel_block
-        ctx[f"g{i}.l0"] = SimpleNamespace(kv_cache=torch.zeros(1, 1, tokens, 1))
-    vllm_config.compilation_config.static_forward_context = ctx
     worker_cls = cls or RblnNixlPullConnectorWorker
     return worker_cls(vllm_config, "test-engine", kv_cache_config)
 

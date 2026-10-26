@@ -82,3 +82,16 @@ def test_hybrid_engine_config_builds_with_prefix_caching_off(model_id):
         max_num_seqs=1,
     ).create_engine_config()
     assert vllm_config.cache_config.enable_prefix_caching is False
+
+
+def test_window_covering_the_context_keeps_prefix_caching():
+    # Phi-3.5-mini ships sliding_window=262144, wider than any context it serves.
+    vllm_config = EngineArgs(
+        model="microsoft/Phi-3.5-mini-instruct",
+        model_impl="optimum",
+        block_size=8192,
+        max_model_len=8192,
+        max_num_seqs=1,
+    ).create_engine_config()
+    assert vllm_config.model_config.hf_text_config.sliding_window is None
+    assert vllm_config.cache_config.enable_prefix_caching is True
