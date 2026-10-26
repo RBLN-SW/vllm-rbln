@@ -225,7 +225,10 @@ class TestIndexerCacheBackends:
 
     def test_scale_cache_head_size_and_dtype(self):
         assert RBLNDeepseekV32IndexerScaleBackend.get_supported_head_sizes() == [1]
-        assert RBLNDeepseekV32IndexerScaleBackend.supported_dtypes == [torch.float16]
+        assert RBLNDeepseekV32IndexerScaleBackend.supported_dtypes == [
+            torch.float16,
+            torch.bfloat16,
+        ]
 
     @pytest.mark.parametrize(
         ("backend", "head_size"),
