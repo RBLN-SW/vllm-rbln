@@ -13,6 +13,7 @@
 # limitations under the License.
 import itertools
 import traceback
+import weakref
 from collections.abc import Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -29,6 +30,9 @@ logger = init_logger(__name__)
 
 _compile_counter = itertools.count(1)
 _current_stage = ContextVar("rbln_backend_current_stage", default="runtime")
+program_input_bindings: ContextVar[
+    dict[int, tuple[weakref.ReferenceType[torch.Tensor], ...]] | None
+] = ContextVar("rbln_program_input_bindings", default=None)
 _SELF_FILE = Path(__file__).resolve()
 
 _DTYPE_SHORT = {
@@ -133,7 +137,12 @@ def _rbln_backend(
         _find_rbln_callsite(),
         "; ".join(parts),
     )
-    return rbln_torch_compile_backend(graph, example_inputs, **kwargs)
+    runtime = rbln_torch_compile_backend(graph, example_inputs, **kwargs)
+    if (bindings := program_input_bindings.get()) is not None:
+        bindings[id(runtime)] = tuple(
+            weakref.ref(x) for x in example_inputs if isinstance(x, torch.Tensor)
+        )
+    return runtime
 
 
 rbln_backend = _rbln_backend

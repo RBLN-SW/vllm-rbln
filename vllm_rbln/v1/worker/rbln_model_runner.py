@@ -14,6 +14,7 @@
 
 import collections
 import dataclasses
+import weakref
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from contextlib import nullcontext
@@ -136,6 +137,7 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
     build_kv_cache_base_bindings,
     build_kv_cache_forward_context_kwargs,
     kv_cache_dynamic_axis,
+    kv_cache_tensor_key,
     validate_shared_attention_kv_cache_contiguity,
 )
 from vllm_rbln.v1.core.rbln_kv_cache_manager import KVCacheCopyOp
@@ -338,7 +340,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.kv_cache_bases: list[torch.Tensor] = []
         self.kv_cache_view_infos: list[KVCacheViewInfo] = []
         self.aux_kv_cache_layers: list[str] = []
-        self.num_aux_kv_tensors = 0
         # Set in initialize_kv_cache: a recurrent state (a MambaSpec group) under
         # speculative decoding, whose verify step replays the accepted drafts.
         self.replays_accepted_drafts = False
@@ -346,6 +347,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # KV cache layer names in layer-index order; the deterministic
         # ordering the KV connector relies on for region<->layer agreement.
         self.kv_cache_names: list[str] = []
+        self.kv_cache_allocations: dict[str, weakref.ReferenceType[torch.Tensor]] = {}
         # Initialize in initialize_kv_cache_tensors
         self.cross_layers_kv_cache: torch.Tensor | None = None
         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
@@ -3407,6 +3409,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             )
         self.kv_cache_names = get_kv_cache_names(kv_caches, num_attn_module)
         self.kv_caches = [kv_caches[name] for name in self.kv_cache_names]
+        self.kv_cache_allocations = {}
+        seen_allocations = set()
+        for name, cache in zip(self.kv_cache_names, self.kv_caches):
+            key = kv_cache_tensor_key(cache)
+            if key not in seen_allocations:
+                self.kv_cache_allocations[name] = weakref.ref(cache)
+                seen_allocations.add(key)
         self.kv_cache_block_axes = block_axes
         forward_context = self.compilation_config.static_forward_context
         for layer_name, kv_cache in kv_caches.items():
@@ -3478,7 +3487,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             block_axes[layer_name] = 0
             aux_layers.append(layer_name)
         self.aux_kv_cache_layers = aux_layers
-        self.num_aux_kv_tensors = len(tensors)
         if tensors:
             logger.info(
                 "Block-aux KV caches: %d layers on %d tensors, %.3f GiB",
