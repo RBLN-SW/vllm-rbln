@@ -35,8 +35,6 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     FullAttentionSpec,
     MambaSpec,
-    MLAAttentionSpec,
-    SlidingWindowMLASpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -54,6 +52,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_transfer_topology import (
     RblnTransferTopology,
+    is_latent,
 )
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.worker.utils import canonical_kv_layers
@@ -267,22 +266,6 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         )
 
         page_sizes = self._layer_page_sizes(xfer_buffers)
-        mla_layers = {
-            name
-            for name in xfer_buffers
-            if isinstance(
-                self._unwrapped_layer_spec(name),
-                (MLAAttentionSpec, SlidingWindowMLASpec),
-            )
-        }
-        if mla_layers and len(mla_layers) != len(xfer_buffers):
-            # Refused here rather than as a block-count mismatch far from its cause.
-            raise RuntimeError(
-                "RBLN NIXL: KV caches mix MLA and non-MLA layers "
-                f"({sorted(mla_layers)} against the rest), which the region "
-                "layout cannot express -- the K/V split is chosen once for the "
-                "whole engine."
-            )
         if self.topo.cross_layers_blocks and len(page_sizes) > 1:
             # The page is scaled by the KV-cache tensor count, so with sizes that
             # differ the product describes no layer.
@@ -310,9 +293,7 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
                 cache_or_caches, layer_spec
             )
             layer_regions.append((layer_name, len(cache_list)))
-            is_mla_region = isinstance(
-                layer_spec, (MLAAttentionSpec, SlidingWindowMLASpec)
-            )
+            is_mla_region = is_latent(layer_spec)
             physical_page_size = (
                 layer_spec.page_size_bytes
                 if isinstance(layer_spec, MambaSpec)
@@ -386,6 +367,23 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
                     else None
                 )
 
+        if any(logical_mla) and kv_per_block_seen is not None:
+            if self.use_mla:
+                raise RuntimeError(
+                    "RBLN NIXL: this engine runs MLA and also holds attention "
+                    "layers, whose K and V the MLA layout does not describe."
+                )
+            # A layer's region count is one number for the engine
+            # (`_regions_per_layer`), and a latent is always one region.
+            if kv_per_block_seen == 1:
+                raise RuntimeError(
+                    "RBLN NIXL: a key-only latent sits beside attention layers "
+                    "whose K and V are separate regions (the rbln_triton_ops "
+                    "layout), so a layer is one region or two. Run with "
+                    "use_custom_kernel off, whose rbln_custom_ops kernels pack K "
+                    "and V into one block."
+                )
+
         rbln_ctx_ptr = rebel.context_of(sample_kv_cache).rbln_ctx_ptr
 
         nixl_rbln.ensure_rbln_backend(
@@ -449,6 +447,7 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
 
         self._logical_region_kv_heads = self._logical_head_bands(layer_regions)
         self._logical_region_local_heads = list(logical_kv_heads)
+        self._logical_region_latent = list(logical_mla)
 
         self.num_regions = len(places)
         if self.topo.virtually_split_kv_in_blocks:
@@ -614,7 +613,6 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         """
         import nixl_rbln
 
-        head_dim, token_dim = self.topo.kv_head_dim, self.topo.kv_token_dim
         cuts: dict[int, tuple[ChipletSplitAxis, int, tuple[tuple[int, int], ...]]] = {}
         areas: list[tuple[int, int]] = []
         for entry, spec, _, _ in regions:
@@ -622,6 +620,14 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
             if base_addr in cuts:
                 continue
             shape = tuple(entry.shape)
+            # The probe read the attention backend's frame. A latent beside it
+            # is its own backend's `(num_blocks, block_size, head_size)`: no
+            # head axis, and a block's tokens on dim 1.
+            head_dim, token_dim = (
+                (None, 1)
+                if is_latent(spec) and not self.use_mla
+                else (self.topo.kv_head_dim, self.topo.kv_token_dim)
+            )
             if entry.storage_offset() != 0:
                 raise RuntimeError(
                     f"RBLN NIXL (D2D): a KV entry of shape {shape} starts "

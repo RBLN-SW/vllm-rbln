@@ -301,6 +301,7 @@ def _make_worker(
     w.vllm_config.speculative_config = None
     w.compat_hash = compat
     w.enforce_compat_hash = True
+    w.use_mla = False
     window_mode(
         w, sw_ratio, has_swa=(sw_ratio is not None) if has_swa is None else has_swa
     )
@@ -1019,6 +1020,31 @@ class TestPpHandshakeFanout:
             )
 
         assert agents == {(0, 0): "n0"}
+
+    @pytest.mark.parametrize(
+        "pp_size, local_tp, peer_tp",
+        # A pipelined peer reaches this branch only at a smaller TP than ours.
+        [(1, 1, 2), (4, 2, 1)],
+    )
+    def test_a_latent_on_the_engine_s_own_lists_is_refused_unregistered(
+        self, pp_size, local_tp, peer_tp
+    ):
+        # A peer not paired by head band takes the branch that registers it,
+        # so the latent refusal has to come before it hands the peer over.
+        w = _make_worker(host_buffer=False)
+        w.transfer_topo.tp_ratio.side_effect = lambda r: (
+            local_tp // r if r <= local_tp else -(r // local_tp)
+        )
+        w._is_head_matched_peer = MagicMock(return_value=False)
+        w._check_d2d_region_pairing = MagicMock()
+        w._logical_region_latent = [False, True, False]
+
+        with pytest.raises(RuntimeError, match="key-only latent region"):
+            _handshake(
+                w, _FakeSock(pp_size=pp_size, tp_size=peer_tp), remote_tp_size=peer_tp
+            )
+
+        w.add_remote_agent.assert_not_called()
 
     def test_a_split_region_alone_forces_the_per_shard_path(self):
         # Companion to test_a_finer_peer_alone_forces_the_per_shard_path: here
@@ -4870,6 +4896,7 @@ class TestARefusedPeerLeavesNothingBehind:
         del w._is_head_matched_peer
         w.use_mla = True
         w._logical_region_kv_heads = [None]
+        w._logical_region_latent = [True]
         w.use_host_buffer = False
         w.transfer_topo.tp_size = 2
         w.transfer_topo.tp_ratio = MagicMock(side_effect=lambda r: 1 if r == 2 else -r)
@@ -4880,6 +4907,67 @@ class TestARefusedPeerLeavesNothingBehind:
 
         w.transfer_topo.register_remote_engine.assert_not_called()
         w.nixl_wrapper.add_remote_agent.assert_not_called()
+
+    def _mixed_worker(self):
+        """A non-MLA engine at TP 2 of a head-cut attention region and a
+        token-cut latent, the real refusal in place."""
+        w = self._worker()
+        del w._check_mla_constraints
+        w.use_mla = False
+        w.use_host_buffer = False
+        w.transfer_topo.tp_size = 2
+        w.transfer_topo.tp_ratio = MagicMock(
+            side_effect=lambda r: 2 // r if r <= 2 else -(r // 2)
+        )
+        fill_region_geometry(
+            w,
+            areas=4,
+            axes=[ChipletSplitAxis.HEAD, ChipletSplitAxis.TOKEN],
+            slices=[2, 4],
+        )
+        w._logical_region_kv_heads = [8, None]
+        w._logical_region_latent = [False, True]
+        return w
+
+    @pytest.mark.parametrize("pp_size", [1, 4])
+    @pytest.mark.parametrize("peer_tp", [4, 1])
+    def test_a_latent_beside_attention_is_refused_across_tp_unregistered(
+        self, peer_tp, pp_size
+    ):
+        # Named before the bands are read: the peer's latent is cut into more
+        # slices than its attention, which no one band describes. Entered where
+        # the handshake enters, for a peer of one stage and of several.
+        w = self._mixed_worker()
+        del w._is_head_matched_peer
+        meta = _agent_meta(
+            engine_id="peer",
+            kv_areas=4,
+            kv_split_axes=[ChipletSplitAxis.HEAD, ChipletSplitAxis.TOKEN],
+            kv_area_slices=[[0, 0, 1, 1], [0, 1, 2, 3]],
+            pp_size=pp_size,
+        )
+
+        with pytest.raises(RuntimeError, match="key-only latent region"):
+            w._add_remote_agent_head_matched(meta, 0, peer_tp, meta.dcp_size)
+
+        w.transfer_topo.register_remote_engine.assert_not_called()
+        w.nixl_wrapper.add_remote_agent.assert_not_called()
+
+    def test_an_mla_engine_is_not_refused_as_a_latent_across_tp(self):
+        # An MLA engine is latent throughout, which positional pairing already
+        # pairs as replicas; the latent refusal is for a latent beside attention.
+        w = self._mixed_worker()
+        w.use_mla = True
+        w._logical_region_latent = [True, True]
+        w._is_head_matched_peer = MagicMock(return_value=False)
+
+        w._check_mla_constraints(_agent_meta(engine_id="peer"), 1)  # no raise
+
+    def test_a_latent_at_equal_tp_passes(self):
+        w = self._mixed_worker()
+        del w._is_head_matched_peer
+
+        w._check_mla_constraints(_agent_meta(engine_id="peer"), 2)  # no raise
 
     def test_a_context_cut_peer_is_refused_by_its_axis_unregistered(self):
         # Through the real check, ahead of the head-cut check, which would count
@@ -5521,6 +5609,7 @@ class TestHeadMatchedAgentRegistration:
         w._remote_agents = {}
         w.nixl_wrapper = MagicMock()
         w._logical_region_kv_heads = list(kv_heads)
+        w.use_mla = False
         fill_region_geometry(
             w,
             areas=4,
