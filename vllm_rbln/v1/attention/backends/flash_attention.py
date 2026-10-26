@@ -450,7 +450,6 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                 self.sinks = self.sinks[:, None]
 
         self.is_causal = not vllm_config.attention_config.use_non_causal
-        self.is_batch_attention_opt = rbln_config.use_batch_attn_opt
         self.is_normal = (self.block_size == self.max_model_len) and (
             self.sinks is None
         )
@@ -614,7 +613,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         self.scale,
                         attn_metadata.local_block_tables,
                         attn_metadata.swa_attn_masks
-                        if self.is_batch_attention_opt and b_size > 1
+                        if attn_metadata.is_prompt_sorted and b_size > 1
                         else None,
                         self.sinks,
                         use_custom_kernel=self.use_custom_kernel,
