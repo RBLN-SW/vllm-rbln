@@ -79,6 +79,12 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
         # them to the host mid-step and serialises what async just decoupled.
         self._logprobs_tensors = logprobs_tensors
 
+    def __del__(self):
+        # Non-output ranks drop this without get_output(). The pinned buffer is
+        # freed at once, so the pending D2H must land before that.
+        if self._copy_ready_event is not None:
+            self._copy_ready_event.synchronize()
+
     @worker_fail_fast
     def get_output(self) -> ModelRunnerOutput:
         """Wait for the sampled tokens on the host and return a ModelRunnerOutput.
