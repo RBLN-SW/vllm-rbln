@@ -98,11 +98,6 @@ def _validate(vllm_config: "VllmConfig") -> None:
         )
 
     if text_config.model_type == "glm5_next_text":
-        if parallel_config.tensor_parallel_size != 1:
-            raise ValueError(
-                "GLM-5.3 runs at tensor parallel size 1 on RBLN; scale it with "
-                "--data-parallel-size and --enable-expert-parallel."
-            )
         if not vllm_config.cache_config.cache_dtype.startswith("fp8"):
             raise ValueError(
                 "GLM-5.3 needs an fp8 KV cache on RBLN; pass --kv-cache-dtype fp8."
