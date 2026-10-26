@@ -66,7 +66,7 @@ class RBLNDeepseekV32IndexerBackend(AttentionBackend):
 
 
 class RBLNDeepseekV32IndexerScaleBackend(RBLNDeepseekV32IndexerBackend):
-    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16]
+    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
 
     @staticmethod
     def get_name() -> str:

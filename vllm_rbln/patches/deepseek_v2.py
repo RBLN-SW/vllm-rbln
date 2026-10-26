@@ -31,10 +31,11 @@ from vllm_rbln.v1.attention.backends.mla.indexer import (
     RBLNDeepseekV32IndexerScaleBackend,
 )
 from vllm_rbln.v1.worker.utils import (
-    num_attn_module as rbln_num_attn_module,
+    indexer_scale_cache_dtype,
+    pipeline_adjusted_layer_index,
 )
 from vllm_rbln.v1.worker.utils import (
-    pipeline_adjusted_layer_index,
+    num_attn_module as rbln_num_attn_module,
 )
 
 logger = init_logger(__name__)
@@ -179,14 +180,14 @@ def rbln_indexer_cache_init(self, *args, **kwargs) -> None:
         self.prefix, model_config, vllm_config.parallel_config, num_attn_module
     )
 
-    # register fp16 scale cache (2-cache spec).
+    # register the per-token scale cache (2-cache spec).
     self.scale_cache = None
     if self.is_fp8_cache:
         scale = DeepseekV32IndexerCache.__new__(DeepseekV32IndexerCache)
         _original_indexer_cache_init(
             scale,
             head_dim=1,
-            dtype=torch.float16,
+            dtype=indexer_scale_cache_dtype(model_config),
             prefix=f"{self.prefix}.scale_cache",
             cache_config=self.cache_config,
         )
