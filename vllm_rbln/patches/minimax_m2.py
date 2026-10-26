@@ -30,7 +30,7 @@ from vllm_rbln.v1.spec_decode.eagle3_pp import (
     aux_slots_received,
 )
 
-if envs.VLLM_RBLN_NESTED_COMPILE_REGION:
+if envs.VLLM_RBLN_USE_NESTED_COMPILE_REGION:
     from vllm.model_executor.models.minimax_m2 import MiniMaxM2DecoderLayer
 
     register_patch(
