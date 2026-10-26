@@ -848,11 +848,69 @@ class TestGetAutobindCpuIds:
         cpu_list = _cpus_8()
         monkeypatch.setattr(worker_utils, "get_visible_memory_node", lambda: [0, 1])
         monkeypatch.setattr(worker_utils, "get_allowed_cpu_list", lambda: cpu_list)
+        # No device nodes: the rank round-robin decides, whatever the host holds.
+        monkeypatch.setattr(worker_utils, "_rbln_present_card_indices", list)
         return cpu_list
 
     @staticmethod
     def _all(cpus):
         return cpus
+
+    @staticmethod
+    def _cards(monkeypatch, numa_of_card, owned):
+        # A container exposing every card in numa_of_card; this rank owns `owned`.
+        monkeypatch.setattr(
+            worker_utils, "_rbln_present_card_indices", lambda: sorted(numa_of_card)
+        )
+        monkeypatch.setattr(worker_utils, "get_rbln_owned_card_indices", lambda: owned)
+        monkeypatch.setattr(
+            worker_utils,
+            "_read_card_attr_int",
+            lambda card, attr: numa_of_card[card]
+            if attr.endswith("numa_node")
+            else None,
+        )
+
+    def test_rank_follows_its_npu_not_its_number(self, cpus, monkeypatch):
+        # rank 0 holds a card on NUMA 1 -> NUMA 1, not the round-robin's NUMA 0.
+        self._cards(monkeypatch, {0: 1, 1: 1, 2: 1, 3: 1}, owned=[0])
+        pc = _make_parallel_config(tp_size=1, dp_size=4, world_size_across_dp=4)
+        assert get_autobind_cpu_ids(0, 0, pc, self._all) == "2"
+
+    def test_ranks_split_the_node_by_cards_on_it(self, cpus, monkeypatch):
+        # Cards 0-3 on NUMA 0 and 4-7 on NUMA 1: NUMA 1 is shared by the four
+        # ranks holding cards 4-7, not by every odd rank.
+        numa_of_card = {c: 0 for c in range(4)} | {c: 1 for c in range(4, 8)}
+        pc = _make_parallel_config(tp_size=1, dp_size=8, world_size_across_dp=8)
+        self._cards(monkeypatch, numa_of_card, owned=[5])
+        assert get_autobind_cpu_ids(1, 0, pc, self._all) == "3"
+        self._cards(monkeypatch, numa_of_card, owned=[1])
+        assert get_autobind_cpu_ids(1, 0, pc, self._all) == "1"
+
+    def test_one_visible_node_is_split_among_its_own_ranks_only(self, monkeypatch):
+        # Only NUMA 1 is visible and holds two cards: two ranks share it, so
+        # each gets half rather than an eighth.
+        monkeypatch.setattr(worker_utils, "get_visible_memory_node", lambda: [1])
+        monkeypatch.setattr(worker_utils, "get_allowed_cpu_list", _cpus_8)
+        self._cards(monkeypatch, {4: 1, 5: 1, 6: 0, 7: 0}, owned=[5])
+        pc = _make_parallel_config(tp_size=1, dp_size=4, world_size_across_dp=4)
+        assert get_autobind_cpu_ids(1, 0, pc, self._all) == "6,7"
+
+    @pytest.mark.parametrize(
+        "numa_of_card, owned",
+        [
+            ({0: -1, 1: 1}, [0]),  # sysfs reports no node for a card
+            ({0: 0, 1: 1}, [0, 1]),  # one rank's cards span both nodes
+            ({0: 1, 1: 1, 2: 1}, [0, 1]),  # the node's cards do not split evenly
+            ({0: 9}, [0]),  # the card's node has no allowed CPUs
+        ],
+    )
+    def test_unusable_card_placement_keeps_the_round_robin(
+        self, cpus, monkeypatch, numa_of_card, owned
+    ):
+        self._cards(monkeypatch, numa_of_card, owned)
+        result = get_autobind_cpu_ids(0, 0, _make_parallel_config(tp_size=1), self._all)
+        assert result == "0,1,4,5"
 
     def test_basic_single_rank(self, cpus):
         # rank 0 -> NUMA 0 -> all of NUMA-0's CPUs (sorted by id).
@@ -896,6 +954,7 @@ class TestGetAutobindCpuIds:
         ]
         monkeypatch.setattr(worker_utils, "get_visible_memory_node", lambda: [0, 1])
         monkeypatch.setattr(worker_utils, "get_allowed_cpu_list", lambda: cpu_list)
+        monkeypatch.setattr(worker_utils, "_rbln_present_card_indices", list)
         pc = _make_parallel_config(tp_size=3, world_size=3, world_size_across_dp=3)
         r0 = get_autobind_cpu_ids(0, 0, pc, self._all)  # ranks 0,2 -> NUMA 0
         r2 = get_autobind_cpu_ids(2, 0, pc, self._all)
@@ -936,6 +995,7 @@ class TestComputeRblnLocalOmpCpuid:
     def cpus(self, monkeypatch):
         monkeypatch.setattr(worker_utils, "get_visible_memory_node", lambda: [0, 1])
         monkeypatch.setattr(worker_utils, "get_allowed_cpu_list", lambda: _cpus_8())
+        monkeypatch.setattr(worker_utils, "_rbln_present_card_indices", list)
 
     def _linux_arch(self, monkeypatch, arch):
         monkeypatch.setattr(envs, "VLLM_RBLN_NUMA", True)
@@ -968,6 +1028,7 @@ class TestComputeRblnLocalOmpCpuid:
         ]
         monkeypatch.setattr(worker_utils, "get_visible_memory_node", lambda: [0])
         monkeypatch.setattr(worker_utils, "get_allowed_cpu_list", lambda: cpu_list)
+        monkeypatch.setattr(worker_utils, "_rbln_present_card_indices", list)
         self._linux_arch(monkeypatch, CpuArchEnum.POWERPC)
         assert compute_rbln_local_omp_cpuid(0, 0, _make_parallel_config()) == "0,1,2,3"
 

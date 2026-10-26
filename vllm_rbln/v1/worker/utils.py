@@ -342,6 +342,37 @@ def _read_card_attr_int(card_index: int, attr: str) -> int | None:
         return None
 
 
+def rbln_npu_numa_placement() -> tuple[int, int, int] | None:
+    """Where this rank's NPUs sit: (numa_node, position, ranks_on_node).
+
+    The split is derived from the cards the container exposes, so it does not
+    depend on which rank took which card: ranks_on_node is the exposed cards on
+    that node divided by the cards this rank owns, and position is this rank's
+    slot among them by card index. None when a card's NUMA node is unknown, the
+    owned cards span two nodes, or the node's cards do not split evenly.
+    """
+    present = _rbln_present_card_indices()
+    owned = get_rbln_owned_card_indices()
+    if not present or not owned:
+        return None
+    numa_of: dict[int, int] = {}
+    for card in present:
+        node = _read_card_attr_int(card, os.path.join("device", "numa_node"))
+        if node is None or node < 0:
+            return None
+        numa_of[card] = node
+    if any(card not in numa_of for card in owned):
+        return None
+    nodes = {numa_of[card] for card in owned}
+    if len(nodes) != 1:
+        return None
+    node = nodes.pop()
+    on_node = sorted(card for card, n in numa_of.items() if n == node)
+    if len(on_node) % len(owned):
+        return None
+    return node, on_node.index(min(owned)) // len(owned), len(on_node) // len(owned)
+
+
 def rbln_device_dram_total_bytes() -> int | None:
     """Device DRAM capacity from `torch.rbln.get_device_properties()`, clamped
     to `REBEL_DRAM_NBYTES`; None when it cannot be answered."""
@@ -894,14 +925,24 @@ def get_autobind_cpu_ids(
         )
         return "all"
 
-    numa_node_idx = rank_across_dp % len(available_numa_nodes)
-    selected_numa_node = available_numa_nodes[numa_node_idx]
+    # Prefer the node this rank's own NPUs sit on; the rank round-robin below
+    # ignores the cards and puts half the ranks across the socket whenever the
+    # cards are not laid out NUMA-alternating by rank.
+    placement = rbln_npu_numa_placement()
+    if placement is not None and placement[0] in available_numa_nodes:
+        selected_numa_node, rank_position, ranks_on_node = placement
+        ranks_in_same_numa = list(range(ranks_on_node))
+        rank_in_numa = rank_position
+    else:
+        numa_node_idx = rank_across_dp % len(available_numa_nodes)
+        selected_numa_node = available_numa_nodes[numa_node_idx]
+        ranks_in_same_numa = [
+            r
+            for r in range(world_size_across_dp)
+            if r % len(available_numa_nodes) == numa_node_idx
+        ]
+        rank_in_numa = rank_across_dp
     numa_node_cpu_list = numa_node_to_cpus[selected_numa_node]
-    ranks_in_same_numa = [
-        r
-        for r in range(world_size_across_dp)
-        if r % len(available_numa_nodes) == numa_node_idx
-    ]
 
     # Select CPUs from each physical core via cpu_selector
     core_to_cpus: dict[int, list[LogicalCPUInfo]] = {}
@@ -921,7 +962,7 @@ def get_autobind_cpu_ids(
         cpus_per_rank = len(selected_cpu_list) // len(ranks_in_same_numa)
         remainder = len(selected_cpu_list) % len(ranks_in_same_numa)
 
-        rank_position = ranks_in_same_numa.index(rank_across_dp)
+        rank_position = ranks_in_same_numa.index(rank_in_numa)
         start_idx = rank_position * cpus_per_rank + min(rank_position, remainder)
         end_idx = start_idx + cpus_per_rank + (1 if rank_position < remainder else 0)
         logical_cpu_list = selected_cpu_list[start_idx:end_idx]
@@ -947,7 +988,7 @@ def get_autobind_cpu_ids(
             rank_across_dp,
             selected_numa_node,
             ",".join(str(x.id) for x in logical_cpu_list),
-            [r for r in ranks_in_same_numa if r != rank_across_dp],
+            [r for r in ranks_in_same_numa if r != rank_in_numa],
             [(x.id, x.physical_core) for x in logical_cpu_list],
         )
     else:
