@@ -130,10 +130,7 @@ from vllm_rbln.platform import use_device_tensor
 from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadataBuilder,
 )
-from vllm_rbln.v1.attention.backends.gdn import (
-    RBLNGDNAttentionMetadataBuilder,
-    stateless_gdn_layers,
-)
+from vllm_rbln.v1.attention.backends.gdn import RBLNGDNAttentionMetadataBuilder
 from vllm_rbln.v1.attention.kv_cache_bindings import (
     KVCacheViewInfo,
     attach_kv_cache_bindings,
@@ -349,8 +346,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
         # indexes: [kv_cache_group_id][attn_group]
         self.attn_groups: list[list[AttentionGroup]] = []
-        # GatedDeltaNet layers keep their state outside the KV cache groups.
-        self.gdn_groups: list[tuple[RBLNGDNAttentionMetadataBuilder, list[str]]] = []
 
         # Set up speculative decoding.
         # NOTE(Jiayi): We put the entire draft model on the last PP rank.
@@ -626,8 +621,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
     def _update_states(self, scheduler_output: RBLNSchedulerOutput) -> None:
         """Update the cached states and the persistent batch with the scheduler
         output."""
-        for gdn_builder, _ in self.gdn_groups:
-            gdn_builder.release(scheduler_output.finished_req_ids)
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
@@ -1051,13 +1044,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         num_reqs_padded: int,
         logits_indices: torch.Tensor | None = None,
         back_pad: torch.Tensor | None = None,
-        req_ids: Sequence[str] | None = None,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
-
-        `req_ids` names the request on each batch row; a dummy run passes None
-        and the GatedDeltaNet state rows of live requests are parked out of its way.
 
         Unlike upstream's runner this takes no padded token count: the metadata
         handed to the drafter is built from the unpadded counts here, where
@@ -1066,7 +1055,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         the batch to it.
         """
         kv_cache_groups = self.kv_cache_config.kv_cache_groups
-        if len(kv_cache_groups) == 0 and not self.gdn_groups:
+        if len(kv_cache_groups) == 0:
             return {}, None
 
         attn_metadata: PerLayerAttnMetadata = {}
@@ -1085,11 +1074,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             num_actual_tokens=num_tokens,
             max_query_len=max_query_len,
             max_seq_len=self.seq_lens[:num_reqs].max().item(),
-            # A model truncated to linear-attention layers only has no KV cache
-            # group and so no block table; the GDN builder reads neither.
-            block_table_tensor=_get_block_table(0)
-            if kv_cache_groups
-            else torch.tensor(0),
+            block_table_tensor=_get_block_table(0),
             slot_mapping=torch.tensor(0),  # dummy
             causal=True,
         )
@@ -1122,30 +1107,33 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
                 attn_group = self.attn_groups[kv_cache_gid][attn_gid]
                 builder = attn_group.get_metadata_builder(0)
-                assert isinstance(builder, RBLNFlashAttentionMetadataBuilder)
-
-                attn_metadata_i = builder.build(
-                    common_attn_metadata=cm,
-                    positions=self.positions,
-                    is_prefill=self.is_prefill,
-                    batch_pad=num_reqs_padded,
-                    back_pad=back_pad,
-                    is_prompt_sorted=self.sort_batch_by_length,
-                )
+                if isinstance(builder, RBLNGDNAttentionMetadataBuilder):
+                    # The blocks every live request holds, so the builder frees
+                    # the rows of finished ones (the batch lists only the
+                    # scheduled requests).
+                    live_blocks = self.input_batch.block_table[kv_cache_gid]
+                    attn_metadata_i = builder.build(
+                        common_attn_metadata=cm,
+                        positions=self.positions,
+                        batch_pad=num_reqs_padded,
+                        is_prefill=self.is_prefill,
+                        live_blocks=live_blocks.get_cpu_tensor()[
+                            : self.input_batch.num_reqs, 0
+                        ].tolist(),
+                    )
+                else:
+                    assert isinstance(builder, RBLNFlashAttentionMetadataBuilder)
+                    attn_metadata_i = builder.build(
+                        common_attn_metadata=cm,
+                        positions=self.positions,
+                        is_prefill=self.is_prefill,
+                        batch_pad=num_reqs_padded,
+                        back_pad=back_pad,
+                        is_prompt_sorted=self.sort_batch_by_length,
+                    )
 
                 for layer_name in attn_group.layer_names:
                     attn_metadata[layer_name] = attn_metadata_i
-
-        for gdn_builder, gdn_layer_names in self.gdn_groups:
-            gdn_metadata = gdn_builder.build(
-                common_attn_metadata=cm_base,
-                positions=self.positions,
-                batch_pad=num_reqs_padded,
-                is_prefill=self.is_prefill,
-                req_ids=req_ids,
-            )
-            for layer_name in gdn_layer_names:
-                attn_metadata[layer_name] = gdn_metadata
 
         self._attach_kv_cache_bindings(attn_metadata)
 
@@ -1999,7 +1987,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     num_reqs_padded=batch_desc.num_reqs_padded,
                     logits_indices=logits_indices,
                     back_pad=self.decode_back_pad,
-                    req_ids=self.input_batch.req_ids[:num_reqs],
                 )
             )
 
@@ -3050,16 +3037,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     num_metadata_builders=1,  # not use ubatching
                 )
 
-        if gdn_layer_names := stateless_gdn_layers(self.vllm_config, kv_cache_config):
-            gdn_builder = RBLNGDNAttentionMetadataBuilder(
-                None,
-                gdn_layer_names,
-                self.vllm_config,
-                self.device,
-                max_batch_pad=max(self.bucketing_manager.batch_buckets),
-            )
-            self.gdn_groups = [(gdn_builder, gdn_layer_names)]
-
         # Initialize drafter attention backend.
         if isinstance(self.drafter, DRAFT_MODEL_PROPOSERS):
             self.drafter.initialize_attn_backend(kv_cache_config, kernel_block_sizes)
@@ -3085,7 +3062,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             assert not isinstance(
                 kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec
             )
-            assert not isinstance(kv_cache_group.kv_cache_spec, MambaSpec)
+            # A MambaSpec group (one state block a request) has block_size =
+            # max_model_len, so its table is one block wide.
             block_size = kv_cache_group.kv_cache_spec.block_size
             block_sizes.append(block_size)
             max_num_blocks_per_req = cdiv(max_model_len, block_size)
@@ -3294,6 +3272,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                         permute_order=tuple(inv_order),
                         dynamic_axis=base_dynamic_axis,
                     )
+                elif isinstance(kv_cache_spec, MambaSpec):
+                    # The page only reserves the request's block: a GatedDeltaNet
+                    # state lives on its backend's rows (v1/attention/backends/
+                    # gdn.py), since its kernels take a whole tensor and the
+                    # compiler cannot view a page shared with an attention layer
+                    # in another dtype.
+                    continue
                 else:
                     raise NotImplementedError
 

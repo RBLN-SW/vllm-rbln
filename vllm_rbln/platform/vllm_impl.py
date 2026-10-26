@@ -104,6 +104,13 @@ def _validate(vllm_config: "VllmConfig") -> None:
                 "Speculative decoding is not supported for GatedDeltaNet models on "
                 "the RBLN vLLM path yet: the decode kernel takes one token per request."
             )
+        heads_v = model_config.hf_text_config.linear_num_value_heads
+        if (heads_v // parallel_config.tensor_parallel_size) % 4:
+            raise ValueError(
+                "The RBLN GatedDeltaNet core splits a rank's value heads over four "
+                f"chiplets; got {heads_v} heads over "
+                f"tensor_parallel_size={parallel_config.tensor_parallel_size}."
+            )
 
     text_config = getattr(model_config, "hf_text_config", model_config.hf_config)
     if (
@@ -358,21 +365,21 @@ def _override(vllm_config: "VllmConfig") -> None:
         )
         model_config.disable_cascade_attn = True
 
-    if (
-        _uses_linear_attention(model_config)
-        and vllm_config.cache_config.enable_prefix_caching
-    ):
-        # A GatedDeltaNet state row belongs to one request and is not content
-        # addressable, so a cache hit could not restore it.
-        logger.warning(
-            "Prefix caching is not supported for GatedDeltaNet models on the RBLN "
-            "vLLM path. Overriding cache_config.enable_prefix_caching to False."
-        )
-        vllm_config.cache_config.enable_prefix_caching = False
-        # Upstream sizes mamba blocks for prefix caching; without it the value
-        # must go back to unset or VllmConfig rejects the pair.
-        if not vllm_config.cache_config.user_specified_mamba_block_size:
-            vllm_config.cache_config.mamba_block_size = None
+    if _uses_linear_attention(model_config):
+        cache_config = vllm_config.cache_config
+        if cache_config.enable_prefix_caching:
+            # A GatedDeltaNet state block belongs to one request and is not
+            # content addressable, so a cache hit could not restore it.
+            logger.warning(
+                "Prefix caching is not supported for GatedDeltaNet models on the "
+                "RBLN vLLM path. Overriding cache_config.enable_prefix_caching to "
+                "False."
+            )
+            cache_config.enable_prefix_caching = False
+        # One state block a request, as upstream sizes it without prefix caching.
+        cache_config.mamba_cache_mode = "none"
+        if not cache_config.user_specified_mamba_block_size:
+            cache_config.mamba_block_size = model_config.max_model_len
 
 
 def _wire(vllm_config: "VllmConfig") -> None:

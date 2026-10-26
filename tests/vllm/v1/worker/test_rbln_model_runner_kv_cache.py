@@ -20,6 +20,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.v1.kv_cache_interface import MambaSpec
 
 import vllm_rbln.v1.worker.rbln_model_runner as mr
 from tests.vllm.v1.worker.utils import make_kv_cache_config, schedule_new
@@ -177,6 +178,27 @@ class TestLayerIndexFollowsCacheOrder:
         assert runner.kv_cache_names == list(names)
         assert [ctx[name].layer_index for name in names] == [0, 1, 2]
         assert runner.kv_caches[2] is ctx[names[-1]].kv_cache
+
+
+class TestMambaSpecGroup:
+    def test_a_state_page_binds_no_view(self, make_model_runner):
+        # The page only reserves the request's block; the GatedDeltaNet state
+        # lives on its backend's rows, so the layer gets no KV cache view.
+        runner = make_model_runner(layers=("layer.0",), init_kv_cache=False)
+        spec = MambaSpec(
+            block_size=runner.model_config.max_model_len,
+            shapes=((64, 512),),
+            dtypes=(torch.uint8,),
+        )
+        config = make_kv_cache_config(runner, groups=[("layer.0",)], spec=spec)
+        runner.kv_cache_config = config
+        runner.initialize_attn_backend(config)
+        raw = runner._allocate_kv_cache_tensors(config)
+        caches, bases, infos, axes = runner._reshape_kv_cache_tensors(
+            config, raw, [spec.block_size]
+        )
+        assert "layer.0" in raw
+        assert not caches and not bases and not infos and not axes
 
 
 class TestHostBufferCopyOp:

@@ -13,14 +13,15 @@
 # limitations under the License.
 
 """The RBLN GatedDeltaNet forward tracks the HF reference across a padded
-prefill chunk, a continued chunk and a decode step. The custom ops run their
-CPU bodies here, so no NPU is needed."""
+prefill chunk, a continued chunk and a decode step, on the request's state
+block. The custom ops run their CPU bodies here, so no NPU is needed."""
 
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn.functional as F
+from rebel.ops.torch_custom_ops.kda import state_view
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5RMSNormGated,
     torch_chunk_gated_delta_rule,
@@ -37,6 +38,8 @@ KEY_DIM, VALUE_DIM = HEADS_K * HEAD_DIM, HEADS_V * HEAD_DIM
 CONV_DIM = 2 * KEY_DIM + VALUE_DIM
 CHUNK = 128
 PREFIX = "model.layers.0.linear_attn"
+# The request's state block (the MambaSpec group's block table entry).
+BLOCK = 2
 
 
 class _Proj(torch.nn.Linear):
@@ -112,6 +115,7 @@ def _common(query_len: int, seq_len: int) -> SimpleNamespace:
         num_reqs=1,
         query_start_loc=torch.tensor([0, query_len], dtype=torch.int32),
         seq_lens=torch.tensor([seq_len], dtype=torch.int32),
+        block_table_tensor=torch.tensor([[BLOCK]], dtype=torch.int32),
     )
 
 
@@ -123,25 +127,23 @@ def vllm_config():
 
 
 def _run(layer, vllm_config, builder, hidden, common, positions, is_prefill, batch_pad):
-    metadata = builder.build(common, positions, batch_pad, is_prefill, req_ids=["A"])
+    metadata = builder.build(common, positions, batch_pad, is_prefill, [BLOCK])
     with set_forward_context({PREFIX: metadata}, vllm_config):
         return patched_gdn_forward(layer, hidden)
 
 
 def _ssm_state(builder) -> torch.Tensor:
-    # the kernel's blocked [heads_k, ratio, 2, 128, 64] -> HF [1, heads_v, dk, dv]
-    from rebel.ops.torch_custom_ops.gdn import unblock_state
-
-    return unblock_state(builder.states[PREFIX].ssm_state[0]).reshape(
-        1, HEADS_V, HEAD_DIM, HEAD_DIM
-    )
+    # R1's bytes of the block's row -> HF [1, heads_v, dk, dv]
+    row = builder.rows.row_of[BLOCK]
+    state = builder.states[PREFIX].ssm_state
+    return state_view(state, HEADS_V, torch.float32)[row : row + 1]
 
 
 def test_padded_prefill_then_decode_tracks_hf(vllm_config):
     layer = _layer()
     vllm_config.compilation_config.static_forward_context[PREFIX] = layer
     builder = RBLNGDNAttentionMetadataBuilder(
-        None, [PREFIX], vllm_config, torch.device("cpu"), max_batch_pad=2
+        None, [PREFIX], vllm_config, torch.device("cpu")
     )
     torch.manual_seed(1)
     tokens = torch.randn(1, 70 + 58 + 1, HIDDEN)
@@ -196,6 +198,10 @@ def test_padded_prefill_then_decode_tracks_hf(vllm_config):
     ref, _, state = _reference(layer, tokens[:, 128:129], history, state)
     torch.testing.assert_close(out[:1], ref, atol=2e-3, rtol=2e-2)
     torch.testing.assert_close(_ssm_state(builder), state, atol=2e-3, rtol=2e-2)
+    # The padded row took its scratch row, so no other live row was touched.
+    rows = builder.states[PREFIX].ssm_state
+    assert builder.rows.row_of == {BLOCK: 0}
+    assert rows[0].any() and not rows[1:].any()
 
 
 def test_forward_without_metadata_is_an_error(vllm_config):

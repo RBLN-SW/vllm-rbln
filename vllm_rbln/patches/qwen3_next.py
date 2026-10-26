@@ -21,22 +21,17 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
 from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
 
 from vllm_rbln.patches import register_patch
-from vllm_rbln.v1.attention.backends.gdn import RBLNGDNAttentionMetadata
+from vllm_rbln.v1.attention.backends.gdn import (
+    GDN_HEAD_DIM,
+    RBLNGDNAttentionMetadata,
+)
 
 _MODULE = "vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn"
 _TARGET = f"{_MODULE}.QwenGatedDeltaNetAttention"
 
 
-@register_patch(
-    target=f"{_TARGET}.get_kv_cache_spec",
-    reason=(
-        "The RBLN core kernels update contiguous state rows, so a request's state "
-        "has to follow its batch row rather than a KV cache block; the RBLN GDN "
-        "backend owns the state outside the KV cache groups."
-    ),
-)
-def patched_gdn_get_kv_cache_spec(self: QwenGatedDeltaNetAttention, vllm_config):
-    return None
+def _l2norm(x: torch.Tensor) -> torch.Tensor:
+    return x * torch.rsqrt(x.float().pow(2).sum(-1, keepdim=True) + 1e-6).to(x.dtype)
 
 
 @register_patch(
@@ -61,13 +56,13 @@ def patched_gdn_forward(
     )
     if not isinstance(metadata, RBLNGDNAttentionMetadata):
         raise RuntimeError(f"{self.prefix}: this step carries no RBLN GDN metadata")
-    state = metadata.states[self.prefix]
     batch, seq_len = metadata.batch_size, metadata.seq_len
     if hidden_states.numel() != batch * seq_len * hidden_states.shape[-1]:
         raise RuntimeError(
             f"{self.prefix}: hidden_states {tuple(hidden_states.shape)} do not hold "
             f"the step's batch {batch} x seq {seq_len} the GDN metadata describes"
         )
+    state = metadata.states[self.prefix]
     tp_size = self.tp_size
     heads_k = self.num_k_heads // tp_size
     heads_v = self.num_v_heads // tp_size
@@ -75,6 +70,7 @@ def patched_gdn_forward(
     key_dim = self.key_dim // tp_size
     value_dim = self.value_dim // tp_size
     channels = key_dim * 2 + value_dim
+    head_dim = GDN_HEAD_DIM
 
     # Keep the leading dims the model uses ([batch, seq] on RBLN); only the
     # kernels need the explicit [batch, seq, ...] views.
@@ -91,48 +87,55 @@ def patched_gdn_forward(
         metadata.state_index,
         metadata.seq_idx,
         metadata.query_len,
-        metadata.has_initial_state_int,
+        metadata.has_initial_state,
         state.conv_width,
     )
     query, key, value = conv_out.split([key_dim, key_dim, value_dim], dim=-1)
-    query = query.reshape(batch, seq_len, heads_k, self.head_k_dim).transpose(1, 2)
-    key = key.reshape(batch, seq_len, heads_k, self.head_k_dim).transpose(1, 2)
-    value = value.reshape(batch, seq_len, heads_k, ratio, self.head_v_dim)
-    value = value.permute(0, 2, 3, 1, 4)
+    # The KDA core takes one q / k per value head, L2-normalized by the caller.
+    query, key = (
+        _l2norm(x.reshape(batch, seq_len, heads_k, 1, head_dim))
+        .expand(batch, seq_len, heads_k, ratio, head_dim)
+        .reshape(batch, seq_len, heads_v, head_dim)
+        .transpose(1, 2)
+        for x in (query, key)
+    )
+    value = value.reshape(batch, seq_len, heads_v, head_dim).transpose(1, 2)
 
-    beta = torch.sigmoid(b).reshape(batch, seq_len, heads_k, ratio).permute(0, 2, 3, 1)
+    beta = torch.sigmoid(b).reshape(batch, seq_len, heads_v).transpose(1, 2)
     g = -torch.exp(self.A_log.float()) * F.softplus(a.float() + self.dt_bias.float())
-    g = g.reshape(batch, seq_len, heads_k, ratio).permute(0, 2, 3, 1)
+    g = g.reshape(batch, seq_len, heads_v).transpose(1, 2)
     if metadata.is_prefill:
         # Padded tokens must neither decay the state nor write to it.
         assert metadata.valid_mask is not None
         g = g * metadata.valid_mask
         beta = beta * metadata.valid_mask.to(beta.dtype)
-        core = torch.ops.rbln_custom_ops.gdn_prefill(
+    # A per-channel decay, as the KDA kernel reads it: the same over the head.
+    g = g.unsqueeze(-1).expand(batch, heads_v, seq_len, head_dim).contiguous()
+    if metadata.is_prefill:
+        core = torch.ops.rbln_custom_ops.kda_prefill(
             query.contiguous(),
             key.contiguous(),
             value.contiguous(),
-            g.contiguous(),
+            g,
             beta.contiguous(),
             state.ssm_state,
-            metadata.slot,
-            metadata.has_initial_state,
+            metadata.core_state_index,
+            metadata.core_has_initial_state,
         )
     else:
-        core = torch.ops.rbln_custom_ops.gdn_decode(
+        core = torch.ops.rbln_custom_ops.kda_decode(
             query.contiguous(),
             key.contiguous(),
             value.contiguous(),
-            g.contiguous(),
+            g,
             beta.contiguous(),
             state.ssm_state,
-            metadata.slot,
+            metadata.core_state_index,
         )
-    # [batch, heads_k, ratio, seq, dv] -> [batch, seq, heads_v, dv]
-    core = core.permute(0, 3, 1, 2, 4).reshape(batch, seq_len, heads_v, self.head_v_dim)
-    z = z.reshape(batch, seq_len, heads_v, self.head_v_dim)
+    core = core.transpose(1, 2).reshape(batch, seq_len, heads_v, head_dim)
+    z = z.reshape(batch, seq_len, heads_v, head_dim)
     gated = self.norm(core, z)
-    output, _ = self.out_proj(gated.reshape(batch, seq_len, heads_v * self.head_v_dim))
+    output, _ = self.out_proj(gated.reshape(batch, seq_len, heads_v * head_dim))
     return output.reshape(*hidden_states.shape[:-1], output.shape[-1])
 
 

@@ -12,87 +12,52 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The GatedDeltaNet state rows follow their requests onto the batch rows, and
-the metadata builder describes a step the way the RBLN kernels read it."""
+"""A request's GatedDeltaNet state block maps to a backend row for as long as
+the request lives, and the metadata builder describes a step the way the RBLN
+kernels read it."""
 
 from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.v1.kv_cache_interface import MambaSpec
 
 from tests.vllm.vllm_config import make_vllm_config
 from vllm_rbln.v1.attention.backends.gdn import (
     RBLNGDNAttentionMetadataBuilder,
     RBLNGDNStateRows,
+    gdn_state_rows,
 )
 
 LAYER = "model.layers.1.linear_attn"
 
 
-def _rows(num_rows: int) -> tuple[RBLNGDNStateRows, torch.Tensor]:
-    # Row r starts as the value r, so a row's content names where it came from.
-    tensor = torch.arange(num_rows + 1, dtype=torch.float32).view(-1, 1).repeat(1, 3)
-    return RBLNGDNStateRows(num_rows, [tensor]), tensor
-
-
-def _content(tensor: torch.Tensor, row: int) -> float:
-    return float(tensor[row, 0])
-
-
 class TestStateRows:
-    def test_new_requests_take_their_rows_without_copies(self):
-        rows, tensor = _rows(6)
-        rows.place(["A", "B"], batch=2)
-        assert rows.owner[:2] == ["A", "B"]
-        assert rows.row_of == {"A": 0, "B": 1}
-        assert torch.equal(
-            tensor, torch.arange(7, dtype=torch.float32).view(-1, 1).repeat(1, 3)
-        )
+    def test_blocks_keep_their_rows_while_live(self):
+        rows = RBLNGDNStateRows(num_live=3)
+        assert rows.rows([7], live={7}, batch=1) == [0]
+        assert rows.rows([7, 9], live={7, 9}, batch=2) == [0, 1]
+        # 9 was prefilled alone; both come back on the rows they took.
+        assert rows.rows([9, 7], live={7, 9}, batch=4) == [1, 0, 5, 6]
 
-    def test_a_prefill_parks_the_request_it_displaces(self):
-        rows, tensor = _rows(6)
-        rows.place(["A", "B"], batch=2)
-        rows.place(["C"], batch=1)
-        # A left row 0 for a free parking row; B stays on row 1, which is parking
-        # for a batch of one.
-        assert rows.owner[0] == "C"
-        assert rows.row_of["B"] == 1
-        assert _content(tensor, rows.row_of["A"]) == 0.0
-        assert rows.row_of["A"] >= 1
+    def test_a_finished_block_frees_its_row(self):
+        rows = RBLNGDNStateRows(num_live=2)
+        rows.rows([7, 9], live={7, 9}, batch=2)
+        # 7 finished: its row goes to the next new block.
+        assert rows.rows([9, 4], live={9, 4}, batch=2) == [1, 0]
+        assert rows.row_of == {9: 1, 4: 0}
 
-    def test_requests_come_back_to_their_batch_rows(self):
-        rows, tensor = _rows(6)
-        rows.place(["A", "B"], batch=2)
-        rows.place(["C"], batch=1)
-        rows.place(["A", "B", "C"], batch=4)
-        assert rows.owner[:4] == ["A", "B", "C", None]
-        # A's state is back on row 0; C's state is whatever row 0 held when C was
-        # prefilled there (the former free row's content, 2.0), now moved to row 2.
-        assert [_content(tensor, r) for r in range(3)] == [0.0, 1.0, 2.0]
-        assert rows.row_of == {"A": 0, "B": 1, "C": 2}
+    def test_the_null_block_takes_a_scratch_row_per_position(self):
+        # A dummy run schedules block 0 on every position; a decode pads with it.
+        rows = RBLNGDNStateRows(num_live=2)
+        assert rows.rows([0, 0], live=set(), batch=2) == [2, 3]
+        assert rows.row_of == {}
 
-    def test_padded_rows_hold_no_live_state(self):
-        rows, _ = _rows(6)
-        rows.place(["A", "B", "C"], batch=4)
-        rows.place(["A"], batch=4)
-        assert rows.owner[0] == "A"
-        assert rows.owner[1:4] == [None, None, None]
-        assert {rows.row_of["B"], rows.row_of["C"]} <= set(range(4, 6))
-
-    def test_release_frees_the_row(self):
-        rows, _ = _rows(6)
-        rows.place(["A", "B"], batch=2)
-        rows.release(["A", "never-seen"])
-        assert rows.owner[0] is None
-        assert "A" not in rows.row_of
-        rows.place(["C", "B"], batch=2)
-        assert rows.owner[:2] == ["C", "B"]
-
-    def test_no_parking_row_is_an_error(self):
-        rows, _ = _rows(2)
-        rows.place(["A", "B"], batch=2)
+    def test_no_free_row_is_an_error(self):
+        rows = RBLNGDNStateRows(num_live=1)
+        rows.rows([7], live={7}, batch=1)
         with pytest.raises(RuntimeError, match="no free GatedDeltaNet state row"):
-            rows.place(["C"], batch=2)
+            rows.rows([9], live={7, 9}, batch=1)
 
 
 def _layer():
@@ -113,12 +78,19 @@ def builder():
         max_num_batched_tokens=128, max_num_seqs=4, dtype="float32"
     )
     vllm_config.compilation_config.static_forward_context[LAYER] = _layer()
+    spec = MambaSpec(
+        block_size=vllm_config.model_config.max_model_len,
+        shapes=((64, 512),),
+        dtypes=(torch.uint8,),
+    )
     return RBLNGDNAttentionMetadataBuilder(
-        None, [LAYER], vllm_config, torch.device("cpu"), max_batch_pad=4
+        spec, [LAYER], vllm_config, torch.device("cpu")
     )
 
 
-def _common(query_lens: list[int], seq_lens: list[int]) -> SimpleNamespace:
+def _common(
+    query_lens: list[int], seq_lens: list[int], blocks: list[int]
+) -> SimpleNamespace:
     starts = [0]
     for n in query_lens:
         starts.append(starts[-1] + n)
@@ -126,62 +98,52 @@ def _common(query_lens: list[int], seq_lens: list[int]) -> SimpleNamespace:
         num_reqs=len(query_lens),
         query_start_loc=torch.tensor(starts, dtype=torch.int32),
         seq_lens=torch.tensor(seq_lens, dtype=torch.int32),
+        block_table_tensor=torch.tensor(blocks, dtype=torch.int32).view(-1, 1),
     )
 
 
 class TestBuilder:
     def test_state_shapes_follow_the_kernels(self, builder):
         state = builder.states[LAYER]
-        # 4 batch rows + 2 x 4 parked + 1 scratch
-        assert state.conv_state.shape == (13, 3, 16, 64)
-        assert state.ssm_state.shape == (13, 2, 2, 2, 128, 64)
+        # 4 live rows + 4 scratch rows; 4 fp32 heads are 128 R1 rows each
+        assert state.conv_state.shape == (8, 3, 16, 64)
+        assert state.ssm_state.shape == (8, gdn_state_rows(4, torch.float32), 512)
+        assert state.ssm_state.dtype == torch.uint8
         assert state.conv_width == 3
 
     def test_first_prefill_chunk(self, builder):
         positions = torch.arange(128)
-        md = builder.build(
-            _common([70], [70]), positions, batch_pad=1, is_prefill=True, req_ids=["A"]
-        )
+        md = builder.build(_common([70], [70], [7]), positions, 1, True, [7])
         assert md.is_prefill and md.batch_size == 1 and md.seq_len == 128
-        assert md.slot.dtype == torch.int16 and int(md.slot) == 0
-        assert md.has_initial_state.tolist() == [0.0]
-        assert md.has_initial_state_int.tolist() == [0]
+        assert md.state_index.tolist() == [0]
+        assert md.has_initial_state.tolist() == [0]
         assert md.seq_idx.tolist() == [0] and md.query_len.tolist() == [70]
-        assert md.valid_mask.shape == (1, 1, 1, 128)
+        assert md.valid_mask.shape == (1, 1, 128)
         assert md.valid_mask.sum() == 70 and md.valid_mask[..., :70].all()
 
     def test_later_prefill_chunk_carries_state(self, builder):
         positions = torch.arange(70, 70 + 58)
-        md = builder.build(
-            _common([58], [128]), positions, batch_pad=1, is_prefill=True, req_ids=["A"]
-        )
-        assert md.has_initial_state.tolist() == [1.0]
+        md = builder.build(_common([58], [128], [7]), positions, 1, True, [7])
+        assert md.has_initial_state.tolist() == [1]
         assert md.seq_idx.tolist() == [70] and md.query_len.tolist() == [58]
 
-    def test_decode_pads_the_batch(self, builder):
-        positions = torch.tensor([128, 4])
+    def test_decode_pads_the_batch_onto_scratch_rows(self, builder):
+        builder.build(_common([70], [70], [7]), torch.arange(128), 1, True, [7])
+        builder.build(_common([5], [5], [3]), torch.arange(128), 1, True, [7, 3])
+        positions = torch.tensor([128, 5])
         md = builder.build(
-            _common([1, 1], [129, 5]),
-            positions,
-            batch_pad=4,
-            is_prefill=False,
-            req_ids=["A", "B"],
+            _common([1, 1], [129, 6], [7, 3]), positions, 4, False, [7, 3]
         )
         assert not md.is_prefill and md.batch_size == 4 and md.seq_len == 1
-        assert md.state_index.tolist() == [0, 1, 2, 3]
-        assert md.seq_idx.tolist() == [128, 4, 0, 0]
+        assert md.state_index.tolist() == [0, 1, 6, 7]
+        assert md.seq_idx.tolist() == [128, 5, 0, 0]
         assert md.query_len.tolist() == [1, 1, 0, 0]
-        assert md.has_initial_state_int.tolist() == [1, 1, 0, 0]
+        assert md.has_initial_state.tolist() == [1, 1, 0, 0]
         assert md.valid_mask is None
-        assert builder.rows.owner[:2] == ["A", "B"]
 
     def test_staging_buffers_are_reused(self, builder):
         positions = torch.arange(128)
-        first = builder.build(
-            _common([70], [70]), positions, batch_pad=1, is_prefill=True, req_ids=["A"]
-        )
-        second = builder.build(
-            _common([58], [128]), positions, batch_pad=1, is_prefill=True, req_ids=["A"]
-        )
+        first = builder.build(_common([70], [70], [7]), positions, 1, True, [7])
+        second = builder.build(_common([58], [128], [7]), positions, 1, True, [7])
         assert first.query_len.data_ptr() == second.query_len.data_ptr()
         assert second.query_len.tolist() == [58]
