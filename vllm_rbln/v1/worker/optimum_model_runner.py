@@ -1140,7 +1140,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         # Condense the batched states if there are gaps left by removed requests
         self.input_batch.condense()
         # Sort requests by length (descending) so the batched dynamic decode
-        # kernel (--rbln-use-batch-attn-opt) can honor its per-partition
+        # kernel can honor its per-partition
         # early-exit contract. Must happen BEFORE refresh_metadata so the
         # snapshot reflects the sorted order.
         self._may_reorder_batch(scheduler_output)

@@ -501,13 +501,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             parallel_config.data_parallel_size > 1
             and self.rbln_config.specialize_moe_decode
         )
-        # The batched dynamic decode kernel (REBEL CR13, or any device with
-        # --rbln-use-batch-attn-opt) processes the first valid_batch[p] rows of
-        # partition p and early-exits on the rest, which is only correct when
-        # rows are sorted by descending sequence length.
-        self.sort_batch_by_length = (
-            current_platform.is_cr13() or self.rbln_config.use_batch_attn_opt
-        )
+        # The batched dynamic decode kernel on REBEL CR13 processes the first
+        # valid_batch[p] rows of partition p and early-exits on the rest, which
+        # is only correct when rows are sorted by descending sequence length.
+        self.sort_batch_by_length = current_platform.is_cr13()
 
         # Static, so the per-step decision only has to supply this step's counts.
         self.shape_config = ShapeConfig(

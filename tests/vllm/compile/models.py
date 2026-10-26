@@ -26,7 +26,6 @@ _MINIMAX_BASE = CompileModelSpec(
         "block_size": 1024,
         "max_num_batched_tokens": 512,
         "enable_expert_parallel": True,
-        "additional_config": {"use_batch_attn_opt": True},
     },
     chips=REBEL,
 )
@@ -40,7 +39,6 @@ MODELS: list[CompileModelSpec] = [
             "block_size": 8192,
             "tensor_parallel_size": 4,
             "enable_expert_parallel": False,
-            "additional_config": {"use_batch_attn_opt": True},
         },
         chips=REBEL,
     ),
@@ -53,7 +51,6 @@ MODELS: list[CompileModelSpec] = [
             "max_num_batched_tokens": 512,
             "data_parallel_size": 4,
             "enable_expert_parallel": True,
-            "additional_config": {"use_batch_attn_opt": True},
         },
         {
             "VLLM_RBLN_SUB_BLOCK_CACHE": "0",

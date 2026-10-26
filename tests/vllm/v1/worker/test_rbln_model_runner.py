@@ -1379,25 +1379,11 @@ class TestCalcSpecDecodeMetadata:
 
 
 class TestSortBatchByLength:
-    # __init__ enables the sort on REBEL CR13 and wherever
-    # --rbln-use-batch-attn-opt is set; other parts keep the scheduler's order.
-    @pytest.mark.parametrize(
-        ("is_cr13", "use_batch_attn_opt", "expected"),
-        [
-            (True, False, True),
-            (False, False, False),
-            (False, True, True),
-        ],
-    )
-    def test_resolved_from_device_and_flag(
-        self, monkeypatch, make_model_runner, is_cr13, use_batch_attn_opt, expected
-    ):
+    @pytest.mark.parametrize("is_cr13", [True, False])
+    def test_resolved_from_device(self, monkeypatch, make_model_runner, is_cr13):
         monkeypatch.setattr(current_platform, "is_cr13", lambda: is_cr13)
-        runner = make_model_runner(
-            init_kv_cache=False,
-            additional_config={"use_batch_attn_opt": use_batch_attn_opt},
-        )
-        assert runner.sort_batch_by_length is expected
+        runner = make_model_runner(init_kv_cache=False)
+        assert runner.sort_batch_by_length is is_cr13
 
 
 class TestMayReorderBatch:

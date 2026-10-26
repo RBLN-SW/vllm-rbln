@@ -92,9 +92,6 @@ class RBLNConfig(RBLNConfigBase):
     enforce_model_fp32: bool = False
     """Force the model dtype to fp32 instead of model_config.dtype."""
 
-    use_batch_attn_opt: bool = False
-    """Use the batch attention optimization for paged attention."""
-
     use_custom_kernel: bool = False
     """Use the custom RBLN kernels."""
 
