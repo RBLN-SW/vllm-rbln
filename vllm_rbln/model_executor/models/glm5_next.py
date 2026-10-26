@@ -15,7 +15,6 @@
 import math
 from collections.abc import Iterable
 from itertools import islice
-from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -60,6 +59,11 @@ from vllm.model_executor.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from vllm.models.glm5next.common.multimodal import (
+    Glm5NextMultiModalProcessor,
+    Glm5NextProcessingInfo,
+    Glm5NextVisionTransformer,
+)
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import set_default_torch_dtype
@@ -67,7 +71,6 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec, MLAAttentionSpec
 
 from vllm_rbln.model_executor.models.interfaces import SupportsRBLNMultiModal
 from vllm_rbln.patches.attention import _resolve_kv_cache
-from vllm_rbln.utils import import_without_package_init
 from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadata,
 )
@@ -1028,8 +1031,6 @@ class RBLNGlm5NextForCausalLM(nn.Module):
         return loaded_params
 
 
-_glm5_mm = import_without_package_init("vllm.models.glm5next.common.multimodal")
-
 # Patches per image the compiled vision encoder takes (64 x 64 grid, 896 x 896 px,
 # 1024 image tokens).
 # TODO(RBLN): image size buckets and video inputs.
@@ -1097,10 +1098,7 @@ class _RBLNGlm5NextVisionEncoder(nn.Module):
         return merger.down_proj(_swiglu_clamped(gate, up, self.swiglu_limit))[0]
 
 
-_Glm5NextProcessingInfo: Any = _glm5_mm.Glm5NextProcessingInfo
-
-
-class RBLNGlm5NextProcessingInfo(_Glm5NextProcessingInfo):
+class RBLNGlm5NextProcessingInfo(Glm5NextProcessingInfo):
     def get_hf_processor(self, **kwargs: object):
         processor = super().get_hf_processor(**kwargs)
         image_processor = processor.image_processor
@@ -1112,7 +1110,7 @@ class RBLNGlm5NextProcessingInfo(_Glm5NextProcessingInfo):
 
 
 @MULTIMODAL_REGISTRY.register_processor(
-    _glm5_mm.Glm5NextMultiModalProcessor,
+    Glm5NextMultiModalProcessor,
     info=RBLNGlm5NextProcessingInfo,
     dummy_inputs=Glm4vDummyInputsBuilder,
 )
@@ -1138,7 +1136,7 @@ class RBLNGlm5NextForConditionalGeneration(
             self._mark_tower_model(vllm_config, {"image", "video"}),
             set_default_torch_dtype(torch.float32),
         ):
-            self.visual = _glm5_mm.Glm5NextVisionTransformer(
+            self.visual = Glm5NextVisionTransformer(
                 hf_config.text_config,
                 hf_config.vision_config,
                 norm_eps=hf_config.vision_config.rms_norm_eps,
