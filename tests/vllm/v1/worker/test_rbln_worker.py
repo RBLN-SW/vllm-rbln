@@ -74,6 +74,8 @@ def _make_vllm_config(
             data_parallel_rank=data_parallel_rank,
             data_parallel_rank_local=data_parallel_rank_local,
             world_size_across_dp=world_size_across_dp,
+            local_world_size=world_size,
+            data_parallel_size_local=data_parallel_size,
             assigned_physical_gpu_ids=assigned_physical_gpu_ids,
             disable_custom_all_reduce=False,
         ),
@@ -1073,6 +1075,9 @@ class TestEnsureRblnHostThreadsBeforeCompile:
         monkeypatch.setattr(
             wm, "set_omp_num_threads", lambda r, lr, n: captured.append(n)
         )
+        monkeypatch.setattr(
+            "vllm_rbln.v1.worker.utils.get_cgroup_cpu_quota", lambda: None
+        )
         # Neutralise the numba<->torch thread juggling (global-state side effect).
         monkeypatch.setattr(
             wm,
@@ -1090,6 +1095,16 @@ class TestEnsureRblnHostThreadsBeforeCompile:
         captured = self._prep(monkeypatch, planned)
         worker._ensure_rbln_host_threads_before_compile()
         assert captured == [expected]
+
+    def test_quota_split_across_local_ranks(self, make_worker, monkeypatch):
+        # 4 local ranks share a 64-CPU quota: min(64, 64 // 4) // 2 = 8.
+        worker = make_worker(world_size=4)
+        captured = self._prep(monkeypatch, 64)
+        monkeypatch.setattr(
+            "vllm_rbln.v1.worker.utils.get_cgroup_cpu_quota", lambda: 64.0
+        )
+        worker._ensure_rbln_host_threads_before_compile()
+        assert captured == [8]
 
     def test_idempotent(self, make_worker, monkeypatch):
         # The ready-flag guard makes a second call a no-op.

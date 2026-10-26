@@ -145,7 +145,7 @@ class RblnTransferTopology(TransferTopology):
             return self._shared_cache_regions(cache, layer_spec)
         if self._kv_shares_a_block:
             # Nothing to iterate: the block is the unit, and the descriptor
-            # path cuts K and V out of it (`RblnNixlWorkerBase._kv_runs`).
+            # path cuts K and V out of it (`pair_area`).
             return [cache]
         # Iterating the tensor yields K and V; the caller divides the page size
         # by how many come back.

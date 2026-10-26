@@ -59,7 +59,10 @@ from vllm_rbln.v1.worker.utils import (
     estimate_available_memory,
     estimate_model_kernel_size,
     get_autobind_cpu_ids,
+    get_cgroup_cpu_quota,
+    get_default_num_threads,
     get_kv_cache_names,
+    get_num_local_ranks,
     get_rbln_owned_card_indices,
     get_rbln_planned_affinity_cpu_count,
     get_rbln_visible_card_indices,
@@ -1013,6 +1016,107 @@ class TestGetRblnPlannedAffinityCpuCount:
     def test_nobind_or_all_uses_current_affinity(self, monkeypatch):
         monkeypatch.setattr(worker_utils.os, "sched_getaffinity", lambda pid: {0, 1, 2})
         assert get_rbln_planned_affinity_cpu_count("nobind") == 3
+
+
+class TestGetCgroupCpuQuota:
+    @staticmethod
+    def _cgroup(tmp_path, rel_path, files):
+        root = tmp_path / "cgroup"
+        for rel, content in files.items():
+            f = root / rel
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(content)
+        root.mkdir(exist_ok=True)
+        proc = tmp_path / "proc_cgroup"
+        proc.write_text(f"0::{rel_path}\n")
+        return str(root), str(proc)
+
+    def test_v2_container_root(self, tmp_path):
+        root, proc = self._cgroup(tmp_path, "/", {"cpu.max": "1400000 100000\n"})
+        assert get_cgroup_cpu_quota(root, proc) == 14.0
+
+    def test_v2_unlimited(self, tmp_path):
+        root, proc = self._cgroup(tmp_path, "/", {"cpu.max": "max 100000\n"})
+        assert get_cgroup_cpu_quota(root, proc) is None
+
+    def test_v2_takes_min_over_ancestors(self, tmp_path):
+        root, proc = self._cgroup(
+            tmp_path,
+            "/pod/ctr",
+            {
+                "pod/cpu.max": "400000 100000\n",
+                "pod/ctr/cpu.max": "max 100000\n",
+            },
+        )
+        assert get_cgroup_cpu_quota(root, proc) == 4.0
+
+    def test_v1(self, tmp_path):
+        root, proc = self._cgroup(
+            tmp_path,
+            "/",
+            {
+                "cpu/cpu.cfs_quota_us": "250000\n",
+                "cpu/cpu.cfs_period_us": "100000\n",
+            },
+        )
+        assert get_cgroup_cpu_quota(root, proc) == 2.5
+
+    def test_v1_unlimited(self, tmp_path):
+        root, proc = self._cgroup(
+            tmp_path,
+            "/",
+            {
+                "cpu/cpu.cfs_quota_us": "-1\n",
+                "cpu/cpu.cfs_period_us": "100000\n",
+            },
+        )
+        assert get_cgroup_cpu_quota(root, proc) is None
+
+    def test_no_cgroup_files(self, tmp_path):
+        assert get_cgroup_cpu_quota(str(tmp_path), str(tmp_path / "missing")) is None
+
+
+class TestGetDefaultNumThreads:
+    @pytest.mark.parametrize(
+        "allocated, quota, expected",
+        [
+            (128, None, 64),
+            (126, 14.0, 7),
+            (126, 2.5, 2),
+            (126, 5.5, 2),
+            (8, 64.0, 4),
+            (1, None, 2),
+        ],
+    )
+    def test_half_of_min_affinity_and_quota(
+        self, monkeypatch, allocated, quota, expected
+    ):
+        monkeypatch.setattr(worker_utils, "get_cgroup_cpu_quota", lambda: quota)
+        assert get_default_num_threads(allocated) == expected
+
+    @pytest.mark.parametrize(
+        "quota, ranks, expected",
+        [
+            (64.0, 4, 8),
+            (14.0, 8, 2),
+            (None, 8, 64),
+        ],
+    )
+    def test_quota_split_across_local_ranks(self, monkeypatch, quota, ranks, expected):
+        monkeypatch.setattr(worker_utils, "get_cgroup_cpu_quota", lambda: quota)
+        assert get_default_num_threads(128, ranks) == expected
+
+
+class TestGetNumLocalRanks:
+    @pytest.mark.parametrize(
+        "local_world_size, dp_local, expected",
+        [(8, 1, 8), (1, 4, 4), (2, 2, 4), (1, 0, 1)],
+    )
+    def test_product_of_tp_pp_and_local_dp(self, local_world_size, dp_local, expected):
+        pc = SimpleNamespace(
+            local_world_size=local_world_size, data_parallel_size_local=dp_local
+        )
+        assert get_num_local_ranks(pc) == expected
 
 
 class TestSetCpuAffinity:

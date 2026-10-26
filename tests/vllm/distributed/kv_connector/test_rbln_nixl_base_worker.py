@@ -44,6 +44,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_worker imp
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.push_worker import (
     RblnNixlPushConnectorWorker,
 )
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import Piece
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 
 
@@ -365,6 +366,30 @@ class TestSwaWindowRatio:
             )
 
 
+class TestAnInertChunkSize:
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("chunk_mode", [False, True])
+    def test_a_chunk_size_without_chunk_mode_says_it_does_nothing(
+        self, monkeypatch, caplog, chunk_mode, stream
+    ):
+        # A streamed write cuts no block either, so streaming alone leaves the
+        # size as unused as having neither knob.
+        with caplog.at_level("INFO"):
+            worker = build_worker(
+                monkeypatch,
+                kv_buffer_device="rbln",
+                chunk_mode=chunk_mode,
+                chunk_tokens=512,
+                push_stream=stream,
+                specs=[MagicMock()],
+                cls=RblnNixlPushConnectorWorker,
+            )
+
+        assert worker._shape.streams_prefix is stream
+        said = [r for r in caplog.records if "has no effect without" in r.getMessage()]
+        assert bool(said) is not chunk_mode
+
+
 class TestSwaWindowDelegation:
     # Both collapse to the upstream Full-only implementation when window_ratio is
     # None; the SWA dual-range paths are exercised in the Swa classes below.
@@ -398,7 +423,8 @@ class TestSwaWindowDelegation:
             lambda self, *args, **kwargs: "shard",
         )
 
-        assert worker.register_local_xfer_handler(64, replica_fanout=2) == "shard"
+        two_copies = [[Piece(0, 0, 0, 64, 1), Piece(0, 1, 0, 64, 1)]]
+        assert worker.register_local_xfer_handler(64, pieces=two_copies) == "shard"
 
     def test_add_remote_agent_delegates_when_no_swa(self, monkeypatch):
         worker = build_worker(monkeypatch)  # window_ratio is None

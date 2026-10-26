@@ -189,9 +189,9 @@ class RblnNixlWorkerBase(
         # drops the entry without releasing what other peers still use.
         self._borrowed_src_handles: set[tuple[str, int, int]] = set()
         self._shard_region_group_ids: dict[tuple[str, int], tuple[int, ...]] = {}
-        # How many descriptors each of that shard's regions is cut into
-        # (_head_split).
-        self._shard_descs_per_block: dict[tuple[str, int], int] = {}
+        # How many descriptors a block of each of that shard's regions is: the
+        # pieces a peer of another TP degree pairs it in (`pair_area`), else one.
+        self._shard_descs_per_block: dict[tuple[str, int], tuple[int, ...]] = {}
         # Per peer shard, the grid its chunk range was built over, or None
         # where its lists carry no such range. See `_shard_chunk_grid`.
         self._shard_chunk_grids: dict[tuple[str, int], ChunkGrid | None] = {}
@@ -235,6 +235,13 @@ class RblnNixlWorkerBase(
                 "RBLN NIXL: swa_window_mode registered no window range. This "
                 "engine has no window to cut by -- no sliding-window group, or "
                 "one as wide as its block."
+            )
+        chunk_tokens = connector_option(vllm_config, "chunk_tokens", 0)
+        if chunk_tokens and not self._shape.cuts_a_block:
+            logger.info(
+                "RBLN NIXL: chunk_tokens=%d has no effect without chunk_mode, "
+                "the only knob that cuts a block into chunks.",
+                chunk_tokens,
             )
         if (
             self._shape.wants_stream
