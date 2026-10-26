@@ -5,6 +5,8 @@ env:
   # Only the cron schedule sets this, so a manual or re-run build exercises the
   # lanes without publishing. Declared here so build.env sees the name either way.
   NIGHTLY_DEPLOY: "${NIGHTLY_DEPLOY:-}"
+  NIGHTLY_REPORT: "${NIGHTLY_REPORT:-}"
+  SLACK_REPORT_CHANNEL: "${SLACK_REPORT_CHANNEL:-}"
 
 _secrets: &secrets
   UV_INDEX_RBLN_NEXUS_NIGHTLY_USERNAME: MGMT_NEXUS_USERNAME
@@ -185,3 +187,26 @@ steps:
     timeout_in_minutes: 30
     command:
       - "bash .buildkite/pipelines/vllm-rbln/scripts/publish-nightly-wheel.sh"
+
+  - label: ":slack: nightly report"
+    key: "nightly-report"
+    if: >-
+      (build.source == "schedule" && build.branch == "dev") ||
+      build.env("NIGHTLY_REPORT") == "1"
+    depends_on:
+      - "nightly-pytest"
+      - "nightly-examples-vllm"
+      - "nightly-perf-upload"
+      - "nightly-lm-eval-upload"
+      - "nightly-publish"
+    allow_dependency_failure: true
+    image: "${DEVTOOLS_DOCKER_IMAGE}"
+    secrets:
+      SLACK_BOT_TOKEN: SLACK_OAUTH_TOKEN
+    timeout_in_minutes: 10
+    artifact_paths:
+      - "nightly-report/*"
+    command: |
+      uv run --no-project --python 3.12 --with pyyaml python \
+        .buildkite/pipelines/vllm-rbln/scripts/report_nightly.py \
+        --chip RBLN-CR13 --download
