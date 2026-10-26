@@ -518,6 +518,23 @@ def _model_impl_for(engine_args: Any) -> tuple[ModelImpl, str, str]:
 
 
 def build_rbln_config(additional_config: Any = None) -> RBLNConfig:
+    removed_key = (
+        isinstance(additional_config, dict)
+        and "use_batch_attn_opt" in additional_config
+    )
+    if "VLLM_RBLN_BATCH_ATTN_OPT" in os.environ or removed_key:
+        logger.warning_once(
+            "VLLM_RBLN_BATCH_ATTN_OPT, --rbln-use-batch-attn-opt / "
+            "--no-rbln-use-batch-attn-opt, and additional_config.use_batch_attn_opt "
+            "have been removed and are ignored. Remove these settings from "
+            "your configuration."
+        )
+    if removed_key:
+        additional_config = {
+            key: value
+            for key, value in additional_config.items()
+            if key != "use_batch_attn_opt"
+        }
     return _resolve(RBLNConfig, additional_config)
 
 
@@ -713,6 +730,14 @@ def add_rbln_cli_args(parser: "FlexibleArgumentParser") -> None:
                 action=_StoreRblnBool if is_bool else _StoreRbln,
                 **field_kwargs,
             )
+
+    parser.add_argument(
+        "--rbln-use-batch-attn-opt",
+        dest="rbln_use_batch_attn_opt",
+        action=_StoreRblnBool,
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
+    )
 
     for action in parser._actions:
         if action.dest == "additional_config":

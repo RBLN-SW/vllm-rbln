@@ -22,6 +22,7 @@ import logging
 import pathlib
 import re
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 from vllm.engine.arg_utils import AsyncEngineArgs
@@ -162,6 +163,46 @@ def test_cli_wins_over_env(parser, monkeypatch):
 def test_unknown_key_is_rejected():
     with pytest.raises(ValueError, match="are not fields"):
         build_rbln_config({"use_custom_samplerr": False})
+
+
+@pytest.mark.parametrize("raw", ["1", "0", ""])
+def test_removed_batch_attention_env_warns_and_is_ignored(monkeypatch, raw):
+    monkeypatch.setenv("VLLM_RBLN_BATCH_ATTN_OPT", raw)
+    with patch("vllm_rbln.config.logger.warning_once") as warning:
+        assert build_rbln_config() == RBLNConfig()
+    warning.assert_called_once()
+    assert "VLLM_RBLN_BATCH_ATTN_OPT" in warning.call_args.args[0]
+    assert "have been removed and are ignored" in warning.call_args.args[0]
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_removed_batch_attention_key_warns_and_preserves_other_settings(value):
+    given = {"use_batch_attn_opt": value, "use_w8a8": True}
+    with patch("vllm_rbln.config.logger.warning_once") as warning:
+        assert build_rbln_config(given).use_w8a8 is True
+    warning.assert_called_once()
+    assert "additional_config.use_batch_attn_opt" in warning.call_args.args[0]
+    assert "have been removed and are ignored" in warning.call_args.args[0]
+    assert given == {"use_batch_attn_opt": value, "use_w8a8": True}
+
+
+@pytest.mark.parametrize(
+    "flag", ["--rbln-use-batch-attn-opt", "--no-rbln-use-batch-attn-opt"]
+)
+def test_removed_batch_attention_flag_warns_and_is_hidden(parser, flag):
+    with patch("vllm_rbln.config.logger.warning_once") as warning:
+        assert resolve(parser, [flag]) == RBLNConfig()
+    warning.assert_called_once()
+    assert flag in warning.call_args.args[0]
+    assert "have been removed and are ignored" in warning.call_args.args[0]
+    assert "rbln-use-batch-attn-opt" not in parser.format_help()
+
+
+def test_absent_batch_attention_settings_do_not_warn(monkeypatch):
+    monkeypatch.delenv("VLLM_RBLN_BATCH_ATTN_OPT", raising=False)
+    with patch("vllm_rbln.config.logger.warning_once") as warning:
+        build_rbln_config()
+    warning.assert_not_called()
 
 
 def test_a_config_of_the_other_path_is_rejected():
