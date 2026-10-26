@@ -33,31 +33,31 @@ LAYER = "model.layers.1.linear_attn"
 
 
 class TestStateRows:
-    def test_blocks_keep_their_rows_while_live(self):
+    def test_blocks_keep_their_rows_until_released(self):
         rows = RBLNGDNStateRows(num_live=3)
-        assert rows.rows([7], live={7}, batch=1) == [0]
-        assert rows.rows([7, 9], live={7, 9}, batch=2) == [0, 1]
-        # 9 was prefilled alone; both come back on the rows they took.
-        assert rows.rows([9, 7], live={7, 9}, batch=4) == [1, 0, 5, 6]
+        assert rows.rows([7], batch=1) == [0]
+        # 9 is prefilled while 7 waits: 7 keeps its row.
+        assert rows.rows([9], batch=1) == [1]
+        assert rows.rows([9, 7], batch=4) == [1, 0, 5, 6]
 
-    def test_a_finished_block_frees_its_row(self):
+    def test_a_released_block_frees_its_row(self):
         rows = RBLNGDNStateRows(num_live=2)
-        rows.rows([7, 9], live={7, 9}, batch=2)
-        # 7 finished: its row goes to the next new block.
-        assert rows.rows([9, 4], live={9, 4}, batch=2) == [1, 0]
+        rows.rows([7, 9], batch=2)
+        rows.release([7, 3])
+        assert rows.rows([9, 4], batch=2) == [1, 0]
         assert rows.row_of == {9: 1, 4: 0}
 
     def test_the_null_block_takes_a_scratch_row_per_position(self):
         # A dummy run schedules block 0 on every position; a decode pads with it.
         rows = RBLNGDNStateRows(num_live=2)
-        assert rows.rows([0, 0], live=set(), batch=2) == [2, 3]
+        assert rows.rows([0, 0], batch=2) == [2, 3]
         assert rows.row_of == {}
 
     def test_no_free_row_is_an_error(self):
         rows = RBLNGDNStateRows(num_live=1)
-        rows.rows([7], live={7}, batch=1)
+        rows.rows([7], batch=1)
         with pytest.raises(RuntimeError, match="no free GatedDeltaNet state row"):
-            rows.rows([9], live={7, 9}, batch=1)
+            rows.rows([9], batch=1)
 
 
 def _layer():
@@ -106,14 +106,15 @@ class TestBuilder:
     def test_state_shapes_follow_the_kernels(self, builder):
         state = builder.states[LAYER]
         # 4 live rows + 4 scratch rows; 4 fp32 heads are 128 R1 rows each
-        assert state.conv_state.shape == (8, 3, 16, 64)
+        assert state.conv_q.shape == state.conv_k.shape == (8, 3, 4, 64)
+        assert state.conv_v.shape == (8, 3, 8, 64)
         assert state.ssm_state.shape == (8, gdn_state_rows(4, torch.float32), 512)
         assert state.ssm_state.dtype == torch.uint8
         assert state.conv_width == 3
 
     def test_first_prefill_chunk(self, builder):
         positions = torch.arange(128)
-        md = builder.build(_common([70], [70], [7]), positions, 1, True, [7])
+        md = builder.build(_common([70], [70], [7]), positions, 1, True)
         assert md.is_prefill and md.batch_size == 1 and md.seq_len == 128
         assert md.state_index.tolist() == [0]
         assert md.has_initial_state.tolist() == [0]
@@ -123,17 +124,15 @@ class TestBuilder:
 
     def test_later_prefill_chunk_carries_state(self, builder):
         positions = torch.arange(70, 70 + 58)
-        md = builder.build(_common([58], [128], [7]), positions, 1, True, [7])
+        md = builder.build(_common([58], [128], [7]), positions, 1, True)
         assert md.has_initial_state.tolist() == [1]
         assert md.seq_idx.tolist() == [70] and md.query_len.tolist() == [58]
 
     def test_decode_pads_the_batch_onto_scratch_rows(self, builder):
-        builder.build(_common([70], [70], [7]), torch.arange(128), 1, True, [7])
-        builder.build(_common([5], [5], [3]), torch.arange(128), 1, True, [7, 3])
+        builder.build(_common([70], [70], [7]), torch.arange(128), 1, True)
+        builder.build(_common([5], [5], [3]), torch.arange(128), 1, True)
         positions = torch.tensor([128, 5])
-        md = builder.build(
-            _common([1, 1], [129, 6], [7, 3]), positions, 4, False, [7, 3]
-        )
+        md = builder.build(_common([1, 1], [129, 6], [7, 3]), positions, 4, False)
         assert not md.is_prefill and md.batch_size == 4 and md.seq_len == 1
         assert md.state_index.tolist() == [0, 1, 6, 7]
         assert md.seq_idx.tolist() == [128, 5, 0, 0]
@@ -143,7 +142,7 @@ class TestBuilder:
 
     def test_staging_buffers_are_reused(self, builder):
         positions = torch.arange(128)
-        first = builder.build(_common([70], [70], [7]), positions, 1, True, [7])
-        second = builder.build(_common([58], [128], [7]), positions, 1, True, [7])
+        first = builder.build(_common([70], [70], [7]), positions, 1, True)
+        second = builder.build(_common([58], [128], [7]), positions, 1, True)
         assert first.query_len.data_ptr() == second.query_len.data_ptr()
         assert second.query_len.tolist() == [58]

@@ -14,6 +14,7 @@
 
 import torch
 import torch.nn.functional as F
+from vllm import ir
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
@@ -31,7 +32,11 @@ _TARGET = f"{_MODULE}.QwenGatedDeltaNetAttention"
 
 
 def _l2norm(x: torch.Tensor) -> torch.Tensor:
-    return x * torch.rsqrt(x.float().pow(2).sum(-1, keepdim=True) + 1e-6).to(x.dtype)
+    """x * rsqrt(sum(x^2) + 1e-6) as vLLM's rms_norm op (eps / D) scaled by
+    D ** -0.5: the compiler lowers that op as one norm that stays cut on the
+    heads, where a [..., 1] sum is packed across tokens and heads."""
+    dim = x.shape[-1]
+    return ir.ops.rms_norm(x, None, 1e-6 / dim) * dim**-0.5
 
 
 @register_patch(
@@ -76,30 +81,44 @@ def patched_gdn_forward(
     # kernels need the explicit [batch, seq, ...] views.
     mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
     gates, _ = self.in_proj_ba(hidden_states)
-    mixed_qkv, z = mixed_qkvz.split([channels, value_dim], dim=-1)
+    q, k, v, z = mixed_qkvz.split([key_dim, key_dim, value_dim, value_dim], dim=-1)
     b, a = gates.chunk(2, dim=-1)
-
     conv_weight = self.conv1d.weight.view(channels, self.conv_kernel_size)
-    conv_out = torch.ops.rbln_custom_ops.kda_conv(
-        mixed_qkv.reshape(batch, seq_len, channels),
-        conv_weight.to(mixed_qkv.dtype),
-        state.conv_state,
-        metadata.state_index,
-        metadata.seq_idx,
-        metadata.query_len,
-        metadata.has_initial_state,
-        state.conv_width,
-    )
-    query, key, value = conv_out.split([key_dim, key_dim, value_dim], dim=-1)
+    conv_weight = conv_weight.to(mixed_qkvz.dtype)
+    # Sliced, not split: the compiler folds a slice into a constant RSD can
+    # cut, but leaves the last part of a split as an op it cannot.
+    w_q = conv_weight[:key_dim]
+    w_k = conv_weight[key_dim : 2 * key_dim]
+    w_v = conv_weight[2 * key_dim :]
+
+    # One conv per q / k / v: RSD then cuts each one's channels on its heads,
+    # where a cut of the q|k|v channels would not fall on head boundaries.
+    def conv(x, weight, ring):
+        return torch.ops.rbln_custom_ops.kda_conv(
+            x.reshape(batch, seq_len, -1),
+            weight,
+            ring,
+            metadata.state_index,
+            metadata.seq_idx,
+            metadata.query_len,
+            metadata.has_initial_state,
+            state.conv_width,
+        )
+
     # The KDA core takes one q / k per value head, L2-normalized by the caller.
+    # Not the kernel's norm_inputs: its zero-row constant shares a content key
+    # with decode-only constants, which then stay on the device and fail the
+    # weight reuse check.
     query, key = (
-        _l2norm(x.reshape(batch, seq_len, heads_k, 1, head_dim))
+        _l2norm(conv(x, w, ring).view(batch * seq_len, heads_k, head_dim))
+        .view(batch, seq_len, heads_k, 1, head_dim)
         .expand(batch, seq_len, heads_k, ratio, head_dim)
         .reshape(batch, seq_len, heads_v, head_dim)
         .transpose(1, 2)
-        for x in (query, key)
+        for x, w, ring in ((q, w_q, state.conv_q), (k, w_k, state.conv_k))
     )
-    value = value.reshape(batch, seq_len, heads_v, head_dim).transpose(1, 2)
+    value = conv(v, w_v, state.conv_v).view(batch, seq_len, heads_v, head_dim)
+    value = value.transpose(1, 2)
 
     beta = torch.sigmoid(b).reshape(batch, seq_len, heads_v).transpose(1, 2)
     g = -torch.exp(self.A_log.float()) * F.softplus(a.float() + self.dt_bias.float())

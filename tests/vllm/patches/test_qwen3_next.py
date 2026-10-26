@@ -127,7 +127,7 @@ def vllm_config():
 
 
 def _run(layer, vllm_config, builder, hidden, common, positions, is_prefill, batch_pad):
-    metadata = builder.build(common, positions, batch_pad, is_prefill, [BLOCK])
+    metadata = builder.build(common, positions, batch_pad, is_prefill)
     with set_forward_context({PREFIX: metadata}, vllm_config):
         return patched_gdn_forward(layer, hidden)
 

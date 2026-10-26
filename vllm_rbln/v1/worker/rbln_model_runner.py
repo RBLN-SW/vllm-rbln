@@ -346,6 +346,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
         # indexes: [kv_cache_group_id][attn_group]
         self.attn_groups: list[list[AttentionGroup]] = []
+        # The GatedDeltaNet group whose blocks key the state rows, and its builder.
+        self.gdn_rows: tuple[int, RBLNGDNAttentionMetadataBuilder] | None = None
 
         # Set up speculative decoding.
         # NOTE(Jiayi): We put the entire draft model on the last PP rank.
@@ -621,6 +623,18 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
     def _update_states(self, scheduler_output: RBLNSchedulerOutput) -> None:
         """Update the cached states and the persistent batch with the scheduler
         output."""
+        if self.gdn_rows is not None:
+            # The scheduler freed these requests' blocks; their state rows go
+            # back before this step's blocks are mapped.
+            gid, gdn_builder = self.gdn_rows
+            gone = scheduler_output.finished_req_ids | set(
+                scheduler_output.preempted_req_ids or ()
+            )
+            gdn_builder.release(
+                self.requests[req_id].block_ids[gid][0]
+                for req_id in gone
+                if req_id in self.requests and self.requests[req_id].block_ids[gid]
+            )
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
@@ -1088,6 +1102,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
         spec_decode_common_attn_metadata = None
+        gdn_metadata = None
         for kv_cache_gid, _ in enumerate(kv_cache_groups):
             cm = copy(cm_base)  # shallow copy
 
@@ -1108,19 +1123,16 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 attn_group = self.attn_groups[kv_cache_gid][attn_gid]
                 builder = attn_group.get_metadata_builder(0)
                 if isinstance(builder, RBLNGDNAttentionMetadataBuilder):
-                    # The blocks every live request holds, so the builder frees
-                    # the rows of finished ones (the batch lists only the
-                    # scheduled requests).
-                    live_blocks = self.input_batch.block_table[kv_cache_gid]
-                    attn_metadata_i = builder.build(
-                        common_attn_metadata=cm,
-                        positions=self.positions,
-                        batch_pad=num_reqs_padded,
-                        is_prefill=self.is_prefill,
-                        live_blocks=live_blocks.get_cpu_tensor()[
-                            : self.input_batch.num_reqs, 0
-                        ].tolist(),
-                    )
+                    # The first GatedDeltaNet group's metadata serves them all
+                    # (see initialize_metadata_builders).
+                    if gdn_metadata is None:
+                        gdn_metadata = builder.build(
+                            common_attn_metadata=cm,
+                            positions=self.positions,
+                            batch_pad=num_reqs_padded,
+                            is_prefill=self.is_prefill,
+                        )
+                    attn_metadata_i = gdn_metadata
                 else:
                     assert isinstance(builder, RBLNFlashAttentionMetadataBuilder)
                     attn_metadata_i = builder.build(
@@ -3036,6 +3048,23 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     else None,
                     num_metadata_builders=1,  # not use ubatching
                 )
+
+        # Every GatedDeltaNet group holds one block a request for the same
+        # requests, so the first group's row map and step tensors serve every
+        # group: one set of step inputs lets the compiler build the conv rings'
+        # index tables once a step rather than once a layer.
+        gdn_builders = [
+            (gid, builder)
+            for gid, groups in enumerate(self.attn_groups)
+            for group in groups
+            if isinstance(
+                builder := group.get_metadata_builder(0),
+                RBLNGDNAttentionMetadataBuilder,
+            )
+        ]
+        for _, builder in gdn_builders[1:]:
+            gdn_builders[0][1].states.update(builder.states)
+        self.gdn_rows = gdn_builders[0] if gdn_builders else None
 
         # Initialize drafter attention backend.
         if isinstance(self.drafter, DRAFT_MODEL_PROPOSERS):
