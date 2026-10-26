@@ -42,10 +42,18 @@ if TYPE_CHECKING:
 
 
 def is_prefill(request: Request) -> bool:
-    return request.num_computed_tokens < request.num_tokens - 1
+    return (
+        request.num_computed_tokens == 0
+        or request.num_computed_tokens < request.num_tokens - 1
+    )
 
 
 def step_is_prefill(scheduler_output: SchedulerOutput) -> bool:
+    if any(req.num_computed_tokens == 0 for req in scheduler_output.scheduled_new_reqs):
+        return True
+    if 0 in scheduler_output.scheduled_cached_reqs.num_computed_tokens:
+        # Resumed from preemption, recomputing from the start.
+        return True
     return any(
         num_base_tokens(
             scheduler_output.num_scheduled_tokens,

@@ -520,7 +520,7 @@ class RBLNGlm5NextKDA(nn.Module):
                 )[:, :, :tokens]
             elif self.drafts is None:
                 o = torch.ops.rbln_custom_ops.kda_decode(
-                    qj, kj, vj, gj, bj, state, load, has_initial_state, None, store
+                    qj, kj, vj, gj, bj, state, load, None, store
                 )
             else:
                 assert tokens == self.num_drafts + 1, tokens
@@ -534,7 +534,6 @@ class RBLNGlm5NextKDA(nn.Module):
                     self.drafts[j].inputs(),
                     load,
                     metadata.num_accepted.view(-1),
-                    has_initial_state,
                     None,
                     load,
                     store,
