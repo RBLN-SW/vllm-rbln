@@ -172,30 +172,21 @@ def test_removed_batch_attention_env_warns_and_is_ignored(monkeypatch, raw):
         assert build_rbln_config() == RBLNConfig()
     warning.assert_called_once()
     assert "VLLM_RBLN_BATCH_ATTN_OPT" in warning.call_args.args[0]
-    assert "have been removed and are ignored" in warning.call_args.args[0]
+    assert "has been removed and is ignored" in warning.call_args.args[0]
 
 
 @pytest.mark.parametrize("value", [True, False])
-def test_removed_batch_attention_key_warns_and_preserves_other_settings(value):
-    given = {"use_batch_attn_opt": value, "use_w8a8": True}
-    with patch("vllm_rbln.config.logger.warning_once") as warning:
-        assert build_rbln_config(given).use_w8a8 is True
+def test_removed_batch_attention_key_warns_before_rejection(value):
+    with (
+        patch("vllm_rbln.config.logger.warning_once") as warning,
+        pytest.raises(ValueError, match="use_batch_attn_opt.*are not fields"),
+    ):
+        build_rbln_config({"use_batch_attn_opt": value})
     warning.assert_called_once()
-    assert "additional_config.use_batch_attn_opt" in warning.call_args.args[0]
-    assert "have been removed and are ignored" in warning.call_args.args[0]
-    assert given == {"use_batch_attn_opt": value, "use_w8a8": True}
-
-
-@pytest.mark.parametrize(
-    "flag", ["--rbln-use-batch-attn-opt", "--no-rbln-use-batch-attn-opt"]
-)
-def test_removed_batch_attention_flag_warns_and_is_hidden(parser, flag):
-    with patch("vllm_rbln.config.logger.warning_once") as warning:
-        assert resolve(parser, [flag]) == RBLNConfig()
-    warning.assert_called_once()
-    assert flag in warning.call_args.args[0]
-    assert "have been removed and are ignored" in warning.call_args.args[0]
-    assert "rbln-use-batch-attn-opt" not in parser.format_help()
+    assert (
+        "additional_config.use_batch_attn_opt has been removed"
+        in warning.call_args.args[0]
+    )
 
 
 def test_absent_batch_attention_settings_do_not_warn(monkeypatch):
