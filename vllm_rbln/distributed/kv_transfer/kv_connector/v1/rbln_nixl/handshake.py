@@ -470,7 +470,8 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         already expresses. What the first refusal below adds is head-band matching,
         where bands computed from the configured KV-head count give plausible
         wrong descriptors. A latent beside attention is the same on every rank,
-        so whichever path builds the lists, a rank offset or a band misplaces it.
+        so on D2D a band misplaces it. Host staging does not record which
+        regions are latents; it refuses an engine whose page sizes differ.
         """
         if self.use_mla and self._is_head_matched_peer(remote_tp_size):
             raise RuntimeError(
@@ -978,13 +979,12 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                             )
                         )
                     else:
-                        # add_remote_agent registers the peer here: equal TP, or
-                        # another TP on our own lists. The pairing check divides
-                        # what the peer published by its layers, which the trim
-                        # below would make our own; the latent refusal has to come
-                        # before the peer is registered.
+                        # Equal TP delegates to upstream, which needs a wider
+                        # stage trimmed to our band (_trim_agent_meta_to_layers).
+                        # The pairing check divides the peer's regions by its
+                        # layers and the trim makes that quotient our own, so it
+                        # runs first, on what the peer published.
                         self._check_d2d_region_pairing(metadata, remote_tp_size)
-                        self._check_mla_constraints(metadata, remote_tp_size)
                         agent = self.add_remote_agent(
                             self._trim_agent_meta_to_layers(metadata, overlap)
                             if partial

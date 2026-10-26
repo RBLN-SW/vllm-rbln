@@ -77,6 +77,10 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
     Piece,
     RegionGeometry,
 )
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_transfer_topology import (
+    RblnTransferTopology,
+)
+from vllm_rbln.v1.attention.backends.minimax_m3 import RBLNMiniMaxM3SparseBackend
 
 
 def _impl_layer_spec(page_size_bytes=4096, num_kv_heads=8):
@@ -1081,6 +1085,131 @@ class TestRegisterKvCachesImpl:
         assert [worker._region_halves(r) for r in range(2)] == [2, 1]
         # A chunk range cuts the latent's one run per token span, not two.
         assert worker._block_runs() == [(1, 4), (4, 1)]
+
+    def test_the_real_topology_names_each_kind_s_bytes_in_both_lists(self, monkeypatch):
+        # Real routing and registration, then both lists of an equal-TP peer:
+        # a block's rows name the whole attention area and the latent area; a
+        # chunk's rows name its tokens in each attention half and head, and in
+        # the one latent area that holds them.
+        tokens, chunk, width = 64, 8, 66
+        worker = _prep_impl_worker(
+            monkeypatch, chunk_mode=True, specs=[MagicMock(spec=FullAttentionSpec)]
+        )
+        worker.attn_backends = [RBLNMiniMaxM3SparseBackend]
+        worker.vllm_config.scheduler_config.max_num_batched_tokens = chunk
+        target = _impl_layer_spec(page_size_bytes=4096, num_kv_heads=8)
+        latent = MagicMock(spec=MLAAttentionSpec)
+        latent.page_size_bytes = tokens * width
+        latent.num_kv_heads = 1
+        worker._layer_specs = {"l0": target, "l1": latent}
+        (attention,) = _impl_kv_caches(
+            num_blocks=worker.num_blocks, names=("l0",)
+        ).values()
+        attention.shape = (worker.num_blocks, 2, 8, 1, tokens, 64)
+        indexer = _mla_kv_caches(
+            num_blocks=worker.num_blocks,
+            base_ptr=0x30000,
+            page_size_bytes=tokens * width,
+        )["l0"]
+
+        with _registering(
+            worker,
+            None,
+            buffers=_impl_buffers(areas=4, slices=4),
+            topology_cls=RblnTransferTopology,
+        ):
+            worker._register_kv_caches_impl({"l0": attention, "l1": indexer})
+            # Upstream's class is faked here, so its fields are what
+            # registration hands it; ours ride the metadata registration
+            # publishes.
+            base = registration.NixlAgentMetadata.call_args.kwargs
+            published = registration.msgspec.msgpack.Encoder.return_value.encode
+            (ours,) = published.call_args.args
+
+        names = ("l0", "l1")
+        # Upstream's `__init__` and `register_kv_caches` set these; this test
+        # bypasses both.
+        worker.local_seen_layer_names = list(names)
+        worker._group_spec_types = [FullAttentionSpec]
+        worker._transfer_layer_region_indices = []
+        worker._register_shard_xfer_state("peer", 0, worker.block_size, names)
+        local = worker.nixl_wrapper.get_xfer_descs.call_args.args[0]
+        # The peer is what this engine publishes, at other addresses and with
+        # more blocks.
+        shift, peer_blocks = 0x1000000000, worker.num_blocks + 8
+        peer = RblnNixlAgentMetadata(
+            **{
+                **base,
+                "engine_id": "peer",
+                "num_blocks": peer_blocks,
+                "region_num_blocks": [peer_blocks] * len(base["kv_caches_base_addr"]),
+                "kv_caches_base_addr": [
+                    addr + shift for addr in base["kv_caches_base_addr"]
+                ],
+            },
+            kv_area_slices=ours.kv_area_slices,
+            kv_split_axes=ours.kv_split_axes,
+            kv_per_block=ours.kv_per_block,
+        )
+        # What the equal-TP branch asks of a peer before it registers one.
+        worker._check_d2d_region_pairing(peer, 1)
+        worker._check_split_axis_constraints(peer, 1)
+        remote = worker._build_fa_remote(
+            MagicMock(source_ranks_per_group=[(0,)], rank_offset_factor=0), peer, 1
+        )
+
+        bases = [
+            _area_base(entry, a) for entry in (attention, indexer) for a in range(4)
+        ]
+        lens = [1024] * 4 + [tokens // 4 * width] * 4
+        span = tokens // 4
+        # An attention area holds K then V, two heads each, a head's tokens
+        # inside it; a latent area holds one token span of the key alone.
+        head_run = tokens * 4
+
+        def check(local_ids, remote_ids, expected):
+            named = [(int(local[i][0]), int(local[i][1])) for i in local_ids]
+            assert sorted(named) == sorted(expected)
+            # The two lists pair by position.
+            assert [(int(remote[i][0]), int(remote[i][1])) for i in remote_ids] == [
+                (addr + shift, length) for addr, length in named
+            ]
+
+        for block in (0, 5):
+            check(
+                worker._get_block_descs_ids_for_shard(
+                    "peer", 0, worker.num_blocks, [[block]]
+                ),
+                worker._get_block_descs_ids_for_shard(
+                    "peer", 0, peer_blocks, [[block]]
+                ),
+                [(bases[r] + block * lens[r], lens[r]) for r in range(8)],
+            )
+            for c in range(tokens // chunk):
+                check(
+                    worker._chunk_descs_ids_for_shard(
+                        "peer", 0, worker.num_blocks, block, (c, c + 1)
+                    ),
+                    worker._chunk_descs_ids_for_shard(
+                        "peer", 0, peer_blocks, block, (c, c + 1)
+                    ),
+                    [
+                        (
+                            bases[a] + block * 1024 + run * head_run + c * chunk * 4,
+                            chunk * 4,
+                        )
+                        for a in range(4)
+                        for run in range(4)
+                    ]
+                    + [
+                        (
+                            bases[4 + c * chunk // span]
+                            + block * span * width
+                            + (c * chunk % span) * width,
+                            chunk * width,
+                        )
+                    ],
+                )
 
     def test_a_latent_beside_split_attention_is_refused(self, monkeypatch):
         # Split K and V make an attention layer two regions against the

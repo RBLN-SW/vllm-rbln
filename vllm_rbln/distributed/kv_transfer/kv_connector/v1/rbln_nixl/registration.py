@@ -680,7 +680,9 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
                 axes = set()
                 for frame, reads_a_window in frames:
                     if head_dim is None:
-                        # A latent has no head to cut: CP is the op's only mode.
+                        # A latent has no head to cut, so its cut is taken to be
+                        # on tokens: MLA's only mode, and assumed to be the same
+                        # for the MSA indexer.
                         axes.add(ChipletSplitAxis.TOKEN)
                         continue
                     heads, tokens = frame[head_dim], frame[token_dim]
@@ -908,9 +910,10 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
             # per-region lengths; what still requires it is this side.
             raise RuntimeError(
                 "RBLN NIXL: host staging cannot register KV caches whose "
-                f"per-layer size differs (got {sorted(page_sizes)}), which is "
-                "what a speculative draft model with its own "
-                "num_key_value_heads produces. The head bands this path "
+                f"per-layer size differs (got {sorted(page_sizes)}), which a "
+                "speculative draft model with its own num_key_value_heads "
+                "produces, as does a key-only latent beside attention layers "
+                "(an MSA indexer). The head bands this path "
                 "derives below give every layer the same number of regions "
                 "and the same band, so a differing layer would be addressed "
                 "by another's geometry. Use kv_buffer_device='rbln'."

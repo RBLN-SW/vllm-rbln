@@ -1021,31 +1021,6 @@ class TestPpHandshakeFanout:
 
         assert agents == {(0, 0): "n0"}
 
-    @pytest.mark.parametrize(
-        "pp_size, local_tp, peer_tp",
-        # A pipelined peer reaches this branch only at a smaller TP than ours.
-        [(1, 1, 2), (4, 2, 1)],
-    )
-    def test_a_latent_on_the_engine_s_own_lists_is_refused_unregistered(
-        self, pp_size, local_tp, peer_tp
-    ):
-        # A peer not paired by head band takes the branch that registers it,
-        # so the latent refusal has to come before it hands the peer over.
-        w = _make_worker(host_buffer=False)
-        w.transfer_topo.tp_ratio.side_effect = lambda r: (
-            local_tp // r if r <= local_tp else -(r // local_tp)
-        )
-        w._is_head_matched_peer = MagicMock(return_value=False)
-        w._check_d2d_region_pairing = MagicMock()
-        w._logical_region_latent = [False, True, False]
-
-        with pytest.raises(RuntimeError, match="key-only latent region"):
-            _handshake(
-                w, _FakeSock(pp_size=pp_size, tp_size=peer_tp), remote_tp_size=peer_tp
-            )
-
-        w.add_remote_agent.assert_not_called()
-
     def test_a_split_region_alone_forces_the_per_shard_path(self):
         # Companion to test_a_finer_peer_alone_forces_the_per_shard_path: here
         # nothing narrows either, but our region spans several of the peer's
@@ -4936,7 +4911,8 @@ class TestARefusedPeerLeavesNothingBehind:
     ):
         # Named before the bands are read: the peer's latent is cut into more
         # slices than its attention, which no one band describes. Entered where
-        # the handshake enters, for a peer of one stage and of several.
+        # the handshake enters, for a peer of one stage and of several -- the
+        # validator beside it branches on `pp_size <= 1`, and the check must not.
         w = self._mixed_worker()
         del w._is_head_matched_peer
         meta = _agent_meta(
