@@ -97,6 +97,26 @@ def _validate(vllm_config: "VllmConfig") -> None:
             f"RBLN; got dtype={model_config.dtype}. Pass --dtype bfloat16."
         )
 
+    if text_config.model_type == "glm5_next_text":
+        if parallel_config.tensor_parallel_size != 1:
+            raise ValueError(
+                "GLM-5.3 runs at tensor parallel size 1 on RBLN; scale it with "
+                "--data-parallel-size and --enable-expert-parallel."
+            )
+        if not vllm_config.cache_config.cache_dtype.startswith("fp8"):
+            raise ValueError(
+                "GLM-5.3 needs an fp8 KV cache on RBLN; pass --kv-cache-dtype fp8."
+            )
+        spec = vllm_config.speculative_config
+        if spec is not None and (
+            spec.method != "mtp" or spec.num_speculative_tokens != 1
+        ):
+            raise ValueError(
+                "GLM-5.3 speculative decoding on RBLN runs its MTP head with "
+                f"num_speculative_tokens=1 only; got method={spec.method!r}, "
+                f"num_speculative_tokens={spec.num_speculative_tokens}."
+            )
+
     if rbln_config.compile_dtype:
         from vllm_rbln.compilation import check_dtype_option_supported
 
