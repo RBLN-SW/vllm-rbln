@@ -78,6 +78,9 @@ def build_kv_cache_base_bindings(
             base_tensors.append(base_tensor)
 
         view_info = kv_cache_view_infos_by_layer[layer_name]
+        if view_info.view_dtype == base_tensors[base_index].dtype:
+            # Only layers of another dtype on the base's extent take a dtype view.
+            view_info = replace(view_info, view_dtype=None)
         if view_info.dynamic_axis is not None and view_info.view_shape is not None:
             axis = view_info.dynamic_axis
             # materialize_kv_cache_view reads the extent after the dtype view.
