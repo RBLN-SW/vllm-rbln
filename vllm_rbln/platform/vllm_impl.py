@@ -82,15 +82,6 @@ def _validate(vllm_config: "VllmConfig") -> None:
     if vllm_config.lora_config is not None:
         raise ValueError("LoRA is not supported on RBLN.")
 
-    if model_config.uses_mrope and model_config.supports_multimodal_inputs:
-        # The runner hands the model `[batch, seq]` positions; a multimodal
-        # prompt needs the `[3, batch, seq]` T/H/W positions it does not build.
-        raise ValueError(
-            "Multimodal inputs to an M-RoPE model (e.g. the Qwen2-VL and Qwen3.5 "
-            "families) are not supported on the RBLN vLLM path yet. Run it "
-            "text-only with --language-model-only, or use the optimum path."
-        )
-
     if _uses_linear_attention(model_config):
         if scheduler_config.max_num_batched_tokens % 128:
             raise ValueError(

@@ -33,6 +33,7 @@ from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.models.interfaces import (
+    SupportsMRoPE,
     SupportsMultiModal,
     supports_eagle3,
     supports_realtime,
@@ -298,6 +299,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.cascade_attn_enabled = not self.model_config.disable_cascade_attn
         # Set in load_model by _resolve_mm_support.
         self.supports_mm_inputs = False
+        # [3, tokens]: the T / H / W positions of an M-RoPE model that takes
+        # images (load_model); None when the model reads plain positions.
+        self.mrope_positions: torch.Tensor | None = None
 
         self.encoder_cache: dict[str, torch.Tensor] = {}
 
@@ -703,6 +707,16 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 lora_request=new_req_data.lora_request,
             )
             self.requests[req_id] = req_state
+            if self.mrope_positions is not None:
+                assert req_state.prompt_token_ids is not None, (
+                    "M-RoPE positions need the prompt's token ids"
+                )
+                (
+                    req_state.mrope_positions,
+                    req_state.mrope_position_delta,
+                ) = cast(SupportsMRoPE, self.model).get_mrope_input_positions(
+                    req_state.prompt_token_ids, req_state.mm_features
+                )
 
             if sampling_params and sampling_params.prompt_logprobs is not None:
                 self.num_prompt_logprobs[req_id] = (
@@ -957,6 +971,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             arange,
             out=positions_np,
         )
+        if self.mrope_positions is not None:
+            self._fill_mrope_positions(num_reqs, positions_np, cu_num_tokens)
 
         # Get token indices.
         # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
@@ -1049,6 +1065,27 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             query_lengths,
             total_query_tokens,
         )
+
+    def _fill_mrope_positions(
+        self, num_reqs: int, positions_np: np.ndarray, cu_num_tokens: np.ndarray
+    ) -> None:
+        """The M-RoPE positions of this step's tokens: the request's precomputed
+        ones inside its prompt, the text position + the request's delta after."""
+        assert self.mrope_positions is not None
+        mrope_np = self.mrope_positions.numpy()
+        start = 0
+        for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+            req = self.requests[req_id]
+            assert req.mrope_positions is not None
+            assert req.mrope_position_delta is not None
+            end = int(cu_num_tokens[i])
+            text = positions_np[start:end]
+            in_prompt = text < req.mrope_positions.shape[1]
+            mrope_np[:, start:end] = text + req.mrope_position_delta
+            mrope_np[:, start:end][:, in_prompt] = req.mrope_positions[
+                :, text[in_prompt]
+            ].numpy()
+            start = end
 
     def _build_attention_metadata(
         self,
@@ -1354,6 +1391,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # For text-only models
         input_ids = self.input_ids[:num_input_tokens].view(num_reqs, -1)
         positions = self.positions[:num_input_tokens].view(num_reqs, -1)
+        if self.mrope_positions is not None:
+            positions = self.mrope_positions[:, :num_input_tokens].view(3, num_reqs, -1)
         inputs_embeds = None
 
         if get_pp_group().is_first_rank:
@@ -2409,6 +2448,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 vllm_config=self.vllm_config, model_config=self.model_config
             )
         self.supports_mm_inputs = self._resolve_mm_support()
+        if self.supports_mm_inputs and self.model_config.uses_mrope:
+            self.mrope_positions = torch.zeros(
+                3, self.max_num_tokens, dtype=torch.int64
+            )
 
         if hasattr(self.model, "logits_processor"):
             self.logits_processor = self.model.logits_processor
@@ -2797,7 +2840,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         input_ids = self.input_ids[:num_tokens]
         inputs_embeds = None
-        positions = self.positions[:num_tokens]
+        positions = self.positions[:num_tokens].view(num_reqs, target_query_len)
+        if self.mrope_positions is not None:
+            positions = positions.expand(3, num_reqs, target_query_len)
         token_indices: torch.Tensor | None = None
         if self.use_wrapped_compute_logits and is_prefill:
             token_indices = torch.arange(
@@ -2828,7 +2873,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # NOTE(RBLN): Clone tensors to make tensors non-view tensors.
         staged_model_input = self.input_stager.stage(
             input_ids=input_ids.view(num_reqs, target_query_len),
-            positions=positions.view(num_reqs, target_query_len),
+            positions=positions,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
             token_indices=token_indices,

@@ -474,27 +474,6 @@ class TestRejectedConfigs:
                 reconfigure(msa(dtype))
         reconfigure(msa(torch.bfloat16))
 
-    def test_mrope_models_run_text_only(self, reconfigure, monkeypatch):
-        # The runner builds [batch, seq] positions, which is exact for text: the
-        # three M-RoPE axes coincide. Only a multimodal prompt needs more.
-        from vllm.config import ModelConfig
-
-        monkeypatch.setattr(ModelConfig, "uses_mrope", property(lambda self: True))
-        monkeypatch.setattr(
-            ModelConfig, "supports_multimodal_inputs", property(lambda self: False)
-        )
-        reconfigure(lambda config: None)
-
-    def test_mrope_models_reject_multimodal_inputs(self, reconfigure, monkeypatch):
-        from vllm.config import ModelConfig
-
-        monkeypatch.setattr(ModelConfig, "uses_mrope", property(lambda self: True))
-        monkeypatch.setattr(
-            ModelConfig, "supports_multimodal_inputs", property(lambda self: True)
-        )
-        with pytest.raises(ValueError, match="M-RoPE"):
-            reconfigure(lambda config: None)
-
     @pytest.fixture
     def gdn(self, monkeypatch):
         """The hook sees a GatedDeltaNet model with Qwen3.5-4B's 32 value heads."""

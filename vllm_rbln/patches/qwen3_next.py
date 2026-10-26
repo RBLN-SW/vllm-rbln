@@ -22,6 +22,7 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
 from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
 
 from vllm_rbln.patches import register_patch
+from vllm_rbln.patches.registry import add_registration
 from vllm_rbln.v1.attention.backends.gdn import (
     GDN_HEAD_DIM,
     RBLNGDNAttentionMetadata,
@@ -29,6 +30,22 @@ from vllm_rbln.v1.attention.backends.gdn import (
 
 _MODULE = "vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn"
 _TARGET = f"{_MODULE}.QwenGatedDeltaNetAttention"
+
+
+@add_registration(
+    reason=(
+        "Upstream's Qwen3.5 merges image embeddings outside forward() and runs its "
+        "vision tower with cu_seqlens attention; the RBLN class merges them inside "
+        "the compiled graph and compiles the tower at one fixed patch bucket."
+    )
+)
+def register_qwen3_5() -> None:
+    from vllm.model_executor.models import ModelRegistry
+
+    ModelRegistry.register_model(
+        "Qwen3_5ForConditionalGeneration",
+        "vllm_rbln.model_executor.models.qwen3_5:RBLNQwen3_5ForConditionalGeneration",
+    )
 
 
 def _l2norm(x: torch.Tensor) -> torch.Tensor:
