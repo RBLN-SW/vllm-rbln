@@ -114,10 +114,18 @@ def placement_itemsize(dtype: str) -> int:
     return -(-bits // 8)
 
 
+def _erase_symbols(dim: Any) -> Any:
+    if isinstance(dim, (tuple, list)):
+        if dim and dim[0] == "symbol":
+            return ("symbol",)
+        return tuple(_erase_symbols(d) for d in dim)
+    return dim
+
+
 def _tensor_fingerprint(spec: Any) -> tuple:
     """What a KV input looks like regardless of how it is sharded."""
     placement = spec.physical_placement
-    return (tuple(spec.shape), tuple(placement.shape), str(placement.dtype))
+    return (tuple(spec.shape), _erase_symbols(placement.shape), str(placement.dtype))
 
 
 def _input_key(spec: Any) -> tuple:
@@ -127,7 +135,7 @@ def _input_key(spec: Any) -> tuple:
         *_tensor_fingerprint(spec),
         tuple(
             sorted(
-                (int(s.node_id), int(s.chiplet_id), tuple(s.slice_shape))
+                (int(s.node_id), int(s.chiplet_id), _erase_symbols(s.slice_shape))
                 for s in placement.shards
             )
         ),

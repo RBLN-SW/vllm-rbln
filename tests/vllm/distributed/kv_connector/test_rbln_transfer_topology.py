@@ -30,6 +30,10 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_transfer_topology im
 )
 from vllm_rbln.v1.attention.backends.flash_attention import RBLNFlashAttentionBackend
 from vllm_rbln.v1.attention.backends.mla.flashattn_mla import RBLNFlashAttnMLABackend
+from vllm_rbln.v1.attention.backends.mla.indexer import (
+    RBLNDeepseekV32IndexerBackend,
+    RBLNDeepseekV32IndexerScaleBackend,
+)
 
 
 class TestRblnTransferTopology:
@@ -77,6 +81,34 @@ class TestRblnTransferTopology:
 
         assert topo.cross_layers_blocks is False
         assert topo.local_physical_heads == 4
+
+    @pytest.mark.parametrize("use_custom_kernel", [False, True])
+    def test_the_attention_cache_names_its_head_and_token_dims(self, use_custom_kernel):
+        # The derived chiplet cut falls on one of these, so they have to be the
+        # dims of the cache the kernels lay out under either setting.
+        with self._kernel_config(use_custom_kernel):
+            topo = self._topology(RBLNFlashAttentionBackend)
+            shape = RBLNFlashAttentionBackend.get_kv_cache_shape(
+                num_blocks=3, block_size=5, num_kv_heads=7, head_size=11
+            )
+
+        assert (shape[topo.kv_head_dim], shape[topo.kv_token_dim]) == (7, 5)
+
+    @pytest.mark.parametrize(
+        "backend",
+        [
+            RBLNFlashAttnMLABackend,
+            RBLNDeepseekV32IndexerBackend,
+            RBLNDeepseekV32IndexerScaleBackend,
+        ],
+    )
+    def test_a_latent_cache_has_a_token_dim_and_no_head_dim(self, backend):
+        # The latent backends lay out no head axis and take only one head, so
+        # the probe cannot ask them for one.
+        topo = self._topology(backend, is_mla=True)
+
+        assert topo.kv_head_dim is None
+        assert topo.kv_token_dim == 1
 
     def test_an_mla_layer_stays_one_region(self):
         topo = self._topology(RBLNFlashAttnMLABackend, is_mla=True)

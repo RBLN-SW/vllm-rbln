@@ -411,6 +411,7 @@ DYNAMIC_KV_SUPPORTED_CONNECTORS = (
     "RblnNixlPullConnector",
     "RblnNixlPushConnector",
     "RBLNLMCacheConnectorV1",
+    "LMCacheMPConnector",
 )
 # vLLM's wrapper for running several connectors at once. It is not itself in the
 # set above because it registers nothing of its own: `register_kv_caches` and the
@@ -1011,6 +1012,77 @@ def get_rbln_planned_affinity_cpu_count(
         cpu_ids = [int(x.strip()) for x in local_omp_cpuid.split(",") if x.strip()]
         return max(1, len(cpu_ids))
     return max(1, len(os.sched_getaffinity(0)))
+
+
+def _read_cgroup_v2_quota(path: str) -> float | None:
+    try:
+        with open(os.path.join(path, "cpu.max")) as f:
+            quota, period = f.read().split()[:2]
+    except OSError:
+        return None
+    if quota == "max":
+        return None
+    return int(quota) / int(period)
+
+
+def _read_cgroup_v1_quota(path: str) -> float | None:
+    try:
+        with open(os.path.join(path, "cpu.cfs_quota_us")) as f:
+            quota = int(f.read())
+        with open(os.path.join(path, "cpu.cfs_period_us")) as f:
+            period = int(f.read())
+    except OSError:
+        return None
+    if quota <= 0 or period <= 0:
+        return None
+    return quota / period
+
+
+def get_cgroup_cpu_quota(
+    cgroup_root: str = "/sys/fs/cgroup", proc_cgroup: str = "/proc/self/cgroup"
+) -> float | None:
+    """CPUs this process may use under its cgroup CPU limit, or None if
+    unlimited.
+
+    A Kubernetes CPU limit is a CFS quota, not a cpuset, so it does not show
+    up in ``sched_getaffinity``.
+    """
+    quotas: list[float | None] = []
+    try:
+        with open(proc_cgroup) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        hierarchy_id, controllers, rel_path = line.split(":", 2)
+        if hierarchy_id == "0" and controllers == "":
+            path = os.path.normpath(cgroup_root + rel_path)
+            while path.startswith(cgroup_root):
+                quotas.append(_read_cgroup_v2_quota(path))
+                if path == cgroup_root:
+                    break
+                path = os.path.dirname(path)
+    for v1_dir in ("cpu", "cpu,cpuacct"):
+        quotas.append(_read_cgroup_v1_quota(os.path.join(cgroup_root, v1_dir)))
+    limits = [q for q in quotas if q is not None]
+    return min(limits) if limits else None
+
+
+def get_num_local_ranks(parallel_config: ParallelConfig) -> int:
+    """Worker processes on this node, which share the container's cgroup."""
+    return max(
+        1, parallel_config.local_world_size * parallel_config.data_parallel_size_local
+    )
+
+
+def get_default_num_threads(allocated_cpus: int, num_local_ranks: int = 1) -> int:
+    """Default torch/OpenMP thread count: half the usable CPUs (physical cores,
+    excluding HT siblings), capped by this rank's share of the cgroup CPU
+    quota."""
+    quota = get_cgroup_cpu_quota()
+    if quota is not None:
+        allocated_cpus = min(allocated_cpus, math.floor(quota / num_local_ranks))
+    return max(2, allocated_cpus // 2)
 
 
 def set_cpu_affinity(

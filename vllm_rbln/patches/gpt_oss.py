@@ -22,7 +22,7 @@ from vllm.model_executor.models.gpt_oss import MLPBlock
 from vllm_rbln import envs
 from vllm_rbln.patches import register_patch
 
-if envs.VLLM_RBLN_NESTED_COMPILE_REGION:
+if envs.VLLM_RBLN_USE_NESTED_COMPILE_REGION:
     from vllm.model_executor.models.gpt_oss import TransformerBlock
 
     register_patch(

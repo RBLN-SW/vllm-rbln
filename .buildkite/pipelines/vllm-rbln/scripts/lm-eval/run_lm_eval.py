@@ -13,13 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Score a target with lm-eval against a server this starts.
-
-The sweep behind the perf lane cannot be reused: it reads back a result file in
-its own format, which lm-eval does not write. Its ServerProcess can be, and is --
-starting a server, polling it, and killing the process group it leaves behind are
-the parts worth not reimplementing.
-"""
+"""Run isolated lm-eval launches and collect their scores in a target summary."""
 
 from __future__ import annotations
 
@@ -30,7 +24,6 @@ import os
 import subprocess
 import sys
 from collections.abc import Iterator
-from dataclasses import dataclass, field
 from datetime import datetime
 from importlib import metadata
 from pathlib import Path
@@ -43,44 +36,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from lane import (  # noqa: E402
     build_cmd,
+    case_status,
     device_count,
     devices_needed,
+    download_results,
     host_chip,
+    measured_pipeline,
     output_dir,
     publish_summary,
+    start_case,
     target_env,
     write_repro,
+    write_result,
 )
 
 _HERE = Path(__file__).resolve().parent
-
-
-@dataclass
-class _Summary:
-    """One target's launches. They evaluate the same model and differ only in how
-    it is parallelized, so their scores belong in one table, not one each."""
-
-    chip: str | None = None
-    facts: list[dict[str, str]] = field(default_factory=list)
-    rows: list[str] = field(default_factory=list)
-    notes: list[str] = field(default_factory=list)
-    degraded: bool = False
-
-
-# The launch directory's parent is the target, per the layout run_target builds.
-_SUMMARIES: dict[Path, _Summary] = {}
-
-
-def _summary_for(out: Path, chip: str | None) -> _Summary:
-    summary = _SUMMARIES.setdefault(out.parent, _Summary(chip=chip))
-    return summary
-
-
-def _note(out: Path, chip: str | None, note: str) -> None:
-    """Why a launch has no numbers, so it is not simply absent from the table."""
-    summary = _summary_for(out, chip)
-    summary.notes.append(f"- {out.name}: {note}")
-    summary.degraded = True
 
 
 def _facts(payload: dict[str, Any], tasks: list[str]) -> dict[str, str]:
@@ -100,69 +70,55 @@ def _facts(payload: dict[str, Any], tasks: list[str]) -> dict[str, str]:
     return facts
 
 
-def _record(
-    out: Path, chip: str | None, payload: dict[str, Any], tasks: list[str]
-) -> None:
-    """One row per (task, metric, filter). lm-eval keys them as ``metric,filter``
-    and puts the error bar under ``metric_stderr,filter``; without that bar a
-    reader treats a move inside it as a regression."""
-    summary = _summary_for(out, chip)
-    summary.facts.append(_facts(payload, tasks))
-    elapsed = "--"
-    with contextlib.suppress(TypeError, ValueError, KeyError):
-        elapsed = f"{float(payload['total_evaluation_time_seconds']):.0f}s"
-
-    for task in tasks:
-        scores = payload["results"].get(task) or {}
-        for key, value in sorted(scores.items()):
-            if "," not in key or "stderr" in key or not isinstance(value, float):
-                continue
-            metric, _, filter_name = key.partition(",")
-            stderr = scores.get(f"{metric}_stderr,{filter_name}")
-            error = f"±{stderr:.4f}" if isinstance(stderr, float) else "--"
-            summary.rows.append(
-                f"| {out.name} | {task} | {metric} | {filter_name} "
-                f"| {value:.4f} | {error} | {elapsed} |"
-            )
-
-
-def flush_summaries() -> None:
-    """Publish each target's launches as one table. A fact shared by every launch
-    moves to the header, leaving the table to what differs."""
-    for target_dir, summary in _SUMMARIES.items():
-        try:
-            _flush(target_dir, summary)
-        except Exception as exc:  # noqa: BLE001 -- reporting never fails a lane
-            print(f"  summary: not built ({type(exc).__name__}: {exc})")
-
-
-def _flush(target_dir: Path, summary: _Summary) -> None:
+def summarize(
+    target: str,
+    chip: str,
+    cases: dict[str, dict[str, Any] | None],
+) -> tuple[str, bool]:
+    """Show every planned launch, including missing and incomplete evaluations."""
+    facts = [
+        result["facts"]
+        for result in cases.values()
+        if result is not None and result["rows"]
+    ]
     shared = {
         key: value
-        for key, value in (summary.facts[0] if summary.facts else {}).items()
-        if all(facts.get(key) == value for facts in summary.facts[1:])
+        for key, value in (facts[0] if facts else {}).items()
+        if all(other.get(key) == value for other in facts[1:])
     }
-    chip = f" -- {summary.chip}" if summary.chip else ""
-    body = [f"#### {target_dir.name}{chip}", ""]
+    body = [f"#### {target} -- {chip}", ""]
     if shared:
         body += [" · ".join(shared.values()), ""]
-    if summary.rows:
-        body += [
-            "| launch | task | metric | filter | value | stderr | time |",
-            "|:--|:--|:--|:--|--:|--:|--:|",
-            *summary.rows,
-        ]
-    else:
-        body.append("no lm-eval results.")
-    if summary.notes:
-        body += ["", *summary.notes]
-    publish_summary(
-        "lm-eval",
-        target_dir,
-        "\n".join(body),
-        chip=summary.chip,
-        degraded=summary.degraded,
-    )
+    body += [
+        "| launch | task | metric | filter | value | stderr | time | status | job |",
+        "|:--|:--|:--|:--|--:|--:|--:|:--|:--|",
+    ]
+    degraded = False
+    for launch, result in cases.items():
+        status = case_status(result)
+        degraded |= status != "ok"
+        rows = result["rows"] if result is not None else []
+        job_url = result["job_url"] if result is not None else None
+        job = f"[log]({job_url})" if job_url else "--"
+        for row in rows or [{}]:
+            value, stderr, elapsed = (
+                row.get("value"),
+                row.get("stderr"),
+                row.get("time"),
+            )
+            cells = [
+                launch,
+                row.get("task", "--"),
+                row.get("metric", "--"),
+                row.get("filter", "--"),
+                f"{value:.4f}" if value is not None else "--",
+                f"±{stderr:.4f}" if isinstance(stderr, float) else "--",
+                f"{float(elapsed):.0f}s" if elapsed is not None else "--",
+                status,
+                job,
+            ]
+            body.append("| " + " | ".join(cells) + " |")
+    return "\n".join(body), degraded
 
 
 @contextlib.contextmanager
@@ -228,7 +184,7 @@ def eval_cmd(target: dict[str, Any], serve: dict[str, Any], out: Path) -> list[s
     return cmd
 
 
-def report(out: Path, target: dict[str, Any], chip: str | None) -> int:
+def report(out: Path, target: dict[str, Any], chip: str, result: dict[str, Any]) -> int:
     """Read what lm-eval wrote and say what it measured.
 
     Without an expected value this only records: a first run is what decides
@@ -237,18 +193,32 @@ def report(out: Path, target: dict[str, Any], chip: str | None) -> int:
     results = sorted(out.glob("results_*.json"))
     if not results:
         print(f"  no lm-eval results under {out}", file=sys.stderr)
-        _note(out, chip, "no lm-eval results")
         return 1
 
     spec = target["eval"]
     # The whole payload: the counts the summary needs sit outside "results".
     payload = json.loads(results[-1].read_text())
     measured = payload["results"]
+    result["facts"] = _facts(payload, spec["tasks"])
     expected = (spec.get("expected") or {}).get(chip)
     key = spec.get("filter", "exact_match,strict-match")
     status = 0
     for task in spec["tasks"]:
         scores = measured[task]
+        for name, value in sorted(scores.items()):
+            if "," not in name or "stderr" in name or not isinstance(value, float):
+                continue
+            metric, _, filter_name = name.partition(",")
+            result["rows"].append(
+                {
+                    "task": task,
+                    "metric": metric,
+                    "filter": filter_name,
+                    "value": value,
+                    "stderr": scores.get(f"{metric}_stderr,{filter_name}"),
+                    "time": payload.get("total_evaluation_time_seconds"),
+                }
+            )
         # Every filter, not only the one compared against: a score that collapses
         # under strict-match but holds under flexible-extract is the answer being
         # formatted differently, not the model being wrong.
@@ -262,9 +232,8 @@ def report(out: Path, target: dict[str, Any], chip: str | None) -> int:
         )
         if (value := scores.get(key)) is None:
             print(f"  {task}: no filter {key!r} in the results", file=sys.stderr)
-            _record(out, chip, payload, spec["tasks"])
-            _note(out, chip, f"`{key}` is not among the {task} filters")
-            return 1
+            status = 1
+            continue
         line = f"  {task}: {key}={value:.4f}"
         if expected is None:
             print(f"{line}  (no expected value for {chip}; recorded only)")
@@ -273,7 +242,6 @@ def report(out: Path, target: dict[str, Any], chip: str | None) -> int:
         ok = abs(value - expected) <= rtol
         print(f"{line}  expected {expected:.4f} +-{rtol}  {'ok' if ok else 'FAILED'}")
         status = max(status, 0 if ok else 1)
-    _record(out, chip, payload, spec["tasks"])
     return status
 
 
@@ -282,11 +250,9 @@ def run_launch(
     target: dict[str, Any],
     serve: dict[str, Any],
     serve_cmd: list[str],
-    chip: str | None,
 ) -> int:
     from vllm.benchmarks.sweep.server import ServerProcess
 
-    out.mkdir(parents=True, exist_ok=True)
     cmd = eval_cmd(target, serve, out)
     # The repro needs the overlay spelled out -- lm-eval is not in the locked
     # environment -- and pinned to the version that produced this score. The api
@@ -305,53 +271,34 @@ def run_launch(
 
     # show_stdout, or the server's output -- the compile included -- goes to
     # /dev/null and a failure to start says only that it failed.
-    server = ServerProcess(serve_cmd, [], show_stdout=True)
-    server.server_cmd = serve_cmd
-    with env_applied(target_env(target)), server:
+    with (
+        env_applied(target_env(target)),
+        ServerProcess(serve_cmd, [], show_stdout=True) as server,
+    ):
         server.wait_until_ready(timeout=target.get("server_ready_timeout", 3600))
         status = subprocess.run(cmd).returncode
 
-    return max(status, report(out, target, chip))
-
-
-def run_target(path: Path, out_dir: Path, run_id: str) -> int:
-    target = yaml.safe_load(path.read_text())
-    name = path.stem
-    print(f"=== {name} ({path})")
-
-    chips = target.get("chips")
-    chip = host_chip()
-    if chips and chip and chip not in chips:
-        print(f"  skip: needs {'/'.join(chips)}, host is {chip}")
-        return 0
-
-    budget = device_count()
-    status = 0
-    for launch, overrides in target["serve_params"].items():
-        serve = {**target.get("serve", {}), **overrides}
-        needed = devices_needed(serve, target_env(target))
-        if needed > budget:
-            print(f"  skip {launch}: needs {needed} NPUs, host has {budget}")
-            continue
-        out = out_dir / run_id / name / launch
-        print(f"--- {name} / {launch} -> {out}")
-        serve_cmd = build_cmd(
-            ["vllm", "serve", "--model", target["model"]], target.get("serve", {})
-        )
-        status = max(
-            status,
-            run_launch(out, target, serve, build_cmd(serve_cmd, overrides), chip),
-        )
     return status
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("targets", nargs="*", help="target names (default: all)")
-    parser.add_argument("--targets-dir", type=Path, default=_HERE / "targets")
-    # A fresh directory per run, so a launch that writes nothing cannot have an
-    # earlier run's score read back as its own.
-    parser.add_argument("--run-id", default=datetime.now().strftime("%Y%m%d_%H%M%S"))
+    commands = parser.add_subparsers(dest="action", required=True)
+    for action in ("run", "pipeline", "summary"):
+        command = commands.add_parser(action)
+        command.add_argument("targets", nargs="*", help="target names (default: all)")
+        command.add_argument("--targets-dir", type=Path, default=_HERE / "targets")
+        command.add_argument("--chip", required=action != "run")
+        command.add_argument(
+            "--run-id",
+            default=os.environ.get("BUILDKITE_BUILD_ID")
+            or datetime.now().strftime("%Y%m%d_%H%M%S"),
+            help="shared by the cases and summary",
+        )
+        if action == "run":
+            command.add_argument("--launch")
+        elif action == "summary":
+            command.add_argument("--download", action="store_true")
     args = parser.parse_args()
 
     paths = sorted([*args.targets_dir.glob("*.yaml"), *args.targets_dir.glob("*.yml")])
@@ -363,11 +310,80 @@ def main() -> int:
     if not paths:
         parser.error(f"no targets under {args.targets_dir}")
 
-    out_dir = output_dir("LM_EVAL_OUTPUT_DIR", "lm-eval-results")
-    # Materialized, or the summaries would be flushed while targets still run.
-    statuses = [run_target(p, out_dir, args.run_id) for p in paths]
-    flush_summaries()
-    return max(statuses)
+    if args.action == "run":
+        chip = host_chip()
+        if chip is None:
+            parser.error("cannot determine the host NPU chip")
+        if args.chip is not None and args.chip != chip:
+            parser.error(f"expected chip {args.chip}, host reports {chip}")
+        args.chip = chip
+    targets = {path.stem: yaml.safe_load(path.read_text()) for path in paths}
+    targets = {
+        name: target
+        for name, target in targets.items()
+        if not target.get("chips") or args.chip in target["chips"]
+    }
+    cases = [
+        (name, launch)
+        for name, target in targets.items()
+        for launch in target["serve_params"]
+    ]
+    if args.action == "run" and args.launch is not None:
+        if args.launch not in {launch for _, launch in cases}:
+            parser.error(f"no such launch: {args.launch}")
+        cases = [case for case in cases if case[1] == args.launch]
+    if not cases:
+        parser.error(f"no lm-eval cases for {args.chip}")
+
+    if args.action == "pipeline":
+        pipeline = measured_pipeline(
+            "lm-eval",
+            Path(__file__).resolve(),
+            targets,
+            cases,
+            chip=args.chip,
+            run_id=args.run_id,
+            targets_dir=args.targets_dir,
+        )
+        print(json.dumps(pipeline))
+        return 0
+
+    base = output_dir("LM_EVAL_OUTPUT_DIR", "lm-eval-results") / args.run_id / args.chip
+    if args.action == "run":
+        status = 0
+        for name, launch in cases:
+            out = base / name / launch
+            print(f"--- {name} / {launch} -> {out}", flush=True)
+            result = start_case(out)
+            target = targets[name]
+            serve = target["serve"] | target["serve_params"][launch]
+            needed = devices_needed(serve, target_env(target))
+            budget = device_count()
+            if needed > budget:
+                raise ValueError(f"{launch} needs {needed} NPUs, host has {budget}")
+            serve_cmd = build_cmd(["vllm", "serve", "--model", target["model"]], serve)
+            rc = run_launch(out, target, serve, serve_cmd)
+            result["exit_code"] = max(
+                int(rc != 0), report(out, target, args.chip, result)
+            )
+            write_result(out, result)
+            status = max(status, result["exit_code"])
+        return status
+
+    assert args.action == "summary"
+    if args.download:
+        download_results("lm-eval", args.run_id, args.chip)
+    for name in targets:
+        results = {}
+        for case_name, launch in cases:
+            if case_name == name:
+                path = base / name / launch / "result.json"
+                results[launch] = (
+                    json.loads(path.read_text()) if path.exists() else None
+                )
+        body, degraded = summarize(name, args.chip, results)
+        publish_summary("lm-eval", base / name, body, chip=args.chip, degraded=degraded)
+    return 0
 
 
 if __name__ == "__main__":

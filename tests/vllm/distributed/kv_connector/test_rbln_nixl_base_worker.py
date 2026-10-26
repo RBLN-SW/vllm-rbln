@@ -18,7 +18,6 @@
 # `build_worker`, which stubs it down to what the RBLN overrides read.
 
 from collections import defaultdict
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -31,11 +30,13 @@ from tests.vllm.distributed.kv_connector.utils import (
     KvGeometry,
     build_worker,
     decode,
+    fill_region_geometry,
     sliding_window_spec,
+    uniform_grid,
     window_mode,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
-    KVSplitAxis,
+    ChipletSplitAxis,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_worker import (
     RblnNixlPullConnectorWorker,
@@ -43,6 +44,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_worker imp
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.push_worker import (
     RblnNixlPushConnectorWorker,
 )
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import Piece
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 
 
@@ -129,85 +131,6 @@ class TestLogicalBlockPinning:
         assert worker._physical_blocks_per_logical_kv_block == 1
         assert worker._logical_num_blocks == 128
         assert worker._pending_kv_caches is None
-
-
-class TestObservingTheKernelBlock:
-    """Which of `block_size` and `sliding_window` the sliding-window kernel
-    addresses the cache in is the runner's answer, and the spec does not carry
-    it -- a pool hands the connector its full-attention layer, whose view is
-    the same shape either way. So it is read off what the runner bound."""
-
-    def test_the_window_geometry_is_read_from_the_bound_view(self, monkeypatch):
-        worker = build_worker(
-            monkeypatch,
-            kv_buffer_device="rbln",
-            block_size=64,
-            specs=[sliding_window_spec(block_size=64, sliding_window=16)],
-            swa_kernel_block=16,
-        )
-        assert worker._observe_swa_kernel_block() == {16}
-
-    def test_the_block_wide_geometry_reads_the_block(self, monkeypatch):
-        # The same spec, and the number that tells the two apart.
-        worker = build_worker(
-            monkeypatch,
-            kv_buffer_device="rbln",
-            block_size=64,
-            specs=[sliding_window_spec(block_size=64, sliding_window=16)],
-            swa_kernel_block=64,
-        )
-        assert worker._observe_swa_kernel_block() == {64}
-
-    def test_an_engine_with_no_window_observes_nothing(self, monkeypatch):
-        worker = build_worker(monkeypatch, kv_buffer_device="rbln", specs=[MagicMock()])
-        assert worker._observe_swa_kernel_block() == set()
-
-    def test_a_group_that_does_not_transfer_is_not_observed(self, monkeypatch):
-        # The ratio this set is checked against comes from the transfer view,
-        # so a window that addresses no descriptor must not reach it -- the
-        # refusal it would arm is about a pairing nothing transfers.
-        worker = build_worker(
-            monkeypatch,
-            kv_buffer_device="rbln",
-            block_size=64,
-            specs=[sliding_window_spec(block_size=64, sliding_window=16)],
-            non_transfer_specs=[sliding_window_spec(block_size=64, sliding_window=32)],
-        )
-        # The opted-out window is the one above, and reading every group
-        # would report it
-        # -- which `_window_grid` then refuses against a ratio it never saw.
-        assert worker._observe_swa_kernel_block() == {16}
-
-    def test_groups_addressed_differently_are_both_reported(self, monkeypatch):
-        # A speculative draft brings its own groups and they need not agree.
-        # Only a window range needs one number, so the disagreement is carried
-        # rather than refused here.
-        worker = build_worker(
-            monkeypatch,
-            kv_buffer_device="rbln",
-            block_size=64,
-            specs=[
-                sliding_window_spec(block_size=64, sliding_window=16),
-                sliding_window_spec(block_size=64, sliding_window=16),
-            ],
-        )
-        ctx = worker.vllm_config.compilation_config.static_forward_context
-        ctx["g1.l0"] = SimpleNamespace(kv_cache=torch.zeros(1, 1, 64, 1))
-        assert worker._observe_swa_kernel_block() == {16, 64}
-
-    def test_an_unbound_layer_says_so(self, monkeypatch):
-        # The placeholder a layer carries until the runner binds it has no
-        # token axis; reading `shape[-2]` off it would be a bare IndexError.
-        worker = build_worker(
-            monkeypatch,
-            kv_buffer_device="rbln",
-            block_size=64,
-            specs=[sliding_window_spec(block_size=64, sliding_window=16)],
-        )
-        ctx = worker.vllm_config.compilation_config.static_forward_context
-        ctx["g0.l0"] = SimpleNamespace(kv_cache=torch.tensor([]))
-        with pytest.raises(AssertionError):
-            worker._observe_swa_kernel_block()
 
 
 class TestSwaWindowRatio:
@@ -443,6 +366,30 @@ class TestSwaWindowRatio:
             )
 
 
+class TestAnInertChunkSize:
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("chunk_mode", [False, True])
+    def test_a_chunk_size_without_chunk_mode_says_it_does_nothing(
+        self, monkeypatch, caplog, chunk_mode, stream
+    ):
+        # A streamed write cuts no block either, so streaming alone leaves the
+        # size as unused as having neither knob.
+        with caplog.at_level("INFO"):
+            worker = build_worker(
+                monkeypatch,
+                kv_buffer_device="rbln",
+                chunk_mode=chunk_mode,
+                chunk_tokens=512,
+                push_stream=stream,
+                specs=[MagicMock()],
+                cls=RblnNixlPushConnectorWorker,
+            )
+
+        assert worker._shape.streams_prefix is stream
+        said = [r for r in caplog.records if "has no effect without" in r.getMessage()]
+        assert bool(said) is not chunk_mode
+
+
 class TestSwaWindowDelegation:
     # Both collapse to the upstream Full-only implementation when window_ratio is
     # None; the SWA dual-range paths are exercised in the Swa classes below.
@@ -476,7 +423,8 @@ class TestSwaWindowDelegation:
             lambda self, *args, **kwargs: "shard",
         )
 
-        assert worker.register_local_xfer_handler(64, replica_fanout=2) == "shard"
+        two_copies = [[Piece(0, 0, 0, 64, 1), Piece(0, 1, 0, 64, 1)]]
+        assert worker.register_local_xfer_handler(64, pieces=two_copies) == "shard"
 
     def test_add_remote_agent_delegates_when_no_swa(self, monkeypatch):
         worker = build_worker(monkeypatch)  # window_ratio is None
@@ -541,6 +489,8 @@ class TestRegisterLocalXferHandlerSwa:
         )
         w = make_worker(kv_cache=geo, swa_window_mode=True)
         assert (w._shape.has_swa, w._shape.window_ratio) == (True, 2)
+        # The frame the runner handed over is what names the kernel's block.
+        assert w._swa_kernel_blocks == {kernel_block or geo.block_size}
 
         blocks_data = w.src_blocks_data
         full_len = w.block_len_per_layer[0]
@@ -590,7 +540,11 @@ class TestRegisterLocalXferHandlerSwa:
 
         with (
             patch.object(worker, "get_backend_aware_kv_block_len", return_value=256),
-            patch.object(type(worker), "_shard_chunk_grid", return_value=(2, 2)),
+            patch.object(
+                type(worker),
+                "_shard_chunk_grid",
+                return_value=uniform_grid(2, 2, regions=2),
+            ),
         ):
             worker.register_local_xfer_handler(64)
 
@@ -628,7 +582,11 @@ class TestRegisterLocalXferHandlerSwa:
 
         with (
             patch.object(worker, "get_backend_aware_kv_block_len", return_value=256),
-            patch.object(type(worker), "_shard_chunk_grid", return_value=(4, 2)),
+            patch.object(
+                type(worker),
+                "_shard_chunk_grid",
+                return_value=uniform_grid(4, 2, regions=2),
+            ),
         ):
             worker.register_local_xfer_handler(64)
 
@@ -807,17 +765,14 @@ class TestAWindowRangeNeedsAGeometryItCanCut:
     neither, and every descriptor count still matches."""
 
     @staticmethod
-    def _worker(blocks, *, axis=KVSplitAxis.HEAD, areas=1):
+    def _worker(blocks, *, axis=ChipletSplitAxis.HEAD, areas=1, heads=8):
         w = object.__new__(RblnNixlPullConnectorWorker)
         w.block_size = 64
         window_mode(w, 4)
         w._swa_kernel_blocks = blocks
-        w._kv_split_axis = axis
-        w._kv_areas, w._kv_slices = areas, areas
         w._kv_per_block = 1
-        w.tp_rank = 0
-        w.transfer_topo = MagicMock(tp_size=1)
-        w._logical_region_kv_heads = [8, 8]
+        fill_region_geometry(w, areas=areas, axes=[axis] * 2, slices=areas)
+        w._logical_region_local_heads = [heads] * 2
         return w
 
     def test_a_granule_wide_view_is_one_run(self):
@@ -838,18 +793,16 @@ class TestAWindowRangeNeedsAGeometryItCanCut:
 
     def test_a_block_wide_view_on_a_context_cut_is_refused(self):
         with pytest.raises(RuntimeError, match="needs a head cut"):
-            self._worker({64}, axis=KVSplitAxis.NON_HEAD, areas=2)._window_grid()
+            self._worker(
+                {64}, axis=ChipletSplitAxis.TOKEN, areas=2, heads=1
+            )._window_grid()
 
-    @pytest.mark.parametrize(
-        "heads", [[8, 4], [None, None]], ids=["disagree", "no-band-at-all"]
-    )
-    def test_regions_without_one_head_band_are_refused(self, heads):
-        # Two causes reach the same branch -- regions disagreeing, and no
-        # region naming a band, which a TP degree above the model's KV heads
-        # gives. The message must not pick one; it prints what it compared.
+    def test_regions_without_one_head_band_are_refused(self):
+        # A draft beside its target holds a head count of its own, and the
+        # window range is cut by one number.
         w = self._worker({64})
-        w._logical_region_kv_heads = heads
-        with pytest.raises(RuntimeError, match="report KV head counts"):
+        w._logical_region_local_heads = [8, 4]
+        with pytest.raises(RuntimeError, match="hold KV head counts"):
             w._window_grid()
 
 
