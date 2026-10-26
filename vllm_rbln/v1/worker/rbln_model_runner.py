@@ -148,7 +148,6 @@ from vllm_rbln.v1.core.utils import (
     sub_block_size_in_use,
 )
 from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
-from vllm_rbln.v1.sample.ops.top_k_top_p import TOP_P_CLAMP
 from vllm_rbln.v1.sample.rbln_logits_processor import build_rbln_logitsprocs
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
 from vllm_rbln.v1.sample.rbln_sampler import WARM_UP_CONFIGS, RBLNSampler
@@ -769,6 +768,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 # The request is resumed from preemption.
                 # Replace the existing block IDs with the new ones.
                 req_state.block_ids = new_block_ids
+                # It recomputes on the new blocks: no drafts of a past step to replay.
+                self.num_accepted_tokens_by_req.pop(req_id, None)
 
             if req_index is None:
                 # The request is not in the persistent batch.
