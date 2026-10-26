@@ -123,7 +123,7 @@ class TestFlashAttentionBackendStatic:
         order = (
             axis.KV,
             axis.BLOCK,
-            axis.TOKEN,
+            axis.STATE,
             axis.HEAD,
             axis.HEAD_DIM,
             axis.SINGLETON,

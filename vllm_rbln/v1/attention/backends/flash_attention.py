@@ -139,7 +139,7 @@ class RBLNFlashAttentionBackend(AttentionBackend):
         from vllm.v1.kv_cache_layout import KVCacheAxis as Axis
         from vllm.v1.kv_cache_layout import KVCacheTensorLayout
 
-        axes = [Axis.KV, Axis.HEAD, Axis.SINGLETON, Axis.TOKEN, Axis.HEAD_DIM]
+        axes = [Axis.KV, Axis.HEAD, Axis.SINGLETON, Axis.STATE, Axis.HEAD_DIM]
         axes.insert(
             attention_block_axis(get_rbln_config().use_custom_kernel), Axis.BLOCK
         )

@@ -35,17 +35,20 @@ _DEFAULT_NUM_HIDDEN_LAYERS = 3
 
 @pytest.fixture
 def kv_layout_registration_api(monkeypatch):
-    """Stand in for the proposed registration types on pinned vLLM releases."""
+    """Use upstream registration types when present, otherwise the draft shim."""
     from enum import IntEnum
     from typing import NamedTuple
 
     import vllm.v1.kv_cache_layout as layouts
 
+    if hasattr(layouts, "KVCacheAxis") and hasattr(layouts, "KVCacheTensorLayout"):
+        return layouts.KVCacheAxis
+
     class Axis(IntEnum):
         BLOCK = 0
         KV = 1
         HEAD = 2
-        TOKEN = 3
+        STATE = 3
         HEAD_DIM = 4
         CONTENT = 5
         SINGLETON = 6
