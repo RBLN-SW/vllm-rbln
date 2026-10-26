@@ -147,7 +147,6 @@ from vllm_rbln.v1.core.utils import (
     step_is_prefill,
     sub_block_size_in_use,
 )
-from vllm_rbln.v1.sample.ops.top_k_top_p import TOP_P_CLAMP
 from vllm_rbln.v1.sample.rbln_logits_processor import build_rbln_logitsprocs
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
 from vllm_rbln.v1.sample.rbln_sampler import WARM_UP_CONFIGS, RBLNSampler
@@ -808,11 +807,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # Add the new or resumed requests to the persistent batch.
         # The smaller empty indices are filled first.
         for request in reqs_to_add:
-            # FIXME(huijong.jeong): remove this once our rbln.top_k_top_p gets revised.
-            if self.rbln_config.use_custom_sampler and (
-                sampling_params := request.sampling_params
-            ):
-                sampling_params.top_p = min(sampling_params.top_p, TOP_P_CLAMP)
             # A prefill-only step evicts every decode request, so each one is re-added
             # here once per prefill, and converting the prompt list is most of
             # add_request. Fill the row from an array made on the first add, and give

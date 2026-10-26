@@ -46,6 +46,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_worker import (
     RblnNixlPullConnectorWorker,
 )
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import ChunkGrid
 
 
 def _sliding_window_spec():
@@ -64,7 +65,7 @@ class TestShardReadPath:
         w._shard_region_group_ids = {("eng", 1): (0, 0, 0, 0)}  # 4 regions, group 0
         # Written together with the group ids by _register_shard_xfer_state, so
         # a shard the read path can reach always has both.
-        w._shard_descs_per_block = {("eng", 1): 1}
+        w._shard_descs_per_block = {("eng", 1): (1,) * 4}
         w._shard_chunk_grids = {("eng", 1): None}
         descs = w._get_block_descs_ids_for_shard(
             "eng", 1, num_blocks=10, block_ids=[[2, 5]]
@@ -73,11 +74,11 @@ class TestShardReadPath:
         assert list(descs) == [2, 5, 12, 15, 22, 25, 32, 35]
 
     def test_get_block_descs_ids_for_shard_with_split(self):
-        """split=2: each block becomes two consecutive descriptors, because
+        """Two pieces a block: each block becomes two consecutive descriptors, because
         both dlists are laid out region-major, then block, then piece."""
         w = object.__new__(RblnNixlPullConnectorWorker)
         w._shard_region_group_ids = {("eng", 1): (0, 0)}  # 2 regions
-        w._shard_descs_per_block = {("eng", 1): 2}
+        w._shard_descs_per_block = {("eng", 1): (2, 2)}
         w._shard_chunk_grids = {("eng", 1): None}
         descs = w._get_block_descs_ids_for_shard(
             "eng", 1, num_blocks=10, block_ids=[[2, 5]]
@@ -85,13 +86,36 @@ class TestShardReadPath:
         # region 0: blocks 2,5 -> descs (2*2,+1) and (5*2,+1); region 1 adds 10*2.
         assert list(descs) == [4, 5, 10, 11, 24, 25, 30, 31]
 
+    def test_regions_in_unlike_pieces_lay_out_one_after_another(self):
+        # Region 0 is one descriptor a block and region 1 two, so region 1
+        # starts after every block of region 0, at 1 x num_blocks.
+        w = object.__new__(RblnNixlPullConnectorWorker)
+        w._shard_region_group_ids = {("eng", 1): (0, 0)}
+        w._shard_descs_per_block = {("eng", 1): (1, 2)}
+        w._shard_chunk_grids = {("eng", 1): None}
+        descs = w._get_block_descs_ids_for_shard(
+            "eng", 1, num_blocks=10, block_ids=[[2, 5]]
+        )
+        assert list(descs) == [2, 5, 14, 15, 20, 21]
+
+    def test_a_chunk_range_follows_every_region_s_whole_blocks(self):
+        # One descriptor a block for region 0 and two for region 1, which the
+        # grid names whole: the chunk range starts past 3 x num_blocks entries,
+        # and region 1 is found at its own place in the whole-block range.
+        w = object.__new__(RblnNixlPullConnectorWorker)
+        w._shard_region_group_ids = {("eng", 1): (0, 0)}
+        w._shard_descs_per_block = {("eng", 1): (1, 2)}
+        w._shard_chunk_grids = {("eng", 1): ChunkGrid(2, ((0, 1, 2), (0, 0, 1)))}
+        ids = w._chunk_descs_ids_for_shard("eng", 1, 4, 3, (0, 2))
+        assert list(ids) == [10, 11, 18, 19]
+
     @staticmethod
     def _trim_worker():
         # 4 regions over 2 chiplet areas: positions 0,2 are area 0 and 1,3 are
         # area 1, which is the relation the trim indexes by.
         w = object.__new__(RblnNixlPullConnectorWorker)
         w._shard_region_group_ids = {("eng", 1): (0, 0, 0, 0)}
-        w._shard_descs_per_block = {("eng", 1): 1}
+        w._shard_descs_per_block = {("eng", 1): (1,) * 4}
         w._shard_chunk_grids = {("eng", 1): None}
         w._shard_region_spans = {("eng", 1): (0, 1, 0, 1)}
         fill_region_geometry(w, areas=2, axes=[ChipletSplitAxis.TOKEN] * 2, slices=2)
@@ -280,7 +304,7 @@ class TestShardReadPath:
     def test_get_block_descs_ids_for_shard_empty_group(self):
         w = object.__new__(RblnNixlPullConnectorWorker)
         w._shard_region_group_ids = {("eng", 0): (0, 0)}
-        w._shard_descs_per_block = {("eng", 0): 1}
+        w._shard_descs_per_block = {("eng", 0): (1, 1)}
         w._shard_chunk_grids = {("eng", 0): None}
         descs = w._get_block_descs_ids_for_shard("eng", 0, num_blocks=4, block_ids=[[]])
         assert descs.size == 0
@@ -345,7 +369,7 @@ class TestShardReadPath:
         # the wrong one rejects a request that is in fact well formed.
         w.kv_cache_config = MagicMock(kv_cache_groups=[0, 1], transfer_groups=[0])
         w._shard_region_group_ids = {("eng", r): (0, 0) for r in range(pp_size)}
-        w._shard_descs_per_block = {("eng", r): 1 for r in range(pp_size)}
+        w._shard_descs_per_block = {("eng", r): (1, 1) for r in range(pp_size)}
         w._shard_chunk_grids = {("eng", r): None for r in range(pp_size)}
         w._shard_region_spans = {("eng", r): (0, 0) for r in range(pp_size)}
         set_shape(w, chunk_mode=False)

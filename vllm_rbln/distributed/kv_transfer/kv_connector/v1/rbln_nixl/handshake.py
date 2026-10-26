@@ -47,9 +47,12 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import
     RblnNixlAgentMetadata,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
+    Piece,
     RblnNixlWorkerState,
     _grid_descs,
+    area_heads,
     every_local_link_down,
+    pair_area,
 )
 from vllm_rbln.logger import init_logger
 
@@ -107,6 +110,32 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         self._refuse_decode_context_parallel(remote_dcp_size)
         areas_l, slices_l, _ = self._local_band(remote_tp_size)
         areas_r, slices_r = self._peer_band(nixl_agent_meta, remote_tp_size)
+        # Ahead of the prelude, which the handshake checks run after: upstream
+        # swallows a handshake exception, so a later raise leaves the peer
+        # registered. The layout checks first, so every region left cuts heads.
+        self._check_d2d_region_pairing(nixl_agent_meta, remote_tp_size)
+        self._check_split_axis_constraints(nixl_agent_meta, remote_tp_size)
+        self._check_mla_constraints(nixl_agent_meta, remote_tp_size)
+        cuts_l, cuts_r = self.topo.tp_size * slices_l, remote_tp_size * slices_r
+        if max(cuts_l, cuts_r) % min(cuts_l, cuts_r):
+            raise RuntimeError(
+                f"RBLN NIXL D2D: this engine cuts KV heads {cuts_l} ways and the "
+                f"peer {cuts_r}, and neither divides the other, so an area of one "
+                "side would hold part of one of the other's. The two sides must "
+                "cut heads at commensurate granularities."
+            )
+        # A peer rank has to hold whole areas of ours: its T / remote_tp heads
+        # a multiple of an area's T / cuts_l. A coarser peer always does, its
+        # TP dividing ours.
+        if cuts_l % remote_tp_size:
+            raise RuntimeError(
+                f"RBLN NIXL D2D: the peer runs TP {remote_tp_size}, which does "
+                f"not divide this engine's {cuts_l} head cut(s) (TP "
+                f"{self.topo.tp_size} x {slices_l} chiplet slice(s)), so one "
+                "chiplet area would straddle several peers. Run the peer at a "
+                f"tensor-parallel size dividing {cuts_l}, or use "
+                "kv_buffer_device='cpu'."
+            )
         self._register_remote_engine_prelude(
             nixl_agent_meta, remote_tp_size, remote_dcp_size
         )
@@ -208,13 +237,12 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         with self._regions_viewed_as(region_ids):
             whole = super()._build_fa_remote(plan, nixl_agent_meta, block_size_ratio)
         # Upstream's builder is reached only by a peer this rank does not band
-        # by head, which is exactly where `_peer_head_split` answers 1.
+        # by head, so every region is one piece a block.
         grid = self._shard_chunk_grid(
             range(len(nixl_agent_meta.kv_caches_base_addr))
             if region_ids is None
             else region_ids,
             block_size=nixl_agent_meta.block_size,
-            split=1,
         )
         if grid is None:
             return whole
@@ -234,6 +262,83 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
             ]
         )
 
+    def _head_matched_plan(
+        self,
+        nixl_agent_meta: RblnNixlAgentMetadata,
+        remote_tp_rank: int,
+        remote_tp_size: int,
+        registered_layer_names: tuple[str, ...] | list[str] | None = None,
+        peer_areas: list[int] | None = None,
+    ) -> tuple[list[int], list[list[Piece]]]:
+        """Our region ids for a peer of another TP degree, and per region the
+        pieces it exchanges with that peer rank (`pair_area`).
+
+        In LOCAL region order, so ``_compute_desc_ids``'s positional pairing
+        keeps holding. Upstream instead walks the peer's list with one global
+        ``rank_offset``, which assumes it holds our heads contiguously in a
+        single region -- false once a region is one chiplet area and heads are
+        area-major: P TP2 -> D TP4 reads local area 2 from remote area 1.
+
+        ``registered_layer_names`` narrows this to one pipeline stage, its
+        region list indexed by position within the stage; None means the peer
+        owns every layer. ``peer_areas`` is `_fan_in_peer_areas`.
+        """
+        areas_l, slices_l, slice_ids_l = self._local_band(remote_tp_size)
+        areas_r, slices_r = self._peer_band(nixl_agent_meta, remote_tp_size)
+        areas_iter = range(areas_l) if peer_areas is None else peer_areas
+        region_ids: list[int] = []
+        plans: list[list[Piece]] = []
+        for logical_l, logical_r in self._logical_region_pairs(registered_layer_names):
+            # A model-config count describes the target's layers, and on a
+            # draft's it lands a plausible offset inside the wrong bytes. The
+            # peer's region holds the same layer, so one count answers for both
+            # sides (the handshake verifies it).
+            total_heads = self._region_kv_heads(logical_l)
+            base_l, per_slice_l = self._slice_head_bounds(
+                self.tp_rank, self.topo.tp_size, total_heads, slices_l, side="local"
+            )
+            base_r, per_slice_r = self._slice_head_bounds(
+                remote_tp_rank, remote_tp_size, total_heads, slices_r, side="peer"
+            )
+            peer = [
+                (
+                    region_r,
+                    area_heads(
+                        slices_r, sid, first_head=base_r, heads=per_slice_r * slices_r
+                    ),
+                    nixl_agent_meta.block_lens[region_r],
+                )
+                for a, sid in enumerate(nixl_agent_meta.kv_area_slices[logical_r])
+                for region_r in [logical_r * areas_r + a]
+            ]
+            for area_l in areas_iter:
+                region_id = logical_l * areas_l + area_l
+                local = area_heads(
+                    slices_l,
+                    slice_ids_l[area_l],
+                    first_head=base_l,
+                    heads=per_slice_l * slices_l,
+                )
+                pieces = pair_area(
+                    local,
+                    self.get_backend_aware_kv_block_len(
+                        layer_idx=region_id, first_split=True, mamba_view=False
+                    ),
+                    peer,
+                    kv_per_block=self._kv_per_block,
+                    every_holder=self._writes_into_peer,
+                    region_id=region_id,
+                )
+                # One chunk grid a region (`_shard_chunk_grid`), so its pieces
+                # have to be cut alike, which the handshake's refusal of
+                # incommensurate head cuts guarantees.
+                assert len({(x.length, x.rows) for x in pieces}) == 1, (
+                    f"region {region_id} pairs in unlike pieces {pieces}"
+                )
+                region_ids.append(region_id)
+                plans.append(pieces)
+        return region_ids, plans
+
     def _build_head_matched_remote(
         self,
         nixl_agent_meta: RblnNixlAgentMetadata,
@@ -244,110 +349,50 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
     ) -> np.ndarray:
         """Remote descriptors for a peer whose TP degree differs from ours.
 
-        Emitted in LOCAL region order, so ``_compute_desc_ids``'s positional
-        pairing keeps holding. Upstream instead walks the peer's list with one
-        global ``rank_offset``, which assumes it holds our heads contiguously
-        in a single region -- false once a region is one chiplet area and heads
-        are area-major: P TP2 -> D TP4 reads local area 2 from remote area 1.
-
-        ``registered_layer_names`` narrows this to one pipeline stage, its
-        region list indexed by position within the stage; None means the peer
-        owns every layer.
-
-        The chunk range follows the whole-piece one where the geometry allows
-        it, asked for here rather than passed in so that the split it is
-        derived from is the split this list was built with.
+        The plan is `_head_matched_plan`'s, and so is the order. The chunk
+        range follows the whole-piece one where the geometry allows it, asked
+        for here rather than passed in so that it is cut from the same plan.
         """
-        areas_l, slices_l, slice_ids_l = self._local_band(remote_tp_size)
-        areas_r, slices_r = self._peer_band(nixl_agent_meta, remote_tp_size)
-
-        cuts_l = self.topo.tp_size * slices_l
-        cuts_r = remote_tp_size * slices_r
-        split = self._head_split(cuts_l, cuts_r)
-        kv_runs = self._kv_runs(self._kv_per_block, cuts_l, cuts_r)
-
-        replicas_r = areas_r // slices_r
-        num_blocks = nixl_agent_meta.num_blocks
-        remote_bases = nixl_agent_meta.kv_caches_base_addr
-        remote_lens = nixl_agent_meta.block_lens
-
-        logical_pairs = self._logical_region_pairs(registered_layer_names)
-
-        # Which of our areas this peer holds (see _fan_in_peer_areas).
-        areas_iter = range(areas_l) if peer_areas is None else peer_areas
-        region_ids = [
-            logical_l * areas_l + area_l
-            for logical_l, _ in logical_pairs
-            for area_l in areas_iter
-        ]
+        region_ids, plans = self._head_matched_plan(
+            nixl_agent_meta,
+            remote_tp_rank,
+            remote_tp_size,
+            registered_layer_names=registered_layer_names,
+            peer_areas=peer_areas,
+        )
         chunk_grid = self._shard_chunk_grid(
             region_ids,
             block_size=nixl_agent_meta.block_size,
-            split=split,
-            kv_runs=kv_runs,
+            rows=[plan[0].rows for plan in plans],
         )
-
-        parts: list[np.ndarray] = []
-        # Axis order is `_shard_local_region_ids`'; within a region, block-major
-        # to match _compute_desc_ids' region_id * num_blocks + b.
+        remote_bases = np.asarray(nixl_agent_meta.kv_caches_base_addr, dtype=np.uint64)
+        remote_lens = np.asarray(nixl_agent_meta.block_lens, dtype=np.uint64)
+        blocks = np.arange(nixl_agent_meta.num_blocks, dtype=np.uint64)[:, None]
         # Every region for one grid before the next, which is the order
-        # `_register_shard_local_xfer_handler` builds its list in.
+        # `_register_shard_local_xfer_handler` builds its list in; within a
+        # region, block-major then piece, as `_get_block_descs_ids_for_shard`
+        # indexes it.
         passes = [[(1, 1)] * len(region_ids)]
         if chunk_grid is not None:
             passes.append([(runs, chunks) for _, runs, chunks in chunk_grid.regions])
+        parts: list[np.ndarray] = []
         for grids in passes:
-            position = iter(grids)
-            for logical_l, logical_r in logical_pairs:
-                # A model-config count describes the target's layers, and on a
-                # draft's it lands a plausible offset inside the wrong bytes. The
-                # peer's region holds the same layer, so one count answers for both
-                # sides (the handshake verifies it).
-                total_heads = self._region_kv_heads(logical_l)
-                base_l, per_slice_l = self._slice_head_bounds(
-                    self.tp_rank,
-                    self.topo.tp_size,
-                    total_heads,
-                    slices_l,
-                    side="local",
+            for plan, grid in zip(plans, grids):
+                if not grid[0]:
+                    continue
+                p = np.asarray(
+                    [(x.remote_region, x.remote_offset, x.length) for x in plan],
+                    dtype=np.uint64,
                 )
-                base_r, per_slice_r = self._slice_head_bounds(
-                    remote_tp_rank,
-                    remote_tp_size,
-                    total_heads,
-                    slices_r,
-                    side="peer",
+                region = p[:, 0].astype(np.intp)
+                starts = (
+                    remote_bases[region] + blocks * remote_lens[region] + p[:, 1]
+                ).ravel()
+                lengths = np.broadcast_to(p[:, 2], (len(blocks), len(plan))).ravel()
+                parts.append(
+                    _grid_descs(starts, lengths, grid, nixl_agent_meta.device_id)
                 )
-                ids_r = nixl_agent_meta.kv_area_slices[logical_r]
-                peer_areas_of = [
-                    [logical_r * areas_r + a for a, sid in enumerate(ids_r) if sid == j]
-                    for j in range(slices_r)
-                ]
-                for area_l in areas_iter:
-                    parts.append(
-                        self._head_matched_desc(
-                            region_id=logical_l * areas_l + area_l,
-                            head=base_l + slice_ids_l[area_l] * per_slice_l,
-                            per_slice_l=per_slice_l,
-                            peer=(base_r, per_slice_r, peer_areas_of),
-                            remote_bases=remote_bases,
-                            remote_lens=remote_lens,
-                            device_id=nixl_agent_meta.device_id,
-                            num_blocks=num_blocks,
-                            split=split,
-                            kv_runs=kv_runs,
-                            grid=next(position),
-                        )
-                    )
-        out = np.concatenate(parts)
-        # Per block, a region becomes one descriptor per head piece per peer
-        # copy per K/V range -- the same count
-        # `_register_shard_local_xfer_handler` builds locally and
-        # `_shard_descs_per_block` records -- and that again for every chunk of
-        # every run when a grid follows it.
-        fanout = replicas_r if self._writes_into_peer else 1
-        units = sum(runs * chunks for grids in passes for runs, chunks in grids)
-        assert len(out) == units * num_blocks * split * fanout * kv_runs
-        return out
+        return np.concatenate(parts)
 
     def _check_d2d_region_pairing(
         self, nixl_agent_meta: RblnNixlAgentMetadata, remote_tp_size: int
@@ -509,16 +554,16 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
             )
         # Both ranges that name less than a block cut it by a number derived
         # from OUR block size -- the chunk grid from it, the window range from
-        # `_window_grid` -- and both lists are cut by that one number. A peer whose
-        # block holds a different count is then cut into pieces that are not its
-        # own, while every byte count still fits.
-        if (self._shape.writes_part_of_a_block or self._own_engine_layout) and (
+        # `_window_grid` -- and a streamed write places its blocks by counting
+        # them on both sides. A peer whose block holds a different count is
+        # then cut or counted in pieces that are not its own.
+        if (self._shape.writes_part_of_a_request or self._own_engine_layout) and (
             nixl_agent_meta.block_size != self.block_size
         ):
             raise RuntimeError(
-                "RBLN NIXL D2D: naming less than a whole block needs both "
-                "sides to cut one the same way, but the peer's block holds "
-                f"{nixl_agent_meta.block_size} tokens and this worker's holds "
+                "RBLN NIXL D2D: naming less than a whole block or request needs "
+                "both sides to count a block the same way, but the peer's block "
+                f"holds {nixl_agent_meta.block_size} tokens and this worker's holds "
                 f"{self.block_size}."
             )
 
@@ -708,7 +753,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         if self.topo.tp_ratio(remote_tp_size) > 0:
             return None
         # Model-level is right for every region here: both the area set and
-        # the guard below reduce to cut-count ratios (`_head_split`).
+        # the guard below reduce to cut-count ratios.
         total_heads = self.topo.total_num_kv_heads
         areas_l, slices_l, slice_ids_l = self._local_band(remote_tp_size)
         base_l, per_slice_l = self._slice_head_bounds(
@@ -719,151 +764,16 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
             side="local",
         )
         heads_per_remote = total_heads // remote_tp_size
-        if per_slice_l > heads_per_remote:
-            raise RuntimeError(
-                "RBLN NIXL D2D: this rank's chiplet area spans "
-                f"{per_slice_l} KV heads but each peer rank owns only "
-                f"{heads_per_remote}, so one area would straddle several "
-                "peers. Reduce the prefill tensor-parallel size (the ratio "
-                "must not exceed the smaller of the chiplet count and this "
-                "rank's head count) or use kv_buffer_device='cpu'."
-            )
+        assert heads_per_remote % per_slice_l == 0, (
+            f"a peer rank's {heads_per_remote} heads split an area of "
+            f"{per_slice_l}; the handshake refuses that before registering"
+        )
         return [
             area_l
             for area_l in range(areas_l)
             if (base_l + slice_ids_l[area_l] * per_slice_l) // heads_per_remote
             == remote_tp_rank
         ]
-
-    def _head_matched_desc(
-        self,
-        *,
-        region_id: int,
-        head: int,
-        per_slice_l: int,
-        peer: tuple[int, int, list[list[int]]],
-        remote_bases: list[int],
-        remote_lens: list[int],
-        device_id: int,
-        num_blocks: int,
-        split: int,
-        kv_runs: int = 1,
-        grid: tuple[int, int] = (1, 1),
-    ) -> np.ndarray:
-        """Descriptors for one local region: ``split * kv_runs`` per block.
-
-        The split is the caller's, one value for the whole transfer. ``head``
-        is the first head this region's area holds; ``peer`` is the peer
-        region's band and, per slice, the region ids of the areas holding it.
-
-        ``kv_runs`` (`_kv_runs`) is 2 where the peer packs K and V into one
-        block and we read a head band out of it, since the band sits once in
-        each half. The halves are `page // kv_runs` apart, and heads run
-        contiguously inside one of them rather than across the whole block.
-
-        Order is block-major, piece-minor, K/V-innermost, to match the local
-        list `_register_shard_local_xfer_handler` builds.
-        """
-        base_r, per_slice_r, areas_of_slice = peer
-        slices_r = len(areas_of_slice)
-
-        desc_len = self.get_backend_aware_kv_block_len(
-            layer_idx=region_id, first_split=True, mamba_view=False
-        )
-        per_piece = per_slice_l // split
-        sub_len = desc_len // kv_runs // split
-
-        pieces: list[tuple[int, int]] = []
-        for j in range(split):
-            # The remote slice covering this piece's first head, and how far
-            # into it we start.
-            slice_r, head_within = divmod(head + j * per_piece - base_r, per_slice_r)
-            if not 0 <= slice_r < slices_r:
-                raise RuntimeError(
-                    f"RBLN NIXL D2D: local head {head + j * per_piece} is "
-                    f"outside the peer's range (it owns heads {base_r}.."
-                    f"{base_r + per_slice_r * slices_r - 1})."
-                )
-            # Replicas of a slice hold identical bytes, so reading any one of
-            # them answers -- but writing only one leaves the peer's other
-            # chiplets on stale KV. Reading takes the first; writing takes all.
-            holders = areas_of_slice[slice_r]
-            for remote_region in holders if self._writes_into_peer else holders[:1]:
-                page = remote_lens[remote_region]
-                if page % kv_runs != 0:
-                    raise RuntimeError(
-                        f"RBLN NIXL D2D: peer region {remote_region} block "
-                        f"length {page}B does not divide into {kv_runs} "
-                        "range(s) of K and V."
-                    )
-                kv_stride = page // kv_runs
-                if kv_stride % per_slice_r != 0:
-                    raise RuntimeError(
-                        f"RBLN NIXL D2D: peer region {remote_region} block "
-                        f"length {page}B does not split into {per_slice_r} "
-                        "heads."
-                    )
-                # Heads are contiguous inside K, and inside V, so skipping
-                # `head_within` of them is a plain byte offset into one of them.
-                head_offset = head_within * (kv_stride // per_slice_r)
-                if sub_len + head_offset > kv_stride:
-                    raise RuntimeError(
-                        f"RBLN NIXL D2D: local region {region_id} piece {j} "
-                        f"wants {sub_len}B at +{head_offset}B, past the end of "
-                        f"the peer's {kv_stride}B half of region "
-                        f"{remote_region}."
-                    )
-                pieces.append((remote_bases[remote_region] + head_offset, page))
-
-        # One grid's worth. `(1, 1)` names the piece itself, so the default is
-        # what this built before grids existed: `sub_len // 1 // 1` is
-        # `sub_len`. The caller runs every region for one grid before moving to
-        # the next, which is the order the local list is built in -- and
-        # `make_prepped_xfer` pairs the two lists by position.
-        p = np.asarray(pieces, dtype=np.uint64).reshape(-1, 2)
-        bases, pages = p[None, :, 0, None], p[None, :, 1, None]
-        block_ids = np.arange(num_blocks, dtype=np.uint64)[:, None, None]
-        kvs = np.arange(kv_runs, dtype=np.uint64)[None, None, :]
-        starts = bases + block_ids * pages + kvs * (pages // np.uint64(kv_runs))
-        return _grid_descs(starts.ravel(), sub_len, grid, device_id)
-
-    @staticmethod
-    def _head_split(cuts_l: int, cuts_r: int) -> int:
-        """How many pieces one of our regions is read in.
-
-        A descriptor names one contiguous range per side, so an area coarser than
-        the peer's slice needs as many pieces as the peer spreads its heads over.
-
-        Cuts (TP degree x slices per shard), not heads per slice: a slice holds
-        `T / cuts`, so the width ratio is `cuts_r / cuts_l` for any `T`. **One
-        split therefore serves every region even when they hold different
-        numbers of heads.**
-        """
-        if cuts_r <= cuts_l:
-            return 1
-        if cuts_r % cuts_l:
-            raise RuntimeError(
-                f"RBLN NIXL D2D: the peer cuts KV heads {cuts_r} ways and this "
-                f"rank {cuts_l}, which does not divide it; the two sides must "
-                "cut heads at commensurate granularities."
-            )
-        return cuts_r // cuts_l
-
-    @staticmethod
-    def _kv_runs(kv_per_block: int, cuts_l: int, cuts_r: int) -> int:
-        """How many ranges one piece of a block breaks into.
-
-        `kv_per_block` is what the backend's layout puts in a block: 2 when K
-        and V share it, 1 when each is its own region. A whole block is one
-        contiguous range either way, so the break only appears once a side reads
-        part of one -- a head band sits once in K and once in V.
-
-        Unequal cuts are what make a side read part of a block, and the count
-        has to match on both: the two descriptor lists pair element-wise, so the
-        side holding a whole block describes it as its halves rather than as one
-        range.
-        """
-        return kv_per_block if cuts_l != cuts_r else 1
 
     def _is_fan_in_peer(self, remote_tp_size: int) -> bool:
         """Whether this peer has MORE TP ranks than us, so we gather from it
@@ -1039,12 +949,10 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                     # ranks pair with it -- a count the transfer path has to
                     # carry, since the peer frees a request's blocks by it.
                     partial = len(overlap) < len(names)
-                    split = self._peer_head_split(metadata, remote_tp_size)
-                    kv_runs = self._peer_kv_runs(metadata, remote_tp_size)
-                    fanout = self._peer_replica_fanout(metadata, remote_tp_size)
                     fan_in = self._is_fan_in_peer(remote_tp_size)
 
-                    if self._is_head_matched_peer(remote_tp_size):
+                    head_matched = self._is_head_matched_peer(remote_tp_size)
+                    if head_matched:
                         # Different TP degrees: pair by head range, over the
                         # layers we share.
                         remote_rank_to_agent_name[(pp_rank, remote_tp_rank)] = (
@@ -1073,13 +981,26 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                         )
                         remote_rank_to_agent_name[(pp_rank, remote_tp_rank)] = agent
 
+                    # After the agent: registering it is what validates the
+                    # peer geometry the plan reads.
+                    peer_areas = self._fan_in_peer_areas(remote_tp_rank, remote_tp_size)
+                    plan = (
+                        self._head_matched_plan(
+                            metadata,
+                            remote_tp_rank,
+                            remote_tp_size,
+                            registered_layer_names=names,
+                            peer_areas=peer_areas,
+                        )
+                        if head_matched
+                        else None
+                    )
                     if not self._needs_own_descriptors(
                         pp_size=pp_size,
                         partial=partial,
                         fan_in=fan_in,
-                        split=split,
-                        fanout=fanout,
-                        kv_runs=kv_runs,
+                        pieces=plan is not None
+                        and any(len(pieces) > 1 for pieces in plan[1]),
                     ):
                         continue
                     self._register_shard_xfer_state(
@@ -1087,13 +1008,9 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                         global_rank,
                         metadata.block_size,
                         names,
-                        peer_areas=self._fan_in_peer_areas(
-                            remote_tp_rank, remote_tp_size
-                        ),
-                        split=split,
+                        peer_areas=peer_areas,
+                        plan=plan,
                         remote_tp_size=remote_tp_size,
-                        replica_fanout=fanout,
-                        kv_runs=kv_runs,
                     )
                     overlapping.append(global_rank)
         # Published once, not accumulated: a handshake that raises partway
@@ -1102,38 +1019,6 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         self._overlapping_ranks[expected_engine_id] = overlapping
         self._remote_pp_size[expected_engine_id] = pp_size
         return remote_rank_to_agent_name, best_offset
-
-    def _peer_kv_runs(
-        self, nixl_agent_meta: RblnNixlAgentMetadata, remote_tp_size: int
-    ) -> int:
-        """`_kv_runs` for a peer, from its advertised chiplet geometry.
-
-        A peer of our own width is named in whole blocks, which are contiguous
-        under either layout. The window view also reads part of a block, and
-        takes its own count from the layout (`register_local_xfer_handler`).
-        """
-        if not self._is_head_matched_peer(remote_tp_size):
-            return 1
-        return self._kv_runs(
-            self._kv_per_block,
-            self.topo.tp_size * self._local_band(remote_tp_size)[1],
-            remote_tp_size * self._peer_band(nixl_agent_meta, remote_tp_size)[1],
-        )
-
-    def _peer_head_split(
-        self, nixl_agent_meta: RblnNixlAgentMetadata, remote_tp_size: int
-    ) -> int:
-        """`_head_split` for a peer, from its advertised chiplet geometry.
-
-        Reads no head count, so it runs before any per-region band exists -- a
-        transfer is set up ahead of the handshake check on a layer's width.
-        """
-        if not self._is_head_matched_peer(remote_tp_size):
-            return 1
-        return self._head_split(
-            self.topo.tp_size * self._local_band(remote_tp_size)[1],
-            remote_tp_size * self._peer_band(nixl_agent_meta, remote_tp_size)[1],
-        )
 
     def _peer_region_ids(
         self, nixl_agent_meta: RblnNixlAgentMetadata
@@ -1161,23 +1046,6 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         if region_ids == list(range(n_peer)):
             return None
         return region_ids
-
-    def _peer_replica_fanout(
-        self, nixl_agent_meta: RblnNixlAgentMetadata, remote_tp_size: int
-    ) -> int:
-        """How many of the peer's copies of a slice one transfer must touch.
-
-        The compiler duplicates a KV head across chiplet areas when a shard
-        owns fewer heads than the device has chiplets. Reading is free to pick
-        one; writing has to fill them all, or the peer's other chiplets keep
-        serving what was there before.
-        """
-        if not self._writes_into_peer:
-            return 1
-        if not self._is_head_matched_peer(remote_tp_size):
-            return 1
-        areas_r, slices_r = self._peer_band(nixl_agent_meta, remote_tp_size)
-        return areas_r // slices_r
 
     def _query_agent_meta(
         self,
@@ -1363,9 +1231,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         pp_size: int,
         partial: bool,
         fan_in: bool,
-        split: int,
-        fanout: int,
-        kv_runs: int,
+        pieces: bool,
     ) -> bool:
         """Whether this peer needs descriptors of ours rather than upstream's.
 
@@ -1373,11 +1239,11 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         whole request. That describes a peer only while nothing about the
         transfer is narrower than the engine, so each way one can be is a
         reason here: a pipelined producer holds part of the layers, a partial
-        overlap part of the names, a fan-in peer part of the heads, and a split
-        reads part of a region. A fan-out peer counts even at one piece per
-        head, because the remote list carries a descriptor per copy where
-        upstream's handle carries one per block, and so does a K/V split,
-        where upstream names a block once and our list names it per range.
+        overlap part of the names, a fan-in peer part of the heads, and
+        `pieces` -- a region exchanged in more than one piece a block -- part
+        of a region. That counts a peer replica and a K/V half as well as a
+        head piece: upstream's handle names a block once, where our list names
+        it once a piece.
         """
         # Trimming narrows a block rather than a peer, and the per-shard ids
         # are what can leave part of one out. Streaming narrows neither: its
@@ -1388,10 +1254,8 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
             pp_size > 1
             or partial
             or fan_in
-            or split > 1
-            or fanout > 1
-            or kv_runs > 1
-            or (self._shape.writes_part_of_a_block and not self._own_engine_layout)
+            or pieces
+            or (self._shape.writes_part_of_a_request and not self._own_engine_layout)
         )
 
     def _register_shard_xfer_state(
@@ -1401,23 +1265,32 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         block_size: int,
         registered_layer_names: tuple[str, ...],
         peer_areas: list[int] | None = None,
-        split: int = 1,
+        plan: tuple[list[int], list[list[Piece]]] | None = None,
         remote_tp_size: int = 1,
-        replica_fanout: int = 1,
-        kv_runs: int = 1,
     ) -> None:
+        """Register one peer shard's local list and what indexes into it.
+
+        `plan` is `_head_matched_plan`'s for a peer of another TP degree; None
+        names every region whole.
+        """
         # A context cut pairs only at equal TP (`_check_split_axis_constraints`),
-        # where no area filter, head piece or replica fan-out applies.
+        # where no area filter or piece applies.
         assert all(
             g.axis is not ChipletSplitAxis.TOKEN for g in self._logical_region_geometry
-        ) or (peer_areas is None and split == 1 and replica_fanout == 1)
+        ) or (peer_areas is None and plan is None)
         # Compute the local region ids once and reuse them for the handler
         # (SWA never reaches a pipelined peer: it is rejected earlier).
-        region_ids = self._shard_local_region_ids(
-            registered_layer_names, peer_areas=peer_areas
-        )
+        if plan is None:
+            region_ids = self._shard_local_region_ids(
+                registered_layer_names, peer_areas=peer_areas
+            )
+            pieces = None
+        else:
+            region_ids, pieces = plan
         chunk_grid = self._shard_chunk_grid(
-            region_ids, block_size=block_size, split=split, kv_runs=kv_runs
+            region_ids,
+            block_size=block_size,
+            rows=None if pieces is None else [p[0].rows for p in pieces],
         )
         key = (engine_id, global_rank, block_size)
         handle = self._base_fan_in_handle(
@@ -1430,10 +1303,8 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                 block_size,
                 registered_layer_names=registered_layer_names,
                 peer_areas=peer_areas,
-                split=split,
                 region_ids=region_ids,
-                replica_fanout=replica_fanout,
-                kv_runs=kv_runs,
+                pieces=pieces,
                 chunk_grid=chunk_grid,
             )
         self.src_xfer_handles_by_remote[key] = handle
@@ -1444,7 +1315,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         )
         self._shard_region_group_ids[(engine_id, global_rank)] = (0,) * len(region_ids)
         self._shard_descs_per_block[(engine_id, global_rank)] = (
-            split * replica_fanout * kv_runs
+            (1,) * len(region_ids) if pieces is None else tuple(map(len, pieces))
         )
         self._shard_chunk_grids[(engine_id, global_rank)] = chunk_grid
         self._shard_region_spans[(engine_id, global_rank)] = tuple(
@@ -1455,8 +1326,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         """(areas, slices, the slice each area holds) every head-banded region
         of this engine shares.
 
-        One split and one K/V run count serve a whole peer (`_head_split`), and
-        the areas a finer peer holds are one filter for every region
+        The areas a finer peer holds are one filter for every region
         (`_fan_in_peer_areas`), so pairing by head band needs the banded regions
         to lay their slices alike; a speculative draft cut into another number
         of slices does not. Per peer, not at registration: symmetric TP does not
@@ -1874,7 +1744,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         if window is not None:
             grids.append([window] * len(pieces))
         grid = self._shard_chunk_grid(
-            range(len(pieces)), block_size=nixl_agent_meta.block_size, split=1
+            range(len(pieces)), block_size=nixl_agent_meta.block_size
         )
         if grid is not None:
             grids.append([(runs, chunks) for _, runs, chunks in grid.regions])

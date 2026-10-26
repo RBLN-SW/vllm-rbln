@@ -201,8 +201,14 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
                 else 0
             ),
         )
-        base_hash = self.compat_hash
-        assert base_hash is not None
+        # Upstream hashes the first attention backend among this rank's layers,
+        # which can differ between pipeline stages of a model that mixes backends,
+        # so a peer pairing with every stage would fail the hash on some of them.
+        # Both registration paths reach here; on host staging upstream has
+        # already hashed that backend, and this replaces it.
+        base_hash = compute_nixl_compatibility_hash(
+            self.vllm_config, "RBLN", transfer_mode=self._TRANSFER_MODE
+        )
         self.compat_hash = rbln_compat_hash(
             base_hash,
             writes_into_peer=self._writes_into_peer,
@@ -234,11 +240,6 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
             if not self._has_mamba
             else None,
             is_mamba=self._has_mamba,
-        )
-        self.compat_hash = compute_nixl_compatibility_hash(
-            self.vllm_config,
-            self.backend_name,
-            transfer_mode=self._TRANSFER_MODE,
         )
 
         # Device id for the RBLN backend's RblnContext.
@@ -476,33 +477,35 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         full_groups = sum(
             not isinstance(spec, SlidingWindowSpec) for spec in self._group_specs
         )
-        # Streaming names part of a block for its own reason and needs the
+        # Streaming names part of a request for its own reason and needs the
         # same shape to do it: one group whose blocks it counts in, and any
         # other group described by a range of its own.
-        cutter = "chunk_mode" if self._shape.chunk_mode else "a streamed write"
+        writer = "chunk_mode" if self._shape.chunk_mode else "a streamed write"
         # One group is all it asks: `_own_engine_layout` is already true for
-        # every multi-group engine that writes part of a block, and both counts
-        # come off `transfer_groups`, so a second term could only repeat this.
-        if self._shape.writes_part_of_a_block and full_groups != 1:
+        # every multi-group engine that writes part of a request, and both
+        # counts come off `transfer_groups`, so a second term could only repeat
+        # this.
+        if self._shape.writes_part_of_a_request and full_groups != 1:
             raise RuntimeError(
-                f"RBLN NIXL (D2D): {cutter} needs one full-attention KV-cache "
+                f"RBLN NIXL (D2D): {writer} needs one full-attention KV-cache "
                 "group, and any other group to be a sliding window whose view "
                 f"it can extend. Got groups={len(self._group_specs)}, "
                 f"full={full_groups}, swa={self._shape.has_swa}, "
                 f"sw_ratio={self._shape.window_ratio}."
             )
-        # An engine that owns the whole-engine lists names a block's chunks
-        # there without naming which span holds the request's last token -- so
-        # a block cut into several spans would send chunks past the request's
-        # own blocks. A head cut leaves one span a block.
+        # The whole-engine lists name a block's chunks without naming which
+        # span holds the request's last token, so a block cut into several
+        # spans would send chunks past the request's own blocks. A streamed
+        # write cuts no block but still counts its coverage in those spans,
+        # which these lists were never shown to place. A head cut has one span.
         region_axes = [geometry.axis for geometry in geometries]
         if (
-            self._shape.writes_part_of_a_block
+            self._shape.writes_part_of_a_request
             and self._own_engine_layout
             and ChipletSplitAxis.TOKEN in region_axes
         ):
             raise RuntimeError(
-                f"RBLN NIXL (D2D): {cutter} on a sliding-window engine needs "
+                f"RBLN NIXL (D2D): {writer} on a sliding-window engine needs "
                 "a head cut, which leaves one token range a block. This cache "
                 f"is cut on the axes {[a.name for a in region_axes]} into "
                 f"{areas} area(s)."
@@ -531,7 +534,7 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         # selects in. The window range has no such parameter, so the builders
         # read the value parked here rather than ask twice.
         self._chunk_grid = self._shard_chunk_grid(
-            range(self.num_regions), block_size=self.block_size, split=1
+            range(self.num_regions), block_size=self.block_size
         )
         self._window_grid_cut = self._window_grid()
         # Said once here rather than per peer: every list counts a block in
