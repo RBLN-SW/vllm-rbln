@@ -212,10 +212,12 @@ class TestHostBufferCopyOp:
 
 
 class TestRegisterKvCachesWithConnector:
-    """The connector is handed whatever the runner holds when it is called.
+    """The connector is handed the storage the runner holds when it is called.
 
-    The worker calls it after `initialize_kv_cache` on a run that keeps that
-    cache, and again after a dynamic-KV resize has rebuilt every tensor.
+    Each cache goes out as the runner's own tensor, or as a view of it where
+    connectors need another shape. The worker registers after
+    `initialize_kv_cache` on a run that keeps that cache, and again after a
+    dynamic-KV resize has rebuilt every tensor.
     """
 
     @staticmethod
@@ -285,8 +287,8 @@ class TestRegisterKvCachesWithConnector:
     ):
         # The DSA indexer's fp16 scale cache is allocated [num_blocks,
         # block_size]. Connectors read every per-token cache with a trailing
-        # width, so it goes out as [num_blocks, block_size, 1] over the same
-        # storage; every other cache is handed over as is.
+        # width, so they get a [num_blocks, block_size, 1] view of it; the
+        # kernels keep the flat tensor, and every other cache goes out as is.
         registered = self._registrations(monkeypatch)
         runner = make_model_runner(
             layers=("layer.0", "layer.1"),
@@ -305,6 +307,7 @@ class TestRegisterKvCachesWithConnector:
         assert attn is runner.kv_caches[0]
         assert tuple(scale.shape) == (4, 16, 1)
         assert scale.data_ptr() == flat.data_ptr()
+        assert runner.kv_caches[1] is flat
 
     def test_a_rebuilt_cache_is_what_the_second_call_registers(
         self, make_model_runner, monkeypatch

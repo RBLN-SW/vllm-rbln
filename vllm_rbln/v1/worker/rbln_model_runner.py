@@ -3455,7 +3455,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         The worker drives this instead of `initialize_kv_cache`: a dynamic-KV
         resize replaces every tensor after warm-up, so the caches worth
-        registering are the ones standing at that point.
+        registering are the ones standing at that point. A connector may get a
+        view rather than the runner's tensor, so it must not re-point one with
+        `set_()`: the runner's tensor would stay on the old storage.
         """
         if not has_kv_transfer_group():
             return
@@ -3466,14 +3468,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 self.cross_layers_kv_cache, self.cross_layers_attn_backend
             )
         else:
-            # Every layer, in layer-index order, as upstream hands them over:
-            # a token-level connector (LMCache) addresses each layer through its
-            # own view. RBLN NIXL registers storage and picks one layer per
-            # buffer itself. The DSA indexer's fp16 scale cache is allocated
-            # flat, [num_blocks, block_size], because the compiler refuses a
-            # squeeze on a dynamic input; connectors get the shape upstream
-            # allocates for that MLA spec, [num_blocks, block_size, 1], as a
-            # view of the same storage.
+            # Every layer, in layer-index order: a token-level connector (LMCache)
+            # addresses each layer through its own view, and RBLN NIXL registers
+            # storage and picks one layer per buffer. The DSA indexer scale cache
+            # stays flat for the kernels (no squeeze on a dynamic input); connectors
+            # get it as [num_blocks, block_size, 1], like the other RBLN MLA caches.
             kv_transfer_group.register_kv_caches(
                 {
                     name: cache.unsqueeze(-1) if cache.dim() == 2 else cache
