@@ -31,11 +31,10 @@ from vllm_rbln.v1.attention.backends.mla.indexer import (
     RBLNDeepseekV32IndexerScaleBackend,
 )
 from vllm_rbln.v1.worker.utils import (
-    indexer_scale_cache_dtype,
-    pipeline_adjusted_layer_index,
+    num_attn_module as rbln_num_attn_module,
 )
 from vllm_rbln.v1.worker.utils import (
-    num_attn_module as rbln_num_attn_module,
+    pipeline_adjusted_layer_index,
 )
 
 logger = init_logger(__name__)
@@ -187,7 +186,7 @@ def rbln_indexer_cache_init(self, *args, **kwargs) -> None:
         _original_indexer_cache_init(
             scale,
             head_dim=1,
-            dtype=indexer_scale_cache_dtype(model_config),
+            dtype=RBLNDeepseekV32IndexerScaleBackend.cache_dtype(model_config.dtype),
             prefix=f"{self.prefix}.scale_cache",
             cache_config=self.cache_config,
         )

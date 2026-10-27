@@ -65,7 +65,6 @@ from vllm_rbln.v1.worker.utils import (
     get_rbln_owned_card_indices,
     get_rbln_planned_affinity_cpu_count,
     get_rbln_visible_card_indices,
-    indexer_scale_cache_dtype,
     prepare_kernel_block_sizes,
     rbln_device_dram_total_bytes,
     read_rbln_card_dram_used_bytes,
@@ -1913,17 +1912,3 @@ class TestRescaleKvCacheConfig:
     def test_a_zero_block_config_is_refused(self):
         with pytest.raises(ValueError, match="cannot rescale"):
             rescale_kv_cache_config(self._cfg(0), 5)
-
-
-class TestIndexerScaleCacheDtype:
-    """The scale cache next to an fp8 indexer key cache follows the compute
-    dtype the indexer kernel declares for it."""
-
-    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-    def test_follows_the_model_dtype(self, dtype):
-        assert indexer_scale_cache_dtype(SimpleNamespace(dtype=dtype)) == dtype
-
-    @pytest.mark.parametrize("dtype", [torch.float32, torch.float8_e4m3fn])
-    def test_a_dtype_without_an_indexer_kernel_is_refused(self, dtype):
-        with pytest.raises(ValueError, match="float16 or bfloat16"):
-            indexer_scale_cache_dtype(SimpleNamespace(dtype=dtype))
