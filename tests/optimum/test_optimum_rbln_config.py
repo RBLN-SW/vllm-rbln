@@ -169,13 +169,18 @@ def test_the_former_prefix_block_size_key_is_accepted():
 
 @pytest.mark.parametrize("num_blocks", [None, 16])
 @pytest.mark.parametrize("utilization", [0.5, 0.9, 1.0])
-def test_explicit_blocks_require_full_memory_utilization(
-    monkeypatch, num_blocks, utilization
+def test_explicit_blocks_normalize_memory_utilization_with_log(
+    monkeypatch, caplog, num_blocks, utilization
 ):
     from vllm_rbln.platform.optimum_impl import check_and_update
     from vllm_rbln.utils.optimum import converter, predicates
 
-    monkeypatch.setattr(converter, "sync_vllm_and_optimum", lambda cfg: None)
+    synced_utilizations = []
+    monkeypatch.setattr(
+        converter,
+        "sync_vllm_and_optimum",
+        lambda cfg: synced_utilizations.append(cfg.cache_config.gpu_memory_utilization),
+    )
     monkeypatch.setattr(predicates, "forces_fp32_dtype", lambda cfg: False)
     hf_config = SimpleNamespace(architectures=["LlamaForCausalLM"])
     cache_config = CacheConfig(
@@ -198,13 +203,23 @@ def test_explicit_blocks_require_full_memory_utilization(
         scheduler_config=SimpleNamespace(async_scheduling=False),
         speculative_config=None,
     )
-    if num_blocks is not None and utilization != 1.0:
-        with pytest.raises(ValueError, match="Set gpu_memory_utilization=1.0"):
-            check_and_update(cfg)
-    else:
+    with caplog.at_level("INFO", logger="vllm_rbln.platform.optimum_impl"):
         check_and_update(cfg)
-    assert cache_config.gpu_memory_utilization == utilization
+    expected_utilization = 1.0 if num_blocks is not None else utilization
+    assert cache_config.gpu_memory_utilization == expected_utilization
+    assert synced_utilizations == [expected_utilization]
     assert cache_config.num_gpu_blocks_override == num_blocks
+    messages = [
+        r.getMessage()
+        for r in caplog.records
+        if "Setting gpu_memory_utilization" in r.getMessage()
+    ]
+    if num_blocks is not None and utilization != 1.0:
+        assert len(messages) == 1
+        assert f"from {utilization} to 1.0" in messages[0]
+        assert f"num_gpu_blocks_override={num_blocks}" in messages[0]
+    else:
+        assert messages == []
 
 
 def test_only_compile_fields_change_the_hash():
