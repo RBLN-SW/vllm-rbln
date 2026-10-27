@@ -136,9 +136,10 @@ def test_transformers_config_is_forwarded_as_the_config_object(monkeypatch, tmp_
     assert "num_hidden_layers" not in passed
 
 
-@pytest.mark.parametrize("num_blocks", [None, 16])
-@pytest.mark.parametrize("utilization", [0.5, 0.9])
-def test_explicit_vllm_blocks_take_precedence_over_memory_utilization(
+@pytest.mark.parametrize(
+    "num_blocks, utilization", [(None, 0.5), (None, 0.9), (16, 1.0)]
+)
+def test_validated_vllm_cache_settings_select_compile_budget(
     monkeypatch, tmp_path, num_blocks, utilization
 ):
     monkeypatch.setenv("RBLN_FORCE_NPU_NAME", "RBLN-CA25")

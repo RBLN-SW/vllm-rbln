@@ -40,6 +40,17 @@ def check_and_update(vllm_config: "VllmConfig") -> None:
     from vllm_rbln.utils.optimum.predicates import forces_fp32_dtype
     from vllm_rbln.utils.optimum.registry import is_pooling_arch
 
+    cache_config = vllm_config.cache_config
+    if (
+        cache_config.num_gpu_blocks_override is not None
+        and cache_config.gpu_memory_utilization != 1.0
+    ):
+        raise ValueError(
+            "num_gpu_blocks_override requires gpu_memory_utilization=1.0. "
+            "Set gpu_memory_utilization=1.0 (--gpu-memory-utilization 1.0) "
+            "when specifying num_gpu_blocks_override."
+        )
+
     # Everything below, and the sync at the end, reads additional_config as an
     # OptimumRBLNConfig. The sync also writes its derived fields back.
     vllm_config.additional_config = build_optimum_rbln_config(
