@@ -576,6 +576,49 @@ class TestInitDeviceEnv:
         )
         assert os.environ["RBLN_VISIBLE_DEVICES"] == expected
 
+    def test_local_rank_devices_list_every_rank_on_the_node(self, make_worker):
+        # In-process DP: the pool entry of every worker, in local rank order.
+        os.environ["RBLN_VISIBLE_DEVICES"] = "4,5,6,7"
+        worker = make_worker(
+            world_size=2,
+            data_parallel_size=2,
+            data_parallel_rank=1,
+            data_parallel_rank_local=1,
+            local_rank=0,
+        )
+        assert worker.local_rank_devices == [4, 5, 6, 7]
+
+    def test_local_rank_devices_survive_the_executor_mapping(self, make_worker):
+        # MultiprocExecutor publishes this DP rank's one-card shard before the
+        # worker exists; the other ranks' cards still come from the pool.
+        worker = make_worker(
+            world_size=1,
+            data_parallel_size=4,
+            data_parallel_rank=2,
+            data_parallel_rank_local=2,
+            assigned_physical_gpu_ids=[2],
+        )
+        assert worker.local_rank_devices == [0, 1, 2, 3]
+
+    @pytest.mark.parametrize(
+        "dp_size, dp_rank, dp_rank_local, assigned",
+        [
+            (4, 2, 0, [2]),  # multi-port external LB: the peers are other servers
+            (1, 0, 0, [2, 3]),  # --device-ids picks devices outside the pool order
+        ],
+    )
+    def test_local_rank_devices_unknown_without_the_whole_node(
+        self, make_worker, dp_size, dp_rank, dp_rank_local, assigned
+    ):
+        worker = make_worker(
+            world_size=len(assigned) if dp_size == 1 else 1,
+            data_parallel_size=dp_size,
+            data_parallel_rank=dp_rank,
+            data_parallel_rank_local=dp_rank_local,
+            assigned_physical_gpu_ids=assigned,
+        )
+        assert worker.local_rank_devices is None
+
     @pytest.mark.parametrize("local_rank, expected", [(0, "2"), (1, "3")])
     def test_tp2_dp_server_given_its_own_pool(self, make_worker, local_rank, expected):
         # One server per DP rank started by hand with RBLN_VISIBLE_DEVICES set to

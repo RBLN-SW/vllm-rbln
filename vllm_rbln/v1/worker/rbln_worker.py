@@ -141,6 +141,27 @@ class RBLNWorker(WorkerBase):
         # In-process DP (InprocClient) gets no mapping, so offset into the pool
         # by the local DP rank, as upstream's GPU worker does.
         assigned = self.parallel_config.assigned_physical_gpu_ids
+        # Every local worker's pool entry, read before env_var narrows to this
+        # rank's: CPU binding splits a NUMA node among the ranks whose NPUs sit on
+        # it. Left unknown unless this node runs every rank from the pool, since a
+        # rank outside it would share cores it cannot see.
+        pc = self.parallel_config
+        raw = os.environ.get(env_var, "")
+        pool = [entry for entry in raw.split(",") if entry.strip()] or None
+        indices = [
+            dp * pc.world_size + r
+            for dp in range(pc.data_parallel_size_local)
+            for r in range(pc.local_world_size)
+        ]
+        self.local_rank_devices: list[int] | None = None
+        if len(indices) == pc.world_size_across_dp and (
+            pool is None or indices[-1] < len(pool)
+        ):
+            devices = [i if pool is None else int(pool[i]) for i in indices]
+            start = (pc.data_parallel_rank_local or 0) * pc.local_world_size
+            own = devices[start : start + pc.local_world_size]
+            if assigned is None or own == [int(device) for device in assigned]:
+                self.local_rank_devices = devices
         if assigned is not None:
             set_assigned_physical_gpu_ids(assigned)
             device_id = self.local_rank
@@ -753,6 +774,7 @@ class RBLNWorker(WorkerBase):
             self.rank,
             self.local_rank,
             self.parallel_config,
+            self.local_rank_devices,
         )
         num_threads = get_default_num_threads(
             allocated_cpus, get_num_local_ranks(self.parallel_config)
@@ -789,6 +811,7 @@ class RBLNWorker(WorkerBase):
             self.rank,
             self.local_rank,
             self.parallel_config,
+            self.local_rank_devices,
         )
         self._rbln_cpu_affinity_applied = True
 

@@ -21,7 +21,7 @@ import platform
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timezone
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Literal, NoReturn, TypeVar
@@ -321,16 +321,23 @@ def get_rbln_owned_card_indices() -> list[int]:
     raw = os.environ.get("RBLN_VISIBLE_DEVICES", "")
     if not raw.strip():
         return present
-    owned: list[int] = []
-    for token in raw.replace(",", " ").split():
-        if not token.strip():
-            continue
-        index = int(token)
-        if 0 <= index < len(present):
-            owned.append(present[index])
-        elif index in present:
-            owned.append(index)
-    return sorted(set(owned)) or present
+    owned = {
+        card
+        for token in raw.replace(",", " ").split()
+        if token.strip() and (card := rbln_card_index(int(token), present)) is not None
+    }
+    return sorted(owned) or present
+
+
+def rbln_card_index(entry: int, present: list[int]) -> int | None:
+    """sysfs card index an `RBLN_VISIBLE_DEVICES` entry selects among `present`.
+
+    Positional first, then a physical name, as `get_rbln_owned_card_indices`
+    documents; None when the entry names no present card.
+    """
+    if 0 <= entry < len(present):
+        return present[entry]
+    return entry if entry in present else None
 
 
 def _read_card_attr_int(card_index: int, attr: str) -> int | None:
@@ -340,37 +347,6 @@ def _read_card_attr_int(card_index: int, attr: str) -> int | None:
             return int(handle.read().strip())
     except (OSError, ValueError):
         return None
-
-
-def rbln_npu_numa_placement() -> tuple[int, int, int] | None:
-    """Where this rank's NPUs sit: (numa_node, position, ranks_on_node).
-
-    The split is derived from the cards the container exposes, so it does not
-    depend on which rank took which card: ranks_on_node is the exposed cards on
-    that node divided by the cards this rank owns, and position is this rank's
-    slot among them by card index. None when a card's NUMA node is unknown, the
-    owned cards span two nodes, or the node's cards do not split evenly.
-    """
-    present = _rbln_present_card_indices()
-    owned = get_rbln_owned_card_indices()
-    if not present or not owned:
-        return None
-    numa_of: dict[int, int] = {}
-    for card in present:
-        node = _read_card_attr_int(card, os.path.join("device", "numa_node"))
-        if node is None or node < 0:
-            return None
-        numa_of[card] = node
-    if any(card not in numa_of for card in owned):
-        return None
-    nodes = {numa_of[card] for card in owned}
-    if len(nodes) != 1:
-        return None
-    node = nodes.pop()
-    on_node = sorted(card for card, n in numa_of.items() if n == node)
-    if len(on_node) % len(owned):
-        return None
-    return node, on_node.index(min(owned)) // len(owned), len(on_node) // len(owned)
 
 
 def rbln_device_dram_total_bytes() -> int | None:
@@ -881,6 +857,7 @@ def get_autobind_cpu_ids(
     local_rank: int,
     parallel_config: ParallelConfig,
     cpu_selector: Callable[[list[LogicalCPUInfo]], list[LogicalCPUInfo]],
+    local_rank_devices: Sequence[int] | None = None,
 ) -> str:
     """Get CPU IDs for automatic thread binding based on NUMA nodes.
 
@@ -889,6 +866,9 @@ def get_autobind_cpu_ids(
         local_rank: Local rank of the worker.
         parallel_config: Parallel configuration.
         cpu_selector: Function to select CPUs from each physical core.
+        local_rank_devices: `RBLN_VISIBLE_DEVICES` entry of every worker on
+            this node, indexed by local DP rank * local world size + local rank;
+            None when the worker could not derive it.
 
     Returns:
         Comma-separated string of CPU IDs, or "all" or "nobind".
@@ -925,14 +905,27 @@ def get_autobind_cpu_ids(
         )
         return "all"
 
-    # Prefer the node this rank's own NPUs sit on; the rank round-robin below
-    # ignores the cards and puts half the ranks across the socket whenever the
-    # cards are not laid out NUMA-alternating by rank.
-    placement = rbln_npu_numa_placement()
-    if placement is not None and placement[0] in available_numa_nodes:
-        selected_numa_node, rank_position, ranks_on_node = placement
-        ranks_in_same_numa = list(range(ranks_on_node))
-        rank_in_numa = rank_position
+    # Split the node each rank's own NPU sits on among the ranks whose NPUs are
+    # there; the rank round-robin ignores the cards and puts half the ranks
+    # across the socket unless the cards alternate NUMA nodes by rank.
+    npu_nodes: list[int | None] = []
+    present = _rbln_present_card_indices()
+    if local_rank_devices is not None and present:
+        for entry in local_rank_devices:
+            card = rbln_card_index(entry, present)
+            npu_nodes.append(
+                None
+                if card is None
+                else _read_card_attr_int(card, os.path.join("device", "numa_node"))
+            )
+    if npu_nodes and all(node in available_numa_nodes for node in npu_nodes):
+        rank_in_numa = (
+            parallel_config.data_parallel_rank_local or 0
+        ) * parallel_config.local_world_size + local_rank
+        selected_numa_node = npu_nodes[rank_in_numa]
+        ranks_in_same_numa = [
+            r for r, node in enumerate(npu_nodes) if node == selected_numa_node
+        ]
     else:
         numa_node_idx = rank_across_dp % len(available_numa_nodes)
         selected_numa_node = available_numa_nodes[numa_node_idx]
@@ -1010,6 +1003,7 @@ def compute_rbln_local_omp_cpuid(
     rank: int,
     local_rank: int,
     parallel_config: ParallelConfig,
+    local_rank_devices: Sequence[int] | None = None,
 ) -> str:
     """CPU set string that ``set_cpu_affinity`` will use (comma list, ``all``, or
     ``nobind``)."""
@@ -1022,11 +1016,16 @@ def compute_rbln_local_omp_cpuid(
                 local_rank,
                 parallel_config,
                 lambda cpus: [cpu for cpu in cpus if cpu.id % 8 < 4],
+                local_rank_devices,
             )
         if cpu_arch == CpuArchEnum.X86:
             # For x86 SMT-2, use 1 CPU per core
             return get_autobind_cpu_ids(
-                rank, local_rank, parallel_config, lambda cpus: cpus[:1]
+                rank,
+                local_rank,
+                parallel_config,
+                lambda cpus: cpus[:1],
+                local_rank_devices,
             )
         return "nobind"
     return "nobind"
@@ -1036,6 +1035,7 @@ def get_rbln_planned_affinity_cpu_count(
     rank: int,
     local_rank: int,
     parallel_config: ParallelConfig,
+    local_rank_devices: Sequence[int] | None = None,
 ) -> int:
     """Logical CPU count this rank will pin to after NUMA split (before
     ``sched_setaffinity``).
@@ -1044,7 +1044,9 @@ def get_rbln_planned_affinity_cpu_count(
     counts match the post-bind CPU mask. If binding is ``nobind``/``all``, uses the
     current ``sched_getaffinity`` mask.
     """
-    local_omp_cpuid = compute_rbln_local_omp_cpuid(rank, local_rank, parallel_config)
+    local_omp_cpuid = compute_rbln_local_omp_cpuid(
+        rank, local_rank, parallel_config, local_rank_devices
+    )
     if local_omp_cpuid not in ("all", "nobind"):
         cpu_ids = [int(x.strip()) for x in local_omp_cpuid.split(",") if x.strip()]
         return max(1, len(cpu_ids))
@@ -1126,6 +1128,7 @@ def set_cpu_affinity(
     rank: int,
     local_rank: int,
     parallel_config: ParallelConfig,
+    local_rank_devices: Sequence[int] | None = None,
 ) -> None:
     """Setup thread affinity based on NUMA nodes.
 
@@ -1134,7 +1137,9 @@ def set_cpu_affinity(
         local_rank: Local rank of the worker.
         parallel_config: Parallel configuration.
     """
-    local_omp_cpuid = compute_rbln_local_omp_cpuid(rank, local_rank, parallel_config)
+    local_omp_cpuid = compute_rbln_local_omp_cpuid(
+        rank, local_rank, parallel_config, local_rank_devices
+    )
 
     if local_omp_cpuid not in ("all", "nobind"):
         # Parse CPU IDs from string (e.g., "0,1,2,3" -> [0, 1, 2, 3])
