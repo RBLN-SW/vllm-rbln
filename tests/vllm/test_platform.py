@@ -32,7 +32,7 @@ from unittest.mock import patch
 import pytest
 import torch
 from pydantic import ValidationError
-from vllm.config import CompilationMode, VllmConfig
+from vllm.config import CompilationMode, ECTransferConfig, VllmConfig
 from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -454,6 +454,18 @@ class TestRejectedConfigs:
         with pytest.raises(ValueError, match="RBLN_USE_CUSTOM_KERNEL"):
             reconfigure(custom_kernel(True))
         reconfigure(custom_kernel(None))
+
+    def test_an_ec_consumer_without_its_language_model(self, reconfigure):
+        def mutate(config):
+            config.ec_transfer_config = ECTransferConfig(
+                ec_connector="RblnECNixlConnector", ec_role="ec_consumer"
+            )
+            config.model_config.multimodal_config = SimpleNamespace(
+                mm_encoder_only=True
+            )
+
+        with pytest.raises(ValueError, match="--mm-encoder-only"):
+            reconfigure(mutate)
 
     def test_lora(self, reconfigure):
         with pytest.raises(ValueError, match="LoRA"):
