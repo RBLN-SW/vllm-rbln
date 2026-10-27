@@ -25,6 +25,7 @@ from torch import nn
 from transformers import PretrainedConfig
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
+    get_pp_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
@@ -60,10 +61,14 @@ from vllm.model_executor.models.glm4_1v import (
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
     SupportsMultiModal,
+    SupportsPP,
 )
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
+    PPMissingLayer,
     WeightsMapper,
+    is_pp_missing_parameter,
+    make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
 )
@@ -942,9 +947,12 @@ class RBLNGlm5NextModel(nn.Module):
         quant_config = vllm_config.quant_config
         self.n = config.mhc_num_residual_streams
 
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size, config.hidden_size, prefix=f"{prefix}.embed_tokens"
-        )
+        if get_pp_group().is_first_rank:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size, config.hidden_size, prefix=f"{prefix}.embed_tokens"
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: RBLNGlm5NextDecoderLayer(
@@ -952,7 +960,14 @@ class RBLNGlm5NextModel(nn.Module):
             ),
             prefix=f"{prefix}.layers",
         )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        if get_pp_group().is_last_rank:
+            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            self.norm = PPMissingLayer()
+        # A stage hands the next its residual streams [B, n, T, H] as [B, T, n * H].
+        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
+            ["streams"], self.n * config.hidden_size
+        )
         kda = [
             layer.self_attn
             for layer in islice(self.layers, self.start_layer, self.end_layer)
@@ -970,16 +985,26 @@ class RBLNGlm5NextModel(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        x = (
-            inputs_embeds
-            if inputs_embeds is not None
-            else self.embed_input_ids(input_ids)
-        )
-        batch, tokens, hidden = x.shape
-        streams = x.unsqueeze(1).expand(batch, self.n, tokens, hidden).contiguous()
+    ) -> torch.Tensor | IntermediateTensors:
+        if get_pp_group().is_first_rank:
+            x = (
+                inputs_embeds
+                if inputs_embeds is not None
+                else self.embed_input_ids(input_ids)
+            )
+            batch, tokens, hidden = x.shape
+            streams = x.unsqueeze(1).expand(batch, self.n, tokens, hidden).contiguous()
+        else:
+            assert intermediate_tensors is not None
+            flat = intermediate_tensors["streams"]
+            batch, tokens, _ = flat.shape
+            streams = flat.view(batch, tokens, self.n, -1).transpose(1, 2).contiguous()
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             streams = layer(streams)
+        if not get_pp_group().is_last_rank:
+            return IntermediateTensors(
+                {"streams": streams.transpose(1, 2).reshape(batch, tokens, -1)}
+            )
         return self.norm(streams.mean(dim=1))
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -988,13 +1013,16 @@ class RBLNGlm5NextModel(nn.Module):
             self.config,
             weights,
             lambda name: (
-                not name.startswith("layers.")
-                or self.start_layer <= int(name.split(".", 2)[1]) < self.end_layer
+                (
+                    not name.startswith("layers.")
+                    or self.start_layer <= int(name.split(".", 2)[1]) < self.end_layer
+                )
+                and not is_pp_missing_parameter(name, self)
             ),
         )
 
 
-class RBLNGlm5NextForCausalLM(nn.Module):
+class RBLNGlm5NextForCausalLM(nn.Module, SupportsPP):
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
             "model.language_model.": "model.",
@@ -1009,12 +1037,18 @@ class RBLNGlm5NextForCausalLM(nn.Module):
         self.model = RBLNGlm5NextModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            prefix=maybe_prefix(prefix, "lm_head"),
-        )
+        if get_pp_group().is_last_rank:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                prefix=maybe_prefix(prefix, "lm_head"),
+            )
+        else:
+            self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config.vocab_size)
+        self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
+            self.model.make_empty_intermediate_tensors
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -1025,7 +1059,7 @@ class RBLNGlm5NextForCausalLM(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | IntermediateTensors:
         return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
@@ -1144,19 +1178,20 @@ class RBLNGlm5NextForConditionalGeneration(
         with self._mark_language_model(vllm_config):
             super().__init__(vllm_config=vllm_config, prefix=prefix)
         hf_config = vllm_config.model_config.hf_config
-        # fp32 tower (dlfp16 on the device, as MiniMax-M3's). Its checkpoint weights
-        # are bf16, outside the fp8 quantization.
-        with (
-            self._mark_tower_model(vllm_config, {"image", "video"}),
-            set_default_torch_dtype(torch.float32),
-        ):
-            self.visual = Glm5NextVisionTransformer(
-                hf_config.text_config,
-                hf_config.vision_config,
-                norm_eps=hf_config.vision_config.rms_norm_eps,
-                quant_config=None,
-                prefix=maybe_prefix(prefix, "visual"),
-            )
+        if get_pp_group().is_first_rank:
+            with (
+                self._mark_tower_model(vllm_config, {"image", "video"}),
+                set_default_torch_dtype(torch.float32),
+            ):
+                self.visual = Glm5NextVisionTransformer(
+                    hf_config.text_config,
+                    hf_config.vision_config,
+                    norm_eps=hf_config.vision_config.rms_norm_eps,
+                    quant_config=None,
+                    prefix=maybe_prefix(prefix, "visual"),
+                )
+        else:
+            self.visual = PPMissingLayer()
         self.config.image_token_index = hf_config.image_token_id
         object.__setattr__(self, "_mm_encoder", None)
 
@@ -1164,6 +1199,8 @@ class RBLNGlm5NextForConditionalGeneration(
         return self
 
     def compile_mm_encoder(self, compile_fn) -> None:
+        if isinstance(self.visual, PPMissingLayer):
+            return
         encoder = _RBLNGlm5NextVisionEncoder(self.visual).eval()
         object.__setattr__(self, "_mm_encoder", compile_fn(encoder))
 
@@ -1240,7 +1277,7 @@ class RBLNGlm5NextForConditionalGeneration(
         mm_embeds: torch.Tensor | None = None,
         mm_mask: torch.Tensor | None = None,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | IntermediateTensors:
         if mm_embeds is not None and inputs_embeds is None:
             assert mm_mask is not None
             text_embeds = self.embed_input_ids(input_ids)
@@ -1312,6 +1349,8 @@ class RBLNGlm5NextMTPModel(nn.Module):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         prefixes = tuple(f"layers.{idx}." for idx in self.layers)
+        if get_pp_group().world_size > 1:
+            prefixes += ("embed_tokens.",)
         return _load_glm5_next_weights(
             self, self.config, weights, lambda name: name.startswith(prefixes)
         )

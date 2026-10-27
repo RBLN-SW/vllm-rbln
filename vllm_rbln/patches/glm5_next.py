@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from vllm_rbln.patches.registry import add_registration
+import functools
+
+from vllm_rbln.patches.registry import add_registration, register_patch
 
 _MODULE = "vllm_rbln.model_executor.models.glm5_next"
 
@@ -35,3 +37,31 @@ def register_glm5_next() -> None:
     )
     # The MTP drafter vLLM's speculative config selects for a glm5_next target.
     ModelRegistry.register_model("Glm5NextMTPModel", f"{_MODULE}:RBLNGlm5NextMTP")
+
+
+@register_patch(
+    target="vllm.v1.core.kv_cache_utils._pp_balanced_mamba_group_count",
+    reason=(
+        "Upstream reads each GLM-5.3 cache's layer with extract_layer_index, which "
+        "asserts one integer a name; the RBLN caches carry a slot after the layer "
+        "(model.layers.<layer>.self_attn.attn.<slot>), so pipeline parallel fails "
+        "there. The wrapper drops the slot and calls upstream."
+    ),
+    build=True,
+)
+def _build_pp_balanced_mamba_group_count():
+    from vllm.v1.core import kv_cache_utils
+
+    original = kv_cache_utils._pp_balanced_mamba_group_count
+
+    @functools.wraps(original)
+    def _pp_balanced_mamba_group_count(
+        vllm_config, mamba_layer_names: list[str], mla_layer_names: list[str]
+    ) -> int | None:
+        return original(
+            vllm_config,
+            [name.rsplit(".", 1)[0] for name in mamba_layer_names],
+            [name.rsplit(".", 1)[0] for name in mla_layer_names],
+        )
+
+    return _pp_balanced_mamba_group_count
