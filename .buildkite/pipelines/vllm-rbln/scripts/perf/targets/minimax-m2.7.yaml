@@ -28,6 +28,7 @@ bench:
 
 bench_params:
   c4-in50k-out1k-greedy:
+    serve: [tp4ep, dp4ep]
     max_concurrency: 4
     num_prompts: 16
     random_input_len: 51200
@@ -35,10 +36,19 @@ bench_params:
     temperature: 0.0
 
   c4-in50k-out1k-non-greedy:
+    serve: [tp4ep, dp4ep]
     max_concurrency: 4
     num_prompts: 16
     random_input_len: 51200
     random_output_len: 1024
+  
+  c4-in50k-out1-greedy:
+    serve: [pp4]
+    max_concurrency: 4
+    num_prompts: 16
+    random_input_len: 51200
+    random_output_len: 1
+    temperature: 0.0
 
 server_ready_timeout: 3600
 num_runs: 1
