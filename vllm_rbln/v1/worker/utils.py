@@ -868,7 +868,8 @@ def get_autobind_cpu_ids(
         cpu_selector: Function to select CPUs from each physical core.
         local_rank_devices: `RBLN_VISIBLE_DEVICES` entry of every worker on
             this node, indexed by local DP rank * local world size + local rank;
-            None when the worker could not derive it.
+            None when the worker could not derive it, and the exposed cards
+            decide instead.
 
     Returns:
         Comma-separated string of CPU IDs, or "all" or "nobind".
@@ -908,16 +909,23 @@ def get_autobind_cpu_ids(
     # Split the node each rank's own NPU sits on among the ranks whose NPUs are
     # there; the rank round-robin ignores the cards and puts half the ranks
     # across the socket unless the cards alternate NUMA nodes by rank.
-    npu_nodes: list[int | None] = []
     present = _rbln_present_card_indices()
+    card_node = {
+        card: _read_card_attr_int(card, os.path.join("device", "numa_node"))
+        for card in present
+    }
+    npu_nodes: list[int | None] = []
     if local_rank_devices is not None and present:
-        for entry in local_rank_devices:
-            card = rbln_card_index(entry, present)
-            npu_nodes.append(
-                None
-                if card is None
-                else _read_card_attr_int(card, os.path.join("device", "numa_node"))
-            )
+        npu_nodes = [
+            card_node.get(rbln_card_index(entry, present))
+            for entry in local_rank_devices
+        ]
+    # Without the table, as with one server per DP rank, the sibling ranks are
+    # the exposed cards on this rank's node, as many cards each as it owns.
+    owned = get_rbln_owned_card_indices()
+    owned_nodes = {card_node.get(card) for card in owned}
+    owned_node = owned_nodes.pop() if len(owned_nodes) == 1 else None
+    on_node = [card for card in present if card_node[card] == owned_node]
     if npu_nodes and all(node in available_numa_nodes for node in npu_nodes):
         rank_in_numa = (
             parallel_config.data_parallel_rank_local or 0
@@ -926,6 +934,14 @@ def get_autobind_cpu_ids(
         ranks_in_same_numa = [
             r for r, node in enumerate(npu_nodes) if node == selected_numa_node
         ]
+    elif (
+        local_rank_devices is None
+        and owned_node in available_numa_nodes
+        and len(on_node) % len(owned) == 0
+    ):
+        selected_numa_node = owned_node
+        ranks_in_same_numa = list(range(len(on_node) // len(owned)))
+        rank_in_numa = on_node.index(min(owned)) // len(owned)
     else:
         numa_node_idx = rank_across_dp % len(available_numa_nodes)
         selected_numa_node = available_numa_nodes[numa_node_idx]

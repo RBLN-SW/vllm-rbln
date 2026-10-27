@@ -846,6 +846,11 @@ class TestEstimateAvailableMemory:
 
 
 class TestGetAutobindCpuIds:
+    @pytest.fixture(autouse=True)
+    def no_cards(self, monkeypatch):
+        # A device host's own cards must not decide the round-robin tests.
+        monkeypatch.setattr(worker_utils, "_rbln_present_card_indices", list)
+
     @pytest.fixture
     def cpus(self, monkeypatch):
         cpu_list = _cpus_8()
@@ -933,6 +938,38 @@ class TestGetAutobindCpuIds:
         assert get_autobind_cpu_ids(0, 0, self._dp(2, 0), self._all, devices) == (
             "0,1,4,5"
         )
+
+    def test_one_server_per_rank_splits_the_node_by_its_exposed_cards(
+        self, cpus, monkeypatch
+    ):
+        # External LB: each dp4 server owns one of cards 0-3, all on NUMA 1, and
+        # knows no sibling's card, so the exposed cards stand in for the ranks.
+        self._cards(monkeypatch, {0: 1, 1: 1, 2: 1, 3: 1})
+        got = []
+        for r in range(4):
+            monkeypatch.setenv("RBLN_VISIBLE_DEVICES", str(r))
+            pc = _make_parallel_config(
+                dp_size=4,
+                world_size_across_dp=4,
+                data_parallel_rank=r,
+                data_parallel_rank_local=0,
+            )
+            got.append(get_autobind_cpu_ids(0, 0, pc, self._all))
+        assert got == ["2", "3", "6", "7"]
+
+    @pytest.mark.parametrize(
+        "numa_of_card, visible",
+        [
+            ({0: 0, 1: 1}, "0,1"),  # the rank's cards span two nodes
+            ({0: 1, 1: 1, 2: 1}, "0,1"),  # the node's cards do not split evenly
+        ],
+    )
+    def test_exposed_cards_that_do_not_split_keep_the_round_robin(
+        self, cpus, monkeypatch, numa_of_card, visible
+    ):
+        self._cards(monkeypatch, numa_of_card)
+        monkeypatch.setenv("RBLN_VISIBLE_DEVICES", visible)
+        assert get_autobind_cpu_ids(0, 0, self._dp(2, 0), self._all) == "0,1,4,5"
 
     def test_basic_single_rank(self, cpus):
         # rank 0 -> NUMA 0 -> all of NUMA-0's CPUs (sorted by id).

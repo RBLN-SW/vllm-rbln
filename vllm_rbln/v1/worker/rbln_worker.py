@@ -143,8 +143,8 @@ class RBLNWorker(WorkerBase):
         assigned = self.parallel_config.assigned_physical_gpu_ids
         # Every local worker's pool entry, read before env_var narrows to this
         # rank's: CPU binding splits a NUMA node among the ranks whose NPUs sit on
-        # it. Left unknown unless this node runs every rank from the pool, since a
-        # rank outside it would share cores it cannot see.
+        # it. Left unknown unless this process runs every rank from the pool;
+        # binding then derives the split from the exposed cards.
         pc = self.parallel_config
         raw = os.environ.get(env_var, "")
         pool = [entry for entry in raw.split(",") if entry.strip()] or None
