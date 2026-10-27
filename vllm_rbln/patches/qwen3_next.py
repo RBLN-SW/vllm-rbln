@@ -49,12 +49,16 @@ def register_qwen3_5() -> None:
     )
 
 
-def _l2norm(x: torch.Tensor) -> torch.Tensor:
-    """x * rsqrt(sum(x^2) + 1e-6) as vLLM's rms_norm op (eps / D) scaled by
-    D ** -0.5: the compiler lowers that op as one norm that stays cut on the
-    heads, where a [..., 1] sum is packed across tokens and heads."""
+def _l2norm(x: torch.Tensor, host_split: bool) -> torch.Tensor:
+    """x * rsqrt(sum(x^2) + 1e-6), on the device: the sum comes from a matmul
+    with ones so every column holds it and nothing runs under 64 wide.
+    host_split takes vLLM's rms_norm op instead, whose [..., 1] rsqrt runs on
+    the host and so ends the device function there."""
     dim = x.shape[-1]
-    return ir.ops.rms_norm(x, None, 1e-6 / dim) * dim**-0.5
+    if host_split:
+        return ir.ops.rms_norm(x, None, 1e-6 / dim) * dim**-0.5
+    ones = torch.ones(dim, dim, dtype=x.dtype, device=x.device)
+    return x * torch.rsqrt((x * x) @ ones + 1e-6)
 
 
 @register_patch(
@@ -118,8 +122,12 @@ def patched_gdn_forward(
         )
 
     # The KDA core takes one q / k per value head, L2-normalized by the caller.
+    host_split = getattr(self, "rbln_host_split", False)
     query, key = (
-        _l2norm(conv(x, w, ring, heads_k).view(batch * seq_len, heads_k, head_dim))
+        _l2norm(
+            conv(x, w, ring, heads_k).view(batch * seq_len, heads_k, head_dim),
+            host_split,
+        )
         .view(batch, seq_len, heads_k, 1, head_dim)
         .expand(batch, seq_len, heads_k, ratio, head_dim)
         .reshape(batch, seq_len, heads_v, head_dim)

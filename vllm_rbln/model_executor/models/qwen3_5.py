@@ -98,6 +98,15 @@ class RBLNQwen3_5ForConditionalGeneration(
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "model"):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         object.__setattr__(self, "_mm_encoder", None)
+        # The GatedDeltaNet layer after each full-attention one ends the device
+        # function at its q / k norm (see patches/qwen3_next._l2norm): with
+        # those layers on the device too, the compiled model aborts on a
+        # continued prefill.
+        layer_types = vllm_config.model_config.hf_text_config.layer_types
+        for index, layer in enumerate(self.language_model.model.layers):
+            attn = getattr(layer, "linear_attn", None)
+            if attn is not None and index > 0:
+                attn.rbln_host_split = layer_types[index - 1] == "full_attention"
         # Upstream builds no vision tower when images are off (a placeholder
         # stands in for it).
         mm_config = vllm_config.model_config.get_multimodal_config()
