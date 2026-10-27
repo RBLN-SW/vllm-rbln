@@ -487,6 +487,7 @@ class RBLNGlm5NextKDA(nn.Module):
             2 * self.num_groups,
             conv_store,
             KDA_QK_NORM_EPS,
+            self.head_dim,
         ).unbind(2)
         group_qkv = [
             tuple(
