@@ -467,6 +467,17 @@ class TestRejectedConfigs:
         with pytest.raises(ValueError, match="--mm-encoder-only"):
             reconfigure(mutate)
 
+    @pytest.mark.parametrize("field", ["data_parallel_size", "pipeline_parallel_size"])
+    def test_an_encoder_only_instance_across_ranks(self, reconfigure, field):
+        def mutate(config):
+            config.model_config.multimodal_config = SimpleNamespace(
+                mm_encoder_only=True
+            )
+            setattr(config.parallel_config, field, 2)
+
+        with pytest.raises(ValueError, match="encoder-only instance"):
+            reconfigure(mutate)
+
     def test_lora(self, reconfigure):
         with pytest.raises(ValueError, match="LoRA"):
             reconfigure(lambda config: setattr(config, "lora_config", object()))
