@@ -76,6 +76,7 @@ from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
     DraftTokenIds,
+    ECConnectorOutput,
     KVConnectorOutput,
     LogprobsLists,
     LogprobsTensors,
@@ -486,6 +487,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         # KV-connector output carried from execute_model() to sample_tokens()
         # (and across the PP / pooling / empty-batch paths).
         self.kv_connector_output: KVConnectorOutput | None = None
+        # The EC-connector output, carried the same way.
+        self.ec_connector_output: ECConnectorOutput | None = None
 
         # NOTE(RBLN): RBLN compiles a fixed decode-batch shape, so bucket to the
         # per-PP-stage decode batch (max_num_seqs // pp_size) -- the same ceiling
@@ -1309,11 +1312,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
     ) -> tuple[
         StagedModelInputs,
         dict[str, Any],
+        ECConnectorOutput | None,
     ]:
         """
         :return: tuple[
             staged_model_inputs,
             model_kwargs,
+            ec_connector_output,
         ]
         """
         # For text-only models
@@ -1348,11 +1353,17 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             **self._init_model_kwargs(),
         }
 
+        ec_connector_output = None
+        # The EC connector's loads feed the gather, so they run on the same
+        # prefill steps instead of on every step.
         if self.supports_mm_inputs and is_prefill and get_pp_group().is_first_rank:
-            self._execute_mm_encoder(scheduler_output)
-            mm_embeds, mm_mask = self._gather_mm_embeddings(
-                scheduler_output, num_input_tokens
-            )
+            with self.maybe_get_ec_connector_output(
+                scheduler_output, encoder_cache=self.encoder_cache
+            ) as ec_connector_output:
+                self._execute_mm_encoder(scheduler_output)
+                mm_embeds, mm_mask = self._gather_mm_embeddings(
+                    scheduler_output, num_input_tokens
+                )
             model_kwargs["mm_embeds"], model_kwargs["mm_mask"] = (
                 self.input_stager.stage_mm_embeds(
                     mm_embeds.view(num_reqs, -1, mm_embeds.shape[-1]),
@@ -1364,6 +1375,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         return (
             staged_model_inputs,
             model_kwargs,
+            ec_connector_output,
         )
 
     def _resolve_mm_support(self) -> bool:
@@ -1978,6 +1990,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             (
                 staged_model_inputs,
                 model_kwargs,
+                ec_connector_output,
             ) = self._preprocess(
                 scheduler_output,
                 num_reqs,
@@ -2031,6 +2044,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 assert isinstance(hidden_states, IntermediateTensors)
                 hidden_states.kv_connector_output = kv_connector_output
                 self.kv_connector_output = kv_connector_output
+                self.ec_connector_output = ec_connector_output
                 return hidden_states
 
             if self.is_pooling_model:
@@ -2065,6 +2079,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             combined_hidden_states,
         )
         self.kv_connector_output = kv_connector_output
+        self.ec_connector_output = ec_connector_output
         return None
 
     @torch.inference_mode()
@@ -2080,6 +2095,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
             if kv_connector_output is not None:
                 output.kv_connector_output = kv_connector_output
+            output.ec_connector_output = self.ec_connector_output
+            self.ec_connector_output = None
             return output
 
         # Unpack ephemeral state.
@@ -2210,6 +2227,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         # self.kv_connector_output may be modified during drafting.
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
+        ec_connector_output = self.ec_connector_output
+        self.ec_connector_output = None
 
         with record_function_or_nullcontext("rbln_model_runner: ModelRunnerOutput"):
             output = ModelRunnerOutput(
@@ -2220,6 +2239,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 prompt_logprobs_dict=prompt_logprobs_dict,
                 num_nans_in_logits=num_nans_in_logits,
                 kv_connector_output=kv_connector_output,
+                ec_connector_output=ec_connector_output,
             )
 
         if not self.use_async_scheduling:

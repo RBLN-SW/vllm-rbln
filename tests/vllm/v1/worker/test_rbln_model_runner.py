@@ -29,10 +29,20 @@ import numpy as np
 import pytest
 import torch
 import vllm.distributed.ec_transfer.ec_transfer_state as ec_state
+from vllm.distributed.ec_transfer.ec_connector.base import (
+    ECConnectorBase,
+    ECConnectorMetadata,
+    ECConnectorRole,
+)
 from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheTensor
-from vllm.v1.outputs import KVConnectorOutput, LogprobsTensors, SamplerOutput
+from vllm.v1.outputs import (
+    ECConnectorOutput,
+    KVConnectorOutput,
+    LogprobsTensors,
+    SamplerOutput,
+)
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
@@ -137,6 +147,7 @@ def test_sample_tokens_collects_deferred_store_in_the_same_output(
             None,
         ),
         kv_connector_output=KVConnectorOutput(kv_cache_events=early),
+        ec_connector_output=None,
         speculative_config=SimpleNamespace(use_eagle=lambda: False),
         use_async_scheduling=False,
         _sample=lambda *a: SamplerOutput(torch.tensor([[7]]), None),
@@ -512,6 +523,122 @@ class TestEncoderOnly:
         cache.save.assert_called_once_with(
             "encoder", cache.config_signature.return_value
         )
+
+
+class _ReceivingECConnector(ECConnectorBase):
+    """A consumer-side EC connector whose load lands one encoder output."""
+
+    def __init__(self, mm_hash: str, encoder_output: torch.Tensor):
+        super().__init__(
+            SimpleNamespace(
+                ec_transfer_config=SimpleNamespace(
+                    is_ec_producer=False, is_ec_consumer=True
+                )
+            ),
+            ECConnectorRole.WORKER,
+        )
+        self.mm_hash = mm_hash
+        self.encoder_output = encoder_output
+
+    def start_load_caches(self, encoder_cache, **kwargs):
+        encoder_cache[self.mm_hash] = self.encoder_output
+
+    def get_finished(self, finished_req_ids):
+        return None, {self.mm_hash}
+
+    def save_caches(self, encoder_cache, mm_hash, **kwargs):
+        raise AssertionError("a consumer saves nothing")
+
+    def has_cache_item(self, identifier):
+        raise AssertionError("scheduler-side only")
+
+    def update_state_after_alloc(self, request, index):
+        raise AssertionError("scheduler-side only")
+
+    def build_connector_meta(self, scheduler_output):
+        raise AssertionError("scheduler-side only")
+
+
+class TestEcConsumer:
+    """An EC consumer receives encoder outputs through the connector instead of
+    encoding them, and reports what it received back to the scheduler."""
+
+    def test_received_encoder_outputs_reach_the_gather(self, monkeypatch):
+        received = torch.ones(4, 2)
+        monkeypatch.setattr(
+            ec_state, "_EC_CONNECTOR_AGENT", _ReceivingECConnector("h0", received)
+        )
+        monkeypatch.setattr(
+            mr, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True)
+        )
+        runner = _make_runner_stub(
+            supports_mm_inputs=True,
+            _is_prefill_step=True,
+            is_pooling_model=False,
+            max_num_tokens=4,
+            input_ids=torch.zeros(4, dtype=torch.long),
+            positions=torch.zeros(4, dtype=torch.long),
+            input_stager=SimpleNamespace(
+                stage=lambda **kw: "STAGED",
+                stage_mm_embeds=lambda embeds, mask, layout: (embeds, mask),
+            ),
+            encoder_cache={},
+            _execute_mm_encoder=lambda so: None,
+        )
+        runner._gather_mm_embeddings = lambda so, n: (
+            runner.encoder_cache["h0"],
+            torch.ones(n, 1),
+        )
+        scheduler_output = SimpleNamespace(
+            ec_connector_metadata=ECConnectorMetadata(), finished_req_ids=set()
+        )
+
+        _, model_kwargs, ec_output = runner._preprocess(
+            scheduler_output, 1, 1, 4, torch.tensor([3])
+        )
+
+        assert torch.equal(model_kwargs["mm_embeds"], received.view(1, 4, 2))
+        assert ec_output.finished_recving == {"h0"}
+
+    def test_a_stage_that_samples_nothing_still_reports_its_loads(self):
+        received = ECConnectorOutput(finished_recving={"h0"})
+        runner = _make_runner_stub(
+            execute_model_state=None,
+            kv_connector_output=None,
+            ec_connector_output=received,
+        )
+
+        output = runner.sample_tokens(None)
+
+        assert output.ec_connector_output is received
+        assert runner.ec_connector_output is None
+
+    def test_the_sampled_output_reports_the_steps_loads(self, monkeypatch):
+        monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: False)
+        received = ECConnectorOutput(finished_recving={"h0"})
+        runner = _make_runner_stub(
+            execute_model_state=ExecuteModelState(
+                SimpleNamespace(total_num_scheduled_tokens=1),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            kv_connector_output=None,
+            ec_connector_output=received,
+            speculative_config=None,
+            use_async_scheduling=False,
+            _sample=lambda *a: SamplerOutput(torch.tensor([[7]]), None),
+            _bookkeeping_sync=lambda *a: (0, None, [], {}, [], {}, []),
+            input_batch=SimpleNamespace(sampling_metadata=None),
+        )
+
+        output = runner.sample_tokens(None)
+
+        assert output.ec_connector_output is received
+        assert runner.ec_connector_output is None
 
 
 @pytest.mark.parametrize("num_reqs", [1, 2])
@@ -2183,6 +2310,7 @@ class TestExecuteModelFlushesAfterTheSubmission:
             _preprocess=lambda *a, **kw: (
                 SimpleNamespace(as_kwargs=lambda: {}),
                 {},
+                None,
             ),
             _bookkeeping_and_output=lambda *a, **kw: "OUTPUT",
             input_batch=SimpleNamespace(num_reqs=1, req_ids=["r0"]),
