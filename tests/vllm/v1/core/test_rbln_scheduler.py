@@ -34,9 +34,12 @@ from tests.vllm.v1.core.utils import (
     advance_to_decode,
     create_rbln_scheduler,
     create_requests,
+    full_attention_spec,
+    make_kv_cache_config,
     make_model_runner_output,
     make_request,
     prefill_request,
+    sliding_window_spec,
 )
 from vllm_rbln.v1.core.rbln_kv_cache_manager import RBLNKVCacheManager
 from vllm_rbln.v1.core.rbln_scheduler import RBLNScheduler, RBLNSchedulerOutput
@@ -90,6 +93,22 @@ class TestSchedulerInit:
             additional_config={"enable_sub_block_cache": False},
         )
         assert not isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
+
+    def test_sub_block_manager_hashes_at_the_engine_hash_block_size(self):
+        # Mixed group block sizes: the engine hashes requests at the gcd and
+        # schedules at the lcm, and the manager must be told the gcd.
+        sched = create_rbln_scheduler(
+            enable_prefix_caching=True,
+            block_size=2048,
+            hash_block_size=1024,
+            max_num_batched_tokens=128,
+            max_model_len=4096,
+            kv_cache_config=make_kv_cache_config(
+                [full_attention_spec(2048), sliding_window_spec(1024, 1024)],
+                num_blocks=64,
+            ),
+        )
+        assert isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
 
     def test_disabled_falls_back_to_base_manager(self):
         # prefix caching off -> plain KVCacheManager.
