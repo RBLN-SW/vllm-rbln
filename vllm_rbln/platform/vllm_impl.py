@@ -102,13 +102,14 @@ def _validate(vllm_config: "VllmConfig") -> None:
             raise ValueError(
                 "GLM-5.3 needs an fp8 KV cache on RBLN; pass --kv-cache-dtype fp8."
             )
+        # The kpool indexer's tail ring holds 3 + K positions in at most 8 slots.
         spec = vllm_config.speculative_config
         if spec is not None and (
-            spec.method != "mtp" or spec.num_speculative_tokens != 1
+            spec.method != "mtp" or not 1 <= spec.num_speculative_tokens <= 5
         ):
             raise ValueError(
                 "GLM-5.3 speculative decoding on RBLN runs its MTP head with "
-                f"num_speculative_tokens=1 only; got method={spec.method!r}, "
+                f"num_speculative_tokens 1 to 5 only; got method={spec.method!r}, "
                 f"num_speculative_tokens={spec.num_speculative_tokens}."
             )
 
