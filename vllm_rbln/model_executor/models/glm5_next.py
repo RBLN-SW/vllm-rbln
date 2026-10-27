@@ -104,6 +104,9 @@ SLOT_DSA_LATENT, SLOT_DSA_INDEX_KEY, SLOT_DSA_INDEX_SCALE, SLOT_DSA_INDEX_TAIL =
 )
 # The 3 taps before a step's first token, and room for one MTP draft.
 KDA_CONV_RING = 4
+# The KDA q / k L2 norm's eps (the reference modeling's l2norm):
+# x * rsqrt(sum(x^2) + eps).
+KDA_QK_NORM_EPS = 1e-6
 
 
 class _RBLNGlm5NextCache(nn.Module, AttentionLayerBase):
@@ -483,6 +486,8 @@ class RBLNGlm5NextKDA(nn.Module):
             self.conv_ring_width,
             2 * self.num_groups,
             conv_store,
+            KDA_QK_NORM_EPS,
+            self.head_dim,
         ).unbind(2)
         group_qkv = [
             tuple(
@@ -572,6 +577,7 @@ class RBLNGlm5NextIndexer(nn.Module):
         # The key cache holds a row a pool.
         assert config.index_kpool == RBLNGlm5NextIndexerBackend.compress_ratio
         kpool = config.index_kpool
+        self.kpool = kpool
         self.n_head = config.index_n_heads
         self.head_dim = config.index_head_dim
         self.topk = config.index_topk // kpool
@@ -614,10 +620,18 @@ class RBLNGlm5NextIndexer(nn.Module):
             (self.block_size // kpool,),
             torch.float16,
         )
+        # The tail ring: the raw (key | gate) rows of a request's latest positions,
+        # slot p % ring. A verify with rejected drafts starts the next step back inside
+        # a pool it passed, so with K drafts the ring keeps the last kpool - 1 + K
+        # positions; the compressor takes a multiple of kpool (a pool then one segment
+        # of the ring).
+        spec = get_current_vllm_config().speculative_config
+        num_drafts = spec.num_speculative_tokens if spec is not None else 0
+        self.tail_ring = -(-(kpool - 1 + max(num_drafts, 1)) // kpool) * kpool
         self.tail_cache = RBLNGlm5NextAuxCache(
             f"{attn_prefix}.attn.{SLOT_DSA_INDEX_TAIL}",
             f"{attn_prefix}.attn.{SLOT_DSA_LATENT}",
-            (kpool, 2 * self.head_dim),
+            (self.tail_ring, 2 * self.head_dim),
             torch.bfloat16,
         )
 
@@ -659,6 +673,8 @@ class RBLNGlm5NextIndexer(nn.Module):
             query_len,
             key_table.view(batch, -1),
             self.block_size,
+            ring=self.tail_ring,
+            kpool=self.kpool,
         )
         return torch.ops.rbln_custom_ops.sparse_attn_glm5_indexer(
             q.transpose(1, 2),
@@ -670,6 +686,7 @@ class RBLNGlm5NextIndexer(nn.Module):
             query_len,
             key_table,
             self.topk,
+            kpool=self.kpool,
         )
 
 
@@ -765,6 +782,7 @@ class RBLNGlm5NextDSA(nn.Module):
             topk,
             k_scale=self._k_scale,
             cache_dtype=torch.float8_e4m3fn,
+            kpool=self.indexer.kpool,
             is_prompt_sorted=metadata.is_prompt_sorted,
         )
         o = torch.matmul(o, w_uv.transpose(2, 3))  # [B, H, T, V]
