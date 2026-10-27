@@ -746,6 +746,10 @@ class TestDetermineAvailableMemory:
             == 250
         )
 
+    def test_mxfp8_counts_int_at_8bit(self, make_worker, monkeypatch):
+        cap = self._capture(make_worker, monkeypatch, quantization="mxfp8")
+        assert cap["n_model_bytes"] == 250
+
     def test_mxfp4_atom_and_rebel_differ(self, make_worker, monkeypatch):
         atom = self._capture(
             make_worker, monkeypatch, quantization="mxfp4", device_name="RBLN-CA25"
