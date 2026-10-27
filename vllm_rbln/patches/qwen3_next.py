@@ -95,7 +95,6 @@ def patched_gdn_forward(
     channels = key_dim * 2 + value_dim
     head_dim = GDN_HEAD_DIM
     kernel = self.conv_kernel_size
-    units = heads_k * (2 + ratio)
 
     # Keep the leading dims the model uses ([batch, seq] on RBLN); only the
     # kernels need the explicit [batch, seq, ...] views.
@@ -105,44 +104,33 @@ def patched_gdn_forward(
     b, a = gates.chunk(2, dim=-1)
     conv_weight = self.conv1d.weight.view(channels, kernel).to(mixed_qkvz.dtype)
 
-    # One ring conv over each key head's q, k and value heads side by side, as
-    # the ring holds them: the chiplet cut then falls on whole key-head groups,
-    # so every chiplet holds the q / k its value heads read.
-    grouped = torch.cat(
-        [
-            q.reshape(batch, seq_len, heads_k, 1, head_dim),
-            k.reshape(batch, seq_len, heads_k, 1, head_dim),
-            v.reshape(batch, seq_len, heads_k, ratio, head_dim),
-        ],
-        dim=3,
-    ).reshape(batch, seq_len, units, head_dim)
-    weight = torch.cat(
-        [
-            conv_weight[:key_dim].reshape(heads_k, 1, head_dim, kernel),
-            conv_weight[key_dim : 2 * key_dim].reshape(heads_k, 1, head_dim, kernel),
-            conv_weight[2 * key_dim :].reshape(heads_k, ratio, head_dim, kernel),
-        ],
-        dim=1,
-    ).reshape(units, head_dim, kernel)
-    conv = torch.ops.rbln_custom_ops.causal_conv1d_ring_tabled(
-        grouped,
-        pack_weight(weight),
-        state.conv,
-        *metadata.conv_tables,
-        state.conv_width,
-    ).view(batch, seq_len, heads_k, 2 + ratio, head_dim)
+    # One conv per q / k / v: RSD then cuts each one's channels on its heads,
+    # where a cut of the q|k|v channels would not fall on head boundaries. The
+    # weights are sliced, not split: the compiler folds a slice into a constant
+    # RSD can cut, but leaves the last part of a split as an op it cannot.
+    def conv(x, weight, ring, heads):
+        return torch.ops.rbln_custom_ops.causal_conv1d_ring_tabled(
+            x.reshape(batch, seq_len, heads, head_dim),
+            pack_weight(weight.reshape(heads, head_dim, kernel)),
+            ring,
+            *metadata.conv_tables,
+            state.conv_width,
+        )
 
     # The KDA core takes one q / k per value head, L2-normalized by the caller.
     query, key = (
-        _l2norm(conv[:, :, :, unit].reshape(batch * seq_len, heads_k, head_dim))
+        _l2norm(conv(x, w, ring, heads_k).view(batch * seq_len, heads_k, head_dim))
         .view(batch, seq_len, heads_k, 1, head_dim)
         .expand(batch, seq_len, heads_k, ratio, head_dim)
         .reshape(batch, seq_len, heads_v, head_dim)
         .transpose(1, 2)
-        for unit in (0, 1)
+        for x, w, ring in (
+            (q, conv_weight[:key_dim], state.conv_q),
+            (k, conv_weight[key_dim : 2 * key_dim], state.conv_k),
+        )
     )
-    value = conv[:, :, :, 2:].reshape(batch, seq_len, heads_v, head_dim)
-    value = value.transpose(1, 2)
+    value = conv(v, conv_weight[2 * key_dim :], state.conv_v, heads_v)
+    value = value.view(batch, seq_len, heads_v, head_dim).transpose(1, 2)
 
     beta = torch.sigmoid(b).reshape(batch, seq_len, heads_v).transpose(1, 2)
     g = -torch.exp(self.A_log.float()) * F.softplus(a.float() + self.dt_bias.float())

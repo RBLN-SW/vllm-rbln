@@ -27,8 +27,8 @@ zero through `has_initial_state`.
 KDA is GatedDeltaNet with a per-channel decay: the layer broadcasts its
 per-head decay over the key channels and repeats q / k over each key head's
 value heads. The short conv (`rbln_custom_ops::causal_conv1d_ring_tabled`)
-keeps one ring a layer on the same rows, each key head's q, k and value heads
-side by side; its index tables are built here, once a step for every layer.
+keeps one ring each for q, k and v on the same rows; its index tables are built
+here, once a step for every layer.
 """
 
 from collections.abc import Iterable, Sequence
@@ -67,9 +67,11 @@ def gdn_state_rows(num_v_heads: int, dtype: torch.dtype) -> int:
 
 @dataclass
 class GDNLayerState:
-    # [rows, width, heads_k * (2 + heads_v / heads_k), 128]: the conv ring, row
-    # p % width holding position p's q, k and value heads, grouped by key head
-    conv: torch.Tensor
+    # [rows, width, heads, 128] each: the conv rings of q, k and v, row
+    # p % width holding position p
+    conv_q: torch.Tensor
+    conv_k: torch.Tensor
+    conv_v: torch.Tensor
     # [rows, 64 * heads_v, 512] uint8: R1's bytes of the [heads_v, 128, 128] states
     ssm_state: torch.Tensor
     conv_width: int
@@ -189,11 +191,16 @@ class RBLNGDNAttentionMetadataBuilder(
                 f"{layer.head_k_dim} / {layer.head_v_dim}"
             )
         width = layer.conv_kernel_size - 1
-        units = heads_k * 2 + heads_v
+
+        def ring(heads: int) -> torch.Tensor:
+            return torch.zeros(
+                rows, width, heads, GDN_HEAD_DIM, dtype=self.dtype, device=self.device
+            )
+
         return GDNLayerState(
-            conv=torch.zeros(
-                rows, width, units, GDN_HEAD_DIM, dtype=self.dtype, device=self.device
-            ),
+            conv_q=ring(heads_k),
+            conv_k=ring(heads_k),
+            conv_v=ring(heads_v),
             ssm_state=torch.zeros(
                 rows,
                 gdn_state_rows(heads_v, self.dtype),
