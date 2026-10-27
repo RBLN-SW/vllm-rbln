@@ -34,6 +34,7 @@ from . import (
     dynamic_kv,
     engine_core,
     fp8_moe_method,
+    gemma4,
     gpt_oss,
     gpt_oss_mxfp4_config,
     kv_connector_factory,
