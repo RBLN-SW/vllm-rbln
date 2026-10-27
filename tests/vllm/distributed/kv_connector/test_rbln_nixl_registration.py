@@ -496,6 +496,41 @@ class TestRegisterKvCaches:
             RegionGeometry(ChipletSplitAxis.HEAD, 1, (AreaPlace(0x1000, 2048, 0),)),
             RegionGeometry(ChipletSplitAxis.HEAD, 1, (AreaPlace(0x2000, 2048, 0),)),
         ]
+        # The same check reads which regions are latents: none, here.
+        assert worker._logical_region_latent == [False, False]
+
+    def test_host_staging_records_a_latent_as_attention(self, monkeypatch):
+        # A latent whose page size matches gets past host staging's refusal,
+        # and the per-head check still has to read it as attention here.
+        worker = build_worker(
+            monkeypatch,
+            kv_buffer_device="cpu",
+            nixl_available=True,
+            layer_names=("l0", "l1"),
+        )
+        worker.nixl_wrapper = "wrapper"
+        latent = MagicMock(spec=MLAAttentionSpec)
+        latent.page_size_bytes = 4096
+        latent.num_kv_heads = 1
+        # Packed attention beside it: one region a layer, as a latent is.
+        worker._layer_specs = {"l0": _impl_layer_spec(), "l1": latent}
+        worker.block_len_per_layer = [4096] * 2
+        worker.tp_rank = 0
+        worker.kv_caches_base_addr = {
+            worker.engine_id: {worker.tp_rank: [0x1000, 0x2000]}
+        }
+        monkeypatch.setattr(
+            sys.modules["nixl_rbln"],
+            "ensure_rbln_backend",
+            lambda wrapper, device_id=0, **kw: None,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            NixlBaseConnectorWorker, "register_kv_caches", lambda self, kv: None
+        )
+        worker.register_kv_caches({"l0": "tensor", "l1": "tensor"})
+
+        assert worker._logical_region_latent == [False] * 2
 
     def test_host_staging_publishes_one_hash_across_pipeline_stages(self, monkeypatch):
         # This path keeps upstream's registration, whose hash takes the rank's
@@ -1237,6 +1272,20 @@ class TestRegisterKvCachesImpl:
             worker._register_kv_caches_impl(kv_caches)
 
         worker.nixl_wrapper.register_memory.assert_not_called()
+
+    def test_a_latent_takes_no_head_band_where_one_head_a_rank_would_fit_one(
+        self, monkeypatch
+    ):
+        # At TP8 an 8-head model's rank holds one head, which is also what a
+        # latent reports.
+        worker = _prep_impl_worker(monkeypatch)
+        worker.world_size = 8
+        worker.model_config.get_total_num_kv_heads.return_value = 8
+        latent = MagicMock(spec=MLAAttentionSpec)
+        latent.num_kv_heads = 1
+        worker._layer_specs = {"l1": latent}
+
+        assert worker._layer_kv_heads("l1") is None
 
     def test_cross_layer_blocks_with_differing_page_sizes_are_rejected(
         self, monkeypatch
