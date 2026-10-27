@@ -68,3 +68,17 @@ def test_the_backend_is_left_to_the_platform():
 
 def test_the_patch_is_the_one_installed():
     assert Gemma4Config.verify_and_update_config is keep_the_rbln_attention_backend
+
+
+def test_the_rbln_model_serves_the_architecture():
+    from vllm.model_executor.models import ModelRegistry
+
+    from vllm_rbln.patches.gemma4 import register_gemma4
+
+    register_gemma4()
+
+    model = ModelRegistry.models["Gemma4ForConditionalGeneration"]
+    assert (model.module_name, model.class_name) == (
+        "vllm_rbln.model_executor.models.gemma4",
+        "RBLNGemma4ForConditionalGeneration",
+    )
