@@ -241,6 +241,10 @@ class RblnECNixlConnectorScheduler(ECConnectorBase):
         super().__init__(vllm_config=vllm_config, role=role)
         self._mm_datas_need_loads: dict[str, int] = {}
 
+    # FIXME(RBLN): implement ensure_cache_available(). Without it the worker
+    # blocks the whole step in start_load_caches() until the encoder outputs
+    # arrive, and a timeout ends in an encoder cache miss on the LLM side.
+
     def has_cache_item(self, identifier: str) -> bool:
         return self.is_consumer
 

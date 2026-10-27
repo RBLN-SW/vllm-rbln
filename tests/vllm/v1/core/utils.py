@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -33,6 +34,11 @@ from vllm.config import (
     SpeculativeConfig,
     VllmConfig,
 )
+from vllm.distributed.ec_transfer.ec_connector.base import (
+    ECConnectorBase,
+    ECConnectorMetadata,
+    ECConnectorRole,
+)
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
@@ -40,6 +46,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorOutput,
 )
 from vllm.lora.request import LoRARequest
+from vllm.multimodal.inputs import (
+    MultiModalFeatureSpec,
+    MultiModalKwargsItem,
+    PlaceholderRange,
+)
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
@@ -130,6 +141,48 @@ class MockKVConnector(KVConnectorBase_V1):
 if "MockKVConnector" not in KVConnectorFactory._registry:
     KVConnectorFactory.register_connector(
         "MockKVConnector", __name__, MockKVConnector.__name__
+    )
+
+
+class ECConnectorInTransit(ECConnectorBase):
+    """A scheduler-side EC consumer whose encoder outputs arrive when told to."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            SimpleNamespace(
+                ec_transfer_config=SimpleNamespace(
+                    is_ec_producer=False, is_ec_consumer=True
+                )
+            ),
+            ECConnectorRole.SCHEDULER,
+        )
+        self.arrived = False
+
+    def ensure_cache_available(self, request, num_computed_tokens):
+        return self.arrived
+
+    def has_cache_item(self, identifier):
+        return False
+
+    def update_state_after_alloc(self, request, index):
+        pass
+
+    def build_connector_meta(self, scheduler_output):
+        return ECConnectorMetadata()
+
+    def start_load_caches(self, encoder_cache, **kwargs):
+        raise AssertionError("worker-side only")
+
+    def save_caches(self, encoder_cache, mm_hash, **kwargs):
+        raise AssertionError("worker-side only")
+
+
+def image_at(offset: int, length: int) -> MultiModalFeatureSpec:
+    return MultiModalFeatureSpec(
+        data=MultiModalKwargsItem.dummy(),
+        modality="image",
+        identifier=f"image@{offset}",
+        mm_position=PlaceholderRange(offset=offset, length=length),
     )
 
 

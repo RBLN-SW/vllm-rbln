@@ -29,11 +29,13 @@ from vllm.v1.request import RequestStatus
 
 from tests.vllm.v1.core.utils import (
     EOS_TOKEN_ID,
+    ECConnectorInTransit,
     MockKVConfig,
     _drain,
     advance_to_decode,
     create_rbln_scheduler,
     create_requests,
+    image_at,
     make_model_runner_output,
     make_request,
     prefill_request,
@@ -1923,3 +1925,41 @@ class TestSyncKVLoads:
         # Only the 16 tokens past the hit are computed this step.
         assert output.num_scheduled_tokens[request.request_id] == 16
         assert output.has_sync_kv_loads
+
+
+class TestEcTransferPending:
+    """A request whose encoder outputs are still in transit is held back,
+    waiting or running, and scheduled once they arrive."""
+
+    @staticmethod
+    def _scheduler():
+        sched = create_rbln_scheduler(
+            max_num_seqs=4, max_num_batched_tokens=8, max_model_len=64
+        )
+        sched.ec_connector = ECConnectorInTransit()
+        return sched
+
+    @staticmethod
+    def _request():
+        # The image sits past the first two chunks, so no chunk here encodes it.
+        return make_request("0", list(range(24)), 16, mm_features=[image_at(20, 4)])
+
+    def test_a_waiting_request(self):
+        sched = self._scheduler()
+        sched.add_request(self._request())
+
+        assert sched.schedule().num_scheduled_tokens == {}
+        sched.ec_connector.arrived = True
+        assert sched.schedule().num_scheduled_tokens == {"0": 8}
+
+    def test_a_running_request(self):
+        sched = self._scheduler()
+        sched.ec_connector.arrived = True
+        sched.add_request(self._request())
+        out = sched.schedule()
+        sched.update_from_output(out, make_model_runner_output(out))
+
+        sched.ec_connector.arrived = False
+        assert sched.schedule().num_scheduled_tokens == {}
+        sched.ec_connector.arrived = True
+        assert sched.schedule().num_scheduled_tokens == {"0": 8}
