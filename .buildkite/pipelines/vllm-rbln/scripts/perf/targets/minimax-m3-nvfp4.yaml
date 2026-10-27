@@ -65,12 +65,12 @@ bench_params:
     random_mm_limit_mm_per_prompt: '{"image": 1, "video": 0}'
     random_mm_bucket_config: '{(672, 672, 1): 1.0}'
   
-  c4-vlm-img672-in1k-out1-greedy:
+  c4-vlm-img672-in50k-out1-greedy:
     serve: [pp4]
     dataset_name: random-mm
     max_concurrency: 4
     num_prompts: 16
-    random_input_len: 1024
+    random_input_len: 51200
     random_output_len: 1
     temperature: 0.0
     random_mm_base_items_per_request: 1
