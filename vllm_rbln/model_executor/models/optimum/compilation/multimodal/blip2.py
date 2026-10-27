@@ -21,7 +21,7 @@ def get_param_blip2(
     max_model_len: int,
     block_size: int,
     num_devices: int,
-    memory_budget: float,
+    memory_budget: float | None,
     prefill_chunk_size: int | None = None,
 ) -> dict:
     language_model_config = get_language_model_config(

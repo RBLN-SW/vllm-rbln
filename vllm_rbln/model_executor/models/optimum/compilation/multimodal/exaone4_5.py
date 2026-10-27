@@ -19,7 +19,7 @@ def get_param_exaone4_5(
     max_model_len: int,
     block_size: int,
     num_devices: int,
-    memory_budget: float,
+    memory_budget: float | None,
     prefill_chunk_size: int | None = None,
 ) -> dict:
     param: dict = {

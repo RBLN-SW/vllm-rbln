@@ -31,7 +31,7 @@ from .qwen import (
 )
 
 _COMPILE_MULTIMODAL_FNS: dict[
-    str, Callable[[int, int, int, int, float, int | None], dict]
+    str, Callable[[int, int, int, int, float | None, int | None], dict]
 ] = {
     "blip2": get_param_blip2,
     "exaone4_5": get_param_exaone4_5,

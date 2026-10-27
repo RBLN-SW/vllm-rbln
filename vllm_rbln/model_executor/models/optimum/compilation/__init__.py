@@ -104,7 +104,7 @@ class RBLNCompileSpec:
         block_size: int,
         max_model_len: int,
         num_devices: int,
-        memory_budget: float,
+        memory_budget: float | None,
         prefill_chunk_size: int | None = None,
         rbln_overrides: dict[str, Any] | None = None,
     ) -> "RBLNCompileSpec":
@@ -187,7 +187,7 @@ class RBLNCompileSpec:
         block_size: int,
         max_model_len: int,
         num_devices: int,
-        memory_budget: float,
+        memory_budget: float | None,
         prefill_chunk_size: int | None = None,
     ) -> "RBLNCompileSpec":
         rbln_config: dict[str, Any] = {
@@ -239,7 +239,7 @@ class RBLNCompileSpec:
         block_size: int,
         max_model_len: int,
         num_devices: int,
-        memory_budget: float,
+        memory_budget: float | None,
         prefill_chunk_size: int | None = None,
     ) -> "RBLNCompileSpec":
         model_name, model_cls_name = get_rbln_model_info(config)
