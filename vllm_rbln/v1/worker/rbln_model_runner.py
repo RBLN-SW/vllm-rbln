@@ -1498,6 +1498,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         most tokens, which fills the encoder's patch bucket."""
         if not (self.supports_mm_inputs and get_pp_group().is_first_rank):
             return
+        if self.is_ec_consumer_only:
+            return
         processor = MULTIMODAL_REGISTRY.create_processor(self.model_config)
         # Only images reach the RBLN vision encoder; the model rejects video.
         if processor.info.allowed_mm_limits.get("image", 0) <= 0:
@@ -2522,7 +2524,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 use_direct_dispatch=True,
                 dtype=self.rbln_config.compile_dtype,
             )
-            if self.supports_mm_inputs:
+            if self.supports_mm_inputs and not self.is_ec_consumer_only:
                 cast(SupportsRBLNMultiModal, self.model).compile_mm_encoder(
                     lambda encoder: compile(
                         encoder,
@@ -3581,6 +3583,17 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
     @property
     def use_wrapped_compute_logits(self) -> bool:
         return not self.is_pooling_model
+
+    @property
+    def is_ec_consumer_only(self) -> bool:
+        """It receives encoder outputs through the EC connector instead of
+        encoding them."""
+        ec_config = self.vllm_config.ec_transfer_config
+        return (
+            ec_config is not None
+            and ec_config.is_ec_consumer
+            and not ec_config.is_ec_producer
+        )
 
     def _attach_kv_cache_bindings(
         self, attn_metadata: PerLayerAttnMetadata | None

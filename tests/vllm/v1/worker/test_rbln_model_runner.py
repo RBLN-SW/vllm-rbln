@@ -29,6 +29,7 @@ import numpy as np
 import pytest
 import torch
 import vllm.distributed.ec_transfer.ec_transfer_state as ec_state
+from vllm.config import ECTransferConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
     ECConnectorBase,
     ECConnectorMetadata,
@@ -639,6 +640,47 @@ class TestEcConsumer:
 
         assert output.ec_connector_output is received
         assert runner.ec_connector_output is None
+
+    @pytest.mark.parametrize(
+        ("ec_role", "compiled"), [(None, True), ("ec_consumer", False)]
+    )
+    def test_the_encoder_is_compiled_only_where_it_runs(
+        self, monkeypatch, ec_role, compiled
+    ):
+        compile_calls = []
+        model = SimpleNamespace(
+            logits_processor=None,
+            compile_mm_encoder=lambda compile_fn: compile_calls.append(compile_fn),
+        )
+        monkeypatch.setattr(
+            mr,
+            "get_model_loader",
+            lambda load_config: SimpleNamespace(load_model=lambda **kw: model),
+        )
+        monkeypatch.setattr(mr, "build_process_group_dict", lambda: {})
+        monkeypatch.setattr(mr, "compile", lambda fn, **kw: fn)
+        ec_config = (
+            None
+            if ec_role is None
+            else ECTransferConfig(ec_connector="RblnECNixlConnector", ec_role=ec_role)
+        )
+        runner = _make_runner_stub(
+            load_config=None,
+            vllm_config=SimpleNamespace(ec_transfer_config=ec_config),
+            model_config=SimpleNamespace(model="m", enforce_eager=False),
+            offload_context=nullcontext,
+            _resolve_mm_support=lambda: True,
+            drafter=None,
+            use_aux_hidden_state_outputs=False,
+            _make_weights_contiguous=lambda: None,
+            compile_context=None,
+            runtime_holder=None,
+            rbln_config=SimpleNamespace(compile_dtype=None),
+        )
+
+        runner.load_model()
+
+        assert bool(compile_calls) is compiled
 
 
 @pytest.mark.parametrize("num_reqs", [1, 2])
