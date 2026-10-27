@@ -26,14 +26,16 @@ zero through `has_initial_state`.
 
 KDA is GatedDeltaNet with a per-channel decay: the layer broadcasts its
 per-head decay over the key channels and repeats q / k over each key head's
-value heads. The short conv (`rbln_custom_ops::causal_conv1d_ring`) keeps one
-ring a layer on the same rows, each key head's q, k and value heads side by side.
+value heads. The short conv (`rbln_custom_ops::causal_conv1d_ring_tabled`)
+keeps one ring a layer on the same rows, each key head's q, k and value heads
+side by side; its index tables are built here, once a step for every layer.
 """
 
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
 import torch
+from rebel.ops.torch_custom_ops.causal_conv1d_ring import ring_tables
 from vllm.config import VllmConfig
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -78,17 +80,14 @@ class RBLNGDNAttentionMetadata:
     is_prefill: bool
     batch_size: int
     seq_len: int
-    # [batch] each row's state row (see RBLNGDNStateRows): int32 on the device
-    # for the conv kernel; int16 on the host for the core kernels, which read
-    # their indices through the const buffer (a device copy crashes the runtime)
-    state_index: torch.Tensor
+    # [batch] int16 on the host: each row's state row (see RBLNGDNStateRows) and
+    # 1 where it carries a cached state. The core kernels read their indices
+    # through the const buffer (a device copy crashes the runtime).
     core_state_index: torch.Tensor
-    # [batch] 1 where the row carries a cached state, likewise twice
-    has_initial_state: torch.Tensor
     core_has_initial_state: torch.Tensor
-    # [batch] int32: the position of the step's first token, and its valid tokens
-    seq_idx: torch.Tensor
-    query_len: torch.Tensor
+    # The conv ring's tables (ring_tables): hist_idx / ring_idx staged on the
+    # device, block / starts / count on the host (the kernel's const buffers)
+    conv_tables: tuple[torch.Tensor, ...]
     # [1, 1, seq_len] float32 on prefill: 1 for valid tokens, 0 for padding
     valid_mask: torch.Tensor | None
     states: dict[str, GDNLayerState]
@@ -167,6 +166,7 @@ class RBLNGDNAttentionMetadataBuilder(
         num_live = vllm_config.scheduler_config.max_num_seqs
         self.rows = RBLNGDNStateRows(num_live)
         layers = vllm_config.compilation_config.static_forward_context
+        self.conv_kernel_size = layers[layer_names[0]].conv_kernel_size
         self.states = {
             name: self._allocate(layers[name], 2 * num_live) for name in layer_names
         }
@@ -251,18 +251,29 @@ class RBLNGDNAttentionMetadataBuilder(
         if is_prefill:
             valid_mask = (torch.arange(seq_len) < query_lens[0]).to(torch.float32)
             valid_mask = valid_mask.view(1, 1, seq_len)
+        has_initial_state = padded(num_computed > 0)
+        hist_idx, ring_idx, block, starts, count = ring_tables(
+            torch.tensor(rows, dtype=torch.int32),
+            padded(first_positions),
+            padded(query_lens),
+            has_initial_state,
+            seq_len,
+            self.conv_kernel_size - 1,
+            self.conv_kernel_size,
+        )
         return RBLNGDNAttentionMetadata(
             is_prefill=is_prefill,
             batch_size=batch,
             seq_len=seq_len,
-            state_index=self._stage(torch.tensor(rows, dtype=torch.int32), "rows"),
             core_state_index=torch.tensor(rows, dtype=torch.int16),
-            has_initial_state=self._stage(
-                padded(num_computed > 0), "has_initial_state"
+            core_has_initial_state=has_initial_state.to(torch.int16),
+            conv_tables=(
+                self._stage(hist_idx, "hist_idx"),
+                self._stage(ring_idx, "ring_idx"),
+                block,
+                starts,
+                count,
             ),
-            core_has_initial_state=padded(num_computed > 0).to(torch.int16),
-            seq_idx=self._stage(padded(first_positions), "seq_idx"),
-            query_len=self._stage(padded(query_lens), "query_len"),
             valid_mask=None
             if valid_mask is None
             else self._stage(valid_mask, "valid_mask"),

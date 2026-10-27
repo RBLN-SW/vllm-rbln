@@ -124,14 +124,11 @@ def patched_gdn_forward(
         ],
         dim=1,
     ).reshape(units, head_dim, kernel)
-    conv = torch.ops.rbln_custom_ops.causal_conv1d_ring(
+    conv = torch.ops.rbln_custom_ops.causal_conv1d_ring_tabled(
         grouped,
         pack_weight(weight),
         state.conv,
-        metadata.state_index,
-        metadata.seq_idx,
-        metadata.query_len,
-        metadata.has_initial_state,
+        *metadata.conv_tables,
         state.conv_width,
     ).view(batch, seq_len, heads_k, 2 + ratio, head_dim)
 

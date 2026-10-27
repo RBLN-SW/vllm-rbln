@@ -20,6 +20,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from rebel.ops.torch_custom_ops.causal_conv1d_ring import ring_tables
 from vllm.v1.kv_cache_interface import MambaSpec
 
 from tests.vllm.vllm_config import make_vllm_config
@@ -102,6 +103,16 @@ def _common(
     )
 
 
+def _assert_conv_tables(md, rows, seq_idx, query_len, has_initial_state):
+    """The conv tables are ring_tables of these per-row values (width 3, 4 taps)."""
+    values = (rows, seq_idx, query_len, has_initial_state)
+    want = ring_tables(
+        *(torch.tensor(v, dtype=torch.int32) for v in values), md.seq_len, 3, 4
+    )
+    for got, expected in zip(md.conv_tables, want, strict=True):
+        assert torch.equal(got.cpu(), expected)
+
+
 class TestBuilder:
     def test_state_shapes_follow_the_kernels(self, builder):
         state = builder.states[LAYER]
@@ -116,17 +127,17 @@ class TestBuilder:
         positions = torch.arange(128)
         md = builder.build(_common([70], [70], [7]), positions, 1, True)
         assert md.is_prefill and md.batch_size == 1 and md.seq_len == 128
-        assert md.state_index.tolist() == [0]
-        assert md.has_initial_state.tolist() == [0]
-        assert md.seq_idx.tolist() == [0] and md.query_len.tolist() == [70]
+        assert md.core_state_index.tolist() == [0]
+        assert md.core_has_initial_state.tolist() == [0]
+        _assert_conv_tables(md, [0], [0], [70], [0])
         assert md.valid_mask.shape == (1, 1, 128)
         assert md.valid_mask.sum() == 70 and md.valid_mask[..., :70].all()
 
     def test_later_prefill_chunk_carries_state(self, builder):
         positions = torch.arange(70, 70 + 58)
         md = builder.build(_common([58], [128], [7]), positions, 1, True)
-        assert md.has_initial_state.tolist() == [1]
-        assert md.seq_idx.tolist() == [70] and md.query_len.tolist() == [58]
+        assert md.core_has_initial_state.tolist() == [1]
+        _assert_conv_tables(md, [0], [70], [58], [1])
 
     def test_decode_pads_the_batch_onto_scratch_rows(self, builder):
         builder.build(_common([70], [70], [7]), torch.arange(128), 1, True)
@@ -134,15 +145,16 @@ class TestBuilder:
         positions = torch.tensor([128, 5])
         md = builder.build(_common([1, 1], [129, 6], [7, 3]), positions, 4, False)
         assert not md.is_prefill and md.batch_size == 4 and md.seq_len == 1
-        assert md.state_index.tolist() == [0, 1, 6, 7]
-        assert md.seq_idx.tolist() == [128, 5, 0, 0]
-        assert md.query_len.tolist() == [1, 1, 0, 0]
-        assert md.has_initial_state.tolist() == [1, 1, 0, 0]
+        assert md.core_state_index.tolist() == [0, 1, 6, 7]
+        assert md.core_has_initial_state.tolist() == [1, 1, 0, 0]
+        _assert_conv_tables(
+            md, [0, 1, 6, 7], [128, 5, 0, 0], [1, 1, 0, 0], [1, 1, 0, 0]
+        )
         assert md.valid_mask is None
 
     def test_staging_buffers_are_reused(self, builder):
         positions = torch.arange(128)
         first = builder.build(_common([70], [70], [7]), positions, 1, True)
         second = builder.build(_common([58], [128], [7]), positions, 1, True)
-        assert first.query_len.data_ptr() == second.query_len.data_ptr()
-        assert second.query_len.tolist() == [58]
+        assert first.conv_tables[0].data_ptr() == second.conv_tables[0].data_ptr()
+        _assert_conv_tables(second, [0], [0], [58], [1])
