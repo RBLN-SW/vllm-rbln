@@ -161,6 +161,8 @@ class RBLNFlashAttentionMetadata:
     cache_offsets: torch.Tensor | None = None
     local_block_tables: torch.Tensor | None = None
     swa_attn_masks: torch.Tensor | None = None
+    # An mm prefix step's sliding-window mask, in the append op's key frame.
+    mm_prefix_swa_mask: torch.Tensor | None = None
 
     use_custom_kernel: bool = False
     is_prompt_sorted: bool = False
@@ -260,7 +262,10 @@ class RBLNFlashAttentionMetadataBuilder(
         skip_attn_masks: bool = False,
         back_pad: torch.Tensor | None = None,
         is_prompt_sorted: bool = False,
+        mm_prefix_query_len: int | None = None,
     ) -> RBLNFlashAttentionMetadata:
+        """`mm_prefix_query_len` is the padded query length of a step that
+        prefills one mm prefix range and nothing else, None on any other step."""
         num_reqs = common_attn_metadata.num_reqs
         # NOTE(RBLN): vllm-rbln keeps attention metadata on the host and copies
         # to the device only when constructing RBLNFlashAttentionMetadata below.
@@ -349,6 +354,33 @@ class RBLNFlashAttentionMetadataBuilder(
 
             local_block_tables = block_tables_tensor[..., :1]
 
+        mm_prefix_swa_mask = None
+        if mm_prefix_query_len is not None and self.swa_appends:
+            # HF's AND(sliding_window, OR(causal, blockwise)) over the strip of
+            # blocks sliding_window_attention_v1 reads. The step's valid tokens
+            # are the one range; padded rows and keys stay masked, as a
+            # bidirectional window would otherwise reach them.
+            assert is_prefill and num_reqs == 1
+            start = int(seq_idx[0])
+            num_valid = int(query_seq_lens_cpu[0])
+            window = self.kv_cache_spec.sliding_window
+            num_blocks = (
+                window + mm_prefix_query_len - 1 + self.block_size - 1
+            ) // self.block_size + 1
+            first_key = max(start - window + 1, 0) // self.block_size * self.block_size
+            row = torch.arange(mm_prefix_query_len).view(-1, 1)
+            key = first_key + torch.arange(num_blocks * self.block_size).view(1, -1)
+            distance = start + row - key
+            keep = (
+                (row < num_valid)
+                & (key < start + num_valid)
+                & (distance < window)
+                & ((distance >= 0) | (key >= start))
+            )
+            mm_prefix_swa_mask = keep.to(
+                torch.float16 if self.enforce_eager else torch.float32
+            ).view(1, 1, mm_prefix_query_len, -1)
+
         attn_metadata = RBLNFlashAttentionMetadata(
             seq_lens=self._stage(seq_idx, "seq_idx"),
             block_tables=self._stage(block_tables_tensor, "block_tables"),
@@ -359,6 +391,7 @@ class RBLNFlashAttentionMetadataBuilder(
             cache_offsets=self._stage(cache_offsets, "cache_offsets"),
             local_block_tables=self._stage(local_block_tables, "local_block_tables"),
             swa_attn_masks=self._stage(swa_attn_masks, "swa_attn_masks"),
+            mm_prefix_swa_mask=self._stage(mm_prefix_swa_mask, "mm_prefix_swa_mask"),
             use_custom_kernel=self.use_custom_kernel,
             is_prompt_sorted=is_prompt_sorted,
         )
@@ -579,6 +612,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     attn_metadata.block_tables,
                     self.sliding_window,
                     self.sinks,
+                    attn_mask=attn_metadata.mm_prefix_swa_mask,
                     is_prompt_sorted=attn_metadata.is_prompt_sorted,
                 )
             else:
@@ -657,6 +691,10 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                 v_quantize_scale = layer._v_scale
                 cache_dtype = _fp8_cache_dtype(self.kv_cache_dtype)
                 if attn_metadata.is_prefill:
+                    # TODO(rebel-compiler): an mm prefix range attends both ways
+                    # on full layers too. Pass is_causal=False and the range's
+                    # mask once this op takes attn_mask; until then an mm prefix
+                    # step runs full layers causally.
                     attn_output = flash_causal_attention_naive_prefill(
                         query,
                         key,
