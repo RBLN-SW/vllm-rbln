@@ -26,7 +26,7 @@ import textwrap
 import threading
 import time
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
@@ -888,6 +888,18 @@ class TestGetAutobindCpuIds:
         result = get_autobind_cpu_ids(0, 0, _make_parallel_config(tp_size=1), self._all)
         assert result == "2,3,6,7"
 
+    def test_several_ranks_keep_round_robin(self, cpus, monkeypatch):
+        # The card is on NUMA 1, but with two ranks rank 0 still gets NUMA 0.
+        monkeypatch.setattr(worker_utils, "rbln_device_numa_node", lambda: 1)
+        result = get_autobind_cpu_ids(0, 0, _make_parallel_config(tp_size=2), self._all)
+        assert result == "0,1,4,5"
+
+    def test_card_node_not_allowed_keeps_round_robin(self, cpus, monkeypatch):
+        # NUMA 2 has no allowed CPUs, so the lone rank falls back to NUMA 0.
+        monkeypatch.setattr(worker_utils, "rbln_device_numa_node", lambda: 2)
+        result = get_autobind_cpu_ids(0, 0, _make_parallel_config(tp_size=1), self._all)
+        assert result == "0,1,4,5"
+
     def test_rank_round_robins_numa_nodes(self, cpus):
         # rank 1 -> NUMA 1 (rank_across_dp % num_numa).
         result = get_autobind_cpu_ids(1, 0, _make_parallel_config(tp_size=1), self._all)
@@ -1224,8 +1236,24 @@ class TestSetPreferredMemoryNode:
         set_preferred_memory_node(0, 0, "nobind")
 
     def test_missing_libnuma_is_skipped(self, monkeypatch):
+        monkeypatch.setattr(worker_utils, "_can_set_mempolicy", lambda: False)
         monkeypatch.setattr(worker_utils, "get_libnuma", lambda: None)
         set_preferred_memory_node(0, 0, "0,1")
+
+    def test_keeps_policy_set_at_launch(self, monkeypatch):
+        # MPOL_BIND, as `numactl --membind` leaves it, is not replaced.
+        def get_mempolicy(mode, *args):
+            ctypes.cast(mode, ctypes.POINTER(ctypes.c_int)).contents.value = 2
+            return 0
+
+        numa_set_preferred = Mock()
+        libnuma = SimpleNamespace(
+            get_mempolicy=get_mempolicy, numa_set_preferred=numa_set_preferred
+        )
+        monkeypatch.setattr(worker_utils, "_can_set_mempolicy", lambda: True)
+        monkeypatch.setattr(worker_utils, "get_libnuma", lambda: libnuma)
+        set_preferred_memory_node(0, 0, "0,1")
+        numa_set_preferred.assert_not_called()
 
 
 class TestSetOmpNumThreads:
