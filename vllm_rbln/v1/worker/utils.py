@@ -14,6 +14,7 @@
 """Utilities for RBLN worker. (CPU affinity, batch reorder, ...)"""
 
 import contextlib
+import ctypes
 import json
 import math
 import os
@@ -38,7 +39,7 @@ from vllm.utils.cpu_resource_utils import (
     get_allowed_cpu_list,
     get_visible_memory_node,
 )
-from vllm.utils.numa_utils import get_libnuma
+from vllm.utils.numa_utils import _can_set_mempolicy, get_libnuma
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
@@ -1128,14 +1129,14 @@ def set_cpu_affinity(rank: int, local_rank: int, local_omp_cpuid: str) -> None:
         try:
             os.sched_setaffinity(0, cpu_ids)
             # sched_setaffinity(0) binds only this thread: bind the ones already
-            # running too (compiler, runtime, torch); one may exit mid-walk.
-            threads = psutil.Process().threads()
-            exited = 0
-            for thread in threads:
-                try:
-                    os.sched_setaffinity(thread.id, cpu_ids)
-                except ProcessLookupError:
-                    exited += 1
+            # running too (compiler, runtime, torch). List them again until none
+            # is new, as an unbound one may start a child mid-walk; one may exit.
+            bound: set[int] = set()
+            while new := {thread.id for thread in psutil.Process().threads()} - bound:
+                for tid in new:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.sched_setaffinity(tid, cpu_ids)
+                bound.update(new)
             # Verify CPU affinity was set correctly
             actual_cpu_ids = sorted(os.sched_getaffinity(0))
             expected_cpu_ids = sorted(cpu_ids)
@@ -1150,13 +1151,11 @@ def set_cpu_affinity(rank: int, local_rank: int, local_omp_cpuid: str) -> None:
                 )
             else:
                 logger.debug(
-                    "Set CPU affinity for rank %d (local_rank %d): CPUs %s, "
-                    "%d threads (%d exited while binding)",
+                    "Set CPU affinity for rank %d (local_rank %d): CPUs %s, %d threads",
                     rank,
                     local_rank,
                     local_omp_cpuid,
-                    len(threads),
-                    exited,
+                    len(bound),
                 )
         except OSError as e:
             logger.error(
@@ -1178,13 +1177,28 @@ def set_preferred_memory_node(rank: int, local_rank: int, local_omp_cpuid: str) 
     """Prefer the CPU binding's NUMA node for new pages before the CPUs are pinned.
 
     The policy applies to this thread and to the threads it starts later.
-    It is skipped when libnuma is not available.
+    A policy set at launch, such as by ``numactl --membind``, is kept.
     """
     if local_omp_cpuid in ("all", "nobind"):
         return
+    if not _can_set_mempolicy():
+        logger.warning(
+            "Cannot set a NUMA memory policy for rank %d; host memory may land "
+            "on another node than its CPUs. In Docker, add --cap-add SYS_NICE.",
+            rank,
+        )
+        return
     libnuma = get_libnuma()
-    if libnuma is None or libnuma.numa_available() < 0:
-        logger.debug("libnuma unavailable; no preferred NUMA node for rank %d", rank)
+    mode = ctypes.c_int()
+    libnuma.get_mempolicy(
+        ctypes.byref(mode), None, ctypes.c_ulong(0), None, ctypes.c_ulong(0)
+    )
+    if mode.value != 0:  # not MPOL_DEFAULT: keep the policy set at launch
+        logger.debug(
+            "Keeping the NUMA memory policy set at launch (mode %d) for rank %d",
+            mode.value,
+            rank,
+        )
         return
     cpu_ids = {int(cpu_id) for cpu_id in local_omp_cpuid.split(",")}
     nodes = {cpu.numa_node for cpu in get_allowed_cpu_list() if cpu.id in cpu_ids}
