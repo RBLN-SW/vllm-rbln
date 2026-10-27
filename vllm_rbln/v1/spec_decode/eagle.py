@@ -172,6 +172,11 @@ class RBLNEagleProposer(EagleProposer):
                 token_indices_to_sample=token_indices_to_sample_padded,
             )
 
+        # A strict producer never verifies a draft, and has no decoding peer to
+        # wait for.
+        if self.runner.is_strict_kv_producer:
+            return draft_ids.new_zeros((num_reqs, self.num_speculative_tokens))
+
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1:
             draft_tokens_ids = self._to_target_token_ids(draft_ids[:num_reqs])
@@ -181,13 +186,9 @@ class RBLNEagleProposer(EagleProposer):
         # since the draft tokens are discarded anyway.
         # Under DP with MoE drafters, we still need to run the full
         # drafter steps for possible decoding peers.
-        # A strict producer discards them too, with no decoding peer to wait for.
-        if self.runner.is_strict_kv_producer or (
-            self.runner.is_intermediate_chunked_prefill
-            and not (
-                self.vllm_config.parallel_config.data_parallel_size > 1
-                and self.draft_has_moe
-            )
+        if self.runner.is_intermediate_chunked_prefill and not (
+            self.vllm_config.parallel_config.data_parallel_size > 1
+            and self.draft_has_moe
         ):
             return draft_ids.new_zeros((num_reqs, self.num_speculative_tokens))
 
