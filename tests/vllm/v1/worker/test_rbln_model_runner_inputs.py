@@ -77,6 +77,61 @@ class TestResolveMultiModalSupport:
             runner._resolve_mm_support()
 
 
+class _MmPrefixModel(_InGraphMergeModel):
+    def __init__(self, query_lens):
+        super().__init__()
+        self.query_lens = query_lens
+
+    def get_mm_prefix_query_lens(self) -> list[int]:
+        return self.query_lens
+
+
+class TestResolveMmPrefixSupport:
+    """An mm prefix LM is served only when every range runs whole in one step."""
+
+    @staticmethod
+    def _runner(make_model_runner, monkeypatch, model, **config):
+        monkeypatch.setattr(
+            ModelConfig, "supports_multimodal_inputs", property(lambda self: True)
+        )
+        monkeypatch.setattr(ModelConfig, "is_mm_prefix_lm", property(lambda self: True))
+        runner = make_model_runner(**{"enable_prefix_caching": False, **config})
+        runner.model = model
+        return runner
+
+    def test_the_models_query_lens_are_taken(self, make_model_runner, monkeypatch):
+        runner = self._runner(make_model_runner, monkeypatch, _MmPrefixModel([64, 128]))
+
+        assert runner._resolve_mm_support() is True
+        assert runner.mm_prefix_query_lens == [64, 128]
+
+    def test_a_model_naming_no_query_lens_is_refused(
+        self, make_model_runner, monkeypatch
+    ):
+        runner = self._runner(make_model_runner, monkeypatch, _InGraphMergeModel())
+
+        with pytest.raises(ValueError, match="SupportsRBLNMmPrefix"):
+            runner._resolve_mm_support()
+
+    @pytest.mark.parametrize(
+        "config, match",
+        [
+            ({"max_num_batched_tokens": 64}, "max_num_batched_tokens=64"),
+            ({"long_prefill_token_threshold": 64}, "long_prefill_token_threshold"),
+            ({"enable_prefix_caching": True}, "Prefix caching"),
+        ],
+    )
+    def test_a_config_that_would_split_a_range_is_refused(
+        self, make_model_runner, monkeypatch, config, match
+    ):
+        runner = self._runner(
+            make_model_runner, monkeypatch, _MmPrefixModel([64, 128]), **config
+        )
+
+        with pytest.raises(ValueError, match=match):
+            runner._resolve_mm_support()
+
+
 class TestGatherMultimodalEmbeddings:
     def test_scheduled_images_are_encoded_and_cached_by_hash(
         self, make_model_runner, monkeypatch

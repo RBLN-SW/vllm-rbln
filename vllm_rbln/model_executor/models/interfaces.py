@@ -49,4 +49,29 @@ def supports_rbln_multimodal(model: object) -> TypeIs[SupportsRBLNMultiModal]:
     return getattr(model, "merges_mm_embeds_in_graph", False) is True
 
 
-__all__ = ["SupportsRBLNMultiModal", "supports_rbln_multimodal"]
+@runtime_checkable
+class SupportsRBLNMmPrefix(Protocol):
+    """An mm prefix LM (upstream's ``is_mm_prefix_lm``) the RBLN vLLM path serves.
+
+    Upstream attends both ways inside each multimodal embedding range through
+    ``mm_prefix_range``, which its kernels read at run time. A compiled RBLN
+    graph cannot, so each range is prefilled as a step of its own, padded to
+    one of the query lengths the model names here.
+    """
+
+    def get_mm_prefix_query_lens(self) -> list[int]:
+        """Ascending padded query lengths an mm prefix step is compiled at;
+        the largest holds the longest range the model can produce."""
+        ...
+
+
+def supports_rbln_mm_prefix(model: object) -> TypeIs[SupportsRBLNMmPrefix]:
+    return isinstance(model, SupportsRBLNMmPrefix)
+
+
+__all__ = [
+    "SupportsRBLNMmPrefix",
+    "SupportsRBLNMultiModal",
+    "supports_rbln_mm_prefix",
+    "supports_rbln_multimodal",
+]
