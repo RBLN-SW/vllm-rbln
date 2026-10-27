@@ -139,8 +139,8 @@ def pair_area(
             continue
         covered += (h1 - h0) * (t1 - t0)
         whole = rect == local
-        token_full = (t0, t1) == (lt0, lt1) == (rt0, rt1)
-        runs = [(h0, h1)] if token_full else [(h, h + 1) for h in range(h0, h1)]
+        same_tokens = (t0, t1) == (lt0, lt1) == (rt0, rt1)
+        runs = [(h0, h1)] if same_tokens else [(h, h + 1) for h in range(h0, h1)]
         for run_lo, run_hi in runs:
             for remote_region, page in (
                 holders[rect] if every_holder else holders[rect][:1]
@@ -181,7 +181,7 @@ def pair_area(
                         f"{lt1 - lt0} token(s) in local region {region_id} and "
                         f"{head_r}B over {rt1 - rt0} in peer region {remote_region}."
                     )
-                if token_full:
+                if same_tokens:
                     length = (run_hi - run_lo) * head_l
                     off_l = (run_lo - lh0) * head_l
                     off_r = (run_lo - rh0) * head_r

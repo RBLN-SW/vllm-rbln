@@ -120,14 +120,17 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         self._check_split_axis_constraints(nixl_agent_meta, remote_tp_size)
         head = ChipletSplitAxis.HEAD
         for logical_l, logical_r in self._logical_region_pairs(registered_layer_names):
+            # Raises here, before the peer is registered, for a layer whose
+            # heads are replicated across our ranks.
+            self._region_kv_heads(logical_l)
+            head_l = self._logical_region_geometry[logical_l].axis is head
+            head_r = nixl_agent_meta.kv_split_axes[logical_r] is head
             # A context cut's slices cut tokens, not heads.
-            cuts_l = self.topo.tp_size * (
-                slices_l if self._logical_region_geometry[logical_l].axis is head else 1
-            )
-            cuts_r = remote_tp_size * (
-                slices_r if nixl_agent_meta.kv_split_axes[logical_r] is head else 1
-            )
-            if max(cuts_l, cuts_r) % min(cuts_l, cuts_r):
+            cuts_l = self.topo.tp_size * (slices_l if head_l else 1)
+            cuts_r = remote_tp_size * (slices_r if head_r else 1)
+            # Against a context cut, a piece is one head over a token range, and
+            # the check below is what keeps a peer rank's heads whole.
+            if head_l and head_r and max(cuts_l, cuts_r) % min(cuts_l, cuts_r):
                 raise RuntimeError(
                     f"RBLN NIXL D2D: for logical region {logical_l} this engine "
                     f"cuts KV heads {cuts_l} ways and the peer {cuts_r}, and "
@@ -1235,12 +1238,13 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
     def _region_kv_heads(self, logical_region: int) -> int:
         """Model-wide KV heads of the layer one logical region belongs to."""
         heads = self._logical_region_kv_heads[logical_region]
-        assert heads is not None, (
-            f"logical region {logical_region} has no head band: its layer either "
-            "has no head axis at all, or holds fewer KV heads than this rank's TP "
-            "degree and has them replicated across ranks. Pairing by head range "
-            "cannot describe either."
-        )
+        if heads is None:
+            raise RuntimeError(
+                f"RBLN NIXL D2D: logical region {logical_region} has no head band: "
+                "its layer either has no head axis at all, or holds fewer KV heads "
+                "than this rank's TP degree and has them replicated across ranks. "
+                "Pairing by head range cannot describe either. Pair at equal TP."
+            )
         return heads
 
     @contextmanager
@@ -1548,7 +1552,8 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         areas_l, _, _ = self._local_band(remote_tp_size)
         for logical_l, logical_r in self._logical_region_pairs(registered_layer_names):
             # A cell is one token of one head; an area holds heads x tokens of
-            # them, so the two sides agree on a cell's bytes or on nothing.
+            # them, so the two sides agree on a cell's bytes or on nothing. Every
+            # area of a region holds as many cells, so rank 0's first stands for all.
             ours, peer = self._area_rects(
                 nixl_agent_meta, logical_l, logical_r, 0, remote_tp_size
             )

@@ -4389,6 +4389,44 @@ class TestAHeadCutMeetsAContextCutAcrossTp:
                         served, [block]
                     )
 
+    @pytest.mark.parametrize("rank_l", range(4))
+    @pytest.mark.parametrize("direction", ["pull", "push_ctx"])
+    def test_a_region_in_one_piece_pairs_with_the_whole_engine_list(
+        self, direction, rank_l
+    ):
+        # One head a rank, split K/V: each region pairs in one piece, so a PP1
+        # peer takes upstream's whole-engine list for ours instead of the
+        # per-shard one, and row i of that list has to name row i's cells.
+        ((w, _, peers, served),) = self._run(
+            direction=direction, total=4, kv=1, local_rank=rank_l
+        ).values()
+        peer_layouts = self._layouts(
+            ChipletSplitAxis.HEAD, tp_rank=0, tp_size=1, total=4, kv=1
+        )
+        meta = _agent_meta(
+            kv_areas=self.AREAS,
+            kv_split_axes=[ChipletSplitAxis.HEAD],
+            num_blocks=self.NUM_BLOCKS,
+            block_size=_TOKENS,
+            kv_caches_base_addr=_region_bases(peer_layouts, self.NUM_BLOCKS),
+            block_lens=[lay.block_len for lay in peer_layouts],
+        )
+        regions, pieces = w._head_matched_plan(meta, 0, 1, peer_areas=None)
+        assert regions == list(range(w.num_regions))
+        assert all(len(p) == 1 for p in pieces)
+        w._transfer_layer_region_indices = None
+        w.region_num_blocks = [self.NUM_BLOCKS] * w.num_regions
+        w.block_stride_per_layer = w.block_len_per_layer
+        bases = w.kv_caches_base_addr["eng"][rank_l]
+        whole = _decode_units(
+            w._build_fa_local(bases, 1).tolist(),
+            bases=bases,
+            layouts=served,
+            num_blocks=self.NUM_BLOCKS,
+        )
+
+        assert [us for _, us in whole] == [us for _, us in peers]
+
     @pytest.mark.parametrize("total", [4, 8], ids=["one_head_a_rank", "two"])
     def test_a_chunk_of_the_context_cut_side_is_named_where_it_sits(self, total):
         # Pulling into a context cut, a region's pieces all lie in its area's
@@ -5196,16 +5234,23 @@ class TestARefusedPeerLeavesNothingBehind:
         w.transfer_topo.register_remote_engine.assert_not_called()
         w.nixl_wrapper.add_remote_agent.assert_not_called()
 
-    def test_a_context_cut_counts_no_slice_as_a_head_cut(self):
-        # Our TP2 context cut splits heads two ways, not 2 x 4 slices, which
-        # divides the six ways a TP1 peer cuts them.
+    def test_a_context_cut_pairs_a_head_cut_of_any_count(self):
+        # Six KV heads: our TP3 context cut holds two a rank, and the TP1 peer
+        # cuts them into two slices of three. Neither count divides the other,
+        # yet every piece is one head over our token range. Bands from geometry.
         w = self._worker()
-        w.transfer_topo.tp_size = 2
-        w.local_seen_layer_names = ["l0"]
+        del w._check_split_axis_constraints
+        w.use_host_buffer = False
+        w.transfer_topo.tp_size = 3
+        w._logical_region_kv_heads = [6]
         fill_region_geometry(w, areas=4, axes=[ChipletSplitAxis.TOKEN], slices=4)
-        w._local_band = MagicMock(return_value=(4, 4, [0, 1, 2, 3]))
-        w._peer_band = MagicMock(return_value=(6, 6))
-        meta = _agent_meta(engine_id="peer", kv_split_axes=[ChipletSplitAxis.HEAD])
+        meta = _agent_meta(
+            engine_id="peer",
+            kv_areas=4,
+            kv_slices=2,
+            kv_split_axes=[ChipletSplitAxis.HEAD],
+            region_names=[],
+        )
 
         with (
             patch.object(
@@ -5216,6 +5261,31 @@ class TestARefusedPeerLeavesNothingBehind:
             pytest.raises(RuntimeError, match="past the cut check"),
         ):
             w.add_remote_agent(meta, 0, 1, meta.dcp_size)
+
+    def test_a_head_cut_against_a_finer_context_cut_is_a_straddle(self):
+        # The same pair the other way round: one of our TP1 head slices spans
+        # two TP3 peers, which the straddle check names.
+        w = self._worker()
+        del w._check_split_axis_constraints
+        w.use_host_buffer = False
+        w._logical_region_kv_heads = [6]
+        fill_region_geometry(w, areas=4, axes=[ChipletSplitAxis.HEAD], slices=2)
+        meta = _agent_meta(
+            engine_id="peer",
+            kv_areas=4,
+            kv_split_axes=[ChipletSplitAxis.TOKEN],
+            region_names=[],
+        )
+
+        with (
+            patch.object(
+                RblnNixlPullConnectorWorker,
+                "_register_remote_engine_prelude",
+                side_effect=AssertionError("registered"),
+            ),
+            pytest.raises(RuntimeError, match="straddle several peers"),
+        ):
+            w.add_remote_agent(meta, 0, 3, meta.dcp_size)
 
     def test_a_context_cut_against_a_head_cut_passes_with_chunks(self):
         # The other way round, every piece lies in our area's one token range,
@@ -5238,26 +5308,6 @@ class TestARefusedPeerLeavesNothingBehind:
             pytest.raises(RuntimeError, match="past the cut check"),
         ):
             w.add_remote_agent(meta, 0, 1, meta.dcp_size)
-
-    def test_a_peer_context_cut_counts_no_slice_as_a_head_cut(self):
-        # The other side of the same count: the peer's TP2 context cut splits
-        # heads two ways, not 2 x 3 slices, which divides our four head cuts.
-        w = self._worker()
-        w.local_seen_layer_names = ["l0"]
-        fill_region_geometry(w, areas=4, axes=[ChipletSplitAxis.HEAD], slices=4)
-        w._local_band = MagicMock(return_value=(4, 4, [0, 1, 2, 3]))
-        w._peer_band = MagicMock(return_value=(3, 3))
-        meta = _agent_meta(engine_id="peer", kv_split_axes=[ChipletSplitAxis.TOKEN])
-
-        with (
-            patch.object(
-                RblnNixlPullConnectorWorker,
-                "_register_remote_engine_prelude",
-                side_effect=RuntimeError("past the cut check"),
-            ),
-            pytest.raises(RuntimeError, match="past the cut check"),
-        ):
-            w.add_remote_agent(meta, 0, 2, meta.dcp_size)
 
     @pytest.mark.parametrize(
         "cls, knob, raised",
@@ -5310,6 +5360,7 @@ class TestARefusedPeerLeavesNothingBehind:
         # cuts its heads only twice: region 1's areas alone straddle TP4 peers.
         w = self._worker()
         w.transfer_topo.tp_size = 2
+        w._logical_region_kv_heads = [8, 8]
         w.local_seen_layer_names = ["l0"]
         fill_region_geometry(
             w, areas=4, axes=[ChipletSplitAxis.HEAD, ChipletSplitAxis.TOKEN], slices=4
@@ -5332,6 +5383,7 @@ class TestARefusedPeerLeavesNothingBehind:
         # The peer's TP2 cuts region 0's tokens (two head cuts) and region 1's
         # heads 2 x 3 ways; only region 1 is incommensurate with our four.
         w = self._worker()
+        w._logical_region_kv_heads = [8, 8]
         w.local_seen_layer_names = ["l0"]
         fill_region_geometry(w, areas=4, axes=[ChipletSplitAxis.HEAD] * 2, slices=4)
         w._local_band = MagicMock(return_value=(4, 4, [0, 1, 2, 3]))
@@ -5356,6 +5408,7 @@ class TestARefusedPeerLeavesNothingBehind:
         # there, ours at region 1, and the head cut meets the context cut. At
         # TP2 the peer would straddle region 0's single cut.
         w = self._worker()
+        w._logical_region_kv_heads = [8, 8]
         w.local_seen_layer_names = ["l0", "l1"]
         fill_region_geometry(
             w, areas=4, axes=[ChipletSplitAxis.TOKEN, ChipletSplitAxis.HEAD], slices=4
@@ -5396,6 +5449,38 @@ class TestARefusedPeerLeavesNothingBehind:
             pytest.raises(RuntimeError, match="straddle several peers"),
         ):
             w.add_remote_agent(meta, 0, 4, meta.dcp_size)
+
+    @pytest.mark.parametrize(
+        "axis, slices",
+        [(ChipletSplitAxis.TOKEN, 4), (ChipletSplitAxis.HEAD, 1)],
+        ids=["context_cut", "replicated"],
+    )
+    def test_a_rank_short_of_one_kv_head_is_refused_unregistered(self, axis, slices):
+        # Four KV heads at TP8: upstream gives each rank one head replicated
+        # across two ranks, which registration records as no head band. Our
+        # bands and the peer's are read from the geometry, not mocked.
+        w = self._worker()
+        del w._check_split_axis_constraints
+        w.use_host_buffer = False
+        w.transfer_topo.tp_size = 8
+        w._logical_region_kv_heads = [None]
+        fill_region_geometry(w, areas=4, axes=[axis], slices=slices)
+        meta = _agent_meta(
+            engine_id="peer",
+            kv_areas=4,
+            kv_split_axes=[ChipletSplitAxis.HEAD],
+            region_names=[],
+        )
+
+        with (
+            patch.object(
+                RblnNixlPullConnectorWorker,
+                "_register_remote_engine_prelude",
+                side_effect=AssertionError("registered"),
+            ),
+            pytest.raises(RuntimeError, match="fewer KV heads than"),
+        ):
+            w.add_remote_agent(meta, 0, 1, meta.dcp_size)
 
     def test_the_prelude_carries_the_peers_dcp_size(self):
         # `EngineTransferInfo.remote_dcp_size` defaults to 1, so a prelude that
