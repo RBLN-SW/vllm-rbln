@@ -164,9 +164,12 @@ def test_the_encoder_compiles_only_where_the_tower_lives(
         gemma4, "get_pp_group", lambda: SimpleNamespace(is_first_rank=first_rank)
     )
     built = nn.Identity()
-    monkeypatch.setattr(gemma4, "_RBLNGemma4VisionEncoder", lambda tower: built)
+    monkeypatch.setattr(
+        gemma4, "_RBLNGemma4VisionEncoder", lambda tower, embed_vision: built
+    )
     model = _bare_model(
         vision_tower=nn.Identity(),
+        embed_vision=nn.Identity(),
         multimodal_config=SimpleNamespace(
             get_limit_per_prompt=lambda modality: limits.get(modality, 0)
         ),
