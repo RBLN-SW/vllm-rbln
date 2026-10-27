@@ -2026,7 +2026,7 @@ wheels = [
 
 [[package]]
 name = "optimum-rbln"
-version = "0.12.1a3"
+version = "0.12.1a4"
 source = { registry = "https://pypi.org/simple/" }
 dependencies = [
     { name = "accelerate" },
@@ -2040,9 +2040,9 @@ dependencies = [
     { name = "transformers" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/e6/81/33e4bb9cd7237911d34bc37caccc6c4c2597c9305910e8dc4989e37185ec/optimum_rbln-0.12.1a3.tar.gz", hash = "sha256:406d7450968af5107a6f401d9e12bb67fbab95a2704e2b45989536c07e222c2b", size = 687623, upload-time = "2026-10-21T07:35:36.653Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/f7/bf/729f89962cc1e6c586487fd20b08f43be9a55730aafb84379d2b60cc4b0b/optimum_rbln-0.12.1a4.tar.gz", hash = "sha256:238a51cd3f99176209bad166c1c3b343789e650376a881303f9a3db4a231f929", size = 692531, upload-time = "2026-10-27T03:59:44.989Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b5/45/4c11c8754dab9f9f575e3ab9a15754fb57f1402586512eac1a808ce8b686/optimum_rbln-0.12.1a3-py3-none-any.whl", hash = "sha256:6bf1d0e238900349f816af8d382b316c716111dd4cd5acfc3e88a7f25fbdfe9b", size = 750612, upload-time = "2026-10-21T07:35:34.554Z" },
+    { url = "https://files.pythonhosted.org/packages/7b/91/e63009e4264ea304b0d8dbd8e8958338e3eae2c6a8d37e27f2a999c01809/optimum_rbln-0.12.1a4-py3-none-any.whl", hash = "sha256:ce9e098dcbb3bf57e7113e5b87eb7aaa7d764807328c1ccc55955e36b7f8dec4", size = 753106, upload-time = "2026-10-27T03:59:42.618Z" },
 ]
 
 [[package]]
@@ -3669,7 +3669,7 @@ requires-dist = [
     { name = "huggingface-hub", marker = "extra == 'dev'" },
     { name = "lmcache-rbln", marker = "extra == 'kv-connectors'", specifier = ">=0.12.0rc1,<0.12.1" },
     { name = "nixl-rbln", marker = "extra == 'kv-connectors'", specifier = ">=0.12.0rc1,<0.12.1" },
-    { name = "optimum-rbln", specifier = ">=0.12.1a3,<0.12.2", index = "https://pypi.org/simple/" },
+    { name = "optimum-rbln", specifier = ">=0.12.1a4,<0.12.2", index = "https://pypi.org/simple/" },
     { name = "packaging", marker = "extra == 'dev'" },
     { name = "pynvml", marker = "extra == 'dev'" },
     { name = "pytest", marker = "extra == 'test'" },
