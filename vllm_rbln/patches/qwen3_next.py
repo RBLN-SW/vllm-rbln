@@ -14,6 +14,7 @@
 
 import torch
 import torch.nn.functional as F
+from rebel.ops.torch_custom_ops.causal_conv1d_ring import pack_weight
 from vllm import ir
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
@@ -93,6 +94,8 @@ def patched_gdn_forward(
     value_dim = self.value_dim // tp_size
     channels = key_dim * 2 + value_dim
     head_dim = GDN_HEAD_DIM
+    kernel = self.conv_kernel_size
+    units = heads_k * (2 + ratio)
 
     # Keep the leading dims the model uses ([batch, seq] on RBLN); only the
     # kernels need the explicit [batch, seq, ...] views.
@@ -100,41 +103,48 @@ def patched_gdn_forward(
     gates, _ = self.in_proj_ba(hidden_states)
     q, k, v, z = mixed_qkvz.split([key_dim, key_dim, value_dim, value_dim], dim=-1)
     b, a = gates.chunk(2, dim=-1)
-    conv_weight = self.conv1d.weight.view(channels, self.conv_kernel_size)
-    conv_weight = conv_weight.to(mixed_qkvz.dtype)
-    # Sliced, not split: the compiler folds a slice into a constant RSD can
-    # cut, but leaves the last part of a split as an op it cannot.
-    w_q = conv_weight[:key_dim]
-    w_k = conv_weight[key_dim : 2 * key_dim]
-    w_v = conv_weight[2 * key_dim :]
+    conv_weight = self.conv1d.weight.view(channels, kernel).to(mixed_qkvz.dtype)
 
-    # One conv per q / k / v: RSD then cuts each one's channels on its heads,
-    # where a cut of the q|k|v channels would not fall on head boundaries.
-    def conv(x, weight, ring):
-        return torch.ops.rbln_custom_ops.kda_conv(
-            x.reshape(batch, seq_len, -1),
-            weight,
-            ring,
-            metadata.state_index,
-            metadata.seq_idx,
-            metadata.query_len,
-            metadata.has_initial_state,
-            state.conv_width,
-        )
+    # One ring conv over each key head's q, k and value heads side by side, as
+    # the ring holds them: the chiplet cut then falls on whole key-head groups,
+    # so every chiplet holds the q / k its value heads read.
+    grouped = torch.cat(
+        [
+            q.reshape(batch, seq_len, heads_k, 1, head_dim),
+            k.reshape(batch, seq_len, heads_k, 1, head_dim),
+            v.reshape(batch, seq_len, heads_k, ratio, head_dim),
+        ],
+        dim=3,
+    ).reshape(batch, seq_len, units, head_dim)
+    weight = torch.cat(
+        [
+            conv_weight[:key_dim].reshape(heads_k, 1, head_dim, kernel),
+            conv_weight[key_dim : 2 * key_dim].reshape(heads_k, 1, head_dim, kernel),
+            conv_weight[2 * key_dim :].reshape(heads_k, ratio, head_dim, kernel),
+        ],
+        dim=1,
+    ).reshape(units, head_dim, kernel)
+    conv = torch.ops.rbln_custom_ops.causal_conv1d_ring(
+        grouped,
+        pack_weight(weight),
+        state.conv,
+        metadata.state_index,
+        metadata.seq_idx,
+        metadata.query_len,
+        metadata.has_initial_state,
+        state.conv_width,
+    ).view(batch, seq_len, heads_k, 2 + ratio, head_dim)
 
     # The KDA core takes one q / k per value head, L2-normalized by the caller.
-    # Not the kernel's norm_inputs: its zero-row constant shares a content key
-    # with decode-only constants, which then stay on the device and fail the
-    # weight reuse check.
     query, key = (
-        _l2norm(conv(x, w, ring).view(batch * seq_len, heads_k, head_dim))
+        _l2norm(conv[:, :, :, unit].reshape(batch * seq_len, heads_k, head_dim))
         .view(batch, seq_len, heads_k, 1, head_dim)
         .expand(batch, seq_len, heads_k, ratio, head_dim)
         .reshape(batch, seq_len, heads_v, head_dim)
         .transpose(1, 2)
-        for x, w, ring in ((q, w_q, state.conv_q), (k, w_k, state.conv_k))
+        for unit in (0, 1)
     )
-    value = conv(v, w_v, state.conv_v).view(batch, seq_len, heads_v, head_dim)
+    value = conv[:, :, :, 2:].reshape(batch, seq_len, heads_v, head_dim)
     value = value.transpose(1, 2)
 
     beta = torch.sigmoid(b).reshape(batch, seq_len, heads_v).transpose(1, 2)

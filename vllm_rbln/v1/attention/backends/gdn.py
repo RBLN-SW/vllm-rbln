@@ -26,8 +26,8 @@ zero through `has_initial_state`.
 
 KDA is GatedDeltaNet with a per-channel decay: the layer broadcasts its
 per-head decay over the key channels and repeats q / k over each key head's
-value heads. The short conv (`rbln_custom_ops::kda_conv`) keeps one ring each
-for q, k and v on the same rows.
+value heads. The short conv (`rbln_custom_ops::causal_conv1d_ring`) keeps one
+ring a layer on the same rows, each key head's q, k and value heads side by side.
 """
 
 from collections.abc import Iterable, Sequence
@@ -56,7 +56,6 @@ logger = init_logger(__name__)
 GDN_HEAD_DIM = 128
 GDN_PREFILL_CHUNK = 128
 R1_ROW_BYTES = 512
-_CONV_LANES = 64
 
 
 def gdn_state_rows(num_v_heads: int, dtype: torch.dtype) -> int:
@@ -66,11 +65,9 @@ def gdn_state_rows(num_v_heads: int, dtype: torch.dtype) -> int:
 
 @dataclass
 class GDNLayerState:
-    # [rows, width, channels / 64, 64] each: the conv rings of q, k and v, row
-    # p % width holding position p
-    conv_q: torch.Tensor
-    conv_k: torch.Tensor
-    conv_v: torch.Tensor
+    # [rows, width, heads_k * (2 + heads_v / heads_k), 128]: the conv ring, row
+    # p % width holding position p's q, k and value heads, grouped by key head
+    conv: torch.Tensor
     # [rows, 64 * heads_v, 512] uint8: R1's bytes of the [heads_v, 128, 128] states
     ssm_state: torch.Tensor
     conv_width: int
@@ -192,17 +189,11 @@ class RBLNGDNAttentionMetadataBuilder(
                 f"{layer.head_k_dim} / {layer.head_v_dim}"
             )
         width = layer.conv_kernel_size - 1
-
-        def ring(heads: int) -> torch.Tensor:
-            blocks = heads * GDN_HEAD_DIM // _CONV_LANES
-            return torch.zeros(
-                rows, width, blocks, _CONV_LANES, dtype=self.dtype, device=self.device
-            )
-
+        units = heads_k * 2 + heads_v
         return GDNLayerState(
-            conv_q=ring(heads_k),
-            conv_k=ring(heads_k),
-            conv_v=ring(heads_v),
+            conv=torch.zeros(
+                rows, width, units, GDN_HEAD_DIM, dtype=self.dtype, device=self.device
+            ),
             ssm_state=torch.zeros(
                 rows,
                 gdn_state_rows(heads_v, self.dtype),

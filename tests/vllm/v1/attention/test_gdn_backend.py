@@ -106,8 +106,8 @@ class TestBuilder:
     def test_state_shapes_follow_the_kernels(self, builder):
         state = builder.states[LAYER]
         # 4 live rows + 4 scratch rows; 4 fp32 heads are 128 R1 rows each
-        assert state.conv_q.shape == state.conv_k.shape == (8, 3, 4, 64)
-        assert state.conv_v.shape == (8, 3, 8, 64)
+        # 2 key heads, each with its q, k and 2 value heads: 8 units of 128
+        assert state.conv.shape == (8, 3, 8, 128)
         assert state.ssm_state.shape == (8, gdn_state_rows(4, torch.float32), 512)
         assert state.ssm_state.dtype == torch.uint8
         assert state.conv_width == 3
