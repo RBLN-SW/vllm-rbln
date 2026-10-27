@@ -116,7 +116,6 @@ class TestResolveMmPrefixSupport:
     @pytest.mark.parametrize(
         "config, match",
         [
-            ({"max_num_batched_tokens": 64}, "max_num_batched_tokens=64"),
             ({"long_prefill_token_threshold": 64}, "long_prefill_token_threshold"),
             ({"enable_prefix_caching": True}, "Prefix caching"),
         ],

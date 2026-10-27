@@ -1406,12 +1406,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 )
             query_lens = self.model.get_mm_prefix_query_lens()
             longest = query_lens[-1]
-            if self.max_num_tokens < longest:
-                raise ValueError(
-                    f"max_num_batched_tokens={self.max_num_tokens} is below "
-                    f"{longest}, the query length the longest multimodal range "
-                    "is padded to: a range has to fit one step."
-                )
             threshold = self.scheduler_config.long_prefill_token_threshold
             if 0 < threshold < longest:
                 raise ValueError(
