@@ -78,3 +78,35 @@ def test_flag_conflicts_with_decoder_override(monkeypatch):
             memory_budget=0.9,
             rbln_overrides={"nested_compile_region": False},
         )
+
+
+@pytest.mark.parametrize("num_blocks", [None, 16])
+@pytest.mark.parametrize(
+    "architecture, key",
+    [
+        ("LlamaForCausalLM", None),
+        ("Qwen3VLForConditionalGeneration", None),
+        ("Gemma3ForConditionalGeneration", "language_model"),
+        ("Idefics3ForConditionalGeneration", "text_model"),
+    ],
+)
+def test_memory_budget_is_only_created_for_automatic_blocks(
+    architecture, key, num_blocks
+):
+    overrides = {} if num_blocks is None else {"kvcache_num_blocks": num_blocks}
+    spec = RBLNCompileSpec.for_architecture(
+        PretrainedConfig(architectures=[architecture]),
+        batch_size=1,
+        block_size=512,
+        max_model_len=4096,
+        num_devices=1,
+        memory_budget=0.9 if num_blocks is None else 1.0,
+        num_gpu_blocks_override=num_blocks,
+        rbln_overrides={key: overrides} if key else overrides,
+    )
+    decoder = spec.rbln_config[key] if key else spec.rbln_config
+    if num_blocks is None:
+        assert decoder["memory_budget"] == 0.9
+    else:
+        assert "memory_budget" not in decoder
+        assert decoder["kvcache_num_blocks"] == num_blocks

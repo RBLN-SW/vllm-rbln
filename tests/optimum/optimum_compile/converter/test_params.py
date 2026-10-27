@@ -335,7 +335,6 @@ class TestGetParamQwen35:
     cfg = {
         "batch_size": 1,
         "num_devices": 1,
-        "memory_budget": 0.9,
         "prefill_chunk_size": 128,
     }
 

@@ -19,7 +19,6 @@ def get_param_qwen2_vl(
     max_model_len: int,
     block_size: int,
     num_devices: int,
-    memory_budget: float | None,
     prefill_chunk_size: int | None = None,
 ) -> dict:
     param: dict = {
@@ -27,7 +26,6 @@ def get_param_qwen2_vl(
         "max_seq_len": max_model_len,
         "batch_size": batch_size,
         "use_inputs_embeds": True,
-        "memory_budget": memory_budget,
     }
     if block_size != max_model_len:
         attn_impl = "flash_attn" if block_size != max_model_len else "eager"
@@ -51,7 +49,6 @@ def get_param_qwen3_5(
     max_model_len: int,
     block_size: int,
     num_devices: int,
-    memory_budget: float | None,
     prefill_chunk_size: int | None = None,
 ) -> dict:
     # Qwen3.5's linear_attention layers use gated_delta_net; the full_attention
@@ -67,7 +64,6 @@ def get_param_qwen3_5(
         max_model_len,
         block_size,
         num_devices,
-        memory_budget,
         prefill_chunk_size,
     )
     param["attn_impl"] = "flash_attn"

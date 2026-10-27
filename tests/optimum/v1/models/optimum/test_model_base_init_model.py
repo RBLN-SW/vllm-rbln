@@ -149,6 +149,11 @@ def test_validated_vllm_cache_settings_select_compile_budget(
     spec = build_spec(config, **passed["compile_kwargs"])
     validated = RBLNLlamaForCausalLMConfig(**spec.rbln_config)
     expected_budget = utilization if num_blocks is None else None
-    assert passed["compile_kwargs"]["memory_budget"] == expected_budget
+    assert passed["compile_kwargs"]["memory_budget"] == utilization
+    assert passed["compile_kwargs"]["num_gpu_blocks_override"] == num_blocks
+    if num_blocks is None:
+        assert spec.rbln_config["memory_budget"] == utilization
+    else:
+        assert "memory_budget" not in spec.rbln_config
     assert validated.memory_budget == expected_budget
     assert validated.kvcache_num_blocks == (num_blocks or 0)

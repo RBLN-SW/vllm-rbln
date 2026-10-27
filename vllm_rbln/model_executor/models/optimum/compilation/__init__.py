@@ -104,9 +104,10 @@ class RBLNCompileSpec:
         block_size: int,
         max_model_len: int,
         num_devices: int,
-        memory_budget: float | None,
+        memory_budget: float,
         prefill_chunk_size: int | None = None,
         rbln_overrides: dict[str, Any] | None = None,
+        num_gpu_blocks_override: int | None = None,
     ) -> "RBLNCompileSpec":
         """Build a compile spec from vllm-rbln inputs, dispatched by architecture."""
         if is_generation_arch(config):
@@ -115,7 +116,6 @@ class RBLNCompileSpec:
                 block_size,
                 max_model_len,
                 num_devices,
-                memory_budget,
                 prefill_chunk_size,
             )
         elif is_pooling_arch(config):
@@ -133,7 +133,6 @@ class RBLNCompileSpec:
                 block_size,
                 max_model_len,
                 num_devices,
-                memory_budget,
                 prefill_chunk_size,
             )
         elif is_enc_dec_arch(config):
@@ -150,15 +149,16 @@ class RBLNCompileSpec:
                 f"Compilation is not implemented for architecture {architectures[0]}"
             )
 
-        if envs.VLLM_RBLN_USE_NESTED_COMPILE_REGION and (
-            is_generation_arch(config) or is_multi_modal(config)
-        ):
+        if is_generation_arch(config) or is_multi_modal(config):
             decoder_config = spec.rbln_config
             for name in ("language_model", "text_model"):
                 if name in decoder_config:
                     decoder_config = decoder_config[name]
                     break
-            decoder_config["nested_compile_region"] = True
+            if num_gpu_blocks_override is None:
+                decoder_config["memory_budget"] = memory_budget
+            if envs.VLLM_RBLN_USE_NESTED_COMPILE_REGION:
+                decoder_config["nested_compile_region"] = True
 
         # rbln_overrides must not overwrite fields vllm derives from its own
         # config (batch_size, max_seq_len, memory_budget, ...); a silent
@@ -187,14 +187,12 @@ class RBLNCompileSpec:
         block_size: int,
         max_model_len: int,
         num_devices: int,
-        memory_budget: float | None,
         prefill_chunk_size: int | None = None,
     ) -> "RBLNCompileSpec":
         rbln_config: dict[str, Any] = {
             "num_devices": num_devices,
             "batch_size": batch_size,
             "max_seq_len": max_model_len,
-            "memory_budget": memory_budget,
         }
         if block_size != max_model_len:
             rbln_config["kvcache_partition_len"] = block_size
@@ -239,7 +237,6 @@ class RBLNCompileSpec:
         block_size: int,
         max_model_len: int,
         num_devices: int,
-        memory_budget: float | None,
         prefill_chunk_size: int | None = None,
     ) -> "RBLNCompileSpec":
         model_name, model_cls_name = get_rbln_model_info(config)
@@ -258,7 +255,6 @@ class RBLNCompileSpec:
             max_model_len,
             block_size,
             num_devices,
-            memory_budget,
             prefill_chunk_size,
         )
         return cls(model_cls=model_cls, rbln_config=rbln_config)

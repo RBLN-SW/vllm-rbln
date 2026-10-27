@@ -30,9 +30,7 @@ from .qwen import (
     get_param_qwen3_vl_moe,
 )
 
-_COMPILE_MULTIMODAL_FNS: dict[
-    str, Callable[[int, int, int, int, float | None, int | None], dict]
-] = {
+_COMPILE_MULTIMODAL_FNS: dict[str, Callable[[int, int, int, int, int | None], dict]] = {
     "blip2": get_param_blip2,
     "exaone4_5": get_param_exaone4_5,
     "idefics3": get_param_idefics3,
