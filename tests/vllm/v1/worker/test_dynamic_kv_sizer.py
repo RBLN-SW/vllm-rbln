@@ -547,6 +547,7 @@ class TestModeResolution:
             ),
             speculative_config=None,
             kv_transfer_config=None,
+            is_mm_encoder_only=False,
         )
 
         with caplog.at_level("WARNING"):

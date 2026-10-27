@@ -97,6 +97,7 @@ def _make_vllm_config(
         scheduler_config=SimpleNamespace(),
         device_config=SimpleNamespace(device=torch.device("cpu"), device_type="cpu"),
         kv_transfer_config=None,
+        is_mm_encoder_only=False,
         additional_config=(
             additional_config if additional_config is not None else RBLNConfig()
         ),

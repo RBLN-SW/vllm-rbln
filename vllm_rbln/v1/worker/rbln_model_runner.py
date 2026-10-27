@@ -82,6 +82,7 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
     PoolerOutput,
     SamplerOutput,
+    make_empty_encoder_model_runner_output,
 )
 from vllm.v1.sample.logits_processor import (
     LogitsProcessors,
@@ -96,6 +97,7 @@ from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import record_function_or_nullcontext
+from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.kv_connector_model_runner_mixin import (
     KVConnectorModelRunnerMixin,
@@ -248,7 +250,7 @@ class ExecuteModelState(NamedTuple):
     combined_hidden_states: torch.Tensor | None
 
 
-class RBLNModelRunner(KVConnectorModelRunnerMixin):
+class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -1414,6 +1416,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         for mm_hash, output in zip(mm_hashes, encoder_outputs):
             self.encoder_cache[mm_hash] = output
+            self.maybe_save_ec_to_connector(self.encoder_cache, mm_hash)
 
     def _gather_mm_embeddings(
         self,
@@ -1912,6 +1915,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         with record_function_or_nullcontext("rbln_model_runner: preprocess"):
             # Update persistent batch states.
             self._update_states(scheduler_output)
+
+            if self.vllm_config.is_mm_encoder_only:
+                with self.maybe_get_ec_connector_output(
+                    scheduler_output, encoder_cache=self.encoder_cache
+                ):
+                    self._execute_mm_encoder(scheduler_output)
+                return make_empty_encoder_model_runner_output(scheduler_output)
 
             # Process sub-block KV cache copy operations before the forward
             # pass so that partially cached blocks are populated.
@@ -3483,6 +3493,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             KVCacheSpec: A dictionary mapping layer names to their KV cache
             format. Layers that do not need KV cache are not included.
         """
+        if self.vllm_config.is_mm_encoder_only:
+            return {}
         kv_cache_spec: dict[str, KVCacheSpec] = {}
         layer_type = cast(type[Any], AttentionLayerBase)
         attn_layers = get_layers_from_vllm_config(self.vllm_config, layer_type)
@@ -3839,22 +3851,23 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         sig = mega_cache.config_signature(self.vllm_config)
         mega_cache.load(self.model_config.model, sig)
         with set_compile_stage("warmup"), self.offload_context():
-            self.run_model_graphs()
+            if not self.vllm_config.is_mm_encoder_only:
+                self.run_model_graphs()
 
-            # NOTE(RBLN): the sampler and the rejection sampler are built on the
-            # last PP rank only, so no other rank has anything to warm up here.
-            if get_pp_group().is_last_rank:
-                # 4-1. sampler
-                if not self.is_pooling_model:
-                    for size in self.bucketing_manager.batch_buckets:
-                        self._dummy_sampler_run(size)
+                # NOTE(RBLN): the sampler and the rejection sampler are built on
+                # the last PP rank only, so no other rank has anything to warm up here.
+                if get_pp_group().is_last_rank:
+                    # 4-1. sampler
+                    if not self.is_pooling_model:
+                        for size in self.bucketing_manager.batch_buckets:
+                            self._dummy_sampler_run(size)
 
-                # 4-2. rejection sampler
-                self._warmup_sampler_decode_batches()
+                    # 4-2. rejection sampler
+                    self._warmup_sampler_decode_batches()
 
-            # 5. specdec (medusa)
-            if isinstance(self.drafter, RBLNMedusaProposer):
-                self.drafter.dummy_run()
+                # 5. specdec (medusa)
+                if isinstance(self.drafter, RBLNMedusaProposer):
+                    self.drafter.dummy_run()
 
             # 6. multimodal encoder
             self._warmup_mm_encoder()

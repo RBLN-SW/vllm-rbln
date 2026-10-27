@@ -28,6 +28,7 @@ from unittest.mock import MagicMock, Mock
 import numpy as np
 import pytest
 import torch
+import vllm.distributed.ec_transfer.ec_transfer_state as ec_state
 from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheTensor
@@ -402,7 +403,7 @@ def test_pooling_warmup_runs_without_language_model_head(monkeypatch):
     monkeypatch.setattr(mr, "mega_cache", cache)
     monkeypatch.setattr(mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True))
     runner = _make_runner_stub(
-        vllm_config=None,
+        vllm_config=SimpleNamespace(is_mm_encoder_only=False),
         model_config=SimpleNamespace(model="pooling", get_hidden_size=lambda: 8),
         is_pooling_model=True,
         run_model_graphs=Mock(),
@@ -419,6 +420,98 @@ def test_pooling_warmup_runs_without_language_model_head(monkeypatch):
 
     runner.run_model_graphs.assert_called_once_with()
     cache.save.assert_called_once_with("pooling", cache.config_signature.return_value)
+
+
+class TestEncoderOnly:
+    """An EC encoder-only instance runs the multimodal encoder and nothing else:
+    its language model is a placeholder, and the scheduler finishes a request
+    once its prompt is consumed."""
+
+    def test_the_placeholder_language_model_reports_no_kv_cache(self, monkeypatch):
+        attn = SimpleNamespace(get_kv_cache_spec=lambda cfg: "SPEC")
+        monkeypatch.setattr(
+            mr, "get_layers_from_vllm_config", lambda cfg, t: {"lm.attn": attn}
+        )
+        runner = _make_runner_stub(vllm_config=SimpleNamespace(is_mm_encoder_only=True))
+
+        assert runner.get_kv_cache_spec() == {}
+
+    def test_execute_model_encodes_and_samples_nothing(self, monkeypatch):
+        order: list[str] = []
+        monkeypatch.setattr(mr, "step_is_prefill", lambda so: True)
+        monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: False)
+        runner = _make_runner_stub(
+            vllm_config=SimpleNamespace(is_mm_encoder_only=True),
+            execute_model_state=None,
+            use_async_scheduling=False,
+            encoder_cache={},
+            _update_states=lambda so: order.append("update_states"),
+            _execute_mm_encoder=lambda so: order.append("encode"),
+            model_executable=Mock(side_effect=AssertionError("no language model")),
+        )
+        scheduler_output = SimpleNamespace(
+            total_num_scheduled_tokens=8, num_scheduled_tokens={"r0": 5, "r1": 3}
+        )
+
+        output = runner.execute_model(scheduler_output)
+
+        assert order == ["update_states", "encode"]
+        assert output.req_ids == ["r0", "r1"]
+        assert output.sampled_token_ids == [[], []]
+        assert runner.execute_model_state is None
+
+    def test_each_encoded_item_reaches_the_ec_connector(self, monkeypatch):
+        published: list[str] = []
+        monkeypatch.setattr(
+            ec_state,
+            "_EC_CONNECTOR_AGENT",
+            SimpleNamespace(
+                save_caches=lambda encoder_cache, mm_hash: published.append(mm_hash)
+            ),
+        )
+        monkeypatch.setattr(
+            mr,
+            "group_and_batch_mm_kwargs",
+            lambda mm_kwargs, device: [("image", len(mm_kwargs), {})],
+        )
+        embeds = (torch.ones(2, 4), torch.zeros(3, 4))
+        features = [
+            SimpleNamespace(data=object(), identifier=f"h{i}", modality="image")
+            for i in range(2)
+        ]
+        runner = _make_runner_stub(
+            requests={"r0": SimpleNamespace(mm_features=features)},
+            model=SimpleNamespace(embed_multimodal=lambda **kw: embeds),
+            encoder_cache={},
+        )
+
+        runner._execute_mm_encoder(
+            SimpleNamespace(scheduled_encoder_inputs={"r0": [0, 1]})
+        )
+
+        assert published == ["h0", "h1"]
+        assert runner.encoder_cache["h1"] is embeds[1]
+
+    def test_warm_up_builds_only_the_encoder(self, monkeypatch):
+        cache = SimpleNamespace(config_signature=Mock(), load=Mock(), save=Mock())
+        monkeypatch.setattr(mr, "mega_cache", cache)
+        no_language_model = Mock(side_effect=AssertionError("no language model"))
+        runner = _make_runner_stub(
+            vllm_config=SimpleNamespace(is_mm_encoder_only=True),
+            model_config=SimpleNamespace(model="encoder"),
+            offload_context=nullcontext,
+            run_model_graphs=no_language_model,
+            _dummy_sampler_run=no_language_model,
+            _warmup_sampler_decode_batches=no_language_model,
+            _warmup_mm_encoder=Mock(),
+        )
+
+        runner.warmup_model()
+
+        runner._warmup_mm_encoder.assert_called_once_with()
+        cache.save.assert_called_once_with(
+            "encoder", cache.config_signature.return_value
+        )
 
 
 @pytest.mark.parametrize("num_reqs", [1, 2])
@@ -1999,7 +2092,7 @@ class TestExecuteModelRecoversADeferredLoad:
             use_async_scheduling=False,
             _update_states=lambda so: order.append("update_states"),
             kv_connector_no_forward=no_forward,
-            vllm_config="VLLM_CONFIG",
+            vllm_config=SimpleNamespace(is_mm_encoder_only=False),
         )
         return runner, order
 
@@ -2096,7 +2189,7 @@ class TestExecuteModelFlushesAfterTheSubmission:
             cache_config=SimpleNamespace(kv_sharing_fast_prefill=False),
             speculative_config=None,
             is_pooling_model=False,
-            vllm_config="VLLM_CONFIG",
+            vllm_config=SimpleNamespace(is_mm_encoder_only=False),
             model_executable=executable,
             num_prompt_logprobs=None,
             kv_cache_bases=None,
