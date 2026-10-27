@@ -943,6 +943,20 @@ def get_autobind_cpu_ids(
         ranks_in_same_numa = list(range(len(on_node) // len(owned)))
         rank_in_numa = on_node.index(min(owned)) // len(owned)
     else:
+        # sysfs still lists the cards when their device nodes are not found.
+        cards = present or owned
+        if cards and not any(
+            card_node.get(card) in available_numa_nodes for card in cards
+        ):
+            logger.warning_once(
+                "Auto thread-binding: no RBLN card in %s resolves to a NUMA node "
+                "with allowed CPUs (device nodes under %s, attributes under %s); "
+                "ranks fall back to the rank round-robin, which can bind a "
+                "rank's threads away from its NPU.",
+                str(cards),
+                RBLN_DEV_DIR,
+                RBLN_SYSFS_CLASS_DIR,
+            )
         numa_node_idx = rank_across_dp % len(available_numa_nodes)
         selected_numa_node = available_numa_nodes[numa_node_idx]
         ranks_in_same_numa = [

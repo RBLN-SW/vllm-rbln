@@ -957,6 +957,25 @@ class TestGetAutobindCpuIds:
             got.append(get_autobind_cpu_ids(0, 0, pc, self._all))
         assert got == ["2", "3", "6", "7"]
 
+    @pytest.mark.parametrize("device_nodes", [True, False])
+    def test_cards_without_a_numa_node_warn_before_the_round_robin(
+        self, cpus, monkeypatch, caplog, device_nodes
+    ):
+        # Either the attribute path or the device node names moved: binding
+        # still works, but not silently. Distinct cards per case keep
+        # warning_once from swallowing the second warning.
+        cards = [0, 1] if device_nodes else [2, 3]
+        self._cards(monkeypatch, {cards[0]: None, cards[1]: -1})
+        if not device_nodes:
+            monkeypatch.setattr(worker_utils, "_rbln_present_card_indices", list)
+            monkeypatch.setattr(
+                worker_utils, "get_rbln_visible_card_indices", lambda: cards
+            )
+        with caplog.at_level("WARNING"):
+            got = get_autobind_cpu_ids(0, 0, self._dp(2, 0), self._all)
+        assert got == "0,1,4,5"
+        assert any(f"no RBLN card in {cards}" in r.getMessage() for r in caplog.records)
+
     @pytest.mark.parametrize(
         "numa_of_card, visible",
         [
