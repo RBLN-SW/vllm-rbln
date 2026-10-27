@@ -508,13 +508,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             parallel_config.data_parallel_size > 1
             and self.rbln_config.specialize_moe_decode
         )
-        # The batched dynamic decode kernel (REBEL CR13, or any device with
-        # --rbln-use-batch-attn-opt) processes the first valid_batch[p] rows of
-        # partition p and early-exits on the rest, which is only correct when
-        # rows are sorted by descending sequence length.
-        self.sort_batch_by_length = (
-            current_platform.is_cr13() or self.rbln_config.use_batch_attn_opt
-        )
+        # The batched dynamic decode kernel on REBEL CR13 processes the first
+        # valid_batch[p] rows of partition p and early-exits on the rest, which
+        # is only correct when rows are sorted by descending sequence length.
+        self.sort_batch_by_length = current_platform.is_cr13()
 
         # Static, so the per-step decision only has to supply this step's counts.
         self.shape_config = ShapeConfig(
@@ -1737,8 +1734,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     )
                 )
         else:
-            # The sampled tokens and the logprobs stay on device; the D2H is
-            # deferred to AsyncRBLNModelRunnerOutput.get_output().
+            # The sampled tokens and the logprobs stay on device;
+            # AsyncRBLNModelRunnerOutput copies them to the host.
             if logprobs_tensors is not None:
                 logger.warning_once(
                     "Requesting logprobs adds host CPU work to every decode "
@@ -3449,7 +3446,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         The worker drives this instead of `initialize_kv_cache`: a dynamic-KV
         resize replaces every tensor after warm-up, so the caches worth
-        registering are the ones standing at that point.
+        registering are the ones standing at that point. A connector may get a
+        view rather than the runner's tensor, so it must not re-point one with
+        `set_()`: the runner's tensor would stay on the old storage.
         """
         if not has_kv_transfer_group():
             return
@@ -3460,12 +3459,18 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 self.cross_layers_kv_cache, self.cross_layers_attn_backend
             )
         else:
-            # Every layer, in layer-index order, as upstream hands them over:
-            # a token-level connector (LMCache) addresses each layer through its
-            # own view. RBLN NIXL registers storage and picks one layer per
-            # buffer itself.
+            # Every layer, in layer-index order: a token-level connector (LMCache)
+            # addresses each layer through its own view, and RBLN NIXL registers
+            # storage and picks one layer per buffer. The DSA indexer scale cache
+            # stays flat for the kernels (no squeeze on a dynamic input); connectors
+            # get it as [num_blocks, block_size, 1], like the other RBLN MLA caches.
             kv_transfer_group.register_kv_caches(
-                dict(zip(self.kv_cache_names, self.kv_caches, strict=True))
+                {
+                    name: cache.unsqueeze(-1) if cache.dim() == 2 else cache
+                    for name, cache in zip(
+                        self.kv_cache_names, self.kv_caches, strict=True
+                    )
+                }
             )
 
         kv_transfer_group.set_host_xfer_buffer_ops(self._copy_host_device_kv_blocks)

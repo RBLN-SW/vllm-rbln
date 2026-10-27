@@ -18,10 +18,6 @@ from __future__ import annotations
 
 from tests.vllm.model_specs import REBEL, CompileModelSpec
 
-OPT_ENVS = {
-    "VLLM_RBLN_BATCH_ATTN_OPT": "1",
-}
-
 _MINIMAX_BASE = CompileModelSpec(
     "MiniMaxAI/MiniMax-M2.7",
     {
@@ -31,7 +27,6 @@ _MINIMAX_BASE = CompileModelSpec(
         "max_num_batched_tokens": 512,
         "enable_expert_parallel": True,
     },
-    OPT_ENVS,
     chips=REBEL,
 )
 
@@ -45,7 +40,6 @@ MODELS: list[CompileModelSpec] = [
             "tensor_parallel_size": 4,
             "enable_expert_parallel": False,
         },
-        OPT_ENVS,
         chips=REBEL,
     ),
     CompileModelSpec(
@@ -60,7 +54,6 @@ MODELS: list[CompileModelSpec] = [
         },
         {
             "VLLM_RBLN_SUB_BLOCK_CACHE": "0",
-            **OPT_ENVS,
         },
         chips=REBEL,
         num_hidden_layers=4,

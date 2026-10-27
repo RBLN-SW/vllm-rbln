@@ -108,6 +108,9 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
             return self._remote_agents[engine_id][agent_key]
 
         self._refuse_decode_context_parallel(remote_dcp_size)
+        # Before the bands, which would refuse a latent cut unlike its attention
+        # under a message about slice layouts.
+        self._check_mla_constraints(nixl_agent_meta, remote_tp_size)
         areas_l, slices_l, _ = self._local_band(remote_tp_size)
         areas_r, slices_r = self._peer_band(nixl_agent_meta, remote_tp_size)
         # Ahead of the prelude, which the handshake checks run after: upstream
@@ -115,7 +118,6 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         # registered. The layout checks first, so every region left cuts heads.
         self._check_d2d_region_pairing(nixl_agent_meta, remote_tp_size)
         self._check_split_axis_constraints(nixl_agent_meta, remote_tp_size)
-        self._check_mla_constraints(nixl_agent_meta, remote_tp_size)
         cuts_l, cuts_r = self.topo.tp_size * slices_l, remote_tp_size * slices_r
         if max(cuts_l, cuts_r) % min(cuts_l, cuts_r):
             raise RuntimeError(
@@ -465,17 +467,29 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         """Reject the MLA topologies whose descriptor math is not established.
 
         MLA is REPLICATE and key-only, which upstream's positional pairing
-        already expresses. What the refusal below adds is head-band matching,
+        already expresses. What the first refusal below adds is head-band matching,
         where bands computed from the configured KV-head count give plausible
-        wrong descriptors.
+        wrong descriptors. A latent beside attention is the same on every rank,
+        so on D2D a band misplaces it. Host staging does not record which
+        regions are latents; it refuses an engine whose page sizes differ.
         """
-        if not self.use_mla:
-            return
-        if self._is_head_matched_peer(remote_tp_size):
+        if self.use_mla and self._is_head_matched_peer(remote_tp_size):
             raise RuntimeError(
                 "RBLN NIXL D2D: MLA is not supported with heterogeneous tensor "
                 f"parallelism (peer TP {remote_tp_size}, local "
                 f"{self.topo.tp_size})."
+            )
+        if (
+            not self.use_mla
+            and any(self._logical_region_latent)
+            and self.topo.tp_ratio(remote_tp_size) != 1
+        ):
+            raise RuntimeError(
+                "RBLN NIXL D2D: a key-only latent region (an MSA indexer or an "
+                "MLA draft beside an attention target) is the "
+                "same on every rank, and pairing it across tensor-parallel "
+                f"degrees (peer TP {remote_tp_size}, local {self.topo.tp_size}) "
+                "is not supported. Use equal TP on both sides."
             )
 
     def _check_split_axis_constraints(
@@ -1330,8 +1344,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         (`_fan_in_peer_areas`), so pairing by head band needs the banded regions
         to lay their slices alike; a speculative draft cut into another number
         of slices does not. Per peer, not at registration: symmetric TP does not
-        band by head at all. Regions without a band are skipped -- one has its
-        own refusal further in.
+        band by head at all. Regions without a band are skipped.
         """
         bands = {
             tuple(place.slice_id for place in geometry.areas)
@@ -1341,8 +1354,8 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
             if heads is not None
         }
         if not bands:
-            # Nothing bands by head (an MLA latent); the refusal that names it
-            # comes later, so let the regions' own layout stand in.
+            # Nothing bands by head (an MLA latent, refused by name at the entry,
+            # or heads every rank holds); let the regions' own layout stand in.
             bands = {
                 tuple(place.slice_id for place in geometry.areas)
                 for geometry in self._logical_region_geometry
