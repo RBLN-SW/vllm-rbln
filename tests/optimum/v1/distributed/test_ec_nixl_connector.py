@@ -15,14 +15,18 @@
 import ctypes
 import queue
 import threading
+from types import SimpleNamespace
 
 import msgspec
 import pytest
 import torch
+from vllm.config import ECTransferConfig
+from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorRole
 
 from vllm_rbln.distributed.ec_transfer.ec_connector.rbln_ec_nixl_connector import (
     _DTYPE_SIZES,
     ECNixlMetadata,
+    RblnECNixlConnector,
     RblnECNixlConnectorWorker,
     _dtype_size,
 )
@@ -46,6 +50,17 @@ def test_dtype_size_covers_registered_table():
 def test_dtype_size_unknown_raises():
     with pytest.raises(ValueError, match="Unsupported dtype"):
         _dtype_size("torch.float64")
+
+
+def test_ec_both_is_rejected():
+    vllm_config = SimpleNamespace(
+        ec_transfer_config=ECTransferConfig(
+            ec_connector="RblnECNixlConnector", ec_role="ec_both"
+        )
+    )
+
+    with pytest.raises(ValueError, match="not 'ec_both'"):
+        RblnECNixlConnector(vllm_config, ECConnectorRole.SCHEDULER)
 
 
 class _FakeNixlAgent:

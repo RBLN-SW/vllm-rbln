@@ -1201,6 +1201,12 @@ class RblnECNixlConnector(ECConnectorBase):
     def __init__(self, vllm_config: VllmConfig, role: ECConnectorRole):
         super().__init__(vllm_config=vllm_config, role=role)
 
+        if self.is_producer and self.is_consumer:
+            raise ValueError(
+                "RblnECNixlConnector supports ec_role='ec_producer' (the encoder "
+                "instance) or 'ec_consumer' (the LLM instance), not 'ec_both'."
+            )
+
         if role == ECConnectorRole.SCHEDULER:
             self._impl: ECConnectorBase = RblnECNixlConnectorScheduler(
                 vllm_config, role
