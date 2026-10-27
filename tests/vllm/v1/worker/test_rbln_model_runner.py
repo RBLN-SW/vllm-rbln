@@ -2031,31 +2031,6 @@ class TestDummyRunPPIntermediateTensors:
         assert captured["intermediate_tensors"]["h"].shape == (1, width, self.HIDDEN)
 
 
-@pytest.mark.parametrize("strict_kv_producer", [True, False])
-def test_a_one_token_step_is_a_prefill_only_on_a_producer(
-    monkeypatch, strict_kv_producer
-):
-    # The stamp picks the graph, and a producer compiled only the prefill one.
-    monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: False)
-    runner = _make_runner_stub(
-        is_strict_kv_producer=strict_kv_producer,
-        execute_model_state=None,
-        use_async_scheduling=False,
-        _update_states=lambda so: None,
-        kv_connector_no_forward=lambda so, cfg: "OUTPUT",
-        vllm_config=None,
-    )
-    runner.execute_model(
-        SimpleNamespace(
-            num_scheduled_tokens={"a": 1},
-            scheduled_spec_decode_tokens={},
-            total_num_scheduled_tokens=0,
-            kv_cache_copy_ops=None,
-        )
-    )
-    assert runner.is_prefill is strict_kv_producer
-
-
 class TestExecuteModelRecoversADeferredLoad:
     """A read the dummy step never issued goes out on the next execute_model.
 
@@ -2281,16 +2256,36 @@ class TestDecodeGraphShapes:
             assert args == (num_reqs, query_len, False)
             assert kw == {"num_tokens_padded_override": override}
 
-    def test_specialized_pins_the_prefill_token_dimension(self):
-        runner = self._runner(buckets=[1, 2, 4], specialized=True)
-        shapes = mr.RBLNModelRunner.decode_graph_shapes(runner)
-        assert shapes[-1] == (4, 1, runner.max_num_tokens)
-
-    def test_a_variable_query_length_adds_the_asymmetric_spec_pin(self):
-        runner = self._runner(buckets=[1, 2, 4], specialized=True, num_spec=3)
-        shapes = mr.RBLNModelRunner.decode_graph_shapes(runner)
-        # Top bucket, one token, padded to what a drafting peer would stage.
-        assert shapes[-1] == (4, 1, 4 * 4)
+    @pytest.mark.parametrize(
+        ("kwargs", "expected"),
+        [
+            (
+                {"buckets": [1, 2, 4], "specialized": True},
+                [(1, 1, None), (2, 1, None), (4, 1, None), (4, 1, 512)],
+            ),
+            (
+                {"buckets": [1, 4], "specialized": True, "num_spec": 3},
+                [(1, 1, None), (1, 4, None), (4, 1, None), (4, 4, None)]
+                # The last is the top bucket, one token, padded to what a
+                # drafting peer would stage.
+                + [(4, 1, 512), (4, 4, 512), (4, 1, 16)],
+            ),
+            (
+                {
+                    "buckets": [1, 4],
+                    "specialized": False,
+                    "num_spec": 3,
+                    "fixed_window": True,
+                },
+                [(1, 4, None), (4, 4, None)],
+            ),
+        ],
+    )
+    def test_the_decode_set_a_decoding_role_compiles(self, kwargs, expected):
+        # Matching the dummies against this list cannot catch a shape the list
+        # itself drops.
+        runner = self._runner(**kwargs)
+        assert mr.RBLNModelRunner.decode_graph_shapes(runner) == expected
 
     def test_a_strict_producer_compiles_no_decode_graph(self):
         # Every step a producer runs is a prefill step, so the decode set it

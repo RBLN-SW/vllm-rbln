@@ -624,7 +624,7 @@ class TestDetermineAvailableMemory:
         params=None,
         specialized_moe_decode=False,
         decode_buckets=3,
-        decode_graph_shapes=(),
+        decode_graph_shapes=((1, 1, None), (2, 1, None), (4, 1, None)),
         drafter=None,
         speculative_config=None,
         dynamic=False,

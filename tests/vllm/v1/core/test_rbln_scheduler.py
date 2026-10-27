@@ -1254,6 +1254,8 @@ class TestFullRunInvariants:
         assert sched.running == []
 
     @pytest.mark.parametrize("async_scheduling", [False, True])
+    # The input processor refuses max_tokens=4 on a producer; it stays here as
+    # the scheduler's invariant for a request that gets past that check.
     @pytest.mark.parametrize("max_tokens", [1, 4])
     # 17 against a 16-token step chunks the prompt and leaves a one-token tail.
     @pytest.mark.parametrize("num_tokens", [10, 17])

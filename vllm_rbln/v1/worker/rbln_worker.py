@@ -216,8 +216,9 @@ class RBLNWorker(WorkerBase):
         model, when present, adds one, and a bucket's worth more (plus the
         specialized-MoE fallback) wherever the runner compiles decode graphs --
         or one more on a producer whose drafter still warms its decode pass.
-        Counting all of them keeps the KV-block estimate from over-reserving and
-        OOMing at runtime.
+        Counting them keeps the KV-block estimate from over-reserving and OOMing
+        at runtime; the draft's share can still fall short of what a drafter
+        compiles.
         """
         params_dict = dict(self.model_runner.model.named_parameters())
         device_name = current_platform.get_device_name().lower()

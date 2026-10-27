@@ -455,16 +455,17 @@ class TestPropose:
         assert out.shape == (2, 3)
         assert out.cpu().tolist() == [[0, 0, 0], [0, 0, 0]]
 
+    @pytest.mark.parametrize("num_spec", [1, 3])
     @pytest.mark.parametrize("draft_has_moe", [False, True])
     def test_a_strict_producer_runs_one_pass_and_drafts_nothing(
-        self, draft_has_moe, monkeypatch
+        self, draft_has_moe, num_spec, monkeypatch
     ):
         # A producer hands its KV off and never verifies a draft. The first
         # pass writes the KV the consumer's drafter reads, so it stays and the
         # drafting loop goes. Unlike the chunk case there is no MoE carve-out:
         # every rank of a producer prefills, so no peer is inside a collective.
         _neutralize(monkeypatch)
-        proposer = make_eagle_proposer(method="eagle", num_speculative_tokens=3)
+        proposer = make_eagle_proposer(method="eagle", num_speculative_tokens=num_spec)
         _wire_runner(proposer, num_reqs=2, strict_kv_producer=True)
         proposer.draft_has_moe = draft_has_moe
         monkeypatch.setattr(
@@ -491,8 +492,7 @@ class TestPropose:
         out = _call_propose(proposer)
 
         assert len(passes) == 1
-        assert out.shape == (2, 3)
-        assert out.cpu().tolist() == [[0, 0, 0], [0, 0, 0]]
+        assert out.cpu().tolist() == [[0] * num_spec] * 2
 
     @pytest.mark.parametrize("dp_size, expected_passes", [(1, 1), (2, 3)])
     def test_a_draft_with_moe_keeps_drafting_only_under_dp(
