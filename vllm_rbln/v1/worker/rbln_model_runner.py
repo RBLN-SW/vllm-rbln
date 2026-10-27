@@ -3071,8 +3071,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             assert not isinstance(
                 kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec
             )
-            # A MambaSpec group (one state block a request) has block_size =
-            # max_model_len, so its table is one block wide.
+            # A MambaSpec group without prefix caching (one state block a request)
+            # has block_size = max_model_len, so its table is one block wide.
             block_size = kv_cache_group.kv_cache_spec.block_size
             block_sizes.append(block_size)
             max_num_blocks_per_req = cdiv(max_model_len, block_size)

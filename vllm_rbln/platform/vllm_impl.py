@@ -111,6 +111,27 @@ def _validate(vllm_config: "VllmConfig") -> None:
                 f"num_speculative_tokens=1 only; got method={spec.method!r}, "
                 f"num_speculative_tokens={spec.num_speculative_tokens}."
             )
+        cache_config = vllm_config.cache_config
+        if (
+            cache_config.enable_prefix_caching
+            and cache_config.user_specified_mamba_block_size
+            and cache_config.mamba_block_size != cache_config.block_size
+        ):
+            raise ValueError(
+                "GLM-5.3 prefix caching keeps a KDA state a KV block on RBLN; "
+                f"got --mamba-block-size {cache_config.mamba_block_size} and "
+                f"--block-size {cache_config.block_size}."
+            )
+        if (
+            cache_config.enable_prefix_caching
+            and cache_config.prefix_match_unit is not None
+            and cache_config.prefix_match_unit < cache_config.block_size
+        ):
+            raise ValueError(
+                "GLM-5.3 prefix caching on RBLN hits whole KV blocks only; got "
+                f"--prefix-match-unit {cache_config.prefix_match_unit} below "
+                f"--block-size {cache_config.block_size}."
+            )
 
     if rbln_config.compile_dtype:
         from vllm_rbln.compilation import check_dtype_option_supported
@@ -351,6 +372,25 @@ def _override(vllm_config: "VllmConfig") -> None:
             "Overriding model_config.disable_cascade_attn to True."
         )
         model_config.disable_cascade_attn = True
+
+    cache_config = vllm_config.cache_config
+    if (
+        model_config.hf_text_config.model_type == "glm5_next_text"
+        and cache_config.enable_prefix_caching
+        and vllm_config.speculative_config is not None
+    ):
+        # A KDA verify step stores its first token's state and replays the accepted
+        # drafts next step, so a block could be cached without the state at its end.
+        logger.warning(
+            "Disabling prefix caching: GLM-5.3 on RBLN does not run it with "
+            "speculative decoding yet."
+        )
+        cache_config.enable_prefix_caching = False
+        # MambaModelConfig set these for prefix caching before this hook; back to
+        # the values it uses without it.
+        cache_config.mamba_cache_mode = "none"
+        if not cache_config.user_specified_mamba_block_size:
+            cache_config.mamba_block_size = model_config.max_model_len
 
 
 def _wire(vllm_config: "VllmConfig") -> None:

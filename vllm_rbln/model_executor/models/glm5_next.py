@@ -129,15 +129,15 @@ class _RBLNGlm5NextCache(nn.Module, AttentionLayerBase):
 
 class RBLNGlm5NextStateCache(_RBLNGlm5NextCache):
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        # TODO(RBLN): prefix caching. A state block of max_model_len tokens is never
-        # cached; it needs mamba_cache_mode "align", a state checkpoint a block.
-        # The extent of an fp8 MLA latent block: [block_size, kv_lora_rank] bytes.
+        # A state a request, or with prefix caching ("align") a checkpoint a KV
+        # block. The extent of an fp8 MLA latent block: [block_size, kv_lora_rank]
+        # bytes.
         latent_block = (
             vllm_config.cache_config.block_size,
             vllm_config.model_config.hf_text_config.kv_lora_rank,
         )
         return MambaSpec(
-            block_size=vllm_config.model_config.max_model_len,
+            block_size=vllm_config.cache_config.mamba_block_size,
             shapes=(latent_block,),
             dtypes=(torch.uint8,),
             mamba_cache_mode=vllm_config.cache_config.mamba_cache_mode,

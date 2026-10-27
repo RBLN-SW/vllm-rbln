@@ -39,6 +39,21 @@ def register_glm5_next() -> None:
     ModelRegistry.register_model("Glm5NextMTPModel", f"{_MODULE}:RBLNGlm5NextMTP")
 
 
+@add_registration(
+    reason=(
+        "The RBLN GLM-5.3 model is not IsHybrid (its KDA states are MambaSpec head "
+        "groups on MLA latent blocks), so vLLM skips the Mamba cache setup a hybrid "
+        "model gets. Mapping its architectures to MambaModelConfig gives prefix "
+        "caching the 'align' mode and a Mamba block of block_size."
+    )
+)
+def register_glm5_next_mamba_config() -> None:
+    from vllm.model_executor.models.config import MODELS_CONFIG_MAP, MambaModelConfig
+
+    for arch in ("Glm5NextForCausalLM", "Glm5NextForConditionalGeneration"):
+        MODELS_CONFIG_MAP[arch] = MambaModelConfig
+
+
 @register_patch(
     target="vllm.v1.core.kv_cache_utils._pp_balanced_mamba_group_count",
     reason=(
