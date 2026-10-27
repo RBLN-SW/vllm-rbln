@@ -18,6 +18,7 @@ compiled and its image embeddings merged inside the compiled graph."""
 from collections.abc import Callable
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from transformers.models.gemma4.modeling_gemma4 import apply_multidimensional_rope
 from vllm.config import VllmConfig
@@ -42,34 +43,43 @@ _KEY_PAD_BIAS = -30000.0
 
 
 class _RBLNGemma4VisionEncoder(nn.Module):
-    """Gemma4's vision encoder layers and pooler as one static graph.
+    """Gemma4's vision tower and its projection into the text model as one
+    static graph.
 
     HF's encoder builds its mask and rotary tables in Python and dispatches
     attention through ALL_ATTENTION_FUNCTIONS. Here the host hands in both,
     the attention is spelled out, and the patches arrive padded to one count.
     """
 
-    def __init__(self, vision_tower: nn.Module):
+    def __init__(self, vision_tower: nn.Module, embed_vision: nn.Module):
         super().__init__()
-        self.layers = vision_tower.encoder.layers
-        self.pooler = vision_tower.pooler
-        self.standardize = vision_tower.config.standardize
-        if self.standardize:
-            self.std_bias = vision_tower.std_bias
-            self.std_scale = vision_tower.std_scale
-        self.pooling_kernel_size = vision_tower.config.pooling_kernel_size
+        self.tower = vision_tower
+        self.embed_vision = embed_vision
 
     def forward(
         self,
-        inputs_embeds: torch.Tensor,
+        pixel_values: torch.Tensor,
         pixel_position_ids: torch.Tensor,
         padding_positions: torch.Tensor,
         key_bias: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
-        hidden_states = inputs_embeds
-        for layer in self.layers:
+        # HF's patch embedder, with its x and y lookups made one: two lookups
+        # into views of the same table fail the RBLN compiler.
+        tower = self.tower
+        patch_embedder = tower.patch_embedder
+        dtype = patch_embedder.input_proj.weight.dtype
+        hidden_states = patch_embedder.input_proj((2 * (pixel_values - 0.5)).to(dtype))
+        table = patch_embedder.position_embedding_table
+        index = pixel_position_ids.clamp(min=0) + table.new_tensor(
+            [0, table.shape[1]], dtype=pixel_position_ids.dtype
+        )
+        position_embeddings = F.embedding(index, table.flatten(0, 1)).sum(dim=-2)
+        hidden_states = hidden_states + torch.where(
+            padding_positions.unsqueeze(-1), 0.0, position_embeddings
+        )
+        for layer in tower.encoder.layers:
             residual = hidden_states
             hidden_states = layer.input_layernorm(hidden_states)
             attn = layer.self_attn
@@ -91,17 +101,17 @@ class _RBLNGemma4VisionEncoder(nn.Module):
             hidden_states = layer.post_feedforward_layernorm(layer.mlp(hidden_states))
             hidden_states = residual + hidden_states
 
-        output_length = inputs_embeds.shape[1] // self.pooling_kernel_size**2
-        pooled, _ = self.pooler(
+        output_length = pixel_values.shape[1] // tower.config.pooling_kernel_size**2
+        pooled, _ = tower.pooler(
             hidden_states=hidden_states,
             pixel_position_ids=pixel_position_ids,
             padding_positions=padding_positions,
             output_length=output_length,
         )
         # The pooler scales in float32; standardize there too, as HF does.
-        if self.standardize:
-            pooled = (pooled - self.std_bias.float()) * self.std_scale.float()
-        return pooled.to(inputs_embeds.dtype)
+        if tower.config.standardize:
+            pooled = (pooled - tower.std_bias.float()) * tower.std_scale.float()
+        return self.embed_vision(inputs_embeds=pooled.to(dtype))
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -147,8 +157,8 @@ class RBLNGemma4ForConditionalGeneration(
             )
         ):
             return
-        encoder = _RBLNGemma4VisionEncoder(self.vision_tower).eval()
-        object.__setattr__(self, "_mm_encoder", compile_fn(encoder))
+        encoder = _RBLNGemma4VisionEncoder(self.vision_tower, self.embed_vision)
+        object.__setattr__(self, "_mm_encoder", compile_fn(encoder.eval()))
 
     def _encode_vision(
         self, pixel_values: torch.Tensor, pixel_position_ids: torch.Tensor
@@ -158,7 +168,9 @@ class RBLNGemma4ForConditionalGeneration(
         encoder = self._mm_encoder
         if encoder is None:
             # enforce_eager: the runner never calls compile_mm_encoder.
-            encoder = _RBLNGemma4VisionEncoder(self.vision_tower).eval()
+            encoder = _RBLNGemma4VisionEncoder(
+                self.vision_tower, self.embed_vision
+            ).eval()
             object.__setattr__(self, "_mm_encoder", encoder)
         tower = self.vision_tower
         bucket = self.mm_encoder_num_patches
@@ -173,24 +185,25 @@ class RBLNGemma4ForConditionalGeneration(
         patches = pixel_values.new_zeros(1, bucket, pixel_values.shape[-1])
         patches[0, :num_patches] = pixel_values[valid]
         padding = ~(positions >= 0).all(dim=-1)
-
-        inputs_embeds = tower.patch_embedder(patches, positions, padding)
-        inputs_embeds = inputs_embeds.to(self.model_dtype)
-        cos, sin = tower.encoder.rotary_emb(inputs_embeds, positions)
         key_bias = torch.where(padding, _KEY_PAD_BIAS, 0.0)[:, None, None, :]
-        pooled = encoder(
-            inputs_embeds,
-            positions,
-            padding,
-            key_bias.to(self.model_dtype),
-            cos.to(self.model_dtype),
-            sin.to(self.model_dtype),
+        # The rotary tables only read the host tensor's device and dtype.
+        cos, sin = tower.encoder.rotary_emb(
+            torch.empty(0, dtype=self.model_dtype), positions
+        )
+        device = next(tower.parameters()).device
+        embeds = encoder(
+            patches.to(device),
+            positions.to(device),
+            padding.to(device),
+            *(
+                x.to(device=device, dtype=self.model_dtype)
+                for x in (key_bias, cos, sin)
+            ),
         )
         # The patches of a grid whose sides are multiples of the pooling kernel
         # pool into the leading cells, in order.
         num_soft_tokens = num_patches // tower.config.pooling_kernel_size**2
-        soft_tokens = pooled[0, :num_soft_tokens].cpu()
-        return self.embed_vision(inputs_embeds=soft_tokens[None])[0]
+        return embeds[0, :num_soft_tokens].cpu()
 
     def _process_image_input(
         self, image_input: Gemma4ImageInputs
