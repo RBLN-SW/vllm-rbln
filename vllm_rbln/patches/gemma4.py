@@ -16,6 +16,7 @@ from vllm.config import VllmConfig
 from vllm.model_executor.models.config import Gemma4Config
 
 from vllm_rbln.patches import register_patch
+from vllm_rbln.patches.registry import add_registration
 
 upstream_verify_and_update_config = Gemma4Config.verify_and_update_config
 
@@ -32,3 +33,20 @@ upstream_verify_and_update_config = Gemma4Config.verify_and_update_config
 )
 def keep_the_rbln_attention_backend(vllm_config: VllmConfig) -> None:
     """Leave the attention backend to the RBLN platform."""
+
+
+@add_registration(
+    reason=(
+        "Upstream's Gemma4ForConditionalGeneration merges image embeddings "
+        "outside forward() and runs its vision tower through HF's dynamic "
+        "attention dispatch. The RBLN subclass merges them in the compiled "
+        "graph and compiles the tower at one patch count."
+    )
+)
+def register_gemma4() -> None:
+    from vllm.model_executor.models import ModelRegistry
+
+    ModelRegistry.register_model(
+        "Gemma4ForConditionalGeneration",
+        "vllm_rbln.model_executor.models.gemma4:RBLNGemma4ForConditionalGeneration",
+    )
