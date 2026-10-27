@@ -276,9 +276,17 @@ def indexer_scale_cache_dtype(model_config: ModelConfig) -> torch.dtype:
     The indexer kernel declares the scale cache in the compute dtype. An fp16
     cache under a bf16 model gets a bf16 physical view, and copying one
     2048-token block of 7 layers into or out of it takes about 0.6 ms instead
-    of 0.07 ms (DeepSeek-V3.2, RBLN-CR13).
+    of 0.07 ms (DeepSeek-V3.2, RBLN-CR13). Only fp16 and bf16 have an RBLN
+    indexer kernel, so any other model dtype is refused here rather than
+    surfacing later as an unsupported scale-cache backend dtype.
     """
-    return model_config.dtype
+    dtype = model_config.dtype
+    if dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(
+            "The fp8 DSA indexer needs a float16 or bfloat16 model dtype on "
+            f"RBLN; got dtype={dtype}. Pass --dtype bfloat16."
+        )
+    return dtype
 
 
 def get_rbln_visible_card_indices() -> list[int]:
