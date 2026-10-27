@@ -92,6 +92,32 @@ def build_cmd(base: list[str], params: dict[str, Any]) -> list[str]:
     return ParameterSweepItem(params).apply_to_cmd(base)
 
 
+def perf_cases(target: dict[str, Any]) -> list[tuple[str, str]]:
+    launches = target["serve_params"]
+    benches = target["bench_params"]
+    for bench, params in benches.items():
+        if "serve" not in params:
+            continue
+        selected = params["serve"]
+        if (
+            not isinstance(selected, list)
+            or not selected
+            or not all(isinstance(name, str) for name in selected)
+        ):
+            raise ValueError(f"{bench}: serve must be a non-empty list of launch names")
+        if unknown := set(selected) - launches.keys():
+            raise ValueError(
+                f"{bench}: unknown serve names: {', '.join(sorted(unknown))}"
+            )
+
+    return [
+        (launch, bench)
+        for launch in launches
+        for bench, params in benches.items()
+        if "serve" not in params or launch in params["serve"]
+    ]
+
+
 _LANE_ENV = {
     # A launch compiles before it serves, which takes far longer than the
     # default this allows.
