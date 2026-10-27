@@ -124,6 +124,7 @@ from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.logger import init_logger
 from vllm_rbln.model_executor.models.interfaces import (
     SupportsRBLNMultiModal,
+    supports_rbln_mm_prefix,
     supports_rbln_multimodal,
 )
 from vllm_rbln.platform import use_device_tensor
@@ -296,6 +297,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.cascade_attn_enabled = not self.model_config.disable_cascade_attn
         # Set in load_model by _resolve_mm_support.
         self.supports_mm_inputs = False
+        self.mm_prefix_query_lens: list[int] = []
+        # The padded query length of a step prefilling one mm prefix range,
+        # None on any other step. Stamped per step like is_prefill.
+        self.mm_prefix_query_len: int | None = None
 
         self.encoder_cache: dict[str, torch.Tensor] = {}
 
@@ -1105,6 +1110,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     batch_pad=num_reqs_padded,
                     back_pad=back_pad,
                     is_prompt_sorted=self.sort_batch_by_length,
+                    mm_prefix_query_len=self.mm_prefix_query_len,
                 )
 
                 for layer_name in attn_group.layer_names:
@@ -1325,11 +1331,17 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             assert intermediate_tensors is not None
 
         is_prefill = self.is_prefill
+        if self.mm_prefix_query_len is not None:
+            query_len_padded = self.mm_prefix_query_len
+        elif is_prefill:
+            query_len_padded = self.max_num_tokens
+        else:
+            query_len_padded = input_ids.shape[1]
         layout = InputLayout(
             num_reqs=num_reqs,
             num_reqs_padded=num_reqs_padded,
             query_len=input_ids.shape[1],
-            query_len_padded=self.max_num_tokens if is_prefill else input_ids.shape[1],
+            query_len_padded=query_len_padded,
         )
         staged_model_inputs = self.input_stager.stage(
             input_ids=input_ids,
@@ -1381,6 +1393,49 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 "text-only with --limit-mm-per-prompt (every modality 0), or use "
                 "the optimum path."
             )
+        if self.model_config.is_mm_prefix_lm:
+            # A range is prefilled whole in a step of its own, padded to one of
+            # the model's query lengths; refuse what would split or resume one.
+            if not supports_rbln_mm_prefix(self.model):
+                raise ValueError(
+                    f"{type(self.model).__name__} attends both ways inside its "
+                    "multimodal ranges (is_mm_prefix_lm), which the RBLN vLLM path "
+                    "serves only for models naming the query lengths to compile "
+                    "those steps at (SupportsRBLNMmPrefix). Without it the ranges "
+                    "would run causally."
+                )
+            query_lens = self.model.get_mm_prefix_query_lens()
+            longest = query_lens[-1]
+            if self.max_num_tokens < longest:
+                raise ValueError(
+                    f"max_num_batched_tokens={self.max_num_tokens} is below "
+                    f"{longest}, the query length the longest multimodal range "
+                    "is padded to: a range has to fit one step."
+                )
+            threshold = self.scheduler_config.long_prefill_token_threshold
+            if 0 < threshold < longest:
+                raise ValueError(
+                    f"long_prefill_token_threshold={threshold} would split a "
+                    f"multimodal range of up to {longest} tokens."
+                )
+            # TODO(RBLN): each of these resumes a range mid-way or runs it under
+            # a shape this path does not pick yet.
+            if self.cache_config.enable_prefix_caching:
+                raise ValueError(
+                    "Prefix caching is not supported with multimodal inputs of an "
+                    "mm prefix LM on RBLN yet; pass --no-enable-prefix-caching."
+                )
+            if self.speculative_config is not None:
+                raise ValueError(
+                    "Speculative decoding is not supported with multimodal inputs of "
+                    "an mm prefix LM on RBLN yet."
+                )
+            if self.parallel_config.data_parallel_size > 1:
+                raise ValueError(
+                    "Data parallelism is not supported with multimodal inputs of an "
+                    "mm prefix LM on RBLN yet."
+                )
+            self.mm_prefix_query_lens = query_lens
         return True
 
     def _execute_mm_encoder(self, scheduler_output: RBLNSchedulerOutput) -> None:
@@ -1947,6 +2002,25 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 scheduler_output,
                 num_scheduled_tokens_np,
             )
+
+            # The scheduler hands a range to a step of its own, so a prefill
+            # spanning exactly one range is an mm prefix step.
+            self.mm_prefix_query_len = None
+            if self.is_prefill and self.mm_prefix_query_lens:
+                first = int(self.input_batch.num_computed_tokens_cpu[0])
+                last = first + int(num_scheduled_tokens_np[0]) - 1
+                ranges = [
+                    embeds_range
+                    for feature in self.requests[req_ids[0]].mm_features
+                    if feature.modality in ("image", "video")
+                    for embeds_range in feature.mm_position.extract_embeds_range()
+                ]
+                if (first, last) in ranges:
+                    self.mm_prefix_query_len = next(
+                        query_len
+                        for query_len in self.mm_prefix_query_lens
+                        if query_len > last - first
+                    )
 
             batch_desc, _route, num_tokens_across_dp = (
                 self._determine_batch_execution_and_padding(num_reqs, num_query_tokens)
@@ -2670,6 +2744,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         *,
         num_tokens_padded_override: int | None = None,
         warmup: bool = True,
+        mm_prefix_query_len: int | None = None,
     ) -> None:
         """Run a dummy forward pass, in one of two modes.
 
@@ -2691,6 +2766,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # Stamp the dummy's own phase before any step setup; on the DP-idle path
         # this stops a prior real step's value leaking into a read.
         self.is_prefill = is_prefill
+        self.mm_prefix_query_len = mm_prefix_query_len
 
         is_idle = not warmup
 
@@ -3787,8 +3863,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
     def run_model_graphs(self) -> None:
         """Every model graph once, at the shapes serving will ask for."""
-        # 1. prefill
+        # 1. prefill, then one mm prefix step per query length
         self._dummy_run(1, self.max_num_tokens, True)
+        for query_len in self.mm_prefix_query_lens:
+            self._dummy_run(1, query_len, True, mm_prefix_query_len=query_len)
 
         # 2. decode
         query_lens = [1]
