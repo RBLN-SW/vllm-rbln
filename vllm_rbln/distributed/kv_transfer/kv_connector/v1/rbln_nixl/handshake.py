@@ -120,11 +120,27 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         self._check_split_axis_constraints(nixl_agent_meta, remote_tp_size)
         head = ChipletSplitAxis.HEAD
         for logical_l, logical_r in self._logical_region_pairs(registered_layer_names):
-            latent = self._logical_region_latent[logical_l]
+            if self._logical_region_latent[logical_l]:
+                # A latent has no heads to band and every peer rank holds all of
+                # it, so only its token ranges are checked: cut on tokens or not
+                # at all, one in fewer ranges than the peer's pairs in pieces of
+                # the peer's alike.
+                spans_l = len(
+                    {p.slice_id for p in self._logical_region_geometry[logical_l].areas}
+                )
+                spans_r = len(set(nixl_agent_meta.kv_area_slices[logical_r]))
+                if self._shape.cuts_a_block and spans_l < spans_r:
+                    raise RuntimeError(
+                        f"RBLN NIXL D2D: logical region {logical_l}, a latent, holds a "
+                        f"block in {spans_l} token range(s) here and {spans_r} on the "
+                        f"peer (TP {remote_tp_size}), so it pairs in pieces of the "
+                        "peer's ranges, which chunk_mode cannot name. Turn chunk_mode "
+                        "off for this pairing, or pair at equal TP."
+                    )
+                continue
             # Raises here, before the peer is registered, for a layer whose
-            # heads are replicated across our ranks; a latent has none to cut.
-            if not latent:
-                self._region_kv_heads(logical_l)
+            # heads are replicated across our ranks.
+            self._region_kv_heads(logical_l)
             head_l = self._logical_region_geometry[logical_l].axis is head
             head_r = nixl_agent_meta.kv_split_axes[logical_r] is head
             # A context cut's slices cut tokens, not heads.
@@ -142,8 +158,8 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                 )
             # A peer rank has to hold whole areas of ours: its T / remote_tp
             # heads a multiple of an area's T / cuts_l. A coarser peer always
-            # does, its TP dividing ours; every peer rank holds all of a latent.
-            if not latent and cuts_l % remote_tp_size:
+            # does, its TP dividing ours.
+            if cuts_l % remote_tp_size:
                 raise RuntimeError(
                     f"RBLN NIXL D2D: the peer runs TP {remote_tp_size}, which does "
                     f"not divide the {cuts_l} way(s) this engine cuts the KV "
@@ -156,8 +172,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
             # holds, and a head cut meeting the peer's context cut pairs in
             # pieces of the peer's spans instead.
             if (
-                not latent
-                and self._logical_region_geometry[logical_l].axis is head
+                self._logical_region_geometry[logical_l].axis is head
                 and nixl_agent_meta.kv_split_axes[logical_r] is ChipletSplitAxis.TOKEN
                 and self._shape.cuts_a_block
             ):
@@ -167,20 +182,6 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                     "pairs in pieces of the peer's token ranges, which chunk_mode "
                     "cannot name. Turn chunk_mode off for this pairing, or pair "
                     "at equal TP."
-                )
-            # A latent is cut on tokens or not at all, and one in fewer token
-            # ranges than the peer's pairs in pieces of the peer's alike.
-            spans_l = len(
-                {p.slice_id for p in self._logical_region_geometry[logical_l].areas}
-            )
-            spans_r = len(set(nixl_agent_meta.kv_area_slices[logical_r]))
-            if latent and self._shape.cuts_a_block and spans_l < spans_r:
-                raise RuntimeError(
-                    f"RBLN NIXL D2D: logical region {logical_l}, a latent, holds a "
-                    f"block in {spans_l} token range(s) here and {spans_r} on the "
-                    f"peer (TP {remote_tp_size}), so it pairs in pieces of the "
-                    "peer's ranges, which chunk_mode cannot name. Turn chunk_mode "
-                    "off for this pairing, or pair at equal TP."
                 )
         self._register_remote_engine_prelude(
             nixl_agent_meta, remote_tp_size, remote_dcp_size
@@ -327,9 +328,10 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
 
         ``registered_layer_names`` narrows this to one pipeline stage, its
         region list indexed by position within the stage; None means the peer
-        owns every layer. ``peer_areas`` is `_fan_in_peer_areas`. A stage holds
-        a latent's attention layer with it, so a plan that leaves the latent to
-        another rank still names a region.
+        owns every layer. ``peer_areas`` is `_fan_in_peer_areas`. An indexer
+        sits in its attention's decoder layer, so a plan that leaves it to
+        another rank still names a region; the assert at the end names a stage
+        that holds only latents.
         """
         areas_l, _, _ = self._local_band(remote_tp_size)
         areas_iter = range(areas_l) if peer_areas is None else peer_areas
@@ -377,6 +379,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                 )
                 region_ids.append(region_id)
                 plans.append(pieces)
+        assert region_ids, f"no region of ours pairs with peer rank {remote_tp_rank}"
         return region_ids, plans
 
     def _area_rects(
@@ -411,7 +414,11 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
             slices = len(set(slice_ids))
             cut = 1 if axis is ChipletSplitAxis.TOKEN else slices
             if latent:
-                first, per_cut = 0, total_heads // cut
+                assert cut == 1, (
+                    f"logical region {logical_l}, a latent, is head-cut {cut} ways "
+                    f"on the {side} side"
+                )
+                first, per_cut = 0, 1
             else:
                 first, per_cut = self._slice_head_bounds(
                     rank, tp, total_heads, cut, side=side
@@ -625,8 +632,8 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         )
         if head_matched:
             ours = [
-                None if is_latent else axis
-                for axis, is_latent in zip(ours, self._logical_region_latent)
+                None if latent else axis
+                for axis, latent in zip(ours, self._logical_region_latent)
             ]
         theirs = cut(nixl_agent_meta.kv_split_axes, nixl_agent_meta.kv_area_slices)
         names = nixl_agent_meta.registered_layer_names
@@ -1377,7 +1384,9 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         `pieces` -- a region exchanged in more than one piece a block -- part
         of a region. That counts a peer replica and a K/V half as well as a
         head piece: upstream's handle names a block once, where our list names
-        it once a piece.
+        it once a piece. `pieces` also covers a list that leaves a region out,
+        as one leaving a latent to another rank does: upstream pairs its handle
+        with the peer's by position, every region once.
         """
         # Trimming narrows a block rather than a peer, and the per-shard ids
         # are what can leave part of one out. Streaming narrows neither: its
