@@ -750,6 +750,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     req_state.output_token_ids.append(new_token_ids[-1])
                 elif num_new_tokens > 0:
                     req_state.output_token_ids.extend(new_token_ids[-num_new_tokens:])
+                if self.replays_accepted_drafts:
+                    num_accepted_tokens = max(num_new_tokens, 1)
+                    self.num_accepted_tokens_by_req[req_id] = num_accepted_tokens
+                    if req_index is not None:
+                        self.input_batch.num_accepted_tokens_cpu[req_index] = (
+                            num_accepted_tokens
+                        )
             elif num_output_tokens < len(req_state.output_token_ids):
                 # Some output tokens were discarded due to a sync-KV-load
                 # failure. Align the cached state.
