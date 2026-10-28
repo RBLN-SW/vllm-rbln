@@ -14,6 +14,8 @@
 
 import ctypes
 import queue
+import socket
+import sys
 import threading
 from types import SimpleNamespace
 
@@ -23,8 +25,10 @@ import torch
 from vllm.config import ECTransferConfig
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorRole
 
+import vllm_rbln.distributed.ec_transfer.ec_connector.rbln_ec_nixl_connector as conn
 from vllm_rbln.distributed.ec_transfer.ec_connector.rbln_ec_nixl_connector import (
     _DTYPE_SIZES,
+    ECNixlAck,
     ECNixlMetadata,
     RblnECNixlConnector,
     RblnECNixlConnectorWorker,
@@ -112,10 +116,11 @@ class _Sink:
         self.messages.append(data)
 
 
-def _producer(agent):
+def _producer(agent, llm_tp_size=1):
     w = object.__new__(RblnECNixlConnectorWorker)
     w._is_producer = True
     w._is_consumer = False
+    w._is_sending_rank = True
     w._nixl_agent = agent
     w._backends = ["UCX"]
     w._engine_id = "encoder"
@@ -123,11 +128,12 @@ def _producer(agent):
     w._registered_caches = {}
     w._registered_descs = {}
     w._registered_timestamps = {}
+    w._unacked = {}
     w._producer_cache_capacity = 4
     w._producer_cache_ttl_s = 60.0
     w._ack_host = ""
     w._ack_port = 0
-    w._push_sock = _Sink()
+    w._push_socks = [_Sink() for _ in range(llm_tp_size)]
     return w
 
 
@@ -135,6 +141,7 @@ def _consumer(agent):
     w = object.__new__(RblnECNixlConnectorWorker)
     w._is_producer = False
     w._is_consumer = True
+    w._is_receiving_rank = True
     w._nixl_agent = agent
     w._backends = ["UCX"]
     w._incoming_metadata = queue.Queue()
@@ -159,7 +166,7 @@ def test_pull_delivers_the_cached_tensor_as_is():
 
     producer.save_caches({"img": embeds}, "img")
 
-    (pushed,) = producer._push_sock.messages
+    (pushed,) = producer._push_socks[0].messages
     meta = msgspec.msgpack.Decoder(ECNixlMetadata).decode(pushed)
     assert meta.mm_hash == "img"
     assert meta.tensor.shape == [3, 4]
@@ -173,3 +180,74 @@ def test_pull_delivers_the_cached_tensor_as_is():
 
     assert not consumer._pending_loads
     assert torch.equal(encoder_cache["img"], embeds)
+
+
+def test_only_encoder_tp_rank_0_sends():
+    producer = _producer(_FakeNixlAgent())
+    producer._is_sending_rank = False
+
+    producer.save_caches({"img": torch.ones(2, 2)}, "img")
+
+    assert producer._push_socks[0].messages == []
+    assert not producer._registered_caches
+
+
+def test_every_llm_rank_is_sent_to_and_acks_before_eviction():
+    producer = _producer(_FakeNixlAgent(), llm_tp_size=2)
+
+    producer.save_caches({"img": torch.ones(2, 2)}, "img")
+
+    assert [len(sock.messages) for sock in producer._push_socks] == [1, 1]
+    producer._incoming_acks.put(ECNixlAck(mm_hash="img", engine_id="encoder"))
+    producer._drain_acks()
+    assert "img" in producer._registered_caches
+    producer._incoming_acks.put(ECNixlAck(mm_hash="img", engine_id="encoder"))
+    producer._drain_acks()
+    assert "img" not in producer._registered_caches
+
+
+def test_llm_ranks_of_one_instance_bind_without_conflict(monkeypatch):
+    # Every worker of a TP > 1 or PP > 1 LLM instance builds its own connector.
+    fake_nixl = SimpleNamespace(nixl_agent=lambda name, config: _FakeNixlAgent())
+    monkeypatch.setitem(sys.modules, "nixl", SimpleNamespace(_api=fake_nixl))
+    monkeypatch.setitem(sys.modules, "nixl._api", fake_nixl)
+    monkeypatch.setattr(conn, "model_parallel_is_initialized", lambda: True)
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        pull_port = probe.getsockname()[1]
+    vllm_config = SimpleNamespace(
+        ec_transfer_config=ECTransferConfig(
+            ec_connector="RblnECNixlConnector",
+            ec_role="ec_consumer",
+            ec_connector_extra_config={
+                "pull_host": "127.0.0.1",
+                "pull_port": pull_port,
+            },
+        )
+    )
+
+    workers = []
+    try:
+        for tp_rank, first_pp_rank in [(0, True), (1, True), (0, False)]:
+            monkeypatch.setattr(
+                conn,
+                "get_tp_group",
+                lambda r=tp_rank: SimpleNamespace(rank_in_group=r),
+            )
+            monkeypatch.setattr(
+                conn,
+                "get_pp_group",
+                lambda f=first_pp_rank: SimpleNamespace(is_first_rank=f),
+            )
+            workers.append(
+                RblnECNixlConnectorWorker(vllm_config, ECConnectorRole.WORKER)
+            )
+    finally:
+        for worker in workers:
+            worker.shutdown()
+
+    assert [getattr(w, "_pull_addr", None) for w in workers] == [
+        f"tcp://127.0.0.1:{pull_port}",
+        f"tcp://127.0.0.1:{pull_port + 1}",
+        None,
+    ]

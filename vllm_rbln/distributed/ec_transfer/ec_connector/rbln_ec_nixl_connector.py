@@ -57,10 +57,11 @@ Design decisions
 
 Port layout
 -----------
-  LLM binds on a single port:
-    - pull_port: ZMQ PULL (receives NIXL metadata from all encoders)
+  LLM TP rank r (first PP stage) binds one port:
+    - pull_port + r: ZMQ PULL (receives NIXL metadata from all encoders)
 
-  Each encoder connects to the llm's PULL port via ZMQ PUSH.
+  Each encoder's TP rank 0 connects to every LLM rank's PULL port via ZMQ
+  PUSH (llm_tp_size of them); the other encoder ranks hold the same outputs.
 
 Configuration example
 ---------------------
@@ -71,6 +72,7 @@ Configuration example
       ec_connector_extra_config={
           "llm_host": "127.0.0.1",
           "llm_pull_port": 16100,
+          "llm_tp_size": 1,
           "backends": ["UCX"],
       },
   )
@@ -109,6 +111,11 @@ from vllm.distributed.ec_transfer.ec_connector.base import (
     ECConnectorRole,
 )
 from vllm.distributed.ec_transfer.ec_connector.example_connector import MMMeta
+from vllm.distributed.parallel_state import (
+    get_pp_group,
+    get_tp_group,
+    model_parallel_is_initialized,
+)
 from vllm.v1.core.sched.output import SchedulerOutput
 
 from vllm_rbln.logger import init_logger
@@ -345,6 +352,16 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
             "dead_threshold_s", _DEFAULT_DEAD_THRESHOLD_S
         )
 
+        # Every TP rank of the encoder holds the same outputs, so rank 0 sends
+        # them; every LLM rank of the first PP stage feeds them to its graph.
+        if model_parallel_is_initialized():
+            tp_rank = get_tp_group().rank_in_group
+            first_pp_rank = get_pp_group().is_first_rank
+        else:
+            tp_rank, first_pp_rank = 0, True
+        self._is_sending_rank = self.is_producer and tp_rank == 0
+        self._is_receiving_rank = self.is_consumer and first_pp_rank
+
         # -- Encoder state --
         # Insertion order is the LRU order; we never move entries, so a plain
         # dict (Python 3.7+) is sufficient.
@@ -354,6 +371,8 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
         self._registered_descs: dict[str, Any] = {}
         # mm_hash -> monotonic timestamp of registration (for TTL)
         self._registered_timestamps: dict[str, float] = {}
+        # mm_hash -> LLM ranks that have yet to ACK; evicted when none are left.
+        self._unacked: dict[str, int] = {}
         # Liveness tracking keyed by consumer_engine_id. Updated by the ACK
         # receiver thread on every incoming message (including pings).
         self._last_seen: dict[str, float] = {}
@@ -397,31 +416,43 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
         self._pending_loads: dict[str, tuple[Any, torch.Tensor, Any]] = {}
         self._encoder_cache: dict[str, Any] | None = None
 
-        if self.is_producer:
+        if self._is_sending_rank:
             llm_host: str = ec_cfg.get_from_extra_config("llm_host", _DEFAULT_LLM_HOST)
             llm_pull_port: int = ec_cfg.get_from_extra_config(
                 "llm_pull_port", _DEFAULT_PULL_PORT
             )
-            self._push_addr = f"tcp://{llm_host}:{llm_pull_port}"
-            if not _probe_tcp(llm_host, llm_pull_port):
-                logger.warning(
-                    "RblnECNixlConnector (encoder): LLM PULL port %s:%d is not "
-                    "accepting connections yet. Start the LLM first with "
-                    "`bash examples/optimum/ec_disagg/serve_ec_llm.sh` - "
-                    "ZMQ will still buffer messages and reconnect"
-                    "once the LLM is up, but tail latency for the earliest"
-                    "requests may be poor.",
-                    llm_host,
-                    llm_pull_port,
-                )
+            # FIXME(RBLN): ask the LLM instance for its ports, as upstream's
+            # Mooncake connector does, instead of relying on llm_tp_size.
+            # Until then it must match the LLM's TP size.
+            llm_tp_size: int = ec_cfg.get_from_extra_config("llm_tp_size", 1)
             self._zmq_ctx = zmq.Context()
-            self._push_sock = self._zmq_ctx.socket(zmq.PUSH)
-            self._push_sock.setsockopt(zmq.SNDHWM, 64)
-            self._push_sock.setsockopt(zmq.LINGER, 5000)
-            self._push_sock.connect(self._push_addr)
+            # A PUSH socket round-robins over its peers, so each LLM rank
+            # gets its own socket to receive every message.
+            self._push_socks: list[Any] = []
+            # FIXME(RBLN): this assumes every receiving LLM rank runs on
+            # llm_host. An LLM instance spread over nodes needs a host per rank.
+            for port in range(llm_pull_port, llm_pull_port + llm_tp_size):
+                if not _probe_tcp(llm_host, port):
+                    logger.warning(
+                        "RblnECNixlConnector (encoder): LLM PULL port %s:%d is "
+                        "not accepting connections yet. Start the LLM first with "
+                        "`bash examples/optimum/ec_disagg/serve_ec_llm.sh` - "
+                        "ZMQ will still buffer messages and reconnect"
+                        "once the LLM is up, but tail latency for the earliest"
+                        "requests may be poor.",
+                        llm_host,
+                        port,
+                    )
+                push_sock = self._zmq_ctx.socket(zmq.PUSH)
+                push_sock.setsockopt(zmq.SNDHWM, 64)
+                push_sock.setsockopt(zmq.LINGER, 5000)
+                push_sock.connect(f"tcp://{llm_host}:{port}")
+                self._push_socks.append(push_sock)
             logger.info(
-                "RblnECNixlConnector (encoder): PUSH connected to %s",
-                self._push_addr,
+                "RblnECNixlConnector (encoder): PUSH connected to %s:%d-%d",
+                llm_host,
+                llm_pull_port,
+                llm_pull_port + llm_tp_size - 1,
             )
 
             # ACK PULL socket — receives completion notifications from LLM so
@@ -453,14 +484,14 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
                 self._ack_port,
             )
 
-        if self.is_consumer:
+        if self._is_receiving_rank:
             pull_host: str = ec_cfg.get_from_extra_config(
                 "pull_host", _DEFAULT_PULL_HOST
             )
             pull_port: int = ec_cfg.get_from_extra_config(
                 "pull_port", _DEFAULT_PULL_PORT
             )
-            self._pull_addr = f"tcp://{pull_host}:{pull_port}"
+            self._pull_addr = f"tcp://{pull_host}:{pull_port + tp_rank}"
             self._zmq_ctx = zmq.Context()
             self._pull_sock = self._zmq_ctx.socket(zmq.PULL)
             self._pull_sock.setsockopt(zmq.RCVHWM, 64)
@@ -814,13 +845,18 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
                 ack = self._incoming_acks.get_nowait()
             except queue.Empty:
                 break
-            if ack.mm_hash in self._registered_caches:
-                logger.debug(
-                    "EC Nixl: ACK status=%s for mm_hash=%s, evicting",
-                    ack.status,
-                    ack.mm_hash,
-                )
-                self._evict_producer_entry(ack.mm_hash)
+            remaining = self._unacked.get(ack.mm_hash)
+            if remaining is None:
+                continue
+            if remaining > 1:
+                self._unacked[ack.mm_hash] = remaining - 1
+                continue
+            logger.debug(
+                "EC Nixl: ACK status=%s for mm_hash=%s, evicting",
+                ack.status,
+                ack.mm_hash,
+            )
+            self._evict_producer_entry(ack.mm_hash)
 
     # ------------------------------------------------------------------
     # Producer-side cache admission (LRU + TTL)
@@ -843,6 +879,7 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
                 )
         self._registered_caches.pop(mm_hash, None)
         self._registered_timestamps.pop(mm_hash, None)
+        self._unacked.pop(mm_hash, None)
 
     def _sweep_expired_producer_entries(self) -> None:
         """Drop any registered producer entries older than the TTL."""
@@ -954,7 +991,7 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
         **kwargs,
     ) -> None:
         """Encoder: register the output with NIXL, push metadata to llm."""
-        if not self.is_producer:
+        if not self._is_sending_rank:
             return
 
         # Drain any ACKs from completed llm-side pulls first so evictions
@@ -987,6 +1024,7 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
         self._registered_caches[mm_hash] = buf
         self._registered_descs[mm_hash] = descs
         self._registered_timestamps[mm_hash] = time.monotonic()
+        self._unacked[mm_hash] = len(self._push_socks)
 
         # Push metadata to llm via ZMQ
         push_meta = ECNixlMetadata(
@@ -998,7 +1036,8 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
             ack_port=self._ack_port,
         )
         encoded = msgspec.msgpack.Encoder().encode(push_meta)
-        self._push_sock.send(encoded)
+        for push_sock in self._push_socks:
+            push_sock.send(encoded)
 
         logger.debug("EC Nixl: registered + pushed mm_hash=%s", mm_hash)
 
@@ -1009,7 +1048,7 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
         **kwargs,
     ) -> None:
         """LLM: drain metadata queue and initiate NIXL pulls."""
-        if self.is_producer:
+        if not self._is_receiving_rank:
             return
 
         self._encoder_cache = encoder_cache
@@ -1124,14 +1163,14 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
 
     def request_finished(self, request: Request) -> tuple[bool, dict[str, Any] | None]:
         """Deregister NIXL memory for completed requests (encoder only)."""
-        if self.is_producer:
+        if self._is_sending_rank:
             # Drain any late ACKs so eviction state stays current.
             self._drain_acks()
             for feature in request.mm_features:
                 mm_hash = feature.identifier
                 self._evict_producer_entry(mm_hash)
 
-        if self.is_consumer:
+        if self._is_receiving_rank:
             for feature in request.mm_features:
                 mm_hash = feature.identifier
 
