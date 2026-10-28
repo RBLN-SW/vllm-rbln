@@ -58,7 +58,7 @@ class RblnECCPUWorker(ECCPUWorker):
         if block_ids is None:
             return
         src = encoder_cache[mm_hash]
-        # A load reads each block back as one row of the model dtype.
+        # One byte row per region block; a load views them back in the model dtype.
         rows = src.view(torch.int8)
         assert (
             src.dtype == self._dtype
