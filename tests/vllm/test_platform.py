@@ -513,6 +513,16 @@ class TestRejectedConfigs:
         with pytest.raises(ValueError, match="divisible"):
             reconfigure(_ranks(data_parallel_size=2, max_num_seqs=5))
 
+    def test_dp_refuses_a_text_prefill_below_the_token_budget(self, reconfigure):
+        def mutate(config):
+            _ranks(data_parallel_size=2)(config)
+            config.scheduler_config.long_prefill_token_threshold = (
+                config.scheduler_config.max_num_batched_tokens // 2
+            )
+
+        with pytest.raises(ValueError, match="long_prefill_token_threshold"):
+            reconfigure(mutate)
+
     @pytest.mark.parametrize("ranks", [dict(data_parallel_size=2), dict(ep=True)])
     def test_dp_and_ep_need_the_moe_tokens_mask(self, reconfigure, ranks):
         with pytest.raises(ValueError, match="--rbln-use-moe-tokens-mask"):

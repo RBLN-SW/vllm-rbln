@@ -151,6 +151,19 @@ def _validate(vllm_config: "VllmConfig") -> None:
                 "when DP enabled."
             )
 
+        # TODO(RBLN): the ranks agree on max_num_batched_tokens as the prefill
+        # token dimension (dp_utils), not on the text prefill length.
+        threshold = scheduler_config.long_prefill_token_threshold
+        if (
+            parallel_config.data_parallel_size > 1
+            and 0 < threshold < max_num_batched_tokens
+        ):
+            raise ValueError(
+                f"long_prefill_token_threshold={threshold} below "
+                f"{max_num_batched_tokens=} shortens the compiled text prefill, "
+                "which data parallelism does not support on RBLN yet."
+            )
+
         if (
             parallel_config.data_parallel_size > 1
             or parallel_config.enable_expert_parallel
@@ -338,9 +351,8 @@ def _override(vllm_config: "VllmConfig") -> None:
         model_config.disable_cascade_attn = True
 
     # As upstream's CUDA and ROCm platforms do: an mm prefix range attends both
-    # ways, so it must never straddle two steps.
-    # TODO(RBLN): prefill pads to max_num_batched_tokens, so the text prefill
-    # graph grows with the longest mm item; give it a length of its own.
+    # ways, so it must never straddle two steps. max_num_batched_tokens then
+    # holds the longest item; long_prefill_token_threshold sizes text prefill.
     scheduler_config = vllm_config.scheduler_config
     if (
         model_config.is_mm_prefix_lm

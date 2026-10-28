@@ -289,6 +289,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # These will be overridden in load_model()
         self.max_model_len = model_config.max_model_len
         self.max_num_tokens = scheduler_config.max_num_batched_tokens
+        # A text prefill step pads to this; an mm prefix step pads to its own
+        # length, which max_num_batched_tokens has to hold.
+        threshold = scheduler_config.long_prefill_token_threshold
+        self.prefill_query_len = (
+            threshold if 0 < threshold < self.max_num_tokens else self.max_num_tokens
+        )
         self.max_num_reqs = scheduler_config.max_num_seqs
 
         self.dcp_world_size = self.parallel_config.decode_context_parallel_size
@@ -1334,7 +1340,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         if self.mm_prefix_query_len is not None:
             query_len_padded = self.mm_prefix_query_len
         elif is_prefill:
-            query_len_padded = self.max_num_tokens
+            query_len_padded = self.prefill_query_len
         else:
             query_len_padded = input_ids.shape[1]
         layout = InputLayout(
@@ -1405,13 +1411,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     "would run causally."
                 )
             query_lens = self.model.get_mm_prefix_query_lens()
-            longest = query_lens[-1]
-            threshold = self.scheduler_config.long_prefill_token_threshold
-            if 0 < threshold < longest:
-                raise ValueError(
-                    f"long_prefill_token_threshold={threshold} would split a "
-                    f"multimodal range of up to {longest} tokens."
-                )
             # TODO(RBLN): each of these resumes a range mid-way or runs it under
             # a shape this path does not pick yet.
             if self.cache_config.enable_prefix_caching:
@@ -3858,7 +3857,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
     def run_model_graphs(self) -> None:
         """Every model graph once, at the shapes serving will ask for."""
         # 1. prefill, then one mm prefix step per query length
-        self._dummy_run(1, self.max_num_tokens, True)
+        self._dummy_run(1, self.prefill_query_len, True)
         for query_len in self.mm_prefix_query_lens:
             self._dummy_run(1, query_len, True, mm_prefix_query_len=query_len)
 
