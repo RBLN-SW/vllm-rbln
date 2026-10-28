@@ -5329,10 +5329,23 @@ class TestARefusedPeerLeavesNothingBehind:
         w.transfer_topo.register_remote_engine.assert_not_called()
         w.nixl_wrapper.add_remote_agent.assert_not_called()
 
-    def test_a_peer_of_another_kv_layout_is_refused_by_it_unregistered(self):
+    @pytest.mark.parametrize(
+        "our_regions",
+        [
+            pytest.param(1, id="as_many_regions"),
+            # Split K and V against a packed peer: the band reads the peer's
+            # list by our region numbers, so it must not run first.
+            pytest.param(2, id="fewer_regions_on_the_peer"),
+        ],
+    )
+    def test_a_peer_of_another_kv_layout_is_refused_by_it_unregistered(
+        self, our_regions
+    ):
         # Through the real check, ahead of the head-cut check, which would
         # refuse TP 2 against TP 3 under its own message.
         w = self._worker()
+        fill_region_geometry(w, areas=1, axes=[ChipletSplitAxis.HEAD] * our_regions)
+        w._logical_region_kv_heads = [8] * our_regions
         del w._check_d2d_region_pairing
         w.use_host_buffer = False
         w.transfer_topo.tp_size = 2
@@ -6490,6 +6503,8 @@ class TestHeadMatchedAgentRegistration:
         # Silent without the refusal: the smaller count divides the larger side's
         # heads per rank, so a wrong band transfers with nothing objecting.
         w = self._slice_worker(slices=[4, 4, 2, 2], kv_heads=[8, 8, 32, 32])
+        w._check_d2d_region_pairing = MagicMock()
+        w._check_split_axis_constraints = MagicMock()
         meta = MagicMock()
         meta.engine_id = "eng"
 

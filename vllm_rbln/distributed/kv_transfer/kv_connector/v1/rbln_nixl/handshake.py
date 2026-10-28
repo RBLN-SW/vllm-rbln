@@ -109,15 +109,15 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
 
         self._refuse_decode_context_parallel(remote_dcp_size)
         self._check_mla_constraints(nixl_agent_meta, remote_tp_size)
-        areas_l, slices_l, _ = self._local_band(remote_tp_size)
-        areas_r, slices_r = self._peer_band(
-            nixl_agent_meta, remote_tp_size, registered_layer_names
-        )
         # Ahead of the prelude, which the handshake checks run after: upstream
         # swallows a handshake exception, so a later raise leaves the peer
         # registered. The layout checks first, which the axes below index by.
         self._check_d2d_region_pairing(nixl_agent_meta, remote_tp_size)
         self._check_split_axis_constraints(nixl_agent_meta, remote_tp_size)
+        areas_l, slices_l, _ = self._local_band(remote_tp_size)
+        areas_r, slices_r = self._peer_band(
+            nixl_agent_meta, remote_tp_size, registered_layer_names
+        )
         head = ChipletSplitAxis.HEAD
         for logical_l, logical_r in self._logical_region_pairs(registered_layer_names):
             if self._logical_region_latent[logical_l]:
