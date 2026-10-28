@@ -169,6 +169,44 @@ def test_forward_runs_only_the_layers_this_rank_built(monkeypatch):
     torch.testing.assert_close(out, torch.full((3, 8), 2.0))
 
 
+def test_indexer_reads_the_post_norm_q_latent():
+    """The trained indexer expects the q latent after `q_a_layernorm`; feeding
+    the pre-norm one, as the checkpoint's `modeling_axk3.py` does, degrades
+    short-context retrieval."""
+    import vllm_rbln.patches.axk3.model as axk3_model
+
+    q_lora_rank, kv_lora_rank, rope, nope, v = 4, 3, 2, 2, 2
+    qkv_lora = torch.randn(1, 2, q_lora_rank + kv_lora_rank + rope)
+    seen = {}
+
+    def indexer(hidden_states, qr, positions, rotary_emb):
+        seen["qr"] = qr
+        return torch.zeros(2, 1, dtype=torch.int32)
+
+    mla = SimpleNamespace(
+        q_lora_rank=q_lora_rank,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=rope,
+        qk_nope_head_dim=nope,
+        qk_head_dim=nope + rope,
+        v_head_dim=v,
+        num_heads=1,
+        fused_qkv_a_proj=lambda x: (qkv_lora,),
+        q_a_layernorm=lambda x: x * 2,
+        q_b_proj=lambda x: (torch.zeros(1, 2, nope + rope + v),),
+        kv_a_layernorm=lambda x: x,
+        rotary_emb=lambda positions, q_pe, k_pe: (q_pe, k_pe),
+        indexer=indexer,
+        indexer_rope_emb=None,
+        mla_attn=lambda *args, output_shape, topk_indices: torch.zeros(output_shape),
+        o_proj=lambda x: (x,),
+    )
+
+    axk3_model._gated_mla_forward(mla, torch.arange(2), torch.zeros(1, 2, 8), None)
+
+    torch.testing.assert_close(seen["qr"], qkv_lora[..., :q_lora_rank] * 2)
+
+
 def test_eagle3_is_refused_on_both_aux_layer_setup_paths():
     """The runner resolves the aux layers from the speculative config, or from
     the model's default, then calls the setter; neither path may silently
