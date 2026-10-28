@@ -1933,9 +1933,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             if self.vllm_config.is_mm_encoder_only:
                 with self.maybe_get_ec_connector_output(
                     scheduler_output, encoder_cache=self.encoder_cache
-                ):
+                ) as ec_connector_output:
                     self._execute_mm_encoder(scheduler_output)
-                return make_empty_encoder_model_runner_output(scheduler_output)
+                return ModelRunnerOutput.with_ec_conn_output(
+                    make_empty_encoder_model_runner_output(scheduler_output),
+                    ec_connector_output,
+                )
 
             # Process sub-block KV cache copy operations before the forward
             # pass so that partially cached blocks are populated.
@@ -1945,9 +1948,22 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             if not num_scheduled_tokens:
                 if not has_kv_transfer_group():
                     # Return empty ModelRunnerOutput if there's no work to do.
-                    return EMPTY_MODEL_RUNNER_OUTPUT
-                # KV send/recv even when there is no forward work to do.
-                return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+                    output = EMPTY_MODEL_RUNNER_OUTPUT
+                else:
+                    # KV send/recv even when there is no forward work to do.
+                    output = self.kv_connector_no_forward(
+                        scheduler_output, self.vllm_config
+                    )
+                # EC send/recv too, on the ranks that run the EC connector.
+                if self.supports_mm_inputs and get_pp_group().is_first_rank:
+                    with self.maybe_get_ec_connector_output(
+                        scheduler_output, encoder_cache=self.encoder_cache
+                    ) as ec_connector_output:
+                        pass
+                    output = ModelRunnerOutput.with_ec_conn_output(
+                        output, ec_connector_output
+                    )
+                return output
 
             if self.cache_config.kv_sharing_fast_prefill:
                 assert not self.num_prompt_logprobs, (

@@ -39,6 +39,7 @@ from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheTensor
 from vllm.v1.outputs import (
+    EMPTY_MODEL_RUNNER_OUTPUT,
     ECConnectorOutput,
     KVConnectorOutput,
     LogprobsTensors,
@@ -504,6 +505,31 @@ class TestEncoderOnly:
         assert published == ["h0", "h1"]
         assert runner.encoder_cache["h1"] is embeds[1]
 
+    @pytest.mark.parametrize("num_scheduled_tokens", [{"r0": 3}, {}])
+    def test_the_step_reports_finished_sends(self, monkeypatch, num_scheduled_tokens):
+        monkeypatch.setattr(ec_state, "_EC_CONNECTOR_AGENT", _SendingECConnector("h0"))
+        monkeypatch.setattr(mr, "step_is_prefill", lambda so: True)
+        monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: False)
+        runner = _make_runner_stub(
+            vllm_config=SimpleNamespace(is_mm_encoder_only=True),
+            execute_model_state=None,
+            use_async_scheduling=False,
+            encoder_cache={},
+            _update_states=lambda so: None,
+            _execute_mm_encoder=lambda so: None,
+        )
+        scheduler_output = SimpleNamespace(
+            total_num_scheduled_tokens=sum(num_scheduled_tokens.values()),
+            num_scheduled_tokens=num_scheduled_tokens,
+            ec_connector_metadata=ECConnectorMetadata(),
+            finished_req_ids=set(),
+        )
+
+        output = runner.execute_model(scheduler_output)
+
+        assert output.ec_connector_output.finished_sending == {"h0"}
+        assert EMPTY_MODEL_RUNNER_OUTPUT.ec_connector_output is None
+
     def test_warm_up_builds_only_the_encoder(self, monkeypatch):
         cache = SimpleNamespace(config_signature=Mock(), load=Mock(), save=Mock())
         monkeypatch.setattr(mr, "mega_cache", cache)
@@ -549,6 +575,39 @@ class _ReceivingECConnector(ECConnectorBase):
 
     def save_caches(self, encoder_cache, mm_hash, **kwargs):
         raise AssertionError("a consumer saves nothing")
+
+    def has_cache_item(self, identifier):
+        raise AssertionError("scheduler-side only")
+
+    def update_state_after_alloc(self, request, index):
+        raise AssertionError("scheduler-side only")
+
+    def build_connector_meta(self, scheduler_output):
+        raise AssertionError("scheduler-side only")
+
+
+class _SendingECConnector(ECConnectorBase):
+    """A producer-side EC connector that reports one finished send."""
+
+    def __init__(self, mm_hash: str):
+        super().__init__(
+            SimpleNamespace(
+                ec_transfer_config=SimpleNamespace(
+                    is_ec_producer=True, is_ec_consumer=False
+                )
+            ),
+            ECConnectorRole.WORKER,
+        )
+        self.mm_hash = mm_hash
+
+    def get_finished(self, finished_req_ids):
+        return {self.mm_hash}, None
+
+    def start_load_caches(self, encoder_cache, **kwargs):
+        raise AssertionError("a producer loads nothing")
+
+    def save_caches(self, encoder_cache, mm_hash, **kwargs):
+        pass
 
     def has_cache_item(self, identifier):
         raise AssertionError("scheduler-side only")
@@ -613,6 +672,44 @@ class TestEcConsumer:
 
         assert output.ec_connector_output is received
         assert runner.ec_connector_output is None
+
+    @pytest.mark.parametrize(
+        ("first_rank", "reported"), [(True, {"h0"}), (False, None)]
+    )
+    def test_a_step_with_no_tokens_still_runs_the_connector(
+        self, monkeypatch, first_rank, reported
+    ):
+        monkeypatch.setattr(
+            ec_state,
+            "_EC_CONNECTOR_AGENT",
+            _ReceivingECConnector("h0", torch.ones(1, 2)),
+        )
+        monkeypatch.setattr(mr, "step_is_prefill", lambda so: False)
+        monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: False)
+        monkeypatch.setattr(
+            mr, "get_pp_group", lambda: SimpleNamespace(is_first_rank=first_rank)
+        )
+        runner = _make_runner_stub(
+            vllm_config=SimpleNamespace(is_mm_encoder_only=False),
+            execute_model_state=None,
+            use_async_scheduling=False,
+            supports_mm_inputs=True,
+            encoder_cache={},
+            _update_states=lambda so: None,
+        )
+        scheduler_output = SimpleNamespace(
+            total_num_scheduled_tokens=0,
+            kv_cache_copy_ops=None,
+            ec_connector_metadata=ECConnectorMetadata(),
+            finished_req_ids=set(),
+        )
+
+        output = runner.execute_model(scheduler_output)
+
+        assert getattr(output.ec_connector_output, "finished_recving", None) == (
+            reported
+        )
+        assert EMPTY_MODEL_RUNNER_OUTPUT.ec_connector_output is None
 
     def test_the_sampled_output_reports_the_steps_loads(self, monkeypatch):
         monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: False)
