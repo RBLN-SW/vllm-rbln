@@ -111,7 +111,9 @@ def _validate(vllm_config: "VllmConfig") -> None:
 
         check_dtype_option_supported()
 
-    if not scheduler_config.enable_chunked_prefill:
+    # Upstream turns chunked prefill off for an engine without a KV cache, such
+    # as an encoder-only instance, then validates the config again in EngineCore.
+    if not (scheduler_config.enable_chunked_prefill or vllm_config.is_mm_encoder_only):
         raise ValueError(
             "Disabling chunked prefill is not supported on RBLN. "
             "Please enable chunked prefill by yourself."

@@ -512,6 +512,17 @@ class TestRejectedConfigs:
                 )
             )
 
+    def test_chunked_prefill_off_on_an_encoder_only_instance(self, reconfigure):
+        # Upstream turns it off once the engine finds no KV cache, then runs
+        # the hook again.
+        def mutate(config):
+            config.model_config.multimodal_config = SimpleNamespace(
+                mm_encoder_only=True
+            )
+            config.scheduler_config.enable_chunked_prefill = False
+
+        reconfigure(mutate)
+
     @pytest.mark.parametrize("method", ["eagle3", "dflash"])
     def test_a_draft_under_pp_needs_a_patched_target(self, reconfigure, method):
         # The default model is a plain LlamaForCausalLM, which 0.30 made
