@@ -135,6 +135,10 @@ Code either succeeds or fails with a clear error.
 
 ## Tests
 
+Even CPU-lane tests load `rebel` during `tests/vllm/conftest.py` initialization,
+before test selection. Without the RBLN SDK the suite cannot collect;
+source-isolated checks do not substitute for running it.
+
 - A test must fail without the change it covers. Verify that; do not assume it.
 - Cover what the change touched. Do not test pre-existing logic, third-party functions, or statically defined values.
 - Extend an existing file, `conftest.py` fixture, or `utils.py` helper before adding a new file.

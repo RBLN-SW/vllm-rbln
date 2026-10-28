@@ -13,17 +13,63 @@
 # limitations under the License.
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
+import torch
+from typing_extensions import Self
 from vllm.config import VllmConfig
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
-from vllm.v1.kv_cache_interface import SlidingWindowSpec
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVQuantMode, SlidingWindowSpec
 from vllm.v1.request import Request
 
 
+class RBLNKVCacheTransferRegions:
+    """Kernel layout captured in the spec before allocation and serialization."""
+
+    kv_quant_mode: KVQuantMode
+    kv_cache_block_axis: int
+
+    def get_kv_cache_transfer_regions(
+        self, kv_cache: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        """Expose the kernel's native K/V planes as aliasing BHNC regions."""
+        if self.kv_quant_mode != KVQuantMode.NONE:
+            raise NotImplementedError("RBLN transfer regions require unquantized KV")
+        if self.kv_cache_block_axis not in (0, 1):
+            raise ValueError("RBLN block axis must be 0 or 1")
+        kv_axis = 1 - self.kv_cache_block_axis
+        if kv_cache.ndim != 6 or kv_cache.shape[kv_axis] != 2 or kv_cache.shape[3] != 1:
+            raise ValueError(f"Unexpected RBLN attention cache: {kv_cache.shape}")
+        return {
+            name: kv_cache.select(kv_axis, index).squeeze(2)
+            for index, name in enumerate(("key", "value"))
+        }
+
+    @classmethod
+    def merge(cls, specs: list[Self]) -> Self:
+        """Preserve the kernel layout across upstream spec reconstruction."""
+        block_axis = specs[0].kv_cache_block_axis
+        if any(spec.kv_cache_block_axis != block_axis for spec in specs):
+            raise ValueError("Cannot merge different RBLN KV kernel layouts")
+        merged = super().merge(specs)  # type: ignore[misc]
+        return replace(merged, kv_cache_block_axis=block_axis)
+
+
+@dataclass(frozen=True, kw_only=True)
+class RBLNFullAttentionSpec(RBLNKVCacheTransferRegions, FullAttentionSpec):
+    kv_cache_block_axis: int = 0
+
+
+@dataclass(frozen=True, kw_only=True)
+class RBLNAppendSlidingWindowSpec(RBLNKVCacheTransferRegions, SlidingWindowSpec):
+    kv_cache_block_axis: int = 0
+
+
 @dataclass(frozen=True)
-class RBLNSlidingWindowSpec(SlidingWindowSpec):
+class RBLNSlidingWindowSpec(RBLNKVCacheTransferRegions, SlidingWindowSpec):
+    kv_cache_block_axis: int = 0
+
     def __post_init__(self):
         super().__post_init__()
         # NOTE: The block size here means to be the physical block size. The
