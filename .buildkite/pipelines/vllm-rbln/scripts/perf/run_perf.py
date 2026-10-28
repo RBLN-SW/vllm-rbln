@@ -47,6 +47,7 @@ from lane import (  # noqa: E402
     host_chip,
     measured_pipeline,
     output_dir,
+    perf_cases,
     publish_summary,
     run_logged,
     start_case,
@@ -233,7 +234,9 @@ def run_case(
         ["vllm", "bench", "serve", "--model", model], target.get("bench", {})
     )
     bench_cmd = spread_across_ranks(bench_cmd, serve)
-    bench_params = {bench: target["bench_params"][bench]}
+    bench_params = {
+        bench: {k: v for k, v in target["bench_params"][bench].items() if k != "serve"}
+    }
 
     log = out / "perf.log"
     repro = write_repro(
@@ -345,8 +348,7 @@ def main() -> int:
     cases = [
         (name, launch, bench)
         for name, target in targets.items()
-        for launch in target["serve_params"]
-        for bench in target["bench_params"]
+        for launch, bench in perf_cases(target)
     ]
     if args.action == "run":
         for selected, column in ((args.launch, 1), (args.bench, 2)):

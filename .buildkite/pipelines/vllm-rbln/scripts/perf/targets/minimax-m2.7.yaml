@@ -6,7 +6,6 @@ env:
 
 serve:
   model_impl: vllm
-  rbln_use_batch_attn_opt: true
   max_model_len: 65536
   block_size: 8192
   max_num_batched_tokens: 1024
@@ -16,7 +15,7 @@ serve:
 
 # One server start -- and one compile -- per entry.
 serve_params:
-  tp4ep: {tensor_parallel_size: 4, enable_expert_parallel: true, num_gpu_blocks_override: 82}
+  tp4: {tensor_parallel_size: 4}
   pp4: {pipeline_parallel_size: 4}
   dp4ep: {data_parallel_size: 4, enable_expert_parallel: true, max_num_seqs: 1}
 
@@ -29,6 +28,7 @@ bench:
 
 bench_params:
   c4-in50k-out1k-greedy:
+    serve: [tp4, dp4ep]
     max_concurrency: 4
     num_prompts: 16
     random_input_len: 51200
@@ -36,10 +36,19 @@ bench_params:
     temperature: 0.0
 
   c4-in50k-out1k-non-greedy:
+    serve: [tp4, dp4ep]
     max_concurrency: 4
     num_prompts: 16
     random_input_len: 51200
     random_output_len: 1024
+  
+  c4-in50k-out1-greedy:
+    serve: [pp4]
+    max_concurrency: 4
+    num_prompts: 16
+    random_input_len: 51200
+    random_output_len: 1
+    temperature: 0.0
 
 server_ready_timeout: 3600
 num_runs: 1

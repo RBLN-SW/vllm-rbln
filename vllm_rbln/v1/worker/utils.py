@@ -261,7 +261,7 @@ def num_attn_module(model_config, cache_dtype) -> int:
     if getattr(text_config, "model_type", None) in ("glm5_next_text", "glm5_next_mtp"):
         return 2 * text_config.linear_num_heads + 1
     # A DSA model puts the lightning-indexer key cache next to MLA: 2 modules,
-    # or 3 when the indexer cache is fp8 (a companion fp16 scale cache).
+    # or 3 when the indexer cache is fp8 (a companion scale cache).
     if hasattr(text_config, "index_topk") or hasattr(hf_config, "index_topk"):
         is_fp8 = bool(cache_dtype) and cache_dtype.startswith("fp8")
         return 3 if is_fp8 else 2

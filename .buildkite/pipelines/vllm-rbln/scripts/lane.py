@@ -92,6 +92,32 @@ def build_cmd(base: list[str], params: dict[str, Any]) -> list[str]:
     return ParameterSweepItem(params).apply_to_cmd(base)
 
 
+def perf_cases(target: dict[str, Any]) -> list[tuple[str, str]]:
+    launches = target["serve_params"]
+    benches = target["bench_params"]
+    for bench, params in benches.items():
+        if "serve" not in params:
+            continue
+        selected = params["serve"]
+        if (
+            not isinstance(selected, list)
+            or not selected
+            or not all(isinstance(name, str) for name in selected)
+        ):
+            raise ValueError(f"{bench}: serve must be a non-empty list of launch names")
+        if unknown := set(selected) - launches.keys():
+            raise ValueError(
+                f"{bench}: unknown serve names: {', '.join(sorted(unknown))}"
+            )
+
+    return [
+        (launch, bench)
+        for launch in launches
+        for bench, params in benches.items()
+        if "serve" not in params or launch in params["serve"]
+    ]
+
+
 _LANE_ENV = {
     # A launch compiles before it serves, which takes far longer than the
     # default this allows.
@@ -205,7 +231,7 @@ def start_case(out: Path, *, resume: bool = False) -> dict[str, Any]:
     job_id = os.environ.get("BUILDKITE_JOB_ID")
     result: dict[str, Any] = {
         "exit_code": None,
-        "job_url": f"{build_url}#{job_id}" if build_url and job_id else None,
+        "job_url": f"{build_url}?job={job_id}" if build_url and job_id else None,
         "rows": [],
     }
     write_result(out, result)
@@ -222,6 +248,34 @@ def case_status(result: dict[str, Any] | None) -> str:
     if not result["rows"]:
         return "no results"
     return "ok"
+
+
+def pytest_addoption(parser):
+    parser.addoption("--ci-result-dir", help="Write structured CI test counts here")
+
+
+def pytest_sessionstart(session):
+    if directory := session.config.getoption("ci_result_dir"):
+        start_case(Path(directory))
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    if directory := config.getoption("ci_result_dir"):
+        out = Path(directory)
+        result = json.loads((out / "result.json").read_text())
+        result["exit_code"] = int(exitstatus)
+        result["counts"] = {
+            label: len(terminalreporter.stats.get(category, []))
+            for label, category in (
+                ("passed", "passed"),
+                ("failed", "failed"),
+                ("errors", "error"),
+                ("skipped", "skipped"),
+                ("xfailed", "xfailed"),
+                ("xpassed", "xpassed"),
+            )
+        }
+        write_result(out, result)
 
 
 def download_results(lane: str, run_id: str, chip: str) -> None:

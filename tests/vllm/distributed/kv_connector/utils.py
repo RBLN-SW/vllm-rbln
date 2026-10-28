@@ -570,6 +570,7 @@ def fill_region_geometry(
         geometries.append(RegionGeometry(axis, count, places))
     w._kv_areas = areas
     w._logical_region_geometry = geometries
+    w._logical_region_latent = [False] * len(axes)
     return w
 
 

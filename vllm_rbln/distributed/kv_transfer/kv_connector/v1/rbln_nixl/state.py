@@ -328,10 +328,14 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
     #: speculative draft keeps its own head count under the target's TP, so
     #: one engine can hold both axes.
     _logical_region_geometry: list[RegionGeometry]
-    #: How many of K and V one region's block holds. Every lifetime reads it:
-    #: registration derives it, the handshake pairs and advertises on it, and
-    #: both a shard list's descriptors and a chunk range's runs are cut by it.
+    #: How many of K and V an attention region's block holds; a latent's is
+    #: one (`_region_halves`, which a chunk range's runs are cut by). Every
+    #: lifetime reads it: registration derives it, and the handshake pairs and
+    #: advertises on it.
     _kv_per_block: int
+    #: Per logical region, whether it is a key-only latent (an MLA cache, or
+    #: an MSA indexer beside attention) rather than K and V.
+    _logical_region_latent: list[bool]
     _logical_region_kv_heads: list[int | None]
     #: This RANK's share of them, which is what a token range of an area is
     #: one byte run per. `_logical_region_kv_heads` is a band across ranks and
@@ -484,6 +488,10 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
             pairs.append((peer_pos, matches[occurrence]))
         return pairs
 
+    def _region_halves(self, logical: int) -> int:
+        """How many of K and V a block of a logical region holds."""
+        return 1 if self._logical_region_latent[logical] else self._kv_per_block
+
     def _logical_regions_per_layer(self) -> int:
         return len(self._logical_region_geometry) // len(self.local_seen_layer_names)
 
@@ -634,7 +642,7 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         block and a range is one run per head of the slice.
 
         A packed block holds a token's K beside its V, so a range is one run in
-        each.
+        each; a latent holds a key alone.
         """
         assert self._logical_region_local_heads, (
             "head counts per region are the direct path's, and so is every "
@@ -651,7 +659,7 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
                 f"logical region {region} holds {heads} KV head(s) over "
                 f"{slices} slice(s)"
             )
-            cuts.append((spans, self._kv_per_block * heads // slices))
+            cuts.append((spans, self._region_halves(region) * heads // slices))
         return cuts
 
     def _window_grid(self) -> tuple[int, int] | None:

@@ -153,6 +153,7 @@ class RblnNixlWorkerBase(
         # (`get_kv_cache_shape`), which is one unless the attention cache packs
         # both. Host staging registers whole logical buffers and stays here.
         self._kv_per_block: int = 1
+        self._logical_region_latent: list[bool] = []
         # Model-wide counts, not this rank's share. None where the layer has
         # no head band (`_layer_kv_heads`).
         self._logical_region_kv_heads: list[int | None] = []
