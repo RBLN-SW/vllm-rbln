@@ -42,6 +42,7 @@ from vllm.model_executor.models.utils import (
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
+from vllm_rbln import envs
 from vllm_rbln.patches.axk2 import model as _axk2_model
 
 # Loaded at import time from the frozen copy, so mypy cannot see its classes
@@ -258,6 +259,10 @@ class AXK3DecoderLayer(_AXK2DecoderLayer):
         x = self.mlp(x)
         hidden_states = self.mlp_gated_residual.write(residual, x, write_gate)
         return hidden_states, None if self.skip_topk else topk_indices
+
+    if envs.VLLM_RBLN_USE_NESTED_COMPILE_REGION:
+        # The region must not write topk_by_layer; forward returns its top-k instead.
+        forward = torch.compiler.nested_compile_region(forward)
 
 
 @support_torch_compile
