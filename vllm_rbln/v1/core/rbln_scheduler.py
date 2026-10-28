@@ -140,7 +140,14 @@ class RBLNScheduler(Scheduler):
         A range attends to itself both ways, which a compiled graph can only do
         over a step holding that range alone: a chunk starting a range is the
         whole range, and any other chunk stops where the next range begins.
+        long_prefill_token_threshold caps only the latter, as it sizes the text
+        prefill graph and a range is padded to a length of its own.
         """
+        threshold = self.scheduler_config.long_prefill_token_threshold
+        if threshold > 0:
+            text_tokens = min(num_new_tokens, threshold)
+        else:
+            text_tokens = num_new_tokens
         for feature in request.mm_features:
             if feature.modality not in ("image", "video"):
                 continue
@@ -156,8 +163,8 @@ class RBLNScheduler(Scheduler):
                     "a prefill chunk stopped inside an mm prefix range"
                 )
                 if num_computed_tokens < first:
-                    return min(num_new_tokens, first - num_computed_tokens)
-        return num_new_tokens
+                    return min(text_tokens, first - num_computed_tokens)
+        return text_tokens
 
     def _decode_demand(self) -> int:
         """Total decode demand for this step's soft (ceil(demand/pp)) cap.
@@ -312,8 +319,10 @@ class RBLNScheduler(Scheduler):
             ):
                 req_index += 1
                 continue
-            if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
-                num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+            mm_prefix = self._is_mm_prefix_lm and request.has_encoder_inputs
+            threshold = self.scheduler_config.long_prefill_token_threshold
+            if not mm_prefix and 0 < threshold < num_new_tokens:
+                num_new_tokens = threshold
             num_new_tokens = min(num_new_tokens, token_budget)
 
             # Make sure the input position does not exceed the max model len.
@@ -324,7 +333,7 @@ class RBLNScheduler(Scheduler):
 
             # Cut before scheduling encoder inputs, so that only the items this
             # chunk overlaps are scheduled.
-            if self._is_mm_prefix_lm and request.has_encoder_inputs:
+            if mm_prefix:
                 num_new_tokens = self._mm_prefix_split(
                     request, request.num_computed_tokens, num_new_tokens
                 )
@@ -665,8 +674,9 @@ class RBLNScheduler(Scheduler):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
+                    mm_prefix = self._is_mm_prefix_lm and request.has_encoder_inputs
                     threshold = self.scheduler_config.long_prefill_token_threshold
-                    if 0 < threshold < num_new_tokens:
+                    if not mm_prefix and 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
 
                     # chunked prefill has to be enabled explicitly to allow
@@ -707,7 +717,7 @@ class RBLNScheduler(Scheduler):
                         # (see the step-phase section in v1/core/utils.py).
                         break
 
-                    if self._is_mm_prefix_lm and request.has_encoder_inputs:
+                    if mm_prefix:
                         num_new_tokens = self._mm_prefix_split(
                             request, num_computed_tokens, num_new_tokens
                         )
