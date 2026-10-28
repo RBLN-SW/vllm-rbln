@@ -17,13 +17,56 @@ physical block per request and prefix caching disabled, unlike the base."""
 
 from collections import defaultdict
 from types import SimpleNamespace
+from typing import TypeAlias
 
 import pytest
 import torch
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
-from vllm_rbln.v1.kv_cache import RBLNSlidingWindowManager, RBLNSlidingWindowSpec
+from vllm_rbln.v1.kv_cache import (
+    RBLNAppendSlidingWindowSpec,
+    RBLNFullAttentionSpec,
+    RBLNSlidingWindowManager,
+    RBLNSlidingWindowSpec,
+)
+
+_TransferSpec: TypeAlias = (
+    RBLNFullAttentionSpec | RBLNAppendSlidingWindowSpec | RBLNSlidingWindowSpec
+)
+
+
+@pytest.mark.parametrize("use_custom_kernel", [False, True])
+@pytest.mark.parametrize(
+    "spec_cls",
+    [RBLNFullAttentionSpec, RBLNAppendSlidingWindowSpec, RBLNSlidingWindowSpec],
+)
+def test_transfer_regions_alias_native_cache(
+    use_custom_kernel: bool, spec_cls: type[_TransferSpec]
+) -> None:
+    """B=2 leaves shape ambiguous; the selected kernel determines each region."""
+    kwargs = {} if spec_cls is RBLNFullAttentionSpec else {"sliding_window": 4}
+    spec = spec_cls(
+        block_size=4,
+        num_kv_heads=3,
+        head_size=5,
+        dtype=torch.float32,
+        kv_cache_block_axis=int(use_custom_kernel),
+        **kwargs,
+    )
+    native = torch.arange(2 * 2 * 3 * 4 * 5, dtype=torch.float32).view(2, 2, 3, 1, 4, 5)
+    regions = spec.get_kv_cache_transfer_regions(native)
+    assert tuple(regions) == ("key", "value")
+    for region in regions.values():
+        assert region.shape == (2, 3, 4, 5)
+        assert (
+            region.untyped_storage().data_ptr() == native.untyped_storage().data_ptr()
+        )
+    key_before = regions["key"].clone()
+    regions["value"].fill_(13)
+    value_native = native[1] if use_custom_kernel else native[:, 1]
+    assert torch.all(value_native == 13)
+    torch.testing.assert_close(regions["key"], key_before)
 
 
 def _spec(*, block_size=16, sliding_window=16):
@@ -328,3 +371,27 @@ class TestCoordinatorCallsTheOverrides:
         coord.allocate_new_blocks("r", num_tokens=1024, num_tokens_main_model=1024)
         coord.remove_skipped_blocks("r", 512, 1024)
         assert len(coord.single_type_managers[0].req_to_blocks["r"]) == 1
+
+
+@pytest.mark.parametrize(
+    "spec_cls",
+    [RBLNFullAttentionSpec, RBLNAppendSlidingWindowSpec, RBLNSlidingWindowSpec],
+)
+def test_transfer_region_layout_survives_spec_merge(
+    spec_cls: type[_TransferSpec],
+) -> None:
+    """Upstream merge reconstruction must not reset the Triton block axis."""
+    kwargs = {} if spec_cls is RBLNFullAttentionSpec else {"sliding_window": 4}
+    spec = spec_cls(
+        block_size=4,
+        num_kv_heads=3,
+        head_size=5,
+        dtype=torch.float32,
+        kv_cache_block_axis=1,
+        **kwargs,
+    )
+    merged = spec_cls.merge([spec, spec])
+    native = torch.arange(240, dtype=torch.float32).view(2, 2, 3, 1, 4, 5)
+    torch.testing.assert_close(
+        merged.get_kv_cache_transfer_regions(native)["value"], native[1, :, :, 0]
+    )
