@@ -14,8 +14,8 @@
 
 # The worker side of the connector: what a producer saves into the shared region
 # is what a consumer loads from it, and both are reported on the same step. The
-# scheduler side and the NIXL transfer are upstream's; only NIXL being on is
-# checked here.
+# scheduler side and the NIXL transfer are upstream's; only which roles get NIXL
+# is checked here.
 
 import uuid
 from types import SimpleNamespace
@@ -50,7 +50,7 @@ def connect(monkeypatch, instance_id):
     """Build connectors that share one region, and clean it up."""
     connectors = []
 
-    def build(*, producer, tp_rank=0, role=ECConnectorRole.WORKER):
+    def build(*, ec_role, tp_rank=0, role=ECConnectorRole.WORKER):
         monkeypatch.setattr(
             cpu_worker, "get_tensor_model_parallel_rank", lambda: tp_rank
         )
@@ -73,7 +73,7 @@ def connect(monkeypatch, instance_id):
             ),
             ec_transfer_config=ECTransferConfig(
                 ec_connector="RblnECCPUConnector",
-                ec_role="ec_producer" if producer else "ec_consumer",
+                ec_role=ec_role,
                 ec_connector_extra_config={"ec_cpu_bytes": 8 * HIDDEN * 2},
             ),
         )
@@ -96,23 +96,26 @@ def _step(connector, metadata, run):
 
 
 def test_the_rbln_runner_gets_the_host_copy_worker(connect):
-    assert isinstance(connect(producer=True).connector_worker, RblnECCPUWorker)
+    assert isinstance(connect(ec_role="ec_producer").connector_worker, RblnECCPUWorker)
 
 
-@pytest.mark.parametrize("producer", [True, False])
-def test_nixl_is_on_without_ec_enable_nixl(connect, monkeypatch, producer):
+@pytest.mark.parametrize(
+    ("ec_role", "nixl"),
+    [("ec_producer", True), ("ec_consumer", True), ("ec_both", False)],
+)
+def test_nixl_without_ec_enable_nixl(connect, monkeypatch, ec_role, nixl):
     setups = []
     monkeypatch.setattr(
         ECCPUScheduler, "_setup_nixl", lambda self, cfg: setups.append(cfg)
     )
 
-    connect(producer=producer, role=ECConnectorRole.SCHEDULER)
+    connect(ec_role=ec_role, role=ECConnectorRole.SCHEDULER)
 
-    assert len(setups) == 1
+    assert len(setups) == int(nixl)
 
 
 def test_a_saved_output_loads_back_as_is(connect):
-    producer, consumer = connect(producer=True), connect(producer=False)
+    producer, consumer = connect(ec_role="ec_producer"), connect(ec_role="ec_consumer")
     embeds = torch.arange(3 * HIDDEN, dtype=torch.bfloat16).reshape(3, HIDDEN)
     # One block per placeholder, which can outnumber the embeddings.
     block_ids = [5, 2, 3, 7]
@@ -136,7 +139,7 @@ def test_a_saved_output_loads_back_as_is(connect):
 
 
 def test_only_tp_rank_0_saves(connect):
-    producer = connect(producer=True, tp_rank=1)
+    producer = connect(ec_role="ec_producer", tp_rank=1)
     embeds = torch.ones(1, HIDDEN, dtype=torch.bfloat16)
 
     saved = _step(
@@ -151,7 +154,7 @@ def test_only_tp_rank_0_saves(connect):
 
 def test_an_output_in_another_dtype_is_refused(connect):
     # A load reads the bytes back in the model dtype.
-    producer = connect(producer=True)
+    producer = connect(ec_role="ec_producer")
     embeds = torch.ones(1, HIDDEN // 2, dtype=torch.float32)
     producer.bind_connector_metadata(ECCPUConnectorMetadata(saves={"img": [0]}))
 

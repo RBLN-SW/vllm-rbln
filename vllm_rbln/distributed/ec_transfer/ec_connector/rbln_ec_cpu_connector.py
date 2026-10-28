@@ -114,8 +114,10 @@ class RblnECCPUConnector(ECCPUConnector):
         return RblnECCPUWorker(vllm_config)
 
     def _make_scheduler(self, vllm_config: "VllmConfig") -> "ECCPUScheduler":
-        # NOTE(RBLN): RBLN transfers only through NIXL, so ec_enable_nixl is
-        # always on.
-        extra_config = vllm_config.ec_transfer_config.ec_connector_extra_config
-        extra_config["ec_enable_nixl"] = True
+        # NOTE(RBLN): a producer and a consumer reach each other only through
+        # NIXL, so it is always on for them. ec_both keeps upstream's default,
+        # a CPU tier of its own.
+        ec_config = vllm_config.ec_transfer_config
+        if ec_config.ec_role != "ec_both":
+            ec_config.ec_connector_extra_config["ec_enable_nixl"] = True
         return super()._make_scheduler(vllm_config)

@@ -739,7 +739,8 @@ class TestEcConsumer:
         assert runner.ec_connector_output is None
 
     @pytest.mark.parametrize(
-        ("ec_role", "compiled"), [(None, True), ("ec_consumer", False)]
+        ("ec_role", "compiled"),
+        [(None, True), ("ec_consumer", False), ("ec_both", True)],
     )
     def test_the_encoder_is_compiled_only_where_it_runs(
         self, monkeypatch, ec_role, compiled
