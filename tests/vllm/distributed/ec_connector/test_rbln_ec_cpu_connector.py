@@ -14,7 +14,8 @@
 
 # The worker side of the connector: what a producer saves into the shared region
 # is what a consumer loads from it, and both are reported on the same step. The
-# scheduler side and the NIXL transfer are upstream's and are not exercised here.
+# scheduler side and the NIXL transfer are upstream's; only NIXL being on is
+# checked here.
 
 import uuid
 from types import SimpleNamespace
@@ -22,11 +23,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 import vllm.distributed.ec_transfer.ec_connector.cpu.worker as cpu_worker
+from vllm.config import ECTransferConfig
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorRole
 from vllm.distributed.ec_transfer.ec_connector.cpu.common import (
     ECCPUConnectorMetadata,
     ECCPUWorkerMetadata,
 )
+from vllm.distributed.ec_transfer.ec_connector.cpu.scheduler import ECCPUScheduler
 from vllm.distributed.ec_transfer.ec_connector.factory import ECConnectorFactory
 
 from vllm_rbln.distributed.ec_transfer.ec_connector.rbln_ec_cpu_connector import (
@@ -44,10 +47,10 @@ def instance_id():
 
 @pytest.fixture
 def connect(monkeypatch, instance_id):
-    """Build worker-side connectors that share one region, and clean it up."""
+    """Build connectors that share one region, and clean it up."""
     connectors = []
 
-    def build(*, producer, tp_rank=0):
+    def build(*, producer, tp_rank=0, role=ECConnectorRole.WORKER):
         monkeypatch.setattr(
             cpu_worker, "get_tensor_model_parallel_rank", lambda: tp_rank
         )
@@ -57,19 +60,24 @@ def connect(monkeypatch, instance_id):
         vllm_config = SimpleNamespace(
             instance_id=instance_id,
             use_v2_model_runner=False,
-            parallel_config=SimpleNamespace(data_parallel_index=0),
+            parallel_config=SimpleNamespace(
+                data_parallel_index=0,
+                tensor_parallel_size=1,
+                prefill_context_parallel_size=1,
+                distributed_executor_backend="uni",
+            ),
             model_config=SimpleNamespace(
                 dtype=torch.bfloat16,
                 hf_config=SimpleNamespace(),
                 get_inputs_embeds_size=lambda: HIDDEN,
             ),
-            ec_transfer_config=SimpleNamespace(
-                is_ec_producer=producer,
-                is_ec_consumer=not producer,
+            ec_transfer_config=ECTransferConfig(
+                ec_connector="RblnECCPUConnector",
+                ec_role="ec_producer" if producer else "ec_consumer",
                 ec_connector_extra_config={"ec_cpu_bytes": 8 * HIDDEN * 2},
             ),
         )
-        connector = RblnECCPUConnector(vllm_config, ECConnectorRole.WORKER)
+        connector = RblnECCPUConnector(vllm_config, role)
         connectors.append(connector)
         return connector
 
@@ -89,6 +97,18 @@ def _step(connector, metadata, run):
 
 def test_the_rbln_runner_gets_the_host_copy_worker(connect):
     assert isinstance(connect(producer=True).connector_worker, RblnECCPUWorker)
+
+
+@pytest.mark.parametrize("producer", [True, False])
+def test_nixl_is_on_without_ec_enable_nixl(connect, monkeypatch, producer):
+    setups = []
+    monkeypatch.setattr(
+        ECCPUScheduler, "_setup_nixl", lambda self, cfg: setups.append(cfg)
+    )
+
+    connect(producer=producer, role=ECConnectorRole.SCHEDULER)
+
+    assert len(setups) == 1
 
 
 def test_a_saved_output_loads_back_as_is(connect):

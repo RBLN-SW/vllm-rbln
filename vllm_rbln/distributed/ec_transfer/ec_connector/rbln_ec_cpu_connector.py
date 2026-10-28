@@ -35,6 +35,7 @@ from vllm.distributed.ec_transfer.ec_connector.cpu.worker import ECCPUWorker
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.distributed.ec_transfer.ec_connector.cpu.scheduler import ECCPUScheduler
 
 
 class RblnECCPUWorker(ECCPUWorker):
@@ -111,3 +112,10 @@ class RblnECCPUConnector(ECCPUConnector):
 
     def _make_worker(self, vllm_config: "VllmConfig") -> RblnECCPUWorker:
         return RblnECCPUWorker(vllm_config)
+
+    def _make_scheduler(self, vllm_config: "VllmConfig") -> "ECCPUScheduler":
+        # NOTE(RBLN): RBLN transfers only through NIXL, so ec_enable_nixl is
+        # always on.
+        extra_config = vllm_config.ec_transfer_config.ec_connector_extra_config
+        extra_config["ec_enable_nixl"] = True
+        return super()._make_scheduler(vllm_config)
