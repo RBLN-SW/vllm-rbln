@@ -10,14 +10,17 @@
 """A.X K3 on top of the vendored A.X K2 model.
 
 K3 keeps K2's gated MLA (fused output gate in q_b_proj), DSA indexer and MoE,
-and changes three things, all following the checkpoint's ``modeling_axk3.py``:
+and changes two things, both following the checkpoint's ``modeling_axk3.py``:
 
 - Gated Residual replaces both pre-norms and ``model.norm``: the residual is
   ``num_streams`` copies of the hidden state, each block reads a gated mean of
   them and writes its output back with a per-stream gate.
 - Index-share: only every ``index_topk_freq``-th layer owns an indexer; the
   others reuse the top-k of their source layer from the same forward.
-- The indexer reads the pre-``q_a_layernorm`` q latent (K2 feeds the normed one).
+
+The indexer reads the post-``q_a_layernorm`` q latent, as in K2. The
+checkpoint's ``modeling_axk3.py`` feeds it the pre-norm one, which the trained
+weights do not match.
 """
 
 import contextlib
@@ -156,7 +159,7 @@ def _gated_mla_forward(
     """K2's gated MLA forward, returning the top-k it attended with.
 
     ``mla`` is the AXK2GatedMultiHeadLatentAttentionWrapper. A layer that owns
-    an indexer computes the top-k from the pre-norm q latent; a skip layer is
+    an indexer computes the top-k from the post-norm q latent; a skip layer is
     handed its source layer's top-k.
     """
     batch_size, seq_len, _ = hidden_states.shape
@@ -184,9 +187,7 @@ def _gated_mla_forward(
     k_pe = k_pe.squeeze(2)
 
     if mla.indexer is not None:
-        topk_indices = mla.indexer(
-            hidden_states, q_c_prenorm, positions, mla.indexer_rope_emb
-        )
+        topk_indices = mla.indexer(hidden_states, q_c, positions, mla.indexer_rope_emb)
 
     attn_out = mla.mla_attn(
         q,
