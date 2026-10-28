@@ -459,7 +459,7 @@ class TestRejectedConfigs:
         def role(ec_role, mm_encoder_only):
             def mutate(config):
                 config.ec_transfer_config = ECTransferConfig(
-                    ec_connector="RblnECNixlConnector", ec_role=ec_role
+                    ec_connector="RblnECCPUConnector", ec_role=ec_role
                 )
                 config.model_config.multimodal_config = SimpleNamespace(
                     mm_encoder_only=mm_encoder_only

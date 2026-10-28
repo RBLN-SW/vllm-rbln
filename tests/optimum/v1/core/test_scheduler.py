@@ -16,6 +16,7 @@ from concurrent.futures import Future
 from unittest.mock import Mock
 
 import pytest
+from vllm.multimodal.inputs import PlaceholderRange
 from vllm.v1.request import RequestStatus
 
 from .utils import create_model_runner_output, create_requests, create_scheduler
@@ -319,3 +320,71 @@ def test_cache_slot_id_freed_on_preemption():
     scheduler.finish_requests(requests[0].request_id, RequestStatus.FINISHED_STOPPED)
     output = scheduler.schedule()
     assert output.cache_slot_id_dict == {"1": 0}
+
+
+def _mm_requests(num_requests: int, num_items: int = 1):
+    return create_requests(
+        num_requests=num_requests,
+        mm_hashes_list=[
+            [f"img{i}_{j}" for j in range(num_items)] for i in range(num_requests)
+        ],
+        mm_positions=[
+            [PlaceholderRange(offset=2 * j, length=2) for j in range(num_items)]
+            for _ in range(num_requests)
+        ],
+    )
+
+
+def _ec_connector(in_transit: set[str] | None = None) -> Mock:
+    connector = Mock()
+    connector.ensure_cache_available.side_effect = (
+        lambda request, num_computed_tokens: request.request_id
+        not in (in_transit or set())
+    )
+    connector.has_cache_item.return_value = False
+    connector.request_finished.return_value = (False, None)
+    connector.take_unavailable_requests.return_value = set()
+    return connector
+
+
+def test_a_request_waits_while_its_encoder_outputs_are_in_transit():
+    scheduler = create_scheduler()
+    in_transit = {"0"}
+    scheduler.ec_connector = _ec_connector(in_transit)
+    for request in _mm_requests(2):
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    assert [req.req_id for req in output.scheduled_new_reqs] == ["1"]
+    scheduler.update_from_output(output, create_model_runner_output(output))
+
+    in_transit.clear()
+    output = scheduler.schedule()
+    assert [req.req_id for req in output.scheduled_new_reqs] == ["0"]
+
+
+def test_every_item_of_an_admitted_request_reaches_the_connector():
+    # A producer allocates its CPU-tier blocks here, though it never holds a
+    # cache item; a request still waiting gets nothing.
+    scheduler = create_scheduler()
+    connector = _ec_connector()
+    scheduler.ec_connector = connector
+    for request in _mm_requests(2, num_items=2):
+        scheduler.add_request(request)
+
+    scheduler.schedule()
+
+    calls = connector.update_state_after_alloc.call_args_list
+    assert [(c.args[0].request_id, c.args[1]) for c in calls] == [("0", 0), ("0", 1)]
+
+
+def test_the_connector_hears_of_a_finished_request_once():
+    scheduler = create_scheduler()
+    connector = _ec_connector()
+    scheduler.ec_connector = connector
+    (request,) = _mm_requests(1)
+    scheduler.add_request(request)
+
+    scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+
+    connector.request_finished.assert_called_once_with(request)

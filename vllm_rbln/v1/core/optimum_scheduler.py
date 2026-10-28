@@ -415,6 +415,11 @@ class RBLNOptimumScheduler(Scheduler):
                     skip_request(request_queue)
                     continue
 
+                # Skip request with pending mm encoding prefetches
+                if self._ec_transfer_pending(request, 0):
+                    skip_request(request_queue)
+                    continue
+
                 assert request.num_computed_tokens == 0
 
                 # Number of tokens to be scheduled.
@@ -511,12 +516,11 @@ class RBLNOptimumScheduler(Scheduler):
                 # of new_blocks during the decode phase.
                 request.num_computed_tokens = 0
 
-                # EC Connector: track multimodal features that need remote
-                # loading or local encoding for this request.
+                # EC Connector: the whole prompt runs in this step, so every
+                # multimodal item is encoded or loaded now.
                 if self.ec_connector is not None and request.has_encoder_inputs:
-                    for i, feature in enumerate(request.mm_features):
-                        if self.ec_connector.has_cache_item(feature.identifier):
-                            self.ec_connector.update_state_after_alloc(request, i)
+                    for i in range(len(request.mm_features)):
+                        self.ec_connector.update_state_after_alloc(request, i)
 
             # re-queue requests skipped in this pass ahead of older skipped items.
             if step_skipped_kv_holding:
@@ -687,15 +691,7 @@ class RBLNOptimumScheduler(Scheduler):
         )
 
         # Build the connector meta for ECConnector.
-        # Also pre-fetch mm_hashes from the waiting queue so the consumer
-        # can pull encoder caches in the background before they are needed.
         if self.ec_connector is not None:
-            for request in self.waiting:
-                if request.has_encoder_inputs:
-                    for i, feature in enumerate(request.mm_features):
-                        if self.ec_connector.has_cache_item(feature.identifier):
-                            self.ec_connector.update_state_after_alloc(request, i)
-
             ec_meta: ECConnectorMetadata = self.ec_connector.build_connector_meta(
                 scheduler_output
             )
@@ -711,12 +707,10 @@ class RBLNOptimumScheduler(Scheduler):
     def _free_request(
         self, request: Request, delay_free_blocks: bool = False
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-        # Capture mm hashes and notify the EC connector before super()
-        # tears the request down — base._free_blocks deletes self.requests[id]
-        # so we can't recover mm_features afterwards.
+        # Capture mm hashes before super() tears the request down —
+        # base._free_blocks deletes self.requests[id] so we can't recover
+        # mm_features afterwards.
         if request.mm_features:
-            if self.ec_connector is not None:
-                self.ec_connector.request_finished(request)
             self._pending_free_mm_hashes.extend(
                 f.identifier for f in request.mm_features
             )

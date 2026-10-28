@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Upstream's ECCPUConnector on the vllm model path.
+"""Upstream's ECCPUConnector on both model paths.
 
-The RBLN runner encodes and gathers on the host, so the shared region and the
+The RBLN runners encode and gather on the host, so the shared region and the
 encoder cache are both host memory: a save or a load is a plain copy, done when
 the call returns and reported on the same step.
 """
@@ -98,7 +98,7 @@ class RblnECCPUConnector(ECCPUConnector):
 
     def __init__(self, vllm_config: "VllmConfig", role: ECConnectorRole) -> None:
         # NOTE(RBLN): skip ECCPUConnector.__init__, which accepts only the V2
-        # model runner; the RBLN runner returns the EC output on every step,
+        # model runner; the RBLN runners return the EC output on every step,
         # which is what that check asks for.
         ECConnectorBase.__init__(self, vllm_config=vllm_config, role=role)
         self.connector_worker = None
