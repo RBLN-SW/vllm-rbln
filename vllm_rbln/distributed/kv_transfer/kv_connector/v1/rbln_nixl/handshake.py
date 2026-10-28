@@ -771,7 +771,10 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         producer that has stopped answering is touched every step.
 
         Mirrors `NixlBaseConnectorWorker._send_heartbeats` as of vllm 0.30.0,
-        differing only in the `except` body.
+        differing in the `except` body and in a push consumer's handshake being
+        notif-only at any `pp_size`. A full one runs the writing side's checks
+        against a producer it never writes into, and a refusal there fails the
+        PUSH_REG that shares its Future.
         """
         for engine_id, hb_info in metadata.heartbeat_by_engine.items():
             # Proactive handshake (this request may still be in waiting queue) so
@@ -784,7 +787,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                     hb_info.tp_size,
                     hb_info.dcp_size,
                     hb_info.pp_size,
-                    self._hb_handshake_notif_only and hb_info.pp_size > 1,
+                    self._hb_handshake_notif_only,
                 )
                 is not None
             ):

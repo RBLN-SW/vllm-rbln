@@ -5580,8 +5580,7 @@ class TestARefusedPeerLeavesNothingBehind:
                 [ChipletSplitAxis.HEAD, ChipletSplitAxis.TOKEN],
                 [ChipletSplitAxis.TOKEN] * 2,
             ),
-            # The side with more ranks writes: a TP4 push consumer's own heartbeat
-            # handshake against a TP1 producer runs this.
+            # The side with more ranks writes: a TP4 side writing into TP1.
             (
                 RblnNixlPushConnectorWorker,
                 4,
@@ -7532,6 +7531,21 @@ class TestADeadPeerIsReported:
         assert bound.arguments["dcp_size"] == 3
         assert bound.arguments["pp_size"] == 2
         assert bound.arguments["notif_agents_only"] is False
+
+    def test_a_push_consumer_s_heartbeat_handshake_is_notif_only_at_any_pp(self):
+        # A producer without pipeline stages included: a full handshake would
+        # run the writing side's checks, and a refusal there fails the
+        # PUSH_REG waiting on the same handshake.
+        w = self._worker()
+        w._hb_handshake_notif_only = True
+
+        w._send_heartbeats(self._heartbeat(pp_size=1))
+
+        call = w._ensure_handshake.call_args
+        bound = inspect.signature(NixlBaseConnectorWorker._ensure_handshake).bind(
+            w, *call.args, **call.kwargs
+        )
+        assert bound.arguments["notif_agents_only"] is True
 
     def test_a_failing_heartbeat_fails_that_peers_reads(self):
         w = self._worker()
