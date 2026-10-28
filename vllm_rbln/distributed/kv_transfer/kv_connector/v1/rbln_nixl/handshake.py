@@ -110,7 +110,9 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         self._refuse_decode_context_parallel(remote_dcp_size)
         self._check_mla_constraints(nixl_agent_meta, remote_tp_size)
         areas_l, slices_l, _ = self._local_band(remote_tp_size)
-        areas_r, slices_r = self._peer_band(nixl_agent_meta, remote_tp_size)
+        areas_r, slices_r = self._peer_band(
+            nixl_agent_meta, remote_tp_size, registered_layer_names
+        )
         # Ahead of the prelude, which the handshake checks run after: upstream
         # swallows a handshake exception, so a later raise leaves the peer
         # registered. The layout checks first, which the axes below index by.
@@ -1480,13 +1482,25 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         (slice_ids,) = bands
         return len(slice_ids), len(set(slice_ids)), slice_ids
 
-    @staticmethod
     def _peer_band(
-        nixl_agent_meta: RblnNixlAgentMetadata, remote_tp_size: int
+        self,
+        nixl_agent_meta: RblnNixlAgentMetadata,
+        remote_tp_size: int,
+        registered_layer_names: tuple[str, ...] | list[str] | None,
     ) -> tuple[int, int]:
-        """(areas, slices) every region of a head-banded peer shares; see
-        `_local_band`."""
-        bands = {(len(ids), len(set(ids))) for ids in nixl_agent_meta.kv_area_slices}
+        """(areas, slices) every head-banded region of the peer shares; see
+        `_local_band`. A peer region is the same layer as ours it pairs with, so
+        ours says which of the peer's have a band."""
+        pairs = self._logical_region_pairs(registered_layer_names)
+        banded = [
+            logical_r
+            for logical_l, logical_r in pairs
+            if self._logical_region_kv_heads[logical_l] is not None
+        ] or [logical_r for _, logical_r in pairs]
+        bands = {
+            (len(ids), len(set(ids)))
+            for ids in (nixl_agent_meta.kv_area_slices[r] for r in banded)
+        }
         if len(bands) != 1:
             raise RuntimeError(
                 "RBLN NIXL D2D: the peer's KV cache entries are cut into "

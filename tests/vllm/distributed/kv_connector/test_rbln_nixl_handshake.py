@@ -2801,7 +2801,7 @@ class TestValidateRemoteAgentHandshake:
         meta = self._meta(pp_size=1, n_regions=56)
 
         w._local_band(2)
-        w._peer_band(meta, 2)
+        w._peer_band(meta, 2, None)
         with pytest.raises(RuntimeError, match="MLA is not supported"):
             w._validate_remote_agent_handshake(meta, remote_tp_size=2)
 
@@ -2998,7 +2998,7 @@ class TestHeadBandMatching:
         meta = self._meta(areas=4, slices=2, n_logical=2, block_len=512)
         meta.kv_area_slices = [[0, 0, 1, 1], [1, 0, 1, 0]]
 
-        assert RblnNixlPullConnectorWorker._peer_band(meta, 1) == (4, 2)
+        assert w._peer_band(meta, 1, None) == (4, 2)
         out = w._build_head_matched_remote(meta, remote_tp_rank=0, remote_tp_size=1)
         # A read takes a slice's first holder: area 0 of region 0, area 1 of
         # region 1.
@@ -5241,27 +5241,72 @@ class TestARefusedPeerLeavesNothingBehind:
         w._logical_region_latent = [False, True]
         return w
 
-    @pytest.mark.parametrize("peer_tp", [4, 1])
-    def test_a_latent_cut_unlike_its_attention_is_refused_by_the_bands_unregistered(
-        self, peer_tp
+    @pytest.mark.parametrize(
+        ("ours_tp", "peer_tp"),
+        [(4, 1), (1, 4)],
+        ids=["finer_registers", "coarser_registers"],
+    )
+    @pytest.mark.parametrize(
+        ("finer", "coarser"),
+        [
+            # A latent cut finer than the attention beside it.
+            (
+                ((ChipletSplitAxis.HEAD, 2), (ChipletSplitAxis.TOKEN, 4)),
+                ((ChipletSplitAxis.HEAD, 4), (ChipletSplitAxis.TOKEN, 4)),
+            ),
+            # An uncut latent, recorded on HEAD with one slice.
+            (
+                ((ChipletSplitAxis.TOKEN, 4), (ChipletSplitAxis.HEAD, 1)),
+                ((ChipletSplitAxis.HEAD, 4), (ChipletSplitAxis.HEAD, 1)),
+            ),
+        ],
+        ids=["token_cut", "uncut"],
+    )
+    def test_a_latent_cut_unlike_its_attention_reaches_registration_both_ways(
+        self, ours_tp, peer_tp, finer, coarser
     ):
-        # The peer's latent is cut into more slices than its attention, which
-        # no one band describes, whether the side sending it has more ranks or
-        # fewer. Entered where the handshake enters.
-        w = self._mixed_worker()
+        # Neither band counts a latent, which pairs by its own slices, so the
+        # same two engines register each other in either direction.
+        ours, theirs = (finer, coarser) if ours_tp > peer_tp else (coarser, finer)
+        w = self._worker()
+        del w._check_mla_constraints
+        del w._check_split_axis_constraints
         del w._is_head_matched_peer
+        w.use_mla = False
+        w.use_host_buffer = False
+        w.transfer_topo.tp_size = ours_tp
+        w.transfer_topo.tp_ratio = MagicMock(
+            return_value=ours_tp // peer_tp or -(peer_tp // ours_tp)
+        )
+        fill_region_geometry(
+            w,
+            areas=4,
+            axes=[axis for axis, _ in ours],
+            slices=[slices for _, slices in ours],
+            latent=[False, True],
+        )
+        w.block_size = 16
+        w._logical_region_kv_heads = [8, None]
+        w.local_seen_layer_names = ["l0", "l1"]
         meta = _agent_meta(
             engine_id="peer",
             kv_areas=4,
-            kv_split_axes=[ChipletSplitAxis.HEAD, ChipletSplitAxis.TOKEN],
-            kv_area_slices=[[0, 0, 1, 1], [0, 1, 2, 3]],
+            kv_split_axes=[axis for axis, _ in theirs],
+            kv_area_slices=[area_slices(4, slices, 1)[0] for _, slices in theirs],
+            region_names=["l0"] * 4 + ["l1"] * 4,
+            block_lens=[8192] * 8,
+            kv_caches_base_addr=[0x1000 * (i + 1) for i in range(8)],
         )
 
-        with pytest.raises(RuntimeError, match="the peer's KV cache entries are cut"):
+        with (
+            patch.object(
+                RblnNixlPullConnectorWorker,
+                "_register_remote_engine_prelude",
+                side_effect=AssertionError("reached the prelude"),
+            ),
+            pytest.raises(AssertionError, match="reached the prelude"),
+        ):
             w._add_remote_agent_head_matched(meta, 0, peer_tp, meta.dcp_size)
-
-        w.transfer_topo.register_remote_engine.assert_not_called()
-        w.nixl_wrapper.add_remote_agent.assert_not_called()
 
     def test_two_context_cuts_are_refused_by_their_axis_unregistered(self):
         # Through the real check, ahead of the head-cut check, which would
@@ -5714,7 +5759,6 @@ class TestARefusedPeerLeavesNothingBehind:
             kv_split_axes=[ChipletSplitAxis.HEAD, ChipletSplitAxis.TOKEN][
                 -len(layers) :
             ],
-            # One band over the peer's regions (`_peer_band`).
             kv_area_slices=[peer_latent, peer_latent][-len(layers) :],
             region_names=[name for name in layers for _ in range(4)],
             block_lens=[8192] * 4 * len(layers),
@@ -6480,10 +6524,11 @@ class TestHeadMatchedAgentRegistration:
 
     def test_a_peer_whose_regions_differ_in_geometry_is_refused(self):
         # The same holds for the peer: one split serves all of its regions.
+        w = self._slice_worker(slices=[4, 4], kv_heads=[8, 8])
         meta = SimpleNamespace(kv_area_slices=[[0, 1, 2, 3], [0, 0, 1, 1]])
 
         with pytest.raises(RuntimeError, match="the peer's KV cache entries"):
-            RblnNixlPullConnectorWorker._peer_band(meta, 2)
+            w._peer_band(meta, 2, None)
 
     def test_uniform_slice_counts_are_not_refused(self):
         # A differing KV geometry is supported; only a differing chiplet CUT is
@@ -6499,6 +6544,18 @@ class TestHeadMatchedAgentRegistration:
         w = self._slice_worker(slices=[4, 4, 1, 1], kv_heads=[8, 8, None, None])
 
         assert w._local_band(2) == (4, 4, (0, 1, 2, 3))
+
+    def test_a_peer_region_paired_with_one_of_ours_without_a_band_is_not_counted(
+        self,
+    ):
+        # A peer region is the layer of ours it pairs with, so ours says which
+        # of the peer's band by head. The peer stage starts at our l1, so its
+        # region 0 is the one without a band.
+        w = self._slice_worker(slices=[2, 4, 2], kv_heads=[8, None, 8])
+        w.local_seen_layer_names = ["l0", "l1", "l2"]
+        meta = SimpleNamespace(kv_area_slices=[[0, 1, 2, 3], [0, 0, 1, 1]])
+
+        assert w._peer_band(meta, 2, ("l1", "l2")) == (4, 2)
 
     def test_a_peer_with_a_different_tp_degree_is_routed_to_head_matching(self):
         # The fork every head-matched path hangs off: unequal TP means position
