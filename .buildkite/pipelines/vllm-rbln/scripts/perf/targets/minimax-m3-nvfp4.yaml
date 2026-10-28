@@ -11,6 +11,7 @@ serve:
   max_num_batched_tokens: 512
   max_num_seqs: 4
   enable_prefix_caching: false
+  mm_processor_cache_gb: 0
   kv_cache_dtype: fp8
   limit_mm_per_prompt: '{"image": 1, "video": 0}'
 
