@@ -42,6 +42,7 @@ from vllm.model_executor.models.utils import (
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
+from vllm_rbln import envs
 from vllm_rbln.patches.axk2 import model as _axk2_model
 
 # Loaded at import time from the frozen copy, so mypy cannot see its classes
@@ -242,7 +243,7 @@ class AXK3DecoderLayer(_AXK2DecoderLayer):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         topk_by_layer: dict[int, torch.Tensor],
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         residual = hidden_states
         x, write_gate = self.attn_gated_residual.read(hidden_states)
         x, topk_indices = _gated_mla_forward(
@@ -251,13 +252,17 @@ class AXK3DecoderLayer(_AXK2DecoderLayer):
             x,
             topk_by_layer[self.index_source_layer] if self.skip_topk else None,
         )
-        topk_by_layer[self.layer_idx] = topk_indices
         hidden_states = self.attn_gated_residual.write(residual, x, write_gate)
 
         residual = hidden_states
         x, write_gate = self.mlp_gated_residual.read(hidden_states)
         x = self.mlp(x)
-        return self.mlp_gated_residual.write(residual, x, write_gate)
+        hidden_states = self.mlp_gated_residual.write(residual, x, write_gate)
+        return hidden_states, None if self.skip_topk else topk_indices
+
+    if envs.VLLM_RBLN_USE_NESTED_COMPILE_REGION:
+        # The region must not write topk_by_layer; forward returns its top-k instead.
+        forward = torch.compiler.nested_compile_region(forward)
 
 
 @support_torch_compile
@@ -336,7 +341,9 @@ class AXK3Model(nn.Module):
         # `make_layers` pads the list to the full depth with `PPMissingLayer`,
         # which returns its first argument; walk only the layers this rank built.
         for layer in islice(self.layers, self.start_layer, self.end_layer):
-            hidden_states = layer(positions, hidden_states, topk_by_layer)
+            hidden_states, topk_indices = layer(positions, hidden_states, topk_by_layer)
+            if topk_indices is not None:
+                topk_by_layer[layer.layer_idx] = topk_indices
 
         hidden_states, _ = self.final_gated_residual.read(hidden_states)
         return hidden_states
