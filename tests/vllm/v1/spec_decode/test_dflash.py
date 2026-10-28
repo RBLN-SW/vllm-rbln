@@ -35,6 +35,7 @@ import pytest
 import torch
 from vllm.v1.spec_decode.dflash import DFlashProposer
 
+import vllm_rbln.platform as platform
 import vllm_rbln.v1.spec_decode.dflash as dflash_module
 from tests.vllm.v1.spec_decode.utils import make_cad
 from vllm_rbln.config import RBLNConfig
@@ -185,7 +186,7 @@ class TestSchedulerCapacity:
             proposer.dflash_causal = False
 
         monkeypatch.setattr(DFlashProposer, "__init__", initialize_base)
-        monkeypatch.setattr(dflash_module, "USE_DEVICE_TENSOR", True)
+        monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", True)
         vllm_config = SimpleNamespace(
             scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
             additional_config=RBLNConfig(),
@@ -319,7 +320,7 @@ class TestPlatformRefusals:
     def test_host_visible_cache_is_required(self, monkeypatch):
         """Without device tensors the cache is on `meta` and the context write
         is dropped without an error."""
-        monkeypatch.setattr(dflash_module, "USE_DEVICE_TENSOR", False)
+        monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", False)
         with pytest.raises(NotImplementedError, match="USE_DEVICE_TENSOR"):
             self._construct()
 

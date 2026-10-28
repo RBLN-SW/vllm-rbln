@@ -20,6 +20,7 @@ from typing import Any, TypeVar, cast
 import rebel
 import torch
 from rebel import CompileContext
+from torch._dynamo.variables.invoke_subgraph import InvokeSubgraphHigherOrderVariable
 from vllm.distributed import get_dp_group, get_pp_group, get_tp_group
 
 from vllm_rbln import envs
@@ -41,6 +42,12 @@ def _ensure_torch_dynamo_configured() -> None:
     # If this flag is set, nn.modules parameters are treated as model input.
     torch._dynamo.config.inline_inbuilt_nn_modules = False
     torch._dynamo.config.cache_size_limit = 64
+    if envs.VLLM_RBLN_USE_NESTED_COMPILE_REGION:
+        # Preserve decoder boundaries even when Dynamo cannot reuse their bodies.
+        torch._dynamo.config.inline_single_use_invoke_subgraph = False
+        # Fail at a side effect inside a region. Allowing it exposes region
+        # intermediates, and the error then surfaces at an unrelated alias.
+        InvokeSubgraphHigherOrderVariable.allow_side_effects = False
 
     _DYNAMO_CONFIGURED = True
 

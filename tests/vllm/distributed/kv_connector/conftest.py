@@ -77,6 +77,8 @@ def make_worker(monkeypatch, tmp_path_factory):
         swa_window_mode: bool = False,
         register: bool = True,
         stripe_width: int | None = None,
+        chunk_mode: bool = False,
+        prefill_step: int | None = None,
     ) -> Any:
         geometry = kv_cache or KvGeometry()
         config = engine_config(
@@ -93,6 +95,14 @@ def make_worker(monkeypatch, tmp_path_factory):
         # during __init__, and later production calls read it again.
         stack.enter_context(set_current_vllm_config(config))
         set_connector_options(monkeypatch, config, swa_window_mode=swa_window_mode)
+        if chunk_mode:
+            set_connector_options(monkeypatch, config, chunk_mode=True)
+        if prefill_step is not None:
+            # The config is shared across tests (`engine_config` caches it), so
+            # the step a chunk is floored by is set for this test only.
+            monkeypatch.setattr(
+                config.scheduler_config, "max_num_batched_tokens", prefill_step
+            )
 
         if geometry.draft_layers:
             assert config.speculative_config is not None, (
@@ -112,10 +122,11 @@ def make_worker(monkeypatch, tmp_path_factory):
         monkeypatch.setattr(
             up_worker, "get_tensor_model_parallel_world_size", lambda: 1
         )
-        # The other device-identity probe (see KvGeometry.kv_caches): the D2D
-        # path asks rebel for the tensor's context pointer, which it hands
-        # straight to the adapter. `aligned_tensor` is a separate name and
-        # stays real, so the host-staging path still allocates for real.
+        # The other device-identity probes (see KvGeometry.kv_caches): the D2D
+        # path asks rebel for the tensor's context pointer and the adapter for
+        # the chiplet buffers its storage sits in. `aligned_tensor` is a
+        # separate name and stays real, so host staging still allocates for
+        # real.
         stack.enter_context(
             patch_in_package(
                 rebel=SimpleNamespace(
@@ -126,9 +137,7 @@ def make_worker(monkeypatch, tmp_path_factory):
 
         kv_caches = geometry.kv_caches()
         monkeypatch.setitem(
-            sys.modules,
-            "nixl_rbln",
-            fake_nixl_rbln(geometry, kv_caches),
+            sys.modules, "nixl_rbln", fake_nixl_rbln(geometry.device_buffers)
         )
 
         cls = (
@@ -140,14 +149,6 @@ def make_worker(monkeypatch, tmp_path_factory):
         # registration always reads an allocated count; leaving it None here
         # would build a state production cannot reach.
         config.cache_config.num_gpu_blocks = geometry.num_blocks
-
-        # What the runner binds before it registers: every layer, unfiltered
-        # (`rbln_model_runner.initialize_kv_cache_tensors`). This is where the
-        # connector reads a sliding-window layer's view.
-        for name, view in geometry.forward_context_caches().items():
-            config.compilation_config.static_forward_context[name] = SimpleNamespace(
-                kv_cache=view
-            )
 
         worker = cls(config, "local-engine", geometry.kv_cache_config())
 

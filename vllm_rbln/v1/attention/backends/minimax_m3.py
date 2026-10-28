@@ -19,8 +19,12 @@ from typing import ClassVar
 import torch
 from vllm.v1.attention.backend import AttentionBackend, MultipleOf
 from vllm.v1.kv_cache_interface import KVCacheSpec
+from vllm.v1.kv_cache_layout import KVCacheLayout
 
-from .flash_attention import RBLNFlashAttentionMetadataBuilder
+from .flash_attention import (
+    RBLNFlashAttentionBackend,
+    RBLNFlashAttentionMetadataBuilder,
+)
 
 MSA_SPARSE_BLOCK_SIZE = 128
 _MSA_KERNEL_BLOCK_SIZE = MultipleOf(4 * MSA_SPARSE_BLOCK_SIZE)
@@ -47,6 +51,10 @@ class RBLNMiniMaxM3SparseBackend(AttentionBackend):
         kv_cache_spec: KVCacheSpec | None = None,
     ) -> list[int | MultipleOf]:
         return [_MSA_KERNEL_BLOCK_SIZE]
+
+    @classmethod
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+        return RBLNFlashAttentionBackend.supported_kv_cache_layouts()
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
@@ -96,6 +104,10 @@ class RBLNMiniMaxM3IndexerBackend(AttentionBackend):
         kv_cache_spec: KVCacheSpec | None = None,
     ) -> list[int | MultipleOf]:
         return [_MSA_KERNEL_BLOCK_SIZE]
+
+    @classmethod
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+        return RBLNMiniMaxM3SparseBackend.supported_kv_cache_layouts()
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:

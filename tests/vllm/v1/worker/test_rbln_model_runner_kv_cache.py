@@ -212,47 +212,13 @@ class TestHostBufferCopyOp:
 
 
 class TestRegisterKvCachesWithConnector:
-    """The connector is handed whatever the runner holds when it is called.
+    """The connector is handed the storage the runner holds when it is called.
 
-    The worker calls it after `initialize_kv_cache` on a run that keeps that
-    cache, and again after a dynamic-KV resize has rebuilt every tensor.
+    Each cache goes out as the runner's own tensor, or as a view of it where
+    connectors need another shape. The worker registers after
+    `initialize_kv_cache` on a run that keeps that cache, and again after a
+    dynamic-KV resize has rebuilt every tensor.
     """
-
-    def test_descriptors_follow_shared_layers_and_rebuilt_caches(
-        self, make_model_runner, monkeypatch, kv_layout_registration_api
-    ):
-        registered = []
-        monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: True)
-        monkeypatch.setattr(
-            mr,
-            "get_kv_transfer_group",
-            lambda: SimpleNamespace(
-                register_kv_caches_with_layouts=lambda caches,
-                layouts: registered.append((caches, layouts)),
-                set_host_xfer_buffer_ops=lambda _op: None,
-            ),
-        )
-        runner = make_model_runner(
-            layers=("layer.0", "layer.1"),
-            kv_sharing={"layer.1": "layer.0"},
-        )
-        runner.register_kv_caches_with_connector()
-        runner.initialize_kv_cache_tensors(
-            runner.kv_cache_config, runner._kernel_block_sizes
-        )
-        runner.register_kv_caches_with_connector()
-
-        first, second = registered
-        assert first[0]["layer.0"] is not second[0]["layer.0"]
-        for caches, layouts in registered:
-            assert set(layouts) == set(caches) == {"layer.0", "layer.1"}
-            assert caches["layer.0"] is caches["layer.1"]
-            assert layouts["layer.0"] is layouts["layer.1"]
-            for name, layout in layouts.items():
-                assert (
-                    caches[name].shape[layout.axes.index(kv_layout_registration_api.KV)]
-                    == 2
-                )
 
     @staticmethod
     def _registrations(monkeypatch) -> list[dict]:
@@ -316,6 +282,33 @@ class TestRegisterKvCachesWithConnector:
             id(t) for t in runner.kv_caches
         ]
 
+    def test_a_flat_cache_is_registered_with_a_unit_trailing_dim(
+        self, make_model_runner, monkeypatch
+    ):
+        # The DSA indexer's fp16 scale cache is allocated [num_blocks,
+        # block_size]. Connectors read every per-token cache with a trailing
+        # width, so they get a [num_blocks, block_size, 1] view of it; the
+        # kernels keep the flat tensor, and every other cache goes out as is.
+        registered = self._registrations(monkeypatch)
+        runner = make_model_runner(
+            layers=("layer.0", "layer.1"),
+            init_kv_cache=False,
+            additional_config={"enable_sub_block_cache": False},
+        )
+        runner.initialize_kv_cache(
+            make_kv_cache_config(runner, groups=[("layer.0", "layer.1")])
+        )
+        flat = torch.zeros(4, 16, dtype=torch.float16)
+        runner.kv_caches[1] = flat
+
+        runner.register_kv_caches_with_connector()
+
+        attn, scale = registered[0].values()
+        assert attn is runner.kv_caches[0]
+        assert tuple(scale.shape) == (4, 16, 1)
+        assert scale.data_ptr() == flat.data_ptr()
+        assert runner.kv_caches[1] is flat
+
     def test_a_rebuilt_cache_is_what_the_second_call_registers(
         self, make_model_runner, monkeypatch
     ):
@@ -366,3 +359,60 @@ class TestBuildAttentionMetadata:
         metadata = attn_metadata["layer.0"]
         assert metadata.kv_caches is runner.kv_caches
         assert metadata.kv_cache_view_infos is None
+
+
+class TestLayerIndexFollowsCachePosition:
+    """A layer reads its cache by `layer_index` into the runner's cache list.
+
+    Construction numbers the layers as if every decoder layer owned
+    `num_attn_module` caches. A layer that owns fewer -- an index-share skip
+    layer with no indexer cache -- shifts every later one, so after binding the
+    runner gives each layer the position the bound list actually has for it.
+    """
+
+    # The fp8 DSA layout, three caches per decoder layer: the attention cache,
+    # the indexer's key cache and its fp16 scale cache. Decoder layer 1 shares
+    # layer 0's top-k and owns the attention cache alone.
+    LAYERS = (
+        "model.layers.0.self_attn.attn",
+        "model.layers.0.self_attn.indexer.k_cache",
+        "model.layers.0.self_attn.indexer.k_cache.scale_cache",
+        "model.layers.1.self_attn.attn",
+        "model.layers.2.self_attn.attn",
+        "model.layers.2.self_attn.indexer.k_cache",
+        "model.layers.2.self_attn.indexer.k_cache.scale_cache",
+    )
+
+    @classmethod
+    def _assert_each_layer_reads_its_own_cache(cls, runner) -> None:
+        forward_context = runner.compilation_config.static_forward_context
+        positions = []
+        for name in cls.LAYERS:
+            layer = forward_context[name]
+            positions.append(layer.layer_index)
+            assert runner.kv_cache_names[layer.layer_index] == name
+            assert runner.kv_caches[layer.layer_index] is layer.kv_cache
+        # One slot each: no two layers resolve to the same cache.
+        assert sorted(positions) == list(range(len(cls.LAYERS)))
+
+    def test_after_initialization_and_after_a_rebind(
+        self, make_model_runner, monkeypatch
+    ):
+        monkeypatch.setattr(mr, "rbln_num_attn_module", lambda *args, **kwargs: 3)
+        runner = make_model_runner(layers=self.LAYERS, init_kv_cache=False)
+
+        runner.initialize_kv_cache(
+            make_kv_cache_config(runner, groups=[(name,) for name in self.LAYERS])
+        )
+        self._assert_each_layer_reads_its_own_cache(runner)
+
+        # A dynamic-KV resize rebuilds every tensor and binds them again.
+        before = list(runner.kv_caches)
+        runner.initialize_kv_cache_tensors(
+            runner.kv_cache_config, runner._kernel_block_sizes
+        )
+
+        assert all(
+            old is not new for old, new in zip(before, runner.kv_caches, strict=True)
+        )
+        self._assert_each_layer_reads_its_own_cache(runner)

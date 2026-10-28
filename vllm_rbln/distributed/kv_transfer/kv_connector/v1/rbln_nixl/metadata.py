@@ -30,7 +30,7 @@ are RBLN, so folding a private version tag into that hash
 """
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, TypeVar
 
@@ -55,8 +55,8 @@ if TYPE_CHECKING:
 # upstream does with ``NIXL_CONNECTOR_VERSION``. Folded into the NIXL compat
 # hash so an RBLN peer on another schema fails the handshake cleanly; earlier
 # bumps are `git log -L` on this line.
-#   9: a coverage range on a push notification, and the unit it counts in
-RBLN_NIXL_CONNECTOR_VERSION: int = 9
+#   10: per logical region, its cut axis and the slice each chiplet area holds
+RBLN_NIXL_CONNECTOR_VERSION: int = 10
 
 # Prefix a push completion notification carries when it names the half-open
 # range this write filled: ``RBLNS:<writer>:<lo>:<hi>:<per_block>:`` ahead of
@@ -66,15 +66,15 @@ RBLN_NIXL_CONNECTOR_VERSION: int = 9
 RBLN_COVERAGE_NOTIF_PREFIX: bytes = b"RBLNS:"
 
 
-class KVSplitAxis(Enum):
+class ChipletSplitAxis(Enum):
     """Which axis the compiler cut a KV entry on across the chiplets.
 
     ``HEAD`` means an area holds some of the shard's KV heads over every token
-    of a block; ``NON_HEAD`` means every head over some of the tokens.
+    of a block; ``TOKEN`` means every head over some of the tokens.
     """
 
     HEAD = 0
-    NON_HEAD = 1
+    TOKEN = 1
 
 
 @dataclass
@@ -89,16 +89,17 @@ class RblnNixlAgentMetadata(NixlAgentMetadata):
 
     pp_rank: int = 0
     pp_size: int = 1
-    # Physical areas one logical region expanded into, and how many of them are
-    # DISTINCT rather than replicas (see `_slice_head_bounds`).
-    kv_areas: int = 1
-    kv_slices: int = 1
-    # The default keeps a blob without this field meaning what versions 2 and 3
-    # meant by the two counts above.
-    kv_split_axis: KVSplitAxis = KVSplitAxis.HEAD
-    # What a block holds (`_kv_per_block`). A process picks the layout, not the
-    # build, so two peers off one build can differ and the version cannot tell
-    # them apart. The default is the layout every version through 4 had.
+    # Per logical region, in region order: the slice each of its chiplet areas
+    # holds, read off the device layout. Areas sharing an id are replicas, so
+    # a region's area count is the list's length and its slice count the ids'.
+    kv_area_slices: list[list[int]] = field(default_factory=list)
+    # Per logical region, in region order: a speculative draft can be cut on
+    # another axis than its target.
+    kv_split_axes: list[ChipletSplitAxis] = field(default_factory=list)
+    # How many of K and V an attention region's block holds (`_kv_per_block`);
+    # a latent's holds one. A process picks the layout, not the build, so two
+    # peers off one build can differ and the version cannot tell them apart.
+    # The default is the layout every version through 4 had.
     kv_per_block: int = 1
     # Tokens a block holds in the view the sliding-window kernel reads. 0 where
     # this shard has no single answer to advertise, which `registration.py`
@@ -294,15 +295,28 @@ class TransferShape:
         Upstream names a region's block once, so a second range needs lists of
         our own. More than one KV group needs them for a different reason -- a
         per-shard list names one of them -- which is why writing part of a
-        block is enough there, with or without a window range.
+        request is enough there, with or without a window range.
         """
         return self.has_window_range or (
-            self.writes_part_of_a_block and self.groups > 1
+            self.writes_part_of_a_request and self.groups > 1
         )
 
     @property
-    def writes_part_of_a_block(self) -> bool:
-        """Whether a write may name less than a whole block."""
+    def cuts_a_block(self) -> bool:
+        """Whether a write cuts a block into chunks.
+
+        Only chunk mode does. A streamed write on its own sends whole blocks:
+        the ones the prefill has closed, and the last one at the handover.
+        """
+        return self.chunk_mode
+
+    @property
+    def writes_part_of_a_request(self) -> bool:
+        """Whether a write may name less than a whole request.
+
+        Part of a block, or a prefix of the request's blocks. Either way the
+        notification has to say which, so the write needs descriptors that can.
+        """
         return self.chunk_mode or self.streams_prefix
 
     @property
@@ -315,7 +329,7 @@ class TransferShape:
         Chunk mode sizes the last block's chunks by it; window mode picks which
         granules of a block the window sits in. Block ids say neither.
         """
-        return self.chunk_mode or self.has_window_range or self.streams_prefix
+        return self.chunk_mode or self.has_window_range
 
 
 def transfer_shape(
@@ -343,7 +357,7 @@ def transfer_shape(
     # would put a window range on lists that never carry one. Host staging
     # holds no areas to put one on either.
     streams_prefix = bool(wants_stream) and writes_into_peer and not use_host_buffer
-    # A write that names part of a block needs a list that can name it: one
+    # A write that names part of a request needs a list that can name it: one
     # group has the per-shard lists, and a hybrid owns the whole-engine ones
     # (`owns_engine_lists`). Groups that are neither have no list to stream in.
     if streams_prefix and len(specs) > 1 and not has_swa:

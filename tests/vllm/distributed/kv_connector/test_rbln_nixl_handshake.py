@@ -28,6 +28,8 @@ import time
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import NamedTuple
 from unittest.mock import MagicMock, call, patch
 
@@ -45,18 +47,18 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 from tests.vllm.distributed.kv_connector.utils import (
+    area_slices,
     build_worker,
+    fill_region_geometry,
     mock_vllm_config,
     patched_in_package,
     set_shape,
     shape,
+    uniform_grid,
     window_mode,
 )
-from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_worker import (
-    RblnNixlWorkerBase,
-)
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
-    KVSplitAxis,
+    ChipletSplitAxis,
     RblnNixlAgentMetadata,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_worker import (
@@ -66,8 +68,12 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.push_worker imp
     RblnNixlPushConnectorWorker,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
+    AreaPlace,
+    ChunkGrid,
+    Piece,
     RblnNixlWorkerState,
     kv_chunk_tokens,
+    pair_area,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.transfer import (
     _chunk_desc_ids,
@@ -82,7 +88,8 @@ def _encode_payload(
     compat="HASH",
     layers_per_stage=1,
     layer_names=None,
-    kv_slices=1,
+    kv_area_slices=None,
+    kv_split_axes=None,
     regions_per_layer=1,
     region_mem_types=None,
 ):
@@ -107,8 +114,15 @@ def _encode_payload(
         pp_rank=pp_rank,
         pp_size=pp_size,
         region_names=list(layer_names),
-        kv_slices=kv_slices,
         region_mem_types=region_mem_types,
+        kv_area_slices=(
+            [[0]] * n_regions if kv_area_slices is None else kv_area_slices
+        ),
+        kv_split_axes=(
+            [ChipletSplitAxis.HEAD] * n_regions
+            if kv_split_axes is None
+            else kv_split_axes
+        ),
     )
     payload = NixlHandshakePayload(
         compatibility_hash=compat,
@@ -118,10 +132,23 @@ def _encode_payload(
 
 
 def _agent_meta(**overrides):
-    """A minimal RblnNixlAgentMetadata for the region-slicing cases."""
+    """A minimal RblnNixlAgentMetadata for the region-slicing cases.
+
+    `kv_areas` and `kv_slices` describe one geometry for every logical region,
+    published as `kv_area_slices` -- one region per axis named, else per
+    `kv_areas` block lengths."""
     # RBLN registers a region's blocks contiguously, so a caller that gives
     # lengths and no strides means the two are the same list.
     block_lens = list(overrides.pop("block_lens", [8192]))
+    areas = overrides.pop("kv_areas", 1)
+    slices = overrides.pop("kv_slices", areas)
+    regions = len(overrides.get("kv_split_axes", ())) or max(
+        1, len(block_lens) // areas
+    )
+    overrides.setdefault("kv_area_slices", area_slices(areas, slices, regions))
+    overrides.setdefault(
+        "kv_split_axes", [ChipletSplitAxis.HEAD] * len(overrides["kv_area_slices"])
+    )
     fields = dict(
         engine_id="eng",
         agent_metadata=b"agent",
@@ -167,7 +194,8 @@ class _FakeSock:
         stage_layers=None,
         tp_size=1,
         peer_stamps=None,
-        kv_slices=1,
+        kv_area_slices=None,
+        kv_split_axes=None,
         regions_per_layer=1,
         region_mem_types=None,
     ):
@@ -184,8 +212,9 @@ class _FakeSock:
         # Optional per-stage layer-name lists (for uneven splits); indexed by
         # pp_rank, since layer ownership is a function of the stage alone.
         self.stage_layers = stage_layers
-        self.kv_slices = kv_slices
         self.region_mem_types = region_mem_types
+        self.kv_area_slices = kv_area_slices
+        self.kv_split_axes = kv_split_axes
         self.queried = []
         self._last = None
 
@@ -209,7 +238,8 @@ class _FakeSock:
             layer_names=(
                 self.stage_layers[self._last] if self.stage_layers is not None else None
             ),
-            kv_slices=self.kv_slices,
+            kv_area_slices=self.kv_area_slices,
+            kv_split_axes=self.kv_split_axes,
             regions_per_layer=self.regions_per_layer,
             region_mem_types=self.region_mem_types,
         )
@@ -219,6 +249,24 @@ class _FakeSock:
             else time.perf_counter()
         )
         return [payload, msgspec.msgpack.encode(stamp)]
+
+
+def _stub_plan(pieces: int, region_ids=(0,)):
+    """A `_head_matched_plan` answer of `pieces` pieces a block per region,
+    for a test about what the handshake does with the count."""
+    piece = Piece(0, 0, 0, 1, 1)
+    return list(region_ids), [[piece] * pieces for _ in region_ids]
+
+
+def _split_plan(region_ids, block_len, split=1, copies=1, rows=1):
+    """A plan cutting each region's block into `split` equal pieces, each sent
+    to `copies` peer copies, in `pair_area`'s order -- for tests about what
+    the lists and the indices do with a plan rather than how one is derived."""
+    sub = block_len // split
+    return list(region_ids), [
+        [Piece(j * sub, 0, 0, sub, rows) for j in range(split) for _ in range(copies)]
+        for _ in region_ids
+    ]
 
 
 def _make_worker(
@@ -233,10 +281,8 @@ def _make_worker(
 ):
     w = object.__new__(cls)
     # Bypassing __init__ skips the layout probe, and a split cache and host
-    # staging both register one K/V per block. `_peer_kv_runs` then asks the
-    # local geometry before it asks the peer's.
+    # staging both register one K/V per block.
     w._kv_per_block = 1
-    w._kv_slices = 1
     # Host staging closes the D2D-only paths -- head matching and fan-in -- so
     # it is the default and a D2D shape has to ask for the device buffer.
     w.use_host_buffer = host_buffer
@@ -255,6 +301,7 @@ def _make_worker(
     w.vllm_config.speculative_config = None
     w.compat_hash = compat
     w.enforce_compat_hash = True
+    w.use_mla = False
     window_mode(
         w, sw_ratio, has_swa=(sw_ratio is not None) if has_swa is None else has_swa
     )
@@ -273,7 +320,8 @@ def _make_worker(
     # Stubbed so the fan-out tests stay on stage enumeration; the body runs for
     # real in TestShardLocalRegions::test_register_shard_xfer_state_keys_the_stage.
     w._register_shard_xfer_state = MagicMock()
-    return w
+    w._logical_region_kv_heads = [8] * 3
+    return fill_region_geometry(w, areas=1, axes=[ChipletSplitAxis.HEAD] * 3)
 
 
 @contextmanager
@@ -435,7 +483,17 @@ def test_peer_meta_block_length_mirrors_the_local_table():
         # `kv_caches` asks the attention backend which axis carries the blocks,
         # and that answer comes off the RBLN config.
         with set_current_vllm_config(engine_config(block_size=geo.block_size)):
-            local = geo.xfer_tables(geo.kv_caches()).block_lens
+            # A blocks-first entry is one region, a K/V-first one two; each
+            # region spreads over the areas.
+            local = [
+                entry.numel()
+                * entry.element_size()
+                // (regions * geo.areas)
+                // geo.num_blocks
+                for entry in geo.kv_caches().values()
+                for regions in [1 if entry.shape[0] == geo.num_blocks else 2]
+                for _ in range(regions * geo.areas)
+            ]
             agent = decoder.decode(peer_meta(geo).agent_metadata_bytes)
         assert list(agent.block_lens) == list(local), geo
 
@@ -471,12 +529,13 @@ def test_peer_meta_names_every_region_the_way_a_producer_does():
     assert agent.registered_layer_names == list(geo.layers)
 
 
-def test_a_replicated_head_band_is_refused_rather_than_mismodelled():
+def test_a_partly_replicated_band_is_refused_rather_than_mismodelled():
     # Regression guard for the refusal in KvGeometry.__post_init__, which owns
-    # the reason the replicated case is not modelled.
+    # the reason a band held by some of the areas is not modelled; a whole
+    # entry on every area is, and the impl tests cover the case between.
     from tests.vllm.distributed.kv_connector.utils import KvGeometry
 
-    with pytest.raises(AssertionError, match="replicated head band"):
+    with pytest.raises(AssertionError, match="replica only of a whole entry"):
         KvGeometry(areas=4, slices=2)
 
 
@@ -516,8 +575,8 @@ class TestSideChannelOverARealSocket:
             sock.close()
             ctx.term()
         # The fields upstream's NixlAgentMetadata does not have: a peer that
-        # dropped them would decode into upstream's type and read as areas 1.
-        assert (meta.kv_areas, meta.kv_slices) == (4, 4)
+        # dropped them would decode into upstream's type and carry no areas.
+        assert {(len(ids), len(set(ids))) for ids in meta.kv_area_slices} == {(4, 4)}
         assert meta.registered_layer_names == list(geo.layers)
 
     def test_a_peer_whose_hash_differs_is_refused(self, make_worker, peer_listener):
@@ -687,6 +746,42 @@ class TestPpHandshakeFanout:
         assert list(sliced.block_lens) == [40, 50]
         assert list(sliced.registered_layer_names) == ["layer.2"]
 
+    def test_trim_keeps_the_axes_of_the_owned_layers(self):
+        # One axis a logical region, not one a region: cut by the region
+        # window, a two-area peer's axes would come back twice as long and
+        # starting at the wrong layer.
+        w = object.__new__(RblnNixlPullConnectorWorker)
+        w.local_seen_layer_names = ["layer.2"]
+        w.num_regions = 4  # K and V over two areas
+        token, head = ChipletSplitAxis.TOKEN, ChipletSplitAxis.HEAD
+        meta = _agent_meta(
+            kv_caches_base_addr=[0x10 * i for i in range(16)],
+            block_lens=[10] * 16,
+            region_names=[f"layer.{i}" for i in range(4) for _ in range(4)],
+            kv_split_axes=[token, token, token, token, head, token, token, token],
+        )
+
+        sliced = w._trim_agent_meta_to_layers(meta, [(2, 0)])
+
+        assert sliced.kv_split_axes == [head, token]
+
+    def test_trim_keeps_the_area_slices_of_the_owned_layers(self):
+        # Indexed like the axes, one entry a logical region; the pairing reads
+        # the copies of a slice off them, so a stale window pairs wrong areas.
+        w = object.__new__(RblnNixlPullConnectorWorker)
+        w.local_seen_layer_names = ["layer.2"]
+        w.num_regions = 4  # K and V over two areas
+        meta = _agent_meta(
+            kv_caches_base_addr=[0x10 * i for i in range(16)],
+            block_lens=[10] * 16,
+            region_names=[f"layer.{i}" for i in range(4) for _ in range(4)],
+            kv_area_slices=[[0, 1]] * 4 + [[1, 0]] + [[0, 1]] * 3,
+        )
+
+        sliced = w._trim_agent_meta_to_layers(meta, [(2, 0)])
+
+        assert sliced.kv_area_slices == [[1, 0], [0, 1]]
+
     def test_trim_agent_meta_to_layers_rejects_a_non_contiguous_span(self):
         w = object.__new__(RblnNixlPullConnectorWorker)
         w._kv_per_block = 1
@@ -799,7 +894,7 @@ class TestPpHandshakeFanout:
         # Chiplet geometry is exercised in TestFanInAreaPartition and
         # TestHeadBandMatching; stub it so this stays about the guard and the
         # registration decision.
-        w._peer_head_split = lambda *a, **k: 1
+        w._head_matched_plan = lambda *a, **k: _stub_plan(1)
         w._fan_in_peer_areas = lambda *a, **k: [0]
         _handshake(w, _FakeSock(pp_size=1, layers_per_stage=3), remote_tp_size=4)
         assert w._overlapping_ranks["eng"] == [0]
@@ -815,7 +910,7 @@ class TestPpHandshakeFanout:
         w.local_seen_layer_names = ["layer.0"]
         w.num_regions = 1
         w._add_remote_agent_head_matched = lambda *a, **k: "agent"
-        w._peer_head_split = lambda *a, **k: 1
+        w._head_matched_plan = lambda *a, **k: _stub_plan(1)
         w._fan_in_peer_areas = lambda *a, **k: [0]
         _handshake(w, _FakeSock(pp_size=1, layers_per_stage=1), remote_tp_size=4)
         assert w._register_shard_xfer_state.call_count == 1
@@ -828,7 +923,8 @@ class TestPpHandshakeFanout:
         # and its TP rank -- which is NOT the flat rank the stages are keyed by.
         w = _make_worker(tp_ratio=2, host_buffer=False)
         w._add_remote_agent_head_matched = MagicMock(return_value="agent")
-        w._peer_head_split = lambda *a, **k: 2
+        plan = _stub_plan(2)
+        w._head_matched_plan = MagicMock(return_value=plan)
         w._fan_in_peer_areas = MagicMock(return_value=[0])
 
         _handshake(w, _FakeSock(pp_size=2, tp_size=2), remote_tp_size=2)
@@ -840,8 +936,13 @@ class TestPpHandshakeFanout:
             c.kwargs["registered_layer_names"]
             for c in w._add_remote_agent_head_matched.call_args_list
         ] == [("layer.0",), ("layer.1",)]
-        kwargs = w._register_shard_xfer_state.call_args.kwargs
-        assert (kwargs["split"], kwargs["replica_fanout"]) == (2, 1)
+        # The plan is asked for the same peer rank and areas, and what it
+        # answers is what registers the stage's local list.
+        assert [
+            (c.args[1:3], c.kwargs["peer_areas"])
+            for c in w._head_matched_plan.call_args_list
+        ] == [((0, 2), [0]), ((0, 2), [0])]
+        assert w._register_shard_xfer_state.call_args.kwargs["plan"] is plan
 
     def test_the_head_band_follows_the_tp_rank_across_a_wider_peer(self):
         # Every other test in this class talks to tp_rank 0 alone, which cannot
@@ -851,7 +952,7 @@ class TestPpHandshakeFanout:
         w.local_seen_layer_names = ["layer.0"]
         w.num_regions = 1
         w._add_remote_agent_head_matched = MagicMock(side_effect=["a0", "a1"])
-        w._peer_head_split = lambda *a, **k: 1
+        w._head_matched_plan = lambda *a, **k: _stub_plan(1)
         w._fan_in_peer_areas = MagicMock(return_value=[0])
 
         agents, _ = _handshake(w, _FakeSock(pp_size=1, tp_size=2), remote_tp_size=2)
@@ -928,7 +1029,7 @@ class TestPpHandshakeFanout:
         w.local_seen_layer_names = ["layer.0"]
         w.num_regions = 1
         w._add_remote_agent_head_matched = lambda *a, **k: "agent"
-        w._peer_head_split = lambda *a, **k: 2
+        w._head_matched_plan = lambda *a, **k: _stub_plan(2)
         w._fan_in_peer_areas = lambda *a, **k: None
 
         _handshake(w, _FakeSock(pp_size=1, layers_per_stage=1), remote_tp_size=1)
@@ -993,15 +1094,16 @@ class TestPpHandshakeFanout:
         w.local_seen_layer_names = ["layer.0"]
         w.num_regions = 1
         w._add_remote_agent_head_matched = lambda *a, **k: "agent"
-        w._peer_head_split = lambda *a, **k: 1
-        w._peer_replica_fanout = lambda *a, **k: 2
+        # One piece, written to two copies: two entries a block.
+        plan = _stub_plan(2)
+        w._head_matched_plan = lambda *a, **k: plan
         w._fan_in_peer_areas = lambda *a, **k: None
 
         _handshake(w, _FakeSock(pp_size=1, layers_per_stage=1), remote_tp_size=1)
 
         assert w._register_shard_xfer_state.call_count == 1
         assert w._overlapping_ranks["eng"] == [0]
-        assert w._register_shard_xfer_state.call_args.kwargs["replica_fanout"] == 2
+        assert w._register_shard_xfer_state.call_args.kwargs["plan"] is plan
 
     def test_compat_hash_mismatch_raises(self):
         w = _make_worker(compat="LOCAL")
@@ -1134,14 +1236,16 @@ class TestPeerRegionView:
 
         plain = w._build_fa_remote(self._plan(), peer, block_size_ratio=1)
         with patch.object(
-            RblnNixlPullConnectorWorker, "_shard_chunk_grid", return_value=(1, 2)
+            RblnNixlPullConnectorWorker,
+            "_shard_chunk_grid",
+            return_value=uniform_grid(1, 2, regions=4),
         ) as grid:
             both = w._build_fa_remote(self._plan(), peer, block_size_ratio=1)
 
         # The peer's block size, not ours: its addresses are what is being
         # cut. And this builder serves the peers this rank does not band by
-        # head, which is where a split of 1 comes from.
-        assert grid.call_args.kwargs == {"block_size": peer.block_size, "split": 1}
+        # head, so every region is one piece and no plan cuts the runs.
+        assert grid.call_args.kwargs == {"block_size": peer.block_size}
         # Upstream hands back its own descriptor shape, and the chunk range is
         # CONCATENATED onto it. `+` there is arithmetic on the very rows this
         # is meant to follow, and a descriptor merely wrong reaches the device.
@@ -1164,7 +1268,9 @@ class TestPeerRegionView:
 
         plain = w._build_fa_remote(self._plan(), peer, block_size_ratio=1)
         with patch.object(
-            RblnNixlPullConnectorWorker, "_shard_chunk_grid", return_value=(2, 2)
+            RblnNixlPullConnectorWorker,
+            "_shard_chunk_grid",
+            return_value=uniform_grid(2, 2, regions=4),
         ):
             both = w._build_fa_remote(self._plan(), peer, block_size_ratio=1)
 
@@ -1368,6 +1474,8 @@ class TestShardLocalRegions:
         w.use_host_buffer = False  # D2D: narrowing comes from chiplet areas
         w._shard_descs_per_block = {}
         w._shard_chunk_grids = {}
+        w._shard_region_spans = {}
+        fill_region_geometry(w, areas=1, axes=[ChipletSplitAxis.HEAD] * 8)
         w._borrowed_src_handles = set()
         return w
 
@@ -1412,7 +1520,7 @@ class TestShardLocalRegions:
 
         _handle, plain = w._register_shard_local_xfer_handler(16, ("l2", "l3"))
         _handle, both = w._register_shard_local_xfer_handler(
-            16, ("l2", "l3"), chunk_grid=(2, 2)
+            16, ("l2", "l3"), chunk_grid=uniform_grid(2, 2, regions=4)
         )
 
         assert np.array_equal(both[: len(plain)], plain)
@@ -1439,15 +1547,20 @@ class TestShardLocalRegions:
         # The one check that ties the two halves together: an index computed
         # from the layout has to land on the descriptor the builder put there.
         w = self._wired_worker()
-        _handle, blocks = w._register_shard_local_xfer_handler(
-            16, ("l2", "l3"), split=split, replica_fanout=fanout, chunk_grid=(2, 2)
-        )
         regions = [4, 5, 6, 7]
+        region_ids, pieces = _split_plan(regions, 64, split, fanout)
+        _handle, blocks = w._register_shard_local_xfer_handler(
+            16,
+            ("l2", "l3"),
+            region_ids=region_ids,
+            pieces=pieces,
+            chunk_grid=uniform_grid(2, 2, regions=4),
+        )
         per_block = split * fanout
         key = ("eng", 0)
         w._shard_region_group_ids = {key: (0,) * len(regions)}
-        w._shard_descs_per_block[key] = per_block
-        w._shard_chunk_grids[key] = (2, 2)
+        w._shard_descs_per_block[key] = (per_block,) * len(regions)
+        w._shard_chunk_grids[key] = uniform_grid(2, 2, regions=4)
 
         ids = w._chunk_descs_ids_for_shard("eng", 0, w.num_blocks, 1, (0, 1))
 
@@ -1473,8 +1586,8 @@ class TestShardLocalRegions:
         w = self._wired_worker()
         key = ("eng", 0)
         w._shard_region_group_ids = {key: (0,) * 4}
-        w._shard_descs_per_block[key] = 1
-        w._shard_chunk_grids[key] = (2, 2)
+        w._shard_descs_per_block[key] = (1,) * 4
+        w._shard_chunk_grids[key] = uniform_grid(2, 2, regions=4)
 
         with pytest.raises(RuntimeError, match="outside the 2 chunk"):
             w._chunk_descs_ids_for_shard("eng", 0, w.num_blocks, 0, (1, 3))
@@ -1485,7 +1598,7 @@ class TestShardLocalRegions:
         w = self._wired_worker()
         key = ("eng", 0)
         w._shard_region_group_ids = {key: (0,) * 4}
-        w._shard_descs_per_block[key] = 1
+        w._shard_descs_per_block[key] = (1,) * 4
         w._shard_chunk_grids[key] = None
 
         assert w._chunk_descs_ids_for_shard("eng", 0, w.num_blocks, 0, (0, 1)).size == 0
@@ -1501,7 +1614,7 @@ class TestShardLocalRegions:
             16, ("l2", "l3"), chunk_grid=None
         )
         _handle, on = w._register_shard_local_xfer_handler(
-            16, ("l2", "l3"), chunk_grid=(2, 2)
+            16, ("l2", "l3"), chunk_grid=uniform_grid(2, 2, regions=4)
         )
 
         assert len(off) < len(on)
@@ -1521,7 +1634,7 @@ class TestShardLocalRegions:
         with patch.object(
             RblnNixlPullConnectorWorker,
             "_shard_chunk_grid",
-            return_value=(runs, chunks),
+            return_value=uniform_grid(runs, chunks, regions=w.num_regions),
         ):
             _handle, blocks = w.register_local_xfer_handler(16)
 
@@ -1552,10 +1665,8 @@ class TestShardLocalRegions:
             16,
             ("l2", "l3"),
             peer_areas=None,
-            split=1,
             region_ids=None,
-            replica_fanout=1,
-            kv_runs=1,
+            pieces=None,
             chunk_grid=None,
         )
 
@@ -1599,23 +1710,26 @@ class TestShardLocalRegions:
         # One group id per region of the shard: layers l2,l3 x rpl 2 = 4.
         assert w._shard_region_group_ids == {("eng", 2): (0, 0, 0, 0)}
 
-    def test_register_shard_xfer_state_records_pieces_times_copies(self):
+    def test_register_shard_xfer_state_records_each_regions_pieces(self):
         # `_shard_descs_per_block` is what the read path multiplies a (region,
-        # block) pair by to reach its descriptor ids, so it has to be the pieces
-        # a head is cut into TIMES the peer copies each piece is written to.
-        # Two pieces and three copies: a product of six that neither factor
-        # alone, and no pair of ones, can produce.
+        # block) pair by to reach its descriptor ids, so it has to be every
+        # entry the plan gives THAT region -- the pieces a head is cut into
+        # times the peer copies each is written to. Two pieces and three copies
+        # for two regions, one for the other two.
         w = self._wired_worker()
         w.kv_cache_config = MagicMock(transfer_groups=[object()])
         w.src_xfer_handles_by_remote = {}
         w._shard_region_group_ids = {}
         w._shard_descs_per_block = {}
 
+        # Regions 4 and 5 in two pieces sent to three copies each, 6 and 7 whole.
+        ids, cut = _split_plan([4, 5], 64, 2, 3)
+        more, whole = _split_plan([6, 7], 64)
         w._register_shard_xfer_state(
-            "eng", 2, 16, ("l2", "l3"), split=2, replica_fanout=3
+            "eng", 2, 16, ("l2", "l3"), plan=(ids + more, cut + whole)
         )
 
-        assert w._shard_descs_per_block == {("eng", 2): 6}
+        assert w._shard_descs_per_block == {("eng", 2): (6, 6, 1, 1)}
 
     @pytest.mark.parametrize(
         "sw_ratio, needs_own",
@@ -1635,7 +1749,7 @@ class TestShardLocalRegions:
 
         assert (
             w._needs_own_descriptors(
-                pp_size=1, partial=False, fan_in=False, split=1, fanout=1, kv_runs=1
+                pp_size=1, partial=False, fan_in=False, pieces=False
             )
             is needs_own
         )
@@ -1652,7 +1766,7 @@ class TestShardLocalRegions:
 
         assert (
             w._needs_own_descriptors(
-                pp_size=1, partial=False, fan_in=False, split=1, fanout=1, kv_runs=1
+                pp_size=1, partial=False, fan_in=False, pieces=False
             )
             is needs_own
         )
@@ -1667,14 +1781,15 @@ class TestShardLocalRegions:
         w._shard_descs_per_block = {}
 
         w._register_shard_xfer_state(
-            "eng", 2, 16, ("l2", "l3"), split=2, replica_fanout=3
+            "eng", 2, 16, ("l2", "l3"), plan=_split_plan([4, 5, 6, 7], 64, 2, 3)
         )
 
-        assert w._shard_descs_per_block == {("eng", 2): 6}
+        assert w._shard_descs_per_block == {("eng", 2): (6,) * 4}
 
+        grid = uniform_grid(1, 2, regions=4)
         with (
             patch.object(
-                RblnNixlPullConnectorWorker, "_shard_chunk_grid", return_value=(1, 2)
+                RblnNixlPullConnectorWorker, "_shard_chunk_grid", return_value=grid
             ),
             patch.object(
                 RblnNixlPullConnectorWorker,
@@ -1684,27 +1799,28 @@ class TestShardLocalRegions:
         ):
             w._register_shard_xfer_state("eng", 2, 16, ("l2", "l3"))
 
-        assert register.call_args.kwargs["chunk_grid"] == (1, 2)
+        assert register.call_args.kwargs["chunk_grid"] == grid
 
     @pytest.mark.parametrize(
-        ("split", "kv_per_block", "kv_runs", "expected"),
+        ("rows", "kv_per_block", "expected"),
         [
-            (1, 1, 1, (2, 2)),
-            (2, 1, 1, (1, 2)),
+            (None, 1, (2, 2)),
+            # A piece holding one of the region's two heads is one run.
+            (1, 1, (1, 2)),
             # A peer that reads K and V apart leaves the piece one of them, so
-            # the grid is the split layout's. Sized against the whole block
+            # the runs are its heads alone. Sized against the whole block
             # instead, a chunk comes out the span and there is no grid at all
             # -- while the peer's list still carries one.
-            (1, 2, 2, (2, 2)),
+            (2, 2, (2, 2)),
         ],
     )
     def test_the_local_grid_is_derived_for_the_piece_this_shard_sends(
-        self, split, kv_per_block, kv_runs, expected
+        self, rows, kv_per_block, expected
     ):
-        # A split halves the piece, so it holds half the heads and a chunk is
-        # one run fewer. The peer's list is derived with the same split
-        # (`_build_head_matched_remote`); derived with a different one, the two
-        # carry different grids and a transfer pairs them by position anyway.
+        # The runs follow the plan's pieces where there is one. The peer's list
+        # is cut from the same plan (`_build_head_matched_remote`); cut from a
+        # different one, the two carry different grids and a transfer pairs
+        # them by position anyway.
         w = self._wired_worker()
         w.kv_cache_config = MagicMock(transfer_groups=[object()])
         w.src_xfer_handles_by_remote = {}
@@ -1713,10 +1829,10 @@ class TestShardLocalRegions:
         # The geometry the grid is read off: 8 heads over 4 areas is 2 a
         # region, and 512B over a 16-token block is 16B a token.
         set_shape(w, chunk_mode=True)
-        w._kv_split_axis = KVSplitAxis.HEAD
-        w._kv_areas = 4
-        w._kv_slices = 4
-        w._logical_region_kv_heads = [8]
+        fill_region_geometry(
+            w, areas=4, axes=[ChipletSplitAxis.HEAD] * 2, slices=[4] * 2
+        )
+        w._logical_region_local_heads = [8] * 2
         w.block_len_per_layer = [512] * 8
         w.tp_rank = 0
         w.transfer_topo.tp_size = 1
@@ -1730,20 +1846,25 @@ class TestShardLocalRegions:
             return_value=(42, []),
         ) as register:
             w._register_shard_xfer_state(
-                "eng", 2, 16, ("l2", "l3"), split=split, kv_runs=kv_runs
+                "eng",
+                2,
+                16,
+                ("l2", "l3"),
+                plan=None
+                if rows is None
+                else _split_plan([4, 5, 6, 7], 512, 2, rows=rows),
             )
 
-        assert register.call_args.kwargs["chunk_grid"] == expected
-        assert w._shard_chunk_grids[("eng", 2)] == expected
+        grid = uniform_grid(*expected, regions=4)
+        assert register.call_args.kwargs["chunk_grid"] == grid
+        assert w._shard_chunk_grids[("eng", 2)] == grid
 
     def test_a_head_cut_chunk_engine_takes_a_narrowed_shard(self):
-        # The three a context cut refuses are all about a region's position
-        # naming a span, which a head cut does not do -- every region there
-        # holds every token of its own heads.
+        # A head cut pairs with a peer of any TP, so its shard can be narrowed
+        # -- every region holds every token of its own heads.
         w = self._wired_worker()
         set_shape(w, chunk_mode=True)
-        w._kv_split_axis = KVSplitAxis.HEAD
-        w._kv_areas = 2
+        fill_region_geometry(w, areas=2, axes=[ChipletSplitAxis.HEAD] * 4, slices=2)
         w.kv_cache_config = MagicMock(transfer_groups=[object()])
         w.src_xfer_handles_by_remote = {}
         w._shard_region_group_ids = {}
@@ -1751,9 +1872,28 @@ class TestShardLocalRegions:
         with patch.object(
             RblnNixlPullConnectorWorker, "_shard_chunk_grid", return_value=None
         ):
-            w._register_shard_xfer_state("eng", 2, 16, ("l2", "l3"), split=2)
+            w._register_shard_xfer_state(
+                "eng", 2, 16, ("l2", "l3"), plan=_split_plan([4, 5, 6, 7], 64, 2)
+            )
 
         assert w.src_xfer_handles_by_remote == {("eng", 2, 16): 42}
+
+    def test_a_context_cut_shard_reads_each_regions_span_off_its_slice(self):
+        # Which token range a region holds is the slice its area holds, not
+        # where the area sits: a layout naming them out of order still names
+        # each region's own range.
+        w = self._wired_worker()
+        fill_region_geometry(w, areas=2, axes=[ChipletSplitAxis.TOKEN] * 4, slices=2)
+        w._logical_region_geometry = [
+            g._replace(areas=g.areas[::-1]) for g in w._logical_region_geometry
+        ]
+        w.kv_cache_config = MagicMock(transfer_groups=[object()])
+        w.src_xfer_handles_by_remote = {}
+        w._shard_region_group_ids = {}
+
+        w._register_shard_xfer_state("eng", 2, 16, ("l2", "l3"))
+
+        assert w._shard_region_spans[("eng", 2)] == (1, 0, 1, 0)
 
     def test_register_shard_xfer_state_rejects_multiple_groups(self):
         # The single-group assumption is what makes the all-zero tuple above
@@ -1768,16 +1908,18 @@ class TestShardLocalRegions:
 
     @pytest.mark.parametrize(
         "narrowed",
-        [{"peer_areas": [0]}, {"split": 2}, {"replica_fanout": 2}],
+        [
+            {"peer_areas": [0]},
+            {"plan": _split_plan([4, 5, 6, 7], 64, 2)},
+            {"plan": _split_plan([4, 5, 6, 7], 64, copies=2)},
+        ],
     )
     def test_a_trimming_engine_refuses_a_narrowed_shard(self, narrowed):
-        # Each of the three breaks the position-to-area relation the trim reads
-        # (see `_register_shard_xfer_state`), which is why one assertion covers
-        # them together.
+        # A context cut pairs only at equal TP, and each of the three comes
+        # from a peer of another (see `_register_shard_xfer_state`).
         w = self._wired_worker()
         set_shape(w, chunk_mode=True)
-        w._kv_split_axis = KVSplitAxis.NON_HEAD
-        w._kv_areas = 2
+        fill_region_geometry(w, areas=2, axes=[ChipletSplitAxis.TOKEN] * 4, slices=2)
         w.kv_cache_config = MagicMock(transfer_groups=[object()])
         w.src_xfer_handles_by_remote = {}
         w._shard_region_group_ids = {}
@@ -1786,18 +1928,313 @@ class TestShardLocalRegions:
             w._register_shard_xfer_state("eng", 2, 16, ("l2", "l3"), **narrowed)
 
 
+@dataclass(frozen=True)
+class _Cut:
+    """One engine's chiplet geometry, layer by layer, for the `_CUTS` cases.
+
+    A layer is `(name, axis, KV heads the rank holds, slices)`; a head cut
+    gives each area `heads // slices` of them, a token cut every one over
+    `block // areas` tokens. `peer_layers` makes the peer a pipeline stage
+    holding only those.
+    """
+
+    layers: tuple[tuple[str, str, int, int], ...]
+    areas: int = 4
+    packed: bool = True
+    step: int = 2
+    peer_layers: tuple[str, ...] | None = None
+
+
+# A target cut on tokens beside a draft cut on heads, and the shapes around it
+# that the same arithmetic has to survive: the draft replicated, partly
+# replicated, or first; K and V in regions of their own; two areas; a peer
+# holding part of the layers; both on heads at different widths.
+_CUTS = {
+    "token-target-head-draft": _Cut(
+        (("t0", "T", 2, 4), ("t1", "T", 2, 4), ("d0", "H", 12, 4))
+    ),
+    # Both on the head axis, the draft six heads an area to the target's one:
+    # the regions still take their own runs.
+    "both-on-heads-draft-wider": _Cut(
+        (("t0", "H", 4, 4), ("t1", "H", 4, 4), ("d0", "H", 24, 4))
+    ),
+    "draft-replicated": _Cut((("t0", "T", 2, 4), ("d0", "H", 3, 1))),
+    "draft-partly-replicated": _Cut((("t0", "T", 2, 4), ("d0", "H", 4, 2))),
+    "draft-first": _Cut((("d0", "H", 12, 4), ("t0", "T", 2, 4))),
+    "draft-between": _Cut((("t0", "T", 2, 4), ("d0", "H", 12, 4), ("t1", "T", 2, 4))),
+    "one-head-target": _Cut((("t0", "T", 1, 4), ("d0", "H", 8, 4))),
+    "three-head-target": _Cut((("t0", "T", 3, 4), ("d0", "H", 12, 4))),
+    "split-kv": _Cut((("t0", "T", 2, 4), ("d0", "H", 12, 4)), packed=False),
+    "two-areas": _Cut((("t0", "T", 2, 2), ("d0", "H", 6, 2)), areas=2),
+    "step-at-a-span": _Cut((("t0", "T", 2, 4), ("d0", "H", 12, 4)), step=4),
+    "step-past-a-span": _Cut((("t0", "T", 2, 4), ("d0", "H", 12, 4)), step=8),
+    "step-at-the-block": _Cut((("t0", "T", 2, 4), ("d0", "H", 12, 4)), step=16),
+    # No head cut to need a range: a chunk of two spans is two areas' whole
+    # blocks, so it pairs with no chunk descriptor at all.
+    "token-cut-only": _Cut((("t0", "T", 2, 4), ("t1", "T", 2, 4)), step=8),
+    "peer-stage-with-the-draft": _Cut(
+        (("t0", "T", 2, 4), ("t1", "T", 2, 4), ("d0", "H", 12, 4)),
+        peer_layers=("t1", "d0"),
+    ),
+    "peer-stage-without-the-draft": _Cut(
+        (("t0", "T", 2, 4), ("t1", "T", 2, 4), ("d0", "H", 12, 4)),
+        peer_layers=("t0", "t1"),
+    ),
+}
+
+
+class TestAnEngineCutOnTwoAxes:
+    """A speculative draft keeps its own head count under the target's TP, so
+    the compiler can cut the target's KV on the token axis and the draft's on
+    the head axis in one engine. Both lists then cut a block's chunks into a
+    different number of runs per region, and they pair element-wise -- an
+    index that strides by one region's count lands the other's chunks on
+    bytes nothing reports.
+
+    Every case is checked exhaustively: each fill of a request's last block,
+    and each chunk range a streamed piece can name. The expected bytes come
+    off the layout alone -- K then V, each head's tokens contiguous, a token
+    cut's area holding its span of every head -- so nothing is shared with
+    the arithmetic under test.
+    """
+
+    BLOCK, TOKEN_BYTES = 16, 4
+    LOCAL_BASE, PEER_BASE = 0x100000, 0x9000000
+    LOCAL_BLOCKS, PEER_BLOCKS = 3, 2
+
+    @classmethod
+    def _regions(cls, cut):
+        """Per local region, in id order: (layer, axis, heads it holds, first
+        token it holds, tokens it holds)."""
+        out = []
+        for name, axis, heads, slices in cut.layers:
+            for _ in range(1 if cut.packed else 2):
+                for area in range(cut.areas):
+                    if axis == "T":
+                        span = cls.BLOCK // cut.areas
+                        out.append((name, axis, heads, area * span, span))
+                    else:
+                        out.append((name, axis, heads // slices, 0, cls.BLOCK))
+        return out
+
+    @classmethod
+    def _block_len(cls, cut, region):
+        _, _, heads, _, width = cls._regions(cut)[region]
+        return (2 if cut.packed else 1) * heads * width * cls.TOKEN_BYTES
+
+    @classmethod
+    def _bases(cls, base, lens, num_blocks):
+        stride = max(lens) * num_blocks * 2
+        return [base + i * stride for i in range(len(lens))]
+
+    @classmethod
+    def _worker(cls, cut):
+        w = object.__new__(RblnNixlPullConnectorWorker)
+        set_shape(w, chunk_mode=True)
+        w.vllm_config = mock_vllm_config()
+        w.vllm_config.scheduler_config.max_num_batched_tokens = cut.step
+        w.block_size = cls.BLOCK
+        w.num_blocks = cls.LOCAL_BLOCKS
+        w.engine_id = "local"
+        w.tp_rank = 0
+        w.device_id = 0
+        w._has_mamba = False
+        w.nixl_memory_type = "VRAM"
+        w.nixl_wrapper = MagicMock()
+        w.nixl_wrapper.get_xfer_descs.side_effect = lambda data, _t: data
+        w.local_seen_layer_names = [name for name, *_ in cut.layers]
+        regions = cls._regions(cut)
+        w.num_regions = len(regions)
+        w.block_len_per_layer = [cls._block_len(cut, r) for r in range(len(regions))]
+        w.kv_caches_base_addr = {
+            "local": {
+                0: cls._bases(cls.LOCAL_BASE, w.block_len_per_layer, cls.LOCAL_BLOCKS)
+            }
+        }
+        w._region_is_mla = [False] * len(regions)
+        # Empty as upstream's __init__ leaves it: regions pair by index.
+        w._transfer_layer_region_indices = ()
+        w._kv_per_block = 2 if cut.packed else 1
+        per_layer = 1 if cut.packed else 2
+        token = ChipletSplitAxis.TOKEN
+        w._logical_region_local_heads = [
+            heads for _, _, heads, _ in cut.layers for _ in range(per_layer)
+        ]
+        w.transfer_topo = MagicMock(virtually_split_kv_in_blocks=False)
+        w._mamba_ssm_size = (0, 0)
+        w._group_spec_types = [FullAttentionSpec]
+        return fill_region_geometry(
+            w,
+            areas=cut.areas,
+            axes=[
+                token if axis == "T" else ChipletSplitAxis.HEAD
+                for _, axis, _, _ in cut.layers
+                for _ in range(per_layer)
+            ],
+            slices=[
+                cut.areas if axis == "T" else slices
+                for _, axis, _, slices in cut.layers
+                for _ in range(per_layer)
+            ],
+        )
+
+    @classmethod
+    def _lists(cls, cut):
+        """Both lists for an equal-TP peer, our region ids in the peer's
+        order, and the worker indexing them."""
+        w = cls._worker(cut)
+        names = cut.peer_layers or tuple(w.local_seen_layer_names)
+        region_ids = w._shard_local_region_ids(names)
+        grid = w._shard_chunk_grid(region_ids, block_size=cls.BLOCK)
+        assert grid is not None, "every case here cuts a block on both axes"
+        _handle, local = w._register_shard_local_xfer_handler(
+            cls.BLOCK, names, chunk_grid=grid
+        )
+        lens = [w.block_len_per_layer[r] for r in region_ids]
+        per_layer = len(region_ids) // len(names)
+        peer = _agent_meta(
+            engine_id="peer",
+            kv_caches_base_addr=cls._bases(cls.PEER_BASE, lens, cls.PEER_BLOCKS),
+            block_lens=lens,
+            num_blocks=cls.PEER_BLOCKS,
+            block_size=cls.BLOCK,
+            region_names=[name for name in names for _ in range(per_layer)],
+        )
+        plan = MagicMock(source_ranks_per_group=[(0,)], rank_offset_factor=0)
+        remote = w._build_fa_remote(plan, peer, block_size_ratio=1)
+        key = ("peer", 0)
+        w._shard_region_group_ids = {key: (0,) * len(region_ids)}
+        w._shard_descs_per_block = {key: (1,) * len(region_ids)}
+        w._shard_chunk_grids = {key: grid}
+        local = [tuple(int(x) for x in d) for d in local]
+        return w, grid, region_ids, local, remote.tolist()
+
+    @staticmethod
+    def _bytes(descs, bases, lens, num_blocks, region_ids):
+        """(our region id, block, byte in block) every descriptor covers."""
+        out = []
+        for addr, length, _dev in descs:
+            (pos,) = [
+                p for p, b in enumerate(bases) if b <= addr < b + lens[p] * num_blocks
+            ]
+            block, offset = divmod(addr - bases[pos], lens[pos])
+            assert offset + length <= lens[pos], "a descriptor crosses a block"
+            out.append({(region_ids[pos], block, offset + i) for i in range(length)})
+        return out
+
+    @classmethod
+    def _expected(cls, cut, region_ids, block, tokens):
+        """The bytes of tokens [lo, hi) of one block, in the given regions."""
+        lo, hi = tokens
+        regions = cls._regions(cut)
+        out = set()
+        for rid in region_ids:
+            _, _, heads, first, width = regions[rid]
+            for t in range(max(lo, first), min(hi, first + width)):
+                for run in range((2 if cut.packed else 1) * heads):
+                    start = (run * width + t - first) * cls.TOKEN_BYTES
+                    out |= {(rid, block, start + i) for i in range(cls.TOKEN_BYTES)}
+        return out
+
+    def _paired(self, cut, region_ids, local, remote, ids, peer_block):
+        """The two picks pair element-wise, and what they cover once each."""
+        local_ids, remote_ids = ids
+        assert len(local_ids) == len(remote_ids)
+        w = self._worker(cut)
+        local_lens = w.block_len_per_layer
+        mine = self._bytes(
+            [local[i] for i in local_ids],
+            w.kv_caches_base_addr["local"][0],
+            local_lens,
+            self.LOCAL_BLOCKS,
+            range(len(local_lens)),
+        )
+        peer_lens = [local_lens[r] for r in region_ids]
+        theirs = self._bytes(
+            [tuple(remote[i]) for i in remote_ids],
+            self._bases(self.PEER_BASE, peer_lens, self.PEER_BLOCKS),
+            peer_lens,
+            self.PEER_BLOCKS,
+            region_ids,
+        )
+        for a, b in zip(mine, theirs):
+            assert {(r, peer_block[blk], o) for r, blk, o in a} == b
+        covered = set().union(*mine) if mine else set()
+        # Each byte once: a region sent whole and again in chunks pairs and
+        # covers the same set, and is still twice the bytes on the fabric.
+        assert sum(len(a) for a in mine) == len(covered), "a byte went out twice"
+        return covered
+
+    @pytest.mark.parametrize("cut", _CUTS.values(), ids=_CUTS.keys())
+    def test_a_request_s_last_block_goes_out_as_the_tokens_it_holds(self, cut):
+        w, grid, region_ids, local, remote = self._lists(cut)
+        chunk = self.BLOCK // grid.chunks_per_block
+        # The peer numbered its blocks from zero, in the order the list below
+        # names ours.
+        peer_block = {2: 0, 1: 1}
+        for tail in range(1, self.BLOCK + 1):
+            valid = self.BLOCK + tail
+            ids = (
+                w._shard_descs_for_tokens(
+                    "peer",
+                    0,
+                    self.LOCAL_BLOCKS,
+                    [[2, 1]],
+                    num_valid_tokens=valid,
+                    num_prompt_blocks=2,
+                ),
+                w._shard_descs_for_tokens(
+                    "peer",
+                    0,
+                    self.PEER_BLOCKS,
+                    [[0, 1]],
+                    num_valid_tokens=valid,
+                    num_prompt_blocks=2,
+                ),
+            )
+            covered = self._paired(cut, region_ids, local, remote, ids, peer_block)
+            # Rounded up to a chunk, every byte of which is the request's block.
+            held = -(-tail // chunk) * chunk
+            assert covered == self._expected(
+                cut, region_ids, 2, (0, self.BLOCK)
+            ) | self._expected(cut, region_ids, 1, (0, held)), f"tail {tail}"
+
+    @pytest.mark.parametrize("cut", _CUTS.values(), ids=_CUTS.keys())
+    def test_a_streamed_piece_reaches_every_region_holding_its_tokens(self, cut):
+        # A piece counts chunks of the block, and a range crossing a target
+        # area is one piece here: which regions hold it is the index's to say.
+        w, grid, region_ids, local, remote = self._lists(cut)
+        cpb = grid.chunks_per_block
+        chunk = self.BLOCK // cpb
+        for lo in range(cpb):
+            for hi in range(lo + 1, cpb + 1):
+                ids = (
+                    w._chunk_descs_ids_for_shard(
+                        "peer", 0, self.LOCAL_BLOCKS, 2, (lo, hi)
+                    ),
+                    w._chunk_descs_ids_for_shard(
+                        "peer", 0, self.PEER_BLOCKS, 1, (lo, hi)
+                    ),
+                )
+                covered = self._paired(cut, region_ids, local, remote, ids, {2: 1})
+                assert covered == self._expected(
+                    cut, region_ids, 2, (lo * chunk, hi * chunk)
+                ), f"chunks [{lo}, {hi})"
+
+
 class TestChunkSizing:
     """What a chunk descriptor covers, and the grid a shard's lists take.
 
     Sized in tokens rather than bytes, so the answer does not depend on which
     regions a rank registered; floored by the prefill chunk because that is
-    the unit a write covers; and rounded to a size that tiles the span because
-    a descriptor may not reach past it.
+    the unit a write covers; and rounded to a size that cuts every span or
+    takes several whole, because a descriptor may not reach past one.
     """
 
     @staticmethod
-    def _sized(*, span_tokens, prefill=512, tokens=0):
+    def _sized(*, span_tokens, block=8192, prefill=512, tokens=0):
         return kv_chunk_tokens(
+            block_tokens=block,
             span_tokens=span_tokens,
             prefill_step_tokens=prefill,
             chunk_tokens=tokens,
@@ -1808,17 +2245,30 @@ class TestChunkSizing:
         [
             # Unset takes the prefill step, which tiles an 8k block cut into
             # four areas.
-            (0, 2048, 512, 512),
+            (0, [2048], 512, 512),
             # The knob is taken over the floor where it is above it.
-            (1024, 2048, 512, 1024),
+            (1024, [2048], 512, 1024),
             # And it tiles the span as well -- 700 would leave a descriptor
             # reaching into the next span.
-            (700, 2048, 512, 1024),
-            # A span one prefill step fills leaves the span uncut, and so does
-            # a step wider than the span.
-            (0, 512, 512, 512),
-            (0, 2048, 2048, 2048),
-            (0, 2048, 4096, 2048),
+            (700, [2048], 512, 1024),
+            # A span one prefill step fills leaves the span uncut.
+            (0, [512], 512, 512),
+            (0, [2048], 2048, 2048),
+            # A step wider than the span takes two spans whole rather than
+            # falling under the floor.
+            (0, [2048], 4096, 4096),
+            (4096, [2048], 512, 4096),
+            # 3000 would end inside a span; the next width that does not is two
+            # spans.
+            (3000, [2048], 512, 4096),
+            # A step as wide as the block leaves nothing to chunk.
+            (0, [2048], 8192, 8192),
+            # A head cut beside a context cut: one width serves both, cutting
+            # the head cut's block and taking context spans whole.
+            (0, [2048, 8192], 4096, 4096),
+            # Two spans tile a span multiple but not the block; the next width
+            # that does is the block.
+            (0, [2048], 5000, 8192),
         ],
     )
     def test_the_chunk_is_the_smallest_tiling_size_the_floors_allow(
@@ -1828,21 +2278,36 @@ class TestChunkSizing:
             expected
         )
 
+    def test_a_block_no_power_of_two_still_tiles_its_spans(self):
+        # Every width above a 3072-token block's quarter tiles the block, so
+        # only the span rule rules any of them out: 1024 divides the block and
+        # ends inside a 768-token span, and the next width that does not is
+        # two spans.
+        assert self._sized(span_tokens=[768], block=3072, prefill=800) == 1536
+
+    def test_a_block_whose_spans_a_step_overfills_keeps_the_step(self):
+        # A 1k block over four areas is 256 tokens an area against a 512-token
+        # step: the chunk is two areas, not one.
+        assert self._sized(span_tokens=[256], block=1024) == 512
+
     def test_a_token_knob_under_one_prefill_step_is_refused(self):
         # Rounding it up instead would ignore the size an operator asked for,
         # and a step closing several chunks is not something the write path
         # can count in.
         with pytest.raises(RuntimeError, match="prefill step"):
-            self._sized(span_tokens=2048, tokens=256)
+            self._sized(span_tokens=[2048], tokens=256)
 
     @staticmethod
-    def _grid_worker(*, block_len, areas=4, prefill=512, cls=None):
+    def _grid_worker(
+        *, block_len, areas=4, prefill=512, cls=None, local_heads=1, kv_per_block=1
+    ):
         w = object.__new__(cls or RblnNixlPullConnectorWorker)
         w._shape = shape()
         set_shape(w, chunk_mode=True)
-        w._kv_areas = areas
-        w._kv_split_axis = KVSplitAxis.NON_HEAD
-        w._kv_per_block = 1
+        # One head a rank is the latent cache; a tensor-parallel GQA rank
+        # brings more.
+        w._logical_region_local_heads = [local_heads] * 8
+        w._kv_per_block = kv_per_block
         w.block_len_per_layer = [block_len] * 8
         w.vllm_config = mock_vllm_config()
         w.vllm_config.scheduler_config.max_num_batched_tokens = prefill
@@ -1850,15 +2315,101 @@ class TestChunkSizing:
         # reaches through __del__ is absent; silence it rather than leak
         # an unraisable at GC.
         w.shutdown = lambda: None
-        return w
+        return fill_region_geometry(
+            w, areas=areas, axes=[ChipletSplitAxis.TOKEN] * 8, slices=[areas] * 8
+        )
 
-    def test_a_context_cut_spreads_a_chunk_over_one_run(self, monkeypatch):
+    @staticmethod
+    def _grid(w, *, block_size=8192):
+        """The grid over the first logical region's four areas."""
+        return w._shard_chunk_grid(range(4), block_size=block_size)
+
+    def test_a_context_cut_of_one_head_spreads_a_chunk_over_one_run(self, monkeypatch):
         # An 8k block over four areas: each area holds 2048 tokens, and a
-        # 512-token prefill step cuts that into four. A run per head would be
-        # the head axis; here the area already is a token range.
+        # 512-token prefill step cuts that into four. One run because the rank
+        # holds one head -- the area is a token range of every head it has.
         w = self._grid_worker(block_len=2048 * 256)
 
-        assert w._shard_chunk_grid(block_size=8192, split=1) == (1, 4)
+        assert self._grid(w) == uniform_grid(1, 4, regions=4, spans=4)
+
+    def test_a_context_cut_is_a_run_per_head_the_rank_holds(self, monkeypatch):
+        # The same geometry with the shape a tensor-parallel GQA model brings:
+        # too few heads a rank for the compiler to split them across chiplets,
+        # so it cuts the tokens and leaves every head on every area. A token
+        # range of that area is then one run of bytes per head, because the
+        # heads are the outer axis inside a block.
+        w = self._grid_worker(block_len=2048 * 256, local_heads=2)
+
+        assert self._grid(w) == uniform_grid(2, 4, regions=4, spans=4)
+
+    def test_a_packed_block_runs_once_in_each_half(self, monkeypatch):
+        # K and V sharing a block puts a second copy of every head after the
+        # first, so a token range of one head sits once in each -- the layout
+        # the run count already carried, and the only thing a context cut over
+        # a packed block ever needed.
+        w = self._grid_worker(block_len=2048 * 256, local_heads=2, kv_per_block=2)
+
+        assert self._grid(w) == uniform_grid(4, 4, regions=4, spans=4)
+
+    def test_regions_disagreeing_on_the_rank_band_take_their_own_runs(self):
+        # A draft beside its target holds its own head count, so its regions
+        # are a run per head of that count. One chunk width still serves both,
+        # which is what keeps a block the same number of chunks in each.
+        w = self._grid_worker(block_len=2048 * 256)
+        w._logical_region_local_heads = [1, 2] * 4
+
+        grid = w._shard_chunk_grid(range(8), block_size=8192)
+
+        assert grid == ChunkGrid(
+            16, tuple((area * 4, runs, 4) for runs in (1, 2) for area in range(4))
+        )
+
+    def test_a_step_wider_than_an_area_takes_areas_whole(self):
+        # A 1k block over four areas against a 512-token step: a chunk is two
+        # areas, each area's whole-block descriptor half of one, so the range
+        # carries nothing.
+        w = self._grid_worker(block_len=256 * 256)
+
+        assert self._grid(w, block_size=1024) == ChunkGrid(
+            2, ((0, 0, 1), (0, 0, 1), (1, 0, 1), (1, 0, 1))
+        )
+
+    def test_a_head_cut_beside_takes_the_same_wider_chunk(self):
+        # The draft's head cut holds the whole block, so the two-area chunk
+        # cuts it in two -- where a chunk of one area would have cut it in four.
+        w = self._grid_worker(block_len=256 * 256)
+        w._logical_region_local_heads = [1, 4] * 4
+        fill_region_geometry(
+            w,
+            areas=4,
+            axes=[ChipletSplitAxis.TOKEN, ChipletSplitAxis.HEAD] * 4,
+            slices=[4] * 8,
+        )
+
+        grid = w._shard_chunk_grid(range(8), block_size=1024)
+
+        assert grid == ChunkGrid(
+            2, ((0, 0, 1), (0, 0, 1), (1, 0, 1), (1, 0, 1)) + ((0, 1, 2),) * 4
+        )
+
+    def test_an_area_exactly_one_chunk_wide_is_named_by_its_whole_block(self):
+        # A 256-token step over a 1k block cut on tokens into four areas: each
+        # area is one chunk, so its whole-block descriptor names it and the
+        # range carries none -- while the head-cut draft beside is cut in four.
+        w = self._grid_worker(block_len=256 * 256, prefill=256)
+        w._logical_region_local_heads = [1, 4] * 4
+        fill_region_geometry(
+            w,
+            areas=4,
+            axes=[ChipletSplitAxis.TOKEN, ChipletSplitAxis.HEAD] * 4,
+            slices=[4] * 8,
+        )
+
+        grid = w._shard_chunk_grid(range(8), block_size=1024)
+
+        assert grid == ChunkGrid(
+            4, tuple((a, 0, 1) for a in range(4)) + ((0, 1, 4),) * 4
+        )
 
     @pytest.mark.parametrize(
         "kwargs, block_size",
@@ -1874,22 +2425,22 @@ class TestChunkSizing:
     def test_a_span_a_chunk_cannot_cut_gets_no_grid(self, kwargs, block_size):
         w = self._grid_worker(**kwargs)
 
-        assert w._shard_chunk_grid(block_size=block_size, split=1) is None
+        assert self._grid(w, block_size=block_size) is None
 
     def test_off_the_knob_there_is_no_grid(self):
         # A block length the shape could cut, so only the knob answers None.
         w = self._grid_worker(block_len=2048 * 256)
         set_shape(w, chunk_mode=False)
 
-        assert w._shard_chunk_grid(block_size=8192, split=1) is None
+        assert self._grid(w) is None
 
-    def test_a_side_that_writes_in_pieces_gets_a_grid_without_the_knob(self):
-        # Streaming names a range of a block whether or not the knob is on, so
-        # it asks for the same grid the knob would have built.
+    def test_a_side_that_streams_alone_gets_no_grid(self):
+        # Streaming writes whole blocks: the ones the prefill closed, and the
+        # last one whole at the handover. Only chunk mode cuts a block.
         w = self._grid_worker(block_len=2048 * 256, cls=RblnNixlPushConnectorWorker)
         w._shape = shape(chunk_mode=False, streams_prefix=True)
 
-        assert w._shard_chunk_grid(block_size=8192, split=1) == (1, 4)
+        assert self._grid(w) is None
 
 
 class TestBaseFanInHandle:
@@ -2000,9 +2551,9 @@ class TestValidateRemoteAgentHandshake:
         # add_remote_agent reads the cached copy __init__ makes of it.
         w.pp_size = 1
         w.vllm_config.speculative_config = None
-        w._kv_areas = 1
-        w._kv_slices = 1
-        w._kv_split_axis = KVSplitAxis.HEAD
+        fill_region_geometry(
+            w, areas=areas, axes=[ChipletSplitAxis.HEAD] * (num_layers * 2)
+        )
         window_mode(w, None, chunk_mode=False, has_swa=False)
         topo = MagicMock()
         topo.get_engine_info.return_value = MagicMock(remote_tp_size=1)
@@ -2021,9 +2572,11 @@ class TestValidateRemoteAgentHandshake:
         block_size=16,
         kv_areas=1,
         kv_slices=1,
-        kv_split_axis=KVSplitAxis.HEAD,
+        axis=ChipletSplitAxis.HEAD,
         n_layers=0,
     ):
+        # K and V of every layer the peer names, or of the consumer's 28
+        # where it names none.
         return _agent_meta(
             pp_size=pp_size,
             kv_caches_base_addr=[1000 * i for i in range(n_regions)],
@@ -2031,7 +2584,7 @@ class TestValidateRemoteAgentHandshake:
             block_size=block_size,
             kv_areas=kv_areas,
             kv_slices=kv_slices,
-            kv_split_axis=kv_split_axis,
+            kv_split_axes=[axis] * (2 * (n_layers or 28)),
             region_names=[f"l{i}" for i in range(n_layers)],
         )
 
@@ -2040,9 +2593,9 @@ class TestValidateRemoteAgentHandshake:
         # entry point still calling it: deleting that one line kept the suite
         # green. Equal TP, so no other refusal can account for the raise.
         w = self._consumer(host_buffer=False)
-        with pytest.raises(RuntimeError, match="cut its KV cache on the NON_HEAD"):
+        with pytest.raises(RuntimeError, match=r"as \[\('TOKEN'"):
             w._validate_remote_agent_handshake(
-                self._meta(pp_size=1, n_regions=56, kv_split_axis=KVSplitAxis.NON_HEAD),
+                self._meta(pp_size=1, n_regions=56, axis=ChipletSplitAxis.TOKEN),
                 remote_tp_size=1,
             )
 
@@ -2083,7 +2636,8 @@ class TestValidateRemoteAgentHandshake:
         # totals legitimately differ from ours while regions per layer match.
         w = self._consumer(num_layers=28, host_buffer=False, areas=4)
         w._validate_remote_agent_handshake(
-            self._meta(pp_size=2, n_regions=112, n_layers=14), remote_tp_size=1
+            self._meta(pp_size=2, n_regions=112, n_layers=14, kv_areas=4, kv_slices=1),
+            remote_tp_size=1,
         )  # no raise
 
     def test_pp_with_larger_peer_tp_raises(self):
@@ -2134,6 +2688,7 @@ class TestValidateRemoteAgentHandshake:
                 _agent_meta(
                     kv_caches_base_addr=[0] * 57,  # not a whole number per layer
                     region_names=[f"l{i}" for i in range(28)],
+                    kv_split_axes=[ChipletSplitAxis.HEAD] * 56,
                 ),
                 0,
                 1,
@@ -2165,7 +2720,11 @@ class TestValidateRemoteAgentHandshake:
             ) as base_val,
         ):
             w._validate_remote_agent_handshake(
-                _agent_meta(kv_caches_base_addr=[0] * 56, region_names=[]),
+                _agent_meta(
+                    kv_caches_base_addr=[0] * 56,
+                    region_names=[],
+                    kv_split_axes=[ChipletSplitAxis.HEAD] * 56,
+                ),
                 remote_tp_size=1,
             )
         head_val.assert_called_once()
@@ -2192,6 +2751,7 @@ class TestValidateRemoteAgentHandshake:
                     kv_caches_base_addr=[0] * 28,
                     num_blocks=8,
                     region_names=[f"l{i}" for i in range(14)],
+                    kv_split_axes=[ChipletSplitAxis.HEAD] * 28,
                 ),
                 remote_tp_size=2,
             )
@@ -2222,6 +2782,20 @@ class TestValidateRemoteAgentHandshake:
                 self._meta(pp_size=1, n_regions=56), remote_tp_size=2
             )
 
+    def test_mla_heterogeneous_tp_is_refused_as_mla_past_the_bands(self):
+        # Registering a peer reads both head bands before it validates the
+        # pairing, and an MLA latent bands no region by head -- so the bands
+        # must not refuse it first under a message about slice layouts.
+        w = self._consumer(use_mla=True, host_buffer=False)
+        w._logical_region_kv_heads = [None] * len(w._logical_region_geometry)
+        w.transfer_topo.tp_ratio.return_value = 2
+        meta = self._meta(pp_size=1, n_regions=56)
+
+        w._local_band(2)
+        w._peer_band(meta, 2)
+        with pytest.raises(RuntimeError, match="MLA is not supported"):
+            w._validate_remote_agent_handshake(meta, remote_tp_size=2)
+
     def test_mla_heterogeneous_tp_on_host_staging_is_allowed(self):
         # The refusal exists because head-band matching would size bands from a
         # head count MLA does not have. Host staging never head-matches, so the
@@ -2236,19 +2810,22 @@ class TestValidateRemoteAgentHandshake:
             )
         base_val.assert_called_once()
 
-    def test_mla_with_pipelined_peer_is_allowed(self):
+    @pytest.mark.parametrize("host_buffer", [True, False])
+    def test_mla_with_pipelined_peer_is_allowed(self, host_buffer):
         # A pipelined producer is paired by layer name, which does not depend on
-        # whether the cache is head-sharded.
-        w = self._consumer(use_mla=True)
+        # whether the cache is head-sharded -- and its geometry is compared on
+        # the layers it holds, not against every layer of ours.
+        w = self._consumer(use_mla=True, host_buffer=host_buffer)
         w._validate_remote_agent_handshake(
-            self._meta(pp_size=2, n_regions=28), remote_tp_size=1
+            self._meta(pp_size=2, n_regions=28, n_layers=14), remote_tp_size=1
         )  # no raise
 
-    def test_mla_geometry_mismatch_raises(self):
-        # Positional pairing needs both sides to expand a logical region the
-        # same way; disagreeing means the block stride differs.
-        w = self._consumer(use_mla=True)
-        with pytest.raises(RuntimeError, match="chiplet geometry"):
+    def test_a_peer_laying_its_slices_out_otherwise_is_refused(self):
+        # Equal TP pairs area k with area k, so both sides have to lay each
+        # region's slices over their areas alike; otherwise the block stride
+        # differs and the wrong bytes move.
+        w = self._consumer(use_mla=True, host_buffer=False)
+        with pytest.raises(RuntimeError, match="an area means something else"):
             w._validate_remote_agent_handshake(
                 self._meta(pp_size=1, n_regions=56, kv_areas=4, kv_slices=1),
                 remote_tp_size=1,
@@ -2272,7 +2849,6 @@ class TestHeadBandMatching:
         w._kv_per_block = 1
         w.tp_rank = tp_rank
         w._kv_areas = areas
-        w._kv_slices = slices
         block_lens = (
             list(block_len) if isinstance(block_len, list) else [block_len] * n_logical
         )
@@ -2287,6 +2863,15 @@ class TestHeadBandMatching:
         w.get_backend_aware_kv_block_len = lambda layer_idx, **_: w.block_len_per_layer[
             layer_idx
         ]
+        w._logical_region_local_heads = [
+            heads // tp_size for heads in w._logical_region_kv_heads
+        ]
+        fill_region_geometry(
+            w,
+            areas=areas,
+            axes=[ChipletSplitAxis.HEAD] * len(w._logical_region_kv_heads),
+            slices=slices,
+        )
         set_shape(w, chunk_mode=False)  # the grid tests turn it on
         return w
 
@@ -2338,11 +2923,11 @@ class TestHeadBandMatching:
         def f(*args):
             return RblnNixlPullConnectorWorker._slice_head_bounds(*args, side="local")
 
-        assert f(0, 1, 8, 4, 4) == (0, 2)
-        assert f(0, 2, 8, 4, 4) == (0, 1)
-        assert f(1, 2, 8, 4, 4) == (4, 1)
-        assert f(0, 4, 8, 4, 2) == (0, 1)
-        assert f(2, 4, 8, 4, 2) == (4, 1)
+        assert f(0, 1, 8, 4) == (0, 2)
+        assert f(0, 2, 8, 4) == (0, 1)
+        assert f(1, 2, 8, 4) == (4, 1)
+        assert f(0, 4, 8, 2) == (0, 1)
+        assert f(2, 4, 8, 2) == (4, 1)
 
     @pytest.mark.parametrize(
         "args,side,message",
@@ -2350,28 +2935,84 @@ class TestHeadBandMatching:
             # Upstream serves TP > num_kv_heads by replicating one head across
             # ranks (tp_mapping's `tp_size > total_num_kv_heads` branch); a band
             # is then a fraction of a head, which no descriptor names.
-            ((0, 8, 4, 4, 4), "peer", "does not divide the model's 4 KV heads"),
-            ((0, 2, 8, 4, 3), "local", "cut into 3 logical slice"),
-            ((0, 2, 8, 6, 4), "peer", "6 chiplet area"),
-            # A peer that advertises no slices at all: without the `slices <= 0`
-            # half of that guard the modulo beside it divides by zero.
-            ((0, 2, 8, 4, 0), "peer", "cut into 0 logical slice"),
+            ((0, 8, 4, 4), "peer", "does not divide the model's 4 KV heads"),
+            ((0, 2, 8, 3), "local", "cut into 3 logical slice"),
         ],
     )
     def test_a_geometry_that_cannot_be_banded_is_refused(self, args, side, message):
-        # The three refusals run on a peer's advertised numbers as well as our
+        # The two refusals run on a peer's advertised numbers as well as our
         # own, so they refuse a pairing across the handshake rather than assert
         # an invariant -- and the message has to name whose numbers failed.
         with pytest.raises(RuntimeError, match=message) as e:
             RblnNixlPullConnectorWorker._slice_head_bounds(*args, side=side)
         assert side in str(e.value)
 
-    def test_a_peer_advertising_no_slices_is_refused_on_arrival(self):
-        # The per-region refusal that names the side runs after the divisions,
-        # so without this the operator gets a ZeroDivisionError instead.
+    @pytest.mark.parametrize("ids", [[], [0, 2], [0, 0, 1]])
+    def test_a_peer_whose_areas_are_not_whole_slices_is_refused_on_arrival(self, ids):
+        # The descriptor arithmetic divides a region's areas by its slices, so
+        # a region with none, a missing slice, or unevenly replicated ones
+        # would otherwise surface as a division or a wrong pairing far in.
         w = _make_worker()
-        with pytest.raises(RuntimeError, match="advertises 0 logical slice"):
-            _handshake(w, _FakeSock(pp_size=1, kv_slices=0))
+        with pytest.raises(RuntimeError, match="each held by the same number"):
+            _handshake(w, _FakeSock(pp_size=1, kv_area_slices=[ids]))
+
+    @pytest.mark.parametrize(
+        "geometry",
+        [
+            {"kv_split_axes": []},
+            {"kv_area_slices": [[0, 1]]},
+            # Three regions the two lists name, so only the area counts disagree.
+            {
+                "kv_area_slices": [[0], [0, 1]],
+                "kv_split_axes": [ChipletSplitAxis.HEAD] * 2,
+                "regions_per_layer": 3,
+            },
+        ],
+        ids=["no-axes", "areas-over-one-region", "uneven-area-counts"],
+    )
+    def test_a_peer_whose_geometry_does_not_describe_its_regions_is_refused(
+        self, geometry
+    ):
+        # Every reader indexes a peer region as `logical * areas + area`, so
+        # the lists have to agree with each other and with the regions.
+        w = _make_worker()
+        with pytest.raises(RuntimeError, match="one region an area"):
+            _handshake(w, _FakeSock(pp_size=1, **geometry))
+
+    def test_each_peer_region_is_read_where_its_own_slices_sit(self):
+        # A peer's regions only have to agree on how many areas and slices they
+        # have; each region's descriptors follow its own slice ids. Here the
+        # peer's second region holds slice 0 in areas 1 and 3, not 0 and 1.
+        w = self._worker(
+            tp_rank=0, tp_size=2, areas=2, slices=2, n_logical=2, block_len=256
+        )
+        meta = self._meta(areas=4, slices=2, n_logical=2, block_len=512)
+        meta.kv_area_slices = [[0, 0, 1, 1], [1, 0, 1, 0]]
+
+        assert RblnNixlPullConnectorWorker._peer_band(meta, 1) == (4, 2)
+        out = w._build_head_matched_remote(meta, remote_tp_rank=0, remote_tp_size=1)
+        # A read takes a slice's first holder: area 0 of region 0, area 1 of
+        # region 1.
+        assert {region for region, _, _ in self._decoded(out, meta)} == {0, 4 + 1}
+
+    def test_a_peer_stage_region_is_read_where_its_own_slices_sit(self):
+        # The same under PP: our layer l1 is the stage's first region, so the
+        # slice ids are the ones at that position of the stage's list, not at
+        # ours.
+        w = self._worker(
+            tp_rank=0, tp_size=2, areas=2, slices=2, n_logical=2, block_len=256
+        )
+        w.local_seen_layer_names = ["l0", "l1"]
+        meta = self._meta(areas=4, slices=2, n_logical=2, block_len=512)
+        meta.kv_area_slices = [[1, 0, 1, 0], [0, 0, 1, 1]]
+
+        out = w._build_head_matched_remote(
+            meta,
+            remote_tp_rank=0,
+            remote_tp_size=1,
+            registered_layer_names=["l1", "l2"],
+        )
+        assert {region for region, _, _ in self._decoded(out, meta)} == {1}
 
     def test_offset_into_coarser_remote_area(self):
         """P TP1 -> D TP4: the peer's area holds 2 heads, we want one of them,
@@ -2391,10 +3032,10 @@ class TestHeadBandMatching:
         )
 
     def test_a_packed_block_is_named_once_in_k_and_once_in_v(self):
-        # The count is the wiring: `_head_matched_desc` takes how many ranges a
-        # block breaks into, and only this builder derives it. Testing that
-        # method directly leaves the derivation and the hand-off unpinned, and
-        # a peer then reads a whole packed block where it wanted K.
+        # The count is the wiring: `pair_area` takes how many ranges a block
+        # breaks into, and only this builder hands it on. Testing that function
+        # directly leaves the hand-off unpinned, and a peer then reads a whole
+        # packed block where it wanted K.
         split = self._worker(
             tp_rank=0, tp_size=4, areas=4, slices=2, n_logical=1, block_len=256
         )
@@ -2424,7 +3065,6 @@ class TestHeadBandMatching:
         )
         w._kv_per_block = 2
         set_shape(w, chunk_mode=True)
-        w._kv_split_axis = KVSplitAxis.HEAD
         w.vllm_config = mock_vllm_config()
         w.vllm_config.scheduler_config.max_num_batched_tokens = 8
         meta = self._meta(areas=4, slices=4, n_logical=1, block_len=512)
@@ -2448,54 +3088,173 @@ class TestHeadBandMatching:
         # A 16-token block whose 2-head region costs 16B a token, so a 128B
         # descriptor target is 8 tokens: two chunks of a block.
         set_shape(w, chunk_mode=True)
-        w._kv_split_axis = KVSplitAxis.HEAD
         w.vllm_config = mock_vllm_config()
         w.vllm_config.scheduler_config.max_num_batched_tokens = prefill
         return w
 
     @pytest.mark.parametrize(
-        "split, expected",
+        "rows, expected",
         [
             # 8 heads over 4 areas is 2 per area, and a block is two chunks.
-            (1, (2, 2)),
-            # A split halves the piece, so it holds half the heads.
-            (2, (1, 2)),
-            # A piece narrower than a head cannot be cut by head.
-            (4, None),
+            (None, (2, 2)),
+            # A piece holding half the area's heads is half the runs.
+            (1, (1, 2)),
         ],
     )
     def test_a_head_cut_spreads_a_chunk_over_one_run_per_head(
-        self, monkeypatch, split, expected
+        self, monkeypatch, rows, expected
     ):
         w = self._grid_worker(monkeypatch=monkeypatch)
 
-        assert w._shard_chunk_grid(block_size=16, split=split) == expected
+        assert w._shard_chunk_grid(
+            range(4), block_size=16, rows=None if rows is None else [rows] * 4
+        ) == uniform_grid(*expected, regions=4)
 
     @pytest.mark.parametrize(
-        "kv_per_block, kv_runs, expected",
+        "kv_per_block, rows, expected",
         [
             # A piece that is K or V alone: one run per head, as before.
-            (1, 1, (2, 8)),
+            (1, None, (2, 8)),
             (2, 2, (2, 8)),
             # A piece holding both: the same token range sits once in each, so
             # it takes twice the runs over the same chunks.
-            (2, 1, (4, 8)),
+            (2, None, (4, 8)),
         ],
     )
     def test_a_piece_holding_both_halves_takes_a_run_in_each(
-        self, monkeypatch, kv_per_block, kv_runs, expected
+        self, monkeypatch, kv_per_block, rows, expected
     ):
         w = self._grid_worker(monkeypatch=monkeypatch, prefill=2)
         w._kv_per_block = kv_per_block
 
-        assert w._shard_chunk_grid(block_size=16, split=1, kv_runs=kv_runs) == expected
+        assert w._shard_chunk_grid(
+            range(4), block_size=16, rows=None if rows is None else [rows] * 4
+        ) == uniform_grid(*expected, regions=4)
 
-    def test_regions_that_disagree_on_their_band_get_no_grid(self, monkeypatch):
-        # Both lists carry one grid, so one region's head band cannot describe
-        # them -- a draft's regions are named past the target's.
+    def test_regions_that_disagree_on_their_band_take_their_own_runs(self, monkeypatch):
+        # A draft's regions hold their own head band, so a chunk of one is
+        # fewer runs than a chunk of the target's -- over the same chunks.
         w = self._grid_worker(monkeypatch=monkeypatch, kv_heads=[8, 4])
 
-        assert w._shard_chunk_grid(block_size=16, split=1) is None
+        assert w._shard_chunk_grid(range(8), block_size=16) == ChunkGrid(
+            2, ((0, 2, 2),) * 4 + ((0, 1, 2),) * 4
+        )
+
+    @pytest.mark.parametrize(
+        ("tp_l", "rank", "tp_r", "heads", "packed"),
+        [
+            (2, 0, 1, (8, 4), False),
+            # A rank past the first reads into the middle of the peer's slice.
+            (2, 1, 1, (8, 4), False),
+            # A packed block read by head band is a run in K and one in V.
+            (2, 0, 1, (8, 4), True),
+            (4, 2, 1, (16, 8), True),
+            # The peer holds two of our ranks' heads, not all of them.
+            (4, 3, 2, (16, 8), False),
+        ],
+    )
+    def test_bands_that_differ_pair_head_for_head_across_tp(
+        self, tp_l, rank, tp_r, heads, packed
+    ):
+        """A draft beside its target at unequal TP: the target region holds
+        twice the draft's heads an area, so a chunk is twice the runs in one.
+        The lists pair element-wise, so each entry has to name the same heads,
+        the same half and the same tokens on both sides."""
+        token_bytes, block, areas = 4, 16, 2
+        kv = 2 if packed else 1
+        local_hpa = [h // tp_l // areas for h in heads]
+        peer_hpa = [h // tp_r // areas for h in heads]
+        w = self._worker(
+            tp_rank=rank,
+            tp_size=tp_l,
+            areas=areas,
+            slices=areas,
+            n_logical=2,
+            block_len=[kv * h * block * token_bytes for h in local_hpa],
+            kv_heads=list(heads),
+        )
+        w._kv_per_block = kv
+        set_shape(w, chunk_mode=True)
+        w.vllm_config = mock_vllm_config()
+        w.vllm_config.scheduler_config.max_num_batched_tokens = 4
+        w.block_size, w.num_blocks, w.num_regions = block, 2, 4
+        w.engine_id, w.device_id, w._has_mamba = "local", 0, False
+        w.nixl_memory_type = "VRAM"
+        w.nixl_wrapper = MagicMock()
+        w.nixl_wrapper.get_xfer_descs.side_effect = lambda data, _t: data
+        stride = max(w.block_len_per_layer) * w.num_blocks
+        bases = [stride * (i + 1) for i in range(4)]
+        w.kv_caches_base_addr = {"local": {rank: bases}}
+        meta = self._meta(
+            areas=areas,
+            slices=areas,
+            n_logical=2,
+            block_len=[kv * h * block * token_bytes for h in peer_hpa],
+        )
+        remote_rank = rank // (tp_l // tp_r)
+
+        remote = w._build_head_matched_remote(
+            meta, remote_tp_rank=remote_rank, remote_tp_size=tp_r
+        )
+        region_ids, pieces = w._head_matched_plan(
+            meta, remote_tp_rank=remote_rank, remote_tp_size=tp_r
+        )
+        assert region_ids == [0, 1, 2, 3]
+        grid = w._shard_chunk_grid(
+            region_ids, block_size=block, rows=[p[0].rows for p in pieces]
+        )
+        _handle, local = w._register_shard_local_xfer_handler(
+            block,
+            (),
+            region_ids=region_ids,
+            pieces=pieces,
+            chunk_grid=grid,
+        )
+
+        def meaning(descs, bases, lens, hpa, tp, owner):
+            """(logical region, block, K or V, head, token) each covers."""
+            out = []
+            for addr, length, _dev in (tuple(int(x) for x in d) for d in descs):
+                (region,) = [
+                    r
+                    for r, b in enumerate(bases)
+                    if b <= addr < b + lens[r] * w.num_blocks
+                ]
+                logical, area = divmod(region, areas)
+                blk, offset = divmod(addr - bases[region], lens[region])
+                first = owner * heads[logical] // tp + area * hpa[logical]
+                half = hpa[logical] * block * token_bytes
+                cells = set()
+                for byte in range(offset, offset + length):
+                    k, rest = divmod(byte, half)
+                    head, within = divmod(rest, block * token_bytes)
+                    cells.add((logical, blk, k, first + head, within // token_bytes))
+                out.append(cells)
+            return out
+
+        ours = meaning(
+            local,
+            bases,
+            w.block_len_per_layer,
+            local_hpa,
+            tp_l,
+            rank,
+        )
+        theirs = meaning(
+            remote,
+            meta.kv_caches_base_addr,
+            meta.block_lens,
+            peer_hpa,
+            tp_r,
+            remote_rank,
+        )
+        assert grid is not None and len({runs for _, runs, _ in grid.regions}) == 2
+        assert len(ours) == len(theirs)
+        assert ours == theirs
+        # Past the whole pieces, an entry is one head's chunk of tokens in one
+        # of K and V.
+        whole = w.num_blocks * sum(map(len, pieces))
+        assert {len(m) for m in ours[whole:]} == {block // grid.chunks_per_block}
 
     def test_the_remote_list_takes_the_same_chunk_grid(self):
         """`make_prepped_xfer` pairs the two lists by position, so a range
@@ -2507,12 +3266,15 @@ class TestHeadBandMatching:
         meta = self._meta(areas=4, slices=4, n_logical=1, block_len=512)
 
         plain = w._build_head_matched_remote(meta, remote_tp_rank=0, remote_tp_size=1)
-        with patch.object(type(w), "_shard_chunk_grid", return_value=(2, 2)) as grid:
+        with patch.object(
+            type(w), "_shard_chunk_grid", return_value=uniform_grid(2, 2, regions=4)
+        ) as grid:
             both = w._build_head_matched_remote(
                 meta, remote_tp_rank=0, remote_tp_size=1
             )
-        # Derived here rather than handed in, from the split this list used.
-        assert grid.call_args.kwargs["split"] == 1
+        # Derived here rather than handed in, from the plan this list used.
+        _, pieces = w._head_matched_plan(meta, 0, 1)
+        assert grid.call_args.kwargs["rows"] == [p[0].rows for p in pieces]
 
         assert np.array_equal(both[: len(plain)], plain)
         assert len(both) == len(plain) * 5
@@ -2725,50 +3487,37 @@ class TestHeadBandMatching:
             {(region, 0, 0): 1 for region in range(4, 8)}
         )
 
-    def test_incommensurate_slices_raise(self):
-        # The peer cuts its heads 3 ways against our 2, so its slice is not a
-        # whole fraction of ours; refuse rather than transfer a partial head.
-        with pytest.raises(RuntimeError, match="does not divide it"):
-            RblnNixlPullConnectorWorker._head_split(2, 3)
-
-    def test_head_split_is_one_unless_we_are_coarser(self):
-        # More cuts means a finer slice; our area splits only when the peer is finer.
-        f = RblnNixlPullConnectorWorker._head_split
-        assert f(1, 1) == 1  # equal granularity
-        assert f(2, 1) == 1  # peer coarser -> offset, not split
-        assert f(1, 2) == 2  # peer finer -> two pieces
-        assert f(1, 4) == 4
-
     @pytest.mark.parametrize(
         ("tp_size", "local", "peer", "remote_tp_size", "tp_ratio", "expected"),
         [
             # Peer TP4 holds 2 of the 8 heads and replicates each over 2 areas,
             # so its slice is finer than ours and our region splits.
-            (1, (4, 4), (4, 2), 4, -4, 2),
+            (1, (4, 4, 256), (4, 2, 128), 4, -4, 2),
             # The same pair from the other end: we are the finer side, so the
             # peer's slice covers ours whole and an offset suffices.
-            (4, (4, 2), (4, 4), 1, 4, 1),
-            # Equal TP keeps positional pairing even where the geometries alone
-            # would have split.
-            (2, (4, 2), (4, 4), 2, 1, 1),
+            (4, (4, 2, 128), (4, 4, 256), 1, 4, 1),
         ],
     )
-    def test_peer_head_split_reads_both_geometries(
+    def test_the_plan_reads_both_geometries(
         self, tp_size, local, peer, remote_tp_size, tp_ratio, expected
     ):
+        # (areas, slices, block length) a side; a head is 128B on both.
         w = self._worker(
             tp_rank=0,
             tp_size=tp_size,
             areas=local[0],
             slices=local[1],
             n_logical=1,
-            block_len=256,
+            block_len=local[2],
         )
         w.use_host_buffer = False
         window_mode(w, None, has_swa=False)
         w.transfer_topo.tp_ratio.return_value = tp_ratio
-        meta = self._meta(areas=peer[0], slices=peer[1], n_logical=1, block_len=256)
-        assert w._peer_head_split(meta, remote_tp_size) == expected
+        meta = self._meta(areas=peer[0], slices=peer[1], n_logical=1, block_len=peer[2])
+        _, pieces = w._head_matched_plan(
+            meta, 0, remote_tp_size, peer_areas=[0] if tp_ratio < 0 else None
+        )
+        assert {len(p) for p in pieces} == {expected}
 
     # The three guards below sit between the head arithmetic and the emitted
     # descriptor, which is the last point at which a wrong address is still
@@ -2800,14 +3549,15 @@ class TestHeadBandMatching:
 
     def test_a_region_longer_than_the_peer_leaves_at_that_offset_raises(self):
         # Our rank holds heads 2..3, which start halfway into the peer's area,
-        # so only half of it is ours to read; a longer local region would run
-        # past its end. _validate_head_matched_handshake rejects the same
-        # geometry from the advertised lengths, before any descriptor is built.
+        # so only half of it is ours to read; a longer local region holds wider
+        # heads, which would run past its end. _validate_head_matched_handshake
+        # rejects the same geometry from the advertised lengths, before any
+        # descriptor is built.
         w = self._worker(
             tp_rank=1, tp_size=4, areas=4, slices=2, n_logical=1, block_len=384
         )
         meta = self._meta(areas=4, slices=2, n_logical=1, block_len=512)
-        with pytest.raises(RuntimeError, match=r"wants 384B at \+256B"):
+        with pytest.raises(RuntimeError, match="a KV head is 384B .* and 128B"):
             w._build_head_matched_remote(meta, remote_tp_rank=0, remote_tp_size=1)
 
 
@@ -2877,8 +3627,9 @@ class TestDescriptorOrderContract:
         remote = w._build_head_matched_remote(
             meta, remote_tp_rank=0, remote_tp_size=2, peer_areas=[0, 1]
         )
+        region_ids, pieces = w._head_matched_plan(meta, 0, 2, peer_areas=[0, 1])
         _, local = w._register_shard_local_xfer_handler(
-            w.block_size, ("l0",), peer_areas=[0, 1], split=2, replica_fanout=1
+            w.block_size, ("l0",), region_ids=region_ids, pieces=pieces
         )
         assert len(local) == len(remote) == 8
 
@@ -2930,8 +3681,9 @@ class TestDescriptorOrderContract:
         remote = w._build_head_matched_remote(
             meta, remote_tp_rank=0, remote_tp_size=4, peer_areas=[0]
         )
+        region_ids, pieces = w._head_matched_plan(meta, 0, 4, peer_areas=[0])
         _, local = w._register_shard_local_xfer_handler(
-            w.block_size, ("l0",), peer_areas=[0], split=2, replica_fanout=2
+            w.block_size, ("l0",), region_ids=region_ids, pieces=pieces
         )
         # 1 area x 2 blocks x 2 pieces x 2 copies.
         assert len(local) == len(remote) == 8
@@ -2985,8 +3737,9 @@ class TestDescriptorOrderContract:
         remote = w._build_head_matched_remote(
             meta, remote_tp_rank=0, remote_tp_size=2, peer_areas=[0, 1]
         )
+        region_ids, pieces = w._head_matched_plan(meta, 0, 2, peer_areas=[0, 1])
         _, local = w._register_shard_local_xfer_handler(
-            w.block_size, ("l0", "l1"), peer_areas=[0, 1], split=2, replica_fanout=1
+            w.block_size, ("l0", "l1"), region_ids=region_ids, pieces=pieces
         )
         assert len(local) == len(remote) == 16
 
@@ -3119,14 +3872,18 @@ def _decode_units(rows, *, bases, layouts, num_blocks):
 
 
 def _covers(rows, tag, *, regions, heads, halves, blocks, tokens, times):
-    """`rows` name exactly these units, each `times` over, and nothing else."""
+    """`rows` name exactly these units, each `times` over, and nothing else.
+
+    `heads` is one set for every region, or a dict of each region's own.
+    """
     got = Counter(u for _, units in rows for u in units)
+    heads_of = heads if isinstance(heads, dict) else dict.fromkeys(regions, heads)
     want = {
         _Unit(region, block, half, head, token)
         for region in regions
         for block in blocks
         for half in halves
-        for head in heads
+        for head in heads_of[region]
         for token in tokens
     }
     assert set(got) == want, f"({tag}) the rows name other units than asked for"
@@ -3153,6 +3910,8 @@ def _assert_shard_contract(w, case, *, peer_key, mine, peers, grid, fanout, **un
 
     A sees the two lists only against each other, so a mistake both make
     alike -- a chunk range walked chunk-major, say -- passes it and fails B.
+    `grid` is `(runs, chunks)`, the runs one count or one per region of ours,
+    each region holding as many whole-block rows.
     """
     assert len(mine) == len(peers), "(A) the two lists differ in length"
     for i, ((_, ours), (_, theirs)) in enumerate(zip(mine, peers)):
@@ -3163,8 +3922,12 @@ def _assert_shard_contract(w, case, *, peer_key, mine, peers, grid, fanout, **un
     def covers(rows, tag, **where):
         _covers(rows, tag, times=fanout, **units, **where)
 
-    per_grid = 1 if grid is None else 1 + grid[0] * grid[1]
-    whole = len(mine) // per_grid
+    if grid is None:
+        whole = len(mine)
+    else:
+        runs, chunks = grid
+        runs = [runs] if isinstance(runs, int) else list(runs)
+        whole = len(mine) * len(runs) // (len(runs) + chunks * sum(runs))
     for lo, hi in [(0, whole)] + ([(whole, len(mine))] if grid else []):
         covers(mine[lo:hi], "C", blocks=range(num_blocks), tokens=range(_TOKENS))
         named = Counter((r, u) for r, us in peers[lo:hi] for u in us)
@@ -3207,14 +3970,23 @@ def _shard_worker(w, *, layouts, num_blocks, chunked):
     w._shard_region_group_ids = {}
     w._shard_descs_per_block = {}
     w._shard_chunk_grids = {}
+    w._shard_region_spans = {}
     w._borrowed_src_handles = set()
     w.use_host_buffer = False
-    w._kv_split_axis = KVSplitAxis.HEAD
+    if not hasattr(w, "_logical_region_geometry"):
+        # One head-cut region per layout, as a single-area region is.
+        fill_region_geometry(w, areas=1, axes=[ChipletSplitAxis.HEAD] * len(layouts))
     if w._writes_into_peer:
         # __init__ never ran, so the writer state shutdown() reaches through
         # __del__ is absent.
         w.shutdown = lambda: None
     return w
+
+
+def _as_grid(grid, regions):
+    """The sweep's one `(runs, chunks)` for every region of a shard, as the
+    `ChunkGrid` the shard lists read."""
+    return None if grid is None else uniform_grid(*grid, regions=regions)
 
 
 class _HeadSide(NamedTuple):
@@ -3224,25 +3996,33 @@ class _HeadSide(NamedTuple):
     tp_size: int
     areas: int
     slices: int
+    # Each logical region's model KV heads; a draft beside its target has its own.
+    kv_heads: tuple[int, ...] = (_HEADS, _HEADS)
 
     @property
     def heads_per_slice(self) -> int:
-        return _HEADS // (self.tp_size * self.slices)
+        return self.per_slice(0)
 
-    def heads_of(self, area: int) -> tuple[int, ...]:
-        """The model heads chiplet `area` of this rank holds.
+    def per_slice(self, logical: int) -> int:
+        return self.kv_heads[logical] // (self.tp_size * self.slices)
+
+    def heads_of(self, area: int, logical: int = 0) -> tuple[int, ...]:
+        """The model heads chiplet `area` of this rank holds in `logical`.
 
         Ranks cut the heads into contiguous bands, a rank's slices cut its band
         again, and the `areas // slices` areas of one slice hold it alike.
         """
         slice_ = area // (self.areas // self.slices)
-        first = (self.tp_rank * self.slices + slice_) * self.heads_per_slice
-        return tuple(range(first, first + self.heads_per_slice))
+        width = self.per_slice(logical)
+        first = (self.tp_rank * self.slices + slice_) * width
+        return tuple(range(first, first + width))
 
-    def layouts(self, kv_per_block, n_logical=2):
+    def layouts(self, kv_per_block):
         return [
-            _RegionLayout(logical, self.heads_of(a), _TOKEN_BYTES, kv_per_block)
-            for logical in range(n_logical)
+            _RegionLayout(
+                logical, self.heads_of(a, logical), _TOKEN_BYTES, kv_per_block
+            )
+            for logical in range(len(self.kv_heads))
             for a in range(self.areas)
         ]
 
@@ -3262,12 +4042,16 @@ class TestHeadMatchedDescriptorSweep:
 
         Unequal TP in both directions, at commensurate cuts and with none of
         our areas straddling two peer ranks; the refusals have their own tests.
+        Each also with a draft beside the target at six times its KV heads, so
+        a chunk of the draft's region is more runs than one of the target's.
         """
         locals_ = [
-            _HeadSide(0, 1, 2, 2),
-            _HeadSide(0, 1, 4, 4),
-            _HeadSide(0, 2, 2, 2),
-            _HeadSide(1, 2, 2, 2),
+            _HeadSide(0, 1, 2, 2, kv_heads)
+            for kv_heads in ((_HEADS, _HEADS), (_HEADS, 6 * _HEADS))
+        ] + [
+            _HeadSide(*side, kv_heads)
+            for side in ((0, 1, 4, 4), (0, 2, 2, 2), (1, 2, 2, 2))
+            for kv_heads in ((_HEADS, _HEADS), (_HEADS, 6 * _HEADS))
         ]
         peers = [  # (tp, slices, replicas)
             (1, 1, 1),
@@ -3292,7 +4076,7 @@ class TestHeadMatchedDescriptorSweep:
                 ):
                     continue
                 ranks = [
-                    _HeadSide(t, tp_r, slices_r * replicas_r, slices_r)
+                    _HeadSide(t, tp_r, slices_r * replicas_r, slices_r, local.kv_heads)
                     for t in range(tp_r)
                 ]
                 paired = [
@@ -3317,7 +4101,7 @@ class TestHeadMatchedDescriptorSweep:
 
     @staticmethod
     def _expected(case, peer):
-        """(split, peer copies, halves, grid, our areas it serves) from the shape."""
+        """(peer copies, grid, our areas it serves) from the shape."""
         local = case["local"]
         theirs = {h for a in range(peer.areas) for h in peer.heads_of(a)}
         areas = [a for a in range(local.areas) if set(local.heads_of(a)) <= theirs]
@@ -3331,11 +4115,16 @@ class TestHeadMatchedDescriptorSweep:
         grid = None
         if case["chunks"] is not None:
             # A token range is one run per head of the piece, in each half the
-            # piece still holds.
-            runs = case["kv_per_block"] // halves * (local.heads_per_slice // split)
+            # piece still holds -- per region, since a draft's piece holds its
+            # own heads. Our regions run logical-major over the areas served.
+            runs = [
+                case["kv_per_block"] // halves * (local.per_slice(logical) // split)
+                for logical in range(len(local.kv_heads))
+                for _ in areas
+            ]
             grid = (runs, case["chunks"])
         peer_areas = None if len(areas) == local.areas else areas
-        return split, fanout, halves, grid, peer_areas
+        return fanout, grid, peer_areas
 
     def _check(self, case):
         """Assert the contract for every peer rank of `case`."""
@@ -3347,8 +4136,8 @@ class TestHeadMatchedDescriptorSweep:
             areas=local_side.areas,
             slices=local_side.slices,
             n_logical=2,
-            block_len=layouts[0].block_len,
-            kv_heads=_HEADS,
+            block_len=[layouts[lg * local_side.areas].block_len for lg in range(2)],
+            kv_heads=list(local_side.kv_heads),
         )
         w.__class__ = (
             RblnNixlPullConnectorWorker
@@ -3364,7 +4153,7 @@ class TestHeadMatchedDescriptorSweep:
             chunked=case["chunks"] is not None,
         )
         for peer in case["peer"]:
-            split, fanout, halves, grid, peer_areas = self._expected(case, peer)
+            fanout, grid, peer_areas = self._expected(case, peer)
             peer_layouts = peer.layouts(case["kv_per_block"])
             meta = _agent_meta(
                 kv_areas=peer.areas,
@@ -3376,7 +4165,12 @@ class TestHeadMatchedDescriptorSweep:
             )
             # The grid is the shape's: deriving it is not what these lists are
             # held to here.
-            with patch.object(type(w), "_shard_chunk_grid", return_value=grid):
+            chunk_grid = (
+                None
+                if grid is None
+                else ChunkGrid(grid[1], tuple((0, r, grid[1]) for r in grid[0]))
+            )
+            with patch.object(type(w), "_shard_chunk_grid", return_value=chunk_grid):
                 remote = w._build_head_matched_remote(
                     meta,
                     remote_tp_rank=peer.tp_rank,
@@ -3389,10 +4183,10 @@ class TestHeadMatchedDescriptorSweep:
                     _TOKENS,
                     ("l0", "l1"),
                     peer_areas=peer_areas,
-                    split=split,
+                    plan=w._head_matched_plan(
+                        meta, peer.tp_rank, peer.tp_size, peer_areas=peer_areas
+                    ),
                     remote_tp_size=peer.tp_size,
-                    replica_fanout=fanout,
-                    kv_runs=halves,
                 )
             local = w.nixl_wrapper.get_xfer_descs.call_args.args[0]
             _assert_shard_contract(
@@ -3414,11 +4208,14 @@ class TestHeadMatchedDescriptorSweep:
                 grid=grid,
                 fanout=fanout,
                 regions=range(2),
-                heads=sorted(
-                    h
-                    for a in (peer_areas or range(local_side.areas))
-                    for h in local_side.heads_of(a)
-                ),
+                heads={
+                    logical: sorted(
+                        h
+                        for a in (peer_areas or range(local_side.areas))
+                        for h in local_side.heads_of(a, logical)
+                    )
+                    for logical in range(2)
+                },
                 halves=range(case["kv_per_block"]),
             )
 
@@ -3519,7 +4316,11 @@ class TestStageDescriptorSweep:
                 pp_rank=rank,
                 pp_size=len(case["stages"]),
             )
-            with patch.object(type(w), "_shard_chunk_grid", return_value=grid):
+            with patch.object(
+                type(w),
+                "_shard_chunk_grid",
+                return_value=_as_grid(grid, len(peer_layouts)),
+            ):
                 remote = w._build_fa_remote(
                     TestPeerRegionView._plan(), meta, block_size_ratio=1
                 )
@@ -3587,7 +4388,7 @@ class TestChunkRangeSweep:
         num_blocks, (runs, chunks) = case["num_blocks"], case["grid"]
         rows = np.asarray(
             RblnNixlWorkerState._chunk_range_descs(
-                pieces, num_blocks=num_blocks, grid=case["grid"]
+                pieces, num_blocks=num_blocks, grids=[case["grid"]] * len(pieces)
             )
         ).tolist()
 
@@ -3619,11 +4420,10 @@ class TestChunkRangeSweep:
             for span in [(c, c + 1) for c in range(chunks)] + [(0, chunks)]:
                 ids = _chunk_desc_ids(
                     start=0,
-                    positions=np.arange(len(pieces), dtype=np.int64),
+                    cuts=[(0, runs, chunks)] * len(pieces),
                     num_blocks=num_blocks,
                     block_id=block,
                     per_block=1,
-                    grid=case["grid"],
                     chunk_span=span,
                 )
                 picked = {(rows[i][0], rows[i][1]) for i in ids}
@@ -3649,6 +4449,74 @@ class TestChunkRangeSweep:
             except AssertionError as e:
                 raise AssertionError(f"{case}: {e}") from e
 
+    @staticmethod
+    def _mixed_shapes():
+        # Per region `(first, runs, chunks)` of the block's chunks, as a context
+        # cut beside a head cut lays them out: a region holding one chunk or
+        # less has no runs, and its whole-block descriptor names it.
+        return [
+            dict(num_blocks=num_blocks, cuts=cuts)
+            for num_blocks in (1, 3)
+            for cuts in (
+                ((0, 0, 1), (0, 2, 2), (1, 0, 1)),  # two areas a chunk
+                ((0, 2, 1), (1, 2, 1), (0, 4, 2)),  # one area a chunk
+                ((0, 1, 2), (2, 1, 2), (0, 2, 4)),  # an area two chunks
+            )
+        ]
+
+    def _check_mixed(self, case):
+        pieces, num_blocks, cuts = self.PIECES, case["num_blocks"], case["cuts"]
+        chunks_per_block = max(first + chunks for first, _, chunks in cuts)
+        whole = RblnNixlWorkerState._chunk_range_descs(
+            pieces, num_blocks=num_blocks, grids=[(1, 1)] * len(pieces)
+        )
+        chunked = RblnNixlWorkerState._chunk_range_descs(
+            pieces, num_blocks=num_blocks, grids=[(r, c) for _, r, c in cuts]
+        )
+        assert len(chunked) == num_blocks * sum(r * c for _, r, c in cuts), (
+            "a region of no runs adds chunk rows"
+        )
+        rows = np.concatenate([whole, chunked]).tolist()
+        for block, (lo, hi), partial_only in itertools.product(
+            range(num_blocks),
+            itertools.combinations(range(chunks_per_block + 1), 2),
+            (False, True),
+        ):
+            ids = _chunk_desc_ids(
+                start=len(whole),
+                cuts=cuts,
+                num_blocks=num_blocks,
+                block_id=block,
+                per_block=1,
+                chunk_span=(lo, hi),
+                partial_only=partial_only,
+            )
+            want = []
+            for (base, length, stride, _), (first, runs, chunks) in zip(pieces, cuts):
+                begin, end = max(lo, first) - first, min(hi, first + chunks) - first
+                if begin >= end or (partial_only and begin == 0 and end == chunks):
+                    continue
+                start = base + block * stride
+                if not runs:
+                    want.append((start, length))
+                    continue
+                run = length // runs
+                want += [
+                    (start + r * run + c * (run // chunks), run // chunks)
+                    for r in range(runs)
+                    for c in range(begin, end)
+                ]
+            picked = sorted((rows[i][0], rows[i][1]) for i in ids)
+            assert picked == sorted(want), (block, (lo, hi), partial_only)
+            assert len(ids) == len(want), "a chunk picked twice"
+
+    def test_a_region_of_no_runs_is_picked_by_its_whole_block(self):
+        for case in self._mixed_shapes():
+            try:
+                self._check_mixed(case)
+            except AssertionError as e:
+                raise AssertionError(f"{case}: {e}") from e
+
 
 class TestFanInAreaPartition:
     """Splitting our chiplet areas across a peer that has MORE TP ranks.
@@ -3664,8 +4532,10 @@ class TestFanInAreaPartition:
         w = object.__new__(RblnNixlPullConnectorWorker)
         w._kv_per_block = 1
         w.tp_rank = tp_rank
-        w._kv_areas = areas
-        w._kv_slices = slices
+        w._logical_region_kv_heads = [8]
+        fill_region_geometry(
+            w, areas=areas, axes=[ChipletSplitAxis.HEAD], slices=slices
+        )
         w.use_host_buffer = host_buffer
         topo = MagicMock()
         topo.tp_size = tp_size
@@ -3705,6 +4575,22 @@ class TestFanInAreaPartition:
         assert w._fan_in_peer_areas(0, remote_tp_size=8) == [0, 1]
         assert w._fan_in_peer_areas(1, remote_tp_size=8) == [2, 3]
 
+    def test_interleaved_replicas_follow_the_slice_their_layout_names(self):
+        # Nothing promises the replicas of a slice sit side by side; the slice
+        # each area holds is what decides its peer, not its position.
+        w = self._worker(tp_rank=0, tp_size=4, areas=4, slices=2)
+        (geometry,) = w._logical_region_geometry
+        w._logical_region_geometry = [
+            geometry._replace(
+                areas=tuple(
+                    place._replace(slice_id=a % 2)
+                    for a, place in enumerate(geometry.areas)
+                )
+            )
+        ]
+        assert w._fan_in_peer_areas(0, remote_tp_size=8) == [0, 2]
+        assert w._fan_in_peer_areas(1, remote_tp_size=8) == [1, 3]
+
     @pytest.mark.parametrize(
         "tp_size,slices,remote_tp_size",
         [(2, 4, 4), (1, 4, 2), (1, 4, 4), (4, 2, 8)],
@@ -3721,13 +4607,6 @@ class TestFanInAreaPartition:
             for area in (w._fan_in_peer_areas(peer, remote_tp_size) or [])
         ]
         assert sorted(seen) == [0, 1, 2, 3]
-
-    def test_area_straddling_two_peers_raises(self):
-        """P TP8 -> D TP1: an area holds heads {2a, 2a+1} but each peer owns a
-        single head, so the area would have to be split across two agents."""
-        w = self._worker(tp_rank=0, tp_size=1, areas=4, slices=4)
-        with pytest.raises(RuntimeError, match="straddle several"):
-            w._fan_in_peer_areas(0, remote_tp_size=8)
 
     def test_host_bounce_never_fans_in(self):
         # Host-bounce registers one logical full-shape buffer per layer, so
@@ -3752,9 +4631,11 @@ class TestShardRegionAreaFilter:
     def _worker(*, areas, n_layers):
         w = object.__new__(RblnNixlPullConnectorWorker)
         w._kv_per_block = 1
-        w._kv_areas = areas
         # One K and one V region per layer, each expanded over `areas`.
         w.num_regions = n_layers * 2 * areas
+        fill_region_geometry(
+            w, areas=areas, axes=[ChipletSplitAxis.HEAD] * (n_layers * 2)
+        )
         w.local_seen_layer_names = [f"l{i}" for i in range(n_layers)]
         return w
 
@@ -3808,10 +4689,13 @@ class TestADecodeContextParallelPeerIsRefused:
         w.dst_xfer_side_handles = defaultdict(dict)
         w.nixl_wrapper = MagicMock()
         w.transfer_topo = MagicMock(tp_size=1)
-        w._kv_areas = w._kv_slices = 1
+        w._logical_region_kv_heads = [8]
+        fill_region_geometry(w, areas=2, axes=[ChipletSplitAxis.HEAD], slices=2)
         w._is_head_matched_peer = MagicMock(return_value=True)
-        w._reject_uneven_region_slices = MagicMock()
         w._register_remote_engine_prelude = MagicMock()
+        w._check_d2d_region_pairing = MagicMock()
+        w._check_split_axis_constraints = MagicMock()
+        w._check_mla_constraints = MagicMock()
         w._build_head_matched_remote = MagicMock(return_value=[(0, 0, 0)])
         w._fan_in_peer_areas = MagicMock(return_value=None)
         return w
@@ -3861,9 +4745,12 @@ class TestARefusedPeerLeavesNothingBehind:
         w.tp_mappings = {}
         w._group_spec_types = []
         w.transfer_topo = MagicMock(tp_size=1)
-        w._kv_areas = w._kv_slices = 1
+        w._logical_region_kv_heads = [8]
+        fill_region_geometry(w, areas=1, axes=[ChipletSplitAxis.HEAD])
         w._is_head_matched_peer = MagicMock(return_value=True)
-        w._reject_uneven_region_slices = MagicMock()
+        w._check_d2d_region_pairing = MagicMock()
+        w._check_split_axis_constraints = MagicMock()
+        w._check_mla_constraints = MagicMock()
         w._build_head_matched_remote = MagicMock(return_value=[(0, 0, 0)])
         w._fan_in_peer_areas = MagicMock(return_value=None)
         return w
@@ -3881,11 +4768,245 @@ class TestARefusedPeerLeavesNothingBehind:
         assert w.kv_caches_base_addr == {}
         w.nixl_wrapper.add_remote_agent.assert_not_called()
 
+    @pytest.mark.parametrize("peer_slices, peer_cuts", [(2, 4), (1, 2)])
+    def test_heads_cut_at_incommensurate_widths_are_refused_unregistered(
+        self, peer_slices, peer_cuts
+    ):
+        # Three cuts here against a peer's finer four or coarser two: an area of
+        # either side holds part of one of the other's, which no plan of like
+        # pieces names.
+        w = self._worker()
+        # More areas than slices on both sides: the cut is the slices'.
+        w._local_band = MagicMock(return_value=(6, 3, [0, 1, 2] * 2))
+        w._peer_band = MagicMock(return_value=(4, peer_slices))
+        meta = _agent_meta(engine_id="peer")
+
+        with pytest.raises(
+            RuntimeError, match=f"cuts KV heads 3 ways and the peer {peer_cuts},"
+        ):
+            w.add_remote_agent(meta, 0, 2, meta.dcp_size)
+
+        w.transfer_topo.register_remote_engine.assert_not_called()
+        assert w.dst_num_blocks == {}
+        assert w.kv_caches_base_addr == {}
+        w.nixl_wrapper.add_remote_agent.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "tp, areas, slices, peer_tp",
+        [(1, 1, 1, 2), (1, 4, 2, 4), (2, 6, 3, 4)],
+    )
+    def test_an_area_straddling_finer_peers_is_refused_unregistered(
+        self, tp, areas, slices, peer_tp
+    ):
+        # Commensurate cuts, but a peer rank holds less than one of our areas,
+        # or (TP 2, 3 slices against TP 4) not a whole number of them.
+        w = self._straddle_worker(tp, areas, slices, peer_tp)
+        meta = _agent_meta(engine_id="peer")
+
+        with pytest.raises(RuntimeError, match="straddle several peers"):
+            w.add_remote_agent(meta, 0, peer_tp, meta.dcp_size)
+
+        w.transfer_topo.register_remote_engine.assert_not_called()
+        w.nixl_wrapper.add_remote_agent.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "tp, areas, slices, peer_tp",
+        [(1, 4, 4, 2), (2, 8, 4, 4)],
+    )
+    def test_a_finer_peer_holding_several_whole_areas_registers(
+        self, tp, areas, slices, peer_tp
+    ):
+        # The other side of the same condition: a peer rank holding two of our
+        # areas is not a straddle.
+        w = self._straddle_worker(tp, areas, slices, peer_tp)
+        meta = _agent_meta(engine_id="peer")
+
+        w.add_remote_agent(meta, 0, peer_tp, meta.dcp_size)
+
+        w.transfer_topo.register_remote_engine.assert_called_once()
+
+    def _straddle_worker(self, tp, areas, slices, peer_tp):
+        # The real _fan_in_peer_areas, which refused a straddle after the peer
+        # was registered.
+        w = self._worker()
+        del w._fan_in_peer_areas
+        w._validate_remote_agent_handshake = MagicMock()
+        w.use_host_buffer = False
+        w.tp_rank = 0
+        w.transfer_topo.tp_size = tp
+        w.transfer_topo.total_num_kv_heads = 12 * tp
+        w.transfer_topo.tp_ratio = MagicMock(return_value=-(peer_tp // tp))
+        ids = [a * slices // areas for a in range(areas)]
+        w._local_band = MagicMock(return_value=(areas, slices, ids))
+        w._peer_band = MagicMock(return_value=(slices, slices))
+        return w
+
+    @pytest.mark.parametrize(
+        "check",
+        [
+            "_check_d2d_region_pairing",
+            "_check_split_axis_constraints",
+            "_check_mla_constraints",
+        ],
+    )
+    def test_the_layout_is_checked_before_the_peer_is_registered(self, check):
+        # The head-cut check counts every region's slices as head cuts, so a
+        # peer laid out otherwise has to be refused first, and before the prelude.
+        w = self._worker()
+        setattr(w, check, MagicMock(side_effect=RuntimeError("laid out otherwise")))
+        meta = _agent_meta(engine_id="peer")
+
+        with pytest.raises(RuntimeError, match="laid out otherwise"):
+            w.add_remote_agent(meta, 0, 2, meta.dcp_size)
+
+        w.transfer_topo.register_remote_engine.assert_not_called()
+        w.nixl_wrapper.add_remote_agent.assert_not_called()
+
+    @pytest.mark.parametrize("peer_tp", [4, 3])
+    def test_an_mla_peer_of_another_tp_is_refused_as_mla_unregistered(self, peer_tp):
+        # Through the real check: refused by name ahead of the head-cut check,
+        # which would refuse TP 2 against TP 3 under its own message.
+        w = self._worker()
+        del w._check_mla_constraints
+        del w._is_head_matched_peer
+        w.use_mla = True
+        w._logical_region_kv_heads = [None]
+        w._logical_region_latent = [True]
+        w.use_host_buffer = False
+        w.transfer_topo.tp_size = 2
+        w.transfer_topo.tp_ratio = MagicMock(side_effect=lambda r: 1 if r == 2 else -r)
+        meta = _agent_meta(engine_id="peer")
+
+        with pytest.raises(RuntimeError, match="MLA is not supported"):
+            w.add_remote_agent(meta, 0, peer_tp, meta.dcp_size)
+
+        w.transfer_topo.register_remote_engine.assert_not_called()
+        w.nixl_wrapper.add_remote_agent.assert_not_called()
+
+    def _mixed_worker(self):
+        """A non-MLA engine at TP 2 of a head-cut attention region and a
+        token-cut latent, the real refusal in place."""
+        w = self._worker()
+        del w._check_mla_constraints
+        w.use_mla = False
+        w.use_host_buffer = False
+        w.transfer_topo.tp_size = 2
+        w.transfer_topo.tp_ratio = MagicMock(
+            side_effect=lambda r: 2 // r if r <= 2 else -(r // 2)
+        )
+        fill_region_geometry(
+            w,
+            areas=4,
+            axes=[ChipletSplitAxis.HEAD, ChipletSplitAxis.TOKEN],
+            slices=[2, 4],
+        )
+        w._logical_region_kv_heads = [8, None]
+        w._logical_region_latent = [False, True]
+        return w
+
+    @pytest.mark.parametrize("pp_size", [1, 4])
+    @pytest.mark.parametrize("peer_tp", [4, 1])
+    def test_a_latent_beside_attention_is_refused_across_tp_unregistered(
+        self, peer_tp, pp_size
+    ):
+        # Named before the bands are read: the peer's latent is cut into more
+        # slices than its attention, which no one band describes. Entered where
+        # the handshake enters, for a peer of one stage and of several -- the
+        # validator beside it branches on `pp_size <= 1`, and the check must not.
+        w = self._mixed_worker()
+        del w._is_head_matched_peer
+        meta = _agent_meta(
+            engine_id="peer",
+            kv_areas=4,
+            kv_split_axes=[ChipletSplitAxis.HEAD, ChipletSplitAxis.TOKEN],
+            kv_area_slices=[[0, 0, 1, 1], [0, 1, 2, 3]],
+            pp_size=pp_size,
+        )
+
+        with pytest.raises(RuntimeError, match="key-only latent region"):
+            w._add_remote_agent_head_matched(meta, 0, peer_tp, meta.dcp_size)
+
+        w.transfer_topo.register_remote_engine.assert_not_called()
+        w.nixl_wrapper.add_remote_agent.assert_not_called()
+
+    def test_an_mla_engine_is_not_refused_as_a_latent_across_tp(self):
+        # An MLA engine is latent throughout, which positional pairing already
+        # pairs as replicas; the latent refusal is for a latent beside attention.
+        w = self._mixed_worker()
+        w.use_mla = True
+        w._logical_region_latent = [True, True]
+        w._is_head_matched_peer = MagicMock(return_value=False)
+
+        w._check_mla_constraints(_agent_meta(engine_id="peer"), 1)  # no raise
+
+    def test_a_latent_at_equal_tp_passes(self):
+        w = self._mixed_worker()
+        del w._is_head_matched_peer
+
+        w._check_mla_constraints(_agent_meta(engine_id="peer"), 2)  # no raise
+
+    def test_a_context_cut_peer_is_refused_by_its_axis_unregistered(self):
+        # Through the real check, ahead of the head-cut check, which would count
+        # the peer's slices as head cuts and refuse TP 2 against TP 3 for that.
+        w = self._worker()
+        del w._check_split_axis_constraints
+        del w._is_head_matched_peer
+        w.use_mla = False
+        w.use_host_buffer = False
+        w.transfer_topo.tp_size = 2
+        w.transfer_topo.tp_ratio = MagicMock(side_effect=lambda r: 1 if r == 2 else -r)
+        meta = _agent_meta(
+            engine_id="peer", kv_split_axes=[ChipletSplitAxis.TOKEN], region_names=[]
+        )
+
+        with pytest.raises(RuntimeError, match="peer cut logical region 0"):
+            w.add_remote_agent(meta, 0, 3, meta.dcp_size)
+
+        w.transfer_topo.register_remote_engine.assert_not_called()
+        w.nixl_wrapper.add_remote_agent.assert_not_called()
+
+    def test_a_peer_of_another_kv_layout_is_refused_by_it_unregistered(self):
+        # Through the real check, ahead of the head-cut check, which would
+        # refuse TP 2 against TP 3 under its own message.
+        w = self._worker()
+        del w._check_d2d_region_pairing
+        w.use_host_buffer = False
+        w.transfer_topo.tp_size = 2
+        w.transfer_topo.tp_ratio = MagicMock(side_effect=lambda r: 1 if r == 2 else -r)
+        meta = _agent_meta(engine_id="peer", kv_per_block=2)
+
+        with pytest.raises(RuntimeError, match="use_custom_kernel"):
+            w.add_remote_agent(meta, 0, 3, meta.dcp_size)
+
+        w.transfer_topo.register_remote_engine.assert_not_called()
+        w.nixl_wrapper.add_remote_agent.assert_not_called()
+
+    def test_a_sliding_window_engine_refuses_another_tp_unregistered(self):
+        w = self._worker()
+        del w._check_d2d_region_pairing
+        w._shape = shape(has_swa=True)
+        w._window_grid_cut = None
+        w.block_len_per_layer = [8192]
+        w.local_seen_layer_names = ["layer.0"]
+        w.num_regions = 1
+        w.use_host_buffer = False
+        w.transfer_topo.tp_size = 2
+        w.transfer_topo.tp_ratio = MagicMock(side_effect=lambda r: 1 if r == 2 else -r)
+        meta = _agent_meta(engine_id="peer", region_names=[])
+
+        with pytest.raises(RuntimeError, match="sliding-window"):
+            w.add_remote_agent(meta, 0, 4, meta.dcp_size)
+
+        w.transfer_topo.register_remote_engine.assert_not_called()
+        w.nixl_wrapper.add_remote_agent.assert_not_called()
+
     def test_the_prelude_carries_the_peers_dcp_size(self):
         # `EngineTransferInfo.remote_dcp_size` defaults to 1, so a prelude that
         # does not pass it describes every peer as DCP-1 -- and upstream's own
         # validation asserts the topology agrees with the argument.
         w = self._worker()
+        # Two areas, so the peer's TP 2 holds whole ones.
+        fill_region_geometry(w, areas=2, axes=[ChipletSplitAxis.HEAD], slices=2)
         w._validate_remote_agent_handshake = MagicMock()
         meta = _agent_meta(engine_id="peer", dcp_size=1)
 
@@ -3951,13 +5072,15 @@ class TestTheRemoteRegionLedger:
         w.region_group_ids = list(region_group_ids)
         w.nixl_memory_type = "VRAM"
         w.nixl_wrapper = MagicMock()
-        w._kv_areas = 1
-        w._kv_slices = 1
+        w._logical_region_kv_heads = [8]
+        fill_region_geometry(w, areas=2, axes=[ChipletSplitAxis.HEAD], slices=2)
         w._kv_per_block = 1
         w.transfer_topo = MagicMock(tp_size=1)
-        w._reject_uneven_region_slices = MagicMock()
         w._register_remote_engine_prelude = MagicMock()
         w._validate_remote_agent_handshake = MagicMock()
+        w._check_d2d_region_pairing = MagicMock()
+        w._check_split_axis_constraints = MagicMock()
+        w._check_mla_constraints = MagicMock()
         w._build_head_matched_remote = MagicMock(return_value=[(0, 0, 0)])
         w._fan_in_peer_areas = MagicMock(return_value=None)
         return w
@@ -4063,7 +5186,8 @@ class TestD2DRegionPairing:
     def test_peer_with_more_tp_ranks_allowed(self):
         # Fan-in: our band spreads over several peer ranks and
         # _fan_in_peer_areas splits our areas between them. Whether an area
-        # straddles two peers needs the measured geometry, so it is checked there.
+        # straddles two peers needs the chiplet cuts, so
+        # _add_remote_agent_head_matched checks it before registering the peer.
         w = self._worker(host_buffer=False, tp_ratio=-2, n_local=56, tp_size=2)
         w._check_d2d_region_pairing(self._meta(56), remote_tp_size=4)  # no raise
 
@@ -4120,8 +5244,9 @@ class TestCleanupRemoteEngine:
         w.nixl_wrapper = MagicMock()
         w.src_xfer_handles_by_remote = {("eng", 0, 16): 100}
         w._shard_region_group_ids = {("eng", 0): (0,)}
-        w._shard_descs_per_block = {("eng", 0): 1}
+        w._shard_descs_per_block = {("eng", 0): (1,)}
         w._shard_chunk_grids = {("eng", 0): None}
+        w._shard_region_spans = {("eng", 0): (0,)}
         w._borrowed_src_handles = set()
         w._remote_shard_layer_names = defaultdict(dict, {"eng": {0: ("l0",)}})
         w._overlapping_ranks = defaultdict(list, {"eng": [0]})
@@ -4151,12 +5276,17 @@ class TestCleanupRemoteEngine:
             ("eng", 1): (0,),
             ("other", 0): (0,),
         }
-        w._shard_descs_per_block = {("eng", 0): 1, ("eng", 1): 2, ("other", 0): 1}
+        w._shard_descs_per_block = {
+            ("eng", 0): (1,),
+            ("eng", 1): (2,),
+            ("other", 0): (1,),
+        }
         w._shard_chunk_grids = {
             ("eng", 0): (1, 2),
             ("eng", 1): None,
             ("other", 0): None,
         }
+        w._shard_region_spans = {key: (0,) for key in w._shard_chunk_grids}
         w._borrowed_src_handles = set()
         w._remote_shard_layer_names = defaultdict(dict, {"eng": {0: ("l0",)}})
         w._overlapping_ranks = defaultdict(list, {"eng": [0, 1], "other": [0]})
@@ -4175,6 +5305,7 @@ class TestCleanupRemoteEngine:
         assert [k for k in w._shard_descs_per_block if k[0] == "eng"] == []
         # A grid left behind would index a range the re-handshake did not build.
         assert [k for k in w._shard_chunk_grids if k[0] == "eng"] == []
+        assert [k for k in w._shard_region_spans if k[0] == "eng"] == []
         # Local dlist handles are ours to release; one per stage.
         assert sorted(
             c.args[0] for c in w.nixl_wrapper.release_dlist_handle.call_args_list
@@ -4222,16 +5353,21 @@ class TestHeadMatchedHandshakeChecks:
         w.kv_cache_layout = layout
         lens = list(local_len) if isinstance(local_len, list) else [local_len]
         # 8 heads over TP4 is 2 per rank, cut into 2 slices -> 1 head per area.
-        w._kv_areas, w._kv_slices = 4, 2
-        w.block_len_per_layer = [ln for ln in lens for _ in range(w._kv_areas)]
+        w.block_len_per_layer = [ln for ln in lens for _ in range(4)]
         w._logical_region_kv_heads = (
             list(kv_heads) if isinstance(kv_heads, list) else [kv_heads] * len(lens)
+        )
+        fill_region_geometry(
+            w, areas=4, axes=[ChipletSplitAxis.HEAD] * len(lens), slices=2
         )
         topo = MagicMock()
         topo.tp_size = 4
         topo.total_num_kv_heads = w._logical_region_kv_heads[0]
         topo.block_size_ratio.return_value = block_size_ratio
         w.transfer_topo = topo
+        w.vllm_config = mock_vllm_config()
+        w.vllm_config.parallel_config.tensor_parallel_size = 4
+        w.vllm_config.speculative_config = None
         return w
 
     @staticmethod
@@ -4250,6 +5386,30 @@ class TestHeadMatchedHandshakeChecks:
 
     def test_equal_bytes_per_head_passes(self):
         w = self._worker(local_len=128)
+        w._validate_head_matched_handshake(
+            self._meta(remote_len=256), remote_tp_size=1
+        )  # no raise
+
+    def test_a_draft_at_another_tp_is_refused_by_name(self):
+        # A separate draft may run at TP 1 under a TP4 target, and then every
+        # rank holds all of its heads. Unnamed, that surfaced as an assertion
+        # on a missing head band, far from the setting that caused it.
+        w = self._worker(local_len=[128, 128], kv_heads=[8, None])
+        w.vllm_config.speculative_config = SimpleNamespace(
+            draft_parallel_config=SimpleNamespace(tensor_parallel_size=1)
+        )
+        with pytest.raises(RuntimeError, match="draft at TP 1 beside a target at TP 4"):
+            w._validate_head_matched_handshake(
+                self._meta(remote_len=[256, 256]), remote_tp_size=1
+            )
+
+    def test_a_draft_at_the_target_tp_takes_the_head_check(self):
+        # An eagle draft inherits the target's TP, which is the shape that
+        # pairs; it goes on to the byte check like any other region.
+        w = self._worker(local_len=128)
+        w.vllm_config.speculative_config = SimpleNamespace(
+            draft_parallel_config=SimpleNamespace(tensor_parallel_size=4)
+        )
         w._validate_head_matched_handshake(
             self._meta(remote_len=256), remote_tp_size=1
         )  # no raise
@@ -4361,14 +5521,17 @@ class TestHeadMatchedAgentRegistration:
         w.kv_caches_base_addr = {"eng": {}}
         w.dst_xfer_side_handles = {"eng": {}}
         w.nixl_memory_type = "VRAM"
-        w._kv_areas, w._kv_slices = 4, 2
-        w._logical_region_slices = [2, 2]
         w._logical_region_kv_heads = [8, 8]
-        w.transfer_topo = MagicMock()
+        fill_region_geometry(w, areas=4, axes=[ChipletSplitAxis.HEAD] * 2, slices=2)
+        w.transfer_topo = MagicMock(tp_size=4)
+        w._check_d2d_region_pairing = MagicMock()
+        w._check_split_axis_constraints = MagicMock()
+        w._check_mla_constraints = MagicMock()
         w.nixl_wrapper = MagicMock()
         w.nixl_wrapper.add_remote_agent.return_value = "agent"
         meta = MagicMock()
         meta.engine_id = "eng"
+        meta.kv_area_slices = area_slices(4, 2, 2)
 
         with (
             patch.object(
@@ -4421,8 +5584,14 @@ class TestHeadMatchedAgentRegistration:
         w._kv_per_block = 1
         w._remote_agents = {}
         w.nixl_wrapper = MagicMock()
-        w._logical_region_slices = list(slices)
         w._logical_region_kv_heads = list(kv_heads)
+        w.use_mla = False
+        fill_region_geometry(
+            w,
+            areas=4,
+            axes=[ChipletSplitAxis.HEAD] * len(list(slices)),
+            slices=list(slices),
+        )
         return w
 
     def test_uneven_region_slice_counts_are_refused_before_an_agent_is_added(self):
@@ -4432,7 +5601,7 @@ class TestHeadMatchedAgentRegistration:
         meta = MagicMock()
         meta.engine_id = "eng"
 
-        with pytest.raises(RuntimeError, match="different numbers of chiplet"):
+        with pytest.raises(RuntimeError, match="no one geometry bands every region"):
             w._add_remote_agent_head_matched(meta, 1, 2)
 
         # Refused at the entry, so no peer state was taken on.
@@ -4444,15 +5613,35 @@ class TestHeadMatchedAgentRegistration:
         # arithmetic rather than the cause. One condition covers both directions.
         w = self._slice_worker(slices=[2, 2, 4, 4], kv_heads=[8, 8, 32, 32])
 
-        with pytest.raises(RuntimeError, match=r"chiplet slices \[2, 4\]"):
-            w._reject_uneven_region_slices(2)
+        with pytest.raises(RuntimeError, match="no one geometry bands every region"):
+            w._local_band(2)
+
+    def test_equal_counts_placed_differently_are_refused(self):
+        # One band picks our areas for every region, so the banded regions have
+        # to place their slices alike; equal counts are not enough. Here the
+        # draft's replicas alternate where the target's sit side by side.
+        w = self._slice_worker(slices=[2, 2, 2, 2], kv_heads=[8, 8, 32, 32])
+        alternating = w._logical_region_geometry[2]._replace(
+            areas=tuple(AreaPlace(0, 0, sid) for sid in (0, 1, 0, 1))
+        )
+        w._logical_region_geometry[2:] = [alternating, alternating]
+
+        with pytest.raises(RuntimeError, match="no one geometry bands every region"):
+            w._local_band(2)
+
+    def test_a_peer_whose_regions_differ_in_geometry_is_refused(self):
+        # The same holds for the peer: one split serves all of its regions.
+        meta = SimpleNamespace(kv_area_slices=[[0, 1, 2, 3], [0, 0, 1, 1]])
+
+        with pytest.raises(RuntimeError, match="the peer's KV cache entries"):
+            RblnNixlPullConnectorWorker._peer_band(meta, 2)
 
     def test_uniform_slice_counts_are_not_refused(self):
         # A differing KV geometry is supported; only a differing chiplet CUT is
         # not. Refusing this would close the case the head bands exist for.
         w = self._slice_worker(slices=[4, 4, 4, 4], kv_heads=[8, 8, 32, 32])
 
-        w._reject_uneven_region_slices(2)
+        assert w._local_band(2) == (4, 4, (0, 1, 2, 3))
 
     def test_a_region_without_a_head_axis_is_not_counted(self):
         # An SSM state is not cut by KV heads, so its slice count says nothing
@@ -4460,7 +5649,7 @@ class TestHeadMatchedAgentRegistration:
         # further in, past this one.
         w = self._slice_worker(slices=[4, 4, 1, 1], kv_heads=[8, 8, None, None])
 
-        w._reject_uneven_region_slices(2)
+        assert w._local_band(2) == (4, 4, (0, 1, 2, 3))
 
     def test_a_peer_with_a_different_tp_degree_is_routed_to_head_matching(self):
         # The fork every head-matched path hangs off: unequal TP means position
@@ -4503,11 +5692,14 @@ class TestSplitAxisConstraints:
         sw_ratio=None,
         cls=RblnNixlPullConnectorWorker,
         stream=False,
+        areas=1,
     ):
         w = object.__new__(cls)
         w._kv_per_block = 1
         w.use_host_buffer = host_buffer
-        w._kv_split_axis = axis
+        # `_agent_meta`'s four layers, one logical region each.
+        w.local_seen_layer_names = [f"layer.{i}" for i in range(4)]
+        fill_region_geometry(w, areas=areas, axes=[axis] * 4, slices=areas)
         w.block_size = block_size
         window_mode(
             w,
@@ -4524,83 +5716,178 @@ class TestSplitAxisConstraints:
         return w
 
     def test_a_peer_that_cut_another_axis_is_rejected(self):
-        w = self._worker(axis=KVSplitAxis.HEAD)
-        meta = _agent_meta(kv_areas=4, kv_slices=4, kv_split_axis=KVSplitAxis.NON_HEAD)
-        with pytest.raises(RuntimeError, match="cut its KV cache on the NON_HEAD"):
+        w = self._worker(axis=ChipletSplitAxis.HEAD)
+        meta = _agent_meta(kv_split_axes=[ChipletSplitAxis.TOKEN] * 4)
+        with pytest.raises(RuntimeError, match=r"layer layer.0 of its KV cache"):
             w._check_split_axis_constraints(meta, 2)
 
     def test_a_context_cut_is_rejected_with_unequal_tp(self):
         # The silent case: the head bands this peer would be matched by name
         # ranges that no chiplet area holds, while every byte count still fits.
-        w = self._worker(axis=KVSplitAxis.NON_HEAD, tp_ratio=2)
-        meta = _agent_meta(kv_areas=4, kv_slices=4, kv_split_axis=KVSplitAxis.NON_HEAD)
+        w = self._worker(axis=ChipletSplitAxis.TOKEN, tp_ratio=2)
+        meta = _agent_meta(kv_split_axes=[ChipletSplitAxis.TOKEN] * 4)
         with pytest.raises(RuntimeError, match="heterogeneous tensor parallelism"):
             w._check_split_axis_constraints(meta, 1)
 
     def test_a_context_cut_at_equal_tp_passes(self):
         # Area k pairs with area k and no band is consulted, so the bytes are
         # right; rejecting this would refuse the only shape that does work.
-        w = self._worker(axis=KVSplitAxis.NON_HEAD)
-        meta = _agent_meta(kv_areas=4, kv_slices=4, kv_split_axis=KVSplitAxis.NON_HEAD)
+        w = self._worker(axis=ChipletSplitAxis.TOKEN)
+        meta = _agent_meta(kv_split_axes=[ChipletSplitAxis.TOKEN] * 4)
         w._check_split_axis_constraints(meta, 2)  # no raise
 
     def test_a_trimming_peer_must_size_its_block_the_same(self):
         # Same axis, equal TP, and still wrong: an area is a fraction of a
         # block, so a peer whose block holds a different number of tokens gives
         # the same area a different token range while the byte counts fit.
-        w = self._worker(axis=KVSplitAxis.NON_HEAD, trim=True, block_size=16)
+        w = self._worker(axis=ChipletSplitAxis.TOKEN, trim=True, block_size=16)
         meta = _agent_meta(
-            kv_areas=4, kv_slices=4, kv_split_axis=KVSplitAxis.NON_HEAD, block_size=32
+            kv_split_axes=[ChipletSplitAxis.TOKEN] * 4,
+            block_size=32,
         )
-        with pytest.raises(RuntimeError, match="cut one the same way"):
+        with pytest.raises(RuntimeError, match="count a block the same way"):
             w._check_split_axis_constraints(meta, 2)
 
     def test_a_windowed_peer_must_size_its_block_the_same(self):
         # The window range divides the peer's block by OUR `window_ratio`, so an
         # unequal block size names a length that is not the peer's window --
         # and the descriptor counts match either way, so nothing reports it.
-        w = self._worker(axis=KVSplitAxis.HEAD, sw_ratio=4, block_size=16)
-        meta = _agent_meta(block_size=32)
-        with pytest.raises(RuntimeError, match="cut one the same way"):
+        w = self._worker(axis=ChipletSplitAxis.HEAD, sw_ratio=4, block_size=16)
+        meta = _agent_meta(block_size=32, kv_split_axes=[ChipletSplitAxis.HEAD] * 4)
+        with pytest.raises(RuntimeError, match="count a block the same way"):
             w._check_split_axis_constraints(meta, 1)
 
     def test_a_streaming_peer_must_size_its_block_the_same(self):
-        # Streaming names part of the block a prefill is filling, by the same
-        # grid the knob cuts a last block with -- so it needs the peer to hold
-        # the same count, whether or not that knob is on.
+        # Streaming alone cuts no block, but it places the blocks a prefill
+        # closes by counting them on both sides -- so it needs the peer to hold
+        # the same count, whether or not chunk mode is on.
         w = self._worker(
-            axis=KVSplitAxis.NON_HEAD,
+            axis=ChipletSplitAxis.TOKEN,
             stream=True,
             block_size=16,
             cls=RblnNixlPushConnectorWorker,
         )
         meta = _agent_meta(
-            kv_areas=4, kv_slices=4, kv_split_axis=KVSplitAxis.NON_HEAD, block_size=32
+            kv_split_axes=[ChipletSplitAxis.TOKEN] * 4,
+            block_size=32,
         )
-        with pytest.raises(RuntimeError, match="cut one the same way"):
+        with pytest.raises(RuntimeError, match="count a block the same way"):
             w._check_split_axis_constraints(meta, 2)
 
     def test_a_matching_block_size_passes_while_trimming(self):
-        w = self._worker(axis=KVSplitAxis.NON_HEAD, trim=True, block_size=16)
+        w = self._worker(axis=ChipletSplitAxis.TOKEN, trim=True, block_size=16)
         meta = _agent_meta(
-            kv_areas=4, kv_slices=4, kv_split_axis=KVSplitAxis.NON_HEAD, block_size=16
+            kv_split_axes=[ChipletSplitAxis.TOKEN] * 4,
+            block_size=16,
         )
         w._check_split_axis_constraints(meta, 2)  # no raise
 
     def test_a_differing_block_size_is_upstreams_when_not_trimming(self):
         # The refusal is scoped to the trim: without it this pairing is
         # upstream's and unchanged.
-        w = self._worker(axis=KVSplitAxis.NON_HEAD, block_size=16)
+        w = self._worker(axis=ChipletSplitAxis.TOKEN, block_size=16)
         meta = _agent_meta(
-            kv_areas=4, kv_slices=4, kv_split_axis=KVSplitAxis.NON_HEAD, block_size=32
+            kv_split_axes=[ChipletSplitAxis.TOKEN] * 4,
+            block_size=32,
         )
         w._check_split_axis_constraints(meta, 2)  # no raise
+
+    def test_a_peer_laying_a_regions_slices_over_other_areas_is_refused(self):
+        # Equal TP pairs area k with the peer's area k, so agreeing on the axis
+        # is not enough: each area has to hold the same slice on both sides.
+        w = self._worker(axis=ChipletSplitAxis.HEAD, areas=4)
+        meta = _agent_meta(
+            kv_area_slices=[[0, 1, 2, 3]] * 2 + [[1, 0, 3, 2]] + [[0, 1, 2, 3]],
+        )
+        with pytest.raises(RuntimeError, match="logical region 0 of layer layer.2"):
+            w._check_split_axis_constraints(meta, 1)
+
+    @pytest.mark.parametrize("token_region", [0, -1], ids=["target", "draft"])
+    def test_a_context_cut_beside_a_head_cut_is_rejected_with_unequal_tp(
+        self, token_region
+    ):
+        # One region cut on its tokens is enough: the bands would name a range
+        # its areas do not hold, however the regions beside it are cut.
+        w = self._worker(axis=ChipletSplitAxis.HEAD, tp_ratio=2)
+        geometry = w._logical_region_geometry
+        geometry[token_region] = geometry[token_region]._replace(
+            axis=ChipletSplitAxis.TOKEN
+        )
+        meta = _agent_meta(kv_split_axes=[g.axis for g in geometry])
+
+        with pytest.raises(RuntimeError, match="heterogeneous tensor parallelism"):
+            w._check_split_axis_constraints(meta, 2)
+
+    def test_a_stage_advertising_another_count_of_regions_a_layer_is_refused(self):
+        # Its axes are sliced a layer at a time, so a count off by one shifts
+        # every layer's slice onto the next one's.
+        w = self._worker(axis=ChipletSplitAxis.HEAD)
+        meta = _agent_meta(
+            region_names=["layer.2", "layer.3"],
+            kv_area_slices=[[0]] * 3,
+        )
+
+        with pytest.raises(RuntimeError, match="cut axes over 2 layer"):
+            w._check_split_axis_constraints(meta, 1)
+
+    def test_a_head_matched_peer_is_compared_on_its_axes_alone(self):
+        # Across TP the head bands read the peer's slice ids area by area, so
+        # how it lays them out is its own.
+        w = self._worker(axis=ChipletSplitAxis.HEAD, areas=4, tp_ratio=2)
+        meta = _agent_meta(kv_area_slices=[[1, 0, 3, 2]] * 4)
+
+        w._check_split_axis_constraints(meta, 2)  # no raise
+
+    def test_a_target_and_draft_cut_alike_on_both_sides_pass(self):
+        w = self._worker(axis=ChipletSplitAxis.TOKEN)
+        geometry = w._logical_region_geometry
+        geometry[-1] = geometry[-1]._replace(axis=ChipletSplitAxis.HEAD)
+        meta = _agent_meta(kv_split_axes=[g.axis for g in geometry])
+
+        w._check_split_axis_constraints(meta, 1)  # no raise
+
+    def test_a_draft_cut_another_way_is_refused_by_name(self):
+        # The engines agree on the target and differ on the draft, which no
+        # count says: the areas and slices of a draft are the same numbers
+        # under either axis.
+        w = self._worker(axis=ChipletSplitAxis.TOKEN)
+        geometry = w._logical_region_geometry
+        geometry[-1] = geometry[-1]._replace(axis=ChipletSplitAxis.HEAD)
+        meta = _agent_meta(kv_split_axes=[ChipletSplitAxis.TOKEN] * 4)
+
+        with pytest.raises(RuntimeError, match="layer layer.3 of its KV cache"):
+            w._check_split_axis_constraints(meta, 1)
+
+    @pytest.mark.parametrize(
+        ("differs_at", "refused"), [("layer.0", False), ("layer.2", True)]
+    )
+    def test_a_pipeline_stage_is_compared_on_the_layers_it_holds(
+        self, differs_at, refused
+    ):
+        # A stage advertises its own layers' axes, so position 0 of its list
+        # is our layer 2 -- read by position, the first case refuses and the
+        # second passes.
+        w = self._worker(axis=ChipletSplitAxis.HEAD)
+        names = [f"layer.{i}" for i in range(4)]
+        geometry = w._logical_region_geometry
+        at = names.index(differs_at)
+        geometry[at] = geometry[at]._replace(axis=ChipletSplitAxis.TOKEN)
+        meta = _agent_meta(
+            region_names=["layer.2", "layer.3"],
+            kv_split_axes=[ChipletSplitAxis.HEAD] * 2,
+        )
+
+        if refused:
+            with pytest.raises(RuntimeError, match="layer layer.2 of its KV cache"):
+                w._check_split_axis_constraints(meta, 1)
+        else:
+            w._check_split_axis_constraints(meta, 1)  # no raise
 
     def test_host_bounce_is_exempt(self):
         # Host staging registers one logical buffer per layer and never expands
         # per area, so its HEAD default describes a peer of any axis.
-        w = self._worker(axis=KVSplitAxis.HEAD, tp_ratio=2, host_buffer=True)
-        meta = _agent_meta(kv_split_axis=KVSplitAxis.NON_HEAD)
+        w = self._worker(axis=ChipletSplitAxis.HEAD, tp_ratio=2, host_buffer=True)
+        meta = _agent_meta(kv_split_axes=[ChipletSplitAxis.TOKEN] * 4)
         w._check_split_axis_constraints(meta, 1)  # no raise
 
 
@@ -4730,7 +6017,11 @@ class TestAddRemoteAgentSwa:
             patched_in_package("compute_tp_mapping", MagicMock()),
             patch.object(worker, "_validate_remote_agent_handshake"),
             patch.object(worker, "get_backend_aware_kv_block_len", return_value=256),
-            patch.object(type(worker), "_shard_chunk_grid", return_value=(2, 2)),
+            patch.object(
+                type(worker),
+                "_shard_chunk_grid",
+                return_value=uniform_grid(2, 2, regions=2),
+            ),
         ):
             worker.add_remote_agent(meta, 0, 1)
             remote = worker.nixl_wrapper.get_xfer_descs.call_args[0][0]
@@ -4767,7 +6058,11 @@ class TestAddRemoteAgentSwa:
             patched_in_package("compute_tp_mapping", MagicMock()),
             patch.object(worker, "_validate_remote_agent_handshake"),
             patch.object(worker, "get_backend_aware_kv_block_len", return_value=256),
-            patch.object(type(worker), "_shard_chunk_grid", return_value=(2, 2)),
+            patch.object(
+                type(worker),
+                "_shard_chunk_grid",
+                return_value=uniform_grid(2, 2, regions=2),
+            ),
         ):
             worker.add_remote_agent(meta, 0, 1)
 
@@ -4864,85 +6159,62 @@ class TestDescriptorsNameTheRightElement:
     PEER_BASE = 1000
     NUM_BLOCKS = 2
     WANTED_HEAD = 2
+    BLOCK = 16
 
-    @staticmethod
-    def _worker(local_page):
-        w = object.__new__(RblnNixlPullConnectorWorker)
-        w.block_len_per_layer = [local_page]
-        w.get_backend_aware_kv_block_len = lambda layer_idx, **_: local_page
-        return w
-
-    def _descs(self, kv_runs):
-        return self._worker(self.LOCAL_PAGE)._head_matched_desc(
+    def _pieces(self, kv_per_block, peer_page=PEER_PAGE):
+        return pair_area(
+            (self.WANTED_HEAD, self.WANTED_HEAD + 2),
+            self.LOCAL_PAGE,
+            [
+                (0, (0, self.PEER_HEADS), peer_page),
+                (1, (self.PEER_HEADS, 2 * self.PEER_HEADS), peer_page),
+            ],
+            kv_per_block=kv_per_block,
+            every_holder=False,
             region_id=0,
-            logical_r=0,
-            area_l=0,
-            geom=(self.WANTED_HEAD, 2, 1),
-            peer=(0, self.PEER_HEADS, 1, 2),
-            areas_r=2,
-            remote_bases=[self.PEER_BASE, 2000],
-            remote_lens=[self.PEER_PAGE, self.PEER_PAGE],
-            device_id=0,
-            num_blocks=self.NUM_BLOCKS,
-            split=1,
-            kv_runs=kv_runs,
         )
 
-    def _decode(self, addr, kv_runs):
+    def _descs(self, kv_per_block):
+        """(address, length) per block and piece, as the remote list has them."""
+        return [
+            (self.PEER_BASE + block * self.PEER_PAGE + p.remote_offset, p.length)
+            for block in range(self.NUM_BLOCKS)
+            for p in self._pieces(kv_per_block)
+        ]
+
+    def _decode(self, addr, kv_per_block):
         """(block, K-or-V, head) for an address inside the peer's region."""
         off = addr - self.PEER_BASE
         block, within_block = divmod(off, self.PEER_PAGE)
-        kv_stride = self.PEER_PAGE // kv_runs
+        kv_stride = self.PEER_PAGE // kv_per_block
         kv, within_kv = divmod(within_block, kv_stride)
         return block, kv, within_kv // (kv_stride // self.PEER_HEADS)
 
     def test_a_packed_block_is_read_at_the_head_the_pairing_asked_for(self):
-        descs = self._descs(kv_runs=2)
+        descs = self._descs(kv_per_block=2)
         # Two blocks, each named once in K and once in V, all at our head.
-        assert [self._decode(a, 2) for a, _, _ in descs] == [
+        assert [self._decode(a, 2) for a, _ in descs] == [
             (0, 0, self.WANTED_HEAD),
             (0, 1, self.WANTED_HEAD),
             (1, 0, self.WANTED_HEAD),
             (1, 1, self.WANTED_HEAD),
         ]
 
-    def test_a_packed_block_read_as_one_range_names_the_wrong_element(self):
-        # The arithmetic the connector shipped with, against a packed peer: one
-        # descriptor per block, and the offset that used to mean "head 2" now
-        # lands in V at head 0. This is the silent corruption the split avoids.
-        wrong = [self._decode(a, 2) for a, _, _ in self._descs(kv_runs=1)]
-        assert wrong == [(0, 1, 0), (1, 1, 0)]
-        assert all(head != self.WANTED_HEAD for _, _, head in wrong)
-
-    @pytest.mark.parametrize("kv_runs", [1, 2])
-    def test_no_descriptor_runs_off_the_end_of_its_half(self, kv_runs):
-        kv_stride = self.PEER_PAGE // kv_runs
-        for addr, length, _ in self._descs(kv_runs):
+    @pytest.mark.parametrize("kv_per_block", [1, 2])
+    def test_no_descriptor_runs_off_the_end_of_its_half(self, kv_per_block):
+        kv_stride = self.PEER_PAGE // kv_per_block
+        for addr, length in self._descs(kv_per_block):
             within_kv = (addr - self.PEER_BASE) % self.PEER_PAGE % kv_stride
             assert within_kv + length <= kv_stride
 
     def test_a_peer_block_that_does_not_halve_is_refused(self):
         # The length comes off the wire, so it is the peer's claim rather than
         # ours; halving it silently would move a byte short of every V.
-        w = self._worker(self.LOCAL_PAGE)
         with pytest.raises(RuntimeError, match="range"):
-            w._head_matched_desc(
-                region_id=0,
-                logical_r=0,
-                area_l=0,
-                geom=(self.WANTED_HEAD, 2, 1),
-                peer=(0, self.PEER_HEADS, 1, 2),
-                areas_r=2,
-                remote_bases=[self.PEER_BASE, 2000],
-                remote_lens=[self.PEER_PAGE + 1, self.PEER_PAGE],
-                device_id=0,
-                num_blocks=1,
-                split=1,
-                kv_runs=2,
-            )
+            self._pieces(kv_per_block=2, peer_page=self.PEER_PAGE + 1)
 
     def test_the_two_halves_are_a_stride_apart(self):
-        addrs = [a for a, _, _ in self._descs(kv_runs=2)]
+        addrs = [a for a, _ in self._descs(kv_per_block=2)]
         kv_stride = self.PEER_PAGE // 2
         # K and V of the same block sit `kv_stride` apart, K first.
         assert addrs[1] - addrs[0] == kv_stride
@@ -5119,37 +6391,101 @@ class TestAPackedBlockNeedsAnEqualPeerBlockSize:
         upstream.assert_called_once_with(meta, 1, 1)
 
 
-class TestKvRuns:
-    """`_kv_runs`: how many ranges one piece of a block breaks into."""
+class TestPairArea:
+    """`pair_area`: the pieces one of our areas is exchanged in.
+
+    A piece is where two areas' heads overlap. What has to hold is
+    that it is one contiguous range on BOTH sides, and that only the ranges
+    neither side cuts are merged.
+    """
+
+    def _pair(self, local, peers, *, kv_per_block=1, page=256, write=False):
+        return pair_area(
+            local,
+            page,
+            [(region, heads, page_r) for region, heads, page_r in peers],
+            kv_per_block=kv_per_block,
+            every_holder=write,
+            region_id=0,
+        )
 
     @pytest.mark.parametrize(
-        "cuts_l, cuts_r",
+        "local, peers",
         [
-            pytest.param(4, 8, id="peer_cuts_finer"),
-            pytest.param(8, 4, id="we_cut_finer"),
+            pytest.param((0, 2), [(0, (0, 1), 128), (1, (1, 2), 128)], id="peer_finer"),
+            pytest.param((2, 4), [(0, (0, 4), 512)], id="we_are_finer"),
         ],
     )
-    def test_a_packed_block_breaks_in_two_when_the_cuts_differ(self, cuts_l, cuts_r):
+    def test_a_packed_block_breaks_in_two_when_the_cuts_differ(self, local, peers):
         # One side reads a head band out of the other's block, and under a packed
         # block that band sits once in K and once in V.
-        assert RblnNixlWorkerBase._kv_runs(PACKED, cuts_l, cuts_r) == 2
+        pieces = self._pair(local, peers, kv_per_block=2)
+        assert [p.local_offset for p in pieces][:2] == [0, 128]
+        assert len(pieces) == 2 * len({p.remote_region for p in pieces})
+
+    @pytest.mark.parametrize("page_r", [128, 512])
+    def test_a_replica_holding_another_block_length_is_refused(self, page_r):
+        # A copy of the same heads in a shorter block would be written past its
+        # end; in a longer one, it lays them out in a way we do not know.
+        with pytest.raises(RuntimeError, match=f"{page_r}B a block, against 256B here"):
+            self._pair((0, 2), [(0, (0, 2), 256), (1, (0, 2), page_r)], write=True)
+
+    def test_a_peer_head_of_another_width_is_refused(self):
+        # The handshake compares area 0 of a region only; a later area whose
+        # heads are wider would be read short, from the start of its head.
+        with pytest.raises(RuntimeError, match="128B a block .* and 256B"):
+            self._pair((0, 1), [(0, (0, 2), 512)], page=128)
 
     def test_a_packed_block_stays_one_range_at_equal_cuts(self):
         # Both sides name whole blocks, and K and V are adjacent inside one.
-        assert RblnNixlWorkerBase._kv_runs(PACKED, 8, 8) == 1
+        assert self._pair((0, 2), [(0, (0, 2), 256)], kv_per_block=2) == [
+            Piece(0, 0, 0, 256, 4)
+        ]
 
     @pytest.mark.parametrize(
-        "cuts_l, cuts_r",
+        "local, peers",
         [
-            pytest.param(4, 8, id="peer_cuts_finer"),
-            pytest.param(8, 4, id="we_cut_finer"),
-            pytest.param(8, 8, id="equal"),
+            pytest.param((0, 2), [(0, (0, 1), 128), (1, (1, 2), 128)], id="peer_finer"),
+            pytest.param((2, 4), [(0, (0, 4), 512)], id="we_are_finer"),
         ],
     )
-    def test_separate_regions_never_break(self, cuts_l, cuts_r):
+    def test_separate_regions_never_break(self, local, peers):
         # A region is K or V alone, so a head band is contiguous however the two
-        # sides cut heads. This is the arithmetic the connector shipped with.
-        assert RblnNixlWorkerBase._kv_runs(SPLIT, cuts_l, cuts_r) == 1
+        # sides cut heads: one piece per peer slice.
+        pieces = self._pair(local, peers)
+        assert len(pieces) == len(peers)
+
+    @pytest.mark.parametrize(
+        "peers, expected",
+        [
+            # Peer coarser: an offset into its slice, one piece.
+            ([(0, (0, 4), 512)], 1),
+            # Peer finer: one piece per slice of it our area spans.
+            ([(0, (0, 1), 128), (1, (1, 2), 128)], 2),
+            ([(r, (r, r + 1), 128) for r in range(3)], 2),
+        ],
+    )
+    def test_an_area_splits_only_where_the_peer_is_finer(self, peers, expected):
+        assert len(self._pair((0, 2), peers)) == expected
+
+    def test_a_replica_is_read_once_and_written_every_time(self):
+        # Reading any copy answers; writing one leaves the peer's other chiplets
+        # on stale KV. The local range repeats while the destination moves.
+        peers = [(0, (0, 2), 256), (1, (0, 2), 256)]
+        read = self._pair((0, 2), peers)
+        written = self._pair((0, 2), peers, write=True)
+        assert [p.remote_region for p in read] == [0]
+        assert [p.remote_region for p in written] == [0, 1]
+        assert {p.local_offset for p in written} == {0}
+
+    def test_heads_the_peer_does_not_hold_are_refused(self):
+        # The peer holds half of what this area needs, so the other half would
+        # never arrive; a read that reports success there is the failure.
+        with pytest.raises(
+            RuntimeError,
+            match=r"outside the peer's range: the areas offered \(0\.\.0\)",
+        ):
+            self._pair((0, 2), [(0, (0, 1), 128)])
 
 
 class TestADeadPeerIsReported:

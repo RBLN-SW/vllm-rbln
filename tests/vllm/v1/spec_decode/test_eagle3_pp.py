@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""What the EAGLE3 pipeline handoff claims to support, and what it rejects.
+"""What the aux hidden state pipeline handoff claims to support, and what it rejects.
 
 Config objects only -- no checkpoint, no device.
 """
@@ -25,10 +25,10 @@ import pytest
 from vllm.model_executor.models.minimax_m2 import MiniMaxM2Model
 
 from vllm_rbln.patches.axk2.model import AXK2Model
-from vllm_rbln.platform.vllm_impl import _validate_eagle3_pp_config
+from vllm_rbln.platform.vllm_impl import _validate_aux_hidden_states_pp_config
 from vllm_rbln.v1.spec_decode.eagle3_pp import (
-    EAGLE3_PP_TARGET_ARCHS,
-    eagle3_aux_hidden_states_enabled,
+    AUX_PP_TARGET_ARCHS,
+    aux_hidden_states_enabled,
 )
 
 SUPPORTED = "MiniMaxM2ForCausalLM"
@@ -60,36 +60,43 @@ def _config(arch: str, pp_size: int, method="eagle3", eagle_config=None):
 
 
 def test_the_allowlist_and_the_patched_forwards_agree():
-    assert set(PATCHED_FORWARD_OWNERS) == set(EAGLE3_PP_TARGET_ARCHS)
+    assert set(PATCHED_FORWARD_OWNERS) == set(AUX_PP_TARGET_ARCHS)
     for arch, model_cls in PATCHED_FORWARD_OWNERS.items():
         assert model_cls.forward.__module__.startswith("vllm_rbln."), (
-            f"{arch} is allowlisted for EAGLE3 under pipeline parallelism, but "
+            f"{arch} is allowlisted for aux hidden states under pipeline "
+            f"parallelism, but "
             f"{model_cls.__name__}.forward is still upstream's"
         )
 
 
 @pytest.mark.parametrize("arch", [SUPPORTED, SUPPORTED_AXK2])
 def test_a_supported_target_is_accepted(arch):
-    _validate_eagle3_pp_config(_config(arch, 4))
+    _validate_aux_hidden_states_pp_config(_config(arch, 4))
 
 
 def test_an_unsupported_target_is_rejected_at_startup():
-    with pytest.raises(ValueError, match="EAGLE3 with pipeline_parallel_size"):
-        _validate_eagle3_pp_config(_config(UNSUPPORTED, 2))
+    with pytest.raises(ValueError, match="auxiliary hidden states"):
+        _validate_aux_hidden_states_pp_config(_config(UNSUPPORTED, 2))
 
 
 def test_an_unsupported_target_passes_when_aux_is_off():
     # With `use_aux_hidden_state` off nothing is captured anywhere, so upstream's
     # unpatched forward is harmless and the split is fine. Rejecting this would
     # block a configuration that works.
-    _validate_eagle3_pp_config(
+    _validate_aux_hidden_states_pp_config(
         _config(UNSUPPORTED, 2, eagle_config={"use_aux_hidden_state": False})
     )
 
 
 @pytest.mark.parametrize("method", [None, "eagle", "ngram", "medusa"])
-def test_only_eagle3_is_gated(method):
-    _validate_eagle3_pp_config(_config(UNSUPPORTED, 4, method=method))
+def test_a_draft_that_wants_no_aux_states_is_not_gated(method):
+    _validate_aux_hidden_states_pp_config(_config(UNSUPPORTED, 4, method=method))
+
+
+def test_an_unsupported_target_is_rejected_for_dflash_too():
+    # DFlash consumes the same aux states, so the split breaks it the same way.
+    with pytest.raises(ValueError, match="auxiliary hidden states"):
+        _validate_aux_hidden_states_pp_config(_config(UNSUPPORTED, 2, method="dflash"))
 
 
 @pytest.mark.parametrize(
@@ -103,17 +110,29 @@ def test_only_eagle3_is_gated(method):
     ],
 )
 def test_the_aux_flag_reader_matches_the_draft_config(eagle_config, expected):
-    # One reader for the runner and the guard: a non-last stage that disagrees with
-    # the last one about this captures nothing and the drafter comes up short.
+    # One reader for every stage: a non-last stage that disagrees with the last
+    # one about this captures nothing and the drafter comes up short.
     spec = _config(SUPPORTED, 4, eagle_config=eagle_config).speculative_config
 
-    assert eagle3_aux_hidden_states_enabled(spec) is expected
+    assert aux_hidden_states_enabled(spec) is expected
 
 
-def test_a_non_eagle3_method_needs_no_aux():
-    assert eagle3_aux_hidden_states_enabled(None) is False
+@pytest.mark.parametrize("eagle_config", [None, {"use_aux_hidden_state": False}])
+def test_dflash_wants_aux_states_whatever_the_draft_config_says(eagle_config):
+    # The flag is EAGLE3's; DFlash always reduces the target's aux states through
+    # its own projection. Every stage has to answer this, while the drafter that
+    # asked exists on the last rank alone.
+    spec = _config(
+        SUPPORTED, 4, method="dflash", eagle_config=eagle_config
+    ).speculative_config
+
+    assert aux_hidden_states_enabled(spec) is True
+
+
+def test_a_method_without_aux_states_needs_none():
+    assert aux_hidden_states_enabled(None) is False
     assert (
-        eagle3_aux_hidden_states_enabled(
+        aux_hidden_states_enabled(
             _config(SUPPORTED, 4, method="eagle").speculative_config
         )
         is False

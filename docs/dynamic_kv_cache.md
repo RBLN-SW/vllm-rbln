@@ -66,8 +66,9 @@ warm-up registration and runs the whole of it from `apply_dynamic_kv_num_blocks`
 after the resize has allocated: `register_kv_caches_with_connector` rebuilds the
 mapping from the tensors the runner is holding. The RBLN NIXL connectors take
 their block count from `cache_config.num_gpu_blocks` at that point instead of the
-pre-compile estimate copied at construction; `RBLNLMCacheConnectorV1` binds the
-actual post-resize tensors and does not cache a block count. Nothing is registered
+pre-compile estimate copied at construction; `RBLNLMCacheConnectorV1` and
+`LMCacheMPConnector` bind the actual post-resize tensors and take the block count
+from their shape rather than caching one. Nothing is registered
 early, so nothing has to be unregistered. Every other mode keeps the start-up
 order.
 
@@ -137,7 +138,7 @@ feature is absent there rather than disabled.
 | `RBLN_USE_CUSTOM_KERNEL=1` | The `rbln_triton_ops` kernels go through the compiler's triton converter, so the KV input never reaches a whitelisted `paged_*` custom op. |
 | A DFlash drafter (`--speculative-config '{"method": "dflash", ...}'`) | The drafter is non-causal on RBLN, and its attention kernel does not accept a dynamic KV input. `use_non_causal` lives on the draft config only, so the method is the signal. |
 | `block_size == max_model_len` | This selects the normal-attention kernels, which do not accept a dynamic KV input. |
-| A KV transfer connector other than the RBLN NIXL ones (`RblnNixlConnector`, `RblnNixlPullConnector`, `RblnNixlPushConnector`) or `RBLNLMCacheConnectorV1` | The worker registers with the connector only once the resize has allocated (see "KV transfer connectors" above). That ordering is connector-agnostic, so a connector outside `DYNAMIC_KV_SUPPORTED_CONNECTORS` in `v1/worker/utils.py` is untried rather than known broken, and is kept off until it has been. A `MultiConnector` is read through to its children and is open exactly when all of them are; one that wraps nothing, or that wraps another `MultiConnector`, is not. |
+| A KV transfer connector other than the RBLN NIXL ones (`RblnNixlConnector`, `RblnNixlPullConnector`, `RblnNixlPushConnector`), `RBLNLMCacheConnectorV1`, or `LMCacheMPConnector` | The worker registers with the connector only once the resize has allocated (see "KV transfer connectors" above). That ordering is connector-agnostic, so a connector outside `DYNAMIC_KV_SUPPORTED_CONNECTORS` in `v1/worker/utils.py` is untried rather than known broken, and is kept off until it has been. A `MultiConnector` is read through to its children and is open exactly when all of them are; one that wraps nothing, or that wraps another `MultiConnector`, is not. |
 
 ## When Start-up Refuses
 

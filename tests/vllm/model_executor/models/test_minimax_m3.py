@@ -143,3 +143,20 @@ def test_text_config_loads_from_local_checkpoint(tmp_path):
     assert loaded.num_hidden_layers == 2
     assert loaded.vocab_size == 256
     assert loaded.architectures == ["MiniMaxM3SparseForCausalLM"]
+
+
+def test_pp_ranks_report_the_same_kv_cache_layouts():
+    from vllm.v1.attention.backends.utils import get_supported_kv_cache_layouts
+
+    from vllm_rbln.v1.attention.backends.flash_attention import (
+        RBLNFlashAttentionBackend,
+    )
+    from vllm_rbln.v1.attention.backends.minimax_m3 import (
+        RBLNMiniMaxM3IndexerBackend,
+        RBLNMiniMaxM3SparseBackend,
+    )
+
+    msa = [RBLNMiniMaxM3SparseBackend, RBLNMiniMaxM3IndexerBackend]
+    assert get_supported_kv_cache_layouts(msa) == get_supported_kv_cache_layouts(
+        [RBLNFlashAttentionBackend, *msa]
+    )

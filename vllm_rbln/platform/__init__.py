@@ -55,10 +55,15 @@ def _configure_logging(config: "LoggingConfig | None" = None) -> None:
 vllm_logger._configure_vllm_root_logger = _configure_logging
 
 # Assigned by `_apply_model_impl`, which this module calls once at the bottom
-# and `register_ops` calls again once the arguments name the model path. Eight
-# modules copy this name into their own namespace, and every one of them imports
-# after both.
+# and `register_ops` calls again once the arguments name the model path. Read it
+# through `use_device_tensor()`: a copy bound at import keeps the import-time guess.
 USE_DEVICE_TENSOR: bool = False
+
+
+def use_device_tensor() -> bool:
+    return USE_DEVICE_TENSOR
+
+
 # RBLN default for an unset max_num_seqs (upstream vLLM defaults to 256).
 RBLN_DEFAULT_MAX_NUM_SEQS = 1
 RBLN_DEFAULT_MAX_NUM_BATCHED_TOKENS = 512

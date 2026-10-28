@@ -86,7 +86,6 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
 )
 
-from vllm_rbln.config import get_rbln_config
 from vllm_rbln.model_executor.models.interfaces import SupportsRBLNMultiModal
 from vllm_rbln.patches.attention import _resolve_kv_cache
 from vllm_rbln.v1.attention.backends.flash_attention import _fp8_cache_dtype
@@ -425,9 +424,7 @@ class RBLNMiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         # Same condition as RBLNModelRunner.sort_batch_by_length: the MSA indexer
         # stops its partition loop at batch 0's last partition, so a batch of
         # more than one row must arrive longest first.
-        self.is_prompt_sorted = (
-            current_platform.is_cr13() or get_rbln_config().use_batch_attn_opt
-        )
+        self.is_prompt_sorted = current_platform.is_cr13()
         sparse_block_size = int(
             sparse_cfg.get("sparse_block_size", MSA_SPARSE_BLOCK_SIZE)
         )

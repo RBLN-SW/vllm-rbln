@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import contextlib
+import json
 import tempfile
 from types import MethodType, SimpleNamespace
 
@@ -30,6 +31,7 @@ from vllm.distributed import (
     ensure_model_parallel_initialized,
     init_distributed_environment,
 )
+from vllm.model_executor.layers.pooler.special import IdentityPooler
 from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.multimodal.inputs import PlaceholderRange
 from vllm.platforms import current_platform
@@ -85,8 +87,9 @@ def get_vllm_config(async_scheduling=False):
 
 
 @pytest.fixture
-def model_runner():
+def model_runner(request):
     vllm_config = get_vllm_config()
+    vllm_config.additional_config.use_custom_sampler = getattr(request, "param", True)
     with set_current_vllm_config(vllm_config, check_compile=False):
         temp_file = tempfile.mkstemp()[1]
         init_distributed_environment(
@@ -817,3 +820,77 @@ def test_init_rejects_nan_counting(monkeypatch):
 
     with pytest.raises(NotImplementedError, match="VLLM_COMPUTE_NANS_IN_LOGITS"):
         RBLNOptimumModelRunner(get_vllm_config(), DEVICE)
+
+
+@pytest.mark.parametrize("model_runner", [False], indirect=True, ids=["vllm-sampler"])
+@pytest.mark.parametrize("metrics_enabled", [True, False])
+def test_metrics_follow_prefill_and_decode(
+    model_runner, monkeypatch, tmp_path, metrics_enabled
+):
+    monkeypatch.setenv("VLLM_RBLN_METRICS", str(int(metrics_enabled)))
+    monkeypatch.setenv("VLLM_RBLN_METRICS_DIR", str(tmp_path))
+    prefill = _schedule_new_request("r0", block_ids=([1],), outer_block_ids=[1])
+    decode = _decode_scheduler_output(["r0"], [0])
+
+    for scheduler_output in (prefill, decode):
+        assert model_runner.execute_model(scheduler_output) is None
+        if metrics_enabled:
+            assert model_runner._metrics_ctx is not None
+            assert model_runner._metrics_ctx.in_pass
+        output = model_runner.sample_tokens(None)
+        assert output.req_ids == ["r0"]
+        assert len(output.sampled_token_ids[0]) == 1
+        if metrics_enabled:
+            assert not model_runner._metrics_ctx.in_pass
+
+    if not metrics_enabled:
+        assert model_runner._metrics_ctx is None
+        assert list(tmp_path.iterdir()) == []
+        return
+    model_runner._metrics_ctx.print_stats()
+    sections = json.loads((tmp_path / "metrics.json").read_text())["sections"]
+    assert set(sections) == {
+        "MODEL + SAMPLE (PREFILL)",
+        "E2E (PREFILL)",
+        "MODEL + SAMPLE (DECODE)",
+        "E2E (DECODE)",
+    }
+    for phase in ("PREFILL", "DECODE"):
+        graph = sections[f"MODEL + SAMPLE ({phase})"]
+        e2e = sections[f"E2E ({phase})"]
+        assert graph["call_count"] == e2e["call_count"] == 1
+        assert e2e["mean_latency_ms"] >= graph["mean_latency_ms"] > 0
+
+
+def test_metrics_finish_with_pooling_output(model_runner, monkeypatch, tmp_path):
+    monkeypatch.setenv("VLLM_RBLN_METRICS", "1")
+    monkeypatch.setenv("VLLM_RBLN_METRICS_DIR", str(tmp_path))
+    model_runner.is_pooling_model = True
+    model_runner.model.pooler = IdentityPooler()
+    prefill = _schedule_new_request(
+        "r0",
+        block_ids=([1],),
+        outer_block_ids=[1],
+        pooling_params=PoolingParams(task="plugin"),
+    )
+
+    output = model_runner.execute_model(prefill)
+
+    assert output.pooler_output[0] is not None
+    assert not model_runner._metrics_ctx.in_pass
+    model_runner._metrics_ctx.print_stats()
+    sections = json.loads((tmp_path / "metrics.json").read_text())["sections"]
+    assert set(sections) == {"MODEL + SAMPLE (PREFILL)", "E2E (PREFILL)"}
+    assert all(section["call_count"] == 1 for section in sections.values())
+
+
+def test_metrics_do_not_record_an_idle_step(model_runner, monkeypatch, tmp_path):
+    monkeypatch.setenv("VLLM_RBLN_METRICS", "1")
+    monkeypatch.setenv("VLLM_RBLN_METRICS_DIR", str(tmp_path))
+    idle = _schedule_new_request(block_ids=([1],), outer_block_ids=[1])
+
+    assert model_runner.execute_model(idle) is EMPTY_MODEL_RUNNER_OUTPUT
+    assert not model_runner._metrics_ctx.in_pass
+    model_runner._metrics_ctx.print_stats()
+    sections = json.loads((tmp_path / "metrics.json").read_text())["sections"]
+    assert sections == {}

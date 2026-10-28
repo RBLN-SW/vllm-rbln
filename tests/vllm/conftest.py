@@ -32,38 +32,6 @@ from tests.vllm.utils import (
 
 _DEFAULT_NUM_HIDDEN_LAYERS = 3
 
-
-@pytest.fixture
-def kv_layout_registration_api(monkeypatch):
-    """Use upstream registration types when present, otherwise the draft shim."""
-    from enum import IntEnum
-    from typing import NamedTuple
-
-    import vllm.v1.kv_cache_layout as layouts
-
-    if hasattr(layouts, "KVCacheAxis") and hasattr(layouts, "KVCacheTensorLayout"):
-        return layouts.KVCacheAxis
-
-    class Axis(IntEnum):
-        BLOCK = 0
-        KV = 1
-        HEAD = 2
-        STATE = 3
-        HEAD_DIM = 4
-        CONTENT = 5
-        SINGLETON = 6
-
-    class Layout(NamedTuple):
-        axes: tuple[Axis, ...]
-
-        def validate_shape(self, shape):
-            assert len(self.axes) == len(shape)
-
-    monkeypatch.setattr(layouts, "KVCacheAxis", Axis, raising=False)
-    monkeypatch.setattr(layouts, "KVCacheTensorLayout", Layout, raising=False)
-    return Axis
-
-
 _scrubbed: dict[str, str] = {}
 
 # module file -> its (possibly still running) batch spawn.
@@ -154,8 +122,7 @@ def pytest_addoption(parser):
         help=(
             "VLLM_RBLN_USE_DEVICE_TENSOR for the whole session. "
             "platform/__init__.py resolves it at module scope into "
-            "RblnPlatform.device_type and friends, and eight modules copy "
-            "USE_DEVICE_TENSOR into their own namespace, so it cannot be "
+            "RblnPlatform.device_type and friends, so it cannot be "
             "parametrized per test -- run the suite once per value instead. "
             "Left unset by default so the source's own default is what gets "
             "exercised."
@@ -453,8 +420,6 @@ def pytest_configure(config):
     envs.INHERITED_MODEL_IMPL = "vllm"
     _apply_model_impl("vllm")
 
-    # Imported only now: it copies USE_DEVICE_TENSOR into its own namespace, as
-    # seven other modules do, and the call above is what settles that value.
     from vllm_rbln.platform import vllm_impl
 
     vllm_impl.patch_upstream()

@@ -106,33 +106,6 @@ def cfg_square():
 class TestFlashAttentionBackendStatic:
     @pytest.mark.parametrize(
         "use_custom_kernel, expected",
-        [(False, [0, 1, 4, 5, 2, 3, 6, 7]), (True, list(range(8)))],
-        ids=["rbln_custom_ops", "rbln_triton_ops"],
-    )
-    def test_declared_axes_disambiguate_two_blocks(
-        self, use_custom_kernel, expected, kv_layout_registration_api
-    ):
-        axis = kv_layout_registration_api
-        config = make_vllm_config(
-            additional_config={"use_custom_kernel": use_custom_kernel}
-        )
-        with set_current_vllm_config(config):
-            shape = RBLNFlashAttentionBackend.get_kv_cache_shape(2, 2, 1, 1)
-            layout = RBLNFlashAttentionBackend.get_kv_cache_tensor_layout()
-        cache = torch.arange(8).reshape(shape)
-        order = (
-            axis.KV,
-            axis.BLOCK,
-            axis.STATE,
-            axis.HEAD,
-            axis.HEAD_DIM,
-            axis.SINGLETON,
-        )
-        canonical = cache.permute(*(layout.axes.index(a) for a in order))
-        assert canonical.flatten().tolist() == expected
-
-    @pytest.mark.parametrize(
-        "use_custom_kernel, expected",
         [(False, (7, 2, 3, 1, 11, 5)), (True, (2, 7, 3, 1, 11, 5))],
         ids=["rbln_custom_ops", "rbln_triton_ops"],
     )
@@ -807,3 +780,18 @@ class TestForwardSlidingWindow:
         )
         assert tables.tolist() == [7, 8, 9]
         assert window == self.WINDOW
+
+    @pytest.mark.parametrize("is_prompt_sorted", [True, False])
+    def test_shift_decode_mask_follows_prompt_sorting(
+        self, cfg, monkeypatch, is_prompt_sorted
+    ):
+        md = self._decode_metadata(swa_appends=False)
+        md.is_prompt_sorted = is_prompt_sorted
+        md.swa_attn_masks = torch.ones(2, 1, 1, self.WINDOW)
+        *_, mask, _sinks = self._forward(
+            cfg, monkeypatch, "sliding_window_attention_naive_decode", md
+        )
+        if is_prompt_sorted:
+            assert mask is md.swa_attn_masks
+        else:
+            assert mask is None

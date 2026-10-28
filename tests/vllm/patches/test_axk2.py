@@ -260,20 +260,30 @@ def test_model_loads_where_triton_is_not_installed():
     assert child.returncode == 0, child.stderr
 
 
-def test_axk2_is_mla_once_the_registry_has_been_applied():
-    """The MLA patch has to outlive our own ModelRegistry registration.
+def test_axk2_registers_its_mla_convertor(monkeypatch):
+    """MLA-ness is decided at config time from a model_type tuple upstream owns.
 
-    Registrations are applied before patches, so a patch that decided whether to
-    apply by asking the registry whether the architecture is known would read
-    our own registration as upstream's and skip itself. The model then builds
-    with use_mla False and the A.X-K2 forward asserts on it.
-    """
+    The registration hands vLLM a convertor for "axk2" instead of patching the
+    base method, so nothing outside this package has to know the model."""
+    from vllm.model_executor.models import ModelRegistry
+    from vllm.transformers_utils.config import _CONFIG_REGISTRY
     from vllm.transformers_utils.model_arch_config_convertor import (
-        ModelArchConfigConvertorBase,
+        MODEL_ARCH_CONFIG_CONVERTORS,
     )
 
-    convertor = SimpleNamespace(
-        hf_text_config=SimpleNamespace(model_type="axk2", kv_lora_rank=512)
-    )
+    from vllm_rbln.patches.axk2 import register_axk2
+    from vllm_rbln.patches.model_arch_config import KvLoraRankMLAConvertor
 
-    assert ModelArchConfigConvertorBase.is_deepseek_mla(convertor)
+    # The registration may already have run in this process; it refuses to
+    # shadow an architecture the registry knows, so hide that for the call.
+    monkeypatch.setattr(ModelRegistry, "get_supported_archs", lambda: set())
+    monkeypatch.setattr(ModelRegistry, "register_model", lambda *a, **k: None)
+    monkeypatch.delitem(_CONFIG_REGISTRY, "axk2", raising=False)
+    monkeypatch.delitem(MODEL_ARCH_CONFIG_CONVERTORS, "axk2", raising=False)
+
+    register_axk2()
+
+    convertor_cls = MODEL_ARCH_CONFIG_CONVERTORS["axk2"]
+    assert convertor_cls is KvLoraRankMLAConvertor
+    config = SimpleNamespace(model_type="axk2", kv_lora_rank=512)
+    assert convertor_cls(config, config).is_deepseek_mla()

@@ -57,10 +57,9 @@ _ENGINE_ARGS = dict(
     enable_chunked_prefill=True,
 )
 
-# Modules that bind platform.USE_DEVICE_TENSOR into their own namespace at
-# import. _apply_model_impl cannot reach them, so none may be imported before
-# the model path is resolved.
-_DEVICE_FLAG_COPIERS = frozenset(
+# Modules that read the device flag. The DP launcher of vllm-rbln-executor
+# imports them before the model path is resolved.
+_DEVICE_FLAG_READERS = frozenset(
     {
         "vllm_rbln.patches.deepseek_mtp",
         "vllm_rbln.platform.vllm_impl",
@@ -490,23 +489,25 @@ class TestRejectedConfigs:
                 )
             )
 
-    def test_eagle3_under_pp_needs_a_patched_target(self, reconfigure):
-        # The default model is a plain LlamaForCausalLM, whose forward still
-        # collects aux hidden states with a stage-local index. Asserting through
-        # the hook rather than on the validator directly is the point: it is what
-        # shows the guard is reached at all.
-        with pytest.raises(ValueError, match="EAGLE3 with pipeline_parallel_size"):
-            reconfigure(_eagle3_under_pp())
+    @pytest.mark.parametrize("method", ["eagle3", "dflash"])
+    def test_a_draft_under_pp_needs_a_patched_target(self, reconfigure, method):
+        # The default model is a plain LlamaForCausalLM, which 0.30 made
+        # pipeline-aware but which packs a handoff key per tensor rather than the
+        # combined one this side reads. Asserting through the hook rather than on
+        # the validator directly is the point: it is what shows the guard is
+        # reached at all.
+        with pytest.raises(ValueError, match="auxiliary hidden states"):
+            reconfigure(_aux_draft_under_pp(method=method))
 
     def test_eagle3_under_pp_accepts_a_patched_target(self, reconfigure):
-        reconfigure(_eagle3_under_pp(arch="MiniMaxM2ForCausalLM"))
+        reconfigure(_aux_draft_under_pp(arch="MiniMaxM2ForCausalLM"))
 
     def test_eagle3_under_pp_accepts_a_draft_with_aux_off(self, reconfigure):
         # Nothing is captured anywhere then, so upstream's forward is harmless.
-        reconfigure(_eagle3_under_pp(eagle_config={"use_aux_hidden_state": False}))
+        reconfigure(_aux_draft_under_pp(eagle_config={"use_aux_hidden_state": False}))
 
     def test_eagle3_at_pp1_is_not_gated(self, reconfigure):
-        reconfigure(_eagle3_under_pp(pp_size=1))
+        reconfigure(_aux_draft_under_pp(pp_size=1))
 
     def test_dp_needs_a_divisible_token_budget(self, reconfigure):
         with pytest.raises(ValueError, match="divisible"):
@@ -529,8 +530,14 @@ class TestRejectedConfigs:
         assert RBLNConfig().use_moe_tokens_mask is True
 
 
-def _eagle3_under_pp(*, arch: str | None = None, eagle_config=None, pp_size: int = 2):
-    """A mutator that puts an EAGLE3 draft on a pipeline-parallel target.
+def _aux_draft_under_pp(
+    *,
+    arch: str | None = None,
+    eagle_config=None,
+    pp_size: int = 2,
+    method: str = "eagle3",
+):
+    """A mutator that puts an aux-consuming draft on a pipeline-parallel target.
 
     EngineArgs would have to resolve a real draft checkpoint to build this, so the
     speculative config is a stand-in shaped like the fields the guard reads.
@@ -541,10 +548,16 @@ def _eagle3_under_pp(*, arch: str | None = None, eagle_config=None, pp_size: int
         # The guard runs after the per-stage decode batch check, which would
         # otherwise raise first and mask it.
         config.scheduler_config.max_num_seqs = pp_size * 2
+        if method == "dflash":
+            # So does DFlash's prefill chunk check, which this stand-in would
+            # otherwise trip with an unset budget.
+            config.scheduler_config.max_num_scheduled_tokens = (
+                config.scheduler_config.max_num_batched_tokens
+            )
         if arch is not None:
             config.model_config.hf_config.architectures = [arch]
         config.speculative_config = SimpleNamespace(
-            method="eagle3",
+            method=method,
             draft_model_config=SimpleNamespace(
                 hf_config=SimpleNamespace(eagle_config=eagle_config)
             ),
@@ -1429,13 +1442,7 @@ class TestModelImpl:
             )
         assert os.environ[platform.envs.RESOLVED_MODEL_IMPL_ENV] == _UNTOUCHED
 
-    def test_the_modules_that_copy_the_device_flag_import_late(self):
-        """They bind USE_DEVICE_TENSOR at their own import.
-
-        That is only correct while none of them is imported before the path is
-        resolved, so the platform module is the only one _apply_model_impl has
-        to reach. A new early import here would silently pin a stale value.
-        """
+    def test_register_ops_applies_no_patch_before_the_path_is_resolved(self):
         import subprocess
         import sys
 
@@ -1446,10 +1453,7 @@ class TestModelImpl:
             "vllm_rbln.register_model();"
             "vllm_rbln.register_ops();"
             "applied = sys.modules.get('vllm_rbln.patches.registry');"
-            "print(applied and applied._applied_patch_keys,"
-            " [m for m in sys.modules if m in COPIERS])".replace(
-                "COPIERS", repr(_DEVICE_FLAG_COPIERS)
-            )
+            "print(applied and applied._applied_patch_keys)"
         )
         out = subprocess.run(
             [sys.executable, "-c", probe],
@@ -1463,6 +1467,31 @@ class TestModelImpl:
             },
         )
         assert out.returncode == 0, out.stderr[-2000:]
-        # "None []": the registry was never imported, so nothing was applied and
-        # no module bound a stale USE_DEVICE_TENSOR.
-        assert out.stdout.strip().endswith("None []"), out.stdout
+        assert out.stdout.strip().endswith("None"), out.stdout
+
+    def test_a_module_imported_before_resolution_reads_the_resolved_flag(self):
+        import subprocess
+        import sys
+
+        probe = (
+            "import importlib, sys;"
+            "from vllm.platforms import current_platform;"
+            "from vllm_rbln import platform;"
+            "mods = [importlib.import_module(m) for m in sorted(READERS)];"
+            "platform._apply_model_impl('vllm');"
+            "print(platform.USE_DEVICE_TENSOR,"
+            " [m.__name__ for m in mods if hasattr(m, 'USE_DEVICE_TENSOR')])"
+        ).replace("READERS", repr(_DEVICE_FLAG_READERS))
+        out = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env={
+                k: v
+                for k, v in os.environ.items()
+                if not k.startswith("VLLM_RBLN")
+                and k != platform.envs.RESOLVED_MODEL_IMPL_ENV
+            },
+        )
+        assert out.returncode == 0, out.stderr[-2000:]
+        assert out.stdout.strip().endswith("True []"), out.stdout
