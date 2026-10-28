@@ -16,6 +16,8 @@
 # ops into RBLNSchedulerOutput and releasing them, plus arbitration against a KV
 # connector. Matching itself is in test_rbln_kv_cache_manager.py.
 
+import random
+
 import pytest
 from vllm.v1.request import RequestStatus
 
@@ -281,3 +283,109 @@ class TestSubBlockIndexingUnderAsyncScheduling:
         out = self._sharer_schedule_after_donor_prefill(async_scheduling)
         assert len(out.kv_cache_copy_ops) == 1
         assert out.kv_cache_copy_ops[0].num_tokens == 8
+
+
+class TestSubBlockMatchAgainstFullPool:
+    # A match touches its source block before allocation. When no request holds
+    # that block, the touch takes it out of the free queue, so the match must
+    # not cost a request that needs every free block its admission.
+    def test_request_needing_every_free_block_is_admitted(self):
+        num_blocks = 10
+        sched = create_rbln_scheduler(
+            enable_prefix_caching=True,
+            block_size=BLOCK_SIZE,
+            sub_block_size=SUB_BLOCK_SIZE,
+            max_num_batched_tokens=BLOCK_SIZE,
+            max_model_len=BLOCK_SIZE * num_blocks,
+            num_blocks=num_blocks,
+        )
+        # The donor finishes, so its block is free but still cached and indexed.
+        donor = make_request("0", list(range(BLOCK_SIZE)), BLOCK_SIZE, max_tokens=1)
+        sched.add_request(donor)
+        while sched.requests:
+            out = sched.schedule()
+            sched.update_from_output(out, make_model_runner_output(out, 0))
+
+        # Needs every free block; its first two sub-blocks match the donor's.
+        num_tokens = sched.kv_cache_manager.block_pool.get_num_free_blocks()
+        num_tokens *= BLOCK_SIZE
+        tokens = list(range(8)) + [900 + i for i in range(num_tokens - 8)]
+        sched.add_request(make_request("1", tokens, BLOCK_SIZE, max_tokens=1))
+
+        assert "1" in sched.schedule().num_scheduled_tokens
+
+
+class TestSubBlockSchedulingFuzz:
+    # Random workloads whose prompts share prefixes at sub-block granularity,
+    # on pools small enough that admissions often need every free block. Every
+    # request must finish, and every block must come back to the free queue.
+    MAX_STEPS = 4000
+
+    @staticmethod
+    def _workload(rng, capacity):
+        bases = [[rng.randrange(50) for _ in range(capacity)] for _ in range(3)]
+        reqs = []
+        for i in range(rng.randrange(4, 14)):
+            max_tokens = rng.randrange(1, 12)
+            length = rng.randrange(SUB_BLOCK_SIZE + 1, capacity - max_tokens + 1)
+            shared = rng.randrange(length // SUB_BLOCK_SIZE + 1) * SUB_BLOCK_SIZE
+            tail = [rng.randrange(100, 1000) for _ in range(length - shared)]
+            prompt = rng.choice(bases)[:shared] + tail
+            reqs.append((rng.randrange(40), str(i), prompt, max_tokens))
+        return sorted(reqs)
+
+    @staticmethod
+    def _runner_output(sched, out, rng):
+        # A partial prefill samples nothing; only a complete prompt does.
+        output = make_model_runner_output(out)
+        output.sampled_token_ids = [
+            [rng.randrange(2000, 2008)]
+            if sched.requests[rid].num_computed_tokens >= sched.requests[rid].num_tokens
+            else []
+            for rid in output.req_ids
+        ]
+        return output
+
+    @pytest.mark.parametrize("num_speculative_tokens", [None, 3])
+    @pytest.mark.parametrize("seed", range(50))
+    def test_every_request_finishes_and_frees_its_blocks(
+        self, seed, num_speculative_tokens
+    ):
+        rng = random.Random(seed)
+        num_blocks = rng.randrange(5, 14)
+        capacity = (num_blocks - 1) * BLOCK_SIZE
+        sched = create_rbln_scheduler(
+            enable_prefix_caching=True,
+            block_size=BLOCK_SIZE,
+            sub_block_size=SUB_BLOCK_SIZE,
+            max_num_batched_tokens=BLOCK_SIZE,
+            max_model_len=capacity,
+            num_blocks=num_blocks,
+            max_num_seqs=rng.choice([1, 2, 4]),
+            num_speculative_tokens=num_speculative_tokens,
+        )
+        # The pool, not max_model_len, bounds a request here, so leave room for
+        # what admission reserves past the prompt: the first decode step's
+        # sampled and draft tokens, and the lookahead.
+        room = 1 + 2 * num_speculative_tokens if num_speculative_tokens else 0
+        pending = self._workload(rng, capacity - room)
+        for step in range(self.MAX_STEPS):
+            while pending and pending[0][0] <= step:
+                _, rid, prompt, max_tokens = pending.pop(0)
+                sched.add_request(
+                    make_request(rid, prompt, BLOCK_SIZE, max_tokens=max_tokens)
+                )
+            if not pending and not sched.requests:
+                break
+            out = sched.schedule()
+            sched.update_from_output(out, self._runner_output(sched, out, rng))
+        else:
+            pytest.fail(
+                f"{len(sched.requests)} requests unfinished after {self.MAX_STEPS} "
+                f"steps ({len(sched.running)} running)"
+            )
+
+        # One more step releases the last copy ops.
+        out = sched.schedule()
+        sched.update_from_output(out, self._runner_output(sched, out, rng))
+        assert sched.kv_cache_manager.block_pool.get_num_free_blocks() == num_blocks - 1
