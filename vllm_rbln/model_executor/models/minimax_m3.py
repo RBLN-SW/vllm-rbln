@@ -15,10 +15,11 @@
 import importlib.util
 import math
 import sys
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from itertools import islice
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -31,6 +32,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import get_forward_context
+from vllm.inputs import ModalityData
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe import (
@@ -74,6 +76,12 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.inputs import ImageItem, MultiModalFieldConfig
+from vllm.multimodal.parse import (
+    DictEmbeddingItems,
+    ModalityDataItems,
+    MultiModalDataParser,
+)
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
@@ -997,9 +1005,65 @@ class _RBLNVisionEncoder(nn.Module):
         return self.tower.patch_merge_mlp(hidden)
 
 
+class _RBLNMiniMaxM3VLDataParser(MultiModalDataParser):
+    # NOTE(RBLN): upstream declares none for MiniMax-M3, so an EC producer
+    # publishes no grid and an image cannot reach a consumer as a metadata-only
+    # reference. Declared as Qwen2-VL does; images only, as the RBLN vision
+    # encoder takes no video.
+    embedding_fields = {
+        "image": {"image_embeds": "values", "image_grid_thw": "metadata"},
+    }
+
+    def __init__(self, merge_size: int, *args, **kwargs) -> None:
+        self._merge_size = merge_size
+        super().__init__(*args, **kwargs)
+
+    def _parse_image_data(
+        self,
+        data: dict[str, torch.Tensor] | ModalityData[ImageItem],
+    ) -> ModalityDataItems[Any, Any] | None:
+        if not isinstance(data, dict):
+            return super()._parse_image_data(data)
+
+        def fields_config(
+            hf_inputs: Mapping[str, torch.Tensor],
+        ) -> Mapping[str, MultiModalFieldConfig]:
+            grid_thw = hf_inputs["image_grid_thw"]
+            return {
+                "image_embeds": MultiModalFieldConfig.flat_from_sizes(
+                    "image", grid_thw.prod(-1) // self._merge_size**2
+                ),
+                "image_grid_thw": MultiModalFieldConfig.batched(
+                    "image", keep_on_cpu=True
+                ),
+            }
+
+        required, optional = self.embedding_field_sets("image")
+        return DictEmbeddingItems(
+            data,
+            modality="image",
+            required_fields=required,
+            optional_fields=optional,
+            fields_factory=fields_config,
+        )
+
+
+# Loaded at import time from a file path, so mypy cannot see its classes.
+_MiniMaxM3VLProcessingInfo: Any = _mm_preprocess.MiniMaxM3VLProcessingInfo
+
+
+class _RBLNMiniMaxM3VLProcessingInfo(_MiniMaxM3VLProcessingInfo):
+    def get_data_parser(self) -> MultiModalDataParser:
+        return _RBLNMiniMaxM3VLDataParser(
+            self.get_image_processor().merge_size,
+            expected_hidden_size=self._get_expected_hidden_size(),
+            allow_missing_mm_embeddings=self.allow_missing_mm_embeddings,
+        )
+
+
 @MULTIMODAL_REGISTRY.register_processor(
     _mm_preprocess.MiniMaxM3VLMultiModalProcessor,
-    info=_mm_preprocess.MiniMaxM3VLProcessingInfo,
+    info=_RBLNMiniMaxM3VLProcessingInfo,
     dummy_inputs=_mm_preprocess.MiniMaxM3VLDummyInputsBuilder,
 )
 class RBLNMiniMaxM3SparseForConditionalGeneration(
@@ -1023,7 +1087,10 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
-        if modality == "image":
+        # The chat parser asks with "image_embeds" for an image sent as embeddings,
+        # as the EPD proxy sends one to an EC consumer. Qwen2-VL matches it the
+        # same way.
+        if modality.startswith("image"):
             return _mm_preprocess.MiniMaxM3VLProcessingInfo.IMAGE_TOKEN
         if modality == "video":
             return _mm_preprocess.MiniMaxM3VLProcessingInfo.VIDEO_TOKEN

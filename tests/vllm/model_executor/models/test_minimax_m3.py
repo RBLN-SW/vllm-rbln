@@ -123,6 +123,44 @@ def test_image_encoding_reuses_eager_or_compiled_encoder(monkeypatch, compiled):
     assert list(model.state_dict()) == ["vision_tower.weight"]
 
 
+@pytest.mark.parametrize("ec_consumer", [False, True])
+def test_an_image_reaches_an_ec_consumer_as_its_grid(monkeypatch, ec_consumer):
+    import vllm_rbln.model_executor.models.minimax_m3 as m3
+
+    # The registered processing info, without a checkpoint behind it.
+    info_cls = m3.RBLNMiniMaxM3SparseForConditionalGeneration._processor_factory.info
+    monkeypatch.setattr(
+        info_cls, "get_image_processor", lambda self: SimpleNamespace(merge_size=2)
+    )
+    monkeypatch.setattr(info_cls, "_get_expected_hidden_size", lambda self: None)
+    monkeypatch.setattr(
+        info_cls, "allow_missing_mm_embeddings", property(lambda self: ec_consumer)
+    )
+    parser = info_cls.__new__(info_cls).get_data_parser()
+
+    # What an EC producer publishes beside the encoder output.
+    assert parser.placeholder_metadata_fields("image") == {"image_grid_thw"}
+
+    grid = torch.tensor([[1, 4, 6]])
+    embeds = parser.parse_mm_data(
+        {"image": {"image_grid_thw": grid, "image_embeds": torch.zeros(6, 8)}}
+    )["image"]
+    assert embeds.get(0)["image_embeds"].shape == (6, 8)
+
+    grid_only = {"image": {"image_grid_thw": grid}}
+    if ec_consumer:
+        assert parser.parse_mm_data(grid_only)["image"].get_count() == 1
+    else:
+        with pytest.raises(ValueError, match="image_embeds"):
+            parser.parse_mm_data(grid_only)
+
+    # The chat parser asks for the placeholder by the content type's modality.
+    model_cls = m3.RBLNMiniMaxM3SparseForConditionalGeneration
+    assert model_cls.get_placeholder_str(
+        "image_embeds", 1
+    ) == model_cls.get_placeholder_str("image", 1)
+
+
 def test_text_config_loads_from_local_checkpoint(tmp_path):
     from vllm.transformers_utils.config import get_config
     from vllm.transformers_utils.configs.minimax_m3 import MiniMaxM3TextConfig
