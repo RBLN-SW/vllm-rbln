@@ -47,6 +47,7 @@ class RBLNGlm5NextMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
         back_pad: torch.Tensor | None = None,
         is_prompt_sorted: bool = False,
         num_accepted: torch.Tensor | None = None,
+        state_load_pos: torch.Tensor | None = None,
     ) -> RBLNFlashAttentionMetadata:
         metadata = super().build(
             common_attn_metadata,
@@ -76,11 +77,10 @@ class RBLNGlm5NextMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
             return metadata
         num_computed_tokens = num_computed_tokens[:num_reqs]
         seq_lens = seq_lens[:num_reqs]
-        accepted = 0
-        if not is_prefill and num_accepted is not None:
-            accepted = num_accepted[:num_reqs].view(-1, 1)
-        load_pos = num_computed_tokens - 1 - accepted
-        store_pos = seq_lens - 1 if is_prefill else num_computed_tokens
+        load_pos = num_computed_tokens - 1
+        if state_load_pos is not None:
+            load_pos = state_load_pos[:num_reqs].view(-1, 1)
+        store_pos = seq_lens - 1
         # A fresh request (no computed token) and a padding one (0 tokens) take column
         # 0; neither reads its state.
         cols = torch.cat([load_pos, store_pos], dim=1).clamp(min=0)

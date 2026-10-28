@@ -379,12 +379,15 @@ def _override(vllm_config: "VllmConfig") -> None:
         model_config.hf_text_config.model_type == "glm5_next_text"
         and cache_config.enable_prefix_caching
         and vllm_config.speculative_config is not None
+        and cache_config.prefix_cache_retention_interval != 0
     ):
         # A KDA verify step stores its first token's state and replays the accepted
-        # drafts next step, so a block could be cached without the state at its end.
+        # drafts next step, so a block it crossed holds no state at its end. Retention
+        # 0 caches only states a prefill stored (prompt end, shared-prefix junction).
         logger.warning(
-            "Disabling prefix caching: GLM-5.3 on RBLN does not run it with "
-            "speculative decoding yet."
+            "Disabling prefix caching: GLM-5.3 on RBLN runs it with speculative "
+            "decoding only at prefix_cache_retention_interval 0, got %s.",
+            cache_config.prefix_cache_retention_interval,
         )
         cache_config.enable_prefix_caching = False
         # MambaModelConfig set these for prefix caching before this hook; back to

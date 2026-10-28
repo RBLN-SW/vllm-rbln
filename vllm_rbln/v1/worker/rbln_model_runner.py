@@ -344,6 +344,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # speculative decoding, whose verify step replays the accepted drafts.
         self.replays_accepted_drafts = False
         self.num_accepted_tokens_by_req: dict[str, int] = {}
+        # Under replays_accepted_drafts, the last position of each request's previous
+        # step: the recurrent state's block that step stored, which the next loads.
+        self.state_pos_by_req: dict[str, int] = {}
         # KV cache layer names in layer-index order; the deterministic
         # ordering the KV connector relies on for region<->layer agreement.
         self.kv_cache_names: list[str] = []
@@ -454,6 +457,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.query_start_loc_np = self.query_start_loc.numpy()
         self.decode_back_pad = torch.zeros(self.max_num_reqs, dtype=torch.int32)
         self.decode_back_pad_np = self.decode_back_pad.numpy()
+        self.state_load_pos = torch.zeros(self.max_num_reqs, dtype=torch.int32)
+        self.state_load_pos_np = self.state_load_pos.numpy()
         self.seq_lens = torch.zeros(self.max_num_tokens, dtype=torch.int32)
         self.seq_lens_np = self.seq_lens.numpy()
         self.discard_request_mask = torch.zeros(self.max_num_reqs, dtype=torch.bool)
@@ -634,6 +639,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             self.num_prompt_logprobs.pop(req_id, None)
             self.prompt_token_arrays.pop(req_id, None)
             self.num_accepted_tokens_by_req.pop(req_id, None)
+            self.state_pos_by_req.pop(req_id, None)
 
         for mm_hash in scheduler_output.free_encoder_mm_hashes:
             self.encoder_cache.pop(mm_hash, None)
@@ -772,6 +778,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 req_state.block_ids = new_block_ids
                 # It recomputes on the new blocks: no drafts of a past step to replay.
                 self.num_accepted_tokens_by_req.pop(req_id, None)
+                self.state_pos_by_req.pop(req_id, None)
 
             if req_index is None:
                 # The request is not in the persistent batch.
@@ -994,6 +1001,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         )
         self.seq_lens_np[num_reqs:].fill(0)
 
+        if self.replays_accepted_drafts:
+            for i, req_id in enumerate(self.input_batch.req_ids):
+                self.state_load_pos_np[i] = self.state_pos_by_req.get(
+                    req_id, self.input_batch.num_computed_tokens_cpu[i] - 1
+                )
+                self.state_pos_by_req[req_id] = int(self.seq_lens_np[i]) - 1
+
         num_tokens = [self.requests[r].num_tokens for r in self.input_batch.req_ids]
         num_tokens_np = np.array(num_tokens, dtype=np.int32)
 
@@ -1094,11 +1108,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 logits_indices
             )
 
-        num_accepted = None
+        num_accepted = state_load_pos = None
         if self.replays_accepted_drafts and not self.is_prefill:
             num_accepted = torch.from_numpy(
                 np.maximum(self.input_batch.num_accepted_tokens_cpu[:num_reqs] - 1, 0)
             ).to(torch.int32)
+            state_load_pos = self.state_load_pos[:num_reqs]
 
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
@@ -1132,6 +1147,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     back_pad=back_pad,
                     is_prompt_sorted=self.sort_batch_by_length,
                     num_accepted=num_accepted,
+                    state_load_pos=state_load_pos,
                 )
 
                 for layer_name in attn_group.layer_names:
