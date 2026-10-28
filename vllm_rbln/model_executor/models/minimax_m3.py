@@ -76,10 +76,7 @@ from vllm.model_executor.models.utils import (
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
-from vllm.utils.torch_utils import (
-    kv_cache_dtype_str_to_dtype,
-    set_default_torch_dtype,
-)
+from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
@@ -1043,16 +1040,13 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         if get_pp_group().is_first_rank and any(
             mm_config.get_limit_per_prompt(m) > 0 for m in ("image", "video")
         ):
-            with set_default_torch_dtype(torch.float32):
-                self.vision_tower = _vision_tower.MiniMaxVLVisionModel(
-                    config=PretrainedConfig.from_dict(config.vision_config),
-                    text_hidden_size=config.text_config.hidden_size,
-                    projector_hidden_size=getattr(
-                        config, "projector_hidden_size", None
-                    ),
-                    quant_config=self.quant_config,
-                    prefix=maybe_prefix(prefix, "vision_tower"),
-                )
+            self.vision_tower = _vision_tower.MiniMaxVLVisionModel(
+                config=PretrainedConfig.from_dict(config.vision_config),
+                text_hidden_size=config.text_config.hidden_size,
+                projector_hidden_size=getattr(config, "projector_hidden_size", None),
+                quant_config=self.quant_config,
+                prefix=maybe_prefix(prefix, "vision_tower"),
+            )
 
         object.__setattr__(self, "_mm_encoder", None)
 
