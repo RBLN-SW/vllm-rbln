@@ -509,6 +509,7 @@ class RBLNKVCacheManager(KVCacheManager):
         full_sequence_must_fit: bool = False,
         reserved_blocks: int = 0,
         has_scheduled_reqs: bool = True,
+        num_decode_step_tokens: int = 0,
     ) -> KVCacheBlocks | None:
         result = super().allocate_slots(
             request,
@@ -522,6 +523,7 @@ class RBLNKVCacheManager(KVCacheManager):
             full_sequence_must_fit=full_sequence_must_fit,
             reserved_blocks=reserved_blocks,
             has_scheduled_reqs=has_scheduled_reqs,
+            num_decode_step_tokens=num_decode_step_tokens,
         )
 
         if result is not None and not delay_cache_blocks:

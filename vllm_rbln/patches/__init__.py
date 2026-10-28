@@ -25,6 +25,7 @@ from vllm_rbln.patches.registry import (
 
 # ruff: noqa: F401
 from . import (
+    admission_lookahead,
     attention,
     axk2,
     axk3,
