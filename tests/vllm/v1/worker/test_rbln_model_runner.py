@@ -1525,9 +1525,11 @@ class TestAllocateKvCacheTensors:
             ],
         )
 
-    def _runner(self):
+    def _runner(self, use_exportable_kv_cache=False):
         return _make_runner_stub(
-            device=torch.device("cpu"), runner_only_attn_layers=set()
+            device=torch.device("cpu"),
+            runner_only_attn_layers=set(),
+            rbln_config=RBLNConfig(use_exportable_kv_cache=use_exportable_kv_cache),
         )
 
     def test_meta_without_device_tensor(self, monkeypatch):
@@ -1564,6 +1566,26 @@ class TestAllocateKvCacheTensors:
         monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", True)
         raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
         assert raw["l0"].device.type == "cpu"  # self.device is cpu here
+
+    def test_exportable_buffers_come_from_torch_rbln_ipc(self, monkeypatch):
+        # Another process can open only what empty_exportable allocated.
+        monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", True)
+        allocated = []
+
+        def empty_exportable(shape, dtype, device):
+            allocated.append(torch.empty(shape, dtype=dtype, device=device))
+            return allocated[-1]
+
+        monkeypatch.setattr(
+            torch,
+            "rbln",
+            SimpleNamespace(ipc=SimpleNamespace(empty_exportable=empty_exportable)),
+            raising=False,
+        )
+        runner = self._runner(use_exportable_kv_cache=True)
+        raw = runner._allocate_kv_cache_tensors(self._cfg())
+        assert {t.data_ptr() for t in raw.values()} == {t.data_ptr() for t in allocated}
+        assert all(t.dtype == torch.int8 for t in allocated)
 
 
 class TestRepairStagedInputIds:

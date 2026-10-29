@@ -529,9 +529,9 @@ class TestModeResolution:
     """One decision at init: every input is static config or env, so the rest of
     the sizer branches on the mode instead of re-reading them."""
 
-    def test_explicit_off_is_silent_in_the_worker(self, monkeypatch, caplog):
-        monkeypatch.setenv("VLLM_RBLN_USE_DEVICE_TENSOR", "1")
-        config = SimpleNamespace(
+    @staticmethod
+    def _worker_config(*, use_exportable_kv_cache=False):
+        return SimpleNamespace(
             cache_config=SimpleNamespace(
                 num_gpu_blocks_override=None,
                 block_size=16,
@@ -544,16 +544,31 @@ class TestModeResolution:
                 compile_model=True,
                 use_custom_kernel=False,
                 use_dynamic_kv_cache=False,
+                use_exportable_kv_cache=use_exportable_kv_cache,
             ),
             speculative_config=None,
             kv_transfer_config=None,
         )
 
+    def test_explicit_off_is_silent_in_the_worker(self, monkeypatch, caplog):
+        monkeypatch.setenv("VLLM_RBLN_USE_DEVICE_TENSOR", "1")
+
         with caplog.at_level("WARNING"):
-            sizer = DynamicKvSizer(config, object(), foreign_dram_used_bytes=0)
+            sizer = DynamicKvSizer(
+                self._worker_config(), object(), foreign_dram_used_bytes=0
+            )
 
         assert sizer.mode is dks.DynamicKvMode.DISABLED
         assert caplog.records == []
+
+    def test_an_exportable_kv_cache_needs_the_resize(self, monkeypatch):
+        # Without the resize the connector would export the KV cache before the
+        # compiled model placed it, pinning a layout the model cannot use.
+        monkeypatch.setenv("VLLM_RBLN_USE_DEVICE_TENSOR", "1")
+        config = self._worker_config(use_exportable_kv_cache=True)
+
+        with pytest.raises(ValueError, match="use_dynamic_kv_cache is off"):
+            DynamicKvSizer(config, object(), foreign_dram_used_bytes=0)
 
     @staticmethod
     def _mode(**kwargs):

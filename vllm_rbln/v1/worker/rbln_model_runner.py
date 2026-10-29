@@ -3092,8 +3092,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # graph input is a whole tensor, and dynamo refuses a slice's offset.
         device = self.device if use_device_tensor() else "meta"
         extent_of = kv_cache_extents(kv_cache_config)
+        empty = (
+            torch.rbln.ipc.empty_exportable
+            if self.rbln_config.use_exportable_kv_cache
+            else torch.empty
+        )
         buffers = {
-            extent: torch.empty(extent[1], dtype=torch.int8, device=device)
+            extent: empty((extent[1],), dtype=torch.int8, device=device)
             for extent in set(extent_of.values())
         }
         kv_cache_raw_tensors = {
