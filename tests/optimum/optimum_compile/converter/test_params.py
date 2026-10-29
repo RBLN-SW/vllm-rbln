@@ -329,8 +329,9 @@ class TestFromRblnConfigDtype:
 
 
 class TestGetParamQwen35:
-    """Qwen3.5 forces flash attention, so block_size must partition
-    max_model_len into >= 2 even parts; otherwise the config is rejected."""
+    """Qwen3.5 takes the same parameters as the other Qwen VLMs: a block_size below
+    max_model_len partitions the cache and selects flash attention, and a block_size
+    equal to it leaves optimum's default, eager."""
 
     cfg = {
         "batch_size": 1,
@@ -346,7 +347,10 @@ class TestGetParamQwen35:
         assert param["kvcache_partition_len"] == 1024
         assert param["max_seq_len"] == 4096
 
-    def test_block_size_equal_max_model_len_raises(self):
-        # Only 1 partition -> flash attention has no partition to work with.
-        with pytest.raises(ValueError, match="block_size"):
-            get_param_qwen3_5(max_model_len=4096, block_size=4096, **self.cfg)
+    def test_block_size_equal_max_model_len_leaves_eager(self):
+        # One partition is not a partition: nothing is set, so optimum keeps its
+        # default and the whole cache is one block.
+        param = get_param_qwen3_5(max_model_len=4096, block_size=4096, **self.cfg)
+        assert "attn_impl" not in param
+        assert "kvcache_partition_len" not in param
+        assert param["max_seq_len"] == 4096
