@@ -31,10 +31,14 @@ from vllm_rbln.v1.core.utils import (
 )
 
 
-def _sched_out(num_scheduled_tokens, spec=None):
+def _sched_out(num_scheduled_tokens, spec=None, new=(), cached=()):
+    """`new` / `cached`: the num_computed_tokens of the new and the cached
+    (running or resumed) requests."""
     return SimpleNamespace(
         num_scheduled_tokens=num_scheduled_tokens,
         scheduled_spec_decode_tokens=spec or {},
+        scheduled_new_reqs=[SimpleNamespace(num_computed_tokens=n) for n in new],
+        scheduled_cached_reqs=SimpleNamespace(num_computed_tokens=list(cached)),
     )
 
 
@@ -49,10 +53,19 @@ class TestStepIsPrefill:
         assert step_is_prefill(_sched_out({"a": 512})) is True
 
     def test_single_token_step_is_decode(self):
-        # Where a 1-token prompt, a chunked prefill's last token and a full
-        # remote-KV or prefix-cache match all land -- is_prefill() reports decode
-        # for each, so this has to as well.
-        assert step_is_prefill(_sched_out({"a": 1})) is False
+        # Where a chunked prefill's last token and a full remote-KV or
+        # prefix-cache match land -- is_prefill() reports decode for each, so
+        # this has to as well.
+        assert step_is_prefill(_sched_out({"a": 1}, cached=[7])) is False
+        assert step_is_prefill(_sched_out({"a": 1}, new=[7])) is False
+
+    @pytest.mark.parametrize(
+        "where", [{"new": [0]}, {"cached": [0]}], ids=["new", "resumed"]
+    )
+    def test_a_first_chunk_is_prefill_whatever_its_length(self, where):
+        # A 1-token prompt, or a first chunk cut to one token, starts a recurrent
+        # state from zero, which only the prefill kernels do.
+        assert step_is_prefill(_sched_out({"a": 1}, **where)) is True
 
     def test_drafts_do_not_inflate_the_phase(self):
         # 1 base + 4 drafts is a decode step; only the base counts.
