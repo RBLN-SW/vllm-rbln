@@ -474,6 +474,66 @@ class TestRejectedConfigs:
                 reconfigure(msa(dtype))
         reconfigure(msa(torch.bfloat16))
 
+    def test_glm5_next_configs(self, reconfigure):
+        def glm5_next(*, cache_dtype="fp8", spec=None, **cache):
+            def mutate(config):
+                config.model_config.hf_text_config.model_type = "glm5_next_text"
+                config.cache_config.cache_dtype = cache_dtype
+                config.speculative_config = spec
+                for name, value in cache.items():
+                    setattr(config.cache_config, name, value)
+
+            return mutate
+
+        def spec(method, num_speculative_tokens):
+            return SimpleNamespace(
+                method=method, num_speculative_tokens=num_speculative_tokens
+            )
+
+        reconfigure(glm5_next())
+        reconfigure(glm5_next(spec=spec("mtp", 5)))
+        with pytest.raises(ValueError, match="--kv-cache-dtype fp8"):
+            reconfigure(glm5_next(cache_dtype="auto"))
+        for method, num_speculative_tokens in (("mtp", 6), ("ngram", 1)):
+            with pytest.raises(ValueError, match="MTP head"):
+                reconfigure(glm5_next(spec=spec(method, num_speculative_tokens)))
+        block_size = _build().cache_config.block_size
+        with pytest.raises(ValueError, match="a KDA state a KV block"):
+            reconfigure(
+                glm5_next(
+                    enable_prefix_caching=True,
+                    user_specified_mamba_block_size=True,
+                    mamba_block_size=2 * block_size,
+                )
+            )
+        with pytest.raises(ValueError, match="whole KV blocks"):
+            reconfigure(
+                glm5_next(enable_prefix_caching=True, prefix_match_unit=block_size // 2)
+            )
+
+    def test_glm5_next_prefix_caching_with_mtp_needs_retention_0(self, reconfigure):
+        # A KDA verify step leaves no state at the end of a block it crossed, so
+        # only retention 0 (states a prefill stored) keeps prefix caching on.
+        def glm5_next_mtp(retention):
+            def mutate(config):
+                config.model_config.hf_text_config.model_type = "glm5_next_text"
+                config.cache_config.cache_dtype = "fp8"
+                config.cache_config.enable_prefix_caching = True
+                # What MambaModelConfig sets up for prefix caching before the hook.
+                config.cache_config.mamba_cache_mode = "align"
+                config.cache_config.prefix_cache_retention_interval = retention
+                config.speculative_config = SimpleNamespace(
+                    method="mtp", num_speculative_tokens=1
+                )
+
+            return mutate
+
+        assert reconfigure(glm5_next_mtp(0)).cache_config.enable_prefix_caching
+        config = reconfigure(glm5_next_mtp(1))
+        assert not config.cache_config.enable_prefix_caching
+        assert config.cache_config.mamba_cache_mode == "none"
+        assert config.cache_config.mamba_block_size == config.model_config.max_model_len
+
     def test_mrope_models_are_rejected(self, reconfigure, monkeypatch):
         from vllm.config import ModelConfig
 
