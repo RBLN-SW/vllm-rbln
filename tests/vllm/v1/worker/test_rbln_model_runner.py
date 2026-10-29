@@ -2220,10 +2220,11 @@ class TestExecuteModelStampsMmPrefixSteps:
         assert seen is None
 
 
-def test_warmup_compiles_one_prefill_per_mm_prefix_query_len():
+def test_warmup_compiles_the_text_prefill_and_one_per_mm_prefix_query_len():
     calls = []
     runner = _make_runner_stub(
         max_num_tokens=512,
+        prefill_chunk_size=256,
         mm_prefix_query_lens=[128, 384],
         speculative_config=None,
         bucketing_manager=SimpleNamespace(decode_batch_buckets=[1]),
@@ -2234,7 +2235,7 @@ def test_warmup_compiles_one_prefill_per_mm_prefix_query_len():
     runner.run_model_graphs()
 
     assert calls[:3] == [
-        ((1, 512, True), {}),
+        ((1, 256, True), {}),
         ((1, 128, True), {"mm_prefix_query_len": 128}),
         ((1, 384, True), {"mm_prefix_query_len": 384}),
     ]
