@@ -48,15 +48,17 @@ def _method(serialized: bool = True) -> Any:
     )
 
 
-def _built_layer(serialized: bool = True) -> torch.nn.Module:
+def _built_layer(
+    serialized: bool = True, partitions: list[int] = PARTITIONS
+) -> torch.nn.Module:
     """A layer carrying exactly the parameters create_weights registers."""
     layer = torch.nn.Module()
     _method(serialized).create_weights(
         layer,
         input_size_per_partition=IN_FEATURES,
-        output_partition_sizes=PARTITIONS,
+        output_partition_sizes=partitions,
         input_size=IN_FEATURES,
-        output_size=sum(PARTITIONS),
+        output_size=sum(partitions),
         params_dtype=torch.bfloat16,
         weight_loader=lambda *a, **k: None,
     )
@@ -93,13 +95,13 @@ class TestCreateWeights:
 
 
 class TestProcessWeightsAfterLoading:
-    def test_uniform_scales_collapse_to_a_scalar(self):
+    def test_uniform_scales_are_kept_per_partition(self):
         layer = _built_layer()
         layer.weight_scale.data = torch.tensor([0.5, 0.5])
         layer.input_scale.data = torch.tensor([0.25, 0.25])
         _method().process_weights_after_loading(layer)
-        assert layer.weight_scale.ndim == 0
-        assert float(layer.weight_scale) == 0.5
+        assert tuple(layer.weight_scale.shape) == (len(PARTITIONS),)
+        assert layer.weight_scale.tolist() == [0.5, 0.5]
 
     def test_differing_scales_are_kept_per_partition(self):
         # The whole point of this method: upstream requantises both halves to
@@ -119,18 +121,21 @@ class TestProcessWeightsAfterLoading:
 
 
 class TestApply:
-    def _prepared(self, weight_scale: list[float]) -> torch.nn.Module:
-        layer = _built_layer()
-        layer.weight.data = torch.ones(sum(PARTITIONS), IN_FEATURES).to(
+    def _prepared(
+        self, weight_scale: list[float], partitions: list[int] = PARTITIONS
+    ) -> torch.nn.Module:
+        layer = _built_layer(partitions=partitions)
+        layer.weight.data = torch.ones(sum(partitions), IN_FEATURES).to(
             torch.float8_e4m3fn
         )
         layer.weight_scale.data = torch.tensor(weight_scale)
-        layer.input_scale.data = torch.tensor([1.0, 1.0])
+        layer.input_scale.data = torch.ones(len(partitions))
         _method().process_weights_after_loading(layer)
         return layer
 
-    def test_scalar_scale_dequantises_the_whole_weight(self):
-        layer = self._prepared([0.5, 0.5])
+    def test_single_partition_scale_dequantises_the_whole_weight(self):
+        layer = self._prepared([0.5], partitions=[sum(PARTITIONS)])
+        assert layer.weight_scale.ndim == 0
         x = torch.ones(1, IN_FEATURES)
         out = _method().apply(layer, x)
         # Every weight entry is 1.0 * 0.5, summed over IN_FEATURES ones.
