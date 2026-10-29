@@ -221,6 +221,63 @@ class TestPromptRowReAdd:
         )
 
 
+class TestAcceptedTokensReAdd:
+    def test_evicted_decode_comes_back_with_its_accepted_tokens(
+        self, make_model_runner, monkeypatch
+    ):
+        # A KDA verify step replays the drafts the request's previous step accepted.
+        # A prefill-only step evicts the request, and add_request resets its row.
+        _last_rank(monkeypatch)
+        runner = make_model_runner()
+        runner._update_states(schedule_new("a"))
+        runner.num_accepted_tokens_by_req["a"] = 2
+        runner._update_states(make_scheduler_output(num_scheduled_tokens={}))
+        assert not is_in_batch(runner, "a")
+
+        runner._update_states(schedule_cached(req_ids=["a"], num_computed_tokens=[3]))
+
+        req_index = runner.input_batch.req_id_to_index["a"]
+        assert runner.input_batch.num_accepted_tokens_cpu[req_index] == 2
+
+    def test_resumed_request_starts_with_no_accepted_drafts(
+        self, make_model_runner, monkeypatch
+    ):
+        # Preemption freed the blocks: a resumed request recomputes on new ones, so
+        # its first verify step has no drafts to replay.
+        _last_rank(monkeypatch)
+        runner = make_model_runner()
+        runner._update_states(schedule_new("a"))
+        runner.num_accepted_tokens_by_req["a"] = 2
+        runner.state_pos_by_req["a"] = 5
+        runner._update_states(make_scheduler_output(num_scheduled_tokens={}))
+
+        runner._update_states(
+            schedule_cached(
+                req_ids=["a"],
+                num_computed_tokens=[0],
+                new_block_ids=[([7],)],
+                resumed_req_ids={"a"},
+            )
+        )
+
+        req_index = runner.input_batch.req_id_to_index["a"]
+        assert runner.input_batch.num_accepted_tokens_cpu[req_index] == 1
+        assert "a" not in runner.num_accepted_tokens_by_req
+        assert "a" not in runner.state_pos_by_req
+
+    def test_finished_request_drops_its_accepted_tokens(
+        self, make_model_runner, monkeypatch
+    ):
+        _last_rank(monkeypatch)
+        runner = make_model_runner()
+        runner._update_states(schedule_new("a"))
+        runner.num_accepted_tokens_by_req["a"] = 2
+        runner.state_pos_by_req["a"] = 5
+        runner._update_states(make_scheduler_output(finished_req_ids={"a"}))
+        assert "a" not in runner.num_accepted_tokens_by_req
+        assert "a" not in runner.state_pos_by_req
+
+
 class TestWritebackBeforeReAdd:
     def test_evicted_decode_comes_back_with_its_sampled_token(
         self, make_model_runner, monkeypatch
@@ -348,6 +405,32 @@ class TestPipelineParallel:
         assert runner.input_batch.num_tokens_no_spec[req_index] == 4
         assert runner.input_batch.token_ids_cpu[req_index, 3] == 101
         assert runner.requests["a"].output_token_ids == [101]
+
+    def test_non_last_rank_counts_the_committed_tokens_as_accepted(
+        self, make_model_runner, monkeypatch
+    ):
+        # Only the last rank samples, but every rank's KDA verify step replays the
+        # accepted drafts: here they are the committed tokens less the bonus one.
+        _last_rank(monkeypatch, is_last=False)
+        runner = make_model_runner()
+        runner.replays_accepted_drafts = True
+        runner._update_states(schedule_new("a"))
+        req_index = runner.input_batch.req_id_to_index["a"]
+
+        for num_computed, new_token_ids, accepted in (
+            (3, [101], 1),
+            (6, [102, 103, 104], 3),
+            (7, [105], 1),
+        ):
+            runner._update_states(
+                schedule_cached(
+                    req_ids=["a"],
+                    num_computed_tokens=[num_computed],
+                    new_token_ids=[new_token_ids],
+                )
+            )
+            assert runner.input_batch.num_accepted_tokens_cpu[req_index] == accepted
+            assert runner.num_accepted_tokens_by_req["a"] == accepted
 
 
 class TestSampleTokensWithoutPendingState:

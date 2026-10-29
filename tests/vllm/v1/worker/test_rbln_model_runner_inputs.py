@@ -310,6 +310,31 @@ class TestPrepareInputsSpecDecode:
         assert logits_indices.tolist() == [0]
 
 
+class TestPrepareInputsReplaysAcceptedDrafts:
+    def test_verify_resumes_from_the_previous_steps_state(
+        self, make_model_runner, monkeypatch
+    ):
+        runner = make_model_runner()
+        _decode_ready(runner, monkeypatch, num_spec_tokens=2)
+        runner.replays_accepted_drafts = True
+        verify = make_scheduler_output(
+            num_scheduled_tokens={"a": 3}, spec_decode_tokens={"a": [11, 12]}
+        )
+        runner._prepare_inputs(verify, np.array([3], dtype=np.int32))
+        assert runner.state_load_pos[0] == 2
+
+        runner.input_batch.num_computed_tokens_cpu[0] = 5
+        runner.input_batch.num_tokens_no_spec[0] = 5
+        runner.input_batch.num_accepted_tokens_cpu[0] = 2
+        runner._prepare_inputs(verify, np.array([3], dtype=np.int32))
+        assert runner.state_load_pos[0] == 5
+
+        attn_metadata, _ = runner._build_attention_metadata(
+            num_tokens=3, num_reqs=1, max_query_len=3, num_reqs_padded=2
+        )
+        assert attn_metadata["layer.0"].num_accepted.view(-1).tolist() == [1, 0]
+
+
 class TestPrepareInputsFixedWindow:
     # A decode with a model-based drafter always stages num_spec_tokens + 1
     # slots and puts the slack behind the scheduled token, so everything
@@ -466,3 +491,43 @@ class TestBookkeepingSyncSpecDecode:
 
         assert runner.requests["req_0"].output_token_ids == [101, 102]
         assert runner.requests["req_1"].output_token_ids == [201]
+
+    def test_recounts_the_accepted_tokens_every_step(
+        self, make_model_runner, monkeypatch
+    ):
+        monkeypatch.setattr(
+            mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+        )
+        runner = make_model_runner(async_scheduling=False)
+        runner.replays_accepted_drafts = True
+        runner._update_states(schedule_new("req_0", "req_1"))
+        batch = runner.input_batch
+        batch.num_tokens_no_spec[:2] = [3, 3]
+        runner.discard_request_mask[:2] = False
+
+        def step(sampled_token_ids: list[list[int]]) -> list[int]:
+            num_tokens = 2 * len(sampled_token_ids[0])
+            runner._bookkeeping_sync(
+                scheduler_output=make_scheduler_output(
+                    num_scheduled_tokens={"req_0": num_tokens // 2, "req_1": 1}
+                ),
+                sampler_output=SamplerOutput(
+                    sampled_token_ids=torch.tensor(
+                        sampled_token_ids, dtype=torch.int32, device=runner.device
+                    ),
+                    logprobs_tensors=None,
+                ),
+                logits=None,
+                hidden_states=torch.zeros(
+                    (num_tokens, runner.model_config.get_hidden_size()),
+                    dtype=runner.dtype,
+                ),
+                num_scheduled_tokens=num_tokens,
+            )
+            assert [
+                runner.num_accepted_tokens_by_req[r] for r in ("req_0", "req_1")
+            ] == batch.num_accepted_tokens_cpu[:2].tolist()
+            return batch.num_accepted_tokens_cpu[:2].tolist()
+
+        assert step([[101, 102], [201, -1]]) == [2, 1]
+        assert step([[103], [202]]) == [1, 1]

@@ -1274,6 +1274,8 @@ class TestUpdateStates:
             requests=requests if requests is not None else {},
             num_prompt_logprobs={},
             prompt_token_arrays={},
+            num_accepted_tokens_by_req={},
+            state_pos_by_req={},
             is_pooling_model=False,
             sort_batch_by_length=False,
             kv_cache_config=SimpleNamespace(kv_cache_groups=[]),
