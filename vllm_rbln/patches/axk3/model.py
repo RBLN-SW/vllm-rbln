@@ -104,14 +104,13 @@ class AXK3GatedResidual(nn.Module):
     def read(self, residual: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         """[..., n*h] -> (block input [..., h], write gate [..., n] fp32 or None)."""
         n = self.num_streams
-        # vLLM's RMSNorm over one row per (token, stream), so the norm lowers
-        # like every other RMSNorm; a hand-written [T, n, 1] statistic left a
-        # host rsqrt between the device functions of every decode layer. It is
-        # fed fp32 so it returns fp32, which keeps the per-stream gain on the
+        # vLLM's RMSNorm over the h axis of [..., n, h], so the norm lowers like
+        # every other RMSNorm; a hand-written [..., n, 1] statistic left a host
+        # rsqrt between the device functions of every decode layer. It is fed
+        # fp32 so it returns fp32, which keeps the per-stream gain on the
         # unrounded normalize and leaves the one cast the reference has.
-        normed = self.norm(residual.reshape(-1, self.hidden_size).float())
-        gamma = self.gamma.view(n, self.hidden_size).float()
-        u = self._streams(normed.view_as(residual)) * gamma
+        normed = self.norm(self._streams(residual).float())
+        u = normed * self.gamma.view(n, self.hidden_size).float()
         u = u.to(residual.dtype).view_as(residual)
 
         z = F.silu(self.read_down(u)[0] / n)
