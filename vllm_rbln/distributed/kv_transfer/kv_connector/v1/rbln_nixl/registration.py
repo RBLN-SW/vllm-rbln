@@ -51,10 +51,12 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
     RegionGeometry,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_transfer_topology import (
+    RblnBlockTransferSpec,
     RblnTransferTopology,
     is_latent,
 )
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
 from vllm_rbln.v1.worker.utils import canonical_kv_layers
 
 logger = init_logger(__name__)
@@ -120,7 +122,9 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         """
         layer_spec = self._unwrapped_layer_spec(layer_name)
         # A latent is the same key on every rank, so no head band names it.
-        if isinstance(layer_spec, MambaSpec) or is_latent(layer_spec):
+        if isinstance(layer_spec, (MambaSpec, RblnBlockTransferSpec)) or is_latent(
+            layer_spec
+        ):
             return None
         known = {self.model_config.get_total_num_kv_heads()}
         speculative_config = self.vllm_config.speculative_config
@@ -304,7 +308,9 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
             # For when registering multiple tensors eg K/V in separate
             # regions. MLA is key-only, so `cache_list` holds one.
             physical_page_size = physical_page_size // len(cache_list)
-            if not is_mla_region and not isinstance(layer_spec, MambaSpec):
+            if not is_mla_region and not isinstance(
+                layer_spec, (MambaSpec, RblnBlockTransferSpec)
+            ):
                 # One region back means the block holds both; two means each
                 # has its own. Read off what registered, not the config that
                 # chose it. Anything else makes `2 //` yield 0, which surfaces
@@ -385,6 +391,13 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
                     "and V into one block."
                 )
 
+        if len({count for _, count in layer_regions}) > 1:
+            raise RuntimeError(
+                "RBLN NIXL requires the same number of regions per layer; "
+                "block state and auxiliary caches cannot accompany separate "
+                "K/V regions."
+            )
+
         rbln_ctx_ptr = rebel.context_of(sample_kv_cache).rbln_ctx_ptr
 
         nixl_rbln.ensure_rbln_backend(
@@ -444,7 +457,12 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         # machinery indexes `transfer_groups`, and the two lists diverge as soon
         # as a group opts out of KV transfer.
         group_of = self.kv_cache_config.transfer_group_index_by_layer
-        self.region_group_ids = [group_of[name] for name in self.region_names]
+        self.region_group_ids = [
+            group_of[self._block_aux_specs[name].owner]
+            if name in self._block_aux_specs
+            else group_of[name]
+            for name in self.region_names
+        ]
 
         self._logical_region_kv_heads = self._logical_head_bands(layer_regions)
         self._logical_region_local_heads = list(logical_kv_heads)
@@ -616,7 +634,11 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
 
         cuts: dict[int, tuple[ChipletSplitAxis, int, tuple[tuple[int, int], ...]]] = {}
         areas: list[tuple[int, int]] = []
-        for entry, spec, _, _ in regions:
+        # Attention frames name the token/head cut of shared storage. Opaque
+        # state payloads reuse its areas without interpreting that cut.
+        for entry, spec, _, _ in sorted(
+            regions, key=lambda region: isinstance(region[1], RblnBlockTransferSpec)
+        ):
             base_addr = entry.data_ptr()
             if base_addr in cuts:
                 continue
@@ -663,7 +685,11 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
                     "cut it evenly."
                 )
             axis, slice_ids = ChipletSplitAxis.HEAD, (0,) * shards
-            if slices > 1:
+            if isinstance(spec, RblnBlockTransferSpec):
+                axis = ChipletSplitAxis.BLOCK
+                replicas = shards // slices
+                slice_ids = tuple(i // replicas for i in range(shards))
+            elif slices > 1:
                 if not isinstance(spec, (FullAttentionSpec, SlidingWindowSpec)):
                     raise RuntimeError(
                         f"RBLN NIXL (D2D): a KV entry of shape {shape} is cut "
@@ -747,8 +773,11 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
             "holds, although `canonical_kv_layers` keeps one layer per buffer"
         )
         geometries = []
-        for entry, _, offset, block_len in regions:
+        for entry, spec, offset, block_len in regions:
             axis, slices, placed = cuts[entry.data_ptr()]
+            if isinstance(spec, RblnBlockTransferSpec):
+                axis = ChipletSplitAxis.BLOCK
+                assert offset % slices == 0 and block_len % slices == 0
             geometries.append(
                 RegionGeometry(
                     axis,
@@ -863,6 +892,21 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
             self.kv_cache_config,
             {name: self._unwrapped_layer_spec(name) for name in self._layer_specs},
         )
+        if self._block_state_layers or self._block_aux_specs:
+            if self.use_host_buffer:
+                raise NotImplementedError(
+                    "RBLN NIXL block state and auxiliary caches require "
+                    "kv_buffer_device='rbln'; host staging copies every group "
+                    "through every layer's buffer."
+                )
+            if self._shape.writes_part_of_a_request or self._shape.has_swa:
+                raise NotImplementedError(
+                    "RBLN NIXL block state and auxiliary caches transfer whole "
+                    "blocks; chunk, streaming and sliding-window transfers "
+                    "are not supported."
+                )
+            canonical.update(self.kv_cache_config.transfer_group_index_by_layer)
+            canonical.update(self._block_aux_specs)
         # The runner allocates from its own copy of the connector's config.
         missing = canonical - kv_caches.keys()
         assert not missing, f"Canonical layers missing from kv_caches: {missing}"
@@ -951,6 +995,21 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
                 self.xfer_handshake_metadata.agent_metadata_bytes
             )
             self._publish_handshake_metadata(base_agent_metadata)
+
+    def register_block_aux_kv_caches(self, specs: dict[str, RBLNBlockAuxSpec]) -> None:
+        group_of = self.kv_cache_config.transfer_group_index_by_layer
+        for name, spec in specs.items():
+            if spec.owner not in group_of:
+                raise ValueError(
+                    f"Block-aux cache {name} has no transfer owner: {spec.owner}"
+                )
+            if name in self._layer_specs and name not in self._block_aux_specs:
+                raise ValueError(f"Block-aux cache {name} shadows a scheduled cache")
+            owner_spec = self._unwrapped_layer_spec(spec.owner)
+            self._layer_specs[name] = RblnBlockTransferSpec(
+                owner_spec.block_size, spec.page_size_bytes
+            )
+        self._block_aux_specs = dict(specs)
 
     def set_host_xfer_buffer_ops(self, copy_operation: CopyBlocksOp):
         """Assign copy (d2h, h2d) operations when host buffer is used.
