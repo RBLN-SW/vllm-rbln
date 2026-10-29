@@ -48,7 +48,8 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_rbln.logger import init_logger
-from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
+from vllm_rbln.platform import use_device_tensor
+from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec, window_splits_block
 
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_utils import KVCacheBlock
@@ -305,6 +306,9 @@ class RBLNKVCacheManager(KVCacheManager):
            in ``_SUB_BLOCK_ELIGIBLE_SPECS``).
         2. Every group must have block_size > sub_block_size and
            block_size % sub_block_size == 0.
+        3. Without device tensors, no sliding-window group may hold a window
+           smaller than its block that divides it, since the runtime KV copy
+           cannot address that group's window-sized kernel blocks.
         """
         if sub_block_size <= 0:
             return False
@@ -312,6 +316,12 @@ class RBLNKVCacheManager(KVCacheManager):
             spec = group.kv_cache_spec
             # The shift kernel overwrites the prefix with the latest window.
             if isinstance(spec, RBLNSlidingWindowSpec):
+                return False
+            if (
+                not use_device_tensor()
+                and isinstance(spec, SlidingWindowSpec)
+                and window_splits_block(spec)
+            ):
                 return False
             if not isinstance(spec, _SUB_BLOCK_ELIGIBLE_SPECS):
                 return False

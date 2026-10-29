@@ -105,7 +105,6 @@ class TestKVCacheBaseBindings:
         runner = make_model_runner(
             layers=("layer.0", "layer.1"),
             init_kv_cache=False,
-            additional_config={"enable_sub_block_cache": False},
         )
         full = make_kv_cache_config(runner).kv_cache_groups[0].kv_cache_spec
         sliding = SlidingWindowSpec(
@@ -123,6 +122,17 @@ class TestKVCacheBaseBindings:
         window_info, full_info = runner.kv_cache_view_infos
         assert window_info.view_shape != full_info.view_shape
         assert [tuple(b.shape) for b in runner.kv_cache_bases] == [full_info.view_shape]
+
+
+class TestSubBlockSettingAtKvInit:
+    def test_a_sub_block_setting_is_refused_before_warm_up(self, make_model_runner):
+        # The scheduler refuses it too, but only once warm-up has run.
+        runner = make_model_runner(
+            init_kv_cache=False,
+            additional_config={"enable_sub_block_cache": False, "sub_block_size": 16},
+        )
+        with pytest.raises(ValueError, match="enable_sub_block_cache=False"):
+            runner.initialize_kv_cache(make_kv_cache_config(runner))
 
 
 class TestLayerIndexFollowsCacheOrder:
