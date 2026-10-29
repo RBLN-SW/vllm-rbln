@@ -93,6 +93,9 @@ def _make_runner_stub(**attrs):
     runner = object.__new__(RBLNModelRunner)
     runner.dp_status = None
     runner.supports_mm_inputs = False
+    # No GatedDeltaNet layers: _update_states has no state rows to release.
+    runner.gdn_rows = None
+    runner.mrope_positions = None
     for key, value in attrs.items():
         setattr(runner, key, value)
     return runner

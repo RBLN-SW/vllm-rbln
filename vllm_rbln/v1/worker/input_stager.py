@@ -89,8 +89,9 @@ class InputStager:
             non_blocking=True,
         )
 
+        # positions is [B, S], or [3, B, S] for an M-RoPE model with images.
         buf.positions.fill_(layout.position_pad_value)
-        buf.positions[: layout.num_reqs, : layout.query_len].copy_(
+        buf.positions[..., : layout.num_reqs, : layout.query_len].copy_(
             positions,
             non_blocking=True,
         )
@@ -110,9 +111,11 @@ class InputStager:
         input_ids: torch.Tensor,
         positions: torch.Tensor,
     ) -> InputBuffer:
+        positions_shape = (*positions.shape[:-2], *layout.shape)
         key = (
             layout.shape,
             input_ids.dtype,
+            positions_shape,
             positions.dtype,
         )
         if key in self._buffers:
@@ -125,7 +128,7 @@ class InputStager:
                 device=self.device,
             ),
             positions=torch.empty(
-                layout.shape,
+                positions_shape,
                 dtype=positions.dtype,
                 device=self.device,
             ),

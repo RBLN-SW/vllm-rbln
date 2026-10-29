@@ -474,12 +474,51 @@ class TestRejectedConfigs:
                 reconfigure(msa(dtype))
         reconfigure(msa(torch.bfloat16))
 
-    def test_mrope_models_are_rejected(self, reconfigure, monkeypatch):
-        from vllm.config import ModelConfig
+    @pytest.fixture
+    def gdn(self, monkeypatch):
+        """The hook sees a GatedDeltaNet model with Qwen3.5-4B's 32 value heads."""
+        from vllm_rbln.platform import vllm_impl
 
-        monkeypatch.setattr(ModelConfig, "uses_mrope", property(lambda self: True))
-        with pytest.raises(ValueError, match="M-RoPE"):
-            reconfigure(lambda config: None)
+        monkeypatch.setattr(
+            vllm_impl, "_uses_linear_attention", lambda model_config: True
+        )
+
+        def mutate(config):
+            config.model_config.hf_text_config.linear_num_value_heads = 32
+
+        return mutate
+
+    def test_gdn_models_need_128_token_prefill_chunks(self, reconfigure, gdn):
+        def chunk_of_192(config):
+            gdn(config)
+            config.scheduler_config.max_num_batched_tokens = 192
+
+        with pytest.raises(ValueError, match="multiple of 128"):
+            reconfigure(chunk_of_192)
+        # A 128-multiple passes, and prefix caching is switched off for the model.
+        config = reconfigure(gdn)
+        assert config.cache_config.enable_prefix_caching is False
+
+    def test_gdn_models_reject_speculative_decoding(self, reconfigure, gdn):
+        def speculative(config):
+            gdn(config)
+            config.speculative_config = object()
+
+        with pytest.raises(ValueError, match="Speculative decoding"):
+            reconfigure(speculative)
+
+    def test_gdn_state_is_one_block_a_request(self, reconfigure, gdn):
+        config = reconfigure(gdn)
+        assert config.cache_config.mamba_block_size == config.model_config.max_model_len
+        assert config.cache_config.mamba_cache_mode == "none"
+
+    def test_gdn_value_heads_split_over_the_chiplets(self, reconfigure, gdn):
+        def six_heads(config):
+            gdn(config)
+            config.model_config.hf_text_config.linear_num_value_heads = 6
+
+        with pytest.raises(ValueError, match="four chiplets"):
+            reconfigure(six_heads)
 
     def test_chunked_prefill_off(self, reconfigure):
         with pytest.raises(ValueError, match="chunked prefill"):

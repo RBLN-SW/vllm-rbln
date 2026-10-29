@@ -33,6 +33,7 @@ from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.models.interfaces import (
+    SupportsMRoPE,
     SupportsMultiModal,
     supports_eagle3,
     supports_realtime,
@@ -130,6 +131,7 @@ from vllm_rbln.platform import use_device_tensor
 from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadataBuilder,
 )
+from vllm_rbln.v1.attention.backends.gdn import RBLNGDNAttentionMetadataBuilder
 from vllm_rbln.v1.attention.kv_cache_bindings import (
     KVCacheViewInfo,
     attach_kv_cache_bindings,
@@ -296,6 +298,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.cascade_attn_enabled = not self.model_config.disable_cascade_attn
         # Set in load_model by _resolve_mm_support.
         self.supports_mm_inputs = False
+        # [3, tokens]: the T / H / W positions of an M-RoPE model that takes
+        # images (load_model); None when the model reads plain positions.
+        self.mrope_positions: torch.Tensor | None = None
 
         self.encoder_cache: dict[str, torch.Tensor] = {}
 
@@ -344,6 +349,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
         # indexes: [kv_cache_group_id][attn_group]
         self.attn_groups: list[list[AttentionGroup]] = []
+        # The GatedDeltaNet group whose blocks key the state rows, and its builder.
+        self.gdn_rows: tuple[int, RBLNGDNAttentionMetadataBuilder] | None = None
 
         # Set up speculative decoding.
         # NOTE(Jiayi): We put the entire draft model on the last PP rank.
@@ -616,6 +623,18 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
     def _update_states(self, scheduler_output: RBLNSchedulerOutput) -> None:
         """Update the cached states and the persistent batch with the scheduler
         output."""
+        if self.gdn_rows is not None:
+            # The scheduler freed these requests' blocks; their state rows go
+            # back before this step's blocks are mapped.
+            gid, gdn_builder = self.gdn_rows
+            gone = scheduler_output.finished_req_ids | set(
+                scheduler_output.preempted_req_ids or ()
+            )
+            gdn_builder.release(
+                self.requests[req_id].block_ids[gid][0]
+                for req_id in gone
+                if req_id in self.requests and self.requests[req_id].block_ids[gid]
+            )
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
@@ -684,6 +703,16 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 lora_request=new_req_data.lora_request,
             )
             self.requests[req_id] = req_state
+            if self.mrope_positions is not None:
+                assert req_state.prompt_token_ids is not None, (
+                    "M-RoPE positions need the prompt's token ids"
+                )
+                (
+                    req_state.mrope_positions,
+                    req_state.mrope_position_delta,
+                ) = cast(SupportsMRoPE, self.model).get_mrope_input_positions(
+                    req_state.prompt_token_ids, req_state.mm_features
+                )
 
             if sampling_params and sampling_params.prompt_logprobs is not None:
                 self.num_prompt_logprobs[req_id] = (
@@ -933,6 +962,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             arange,
             out=positions_np,
         )
+        if self.mrope_positions is not None:
+            self._fill_mrope_positions(num_reqs, positions_np, cu_num_tokens)
 
         # Get token indices.
         # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
@@ -1026,6 +1057,27 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             total_query_tokens,
         )
 
+    def _fill_mrope_positions(
+        self, num_reqs: int, positions_np: np.ndarray, cu_num_tokens: np.ndarray
+    ) -> None:
+        """The M-RoPE positions of this step's tokens: the request's precomputed
+        ones inside its prompt, the text position + the request's delta after."""
+        assert self.mrope_positions is not None
+        mrope_np = self.mrope_positions.numpy()
+        start = 0
+        for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+            req = self.requests[req_id]
+            assert req.mrope_positions is not None
+            assert req.mrope_position_delta is not None
+            end = int(cu_num_tokens[i])
+            text = positions_np[start:end]
+            in_prompt = text < req.mrope_positions.shape[1]
+            mrope_np[:, start:end] = text + req.mrope_position_delta
+            mrope_np[:, start:end][:, in_prompt] = req.mrope_positions[
+                :, text[in_prompt]
+            ].numpy()
+            start = end
+
     def _build_attention_metadata(
         self,
         num_tokens: int,
@@ -1044,7 +1096,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         request count is still needed -- the decode branch of the builder pads
         the batch to it.
         """
-        if len(kv_cache_groups := self.kv_cache_config.kv_cache_groups) == 0:
+        kv_cache_groups = self.kv_cache_config.kv_cache_groups
+        if len(kv_cache_groups) == 0:
             return {}, None
 
         attn_metadata: PerLayerAttnMetadata = {}
@@ -1077,6 +1130,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
         spec_decode_common_attn_metadata = None
+        gdn_metadata = None
         for kv_cache_gid, _ in enumerate(kv_cache_groups):
             cm = copy(cm_base)  # shallow copy
 
@@ -1096,16 +1150,27 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
                 attn_group = self.attn_groups[kv_cache_gid][attn_gid]
                 builder = attn_group.get_metadata_builder(0)
-                assert isinstance(builder, RBLNFlashAttentionMetadataBuilder)
-
-                attn_metadata_i = builder.build(
-                    common_attn_metadata=cm,
-                    positions=self.positions,
-                    is_prefill=self.is_prefill,
-                    batch_pad=num_reqs_padded,
-                    back_pad=back_pad,
-                    is_prompt_sorted=self.sort_batch_by_length,
-                )
+                if isinstance(builder, RBLNGDNAttentionMetadataBuilder):
+                    # The first GatedDeltaNet group's metadata serves them all
+                    # (see initialize_metadata_builders).
+                    if gdn_metadata is None:
+                        gdn_metadata = builder.build(
+                            common_attn_metadata=cm,
+                            positions=self.positions,
+                            batch_pad=num_reqs_padded,
+                            is_prefill=self.is_prefill,
+                        )
+                    attn_metadata_i = gdn_metadata
+                else:
+                    assert isinstance(builder, RBLNFlashAttentionMetadataBuilder)
+                    attn_metadata_i = builder.build(
+                        common_attn_metadata=cm,
+                        positions=self.positions,
+                        is_prefill=self.is_prefill,
+                        batch_pad=num_reqs_padded,
+                        back_pad=back_pad,
+                        is_prompt_sorted=self.sort_batch_by_length,
+                    )
 
                 for layer_name in attn_group.layer_names:
                     attn_metadata[layer_name] = attn_metadata_i
@@ -1317,6 +1382,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # For text-only models
         input_ids = self.input_ids[:num_input_tokens].view(num_reqs, -1)
         positions = self.positions[:num_input_tokens].view(num_reqs, -1)
+        if self.mrope_positions is not None:
+            positions = self.mrope_positions[:, :num_input_tokens].view(3, num_reqs, -1)
         inputs_embeds = None
 
         if get_pp_group().is_first_rank:
@@ -2372,6 +2439,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 vllm_config=self.vllm_config, model_config=self.model_config
             )
         self.supports_mm_inputs = self._resolve_mm_support()
+        if self.supports_mm_inputs and self.model_config.uses_mrope:
+            self.mrope_positions = torch.zeros(
+                3, self.max_num_tokens, dtype=torch.int64
+            )
 
         if hasattr(self.model, "logits_processor"):
             self.logits_processor = self.model.logits_processor
@@ -2761,7 +2832,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         input_ids = self.input_ids[:num_tokens]
         inputs_embeds = None
-        positions = self.positions[:num_tokens]
+        positions = self.positions[:num_tokens].view(num_reqs, target_query_len)
+        if self.mrope_positions is not None:
+            positions = positions.expand(3, num_reqs, target_query_len)
         token_indices: torch.Tensor | None = None
         if self.use_wrapped_compute_logits and is_prefill:
             token_indices = torch.arange(
@@ -2792,7 +2865,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # NOTE(RBLN): Clone tensors to make tensors non-view tensors.
         staged_model_input = self.input_stager.stage(
             input_ids=input_ids.view(num_reqs, target_query_len),
-            positions=positions.view(num_reqs, target_query_len),
+            positions=positions,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
             token_indices=token_indices,
@@ -3013,6 +3086,23 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     num_metadata_builders=1,  # not use ubatching
                 )
 
+        # Every GatedDeltaNet group holds one block a request for the same
+        # requests, so the first group's row map and step tensors serve every
+        # group: one set of step inputs lets the compiler build the conv rings'
+        # index tables once a step rather than once a layer.
+        gdn_builders = [
+            (gid, builder)
+            for gid, groups in enumerate(self.attn_groups)
+            for group in groups
+            if isinstance(
+                builder := group.get_metadata_builder(0),
+                RBLNGDNAttentionMetadataBuilder,
+            )
+        ]
+        for _, builder in gdn_builders[1:]:
+            gdn_builders[0][1].states.update(builder.states)
+        self.gdn_rows = gdn_builders[0] if gdn_builders else None
+
         # Initialize drafter attention backend.
         if isinstance(self.drafter, DRAFT_MODEL_PROPOSERS):
             self.drafter.initialize_attn_backend(kv_cache_config, kernel_block_sizes)
@@ -3038,7 +3128,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             assert not isinstance(
                 kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec
             )
-            assert not isinstance(kv_cache_group.kv_cache_spec, MambaSpec)
+            # A MambaSpec group (one state block a request) has block_size =
+            # max_model_len, so its table is one block wide.
             block_size = kv_cache_group.kv_cache_spec.block_size
             block_sizes.append(block_size)
             max_num_blocks_per_req = cdiv(max_model_len, block_size)
@@ -3247,6 +3338,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                         permute_order=tuple(inv_order),
                         dynamic_axis=base_dynamic_axis,
                     )
+                elif isinstance(kv_cache_spec, MambaSpec):
+                    # The page only reserves the request's block: a GatedDeltaNet
+                    # state lives on its backend's rows (v1/attention/backends/
+                    # gdn.py), since its kernels take a whole tensor and the
+                    # compiler cannot view a page shared with an attention layer
+                    # in another dtype.
+                    continue
                 else:
                     raise NotImplementedError
 
