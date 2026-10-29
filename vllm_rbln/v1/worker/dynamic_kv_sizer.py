@@ -739,7 +739,7 @@ class DynamicKvSizer:
         unbound = 0
         for layer_name in dict.fromkeys(
             [name for t in old_cfg.kv_cache_tensors for name in t.layers]
-            + mr.aux_kv_cache_layers
+            + list(mr.aux_kv_cache_specs)
         ):
             layer = forward_context.get(layer_name)
             if layer is None:
