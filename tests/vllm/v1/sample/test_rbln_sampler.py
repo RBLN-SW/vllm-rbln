@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from collections.abc import Callable
-from typing import Any, NamedTuple
+from typing import Any
 from unittest.mock import Mock
 
 import pytest
@@ -98,40 +98,27 @@ def test_all_greedy_batch_takes_the_argmax_op(sampler, op_args):
 ROWS = 256
 WEIGHTED = weighted_token_ids(32).tolist()
 TAIL_TOKEN = 1
-
-
-class Mode(NamedTuple):
-    name: str  # "rebel_cpu" or "npu", the key into TOP_K_TOP_P
-    sampler: RBLNSampler  # the sampler under test
-    device: str 
-    launches: int  # sampler runs per `draw()`
-
-
-@pytest.fixture(params=["rebel_cpu", pytest.param("npu", marks=pytest.mark.use_device)])
-def mode(request) -> Mode:
-    """`rebel_cpu` mocks the compile and runs rebel's CPU body. `npu` runs the
-    NPU kernel, with more launches since its draws are cheap."""
-    if request.param == "rebel_cpu":
-        return Mode("rebel_cpu", request.getfixturevalue("sampler"), "cpu", 10)
-    return Mode("npu", RBLNSampler(), current_platform.device_type, 40)
+# NPU draws are cheap, so each `draw()` runs the sampler this many times.
+LAUNCHES = 40
 
 
 def sample(
-    mode: Mode,
     logits: torch.Tensor,
     params: list[SamplingParams],
-    launches: int | None = None,
+    launches: int = LAUNCHES,
     sampler: Callable[[torch.Tensor, SamplingMetadata], SamplerOutput] | None = None,
     **request_kwargs: Any,
 ) -> torch.Tensor:
-    """`sampler` stands in for `mode.sampler`, to wrap it as the runner does."""
+    """Draw from a compiled `RBLNSampler`, or from `sampler`, which wraps one as
+    the runner does."""
+    device = current_platform.device_type
     metadata = build_input_batch(
         [(str(i), p) for i, p in enumerate(params)],
-        device=mode.device,
+        device=device,
         **request_kwargs,
     ).sampling_metadata
-    logits = logits.contiguous().to(mode.device)
-    return draw(sampler or mode.sampler, logits, metadata, launches or mode.launches)
+    logits = logits.contiguous().to(device)
+    return draw(sampler or RBLNSampler(), logits, metadata, launches)
 
 
 def with_bad_words_token_ids(
@@ -143,35 +130,21 @@ def with_bad_words_token_ids(
     return params
 
 
-def unrenormalized_top_k_top_p(
-    budget: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
-) -> Callable[[torch.Tensor, torch.Tensor | None, torch.Tensor | None], torch.Tensor]:
-    """Top-k/top-p without upstream's renormalization over the top-k. A token
-    stays while the mass above it is under `budget(p, kept)`, `kept` being the
-    top-k mass."""
-
-    def top_k_top_p(logits, k, p):
-        probs, order = logits.softmax(dim=-1).sort(dim=-1, descending=True)
-        keep = torch.ones_like(probs, dtype=torch.bool)
-        if k is not None:
-            keep &= torch.arange(probs.shape[-1]) < k.unsqueeze(dim=1)
-        if p is not None:
-            kept = (probs * keep).sum(dim=-1, keepdim=True)
-            above = probs.cumsum(dim=-1) - probs
-            keep &= above < budget(p.unsqueeze(dim=1), kept)
-            keep[:, 0] = True
-        mask = torch.empty_like(keep).scatter_(-1, order, keep)
-        return logits.masked_fill(~mask, float("-inf"))
-
-    return top_k_top_p
-
-
-# How `rbln::top_k_top_p` cuts with both set. rebel's CPU body takes the mass
-# top-k drops out of p. The NPU keeps the intersection of top-k and top-p.
-TOP_K_TOP_P = {
-    "rebel_cpu": unrenormalized_top_k_top_p(lambda p, kept: p - (1 - kept)),
-    "npu": unrenormalized_top_k_top_p(lambda p, kept: p),
-}
+def npu_top_k_top_p(
+    logits: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor | None
+) -> torch.Tensor:
+    """How `rbln::top_k_top_p` cuts on the NPU: the intersection of top-k and
+    top-p, without upstream's renormalization over the top-k."""
+    probs, order = logits.softmax(dim=-1).sort(dim=-1, descending=True)
+    keep = torch.ones_like(probs, dtype=torch.bool)
+    if k is not None:
+        keep &= torch.arange(probs.shape[-1]) < k.unsqueeze(dim=1)
+    if p is not None:
+        above = probs.cumsum(dim=-1) - probs
+        keep &= above < p.unsqueeze(dim=1)
+        keep[:, 0] = True
+    mask = torch.empty_like(keep).scatter_(-1, order, keep)
+    return logits.masked_fill(~mask, float("-inf"))
 
 
 def case(params: SamplingParams, id: str, **request_kwargs: Any):
@@ -190,9 +163,9 @@ DISTRIBUTION_CASES = [
     case(SamplingParams(top_p=0.5), "top_p_0.5"),
     case(SamplingParams(top_p=0.7), "top_p_0.7"),
     case(SamplingParams(top_p=0.98), "top_p_0.98"),
-    # Both set: rebel's CPU body keeps 6 of the top 8, the NPU and upstream all 8.
+    # Both set: the NPU and upstream keep all of the top 8.
     case(SamplingParams(top_k=8, top_p=0.9), "top_k_8_top_p_0.9"),
-    # Upstream keeps 2, rebel's CPU body 1 and the NPU all 4.
+    # Upstream keeps 2 and the NPU all 4.
     case(SamplingParams(top_k=4, top_p=0.5), "top_k_4_top_p_0.5"),
     # Temperature scales the logits before top-p cuts the nucleus.
     case(SamplingParams(temperature=0.7, top_p=0.8), "temperature_top_p"),
@@ -239,21 +212,23 @@ DISTRIBUTION_CASES = [
 
 
 @pytest.mark.parametrize(("params", "request_kwargs"), DISTRIBUTION_CASES)
-def test_sampled_distribution(mode, params, request_kwargs):
+@pytest.mark.use_device
+def test_sampled_distribution(params, request_kwargs):
     row = make_logits(range(1, 33))
     expected = expected_probs(
         row.unsqueeze(0),
         [params],
-        top_k_top_p=TOP_K_TOP_P[mode.name],
+        top_k_top_p=npu_top_k_top_p,
         **request_kwargs,
     )[0]
 
-    samples = sample(mode, row.expand(ROWS, -1), [params] * ROWS, **request_kwargs)
+    samples = sample(row.expand(ROWS, -1), [params] * ROWS, **request_kwargs)
 
     assert_samples_match(samples, expected)
 
 
-def test_structured_output_mask_with_top_p_min_p(mode):
+@pytest.mark.use_device
+def test_structured_output_mask_with_top_p_min_p():
     """A token masked to -inf must never come back, whatever the filters keep."""
     row = make_logits(range(1, 33))
     row[[WEIGHTED[31], WEIGHTED[30], *range(WEIGHTED[0] + 1, WEIGHTED[1])]] = float(
@@ -262,12 +237,13 @@ def test_structured_output_mask_with_top_p_min_p(mode):
     params = SamplingParams(top_p=0.9, min_p=0.05)
     expected = expected_probs(row.unsqueeze(0), [params])[0]
 
-    samples = sample(mode, row.expand(ROWS, -1), [params] * ROWS)
+    samples = sample(row.expand(ROWS, -1), [params] * ROWS)
 
     assert_samples_match(samples, expected)
 
 
-def test_mixed_batch_keeps_each_row_to_its_own_params(mode):
+@pytest.mark.use_device
+def test_mixed_batch_keeps_each_row_to_its_own_params():
     """One op call serves the mixed batch, greedy rows as top_k=1. Each row must
     keep its own distribution."""
     weighted_row = make_logits(range(1, 33))
@@ -279,21 +255,38 @@ def test_mixed_batch_keeps_each_row_to_its_own_params(mode):
         (weighted_row, SamplingParams(temperature=1.0)),
         (weighted_row, SamplingParams(temperature=0.7, top_k=8)),
         (weighted_row, SamplingParams(temperature=1.2, top_p=0.7)),
+        (
+            weighted_row,
+            SamplingParams(
+                presence_penalty=0.5,
+                frequency_penalty=0.3,
+                repetition_penalty=1.2,
+                top_p=0.9,
+            ),
+        ),
     ]
+    # Only the penalized group reads the history.
+    history: dict[str, Any] = {
+        "prompt_token_ids": [WEIGHTED[29]],
+        "output_token_ids": [WEIGHTED[31], WEIGHTED[30], WEIGHTED[30]],
+    }
     per_group = ROWS // len(groups)
     logits = torch.stack([row for row, _ in groups for _ in range(per_group)])
     params = [p for _, p in groups for _ in range(per_group)]
     expected = expected_probs(
-        torch.stack([row for row, _ in groups]), [p for _, p in groups]
+        torch.stack([row for row, _ in groups]),
+        [p for _, p in groups],
+        **history,
     )
 
-    samples = sample(mode, logits, params)
+    samples = sample(logits, params, **history)
 
     for g, probs in enumerate(expected):
         assert_samples_match(samples[:, g * per_group : (g + 1) * per_group], probs)
 
 
-def test_padded_bucket_keeps_live_rows_to_their_params(mode):
+@pytest.mark.use_device
+def test_padded_bucket_keeps_live_rows_to_their_params():
     """Padding the metadata with copies of the last live row must not change
     any live row's distribution."""
     weighted_row = make_logits(range(1, 33))
@@ -317,11 +310,13 @@ def test_padded_bucket_keeps_live_rows_to_their_params(mode):
         torch.stack([row for row, _ in groups]), [p for _, p in groups]
     )
 
+    sampler = RBLNSampler()
+
     def padded(logits, metadata):
-        out = mode.sampler(logits, _pad_sampling_metadata(metadata, ROWS))
+        out = sampler(logits, _pad_sampling_metadata(metadata, ROWS))
         return _depad_sampler_output(out, num_reqs)
 
-    samples = sample(mode, logits, params, sampler=padded)
+    samples = sample(logits, params, sampler=padded)
 
     assert samples.shape[1] == num_reqs
     for g, probs in enumerate(expected):
@@ -463,7 +458,8 @@ EXACT_CASES = [
 
 
 @pytest.mark.parametrize(("params", "structured", "mixed"), EXACT_CASES)
-def test_sample_only_the_winner(mode, params, structured, mixed):
+@pytest.mark.use_device
+def test_sample_only_the_winner(params, structured, mixed):
     """Where the parameters leave one candidate, every draw must be it. A mixed
     row shares the batch with a row of the opposite kind."""
     row = exact_logits(structured)
@@ -476,7 +472,6 @@ def test_sample_only_the_winner(mode, params, structured, mixed):
     expected = expected_probs(row.expand(len(groups), -1), groups, **EXACT_HISTORY)
 
     samples = sample(
-        mode,
         row.expand(ROWS, -1),
         [p for p in groups for _ in range(per_group)],
         launches=2,
