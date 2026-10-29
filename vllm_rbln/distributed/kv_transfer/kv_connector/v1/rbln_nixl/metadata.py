@@ -56,7 +56,8 @@ if TYPE_CHECKING:
 # hash so an RBLN peer on another schema fails the handshake cleanly; earlier
 # bumps are `git log -L` on this line.
 #   10: per logical region, its cut axis and the slice each chiplet area holds
-RBLN_NIXL_CONNECTOR_VERSION: int = 10
+#   11: indivisible block state and auxiliary regions retain their owner groups
+RBLN_NIXL_CONNECTOR_VERSION: int = 11
 
 # Prefix a push completion notification carries when it names the half-open
 # range this write filled: ``RBLNS:<writer>:<lo>:<hi>:<per_block>:`` ahead of
@@ -71,10 +72,12 @@ class ChipletSplitAxis(Enum):
 
     ``HEAD`` means an area holds some of the shard's KV heads over every token
     of a block; ``TOKEN`` means every head over some of the tokens.
+    ``BLOCK`` is an opaque per-block payload paired only at equal TP.
     """
 
     HEAD = 0
     TOKEN = 1
+    BLOCK = 2
 
 
 @dataclass
