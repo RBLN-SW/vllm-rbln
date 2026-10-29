@@ -28,7 +28,13 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 import yaml
-from lane import agent_bin, case_status, perf_cases
+from lane import (
+    agent_bin,
+    case_status,
+    load_targets,
+    perf_cases,
+    restore_ci_targets,
+)
 
 ROOT = Path(__file__).resolve().parents[4]
 
@@ -112,16 +118,15 @@ def build_report(results, *, run_id, chip, build_url, branch, commit):
     rows = [[{"type": "raw_text", "text": title} for title in titles]]
     markdown = ["| " + " | ".join(titles) + " |", "|" + "---|" * len(titles)]
     completed = planned = 0
-    targets = pipelines / "scripts/perf/targets"
-    for path in sorted([*targets.glob("*.yaml"), *targets.glob("*.yml")]):
-        target = yaml.safe_load(path.read_text())
-        if target.get("chips") and chip not in target["chips"]:
-            continue
+    snapshot = results / "ci-targets" / run_id
+    targets = {}
+    if (snapshot / "snapshot.tar.gz").exists():
+        source = restore_ci_targets(snapshot)
+        targets = load_targets(snapshot / "perf", chip, "perf")
+    for name, target in targets.items():
         for launch, bench in sorted(perf_cases(target)):
             planned += 1
-            directory = (
-                results / "perf-results" / run_id / chip / path.stem / launch / bench
-            )
+            directory = results / "perf-results" / run_id / chip / name / launch / bench
             result_file = directory / "result.json"
             result = (
                 json.loads(result_file.read_text()) if result_file.exists() else None
@@ -185,15 +190,21 @@ def build_report(results, *, run_id, chip, build_url, branch, commit):
                 markdown.append(
                     "| " + " | ".join([f"[{number}]({url})", *cells]) + " |"
                 )
-    if not planned:
-        raise ValueError(f"No perf cases configured for {chip}")
+    if planned:
+        perf = (
+            f"{completed}/{planned} cases completed · {chip}\n"
+            f"Targets: {source['repo']} @ {source['commit']}"
+        )
+    else:
+        perf = "CI target preparation failed: target snapshot is missing"
+        degraded = True
 
     title = f"vllm-rbln {branch} nightly build"
     build_number = urlsplit(build_url).path.rstrip("/").rsplit("/", 1)[-1]
     sections = [
         "*Tests*\n" + "\n".join(tests),
         "*Examples*\n" + examples,
-        f"*Perf*\n{completed}/{planned} cases completed · {chip}",
+        "*Perf*\n" + perf,
     ]
     text = (
         f"{'⚠️' if degraded else '✅'} *{title} <{build_url}|#{build_number}> "
@@ -201,17 +212,20 @@ def build_report(results, *, run_id, chip, build_url, branch, commit):
     )
     blocks = [
         {"type": "section", "text": {"type": "mrkdwn", "text": text}},
-        {
-            "type": "table",
-            "column_settings": [
-                {"align": "right"},
-                {"is_wrapped": True},
-                {"is_wrapped": True},
-                *({"align": "right"} for _ in range(4)),
-            ],
-            "rows": rows,
-        },
     ]
+    if planned:
+        blocks.append(
+            {
+                "type": "table",
+                "column_settings": [
+                    {"align": "right"},
+                    {"is_wrapped": True},
+                    {"is_wrapped": True},
+                    *({"align": "right"} for _ in range(4)),
+                ],
+                "rows": rows,
+            }
+        )
     annotation = (
         f"**{title} [#{build_number}]({build_url}) ({commit[:8]})**\n\n"
         + "\n\n".join(
@@ -278,16 +292,29 @@ def main():
                 "pytest-results/**/result.json",
                 "example-results/**/results.json",
                 f"perf-results/{args.run_id}/{args.chip}/**/result.json",
+                f"ci-targets/{args.run_id}/snapshot.tar.gz",
             ):
+                scope = (
+                    ["--step", "nightly-targets-prepare"]
+                    if pattern.startswith("ci-targets/")
+                    else []
+                )
                 found = subprocess.run(
-                    [agent, "artifact", "search", pattern, "--allow-empty-results"],
+                    [
+                        agent,
+                        "artifact",
+                        "search",
+                        pattern,
+                        "--allow-empty-results",
+                        *scope,
+                    ],
                     check=True,
                     capture_output=True,
                     text=True,
                 )
                 if found.stdout.strip():
                     subprocess.run(
-                        [agent, "artifact", "download", pattern, str(results)],
+                        [agent, "artifact", "download", pattern, str(results), *scope],
                         check=True,
                     )
         payload, annotation, degraded = build_report(
