@@ -58,6 +58,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import
     RblnNixlConnectorMetadata,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
+    AreaRect,
     pair_area,
 )
 
@@ -1035,11 +1036,12 @@ class TestReplicaFanOut:
 
     # Our area holds heads 0-1; the peer holds them one per slice, each slice
     # on two of its areas (regions 0,1 and 2,3).
-    PEER = [(r, (r // 2, r // 2 + 1), 512) for r in range(4)]
+    FULL = (0, 16)
+    PEER = [(r, AreaRect((r // 2, r // 2 + 1), (0, 16)), 512) for r in range(4)]
 
     def _pieces(self, cls, peer=PEER):
         return pair_area(
-            (0, 2),
+            AreaRect((0, 2), self.FULL),
             1024,
             peer,
             kv_per_block=1,
@@ -1060,7 +1062,7 @@ class TestReplicaFanOut:
     def test_a_peer_without_copies_is_the_same_either_way(self):
         # areas == slices: nothing is duplicated, so there is only one place to
         # put the bytes and the two directions agree.
-        peer = [(r, (r // 2, r // 2 + 1), 512) for r in (0, 2)]
+        peer = [(r, AreaRect((r // 2, r // 2 + 1), self.FULL), 512) for r in (0, 2)]
         assert self._pieces(RblnNixlPullConnectorWorker, peer) == self._pieces(
             RblnNixlPushConnectorWorker, peer
         )

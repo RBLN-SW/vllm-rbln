@@ -956,7 +956,7 @@ class TestRegisterKvCachesImpl:
 
         # Registration itself still serves.
         assert worker._logical_region_kv_heads == [None] * 4
-        with pytest.raises(AssertionError, match="no head band"):
+        with pytest.raises(RuntimeError, match="no head band"):
             worker._region_kv_heads(0)
 
     def test_two_models_sharing_a_per_rank_share_of_one_is_refused(self, monkeypatch):
