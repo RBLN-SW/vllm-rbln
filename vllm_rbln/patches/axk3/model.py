@@ -10,14 +10,17 @@
 """A.X K3 on top of the vendored A.X K2 model.
 
 K3 keeps K2's gated MLA (fused output gate in q_b_proj), DSA indexer and MoE,
-and changes three things, all following the checkpoint's ``modeling_axk3.py``:
+and changes two things, both following the checkpoint's ``modeling_axk3.py``:
 
 - Gated Residual replaces both pre-norms and ``model.norm``: the residual is
   ``num_streams`` copies of the hidden state, each block reads a gated mean of
   them and writes its output back with a per-stream gate.
 - Index-share: only every ``index_topk_freq``-th layer owns an indexer; the
   others reuse the top-k of their source layer from the same forward.
-- The indexer reads the pre-``q_a_layernorm`` q latent (K2 feeds the normed one).
+
+The indexer reads the post-``q_a_layernorm`` q latent, as in K2. The
+checkpoint's ``modeling_axk3.py`` feeds it the pre-norm one, which the trained
+weights do not match.
 """
 
 import contextlib
@@ -42,6 +45,7 @@ from vllm.model_executor.models.utils import (
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
+from vllm_rbln import envs
 from vllm_rbln.patches.axk2 import model as _axk2_model
 
 # Loaded at import time from the frozen copy, so mypy cannot see its classes
@@ -155,7 +159,7 @@ def _gated_mla_forward(
     """K2's gated MLA forward, returning the top-k it attended with.
 
     ``mla`` is the AXK2GatedMultiHeadLatentAttentionWrapper. A layer that owns
-    an indexer computes the top-k from the pre-norm q latent; a skip layer is
+    an indexer computes the top-k from the post-norm q latent; a skip layer is
     handed its source layer's top-k.
     """
     batch_size, seq_len, _ = hidden_states.shape
@@ -183,9 +187,7 @@ def _gated_mla_forward(
     k_pe = k_pe.squeeze(2)
 
     if mla.indexer is not None:
-        topk_indices = mla.indexer(
-            hidden_states, q_c_prenorm, positions, mla.indexer_rope_emb
-        )
+        topk_indices = mla.indexer(hidden_states, q_c, positions, mla.indexer_rope_emb)
 
     attn_out = mla.mla_attn(
         q,
@@ -242,7 +244,7 @@ class AXK3DecoderLayer(_AXK2DecoderLayer):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         topk_by_layer: dict[int, torch.Tensor],
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         residual = hidden_states
         x, write_gate = self.attn_gated_residual.read(hidden_states)
         x, topk_indices = _gated_mla_forward(
@@ -251,13 +253,17 @@ class AXK3DecoderLayer(_AXK2DecoderLayer):
             x,
             topk_by_layer[self.index_source_layer] if self.skip_topk else None,
         )
-        topk_by_layer[self.layer_idx] = topk_indices
         hidden_states = self.attn_gated_residual.write(residual, x, write_gate)
 
         residual = hidden_states
         x, write_gate = self.mlp_gated_residual.read(hidden_states)
         x = self.mlp(x)
-        return self.mlp_gated_residual.write(residual, x, write_gate)
+        hidden_states = self.mlp_gated_residual.write(residual, x, write_gate)
+        return hidden_states, None if self.skip_topk else topk_indices
+
+    if envs.VLLM_RBLN_USE_NESTED_COMPILE_REGION:
+        # The region must not write topk_by_layer; forward returns its top-k instead.
+        forward = torch.compiler.nested_compile_region(forward)
 
 
 @support_torch_compile
@@ -336,7 +342,9 @@ class AXK3Model(nn.Module):
         # `make_layers` pads the list to the full depth with `PPMissingLayer`,
         # which returns its first argument; walk only the layers this rank built.
         for layer in islice(self.layers, self.start_layer, self.end_layer):
-            hidden_states = layer(positions, hidden_states, topk_by_layer)
+            hidden_states, topk_indices = layer(positions, hidden_states, topk_by_layer)
+            if topk_indices is not None:
+                topk_by_layer[layer.layer_idx] = topk_indices
 
         hidden_states, _ = self.final_gated_residual.read(hidden_states)
         return hidden_states

@@ -70,8 +70,9 @@ def _rbln_indexer_forward(
     k_cache = _resolve_kv_cache(attn_metadata, self.k_cache.layer_index)
 
     # fp8 indexer cache is a 2-cache spec: fp8_e4m3 values here plus a companion
-    # fp16 per-position scale cache. Registered by the DeepseekV32IndexerCache
-    # patch only when --kv-cache-dtype is fp8*, so this stays None on the bf16 path.
+    # per-position scale cache in the model dtype. Registered by the
+    # DeepseekV32IndexerCache patch only when --kv-cache-dtype is fp8*, so this
+    # stays None on the bf16 path.
     scale_cache = None
     if getattr(self.k_cache, "scale_cache", None) is not None:
         scale_cache = _resolve_kv_cache(

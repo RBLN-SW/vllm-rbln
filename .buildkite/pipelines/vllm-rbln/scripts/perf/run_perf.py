@@ -47,6 +47,7 @@ from lane import (  # noqa: E402
     host_chip,
     measured_pipeline,
     output_dir,
+    perf_cases,
     publish_summary,
     run_logged,
     start_case,
@@ -56,7 +57,7 @@ from lane import (  # noqa: E402
 )
 
 _HERE = Path(__file__).resolve().parent
-_RR_BENCH = _HERE / "dp_round_robin_bench.py"
+_SERVE_BENCH = _HERE / "serve_bench.py"
 
 
 def _seconds(ms: float) -> str:
@@ -202,16 +203,6 @@ def summarize(
     return "\n".join(body), degraded
 
 
-def spread_across_ranks(bench_cmd: list[str], serve: dict[str, Any]) -> list[str]:
-    """Under data parallelism, send the benchmark through the shim that cycles
-    the rank per request: one client cannot otherwise reach more than one rank,
-    and the server's balancer does not divide the load evenly enough."""
-    dp = int(serve.get("data_parallel_size", 1))
-    if dp <= 1:
-        return bench_cmd
-    return [sys.executable, str(_RR_BENCH), "--dp-size", str(dp), *bench_cmd]
-
-
 def run_case(
     out: Path,
     target: dict[str, Any],
@@ -230,10 +221,19 @@ def run_case(
     model = target["model"]
     serve_cmd = build_cmd(["vllm", "serve", "--model", model], target["serve"])
     bench_cmd = build_cmd(
-        ["vllm", "bench", "serve", "--model", model], target.get("bench", {})
+        [
+            sys.executable,
+            str(_SERVE_BENCH),
+            "--dp-size",
+            str(serve.get("data_parallel_size", 1)),
+            "--model",
+            model,
+        ],
+        target.get("bench", {}),
     )
-    bench_cmd = spread_across_ranks(bench_cmd, serve)
-    bench_params = {bench: target["bench_params"][bench]}
+    bench_params = {
+        bench: {k: v for k, v in target["bench_params"][bench].items() if k != "serve"}
+    }
 
     log = out / "perf.log"
     repro = write_repro(
@@ -345,8 +345,7 @@ def main() -> int:
     cases = [
         (name, launch, bench)
         for name, target in targets.items()
-        for launch in target["serve_params"]
-        for bench in target["bench_params"]
+        for launch, bench in perf_cases(target)
     ]
     if args.action == "run":
         for selected, column in ((args.launch, 1), (args.bench, 2)):

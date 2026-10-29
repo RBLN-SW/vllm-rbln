@@ -28,7 +28,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 import yaml
-from lane import agent_bin, case_status
+from lane import agent_bin, case_status, perf_cases
 
 ROOT = Path(__file__).resolve().parents[4]
 
@@ -117,85 +117,74 @@ def build_report(results, *, run_id, chip, build_url, branch, commit):
         target = yaml.safe_load(path.read_text())
         if target.get("chips") and chip not in target["chips"]:
             continue
-        for launch in sorted(target["serve_params"]):
-            for bench in sorted(target["bench_params"]):
-                planned += 1
-                directory = (
-                    results
-                    / "perf-results"
-                    / run_id
-                    / chip
-                    / path.stem
-                    / launch
-                    / bench
+        for launch, bench in sorted(perf_cases(target)):
+            planned += 1
+            directory = (
+                results / "perf-results" / run_id / chip / path.stem / launch / bench
+            )
+            result_file = directory / "result.json"
+            result = (
+                json.loads(result_file.read_text()) if result_file.exists() else None
+            )
+            status = case_status(result)
+            measurements = result["rows"] if result else []
+            case_ok = status == "ok"
+            metrics = (
+                ("output_throughput", 1),
+                ("total_token_throughput", 1),
+                ("mean_ttft_ms", 1000),
+                ("mean_tpot_ms", 1),
+            )
+            for row in measurements:
+                case_ok &= (
+                    int(row["completed"]) == int(row["num_prompts"])
+                    and int(row["failed"]) == 0
+                    and all(
+                        row.get(key) is not None and math.isfinite(float(row[key]))
+                        for key, _ in metrics
+                    )
                 )
-                result_file = directory / "result.json"
-                result = (
-                    json.loads(result_file.read_text())
-                    if result_file.exists()
-                    else None
+            completed += case_ok
+            degraded |= not case_ok
+            url = (result or {}).get("job_url") or build_url
+            parts = urlsplit(url)
+            if parts.fragment:
+                query = dict(parse_qsl(parts.query)) | {"job": parts.fragment}
+                url = urlunsplit(parts._replace(query=urlencode(query), fragment=""))
+            number = str(planned)
+            link = {
+                "type": "rich_text",
+                "elements": [
+                    {
+                        "type": "rich_text_section",
+                        "elements": [
+                            {"type": "link", "text": number, "url": url},
+                        ],
+                    },
+                ],
+            }
+            if result is None:
+                failure = "MISSING"
+            elif result["exit_code"] is None:
+                failure = "INCOMPLETE"
+            else:
+                failure = "FAILED"
+            for row in measurements or [{}]:
+                case = f"{launch} / {bench}"
+                if not case_ok:
+                    case = f"❌ {case} ({failure})"
+                cells = [target["model"].rsplit("/", 1)[-1], case]
+                for key, scale in metrics:
+                    value = row.get(key)
+                    cells.append(
+                        f"{float(value) / scale:.1f}" if value is not None else "—"
+                    )
+                rows.append(
+                    [link, *({"type": "raw_text", "text": cell} for cell in cells)]
                 )
-                status = case_status(result)
-                measurements = result["rows"] if result else []
-                case_ok = status == "ok"
-                metrics = (
-                    ("output_throughput", 1),
-                    ("total_token_throughput", 1),
-                    ("mean_ttft_ms", 1000),
-                    ("mean_tpot_ms", 1),
+                markdown.append(
+                    "| " + " | ".join([f"[{number}]({url})", *cells]) + " |"
                 )
-                for row in measurements:
-                    case_ok &= (
-                        int(row["completed"]) == int(row["num_prompts"])
-                        and int(row["failed"]) == 0
-                        and all(
-                            row.get(key) is not None and math.isfinite(float(row[key]))
-                            for key, _ in metrics
-                        )
-                    )
-                completed += case_ok
-                degraded |= not case_ok
-                url = (result or {}).get("job_url") or build_url
-                parts = urlsplit(url)
-                if parts.fragment:
-                    query = dict(parse_qsl(parts.query)) | {"job": parts.fragment}
-                    url = urlunsplit(
-                        parts._replace(query=urlencode(query), fragment="")
-                    )
-                number = str(planned)
-                link = {
-                    "type": "rich_text",
-                    "elements": [
-                        {
-                            "type": "rich_text_section",
-                            "elements": [
-                                {"type": "link", "text": number, "url": url},
-                            ],
-                        },
-                    ],
-                }
-                if result is None:
-                    failure = "MISSING"
-                elif result["exit_code"] is None:
-                    failure = "INCOMPLETE"
-                else:
-                    failure = "FAILED"
-                for row in measurements or [{}]:
-                    case = f"{launch} / {bench}"
-                    if not case_ok:
-                        case = f"❌ {case} ({failure})"
-                    cells = [target["model"].rsplit("/", 1)[-1], case]
-                    for key, scale in metrics:
-                        value = row.get(key)
-                        cells.append(
-                            f"{float(value) / scale:.1f}" if value is not None else "—"
-                        )
-                    rows.append(
-                        [link, *({"type": "raw_text", "text": cell} for cell in cells)]
-                    )
-                    markdown.append(
-                        "| " + " | ".join([f"[{number}]({url})", *cells]) + " |"
-                    )
     if not planned:
         raise ValueError(f"No perf cases configured for {chip}")
 

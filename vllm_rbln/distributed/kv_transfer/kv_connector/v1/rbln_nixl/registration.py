@@ -119,7 +119,8 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         fits more than one declared count -- a draft's as well as the target's.
         """
         layer_spec = self._unwrapped_layer_spec(layer_name)
-        if isinstance(layer_spec, MambaSpec):
+        # A latent is the same key on every rank, so no head band names it.
+        if isinstance(layer_spec, MambaSpec) or is_latent(layer_spec):
             return None
         known = {self.model_config.get_total_num_kv_heads()}
         speculative_config = self.vllm_config.speculative_config
@@ -940,6 +941,9 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
                 self.block_len_per_layer,
             )
         ]
+        # Host staging records no latents; the per-head check a pipelined peer
+        # reaches through this path reads every region as attention.
+        self._logical_region_latent = [False] * len(self._logical_region_geometry)
         # Re-wrap upstream's published handshake metadata with this stage's PP
         # identity and chiplet geometry (no-op degrade for pp_size == 1).
         if self.xfer_handshake_metadata is not None:
