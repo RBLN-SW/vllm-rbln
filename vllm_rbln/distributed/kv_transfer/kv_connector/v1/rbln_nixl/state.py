@@ -934,7 +934,7 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
             assert len(pieces) == len(region_ids)
             assert block_size_ratio == 1
 
-        # Per region, `(offset, length)` of each piece of a block.
+        # Per entry, `(offset, length)` of each piece of a block.
         ranges: list[np.ndarray] = []
         for i, region_id in enumerate(region_ids):
             if pieces is None:

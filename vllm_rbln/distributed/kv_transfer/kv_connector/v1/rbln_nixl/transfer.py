@@ -304,14 +304,14 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
     ) -> np.ndarray:
         """This shard's whole-block descriptors for `block_ids`.
 
-        `needed` is how many chunks of the last block hold tokens; a region
+        `needed` is how many chunks of the last block hold tokens; an entry
         holding any chunk past them leaves that block to the chunk range.
         """
         region_group_ids = self._shard_region_group_ids[(engine_id, global_rank)]
         per_block = self._shard_descs_per_block[(engine_id, global_rank)]
-        # `(first chunk, chunks)` of a block each region holds: off the grid
+        # `(first chunk, chunks)` of a block each entry holds: off the grid
         # where the lists carry one, and without one a chunk is a span, so each
-        # region holds the span its area does.
+        # entry holds the span its region's area does.
         windows: list[tuple[int, int]] = []
         if needed is not None:
             grid = self._shard_chunk_grids[(engine_id, global_rank)]
@@ -388,7 +388,7 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
         per_block = self._shard_descs_per_block[(engine_id, global_rank)]
         return _chunk_desc_ids(
             # Where the chunk range starts: the whole-block range covers every
-            # region, block and piece once.
+            # entry, block and piece once.
             start=sum(per_block) * num_blocks,
             cuts=grid.entries,
             num_blocks=num_blocks,
@@ -441,7 +441,7 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
         """This shard's descriptors for `block_ids`, cut to the tokens held.
 
         The last block goes out as the chunks that hold tokens: whole from the
-        regions whose part of it they fill, and in chunks from every region the
+        entries whose part of it they fill, and in chunks from every entry the
         last of them falls inside. Both sides build this the same way, so the two
         lists still pair by position.
 
