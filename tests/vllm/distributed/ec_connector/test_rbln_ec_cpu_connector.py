@@ -162,6 +162,8 @@ def test_an_output_in_another_dtype_is_refused(connect):
         producer.save_caches({"img": embeds}, "img")
 
 
-def test_the_vllm_path_registers_the_connector():
+def test_the_connector_is_registered():
+    import vllm_rbln.distributed.ec_transfer.ec_connector.factory  # noqa: F401
+
     cls = ECConnectorFactory._registry["RblnECCPUConnector"]()
     assert cls is RblnECCPUConnector

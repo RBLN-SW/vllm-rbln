@@ -37,7 +37,7 @@ from vllm.multimodal.inputs import PlaceholderRange
 from vllm.platforms import current_platform
 from vllm.pooling_params import PoolingParams
 from vllm.v1.core.sched.output import CachedRequestData
-from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
+from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ECConnectorOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 
 import vllm_rbln.v1.worker.optimum_model_runner as runner_module
@@ -266,7 +266,7 @@ def test_load_model_skips_the_pad_block_pool_on_the_ec_producer(
     model.kv_block_adapter = None
     monkeypatch.setattr(runner_module, "get_optimum_model", lambda vllm_config: model)
     model_runner.vllm_config.ec_transfer_config = ECTransferConfig(
-        ec_connector="RblnECNixlConnector", ec_role="ec_producer"
+        ec_connector="RblnECCPUConnector", ec_role="ec_producer"
     )
     del model_runner.available_blocks
 
@@ -719,13 +719,31 @@ class TestMropePositions:
         assert RBLNOptimumModelRunner._mrope_positions(state, 0, 3) is None
 
 
+def _make_ec_producer(model_runner) -> None:
+    # Upstream makes an EC producer encoder-only.
+    model_runner.vllm_config.ec_transfer_config = ECTransferConfig(
+        ec_connector="RblnECCPUConnector", ec_role="ec_producer"
+    )
+    model_runner.vllm_config.model_config.multimodal_config = SimpleNamespace(
+        mm_encoder_only=True
+    )
+
+
+def _report_connector_output(model_runner, monkeypatch) -> ECConnectorOutput:
+    reported = ECConnectorOutput(finished_sending={"img"})
+
+    @contextlib.contextmanager
+    def connector_output(scheduler_output, encoder_cache):
+        yield reported
+
+    monkeypatch.setattr(model_runner, "maybe_get_ec_connector_output", connector_output)
+    return reported
+
+
 def test_execute_model_on_the_ec_producer_returns_the_empty_encoder_output(
     model_runner, monkeypatch
 ):
-    model_runner.vllm_config.ec_transfer_config = ECTransferConfig(
-        ec_connector="RblnECNixlConnector", ec_role="ec_producer"
-    )
-    model_runner.is_ec_producer = True
+    _make_ec_producer(model_runner)
     encoded = []
     monkeypatch.setattr(
         model_runner,
@@ -748,10 +766,7 @@ def test_execute_model_on_the_ec_producer_returns_the_empty_encoder_output(
 def test_execute_model_on_the_ec_producer_enters_the_connector_on_an_idle_step(
     model_runner, monkeypatch
 ):
-    model_runner.vllm_config.ec_transfer_config = ECTransferConfig(
-        ec_connector="RblnECNixlConnector", ec_role="ec_producer"
-    )
-    model_runner.is_ec_producer = True
+    _make_ec_producer(model_runner)
     entered = []
 
     @contextlib.contextmanager
@@ -769,6 +784,35 @@ def test_execute_model_on_the_ec_producer_enters_the_connector_on_an_idle_step(
     # must enter it even when nothing new was scheduled.
     assert entered == [idle_step]
     assert output is EMPTY_MODEL_RUNNER_OUTPUT
+
+
+def test_execute_model_on_the_ec_producer_returns_the_connector_output(
+    model_runner, monkeypatch
+):
+    # A save completes through the worker's report; dropping it leaves the
+    # output unpublished.
+    _make_ec_producer(model_runner)
+    reported = _report_connector_output(model_runner, monkeypatch)
+    monkeypatch.setattr(model_runner, "_execute_mm_encoder", lambda *args: None)
+    scheduler_output = _schedule_new_request(
+        "req_0", block_ids=([1],), outer_block_ids=[1]
+    )
+
+    output = model_runner.execute_model(scheduler_output)
+
+    assert output.ec_connector_output is reported
+    assert output.req_ids == ["req_0"]
+
+
+def test_an_idle_step_returns_the_connector_output(model_runner, monkeypatch):
+    model_runner.supports_mm_inputs = True
+    reported = _report_connector_output(model_runner, monkeypatch)
+    idle_step = _schedule_new_request(block_ids=([1],), outer_block_ids=[1])
+
+    output = model_runner.execute_model(idle_step)
+
+    assert output.ec_connector_output is reported
+    assert EMPTY_MODEL_RUNNER_OUTPUT.ec_connector_output is None
 
 
 def test_update_states_rejects_a_streaming_request(model_runner):
