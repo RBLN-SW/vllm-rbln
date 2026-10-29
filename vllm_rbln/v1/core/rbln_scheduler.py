@@ -131,6 +131,10 @@ class RBLNScheduler(Scheduler):
         self._pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
 
         self._is_mm_prefix_lm = self.vllm_config.model_config.is_mm_prefix_lm
+        self._prefill_chunk_size = (
+            rbln_config.prefill_chunk_size
+            or self.scheduler_config.max_num_batched_tokens
+        )
 
     def _mm_prefix_split(
         self, request: Request, num_computed_tokens: int, num_new_tokens: int
@@ -140,7 +144,10 @@ class RBLNScheduler(Scheduler):
         A range attends to itself both ways, which a compiled graph can only do
         over a step holding that range alone: a chunk starting a range is the
         whole range, and any other chunk stops where the next range begins.
+        Only the latter is capped at the prefill chunk size; a range is padded
+        to a length of its own.
         """
+        text_tokens = min(num_new_tokens, self._prefill_chunk_size)
         for feature in request.mm_features:
             if feature.modality not in ("image", "video"):
                 continue
@@ -156,8 +163,8 @@ class RBLNScheduler(Scheduler):
                     "a prefill chunk stopped inside an mm prefix range"
                 )
                 if num_computed_tokens < first:
-                    return min(num_new_tokens, first - num_computed_tokens)
-        return num_new_tokens
+                    return min(text_tokens, first - num_computed_tokens)
+        return text_tokens
 
     def _decode_demand(self) -> int:
         """Total decode demand for this step's soft (ceil(demand/pp)) cap.
@@ -328,6 +335,8 @@ class RBLNScheduler(Scheduler):
                 num_new_tokens = self._mm_prefix_split(
                     request, request.num_computed_tokens, num_new_tokens
                 )
+            else:
+                num_new_tokens = min(num_new_tokens, self._prefill_chunk_size)
 
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
@@ -711,6 +720,8 @@ class RBLNScheduler(Scheduler):
                         num_new_tokens = self._mm_prefix_split(
                             request, num_computed_tokens, num_new_tokens
                         )
+                    else:
+                        num_new_tokens = min(num_new_tokens, self._prefill_chunk_size)
 
                     # Schedule encoder inputs.
                     if request.has_encoder_inputs:
