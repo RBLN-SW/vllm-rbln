@@ -288,6 +288,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # These will be overridden in load_model()
         self.max_model_len = model_config.max_model_len
         self.max_num_tokens = scheduler_config.max_num_batched_tokens
+        self.prefill_chunk_size = (
+            self.rbln_config.prefill_chunk_size or self.max_num_tokens
+        )
         self.max_num_reqs = scheduler_config.max_num_seqs
 
         self.dcp_world_size = self.parallel_config.decode_context_parallel_size
@@ -1329,7 +1332,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             num_reqs=num_reqs,
             num_reqs_padded=num_reqs_padded,
             query_len=input_ids.shape[1],
-            query_len_padded=self.max_num_tokens if is_prefill else input_ids.shape[1],
+            query_len_padded=(
+                self.prefill_chunk_size if is_prefill else input_ids.shape[1]
+            ),
         )
         staged_model_inputs = self.input_stager.stage(
             input_ids=input_ids,
@@ -3789,7 +3794,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
     def run_model_graphs(self) -> None:
         """Every model graph once, at the shapes serving will ask for."""
         # 1. prefill
-        self._dummy_run(1, self.max_num_tokens, True)
+        self._dummy_run(1, self.prefill_chunk_size, True)
 
         # 2. decode
         query_lens = [1]
