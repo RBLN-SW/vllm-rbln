@@ -98,6 +98,13 @@ class RBLNConfig(RBLNConfigBase):
     it off on its own; True refuses such a configuration at start-up; False
     keeps the estimate."""
 
+    use_exportable_kv_cache: bool = False
+    """Allocate the KV cache with `torch.rbln.ipc.empty_exportable`, so another
+    process on the same device can open it, as an LMCache server in
+    LMCache-driven mode does. Needs the dynamic KV cache resize: an export pins
+    the layout the memory has at that moment, and only the resize registers
+    the KV cache after the compiled model has placed it."""
+
     enable_sub_block_cache: bool = True
     """Enable sub-block prefix caching, at `sub_block_size` granularity."""
 
@@ -147,10 +154,12 @@ class RBLNConfig(RBLNConfigBase):
 
         ignored_factors = {
             # Sampler graphs compile with use_cache=False, so they never enter
-            # the bundle. Sub-block caching changes what runs, not what is built.
+            # the bundle. Sub-block caching and how the KV cache is allocated
+            # change what runs, not what is built.
             "use_custom_sampler",
             "enable_sub_block_cache",
             "sub_block_size",
+            "use_exportable_kv_cache",
         }
         factors = get_hash_factors(self, ignored_factors)
         # Unset and True build the same graph; only False changes the artifact.

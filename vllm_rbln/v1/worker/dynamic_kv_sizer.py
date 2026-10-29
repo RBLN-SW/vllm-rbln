@@ -204,6 +204,14 @@ class DynamicKvSizer:
             num_gpu_blocks_override=self.cache_config.num_gpu_blocks_override,
             compile_skip_reason=compile_and_warmup_skip_reason(vllm_config),
         )
+        if (
+            vllm_config.additional_config.use_exportable_kv_cache
+            and not self.defers_kv_registration
+        ):
+            raise ValueError(
+                "use_exportable_kv_cache needs the dynamic KV cache resize, "
+                f"which is {self.mode.value}: {self.mode_reason}"
+            )
         # The count vLLM sized, held while the cache is shrunk for the compile.
         self.kv_blocks_before_shrink: int | None = None
         self.programs: list[Any] = []
