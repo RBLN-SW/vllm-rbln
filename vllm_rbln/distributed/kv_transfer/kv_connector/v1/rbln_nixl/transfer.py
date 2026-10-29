@@ -43,7 +43,7 @@ def _chunk_desc_ids(
     """Descriptor ids for chunks `[lo, hi)` of one block, in every region
     holding any of them.
 
-    `cuts` is `ChunkGrid.regions` and the span counts chunks of the block, so
+    `cuts` is `ChunkGrid.entries` and the span counts chunks of the block, so
     each region takes the part of it that falls in its own window.
     `partial_only` leaves out a region the span covers whole, which a
     whole-block descriptor carried instead. A region of no runs holds at most
@@ -235,7 +235,7 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
             # region holds the whole block and every one takes the span.
             return _chunk_desc_ids(
                 start=num_whole_descs * (1 + window_units),
-                cuts=grid.regions,
+                cuts=grid.entries,
                 num_blocks=num_blocks,
                 block_id=block_id,
                 per_block=1,
@@ -316,7 +316,7 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
         if needed is not None:
             grid = self._shard_chunk_grids[(engine_id, global_rank)]
             windows = (
-                [(first, chunks) for first, _, chunks in grid.regions]
+                [(first, chunks) for first, _, chunks in grid.entries]
                 if grid is not None
                 else [
                     (span, 1)
@@ -363,7 +363,8 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
 
         The span counts chunks of the block. A context cut gives each area a
         window of them, so only the areas whose window it reaches take part;
-        a head cut gives every region all of them.
+        a head cut gives every region all of them, and an entry split off a
+        region on the peer's token ranges holds one range of them.
 
         Indexes the second range the shard's lists carry (see
         `_register_shard_local_xfer_handler`), which follows the whole-block
@@ -383,13 +384,13 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
                 f"{grid.chunks_per_block} chunk(s) a block holds"
             )
         region_group_ids = self._shard_region_group_ids[(engine_id, global_rank)]
-        assert len(grid.regions) == len(region_group_ids)
+        assert len(grid.entries) == len(region_group_ids)
         per_block = self._shard_descs_per_block[(engine_id, global_rank)]
         return _chunk_desc_ids(
             # Where the chunk range starts: the whole-block range covers every
             # region, block and piece once.
             start=sum(per_block) * num_blocks,
-            cuts=grid.regions,
+            cuts=grid.entries,
             num_blocks=num_blocks,
             block_id=block_id,
             per_block=per_block,
