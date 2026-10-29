@@ -119,7 +119,9 @@ from vllm_rbln.compilation import (
 )
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import (
+    SupportsBlockAuxKVCaches,
     flush_deferred_loads,
+    iter_kv_connectors,
 )
 from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.logger import init_logger
@@ -339,7 +341,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.kv_cache_block_axes: dict[str, int] = {}
         self.kv_cache_bases: list[torch.Tensor] = []
         self.kv_cache_view_infos: list[KVCacheViewInfo] = []
-        self.aux_kv_cache_layers: list[str] = []
+        self.aux_kv_cache_specs: dict[str, RBLNBlockAuxSpec] = {}
         # Set in initialize_kv_cache: a recurrent state (a MambaSpec group) under
         # speculative decoding, whose verify step replays the accepted drafts.
         self.replays_accepted_drafts = False
@@ -3480,7 +3482,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         dynamic_axis = 0 if dynamic_kv_enabled(self.vllm_config) else None
         tensors: dict[tuple, torch.Tensor] = {}
         ordinals: defaultdict[tuple, int] = defaultdict(int)
-        aux_layers: list[str] = []
+        aux_specs: dict[str, RBLNBlockAuxSpec] = {}
         forward_context = self.compilation_config.static_forward_context
         for layer_name, module in forward_context.items():
             get_aux_spec = getattr(module, "get_aux_cache_spec", None)
@@ -3506,12 +3508,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 dynamic_axis=dynamic_axis,
             )
             block_axes[layer_name] = 0
-            aux_layers.append(layer_name)
-        self.aux_kv_cache_layers = aux_layers
+            aux_specs[layer_name] = spec
+        self.aux_kv_cache_specs = aux_specs
         if tensors:
             logger.info(
                 "Block-aux KV caches: %d layers on %d tensors, %.3f GiB",
-                len(aux_layers),
+                len(aux_specs),
                 len(tensors),
                 sum(t.numel() * t.element_size() for t in tensors.values()) / 2**30,
             )
@@ -3589,6 +3591,22 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # Reinitialize need to after initialize_attn_backend
         self.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
         self.initialize_kv_cache_tensors(kv_cache_config, kernel_block_sizes)
+        if self.aux_kv_cache_specs and has_kv_transfer_group():
+            connectors = list(iter_kv_connectors(get_kv_transfer_group()))
+            unsupported = [
+                type(connector).__name__
+                for connector in connectors
+                if not isinstance(connector, SupportsBlockAuxKVCaches)
+            ]
+            if unsupported:
+                raise NotImplementedError(
+                    f"{', '.join(unsupported)} cannot move block-aux KV caches, "
+                    f"which {len(self.aux_kv_cache_specs)} layers of this model keep "
+                    "beside the KV cache: a transferred block would arrive without "
+                    "them."
+                )
+            for connector in connectors:
+                connector.register_block_aux_kv_caches(self.aux_kv_cache_specs)
 
         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
         self.cache_config.num_cpu_blocks = 0

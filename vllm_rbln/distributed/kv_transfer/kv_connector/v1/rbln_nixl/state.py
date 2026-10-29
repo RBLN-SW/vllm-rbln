@@ -30,6 +30,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_transfer_topology im
     RblnTransferTopology,
 )
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
 
 logger = init_logger(__name__)
 
@@ -368,6 +369,9 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
     #: names no run.
     _logical_region_local_heads: list[int | None]
     local_seen_layer_names: list[str]
+    _block_state_layers: set[str]
+    _block_state_groups: set[int]
+    _block_aux_specs: dict[str, RBLNBlockAuxSpec]
     compat_hash: str | None
 
     _remote_shard_layer_names: defaultdict[str, dict[int, tuple[str, ...]]]

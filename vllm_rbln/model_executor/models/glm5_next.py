@@ -201,8 +201,6 @@ class RBLNGlm5NextPagedCache(_RBLNGlm5NextCache):
         )
 
 
-# TODO(RBLN): PD. The NIXL connector refuses Mamba layers; the KDA states and the aux
-# caches have to be registered as regions and moved with their blocks.
 class RBLNGlm5NextAuxCache(_RBLNGlm5NextCache):
     def __init__(
         self,
