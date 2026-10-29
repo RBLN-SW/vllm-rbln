@@ -393,13 +393,9 @@ class RBLNGlm5NextKDA(nn.Module):
         block_size = vllm_config.cache_config.block_size
         latent_bytes = block_size * config.kv_lora_rank
         state_bytes = self.head_dim * self.head_dim * dtype.itemsize
-        if latent_bytes % state_bytes or self.num_heads % (latent_bytes // state_bytes):
-            raise ValueError(
-                f"GLM-5.3: block_size {block_size} does not split the "
-                f"{self.num_heads} KDA heads of a TP rank into states of a latent "
-                f"block ({latent_bytes} B, {state_bytes} B a head)"
-            )
+        assert latent_bytes % state_bytes == 0, (block_size, state_bytes)
         self.group_heads = latent_bytes // state_bytes
+        assert self.num_heads % self.group_heads == 0, (block_size, self.num_heads)
         self.num_groups = self.num_heads // self.group_heads
         self.register_buffer(
             "conv_weight",

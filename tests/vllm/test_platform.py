@@ -411,6 +411,17 @@ class TestPlatformIdentity:
         }
 
 
+def _as_glm5_next(config: VllmConfig) -> None:
+    """GLM-5.3's text config on the test model: its KDA heads and MLA latent."""
+    text_config = config.model_config.hf_text_config
+    text_config.model_type = "glm5_next_text"
+    text_config.linear_num_heads = 64
+    text_config.linear_head_dim = 128
+    text_config.kv_lora_rank = 512
+    config.model_config.dtype = torch.bfloat16
+    config.cache_config.cache_dtype = "fp8"
+
+
 class TestRejectedConfigs:
     @pytest.mark.parametrize(
         ("block_size", "max_num_batched_tokens", "invalid_block_size"),
@@ -475,11 +486,12 @@ class TestRejectedConfigs:
         reconfigure(msa(torch.bfloat16))
 
     def test_glm5_next_configs(self, reconfigure):
-        def glm5_next(*, cache_dtype="fp8", spec=None, **cache):
+        def glm5_next(*, cache_dtype="fp8", spec=None, tp=1, **cache):
             def mutate(config):
-                config.model_config.hf_text_config.model_type = "glm5_next_text"
+                _as_glm5_next(config)
                 config.cache_config.cache_dtype = cache_dtype
                 config.speculative_config = spec
+                config.parallel_config.tensor_parallel_size = tp
                 for name, value in cache.items():
                     setattr(config.cache_config, name, value)
 
@@ -511,13 +523,34 @@ class TestRejectedConfigs:
                 glm5_next(enable_prefix_caching=True, prefix_match_unit=block_size // 2)
             )
 
+        reconfigure(glm5_next(tp=4, block_size=1024))
+        for tp, block_size in ((4, 2048), (1, 8192), (1, 192), (1, 160)):
+            with pytest.raises(ValueError, match="whole KDA head states"):
+                reconfigure(glm5_next(tp=tp, block_size=block_size))
+
+        def bf16_forced_to_fp32(config):
+            glm5_next(block_size=8192)(config)
+            config.additional_config = replace(
+                config.additional_config, enforce_model_fp32=True
+            )
+
+        reconfigure(bf16_forced_to_fp32)
+        if platform.USE_DEVICE_TENSOR:
+
+            def fp32_forced_to_fp16(config):
+                glm5_next(block_size=8192)(config)
+                config.model_config.dtype = torch.float32
+                config.model_config.enforce_eager = True
+
+            with pytest.raises(ValueError, match="whole KDA head states"):
+                reconfigure(fp32_forced_to_fp16)
+
     def test_glm5_next_prefix_caching_with_mtp_needs_retention_0(self, reconfigure):
         # A KDA verify step leaves no state at the end of a block it crossed, so
         # only retention 0 (states a prefill stored) keeps prefix caching on.
         def glm5_next_mtp(retention):
             def mutate(config):
-                config.model_config.hf_text_config.model_type = "glm5_next_text"
-                config.cache_config.cache_dtype = "fp8"
+                _as_glm5_next(config)
                 config.cache_config.enable_prefix_caching = True
                 # What MambaModelConfig sets up for prefix caching before the hook.
                 config.cache_config.mamba_cache_mode = "align"
