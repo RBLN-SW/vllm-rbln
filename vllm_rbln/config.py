@@ -101,6 +101,12 @@ class RBLNConfig(RBLNConfigBase):
     enable_sub_block_cache: bool = True
     """Enable sub-block prefix caching, at `sub_block_size` granularity."""
 
+    prefill_chunk_size: int | None = Field(default=None, gt=0)
+    """Length the text prefill graph is compiled at, and so the longest text
+    chunk the scheduler hands it. An mm prefix range is padded to a length of
+    its own, which `max_num_batched_tokens` has to hold. If None, uses
+    `max_num_batched_tokens`."""
+
     specialize_moe_decode: bool = True
     """Specialize the case where every instance is at the decode stage."""
 

@@ -513,6 +513,31 @@ class TestRejectedConfigs:
         with pytest.raises(ValueError, match="divisible"):
             reconfigure(_ranks(data_parallel_size=2, max_num_seqs=5))
 
+    def test_a_prefill_chunk_above_the_token_budget_is_refused(self, reconfigure):
+        with pytest.raises(ValueError, match="exceeds"):
+            reconfigure(_prefill_chunk(256))
+
+    def test_a_prefill_chunk_below_the_token_budget_is_taken(self, reconfigure):
+        config = reconfigure(_prefill_chunk(64))
+        assert config.additional_config.prefill_chunk_size == 64
+
+    @pytest.mark.parametrize(
+        "feature",
+        ["data parallelism", "speculative decoding", "sub-block prefix caching"],
+    )
+    def test_a_prefill_chunk_below_the_token_budget_refuses(self, reconfigure, feature):
+        def mutate(config):
+            _prefill_chunk(64)(config)
+            if feature == "data parallelism":
+                _ranks(data_parallel_size=2)(config)
+            elif feature == "speculative decoding":
+                config.speculative_config = SimpleNamespace(method="ngram")
+            else:
+                config.cache_config.enable_prefix_caching = True
+
+        with pytest.raises(ValueError, match=feature):
+            reconfigure(mutate)
+
     @pytest.mark.parametrize("ranks", [dict(data_parallel_size=2), dict(ep=True)])
     def test_dp_and_ep_need_the_moe_tokens_mask(self, reconfigure, ranks):
         with pytest.raises(ValueError, match="--rbln-use-moe-tokens-mask"):
@@ -586,6 +611,18 @@ def _ranks(
             config.additional_config = replace(
                 config.additional_config, use_moe_tokens_mask=moe_tokens_mask
             )
+
+    return mutate
+
+
+def _prefill_chunk(size: int):
+    """A mutator that sets --rbln-prefill-chunk-size, with sub-block caching off."""
+
+    def mutate(config: VllmConfig) -> None:
+        config.additional_config = replace(
+            config.additional_config, prefill_chunk_size=size
+        )
+        config.cache_config.enable_prefix_caching = False
 
     return mutate
 

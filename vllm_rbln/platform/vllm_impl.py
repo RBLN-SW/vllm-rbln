@@ -129,6 +129,34 @@ def _validate(vllm_config: "VllmConfig") -> None:
             "Set --block-size within this range."
         )
 
+    chunk = rbln_config.prefill_chunk_size
+    if chunk is not None and chunk > max_num_batched_tokens:
+        raise ValueError(
+            f"--rbln-prefill-chunk-size={chunk} exceeds {max_num_batched_tokens=}."
+        )
+    # TODO(RBLN): DP ranks agree on max_num_batched_tokens as the prefill token
+    # dimension (dp_utils), and spec decode and sub-block caching take it as
+    # the prefill chunk.
+    if chunk is not None and chunk < max_num_batched_tokens:
+        unsupported = [
+            name
+            for name, on in (
+                ("data parallelism", parallel_config.data_parallel_size > 1),
+                ("speculative decoding", vllm_config.speculative_config is not None),
+                (
+                    "sub-block prefix caching",
+                    vllm_config.cache_config.enable_prefix_caching
+                    and rbln_config.enable_sub_block_cache,
+                ),
+            )
+            if on
+        ]
+        if unsupported:
+            raise ValueError(
+                f"--rbln-prefill-chunk-size={chunk} below {max_num_batched_tokens=} "
+                f"is not supported with {', '.join(unsupported)} on RBLN yet."
+            )
+
     if envs.VLLM_RBLN_COMPILE_ONLY and envs.VLLM_DISABLE_COMPILE_CACHE:
         # Compile-only compiles each graph and writes the .rbln artifact to
         # the compile cache (the runtime is built on a dummy device so no
@@ -338,9 +366,8 @@ def _override(vllm_config: "VllmConfig") -> None:
         model_config.disable_cascade_attn = True
 
     # As upstream's CUDA and ROCm platforms do: an mm prefix range attends both
-    # ways, so it must never straddle two steps.
-    # TODO(RBLN): prefill pads to max_num_batched_tokens, so the text prefill
-    # graph grows with the longest mm item; give it a length of its own.
+    # ways, so it must never straddle two steps. max_num_batched_tokens then
+    # holds the longest item; prefill_chunk_size sizes text prefill.
     scheduler_config = vllm_config.scheduler_config
     if (
         model_config.is_mm_prefix_lm
