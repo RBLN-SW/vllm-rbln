@@ -33,8 +33,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import yaml
-
 # The lanes share a directory, not a package.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -45,6 +43,7 @@ from lane import (  # noqa: E402
     devices_needed,
     download_results,
     host_chip,
+    load_targets,
     measured_pipeline,
     output_dir,
     perf_cases,
@@ -298,7 +297,7 @@ def main() -> int:
     for action in ("run", "pipeline", "summary"):
         command = commands.add_parser(action)
         command.add_argument("targets", nargs="*", help="target names (default: all)")
-        command.add_argument("--targets-dir", type=Path, default=_HERE / "targets")
+        command.add_argument("--targets-dir", type=Path)
         command.add_argument("--chip", required=action != "run")
         command.add_argument(
             "--run-id",
@@ -311,23 +310,17 @@ def main() -> int:
             command.add_argument("--bench")
         elif action == "summary":
             command.add_argument("--download", action="store_true")
+        elif action == "pipeline":
+            command.add_argument("--snapshot", action="store_true")
     args, passthrough = parser.parse_known_args()
     if passthrough and args.action != "run":
         parser.error(f"unrecognized arguments: {shlex.join(passthrough)}")
 
+    args.targets_dir = args.targets_dir or Path("ci-targets") / args.run_id / "perf"
     # Not a flag: an --output-dir here would reach the sweep through passthrough
     # and move its results out from under the launch directory.
     if bad := {"-o", "--output-dir"} & {arg.split("=", 1)[0] for arg in passthrough}:
         parser.error(f"{', '.join(sorted(bad))} is set with PERF_OUTPUT_DIR instead")
-
-    paths = sorted([*args.targets_dir.glob("*.yaml"), *args.targets_dir.glob("*.yml")])
-    if args.targets:
-        wanted = set(args.targets)
-        paths = [p for p in paths if p.stem in wanted]
-        if missing := wanted - {p.stem for p in paths}:
-            parser.error(f"no such target: {', '.join(sorted(missing))}")
-    if not paths:
-        parser.error(f"no targets under {args.targets_dir}")
 
     if args.action == "run":
         chip = host_chip()
@@ -336,12 +329,12 @@ def main() -> int:
         if args.chip is not None and args.chip != chip:
             parser.error(f"expected chip {args.chip}, host reports {chip}")
         args.chip = chip
-    targets = {path.stem: yaml.safe_load(path.read_text()) for path in paths}
-    targets = {
-        name: target
-        for name, target in targets.items()
-        if not target.get("chips") or args.chip in target["chips"]
-    }
+    targets = load_targets(args.targets_dir, args.chip, "perf")
+    if args.targets:
+        wanted = set(args.targets)
+        if missing := wanted - targets.keys():
+            parser.error(f"no such target: {', '.join(sorted(missing))}")
+        targets = {name: target for name, target in targets.items() if name in wanted}
     cases = [
         (name, launch, bench)
         for name, target in targets.items()
@@ -367,6 +360,7 @@ def main() -> int:
             chip=args.chip,
             run_id=args.run_id,
             targets_dir=args.targets_dir,
+            snapshot=args.snapshot,
         )
         print(json.dumps(pipeline))
         return 0
