@@ -547,13 +547,19 @@ def area_slices(areas: int, slices: int, regions: int) -> list[list[int]]:
 
 
 def fill_region_geometry(
-    w: Any, *, areas: int, axes: Sequence[Any], slices: int | Sequence[int] = 1
+    w: Any,
+    *,
+    areas: int,
+    axes: Sequence[Any],
+    slices: int | Sequence[int] = 1,
+    latent: Sequence[bool] | None = None,
 ) -> Any:
     """The chiplet geometry registration lays out, for a worker a test built by
     hand: one logical region per entry of `axes`, each over `areas` areas and
     cut into `slices` (one count for every region, or one per region), the
     replicas of a slice adjacent as in `area_slices`. Nothing that reads this
-    reads an address, so the places carry none.
+    reads an address, so the places carry none. `latent` marks the key-only
+    regions; none by default.
     """
     from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
         AreaPlace,
@@ -570,7 +576,8 @@ def fill_region_geometry(
         geometries.append(RegionGeometry(axis, count, places))
     w._kv_areas = areas
     w._logical_region_geometry = geometries
-    w._logical_region_latent = [False] * len(axes)
+    assert latent is None or len(latent) == len(axes), (latent, axes)
+    w._logical_region_latent = [False] * len(axes) if latent is None else list(latent)
     return w
 
 
