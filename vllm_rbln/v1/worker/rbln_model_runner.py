@@ -2559,6 +2559,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                         guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
                         runtime_holder=self.runtime_holder,
                         mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
+                        use_static_output=True,
                     )
                 )
 
