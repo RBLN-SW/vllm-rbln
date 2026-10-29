@@ -79,6 +79,20 @@ class RegionGeometry(NamedTuple):
     areas: tuple[AreaPlace, ...]
 
 
+class AreaRect(NamedTuple):
+    """What one chiplet area holds of one logical region's block.
+
+    Inside one of K and V the area lays its heads outermost and each head's
+    tokens inside it, so a token range of one head is one contiguous run of
+    bytes.
+    """
+
+    #: `[lo, hi)` in model-wide KV heads.
+    heads: tuple[int, int]
+    #: `[lo, hi)` in tokens of the block.
+    tokens: tuple[int, int]
+
+
 class Piece(NamedTuple):
     """One contiguous range on each side of a transfer, per block."""
 
@@ -90,20 +104,10 @@ class Piece(NamedTuple):
     rows: int
 
 
-def area_heads(
-    slices: int, slice_id: int, *, first_head: int, heads: int
-) -> tuple[int, int]:
-    """`[lo, hi)` in model-wide KV heads of a slice of a rank's `heads` from
-    `first_head`."""
-    per_slice = heads // slices
-    lo = first_head + slice_id * per_slice
-    return lo, lo + per_slice
-
-
 def pair_area(
-    local: tuple[int, int],
+    local: AreaRect,
     local_page: int,
-    peer_areas: Sequence[tuple[int, tuple[int, int], int]],
+    peer_areas: Sequence[tuple[int, AreaRect, int]],
     *,
     kv_per_block: int,
     every_holder: bool,
@@ -111,79 +115,101 @@ def pair_area(
 ) -> list[Piece]:
     """The pieces one local area exchanges with one peer rank's areas.
 
-    `local` and each peer area are a `[lo, hi)` of model-wide KV heads, and
-    `peer_areas` is `(region id, heads, block length)` per area. A piece is
-    where two areas' heads overlap, one range of heads on both sides, and K
-    with V merge into one piece where both sides hold the same heads. Areas
-    holding the same heads are replicas: a read takes the first, a write every
-    one.
+    `peer_areas` is `(region id, rectangle, block length)` per area. A piece
+    is the intersection of two rectangles, so it is one run per head on both
+    sides; heads merge into one piece where both sides hold the same token
+    range, and K with V where both sides hold the same rectangle. Areas
+    holding the same rectangle are replicas: a read takes the first, a write
+    every one.
 
-    Ordered by peer heads, then holder, then K/V -- the order both descriptor
-    lists are built in.
+    Ordered by peer rectangle, then head run, then holder, then K/V -- the
+    order both descriptor lists are built in.
     """
-    lh0, lh1 = local
-    holders: dict[tuple[int, int], list[tuple[int, int]]] = {}
-    for region, heads, page in peer_areas:
-        holders.setdefault(heads, []).append((region, page))
+    (lh0, lh1), (lt0, lt1) = local
+    holders: dict[AreaRect, list[tuple[int, int]]] = {}
+    for region, rect, page in peer_areas:
+        holders.setdefault(rect, []).append((region, page))
     pieces: list[Piece] = []
     covered = 0
-    for heads in sorted(holders):
-        rh0, rh1 = heads
+    for rect in sorted(holders):
+        (rh0, rh1), (rt0, rt1) = rect
         h0, h1 = max(lh0, rh0), min(lh1, rh1)
-        if h0 >= h1:
+        t0, t1 = max(lt0, rt0), min(lt1, rt1)
+        if h0 >= h1 or t0 >= t1:
             continue
-        covered += h1 - h0
-        for remote_region, page in (
-            holders[heads] if every_holder else holders[heads][:1]
-        ):
-            if heads == local:
-                if page != local_page:
+        covered += (h1 - h0) * (t1 - t0)
+        whole = rect == local
+        same_tokens = (t0, t1) == (lt0, lt1) == (rt0, rt1)
+        runs = [(h0, h1)] if same_tokens else [(h, h + 1) for h in range(h0, h1)]
+        for run_lo, run_hi in runs:
+            for remote_region, page in (
+                holders[rect] if every_holder else holders[rect][:1]
+            ):
+                if whole:
+                    if page != local_page:
+                        raise RuntimeError(
+                            f"RBLN NIXL D2D: peer region {remote_region} holds what "
+                            f"local region {region_id} does in {page}B a "
+                            f"block, against {local_page}B here."
+                        )
+                    pieces.append(
+                        Piece(
+                            0,
+                            remote_region,
+                            0,
+                            local_page,
+                            kv_per_block * (run_hi - run_lo),
+                        )
+                    )
+                    continue
+                if page % kv_per_block:
                     raise RuntimeError(
-                        f"RBLN NIXL D2D: peer region {remote_region} holds the same "
-                        f"heads as local region {region_id} in {page}B a block, "
-                        f"against {local_page}B here."
+                        f"RBLN NIXL D2D: peer region {remote_region} block length "
+                        f"{page}B does not divide into {kv_per_block} range(s) "
+                        "of K and V."
                     )
-                pieces.append(
-                    Piece(0, remote_region, 0, local_page, kv_per_block * (h1 - h0))
-                )
-                continue
-            if page % kv_per_block:
-                raise RuntimeError(
-                    f"RBLN NIXL D2D: peer region {remote_region} block length "
-                    f"{page}B does not divide into {kv_per_block} range(s) "
-                    "of K and V."
-                )
-            half_l, half_r = local_page // kv_per_block, page // kv_per_block
-            if half_r % (rh1 - rh0):
-                raise RuntimeError(
-                    f"RBLN NIXL D2D: region {remote_region}'s {half_r}B does not "
-                    f"split into {rh1 - rh0} heads."
-                )
-            head_l, head_r = half_l // (lh1 - lh0), half_r // (rh1 - rh0)
-            if head_l != head_r:
-                raise RuntimeError(
-                    f"RBLN NIXL D2D: a KV head is {head_l}B a block in local "
-                    f"region {region_id} and {head_r}B in peer region "
-                    f"{remote_region}."
-                )
-            length = (h1 - h0) * head_l
-            off_l, off_r = (h0 - lh0) * head_l, (h0 - rh0) * head_r
-            for kv in range(kv_per_block):
-                pieces.append(
-                    Piece(
-                        kv * half_l + off_l,
-                        remote_region,
-                        kv * half_r + off_r,
-                        length,
-                        h1 - h0,
+                half_l, half_r = local_page // kv_per_block, page // kv_per_block
+                if half_r % (rh1 - rh0):
+                    raise RuntimeError(
+                        f"RBLN NIXL D2D: region {remote_region}'s {half_r}B does "
+                        f"not split into {rh1 - rh0} heads."
                     )
-                )
-    if covered != lh1 - lh0:
-        offered = ", ".join(f"{h0}..{h1 - 1}" for h0, h1 in sorted(holders))
+                head_l, head_r = half_l // (lh1 - lh0), half_r // (rh1 - rh0)
+                if head_l * (rt1 - rt0) != head_r * (lt1 - lt0):
+                    raise RuntimeError(
+                        f"RBLN NIXL D2D: a KV head is {head_l}B a block over "
+                        f"{lt1 - lt0} token(s) in local region {region_id} and "
+                        f"{head_r}B over {rt1 - rt0} in peer region {remote_region}."
+                    )
+                if same_tokens:
+                    length = (run_hi - run_lo) * head_l
+                    off_l = (run_lo - lh0) * head_l
+                    off_r = (run_lo - rh0) * head_r
+                else:
+                    # Exact: ours by the cache's own shape, the peer's by the
+                    # per-token check above.
+                    token_l, token_r = head_l // (lt1 - lt0), head_r // (rt1 - rt0)
+                    length = (t1 - t0) * token_l
+                    off_l = (run_lo - lh0) * head_l + (t0 - lt0) * token_l
+                    off_r = (run_lo - rh0) * head_r + (t0 - rt0) * token_r
+                for kv in range(kv_per_block):
+                    pieces.append(
+                        Piece(
+                            kv * half_l + off_l,
+                            remote_region,
+                            kv * half_r + off_r,
+                            length,
+                            run_hi - run_lo,
+                        )
+                    )
+    if covered != (lh1 - lh0) * (lt1 - lt0):
+        offered = ", ".join(
+            f"{h0}..{h1 - 1} x {t0}..{t1 - 1}" for (h0, h1), (t0, t1) in sorted(holders)
+        )
         raise RuntimeError(
-            f"RBLN NIXL D2D: local region {region_id} holds heads {lh0}..{lh1 - 1}, "
-            f"and part of that is outside the peer's range: the areas offered "
-            f"({offered}) do not cover it exactly once."
+            f"RBLN NIXL D2D: local region {region_id} holds heads {lh0}..{lh1 - 1} "
+            f"over tokens {lt0}..{lt1 - 1}, and part of that is outside the peer's "
+            f"range: the areas offered ({offered}) do not cover it exactly once."
         )
     return pieces
 

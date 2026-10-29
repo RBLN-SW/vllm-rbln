@@ -21,6 +21,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from torch._dynamo.variables.invoke_subgraph import InvokeSubgraphHigherOrderVariable
 
 import vllm_rbln.compilation.compiler as compiler
 from vllm_rbln.compilation import (
@@ -40,10 +41,14 @@ def _dynamo_isolation():
         cfg.inline_inbuilt_nn_modules,
         cfg.cache_size_limit,
         compiler._DYNAMO_CONFIGURED,
+        cfg.inline_single_use_invoke_subgraph,
+        InvokeSubgraphHigherOrderVariable.allow_side_effects,
     )
     yield
     cfg.inline_inbuilt_nn_modules, cfg.cache_size_limit = saved[0], saved[1]
     compiler._DYNAMO_CONFIGURED = saved[2]
+    cfg.inline_single_use_invoke_subgraph = saved[3]
+    InvokeSubgraphHigherOrderVariable.allow_side_effects = saved[4]
 
 
 @pytest.fixture
@@ -206,15 +211,24 @@ class TestCompileOptions:
 
 
 class TestEnsureTorchDynamoConfigured:
-    def test_sets_rbln_flags(self):
+    @pytest.mark.parametrize("nested", [False, True])
+    def test_sets_rbln_flags(self, monkeypatch, nested):
         # Applies the RBLN dynamo settings (nn.Module params must not become
-        # graph inputs; larger cache size limit).
+        # graph inputs; larger cache size limit). Nested compile regions also
+        # keep single-use regions and reject side effects inside a region.
+        monkeypatch.setattr(
+            compiler.envs, "VLLM_RBLN_USE_NESTED_COMPILE_REGION", nested
+        )
         compiler._DYNAMO_CONFIGURED = False
         torch._dynamo.config.inline_inbuilt_nn_modules = True
         torch._dynamo.config.cache_size_limit = 8
+        torch._dynamo.config.inline_single_use_invoke_subgraph = True
+        InvokeSubgraphHigherOrderVariable.allow_side_effects = True
         compiler._ensure_torch_dynamo_configured()
         assert torch._dynamo.config.inline_inbuilt_nn_modules is False
         assert torch._dynamo.config.cache_size_limit == 64
+        assert torch._dynamo.config.inline_single_use_invoke_subgraph is not nested
+        assert InvokeSubgraphHigherOrderVariable.allow_side_effects is not nested
 
     def test_idempotent(self):
         # After the first call the guard makes further calls no-ops.

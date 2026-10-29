@@ -1068,8 +1068,9 @@ class TestEnsureRblnHostThreadsBeforeCompile:
     @staticmethod
     def _prep(monkeypatch, planned):
         captured = []
+        monkeypatch.setattr(wm, "compute_rbln_local_omp_cpuid", lambda r, lr, pc: "0")
         monkeypatch.setattr(
-            wm, "get_rbln_planned_affinity_cpu_count", lambda r, lr, pc: planned
+            wm, "get_rbln_planned_affinity_cpu_count", lambda cpuid: planned
         )
         monkeypatch.setattr(
             wm, "set_omp_num_threads", lambda r, lr, n: captured.append(n)
@@ -1118,13 +1119,28 @@ class TestEnsureRblnCpuAffinityAfterWarmup:
     def test_applies_affinity_once(self, make_worker, monkeypatch):
         # Applies set_cpu_affinity exactly once (idempotent guard).
         worker = make_worker()
+        monkeypatch.setattr(wm, "compute_rbln_local_omp_cpuid", lambda r, lr, pc: "0")
         calls = []
         monkeypatch.setattr(
-            wm, "set_cpu_affinity", lambda r, lr, pc: calls.append((r, lr))
+            wm, "set_cpu_affinity", lambda r, lr, cpuid: calls.append((r, lr))
         )
         worker._ensure_rbln_cpu_affinity_after_warmup()
         worker._ensure_rbln_cpu_affinity_after_warmup()
         assert calls == [(0, 0)]
+
+    def test_binds_the_cpus_planned_before_warmup(self, make_worker, monkeypatch):
+        # The binding shrinks the allowed CPUs, so a second computation after
+        # warm-up could pick other CPUs than the thread count was sized for.
+        worker = make_worker()
+        computed = iter(["0,1,2,3", "0,1"])
+        monkeypatch.setattr(
+            wm, "compute_rbln_local_omp_cpuid", lambda r, lr, pc: next(computed)
+        )
+        bound = []
+        monkeypatch.setattr(wm, "set_cpu_affinity", lambda r, lr, c: bound.append(c))
+        planned = worker._rbln_omp_cpuid
+        worker._ensure_rbln_cpu_affinity_after_warmup()
+        assert bound == [planned]
 
 
 class TestInitWorkerDistributedEnvironment:
