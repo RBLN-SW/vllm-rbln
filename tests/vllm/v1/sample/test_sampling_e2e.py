@@ -193,3 +193,49 @@ def test_first_token_distribution_matches_upstream(runner, params):
     completions = generate(runner, [PROMPT] * NUM_SAMPLES, params)
 
     assert_samples_match(torch.tensor([c.token_ids[0] for c in completions]), expected)
+
+
+# The grammar fixes the first token to "x", so the digit after it comes from a
+# decode step, where the measured rows share the batch with the rows below.
+X_THEN_DIGIT = StructuredOutputsParams(regex=r"x[0-9]")
+NEIGHBORS = [
+    SamplingParams(temperature=0.0, max_tokens=2),
+    SamplingParams(
+        temperature=1.0,
+        presence_penalty=1.0,
+        frequency_penalty=1.0,
+        repetition_penalty=1.5,
+        max_tokens=2,
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"temperature": 1.0},
+        {"temperature": 0.7, "top_k": 3},
+        {"temperature": 1.2, "top_p": 0.8},
+    ],
+    ids=["temperature", "top_k", "top_p"],
+)
+def test_decode_distribution_holds_in_a_mixed_batch(runner, kwargs):
+    """Greedy and penalized rows beside a random row must not change its
+    decode-step distribution."""
+    probe = SamplingParams(
+        temperature=0.0, structured_outputs=X_THEN_DIGIT, max_tokens=2, logprobs=-1
+    )
+    (completion,) = generate(runner, [PROMPT], probe)
+    vocab_size = runner.llm.llm_engine.model_config.get_vocab_size()
+    raw = torch.full((vocab_size,), float("-inf"))
+    for token_id, logprob in completion.logprobs[1].items():
+        raw[token_id] = logprob.logprob
+    measured = SamplingParams(structured_outputs=X_THEN_DIGIT, max_tokens=2, **kwargs)
+    expected = expected_probs(raw.unsqueeze(0), [measured])[0]
+    params = [measured, measured, *NEIGHBORS] * (NUM_SAMPLES // 2)
+
+    completions = generate(runner, [PROMPT] * len(params), params)
+
+    digits = [c for c, p in zip(completions, params) if p is measured]
+    assert {c.token_ids[0] for c in digits} == {completion.token_ids[0]}
+    assert_samples_match(torch.tensor([c.token_ids[1] for c in digits]), expected)
