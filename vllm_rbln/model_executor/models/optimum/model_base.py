@@ -237,6 +237,7 @@ class RBLNOptimumModelBase(nn.Module):
                 # model matches the value used for KV-cache block padding.
                 prefill_chunk_size=self.vllm_config.scheduler_config.max_num_batched_tokens,
                 memory_budget=self.vllm_config.cache_config.gpu_memory_utilization,
+                num_gpu_blocks_override=self.vllm_config.cache_config.num_gpu_blocks_override,
                 rbln_overrides=rbln_overrides,
             )
             logger.info(

@@ -21,15 +21,23 @@ NPU-dependent operations are replaced with test doubles.
 
 import types
 
+import pytest
 import torch
-from transformers import Gemma4Config
+from optimum.rbln import RBLNLlamaForCausalLMConfig
+from transformers import Gemma4Config, LlamaConfig
 
 from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.model_executor.models.optimum import model_base
 from vllm_rbln.model_executor.models.optimum.model_base import RBLNOptimumModelBase
 
 
-def _init_model_with(monkeypatch, tmp_path, hf_config) -> dict:
+def _init_model_with(
+    monkeypatch,
+    tmp_path,
+    hf_config,
+    num_gpu_blocks_override=None,
+    gpu_memory_utilization=0.9,
+) -> dict:
     passed = {}
 
     class FakeRBLNModel:
@@ -40,14 +48,12 @@ def _init_model_with(monkeypatch, tmp_path, hf_config) -> dict:
                 rbln_config=types.SimpleNamespace(), save_pretrained=lambda p: None
             )
 
+    def compile_spec(cls, config, **kwargs):
+        passed["compile_kwargs"] = kwargs
+        return types.SimpleNamespace(model_cls=FakeRBLNModel, rbln_config={})
+
     monkeypatch.setattr(
-        model_base.RBLNCompileSpec,
-        "for_architecture",
-        classmethod(
-            lambda cls, *a, **k: types.SimpleNamespace(
-                model_cls=FakeRBLNModel, rbln_config={}
-            )
-        ),
+        model_base.RBLNCompileSpec, "for_architecture", classmethod(compile_spec)
     )
     monkeypatch.setattr(model_base, "is_compiled_dir", lambda path: False)
     monkeypatch.setattr(model_base, "get_attn_block_size", lambda cfg: 4096)
@@ -65,10 +71,18 @@ def _init_model_with(monkeypatch, tmp_path, hf_config) -> dict:
     obj.vllm_config = types.SimpleNamespace(
         # What `check_and_update` leaves on the config, which is what
         # `init_model` reads its options off.
-        additional_config=OptimumRBLNConfig(cached_model_path=str(tmp_path)),
+        additional_config=OptimumRBLNConfig(
+            cached_model_path=str(tmp_path),
+            optimum_overrides={"kvcache_num_blocks": num_gpu_blocks_override}
+            if num_gpu_blocks_override is not None
+            else {},
+        ),
         model_config=obj.model_config,
         scheduler_config=obj.scheduler_config,
-        cache_config=types.SimpleNamespace(gpu_memory_utilization=0.9),
+        cache_config=types.SimpleNamespace(
+            gpu_memory_utilization=gpu_memory_utilization,
+            num_gpu_blocks_override=num_gpu_blocks_override,
+        ),
         ec_transfer_config=None,
     )
     obj.init_model()
@@ -120,3 +134,26 @@ def test_transformers_config_is_forwarded_as_the_config_object(monkeypatch, tmp_
     assert passed["config"] is hf_config
     assert "text_config" not in passed
     assert "num_hidden_layers" not in passed
+
+
+@pytest.mark.parametrize(
+    "num_blocks, utilization", [(None, 0.5), (None, 0.9), (16, 1.0)]
+)
+def test_validated_vllm_cache_settings_select_compile_budget(
+    monkeypatch, tmp_path, num_blocks, utilization
+):
+    monkeypatch.setenv("RBLN_FORCE_NPU_NAME", "RBLN-CA25")
+    build_spec = model_base.RBLNCompileSpec.for_architecture
+    config = LlamaConfig(architectures=["LlamaForCausalLM"], num_hidden_layers=2)
+    passed = _init_model_with(monkeypatch, tmp_path, config, num_blocks, utilization)
+    spec = build_spec(config, **passed["compile_kwargs"])
+    validated = RBLNLlamaForCausalLMConfig(**spec.rbln_config)
+    expected_budget = utilization if num_blocks is None else None
+    assert passed["compile_kwargs"]["memory_budget"] == utilization
+    assert passed["compile_kwargs"]["num_gpu_blocks_override"] == num_blocks
+    if num_blocks is None:
+        assert spec.rbln_config["memory_budget"] == utilization
+    else:
+        assert "memory_budget" not in spec.rbln_config
+    assert validated.memory_budget == expected_budget
+    assert validated.kvcache_num_blocks == (num_blocks or 0)

@@ -21,7 +21,6 @@ def get_param_llava(
     max_model_len: int,
     block_size: int,
     num_devices: int,
-    memory_budget: float,
     prefill_chunk_size: int | None = None,
 ) -> dict:
     param = {
@@ -31,7 +30,6 @@ def get_param_llava(
             max_model_len,
             block_size,
             num_devices,
-            memory_budget,
             prefill_chunk_size,
         ),
     }
