@@ -13,7 +13,6 @@ _if_changed: &if_changed
   exclude:
     - ".buildkite/pipelines/optimum-pr/**"
     - "tests/optimum/**"
-    - "vllm_rbln/distributed/ec_transfer/**"
     - "vllm_rbln/model_executor/models/**"
     - "vllm_rbln/utils/optimum/**"
     - "vllm_rbln/v1/**/optimum_*"
