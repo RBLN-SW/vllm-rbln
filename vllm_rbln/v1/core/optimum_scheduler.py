@@ -420,6 +420,27 @@ class RBLNOptimumScheduler(Scheduler):
                     skip_request(request_queue)
                     continue
 
+                # NOTE(RBLN): an EC consumer loads no visual runtime, so a request
+                # with an image the connector does not hold fails; upstream
+                # encodes it locally. update_from_output() fails these.
+                ec = self.ec_connector
+                if (
+                    ec is not None
+                    and ec.is_consumer
+                    and not ec.is_producer
+                    and request.has_encoder_inputs
+                    and not all(
+                        ec.has_cache_item(f.identifier) for f in request.mm_features
+                    )
+                ):
+                    logger.warning(
+                        "EC consumer: failing request %s, which needs a local encode",
+                        request_id,
+                    )
+                    self.encoder_cache_mismatch_reqs.add(request_id)
+                    skip_request(request_queue)
+                    continue
+
                 assert request.num_computed_tokens == 0
 
                 # Number of tokens to be scheduled.

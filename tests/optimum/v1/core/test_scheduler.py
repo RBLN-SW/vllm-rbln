@@ -335,8 +335,12 @@ def _mm_requests(num_requests: int, num_items: int = 1):
     )
 
 
-def _ec_connector(in_transit: set[str] | None = None) -> Mock:
+def _ec_connector(
+    in_transit: set[str] | None = None, *, consumer_only: bool = False
+) -> Mock:
     connector = Mock()
+    connector.is_consumer = True
+    connector.is_producer = not consumer_only
     connector.ensure_cache_available.side_effect = (
         lambda request, num_computed_tokens: request.request_id
         not in (in_transit or set())
@@ -388,3 +392,21 @@ def test_the_connector_hears_of_a_finished_request_once():
     scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
 
     connector.request_finished.assert_called_once_with(request)
+
+
+@pytest.mark.parametrize("held", [False, True])
+def test_a_consumer_admits_only_a_request_whose_images_it_holds(held):
+    # An EC consumer loads no visual runtime, so an image the connector does
+    # not hold would have to be encoded where nothing can encode it.
+    scheduler = create_scheduler()
+    connector = _ec_connector(consumer_only=True)
+    connector.has_cache_item.return_value = held
+    scheduler.ec_connector = connector
+    (request,) = _mm_requests(1)
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    scheduler.update_from_output(output, create_model_runner_output(output))
+
+    assert [req.req_id for req in output.scheduled_new_reqs] == (["0"] if held else [])
+    assert (request.status == RequestStatus.FINISHED_ERROR) is not held
