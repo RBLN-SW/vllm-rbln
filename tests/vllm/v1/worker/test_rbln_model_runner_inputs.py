@@ -21,7 +21,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-from vllm.config import ModelConfig
+from vllm.config import ECTransferConfig, ModelConfig
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
     MultiModalFieldConfig,
@@ -210,7 +210,7 @@ class TestWarmupMultimodalEncoder:
         torch.testing.assert_close(encoded[0], pixels)
 
     @pytest.mark.parametrize(
-        "reason", ["text_only_model", "other_pp_rank", "no_image_limit"]
+        "reason", ["text_only_model", "other_pp_rank", "no_image_limit", "ec_consumer"]
     )
     def test_skips_when_no_image_can_reach_the_encoder(
         self, make_model_runner, monkeypatch, reason
@@ -222,6 +222,14 @@ class TestWarmupMultimodalEncoder:
         )
         runner = make_model_runner()
         runner.supports_mm_inputs = reason != "text_only_model"
+        if reason == "ec_consumer":
+            monkeypatch.setattr(
+                runner.vllm_config,
+                "ec_transfer_config",
+                ECTransferConfig(
+                    ec_connector="RblnECNixlConnector", ec_role="ec_consumer"
+                ),
+            )
         self._fake_processor(
             monkeypatch,
             torch.ones(1, 1, 2),

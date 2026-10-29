@@ -75,6 +75,15 @@ def _validate(vllm_config: "VllmConfig") -> None:
     if vllm_config.lora_config is not None:
         raise ValueError("LoRA is not supported on RBLN.")
 
+    if vllm_config.is_mm_encoder_only and (
+        parallel_config.data_parallel_size > 1
+        or parallel_config.pipeline_parallel_size > 1
+    ):
+        raise ValueError(
+            "An encoder-only instance supports neither data nor pipeline "
+            "parallelism on RBLN."
+        )
+
     if model_config.uses_mrope:
         # The RBLN RoPE override covers `RotaryEmbedding` and takes
         # `[batch, seq]` positions; `MRotaryEmbedding` is a sibling class with
@@ -102,7 +111,9 @@ def _validate(vllm_config: "VllmConfig") -> None:
 
         check_dtype_option_supported()
 
-    if not scheduler_config.enable_chunked_prefill:
+    # Upstream turns chunked prefill off for an engine without a KV cache, such
+    # as an encoder-only instance, then validates the config again in EngineCore.
+    if not (scheduler_config.enable_chunked_prefill or vllm_config.is_mm_encoder_only):
         raise ValueError(
             "Disabling chunked prefill is not supported on RBLN. "
             "Please enable chunked prefill by yourself."

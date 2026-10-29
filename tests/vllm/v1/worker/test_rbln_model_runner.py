@@ -28,10 +28,23 @@ from unittest.mock import MagicMock, Mock
 import numpy as np
 import pytest
 import torch
+import vllm.distributed.ec_transfer.ec_transfer_state as ec_state
+from vllm.config import ECTransferConfig
+from vllm.distributed.ec_transfer.ec_connector.base import (
+    ECConnectorBase,
+    ECConnectorMetadata,
+    ECConnectorRole,
+)
 from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheTensor
-from vllm.v1.outputs import KVConnectorOutput, LogprobsTensors, SamplerOutput
+from vllm.v1.outputs import (
+    EMPTY_MODEL_RUNNER_OUTPUT,
+    ECConnectorOutput,
+    KVConnectorOutput,
+    LogprobsTensors,
+    SamplerOutput,
+)
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
@@ -136,6 +149,7 @@ def test_sample_tokens_collects_deferred_store_in_the_same_output(
             None,
         ),
         kv_connector_output=KVConnectorOutput(kv_cache_events=early),
+        ec_connector_output=None,
         speculative_config=SimpleNamespace(use_eagle=lambda: False),
         use_async_scheduling=False,
         _sample=lambda *a: SamplerOutput(torch.tensor([[7]]), None),
@@ -402,7 +416,7 @@ def test_pooling_warmup_runs_without_language_model_head(monkeypatch):
     monkeypatch.setattr(mr, "mega_cache", cache)
     monkeypatch.setattr(mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True))
     runner = _make_runner_stub(
-        vllm_config=None,
+        vllm_config=SimpleNamespace(is_mm_encoder_only=False),
         model_config=SimpleNamespace(model="pooling", get_hidden_size=lambda: 8),
         is_pooling_model=True,
         run_model_graphs=Mock(),
@@ -419,6 +433,352 @@ def test_pooling_warmup_runs_without_language_model_head(monkeypatch):
 
     runner.run_model_graphs.assert_called_once_with()
     cache.save.assert_called_once_with("pooling", cache.config_signature.return_value)
+
+
+class TestEncoderOnly:
+    """An EC encoder-only instance runs the multimodal encoder and nothing else:
+    its language model is a placeholder, and the scheduler finishes a request
+    once its prompt is consumed."""
+
+    def test_the_placeholder_language_model_reports_no_kv_cache(self, monkeypatch):
+        attn = SimpleNamespace(get_kv_cache_spec=lambda cfg: "SPEC")
+        monkeypatch.setattr(
+            mr, "get_layers_from_vllm_config", lambda cfg, t: {"lm.attn": attn}
+        )
+        runner = _make_runner_stub(vllm_config=SimpleNamespace(is_mm_encoder_only=True))
+
+        assert runner.get_kv_cache_spec() == {}
+
+    def test_execute_model_encodes_and_samples_nothing(self, monkeypatch):
+        order: list[str] = []
+        monkeypatch.setattr(mr, "step_is_prefill", lambda so: True)
+        monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: False)
+        runner = _make_runner_stub(
+            vllm_config=SimpleNamespace(is_mm_encoder_only=True),
+            execute_model_state=None,
+            use_async_scheduling=False,
+            encoder_cache={},
+            _update_states=lambda so: order.append("update_states"),
+            _execute_mm_encoder=lambda so: order.append("encode"),
+            model_executable=Mock(side_effect=AssertionError("no language model")),
+        )
+        scheduler_output = SimpleNamespace(
+            total_num_scheduled_tokens=8, num_scheduled_tokens={"r0": 5, "r1": 3}
+        )
+
+        output = runner.execute_model(scheduler_output)
+
+        assert order == ["update_states", "encode"]
+        assert output.req_ids == ["r0", "r1"]
+        assert output.sampled_token_ids == [[], []]
+        assert runner.execute_model_state is None
+
+    def test_each_encoded_item_reaches_the_ec_connector(self, monkeypatch):
+        published: list[str] = []
+        monkeypatch.setattr(
+            ec_state,
+            "_EC_CONNECTOR_AGENT",
+            SimpleNamespace(
+                save_caches=lambda encoder_cache, mm_hash: published.append(mm_hash)
+            ),
+        )
+        monkeypatch.setattr(
+            mr,
+            "group_and_batch_mm_kwargs",
+            lambda mm_kwargs, device: [("image", len(mm_kwargs), {})],
+        )
+        embeds = (torch.ones(2, 4), torch.zeros(3, 4))
+        features = [
+            SimpleNamespace(data=object(), identifier=f"h{i}", modality="image")
+            for i in range(2)
+        ]
+        runner = _make_runner_stub(
+            requests={"r0": SimpleNamespace(mm_features=features)},
+            model=SimpleNamespace(embed_multimodal=lambda **kw: embeds),
+            encoder_cache={},
+        )
+
+        runner._execute_mm_encoder(
+            SimpleNamespace(scheduled_encoder_inputs={"r0": [0, 1]})
+        )
+
+        assert published == ["h0", "h1"]
+        assert runner.encoder_cache["h1"] is embeds[1]
+
+    @pytest.mark.parametrize("num_scheduled_tokens", [{"r0": 3}, {}])
+    def test_the_step_reports_finished_sends(self, monkeypatch, num_scheduled_tokens):
+        monkeypatch.setattr(ec_state, "_EC_CONNECTOR_AGENT", _SendingECConnector("h0"))
+        monkeypatch.setattr(mr, "step_is_prefill", lambda so: True)
+        monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: False)
+        runner = _make_runner_stub(
+            vllm_config=SimpleNamespace(is_mm_encoder_only=True),
+            execute_model_state=None,
+            use_async_scheduling=False,
+            encoder_cache={},
+            _update_states=lambda so: None,
+            _execute_mm_encoder=lambda so: None,
+        )
+        scheduler_output = SimpleNamespace(
+            total_num_scheduled_tokens=sum(num_scheduled_tokens.values()),
+            num_scheduled_tokens=num_scheduled_tokens,
+            ec_connector_metadata=ECConnectorMetadata(),
+            finished_req_ids=set(),
+        )
+
+        output = runner.execute_model(scheduler_output)
+
+        assert output.ec_connector_output.finished_sending == {"h0"}
+        assert EMPTY_MODEL_RUNNER_OUTPUT.ec_connector_output is None
+
+    def test_warm_up_builds_only_the_encoder(self, monkeypatch):
+        cache = SimpleNamespace(config_signature=Mock(), load=Mock(), save=Mock())
+        monkeypatch.setattr(mr, "mega_cache", cache)
+        no_language_model = Mock(side_effect=AssertionError("no language model"))
+        runner = _make_runner_stub(
+            vllm_config=SimpleNamespace(is_mm_encoder_only=True),
+            model_config=SimpleNamespace(model="encoder"),
+            offload_context=nullcontext,
+            run_model_graphs=no_language_model,
+            _dummy_sampler_run=no_language_model,
+            _warmup_sampler_decode_batches=no_language_model,
+            _warmup_mm_encoder=Mock(),
+        )
+
+        runner.warmup_model()
+
+        runner._warmup_mm_encoder.assert_called_once_with()
+        cache.save.assert_called_once_with(
+            "encoder", cache.config_signature.return_value
+        )
+
+
+class _ReceivingECConnector(ECConnectorBase):
+    """A consumer-side EC connector whose load lands one encoder output."""
+
+    def __init__(self, mm_hash: str, encoder_output: torch.Tensor):
+        super().__init__(
+            SimpleNamespace(
+                ec_transfer_config=SimpleNamespace(
+                    is_ec_producer=False, is_ec_consumer=True
+                )
+            ),
+            ECConnectorRole.WORKER,
+        )
+        self.mm_hash = mm_hash
+        self.encoder_output = encoder_output
+
+    def start_load_caches(self, encoder_cache, **kwargs):
+        encoder_cache[self.mm_hash] = self.encoder_output
+
+    def get_finished(self, finished_req_ids):
+        return None, {self.mm_hash}
+
+    def save_caches(self, encoder_cache, mm_hash, **kwargs):
+        raise AssertionError("a consumer saves nothing")
+
+    def has_cache_item(self, identifier):
+        raise AssertionError("scheduler-side only")
+
+    def update_state_after_alloc(self, request, index):
+        raise AssertionError("scheduler-side only")
+
+    def build_connector_meta(self, scheduler_output):
+        raise AssertionError("scheduler-side only")
+
+
+class _SendingECConnector(ECConnectorBase):
+    """A producer-side EC connector that reports one finished send."""
+
+    def __init__(self, mm_hash: str):
+        super().__init__(
+            SimpleNamespace(
+                ec_transfer_config=SimpleNamespace(
+                    is_ec_producer=True, is_ec_consumer=False
+                )
+            ),
+            ECConnectorRole.WORKER,
+        )
+        self.mm_hash = mm_hash
+
+    def get_finished(self, finished_req_ids):
+        return {self.mm_hash}, None
+
+    def start_load_caches(self, encoder_cache, **kwargs):
+        raise AssertionError("a producer loads nothing")
+
+    def save_caches(self, encoder_cache, mm_hash, **kwargs):
+        pass
+
+    def has_cache_item(self, identifier):
+        raise AssertionError("scheduler-side only")
+
+    def update_state_after_alloc(self, request, index):
+        raise AssertionError("scheduler-side only")
+
+    def build_connector_meta(self, scheduler_output):
+        raise AssertionError("scheduler-side only")
+
+
+class TestEcConsumer:
+    """An EC consumer receives encoder outputs through the connector instead of
+    encoding them, and reports what it received back to the scheduler."""
+
+    def test_received_encoder_outputs_reach_the_gather(self, monkeypatch):
+        received = torch.ones(4, 2)
+        monkeypatch.setattr(
+            ec_state, "_EC_CONNECTOR_AGENT", _ReceivingECConnector("h0", received)
+        )
+        monkeypatch.setattr(
+            mr, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True)
+        )
+        runner = _make_runner_stub(
+            supports_mm_inputs=True,
+            _is_prefill_step=True,
+            is_pooling_model=False,
+            max_num_tokens=4,
+            input_ids=torch.zeros(4, dtype=torch.long),
+            positions=torch.zeros(4, dtype=torch.long),
+            input_stager=SimpleNamespace(
+                stage=lambda **kw: "STAGED",
+                stage_mm_embeds=lambda embeds, mask, layout: (embeds, mask),
+            ),
+            encoder_cache={},
+            _execute_mm_encoder=lambda so: None,
+        )
+        runner._gather_mm_embeddings = lambda so, n: (
+            runner.encoder_cache["h0"],
+            torch.ones(n, 1),
+        )
+        scheduler_output = SimpleNamespace(
+            ec_connector_metadata=ECConnectorMetadata(), finished_req_ids=set()
+        )
+
+        _, model_kwargs, ec_output = runner._preprocess(
+            scheduler_output, 1, 1, 4, torch.tensor([3])
+        )
+
+        assert torch.equal(model_kwargs["mm_embeds"], received.view(1, 4, 2))
+        assert ec_output.finished_recving == {"h0"}
+
+    def test_a_stage_that_samples_nothing_still_reports_its_loads(self):
+        received = ECConnectorOutput(finished_recving={"h0"})
+        runner = _make_runner_stub(
+            execute_model_state=None,
+            kv_connector_output=None,
+            ec_connector_output=received,
+        )
+
+        output = runner.sample_tokens(None)
+
+        assert output.ec_connector_output is received
+        assert runner.ec_connector_output is None
+
+    @pytest.mark.parametrize(
+        ("first_rank", "reported"), [(True, {"h0"}), (False, None)]
+    )
+    def test_a_step_with_no_tokens_still_runs_the_connector(
+        self, monkeypatch, first_rank, reported
+    ):
+        monkeypatch.setattr(
+            ec_state,
+            "_EC_CONNECTOR_AGENT",
+            _ReceivingECConnector("h0", torch.ones(1, 2)),
+        )
+        monkeypatch.setattr(mr, "step_is_prefill", lambda so: False)
+        monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: False)
+        monkeypatch.setattr(
+            mr, "get_pp_group", lambda: SimpleNamespace(is_first_rank=first_rank)
+        )
+        runner = _make_runner_stub(
+            vllm_config=SimpleNamespace(is_mm_encoder_only=False),
+            execute_model_state=None,
+            use_async_scheduling=False,
+            supports_mm_inputs=True,
+            encoder_cache={},
+            _update_states=lambda so: None,
+        )
+        scheduler_output = SimpleNamespace(
+            total_num_scheduled_tokens=0,
+            kv_cache_copy_ops=None,
+            ec_connector_metadata=ECConnectorMetadata(),
+            finished_req_ids=set(),
+        )
+
+        output = runner.execute_model(scheduler_output)
+
+        assert getattr(output.ec_connector_output, "finished_recving", None) == (
+            reported
+        )
+        assert EMPTY_MODEL_RUNNER_OUTPUT.ec_connector_output is None
+
+    def test_the_sampled_output_reports_the_steps_loads(self, monkeypatch):
+        monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: False)
+        received = ECConnectorOutput(finished_recving={"h0"})
+        runner = _make_runner_stub(
+            execute_model_state=ExecuteModelState(
+                SimpleNamespace(total_num_scheduled_tokens=1),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            kv_connector_output=None,
+            ec_connector_output=received,
+            speculative_config=None,
+            use_async_scheduling=False,
+            _sample=lambda *a: SamplerOutput(torch.tensor([[7]]), None),
+            _bookkeeping_sync=lambda *a: (0, None, [], {}, [], {}, []),
+            input_batch=SimpleNamespace(sampling_metadata=None),
+        )
+
+        output = runner.sample_tokens(None)
+
+        assert output.ec_connector_output is received
+        assert runner.ec_connector_output is None
+
+    @pytest.mark.parametrize(
+        ("ec_role", "compiled"),
+        [(None, True), ("ec_consumer", False), ("ec_both", True)],
+    )
+    def test_the_encoder_is_compiled_only_where_it_runs(
+        self, monkeypatch, ec_role, compiled
+    ):
+        compile_calls = []
+        model = SimpleNamespace(
+            logits_processor=None,
+            compile_mm_encoder=lambda compile_fn: compile_calls.append(compile_fn),
+        )
+        monkeypatch.setattr(
+            mr,
+            "get_model_loader",
+            lambda load_config: SimpleNamespace(load_model=lambda **kw: model),
+        )
+        monkeypatch.setattr(mr, "build_process_group_dict", lambda: {})
+        monkeypatch.setattr(mr, "compile", lambda fn, **kw: fn)
+        ec_config = (
+            None
+            if ec_role is None
+            else ECTransferConfig(ec_connector="RblnECNixlConnector", ec_role=ec_role)
+        )
+        runner = _make_runner_stub(
+            load_config=None,
+            vllm_config=SimpleNamespace(ec_transfer_config=ec_config),
+            model_config=SimpleNamespace(model="m", enforce_eager=False),
+            offload_context=nullcontext,
+            _resolve_mm_support=lambda: True,
+            drafter=None,
+            use_aux_hidden_state_outputs=False,
+            _make_weights_contiguous=lambda: None,
+            compile_context=None,
+            runtime_holder=None,
+            rbln_config=SimpleNamespace(compile_dtype=None),
+        )
+
+        runner.load_model()
+
+        assert bool(compile_calls) is compiled
 
 
 @pytest.mark.parametrize("num_reqs", [1, 2])
@@ -1999,7 +2359,7 @@ class TestExecuteModelRecoversADeferredLoad:
             use_async_scheduling=False,
             _update_states=lambda so: order.append("update_states"),
             kv_connector_no_forward=no_forward,
-            vllm_config="VLLM_CONFIG",
+            vllm_config=SimpleNamespace(is_mm_encoder_only=False),
         )
         return runner, order
 
@@ -2090,13 +2450,14 @@ class TestExecuteModelFlushesAfterTheSubmission:
             _preprocess=lambda *a, **kw: (
                 SimpleNamespace(as_kwargs=lambda: {}),
                 {},
+                None,
             ),
             _bookkeeping_and_output=lambda *a, **kw: "OUTPUT",
             input_batch=SimpleNamespace(num_reqs=1, req_ids=["r0"]),
             cache_config=SimpleNamespace(kv_sharing_fast_prefill=False),
             speculative_config=None,
             is_pooling_model=False,
-            vllm_config="VLLM_CONFIG",
+            vllm_config=SimpleNamespace(is_mm_encoder_only=False),
             model_executable=executable,
             num_prompt_logprobs=None,
             kv_cache_bases=None,

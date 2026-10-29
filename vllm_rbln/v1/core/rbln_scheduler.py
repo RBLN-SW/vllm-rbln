@@ -267,6 +267,12 @@ class RBLNScheduler(Scheduler):
                 req_index += 1
                 continue
 
+            if self._ec_transfer_pending(
+                request, request.num_computed_tokens - request.num_output_placeholders
+            ):
+                req_index += 1
+                continue
+
             num_new_tokens = (
                 request.num_tokens_with_spec
                 + request.num_output_placeholders
@@ -596,6 +602,19 @@ class RBLNScheduler(Scheduler):
                     )
                     assert num_computed_tokens <= request.num_tokens
 
+                    # Skip request with pending mm encoding prefetches
+                    if self._ec_transfer_pending(request, num_computed_tokens):
+                        # NOTE(RBLN): the next request overwrites the match, so
+                        # release it here.
+                        if sub_block_match is not None:
+                            assert isinstance(self.kv_cache_manager, RBLNKVCacheManager)
+                            self.kv_cache_manager.release_sub_block_match(
+                                sub_block_match
+                            )
+                            sub_block_match = None
+                        skip_request(request_queue)
+                        continue
+
                     # Track first scheduled prefill, not post-preemption repeat prefills
                     if request.prefill_stats is not None:
                         assert num_computed_tokens <= request.num_prompt_tokens
@@ -614,6 +633,10 @@ class RBLNScheduler(Scheduler):
                     new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
+
+                    if self._ec_transfer_pending(request, num_computed_tokens):
+                        skip_request(request_queue)
+                        continue
 
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
@@ -1122,6 +1145,40 @@ class RBLNScheduler(Scheduler):
                 )
 
         return result
+
+    def _try_schedule_encoder_inputs(
+        self,
+        request: Request,
+        num_computed_tokens: int,
+        num_new_tokens: int,
+        encoder_compute_budget: int,
+        shift_computed_tokens: int = 0,
+    ) -> tuple[list[int], int, int, list[int]]:
+        scheduled = super()._try_schedule_encoder_inputs(
+            request,
+            num_computed_tokens,
+            num_new_tokens,
+            encoder_compute_budget,
+            shift_computed_tokens,
+        )
+        connector = self.ec_connector
+        if not (
+            scheduled[0]
+            and connector is not None
+            and connector.is_consumer
+            and not connector.is_producer
+        ):
+            return scheduled
+        # NOTE(RBLN): an EC consumer compiles no vision encoder, so an image the
+        # connector cannot supply fails the request; upstream encodes it locally.
+        # update_from_output() fails every request in encoder_cache_mismatch_reqs.
+        logger.error(
+            "EC consumer: request %s has an image the EC connector cannot supply, "
+            "and this instance compiles no vision encoder; failing the request.",
+            request.request_id,
+        )
+        self.encoder_cache_mismatch_reqs.add(request.request_id)
+        return [], 0, encoder_compute_budget, []
 
     def _try_sub_block_match(
         self,

@@ -80,7 +80,8 @@ def _warmup_graph_set_factors(vllm_config) -> str:
     """Hash of the graph-shaping config that compute_hash() leaves out.
 
     Decode buckets, KV cache input, decode query length, which drafter graphs
-    exist. Without them two runs share a bundle that only partly hits.
+    exist, which of the language model and the encoder are built. Without them
+    two runs share a bundle that only partly hits.
     """
     from vllm.config.utils import hash_factors, normalize_value
 
@@ -89,6 +90,7 @@ def _warmup_graph_set_factors(vllm_config) -> str:
     spec = getattr(vllm_config, "speculative_config", None)
     # Not draft_parallel_config: it carries the same per-launch ports.
     draft = getattr(spec, "draft_model_config", None)
+    ec = vllm_config.ec_transfer_config
     factors: dict[str, object] = {
         "max_num_seqs": normalize_value(getattr(scheduler, "max_num_seqs", None)),
         "num_gpu_blocks_override": normalize_value(
@@ -106,6 +108,8 @@ def _warmup_graph_set_factors(vllm_config) -> str:
         "draft_tensor_parallel_size": normalize_value(
             getattr(spec, "draft_tensor_parallel_size", None)
         ),
+        # compute_hash() takes in the EC config but leaves its role out.
+        "ec_role": ec.ec_role if ec is not None else None,
     }
     return hash_factors(factors)
 

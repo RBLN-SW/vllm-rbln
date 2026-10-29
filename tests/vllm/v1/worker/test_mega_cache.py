@@ -58,6 +58,8 @@ def _stub_config(digest: str = "cfghash"):
         ),
         model_config=SimpleNamespace(max_model_len=32),
         kv_transfer_config=None,
+        ec_transfer_config=None,
+        is_mm_encoder_only=False,
     )
 
 
@@ -112,6 +114,20 @@ class TestSignatureComposition:
         enabled = False
         static = mega_cache.config_signature(_stub_config())
         assert dynamic != static
+
+    def test_each_ec_role_keys_its_own_bundle(self, monkeypatch):
+        # Given the same flags, a producer builds only the encoder, a consumer
+        # only the language model, and ec_both both. Dynamic KV off is when
+        # nothing else splits their keys.
+        monkeypatch.setattr(mega_cache, "dynamic_kv_enabled", lambda config: False)
+
+        def signature(ec_role):
+            config = _stub_config()
+            config.ec_transfer_config = SimpleNamespace(ec_role=ec_role)
+            return mega_cache.config_signature(config)
+
+        roles = ("ec_producer", "ec_consumer", "ec_both")
+        assert len({signature(role) for role in roles}) == len(roles)
 
 
 # Variables the built graph depends on and RBLNConfig does not carry, so this

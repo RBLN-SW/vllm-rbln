@@ -26,12 +26,15 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+import vllm.distributed.ec_transfer.ec_transfer_state as ec_state
 import vllm.platforms.interface as platform_interface
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from torch._dynamo.exc import BackendCompilerFailed
-from vllm.config import ProfilerConfig, get_current_vllm_config
+from vllm.config import ECTransferConfig, ProfilerConfig, get_current_vllm_config
+from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorRole
+from vllm.distributed.ec_transfer.ec_connector.factory import ECConnectorFactory
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
 from vllm.tracing import otel
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
@@ -94,6 +97,7 @@ def _make_vllm_config(
         scheduler_config=SimpleNamespace(),
         device_config=SimpleNamespace(device=torch.device("cpu"), device_type="cpu"),
         kv_transfer_config=None,
+        is_mm_encoder_only=False,
         additional_config=(
             additional_config if additional_config is not None else RBLNConfig()
         ),
@@ -1138,6 +1142,7 @@ class TestInitWorkerDistributedEnvironment:
         dp_rank=0,
         world_size_across_dp=1,
         auto_port=False,
+        ec_transfer_config=None,
     ):
         monkeypatch.setattr(wm, "init_distributed_environment", lambda *a, **k: None)
         monkeypatch.setattr(
@@ -1154,7 +1159,8 @@ class TestInitWorkerDistributedEnvironment:
                 tensor_parallel_size=world_size,
                 pipeline_parallel_size=1,
                 disable_custom_all_reduce=False,
-            )
+            ),
+            ec_transfer_config=ec_transfer_config,
         )
         init_worker_distributed_environment(vcfg, rank=rank, local_rank=rank)
         return (
@@ -1184,6 +1190,59 @@ class TestInitWorkerDistributedEnvironment:
     def test_auto_port_sets_rccl_env(self, monkeypatch):
         _, _, rccl = self._run(monkeypatch, auto_port=True)
         assert rccl == "1"
+
+    def test_an_ec_instance_gets_its_worker_connector(self, monkeypatch):
+        monkeypatch.setitem(
+            ECConnectorFactory._registry,
+            "RecordingECConnector",
+            lambda: _RecordingECConnector,
+        )
+        monkeypatch.setattr(ec_state, "_EC_CONNECTOR_AGENT", None)
+
+        self._run(
+            monkeypatch,
+            ec_transfer_config=ECTransferConfig(
+                ec_connector="RecordingECConnector", ec_role="ec_consumer"
+            ),
+        )
+
+        connector = ec_state.get_ec_transfer()
+        assert isinstance(connector, _RecordingECConnector)
+        assert connector.role == ECConnectorRole.WORKER
+
+
+class _RecordingECConnector:
+    """A worker-side EC connector that records the lifecycle calls it gets."""
+
+    def __init__(self, vllm_config, role):
+        self.role = role
+        self.calls: list[str] = []
+
+    def start_worker_services(self) -> None:
+        self.calls.append("start_worker_services")
+
+    def shutdown(self) -> None:
+        self.calls.append("shutdown")
+
+
+class TestEcConnectorLifecycle:
+    def test_services_start_after_the_model_loads_and_shutdown_releases_it(
+        self, make_worker, monkeypatch
+    ):
+        connector = _RecordingECConnector(None, ECConnectorRole.WORKER)
+        monkeypatch.setattr(ec_state, "_EC_CONNECTOR_AGENT", connector)
+        worker = make_worker()
+        worker.model_runner = SimpleNamespace(
+            load_model=lambda: connector.calls.append("load_model")
+        )
+        monkeypatch.setattr(wm, "set_current_vllm_config", lambda _: nullcontext())
+        monkeypatch.setattr(worker, "_release_offload_temp_storage", lambda: None)
+
+        worker.load_model()
+        worker.shutdown()
+
+        assert connector.calls == ["load_model", "start_worker_services", "shutdown"]
+        assert not ec_state.has_ec_transfer()
 
 
 class TestHandshakeMetadata:

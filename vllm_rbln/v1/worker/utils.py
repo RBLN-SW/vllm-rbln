@@ -476,6 +476,8 @@ def dynamic_kv_unsupported_reason(vllm_config: VllmConfig) -> str | None:
                 "among the connectors the dynamic-KV resize is open for "
                 f"({', '.join(DYNAMIC_KV_SUPPORTED_CONNECTORS)})"
             )
+    if vllm_config.is_mm_encoder_only:
+        return "this instance runs the multimodal encoder only and holds no KV cache"
     return None
 
 

@@ -32,7 +32,7 @@ from unittest.mock import patch
 import pytest
 import torch
 from pydantic import ValidationError
-from vllm.config import CompilationMode, VllmConfig
+from vllm.config import CompilationMode, ECTransferConfig, VllmConfig
 from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -455,6 +455,36 @@ class TestRejectedConfigs:
             reconfigure(custom_kernel(True))
         reconfigure(custom_kernel(None))
 
+    def test_an_ec_consumer_without_its_language_model(self, reconfigure):
+        def role(ec_role, mm_encoder_only):
+            def mutate(config):
+                config.ec_transfer_config = ECTransferConfig(
+                    ec_connector="RblnECNixlConnector", ec_role=ec_role
+                )
+                config.model_config.multimodal_config = SimpleNamespace(
+                    mm_encoder_only=mm_encoder_only
+                )
+
+            return mutate
+
+        for refused in (role("ec_consumer", True), role("ec_both", True)):
+            with pytest.raises(ValueError, match="--mm-encoder-only"):
+                reconfigure(refused)
+        reconfigure(role("ec_producer", True))
+        reconfigure(role("ec_consumer", False))
+        reconfigure(role("ec_both", False))
+
+    @pytest.mark.parametrize("field", ["data_parallel_size", "pipeline_parallel_size"])
+    def test_an_encoder_only_instance_across_ranks(self, reconfigure, field):
+        def mutate(config):
+            config.model_config.multimodal_config = SimpleNamespace(
+                mm_encoder_only=True
+            )
+            setattr(config.parallel_config, field, 2)
+
+        with pytest.raises(ValueError, match="encoder-only instance"):
+            reconfigure(mutate)
+
     def test_lora(self, reconfigure):
         with pytest.raises(ValueError, match="LoRA"):
             reconfigure(lambda config: setattr(config, "lora_config", object()))
@@ -488,6 +518,17 @@ class TestRejectedConfigs:
                     config.scheduler_config, "enable_chunked_prefill", False
                 )
             )
+
+    def test_chunked_prefill_off_on_an_encoder_only_instance(self, reconfigure):
+        # Upstream turns it off once the engine finds no KV cache, then runs
+        # the hook again.
+        def mutate(config):
+            config.model_config.multimodal_config = SimpleNamespace(
+                mm_encoder_only=True
+            )
+            config.scheduler_config.enable_chunked_prefill = False
+
+        reconfigure(mutate)
 
     @pytest.mark.parametrize("method", ["eagle3", "dflash"])
     def test_a_draft_under_pp_needs_a_patched_target(self, reconfigure, method):

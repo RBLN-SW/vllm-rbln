@@ -33,6 +33,12 @@ from vllm.distributed import (
     init_distributed_environment,
     set_custom_all_reduce,
 )
+from vllm.distributed.ec_transfer import (
+    ensure_ec_transfer_initialized,
+    ensure_ec_transfer_shutdown,
+    get_ec_transfer,
+    has_ec_transfer,
+)
 from vllm.distributed.kv_transfer import (
     ensure_kv_transfer_initialized,
     ensure_kv_transfer_shutdown,
@@ -205,6 +211,9 @@ class RBLNWorker(WorkerBase):
     def load_model(self):
         with set_current_vllm_config(self.vllm_config):
             self.model_runner.load_model()
+
+        if has_ec_transfer():
+            get_ec_transfer().start_worker_services()
 
     @torch.inference_mode()
     @worker_fail_fast
@@ -717,6 +726,8 @@ class RBLNWorker(WorkerBase):
         # has_kv_transfer_group can be None during interpreter shutdown.
         if ensure_kv_transfer_shutdown is not None:
             ensure_kv_transfer_shutdown()
+        if ensure_ec_transfer_shutdown is not None:
+            ensure_ec_transfer_shutdown()
         if self.profiler is not None:
             self.profiler.shutdown()
 
@@ -841,3 +852,6 @@ def init_worker_distributed_environment(
         parallel_config.tensor_parallel_size,
         parallel_config.pipeline_parallel_size,
     )
+
+    # Before any KV cache work: an EC encoder-only instance allocates none.
+    ensure_ec_transfer_initialized(vllm_config)
