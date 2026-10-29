@@ -210,10 +210,9 @@ def draw(
 def assert_samples_match(
     samples: torch.Tensor, probs: torch.Tensor, min_expected: float = 5.0
 ) -> None:
-    """Chi-squared fit of `samples` against the 1-D `probs`, after upstream's
-    `_assert_distribution_match`. Unlike upstream, a rare-token pool too small
-    to count folds into the smallest bin, not out. The ~10 sigma bound keeps
-    unseeded runs from flaking."""
+    """Chi-squared fit of `samples` against the 1-D `probs`. A rare-token pool
+    too small to count folds into the smallest bin instead of being dropped.
+    The ~10 sigma bound keeps unseeded runs from flaking."""
     samples = samples.flatten().cpu().long()
     probs = probs.cpu().double()
     counts = torch.bincount(samples, minlength=probs.numel()).double()
@@ -237,7 +236,7 @@ def assert_samples_match(
 
     df = observed.numel() - 1
     if df < 1:
-        # One token: the zero-probability check covered it.
+        # One bin left, so only the zero-probability check applies.
         return
     chi2 = ((observed - expected) ** 2 / expected).sum().item()
     bound = df + 10 * math.sqrt(2 * df)
