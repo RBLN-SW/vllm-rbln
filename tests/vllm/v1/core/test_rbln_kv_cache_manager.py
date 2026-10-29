@@ -36,6 +36,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.request import Request
 
+import vllm_rbln.platform as platform
 from tests.vllm.v1.core.utils import (
     full_attention_spec,
     make_hybrid_manager,
@@ -328,6 +329,25 @@ class TestCanUseSubBlockCaching:
             ]
         )
         assert not RBLNKVCacheManager.can_use_sub_block_caching(cfg_bad, 4)
+
+    @pytest.mark.parametrize(
+        "device_tensor, window, eligible",
+        [(False, 4, False), (False, 8, True), (False, 3, True), (True, 4, True)],
+        ids=[
+            "runtime-window-kernel",
+            "runtime-block-kernel",
+            "runtime-non-dividing",
+            "device-tensor",
+        ],
+    )
+    def test_the_runtime_copy_takes_no_window_kernel_blocks(
+        self, monkeypatch, device_tensor, window, eligible
+    ):
+        # The runtime KV copy moves a block's first rows, where a window smaller
+        # than the block that divides it does not hold the prefix.
+        monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", device_tensor)
+        cfg = make_kv_cache_config([sliding_window_spec(8, window)])
+        assert RBLNKVCacheManager.can_use_sub_block_caching(cfg, 4) is eligible
 
 
 class TestManagerInit:
