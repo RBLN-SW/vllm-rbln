@@ -1146,6 +1146,40 @@ class RBLNScheduler(Scheduler):
 
         return result
 
+    def _try_schedule_encoder_inputs(
+        self,
+        request: Request,
+        num_computed_tokens: int,
+        num_new_tokens: int,
+        encoder_compute_budget: int,
+        shift_computed_tokens: int = 0,
+    ) -> tuple[list[int], int, int, list[int]]:
+        scheduled = super()._try_schedule_encoder_inputs(
+            request,
+            num_computed_tokens,
+            num_new_tokens,
+            encoder_compute_budget,
+            shift_computed_tokens,
+        )
+        connector = self.ec_connector
+        if not (
+            scheduled[0]
+            and connector is not None
+            and connector.is_consumer
+            and not connector.is_producer
+        ):
+            return scheduled
+        # NOTE(RBLN): an EC consumer compiles no vision encoder, so an image the
+        # connector cannot supply fails the request; upstream encodes it locally.
+        # update_from_output() fails every request in encoder_cache_mismatch_reqs.
+        logger.error(
+            "EC consumer: request %s has an image the EC connector cannot supply, "
+            "and this instance compiles no vision encoder; failing the request.",
+            request.request_id,
+        )
+        self.encoder_cache_mismatch_reqs.add(request.request_id)
+        return [], 0, encoder_compute_budget, []
+
     def _try_sub_block_match(
         self,
         request: Request,

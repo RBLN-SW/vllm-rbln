@@ -147,11 +147,11 @@ if "MockKVConnector" not in KVConnectorFactory._registry:
 class ECConnectorInTransit(ECConnectorBase):
     """A scheduler-side EC consumer whose encoder outputs arrive when told to."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, is_producer: bool = False) -> None:
         super().__init__(
             SimpleNamespace(
                 ec_transfer_config=SimpleNamespace(
-                    is_ec_producer=False, is_ec_consumer=True
+                    is_ec_producer=is_producer, is_ec_consumer=True
                 )
             ),
             ECConnectorRole.SCHEDULER,

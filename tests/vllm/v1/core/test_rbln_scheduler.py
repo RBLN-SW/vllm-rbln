@@ -21,6 +21,7 @@ from types import SimpleNamespace
 
 import pytest
 from vllm.distributed.kv_events import BlockStored, KVEventBatch
+from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.metrics.stats import PrefixCacheStats
@@ -1963,3 +1964,34 @@ class TestEcTransferPending:
         assert sched.schedule().num_scheduled_tokens == {}
         sched.ec_connector.arrived = True
         assert sched.schedule().num_scheduled_tokens == {"0": 8}
+
+
+class TestEcConsumerEncodesNothing:
+    """An image the connector cannot supply would be encoded locally, which an EC
+    consumer has no vision encoder for."""
+
+    @staticmethod
+    def _schedule(*, is_producer):
+        sched = create_rbln_scheduler(
+            max_num_seqs=4, max_num_batched_tokens=8, max_model_len=64
+        )
+        sched.ec_connector = ECConnectorInTransit(is_producer=is_producer)
+        sched.ec_connector.arrived = True
+        sched.max_num_encoder_input_tokens = 16
+        sched.encoder_cache_manager = EncoderCacheManager(cache_size=16)
+        request = make_request("0", list(range(24)), 16, mm_features=[image_at(0, 4)])
+        sched.add_request(request)
+        return sched, request, sched.schedule()
+
+    def test_the_consumer_fails_the_request(self):
+        sched, request, out = self._schedule(is_producer=False)
+
+        assert out.num_scheduled_tokens == {}
+        sched.update_from_output(out, make_model_runner_output(out))
+        assert request.status == RequestStatus.FINISHED_ERROR
+
+    def test_ec_both_encodes_it(self):
+        _, request, out = self._schedule(is_producer=True)
+
+        assert out.scheduled_encoder_inputs == {"0": [0]}
+        assert request.status == RequestStatus.RUNNING
