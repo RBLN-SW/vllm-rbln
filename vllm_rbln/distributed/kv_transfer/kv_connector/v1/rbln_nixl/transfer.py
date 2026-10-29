@@ -40,15 +40,15 @@ def _chunk_desc_ids(
     chunk_span: tuple[int, int],
     partial_only: bool = False,
 ) -> np.ndarray:
-    """Descriptor ids for chunks `[lo, hi)` of one block, in every region
+    """Descriptor ids for chunks `[lo, hi)` of one block, in every entry
     holding any of them.
 
     `cuts` is `ChunkGrid.entries` and the span counts chunks of the block, so
-    each region takes the part of it that falls in its own window.
-    `partial_only` leaves out a region the span covers whole, which a
-    whole-block descriptor carried instead. A region of no runs holds at most
+    each entry takes the part of it that falls in its own window.
+    `partial_only` leaves out an entry the span covers whole, which a
+    whole-block descriptor carried instead. An entry of no runs holds at most
     one chunk, named by its whole-block descriptor from 0, `per_block` a block:
-    one count for every region, or one per region in the order of `cuts`.
+    one count for every entry, or one per entry in the order of `cuts`.
 
     `start` is where the chunk range begins: one whole-block range before it on
     a shard's lists, and a window range as well on the whole-engine lists. The
@@ -59,9 +59,9 @@ def _chunk_desc_ids(
     lo, hi = chunk_span
     first, runs, chunks = np.asarray(cuts, dtype=np.int64).reshape(-1, 3).T
     pieces = np.broadcast_to(np.asarray(per_block, dtype=np.int64), first.shape)
-    per_region = pieces * runs * chunks
-    starts = start + (np.cumsum(per_region) - per_region) * num_blocks
-    starts += block_id * per_region
+    per_entry = pieces * runs * chunks
+    starts = start + (np.cumsum(per_entry) - per_entry) * num_blocks
+    starts += block_id * per_entry
     whole = runs == 0
     starts[whole] = (np.cumsum(pieces) - pieces)[whole] * num_blocks + (
         block_id * pieces[whole]
@@ -71,9 +71,9 @@ def _chunk_desc_ids(
     take = begin < end
     if partial_only:
         take &= (begin > 0) | (end < chunks)
-    # Regions cut alike share one offset pattern, and an engine has few cuts
-    # however many regions it has. The window leads the key so the ids come
-    # area by area, region by region inside one.
+    # Entries cut alike share one offset pattern, and an engine has few cuts
+    # however many entries it has. The window leads the key so the ids come
+    # area by area, entry by entry inside one.
     keys = np.stack([first, runs, chunks, begin, end, pieces], axis=1)[take]
     out = []
     for key in np.unique(keys, axis=0):
@@ -324,21 +324,21 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
                 ]
             )
         offsets = np.cumsum((0, *per_block))
-        # Converted once, not once per region: this runs per request, and every
-        # region of a layer names the same group.
+        # Converted ahead of the loop: this runs per request, and every entry
+        # of a layer names the same group.
         group_arrays = [np.asarray(g, dtype=np.int64) for g in block_ids]
         desc_ids: list[np.ndarray] = []
-        for region_id, group_id in enumerate(region_group_ids):
+        for entry, group_id in enumerate(region_group_ids):
             group_arr = group_arrays[group_id]
-            if needed is not None and sum(windows[region_id]) > needed:
+            if needed is not None and sum(windows[entry]) > needed:
                 group_arr = group_arr[:-1]
             if group_arr.size == 0:
                 continue
-            # Both dlists are laid out region-major, then block, then piece, so
+            # Both dlists are laid out entry-major, then block, then piece, so
             # one block becomes `pieces` consecutive descriptors on each side,
-            # after every block of the regions before it.
-            pieces = per_block[region_id]
-            first = offsets[region_id] * num_blocks + group_arr * pieces
+            # after every block of the entries before it.
+            pieces = per_block[entry]
+            first = offsets[entry] * num_blocks + group_arr * pieces
             if pieces == 1:
                 desc_ids.append(first)
                 continue

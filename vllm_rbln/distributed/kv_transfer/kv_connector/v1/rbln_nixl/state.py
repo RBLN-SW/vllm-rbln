@@ -384,11 +384,11 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
     src_xfer_handles_by_remote: dict[tuple[str, int, int], int]
     _borrowed_src_handles: set[tuple[str, int, int]]
     _shard_region_group_ids: dict[tuple[str, int], tuple[int, ...]]
-    #: Per peer shard, descriptors a block of each region of its list is.
+    #: Per peer shard, descriptors a block of each entry of its list is.
     _shard_descs_per_block: dict[tuple[str, int], tuple[int, ...]]
     _shard_chunk_grids: dict[tuple[str, int], ChunkGrid | None]
-    #: Per peer shard, which token range of a block each region of its list
-    #: holds (`_region_span_index`).
+    #: Per peer shard, which token range of a block the region of each entry
+    #: of its list holds (`_region_span_index`).
     _shard_region_spans: dict[tuple[str, int], tuple[int, ...]]
     _chunk_grid: ChunkGrid | None
     #: `_window_grid()` for this engine, parked so a transfer does
@@ -911,7 +911,7 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         """Prepare this shard's local descriptors, optionally twice over.
 
         `pieces` is, per entry, the ranges a peer of another TP degree pairs
-        it in (`pair_area`); None names every region whole. A piece sent to
+        its region in (`pair_area`); None names every region whole. A piece sent to
         several replicas repeats here while the remote list advances.
 
         `chunk_grid` says, per entry, how many byte runs one piece is spread
