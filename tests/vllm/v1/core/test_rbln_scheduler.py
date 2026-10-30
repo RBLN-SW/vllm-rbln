@@ -20,7 +20,9 @@ import inspect
 from types import SimpleNamespace
 
 import pytest
+import torch
 from vllm.distributed.kv_events import BlockStored, KVEventBatch
+from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.metrics.stats import PrefixCacheStats
@@ -34,9 +36,12 @@ from tests.vllm.v1.core.utils import (
     advance_to_decode,
     create_rbln_scheduler,
     create_requests,
+    full_attention_spec,
+    make_kv_cache_config,
     make_model_runner_output,
     make_request,
     prefill_request,
+    sliding_window_spec,
 )
 from vllm_rbln.v1.core.rbln_kv_cache_manager import RBLNKVCacheManager
 from vllm_rbln.v1.core.rbln_scheduler import RBLNScheduler, RBLNSchedulerOutput
@@ -90,6 +95,22 @@ class TestSchedulerInit:
             additional_config={"enable_sub_block_cache": False},
         )
         assert not isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
+
+    def test_sub_block_manager_hashes_at_the_engine_hash_block_size(self):
+        # Mixed group block sizes: the engine hashes requests at the gcd and
+        # schedules at the lcm, and the manager must be told the gcd.
+        sched = create_rbln_scheduler(
+            enable_prefix_caching=True,
+            block_size=2048,
+            hash_block_size=1024,
+            max_num_batched_tokens=128,
+            max_model_len=4096,
+            kv_cache_config=make_kv_cache_config(
+                [full_attention_spec(2048), sliding_window_spec(1024, 1024)],
+                num_blocks=64,
+            ),
+        )
+        assert isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
 
     def test_disabled_falls_back_to_base_manager(self):
         # prefix caching off -> plain KVCacheManager.
@@ -798,6 +819,61 @@ class TestSchedulePrefillAllocation:
         sched.schedule()
 
         assert block.block_hash is not None
+
+
+class TestMmPrefixChunks:
+    """Prefill chunks of an mm prefix LM are cut on its embedding ranges."""
+
+    @staticmethod
+    def _feature(modality: str, offset: int, is_embed: list[bool]):
+        return MultiModalFeatureSpec(
+            data=None,
+            modality=modality,
+            identifier=f"{modality}-{offset}",
+            mm_position=PlaceholderRange(
+                offset=offset, length=len(is_embed), is_embed=torch.tensor(is_embed)
+            ),
+        )
+
+    def _chunks(self, monkeypatch, features, *, num_tokens=40, budget=16):
+        sched = create_rbln_scheduler(
+            max_num_batched_tokens=budget, max_model_len=64, block_size=16
+        )
+        sched._is_mm_prefix_lm = True
+        # Encoder budgeting is upstream's, and opt-125m owns no encoder.
+        monkeypatch.setattr(
+            sched,
+            "_try_schedule_encoder_inputs",
+            lambda request, computed, new, budget, shift_computed_tokens: (
+                [],
+                new,
+                budget,
+                [],
+            ),
+        )
+        req = make_request("a", list(range(num_tokens)), 16, mm_features=features)
+        sched.add_request(req)
+        chunks = []
+        while req.num_computed_tokens < num_tokens:
+            out = sched.schedule()
+            chunks.append(out.num_scheduled_tokens["a"])
+            sched.update_from_output(out, make_model_runner_output(out))
+        return chunks
+
+    def test_an_image_runs_alone_between_text_chunks(self, monkeypatch):
+        # <boi> at 9, ten soft tokens at 10..19, <eoi> at 20.
+        image = self._feature("image", 9, [False] + [True] * 10 + [False])
+        assert self._chunks(monkeypatch, [image]) == [10, 10, 16, 4]
+
+    def test_each_video_frame_is_its_own_range(self, monkeypatch):
+        # Two frames of four soft tokens, each between a timestamp, <boi>, <eoi>.
+        frame = [False, False] + [True] * 4 + [False]
+        video = self._feature("video", 2, frame * 2)
+        assert self._chunks(monkeypatch, [video], num_tokens=24) == [4, 4, 3, 4, 9]
+
+    def test_audio_is_not_an_mm_prefix_range(self, monkeypatch):
+        audio = self._feature("audio", 4, [True] * 8)
+        assert self._chunks(monkeypatch, [audio], num_tokens=24) == [16, 8]
 
 
 class TestScheduleSpecDecodeCap:

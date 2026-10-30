@@ -49,4 +49,51 @@ def supports_rbln_multimodal(model: object) -> TypeIs[SupportsRBLNMultiModal]:
     return getattr(model, "merges_mm_embeds_in_graph", False) is True
 
 
-__all__ = ["SupportsRBLNMultiModal", "supports_rbln_multimodal"]
+@runtime_checkable
+class SupportsRBLNMmPrefix(Protocol):
+    """An mm prefix LM (upstream's ``is_mm_prefix_lm``) the RBLN vLLM path serves.
+
+    Upstream attends both ways inside each multimodal embedding range through
+    ``mm_prefix_range``, which its kernels read at run time. A compiled RBLN
+    graph cannot, so each range is prefilled as a step of its own, padded to
+    one of the query lengths the model names here.
+    """
+
+    def get_mm_prefix_query_lens(self) -> list[int]:
+        """Ascending padded query lengths an mm prefix step is compiled at;
+        the largest holds the longest range the model can produce."""
+        ...
+
+
+def supports_rbln_mm_prefix(model: object) -> TypeIs[SupportsRBLNMmPrefix]:
+    return isinstance(model, SupportsRBLNMmPrefix)
+
+
+@runtime_checkable
+class SupportsRBLNMmEncoderWarmup(Protocol):
+    """A multimodal model whose encoder is compiled at more than one input size.
+
+    The runner's warm-up encodes the processor's one dummy item, which reaches
+    one size; such a model runs its encoder at every size itself instead.
+    """
+
+    def warm_up_mm_encoder(self) -> None:
+        """Run the compiled encoder once at every input size it serves. A rank
+        that owns no encoder returns without running it."""
+        ...
+
+
+def supports_rbln_mm_encoder_warmup(
+    model: object,
+) -> TypeIs[SupportsRBLNMmEncoderWarmup]:
+    return isinstance(model, SupportsRBLNMmEncoderWarmup)
+
+
+__all__ = [
+    "SupportsRBLNMmEncoderWarmup",
+    "SupportsRBLNMmPrefix",
+    "SupportsRBLNMultiModal",
+    "supports_rbln_mm_encoder_warmup",
+    "supports_rbln_mm_prefix",
+    "supports_rbln_multimodal",
+]

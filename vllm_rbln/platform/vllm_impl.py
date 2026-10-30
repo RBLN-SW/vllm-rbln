@@ -337,6 +337,22 @@ def _override(vllm_config: "VllmConfig") -> None:
         )
         model_config.disable_cascade_attn = True
 
+    # As upstream's CUDA and ROCm platforms do: an mm prefix range attends both
+    # ways, so it must never straddle two steps.
+    # TODO(RBLN): prefill pads to max_num_batched_tokens, so the text prefill
+    # graph grows with the longest mm item; give it a length of its own.
+    scheduler_config = vllm_config.scheduler_config
+    if (
+        model_config.is_mm_prefix_lm
+        and scheduler_config.is_multimodal_model
+        and not scheduler_config.disable_chunked_mm_input
+    ):
+        logger.warning(
+            "Forcing --disable-chunked-mm-input for models with "
+            "multimodal-bidirectional attention."
+        )
+        scheduler_config.disable_chunked_mm_input = True
+
 
 def _wire(vllm_config: "VllmConfig") -> None:
     rbln_config: RBLNConfig = vllm_config.additional_config

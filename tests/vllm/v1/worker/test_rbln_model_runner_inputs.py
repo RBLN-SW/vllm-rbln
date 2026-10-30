@@ -17,6 +17,7 @@
 # sampler's output back.
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -74,6 +75,60 @@ class TestResolveMultiModalSupport:
         runner.model = SimpleNamespace(embed_multimodal=lambda **kw: ())
 
         with pytest.raises(ValueError, match="SupportsRBLNMultiModal"):
+            runner._resolve_mm_support()
+
+
+class _MmPrefixModel(_InGraphMergeModel):
+    def __init__(self, query_lens):
+        super().__init__()
+        self.query_lens = query_lens
+
+    def get_mm_prefix_query_lens(self) -> list[int]:
+        return self.query_lens
+
+
+class TestResolveMmPrefixSupport:
+    """An mm prefix LM is served only when every range runs whole in one step."""
+
+    @staticmethod
+    def _runner(make_model_runner, monkeypatch, model, **config):
+        monkeypatch.setattr(
+            ModelConfig, "supports_multimodal_inputs", property(lambda self: True)
+        )
+        monkeypatch.setattr(ModelConfig, "is_mm_prefix_lm", property(lambda self: True))
+        runner = make_model_runner(**{"enable_prefix_caching": False, **config})
+        runner.model = model
+        return runner
+
+    def test_the_models_query_lens_are_taken(self, make_model_runner, monkeypatch):
+        runner = self._runner(make_model_runner, monkeypatch, _MmPrefixModel([64, 128]))
+
+        assert runner._resolve_mm_support() is True
+        assert runner.mm_prefix_query_lens == [64, 128]
+
+    def test_a_model_naming_no_query_lens_is_refused(
+        self, make_model_runner, monkeypatch
+    ):
+        runner = self._runner(make_model_runner, monkeypatch, _InGraphMergeModel())
+
+        with pytest.raises(ValueError, match="SupportsRBLNMmPrefix"):
+            runner._resolve_mm_support()
+
+    @pytest.mark.parametrize(
+        "config, match",
+        [
+            ({"long_prefill_token_threshold": 64}, "long_prefill_token_threshold"),
+            ({"enable_prefix_caching": True}, "Prefix caching"),
+        ],
+    )
+    def test_a_config_that_would_split_a_range_is_refused(
+        self, make_model_runner, monkeypatch, config, match
+    ):
+        runner = self._runner(
+            make_model_runner, monkeypatch, _MmPrefixModel([64, 128]), **config
+        )
+
+        with pytest.raises(ValueError, match=match):
             runner._resolve_mm_support()
 
 
@@ -208,6 +263,19 @@ class TestWarmupMultimodalEncoder:
         assert dummy_calls == [{"image": 1}]
         assert len(encoded) == 1
         torch.testing.assert_close(encoded[0], pixels)
+
+    def test_a_model_with_several_encoder_sizes_warms_them_itself(self, monkeypatch):
+        monkeypatch.setattr(
+            mr, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True)
+        )
+        self._fake_processor(monkeypatch, torch.ones(1, 1, 2))
+        model = Mock(spec=["warm_up_mm_encoder", "embed_multimodal"])
+        runner = SimpleNamespace(supports_mm_inputs=True, model=model)
+
+        mr.RBLNModelRunner._warmup_mm_encoder(runner)
+
+        model.warm_up_mm_encoder.assert_called_once_with()
+        model.embed_multimodal.assert_not_called()
 
     @pytest.mark.parametrize(
         "reason", ["text_only_model", "other_pp_rank", "no_image_limit"]
