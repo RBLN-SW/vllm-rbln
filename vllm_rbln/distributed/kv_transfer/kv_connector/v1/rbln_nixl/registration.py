@@ -772,6 +772,13 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
             "a sliding-window group reads a storage no registered KV entry "
             "holds, although `canonical_kv_layers` keeps one layer per buffer"
         )
+        # A transfer region is numbered `logical * areas + area`, so an entry the
+        # compiler left on one area (GLM at TP 4) is named as replicas of its one
+        # slice; its writes repeat into the same bytes.
+        widest = max((len(placed) for _, _, placed in cuts.values()), default=1)
+        for base_addr, (axis, slices, placed) in cuts.items():
+            if len(placed) == 1 < widest:
+                cuts[base_addr] = (axis, slices, placed * widest)
         geometries = []
         for entry, spec, offset, block_len in regions:
             axis, slices, placed = cuts[entry.data_ptr()]
