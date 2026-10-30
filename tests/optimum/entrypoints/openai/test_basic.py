@@ -18,7 +18,7 @@ import openai
 import pytest
 import pytest_asyncio
 
-from .utils import RemoteOpenAIServer
+from tests.utils import RemoteOpenAIServer
 
 MODEL_NAME = "facebook/opt-125m"
 MAX_TOKENS = 1

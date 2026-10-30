@@ -23,7 +23,7 @@ import openai
 import pytest
 import pytest_asyncio
 
-from tests.optimum.entrypoints.openai.utils import RemoteOpenAIServer
+from tests.utils import RemoteOpenAIServer
 from tests.vllm.runners import rbln_engine_args
 from tests.vllm.vllm_config import local_weights_path
 
