@@ -173,6 +173,7 @@ def _scheduler(*, use_host_buffer=False, cls=RblnNixlPullConnectorScheduler):
     sched.vllm_config.scheduler_config.max_num_batched_tokens = 512
     if cls is RblnNixlPushConnectorScheduler:
         sched._released_tokens = {}
+        sched._closing_valid_tokens = {}
         sched._push_pending_registrations = {}
         sched._push_registration_deadlines = {}
         sched._push_registration_timeout = 480
@@ -573,7 +574,7 @@ class TestEarlyOfferOnTheWritePath:
         sched._reqs_need_save["prefill"] = req
         req.num_computed_tokens = 24
 
-        meta = sched.build_connector_meta(_sched_output("prefill", ([1, 2, 3],), 24))
+        meta = sched.build_connector_meta(_sched_output("prefill", ([1, 2, 3],), 8))
 
         assert meta.reqs_to_save["prefill"].local_block_ids == ([1],)
 
@@ -610,11 +611,11 @@ class TestEarlyOfferOnTheWritePath:
         req = _Request("prefill", num_prompt_tokens=44)
         sched._reqs_need_save["prefill"] = req
         req.num_computed_tokens = 32
-        sched.build_connector_meta(_sched_output("prefill", ([1, 2, 3],), 32))
+        sched.build_connector_meta(_sched_output("prefill", ([1, 2, 3],), 8))
 
         req.num_computed_tokens = 40
         meta = sched.build_connector_meta(
-            _sched_output("prefill", ([1, 2, 3],), 8, is_new=False)
+            _sched_output("prefill", ([1, 2, 3],), 2, is_new=False)
         )
 
         if offered is None:
@@ -622,6 +623,54 @@ class TestEarlyOfferOnTheWritePath:
         else:
             assert meta.reqs_to_save["prefill"].local_block_ids == offered
             assert meta.push_stream_tokens["prefill"] == 40
+
+    @pytest.mark.parametrize("chunk_mode", [False, True])
+    def test_the_closing_step_offers_the_whole_list(self, chunk_mode):
+        # Each PP stage writes once its own forward of the closing chunk is
+        # done, rather than when the handover has crossed the pipeline.
+        sched = self._chunking_scheduler(8)
+        set_shape(sched, chunk_mode=chunk_mode)
+        req = _Request("prefill", num_prompt_tokens=44)
+        sched._reqs_need_save["prefill"] = req
+        req.num_computed_tokens = 40
+
+        meta = sched.build_connector_meta(_sched_output("prefill", ([1, 2, 3],), 4))
+
+        assert meta.reqs_to_save["prefill"].local_block_ids == ([1, 2, 3],)
+        assert meta.push_stream_total["prefill"] == 3
+        assert "prefill" not in meta.push_stream_tokens
+        assert meta.valid_tokens == ({"prefill": 44} if chunk_mode else {})
+        assert sched._closing_valid_tokens == {}
+
+    def test_a_closing_step_short_of_its_blocks_stays_a_prefix(self):
+        # The accumulation lags by a step on a resume; a whole-list offer then
+        # would name KV that no block of ours holds.
+        sched = self._chunking_scheduler(8)
+        set_shape(sched, chunk_mode=True)
+        req = _Request("prefill", num_prompt_tokens=44)
+        sched._reqs_need_save["prefill"] = req
+        req.num_computed_tokens = 40
+
+        meta = sched.build_connector_meta(_sched_output("prefill", ([1, 2],), 4))
+
+        assert meta.reqs_to_save["prefill"].local_block_ids == ([1, 2],)
+        assert meta.push_stream_tokens["prefill"] == 32
+        assert meta.valid_tokens == {}
+
+    def test_a_hybrid_leaves_its_closing_step_to_the_handover(self):
+        # Offers never carry the window group, so a whole-list write would
+        # settle the consumer without it.
+        sched = self._chunking_scheduler(8)
+        set_shape(sched, chunk_mode=True)
+        req = _Request("prefill", num_prompt_tokens=44)
+        sched._reqs_need_save["prefill"] = req
+        req.num_computed_tokens = 40
+
+        meta = sched.build_connector_meta(_sched_output("prefill", ([1, 2, 3], [9]), 4))
+
+        assert meta.reqs_to_save["prefill"].local_block_ids == ([1, 2, 3], [])
+        assert meta.push_stream_tokens["prefill"] == 40
+        assert meta.valid_tokens == {}
 
     def test_a_hybrid_offers_its_full_attention_blocks_and_no_window(self):
         # The window's group holds one block whatever the prompt length, so a
