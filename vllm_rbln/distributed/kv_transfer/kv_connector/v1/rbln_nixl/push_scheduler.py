@@ -67,6 +67,9 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
         self._early_sent: set[ReqId] = set()
         # Tokens each handed-over request holds, for the worker's `_tail_chunks`.
         self._valid_tokens: dict[ReqId, int] = {}
+        # The same count for a request whose closing chunk this step schedules,
+        # sent with that step's offer.
+        self._closing_valid_tokens: dict[ReqId, int] = {}
 
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
@@ -107,6 +110,8 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
             for req_id in meta.push_finished_blocks
             if req_id in self._valid_tokens
         }
+        meta.valid_tokens.update(self._closing_valid_tokens)
+        self._closing_valid_tokens.clear()
         return meta
 
     def _build_stream_meta(
@@ -166,7 +171,20 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
             # releases the last one as it fills, and a write takes only the
             # chunks of it the token count backs -- see `_stream_window`.
             total = cdiv(req.num_prompt_tokens, self.block_size)
-            if self._shape.cuts_a_block and held > (total - 1) * self.block_size:
+            # The closing chunk's step offers the whole list, so each PP stage
+            # writes after its own forward of it rather than after the handover,
+            # which queues behind other requests' batches. One group only.
+            after_step = (
+                req.num_computed_tokens + scheduler_output.num_scheduled_tokens[req_id]
+            )
+            closing = (
+                len(groups) == 1
+                and after_step >= req.num_prompt_tokens
+                and len(groups[counted]) * self.block_size >= after_step
+            )
+            if closing:
+                released = after_step
+            elif self._shape.cuts_a_block and held > (total - 1) * self.block_size:
                 released = held
             else:
                 released = held // self.block_size * self.block_size
@@ -174,7 +192,12 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
                 continue
             self._released_tokens[req_id] = released
             meta.push_stream_total[req_id] = total
-            meta.push_stream_tokens[req_id] = released
+            if closing:
+                # Without a prefix count the worker reads the list as whole.
+                if self._sends_token_count:
+                    self._closing_valid_tokens[req_id] = after_step
+            else:
+                meta.push_stream_tokens[req_id] = released
             offered = cdiv(released, self.block_size)
             meta.add_new_req_to_save(
                 request_id=req_id,
