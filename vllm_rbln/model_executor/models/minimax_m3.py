@@ -952,11 +952,12 @@ MM_ENCODER_PATCH_BUCKET = 5184
 
 
 class _RBLNVisionEncoder(nn.Module):
-    def __init__(self, tower: nn.Module):
+    def __init__(self, tower: nn.Module, out_dtype: torch.dtype):
         super().__init__()
         vm = tower.vision_model
         attn = vm.encoder.layers[0].self_attn
         self.tower = tower
+        self.out_dtype = out_dtype
         self.num_heads = attn.num_heads_per_partition
         self.head_dim = attn.head_dim
         w = vm.embeddings.patch_embedding.weight
@@ -997,7 +998,7 @@ class _RBLNVisionEncoder(nn.Module):
             mlp, _ = layer.fc2(layer.act(mlp))
             hidden = hidden + mlp
         hidden = self.tower.multi_modal_projector(hidden)
-        return self.tower.patch_merge_mlp(hidden)
+        return self.tower.patch_merge_mlp(hidden).to(self.out_dtype)
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -1038,7 +1039,7 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         self.config = config
         self.quant_config = vllm_config.quant_config
         self.vision_tower = None
-
+        self.mm_embeds_dtype = vllm_config.model_config.dtype
         mm_config = vllm_config.model_config.multimodal_config
         if get_pp_group().is_first_rank and any(
             mm_config.get_limit_per_prompt(m) > 0 for m in ("image", "video")
@@ -1083,7 +1084,7 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         # Non-first PP ranks and zero image/video limits own no vision tower.
         if self.vision_tower is None:
             return
-        encoder = _RBLNVisionEncoder(self.vision_tower).eval()
+        encoder = _RBLNVisionEncoder(self.vision_tower, self.mm_embeds_dtype).eval()
         object.__setattr__(self, "_mm_encoder", compile_fn(encoder))
 
     def _encoder_inputs(
@@ -1158,7 +1159,7 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         if self._mm_encoder is None:
             # enforce_eager: the runner never calls compile_mm_encoder.
             assert self.vision_tower is not None
-            encoder = _RBLNVisionEncoder(self.vision_tower).eval()
+            encoder = _RBLNVisionEncoder(self.vision_tower, self.mm_embeds_dtype).eval()
             object.__setattr__(self, "_mm_encoder", encoder)
         image_grid_thw = kwargs["image_grid_thw"]
         assert isinstance(pixel_values, torch.Tensor)

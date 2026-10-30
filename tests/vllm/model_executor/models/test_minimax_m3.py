@@ -36,11 +36,12 @@ def test_minimax_m3_encoder_compile_requires_local_tower(monkeypatch, has_tower)
     runtime = Mock()
     compile_fn = Mock(return_value=runtime)
     model._mm_encoder = None
+    model.mm_embeds_dtype = torch.bfloat16
 
     model.compile_mm_encoder(compile_fn)
 
     if has_tower:
-        build_encoder.assert_called_once_with(model.vision_tower)
+        build_encoder.assert_called_once_with(model.vision_tower, torch.bfloat16)
         compile_fn.assert_called_once_with(encoder)
         assert model._mm_encoder is runtime
     else:
@@ -103,6 +104,7 @@ def test_image_encoding_reuses_eager_or_compiled_encoder(monkeypatch, compiled):
     build_encoder = Mock(return_value=encoder)
     monkeypatch.setattr(m3, "_RBLNVisionEncoder", build_encoder)
     object.__setattr__(model, "_mm_encoder", encoder if compiled else None)
+    model.mm_embeds_dtype = torch.float32
     model._encoder_inputs = Mock(side_effect=lambda pixels, grid: [pixels])
     pixels = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
     grids = torch.tensor([[1, 1, 1], [1, 1, 2]])
@@ -116,11 +118,49 @@ def test_image_encoding_reuses_eager_or_compiled_encoder(monkeypatch, compiled):
     if compiled:
         build_encoder.assert_not_called()
     else:
-        build_encoder.assert_called_once_with(model.vision_tower)
+        build_encoder.assert_called_once_with(model.vision_tower, torch.float32)
         assert not encoder.training
     assert model._mm_encoder is encoder
     assert "_mm_encoder" not in model._modules
     assert list(model.state_dict()) == ["vision_tower.weight"]
+
+
+def test_fp32_vision_encoder_hands_out_model_dtype_embeddings():
+    import vllm_rbln.model_executor.models.minimax_m3 as m3
+
+    torch.manual_seed(0)
+    patch_weight = torch.randn(4, 1, 2, 3)
+    vision_model = SimpleNamespace(
+        encoder=SimpleNamespace(
+            layers=[
+                SimpleNamespace(
+                    self_attn=SimpleNamespace(num_heads_per_partition=1, head_dim=4)
+                )
+            ]
+        ),
+        embeddings=SimpleNamespace(
+            patch_embedding=SimpleNamespace(weight=patch_weight)
+        ),
+        t_dim=2,
+        h_dim=1,
+        w_dim=1,
+        pre_layrnorm=torch.nn.LayerNorm(4),
+    )
+    tower = torch.nn.Module()
+    tower.vision_model = vision_model
+    tower.multi_modal_projector = torch.nn.Linear(4, 4)
+    tower.patch_merge_mlp = torch.nn.Linear(4, 4)
+    encoder = m3._RBLNVisionEncoder(tower, torch.bfloat16)
+    # No encoder layers: only the dtype the embeddings leave in is under test.
+    vision_model.encoder.layers = []
+    pixels = torch.randn(3, 6)
+
+    out = encoder(pixels, torch.ones(3, 4), torch.zeros(3, 4), torch.zeros(1, 1, 1, 3))
+
+    hidden = vision_model.pre_layrnorm(pixels @ patch_weight.reshape(4, -1).T)
+    expected = tower.patch_merge_mlp(tower.multi_modal_projector(hidden))
+    assert out.dtype == torch.bfloat16
+    torch.testing.assert_close(out, expected.to(torch.bfloat16))
 
 
 def test_text_config_loads_from_local_checkpoint(tmp_path):
