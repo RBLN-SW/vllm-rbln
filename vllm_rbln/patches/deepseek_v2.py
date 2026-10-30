@@ -23,6 +23,7 @@ from vllm.model_executor.models.deepseek_v2 import (
     DeepseekV32IndexerCache,
 )
 
+from vllm_rbln import envs
 from vllm_rbln.logger import init_logger
 from vllm_rbln.patches import register_patch
 from vllm_rbln.patches.attention import _resolve_kv_cache
@@ -57,6 +58,18 @@ def patched_deepseek_v2_decoder_layer_init(
     if self.use_sequence_parallel_moe:
         self.use_sequence_parallel_moe = False
         self.self_attn.o_proj.reduce_results = True
+
+
+if envs.VLLM_RBLN_USE_NESTED_COMPILE_REGION:
+    register_patch(
+        target="vllm.model_executor.models.deepseek_v2.DeepseekV2DecoderLayer.forward",
+        owner_module=__name__,
+        reason=(
+            "Upstream DeepSeek-V2 exposes no decoder compile-region hook. Preserve "
+            "decoder bodies for RBLN loop-compilation bring-up using "
+            "invoke_subgraph boundaries."
+        ),
+    )(torch.compiler.nested_compile_region(DeepseekV2DecoderLayer.forward))
 
 
 @register_patch(
