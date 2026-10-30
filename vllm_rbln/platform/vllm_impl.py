@@ -264,7 +264,8 @@ def _validate_aux_hidden_states_pp_config(vllm_config: "VllmConfig") -> None:
     raise ValueError(
         f"A {vllm_config.speculative_config.method} draft consumes the target's "
         "auxiliary hidden states, and collecting them across pipeline stages "
-        "needs a per-architecture patch that this target does not have yet. "
+        "needs the target's forward to hand them on as the one combined tensor "
+        "this plugin reads, which this target's forward does not do yet. "
         "pipeline_parallel_size="
         f"{vllm_config.parallel_config.pipeline_parallel_size} is supported on "
         f"RBLN only for target architectures {sorted(AUX_PP_TARGET_ARCHS)}, but "
