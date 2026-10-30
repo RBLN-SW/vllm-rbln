@@ -49,8 +49,7 @@ def build_op_top_k_top_p(
     filter stays out of the top-k top-p kernel's compare.
     """
     assert not sampling_metadata.all_greedy, (
-        "all-greedy is the caller's: the sampler runs rbln::argmax and the "
-        "rejection sampler passes its own top_k of ones"
+        "Expected a batch containing at least one random-sampling request"
     )
 
     top_k = sampling_metadata.top_k
