@@ -17,6 +17,7 @@
 # sampler's output back.
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -262,6 +263,19 @@ class TestWarmupMultimodalEncoder:
         assert dummy_calls == [{"image": 1}]
         assert len(encoded) == 1
         torch.testing.assert_close(encoded[0], pixels)
+
+    def test_a_model_with_several_encoder_sizes_warms_them_itself(self, monkeypatch):
+        monkeypatch.setattr(
+            mr, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True)
+        )
+        self._fake_processor(monkeypatch, torch.ones(1, 1, 2))
+        model = Mock(spec=["warm_up_mm_encoder", "embed_multimodal"])
+        runner = SimpleNamespace(supports_mm_inputs=True, model=model)
+
+        mr.RBLNModelRunner._warmup_mm_encoder(runner)
+
+        model.warm_up_mm_encoder.assert_called_once_with()
+        model.embed_multimodal.assert_not_called()
 
     @pytest.mark.parametrize(
         "reason", ["text_only_model", "other_pp_rank", "no_image_limit"]

@@ -15,6 +15,7 @@
 """Gemma4 on the RBLN vLLM path: upstream's model, with its vision tower
 compiled and its image embeddings merged inside the compiled graph."""
 
+import math
 from collections.abc import Callable, Mapping
 from functools import cached_property
 
@@ -39,7 +40,10 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.parse import MultiModalDataItems
 from vllm.sequence import IntermediateTensors
 
-from vllm_rbln.model_executor.models.interfaces import SupportsRBLNMultiModal
+from vllm_rbln.model_executor.models.interfaces import (
+    SupportsRBLNMmEncoderWarmup,
+    SupportsRBLNMultiModal,
+)
 
 # Padding seen by the encoder's softmax: far below any real score, still
 # finite in half precision.
@@ -176,18 +180,21 @@ class RBLNGemma4MultiModalProcessor(Gemma4MultiModalProcessor):
     dummy_inputs=Gemma4DummyInputsBuilder,
 )
 class RBLNGemma4ForConditionalGeneration(
-    Gemma4ForConditionalGeneration, SupportsRBLNMultiModal
+    Gemma4ForConditionalGeneration, SupportsRBLNMultiModal, SupportsRBLNMmEncoderWarmup
 ):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-        # Every image or frame is padded to the patches of the largest soft
-        # token budget this deployment allows, one compiled encoder shape.
         self.mm_soft_token_cap = mm_soft_token_cap(
             MULTIMODAL_REGISTRY.create_processor(vllm_config.model_config).info
         )
-        self.mm_encoder_num_patches = (
-            self.mm_soft_token_cap * self.config.vision_config.pooling_kernel_size**2
-        )
+        # One compiled encoder shape per soft token budget up to the cap; an
+        # image or frame is padded to the smallest that holds its patches.
+        pool = self.config.vision_config.pooling_kernel_size
+        self.mm_encoder_buckets = [
+            budget * pool**2
+            for budget in _SUPPORTED_SOFT_TOKENS
+            if budget <= self.mm_soft_token_cap
+        ]
         self._mm_encoder: Callable[..., torch.Tensor] | None
         object.__setattr__(self, "_mm_encoder", None)
 
@@ -217,6 +224,25 @@ class RBLNGemma4ForConditionalGeneration(
         encoder = _RBLNGemma4VisionEncoder(self.vision_tower, self.embed_vision)
         object.__setattr__(self, "_mm_encoder", compile_fn(encoder.eval()))
 
+    def warm_up_mm_encoder(self) -> None:
+        if self._mm_encoder is None:
+            return
+        vision_config = self.config.vision_config
+        pool = vision_config.pooling_kernel_size
+        patch_pixels = 3 * vision_config.patch_size**2
+        with torch.inference_mode():
+            for bucket in self.mm_encoder_buckets:
+                # A full grid whose sides are multiples of the pooling kernel.
+                cells = bucket // pool**2
+                rows = max(d for d in range(1, math.isqrt(cells) + 1) if cells % d == 0)
+                ys, xs = torch.meshgrid(
+                    torch.arange(rows * pool),
+                    torch.arange(cells // rows * pool),
+                    indexing="ij",
+                )
+                positions = torch.stack([xs, ys], dim=-1).reshape(-1, 2)
+                self._encode_vision(torch.zeros(bucket, patch_pixels), positions)
+
     def _encode_vision(
         self, pixel_values: torch.Tensor, pixel_position_ids: torch.Tensor
     ) -> torch.Tensor:
@@ -230,16 +256,17 @@ class RBLNGemma4ForConditionalGeneration(
             ).eval()
             object.__setattr__(self, "_mm_encoder", encoder)
         tower = self.vision_tower
-        bucket = self.mm_encoder_num_patches
         valid = (pixel_position_ids >= 0).all(dim=-1)
         num_patches = int(valid.sum())
-        assert num_patches <= bucket, (
+        assert num_patches <= self.mm_encoder_buckets[-1], (
             f"an image of {num_patches} patches exceeds the vision encoder's "
-            f"{bucket}-patch bucket"
+            f"{self.mm_encoder_buckets[-1]}-patch bucket"
         )
-        positions = torch.full((1, bucket, 2), -1, dtype=pixel_position_ids.dtype)
+        bucket = next(b for b in self.mm_encoder_buckets if b >= num_patches)
+        # Fixed dtypes, so warm-up and serving reach the same compiled graphs.
+        positions = torch.full((1, bucket, 2), -1, dtype=torch.long)
         positions[0, :num_patches] = pixel_position_ids[valid]
-        patches = pixel_values.new_zeros(1, bucket, pixel_values.shape[-1])
+        patches = torch.zeros(1, bucket, pixel_values.shape[-1])
         patches[0, :num_patches] = pixel_values[valid]
         padding = ~(positions >= 0).all(dim=-1)
         key_bias = torch.where(padding, _KEY_PAD_BIAS, 0.0)[:, None, None, :]

@@ -124,6 +124,7 @@ from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.logger import init_logger
 from vllm_rbln.model_executor.models.interfaces import (
     SupportsRBLNMultiModal,
+    supports_rbln_mm_encoder_warmup,
     supports_rbln_mm_prefix,
     supports_rbln_multimodal,
 )
@@ -1529,8 +1530,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         The vision encoder compiles on its first call, so without this the
         first image request would pay for it. The dummy item is the one
         upstream profiles the encoder with: the image size that yields the
-        most tokens, which fills the encoder's patch bucket."""
+        most tokens, which fills the encoder's patch bucket. A model compiled
+        at several sizes runs each of them itself."""
         if not (self.supports_mm_inputs and get_pp_group().is_first_rank):
+            return
+        if supports_rbln_mm_encoder_warmup(self.model):
+            self.model.warm_up_mm_encoder()
             return
         processor = MULTIMODAL_REGISTRY.create_processor(self.model_config)
         # Only images reach the RBLN vision encoder; the model rejects video.

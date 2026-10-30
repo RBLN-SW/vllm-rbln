@@ -90,7 +90,7 @@ def test_the_vision_encoder_matches_hfs(width, height):
         vision_tower=tower,
         embed_vision=_Identity(),
         model_dtype=torch.float32,
-        mm_encoder_num_patches=90,
+        mm_encoder_buckets=[90],
     )
     pixels, positions = _image(width, height, num_patches=81)
 
@@ -109,12 +109,61 @@ def test_an_image_beyond_the_bucket_is_refused():
         vision_tower=_vision_tower(),
         embed_vision=_Identity(),
         model_dtype=torch.float32,
-        mm_encoder_num_patches=9,
+        mm_encoder_buckets=[9],
     )
     pixels, positions = _image(6, 3, num_patches=18)
 
     with pytest.raises(AssertionError, match="9-patch bucket"):
         model._encode_vision(pixels, positions)
+
+
+def _recording_model(buckets):
+    """A model whose compiled encoder records the patch count it is called at."""
+    tower = _vision_tower()
+    calls = []
+
+    def encoder(patches, positions, padding, *rest):
+        calls.append((patches.shape[1], int((~padding).sum())))
+        return torch.zeros(1, patches.shape[1] // POOL**2, 32)
+
+    model = _bare_model(
+        vision_tower=tower,
+        embed_vision=_Identity(),
+        model_dtype=torch.float32,
+        mm_encoder_buckets=buckets,
+        config=SimpleNamespace(vision_config=tower.config),
+    )
+    object.__setattr__(model, "_mm_encoder", encoder)
+    return model, calls
+
+
+@pytest.mark.parametrize(
+    "width, height, bucket", [(3, 3, 18), (6, 3, 18), (9, 3, 45), (9, 9, 90)]
+)
+def test_an_image_takes_the_smallest_bucket_holding_it(width, height, bucket):
+    model, calls = _recording_model([18, 45, 90])
+    pixels, positions = _image(width, height, num_patches=90)
+
+    model._encode_vision(pixels, positions)
+
+    assert calls == [(bucket, width * height)]
+
+
+def test_warm_up_runs_every_bucket_once_full():
+    model, calls = _recording_model([18, 45, 90])
+
+    model.warm_up_mm_encoder()
+
+    assert calls == [(18, 18), (45, 45), (90, 90)]
+
+
+def test_warm_up_without_an_encoder_runs_nothing():
+    model, calls = _recording_model([18])
+    object.__setattr__(model, "_mm_encoder", None)
+
+    model.warm_up_mm_encoder()
+
+    assert calls == []
 
 
 @pytest.mark.parametrize(
