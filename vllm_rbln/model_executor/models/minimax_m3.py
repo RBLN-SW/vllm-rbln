@@ -13,17 +13,19 @@
 # limitations under the License.
 
 import importlib.util
+import inspect
 import math
 import sys
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from itertools import islice
 from pathlib import Path
 from types import ModuleType
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
 from torch import nn
-from transformers import PretrainedConfig
+from transformers import BatchFeature, PretrainedConfig
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_pp_group,
@@ -76,6 +78,11 @@ from vllm.model_executor.models.utils import (
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+from vllm.transformers_utils.processors.minimax_m3 import (
+    MAX_RATIO,
+    MiniMaxM3VLImageProcessor,
+    smart_resize,
+)
 from vllm.utils.torch_utils import (
     kv_cache_dtype_str_to_dtype,
     set_default_torch_dtype,
@@ -945,10 +952,67 @@ def _load_upstream_common(name: str) -> ModuleType:
 _mm_preprocess = _load_upstream_common("mm_preprocess")
 _vision_tower = _load_upstream_common("vision_tower")
 
+if TYPE_CHECKING:
+    from vllm.models.minimax_m3.common.mm_preprocess import (
+        MiniMaxM3VLMultiModalProcessor,
+        MiniMaxM3VLProcessingInfo,
+    )
+else:
+    MiniMaxM3VLProcessingInfo = _mm_preprocess.MiniMaxM3VLProcessingInfo
+    MiniMaxM3VLMultiModalProcessor = _mm_preprocess.MiniMaxM3VLMultiModalProcessor
 
-# Patches per image the compiled vision encoder takes: the model's largest image,
-# 1008 x 1008 px at patch_size 14 (a 72 x 72 grid).
-MM_ENCODER_PATCH_BUCKET = 5184
+
+_MIN_IMAGE_PIXELS = inspect.signature(smart_resize).parameters["min_pixels"].default
+
+
+class _RBLNMiniMaxM3VLProcessingInfo(MiniMaxM3VLProcessingInfo):
+    def get_image_processor(self, **kwargs: object) -> MiniMaxM3VLImageProcessor:
+        kwargs = self.ctx.get_merged_mm_kwargs(kwargs, modality="image")
+        return super().get_image_processor(**kwargs)
+
+    def get_max_image_tokens(self) -> int:
+        """Bound resized area across aspect ratios and both enlargement paths."""
+        processor = self.get_image_processor()
+        factor = processor.patch_size * processor.merge_size
+        long_side = processor.max_long_side_pixel
+        if long_side is None:
+            minimum = _MIN_IMAGE_PIXELS / factor**2
+            ratio = math.sqrt(MAX_RATIO)
+            enlarged = math.ceil(minimum + math.sqrt(minimum) * (ratio + 1 / ratio) + 1)
+            return max(processor.max_pixels // factor**2, enlarged)
+
+        side = max(1, math.floor(long_side / factor + 0.5))
+        short = max(1, math.floor(processor.min_short_side_pixel / factor + 0.5))
+        stretched = max(
+            1,
+            math.floor(
+                processor.min_short_side_pixel * min(MAX_RATIO, long_side) / factor
+                + 0.5
+            ),
+        )
+        return min(
+            max(side**2, short * stretched), processor.max_total_pixels // factor**2
+        )
+
+
+class _RBLNMiniMaxM3VLMultiModalProcessor(MiniMaxM3VLMultiModalProcessor):
+    def _call_hf_processor(
+        self, hf_data: Mapping[str, object], hf_kwargs: Mapping[str, object]
+    ) -> BatchFeature:
+        outputs = super()._call_hf_processor(hf_data, hf_kwargs)
+
+        if "image_grid_thw" in outputs:
+            merge = self.info.get_image_processor().merge_size
+            limit = self.info.get_max_image_tokens() * merge**2
+            for grid in outputs["image_grid_thw"].tolist():
+                if math.prod(grid) > limit:
+                    raise ValueError(
+                        f"An image of {math.prod(grid)} patches (grid {grid}) is "
+                        f"larger than the {limit} patches the RBLN vision encoder "
+                        "is compiled for. Lower the request's resize limits, or "
+                        "raise the startup limits in --mm-processor-kwargs."
+                    )
+        return outputs
 
 
 class _RBLNVisionEncoder(nn.Module):
@@ -1002,8 +1066,8 @@ class _RBLNVisionEncoder(nn.Module):
 
 
 @MULTIMODAL_REGISTRY.register_processor(
-    _mm_preprocess.MiniMaxM3VLMultiModalProcessor,
-    info=_mm_preprocess.MiniMaxM3VLProcessingInfo,
+    _RBLNMiniMaxM3VLMultiModalProcessor,
+    info=_RBLNMiniMaxM3VLProcessingInfo,
     dummy_inputs=_mm_preprocess.MiniMaxM3VLDummyInputsBuilder,
 )
 class RBLNMiniMaxM3SparseForConditionalGeneration(
@@ -1055,6 +1119,32 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
                     prefix=maybe_prefix(prefix, "vision_tower"),
                 )
 
+            info = MULTIMODAL_REGISTRY.create_processor(vllm_config.model_config).info
+            image_processor = info.get_image_processor()
+            merge = image_processor.merge_size
+            max_patches = info.get_max_image_tokens() * merge**2
+            buckets = sorted(vllm_config.additional_config.mm_encoder_patch_buckets)
+            buckets = buckets or [max_patches]
+            if odd := [b for b in buckets if b % merge**2]:
+                raise ValueError(
+                    f"mm_encoder_patch_buckets {odd} must be multiples of {merge**2}: "
+                    f"the encoder merges {merge} x {merge} patches into one token."
+                )
+            reaching = [b for b in buckets if b >= max_patches]
+            if not reaching:
+                raise ValueError(
+                    f"mm_encoder_patch_buckets {buckets} must reach {max_patches} "
+                    "patches, the processor's patch upper bound. Add a bucket that "
+                    "large, or lower the resize limits in --mm-processor-kwargs."
+                )
+            if len(reaching) > 1:
+                raise ValueError(
+                    f"mm_encoder_patch_buckets {reaching[1:]} would never be used: the "
+                    f"processor's patch upper bound is {max_patches}."
+                )
+
+            self.mm_encoder_patch_buckets = buckets
+
         object.__setattr__(self, "_mm_encoder", None)
 
         with self._mark_language_model(vllm_config):
@@ -1080,6 +1170,26 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
     def logits_processor(self) -> nn.Module:
         return self.language_model.logits_processor
 
+    def warmup_mm_encoder(self) -> None:
+        tower = self.vision_tower
+        if tower is None:
+            return
+        if self._mm_encoder is None:
+            self.compile_mm_encoder(lambda encoder: encoder)
+        assert self._mm_encoder is not None
+        vm = tower.vision_model
+        patch_dim = vm.embeddings.patch_embedding.weight[0].numel()
+        head_dim = vm.encoder.layers[0].self_attn.head_dim
+        device = next(tower.parameters()).device
+        with torch.inference_mode():
+            for bucket in self.mm_encoder_patch_buckets:
+                self._mm_encoder(
+                    torch.zeros(bucket, patch_dim, dtype=tower.dtype, device=device),
+                    torch.ones(bucket, head_dim, dtype=tower.dtype, device=device),
+                    torch.zeros(bucket, head_dim, dtype=tower.dtype, device=device),
+                    torch.zeros(1, 1, 1, bucket, dtype=tower.dtype, device=device),
+                )
+
     def compile_mm_encoder(self, compile_fn) -> None:
         # Non-first PP ranks and zero image/video limits own no vision tower.
         if self.vision_tower is None:
@@ -1094,12 +1204,10 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         tower = self.vision_tower
         assert tower is not None
         vm = tower.vision_model
-        bucket = MM_ENCODER_PATCH_BUCKET
         num_patches = math.prod(grid_thw)
-        assert num_patches <= bucket, (
-            f"an image of {num_patches} patches (grid {grid_thw}) exceeds the "
-            f"vision encoder's {bucket}-patch bucket"
-        )
+        fits = [b for b in self.mm_encoder_patch_buckets if b >= num_patches]
+        assert fits, f"an image of {num_patches} patches (grid {grid_thw})"
+        bucket = fits[0]
         dtype = tower.dtype
         device = next(tower.parameters()).device
         patch_dim = vm.embeddings.patch_embedding.weight[0].numel()
@@ -1158,9 +1266,7 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
             return ()
         if self._mm_encoder is None:
             # enforce_eager: the runner never calls compile_mm_encoder.
-            assert self.vision_tower is not None
-            encoder = _RBLNVisionEncoder(self.vision_tower, self.mm_embeds_dtype).eval()
-            object.__setattr__(self, "_mm_encoder", encoder)
+            self.compile_mm_encoder(lambda encoder: encoder)
         image_grid_thw = kwargs["image_grid_thw"]
         assert isinstance(pixel_values, torch.Tensor)
         assert isinstance(image_grid_thw, torch.Tensor)

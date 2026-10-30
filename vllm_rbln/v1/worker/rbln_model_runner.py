@@ -43,7 +43,6 @@ from vllm.model_executor.models.interfaces_base import (
     is_pooling_model,
     is_text_generation_model,
 )
-from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalKwargsItem
 from vllm.multimodal.utils import group_and_batch_mm_kwargs
 from vllm.platforms import current_platform
@@ -1475,30 +1474,16 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         return mm_embeds, is_mm.to(self.dtype).unsqueeze(-1)
 
     def _warmup_mm_encoder(self) -> None:
-        """Encode the processor's largest dummy image once before serving.
-
-        The vision encoder compiles on its first call, so without this the
-        first image request would pay for it. The dummy item is the one
-        upstream profiles the encoder with: the image size that yields the
-        most tokens, which fills the encoder's patch bucket."""
+        """Materialize every encoder bucket before serving and sizing KV caches."""
         if not (self.supports_mm_inputs and get_pp_group().is_first_rank):
             return
-        processor = MULTIMODAL_REGISTRY.create_processor(self.model_config)
+        mm_config = self.model_config.multimodal_config
+        assert mm_config is not None
         # Only images reach the RBLN vision encoder; the model rejects video.
-        if processor.info.allowed_mm_limits.get("image", 0) <= 0:
+        if mm_config.get_limit_per_prompt("image") <= 0:
             return
-        dummy_inputs = processor.get_dummy_mm_inputs(
-            mm_counts={"image": 1}, scheduler_config=self.scheduler_config
-        )
-        mm_kwargs = [("image", item) for item in dummy_inputs["mm_kwargs"]["image"]]
-
-        model = cast(SupportsMultiModal, self.model)
         with torch.inference_mode():
-            for _modality, num_items, mm_kwargs_batch in group_and_batch_mm_kwargs(
-                mm_kwargs, device="cpu"
-            ):
-                outputs = model.embed_multimodal(**mm_kwargs_batch)
-                sanity_check_mm_encoder_outputs(outputs, expected_num_items=num_items)
+            cast(SupportsRBLNMultiModal, self.model).warmup_mm_encoder()
 
     def _sample(
         self,

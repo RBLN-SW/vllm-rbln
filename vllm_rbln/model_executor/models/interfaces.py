@@ -44,6 +44,10 @@ class SupportsRBLNMultiModal(Protocol):
         rank that owns no encoder returns without calling ``compile_fn``."""
         ...
 
+    def warmup_mm_encoder(self) -> None:
+        """Run every encoder graph once; return if this rank owns no encoder."""
+        ...
+
 
 def supports_rbln_multimodal(model: object) -> TypeIs[SupportsRBLNMultiModal]:
     return getattr(model, "merges_mm_embeds_in_graph", False) is True

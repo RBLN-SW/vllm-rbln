@@ -225,6 +225,14 @@ def test_manual_strategy_needs_buckets():
         RBLNConfig(decode_batch_bucket_strategy="manual")
 
 
+@pytest.mark.parametrize(
+    ("buckets", "error"), [([0, 2304], "must all be > 0"), ([2304, 2304], "unique")]
+)
+def test_mm_encoder_patch_buckets_are_positive_and_unique(buckets, error):
+    with pytest.raises(ValueError, match=error):
+        RBLNConfig(mm_encoder_patch_buckets=buckets)
+
+
 @pytest.mark.parametrize("size", [0, -1])
 def test_a_sub_block_size_of_zero_or_less_is_rejected(size):
     """`sub_block_size_in_use()` takes a size or None, so the field refuses
@@ -324,6 +332,8 @@ def test_only_compile_fields_change_the_hash():
     assert RBLNConfig(decode_batch_bucket_strategy="linear").compute_hash() != base
     buckets = RBLNConfig(decode_batch_bucket_manual_buckets=[1, 2, 4])
     assert buckets.compute_hash() != base
+    patch_buckets = RBLNConfig(mm_encoder_patch_buckets=[1024, 2304])
+    assert patch_buckets.compute_hash() != base
     # Unset and True resolve to the same graph; False compiles a static one.
     assert RBLNConfig(use_dynamic_kv_cache=True).compute_hash() == base
     assert RBLNConfig(use_dynamic_kv_cache=False).compute_hash() != base
