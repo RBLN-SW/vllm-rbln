@@ -34,7 +34,7 @@ from .utils import (
     assert_samples_match,
     build_input_batch,
     expected_probs,
-    make_logits,
+    logits_from_weights,
     weighted_token_ids,
 )
 
@@ -223,7 +223,7 @@ DISTRIBUTION_CASES = [
 @pytest.mark.parametrize(("params", "request_kwargs"), DISTRIBUTION_CASES)
 @pytest.mark.use_device
 def test_sampled_distribution(params, request_kwargs):
-    row = make_logits(weights=range(1, 33))
+    row = logits_from_weights(weights=range(1, 33))
     expected = expected_probs(
         logits=row.unsqueeze(0),
         params=[params],
@@ -241,7 +241,7 @@ def test_sampled_distribution(params, request_kwargs):
 @pytest.mark.use_device
 def test_structured_output_mask_with_top_p_min_p():
     """A token masked to -inf must never come back, whatever the filters keep."""
-    row = make_logits(weights=range(1, 33))
+    row = logits_from_weights(weights=range(1, 33))
     row[[WEIGHTED[31], WEIGHTED[30], *range(WEIGHTED[0] + 1, WEIGHTED[1])]] = float(
         "-inf"
     )
@@ -257,7 +257,7 @@ def test_structured_output_mask_with_top_p_min_p():
 def test_mixed_batch_keeps_each_row_to_its_own_params():
     """One op call serves the mixed batch, greedy rows as top_k=1. Each row must
     keep its own distribution."""
-    weighted_row = make_logits(weights=range(1, 33))
+    weighted_row = logits_from_weights(weights=range(1, 33))
     groups = [
         (
             near_tied_logits(top_token=WEIGHTED[20], second_token=WEIGHTED[5]),
@@ -302,7 +302,7 @@ def test_mixed_batch_keeps_each_row_to_its_own_params():
 def test_padded_bucket_keeps_live_rows_to_their_params():
     """Padding the metadata with copies of the last live row must not change
     any live row's distribution."""
-    weighted_row = make_logits(weights=range(1, 33))
+    weighted_row = logits_from_weights(weights=range(1, 33))
     groups = [
         (
             near_tied_logits(top_token=WEIGHTED[20], second_token=WEIGHTED[5]),

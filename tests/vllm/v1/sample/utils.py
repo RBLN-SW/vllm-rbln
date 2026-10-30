@@ -96,24 +96,28 @@ def build_input_batch(
 
 def weighted_token_ids(num_weighted: int, vocab_size: int = VOCAB_SIZE) -> torch.Tensor:
     """Ids spread over the whole vocab, first and last included."""
-    return torch.linspace(0, vocab_size - 1, num_weighted).round().long()
+    return torch.linspace(0, vocab_size - 1, num_weighted).round().to(torch.int64)
 
 
-def make_logits(
+def logits_from_weights(
     weights: Sequence[int],
     vocab_size: int = VOCAB_SIZE,
     tail_mass: float = 0.01,
     dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    """Logits whose softmax weighs `weighted_token_ids()[i]` by `weights[i]` and
-    spreads `tail_mass` over the rest. Rounded to `dtype`, so build the expected
-    distribution from the row, not from `weights`."""
-    logits = torch.empty(vocab_size, dtype=torch.float64)
+    """Weights `weighted_token_ids()` by `weights` and spreads `tail_mass` over
+    the rest, rounded to `dtype`. Expected probs come from the row, not `weights`.
+
+    For example, `logits_from_weights(weights=[1, 3], vocab_size=5, tail_mass=0.3)`
+    splits 0.7 between tokens 0 and 4 at 1:3. Its softmax is [0.175, 0.1, 0.1,
+    0.1, 0.525] before the bf16 rounding and [0.1747, ..., 0.5256] after it.
+    """
+    logits = torch.empty(vocab_size, dtype=torch.float32)
     total_weight = sum(weights)
     num_tail = vocab_size - len(weights)
     logits.fill_(math.log(tail_mass / (1.0 - tail_mass) * total_weight / num_tail))
     logits[weighted_token_ids(num_weighted=len(weights), vocab_size=vocab_size)] = (
-        torch.tensor(weights, dtype=torch.float64).log()
+        torch.tensor(weights, dtype=torch.float32).log()
     )
     return logits.to(dtype)
 
@@ -161,9 +165,9 @@ def assert_samples_match(
     """Chi-squared fit of `samples` against the 1-D `probs`. A rare-token pool
     too small to count folds into the smallest bin instead of being dropped.
     The ~10 sigma bound keeps unseeded runs from flaking."""
-    samples = samples.flatten().cpu().long()
-    probs = probs.cpu().double()
-    counts = torch.bincount(samples, minlength=probs.numel()).double()
+    samples = samples.flatten().cpu().to(torch.int64)
+    probs = probs.cpu().float()
+    counts = torch.bincount(samples, minlength=probs.numel()).float()
 
     impossible = (probs == 0) & (counts > 0)
     assert not impossible.any(), (
