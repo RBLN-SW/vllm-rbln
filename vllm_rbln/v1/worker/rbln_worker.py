@@ -255,6 +255,7 @@ class RBLNWorker(WorkerBase):
                 "mxfp4",
                 "gpt_oss_mxfp4",
                 "fp8",
+                "mxfp8",
                 "compressed-tensors",
                 "modelopt_mixed",
             )
@@ -294,7 +295,9 @@ class RBLNWorker(WorkerBase):
                         f"only 4-bit (int4) or 8-bit (fp8)."
                     )
 
-            if quantization == "fp8":
+            if quantization in ("fp8", "mxfp8"):
+                # MXFP8: the e4m3 weights are a float dtype (element_size()
+                # below); the uint8 E8M0 scales are 8 bits each
                 nbits_per_param = 8
                 packed_num_elems = 1
             elif quantization == "modelopt_mixed":
