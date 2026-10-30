@@ -21,6 +21,7 @@ import json
 import math
 import os
 import subprocess
+import sys
 import tempfile
 from collections import Counter
 from pathlib import Path
@@ -120,6 +121,7 @@ def build_report(results, *, run_id, chip, build_url, branch, commit):
     completed = planned = 0
     snapshot = results / "ci-targets" / run_id
     targets = {}
+    source = None
     if (snapshot / "snapshot.tar.gz").exists():
         source = restore_ci_targets(snapshot)
         targets = load_targets(snapshot / "perf", chip, "perf")
@@ -199,6 +201,32 @@ def build_report(results, *, run_id, chip, build_url, branch, commit):
         perf = "CI target preparation failed: target snapshot is missing"
         degraded = True
 
+    sys.path.insert(0, str(Path(__file__).with_name("sampler-perf")))
+    from run_benchmarks import sampler_summary
+
+    sampler_path = results / "sampler-perf-results" / run_id / chip / "manifest.json"
+    sampler = None
+    sampler_url = build_url
+    if sampler_path.is_file():
+        try:
+            manifest = json.loads(sampler_path.read_text())
+            if manifest["chip"] not in (None, chip):
+                raise ValueError("sampler result chip does not match nightly report")
+            if source is None:
+                raise ValueError("CI targets snapshot is missing")
+            sampler_targets = f"Targets: {source['repo']} @ {source['commit']}"
+            sampler = sampler_summary(manifest)
+        except (ValueError, KeyError, TypeError, OSError) as error:
+            sampler_text = f"INVALID: Sampler Perf results ({error})."
+            degraded = True
+        else:
+            sampler_url = manifest.get("job_url") or build_url
+            sampler_text = sampler["text"] + "\n" + sampler_targets
+            degraded |= sampler["degraded"]
+    else:
+        sampler_text = "MISSING: Sampler Perf manifest was not uploaded."
+        degraded = True
+
     title = f"vllm-rbln {branch} nightly build"
     build_number = urlsplit(build_url).path.rstrip("/").rsplit("/", 1)[-1]
     sections = [
@@ -226,6 +254,26 @@ def build_report(results, *, run_id, chip, build_url, branch, commit):
                 "rows": rows,
             }
         )
+    sampler_section = f"*Sampler Perf*\n{sampler_text}\n<{sampler_url}|Job and details>"
+    blocks.append(
+        {"type": "section", "text": {"type": "mrkdwn", "text": sampler_section}}
+    )
+    if sampler is not None:
+        blocks.append(
+            {
+                "type": "table",
+                "column_settings": [
+                    {"is_wrapped": True},
+                    {"is_wrapped": True},
+                    *({"align": "right"} for _ in sampler["titles"][2:]),
+                ],
+                "rows": [
+                    [{"type": "raw_text", "text": cell} for cell in row]
+                    for row in [sampler["titles"], *sampler["rows"]]
+                ],
+            }
+        )
+    text += "\n\n" + sampler_section
     annotation = (
         f"**{title} [#{build_number}]({build_url}) ({commit[:8]})**\n\n"
         + "\n\n".join(
@@ -236,6 +284,8 @@ def build_report(results, *, run_id, chip, build_url, branch, commit):
         )
         + "\n\n"
         + "\n".join(markdown)
+        + f"\n\n**Sampler Perf**\n{sampler_text}\n\n[Job and details]({sampler_url})"
+        + ("\n\n" + sampler["markdown"] if sampler is not None else "")
     )
     return (
         {"text": text, "blocks": blocks, "unfurl_links": False, "unfurl_media": False},
@@ -292,6 +342,7 @@ def main():
                 "pytest-results/**/result.json",
                 "example-results/**/results.json",
                 f"perf-results/{args.run_id}/{args.chip}/**/result.json",
+                f"sampler-perf-results/{args.run_id}/{args.chip}/manifest.json",
                 f"ci-targets/{args.run_id}/snapshot.tar.gz",
             ):
                 scope = (

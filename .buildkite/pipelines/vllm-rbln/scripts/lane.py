@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared perf and lm-eval target snapshots, device budgets, commands, and results."""
+"""Shared CI target snapshots, device budgets, commands, and results."""
 
 from __future__ import annotations
 
@@ -34,6 +34,7 @@ from typing import Any
 
 import yaml
 
+_TARGET_DIRS = ("perf", "lm-eval", "sampler-perf")
 _RSD_ENV = "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK"
 _RSD_SERVE = "rbln_num_devices_per_local_rank"
 _PARALLEL_KEYS = (
@@ -163,7 +164,7 @@ def load_targets(directory: Path, chip: str, lane: str) -> dict[str, Any]:
 
 def restore_ci_targets(directory: Path) -> dict[str, Any]:
     with tarfile.open(directory / "snapshot.tar.gz") as archive:
-        for name in ("perf", "lm-eval"):
+        for name in _TARGET_DIRS:
             if (directory / name).exists():
                 shutil.rmtree(directory / name)
         archive.extractall(directory, filter="data")
@@ -619,8 +620,7 @@ def main() -> int:
                 "--format=tar",
                 f"--output={archive_path}",
                 resolved,
-                "perf",
-                "lm-eval",
+                *_TARGET_DIRS,
             ],
             check=True,
         )
@@ -629,10 +629,24 @@ def main() -> int:
             archive.extractall(content, filter="data")
         for name in ("perf", "lm-eval"):
             load_targets(content / name, args.chip, name)
+        subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).with_name("sampler-perf") / "run_benchmarks.py"),
+                "--config",
+                str(content / "sampler-perf" / "benchmark-configs.yaml"),
+                "--output-dir",
+                str(checkout / "sampler-validation"),
+                "--dry-run",
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
         manifest = snapshot / "source.json"
         manifest.write_text(json.dumps(source, indent=2) + "\n")
         with tarfile.open(snapshot / "snapshot.tar.gz", "w:gz") as archive:
-            for name in ("perf", "lm-eval"):
+            for name in _TARGET_DIRS:
                 archive.add(content / name, arcname=name)
             archive.add(manifest, arcname="source.json")
     restore_ci_targets(snapshot)
