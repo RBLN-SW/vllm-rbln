@@ -31,6 +31,7 @@ from vllm.model_executor.models.gemma4_mm import (
     Gemma4MultiModalProcessor,
     Gemma4ProcessingInfo,
     Gemma4VideoInputs,
+    _get_max_soft_tokens,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
@@ -114,6 +115,31 @@ class _RBLNGemma4VisionEncoder(nn.Module):
         return self.embed_vision(inputs_embeds=pooled.to(dtype))
 
 
+def mm_soft_token_cap(vllm_config: VllmConfig) -> int:
+    """The most soft tokens an image may take: the engine's max_soft_tokens,
+    else the HF image processor's own. Encoder and image prefill compile to it.
+    """
+    model_config = vllm_config.model_config
+    info = MULTIMODAL_REGISTRY.create_processor(model_config).info
+    cap, _ = _get_max_soft_tokens(info.ctx.get_merged_mm_kwargs({}))
+    if cap is None:
+        cap = info.get_hf_processor().image_processor.max_soft_tokens
+        # Upstream counts an image without max_soft_tokens at
+        # default_output_length, while HF sizes it by its processor.
+        default = model_config.hf_config.vision_config.default_output_length
+        if cap != default:
+            raise ValueError(
+                f"vision_config.default_output_length={default} differs from "
+                f"the image processor's max_soft_tokens={cap}; set the budget "
+                "with --mm-processor-kwargs '{\"max_soft_tokens\": N}' instead."
+            )
+    if cap not in _SUPPORTED_SOFT_TOKENS:
+        raise ValueError(
+            f"max_soft_tokens={cap} is not one of {_SUPPORTED_SOFT_TOKENS}."
+        )
+    return cap
+
+
 @MULTIMODAL_REGISTRY.register_processor(
     Gemma4MultiModalProcessor,
     info=Gemma4ProcessingInfo,
@@ -124,11 +150,11 @@ class RBLNGemma4ForConditionalGeneration(
 ):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-        vision_config = self.config.vision_config
         # Every image or frame is padded to the patches of the largest soft
         # token budget this deployment allows, one compiled encoder shape.
+        self.mm_soft_token_cap = mm_soft_token_cap(vllm_config)
         self.mm_encoder_num_patches = (
-            vision_config.default_output_length * vision_config.pooling_kernel_size**2
+            self.mm_soft_token_cap * self.config.vision_config.pooling_kernel_size**2
         )
         self._mm_encoder: Callable[..., torch.Tensor] | None
         object.__setattr__(self, "_mm_encoder", None)
@@ -137,12 +163,11 @@ class RBLNGemma4ForConditionalGeneration(
         # One length per soft token budget the processor may emit, rounded up
         # to the 128-token tiles optimum-rbln compiles image prefill at. Video
         # frames use the smallest budget.
-        cap = self.config.vision_config.default_output_length
         return sorted(
             {
                 (budget + 127) // 128 * 128
                 for budget in _SUPPORTED_SOFT_TOKENS
-                if budget <= cap
+                if budget <= self.mm_soft_token_cap
             }
         )
 

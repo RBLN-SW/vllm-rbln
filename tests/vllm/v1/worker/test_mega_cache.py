@@ -113,6 +113,18 @@ class TestSignatureComposition:
         static = mega_cache.config_signature(_stub_config())
         assert dynamic != static
 
+    def test_mm_processor_kwargs_invalidate(self):
+        # compute_hash() leaves them out, but Gemma4 compiles its vision
+        # encoder and image prefill to the max_soft_tokens they carry.
+        def signature(kwargs):
+            config = _stub_config()
+            config.model_config.multimodal_config = SimpleNamespace(
+                mm_processor_kwargs=kwargs
+            )
+            return mega_cache.config_signature(config)
+
+        assert signature({"max_soft_tokens": 70}) != signature({"max_soft_tokens": 280})
+
 
 # Variables the built graph depends on and RBLNConfig does not carry, so this
 # is the only route into the key. What has to survive is the round trip through
