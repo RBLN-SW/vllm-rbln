@@ -33,10 +33,8 @@ from . import utils
 from .utils import (
     assert_samples_match,
     build_input_batch,
-    draw,
     expected_probs,
     make_logits,
-    min_margin_logits,
     weighted_token_ids,
 )
 
@@ -63,19 +61,18 @@ def op_args(sampler) -> list[tuple[torch.Tensor, torch.Tensor]]:
     return recorded
 
 
-def near_tied_logits() -> torch.Tensor:
-    """Two rows whose top two logits are almost equal.
-
-    Under the previous encoding -- dividing a greedy row by 1e-3 to collapse its
-    softmax toward a one-hot -- a gap this small survives the scaling (0.0001 *
-    1000 = 0.1), leaving the argmax only ~52% likely. Narrowing the candidate
-    set instead makes the outcome exact.
-    """
-    logits = torch.full((2, VOCAB_SIZE), -100.0)
-    logits[0, 4] = 10.0
-    logits[0, 6] = 10.0001  # row 0 argmax
-    logits[1, 1] = 10.0001  # row 1 argmax
-    logits[1, 5] = 10.0
+def near_tied_logits(
+    top_token: int,
+    second_token: int,
+    vocab_size: int = utils.VOCAB_SIZE,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """A row where `top_token` beats `second_token` by one ulp of `dtype`, the
+    smallest margin a greedy row must still resolve."""
+    logits = torch.full((vocab_size,), -100.0, dtype=dtype)
+    logits[second_token] = 10.0
+    # Values in [8, 16) sit 8 * eps apart.
+    logits[top_token] = 10.0 + 8 * torch.finfo(dtype).eps
     return logits
 
 
@@ -83,10 +80,22 @@ def test_all_greedy_batch_takes_the_argmax_op(sampler, op_args):
     """`rbln::argmax` must resolve the near tie exactly."""
     greedy = SamplingParams(temperature=0.0)
     metadata = build_input_batch(
-        [("0", greedy), ("1", greedy)], VOCAB_SIZE
+        requests=[("0", greedy), ("1", greedy)], vocab_size=VOCAB_SIZE
     ).sampling_metadata
+    # float32, where a one-ulp gap divided by a small temperature is still a
+    # near tie, so only an exact argmax passes.
+    logits = torch.stack(
+        [
+            near_tied_logits(
+                top_token=6, second_token=4, vocab_size=VOCAB_SIZE, dtype=torch.float32
+            ),
+            near_tied_logits(
+                top_token=1, second_token=5, vocab_size=VOCAB_SIZE, dtype=torch.float32
+            ),
+        ]
+    )
 
-    sampled, _ = sampler.sample(near_tied_logits(), metadata)
+    sampled, _ = sampler.sample(logits, metadata)
 
     # An all-greedy batch skips the top-k/top-p op entirely.
     assert op_args == []
@@ -96,9 +105,8 @@ def test_all_greedy_batch_takes_the_argmax_op(sampler, op_args):
 ########################### sampled distributions ###########################
 # Every row shares one logits row: WEIGHTED[i] weighs i + 1, the tail holds 1%.
 ROWS = 256
-WEIGHTED = weighted_token_ids(32).tolist()
+WEIGHTED = weighted_token_ids(num_weighted=32).tolist()
 TAIL_TOKEN = 1
-# NPU draws are cheap, so each `draw()` runs the sampler this many times.
 LAUNCHES = 40
 
 
@@ -109,25 +117,23 @@ def sample(
     sampler: Callable[[torch.Tensor, SamplingMetadata], SamplerOutput] | None = None,
     **request_kwargs: Any,
 ) -> torch.Tensor:
-    """Draw from a compiled `RBLNSampler`, or from `sampler`, which wraps one as
-    the runner does."""
+    """Token ids shaped (launches, rows), drawn from `sampler`,
+    which wraps one as the runner does."""
     device = current_platform.device_type
     metadata = build_input_batch(
-        [(str(i), p) for i, p in enumerate(params)],
+        requests=[(str(i), p) for i, p in enumerate(params)],
         device=device,
         **request_kwargs,
     ).sampling_metadata
     logits = logits.contiguous().to(device)
-    return draw(sampler or RBLNSampler(), logits, metadata, launches)
-
-
-def with_bad_words_token_ids(
-    bad_words_token_ids: list[list[int]], **kwargs: Any
-) -> SamplingParams:
-    params = SamplingParams(**kwargs)
-    # The tokenizer normally fills this in from `bad_words`.
-    params._bad_words_token_ids = bad_words_token_ids
-    return params
+    sampler = sampler or RBLNSampler()
+    # A fresh copy per launch, since the sampler scales `logits` in place.
+    return torch.stack(
+        [
+            sampler(logits.clone(), metadata).sampled_token_ids.view(-1).cpu()
+            for _ in range(launches)
+        ]
+    )
 
 
 def npu_top_k_top_p(
@@ -195,9 +201,12 @@ DISTRIBUTION_CASES = [
         ),
         "allowed_token_ids_top_p_min_p",
     ),
+    # The tokenizer normally fills `_bad_words_token_ids` in from `bad_words`.
     case(
-        with_bad_words_token_ids(
-            [[WEIGHTED[31]], [WEIGHTED[28]]], top_p=0.9, min_p=0.05
+        SamplingParams(
+            _bad_words_token_ids=[[WEIGHTED[31]], [WEIGHTED[28]]],
+            top_p=0.9,
+            min_p=0.05,
         ),
         "bad_words_top_p_min_p",
     ),
@@ -214,42 +223,44 @@ DISTRIBUTION_CASES = [
 @pytest.mark.parametrize(("params", "request_kwargs"), DISTRIBUTION_CASES)
 @pytest.mark.use_device
 def test_sampled_distribution(params, request_kwargs):
-    row = make_logits(range(1, 33))
+    row = make_logits(weights=range(1, 33))
     expected = expected_probs(
-        row.unsqueeze(0),
-        [params],
+        logits=row.unsqueeze(0),
+        params=[params],
         top_k_top_p=npu_top_k_top_p,
         **request_kwargs,
     )[0]
 
-    samples = sample(row.expand(ROWS, -1), [params] * ROWS, **request_kwargs)
+    samples = sample(
+        logits=row.expand(ROWS, -1), params=[params] * ROWS, **request_kwargs
+    )
 
-    assert_samples_match(samples, expected)
+    assert_samples_match(samples=samples, probs=expected)
 
 
 @pytest.mark.use_device
 def test_structured_output_mask_with_top_p_min_p():
     """A token masked to -inf must never come back, whatever the filters keep."""
-    row = make_logits(range(1, 33))
+    row = make_logits(weights=range(1, 33))
     row[[WEIGHTED[31], WEIGHTED[30], *range(WEIGHTED[0] + 1, WEIGHTED[1])]] = float(
         "-inf"
     )
     params = SamplingParams(top_p=0.9, min_p=0.05)
-    expected = expected_probs(row.unsqueeze(0), [params])[0]
+    expected = expected_probs(logits=row.unsqueeze(0), params=[params])[0]
 
-    samples = sample(row.expand(ROWS, -1), [params] * ROWS)
+    samples = sample(logits=row.expand(ROWS, -1), params=[params] * ROWS)
 
-    assert_samples_match(samples, expected)
+    assert_samples_match(samples=samples, probs=expected)
 
 
 @pytest.mark.use_device
 def test_mixed_batch_keeps_each_row_to_its_own_params():
     """One op call serves the mixed batch, greedy rows as top_k=1. Each row must
     keep its own distribution."""
-    weighted_row = make_logits(range(1, 33))
+    weighted_row = make_logits(weights=range(1, 33))
     groups = [
         (
-            min_margin_logits(WEIGHTED[20], WEIGHTED[5]),
+            near_tied_logits(top_token=WEIGHTED[20], second_token=WEIGHTED[5]),
             SamplingParams(temperature=0.0),
         ),
         (weighted_row, SamplingParams(temperature=1.0)),
@@ -274,25 +285,27 @@ def test_mixed_batch_keeps_each_row_to_its_own_params():
     logits = torch.stack([row for row, _ in groups for _ in range(per_group)])
     params = [p for _, p in groups for _ in range(per_group)]
     expected = expected_probs(
-        torch.stack([row for row, _ in groups]),
-        [p for _, p in groups],
+        logits=torch.stack([row for row, _ in groups]),
+        params=[p for _, p in groups],
         **history,
     )
 
-    samples = sample(logits, params, **history)
+    samples = sample(logits=logits, params=params, **history)
 
     for g, probs in enumerate(expected):
-        assert_samples_match(samples[:, g * per_group : (g + 1) * per_group], probs)
+        assert_samples_match(
+            samples=samples[:, g * per_group : (g + 1) * per_group], probs=probs
+        )
 
 
 @pytest.mark.use_device
 def test_padded_bucket_keeps_live_rows_to_their_params():
     """Padding the metadata with copies of the last live row must not change
     any live row's distribution."""
-    weighted_row = make_logits(range(1, 33))
+    weighted_row = make_logits(weights=range(1, 33))
     groups = [
         (
-            min_margin_logits(WEIGHTED[20], WEIGHTED[5]),
+            near_tied_logits(top_token=WEIGHTED[20], second_token=WEIGHTED[5]),
             SamplingParams(temperature=0.0),
         ),
         (weighted_row, SamplingParams(temperature=1.5, min_p=0.3)),
@@ -307,7 +320,8 @@ def test_padded_bucket_keeps_live_rows_to_their_params():
         + [weighted_row] * (ROWS - num_reqs)
     )
     expected = expected_probs(
-        torch.stack([row for row, _ in groups]), [p for _, p in groups]
+        logits=torch.stack([row for row, _ in groups]),
+        params=[p for _, p in groups],
     )
 
     sampler = RBLNSampler()
@@ -316,11 +330,13 @@ def test_padded_bucket_keeps_live_rows_to_their_params():
         out = sampler(logits, _pad_sampling_metadata(metadata, ROWS))
         return _depad_sampler_output(out, num_reqs)
 
-    samples = sample(logits, params, sampler=padded)
+    samples = sample(logits=logits, params=params, sampler=padded)
 
     assert samples.shape[1] == num_reqs
     for g, probs in enumerate(expected):
-        assert_samples_match(samples[:, g * per_group : (g + 1) * per_group], probs)
+        assert_samples_match(
+            samples=samples[:, g * per_group : (g + 1) * per_group], probs=probs
+        )
 
 
 ########################### pairwise exact sampling ###########################
@@ -359,7 +375,7 @@ def exact_case(
     structured: bool = False,
     mixed: bool = False,
 ):
-    kwargs: dict[str, Any] = dict(
+    params = SamplingParams(
         temperature=temperature,
         top_k=top_k,
         top_p=top_p,
@@ -371,11 +387,7 @@ def exact_case(
         allowed_token_ids=[B, C, D] if allowed else None,
         min_tokens=4 if min_tokens else 0,
         stop_token_ids=[B] if min_tokens else None,
-    )
-    params = (
-        with_bad_words_token_ids([[C]], **kwargs)
-        if bad_words
-        else SamplingParams(**kwargs)
+        _bad_words_token_ids=[[C]] if bad_words else None,
     )
     return pytest.param(params, structured, mixed, id=id)
 
@@ -462,18 +474,20 @@ EXACT_CASES = [
 def test_sample_only_the_winner(params, structured, mixed):
     """Where the parameters leave one candidate, every draw must be it. A mixed
     row shares the batch with a row of the opposite kind."""
-    row = exact_logits(structured)
+    row = exact_logits(structured=structured)
     if params.temperature == 0.0:
         sibling = SamplingParams(temperature=1.0, top_k=1)
     else:
         sibling = SamplingParams(temperature=0.0)
     groups = [params, sibling] if mixed else [params]
     per_group = ROWS // len(groups)
-    expected = expected_probs(row.expand(len(groups), -1), groups, **EXACT_HISTORY)
+    expected = expected_probs(
+        logits=row.expand(len(groups), -1), params=groups, **EXACT_HISTORY
+    )
 
     samples = sample(
-        row.expand(ROWS, -1),
-        [p for p in groups for _ in range(per_group)],
+        logits=row.expand(ROWS, -1),
+        params=[p for p in groups for _ in range(per_group)],
         launches=2,
         **EXACT_HISTORY,
     )

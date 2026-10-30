@@ -232,13 +232,13 @@ def test_greedy_request_of_a_mixed_batch_carries_neutral_top_k_top_p():
     # The greedy request asks for both filters; the random ones are what make
     # vLLM materialize the per-request tensors for the whole batch.
     input_batch = build_input_batch(
-        [
+        requests=[
             ("greedy", SamplingParams(temperature=0.0, top_k=4, top_p=0.5)),
             ("random_top_k", SamplingParams(temperature=1.0, top_k=4)),
             ("random_top_p", SamplingParams(temperature=1.0, top_p=0.9)),
         ],
-        VOCAB_SIZE,
-        DEVICE,
+        vocab_size=VOCAB_SIZE,
+        device=DEVICE,
     )
 
     metadata = input_batch.sampling_metadata
@@ -274,7 +274,9 @@ ROW_KINDS = [
 def test_every_row_kind_gets_its_own_top_k_top_p():
     """All five kinds in one batch, since the op reads k/p per row."""
     input_batch = build_input_batch(
-        [(name, params) for name, params, _, _ in ROW_KINDS], VOCAB_SIZE, DEVICE
+        requests=[(name, params) for name, params, _, _ in ROW_KINDS],
+        vocab_size=VOCAB_SIZE,
+        device=DEVICE,
     )
 
     top_k, top_p = build_op_top_k_top_p(

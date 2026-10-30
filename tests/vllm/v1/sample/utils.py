@@ -15,13 +15,10 @@
 import math
 from collections.abc import Callable, Sequence
 from types import SimpleNamespace
-from typing import Any
 
 import torch
 from vllm.sampling_params import _SAMPLING_EPS, SamplingParams
-from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
-from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
@@ -52,23 +49,24 @@ def create_allowed_token_ids(
     return mask
 
 
-def make_input_batch(
-    max_num_reqs: int,
+def build_input_batch(
+    requests: Sequence[tuple[str, SamplingParams]],
     vocab_size: int = VOCAB_SIZE,
     device: torch.device | str = "cpu",
     *,
-    cls: type[InputBatch] = InputBatch,
     build: Callable[..., LogitsProcessors] = build_rbln_logitsprocs,
-    **cls_kwargs: Any,
+    prompt_token_ids: Sequence[int] = (1, 2, 3),
+    output_token_ids: Sequence[int] = (),
 ) -> InputBatch:
-    """An empty `cls` with the logits processors `build` makes."""
+    """Feed real `SamplingParams` through an `InputBatch`, as the runner does.
+    Every request shares one prompt and one output so far."""
     device = torch.device(device)
     vllm_config = SimpleNamespace(
-        scheduler_config=SimpleNamespace(max_num_seqs=max_num_reqs),
+        scheduler_config=SimpleNamespace(max_num_seqs=len(requests)),
         speculative_config=None,
     )
-    return cls(
-        max_num_reqs=max_num_reqs,
+    input_batch = InputBatch(
+        max_num_reqs=len(requests),
         max_model_len=64,
         max_num_batched_tokens=64,
         device=device,
@@ -77,18 +75,7 @@ def make_input_batch(
         kernel_block_sizes=[16],
         max_num_blocks_per_req=[4],
         logitsprocs=build(vllm_config, device, False, False),
-        **cls_kwargs,
     )
-
-
-def add_requests(
-    input_batch: InputBatch,
-    requests: Sequence[tuple[str, SamplingParams]],
-    *,
-    prompt_token_ids: Sequence[int] = (1, 2, 3),
-    output_token_ids: Sequence[int] = (),
-) -> None:
-    """Every request shares one prompt and one output so far."""
     for req_id, params in requests:
         input_batch.add_request(
             CachedRequestState(
@@ -103,19 +90,6 @@ def add_requests(
                 output_token_ids=list(output_token_ids),
             )
         )
-
-
-def build_input_batch(
-    requests: Sequence[tuple[str, SamplingParams]],
-    vocab_size: int = VOCAB_SIZE,
-    device: torch.device | str = "cpu",
-    *,
-    build: Callable[..., LogitsProcessors] = build_rbln_logitsprocs,
-    **request_kwargs: Any,
-) -> InputBatch:
-    """Feed real `SamplingParams` through an `InputBatch`, as the runner does."""
-    input_batch = make_input_batch(len(requests), vocab_size, device, build=build)
-    add_requests(input_batch, requests, **request_kwargs)
     input_batch.refresh_metadata()
     return input_batch
 
@@ -138,20 +112,10 @@ def make_logits(
     total_weight = sum(weights)
     num_tail = vocab_size - len(weights)
     logits.fill_(math.log(tail_mass / (1.0 - tail_mass) * total_weight / num_tail))
-    logits[weighted_token_ids(len(weights), vocab_size)] = torch.tensor(
-        weights, dtype=torch.float64
-    ).log()
+    logits[weighted_token_ids(num_weighted=len(weights), vocab_size=vocab_size)] = (
+        torch.tensor(weights, dtype=torch.float64).log()
+    )
     return logits.to(dtype)
-
-
-def min_margin_logits(
-    argmax: int, second: int, vocab_size: int = VOCAB_SIZE
-) -> torch.Tensor:
-    """A bf16 row where `argmax` beats `second` by one ulp, the smallest margin."""
-    logits = torch.full((vocab_size,), -100.0, dtype=torch.bfloat16)
-    logits[second] = 10.0
-    logits[argmax] = 10.0625
-    return logits
 
 
 def expected_probs(
@@ -168,8 +132,8 @@ def expected_probs(
     filter for a kernel that cuts differently."""
     logits = logits.to("cpu", torch.float32, copy=True)
     metadata = build_input_batch(
-        [(str(i), p) for i, p in enumerate(params)],
-        logits.shape[-1],
+        requests=[(str(i), p) for i, p in enumerate(params)],
+        vocab_size=logits.shape[-1],
         build=build_logitsprocs,
         **request_kwargs,
     ).sampling_metadata
@@ -189,22 +153,6 @@ def expected_probs(
     probs = top_k_top_p(logits, metadata.top_k, metadata.top_p).softmax(dim=-1)
     is_greedy = (metadata.temperature < _SAMPLING_EPS).unsqueeze(dim=1)
     return torch.where(is_greedy, greedy, probs)
-
-
-def draw(
-    sampler: Callable[[torch.Tensor, SamplingMetadata], SamplerOutput],
-    logits: torch.Tensor,
-    metadata: SamplingMetadata,
-    num_launches: int,
-) -> torch.Tensor:
-    """Token ids from `num_launches` runs, shaped (num_launches, rows). Each run
-    gets a fresh copy, since the sampler scales `logits` in place."""
-    return torch.stack(
-        [
-            sampler(logits.clone(), metadata).sampled_token_ids.view(-1).cpu()
-            for _ in range(num_launches)
-        ]
-    )
 
 
 def assert_samples_match(

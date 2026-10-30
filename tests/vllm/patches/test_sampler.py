@@ -25,7 +25,7 @@ from tests.vllm.v1.sample.utils import build_input_batch
 def test_reference_sampler_filters_without_triton(top_k, top_p):
     params = SamplingParams(temperature=1.0, top_k=top_k, top_p=top_p, logprobs=1)
     metadata = build_input_batch(
-        [("0", params)], vocab_size=4, build=build_logitsprocs
+        requests=[("0", params)], vocab_size=4, build=build_logitsprocs
     ).sampling_metadata
     logits = torch.tensor([[0.0, 1.0, 2.0, 3.0]])
     expected_logprob = logits.log_softmax(dim=-1)[:, 3]

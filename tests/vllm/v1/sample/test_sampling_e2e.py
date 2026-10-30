@@ -188,11 +188,13 @@ def test_first_token_distribution_matches_upstream(runner, params):
     raw = torch.full((vocab_size,), float("-inf"))
     for token_id, logprob in completion.logprobs[0].items():
         raw[token_id] = logprob.logprob
-    expected = expected_probs(raw.unsqueeze(0), [params])[0]
+    expected = expected_probs(logits=raw.unsqueeze(0), params=[params])[0]
 
     completions = generate(runner, [PROMPT] * NUM_SAMPLES, params)
 
-    assert_samples_match(torch.tensor([c.token_ids[0] for c in completions]), expected)
+    assert_samples_match(
+        samples=torch.tensor([c.token_ids[0] for c in completions]), probs=expected
+    )
 
 
 # The grammar fixes the first token to "x", so the digit after it comes from a
@@ -231,11 +233,13 @@ def test_decode_distribution_holds_in_a_mixed_batch(runner, kwargs):
     for token_id, logprob in completion.logprobs[1].items():
         raw[token_id] = logprob.logprob
     measured = SamplingParams(structured_outputs=X_THEN_DIGIT, max_tokens=2, **kwargs)
-    expected = expected_probs(raw.unsqueeze(0), [measured])[0]
+    expected = expected_probs(logits=raw.unsqueeze(0), params=[measured])[0]
     params = [measured, measured, *NEIGHBORS] * (NUM_SAMPLES // 2)
 
     completions = generate(runner, [PROMPT] * len(params), params)
 
     digits = [c for c, p in zip(completions, params) if p is measured]
     assert {c.token_ids[0] for c in digits} == {completion.token_ids[0]}
-    assert_samples_match(torch.tensor([c.token_ids[1] for c in digits]), expected)
+    assert_samples_match(
+        samples=torch.tensor([c.token_ids[1] for c in digits]), probs=expected
+    )
