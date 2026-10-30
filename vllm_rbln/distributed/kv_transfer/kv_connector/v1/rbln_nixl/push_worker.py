@@ -99,6 +99,9 @@ class OfferedBlocks(tuple):
     #: record when the blocks are about to be reused, so a list whose number no
     #: live record carries is one the writer must not send.
     serial: int
+    #: Completes when the forwards that wrote these blocks do. The writer waits
+    #: on it before reading them, so the engine thread never has to.
+    done: "torch.rbln.Event | None"
 
     def __new__(
         cls,
@@ -107,6 +110,7 @@ class OfferedBlocks(tuple):
         serial: int,
         *,
         handover: bool = False,
+        done: "torch.rbln.Event | None" = None,
     ) -> "OfferedBlocks":
         if groups and not isinstance(groups[0], (list, tuple)):
             # Upstream rebuilds a flat list as a plain tuple of one group
@@ -123,6 +127,7 @@ class OfferedBlocks(tuple):
         self.offered_tokens = offered_tokens
         self.handover = handover
         self.serial = serial
+        self.done = done
         return self
 
 
@@ -166,7 +171,7 @@ class _StreamedSend:
     and `failed` cross between the two, and every access to those is under
     `_sending_transfers_lock`. `total` crosses unlocked, every write of it
     being the same value; `serial` never changes once the record is built. The
-    three `pending_offer` fields are the engine thread's.
+    three `pending_offer` fields and `released_done` are the engine thread's.
     """
 
     # Blocks this rank has closed, held for the next step to hand over. None
@@ -181,6 +186,9 @@ class _StreamedSend:
     # Whether the writer has been told about this request at all. Not derivable
     # from `pending_offer`: an aborted offer clears that without ever releasing.
     released: bool = False
+    # The event of the last offer handed to the writer. The handover carries it,
+    # because a parked handover replaces that offer and would drop its wait.
+    released_done: "torch.rbln.Event | None" = None
     # Blocks the request will hold once its whole prompt is computed, which is
     # what places the consumer's window inside our list.
     total: int | None = None
@@ -360,7 +368,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                 # Marked on the list because that is what survives the fold,
                 # riding through the parking to the batch that carries it.
                 metadata.push_finished_blocks[req_id] = OfferedBlocks(
-                    blocks, 0, send.serial, handover=True
+                    blocks, 0, send.serial, handover=True, done=send.released_done
                 )
 
     def start_early_push(self, metadata: "RblnNixlConnectorMetadata") -> None:
@@ -374,7 +382,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         Held rather than handed over, because the forward that produced the KV
         completes asynchronously: a write issued from here would read KV still
         being written, silently -- the transfer reports no error. The event
-        recorded here is what `release_early_offers` waits on before releasing.
+        recorded here rides the offer, and the writer waits on it before reading.
 
         Called from `wait_for_save` rather than the completion hook so the copy
         for the step is already done: speculative decoding on the last stage
@@ -398,12 +406,14 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
     def release_early_offers(self) -> None:
         """Hand the previous step's held offers to the writer.
 
-        Waits for the device work behind an offer before letting it go. Called
-        from the connector's flush site, past the submission that work retires
-        behind, so the wait is a check rather than a stall, and ahead of the
-        handover, so a request whose handover lands on this step is written by
-        its offer too. Every offer goes on the step that reaches here --
-        `_seal_at_handover` marks only what has been released.
+        The device work behind an offer travels with it, and the writer waits
+        on it. Waiting here, at the start of the next step, would hold the
+        engine thread until the previous forward finished, so the next step
+        could not be prepared while it ran and the NPU would idle for that
+        preparation. Called ahead of the handover, so a request whose handover lands
+        on this step is written by its offer too. Every offer goes on the step
+        that reaches here -- `_seal_at_handover` marks only what has been
+        released.
 
         What guarantees a next step: an unfinished request keeps the engine
         stepping, and a finished one keeps it stepping on the connector's
@@ -415,7 +425,10 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                 req_id,
                 send,
                 OfferedBlocks(
-                    send.pending_offer, send.pending_offer_tokens, send.serial
+                    send.pending_offer,
+                    send.pending_offer_tokens,
+                    send.serial,
+                    done=send.pending_offer_done,
                 ),
             )
             for req_id, send in self._streamed.items()
@@ -427,9 +440,8 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
             for _, send, _ in offers:
                 send.released = True
         for req_id, send, block_ids in offers:
-            done = send.pending_offer_done
-            assert done is not None
-            done.synchronize()
+            assert block_ids.done is not None
+            send.released_done = block_ids.done
             send.pending_offer = None
             send.pending_offer_tokens = 0
             send.pending_offer_done = None
@@ -799,6 +811,11 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         in one go.
         """
         assert meta.remote is not None and self.transfer_topo is not None
+        # Before the guard below, so a request dropped while this waits is
+        # still refused.
+        done = getattr(meta.local_block_ids, "done", None)
+        if done is not None:
+            done.synchronize()
         with self._sending_transfers_lock:
             send = self._streamed.get(req_id)
             serial = getattr(meta.local_block_ids, "serial", None)

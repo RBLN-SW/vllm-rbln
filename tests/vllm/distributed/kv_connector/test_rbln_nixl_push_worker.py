@@ -1306,6 +1306,49 @@ class TestStreamedEngineHandleWrite:
         call = worker.nixl_wrapper.make_prepped_xfer.call_args
         return list(call.args[2]), call.kwargs["notif_msg"]
 
+    def _offer_with_work(self, worker, on_wait):
+        meta = self._offer(worker, ([0, 1, 2, 3], [7]), ([4, 5], [6]), 16)
+        meta.local_block_ids = pw.OfferedBlocks(
+            meta.local_block_ids,
+            16,
+            worker._streamed["r0"].serial,
+            done=SimpleNamespace(synchronize=on_wait),
+        )
+        return meta
+
+    def test_the_writer_waits_for_the_offer_s_work_before_its_guard(self):
+        # The engine thread no longer waits, so this wait is the only thing
+        # between a block the forward is still writing and a silent bad write.
+        order = []
+        worker = self._worker()
+        lock = worker._sending_transfers_lock
+
+        class Recording:
+            def __enter__(self):
+                order.append("guard")
+                return lock.__enter__()
+
+            def __exit__(self, *exc):
+                return lock.__exit__(*exc)
+
+        worker._sending_transfers_lock = Recording()
+        meta = self._offer_with_work(worker, lambda: order.append("wait"))
+
+        worker._xfer_blocks_for_req("r0", meta)
+
+        assert order[:2] == ["wait", "guard"]
+        assert worker.nixl_wrapper.make_prepped_xfer.called
+
+    def test_a_request_dropped_during_the_wait_is_refused(self):
+        # A preemption can drop the record while the writer waits; its blocks
+        # then hold the re-prefill, so nothing may leave for the old list.
+        worker = self._worker()
+        meta = self._offer_with_work(worker, lambda: worker._streamed.pop("r0"))
+
+        worker._xfer_blocks_for_req("r0", meta)
+
+        assert not worker.nixl_wrapper.make_prepped_xfer.called
+
     def test_a_write_with_no_range_carries_the_bare_notification(self):
         # A request written in one transfer has no range to name, and the
         # consumer settles it on upstream's own count -- so what reaches it is
@@ -2012,29 +2055,47 @@ class TestEarlySend:
 
         assert recorded == []
 
-    def test_the_offer_waits_for_that_work_before_the_writer_sees_it(self, monkeypatch):
-        # The writer reads the blocks straight out of device memory and reports
-        # no error when they are still being written, so the wait is the only
-        # thing standing between a half-written block and a silent bad transfer.
+    @staticmethod
+    def _recording_event(order, name="wait"):
+        return SimpleNamespace(
+            record=lambda _stream: None, synchronize=lambda: order.append(name)
+        )
+
+    def test_the_offer_carries_its_work_to_the_writer_unwaited(self, monkeypatch):
+        # Waiting here would hold the engine thread until the forward had wholly
+        # retired, so the next step's launch could no longer overlap its tail.
         order = []
         monkeypatch.setattr(
-            pw.torch.rbln,
-            "Event",
-            lambda: SimpleNamespace(
-                record=lambda _stream: None,
-                synchronize=lambda: order.append("wait"),
-            ),
+            pw.torch.rbln, "Event", lambda: self._recording_event(order)
         )
         worker = self._worker()
         worker.start_early_push(self._meta(saves=["r0"]))
-        monkeypatch.setattr(
-            worker._finished_blocks_inbox, "put", lambda item: order.append("hand")
-        )
+        event = worker._streamed["r0"].pending_offer_done
 
         worker.release_early_offers()
 
-        assert order == ["wait", "hand"]
+        _, blocks = worker._finished_blocks_inbox.get_nowait()
+        assert order == []
+        assert blocks.done is event
         assert worker._streamed["r0"].pending_offer_done is None
+
+    def test_the_handover_carries_the_last_released_offer_s_work(self, monkeypatch):
+        # A parked handover replaces the offer ahead of it, so the offer's wait
+        # has to ride the handover too, or a fold writes blocks still in flight.
+        monkeypatch.setattr(pw.torch.rbln, "Event", lambda: self._recording_event([]))
+        worker = self._worker()
+        worker.start_early_push(self._meta(saves=["r0"]))
+        event = worker._streamed["r0"].pending_offer_done
+        worker.release_early_offers()
+        handover = self._meta(pushes=["r0"])
+        worker._seal_at_handover(handover)
+        for req_id, blocks in handover.push_finished_blocks.items():
+            worker._finished_blocks_inbox.put((req_id, blocks))
+
+        self._writer_matches_the_inbox(worker)
+
+        assert worker._push_finished_blocks["r0"].handover
+        assert worker._push_finished_blocks["r0"].done is event
 
     def test_a_step_that_closes_nothing_still_releases_what_is_held(self):
         # The release cannot wait for another closing chunk: steps that close
