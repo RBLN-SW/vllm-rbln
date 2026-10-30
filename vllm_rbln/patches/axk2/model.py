@@ -13,6 +13,7 @@ import torch
 from vllm.distributed import get_pp_group
 from vllm.forward_context import get_forward_context
 from vllm.sequence import IntermediateTensors
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 from vllm_rbln.patches.attention import _resolve_kv_cache
 from vllm_rbln.patches.axk2.loader import load_frozen_module
@@ -93,6 +94,7 @@ def _rbln_indexer_forward(
         self.topk_tokens,
         scale_cache,
         is_prompt_sorted=attn_metadata.is_prompt_sorted,
+        null_block_id=NULL_BLOCK_ID,
     )
 
 
