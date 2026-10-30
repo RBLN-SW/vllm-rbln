@@ -126,22 +126,18 @@ def test_one_query_len_per_soft_token_budget(cap, query_lens):
     assert model.get_mm_prefix_query_lens() == query_lens
 
 
-def _cap_config(monkeypatch, engine_kwargs, processor_default, default_output_length):
+def _processing_info(engine_kwargs, processor_default, default_output_length):
+    """Upstream's merge: the request's kwargs over the engine's."""
     image_processor = SimpleNamespace(max_soft_tokens=processor_default)
-    info = SimpleNamespace(
-        ctx=SimpleNamespace(get_merged_mm_kwargs=lambda kwargs: dict(engine_kwargs)),
-        get_hf_processor=lambda: SimpleNamespace(image_processor=image_processor),
-    )
-    monkeypatch.setattr(
-        gemma4.MULTIMODAL_REGISTRY,
-        "create_processor",
-        lambda model_config: SimpleNamespace(info=info),
-    )
     vision_config = SimpleNamespace(default_output_length=default_output_length)
     return SimpleNamespace(
-        model_config=SimpleNamespace(
-            hf_config=SimpleNamespace(vision_config=vision_config)
-        )
+        ctx=SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(vision_config=vision_config)
+            ),
+            get_merged_mm_kwargs=lambda kwargs: {**engine_kwargs, **kwargs},
+        ),
+        get_hf_processor=lambda: SimpleNamespace(image_processor=image_processor),
     )
 
 
@@ -153,26 +149,55 @@ def _cap_config(monkeypatch, engine_kwargs, processor_default, default_output_le
         ({"images_kwargs": {"max_soft_tokens": 1120}}, 1120),
     ],
 )
-def test_the_cap_is_the_engines_budget_else_the_processors(
-    monkeypatch, engine_kwargs, cap
-):
-    config = _cap_config(monkeypatch, engine_kwargs, 280, 280)
-    assert gemma4.mm_soft_token_cap(config) == cap
+def test_the_cap_is_the_engines_budget_else_the_processors(engine_kwargs, cap):
+    info = _processing_info(engine_kwargs, 280, 280)
+    assert gemma4.mm_soft_token_cap(info) == cap
 
 
-def test_a_default_output_length_the_processor_ignores_is_refused(monkeypatch):
+def test_a_default_output_length_the_processor_ignores_is_refused():
     # HF would cut a 280-token image that upstream counts as 70.
-    config = _cap_config(monkeypatch, {}, 280, 70)
+    info = _processing_info({}, 280, 70)
     with pytest.raises(ValueError, match="--mm-processor-kwargs"):
-        gemma4.mm_soft_token_cap(config)
-    config = _cap_config(monkeypatch, {"max_soft_tokens": 70}, 280, 70)
-    assert gemma4.mm_soft_token_cap(config) == 70
+        gemma4.mm_soft_token_cap(info)
+    info = _processing_info({"max_soft_tokens": 70}, 280, 70)
+    assert gemma4.mm_soft_token_cap(info) == 70
 
 
-def test_an_unsupported_budget_is_refused(monkeypatch):
-    config = _cap_config(monkeypatch, {"max_soft_tokens": 100}, 280, 280)
+def test_an_unsupported_budget_is_refused():
+    info = _processing_info({"max_soft_tokens": 100}, 280, 280)
     with pytest.raises(ValueError, match="not one of"):
-        gemma4.mm_soft_token_cap(config)
+        gemma4.mm_soft_token_cap(info)
+
+
+@pytest.mark.parametrize(
+    "num_images, request_kwargs, refused",
+    [
+        (1, {"max_soft_tokens": 560}, True),
+        (1, {"max_soft_tokens": 280}, False),
+        (1, {}, False),
+        # Video frames take their own budget whatever the request says.
+        (0, {"max_soft_tokens": 560}, False),
+    ],
+)
+def test_a_request_budget_above_the_cap_is_refused(
+    monkeypatch, num_images, request_kwargs, refused
+):
+    upstream = Mock(return_value="processed")
+    monkeypatch.setattr(
+        gemma4.Gemma4MultiModalProcessor, "_apply_hf_processor_main", upstream
+    )
+    processor = gemma4.RBLNGemma4MultiModalProcessor.__new__(
+        gemma4.RBLNGemma4MultiModalProcessor
+    )
+    processor.info = _processing_info({}, 280, 280)
+    items = SimpleNamespace(get_count=lambda modality, strict: num_images)
+
+    if refused:
+        with pytest.raises(ValueError, match="--mm-processor-kwargs"):
+            processor._apply_hf_processor_main(items, request_kwargs)
+        upstream.assert_not_called()
+    else:
+        assert processor._apply_hf_processor_main(items, request_kwargs) == "processed"
 
 
 def test_video_frames_are_regrouped_per_video(monkeypatch):
