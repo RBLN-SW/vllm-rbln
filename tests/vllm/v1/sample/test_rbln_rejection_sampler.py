@@ -80,18 +80,15 @@ def impl(monkeypatch) -> RBLNRejectionSamplerImpl:
 
 
 ########################### build_op_top_k_top_p ###########################
-def test_all_greedy():
+def test_all_greedy_is_rejected():
     metadata = make_sampling_metadata(
         temperature=None,
         all_greedy=True,
         all_random=False,
     )
 
-    top_k, top_p = build_op_top_k_top_p(metadata, 3, VOCAB_SIZE, DEVICE)
-
-    assert torch.equal(top_k, torch.tensor([GREEDY_TOP_K] * 3, dtype=torch.int32))
-    # Greedy is keyed on `top_k == 1` alone; the unused top-p is elided.
-    assert top_p is None
+    with pytest.raises(AssertionError):
+        build_op_top_k_top_p(metadata, 3, VOCAB_SIZE, DEVICE)
 
 
 def test_all_random_pure_multinomial():
