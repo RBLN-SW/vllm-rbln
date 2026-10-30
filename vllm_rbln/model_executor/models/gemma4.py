@@ -15,11 +15,13 @@
 """Gemma4 on the RBLN vLLM path: upstream's model, with its vision tower
 compiled and its image embeddings merged inside the compiled graph."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from functools import cached_property
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+from transformers import BatchFeature
 from transformers.models.gemma4.modeling_gemma4 import apply_multidimensional_rope
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
@@ -34,6 +36,7 @@ from vllm.model_executor.models.gemma4_mm import (
     _get_max_soft_tokens,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.parse import MultiModalDataItems
 from vllm.sequence import IntermediateTensors
 
 from vllm_rbln.model_executor.models.interfaces import SupportsRBLNMultiModal
@@ -115,12 +118,11 @@ class _RBLNGemma4VisionEncoder(nn.Module):
         return self.embed_vision(inputs_embeds=pooled.to(dtype))
 
 
-def mm_soft_token_cap(vllm_config: VllmConfig) -> int:
+def mm_soft_token_cap(info: Gemma4ProcessingInfo) -> int:
     """The most soft tokens an image may take: the engine's max_soft_tokens,
     else the HF image processor's own. Encoder and image prefill compile to it.
     """
-    model_config = vllm_config.model_config
-    info = MULTIMODAL_REGISTRY.create_processor(model_config).info
+    model_config = info.ctx.model_config
     cap, _ = _get_max_soft_tokens(info.ctx.get_merged_mm_kwargs({}))
     if cap is None:
         cap = info.get_hf_processor().image_processor.max_soft_tokens
@@ -140,8 +142,36 @@ def mm_soft_token_cap(vllm_config: VllmConfig) -> int:
     return cap
 
 
+class RBLNGemma4MultiModalProcessor(Gemma4MultiModalProcessor):
+    """Upstream's processor, refusing per request an image budget above the
+    one the vision encoder and image prefill compile to."""
+
+    @cached_property
+    def _mm_soft_token_cap(self) -> int:
+        return mm_soft_token_cap(self.info)
+
+    def _apply_hf_processor_main(
+        self,
+        mm_items: MultiModalDataItems,
+        hf_kwargs: Mapping[str, object],
+    ) -> BatchFeature:
+        # Video frames take a fixed budget of their own, below any cap.
+        if mm_items.get_count("image", strict=False):
+            budget, _ = _get_max_soft_tokens(
+                self.info.ctx.get_merged_mm_kwargs(hf_kwargs)
+            )
+            if isinstance(budget, int) and budget > self._mm_soft_token_cap:
+                raise ValueError(
+                    f"max_soft_tokens={budget} is above the engine's image budget "
+                    f"of {self._mm_soft_token_cap}, which the vision encoder and "
+                    "image prefill are compiled to; raise it with "
+                    "--mm-processor-kwargs at start-up."
+                )
+        return super()._apply_hf_processor_main(mm_items, hf_kwargs)
+
+
 @MULTIMODAL_REGISTRY.register_processor(
-    Gemma4MultiModalProcessor,
+    RBLNGemma4MultiModalProcessor,
     info=Gemma4ProcessingInfo,
     dummy_inputs=Gemma4DummyInputsBuilder,
 )
@@ -152,7 +182,9 @@ class RBLNGemma4ForConditionalGeneration(
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         # Every image or frame is padded to the patches of the largest soft
         # token budget this deployment allows, one compiled encoder shape.
-        self.mm_soft_token_cap = mm_soft_token_cap(vllm_config)
+        self.mm_soft_token_cap = mm_soft_token_cap(
+            MULTIMODAL_REGISTRY.create_processor(vllm_config.model_config).info
+        )
         self.mm_encoder_num_patches = (
             self.mm_soft_token_cap * self.config.vision_config.pooling_kernel_size**2
         )
