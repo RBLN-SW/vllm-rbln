@@ -14,9 +14,24 @@
 
 import torch
 from vllm.distributed import tensor_model_parallel_all_reduce
-from vllm.model_executor.models.qwen3_moe import Qwen3MoeSparseMoeBlock
+from vllm.model_executor.models.qwen3_moe import (
+    Qwen3MoeDecoderLayer,
+    Qwen3MoeSparseMoeBlock,
+)
 
+from vllm_rbln import envs
 from vllm_rbln.patches import register_patch
+
+if envs.VLLM_RBLN_USE_NESTED_COMPILE_REGION:
+    register_patch(
+        target="vllm.model_executor.models.qwen3_moe.Qwen3MoeDecoderLayer.forward",
+        owner_module=__name__,
+        reason=(
+            "Upstream Qwen3-MoE exposes no decoder compile-region hook. Preserve "
+            "decoder bodies for RBLN loop-compilation bring-up using "
+            "invoke_subgraph boundaries."
+        ),
+    )(torch.compiler.nested_compile_region(Qwen3MoeDecoderLayer.forward))
 
 
 @register_patch(

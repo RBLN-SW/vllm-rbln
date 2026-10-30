@@ -405,8 +405,9 @@ print("RESULT" + json.dumps(
 _NOTHING_APPLIED = {"imported": False, "applied": [], "applicable": []}
 
 
-def _load_plugins_in(**environ: str) -> dict[str, Any]:
-    """What the plugin entry point applied in a process started with ``environ``.
+def _load_plugins_in(probe: str = _PLUGIN_LOAD_PROBE, /, **environ: str) -> Any:
+    """What ``probe`` reports after the plugin entry point ran in a process
+    started with ``environ``.
 
     Every RBLN knob is dropped first, the resolved path included: this suite
     exports it, and inheriting it would answer the question the probe asks.
@@ -417,7 +418,7 @@ def _load_plugins_in(**environ: str) -> dict[str, Any]:
         if not k.startswith("VLLM_RBLN") and k != platform_envs.RESOLVED_MODEL_IMPL_ENV
     }
     out = subprocess.run(
-        [sys.executable, "-c", _PLUGIN_LOAD_PROBE],
+        [sys.executable, "-c", probe],
         capture_output=True,
         text=True,
         env=env | environ,
@@ -478,3 +479,41 @@ class TestApplySites:
         vllm_impl.patch_upstream()
 
         assert applied == ["registrations", "patches"]
+
+
+_DECODER_REGION_PROBE = """
+import json, sys
+from vllm.plugins import load_general_plugins
+load_general_plugins()
+from vllm.model_executor.models import deepseek_v2, llama, qwen2, qwen3, qwen3_moe
+from vllm_rbln.model_executor.models import minimax_m3
+from vllm_rbln.patches.axk2 import model as axk2
+layers = [
+    qwen2.Qwen2DecoderLayer,
+    qwen3.Qwen3DecoderLayer,
+    llama.LlamaDecoderLayer,
+    deepseek_v2.DeepseekV2DecoderLayer,
+    qwen3_moe.Qwen3MoeDecoderLayer,
+    sys.modules[axk2.CANONICAL_NAME].AXK2DecoderLayer,
+    minimax_m3.RBLNMiniMaxM3DecoderLayer,
+]
+print("RESULT" + json.dumps(
+    {layer.__name__: hasattr(layer.forward, "__marked_compile_region_fn__")
+     for layer in layers}
+))
+"""
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_nested_compile_region_marks_decoder_layers(nested):
+    """The flag is read when the modules are imported, so a fresh process
+    reads it. AX-K2 and MiniMax-M3 are RBLN code and mark the layer in place;
+    the upstream layers are marked through the registry."""
+    marked = _load_plugins_in(
+        _DECODER_REGION_PROBE,
+        **{
+            platform_envs.RESOLVED_MODEL_IMPL_ENV: "vllm",
+            "VLLM_RBLN_USE_NESTED_COMPILE_REGION": str(int(nested)),
+        },
+    )
+    assert marked == dict.fromkeys(marked, nested)

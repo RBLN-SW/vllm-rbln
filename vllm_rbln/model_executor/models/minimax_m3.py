@@ -86,6 +86,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
 )
 
+from vllm_rbln import envs
 from vllm_rbln.model_executor.models.interfaces import SupportsRBLNMultiModal
 from vllm_rbln.patches.attention import _resolve_kv_cache
 from vllm_rbln.v1.attention.backends.flash_attention import _fp8_cache_dtype
@@ -697,6 +698,9 @@ class RBLNMiniMaxM3DecoderLayer(nn.Module):
         else:
             hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
+
+    if envs.VLLM_RBLN_USE_NESTED_COMPILE_REGION:
+        forward = torch.compiler.nested_compile_region(forward)
 
 
 class RBLNMiniMaxM3Model(nn.Module, EagleModelMixin):

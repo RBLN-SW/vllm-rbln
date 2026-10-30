@@ -14,6 +14,7 @@ from vllm.distributed import get_pp_group
 from vllm.forward_context import get_forward_context
 from vllm.sequence import IntermediateTensors
 
+from vllm_rbln import envs
 from vllm_rbln.patches.attention import _resolve_kv_cache
 from vllm_rbln.patches.axk2.loader import load_frozen_module
 from vllm_rbln.patches.deepseek_v2 import patched_deepseek_v2_moe_forward
@@ -267,6 +268,10 @@ _module.Indexer.forward = _rbln_indexer_forward
 _module.AXK2GatedMultiHeadLatentAttentionWrapper.forward = _rbln_gated_mla_forward
 _module.AXK2MoE.forward = patched_deepseek_v2_moe_forward
 _module.AXK2Model.forward = _rbln_axk2_model_forward
+if envs.VLLM_RBLN_USE_NESTED_COMPILE_REGION:
+    _module.AXK2DecoderLayer.forward = torch.compiler.nested_compile_region(
+        _module.AXK2DecoderLayer.forward
+    )
 
 AXK2ForCausalLM = _module.AXK2ForCausalLM
 AXK2Model = _module.AXK2Model
