@@ -13,7 +13,6 @@
 # limitations under the License.
 from collections.abc import Callable
 from typing import Any
-from unittest.mock import Mock
 
 import pytest
 import torch
@@ -22,7 +21,6 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 
-from vllm_rbln.v1.sample import rbln_sampler as module
 from vllm_rbln.v1.sample.rbln_sampler import RBLNSampler
 from vllm_rbln.v1.worker.rbln_model_runner import (
     _depad_sampler_output,
@@ -38,13 +36,13 @@ from .utils import (
     weighted_token_ids,
 )
 
-VOCAB_SIZE = 8
+# Logits arrive in the model's dtype, and RBLN serves all three.
+DTYPES = [torch.bfloat16, torch.float16, torch.float32]
 
 
 @pytest.fixture
-def sampler(monkeypatch) -> RBLNSampler:
-    monkeypatch.setattr(module, "compile", lambda target, **kwargs: target)
-    return RBLNSampler(compile_context=Mock())
+def sampler() -> RBLNSampler:
+    return RBLNSampler()
 
 
 @pytest.fixture
@@ -67,39 +65,36 @@ def near_tied_logits(
     vocab_size: int = utils.VOCAB_SIZE,
     dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    """A row where `top_token` beats `second_token` by one ulp of `dtype`, the
-    smallest margin a greedy row must still resolve."""
+    """A row where `top_token` beats `second_token` by the smallest margin the
+    NPU resolves in `dtype`, which a greedy row must still pick."""
     logits = torch.full((vocab_size,), -100.0, dtype=dtype)
     logits[second_token] = 10.0
-    # Values in [8, 16) sit 8 * eps apart.
-    logits[top_token] = 10.0 + 8 * torch.finfo(dtype).eps
+    # One ulp is 8 * eps in [8, 16). The NPU reads one float16 ulp, or a float32
+    # gap below 0.0078, as a tie and takes the lower id, so neither margin goes
+    # below two float16 ulps.
+    float16_ulp = 8 * torch.finfo(torch.float16).eps
+    logits[top_token] = 10.0 + max(8 * torch.finfo(dtype).eps, 2 * float16_ulp)
     return logits
 
 
-def test_all_greedy_batch_takes_the_argmax_op(sampler, op_args):
-    """`rbln::argmax` must resolve the near tie exactly."""
-    greedy = SamplingParams(temperature=0.0)
-    metadata = build_input_batch(
-        requests=[("0", greedy), ("1", greedy)], vocab_size=VOCAB_SIZE
-    ).sampling_metadata
-    # float32, where a one-ulp gap divided by a small temperature is still a
-    # near tie, so only an exact argmax passes.
-    logits = torch.stack(
-        [
-            near_tied_logits(
-                top_token=6, second_token=4, vocab_size=VOCAB_SIZE, dtype=torch.float32
-            ),
-            near_tied_logits(
-                top_token=1, second_token=5, vocab_size=VOCAB_SIZE, dtype=torch.float32
-            ),
-        ]
+@pytest.mark.parametrize("dtype", DTYPES, ids=str)
+@pytest.mark.use_device
+def test_all_greedy_batch_takes_the_argmax_op(sampler, op_args, dtype):
+    """`rbln::argmax` must resolve the near tie."""
+    row = near_tied_logits(
+        top_token=WEIGHTED[20], second_token=WEIGHTED[5], dtype=dtype
     )
 
-    sampled, _ = sampler.sample(logits, metadata)
+    samples = sample(
+        logits=row.expand(ROWS, -1),
+        params=[SamplingParams(temperature=0.0)] * ROWS,
+        launches=2,
+        sampler=sampler,
+    )
 
     # An all-greedy batch skips the top-k/top-p op entirely.
     assert op_args == []
-    assert sampled.tolist() == [6, 1]
+    assert (samples == WEIGHTED[20]).all(), samples.unique().tolist()
 
 
 ########################### sampled distributions ###########################
@@ -221,9 +216,10 @@ DISTRIBUTION_CASES = [
 
 
 @pytest.mark.parametrize(("params", "request_kwargs"), DISTRIBUTION_CASES)
+@pytest.mark.parametrize("dtype", DTYPES, ids=str)
 @pytest.mark.use_device
-def test_sampled_distribution(params, request_kwargs):
-    row = logits_from_weights(weights=range(1, 33))
+def test_sampled_distribution(params, request_kwargs, dtype):
+    row = logits_from_weights(weights=range(1, 33), dtype=dtype)
     expected = expected_probs(
         logits=row.unsqueeze(0),
         params=[params],
@@ -253,14 +249,25 @@ def test_structured_output_mask_with_top_p_min_p():
     assert_samples_match(samples=samples, probs=expected)
 
 
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        torch.bfloat16,
+        # torch.float16,
+        torch.float32,
+    ],
+    ids=str,
+)
 @pytest.mark.use_device
-def test_mixed_batch_keeps_each_row_to_its_own_params():
+def test_mixed_batch_keeps_each_row_to_its_own_params(dtype):
     """One op call serves the mixed batch, greedy rows as top_k=1. Each row must
     keep its own distribution."""
-    weighted_row = logits_from_weights(weights=range(1, 33))
+    weighted_row = logits_from_weights(weights=range(1, 33), dtype=dtype)
     groups = [
         (
-            near_tied_logits(top_token=WEIGHTED[20], second_token=WEIGHTED[5]),
+            near_tied_logits(
+                top_token=WEIGHTED[20], second_token=WEIGHTED[5], dtype=dtype
+            ),
             SamplingParams(temperature=0.0),
         ),
         (weighted_row, SamplingParams(temperature=1.0)),
@@ -350,9 +357,9 @@ D = WEIGHTED[8]  # -4.0, nothing drops it
 EXACT_HISTORY: dict[str, Any] = {"prompt_token_ids": [A], "output_token_ids": [A, A]}
 
 
-def exact_logits(structured: bool) -> torch.Tensor:
-    row = torch.full((utils.VOCAB_SIZE,), -30.0, dtype=torch.bfloat16)
-    row[[A, B, C, D]] = torch.tensor([9.0, 8.0, 1.0, -4.0], dtype=torch.bfloat16)
+def exact_logits(structured: bool, dtype: torch.dtype) -> torch.Tensor:
+    row = torch.full((utils.VOCAB_SIZE,), -30.0, dtype=dtype)
+    row[[A, B, C, D]] = torch.tensor([9.0, 8.0, 1.0, -4.0], dtype=dtype)
     if structured:
         row[B] = float("-inf")
     return row
@@ -470,11 +477,12 @@ EXACT_CASES = [
 
 
 @pytest.mark.parametrize(("params", "structured", "mixed"), EXACT_CASES)
+@pytest.mark.parametrize("dtype", DTYPES, ids=str)
 @pytest.mark.use_device
-def test_sample_only_the_winner(params, structured, mixed):
+def test_sample_only_the_winner(params, structured, mixed, dtype):
     """Where the parameters leave one candidate, every draw must be it. A mixed
     row shares the batch with a row of the opposite kind."""
-    row = exact_logits(structured=structured)
+    row = exact_logits(structured=structured, dtype=dtype)
     if params.temperature == 0.0:
         sibling = SamplingParams(temperature=1.0, top_k=1)
     else:
