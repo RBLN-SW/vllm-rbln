@@ -94,6 +94,11 @@ from vllm_rbln.v1.attention.backends.minimax_m3 import (
     RBLNMiniMaxM3IndexerBackend,
     RBLNMiniMaxM3SparseBackend,
 )
+from vllm_rbln.v1.spec_decode.eagle3_pp import (
+    AUX_COMBINED,
+    aux_slots_captured,
+    aux_slots_received,
+)
 from vllm_rbln.v1.worker.utils import (
     num_attn_module as rbln_num_attn_module,
 )
@@ -744,7 +749,8 @@ class RBLNMiniMaxM3Model(nn.Module, EagleModelMixin):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        received: list[torch.Tensor] = []
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -755,8 +761,14 @@ class RBLNMiniMaxM3Model(nn.Module, EagleModelMixin):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
+            if aux_slots_received(self):
+                received = [intermediate_tensors[AUX_COMBINED]]
 
-        aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
+        # Index i is the input to layer i, by its global number. Index 0 is the
+        # embedding output, which only the first stage holds.
+        captured: list[torch.Tensor] = []
+        if get_pp_group().is_first_rank:
+            self._maybe_add_hidden_state(captured, 0, hidden_states, residual)
         # islice, not a slice: on torch >= 2.12 Dynamo lifts the parameters of a
         # sliced ModuleList into graph inputs, and the compiler then sees no
         # constant weights (an MXFP8 dense cannot pack).
@@ -765,17 +777,28 @@ class RBLNMiniMaxM3Model(nn.Module, EagleModelMixin):
         ):
             hidden_states, residual = layer(positions, hidden_states, residual)
             self._maybe_add_hidden_state(
-                aux_hidden_states, idx + 1, hidden_states, residual
+                captured, self.start_layer + idx + 1, hidden_states, residual
             )
 
+        # The drafter runs on the last stage, so the earlier stages' captures
+        # travel with the handoff.
+        aux = received + captured
         if not get_pp_group().is_last_rank:
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+            tensors = {"hidden_states": hidden_states, "residual": residual}
+            if aux:
+                tensors[AUX_COMBINED] = aux[0] if len(aux) == 1 else torch.cat(aux, -1)
+            return IntermediateTensors(tensors)
         hidden_states, _ = self.norm(hidden_states, residual)
-        if aux_hidden_states:
-            return hidden_states, aux_hidden_states
-        return hidden_states
+        if not self.aux_hidden_state_layers:
+            return hidden_states
+        carried = sum(t.shape[-1] for t in aux) // hidden_states.shape[-1]
+        assert carried == len(self.aux_hidden_state_layers), (
+            f"EAGLE3 expected {len(self.aux_hidden_state_layers)} aux hidden states "
+            f"for layers {sorted(self.aux_hidden_state_layers)}, but the handoff "
+            f"carried {carried}: {len(aux_slots_received(self))} arrived and "
+            f"{len(aux_slots_captured(self))} were captured"
+        )
+        return hidden_states, aux
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return fused_moe_make_expert_params_mapping(
