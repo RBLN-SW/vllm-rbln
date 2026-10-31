@@ -556,8 +556,9 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         )
         self._window_grid_cut = self._window_grid()
         # Said once here rather than per peer: every list counts a block in
-        # the same chunks, and a peer whose block holds a different count is
-        # refused at the handshake.
+        # these chunks but one whose entries split a region on a peer's token
+        # ranges, whose chunk also cuts those ranges; a peer whose block holds
+        # a different number of tokens is refused at the handshake.
         if self._shape.chunk_mode:
             chunks_per_block = self._chunks_per_block(self._chunk_grid)
             logger.info(
@@ -772,6 +773,13 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
             "a sliding-window group reads a storage no registered KV entry "
             "holds, although `canonical_kv_layers` keeps one layer per buffer"
         )
+        # A transfer region is numbered `logical * areas + area`, so an entry the
+        # compiler left on one area (GLM-5.3 on a PP stage) is named as replicas
+        # of its one slice; its writes repeat into the same bytes.
+        widest = max((len(placed) for _, _, placed in cuts.values()), default=1)
+        for base_addr, (axis, slices, placed) in cuts.items():
+            if len(placed) == 1 < widest:
+                cuts[base_addr] = (axis, slices, placed * widest)
         geometries = []
         for entry, spec, offset, block_len in regions:
             axis, slices, placed = cuts[entry.data_ptr()]

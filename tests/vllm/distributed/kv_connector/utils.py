@@ -578,6 +578,7 @@ def fill_region_geometry(
     w._logical_region_geometry = geometries
     assert latent is None or len(latent) == len(axes), (latent, axes)
     w._logical_region_latent = [False] * len(axes) if latent is None else list(latent)
+    w.region_group_ids = [0] * (len(axes) * areas)
     return w
 
 

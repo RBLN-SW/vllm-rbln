@@ -303,6 +303,7 @@ class TestPerShardWrite:
         w.kv_cache_config = MagicMock(kv_cache_groups=[0])
         # single group, 2 regions per shard
         w._shard_region_group_ids = {("eng", r): (0, 0) for r in range(ranks)}
+        w._shard_peer_region_group_ids = dict(w._shard_region_group_ids)
         # Written together with the group ids by _register_shard_xfer_state, so a
         # shard the write path can reach always has both.
         w._shard_descs_per_block = {("eng", r): (1, 1) for r in range(ranks)}
@@ -363,6 +364,7 @@ class TestPerShardWrite:
         )
         worker._shard_region_spans = {("eng", 0): (0, 1, 0, 0)}
         worker._shard_region_group_ids = {("eng", 0): (0, 0, 0, 0)}
+        worker._shard_peer_region_group_ids = dict(worker._shard_region_group_ids)
         worker._shard_descs_per_block = {("eng", 0): (1,) * 4}
         coverage = []
 
@@ -389,6 +391,9 @@ class TestPerShardWrite:
             ("eng", 1): uniform_grid(1, 2, regions=1),
         }
         worker._shard_region_group_ids[("eng", 1)] = (0,)
+        worker._shard_peer_region_group_ids[("eng", 1)] = (
+            worker._shard_region_group_ids[("eng", 1)]
+        )
         worker._shard_descs_per_block[("eng", 1)] = (1,)
         worker._shard_region_spans[("eng", 1)] = (0,)
         coverage = []
@@ -1146,6 +1151,7 @@ class TestTheThreeListsAgree:
             region_ids,
             block_size=worker.block_size,
             rows=[p[0].rows for p in pieces],
+            token_ranges=[p[0].tokens for p in pieces],
         )
 
         remote = worker._build_head_matched_remote(peer, 0, 4, peer_areas=areas)
@@ -1163,7 +1169,7 @@ class TestTheThreeListsAgree:
         assert (cls is RblnNixlPushConnectorWorker) == (fanout == 2)
         # This shape has to be one that carries a chunk range -- without it
         # the two lists agree trivially and say nothing about the range.
-        assert grid == uniform_grid(1, 2, regions=len(grid.regions))
+        assert grid == uniform_grid(1, 2, regions=len(grid.entries))
 
     def test_a_peers_interleaved_copies_are_found_by_their_slice(self):
         # The peer names which of its areas holds which slice; the copies of
@@ -2419,6 +2425,7 @@ class TestCoverageNotif:
         # length describes no request.
         worker = TestPerShardWrite._writing_worker(ranks=1)
         worker._shard_region_group_ids = {("eng", 0): (0, 0)}
+        worker._shard_peer_region_group_ids = dict(worker._shard_region_group_ids)
         worker._group_specs = [
             MagicMock(spec=SlidingWindowSpec),
             MagicMock(),  # full attention, and the second group at that
