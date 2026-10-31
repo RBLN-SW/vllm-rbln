@@ -32,6 +32,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_transfer_topology im
     RblnTransferTopology,
 )
 from vllm_rbln.v1.attention.backends.flash_attention import RBLNFlashAttentionBackend
+from vllm_rbln.v1.attention.backends.glm5_next import RBLNGlm5NextIndexerBackend
 from vllm_rbln.v1.attention.backends.mla.flashattn_mla import RBLNFlashAttnMLABackend
 from vllm_rbln.v1.attention.backends.mla.indexer import (
     RBLNDeepseekV32IndexerBackend,
@@ -123,6 +124,13 @@ class TestRblnTransferTopology:
         topo = self._topology(backend, is_mla=True)
 
         assert topo.kv_head_dim is None
+        assert topo.kv_token_dim == 1
+
+    def test_a_compressing_cache_is_probed_at_a_multiple_of_its_ratio(self):
+        # GLM-5.3's indexer keeps a row per 4 tokens and refuses a block it
+        # cannot divide; it is the first backend on a later PP stage.
+        topo = self._topology(RBLNGlm5NextIndexerBackend, is_mla=True)
+
         assert topo.kv_token_dim == 1
 
     def test_an_mla_layer_stays_one_region(self):

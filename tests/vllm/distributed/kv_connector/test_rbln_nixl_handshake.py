@@ -1589,6 +1589,7 @@ class TestShardLocalRegions:
         per_block = split * fanout
         key = ("eng", 0)
         w._shard_region_group_ids = {key: (0,) * len(regions)}
+        w._shard_peer_region_group_ids = dict(w._shard_region_group_ids)
         w._shard_descs_per_block[key] = (per_block,) * len(regions)
         w._shard_chunk_grids[key] = uniform_grid(2, 2, regions=4)
 
@@ -1616,6 +1617,7 @@ class TestShardLocalRegions:
         w = self._wired_worker()
         key = ("eng", 0)
         w._shard_region_group_ids = {key: (0,) * 4}
+        w._shard_peer_region_group_ids = dict(w._shard_region_group_ids)
         w._shard_descs_per_block[key] = (1,) * 4
         w._shard_chunk_grids[key] = uniform_grid(2, 2, regions=4)
 
@@ -1628,6 +1630,7 @@ class TestShardLocalRegions:
         w = self._wired_worker()
         key = ("eng", 0)
         w._shard_region_group_ids = {key: (0,) * 4}
+        w._shard_peer_region_group_ids = dict(w._shard_region_group_ids)
         w._shard_descs_per_block[key] = (1,) * 4
         w._shard_chunk_grids[key] = None
 
@@ -1710,6 +1713,7 @@ class TestShardLocalRegions:
         w.kv_cache_config = MagicMock(transfer_groups=[object()])
         w.src_xfer_handles_by_remote = {}
         w._shard_region_group_ids = {}
+        w._shard_peer_region_group_ids = dict(w._shard_region_group_ids)
 
         with (
             patch.object(
@@ -1733,6 +1737,7 @@ class TestShardLocalRegions:
         w.kv_cache_config = MagicMock(transfer_groups=[object()])
         w.src_xfer_handles_by_remote = {}
         w._shard_region_group_ids = {}
+        w._shard_peer_region_group_ids = dict(w._shard_region_group_ids)
 
         w._register_shard_xfer_state("eng", 2, 16, ("l2", "l3"))
 
@@ -1750,6 +1755,7 @@ class TestShardLocalRegions:
         w.kv_cache_config = MagicMock(transfer_groups=[object()])
         w.src_xfer_handles_by_remote = {}
         w._shard_region_group_ids = {}
+        w._shard_peer_region_group_ids = dict(w._shard_region_group_ids)
         w._shard_descs_per_block = {}
 
         # Regions 4 and 5 in two pieces sent to three copies each, 6 and 7 whole.
@@ -1808,6 +1814,7 @@ class TestShardLocalRegions:
         w.kv_cache_config = MagicMock(transfer_groups=[object()])
         w.src_xfer_handles_by_remote = {}
         w._shard_region_group_ids = {}
+        w._shard_peer_region_group_ids = dict(w._shard_region_group_ids)
         w._shard_descs_per_block = {}
 
         w._register_shard_xfer_state(
@@ -1855,6 +1862,7 @@ class TestShardLocalRegions:
         w.kv_cache_config = MagicMock(transfer_groups=[object()])
         w.src_xfer_handles_by_remote = {}
         w._shard_region_group_ids = {}
+        w._shard_peer_region_group_ids = dict(w._shard_region_group_ids)
         w._shard_descs_per_block = {}
         # The geometry the grid is read off: 8 heads over 4 areas is 2 a
         # region, and 512B over a 16-token block is 16B a token.
@@ -1898,6 +1906,7 @@ class TestShardLocalRegions:
         w.kv_cache_config = MagicMock(transfer_groups=[object()])
         w.src_xfer_handles_by_remote = {}
         w._shard_region_group_ids = {}
+        w._shard_peer_region_group_ids = dict(w._shard_region_group_ids)
 
         with patch.object(
             RblnNixlPullConnectorWorker, "_shard_chunk_grid", return_value=None
@@ -1920,6 +1929,7 @@ class TestShardLocalRegions:
         w.kv_cache_config = MagicMock(transfer_groups=[object()])
         w.src_xfer_handles_by_remote = {}
         w._shard_region_group_ids = {}
+        w._shard_peer_region_group_ids = dict(w._shard_region_group_ids)
 
         w._register_shard_xfer_state("eng", 2, 16, ("l2", "l3"))
 
@@ -1932,6 +1942,7 @@ class TestShardLocalRegions:
         w.kv_cache_config = MagicMock(transfer_groups=[object(), object()])
         w.src_xfer_handles_by_remote = {}
         w._shard_region_group_ids = {}
+        w._shard_peer_region_group_ids = dict(w._shard_region_group_ids)
 
         with pytest.raises(AssertionError, match="single KV-cache group"):
             w._register_shard_xfer_state("eng", 2, 16, ("l2", "l3"))
@@ -2113,6 +2124,7 @@ class TestAnEngineCutOnTwoAxes:
         remote = w._build_fa_remote(plan, peer, block_size_ratio=1)
         key = ("peer", 0)
         w._shard_region_group_ids = {key: (0,) * len(region_ids)}
+        w._shard_peer_region_group_ids = dict(w._shard_region_group_ids)
         w._shard_descs_per_block = {key: (1,) * len(region_ids)}
         w._shard_chunk_grids = {key: grid}
         local = [tuple(int(x) for x in d) for d in local]
@@ -3986,6 +3998,7 @@ def _shard_worker(w, *, layouts, num_blocks, chunked):
     w.nixl_wrapper = MagicMock()
     w.src_xfer_handles_by_remote = {}
     w._shard_region_group_ids = {}
+    w._shard_peer_region_group_ids = dict(w._shard_region_group_ids)
     w._shard_descs_per_block = {}
     w._shard_chunk_grids = {}
     w._shard_region_spans = {}
@@ -6085,6 +6098,7 @@ class TestCleanupRemoteEngine:
         w.nixl_wrapper = MagicMock()
         w.src_xfer_handles_by_remote = {("eng", 0, 16): 100}
         w._shard_region_group_ids = {("eng", 0): (0,)}
+        w._shard_peer_region_group_ids = dict(w._shard_region_group_ids)
         w._shard_descs_per_block = {("eng", 0): (1,)}
         w._shard_chunk_grids = {("eng", 0): None}
         w._shard_region_spans = {("eng", 0): (0,)}
@@ -6117,6 +6131,7 @@ class TestCleanupRemoteEngine:
             ("eng", 1): (0,),
             ("other", 0): (0,),
         }
+        w._shard_peer_region_group_ids = dict(w._shard_region_group_ids)
         w._shard_descs_per_block = {
             ("eng", 0): (1,),
             ("eng", 1): (2,),
@@ -6164,6 +6179,7 @@ class TestCleanupRemoteEngine:
         w.src_xfer_handles_by_remote = {("eng", 0, 16): 100, ("eng", 1, 16): 101}
         w._borrowed_src_handles = {("eng", 1, 16)}
         w._shard_region_group_ids = {}
+        w._shard_peer_region_group_ids = dict(w._shard_region_group_ids)
         w._shard_descs_per_block = {}
         w._shard_chunk_grids = {}
         w._remote_shard_layer_names = defaultdict(dict)
@@ -7659,3 +7675,29 @@ class TestMetadataTakenMidSweep:
         # Reading the live view would raise here; the sweep still covers every
         # read it set out to, including the one taken from under it.
         assert w._recv_failures == {"r0", "r1", "r2"}
+
+
+class TestShardPeerGroupIds:
+    @staticmethod
+    def _worker():
+        # Our band is the last two of a peer stage's four layers, two regions
+        # a layer over two chiplet areas.
+        w = object.__new__(RblnNixlPullConnectorWorker)
+        w.local_seen_layer_names = ["l2", "l3"]
+        w.num_regions = 4
+        w._kv_areas = 2
+        return w
+
+    def test_a_layer_takes_its_group_from_the_peer_s_position(self):
+        ids = self._worker()._shard_peer_group_ids(
+            ("l0", "l1", "l2", "l3"), [0, 0, 1, 1, 5, 5, 6, 6], None
+        )
+
+        assert ids == (5, 5, 6, 6)
+
+    def test_the_peer_s_areas_narrow_it_as_they_do_our_regions(self):
+        ids = self._worker()._shard_peer_group_ids(
+            ("l0", "l1", "l2", "l3"), [0, 0, 1, 1, 5, 4, 6, 3], [1]
+        )
+
+        assert ids == (4, 3)

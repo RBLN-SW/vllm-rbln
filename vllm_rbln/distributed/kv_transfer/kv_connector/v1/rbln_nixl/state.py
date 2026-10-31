@@ -380,6 +380,7 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
     src_xfer_handles_by_remote: dict[tuple[str, int, int], int]
     _borrowed_src_handles: set[tuple[str, int, int]]
     _shard_region_group_ids: dict[tuple[str, int], tuple[int, ...]]
+    _shard_peer_region_group_ids: dict[tuple[str, int], tuple[int, ...]]
     #: Per peer shard, descriptors a block of each region of its list is.
     _shard_descs_per_block: dict[tuple[str, int], tuple[int, ...]]
     _shard_chunk_grids: dict[tuple[str, int], ChunkGrid | None]
