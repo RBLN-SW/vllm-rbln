@@ -48,7 +48,17 @@ jobs:
       - name: Check Skip PR (vllm-rbln)
         id: skip-pr
         run: |
-            CURRENT_VERSION=$(grep -m 1 '"optimum-rbln' pyproject.toml | sed -E 's/.*optimum-rbln[<>=]{2}([^",]+).*/\1/' || echo "not_found")
+            # Read where we are from uv.lock, not from the floor in pyproject.toml.
+            # The update PR only raises that floor when a release falls outside the
+            # declared range, so the floor no longer tracks the version we ship, and
+            # comparing against it would re-open the same PR on every run.
+            CURRENT_VERSION=$(python - <<'PY'
+            import pathlib, re
+            text = pathlib.Path("uv.lock").read_text()
+            match = re.search(r'^\[\[package\]\]\nname = "optimum-rbln"\nversion = "([^"]+)"', text, re.M)
+            print(match.group(1) if match else "not_found")
+            PY
+            )
             if [ "$CURRENT_VERSION" == "${{ steps.optimum-version.outputs.version }}" ]; then
                 SKIP_PR="true"
             else
