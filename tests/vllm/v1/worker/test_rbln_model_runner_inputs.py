@@ -466,3 +466,46 @@ class TestBookkeepingSyncSpecDecode:
 
         assert runner.requests["req_0"].output_token_ids == [101, 102]
         assert runner.requests["req_1"].output_token_ids == [201]
+
+
+@pytest.mark.parametrize(
+    ("kv_role", "prefill"), [("kv_producer", True), ("kv_both", False)]
+)
+def test_a_producer_stages_its_last_prompt_token_as_a_prefill(
+    make_model_runner, monkeypatch, kv_role, prefill
+):
+    # A full prefix hit leaves one prompt token. A producer compiled only the
+    # prefill graph, so the step has to reach the model at that graph's width.
+    from vllm.config import KVTransferConfig
+
+    monkeypatch.setattr(
+        mr,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: False)
+    runner = make_model_runner(
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="RblnNixlConnector", kv_role=kv_role
+        )
+    )
+    staged = {}
+
+    def model(**kwargs):
+        staged.update(kwargs)
+        return torch.zeros(1, 1, 8), torch.zeros(1, 8), None
+
+    runner.model_executable = model
+
+    runner.execute_model(
+        schedule_new("a", num_computed_tokens=[2], num_scheduled_tokens=[1])
+    )
+
+    assert runner.is_prefill is prefill
+    assert staged["input_ids"][0, 0].item() == 3
+    assert staged["positions"][0, 0].item() == 2
+    if prefill:
+        assert staged["input_ids"].shape == (1, runner.max_num_tokens)
+        assert staged["token_indices"].tolist() == [0]
+    else:
+        assert staged["input_ids"].shape[1] == 1

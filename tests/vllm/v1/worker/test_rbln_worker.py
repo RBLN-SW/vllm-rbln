@@ -42,6 +42,7 @@ import vllm_rbln.v1.worker.rbln_worker as wm
 import vllm_rbln.v1.worker.utils as worker_utils
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.platform import RblnPlatform
+from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
 from vllm_rbln.v1.worker.rbln_worker import (
     RBLNWorker,
     init_worker_distributed_environment,
@@ -346,7 +347,12 @@ class TestWorkerFailFast:
         worker = make_worker(vllm_config=_make_vllm_config(backend=backend))
         error = RuntimeError("worker step failed")
         step = Mock(side_effect=error)
-        worker.model_runner = SimpleNamespace(**{runner_method: step})
+        # is_strict_kv_producer is read before the step the failure policy is
+        # about; __init__ always sets it.
+        worker.model_runner = SimpleNamespace(
+            is_strict_kv_producer=False,
+            **{runner_method: step},
+        )
         monkeypatch.setattr(wm, "set_current_vllm_config", lambda _: nullcontext())
         monkeypatch.setenv("VLLM_RBLN_DISABLE_WORKER_FAIL_FAST", disabled)
         exit_process = Mock(side_effect=SystemExit(70))
@@ -617,8 +623,8 @@ class TestDetermineAvailableMemory:
         hf_config=None,
         params=None,
         specialized_moe_decode=False,
-        uses_fixed_decode_window=False,
         decode_buckets=3,
+        decode_graph_shapes=((1, 1, None), (2, 1, None), (4, 1, None)),
         drafter=None,
         speculative_config=None,
         dynamic=False,
@@ -652,7 +658,7 @@ class TestDetermineAvailableMemory:
             ),
             drafter=drafter,
             get_kv_cache_spec=lambda: {},
-            uses_fixed_decode_window=uses_fixed_decode_window,
+            decode_graph_shapes=lambda: list(decode_graph_shapes),
         )
         _attach_sizer(worker)
         worker.determine_available_memory()
@@ -703,6 +709,7 @@ class TestDetermineAvailableMemory:
             model=SimpleNamespace(named_parameters=lambda: iter(_params().items())),
             specialized_moe_decode=False,
             bucketing_manager=SimpleNamespace(decode_batch_buckets_count=3),
+            decode_graph_shapes=lambda: [(b, 1, None) for b in (1, 2, 4)],
             drafter=None,
             get_kv_cache_spec=lambda: {"a": spec, "b": spec},
         )
@@ -729,12 +736,16 @@ class TestDetermineAvailableMemory:
         cap = self._capture(make_worker, monkeypatch, device_name="RBLN-CR13")
         assert "chiplet_memory" not in cap
 
-    def test_num_runtimes_from_buckets_and_moe(self, make_worker, monkeypatch):
+    def test_num_runtimes_counts_each_decode_graph_and_the_prefill(
+        self, make_worker, monkeypatch
+    ):
+        # The runner owns which shapes it compiles; the worker reserves one
+        # runtime for each of them and one for the prefill graph.
         cap = self._capture(
-            make_worker, monkeypatch, specialized_moe_decode=True, decode_buckets=3
+            make_worker,
+            monkeypatch,
+            decode_graph_shapes=[(b, 1, None) for b in (1, 2, 4)] + [(4, 1, 512)],
         )
-        # Non-spec: num_decode_query_lens == 1, so 1 + buckets(3)*1 = 4, plus
-        # the specialized-MoE-decode fallback (+1 query length) = 5.
         assert cap["num_runtimes"] == 5
 
     def test_no_quant_counts_int_at_16bit(self, make_worker, monkeypatch):
@@ -796,7 +807,8 @@ class TestDetermineAvailableMemory:
         drafter = SimpleNamespace(
             model=SimpleNamespace(
                 parameters=lambda: iter([torch.zeros(20, dtype=torch.float16)])
-            )
+            ),
+            warms_up_decode_graphs_on_a_producer=False,
         )
         spec = SimpleNamespace(
             draft_model_config=SimpleNamespace(quantization=None),
@@ -808,13 +820,66 @@ class TestDetermineAvailableMemory:
             monkeypatch,
             drafter=drafter,
             speculative_config=spec,
-            uses_fixed_decode_window=True,
+            decode_graph_shapes=[(b, 1, None) for b in (1, 2, 4)],
         )
         assert "kernel_size" in cap
         assert "n_model_bytes" not in cap
         # A fixed decode window compiles one decode query length: target =
         # 1 + buckets(3)*1 = 4 (no MoE); draft = 1 + buckets(3) = 4. Total 8.
         assert cap["num_runtimes"] == 8
+
+    def test_medusa_on_a_producer_reserves_one_draft_runtime(
+        self, make_worker, monkeypatch
+    ):
+        # The stubs above supply the attribute, so they cannot catch a drafter
+        # class that lacks it. On a producer the left operand is empty, so the
+        # real medusa class's attribute is read.
+        drafter = RBLNMedusaProposer.__new__(RBLNMedusaProposer)
+        drafter.model = SimpleNamespace(
+            parameters=lambda: iter([torch.zeros(20, dtype=torch.float16)])
+        )
+        spec = SimpleNamespace(
+            draft_model_config=SimpleNamespace(quantization=None),
+            draft_parallel_config=None,
+            method="medusa",
+        )
+        cap = self._capture(
+            make_worker,
+            monkeypatch,
+            drafter=drafter,
+            speculative_config=spec,
+            decode_graph_shapes=[],
+        )
+        assert cap["num_runtimes"] == 2
+
+    @pytest.mark.parametrize(("warms_up_decode", "expected"), [(False, 2), (True, 3)])
+    def test_a_producer_reserves_only_for_the_drafter_that_warms_decode(
+        self, make_worker, monkeypatch, warms_up_decode, expected
+    ):
+        # A producer compiles no decode graph, so the target holds one runtime and
+        # warm-up issues one drafter dummy. DFlash warms its query pass there and
+        # eagle does not, and only the drafter knows which -- but either way the
+        # bucket axis is gone, so charging the bucket count would eat the win.
+        drafter = SimpleNamespace(
+            model=SimpleNamespace(
+                parameters=lambda: iter([torch.zeros(20, dtype=torch.float16)])
+            ),
+            warms_up_decode_graphs_on_a_producer=warms_up_decode,
+        )
+        spec = SimpleNamespace(
+            draft_model_config=SimpleNamespace(quantization=None),
+            draft_parallel_config=None,
+            method="dflash" if warms_up_decode else "eagle",
+        )
+        cap = self._capture(
+            make_worker,
+            monkeypatch,
+            drafter=drafter,
+            speculative_config=spec,
+            decode_graph_shapes=[],
+        )
+        # target = 1; draft = 1, plus the one shape a warming drafter builds.
+        assert cap["num_runtimes"] == expected
 
     def test_draft_runtime_adds_specialized_moe_fallback(
         self, make_worker, monkeypatch
@@ -827,6 +892,7 @@ class TestDetermineAvailableMemory:
             model=SimpleNamespace(
                 parameters=lambda: iter([torch.zeros(20, dtype=torch.float16)])
             ),
+            warms_up_decode_graphs_on_a_producer=False,
         )
         spec = SimpleNamespace(
             draft_model_config=SimpleNamespace(quantization=None),
@@ -839,7 +905,7 @@ class TestDetermineAvailableMemory:
             drafter=drafter,
             speculative_config=spec,
             specialized_moe_decode=True,
-            uses_fixed_decode_window=True,
+            decode_graph_shapes=[(b, 1, None) for b in (1, 2, 4)] + [(4, 1, 512)],
         )
         assert cap["num_runtimes"] == 10
 
@@ -847,7 +913,8 @@ class TestDetermineAvailableMemory:
         drafter = SimpleNamespace(
             model=SimpleNamespace(
                 parameters=lambda: iter([torch.zeros(20, dtype=torch.float16)])
-            )
+            ),
+            warms_up_decode_graphs_on_a_producer=False,
         )
         spec = SimpleNamespace(
             draft_model_config=SimpleNamespace(quantization="fp8"),
@@ -860,7 +927,6 @@ class TestDetermineAvailableMemory:
                 monkeypatch,
                 drafter=drafter,
                 speculative_config=spec,
-                uses_fixed_decode_window=True,
             )
 
 
@@ -1439,3 +1505,29 @@ class TestProfile:
 
         assert calls == ["start", "done"]
         assert isinstance(worker.profiler, worker_utils.RblnProfilerWrapper)
+
+
+class TestExecuteDummyBatch:
+    # An idle rank reports the minimal entry either way; only which graph it asks
+    # for differs, and _dummy_run pads a prefill to the width warm-up compiled.
+    @staticmethod
+    def _dummy_run_args(make_worker, *, strict_kv_producer):
+        worker = make_worker()
+        calls = []
+        worker.model_runner = SimpleNamespace(
+            is_strict_kv_producer=strict_kv_producer,
+            _dummy_run=lambda *a, **kw: calls.append((a, kw)),
+        )
+        worker.execute_dummy_batch()
+        assert len(calls) == 1
+        return calls[0]
+
+    def test_a_decoding_engine_runs_the_minimal_decode_dummy(self, make_worker):
+        args, kwargs = self._dummy_run_args(make_worker, strict_kv_producer=False)
+        assert args == (1, 1)
+        assert kwargs == {"is_prefill": False, "warmup": False}
+
+    def test_a_strict_producer_runs_the_prefill_graph(self, make_worker):
+        args, kwargs = self._dummy_run_args(make_worker, strict_kv_producer=True)
+        assert args == (1, 1)
+        assert kwargs == {"is_prefill": True, "warmup": False}
