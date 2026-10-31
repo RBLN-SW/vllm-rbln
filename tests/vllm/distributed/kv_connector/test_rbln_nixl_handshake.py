@@ -787,14 +787,23 @@ class TestPpHandshakeFanout:
 
         assert sliced.kv_area_slices == [[1, 0], [0, 1]]
 
-    def test_trim_agent_meta_to_layers_rejects_a_non_contiguous_span(self):
+    def test_trim_agent_meta_to_layers_keeps_a_non_contiguous_span(self):
+        # A decoder whose band straddles two producer stages owns positions
+        # that are not one range. Every field is taken position by position,
+        # so the trim describes exactly the layers this rank reads.
         w = object.__new__(RblnNixlPullConnectorWorker)
         w._kv_per_block = 1
         w.local_seen_layer_names = ["layer.0", "layer.2"]
         w.num_regions = 2
-        meta = _agent_meta(kv_caches_base_addr=[0xA, 0xB, 0xC], block_lens=[1, 2, 3])
-        with pytest.raises(RuntimeError, match="non-contiguous"):
-            w._trim_agent_meta_to_layers(meta, [(0, 0), (2, 1)])
+        meta = _agent_meta(
+            kv_caches_base_addr=[0xA, 0xB, 0xC, 0xD], block_lens=[1, 2, 3, 4]
+        )
+
+        sliced = w._trim_agent_meta_to_layers(meta, [(0, 0), (2, 1)])
+
+        assert sliced.kv_caches_base_addr == [0xA, 0xC]
+        assert sliced.block_lens == [1, 3]
+        assert sliced.region_names == ["layer.0", "layer.2"]
 
     def test_non_pp_producer_wider_than_our_band_is_narrowed(self):
         # The producer runs no pipeline parallelism, but ours is finer, so it
@@ -1939,17 +1948,39 @@ class TestShardLocalRegions:
 
         assert w._shard_region_spans[("eng", 2)] == (1, 0, 1, 0)
 
-    def test_register_shard_xfer_state_rejects_multiple_groups(self):
-        # The single-group assumption is what makes the all-zero tuple above
-        # right; more than one group has to fail rather than mislabel regions.
+    def test_a_shard_takes_the_group_of_every_region_it_covers(self):
+        # GLM-5.3 registers a transfer group per cache kind, so the regions of
+        # one shard no longer all sit in group 0. A region labelled with the
+        # wrong group is addressed in another group's block pool.
         w = self._wired_worker()
+        w.region_group_ids = [0, 0, 1, 1, 0, 2, 2, 0]
+        w.kv_cache_config = MagicMock(transfer_groups=[object(), object(), object()])
+        w.src_xfer_handles_by_remote = {}
+        w._shard_region_group_ids = {}
+        w._shard_peer_region_group_ids = {}
+
+        w._register_shard_xfer_state("eng", 2, 16, ("l2", "l3"))
+
+        assert w._shard_region_group_ids[("eng", 2)] == (0, 2, 2, 0)
+        assert w._shard_peer_region_group_ids[("eng", 2)] == (0, 2, 2, 0)
+
+    def test_a_peer_stage_keeps_its_own_group_numbering(self):
+        # A producer stage numbers its groups off the layers it holds, and the
+        # block ids it sends follow that numbering, so the peer side of the
+        # pair is labelled with the peer's own ids and not with ours.
+        w = self._wired_worker()
+        w.region_group_ids = [0] * 8
         w.kv_cache_config = MagicMock(transfer_groups=[object(), object()])
         w.src_xfer_handles_by_remote = {}
         w._shard_region_group_ids = {}
-        w._shard_peer_region_group_ids = dict(w._shard_region_group_ids)
+        w._shard_peer_region_group_ids = {}
 
-        with pytest.raises(AssertionError, match="single KV-cache group"):
-            w._register_shard_xfer_state("eng", 2, 16, ("l2", "l3"))
+        w._register_shard_xfer_state(
+            "eng", 2, 16, ("l2", "l3"), peer_region_group_ids=[1, 1, 0, 0]
+        )
+
+        assert w._shard_region_group_ids[("eng", 2)] == (0, 0, 0, 0)
+        assert w._shard_peer_region_group_ids[("eng", 2)] == (1, 1, 0, 0)
 
 
 @dataclass(frozen=True)
@@ -6221,6 +6252,7 @@ class TestD2DRegionPairing:
         topo.get_engine_info.return_value = MagicMock(remote_tp_size=1)
         topo.block_size_ratio.return_value = 1
         w.transfer_topo = topo
+        fill_region_geometry(w, areas=1, axes=[ChipletSplitAxis.HEAD] * n_local)
         return w
 
     @staticmethod
@@ -7420,6 +7452,7 @@ class TestTwoLayoutsNeverPair:
         topo = MagicMock()
         topo.tp_ratio.return_value = 1
         w.transfer_topo = topo
+        fill_region_geometry(w, areas=1, axes=[ChipletSplitAxis.HEAD])
         return w
 
     @staticmethod
@@ -7473,6 +7506,7 @@ class TestTwoKernelGeometriesNeverPair:
         topo = MagicMock()
         topo.tp_ratio.return_value = 1
         w.transfer_topo = topo
+        fill_region_geometry(w, areas=1, axes=[ChipletSplitAxis.HEAD])
         return w
 
     @staticmethod
@@ -7530,6 +7564,7 @@ class TestAPackedBlockNeedsAnEqualPeerBlockSize:
         # Unequal TP pairs by head band and refuses this on its own; the path
         # this guards is the one that reaches upstream.
         w._is_head_matched_peer = lambda _: False
+        fill_region_geometry(w, areas=1, axes=[ChipletSplitAxis.HEAD])
         return w
 
     @staticmethod

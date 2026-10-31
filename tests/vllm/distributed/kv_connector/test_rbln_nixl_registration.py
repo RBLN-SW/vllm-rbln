@@ -1988,6 +1988,8 @@ class TestPublishHandshakeMetadata:
         w._kv_per_block = 1
         w.kv_buffer_device = "cpu"
         w._has_mamba = False
+        w._block_state_layers = set()
+        w._block_aux_specs = {}
         w._use_rbln_nixl_backend = False
         w.xfer_handshake_metadata = MagicMock(
             agent_metadata_bytes=msgspec.msgpack.encode(self._base_meta())
