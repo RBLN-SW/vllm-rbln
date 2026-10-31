@@ -7439,7 +7439,8 @@ class TestTwoLayoutsNeverPair:
 
 class TestTwoKernelGeometriesNeverPair:
     """Which of `block_size` and `sliding_window` the kernel addresses the
-    cache in is the runner's choice, so two engines off one build can differ.
+    cache in follows whether the window divides the block, and an older
+    vllm-rbln moved it under sub-block prefix caching, so two engines can differ.
     A window range is cut by that number, so the lists would name different
     pieces of the same block while every byte count still matched."""
 

@@ -14,7 +14,7 @@
 
 import math
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -48,34 +48,47 @@ class KVCacheViewInfo:
     dynamic_scale: tuple[int, int] = (1, 1)
 
 
+def _view_key(tensor: torch.Tensor) -> tuple[int, int, int, int]:
+    # The byte window and not just the storage: layers share a buffer only
+    # where they are the same cache, and collapsing distinct windows would
+    # hand every one of them the first window's bytes.
+    return (
+        *_storage_key(tensor),
+        tensor.storage_offset() * tensor.element_size(),
+        tensor.numel() * tensor.element_size(),
+    )
+
+
 def build_kv_cache_base_bindings(
     kv_cache_bases_by_layer: dict[str, torch.Tensor],
     kv_cache_view_infos_by_layer: dict[str, KVCacheViewInfo],
+    canonical_layers: Collection[str],
     num_attn_module: int = 1,
 ) -> tuple[list[torch.Tensor], list[KVCacheViewInfo]]:
-    """Deduplicate KV cache inputs by storage and capture per-layer view info."""
+    """Deduplicate KV cache inputs by storage and capture per-layer view info.
+
+    Each storage is bound in its canonical layer's shape (`canonical_kv_layers`)
+    rather than the first layer's; the other layers view it.
+    """
     base_tensors: list[torch.Tensor] = []
     view_infos: list[KVCacheViewInfo] = []
     base_index_by_view: dict[tuple[int, int, int, int], int] = {}
+    canonical_bases = {
+        _view_key(kv_cache_bases_by_layer[name]): kv_cache_bases_by_layer[name]
+        for name in canonical_layers
+    }
 
     layer_names = _get_ordered_layer_names(
         kv_cache_view_infos_by_layer, num_attn_module
     )
     for layer_name in layer_names:
         base_tensor = kv_cache_bases_by_layer[layer_name]
-        # The byte window and not just the storage: layers share a buffer only
-        # where they are the same cache, and collapsing distinct windows would
-        # hand every one of them the first window's bytes.
-        view_key = (
-            *_storage_key(base_tensor),
-            base_tensor.storage_offset() * base_tensor.element_size(),
-            base_tensor.numel() * base_tensor.element_size(),
-        )
+        view_key = _view_key(base_tensor)
         base_index = base_index_by_view.get(view_key)
         if base_index is None:
             base_index = len(base_tensors)
             base_index_by_view[view_key] = base_index
-            base_tensors.append(base_tensor)
+            base_tensors.append(canonical_bases[view_key])
 
         view_info = kv_cache_view_infos_by_layer[layer_name]
         if view_info.dynamic_axis is not None and view_info.view_shape is not None:

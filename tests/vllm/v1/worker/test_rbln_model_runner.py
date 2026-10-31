@@ -1145,6 +1145,27 @@ class TestProcessKvCacheCopyOps:
         assert (dst[..., :3, :] == 5.0).all()
         assert (dst[..., 3:, :] == 0.0).all()
 
+    def test_a_window_group_copies_the_whole_manager_block(self, monkeypatch):
+        monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", True)
+        # Kernel blocks of 2, four to a manager block of 8: manager block 1 is
+        # kernel blocks 4..7, and five tokens still take all four.
+        kv = torch.zeros(16, 2, 1, 1, 2, 2)
+        for kb in range(16):
+            kv[kb] = float(kb)
+        before = kv.clone()
+        r = _make_runner_stub(
+            kv_caches=[kv],
+            kv_cache_names=["sw"],
+            kv_cache_block_axes={"sw": 0},
+            kv_cache_config=_copy_groups(["sw"]),
+            _kernel_block_sizes=[2],
+            model_config=SimpleNamespace(use_mla=False, enforce_eager=True),
+            runtime_holder=[None],
+        )
+        r._process_kv_cache_copy_ops([KVCacheCopyOp(0, 1, 2, 5)])
+        assert torch.equal(kv[8:12], before[4:8])
+        assert torch.equal(kv[:8], before[:8]) and torch.equal(kv[12:], before[12:])
+
     def test_eager_copy_mla(self, monkeypatch):
         monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", True)
         kv = torch.zeros(4, 8, 2)  # (num_blocks, block_tokens, dim)
@@ -1215,6 +1236,8 @@ class TestProcessKvCacheCopyOps:
             kv_caches=[],
             kv_cache_names=[],
             kv_cache_block_axes={},
+            kv_cache_config=_copy_groups(["l0"]),
+            _kernel_block_sizes=[8],
             model_config=SimpleNamespace(use_mla=False, enforce_eager=False),
             runtime_holder=[runtime],
             rbln_config=RBLNConfig(),

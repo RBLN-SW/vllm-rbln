@@ -376,16 +376,6 @@ def _kv_config(*specs):
     return SimpleNamespace(kv_cache_groups=groups)
 
 
-def _sliding(window, spec_cls=SlidingWindowSpec):
-    return spec_cls(
-        block_size=64,
-        num_kv_heads=1,
-        head_size=8,
-        dtype=torch.float16,
-        sliding_window=window,
-    )
-
-
 def _backend(sizes):
     # A backend type exposing the classmethod select_common_block_size calls.
     return type(
@@ -516,9 +506,10 @@ class TestGetKvCacheNames:
 class TestPrepareKernelBlockSizes:
     @pytest.mark.parametrize("spec_cls", [SlidingWindowSpec, RBLNSlidingWindowSpec])
     def test_sliding_window_uses_window(self, spec_cls):
-        # Either sliding-window spec -> kernel block size is its sliding_window,
-        # so the cache the kernel sees is the same on both paths. A backend is
-        # never consulted, hence the empty attention group.
+        # Either sliding-window spec with a window that divides the block ->
+        # kernel block size is its sliding_window, so the cache the kernel sees
+        # is the same for both specs. A backend is never consulted, hence the
+        # empty attention group.
         sw = spec_cls(
             block_size=32,
             num_kv_heads=1,
@@ -528,21 +519,17 @@ class TestPrepareKernelBlockSizes:
         )
         assert prepare_kernel_block_sizes(_kv_config(sw), [[]]) == [16]
 
-    @pytest.mark.parametrize(
-        "spec_cls, expected",
-        [(SlidingWindowSpec, 64), (RBLNSlidingWindowSpec, 8)],
-        ids=["append_kernel", "shift_kernel"],
-    )
-    def test_sub_block_caching_puts_the_append_kernel_on_the_manager_block(
-        self, spec_cls, expected
-    ):
-        # The append kernel then slices the buffer it shares with a full-
-        # attention layer in that layer's geometry; the shift kernel cannot
-        # leave its window.
-        sw = _sliding(8, spec_cls)
-        assert prepare_kernel_block_sizes(_kv_config(sw), [[]], sub_block_size=16) == [
-            expected
-        ]
+    def test_a_window_that_does_not_divide_the_block_takes_the_block(self):
+        # Upstream's block table refuses a kernel block that does not divide
+        # the block. Only the append kernel's spec can carry such a window.
+        sw = SlidingWindowSpec(
+            block_size=32,
+            num_kv_heads=1,
+            head_size=8,
+            dtype=torch.float16,
+            sliding_window=24,
+        )
+        assert prepare_kernel_block_sizes(_kv_config(sw), [[]]) == [32]
 
     def test_attention_uses_select_common_block_size(self):
         # AttentionSpec group -> select_common_block_size splits 32 to a backend-

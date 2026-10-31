@@ -548,9 +548,11 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                 f"RBLN NIXL D2D: the peer's sliding-window kernel addresses "
                 f"its cache in {peer_swa_block}-token blocks and this "
                 f"worker's in {sorted(self._swa_kernel_blocks)}, so the two "
-                "window ranges name different pieces of the same block. Both "
-                "ends have to run under the same sub-block prefix caching "
-                "setting."
+                "window ranges name different pieces of the same block. A "
+                "kernel addresses whole blocks where the window does not divide "
+                "the block, and did under sub-block prefix caching on a "
+                "vllm-rbln from before the window kernel kept to its window, so "
+                "compare the two ends' block size and version."
             )
         n_remote = len(nixl_agent_meta.kv_caches_base_addr)
         peer_layers = len(nixl_agent_meta.registered_layer_names)

@@ -22,6 +22,15 @@ from vllm.v1.kv_cache_interface import SlidingWindowSpec
 from vllm.v1.request import Request
 
 
+def window_splits_block(spec: SlidingWindowSpec) -> bool:
+    """Whether the window kernel holds each block as several window-sized
+    kernel blocks: the window is smaller than the block and divides it."""
+    return (
+        spec.sliding_window < spec.block_size
+        and spec.block_size % spec.sliding_window == 0
+    )
+
+
 @dataclass(frozen=True)
 class RBLNSlidingWindowSpec(SlidingWindowSpec):
     def __post_init__(self):
