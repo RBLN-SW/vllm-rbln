@@ -724,6 +724,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                 self.nixl_wrapper.release_dlist_handle(handle)
         for skey in [k for k in self._shard_region_group_ids if k[0] == engine_id]:
             del self._shard_region_group_ids[skey]
+            self._shard_peer_region_group_ids.pop(skey, None)
         for skey in [k for k in self._shard_descs_per_block if k[0] == engine_id]:
             del self._shard_descs_per_block[skey]
         for skey in [k for k in self._shard_chunk_grids if k[0] == engine_id]:
@@ -1158,6 +1159,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                         peer_areas=peer_areas,
                         plan=plan,
                         remote_tp_size=remote_tp_size,
+                        peer_region_group_ids=metadata.region_group_ids,
                     )
                     overlapping.append(global_rank)
         # Published once, not accumulated: a handshake that raises partway
@@ -1420,6 +1422,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         peer_areas: list[int] | None = None,
         plan: tuple[list[int], list[list[Piece]]] | None = None,
         remote_tp_size: int = 1,
+        peer_region_group_ids: list[int] | None = None,
     ) -> None:
         """Register one peer shard's local list and what indexes into it.
 
@@ -1458,6 +1461,13 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         self.src_xfer_handles_by_remote[key] = handle
         self._shard_region_group_ids[(engine_id, global_rank)] = tuple(
             self.region_group_ids[i] for i in region_ids
+        )
+        self._shard_peer_region_group_ids[(engine_id, global_rank)] = (
+            self._shard_peer_group_ids(
+                registered_layer_names, peer_region_group_ids, peer_areas
+            )
+            if plan is None and peer_region_group_ids
+            else self._shard_region_group_ids[(engine_id, global_rank)]
         )
         self._shard_descs_per_block[(engine_id, global_rank)] = (
             (1,) * len(region_ids) if pieces is None else tuple(map(len, pieces))
@@ -1529,6 +1539,27 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
             )
         (band,) = bands
         return band
+
+    def _shard_peer_group_ids(
+        self,
+        registered_layer_names: tuple[str, ...],
+        peer_region_group_ids: list[int],
+        peer_areas: list[int] | None,
+    ) -> tuple[int, ...]:
+        """The peer's group of each region `_shard_local_region_ids` lists.
+
+        A pipelined producer numbers its groups off its own stage layout, so a
+        layer's group there can differ from ours; its block ids follow its
+        numbering.
+        """
+        rpl = self._regions_per_layer()
+        wanted = None if peer_areas is None else set(peer_areas)
+        return tuple(
+            peer_region_group_ids[peer * rpl + k]
+            for peer, local in self._layer_overlap(registered_layer_names)
+            for k in range(rpl)
+            if wanted is None or (local * rpl + k) % self._kv_areas in wanted
+        )
 
     def _trim_agent_meta_to_layers(
         self, nixl_agent_meta: RblnNixlAgentMetadata, overlap: list[tuple[int, int]]
@@ -1733,9 +1764,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                     peer_region = peer * rpl + area
                     local_region = local * rpl + area
                     if (
-                        nixl_agent_meta.region_group_ids[peer_region]
-                        != self.region_group_ids[local_region]
-                        or nixl_agent_meta.block_lens[peer_region]
+                        nixl_agent_meta.block_lens[peer_region]
                         != self.block_len_per_layer[local_region]
                     ):
                         raise RuntimeError(

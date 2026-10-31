@@ -957,6 +957,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                 remote_block_ids,
                 num_valid_tokens=tail_tokens,
                 num_prompt_blocks=n_prompt_blocks,
+                remote=True,
             )
             local_descs = self._shard_descs_for_tokens(
                 engine_id,

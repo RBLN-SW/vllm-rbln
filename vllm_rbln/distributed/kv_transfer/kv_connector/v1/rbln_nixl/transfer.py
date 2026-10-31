@@ -301,13 +301,19 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
         num_blocks: int,
         block_ids: BlockIds,
         needed: int | None = None,
+        *,
+        remote: bool = False,
     ) -> np.ndarray:
         """This shard's whole-block descriptors for `block_ids`.
 
         `needed` is how many chunks of the last block hold tokens; a region
         holding any chunk past them leaves that block to the chunk range.
         """
-        region_group_ids = self._shard_region_group_ids[(engine_id, global_rank)]
+        region_group_ids = (
+            self._shard_peer_region_group_ids
+            if remote
+            else self._shard_region_group_ids
+        )[(engine_id, global_rank)]
         per_block = self._shard_descs_per_block[(engine_id, global_rank)]
         # `(first chunk, chunks)` of a block each region holds: off the grid
         # where the lists carry one, and without one a chunk is a span, so each
@@ -436,6 +442,7 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
         *,
         num_valid_tokens: int | None,
         num_prompt_blocks: int,
+        remote: bool = False,
     ) -> np.ndarray:
         """This shard's descriptors for `block_ids`, cut to the tokens held.
 
@@ -454,7 +461,7 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
             chunk_grid=self._shard_chunk_grids[(engine_id, global_rank)],
         )
         descs = self._get_block_descs_ids_for_shard(
-            engine_id, global_rank, num_blocks, block_ids, needed=needed
+            engine_id, global_rank, num_blocks, block_ids, needed=needed, remote=remote
         )
         if needed is None or not block_ids[0]:
             return descs

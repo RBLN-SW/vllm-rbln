@@ -115,7 +115,17 @@ class RblnNixlPullConnectorWorker(RblnNixlWorkerBase, NixlPullConnectorWorker):
         # tail, so the last element is still the request's last block.
         n_prompt_blocks = sum(len(g) for g in remote_block_ids)
 
-        if not prefix_hit:
+        if not prefix_hit and len(remote_block_ids) != len(local_block_ids):
+            # A pipelined producer can split the same layers into more groups.
+            # Regions pick their own side's group, so the lists need not pair,
+            # but a prefix trim does: only a whole-prompt read is expressible.
+            assert len(local_block_ids) == len(self.kv_cache_config.transfer_groups)
+            assert len(local_block_ids[0]) == len(remote_block_ids[0]), (
+                f"RBLN NIXL: a local prefix hit on {req_id} against a producer "
+                f"with {len(remote_block_ids)} KV groups to our "
+                f"{len(local_block_ids)} has no group pairing to trim by"
+            )
+        elif not prefix_hit:
             # _apply_prefix_caching indexes per KV-cache group, so a group-count
             # mismatch must fail loudly here rather than as an opaque IndexError.
             assert (
@@ -184,6 +194,7 @@ class RblnNixlPullConnectorWorker(RblnNixlWorkerBase, NixlPullConnectorWorker):
                 remote_block_ids,
                 num_valid_tokens=valid_tokens,
                 num_prompt_blocks=n_prompt_blocks,
+                remote=True,
             )
             local_descs = self._shard_descs_for_tokens(
                 engine_id,
