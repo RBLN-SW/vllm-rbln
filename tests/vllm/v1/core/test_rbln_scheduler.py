@@ -777,6 +777,24 @@ class TestSchedulePrefillAllocation:
         assert req_a.request_id not in out.num_scheduled_tokens
         assert out.num_scheduled_tokens[req_b.request_id] == max_num_batched_tokens
 
+    def test_prefill_chunks_are_capped_at_the_prefill_chunk_size(self):
+        # The step budget stays 128; the prefill graph is compiled at 64.
+        sched = create_rbln_scheduler(
+            max_num_batched_tokens=128,
+            max_model_len=256,
+            block_size=128,
+            num_blocks=10000,
+            additional_config={"prefill_chunk_size": 64},
+        )
+        req = create_requests(1, num_tokens=200, block_size=128)[0]
+        sched.add_request(req)
+        chunks = []
+        while req.num_computed_tokens < 200:
+            out = sched.schedule()
+            chunks.append(out.num_scheduled_tokens[req.request_id])
+            sched.update_from_output(out, make_model_runner_output(out))
+        assert chunks == [64, 64, 64, 8]
+
     def test_partial_block_is_cached_once_decode_fills_it(self):
         # A prompt that stops mid-block leaves it uncached until decode supplies
         # the missing token.

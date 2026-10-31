@@ -130,6 +130,11 @@ class RBLNScheduler(Scheduler):
         # the soft cap a no-op. See v1/core/utils.py.
         self._pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
 
+        self._prefill_chunk_size = (
+            rbln_config.prefill_chunk_size
+            or self.scheduler_config.max_num_batched_tokens
+        )
+
     def _decode_demand(self) -> int:
         """Total decode demand for this step's soft (ceil(demand/pp)) cap.
 
@@ -285,7 +290,7 @@ class RBLNScheduler(Scheduler):
                 continue
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
-            num_new_tokens = min(num_new_tokens, token_budget)
+            num_new_tokens = min(num_new_tokens, self._prefill_chunk_size, token_budget)
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
@@ -632,6 +637,7 @@ class RBLNScheduler(Scheduler):
                     threshold = self.scheduler_config.long_prefill_token_threshold
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
+                    num_new_tokens = min(num_new_tokens, self._prefill_chunk_size)
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
