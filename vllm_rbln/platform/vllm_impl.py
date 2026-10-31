@@ -97,6 +97,43 @@ def _validate(vllm_config: "VllmConfig") -> None:
             f"RBLN; got dtype={model_config.dtype}. Pass --dtype bfloat16."
         )
 
+    if text_config.model_type == "glm5_next_text":
+        if not vllm_config.cache_config.cache_dtype.startswith("fp8"):
+            raise ValueError(
+                "GLM-5.3 needs an fp8 KV cache on RBLN; pass --kv-cache-dtype fp8."
+            )
+        # The kpool indexer's tail ring holds 3 + K positions in at most 8 slots.
+        spec = vllm_config.speculative_config
+        if spec is not None and (
+            spec.method != "mtp" or not 1 <= spec.num_speculative_tokens <= 5
+        ):
+            raise ValueError(
+                "GLM-5.3 speculative decoding on RBLN runs its MTP head with "
+                f"num_speculative_tokens 1 to 5 only; got method={spec.method!r}, "
+                f"num_speculative_tokens={spec.num_speculative_tokens}."
+            )
+        cache_config = vllm_config.cache_config
+        if (
+            cache_config.enable_prefix_caching
+            and cache_config.user_specified_mamba_block_size
+            and cache_config.mamba_block_size != cache_config.block_size
+        ):
+            raise ValueError(
+                "GLM-5.3 prefix caching keeps a KDA state a KV block on RBLN; "
+                f"got --mamba-block-size {cache_config.mamba_block_size} and "
+                f"--block-size {cache_config.block_size}."
+            )
+        if (
+            cache_config.enable_prefix_caching
+            and cache_config.prefix_match_unit is not None
+            and cache_config.prefix_match_unit < cache_config.block_size
+        ):
+            raise ValueError(
+                "GLM-5.3 prefix caching on RBLN hits whole KV blocks only; got "
+                f"--prefix-match-unit {cache_config.prefix_match_unit} below "
+                f"--block-size {cache_config.block_size}."
+            )
+
     if rbln_config.compile_dtype:
         from vllm_rbln.compilation import check_dtype_option_supported
 
@@ -311,6 +348,22 @@ def _override(vllm_config: "VllmConfig") -> None:
         # RBLN(NOTE): force dtype into fp16 for eager mode
         model_config.dtype = torch.float16
 
+    text_config = model_config.hf_text_config
+    if text_config.model_type == "glm5_next_text":
+        tp_size = vllm_config.parallel_config.tensor_parallel_size
+        block_size = vllm_config.cache_config.block_size
+        num_heads = text_config.linear_num_heads // tp_size
+        state_bytes = text_config.linear_head_dim**2 * model_config.dtype.itemsize
+        group_heads, rem = divmod(block_size * text_config.kv_lora_rank, state_bytes)
+        if rem or not group_heads or num_heads % group_heads:
+            head_block_size = state_bytes // text_config.kv_lora_rank
+            raise ValueError(
+                "GLM-5.3 on RBLN fills an fp8 MLA latent block with whole KDA head "
+                f"states, so at TP {tp_size} --block-size must be {head_block_size} "
+                f"times a divisor of the {num_heads} heads a rank holds (at most "
+                f"{head_block_size * num_heads}); got {block_size}."
+            )
+
     if vllm_config.compilation_config.mode != CompilationMode.NONE:
         logger.info(
             "vLLM compilation mode is not used on RBLN because "
@@ -336,6 +389,28 @@ def _override(vllm_config: "VllmConfig") -> None:
             "Overriding model_config.disable_cascade_attn to True."
         )
         model_config.disable_cascade_attn = True
+
+    cache_config = vllm_config.cache_config
+    if (
+        model_config.hf_text_config.model_type == "glm5_next_text"
+        and cache_config.enable_prefix_caching
+        and vllm_config.speculative_config is not None
+        and cache_config.prefix_cache_retention_interval != 0
+    ):
+        # A KDA verify step stores its first token's state and replays the accepted
+        # drafts next step, so a block it crossed holds no state at its end. Retention
+        # 0 caches only states a prefill stored (prompt end, shared-prefix junction).
+        logger.warning(
+            "Disabling prefix caching: GLM-5.3 on RBLN runs it with speculative "
+            "decoding only at prefix_cache_retention_interval 0, got %s.",
+            cache_config.prefix_cache_retention_interval,
+        )
+        cache_config.enable_prefix_caching = False
+        # MambaModelConfig set these for prefix caching before this hook; back to
+        # the values it uses without it.
+        cache_config.mamba_cache_mode = "none"
+        if not cache_config.user_specified_mamba_block_size:
+            cache_config.mamba_block_size = model_config.max_model_len
 
 
 def _wire(vllm_config: "VllmConfig") -> None:

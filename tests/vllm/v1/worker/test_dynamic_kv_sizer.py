@@ -16,6 +16,7 @@
 SimpleNamespace stand-ins that carry only the state each path reads."""
 
 import sys
+import weakref
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -85,7 +86,6 @@ def _kv_cache_tensors(num_caches: int, stride: int = 1024):
 def _bind_sizing(sizer) -> None:
     """Give a SimpleNamespace sizer the real placement-sizing methods."""
     sizer.log_release_shortfall = DynamicKvSizer.log_release_shortfall
-    sizer._specs_covering_tensors = DynamicKvSizer._specs_covering_tensors
     for name in (
         "_kv_growth_from_programs",
         "_size_kv_from_snapshot",
@@ -227,6 +227,19 @@ class TestComputeDynamicKvNumBlocks:
             num_caches = sum(
                 spec.physical_placement is not None for spec in programs[0].input_specs
             )
+        caches = {}
+        bindings = {}
+        for program in programs:
+            bound = [torch.empty(1)]
+            for i, spec in enumerate(program.input_specs[1:]):
+                name = f"{program.name.split('/')[0]}.{i}"
+                if name not in caches:
+                    caches[name] = torch.empty(spec.shape, device="meta")
+                bound.append(caches[name])
+            bindings[id(program.runtime)] = tuple(weakref.ref(t) for t in bound)
+        while len(caches) < num_caches:
+            caches[f"missing.{len(caches)}"] = torch.empty(1, device="meta")
+        allocations = {name: weakref.ref(t) for name, t in caches.items()}
         sizer = SimpleNamespace(
             rank=0,
             device=torch.device("cpu"),
@@ -244,8 +257,11 @@ class TestComputeDynamicKvNumBlocks:
                     kv_cache_groups=list(kv_cache_groups),
                 ),
                 _kernel_block_sizes=list(kernel_block_sizes),
+                kv_cache_allocations=allocations,
+                kv_caches=list(caches.values()),
             ),
             programs=list(programs),
+            program_inputs=bindings,
             memory_snapshot=lambda device: (snapshot, "stub"),
             copy_stream_reserve_bytes=lambda: 0,
             release_kv_cache_tensors=lambda cfg: None,
@@ -423,17 +439,18 @@ class TestComputeDynamicKvNumBlocks:
         assert "summed over 2 KV input(s) from 1 set(s)" in caplog.text
         assert "vllm allocated 1 KV cache tensor(s) over 2 cache(s)" in caplog.text
 
-    def test_a_count_that_matches_neither_reading_is_refused(self):
+    def test_verify_only_cache_is_counted_once_beside_a_drafter(self):
         programs = [
             _program([HEAD_SPLIT, HEAD_SPLIT], name="0/0"),
-            _program([HEAD_SPLIT_S1, HEAD_SPLIT_S1], name="0/1"),
+            _program([HEAD_SPLIT_S1] * 3, name="0/1"),
+            _program([HEAD_SPLIT], name="1/0"),
         ]
         sizer = self._sizer(
-            programs=programs, snapshot=self._snapshot([30 * self.GIB] * 4)
+            programs=programs,
+            snapshot=self._snapshot([30 * self.GIB] * 4),
+            num_caches=4,
         )
-        sizer.model_runner.kv_cache_config.kv_cache_tensors = _kv_cache_tensors(3)
-        with pytest.raises(RuntimeError, match="neither sum to nor"):
-            DynamicKvSizer.compute_num_blocks(sizer)
+        assert DynamicKvSizer.compute_num_blocks(sizer) == 5 * 256
 
     def test_programs_that_disagree_on_the_layout_are_refused(self):
         other = _placement((_shard(0, 0, (2, S0, 8, 1, 1024, 128)),))
@@ -629,17 +646,19 @@ class TestWarmupCapturesPrograms:
             ),
             DynamicKvSizer.capture_programs(sizer) as programs,
         ):
-            pass
+            assert dks.program_input_bindings.get() is sizer.program_inputs
+        assert dks.program_input_bindings.get() is None
         assert programs is recorded
 
     def test_on_without_capture_programs_refuses(self):
         with (
             patch.object(dks.torch, "rbln", SimpleNamespace(), create=True),
             pytest.raises(RuntimeError, match="capture_programs"),
-        ):
             DynamicKvSizer.capture_programs(
                 SimpleNamespace(mode=dks.DynamicKvMode.ACTIVE)
-            )
+            ),
+        ):
+            pass
 
     def test_runtimes_are_deduped_across_programs(self):
         shared = object()
@@ -884,9 +903,11 @@ class TestDynamicKvFailuresRaise:
             model_runner=SimpleNamespace(
                 kv_cache_config=SimpleNamespace(
                     num_blocks=211, kv_cache_tensors=_kv_cache_tensors(2)
-                )
+                ),
+                kv_cache_allocations={},
             ),
             programs=list(programs),
+            program_inputs={},
             release_kv_cache_tensors=lambda cfg: None,
         )
         _bind_sizing(sizer)
@@ -1102,12 +1123,17 @@ class TestReleaseKvCacheTensors:
         # The rebind reassigns these together from one ordered name list, so a
         # piece left behind describes a cache that no longer exists.
         layer = SimpleNamespace(kv_cache=torch.zeros(1))
+        aux = SimpleNamespace(kv_cache=torch.zeros(1))
         model_runner = SimpleNamespace(
             kv_caches=[torch.zeros(1)],
             kv_cache_bases=[torch.zeros(1)],
             kv_cache_names=["l0"],
             kv_cache_block_axes={"l0": 1},
-            compilation_config=SimpleNamespace(static_forward_context={"l0": layer}),
+            compilation_config=SimpleNamespace(
+                static_forward_context={"l0": layer, "aux": aux}
+            ),
+            aux_kv_cache_layers=["aux"],
+            kv_cache_allocations={"l0": weakref.ref(layer.kv_cache)},
         )
         sizer = SimpleNamespace(
             model_runner=model_runner,
@@ -1125,4 +1151,6 @@ class TestReleaseKvCacheTensors:
         assert model_runner.kv_cache_bases == []
         assert model_runner.kv_cache_names == []
         assert model_runner.kv_cache_block_axes == {}
+        assert model_runner.kv_cache_allocations == {}
         assert layer.kv_cache is None
+        assert aux.kv_cache is None

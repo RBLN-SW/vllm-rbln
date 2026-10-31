@@ -23,6 +23,9 @@ import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
+from weakref import ReferenceType
+
+import torch
 
 from vllm_rbln.logger import init_logger
 
@@ -122,17 +125,13 @@ def _erase_symbols(dim: Any) -> Any:
     return dim
 
 
-def _tensor_fingerprint(spec: Any) -> tuple:
-    """What a KV input looks like regardless of how it is sharded."""
-    placement = spec.physical_placement
-    return (tuple(spec.shape), _erase_symbols(placement.shape), str(placement.dtype))
-
-
 def _input_key(spec: Any) -> tuple:
-    """Order-independent identity of a KV input, for comparing programs."""
+    """Layout signature, independent of symbol names and shard order."""
     placement = spec.physical_placement
     return (
-        *_tensor_fingerprint(spec),
+        tuple(spec.shape),
+        _erase_symbols(placement.shape),
+        str(placement.dtype),
         tuple(
             sorted(
                 (int(s.node_id), int(s.chiplet_id), _erase_symbols(s.slice_shape))
@@ -142,38 +141,67 @@ def _input_key(spec: Any) -> tuple:
     )
 
 
-def select_kv_input_groups(programs: Sequence[Any]) -> list[tuple[list[Any], Any]]:
-    """The distinct sets of KV inputs the programs bind (the target's, a
-    drafter's), one `(specs, program)` each, in first-seen order. Inputs matching
-    in shape and dtype but not in shards are the same tensors placed two ways,
-    and refuse."""
-    groups: dict[tuple, tuple[list[Any], Any]] = {}
-    fingerprints: dict[tuple, tuple] = {}
-    for program in programs:
-        specs = [
-            spec for spec in program.input_specs if spec.physical_placement is not None
-        ]
-        if not specs:
-            continue
-        key = tuple(sorted(_input_key(spec) for spec in specs))
-        if key in groups:
-            continue
-        fingerprint = tuple(sorted(_tensor_fingerprint(spec) for spec in specs))
-        if fingerprint in fingerprints:
-            other = groups[fingerprints[fingerprint]][1]
+def select_kv_input_groups(
+    programs: Sequence[Any],
+    allocations: Mapping[str, ReferenceType[torch.Tensor]],
+    program_inputs: Mapping[int, Sequence[ReferenceType[torch.Tensor]]],
+) -> list[tuple[list[Any], Any]]:
+    from vllm_rbln.v1.attention.kv_cache_bindings import kv_cache_tensor_key
+
+    names_by_key = {}
+    for name, ref in allocations.items():
+        tensor = ref()
+        if tensor is None:
             raise RuntimeError(
-                "compiled programs disagree on the KV cache placement: "
-                f"{_program_name(other)} and {_program_name(program)} bind the "
-                f"same {len(specs)} KV input(s) with different shard layouts. A KV "
-                "tensor can only hold one placement at a time."
+                f"initialized KV cache {name!r} was released before sizing"
             )
-        groups[key] = (specs, program)
-        fingerprints[fingerprint] = key
-    if not groups:
+        names_by_key[kv_cache_tensor_key(tensor)] = name
+    selected: dict[str, tuple[Any, Any]] = {}
+    for program in programs:
+        if not any(s.physical_placement is not None for s in program.input_specs):
+            continue
+        input_refs = program_inputs.get(id(program.runtime))
+        if input_refs is None:
+            raise RuntimeError(
+                f"{_program_name(program)} has no captured input bindings"
+            )
+        for spec, input_ref in zip(program.input_specs, input_refs, strict=True):
+            if spec.physical_placement is None:
+                continue
+            tensor = input_ref()
+            if tensor is None:
+                raise RuntimeError(
+                    f"{_program_name(program)} KV input {spec.name!r} "
+                    "has no live binding"
+                )
+            cache_name = names_by_key.get(kv_cache_tensor_key(tensor))
+            if cache_name is None:
+                raise RuntimeError(
+                    f"{_program_name(program)} input {spec.name!r} "
+                    "is not an initialized KV cache allocation"
+                )
+            previous = selected.get(cache_name)
+            if previous is None:
+                selected[cache_name] = (spec, program)
+            elif _input_key(previous[0]) != _input_key(spec):
+                raise RuntimeError(
+                    f"compiled programs disagree on KV cache {cache_name!r}: "
+                    f"{_program_name(previous[1])} and {_program_name(program)} "
+                    "bind the same allocation with different layouts."
+                )
+    if not selected:
         raise RuntimeError(
             f"none of the {len(programs)} compiled program(s) carries a dynamic-shape "
             "KV input; was VLLM_CACHE_ROOT replaying a static build?"
         )
+    missing = allocations.keys() - selected.keys()
+    if missing:
+        raise RuntimeError(
+            f"initialized KV caches have no compiled placement: {sorted(missing)}"
+        )
+    groups: dict[int, tuple[list[Any], Any]] = {}
+    for spec, program in selected.values():
+        groups.setdefault(id(program), ([], program))[0].append(spec)
     return list(groups.values())
 
 

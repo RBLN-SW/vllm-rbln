@@ -175,6 +175,19 @@ class TestBuildKvCacheBaseBindings:
         assert view_infos[0].dynamic_scale == (1, 1)
         assert materialize_kv_cache_view([base], view_infos[0]).shape == (4, 8)
 
+    def test_a_view_to_the_bases_own_dtype_is_dropped(self):
+        base = torch.zeros(4, 16, dtype=torch.uint8)
+        infos = {
+            _layer(0): KVCacheViewInfo(view_shape=(4, 16), view_dtype=torch.uint8),
+            _layer(1): KVCacheViewInfo(
+                view_shape=(4, 16), view_dtype=torch.float8_e4m3fn
+            ),
+        }
+        _, view_infos = build_kv_cache_base_bindings(
+            {_layer(0): base, _layer(1): base}, infos
+        )
+        assert [vi.view_dtype for vi in view_infos] == [None, torch.float8_e4m3fn]
+
     def test_mixed_shared_and_distinct_storage(self):
         # Two layers on one cache plus an independent third: guards the
         # dedup <-> index interaction the pure cases cannot.

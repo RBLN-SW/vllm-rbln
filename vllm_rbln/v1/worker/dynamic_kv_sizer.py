@@ -19,10 +19,11 @@ import gc
 import os
 import re
 from collections.abc import Mapping
-from contextlib import nullcontext
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any
+from weakref import ReferenceType
 
 import torch
 import torch.rbln  # noqa: F401  # a hard dependency; see pyproject.
@@ -39,7 +40,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
-from vllm_rbln.compilation.backends import set_compile_stage
+from vllm_rbln.compilation.backends import program_input_bindings, set_compile_stage
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.core.utils import sub_block_size_in_use
 from vllm_rbln.v1.worker.kv_placement import (
@@ -59,7 +60,6 @@ from vllm_rbln.v1.worker.utils import (
     compile_and_warmup_skip_reason,
     dynamic_kv_unsupported_reason,
     estimate_available_memory,
-    kv_cache_extents,
     rescale_kv_cache_config,
 )
 
@@ -207,6 +207,7 @@ class DynamicKvSizer:
         # The count vLLM sized, held while the cache is shrunk for the compile.
         self.kv_blocks_before_shrink: int | None = None
         self.programs: list[Any] = []
+        self.program_inputs: dict[int, tuple[ReferenceType[torch.Tensor], ...]] = {}
         self.expected_used: dict[Unit, int] = {}
         # Other tenants' card DRAM at init; the allocator-snapshot fallback only.
         self.foreign_dram_used_bytes = foreign_dram_used_bytes
@@ -353,17 +354,25 @@ class DynamicKvSizer:
         )
         return shrunk
 
+    @contextmanager
     def capture_programs(self):
         """Scope that records the programs warm-up builds, when the flag is on."""
         if self.mode is DynamicKvMode.DISABLED:
-            return nullcontext(None)
+            yield None
+            return
         capture = getattr(torch.rbln, "capture_programs", None)
         if capture is None:
             raise RuntimeError(
                 "The dynamic KV cache needs torch_rbln's capture_programs(); "
                 "this torch_rbln does not carry it."
             )
-        return capture()
+        self.program_inputs = {}
+        token = program_input_bindings.set(self.program_inputs)
+        try:
+            with capture() as programs:
+                yield programs
+        finally:
+            program_input_bindings.reset(token)
 
     def collect_runtimes(self) -> list[Any]:
         """Every rbln runtime warm-up built, deduplicated across programs."""
@@ -476,7 +485,9 @@ class DynamicKvSizer:
         """The KV growth the captured programs' placements imply, the hint they
         were traced with, and the device they run on."""
         programs = list(self.programs)
-        groups = select_kv_input_groups(programs)
+        groups = select_kv_input_groups(
+            programs, self.model_runner.kv_cache_allocations, self.program_inputs
+        )
         hint_blocks = self.model_runner.kv_cache_config.num_blocks
         for group_specs, group_program in groups:
             logger.info(
@@ -491,10 +502,8 @@ class DynamicKvSizer:
             )
         cfg = self.model_runner.kv_cache_config
         tensors = cfg.kv_cache_tensors
-        # A KV input is one allocated cache, and the layers on one extent share
-        # it, so the count is the extents rather than the layer total.
-        num_caches = len(set(kv_cache_extents(cfg).values()))
-        specs = self._specs_covering_tensors(groups, num_caches)
+        num_caches = len(self.model_runner.kv_cache_allocations)
+        specs = [spec for group_specs, _ in groups for spec in group_specs]
         logger.info(
             "[Dynamic KV] the slope is summed over %d KV input(s) from %d set(s); "
             "vllm allocated %d KV cache tensor(s) over %d cache(s).",
@@ -507,34 +516,6 @@ class DynamicKvSizer:
         program = groups[0][1]
         device = program.device if program.device is not None else self.device
         return growth, hint_blocks, device
-
-    @staticmethod
-    def _specs_covering_tensors(
-        groups: list[tuple[list[Any], Any]], num_caches: int
-    ) -> list[Any]:
-        """The KV inputs the slope is summed over: every cache once.
-
-        A group is one distinct KV input set (`select_kv_input_groups`): the
-        target's, and a drafter's next to it. If one set ever still splits into
-        two groups, summing both would charge every cache twice. `InputSpec`
-        carries no identity, so the number of caches vllm allocated is what says
-        which case this is.
-        """
-        flat = [spec for group_specs, _ in groups for spec in group_specs]
-        if len(flat) == num_caches:
-            # Disjoint sets (a target's and a drafter's): the sum is the answer.
-            return flat
-        sizes = {len(group_specs) for group_specs, _ in groups}
-        if sizes == {num_caches}:
-            # Every group already covers every cache, so one of them is it.
-            return list(groups[0][0])
-        raise RuntimeError(
-            f"the compiled programs carry {len(flat)} KV input(s) across "
-            f"{len(groups)} set(s) of {sorted(sizes)}, which neither sum to nor "
-            f"individually match the {num_caches} cache(s) vllm allocated. The "
-            "placement cannot be attributed to them, so the block count would "
-            "be wrong."
-        )
 
     def _size_kv_from_snapshot(
         self,
@@ -750,13 +731,15 @@ class DynamicKvSizer:
         mr.kv_cache_bases = []
         mr.kv_cache_names = []
         mr.kv_cache_block_axes = {}
+        mr.kv_cache_allocations = {}
 
         # Each layer's view is parked on its Attention module; the next bind
         # overwrites it only after the new tensors exist.
         forward_context = mr.compilation_config.static_forward_context
         unbound = 0
         for layer_name in dict.fromkeys(
-            name for t in old_cfg.kv_cache_tensors for name in t.layers
+            [name for t in old_cfg.kv_cache_tensors for name in t.layers]
+            + mr.aux_kv_cache_layers
         ):
             layer = forward_context.get(layer_name)
             if layer is None:
