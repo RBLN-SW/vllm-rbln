@@ -63,6 +63,7 @@ class TestShardReadPath:
         # group. Single group -> region_id * num_blocks + block_ids[0].
         w = object.__new__(RblnNixlPullConnectorWorker)
         w._shard_region_group_ids = {("eng", 1): (0, 0, 0, 0)}  # 4 regions, group 0
+        w._shard_peer_region_group_ids = dict(w._shard_region_group_ids)
         # Written together with the group ids by _register_shard_xfer_state, so
         # a shard the read path can reach always has both.
         w._shard_descs_per_block = {("eng", 1): (1,) * 4}
@@ -73,11 +74,28 @@ class TestShardReadPath:
         # region r contributes r*10 + [2,5]: [2,5, 12,15, 22,25, 32,35]
         assert list(descs) == [2, 5, 12, 15, 22, 25, 32, 35]
 
+    def test_the_remote_list_takes_blocks_by_the_peer_s_groups(self):
+        # A pipelined producer numbers a layer's group off its own stage, so
+        # the remote list picks block ids by its numbering, the local by ours.
+        w = object.__new__(RblnNixlPullConnectorWorker)
+        w._shard_region_group_ids = {("eng", 1): (0, 0)}
+        w._shard_peer_region_group_ids = {("eng", 1): (1, 1)}
+        w._shard_descs_per_block = {("eng", 1): (1, 1)}
+        w._shard_chunk_grids = {("eng", 1): None}
+        block_ids = [[2], [7]]
+
+        local = w._get_block_descs_ids_for_shard("eng", 1, 10, block_ids)
+        remote = w._get_block_descs_ids_for_shard("eng", 1, 10, block_ids, remote=True)
+
+        assert list(local) == [2, 12]
+        assert list(remote) == [7, 17]
+
     def test_get_block_descs_ids_for_shard_with_split(self):
         """Two pieces a block: each block becomes two consecutive descriptors, because
         both dlists are laid out region-major, then block, then piece."""
         w = object.__new__(RblnNixlPullConnectorWorker)
         w._shard_region_group_ids = {("eng", 1): (0, 0)}  # 2 regions
+        w._shard_peer_region_group_ids = dict(w._shard_region_group_ids)
         w._shard_descs_per_block = {("eng", 1): (2, 2)}
         w._shard_chunk_grids = {("eng", 1): None}
         descs = w._get_block_descs_ids_for_shard(
@@ -91,6 +109,7 @@ class TestShardReadPath:
         # starts after every block of region 0, at 1 x num_blocks.
         w = object.__new__(RblnNixlPullConnectorWorker)
         w._shard_region_group_ids = {("eng", 1): (0, 0)}
+        w._shard_peer_region_group_ids = dict(w._shard_region_group_ids)
         w._shard_descs_per_block = {("eng", 1): (1, 2)}
         w._shard_chunk_grids = {("eng", 1): None}
         descs = w._get_block_descs_ids_for_shard(
@@ -104,6 +123,7 @@ class TestShardReadPath:
         # and region 1 is found at its own place in the whole-block range.
         w = object.__new__(RblnNixlPullConnectorWorker)
         w._shard_region_group_ids = {("eng", 1): (0, 0)}
+        w._shard_peer_region_group_ids = dict(w._shard_region_group_ids)
         w._shard_descs_per_block = {("eng", 1): (1, 2)}
         w._shard_chunk_grids = {("eng", 1): ChunkGrid(2, ((0, 1, 2), (0, 0, 1)))}
         ids = w._chunk_descs_ids_for_shard("eng", 1, 4, 3, (0, 2))
@@ -115,6 +135,7 @@ class TestShardReadPath:
         # area 1, which is the relation the trim indexes by.
         w = object.__new__(RblnNixlPullConnectorWorker)
         w._shard_region_group_ids = {("eng", 1): (0, 0, 0, 0)}
+        w._shard_peer_region_group_ids = dict(w._shard_region_group_ids)
         w._shard_descs_per_block = {("eng", 1): (1,) * 4}
         w._shard_chunk_grids = {("eng", 1): None}
         w._shard_region_spans = {("eng", 1): (0, 1, 0, 1)}
@@ -304,6 +325,7 @@ class TestShardReadPath:
     def test_get_block_descs_ids_for_shard_empty_group(self):
         w = object.__new__(RblnNixlPullConnectorWorker)
         w._shard_region_group_ids = {("eng", 0): (0, 0)}
+        w._shard_peer_region_group_ids = dict(w._shard_region_group_ids)
         w._shard_descs_per_block = {("eng", 0): (1, 1)}
         w._shard_chunk_grids = {("eng", 0): None}
         descs = w._get_block_descs_ids_for_shard("eng", 0, num_blocks=4, block_ids=[[]])
@@ -369,6 +391,7 @@ class TestShardReadPath:
         # the wrong one rejects a request that is in fact well formed.
         w.kv_cache_config = MagicMock(kv_cache_groups=[0, 1], transfer_groups=[0])
         w._shard_region_group_ids = {("eng", r): (0, 0) for r in range(pp_size)}
+        w._shard_peer_region_group_ids = dict(w._shard_region_group_ids)
         w._shard_descs_per_block = {("eng", r): (1, 1) for r in range(pp_size)}
         w._shard_chunk_grids = {("eng", r): None for r in range(pp_size)}
         w._shard_region_spans = {("eng", r): (0, 0) for r in range(pp_size)}
