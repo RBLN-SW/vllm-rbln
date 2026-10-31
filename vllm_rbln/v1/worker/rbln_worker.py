@@ -15,6 +15,7 @@
 
 import os
 import time
+from functools import cached_property
 from types import NoneType
 from typing import TYPE_CHECKING, Any
 
@@ -71,6 +72,7 @@ from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
 from vllm_rbln.v1.worker.utils import (
     RblnProfilerWrapper,
     compile_and_warmup_skip_reason,
+    compute_rbln_local_omp_cpuid,
     dynamic_kv_enabled,
     estimate_model_kernel_size,
     get_default_num_threads,
@@ -79,6 +81,7 @@ from vllm_rbln.v1.worker.utils import (
     read_rbln_card_dram_used_bytes,
     set_cpu_affinity,
     set_omp_num_threads,
+    set_preferred_memory_node,
     worker_fail_fast,
 )
 
@@ -185,6 +188,8 @@ class RBLNWorker(WorkerBase):
             self.local_rank,
             current_platform.dist_backend,
         )
+        # Before model load and warm-up, whose host pages the decode loop reuses.
+        set_preferred_memory_node(self.rank, self.local_rank, self._rbln_omp_cpuid)
 
         # Set random seed.
         set_random_seed(self.model_config.seed)
@@ -736,6 +741,13 @@ class RBLNWorker(WorkerBase):
         if num_removed:
             logger.info("Released %d RBLN offload temp file(s)", num_removed)
 
+    @cached_property
+    def _rbln_omp_cpuid(self) -> str:
+        # Computed once: the CPUs it reads shrink once the binding is applied.
+        return compute_rbln_local_omp_cpuid(
+            self.rank, self.local_rank, self.parallel_config
+        )
+
     def _ensure_rbln_host_threads_before_compile(self) -> None:
         """Set OpenMP / torch / numba threads before ``warm_up_model()`` without
         CPU affinity.
@@ -749,11 +761,7 @@ class RBLNWorker(WorkerBase):
         if self._rbln_host_threads_before_compile_ready:
             return
 
-        allocated_cpus = get_rbln_planned_affinity_cpu_count(
-            self.rank,
-            self.local_rank,
-            self.parallel_config,
-        )
+        allocated_cpus = get_rbln_planned_affinity_cpu_count(self._rbln_omp_cpuid)
         num_threads = get_default_num_threads(
             allocated_cpus, get_num_local_ranks(self.parallel_config)
         )
@@ -785,11 +793,7 @@ class RBLNWorker(WorkerBase):
         if self._rbln_cpu_affinity_applied:
             return
 
-        set_cpu_affinity(
-            self.rank,
-            self.local_rank,
-            self.parallel_config,
-        )
+        set_cpu_affinity(self.rank, self.local_rank, self._rbln_omp_cpuid)
         self._rbln_cpu_affinity_applied = True
 
 

@@ -1151,6 +1151,7 @@ class TestTheThreeListsAgree:
             region_ids,
             block_size=worker.block_size,
             rows=[p[0].rows for p in pieces],
+            token_ranges=[p[0].tokens for p in pieces],
         )
 
         remote = worker._build_head_matched_remote(peer, 0, 4, peer_areas=areas)
@@ -1168,7 +1169,7 @@ class TestTheThreeListsAgree:
         assert (cls is RblnNixlPushConnectorWorker) == (fanout == 2)
         # This shape has to be one that carries a chunk range -- without it
         # the two lists agree trivially and say nothing about the range.
-        assert grid == uniform_grid(1, 2, regions=len(grid.regions))
+        assert grid == uniform_grid(1, 2, regions=len(grid.entries))
 
     def test_a_peers_interleaved_copies_are_found_by_their_slice(self):
         # The peer names which of its areas holds which slice; the copies of

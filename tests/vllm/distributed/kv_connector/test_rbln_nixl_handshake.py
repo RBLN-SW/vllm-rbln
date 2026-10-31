@@ -255,7 +255,7 @@ class _FakeSock:
 def _stub_plan(pieces: int, region_ids=(0,)):
     """A `_head_matched_plan` answer of `pieces` pieces a block per region,
     for a test about what the handshake does with the count."""
-    piece = Piece(0, 0, 0, 1, 1)
+    piece = Piece(0, 0, 0, 1, 1, (0, 1))
     return list(region_ids), [[piece] * pieces for _ in region_ids]
 
 
@@ -265,7 +265,11 @@ def _split_plan(region_ids, block_len, split=1, copies=1, rows=1):
     the lists and the indices do with a plan rather than how one is derived."""
     sub = block_len // split
     return list(region_ids), [
-        [Piece(j * sub, 0, 0, sub, rows) for j in range(split) for _ in range(copies)]
+        [
+            Piece(j * sub, 0, 0, sub, rows, (0, 16))
+            for j in range(split)
+            for _ in range(copies)
+        ]
         for _ in region_ids
     ]
 
@@ -2413,6 +2417,22 @@ class TestChunkSizing:
             2, ((0, 0, 1), (0, 0, 1), (1, 0, 1), (1, 0, 1)) + ((0, 1, 2),) * 4
         )
 
+    def test_a_head_cut_s_chunk_is_cut_for_the_peer_s_ranges_too(self):
+        # A head cut meeting a context cut pairs in entries of the peer's
+        # 6-token ranges. Our 24-token span alone would take an 8-token step's
+        # chunk at 8, which no range lines up with; the ranges take it to 12.
+        w = self._grid_worker(block_len=24 * 256, prefill=8, local_heads=4)
+        fill_region_geometry(w, areas=4, axes=[ChipletSplitAxis.HEAD] * 8, slices=4)
+
+        grid = w._shard_chunk_grid(
+            [0] * 4,
+            block_size=24,
+            rows=[1] * 4,
+            token_ranges=[(6 * a, 6 * a + 6) for a in range(4)],
+        )
+
+        assert grid == ChunkGrid(2, ((0, 0, 1), (0, 0, 1), (1, 0, 1), (1, 0, 1)))
+
     def test_an_area_exactly_one_chunk_wide_is_named_by_its_whole_block(self):
         # A 256-token step over a 1k block cut on tokens into four areas: each
         # area is one chunk, so its whole-block descriptor names it and the
@@ -3128,7 +3148,10 @@ class TestHeadBandMatching:
         w = self._grid_worker(monkeypatch=monkeypatch)
 
         assert w._shard_chunk_grid(
-            range(4), block_size=16, rows=None if rows is None else [rows] * 4
+            range(4),
+            block_size=16,
+            rows=None if rows is None else [rows] * 4,
+            token_ranges=None if rows is None else [(0, 16)] * 4,
         ) == uniform_grid(*expected, regions=4)
 
     @pytest.mark.parametrize(
@@ -3149,7 +3172,10 @@ class TestHeadBandMatching:
         w._kv_per_block = kv_per_block
 
         assert w._shard_chunk_grid(
-            range(4), block_size=16, rows=None if rows is None else [rows] * 4
+            range(4),
+            block_size=16,
+            rows=None if rows is None else [rows] * 4,
+            token_ranges=None if rows is None else [(0, 16)] * 4,
         ) == uniform_grid(*expected, regions=4)
 
     def test_regions_that_disagree_on_their_band_take_their_own_runs(self, monkeypatch):
@@ -3222,7 +3248,10 @@ class TestHeadBandMatching:
         )
         assert region_ids == [0, 1, 2, 3]
         grid = w._shard_chunk_grid(
-            region_ids, block_size=block, rows=[p[0].rows for p in pieces]
+            region_ids,
+            block_size=block,
+            rows=[p[0].rows for p in pieces],
+            token_ranges=[p[0].tokens for p in pieces],
         )
         _handle, local = w._register_shard_local_xfer_handler(
             block,
@@ -3269,7 +3298,7 @@ class TestHeadBandMatching:
             tp_r,
             remote_rank,
         )
-        assert grid is not None and len({runs for _, runs, _ in grid.regions}) == 2
+        assert grid is not None and len({runs for _, runs, _ in grid.entries}) == 2
         assert len(ours) == len(theirs)
         assert ours == theirs
         # Past the whole pieces, an entry is one head's chunk of tokens in one
@@ -4268,7 +4297,7 @@ class TestAHeadCutMeetsAContextCutAcrossTp:
     sweep's contract read cell by cell: row i of ours and row i of the peer's
     name the same (K/V, head, token) cells, every cell of ours is named once,
     no cell of the peer's twice, and the rows a block's ids pick are that
-    block's -- or a chunk's, on the side whose areas the pieces do not split.
+    block's, and a chunk's ids that chunk's, on either side.
     """
 
     AREAS = 4
@@ -4302,13 +4331,15 @@ class TestAHeadCutMeetsAContextCutAcrossTp:
         ]
 
     @classmethod
-    def _latent(cls):
-        """An indexer's key over the four areas, cut on tokens on either side
-        and the same on every rank."""
-        span = _TOKENS // cls.AREAS
+    def _latent(cls, slices=None):
+        """An indexer's key over the four areas, cut on tokens into `slices`
+        ranges (one an area by default), and the same on every rank."""
+        slices = slices or cls.AREAS
+        span = _TOKENS // slices
+        (ids,) = area_slices(cls.AREAS, slices, 1)
         return [
-            _RegionLayout(1, (0,), _TOKEN_BYTES, 1, (a * span, (a + 1) * span))
-            for a in range(cls.AREAS)
+            _RegionLayout(1, (0,), _TOKEN_BYTES, 1, (s * span, (s + 1) * span))
+            for s in ids
         ]
 
     @classmethod
@@ -4323,10 +4354,14 @@ class TestAHeadCutMeetsAContextCutAcrossTp:
         chunks=None,
         stream=False,
         latent=False,
+        latent_slices=(None, None),
+        step=None,
     ):
         """Our lists against every peer rank's, as `(mine, peers)` per rank.
 
-        `latent` adds a second logical region, an indexer beside the layer.
+        `latent` adds a second logical region, an indexer beside the layer, cut
+        into `latent_slices` token ranges here and on the peer.
+        `step` overrides the prefill step `chunks` cuts an area into.
         """
         # Pull is TP4 rank `local_rank`, context-cut, reading the head cut at
         # `coarse_tp`, and pull_coarse a head-cut rank reading the TP4 ranks it
@@ -4350,7 +4385,8 @@ class TestAHeadCutMeetsAContextCutAcrossTp:
         attention = cls._layouts(
             axis_l, tp_rank=rank_l, tp_size=tp_l, total=total, kv=kv
         )
-        layouts = attention + (cls._latent() if latent else [])
+        ours_latent, theirs_latent = latent_slices
+        layouts = attention + (cls._latent(ours_latent) if latent else [])
         names = ("l0", "l1") if latent else ("l0",)
         w = TestHeadBandMatching._worker(
             tp_rank=rank_l,
@@ -4373,7 +4409,7 @@ class TestAHeadCutMeetsAContextCutAcrossTp:
             w,
             areas=cls.AREAS,
             axes=[axis_l] + [ChipletSplitAxis.TOKEN] * latent,
-            slices=cls.AREAS,
+            slices=[cls.AREAS] + [ours_latent or cls.AREAS] * latent,
             latent=[False] + [True] * latent,
         )
         if latent:
@@ -4386,17 +4422,19 @@ class TestAHeadCutMeetsAContextCutAcrossTp:
         if stream:
             set_shape(w, streams_prefix=True)
         w.vllm_config = mock_vllm_config()
-        w.vllm_config.scheduler_config.max_num_batched_tokens = (
+        w.vllm_config.scheduler_config.max_num_batched_tokens = step or (
             _TOKENS // cls.AREAS // (chunks or 1)
         )
         out = {}
         for rank in peer_ranks:
             peer_layouts = cls._layouts(
                 axis_r, tp_rank=rank, tp_size=tp_r, total=total, kv=kv
-            ) + (cls._latent() if latent else [])
+            ) + (cls._latent(theirs_latent) if latent else [])
             meta = _agent_meta(
                 kv_areas=cls.AREAS,
                 kv_split_axes=[axis_r] + [ChipletSplitAxis.TOKEN] * latent,
+                kv_area_slices=[list(range(cls.AREAS))]
+                + area_slices(cls.AREAS, theirs_latent or cls.AREAS, 1) * latent,
                 region_names=[name for name in names for _ in range(cls.AREAS)],
                 num_blocks=cls.NUM_BLOCKS,
                 block_size=_TOKENS,
@@ -4436,7 +4474,7 @@ class TestAHeadCutMeetsAContextCutAcrossTp:
             sender = {"push_ctx": rank_l, "pull_coarse": rank}.get(direction, 0)
             served = [attention[a] for a in (areas or range(cls.AREAS))]
             if latent and sender % group == 0:
-                served += cls._latent()
+                served += cls._latent(ours_latent)
             out[rank] = (w, mine, peers, served)
         return out
 
@@ -4453,9 +4491,9 @@ class TestAHeadCutMeetsAContextCutAcrossTp:
         }
 
     @pytest.mark.parametrize(
-        "direction, rank_l, coarse_tp, total, kv, latent",
+        "direction, rank_l, coarse_tp, total, kv, latent, latent_slices",
         [
-            (direction, rank, coarse_tp, total, kv, latent)
+            (direction, rank, coarse_tp, total, kv, latent, latent_slices)
             # At TP2 the coarser side has to hold four areas' worth of heads while a
             # finer rank still holds fewer than its areas: eight heads, two a rank.
             for coarse_tp, totals in ((1, (4, 8)), (2, (8,)))
@@ -4469,12 +4507,16 @@ class TestAHeadCutMeetsAContextCutAcrossTp:
             for rank in ranks
             # Registration seats a latent beside packed K and V only.
             for kv, latent in ((1, False), (2, False), (2, True))
+            # An indexer in fewer token ranges than the peer's, on either side.
+            for latent_slices in (
+                ((None, None), (2, None), (None, 2)) if latent else ((None, None),)
+            )
             # A TP2 coarser side and pull_coarse are there for the latent's sender.
             if latent or (coarse_tp == 1 and direction != "pull_coarse")
         ],
     )
     def test_every_cell_pairs_with_the_same_cell(
-        self, direction, rank_l, coarse_tp, total, kv, latent
+        self, direction, rank_l, coarse_tp, total, kv, latent, latent_slices
     ):
         for rank, (w, mine, peers, served) in self._run(
             direction=direction,
@@ -4483,14 +4525,22 @@ class TestAHeadCutMeetsAContextCutAcrossTp:
             local_rank=rank_l,
             coarse_tp=coarse_tp,
             latent=latent,
+            latent_slices=latent_slices,
         ).items():
             assert len(mine) == len(peers)
             for i, ((_, a), (_, b)) in enumerate(zip(mine, peers)):
                 assert a == b, f"rank {rank} row {i} pairs different cells"
             named = Counter(u for _, us in mine for u in us)
             assert set(named) == self._units(served, range(self.NUM_BLOCKS))
-            assert set(named.values()) == {1}
-            assert set(Counter((r, u) for r, us in peers for u in us).values()) == {1}
+            # An attention cell moves once. Each replica of a coarser indexer
+            # here moves its copy, writing too (picking one writer is a
+            # follow-up), and a write reaches each replica of the peer's.
+            ours, theirs = (self.AREAS // (n or self.AREAS) for n in latent_slices)
+            writes = direction.startswith("push")
+            here = {0: 1, 1: ours * (theirs if writes else 1)}
+            assert all(n == here[u.region] for u, n in named.items())
+            there = Counter((r, u) for r, us in peers for u in us)
+            assert all(n == (1, ours)[u.region] for (_, u), n in there.items())
             for block in range(self.NUM_BLOCKS):
                 ids = w._get_block_descs_ids_for_shard(
                     "peer", rank, self.NUM_BLOCKS, [[block]]
@@ -4538,30 +4588,74 @@ class TestAHeadCutMeetsAContextCutAcrossTp:
 
         assert [us for _, us in whole] == [us for _, us in peers]
 
+    # Prefill steps that make a chunk half of a context-cut area's range, and
+    # the whole of it, where every entry of the head-cut side is one chunk and
+    # names it whole. Pulling into the context cut, a chunk of an area is that
+    # area's span, so there is no grid to read but for a coarser indexer here.
     @pytest.mark.parametrize(
-        "kv, latent", [(1, False), (2, True)], ids=["layer", "with_indexer"]
+        "direction, chunks",
+        [
+            ("pull", 2),
+            ("push", 2),
+            ("push", 1),
+            ("pull_coarse", 2),
+        ],
+        ids=[
+            "pull-half_an_area",
+            "push-half_an_area",
+            "push-an_area",
+            "pull_coarse-half_an_area",
+        ],
+    )
+    @pytest.mark.parametrize(
+        "kv, latent, latent_slices",
+        [
+            (1, False, (None, None)),
+            (2, True, (None, None)),
+            # An indexer in fewer token ranges than the peer's, on either side:
+            # the coarser one pairs in pieces of the finer one's ranges.
+            (2, True, (2, None)),
+            (2, True, (None, 2)),
+        ],
+        ids=["layer", "with_indexer", "coarser_indexer_here", "coarser_indexer_there"],
     )
     @pytest.mark.parametrize("total", [4, 8], ids=["one_head_a_rank", "two"])
-    def test_a_chunk_of_the_context_cut_side_is_named_where_it_sits(
-        self, total, kv, latent
+    def test_a_chunk_is_named_where_it_sits_on_either_side(
+        self, direction, total, kv, latent, latent_slices, chunks
     ):
-        # Pulling into a context cut, a region's pieces all lie in its area's
-        # token range, so one grid a region still names a chunk's cells. An
-        # indexer's key is one run a block beside packed K and V.
-        chunks = 2
+        # Pulling into a context cut, a region's pieces lie in its own area's
+        # token range; on the head cut, writing or reading, one head-cut
+        # region's pieces lie in four, and each is an entry placed by its own.
+        # Either way the ids for chunks of a block have to name those chunks'
+        # cells on both lists.
+        width = _TOKENS // self.AREAS // chunks
+        per_block = _TOKENS // width
+        spans = [(c, c + 1) for c in range(per_block)] + [
+            (1, per_block - 1),
+            (0, per_block),
+        ]
         for rank, (w, mine, peers, served) in self._run(
-            direction="pull", total=total, kv=kv, chunks=chunks, latent=latent
+            direction=direction,
+            total=total,
+            kv=kv,
+            chunks=chunks,
+            latent=latent,
+            latent_slices=latent_slices,
         ).items():
-            width = _TOKENS // self.AREAS // chunks
-            per_block = _TOKENS // width
+            assert w._chunks_per_block(w._shard_chunk_grids[("peer", rank)]) == (
+                per_block
+            )
+            if chunks == 1:
+                # An entry one chunk wide is named by its block descriptor, so
+                # the lists hold block descriptors and nothing more.
+                per_entry = w._shard_descs_per_block[("peer", rank)]
+                assert len(mine) == len(peers) == self.NUM_BLOCKS * sum(per_entry)
             for block in range(self.NUM_BLOCKS):
-                for c in range(per_block):
+                for lo, hi in spans:
                     ids = w._chunk_descs_ids_for_shard(
-                        "peer", rank, self.NUM_BLOCKS, block, (c, c + 1)
+                        "peer", rank, self.NUM_BLOCKS, block, (lo, hi)
                     )
-                    want = self._units(
-                        served, [block], range(c * width, (c + 1) * width)
-                    )
+                    want = self._units(served, [block], range(lo * width, hi * width))
                     for rows in (mine, peers):
                         assert {u for i in ids for u in rows[i][1]} == want
 
@@ -4576,6 +4670,76 @@ class TestAHeadCutMeetsAContextCutAcrossTp:
             named = Counter(u for _, us in mine for u in us)
             assert set(named) == self._units(served, range(self.NUM_BLOCKS))
             assert set(named.values()) == {1}
+
+    # A chunk half an area, an area, and the whole block: the last of these
+    # leaves no partial block on either side, as without a peer pairing.
+    @pytest.mark.parametrize(
+        "chunks, step",
+        [(2, None), (1, None), (1, _TOKENS)],
+        ids=["half_an_area", "an_area", "a_block"],
+    )
+    @pytest.mark.parametrize(
+        "latent, latent_slices",
+        [
+            (True, (None, None)),
+            (False, (None, None)),
+            (True, (2, None)),
+            (True, (None, 2)),
+        ],
+        ids=["with_indexer", "layer", "coarser_indexer_here", "coarser_indexer_there"],
+    )
+    @pytest.mark.parametrize("direction", ["pull", "push", "pull_coarse"])
+    @pytest.mark.parametrize("total", [4, 8], ids=["one_head_a_rank", "two"])
+    def test_a_request_names_the_tokens_it_holds_and_no_more(
+        self, direction, total, chunks, step, latent, latent_slices
+    ):
+        # The last block filled to every count from one token to whole: the
+        # rows a request picks hold its tokens, rounded up to a chunk, and the
+        # entries of a range past them leave that block.
+        width = step or _TOKENS // self.AREAS // chunks
+        blocks = list(range(self.NUM_BLOCKS))
+        for rank, (w, mine, peers, served) in self._run(
+            direction=direction,
+            total=total,
+            kv=2,
+            chunks=chunks,
+            latent=latent,
+            latent_slices=latent_slices,
+            step=step,
+        ).items():
+            if (
+                direction == "pull"
+                and chunks == 1
+                and step is None
+                and latent_slices[0] is None
+            ):
+                # A chunk of the context cut's span is the span: no range, as
+                # at equal TP, and the trim takes regions whole.
+                assert w._shard_chunk_grids[("peer", rank)] is None
+            whole = w._get_block_descs_ids_for_shard(
+                "peer", rank, self.NUM_BLOCKS, [blocks]
+            )
+            for filled in range(1, _TOKENS + 1):
+                ids = w._shard_descs_for_tokens(
+                    "peer",
+                    rank,
+                    self.NUM_BLOCKS,
+                    [blocks],
+                    num_valid_tokens=(self.NUM_BLOCKS - 1) * _TOKENS + filled,
+                    num_prompt_blocks=self.NUM_BLOCKS,
+                )
+                held = -(-filled // width) * width
+                want = self._units(served, blocks[:-1]) | self._units(
+                    served, blocks[-1:], range(held)
+                )
+                for rows in (mine, peers):
+                    # A coarser indexer's replicas each take their copy, so a
+                    # cell is named as often as the whole blocks name it.
+                    full = Counter(u for i in whole for u in rows[i][1])
+                    named = Counter(u for i in ids for u in rows[i][1])
+                    assert named == {u: full[u] for u in want}, (
+                        f"{filled} token(s) in the last block"
+                    )
 
 
 class TestStageDescriptorSweep:
@@ -5443,6 +5607,38 @@ class TestARefusedPeerLeavesNothingBehind:
         ):
             w.add_remote_agent(meta, 0, 3, meta.dcp_size)
 
+    @pytest.mark.parametrize(
+        ("ours", "tp", "theirs", "peer_tp"),
+        [
+            (ChipletSplitAxis.HEAD, 4, ChipletSplitAxis.TOKEN, 1),
+            (ChipletSplitAxis.TOKEN, 1, ChipletSplitAxis.HEAD, 4),
+        ],
+        ids=["head_cut_registers", "context_cut_registers"],
+    )
+    def test_a_context_cut_with_fewer_ranks_is_a_straddle_from_either_side(
+        self, ours, tp, theirs, peer_tp
+    ):
+        # A TP1 context cut's area holds every head, which a TP4 head cut
+        # spreads over four ranks: refused by whichever engine registers.
+        w = self._worker()
+        w.transfer_topo.tp_size = tp
+        w._logical_region_kv_heads = [16]
+        w.local_seen_layer_names = ["l0"]
+        fill_region_geometry(w, areas=4, axes=[ours], slices=4)
+        w._local_band = MagicMock(return_value=(4, 4, [0, 1, 2, 3]))
+        w._peer_band = MagicMock(return_value=(4, 4))
+        meta = _agent_meta(engine_id="peer", kv_split_axes=[theirs])
+
+        with (
+            patch.object(
+                RblnNixlPullConnectorWorker,
+                "_register_remote_engine_prelude",
+                side_effect=AssertionError("registered"),
+            ),
+            pytest.raises(RuntimeError, match="straddle several"),
+        ):
+            w.add_remote_agent(meta, 0, peer_tp, meta.dcp_size)
+
     def test_a_context_cut_against_a_head_cut_passes_with_chunks(self):
         # The other way round, every piece lies in our area's one token range,
         # which a chunk range names: chunk_mode is not refused here.
@@ -5466,40 +5662,51 @@ class TestARefusedPeerLeavesNothingBehind:
             w.add_remote_agent(meta, 0, 1, meta.dcp_size)
 
     @pytest.mark.parametrize(
-        "cls, knob, raised",
+        ("cls", "knob", "ours", "tp", "theirs", "peer_tp"),
         [
-            (
-                RblnNixlPullConnectorWorker,
-                {"chunk_mode": True},
-                "which chunk_mode cannot name",
-            ),
-            (
-                RblnNixlPushConnectorWorker,
-                {"chunk_mode": True},
-                "which chunk_mode cannot name",
-            ),
+            (cls, knob, *side)
+            for cls, knob in [
+                (RblnNixlPullConnectorWorker, {"chunk_mode": True}),
+                (RblnNixlPushConnectorWorker, {"chunk_mode": True}),
+            ]
+            for side in [
+                (ChipletSplitAxis.HEAD, 1, ChipletSplitAxis.TOKEN, 4),
+                (ChipletSplitAxis.TOKEN, 4, ChipletSplitAxis.HEAD, 1),
+            ]
+        ]
+        + [
             (
                 RblnNixlPushConnectorWorker,
                 {"streams_prefix": True},
-                "past the cut check",
-            ),
+                ChipletSplitAxis.HEAD,
+                1,
+                ChipletSplitAxis.TOKEN,
+                4,
+            )
         ],
-        ids=["pull_chunked", "push_chunked", "push_streamed"],
+        ids=[
+            "pull_chunked-head_cut_registers",
+            "pull_chunked-context_cut_registers",
+            "push_chunked-head_cut_registers",
+            "push_chunked-context_cut_registers",
+            "push_streamed-head_cut_registers",
+        ],
     )
-    def test_a_head_cut_against_a_context_cut_refuses_chunks_unregistered(
-        self, cls, knob, raised
+    def test_a_head_cut_against_a_context_cut_passes_with_chunks_or_streams(
+        self, cls, knob, ours, tp, theirs, peer_tp
     ):
-        # Our head cut meets the peer's context cut, reading or writing: a
-        # region pairs in pieces of the peer's token spans, which a chunk range
-        # cannot place. A streamed write names whole blocks and pairs.
+        # The same two engines from either side, reading or writing: the head
+        # cut's region pairs in pieces of the context cut's token spans, each
+        # its own entry, so chunks pair; a streamed write names whole blocks.
         w = self._worker()
         w.__class__ = cls
+        w.transfer_topo.tp_size = tp
         w.local_seen_layer_names = ["l0"]
-        fill_region_geometry(w, areas=4, axes=[ChipletSplitAxis.HEAD], slices=4)
+        fill_region_geometry(w, areas=4, axes=[ours], slices=4)
         set_shape(w, **knob)
         w._local_band = MagicMock(return_value=(4, 4, [0, 1, 2, 3]))
         w._peer_band = MagicMock(return_value=(4, 4))
-        meta = _agent_meta(engine_id="peer", kv_split_axes=[ChipletSplitAxis.TOKEN])
+        meta = _agent_meta(engine_id="peer", kv_split_axes=[theirs])
 
         with (
             patch.object(
@@ -5507,9 +5714,9 @@ class TestARefusedPeerLeavesNothingBehind:
                 "_register_remote_engine_prelude",
                 side_effect=RuntimeError("past the cut check"),
             ),
-            pytest.raises(RuntimeError, match=raised),
+            pytest.raises(RuntimeError, match="past the cut check"),
         ):
-            w.add_remote_agent(meta, 0, 4, meta.dcp_size)
+            w.add_remote_agent(meta, 0, peer_tp, meta.dcp_size)
 
     def test_each_logical_region_is_counted_on_its_own_axis(self):
         # Our TP2 cuts region 0's heads 2 x 4 ways and region 1's tokens, which
@@ -5561,8 +5768,8 @@ class TestARefusedPeerLeavesNothingBehind:
 
     def test_a_peer_stage_s_regions_are_read_at_its_own_positions(self):
         # The peer's stage holds our layer l1 as its region 0: its axis is read
-        # there, ours at region 1, and the head cut meets the context cut. At
-        # TP2 the peer would straddle region 0's single cut.
+        # there and ours at region 1, where the head cut meets the context cut
+        # and pairs. At TP2 the peer would straddle region 0's single cut.
         w = self._worker()
         w._logical_region_kv_heads = [8, 8]
         w.local_seen_layer_names = ["l0", "l1"]
@@ -5571,16 +5778,18 @@ class TestARefusedPeerLeavesNothingBehind:
         )
         set_shape(w, chunk_mode=True)
         w._local_band = MagicMock(return_value=(4, 4, [0, 1, 2, 3]))
-        w._peer_band = MagicMock(return_value=(4, 4))
+        # A peer band of three slices: read as a head cut it would not be
+        # commensurate with ours, so the peer's axis decides the outcome.
+        w._peer_band = MagicMock(return_value=(3, 3))
         meta = _agent_meta(engine_id="peer", kv_split_axes=[ChipletSplitAxis.TOKEN])
 
         with (
             patch.object(
                 RblnNixlPullConnectorWorker,
                 "_register_remote_engine_prelude",
-                side_effect=AssertionError("registered"),
+                side_effect=RuntimeError("past the cut check"),
             ),
-            pytest.raises(RuntimeError, match="logical region 1 is head-cut here"),
+            pytest.raises(RuntimeError, match="past the cut check"),
         ):
             w._add_remote_agent_head_matched(
                 meta, 0, 2, meta.dcp_size, registered_layer_names=("l1",)
@@ -5697,83 +5906,71 @@ class TestARefusedPeerLeavesNothingBehind:
             w._add_remote_agent_head_matched(meta, 0, 4, meta.dcp_size)
 
     @pytest.mark.parametrize(
-        (
-            "attention_slices",
-            "latent_slices",
-            "peer_latent",
-            "chunked",
-            "stage",
-            "raised",
-        ),
+        ("head_cut", "attention_slices", "latent_slices", "peer_latent", "stage"),
         [
-            (
-                4,
-                2,
-                [0, 1, 2, 3],
-                True,
-                False,
-                "logical region 1, a latent, holds a block in 2 token range",
-            ),
-            (4, 2, [0, 1, 2, 3], False, False, "reached the prelude"),
-            (4, 4, [0, 1, 2, 3], True, False, "reached the prelude"),
-            # Ours finer than the peer's: each of our ranges lies in one of its.
-            (4, 4, [0, 0, 1, 1], True, False, "reached the prelude"),
-            # The refusal is the latent's; attention cut coarser pairs as it does
-            # without a latent.
-            (2, 4, [0, 1, 2, 3], True, False, "reached the prelude"),
-            # A peer stage of l1 alone: its region 0 is our region 1.
-            (
-                4,
-                2,
-                [0, 1, 2, 3],
-                True,
-                True,
-                "logical region 1, a latent, holds a block in 2 token range",
-            ),
-            # An uncut latent is recorded on HEAD, and named as a latent.
-            (
-                4,
-                1,
-                [0, 1, 2, 3],
-                True,
-                False,
-                "logical region 1, a latent, holds a block in 1 token range",
-            ),
+            (False, 4, 2, [0, 1, 2, 3], False),
+            (False, 4, 4, [0, 1, 2, 3], False),
+            (False, 4, 4, [0, 0, 1, 1], False),
+            (False, 2, 4, [0, 1, 2, 3], False),
+            (False, 4, 2, [0, 1, 2, 3], True),
+            # An uncut latent is recorded on HEAD with one slice.
+            (False, 4, 1, [0, 1, 2, 3], False),
+            # The same two engines registered from the head-cut TP1 side; an
+            # uncut peer latent is on HEAD with one slice.
+            (True, 4, 4, [0, 0, 1, 1], False),
+            (True, 4, 4, [0, 1, 2, 3], False),
+            (True, 4, 2, [0, 1, 2, 3], False),
+            (True, 4, 4, [0, 0, 1, 1], True),
+            (True, 4, 4, [0, 0, 0, 0], False),
+            # And the head-cut side's own coarser latents, from both sides.
+            (True, 4, 2, [0, 1, 2, 3], True),
+            (False, 4, 4, [0, 0, 1, 1], True),
+            (True, 4, 1, [0, 1, 2, 3], False),
+            (False, 4, 4, [0, 0, 0, 0], False),
         ],
         ids=[
-            "coarser_chunked",
-            "coarser_whole",
-            "alike_chunked",
-            "finer_chunked",
-            "attention_coarser_chunked",
-            "coarser_chunked_stage",
-            "uncut_chunked",
+            "coarser_here",
+            "alike",
+            "coarser_there",
+            "attention_coarser",
+            "coarser_here_stage",
+            "uncut_here",
+            "head_cut_coarser_there",
+            "head_cut_alike",
+            "head_cut_coarser_here",
+            "head_cut_coarser_there_stage",
+            "head_cut_uncut_there",
+            "head_cut_coarser_here_stage",
+            "coarser_there_stage",
+            "head_cut_uncut_here",
+            "uncut_there",
         ],
     )
-    def test_a_latent_in_coarser_token_ranges_refuses_chunks_unregistered(
-        self, attention_slices, latent_slices, peer_latent, chunked, stage, raised
+    def test_a_latent_in_any_token_ranges_reaches_registration_with_chunks(
+        self, head_cut, attention_slices, latent_slices, peer_latent, stage
     ):
-        # Our latent's two token ranges each span two of the peer's four, so a
-        # chunk of ours is pieces of the peer's; whole blocks still pair.
+        # A latent in fewer token ranges than the peer's pairs in pieces of the
+        # peer's, each its own entry of the plan, so chunk_mode is not refused
+        # whichever side holds the coarser one, or registers.
         w = self._worker()
         del w._check_mla_constraints
         del w._check_split_axis_constraints
         del w._is_head_matched_peer
         w.use_mla = False
         w.use_host_buffer = False
-        w.transfer_topo.tp_size = 4
-        w.transfer_topo.tp_ratio = MagicMock(return_value=4)
+        w.transfer_topo.tp_size = 1 if head_cut else 4
+        w.transfer_topo.tp_ratio = MagicMock(return_value=-4 if head_cut else 4)
         fill_region_geometry(
             w,
             areas=4,
             axes=[
-                ChipletSplitAxis.TOKEN,
+                ChipletSplitAxis.HEAD if head_cut else ChipletSplitAxis.TOKEN,
                 ChipletSplitAxis.HEAD if latent_slices == 1 else ChipletSplitAxis.TOKEN,
             ],
             slices=[attention_slices, latent_slices],
             latent=[False, True],
         )
-        set_shape(w, chunk_mode=chunked)
+        set_shape(w, chunk_mode=True)
         w.block_size = 16
         w._logical_region_kv_heads = [8, None]
         w.local_seen_layer_names = ["l0", "l1"]
@@ -5781,10 +5978,13 @@ class TestARefusedPeerLeavesNothingBehind:
         meta = _agent_meta(
             engine_id="peer",
             kv_areas=4,
-            kv_split_axes=[ChipletSplitAxis.HEAD, ChipletSplitAxis.TOKEN][
-                -len(layers) :
-            ],
-            kv_area_slices=[peer_latent, peer_latent][-len(layers) :],
+            kv_split_axes=[
+                ChipletSplitAxis.TOKEN if head_cut else ChipletSplitAxis.HEAD,
+                ChipletSplitAxis.HEAD
+                if len(set(peer_latent)) == 1
+                else ChipletSplitAxis.TOKEN,
+            ][-len(layers) :],
+            kv_area_slices=[[0, 1, 2, 3], peer_latent][-len(layers) :],
             region_names=[name for name in layers for _ in range(4)],
             block_lens=[8192] * 4 * len(layers),
             kv_caches_base_addr=[0x1000 * (i + 1) for i in range(4 * len(layers))],
@@ -5796,10 +5996,14 @@ class TestARefusedPeerLeavesNothingBehind:
                 "_register_remote_engine_prelude",
                 side_effect=AssertionError("reached the prelude"),
             ),
-            pytest.raises((RuntimeError, AssertionError), match=raised),
+            pytest.raises(AssertionError, match="reached the prelude"),
         ):
             w._add_remote_agent_head_matched(
-                meta, 0, 1, meta.dcp_size, registered_layer_names=tuple(layers)
+                meta,
+                0,
+                4 if head_cut else 1,
+                meta.dcp_size,
+                registered_layer_names=tuple(layers),
             )
 
     def test_a_context_cut_straddles_a_finer_peer_unregistered(self):
@@ -7448,7 +7652,7 @@ class TestPairArea:
     def test_a_packed_block_stays_one_range_at_equal_cuts(self):
         # Both sides name whole blocks, and K and V are adjacent inside one.
         assert self._pair((0, 2), [(0, (0, 2), 256)], kv_per_block=2) == [
-            Piece(0, 0, 0, 256, 4)
+            Piece(0, 0, 0, 256, 4, self.FULL)
         ]
 
     @pytest.mark.parametrize(

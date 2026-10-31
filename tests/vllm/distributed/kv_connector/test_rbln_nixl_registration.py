@@ -2311,7 +2311,7 @@ class TestTheLayoutReachesTheDescriptors:
         # Both sides name whole blocks, so the layout does not matter.
         w = self._worker(PACKED)
         _, pieces = w._head_matched_plan(self._peer(1), 0, 1)
-        assert pieces == [[Piece(0, 0, 0, 256, 2 * 8)]]
+        assert pieces == [[Piece(0, 0, 0, 256, 2 * 8, (0, 16))]]
 
     def test_a_split_alone_keeps_the_handler_off_upstream_s_fast_path(self):
         # `register_local_xfer_handler` hands a whole-engine peer to upstream's
@@ -2319,7 +2319,9 @@ class TestTheLayoutReachesTheDescriptors:
         # narrowed: upstream names a block once and our list names it per range.
         w = self._worker(PACKED)
         w.local_seen_layer_names = ["layer.0"]
-        pieces = [[Piece(0, 0, 0, 128, 8), Piece(128, 0, 128, 128, 8)]]
+        pieces = [
+            [Piece(0, 0, 0, 128, 8, (0, 16)), Piece(128, 0, 128, 128, 8, (0, 16))]
+        ]
 
         with patch.object(
             RblnNixlPullConnectorWorker, "_register_shard_local_xfer_handler"
@@ -2433,7 +2435,7 @@ class TestTailBlockTrim:
         )
 
         assert [worker._region_span_index(r) for r in range(4)] == [0, 0, 1, 1]
-        assert [first for first, _, _ in worker._chunk_grid.regions[:4]] == [0, 0, 4, 4]
+        assert [first for first, _, _ in worker._chunk_grid.entries[:4]] == [0, 0, 4, 4]
 
     def test_areas_that_do_not_divide_the_block_are_refused(self, monkeypatch):
         # 6 tokens over 4 areas: no area is a whole number of them.
