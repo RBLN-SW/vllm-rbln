@@ -773,8 +773,8 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
             "holds, although `canonical_kv_layers` keeps one layer per buffer"
         )
         # A transfer region is numbered `logical * areas + area`, so an entry the
-        # compiler left on one area (GLM at TP 4) is named as replicas of its one
-        # slice; its writes repeat into the same bytes.
+        # compiler left on one area (GLM-5.3 on a PP stage) is named as replicas
+        # of its one slice; its writes repeat into the same bytes.
         widest = max((len(placed) for _, _, placed in cuts.values()), default=1)
         for base_addr, (axis, slices, placed) in cuts.items():
             if len(placed) == 1 < widest:
