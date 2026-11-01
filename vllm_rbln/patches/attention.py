@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from vllm.config import VllmConfig, get_current_vllm_config
@@ -23,19 +23,25 @@ from vllm.model_executor.layers.attention.kv_transfer_utils import (
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionMetadata, AttentionType
 from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
     KVCacheSpec,
-    SlidingWindowSpec,
 )
 
+from vllm_rbln.config import RBLNConfig
 from vllm_rbln.patches import register_patch
 from vllm_rbln.patches.registry import MIN_PATCH_PRIORITY
 from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionBackend,
     RBLNFlashAttentionMetadata,
 )
-from vllm_rbln.v1.attention.kv_cache_bindings import materialize_kv_cache_view
-from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
+from vllm_rbln.v1.attention.kv_cache_bindings import (
+    attention_block_axis,
+    materialize_kv_cache_view,
+)
+from vllm_rbln.v1.kv_cache import (
+    RBLNAppendSlidingWindowSpec,
+    RBLNFullAttentionSpec,
+    RBLNSlidingWindowSpec,
+)
 from vllm_rbln.v1.worker.utils import (
     num_attn_module as rbln_num_attn_module,
 )
@@ -248,12 +254,15 @@ def patched_attention_init(self: Attention, *args, **kwargs) -> None:
         "A sliding-window layer needs the RBLN spec for the kernel that "
         "shifts the window in place: one block per request, no reclaim, no "
         "prefix sharing. REBEL CR13 carries sliding_window_attention_v1, "
-        "which appends into several blocks and takes upstream's spec."
+        "which appends into several blocks and keeps upstream window allocation."
     ),
 )
 def patched_get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
     # Block size may get updated after model loading, refresh it
     block_size = vllm_config.cache_config.block_size
+    block_axis = attention_block_axis(
+        cast(RBLNConfig, vllm_config.additional_config).use_custom_kernel
+    )
     # Should not be called for enc-dec or encoder-only attention.
     assert self.attn_type == AttentionType.DECODER
     if self.sliding_window is not None:
@@ -262,7 +271,9 @@ def patched_get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
                 "MLA is not supported with sliding window attention."
             )
         spec_cls = (
-            SlidingWindowSpec if current_platform.is_cr13() else RBLNSlidingWindowSpec
+            RBLNAppendSlidingWindowSpec
+            if current_platform.is_cr13()
+            else RBLNSlidingWindowSpec
         )
         return spec_cls(
             block_size=block_size,
@@ -270,12 +281,14 @@ def patched_get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
             head_size=self.head_size,
             dtype=self.kv_cache_torch_dtype,
             sliding_window=self.sliding_window,
+            kv_cache_block_axis=block_axis,
         )
     else:
-        return FullAttentionSpec(
+        return RBLNFullAttentionSpec(
             block_size=block_size,
             num_kv_heads=self.num_kv_heads,
             head_size=self.head_size,
             head_size_v=self.head_size_v,
             dtype=self.kv_cache_torch_dtype,
+            kv_cache_block_axis=block_axis,
         )

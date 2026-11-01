@@ -22,11 +22,15 @@ import pytest
 import torch
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionType
-from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 
+from vllm_rbln.config import RBLNConfig
 from vllm_rbln.patches import attention
 from vllm_rbln.patches.attention import patched_get_kv_cache_spec
-from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
+from vllm_rbln.v1.kv_cache import (
+    RBLNAppendSlidingWindowSpec,
+    RBLNFullAttentionSpec,
+    RBLNSlidingWindowSpec,
+)
 
 
 def _layer(sliding_window):
@@ -40,10 +44,11 @@ def _layer(sliding_window):
     )
 
 
-def _config(use_mla=False):
+def _config(use_mla=False, use_custom_kernel=False):
     return SimpleNamespace(
         cache_config=SimpleNamespace(block_size=32),
         model_config=SimpleNamespace(use_mla=use_mla),
+        additional_config=RBLNConfig(use_custom_kernel=use_custom_kernel),
     )
 
 
@@ -56,27 +61,40 @@ def cr13(monkeypatch):
 
 
 class TestSlidingWindowSpec:
-    def test_cr13_declares_upstreams_spec(self, cr13):
+    @pytest.mark.parametrize("use_custom_kernel", [False, True])
+    def test_cr13_declares_append_spec_with_transfer_regions(
+        self, cr13, use_custom_kernel
+    ):
         # Appending into an ordinary paged cache is what upstream's spec and its
         # manager already describe: several blocks, reclaimed behind the window.
         cr13(True)
-        spec = patched_get_kv_cache_spec(_layer(16), _config())
-        assert type(spec) is SlidingWindowSpec
+        spec = patched_get_kv_cache_spec(
+            _layer(16), _config(use_custom_kernel=use_custom_kernel)
+        )
+        assert type(spec) is RBLNAppendSlidingWindowSpec
+        assert spec.kv_cache_block_axis == int(use_custom_kernel)
 
-    def test_otherwise_the_rbln_spec(self, cr13):
+    @pytest.mark.parametrize("use_custom_kernel", [False, True])
+    def test_otherwise_the_rbln_spec(self, cr13, use_custom_kernel):
         # The shift kernel holds the window in one block, which only
         # RBLNSlidingWindowSpec and its manager allocate that way.
         cr13(False)
-        spec = patched_get_kv_cache_spec(_layer(16), _config())
+        spec = patched_get_kv_cache_spec(
+            _layer(16), _config(use_custom_kernel=use_custom_kernel)
+        )
         assert type(spec) is RBLNSlidingWindowSpec
+        assert spec.kv_cache_block_axis == int(use_custom_kernel)
 
-    def test_a_layer_without_a_window_ignores_the_device(self, cr13):
+    @pytest.mark.parametrize("use_custom_kernel", [False, True])
+    def test_a_layer_without_a_window_ignores_the_device(self, cr13, use_custom_kernel):
         # The device picks a sliding-window cache layout; full attention keeps
         # the one spec it has on either NPU.
         cr13(True)
-        assert type(patched_get_kv_cache_spec(_layer(None), _config())) is (
-            FullAttentionSpec
+        spec = patched_get_kv_cache_spec(
+            _layer(None), _config(use_custom_kernel=use_custom_kernel)
         )
+        assert type(spec) is RBLNFullAttentionSpec
+        assert spec.kv_cache_block_axis == int(use_custom_kernel)
 
     def test_mla_with_a_window_is_rejected(self, cr13):
         cr13(True)
