@@ -31,9 +31,9 @@ from . import utils
 from .utils import (
     assert_samples_match,
     build_input_batch,
+    evenly_spaced_token_ids,
     expected_probs,
     logits_from_weights,
-    weighted_token_ids,
 )
 
 # Logits arrive in the model's dtype, and RBLN serves all three.
@@ -98,9 +98,9 @@ def test_all_greedy_batch_takes_the_argmax_op(sampler, op_args, dtype):
 
 
 ########################### sampled distributions ###########################
-# Every row shares one logits row: WEIGHTED[i] weighs i + 1, the tail holds 1%.
+# The weighted row: WEIGHTED[i] weighs i + 1, the tail holds 1%.
 ROWS = 256
-WEIGHTED = weighted_token_ids(num_weighted=32).tolist()
+WEIGHTED = evenly_spaced_token_ids(num_ids=32).tolist()
 TAIL_TOKEN = 1
 LAUNCHES = 40
 
@@ -152,7 +152,8 @@ def case(params: SamplingParams, id: str, **request_kwargs: Any):
     return pytest.param(params, request_kwargs, id=id)
 
 
-DISTRIBUTION_CASES = [
+# Cases that no logits processor touches, so they fit any logits row.
+NO_PROCESSOR_CASES = [
     # Temperature alone.
     case(SamplingParams(temperature=0.5), "temperature_0.5"),
     case(SamplingParams(temperature=1.0), "temperature_1.0"),
@@ -170,6 +171,10 @@ DISTRIBUTION_CASES = [
     case(SamplingParams(top_k=4, top_p=0.5), "top_k_4_top_p_0.5"),
     # Temperature scales the logits before top-p cuts the nucleus.
     case(SamplingParams(temperature=0.7, top_p=0.8), "temperature_top_p"),
+]
+
+DISTRIBUTION_CASES = [
+    *NO_PROCESSOR_CASES,
     # min_p compares against the temperature-scaled distribution.
     case(SamplingParams(temperature=1.5, min_p=0.3), "min_p"),
     case(
@@ -232,6 +237,41 @@ def test_sampled_distribution(params, request_kwargs, dtype):
     )
 
     assert_samples_match(samples=samples, probs=expected)
+
+
+# Each shape owns the token ids of one residue mod 3, its weighted tokens at:
+#   flat         SLOTS + 0 = [0, 5286, 10569, ..., 163836]
+#   peaked       SLOTS + 1 = [1, 5287, 10570, ..., 163837]
+#   long-tailed  SLOTS + 2 = [2, 5288, 10571, ..., 163838]
+SLOTS = 3 * evenly_spaced_token_ids(num_ids=32, vocab_size=utils.VOCAB_SIZE // 3)
+
+
+@pytest.mark.parametrize(("params", "request_kwargs"), NO_PROCESSOR_CASES)
+@pytest.mark.parametrize("dtype", DTYPES, ids=str)
+@pytest.mark.use_device
+def test_each_row_follows_its_own_logits(params, request_kwargs, dtype):
+    """Shapes on disjoint token ids, so a row mix-up samples zero-probability tokens."""
+    rows = torch.full((3, utils.VOCAB_SIZE), torch.finfo(dtype).min)
+    rows[0, SLOTS] = torch.linspace(0.0, 0.5, 32)  # flat
+    rows[1, SLOTS + 1] = torch.cat(
+        [torch.tensor([6.0]), torch.linspace(0.0, 1.875, 31)]
+    )  # peaked
+    rows[2, 2::3] = logits_from_weights(  # long-tailed
+        weights=range(1, 33), vocab_size=utils.VOCAB_SIZE // 3, dtype=torch.float32
+    )
+    rows = rows.to(dtype)
+    shape = torch.arange(ROWS) * len(rows) // ROWS  # 86, 85 and 85 rows
+    expected = expected_probs(
+        logits=rows,
+        params=[params] * len(rows),
+        top_k_top_p=npu_top_k_top_p,
+        **request_kwargs,
+    )
+
+    samples = sample(logits=rows[shape], params=[params] * ROWS, **request_kwargs)
+
+    for s, probs in enumerate(expected):
+        assert_samples_match(samples=samples[:, shape == s], probs=probs)
 
 
 @pytest.mark.use_device

@@ -94,9 +94,9 @@ def build_input_batch(
     return input_batch
 
 
-def weighted_token_ids(num_weighted: int, vocab_size: int = VOCAB_SIZE) -> torch.Tensor:
+def evenly_spaced_token_ids(num_ids: int, vocab_size: int = VOCAB_SIZE) -> torch.Tensor:
     """Ids spread over the whole vocab, first and last included."""
-    return torch.linspace(0, vocab_size - 1, num_weighted).round().to(torch.int64)
+    return torch.linspace(0, vocab_size - 1, num_ids).round().to(torch.int64)
 
 
 def logits_from_weights(
@@ -105,7 +105,7 @@ def logits_from_weights(
     tail_mass: float = 0.01,
     dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    """Weights `weighted_token_ids()` by `weights` and spreads `tail_mass` over
+    """Weights `evenly_spaced_token_ids()` by `weights` and spreads `tail_mass` over
     the rest, rounded to `dtype`. Expected probs come from the row, not `weights`.
 
     For example, `logits_from_weights(weights=[1, 3], vocab_size=5, tail_mass=0.3)`
@@ -116,7 +116,7 @@ def logits_from_weights(
     total_weight = sum(weights)
     num_tail = vocab_size - len(weights)
     logits.fill_(math.log(tail_mass / (1.0 - tail_mass) * total_weight / num_tail))
-    logits[weighted_token_ids(num_weighted=len(weights), vocab_size=vocab_size)] = (
+    logits[evenly_spaced_token_ids(num_ids=len(weights), vocab_size=vocab_size)] = (
         torch.tensor(weights, dtype=torch.float32).log()
     )
     return logits.to(dtype)
