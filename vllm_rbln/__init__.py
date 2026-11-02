@@ -26,19 +26,35 @@ def register():
 
 
 def register_model():
-    pass
+    """Nothing to do, and kept so an installed copy still resolves this name.
+
+    The A.X K2 registration this used to hold runs from the patch registry now.
+    It has to: this entry point is called before the arguments are parsed, too
+    early to know the model path, while the architecture is resolved in the
+    process that parses them.
+    """
+    # TODO(vllm-rbln>=0.14.0): delete, with the entry point in pyproject.toml.
 
 
 def register_ops():
     import vllm_rbln.distributed.ec_transfer.ec_connector.factory  # noqa
     from vllm_rbln import envs
+    from vllm_rbln.platform import RblnPlatform
 
-    if envs.VLLM_RBLN_USE_VLLM_MODEL:
+    RblnPlatform._use_v1_model_runner()
+
+    # Both `vllm serve` and `LLM(...)` load the plugins before they build a
+    # config, and only the first of them parses arguments, so this is the one
+    # point early enough to see every `create_engine_config` call.
+    RblnPlatform._capture_model_impl()
+
+    # Only the path a parent already resolved can be acted on here: this runs
+    # before the arguments are parsed, so in the process that parses them there
+    # is none, and the platform hook applies the same set afterwards. A patch
+    # applied on what the deprecated variable guesses would outlive a flag that
+    # disagrees with it.
+    if envs.INHERITED_MODEL_IMPL == "vllm":
         from vllm_rbln.patches import apply_registered_patches, apply_registrations
 
         apply_registrations()
         apply_registered_patches()
-
-        # TODO(RBLN): remove the following imports after we have a better way
-        import vllm_rbln.distributed.kv_transfer.kv_connector.factory  # noqa
-        import vllm_rbln.model_executor.model_loader.weight_loader  # noqa

@@ -1,0 +1,502 @@
+# Copyright 2025 Rebellions Inc. All rights reserved.
+
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at:
+
+#     http://www.apache.org/licenses/LICENSE-2.0
+
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from collections.abc import Sequence
+from contextlib import contextmanager
+
+import numpy as np
+from vllm.distributed.kv_transfer.kv_connector.utils import (
+    BlockIds,
+)
+from vllm.utils.math_utils import cdiv
+from vllm.v1.kv_cache_interface import (
+    SlidingWindowSpec,
+)
+
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
+    ChunkGrid,
+    RblnNixlWorkerState,
+)
+
+
+def _chunk_desc_ids(
+    *,
+    start: int,
+    cuts: Sequence[tuple[int, int, int]],
+    num_blocks: int,
+    block_id: int,
+    per_block: int | Sequence[int],
+    chunk_span: tuple[int, int],
+    partial_only: bool = False,
+) -> np.ndarray:
+    """Descriptor ids for chunks `[lo, hi)` of one block, in every entry
+    holding any of them.
+
+    `cuts` is `ChunkGrid.entries` and the span counts chunks of the block, so
+    each entry takes the part of it that falls in its own window.
+    `partial_only` leaves out an entry the span covers whole, which a
+    whole-block descriptor carried instead. An entry of no runs holds at most
+    one chunk, named by its whole-block descriptor from 0, `per_block` a block:
+    one count for every entry, or one per entry in the order of `cuts`.
+
+    `start` is where the chunk range begins: one whole-block range before it on
+    a shard's lists, and a window range as well on the whole-engine lists. The
+    order inside the range is what every caller's lists share, so it lives here:
+    an index computed one way and a descriptor emitted the other lands on bytes
+    nothing reports.
+    """
+    lo, hi = chunk_span
+    first, runs, chunks = np.asarray(cuts, dtype=np.int64).reshape(-1, 3).T
+    pieces = np.broadcast_to(np.asarray(per_block, dtype=np.int64), first.shape)
+    per_entry = pieces * runs * chunks
+    starts = start + (np.cumsum(per_entry) - per_entry) * num_blocks
+    starts += block_id * per_entry
+    whole = runs == 0
+    starts[whole] = (np.cumsum(pieces) - pieces)[whole] * num_blocks + (
+        block_id * pieces[whole]
+    )
+    begin = np.maximum(lo, first) - first
+    end = np.minimum(hi, first + chunks) - first
+    take = begin < end
+    if partial_only:
+        take &= (begin > 0) | (end < chunks)
+    # Entries cut alike share one offset pattern, and an engine has few cuts
+    # however many entries it has. The window leads the key so the ids come
+    # area by area, entry by entry inside one.
+    keys = np.stack([first, runs, chunks, begin, end, pieces], axis=1)[take]
+    out = []
+    for key in np.unique(keys, axis=0):
+        _, k_runs, k_chunks, k_begin, k_end, k_pieces = (int(v) for v in key)
+        k_runs = max(k_runs, 1)
+        within = (
+            np.arange(k_pieces, dtype=np.int64)[:, None, None] * (k_runs * k_chunks)
+            + np.arange(k_runs, dtype=np.int64)[None, :, None] * k_chunks
+            + np.arange(k_begin, k_end, dtype=np.int64)[None, None, :]
+        ).ravel()
+        group = starts[take][(keys == key).all(axis=1)]
+        out.append((group[:, None] + within[None, :]).ravel())
+    return np.concatenate(out) if out else np.empty(0, dtype=np.int64)
+
+
+class RblnNixlTransferMixin(RblnNixlWorkerState):
+    """Issuing one transfer: which descriptors a request needs, and how a
+    completion is named.
+
+    The transfer lifetime, and the only one that runs per request: registration
+    produces the region table and the handshake produces the pairing, both once,
+    and this reads what they left.
+    """
+
+    @contextmanager
+    def _tail_viewed_as(
+        self,
+        valid_tokens: int | None,
+        prompt_blocks: int | None,
+        pieces: tuple[tuple[int, tuple[int, int]], ...] = (),
+    ):
+        """Park which part of a request's blocks this transfer names.
+
+        `_compute_desc_ids` is what selects the descriptors, and it takes block
+        ids and nothing else -- upstream's signature, with no room for a token
+        count. A plain attribute suffices: one transfer reaches it twice, both
+        synchronously, and a worker moves one request at a time on one thread
+        (the read path on the worker's, the write path on the single writer's).
+
+        A write naming the whole request parks how far its last block is filled
+        and lets the tail be derived. One naming part of it -- a streamed batch
+        -- parks the chunk ranges it decided on instead. They arrive by the same
+        door because the block ids alone cannot say which of the two this is.
+
+        The pieces are one side's, so a caller with two lists parks each
+        around its own call.
+        """
+        prev = self._request_tail
+        self._request_tail = (valid_tokens, prompt_blocks, pieces)
+        try:
+            yield
+        finally:
+            self._request_tail = prev
+
+    def _prompt_blocks(self, block_ids: BlockIds) -> int | None:
+        """How many blocks the request holds, read off the group a chunk cuts.
+
+        None where no group is full-attention, which is the shape a chunk range
+        is refused on (`registration.py`) -- so nothing downstream reads a
+        count taken off a sliding window's clipped list.
+        """
+        counted = self._shape.counted_group
+        return None if counted is None else len(block_ids[counted])
+
+    def _window_granules(
+        self, blocks: list[int], valid_tokens: int, sw_ratio: int
+    ) -> list[tuple[int, int]]:
+        """(block, the granule in it) the request's window lands in.
+
+        A window is the last `sliding_window` tokens, so the group's last block
+        holds the newest one and the token count says where inside. It spans one
+        granule, or two when it straddles a boundary -- and the second of those
+        sits in the block before, so a list too short to reach it names one and
+        says nothing.
+
+        What keeps the two ends agreeing is upstream's `get_exchange_clipped_blocks`,
+        which cuts an SWA group to `blocks_per_sw` = `cdiv(sliding_window,
+        block_size) + 1` from the tail. Both ends of a read run it -- the
+        producer in `request_finished` before it publishes the ids, the consumer
+        in `update_state_after_alloc` on its own -- so neither is clipped here
+        and a short list means the peer was short too.
+        """
+        sw = self.block_size // sw_ratio
+        newest = (valid_tokens - 1) // sw
+        oldest = max(0, valid_tokens - sw) // sw
+        # The group's list ends at the block holding the newest token, so a
+        # position in it is a logical block counted back from there.
+        last_block = newest // sw_ratio
+        return [
+            (block_id, granule % sw_ratio)
+            for i, block_id in enumerate(blocks)
+            for granule in range(oldest, newest + 1)
+            if granule // sw_ratio == last_block - (len(blocks) - 1 - i)
+        ]
+
+    def _compute_desc_ids(
+        self,
+        block_ids: BlockIds,
+        dst_num_blocks: int,
+        block_size_ratio: float | None,
+        physical_blocks_per_logical: int,
+        region_num_blocks: list[int] | None = None,
+        region_group_ids: list[int] | None = None,
+        uses_region_group_mapping: bool | None = None,
+    ) -> np.ndarray:
+        if not self._own_engine_layout:
+            # Upstream's Full/SSM desc layout applies, and the 0.30.0
+            # per-region arguments belong to it.
+            return super()._compute_desc_ids(
+                block_ids,
+                dst_num_blocks,
+                block_size_ratio,
+                physical_blocks_per_logical,
+                region_num_blocks=region_num_blocks,
+                region_group_ids=region_group_ids,
+                uses_region_group_mapping=uses_region_group_mapping,
+            )
+
+        # The SWA desc formula below indexes physical blocks directly; the
+        # connector pins one physical block per logical block, so the
+        # physical_blocks_per_logical argument does not apply here.
+        assert physical_blocks_per_logical == 1, (
+            "RBLN NIXL connector assumes physical_blocks_per_logical == 1"
+        )
+
+        num_blocks = dst_num_blocks
+        if block_size_ratio is not None:
+            num_blocks = int(num_blocks * block_size_ratio)
+
+        # Both lists run region-major then block. A whole block is one
+        # descriptor, and the window range that follows cuts that same block
+        # into `runs x granules` (`_window_grid`). Without window mode that
+        # range is absent, so the chunk range starts one range earlier.
+        window = self._window_grid_cut
+        window_units = window[0] * window[1] if window is not None else 0
+        region_ids = np.arange(self.num_regions)[:, None]
+        num_whole_descs = self.num_regions * num_blocks
+        # One decision for the whole request, whichever list this call is for:
+        # the chunk ranges a streamed batch named, or how many chunks of the
+        # last block a whole-request write still owes.
+        tail = self._request_tail
+        pieces = tail[2] if tail is not None else ()
+        grid = self._chunk_grid
+        if tail is None or pieces or grid is None:
+            needed = None
+        else:
+            # A chunk range exists only where a full-attention group does, and
+            # that group is what the shape counts in.
+            prompt_blocks = tail[1]
+            assert prompt_blocks is not None
+            needed = self._tail_chunks(prompt_blocks, tail[0], chunk_grid=grid)
+
+        def whole(blocks: list[int]) -> np.ndarray:
+            return (region_ids * num_blocks + np.asarray(blocks)[None, :]).flatten()
+
+        def chunks_of(block_id: int, chunk_span: tuple[int, int]) -> np.ndarray:
+            assert grid is not None
+            # Registration refuses a context cut beside these lists, so every
+            # region holds the whole block and every one takes the span.
+            return _chunk_desc_ids(
+                start=num_whole_descs * (1 + window_units),
+                cuts=grid.entries,
+                num_blocks=num_blocks,
+                block_id=block_id,
+                per_block=1,
+                chunk_span=chunk_span,
+            )
+
+        all_descs: list[np.ndarray] = []
+        for g, group in enumerate(block_ids):
+            is_sw = isinstance(self._group_specs[g], SlidingWindowSpec)
+            if is_sw:
+                if window is None:
+                    # Window mode registered no range: this group's blocks go
+                    # whole, and the chunk range cuts the full-attention
+                    # group's last block only.
+                    if group:
+                        all_descs.append(whole(group))
+                    continue
+                runs, granules_per_block = window
+                # Nothing having said how many tokens the request holds leaves
+                # nothing to say where its window is, so every granule goes --
+                # which is the block itself.
+                if group:
+                    picked = (
+                        [(b, gran) for b in group for gran in range(granules_per_block)]
+                        if tail is None or tail[0] is None
+                        else self._window_granules(group, tail[0], granules_per_block)
+                    )
+                    ids = (
+                        region_ids * num_blocks
+                        + np.asarray([b for b, _ in picked])[None, :]
+                    )
+                    granules = np.asarray([gran for _, gran in picked], dtype=np.int64)
+                    # A granule is one run of bytes only where the kernel
+                    # addresses the cache in window-wide blocks; otherwise the
+                    # head cut spreads it, and every run of it goes.
+                    all_descs.append(
+                        (
+                            ids[:, :, None] * window_units
+                            + granules[None, :, None]
+                            + np.arange(runs, dtype=np.int64)[None, None, :]
+                            * granules_per_block
+                            + num_whole_descs
+                        ).ravel()
+                    )
+                continue
+            # The full-attention group, which is the one a chunk cuts. Its
+            # whole blocks may be empty while its pieces are not: a batch can
+            # owe nothing but the rest of a block it half-wrote.
+            keep = group if needed is None else group[:-1]
+            if keep:
+                all_descs.append(whole(keep))
+            if needed is not None and group:
+                # The last block leaves the whole-block range and comes back as
+                # the chunks that hold tokens, from the third range.
+                all_descs.append(chunks_of(group[-1], (0, needed)))
+            all_descs += [chunks_of(block_id, span) for block_id, span in pieces]
+        return np.concatenate(all_descs) if all_descs else np.empty(0, dtype=int)
+
+    def _get_block_descs_ids_for_shard(
+        self,
+        engine_id: str,
+        global_rank: int,
+        num_blocks: int,
+        block_ids: BlockIds,
+        needed: int | None = None,
+    ) -> np.ndarray:
+        """This shard's whole-block descriptors for `block_ids`.
+
+        `needed` is how many chunks of the last block hold tokens; an entry
+        holding any chunk past them leaves that block to the chunk range.
+        """
+        region_group_ids = self._shard_region_group_ids[(engine_id, global_rank)]
+        per_block = self._shard_descs_per_block[(engine_id, global_rank)]
+        # `(first chunk, chunks)` of a block each entry holds: off the grid
+        # where the lists carry one, and without one a chunk is a span, so each
+        # entry holds the span its region's area does.
+        windows: list[tuple[int, int]] = []
+        if needed is not None:
+            grid = self._shard_chunk_grids[(engine_id, global_rank)]
+            windows = (
+                [(first, chunks) for first, _, chunks in grid.entries]
+                if grid is not None
+                else [
+                    (span, 1)
+                    for span in self._shard_region_spans[(engine_id, global_rank)]
+                ]
+            )
+        offsets = np.cumsum((0, *per_block))
+        # Converted ahead of the loop: this runs per request, and every entry
+        # of a layer names the same group.
+        group_arrays = [np.asarray(g, dtype=np.int64) for g in block_ids]
+        desc_ids: list[np.ndarray] = []
+        for entry, group_id in enumerate(region_group_ids):
+            group_arr = group_arrays[group_id]
+            if needed is not None and sum(windows[entry]) > needed:
+                group_arr = group_arr[:-1]
+            if group_arr.size == 0:
+                continue
+            # Both dlists are laid out entry-major, then block, then piece, so
+            # one block becomes `pieces` consecutive descriptors on each side,
+            # after every block of the entries before it.
+            pieces = per_block[entry]
+            first = offsets[entry] * num_blocks + group_arr * pieces
+            if pieces == 1:
+                desc_ids.append(first)
+                continue
+            desc_ids.append(
+                (first[:, None] + np.arange(pieces, dtype=np.int64)).ravel()
+            )
+        if not desc_ids:
+            return np.empty(0, dtype=np.int64)
+        return np.concatenate(desc_ids)
+
+    def _chunk_descs_ids_for_shard(
+        self,
+        engine_id: str,
+        global_rank: int,
+        num_blocks: int,
+        block_id: int,
+        chunk_span: tuple[int, int],
+        *,
+        partial_only: bool = False,
+    ) -> np.ndarray:
+        """Descriptors for chunks `[lo, hi)` of one block, wherever they sit.
+
+        The span counts chunks of the block. A context cut gives each area a
+        window of them, so only the areas whose window it reaches take part;
+        a head cut gives every region all of them, and an entry split off a
+        region on the peer's token ranges holds one range of them.
+
+        Indexes the second range the shard's lists carry (see
+        `_register_shard_local_xfer_handler`), which follows the whole-block
+        range and holds `runs * chunks` entries where that one holds 1. Both
+        lists are laid out the same way, so one index array serves either side.
+
+        Empty where this shard has no such range, which is every peer the
+        chunk grid was not derived for.
+        """
+        grid = self._shard_chunk_grids[(engine_id, global_rank)]
+        lo, hi = chunk_span
+        if grid is None or hi <= lo:
+            return np.empty(0, dtype=np.int64)
+        if not 0 <= lo < hi <= grid.chunks_per_block:
+            raise RuntimeError(
+                f"RBLN NIXL: chunk range [{lo}, {hi}) is outside the "
+                f"{grid.chunks_per_block} chunk(s) a block holds"
+            )
+        region_group_ids = self._shard_region_group_ids[(engine_id, global_rank)]
+        assert len(grid.entries) == len(region_group_ids)
+        per_block = self._shard_descs_per_block[(engine_id, global_rank)]
+        return _chunk_desc_ids(
+            # Where the chunk range starts: the whole-block range covers every
+            # entry, block and piece once.
+            start=sum(per_block) * num_blocks,
+            cuts=grid.entries,
+            num_blocks=num_blocks,
+            block_id=block_id,
+            per_block=per_block,
+            chunk_span=chunk_span,
+            partial_only=partial_only,
+        )
+
+    def _tail_chunks(
+        self,
+        num_blocks: int,
+        num_valid_tokens: int | None,
+        *,
+        chunk_grid: ChunkGrid | None,
+    ) -> int | None:
+        """How many chunks of a request's last block hold its tokens.
+
+        A block is `_chunks_per_block` chunks of equal token width however its
+        regions are cut, so a last block filled to `rem` tokens has nothing
+        above cdiv(rem, chunk). None keeps the whole block: that is what a
+        full last block wants, and what one needing every chunk wants -- the
+        same bytes in more descriptors is a loss.
+
+        Rounds up, because every token counted has to reach the peer.
+        """
+        if not self._shape.cuts_a_block or not num_valid_tokens or num_blocks <= 0:
+            return None
+        rem = num_valid_tokens - (num_blocks - 1) * self.block_size
+        if not 1 <= rem <= self.block_size:
+            raise RuntimeError(
+                f"RBLN NIXL D2D: a request holding {num_blocks} block(s) of "
+                f"{self.block_size} reports {num_valid_tokens} token(s); its "
+                "block list and its token count describe different KV."
+            )
+        chunks_per_block = self._chunks_per_block(chunk_grid)
+        needed = cdiv(rem, self.block_size // chunks_per_block)
+        return needed if needed < chunks_per_block else None
+
+    def _shard_descs_for_tokens(
+        self,
+        engine_id: str,
+        global_rank: int,
+        num_blocks: int,
+        block_ids: BlockIds,
+        *,
+        num_valid_tokens: int | None,
+        num_prompt_blocks: int,
+    ) -> np.ndarray:
+        """This shard's descriptors for `block_ids`, cut to the tokens held.
+
+        The last block goes out as the chunks that hold tokens: whole from the
+        entries whose part of it they fill, and in chunks from every entry the
+        last of them falls inside. Both sides build this the same way, so the two
+        lists still pair by position.
+
+        `num_prompt_blocks` is the request's own block count, which is what
+        the token count describes -- `block_ids` may have lost its prefix to a
+        cache hit.
+        """
+        needed = self._tail_chunks(
+            num_prompt_blocks,
+            num_valid_tokens,
+            chunk_grid=self._shard_chunk_grids[(engine_id, global_rank)],
+        )
+        descs = self._get_block_descs_ids_for_shard(
+            engine_id, global_rank, num_blocks, block_ids, needed=needed
+        )
+        if needed is None or not block_ids[0]:
+            return descs
+        return np.concatenate(
+            (
+                descs,
+                self._chunk_descs_ids_for_shard(
+                    engine_id,
+                    global_rank,
+                    num_blocks,
+                    block_ids[0][-1],
+                    (0, needed),
+                    partial_only=True,
+                ),
+            )
+        )
+
+    def _xfer_notif_id(
+        self,
+        engine_id: str,
+        remote_request_id: str,
+        remote_tp_size: int,
+        *,
+        count_stages: bool = True,
+    ) -> bytes:
+        """Notification carrying what the peer on this path waits for.
+
+        NOTE(RBLN): the two paths send different units, because vllm 0.30
+        changed one of the two protocols and left the other alone. The read
+        path's peer counts notifications and settles the request when the
+        total arrives, deriving nothing from the number, so it is handed that
+        total: our readers of one peer rank, times our stages, since a finer
+        pipeline has each stage report for its own layers. The write path's
+        peer still divides by its own TP, so it is handed the quantity that
+        division expects, and it must not count stages -- the consumer's own
+        accounting multiplies the producer's stage count back in, off the
+        `pp_size` its `ReqMeta` carries, so they would be counted twice.
+        """
+        peers = max(1, self.world_size // remote_tp_size)
+        if not count_stages:
+            return f"{remote_request_id}:{peers * remote_tp_size}".encode()
+        remote_pp = self._remote_pp_size.get(engine_id, 1)
+        local_pp = self.vllm_config.parallel_config.pipeline_parallel_size
+        return f"{remote_request_id}:{peers * max(1, local_pp // remote_pp)}".encode()

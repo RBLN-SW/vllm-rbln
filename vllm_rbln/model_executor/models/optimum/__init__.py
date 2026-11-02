@@ -19,7 +19,6 @@ from vllm.logger import init_logger
 
 from vllm_rbln.model_executor.models.optimum.base import (
     ModelInputForRBLN,
-    PartialPrefixInfo,
 )
 from vllm_rbln.utils.optimum.predicates import is_qwen3_reranker
 from vllm_rbln.utils.optimum.registry import (
@@ -43,6 +42,7 @@ from .qwen2_vl import (  # noqa: F401
     RBLNOptimumQwen2_5_VLForConditionalGeneration,
     RBLNOptimumQwen2VLForConditionalGeneration,
 )
+from .qwen3_asr import RBLNOptimumQwen3ASRForConditionalGeneration  # noqa: F401
 from .qwen3_reranker import RBLNOptimumQwen3RerankerModel
 from .qwen3_vl import (  # noqa: F401
     RBLNOptimumQwen3_5ForConditionalGeneration,
@@ -119,6 +119,5 @@ def load_model(vllm_config: VllmConfig) -> nn.Module:
 __all__ = [
     "load_model",
     "ModelInputForRBLN",
-    "PartialPrefixInfo",
     "RBLNOptimumForEncoderModel",
 ]

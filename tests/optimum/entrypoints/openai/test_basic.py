@@ -17,12 +17,20 @@ import asyncio
 import openai
 import pytest
 import pytest_asyncio
-from utils import RemoteOpenAIServer
+
+from .utils import RemoteOpenAIServer
 
 MODEL_NAME = "facebook/opt-125m"
 MAX_TOKENS = 1
 
-SERVER_ARGS = ["--block-size", "2048", "--max-num-seqs", "2"]
+SERVER_ARGS = [
+    "--model-impl",
+    "optimum",
+    "--block-size",
+    "2048",
+    "--max-num-seqs",
+    "2",
+]
 SERVER_ENV = {"VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK": "1"}
 
 

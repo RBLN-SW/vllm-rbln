@@ -75,6 +75,14 @@ class RBLNMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         # Remove the head dim added above so downstream gets [batch, seq, rope_dim]
         k_pe = k_pe.squeeze(2)
 
+        topk_indices = None
+        if getattr(self, "indexer", None) is not None and getattr(
+            self, "is_sparse", False
+        ):
+            topk_indices = self.indexer(
+                hidden_states, q_c, positions, self.indexer_rope_emb
+            )
+
         if llama_4_scaling is not None:
             q *= llama_4_scaling
 
@@ -83,6 +91,7 @@ class RBLNMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             kv_c_normed,
             k_pe,
             output_shape=(batch_size, seq_len, self.num_heads * self.v_head_dim),
+            topk_indices=topk_indices,
         )
 
         return self.o_proj(attn_out)[0]

@@ -1,0 +1,55 @@
+name: 'Close inactive issues and PRs'
+
+on:
+  # schedule only ever runs the copy of this file on the default branch
+  schedule:
+    # Daily at 16:30 UTC, which is 01:30 KST
+    - cron: '30 16 * * *'
+
+jobs:
+  close-issues-and-pull-requests:
+    # Prevents triggering on forks or other repos
+    if: github.repository == 'RBLN-SW/vllm-rbln'
+    permissions:
+      issues: write
+      pull-requests: write
+      # actions: write lets the action cache its resume point when a run hits
+      # operations-per-run.
+      actions: write
+    runs-on: rbln-sw-k8s-general
+    steps:
+      - uses: actions/stale@eb5cf3af3ac0a1aa4c9c45633dd1ae542a27a899 # v10.3.0
+        with:
+          # Above the default of 30, so one run covers the whole backlog.
+          operations-per-run: 1000
+
+          exempt-draft-pr: true
+          exempt-issue-labels: 'keep-open'
+          exempt-pr-labels: 'keep-open'
+
+          labels-to-add-when-unstale: 'unstale'
+          labels-to-remove-when-stale: 'unstale'
+
+          days-before-stale: 30
+          days-before-close: 7
+
+          stale-issue-label: 'stale'
+          stale-issue-message: >
+            This issue has been automatically marked as stale because it has not
+            had any activity within 30 days. It will be automatically closed if no
+            further activity occurs within 7 days. Leave a comment if
+            you feel this issue should remain open. Thank you!
+          close-issue-message: >
+            This issue has been automatically closed due to inactivity. Please
+            feel free to reopen if you feel it is still relevant. Thank you!
+
+          stale-pr-label: 'stale'
+          stale-pr-message: >
+            This pull request has been automatically marked as stale because it
+            has not had any activity within 30 days. It will be automatically
+            closed if no further activity occurs within 7 days. Leave a comment
+            if you feel this pull request should remain open. Thank you!
+          close-pr-message: >
+            This pull request has been automatically closed due to inactivity.
+            Please feel free to reopen if you intend to continue working on it.
+            Thank you!

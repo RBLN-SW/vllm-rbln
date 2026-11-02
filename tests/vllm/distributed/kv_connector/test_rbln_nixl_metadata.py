@@ -1,0 +1,484 @@
+# Copyright 2026 Rebellions Inc. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at:
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Unit coverage for the RBLN NIXL metadata extension: the layer axis, the
+# chiplet geometry a shard advertises and which axis it came from, and the
+# compatibility hash that keeps a peer with another schema, transfer direction
+# or draft model from pairing.
+#
+# Self-contained: exercises only ``rbln_nixl.metadata`` (upstream vLLM NIXL +
+# msgspec + hash), so it does not require the ``nixl-rbln`` install or a worker.
+
+from unittest.mock import MagicMock
+
+import msgspec
+import pytest
+from vllm.config import SpeculativeConfig
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
+    NixlAgentMetadata,
+    NixlConnectorMetadata,
+)
+
+from tests.vllm.distributed.kv_connector.utils import (
+    mock_vllm_config,
+    setattr_in_package,
+    sliding_window_spec,
+)
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl import metadata as md
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
+    RBLN_NIXL_CONNECTOR_VERSION,
+    ChipletSplitAxis,
+    RblnNixlAgentMetadata,
+    RblnNixlConnectorMetadata,
+    connector_option,
+    rbln_compat_hash,
+    transfer_shape,
+)
+
+_BASE_FIELDS = dict(
+    engine_id="engine-0",
+    agent_metadata=b"agent-bytes",
+    kv_caches_base_addr=[0x1000, 0x2000],
+    device_id=0,
+    num_blocks=64,
+    block_lens=[8192, 8192],
+    block_strides=[8192, 8192],
+    kv_cache_layout="LBHNC",
+    block_size=16,
+    ssm_sizes=(0, 0),
+    attn_backend_name="RBLN_FLASH_ATTN",
+    physical_blocks_per_logical_kv_block=1,
+)
+
+
+def _make(**pp):
+    return RblnNixlAgentMetadata(**_BASE_FIELDS, **pp)
+
+
+class TestConnectorOptions:
+    """Where this connector's knobs come from, and what a wrong one does."""
+
+    @staticmethod
+    def _config(extra):
+        from types import SimpleNamespace
+
+        from vllm.config import KVTransferConfig
+
+        return SimpleNamespace(
+            kv_transfer_config=KVTransferConfig(
+                kv_connector="RblnNixlConnector",
+                kv_role="kv_both",
+                kv_connector_extra_config=extra,
+            )
+        )
+
+    def test_a_knob_nobody_set_is_its_default(self):
+        assert connector_option(self._config({}), "chunk_mode", False) is False
+        assert connector_option(self._config({}), "chunk_tokens", 0) == 0
+
+    def test_a_knob_that_was_set_is_what_it_says(self):
+        config = self._config({"chunk_mode": True, "chunk_tokens": 512})
+
+        assert connector_option(config, "chunk_mode", False) is True
+        assert connector_option(config, "chunk_tokens", 0) == 512
+
+    @pytest.mark.parametrize(
+        "extra, key, default, takes",
+        [
+            # Read for its truthiness otherwise, which "0" and "false" both
+            # pass -- and this config is written by hand.
+            ({"chunk_mode": "false"}, "chunk_mode", False, "bool"),
+            # The axis the bool case cannot reach: `bool` is a subclass of
+            # `int`, so an int knob given `true` would count as 1.
+            ({"chunk_tokens": True}, "chunk_tokens", 0, "int"),
+        ],
+    )
+    def test_a_value_of_the_wrong_type_is_refused(self, extra, key, default, takes):
+        config = self._config(extra)
+
+        with pytest.raises(RuntimeError, match=f"takes a {takes}"):
+            connector_option(config, key, default)
+
+
+class TestRblnNixlAgentMetadata:
+    def test_defaults_are_single_stage(self):
+        # Omitting the new fields yields the single-shard, single-area values a
+        # blob from an older schema decodes to.
+        m = _make()
+        assert (m.pp_rank, m.pp_size) == (0, 1)
+        assert m.registered_layer_names == []
+        # Every engine publishes one of each a logical region, host staging
+        # included, so empty is only what a peer that never sent them decodes to.
+        assert m.kv_area_slices == []
+        assert m.kv_split_axes == []
+        # Separate K and V regions is what every version through 4 registered.
+        assert m.kv_per_block == 1
+
+    def test_roundtrip_preserves_pp_fields(self):
+        # msgspec encode→decode with the RBLN type preserves PP descriptors.
+        m = _make(
+            pp_rank=1,
+            pp_size=2,
+            region_names=["model.layers.14", "model.layers.15"],
+        )
+        enc = msgspec.msgpack.Encoder().encode(m)
+        back = msgspec.msgpack.Decoder(RblnNixlAgentMetadata).decode(enc)
+        assert back == m
+        assert back.pp_rank == 1
+        assert back.pp_size == 2
+        assert back.registered_layer_names == [
+            "model.layers.14",
+            "model.layers.15",
+        ]
+
+    def test_upstream_consumer_ignores_pp_fields(self):
+        # A blob encoded with the RBLN type decodes cleanly as upstream's
+        # ``NixlAgentMetadata`` (PP fields ignored) — backward compatible.
+        enc = msgspec.msgpack.Encoder().encode(
+            _make(pp_rank=1, pp_size=2, kv_area_slices=[[0, 0, 1, 1]] * 2)
+        )
+        base = msgspec.msgpack.Decoder(NixlAgentMetadata).decode(enc)
+        assert base.engine_id == "engine-0"
+        assert base.num_blocks == 64
+        assert base.block_lens == [8192, 8192]
+        assert not hasattr(base, "pp_rank")
+        assert not hasattr(base, "kv_area_slices")
+
+    def test_roundtrip_preserves_chiplet_geometry(self):
+        # The head axis rides the same blob as the layer axis. Replication is the
+        # case that matters: which areas copy which slice has to survive, or the
+        # peer pairs areas by an order it guessed. Interleaved here on purpose.
+        geometry = [[0, 1, 0, 1], [0, 0, 1, 1]]
+        m = _make(kv_area_slices=geometry)
+        back = msgspec.msgpack.Decoder(RblnNixlAgentMetadata).decode(
+            msgspec.msgpack.Encoder().encode(m)
+        )
+        assert back.kv_area_slices == geometry
+
+    def test_registered_layer_names_order_preserved(self):
+        names = [f"model.layers.{i}" for i in range(14, 28)]
+        m = _make(pp_rank=1, pp_size=2, region_names=names)
+        back = msgspec.msgpack.Decoder(RblnNixlAgentMetadata).decode(
+            msgspec.msgpack.Encoder().encode(m)
+        )
+        assert back.registered_layer_names == names
+
+    def test_roundtrip_preserves_what_a_block_holds(self):
+        # A per-process setting, so a peer cannot recompute it from the rest of
+        # the blob -- two workers off one build can hold different layouts.
+        m = _make(kv_per_block=2)
+        back = msgspec.msgpack.Decoder(RblnNixlAgentMetadata).decode(
+            msgspec.msgpack.Encoder().encode(m)
+        )
+        assert back.kv_per_block == 2
+
+    def test_roundtrip_preserves_the_split_axes(self):
+        # The axes cross the wire as enum members, in region order: a slice id
+        # reads the same under either cut, so decoding an axis as anything else
+        # would put a context cut back under the head-band arithmetic. A target
+        # and its draft, cut differently.
+        axes = [ChipletSplitAxis.TOKEN, ChipletSplitAxis.HEAD]
+        m = _make(kv_area_slices=[[0, 1, 2, 3]] * 2, kv_split_axes=axes)
+        back = msgspec.msgpack.Decoder(RblnNixlAgentMetadata).decode(
+            msgspec.msgpack.Encoder().encode(m)
+        )
+        assert back.kv_split_axes == axes
+        assert all(isinstance(a, ChipletSplitAxis) for a in back.kv_split_axes)
+
+
+class TestRblnCompatHash:
+    def test_deterministic(self):
+        assert rbln_compat_hash(
+            "BASE", writes_into_peer=False, cross_layers_blocks=False
+        ) == rbln_compat_hash("BASE", writes_into_peer=False, cross_layers_blocks=False)
+
+    def test_differs_from_base(self):
+        # Folding our version in must move the hash, or a peer that speaks only
+        # upstream's schema would match one that speaks ours.
+        assert (
+            rbln_compat_hash("BASE", writes_into_peer=False, cross_layers_blocks=False)
+            != "BASE"
+        )
+
+    def test_the_two_transfer_directions_do_not_share_a_hash(self):
+        # A producer that writes into the consumer and one the consumer reads
+        # from describe the same bytes, so every length check on the handshake
+        # passes and only this separates them.
+        assert rbln_compat_hash(
+            "BASE", writes_into_peer=True, cross_layers_blocks=False
+        ) != rbln_compat_hash("BASE", writes_into_peer=False, cross_layers_blocks=False)
+
+    def test_distinguishes_base_hashes(self):
+        assert rbln_compat_hash(
+            "hash-a", writes_into_peer=False, cross_layers_blocks=False
+        ) != rbln_compat_hash(
+            "hash-b", writes_into_peer=False, cross_layers_blocks=False
+        )
+
+    def test_cross_layer_blocks_do_not_share_a_hash(self):
+        # The flag scales the page by the KV-cache tensor count, so two peers
+        # that disagree describe different block lengths. Upstream dropped it
+        # from its own factors in 0.30, leaving this the only place it is hashed.
+        assert rbln_compat_hash(
+            "BASE", writes_into_peer=False, cross_layers_blocks=True
+        ) != rbln_compat_hash("BASE", writes_into_peer=False, cross_layers_blocks=False)
+
+    @staticmethod
+    def _spec_config(*, method="eagle3", model="draft-a", revision=None):
+        draft_model_config = MagicMock()
+        draft_model_config.model = model
+        draft_model_config.revision = revision
+        draft_model_config.code_revision = None
+        spec = MagicMock(method=method, draft_model_config=draft_model_config)
+        # Upstream's own predicates, not a copy of the method names they read:
+        # a method moving between them has to show up here.
+        spec.use_eagle = lambda: SpeculativeConfig.use_eagle(spec)
+        spec.uses_draft_model = lambda: SpeculativeConfig.uses_draft_model(spec)
+        return spec
+
+    def test_no_speculation_leaves_the_factors_alone(self):
+        # Only a deployment running a draft model should see its hash move.
+        assert rbln_compat_hash(
+            "BASE",
+            writes_into_peer=False,
+            cross_layers_blocks=False,
+            speculative_config=None,
+        ) == rbln_compat_hash("BASE", writes_into_peer=False, cross_layers_blocks=False)
+
+    def test_a_draft_moves_the_hash(self):
+        # Without this, P with a draft and D without it pair.
+        assert rbln_compat_hash(
+            "BASE",
+            writes_into_peer=False,
+            cross_layers_blocks=False,
+            speculative_config=self._spec_config(),
+        ) != rbln_compat_hash("BASE", writes_into_peer=False, cross_layers_blocks=False)
+
+    def test_two_drafts_do_not_share_a_hash(self):
+        # Two drafts register regions of different sizes past the target's depth.
+        assert rbln_compat_hash(
+            "BASE",
+            writes_into_peer=False,
+            cross_layers_blocks=False,
+            speculative_config=self._spec_config(model="draft-a"),
+        ) != rbln_compat_hash(
+            "BASE",
+            writes_into_peer=False,
+            cross_layers_blocks=False,
+            speculative_config=self._spec_config(model="draft-b"),
+        )
+
+    def test_a_revision_separates_one_name(self):
+        # What the name resolves to is the rest of the answer: every geometry
+        # field the descriptors need follows from the name and this together.
+        assert rbln_compat_hash(
+            "BASE",
+            writes_into_peer=False,
+            cross_layers_blocks=False,
+            speculative_config=self._spec_config(revision="r1"),
+        ) != rbln_compat_hash(
+            "BASE",
+            writes_into_peer=False,
+            cross_layers_blocks=False,
+            speculative_config=self._spec_config(revision="r2"),
+        )
+
+    def test_a_method_without_a_draft_model_leaves_the_factors_alone(self):
+        # Upstream hands n-gram the target's own config, so a hash keyed on a
+        # draft config's presence would refuse a decode-only n-gram pairing.
+        plain = rbln_compat_hash(
+            "BASE", writes_into_peer=False, cross_layers_blocks=False
+        )
+        for method in ("ngram", "suffix"):
+            assert (
+                rbln_compat_hash(
+                    "BASE",
+                    writes_into_peer=False,
+                    cross_layers_blocks=False,
+                    speculative_config=self._spec_config(method=method),
+                )
+                == plain
+            )
+
+    def test_a_separate_draft_model_moves_the_hash(self):
+        # The other method that registers layers of its own.
+        assert rbln_compat_hash(
+            "BASE",
+            writes_into_peer=False,
+            cross_layers_blocks=False,
+            speculative_config=self._spec_config(method="draft_model"),
+        ) != rbln_compat_hash("BASE", writes_into_peer=False, cross_layers_blocks=False)
+
+    def test_version_is_folded(self, monkeypatch):
+        # Bumping RBLN_NIXL_CONNECTOR_VERSION changes the hash (gates schema drift).
+        h1 = md.rbln_compat_hash(
+            "BASE", writes_into_peer=False, cross_layers_blocks=False
+        )
+        setattr_in_package(
+            monkeypatch, RBLN_NIXL_CONNECTOR_VERSION=RBLN_NIXL_CONNECTOR_VERSION + 1
+        )
+        assert (
+            md.rbln_compat_hash(
+                "BASE", writes_into_peer=False, cross_layers_blocks=False
+            )
+            != h1
+        )
+
+
+class TestRblnNixlConnectorMetadata:
+    def test_promotion_keeps_every_field_upstream_filled(self):
+        # Upstream scheduler names its own type, so ours is copied from the
+        # instance it built; a field lost here is a step's transfers lost.
+        base = NixlConnectorMetadata()
+        base.reqs_to_recv = {"r0": "recv"}
+        base.reqs_to_save = {"r1": "save"}
+        base.reqs_in_batch = {"r2"}
+        base.push_finished_blocks = {"r3": ([1],)}
+
+        promoted = RblnNixlConnectorMetadata.promote(base)
+
+        assert promoted.reqs_to_recv == {"r0": "recv"}
+        assert promoted.reqs_to_save == {"r1": "save"}
+        assert promoted.reqs_in_batch == {"r2"}
+        assert promoted.push_finished_blocks == {"r3": ([1],)}
+        assert promoted.push_early_flush == set()
+        assert promoted.push_stream_total == {}
+        assert promoted.valid_tokens == {}
+        # Upstream asserts on its own type in several places.
+        assert isinstance(promoted, NixlConnectorMetadata)
+
+    def test_the_added_fields_do_not_bleed_into_each_other(self):
+        # They are filled by different paths on different steps -- the flush on
+        # a preemption, the total on every streamed offer, the token count only
+        # on a handover -- so a promotion that aliased them would show up as
+        # one path clearing another.
+        meta = RblnNixlConnectorMetadata()
+        meta.push_early_flush = {"r0"}
+        meta.push_stream_total = {"r1": 4}
+        meta.valid_tokens = {"r2": 33}
+
+        promoted = RblnNixlConnectorMetadata.promote(meta)
+
+        assert promoted.push_early_flush == {"r0"}
+        assert promoted.push_stream_total == {"r1": 4}
+        assert promoted.valid_tokens == {"r2": 33}
+
+
+class TestTransferShape:
+    """The reduction both sides run. Its inputs are two config objects, so a
+    case here states a deployment rather than a worker."""
+
+    @staticmethod
+    def _groups(*specs):
+        return [MagicMock(kv_cache_spec=spec) for spec in specs]
+
+    def _hybrid(self):
+        # gpt-oss' shape: one full-attention group and one sliding-window
+        # group, the only one where a prefix offer has two groups to tell apart.
+        from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+        return self._groups(
+            MagicMock(spec=FullAttentionSpec),
+            sliding_window_spec(block_size=64, sliding_window=16),
+        )
+
+    @pytest.mark.parametrize(
+        ("writes_into_peer", "streams"), [(True, True), (False, False)]
+    )
+    def test_streaming_is_inert_on_the_side_that_does_not_write(
+        self, writes_into_peer, streams
+    ):
+        # One `--kv-transfer-config` is handed to both ends of a P/D pair, so
+        # the knob reaches the reading side too. Acting on it there would give
+        # that side's descriptor lists a window range nothing reads.
+        shape = transfer_shape(
+            mock_vllm_config(push_stream=True),
+            self._hybrid(),
+            writes_into_peer=writes_into_peer,
+        )
+
+        assert shape.streams_prefix is streams
+        # The lists a streamed write needs, which a hybrid owns without a
+        # window range -- that knob is asked for separately now.
+        assert shape.owns_engine_lists is streams
+        assert shape.has_window_range is False
+
+    @pytest.mark.parametrize(
+        ("push_stream", "kv_buffer_device", "streams"),
+        [(True, "rbln", True), (False, "rbln", False), (True, "cpu", False)],
+    )
+    def test_host_staging_takes_no_prefix(self, push_stream, kv_buffer_device, streams):
+        # Host staging registers one full-shape buffer per layer and moves a
+        # request at a time, so there is nothing for a prefix to be named in.
+        config = mock_vllm_config(push_stream=push_stream)
+        config.kv_transfer_config.kv_buffer_device = kv_buffer_device
+
+        shape = transfer_shape(config, self._hybrid(), writes_into_peer=True)
+
+        assert shape.streams_prefix is streams
+
+    def test_a_lone_sliding_window_group_counts_in_none(self):
+        # Being the only group does not make a clipped list describe the
+        # request. Nothing reads this on such an engine -- registration refuses
+        # it for the same reason -- so the honest answer is that there is no
+        # group to count in, not the one that cannot.
+        shape = transfer_shape(
+            mock_vllm_config(chunk_mode=True),
+            self._groups(sliding_window_spec(block_size=64, sliding_window=16)),
+            writes_into_peer=True,
+        )
+
+        assert shape.counted_group is None
+
+    def test_the_counted_group_is_the_one_that_does_not_slide(self):
+        # Not the first: a sliding-window group holds one block whatever the
+        # prompt length, so an offer sized from it would be one block for every
+        # request. Which position it sits in is the model's business.
+        from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+        groups = self._groups(
+            sliding_window_spec(block_size=64, sliding_window=16),
+            MagicMock(spec=FullAttentionSpec),
+        )
+
+        shape = transfer_shape(
+            mock_vllm_config(chunk_mode=True), groups, writes_into_peer=True
+        )
+
+        assert shape.counted_group == 1
+
+    def test_the_knob_is_still_reported_as_asked_for(self):
+        # `wants_stream` is what an operator typed; `streams_prefix` is what
+        # this side does about it. A refusal reads the first.
+        shape = transfer_shape(
+            mock_vllm_config(push_stream=True),
+            self._hybrid(),
+            writes_into_peer=False,
+        )
+
+        assert shape.wants_stream is True
+        # ... and what travels with a request follows the second, so a knob
+        # inert on this side puts nothing in the metadata for it.
+        assert shape.sends_token_count is False
+
+    def test_a_side_that_streams_alone_sends_no_count(self):
+        # A streamed handover sends the last block whole, so with the other
+        # knobs off nothing reads the count. Mid-stream offers carry their own.
+        shape = transfer_shape(
+            mock_vllm_config(push_stream=True),
+            self._hybrid(),
+            writes_into_peer=True,
+        )
+
+        assert (shape.streams_prefix, shape.sends_token_count) == (True, False)

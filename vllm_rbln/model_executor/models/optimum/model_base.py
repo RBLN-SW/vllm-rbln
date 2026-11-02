@@ -32,16 +32,26 @@ import optimum.rbln
 from optimum.rbln.transformers.models.decoderonly import (
     decoderonly_runtime_utils as runtime_utils,
 )
-from vllm_rbln import envs
+from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.logger import init_logger
 from vllm_rbln.utils.optimum.block_size import get_attn_block_size
 from vllm_rbln.utils.optimum.bucket import select_bucket_size
+from vllm_rbln.utils.optimum.paths import is_compiled_dir
 from vllm_rbln.utils.optimum.registry import get_rbln_model_info
 
-from .base import ModelInputForRBLN, PartialPrefixInfo
+from .base import ModelInputForRBLN
 from .compilation import RBLNCompileSpec
 
 logger = init_logger(__name__)
+
+
+class KVCacheCopyError(RuntimeError):
+    """Raised when copying prefix-cached KV blocks fails (e.g. device OOM).
+
+    The copy is a pure optimization: the caller can always recover by
+    running a full prefill without the cached-prefix trim, so this error
+    must be caught at the copy call site instead of killing the engine.
+    """
 
 
 class KVCacheBlockAdapter:
@@ -77,16 +87,10 @@ class KVCacheBlockAdapter:
 
     def _estimated_num_blocks(self) -> int:
         """Override estimated blocks if num_gpu_blocks_override is set."""
-        if (
-            self.vllm_config.additional_config
-            and "num_blocks_override" in self.vllm_config.additional_config
-        ):
-            num_gpu_blocks_override = self.vllm_config.additional_config[
-                "num_blocks_override"
-            ]
-            return num_gpu_blocks_override
-        else:
-            return int(self.estimated_kvcache_num_blocks)
+        rbln_config: OptimumRBLNConfig = self.vllm_config.additional_config
+        if rbln_config.num_blocks_override is not None:
+            return rbln_config.num_blocks_override
+        return int(self.estimated_kvcache_num_blocks)
 
     def is_full_block_available(self) -> bool:
         """True if we can allocate a full batch worth of blocks."""
@@ -102,7 +106,7 @@ class KVCacheBlockAdapter:
 
     def get_available_num_blocks(self) -> int:
         if self.vllm_config.cache_config.enable_prefix_caching:
-            ob_size = self.vllm_config.additional_config["attn_block_size"]
+            ob_size = get_attn_block_size(self.vllm_config)
             ib_size = self.vllm_config.cache_config.block_size
             blk_ratio = ob_size // ib_size
         else:
@@ -178,13 +182,14 @@ class RBLNOptimumModelBase(nn.Module):
 
     def init_model(self) -> None:
         hf_config = self.model_config.hf_config
-        cached_model_path = self.vllm_config.additional_config.get("cached_model_path")
-        rbln_overrides = self.vllm_config.additional_config.get("rbln_config", {})
+        rbln_config: OptimumRBLNConfig = self.vllm_config.additional_config
+        cached_model_path = rbln_config.cached_model_path
+        rbln_overrides = rbln_config.optimum_overrides
         _, model_cls_name = get_rbln_model_info(hf_config)
         model_path = self.vllm_config.model_config.model
-        if os.path.exists(model_path):
+        if is_compiled_dir(model_path):
             valid_path = model_path
-        elif cached_model_path and os.path.exists(cached_model_path):
+        elif is_compiled_dir(cached_model_path):
             valid_path = cached_model_path
         else:
             valid_path = None
@@ -226,7 +231,7 @@ class RBLNOptimumModelBase(nn.Module):
                 batch_size=self.scheduler_config.max_num_seqs,
                 block_size=get_attn_block_size(self.vllm_config),
                 max_model_len=self.model_config.max_model_len,
-                num_devices=envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
+                num_devices=rbln_config.num_devices_per_local_rank,
                 # Resolved during sync (from_optimum/from_vllm) into
                 # max_num_batched_tokens; pin it at compile time so the compiled
                 # model matches the value used for KV-cache block padding.
@@ -240,8 +245,30 @@ class RBLNOptimumModelBase(nn.Module):
                 spec.model_cls.__name__,
                 json.dumps(spec.rbln_config, indent=2, default=str),
             )
+            # Pass transformers config objects directly to preserve all settings.
+            # Config classes defined outside transformers (e.g. vLLM's qwen3_asr)
+            # may be incompatible with the transformers model implementation.
+            # For these configs, pass num_hidden_layers and, when available,
+            # layer_types as config kwargs instead.
+            # FIXME(optimum-rbln): Ensure RBLNGptOssForCausalLM.get_pytorch_model
+            # applies these config kwargs; it currently discards them.
+            if type(hf_config).__module__.startswith("transformers."):
+                config_override = {"config": hf_config}
+            else:
+                text_config = hf_config.get_text_config()
+                layer_override = {"num_hidden_layers": text_config.num_hidden_layers}
+                if hasattr(text_config, "layer_types"):
+                    layer_override["layer_types"] = text_config.layer_types
+                config_override = (
+                    layer_override
+                    if text_config is hf_config
+                    else {"text_config": layer_override}
+                )
             model = spec.model_cls.from_pretrained(
-                self.model_config.model, rbln_config=spec.rbln_config, config=hf_config
+                self.model_config.model,
+                rbln_config=spec.rbln_config,
+                dtype=self.model_config.dtype,
+                **config_override,
             )
             model.save_pretrained(cached_model_path)  # type: ignore[attr-defined]
             self.vllm_config.model_config.model = cached_model_path
@@ -286,7 +313,6 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
         use_multiple_decoder: bool,
         default_batch_size: int,
         decoder_batch_sizes: list[int],
-        num_blocks: int,
     ):
         self.attn_impl = attn_impl
         self.use_multiple_decoder = use_multiple_decoder
@@ -296,117 +322,24 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
             self.decoder_batch_sizes = tuple(reversed(decoder_batch_sizes))
 
         self.logits_processor = LogitsProcessor(vocab_size, logits_as_input=True)
-        self.available_blocks = torch.arange(
-            0,
-            num_blocks,
-            dtype=torch.int16,
+
+    def decode_layout(
+        self, cache_slot_ids: torch.Tensor, block_tables: torch.Tensor
+    ) -> tuple[int, slice | torch.Tensor]:
+        """Padded decode batch size and the row of each running request in it.
+
+        By default the requests sit in running order at rows [0, num_reqs) of
+        the smallest decoder bucket that fits. A model whose graph keeps
+        per-row on-device state overrides this to pin each request to its row
+        of the decoder's full batch.
+        """
+        num_reqs = cache_slot_ids.shape[0]
+        padded_batch_size = (
+            select_bucket_size(num_reqs, self.decoder_batch_sizes)
+            if self.use_multiple_decoder
+            else self.decoder_batch_size
         )
-
-    def pad_decoder_items(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        block_tables: torch.Tensor,
-        input_block_ids: torch.Tensor | None = None,
-        padded_batch_size: int | None = None,
-        dummy_block: int | None = None,
-    ):
-        assert input_ids.shape[1] == 1
-        if input_block_ids is None and padded_batch_size is None:
-            raise ValueError(
-                "Either input_block_ids or padded_batch_size must be provided."
-            )
-        elif input_block_ids is not None and padded_batch_size is not None:
-            raise ValueError(
-                "Cannot provide both input_block_ids and padded_batch_size."
-            )
-
-        if padded_batch_size is None:
-            padded_batch_size = self.decoder_batch_size
-
-        original_batch_size = input_ids.shape[0]
-
-        padded_input_ids = torch.zeros(padded_batch_size, 1, dtype=input_ids.dtype)
-        padded_position_ids = torch.zeros(padded_batch_size, 1, dtype=positions.dtype)
-        padded_block_tables = torch.zeros(
-            padded_batch_size, block_tables.shape[1], dtype=block_tables.dtype
-        ).fill_(-1)
-
-        mask = torch.ones_like(
-            padded_block_tables,
-            dtype=torch.bool,
-            device=block_tables.device,
-        )
-
-        if input_block_ids is None:
-            padded_input_ids[:original_batch_size] = input_ids
-            padded_position_ids[:original_batch_size] = positions
-            padded_block_tables[:original_batch_size] = block_tables
-            mask[:original_batch_size, :] = False
-        else:
-            padded_input_ids[input_block_ids] = input_ids
-            padded_position_ids[input_block_ids] = positions
-            padded_block_tables[input_block_ids] = block_tables
-            mask[input_block_ids, :] = False
-
-        if torch.any(mask):
-            if dummy_block is not None:
-                padding_blocks = torch.tensor([dummy_block], dtype=block_tables.dtype)
-            else:
-                padding_blocks = self.available_blocks[
-                    ~torch.isin(self.available_blocks, block_tables.flatten())
-                ]
-            padded_block_tables[mask] = padding_blocks[0]
-        return padded_input_ids, padded_position_ids, padded_block_tables
-
-    def preprocess_for_decoder(
-        self,
-        is_prompt: bool,
-        block_tables: torch.Tensor,
-        input_ids: torch.Tensor | None = None,
-        cache_position: torch.Tensor | None = None,
-        input_block_ids: list[int] | None = None,
-        dummy_block: int | None = None,
-    ):
-        padded_batch_size = None
-        # 1. Set the type
-        # TODO: Does it require changing the dtype dynamically?
-        input_ids = input_ids.to(torch.int64) if input_ids is not None else None
-        cache_position = (
-            cache_position.to(torch.int32) if cache_position is not None else None
-        )
-        block_tables = block_tables.to(torch.int16)
-
-        # 2. Adjust the shape of tensors by squeezing and padding
-        if is_prompt:
-            block_tables = block_tables.squeeze(0)
-            padded_batch_size = 1
-        else:
-            if input_block_ids is None:
-                padded_batch_size = self.decoder_batch_size
-                if input_ids is not None:
-                    request_nums = input_ids.shape[0]
-                # Select lower-bounded batch size in case of multiple decoders
-                if self.use_multiple_decoder:
-                    padded_batch_size = select_bucket_size(
-                        request_nums, self.decoder_batch_sizes
-                    )
-
-            input_ids, cache_position, block_tables = self.pad_decoder_items(
-                input_ids,
-                cache_position,
-                block_tables,
-                input_block_ids=input_block_ids,
-                padded_batch_size=padded_batch_size,
-                dummy_block=dummy_block,
-            )
-        kwargs = {
-            "block_tables": block_tables,
-            "padded_batch_size": padded_batch_size,
-            "input_ids": input_ids,
-            "cache_position": cache_position,
-        }
-        return kwargs
+        return padded_batch_size, slice(0, num_reqs)
 
     def get_prefill_decoder(self) -> runtime_utils.RBLNRuntimeModel:
         return self.model.prefill_decoder
@@ -426,7 +359,12 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
         Args:
             cached_block_tables: Source block IDs to copy from.
             cached_lengths: Cached length for each source block.
-            block_tables: Tensor whose first row holds the destination block IDs.
+            block_tables: Destination block IDs of the request.
+
+        Raises:
+            KVCacheCopyError: A block copy failed (e.g. device OOM). The
+                destination blocks may be partially written; the caller must
+                fall back to a full prefill, which overwrites them all.
         """
         if not cached_block_tables:
             return
@@ -440,7 +378,7 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
 
         prefill_decoder = self.get_prefill_decoder()
         # Convert to list once for efficiency
-        dst_blocks = block_tables[0].tolist()
+        dst_blocks = block_tables.tolist()
 
         for block_idx, (src_block, dst_block) in enumerate(
             zip(cached_block_tables, dst_blocks)
@@ -455,12 +393,10 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
                     dst_block,
                 )
             except Exception as e:
-                error_msg = (
+                raise KVCacheCopyError(
                     f"Failed to copy KV cache from block {src_block} to block "
                     f"{dst_block} at index {block_idx}: {e}"
-                )
-                logger.error(error_msg)
-                raise RuntimeError(error_msg) from e
+                ) from e
 
     # It is required for decoder models in openai api server
     def compute_logits(
@@ -478,78 +414,37 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
         return self.model.language_model.prefill_decoder
 
     def build_prefill_forward_inputs(
-        self,
-        model_input: ModelInputForRBLN,
-        mrope_position_deltas: dict[str, float],
+        self, model_input: ModelInputForRBLN
     ) -> ModelInputForRBLN:
-        """Dispatch full vs partial prefix-cache prefill. Shared by every MM
-        model; subclasses override the ``_build_*_prefill_forward_inputs``
-        builders, not this dispatch.
-
-        ``mrope_position_deltas`` is unused in the base builders but forwarded
-        so MRoPE overrides (e.g. Qwen-VL) can record per-request rope deltas.
-        """
-        if model_input.partial_prefix is not None:
-            return self._build_partial_prefill_forward_inputs(
-                model_input, mrope_position_deltas
-            )
-        return self._build_full_prefill_forward_inputs(
-            model_input, mrope_position_deltas
+        """Scatter the runner's gathered `mm_embeds` over the text embeddings.
+        Subclasses add their graph extras (MRoPE positions, deepstack)."""
+        inputs_embeds = self.embed_input_ids(
+            model_input.input_tokens,
+            model_input.mm_embeds,
+            is_multimodal=model_input.is_mm_embed,
         )
-
-    def _build_full_prefill_forward_inputs(
-        self,
-        model_input: ModelInputForRBLN,
-        mrope_position_deltas: dict[str, float],
-    ) -> ModelInputForRBLN:
-        multimodal_embeddings = self.embed_multimodal(
-            **(model_input.multi_modal_kwargs or {})
-        )
-        input_ids = model_input.input_tokens.to(torch.int64)
-        inputs_embeds = self.embed_input_ids(input_ids, multimodal_embeddings)
         return replace(model_input, inputs_embeds=inputs_embeds)
 
-    def _build_partial_prefill_forward_inputs(
-        self,
-        model_input: ModelInputForRBLN,
-        mrope_position_deltas: dict[str, float],
+    def build_decode_forward_inputs(
+        self, model_input: ModelInputForRBLN
     ) -> ModelInputForRBLN:
-        assert model_input.partial_prefix is not None
-        multimodal_embeddings = self.embed_multimodal(
-            **(model_input.multi_modal_kwargs or {})
-        )
-        multimodal_embeddings = self._build_partial_mm_embeds(
-            model_input.partial_prefix, multimodal_embeddings
-        )
-        input_ids = model_input.input_tokens.to(torch.int64)
-        inputs_embeds = self.embed_input_ids(input_ids, multimodal_embeddings)
-        return replace(model_input, inputs_embeds=inputs_embeds)
+        """Decode counterpart: the base graphs take the token ids as they are,
+        MRoPE models add `position_embed`."""
+        return model_input
 
-    def compute_decode_position_embed(
-        self,
-        model_input: ModelInputForRBLN,
-        # Unused in the base (no decode-time position embed); MRoPE models
-        # (e.g. Qwen-VL) override this and consume the recorded rope deltas.
-        mrope_position_deltas: dict[str, float],
-    ) -> torch.Tensor | None:
-        return None
-
-    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings | dict:
-        # Default vision-only encode path shared by the simple MM models: parse
-        # the image input and return per-image token embeddings. Models with a
-        # richer cacheable unit (e.g. Qwen-VL, which also handles video) override
-        # this.
+    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
+        # One 2D tensor per multimodal item, in the order the items appear in
+        # the kwargs (upstream's SupportsMultiModal contract); the runner caches
+        # each item's tensor by mm_hash. Models that also take video (Qwen-VL)
+        # override this.
         image_input = self._parse_and_validate_image_input(**kwargs)
         if image_input is None:
             return []
 
         return self._process_image_input(image_input)
 
-    def _process_image_input(self, image_input: object) -> list[torch.Tensor] | dict:
-        # Encode a validated image input into the model's cacheable multimodal
-        # unit: per-image token embeddings (list[torch.Tensor]) for the simple
-        # models, or a richer dict (e.g. Qwen-VL). Consumed by the default
-        # embed_multimodal() above.
+    def _process_image_input(self, image_input: object) -> list[torch.Tensor]:
+        # Encode a validated image input into per-image token embeddings.
         raise NotImplementedError(
             "`_process_image_input` must be implemented for each model."
         )
@@ -601,59 +496,7 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
             return inputs_embeds
 
         # Flatten per-item embeddings into (num_mm_tokens, hidden_size).
-        mm_embeds = torch.cat(list(multimodal_embeddings)).to(
-            inputs_embeds.device, inputs_embeds.dtype
-        )
+        mm_embeds = torch.cat(list(multimodal_embeddings)).to(inputs_embeds.dtype)
         self._assert_mm_tokens_match(int(is_multimodal.sum()), mm_embeds.shape[0])
         scatter_mask = is_multimodal.unsqueeze(-1).expand_as(inputs_embeds)
         return inputs_embeds.masked_scatter(scatter_mask, mm_embeds)
-
-    def build_prefill_inputs_from_cache(
-        self,
-        input_ids: torch.Tensor,
-        cached_mm_outputs: list,
-        *,
-        cache_position: torch.Tensor | None = None,
-        running_requests_ids: list[str] | None = None,
-        mrope_position_deltas: dict[str, float] | None = None,
-    ) -> dict:
-        # NOTE: this default is currently unreachable. init_model() gates the EC
-        # producer/consumer path on ec_enabled_model ==
-        # "RBLNQwen3VLForConditionalGeneration", so no non-Qwen model enters the
-        # EC path today. It is kept as the shared interface contract / placeholder
-        # until more models are EC-enabled.
-        mm_embeds = [t for out in cached_mm_outputs for t in out]
-        inputs_embeds = self.embed_input_ids(input_ids, mm_embeds)
-        return {"inputs_embeds": inputs_embeds, "cache_position": cache_position}
-
-    def _build_partial_mm_embeds(
-        self,
-        partial_prefix: PartialPrefixInfo,
-        multimodal_embeddings: MultiModalEmbeddings,
-    ) -> MultiModalEmbeddings:
-        tail_starts_by_modality = partial_prefix.mm_embed_tail_starts or {}
-        # Base MM models are single-modality (image); flatten to one start list
-        # kept-item order, matching the flat per-item embeddings list.
-        if len(tail_starts_by_modality) > 1:
-            raise NotImplementedError(
-                "Partial prefix tail slicing across multiple modalities needs a "
-                "model-specific _build_partial_mm_embeds override."
-            )
-        tail_starts = next(iter(tail_starts_by_modality.values()), [])
-
-        if not isinstance(multimodal_embeddings, (list, tuple)):
-            raise NotImplementedError(
-                "Base partial prefix slicing expects per-item embeddings "
-                f"(list/tuple), got {type(multimodal_embeddings).__name__}; "
-                "override _build_partial_mm_embeds for this representation."
-            )
-        if len(tail_starts) != len(multimodal_embeddings):
-            raise ValueError(
-                f"kept-item count mismatch: {len(multimodal_embeddings)} "
-                f"embeddings vs {len(tail_starts)} tail starts"
-            )
-
-        sliced = [
-            embeds[start:] for embeds, start in zip(multimodal_embeddings, tail_starts)
-        ]
-        return type(multimodal_embeddings)(sliced)

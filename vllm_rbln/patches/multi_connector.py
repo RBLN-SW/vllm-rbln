@@ -11,56 +11,93 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Backport of vllm-project/vllm#46865 (``2285cfc``).
 
-``MultiConnector`` handed empty blocks to every sub-connector that did not win
-the lookup. An offload connector records those block ids for its store path, so
-blank blocks mean "cannot store". On a prefill instance with a cold cache nobody
-wins, so no child ever sees the real blocks and the cache never bootstraps.
+"""Forward a child connector's worker-side KV events through ``MultiConnector``.
 
-TODO(vllm>=0.26.0): delete this module, its entry in ``patches/__init__.py`` and
-``tests/native/patches/test_multi_connector.py``.
+The model runner collects worker-side KV events only through
+``get_kv_connector_kv_cache_events``. ``MultiConnector`` already hands the
+aggregated output back to every child on the scheduler side and chains their
+``take_events``; only this worker-side hop is missing upstream.
 """
 
+from __future__ import annotations
+
+import functools
 from typing import TYPE_CHECKING
 
-from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiConnector
-from vllm.version import __version_tuple__ as VLLM_VERSION
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
+from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
+    MultiConnector,
+)
 
 from vllm_rbln.patches import register_patch
 
 if TYPE_CHECKING:
-    from vllm.v1.core.kv_cache_manager import KVCacheBlocks
-    from vllm.v1.request import Request
-
-# Fails loudly on the upgrade that makes this backport redundant.
-assert VLLM_VERSION < (0, 26), (
-    f"vLLM {VLLM_VERSION} already ships vllm#46865; delete this module, its "
-    "entry in vllm_rbln/patches/__init__.py and "
-    "tests/native/patches/test_multi_connector.py."
-)
+    from vllm.config import VllmConfig
+    from vllm.distributed.kv_events import KVConnectorKVEvents
 
 
 @register_patch(
     target=(
-        "vllm.distributed.kv_transfer.kv_connector.v1."
-        "multi_connector.MultiConnector.update_state_after_alloc"
+        "vllm.distributed.kv_transfer.kv_connector.v1.multi_connector."
+        "MultiConnector.get_kv_connector_kv_cache_events"
     ),
     reason=(
-        "Backport vllm#46865 (2285cfc): empty blocks for non-chosen sub-connectors "
-        "starve an offload connector's store path. TODO(vllm>=0.26.0): delete."
+        "MultiConnector drops in-process LMCache's worker-side RDS events "
+        "(vllm-project/vllm#31811 closed unmerged). TODO(vllm-rbln): delete "
+        "both patches after LMCache moves to multiprocess (MP) mode and "
+        "the router receives RDS events from the LMCache server process "
+        "without this worker-side hook."
     ),
+    key="vllm_rbln.patches.multi_connector.get_kv_connector_kv_cache_events",
+    owner_module="vllm_rbln.patches.multi_connector",
 )
-def patched_update_state_after_alloc(
+def get_kv_connector_kv_cache_events(
     self: MultiConnector,
-    request: "Request",
-    blocks: "KVCacheBlocks",
-    num_external_tokens: int,
-) -> None:
-    chosen_connector = self._requests_to_connector.get(request.request_id, -1)
-    for i, c in enumerate(self._connectors):
-        c.update_state_after_alloc(
-            request,
-            blocks,
-            num_external_tokens if i == chosen_connector else 0,
-        )
+) -> KVConnectorKVEvents | None:
+    # Every child is called each step: a child may drain its worker-side queue
+    # in this call even on the workers that report nothing. With events enabled,
+    # MultiConnector.__init__ allows at most one child to override this hook.
+    events = [child.get_kv_connector_kv_cache_events() for child in self._connectors]
+    return next((e for e in events if e is not None), None)
+
+
+@register_patch(
+    target=(
+        "vllm.distributed.kv_transfer.kv_connector.v1.multi_connector."
+        "MultiConnector.__init__"
+    ),
+    reason=(
+        "Forwarding a child's KV events cannot merge two children's events: "
+        "each carries its own cross-worker aggregate() rule. With KV events "
+        "enabled, refuse a second reporting child at construction instead of "
+        "mid-serving. TODO(vllm-rbln): delete with the forwarding patch."
+    ),
+    key="vllm_rbln.patches.multi_connector.init",
+    owner_module="vllm_rbln.patches.multi_connector",
+    build=True,
+)
+def _build_init():
+    original = MultiConnector.__init__
+    base = KVConnectorBase_V1.get_kv_connector_kv_cache_events
+
+    @functools.wraps(original)
+    def __init__(
+        self: MultiConnector, vllm_config: VllmConfig, *args, **kwargs
+    ) -> None:
+        original(self, vllm_config, *args, **kwargs)
+        event_config = vllm_config.kv_events_config
+        if event_config is None or not event_config.enable_kv_cache_events:
+            return
+        reporters = [
+            type(child).__name__
+            for child in self._connectors
+            if type(child).get_kv_connector_kv_cache_events is not base
+        ]
+        if len(reporters) > 1:
+            raise NotImplementedError(
+                "MultiConnector cannot merge KV events from more than one child "
+                f"connector; {reporters} all report them"
+            )
+
+    return __init__

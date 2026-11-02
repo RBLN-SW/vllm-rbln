@@ -14,7 +14,8 @@
 
 import pytest
 import requests
-from utils import RemoteOpenAIServer
+
+from .utils import RemoteOpenAIServer
 
 MODEL_NAME = "facebook/opt-125m"
 ARGS = ["--block-size", str(2048)]
@@ -25,7 +26,7 @@ RBLN_DEFAULT_MAX_NUM_SEQS = 1
 EXPLICIT_MAX_NUM_SEQS = 2
 
 # VLLM_RBLN_USE_VLLM_MODEL selects the runtime backend: 0 = optimum path,
-# 1 = vLLM-native model path. The default must hold for both.
+# 1 = the vllm model path. The default must hold for both.
 # FIXME MODE=1 is skipped for now.
 MODES = ["0"]
 

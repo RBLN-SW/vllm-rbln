@@ -15,25 +15,34 @@
 
 import json
 import logging
+from copy import deepcopy
 from logging.config import dictConfig
 from os import path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+from weakref import WeakSet
 
+import vllm.logger as vllm_logger
 from vllm import envs
 from vllm.logger import _DATE_FORMAT, _use_color, init_logger
+from vllm.logging_utils import ColoredFormatter, NewLineFormatter
+
+if TYPE_CHECKING:
+    from vllm.config.logging import LoggingConfig
 
 _FORMAT = "[vllm-rbln] %(levelname)s %(asctime)s [%(fileinfo)s:%(lineno)d] %(message)s"
 DEFAULT_LOGGIN_CONFIG: dict[str, dict[str, Any] | Any] = {
     "formatters": {
         "vllm_rbln": {
-            "class": "vllm.logging_utils.NewLineFormatter",
+            "()": "vllm.logging_utils.NewLineFormatter",
             "datefmt": _DATE_FORMAT,
             "format": _FORMAT,
+            "log_level": envs.VLLM_LOGGING_LEVEL,
         },
         "vllm_rbln_color": {
-            "class": "vllm.logging_utils.ColoredFormatter",
+            "()": "vllm.logging_utils.ColoredFormatter",
             "datefmt": _DATE_FORMAT,
             "format": _FORMAT,
+            "log_level": envs.VLLM_LOGGING_LEVEL,
         },
     },
     "handlers": {
@@ -56,6 +65,9 @@ DEFAULT_LOGGIN_CONFIG: dict[str, dict[str, Any] | Any] = {
     "disable_existing_loggers": False,
 }
 
+_console_handler: logging.Handler | None = None
+_file_handlers: WeakSet[logging.FileHandler] = WeakSet()
+
 
 def make_file_handler(file_path: str) -> logging.FileHandler:
     """Create a file handler using the same format as the stdout handler.
@@ -69,14 +81,15 @@ def make_file_handler(file_path: str) -> logging.FileHandler:
     Example:
         >>> logger.addHandler(make_file_handler("/tmp/metrics.log"))
     """
-    from vllm.logging_utils import NewLineFormatter
-
     handler = logging.FileHandler(file_path)
-    handler.setFormatter(NewLineFormatter(_FORMAT))
+    level = logging.getLevelName(logging.getLogger("vllm_rbln").getEffectiveLevel())
+    handler.setFormatter(NewLineFormatter(_FORMAT, log_level=level))
+    _file_handlers.add(handler)
     return handler
 
 
 def _configure_vllm_root_logger() -> None:
+    global _console_handler
     logging_config: dict[str, dict[str, Any] | Any] = {}
 
     if not envs.VLLM_CONFIGURE_LOGGING and envs.VLLM_LOGGING_CONFIG_PATH:
@@ -88,7 +101,7 @@ def _configure_vllm_root_logger() -> None:
         )
 
     if envs.VLLM_CONFIGURE_LOGGING:
-        logging_config = DEFAULT_LOGGIN_CONFIG
+        logging_config = deepcopy(DEFAULT_LOGGIN_CONFIG)
 
         vllm_handler = logging_config["handlers"]["vllm_rbln"]
         # Refresh these values in case env vars have changed.
@@ -98,6 +111,8 @@ def _configure_vllm_root_logger() -> None:
 
         vllm_loggers = logging_config["loggers"]["vllm_rbln"]
         vllm_loggers["level"] = envs.VLLM_LOGGING_LEVEL
+        for formatter in logging_config["formatters"].values():
+            formatter["log_level"] = envs.VLLM_LOGGING_LEVEL
 
     if envs.VLLM_LOGGING_CONFIG_PATH:
         if not path.exists(envs.VLLM_LOGGING_CONFIG_PATH):
@@ -122,12 +137,52 @@ def _configure_vllm_root_logger() -> None:
 
     if logging_config:
         dictConfig(logging_config)
+        _console_handler = (
+            logging.getLogger("vllm_rbln").handlers[0]
+            if not envs.VLLM_LOGGING_CONFIG_PATH
+            else None
+        )
 
 
-# The root logger is initialized when the module is imported.
-# This is thread-safe as the module is only imported once,
-# guaranteed by the Python GIL.
+def _sync_logging_config(config: "LoggingConfig | None") -> None:
+    global _console_handler
+    enabled = config.configure_logging if config else envs.VLLM_CONFIGURE_LOGGING
+    config_file = (
+        config.pylogging_config_file if config else envs.VLLM_LOGGING_CONFIG_PATH
+    )
+    if not enabled or config_file:
+        return
+
+    level = config.log_level if config else envs.VLLM_LOGGING_LEVEL
+    root = logging.getLogger("vllm_rbln")
+    root.setLevel(level)
+    handler = _console_handler
+    if handler is None or handler not in root.handlers:
+        # Bootstrap can be disabled even when the parsed config enables logging.
+        upstream_handler = logging.getLogger("vllm").handlers[0]
+        assert isinstance(upstream_handler, logging.StreamHandler)
+        handler = logging.StreamHandler(upstream_handler.stream)
+        for installed in tuple(root.handlers):
+            if installed not in _file_handlers:
+                root.removeHandler(installed)
+                installed.close()
+
+    # dictConfig clears name registrations even for handlers it leaves attached.
+    handler.name = "vllm_rbln"
+    handler.setLevel(level)
+    formatter_cls = ColoredFormatter if _use_color() else NewLineFormatter
+    handler.setFormatter(formatter_cls(_FORMAT, datefmt=_DATE_FORMAT, log_level=level))
+    root.addHandler(handler)
+    root.propagate = False
+    _console_handler = handler
+    for file_handler in tuple(_file_handlers):
+        file_handler.setFormatter(NewLineFormatter(_FORMAT, log_level=level))
+
+
+# Platform discovery can run while this module is importing vLLM.
+# Synchronize only after the RBLN logging functions and handlers are initialized.
 _configure_vllm_root_logger()
+_sync_logging_config(vllm_logger._last_configured_logging_config)
 
 # Transformers uses httpx to access the Hugging Face Hub. httpx is quite verbose,
 # so we set its logging level to WARNING when vLLM's logging level is INFO.

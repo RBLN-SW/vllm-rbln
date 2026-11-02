@@ -20,17 +20,28 @@ from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.layers.attention.kv_transfer_utils import (
     maybe_transfer_kv_layer,
 )
-from vllm.model_executor.models.utils import extract_layer_index
+from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionMetadata, AttentionType
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheSpec,
+    SlidingWindowSpec,
+)
 
 from vllm_rbln.patches import register_patch
+from vllm_rbln.patches.registry import MIN_PATCH_PRIORITY
 from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionBackend,
     RBLNFlashAttentionMetadata,
 )
 from vllm_rbln.v1.attention.kv_cache_bindings import materialize_kv_cache_view
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
+from vllm_rbln.v1.worker.utils import (
+    num_attn_module as rbln_num_attn_module,
+)
+from vllm_rbln.v1.worker.utils import (
+    pipeline_adjusted_layer_index,
+)
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention import MLAAttention
@@ -40,22 +51,19 @@ attention_original_forward = Attention.forward
 
 
 def _record_pipeline_layer_index(self: "Attention | MLAAttention") -> None:
-    """Record a pipeline-adjusted layer index on an attention layer.
-
-    RBLN resolves each layer's KV cache from attention metadata (a graph
-    input) by index; that index must be relative to the layers that live on
-    this pipeline-parallel rank, so subtract the rank's starting layer.
-    """
-    self.layer_index = extract_layer_index(self.layer_name)
-
-    # NOTE(RBLN): Consider PP
     vllm_config = get_current_vllm_config()
     model_config = vllm_config.model_config
-    if model_config is not None:
-        start, _ = model_config.get_layers_start_end_indices(
-            vllm_config.parallel_config
-        )
-        self.layer_index -= start
+    num_attn_module = (
+        rbln_num_attn_module(model_config, vllm_config.cache_config.cache_dtype)
+        if model_config is not None
+        else 1
+    )
+    self.layer_index = pipeline_adjusted_layer_index(
+        self.layer_name,
+        model_config,
+        vllm_config.parallel_config,
+        num_attn_module,
+    )
 
 
 # NOTE(RBLN) - To represent kv cache as model input,
@@ -90,13 +98,12 @@ def _resolve_kv_cache(
         "but upstream get_attention_context reads the attention layer's "
         "embedded kv_cache, which Dynamo bakes into the graph as a get_attr "
         "constant. Return kv_cache=None so callers (notably the "
-        "maybe_transfer_kv_layer wrapper) never touch it. Applied immediately "
-        "at import: maybe_transfer_kv_layer binds get_attention_context into "
-        "its closure when the patched_unified_attention_with_output wrap "
-        "below is constructed, so this override must already be in place by "
-        "then."
+        "maybe_transfer_kv_layer wrapper) never touch it. Applied first: "
+        "maybe_transfer_kv_layer binds get_attention_context into its closure "
+        "when the unified_attention_with_output wrap below is built, so this "
+        "override has to be in place by then."
     ),
-    apply_immediately=True,
+    priority=MIN_PATCH_PRIORITY,
 )
 def patched_get_attention_context(
     layer_name: str,
@@ -143,21 +150,7 @@ def patched_get_attention_context(
     return attn_metadata, attn_layer, None, layer_slot_mapping
 
 
-@register_patch(
-    target=(
-        "vllm.model_executor.layers.attention.attention.unified_attention_with_output"
-    ),
-    reason=(
-        "RBLN resolves the KV cache from attention metadata (a graph input) "
-        "instead of the layer's embedded cache, and wraps the replacement in "
-        "maybe_transfer_kv_layer for KV-transfer connector support. The wrap "
-        "is constructed here at import time and snapshots "
-        "get_attention_context into its closure, which is why the "
-        "get_attention_context patch above uses apply_immediately=True."
-    ),
-)
-@maybe_transfer_kv_layer
-def patched_unified_attention_with_output(
+def _unified_attention_with_output(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -198,6 +191,23 @@ def patched_unified_attention_with_output(
 
 
 @register_patch(
+    target=(
+        "vllm.model_executor.layers.attention.attention.unified_attention_with_output"
+    ),
+    reason=(
+        "RBLN resolves the KV cache from attention metadata (a graph input) "
+        "instead of the layer's embedded cache, and wraps the replacement in "
+        "maybe_transfer_kv_layer for KV-transfer connector support. That wrap "
+        "snapshots get_attention_context, so it is built here rather than at "
+        "import, after the patch above has replaced it."
+    ),
+    build=True,
+)
+def _build_unified_attention_with_output():
+    return maybe_transfer_kv_layer(_unified_attention_with_output)
+
+
+@register_patch(
     target="vllm.model_executor.layers.attention.Attention.forward",
     reason="To preserve RBLN-specific attention output shape.",
 )
@@ -235,8 +245,10 @@ def patched_attention_init(self: Attention, *args, **kwargs) -> None:
         "vllm.model_executor.layers.attention.attention.Attention.get_kv_cache_spec"
     ),
     reason=(
-        "RBLN needs Attention KV-cache specs to use RBLN sliding-window "
-        "metadata while preserving upstream full-attention spec fields."
+        "A sliding-window layer needs the RBLN spec for the kernel that "
+        "shifts the window in place: one block per request, no reclaim, no "
+        "prefix sharing. REBEL CR13 carries sliding_window_attention_v1, "
+        "which appends into several blocks and takes upstream's spec."
     ),
 )
 def patched_get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
@@ -249,7 +261,10 @@ def patched_get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
             raise NotImplementedError(
                 "MLA is not supported with sliding window attention."
             )
-        return RBLNSlidingWindowSpec(
+        spec_cls = (
+            SlidingWindowSpec if current_platform.is_cr13() else RBLNSlidingWindowSpec
+        )
+        return spec_cls(
             block_size=block_size,
             num_kv_heads=self.num_kv_heads,
             head_size=self.head_size,

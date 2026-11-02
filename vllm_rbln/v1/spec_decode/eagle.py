@@ -17,6 +17,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
+from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.model_executor.models.deepseek_eagle3 import Eagle3DeepseekV2ForCausalLM
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
@@ -29,9 +30,10 @@ from vllm_rbln.compilation import (
     build_process_group_dict,
     compile,
 )
+from vllm_rbln.config import RBLNConfig
 from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.logger import init_logger
-from vllm_rbln.platform import USE_DEVICE_TENSOR
+from vllm_rbln.platform import use_device_tensor
 from vllm_rbln.v1.attention.kv_cache_bindings import (
     attach_kv_cache_bindings,
     build_kv_cache_forward_context_kwargs,
@@ -39,6 +41,10 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
 from vllm_rbln.v1.spec_decode.utils import (
     eagle_prepare_inputs_padded,
     eagle_prepare_next_token_padded,
+)
+from vllm_rbln.v1.worker.dp_utils import (
+    BatchDescriptor,
+    determine_draft_batch_execution_and_padding,
 )
 from vllm_rbln.v1.worker.input_stager import InputLayout, InputStager
 
@@ -55,10 +61,14 @@ class RBLNEagleProposer(EagleProposer):
         device: torch.device,
         runner: "RBLNModelRunner",
     ):
-        super().__init__(vllm_config, device, runner)
+        # The parent's ctor gets "cpu", so its bookkeeping -- input_ids,
+        # positions, hidden_states, backup ids -- lives on the host: torch-rbln
+        # runs int/bool eager ops through a CPU fallback. Whatever reads
+        # `self.device` afterwards (attention metadata builders, input stager)
+        # still gets the NPU, where the draft model itself keeps running.
+        super().__init__(vllm_config, torch.device("cpu"), runner)
+        self.device = device
 
-        if self.supports_mm_inputs:
-            raise NotImplementedError
         if self.needs_extra_input_slots:
             raise NotImplementedError(
                 "vllm-rbln does not support EAGLE extra input slots required for "
@@ -71,11 +81,12 @@ class RBLNEagleProposer(EagleProposer):
             )
 
         self.runner = runner
-        self.arange_cpu = torch.arange(self.arange.shape[0], dtype=torch.int32)
         self.input_stager = InputStager(device)
         # Populated from the draft model in `load_model`. None means the draft
         # head shares the target vocabulary, so `propose()` maps no ids.
         self.draft_id_to_target_id: torch.Tensor | None = None
+        # Whether a draft forward joins the DP all-gather; see `load_model`.
+        self.draft_has_moe = False
 
     def propose(
         self,
@@ -93,15 +104,21 @@ class RBLNEagleProposer(EagleProposer):
         assert target_hidden_states.shape[-1] == self.hidden_size
 
         num_tokens = target_token_ids.shape[0]
+        if token_indices_to_sample is None:
+            token_indices_to_sample = common_attn_metadata.query_start_loc[1:] - 1
 
         assert self.runner is not None
         is_prefill = self.runner.is_prefill
 
         # Build attention metadata
         num_reqs = self.runner.input_batch.num_reqs
-        num_reqs_padded, num_padded_tokens, num_tokens_across_dp = (
-            self._determine_draft_batch_padding(num_reqs, num_tokens, is_prefill)
+        batch_desc, num_tokens_across_dp = self._determine_batch_execution_and_padding(
+            num_reqs,
+            num_tokens,
+            is_prefill,
         )
+        num_reqs_padded = batch_desc.num_reqs_padded
+        num_padded_tokens = batch_desc.num_tokens_padded
         per_layer_attn_metadata: dict[str, object] = {}
         for attn_group in self.draft_attn_groups:
             attn_metadata = attn_group.get_metadata_builder().build(
@@ -109,6 +126,8 @@ class RBLNEagleProposer(EagleProposer):
                 positions=target_positions,
                 is_prefill=is_prefill,
                 batch_pad=num_reqs_padded,
+                back_pad=self.runner.decode_back_pad,
+                is_prompt_sorted=self.runner.sort_batch_by_length,
             )
             attach_kv_cache_bindings(
                 attn_metadata,
@@ -130,7 +149,6 @@ class RBLNEagleProposer(EagleProposer):
                 token_indices_to_sample=token_indices_to_sample,
                 target_token_ids=target_token_ids,
                 next_token_ids=next_token_ids,
-                cad=common_attn_metadata,
             )
         )
         inputs_embeds = None
@@ -156,10 +174,17 @@ class RBLNEagleProposer(EagleProposer):
             draft_tokens_ids = self._to_target_token_ids(draft_ids[:num_reqs])
             return draft_tokens_ids.view(-1, 1)
 
-        assert token_indices_to_sample_padded is not None
-        positions = target_positions[
-            token_indices_to_sample_padded.to(target_positions.device)
-        ]
+        # Early exit if it's an intermediate chunked prefill,
+        # since the draft tokens are discarded anyway.
+        # Under DP with MoE drafters, we still need to run the full
+        # drafter steps for possible decoding peers.
+        if self.runner.is_intermediate_chunked_prefill and not (
+            self.vllm_config.parallel_config.data_parallel_size > 1
+            and self.draft_has_moe
+        ):
+            return draft_ids.new_zeros((num_reqs, self.num_speculative_tokens))
+
+        positions = target_positions[token_indices_to_sample]
 
         # `hidden_states` is deliberately not gathered here -- #821 moved
         # that gather inside `model_wrapper`. Doing it again would index an
@@ -184,8 +209,8 @@ class RBLNEagleProposer(EagleProposer):
         common_attn_metadata.seq_lens = common_attn_metadata.seq_lens.clone()
         common_attn_metadata.num_actual_tokens = num_reqs
         common_attn_metadata.max_query_len = 1
-        common_attn_metadata.query_start_loc = self.arange_cpu[: num_reqs + 1]
-        common_attn_metadata.query_start_loc_cpu = self.arange_cpu[: num_reqs + 1]
+        common_attn_metadata.query_start_loc = self.arange[: num_reqs + 1]
+        common_attn_metadata.query_start_loc_cpu = self.arange[: num_reqs + 1]
 
         # In padded drafter batch, we need to adjust the sequence lengths
         # to remove the "padding" (i.e. rejected tokens).
@@ -194,11 +219,14 @@ class RBLNEagleProposer(EagleProposer):
         if self.num_speculative_tokens > 1 and num_rejected_tokens is not None:
             common_attn_metadata.seq_lens -= num_rejected_tokens
 
-        num_reqs_padded, num_padded_tokens, num_tokens_across_dp = (
-            self._determine_draft_batch_padding(
-                num_reqs, num_reqs, False, first_pass=False
-            )
+        batch_desc, num_tokens_across_dp = self._determine_batch_execution_and_padding(
+            num_reqs,
+            num_reqs,
+            False,
+            first_pass=False,
         )
+        num_reqs_padded = batch_desc.num_reqs_padded
+        num_padded_tokens = batch_desc.num_tokens_padded
         for token_index in range(self.num_speculative_tokens - 1):
             self.input_ids[:num_reqs] = draft_token_ids_list[-1].int()
             positions = positions.view(-1) + 1
@@ -214,6 +242,7 @@ class RBLNEagleProposer(EagleProposer):
                     positions=positions,
                     is_prefill=False,
                     batch_pad=num_reqs_padded,
+                    is_prompt_sorted=self.runner.sort_batch_by_length,
                 )
                 attach_kv_cache_bindings(
                     attn_metadata,
@@ -270,6 +299,8 @@ class RBLNEagleProposer(EagleProposer):
         Equivalent to upstream's scatter-then-argmax for a monotonic mapping:
         both pick the same winner, and on an exact tie both pick the lowest id.
         """
+        # A graph output: the one D2H of a draft pass, the rest stays on the host.
+        draft_token_ids = draft_token_ids.cpu()
         d2t = self.draft_id_to_target_id
         if d2t is None:
             return draft_token_ids.long().clone()
@@ -294,16 +325,17 @@ class RBLNEagleProposer(EagleProposer):
             dtype=np.int32,
         )
         self.backup_next_token_ids.copy_to_gpu(num_reqs)
-        backup_tokens_gpu = self.backup_next_token_ids.gpu
+        backup_tokens = self.backup_next_token_ids.gpu
 
         assert discard_request_mask.dtype == torch.bool
-        assert backup_tokens_gpu.dtype == torch.int32
+        assert backup_tokens.dtype == torch.int32
 
         batch_size = sampled_token_ids.shape[0]
+        sampled_token_ids = sampled_token_ids.to(backup_tokens.device)
         return eagle_prepare_next_token_padded(
             sampled_token_ids,
             discard_request_mask[:batch_size],
-            backup_tokens_gpu[:batch_size],
+            backup_tokens[:batch_size],
             gpu_input_batch.vocab_size,
         )
 
@@ -353,8 +385,21 @@ class RBLNEagleProposer(EagleProposer):
 
     def load_model(self, target_model: nn.Module) -> None:
         super().load_model(target_model)
+        if self.supports_mm_inputs:
+            raise NotImplementedError(
+                "vllm-rbln does not pass multimodal embeddings to the drafter yet."
+            )
 
         self.draft_id_to_target_id = getattr(self.model, "draft_id_to_target_id", None)
+        if self.draft_id_to_target_id is not None:
+            self.draft_id_to_target_id = self.draft_id_to_target_id.cpu()
+
+        # Fused MoE is the only reader of the step's padded token dimension, so a
+        # draft without it runs no collective of its own -- which is what lets an
+        # idle rank skip drafting entirely rather than draft a discarded result.
+        self.draft_has_moe = any(
+            isinstance(module, MoERunner) for module in self.model.modules()
+        )
 
         def model_wrapper(
             input_ids: torch.Tensor,
@@ -405,10 +450,8 @@ class RBLNEagleProposer(EagleProposer):
             # the logits too.
             return hidden_states, torch.ops.rbln.argmax(logits)
 
-        if (
-            self.vllm_config.speculative_config.enforce_eager
-            or not envs.VLLM_RBLN_COMPILE_MODEL
-        ):
+        rbln_config: RBLNConfig = self.vllm_config.additional_config
+        if self.vllm_config.speculative_config.enforce_eager:
             self.model_executable = model_wrapper
         else:
             self.model_executable = compile(
@@ -416,13 +459,15 @@ class RBLNEagleProposer(EagleProposer):
                 dynamic=False,
                 fullgraph=True,
                 compile_context=self.runner.compile_context,
-                num_devices=envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
-                model_trace_method="export" if USE_DEVICE_TENSOR else "",
+                num_devices=1,
+                model_trace_method="export" if use_device_tensor() else "",
                 process_group_dict=build_process_group_dict(),
                 guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
                 runtime_holder=self.runner.runtime_holder,
                 mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
                 use_static_output=True,
+                use_direct_dispatch=True,
+                dtype=rbln_config.compile_dtype,
             )
 
     def _build_dummy_attn_metadata(
@@ -448,9 +493,9 @@ class RBLNEagleProposer(EagleProposer):
             num_actual_tokens=num_tokens,
             max_query_len=num_tokens_per_req,
             max_seq_len=seq_lens.max().item(),
-            block_table_tensor=self.runner.input_batch.block_table[0].get_cpu_tensor()[
-                :num_reqs
-            ],
+            block_table_tensor=self.runner.input_batch.block_table[
+                self.kv_cache_gid
+            ].get_cpu_tensor()[:num_reqs],
             slot_mapping=torch.tensor(0),  # dummy
             causal=True,
         )
@@ -464,6 +509,17 @@ class RBLNEagleProposer(EagleProposer):
         *,
         num_padded_tokens: int | None = None,
     ) -> None:
+        status = self.runner.dp_status
+        if (
+            status is not None
+            and status.is_idle[self.dp_rank]
+            and not self.draft_has_moe
+        ):
+            # This rank has no work, so what a draft pass produces here is
+            # discarded, and without fused MoE no busy rank is waiting inside a
+            # collective for it.
+            return
+
         num_tokens = num_tokens_per_req * num_reqs
         assert num_tokens <= self.max_num_tokens
         override_padded = num_padded_tokens
@@ -471,10 +527,14 @@ class RBLNEagleProposer(EagleProposer):
         common_attn_metadata = self._build_dummy_attn_metadata(
             num_reqs, num_tokens_per_req
         )
-        num_reqs_padded, dp_padded, num_tokens_across_dp = (
-            self._determine_draft_batch_padding(num_reqs, num_tokens, is_prefill)
+        batch_desc, num_tokens_across_dp = self._determine_batch_execution_and_padding(
+            num_reqs,
+            num_tokens,
+            is_prefill,
+            pinned_num_tokens_padded=override_padded,
         )
-        num_padded_tokens = override_padded or dp_padded
+        num_reqs_padded = batch_desc.num_reqs_padded
+        num_padded_tokens = batch_desc.num_tokens_padded
 
         per_layer_attn_metadata: dict[str, object] = {}
         for attn_group in self.draft_attn_groups:
@@ -483,6 +543,7 @@ class RBLNEagleProposer(EagleProposer):
                 positions=self.positions[:num_tokens],
                 is_prefill=is_prefill,
                 batch_pad=num_reqs_padded,
+                is_prompt_sorted=self.runner.sort_batch_by_length,
             )
             attach_kv_cache_bindings(
                 attn_metadata,
@@ -494,8 +555,7 @@ class RBLNEagleProposer(EagleProposer):
                 per_layer_attn_metadata[layer_name] = attn_metadata
 
         token_indices_to_sample = (
-            torch.arange(num_reqs, device=self.device, dtype=torch.int32)
-            * num_tokens_per_req
+            torch.arange(num_reqs, dtype=torch.int32) * num_tokens_per_req
         )
         input_ids, positions, hidden_states, token_indices_to_sample_padded = (
             self._preprocess(
@@ -531,16 +591,19 @@ class RBLNEagleProposer(EagleProposer):
 
         common_attn_metadata.num_actual_tokens = num_reqs
         common_attn_metadata.max_query_len = 1
-        common_attn_metadata.query_start_loc = self.arange_cpu[: num_reqs + 1]
-        common_attn_metadata.query_start_loc_cpu = self.arange_cpu[: num_reqs + 1]
+        common_attn_metadata.query_start_loc = self.arange[: num_reqs + 1]
+        common_attn_metadata.query_start_loc_cpu = self.arange[: num_reqs + 1]
         common_attn_metadata.seq_lens += 1
 
-        num_reqs_padded, dp_padded, num_tokens_across_dp = (
-            self._determine_draft_batch_padding(
-                num_reqs, num_reqs, False, first_pass=False
-            )
+        batch_desc, num_tokens_across_dp = self._determine_batch_execution_and_padding(
+            num_reqs,
+            num_reqs,
+            False,
+            first_pass=False,
+            pinned_num_tokens_padded=override_padded,
         )
-        num_padded_tokens = override_padded or dp_padded
+        num_reqs_padded = batch_desc.num_reqs_padded
+        num_padded_tokens = batch_desc.num_tokens_padded
         per_layer_attn_metadata.clear()
         for attn_group in self.draft_attn_groups:
             attn_metadata = attn_group.get_metadata_builder().build(
@@ -548,6 +611,7 @@ class RBLNEagleProposer(EagleProposer):
                 positions=self.positions[:num_reqs],
                 is_prefill=False,
                 batch_pad=num_reqs_padded,
+                is_prompt_sorted=self.runner.sort_batch_by_length,
             )
             attach_kv_cache_bindings(
                 attn_metadata,
@@ -584,6 +648,40 @@ class RBLNEagleProposer(EagleProposer):
                     token_indices_to_sample=None,
                 )
 
+    def _determine_batch_execution_and_padding(
+        self,
+        num_reqs: int,
+        num_tokens: int,
+        is_prefill: bool,
+        *,
+        first_pass: bool = True,
+        pinned_num_tokens_padded: int | None = None,
+    ) -> tuple[BatchDescriptor, torch.Tensor | None]:
+        """This pass's padded batch (see v1/worker/dp_utils.py).
+
+        Under DP the draft decides from the status the step published, so a step
+        that has not published one is a caller in the wrong place rather than a
+        rank on its own; on a single rank there is no group to read.
+        """
+        if self.vllm_config.parallel_config.data_parallel_size == 1:
+            status = None
+        else:
+            status = self.runner.dp_status
+            assert status is not None, (
+                "the step published no status for the draft to decide from"
+            )
+        return determine_draft_batch_execution_and_padding(
+            cfg=self.runner.shape_config,
+            status=status,
+            dp_rank=self.dp_rank,
+            num_reqs=num_reqs,
+            num_tokens=num_tokens,
+            is_prefill=is_prefill,
+            draft_has_moe=self.draft_has_moe,
+            first_pass=first_pass,
+            pinned_num_tokens_padded=pinned_num_tokens_padded,
+        )
+
     def _preprocess(
         self,
         num_reqs: int,
@@ -596,16 +694,11 @@ class RBLNEagleProposer(EagleProposer):
         token_indices_to_sample: torch.Tensor | None = None,
         target_token_ids: torch.Tensor | None = None,
         next_token_ids: torch.Tensor | None = None,
-        cad: CommonAttentionMetadata | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         if target_token_ids is not None:
             assert next_token_ids is not None
+            assert token_indices_to_sample is not None
             assert num_input_tokens == target_token_ids.shape[0]
-
-            if token_indices_to_sample is None:
-                assert cad is not None
-                token_indices_to_sample = cad.query_start_loc[1:] - 1
-            token_indices_to_sample = token_indices_to_sample.to(self.device)
 
             self.input_ids[: num_input_tokens - 1] = target_token_ids[1:]
             self.input_ids[token_indices_to_sample] = next_token_ids
@@ -637,62 +730,3 @@ class RBLNEagleProposer(EagleProposer):
             staged.hidden_states,
             staged.token_indices,
         )
-
-    def _determine_draft_batch_padding(
-        self,
-        num_reqs: int,
-        num_tokens: int,
-        is_prefill: bool,
-        *,
-        first_pass: bool = True,
-    ) -> tuple[int, int | None, torch.Tensor | None]:
-        num_reqs_padded = (
-            self.runner.bucketing_manager.find_decode_batch_bucket(num_reqs)
-            if not is_prefill
-            else num_reqs
-        )
-        dp_size = self.vllm_config.parallel_config.data_parallel_size
-        if dp_size == 1:
-            return num_reqs_padded, None, None
-
-        num_tokens_across_dp, num_reqs_across_dp, any_prefill = self._reuse_dp_status(
-            num_reqs, num_tokens, first_pass
-        )
-
-        num_tokens_padded = self.max_num_tokens
-        if self.runner.specialized_moe_decode and not is_prefill:
-            if any_prefill:
-                num_reqs_padded = self.runner.bucketing_manager.decode_batch_buckets[-1]
-            else:
-                num_reqs_padded = (
-                    self.runner.bucketing_manager.find_decode_batch_bucket(
-                        int(num_reqs_across_dp.max())
-                    )
-                )
-                max_tokens_per_req = int(
-                    (num_tokens_across_dp // num_reqs_across_dp).max()
-                )
-                num_tokens_padded = num_reqs_padded * max_tokens_per_req
-        return num_reqs_padded, num_tokens_padded, num_tokens_across_dp
-
-    def _reuse_dp_status(
-        self,
-        num_reqs: int,
-        num_tokens: int,
-        first_pass: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor, bool]:
-        dp_status = self.runner.dp_status
-        assert dp_status is not None, (
-            "dp_status is not saved from _determine_batch_padding"
-        )
-        num_tokens_across_dp, num_reqs_across_dp, any_prefill = dp_status
-        local_reqs = int(num_reqs_across_dp[self.dp_rank])
-        assert local_reqs == num_reqs
-
-        if first_pass:
-            local_tokens = int(num_tokens_across_dp[self.dp_rank])
-            assert local_tokens == num_tokens
-            return num_tokens_across_dp, num_reqs_across_dp, any_prefill
-
-        assert num_tokens == num_reqs
-        return num_reqs_across_dp.clone(), num_reqs_across_dp, False

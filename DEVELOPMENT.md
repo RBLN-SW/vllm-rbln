@@ -2,7 +2,7 @@
 
 Requirements:
 - Linux x86_64 with access to the internal network (Nexus)
-- Python **3.12** for this dev workflow (`rebel-compiler` nightly wheels are currently cp312-only; the package itself targets 3.10-3.13)
+- Python **3.12** for this dev workflow (every CI lane syncs on 3.12; the package itself targets 3.10-3.14)
 - uv **>= 0.11.25** (`uv self update`) — enforced via `required-version` in `pyproject.toml`. Older uv writes `uv.lock` in a different serialization (repeats the `tool.uv.environments` marker on every dependency), so re-locking with it produces a ~900-line noise diff.
 
 The Nexus index requires your **LDAP account** credentials (set once, e.g. in your shell profile):
@@ -20,7 +20,9 @@ Then install the locked, team-identical environment with a single command:
 uv sync --extra runtime
 ```
 
-> `rebel-compiler` is separated into the `runtime` extra — it is required for NPU execution but excluded from the base dependency set. `--extra runtime` installs it alongside the rest of the locked environment.
+> `rebel-compiler` is separated into the `runtime` extra — it is required for NPU execution but excluded from the base dependency set. `--extra runtime` installs it alongside the rest of the locked environment. `nixl-rbln` and `lmcache-rbln` live in the `kv_connectors` extra; add `--extra kv_connectors` when working on the NIXL or LMCache KV connectors.
+
+> `qwen_vl_utils` is in the `examples` extra, not the base set — nothing under `vllm_rbln/` imports it. Add `--extra examples` to run the optimum multimodal examples.
 
 ## pyproject.toml vs uv.lock — what to edit when
 

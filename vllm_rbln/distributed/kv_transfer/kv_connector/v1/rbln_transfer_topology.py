@@ -1,0 +1,169 @@
+# Copyright 2026 Rebellions Inc. All rights reserved.
+
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at:
+
+#     http://www.apache.org/licenses/LICENSE-2.0
+
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+"""RBLN's variant of upstream's NIXL transfer topology.
+
+It lives beside the connector rather than inside it so that the patch module
+that substitutes it upstream can import it without pulling the whole connector
+package in at plugin load.
+"""
+
+import torch
+from vllm.distributed.kv_transfer.kv_connector.utils import (
+    EngineId,
+    EngineTransferInfo,
+    TransferTopology,
+)
+from vllm.v1.kv_cache_interface import (
+    KVCacheSpec,
+    MambaSpec,
+    MLAAttentionSpec,
+    SlidingWindowMLASpec,
+)
+
+
+def is_latent(layer_spec: KVCacheSpec) -> bool:
+    """Whether a layer's cache is one key-only latent rather than K and V."""
+    return isinstance(layer_spec, (MLAAttentionSpec, SlidingWindowMLASpec))
+
+
+class RblnTransferTopology(TransferTopology):
+    """Upstream's topology, taught RBLN's two attention KV layouts.
+
+    The rbln_triton_ops cache keeps K and V as separate spans, so each becomes
+    its own NIXL region -- the layout upstream standardized away in 0.26. The
+    rbln_custom_ops cache puts them inside one block, so that one registers as
+    a single region and the descriptor path names the two halves itself.
+    MLA and Mamba caches are upstream's own shapes and stay on its path -- and
+    so does a latent beside attention layers (an MSA indexer), whose shape is
+    its own backend's rather than the attention backend's.
+
+    ``__post_init__`` reimplements upstream's rather than extending it, since
+    upstream's asserts a blocks-first 4-dim shape RBLN never produces. So a
+    field upstream sets there has to be set here too, and leaving one out
+    fails nowhere until the first handshake reads it -- and one it does not set
+    fails the test holding the two in step.
+    """
+
+    def __post_init__(self) -> None:
+        self.local_physical_heads = max(1, self.total_num_kv_heads // self.tp_size)
+        self._engines: dict[tuple[EngineId, int], EngineTransferInfo] = {}
+        self._cross_layers_blocks = False
+        # Set before the shape probe below, which Mamba returns ahead of: its
+        # cache is upstream's own, and the connector refuses one anyway.
+        self._kv_head_dim: int | None = None
+        self._kv_token_dim = 0
+        if self.is_mamba:
+            # Upstream skips the shape for the same reason: a Mamba cache is a
+            # (conv, ssm) pair, and the connector hands it no tensor shape.
+            return
+        backend = self.attn_backends[0]
+        # Extents no other can collide with, so the shape itself says which
+        # axis carries each. Upstream's get_kv_cache_block_dim reads the block
+        # axis the same way, but only off an AttentionBackend subclass. The
+        # probe asks for one head under MLA: a latent frame has no head axis
+        # for a distinctive count to land on.
+        mock_blocks, mock_tokens = 1234567, 7907
+        mock_heads = 1 if self.is_mla else 7919
+        shape = backend.get_kv_cache_shape(
+            num_blocks=mock_blocks,
+            block_size=mock_tokens,
+            num_kv_heads=mock_heads,
+            head_size=1,
+        )
+        block_dim = shape.index(mock_blocks)
+        if self.is_mla:
+            assert block_dim == 0, (
+                "RBLN NIXL descriptors assume a (num_blocks, ...) MLA cache, "
+                f"got {shape} from {backend.__name__}."
+            )
+        else:
+            assert block_dim in (0, 1), (
+                "RBLN NIXL descriptors assume the attention cache carries "
+                f"num_blocks on one of its first two axes, got {shape} from "
+                f"{backend.__name__}."
+            )
+        # Read here rather than where the regions are cut: the shape comes from
+        # the RBLN config, which is only guaranteed to be set while the model
+        # is being built, and `get_transfer_cache_regions` runs later.
+        self._kv_shares_a_block = block_dim == 0
+        self._cross_layers_blocks = (
+            self.tensor_shape is not None and len(self.tensor_shape) == len(shape) + 1
+        )
+        self._kv_token_dim = shape.index(mock_tokens)
+        if not self.is_mla:
+            self._kv_head_dim = shape.index(mock_heads)
+
+    # vllm 0.30.0 dropped these three from TransferTopology along with the
+    # cross-layer-block path they served. The RBLN registration path still
+    # turns on all three, so the subclass that computes
+    # `_cross_layers_blocks` owns them now.
+
+    @property
+    def cross_layers_blocks(self) -> bool:
+        return self._cross_layers_blocks
+
+    @property
+    def kv_head_dim(self) -> int | None:
+        """The dim of one layer's KV entry that carries its heads; None for an
+        MLA latent."""
+        return self._kv_head_dim
+
+    @property
+    def kv_token_dim(self) -> int:
+        """The dim of one layer's KV entry that carries a block's tokens."""
+        return self._kv_token_dim
+
+    @property
+    def virtually_split_kv_in_blocks(self) -> bool:
+        """Whether a block splits into two separately indexable sub-regions.
+
+        K and V share an attention block, which transfers as one unit; only
+        Mamba needs its conv and ssm states indexed apart. A cross-layer block
+        interleaves per layer, so a half-split would not separate them.
+        """
+        return self.is_mamba and not self._cross_layers_blocks
+
+    def _shared_cache_regions(
+        self, cache: torch.Tensor, layer_spec: KVCacheSpec
+    ) -> list[torch.Tensor]:
+        """What upstream's own `get_transfer_cache_regions` returned."""
+        if isinstance(layer_spec, MambaSpec):
+            conv, _ssm = cache
+            return [conv]
+        if self.is_mamba and cache.shape[0] == 2:
+            # With Mamba present every backend is blocks-first so blocks can be
+            # shared with the attention layers, so this swaps [2 <-> num_blocks]
+            # to match `_update_hybrid_attention_mamba_layout`.
+            cache = cache.transpose(0, 1)
+        return [cache]
+
+    def get_transfer_cache_regions(
+        self, cache: torch.Tensor, layer_spec: KVCacheSpec
+    ) -> list[torch.Tensor] | torch.Tensor:
+        if (
+            self.is_mla
+            or self.is_mamba
+            or self._cross_layers_blocks
+            or is_latent(layer_spec)
+        ):
+            return self._shared_cache_regions(cache, layer_spec)
+        if self._kv_shares_a_block:
+            # Nothing to iterate: the block is the unit, and the descriptor
+            # path cuts K and V out of it (`pair_area`).
+            return [cache]
+        # Iterating the tensor yields K and V; the caller divides the page size
+        # by how many come back.
+        return cache

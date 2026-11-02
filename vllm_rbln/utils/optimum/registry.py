@@ -24,16 +24,22 @@ _RBLN_GENERATION_MODELS: dict[str, tuple[str, str]] = {
     ),
     "GemmaForCausalLM": ("gemma", "RBLNGemmaForCausalLM"),
     "Gemma2ForCausalLM": ("gemma2", "RBLNGemma2ForCausalLM"),
+    "Glm4ForCausalLM": ("glm4", "RBLNGlm4ForCausalLM"),
     "PhiForCausalLM": ("phi", "RBLNPhiForCausalLM"),
+    "Phi3ForCausalLM": ("phi3", "RBLNPhi3ForCausalLM"),
     "GPT2LMHeadModel": ("gpt2", "RBLNGPT2LMHeadModel"),
+    "GraniteForCausalLM": ("granite", "RBLNGraniteForCausalLM"),
     "MidmLMHeadModel": ("midm", "RBLNMidmLMHeadModel"),
     "MistralForCausalLM": ("mistral", "RBLNMistralForCausalLM"),
     "ExaoneForCausalLM": ("exaone", "RBLNExaoneForCausalLM"),
     "Qwen2ForCausalLM": ("qwen2", "RBLNQwen2ForCausalLM"),
     "OPTForCausalLM": ("opt", "RBLNOPTForCausalLM"),
+    "Olmo2ForCausalLM": ("olmo2", "RBLNOlmo2ForCausalLM"),
     "Qwen3ForCausalLM": ("qwen3", "RBLNQwen3ForCausalLM"),
     "Qwen3MoeForCausalLM": ("qwen3_moe", "RBLNQwen3MoeForCausalLM"),
+    "SmolLM3ForCausalLM": ("smollm3", "RBLNSmolLM3ForCausalLM"),
     "GptOssForCausalLM": ("gpt-oss", "RBLNGptOssForCausalLM"),
+    "Starcoder2ForCausalLM": ("starcoder2", "RBLNStarcoder2ForCausalLM"),
     # Qwen3-Reranker is served by score() but reads its score off two vocabulary
     # logits, so it runs the generation graph -- as upstream vLLM does, resolving
     # it to Qwen3ForCausalLM. Classing it as pooling would compile
@@ -72,6 +78,10 @@ _RBLN_MULTIMODAL_MODELS = {
     "Qwen3_5ForConditionalGeneration": (
         "qwen3_5",
         "RBLNQwen3_5ForConditionalGeneration",
+    ),
+    "Qwen3ASRForConditionalGeneration": (
+        "qwen3_asr",
+        "RBLNQwen3ASRForConditionalGeneration",
     ),
     "Exaone4_5_ForConditionalGeneration": (
         "exaone4_5",
@@ -130,16 +140,16 @@ def is_enc_dec_arch(config: PretrainedConfig) -> bool:
 
 
 def is_arch_supported(
-    config: PretrainedConfig, model_set: dict[str, tuple[str, str]]
+    config: PretrainedConfig, model_set: dict[str, tuple[str, str]] | None = None
 ) -> bool:
-    architectures = getattr(config, "architectures", [])
-    return any(
-        arch in _RBLN_SUPPORTED_MODELS and arch in model_set for arch in architectures
-    )
+    architectures = getattr(config, "architectures", None) or []
+    if model_set is None:
+        model_set = _RBLN_SUPPORTED_MODELS
+    return any(arch in model_set for arch in architectures)
 
 
 def get_rbln_model_info(config: PretrainedConfig) -> tuple[str, str]:
-    architectures = getattr(config, "architectures", [])
+    architectures = getattr(config, "architectures", None) or []
 
     for arch in architectures:
         if arch in _RBLN_SUPPORTED_MODELS:

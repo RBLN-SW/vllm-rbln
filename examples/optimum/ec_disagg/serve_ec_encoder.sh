@@ -41,7 +41,7 @@ launch_encoder() {
     local port=$((BASE_PORT + idx))
 
     echo "Starting encoder $idx (device=$device, port=$port, push→$LLM_HOST:$LLM_PULL_PORT)"
-    RBLN_DEVICES=$device vllm serve "$MODEL_ID" \
+    RBLN_VISIBLE_DEVICES=$device vllm serve "$MODEL_ID" \
         --port "$port" \
         --mm-processor-kwargs '{"max_pixels": 802816}' \
         --ec-transfer-config "{

@@ -226,7 +226,9 @@ class MemoryPoolManager:
         self._pooled_tensor = torch.zeros(max_model_len // ob_size, dtype=self.dtype)
 
     def get_tensor_for_blocks(self, block_ids: list[int]) -> torch.Tensor:
-        self._pooled_tensor.fill_(-1)
+        # Pad unused slots with block 0, not a -1 sentinel, as mask_block_table
+        # does: the attention kernel reads every slot of a live partition.
+        self._pooled_tensor.fill_(0)
 
         if block_ids:
             value = torch.tensor(block_ids, dtype=self.dtype)

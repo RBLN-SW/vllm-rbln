@@ -1,0 +1,424 @@
+# Copyright 2026 Rebellions Inc. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at:
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# _update_states on a real runner: the block table, the CPU token buffers and the
+# pipeline-parallel branches, none of which a bare stub can reach.
+
+from collections.abc import Iterable
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+import torch
+from vllm.v1.sample.logits_processor import AdapterLogitsProcessor
+
+import vllm_rbln.v1.worker.rbln_model_runner as mr
+from tests.vllm.v1.worker.utils import (
+    block_table_matches_state,
+    is_in_batch,
+    make_scheduler_output,
+    schedule_cached,
+    schedule_new,
+)
+
+pytestmark = pytest.mark.maybe_use_device
+
+
+def _last_rank(monkeypatch, is_last: bool = True) -> None:
+    monkeypatch.setattr(
+        mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=is_last)
+    )
+
+
+class TestBlockTableMaintenance:
+    def test_appends_new_blocks_to_running_request(
+        self, make_model_runner, monkeypatch
+    ):
+        # A growing running request gets its new blocks appended, and the block
+        # table row must still agree with the cached state.
+        _last_rank(monkeypatch)
+        runner = make_model_runner()
+        runner._update_states(schedule_new("a", block_ids=[([0],)]))
+        # block_ids keeps the per-KV-cache-group tuple shape it arrived with.
+        assert runner.requests["a"].block_ids == ([0],)
+
+        runner._update_states(
+            schedule_cached(
+                req_ids=["a"],
+                num_computed_tokens=[3],
+                new_block_ids=[([1, 2],)],
+            )
+        )
+
+        assert runner.requests["a"].block_ids == ([0, 1, 2],)
+        assert block_table_matches_state(runner, "a")
+
+    def test_resumed_from_preemption_replaces_block_table(
+        self, make_model_runner, monkeypatch
+    ):
+        # Resuming re-allocates, so block ids are replaced; appending would leave
+        # freed blocks in the table and read another request's KV.
+        _last_rank(monkeypatch)
+        runner = make_model_runner()
+        runner._update_states(schedule_new("a", block_ids=[([0, 1],)]))
+        assert runner.requests["a"].block_ids == ([0, 1],)
+
+        # Drop it from the batch first: the resumed path asserts it is not
+        # currently batched.
+        runner._update_states(make_scheduler_output(num_scheduled_tokens={}))
+        assert not is_in_batch(runner, "a")
+
+        runner._update_states(
+            schedule_cached(
+                req_ids=["a"],
+                num_computed_tokens=[3],
+                new_block_ids=[([7, 8, 9],)],
+                resumed_req_ids={"a"},
+            )
+        )
+
+        assert runner.requests["a"].block_ids == ([7, 8, 9],)
+        assert is_in_batch(runner, "a")
+        assert block_table_matches_state(runner, "a")
+
+    def test_condenses_batch_after_a_gap(self, make_model_runner, monkeypatch):
+        # Finishing a middle request leaves a hole; rows must be compacted since
+        # the forward pass indexes 0..num_reqs-1.
+        _last_rank(monkeypatch)
+        runner = make_model_runner()
+        runner._update_states(schedule_new("a", "b", "c"))
+        assert runner.input_batch.req_id_to_index == {"a": 0, "b": 1, "c": 2}
+
+        runner._update_states(
+            make_scheduler_output(
+                num_scheduled_tokens={"a": 1, "c": 1}, finished_req_ids={"b"}
+            )
+        )
+
+        assert "b" not in runner.requests
+        assert set(runner.input_batch.req_id_to_index) == {"a", "c"}
+        assert sorted(runner.input_batch.req_id_to_index.values()) == [0, 1]
+        for req_id in ("a", "c"):
+            assert block_table_matches_state(runner, req_id)
+
+
+class TestPromptRowReAdd:
+    def test_re_add_fills_the_row_from_the_first_prompt_array(
+        self, make_model_runner, monkeypatch
+    ):
+        # A decode evicted by a prefill-only step is re-added from the int32 array
+        # made on its first add, and a logits processor still keeps the prompt list.
+        _last_rank(monkeypatch)
+        runner = make_model_runner()
+        runner._update_states(schedule_new("a"))
+        prompt = runner.requests["a"].prompt_token_ids
+        array = runner.prompt_token_arrays["a"]
+        assert isinstance(array, np.ndarray) and array.dtype == np.int32
+        runner._update_states(make_scheduler_output(num_scheduled_tokens={}))
+        assert not is_in_batch(runner, "a")
+
+        handed_in: list[object] = []
+        add_request = runner.input_batch.add_request
+
+        def record_handed_in(request):
+            handed_in.append(request.prompt_token_ids)
+            return add_request(request)
+
+        class KeepsPrompt(AdapterLogitsProcessor):
+            # A per-request processor that takes the prompt, the way a user's does.
+            # The adapter holds that prompt for as long as the request runs.
+            def is_argmax_invariant(self):
+                return False
+
+            def new_req_logits_processor(self, params):
+                return lambda prompt_ids, output_ids, logits: logits
+
+        logitsproc = KeepsPrompt(runner.vllm_config, torch.device("cpu"), False)
+        runner.input_batch.logitsprocs.non_argmax_invariant.append(logitsproc)
+        monkeypatch.setattr(runner.input_batch, "add_request", record_handed_in)
+        runner._update_states(schedule_cached(req_ids=["a"], num_computed_tokens=[3]))
+
+        assert runner.prompt_token_arrays["a"] is array
+        assert len(handed_in) == 1 and handed_in[0] is array
+        assert runner.requests["a"].prompt_token_ids is prompt
+        req_index = runner.input_batch.req_id_to_index["a"]
+        assert logitsproc.req_info[req_index].args[0] is prompt
+        assert (
+            runner.input_batch.token_ids_cpu[req_index, : len(prompt)].tolist()
+            == prompt
+        )
+
+    def test_finished_request_drops_its_prompt_array(
+        self, make_model_runner, monkeypatch
+    ):
+        _last_rank(monkeypatch)
+        runner = make_model_runner()
+        runner._update_states(schedule_new("a"))
+        runner._update_states(make_scheduler_output(finished_req_ids={"a"}))
+        assert "a" not in runner.prompt_token_arrays
+
+    def test_re_add_leaves_the_array_nowhere_in_the_batch(
+        self, make_model_runner, monkeypatch
+    ):
+        # The array is only lent to add_request. If upstream starts keeping the
+        # prompt it is handed, the array would stay behind without any error.
+        _last_rank(monkeypatch)
+        runner = make_model_runner()
+        runner._update_states(schedule_new("a"))
+        array = runner.prompt_token_arrays["a"]
+        runner._update_states(make_scheduler_output(num_scheduled_tokens={}))
+        runner._update_states(schedule_cached(req_ids=["a"], num_computed_tokens=[3]))
+
+        seen: set[int] = set()
+        pending: list[tuple[object, int]] = [(runner.input_batch, 0)]
+        while pending:
+            obj, depth = pending.pop()
+            assert obj is not array
+            if (
+                depth == 3
+                or id(obj) in seen
+                or isinstance(obj, (np.ndarray, torch.Tensor))
+            ):
+                continue
+            seen.add(id(obj))
+            children: Iterable[object]
+            if isinstance(obj, dict):
+                children = obj.values()
+            elif isinstance(obj, (list, tuple, set)):
+                children = obj
+            else:
+                children = getattr(obj, "__dict__", {}).values()
+            pending.extend((child, depth + 1) for child in children)
+
+    def test_streaming_update_refills_the_row_from_the_grown_prompt(
+        self, make_model_runner, monkeypatch
+    ):
+        # Under the uni executor the scheduler extends this same list in place for
+        # a streaming update, so the list identity does not change.
+        _last_rank(monkeypatch)
+        runner = make_model_runner()
+        prompt = [1, 2, 3]
+        runner._update_states(schedule_new("a", prompt_token_ids=[prompt]))
+        prompt.extend([4, 5])
+        runner._update_states(schedule_new("a", prompt_token_ids=[prompt]))
+
+        req_index = runner.input_batch.req_id_to_index["a"]
+        assert runner.input_batch.num_prompt_tokens[req_index] == len(prompt)
+        assert (
+            runner.input_batch.token_ids_cpu[req_index, : len(prompt)].tolist()
+            == prompt
+        )
+
+
+class TestWritebackBeforeReAdd:
+    def test_evicted_decode_comes_back_with_its_sampled_token(
+        self, make_model_runner, monkeypatch
+    ):
+        # Async scheduling leaves a -1 for the token still being sampled. If a
+        # prefill-only step evicts the request first, only the writeback repairs
+        # its cached state, as all_token_ids no longer arrives; the re-add then
+        # rebuilds the row from that state.
+        _last_rank(monkeypatch)
+        runner = make_model_runner()
+        runner._update_states(schedule_new("a"))
+        state = runner.requests["a"]
+        n = state.num_prompt_tokens
+        state.output_token_ids.append(-1)
+        runner._pending_token_writeback.append((["a"], [[42]], {"a": n}))
+        runner._update_states(make_scheduler_output(num_scheduled_tokens={}))
+        assert not is_in_batch(runner, "a")
+
+        runner._apply_pending_token_writeback()
+        runner._update_states(
+            schedule_cached(
+                req_ids=["a"], num_computed_tokens=[n], num_output_tokens=[1]
+            )
+        )
+
+        req_index = runner.input_batch.req_id_to_index["a"]
+        assert runner.input_batch.token_ids_cpu[req_index, n] == 42
+
+
+class TestEncoderCache:
+    def test_only_scheduler_released_images_are_evicted(
+        self, make_model_runner, monkeypatch
+    ):
+        _last_rank(monkeypatch)
+        runner = make_model_runner()
+        retained = torch.ones(2, 4)
+        runner.encoder_cache.update(released=torch.zeros(2, 4), retained=retained)
+        step = make_scheduler_output()
+        step.free_encoder_mm_hashes = ["released"]
+
+        runner._update_states(step)
+
+        assert list(runner.encoder_cache) == ["retained"]
+        assert runner.encoder_cache["retained"] is retained
+
+
+class TestOutputTokenAlignment:
+    def test_discarded_output_tokens_are_truncated(
+        self, make_model_runner, monkeypatch
+    ):
+        # A sync-KV-load failure reports fewer output tokens than the runner
+        # cached; the extras must go or the next step samples an unwritten slot.
+        _last_rank(monkeypatch)
+        runner = make_model_runner()
+        runner._update_states(schedule_new("a"))
+
+        state = runner.requests["a"]
+        req_index = runner.input_batch.req_id_to_index["a"]
+        state.output_token_ids.extend([101, 102])
+        runner.input_batch.num_tokens_no_spec[req_index] = (
+            runner.input_batch.num_prompt_tokens[req_index] + 2
+        )
+
+        runner._update_states(
+            schedule_cached(
+                req_ids=["a"], num_computed_tokens=[3], num_output_tokens=[1]
+            )
+        )
+
+        assert state.output_token_ids == [101]
+        assert (
+            runner.input_batch.num_tokens_no_spec[req_index]
+            == runner.input_batch.num_prompt_tokens[req_index] + 1
+        )
+
+
+class TestPipelineParallel:
+    def test_non_last_rank_folds_in_scheduler_supplied_tokens(
+        self, make_model_runner, monkeypatch
+    ):
+        # A non-last rank never samples, so the scheduler ships the sampled token
+        # back; it must land in both the request state and the CPU buffer.
+        _last_rank(monkeypatch, is_last=False)
+        runner = make_model_runner()
+        runner._update_states(schedule_new("a"))
+        req_index = runner.input_batch.req_id_to_index["a"]
+
+        runner._update_states(
+            schedule_cached(
+                req_ids=["a"],
+                num_computed_tokens=[3],
+                new_token_ids=[[101]],
+                num_output_tokens=[1],
+            )
+        )
+
+        assert runner.requests["a"].output_token_ids == [101]
+        assert runner.input_batch.token_ids_cpu[req_index, 3] == 101
+        assert runner.input_batch.num_tokens_no_spec[req_index] == 4
+
+    def test_last_rank_keeps_its_own_cached_tokens(
+        self, make_model_runner, monkeypatch
+    ):
+        # The last rank samples itself and gets no token ids back, so it must
+        # leave its buffer alone; the non-last path would rewind the cursor.
+        _last_rank(monkeypatch, is_last=True)
+        runner = make_model_runner()
+        runner._update_states(schedule_new("a"))
+
+        req_index = runner.input_batch.req_id_to_index["a"]
+        runner.input_batch.token_ids_cpu[req_index, 3] = 101
+        runner.input_batch.is_token_ids[req_index, 3] = True
+        runner.input_batch.num_tokens_no_spec[req_index] = 4
+        runner.requests["a"].output_token_ids.append(101)
+
+        runner._update_states(
+            schedule_cached(
+                req_ids=["a"],
+                num_computed_tokens=[3],
+                new_token_ids=[[]],  # what the scheduler sends the last rank
+                num_output_tokens=[1],
+            )
+        )
+
+        assert runner.input_batch.num_tokens_no_spec[req_index] == 4
+        assert runner.input_batch.token_ids_cpu[req_index, 3] == 101
+        assert runner.requests["a"].output_token_ids == [101]
+
+
+class TestSampleTokensWithoutPendingState:
+    def test_surfaces_stashed_kv_connector_output(self, make_model_runner):
+        # With no pending state sample_tokens must still forward the stashed
+        # KV-connector output, else finished send/recv notices are lost.
+        runner = make_model_runner()
+        runner.execute_model_state = None
+        sentinel = object()
+        runner.kv_connector_output = sentinel
+
+        output = runner.sample_tokens(grammar_output=None)
+
+        assert output.kv_connector_output is sentinel
+        # Consumed, so a second call does not re-report it.
+        assert runner.kv_connector_output is None
+        assert runner.sample_tokens(grammar_output=None).kv_connector_output is None
+
+
+class TestSampleTokensOnDrafterOverflow:
+    def test_zeroes_the_drafts_instead_of_leaving_them_none(
+        self, make_model_runner, monkeypatch
+    ):
+        # A step whose next speculative token would overrun the drafter's context
+        # skips proposal, which leaves _draft_token_ids at the None sample_tokens
+        # resets it to. take_draft_token_ids would then ship
+        # DraftTokenIds(req_ids, None) and the scheduler zips over that None.
+        _last_rank(monkeypatch)
+        runner = make_model_runner(
+            speculative_config={
+                "method": "ngram",
+                "num_speculative_tokens": 3,
+                "prompt_lookup_max": 4,
+            }
+        )
+        scheduler_output = schedule_new("a")
+        runner._update_states(scheduler_output)
+        # 10 + 3 > 12, so this step cannot propose.
+        monkeypatch.setattr(runner, "effective_drafter_max_model_len", 12)
+        runner.execute_model_state = mr.ExecuteModelState(
+            scheduler_output=scheduler_output,
+            logits=torch.zeros((1, 8)),
+            spec_decode_metadata=None,
+            spec_decode_common_attn_metadata=SimpleNamespace(max_seq_len=10),
+            hidden_states=torch.zeros((1, 4)),
+            sample_hidden_states=torch.zeros((1, 4)),
+            combined_hidden_states=None,
+        )
+
+        def unexpected_propose(*args, **kwargs):
+            raise AssertionError("the drafter must not run when the input overflows")
+
+        monkeypatch.setattr(runner, "propose_draft_token_ids", unexpected_propose)
+        monkeypatch.setattr(
+            runner,
+            "_sample",
+            lambda logits, spec_decode_metadata: SimpleNamespace(
+                sampled_token_ids=torch.tensor([[101]], dtype=torch.int32)
+            ),
+        )
+        monkeypatch.setattr(
+            runner,
+            "_bookkeeping_sync",
+            lambda *args: ({}, None, [[101]], {}, ["a"], {"a": 0}, []),
+        )
+
+        runner.sample_tokens(grammar_output=None)
+
+        drafts = runner._draft_token_ids
+        assert isinstance(drafts, torch.Tensor)
+        assert drafts.shape == (1, 3)  # one request, num_speculative_tokens
+        # What the scheduler actually receives. .tolist() is also the only read of
+        # the expanded (non-contiguous) view the runner builds.
+        assert runner.take_draft_token_ids().draft_token_ids == [[0, 0, 0]]

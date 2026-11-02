@@ -170,9 +170,8 @@ def _probe_tcp(host: str, port: int, timeout: float = _LLM_PROBE_TIMEOUT_S) -> b
 
 
 class ECNixlTensorInfo(msgspec.Struct):
-    """Per-tensor metadata sent from encoder to llm."""
+    """Where and how the encoder output of one mm_hash sits in the encoder's memory."""
 
-    key: str
     base_addr: int
     nbytes: int
     device_id: int
@@ -190,10 +189,7 @@ class ECNixlMetadata(msgspec.Struct):
     engine_id: str
     mm_hash: str
     agent_metadata: bytes
-    tensors: list[ECNixlTensorInfo]
-    # Non-tensor values (e.g. second_per_grid_ts) serialised as
-    # {key: value} — llm restores these alongside pulled tensors.
-    non_tensor_data: dict = {}
+    tensor: ECNixlTensorInfo
     # ACK channel the llm should PUSH completion/fail notifications to.
     # Empty host means the producer did not enable ACKs (backward compat).
     ack_host: str = ""
@@ -348,8 +344,8 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
         # -- Encoder state --
         # Insertion order is the LRU order; we never move entries, so a plain
         # dict (Python 3.7+) is sufficient.
-        # mm_hash -> dict[key, aligned CPU tensor]
-        self._registered_caches: dict[str, dict[str, torch.Tensor]] = {}
+        # mm_hash -> aligned CPU copy of the encoder output
+        self._registered_caches: dict[str, torch.Tensor] = {}
         # mm_hash -> NIXL descriptor (for deregistration)
         self._registered_descs: dict[str, Any] = {}
         # mm_hash -> monotonic timestamp of registration (for TTL)
@@ -391,12 +387,10 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
         self._cache_events_lock = threading.Lock()
         # engine_id -> remote NIXL agent name
         self._remote_agents: dict[str, str] = {}
-        # mm_hash -> (engine_id, list[ECNixlTensorInfo])
-        self._tensor_registry: dict[str, tuple[str, list[ECNixlTensorInfo]]] = {}
-        # mm_hash -> non-tensor data dict
-        self._non_tensor_registry: dict[str, dict] = {}
-        # Pending async NIXL transfers: mm_hash -> (handle, local_bufs, local_descs)
-        self._pending_loads: dict[str, tuple[Any, dict[str, torch.Tensor], Any]] = {}
+        # mm_hash -> (engine_id, ECNixlTensorInfo)
+        self._tensor_registry: dict[str, tuple[str, ECNixlTensorInfo]] = {}
+        # Pending async NIXL transfers: mm_hash -> (handle, local_buf, local_descs)
+        self._pending_loads: dict[str, tuple[Any, torch.Tensor, Any]] = {}
         self._encoder_cache: dict[str, Any] | None = None
 
         if self.is_producer:
@@ -533,10 +527,9 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
                     evt.set()
 
             logger.debug(
-                "EC Nixl: received metadata for mm_hash=%s from engine=%s (%d tensors)",
+                "EC Nixl: received metadata for mm_hash=%s from engine=%s",
                 meta.mm_hash,
                 meta.engine_id,
-                len(meta.tensors),
             )
 
     def _process_pending_metadata(self) -> set[str]:
@@ -573,10 +566,7 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
                 meta.agent_metadata
             )
 
-            # Store tensor registry and non-tensor data for this mm_hash
-            self._tensor_registry[mm_hash] = (engine_id, meta.tensors)
-            if meta.non_tensor_data:
-                self._non_tensor_registry[mm_hash] = meta.non_tensor_data
+            self._tensor_registry[mm_hash] = (engine_id, meta.tensor)
             if meta.ack_host and meta.ack_port:
                 addr = (meta.ack_host, meta.ack_port)
                 self._mm_hash_ack_addr[mm_hash] = addr
@@ -908,29 +898,18 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
     def _initiate_pull(
         self,
         mm_hash: str,
-    ) -> tuple[Any, dict[str, torch.Tensor], Any]:
-        """Allocate local buffers and start async NIXL pull."""
-        engine_id, tensor_infos = self._tensor_registry[mm_hash]
+    ) -> tuple[Any, torch.Tensor, Any]:
+        """Allocate the local buffer and start the async NIXL pull."""
+        engine_id, tinfo = self._tensor_registry[mm_hash]
         remote_agent_name = self._remote_agents[engine_id]
 
-        local_bufs: dict[str, torch.Tensor] = {}
-        local_reg_data: list[tuple[int, int, int, str]] = []
-        local_xfer_data: list[tuple[int, int, int]] = []
-        remote_xfer_data: list[tuple[int, int, int]] = []
+        numel = tinfo.nbytes // _dtype_size(tinfo.dtype_str)
+        local_buf = aligned_tensor(numel).reshape(tinfo.shape)
+        local_reg_data = [(local_buf.data_ptr(), tinfo.nbytes, 0, "")]
+        local_xfer_data = [(local_buf.data_ptr(), tinfo.nbytes, 0)]
+        remote_xfer_data = [(tinfo.base_addr, tinfo.nbytes, tinfo.device_id)]
 
-        for tinfo in tensor_infos:
-            numel = tinfo.nbytes // _dtype_size(tinfo.dtype_str)
-            buf = aligned_tensor(numel)
-            if tinfo.shape:
-                buf = buf.reshape(tinfo.shape)
-            local_bufs[tinfo.key] = buf
-            local_reg_data.append((buf.data_ptr(), tinfo.nbytes, 0, ""))
-            local_xfer_data.append((buf.data_ptr(), tinfo.nbytes, 0))
-            remote_xfer_data.append((tinfo.base_addr, tinfo.nbytes, tinfo.device_id))
-
-        num_descs = len(local_xfer_data)
-
-        # Register local destination buffers with NIXL
+        # Register the local destination buffer with NIXL
         local_descs = self._nixl_agent.get_reg_descs(local_reg_data, "DRAM")
         self._nixl_agent.register_memory(local_descs, backends=self._backends)
 
@@ -943,7 +922,7 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
         )
 
         # Initiate async READ (llm pulls from encoder)
-        indices = list(range(num_descs))
+        indices = [0]
         handle = self._nixl_agent.make_prepped_xfer(
             "READ",
             local_prepped,
@@ -958,7 +937,7 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
                 f"EC Nixl: transfer initiation failed for mm_hash={mm_hash}"
             )
 
-        return handle, local_bufs, local_descs
+        return handle, local_buf, local_descs
 
     # ------------------------------------------------------------------
     # ECConnectorBase interface — worker side
@@ -970,7 +949,7 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
         mm_hash: str,
         **kwargs,
     ) -> None:
-        """Encoder: register tensors with NIXL, push metadata to llm."""
+        """Encoder: register the output with NIXL, push metadata to llm."""
         if not self.is_producer:
             return
 
@@ -981,67 +960,27 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
         if mm_hash in self._registered_caches:
             return
 
-        raw: dict[str, torch.Tensor] = encoder_cache[mm_hash]
-        if not isinstance(raw, dict):
-            raw = {"inputs_embeds": raw}
-
-        # Allocate aligned CPU tensors and register with NIXL
-        aligned: dict[str, Any] = {}
-        caches_data: list[tuple[int, int, int, str]] = []
-        tensor_infos: list[ECNixlTensorInfo] = []
-        non_tensor_data: dict = {}
-
-        def _register_tensor(key: str, tensor: torch.Tensor) -> None:
-            t = tensor.detach().cpu()
-            buf = aligned_tensor(t.numel()).reshape(t.shape)
-            buf.copy_(t)
-            aligned[key] = buf
-            nbytes = buf.numel() * buf.element_size()
-            caches_data.append((buf.data_ptr(), nbytes, 0, ""))
-            tensor_infos.append(
-                ECNixlTensorInfo(
-                    key=key,
-                    base_addr=buf.data_ptr(),
-                    nbytes=nbytes,
-                    device_id=0,
-                    shape=list(buf.shape),
-                    dtype_str=str(buf.dtype),
-                )
-            )
-
-        def _collect(key: str, value: Any) -> None:
-            """Recursively register tensors and collect non-tensor data."""
-            if isinstance(value, torch.Tensor):
-                _register_tensor(key, value)
-            elif isinstance(value, (tuple, list)):
-                for i, item in enumerate(value):
-                    _collect(f"{key}.{i}", item)
-                non_tensor_data[f"_seq_meta.{key}"] = {
-                    "length": len(value),
-                    "is_tuple": isinstance(value, tuple),
-                }
-            else:
-                # Primitive value (int, float, str, None, etc.)
-                non_tensor_data[key] = value
-
-        for key, value in raw.items():
-            _collect(key, value)
-
-        if not caches_data:
-            logger.warning(
-                "EC Nixl: no tensors to register for mm_hash=%s "
-                "(all values are non-tensor)",
-                mm_hash,
-            )
-            return
+        t = encoder_cache[mm_hash].detach().cpu()
+        buf = aligned_tensor(t.numel()).reshape(t.shape)
+        buf.copy_(t)
+        nbytes = buf.numel() * buf.element_size()
+        tensor_info = ECNixlTensorInfo(
+            base_addr=buf.data_ptr(),
+            nbytes=nbytes,
+            device_id=0,
+            shape=list(buf.shape),
+            dtype_str=str(buf.dtype),
+        )
 
         # Enforce LRU capacity + TTL before registering a new entry.
         self._admit_producer_entry()
 
-        descs = self._nixl_agent.get_reg_descs(caches_data, "DRAM")
+        descs = self._nixl_agent.get_reg_descs(
+            [(buf.data_ptr(), nbytes, 0, "")], "DRAM"
+        )
         self._nixl_agent.register_memory(descs, backends=self._backends)
 
-        self._registered_caches[mm_hash] = aligned
+        self._registered_caches[mm_hash] = buf
         self._registered_descs[mm_hash] = descs
         self._registered_timestamps[mm_hash] = time.monotonic()
 
@@ -1050,19 +989,14 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
             engine_id=self._engine_id,
             mm_hash=mm_hash,
             agent_metadata=self._nixl_agent.get_agent_metadata(),
-            tensors=tensor_infos,
-            non_tensor_data=non_tensor_data,
+            tensor=tensor_info,
             ack_host=self._ack_host,
             ack_port=self._ack_port,
         )
         encoded = msgspec.msgpack.Encoder().encode(push_meta)
         self._push_sock.send(encoded)
 
-        logger.debug(
-            "EC Nixl: registered + pushed mm_hash=%s (%d tensors)",
-            mm_hash,
-            len(tensor_infos),
-        )
+        logger.debug("EC Nixl: registered + pushed mm_hash=%s", mm_hash)
 
     def start_load_caches(
         self,
@@ -1114,8 +1048,8 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
                 )
                 continue
 
-            handle, local_bufs, local_descs = self._initiate_pull(mm_hash)
-            self._pending_loads[mm_hash] = (handle, local_bufs, local_descs)
+            handle, local_buf, local_descs = self._initiate_pull(mm_hash)
+            self._pending_loads[mm_hash] = (handle, local_buf, local_descs)
             logger.debug("EC Nixl: initiated pull for mm_hash=%s", mm_hash)
 
         if self._pending_loads and blocking:
@@ -1125,13 +1059,12 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
         """Block until all pending NIXL pulls complete."""
         deadline = time.monotonic() + _CACHE_WAIT_TIMEOUT_S
         while self._pending_loads and time.monotonic() < deadline:
-            for mm_hash, (handle, local_bufs, local_descs) in list(
+            for mm_hash, (handle, local_buf, local_descs) in list(
                 self._pending_loads.items()
             ):
                 status = self._nixl_agent.check_xfer_state(handle)
                 if status == "DONE":
-                    non_tensor = self._non_tensor_registry.pop(mm_hash, None)
-                    encoder_cache[mm_hash] = _merge_pull_result(local_bufs, non_tensor)
+                    encoder_cache[mm_hash] = local_buf
                     self._release_pull(handle, local_descs)
                     del self._pending_loads[mm_hash]
                     self._send_ack_if_unsent(mm_hash, "ok")
@@ -1139,7 +1072,6 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
                 elif status not in ("DONE", "PROC"):
                     logger.error("EC Nixl: transfer failed for mm_hash=%s", mm_hash)
                     self._release_pull(handle, local_descs)
-                    self._non_tensor_registry.pop(mm_hash, None)
                     del self._pending_loads[mm_hash]
                     self._send_ack_if_unsent(mm_hash, "fail")
             if self._pending_loads:
@@ -1152,7 +1084,6 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
             )
             for mm_hash, (handle, _, local_descs) in list(self._pending_loads.items()):
                 self._release_pull(handle, local_descs)
-                self._non_tensor_registry.pop(mm_hash, None)
                 del self._pending_loads[mm_hash]
                 self._send_ack_if_unsent(mm_hash, "fail")
 
@@ -1168,16 +1099,12 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
         self._process_pending_metadata()
 
         completed: set[str] = set()
-        for mm_hash, (handle, local_bufs, local_descs) in list(
+        for mm_hash, (handle, local_buf, local_descs) in list(
             self._pending_loads.items()
         ):
             status = self._nixl_agent.check_xfer_state(handle)
             if status == "DONE":
-                result = dict(local_bufs)
-                non_tensor = self._non_tensor_registry.pop(mm_hash, None)
-                if non_tensor:
-                    result.update(non_tensor)
-                self._encoder_cache[mm_hash] = result
+                self._encoder_cache[mm_hash] = local_buf
                 self._release_pull(handle, local_descs)
                 del self._pending_loads[mm_hash]
                 completed.add(mm_hash)
@@ -1186,7 +1113,6 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
             elif status not in ("DONE", "PROC"):
                 logger.error("EC Nixl: transfer failed for mm_hash=%s", mm_hash)
                 self._release_pull(handle, local_descs)
-                self._non_tensor_registry.pop(mm_hash, None)
                 del self._pending_loads[mm_hash]
                 self._send_ack_if_unsent(mm_hash, "fail")
 
@@ -1214,7 +1140,6 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
                 with self._cache_events_lock:
                     self._cache_events.pop(mm_hash, None)
                 self._tensor_registry.pop(mm_hash, None)
-                self._non_tensor_registry.pop(mm_hash, None)
                 self._mm_hash_ack_addr.pop(mm_hash, None)
                 self._ack_sent.discard(mm_hash)
                 self._deferred_loads.discard(mm_hash)
@@ -1339,48 +1264,3 @@ def _dtype_size(dtype_str: str) -> int:
     if size is None:
         raise ValueError(f"Unsupported dtype: {dtype_str}")
     return size
-
-
-def _merge_pull_result(
-    local_bufs: dict[str, torch.Tensor],
-    non_tensor: dict | None,
-) -> dict[str, Any]:
-    """Merge NIXL-pulled tensors with non-tensor metadata.
-
-    Reconstructs tuple/list values that were flattened during
-    save_caches (e.g. "image_embeds.0", "image_embeds.1" → tuple).
-    """
-    if non_tensor is None:
-        return dict(local_bufs)
-
-    # Pool all values (tensors + non-tensors) into a flat lookup
-    pool: dict[str, Any] = dict(local_bufs)
-    seq_metas: dict[str, dict] = {}
-    for k, v in non_tensor.items():
-        if k.startswith("_seq_meta."):
-            seq_metas[k[len("_seq_meta.") :]] = v
-        else:
-            pool[k] = v
-
-    def _reconstruct(key: str) -> Any:
-        """Recursively reconstruct a value from the flat pool."""
-        if key in seq_metas:
-            meta = seq_metas[key]
-            items = [_reconstruct(f"{key}.{i}") for i in range(meta["length"])]
-            return tuple(items) if meta.get("is_tuple", False) else items
-        return pool.pop(key, None)
-
-    # Reconstruct all sequences first (deepest-first via recursion)
-    result: dict[str, Any] = {}
-    for key in sorted(seq_metas, key=lambda k: k.count("."), reverse=True):
-        if key.count(".") == 0:
-            # Top-level sequence
-            result[key] = _reconstruct(key)
-
-    # Add remaining flat values (tensors and primitives)
-    for k, v in pool.items():
-        # Skip sub-keys already consumed by reconstruction
-        if "." not in k:
-            result[k] = v
-
-    return result

@@ -13,8 +13,9 @@
 # limitations under the License.
 """torch.compiler mega-cache bundle helpers for the rbln model runner.
 
-Persists/restores `torch.compiler.{save,load}_cache_artifacts()` bundles as a
-per-(model, config-signature, rank) file under VLLM_CACHE_ROOT.
+Persists/restores the rbln mega-cache bundle (torch.compiler cache-artifact
+layout, written and read by rebel.core.mega_cache) as a per-(model,
+config-signature, rank) file under VLLM_CACHE_ROOT.
 """
 
 import contextlib
@@ -23,10 +24,10 @@ import hashlib
 import os
 import re
 
-import torch
 import vllm.envs as envs
 
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.worker.utils import dynamic_kv_enabled
 
 logger = init_logger(__name__)
 
@@ -96,6 +97,7 @@ def _warmup_graph_set_factors(vllm_config) -> str:
         "gpu_memory_utilization": normalize_value(
             getattr(cache, "gpu_memory_utilization", None)
         ),
+        "dynamic_kv_enabled": normalize_value(dynamic_kv_enabled(vllm_config)),
         "num_speculative_tokens": normalize_value(
             getattr(spec, "num_speculative_tokens", None)
         ),
@@ -189,7 +191,7 @@ def load(model: str, sig: str) -> None:
         return
     try:
         with open(path, "rb") as src:
-            info = torch.compiler.load_cache_artifacts(src.read())
+            info = rbln_mega_cache.read_bundle(src)
         if info is None:
             logger.warning(
                 "Ignored an unreadable rbln mega-cache bundle at %s; recompiling",
@@ -211,23 +213,22 @@ def save(model: str, sig: str) -> None:
     path = bundle_path(model, sig)
     tmp_path = f"{path}.{os.getpid()}.tmp"
     try:
-        rbln_mega_cache.flush_to_bundle()
-        result = torch.compiler.save_cache_artifacts()
-        if result is None:
-            return
-        artifact_bytes, _ = result
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(tmp_path, "wb") as dst:
-            dst.write(artifact_bytes)
-            # Delayed allocation defers ENOSPC to flush, so a bundle could be
-            # renamed into place truncated without this.
-            dst.flush()
-            os.fsync(dst.fileno())
+            written = rbln_mega_cache.write_bundle(dst)
+            if written:
+                # Delayed allocation defers ENOSPC to flush, so a bundle could
+                # be renamed into place truncated without this.
+                dst.flush()
+                os.fsync(dst.fileno())
+        if not written:
+            os.remove(tmp_path)
+            return
         os.replace(tmp_path, path)
         logger.info(
             "Saved rbln mega-cache bundle to %s (%.1f MiB)",
             path,
-            len(artifact_bytes) / (1 << 20),
+            os.path.getsize(path) / (1 << 20),
         )
     except Exception as exc:  # pylint: disable=broad-exception-caught
         with contextlib.suppress(OSError):

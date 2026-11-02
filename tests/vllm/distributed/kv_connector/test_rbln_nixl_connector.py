@@ -1,0 +1,436 @@
+# Copyright 2026 Rebellions Inc. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at:
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The connectors' construction guards, role -> scheduler/worker wiring, finalize
+# delegation, that handshake metadata reaches the scheduler that serves it, and the
+# read the pull connector holds until a submission is in flight, with the base
+# __init__ and sub-connectors patched out.
+
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
+
+import vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.connector as cm
+import vllm_rbln.envs as envs
+from tests.vllm.distributed.kv_connector.utils import setattr_in_package
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.connector import (
+    RblnNixlPullConnector,
+    RblnNixlPushConnector,
+)
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import (
+    flush_deferred_loads,
+)
+
+
+def _vllm_config(*, kv_buffer_device="cpu", engine_id="engine-0", has_transfer=True):
+    transfer = (
+        SimpleNamespace(engine_id=engine_id, kv_buffer_device=kv_buffer_device)
+        if has_transfer
+        else None
+    )
+    return SimpleNamespace(kv_transfer_config=transfer)
+
+
+@pytest.fixture
+def isolated_connector(monkeypatch):
+    """Construct RblnNixlPullConnector with the upstream base __init__ neutralized
+    and the sub-connectors faked, so only the guards + wiring execute. Returns a
+    builder(vllm_config, role, use_device_tensor=True)."""
+    monkeypatch.setattr(cm.KVConnectorBase_V1, "__init__", lambda self, *a, **k: None)
+    setattr_in_package(
+        monkeypatch,
+        RblnNixlPullConnectorScheduler=lambda *a, **k: "SCHEDULER",
+        RblnNixlPullConnectorWorker=lambda *a, **k: "WORKER",
+    )
+
+    def build(vllm_config, role=KVConnectorRole.SCHEDULER, use_device_tensor=True):
+        monkeypatch.setattr(envs, "VLLM_RBLN_USE_DEVICE_TENSOR", use_device_tensor)
+        connector = object.__new__(RblnNixlPullConnector)
+        RblnNixlPullConnector.__init__(connector, vllm_config, role, {"kv_cache": 1})
+        return connector
+
+    return build
+
+
+class TestConstructionGuards:
+    def test_requires_kv_transfer_config(self, isolated_connector):
+        with pytest.raises(AssertionError):
+            isolated_connector(_vllm_config(has_transfer=False))
+
+    def test_requires_engine_id(self, isolated_connector):
+        with pytest.raises(AssertionError):
+            isolated_connector(_vllm_config(engine_id=None))
+
+    def test_rejects_unknown_kv_buffer_device(self, isolated_connector):
+        with pytest.raises(AssertionError, match="kv_buffer_device"):
+            isolated_connector(_vllm_config(kv_buffer_device="gpu"))
+
+    @pytest.mark.parametrize("kv_buffer_device", ["cpu", "rbln"])
+    def test_accepts_supported_kv_buffer_devices(
+        self, isolated_connector, kv_buffer_device
+    ):
+        # Both host-bounce ("cpu") and D2D ("rbln") pass the guard and construct
+        # all the way through to the role wiring.
+        connector = isolated_connector(_vllm_config(kv_buffer_device=kv_buffer_device))
+        assert connector.connector_scheduler == "SCHEDULER"
+
+    def test_requires_device_tensor(self, isolated_connector):
+        with pytest.raises(AssertionError, match="VLLM_RBLN_USE_DEVICE_TENSOR"):
+            isolated_connector(_vllm_config(), use_device_tensor=False)
+
+
+class TestRoleWiring:
+    def test_scheduler_role_builds_scheduler_only(self, isolated_connector):
+        connector = isolated_connector(_vllm_config(), role=KVConnectorRole.SCHEDULER)
+        assert connector.connector_scheduler == "SCHEDULER"
+        assert connector.connector_worker is None
+
+    def test_worker_role_builds_worker_only(self, isolated_connector):
+        connector = isolated_connector(_vllm_config(), role=KVConnectorRole.WORKER)
+        assert connector.connector_worker == "WORKER"
+        assert connector.connector_scheduler is None
+
+
+class TestFinalizeDelegation:
+    def test_delegates_to_worker_when_present(self):
+        calls = []
+        connector = object.__new__(RblnNixlPullConnector)
+        connector.connector_worker = SimpleNamespace(
+            finalize_kv_cache_registration=lambda: calls.append(1)
+        )
+        connector.finalize_kv_cache_registration()
+        assert calls == [1]
+
+    def test_noop_on_scheduler_role(self):
+        # Scheduler role has no worker; finalize must be a safe no-op.
+        connector = object.__new__(RblnNixlPullConnector)
+        connector.connector_worker = None
+        connector.finalize_kv_cache_registration()  # must not raise
+
+
+class TestSetXferHandshakeMetadataPpAware:
+    # This connector no longer overrides the pp-aware setter, and that deletion
+    # is the fix: the override it replaced called a method 0.26 removed from
+    # NixlConnector, so the call fell through to KVConnectorBase_V1's no-op, the
+    # side channel served nothing and every consumer handshake timed out.
+
+    def test_the_flattening_override_stays_deleted(self):
+        c = object.__new__(RblnNixlPullConnector)
+        c.connector_scheduler = MagicMock()
+        metadata = {(0, 0): "a", (0, 1): "b", (1, 0): "c", (1, 1): "d"}
+
+        c.set_xfer_handshake_metadata_pp_aware(metadata)
+
+        c.connector_scheduler.set_xfer_handshake_metadata.assert_called_once_with(
+            metadata
+        )
+
+
+class TestConnectorWiring:
+    @pytest.fixture
+    def push_connector(self, monkeypatch):
+        monkeypatch.setattr(
+            cm.KVConnectorBase_V1, "__init__", lambda self, *a, **k: None
+        )
+        setattr_in_package(
+            monkeypatch,
+            RblnNixlPushConnectorScheduler=lambda *a, **k: "SCHEDULER",
+            RblnNixlPushConnectorWorker=lambda *a, **k: "WORKER",
+        )
+        monkeypatch.setattr(envs, "VLLM_RBLN_USE_DEVICE_TENSOR", True)
+
+        def build(role, kv_buffer_device="rbln"):
+            vllm_config = SimpleNamespace(
+                kv_transfer_config=SimpleNamespace(
+                    engine_id="engine-0", kv_buffer_device=kv_buffer_device
+                )
+            )
+            connector = object.__new__(RblnNixlPushConnector)
+            RblnNixlPushConnector.__init__(
+                connector, vllm_config, role, {"kv_cache": 1}
+            )
+            return connector
+
+        return build
+
+    def test_worker_role_builds_the_push_worker(self, push_connector):
+        connector = push_connector(KVConnectorRole.WORKER)
+        assert connector.connector_worker == "WORKER"
+        assert connector.connector_scheduler is None
+
+    def test_scheduler_role_builds_the_push_scheduler(self, push_connector):
+        connector = push_connector(KVConnectorRole.SCHEDULER)
+        assert connector.connector_scheduler == "SCHEDULER"
+        assert connector.connector_worker is None
+
+    def test_shares_the_construction_guards(self, push_connector):
+        # The guards live on the shared connector base; one of them is enough to
+        # pin that this direction goes through it.
+        with pytest.raises(AssertionError, match="kv_buffer_device"):
+            push_connector(KVConnectorRole.WORKER, kv_buffer_device="gpu")
+
+
+class TestDeferredLoad:
+    """Holding a read until a model submission is in flight to run it behind."""
+
+    @pytest.fixture
+    def worker_connector(self, isolated_connector, monkeypatch):
+        def build():
+            connector = isolated_connector(_vllm_config(), role=KVConnectorRole.WORKER)
+            connector.connector_worker = SimpleNamespace(
+                started=[],
+                start_load_kv=lambda meta: connector.connector_worker.started.append(
+                    meta
+                ),
+            )
+            return connector
+
+        return build
+
+    @staticmethod
+    def _ctx(attn_metadata):
+        return SimpleNamespace(attn_metadata=attn_metadata)
+
+    def test_the_read_is_held(self, worker_connector):
+        connector = worker_connector()
+        connector._connector_metadata = "META"
+
+        connector.start_load_kv(self._ctx({"layer.0": "ATTN"}))
+
+        assert connector.connector_worker.started == []
+
+    def test_upstream_is_never_reached_at_this_point(
+        self, worker_connector, monkeypatch
+    ):
+        # Upstream issues here; this override replaces that rather than adding to
+        # it. Patching the upstream method so a rename or a re-route on that side
+        # fails here (monkeypatch raises by default).
+        connector = worker_connector()
+        connector._connector_metadata = "META"
+        delegated = []
+        monkeypatch.setattr(
+            cm.NixlPullConnector,
+            "start_load_kv",
+            lambda self, forward_context, **kw: delegated.append(forward_context),
+        )
+
+        connector.start_load_kv(self._ctx({"layer.0": "ATTN"}))
+
+        assert delegated == []
+
+    def test_holding_a_second_read_is_refused(self, worker_connector):
+        # The entry flush is what keeps this unreachable, so the assert is the
+        # only thing that would notice if that ordering were ever changed.
+        connector = worker_connector()
+        connector._connector_metadata = "META"
+        connector.start_load_kv(self._ctx(None))
+
+        with pytest.raises(AssertionError):
+            connector.start_load_kv(self._ctx(None))
+
+    def test_flush_issues_the_held_read_once(self, worker_connector):
+        connector = worker_connector()
+        connector._connector_metadata = "META"
+        connector.start_load_kv(self._ctx(None))
+
+        connector.flush_deferred_load()
+
+        assert connector.connector_worker.started == ["META"]
+
+    def test_flush_again_issues_nothing(self, worker_connector):
+        # A second flush in the same round -- the dummy step and the next
+        # execute_model both call it -- must not read every block twice.
+        connector = worker_connector()
+        connector._connector_metadata = "META"
+        connector.start_load_kv(self._ctx(None))
+        connector.flush_deferred_load()
+
+        connector.flush_deferred_load()
+
+        assert connector.connector_worker.started == ["META"]
+
+    def test_flush_with_nothing_held_issues_nothing(self, worker_connector):
+        connector = worker_connector()
+
+        connector.flush_deferred_load()
+
+        assert connector.connector_worker.started == []
+
+    def test_the_helper_reaches_this_connector(self, worker_connector):
+        # The runner flushes through the helper, which skips anything without the
+        # protocol -- so going through it is what proves this connector is reached.
+        connector = worker_connector()
+        connector._connector_metadata = "META"
+        connector.start_load_kv(self._ctx({"layer.0": "ATTN"}))
+
+        flush_deferred_loads(connector)
+
+        assert connector.connector_worker.started == ["META"]
+
+
+class TestEarlyWriteWiring:
+    """Where the write path hooks into the step: after the host copy, and
+    ahead of the forward that reuses the blocks."""
+
+    @pytest.fixture
+    def push_worker_connector(self, monkeypatch):
+        monkeypatch.setattr(
+            cm.KVConnectorBase_V1, "__init__", lambda self, *a, **k: None
+        )
+        monkeypatch.setattr(envs, "VLLM_RBLN_USE_DEVICE_TENSOR", True)
+        # The real class, with only its construction skipped: the connector
+        # narrows on the type before delegating.
+        monkeypatch.setattr(
+            cm.RblnNixlPushConnectorWorker, "__init__", lambda self, *a, **k: None
+        )
+
+        def build():
+            vllm_config = SimpleNamespace(
+                kv_transfer_config=SimpleNamespace(
+                    engine_id="engine-0", kv_buffer_device="rbln"
+                )
+            )
+            connector = object.__new__(RblnNixlPushConnector)
+            RblnNixlPushConnector.__init__(
+                connector, vllm_config, KVConnectorRole.WORKER, {"kv_cache": 1}
+            )
+            worker = connector.connector_worker
+            worker.start_early_push = MagicMock()
+            worker.flush_early_sends = MagicMock()
+            worker.release_early_offers = MagicMock()
+            worker.start_load_kv = MagicMock()
+            # __init__ was skipped, so the state __del__ reaches is absent.
+            worker.shutdown = lambda: None
+            return connector
+
+        return build
+
+    def test_a_second_hold_without_a_flush_stops(self, push_worker_connector):
+        # The pull side has the same guard; this pins that the write side did
+        # not skip it, which is what the suite would otherwise not notice.
+        connector = push_worker_connector()
+        connector._connector_metadata = "META"
+        connector.start_load_kv(SimpleNamespace(attn_metadata=None))
+
+        with pytest.raises(AssertionError):
+            connector.start_load_kv(SimpleNamespace(attn_metadata=None))
+
+    def test_the_host_copy_runs_before_the_write_is_offered(
+        self, monkeypatch, push_worker_connector
+    ):
+        # Upstream does the staging copy in wait_for_save; a write offered
+        # first would read a buffer still being filled.
+        order = []
+        monkeypatch.setattr(
+            cm.NixlPushConnector, "wait_for_save", lambda self: order.append("copy")
+        )
+        connector = push_worker_connector()
+        connector.connector_worker.start_early_push.side_effect = lambda meta: (
+            order.append("offer")
+        )
+        connector._connector_metadata = cm.RblnNixlConnectorMetadata()
+
+        connector.wait_for_save()
+
+        assert order == ["copy", "offer"]
+
+    def test_a_flush_reaches_the_worker(self, monkeypatch, push_worker_connector):
+        connector = push_worker_connector()
+        meta = cm.RblnNixlConnectorMetadata()
+        meta.push_early_flush = {"r0"}
+
+        connector.handle_preemptions(meta)
+
+        connector.connector_worker.flush_early_sends.assert_called_once_with({"r0"})
+
+    def test_the_step_s_work_is_held(self, push_worker_connector):
+        # Both halves wait for the flush: the release wants a submission ahead of
+        # it, and the handover must stay behind the release.
+        connector = push_worker_connector()
+        connector._connector_metadata = cm.RblnNixlConnectorMetadata()
+
+        connector.start_load_kv(object())
+
+        connector.connector_worker.release_early_offers.assert_not_called()
+        connector.connector_worker.start_load_kv.assert_not_called()
+
+    def test_upstream_is_never_reached_at_this_point(
+        self, monkeypatch, push_worker_connector
+    ):
+        # Upstream drives the worker here; this override replaces that rather
+        # than adding to it. `monkeypatch(raising=True)` would not notice
+        # upstream dropping the method -- it checks `hasattr`, which the
+        # inherited definition on `KVConnectorBase_V1` satisfies -- so the
+        # class's own namespace is what says the override is still there.
+        assert "start_load_kv" in vars(cm.NixlPushConnector)
+        delegated = []
+        monkeypatch.setattr(
+            cm.NixlPushConnector,
+            "start_load_kv",
+            lambda self, ctx, **kw: delegated.append(ctx),
+        )
+        connector = push_worker_connector()
+        connector._connector_metadata = cm.RblnNixlConnectorMetadata()
+
+        connector.start_load_kv(object())
+
+        assert delegated == []
+
+    def test_the_release_precedes_this_step_s_work(self, push_worker_connector):
+        # The handover is adopted by the worker's start_load_kv; releasing after
+        # it would drop the offer of a request whose handover lands on this
+        # same step instead of writing it.
+        order = []
+        connector = push_worker_connector()
+        meta = cm.RblnNixlConnectorMetadata()
+        connector._connector_metadata = meta
+        connector.connector_worker.release_early_offers.side_effect = lambda: (
+            order.append("release")
+        )
+        connector.connector_worker.start_load_kv.side_effect = lambda held: (
+            order.append("adopt")
+        )
+        connector.start_load_kv(object())
+
+        connector.flush_deferred_load()
+
+        assert order == ["release", "adopt"]
+        connector.connector_worker.start_load_kv.assert_called_once_with(meta)
+
+    def test_flush_again_releases_nothing(self, push_worker_connector):
+        # The entry site and the dummy step both flush; a second release would
+        # hand the writer offers it has already taken.
+        connector = push_worker_connector()
+        connector._connector_metadata = cm.RblnNixlConnectorMetadata()
+        connector.start_load_kv(object())
+        connector.flush_deferred_load()
+
+        connector.flush_deferred_load()
+
+        connector.connector_worker.release_early_offers.assert_called_once()
+        connector.connector_worker.start_load_kv.assert_called_once()
+
+    def test_the_helper_reaches_this_connector(self, push_worker_connector):
+        # The runner flushes through the helper, which skips anything without the
+        # protocol -- so going through it is what proves this connector is reached.
+        connector = push_worker_connector()
+        connector._connector_metadata = cm.RblnNixlConnectorMetadata()
+        connector.start_load_kv(object())
+        assert not connector.connector_worker.release_early_offers.called
+
+        flush_deferred_loads(connector)
+
+        connector.connector_worker.release_early_offers.assert_called_once()

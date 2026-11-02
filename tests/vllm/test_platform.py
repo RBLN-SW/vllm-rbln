@@ -1,0 +1,1497 @@
+# Copyright 2026 Rebellions Inc. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at:
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# RblnPlatform on the vllm model path only (--model-impl vllm). Written
+# against outcomes rather than call paths -- a real config is built so the engine's
+# own entry point (VllmConfig.__post_init__ -> check_and_update_config) does the
+# work, and the assertions read the resulting config, the raised error, or the
+# process env. That survives splitting the optimum and vllm model paths apart.
+
+from __future__ import annotations
+
+import copy
+import os
+import subprocess
+import sys
+import textwrap
+from dataclasses import replace
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+import torch
+from pydantic import ValidationError
+from vllm.config import CompilationMode, VllmConfig
+from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
+from vllm.usage.usage_lib import UsageContext
+from vllm.utils.argparse_utils import FlexibleArgumentParser
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+import vllm_rbln.platform as platform
+from tests.vllm.vllm_config import local_model_path
+from vllm_rbln.config import OptimumRBLNConfig, RBLNConfig
+from vllm_rbln.platform import (
+    RBLN_DEFAULT_GPU_MEMORY_UTILIZATION,
+    RBLN_DEFAULT_MAX_NUM_SEQS,
+    RblnPlatform,
+)
+
+# Small, non-gated and already needed by the spec-decode tests; a config build
+# never touches the device.
+_MODEL = "JackFram/llama-68m"
+_ENGINE_ARGS = dict(
+    max_model_len=2048,
+    block_size=1024,
+    max_num_batched_tokens=128,
+    enable_chunked_prefill=True,
+)
+
+# Modules that read the device flag. The DP launcher of vllm-rbln-executor
+# imports them before the model path is resolved.
+_DEVICE_FLAG_READERS = frozenset(
+    {
+        "vllm_rbln.patches.deepseek_mtp",
+        "vllm_rbln.platform.vllm_impl",
+        "vllm_rbln.v1.sample.rbln_rejection_sampler",
+        "vllm_rbln.v1.sample.rbln_sampler",
+        "vllm_rbln.v1.spec_decode.dflash",
+        "vllm_rbln.v1.spec_decode.eagle",
+        "vllm_rbln.v1.spec_decode.medusa",
+        "vllm_rbln.v1.worker.rbln_model_runner",
+    }
+)
+
+_STANDALONE = "RBLN_CTX_STANDALONE"
+# Means "the platform did not touch it". Set rather than deleted so monkeypatch
+# has recorded the key and can roll back the platform's direct os.environ write.
+_UNTOUCHED = ""
+
+
+def _build(**engine_kwargs) -> VllmConfig:
+    """A real config, so building it *is* running the platform hook.
+
+    Not vllm_config.make_vllm_config: that pins max_num_seqs, which this file
+    needs unset to observe the RBLN default.
+    """
+    return EngineArgs(
+        model=local_model_path(_MODEL), **{**_ENGINE_ARGS, **engine_kwargs}
+    ).create_engine_config()
+
+
+@pytest.fixture(scope="module")
+def configured() -> VllmConfig:
+    """One plain config on the vllm model path, built once."""
+    return _build()
+
+
+@pytest.fixture
+def reconfigure(configured):
+    """Copy the built config, mutate it, run the hook again.
+
+    For branches EngineArgs cannot express -- an unsupported dtype, chunked
+    prefill off (upstream rejects it first), a LoRA config, more ranks. Re-running
+    is safe because every field the hook writes is already at its final value.
+    """
+
+    def run(mutate) -> VllmConfig:
+        config = copy.deepcopy(configured)
+        mutate(config)
+        RblnPlatform.check_and_update_config(config)
+        return config
+
+    return run
+
+
+@pytest.fixture(autouse=True)
+def isolated_standalone_env(monkeypatch):
+    monkeypatch.setenv(_STANDALONE, _UNTOUCHED)
+
+
+@pytest.fixture
+def run_logging_probe(tmp_path):
+    def run(probe, bootstrap_logging, color):
+        result = subprocess.run(
+            [sys.executable, "-c", textwrap.dedent(probe), str(tmp_path)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={
+                **os.environ,
+                "VLLM_CONFIGURE_LOGGING": bootstrap_logging,
+                "VLLM_LOGGING_LEVEL": "INFO",
+                "VLLM_LOGGING_CONFIG_PATH": "",
+                "VLLM_LOGGING_COLOR": color,
+                "NO_COLOR": "",
+            },
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+
+    return run
+
+
+@pytest.mark.parametrize("bootstrap_logging", ["0", "1"])
+@pytest.mark.parametrize("color", ["0", "1"])
+def test_logging_initialization_honors_upstream_config(
+    run_logging_probe, bootstrap_logging, color
+):
+    run_logging_probe(
+        r"""
+        import logging
+        import os
+        import re
+        import sys
+        from copy import deepcopy
+
+        from vllm.config.logging import LoggingConfig
+        from vllm.logger import configure_logging
+
+        configure_logging(LoggingConfig(configure_logging=True, log_level="ERROR"))
+        import vllm_rbln.platform
+        import vllm_rbln.logger as rbln_logger
+
+        assert logging.getLogger("vllm_rbln").getEffectiveLevel() == logging.ERROR
+        defaults = deepcopy(rbln_logger.DEFAULT_LOGGIN_CONFIG)
+        os.environ["VLLM_CONFIGURE_LOGGING"] = "1"
+        os.environ["VLLM_LOGGING_LEVEL"] = "DEBUG"
+        rbln_logger._configure_vllm_root_logger()
+        assert rbln_logger.DEFAULT_LOGGIN_CONFIG == defaults
+        source = sys.modules[LoggingConfig.__module__].__file__
+        record = logging.LogRecord(
+            "vllm_rbln.logging_test", logging.ERROR, source, 7, "path marker", (), None
+        )
+        root = logging.getLogger("vllm_rbln")
+        rendered = root.handlers[0].formatter.format(record)
+        assert "[config/logging.py:7]" in re.sub(r"\x1b\[[0-9;]*m", "", rendered)
+        """,
+        bootstrap_logging,
+        color,
+    )
+
+
+@pytest.mark.parametrize("bootstrap_logging", ["0", "1"])
+@pytest.mark.parametrize("color", ["0", "1"])
+def test_logging_reconfiguration_preserves_rbln_output(
+    run_logging_probe, bootstrap_logging, color
+):
+    run_logging_probe(
+        r"""
+        import io
+        import logging
+        import re
+        import sys
+        from contextlib import closing
+        from pathlib import Path
+
+        from vllm.config.logging import LoggingConfig
+        from vllm.logger import configure_logging, init_logger
+
+        import vllm_rbln.platform
+        from vllm_rbln.logger import make_file_handler
+
+        root = logging.getLogger("vllm_rbln")
+        source = sys.modules[LoggingConfig.__module__].__file__
+        record = logging.LogRecord(
+            "vllm_rbln.logging_test", logging.ERROR, source, 7, "path marker", (), None
+        )
+        configure_logging(LoggingConfig(configure_logging=True, log_level="INFO"))
+        console, = root.handlers
+        output = io.StringIO()
+        console.setStream(output)
+        formatter = console.formatter
+        logger = init_logger("vllm_rbln.logging_test")
+        file_path = Path(sys.argv[1]) / "metrics.log"
+        file_handler = make_file_handler(str(file_path))
+        logger.addHandler(file_handler)
+
+        for level in ("INFO", "ERROR", "DEBUG", "INFO"):
+            configure_logging(LoggingConfig(configure_logging=True, log_level=level))
+            assert root.getEffectiveLevel() == getattr(logging, level)
+            assert root.handlers == [console]
+            assert type(console.formatter) is type(formatter)
+            assert console.stream is output
+            assert logger.handlers == [file_handler]
+            output.seek(0)
+            output.truncate()
+            logger.debug("debug marker")
+            logger.info("info marker")
+            logger.error("error marker")
+            logger.handle(record)
+            text = re.sub(r"\x1b\[[0-9;]*m", "", output.getvalue())
+            assert ("debug marker" in text) == (level == "DEBUG"), text
+            assert ("info marker" in text) == (level != "ERROR"), text
+            assert text.count("error marker") == 1, text
+            assert all(line.startswith("[vllm-rbln] ") for line in text.splitlines())
+            assert "pid=" not in text
+            location = "config/logging.py" if level == "DEBUG" else "logging.py"
+            assert f"[{location}:7]" in text, text
+            assert f"[{location}:7]" in file_path.read_text().splitlines()[-1]
+            level_path = Path(sys.argv[1]) / f"{level}.log"
+            with closing(make_file_handler(str(level_path))) as level_handler:
+                level_handler.handle(record)
+            assert f"[{location}:7]" in level_path.read_text()
+
+        configure_logging(LoggingConfig(configure_logging=False, log_level="ERROR"))
+        assert root.getEffectiveLevel() == logging.INFO
+        logger.info("file marker")
+        file_handler.flush()
+        assert "[vllm-rbln] INFO" in file_path.read_text()
+        assert "file marker" in file_path.read_text()
+        logger.removeHandler(file_handler)
+        file_handler.close()
+        """,
+        bootstrap_logging,
+        color,
+    )
+
+
+@pytest.mark.parametrize("bootstrap_logging", ["0", "1"])
+@pytest.mark.parametrize("color", ["0", "1"])
+def test_logging_custom_config_and_default_transition(
+    run_logging_probe, bootstrap_logging, color
+):
+    run_logging_probe(
+        r"""
+        import io
+        import json
+        import logging
+        import re
+        import sys
+        from contextlib import redirect_stdout
+        from pathlib import Path
+
+        from vllm.config.logging import LoggingConfig
+        from vllm.logger import configure_logging, init_logger
+
+        import vllm_rbln.platform
+        from vllm_rbln.logger import make_file_handler
+
+        configure_logging(LoggingConfig(configure_logging=True, log_level="INFO"))
+        root = logging.getLogger("vllm_rbln")
+        output = io.StringIO()
+        root.handlers[0].setStream(output)
+        logger = init_logger("vllm_rbln.logging_test")
+
+        custom_path = Path(sys.argv[1]) / "logging.json"
+        custom_path.write_text(json.dumps({
+            "version": 1,
+            "incremental": True,
+            "handlers": {"vllm_rbln": {"level": "ERROR"}},
+            "loggers": {"vllm_rbln": {"level": "WARNING"}},
+        }))
+        configure_logging(LoggingConfig(
+            configure_logging=True,
+            log_level="DEBUG",
+            pylogging_config_file=str(custom_path),
+        ))
+        assert root.getEffectiveLevel() == logging.WARNING
+        output.seek(0)
+        output.truncate()
+        logger.warning("filtered marker")
+        logger.error("incremental marker")
+        assert "filtered marker" not in output.getvalue()
+        assert output.getvalue().count("incremental marker") == 1
+
+        for name in ("application_console", "vllm_rbln"):
+            custom_path.write_text(json.dumps({
+                "version": 1,
+                "disable_existing_loggers": False,
+                "formatters": {"custom": {"format": "[custom] %(message)s"}},
+                "handlers": {name: {
+                    "class": "logging.StreamHandler",
+                    "stream": "ext://sys.stdout",
+                    "formatter": "custom",
+                }},
+                "loggers": {"vllm_rbln": {
+                    "handlers": [name], "level": "INFO", "propagate": False,
+                }},
+            }))
+            output = io.StringIO()
+            with redirect_stdout(output):
+                configure_logging(LoggingConfig(
+                    configure_logging=True, pylogging_config_file=str(custom_path),
+                ))
+                persistent_path = Path(sys.argv[1]) / f"{name}.log"
+                persistent = make_file_handler(str(persistent_path))
+                root.addHandler(persistent)
+                logger.info("custom marker")
+                assert output.getvalue().strip() == "[custom] custom marker"
+                output.seek(0)
+                output.truncate()
+                configure_logging(LoggingConfig(
+                    configure_logging=True, log_level="INFO",
+                ))
+                logger.info("transition marker")
+            text = re.sub(r"\x1b\[[0-9;]*m", "", output.getvalue())
+            assert text.count("transition marker") == 1, text
+            assert text.startswith("[vllm-rbln] "), text
+            assert persistent in root.handlers
+            assert "transition marker" in persistent_path.read_text()
+            root.removeHandler(persistent)
+            persistent.close()
+        """,
+        bootstrap_logging,
+        color,
+    )
+
+
+class TestPlatformIdentity:
+    """Values frozen at import: the class body derives them from the env, so a
+    spawned worker re-importing the module must land on the same lane."""
+
+    def test_device_triple_moves_together(self):
+        # A device_type of "rbln" with an empty dist_backend (or the reverse)
+        # would half-enable the device lane.
+        triple = (
+            RblnPlatform.device_name,
+            RblnPlatform.device_type,
+            RblnPlatform.dist_backend,
+        )
+        if platform.USE_DEVICE_TENSOR:
+            assert triple == ("rbln", "rbln", "rbln-ccl")
+        else:
+            assert triple == ("cpu", "cpu", "")
+
+    def test_device_tensor_needs_both_switches(self):
+        assert platform.USE_DEVICE_TENSOR is (
+            platform.envs.model_impl_from_env() == "vllm"
+            and platform.envs.VLLM_RBLN_USE_DEVICE_TENSOR
+        )
+
+    @pytest.mark.parametrize(
+        ("attribute", "expected"),
+        [
+            # Ops dispatch on CPU even when tensors live on the device.
+            ("dispatch_key", "CPU"),
+            # RBLNWorker._init_device_env narrows this var per rank.
+            ("device_control_env_var", "RBLN_VISIBLE_DEVICES"),
+            ("simple_compile_backend", "bypass"),
+        ],
+    )
+    def test_pinned_attributes(self, attribute, expected):
+        assert getattr(RblnPlatform, attribute) == expected
+
+    def test_simple_compile_backend_is_registered(self):
+        # Named at class scope; an unregistered name only fails once vLLM
+        # compiles something.
+        assert torch._dynamo.lookup_backend(RblnPlatform.simple_compile_backend)
+
+    @pytest.mark.parametrize(
+        ("method", "expected"),
+        [
+            ("is_pin_memory_available", False),
+            ("can_update_inplace", False),
+            ("support_hybrid_kv_cache", True),
+            ("get_nixl_memory_type", "DRAM"),
+            (
+                "get_device_communicator_cls",
+                "vllm_rbln.distributed.rbln_communicator.RblnCommunicator",
+            ),
+        ],
+    )
+    def test_pinned_answers(self, method, expected):
+        assert getattr(RblnPlatform, method)() == expected
+
+    def test_nixl_supported_devices(self):
+        # Upstream rejects any kv_buffer_device not listed here, so both the
+        # host-bounce ("cpu") and D2D ("rbln") pairings must stay.
+        assert RblnPlatform.get_nixl_supported_devices() == {
+            "cpu": ("cpu", "rbln"),
+            "rbln": ("rbln", "cpu"),
+        }
+
+
+class TestRejectedConfigs:
+    @pytest.mark.parametrize(
+        ("block_size", "max_num_batched_tokens", "invalid_block_size"),
+        [(128, 128, 127), (16384, 128, 16385), (16384, 16384, 16385)],
+    )
+    def test_block_size_range(
+        self, block_size, max_num_batched_tokens, invalid_block_size
+    ):
+        _build(block_size=block_size, max_num_batched_tokens=max_num_batched_tokens)
+        with pytest.raises(
+            ValidationError,
+            match=(
+                "RBLN requires max_num_batched_tokens <= block_size <= max_block_size"
+            ),
+        ):
+            _build(
+                block_size=invalid_block_size,
+                max_num_batched_tokens=max_num_batched_tokens,
+            )
+
+    @pytest.mark.parametrize("max_num_batched_tokens", [16, 128, None])
+    def test_block_size_must_be_explicit(self, max_num_batched_tokens):
+        with pytest.raises(ValidationError, match="requires an explicit block_size"):
+            _build(block_size=None, max_num_batched_tokens=max_num_batched_tokens)
+
+    def test_token_budget_exceeds_block_size_limit(self):
+        with pytest.raises(
+            ValidationError,
+            match="max_num_batched_tokens=16385.*--max-num-batched-tokens",
+        ):
+            _build(block_size=16384, max_num_batched_tokens=16385)
+
+    def test_an_explicit_dynamic_kv_on_an_unsizable_config(self, reconfigure):
+        def custom_kernel(dynamic):
+            def mutate(config):
+                config.additional_config.use_custom_kernel = True
+                config.additional_config.use_dynamic_kv_cache = dynamic
+
+            return mutate
+
+        with pytest.raises(ValueError, match="RBLN_USE_CUSTOM_KERNEL"):
+            reconfigure(custom_kernel(True))
+        reconfigure(custom_kernel(None))
+
+    def test_lora(self, reconfigure):
+        with pytest.raises(ValueError, match="LoRA"):
+            reconfigure(lambda config: setattr(config, "lora_config", object()))
+
+    def test_msa_models_need_bfloat16(self, reconfigure):
+        def msa(dtype):
+            def mutate(config):
+                config.model_config.hf_text_config.sparse_attention_config = {
+                    "sparse_attention_freq": [0, 1]
+                }
+                config.model_config.dtype = dtype
+
+            return mutate
+
+        for dtype in (torch.float16, torch.float32):
+            with pytest.raises(ValueError, match="bfloat16 only"):
+                reconfigure(msa(dtype))
+        reconfigure(msa(torch.bfloat16))
+
+    def test_mrope_models_are_rejected(self, reconfigure, monkeypatch):
+        from vllm.config import ModelConfig
+
+        monkeypatch.setattr(ModelConfig, "uses_mrope", property(lambda self: True))
+        with pytest.raises(ValueError, match="M-RoPE"):
+            reconfigure(lambda config: None)
+
+    def test_chunked_prefill_off(self, reconfigure):
+        with pytest.raises(ValueError, match="chunked prefill"):
+            reconfigure(
+                lambda config: setattr(
+                    config.scheduler_config, "enable_chunked_prefill", False
+                )
+            )
+
+    @pytest.mark.parametrize("method", ["eagle3", "dflash"])
+    def test_a_draft_under_pp_needs_a_patched_target(self, reconfigure, method):
+        # The default model is a plain LlamaForCausalLM, which 0.30 made
+        # pipeline-aware but which packs a handoff key per tensor rather than the
+        # combined one this side reads. Asserting through the hook rather than on
+        # the validator directly is the point: it is what shows the guard is
+        # reached at all.
+        with pytest.raises(ValueError, match="auxiliary hidden states"):
+            reconfigure(_aux_draft_under_pp(method=method))
+
+    def test_eagle3_under_pp_accepts_a_patched_target(self, reconfigure):
+        reconfigure(_aux_draft_under_pp(arch="MiniMaxM2ForCausalLM"))
+
+    def test_eagle3_under_pp_accepts_a_draft_with_aux_off(self, reconfigure):
+        # Nothing is captured anywhere then, so upstream's forward is harmless.
+        reconfigure(_aux_draft_under_pp(eagle_config={"use_aux_hidden_state": False}))
+
+    def test_eagle3_at_pp1_is_not_gated(self, reconfigure):
+        reconfigure(_aux_draft_under_pp(pp_size=1))
+
+    def test_dp_needs_a_divisible_token_budget(self, reconfigure):
+        with pytest.raises(ValueError, match="divisible"):
+            reconfigure(_ranks(data_parallel_size=2, max_num_seqs=5))
+
+    @pytest.mark.parametrize("ranks", [dict(data_parallel_size=2), dict(ep=True)])
+    def test_dp_and_ep_need_the_moe_tokens_mask(self, reconfigure, ranks):
+        with pytest.raises(ValueError, match="--rbln-use-moe-tokens-mask"):
+            reconfigure(_ranks(moe_tokens_mask=False, **ranks))
+
+    def test_tp_inherits_neither_dp_rule(self, reconfigure):
+        # Both rules guard padding introduced by DP multicast, so TP alone must
+        # pass even with the mask off and an indivisible budget.
+        reconfigure(
+            _ranks(tensor_parallel_size=2, max_num_seqs=5, moe_tokens_mask=False)
+        )
+
+    def test_moe_tokens_mask_defaults_on(self):
+        # The error above calls it the default; a flipped default breaks DP.
+        assert RBLNConfig().use_moe_tokens_mask is True
+
+
+def _aux_draft_under_pp(
+    *,
+    arch: str | None = None,
+    eagle_config=None,
+    pp_size: int = 2,
+    method: str = "eagle3",
+):
+    """A mutator that puts an aux-consuming draft on a pipeline-parallel target.
+
+    EngineArgs would have to resolve a real draft checkpoint to build this, so the
+    speculative config is a stand-in shaped like the fields the guard reads.
+    """
+
+    def mutate(config: VllmConfig) -> None:
+        config.parallel_config.pipeline_parallel_size = pp_size
+        # The guard runs after the per-stage decode batch check, which would
+        # otherwise raise first and mask it.
+        config.scheduler_config.max_num_seqs = pp_size * 2
+        if method == "dflash":
+            # So does DFlash's prefill chunk check, which this stand-in would
+            # otherwise trip with an unset budget.
+            config.scheduler_config.max_num_scheduled_tokens = (
+                config.scheduler_config.max_num_batched_tokens
+            )
+        if arch is not None:
+            config.model_config.hf_config.architectures = [arch]
+        config.speculative_config = SimpleNamespace(
+            method=method,
+            draft_model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(eagle_config=eagle_config)
+            ),
+        )
+
+    return mutate
+
+
+def _ranks(
+    *,
+    ep: bool = False,
+    max_num_seqs: int | None = None,
+    moe_tokens_mask: bool | None = None,
+    **parallel,
+):
+    """A mutator that widens a config to more ranks."""
+
+    def mutate(config: VllmConfig) -> None:
+        for field, value in parallel.items():
+            setattr(config.parallel_config, field, value)
+        if ep:
+            config.parallel_config.enable_expert_parallel = True
+        if max_num_seqs is not None:
+            config.scheduler_config.max_num_seqs = max_num_seqs
+        if moe_tokens_mask is not None:
+            config.additional_config = replace(
+                config.additional_config, use_moe_tokens_mask=moe_tokens_mask
+            )
+
+    return mutate
+
+
+class TestModelParallelSideEffect:
+    @pytest.mark.parametrize(
+        "ranks",
+        [
+            dict(data_parallel_size=2),
+            dict(tensor_parallel_size=2),
+            # PP compiles max_num_seqs // pp_size decode slots per stage, so the
+            # budget must be >= pp_size (the default of 1 would floor to 0).
+            dict(pipeline_parallel_size=2, max_num_seqs=2),
+            dict(ep=True),
+        ],
+        ids=["dp", "tp", "pp", "ep"],
+    )
+    def test_any_model_parallel_axis_sets_standalone_context(self, reconfigure, ranks):
+        reconfigure(_ranks(**ranks))
+        assert os.environ[_STANDALONE] == "1"
+
+    def test_single_rank_leaves_it_alone(self, reconfigure):
+        reconfigure(lambda config: None)
+        assert os.environ[_STANDALONE] == _UNTOUCHED
+
+
+class TestDtype:
+    def test_supported_dtype_is_kept(self):
+        assert _build(dtype="float16").model_config.dtype == torch.float16
+
+    def test_unsupported_dtype_falls_back_to_fp32(self, reconfigure):
+        config = reconfigure(
+            lambda config: setattr(config.model_config, "dtype", torch.float64)
+        )
+        assert config.model_config.dtype == torch.float32
+
+    def test_enforce_fp32_overrides_a_supported_dtype(self):
+        config = _build(dtype="float16", additional_config={"enforce_model_fp32": True})
+        assert config.model_config.dtype == torch.float32
+
+
+class TestCompileDtype:
+    @staticmethod
+    def _with_dtype(config):
+        config.additional_config = replace(
+            config.additional_config, compile_dtype="float16"
+        )
+
+    @pytest.fixture
+    def older_rebel(self, monkeypatch):
+        import vllm_rbln.compilation.compiler as compiler
+
+        def legacy_compile(model, *, npu=None):
+            pass
+
+        monkeypatch.setattr(compiler.rebel, "compile", legacy_compile)
+
+    def test_empty_dtype_skips_the_probe(self, reconfigure, older_rebel):
+        config = reconfigure(lambda config: None)
+        assert config.additional_config.compile_dtype == ""
+
+    def test_refused_at_startup_on_an_older_rebel(self, reconfigure, older_rebel):
+        with pytest.raises(ValueError, match="dtype"):
+            reconfigure(self._with_dtype)
+
+
+class TestWorkerAndScheduler:
+    @pytest.mark.parametrize("selection", [None, "0", "1"])
+    def test_runner_selection_ignores_upstream_env(self, monkeypatch, selection):
+        import vllm.config.vllm as upstream_config
+
+        monkeypatch.setattr(upstream_config, "HAS_TRITON", True)
+        if selection is None:
+            monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
+        else:
+            monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", selection)
+        with patch.object(platform.logger, "warning_once") as warning:
+            config = _build()
+            assert config.use_v2_model_runner is False
+        assert config.parallel_config.worker_cls == (
+            "vllm_rbln.v1.worker.rbln_worker.RBLNWorker"
+        )
+        assert os.environ.get("VLLM_USE_V2_MODEL_RUNNER") == selection
+        assert warning.called is (selection != "0")
+        if warning.called:
+            assert "V2 selection is ignored" in warning.call_args.args[0]
+
+    def test_v2_scoring_is_rejected(self, monkeypatch):
+        from vllm.exceptions import VLLMValidationError
+        from vllm.sampling_params import SamplingParams
+        from vllm.v1.engine.input_processor import InputProcessor
+
+        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+        processor = InputProcessor(_build())
+        with pytest.raises(VLLMValidationError, match="requires the V2 model runner"):
+            processor._validate_params(
+                SamplingParams(prompt_logprob_token_ids=[1]), ("generate",)
+            )
+
+    def test_auto_worker_becomes_the_rbln_worker(self, configured):
+        assert (
+            configured.parallel_config.worker_cls
+            == "vllm_rbln.v1.worker.rbln_worker.RBLNWorker"
+        )
+
+    def test_an_explicit_worker_is_respected(self):
+        assert (
+            _build(worker_cls="pkg.mod.MyWorker").parallel_config.worker_cls
+            == "pkg.mod.MyWorker"
+        )
+
+    def test_scheduler_is_replaced_unconditionally(self, reconfigure):
+        # Unlike worker_cls there is no "auto" guard: whatever was asked for is
+        # overwritten. Reading the expectation back off the config under test
+        # would agree with whatever the platform decided, so the carriers are
+        # pinned off and the sync scheduler named outright.
+
+        def mutate(config: VllmConfig) -> None:
+            config.scheduler_config.scheduler_cls = "pkg.mod.MyScheduler"
+            config.additional_config = replace(
+                config.additional_config, use_custom_sampler=False
+            )
+
+        config = reconfigure(mutate)
+        assert (
+            config.scheduler_config.scheduler_cls
+            == "vllm_rbln.v1.core.rbln_scheduler.RBLNScheduler"
+        )
+
+    def test_a_plain_build_lands_on_the_async_scheduler(self, monkeypatch):
+        # Nobody passes --async-scheduling here: vLLM resolves the unset flag to
+        # True before this platform hook, and with both carriers on nothing
+        # refuses it, so the vllm model path selects the async scheduler. This is
+        # what the async support changed, and it went unasserted.
+        for name in ("VLLM_RBLN_USE_DEVICE_TENSOR", "VLLM_RBLN_SAMPLER"):
+            monkeypatch.setenv(name, "1")
+        config = _build()
+        assert config.scheduler_config.async_scheduling is True
+        assert (
+            config.scheduler_config.scheduler_cls
+            == "vllm_rbln.v1.core.rbln_scheduler.RBLNAsyncScheduler"
+        )
+
+
+class TestCompilation:
+    def test_vllm_compilation_is_disabled(self, configured):
+        # @support_torch_compile is unsupported; RBLN compiles in its own runner.
+        assert configured.compilation_config.mode == CompilationMode.NONE
+
+    def test_a_lone_none_custom_op_is_cleared(self):
+        assert (
+            _build(
+                compilation_config={"custom_ops": ["none"]}
+            ).compilation_config.custom_ops
+            == []
+        )
+
+    def test_only_a_lone_none_is_cleared(self):
+        # Two entries fall outside the guard, so "none" survives as upstream
+        # meant it. (The default list is upstream's business, not ours.)
+        assert _build(
+            compilation_config={"custom_ops": ["none", "+rms_norm"]}
+        ).compilation_config.custom_ops == ["none", "+rms_norm"]
+
+
+class TestSchedulerOverrides:
+    @pytest.mark.parametrize(
+        ("engine_args_cls", "usage_context"),
+        [
+            (EngineArgs, UsageContext.LLM_CLASS),
+            (AsyncEngineArgs, UsageContext.OPENAI_API_SERVER),
+            (EngineArgs, None),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "max_num_batched_tokens, expected", [(None, 512), (128, 128)]
+    )
+    def test_token_budget_default(
+        self, engine_args_cls, usage_context, max_num_batched_tokens, expected
+    ):
+        config = engine_args_cls(
+            model=local_model_path(_MODEL),
+            **{**_ENGINE_ARGS, "max_num_batched_tokens": max_num_batched_tokens},
+        ).create_engine_config(usage_context=usage_context)
+
+        assert config.scheduler_config.max_num_batched_tokens == expected
+
+    def test_throughput_mode_keeps_the_rbln_token_budget_default(self):
+        config = _build(max_num_batched_tokens=None, performance_mode="throughput")
+
+        assert config.scheduler_config.max_num_batched_tokens == 512
+
+    def test_async_scheduling_is_honored(self, monkeypatch):
+        # The platform used to force this off unconditionally. It now follows
+        # vLLM's --async-scheduling, as long as the device-side token path is
+        # available (see below). Both carriers are pinned on because
+        # --device-tensor 0 switches the first one off for the whole session,
+        # which would land this on the negative case below.
+        for name in ("VLLM_RBLN_USE_DEVICE_TENSOR", "VLLM_RBLN_SAMPLER"):
+            monkeypatch.setenv(name, "1")
+        assert _build(async_scheduling=True).scheduler_config.async_scheduling is True
+
+    @pytest.mark.parametrize(
+        "switched_off", ["VLLM_RBLN_USE_DEVICE_TENSOR", "VLLM_RBLN_SAMPLER"]
+    )
+    def test_async_scheduling_needs_the_device_token_carriers(
+        self, monkeypatch, switched_off
+    ):
+        """Either env var off means async has no way to carry its in-flight tokens.
+
+        VLLM_RBLN_USE_DEVICE_TENSOR gates the feedback scatter that replaces the
+        scheduler's -1 placeholders; VLLM_RBLN_SAMPLER gates the ring the output
+        thread reads. Without them the runner decodes from a token that was never
+        sampled and returns wrong text with no error raised, so the platform
+        downgrades to sync rather than run the combination.
+        """
+        # Both are set before one is switched off: the gate refuses on either,
+        # so leaving the other to the lane lets --device-tensor 0 satisfy this
+        # case with the sampler still on, and the parametrization proves nothing.
+        for name in ("VLLM_RBLN_USE_DEVICE_TENSOR", "VLLM_RBLN_SAMPLER"):
+            monkeypatch.setenv(name, "1")
+        monkeypatch.setenv(switched_off, "0")
+        config = _build(async_scheduling=True)
+        assert config.scheduler_config.async_scheduling is False
+        assert config.scheduler_config.scheduler_cls.endswith("RBLNScheduler")
+
+    def test_async_scheduling_is_refused_with_speculative_decoding(self, reconfigure):
+        """The async feedback carries one sampled token per step.
+
+        _bookkeeping_sync asserts a single sampled column, which a rejection
+        sampler output of shape (batch, num_spec + 1) cannot satisfy. vLLM allows
+        async with eagle / ngram / draft_model, so without this the combination
+        reaches the runner and dies on that assert mid-decode.
+        """
+
+        def mutate(config: VllmConfig) -> None:
+            config.scheduler_config.async_scheduling = True
+            # eagle is a method vLLM does allow async scheduling with.
+            config.speculative_config = SimpleNamespace(method="eagle")
+
+        config = reconfigure(mutate)
+        assert config.scheduler_config.async_scheduling is False
+        assert config.scheduler_config.scheduler_cls.endswith("RBLNScheduler")
+
+    def test_async_scheduling_is_refused_under_pipeline_parallelism(self, reconfigure):
+        """Under PP the scheduler stops shipping the sampled tokens.
+
+        It expects the runner to broadcast prev_sampled_token_ids from the last
+        stage instead, which this runner does not do, so a non-last rank reaches
+        _update_states with no token source and dies on its assert mid-decode.
+        """
+
+        def mutate(config: VllmConfig) -> None:
+            config.scheduler_config.async_scheduling = True
+            _ranks(pipeline_parallel_size=2, max_num_seqs=2)(config)
+
+        config = reconfigure(mutate)
+        assert config.scheduler_config.async_scheduling is False
+        assert config.scheduler_config.scheduler_cls.endswith("RBLNScheduler")
+
+    def test_cascade_attention_is_disabled(self, configured):
+        assert configured.model_config.disable_cascade_attn is True
+
+    def test_unset_max_num_seqs_takes_the_rbln_default(self, configured):
+        assert configured.scheduler_config.max_num_seqs == RBLN_DEFAULT_MAX_NUM_SEQS
+
+    def test_an_explicit_max_num_seqs_is_respected(self):
+        assert _build(max_num_seqs=8).scheduler_config.max_num_seqs == 8
+
+
+class TestCacheOverrides:
+    def test_upstream_default_gpu_memory_utilization_takes_the_rbln_default(
+        self, configured
+    ):
+        assert (
+            configured.cache_config.gpu_memory_utilization
+            == RBLN_DEFAULT_GPU_MEMORY_UTILIZATION
+        )
+
+    def test_an_explicit_gpu_memory_utilization_is_respected(self):
+        config = _build(gpu_memory_utilization=0.5)
+        assert config.cache_config.gpu_memory_utilization == 0.5
+
+    def test_serve_advertises_the_rbln_gpu_memory_utilization(self):
+        parser = AsyncEngineArgs.add_cli_args(FlexibleArgumentParser())
+        assert (
+            parser.get_default("gpu_memory_utilization")
+            == RBLN_DEFAULT_GPU_MEMORY_UTILIZATION
+        )
+
+
+class TestEnforceEager:
+    def test_outcome_follows_the_device_lane(self, reconfigure):
+        mutate = lambda config: setattr(  # noqa: E731
+            config.model_config, "enforce_eager", True
+        )
+        if platform.USE_DEVICE_TENSOR:
+            # Eager needs real device tensors; dtype is forced to fp16 there.
+            assert reconfigure(mutate).model_config.dtype == torch.float16
+        else:
+            with pytest.raises(ValueError, match="VLLM_RBLN_USE_DEVICE_TENSOR"):
+                reconfigure(mutate)
+
+
+def _selector(*, use_mla: bool = False, use_sparse: bool = False) -> SimpleNamespace:
+    return SimpleNamespace(use_mla=use_mla, use_sparse=use_sparse)
+
+
+class TestAttentionBackend:
+    @pytest.mark.parametrize(
+        ("use_mla", "expected"),
+        [
+            (False, AttentionBackendEnum.FLASH_ATTN),
+            (True, AttentionBackendEnum.FLASH_ATTN_MLA),
+        ],
+    )
+    def test_unset_backend_resolves_by_mla(self, use_mla, expected):
+        assert (
+            RblnPlatform.get_attn_backend_cls(None, _selector(use_mla=use_mla))
+            == expected.get_path()
+        )
+
+    @pytest.mark.parametrize(
+        "backend",
+        [AttentionBackendEnum.FLASH_ATTN, AttentionBackendEnum.FLASH_ATTN_MLA],
+    )
+    def test_an_allowed_backend_passes_through(self, backend):
+        assert (
+            RblnPlatform.get_attn_backend_cls(backend, _selector())
+            == backend.get_path()
+        )
+
+    def test_any_other_backend_is_rejected(self):
+        other = next(
+            backend
+            for backend in AttentionBackendEnum
+            if backend
+            not in (
+                AttentionBackendEnum.FLASH_ATTN,
+                AttentionBackendEnum.FLASH_ATTN_MLA,
+            )
+        )
+        with pytest.raises(ValueError, match="Cannot use"):
+            RblnPlatform.get_attn_backend_cls(other, _selector())
+
+    def test_sparse_attention_is_unsupported(self):
+        with pytest.raises(NotImplementedError, match="Sparse"):
+            RblnPlatform.get_attn_backend_cls(
+                AttentionBackendEnum.FLASH_ATTN, _selector(use_sparse=True)
+            )
+
+
+class TestDeviceName:
+    """The NPU name drives compilation, so a compile-only host without an NPU
+    must still be able to name its target."""
+
+    @pytest.fixture(autouse=True)
+    def no_host_override(self, monkeypatch):
+        # Both are host passthrough vars the suite does not scrub.
+        monkeypatch.delenv("RBLN_FORCE_NPU_NAME", raising=False)
+        monkeypatch.delenv("RBLN_TARGET_SOC", raising=False)
+
+    def test_the_driver_answer_wins(self, monkeypatch):
+        monkeypatch.setenv("RBLN_FORCE_NPU_NAME", "RBLN-FROM-ENV")
+        monkeypatch.setattr(platform.rebel, "get_npu_name", lambda *a: "RBLN-CR03")
+        assert RblnPlatform.get_device_name() == "RBLN-CR03"
+
+    @pytest.mark.parametrize("env", ["RBLN_FORCE_NPU_NAME", "RBLN_TARGET_SOC"])
+    def test_env_fallbacks_when_no_npu_is_mounted(self, monkeypatch, env):
+        monkeypatch.setattr(platform.rebel, "get_npu_name", lambda *a: None)
+        monkeypatch.setenv(env, "RBLN-CA25")
+        assert RblnPlatform.get_device_name() == "RBLN-CA25"
+
+    def test_no_npu_and_no_override_raises(self, monkeypatch):
+        monkeypatch.setattr(platform.rebel, "get_npu_name", lambda *a: None)
+        with pytest.raises(RuntimeError, match="RBLN_FORCE_NPU_NAME"):
+            RblnPlatform.get_device_name()
+
+    @pytest.mark.parametrize(
+        ("name", "expected"),
+        [
+            ("RBLN-CR13", True),
+            (" rbln-cr13 ", True),
+            ("RBLN-CR03", False),
+            ("RBLN-CA25", False),
+        ],
+    )
+    def test_is_cr13_matches_the_exact_soc_name(self, monkeypatch, name, expected):
+        monkeypatch.setattr(platform.rebel, "get_npu_name", lambda *a: name)
+        assert RblnPlatform.is_cr13() is expected
+
+    @pytest.mark.parametrize(
+        ("name", "expected"),
+        [
+            ("RBLN-CA25", True),
+            ("RBLN-CA22", True),
+            (" rbln-ca02 ", True),
+            ("RBLN-CR03", False),
+            ("RBLN-CR13", False),
+        ],
+    )
+    def test_is_ca_matches_the_soc_name_prefix(self, monkeypatch, name, expected):
+        """A family, not one part: a new RBLN-CA* needs no code change here."""
+        monkeypatch.setattr(platform.rebel, "get_npu_name", lambda *a: name)
+        assert RblnPlatform.is_ca() is expected
+
+
+class TestAdditionalForwardContext:
+    def test_kv_cache_bases_passes_through(self):
+        bases = object()
+        assert RblnPlatform.set_additional_forward_context(kv_cache_bases=bases) == {
+            "kv_cache_bases": bases
+        }
+
+    @pytest.mark.parametrize("kwargs", [{}, {"kv_bases": 1}, {"attn_metadata": 1}])
+    def test_everything_else_is_dropped(self, kwargs):
+        assert RblnPlatform.set_additional_forward_context(**kwargs) == {}
+
+
+class TestPreRegisterAndUpdate:
+    def test_parser_gains_rbln_and_loses_block_size_choices(self):
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--device", choices=["cuda", "cpu"])
+        parser.add_argument("--block-size", dest="block_size", choices=[8, 16])
+
+        RblnPlatform.pre_register_and_update(parser)
+
+        device, block_size = parser._actions[1], parser._actions[2]
+        assert device.choices is not None and "rbln" in device.choices
+        # RBLN block sizes are not from upstream's list.
+        assert block_size.choices is None
+
+    def test_the_engine_args_patches_are_idempotent(self):
+        # Applied at plugin load already; wrapping twice would stack wrappers.
+        # __func__ because each attribute access rebinds the classmethod.
+        before = EngineArgs.get_batch_defaults.__func__
+        RblnPlatform.pre_register_and_update()
+        assert EngineArgs.get_batch_defaults.__func__ is before
+
+
+class TestDeprecatedDeviceControlEnvVar:
+    """``RBLN_DEVICES`` is folded into ``device_control_env_var`` and unset.
+
+    Unsetting is the point: the runtime takes both names but prefers the
+    deprecated one, so one left behind would override the pool a worker
+    narrows itself to.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolated_env(self):
+        # patch.dict, not monkeypatch.delenv: the code under test creates the
+        # current name, and a key a test never held is not restored.
+        with patch.dict(os.environ):
+            os.environ.pop("RBLN_DEVICES", None)
+            os.environ.pop(RblnPlatform.device_control_env_var, None)
+            yield
+
+    def test_legacy_value_carries_over_and_the_name_goes(self):
+        os.environ["RBLN_DEVICES"] = "4,5"
+
+        RblnPlatform.pre_register_and_update()
+
+        assert os.environ[RblnPlatform.device_control_env_var] == "4,5"
+        assert "RBLN_DEVICES" not in os.environ
+
+    def test_the_current_name_wins_when_both_are_set(self):
+        os.environ["RBLN_DEVICES"] = "4,5"
+        os.environ[RblnPlatform.device_control_env_var] = "6,7"
+
+        RblnPlatform.pre_register_and_update()
+
+        assert os.environ[RblnPlatform.device_control_env_var] == "6,7"
+        assert "RBLN_DEVICES" not in os.environ
+
+    def test_nothing_is_invented_when_neither_is_set(self):
+        RblnPlatform.pre_register_and_update()
+
+        assert RblnPlatform.device_control_env_var not in os.environ
+
+
+class TestCustomKvCacheSpecs:
+    @pytest.fixture(autouse=True)
+    def restore_registry(self):
+        # The registry is a process global with lazy init: it populates itself
+        # only while empty, so leaving it half-filled makes every later test that
+        # builds a scheduler fail with "No manager registered for ...".
+        from vllm.v1 import kv_cache_spec_registry as registry
+
+        saved = dict(registry._REGISTRY_KVCACHESPEC_LIST)
+        yield
+        registry._REGISTRY_KVCACHESPEC_LIST.clear()
+        registry._REGISTRY_KVCACHESPEC_LIST.update(saved)
+
+    def test_the_sliding_window_manager_is_reachable(self, configured):
+        # The runner looks the manager up by spec at KV-cache init; an
+        # unregistered pair only fails there, on a device. Registered through
+        # register_all_kvcache_specs like production does -- it fills in the
+        # built-in specs first and calls the platform hook last.
+        from vllm.v1.core.single_type_kv_cache_manager import (
+            register_all_kvcache_specs,
+        )
+        from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+
+        from vllm_rbln.v1.kv_cache import (
+            RBLNSlidingWindowManager,
+            RBLNSlidingWindowSpec,
+        )
+
+        register_all_kvcache_specs(configured)
+        spec = RBLNSlidingWindowSpec(
+            block_size=1024,
+            num_kv_heads=2,
+            head_size=8,
+            dtype=torch.float16,
+            sliding_window=512,
+        )
+        assert KVCacheSpecRegistry.get_manager_class(spec) is RBLNSlidingWindowManager
+
+
+def test_running_the_hook_twice_changes_nothing(configured, reconfigure):
+    """The premise every reconfigure() test rests on: each field the hook writes
+    is already at its final value, so a second pass is a no-op. Should the hook
+    start appending instead of assigning, this fails first."""
+    again = reconfigure(lambda config: None)
+
+    assert again.model_config.dtype == configured.model_config.dtype
+    assert again.parallel_config.worker_cls == configured.parallel_config.worker_cls
+    assert (
+        again.scheduler_config.scheduler_cls
+        == configured.scheduler_config.scheduler_cls
+    )
+    assert again.compilation_config.mode == configured.compilation_config.mode
+    assert (
+        again.compilation_config.custom_ops == configured.compilation_config.custom_ops
+    )
+    assert (
+        again.cache_config.enable_prefix_caching
+        == configured.cache_config.enable_prefix_caching
+    )
+
+
+def test_default_single_worker_uses_uni_without_warning(caplog):
+    config = _build()
+    assert config.parallel_config.distributed_executor_backend == "uni"
+    assert not any(
+        record.name == platform.logger.name
+        and "distributed executor backend" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.parametrize("backend", [None, "mp", "uni", "ray", "external_launcher"])
+def test_executor_backend_warning_preserves_selection(reconfigure, caplog, backend):
+    caplog.clear()
+    config = reconfigure(
+        lambda config: setattr(
+            config.parallel_config, "distributed_executor_backend", backend
+        )
+    )
+    assert config.parallel_config.distributed_executor_backend == backend
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == platform.logger.name
+        and "distributed executor backend" in record.getMessage()
+    ]
+    if backend in ("ray", "external_launcher"):
+        assert len(messages) == 1
+        assert "Keeping the selected" in messages[0]
+    else:
+        assert messages == []
+
+
+class TestKnownGaps:
+    """Behaviour pinned as-is because it looks unintended."""
+
+    def test_sliding_window_keeps_prefix_caching_on(self):
+        # disable_unsupported_prefix_caching runs on the optimum path only, so
+        # the vllm model path has no SWA guard. SWA instead surfaces much later
+        # as the sub-block multi-group NotImplementedError in
+        # RBLNModelRunner.initialize_kv_cache, and the workaround in use is
+        # VLLM_RBLN_SUB_BLOCK_CACHE=0.
+        config = _build(
+            enable_prefix_caching=True, hf_overrides={"sliding_window": 512}
+        )
+        assert config.model_config.hf_config.sliding_window == 512
+        assert config.cache_config.enable_prefix_caching is True
+
+
+class TestDflashTokenBudget:
+    """DFlash reserves no drafting slots, so the auto-computed budget is the
+    whole of `max_num_batched_tokens`; anything else was set explicitly, and no
+    other prefill chunk lands on a KV block boundary."""
+
+    def _mutate(self, scheduled):
+        def mutate(config: VllmConfig) -> None:
+            config.speculative_config = SimpleNamespace(method="dflash")
+            config.scheduler_config.max_num_scheduled_tokens = scheduled
+
+        return mutate
+
+    def test_the_auto_computed_budget_is_accepted(self, reconfigure, configured):
+        budget = configured.scheduler_config.max_num_batched_tokens
+        config = reconfigure(self._mutate(budget))
+        assert config.scheduler_config.max_num_scheduled_tokens == budget
+
+    @pytest.mark.parametrize("delta", [-1, -8, 1])
+    def test_any_other_budget_is_refused(self, reconfigure, configured, delta):
+        budget = configured.scheduler_config.max_num_batched_tokens
+        with pytest.raises(ValueError, match="auto-computed"):
+            reconfigure(self._mutate(budget + delta))
+
+    def test_only_dflash_is_gated(self, reconfigure, configured):
+        def mutate(config: VllmConfig) -> None:
+            config.speculative_config = SimpleNamespace(method="eagle3")
+            config.scheduler_config.max_num_scheduled_tokens = 8
+
+        assert reconfigure(mutate).scheduler_config.max_num_scheduled_tokens == 8
+
+
+# Resolving the vllm path reads the host's device now that RBLN-CA* refuses it,
+# so the chip is named here rather than inherited from whatever card ran this.
+@pytest.mark.usefixtures("cr13")
+class TestModelImpl:
+    """`--model-impl` decides the path, and the path decides the device.
+
+    The frontend only learns it after the arguments are parsed, later than the
+    module scope where RblnPlatform's device identity is first computed, so the
+    values are assigned again from the parsed config.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _restore(self):
+        before = platform.envs.model_impl_from_env()
+        yield
+        platform._apply_model_impl(before)
+
+    @pytest.mark.parametrize(
+        ("model_impl", "expected"),
+        [("vllm", ("rbln", "rbln", "rbln-ccl")), ("optimum", ("cpu", "cpu", ""))],
+    )
+    def test_the_path_moves_the_device_identity(self, model_impl, expected):
+        platform._apply_model_impl(model_impl)
+        assert (
+            RblnPlatform.device_name,
+            RblnPlatform.device_type,
+            RblnPlatform.dist_backend,
+        ) == expected
+
+    def test_the_path_picks_the_impl_module(self):
+        platform._apply_model_impl("vllm")
+        assert platform._impl().__name__.endswith("vllm_impl")
+        platform._apply_model_impl("optimum")
+        assert platform._impl().__name__.endswith("optimum_impl")
+
+    @pytest.fixture
+    def on_the_other_path(self, monkeypatch):
+        """Start where the flag has to move the platform from.
+
+        The suite exports the deprecated variable and this module resolved it at
+        import, so without this the assertions below would pass on import-time
+        state and prove nothing.
+        """
+        monkeypatch.delenv("VLLM_RBLN_USE_VLLM_MODEL", raising=False)
+        # Set, not deleted, so monkeypatch has the key recorded and can roll
+        # back what _apply_model_impl writes.
+        monkeypatch.setenv(platform.envs.RESOLVED_MODEL_IMPL_ENV, _UNTOUCHED)
+        platform._apply_model_impl("optimum")
+
+    def test_building_a_config_from_the_flag_alone_reaches_the_device(
+        self, on_the_other_path
+    ):
+        """`LLM(...)` builds its config without ever parsing a command line.
+
+        It is the entry point that skips `add_cli_args`, so a wrapper installed
+        from there would never see this call, and a run with the flag set would
+        stay on the optimum path.
+        """
+        assert RblnPlatform.device_type == "cpu"
+
+        config = _build(model_impl="vllm")
+
+        assert isinstance(config.additional_config, RBLNConfig)
+        assert RblnPlatform.device_type == "rbln"
+        assert platform.USE_DEVICE_TENSOR is True
+        assert os.environ[platform.envs.RESOLVED_MODEL_IMPL_ENV] == "vllm"
+
+    def test_auto_reads_the_model_off_the_engine_args(self, monkeypatch):
+        """The wrapper is the only place `auto` can be handed a model to read.
+
+        Resolution takes the flag and the additional_config as arguments, and
+        the model sits on the EngineArgs the wrapper is called on. This one is
+        an architecture optimum-rbln runs, and the suite runs on the vllm path.
+        """
+        monkeypatch.setattr(platform.envs, "INHERITED_MODEL_IMPL", None)
+        monkeypatch.delenv("VLLM_RBLN_USE_VLLM_MODEL", raising=False)
+        monkeypatch.setenv(platform.envs.RESOLVED_MODEL_IMPL_ENV, _UNTOUCHED)
+        platform._apply_model_impl("vllm")
+
+        config = _build()
+
+        assert isinstance(config.additional_config, OptimumRBLNConfig)
+        assert RblnPlatform.device_type == "cpu"
+
+    def test_a_built_config_passed_in_keeps_its_path(self, on_the_other_path):
+        """`LLM(additional_config=RBLNConfig(...))` hands in a resolved object.
+
+        The wrapper must read the path off it rather than overwrite it with a
+        dict, which would drop every other field the caller set. The class is
+        what states the path; nothing here says it a second time.
+        """
+        given = RBLNConfig(use_w8a8=True)
+
+        config = _build(additional_config=given)
+
+        assert config.additional_config is given
+        assert config.additional_config.use_w8a8 is True
+        assert RblnPlatform.device_type == "rbln"
+
+    def test_the_write_back_keeps_the_rest_of_additional_config(
+        self, on_the_other_path
+    ):
+        """The flag picks the path and additional_config keeps carrying options.
+
+        The two arrive separately now, so a run that sets both has to end up
+        with the path the flag named and every field the dict held.
+        """
+        config = _build(model_impl="vllm", additional_config={"use_w8a8": True})
+
+        assert isinstance(config.additional_config, RBLNConfig)
+        assert config.additional_config.use_w8a8 is True
+
+    def test_a_second_engine_does_not_take_the_first_one_s_path(self, monkeypatch):
+        """The published path is for the processes this one spawns.
+
+        Read back here it would let the first engine decide for every one after
+        it, and `LLM(...)` built with no path of its own would run on that one
+        instead of the default. Both engines are resolved in this process, which
+        is where two `LLM(...)` calls in one script build their configs.
+        """
+        from vllm.engine.arg_utils import EngineArgs
+
+        monkeypatch.setattr(EngineArgs, "create_engine_config", lambda self: None)
+        monkeypatch.setattr(
+            EngineArgs, "_rbln_model_impl_patched", False, raising=False
+        )
+        monkeypatch.setattr(platform.envs, "INHERITED_MODEL_IMPL", None)
+        monkeypatch.delenv("VLLM_RBLN_USE_VLLM_MODEL", raising=False)
+        RblnPlatform._capture_model_impl()
+
+        first = EngineArgs(model=local_model_path(_MODEL), model_impl="vllm")
+        EngineArgs.create_engine_config(first)
+        assert platform._MODEL_IMPL == "vllm"
+        assert first.max_num_batched_tokens == 512
+
+        # Left at `auto`, so the path is the model's own: optimum-rbln runs this
+        # architecture, and the first engine's answer is not consulted.
+        second = EngineArgs(model=local_model_path(_MODEL))
+        EngineArgs.create_engine_config(second)
+        assert platform._MODEL_IMPL == "optimum"
+        assert second.max_num_batched_tokens is None
+
+    def test_the_upstream_flag_picks_the_path_and_is_handed_back(self):
+        """`--model-impl` says which path runs, and upstream never sees that.
+
+        Its own meaning for the value is a different question: `transformers`
+        there is vLLM's Transformers backend, which refuses several models
+        optimum-rbln supports, and it is asked at config time. Putting the
+        default back leaves that resolution exactly as it would have been.
+        """
+        config = _build(model_impl="vllm")
+
+        assert isinstance(config.additional_config, RBLNConfig)
+        assert config.model_config.model_impl == "auto"
+
+    def test_a_ray_actor_is_told_the_path(self):
+        """Ray copies a chosen set of names, not the environment.
+
+        The leading underscore keeps the resolved path out of the VLLM_RBLN_*
+        namespace, and out of the `VLLM_` prefix Ray copies on. Without the
+        platform listing it, an actor would start on the default path and run
+        the worker against upstream nobody patched.
+        """
+        from vllm.ray.ray_env import get_env_vars_to_copy
+
+        copied = get_env_vars_to_copy(
+            additional_vars=set(RblnPlatform.additional_env_vars)
+        )
+
+        assert platform.envs.RESOLVED_MODEL_IMPL_ENV in copied
+
+    def test_a_bare_string_additional_config_is_left_to_upstream(self):
+        """`_MergeAdditionalConfig` keeps the bare string the CLI action takes,
+        and `VllmConfig`, which types the field, is what refuses it. Merging the
+        path into it first raises a TypeError from an operator instead."""
+        with pytest.raises(ValidationError, match="additional_config"):
+            _build(additional_config="something")
+
+    def test_creating_the_engine_config_publishes_the_path(self, monkeypatch):
+        """The wrapper is the only place the flag and the spawned processes meet.
+
+        It writes the path back into additional_config, so the config that
+        reaches a worker states its own path, and publishes it for the entry
+        points that run before that config arrives.
+        """
+        from vllm.engine.arg_utils import EngineArgs
+
+        seen = []
+        monkeypatch.setattr(
+            EngineArgs,
+            "create_engine_config",
+            lambda self, *a, **k: seen.append(self.additional_config),
+            raising=False,
+        )
+        monkeypatch.delattr(EngineArgs, "_rbln_model_impl_patched", raising=False)
+        monkeypatch.setenv(platform.envs.RESOLVED_MODEL_IMPL_ENV, _UNTOUCHED)
+        RblnPlatform._capture_model_impl()
+
+        EngineArgs.create_engine_config(
+            SimpleNamespace(
+                additional_config={"model_impl": "vllm"},
+                model_impl="auto",
+                max_num_batched_tokens=None,
+            )
+        )
+
+        assert seen == [{"model_impl": "vllm"}]
+        assert os.environ[platform.envs.RESOLVED_MODEL_IMPL_ENV] == "vllm"
+        assert RblnPlatform.device_type == "rbln"
+
+    def test_a_disabled_path_stops_the_config(self, monkeypatch):
+        """The wrapper resolves the path, so a disabled one fails here."""
+        from vllm.engine.arg_utils import EngineArgs
+
+        monkeypatch.setattr(
+            platform.rebel, "get_npu_name", lambda *a, **kw: "RBLN-CA25"
+        )
+        monkeypatch.setattr(
+            EngineArgs, "create_engine_config", lambda self, *a, **k: None
+        )
+        monkeypatch.delattr(EngineArgs, "_rbln_model_impl_patched", raising=False)
+        monkeypatch.setenv(platform.envs.RESOLVED_MODEL_IMPL_ENV, _UNTOUCHED)
+        RblnPlatform._capture_model_impl()
+
+        with pytest.raises(ValueError, match="RBLN-CA25"):
+            EngineArgs.create_engine_config(
+                SimpleNamespace(
+                    max_num_batched_tokens=None,
+                    additional_config=None,
+                    model_impl="vllm",
+                )
+            )
+        assert os.environ[platform.envs.RESOLVED_MODEL_IMPL_ENV] == _UNTOUCHED
+
+    def test_register_ops_applies_no_patch_before_the_path_is_resolved(self):
+        import subprocess
+        import sys
+
+        probe = (
+            "import sys;"
+            "from vllm.platforms import current_platform;"
+            "import vllm_rbln;"
+            "vllm_rbln.register_model();"
+            "vllm_rbln.register_ops();"
+            "applied = sys.modules.get('vllm_rbln.patches.registry');"
+            "print(applied and applied._applied_patch_keys)"
+        )
+        out = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env={
+                k: v
+                for k, v in os.environ.items()
+                if not k.startswith("VLLM_RBLN")
+                and k != platform.envs.RESOLVED_MODEL_IMPL_ENV
+            },
+        )
+        assert out.returncode == 0, out.stderr[-2000:]
+        assert out.stdout.strip().endswith("None"), out.stdout
+
+    def test_a_module_imported_before_resolution_reads_the_resolved_flag(self):
+        import subprocess
+        import sys
+
+        probe = (
+            "import importlib, sys;"
+            "from vllm.platforms import current_platform;"
+            "from vllm_rbln import platform;"
+            "mods = [importlib.import_module(m) for m in sorted(READERS)];"
+            "platform._apply_model_impl('vllm');"
+            "print(platform.USE_DEVICE_TENSOR,"
+            " [m.__name__ for m in mods if hasattr(m, 'USE_DEVICE_TENSOR')])"
+        ).replace("READERS", repr(_DEVICE_FLAG_READERS))
+        out = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env={
+                k: v
+                for k, v in os.environ.items()
+                if not k.startswith("VLLM_RBLN")
+                and k != platform.envs.RESOLVED_MODEL_IMPL_ENV
+            },
+        )
+        assert out.returncode == 0, out.stderr[-2000:]
+        assert out.stdout.strip().endswith("True []"), out.stdout

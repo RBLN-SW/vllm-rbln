@@ -27,32 +27,18 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from vllm.platforms import current_platform
+
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
+    from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
 
 
-# --- Step phase: prefill graph or decode graph -------------------------------
-#
-# RBLN compiles a graph per shape, so a step runs one graph or the other, never a
-# mix. Two functions answer which, because the scheduler decides the phase but
-# every PP rank has to arrive at the same answer:
-#
-#   is_prefill(request)         2 or more tokens left to compute. The definition,
-#                               on pre-advance state only the scheduler holds.
-#   step_is_prefill(sched_out)  2 or more non-draft tokens scheduled. The same
-#                               phase, from what every rank receives alike.
-#
-# They can disagree only on a prefill scheduled exactly 1 token. That does not
-# happen: with 1 token left, is_prefill() already reports decode, which is where
-# a 1-token prompt, a chunked prefill's last token, a full remote-KV match and a
-# full prefix-cache match all land -- and no clamp in schedule() cuts a chunk
-# that short. The scheduler tests pin both views together across whole runs.
-#
-# If that ever breaks, an unfinished prompt runs on the decode graph, and
-# is_intermediate_chunked_prefill falls with it since it ANDs the phase: the step
-# gets sampled and drafts get proposed with no anchor token, landing drafts on a
-# request that is still prefilling.
+# is_prefill reads the request's remaining tokens; step_is_prefill reads the
+# scheduled non-draft token count shared by all PP ranks. Encoder scheduling
+# can truncate an unfinished prompt to one token, so these views can disagree.
+# A decode step classification therefore does not imply a completed prompt.
 
 
 def is_prefill(request: Request) -> bool:
@@ -147,8 +133,9 @@ def resolve_propagated_token_write(
     ``(committed_tip, tokens)`` to write at ``token_ids_cpu[cursor:committed_tip]``,
     or ``None`` if the cursor already reached it.
 
-    Sync-scheduling only (RBLN force-disables async); async would need the
-    prev_sampled_token_ids broadcast path, not surface here.
+    Sync-scheduling only: async under PP would need the
+    prev_sampled_token_ids broadcast path instead of this payload, which is why
+    the platform refuses that combination.
     """
     committed_tip = num_computed_tokens + base
     if committed_tip <= cursor:
@@ -235,3 +222,70 @@ class DecodeBatchBudget:
     @property
     def count(self) -> int:
         return self._count
+
+
+def sub_block_size_in_use(
+    *,
+    enable_prefix_caching: bool,
+    sub_block_cache: bool,
+    block_size: int,
+    max_num_batched_tokens: int,
+    kv_cache_config: KVCacheConfig,
+    sub_block_size: int | None = None,
+) -> int | None:
+    """The sub-block size prefix caching runs at (None takes the prefill
+    chunk), or None when the scheduler stays on vLLM's manager.
+
+    Every rule on the sub-block configuration is here. A size the caller asked
+    for is honored or refused with a ValueError, never dropped on the way. The
+    derived default returns None wherever it does not fit instead, since a run
+    that never asked for sub-blocks should not fail over them.
+    """
+    # Imported here: the manager pulls in vllm.distributed.kv_events (numba).
+    from vllm_rbln.v1.core.rbln_kv_cache_manager import RBLNKVCacheManager
+
+    # RBLNConfig's `gt=0` already refused anything but a size or None.
+    wanted = sub_block_size
+    if not (sub_block_cache and enable_prefix_caching):
+        if wanted:
+            off = (
+                "enable_sub_block_cache"
+                if not sub_block_cache
+                else "enable_prefix_caching"
+            )
+            raise ValueError(
+                f"sub_block_size={wanted} asks for sub-block prefix caching and "
+                f"{off}=False turns it off."
+            )
+        return None
+
+    sub_block_size = wanted or max_num_batched_tokens
+    eligible = RBLNKVCacheManager.can_use_sub_block_caching(
+        kv_cache_config, sub_block_size
+    )
+    fits = block_size >= max_num_batched_tokens >= sub_block_size
+    if not wanted:
+        if not (eligible and fits):
+            return None
+    elif not fits:
+        raise ValueError(
+            "sub-block prefix caching needs block_size >= max_num_batched_tokens "
+            f">= sub_block_size, got {block_size} >= {max_num_batched_tokens} >= "
+            f"{sub_block_size}."
+        )
+    elif not eligible:
+        raise ValueError(
+            f"sub_block_size={sub_block_size} is not one this KV cache can hold: "
+            "every group needs a spec that stores per-token KV, and a block_size "
+            f"larger than {sub_block_size} and a multiple of it."
+        )
+    # Left until last: the equal case never asks, so a compile-only worker with
+    # no NPU to name still starts on the default setting.
+    if sub_block_size != max_num_batched_tokens and not current_platform.is_cr13():
+        raise ValueError(
+            f"sub_block_size={sub_block_size} below max_num_batched_tokens="
+            f"{max_num_batched_tokens} makes a prefill chunk span two blocks, "
+            "which needs the multi-block store that only REBEL CR13 carries; "
+            f"this is {current_platform.get_device_name()}."
+        )
+    return sub_block_size

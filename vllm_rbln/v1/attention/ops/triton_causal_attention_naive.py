@@ -100,8 +100,8 @@ def causal_attention_naive_prefill(
             base=kv_cache_base,
             shape=(2, NUM_BATCH, NUM_HEAD, 1, PARTITION_SIZE, HEAD_DIM),
             strides=(
-                2 * NUM_BATCH * NUM_HEAD * 1 * PARTITION_SIZE * HEAD_DIM,
                 NUM_BATCH * NUM_HEAD * 1 * PARTITION_SIZE * HEAD_DIM,
+                NUM_HEAD * 1 * PARTITION_SIZE * HEAD_DIM,
                 1 * PARTITION_SIZE * HEAD_DIM,
                 PARTITION_SIZE * HEAD_DIM,
                 HEAD_DIM,
@@ -115,8 +115,8 @@ def causal_attention_naive_prefill(
             base=kv_cache_base,
             shape=(2, NUM_BATCH, NUM_HEAD, 1, PARTITION_SIZE, HEAD_DIM),
             strides=(
-                2 * NUM_BATCH * NUM_HEAD * 1 * PARTITION_SIZE * HEAD_DIM,
                 NUM_BATCH * NUM_HEAD * 1 * PARTITION_SIZE * HEAD_DIM,
+                NUM_HEAD * 1 * PARTITION_SIZE * HEAD_DIM,
                 1 * PARTITION_SIZE * HEAD_DIM,
                 PARTITION_SIZE * HEAD_DIM,
                 HEAD_DIM,
@@ -274,8 +274,8 @@ def causal_attention_naive_decode(
             base=kv_cache_base,
             shape=(2, NUM_BATCH, NUM_HEAD, 1, PARTITION_SIZE, HEAD_DIM),
             strides=(
-                2 * NUM_BATCH * NUM_HEAD * 1 * PARTITION_SIZE * HEAD_DIM,
                 NUM_BATCH * NUM_HEAD * 1 * PARTITION_SIZE * HEAD_DIM,
+                NUM_HEAD * 1 * PARTITION_SIZE * HEAD_DIM,
                 1 * PARTITION_SIZE * HEAD_DIM,
                 PARTITION_SIZE * HEAD_DIM,
                 HEAD_DIM,
@@ -289,8 +289,8 @@ def causal_attention_naive_decode(
             base=kv_cache_base,
             shape=(2, NUM_BATCH, NUM_HEAD, 1, PARTITION_SIZE, HEAD_DIM),
             strides=(
-                2 * NUM_BATCH * NUM_HEAD * 1 * PARTITION_SIZE * HEAD_DIM,
                 NUM_BATCH * NUM_HEAD * 1 * PARTITION_SIZE * HEAD_DIM,
+                NUM_HEAD * 1 * PARTITION_SIZE * HEAD_DIM,
                 1 * PARTITION_SIZE * HEAD_DIM,
                 PARTITION_SIZE * HEAD_DIM,
                 HEAD_DIM,

@@ -15,13 +15,7 @@
 """Optimum smoke tests for the RSD-4 runner: decoder + multimodal.
 Run with ``pytest tests/optimum_compile/test_rsd4.py``."""
 
-import pytest
 from test_base import DecoderSmoke, MultimodalSmoke
-
-_GET_INPUT_EMBEDS_BUG = pytest.mark.xfail(
-    reason="vllm-rbln get_input_embeddings() returns None in the MM embed path",
-    strict=False,
-)
 
 
 class TestLlamaEager(DecoderSmoke.Test):

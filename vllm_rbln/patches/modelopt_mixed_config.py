@@ -1,0 +1,93 @@
+# Copyright 2025 Rebellions Inc. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at:
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import torch
+from vllm.model_executor.layers.fused_moe import RoutedExperts
+from vllm.model_executor.layers.quantization import register_quantization_config
+from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+from vllm.model_executor.layers.quantization.modelopt import (
+    LINEAR_METHOD_BUILDERS,
+    ModelOptMixedPrecisionConfig,
+)
+
+from vllm_rbln.model_executor.layers.quantization.modelopt_fp8 import (
+    RBLNModelOptFp8LinearMethod,
+)
+from vllm_rbln.model_executor.layers.quantization.modelopt_mxfp8 import (
+    RBLNModelOptMxFp8LinearMethod,
+)
+from vllm_rbln.model_executor.layers.quantization.nvfp4 import (
+    RBLNModelOptNvFp4FusedMoE,
+)
+from vllm_rbln.patches import add_registration
+
+
+class RBLNModelOptMixedPrecisionConfig(ModelOptMixedPrecisionConfig):
+    """ModelOpt MIXED_PRECISION config for RBLN."""
+
+    def get_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> QuantizeMethodBase | None:
+        if isinstance(layer, RoutedExperts):
+            quant_algo = self._resolve_quant_algo(prefix)
+            if quant_algo == "NVFP4":
+                return RBLNModelOptNvFp4FusedMoE(self.nvfp4_config, layer.moe_config)
+            if quant_algo == "W4A16_NVFP4":
+                return RBLNModelOptNvFp4FusedMoE(
+                    self.w4a16_nvfp4_config, layer.moe_config
+                )
+        return super().get_quant_method(layer, prefix)
+
+
+@add_registration(
+    reason=(
+        "Override the built-in ModelOpt MIXED_PRECISION (modelopt_mixed) config "
+        "so NVFP4 routed-expert MoE layers dequantise through the RBLN "
+        "group-dequantise custom op instead of the upstream CUDA/Marlin kernels."
+    )
+)
+def register_rbln_modelopt_mixed_config() -> None:
+    register_quantization_config("modelopt_mixed")(RBLNModelOptMixedPrecisionConfig)
+
+
+@add_registration(
+    reason=(
+        "Upstream's generic ModelOptLinearMethod requantises a fused layer's "
+        "halves to one max scale, which is lossy and needs an eager fp8 quant "
+        "this platform cannot run at load time. LINEAR_METHOD_BUILDERS is "
+        "upstream's hook for an algo whose create/process/apply lifecycle "
+        "differs; it is read by build_linear_method, which both the plain FP8 "
+        "config and the mixed-precision config dispatch through."
+    )
+)
+def register_rbln_modelopt_fp8_linear_method() -> None:
+    LINEAR_METHOD_BUILDERS["FP8"] = lambda config, prefix: RBLNModelOptFp8LinearMethod(
+        config
+    )
+
+
+@add_registration(
+    reason=(
+        "vLLM's generic MXFP8 linear method either quantizes activations too "
+        "(DeepGEMM W8A8 on CUDA) or dequantizes the weight to bf16 once at "
+        "load. RBLN keeps the e4m3 weight and e8m0 block scales as loaded and "
+        "dequantizes per 32-element group in the compiled graph (W8A16), so the "
+        "weight stays one byte on the device. LINEAR_METHOD_BUILDERS is the "
+        "hook build_linear_method reads first."
+    )
+)
+def register_rbln_modelopt_mxfp8_linear_method() -> None:
+    LINEAR_METHOD_BUILDERS["MXFP8"] = lambda config, prefix: (
+        RBLNModelOptMxFp8LinearMethod()
+    )

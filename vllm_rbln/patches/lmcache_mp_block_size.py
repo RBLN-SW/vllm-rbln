@@ -84,7 +84,9 @@ def _lmcache_mp_available() -> bool:
         )
     except Exception:  # noqa: BLE001 - absent (in-process image) or too early
         return False
-    _ORIGINAL_INITS["LMCacheMPSchedulerAdapter"] = _mp.LMCacheMPSchedulerAdapter.__init__
+    _ORIGINAL_INITS["LMCacheMPSchedulerAdapter"] = (
+        _mp.LMCacheMPSchedulerAdapter.__init__
+    )
     _ORIGINAL_INITS["LMCacheMPWorkerAdapter"] = _mp.LMCacheMPWorkerAdapter.__init__
     return True
 
@@ -98,7 +100,7 @@ def ensure_applied() -> None:
     apply_registered_patches()
 
 
-_ORIGINAL_CREATE_CONNECTOR = None
+_ORIGINAL_CREATE_CONNECTOR: Any = None
 
 # The VllmConfig the factory was handed, kept for `_redirect`.
 # `LMCacheMPConnector` does **not** pass vllm_config to its adapters --
@@ -155,14 +157,13 @@ def _kernel_block_size(vllm_config: Any) -> int | None:
     and the worker cannot disagree about whether the geometry was converted.
     """
     import vllm_rbln.envs as envs
+    from vllm_rbln.v1.core.page_layout import kernel_block_size_from_config
 
     if not envs.VLLM_RBLN_PAGE_LAYOUT:
         return None
-    additional = getattr(vllm_config, "additional_config", None)
-    kernel_block_size = additional.get("attn_block_size") if additional else None
+    kernel_block_size = kernel_block_size_from_config(vllm_config)
     if not kernel_block_size:
         return None
-    kernel_block_size = int(kernel_block_size)
     page_size = vllm_config.cache_config.block_size
     if kernel_block_size == page_size or kernel_block_size % page_size != 0:
         return None

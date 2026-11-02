@@ -1,0 +1,1925 @@
+# Copyright 2026 Rebellions Inc. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at:
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# RBLNScheduler differences from upstream schedule(): no mixed batching, prefill
+# batch of 1, capped decode batch, block-boundary spec, sub-block copy.
+
+import dataclasses
+import inspect
+from types import SimpleNamespace
+
+import pytest
+from vllm.distributed.kv_events import BlockStored, KVEventBatch
+from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.metrics.stats import PrefixCacheStats
+from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.request import RequestStatus
+
+from tests.vllm.v1.core.utils import (
+    EOS_TOKEN_ID,
+    MockKVConfig,
+    _drain,
+    advance_to_decode,
+    create_rbln_scheduler,
+    create_requests,
+    make_model_runner_output,
+    make_request,
+    prefill_request,
+)
+from vllm_rbln.v1.core.rbln_kv_cache_manager import RBLNKVCacheManager
+from vllm_rbln.v1.core.rbln_scheduler import RBLNScheduler, RBLNSchedulerOutput
+from vllm_rbln.v1.core.utils import is_prefill, step_is_prefill
+
+
+class TestSchedulerInit:
+    @pytest.mark.usefixtures("cr13")
+    def test_sub_block_caching_enabled_uses_rbln_manager(self):
+        # prefix caching + eligible config + sub_block_size -> RBLNKVCacheManager.
+        sched = create_rbln_scheduler(
+            enable_prefix_caching=True,
+            block_size=16,
+            max_num_batched_tokens=16,
+            max_model_len=8192,
+            sub_block_size=8,
+        )
+        assert isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
+
+    def test_sub_block_size_defaults_to_max_num_batched_tokens(self):
+        # enable_sub_block_cache is on by default, so with no explicit
+        # sub_block_size the scheduler uses max_num_batched_tokens.
+        sched = create_rbln_scheduler(
+            enable_prefix_caching=True,
+            block_size=1024,
+            max_num_batched_tokens=128,
+            max_model_len=2048,
+        )
+        assert isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
+        assert sched.kv_cache_manager.sub_block_size == 128
+
+    @pytest.mark.usefixtures("cr13")
+    def test_additional_config_sets_the_sub_block_size(self):
+        # RBLNConfig.sub_block_size decouples the sub-block from the chunk.
+        sched = create_rbln_scheduler(
+            enable_prefix_caching=True,
+            block_size=1024,
+            max_num_batched_tokens=128,
+            max_model_len=2048,
+            additional_config={"sub_block_size": 64},
+        )
+        assert sched.kv_cache_manager.sub_block_size == 64
+
+    def test_additional_config_turns_sub_block_caching_off(self):
+        # Eligible otherwise, so the plain manager is the option's doing.
+        sched = create_rbln_scheduler(
+            enable_prefix_caching=True,
+            block_size=1024,
+            max_num_batched_tokens=128,
+            max_model_len=2048,
+            additional_config={"enable_sub_block_cache": False},
+        )
+        assert not isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
+
+    def test_disabled_falls_back_to_base_manager(self):
+        # prefix caching off -> plain KVCacheManager.
+        sched = create_rbln_scheduler(enable_prefix_caching=False)
+        assert not isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
+
+    def test_sub_block_size_above_token_budget_is_rejected(self):
+        with pytest.raises(ValueError, match="got 512 >= 128 >= 256"):
+            create_rbln_scheduler(
+                enable_prefix_caching=True,
+                block_size=512,
+                max_num_batched_tokens=128,
+                max_model_len=128,
+                sub_block_size=256,
+            )
+
+    def test_equal_block_and_sub_block_size_is_rejected(self):
+        # sub_block_size == block_size leaves no sub-block to match, and the
+        # size was asked for, so it is refused rather than dropped.
+        with pytest.raises(ValueError, match="not one this KV cache can hold"):
+            create_rbln_scheduler(
+                enable_prefix_caching=True,
+                block_size=128,
+                max_num_batched_tokens=128,
+                max_model_len=128,
+                sub_block_size=128,
+            )
+
+
+class TestPendingRunnerBlockDeltas:
+    @staticmethod
+    def _scheduled_delta(sched, req):
+        # A real non-empty KVCacheBlocks for a scheduled request.
+        sched.add_request(req)
+        sched.schedule()
+        return sched.kv_cache_manager.get_blocks(req.request_id)
+
+    def test_add_none_or_empty_is_noop(self):
+        # None or an all-empty delta is not stored.
+        sched = create_rbln_scheduler()
+        sched._add_pending_runner_block_delta("x", None)
+        sched._add_pending_runner_block_delta(
+            "x", sched.kv_cache_manager.empty_kv_cache_blocks
+        )
+        assert "x" not in sched._pending_runner_block_deltas
+
+    def test_add_stores_nonempty_delta(self):
+        # A non-empty delta is stored under the request id.
+        sched = create_rbln_scheduler()
+        delta = self._scheduled_delta(sched, create_requests(1, num_tokens=10)[0])
+        assert any(len(g) > 0 for g in delta.get_block_ids())
+        sched._add_pending_runner_block_delta("k", delta)
+        assert "k" in sched._pending_runner_block_deltas
+
+    def test_add_accumulates_existing(self):
+        # Adding twice accumulates (prev + new).
+        sched = create_rbln_scheduler()
+        delta = self._scheduled_delta(sched, create_requests(1, num_tokens=10)[0])
+        single = sum(len(g) for g in delta.get_block_ids())
+        assert single > 0
+        sched._add_pending_runner_block_delta("k", delta)
+        sched._add_pending_runner_block_delta("k", delta)
+        stored = sched._pending_runner_block_deltas["k"]
+        assert sum(len(g) for g in stored.get_block_ids()) == 2 * single
+
+    def test_drain_attaches_to_cached_reqs_and_pops(self):
+        # drain prepends the pending delta to req_to_new_blocks and pops it.
+        sched = create_rbln_scheduler()
+        req = create_requests(1, num_tokens=10)[0]
+        delta = self._scheduled_delta(sched, req)
+        sched._add_pending_runner_block_delta(req.request_id, delta)
+        req_to_new_blocks = {
+            req.request_id: sched.kv_cache_manager.empty_kv_cache_blocks
+        }
+        sched._drain_pending_runner_block_deltas([req], req_to_new_blocks)
+        assert req.request_id not in sched._pending_runner_block_deltas
+        assert any(
+            len(g) > 0 for g in req_to_new_blocks[req.request_id].get_block_ids()
+        )
+
+
+class TestUpdateFromOutput:
+    @pytest.mark.usefixtures("cr13")
+    @pytest.mark.parametrize("async_scheduling", [False, True])
+    @pytest.mark.parametrize("async_load", [False, True])
+    def test_connector_loaded_prefix_events_survive_scheduling_ahead(
+        self, monkeypatch, async_scheduling, async_load
+    ):
+        sched = create_rbln_scheduler(
+            enable_prefix_caching=True,
+            enable_kv_cache_events=True,
+            block_size=16,
+            sub_block_size=8,
+            max_num_batched_tokens=16,
+            max_model_len=128,
+            async_scheduling=async_scheduling,
+            use_kv_connector=MockKVConfig(matched_tokens=32, is_async=async_load),
+        )
+        published: list[KVEventBatch] = []
+        monkeypatch.setattr(sched.kv_event_publisher, "publish", published.append)
+        request = make_request("remote", list(range(40)), 16)
+        request.kv_transfer_params = {"do_remote_prefill": True}
+        sched.add_request(request)
+        out = sched.schedule()
+        if async_load:
+            assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+            assert out.total_num_scheduled_tokens == 0
+            sched.update_from_output(
+                out,
+                make_model_runner_output(out, finished_recving={request.request_id}),
+            )
+            out = sched.schedule()
+        assert out.num_scheduled_tokens[request.request_id] == 8
+        if async_scheduling:
+            ahead = sched.schedule()
+            assert ahead.num_scheduled_tokens[request.request_id] > 0
+        sched.update_from_output(out, make_model_runner_output(out, 1))
+        if async_scheduling:
+            sched.update_from_output(ahead, make_model_runner_output(ahead, 2))
+        events = [e for batch in published for e in batch.events]
+        events.extend(sched.kv_cache_manager.take_events())
+        stored = [e for e in events if isinstance(e, BlockStored)]
+        assert [t for e in stored for t in e.token_ids] == list(range(40))
+
+    @pytest.mark.usefixtures("cr13")
+    def test_preempted_remote_request_reannounces_after_cache_reset(self):
+        sched = create_rbln_scheduler(
+            enable_prefix_caching=True,
+            enable_kv_cache_events=True,
+            block_size=16,
+            sub_block_size=8,
+            max_num_batched_tokens=16,
+            max_model_len=128,
+            use_kv_connector=MockKVConfig(matched_tokens=32),
+        )
+        request = make_request("remote", list(range(40)), 16)
+        request.kv_transfer_params = {"do_remote_prefill": True}
+        sched.add_request(request)
+        out = sched.schedule()
+        sched.update_from_output(out, make_model_runner_output(out, 1))
+        manager = sched.kv_cache_manager
+        initial = [e for e in manager.take_events() if isinstance(e, BlockStored)]
+        assert [t for e in initial for t in e.token_ids] == list(range(40))
+
+        sched.running.remove(request)
+        sched._preempt_request(request, 0.0)
+        assert request.status == RequestStatus.PREEMPTED
+        assert manager.reset_prefix_cache()
+        manager.take_events()
+
+        out = sched.schedule()
+        sched.update_from_output(out, make_model_runner_output(out, 2))
+
+        restored = [e for e in manager.take_events() if isinstance(e, BlockStored)]
+        assert [t for e in restored for t in e.token_ids] == list(range(40))
+        assert [h for e in restored for h in e.block_hashes] == [
+            h for e in initial for h in e.block_hashes
+        ]
+
+    def test_asserts_rbln_scheduler_output(self):
+        # A non-RBLNSchedulerOutput trips the assert on the first line.
+        sched = create_rbln_scheduler()
+        with pytest.raises(AssertionError):
+            sched.update_from_output(object(), None)
+
+    @pytest.mark.usefixtures("cr13")
+    def test_calls_do_pending_indexing_with_rbln_manager(self):
+        # With the RBLN manager, update_from_output runs sub-block indexing so
+        # the full block's sub-blocks land in the index.
+        sched = create_rbln_scheduler(
+            enable_prefix_caching=True,
+            block_size=16,
+            max_num_batched_tokens=16,
+            max_model_len=8192,
+            sub_block_size=8,
+        )
+        req = create_requests(1, num_tokens=16, block_size=16)[0]
+        sched.add_request(req)
+        out = sched.schedule()
+        sched.update_from_output(out, make_model_runner_output(out, 1))
+        idx = sched.kv_cache_manager._group_infos[0].sub_block_index
+        assert len(idx._block_hashes) > 0
+
+    def test_non_rbln_manager_skips_sub_block_steps(self):
+        # With a plain manager, update_from_output completes without touching the
+        # sub-block machinery.
+        sched = create_rbln_scheduler(enable_prefix_caching=False)
+        req = create_requests(1, num_tokens=10)[0]
+        sched.add_request(req)
+        out = sched.schedule()
+        sched.update_from_output(out, make_model_runner_output(out, 1))
+        assert not isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
+
+
+@pytest.mark.usefixtures("cr13")
+class TestSubBlockIndexAfterSpecDecodeStop:
+    # A request whose last decode step lands num_computed_tokens on a block
+    # boundary frees its last block without the synthetic hash, while the index
+    # still lists the sub-blocks recorded during decode.
+    _BS = 16
+    _SUB = 4
+    _PROMPT = list(range(1000, 1024))  # one full block and 8 tokens
+    _PROBE = list(range(2000, 2009))  # two sub-blocks and one token
+    _FILLER = list(range(4000, 4009))
+
+    def _scheduler(self):
+        return create_rbln_scheduler(
+            enable_prefix_caching=True,
+            block_size=self._BS,
+            max_num_batched_tokens=self._BS,
+            sub_block_size=self._SUB,
+            max_model_len=128,
+            num_blocks=20,
+            num_speculative_tokens=3,
+        )
+
+    @staticmethod
+    def _step(sched, sampled=None, spec=None):
+        for req_id, ids in (spec or {}).items():
+            sched.requests[req_id].spec_token_ids = list(ids)
+        out = sched.schedule()
+        req_ids = list(out.num_scheduled_tokens)
+        sched.update_from_output(
+            out,
+            ModelRunnerOutput(
+                req_ids=req_ids,
+                req_id_to_index={r: i for i, r in enumerate(req_ids)},
+                sampled_token_ids=[list((sampled or {}).get(r, [])) for r in req_ids],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+        return out
+
+    def _run_long_request(self, sched, *, last_step_spec):
+        # Prefill in two chunks, then one decode step with 3 drafts all accepted
+        # (computed 28, 3 sub-blocks of block 1 indexed), then the last step.
+        req = make_request("long", self._PROMPT, self._BS, max_tokens=6)
+        sched.add_request(req)
+        self._step(sched)
+        self._step(sched, sampled={"long": [7]})
+        self._step(sched, sampled={"long": [7] * 4}, spec={"long": [7] * 3})
+        block1 = sched.kv_cache_manager.coordinator.get_blocks("long")[0][1]
+        n = len(last_step_spec)
+        self._step(
+            sched, sampled={"long": [7] * (n + 1)}, spec={"long": last_step_spec}
+        )
+        assert req.is_finished()
+        return req, block1
+
+    def _run_probe(self, sched, req_id, tokens=None):
+        tokens = self._PROBE if tokens is None else tokens
+        sched.add_request(make_request(req_id, tokens, self._BS, max_tokens=1))
+        out = self._step(sched, sampled={req_id: [7]})
+        return out.scheduled_new_reqs[0].block_ids[0][0]
+
+    def test_reusing_a_hashless_block_removes_its_sub_block_index(self):
+        sched = self._scheduler()
+        req, block1 = self._run_long_request(sched, last_step_spec=[7] * 3)
+        # max_tokens stopped the request after one of the four sampled tokens,
+        # but num_computed_tokens kept all four.
+        assert req.num_computed_tokens == 32 > req.num_tokens - 1
+        manager = sched.kv_cache_manager
+        idx = manager._group_infos[0].sub_block_index
+        assert block1.block_hash is None
+        assert idx.contains(block1.block_id)
+        pool = manager.block_pool
+        reused = pool.get_new_blocks(pool.get_num_free_blocks())
+        assert block1 in reused
+        assert not idx.contains(block1.block_id)
+        pool.free_blocks(reused)
+
+    def test_probe_after_the_long_request_matches(self):
+        sched = self._scheduler()
+        self._run_long_request(sched, last_step_spec=[7] * 3)
+        # The block past the boundary went back to the queue head after block 1.
+        self._run_probe(sched, "filler", self._FILLER)
+        self._run_probe(sched, "probe")
+        repeat = make_request("repeat", self._PROBE, self._BS, max_tokens=1)
+        match = sched.kv_cache_manager.get_computed_blocks_sub_block(repeat, 0)
+        assert match is not None and match.num_tokens == 2 * self._SUB
+        sched.kv_cache_manager.release_sub_block_match(match)
+
+    def test_old_prefix_does_not_match_a_block_overwritten_by_the_probe(self):
+        sched = self._scheduler()
+        self._run_long_request(sched, last_step_spec=[7] * 3)
+        self._run_probe(sched, "filler", self._FILLER)
+        probe_block = self._run_probe(sched, "probe")
+        query = make_request("old", self._PROMPT[: 16 + 12] + [3000] * 4, self._BS)
+        m = sched.kv_cache_manager
+        _, num_computed, _ = m.get_computed_blocks(query)
+        match = m.get_computed_blocks_sub_block(query, num_computed)
+        if match is not None:
+            src = match.group_matches[0].src_block.block_id
+            m.release_sub_block_match(match)
+            assert src != probe_block, "matched KV the probe overwrote"
+
+    def test_without_overshoot_the_probe_matches(self):
+        # Control: the last step schedules no drafts, so num_computed_tokens stops
+        # inside block 1 and free gives it the synthetic hash.
+        sched = self._scheduler()
+        req, _ = self._run_long_request(sched, last_step_spec=[])
+        assert req.num_computed_tokens == req.num_tokens - 1
+        self._run_probe(sched, "filler", self._FILLER)
+        self._run_probe(sched, "probe")
+        repeat = make_request("repeat", self._PROBE, self._BS, max_tokens=1)
+        match = sched.kv_cache_manager.get_computed_blocks_sub_block(repeat, 0)
+        assert match is not None and match.num_tokens == 2 * self._SUB
+        sched.kv_cache_manager.release_sub_block_match(match)
+
+
+@pytest.mark.usefixtures("cr13")
+class TestTrySubBlockMatch:
+    @staticmethod
+    def _seeded_scheduler():
+        # RBLN manager seeded (via its own prefill flow) with a cached block
+        # whose first sub-block a query request will share.
+        sched = create_rbln_scheduler(
+            enable_prefix_caching=True,
+            block_size=16,
+            sub_block_size=8,
+            max_num_batched_tokens=16,
+            max_model_len=128,
+        )
+        m = sched.kv_cache_manager
+        seed = make_request("seed", list(range(16)), 16)
+        prefill_request(m, seed)
+        m.free(seed)
+        return sched
+
+    def test_no_rbln_manager_returns_none(self):
+        sched = create_rbln_scheduler(enable_prefix_caching=False)
+        req = create_requests(1)[0]
+        assert sched._try_sub_block_match(req, 0, 0) == (None, 0)
+
+    def test_match_wins_on_ge_connector_tokens(self):
+        # match.num_tokens >= external -> match wins (ties favor local copy).
+        sched = self._seeded_scheduler()
+        query = make_request("q", list(range(8)) + [100] * 16, 16)
+        _, local, _ = sched.kv_cache_manager.get_computed_blocks(query)
+        match, n = sched._try_sub_block_match(query, local, 8)
+        assert match is not None
+        assert n == 8
+        sched.kv_cache_manager.release_sub_block_match(match)
+
+    def test_connector_better_releases_and_returns_none(self):
+        # external > match -> the match is released and (None, 0) returned.
+        sched = self._seeded_scheduler()
+        query = make_request("q", list(range(8)) + [100] * 16, 16)
+        _, local, _ = sched.kv_cache_manager.get_computed_blocks(query)
+        assert sched._try_sub_block_match(query, local, 12) == (None, 0)
+
+    def test_no_match_returns_none(self):
+        # No sub-block match at all -> (None, 0).
+        sched = self._seeded_scheduler()
+        query = make_request("q", [500] * 16, 16)
+        _, local, _ = sched.kv_cache_manager.get_computed_blocks(query)
+        assert sched._try_sub_block_match(query, local, 0) == (None, 0)
+
+
+class TestIsPrefill:
+    def test_is_prefill_boundary(self):
+        # num_computed < num_tokens - 1 is prefill; the last-token point is not.
+        req = create_requests(1, num_tokens=10)[0]
+        req.num_computed_tokens = 5
+        assert is_prefill(req)
+        req.num_computed_tokens = req.num_tokens - 1
+        assert not is_prefill(req)
+
+
+class TestScheduleBasic:
+    @pytest.mark.parametrize("policy", ["fcfs", "priority"])
+    def test_kv_holder_runs_before_blockless_request_under_kv_pressure(self, policy):
+        sched = create_rbln_scheduler(
+            policy=policy,
+            num_blocks=6,
+            block_size=64,
+            max_num_batched_tokens=64,
+            max_model_len=512,
+            use_kv_connector=MockKVConfig(matched_tokens=192, is_async=True),
+        )
+        local = create_requests(
+            1,
+            req_ids=["local"],
+            num_tokens=256,
+            block_size=64,
+            max_tokens=1,
+            priority=0,
+        )[0]
+        remote = create_requests(
+            1,
+            req_ids=["remote"],
+            num_tokens=192,
+            block_size=64,
+            max_tokens=1,
+            priority=10,
+        )[0]
+        local.status = RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR
+        remote.kv_transfer_params = {"do_remote_prefill": True}
+        sched.add_request(local)
+        sched.add_request(remote)
+
+        output = sched.schedule()
+        assert output.total_num_scheduled_tokens == 0
+        assert list(sched.waiting) == [local]
+        assert list(sched.kv_holding_waiting) == [remote]
+        assert sched.deferred_waiting == {local, remote}
+        pool = sched.kv_cache_manager.block_pool
+        assert pool.get_num_free_blocks() < 4
+
+        local.status = RequestStatus.WAITING
+        sched.update_from_output(
+            output, make_model_runner_output(output, finished_recving={"remote"})
+        )
+        output = sched.schedule()
+        assert output.num_scheduled_tokens == {"remote": 1}
+        assert remote not in sched.deferred_waiting
+        sched.update_from_output(output, make_model_runner_output(output, 1))
+
+        output = sched.schedule()
+        assert output.num_scheduled_tokens == {"local": 64}
+        assert not sched.deferred_waiting
+        sched.update_from_output(output, make_model_runner_output(output, 1))
+        _drain(sched)
+        assert sched.get_num_unfinished_requests() == 0
+        assert pool.get_num_free_blocks() == 5
+
+    @pytest.mark.parametrize("receive_complete", [False, True])
+    def test_aborting_deferred_remote_load_cleans_up_queues(self, receive_complete):
+        sched = create_rbln_scheduler(
+            use_kv_connector=MockKVConfig(matched_tokens=16, is_async=True)
+        )
+        request = create_requests(1, num_tokens=16)[0]
+        request.kv_transfer_params = {"do_remote_prefill": True}
+        sched.add_request(request)
+        output = sched.schedule()
+        assert request in sched.kv_holding_waiting
+        assert request in sched.deferred_waiting
+        if receive_complete:
+            sched.update_from_output(
+                output,
+                make_model_runner_output(output, finished_recving={request.request_id}),
+            )
+
+        sched.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+
+        assert not sched.kv_holding_waiting
+        assert not sched.deferred_waiting
+        assert sched.get_request_counts() == (0, 0)
+        stats = sched.make_stats()
+        assert stats.num_skipped_waiting_reqs == 0
+
+    def test_pending_kv_lookup_stays_in_blockless_waiting_queue(self, monkeypatch):
+        sched = create_rbln_scheduler(use_kv_connector=MockKVConfig())
+        request = create_requests(1)[0]
+        sched.add_request(request)
+        monkeypatch.setattr(
+            sched.connector, "get_num_new_matched_tokens", lambda *args: (None, False)
+        )
+
+        assert sched.schedule().total_num_scheduled_tokens == 0
+        assert list(sched.waiting) == [request]
+        assert not sched.kv_holding_waiting
+        stats = sched.make_stats()
+        assert stats.num_waiting_reqs == 0
+        assert stats.num_skipped_waiting_reqs == 1
+
+        monkeypatch.setattr(
+            sched.connector, "get_num_new_matched_tokens", lambda *args: (0, False)
+        )
+        assert sched.schedule().num_scheduled_tokens == {request.request_id: 10}
+        assert not sched.deferred_waiting
+
+    @pytest.mark.usefixtures("cr13")
+    @pytest.mark.parametrize("sub_block", [False, True])
+    @pytest.mark.parametrize("preempted", [False, True])
+    def test_prefix_cache_stats_recorded_once_at_admission(
+        self, monkeypatch, sub_block, preempted
+    ):
+        sched = create_rbln_scheduler(
+            enable_prefix_caching=True,
+            block_size=16,
+            max_num_batched_tokens=16,
+            max_model_len=128,
+            sub_block_size=8 if sub_block else None,
+            additional_config={"enable_sub_block_cache": sub_block},
+        )
+        seed = make_request("seed", list(range(32)), 16, max_tokens=1)
+        sched.add_request(seed)
+        out = sched.schedule()
+        sched.update_from_output(out, make_model_runner_output(out))
+        out = sched.schedule()
+        sched.update_from_output(out, make_model_runner_output(out, 1))
+        assert seed.is_finished()
+        manager = sched.kv_cache_manager
+        manager.make_prefix_cache_stats()
+
+        query = make_request("query", list(range(24)) + [100] * 16, 16)
+        if preempted:
+            query.status = RequestStatus.PREEMPTED
+            query.num_preemptions = 1
+        sched.add_request(query)
+        with monkeypatch.context() as patch:
+            patch.setattr(manager, "allocate_slots", lambda *args, **kwargs: None)
+            assert not sched.schedule().num_scheduled_tokens
+            assert manager.make_prefix_cache_stats() == PrefixCacheStats()
+
+        out = sched.schedule()
+        assert query.request_id in out.num_scheduled_tokens
+        hits = 24 if sub_block else 16
+        if preempted:
+            expected = PrefixCacheStats(
+                preempted_requests=1,
+                preempted_queries=query.num_tokens,
+                preempted_hits=hits,
+            )
+        else:
+            expected = PrefixCacheStats(requests=1, queries=query.num_tokens, hits=hits)
+        assert manager.make_prefix_cache_stats() == expected
+
+    def test_admits_and_counts_tokens(self):
+        # add -> schedule returns RBLNSchedulerOutput scheduling one prefill with
+        # the exact prompt length (also smokes the ported schedule() on 0.22.0).
+        sched = create_rbln_scheduler()
+        reqs = create_requests(3, num_tokens=10)
+        for r in reqs:
+            sched.add_request(r)
+        out = sched.schedule()
+        assert isinstance(out, RBLNSchedulerOutput)
+        assert len(out.scheduled_new_reqs) == 1
+        _, n = next(iter(out.num_scheduled_tokens.items()))
+        assert n == 10
+
+    def test_waiting_running_transition(self):
+        # The scheduled request moves to running; the rest stay waiting.
+        sched = create_rbln_scheduler()
+        for r in create_requests(3, num_tokens=10):
+            sched.add_request(r)
+        sched.schedule()
+        assert len(sched.running) == 1
+        assert len(sched.waiting) == 2
+
+    def test_chunked_prefill_across_steps(self):
+        # A prompt longer than max_num_batched_tokens is chunked across steps.
+        sched = create_rbln_scheduler(max_num_batched_tokens=256, block_size=256)
+        req = create_requests(1, num_tokens=500)[0]
+        sched.add_request(req)
+        out = sched.schedule()
+        assert out.num_scheduled_tokens[req.request_id] == 256
+        sched.update_from_output(out, make_model_runner_output(out))
+        out = sched.schedule()
+        assert out.num_scheduled_tokens[req.request_id] == 244
+        sched.update_from_output(out, make_model_runner_output(out, 0))
+        out = sched.schedule()
+        assert out.num_scheduled_tokens[req.request_id] == 1
+
+
+class TestSchedulePrefillBatchLimit:
+    def test_only_one_prefill_per_step(self):
+        # RBLN difference: at most one prefill scheduled per step.
+        sched = create_rbln_scheduler()
+        for r in create_requests(5, num_tokens=10):
+            sched.add_request(r)
+        out = sched.schedule()
+        assert len(out.scheduled_new_reqs) == 1
+        assert len(out.num_scheduled_tokens) == 1
+
+
+class TestScheduleNoMixedBatching:
+    def test_prefill_evicts_running_decode(self):
+        # RBLN difference: a new prefill evicts running decodes (no mixing).
+        sched = create_rbln_scheduler(
+            max_num_batched_tokens=128, block_size=128, num_blocks=10000
+        )
+        req_a = create_requests(1, num_tokens=64, req_ids=["A"])[0]
+        advance_to_decode(sched, req_a)
+        req_b = create_requests(1, num_tokens=64, req_ids=["B"])[0]
+        sched.add_request(req_b)
+        out = sched.schedule()
+        assert len(out.scheduled_new_reqs) == 1
+        assert req_a.request_id not in out.num_scheduled_tokens
+        assert req_b.request_id in out.num_scheduled_tokens
+
+    def test_decode_back_from_eviction_ships_no_token_copy(self):
+        # The evicted decode returns outside prev_step_scheduled_req_ids, where
+        # upstream attaches all of its tokens; the RBLN runner never reads them.
+        sched = create_rbln_scheduler(
+            max_num_batched_tokens=128, block_size=128, num_blocks=10000
+        )
+        req_a = create_requests(1, num_tokens=64, req_ids=["A"])[0]
+        advance_to_decode(sched, req_a)
+        req_b = create_requests(1, num_tokens=64, req_ids=["B"])[0]
+        sched.add_request(req_b)
+        out = sched.schedule()
+        sched.update_from_output(out, make_model_runner_output(out, 1))
+        out = sched.schedule()
+        assert req_a.request_id in out.scheduled_cached_reqs.req_ids
+        assert out.scheduled_cached_reqs.all_token_ids == {}
+
+
+class TestScheduleDecodeBatchLimit:
+    def test_decode_batch_capped_by_pipeline_parallel(self):
+        # Per-step decode batch is capped at max_num_seqs // pp_size, and the
+        # shared budget also gates waiting-loop admissions. With max_num_seqs=4,
+        # pp=2 (cap 2), advancing 4 requests one step at a time: the 4th's prefill
+        # is held while two decodes saturate the step, so running settles at 3.
+        sched = create_rbln_scheduler(
+            max_num_seqs=4,
+            pipeline_parallel_size=2,
+            block_size=16,
+            num_blocks=10000,
+        )
+        for r in create_requests(4, num_tokens=10, req_ids=["A", "B", "C", "D"]):
+            advance_to_decode(sched, r)
+        assert len(sched.running) == 3
+        out = sched.schedule()
+        # cap = max_num_seqs // pp = 2.
+        assert len(out.num_scheduled_tokens) == 2
+
+    def test_prefill_held_by_cap_is_not_starved(self):
+        # A prefill held behind a saturated decode cap still enters within a
+        # bounded number of steps: the gate holds it for a step, not forever,
+        # because running decodes drain and free slots.
+        sched = create_rbln_scheduler(
+            max_num_seqs=4,
+            pipeline_parallel_size=2,
+            block_size=16,
+            num_blocks=10000,
+        )
+        # Saturate the per-step decode cap (max_num_seqs // pp = 2).
+        for r in create_requests(2, num_tokens=10, req_ids=["A", "B"]):
+            advance_to_decode(sched, r)
+        # A fresh prefill arrives while the cap is saturated.
+        sched.add_request(create_requests(1, num_tokens=10, req_ids=["C"])[0])
+
+        scheduled = set()
+
+        def check(out):
+            # Never mixed and never over the cap.
+            assert len(out.num_scheduled_tokens) <= 2
+            scheduled.update(out.num_scheduled_tokens)
+
+        _drain(sched, per_step=check)
+        # The held prefill was admitted and every request drained to completion.
+        assert "C" in scheduled
+        assert not sched.requests
+
+
+class TestSchedulePrefillAllocation:
+    def test_prefill_not_scheduled_when_full_prompt_cannot_fit(self):
+        # KV is reserved for the whole prompt: 500 tokens need 4 blocks and only
+        # 3 are usable, so nothing is scheduled even though one chunk would fit.
+        sched = create_rbln_scheduler(
+            max_num_batched_tokens=128, block_size=128, num_blocks=4
+        )
+        req = create_requests(1, num_tokens=500, block_size=128)[0]
+        sched.add_request(req)
+        out = sched.schedule()
+        assert req.request_id not in out.num_scheduled_tokens
+        # With ample blocks the same request schedules its first full chunk.
+        sched2 = create_rbln_scheduler(
+            max_num_batched_tokens=128, block_size=128, num_blocks=10000
+        )
+        req2 = create_requests(1, num_tokens=500, block_size=128)[0]
+        sched2.add_request(req2)
+        out2 = sched2.schedule()
+        assert out2.num_scheduled_tokens[req2.request_id] == 128
+
+    def test_new_prefill_uses_full_budget_when_decode_running(self):
+        # The new prefill evicts the running decode and recovers the full budget,
+        # so its first chunk is max_num_batched_tokens, not budget-minus-decode.
+        max_num_batched_tokens = 128
+        sched = create_rbln_scheduler(
+            max_num_batched_tokens=max_num_batched_tokens,
+            max_num_seqs=4,
+            block_size=128,
+            num_blocks=10000,
+        )
+        req_a = create_requests(1, num_tokens=64, req_ids=["A"])[0]
+        advance_to_decode(sched, req_a)
+        req_b = create_requests(1, num_tokens=500, req_ids=["B"])[0]
+        sched.add_request(req_b)
+        out = sched.schedule()
+        assert req_a.request_id not in out.num_scheduled_tokens
+        assert out.num_scheduled_tokens[req_b.request_id] == max_num_batched_tokens
+
+    def test_partial_block_is_cached_once_decode_fills_it(self):
+        # A prompt that stops mid-block leaves it uncached until decode supplies
+        # the missing token.
+        sched = create_rbln_scheduler(
+            block_size=16,
+            max_num_batched_tokens=16,
+            max_model_len=64,
+            enable_prefix_caching=True,
+            num_blocks=100,
+        )
+        req = make_request("a", list(range(15)), 16, max_tokens=2)
+        sched.add_request(req)
+        out = sched.schedule()
+
+        block = sched.kv_cache_manager.get_blocks("a").blocks[0][0]
+        assert block.block_hash is None
+
+        sched.update_from_output(out, make_model_runner_output(out, 0))
+        sched.schedule()
+
+        assert block.block_hash is not None
+
+
+class TestScheduleSpecDecodeCap:
+    _BS = 1024
+    _NUM_BLOCKS = 100
+    _MAX_NUM_SEQS = 10
+
+    def _scheduler(self, **kwargs):
+        return create_rbln_scheduler(
+            block_size=self._BS,
+            max_num_batched_tokens=self._BS,
+            num_blocks=self._NUM_BLOCKS,
+            max_num_seqs=self._MAX_NUM_SEQS,
+            num_speculative_tokens=4,
+            **kwargs,
+        )
+
+    def _request(self, num_tokens, req_id):
+        return create_requests(
+            1,
+            num_tokens=num_tokens,
+            block_size=self._BS,
+            max_tokens=2048,
+            req_ids=[req_id],
+        )[0]
+
+    def test_spec_at_block_boundary_keeps_full_spec(self):
+        # prompt == block_size -> remaining_in_block == block_size; the 4 spec
+        # tokens fit so num_scheduled == 1 (decode) + 4 (spec).
+        sched = self._scheduler()
+        req = self._request(1024, "A")
+        advance_to_decode(sched, req)
+        req.spec_token_ids = [1] * 4
+        out = sched.schedule()
+        rid = req.request_id
+        assert out.num_scheduled_tokens[rid] == 5
+        assert len(out.scheduled_spec_decode_tokens[rid]) == 4
+
+    def test_spec_kept_when_crossing_block_boundary(self):
+        sched = self._scheduler()
+        req = self._request(1020, "A")
+        advance_to_decode(sched, req)
+        req.spec_token_ids = [1] * 4
+        out = sched.schedule()
+        rid = req.request_id
+        assert out.num_scheduled_tokens[rid] == 5
+        assert len(out.scheduled_spec_decode_tokens[rid]) == 4
+
+    def test_no_spec_tokens_schedules_one_token(self):
+        sched = self._scheduler()
+        req_a = self._request(1024, "A")
+        req_b = self._request(1023, "B")
+        advance_to_decode(sched, req_a)
+        advance_to_decode(sched, req_b)
+        out = sched.schedule()
+        assert out.num_scheduled_tokens[req_a.request_id] == 1
+        assert out.num_scheduled_tokens[req_b.request_id] == 1
+        assert out.scheduled_spec_decode_tokens == {}
+
+
+class TestFixedWindowReservation:
+    _BS = 16
+    _NUM_SPEC = 4
+
+    def test_the_window_fits_the_blocks_the_scheduler_reserved(self):
+        sched = create_rbln_scheduler(
+            num_speculative_tokens=self._NUM_SPEC,
+            block_size=self._BS,
+            num_blocks=256,
+            max_num_seqs=8,
+        )
+        assert sched.vllm_config.speculative_config.method == "ngram"
+        req = create_requests(
+            1, num_tokens=13, block_size=self._BS, max_tokens=64, req_ids=["R"]
+        )[0]
+        advance_to_decode(sched, req)
+        # Fewer drafts than the window, so the runner pads the rest behind them.
+        req.spec_token_ids = [1, 2]
+        sched.schedule()
+
+        blocks = sched.kv_cache_manager.coordinator.get_blocks(req.request_id)[0]
+        last_position = req.num_computed_tokens + self._NUM_SPEC
+        assert last_position // self._BS < len(blocks)
+
+
+class TestBlockBoundaryJoin:
+    _BS = 32
+    _NUM_SPEC = 4
+
+    def _scheduler(self):
+        return create_rbln_scheduler(
+            num_speculative_tokens=self._NUM_SPEC,
+            block_size=self._BS,
+            max_num_batched_tokens=self._BS,
+            num_blocks=256,
+            max_num_seqs=8,
+            enable_prefix_caching=True,
+        )
+
+    def _decode_ready_at_boundary(self, sched, seed_id, req_id):
+        # prompt = block_size + 1 with the first block prefix-matched, so the
+        # request joins decode-ready right at the boundary.
+        seed, req = create_requests(
+            2,
+            num_tokens=self._BS + 1,
+            block_size=self._BS,
+            max_tokens=64,
+            same_prompt=True,
+            req_ids=[seed_id, req_id],
+        )
+        sched.add_request(seed)
+        out = sched.schedule()
+        sched.update_from_output(out, make_model_runner_output(out))
+        sched.add_request(req)
+        return req
+
+    def test_peer_at_a_block_boundary_keeps_the_batch_on_spec(self):
+        sched = self._scheduler()
+
+        # A running decode that, on its own, keeps full spec.
+        running = create_requests(
+            1, num_tokens=20, block_size=self._BS, max_tokens=64, req_ids=["R"]
+        )[0]
+        advance_to_decode(sched, running)
+        running.spec_token_ids = [1, 2, 3, 4]
+        out = sched.schedule()
+        assert out.num_scheduled_tokens["R"] == 1 + self._NUM_SPEC
+        assert out.scheduled_spec_decode_tokens["R"] == [1, 2, 3, 4]
+        sched.update_from_output(out, make_model_runner_output(out, 1))
+
+        self._decode_ready_at_boundary(sched, "seed", "A")
+        running.spec_token_ids = [1, 2, 3, 4]
+        out = sched.schedule()
+
+        assert out.num_scheduled_tokens["R"] == 1 + self._NUM_SPEC
+        assert out.scheduled_spec_decode_tokens["R"] == [1, 2, 3, 4]
+        assert out.num_scheduled_tokens["A"] == 1
+
+
+class TestStrandedBlockDelta:
+    # A block allocated exactly on the prefill->decode transition and then evicted
+    # by the no-mixed-batching path is stashed and re-emitted on resume.
+    @staticmethod
+    def _stash_evicted_block():
+        block_size = 16
+        sched = create_rbln_scheduler(
+            max_num_batched_tokens=16,
+            max_num_seqs=4,
+            block_size=block_size,
+            num_blocks=10000,
+        )
+        req_a = create_requests(
+            1, num_tokens=block_size, block_size=block_size, req_ids=["A"]
+        )[0]
+        sched.add_request(req_a)
+        out1 = sched.schedule()
+        assert out1.num_scheduled_tokens[req_a.request_id] == block_size
+        sched.update_from_output(out1, make_model_runner_output(out1, 1))
+        assert req_a.num_computed_tokens == block_size
+        req_b = create_requests(
+            1, num_tokens=block_size, block_size=block_size, req_ids=["B"]
+        )[0]
+        sched.add_request(req_b)
+        out2 = sched.schedule()
+        assert req_a.request_id not in out2.num_scheduled_tokens
+        assert req_b.request_id in out2.num_scheduled_tokens
+        assert req_a.request_id in sched._pending_runner_block_deltas
+        return sched, req_a, out2
+
+    def test_delta_reemitted_when_req_dropped_then_resumed(self):
+        sched, req_a, out2 = self._stash_evicted_block()
+        stashed = sched._pending_runner_block_deltas[req_a.request_id].get_block_ids()
+        assert any(len(g) > 0 for g in stashed)
+        sched.update_from_output(out2, make_model_runner_output(out2, 1))
+        out3 = sched.schedule()
+        assert req_a.request_id in out3.num_scheduled_tokens
+        cached = out3.scheduled_cached_reqs
+        reemitted = cached.new_block_ids[cached.req_ids.index(req_a.request_id)]
+        assert reemitted is not None
+        assert any(len(g) > 0 for g in reemitted)
+        assert req_a.request_id not in sched._pending_runner_block_deltas
+        flat_reemitted = [b for g in reemitted for b in g]
+        flat_stashed = [b for g in stashed for b in g]
+        assert flat_stashed
+        assert all(b in flat_reemitted for b in flat_stashed)
+
+    def test_cleaned_up_on_finish(self):
+        # A stashed delta is dropped if the request finishes before rescheduling.
+        sched, req_a, _ = self._stash_evicted_block()
+        sched.finish_requests(req_a.request_id, RequestStatus.FINISHED_ABORTED)
+        assert req_a.request_id not in sched._pending_runner_block_deltas
+
+    def test_cleaned_up_on_preempt(self):
+        # A stashed delta is dropped when the request is preempted (its blocks,
+        # including the stashed one, are freed).
+        sched, req_a, _ = self._stash_evicted_block()
+        assert req_a in sched.running
+        sched.running.remove(req_a)
+        sched._preempt_request(req_a, 0.0)
+        assert req_a.status == RequestStatus.PREEMPTED
+        assert req_a.request_id not in sched._pending_runner_block_deltas
+
+
+class TestAsyncMaxTokensSkip:
+    """The placeholder-aware max_tokens check in schedule().
+
+    Async counts tokens that have not arrived yet, so the step that reaches
+    max_tokens is in flight when the next one is being scheduled. Without the
+    check the request gets a step it does not need; with it too eager, the
+    request stops one token short. num_output_placeholders is zero under sync
+    scheduling, so the whole branch was unreachable before async landed.
+
+    Sync is the control: it decides from tokens it already has, and its step
+    count is what async has to match.
+    """
+
+    @staticmethod
+    def _drain_async(sched, token=7, max_steps=50):
+        """One output in flight, the way the engine's batch queue drives async:
+        schedule() runs a step ahead of the update_from_output() for the step
+        before it. That lag is what leaves num_output_placeholders above zero,
+        so the serial _drain never reaches the branch under test."""
+        steps = 0
+        pending = None
+        while True:
+            out = sched.schedule()
+            scheduled = bool(out.num_scheduled_tokens)
+            if scheduled:
+                steps += 1
+            if pending is not None:
+                sched.update_from_output(*pending)
+            pending = (out, make_model_runner_output(out, token)) if scheduled else None
+            if pending is None:
+                return steps
+            assert steps < max_steps, "run did not converge"
+
+    @classmethod
+    def _run(cls, async_scheduling, max_tokens):
+        sched = create_rbln_scheduler(async_scheduling=async_scheduling)
+        req = create_requests(1, num_tokens=8, max_tokens=max_tokens)[0]
+        sched.add_request(req)
+        if async_scheduling:
+            return cls._drain_async(sched), req
+        return _drain(sched, token=7), req
+
+    @pytest.mark.parametrize("max_tokens", [1, 2, 3, 4, 5])
+    def test_async_takes_the_same_steps_as_sync(self, max_tokens):
+        sync_steps, _ = self._run(False, max_tokens)
+        async_steps, _ = self._run(True, max_tokens)
+        assert async_steps == sync_steps
+
+    @pytest.mark.parametrize("max_tokens", [1, 2, 3, 4, 5])
+    def test_async_still_generates_every_token(self, max_tokens):
+        _, req = self._run(True, max_tokens)
+        assert len(req.output_token_ids) == max_tokens
+
+    @classmethod
+    def _run_batch(cls, async_scheduling, plan):
+        sched = create_rbln_scheduler(async_scheduling=async_scheduling)
+        reqs = []
+        for req_id, num_tokens, max_tokens in plan:
+            req = create_requests(
+                1, num_tokens=num_tokens, max_tokens=max_tokens, req_ids=[req_id]
+            )[0]
+            sched.add_request(req)
+            reqs.append(req)
+        if async_scheduling:
+            return cls._drain_async(sched), reqs
+        return _drain(sched, token=7), reqs
+
+    def test_a_mixed_batch_stops_each_request_at_its_own_max_tokens(self):
+        # The skip advances req_index rather than dropping the request, so the
+        # ones sitting after it in self.running still have to get their steps.
+        plan = [("a", 8, 1), ("b", 9, 3), ("c", 10, 5)]
+        sync_steps, sync_reqs = self._run_batch(False, plan)
+        async_steps, async_reqs = self._run_batch(True, plan)
+        assert async_steps == sync_steps
+        assert [len(r.output_token_ids) for r in sync_reqs] == [1, 3, 5]
+        assert [len(r.output_token_ids) for r in async_reqs] == [1, 3, 5]
+
+    def test_the_branch_is_actually_reached(self):
+        # Without placeholders above zero the two assertions above would pass
+        # against a branch that never ran.
+        sched = create_rbln_scheduler(async_scheduling=True)
+        req = create_requests(1, num_tokens=8, max_tokens=4)[0]
+        sched.add_request(req)
+        out = sched.schedule()
+        sched.schedule()  # the engine schedules ahead before the output lands
+        assert req.num_output_placeholders > 0
+        sched.update_from_output(out, make_model_runner_output(out, 7))
+
+
+class TestStopping:
+    def test_eos_stops_request(self):
+        # An EOS sample finishes the request and removes it from running.
+        sched = create_rbln_scheduler()
+        req = create_requests(1, num_tokens=10, max_tokens=20)[0]
+        sched.add_request(req)
+        out = sched.schedule()
+        sched.update_from_output(out, make_model_runner_output(out, EOS_TOKEN_ID))
+        assert req.is_finished()
+        assert req not in sched.running
+
+    def test_max_tokens_stops_request(self):
+        # Reaching max_tokens finishes the request.
+        sched = create_rbln_scheduler()
+        req = create_requests(1, num_tokens=10, max_tokens=1, ignore_eos=True)[0]
+        sched.add_request(req)
+        for _ in range(10):
+            out = sched.schedule()
+            if not out.num_scheduled_tokens:
+                break
+            sched.update_from_output(out, make_model_runner_output(out, 0))
+            if req.is_finished():
+                break
+        assert req.is_finished()
+
+
+class TestPreemption:
+    @pytest.mark.parametrize("num_prompt_blocks", [1, 5])
+    def test_kv_exhaustion_preempts(self, num_prompt_blocks):
+        # Under KV pressure a running request is preempted; the preempted
+        # request still receives its sampled token from the in-flight step.
+        sched = create_rbln_scheduler(
+            max_num_batched_tokens=100,
+            block_size=100,
+            num_blocks=2 * num_prompt_blocks + 1,
+            enable_prefix_caching=False,
+        )
+        reqs = create_requests(2, num_tokens=100 * num_prompt_blocks, block_size=100)
+        sched.add_request(reqs[0])
+        for _ in range(num_prompt_blocks - 1):
+            out = sched.schedule()
+            sched.update_from_output(out, make_model_runner_output(out))
+        out0 = sched.schedule()
+        assert len(sched.kv_cache_manager.get_blocks(reqs[0].request_id).blocks[0]) == (
+            num_prompt_blocks
+        )
+        sched.add_request(reqs[1])
+        for _ in range(num_prompt_blocks - 1):
+            out = sched.schedule()
+            sched.update_from_output(out, make_model_runner_output(out))
+        out1 = sched.schedule()
+        assert len(sched.kv_cache_manager.get_blocks(reqs[1].request_id).blocks[0]) == (
+            num_prompt_blocks
+        )
+        sched.update_from_output(out0, make_model_runner_output(out0, 0))
+        sched.schedule()
+        assert len(sched.running) == 1
+        assert sched.running[0] == reqs[0]
+        assert reqs[1].status == RequestStatus.PREEMPTED
+        assert sched.kv_cache_manager.block_pool.get_num_free_blocks() == (
+            num_prompt_blocks - 1
+        )
+        sched.update_from_output(out1, make_model_runner_output(out1, 42))
+        assert reqs[1].output_token_ids[0] == 42
+
+
+class TestPortDriftConformance:
+    # The core value of this file: catch drift between the ported schedule() and
+    # the installed vllm.
+    def test_full_lifecycle_runs_end_to_end(self):
+        # A whole prefill -> decode -> stop lifecycle on the installed vllm: a
+        # wider surface than one schedule() call, so drift shows up early.
+        sched = create_rbln_scheduler()
+        reqs = create_requests(3, num_tokens=10, max_tokens=3)
+        for r in reqs:
+            sched.add_request(r)
+        for _ in range(40):
+            if not sched.running and not sched.waiting:
+                break
+            out = sched.schedule()
+            sched.update_from_output(out, make_model_runner_output(out, 0))
+        assert not sched.running
+        assert not sched.waiting
+
+    def test_override_signatures_match_upstream(self):
+        # The overrides stay call-compatible with the upstream Scheduler base.
+        for name in ("update_from_output", "_preempt_request", "_free_request"):
+            base = inspect.signature(getattr(Scheduler, name))
+            override = inspect.signature(getattr(RBLNScheduler, name))
+            assert list(override.parameters) == list(base.parameters)
+
+    def test_rbln_scheduler_output_is_valid_subclass(self):
+        # RBLNSchedulerOutput subclasses SchedulerOutput and adds the copy-ops
+        # field while keeping the base fields.
+        assert issubclass(RBLNSchedulerOutput, SchedulerOutput)
+        fields = {f.name for f in dataclasses.fields(RBLNSchedulerOutput)}
+        assert "kv_cache_copy_ops" in fields
+        assert "num_scheduled_tokens" in fields
+
+
+# The classes below drive complete generation runs rather than single steps, to
+# check the invariants hold at every step.
+
+
+def _check_phase_agrees(sched, out) -> bool:
+    """The scheduler's phase for a step against the phase the runner derives from
+    it, and that the step carries only one of the two. Returns the phase.
+
+    schedule() advances num_computed_tokens by the scheduled chunk before it
+    returns, so back the chunk out to reach the state the scheduler classified.
+    """
+    phases = set()
+    for rid, chunk in out.num_scheduled_tokens.items():
+        req = sched.requests[rid]
+        phases.add(
+            is_prefill(
+                SimpleNamespace(
+                    num_computed_tokens=req.num_computed_tokens - chunk,
+                    num_tokens=req.num_tokens,
+                )
+            )
+        )
+    assert len(phases) <= 1, "a step mixed prefill and decode"
+    assert step_is_prefill(out) is (phases == {True}), (
+        f"phase {phases} but chunks {out.num_scheduled_tokens} "
+        f"(spec {out.scheduled_spec_decode_tokens})"
+    )
+    return phases == {True}
+
+
+class TestFullRunInvariants:
+    def test_multi_request_full_drain(self):
+        # Six requests to completion: every step homogeneous, prefill batch <= 1,
+        # decode batch within max_num_seqs // pp.
+        sched = create_rbln_scheduler(max_num_seqs=4, block_size=16, num_blocks=10000)
+        reqs = create_requests(6, num_tokens=10, max_tokens=4)
+        for r in reqs:
+            sched.add_request(r)
+
+        def check(out):
+            scheduled = list(out.num_scheduled_tokens)
+            if _check_phase_agrees(sched, out):
+                assert len(scheduled) == 1, "more than one request in a prefill step"
+            assert len(scheduled) <= 4, "decode batch exceeded the cap"
+
+        _drain(sched, per_step=check)
+        assert all(r.is_finished() for r in reqs)
+        assert sched.running == []
+
+    @pytest.mark.parametrize(
+        ("num_tokens", "max_num_batched_tokens"),
+        [
+            (10, 16),  # prompt in one chunk
+            (1, 16),  # single-token prompt: no prefill step at all
+            (33, 16),  # chunked, tail chunk of 1 token
+            (32, 16),  # chunked, block-aligned
+        ],
+    )
+    def test_step_phase_matches_the_scheduled_chunks(
+        self, num_tokens, max_num_batched_tokens
+    ):
+        # What the runner derives from a step (step_is_prefill) has to be what the
+        # scheduler decided (is_prefill), on every step of a run. The chunk sizes
+        # here reach the cases where the two could come apart -- above all a
+        # prefill whose last chunk is a single token.
+        sched = create_rbln_scheduler(
+            max_num_seqs=4,
+            block_size=16,
+            num_blocks=10000,
+            max_num_batched_tokens=max_num_batched_tokens,
+        )
+        for r in create_requests(3, num_tokens=num_tokens, max_tokens=4):
+            sched.add_request(r)
+
+        _drain(sched, per_step=lambda out: _check_phase_agrees(sched, out))
+
+    def test_step_phase_matches_the_scheduled_chunks_under_spec_decode(self):
+        # A verify step schedules 1 + num_spec tokens; only the base token counts,
+        # so the step still reads as decode.
+        sched = create_rbln_scheduler(
+            max_num_seqs=4, block_size=16, num_blocks=10000, num_speculative_tokens=3
+        )
+        for r in create_requests(2, num_tokens=10, max_tokens=6):
+            sched.add_request(r)
+
+        _drain(sched, per_step=lambda out: _check_phase_agrees(sched, out))
+
+    def test_scheduled_token_count_matches_output(self):
+        # Across a run, every request in num_scheduled_tokens must appear in the
+        # model runner output mapping (no orphaned / dropped requests).
+        sched = create_rbln_scheduler(max_num_seqs=4, block_size=16, num_blocks=10000)
+        for r in create_requests(4, num_tokens=10, max_tokens=3):
+            sched.add_request(r)
+
+        def check(out):
+            mro = make_model_runner_output(out, 0)
+            assert set(out.num_scheduled_tokens) == set(mro.req_ids)
+
+        _drain(sched, per_step=check)
+
+
+class TestRunningQueueCapacity:
+    # Borrowed from upstream test_async_scheduler.test_running_queue: how
+    # concurrency is capped over a run. RBLN caps running at max_num_seqs // pp.
+    @pytest.mark.parametrize(
+        ("active_cap", "paused_streaming"), [(1, False), (2, False), (2, True)]
+    )
+    def test_capacity_limited_by_max_num_active_seqs(
+        self, active_cap, paused_streaming
+    ):
+        sched = create_rbln_scheduler(max_num_seqs=4, max_num_active_seqs=active_cap)
+        if paused_streaming:
+            session = create_requests(1, max_tokens=1, req_ids=["paused"])[0]
+            session.resumable = True
+            advance_to_decode(sched, session)
+            assert session.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+
+        reqs = create_requests(3, num_tokens=10, max_tokens=6)
+        for request in reqs:
+            sched.add_request(request)
+        peak = 0
+
+        def check(out):
+            nonlocal peak
+            active = len(sched.running) + sched.num_waiting_for_streaming_input
+            assert active <= active_cap
+            peak = max(peak, active)
+
+        _drain(sched, per_step=check)
+        assert peak == active_cap
+        assert all(request.is_finished() for request in reqs)
+        assert sched.max_num_running_reqs == 4
+
+    def test_capacity_limited_by_max_num_seqs(self):
+        sched = create_rbln_scheduler(max_num_seqs=2, block_size=16, num_blocks=10000)
+        reqs = create_requests(5, num_tokens=10, max_tokens=6)
+        for r in reqs:
+            sched.add_request(r)
+        peak = 0
+
+        def check(out):
+            nonlocal peak
+            peak = max(peak, len(sched.running))
+
+        _drain(sched, per_step=check)
+        assert peak <= 2, "running set exceeded max_num_seqs"
+        assert all(r.is_finished() for r in reqs)
+
+    def test_capacity_limited_by_blocks(self):
+        # With scarce blocks the scheduler cannot run all requests at once, yet
+        # it still drains the whole queue (exact counts are allocator-specific).
+        sched = create_rbln_scheduler(
+            max_num_seqs=8,
+            block_size=16,
+            num_blocks=6,
+            max_num_batched_tokens=16,
+        )
+        reqs = create_requests(4, num_tokens=30, max_tokens=3, block_size=16)
+        for r in reqs:
+            sched.add_request(r)
+        peak = 0
+
+        def check(out):
+            nonlocal peak
+            peak = max(peak, len(sched.running))
+
+        _drain(sched, per_step=check)
+        assert peak < len(reqs), "blocks did not throttle concurrency"
+        assert all(r.is_finished() for r in reqs)
+
+
+class TestPreemptResumeCompletion:
+    # Extends TestPreemption past the preemption event: the victim must resume
+    # and finish once KV frees up.
+    def test_preempted_request_resumes_and_completes(self):
+        # Three prompts growing through decode with only 7 usable blocks forces a
+        # genuine preemption.
+        sched = create_rbln_scheduler(
+            max_num_seqs=4,
+            block_size=16,
+            num_blocks=8,
+            max_num_batched_tokens=16,
+            enable_prefix_caching=False,
+        )
+        reqs = create_requests(
+            3, num_tokens=10, max_tokens=30, block_size=16, ignore_eos=True
+        )
+        for r in reqs:
+            sched.add_request(r)
+        saw_preemption = False
+
+        def check(out):
+            nonlocal saw_preemption
+            if any(r.status == RequestStatus.PREEMPTED for r in reqs):
+                saw_preemption = True
+
+        _drain(sched, per_step=check)
+        assert saw_preemption, "expected a preemption under KV pressure"
+        assert all(r.is_finished() for r in reqs)
+
+
+class TestStoppingVariety:
+    # Complements TestStopping (eos, max_tokens) with the remaining stop paths.
+    def test_stop_token_id_finishes_request(self):
+        sched = create_rbln_scheduler()
+        req = create_requests(
+            1, num_tokens=10, max_tokens=20, stop_token_ids=[7], ignore_eos=True
+        )[0]
+        sched.add_request(req)
+        out = sched.schedule()  # prefill
+        sched.update_from_output(out, make_model_runner_output(out, 0))
+        out = sched.schedule()  # first decode; sample the stop token
+        sched.update_from_output(out, make_model_runner_output(out, 7))
+        assert req.is_finished()
+
+    def test_ignore_eos_does_not_stop_on_eos(self):
+        sched = create_rbln_scheduler()
+        req = create_requests(1, num_tokens=10, max_tokens=5, ignore_eos=True)[0]
+        sched.add_request(req)
+        out = sched.schedule()  # prefill
+        sched.update_from_output(out, make_model_runner_output(out, EOS_TOKEN_ID))
+        out = sched.schedule()  # decode with EOS sampled
+        sched.update_from_output(out, make_model_runner_output(out, EOS_TOKEN_ID))
+        assert not req.is_finished(), "ignore_eos must not stop on EOS"
+        # It still stops on max_tokens.
+        _drain(sched, token=EOS_TOKEN_ID)
+        assert req.is_finished()
+
+
+# Behaviours from upstream tests/v1/core/test_scheduler.py that apply to
+# RBLNScheduler.
+
+
+class TestMinTokens:
+    def test_an_ordinary_token_below_min_tokens_keeps_running(self):
+        # min_tokens=3: two ordinary tokens are not enough to stop.
+        sched = create_rbln_scheduler()
+        req = create_requests(1, num_tokens=10, max_tokens=20, min_tokens=3)[0]
+        sched.add_request(req)
+        out = sched.schedule()  # prefill -> 1 output token
+        sched.update_from_output(out, make_model_runner_output(out, 0))
+        out = sched.schedule()  # decode -> 2 tokens, still < min_tokens
+        sched.update_from_output(out, make_model_runner_output(out, 0))
+        assert not req.is_finished()
+
+    def test_a_sampled_eos_stops_even_below_min_tokens(self):
+        # check_stop reads min_tokens after the stop-token checks, not before:
+        # the sampler masks every stop token (EOS included) while the request is
+        # under min_tokens, so an EOS that still arrives is taken at face value.
+        sched = create_rbln_scheduler()
+        req = create_requests(1, num_tokens=10, max_tokens=20, min_tokens=3)[0]
+        sched.add_request(req)
+        out = sched.schedule()  # prefill -> 1 output token, below min_tokens
+        sched.update_from_output(out, make_model_runner_output(out, EOS_TOKEN_ID))
+        assert req.is_finished()
+
+
+class TestMemoryFreed:
+    def test_all_blocks_freed_after_run(self):
+        # After every request finishes, the block pool must return to its initial
+        # free count (no block leak) -- upstream test_memory_leak.
+        sched = create_rbln_scheduler(num_blocks=100, block_size=16)
+        pool = sched.kv_cache_manager.block_pool
+        free0 = pool.get_num_free_blocks()
+        for r in create_requests(5, num_tokens=10, max_tokens=4):
+            sched.add_request(r)
+        _drain(sched)
+        assert sched.get_num_unfinished_requests() == 0
+        assert pool.get_num_free_blocks() == free0
+
+
+class TestFcfsOrdering:
+    def test_admits_in_arrival_order(self):
+        # prefill batch = 1 admits requests one per step; under FCFS that must be
+        # arrival order regardless of how the waiting queue is drained.
+        sched = create_rbln_scheduler(max_num_seqs=4, num_blocks=10000)
+        reqs = create_requests(
+            4, num_tokens=10, max_tokens=4, req_ids=["A", "B", "C", "D"]
+        )
+        for r in reqs:
+            sched.add_request(r)
+        admitted: list[str] = []
+
+        def check(out):
+            admitted.extend(nr.req_id for nr in out.scheduled_new_reqs)
+
+        _drain(sched, per_step=check)
+        assert admitted == ["A", "B", "C", "D"]
+
+
+class TestPriorityScheduling:
+    # RBLNScheduler.schedule() honors SchedulingPolicy.PRIORITY (lower priority
+    # value = higher priority).
+    def test_higher_priority_scheduled_first(self):
+        sched = create_rbln_scheduler(
+            max_num_seqs=1, policy="priority", num_blocks=10000
+        )
+        low = create_requests(1, req_ids=["low"], priority=10)[0]
+        high = create_requests(1, req_ids=["high"], priority=0)[0]
+        sched.add_request(low)  # arrives first
+        sched.add_request(high)  # arrives second, higher priority
+        out = sched.schedule()
+        # The higher-priority request wins the single prefill slot despite the
+        # later arrival.
+        assert [nr.req_id for nr in out.scheduled_new_reqs] == ["high"]
+
+    def test_preemption_victim_is_lowest_priority(self):
+        # Under KV pressure only lower-priority requests are preempted; the
+        # highest-priority request is never a victim and all complete.
+        sched = create_rbln_scheduler(
+            max_num_seqs=4,
+            policy="priority",
+            num_blocks=8,
+            max_num_batched_tokens=16,
+        )
+        high = create_requests(
+            1, req_ids=["high"], num_tokens=10, max_tokens=30, priority=0
+        )[0]
+        lows = create_requests(
+            2, req_ids=["low0", "low1"], num_tokens=10, max_tokens=30, priority=10
+        )
+        reqs = [high, *lows]
+        for r in reqs:
+            sched.add_request(r)
+        victims: set[str] = set()
+
+        def check(out):
+            victims.update(
+                r.request_id for r in reqs if r.status == RequestStatus.PREEMPTED
+            )
+
+        _drain(sched, per_step=check)
+        assert "high" not in victims, "the highest-priority request was preempted"
+        assert victims, "expected a preemption under KV pressure"
+        assert all(r.is_finished() for r in reqs)
+
+
+@pytest.mark.usefixtures("cr13")
+class TestSpecDecodeReadyJoin:
+    @staticmethod
+    def _running_decoder_with_spec():
+        # req0: a running decode carrying 4 spec tokens, positioned mid-block so
+        # it would normally keep the full 1 + 4 spec query.
+        sched = create_rbln_scheduler(
+            enable_prefix_caching=True,
+            block_size=16,
+            sub_block_size=8,
+            num_speculative_tokens=4,
+            max_num_batched_tokens=16,
+            max_model_len=128,
+            num_blocks=10000,
+        )
+        req0 = make_request("0", list(range(16)), 16, max_tokens=50)
+        sched.add_request(req0)
+        for _ in range(4):
+            out = sched.schedule()
+            sched.update_from_output(out, make_model_runner_output(out, 0))
+        req0.spec_token_ids = [1] * 4
+        return sched, req0
+
+    # 16 lands the join on a block start and 8 mid-block; the removed check
+    # treated those as the unsafe and safe sides, and neither costs drafts now.
+    @pytest.mark.parametrize("prefix_len", [16, 8])
+    def test_a_decode_ready_join_keeps_the_batch_on_spec(self, prefix_len):
+        sched, req0 = self._running_decoder_with_spec()
+        req1 = make_request("1", list(range(prefix_len)) + [999], 16, max_tokens=50)
+        sched.add_request(req1)
+        out = sched.schedule()
+        assert out.num_scheduled_tokens[req1.request_id] == 1  # decode-ready join
+        assert out.num_scheduled_tokens[req0.request_id] == 5
+        assert len(out.scheduled_spec_decode_tokens[req0.request_id]) == 4
+
+
+class TestNoSpecDuringPrefill:
+    def test_prefill_chunk_schedules_no_spec_tokens(self):
+        # A still-prefilling request never gets spec tokens: the spec block is
+        # gated on `not is_prefill` even when spec_token_ids are set.
+        sched = create_rbln_scheduler(
+            num_speculative_tokens=4,
+            block_size=32,
+            max_num_batched_tokens=32,
+            max_model_len=2048,
+            num_blocks=10000,
+        )
+        req = create_requests(
+            1, num_tokens=100, block_size=32, max_tokens=50, req_ids=["0"]
+        )[0]
+        sched.add_request(req)
+        out = sched.schedule()  # first prefill chunk
+        assert is_prefill(req)
+        sched.update_from_output(out, make_model_runner_output(out, 0))
+
+        req.spec_token_ids = [1] * 4  # spec present, but still prefilling
+        out2 = sched.schedule()
+        assert is_prefill(req)
+        assert out2.num_scheduled_tokens[req.request_id] == 32  # a full prefill chunk
+        assert req.request_id not in out2.scheduled_spec_decode_tokens
+
+
+class TestDecodeCapMachinery:
+    # Covers the per-step decode-batch admission budget in v1/core/utils
+    # (DecodeBatchBudget) and its wiring into schedule().
+
+    def test_decode_budget_for_step_spreads_demand(self):
+        # for_step: hard cap = max_num_seqs // pp; soft cap = max(1, ceil(demand/pp)).
+        from vllm_rbln.v1.core.utils import DecodeBatchBudget
+
+        # max_num_seqs=16, pp=2 -> hard 8; demand 6 -> soft ceil(6/2)=3.
+        b = DecodeBatchBudget.for_step(16, 2, 6)
+        b.admit(3)  # count == soft
+        assert not b.can_admit()  # budgeted gate closes at the soft cap
+        assert b.can_admit(apply_soft_cap=False)  # hard (8) still has room
+        b.admit(5)  # count == hard
+        assert not b.can_admit(apply_soft_cap=False)
+
+        # No demand -> soft floored at 1 (never 0, which would wedge the budget).
+        nb = DecodeBatchBudget.for_step(16, 2, 0)
+        nb.admit()
+        assert not nb.can_admit()
+
+        # pp == 1 -> soft == demand, a no-op against the max_num_seqs hard cap.
+        b1 = DecodeBatchBudget.for_step(16, 1, 5)
+        b1.admit(5)
+        assert not b1.can_admit()  # soft == demand == 5
+        assert b1.can_admit(apply_soft_cap=False)  # hard == 16
+
+    def test_decode_budget_hard_vs_soft_cap(self):
+        # can_admit: the hard cap (compiled bucket ceiling) always applies; the
+        # soft (spreading) cap only when apply_soft_cap. Demand-unbudgeted joins
+        # (full local prefix / resumed-after-eviction) fill to the hard cap.
+        from vllm_rbln.v1.core.utils import DecodeBatchBudget
+
+        b = DecodeBatchBudget(hard_cap=8, soft_cap=2)
+        b.admit(2)  # count == soft
+        assert not b.can_admit()  # budgeted: gated at soft (2)
+        assert b.can_admit(apply_soft_cap=False)  # unbudgeted: hard (8) has room
+        b.admit(6)  # count == hard
+        assert not b.can_admit(apply_soft_cap=False)  # hard cap reached
+        assert not b.can_admit()
+
+        # soft == hard: apply_soft_cap makes no difference.
+        b2 = DecodeBatchBudget(hard_cap=8, soft_cap=8)
+        b2.admit(8)
+        assert not b2.can_admit()
+        assert not b2.can_admit(apply_soft_cap=False)
+
+    def test_decode_budget_discard(self):
+        # discard() un-admits decodes dropped from the step so can_admit() is not
+        # stopped early on a stale over-count (still-admitted decodes stay counted).
+        from vllm_rbln.v1.core.utils import DecodeBatchBudget
+
+        b = DecodeBatchBudget(hard_cap=2, soft_cap=2)
+        b.admit(2)  # batch full at the cap
+        assert not b.can_admit()  # gate closed
+        b.discard()  # a scheduled decode is preempted -> one slot freed
+        assert b.count == 1
+        assert b.can_admit()  # gate reopens for another admit
+        # reset() would instead zero the whole count (whole-batch eviction).
+        b.reset()
+        assert b.count == 0
+
+    def test_decode_budget_discard_underflow_asserts(self):
+        # A discard() without a matching admit would drive the count negative and
+        # silently disable both caps -- the guard asserts instead.
+        from vllm_rbln.v1.core.utils import DecodeBatchBudget
+
+        b = DecodeBatchBudget(hard_cap=2, soft_cap=2)
+        with pytest.raises(AssertionError, match="without a matching admit"):
+            b.discard()  # count 0 -> would underflow
+        b.admit()
+        b.discard()  # matched -> count back to 0
+        with pytest.raises(AssertionError):
+            b.discard()  # underflow again
+
+    def test_schedule_spreads_decode_across_microbatch(self):
+        # Under PP the per-step decode batch is sized to ~ceil(active/pp),
+        # spreading active decodes across microbatches instead of packing them
+        # into one (which would idle the other PP stages).
+        import math
+
+        n = 6
+        # max_num_seqs=16, pp=2 -> hard cap 8; n=6 active -> soft ceil(6/2)=3.
+        sched = create_rbln_scheduler(
+            max_num_seqs=16,
+            pipeline_parallel_size=2,
+            block_size=32,
+            max_num_batched_tokens=32,
+        )
+        reqs = create_requests(
+            n, num_tokens=32, block_size=32, req_ids=[f"d{i}" for i in range(n)]
+        )
+        for r in reqs:
+            advance_to_decode(sched, r)
+        running_decodes = sum(1 for r in sched.running if not is_prefill(r))
+        out = sched.schedule()
+        # At most ceil(active / pp) decodes admitted this step, and at least one.
+        assert 1 <= len(out.num_scheduled_tokens) <= math.ceil(running_decodes / 2)
+
+    def test_priority_preemption_discards_admitted_decode(self, monkeypatch):
+        # When PRIORITY preempts an already-scheduled decode to free KV, the
+        # scheduler discard()s it from the per-step budget so can_admit() isn't
+        # stopped on a stale count. The victim was scheduled this step, so
+        # discard() fires exactly once.
+        from vllm_rbln.v1.core.utils import DecodeBatchBudget
+
+        discard_calls = []
+        orig_discard = DecodeBatchBudget.discard
+
+        def spy(self, n=1):
+            discard_calls.append(n)
+            return orig_discard(self, n)
+
+        monkeypatch.setattr(DecodeBatchBudget, "discard", spy)
+
+        # num_blocks=4 -> 3 usable (block 0 is the null block): one block per
+        # prefill (2) leaves exactly one free for a decode boundary block, so
+        # only one of the two decodes can grow this step.
+        sched = create_rbln_scheduler(
+            max_num_batched_tokens=16,
+            max_num_seqs=4,
+            block_size=16,
+            num_blocks=4,
+            enable_prefix_caching=False,
+            policy="priority",
+        )
+        victim, trigger = create_requests(
+            2, num_tokens=16, block_size=16, req_ids=["victim", "trigger"]
+        )
+        # Higher priority VALUE == lower scheduling importance == preempted first.
+        victim.priority = 1
+        trigger.priority = 0
+        for r in (victim, trigger):
+            advance_to_decode(sched, r)
+
+        out = sched.schedule()
+
+        assert victim.status == RequestStatus.PREEMPTED
+        assert trigger.request_id in out.num_scheduled_tokens
+        assert discard_calls == [1], (
+            "discard() must fire exactly once for the preempted already-scheduled "
+            f"decode, got {discard_calls}"
+        )
+
+
+class TestDeferredBlockFree:
+    # The ``defer_block_free`` fence (``sched_step_seq``): blocks of a request
+    # aborted mid-step must not return to the pool until that step's output is
+    # processed, because with several batches in flight (PP) a connector load can
+    # refill blocks the in-flight step is still writing. On only when >1 batch is
+    # in flight AND the instance is a KV consumer. The fence lives in the copied
+    # schedule() and had no unit coverage of its own.
+
+    def test_deferred_free_fenced_by_inflight_step(self):
+        sched = create_rbln_scheduler(
+            pipeline_parallel_size=2, use_kv_connector=MockKVConfig()
+        )
+        assert sched.defer_block_free
+
+        request = create_requests(1)[0]
+        sched.add_request(request)
+        output = sched.schedule()
+        assert output.total_num_scheduled_tokens > 0
+        assert sched.sched_step_seq == 1
+        assert request.last_sched_seq == 1
+
+        block_pool = sched.kv_cache_manager.block_pool
+        free_before = block_pool.get_num_free_blocks()
+        sched.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+        # Fenced: blocks stay out of the pool until the in-flight step drains.
+        assert sched.deferred_frees, "blocks must be fenced, not freed"
+        assert block_pool.get_num_free_blocks() == free_before
+
+        sched.update_from_output(output, make_model_runner_output(output, 0))
+        assert sched.processed_step_seq == 1
+        assert not sched.deferred_frees
+        assert block_pool.get_num_free_blocks() > free_before
+
+    def test_no_deferred_free_without_multiple_inflight_batches(self):
+        # A guard rather than a test of the fence itself: with a single batch in
+        # flight (no PP) the whole mechanism has to stay inert even though a KV
+        # connector is present, so freeing is immediate and neither counter moves.
+        sched = create_rbln_scheduler(use_kv_connector=MockKVConfig())
+        assert not sched.defer_block_free
+
+        request = create_requests(1)[0]
+        sched.add_request(request)
+        output = sched.schedule()
+        assert sched.sched_step_seq == 0
+
+        block_pool = sched.kv_cache_manager.block_pool
+        free_before = block_pool.get_num_free_blocks()
+        sched.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+        assert not sched.deferred_frees
+        assert block_pool.get_num_free_blocks() > free_before
+
+        # Processing the step leaves the fence untouched: nothing to drain, and
+        # the release counter stays with the scheduling one at 0.
+        sched.update_from_output(output, make_model_runner_output(output, 0))
+        assert sched.processed_step_seq == 0
+        assert not sched.deferred_frees
+
+    def test_empty_step_does_not_advance_the_fence(self):
+        # The other half of the condition. update_from_output only advances
+        # processed_step_seq for a step that has tokens, so a scheduling counter
+        # that moved on an empty step would run ahead for good -- the fence would
+        # stop clearing and deferred blocks would never return to the pool. Empty
+        # steps are normal here: a KV consumer parks requests that wait on a
+        # remote KV load.
+        sched = create_rbln_scheduler(
+            pipeline_parallel_size=2, use_kv_connector=MockKVConfig()
+        )
+        assert sched.defer_block_free
+
+        output = sched.schedule()  # nothing queued
+
+        assert output.total_num_scheduled_tokens == 0
+        assert sched.sched_step_seq == 0
+
+    @pytest.mark.usefixtures("cr13")
+    def test_deferred_free_settles_sub_block_state(self):
+        # The fenced path releases blocks through pop_blocks_for_free(), so the
+        # sub-block bookkeeping has to be settled there as free() settles it.
+        # Otherwise the request's hashes outlive it, and its partial block never
+        # gets the synthetic hash that keeps it in the LRU.
+        sched = create_rbln_scheduler(
+            enable_prefix_caching=True,
+            block_size=16,
+            sub_block_size=8,
+            max_num_batched_tokens=16,
+            max_model_len=8192,
+            pipeline_parallel_size=2,
+            use_kv_connector=MockKVConfig(),
+        )
+        manager = sched.kv_cache_manager
+        # 24 tokens over a 16-token block with 8-token sub-blocks, prefilled in
+        # two chunks: one full block plus an 8-token partial. Ordinary caching
+        # hashes the full block only, so the partial one's hash can come from
+        # nothing but this path -- a multiple of the block size would leave no
+        # partial block at all and the assert below would hold either way.
+        request = create_requests(1, num_tokens=24)[0]
+        sched.add_request(request)
+        sched.schedule()
+        sched.schedule()
+        partial_block = manager.coordinator.get_blocks(request.request_id)[0][-1]
+
+        sched.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+
+        assert sched.deferred_frees, "blocks must be fenced, not freed"
+        assert request.request_id not in manager._req_sub_hashes
+        assert request.request_id not in manager._pending_indexing
+        assert partial_block.block_hash is not None
+
+
+class TestDraftingLookahead:
+    """A first chunk was allocated with no drafting lookahead at all, so a
+    request whose prefill ends in a block's last slots got no page for the draft
+    block that follows it. Upstream zeroes the lookahead only to keep the local
+    and remote block counts matching under an async P/D load; that is the
+    condition here, rather than every request on its first chunk."""
+
+    LOOKAHEAD = 4
+
+    PROMPT = 32
+
+    def _lookahead_seen(self, use_kv_connector=None, remote_prefill=False):
+        sched = create_rbln_scheduler(
+            num_speculative_tokens=3,
+            use_kv_connector=use_kv_connector,
+            enable_prefix_caching=True,
+        )
+        # ngram is what the helper builds without a draft model, so the two
+        # attributes a drafting method would set are set here instead -- they
+        # are what the branch reads.
+        sched.use_eagle = True
+        sched.num_lookahead_tokens = self.LOOKAHEAD
+
+        seen: list[int] = []
+        allocate_slots = sched.kv_cache_manager.allocate_slots
+
+        def spy(*args, **kwargs):
+            seen.append(kwargs["num_lookahead_tokens"])
+            return allocate_slots(*args, **kwargs)
+
+        sched.kv_cache_manager.allocate_slots = spy
+
+        num_tokens = self.PROMPT if remote_prefill else 16
+        request = create_requests(1, num_tokens=num_tokens)[0]
+        if remote_prefill:
+            request.kv_transfer_params = {"do_remote_prefill": True}
+        sched.add_request(request)
+        sched.schedule()
+        if not remote_prefill:
+            assert request.num_computed_tokens == request.num_prompt_tokens
+        return seen
+
+    def test_a_first_chunk_gets_the_drafting_lookahead(self):
+        assert self._lookahead_seen() == [self.LOOKAHEAD]
+
+    def test_a_synchronous_remote_load_keeps_it(self):
+        seen = self._lookahead_seen(
+            use_kv_connector=MockKVConfig(matched_tokens=16, is_async=False),
+            remote_prefill=True,
+        )
+        assert seen == [self.LOOKAHEAD]
+
+    def test_an_async_remote_load_still_gets_none(self):
+        """The case upstream zeroes it for: an extra block here would leave the
+        local and remote block counts mismatched."""
+        seen = self._lookahead_seen(
+            use_kv_connector=MockKVConfig(matched_tokens=16, is_async=True),
+            remote_prefill=True,
+        )
+        assert seen == [0]
+
+
+class TestSyncKVLoads:
+    """The model runner starts a connector's loads after the forward unless the
+    step says it holds a synchronous one, so a step that admits a synchronous
+    external hit has to say so, or the forward reads blocks not yet loaded."""
+
+    def test_a_synchronous_external_hit_is_flagged(self):
+        sched = create_rbln_scheduler(
+            use_kv_connector=MockKVConfig(matched_tokens=16, is_async=False)
+        )
+        request = create_requests(1, num_tokens=32)[0]
+        request.kv_transfer_params = {"do_remote_prefill": True}
+        sched.add_request(request)
+
+        output = sched.schedule()
+
+        # Only the 16 tokens past the hit are computed this step.
+        assert output.num_scheduled_tokens[request.request_id] == 16
+        assert output.has_sync_kv_loads

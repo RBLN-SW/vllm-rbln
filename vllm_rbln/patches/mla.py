@@ -19,8 +19,13 @@
 
 import torch
 from vllm.forward_context import ForwardContext, get_forward_context
+from vllm.model_executor.layers.attention import mla_attention as _mla_attention_mod
 from vllm.model_executor.layers.attention.mla_attention import MLAAttention
+from vllm.model_executor.utils import replace_parameter
 
+from vllm_rbln.model_executor.layers.quantization.modelopt_fp8 import (
+    RBLNModelOptFp8LinearMethod,
+)
 from vllm_rbln.patches import register_patch
 from vllm_rbln.patches.attention import (
     _record_pipeline_layer_index,
@@ -29,6 +34,35 @@ from vllm_rbln.patches.attention import (
 
 mla_attention_original_init = MLAAttention.__init__
 mla_attention_original_process_weights = MLAAttention.process_weights_after_loading
+mla_attention_original_get_kv_cache_spec = MLAAttention.get_kv_cache_spec
+mla_attention_original_get_and_maybe_dequant_weights = (
+    _mla_attention_mod.get_and_maybe_dequant_weights
+)
+
+
+@register_patch(
+    target=(
+        "vllm.model_executor.layers.attention.mla_attention."
+        "get_and_maybe_dequant_weights"
+    ),
+    reason=(
+        "The MLA kv_b_proj weight-absorb dequantises eagerly at load time. "
+        "Upstream's fast path covers only Fp8LinearMethod, so per-tensor ModelOpt "
+        "fp8 falls to the generic base case, which reads the weight back by "
+        "running the layer's apply() against an identity matrix -- an eager "
+        "matmul the dummy compile device has no NPU to execute. Dequantise "
+        "directly instead."
+    ),
+)
+def patched_get_and_maybe_dequant_weights(
+    layer: torch.nn.Module, out_dtype: torch.dtype = torch.float32
+) -> torch.Tensor:
+    quant_method = getattr(layer, "quant_method", None)
+    if isinstance(quant_method, RBLNModelOptFp8LinearMethod):
+        weight = layer.weight.detach().to("cpu", torch.float32)
+        scale = layer.weight_scale.detach().to("cpu", torch.float32)
+        return (weight * scale).to(out_dtype).to(layer.weight.device)
+    return mla_attention_original_get_and_maybe_dequant_weights(layer, out_dtype)
 
 
 class _RBLNNoOpMLAPrefillBackend:
@@ -53,6 +87,44 @@ class _RBLNNoOpMLAPrefillBackend:
 )
 def patched_get_mla_prefill_backend(vllm_config) -> type[_RBLNNoOpMLAPrefillBackend]:
     return _RBLNNoOpMLAPrefillBackend
+
+
+@register_patch(
+    target=(
+        "vllm.model_executor.layers.attention.mla_attention."
+        "MLAAttention.get_kv_cache_spec"
+    ),
+    reason=(
+        "fp8 DSA MLA stores the latent cache as an RBLN-packed 768-byte uint8 row "
+        "(512 fp8 kv_c + fp16 scale + k_pe), quantized/packed in-kernel by the "
+        "sparse_attn_deepseek_mla fp8 kernel. The compiler routes fp8 vs bf16 by "
+        "the cache channel width (768 != 576), so allocate head_size=768 uint8. "
+        "cache_dtype_str stays 'auto' so the page size is the plain "
+        "head_size*itemsize (768B), not the upstream fp8_ds_mla 656B layout. "
+        "Only the sparse (DSA) path packs this way; a dense MLA layer keeps the "
+        "upstream spec even under --kv-cache-dtype fp8, since its kernel cannot "
+        "read the packed row."
+    ),
+)
+def patched_mla_get_kv_cache_spec(self: MLAAttention, vllm_config):
+    cache_dtype = vllm_config.cache_config.cache_dtype
+    use_sparse = getattr(self, "use_sparse", False)
+    if use_sparse and cache_dtype and cache_dtype.startswith("fp8"):
+        from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+        impl = getattr(self, "impl", None)
+        kv_lora_rank = getattr(impl, "kv_lora_rank", 512)
+        rope_dim = getattr(impl, "qk_rope_head_dim", 64)
+        _FP8_KV_SCALE_BYTES = 128
+        packed_head_size = kv_lora_rank + _FP8_KV_SCALE_BYTES + rope_dim * 2
+        return MLAAttentionSpec(
+            block_size=vllm_config.cache_config.block_size,
+            num_kv_heads=1,
+            head_size=packed_head_size,
+            dtype=torch.uint8,
+            cache_dtype_str="auto",
+        )
+    return mla_attention_original_get_kv_cache_spec(self, vllm_config)
 
 
 @register_patch(
@@ -85,10 +157,8 @@ def patched_mla_attention_forward(
     kv_c_normed: torch.Tensor,
     k_pe: torch.Tensor,
     output_shape: torch.Size | None = None,
+    topk_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    if self.calculate_kv_scales:
-        torch.ops.vllm.maybe_calc_kv_scales(q, kv_c_normed, k_pe, self.layer_name)
-
     if self.use_direct_call:
         forward_context: ForwardContext = get_forward_context()
         attn_metadata = forward_context.attn_metadata
@@ -109,10 +179,17 @@ def patched_mla_attention_forward(
                 self_kv_cache,
                 attn_metadata,
                 output=output,
+                topk_indices=topk_indices,
             )
             return output
         return self.impl.forward(
-            self, q, kv_c_normed, k_pe, self_kv_cache, attn_metadata
+            self,
+            q,
+            kv_c_normed,
+            k_pe,
+            self_kv_cache,
+            attn_metadata,
+            topk_indices=topk_indices,
         )
 
     if self.attn_backend.accept_output_buffer:
@@ -148,6 +225,6 @@ def patched_mla_process_weights(self: MLAAttention, act_dtype: torch.dtype) -> N
     mla_attention_original_process_weights(self, act_dtype)
     # RBLN uses 4D weights for batched matmul: [1, N, P, L] / [1, N, L, V]
     if hasattr(self, "W_UK_T"):
-        self.W_UK_T = self.W_UK_T.unsqueeze(0)
+        replace_parameter(self, "W_UK_T", self.W_UK_T.unsqueeze(0))
     if hasattr(self, "W_UV"):
-        self.W_UV = self.W_UV.unsqueeze(0)
+        replace_parameter(self, "W_UV", self.W_UV.unsqueeze(0))

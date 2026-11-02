@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from vllm.distributed.kv_events import KVCacheEvent
+from collections.abc import Callable
+
+from vllm.distributed.kv_events import MEDIUM_GPU, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.v1.core.block_pool import BlockHashToBlockMap, BlockPool
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
@@ -56,14 +58,18 @@ class RBLNBlockPool(BlockPool):
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
         is_encoder_decoder: bool = False,
+        medium: str = MEDIUM_GPU,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
+        # Read only when KV cache events are enabled. The optimum scheduler
+        # pins enable_kv_cache_events to False, so it is never read here.
+        self.medium = medium
         self.enable_caching = enable_caching
         self.hash_block_size = hash_block_size
         # All kv-cache blocks.
         self.blocks: list[KVCacheBlock] = [
-            KVCacheBlock(idx) for idx in range(num_gpu_blocks)
+            KVCacheBlock(idx, pool=self) for idx in range(num_gpu_blocks)
         ]
         # Free block queue that constructs and manipulates a doubly linked
         # list of free blocks (including eviction candidates when caching is
@@ -99,3 +105,4 @@ class RBLNBlockPool(BlockPool):
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
+        self._reuse_watchers: dict[int, Callable[[KVCacheBlock], None]] = {}

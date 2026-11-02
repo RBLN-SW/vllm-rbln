@@ -23,9 +23,9 @@ from vllm.v1.attention.backend import (
     AttentionType,
     MLAAttentionImpl,
 )
+from vllm.v1.attention.backends.mla.index_group import SparseMLAIndexGroupBuilder
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 
-import vllm_rbln.envs as envs
 from vllm_rbln.logger import init_logger
 
 from ...ops.flash_causal_mla_naive import (
@@ -45,7 +45,7 @@ class RBLNFlashAttnMLABackend(MLACommonBackend):
     """MLA backend for RBLN."""
 
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
-    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["auto"]
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["auto", "fp8", "fp8_e4m3"]
     accept_output_buffer: bool = False
 
     @staticmethod
@@ -106,7 +106,14 @@ class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
         kv_b_proj: ColumnParallelLinear,
         indexer=None,
         q_pad_num_heads: int | None = None,
+        topk_indices_buffer: torch.Tensor | None = None,
+        index_group_builder: SparseMLAIndexGroupBuilder | None = None,
     ) -> None:
+        # Upstream routes sparse top-k indices to the impl through a shared
+        # buffer that the index group builder assigns. RBLN's patched Indexer
+        # returns them and the patched MLAAttention.forward passes them in, so
+        # the builder has nothing to drive here; it is accepted only because
+        # MLAAttention.__init__ passes it to every sparse impl.
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = float(scale)
@@ -121,6 +128,7 @@ class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
         self.kv_b_proj = kv_b_proj
         self.indexer = indexer
         self.q_pad_num_heads = q_pad_num_heads
+        self.topk_indices_buffer = topk_indices_buffer
 
         unsupported = [alibi_slopes, sliding_window, logits_soft_cap]
         if any(unsupported):
@@ -132,9 +140,21 @@ class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
             raise NotImplementedError(
                 "Only decoder self-attention is implemented for FlashAttnMLAImpl"
             )
-        if is_quantized_kv_cache(self.kv_cache_dtype):
+
+        # MLAAttention hands every sparse layer the top-k buffer, including an
+        # index-share skip layer that owns no indexer and reads another layer's
+        # top-k.
+        is_sparse = self.indexer is not None or topk_indices_buffer is not None
+        if is_quantized_kv_cache(self.kv_cache_dtype) and not (
+            self.kv_cache_dtype.startswith("fp8") and is_sparse
+        ):
+            # Only the sparse (DSA) path packs an fp8 latent cache the kernel can
+            # read; a dense MLA layer would be handed a cache its bf16 kernel
+            # cannot read, so reject it here instead of failing later.
             raise NotImplementedError(
-                "FlashAttnMLA with FP8 KV cache not yet supported"
+                "FlashAttnMLA supports an fp8 KV cache only on the sparse (DSA) "
+                "path with a lightning indexer; kv_cache_dtype="
+                f"{self.kv_cache_dtype!r} is not supported here."
             )
         if kv_sharing_target_layer_name is not None:
             raise NotImplementedError("KV sharing is not supported in RBLN.")
@@ -153,7 +173,6 @@ class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
             )
 
         self.sliding_window = sliding_window
-        self.is_causal = envs.VLLM_RBLN_FLASH_CAUSAL_ATTN
         self.scale_tensor = torch.tensor(scale, device=self.device)
 
     # -- stubs required by MLAAttentionImpl interface -----------------------
@@ -196,6 +215,7 @@ class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
         output: torch.Tensor | None = None,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
+        topk_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass.
 
@@ -221,6 +241,20 @@ class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
             [decode_ql_nope, decode_q_pe], dim=-1
         )  # [B, H, S, lora_rank+rope]
 
+        if topk_indices is not None:
+            attn_output = torch.ops.rbln_custom_ops.sparse_attn_deepseek_mla(
+                q,
+                kv_c_normed,
+                k_pe,
+                kv_cache,
+                self.scale_tensor,
+                attn_metadata.seq_lens.to(torch.int32),
+                attn_metadata.block_tables,
+                topk_indices,
+                is_prompt_sorted=attn_metadata.is_prompt_sorted,
+            )
+            return self._v_up_proj(attn_output, layer.W_UV)
+
         # Dispatch to custom kernel
         if attn_metadata.is_prefill:
             kernel = paged_flash_causal_mla_naive_prefill
@@ -235,6 +269,7 @@ class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
             attn_metadata.seq_lens,
             attn_metadata.block_tables,
             self.scale_tensor,
+            is_prompt_sorted=attn_metadata.is_prompt_sorted,
         )
 
         # attn_output: [B, H, S, kv_lora_rank] → V-up projection → [B, S, H*v_head_dim]

@@ -33,6 +33,7 @@ __all__ = ["CopyOpMixin", "CopyOpQueue", "KVCacheCopyOp"]
 class KVCacheCopyOp:
     """A token range to copy between KV blocks before the forward pass."""
 
+    group_id: int
     src_block_id: int
     dst_block_id: int
     num_tokens: int

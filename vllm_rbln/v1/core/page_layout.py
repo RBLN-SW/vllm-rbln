@@ -22,27 +22,24 @@ that can enforce it -- keeping a second copy here is how the two drift apart.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from vllm_rbln.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
+    from vllm_rbln.config import RBLNConfig
+
 logger = init_logger(__name__)
 
 __all__ = [
-    "ATTN_BLOCK_SIZE_KEY",
     "PageLayout",
     "PageLayoutConfig",
     "kernel_block_size_from_config",
     "resolve_config",
     "validate_fragmentation",
 ]
-
-# Where the compiled model publishes its kernel block size.
-ATTN_BLOCK_SIZE_KEY = "attn_block_size"
-
 
 # --------------------------------------------------------------------------- #
 # Geometry
@@ -115,9 +112,8 @@ def resolve_config(
 
 
 def kernel_block_size_from_config(vllm_config: VllmConfig) -> int | None:
-    additional: dict[str, Any] | None = getattr(vllm_config, "additional_config", None)
-    value = additional.get(ATTN_BLOCK_SIZE_KEY) if additional else None
-    return int(value) if value else None
+    rbln_config: RBLNConfig = vllm_config.additional_config
+    return rbln_config.kernel_block_size
 
 
 def validate_fragmentation(
@@ -207,8 +203,8 @@ def validate_fragmentation(
 #
 #   1. `validate_fragmentation` rejected concurrency the pool cannot hold at
 #      once, which is preemption's job, not a startup error (see above).
-#   2. `RblnNixlConnectorWorker` registered its descriptors over pages while the
-#      tensors held kernel blocks.
+#   2. The RBLN NIXL worker registered its descriptors over pages while the
+#      tensors held kernel blocks. NIXL is now refused instead; see below.
 #   3. `RBLNScheduler.schedule` translated block ids *after* the connector had
 #      already read them, so the worker got kernel blocks and the connector kept
 #      pages.
@@ -225,7 +221,8 @@ def validate_fragmentation(
 # combination breaks again, suspect another place where the two units meet
 # before suspecting the transport.
 #
-# ⚠️ STILL NOT USABLE WITH A KV CONNECTOR. Six unit fixes later the engine runs
+# ⚠️ NOT USABLE WITH NIXL, which `RBLNModelRunner._maybe_rescale_to_kernel_blocks`
+# refuses at start-up. Six unit fixes later the engine runs
 # and short requests answer correctly, but a decode that pulls KV from a remote
 # prefill hits upstream's prefix-caching trim:
 #

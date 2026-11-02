@@ -6,7 +6,7 @@
 # anything else changing would make the comparison meaningless.
 #
 #   subblock    --block-size 8192, sub_block = chunk = 512  (VLLM_RBLN_SUB_BLOCK_CACHE)
-#   pagelayout  --block-size 512 (page), attn_block_size 8192 (VLLM_RBLN_PAGE_LAYOUT)
+#   pagelayout  --block-size 512 (page), kernel_block_size 8192 (VLLM_RBLN_PAGE_LAYOUT)
 #
 # No KV connector: this compares vLLM-local mechanisms only.
 #
@@ -66,7 +66,7 @@ case "$MODE" in
   pagelayout)
     export VLLM_RBLN_SUB_BLOCK_CACHE=0 VLLM_RBLN_PAGE_LAYOUT=1
     BLOCK_ARGS=(--block-size "$PAGE"
-                --additional-config "{\"attn_block_size\": $KERNEL_BLOCK}")
+                --additional-config "{\"kernel_block_size\": $KERNEL_BLOCK}")
     ;;
   *) echo "unknown mode $MODE (expected subblock or pagelayout)"; exit 2 ;;
 esac

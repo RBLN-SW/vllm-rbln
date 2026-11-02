@@ -11,9 +11,10 @@ This directory used to contain vLLM-rbln's benchmark scripts and utilities for p
 benchmark offline throughput with random data.
 
 ```bash
-RBLN_PROFILER=0 RBLN_KERNEL_MODE=triton VLLM_RBLN_USE_VLLM_MODEL=1 VLLM_DISABLE_COMPILE_CACHE=1 VLLM_USE_V1=1 \
+RBLN_PROFILER=0 RBLN_KERNEL_MODE=triton VLLM_DISABLE_COMPILE_CACHE=1 VLLM_USE_V1=1 \
 python3 benchmark_throughput.py \
     --model meta-llama/Llama-3.2-1B-instruct \
+    --model-impl vllm \
     --backend vllm \
     --dataset-name random --input-len 1024 --output-len 124 \
     --num-prompts 100 \
@@ -37,8 +38,9 @@ python3 benchmark_throughput.py \
 *Server Setup*
 
 ```bash
-RBLN_KERNEL_MODE=triton VLLM_RBLN_USE_VLLM_MODEL=1 VLLM_DISABLE_COMPILE_CACHE=1 VLLM_USE_V1=1 \
+RBLN_KERNEL_MODE=triton VLLM_DISABLE_COMPILE_CACHE=1 VLLM_USE_V1=1 \
 vllm serve meta-llama/Llama-3.2-1B-instruct \
+    --model-impl vllm \
     --tokenizer meta-llama/Llama-3.2-1B-instruct \
     --host 127.0.0.1 \
     --port 8000 \

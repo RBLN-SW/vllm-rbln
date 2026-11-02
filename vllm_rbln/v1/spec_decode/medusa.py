@@ -25,7 +25,8 @@ from vllm_rbln.compilation import (
     compile,
     create_compile_context,
 )
-from vllm_rbln.platform import USE_DEVICE_TENSOR
+from vllm_rbln.config import RBLNConfig
+from vllm_rbln.platform import use_device_tensor
 
 if TYPE_CHECKING:
     from rebel.compile_context import CompileContext
@@ -50,7 +51,7 @@ class RBLNMedusaProposer(MedusaProposer):
                 use_weight_sharing=True,
                 use_global_ctx=True,
             )
-            if not USE_DEVICE_TENSOR
+            if not use_device_tensor()
             else None
         )
 
@@ -62,10 +63,8 @@ class RBLNMedusaProposer(MedusaProposer):
             logits = self.model.compute_logits(hidden_states)
             return logits
 
-        if (
-            self.vllm_config.speculative_config.enforce_eager
-            or not envs.VLLM_RBLN_COMPILE_MODEL
-        ):
+        rbln_config: RBLNConfig = self.vllm_config.additional_config
+        if self.vllm_config.speculative_config.enforce_eager:
             self.model_executable = model_wrapper
         else:
             self.model_executable = compile(
@@ -73,11 +72,13 @@ class RBLNMedusaProposer(MedusaProposer):
                 dynamic=False,
                 fullgraph=True,
                 compile_context=self.compile_context,
-                num_devices=envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
-                model_trace_method="export" if USE_DEVICE_TENSOR else "",
+                num_devices=1,
+                model_trace_method="export" if use_device_tensor() else "",
                 process_group_dict=build_process_group_dict(),
                 guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
                 mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
+                use_direct_dispatch=True,
+                dtype=rbln_config.compile_dtype,
             )
 
     def propose(

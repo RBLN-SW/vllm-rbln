@@ -202,7 +202,9 @@ class RBLNPageLayoutKVCacheManager(CopyOpMixin, KVCacheManager):
 
     # -- prefix match -------------------------------------------------------
 
-    def get_computed_blocks(self, request: Request) -> tuple[RBLNKVCacheBlocks, int]:
+    def get_computed_blocks(
+        self, request: Request
+    ) -> tuple[RBLNKVCacheBlocks, int, int]:
         """Match a group at a time, over kernel blocks rather than pages.
 
         Upstream matches page by page and asks the hash table for *a* block
@@ -217,23 +219,19 @@ class RBLNPageLayoutKVCacheManager(CopyOpMixin, KVCacheManager):
         duplicate resolution in one pass, and cannot return an unaddressable
         match by construction.
         """
-        if not self.enable_caching or request.skip_reading_prefix_cache:
-            return self.empty_kv_cache_blocks, 0
+        if not self.prefix_cache_lookup_enabled(request):
+            return self.empty_kv_cache_blocks, 0, 0
 
-        # The last token must be recomputed to produce logits.
+        # The last token must be recomputed to produce logits. No group retains
+        # sparsely, so there is never a shared-prefix boundary to pin.
         max_pages = (request.num_tokens - 1) // self.geometry.page_size
         pages = self._match(request.block_hashes, max_pages)
-        if self.log_stats and self.prefix_cache_stats is not None:
-            self.prefix_cache_stats.record(
-                num_tokens=request.num_tokens,
-                num_hits=len(pages) * self.geometry.page_size,
-                preempted=request.num_preemptions > 0,
-            )
         if not pages:
-            return self.empty_kv_cache_blocks, 0
+            return self.empty_kv_cache_blocks, 0, 0
         return (
             self.create_kv_cache_blocks((pages,)),
             len(pages) * self.geometry.page_size,
+            0,
         )
 
     def _match(
@@ -294,10 +292,14 @@ class RBLNPageLayoutKVCacheManager(CopyOpMixin, KVCacheManager):
         the rest of the tokens are allocated, so the unmatched pages land at the
         right slot. Returns ``None`` when the request cannot be admitted.
         """
-        if num_new_tokens == 0 and num_external_computed_tokens == 0:
+        if (
+            num_new_tokens == 0
+            and num_external_computed_tokens == 0
+            and num_new_computed_tokens == 0
+        ):
             raise ValueError(
                 "num_new_tokens must be greater than 0 when there are no "
-                "external computed tokens"
+                "computed tokens to adopt"
             )
 
         matched: list[RBLNKVCacheBlock] = []
@@ -356,6 +358,8 @@ class RBLNPageLayoutKVCacheManager(CopyOpMixin, KVCacheManager):
         ):
             watermark_blocks = self.watermark_blocks
 
+        prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
+
         num_tokens_main_model = total_computed_tokens + num_new_tokens
         num_tokens_need_slot = min(
             num_tokens_main_model + num_lookahead_tokens, self.max_model_len
@@ -371,8 +375,10 @@ class RBLNPageLayoutKVCacheManager(CopyOpMixin, KVCacheManager):
                         new_computed_blocks=computed,
                         num_encoder_tokens=num_encoder_tokens,
                         total_computed_tokens=total_computed_tokens,
+                        num_local_computed_tokens=num_local_computed_tokens,
                         num_tokens_main_model=full_num_tokens,
                         apply_admission_cap=True,
+                        prefill_end=prefill_end,
                     )
                     + watermark_blocks
                 )
@@ -382,7 +388,9 @@ class RBLNPageLayoutKVCacheManager(CopyOpMixin, KVCacheManager):
                     return None
 
             self.coordinator.remove_skipped_blocks(
-                request.request_id, total_computed_tokens
+                request.request_id,
+                max(0, total_computed_tokens - request.num_in_flight_tokens),
+                num_prompt_tokens=request.num_prompt_tokens,
             )
             # Everything this step must find room for, in pages: the tokens
             # themselves, the watermark held back for the next admission, and
@@ -405,7 +413,9 @@ class RBLNPageLayoutKVCacheManager(CopyOpMixin, KVCacheManager):
                     total_computed_tokens=(
                         num_local_computed_tokens + num_external_computed_tokens
                     ),
+                    num_local_computed_tokens=num_local_computed_tokens,
                     num_tokens_main_model=num_tokens_main_model,
+                    prefill_end=prefill_end,
                 )
                 + watermark_blocks
                 + reserved_blocks
@@ -457,6 +467,7 @@ class RBLNPageLayoutKVCacheManager(CopyOpMixin, KVCacheManager):
         page = self.geometry.page_size
         self.queue_copy(
             KVCacheCopyOp(
+                group_id=0,
                 src_block_id=tail_copy.source[0].kernel_block.index,
                 dst_block_id=tail_copy.destination[0].kernel_block.index,
                 num_tokens=len(tail_copy.source) * page,

@@ -1,0 +1,1128 @@
+# Copyright 2026 Rebellions Inc. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at:
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""`DynamicKvSizer`: the sizer's placement-based KV sizing, tested on
+SimpleNamespace stand-ins that carry only the state each path reads."""
+
+import sys
+from contextlib import contextmanager, nullcontext
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+import torch
+from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+
+import vllm_rbln.v1.worker.dynamic_kv_sizer as dks
+from vllm_rbln.v1.worker.dynamic_kv_sizer import DynamicKvSizer
+
+S0 = ("symbol", "s0")
+
+
+def _shard(node, chiplet, shape):
+    return SimpleNamespace(node_id=node, chiplet_id=chiplet, slice_shape=tuple(shape))
+
+
+def _placement(shards):
+    return SimpleNamespace(
+        shape=(2, S0, 8, 1, 1024, 128), dtype="dlfloat16", shards=shards
+    )
+
+
+HEAD_SPLIT = _placement(tuple(_shard(0, c, (2, S0, 2, 1, 1024, 128)) for c in range(4)))
+
+# The same tensor as HEAD_SPLIT, bound by a second program: dynamo names the
+# symbol differently.
+S1 = ("symbol", "s40")
+HEAD_SPLIT_S1 = SimpleNamespace(
+    shape=(2, S1, 8, 1, 1024, 128),
+    dtype="dlfloat16",
+    shards=tuple(_shard(0, c, (2, S1, 2, 1, 1024, 128)) for c in range(4)),
+)
+
+
+def _program(placements, name="0/0", runtime=None, device=None, extent=4):
+    specs = (SimpleNamespace(name="ids", shape=(1,), physical_placement=None),) + tuple(
+        SimpleNamespace(
+            name=f"kv.{i}",
+            shape=tuple(extent if not isinstance(d, int) else d for d in p.shape),
+            physical_placement=p,
+        )
+        for i, p in enumerate(placements)
+    )
+    return SimpleNamespace(
+        name=name,
+        input_specs=specs,
+        runtime=runtime if runtime is not None else object(),
+        device=device,
+    )
+
+
+def _kv_cache_tensors(num_caches: int, stride: int = 1024):
+    """One KVCacheTensor listing the caches vllm allocated, as its builder
+    produces them; the sizer counts their extents against the compiled
+    programs. One layer per extent, so the count is the layer count."""
+    return [
+        SimpleNamespace(
+            layers=[f"layer.{i}" for i in range(num_caches)],
+            layer_stride=stride,
+            offset=0,
+        )
+    ]
+
+
+def _bind_sizing(sizer) -> None:
+    """Give a SimpleNamespace sizer the real placement-sizing methods."""
+    sizer.log_release_shortfall = DynamicKvSizer.log_release_shortfall
+    sizer._specs_covering_tensors = DynamicKvSizer._specs_covering_tensors
+    for name in (
+        "_kv_growth_from_programs",
+        "_size_kv_from_snapshot",
+        "_size_kv_and_release",
+        "_propose_kv_size",
+    ):
+        method = getattr(DynamicKvSizer, name)
+        setattr(sizer, name, lambda *a, _m=method, **kw: _m(sizer, *a, **kw))
+
+
+def _full_spec(block_size=16384):
+    return FullAttentionSpec(
+        block_size=block_size, num_kv_heads=1, head_size=64, dtype=torch.bfloat16
+    )
+
+
+def _sliding_spec(block_size=16384, sliding_window=128):
+    return SlidingWindowSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.bfloat16,
+        sliding_window=sliding_window,
+    )
+
+
+def _group(spec):
+    return SimpleNamespace(kv_cache_spec=spec)
+
+
+class TestInt16BlockIdCap:
+    def test_full_attention_alone_caps_at_the_int16_max(self):
+        cfg = SimpleNamespace(kv_cache_groups=[_group(_full_spec())])
+        assert dks.max_num_blocks_for_int16_block_ids(cfg, [16384]) == (32767, 0, 1)
+
+    def test_the_group_with_the_most_kernel_blocks_per_block_decides(self):
+        cfg = SimpleNamespace(
+            kv_cache_groups=[_group(_full_spec()), _group(_sliding_spec())]
+        )
+        assert dks.max_num_blocks_for_int16_block_ids(cfg, [16384, 128]) == (
+            255,
+            1,
+            128,
+        )
+
+    def test_a_sliding_window_kept_at_the_manager_block_is_not_split(self):
+        cfg = SimpleNamespace(
+            kv_cache_groups=[_group(_full_spec()), _group(_sliding_spec())]
+        )
+        assert dks.max_num_blocks_for_int16_block_ids(cfg, [16384, 16384]) == (
+            32767,
+            0,
+            1,
+        )
+
+    def test_no_attention_group_means_no_cap(self):
+        cfg = SimpleNamespace(kv_cache_groups=[])
+        assert dks.max_num_blocks_for_int16_block_ids(cfg, []) is None
+
+
+class TestCheckBlockIdsFitInt16:
+    @staticmethod
+    def _sizer(num_blocks, *, mode, shrunk=False, override=None):
+        return SimpleNamespace(
+            mode=mode,
+            cache_config=SimpleNamespace(num_gpu_blocks_override=override),
+            compiled_with_shrunk_cache=shrunk,
+            model_runner=SimpleNamespace(
+                kv_cache_config=SimpleNamespace(
+                    num_blocks=num_blocks,
+                    kv_cache_groups=[_group(_sliding_spec()), _group(_full_spec())],
+                ),
+                _kernel_block_sizes=[128, 16384],
+            ),
+        )
+
+    @pytest.mark.parametrize(
+        "mode",
+        [dks.DynamicKvMode.PINNED, dks.DynamicKvMode.DISABLED, dks.DynamicKvMode.INERT],
+    )
+    def test_an_override_past_the_cap_is_refused_with_the_limit(self, mode):
+        sizer = self._sizer(1670, mode=mode, override=1670)
+        with pytest.raises(ValueError) as exc:
+            DynamicKvSizer.check_block_ids_fit_int16(sizer)
+        assert (
+            "holds 1670 blocks (from --num-gpu-blocks-override=1670), but the "
+            "compiled attention ops can address at most 255" in str(exc.value)
+        )
+        assert sizer.model_runner.kv_cache_config.num_blocks == 1670
+
+    def test_the_estimate_past_the_cap_is_named_as_such(self):
+        sizer = self._sizer(428, mode=dks.DynamicKvMode.DISABLED)
+        with pytest.raises(ValueError, match=r"\(from vllm's estimate\)"):
+            DynamicKvSizer.check_block_ids_fit_int16(sizer)
+
+    def test_a_count_within_the_cap_passes(self):
+        sizer = self._sizer(255, mode=dks.DynamicKvMode.PINNED, override=255)
+        DynamicKvSizer.check_block_ids_fit_int16(sizer)
+
+    def test_the_shrunk_compile_is_left_to_the_resize(self):
+        sizer = self._sizer(1670, mode=dks.DynamicKvMode.ACTIVE, shrunk=True)
+        DynamicKvSizer.check_block_ids_fit_int16(sizer)
+
+
+class TestComputeDynamicKvNumBlocks:
+    """`compute_num_blocks` = placement slope x memory snapshot.
+
+    The snapshot is stubbed at the sizer seam (`memory_snapshot`);
+    `TestDynamicKvMemorySnapshot` covers the seam itself.
+    """
+
+    GIB = 2**30
+    HINT = 4
+    TOTAL = 35 * GIB
+
+    @pytest.fixture(autouse=True)
+    def _real_device(self):
+        with patch.object(
+            dks.torch,
+            "rbln",
+            SimpleNamespace(is_dummy_device=lambda: False),
+            create=True,
+        ):
+            yield
+
+    def _sizer(
+        self,
+        *,
+        programs,
+        snapshot,
+        num_caches=None,
+        tp_size=1,
+        gmu=1.0,
+        kv_cache_groups=(),
+        kernel_block_sizes=(),
+    ):
+        if num_caches is None:
+            # Every program binds the same caches unless a test says otherwise.
+            num_caches = sum(
+                spec.physical_placement is not None for spec in programs[0].input_specs
+            )
+        sizer = SimpleNamespace(
+            rank=0,
+            device=torch.device("cpu"),
+            mode=dks.DynamicKvMode.ACTIVE,
+            mode_reason=None,
+            cache_config=SimpleNamespace(
+                num_gpu_blocks_override=None, gpu_memory_utilization=gmu
+            ),
+            parallel_config=SimpleNamespace(tensor_parallel_size=tp_size),
+            kv_blocks_before_shrink=211,
+            model_runner=SimpleNamespace(
+                kv_cache_config=SimpleNamespace(
+                    num_blocks=self.HINT,
+                    kv_cache_tensors=_kv_cache_tensors(num_caches),
+                    kv_cache_groups=list(kv_cache_groups),
+                ),
+                _kernel_block_sizes=list(kernel_block_sizes),
+            ),
+            programs=list(programs),
+            memory_snapshot=lambda device: (snapshot, "stub"),
+            copy_stream_reserve_bytes=lambda: 0,
+            release_kv_cache_tensors=lambda cfg: None,
+        )
+        _bind_sizing(sizer)
+        return sizer
+
+    def _snapshot(self, used):
+        return {
+            (0, c): dks.ChipletMemory(total=self.TOTAL, used=u)
+            for c, u in enumerate(used)
+        }
+
+    def test_the_heaviest_chiplet_decides_after_the_compile_cache_is_released(self):
+        # Two layers -> 2 MiB per block per chiplet.
+        programs = [
+            _program([HEAD_SPLIT, HEAD_SPLIT], name="0/0"),
+            _program([HEAD_SPLIT, HEAD_SPLIT], name="0/1"),
+            _program([], name="0/2"),
+        ]
+        used = [5 * self.GIB, 30 * self.GIB, 1 * self.GIB, 0]
+        order: list = []
+        sizer = self._sizer(programs=programs, snapshot=self._snapshot(used))
+        sizer.release_kv_cache_tensors = lambda cfg: order.append("release")
+        snapshot = sizer.memory_snapshot
+
+        def recording_snapshot(device):
+            order.append("snapshot")
+            return snapshot(device)
+
+        sizer.memory_snapshot = recording_snapshot
+        n = DynamicKvSizer.compute_num_blocks(sizer)
+        # chiplet 1: (35 GiB - 30 GiB) / 2 MiB = 2560 blocks, nothing subtracted
+        assert n == 5 * 512
+        # The first snapshot is the before-release reading the shortfall check
+        # compares against; the count is sized from the one after it.
+        assert order == ["snapshot", "release", "snapshot"]
+
+    def test_the_copy_stream_reserve_comes_off_every_chiplet(self):
+        programs = [_program([HEAD_SPLIT, HEAD_SPLIT], name="0/0")]
+        sizer = self._sizer(
+            programs=programs, snapshot=self._snapshot([30 * self.GIB] * 4)
+        )
+        sizer.copy_stream_reserve_bytes = lambda: 64 * 2**20
+        # (35 GiB - 30 GiB - 64 MiB) / 2 MiB = 2560 - 32 blocks
+        assert DynamicKvSizer.compute_num_blocks(sizer) == 5 * 512 - 32
+
+    def test_gpu_memory_utilization_bounds_the_budget(self):
+        programs = [_program([HEAD_SPLIT])]
+        # The snapshot is taken after the compile cache is released: base 0.
+        snapshot = self._snapshot([0] * 4)
+        full = DynamicKvSizer.compute_num_blocks(
+            self._sizer(programs=programs, snapshot=snapshot, gmu=1.0)
+        )
+        half = DynamicKvSizer.compute_num_blocks(
+            self._sizer(programs=programs, snapshot=snapshot, gmu=0.5)
+        )
+        assert full == 35 * 1024
+        assert half == full // 2
+
+    def test_the_sliding_window_kernel_block_ids_cap_the_count(self, caplog):
+        programs = [_program([HEAD_SPLIT])]
+        groups = [_group(_full_spec()), _group(_sliding_spec())]
+        sizer = self._sizer(
+            programs=programs,
+            snapshot=self._snapshot([0] * 4),
+            kv_cache_groups=groups,
+            kernel_block_sizes=[16384, 128],
+        )
+        with caplog.at_level("WARNING", logger=dks.logger.name):
+            n = DynamicKvSizer.compute_num_blocks(sizer)
+        # 35 * 1024 blocks fit the memory; 255 * 128 is the last id in int16.
+        assert n == 255
+        assert (
+            "capping 35840 blocks to 255: KV cache group 1 maps each block to 128 "
+            "kernel block ids" in caplog.text
+        )
+
+    def test_a_count_under_the_int16_cap_is_left_alone(self):
+        programs = [_program([HEAD_SPLIT])]
+        snapshot = self._snapshot([0] * 4)
+        uncapped = DynamicKvSizer.compute_num_blocks(
+            self._sizer(programs=programs, snapshot=snapshot, gmu=0.005)
+        )
+        sizer = self._sizer(
+            programs=programs,
+            snapshot=snapshot,
+            gmu=0.005,
+            kv_cache_groups=[_group(_full_spec()), _group(_sliding_spec())],
+            kernel_block_sizes=[16384, 128],
+        )
+        assert uncapped < 255
+        assert DynamicKvSizer.compute_num_blocks(sizer) == uncapped
+
+    def test_the_snapshot_is_taken_on_the_program_s_device(self):
+        seen = []
+        programs = [_program([HEAD_SPLIT], device=torch.device("cpu", 3))]
+        sizer = self._sizer(programs=programs, snapshot=self._snapshot([0] * 4))
+
+        def snapshot(device):
+            seen.append(device)
+            return self._snapshot([0] * 4), "stub"
+
+        sizer.memory_snapshot = snapshot
+        DynamicKvSizer.compute_num_blocks(sizer)
+        # Both readings -- before the release and the one sized from.
+        assert seen == [torch.device("cpu", 3)] * 2
+
+    def test_a_base_over_budget_is_refused_with_the_breakdown(self):
+        programs = [_program([HEAD_SPLIT])]
+        snapshot = self._snapshot([self.TOTAL, 0, 0, 0])
+        with pytest.raises(RuntimeError, match="no KV block fits") as exc:
+            DynamicKvSizer.compute_num_blocks(
+                self._sizer(programs=programs, snapshot=snapshot, gmu=0.9)
+            )
+        assert "0:0(" in str(exc.value)
+
+    def test_a_dummy_device_keeps_the_estimate(self, caplog):
+        """The executor compiles under RBLN_DUMMY_DEVICE=1: nothing to measure,
+        so the pre-shrink count is restored instead of refusing the compile."""
+        programs = [_program([HEAD_SPLIT])]
+        sizer = self._sizer(programs=programs, snapshot=self._snapshot([0] * 4))
+        with (
+            patch.object(
+                dks.torch,
+                "rbln",
+                SimpleNamespace(is_dummy_device=lambda: True),
+                create=True,
+            ),
+            caplog.at_level("WARNING"),
+        ):
+            assert DynamicKvSizer.compute_num_blocks(sizer) is None
+        assert "RBLN_DUMMY_DEVICE" in caplog.text
+
+    def test_the_same_tensors_seen_twice_are_counted_once(self, caplog):
+        """Prefill and decode bind the same KV tensors under differently named
+        symbols. Summing both would double the slope and halve the count."""
+        programs = [
+            _program([HEAD_SPLIT, HEAD_SPLIT], name="0/0"),
+            _program([HEAD_SPLIT_S1, HEAD_SPLIT_S1], name="0/1"),
+        ]
+        sizer = self._sizer(
+            programs=programs, snapshot=self._snapshot([30 * self.GIB] * 4)
+        )
+        with caplog.at_level("INFO"):
+            n = DynamicKvSizer.compute_num_blocks(sizer)
+        assert "summed over 2 KV input(s) from 1 set(s)" in caplog.text
+        # 2 MiB per block, not 4: (35 - 30) GiB / 2 MiB.
+        assert n == 5 * 512
+
+    def test_a_drafter_next_to_a_target_seen_twice_is_summed_once(self, caplog):
+        programs = [
+            _program([HEAD_SPLIT, HEAD_SPLIT], name="0/0"),
+            _program([HEAD_SPLIT_S1, HEAD_SPLIT_S1], name="0/1"),
+            _program([HEAD_SPLIT], name="1/0"),
+        ]
+        sizer = self._sizer(
+            programs=programs,
+            snapshot=self._snapshot([30 * self.GIB] * 4),
+            num_caches=3,
+        )
+        with caplog.at_level("INFO"):
+            DynamicKvSizer.compute_num_blocks(sizer)
+        assert "summed over 3 KV input(s) from 2 set(s)" in caplog.text
+
+    def test_disjoint_sets_are_summed(self, caplog):
+        """A target's and a drafter's KV are different tensors; the sum is the
+        answer."""
+        programs = [_program([HEAD_SPLIT, HEAD_SPLIT], name="0/0")]
+        sizer = self._sizer(
+            programs=programs, snapshot=self._snapshot([30 * self.GIB] * 4)
+        )
+        with caplog.at_level("INFO"):
+            DynamicKvSizer.compute_num_blocks(sizer)
+        assert "summed over 2 KV input(s) from 1 set(s)" in caplog.text
+        assert "vllm allocated 1 KV cache tensor(s) over 2 cache(s)" in caplog.text
+
+    def test_a_count_that_matches_neither_reading_is_refused(self):
+        programs = [
+            _program([HEAD_SPLIT, HEAD_SPLIT], name="0/0"),
+            _program([HEAD_SPLIT_S1, HEAD_SPLIT_S1], name="0/1"),
+        ]
+        sizer = self._sizer(
+            programs=programs, snapshot=self._snapshot([30 * self.GIB] * 4)
+        )
+        sizer.model_runner.kv_cache_config.kv_cache_tensors = _kv_cache_tensors(3)
+        with pytest.raises(RuntimeError, match="neither sum to nor"):
+            DynamicKvSizer.compute_num_blocks(sizer)
+
+    def test_programs_that_disagree_on_the_layout_are_refused(self):
+        other = _placement((_shard(0, 0, (2, S0, 8, 1, 1024, 128)),))
+        programs = [_program([HEAD_SPLIT]), _program([other], name="0/1")]
+        with pytest.raises(RuntimeError, match="disagree"):
+            DynamicKvSizer.compute_num_blocks(
+                self._sizer(programs=programs, snapshot=self._snapshot([0] * 4))
+            )
+
+
+class TestDynamicKvMemorySnapshot:
+    """`memory_snapshot` prefers the driver's per-chiplet figures and
+    falls back to this process's allocator with the reserve and foreign usage
+    added back."""
+
+    DRIVER = {
+        "npu.0.chiplet.0.total": 100,
+        "npu.0.chiplet.0.used": 40,
+        "npu.0.chiplet.1.total": 100,
+        "npu.0.chiplet.1.used": 10,
+    }
+    ALLOCATOR = {
+        "npu.0.chiplet.0.reserved.current": 30,
+        "npu.0.chiplet.1.reserved.current": 5,
+    }
+
+    @staticmethod
+    def _sizer(foreign=0):
+        return SimpleNamespace(foreign_dram_used_bytes=foreign)
+
+    def _rbln(self, *, driver=None, driver_error=None, allocator=None, per_chiplet=100):
+        calls = []
+        rbln = SimpleNamespace(
+            empty_cache=lambda device: calls.append(("empty_cache", device)),
+            get_device_properties=lambda device: SimpleNamespace(
+                memory_per_chiplet=per_chiplet
+            ),
+            memory_stats_per_chiplet=lambda device: dict(allocator or {}),
+        )
+        if driver is not None or driver_error is not None:
+
+            def query(device):
+                if driver_error is not None:
+                    raise driver_error
+                return dict(driver)
+
+            rbln.mem_get_info_per_chiplet = query
+        return rbln, calls
+
+    def _snapshot(self, rbln, sizer=None):
+        with patch.object(dks.torch, "rbln", rbln, create=True):
+            return DynamicKvSizer.memory_snapshot(
+                sizer or self._sizer(), torch.device("cpu")
+            )
+
+    def test_the_driver_wins_when_it_answers(self):
+        rbln, calls = self._rbln(driver=self.DRIVER, allocator=self.ALLOCATOR)
+        snapshot, source = self._snapshot(rbln)
+        assert source == "driver"
+        assert snapshot == {
+            (0, 0): dks.ChipletMemory(total=100, used=40),
+            (0, 1): dks.ChipletMemory(total=100, used=10),
+        }
+        assert calls == []
+
+    def test_an_old_driver_falls_back_to_the_allocator(self, caplog):
+        rbln, calls = self._rbln(
+            driver_error=RuntimeError("does not provide the query"),
+            allocator=self.ALLOCATOR,
+            per_chiplet=100,
+        )
+        with caplog.at_level("WARNING"):
+            snapshot, source = self._snapshot(rbln, self._sizer(foreign=20))
+        assert source == "allocator"
+        reserve = dks.DYNAMIC_KV_ALLOCATOR_RESERVE_BYTES
+        assert snapshot == {
+            (0, 0): dks.ChipletMemory(total=100, used=30 + 10 + reserve),
+            (0, 1): dks.ChipletMemory(total=100, used=5 + 10 + reserve),
+        }
+        # Cached-but-free blocks would otherwise count as reserved.
+        assert calls == [("empty_cache", torch.device("cpu"))]
+        assert "sizing from this process's allocator" in caplog.text
+
+    def test_a_torch_rbln_without_the_query_falls_back_too(self, caplog):
+        rbln, _ = self._rbln(allocator=self.ALLOCATOR)
+        with caplog.at_level("WARNING"):
+            _, source = self._snapshot(rbln)
+        assert source == "allocator"
+        assert "no mem_get_info_per_chiplet" in caplog.text
+
+
+class TestModeResolution:
+    """One decision at init: every input is static config or env, so the rest of
+    the sizer branches on the mode instead of re-reading them."""
+
+    def test_explicit_off_is_silent_in_the_worker(self, monkeypatch, caplog):
+        monkeypatch.setenv("VLLM_RBLN_USE_DEVICE_TENSOR", "1")
+        config = SimpleNamespace(
+            cache_config=SimpleNamespace(
+                num_gpu_blocks_override=None,
+                block_size=16,
+            ),
+            scheduler_config=SimpleNamespace(),
+            device_config=SimpleNamespace(device=torch.device("cpu")),
+            parallel_config=SimpleNamespace(rank=0),
+            model_config=SimpleNamespace(enforce_eager=False, max_model_len=32),
+            additional_config=SimpleNamespace(
+                compile_model=True,
+                use_custom_kernel=False,
+                use_dynamic_kv_cache=False,
+            ),
+            speculative_config=None,
+            kv_transfer_config=None,
+        )
+
+        with caplog.at_level("WARNING"):
+            sizer = DynamicKvSizer(config, object(), foreign_dram_used_bytes=0)
+
+        assert sizer.mode is dks.DynamicKvMode.DISABLED
+        assert caplog.records == []
+
+    @staticmethod
+    def _mode(**kwargs):
+        args = dict(
+            use_dynamic_kv=True,
+            unsupported_reason=None,
+            num_gpu_blocks_override=None,
+            compile_skip_reason=None,
+        )
+        return dks.resolve_mode(**{**args, **kwargs})
+
+    def test_the_flag_off_disables_everything(self):
+        assert self._mode(use_dynamic_kv=False) == (
+            dks.DynamicKvMode.DISABLED,
+            "use_dynamic_kv_cache is off",
+        )
+
+    def test_an_unsupported_config_disables_the_feature(self):
+        # The flag is on by default, so a shape the path cannot size turns it
+        # off rather than refusing a run the flag off would have served.
+        assert self._mode(unsupported_reason="the optimum path") == (
+            dks.DynamicKvMode.DISABLED,
+            "the optimum path",
+        )
+
+    def test_unsupported_wins_over_a_skipped_compile_and_the_override(self):
+        assert self._mode(
+            unsupported_reason="the optimum path",
+            compile_skip_reason="enforce_eager is set",
+            num_gpu_blocks_override=64,
+        ) == (dks.DynamicKvMode.DISABLED, "the optimum path")
+
+    def test_a_skipped_compile_wins_over_the_override(self):
+        assert self._mode(
+            compile_skip_reason="enforce_eager is set",
+            num_gpu_blocks_override=64,
+        ) == (dks.DynamicKvMode.INERT, "enforce_eager is set")
+
+    def test_an_override_pins_the_count(self):
+        assert self._mode(num_gpu_blocks_override=64) == (
+            dks.DynamicKvMode.PINNED,
+            "--num-gpu-blocks-override=64",
+        )
+
+    def test_the_flag_alone_is_active(self):
+        assert self._mode() == (dks.DynamicKvMode.ACTIVE, None)
+
+
+class TestWarmupCapturesPrograms:
+    """The programs warm-up builds are the only handle on the KV-holding
+    runtimes, so the capture has to wrap exactly the warm-up."""
+
+    def test_off_means_no_capture(self):
+        sizer = SimpleNamespace(mode=dks.DynamicKvMode.DISABLED)
+        with DynamicKvSizer.capture_programs(sizer) as programs:
+            pass
+        assert programs is None
+
+    def test_on_opens_torch_rbln_s_scope(self):
+        recorded = ["p0", "p1"]
+
+        @contextmanager
+        def fake_capture():
+            yield recorded
+
+        sizer = SimpleNamespace(mode=dks.DynamicKvMode.ACTIVE)
+        with (
+            patch.object(
+                dks.torch,
+                "rbln",
+                SimpleNamespace(capture_programs=fake_capture),
+                create=True,
+            ),
+            DynamicKvSizer.capture_programs(sizer) as programs,
+        ):
+            pass
+        assert programs is recorded
+
+    def test_on_without_capture_programs_refuses(self):
+        with (
+            patch.object(dks.torch, "rbln", SimpleNamespace(), create=True),
+            pytest.raises(RuntimeError, match="capture_programs"),
+        ):
+            DynamicKvSizer.capture_programs(
+                SimpleNamespace(mode=dks.DynamicKvMode.ACTIVE)
+            )
+
+    def test_runtimes_are_deduped_across_programs(self):
+        shared = object()
+        sizer = SimpleNamespace(
+            programs=[
+                _program([HEAD_SPLIT], runtime=shared),
+                _program([HEAD_SPLIT], runtime=shared),
+                _program([], runtime=object()),
+            ]
+        )
+        assert len(DynamicKvSizer.collect_runtimes(sizer)) == 2
+
+
+class TestMaybeShrinkKvCacheForCompile:
+    """The shrink decides the compile size and, through the latch, whether the
+    resize runs at all: every branch returning the config unchanged turns the
+    feature off for that run, so the branch taken and its log are the behaviour.
+    """
+
+    ESTIMATED_BLOCKS = 211
+    PAGE_SIZE = 1 << 20
+
+    @classmethod
+    def _config(cls, num_blocks=None):
+        blocks = cls.ESTIMATED_BLOCKS if num_blocks is None else num_blocks
+        return SimpleNamespace(
+            num_blocks=blocks,
+            kv_cache_tensors=[
+                # Layer-compact placement: two single-layer groups overlaying
+                # the pool from byte 0. Rescaling moves everything but the page.
+                SimpleNamespace(
+                    size=blocks * cls.PAGE_SIZE,
+                    layers=["layer.0"],
+                    layer_stride=blocks * cls.PAGE_SIZE,
+                    block_stride=cls.PAGE_SIZE,
+                    offset=0,
+                ),
+                SimpleNamespace(
+                    size=blocks * cls.PAGE_SIZE,
+                    layers=["layer.1"],
+                    layer_stride=blocks * cls.PAGE_SIZE,
+                    block_stride=cls.PAGE_SIZE,
+                    offset=0,
+                ),
+            ],
+        )
+
+    @staticmethod
+    def _shrink(config, *, dynamic=True, override=None, warmup_skipped=False):
+        mode, reason = dks.resolve_mode(
+            use_dynamic_kv=dynamic,
+            unsupported_reason=None,
+            num_gpu_blocks_override=override,
+            compile_skip_reason="enforce_eager is set" if warmup_skipped else None,
+        )
+        sizer = SimpleNamespace(
+            mode=mode,
+            mode_reason=reason,
+            cache_config=SimpleNamespace(num_gpu_blocks_override=override),
+            kv_blocks_before_shrink=None,
+        )
+        out = DynamicKvSizer.shrink_for_compile(sizer, config)
+        return sizer, out
+
+    def test_the_flag_alone_shrinks_to_the_constant(self, caplog):
+        config = self._config()
+        with caplog.at_level("INFO"):
+            sizer, out = self._shrink(config)
+
+        assert out is not config
+        assert out.num_blocks == dks.COMPILE_KV_CACHE_NUM_BLOCKS
+        assert sizer.kv_blocks_before_shrink == self.ESTIMATED_BLOCKS
+        # The tensors have to shrink with num_blocks or the allocation and the
+        # config disagree.
+        for kv_tensor in out.kv_cache_tensors:
+            assert kv_tensor.size == out.num_blocks * self.PAGE_SIZE
+        # The caller's config must survive: it is what the resize restores to.
+        assert config.num_blocks == self.ESTIMATED_BLOCKS
+        assert all(
+            t.size == self.ESTIMATED_BLOCKS * self.PAGE_SIZE
+            for t in config.kv_cache_tensors
+        )
+
+    def test_the_flag_off_returns_the_config_untouched(self):
+        config = self._config()
+        sizer, out = self._shrink(config, dynamic=False)
+        assert out is config
+        assert sizer.kv_blocks_before_shrink is None
+
+    def test_a_pinned_block_count_cancels_the_shrink(self, caplog):
+        config = self._config()
+        with caplog.at_level("WARNING"):
+            sizer, out = self._shrink(config, override=64)
+
+        assert out is config
+        assert sizer.kv_blocks_before_shrink is None
+        assert "num-gpu-blocks-override" in caplog.text
+
+    def test_a_hint_that_cannot_shrink_refuses(self):
+        # The estimate is free memory over the cost of one block, so a large
+        # block_size can legally put it at or below the hint. Serving on there
+        # would silently keep the pre-compile estimate, so it is a refusal.
+        with pytest.raises(RuntimeError, match="nothing to shrink"):
+            self._shrink(self._config(num_blocks=dks.COMPILE_KV_CACHE_NUM_BLOCKS))
+
+    def test_no_warmup_means_no_shrink(self, caplog):
+        """Skipping compile/warm-up has to skip the shrink too: otherwise the
+        latch is set, the profile query finds no runtimes, and the restore path
+        trips an assertion whose message names none of the cause.
+        """
+        config = self._config()
+        with caplog.at_level("WARNING"):
+            sizer, out = self._shrink(config, warmup_skipped=True)
+
+        assert out is config
+        assert sizer.kv_blocks_before_shrink is None
+        assert "compile/warm-up is skipped" in caplog.text
+        assert "does nothing for this run" in caplog.text
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {},
+            {"dynamic": False},
+            {"override": 64},
+            {"warmup_skipped": True},
+        ],
+        ids=["active", "disabled", "pinned", "inert"],
+    )
+    def test_a_connector_waits_exactly_where_the_shrink_latched(self, kwargs):
+        # A KV connector registers the addresses it is handed. It may only be
+        # made to wait where the cache it would see now is the placeholder the
+        # resize replaces -- which is the branch that shrinks, and no other.
+        config = self._config()
+        sizer, out = self._shrink(config, **kwargs)
+
+        # A bare instance: the property reads the mode and nothing else, while
+        # __init__ wants a device.
+        probe = object.__new__(DynamicKvSizer)
+        probe.mode = sizer.mode
+        assert probe.defers_kv_registration == (out is not config)
+
+
+class TestReleaseShortfallIsReported:
+    """The count is sized from the snapshot after the release, so bytes the
+    runtime keeps are charged to the non-KV base and silently cost blocks."""
+
+    @staticmethod
+    def _mem(used):
+        return {u: dks.ChipletMemory(total=100, used=used[u]) for u in used}
+
+    def test_a_full_release_says_nothing(self, caplog):
+        with caplog.at_level("WARNING"):
+            DynamicKvSizer.log_release_shortfall(
+                self._mem({(0, 0): 50, (0, 1): 50}),
+                self._mem({(0, 0): 10, (0, 1): 10}),
+                {(0, 0): 40, (0, 1): 40},
+                4,
+            )
+        assert caplog.text == ""
+
+    def test_retained_bytes_are_named_per_chiplet(self, caplog):
+        with caplog.at_level("WARNING"):
+            DynamicKvSizer.log_release_shortfall(
+                self._mem({(0, 0): 50, (0, 1): 50}),
+                self._mem({(0, 0): 10, (0, 1): 35}),  # chiplet 1 kept 25
+                {(0, 0): 40, (0, 1): 40},
+                4,
+            )
+        assert "the 4-block compile cache holds" in caplog.text
+        assert "{'0:1': 25}" in caplog.text
+
+
+class TestOnlyTheShrunkModeReplacesTheEstimate:
+    """Every mode but ACTIVE serves the estimate vllm sized, so nothing that
+    only the resize justifies may move it."""
+
+    def test_the_one_request_floor_is_only_for_the_shrunk_estimate(self, monkeypatch):
+        """The floor exists because the shrink makes the estimate a placeholder.
+        Every other mode serves this estimate, so raising it resizes the pool."""
+        spec = SimpleNamespace()
+        monkeypatch.setattr(dks, "get_kv_cache_groups", lambda cfg, spec: ["g"])
+        monkeypatch.setattr(
+            dks, "_max_memory_usage_bytes_from_groups", lambda cfg, groups: 8000
+        )
+        monkeypatch.setattr(dks, "_pool_bytes_per_block", lambda groups: 100)
+        monkeypatch.setattr(dks, "estimate_available_memory", lambda **kw: 999)
+
+        def sizer(mode):
+            return SimpleNamespace(
+                mode=mode,
+                vllm_config=SimpleNamespace(),
+                model_runner=SimpleNamespace(
+                    get_kv_cache_spec=lambda: {"a": spec, "b": spec}
+                ),
+            )
+
+        with patch.object(
+            dks.torch,
+            "rbln",
+            SimpleNamespace(is_dummy_device=lambda: True),
+            create=True,
+        ):
+            active = DynamicKvSizer.pre_compile_estimate(
+                sizer(dks.DynamicKvMode.ACTIVE), {}
+            )
+            assert active == 8100
+            for mode in (dks.DynamicKvMode.PINNED, dks.DynamicKvMode.INERT):
+                assert DynamicKvSizer.pre_compile_estimate(sizer(mode), {}) == 999
+
+    def test_the_flag_off_never_snapshots(self, monkeypatch):
+        """The DISABLED early return is the only thing keeping the default path
+        on the plain estimate instead of the per-chiplet snapshot."""
+        seen: list = []
+        monkeypatch.setattr(dks, "estimate_available_memory", lambda **kw: 777)
+        sizer = SimpleNamespace(
+            mode=dks.DynamicKvMode.DISABLED,
+            memory_snapshot=lambda device: seen.append(device),
+        )
+        assert DynamicKvSizer.pre_compile_estimate(sizer, {}) == 777
+        assert seen == []
+
+
+class TestDynamicKvFailuresRaise:
+    """After the shrink, failing to size from the device must not boot: the run
+    would serve the pre-compile estimate. The gates before it stay a quiet None."""
+
+    @staticmethod
+    def _sizer(*, shrunk=True, override=None, programs=()):
+        mode, reason = dks.resolve_mode(
+            use_dynamic_kv=True,
+            unsupported_reason=None,
+            num_gpu_blocks_override=override,
+            compile_skip_reason=None if shrunk or override else "enforce_eager is set",
+        )
+        sizer = SimpleNamespace(
+            rank=0,
+            mode=mode,
+            mode_reason=reason,
+            cache_config=SimpleNamespace(num_gpu_blocks_override=override),
+            kv_blocks_before_shrink=211 if shrunk else None,
+            model_runner=SimpleNamespace(
+                kv_cache_config=SimpleNamespace(
+                    num_blocks=211, kv_cache_tensors=_kv_cache_tensors(2)
+                )
+            ),
+            programs=list(programs),
+            release_kv_cache_tensors=lambda cfg: None,
+        )
+        _bind_sizing(sizer)
+        return sizer
+
+    @pytest.fixture(autouse=True)
+    def _real_device(self):
+        with patch.object(
+            dks.torch,
+            "rbln",
+            SimpleNamespace(is_dummy_device=lambda: False),
+            create=True,
+        ):
+            yield
+
+    def test_no_program_after_the_shrink_raises(self):
+        with pytest.raises(RuntimeError, match="none of the 0"):
+            DynamicKvSizer.compute_num_blocks(self._sizer(programs=()))
+
+    def test_no_dynamic_input_after_the_shrink_raises(self):
+        """Every program static is the documented replayed-static-build case.
+
+        It used to log an error and boot on the estimate, which is the bug this
+        feature exists to remove.
+        """
+        with pytest.raises(RuntimeError) as exc:
+            DynamicKvSizer.compute_num_blocks(
+                self._sizer(programs=(_program([]), _program([], name="0/1")))
+            )
+        assert "dynamic-shape KV input" in str(exc.value)
+        assert "VLLM_CACHE_ROOT" in str(exc.value)
+
+    def test_the_pre_shrink_gates_still_return_none(self):
+        """An override and "not shrunk" are legitimate: nothing moved."""
+        assert DynamicKvSizer.compute_num_blocks(self._sizer(override=64)) is None
+        # The shrink did not happen, so there is nothing to size from.
+        assert DynamicKvSizer.compute_num_blocks(self._sizer(shrunk=False)) is None
+
+
+class TestKvCopyStreamReserve:
+    """The reserve follows the scheduler's own sub-block prefix caching predicate."""
+
+    @staticmethod
+    def _sizer(*, prefix_caching=True, sub_block_cache=True, sub_block_size=0):
+        return SimpleNamespace(
+            cache_config=SimpleNamespace(
+                enable_prefix_caching=prefix_caching, block_size=1024
+            ),
+            vllm_config=SimpleNamespace(
+                additional_config=SimpleNamespace(
+                    enable_sub_block_cache=sub_block_cache,
+                    sub_block_size=sub_block_size,
+                )
+            ),
+            scheduler_config=SimpleNamespace(max_num_batched_tokens=512),
+            model_runner=SimpleNamespace(kv_cache_config=SimpleNamespace()),
+        )
+
+    @staticmethod
+    def _manager(monkeypatch, eligible):
+        fake = SimpleNamespace(
+            RBLNKVCacheManager=SimpleNamespace(
+                can_use_sub_block_caching=lambda cfg, sub_block_size: eligible
+            )
+        )
+        monkeypatch.setitem(
+            sys.modules, "vllm_rbln.v1.core.rbln_kv_cache_manager", fake
+        )
+
+    def test_reserved_when_the_scheduler_would_sub_block_cache(self, monkeypatch):
+        self._manager(monkeypatch, eligible=True)
+        assert (
+            DynamicKvSizer.copy_stream_reserve_bytes(self._sizer())
+            == dks.DYNAMIC_KV_COPY_STREAM_RESERVE_BYTES
+        )
+
+    def test_the_configured_size_reaches_the_eligibility_check(self, monkeypatch, cr13):
+        # Not the prefill chunk: RBLNConfig.sub_block_size decouples the two.
+        seen: list[int] = []
+
+        def can_use(cfg, sub_block_size):
+            seen.append(sub_block_size)
+            return True
+
+        monkeypatch.setitem(
+            sys.modules,
+            "vllm_rbln.v1.core.rbln_kv_cache_manager",
+            SimpleNamespace(
+                RBLNKVCacheManager=SimpleNamespace(can_use_sub_block_caching=can_use)
+            ),
+        )
+        DynamicKvSizer.copy_stream_reserve_bytes(self._sizer(sub_block_size=64))
+        assert seen == [64]
+
+    def test_nothing_without_prefix_caching(self, monkeypatch):
+        self._manager(monkeypatch, eligible=True)
+        sizer = self._sizer(prefix_caching=False)
+        assert DynamicKvSizer.copy_stream_reserve_bytes(sizer) == 0
+
+    def test_nothing_when_sub_block_cache_is_off(self, monkeypatch):
+        self._manager(monkeypatch, eligible=True)
+        sizer = self._sizer(sub_block_cache=False)
+        assert DynamicKvSizer.copy_stream_reserve_bytes(sizer) == 0
+
+    def test_nothing_when_the_config_is_ineligible(self, monkeypatch):
+        self._manager(monkeypatch, eligible=False)
+        assert DynamicKvSizer.copy_stream_reserve_bytes(self._sizer()) == 0
+
+
+class TestApplyResizesThenMaterializes:
+    """`apply_num_blocks` settles the latch, and any actual resize
+    must be followed by the boot-time materialization: without it the first
+    request pays the whole pool's physical allocation (measured 19.8 s TTFT)."""
+
+    @staticmethod
+    def _sizer(*, before_shrink=211, current=4):
+        calls: list = []
+        sizer = SimpleNamespace(
+            kv_blocks_before_shrink=before_shrink,
+            model_runner=SimpleNamespace(
+                kv_cache_config=SimpleNamespace(num_blocks=current),
+                kv_caches=[object()],
+            ),
+            reallocate=lambda target: calls.append(("realloc", target)),
+            materialize=lambda: calls.append(("materialize",)),
+            expected_used={},
+            log_fit_check=lambda n: calls.append(("check", n)),
+        )
+        return sizer, calls
+
+    def test_a_computed_count_reallocates_then_materializes(self):
+        sizer, calls = self._sizer()
+        assert DynamicKvSizer.apply_num_blocks(sizer, 1368) == 1368
+        assert calls == [("realloc", 1368), ("materialize",)]
+        assert sizer.kv_blocks_before_shrink is None
+
+    def test_a_computed_count_is_checked_against_the_prediction(self):
+        sizer, calls = self._sizer()
+        sizer.expected_used = {(0, 0): 123}
+        assert DynamicKvSizer.apply_num_blocks(sizer, 1368) == 1368
+        assert calls == [("realloc", 1368), ("materialize",), ("check", 1368)]
+
+    def test_the_fit_check_reports_measured_against_expected(self, caplog):
+        snapshot = {(0, 0): dks.ChipletMemory(total=1000, used=460)}
+        sizer = SimpleNamespace(
+            device=torch.device("cpu"),
+            cache_config=SimpleNamespace(gpu_memory_utilization=0.5),
+            expected_used={(0, 0): 450, (0, 1): 7},
+            memory_snapshot=lambda device: (snapshot, "driver"),
+        )
+        with caplog.at_level("INFO"):
+            DynamicKvSizer.log_fit_check(sizer, 58)
+        assert "0:0(expected=450 measured=460 diff=+10 budget_left=+40)" in caplog.text
+        assert "0:1(expected=7 measured=?)" in caplog.text
+
+    def test_none_restores_the_pre_shrink_count(self):
+        sizer, calls = self._sizer()
+        with patch.object(
+            dks.torch,
+            "rbln",
+            SimpleNamespace(is_dummy_device=lambda: False),
+            create=True,
+        ):
+            assert DynamicKvSizer.apply_num_blocks(sizer, None) == 211
+        assert calls == [("realloc", 211), ("materialize",)]
+
+    def test_none_on_a_dummy_device_keeps_the_compile_cache(self):
+        sizer, calls = self._sizer()
+        with patch.object(
+            dks.torch,
+            "rbln",
+            SimpleNamespace(is_dummy_device=lambda: True),
+            create=True,
+        ):
+            assert DynamicKvSizer.apply_num_blocks(sizer, None) == 4
+        assert calls == []
+        assert sizer.kv_blocks_before_shrink is None
+
+    def test_a_matching_count_skips_both(self):
+        sizer, calls = self._sizer(before_shrink=4, current=4)
+        assert DynamicKvSizer.apply_num_blocks(sizer, 4) == 4
+        assert calls == []
+
+    def test_a_matching_count_still_reallocates_a_released_cache(self):
+        # Release-first sizing leaves the sizer with no KV cache; landing on
+        # the compile hint must not skip the realloc, or the first forward has
+        # nothing bound.
+        sizer, calls = self._sizer(before_shrink=4, current=4)
+        sizer.model_runner.kv_caches = []
+        assert DynamicKvSizer.apply_num_blocks(sizer, 4) == 4
+        assert calls == [("realloc", 4), ("materialize",)]
+
+    def test_nothing_pending_returns_none(self):
+        sizer, calls = self._sizer(before_shrink=None)
+        assert DynamicKvSizer.apply_num_blocks(sizer, None) is None
+        assert calls == []
+
+    def test_materialize_runs_every_model_graph(self):
+        ran: list = []
+        sizer = SimpleNamespace(
+            mode=dks.DynamicKvMode.ACTIVE,
+            model_runner=SimpleNamespace(
+                offload_context=nullcontext,
+                run_model_graphs=lambda: ran.append("graphs"),
+            ),
+        )
+        DynamicKvSizer.materialize(sizer)
+        assert ran == ["graphs"]
+
+
+class TestReleaseKvCacheTensors:
+    def test_it_clears_every_piece_of_the_rebound_state(self, monkeypatch):
+        # The rebind reassigns these together from one ordered name list, so a
+        # piece left behind describes a cache that no longer exists.
+        layer = SimpleNamespace(kv_cache=torch.zeros(1))
+        model_runner = SimpleNamespace(
+            kv_caches=[torch.zeros(1)],
+            kv_cache_bases=[torch.zeros(1)],
+            kv_cache_names=["l0"],
+            kv_cache_block_axes={"l0": 1},
+            compilation_config=SimpleNamespace(static_forward_context={"l0": layer}),
+        )
+        sizer = SimpleNamespace(
+            model_runner=model_runner,
+            allocator_state_per_chiplet=lambda: "stub",
+        )
+        old_cfg = SimpleNamespace(
+            num_blocks=4,
+            kv_cache_tensors=[SimpleNamespace(layers=["l0"], size=8)],
+        )
+        monkeypatch.setattr(dks, "empty_rbln_device_caches", lambda: False)
+
+        DynamicKvSizer.release_kv_cache_tensors(sizer, old_cfg)
+
+        assert model_runner.kv_caches == []
+        assert model_runner.kv_cache_bases == []
+        assert model_runner.kv_cache_names == []
+        assert model_runner.kv_cache_block_axes == {}
+        assert layer.kv_cache is None

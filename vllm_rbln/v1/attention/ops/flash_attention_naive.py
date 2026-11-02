@@ -14,8 +14,6 @@
 
 import torch
 
-from vllm_rbln import envs
-
 from . import triton_flash_attention_naive  # noqa: F401
 
 
@@ -29,35 +27,36 @@ def flash_attention_naive_prefill(
     seq_idx: torch.Tensor,
     block_tables: torch.Tensor,
     sinks: torch.Tensor | None = None,
+    *,
+    use_custom_kernel: bool,
+    is_prompt_sorted: bool = False,
 ) -> torch.Tensor:
-    if envs.VLLM_RBLN_COMPILE_MODEL:
-        if envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
-            return torch.ops.rbln_triton_ops.flash_attention_naive_prefill(
-                q,
-                k,
-                v,
-                kv_cache,
-                mask,
-                scale,
-                seq_idx,
-                block_tables,
-                scale,  # dummy
-            )
-        else:
-            return torch.ops.rbln_custom_ops.flash_attention_naive_prefill(
-                q,
-                k,
-                v,
-                kv_cache,
-                mask,
-                scale,
-                seq_idx,
-                block_tables,
-                scale,  # dummy
-                sinks,
-            )
-
-    raise NotImplementedError
+    if use_custom_kernel:
+        return torch.ops.rbln_triton_ops.flash_attention_naive_prefill(
+            q,
+            k,
+            v,
+            kv_cache,
+            mask,
+            scale,
+            seq_idx,
+            block_tables,
+            scale,  # dummy
+        )
+    else:
+        return torch.ops.rbln_custom_ops.flash_attention_naive_prefill(
+            q,
+            k,
+            v,
+            kv_cache,
+            mask,
+            scale,
+            seq_idx,
+            block_tables,
+            scale,  # dummy
+            sinks,
+            is_prompt_sorted=is_prompt_sorted,
+        )
 
 
 def flash_attention_naive_decode(
@@ -70,32 +69,33 @@ def flash_attention_naive_decode(
     seq_idx: torch.Tensor,
     block_tables: torch.Tensor,
     sinks: torch.Tensor | None = None,
+    *,
+    use_custom_kernel: bool,
+    is_prompt_sorted: bool = False,
 ) -> torch.Tensor:
-    if envs.VLLM_RBLN_COMPILE_MODEL:
-        if envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
-            return torch.ops.rbln_triton_ops.flash_attention_naive_decode(
-                q,
-                k,
-                v,
-                kv_cache,
-                mask,
-                scale,
-                seq_idx,
-                block_tables,
-                scale,  # dummy
-            )
-        else:
-            return torch.ops.rbln_custom_ops.flash_attention_naive_decode(
-                q,
-                k,
-                v,
-                kv_cache,
-                mask,
-                scale,
-                seq_idx,
-                block_tables,
-                scale,  # dummy
-                sinks,
-            )
-
-    raise NotImplementedError
+    if use_custom_kernel:
+        return torch.ops.rbln_triton_ops.flash_attention_naive_decode(
+            q,
+            k,
+            v,
+            kv_cache,
+            mask,
+            scale,
+            seq_idx,
+            block_tables,
+            scale,  # dummy
+        )
+    else:
+        return torch.ops.rbln_custom_ops.flash_attention_naive_decode(
+            q,
+            k,
+            v,
+            kv_cache,
+            mask,
+            scale,
+            seq_idx,
+            block_tables,
+            scale,  # dummy
+            sinks,
+            is_prompt_sorted=is_prompt_sorted,
+        )

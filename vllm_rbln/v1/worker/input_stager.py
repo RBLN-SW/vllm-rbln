@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+from vllm.sequence import IntermediateTensors
 
 
 @dataclass(frozen=True)
@@ -44,7 +45,7 @@ class InputBuffer:
 class StagedModelInputs:
     input_ids: torch.Tensor
     positions: torch.Tensor
-    intermediate_tensors: torch.Tensor | None
+    intermediate_tensors: IntermediateTensors | None
     inputs_embeds: torch.Tensor | None
     token_indices: torch.Tensor | None
     # For Eagle3 drafter
@@ -66,13 +67,14 @@ class InputStager:
         self._buffers: dict[tuple, InputBuffer] = {}
         self._hidden_state_buffers: dict[tuple, torch.Tensor] = {}
         self._token_indices_buffers: dict[tuple[torch.dtype, int], torch.Tensor] = {}
+        self._mm_embeds_buffers: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 
     def stage(
         self,
         *,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        intermediate_tensors: torch.Tensor | None = None,
+        intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         token_indices: torch.Tensor | None = None,
         hidden_states: torch.Tensor | None = None,
@@ -155,6 +157,33 @@ class InputStager:
             non_blocking=True,
         )
         return buf
+
+    def stage_mm_embeds(
+        self,
+        mm_embeds: torch.Tensor,
+        mm_mask: torch.Tensor,
+        layout: InputLayout,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Pad a multimodal model's per-token vision embeddings [R, L, H] and
+        their 0 / 1 mask [R, L, 1] to the layout; padding is text (mask 0)."""
+        key = (layout.shape, mm_embeds.dtype, mm_embeds.shape[-1])
+        if (bufs := self._mm_embeds_buffers.get(key)) is None:
+            bufs = (
+                torch.empty(
+                    (*layout.shape, mm_embeds.shape[-1]),
+                    dtype=mm_embeds.dtype,
+                    device=self.device,
+                ),
+                torch.empty(
+                    (*layout.shape, 1), dtype=mm_mask.dtype, device=self.device
+                ),
+            )
+            self._mm_embeds_buffers[key] = bufs
+
+        for buf, src in zip(bufs, (mm_embeds, mm_mask)):
+            buf.zero_()
+            buf[: layout.num_reqs, : layout.query_len].copy_(src, non_blocking=True)
+        return bufs
 
     def _stage_token_indices(
         self,

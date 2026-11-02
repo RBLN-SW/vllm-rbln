@@ -184,6 +184,7 @@ class RBLNOptimumForEncoderModel(RBLNOptimumModelBase, VllmModelForPooling):
         )
 
     def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
+        request_nums = model_input.input_tokens.shape[0]
         input_ids, positions = self.preprocess(
             model_input.input_tokens,
             model_input.input_positions,
@@ -194,7 +195,6 @@ class RBLNOptimumForEncoderModel(RBLNOptimumModelBase, VllmModelForPooling):
             positions.shape[1], device=positions.device
         ).unsqueeze(0)
         attention_mask = (position_indices <= max_position.unsqueeze(1)).long()
-        request_nums = input_ids.shape[0]
         kwargs = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,

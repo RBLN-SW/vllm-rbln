@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -34,7 +34,11 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
-from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
+from vllm.v1.core.sched.request_queue import (
+    RequestQueue,
+    SchedulingPolicy,
+    create_request_queue,
+)
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreEventType
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -44,6 +48,7 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
+from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.core.optimum_kv_cache_manager import RBLNKVCacheManager
 
@@ -64,12 +69,18 @@ class RBLNSchedulerOutput(SchedulerOutput):
         The index of dummy block for padding. It is required
         if the number of requests is less than the number of batch_size
         in decode phase.
+    cache_slot_id_dict: dict[str, int]
+        Mapping from request ID to its cache slot id, for every
+        scheduled request. The id is the request's row in the per-sequence
+        on-device caches (sliding-window KV, linear-attention state), pinned
+        for the request's lifetime.
     """
 
     block_table_dict: dict[str, torch.Tensor] = field(default_factory=dict)
     cached_block_table: list[int] = field(default_factory=list)
     cached_length: list[int] = field(default_factory=list)
     dummy_block: int | None = None
+    cache_slot_id_dict: dict[str, int] = field(default_factory=dict)
 
 
 class RBLNOptimumScheduler(Scheduler):
@@ -92,7 +103,13 @@ class RBLNOptimumScheduler(Scheduler):
         self.kv_events_config = vllm_config.kv_events_config
         self.parallel_config = vllm_config.parallel_config
         self.log_stats = log_stats
+        self.grammar_compile_error_reqs: set[str] = set()
+        self.encoder_cache_mismatch_reqs: set[str] = set()
+        self.reset_preempted_req_ids: set[str] = set()
         self.observability_config = vllm_config.observability_config
+        self.spec_decode_metrics_level = (
+            self.observability_config.per_request_spec_decode_metrics
+        )
         self.kv_metrics_collector: KVCacheMetricsCollector | None = None
         if self.observability_config.kv_cache_metrics:
             self.kv_metrics_collector = KVCacheMetricsCollector(
@@ -100,6 +117,8 @@ class RBLNOptimumScheduler(Scheduler):
             )
         self.structured_output_manager = structured_output_manager
         self.is_encoder_decoder = vllm_config.model_config.is_encoder_decoder
+        self.is_mm_encoder_only = vllm_config.is_mm_encoder_only
+        self.model_uses_mrope = vllm_config.model_config.uses_mrope
 
         # include_finished_set controls whether a separate set of finished
         # request ids should be included in the EngineCoreOutputs returned
@@ -112,6 +131,11 @@ class RBLNOptimumScheduler(Scheduler):
 
         # Scheduling constraints.
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
+        self.max_num_active_reqs = (
+            self.scheduler_config.max_num_active_seqs
+            if self.scheduler_config.max_num_active_seqs is not None
+            else self.max_num_running_reqs
+        )
         # Per-step token budget. Not max_num_batched_tokens: the optimum path
         # repurposes that as the compiled prefill chunk size, and the runner
         # prefills the whole prompt in one step (chunking is internal to the
@@ -165,6 +189,13 @@ class RBLNOptimumScheduler(Scheduler):
         self.block_size = self.cache_config.block_size
         # req_id -> Request
         self.requests: dict[str, Request] = {}
+        # req_id -> cache slot id: the request's row in the
+        # per-sequence on-device caches (sliding-window KV, linear-attention
+        # state). The rows are a fixed [max_num_seqs] pool; each request is
+        # pinned to the lowest free row at admission and holds it until it
+        # finishes or is preempted. Shipped to the worker through
+        # RBLNSchedulerOutput.cache_slot_id_dict.
+        self._cache_slot_ids: dict[str, int] = {}
         # Scheduling policy
         try:
             self.policy = SchedulingPolicy(self.scheduler_config.policy)
@@ -174,8 +205,8 @@ class RBLNOptimumScheduler(Scheduler):
             ) from e
         # Priority queues for requests.
         self.waiting = create_request_queue(self.policy)
-        # requests skipped in waiting flow due async deps or constraints.
-        self.skipped_waiting = create_request_queue(self.policy)
+        self.kv_holding_waiting = create_request_queue(self.policy)
+        self.deferred_waiting: set[Request] = set()
         self.running: list[Request] = []
 
         # The request IDs that are finished in between the previous and the
@@ -193,13 +224,8 @@ class RBLNOptimumScheduler(Scheduler):
         self.failed_recving_kv_req_ids: set[str] = set()
 
         # Create the KV cache manager.
-        if (
-            self.vllm_config.additional_config is not None
-            and "attn_block_size" in self.vllm_config.additional_config
-        ):
-            attn_block_size = self.vllm_config.additional_config["attn_block_size"]
-        else:
-            attn_block_size = None
+        rbln_config: OptimumRBLNConfig = self.vllm_config.additional_config
+        attn_block_size = rbln_config.attn_block_size
         # gemma3/gemma4: optimum-rbln's chunked prefill touches extra KV-cache
         # slots beyond the prompt (partition-alignment + trailing chunk
         # write-extent), so `allocate_slots` must reserve them. The prefill chunk
@@ -211,10 +237,7 @@ class RBLNOptimumScheduler(Scheduler):
         image_prefill_chunk_size = None
         if needs_chunked_prefill_pad:
             prefill_chunk_size = self.scheduler_config.max_num_batched_tokens
-            if vllm_config.additional_config is not None:
-                image_prefill_chunk_size = vllm_config.additional_config.get(
-                    "image_prefill_chunk_size"
-                )
+            image_prefill_chunk_size = rbln_config.image_prefill_chunk_size
 
         # Create the KV cache manager.
         if hash_block_size is None:
@@ -226,7 +249,7 @@ class RBLNOptimumScheduler(Scheduler):
             # The SWA/chunked-local admission cap, which must match the actual
             # per-step budget, not max_num_batched_tokens (the compiled chunk
             # size). See max_num_scheduled_tokens above.
-            max_num_batched_tokens=self.max_num_scheduled_tokens,
+            max_in_flight_tokens=self.max_num_scheduled_tokens,
             enable_caching=self.cache_config.enable_prefix_caching,
             use_eagle=False,
             log_stats=self.log_stats,
@@ -246,12 +269,12 @@ class RBLNOptimumScheduler(Scheduler):
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
             self.perf_metrics = ModelMetrics(vllm_config)
 
-        # NOTE(vllm 0.22): inherited _update_after_schedule/update_from_output
-        # read this attribute. Always False on RBLN (no routed-experts return).
-        if vllm_config.model_config.enable_return_routed_experts:
+        if vllm_config.aux_output_config.enabled:
             raise NotImplementedError("enable_return_routed_experts is not supported.")
-
-        self.enable_return_routed_experts = False
+        self.aux_output_connector = None
+        if vllm_config.model_config.return_sampling_mask:
+            raise NotImplementedError("return_sampling_mask is not supported.")
+        self.return_sampling_mask = False
         # Encoder-related.
         # It is not used in RBLN.
         # But for reuse original functions(e.g. free_request) in vLLM,
@@ -274,6 +297,7 @@ class RBLNOptimumScheduler(Scheduler):
 
         # Speculative decoding is not supported on the optimum path
         self.use_eagle = False
+        self.num_prefill_lookahead = 0
         self.num_spec_tokens = 0
         self.num_lookahead_tokens = 0
         self.dynamic_sd_lookup: list[int] | None = None
@@ -349,30 +373,32 @@ class RBLNOptimumScheduler(Scheduler):
 
         # First, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
-            step_skipped_waiting = create_request_queue(self.policy)
-            while (self.waiting or self.skipped_waiting) and token_budget > 0:
-                if len(self.running) == self.max_num_running_reqs:
+            step_skipped_waiting: deque[Request] = deque()
+            step_skipped_kv_holding: deque[Request] = deque()
+
+            def skip_request(from_queue: RequestQueue) -> None:
+                request_to_skip = from_queue.pop_request()
+                self.deferred_waiting.add(request_to_skip)
+                if self._holds_kv_blocks(request_to_skip):
+                    step_skipped_kv_holding.appendleft(request_to_skip)
+                else:
+                    step_skipped_waiting.appendleft(request_to_skip)
+
+            while token_budget > 0:
+                num_running = len(self.running) + self.num_waiting_for_streaming_input
+                if num_running >= self.max_num_active_reqs:
                     break
-                request_queue = self._select_waiting_queue_for_scheduling()
-                assert request_queue is not None
+                request_queue = self.kv_holding_waiting or self.waiting
+                if not request_queue:
+                    break
                 request = request_queue.peek_request()
                 request_id = request.request_id
-                # try to promote blocked statuses while traversing skipped queue.
                 # NOTE(eunji): prefill request is allowed only one
                 if req_index > 0:
                     break
 
-                # try to promote blocked statuses while traversing skipped queue.
-                if self._is_blocked_waiting_status(
-                    request.status
-                ) and not self._try_promote_blocked_waiting_request(request):
-                    if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
-                        logger.debug(
-                            "%s is still in WAITING_FOR_REMOTE_KVS state.",
-                            request_id,
-                        )
-                    request_queue.pop_request()
-                    step_skipped_waiting.prepend_request(request)
+                if not self._handle_blocked_waiting_request(request):
+                    skip_request(request_queue)
                     continue
 
                 # Check that adding the request still respects the max_loras
@@ -386,8 +412,7 @@ class RBLNOptimumScheduler(Scheduler):
                     )
                 ):
                     # Scheduling would exceed max_loras, skip.
-                    request_queue.pop_request()
-                    step_skipped_waiting.prepend_request(request)
+                    skip_request(request_queue)
                     continue
 
                 assert request.num_computed_tokens == 0
@@ -418,8 +443,13 @@ class RBLNOptimumScheduler(Scheduler):
                 # which would otherwise reduce the cache hit rate.
                 # This is special logic
                 # because we do not touch cache-hit blocks.
-                new_computed_blocks, num_new_local_computed_tokens = (
-                    self.kv_cache_manager.get_computed_blocks(request)
+                (
+                    new_computed_blocks,
+                    num_new_local_computed_tokens,
+                    request.shared_prefix_boundary,
+                ) = self.kv_cache_manager.get_computed_blocks(request)
+                self.kv_cache_manager.record_prefix_cache_stats(
+                    request, num_new_local_computed_tokens
                 )
 
                 # Get the cached blocks for prefix caching.
@@ -449,9 +479,14 @@ class RBLNOptimumScheduler(Scheduler):
                 # Request was already popped from self.waiting
                 # unless it was re-added above due to new_blocks being None.
                 request = request_queue.pop_request()
+                self.deferred_waiting.discard(request)
 
                 req_index += 1
                 self.running.append(request)
+                free_slot_ids = set(range(self.max_num_running_reqs)) - set(
+                    self._cache_slot_ids.values()
+                )
+                self._cache_slot_ids[request_id] = min(free_slot_ids)
                 if self.log_stats:
                     request.record_event(
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
@@ -484,8 +519,10 @@ class RBLNOptimumScheduler(Scheduler):
                             self.ec_connector.update_state_after_alloc(request, i)
 
             # re-queue requests skipped in this pass ahead of older skipped items.
+            if step_skipped_kv_holding:
+                self.kv_holding_waiting.prepend_requests(step_skipped_kv_holding)
             if step_skipped_waiting:
-                self.skipped_waiting.prepend_requests(step_skipped_waiting)
+                self.waiting.prepend_requests(step_skipped_waiting)
 
         # Next, schedule the RUNNING requests.
         if req_index == 0:
@@ -592,7 +629,9 @@ class RBLNOptimumScheduler(Scheduler):
         # Construct the scheduler output.
         new_reqs_data = [
             NewRequestData.from_request(
-                req, req_to_new_blocks[req.request_id].get_block_ids()
+                req,
+                req_to_new_blocks[req.request_id].get_block_ids(),
+                uses_mrope=self.model_uses_mrope,
             )
             for req in scheduled_new_reqs
         ]
@@ -642,6 +681,9 @@ class RBLNOptimumScheduler(Scheduler):
             cached_block_table=cached_block_table,
             cached_length=cached_length,
             dummy_block=dummy_block,
+            cache_slot_id_dict={
+                req_id: self._cache_slot_ids[req_id] for req_id in num_scheduled_tokens
+            },
         )
 
         # Build the connector meta for ECConnector.
@@ -668,7 +710,7 @@ class RBLNOptimumScheduler(Scheduler):
 
     def _free_request(
         self, request: Request, delay_free_blocks: bool = False
-    ) -> dict[str, Any] | None:
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         # Capture mm hashes and notify the EC connector before super()
         # tears the request down — base._free_blocks deletes self.requests[id]
         # so we can't recover mm_features afterwards.
@@ -678,6 +720,8 @@ class RBLNOptimumScheduler(Scheduler):
             self._pending_free_mm_hashes.extend(
                 f.identifier for f in request.mm_features
             )
+        # A request aborted while WAITING was never admitted and holds no id.
+        self._cache_slot_ids.pop(request.request_id, None)
         return super()._free_request(request, delay_free_blocks=delay_free_blocks)
 
     def update_block_table_dict(
@@ -691,6 +735,7 @@ class RBLNOptimumScheduler(Scheduler):
         self,
         request: Request,
         timestamp: float,
+        drop_stale_output: bool = False,
     ) -> None:
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
@@ -708,6 +753,9 @@ class RBLNOptimumScheduler(Scheduler):
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
         request.num_preemptions += 1
+        # The preempted request restarts from prefill, so it releases its
+        # cache slot id now and gets a fresh one at re-admission.
+        del self._cache_slot_ids[request.request_id]
         if self.log_stats:
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
 

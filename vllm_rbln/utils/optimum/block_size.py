@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 else:
     VllmConfig = None
 
+from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
@@ -30,7 +31,11 @@ logger = init_logger(__name__)
 # FIXME This will be refactored with RBLNPrefixKVCacheManager in the future
 def get_attn_block_size(vllm_config: VllmConfig) -> int:
     if vllm_config.cache_config.enable_prefix_caching:
-        block_size = vllm_config.additional_config["attn_block_size"]
+        rbln_config: OptimumRBLNConfig = vllm_config.additional_config
+        assert rbln_config.attn_block_size is not None, (
+            "the block-size sync sets attn_block_size when prefix caching is on"
+        )
+        block_size = rbln_config.attn_block_size
     else:
         block_size = vllm_config.cache_config.block_size
     return block_size

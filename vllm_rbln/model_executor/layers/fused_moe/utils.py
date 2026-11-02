@@ -16,7 +16,14 @@ import torch
 from vllm.forward_context import get_forward_context
 
 
-def get_tokens_mask(num_tokens: int, left=1.0, right=0.0, device=None) -> torch.Tensor:
+def get_tokens_mask(
+    num_tokens: int,
+    left=1.0,
+    right=0.0,
+    device=None,
+    *,
+    dtype: torch.dtype,
+) -> torch.Tensor:
     """Real-vs-padding mask aligned with the DP multicast output layout.
 
     For every DP rank's slot in the multicast buffer, positions before
@@ -43,6 +50,11 @@ def get_tokens_mask(num_tokens: int, left=1.0, right=0.0, device=None) -> torch.
             ``max_pads_across_dp`` is ``None``); ignored otherwise
         left: Value for real-token positions.
         right: Value for padded positions.
+        dtype: Dtype of the returned mask. Required, and keyword-only: pass
+            the dtype of the tensor the mask is combined with. There is no
+            default because the only sensible fallback (the torch default,
+            fp32) is the very thing this argument exists to avoid -- see the
+            comment at the ``torch.where`` below.
 
     Returns:
         Tensor of shape ``[dp_size * max_pad, 1]``.
@@ -57,7 +69,11 @@ def get_tokens_mask(num_tokens: int, left=1.0, right=0.0, device=None) -> torch.
     )
     pos = torch.arange(max_pad, dtype=torch.int32).unsqueeze(0)
 
-    tokens_mask = torch.where(pos < num_tokens_across_dp, left, right)
+    tokens_mask = torch.where(
+        pos < num_tokens_across_dp,
+        torch.tensor(left, dtype=dtype),
+        torch.tensor(right, dtype=dtype),
+    )
     tokens_mask = tokens_mask.reshape(-1, 1)  # [dp_size * max_pad, 1]
     if device is not None:
         tokens_mask = tokens_mask.to(device)

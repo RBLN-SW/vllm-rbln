@@ -34,7 +34,7 @@ class RBLNKVCacheManager(KVCacheManager):
         max_model_len: int,
         scheduler_block_size: int,
         hash_block_size: int,
-        max_num_batched_tokens: int | None = None,
+        max_in_flight_tokens: int | None = None,
         enable_caching: bool = True,
         use_eagle: bool = False,
         log_stats: bool = False,
@@ -61,6 +61,7 @@ class RBLNKVCacheManager(KVCacheManager):
         self.log_stats = log_stats
         self.metrics_collector = metrics_collector
         self.scheduler_block_size = scheduler_block_size
+        self.enable_kv_cache_events = enable_kv_cache_events
         assert watermark == 0.0, "watermark is not supported on the RBLN optimum path"
         self.watermark_blocks = 0
         # FIXME: make prefix cache stats conditional on log_stats. We still need
@@ -74,11 +75,11 @@ class RBLNKVCacheManager(KVCacheManager):
         # admission cap for SWA / chunked-local specs, clamped there by
         # max_model_len; full/cross-attention block allocation (e.g. Whisper)
         # sizes purely off the request's own tokens.
-        assert max_num_batched_tokens is not None, "max_num_batched_tokens must be set."
+        assert max_in_flight_tokens is not None, "max_in_flight_tokens must be set."
         self.coordinator = RBLNKVCacheCoordinator(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
-            max_num_batched_tokens=max_num_batched_tokens,
+            max_in_flight_tokens=max_in_flight_tokens,
             use_eagle=self.use_eagle,
             enable_caching=self.enable_caching,
             enable_kv_cache_events=enable_kv_cache_events,
@@ -281,6 +282,7 @@ class RBLNKVCacheManager(KVCacheManager):
             new_computed_blocks=self.empty_kv_cache_blocks.blocks,
             num_encoder_tokens=0,
             total_computed_tokens=0,
+            num_local_computed_tokens=0,
             num_tokens_main_model=num_tokens_need_slot,
         )
 
