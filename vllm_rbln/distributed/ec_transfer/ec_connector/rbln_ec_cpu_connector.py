@@ -36,6 +36,7 @@ from vllm.distributed.ec_transfer.ec_connector.cpu.worker import ECCPUWorker
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.distributed.ec_transfer.ec_connector.cpu.scheduler import ECCPUScheduler
+    from vllm.v1.request import Request
 
 
 class RblnECCPUWorker(ECCPUWorker):
@@ -121,3 +122,28 @@ class RblnECCPUConnector(ECCPUConnector):
         if ec_config.ec_role != "ec_both":
             ec_config.ec_connector_extra_config["ec_enable_nixl"] = True
         return super()._make_scheduler(vllm_config)
+
+    def start_save_caches(
+        self, encoder_cache: dict[str, torch.Tensor] | None = None, **kwargs
+    ) -> None:
+        # NOTE(RBLN): ECConnectorModelRunnerMixin._get_ec_connector_output() calls
+        # this before encoding to save outputs already in the runner cache.
+        # The runner saves new outputs later through maybe_save_ec_to_connector().
+        if encoder_cache is None:
+            return
+        metadata = self._get_connector_metadata()
+        assert isinstance(metadata, ECCPUConnectorMetadata)
+        for mm_hash in metadata.saves:
+            if mm_hash in encoder_cache:
+                self.save_caches(encoder_cache, mm_hash)
+
+    def update_state_after_cache_hit(self, request: "Request", index: int) -> None:
+        scheduler = self.connector_scheduler
+        assert scheduler is not None
+        mm_hash = request.mm_features[index].identifier
+        if self.is_producer and scheduler._cache.get(mm_hash) is None:
+            # Producer: allocate shared-memory blocks and queue their IDs
+            # in _pending_saves, delivered to the worker as metadata.saves.
+            # Consumer: pin ready blocks and queue loads.
+            # ec_both: both.
+            scheduler.update_state_after_alloc(request, index)

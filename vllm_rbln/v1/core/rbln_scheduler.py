@@ -38,6 +38,9 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_rbln.config import RBLNConfig
+from vllm_rbln.distributed.ec_transfer.ec_connector.rbln_ec_cpu_connector import (
+    RblnECCPUConnector,
+)
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.core.rbln_kv_cache_manager import (
     KVCacheCopyOp,
@@ -1162,6 +1165,27 @@ class RBLNScheduler(Scheduler):
             shift_computed_tokens,
         )
         connector = self.ec_connector
+        # NOTE(RBLN): upstream skips EC saves on runner-cache hits.
+        # Reserve saves for outputs missing from the shared-memory cache.
+        if (
+            isinstance(connector, RblnECCPUConnector)
+            and connector.is_producer
+            and not self.is_encoder_decoder
+            and scheduled[1] > 0
+        ):
+            window_end = num_computed_tokens + scheduled[1] + shift_computed_tokens
+            for i, feature in enumerate(request.mm_features):
+                pos = feature.mm_position
+                if (
+                    pos.offset >= window_end
+                    or pos.offset + pos.length <= num_computed_tokens
+                ):
+                    continue
+                cached_num_embeds = (
+                    self.encoder_cache_manager.get_cached_num_encoder_embeds(request, i)
+                )
+                if cached_num_embeds == request.get_num_encoder_embeds(i):
+                    connector.update_state_after_cache_hit(request, i)
         if not (
             scheduled[0]
             and connector is not None

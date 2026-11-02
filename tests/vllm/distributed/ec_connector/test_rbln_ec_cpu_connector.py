@@ -12,11 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The worker side of the connector: what a producer saves into the shared region
-# is what a consumer loads from it, and both are reported on the same step. The
-# scheduler side and the NIXL transfer are upstream's; only which roles get NIXL
-# is checked here.
-
 import uuid
 from types import SimpleNamespace
 
@@ -31,7 +26,10 @@ from vllm.distributed.ec_transfer.ec_connector.cpu.common import (
 )
 from vllm.distributed.ec_transfer.ec_connector.cpu.scheduler import ECCPUScheduler
 from vllm.distributed.ec_transfer.ec_connector.factory import ECConnectorFactory
+from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
+from vllm.v1.outputs import ECConnectorOutput
 
+from tests.vllm.v1.core.utils import create_rbln_scheduler, image_at, make_request
 from vllm_rbln.distributed.ec_transfer.ec_connector.rbln_ec_cpu_connector import (
     RblnECCPUConnector,
     RblnECCPUWorker,
@@ -150,6 +148,95 @@ def test_only_tp_rank_0_saves(connect):
 
     assert saved is None
     assert not producer.connector_worker._region.blocks.any()
+
+
+def test_a_cached_output_is_saved_at_step_entry(connect):
+    producer, consumer = connect(ec_role="ec_producer"), connect(ec_role="ec_consumer")
+    embeds = torch.arange(3 * HIDDEN, dtype=torch.bfloat16).reshape(3, HIDDEN)
+    saved = _step(
+        producer,
+        ECCPUConnectorMetadata(saves={"img": [0, 1, 2], "new": [3]}),
+        lambda: producer.start_save_caches(encoder_cache={"img": embeds}),
+    )
+    cache: dict[str, torch.Tensor] = {}
+    _step(
+        consumer,
+        ECCPUConnectorMetadata(loads={"img": (1, [0, 1, 2])}),
+        lambda: consumer.start_load_caches(cache),
+    )
+
+    assert torch.equal(cache["img"], embeds)
+    assert saved == ECCPUWorkerMetadata(completed_saves=["img"])
+
+
+def test_a_runner_hit_is_republished_after_shared_memory_eviction(connect):
+    connector = connect(ec_role="ec_both", role=ECConnectorRole.SCHEDULER)
+    producer, consumer = connect(ec_role="ec_both"), connect(ec_role="ec_consumer")
+    request = make_request("repeat", list(range(8)), 16, mm_features=[image_at(0, 3)])
+    replacement = make_request(
+        "replacement", list(range(8)), 16, mm_features=[image_at(0, 8)]
+    )
+    replacement.mm_features[0].identifier = "replacement"
+    mm_hash = request.mm_features[0].identifier
+    embeds = torch.arange(3 * HIDDEN, dtype=torch.bfloat16).reshape(3, HIDDEN)
+    runner_cache = {mm_hash: embeds}
+
+    for req, tensor in (
+        (request, embeds),
+        (replacement, torch.full((8, HIDDEN), 7, dtype=torch.bfloat16)),
+    ):
+        key = req.mm_features[0].identifier
+        connector.update_state_after_alloc(req, 0)
+        metadata = connector.build_connector_meta(None)
+        reported = _step(
+            producer,
+            metadata,
+            lambda key=key, tensor=tensor: producer.save_caches({key: tensor}, key),
+        )
+        connector.update_connector_output(
+            ECConnectorOutput(ec_connector_worker_meta=reported)
+        )
+    assert connector.connector_scheduler._cache.get(mm_hash) is None
+
+    scheduler = create_rbln_scheduler(
+        max_num_seqs=4, max_num_batched_tokens=8, max_model_len=64
+    )
+    scheduler.ec_connector = connector
+    scheduler.max_num_encoder_input_tokens = 16
+    scheduler.encoder_cache_manager = EncoderCacheManager(cache_size=16)
+    scheduler.encoder_cache_manager.allocate(request, 0)
+    scheduler.encoder_cache_manager.free(request)
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {request.request_id: 8}
+    assert output.scheduled_encoder_inputs == {}
+    metadata = output.ec_connector_metadata
+    assert mm_hash in metadata.saves
+    assert metadata.loads == {}
+    connector.update_state_after_cache_hit(request, 0)
+    assert connector.build_connector_meta(None).saves == {}
+    reported = _step(
+        producer,
+        metadata,
+        lambda: producer.start_save_caches(encoder_cache=runner_cache),
+    )
+    connector.update_connector_output(
+        ECConnectorOutput(ec_connector_worker_meta=reported)
+    )
+    assert connector.connector_scheduler._cache.get(mm_hash).ready
+    connector.update_state_after_cache_hit(request, 0)
+    repeated = connector.build_connector_meta(None)
+    assert repeated.saves == {}
+    assert repeated.loads == {}
+
+    cache: dict[str, torch.Tensor] = {}
+    _step(
+        consumer,
+        ECCPUConnectorMetadata(loads={mm_hash: (1, metadata.saves[mm_hash])}),
+        lambda: consumer.start_load_caches(cache),
+    )
+    assert torch.equal(cache[mm_hash], embeds)
 
 
 def test_an_output_in_another_dtype_is_refused(connect):
