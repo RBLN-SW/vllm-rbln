@@ -104,10 +104,11 @@ def _common(
 
 
 def _assert_conv_tables(md, rows, seq_idx, query_len, has_initial_state):
-    """The conv tables are ring_tables of these per-row values (width 3, 4 taps)."""
+    """The conv tables are ring_tables of these per-row values (width 3, 4 taps,
+    one ring a block)."""
     values = (rows, seq_idx, query_len, has_initial_state)
     want = ring_tables(
-        *(torch.tensor(v, dtype=torch.int32) for v in values), md.seq_len, 3, 4
+        *(torch.tensor(v, dtype=torch.int32) for v in values), md.seq_len, 3, 4, 3
     )
     for got, expected in zip(md.conv_tables, want, strict=True):
         assert torch.equal(got.cpu(), expected)

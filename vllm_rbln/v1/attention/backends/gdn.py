@@ -88,7 +88,7 @@ class RBLNGDNAttentionMetadata:
     core_state_index: torch.Tensor
     core_has_initial_state: torch.Tensor
     # The conv ring's tables (ring_tables): hist_idx / ring_idx staged on the
-    # device, block / starts / count on the host (the kernel's const buffers)
+    # device, block / count on the host (the kernel's const buffers)
     conv_tables: tuple[torch.Tensor, ...]
     # [1, 1, seq_len] float32 on prefill: 1 for valid tokens, 0 for padding
     valid_mask: torch.Tensor | None
@@ -259,14 +259,17 @@ class RBLNGDNAttentionMetadataBuilder(
             valid_mask = (torch.arange(seq_len) < query_lens[0]).to(torch.float32)
             valid_mask = valid_mask.view(1, 1, seq_len)
         has_initial_state = padded(num_computed > 0)
-        hist_idx, ring_idx, block, starts, count = ring_tables(
+        # A ring block holds one ring of width K - 1.
+        width = self.conv_kernel_size - 1
+        hist_idx, ring_idx, block, count = ring_tables(
             torch.tensor(rows, dtype=torch.int32),
             padded(first_positions),
             padded(query_lens),
             has_initial_state,
             seq_len,
-            self.conv_kernel_size - 1,
+            width,
             self.conv_kernel_size,
+            width,
         )
         return RBLNGDNAttentionMetadata(
             is_prefill=is_prefill,
@@ -278,7 +281,6 @@ class RBLNGDNAttentionMetadataBuilder(
                 self._stage(hist_idx, "hist_idx"),
                 self._stage(ring_idx, "ring_idx"),
                 block,
-                starts,
                 count,
             ),
             valid_mask=None
