@@ -145,7 +145,6 @@ class RBLNMoERunner(MoERunner):
         per_expert_scale = getattr(self.router, "per_expert_scale", None)
 
         if self.moe_parallel_config.dp_size > 1:
-            assert callable(router), "precomputed router logits need DP=1"
             org_hidden_shape = hidden_states.shape
             R = self.moe_parallel_config.dp_size
             num_tokens = org_hidden_shape[:-1].numel()
