@@ -1347,13 +1347,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         if self.supports_mm_inputs and is_prefill and get_pp_group().is_first_rank:
             self._execute_mm_encoder(scheduler_output)
-            mm_embeds, mm_mask = self._gather_mm_embeddings(
+            mm_rows, mm_mask = self._gather_mm_embeddings(
                 scheduler_output, num_input_tokens
             )
             model_kwargs["mm_embeds"], model_kwargs["mm_mask"] = (
                 self.input_stager.stage_mm_embeds(
-                    mm_embeds.view(num_reqs, -1, mm_embeds.shape[-1]),
+                    mm_rows,
                     mm_mask.view(num_reqs, -1, 1),
+                    self.model_config.get_hidden_size(),
                     layout,
                 )
             )
@@ -1418,15 +1419,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self,
         scheduler_output: RBLNSchedulerOutput,
         num_tokens: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Scatter the cached encoder outputs over this step's flat tokens."""
-
-        hidden_size = self.model_config.get_hidden_size()
-        mm_embeds = torch.zeros(num_tokens, hidden_size, dtype=self.dtype)
+    ) -> tuple[list[tuple[int, int, torch.Tensor]], torch.Tensor]:
+        mm_rows: list[tuple[int, int, torch.Tensor]] = []
         is_mm = torch.zeros(num_tokens, dtype=torch.bool)
 
         req_start_idx = 0
-        for req_id in self.input_batch.req_ids:
+        for req_index, req_id in enumerate(self.input_batch.req_ids):
             num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
             req_state = self.requests[req_id]
             num_computed_tokens = req_state.num_computed_tokens
@@ -1458,20 +1456,31 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     f"Encoder cache miss for {mm_feature.identifier}."
                 )
 
-                dst_start = req_start_idx + start_pos - num_computed_tokens
-                dst = slice(dst_start + start_idx, dst_start + end_idx)
+                first_token = start_pos - num_computed_tokens + start_idx
+                dst_start = req_start_idx + first_token
+                dst = slice(dst_start, dst_start + end_idx - start_idx)
+                embeds = encoder_output[embeds_start:embeds_end].to(self.dtype)
                 if pos_info.is_embed is None:
-                    rows = torch.ones(end_idx - start_idx, dtype=torch.bool)
-                else:
-                    rows = pos_info.is_embed[start_idx:end_idx]
-                mm_embeds[dst][rows] = encoder_output[embeds_start:embeds_end].to(
-                    self.dtype
-                )
+                    assert embeds.shape[0] == end_idx - start_idx
+                    is_mm[dst] = True
+                    mm_rows.append((req_index, first_token, embeds))
+                    continue
+
+                rows = pos_info.is_embed[start_idx:end_idx]
                 is_mm[dst] |= rows
+                edges = torch.nn.functional.pad(rows.to(torch.int8), (1, 1)).diff()
+                run_starts = (edges == 1).nonzero().flatten().tolist()
+                run_ends = (edges == -1).nonzero().flatten().tolist()
+                taken = 0
+                for run_start, run_end in zip(run_starts, run_ends):
+                    run_rows = embeds[taken : taken + run_end - run_start]
+                    mm_rows.append((req_index, first_token + run_start, run_rows))
+                    taken += run_end - run_start
+                assert taken == embeds.shape[0]
 
             req_start_idx += num_scheduled_tokens
 
-        return mm_embeds, is_mm.to(self.dtype).unsqueeze(-1)
+        return mm_rows, is_mm.to(self.dtype).unsqueeze(-1)
 
     def _warmup_mm_encoder(self) -> None:
         """Materialize every encoder bucket before serving and sizing KV caches."""
@@ -2825,10 +2834,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             self.supports_mm_inputs and self.is_prefill and get_pp_group().is_first_rank
         ):
             return {}
-        shape = (layout.num_reqs, layout.query_len)
         mm_embeds, mm_mask = self.input_stager.stage_mm_embeds(
-            torch.zeros(*shape, self.model_config.get_hidden_size(), dtype=self.dtype),
-            torch.zeros(*shape, 1, dtype=self.dtype),
+            [],
+            torch.zeros(layout.num_reqs, layout.query_len, 1, dtype=self.dtype),
+            self.model_config.get_hidden_size(),
             layout,
         )
         return {"mm_embeds": mm_embeds, "mm_mask": mm_mask}

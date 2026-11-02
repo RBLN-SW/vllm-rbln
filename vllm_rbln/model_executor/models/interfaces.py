@@ -30,7 +30,8 @@ class SupportsRBLNMultiModal(Protocol):
     and hands the result in as ``inputs_embeds``. The RBLN compiled graph takes a
     fixed set of inputs, so the runner instead stages the per-token embeddings as
     ``mm_embeds`` ``[B, L, H]`` and a 0/1 ``mm_mask`` ``[B, L, 1]``, and the model
-    selects between them and its text embeddings inside the graph.
+    selects between them and its text embeddings inside the graph. Where the mask
+    is 0, ``mm_embeds`` holds finite leftovers rather than zeros: select, not add.
 
     Only a model declaring this takes the runner's multimodal path. An upstream
     multimodal model accepts the two kwargs through ``**kwargs`` and ignores

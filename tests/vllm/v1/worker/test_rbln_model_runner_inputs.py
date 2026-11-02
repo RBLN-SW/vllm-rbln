@@ -39,6 +39,7 @@ from tests.vllm.v1.worker.utils import (
     make_speculative_config,
     schedule_new,
 )
+from vllm_rbln.v1.worker.input_stager import InputLayout
 
 pytestmark = pytest.mark.maybe_use_device
 
@@ -118,32 +119,43 @@ class TestGatherMultimodalEmbeddings:
         torch.testing.assert_close(runner.encoder_cache["image-1"], pixels[1] + 10)
 
     @pytest.mark.parametrize(
-        "computed, values",
-        [(0, [0, 0, 11]), (3, [0, 22, 33]), (6, [0, 0, 0])],
+        "computed, with_text_holes, values",
+        [
+            (0, True, [0, 0, 11]),
+            (2, True, [11, 0, 22]),
+            (3, True, [0, 22, 33]),
+            (6, True, [0, 0, 0]),
+            (0, False, [0, 0, 11]),
+            (3, False, [22, 33, 0]),
+        ],
     )
     def test_chunk_boundaries_preserve_text_holes_and_request_order(
-        self, make_model_runner, monkeypatch, computed, values
+        self, make_model_runner, monkeypatch, computed, with_text_holes, values
     ):
         monkeypatch.setattr(
             mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
         )
         runner = make_model_runner()
         step = schedule_new(
-            "image",
             "text",
+            "image",
             prompt_token_ids=[[1] * 12, [1] * 12],
-            num_computed_tokens=[computed, 0],
+            num_computed_tokens=[0, computed],
             num_scheduled_tokens=[3, 3],
         )
-        step.scheduled_new_reqs[0].mm_features = [
+        step.scheduled_new_reqs[1].mm_features = [
             MultiModalFeatureSpec(
                 data=None,
                 modality="image",
                 identifier="image-hash",
                 mm_position=PlaceholderRange(
                     offset=2,
-                    length=5,
-                    is_embed=torch.tensor([True, False, True, True, False]),
+                    length=5 if with_text_holes else 3,
+                    is_embed=(
+                        torch.tensor([True, False, True, True, False])
+                        if with_text_holes
+                        else None
+                    ),
                 ),
             )
         ]
@@ -153,10 +165,18 @@ class TestGatherMultimodalEmbeddings:
             torch.tensor([11.0, 22.0, 33.0]).unsqueeze(1).expand(-1, hidden)
         )
 
-        embeds, mask = runner._gather_mm_embeddings(step, num_tokens=6)
+        mm_rows, mask = runner._gather_mm_embeddings(step, num_tokens=6)
+        embeds, _ = runner.input_stager.stage_mm_embeds(
+            mm_rows,
+            mask.view(2, 3, 1),
+            hidden,
+            InputLayout(num_reqs=2, num_reqs_padded=2, query_len=3, query_len_padded=3),
+        )
 
-        expected = torch.tensor(values + [0, 0, 0], dtype=runner.dtype)
-        torch.testing.assert_close(embeds, expected[:, None].expand(-1, hidden))
+        expected = torch.tensor([0, 0, 0] + values, dtype=runner.dtype)
+        torch.testing.assert_close(
+            embeds.cpu().view(6, hidden), expected[:, None].expand(-1, hidden)
+        )
         torch.testing.assert_close(mask[:, 0], (expected != 0).to(runner.dtype))
 
 
