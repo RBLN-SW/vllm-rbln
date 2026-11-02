@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from collections import Counter
 from collections.abc import Iterable
 from typing import Any
@@ -464,6 +465,10 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         self._logical_region_kv_heads = self._logical_head_bands(layer_regions)
         self._logical_region_local_heads = list(logical_kv_heads)
         self._logical_region_latent = list(logical_mla)
+        self._logical_region_block_spec = [
+            spec if isinstance(spec, RblnBlockTransferSpec) else None
+            for _, spec, _, _ in regions
+        ]
 
         self.num_regions = len(places)
         if self.topo.virtually_split_kv_in_blocks:
@@ -993,6 +998,7 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         # Host staging records no latents; the per-head check a pipelined peer
         # reaches through this path reads every region as attention.
         self._logical_region_latent = [False] * len(self._logical_region_geometry)
+        self._logical_region_block_spec = [None] * len(self._logical_region_geometry)
         # Re-wrap upstream's published handshake metadata with this stage's PP
         # identity and chiplet geometry (no-op degrade for pp_size == 1).
         if self.xfer_handshake_metadata is not None:
@@ -1011,8 +1017,24 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
             if name in self._layer_specs and name not in self._block_aux_specs:
                 raise ValueError(f"Block-aux cache {name} shadows a scheduled cache")
             owner_spec = self._unwrapped_layer_spec(spec.owner)
+            band_heads = getattr(owner_spec, "band_heads", 0)
+            if spec.head_axis is None or not band_heads:
+                self._layer_specs[name] = RblnBlockTransferSpec(
+                    owner_spec.block_size, spec.page_size_bytes
+                )
+                continue
+            runs = math.prod(spec.block_shape[: spec.head_axis])
+            rank_heads = (
+                band_heads // self.vllm_config.parallel_config.tensor_parallel_size
+            )
+            head_bytes, rem = divmod(spec.page_size_bytes // runs, rank_heads)
+            assert not rem, (name, spec, rank_heads)
             self._layer_specs[name] = RblnBlockTransferSpec(
-                owner_spec.block_size, spec.page_size_bytes
+                owner_spec.block_size,
+                spec.page_size_bytes,
+                band_heads,
+                head_bytes,
+                runs,
             )
         self._block_aux_specs = dict(specs)
 

@@ -48,9 +48,11 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
     AreaRect,
+    BlockWindow,
     Piece,
     RblnNixlWorkerState,
     _grid_descs,
+    block_rects,
     every_local_link_down,
     pair_area,
 )
@@ -120,11 +122,15 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         )
         head = ChipletSplitAxis.HEAD
         for logical_l, logical_r in self._logical_region_pairs(registered_layer_names):
-            if self._logical_region_latent[logical_l]:
+            if (
+                self._logical_region_latent[logical_l]
+                or self._block_spec(logical_l) is not None
+            ):
                 # A latent has no heads to band and every peer rank holds all of
                 # it, so none of the checks below applies; one in fewer token
                 # ranges than the peer's pairs in pieces of the peer's, each its
-                # own entry, as a head cut meeting a context cut does.
+                # own entry, as a head cut meeting a context cut does. A block
+                # payload's band is `block_rects`', checked as it pairs.
                 continue
             # Raises here, before the peer is registered, for a layer whose
             # heads are replicated across our ranks.
@@ -324,7 +330,9 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         # first sends it (`handshake_target_ranks`), and the side moving it picks
         # that rank.
         latent_sent = True
-        if any(self._logical_region_latent):
+        if any(
+            map(self._same_on_every_rank, range(len(self._logical_region_geometry)))
+        ):
             tp_ratio = self.topo.tp_ratio(remote_tp_size)
             if self._writes_into_peer:
                 latent_sent = tp_ratio < 0 or self.tp_rank % tp_ratio == 0
@@ -333,28 +341,42 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         region_ids: list[int] = []
         plans: list[list[Piece]] = []
         for logical_l, logical_r in self._logical_region_pairs(registered_layer_names):
-            if self._logical_region_latent[logical_l] and not latent_sent:
+            same_everywhere = self._same_on_every_rank(logical_l)
+            if same_everywhere and not latent_sent:
                 continue
+            windows = self._block_windows(
+                nixl_agent_meta, logical_l, logical_r, remote_tp_rank, remote_tp_size
+            )
             ours, peer = self._area_rects(
                 nixl_agent_meta, logical_l, logical_r, remote_tp_rank, remote_tp_size
             )
             # A peer rank holds a band of a region's heads, which is what the
             # area filter picks by; a latent is whole on every rank.
-            served = (
-                range(areas_l) if self._logical_region_latent[logical_l] else areas_iter
-            )
+            served = range(areas_l) if same_everywhere else areas_iter
             for area_l in served:
                 region_id = logical_l * areas_l + area_l
                 pieces = pair_area(
                     ours[area_l],
                     self.get_backend_aware_kv_block_len(
                         layer_idx=region_id, first_split=True, mamba_view=False
-                    ),
+                    )
+                    if windows is None
+                    else windows[0][area_l].length,
                     peer,
                     kv_per_block=self._region_halves(logical_l),
                     every_holder=self._writes_into_peer,
                     region_id=region_id,
                 )
+                if windows is not None:
+                    local, remote = windows[0][area_l], windows[1]
+                    pieces = [
+                        x._replace(
+                            local_offset=x.local_offset + local.offset,
+                            remote_offset=x.remote_offset
+                            + remote[x.remote_region].offset,
+                        )
+                        for x in pieces
+                    ]
                 # An entry's grid is read off its first piece, and a region's
                 # pieces are cut alike: the handshake refuses incommensurate
                 # head cuts, and one side's token ranges nest in the other's.
@@ -376,7 +398,8 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         remote_tp_size: int,
     ) -> tuple[list[AreaRect], list[tuple[int, AreaRect, int]]]:
         """What each of our areas of one logical region holds, and per area of
-        the peer's: its region id, what it holds, and its block length.
+        the peer's: its region id, what it holds, and its block length (a block
+        payload's: the length of the window it holds).
 
         A head cut gives a slice a band of the rank's heads and every token; a
         context cut gives it all of the rank's heads and a token range, which
@@ -385,6 +408,14 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         sits; registration cuts a latent on tokens or not at all, so no slice
         splits that head.
         """
+        windows = self._block_windows(
+            nixl_agent_meta, logical_l, logical_r, remote_tp_rank, remote_tp_size
+        )
+        if windows is not None:
+            ours_w, peer_w = windows
+            return [w.rect for w in ours_w], [
+                (region, w.rect, w.length) for region, w in peer_w.items()
+            ]
         latent = self._logical_region_latent[logical_l]
         # A model-config count describes the target's layers, and on a draft's
         # it lands a plausible offset inside the wrong bytes. The peer's region
@@ -444,6 +475,45 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
             for a, rect in enumerate(theirs)
         ]
         return ours, peer
+
+    def _block_windows(
+        self,
+        nixl_agent_meta: RblnNixlAgentMetadata,
+        logical_l: int,
+        logical_r: int,
+        remote_tp_rank: int,
+        remote_tp_size: int,
+    ) -> tuple[list[BlockWindow], dict[int, BlockWindow]] | None:
+        """Per area of ours, and per peer region, what a block payload's area holds
+        and where; None for a region that is not one. The peer's region is the same
+        layer's and so takes the same spec."""
+        spec = self._block_spec(logical_l)
+        if spec is None:
+            return None
+        if nixl_agent_meta.kv_split_axes[logical_r] is not ChipletSplitAxis.BLOCK:
+            raise RuntimeError(
+                f"RBLN NIXL D2D: logical region {logical_l} is a block payload "
+                f"here and cut on {nixl_agent_meta.kv_split_axes[logical_r].name} "
+                "on the peer."
+            )
+        geometry = self._logical_region_geometry[logical_l]
+        ours = block_rects(
+            spec,
+            [place.slice_id for place in geometry.areas],
+            geometry.areas[0].block_len,
+            self.tp_rank,
+            self.topo.tp_size,
+        )
+        ids_r = nixl_agent_meta.kv_area_slices[logical_r]
+        first_r = logical_r * len(ids_r)
+        theirs = block_rects(
+            spec,
+            ids_r,
+            nixl_agent_meta.block_lens[first_r],
+            remote_tp_rank,
+            remote_tp_size,
+        )
+        return ours, {first_r + a: window for a, window in enumerate(theirs)}
 
     def _build_head_matched_remote(
         self,
@@ -521,10 +591,14 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         tp_ratio = self.topo.tp_ratio(remote_tp_size)
         if any(
             g.axis is ChipletSplitAxis.BLOCK for g in self._logical_region_geometry
-        ) and (tp_ratio != 1 or nixl_agent_meta.block_size != self.block_size):
+        ) and (
+            (tp_ratio != 1 and not self._block_payloads_band())
+            or nixl_agent_meta.block_size != self.block_size
+        ):
             raise RuntimeError(
                 "RBLN NIXL block state and auxiliary caches require equal "
-                "P/D tensor parallel sizes and block sizes."
+                "P/D block sizes, and equal tensor parallel sizes unless every "
+                "one of them is banded by head or the same on every rank."
             )
         if tp_ratio != 1 and self._shape.has_swa:
             raise RuntimeError(
@@ -573,6 +647,21 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                 "geometry itself differs and no pairing is meaningful."
             )
 
+    def _block_payloads_band(self) -> bool:
+        """Whether every block payload pairs across TP degrees: a block state and
+        what it owns banded by head, anything else the same on every rank."""
+        owned_by_state = {
+            name
+            for name, aux in self._block_aux_specs.items()
+            if aux.owner in self._block_state_layers
+        }
+        banded = self._block_state_layers | owned_by_state
+        return all(
+            spec.band_heads
+            for logical, name in enumerate(self.region_names[:: self._kv_areas])
+            if (spec := self._block_spec(logical)) is not None and name in banded
+        )
+
     def _check_mla_constraints(
         self, nixl_agent_meta: RblnNixlAgentMetadata, remote_tp_size: int
     ) -> None:
@@ -588,7 +677,11 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         staging, which records every region as attention, refuses an engine
         whose page sizes differ.
         """
-        if self.use_mla and self._is_head_matched_peer(remote_tp_size):
+        if (
+            self.use_mla
+            and self._is_head_matched_peer(remote_tp_size)
+            and not (self._block_state_layers and self._block_payloads_band())
+        ):
             raise RuntimeError(
                 "RBLN NIXL D2D: MLA is not supported with heterogeneous tensor "
                 f"parallelism (peer TP {remote_tp_size}, local "
@@ -1452,18 +1545,22 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         self._shard_region_group_ids[(engine_id, global_rank)] = tuple(
             self.region_group_ids[i] for i in region_ids
         )
+        if not peer_region_group_ids:
+            raise RuntimeError(
+                f"RBLN NIXL: peer {engine_id} rank {global_rank} published no "
+                "KV group per region, so its block ids cannot be paired with "
+                "ours."
+            )
         if plan is None:
-            if not peer_region_group_ids:
-                raise RuntimeError(
-                    f"RBLN NIXL: peer {engine_id} rank {global_rank} published no "
-                    "KV group per region, so its block ids cannot be paired with "
-                    "ours."
-                )
             peer_group_ids = self._shard_peer_group_ids(
                 registered_layer_names, peer_region_group_ids, peer_areas
             )
         else:
-            peer_group_ids = self._shard_region_group_ids[(engine_id, global_rank)]
+            # A pipelined producer numbers its groups off its own stage, so an
+            # entry takes the group of the peer region it reads.
+            peer_group_ids = tuple(
+                peer_region_group_ids[entry[0].remote_region] for entry in plan[1]
+            )
         self._shard_peer_region_group_ids[(engine_id, global_rank)] = peer_group_ids
         self._shard_descs_per_block[(engine_id, global_rank)] = (
             (1,) * len(region_ids) if pieces is None else tuple(map(len, pieces))
@@ -1485,10 +1582,8 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         """
         bands = {
             tuple(place.slice_id for place in geometry.areas)
-            for geometry, heads in zip(
-                self._logical_region_geometry, self._logical_region_kv_heads
-            )
-            if heads is not None
+            for logical, geometry in enumerate(self._logical_region_geometry)
+            if self._region_bands(logical)
         }
         if not bands:
             # Nothing bands by head (an MLA latent, refused by name at the entry,
@@ -1507,6 +1602,13 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         (slice_ids,) = bands
         return len(slice_ids), len(set(slice_ids)), slice_ids
 
+    def _region_bands(self, logical: int) -> bool:
+        """Whether a logical region's bytes are banded across TP ranks by head."""
+        spec = self._block_spec(logical)
+        if spec is not None:
+            return bool(spec.band_heads)
+        return self._logical_region_kv_heads[logical] is not None
+
     def _peer_band(
         self,
         nixl_agent_meta: RblnNixlAgentMetadata,
@@ -1518,9 +1620,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         ours says which of the peer's have a band."""
         pairs = self._logical_region_pairs(registered_layer_names)
         banded = [
-            logical_r
-            for logical_l, logical_r in pairs
-            if self._logical_region_kv_heads[logical_l] is not None
+            logical_r for logical_l, logical_r in pairs if self._region_bands(logical_l)
         ] or [logical_r for _, logical_r in pairs]
         bands = {
             (len(ids), len(set(ids)))
@@ -1657,7 +1757,14 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
             (lh0, lh1), (lt0, lt1) = ours[0]
             _, ((rh0, rh1), (rt0, rt1)), remote_len = peer[0]
             cells_l, cells_r = (lh1 - lh0) * (lt1 - lt0), (rh1 - rh0) * (rt1 - rt0)
-            local_len = self.block_len_per_layer[logical_l * areas_l]
+            windows = self._block_windows(
+                nixl_agent_meta, logical_l, logical_r, 0, remote_tp_size
+            )
+            local_len = (
+                self.block_len_per_layer[logical_l * areas_l]
+                if windows is None
+                else windows[0][0].length
+            )
             if local_len * cells_r != remote_len * cells_l:
                 raise RuntimeError(
                     f"RBLN NIXL: for logical region {logical_l} (the peer's "
@@ -1749,7 +1856,9 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         self._check_d2d_region_pairing(nixl_agent_meta, remote_tp_size)
         self._check_split_axis_constraints(nixl_agent_meta, remote_tp_size)
         self._check_mla_constraints(nixl_agent_meta, remote_tp_size)
-        if any(g.axis is ChipletSplitAxis.BLOCK for g in self._logical_region_geometry):
+        if not self._is_head_matched_peer(remote_tp_size) and any(
+            g.axis is ChipletSplitAxis.BLOCK for g in self._logical_region_geometry
+        ):
             rpl = self._regions_per_layer()
             for peer, local in self._layer_overlap(
                 nixl_agent_meta.registered_layer_names
