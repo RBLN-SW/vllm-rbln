@@ -113,6 +113,18 @@ def test_flags_reach_the_config(parser):
     assert config.decode_batch_bucket_manual_buckets == [1, 4, 16]
 
 
+@pytest.mark.parametrize("buckets", [{}, {"image": [1024, 2304], "video": [12288]}])
+def test_patch_buckets_accept_modality_flags(parser, buckets):
+    config = resolve(parser, ["--rbln-mm-encoder-patch-buckets", json.dumps(buckets)])
+    assert config.mm_encoder_patch_buckets == buckets
+
+
+@pytest.mark.parametrize("buckets", [[], [1024, 2304]])
+def test_patch_bucket_lists_are_rejected(buckets):
+    with pytest.raises(ValueError, match="valid dictionary"):
+        build_rbln_config({"mm_encoder_patch_buckets": buckets})
+
+
 def test_coexists_with_additional_config(parser):
     """The dotted form is appended at the end of argv, so it must merge."""
     args = parser.parse_args(
@@ -226,11 +238,24 @@ def test_manual_strategy_needs_buckets():
 
 
 @pytest.mark.parametrize(
-    ("buckets", "error"), [([0, 2304], "must all be > 0"), ([2304, 2304], "unique")]
+    ("buckets", "error"),
+    [
+        ({"image": [0, 2304]}, "must all be > 0"),
+        ({"image": [2304, 2304]}, "unique"),
+        ({"video": [0, 12288]}, "must all be > 0"),
+        ({"video": [12288, 12288]}, "unique"),
+    ],
 )
 def test_mm_encoder_patch_buckets_are_positive_and_unique(buckets, error):
     with pytest.raises(ValueError, match=error):
         RBLNConfig(mm_encoder_patch_buckets=buckets)
+
+
+def test_patch_bucket_modality_changes_the_config_hash():
+    image = RBLNConfig(mm_encoder_patch_buckets={"image": [1024, 2304]})
+    video = RBLNConfig(mm_encoder_patch_buckets={"video": [1024, 2304]})
+
+    assert image.compute_hash() != video.compute_hash()
 
 
 @pytest.mark.parametrize("size", [0, -1])
@@ -332,7 +357,7 @@ def test_only_compile_fields_change_the_hash():
     assert RBLNConfig(decode_batch_bucket_strategy="linear").compute_hash() != base
     buckets = RBLNConfig(decode_batch_bucket_manual_buckets=[1, 2, 4])
     assert buckets.compute_hash() != base
-    patch_buckets = RBLNConfig(mm_encoder_patch_buckets=[1024, 2304])
+    patch_buckets = RBLNConfig(mm_encoder_patch_buckets={"image": [1024, 2304]})
     assert patch_buckets.compute_hash() != base
     # Unset and True resolve to the same graph; False compiles a static one.
     assert RBLNConfig(use_dynamic_kv_cache=True).compute_hash() == base

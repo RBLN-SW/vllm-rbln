@@ -1488,8 +1488,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             return
         mm_config = self.model_config.multimodal_config
         assert mm_config is not None
-        # Only images reach the RBLN vision encoder; the model rejects video.
-        if mm_config.get_limit_per_prompt("image") <= 0:
+        if all(mm_config.get_limit_per_prompt(m) <= 0 for m in ("image", "video")):
             return
         with torch.inference_mode():
             cast(SupportsRBLNMultiModal, self.model).warmup_mm_encoder()

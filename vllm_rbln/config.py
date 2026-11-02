@@ -128,9 +128,10 @@ class RBLNConfig(RBLNConfigBase):
     decode_batch_bucket_manual_buckets: list[int] = field(default_factory=list)
     """Explicit decode batch sizes, used when the strategy is `manual`."""
 
-    mm_encoder_patch_buckets: list[int] = field(default_factory=list)
-    """Patch counts the vision encoder buckets; an image runs padded to the
-    smallest that holds it. Empty: one at the processor's patch upper bound."""
+    mm_encoder_patch_buckets: dict[str, list[int]] = field(default_factory=dict)
+    """Patch buckets per modality, e.g. {"image": [1024, 2304], "video": [12288]}.
+    Missing or empty entries use the modality's processor upper bound.
+    Identical shapes share an encoder graph."""
 
     use_w8a8: bool = False
     """Opt in to W8A8. W8A16 runs on every RBLN NPU, W8A8 only on the ones
@@ -172,11 +173,12 @@ class RBLNConfig(RBLNConfigBase):
                 "decode_batch_bucket_strategy='manual' needs at least one entry "
                 "in decode_batch_bucket_manual_buckets"
             )
-        patch_buckets = self.mm_encoder_patch_buckets
-        if any(b <= 0 for b in patch_buckets):
-            raise ValueError("mm_encoder_patch_buckets must all be > 0")
-        if len(patch_buckets) != len(set(patch_buckets)):
-            raise ValueError("mm_encoder_patch_buckets must be unique")
+        for modality, patch_buckets in self.mm_encoder_patch_buckets.items():
+            name = f"mm_encoder_patch_buckets[{modality!r}]"
+            if any(b <= 0 for b in patch_buckets):
+                raise ValueError(f"{name} must all be > 0")
+            if len(patch_buckets) != len(set(patch_buckets)):
+                raise ValueError(f"{name} must be unique")
 
 
 @vllm_config_dataclass

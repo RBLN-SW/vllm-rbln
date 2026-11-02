@@ -102,12 +102,13 @@ def test_image_encoding_reuses_eager_or_compiled_encoder(monkeypatch, compiled):
     torch.nn.Module.__init__(model)
     model.vision_tower = torch.nn.Linear(2, 2, bias=False)
     model.vision_tower.spatial_merge_size = 1
+    model.vision_tower.vision_model = SimpleNamespace(vision_segment_max_frames=4)
     encoder = torch.nn.Sequential(model.vision_tower)
     build_encoder = Mock(return_value=encoder)
     monkeypatch.setattr(m3, "_RBLNVisionEncoder", build_encoder)
     object.__setattr__(model, "_mm_encoder", encoder if compiled else None)
     model.mm_embeds_dtype = torch.float32
-    model._encoder_inputs = Mock(side_effect=lambda pixels, grid: [pixels])
+    model._encoder_inputs = Mock(side_effect=lambda pixels, grid, modality: [pixels])
     pixels = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
     grids = torch.tensor([[1, 1, 1], [1, 1, 2]])
 
@@ -165,12 +166,18 @@ def test_fp32_vision_encoder_hands_out_model_dtype_embeddings():
     torch.testing.assert_close(out, expected.to(torch.bfloat16))
 
 
-def _image_info(**kwargs):
-    from vllm.transformers_utils.processors.minimax_m3 import MiniMaxM3VLImageProcessor
+def _image_info(video_kwargs=None, **kwargs):
+    from vllm.transformers_utils.processors.minimax_m3 import (
+        MiniMaxM3VLImageProcessor,
+        MiniMaxM3VLVideoProcessor,
+    )
 
     import vllm_rbln.model_executor.models.minimax_m3 as m3
 
-    processor = SimpleNamespace(image_processor=MiniMaxM3VLImageProcessor(**kwargs))
+    processor = SimpleNamespace(
+        image_processor=MiniMaxM3VLImageProcessor(**kwargs),
+        video_processor=MiniMaxM3VLVideoProcessor(**(video_kwargs or {})),
+    )
     ctx = SimpleNamespace(
         get_hf_processor=lambda *args, **kw: processor,
         get_merged_mm_kwargs=lambda kwargs, **kw: kwargs,
@@ -178,21 +185,37 @@ def _image_info(**kwargs):
     return m3.RBLNMiniMaxM3SparseForConditionalGeneration._processor_factory.info(ctx)
 
 
-def _build_with_patch_buckets(monkeypatch, buckets, *, max_side=672, info=None):
+def _build_with_patch_buckets(
+    monkeypatch,
+    buckets,
+    *,
+    max_side=672,
+    info=None,
+    limits=None,
+    segment_frames=4,
+    is_first_rank=True,
+):
     import vllm_rbln.model_executor.models.minimax_m3 as m3
     from vllm_rbln.config import RBLNConfig
 
     cls = m3.RBLNMiniMaxM3SparseForConditionalGeneration
     info = info or _image_info(max_pixels=max_side**2)
+    limits = limits or {"image": 1, "video": 0}
     monkeypatch.setattr(
         m3.MULTIMODAL_REGISTRY,
         "create_processor",
         lambda model_config: SimpleNamespace(info=info),
     )
-    monkeypatch.setattr(m3, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True))
     monkeypatch.setattr(
-        m3._vision_tower, "MiniMaxVLVisionModel", lambda **kw: torch.nn.Identity()
+        m3, "get_pp_group", lambda: SimpleNamespace(is_first_rank=is_first_rank)
     )
+
+    def tower(**kw):
+        module = torch.nn.Module()
+        module.vision_model = SimpleNamespace(vision_segment_max_frames=segment_frames)
+        return module
+
+    monkeypatch.setattr(m3._vision_tower, "MiniMaxVLVisionModel", tower)
     monkeypatch.setattr(
         m3,
         "init_vllm_registered_model",
@@ -200,13 +223,15 @@ def _build_with_patch_buckets(monkeypatch, buckets, *, max_side=672, info=None):
     )
     monkeypatch.setattr(cls, "_mark_language_model", lambda self, c: nullcontext())
     config = SimpleNamespace(
-        vision_config={}, text_config=SimpleNamespace(hidden_size=8)
+        vision_config={"vision_segment_max_frames": segment_frames},
+        text_config=SimpleNamespace(hidden_size=8),
     )
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(
             hf_config=config,
             dtype=torch.bfloat16,
-            multimodal_config=SimpleNamespace(get_limit_per_prompt=lambda m: 1),
+            max_model_len=4096,
+            multimodal_config=SimpleNamespace(get_limit_per_prompt=limits.get),
         ),
         quant_config=None,
         additional_config=RBLNConfig(mm_encoder_patch_buckets=buckets),
@@ -218,9 +243,10 @@ def _build_with_patch_buckets(monkeypatch, buckets, *, max_side=672, info=None):
     ("configured", "buckets"),
     [
         # Unset: one bucket, the processor's largest image (672 px: 48 x 48).
-        ([], [2304]),
-        ([2304, 1024], [1024, 2304]),
-        ([1024, 2400], [1024, 2400]),
+        ({}, [2304]),
+        ({"image": []}, [2304]),
+        ({"image": [2304, 1024]}, [1024, 2304]),
+        ({"image": [1024, 2400]}, [1024, 2400]),
     ],
 )
 def test_patch_buckets_default_to_the_processors_largest_image(
@@ -228,15 +254,169 @@ def test_patch_buckets_default_to_the_processors_largest_image(
 ):
     model = _build_with_patch_buckets(monkeypatch, configured)
 
+    assert model.mm_encoder_patch_buckets == {"image": buckets}
+
+
+@pytest.mark.parametrize(
+    ("limits", "buckets"),
+    [
+        # A video segment: 4 temporal patches of a 602,112 px frame (3072 each).
+        ({"image": 0, "video": 1}, {"video": [12288]}),
+        ({"image": 1, "video": 1}, {"image": [2304], "video": [12288]}),
+    ],
+)
+def test_patch_buckets_default_to_one_per_enabled_modality(
+    monkeypatch, limits, buckets
+):
+    model = _build_with_patch_buckets(monkeypatch, {}, limits=limits)
+
     assert model.mm_encoder_patch_buckets == buckets
+
+
+def test_patch_buckets_must_hold_a_video_segment(monkeypatch):
+    with pytest.raises(ValueError, match="must reach 12288 patches"):
+        _build_with_patch_buckets(
+            monkeypatch, {"video": [2304, 3072]}, limits={"image": 1, "video": 1}
+        )
+
+
+def test_video_buckets_do_not_change_image_selection(monkeypatch, vision_encoder_model):
+    model = _build_with_patch_buckets(
+        monkeypatch,
+        {"image": [1024, 2304], "video": [512, 12288]},
+        limits={"image": 1, "video": 1},
+    )
+    model.vision_tower = vision_encoder_model.vision_tower
+    pixels = torch.ones(16, 6)
+
+    image, *_ = model._encoder_inputs(pixels, [1, 4, 4], "image")
+    video, *_ = model._encoder_inputs(pixels, [1, 4, 4], "video")
+
+    assert image.shape[0] == 1024
+    assert video.shape[0] == 512
+
+
+def test_image_buckets_allow_default_video_buckets(monkeypatch):
+    model = _build_with_patch_buckets(
+        monkeypatch, {"image": [1024, 2304]}, limits={"image": 1, "video": 1}
+    )
+    assert model.mm_encoder_patch_buckets == {"image": [1024, 2304], "video": [12288]}
+
+
+@pytest.mark.parametrize("image_limit", [0, 1])
+@pytest.mark.parametrize("is_first_rank", [False, True])
+def test_unsegmented_video_is_rejected_at_startup(
+    monkeypatch, image_limit, is_first_rank
+):
+    with pytest.raises(ValueError, match="vision_segment_max_frames=None"):
+        _build_with_patch_buckets(
+            monkeypatch,
+            {},
+            limits={"image": image_limit, "video": 1},
+            segment_frames=None,
+            is_first_rank=is_first_rank,
+        )
+
+
+def test_image_only_allows_no_frame_limit(monkeypatch):
+    model = _build_with_patch_buckets(
+        monkeypatch, {}, limits={"image": 1, "video": 0}, segment_frames=None
+    )
+    assert model.mm_encoder_patch_buckets == {"image": [2304]}
+
+
+def test_video_budget_can_schedule_a_video_enlarged_by_min_pixels():
+    from vllm.config import SchedulerConfig
+    from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.core.encoder_cache_manager import (
+        EncoderCacheManager,
+        compute_mm_encoder_budget,
+    )
+    from vllm.v1.request import Request
+
+    from vllm_rbln.v1.core.rbln_scheduler import RBLNScheduler
+
+    # 25 temporal patches of a frame enlarged to 1008 x 1008 (1296 tokens).
+    seq_len, num_embeds = 32768, 32400
+    info = _image_info(video_kwargs={"min_pixels": 1_000_000})
+    config = SchedulerConfig(
+        max_num_batched_tokens=2048,
+        max_num_seqs=1,
+        max_model_len=seq_len,
+        enable_chunked_prefill=True,
+        is_encoder_decoder=False,
+    )
+    budget, cache_size = compute_mm_encoder_budget(
+        config, {"video": info.get_max_video_tokens(seq_len, {"video": 1})}
+    )
+    request = Request(
+        "video",
+        [1] * num_embeds,
+        SamplingParams(max_tokens=1),
+        None,
+        mm_features=[
+            MultiModalFeatureSpec(
+                data=None,
+                modality="video",
+                identifier="video",
+                mm_position=PlaceholderRange(offset=0, length=num_embeds),
+            )
+        ],
+    )
+    scheduler = SimpleNamespace(
+        is_encoder_decoder=False,
+        scheduler_config=config,
+        ec_connector=None,
+        encoder_cache_manager=EncoderCacheManager(cache_size),
+    )
+
+    inputs, num_tokens, remaining, _ = RBLNScheduler._try_schedule_encoder_inputs(
+        scheduler, request, 0, 2048, budget
+    )
+
+    assert inputs == [0]
+    assert num_tokens == 2048
+    assert remaining == budget - num_embeds
+
+
+@pytest.mark.parametrize(
+    ("seq_len", "batch_tokens", "disable_mm_chunking"),
+    [(4096, 2048, False), (4096, 3840, True), (1048576, 2048, False)],
+)
+def test_video_budget_preserves_upstream_estimate(
+    seq_len, batch_tokens, disable_mm_chunking
+):
+    from vllm.config import SchedulerConfig
+    from vllm.v1.core.encoder_cache_manager import compute_mm_encoder_budget
+
+    import vllm_rbln.model_executor.models.minimax_m3 as m3
+
+    info = _image_info()
+    upstream = m3.MiniMaxM3VLProcessingInfo(info.ctx)
+    config = SchedulerConfig(
+        max_num_batched_tokens=batch_tokens,
+        max_num_seqs=1,
+        max_model_len=seq_len,
+        enable_chunked_prefill=True,
+        disable_chunked_mm_input=disable_mm_chunking,
+        is_encoder_decoder=False,
+    )
+    expected = compute_mm_encoder_budget(
+        config, {"video": upstream.get_max_video_tokens(seq_len, {"video": 1})}
+    )
+    actual = compute_mm_encoder_budget(
+        config, {"video": info.get_max_video_tokens(seq_len, {"video": 1})}
+    )
+    assert actual == expected
 
 
 @pytest.mark.parametrize(
     ("configured", "max_side", "error"),
     [
-        ([1022, 2304], 672, r"\[1022\] must be multiples of 4"),
-        ([1024], 672, "must reach 2304 patches"),
-        ([2304, 5184], 672, r"\[5184\] would never be used"),
+        ({"image": [1022, 2304]}, 672, r"\[1022\] must be multiples of 4"),
+        ({"image": [1024]}, 672, "must reach 2304 patches"),
+        ({"image": [2304, 5184]}, 672, r"\[5184\] would never be used"),
     ],
 )
 def test_unusable_patch_buckets_are_rejected_at_startup(
@@ -268,10 +448,91 @@ def vision_encoder_model():
         encoder=SimpleNamespace(
             layers=[SimpleNamespace(self_attn=SimpleNamespace(head_dim=16))]
         ),
+        vision_segment_max_frames=2,
     )
     model.vision_tower = tower
-    model.mm_encoder_patch_buckets = [16, 64]
+    model.mm_encoder_patch_buckets = {"image": [16, 64], "video": [16, 64]}
     return model
+
+
+def test_a_video_is_encoded_in_segments_of_temporal_patches(vision_encoder_model):
+    model = vision_encoder_model
+    calls = []
+
+    def encode(pixels, cos, sin, bias):
+        calls.append((pixels, cos))
+        # One token per 2 x 2 merge: the patch index of its first patch.
+        return pixels[::4, :1]
+
+    object.__setattr__(model, "_mm_encoder", encode)
+    pixels = torch.arange(20.0).unsqueeze(1).expand(-1, 6)
+
+    (embeds,) = model.embed_multimodal(
+        pixel_values_videos=pixels, video_grid_thw=torch.tensor([[5, 2, 2]])
+    )
+
+    torch.testing.assert_close(embeds, torch.arange(0.0, 20.0, 4).unsqueeze(1))
+    starts = [0, 8, 16]
+    for (seg_pixels, cos), start, n in zip(calls, starts, [8, 8, 4], strict=True):
+        torch.testing.assert_close(seg_pixels[:n], pixels[start : start + n])
+        # The temporal position restarts in each segment (inv_freq_t is 1).
+        t_pos = torch.arange(n) // 4
+        torch.testing.assert_close(cos[:n, 0], t_pos.float().cos())
+
+
+def test_no_frame_limit_keeps_image_output_storage(vision_encoder_model):
+    model = vision_encoder_model
+    model.vision_tower.vision_model.vision_segment_max_frames = None
+    outputs = []
+
+    def encode(pixels, cos, sin, bias):
+        outputs.append(pixels[::4, :1])
+        return outputs[-1]
+
+    object.__setattr__(model, "_mm_encoder", encode)
+    pixels = torch.arange(4.0).unsqueeze(1).expand(-1, 6)
+    (embeds,) = model.embed_multimodal(
+        pixel_values=pixels, image_grid_thw=torch.tensor([[1, 2, 2]])
+    )
+
+    assert len(outputs) == 1
+    assert embeds.data_ptr() == outputs[0].data_ptr()
+    torch.testing.assert_close(embeds, pixels[::4, :1])
+
+
+def test_shared_bucket_is_warmed_once(vision_encoder_model):
+    model = vision_encoder_model
+    model.mm_encoder_patch_buckets = {"image": [16, 64], "video": [64, 128]}
+    encoder = Mock()
+    object.__setattr__(model, "_mm_encoder", encoder)
+
+    model.warmup_mm_encoder()
+
+    assert [call.args[0].shape[0] for call in encoder.call_args_list] == [16, 64, 128]
+
+
+@pytest.mark.parametrize("video_first", [False, True])
+def test_mixed_modalities_preserve_input_order(vision_encoder_model, video_first):
+    model = vision_encoder_model
+    object.__setattr__(model, "_mm_encoder", lambda pixels, *args: pixels[::4, :1])
+    image = {
+        "pixel_values": torch.full((4, 6), 3.0),
+        "image_grid_thw": torch.tensor([[1, 2, 2]]),
+    }
+    video = {
+        "pixel_values_videos": torch.full((12, 6), 7.0),
+        "video_grid_thw": torch.tensor([[3, 2, 2]]),
+    }
+    inputs = {**video, **image} if video_first else {**image, **video}
+
+    outputs = model.embed_multimodal(**inputs)
+
+    expected = [torch.full((1, 1), 3.0), torch.full((3, 1), 7.0)]
+    if video_first:
+        expected.reverse()
+    assert len(outputs) == 2
+    for output, target in zip(outputs, expected):
+        torch.testing.assert_close(output, target)
 
 
 def test_an_image_runs_in_the_smallest_bucket_that_holds_it(vision_encoder_model):
@@ -280,7 +541,7 @@ def test_an_image_runs_in_the_smallest_bucket_that_holds_it(vision_encoder_model
     for grid, bucket in (([1, 4, 4], 16), ([1, 4, 6], 64)):
         pixels = torch.ones(math.prod(grid), 6)
 
-        padded, cos, sin, key_bias = model._encoder_inputs(pixels, grid)
+        padded, cos, sin, key_bias = model._encoder_inputs(pixels, grid, "image")
 
         assert padded.shape == (bucket, 6)
         assert cos.shape == sin.shape == (bucket, 16)
@@ -299,7 +560,9 @@ def test_an_image_runs_in_the_smallest_bucket_that_holds_it(vision_encoder_model
 def test_warmup_runs_every_patch_bucket(
     monkeypatch, vision_encoder_model, buckets, max_side
 ):
-    model = _build_with_patch_buckets(monkeypatch, buckets, max_side=max_side)
+    model = _build_with_patch_buckets(
+        monkeypatch, {"image": buckets}, max_side=max_side
+    )
     model.vision_tower = vision_encoder_model.vision_tower
     warmed = []
 
@@ -336,31 +599,40 @@ def test_warmup_without_a_local_vision_tower(vision_encoder_model):
     model._mm_encoder.assert_not_called()
 
 
-@pytest.mark.parametrize(("side", "rejected"), [(48, False), (50, True)])
-def test_a_request_may_not_enlarge_an_image_past_the_compiled_encoder(
-    monkeypatch, side, rejected
+@pytest.mark.parametrize(
+    ("modality", "frames", "side", "error"),
+    [
+        ("image", 1, 48, None),
+        ("image", 1, 50, "2500 patches a frame, more than the 2304"),
+        # A video frame is bounded by the video processor's 602,112 px.
+        ("video", 6, 55, None),
+        ("video", 6, 56, "3136 patches a frame, more than the 3072"),
+    ],
+)
+def test_a_request_may_not_enlarge_a_frame_past_the_compiled_encoder(
+    monkeypatch, modality, frames, side, error
 ):
     from transformers import BatchFeature
 
     import vllm_rbln.model_executor.models.minimax_m3 as m3
 
-    grid = torch.tensor([[1, 32, 32], [1, side, side]])
+    grid = torch.tensor([[frames, 32, 32], [frames, side, side]])
     monkeypatch.setattr(
         m3._mm_preprocess.MiniMaxM3VLMultiModalProcessor,
         "_call_hf_processor",
-        lambda self, hf_data, hf_kwargs: BatchFeature({"image_grid_thw": grid}),
+        lambda self, hf_data, hf_kwargs: BatchFeature({f"{modality}_grid_thw": grid}),
     )
     processor = m3._RBLNMiniMaxM3VLMultiModalProcessor.__new__(
         m3._RBLNMiniMaxM3VLMultiModalProcessor
     )
     processor.info = _image_info(max_pixels=672**2)
 
-    if rejected:
-        with pytest.raises(ValueError, match="2500 patches .* than the 2304"):
-            processor._call_hf_processor({}, {"max_pixels": 700 * 700})
+    if error:
+        with pytest.raises(ValueError, match=error):
+            processor._call_hf_processor({}, {"max_pixels": 800 * 800})
     else:
         outputs = processor._call_hf_processor({}, {})
-        torch.testing.assert_close(outputs["image_grid_thw"], grid)
+        torch.testing.assert_close(outputs[f"{modality}_grid_thw"], grid)
 
 
 @pytest.mark.parametrize(
@@ -380,8 +652,8 @@ def test_image_bound_covers_the_real_resize(monkeypatch, kwargs, size):
     info = _image_info(**kwargs)
     outputs = info.get_image_processor()(Image.new("RGB", size), return_tensors="pt")
     patches = int(outputs["image_grid_thw"].prod())
-    model = _build_with_patch_buckets(monkeypatch, [], info=info)
-    assert model.mm_encoder_patch_buckets[-1] >= patches
+    model = _build_with_patch_buckets(monkeypatch, {}, info=info)
+    assert model.mm_encoder_patch_buckets["image"][-1] >= patches
     assert info.get_max_image_tokens() >= patches // 4
 
     monkeypatch.setattr(
@@ -396,6 +668,45 @@ def test_image_bound_covers_the_real_resize(monkeypatch, kwargs, size):
     assert processor._call_hf_processor({}, {}) is outputs
 
 
+@pytest.mark.parametrize(
+    ("kwargs", "size"),
+    [
+        ({"max_pixels": 640000}, (812, 784)),
+        ({"max_long_side_pixel": 1000}, (200, 1)),
+        # The video processor enlarges to its own min_pixels, unlike images.
+        ({"min_pixels": 1_000_000}, (100, 100)),
+    ],
+)
+def test_video_bound_covers_the_real_resize(monkeypatch, kwargs, size):
+    import numpy as np
+
+    info = _image_info(video_kwargs=kwargs)
+    frames = np.zeros((10, size[1], size[0], 3), dtype=np.uint8)
+    outputs = info.get_video_processor()(
+        videos=[frames],
+        do_resize=True,
+        return_tensors="pt",
+        input_data_format="channels_last",
+    )
+    t, h, w = outputs["video_grid_thw"][0].tolist()
+    assert info.get_max_video_frame_tokens() >= h * w // 4
+    assert (
+        info.get_num_video_tokens(
+            image_width=size[0],
+            image_height=size[1],
+            num_frames=10,
+            image_processor=info.get_video_processor(),
+            mm_kwargs={},
+        )
+        == t * h * w // 4
+    )
+
+    model = _build_with_patch_buckets(
+        monkeypatch, {}, info=info, limits={"image": 0, "video": 1}
+    )
+    assert model.mm_encoder_patch_buckets["video"][-1] >= 4 * h * w
+
+
 def test_patch_bucket_accepts_a_non_square_image(monkeypatch):
     from PIL import Image
 
@@ -404,19 +715,23 @@ def test_patch_bucket_accepts_a_non_square_image(monkeypatch):
         Image.new("RGB", (784, 560)), return_tensors="pt"
     )
     assert int(outputs["image_grid_thw"].prod()) == 2240
-    model = _build_with_patch_buckets(monkeypatch, [2208, 2240, 2304], info=info)
-    assert model.mm_encoder_patch_buckets == [2208, 2240, 2304]
+    model = _build_with_patch_buckets(
+        monkeypatch, {"image": [2208, 2240, 2304]}, info=info
+    )
+    assert model.mm_encoder_patch_buckets == {"image": [2208, 2240, 2304]}
 
 
 @pytest.mark.parametrize(
-    "kwargs",
+    ("modality", "kwargs"),
     [
-        {"max_pixels": 640000},
-        {"images_kwargs": {"max_pixels": 640000}},
-        {"images_kwargs": {"max_long_side_pixel": 1000}},
+        ("image", {"max_pixels": 640000}),
+        ("image", {"images_kwargs": {"max_pixels": 640000}}),
+        ("image", {"images_kwargs": {"max_long_side_pixel": 1000}}),
+        ("video", {"videos_kwargs": {"max_pixels": 640000}}),
     ],
 )
-def test_startup_image_limits_match_the_full_processor(tmp_path, kwargs):
+def test_startup_limits_match_the_full_processor(tmp_path, modality, kwargs):
+    import numpy as np
     from PIL import Image
     from tokenizers import Tokenizer
     from tokenizers.models import WordLevel
@@ -464,12 +779,18 @@ def test_startup_image_limits_match_the_full_processor(tmp_path, kwargs):
     )
     processor.info = info
 
-    outputs = processor._call_hf_processor(
-        {"images": [Image.new("RGB", (812, 784))], "text": tokens[1]}, {}
-    )
+    if modality == "image":
+        data = {"images": [Image.new("RGB", (812, 784))], "text": tokens[1]}
+        max_frame_tokens = info.get_max_image_tokens
+    else:
+        frames = np.zeros((2, 784, 812, 3), dtype=np.uint8)
+        data = {"videos": [frames], "text": tokens[2]}
+        max_frame_tokens = info.get_max_video_frame_tokens
 
-    assert outputs["image_grid_thw"].tolist() == [[1, 56, 58]]
-    assert info.get_max_image_tokens() >= 812
+    outputs = processor._call_hf_processor(data, {})
+
+    assert outputs[f"{modality}_grid_thw"].tolist() == [[1, 56, 58]]
+    assert max_frame_tokens() >= 812
 
 
 def test_text_config_loads_from_local_checkpoint(tmp_path):

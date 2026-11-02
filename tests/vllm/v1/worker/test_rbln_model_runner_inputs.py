@@ -181,14 +181,17 @@ class TestGatherMultimodalEmbeddings:
 
 
 class TestWarmupMultimodalEncoder:
-    def test_warms_the_models_encoder_graphs(self, make_model_runner, monkeypatch):
+    @pytest.mark.parametrize("limits", [{"image": 1, "video": 0}, {"image": 0}])
+    def test_warms_the_models_encoder_graphs(
+        self, make_model_runner, monkeypatch, limits
+    ):
         monkeypatch.setattr(
             mr, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True)
         )
         runner = make_model_runner()
         runner.supports_mm_inputs = True
         runner.model_config.multimodal_config = MultiModalConfig(
-            limit_per_prompt={"image": 1}
+            limit_per_prompt=limits
         )
         warmup = Mock()
         runner.model = SimpleNamespace(warmup_mm_encoder=warmup)
@@ -198,9 +201,9 @@ class TestWarmupMultimodalEncoder:
         warmup.assert_called_once_with()
 
     @pytest.mark.parametrize(
-        "reason", ["text_only_model", "other_pp_rank", "no_image_limit"]
+        "reason", ["text_only_model", "other_pp_rank", "no_image_or_video"]
     )
-    def test_skips_when_no_image_can_reach_the_encoder(
+    def test_skips_when_nothing_can_reach_the_encoder(
         self, make_model_runner, monkeypatch, reason
     ):
         monkeypatch.setattr(
@@ -210,8 +213,9 @@ class TestWarmupMultimodalEncoder:
         )
         runner = make_model_runner()
         runner.supports_mm_inputs = reason != "text_only_model"
+        limit = 0 if reason == "no_image_or_video" else 1
         runner.model_config.multimodal_config = MultiModalConfig(
-            limit_per_prompt={"image": 0 if reason == "no_image_limit" else 1}
+            limit_per_prompt={"image": limit, "video": limit}
         )
         warmup = Mock()
         runner.model = SimpleNamespace(warmup_mm_encoder=warmup)
