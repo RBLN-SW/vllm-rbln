@@ -523,7 +523,12 @@ class TestRejectedConfigs:
 
     @pytest.mark.parametrize(
         "feature",
-        ["data parallelism", "speculative decoding", "sub-block prefix caching"],
+        [
+            "data parallelism",
+            "speculative decoding",
+            "sub-block prefix caching",
+            "KV transfer",
+        ],
     )
     def test_a_prefill_chunk_below_the_token_budget_refuses(self, reconfigure, feature):
         def mutate(config):
@@ -532,6 +537,10 @@ class TestRejectedConfigs:
                 _ranks(data_parallel_size=2)(config)
             elif feature == "speculative decoding":
                 config.speculative_config = SimpleNamespace(method="ngram")
+            elif feature == "KV transfer":
+                config.kv_transfer_config = SimpleNamespace(
+                    kv_connector="RblnNixlPushConnector"
+                )
             else:
                 config.cache_config.enable_prefix_caching = True
 

@@ -135,8 +135,8 @@ def _validate(vllm_config: "VllmConfig") -> None:
             f"--rbln-prefill-chunk-size={chunk} exceeds {max_num_batched_tokens=}."
         )
     # TODO(RBLN): DP ranks agree on max_num_batched_tokens as the prefill token
-    # dimension (dp_utils), and spec decode and sub-block caching take it as
-    # the prefill chunk.
+    # dimension (dp_utils), and spec decode, sub-block caching and the RBLN NIXL
+    # connector's resume trim take it as the prefill chunk.
     if chunk is not None and chunk < max_num_batched_tokens:
         unsupported = [
             name
@@ -148,6 +148,7 @@ def _validate(vllm_config: "VllmConfig") -> None:
                     vllm_config.cache_config.enable_prefix_caching
                     and rbln_config.enable_sub_block_cache,
                 ),
+                ("KV transfer", vllm_config.kv_transfer_config is not None),
             )
             if on
         ]
