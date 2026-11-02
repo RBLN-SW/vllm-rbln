@@ -240,10 +240,11 @@ class TestEnsureTorchDynamoConfigured:
         assert torch._dynamo.config.inline_inbuilt_nn_modules is True
 
 
-def test_mark_decoder_regions_marks_only_the_built_decoder_layers(monkeypatch):
-    # A make_layers stack with a PP placeholder past end_layer, next to a
-    # `layers` list that make_layers did not build: only the stack's two built
-    # layers become regions, and they share one body.
+@pytest.mark.parametrize("stack", ["layers", "h", "blocks"])
+def test_mark_decoder_regions_marks_only_the_built_decoder_layers(monkeypatch, stack):
+    # A make_layers stack, under each name upstream gives it, with a PP
+    # placeholder past end_layer, next to a `layers` list that make_layers did
+    # not build: only the stack's two built layers become regions, sharing a body.
     from vllm.model_executor.models.utils import PPMissingLayer
 
     class Layer(torch.nn.Module):
@@ -260,11 +261,12 @@ def test_mark_decoder_regions_marks_only_the_built_decoder_layers(monkeypatch):
             self.encoder = torch.nn.Module()
             self.encoder.layers = torch.nn.ModuleList([Layer()])
             self.start_layer, self.end_layer = 0, 2
-            self.layers = torch.nn.ModuleList([Layer(), Layer(), PPMissingLayer()])
+            layers = torch.nn.ModuleList([Layer(), Layer(), PPMissingLayer()])
+            setattr(self, stack, layers)
 
         def forward(self, x):
             x = self.encoder.layers[0](x)
-            for layer in self.layers[self.start_layer : self.end_layer]:
+            for layer in getattr(self, stack)[self.start_layer : self.end_layer]:
                 x = layer(x)
             return x
 

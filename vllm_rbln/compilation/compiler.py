@@ -56,15 +56,21 @@ def _ensure_torch_dynamo_configured() -> None:
 def mark_decoder_regions(model: torch.nn.Module) -> None:
     """Make every decoder layer of ``model`` a nested compile region.
 
-    A decoder stack is a ``layers`` list whose owner also keeps
-    ``start_layer``/``end_layer``, as ``make_layers`` sets them; the layers
-    outside that range are pipeline-parallel placeholders.
+    A decoder stack is the list ``make_layers`` builds, which its owner keeps as
+    ``layers`` (``h`` or ``blocks`` in a few models) next to the
+    ``start_layer``/``end_layer`` it also sets; the layers outside that range are
+    pipeline-parallel placeholders.
     """
     regions: dict[type, type] = {}
     for module in model.modules():
         if not hasattr(module, "start_layer"):
             continue
-        for layer in islice(module.layers, module.start_layer, module.end_layer):
+        stack = next(
+            getattr(module, name)
+            for name in ("layers", "h", "blocks")
+            if hasattr(module, name)
+        )
+        for layer in islice(stack, module.start_layer, module.end_layer):
             cls = type(layer)
             if cls not in regions:
                 # Marked on a class, not on the instance: Dynamo then traces every
