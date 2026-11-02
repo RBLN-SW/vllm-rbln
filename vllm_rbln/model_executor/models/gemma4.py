@@ -151,6 +151,15 @@ class RBLNGemma4MultiModalProcessor(Gemma4MultiModalProcessor):
     """Upstream's processor, refusing per request an image budget above the
     one the vision encoder and image prefill compile to."""
 
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # Upstream caches the HF processor on max_soft_tokens, which Gemma4's
+        # processor takes at construction, so the first request at a budget
+        # would build one; build each allowed budget's before serving.
+        for budget in _SUPPORTED_SOFT_TOKENS:
+            if budget <= self._mm_soft_token_cap:
+                self.info.get_hf_processor(max_soft_tokens=budget)
+
     @cached_property
     def _mm_soft_token_cap(self) -> int:
         return mm_soft_token_cap(self.info)
