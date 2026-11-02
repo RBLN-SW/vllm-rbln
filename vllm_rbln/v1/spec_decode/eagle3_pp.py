@@ -17,7 +17,8 @@ Everything here is architecture-independent: the slot naming, which indices a
 stage receives versus captures, and the handoff placeholder that has to advertise
 them. Only the capture itself is not, because it lives inside a model's `forward`
 and the tensors have to be graph outputs of that forward -- see
-`vllm_rbln/patches/minimax_m2.py` and `vllm_rbln/patches/axk2/model.py`.
+`vllm_rbln/patches/minimax_m2.py`, `vllm_rbln/patches/axk2/model.py` and
+`vllm_rbln/model_executor/models/minimax_m3.py`.
 """
 
 from __future__ import annotations
@@ -33,7 +34,15 @@ from vllm.sequence import IntermediateTensors
 # drops the capture on a non-last stage, or -- where upstream has converted it --
 # packs a key per tensor, which this side does not read. The startup hook in
 # `platform/vllm_impl.py` refuses it rather than letting it fail mid-compile.
-AUX_PP_TARGET_ARCHS = frozenset({"MiniMaxM2ForCausalLM", "AXK2ForCausalLM"})
+AUX_PP_TARGET_ARCHS = frozenset(
+    {
+        "MiniMaxM2ForCausalLM",
+        "AXK2ForCausalLM",
+        # vllm_rbln/model_executor/models/minimax_m3.py, text-only and VL.
+        "MiniMaxM3SparseForCausalLM",
+        "MiniMaxM3SparseForConditionalGeneration",
+    }
+)
 
 # One handoff tensor carries every aux hidden state, concatenated on the feature
 # dim in ascending layer order, which is the layout the drafter's `fc` already expects.

@@ -24,6 +24,7 @@ from types import SimpleNamespace
 import pytest
 from vllm.model_executor.models.minimax_m2 import MiniMaxM2Model
 
+from vllm_rbln.model_executor.models.minimax_m3 import RBLNMiniMaxM3Model
 from vllm_rbln.patches.axk2.model import AXK2Model
 from vllm_rbln.platform.vllm_impl import _validate_aux_hidden_states_pp_config
 from vllm_rbln.v1.spec_decode.eagle3_pp import (
@@ -33,12 +34,19 @@ from vllm_rbln.v1.spec_decode.eagle3_pp import (
 
 SUPPORTED = "MiniMaxM2ForCausalLM"
 SUPPORTED_AXK2 = "AXK2ForCausalLM"
+SUPPORTED_M3 = "MiniMaxM3SparseForCausalLM"
+SUPPORTED_M3_VL = "MiniMaxM3SparseForConditionalGeneration"
 UNSUPPORTED = "LlamaForCausalLM"
 
 # Each allowlisted architecture, with the class whose patched `forward` carries the
 # aux states across the split. Growing the allowlist has to touch this map, and the
 # assertion below then bites if the patch itself is missing.
-PATCHED_FORWARD_OWNERS = {SUPPORTED: MiniMaxM2Model, SUPPORTED_AXK2: AXK2Model}
+PATCHED_FORWARD_OWNERS = {
+    SUPPORTED: MiniMaxM2Model,
+    SUPPORTED_AXK2: AXK2Model,
+    SUPPORTED_M3: RBLNMiniMaxM3Model,
+    SUPPORTED_M3_VL: RBLNMiniMaxM3Model,
+}
 
 
 def _config(arch: str, pp_size: int, method="eagle3", eagle_config=None):
@@ -69,7 +77,9 @@ def test_the_allowlist_and_the_patched_forwards_agree():
         )
 
 
-@pytest.mark.parametrize("arch", [SUPPORTED, SUPPORTED_AXK2])
+@pytest.mark.parametrize(
+    "arch", [SUPPORTED, SUPPORTED_AXK2, SUPPORTED_M3, SUPPORTED_M3_VL]
+)
 def test_a_supported_target_is_accepted(arch):
     _validate_aux_hidden_states_pp_config(_config(arch, 4))
 
