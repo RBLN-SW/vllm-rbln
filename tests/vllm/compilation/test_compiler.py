@@ -240,6 +240,59 @@ class TestEnsureTorchDynamoConfigured:
         assert torch._dynamo.config.inline_inbuilt_nn_modules is True
 
 
+@pytest.mark.parametrize("stack", ["layers", "h", "blocks"])
+def test_mark_decoder_regions_marks_only_the_built_decoder_layers(monkeypatch, stack):
+    # A make_layers stack, under each name upstream gives it, with a PP
+    # placeholder past end_layer, next to a `layers` list that make_layers did
+    # not build: only the stack's two built layers become regions, sharing a body.
+    from vllm.model_executor.models.utils import PPMissingLayer
+
+    class Layer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = torch.nn.Linear(4, 4)
+
+        def forward(self, x):
+            return self.proj(x) + x
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = torch.nn.Module()
+            self.encoder.layers = torch.nn.ModuleList([Layer()])
+            self.start_layer, self.end_layer = 0, 2
+            layers = torch.nn.ModuleList([Layer(), Layer(), PPMissingLayer()])
+            setattr(self, stack, layers)
+
+        def forward(self, x):
+            x = self.encoder.layers[0](x)
+            for layer in getattr(self, stack)[self.start_layer : self.end_layer]:
+                x = layer(x)
+            return x
+
+    monkeypatch.setattr(compiler.envs, "VLLM_RBLN_USE_NESTED_COMPILE_REGION", True)
+    compiler._DYNAMO_CONFIGURED = False
+    compiler._ensure_torch_dynamo_configured()
+    model = Model()
+    compiler.mark_decoder_regions(model)
+
+    graphs = []
+
+    def backend(gm, example_inputs):
+        graphs.append(gm)
+        return gm.forward
+
+    torch._dynamo.reset()
+    torch.compile(model, backend=backend, fullgraph=True)(torch.randn(2, 4))
+    calls = [
+        node
+        for node in graphs[0].graph.nodes
+        if node.target is torch.ops.higher_order.invoke_subgraph
+    ]
+    assert len(calls) == 2
+    assert len({node.args[0].target for node in calls}) == 1
+
+
 class TestBuildProcessGroupDict:
     def test_maps_device_and_cpu_names_for_all_groups(self, monkeypatch):
         # Both the device- and cpu-group names of tp/pp/dp, each mapped to that
