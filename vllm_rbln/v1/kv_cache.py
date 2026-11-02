@@ -25,11 +25,16 @@ from vllm.v1.request import Request
 
 @dataclass(frozen=True)
 class RBLNBlockAuxSpec:
-    """A per-block cache region beside a scheduled KV layer's cache."""
+    """A per-block cache region beside a scheduled KV layer's cache.
+
+    `prefix_cacheable` has the meaning of vLLM's `KVCacheSpec.prefix_cacheable`:
+    False for a scratch region that a prefix resumed at a block boundary never reads.
+    """
 
     owner: str
     block_shape: tuple[int, ...]
     dtype: torch.dtype
+    prefix_cacheable: bool = True
 
     @property
     def page_size_bytes(self) -> int:
