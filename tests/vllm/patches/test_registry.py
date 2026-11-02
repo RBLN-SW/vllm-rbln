@@ -485,14 +485,18 @@ _DECODER_REGION_PROBE = """
 import json, sys
 from vllm.plugins import load_general_plugins
 load_general_plugins()
-from vllm.model_executor.models import deepseek_v2, llama, qwen2, qwen3, qwen3_moe
+from vllm.model_executor.models import (
+    deepseek_v2, gpt_oss, llama, minimax_m2, qwen2, qwen3, qwen3_moe,
+)
 from vllm_rbln.model_executor.models import minimax_m3
 from vllm_rbln.patches.axk2 import model as axk2
 layers = [
+    deepseek_v2.DeepseekV2DecoderLayer,
+    gpt_oss.TransformerBlock,
+    llama.LlamaDecoderLayer,
+    minimax_m2.MiniMaxM2DecoderLayer,
     qwen2.Qwen2DecoderLayer,
     qwen3.Qwen3DecoderLayer,
-    llama.LlamaDecoderLayer,
-    deepseek_v2.DeepseekV2DecoderLayer,
     qwen3_moe.Qwen3MoeDecoderLayer,
     sys.modules[axk2.CANONICAL_NAME].AXK2DecoderLayer,
     minimax_m3.RBLNMiniMaxM3DecoderLayer,
