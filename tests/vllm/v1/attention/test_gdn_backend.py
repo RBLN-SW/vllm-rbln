@@ -27,7 +27,6 @@ from tests.vllm.vllm_config import make_vllm_config
 from vllm_rbln.v1.attention.backends.gdn import (
     RBLNGDNAttentionMetadataBuilder,
     RBLNGDNStateRows,
-    gdn_state_rows,
 )
 
 LAYER = "model.layers.1.linear_attn"
@@ -117,11 +116,12 @@ def _assert_conv_tables(md, rows, seq_idx, query_len, has_initial_state):
 class TestBuilder:
     def test_state_shapes_follow_the_kernels(self, builder):
         state = builder.states[LAYER]
-        # 4 live rows + 4 scratch rows; 4 fp32 heads are 128 R1 rows each
+        # 4 live rows + 4 scratch rows; 2 value heads under each of 2 key
+        # heads, each state blocked as [2, 128, 64] dlfloat16 bits
         assert state.conv_q.shape == state.conv_k.shape == (8, 3, 2, 128)
         assert state.conv_v.shape == (8, 3, 4, 128)
-        assert state.ssm_state.shape == (8, gdn_state_rows(4, torch.float32), 512)
-        assert state.ssm_state.dtype == torch.uint8
+        assert state.ssm_state.shape == (8, 2, 2, 2, 128, 64)
+        assert state.ssm_state.dtype == torch.int16
         assert state.conv_width == 3
 
     def test_first_prefill_chunk(self, builder):

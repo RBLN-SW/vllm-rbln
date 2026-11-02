@@ -21,7 +21,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn.functional as F
-from rebel.ops.torch_custom_ops.kda import state_view
+from rebel.ops.torch_custom_ops.gdn import unblock_state
+from rebel.ops.torch_custom_ops.kda import dlf16_to_float
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5RMSNormGated,
     torch_chunk_gated_delta_rule,
@@ -133,10 +134,10 @@ def _run(layer, vllm_config, builder, hidden, common, positions, is_prefill, bat
 
 
 def _ssm_state(builder) -> torch.Tensor:
-    # R1's bytes of the block's row -> HF [1, heads_v, dk, dv]
+    # The block's row, dlfloat16 bits in the blocked layout -> HF [1, heads_v, dk, dv]
     row = builder.rows.row_of[BLOCK]
-    state = builder.states[PREFIX].ssm_state
-    return state_view(state, HEADS_V, torch.float32)[row : row + 1]
+    bits = builder.states[PREFIX].ssm_state[row : row + 1]
+    return unblock_state(dlf16_to_float(bits)).reshape(1, HEADS_V, HEAD_DIM, HEAD_DIM)
 
 
 def test_padded_prefill_then_decode_tracks_hf(vllm_config):

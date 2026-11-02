@@ -17,18 +17,19 @@
 A layer's state is a `MambaSpec` KV cache group of one block a request
 (block_size = max_model_len): the scheduler holds a block for every live
 request and the group's block table names it. The state itself lives on this
-backend's rows, not in the KV cache pool: the KDA core kernels
-(`rbln_custom_ops::kda_prefill` / `kda_decode`) take a whole state tensor and
-the compiler lowers a dtype view to a plain view, so a state can neither be
-carved out of a page nor share an attention layer's page. `RBLNGDNStateRows`
-maps each live block to a row; a block seen for the first time starts from
-zero through `has_initial_state`.
+backend's rows, not in the KV cache pool: the core kernels
+(`rbln_custom_ops::chunk_gated_delta_rule` / `recurrent_gated_delta_rule` on
+their RBLN-CR13 bodies) take a whole state tensor and the compiler lowers a
+dtype view to a plain view, so a state can neither be carved out of a page nor
+share an attention layer's page. `RBLNGDNStateRows` maps each live block to a
+row; a block seen for the first time starts from zero through
+`has_initial_state`.
 
-KDA is GatedDeltaNet with a per-channel decay: the layer broadcasts its
-per-head decay over the key channels and repeats q / k over each key head's
-value heads. The short conv (`rbln_custom_ops::causal_conv1d_ring_tabled`)
-keeps one ring each for q, k and v on the same rows; its index tables are built
-here, once a step for every layer.
+The cores take q / k per key head, L2-normalized in the kernel, and v, g and
+beta per value head grouped under its key head. The short conv
+(`rbln_custom_ops::causal_conv1d_ring_tabled`) keeps one ring each for q, k and
+v on the same rows; its index tables are built here, once a step for every
+layer.
 """
 
 from collections.abc import Iterable, Sequence
@@ -52,17 +53,10 @@ from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
 
-# The core kernels take 128-wide heads; prefill runs in 128-token chunks (the
-# KDA kernel's own chunk is 64). A head's state is kept as R1's bytes: 64 rows
-# of 512 bytes a [128, 128] bf16 state.
+# The core kernels take 128-wide heads; the CR13 prefill kernel runs 128-token
+# chunks only.
 GDN_HEAD_DIM = 128
 GDN_PREFILL_CHUNK = 128
-R1_ROW_BYTES = 512
-
-
-def gdn_state_rows(num_v_heads: int, dtype: torch.dtype) -> int:
-    """The R1 rows a block's `num_v_heads` [128, 128] states take."""
-    return num_v_heads * GDN_HEAD_DIM * GDN_HEAD_DIM * dtype.itemsize // R1_ROW_BYTES
 
 
 @dataclass
@@ -72,7 +66,9 @@ class GDNLayerState:
     conv_q: torch.Tensor
     conv_k: torch.Tensor
     conv_v: torch.Tensor
-    # [rows, 64 * heads_v, 512] uint8: R1's bytes of the [heads_v, 128, 128] states
+    # [rows, heads_k, heads_v / heads_k, 2, 128, 64] int16: each [128, 128]
+    # state's dlfloat16 bits in the cores' blocked layout. The dtype selects
+    # the CR13 kernels, which address the rows per batch row.
     ssm_state: torch.Tensor
     conv_width: int
 
@@ -203,9 +199,12 @@ class RBLNGDNAttentionMetadataBuilder(
             conv_v=ring(heads_v),
             ssm_state=torch.zeros(
                 rows,
-                gdn_state_rows(heads_v, self.dtype),
-                R1_ROW_BYTES,
-                dtype=torch.uint8,
+                heads_k,
+                heads_v // heads_k,
+                GDN_HEAD_DIM // 64,
+                GDN_HEAD_DIM,
+                64,
+                dtype=torch.int16,
                 device=self.device,
             ),
             conv_width=width,

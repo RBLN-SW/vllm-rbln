@@ -15,7 +15,6 @@
 import torch
 import torch.nn.functional as F
 from rebel.ops.torch_custom_ops.causal_conv1d_ring import pack_weight
-from vllm import ir
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
@@ -26,6 +25,7 @@ from vllm_rbln.patches import register_patch
 from vllm_rbln.patches.registry import add_registration
 from vllm_rbln.v1.attention.backends.gdn import (
     GDN_HEAD_DIM,
+    GDN_PREFILL_CHUNK,
     RBLNGDNAttentionMetadata,
 )
 
@@ -47,14 +47,6 @@ def register_qwen3_5() -> None:
         "Qwen3_5ForConditionalGeneration",
         "vllm_rbln.model_executor.models.qwen3_5:RBLNQwen3_5ForConditionalGeneration",
     )
-
-
-def _l2norm(x: torch.Tensor) -> torch.Tensor:
-    """x * rsqrt(sum(x^2) + 1e-6) as vLLM's rms_norm op (eps / D) scaled by
-    D ** -0.5: the compiler lowers that op as one norm that stays cut on the
-    heads, where a [..., 1] sum is packed across tokens and heads."""
-    dim = x.shape[-1]
-    return ir.ops.rms_norm(x, None, 1e-6 / dim) * dim**-0.5
 
 
 @register_patch(
@@ -117,53 +109,57 @@ def patched_gdn_forward(
             state.conv_width,
         )
 
-    # The KDA core takes one q / k per value head, L2-normalized by the caller.
+    # The cores take q / k per key head (they L2-normalize them) and v, g and
+    # beta per value head grouped under its key head: value head h is key head
+    # h // ratio's (h % ratio)-th, as HF's repeat_interleave pairs them.
     query, key = (
-        _l2norm(conv(x, w, ring, heads_k).view(batch * seq_len, heads_k, head_dim))
-        .view(batch, seq_len, heads_k, 1, head_dim)
-        .expand(batch, seq_len, heads_k, ratio, head_dim)
-        .reshape(batch, seq_len, heads_v, head_dim)
+        conv(x, w, ring, heads_k)
+        .view(batch, seq_len, heads_k, head_dim)
         .transpose(1, 2)
+        .contiguous()
         for x, w, ring in (
             (q, conv_weight[:key_dim], state.conv_q),
             (k, conv_weight[key_dim : 2 * key_dim], state.conv_k),
         )
     )
     value = conv(v, conv_weight[2 * key_dim :], state.conv_v, heads_v)
-    value = value.view(batch, seq_len, heads_v, head_dim).transpose(1, 2)
+    value = value.view(batch, seq_len, heads_k, ratio, head_dim)
+    value = value.permute(0, 2, 3, 1, 4).contiguous()
 
-    beta = torch.sigmoid(b).reshape(batch, seq_len, heads_v).transpose(1, 2)
+    beta = torch.sigmoid(b).reshape(batch, seq_len, heads_k, ratio)
     g = -torch.exp(self.A_log.float()) * F.softplus(a.float() + self.dt_bias.float())
-    g = g.reshape(batch, seq_len, heads_v).transpose(1, 2)
+    g = g.reshape(batch, seq_len, heads_k, ratio)
+    beta, g = (x.permute(0, 2, 3, 1) for x in (beta, g))
     if metadata.is_prefill:
         # Padded tokens must neither decay the state nor write to it.
         assert metadata.valid_mask is not None
         g = g * metadata.valid_mask
         beta = beta * metadata.valid_mask.to(beta.dtype)
-    # A per-channel decay, as the KDA kernel reads it: the same over the head.
-    g = g.unsqueeze(-1).expand(batch, heads_v, seq_len, head_dim).contiguous()
+    beta, g = beta.contiguous(), g.contiguous()
     if metadata.is_prefill:
-        core = torch.ops.rbln_custom_ops.kda_prefill(
-            query.contiguous(),
-            key.contiguous(),
-            value.contiguous(),
+        core = torch.ops.rbln_custom_ops.chunk_gated_delta_rule(
+            query,
+            key,
+            value,
             g,
-            beta.contiguous(),
+            beta,
             state.ssm_state,
             metadata.core_state_index,
             metadata.core_has_initial_state,
+            GDN_PREFILL_CHUNK,
         )
     else:
-        core = torch.ops.rbln_custom_ops.kda_decode(
-            query.contiguous(),
-            key.contiguous(),
-            value.contiguous(),
+        core = torch.ops.rbln_custom_ops.recurrent_gated_delta_rule(
+            query,
+            key,
+            value,
             g,
-            beta.contiguous(),
+            beta,
             state.ssm_state,
             metadata.core_state_index,
         )
-    core = core.transpose(1, 2).reshape(batch, seq_len, heads_v, head_dim)
+    # [batch, heads_k, ratio, seq, 128] -> [batch, seq, heads_v, 128]
+    core = core.permute(0, 3, 1, 2, 4).reshape(batch, seq_len, heads_v, head_dim)
     z = z.reshape(batch, seq_len, heads_v, head_dim)
     gated = self.norm(core, z)
     output, _ = self.out_proj(gated.reshape(batch, seq_len, heads_v * head_dim))
