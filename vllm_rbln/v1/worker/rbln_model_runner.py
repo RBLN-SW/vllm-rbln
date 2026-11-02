@@ -1484,11 +1484,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     "Speculative decoding is not supported with multimodal inputs of "
                     "an mm prefix LM on RBLN yet."
                 )
-            if self.parallel_config.data_parallel_size > 1:
-                raise ValueError(
-                    "Data parallelism is not supported with multimodal inputs of an "
-                    "mm prefix LM on RBLN yet."
-                )
             self.mm_prefix_query_lens = query_lens
         return True
 
