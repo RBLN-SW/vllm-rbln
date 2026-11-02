@@ -18,6 +18,7 @@ compiled and its image embeddings merged inside the compiled graph."""
 import math
 from collections.abc import Callable, Mapping
 from functools import cached_property
+from itertools import islice
 
 import torch
 import torch.nn.functional as F
@@ -184,6 +185,21 @@ class RBLNGemma4ForConditionalGeneration(
 ):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        text_model = self.language_model.model
+        for layer in islice(
+            text_model.layers, text_model.start_layer, text_model.end_layer
+        ):
+            if not layer.enable_moe_block:
+                continue
+            if vllm_config.parallel_config.data_parallel_size > 1:
+                raise ValueError(
+                    "Gemma4 MoE does not support data parallel on RBLN: the MoE "
+                    "runner gathers expert inputs across ranks, but Gemma4 routes "
+                    "on the residual, which is not gathered."
+                )
+            # RBLNMoERunner routes inline and never calls the upstream custom
+            # routing function, which is where Gemma4 applies this scale.
+            layer.experts.router.per_expert_scale = layer.router.per_expert_scale
         self.mm_soft_token_cap = mm_soft_token_cap(
             MULTIMODAL_REGISTRY.create_processor(vllm_config.model_config).info
         )
