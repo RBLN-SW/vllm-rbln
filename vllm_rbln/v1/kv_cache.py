@@ -29,8 +29,11 @@ from vllm.v1.request import Request
 class RBLNBlockAuxSpec:
     """A per-block cache region beside a scheduled KV layer's cache.
 
-    `prefix_cacheable` has the meaning of vLLM's `KVCacheSpec.prefix_cacheable`:
-    False for a scratch region that a prefix resumed at a block boundary never reads.
+    `prefix_cacheable=False` means this region's previous contents do not affect
+    the result when a prefix resumes at a block boundary, so it need not be saved
+    or restored. The buffer must still be allocated and readable: kernels may read
+    it physically (the tail ring with two or more MTP drafts, masked draft rows).
+    It is per aux region, not vLLM's group-level `KVCacheSpec.prefix_cacheable`.
     """
 
     owner: str
