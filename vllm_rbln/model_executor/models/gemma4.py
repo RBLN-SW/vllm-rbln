@@ -184,6 +184,8 @@ class RBLNGemma4ForConditionalGeneration(
     Gemma4ForConditionalGeneration, SupportsRBLNMultiModal, SupportsRBLNMmEncoderWarmup
 ):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        if vllm_config.parallel_config.data_parallel_size > 1:
+            raise ValueError("Gemma4 does not support data parallel on RBLN.")
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         text_model = self.language_model.model
         for layer in islice(
@@ -191,12 +193,6 @@ class RBLNGemma4ForConditionalGeneration(
         ):
             if not layer.enable_moe_block:
                 continue
-            if vllm_config.parallel_config.data_parallel_size > 1:
-                raise ValueError(
-                    "Gemma4 MoE does not support data parallel on RBLN: the MoE "
-                    "runner gathers expert inputs across ranks, but Gemma4 routes "
-                    "on the residual, which is not gathered."
-                )
             # RBLNMoERunner routes inline and never calls the upstream custom
             # routing function, which is where Gemma4 applies this scale.
             layer.experts.router.per_expert_scale = layer.router.per_expert_scale
