@@ -523,27 +523,30 @@ class TestRejectedConfigs:
                 glm5_next(enable_prefix_caching=True, prefix_match_unit=block_size // 2)
             )
 
-        reconfigure(glm5_next(tp=4, block_size=1024))
-        for tp, block_size in ((4, 2048), (1, 8192), (1, 192), (1, 160)):
+        for tp, block_size in ((4, 1024), (4, 2048), (4, 4096), (1, 8192)):
+            reconfigure(glm5_next(tp=tp, block_size=block_size))
+        for tp, block_size in ((4, 1536), (1, 6144), (1, 192), (1, 160)):
             with pytest.raises(ValueError, match="whole KDA head states"):
                 reconfigure(glm5_next(tp=tp, block_size=block_size))
 
+        # At 12288 an fp32 block holds 96 states (neither a divisor nor a multiple
+        # of 64) and a 16-bit one 192: the check must see the dtype as forced.
         def bf16_forced_to_fp32(config):
-            glm5_next(block_size=8192)(config)
+            glm5_next(block_size=12288)(config)
             config.additional_config = replace(
                 config.additional_config, enforce_model_fp32=True
             )
 
-        reconfigure(bf16_forced_to_fp32)
+        with pytest.raises(ValueError, match="whole KDA head states"):
+            reconfigure(bf16_forced_to_fp32)
         if platform.USE_DEVICE_TENSOR:
 
             def fp32_forced_to_fp16(config):
-                glm5_next(block_size=8192)(config)
+                glm5_next(block_size=12288)(config)
                 config.model_config.dtype = torch.float32
                 config.model_config.enforce_eager = True
 
-            with pytest.raises(ValueError, match="whole KDA head states"):
-                reconfigure(fp32_forced_to_fp16)
+            reconfigure(fp32_forced_to_fp16)
 
     def test_glm5_next_prefix_caching_with_mtp_needs_retention_0(self, reconfigure):
         # A KDA verify step leaves no state at the end of a block it crossed, so

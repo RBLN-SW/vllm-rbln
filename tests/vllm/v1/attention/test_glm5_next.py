@@ -21,6 +21,7 @@ from tests.vllm.vllm_config import make_vllm_config
 from vllm_rbln.v1.attention.backends.glm5_next import (
     RBLNGlm5NextMetadataBuilder,
     RBLNGlm5NextStateMetadata,
+    kda_state_layout,
 )
 
 # The KDA state group's load / store blocks: the column of each request's block
@@ -132,3 +133,19 @@ def test_verify_reads_where_the_previous_verify_wrote(
         state_load_pos=torch.tensor([previous_last], dtype=torch.int32),
     )
     assert blocks == ([expected[0]], [expected[1]])
+
+
+@pytest.mark.parametrize(
+    "block_size, num_heads, layout",
+    [
+        (4096, 64, (64, 1)),  # TP 1: one group fills the block
+        (2048, 64, (32, 1)),  # two groups, a block each
+        (1024, 16, (16, 1)),  # TP 4
+        (4096, 16, (16, 4)),  # TP 4 at the prefill's block: one of 4 slots
+        (2048, 16, (16, 2)),
+        (1536, 16, None),  # 24 states: neither a divisor nor a multiple of 16
+        (32, 64, None),  # less than a state
+    ],
+)
+def test_kda_state_layout(block_size, num_heads, layout):
+    assert kda_state_layout(block_size, 512, num_heads, 128 * 128 * 2) == layout

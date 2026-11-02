@@ -16,6 +16,8 @@ from dataclasses import dataclass, fields
 from typing import ClassVar
 
 import torch
+from vllm.config import VllmConfig
+from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import MambaSpec
@@ -30,10 +32,61 @@ from .flash_attention import (
 )
 
 
+def kda_state_layout(
+    block_size: int, kv_lora_rank: int, num_heads: int, state_bytes: int
+) -> tuple[int, int] | None:
+    """(heads a state group holds, groups a block holds) for a rank's `num_heads`
+    KDA states in an fp8 MLA latent block, or None when whole states do not tile it.
+
+    A block too big for the rank's heads holds several groups' worth and the
+    rank uses one of them (`kda_state_slot`), so the block size can stay the one
+    a peer of another TP degree runs.
+    """
+    group_heads, rem = divmod(block_size * kv_lora_rank, state_bytes)
+    if rem or not group_heads:
+        return None
+    if num_heads % group_heads == 0:
+        return group_heads, 1
+    if group_heads % num_heads == 0:
+        return num_heads, group_heads // num_heads
+    return None
+
+
+def kda_state_slot(vllm_config: VllmConfig) -> tuple[int, int]:
+    """(state slots a block holds, the one this rank uses)."""
+    text_config = vllm_config.model_config.hf_text_config
+    if text_config.model_type != "glm5_next_text":
+        return 1, 0
+    layout = kda_state_layout(
+        vllm_config.cache_config.block_size,
+        text_config.kv_lora_rank,
+        text_config.linear_num_heads
+        // vllm_config.parallel_config.tensor_parallel_size,
+        text_config.linear_head_dim**2 * vllm_config.model_config.dtype.itemsize,
+    )
+    assert layout is not None
+    slots = layout[1]
+    return slots, get_tensor_model_parallel_rank() % slots
+
+
+def kda_state_band(vllm_config: VllmConfig) -> tuple[int, int] | None:
+    """(model-wide KDA heads, bytes one head's state takes), or None off GLM-5.3."""
+    text_config = vllm_config.model_config.hf_text_config
+    if text_config.model_type != "glm5_next_text":
+        return None
+    return (
+        text_config.linear_num_heads,
+        text_config.linear_head_dim**2 * vllm_config.model_config.dtype.itemsize,
+    )
+
+
 @dataclass
 class RBLNGlm5NextStateMetadata(RBLNFlashAttentionMetadata):
     load_blocks: torch.Tensor | None = None
     store_blocks: torch.Tensor | None = None
+    # load / store_blocks in units of a block's state slots, for the KDA kernels.
+    load_slots: torch.Tensor | None = None
+    store_slots: torch.Tensor | None = None
 
 
 class RBLNGlm5NextMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
@@ -92,10 +145,19 @@ class RBLNGlm5NextMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
         if not is_prefill:
             load_blocks = rbln_utils.pad(load_blocks, 0, batch_pad)
             store_blocks = rbln_utils.pad(store_blocks, 0, batch_pad)
+        slots, slot = kda_state_slot(self.vllm_config)
+        load_slots, store_slots = (
+            self._stage(blocks * slots + slot, f"{name}_slots") if slots > 1 else None
+            for blocks, name in ((load_blocks, "load"), (store_blocks, "store"))
+        )
+        load_blocks = self._stage(load_blocks, "load_blocks")
+        store_blocks = self._stage(store_blocks, "store_blocks")
         return RBLNGlm5NextStateMetadata(
             **{f.name: getattr(metadata, f.name) for f in fields(metadata)},
-            load_blocks=self._stage(load_blocks, "load_blocks"),
-            store_blocks=self._stage(store_blocks, "store_blocks"),
+            load_blocks=load_blocks,
+            store_blocks=store_blocks,
+            load_slots=load_blocks if load_slots is None else load_slots,
+            store_slots=store_blocks if store_slots is None else store_slots,
         )
 
 

@@ -354,14 +354,18 @@ def _override(vllm_config: "VllmConfig") -> None:
         block_size = vllm_config.cache_config.block_size
         num_heads = text_config.linear_num_heads // tp_size
         state_bytes = text_config.linear_head_dim**2 * model_config.dtype.itemsize
-        group_heads, rem = divmod(block_size * text_config.kv_lora_rank, state_bytes)
-        if rem or not group_heads or num_heads % group_heads:
+        from vllm_rbln.v1.attention.backends.glm5_next import kda_state_layout
+
+        layout = kda_state_layout(
+            block_size, text_config.kv_lora_rank, num_heads, state_bytes
+        )
+        if layout is None:
             head_block_size = state_bytes // text_config.kv_lora_rank
             raise ValueError(
                 "GLM-5.3 on RBLN fills an fp8 MLA latent block with whole KDA head "
                 f"states, so at TP {tp_size} --block-size must be {head_block_size} "
-                f"times a divisor of the {num_heads} heads a rank holds (at most "
-                f"{head_block_size * num_heads}); got {block_size}."
+                f"times a divisor or a multiple of the {num_heads} heads a rank "
+                f"holds; got {block_size}."
             )
 
     if vllm_config.compilation_config.mode != CompilationMode.NONE:

@@ -92,6 +92,7 @@ from vllm_rbln.v1.attention.backends.glm5_next import (
     RBLNGlm5NextCacheBackend,
     RBLNGlm5NextIndexerBackend,
     RBLNGlm5NextStateMetadata,
+    kda_state_layout,
 )
 from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
 from vllm_rbln.v1.worker.utils import (
@@ -163,6 +164,16 @@ class RBLNGlm5NextStateCache(_RBLNGlm5NextCache):
             metadata,
         )
 
+    def slots(self, rows: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The state cache as [blocks * slots, rows, row] and the slots a step loads
+        and stores, for the KDA kernels."""
+        metadata = get_forward_context().attn_metadata[self.prefix]
+        assert metadata.load_slots is not None and metadata.store_slots is not None
+        state = _resolve_kv_cache(metadata, self.layer_index)
+        blocks, block_rows, row = state.shape
+        state = state.view(blocks * (block_rows // rows), rows, row)
+        return state, metadata.load_slots.view(-1), metadata.store_slots.view(-1)
+
 
 class RBLNGlm5NextPagedCache(_RBLNGlm5NextCache):
     def __init__(
@@ -208,17 +219,21 @@ class RBLNGlm5NextAuxCache(_RBLNGlm5NextCache):
         owner: str,
         block_shape: tuple[int, ...],
         dtype: torch.dtype,
+        head_axis: int | None = None,
     ) -> None:
         super().__init__(prefix)
         self.owner = owner
         self.block_shape = block_shape
         self.dtype = dtype
+        self.head_axis = head_axis
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> None:
         return None
 
     def get_aux_cache_spec(self, vllm_config: VllmConfig) -> RBLNBlockAuxSpec:
-        return RBLNBlockAuxSpec(self.owner, self.block_shape, self.dtype)
+        return RBLNBlockAuxSpec(
+            self.owner, self.block_shape, self.dtype, self.head_axis
+        )
 
     def get_attn_backend(self) -> type[RBLNGlm5NextCacheBackend]:
         return RBLNGlm5NextCacheBackend
@@ -387,13 +402,16 @@ class RBLNGlm5NextKDA(nn.Module):
 
         vllm_config = get_current_vllm_config()
         dtype = vllm_config.model_config.dtype
-        # g head groups, each group's state filling one fp8 MLA latent block.
+        # g head groups, each group's state filling one fp8 MLA latent block, or
+        # (a block bigger than the rank's heads) one slot of it.
         block_size = vllm_config.cache_config.block_size
-        latent_bytes = block_size * config.kv_lora_rank
         state_bytes = self.head_dim * self.head_dim * dtype.itemsize
-        assert latent_bytes % state_bytes == 0, (block_size, state_bytes)
-        self.group_heads = latent_bytes // state_bytes
-        assert self.num_heads % self.group_heads == 0, (block_size, self.num_heads)
+        layout = kda_state_layout(
+            block_size, config.kv_lora_rank, self.num_heads, state_bytes
+        )
+        assert layout is not None, (block_size, self.num_heads)
+        self.group_heads = layout[0]
+        self.state_rows = self.group_heads * state_bytes // config.kv_lora_rank
         self.num_groups = self.num_heads // self.group_heads
         self.register_buffer(
             "conv_weight",
@@ -417,6 +435,7 @@ class RBLNGlm5NextKDA(nn.Module):
                 CONV_LANES,
             ),
             dtype,
+            head_axis=2,
         )
         self.drafts = None
         if self.num_drafts:
@@ -426,6 +445,7 @@ class RBLNGlm5NextKDA(nn.Module):
                     state.prefix,
                     (self.group_heads, self.num_drafts, 4, self.head_dim),
                     dtype,
+                    head_axis=0,
                 )
                 for j, state in enumerate(self.states)
             )
@@ -520,9 +540,12 @@ class RBLNGlm5NextKDA(nn.Module):
 
         gate = F.linear(hidden_states, self.g_weight).view(shape)
         outs = []
-        for j, ((state, load, store, _), (qj, kj, vj)) in enumerate(
-            zip(group_states, group_qkv)
-        ):
+        kda_states = [state.slots(self.state_rows) for state in self.states]
+        for j, (
+            (state, load, store),
+            (_, load_block, store_block, _),
+            (qj, kj, vj),
+        ) in enumerate(zip(kda_states, group_states, group_qkv)):
             channels = slice(j * group_channels, (j + 1) * group_channels)
             heads = slice(j * self.group_heads, (j + 1) * self.group_heads)
             gj, bj = g[:, heads], beta[:, heads]
@@ -550,9 +573,9 @@ class RBLNGlm5NextKDA(nn.Module):
                     load,
                     metadata.num_accepted.view(-1),
                     None,
-                    load,
+                    load_block,
                     store,
-                    store,
+                    store_block,
                 )
             o = o.transpose(1, 2)  # [B, T, h, D]
             o = self.o_norm(o) * torch.sigmoid(gate[:, :, heads].float()).to(o.dtype)

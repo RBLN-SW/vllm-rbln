@@ -30,6 +30,9 @@ class RBLNBlockAuxSpec:
     owner: str
     block_shape: tuple[int, ...]
     dtype: torch.dtype
+    # The axis of block_shape a TP rank's share of its owner's heads cuts, each
+    # index before it one run of them; None where every rank holds the same bytes.
+    head_axis: int | None = None
 
     @property
     def page_size_bytes(self) -> int:
