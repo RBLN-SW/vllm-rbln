@@ -80,8 +80,8 @@ def _warmup_graph_set_factors(vllm_config) -> str:
     """Hash of the graph-shaping config that compute_hash() leaves out.
 
     Decode buckets, KV cache input, decode query length, which drafter graphs
-    exist, the image sizes (mm_processor_kwargs). Without them two runs share a
-    bundle that only partly hits.
+    exist, Gemma4's image budget. Without them two runs share a bundle that
+    only partly hits.
     """
     from vllm.config.utils import hash_factors, normalize_value
 
@@ -91,6 +91,7 @@ def _warmup_graph_set_factors(vllm_config) -> str:
     # Not draft_parallel_config: it carries the same per-launch ports.
     draft = getattr(spec, "draft_model_config", None)
     mm = getattr(getattr(vllm_config, "model_config", None), "multimodal_config", None)
+    mm_kwargs = getattr(mm, "mm_processor_kwargs", None) or {}
     factors: dict[str, object] = {
         "max_num_seqs": normalize_value(getattr(scheduler, "max_num_seqs", None)),
         "num_gpu_blocks_override": normalize_value(
@@ -108,10 +109,12 @@ def _warmup_graph_set_factors(vllm_config) -> str:
         "draft_tensor_parallel_size": normalize_value(
             getattr(spec, "draft_tensor_parallel_size", None)
         ),
-        "mm_processor_kwargs": normalize_value(
-            getattr(mm, "mm_processor_kwargs", None)
-        ),
     }
+    # Gemma4 compiles its vision encoder and image prefill to this budget. Only
+    # this key, and only when given: other kwargs do not shape a graph, and an
+    # absent factor keeps every other model's existing bundle key.
+    if "max_soft_tokens" in mm_kwargs:
+        factors["max_soft_tokens"] = normalize_value(mm_kwargs["max_soft_tokens"])
     return hash_factors(factors)
 
 
