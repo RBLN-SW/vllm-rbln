@@ -27,9 +27,9 @@ row; a block seen for the first time starts from zero through
 
 The cores take q / k per key head, L2-normalized in the kernel, and v, g and
 beta per value head grouped under its key head. The short conv
-(`rbln_custom_ops::causal_conv1d_ring_tabled`) keeps one ring each for q, k and
-v on the same rows; its index tables are built here, once a step for every
-layer.
+(`rbln_custom_ops::causal_conv1d_ring_tabled`) runs once over q | k | v in that
+same key-head order (`grouped_qkv_rows`) and keeps one ring on the same rows;
+its index tables are built here, once a step for every layer.
 """
 
 from collections.abc import Iterable, Sequence
@@ -59,13 +59,23 @@ GDN_HEAD_DIM = 128
 GDN_PREFILL_CHUNK = 128
 
 
+def grouped_qkv_rows(heads_k: int, ratio: int, head_dim: int) -> torch.Tensor:
+    """The rows of [q heads | k heads | v heads] regrouped by key head: q_h, k_h,
+    then key head h's `ratio` value heads, for each h. The short conv runs one
+    call over this order, so RSD's cut of its channels is the cores' cut of
+    their heads and no chiplet reads another's output."""
+    q = torch.arange(heads_k).view(heads_k, 1)
+    k = q + heads_k
+    v = (torch.arange(heads_k * ratio) + 2 * heads_k).view(heads_k, ratio)
+    heads = torch.cat([q, k, v], dim=1).reshape(-1, 1)
+    return (heads * head_dim + torch.arange(head_dim)).reshape(-1)
+
+
 @dataclass
 class GDNLayerState:
-    # [rows, width, heads, 128] each: the conv rings of q, k and v, row
-    # p % width holding position p
-    conv_q: torch.Tensor
-    conv_k: torch.Tensor
-    conv_v: torch.Tensor
+    # [rows, width, heads_k * (2 + ratio), 128]: the conv ring of q | k | v in
+    # grouped_qkv_rows order, row p % width holding position p
+    conv_qkv: torch.Tensor
     # [rows, heads_k, heads_v / heads_k, 2, 128, 64] int16: each [128, 128]
     # state's dlfloat16 bits in the cores' blocked layout. The dtype selects
     # the CR13 kernels, which address the rows per batch row.
@@ -187,16 +197,15 @@ class RBLNGDNAttentionMetadataBuilder(
                 f"{layer.head_k_dim} / {layer.head_v_dim}"
             )
         width = layer.conv_kernel_size - 1
-
-        def ring(heads: int) -> torch.Tensor:
-            return torch.zeros(
-                rows, width, heads, GDN_HEAD_DIM, dtype=self.dtype, device=self.device
-            )
-
         return GDNLayerState(
-            conv_q=ring(heads_k),
-            conv_k=ring(heads_k),
-            conv_v=ring(heads_v),
+            conv_qkv=torch.zeros(
+                rows,
+                width,
+                heads_k * (2 + heads_v // heads_k),
+                GDN_HEAD_DIM,
+                dtype=self.dtype,
+                device=self.device,
+            ),
             ssm_state=torch.zeros(
                 rows,
                 heads_k,

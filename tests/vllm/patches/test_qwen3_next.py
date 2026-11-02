@@ -32,7 +32,10 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
 from tests.vllm.vllm_config import make_vllm_config
 from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.patches.qwen3_next import patched_gdn_forward
-from vllm_rbln.v1.attention.backends.gdn import RBLNGDNAttentionMetadataBuilder
+from vllm_rbln.v1.attention.backends.gdn import (
+    RBLNGDNAttentionMetadataBuilder,
+    grouped_qkv_rows,
+)
 
 HIDDEN, HEADS_K, HEADS_V, HEAD_DIM, KERNEL = 64, 2, 4, 128, 4
 KEY_DIM, VALUE_DIM = HEADS_K * HEAD_DIM, HEADS_V * HEAD_DIM
@@ -72,6 +75,19 @@ def _layer():
     layer.norm = Qwen3_5RMSNormGated(HEAD_DIM, eps=1e-6)
     layer.out_proj = _Proj(VALUE_DIM, HIDDEN, bias=False)
     return layer
+
+
+def _grouped(layer):
+    """The layer as RBLNQwen3_5ForConditionalGeneration.load_weights leaves it:
+    the q | k | v rows of in_proj_qkvz and conv1d regrouped by key head."""
+    rows = grouped_qkv_rows(HEADS_K, HEADS_V // HEADS_K, HEAD_DIM)
+    grouped = SimpleNamespace(**vars(layer))
+    grouped.in_proj_qkvz = _Proj(HIDDEN, CONV_DIM + VALUE_DIM, bias=False)
+    grouped.in_proj_qkvz.weight.data = layer.in_proj_qkvz.weight.data.clone()
+    grouped.in_proj_qkvz.weight.data[: rows.numel()] = layer.in_proj_qkvz.weight[rows]
+    grouped.conv1d = SimpleNamespace(weight=layer.conv1d.weight.clone())
+    grouped.conv1d.weight[: rows.numel()] = layer.conv1d.weight[rows]
+    return grouped
 
 
 def _reference(layer, hidden, conv_history, recurrent_state):
@@ -142,7 +158,8 @@ def _ssm_state(builder) -> torch.Tensor:
 
 def test_padded_prefill_then_decode_tracks_hf(vllm_config):
     layer = _layer()
-    vllm_config.compilation_config.static_forward_context[PREFIX] = layer
+    device_layer = _grouped(layer)
+    vllm_config.compilation_config.static_forward_context[PREFIX] = device_layer
     builder = RBLNGDNAttentionMetadataBuilder(
         None, [PREFIX], vllm_config, torch.device("cpu")
     )
@@ -153,7 +170,7 @@ def test_padded_prefill_then_decode_tracks_hf(vllm_config):
     hidden = torch.zeros(1, CHUNK, HIDDEN)
     hidden[:, :70] = tokens[:, :70]
     out = _run(
-        layer,
+        device_layer,
         vllm_config,
         builder,
         hidden,
@@ -170,7 +187,7 @@ def test_padded_prefill_then_decode_tracks_hf(vllm_config):
     hidden = torch.zeros(1, CHUNK, HIDDEN)
     hidden[:, :58] = tokens[:, 70:128]
     out = _run(
-        layer,
+        device_layer,
         vllm_config,
         builder,
         hidden,
@@ -187,7 +204,7 @@ def test_padded_prefill_then_decode_tracks_hf(vllm_config):
     hidden = torch.zeros(2, 1, HIDDEN)
     hidden[0] = tokens[:, 128]
     out = _run(
-        layer,
+        device_layer,
         vllm_config,
         builder,
         hidden,

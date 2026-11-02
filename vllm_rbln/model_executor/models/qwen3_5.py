@@ -21,7 +21,7 @@ reach the language model through the runner's staged `mm_embeds` / `mm_mask`
 """
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 
 import torch
 import torch.nn.functional as F
@@ -33,6 +33,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 
 from vllm_rbln.model_executor.models.interfaces import SupportsRBLNMultiModal
+from vllm_rbln.v1.attention.backends.gdn import grouped_qkv_rows
 
 # The largest image, in patches, the compiled vision encoder takes. Attention
 # runs over the whole bucket at once, so the processor's own limit (16M pixels
@@ -117,6 +118,23 @@ class RBLNQwen3_5ForConditionalGeneration(
                     f"kwargs '{{\"max_pixels\": {max_pixels}}}' or less, or serve "
                     "text-only with --language-model-only."
                 )
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        loaded = super().load_weights(weights)
+        # The checkpoint's [q | k | v] rows in key-head groups, the order the
+        # GatedDeltaNet conv runs them in (patches/qwen3_next).
+        for layer in self.language_model.model.layers:
+            attn = getattr(layer, "linear_attn", None)
+            if attn is None:
+                continue
+            rows = grouped_qkv_rows(
+                attn.num_k_heads // attn.tp_size,
+                attn.num_v_heads // attn.num_k_heads,
+                attn.head_k_dim,
+            )
+            for weight in (attn.in_proj_qkvz.weight, attn.conv1d.weight):
+                weight.data[: rows.numel()] = weight.data[rows]
+        return loaded
 
     def compile_mm_encoder(self, compile_fn: Callable[[nn.Module], nn.Module]) -> None:
         if not self.has_vision:

@@ -27,9 +27,18 @@ from tests.vllm.vllm_config import make_vllm_config
 from vllm_rbln.v1.attention.backends.gdn import (
     RBLNGDNAttentionMetadataBuilder,
     RBLNGDNStateRows,
+    grouped_qkv_rows,
 )
 
 LAYER = "model.layers.1.linear_attn"
+
+
+def test_grouped_qkv_rows_interleaves_each_key_heads_q_k_and_values():
+    # 2 key heads, 2 value heads each, 1-wide heads: [q0 q1 | k0 k1 | v0 v1 v2 v3]
+    assert grouped_qkv_rows(2, 2, 1).tolist() == [0, 2, 4, 5, 1, 3, 6, 7]
+    # 2-wide heads: each head's rows stay adjacent
+    assert grouped_qkv_rows(1, 1, 2).tolist() == [0, 1, 2, 3, 4, 5]
+    assert grouped_qkv_rows(2, 1, 2).tolist() == [0, 1, 4, 5, 8, 9, 2, 3, 6, 7, 10, 11]
 
 
 class TestStateRows:
@@ -117,9 +126,9 @@ class TestBuilder:
     def test_state_shapes_follow_the_kernels(self, builder):
         state = builder.states[LAYER]
         # 4 live rows + 4 scratch rows; 2 value heads under each of 2 key
-        # heads, each state blocked as [2, 128, 64] dlfloat16 bits
-        assert state.conv_q.shape == state.conv_k.shape == (8, 3, 2, 128)
-        assert state.conv_v.shape == (8, 3, 4, 128)
+        # heads: one conv ring of 2 * (2 + 2) heads, each state blocked as
+        # [2, 128, 64] dlfloat16 bits
+        assert state.conv_qkv.shape == (8, 3, 8, 128)
         assert state.ssm_state.shape == (8, 2, 2, 2, 128, 64)
         assert state.ssm_state.dtype == torch.int16
         assert state.conv_width == 3

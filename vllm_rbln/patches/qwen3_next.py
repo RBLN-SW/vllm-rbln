@@ -92,39 +92,29 @@ def patched_gdn_forward(
     # kernels need the explicit [batch, seq, ...] views.
     mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
     gates, _ = self.in_proj_ba(hidden_states)
-    q, k, v, z = mixed_qkvz.split([key_dim, key_dim, value_dim, value_dim], dim=-1)
+    qkv, z = mixed_qkvz.split([channels, value_dim], dim=-1)
     b, a = gates.chunk(2, dim=-1)
-    conv_weight = self.conv1d.weight.view(channels, kernel).to(mixed_qkvz.dtype)
+    groups = heads_k * (2 + ratio)
 
-    # One conv per q / k / v: RSD then cuts each one's channels on its heads,
-    # where a cut of the q|k|v channels would not fall on head boundaries. The
-    # weights are sliced, not split: the compiler folds a slice into a constant
-    # RSD can cut, but leaves the last part of a split as an op it cannot.
-    def conv(x, weight, ring, heads):
-        return torch.ops.rbln_custom_ops.causal_conv1d_ring_tabled(
-            x.reshape(batch, seq_len, heads, head_dim),
-            pack_weight(weight.reshape(heads, head_dim, kernel)),
-            ring,
-            *metadata.conv_tables,
-            state.conv_width,
-        )
-
+    # One conv over q | k | v, whose rows the model regrouped by key head at
+    # load time (grouped_qkv_rows): RSD cuts the conv's channels where it cuts
+    # the cores' heads, so a chiplet's conv output is what its cores read.
+    convolved = torch.ops.rbln_custom_ops.causal_conv1d_ring_tabled(
+        qkv.reshape(batch, seq_len, groups, head_dim),
+        pack_weight(
+            self.conv1d.weight.view(groups, head_dim, kernel).to(mixed_qkvz.dtype)
+        ),
+        state.conv_qkv,
+        *metadata.conv_tables,
+        state.conv_width,
+    )
     # The cores take q / k per key head (they L2-normalize them) and v, g and
     # beta per value head grouped under its key head: value head h is key head
     # h // ratio's (h % ratio)-th, as HF's repeat_interleave pairs them.
-    query, key = (
-        conv(x, w, ring, heads_k)
-        .view(batch, seq_len, heads_k, head_dim)
-        .transpose(1, 2)
-        .contiguous()
-        for x, w, ring in (
-            (q, conv_weight[:key_dim], state.conv_q),
-            (k, conv_weight[key_dim : 2 * key_dim], state.conv_k),
-        )
-    )
-    value = conv(v, conv_weight[2 * key_dim :], state.conv_v, heads_v)
-    value = value.view(batch, seq_len, heads_k, ratio, head_dim)
-    value = value.permute(0, 2, 3, 1, 4).contiguous()
+    grouped = convolved.view(batch, seq_len, heads_k, 2 + ratio, head_dim)
+    grouped = grouped.permute(0, 2, 3, 1, 4)
+    query, key = (grouped[:, :, i].contiguous() for i in (0, 1))
+    value = grouped[:, :, 2:].contiguous()
 
     beta = torch.sigmoid(b).reshape(batch, seq_len, heads_k, ratio)
     g = -torch.exp(self.A_log.float()) * F.softplus(a.float() + self.dt_bias.float())
