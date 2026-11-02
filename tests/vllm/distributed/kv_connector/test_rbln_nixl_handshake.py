@@ -73,11 +73,15 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
     ChunkGrid,
     Piece,
     RblnNixlWorkerState,
+    block_rects,
     kv_chunk_tokens,
     pair_area,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.transfer import (
     _chunk_desc_ids,
+)
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_transfer_topology import (
+    RblnBlockTransferSpec,
 )
 
 
@@ -8022,3 +8026,71 @@ class TestShardPeerGroupIds:
         )
 
         assert ids == (4, 3)
+
+
+class TestABlockPayloadPairsAcrossTp:
+    """GLM-5.3's block payloads between a TP1 producer and a TP4 consumer, both at
+    a 4096-token block over four chiplet slices. The KDA kernel cuts the heads of
+    its own view over the chiplets: the consumer's state view is four slots a
+    block, so an area holds 4 heads of every slot and the rank owns one slot's;
+    the conv ring is twelve runs (ring row x q / k / v), an area a lane slice of
+    each. A ring every rank holds alike pairs whole."""
+
+    STATE = RblnBlockTransferSpec(4096, 4096 * 512, 64, 128 * 128 * 2)
+    CONV = RblnBlockTransferSpec(4096, 4 * 3 * 32 * 64 * 2, 64, 256, 12)
+    TAIL = RblnBlockTransferSpec(4096, 4 * 256 * 2)
+    SLICES = [0, 1, 2, 3]
+
+    def _pair(self, spec, area_len_l, area_len_r, rank, kv_per_block, slices=None):
+        slices = slices or self.SLICES
+        ours = block_rects(spec, slices, area_len_l, rank, 4)
+        theirs = block_rects(spec, slices, area_len_r, 0, 1)
+        peer = [(a, w.rect, w.length) for a, w in enumerate(theirs)]
+        out = []
+        for area, w in enumerate(ours):
+            pieces = pair_area(
+                w.rect,
+                w.length,
+                peer,
+                kv_per_block=kv_per_block,
+                every_holder=False,
+                region_id=area,
+            )
+            out.append(
+                [
+                    x._replace(
+                        local_offset=x.local_offset + w.offset,
+                        remote_offset=x.remote_offset + theirs[x.remote_region].offset,
+                    )
+                    for x in pieces
+                ]
+            )
+        return out
+
+    @pytest.mark.parametrize("rank", range(4))
+    def test_a_state_slice_reads_its_heads_into_the_rank_slot(self, rank):
+        quarter = 128 * 1024
+        pieces = self._pair(self.STATE, 4 * quarter, 4 * quarter, rank, 1)
+        assert pieces == [
+            [Piece(rank * quarter, rank, area * quarter, quarter, 4, (0, 1))]
+            for area in range(4)
+        ]
+
+    @pytest.mark.parametrize("rank", range(4))
+    def test_a_ring_slice_takes_its_heads_out_of_every_run(self, rank):
+        pieces = self._pair(self.CONV, 12288, 49152, rank, 12)
+        assert pieces == [
+            [
+                Piece(run * 1024, rank, run * 4096 + area * 1024, 1024, 4, (0, 1))
+                for run in range(12)
+            ]
+            for area in range(4)
+        ]
+
+    def test_a_payload_every_rank_holds_is_read_whole_from_the_first_replica(self):
+        pieces = self._pair(self.TAIL, 2048, 2048, 2, 1, slices=[0] * 4)
+        assert pieces == [[Piece(0, 0, 0, 2048, 1, (0, 2048))]] * 4
+
+    def test_heads_a_slice_cannot_cut_evenly_are_refused(self):
+        with pytest.raises(RuntimeError, match="do not cut evenly"):
+            block_rects(self.STATE, self.SLICES, 512 * 1024, 0, 32)
