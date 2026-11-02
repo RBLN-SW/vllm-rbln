@@ -138,7 +138,7 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
     kv_cache_dynamic_axis,
     validate_shared_attention_kv_cache_contiguity,
 )
-from vllm_rbln.v1.core.rbln_kv_cache_manager import KVCacheCopyOp
+from vllm_rbln.v1.core.rbln_kv_cache_manager import KVCacheCopyOp, KVCacheTailOp
 from vllm_rbln.v1.core.rbln_scheduler import RBLNSchedulerOutput
 from vllm_rbln.v1.core.utils import (
     decode_batch_size,
@@ -334,6 +334,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.kv_caches: list[torch.Tensor] = []
         # Layer name -> which axis of its cache a block indexes.
         self.kv_cache_block_axes: dict[str, int] = {}
+        # Host tail slots, one block per slot per layer, allocated on the first
+        # tail op (see _process_kv_cache_tail_ops).
+        self._tail_host: dict[str, torch.Tensor] | None = None
         self.kv_cache_bases: list[torch.Tensor] = []
         self.kv_cache_view_infos: list[KVCacheViewInfo] = []
         # KV cache layer names in layer-index order; the deterministic
@@ -1912,6 +1915,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         with record_function_or_nullcontext("rbln_model_runner: preprocess"):
             # Update persistent batch states.
             self._update_states(scheduler_output)
+
+            # Host tail saves and loads first: a save reads a block the
+            # scheduler freed, which this step's copies, connector loads or
+            # forward may already write.
+            if scheduler_output.kv_cache_tail_ops:
+                self._process_kv_cache_tail_ops(scheduler_output.kv_cache_tail_ops)
 
             # Process sub-block KV cache copy operations before the forward
             # pass so that partially cached blocks are populated.
@@ -3881,6 +3890,54 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             direction,
             block_axes=self.kv_cache_block_axes,
         )
+
+    def _process_kv_cache_tail_ops(self, tail_ops: list[KVCacheTailOp]) -> None:
+        """Copy tail blocks between the KV cache and the host tail slots.
+
+        A whole block moves per op, one K and one V plane per layer: each plane
+        is contiguous on both sides, the D2H form the LMCache connector stores
+        full chunks with. Ops run in the order the scheduler made them.
+        """
+        assert not self.model_config.use_mla, "tail offload needs a K/V cache"
+        if self._tail_host is None:
+            num_slots = envs.VLLM_RBLN_TAIL_OFFLOAD_SLOTS
+            self._tail_host = {}
+            for layer_name, kv_cache in zip(
+                self.kv_cache_names, self.kv_caches, strict=True
+            ):
+                block = kv_cache.select(self.kv_cache_block_axes[layer_name], 0)
+                self._tail_host[layer_name] = torch.empty(
+                    (num_slots, *block.shape), dtype=block.dtype, device="cpu"
+                )
+            logger.info(
+                "Tail offload: %d host slots, %.1f GiB",
+                num_slots,
+                sum(t.numel() * t.element_size() for t in self._tail_host.values())
+                / 2**30,
+            )
+        for op in tail_ops:
+            layer_names = set(
+                self.kv_cache_config.kv_cache_groups[op.group_id].layer_names
+            )
+            dsts: list[torch.Tensor] = []
+            srcs: list[torch.Tensor] = []
+            for layer_name, kv_cache in zip(
+                self.kv_cache_names, self.kv_caches, strict=True
+            ):
+                if layer_name not in layer_names:
+                    continue
+                block = kv_cache.select(
+                    self.kv_cache_block_axes[layer_name], op.block_id
+                )
+                host = self._tail_host[layer_name][op.slot]
+                for half in range(block.shape[0]):
+                    if op.kind == "save":
+                        dsts.append(host[half])
+                        srcs.append(block[half])
+                    else:
+                        dsts.append(block[half])
+                        srcs.append(host[half])
+            torch._foreach_copy_(dsts, srcs)
 
     def _process_kv_cache_copy_ops(
         self,

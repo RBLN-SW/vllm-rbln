@@ -188,6 +188,32 @@ class TestSubBlockVersusKVConnector:
         assert len(out.kv_cache_copy_ops) == 1
         assert seen[-1] == 0
 
+    def test_tail_reuse_extends_the_connector_hit(self, monkeypatch):
+        # With host tail slots the two are not arbitrated: a whole-block
+        # connector hit stands and the saved tail extends it at the boundary.
+        monkeypatch.setenv("VLLM_RBLN_TAIL_OFFLOAD_SLOTS", "2")
+        sched = self._scheduler(matched_tokens=BLOCK_SIZE)
+        # A block of prompt plus a sub-block of output, saved on finish.
+        req0 = make_request(
+            "0", list(range(BLOCK_SIZE)), BLOCK_SIZE, max_tokens=SUB_BLOCK_SIZE + 1
+        )
+        sched.add_request(req0)
+        while sched.has_requests():
+            out = sched.schedule()
+            sched.update_from_output(out, make_model_runner_output(out, 0))
+        assert sched.reset_prefix_cache()
+
+        tokens = req0.all_token_ids[: BLOCK_SIZE + SUB_BLOCK_SIZE] + [
+            900 + i for i in range(BLOCK_SIZE)
+        ]
+        out = self._schedule_query(sched, tokens, remote_prefill=True)
+
+        assert [op.kind for op in out.kv_cache_tail_ops] == ["load"]
+        assert out.kv_cache_copy_ops == []
+        assert (
+            out.num_scheduled_tokens["1"] == len(tokens) - BLOCK_SIZE - SUB_BLOCK_SIZE
+        )
+
     def test_resume_from_preemption_skips_the_sub_block_match(self):
         # The connector is queried once, with the block-aligned local count,
         # and LMCache asserts on resume that the request restarts exactly
