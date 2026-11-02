@@ -249,6 +249,28 @@ def test_a_request_budget_above_the_cap_is_refused(
         assert processor._apply_hf_processor_main(items, request_kwargs) == "processed"
 
 
+def test_construction_builds_the_hf_processor_of_every_allowed_budget(monkeypatch):
+    # Upstream caches the HF processor per max_soft_tokens; building each one
+    # up front keeps a request's first use of a budget from paying for it.
+    info = _processing_info({}, 280, 280)
+    built = []
+    plain = info.get_hf_processor
+
+    def get_hf_processor(**kwargs):
+        built.append(kwargs)
+        return plain()
+
+    info.get_hf_processor = get_hf_processor
+
+    def upstream_init(self, *args, **kwargs):
+        self.info = info
+
+    monkeypatch.setattr(gemma4.Gemma4MultiModalProcessor, "__init__", upstream_init)
+    gemma4.RBLNGemma4MultiModalProcessor()
+
+    assert [kwargs["max_soft_tokens"] for kwargs in built if kwargs] == [70, 140, 280]
+
+
 def test_video_frames_are_regrouped_per_video(monkeypatch):
     model = _bare_model()
     monkeypatch.setattr(
