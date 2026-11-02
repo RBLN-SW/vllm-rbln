@@ -141,22 +141,22 @@ def _input_key(spec: Any) -> tuple:
     )
 
 
-def select_kv_input_groups(
+def select_kv_inputs(
     programs: Sequence[Any],
     allocations: Mapping[str, ReferenceType[torch.Tensor]],
     program_inputs: Mapping[int, Sequence[ReferenceType[torch.Tensor]]],
-) -> list[tuple[list[Any], Any]]:
+) -> list[tuple[Any, Any]]:
     from vllm_rbln.v1.attention.kv_cache_bindings import kv_cache_tensor_key
 
-    names_by_key = {}
+    allocation_names = {}
     for name, ref in allocations.items():
         tensor = ref()
         if tensor is None:
             raise RuntimeError(
                 f"initialized KV cache {name!r} was released before sizing"
             )
-        names_by_key[kv_cache_tensor_key(tensor)] = name
-    selected: dict[str, tuple[Any, Any]] = {}
+        allocation_names[kv_cache_tensor_key(tensor)] = name
+    selected: dict[tuple, tuple[Any, Any]] = {}
     for program in programs:
         if not any(s.physical_placement is not None for s in program.input_specs):
             continue
@@ -174,18 +174,19 @@ def select_kv_input_groups(
                     f"{_program_name(program)} KV input {spec.name!r} "
                     "has no live binding"
                 )
-            cache_name = names_by_key.get(kv_cache_tensor_key(tensor))
-            if cache_name is None:
+            key = kv_cache_tensor_key(tensor)
+            if key not in allocation_names:
                 raise RuntimeError(
                     f"{_program_name(program)} input {spec.name!r} "
                     "is not an initialized KV cache allocation"
                 )
-            previous = selected.get(cache_name)
+            previous = selected.get(key)
             if previous is None:
-                selected[cache_name] = (spec, program)
+                selected[key] = (spec, program)
             elif _input_key(previous[0]) != _input_key(spec):
                 raise RuntimeError(
-                    f"compiled programs disagree on KV cache {cache_name!r}: "
+                    "compiled programs disagree on KV cache "
+                    f"{allocation_names[key]!r}: "
                     f"{_program_name(previous[1])} and {_program_name(program)} "
                     "bind the same allocation with different layouts."
                 )
@@ -194,15 +195,11 @@ def select_kv_input_groups(
             f"none of the {len(programs)} compiled program(s) carries a dynamic-shape "
             "KV input; was VLLM_CACHE_ROOT replaying a static build?"
         )
-    missing = allocations.keys() - selected.keys()
+    missing = allocation_names.keys() - selected.keys()
     if missing:
-        raise RuntimeError(
-            f"initialized KV caches have no compiled placement: {sorted(missing)}"
-        )
-    groups: dict[int, tuple[list[Any], Any]] = {}
-    for spec, program in selected.values():
-        groups.setdefault(id(program), ([], program))[0].append(spec)
-    return list(groups.values())
+        names = sorted(allocation_names[key] for key in missing)
+        raise RuntimeError(f"initialized KV caches have no compiled placement: {names}")
+    return list(selected.values())
 
 
 def _program_name(program: Any) -> str:

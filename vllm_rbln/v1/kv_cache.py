@@ -14,9 +14,11 @@
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from math import prod
 
 import torch
 from vllm.config import VllmConfig
+from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
 from vllm.v1.kv_cache_interface import SlidingWindowSpec
@@ -33,7 +35,7 @@ class RBLNBlockAuxSpec:
 
     @property
     def page_size_bytes(self) -> int:
-        return self.dtype.itemsize * int(torch.Size(self.block_shape).numel())
+        return prod(self.block_shape) * get_dtype_size(self.dtype)
 
 
 @dataclass(frozen=True)
