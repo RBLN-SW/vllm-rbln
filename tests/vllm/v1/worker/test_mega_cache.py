@@ -27,6 +27,7 @@ import os
 import re
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from tests.vllm.vllm_config import make_vllm_config
@@ -249,6 +250,62 @@ class TestSignatureVllmConfig:
         # and a partly-hitting bundle costs a duplicate weight set on device.
         base = mega_cache.config_signature(make_vllm_config())
         assert mega_cache.config_signature(make_vllm_config(**overrides)) != base
+
+    @pytest.mark.parametrize(
+        ("before", "after"),
+        [
+            (None, {"image": [2304]}),
+            ({"image": [2304]}, {"image": [1024, 2304]}),
+            ({"image": [2304]}, {"image": [2304], "video": [12288]}),
+        ],
+        ids=["text-to-mm", "image-bucket-added", "video-enabled"],
+    )
+    def test_mm_encoder_buckets_invalidate(self, before, after):
+        config = make_vllm_config()
+        assert mega_cache.config_signature(
+            config, after
+        ) != mega_cache.config_signature(config, before)
+
+    @pytest.mark.parametrize(
+        "options",
+        [
+            {"limit_per_prompt": {"image": 2, "video": 1}},
+            {"limit_per_prompt": {}},
+            {"limit_per_prompt": {"image": 999, "video": 999}},
+            {"limit_per_prompt": {"image": {"count": 1, "width": 512, "height": 512}}},
+            {"mm_processor_kwargs": {"videos_kwargs": {"fps": np.int64(2)}}},
+        ],
+        ids=["count", "implicit-limit", "explicit-limit", "dummy-size", "numpy-fps"],
+    )
+    def test_mm_inputs_key_only_through_the_resolved_buckets(self, options):
+        from vllm.config import MultiModalConfig
+
+        buckets = {"image": [2304], "video": [12288]}
+        config = make_vllm_config()
+        config.model_config.multimodal_config = MultiModalConfig(
+            limit_per_prompt={"image": 1, "video": 1}
+        )
+        base = mega_cache.config_signature(config, buckets)
+        config.model_config.multimodal_config = MultiModalConfig(**options)
+        assert mega_cache.config_signature(config, dict(reversed(buckets.items()))) == (
+            base
+        )
+
+    @pytest.mark.parametrize(
+        ("before", "after"),
+        [
+            ({"image": [12288]}, {"image": [12288], "video": [12288]}),
+            ({"image": [1024, 2304]}, {"image": [2304, 1024, 1024]}),
+            ({"image": [3264]}, {"image": [np.int64(3264)]}),
+            (None, {}),
+        ],
+        ids=["shared-bucket", "bucket-order", "numpy-bucket", "no-local-encoder"],
+    )
+    def test_equivalent_encoder_graph_sets_share_a_bundle(self, before, after):
+        config = make_vllm_config()
+        assert mega_cache.config_signature(
+            config, before
+        ) == mega_cache.config_signature(config, after)
 
     def test_speculative_tokens_invalidate(self):
         # num_spec_tokens sets the decode query_len the warm-up compiles, and

@@ -251,13 +251,6 @@ def test_mm_encoder_patch_buckets_are_positive_and_unique(buckets, error):
         RBLNConfig(mm_encoder_patch_buckets=buckets)
 
 
-def test_patch_bucket_modality_changes_the_config_hash():
-    image = RBLNConfig(mm_encoder_patch_buckets={"image": [1024, 2304]})
-    video = RBLNConfig(mm_encoder_patch_buckets={"video": [1024, 2304]})
-
-    assert image.compute_hash() != video.compute_hash()
-
-
 @pytest.mark.parametrize("size", [0, -1])
 def test_a_sub_block_size_of_zero_or_less_is_rejected(size):
     """`sub_block_size_in_use()` takes a size or None, so the field refuses
@@ -352,13 +345,14 @@ def test_only_compile_fields_change_the_hash():
     assert RBLNConfig(use_custom_sampler=False).compute_hash() == base
     assert RBLNConfig(enable_sub_block_cache=False).compute_hash() == base
     assert RBLNConfig(sub_block_size=64).compute_hash() == base
+    # mega_cache keys on the buckets the model resolves from this one.
+    patch_buckets = RBLNConfig(mm_encoder_patch_buckets={"image": [1024, 2304]})
+    assert patch_buckets.compute_hash() == base
     assert RBLNConfig(use_w8a8=True).compute_hash() != base
     assert RBLNConfig(compile_dtype="float16").compute_hash() != base
     assert RBLNConfig(decode_batch_bucket_strategy="linear").compute_hash() != base
     buckets = RBLNConfig(decode_batch_bucket_manual_buckets=[1, 2, 4])
     assert buckets.compute_hash() != base
-    patch_buckets = RBLNConfig(mm_encoder_patch_buckets={"image": [1024, 2304]})
-    assert patch_buckets.compute_hash() != base
     # Unset and True resolve to the same graph; False compiles a static one.
     assert RBLNConfig(use_dynamic_kv_cache=True).compute_hash() == base
     assert RBLNConfig(use_dynamic_kv_cache=False).compute_hash() != base

@@ -325,6 +325,21 @@ def test_image_only_allows_no_frame_limit(monkeypatch):
     assert model.mm_encoder_patch_buckets == {"image": [2304]}
 
 
+@pytest.mark.parametrize(
+    ("limits", "is_first_rank"),
+    [({"image": 1, "video": 1}, False), ({"image": 0, "video": 0}, True)],
+    ids=["later-pp-rank", "text-only"],
+)
+def test_a_rank_without_an_encoder_has_no_patch_buckets(
+    monkeypatch, limits, is_first_rank
+):
+    model = _build_with_patch_buckets(
+        monkeypatch, {}, limits=limits, is_first_rank=is_first_rank
+    )
+    assert model.vision_tower is None
+    assert model.mm_encoder_patch_buckets == {}
+
+
 def test_video_budget_can_schedule_a_video_enlarged_by_min_pixels():
     from vllm.config import SchedulerConfig
     from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange

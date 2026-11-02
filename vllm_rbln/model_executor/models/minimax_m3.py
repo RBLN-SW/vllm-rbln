@@ -1152,6 +1152,7 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         self.config = config
         self.quant_config = vllm_config.quant_config
         self.vision_tower = None
+        self.mm_encoder_patch_buckets: dict[str, list[int]] = {}
         self.mm_embeds_dtype = vllm_config.model_config.dtype
         mm_config = vllm_config.model_config.multimodal_config
         if (
@@ -1191,7 +1192,6 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
                     "Unsupported mm_encoder_patch_buckets modalities: "
                     f"{sorted(unknown)}"
                 )
-            self.mm_encoder_patch_buckets: dict[str, list[int]] = {}
             for modality, max_patches in bounds.items():
                 buckets = sorted(configured.get(modality, [])) or [max_patches]
                 name = f"mm_encoder_patch_buckets[{modality!r}]"

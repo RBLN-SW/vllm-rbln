@@ -39,6 +39,7 @@ class SupportsRBLNMultiModal(Protocol):
     """
 
     merges_mm_embeds_in_graph: ClassVar[Literal[True]] = True
+    mm_encoder_patch_buckets: dict[str, list[int]]
 
     def compile_mm_encoder(self, compile_fn: Callable[[nn.Module], nn.Module]) -> None:
         """Compile the multimodal encoder with the runner's compile wrapper. A

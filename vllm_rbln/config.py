@@ -156,6 +156,7 @@ class RBLNConfig(RBLNConfigBase):
             "use_custom_sampler",
             "enable_sub_block_cache",
             "sub_block_size",
+            "mm_encoder_patch_buckets",
         }
         factors = get_hash_factors(self, ignored_factors)
         # Unset and True build the same graph; only False changes the artifact.

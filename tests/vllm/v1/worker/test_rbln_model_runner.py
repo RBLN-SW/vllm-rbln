@@ -418,7 +418,31 @@ def test_pooling_warmup_runs_without_language_model_head(monkeypatch):
     runner.warmup_model()
 
     runner.run_model_graphs.assert_called_once_with()
+    cache.config_signature.assert_called_once_with(None, None)
     cache.save.assert_called_once_with("pooling", cache.config_signature.return_value)
+
+
+def test_multimodal_warmup_keys_the_bundle_on_the_encoder_buckets(monkeypatch):
+    cache = SimpleNamespace(config_signature=Mock(), load=Mock(), save=Mock())
+    monkeypatch.setattr(mr, "mega_cache", cache)
+    monkeypatch.setattr(mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=False))
+    buckets = {"image": [1024, 2304], "video": [12288]}
+    vllm_config = object()
+    runner = _make_runner_stub(
+        vllm_config=vllm_config,
+        model_config=SimpleNamespace(model="m3"),
+        model=SimpleNamespace(mm_encoder_patch_buckets=buckets),
+        supports_mm_inputs=True,
+        run_model_graphs=Mock(),
+        offload_context=nullcontext,
+        drafter=None,
+        _warmup_mm_encoder=Mock(),
+    )
+
+    runner.warmup_model()
+
+    cache.config_signature.assert_called_once_with(vllm_config, buckets)
+    runner._warmup_mm_encoder.assert_called_once_with()
 
 
 @pytest.mark.parametrize("num_reqs", [1, 2])
