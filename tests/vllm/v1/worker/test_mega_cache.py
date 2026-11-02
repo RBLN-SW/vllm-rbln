@@ -113,17 +113,25 @@ class TestSignatureComposition:
         static = mega_cache.config_signature(_stub_config())
         assert dynamic != static
 
-    def test_mm_processor_kwargs_invalidate(self):
-        # compute_hash() leaves them out, but Gemma4 compiles its vision
-        # encoder and image prefill to the max_soft_tokens they carry.
-        def signature(kwargs):
-            config = _stub_config()
-            config.model_config.multimodal_config = SimpleNamespace(
-                mm_processor_kwargs=kwargs
-            )
-            return mega_cache.config_signature(config)
+    def test_max_soft_tokens_invalidates(self):
+        # compute_hash() leaves mm_processor_kwargs out, but Gemma4 compiles
+        # its vision encoder and image prefill to the max_soft_tokens they carry.
+        assert _signature_with_mm_kwargs(
+            {"max_soft_tokens": 70}
+        ) != _signature_with_mm_kwargs({"max_soft_tokens": 280})
 
-        assert signature({"max_soft_tokens": 70}) != signature({"max_soft_tokens": 280})
+    def test_other_mm_processor_kwargs_keep_the_key(self):
+        # Without max_soft_tokens the key is the one a text model gets, so no
+        # other model loses its bundle to this factor.
+        text_only = mega_cache.config_signature(_stub_config())
+        assert _signature_with_mm_kwargs(None) == text_only
+        assert _signature_with_mm_kwargs({"do_pan_and_scan": True}) == text_only
+
+
+def _signature_with_mm_kwargs(kwargs) -> str:
+    config = _stub_config()
+    config.model_config.multimodal_config = SimpleNamespace(mm_processor_kwargs=kwargs)
+    return mega_cache.config_signature(config)
 
 
 # Variables the built graph depends on and RBLNConfig does not carry, so this
