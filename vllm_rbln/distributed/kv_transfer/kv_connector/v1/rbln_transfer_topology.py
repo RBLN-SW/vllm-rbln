@@ -49,6 +49,12 @@ class RblnBlockTransferSpec(KVCacheSpec):
     """
 
     page_bytes: int
+    # Model-wide heads the payload bands over TP ranks; 0 where every rank holds
+    # the same bytes. A block is `runs` runs of the rank's heads, `head_bytes` a
+    # head, or one run holding several ranks' worth of which this rank owns one.
+    band_heads: int = 0
+    head_bytes: int = 0
+    runs: int = 1
 
     @property
     def page_size_bytes(self) -> int:
