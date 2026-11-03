@@ -5,8 +5,8 @@
 # Start the EC producer: an encoder-only instance on the vllm model path that
 # encodes images and serves the outputs to consumers over NIXL.
 #
-# Usage:
-#   RBLN_DEVICES=0 bash serve_ec_producer.sh [MODEL] [PORT]
+# Usage (same host as the consumer's default devices):
+#   RBLN_DEVICES=4 bash serve_ec_producer.sh [MODEL] [PORT]
 #
 # MODEL must be the same string on the producer and the consumer: it is part of
 # the compatibility hash the two compare. A consumer on another host needs

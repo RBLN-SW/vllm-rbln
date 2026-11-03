@@ -7,10 +7,11 @@
 # encoding the image itself.
 #
 # Usage:
-#   RBLN_DEVICES=1 bash serve_ec_consumer.sh [MODEL] [PORT]
+#   RBLN_DEVICES=0,1,2,3 bash serve_ec_consumer.sh [MODEL] [PORT]
 #
 # MODEL must be the same string as on the producer. With TENSOR_PARALLEL_SIZE
 # above 1, list that many devices in RBLN_DEVICES.
+# When sharing a host, run the producer with RBLN_DEVICES=4.
 set -euo pipefail
 
 MODEL="${1:-nvidia/MiniMax-M3-NVFP4}"
@@ -23,7 +24,7 @@ BLOCK_SIZE="${BLOCK_SIZE:-8192}"
 IMAGE_LIMIT="${IMAGE_LIMIT:-1}"
 EC_CPU_BYTES="${EC_CPU_BYTES:-1073741824}"
 
-export RBLN_DEVICES="${RBLN_DEVICES:-1}"
+export RBLN_DEVICES="${RBLN_DEVICES:-0,1,2,3}"
 
 exec vllm serve "$MODEL" \
     --port "$PORT" \
