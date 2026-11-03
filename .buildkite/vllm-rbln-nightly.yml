@@ -169,6 +169,41 @@ steps:
             .buildkite/pipelines/vllm-rbln/scripts/perf/run_perf.py pipeline --chip RBLN-CR13 --snapshot \
             | buildkite-agent pipeline upload
 
+  - <<: *measured
+    label: "[CR13] Sampler Perf"
+    key: "nightly-sampler-perf"
+    depends_on: "nightly-targets-prepare"
+    resources:
+      npu:
+        count: 1
+        product: "RBLN-CR13"
+    timeout_in_minutes: 60
+    artifact_paths:
+      - "sampler-perf-results/**/*"
+    command:
+      - *sync
+      - |
+        set -euo pipefail
+        sampler_output="sampler-perf-results/$${BUILDKITE_BUILD_ID}/RBLN-CR13"
+        mkdir -p "$${sampler_output}"
+        rm -f "$${sampler_output}/manifest.json" "$${sampler_output}/summary.md"
+        uv run --no-project --python 3.12 --with pyyaml python \
+          .buildkite/pipelines/vllm-rbln/scripts/lane.py restore --run-id "$${BUILDKITE_BUILD_ID}"
+        sampler_status=0
+        uv run --no-sync python \
+          .buildkite/pipelines/vllm-rbln/scripts/sampler-perf/run_benchmarks.py \
+          --config "ci-targets/$${BUILDKITE_BUILD_ID}/sampler-perf/benchmark-configs.yaml" \
+          --output-dir "$${sampler_output}" || sampler_status=$$?
+        if [[ -f "$${sampler_output}/summary.md" ]]; then
+          sampler_style=info
+          [[ "$${sampler_status}" == 0 ]] || sampler_style=warning
+          if ! buildkite-agent annotate --context sampler-perf-RBLN-CR13 \
+            --style "$${sampler_style}" < "$${sampler_output}/summary.md"; then
+            echo "Sampler Perf annotation failed; results remain in artifacts" >&2
+          fi
+        fi
+        exit "$${sampler_status}"
+
   - group: "[CR13] lm-eval"
     key: "nightly-lm-eval"
     steps:
@@ -215,6 +250,7 @@ steps:
       - "nightly-pytest"
       - "nightly-examples-vllm"
       - "nightly-perf-upload"
+      - "nightly-sampler-perf"
       - "nightly-lm-eval-upload"
       - "nightly-publish"
     allow_dependency_failure: true

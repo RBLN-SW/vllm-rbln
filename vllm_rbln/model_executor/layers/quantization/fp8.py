@@ -48,6 +48,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         from vllm_rbln.config import get_rbln_config
 
         self.use_w8a8 = get_rbln_config().use_w8a8
+        swiglu_limit = layer.swiglu_limit
+        if self.use_w8a8 and swiglu_limit is not None and swiglu_limit > 0:
+            raise NotImplementedError(
+                f"swiglu_limit {swiglu_limit}: the RBLN W8A8 MoE kernel has no "
+                "SwiGLU clamp; use the fp8 weight-only (W8A16) MoE path"
+            )
 
     def create_weights(
         self,
@@ -333,11 +339,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         # SwiGLU clamp: silu(min(gate, L)) * clamp(up, -L, L).
         swiglu_limit = layer.swiglu_limit
-        clamped = False
         hidden_act = layer.activation.value
         swiglu_kwargs = {}
         if swiglu_limit is not None and swiglu_limit > 0:
-            clamped = True
             if hidden_act not in ("silu", "swish"):
                 raise NotImplementedError(
                     f"swiglu_limit {swiglu_limit} with activation {hidden_act!r}: "
@@ -351,11 +355,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             }
 
         if self.use_w8a8:
-            if clamped:
-                raise NotImplementedError(
-                    f"swiglu_limit {swiglu_limit}: the RBLN W8A8 MoE kernel has no "
-                    "SwiGLU clamp; use the fp8 weight-only (W8A16) MoE path"
-                )
             # W8A8: dynamically quantize hidden_states to fp8 per (1, block_k)
             # group along K and hand both the fp8 tensor and the per-(token,
             # K-block) scale to the W8A8 MoE custom op.

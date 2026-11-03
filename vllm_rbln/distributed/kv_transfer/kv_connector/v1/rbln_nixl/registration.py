@@ -556,8 +556,9 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         )
         self._window_grid_cut = self._window_grid()
         # Said once here rather than per peer: every list counts a block in
-        # the same chunks, and a peer whose block holds a different count is
-        # refused at the handshake.
+        # these chunks but one whose entries split a region on a peer's token
+        # ranges, whose chunk also cuts those ranges; a peer whose block holds
+        # a different number of tokens is refused at the handshake.
         if self._shape.chunk_mode:
             chunks_per_block = self._chunks_per_block(self._chunk_grid)
             logger.info(

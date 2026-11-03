@@ -407,7 +407,7 @@ class RBLNGlm5NextKDA(nn.Module):
         spec = vllm_config.speculative_config
         self.num_drafts = spec.num_speculative_tokens if spec is not None else 0
         self.conv_ring_width = max(KDA_CONV_RING, taps - 1 + self.num_drafts)
-        self.conv_ring = RBLNGlm5NextAuxCache(
+        self.conv_state = RBLNGlm5NextAuxCache(
             f"{prefix}.attn.{self.num_groups}",
             self.states[0].prefix,
             (
@@ -472,7 +472,7 @@ class RBLNGlm5NextKDA(nn.Module):
         convolved = torch.ops.rbln_custom_ops.kda_conv(
             torch.stack(inputs, dim=2),
             self.conv_weight,
-            self.conv_ring.inputs(),
+            self.conv_state.inputs(),
             conv_load,
             seq_idx.view(-1),
             query_len.view(-1),
@@ -643,8 +643,8 @@ class RBLNGlm5NextIndexer(nn.Module):
         key = F.layer_norm(
             key.float(),
             (self.head_dim,),
-            self.k_norm.weight,
-            self.k_norm.bias,
+            self.k_norm.weight.float(),
+            self.k_norm.bias.float(),
             self.k_norm.eps,
         ).to(hidden_states.dtype)
         gate = F.linear(hidden_states, self.index_kpool_compress_gate)

@@ -26,6 +26,7 @@ import torch
 from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 
 import vllm_rbln.v1.worker.dynamic_kv_sizer as dks
+from vllm_rbln.v1.attention.kv_cache_bindings import kv_cache_tensor_key
 from vllm_rbln.v1.worker.dynamic_kv_sizer import DynamicKvSizer
 
 S0 = ("symbol", "s0")
@@ -236,10 +237,10 @@ class TestComputeDynamicKvNumBlocks:
                 if name not in caches:
                     caches[name] = torch.empty(spec.shape, device="meta")
                 bound.append(caches[name])
-            bindings[id(program.runtime)] = tuple(weakref.ref(t) for t in bound)
+            bindings[id(program.runtime)] = tuple(kv_cache_tensor_key(t) for t in bound)
         while len(caches) < num_caches:
             caches[f"missing.{len(caches)}"] = torch.empty(1, device="meta")
-        allocations = {name: weakref.ref(t) for name, t in caches.items()}
+        allocations = {kv_cache_tensor_key(t): name for name, t in caches.items()}
         sizer = SimpleNamespace(
             rank=0,
             device=torch.device("cpu"),
@@ -628,6 +629,45 @@ class TestWarmupCapturesPrograms:
         with DynamicKvSizer.capture_programs(sizer) as programs:
             pass
         assert programs is None
+
+    def test_sizing_does_not_require_the_input_view_to_survive(self, monkeypatch):
+        from rebel.core.program_capture import _submit_program
+
+        import vllm_rbln.compilation.backends as backends
+
+        program = _program([HEAD_SPLIT])
+        cache = torch.empty(program.input_specs[1].shape, device="meta")
+
+        def compile_graph(graph, inputs, **kwargs):
+            _submit_program(program)
+            return program.runtime
+
+        monkeypatch.setattr(backends, "rbln_torch_compile_backend", compile_graph)
+        sizer = SimpleNamespace(
+            mode=dks.DynamicKvMode.ACTIVE,
+            device=torch.device("cpu"),
+            model_runner=SimpleNamespace(
+                kv_cache_config=SimpleNamespace(
+                    num_blocks=4, kv_cache_tensors=_kv_cache_tensors(1)
+                ),
+                kv_cache_allocations={kv_cache_tensor_key(cache): "state"},
+            ),
+        )
+        with DynamicKvSizer.capture_programs(sizer) as programs:
+            graph_input = cache.view_as(cache)
+            input_ref = weakref.ref(graph_input)
+            result = backends.rbln_backend(
+                torch.fx.GraphModule({}, torch.fx.Graph()), [torch.ones(1), graph_input]
+            )
+            del graph_input
+        assert input_ref() is None
+        sizer.programs = programs
+
+        assert result is program.runtime
+        growth, hint, device = DynamicKvSizer._kv_growth_from_programs(sizer)
+        assert growth.per_block == {(0, c): 2**20 for c in range(4)}
+        assert hint == 4
+        assert device == sizer.device
 
     def test_on_opens_torch_rbln_s_scope(self):
         recorded = ["p0", "p1"]
@@ -1133,11 +1173,12 @@ class TestReleaseKvCacheTensors:
                 static_forward_context={"l0": layer, "aux": aux}
             ),
             aux_kv_cache_layers=["aux"],
-            kv_cache_allocations={"l0": weakref.ref(layer.kv_cache)},
+            kv_cache_allocations={kv_cache_tensor_key(layer.kv_cache): "l0"},
         )
         sizer = SimpleNamespace(
             model_runner=model_runner,
             allocator_state_per_chiplet=lambda: "stub",
+            program_inputs={0: (kv_cache_tensor_key(layer.kv_cache),)},
         )
         old_cfg = SimpleNamespace(
             num_blocks=4,
@@ -1152,5 +1193,6 @@ class TestReleaseKvCacheTensors:
         assert model_runner.kv_cache_names == []
         assert model_runner.kv_cache_block_axes == {}
         assert model_runner.kv_cache_allocations == {}
+        assert sizer.program_inputs == {}
         assert layer.kv_cache is None
         assert aux.kv_cache is None

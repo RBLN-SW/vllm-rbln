@@ -23,9 +23,6 @@ import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
-from weakref import ReferenceType
-
-import torch
 
 from vllm_rbln.logger import init_logger
 
@@ -141,51 +138,35 @@ def _input_key(spec: Any) -> tuple:
     )
 
 
-def select_kv_input_groups(
+def select_kv_inputs(
     programs: Sequence[Any],
-    allocations: Mapping[str, ReferenceType[torch.Tensor]],
-    program_inputs: Mapping[int, Sequence[ReferenceType[torch.Tensor]]],
-) -> list[tuple[list[Any], Any]]:
-    from vllm_rbln.v1.attention.kv_cache_bindings import kv_cache_tensor_key
-
-    names_by_key = {}
-    for name, ref in allocations.items():
-        tensor = ref()
-        if tensor is None:
-            raise RuntimeError(
-                f"initialized KV cache {name!r} was released before sizing"
-            )
-        names_by_key[kv_cache_tensor_key(tensor)] = name
-    selected: dict[str, tuple[Any, Any]] = {}
+    allocations: Mapping[tuple, str],
+    program_inputs: Mapping[int, Sequence[tuple]],
+) -> list[tuple[Any, Any]]:
+    selected: dict[tuple, tuple[Any, Any]] = {}
     for program in programs:
         if not any(s.physical_placement is not None for s in program.input_specs):
             continue
-        input_refs = program_inputs.get(id(program.runtime))
-        if input_refs is None:
+        input_keys = program_inputs.get(id(program.runtime))
+        if input_keys is None:
             raise RuntimeError(
                 f"{_program_name(program)} has no captured input bindings"
             )
-        for spec, input_ref in zip(program.input_specs, input_refs, strict=True):
+        for spec, key in zip(program.input_specs, input_keys, strict=True):
             if spec.physical_placement is None:
                 continue
-            tensor = input_ref()
-            if tensor is None:
-                raise RuntimeError(
-                    f"{_program_name(program)} KV input {spec.name!r} "
-                    "has no live binding"
-                )
-            cache_name = names_by_key.get(kv_cache_tensor_key(tensor))
-            if cache_name is None:
+            if key not in allocations:
                 raise RuntimeError(
                     f"{_program_name(program)} input {spec.name!r} "
                     "is not an initialized KV cache allocation"
                 )
-            previous = selected.get(cache_name)
+            previous = selected.get(key)
             if previous is None:
-                selected[cache_name] = (spec, program)
+                selected[key] = (spec, program)
             elif _input_key(previous[0]) != _input_key(spec):
                 raise RuntimeError(
-                    f"compiled programs disagree on KV cache {cache_name!r}: "
+                    "compiled programs disagree on KV cache "
+                    f"{allocations[key]!r}: "
                     f"{_program_name(previous[1])} and {_program_name(program)} "
                     "bind the same allocation with different layouts."
                 )
@@ -196,13 +177,9 @@ def select_kv_input_groups(
         )
     missing = allocations.keys() - selected.keys()
     if missing:
-        raise RuntimeError(
-            f"initialized KV caches have no compiled placement: {sorted(missing)}"
-        )
-    groups: dict[int, tuple[list[Any], Any]] = {}
-    for spec, program in selected.values():
-        groups.setdefault(id(program), ([], program))[0].append(spec)
-    return list(groups.values())
+        names = sorted(allocations[key] for key in missing)
+        raise RuntimeError(f"initialized KV caches have no compiled placement: {names}")
+    return list(selected.values())
 
 
 def _program_name(program: Any) -> str:

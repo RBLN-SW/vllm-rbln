@@ -14,7 +14,6 @@
 
 import collections
 import dataclasses
-import weakref
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from contextlib import nullcontext
@@ -115,6 +114,7 @@ from vllm_rbln.compilation import (
     build_process_group_dict,
     compile,
     create_compile_context,
+    mark_decoder_regions,
     set_compile_stage,
 )
 from vllm_rbln.config import RBLNConfig
@@ -352,7 +352,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # KV cache layer names in layer-index order; the deterministic
         # ordering the KV connector relies on for region<->layer agreement.
         self.kv_cache_names: list[str] = []
-        self.kv_cache_allocations: dict[str, weakref.ReferenceType[torch.Tensor]] = {}
+        self.kv_cache_allocations: dict[tuple, str] = {}
         # Initialize in initialize_kv_cache_tensors
         self.cross_layers_kv_cache: torch.Tensor | None = None
         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
@@ -941,7 +941,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             front_pad = np.maximum(
                 0, num_computed + query_lengths - self.max_model_len
             ).astype(np.int32)
-            assert not (self.replays_accepted_drafts and front_pad.any()), front_pad
+            if self.replays_accepted_drafts and front_pad.any():
+                raise NotImplementedError(
+                    "RBLN speculative decoding with recurrent-state replay does not "
+                    "support shifting the fixed decode window at max_model_len. "
+                    f"num_speculative_tokens={self.num_spec_tokens}, "
+                    f"max_model_len={self.max_model_len}, "
+                    f"front_pad={front_pad.tolist()}."
+                )
             back_pad = slack - front_pad
         else:
             query_lengths = logical_num_tokens
@@ -1012,6 +1019,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 self.state_load_pos_np[i] = self.state_pos_by_req.get(
                     req_id, self.input_batch.num_computed_tokens_cpu[i] - 1
                 )
+                # TODO(RBLN, #1370): handle output rollback when tracking state
+                # positions. This advances before forward and is not restored if
+                # the step is discarded. RBLN NIXL currently rejects Mamba
+                # groups, blocking this load-failure path.
                 self.state_pos_by_req[req_id] = int(self.seq_lens_np[i]) - 1
 
         num_tokens = [self.requests[r].num_tokens for r in self.input_batch.req_ids]
@@ -2464,6 +2475,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             install_aux_handoff_slots(self.model)
 
         self._make_weights_contiguous()
+        if envs.VLLM_RBLN_USE_NESTED_COMPILE_REGION:
+            mark_decoder_regions(self.model)
 
         # NOTE(RBLN): This wrapper is designed to be compiled by torch.compile.
         # It handles the forward pass of the underlying model and computes
@@ -3432,13 +3445,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             )
         self.kv_cache_names = get_kv_cache_names(kv_caches, num_attn_module)
         self.kv_caches = [kv_caches[name] for name in self.kv_cache_names]
+        # The runner owns the cache storage until sizing finishes. Rebuild keys
+        # on allocation so addresses are never matched across cache generations.
         self.kv_cache_allocations = {}
-        seen_allocations = set()
         for name, cache in zip(self.kv_cache_names, self.kv_caches):
             key = kv_cache_tensor_key(cache)
-            if key not in seen_allocations:
-                self.kv_cache_allocations[name] = weakref.ref(cache)
-                seen_allocations.add(key)
+            self.kv_cache_allocations.setdefault(key, name)
         self.kv_cache_block_axes = block_axes
         forward_context = self.compilation_config.static_forward_context
         for layer_name, kv_cache in kv_caches.items():

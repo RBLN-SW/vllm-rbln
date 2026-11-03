@@ -23,7 +23,6 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any
-from weakref import ReferenceType
 
 import torch
 import torch.rbln  # noqa: F401  # a hard dependency; see pyproject.
@@ -52,7 +51,7 @@ from vllm_rbln.v1.worker.kv_placement import (
     format_placements,
     kv_growth,
     max_num_blocks,
-    select_kv_input_groups,
+    select_kv_inputs,
     snapshot_from_allocator,
     snapshot_from_driver,
 )
@@ -207,7 +206,7 @@ class DynamicKvSizer:
         # The count vLLM sized, held while the cache is shrunk for the compile.
         self.kv_blocks_before_shrink: int | None = None
         self.programs: list[Any] = []
-        self.program_inputs: dict[int, tuple[ReferenceType[torch.Tensor], ...]] = {}
+        self.program_inputs: dict[int, tuple[tuple, ...]] = {}
         self.expected_used: dict[Unit, int] = {}
         # Other tenants' card DRAM at init; the allocator-snapshot fallback only.
         self.foreign_dram_used_bytes = foreign_dram_used_bytes
@@ -485,11 +484,14 @@ class DynamicKvSizer:
         """The KV growth the captured programs' placements imply, the hint they
         were traced with, and the device they run on."""
         programs = list(self.programs)
-        groups = select_kv_input_groups(
+        selected = select_kv_inputs(
             programs, self.model_runner.kv_cache_allocations, self.program_inputs
         )
         hint_blocks = self.model_runner.kv_cache_config.num_blocks
-        for group_specs, group_program in groups:
+        groups: dict[int, tuple[list[Any], Any]] = {}
+        for spec, program in selected:
+            groups.setdefault(id(program), ([], program))[0].append(spec)
+        for group_specs, group_program in groups.values():
             logger.info(
                 "[Dynamic KV] KV placement from %s (%d program(s) captured, %d KV "
                 "input set(s), %d dynamic input(s) in this set, hint=%d blocks): %s",
@@ -503,7 +505,7 @@ class DynamicKvSizer:
         cfg = self.model_runner.kv_cache_config
         tensors = cfg.kv_cache_tensors
         num_caches = len(self.model_runner.kv_cache_allocations)
-        specs = [spec for group_specs, _ in groups for spec in group_specs]
+        specs = [spec for spec, _ in selected]
         logger.info(
             "[Dynamic KV] the slope is summed over %d KV input(s) from %d set(s); "
             "vllm allocated %d KV cache tensor(s) over %d cache(s).",
@@ -513,7 +515,7 @@ class DynamicKvSizer:
             num_caches,
         )
         growth = kv_growth(specs, hint_blocks)
-        program = groups[0][1]
+        program = selected[0][1]
         device = program.device if program.device is not None else self.device
         return growth, hint_blocks, device
 
@@ -732,6 +734,7 @@ class DynamicKvSizer:
         mr.kv_cache_names = []
         mr.kv_cache_block_axes = {}
         mr.kv_cache_allocations = {}
+        self.program_inputs = {}
 
         # Each layer's view is parked on its Attention module; the next bind
         # overwrites it only after the new tensors exist.

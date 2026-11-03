@@ -19,12 +19,12 @@ form rebel emits: ints for static dims, `("symbol", name)` for the dynamic one.
 the dynamic dim's compile-time extent.
 """
 
-import weakref
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from vllm_rbln.v1.attention.kv_cache_bindings import kv_cache_tensor_key
 from vllm_rbln.v1.worker.kv_placement import (
     ChipletMemory,
     allocator_reserved,
@@ -34,7 +34,7 @@ from vllm_rbln.v1.worker.kv_placement import (
     kv_growth,
     max_num_blocks,
     placement_itemsize,
-    select_kv_input_groups,
+    select_kv_inputs,
     snapshot_from_allocator,
     snapshot_from_driver,
 )
@@ -221,48 +221,53 @@ class TestGrowth:
 
 
 def _inventory(*caches):
-    return {f"cache.{i}": weakref.ref(t) for i, t in enumerate(caches)}
+    return {kv_cache_tensor_key(t): f"cache.{i}" for i, t in enumerate(caches)}
 
 
 def _select(programs, allocations):
     bindings = {
-        id(p.runtime): tuple(weakref.ref(t) for t in p.bindings) for p in programs
+        id(p.runtime): tuple(kv_cache_tensor_key(t) for t in p.bindings)
+        for p in programs
     }
-    return select_kv_input_groups(programs, allocations, bindings)
+    return select_kv_inputs(programs, allocations, bindings)
 
 
-class TestSelectKvInputGroups:
+class TestSelectKvInputs:
     def test_static_programs_are_skipped(self):
         cache = torch.empty(8)
         decode = _program([HEAD_SHARDED], bindings=[cache])
-        [(specs, program)] = _select([_program([]), decode], _inventory(cache))
+        [(spec, program)] = _select([_program([]), decode], _inventory(cache))
         assert program is decode
-        assert [s.physical_placement for s in specs] == [HEAD_SHARDED]
+        assert spec.physical_placement is HEAD_SHARDED
 
     def test_overlapping_graphs_and_equal_shaped_independent_caches(self):
         state, conv, draft, drafter = [torch.empty(8) for _ in range(4)]
         prefill = _program([HEAD_SHARDED] * 2, bindings=[state, conv])
         verify = _program([HEAD_SHARDED] * 3, bindings=[draft, conv, state], statics=3)
         proposal = _program([HEAD_SHARDED], bindings=[drafter], name="1/0")
-        groups = _select(
+        selected = _select(
             [prefill, verify, proposal, prefill],
             _inventory(state, conv, draft, drafter),
         )
-        assert [len(specs) for specs, _ in groups] == [2, 1, 1]
-        assert [p for _, p in groups] == [prefill, verify, proposal]
+        assert selected == [
+            (prefill.input_specs[1], prefill),
+            (prefill.input_specs[2], prefill),
+            (verify.input_specs[3], verify),
+            (proposal.input_specs[1], proposal),
+        ]
 
     def test_dtype_views_alias_but_disjoint_storage_windows_do_not(self):
         storage = torch.empty(16)
         a, b = storage[:8], storage[8:]
         byte_view = a.view(torch.uint8)
-        groups = _select(
+        selected = _select(
             [
                 _program([HEAD_SHARDED], bindings=[a]),
                 _program([HEAD_SHARDED] * 2, bindings=[byte_view, b]),
             ],
             _inventory(a, b),
         )
-        assert [len(specs) for specs, _ in groups] == [1, 1]
+        assert [spec.physical_placement for spec, _ in selected] == [HEAD_SHARDED] * 2
 
     def test_shard_order_and_symbol_names_do_not_matter(self):
         cache = torch.empty(8)
@@ -273,14 +278,14 @@ class TestSelectKvInputGroups:
                 for s in reversed(HEAD_SHARDED.shards)
             ],
         )
-        groups = _select(
+        selected = _select(
             [
                 _program([HEAD_SHARDED], bindings=[cache]),
                 _program([renamed], bindings=[cache]),
             ],
             _inventory(cache),
         )
-        assert len(groups) == 1
+        assert len(selected) == 1
 
     def test_one_allocation_with_conflicting_placements_is_refused(self):
         cache = torch.empty(8)
@@ -295,14 +300,14 @@ class TestSelectKvInputGroups:
 
     def test_independent_equal_shapes_may_have_different_placements(self):
         a, b = torch.empty(8), torch.empty(8)
-        groups = _select(
+        selected = _select(
             [
                 _program([HEAD_SHARDED], bindings=[a]),
                 _program([REPLICATED], bindings=[b]),
             ],
             _inventory(a, b),
         )
-        assert len(groups) == 2
+        assert len(selected) == 2
 
     def test_unobserved_allocation_is_not_silently_dropped(self):
         a, b = torch.empty(8), torch.empty(8)
@@ -314,20 +319,19 @@ class TestSelectKvInputGroups:
         with pytest.raises(RuntimeError, match="not an initialized"):
             _select([_program([HEAD_SHARDED], bindings=[unknown])], _inventory(a))
 
-    def test_released_binding_is_refused(self):
+    def test_unrecorded_graph_is_refused_even_if_all_allocations_are_covered(self):
         cache = torch.empty(8)
-        program = _program([HEAD_SHARDED], bindings=[cache], statics=0)
-        released = weakref.ref(torch.empty(8))
-        with pytest.raises(RuntimeError, match="no live binding"):
-            select_kv_input_groups(
-                [program], _inventory(cache), {id(program.runtime): (released,)}
-            )
+        prefill = _program([HEAD_SHARDED], bindings=[cache], statics=0)
+        verify = _program([REPLICATED], bindings=[cache], statics=0)
+        bindings = {id(prefill.runtime): (kv_cache_tensor_key(cache),)}
+        with pytest.raises(RuntimeError, match="no captured input bindings"):
+            select_kv_inputs([prefill, verify], _inventory(cache), bindings)
 
     def test_missing_captured_bindings_is_refused(self):
         cache = torch.empty(8)
         program = _program([HEAD_SHARDED], bindings=[cache])
         with pytest.raises(RuntimeError, match="no captured input bindings"):
-            select_kv_input_groups([program], _inventory(cache), {})
+            select_kv_inputs([program], _inventory(cache), {})
 
     def test_no_dynamic_input_anywhere_names_the_cache_root(self):
         with pytest.raises(RuntimeError, match="VLLM_CACHE_ROOT"):
