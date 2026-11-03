@@ -289,15 +289,7 @@ def test_structured_output_mask_with_top_p_min_p():
     assert_samples_match(samples=samples, probs=expected)
 
 
-@pytest.mark.parametrize(
-    "dtype",
-    [
-        torch.bfloat16,
-        # torch.float16,
-        torch.float32,
-    ],
-    ids=str,
-)
+@pytest.mark.parametrize("dtype", DTYPES, ids=str)
 @pytest.mark.use_device
 def test_mixed_batch_keeps_each_row_to_its_own_params(dtype):
     """One op call serves the mixed batch, greedy rows as top_k=1. Each row must
