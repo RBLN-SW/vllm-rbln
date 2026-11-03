@@ -78,9 +78,9 @@ def patched_rope_forward_oot(
     self: RotaryEmbedding,
     positions: torch.Tensor,
     query: torch.Tensor,
-    key: torch.Tensor,
+    key: torch.Tensor | None,
     offsets: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     """
     Args:
         positions: [batch_size, seq_len]
@@ -122,6 +122,10 @@ def patched_rope_forward_oot(
     else:
         query_pass = query[..., self.rotary_dim :]
         query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
+
+    # A KV-shared layer (Gemma4 MTP) rotates its query alone.
+    if key is None:
+        return query, None
 
     key_shape = key.shape
     key = key.view(batch_size, seq_len, -1, self.head_size)
