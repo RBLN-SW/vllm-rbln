@@ -691,10 +691,9 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                 v_quantize_scale = layer._v_scale
                 cache_dtype = _fp8_cache_dtype(self.kv_cache_dtype)
                 if attn_metadata.is_prefill:
-                    # TODO(rebel-compiler): an mm prefix range attends both ways
-                    # on full layers too. Pass is_causal=False and the range's
-                    # mask once this op takes attn_mask; until then an mm prefix
-                    # step runs full layers causally.
+                    # Full layers stay causal in an mm prefix step too: HF and
+                    # upstream Gemma4 apply the bidirectional range only on
+                    # sliding layers.
                     attn_output = flash_causal_attention_naive_prefill(
                         query,
                         key,
