@@ -136,7 +136,8 @@ def _validate(vllm_config: "VllmConfig") -> None:
         )
     # TODO(RBLN): DP ranks agree on max_num_batched_tokens as the prefill token
     # dimension (dp_utils), and spec decode, sub-block caching and the RBLN NIXL
-    # connector's resume trim take it as the prefill chunk.
+    # connector's resume trim take it as the prefill chunk. Lifting a refusal
+    # means pointing that feature's sites at prefill_chunk_size; #1372 lists them.
     if chunk is not None and chunk < max_num_batched_tokens:
         kv_transfer = vllm_config.kv_transfer_config
         connectors = [] if kv_transfer is None else [kv_transfer.kv_connector]
