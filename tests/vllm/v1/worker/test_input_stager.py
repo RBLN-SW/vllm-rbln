@@ -315,26 +315,31 @@ class TestHiddenStates:
 
 @pytest.mark.maybe_use_device
 class TestMultimodalEmbeddings:
-    def test_writes_only_the_image_runs_and_pads_the_mask_as_text(self):
+    @pytest.mark.parametrize("split_first", [False, True])
+    def test_scatters_embeddings_across_text_holes_and_padded_requests(
+        self, split_first
+    ):
         stager = _stager()
         first = torch.arange(8, dtype=torch.bfloat16).reshape(2, 4) + 1
         second = torch.full((1, 4), 7.0, dtype=torch.bfloat16)
-        mask = torch.tensor([[[0], [1], [1]], [[1], [0], [0]]], dtype=torch.bfloat16)
+        mask = torch.tensor([[[1], [0], [1]], [[1], [0], [0]]], dtype=torch.bfloat16)
+        sources = [first[:1], first[1:], second] if split_first else [first, second]
         staged, staged_mask = stager.stage_mm_embeds(
-            [(0, 1, first), (1, 0, second)], mask, 4, _layout()
+            [rows.to(stager.device) for rows in sources], mask, 4, _layout()
         )
         expected = torch.zeros(4, 8, 4, dtype=torch.bfloat16)
-        expected[0, 1:3] = first
+        expected[0, 0] = first[0]
+        expected[0, 2] = first[1]
         expected[1, 0] = second
         expected_mask = torch.zeros(4, 8, 1, dtype=torch.bfloat16)
         expected_mask[:2, :3] = mask
         torch.testing.assert_close(staged.cpu(), expected)
         torch.testing.assert_close(staged_mask.cpu(), expected_mask)
 
-        # A later step rewrites only its own runs; the mask hides the rest.
+        # A later step rewrites only its own positions; the mask hides the rest.
         third = torch.full((1, 4), 9.0, dtype=torch.bfloat16)
         next_embeds, next_mask = stager.stage_mm_embeds(
-            [(0, 0, third)],
+            [third.to(stager.device)],
             torch.tensor([[[1], [0]]], dtype=torch.bfloat16),
             4,
             _layout(num_reqs=1, query_len=2),
@@ -346,6 +351,16 @@ class TestMultimodalEmbeddings:
         expected_mask.zero_()
         expected_mask[0, 0] = 1
         torch.testing.assert_close(next_mask.cpu(), expected_mask)
+
+        empty_embeds, empty_mask = stager.stage_mm_embeds(
+            [],
+            torch.zeros(1, 2, 1, dtype=torch.bfloat16),
+            4,
+            _layout(num_reqs=1, query_len=2),
+        )
+        assert empty_embeds is staged
+        torch.testing.assert_close(empty_embeds.cpu(), expected)
+        torch.testing.assert_close(empty_mask.cpu(), torch.zeros_like(expected_mask))
 
 
 @pytest.mark.maybe_use_device

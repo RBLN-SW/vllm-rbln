@@ -208,12 +208,15 @@ class TestGatherMultimodalEmbeddings:
         runner._update_states(step)
         hidden = runner.model_config.get_hidden_size()
         runner.encoder_cache["image-hash"] = (
-            torch.tensor([11.0, 22.0, 33.0]).unsqueeze(1).expand(-1, hidden)
+            torch.tensor([11.0, 22.0, 33.0])
+            .unsqueeze(1)
+            .expand(-1, hidden)
+            .to(runner.device)
         )
 
-        mm_rows, mask = runner._gather_mm_embeddings(step, num_tokens=6)
+        mm_embeds, mask = runner._gather_mm_embeddings(step, num_tokens=6)
         embeds, _ = runner.input_stager.stage_mm_embeds(
-            mm_rows,
+            mm_embeds,
             mask.view(2, 3, 1),
             hidden,
             InputLayout(num_reqs=2, num_reqs_padded=2, query_len=3, query_len_padded=3),

@@ -1431,12 +1431,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 scheduler_output, encoder_cache=self.encoder_cache
             ) as ec_connector_output:
                 self._execute_mm_encoder(scheduler_output)
-                mm_rows, mm_mask = self._gather_mm_embeddings(
+                self._execute_mm_encoder(scheduler_output)
+                mm_embeds, mm_mask = self._gather_mm_embeddings(
                     scheduler_output, num_input_tokens
                 )
             model_kwargs["mm_embeds"], model_kwargs["mm_mask"] = (
                 self.input_stager.stage_mm_embeds(
-                    mm_rows,
+                    mm_embeds,
                     mm_mask.view(num_reqs, -1, 1),
                     self.model_config.get_hidden_size(),
                     layout,
@@ -1524,12 +1525,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         self,
         scheduler_output: RBLNSchedulerOutput,
         num_tokens: int,
-    ) -> tuple[list[tuple[int, int, torch.Tensor]], torch.Tensor]:
-        mm_rows: list[tuple[int, int, torch.Tensor]] = []
+    ) -> tuple[list[torch.Tensor], torch.Tensor]:
+        mm_embeds: list[torch.Tensor] = []
         is_mm = torch.zeros(num_tokens, dtype=torch.bool)
 
         req_start_idx = 0
-        for req_index, req_id in enumerate(self.input_batch.req_ids):
+        for req_id in self.input_batch.req_ids:
             num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
             req_state = self.requests[req_id]
             num_computed_tokens = req_state.num_computed_tokens
@@ -1568,24 +1569,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 if pos_info.is_embed is None:
                     assert embeds.shape[0] == end_idx - start_idx
                     is_mm[dst] = True
-                    mm_rows.append((req_index, first_token, embeds))
-                    continue
-
-                rows = pos_info.is_embed[start_idx:end_idx]
-                is_mm[dst] |= rows
-                edges = torch.nn.functional.pad(rows.to(torch.int8), (1, 1)).diff()
-                run_starts = (edges == 1).nonzero().flatten().tolist()
-                run_ends = (edges == -1).nonzero().flatten().tolist()
-                taken = 0
-                for run_start, run_end in zip(run_starts, run_ends):
-                    run_rows = embeds[taken : taken + run_end - run_start]
-                    mm_rows.append((req_index, first_token + run_start, run_rows))
-                    taken += run_end - run_start
-                assert taken == embeds.shape[0]
+                else:
+                    is_mm[dst] |= pos_info.is_embed[start_idx:end_idx]
+                mm_embeds.append(embeds)
 
             req_start_idx += num_scheduled_tokens
 
-        return mm_rows, is_mm.to(self.dtype).unsqueeze(-1)
+        return mm_embeds, is_mm.to(self.dtype).unsqueeze(-1)
 
     def _warmup_mm_encoder(self) -> None:
         """Materialize every encoder bucket before serving and sizing KV caches."""
