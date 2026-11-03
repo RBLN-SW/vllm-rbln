@@ -49,7 +49,7 @@ from tests.vllm.v1.worker.utils import (
     schedule_new,
 )
 from vllm_rbln.config import RBLNConfig
-from vllm_rbln.v1.core.rbln_kv_cache_manager import KVCacheCopyOp
+from vllm_rbln.v1.core.kv_cache_copy import KVCacheCopyOp
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.utils import eagle_prepare_inputs_padded
 from vllm_rbln.v1.worker.bucketing.exponential_bucketing_manager import (

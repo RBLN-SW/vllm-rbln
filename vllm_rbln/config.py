@@ -101,6 +101,10 @@ class RBLNConfig(RBLNConfigBase):
     enable_sub_block_cache: bool = True
     """Enable sub-block prefix caching, at `sub_block_size` granularity."""
 
+    kernel_block_size: int | None = Field(default=None, gt=0)
+    """Kernel block size under VLLM_RBLN_PAGE_LAYOUT, which makes `--block-size`
+    the page. A multiple of the page; unset leaves page layout off."""
+
     specialize_moe_decode: bool = True
     """Specialize the case where every instance is at the decode stage."""
 

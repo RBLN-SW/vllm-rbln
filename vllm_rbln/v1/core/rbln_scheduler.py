@@ -37,12 +37,21 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.utils import record_function_or_nullcontext
 
+import vllm_rbln.envs as envs
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.core.kv_cache_copy import CopyOpMixin, KVCacheCopyOp
+from vllm_rbln.v1.core.page_layout import (
+    kernel_block_size_from_config,
+    resolve_config,
+    validate_fragmentation,
+)
 from vllm_rbln.v1.core.rbln_kv_cache_manager import (
-    KVCacheCopyOp,
     RBLNKVCacheManager,
     SubBlockMatch,
+)
+from vllm_rbln.v1.core.rbln_page_layout_kv_cache_manager import (
+    RBLNPageLayoutKVCacheManager,
 )
 from vllm_rbln.v1.core.utils import (
     DecodeBatchBudget,
@@ -57,10 +66,33 @@ logger = init_logger(__name__)
 
 @dataclass
 class RBLNSchedulerOutput(SchedulerOutput):
-    """SchedulerOutput extended with KV cache copy operations for sub-block
-    prefix caching."""
+    """SchedulerOutput extended with KV cache copies for the worker to perform
+    before the forward pass.
+    """
 
     kv_cache_copy_ops: list[KVCacheCopyOp] = field(default_factory=list)
+
+
+class _KernelBlockView:
+    """A `KVCacheBlocks` that reports kernel-block ids, delegating the rest.
+
+    Wrapping rather than rebuilding: `KVCacheBlocks` carries real block objects
+    that the allocator owns, and a connector may reach for anything on it. Only
+    the id view differs under page layout, so only that is replaced -- anything
+    else a connector touches still goes to the object the manager handed us.
+    """
+
+    __slots__ = ("_blocks", "_kernel_block_ids")
+
+    def __init__(self, blocks, kernel_block_ids):
+        object.__setattr__(self, "_blocks", blocks)
+        object.__setattr__(self, "_kernel_block_ids", kernel_block_ids)
+
+    def get_block_ids(self, *args, **kwargs):
+        return self._kernel_block_ids
+
+    def __getattr__(self, name):
+        return getattr(self._blocks, name)
 
 
 class RBLNScheduler(Scheduler):
@@ -75,14 +107,19 @@ class RBLNScheduler(Scheduler):
 
         # Replace the upstream KVCacheManager with RBLNKVCacheManager
         # when sub-block prefix caching is enabled.
-        sub_block_size = sub_block_size_in_use(
-            enable_prefix_caching=self.cache_config.enable_prefix_caching,
-            sub_block_cache=rbln_config.enable_sub_block_cache,
-            block_size=self.block_size,
-            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
-            kv_cache_config=self.kv_cache_config,
-            sub_block_size=rbln_config.sub_block_size,
-        )
+        # Page layout supersedes the overlay: upstream gives the same
+        # fine-grained hits directly once the page is --block-size.
+        if self._maybe_install_page_layout_manager():
+            sub_block_size = None
+        else:
+            sub_block_size = sub_block_size_in_use(
+                enable_prefix_caching=self.cache_config.enable_prefix_caching,
+                sub_block_cache=rbln_config.enable_sub_block_cache,
+                block_size=self.block_size,
+                max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+                kv_cache_config=self.kv_cache_config,
+                sub_block_size=rbln_config.sub_block_size,
+            )
         if sub_block_size is not None:
             hash_fn = get_hash_fn_by_name(self.cache_config.prefix_caching_hash_algo)
             init_none_hash(hash_fn)
@@ -124,11 +161,70 @@ class RBLNScheduler(Scheduler):
         # a full block table.
         self._pending_runner_block_deltas: dict[str, KVCacheBlocks] = {}
 
+        # KernelBlocks the worker already holds. Not derivable from the page delta:
+        # the list grows once per `pages_per_kernel_block` pages.
+        self._sent_kernel_block_counts: dict[str, int] = {}
+
         # NOTE(RBLN): PP degree for the per-step decode-admission budget
         # (DecodeBatchBudget.for_step): hard cap = max_num_seqs // pp, soft cap =
         # ceil(demand / pp) to spread decodes across microbatches. pp == 1 makes
         # the soft cap a no-op. See v1/core/utils.py.
         self._pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
+
+    def _maybe_install_page_layout_manager(self) -> bool:
+        """Swap in the page/kernel block manager; everything is derivable."""
+        if not envs.VLLM_RBLN_PAGE_LAYOUT:
+            return False
+        if not self.cache_config.enable_prefix_caching:
+            return False
+
+        kernel_block_size = kernel_block_size_from_config(self.vllm_config)
+        page_layout_config = resolve_config(
+            page_size=self.block_size,
+            kernel_block_size=kernel_block_size,
+            num_pages=self.kv_cache_config.num_blocks,
+        )
+        if not RBLNPageLayoutKVCacheManager.can_use_page_layout(
+            self.kv_cache_config, page_layout_config
+        ):
+            logger.warning(
+                "VLLM_RBLN_PAGE_LAYOUT is set but this configuration cannot "
+                "use it (kernel_block_size=%s, page_size=%d, kv_cache_groups=%d); "
+                "falling back.",
+                kernel_block_size,
+                self.block_size,
+                len(self.kv_cache_config.kv_cache_groups),
+            )
+            return False
+
+        page_layout_config.geometry.validate_chunk(
+            self.scheduler_config.max_num_batched_tokens
+        )
+        validate_fragmentation(
+            page_layout_config.geometry,
+            self.scheduler_config.max_num_seqs,
+            page_layout_config.num_kernel_blocks,
+            self.max_model_len,
+        )
+
+        hash_fn = get_hash_fn_by_name(self.cache_config.prefix_caching_hash_algo)
+        init_none_hash(hash_fn)
+        self.kv_cache_manager = RBLNPageLayoutKVCacheManager(
+            kv_cache_config=self.kv_cache_config,
+            page_layout_config=page_layout_config,
+            max_model_len=self.max_model_len,
+            scheduler_block_size=self.block_size,
+            hash_block_size=self.block_size,
+            enable_caching=True,
+            use_eagle=self.use_eagle,
+            log_stats=self.log_stats,
+            enable_kv_cache_events=self.enable_kv_cache_events,
+            dcp_world_size=self.dcp_world_size,
+            pcp_world_size=self.pcp_world_size,
+            metrics_collector=self.kv_metrics_collector,
+            watermark=self.scheduler_config.watermark,
+        )
+        return True
 
     def _decode_demand(self) -> int:
         """Total decode demand for this step's soft (ceil(demand/pp)) cap.
@@ -765,7 +861,7 @@ class RBLNScheduler(Scheduler):
                 if self.connector is not None:
                     self.connector.update_state_after_alloc(
                         request,
-                        self.kv_cache_manager.get_blocks(request_id),
+                        self._connector_blocks(request_id),
                         num_external_computed_tokens,
                     )
                     if (
@@ -1011,10 +1107,17 @@ class RBLNScheduler(Scheduler):
         # Source-block refs are kept alive until update_from_output(),
         # which runs after the model runner finishes (safe for async
         # scheduling / pipeline parallelism).
-        if isinstance(self.kv_cache_manager, RBLNKVCacheManager):
+        if isinstance(self.kv_cache_manager, CopyOpMixin):
             scheduler_output.kv_cache_copy_ops = (
                 self.kv_cache_manager.drain_pending_copy_ops()
             )
+
+        # Page ids -> the kernel blocks backing them, for the **worker's block
+        # table**. The worker addresses attention by kernel block, so this stays.
+        #
+        # It deliberately runs after `build_connector_meta` below: connectors
+        # keep pages. LMCache is handed kernel blocks by a different route
+        # (`_connector_blocks`), because it indexes the KV tensor directly.
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
@@ -1040,7 +1143,87 @@ class RBLNScheduler(Scheduler):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        self._rewrite_block_ids_to_kernel_blocks(scheduler_output)
         return scheduler_output
+
+    def _connector_blocks(self, request_id: str):
+        """The blocks a connector sees, in the unit it indexes KV with.
+
+        `update_state_after_alloc` is the last block-id path that does not run
+        through `scheduler_output`: upstream hands the connector
+        `kv_cache_manager.get_blocks()`, whose ids are *pages* under page layout.
+        Connectors read `get_block_ids()` off it and index device memory with the
+        result, so pages here mean a load lands on the wrong side of an 8x
+        stride.
+
+        Measured 2026-08-22 (MiniMax-M2.5 / R100 2P2D): with the other paths
+        already converted, LMCache's retrieve still scattered on pages --
+        "unflatten: Provided sizes [8, 4096] don't multiply up to the size of
+        dim 2 (4096)" from `scatter_chunk_to_blocks`, which takes its block
+        *size* off the KV tensor (kernel block) and its block *count* off these
+        ids (pages).
+
+        Only `get_block_ids()` is substituted. Connectors use it alone from this
+        object, and the list stays cumulative -- LMCache appends
+        `group_blocks[existing:]` across the two calls an async load makes, so a
+        non-cumulative view would corrupt its tracker.
+        """
+        blocks = self.kv_cache_manager.get_blocks(request_id)
+        if not isinstance(self.kv_cache_manager, RBLNPageLayoutKVCacheManager):
+            return blocks
+        kernel_blocks = (list(self.kv_cache_manager.block_table(request_id)),)
+        return _KernelBlockView(blocks, kernel_blocks)
+
+    def _rewrite_block_ids_to_kernel_blocks(
+        self, scheduler_output: RBLNSchedulerOutput
+    ) -> None:
+        """Swap page ids for the kernel blocks backing them, at the output boundary.
+
+        Keeps the translation out of ``schedule()``'s delta bookkeeping.
+        """
+        manager = self.kv_cache_manager
+        if not isinstance(manager, RBLNPageLayoutKVCacheManager):
+            return
+
+        for new_req in scheduler_output.scheduled_new_reqs:
+            kernel_blocks = manager.block_table(new_req.req_id)
+            new_req.block_ids = (list(kernel_blocks),)
+            self._sent_kernel_block_counts[new_req.req_id] = len(kernel_blocks)
+
+        cached = scheduler_output.scheduled_cached_reqs
+        for i, req_id in enumerate(cached.req_ids):
+            kernel_blocks = manager.block_table(req_id)
+            if req_id in cached.resumed_req_ids:
+                # resumed requests get the whole table, not a delta
+                cached.new_block_ids[i] = (list(kernel_blocks),)
+            else:
+                already_sent = self._sent_kernel_block_counts.get(req_id, 0)
+                delta = kernel_blocks[already_sent:]
+                cached.new_block_ids[i] = (list(delta),) if delta else None
+            self._sent_kernel_block_counts[req_id] = len(kernel_blocks)
+
+    def _inflight_prefill_reserved_blocks(self) -> int:
+        """What in-flight prefills have spoken for, rounded per request to groups.
+
+        Upstream sums the pages each one still needs, which under page layout
+        under-reserves exactly where it matters: four prefills a page short each
+        have to open a whole kernel block, and their sum -- four pages -- reads
+        as one. It also over-reserves the pages they can still take from their
+        own Open group. Both are per-request facts, so the rounding has to happen
+        before the sum, not after. Reported in pages, as whole groups, so it
+        passes through `allocate_slots`'s conversion untouched.
+        """
+        manager = self.kv_cache_manager
+        if not isinstance(manager, RBLNPageLayoutKVCacheManager):
+            return super()._inflight_prefill_reserved_blocks()
+
+        ppe = manager.geometry.pages_per_kernel_block
+        return ppe * sum(
+            manager.pool.kernel_blocks_needed(
+                self._request_remaining_blocks(request), owner=request.request_id
+            )
+            for request in self._inflight_prefills
+        )
 
     def _preempt_request(
         self, request: Request, timestamp: float, drop_stale_output: bool = False
@@ -1048,6 +1231,7 @@ class RBLNScheduler(Scheduler):
         # Preempted requests resume with full block tables, so pending deltas
         # from the previous running state are stale.
         self._pending_runner_block_deltas.pop(request.request_id, None)
+        self._sent_kernel_block_counts.pop(request.request_id, None)
         super()._preempt_request(request, timestamp, drop_stale_output)
 
     def _make_cached_request_data(
@@ -1100,6 +1284,7 @@ class RBLNScheduler(Scheduler):
         # Drop any pending runner block delta; the request is finishing and will
         # never be scheduled again.
         self._pending_runner_block_deltas.pop(request.request_id, None)
+        self._sent_kernel_block_counts.pop(request.request_id, None)
         return super()._free_request(request, delay_free_blocks)
 
     def update_from_output(
@@ -1114,12 +1299,13 @@ class RBLNScheduler(Scheduler):
             # Now that execute_model has written KV data and
             # super().update_from_output() has updated num_computed_tokens
             # (and freed finished requests), index sub-blocks for the
-            # remaining running requests and release copy-op source refs.
+            # remaining running requests.
             self.kv_cache_manager.do_pending_indexing()
-            if scheduler_output.kv_cache_copy_ops:
-                self.kv_cache_manager.release_copy_ops(
-                    scheduler_output.kv_cache_copy_ops
-                )
+
+        # Sources can be released now the worker has read them; running after
+        # super() keeps this safe under async scheduling / PP.
+        if isinstance(self.kv_cache_manager, CopyOpMixin):
+            self.kv_cache_manager.release_copy_ops(scheduler_output.kv_cache_copy_ops)
 
         return result
 

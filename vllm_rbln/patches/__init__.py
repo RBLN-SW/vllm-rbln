@@ -38,6 +38,7 @@ from . import (
     gpt_oss_mxfp4_config,
     kv_connector_factory,
     kv_connector_utils,
+    lmcache_mp_block_size,
     metrics,
     minimax_m2,
     minimax_m3,
