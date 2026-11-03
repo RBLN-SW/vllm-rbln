@@ -195,6 +195,11 @@ class InputStager:
 
         num_indices = token_indices.shape[0]
         assert num_indices <= layout.num_reqs_padded
+        if layout.query_len != layout.query_len_padded:
+            # Index the flattened staged rows rather than the unpadded ones.
+            row = token_indices // layout.query_len
+            col = token_indices % layout.query_len
+            token_indices = row * layout.query_len_padded + col
 
         key = (token_indices.dtype, layout.num_reqs_padded)
         if (buf := self._token_indices_buffers.get(key)) is None:

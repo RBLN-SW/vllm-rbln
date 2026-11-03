@@ -114,20 +114,82 @@ def _validate(vllm_config: "VllmConfig") -> None:
     block_size = vllm_config.cache_config.block_size
     max_num_batched_tokens = scheduler_config.max_num_batched_tokens
     max_block_size = 16384
+    max_prefill_batch = rbln_config.max_prefill_batch
 
-    if max_num_batched_tokens > max_block_size:
-        raise ValueError(
-            f"{max_num_batched_tokens=} exceeds the RBLN block size limit of "
-            f"{max_block_size}. Set --max-num-batched-tokens to at most "
-            f"{max_block_size}."
-        )
+    if max_prefill_batch == 1:
+        if max_num_batched_tokens > max_block_size:
+            raise ValueError(
+                f"{max_num_batched_tokens=} exceeds the RBLN block size limit of "
+                f"{max_block_size}. Set --max-num-batched-tokens to at most "
+                f"{max_block_size}."
+            )
 
-    if not max_num_batched_tokens <= block_size <= max_block_size:
-        raise ValueError(
-            "RBLN requires max_num_batched_tokens <= block_size <= max_block_size, "
-            f"got {max_num_batched_tokens=}, {block_size=}, {max_block_size=}. "
-            "Set --block-size within this range."
-        )
+        if not max_num_batched_tokens <= block_size <= max_block_size:
+            raise ValueError(
+                "RBLN requires max_num_batched_tokens <= block_size <= "
+                f"max_block_size, got {max_num_batched_tokens=}, {block_size=}, "
+                f"{max_block_size=}. Set --block-size within this range."
+            )
+    else:
+        if max_prefill_batch > scheduler_config.max_num_seqs:
+            raise ValueError(
+                f"--rbln-prefill-batch-buckets reaches {max_prefill_batch}, above "
+                f"max_num_seqs={scheduler_config.max_num_seqs}."
+            )
+        if max_num_batched_tokens % max_prefill_batch:
+            raise ValueError(
+                f"{max_num_batched_tokens=} must be divisible by the largest "
+                f"prefill batch bucket {max_prefill_batch}: each request in a "
+                "batched prefill gets an equal chunk."
+            )
+        chunk = rbln_config.prefill_chunk_size(max_num_batched_tokens)
+        # The compiled prefill store is wrong for a row that crosses into its
+        # next block once the batch is larger than one.
+        if block_size % chunk or block_size > max_block_size:
+            raise ValueError(
+                f"A batched prefill runs each request in a {chunk}-token chunk, "
+                f"which needs a block_size that is a multiple of {chunk} and at "
+                f"most {max_block_size}, got {block_size=}."
+            )
+        unsupported = [
+            name
+            for name, on in (
+                ("data parallelism", parallel_config.data_parallel_size > 1),
+                ("pipeline parallelism", parallel_config.pipeline_parallel_size > 1),
+                ("speculative decoding", vllm_config.speculative_config is not None),
+                ("a KV connector", vllm_config.kv_transfer_config is not None),
+                ("--rbln-use-custom-kernel", rbln_config.use_custom_kernel),
+                ("non-causal attention", vllm_config.attention_config.use_non_causal),
+                # The DSA ops are verified for a batched prefill, the dense MLA
+                # prefill op is not.
+                (
+                    "MLA without DSA",
+                    model_config.use_mla and not hasattr(text_config, "index_topk"),
+                ),
+                (
+                    "an fp8 KV cache",
+                    vllm_config.cache_config.cache_dtype.startswith("fp8"),
+                ),
+                (
+                    "sparse attention",
+                    bool(getattr(text_config, "sparse_attention_config", None)),
+                ),
+                ("hybrid models", model_config.is_hybrid),
+                ("multimodal models", model_config.is_multimodal_model),
+                ("pooling models", model_config.runner_type == "pooling"),
+                (
+                    "sub-block prefix caching",
+                    vllm_config.cache_config.enable_prefix_caching
+                    and rbln_config.enable_sub_block_cache,
+                ),
+            )
+            if on
+        ]
+        if unsupported:
+            raise ValueError(
+                "--rbln-prefill-batch-buckets above 1 is not supported with "
+                f"{', '.join(unsupported)} on RBLN yet."
+            )
 
     if envs.VLLM_RBLN_COMPILE_ONLY and envs.VLLM_DISABLE_COMPILE_CACHE:
         # Compile-only compiles each graph and writes the .rbln artifact to

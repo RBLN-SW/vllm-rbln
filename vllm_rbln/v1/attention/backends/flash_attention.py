@@ -205,7 +205,9 @@ class RBLNFlashAttentionMetadataBuilder(
         self.use_custom_kernel = rbln_config.use_custom_kernel
 
         self.block_size = kv_cache_spec.block_size
-        self.chunked_prefill_size = self.scheduler_config.max_num_batched_tokens
+        self.chunked_prefill_size = rbln_config.prefill_chunk_size(
+            self.scheduler_config.max_num_batched_tokens
+        )
         self.enforce_eager = get_current_vllm_config().model_config.enforce_eager
         # Causality is per model, not per process: each model builds its
         # attention under its own config, and upstream sets `use_non_causal` on
@@ -221,6 +223,14 @@ class RBLNFlashAttentionMetadataBuilder(
                 "Sliding window attention on REBEL CR13 is not supported with "
                 "--rbln-use-custom-kernel: rbln_triton_ops has no "
                 "sliding_window_attention_v1 kernel."
+            )
+        if (
+            isinstance(kv_cache_spec, SlidingWindowSpec)
+            and rbln_config.max_prefill_batch > 1
+        ):
+            raise NotImplementedError(
+                "Sliding window attention is not supported with "
+                "--rbln-prefill-batch-buckets above 1 on RBLN yet."
             )
 
         self._staged: dict[tuple, torch.Tensor] = {}
@@ -277,7 +287,16 @@ class RBLNFlashAttentionMetadataBuilder(
         # Masks are host-built at `max_model_len` width and staged every step,
         # so a caller that replaces them opts out with `skip_attn_masks`.
         attn_masks = None
-        if is_prefill:
+        if is_prefill and batch_pad > 1:
+            # NOTE(RBLN): the compiled prefill store loses a batched row whose
+            # chunk crosses into its next block.
+            row_ends = seq_idx % self.block_size + self.chunked_prefill_size
+            assert bool((row_ends <= self.block_size).all()), (
+                f"a batched prefill row crosses a block: {seq_idx.flatten().tolist()}"
+            )
+            seq_idx = rbln_utils.pad(seq_idx, 0, batch_pad)
+            block_tables_tensor = rbln_utils.pad(block_tables_tensor, 0, batch_pad)
+        elif is_prefill:
             # NOTE(RBLN): block_tables_tensor for prefill must be a 1D tensor.
             block_tables_tensor = block_tables_tensor[0]
             # NOTE(RBLN): entries beyond num_blocks_per_row must stay 0 -- the

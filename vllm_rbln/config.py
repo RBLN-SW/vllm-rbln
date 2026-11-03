@@ -128,6 +128,11 @@ class RBLNConfig(RBLNConfigBase):
     decode_batch_bucket_manual_buckets: list[int] = field(default_factory=list)
     """Explicit decode batch sizes, used when the strategy is `manual`."""
 
+    prefill_batch_buckets: list[int] | None = None
+    """Prefill batch sizes to compile. A step prefills up to the largest of
+    them, each request in a chunk of `max_num_batched_tokens` divided by that
+    size. If None, one request per prefill step."""
+
     use_w8a8: bool = False
     """Opt in to W8A8. W8A16 runs on every RBLN NPU, W8A8 only on the ones
     whose kernels take an fp8 activation."""
@@ -168,6 +173,20 @@ class RBLNConfig(RBLNConfigBase):
                 "decode_batch_bucket_strategy='manual' needs at least one entry "
                 "in decode_batch_bucket_manual_buckets"
             )
+        prefill_buckets = self.prefill_batch_buckets
+        if prefill_buckets is not None:
+            if not prefill_buckets or any(b <= 0 for b in prefill_buckets):
+                raise ValueError("prefill_batch_buckets must be non-empty and > 0")
+            if len(prefill_buckets) != len(set(prefill_buckets)):
+                raise ValueError("prefill_batch_buckets must be unique")
+
+    @property
+    def max_prefill_batch(self) -> int:
+        return max(self.prefill_batch_buckets or [1])
+
+    def prefill_chunk_size(self, max_num_batched_tokens: int) -> int:
+        """Length of each request's row in the prefill graph."""
+        return max_num_batched_tokens // self.max_prefill_batch
 
 
 @vllm_config_dataclass

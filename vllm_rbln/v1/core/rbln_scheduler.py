@@ -130,6 +130,11 @@ class RBLNScheduler(Scheduler):
         # the soft cap a no-op. See v1/core/utils.py.
         self._pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
 
+        self._max_prefill_batch = rbln_config.max_prefill_batch
+        self._prefill_chunk_size = rbln_config.prefill_chunk_size(
+            self.scheduler_config.max_num_batched_tokens
+        )
+
     def _decode_demand(self) -> int:
         """Total decode demand for this step's soft (ceil(demand/pp)) cap.
 
@@ -198,11 +203,11 @@ class RBLNScheduler(Scheduler):
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         # NOTE(RBLN): The runner reads this step's phase off this dict
         # (step_is_prefill), which holds because a step is never mixed -- all
-        # decodes, or a lone prefill. Four guards keep it that way:
-        #   (A) the running loop schedules a trailing prefill alone;
-        #   (B) that prefill then skips the waiting loop;
-        #   (C) a waiting prefill defers once anything else is admitted;
-        #   (D) an admitted waiting prefill evicts the decode batch.
+        # decodes, or up to max_prefill_batch prefills. Four guards keep it so:
+        #   (A) the running loop schedules only prefills while any is running;
+        #   (B) the waiting loop is skipped once the prefill batch is full;
+        #   (C) a waiting request defers if it would mix with what is admitted;
+        #   (D) the first admitted waiting prefill evicts the decode batch.
         # Relaxing any of (A)-(D), or clamping a prefill chunk to a single token,
         # breaks that read; see the step-phase section in v1/core/utils.py for
         # what it would cost.
@@ -238,18 +243,19 @@ class RBLNScheduler(Scheduler):
         )
 
         # First, schedule the RUNNING requests.
-        # NOTE(RBLN): Prioritize prefill requests. Given our constraint that the prefill
-        # batch size fixed to 1 if any prefill request is running there must be exactly
-        # one at the end of the list.
+        # NOTE(RBLN): Prioritize prefill requests: while any running request is
+        # prefilling, schedule only the prefills, wherever they sit in the list.
+        # Admission keeps them within max_prefill_batch.
         # Guard (A) of the no-mixed-batching invariant; see the step-phase
         # section in v1/core/utils.py.
-        req_index = (
-            len(self.running) - 1
-            if self.running and is_prefill(self.running[-1])
-            else 0
-        )
+        prefills_only = any(is_prefill(r) for r in self.running)
+        req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+
+            if prefills_only and not is_prefill(request):
+                req_index += 1
+                continue
 
             if (
                 request.num_output_placeholders > 0
@@ -285,7 +291,7 @@ class RBLNScheduler(Scheduler):
                 continue
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
-            num_new_tokens = min(num_new_tokens, token_budget)
+            num_new_tokens = min(num_new_tokens, self._prefill_chunk_size, token_budget)
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
@@ -440,7 +446,8 @@ class RBLNScheduler(Scheduler):
             # NOTE(RBLN): hold the running decode batch within the shared budget
             # -- the compiled ceiling (max_num_seqs // pp) and the ceil(demand/pp)
             # spreading cap -- to keep the PP stages balanced (avoid bubbles).
-            if not decode_budget.can_admit():
+            # A prefill step is bounded by max_prefill_batch instead.
+            if not prefills_only and not decode_budget.can_admit():
                 break
 
         # Record the LoRAs in scheduled_running_reqs
@@ -454,14 +461,15 @@ class RBLNScheduler(Scheduler):
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
         # Next, schedule the WAITING requests.
-        # NOTE(RBLN): We do not attempt to schedule a new prefill request when a running
-        # prefill request is already scheduled.
+        # NOTE(RBLN): We do not attempt to schedule a new prefill request when the
+        # running prefills already fill the prefill batch.
         # Guard (B) of the no-mixed-batching invariant; see the step-phase
         # section in v1/core/utils.py.
+        num_prefills = len(scheduled_running_reqs) if prefills_only else 0
         if (
             not preempted_reqs
             and self._pause_state == PauseState.UNPAUSED
-            and not (scheduled_running_reqs and is_prefill(scheduled_running_reqs[0]))
+            and num_prefills < self._max_prefill_batch
         ):
             # NOTE(RBLN): refresh the token budget to determine whether we can schedule
             # new prefill requests into the running batch.
@@ -632,6 +640,7 @@ class RBLNScheduler(Scheduler):
                     threshold = self.scheduler_config.long_prefill_token_threshold
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
+                    num_new_tokens = min(num_new_tokens, self._prefill_chunk_size)
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
@@ -643,22 +652,34 @@ class RBLNScheduler(Scheduler):
                         # we can stop the scheduling here.
                         break
 
-                    # NOTE(RBLN): Use prefill_token_budget instead of
-                    # token_budget. Running decode requests may have already
-                    # consumed part of token_budget, but they will be kicked
-                    # out when this new prefill is scheduled (see the
+                    # NOTE(RBLN): The first prefill uses prefill_token_budget
+                    # instead of token_budget. Running decode requests may have
+                    # already consumed part of token_budget, but they will be
+                    # kicked out when this new prefill is scheduled (see the
                     # "disable mixed batching" block below), restoring the
                     # full budget. Using token_budget here would clip the
                     # first prefill chunk short (e.g. 127 instead of 128).
-                    num_new_tokens = min(num_new_tokens, prefill_token_budget)
+                    num_new_tokens = min(
+                        num_new_tokens,
+                        token_budget if num_prefills else prefill_token_budget,
+                    )
                     assert num_new_tokens > 0
 
-                    if is_prefill(request) and (
-                        len(scheduled_new_reqs) > 0 or len(scheduled_resumed_reqs) > 0
+                    if num_prefills and request.num_tokens - num_computed_tokens <= 1:
+                        # NOTE(RBLN): This step already prefills, and this
+                        # request would join it as a decode. Left un-popped at
+                        # the queue head, re-tried next step.
+                        # Guard (C) of the no-mixed-batching invariant.
+                        break
+
+                    if (
+                        is_prefill(request)
+                        and not num_prefills
+                        and (scheduled_new_reqs or scheduled_resumed_reqs)
                     ):
                         # NOTE(RBLN): Only a request that will run as a LOCAL prefill
-                        # (lone, num_reqs == 1, via the no-mixed-batching eviction
-                        # below) needs deferring. A decode-ready request (not
+                        # (via the no-mixed-batching eviction below) needs
+                        # deferring. A decode-ready request (not
                         # is_prefill) instead joins the decode batch at the block
                         # below and is fine to co-schedule. Defer this prefill
                         # because a decode-ready request was already admitted this
@@ -874,30 +895,34 @@ class RBLNScheduler(Scheduler):
                     # we can continue to schedule the next request.
                     continue
 
-                # NOTE(RBLN): admit this prefill by evicting all scheduled running
-                # reqs and running it alone (no mixed batching); they rejoin as
-                # decodes next step (or once its prefill finishes).
+                # NOTE(RBLN): admit the first prefill of a decode step by evicting
+                # all scheduled running reqs (no mixed batching); they rejoin as
+                # decodes next step (or once the prefills finish).
                 # Guard (D) of the no-mixed-batching invariant; see the step-phase
                 # section in v1/core/utils.py.
-                for req in scheduled_running_reqs:
-                    evicted_delta = req_to_new_blocks.pop(req.request_id)
-                    num_scheduled_tokens.pop(req.request_id)
-                    req.spec_token_ids = scheduled_spec_decode_tokens.pop(
-                        req.request_id, []
-                    )
-                    scheduled_encoder_inputs.pop(req.request_id, None)
+                if not num_prefills:
+                    for req in scheduled_running_reqs:
+                        evicted_delta = req_to_new_blocks.pop(req.request_id)
+                        num_scheduled_tokens.pop(req.request_id)
+                        req.spec_token_ids = scheduled_spec_decode_tokens.pop(
+                            req.request_id, []
+                        )
+                        scheduled_encoder_inputs.pop(req.request_id, None)
 
-                    self._add_pending_runner_block_delta(req.request_id, evicted_delta)
+                        self._add_pending_runner_block_delta(
+                            req.request_id, evicted_delta
+                        )
 
-                scheduled_running_reqs.clear()
-                # NOTE(RBLN): the decode batch was just evicted to make room for
-                # a prefill (no mixed batching); zero the admission count so the
-                # budget tracks the now-empty batch.
-                decode_budget.reset()
-                token_budget = prefill_token_budget
+                    scheduled_running_reqs.clear()
+                    # NOTE(RBLN): the decode batch was just evicted to make room
+                    # for a prefill (no mixed batching); zero the admission count
+                    # so the budget tracks the now-empty batch.
+                    decode_budget.reset()
+                    token_budget = prefill_token_budget - num_new_tokens
 
-                # NOTE(RBLN): we restrict the prefill batch size to 1 for now.
-                break
+                num_prefills += 1
+                if num_prefills == self._max_prefill_batch:
+                    break
 
             # NOTE(RBLN): Release any un-applied sub-block match from a
             # break path (budget exhausted, allocation failure, etc.).

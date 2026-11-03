@@ -99,6 +99,17 @@ class ShapeConfig:
     max_num_tokens: int
     """Prefill-sized token dimension, used as the padding target."""
     specialized_moe_decode: bool
+    prefill_batch_buckets: Sequence[int] = (1,)
+    """Ascending compiled prefill batch sizes."""
+
+    def find_prefill_bucket(self, num_reqs: int) -> int:
+        for bucket in self.prefill_batch_buckets:
+            if bucket >= num_reqs:
+                return bucket
+        raise ValueError(
+            f"{num_reqs} prefills exceed the largest prefill batch bucket "
+            f"{self.prefill_batch_buckets[-1]}"
+        )
 
 
 @dataclass(frozen=True)
@@ -108,8 +119,8 @@ class BatchDescriptor:
     dimensions RBLN compiles for."""
 
     num_reqs_padded: int
-    """Compiled batch dimension. On a prefill step this is ``num_reqs``: RBLN
-    prefills one request at a time and the decode padding does not apply."""
+    """Compiled batch dimension. On a prefill step this is the prefill batch
+    bucket for ``num_reqs``; the decode buckets do not apply."""
     query_len: int
     """Tokens per request to stage. Equals this rank's own ``num_tokens //
     num_reqs`` except on ``AGREED``, where an idle rank adopts the busy ranks'
@@ -162,9 +173,9 @@ def determine_batch_execution_and_padding(
     )
     query_len = num_tokens // num_reqs
 
-    # A prefill step is not padded to a decode bucket; keep num_reqs so no caller
-    # has to override the value afterwards.
-    local_num_reqs_padded = num_reqs if is_prefill else cfg.find_bucket(num_reqs)
+    local_num_reqs_padded = (
+        cfg.find_prefill_bucket(num_reqs) if is_prefill else cfg.find_bucket(num_reqs)
+    )
 
     if pinned_num_tokens_padded is not None:
         return (
@@ -210,7 +221,9 @@ def determine_batch_execution_and_padding(
         return (
             BatchDescriptor(
                 num_reqs_padded=(
-                    num_reqs if is_prefill else cfg.decode_batch_buckets[-1]
+                    local_num_reqs_padded
+                    if is_prefill
+                    else cfg.decode_batch_buckets[-1]
                 ),
                 query_len=query_len,
                 num_tokens_padded=cfg.max_num_tokens,

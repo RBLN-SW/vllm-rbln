@@ -514,11 +514,18 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.sort_batch_by_length = current_platform.is_cr13()
 
         # Static, so the per-step decision only has to supply this step's counts.
+        self.prefill_batch_buckets = sorted(
+            self.rbln_config.prefill_batch_buckets or [1]
+        )
+        self.prefill_chunk_size = self.rbln_config.prefill_chunk_size(
+            self.max_num_tokens
+        )
         self.shape_config = ShapeConfig(
             decode_batch_buckets=self.bucketing_manager.decode_batch_buckets,
             find_bucket=self.bucketing_manager.find_decode_batch_bucket,
             max_num_tokens=self.max_num_tokens,
             specialized_moe_decode=self.specialized_moe_decode,
+            prefill_batch_buckets=self.prefill_batch_buckets,
         )
 
         self.offload_context = nullcontext
@@ -582,7 +589,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         ib = self.input_batch
         n = len(ib.req_ids)
-        toks = ib.num_tokens_no_spec[:n]
+        # A batched prefill sorts by the tokens already in the cache: the DSA
+        # indexer takes row 0's context as the batch's longest and returns a
+        # wrong top-k for any longer row behind it.
+        toks = (
+            ib.num_computed_tokens_cpu[:n]
+            if self.is_prefill
+            else ib.num_tokens_no_spec[:n]
+        )
 
         # The batch is reordered in place every step, so in steady-state decode
         # it is already sorted and a stable argsort would be identity; skip via
@@ -897,6 +911,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         window_fixed = not self.is_prefill and (
             self.uses_fixed_decode_window or use_spec_decode
         )
+        # NOTE(RBLN): A batched prefill stages every row at its longest chunk,
+        # the slack behind each row's tokens as on the fixed window. The window
+        # never shifts: the kernel writes the row's KV from its first position.
+        rows_padded = window_fixed or (self.is_prefill and num_reqs > 1)
         if window_fixed:
             query_lengths = np.full(num_reqs, self.num_spec_tokens + 1, dtype=np.int32)
             slack = query_lengths - logical_num_tokens
@@ -910,6 +928,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 0, num_computed + query_lengths - self.max_model_len
             ).astype(np.int32)
             back_pad = slack - front_pad
+        elif rows_padded:
+            query_lengths = np.full(num_reqs, logical_num_tokens.max(), dtype=np.int32)
+            front_pad = np.zeros_like(logical_num_tokens)
+            back_pad = query_lengths - logical_num_tokens
         else:
             query_lengths = logical_num_tokens
             front_pad = np.zeros_like(logical_num_tokens)
@@ -939,13 +961,17 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # -> [0, 1, M, M + 1, M + 2, M + 3, M + 4, 2 * M, 2 * M + 1, 2 * M + 2]
         # where M is the max_model_len.
         lookup_positions = positions_np
-        if window_fixed:
+        if rows_padded:
             logical_end = (
                 self.input_batch.num_computed_tokens_cpu[:num_reqs]
                 + logical_num_tokens
                 - 1
             )
             lookup_positions = np.minimum(positions_np, logical_end[req_indices])
+            if self.is_prefill:
+                # Keeps the padding inside the RoPE table on a row near
+                # max_model_len.
+                positions_np[:] = lookup_positions
         token_indices = (
             lookup_positions + req_indices * self.input_batch.token_ids_cpu.shape[1]
         )
@@ -989,7 +1015,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             # We will ignore the sampled tokens from the partial requests.
             # TODO: Support prompt logprobs.
             logits_indices = self.query_start_loc[1 : num_reqs + 1] - 1
-            if window_fixed:
+            if rows_padded:
                 logits_indices = logits_indices - self.decode_back_pad[:num_reqs]
             spec_decode_metadata = None
         else:
@@ -1329,7 +1355,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             num_reqs=num_reqs,
             num_reqs_padded=num_reqs_padded,
             query_len=input_ids.shape[1],
-            query_len_padded=self.max_num_tokens if is_prefill else input_ids.shape[1],
+            query_len_padded=(
+                self.prefill_chunk_size if is_prefill else input_ids.shape[1]
+            ),
         )
         staged_model_inputs = self.input_stager.stage(
             input_ids=input_ids,
@@ -1511,7 +1539,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             # anyway through discard_request_mask.
             return SamplerOutput(
                 sampled_token_ids=torch.full(
-                    (1, 1), -1, dtype=torch.int32, device=logits.device
+                    (self.input_batch.num_reqs, 1),
+                    -1,
+                    dtype=torch.int32,
+                    device=logits.device,
                 ),
                 logprobs_tensors=None,
             )
@@ -2444,7 +2475,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 and self.logits_processor is not None
             ):
                 if token_indices is not None:
-                    sample_hidden_states = hidden_states[:, token_indices]
+                    # token_indices index the flattened [batch, query] rows.
+                    sample_hidden_states = hidden_states.flatten(0, 1)[
+                        token_indices
+                    ].unsqueeze(0)
                     # NOTE(RBLN): token_indices points to the last-token positions used
                     # for sampling. EAGLE needs the full hidden_states during prefill,
                     # so do not slice them here.
@@ -3545,7 +3579,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
     @property
     def is_intermediate_chunked_prefill(self) -> bool:
-        return self.is_prefill and bool(self.discard_request_mask[0])
+        num_reqs = self.input_batch.num_reqs
+        return self.is_prefill and bool(self.discard_request_mask[:num_reqs].all())
 
     @property
     def use_wrapped_compute_logits(self) -> bool:
@@ -3789,7 +3824,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
     def run_model_graphs(self) -> None:
         """Every model graph once, at the shapes serving will ask for."""
         # 1. prefill
-        self._dummy_run(1, self.max_num_tokens, True)
+        for num_req in self.prefill_batch_buckets:
+            self._dummy_run(num_req, self.prefill_chunk_size, True)
 
         # 2. decode
         query_lens = [1]
@@ -3847,7 +3883,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             if get_pp_group().is_last_rank:
                 # 4-1. sampler
                 if not self.is_pooling_model:
-                    for size in self.bucketing_manager.batch_buckets:
+                    for size in sorted(
+                        {
+                            *self.prefill_batch_buckets,
+                            *self.bucketing_manager.batch_buckets,
+                        }
+                    ):
                         self._dummy_sampler_run(size)
 
                 # 4-2. rejection sampler
