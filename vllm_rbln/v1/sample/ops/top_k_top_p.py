@@ -31,7 +31,6 @@ def build_op_top_k_top_p(
 
     batch      | filters (random rows)    | top_k             | top_p
     -----------+--------------------------+-------------------+----------------
-    all greedy | -                        | tensor of 1s      | None
     all random | none (pure multinomial)  | None              | None
                | top-k only               | metadata tensor   | None
                | top-p only               | None              | metadata tensor
@@ -49,13 +48,9 @@ def build_op_top_k_top_p(
     filter (`None` / `None`) runs the multinomial sampler kernel, and an unused
     filter stays out of the top-k top-p kernel's compare.
     """
-    # Reached only from the rejection sampler: spec decode has no separate
-    # greedy op, while the normal sampler answers all_greedy with rbln::argmax.
-    if sampling_metadata.all_greedy:
-        return (
-            torch.full((batch_size,), GREEDY_TOP_K, dtype=torch.int32, device=device),
-            None,
-        )
+    assert not sampling_metadata.all_greedy, (
+        "Expected a batch containing at least one random-sampling request"
+    )
 
     top_k = sampling_metadata.top_k
     top_p = sampling_metadata.top_p

@@ -92,7 +92,7 @@ class RBLNModelOptFp8LinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.weight = Parameter(layer.weight.data, requires_grad=False)
         weight_scale = layer.weight_scale.data.reshape(-1)
-        if weight_scale.numel() == 1 or bool((weight_scale == weight_scale[0]).all()):
+        if weight_scale.numel() == 1:
             weight_scale = weight_scale[0]
         layer.weight_scale = Parameter(weight_scale, requires_grad=False)
         if getattr(layer, "input_scale", None) is not None:

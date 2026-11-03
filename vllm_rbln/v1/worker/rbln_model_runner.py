@@ -115,6 +115,7 @@ from vllm_rbln.compilation import (
     build_process_group_dict,
     compile,
     create_compile_context,
+    mark_decoder_regions,
     set_compile_stage,
 )
 from vllm_rbln.config import RBLNConfig
@@ -2473,6 +2474,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             install_aux_handoff_slots(self.model)
 
         self._make_weights_contiguous()
+        if envs.VLLM_RBLN_USE_NESTED_COMPILE_REGION:
+            mark_decoder_regions(self.model)
 
         # NOTE(RBLN): This wrapper is designed to be compiled by torch.compile.
         # It handles the forward pass of the underlying model and computes

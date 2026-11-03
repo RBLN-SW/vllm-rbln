@@ -326,7 +326,7 @@ class TestChunkIdOrder:
 
         ids = _chunk_desc_ids(
             start=0,
-            cuts=grid.regions,
+            cuts=grid.entries,
             num_blocks=1,
             block_id=0,
             per_block=1,
