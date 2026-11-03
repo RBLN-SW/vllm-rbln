@@ -70,8 +70,6 @@ class RBLNMoERunner(MoERunner):
       MoE blocks (qwen/deepseek/minimax/gpt-oss) pass ``router=`` accordingly.
       With DP=1 the router logits may come precomputed, for a model whose router
       reads a different tensor than its experts (Gemma4 routes on the residual).
-    * A ``per_expert_scale`` on the router scales each expert's routing weight,
-      for routing upstream expresses only through ``custom_routing_function``.
     * Hidden states stay **3-D ``[B, L, H]``** throughout (RBLN convention); no
       2-D unpacking.
     * Routing (top-k + softmax/sigmoid, optional grouped-topk) is done inline and
@@ -142,8 +140,6 @@ class RBLNMoERunner(MoERunner):
         router: Callable[[torch.Tensor], torch.Tensor] | torch.Tensor,
     ) -> torch.Tensor:
         assert self._quant_method is not None
-        per_expert_scale = getattr(self.router, "per_expert_scale", None)
-
         if self.moe_parallel_config.dp_size > 1:
             org_hidden_shape = hidden_states.shape
             R = self.moe_parallel_config.dp_size
@@ -291,11 +287,6 @@ class RBLNMoERunner(MoERunner):
                         all_router_logits_t
                     )  # [E, R*max_pad]
                     masked_routing_weights.scatter_(0, selected_experts, topk_weights)
-
-            if per_expert_scale is not None:
-                masked_routing_weights = masked_routing_weights * per_expert_scale.to(
-                    masked_routing_weights.dtype
-                ).unsqueeze(1)
 
             # Apply token mask to zero out padded positions per DP rank
             if self.use_moe_tokens_mask:
@@ -526,11 +517,6 @@ class RBLNMoERunner(MoERunner):
                     ).clamp_min(1e-20)
                 masked_routing_weights = torch.zeros_like(router_logits_t)  # [E, t]
                 masked_routing_weights.scatter_(0, selected_experts, topk_weights)
-
-        if per_expert_scale is not None:
-            masked_routing_weights = masked_routing_weights * per_expert_scale.to(
-                masked_routing_weights.dtype
-            ).unsqueeze(1)
 
         if self.use_moe_tokens_mask:
             tokens_mask = get_tokens_mask(

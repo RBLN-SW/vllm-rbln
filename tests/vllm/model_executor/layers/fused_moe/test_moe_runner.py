@@ -364,18 +364,18 @@ def _routed_weights(monkeypatch, router, logits):
 
 class TestGemma4Routing:
     def test_precomputed_logits_route_like_upstream_gemma4(self, monkeypatch):
-        # Gemma4 hands the runner logits it computed from the residual, and its
-        # per-expert scale rides on the router; the result must match upstream's
-        # torch routing, scale folded in.
+        # Gemma4 hands the runner logits it computed from the residual; its
+        # per-expert scale is folded into down_proj, so routing sees none.
         from vllm.model_executor.models.gemma4 import gemma4_routing_function_torch
 
         logits = torch.randn(1, 3, 4)
-        scale = torch.tensor([0.5, 1.0, 2.0, 4.0])
-        router = SimpleNamespace(renormalize=True, per_expert_scale=scale)
+        router = SimpleNamespace(renormalize=True)
 
         weights = _routed_weights(monkeypatch, router, logits)
 
-        topk_weights, topk_ids = gemma4_routing_function_torch(logits[0], 2, scale)
+        topk_weights, topk_ids = gemma4_routing_function_torch(
+            logits[0], 2, torch.ones(4)
+        )
         expected = torch.zeros(3, 4).scatter_(1, topk_ids.long(), topk_weights)
         torch.testing.assert_close(weights, expected.T)
 
