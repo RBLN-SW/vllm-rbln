@@ -22,6 +22,7 @@ import logging
 import pathlib
 import re
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 from vllm.engine.arg_utils import AsyncEngineArgs
@@ -162,6 +163,37 @@ def test_cli_wins_over_env(parser, monkeypatch):
 def test_unknown_key_is_rejected():
     with pytest.raises(ValueError, match="are not fields"):
         build_rbln_config({"use_custom_samplerr": False})
+
+
+@pytest.mark.parametrize("raw", ["1", "0", ""])
+def test_removed_batch_attention_env_warns_and_is_ignored(monkeypatch, raw):
+    monkeypatch.setenv("VLLM_RBLN_BATCH_ATTN_OPT", raw)
+    with patch("vllm_rbln.config.logger.warning_once") as warning:
+        assert build_rbln_config() == RBLNConfig()
+    warning.assert_called_once()
+    assert "VLLM_RBLN_BATCH_ATTN_OPT" in warning.call_args.args[0]
+    assert "has been removed and is ignored" in warning.call_args.args[0]
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_removed_batch_attention_key_warns_before_rejection(value):
+    with (
+        patch("vllm_rbln.config.logger.warning_once") as warning,
+        pytest.raises(ValueError, match="use_batch_attn_opt.*are not fields"),
+    ):
+        build_rbln_config({"use_batch_attn_opt": value})
+    warning.assert_called_once()
+    assert (
+        "additional_config.use_batch_attn_opt has been removed"
+        in warning.call_args.args[0]
+    )
+
+
+def test_absent_batch_attention_settings_do_not_warn(monkeypatch):
+    monkeypatch.delenv("VLLM_RBLN_BATCH_ATTN_OPT", raising=False)
+    with patch("vllm_rbln.config.logger.warning_once") as warning:
+        build_rbln_config()
+    warning.assert_not_called()
 
 
 def test_a_config_of_the_other_path_is_rejected():

@@ -26,7 +26,17 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
     EngineTransferInfo,
     TransferTopology,
 )
-from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
+from vllm.v1.kv_cache_interface import (
+    KVCacheSpec,
+    MambaSpec,
+    MLAAttentionSpec,
+    SlidingWindowMLASpec,
+)
+
+
+def is_latent(layer_spec: KVCacheSpec) -> bool:
+    """Whether a layer's cache is one key-only latent rather than K and V."""
+    return isinstance(layer_spec, (MLAAttentionSpec, SlidingWindowMLASpec))
 
 
 class RblnTransferTopology(TransferTopology):
@@ -36,7 +46,9 @@ class RblnTransferTopology(TransferTopology):
     its own NIXL region -- the layout upstream standardized away in 0.26. The
     rbln_custom_ops cache puts them inside one block, so that one registers as
     a single region and the descriptor path names the two halves itself.
-    MLA and Mamba caches are upstream's own shapes and stay on its path.
+    MLA and Mamba caches are upstream's own shapes and stay on its path -- and
+    so does a latent beside attention layers (an MSA indexer), whose shape is
+    its own backend's rather than the attention backend's.
 
     ``__post_init__`` reimplements upstream's rather than extending it, since
     upstream's asserts a blocks-first 4-dim shape RBLN never produces. So a
@@ -141,7 +153,12 @@ class RblnTransferTopology(TransferTopology):
     def get_transfer_cache_regions(
         self, cache: torch.Tensor, layer_spec: KVCacheSpec
     ) -> list[torch.Tensor] | torch.Tensor:
-        if self.is_mla or self.is_mamba or self._cross_layers_blocks:
+        if (
+            self.is_mla
+            or self.is_mamba
+            or self._cross_layers_blocks
+            or is_latent(layer_spec)
+        ):
             return self._shared_cache_regions(cache, layer_spec)
         if self._kv_shares_a_block:
             # Nothing to iterate: the block is the unit, and the descriptor

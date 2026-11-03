@@ -96,9 +96,10 @@ class RblnNixlAgentMetadata(NixlAgentMetadata):
     # Per logical region, in region order: a speculative draft can be cut on
     # another axis than its target.
     kv_split_axes: list[ChipletSplitAxis] = field(default_factory=list)
-    # What a block holds (`_kv_per_block`). A process picks the layout, not the
-    # build, so two peers off one build can differ and the version cannot tell
-    # them apart. The default is the layout every version through 4 had.
+    # How many of K and V an attention region's block holds (`_kv_per_block`);
+    # a latent's holds one. A process picks the layout, not the build, so two
+    # peers off one build can differ and the version cannot tell them apart.
+    # The default is the layout every version through 4 had.
     kv_per_block: int = 1
     # Tokens a block holds in the view the sliding-window kernel reads. 0 where
     # this shard has no single answer to advertise, which `registration.py`

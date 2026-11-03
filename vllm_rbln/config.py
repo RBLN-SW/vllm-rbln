@@ -89,9 +89,6 @@ class RBLNConfig(RBLNConfigBase):
     enforce_model_fp32: bool = False
     """Force the model dtype to fp32 instead of model_config.dtype."""
 
-    use_batch_attn_opt: bool = False
-    """Use the batch attention optimization for paged attention."""
-
     use_custom_kernel: bool = False
     """Use the custom RBLN kernels."""
 
@@ -258,7 +255,6 @@ def _fields_of(cls: type[RBLNConfigBase]) -> tuple["DataclassField[Any]", ...]:
 # The envs.py attribute a renamed field reads. Goes away with the env vars.
 _ENV_NAME: dict[str, str] = {
     "use_custom_sampler": "VLLM_RBLN_SAMPLER",
-    "use_batch_attn_opt": "VLLM_RBLN_BATCH_ATTN_OPT",
     "use_all2all_dispatch": "VLLM_RBLN_DISPATCH_ALL2ALL",
     "use_all2all_combine": "VLLM_RBLN_COMBINE_ALL2ALL",
     "enable_sub_block_cache": "VLLM_RBLN_SUB_BLOCK_CACHE",
@@ -522,6 +518,19 @@ def _model_impl_for(engine_args: Any) -> tuple[ModelImpl, str, str]:
 
 
 def build_rbln_config(additional_config: Any = None) -> RBLNConfig:
+    if "VLLM_RBLN_BATCH_ATTN_OPT" in os.environ:
+        logger.warning_once(
+            "VLLM_RBLN_BATCH_ATTN_OPT has been removed and is ignored. "
+            "Remove it from your environment."
+        )
+    if (
+        isinstance(additional_config, dict)
+        and "use_batch_attn_opt" in additional_config
+    ):
+        logger.warning_once(
+            "additional_config.use_batch_attn_opt has been removed. "
+            "Remove it from your configuration."
+        )
     return _resolve(RBLNConfig, additional_config)
 
 

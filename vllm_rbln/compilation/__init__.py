@@ -18,6 +18,7 @@ from vllm_rbln.compilation.compiler import (
     check_dtype_option_supported,
     compile,
     create_compile_context,
+    mark_decoder_regions,
 )
 
 __all__ = [
@@ -25,6 +26,7 @@ __all__ = [
     "check_dtype_option_supported",
     "compile",
     "create_compile_context",
+    "mark_decoder_regions",
     "rbln_backend",
     "set_compile_stage",
 ]

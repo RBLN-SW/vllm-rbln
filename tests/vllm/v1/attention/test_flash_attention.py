@@ -780,3 +780,18 @@ class TestForwardSlidingWindow:
         )
         assert tables.tolist() == [7, 8, 9]
         assert window == self.WINDOW
+
+    @pytest.mark.parametrize("is_prompt_sorted", [True, False])
+    def test_shift_decode_mask_follows_prompt_sorting(
+        self, cfg, monkeypatch, is_prompt_sorted
+    ):
+        md = self._decode_metadata(swa_appends=False)
+        md.is_prompt_sorted = is_prompt_sorted
+        md.swa_attn_masks = torch.ones(2, 1, 1, self.WINDOW)
+        *_, mask, _sinks = self._forward(
+            cfg, monkeypatch, "sliding_window_attention_naive_decode", md
+        )
+        if is_prompt_sorted:
+            assert mask is md.swa_attn_masks
+        else:
+            assert mask is None

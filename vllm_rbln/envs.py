@@ -61,7 +61,6 @@ if TYPE_CHECKING:
     # --- DYNAMIC KV CACHE ---
     VLLM_RBLN_USE_DYNAMIC_KV_CACHE: bool = True
     # --- ATTENTION ---
-    VLLM_RBLN_BATCH_ATTN_OPT: bool = False
     VLLM_RBLN_USE_CUSTOM_KERNEL: bool = False
     # --- MODEL INPUT / SCHEDULING ---
     VLLM_RBLN_SUB_BLOCK_CACHE: bool = True
@@ -305,12 +304,6 @@ environment_variables = {
         )
     ),
     # --- ATTENTION ---
-    # Use batch attention optimization for paged attention
-    "VLLM_RBLN_BATCH_ATTN_OPT": (
-        lambda: (
-            os.environ.get("VLLM_RBLN_BATCH_ATTN_OPT", "False").lower() in ("true", "1")
-        )
-    ),
     "VLLM_RBLN_USE_CUSTOM_KERNEL": (
         lambda: (
             os.environ.get("RBLN_USE_CUSTOM_KERNEL", "False").lower() in ("true", "1")
@@ -412,7 +405,6 @@ RBLN_NON_COMPILE_ENV = frozenset(
         # RBLNConfig fields: the config hash keys the bundle on these
         "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK",
         "VLLM_RBLN_ENFORCE_MODEL_FP32",
-        "VLLM_RBLN_BATCH_ATTN_OPT",
         "VLLM_RBLN_USE_CUSTOM_KERNEL",
         "VLLM_RBLN_USE_DYNAMIC_KV_CACHE",
         "VLLM_RBLN_SPECIALIZE_MOE_DECODE",
