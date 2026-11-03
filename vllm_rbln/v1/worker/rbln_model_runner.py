@@ -1672,13 +1672,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     ] = sampled_ids
 
     def _repair_staged_input_ids(
-        self, staged_model_inputs: StagedModelInputs, req_ids: list[str]
+        self, staged_model_inputs: StagedModelInputs | None, req_ids: list[str]
     ) -> None:
-        """Overwrite the scheduler's -1 placeholders with the previous step's tokens.
+        """Read previous tokens with None, then repair inputs after staging.
 
         Skips requests absent from the previous batch; they are repaired by
-        _apply_pending_token_writeback. Must run before this step's sampling,
-        which overwrites the ring slot prev_sampled_token_ids aliases.
+        _apply_pending_token_writeback. Both calls must precede sampling,
+        which may reuse the previous token's ring slot.
         """
         prev_sampled = self.input_batch.prev_sampled_token_ids
         prev_req_id_to_index = self.input_batch.prev_req_id_to_index
@@ -1701,15 +1701,19 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         # that refills it wait, which costs most of a decode step.
         num_prev = prev_sampled.shape[0]
         host_buffer = self._prev_token_host_buffer
-        if (
-            host_buffer is None
-            or host_buffer.shape[0] < num_prev
-            or host_buffer.dtype != prev_sampled.dtype
-        ):
-            host_buffer = torch.empty(num_prev, dtype=prev_sampled.dtype)
-            self._prev_token_host_buffer = host_buffer
+        if staged_model_inputs is None:
+            if (
+                host_buffer is None
+                or host_buffer.shape[0] < num_prev
+                or host_buffer.dtype != prev_sampled.dtype
+            ):
+                host_buffer = torch.empty(num_prev, dtype=prev_sampled.dtype)
+                self._prev_token_host_buffer = host_buffer
+            host_buffer[:num_prev].copy_(prev_sampled[:num_prev, 0])
+            return
+
+        assert host_buffer is not None
         host = host_buffer[:num_prev]
-        host.copy_(prev_sampled[:num_prev, 0])
 
         input_ids = staged_model_inputs.input_ids
         # Equal row lists are not the identity prefix: a skipped request leaves a
@@ -2067,6 +2071,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     back_pad=self.decode_back_pad,
                 )
             )
+
+            if self.use_async_scheduling:
+                self._repair_staged_input_ids(None, req_ids)
 
             (
                 staged_model_inputs,

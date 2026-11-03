@@ -64,7 +64,7 @@ class StagedModelInputs:
 class InputStager:
     def __init__(self, device: torch.device):
         self.device = device
-        self._buffers: dict[tuple, InputBuffer] = {}
+        self._buffers: dict[tuple, tuple[InputBuffer, InputBuffer]] = {}
         self._hidden_state_buffers: dict[tuple, torch.Tensor] = {}
         self._token_indices_buffers: dict[tuple[torch.dtype, int], torch.Tensor] = {}
         self._mm_embeds_buffers: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -80,20 +80,16 @@ class InputStager:
         hidden_states: torch.Tensor | None = None,
         layout: InputLayout,
     ) -> StagedModelInputs:
-        buf = self._get_or_create_buffer(layout, input_ids, positions)
+        buf, host_buf = self._get_or_create_buffer(layout, input_ids, positions)
 
         assert buf.input_ids.shape == layout.shape
-        buf.input_ids.fill_(layout.input_pad_value)
-        buf.input_ids[: layout.num_reqs, : layout.query_len].copy_(
-            input_ids,
-            non_blocking=True,
-        )
+        host_buf.input_ids.fill_(layout.input_pad_value)
+        host_buf.input_ids[: layout.num_reqs, : layout.query_len].copy_(input_ids)
+        buf.input_ids.copy_(host_buf.input_ids, non_blocking=True)
 
-        buf.positions.fill_(layout.position_pad_value)
-        buf.positions[: layout.num_reqs, : layout.query_len].copy_(
-            positions,
-            non_blocking=True,
-        )
+        host_buf.positions.fill_(layout.position_pad_value)
+        host_buf.positions[: layout.num_reqs, : layout.query_len].copy_(positions)
+        buf.positions.copy_(host_buf.positions, non_blocking=True)
 
         return StagedModelInputs(
             input_ids=buf.input_ids,
@@ -109,7 +105,7 @@ class InputStager:
         layout: InputLayout,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-    ) -> InputBuffer:
+    ) -> tuple[InputBuffer, InputBuffer]:
         key = (
             layout.shape,
             input_ids.dtype,
@@ -130,8 +126,16 @@ class InputStager:
                 device=self.device,
             ),
         )
-        self._buffers[key] = buf
-        return buf
+        host_buf = InputBuffer(
+            input_ids=torch.empty(
+                layout.shape, dtype=input_ids.dtype, device="cpu", pin_memory=True
+            ),
+            positions=torch.empty(
+                layout.shape, dtype=positions.dtype, device="cpu", pin_memory=True
+            ),
+        )
+        self._buffers[key] = (buf, host_buf)
+        return buf, host_buf
 
     def _stage_hidden_states(
         self,
