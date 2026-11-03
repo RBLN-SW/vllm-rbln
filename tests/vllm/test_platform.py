@@ -529,27 +529,38 @@ class TestRejectedConfigs:
         assert config.additional_config.prefill_chunk_size == 64
 
     @pytest.mark.parametrize(
-        "feature",
+        "feature, enable",
         [
-            "data parallelism",
-            "speculative decoding",
-            "sub-block prefix caching",
-            "RBLN NIXL KV transfer",
+            ("data parallelism", lambda c: _ranks(data_parallel_size=2)(c)),
+            (
+                "speculative decoding",
+                lambda c: setattr(
+                    c, "speculative_config", SimpleNamespace(method="ngram")
+                ),
+            ),
+            (
+                "sub-block prefix caching",
+                lambda c: setattr(c.cache_config, "enable_prefix_caching", True),
+            ),
+            (
+                "RBLN NIXL KV transfer",
+                lambda c: setattr(
+                    c,
+                    "kv_transfer_config",
+                    SimpleNamespace(
+                        kv_connector="RblnNixlPushConnector",
+                        kv_connector_extra_config={},
+                    ),
+                ),
+            ),
         ],
     )
-    def test_a_prefill_chunk_below_the_token_budget_refuses(self, reconfigure, feature):
+    def test_a_prefill_chunk_below_the_token_budget_refuses(
+        self, reconfigure, feature, enable
+    ):
         def mutate(config):
             _prefill_chunk(64)(config)
-            if feature == "data parallelism":
-                _ranks(data_parallel_size=2)(config)
-            elif feature == "speculative decoding":
-                config.speculative_config = SimpleNamespace(method="ngram")
-            elif feature == "RBLN NIXL KV transfer":
-                config.kv_transfer_config = SimpleNamespace(
-                    kv_connector="RblnNixlPushConnector"
-                )
-            else:
-                config.cache_config.enable_prefix_caching = True
+            enable(config)
 
         with pytest.raises(ValueError, match=feature):
             reconfigure(mutate)
