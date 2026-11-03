@@ -16,9 +16,8 @@
 compiled and its image embeddings merged inside the compiled graph."""
 
 import math
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from functools import cached_property
-from itertools import islice
 
 import torch
 import torch.nn.functional as F
@@ -196,15 +195,6 @@ class RBLNGemma4ForConditionalGeneration(
         if vllm_config.parallel_config.data_parallel_size > 1:
             raise ValueError("Gemma4 does not support data parallel on RBLN.")
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-        text_model = self.language_model.model
-        for layer in islice(
-            text_model.layers, text_model.start_layer, text_model.end_layer
-        ):
-            if not layer.enable_moe_block:
-                continue
-            # RBLNMoERunner routes inline and never calls the upstream custom
-            # routing function, which is where Gemma4 applies this scale.
-            layer.experts.router.per_expert_scale = layer.router.per_expert_scale
         self.mm_soft_token_cap = mm_soft_token_cap(
             MULTIMODAL_REGISTRY.create_processor(vllm_config.model_config).info
         )
@@ -218,6 +208,35 @@ class RBLNGemma4ForConditionalGeneration(
         ]
         self._mm_encoder: Callable[..., torch.Tensor] | None
         object.__setattr__(self, "_mm_encoder", None)
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # Scale each expert's down projection instead of its routing weight:
+        # the decode graph lowers the [E, 1] routing-weight scale incorrectly.
+        # Folded on the checkpoint tensors, before they reach the device.
+        def fold(weights):
+            scales: dict[str, torch.Tensor] = {}
+            downs: dict[str, torch.Tensor] = {}
+            for name, w in weights:
+                if name.endswith("router.per_expert_scale"):
+                    key = name.removesuffix("router.per_expert_scale")
+                    scales[key] = w
+                    if key in downs:
+                        down = downs.pop(key)
+                        yield (
+                            key + "experts.down_proj",
+                            down * w.to(down.dtype).view(-1, 1, 1),
+                        )
+                elif name.endswith("experts.down_proj"):
+                    key = name.removesuffix("experts.down_proj")
+                    if key in scales:
+                        w = w * scales[key].to(w.dtype).view(-1, 1, 1)
+                    else:
+                        downs[key] = w
+                        continue
+                yield name, w
+            assert not downs, f"no per_expert_scale for {sorted(downs)}"
+
+        return super().load_weights(fold(weights))
 
     def get_mm_prefix_query_lens(self) -> list[int]:
         # One length per soft token budget the processor may emit, rounded up
