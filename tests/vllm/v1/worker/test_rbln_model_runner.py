@@ -2231,6 +2231,13 @@ class TestExecuteModelStampsMmPrefixSteps:
         )
         assert seen == query_len
 
+    def test_the_rest_of_a_range_a_prefix_cache_hit_resumed_is_one(self, monkeypatch):
+        # Soft tokens at 5..14; a hit ended at 9, so the step runs 9..14.
+        seen = self._query_len_seen(
+            monkeypatch, computed=9, scheduled=6, mm_features=[self._image(4, 10)]
+        )
+        assert seen == 128
+
     def test_a_text_chunk_is_not_an_mm_prefix_step(self, monkeypatch):
         seen = self._query_len_seen(
             monkeypatch, computed=0, scheduled=5, mm_features=[self._image(4, 10)]
