@@ -18,7 +18,6 @@ compiled and its image embeddings merged inside the compiled graph."""
 import math
 from collections.abc import Callable, Iterable, Mapping
 from functools import cached_property
-from itertools import islice
 
 import torch
 import torch.nn.functional as F
@@ -211,23 +210,35 @@ class RBLNGemma4ForConditionalGeneration(
         object.__setattr__(self, "_mm_encoder", None)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loaded = super().load_weights(weights)
         # Scale each expert's down projection instead of its routing weight:
         # the decode graph lowers the [E, 1] routing-weight scale incorrectly.
-        text_model = self.language_model.model
-        for layer in islice(
-            text_model.layers, text_model.start_layer, text_model.end_layer
-        ):
-            if not layer.enable_moe_block:
-                continue
-            (w2,) = (
-                p
-                for n, p in layer.experts.named_parameters()
-                if n.endswith("w2_weight")
-            )
-            scale = layer.router.per_expert_scale.data
-            w2.data.mul_(scale.to(w2.dtype).view(-1, 1, 1))
-        return loaded
+        # Folded on the checkpoint tensors, before they reach the device.
+        def fold(weights):
+            scales: dict[str, torch.Tensor] = {}
+            downs: dict[str, torch.Tensor] = {}
+            for name, w in weights:
+                if name.endswith("router.per_expert_scale"):
+                    key = name.removesuffix("router.per_expert_scale")
+                    scales[key] = w
+                    if key in downs:
+                        yield (
+                            key + "experts.down_proj",
+                            downs.pop(key)
+                            * w.to(downs[key].dtype if key in downs else w.dtype).view(
+                                -1, 1, 1
+                            ),
+                        )
+                elif name.endswith("experts.down_proj"):
+                    key = name.removesuffix("experts.down_proj")
+                    if key in scales:
+                        w = w * scales[key].to(w.dtype).view(-1, 1, 1)
+                    else:
+                        downs[key] = w
+                        continue
+                yield name, w
+            assert not downs, f"no per_expert_scale for {sorted(downs)}"
+
+        return super().load_weights(fold(weights))
 
     def get_mm_prefix_query_lens(self) -> list[int]:
         # One length per soft token budget the processor may emit, rounded up
