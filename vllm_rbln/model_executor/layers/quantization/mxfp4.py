@@ -161,7 +161,7 @@ class RBLNGptOssMxfp4MoEMethod(GptOssMxfp4MoEMethod):
             masked_routing_weights,
             self.swiglu_alpha,
             self.swiglu_limit,
-            layer.expert_map,
+            layer.local_expert_ids,
         )
         return out.reshape(orig_shape)
 

@@ -366,7 +366,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 None,  # gate_proj_bias
                 None,  # up_proj_bias
                 None,  # down_proj_bias
-                layer.expert_map,
+                layer.local_expert_ids,
             )
         else:
             final_hidden_states = (
@@ -384,7 +384,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     None,  # gate_proj_bias
                     None,  # up_proj_bias
                     None,  # down_proj_bias
-                    layer.expert_map,
+                    layer.local_expert_ids,
                 )
             )
 

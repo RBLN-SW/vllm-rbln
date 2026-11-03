@@ -19,15 +19,83 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from vllm.model_executor.custom_op import maybe_get_oot_by_class
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
+import vllm_rbln.model_executor.layers.fused_moe.runner.moe_runner as moe_runner
 import vllm_rbln.model_executor.layers.fused_moe.utils as fused_moe_utils
 from vllm_rbln.model_executor.layers.fused_moe.runner.moe_runner import RBLNMoERunner
 from vllm_rbln.model_executor.layers.fused_moe.runner.moe_runner import (
     _apply_grouped_topk_torch as grouped_topk,
 )
+from vllm_rbln.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+    RBLNUnquantizedFusedMoEMethod,
+)
+
+
+@pytest.mark.parametrize(
+    "expert_map,local_expert_ids",
+    [
+        (None, None),
+        ([-1, -1, 0, 1], [2, 3]),
+        ([0, -1, 1, -1], [0, 2]),
+        ([-1, 1, -1, 0], [3, 1]),
+        ([-1, -1, 0, -1], [2]),
+    ],
+)
+def test_local_expert_metadata_routes_in_weight_order(
+    monkeypatch, expert_map, local_expert_ids
+):
+    layer = torch.nn.Module()
+    layer.expert_map = None if expert_map is None else torch.tensor(expert_map)
+    layer.global_num_experts = 4
+    layer.activation = SimpleNamespace(value="silu")
+    experts = 4 if local_expert_ids is None else len(local_expert_ids)
+    generator = torch.Generator().manual_seed(0)
+    layer.w13_weight = torch.nn.Parameter(
+        torch.randn(experts, 8, 4, generator=generator)
+    )
+    layer.w2_weight = torch.nn.Parameter(
+        torch.randn(experts, 4, 4, generator=generator)
+    )
+
+    def initialize(runner):
+        torch.nn.Module.__init__(runner)
+        runner.routed_experts = layer
+        runner.moe_config = SimpleNamespace(
+            moe_parallel_config=SimpleNamespace(dp_size=1), experts_per_token=2
+        )
+
+    monkeypatch.setattr(MoERunner, "__init__", initialize)
+    monkeypatch.setattr(
+        moe_runner,
+        "get_rbln_config",
+        lambda: SimpleNamespace(
+            use_all2all_dispatch=False,
+            use_all2all_combine=False,
+            use_moe_tokens_mask=False,
+        ),
+    )
+    runner = RBLNMoERunner()
+    assert runner.routed_experts.local_expert_ids == local_expert_ids
+    method = object.__new__(RBLNUnquantizedFusedMoEMethod)
+    hidden = torch.randn(1, 2, 4, generator=generator)
+    routing = torch.tensor([[0.1, 0.4], [0.2, 0.3], [0.3, 0.2], [0.4, 0.1]])
+    expected = torch.zeros_like(hidden)
+    for local_id, global_id in enumerate(
+        range(4) if local_expert_ids is None else local_expert_ids
+    ):
+        gate = torch.nn.functional.linear(hidden, layer.w13_weight[local_id, :4])
+        up = torch.nn.functional.linear(hidden, layer.w13_weight[local_id, 4:])
+        down = torch.nn.functional.linear(
+            torch.nn.functional.silu(gate) * up, layer.w2_weight[local_id]
+        )
+        expected += down * routing[global_id].reshape(1, 2, 1)
+    with torch.inference_mode():
+        result = method.apply(layer, hidden, routing)
+    torch.testing.assert_close(result, expected)
 
 
 class TestApplyGroupedTopkTorch:

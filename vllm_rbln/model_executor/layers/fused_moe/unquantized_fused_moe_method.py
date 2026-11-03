@@ -54,7 +54,7 @@ class RBLNUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             down_proj_weight,
             masked_routing_weights,
             layer.activation.value,
-            layer.expert_map,
+            layer.local_expert_ids,
             None,
             None,
             None,

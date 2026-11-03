@@ -102,7 +102,7 @@ class RBLNModelOptNvFp4FusedMoE(ModelOptNvFp4FusedMoE):
             None,  # gate_proj_bias
             None,  # up_proj_bias
             None,  # down_proj_bias
-            layer.expert_map,
+            layer.local_expert_ids,
             gate_proj_scale_2=layer.w13_weight_scale_2[:, 0].contiguous(),
             up_proj_scale_2=layer.w13_weight_scale_2[:, 1].contiguous(),
             down_proj_scale_2=layer.w2_weight_scale_2,

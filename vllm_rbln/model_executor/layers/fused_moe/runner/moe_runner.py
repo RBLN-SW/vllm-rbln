@@ -91,6 +91,19 @@ class RBLNMoERunner(MoERunner):
         self.moe_parallel_config = self.moe_config.moe_parallel_config
         self.global_num_experts = self.routed_experts.global_num_experts
 
+        expert_map = self.routed_experts.expert_map
+        if expert_map is None:
+            self.routed_experts.local_expert_ids = None
+        else:
+            placement = sorted(
+                (local_id, global_id)
+                for global_id, local_id in enumerate(expert_map.cpu().tolist())
+                if local_id >= 0
+            )
+            self.routed_experts.local_expert_ids = [
+                global_id for _, global_id in placement
+            ]
+
         # --- #41184 remap: top_k lives on moe_config ---
         self.top_k = self.moe_config.experts_per_token
 
