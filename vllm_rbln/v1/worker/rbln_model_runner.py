@@ -1017,6 +1017,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 self.state_load_pos_np[i] = self.state_pos_by_req.get(
                     req_id, self.input_batch.num_computed_tokens_cpu[i] - 1
                 )
+                # TODO(RBLN, #1370): handle output rollback when tracking state
+                # positions. This advances before forward and is not restored if
+                # the step is discarded. RBLN NIXL currently rejects Mamba
+                # groups, blocking this load-failure path.
                 self.state_pos_by_req[req_id] = int(self.seq_lens_np[i]) - 1
 
         num_tokens = [self.requests[r].num_tokens for r in self.input_batch.req_ids]

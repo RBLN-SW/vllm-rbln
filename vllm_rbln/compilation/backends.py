@@ -138,6 +138,9 @@ def _rbln_backend(
         "; ".join(parts),
     )
     runtime = rbln_torch_compile_backend(graph, example_inputs, **kwargs)
+    # The dynamic-KV sizer matches a program's KV inputs to the caches vllm
+    # allocated by tensor identity: the backend's return value is what a captured
+    # program carries as `.runtime`, and its `input_specs` run in this order.
     if (bindings := program_input_bindings.get()) is not None:
         bindings[id(runtime)] = tuple(
             weakref.ref(x) for x in example_inputs if isinstance(x, torch.Tensor)
