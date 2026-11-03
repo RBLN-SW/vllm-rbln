@@ -139,22 +139,21 @@ class RBLNScheduler(Scheduler):
 
         A range attends to itself both ways, which a compiled graph can only do
         over a step holding that range alone: a chunk starting a range is the
-        whole range, and any other chunk stops where the next range begins.
+        whole range, and any other chunk stops where the next range begins. A
+        prefix cache hit ending inside a range resumes it, and the step is the
+        rest of that range.
         """
         for feature in request.mm_features:
             if feature.modality not in ("image", "video"):
                 continue
             for first, last in feature.mm_position.extract_embeds_range():
-                if num_computed_tokens == first:
-                    range_len = last + 1 - first
+                if first <= num_computed_tokens <= last:
+                    range_len = last + 1 - num_computed_tokens
                     assert num_new_tokens >= range_len, (
                         f"an mm prefix range of {range_len} tokens does not fit "
                         f"the {num_new_tokens} this step can schedule"
                     )
                     return range_len
-                assert not first < num_computed_tokens <= last, (
-                    "a prefill chunk stopped inside an mm prefix range"
-                )
                 if num_computed_tokens < first:
                     return min(num_new_tokens, first - num_computed_tokens)
         return num_new_tokens

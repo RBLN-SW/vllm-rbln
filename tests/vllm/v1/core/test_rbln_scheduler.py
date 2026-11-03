@@ -871,6 +871,13 @@ class TestMmPrefixChunks:
         video = self._feature("video", 2, frame * 2)
         assert self._chunks(monkeypatch, [video], num_tokens=24) == [4, 4, 3, 4, 9]
 
+    def test_a_prefix_cache_hit_inside_a_range_resumes_its_rest(self):
+        # Soft tokens at 10..19; a hit ending at 14 leaves 14..19 for one step.
+        image = self._feature("image", 9, [False] + [True] * 10 + [False])
+        sched = create_rbln_scheduler(max_num_batched_tokens=16, max_model_len=64)
+        req = make_request("a", list(range(40)), 16, mm_features=[image])
+        assert sched._mm_prefix_split(req, 14, 16) == 6
+
     def test_audio_is_not_an_mm_prefix_range(self, monkeypatch):
         audio = self._feature("audio", 4, [True] * 8)
         assert self._chunks(monkeypatch, [audio], num_tokens=24) == [16, 8]
