@@ -3689,7 +3689,7 @@ requires-dist = [
     { name = "torchaudio", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torchcodec", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torchvision", index = "https://download.pytorch.org/whl/cpu" },
-    { name = "vllm", specifier = "==0.31.0+cpu", index = "https://wheels.vllm.ai/0.31.0/cpu" },
+    { name = "vllm", specifier = "==0.31.0", index = "https://wheels.vllm.ai/0.31.0/cpu" },
     { name = "vllm", extras = ["audio"], marker = "extra == 'audio'", index = "https://wheels.vllm.ai/0.31.0/cpu" },
 ]
 provides-extras = ["examples", "audio", "test", "build", "dev", "runtime", "kv-connectors"]
