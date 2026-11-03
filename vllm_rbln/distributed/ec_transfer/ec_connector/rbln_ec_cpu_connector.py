@@ -19,6 +19,7 @@ encoder cache are both host memory: a save or a load is a plain copy, done when
 the call returns and reported on the same step.
 """
 
+from collections.abc import Collection
 from typing import TYPE_CHECKING
 
 import torch
@@ -31,12 +32,47 @@ from vllm.distributed.ec_transfer.ec_connector.cpu.common import (
     ECCPUWorkerMetadata,
 )
 from vllm.distributed.ec_transfer.ec_connector.cpu.connector import ECCPUConnector
+from vllm.distributed.ec_transfer.ec_connector.cpu.scheduler import ECCPUScheduler
 from vllm.distributed.ec_transfer.ec_connector.cpu.worker import ECCPUWorker
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-    from vllm.distributed.ec_transfer.ec_connector.cpu.scheduler import ECCPUScheduler
+    from vllm.multimodal.inputs import MultiModalFeatureSpec
     from vllm.v1.request import Request
+
+
+class RblnECCPUScheduler(ECCPUScheduler):
+    """Admits reusable runner outputs without requiring a remote transfer."""
+
+    def __init__(self, vllm_config: "VllmConfig") -> None:
+        self._local_cache_hashes: Collection[str] = ()
+        super().__init__(vllm_config)
+
+    def ensure_cache_available(
+        self,
+        request: "Request",
+        num_computed_tokens: int,
+        local_cache_hashes: Collection[str] | None = None,
+    ) -> bool:
+        self._local_cache_hashes = local_cache_hashes or ()
+        try:
+            return super().ensure_cache_available(request, num_computed_tokens)
+        finally:
+            self._local_cache_hashes = ()
+
+    def _admit_item(
+        self,
+        request: "Request",
+        feature: "MultiModalFeatureSpec",
+        num_computed_tokens: int,
+        now: float,
+    ) -> bool:
+        # NOTE(RBLN): skip transfers for inputs already in the runner cache.
+        # Keep the connector's existing transfer polling and timeout handling.
+        if feature.identifier in self._local_cache_hashes:
+            self._deferred_since.pop((request.request_id, feature.identifier), None)
+            return True
+        return super()._admit_item(request, feature, num_computed_tokens, now)
 
 
 class RblnECCPUWorker(ECCPUWorker):
@@ -114,14 +150,26 @@ class RblnECCPUConnector(ECCPUConnector):
     def _make_worker(self, vllm_config: "VllmConfig") -> RblnECCPUWorker:
         return RblnECCPUWorker(vllm_config)
 
-    def _make_scheduler(self, vllm_config: "VllmConfig") -> "ECCPUScheduler":
+    def _make_scheduler(self, vllm_config: "VllmConfig") -> RblnECCPUScheduler:
         # NOTE(RBLN): a producer and a consumer reach each other only through
         # NIXL, so it is always on for them. ec_both keeps upstream's default,
         # a CPU tier of its own.
         ec_config = vllm_config.ec_transfer_config
         if ec_config.ec_role != "ec_both":
             ec_config.ec_connector_extra_config["ec_enable_nixl"] = True
-        return super()._make_scheduler(vllm_config)
+        return RblnECCPUScheduler(vllm_config)
+
+    def ensure_cache_available(
+        self,
+        request: "Request",
+        num_computed_tokens: int,
+        local_cache_hashes: Collection[str] | None = None,
+    ) -> bool:
+        scheduler = self.connector_scheduler
+        assert isinstance(scheduler, RblnECCPUScheduler)
+        return scheduler.ensure_cache_available(
+            request, num_computed_tokens, local_cache_hashes
+        )
 
     def start_save_caches(
         self, encoder_cache: dict[str, torch.Tensor] | None = None, **kwargs

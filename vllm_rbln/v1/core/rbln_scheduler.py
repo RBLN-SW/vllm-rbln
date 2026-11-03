@@ -21,6 +21,7 @@ from typing import Any
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.utils.hashing import get_hash_fn_by_name
+from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import init_none_hash
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
@@ -58,6 +59,30 @@ from vllm_rbln.v1.core.utils import (
 logger = init_logger(__name__)
 
 
+class RBLNEncoderCacheManager(EncoderCacheManager):
+    """Defers runner hits evicted by an earlier input in the scheduling pass."""
+
+    def __init__(self, cache_size: int) -> None:
+        super().__init__(cache_size)
+        self.initial_cache_hits: set[str] = set()
+
+    def can_allocate(
+        self,
+        request: Request,
+        input_id: int,
+        encoder_compute_budget: int,
+        num_embeds_to_schedule: int,
+    ) -> bool:
+        mm_hash = request.mm_features[input_id].identifier
+        if mm_hash in self.initial_cache_hits and mm_hash not in self.cached:
+            # NOTE(RBLN): consumers cannot re-encode an evicted hit locally.
+            # Defer it for a fresh transfer check on the next step.
+            return False
+        return super().can_allocate(
+            request, input_id, encoder_compute_budget, num_embeds_to_schedule
+        )
+
+
 @dataclass
 class RBLNSchedulerOutput(SchedulerOutput):
     """SchedulerOutput extended with KV cache copy operations for sub-block
@@ -67,8 +92,14 @@ class RBLNSchedulerOutput(SchedulerOutput):
 
 
 class RBLNScheduler(Scheduler):
+    encoder_cache_manager: EncoderCacheManager
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        if not self.is_encoder_decoder:
+            self.encoder_cache_manager = RBLNEncoderCacheManager(
+                self.encoder_cache_manager.cache_size
+            )
 
         self.num_lookahead_tokens: int = max(
             self.num_lookahead_tokens, self.num_spec_tokens
@@ -1149,6 +1180,27 @@ class RBLNScheduler(Scheduler):
 
         return result
 
+    def _ec_transfer_pending(self, request: Request, num_computed_tokens: int) -> bool:
+        connector = self.ec_connector
+        if not isinstance(connector, RblnECCPUConnector) or not request.mm_features:
+            return super()._ec_transfer_pending(request, num_computed_tokens)
+        # NOTE(RBLN): local_cache_hashes identifies inputs already in the runner
+        # cache so the connector skips their transfers even if its cache lacks them.
+        local_cache_hashes = set()
+        if not self.is_encoder_decoder:
+            for i, feature in enumerate(request.mm_features):
+                pos = feature.mm_position
+                if pos.offset + pos.length <= num_computed_tokens:
+                    continue
+                cached_num_embeds = (
+                    self.encoder_cache_manager.get_cached_num_encoder_embeds(request, i)
+                )
+                if cached_num_embeds == request.get_num_encoder_embeds(i):
+                    local_cache_hashes.add(feature.identifier)
+        return not connector.ensure_cache_available(
+            request, num_computed_tokens, local_cache_hashes=local_cache_hashes
+        )
+
     def _try_schedule_encoder_inputs(
         self,
         request: Request,
@@ -1157,13 +1209,30 @@ class RBLNScheduler(Scheduler):
         encoder_compute_budget: int,
         shift_computed_tokens: int = 0,
     ) -> tuple[list[int], int, int, list[int]]:
-        scheduled = super()._try_schedule_encoder_inputs(
-            request,
-            num_computed_tokens,
-            num_new_tokens,
-            encoder_compute_budget,
-            shift_computed_tokens,
-        )
+        cache_manager = self.encoder_cache_manager
+        if (
+            isinstance(cache_manager, RBLNEncoderCacheManager)
+            and isinstance(self.ec_connector, RblnECCPUConnector)
+            and request.ec_transfer_params
+        ):
+            # NOTE(RBLN): initial_cache_hits tracks hits for the eviction guard
+            # without pinning them so earlier inputs can still reclaim cache space.
+            cache_manager.initial_cache_hits = {
+                feature.identifier
+                for i, feature in enumerate(request.mm_features)
+                if cache_manager.get_cached_num_encoder_embeds(request, i) is not None
+            }
+        try:
+            scheduled = super()._try_schedule_encoder_inputs(
+                request,
+                num_computed_tokens,
+                num_new_tokens,
+                encoder_compute_budget,
+                shift_computed_tokens,
+            )
+        finally:
+            if isinstance(cache_manager, RBLNEncoderCacheManager):
+                cache_manager.initial_cache_hits.clear()
         connector = self.ec_connector
         # NOTE(RBLN): upstream skips EC saves on runner-cache hits.
         # Reserve saves for outputs missing from the shared-memory cache.

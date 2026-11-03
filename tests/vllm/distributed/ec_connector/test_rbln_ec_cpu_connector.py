@@ -14,6 +14,7 @@
 
 import uuid
 from types import SimpleNamespace
+from unittest.mock import Mock, call
 
 import pytest
 import torch
@@ -29,7 +30,12 @@ from vllm.distributed.ec_transfer.ec_connector.factory import ECConnectorFactory
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.outputs import ECConnectorOutput
 
-from tests.vllm.v1.core.utils import create_rbln_scheduler, image_at, make_request
+from tests.vllm.v1.core.utils import (
+    create_rbln_scheduler,
+    image_at,
+    make_model_runner_output,
+    make_request,
+)
 from vllm_rbln.distributed.ec_transfer.ec_connector.rbln_ec_cpu_connector import (
     RblnECCPUConnector,
     RblnECCPUWorker,
@@ -65,6 +71,7 @@ def connect(monkeypatch, instance_id):
                 distributed_executor_backend="uni",
             ),
             model_config=SimpleNamespace(
+                model="ec-test-model",
                 dtype=torch.bfloat16,
                 hf_config=SimpleNamespace(),
                 get_inputs_embeds_size=lambda: HIDDEN,
@@ -82,6 +89,48 @@ def connect(monkeypatch, instance_id):
     yield build
     for connector in connectors:
         connector.shutdown()
+
+
+@pytest.fixture
+def ec_consumer(connect, monkeypatch):
+    import vllm.distributed.ec_transfer.ec_connector.cpu.control.zmq as control
+    import vllm.distributed.ec_transfer.ec_connector.cpu.data.nixl as data
+    import vllm.distributed.nixl_utils as nixl
+
+    transport = Mock()
+    transport.poll.return_value = {}
+    transport.poll_dead.return_value = []
+    transport.connect.side_effect = RuntimeError("producer unavailable")
+    monkeypatch.setattr(nixl, "NixlWrapper", object())
+    monkeypatch.setattr(nixl, "nixl_agent_config", object())
+    monkeypatch.setattr(data, "NixlDataTransport", lambda **kwargs: Mock())
+    monkeypatch.setattr(control, "ZmqClientTransport", lambda: transport)
+    scheduler = create_rbln_scheduler(
+        max_num_seqs=4, max_num_batched_tokens=8, max_model_len=64
+    )
+    scheduler.ec_connector = connect(
+        ec_role="ec_consumer", role=ECConnectorRole.SCHEDULER
+    )
+    scheduler.max_num_encoder_input_tokens = 16
+    scheduler.encoder_cache_manager = type(scheduler.encoder_cache_manager)(
+        cache_size=8
+    )
+    return scheduler, transport
+
+
+def _remote_request(features):
+    for feature in features:
+        feature.data = None
+    request = make_request("remote", list(range(24)), 16, mm_features=features)
+    request.ec_transfer_params = {
+        feature.identifier: {
+            "peer_host": feature.identifier,
+            "peer_port": 1234,
+            "size_bytes": feature.mm_position.length * HIDDEN * 2,
+        }
+        for feature in features
+    }
+    return request
 
 
 def _step(connector, metadata, run):
@@ -237,6 +286,103 @@ def test_a_runner_hit_is_republished_after_shared_memory_eviction(connect):
         lambda: consumer.start_load_caches(cache),
     )
     assert torch.equal(cache[mm_hash], embeds)
+
+
+@pytest.mark.parametrize("running", [False, True])
+def test_consumer_reuses_runner_hit_without_contacting_producer(ec_consumer, running):
+    scheduler, transport = ec_consumer
+    request = _remote_request([image_at(8, 3)])
+    params = request.ec_transfer_params
+    request.ec_transfer_params = None
+    scheduler.add_request(request)
+    if running:
+        first = scheduler.schedule()
+        scheduler.update_from_output(first, make_model_runner_output(first))
+    request.ec_transfer_params = params
+    manager = scheduler.encoder_cache_manager
+    manager.allocate(request, 0)
+    manager.free(request)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {request.request_id: 8}
+    assert output.scheduled_encoder_inputs == {}
+    assert transport.connect.call_count == 0
+    if not running:
+        assert (
+            request.request_id not in manager.cached[request.mm_features[0].identifier]
+        )
+
+
+def test_consumer_still_fetches_uncached_inputs_in_a_mixed_request(ec_consumer):
+    scheduler, transport = ec_consumer
+    request = _remote_request([image_at(0, 2), image_at(2, 2)])
+    manager = scheduler.encoder_cache_manager
+    manager.allocate(request, 0)
+    manager.free(request)
+
+    assert scheduler._ec_transfer_pending(request, 0)
+    assert transport.connect.call_args_list == [call(("image@2", 1234))]
+    assert scheduler.ec_connector.take_unavailable_requests() == {request.request_id}
+
+
+def test_consumer_refetches_a_runner_hit_evicted_before_readmission(ec_consumer):
+    scheduler, transport = ec_consumer
+    request = _remote_request([image_at(0, 3)])
+    manager = scheduler.encoder_cache_manager
+    manager.allocate(request, 0)
+    manager.free(request)
+    assert not scheduler._ec_transfer_pending(request, 0)
+    assert transport.connect.call_count == 0
+
+    replacement = make_request(
+        "replacement", list(range(24)), 16, mm_features=[image_at(8, 8)]
+    )
+    assert manager.can_allocate(replacement, 0, 16, 0)
+    manager.allocate(replacement, 0)
+    assert scheduler._ec_transfer_pending(request, 0)
+    assert transport.connect.call_count == 1
+
+
+def test_consumer_rechecks_embedding_count_before_reusing_a_runner_hit(ec_consumer):
+    scheduler, transport = ec_consumer
+    request = _remote_request([image_at(0, 3)])
+    manager = scheduler.encoder_cache_manager
+    manager.allocate(request, 0)
+    manager.free(request)
+    assert not scheduler._ec_transfer_pending(request, 0)
+    assert transport.connect.call_count == 0
+
+    request = _remote_request([image_at(0, 4)])
+    assert scheduler._ec_transfer_pending(request, 0)
+    assert transport.connect.call_count == 1
+
+
+def test_consumer_defers_a_runner_hit_evicted_during_scheduling(ec_consumer):
+    scheduler, transport = ec_consumer
+    request = _remote_request([image_at(0, 2), image_at(2, 2)])
+    other = make_request("other", list(range(8)), 16, mm_features=[image_at(8, 2)])
+    manager = type(scheduler.encoder_cache_manager)(cache_size=4)
+    scheduler.encoder_cache_manager = manager
+    manager.allocate(request, 1)
+    manager.free(request)
+    manager.allocate(other, 0)
+    manager.free(other)
+    cpu_cache = scheduler.ec_connector.connector_scheduler._cache
+    first_hash = request.mm_features[0].identifier
+    cpu_cache.alloc(first_hash, 2)
+    cpu_cache.mark_ready(first_hash)
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {request.request_id: 2}
+    assert output.scheduled_encoder_inputs == {}
+    assert request.request_id not in scheduler.encoder_cache_mismatch_reqs
+    assert transport.connect.call_count == 0
+    assert manager.can_allocate(request, 1, 16, 0)
+    assert scheduler._ec_transfer_pending(request, 2)
+    assert transport.connect.call_count == 1
 
 
 def test_an_output_in_another_dtype_is_refused(connect):
