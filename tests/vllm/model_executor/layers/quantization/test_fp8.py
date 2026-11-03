@@ -16,17 +16,24 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.config import set_current_vllm_config
+from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 
+from vllm_rbln.config import RBLNConfig
 from vllm_rbln.model_executor.layers.quantization.fp8 import Fp8MoEMethod
 
 EXPERTS, HIDDEN, INTER, TOKENS, BLOCK = 2, 128, 128, 8, 128
 
 
-def _method(use_w8a8: bool = False) -> Fp8MoEMethod:
-    method = Fp8MoEMethod.__new__(Fp8MoEMethod)
-    method.use_w8a8 = use_w8a8
-    method.weight_block_size = [BLOCK, BLOCK]
-    return method
+def _method(layer, use_w8a8: bool = False) -> Fp8MoEMethod:
+    config = SimpleNamespace(additional_config=RBLNConfig(use_w8a8=use_w8a8))
+    with set_current_vllm_config(config):
+        return Fp8MoEMethod(
+            Fp8Config(
+                is_checkpoint_fp8_serialized=True, weight_block_size=[BLOCK, BLOCK]
+            ),
+            layer,
+        )
 
 
 def _layer(swiglu_limit, activation="silu"):
@@ -39,6 +46,7 @@ def _layer(swiglu_limit, activation="silu"):
         return torch.rand(*shape, generator=g) * 0.2 + 0.1
 
     return SimpleNamespace(
+        moe_config=SimpleNamespace(swiglu_limit=swiglu_limit),
         w13_weight=fp8(EXPERTS, 2 * INTER, HIDDEN),
         w2_weight=fp8(EXPERTS, HIDDEN, INTER),
         w13_weight_scale_inv=scale(EXPERTS, 2 * INTER // BLOCK, HIDDEN // BLOCK),
@@ -73,24 +81,25 @@ def test_apply_clamps_the_swiglu_when_the_layer_has_a_limit(limit):
     g = torch.Generator().manual_seed(1)
     x = torch.randn(TOKENS, HIDDEN, generator=g)
     routing = torch.softmax(torch.randn(EXPERTS, TOKENS, generator=g), dim=0)
-    out = _method().apply(layer, x, routing)
+    out = _method(layer).apply(layer, x, routing)
     expected = _reference(layer, x, routing, limit)
     torch.testing.assert_close(out.float(), expected, atol=1e-3, rtol=1e-3)
     if limit:  # the limit bites: the unclamped result differs
         assert not torch.allclose(out.float(), _reference(layer, x, routing, None))
 
 
-def test_w8a8_refuses_a_limit():
-    with pytest.raises(NotImplementedError, match="W8A8"):
-        _method(use_w8a8=True).apply(
-            _layer(10.0), torch.randn(TOKENS, HIDDEN), torch.ones(EXPERTS, TOKENS)
-        )
+@pytest.mark.parametrize("limit", [None, 0.0, 10.0])
+def test_w8a8_checks_clamp_support_at_initialization(limit):
+    if limit:
+        with pytest.raises(NotImplementedError, match="W8A8.*SwiGLU clamp"):
+            _method(_layer(limit), use_w8a8=True)
+    else:
+        assert _method(_layer(limit), use_w8a8=True).use_w8a8
 
 
 def test_a_limit_needs_silu():
+    layer = _layer(10.0, activation="gelu")
     with pytest.raises(NotImplementedError, match="silu"):
-        _method().apply(
-            _layer(10.0, activation="gelu"),
-            torch.randn(TOKENS, HIDDEN),
-            torch.ones(EXPERTS, TOKENS),
+        _method(layer).apply(
+            layer, torch.randn(TOKENS, HIDDEN), torch.ones(EXPERTS, TOKENS)
         )
