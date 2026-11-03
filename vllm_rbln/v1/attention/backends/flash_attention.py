@@ -180,10 +180,14 @@ class RBLNFlashAttentionMetadata:
 
         self.seq_lens = self.seq_lens.to(torch.int32)
         self.cache_seq_lens = (
-            self.cache_seq_lens.to(torch.int32) if self.cache_seq_lens else None
+            self.cache_seq_lens.to(torch.int32)
+            if self.cache_seq_lens is not None
+            else None
         )
         self.cache_offsets = (
-            self.cache_offsets.to(torch.int32) if self.cache_offsets else None
+            self.cache_offsets.to(torch.int32)
+            if self.cache_offsets is not None
+            else None
         )
 
 

@@ -645,8 +645,8 @@ class RBLNGlm5NextIndexer(nn.Module):
         key = F.layer_norm(
             key.float(),
             (self.head_dim,),
-            self.k_norm.weight,
-            self.k_norm.bias,
+            self.k_norm.weight.float(),
+            self.k_norm.bias.float(),
             self.k_norm.eps,
         ).to(hidden_states.dtype)
         gate = F.linear(hidden_states, self.index_kpool_compress_gate)
