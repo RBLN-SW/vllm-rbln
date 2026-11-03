@@ -16,7 +16,7 @@
 compiled and its image embeddings merged inside the compiled graph."""
 
 import math
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from functools import cached_property
 from itertools import islice
 
@@ -196,15 +196,6 @@ class RBLNGemma4ForConditionalGeneration(
         if vllm_config.parallel_config.data_parallel_size > 1:
             raise ValueError("Gemma4 does not support data parallel on RBLN.")
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-        text_model = self.language_model.model
-        for layer in islice(
-            text_model.layers, text_model.start_layer, text_model.end_layer
-        ):
-            if not layer.enable_moe_block:
-                continue
-            # RBLNMoERunner routes inline and never calls the upstream custom
-            # routing function, which is where Gemma4 applies this scale.
-            layer.experts.router.per_expert_scale = layer.router.per_expert_scale
         self.mm_soft_token_cap = mm_soft_token_cap(
             MULTIMODAL_REGISTRY.create_processor(vllm_config.model_config).info
         )
@@ -218,6 +209,25 @@ class RBLNGemma4ForConditionalGeneration(
         ]
         self._mm_encoder: Callable[..., torch.Tensor] | None
         object.__setattr__(self, "_mm_encoder", None)
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        loaded = super().load_weights(weights)
+        # Scale each expert's down projection instead of its routing weight:
+        # the decode graph lowers the [E, 1] routing-weight scale incorrectly.
+        text_model = self.language_model.model
+        for layer in islice(
+            text_model.layers, text_model.start_layer, text_model.end_layer
+        ):
+            if not layer.enable_moe_block:
+                continue
+            (w2,) = (
+                p
+                for n, p in layer.experts.named_parameters()
+                if n.endswith("w2_weight")
+            )
+            scale = layer.router.per_expert_scale.data
+            w2.data.mul_(scale.to(w2.dtype).view(-1, 1, 1))
+        return loaded
 
     def get_mm_prefix_query_lens(self) -> list[int]:
         # One length per soft token budget the processor may emit, rounded up
