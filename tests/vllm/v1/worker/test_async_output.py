@@ -182,6 +182,27 @@ class TestGetOutput:
         assert result.returncode == 70, result.stdout + result.stderr
         assert "subprocess output copy failed" in result.stdout + result.stderr
 
+    def test_feedback_reuses_readback_without_publishing_output(self):
+        async_out, queue = _async_output(torch.tensor([[7], [8]], dtype=torch.int32))
+        async_out._sampled_token_ids_cpu.copy_(torch.tensor([[10], [11]]))
+        event = Mock()
+        async_out._copy_ready_event = event
+
+        tokens = async_out.get_sampled_token_ids_cpu()
+
+        assert tokens is async_out._sampled_token_ids_cpu
+        assert tokens.tolist() == [[10], [11]]
+        event.synchronize.assert_called_once_with()
+        assert not queue
+        assert async_out.get_output().sampled_token_ids == [[10], [11]]
+
+    def test_feedback_reads_cpu_tokens_without_waiting_for_output_thread(self):
+        tokens = torch.tensor([[7], [8]], dtype=torch.int32)
+        async_out, queue = _async_output(tokens)
+
+        assert async_out.get_sampled_token_ids_cpu() is tokens
+        assert not queue
+
     def test_returns_the_sampled_tokens(self):
         async_out, _ = _async_output(torch.tensor([[7], [8]], dtype=torch.int32))
         assert async_out.get_output().sampled_token_ids == [[7], [8]]
@@ -198,7 +219,11 @@ class TestGetOutput:
         # Overwrite the source, as a later step does to the ring slot. A copy
         # issued at construction still holds the original tokens.
         src.copy_(torch.tensor([[5], [6]], dtype=src.dtype).to("rbln"))
-        assert async_out.get_output().sampled_token_ids == [[1], [0]]
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            output = pool.submit(async_out.get_output)
+            feedback = pool.submit(async_out.get_sampled_token_ids_cpu)
+            assert feedback.result(timeout=10).tolist() == [[1], [0]]
+            assert output.result(timeout=10).sampled_token_ids == [[1], [0]]
 
     def test_clears_the_rows_the_sampler_discarded(self):
         async_out, _ = _async_output(

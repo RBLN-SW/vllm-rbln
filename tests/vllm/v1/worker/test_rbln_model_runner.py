@@ -1989,7 +1989,7 @@ class TestAllocateKvCacheTensors:
         assert raw["l0"].device.type == "cpu"  # self.device is cpu here
 
 
-class TestRepairStagedInputIds:
+class TestRepairInputIds:
     # The scheduler stages -1 where this step's input token belongs; the real
     # token is still on the device in the previous step's ring slot. The repair
     # has to land each one on the row the request occupies *now*.
@@ -1997,7 +1997,17 @@ class TestRepairStagedInputIds:
     def _runner(*, prev_index, prev_tokens, is_prefill=False):
         return _make_runner_stub(
             is_prefill=is_prefill,
-            _prev_token_host_buffer=None,
+            _prev_async_output=(
+                None
+                if prev_tokens is None
+                else SimpleNamespace(
+                    get_sampled_token_ids_cpu=Mock(
+                        return_value=torch.tensor(
+                            prev_tokens, dtype=torch.int32
+                        ).unsqueeze(1)
+                    )
+                )
+            ),
             input_batch=SimpleNamespace(
                 prev_sampled_token_ids=(
                     None
@@ -2015,74 +2025,54 @@ class TestRepairStagedInputIds:
             input_ids=torch.full((num_rows, 1), -1, dtype=torch.int32)
         )
 
-    def test_execute_reads_tokens_before_staging_and_repairs_before_forward(
-        self, monkeypatch
-    ):
-        runner, order = TestExecuteModelFlushesAfterTheSubmission._runner(monkeypatch)
+    def test_preprocess_repairs_cpu_tokens_before_input_staging(self, monkeypatch):
+        runner = self._runner(prev_index={"a": 0}, prev_tokens=[10])
         runner.use_async_scheduling = True
-        runner._pending_token_writeback = deque()
-        runner._prev_token_host_buffer = None
-        runner.input_batch.prev_sampled_token_ids = torch.tensor(
-            [[10]], dtype=torch.int32
-        )
-        runner.input_batch.prev_req_id_to_index = {"r0": 0}
-        staged = self._staged(1)
-        staged.as_kwargs = lambda: {"input_ids": staged.input_ids}
+        runner.input_batch.req_ids = ["a"]
+        runner.input_ids = torch.tensor([-1], dtype=torch.int32)
+        runner.positions = torch.tensor([4], dtype=torch.int64)
+        runner._init_model_kwargs = lambda: {}
+        seen = []
 
-        def preprocess(*args, **kwargs):
-            assert runner._prev_token_host_buffer is not None
-            assert runner._prev_token_host_buffer.tolist() == [10]
-            assert staged.input_ids.item() == -1
-            order.append("stage")
-            return staged, {}
+        def stage(**kwargs):
+            assert kwargs["input_ids"].is_cpu
+            assert kwargs["input_ids"].tolist() == [[10]]
+            seen.append(kwargs["input_ids"].clone())
+            return self._staged(1)
 
-        submit = runner.model_executable
-
-        def executable(**kwargs):
-            assert kwargs["input_ids"].item() == 10
-            return submit(**kwargs)
-
-        runner._preprocess = preprocess
-        runner.model_executable = executable
-        scheduler_output = SimpleNamespace(
-            total_num_scheduled_tokens=1,
-            num_scheduled_tokens={"r0": 1},
-            kv_connector_metadata="META",
-            kv_cache_copy_ops=None,
+        runner.input_stager = SimpleNamespace(stage=stage)
+        monkeypatch.setattr(
+            mr, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True)
         )
 
-        runner.execute_model(scheduler_output)
+        runner._preprocess(SimpleNamespace(), 1, 1, 1, torch.tensor([0]))
 
-        assert order == ["flush", "stage", "submit", "flush"]
+        assert len(seen) == 1
+        runner._prev_async_output.get_sampled_token_ids_cpu.assert_called_once_with()
 
     @pytest.mark.parametrize(
         "req_ids, expected",
         [(["a", "b"], [10, 11]), (["b", "a"], [11, 10]), (["new", "b"], [-1, 11])],
     )
-    def test_writes_the_cpu_snapshot_without_reading_the_ring_again(
-        self, req_ids, expected
-    ):
+    def test_reads_shared_readback_instead_of_the_ring(self, req_ids, expected):
         r = self._runner(prev_index={"a": 0, "b": 1}, prev_tokens=[10, 11])
-        r._repair_staged_input_ids(None, req_ids)
         r.input_batch.prev_sampled_token_ids.fill_(99)
+        inputs = self._staged(len(req_ids)).input_ids
+        r._repair_input_ids(inputs, req_ids)
 
-        staged = self._staged(len(req_ids))
-        r._repair_staged_input_ids(staged, req_ids)
-
-        assert staged.input_ids[:, 0].tolist() == expected
+        assert inputs[:, 0].tolist() == expected
+        r._prev_async_output.get_sampled_token_ids_cpu.assert_called_once_with()
 
     def test_repairs_every_row_when_the_batch_is_unchanged(self):
         r = self._runner(prev_index={"a": 0, "b": 1}, prev_tokens=[10, 11])
         staged = self._staged(2)
-        r._repair_staged_input_ids(None, ["a", "b"])
-        r._repair_staged_input_ids(staged, ["a", "b"])
+        r._repair_input_ids(staged.input_ids, ["a", "b"])
         assert staged.input_ids[:, 0].tolist() == [10, 11]
 
     def test_follows_the_request_when_rows_are_reordered(self):
         r = self._runner(prev_index={"a": 0, "b": 1}, prev_tokens=[10, 11])
         staged = self._staged(2)
-        r._repair_staged_input_ids(None, ["b", "a"])
-        r._repair_staged_input_ids(staged, ["b", "a"])
+        r._repair_input_ids(staged.input_ids, ["b", "a"])
         assert staged.input_ids[:, 0].tolist() == [11, 10]
 
     def test_does_not_shift_rows_up_when_a_request_is_skipped(self):
@@ -2092,38 +2082,33 @@ class TestRepairStagedInputIds:
         # row 0 and hand row 1 the token belonging to row 0.
         r = self._runner(prev_index={"a": 0, "b": 1, "c": 2}, prev_tokens=[10, 11, 12])
         staged = self._staged(3)
-        r._repair_staged_input_ids(None, ["new", "b", "c"])
-        r._repair_staged_input_ids(staged, ["new", "b", "c"])
+        r._repair_input_ids(staged.input_ids, ["new", "b", "c"])
         assert staged.input_ids[:, 0].tolist() == [-1, 11, 12]
 
     def test_leaves_a_request_absent_from_the_previous_batch(self):
         # _apply_pending_token_writeback repairs that one a step later.
         r = self._runner(prev_index={"a": 0}, prev_tokens=[10])
         staged = self._staged(2)
-        r._repair_staged_input_ids(None, ["a", "new"])
-        r._repair_staged_input_ids(staged, ["a", "new"])
+        r._repair_input_ids(staged.input_ids, ["a", "new"])
         assert staged.input_ids[:, 0].tolist() == [10, -1]
 
     def test_does_nothing_when_no_request_carries_over(self):
         r = self._runner(prev_index={"gone": 0}, prev_tokens=[10])
         staged = self._staged(1)
-        r._repair_staged_input_ids(None, ["new"])
-        r._repair_staged_input_ids(staged, ["new"])
+        r._repair_input_ids(staged.input_ids, ["new"])
         assert staged.input_ids[:, 0].tolist() == [-1]
 
     def test_does_nothing_on_a_prefill_step(self):
         # Prefill has no previous sampled token to feed back.
         r = self._runner(prev_index={"a": 0}, prev_tokens=[10], is_prefill=True)
         staged = self._staged(1)
-        r._repair_staged_input_ids(None, ["a"])
-        r._repair_staged_input_ids(staged, ["a"])
+        r._repair_input_ids(staged.input_ids, ["a"])
         assert staged.input_ids[:, 0].tolist() == [-1]
 
     def test_does_nothing_before_the_first_sampled_token_exists(self):
         r = self._runner(prev_index={"a": 0}, prev_tokens=None)
         staged = self._staged(1)
-        r._repair_staged_input_ids(None, ["a"])
-        r._repair_staged_input_ids(staged, ["a"])
+        r._repair_input_ids(staged.input_ids, ["a"])
         assert staged.input_ids[:, 0].tolist() == [-1]
 
 

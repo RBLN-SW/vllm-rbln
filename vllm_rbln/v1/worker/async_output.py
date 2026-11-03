@@ -90,6 +90,13 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
         # them to the host mid-step and serialises what async just decoupled.
         self._logprobs_tensors = logprobs_tensors
 
+    def get_sampled_token_ids_cpu(self) -> torch.Tensor:
+        """Wait for token readback without publishing the scheduler output."""
+        if self._copy_ready_event is None:
+            return self._sampled_token_ids
+        self._copy_ready_event.synchronize()
+        return self._sampled_token_ids_cpu
+
     @worker_fail_fast
     def get_output(self) -> ModelRunnerOutput:
         """Wait for the sampled tokens on the host and return a ModelRunnerOutput.
@@ -97,7 +104,7 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
         Blocks until the copy finishes; the executor decides which thread calls it.
         """
         if self._copy_ready_event is not None:
-            self._copy_ready_event.synchronize()
+            self.get_sampled_token_ids_cpu()
         else:
             # InferenceMode is thread-local, hence off here, and updating
             # _sampled_token_ids_cpu - an inference tensor allocated under

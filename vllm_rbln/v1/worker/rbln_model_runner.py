@@ -330,7 +330,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         # Async scheduling state. The sampled-token buffers live here because
         # async scheduling is the runner's concern; the copy into them is
         # enqueued by the sampler, next to the launch that produces the source.
-        self._prev_token_host_buffer: torch.Tensor | None = None
+        self._prev_async_output: AsyncRBLNModelRunnerOutput | None = None
         self._sampled_token_ring: list[torch.Tensor] = []
         self._ring_slot = 0
         self._async_logprobs_tensors: LogprobsTensors | None = None
@@ -1383,6 +1383,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         """
         # For text-only models
         input_ids = self.input_ids[:num_input_tokens].view(num_reqs, -1)
+        if self.use_async_scheduling:
+            self._repair_input_ids(input_ids, self.input_batch.req_ids)
         positions = self.positions[:num_input_tokens].view(num_reqs, -1)
         inputs_embeds = None
 
@@ -1671,15 +1673,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                         req_index, start : start + len(sampled_ids)
                     ] = sampled_ids
 
-    def _repair_staged_input_ids(
-        self, staged_model_inputs: StagedModelInputs | None, req_ids: list[str]
-    ) -> None:
-        """Read previous tokens with None, then repair inputs after staging.
-
-        Skips requests absent from the previous batch; they are repaired by
-        _apply_pending_token_writeback. Both calls must precede sampling,
-        which may reuse the previous token's ring slot.
-        """
+    def _repair_input_ids(self, input_ids: torch.Tensor, req_ids: list[str]) -> None:
+        """Merge previous tokens into CPU inputs before full input staging."""
         prev_sampled = self.input_batch.prev_sampled_token_ids
         prev_req_id_to_index = self.input_batch.prev_req_id_to_index
         if self.is_prefill or prev_sampled is None or prev_req_id_to_index is None:
@@ -1697,27 +1692,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         if not prev_rows:
             return
 
-        # Remap on the host: any eager device op reading the ring makes the copy
-        # that refills it wait, which costs most of a decode step.
-        num_prev = prev_sampled.shape[0]
-        host_buffer = self._prev_token_host_buffer
-        if staged_model_inputs is None:
-            if (
-                host_buffer is None
-                or host_buffer.shape[0] < num_prev
-                or host_buffer.dtype != prev_sampled.dtype
-            ):
-                host_buffer = torch.empty(num_prev, dtype=prev_sampled.dtype)
-                self._prev_token_host_buffer = host_buffer
-            host_buffer[:num_prev].copy_(prev_sampled[:num_prev, 0])
-            return
+        # Reuse the output snapshot without reading the device ring again.
+        # The output owner keeps its pinned buffer alive through this CPU merge.
+        assert self._prev_async_output is not None
+        host = self._prev_async_output.get_sampled_token_ids_cpu()[:, 0]
 
-        assert host_buffer is not None
-        host = host_buffer[:num_prev]
-
-        input_ids = staged_model_inputs.input_ids
-        # Equal row lists are not the identity prefix: a skipped request leaves a
-        # hole, and [0, 2, 3] written contiguously lands on rows 0, 1, 2.
+        # Matching row lists can contain holes left by newly admitted requests.
         if not any_skipped and cur_rows == prev_rows:
             input_ids[: len(cur_rows), 0].copy_(host[: len(cur_rows)])
         else:
@@ -2072,9 +2052,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 )
             )
 
-            if self.use_async_scheduling:
-                self._repair_staged_input_ids(None, req_ids)
-
             (
                 staged_model_inputs,
                 model_kwargs,
@@ -2087,9 +2064,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 logits_indices,
                 intermediate_tensors,
             )
-
-            if self.use_async_scheduling:
-                self._repair_staged_input_ids(staged_model_inputs, req_ids)
 
         self._stage_attention_metadata(attn_metadata)
         # Run the model.
@@ -2346,6 +2320,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             rank=self.parallel_config.rank,
             dp_rank=self.parallel_config.data_parallel_rank,
         )
+        self._prev_async_output = async_output
         return async_output
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
