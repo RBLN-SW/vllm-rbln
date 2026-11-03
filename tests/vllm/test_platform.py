@@ -517,6 +517,13 @@ class TestRejectedConfigs:
         with pytest.raises(ValueError, match="exceeds"):
             reconfigure(_prefill_chunk(256))
 
+    def test_an_unset_prefill_chunk_resolves_to_the_token_budget(self, reconfigure):
+        config = reconfigure(lambda config: None)
+        assert (
+            config.additional_config.prefill_chunk_size
+            == config.scheduler_config.max_num_batched_tokens
+        )
+
     def test_a_prefill_chunk_below_the_token_budget_is_taken(self, reconfigure):
         config = reconfigure(_prefill_chunk(64))
         assert config.additional_config.prefill_chunk_size == 64

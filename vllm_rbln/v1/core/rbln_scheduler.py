@@ -130,10 +130,7 @@ class RBLNScheduler(Scheduler):
         # the soft cap a no-op. See v1/core/utils.py.
         self._pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
 
-        self._prefill_chunk_size = (
-            rbln_config.prefill_chunk_size
-            or self.scheduler_config.max_num_batched_tokens
-        )
+        self._prefill_chunk_size = rbln_config.prefill_chunk_size
 
     def _decode_demand(self) -> int:
         """Total decode demand for this step's soft (ceil(demand/pp)) cap.

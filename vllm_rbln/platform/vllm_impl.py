@@ -173,6 +173,9 @@ def _validate(vllm_config: "VllmConfig") -> None:
                 f"--rbln-prefill-chunk-size={chunk} below {max_num_batched_tokens=} "
                 f"is not supported with {', '.join(unsupported)} on RBLN yet."
             )
+    # Resolved here so the scheduler and runner read one value, and compute_hash,
+    # which runs after this, keys "unset" and "set to the budget" alike.
+    rbln_config.prefill_chunk_size = chunk or max_num_batched_tokens
 
     if envs.VLLM_RBLN_COMPILE_ONLY and envs.VLLM_DISABLE_COMPILE_CACHE:
         # Compile-only compiles each graph and writes the .rbln artifact to
