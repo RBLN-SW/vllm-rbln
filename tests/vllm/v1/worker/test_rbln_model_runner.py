@@ -56,12 +56,15 @@ import vllm_rbln.platform as platform
 import vllm_rbln.v1.worker.dp_utils as dp_utils
 import vllm_rbln.v1.worker.rbln_model_runner as mr
 import vllm_rbln.v1.worker.utils as worker_utils
+from tests.vllm.v1.attention.utils import make_builder
 from tests.vllm.v1.worker.utils import (
     make_runner_config,
     make_speculative_config,
     schedule_new,
 )
+from tests.vllm.vllm_config import make_vllm_config
 from vllm_rbln.config import RBLNConfig
+from vllm_rbln.v1.attention.backends.flash_attention import RBLNFlashAttentionMetadata
 from vllm_rbln.v1.core.rbln_kv_cache_manager import KVCacheCopyOp
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.utils import eagle_prepare_inputs_padded
@@ -107,6 +110,7 @@ def _make_runner_stub(**attrs):
     runner = object.__new__(RBLNModelRunner)
     runner.dp_status = None
     runner.supports_mm_inputs = False
+    runner.attn_groups = []
     for key, value in attrs.items():
         setattr(runner, key, value)
     return runner
@@ -2538,3 +2542,76 @@ class TestExecuteModelFlushesAfterTheSubmission:
         # The entry flush recovers a stale hold, then this step's read goes out
         # only after its own submission.
         assert order == ["flush", "submit", "flush"]
+
+
+class TestDeferredAttentionStaging:
+    @pytest.mark.parametrize("dummy", [False, True])
+    def test_stages_each_group_after_inputs_before_forward_context(
+        self, monkeypatch, dummy
+    ):
+        if dummy:
+            runner, _ = TestDummyRunPadding._runner(
+                monkeypatch, reqs_across_dp=[1, 1, 1, 1]
+            )
+        else:
+            runner, _ = TestExecuteModelFlushesAfterTheSubmission._runner(monkeypatch)
+        cfg = make_vllm_config(max_model_len=32, max_num_batched_tokens=8)
+        metadata = {}
+        sources = []
+        runner.attn_groups = []
+        for index in range(2):
+            layers = [f"group{index}.layer0", f"group{index}.layer1"]
+            builder = make_builder(cfg, layer_names=tuple(layers))
+            source = torch.tensor([[index]])
+            md = RBLNFlashAttentionMetadata(
+                seq_lens=source,
+                block_tables=torch.tensor([index]),
+                is_prefill=False,
+            )
+            sources.append((md, source))
+            metadata.update(dict.fromkeys(layers, md))
+            runner.attn_groups.append(
+                [
+                    SimpleNamespace(
+                        layer_names=layers, get_metadata_builder=lambda i, b=builder: b
+                    )
+                ]
+            )
+        runner._build_attention_metadata = lambda **kw: (metadata, None)
+
+        prepare = runner.input_stager.stage if dummy else runner._preprocess
+
+        def prepare_inputs(*args, **kwargs):
+            for md, source in sources:
+                assert md.seq_lens is source
+                source.add_(10)
+            return prepare(*args, **kwargs)
+
+        if dummy:
+            monkeypatch.setattr(runner.input_stager, "stage", prepare_inputs)
+        else:
+            monkeypatch.setattr(runner, "_preprocess", prepare_inputs)
+
+        contexts = []
+
+        def forward_context(attn_metadata, *args, **kwargs):
+            assert attn_metadata is metadata
+            for md, source in sources:
+                assert md.seq_lens is not source
+                assert torch.equal(md.seq_lens, source)
+            contexts.append(attn_metadata)
+            return nullcontext()
+
+        monkeypatch.setattr(mr, "set_forward_context", forward_context)
+        if dummy:
+            runner._dummy_run(1, 1, is_prefill=False)
+        else:
+            runner.execute_model(
+                SimpleNamespace(
+                    total_num_scheduled_tokens=1,
+                    num_scheduled_tokens={"r0": 1},
+                    kv_connector_metadata="META",
+                    kv_cache_copy_ops=None,
+                )
+            )
+        assert len(contexts) == 1

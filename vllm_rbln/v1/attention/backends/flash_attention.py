@@ -230,26 +230,29 @@ class RBLNFlashAttentionMetadataBuilder(
 
         self._staged: dict[tuple, torch.Tensor] = {}
 
-    def _stage(self, t: torch.Tensor | None, slot: str) -> torch.Tensor | None:
-        """Copy a host tensor into this builder's persistent device buffer.
+    def stage(self, metadata: RBLNFlashAttentionMetadata):
+        """Copy a host tensor into this builder's persistent device buffer."""
 
-        `slot` must be unique per logical tensor: cache_seq_lens and
-        cache_offsets share both shape and dtype, so keying on those alone
-        would silently make them share one buffer.
+        def _stage(t: torch.Tensor | None, slot: str) -> torch.Tensor | None:
+            if t is None:
+                return None
+            key = (slot, t.shape, t.dtype)
+            if (buf := self._staged.get(key)) is None:
+                buf = torch.empty(t.shape, dtype=t.dtype, device=self.device)
+                self._staged[key] = buf
+            buf.copy_(t)
+            return buf
 
-        The returned tensor is overwritten by the next build() call, so the
-        caller must run the forward pass before building again. That holds
-        because each AttentionGroup owns its own builder instance and every
-        build() is immediately followed by a forward.
-        """
-        if t is None:
-            return None
-        key = (slot, t.shape, t.dtype)
-        if (buf := self._staged.get(key)) is None:
-            buf = torch.empty(t.shape, dtype=t.dtype, device=self.device)
-            self._staged[key] = buf
-        buf.copy_(t)
-        return buf
+        metadata.seq_lens = _stage(metadata.seq_lens, "seq_lens")
+        metadata.block_tables = _stage(metadata.block_tables, "block_tables")
+        metadata.attn_masks = _stage(metadata.attn_masks, "attn_masks")
+        metadata.cache_seq_lens = _stage(metadata.cache_seq_lens, "cache_seq_lens")
+        metadata.cache_offsets = _stage(metadata.cache_offsets, "cache_offsets")
+        metadata.local_block_tables = _stage(
+            metadata.local_block_tables, "local_block_tables"
+        )
+        metadata.swa_attn_masks = _stage(metadata.swa_attn_masks, "swa_attn_masks")
+        metadata.num_accepted = _stage(metadata.num_accepted, "num_accepted")
 
     def reorder_batch(
         self, input_batch: "InputBatch", scheduler_output: "SchedulerOutput"
@@ -357,22 +360,21 @@ class RBLNFlashAttentionMetadataBuilder(
             local_block_tables = block_tables_tensor[..., :1]
 
         attn_metadata = RBLNFlashAttentionMetadata(
-            seq_lens=self._stage(seq_idx, "seq_idx"),
-            block_tables=self._stage(block_tables_tensor, "block_tables"),
+            seq_lens=seq_idx,
+            block_tables=block_tables_tensor,
             is_prefill=is_prefill,
-            attn_masks=self._stage(attn_masks, "attn_masks"),
+            attn_masks=attn_masks,
             swa_appends=self.swa_appends,
-            cache_seq_lens=self._stage(cache_seq_lens, "cache_seq_lens"),
-            cache_offsets=self._stage(cache_offsets, "cache_offsets"),
-            local_block_tables=self._stage(local_block_tables, "local_block_tables"),
-            swa_attn_masks=self._stage(swa_attn_masks, "swa_attn_masks"),
+            cache_seq_lens=cache_seq_lens,
+            cache_offsets=cache_offsets,
+            local_block_tables=local_block_tables,
+            swa_attn_masks=swa_attn_masks,
             use_custom_kernel=self.use_custom_kernel,
             is_prompt_sorted=is_prompt_sorted,
-            num_accepted=self._stage(
+            num_accepted=(
                 None
                 if num_accepted is None
-                else rbln_utils.pad(num_accepted.view(-1, 1), 0, batch_pad),
-                "num_accepted",
+                else rbln_utils.pad(num_accepted.view(-1, 1), 0, batch_pad)
             ),
         )
 

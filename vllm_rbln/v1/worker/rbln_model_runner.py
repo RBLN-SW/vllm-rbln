@@ -2084,6 +2084,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             if self.use_async_scheduling:
                 self._repair_staged_input_ids(staged_model_inputs, req_ids)
 
+        self._stage_attention_metadata(attn_metadata)
         # Run the model.
         # With spec decode, defer connector finalization (wait_for_save + clear
         # metadata) until after the draft runs in sample_tokens() so the draft
@@ -2912,6 +2913,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             layout=layout,
         )
 
+        self._stage_attention_metadata(attn_metadata)
         with set_forward_context(
             attn_metadata,
             self.vllm_config,
@@ -4180,6 +4182,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     dsts.append(kv_cache.select(axis, dst)[..., :nt, :])
                     srcs.append(kv_cache.select(axis, src)[..., :nt, :])
         torch._foreach_copy_(dsts, srcs)
+
+    def _stage_attention_metadata(self, attn_metadata: PerLayerAttnMetadata) -> None:
+        for groups in self.attn_groups:
+            for group in groups:
+                builder = group.get_metadata_builder(0)
+                builder.stage(attn_metadata[group.layer_names[0]])
 
 
 def _dummy_tensor_view(

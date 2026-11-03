@@ -535,42 +535,70 @@ class TestBuildOutputAssembly:
 
 class TestStage:
     def test_none_passthrough(self, cfg):
-        # None in -> None out; there is nothing to stage.
-        assert make_builder(cfg)._stage(None, "x") is None
+        md = _metadata()
+        make_builder(cfg).stage(md)
+        assert md.attn_masks is None
+        assert md.cache_seq_lens is None
+        assert md.cache_offsets is None
+        assert md.local_block_tables is None
+        assert md.swa_attn_masks is None
 
-    def test_copies_values_onto_self_device(self, cfg):
-        # The tensor is copied into a buffer living on self.device.
-        staged = make_builder(cfg)._stage(torch.tensor([1, 2, 3]), "x")
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "seq_lens",
+            "block_tables",
+            "attn_masks",
+            "cache_seq_lens",
+            "cache_offsets",
+            "local_block_tables",
+            "swa_attn_masks",
+        ],
+    )
+    def test_copies_values_onto_self_device(self, cfg, field):
+        md = _metadata()
+        source = torch.tensor([1, 2, 3])
+        setattr(md, field, source)
+        builder = make_builder(cfg)
+        builder.stage(md)
+        staged = getattr(md, field)
+        assert torch.equal(staged, source)
+        assert staged.device == builder.device
+        source.zero_()
         assert staged.tolist() == [1, 2, 3]
-        assert staged.device.type == "cpu"  # self.device
 
     def test_reuses_buffer_for_same_key(self, cfg):
-        # Same (slot, shape, dtype) key returns the one buffer, overwriting it.
         builder = make_builder(cfg)
-        first = builder._stage(torch.tensor([1, 2, 3]), "x")
-        second = builder._stage(torch.tensor([4, 5, 6]), "x")
-        assert first is second
-        assert second.tolist() == [4, 5, 6]
+        first = _metadata(cache_seq_lens=torch.tensor([1, 2, 3]))
+        second = _metadata(cache_seq_lens=torch.tensor([4, 5, 6]))
+        builder.stage(first)
+        builder.stage(second)
+        assert first.cache_seq_lens is second.cache_seq_lens
+        assert second.cache_seq_lens.tolist() == [4, 5, 6]
 
     def test_distinct_slots_do_not_alias(self, cfg):
-        # cache_seq_lens and cache_offsets share shape/dtype; the slot keeps them
-        # from sharing one buffer (the _stage docstring warning).
-        builder = make_builder(cfg)
-        t = torch.tensor([1, 2, 3])
-        assert builder._stage(t, "cache_seq_lens") is not builder._stage(
-            t, "cache_offsets"
+        md = _metadata(
+            cache_seq_lens=torch.tensor([1, 2, 3]),
+            cache_offsets=torch.tensor([4, 5, 6]),
         )
+        make_builder(cfg).stage(md)
+        md.cache_seq_lens.zero_()
+        assert md.cache_offsets.tolist() == [4, 5, 6]
 
-    def test_different_shape_gets_new_buffer(self, cfg):
-        # A different shape is a different key, so it gets its own buffer.
+    @pytest.mark.parametrize(
+        "second_tensor", [torch.tensor([4, 5]), torch.tensor([4.0, 5.0, 6.0])]
+    )
+    def test_different_shape_or_dtype_gets_new_buffer(self, cfg, second_tensor):
         builder = make_builder(cfg)
-        assert builder._stage(torch.tensor([1, 2, 3]), "x") is not builder._stage(
-            torch.tensor([1, 2]), "x"
-        )
+        first = _metadata(cache_seq_lens=torch.tensor([1, 2, 3]))
+        second = _metadata(cache_seq_lens=second_tensor)
+        builder.stage(first)
+        builder.stage(second)
+        assert first.cache_seq_lens.tolist() == [1, 2, 3]
+        assert torch.equal(second.cache_seq_lens, second_tensor)
 
-    def test_buffer_reused_across_builds(self, cfg):
-        # The "overwritten by next build()" contract: same slot/shape/dtype across
-        # builds returns the same buffer, so the earlier result is clobbered.
+    @pytest.mark.parametrize("stage_first", [False, True])
+    def test_build_preserves_previous_values_until_stage(self, cfg, stage_first):
         builder = make_builder(cfg)
 
         def run(offset):
@@ -584,12 +612,19 @@ class TestStage:
                 torch.arange(4) + offset,
                 batch_pad=1,
                 is_prefill=True,
-            ).seq_lens
+            )
 
-        first = run(0)  # seq_idx = [0]
-        second = run(10)  # seq_idx = [10]
-        assert first is second
-        assert first.reshape(-1).tolist() == [10]
+        first = run(0)
+        if stage_first:
+            builder.stage(first)
+        second = run(10)
+        assert first.seq_lens.reshape(-1).tolist() == [0]
+        assert second.seq_lens.reshape(-1).tolist() == [10]
+        assert first.seq_lens is not second.seq_lens
+        builder.stage(second)
+        if stage_first:
+            assert first.seq_lens is second.seq_lens
+            assert first.seq_lens.reshape(-1).tolist() == [10]
 
 
 @pytest.mark.maybe_use_device
