@@ -256,8 +256,10 @@ def num_attn_module(model_config, cache_dtype) -> int:
     if getattr(hf_config, "model_type", None) == "longcat_flash":
         return 2
     text_config = getattr(model_config, "hf_text_config", hf_config)
-    # GLM-5.3: a KDA layer's caches are its head groups' states, its conv ring and
-    # (MTP) its head groups' drafts, so at most two a head and one.
+    # GLM uses an upper bound for per-layer index spacing, not a cache count.
+    # KDA needs up to 2 * num_groups + 1 slots; num_groups <= linear_num_heads.
+    # MTP uses the same bound although its DSA layers have only four slots.
+    # Cache binding compacts the actual entries into consecutive indices.
     if getattr(text_config, "model_type", None) in ("glm5_next_text", "glm5_next_mtp"):
         return 2 * text_config.linear_num_heads + 1
     # A DSA model puts the lightning-indexer key cache next to MLA: 2 modules,

@@ -311,6 +311,29 @@ class TestPrepareInputsSpecDecode:
 
 
 class TestPrepareInputsReplaysAcceptedDrafts:
+    @pytest.mark.parametrize("num_spec_tokens", [2, 3, 5])
+    def test_context_end_reports_unsupported_replay_window(
+        self, make_model_runner, monkeypatch, num_spec_tokens
+    ):
+        runner = make_model_runner()
+        _decode_ready(
+            runner,
+            monkeypatch,
+            num_spec_tokens=num_spec_tokens,
+            num_computed=runner.max_model_len - 2,
+        )
+        runner.replays_accepted_drafts = True
+
+        with pytest.raises(
+            NotImplementedError, match="recurrent-state replay.*max_model_len"
+        ) as exc:
+            runner._prepare_inputs(
+                make_scheduler_output(num_scheduled_tokens={"a": 1}),
+                np.array([1], dtype=np.int32),
+            )
+        assert f"num_speculative_tokens={num_spec_tokens}" in str(exc.value)
+        assert f"max_model_len={runner.max_model_len}" in str(exc.value)
+
     def test_verify_resumes_from_the_previous_steps_state(
         self, make_model_runner, monkeypatch
     ):

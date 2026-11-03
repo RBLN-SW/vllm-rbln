@@ -939,7 +939,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             front_pad = np.maximum(
                 0, num_computed + query_lengths - self.max_model_len
             ).astype(np.int32)
-            assert not (self.replays_accepted_drafts and front_pad.any()), front_pad
+            if self.replays_accepted_drafts and front_pad.any():
+                raise NotImplementedError(
+                    "RBLN speculative decoding with recurrent-state replay does not "
+                    "support shifting the fixed decode window at max_model_len. "
+                    f"num_speculative_tokens={self.num_spec_tokens}, "
+                    f"max_model_len={self.max_model_len}, "
+                    f"front_pad={front_pad.tolist()}."
+                )
             back_pad = slack - front_pad
         else:
             query_lengths = logical_num_tokens
