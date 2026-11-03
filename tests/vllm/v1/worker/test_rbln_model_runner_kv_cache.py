@@ -23,6 +23,7 @@ import torch
 
 import vllm_rbln.v1.worker.rbln_model_runner as mr
 from tests.vllm.v1.worker.utils import make_kv_cache_config, schedule_new
+from vllm_rbln.v1.attention.kv_cache_bindings import kv_cache_tensor_key
 from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
 
 pytestmark = pytest.mark.maybe_use_device
@@ -192,19 +193,22 @@ class TestBlockAuxKVCaches:
             monkeypatch.setitem(context, f"layer.{i}", module)
         config = make_kv_cache_config(runner, groups=[("layer.0",), ("layer.1",)])
         runner.initialize_kv_cache(config)
-        assert list(runner.kv_cache_allocations) == ["layer.0", "layer.2"]
-        assert runner.kv_cache_allocations["layer.0"]() is runner.kv_caches[0]
-        assert runner.kv_cache_allocations["layer.2"]() is runner.kv_caches[2]
+        assert runner.kv_cache_allocations == {
+            kv_cache_tensor_key(runner.kv_caches[0]): "layer.0",
+            kv_cache_tensor_key(runner.kv_caches[2]): "layer.2",
+        }
 
         old_allocations = runner.kv_cache_allocations.copy()
         replacement = make_kv_cache_config(
             runner, groups=[("layer.0",), ("layer.1",)], num_blocks=20
         )
         runner.initialize_kv_cache_tensors(replacement, runner._kernel_block_sizes)
-        assert list(runner.kv_cache_allocations) == list(old_allocations)
-        for name, ref in runner.kv_cache_allocations.items():
-            assert ref() is not old_allocations[name]()
-            assert ref() is context[name].kv_cache
+        assert list(runner.kv_cache_allocations.values()) == list(
+            old_allocations.values()
+        )
+        assert runner.kv_cache_allocations.keys().isdisjoint(old_allocations)
+        for key, name in runner.kv_cache_allocations.items():
+            assert key == kv_cache_tensor_key(context[name].kv_cache)
 
     @staticmethod
     def _aux(owner, shape=(4, 64), dtype=torch.bfloat16):

@@ -23,7 +23,6 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any
-from weakref import ReferenceType
 
 import torch
 import torch.rbln  # noqa: F401  # a hard dependency; see pyproject.
@@ -207,7 +206,7 @@ class DynamicKvSizer:
         # The count vLLM sized, held while the cache is shrunk for the compile.
         self.kv_blocks_before_shrink: int | None = None
         self.programs: list[Any] = []
-        self.program_inputs: dict[int, tuple[ReferenceType[torch.Tensor], ...]] = {}
+        self.program_inputs: dict[int, tuple[tuple, ...]] = {}
         self.expected_used: dict[Unit, int] = {}
         # Other tenants' card DRAM at init; the allocator-snapshot fallback only.
         self.foreign_dram_used_bytes = foreign_dram_used_bytes
@@ -735,6 +734,7 @@ class DynamicKvSizer:
         mr.kv_cache_names = []
         mr.kv_cache_block_axes = {}
         mr.kv_cache_allocations = {}
+        self.program_inputs = {}
 
         # Each layer's view is parked on its Attention module; the next bind
         # overwrites it only after the new tensors exist.

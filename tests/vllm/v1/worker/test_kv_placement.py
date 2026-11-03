@@ -19,12 +19,12 @@ form rebel emits: ints for static dims, `("symbol", name)` for the dynamic one.
 the dynamic dim's compile-time extent.
 """
 
-import weakref
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from vllm_rbln.v1.attention.kv_cache_bindings import kv_cache_tensor_key
 from vllm_rbln.v1.worker.kv_placement import (
     ChipletMemory,
     allocator_reserved,
@@ -221,12 +221,13 @@ class TestGrowth:
 
 
 def _inventory(*caches):
-    return {f"cache.{i}": weakref.ref(t) for i, t in enumerate(caches)}
+    return {kv_cache_tensor_key(t): f"cache.{i}" for i, t in enumerate(caches)}
 
 
 def _select(programs, allocations):
     bindings = {
-        id(p.runtime): tuple(weakref.ref(t) for t in p.bindings) for p in programs
+        id(p.runtime): tuple(kv_cache_tensor_key(t) for t in p.bindings)
+        for p in programs
     }
     return select_kv_inputs(programs, allocations, bindings)
 
@@ -318,14 +319,13 @@ class TestSelectKvInputs:
         with pytest.raises(RuntimeError, match="not an initialized"):
             _select([_program([HEAD_SHARDED], bindings=[unknown])], _inventory(a))
 
-    def test_released_binding_is_refused(self):
+    def test_unrecorded_graph_is_refused_even_if_all_allocations_are_covered(self):
         cache = torch.empty(8)
-        program = _program([HEAD_SHARDED], bindings=[cache], statics=0)
-        released = weakref.ref(torch.empty(8))
-        with pytest.raises(RuntimeError, match="no live binding"):
-            select_kv_inputs(
-                [program], _inventory(cache), {id(program.runtime): (released,)}
-            )
+        prefill = _program([HEAD_SHARDED], bindings=[cache], statics=0)
+        verify = _program([REPLICATED], bindings=[cache], statics=0)
+        bindings = {id(prefill.runtime): (kv_cache_tensor_key(cache),)}
+        with pytest.raises(RuntimeError, match="no captured input bindings"):
+            select_kv_inputs([prefill, verify], _inventory(cache), bindings)
 
     def test_missing_captured_bindings_is_refused(self):
         cache = torch.empty(8)

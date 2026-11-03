@@ -14,7 +14,6 @@
 
 import collections
 import dataclasses
-import weakref
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from contextlib import nullcontext
@@ -351,7 +350,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # KV cache layer names in layer-index order; the deterministic
         # ordering the KV connector relies on for region<->layer agreement.
         self.kv_cache_names: list[str] = []
-        self.kv_cache_allocations: dict[str, weakref.ReferenceType[torch.Tensor]] = {}
+        self.kv_cache_allocations: dict[tuple, str] = {}
         # Initialize in initialize_kv_cache_tensors
         self.cross_layers_kv_cache: torch.Tensor | None = None
         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
@@ -3444,13 +3443,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             )
         self.kv_cache_names = get_kv_cache_names(kv_caches, num_attn_module)
         self.kv_caches = [kv_caches[name] for name in self.kv_cache_names]
+        # The runner owns the cache storage until sizing finishes. Rebuild keys
+        # on allocation so addresses are never matched across cache generations.
         self.kv_cache_allocations = {}
-        seen_allocations = set()
         for name, cache in zip(self.kv_cache_names, self.kv_caches):
             key = kv_cache_tensor_key(cache)
-            if key not in seen_allocations:
-                self.kv_cache_allocations[name] = weakref.ref(cache)
-                seen_allocations.add(key)
+            self.kv_cache_allocations.setdefault(key, name)
         self.kv_cache_block_axes = block_axes
         forward_context = self.compilation_config.static_forward_context
         for layer_name, kv_cache in kv_caches.items():

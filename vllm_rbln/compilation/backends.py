@@ -13,7 +13,6 @@
 # limitations under the License.
 import itertools
 import traceback
-import weakref
 from collections.abc import Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -30,9 +29,9 @@ logger = init_logger(__name__)
 
 _compile_counter = itertools.count(1)
 _current_stage = ContextVar("rbln_backend_current_stage", default="runtime")
-program_input_bindings: ContextVar[
-    dict[int, tuple[weakref.ReferenceType[torch.Tensor], ...]] | None
-] = ContextVar("rbln_program_input_bindings", default=None)
+program_input_bindings: ContextVar[dict[int, tuple[tuple, ...]] | None] = ContextVar(
+    "rbln_program_input_bindings", default=None
+)
 _SELF_FILE = Path(__file__).resolve()
 
 _DTYPE_SHORT = {
@@ -138,12 +137,15 @@ def _rbln_backend(
         "; ".join(parts),
     )
     runtime = rbln_torch_compile_backend(graph, example_inputs, **kwargs)
-    # The dynamic-KV sizer matches a program's KV inputs to the caches vllm
-    # allocated by tensor identity: the backend's return value is what a captured
-    # program carries as `.runtime`, and its `input_specs` run in this order.
+    # Captured programs carry this runtime and tensor-input order. Snapshot
+    # byte-window keys here so sizing does not depend on input views surviving.
     if (bindings := program_input_bindings.get()) is not None:
+        from vllm_rbln.v1.attention.kv_cache_bindings import kv_cache_tensor_key
+
         bindings[id(runtime)] = tuple(
-            weakref.ref(x) for x in example_inputs if isinstance(x, torch.Tensor)
+            kv_cache_tensor_key(x)
+            for x in example_inputs
+            if isinstance(x, torch.Tensor)
         )
     return runtime
 
