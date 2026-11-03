@@ -1413,13 +1413,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     f"long_prefill_token_threshold={threshold} would split a "
                     f"multimodal range of up to {longest} tokens."
                 )
-            # TODO(RBLN): each of these resumes a range mid-way or runs it under
-            # a shape this path does not pick yet.
-            if self.cache_config.enable_prefix_caching:
-                raise ValueError(
-                    "Prefix caching is not supported with multimodal inputs of an "
-                    "mm prefix LM on RBLN yet; pass --no-enable-prefix-caching."
-                )
+            # TODO(RBLN): spec decode runs a range under a shape this path does
+            # not pick yet.
             if self.speculative_config is not None:
                 raise ValueError(
                     "Speculative decoding is not supported with multimodal inputs of "
@@ -1998,7 +1993,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             )
 
             # The scheduler hands a range to a step of its own, so a prefill
-            # spanning exactly one range is an mm prefix step.
+            # ending a range it started in, at its start or where a prefix cache
+            # hit resumed it, is an mm prefix step.
             self.mm_prefix_query_len = None
             if self.is_prefill and self.mm_prefix_query_lens:
                 first = int(self.input_batch.num_computed_tokens_cpu[0])
@@ -2009,7 +2005,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     if feature.modality in ("image", "video")
                     for embeds_range in feature.mm_position.extract_embeds_range()
                 ]
-                if (first, last) in ranges:
+                if any(start <= first and last == end for start, end in ranges):
                     self.mm_prefix_query_len = next(
                         query_len
                         for query_len in self.mm_prefix_query_lens

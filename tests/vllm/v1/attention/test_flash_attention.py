@@ -537,7 +537,7 @@ class TestBuildMmPrefixSlidingWindow:
         logits = (q @ k.transpose(-1, -2) * scale).masked_fill(~keep, float("-inf"))
         return logits.softmax(-1) @ v
 
-    def _run(self, cfg, chunks, mm_ranges, *, padding=3):
+    def _run(self, cfg, chunks, mm_ranges, *, padding=3, checked=None):
         torch.manual_seed(0)
         n = chunks[-1][1]
         shape = (1, self.HEADS, 1, n, self.DIM)
@@ -550,7 +550,8 @@ class TestBuildMmPrefixSlidingWindow:
         builder = self._builder(cfg)
         outputs = []
         for s, e in chunks:
-            is_mm_prefix = (s, e) in mm_ranges
+            # A prefix cache hit can resume a range mid-way; the step is its tail.
+            is_mm_prefix = any(rs <= s and e == re for rs, re in mm_ranges)
             query_len = e - s + padding if is_mm_prefix else e - s
 
             def chunk(t, s=s, e=e, query_len=query_len):
@@ -581,6 +582,11 @@ class TestBuildMmPrefixSlidingWindow:
             )
             outputs.append(out[..., : e - s, :])
         expected = self._dense(q, k, v, scale, mm_ranges)
+        if checked is not None:
+            # Only the chunk at that index; a single layer's cached K/V do not
+            # depend on the mask, so earlier chunks just fill the cache.
+            s, e = chunks[checked]
+            return (outputs[checked] - expected[..., s:e, :]).abs().max().item()
         return (torch.cat(outputs, dim=-2) - expected).abs().max().item()
 
     def test_a_range_inside_the_window(self, cfg):
@@ -592,6 +598,16 @@ class TestBuildMmPrefixSlidingWindow:
 
     def test_a_range_at_the_start_of_the_prompt(self, cfg):
         assert self._run(cfg, [(0, 6), (6, 13)], [(0, 6)]) < 1e-5
+
+    def test_a_range_resumed_mid_way_by_a_prefix_cache_hit(self, cfg):
+        # The cached head [9, 12) is behind every query of the tail [12, 16), so
+        # the step's own mask already sees it.
+        chunks = [(0, 9), (9, 16), (12, 16)]
+        assert self._run(cfg, chunks, [(9, 16)], checked=2) < 1e-5
+
+    def test_a_long_range_resumed_mid_way_is_still_clipped_by_the_window(self, cfg):
+        chunks = [(0, 5), (5, 20), (15, 20)]
+        assert self._run(cfg, chunks, [(5, 20)], checked=2) < 1e-5
 
     def test_a_full_attention_group_builds_no_mask(self, cfg):
         md = make_builder(cfg).build(

@@ -114,22 +114,29 @@ class TestResolveMmPrefixSupport:
         with pytest.raises(ValueError, match="SupportsRBLNMmPrefix"):
             runner._resolve_mm_support()
 
-    @pytest.mark.parametrize(
-        "config, match",
-        [
-            ({"long_prefill_token_threshold": 64}, "long_prefill_token_threshold"),
-            ({"enable_prefix_caching": True}, "Prefix caching"),
-        ],
-    )
     def test_a_config_that_would_split_a_range_is_refused(
-        self, make_model_runner, monkeypatch, config, match
+        self, make_model_runner, monkeypatch
     ):
         runner = self._runner(
-            make_model_runner, monkeypatch, _MmPrefixModel([64, 128]), **config
+            make_model_runner,
+            monkeypatch,
+            _MmPrefixModel([64, 128]),
+            long_prefill_token_threshold=64,
         )
 
-        with pytest.raises(ValueError, match=match):
+        with pytest.raises(ValueError, match="long_prefill_token_threshold"):
             runner._resolve_mm_support()
+
+    def test_prefix_caching_is_taken(self, make_model_runner, monkeypatch):
+        # A hit ending inside a range resumes it in a step of its own.
+        runner = self._runner(
+            make_model_runner,
+            monkeypatch,
+            _MmPrefixModel([64, 128]),
+            enable_prefix_caching=True,
+        )
+
+        assert runner._resolve_mm_support() is True
 
 
 class TestGatherMultimodalEmbeddings:
