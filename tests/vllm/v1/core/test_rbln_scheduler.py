@@ -20,6 +20,7 @@ import inspect
 from types import SimpleNamespace
 
 import pytest
+from vllm.config.ec_manager_config import EncoderCacheManagerConfig
 from vllm.distributed.kv_events import BlockStored, KVEventBatch
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -47,6 +48,19 @@ from vllm_rbln.v1.core.utils import is_prefill, step_is_prefill
 
 
 class TestSchedulerInit:
+    def test_no_ec_connector_keeps_the_default_encoder_cache_manager(self):
+        sched = create_rbln_scheduler()
+        assert type(sched.encoder_cache_manager) is EncoderCacheManager
+
+    def test_explicit_encoder_cache_manager_is_preserved(self):
+        config = EncoderCacheManagerConfig(
+            encoder_cache_manager_cls=(
+                "vllm.v1.core.encoder_cache_manager.EncoderCacheManager"
+            )
+        )
+        sched = create_rbln_scheduler(ec_manager_config=config)
+        assert type(sched.encoder_cache_manager) is EncoderCacheManager
+
     @pytest.mark.usefixtures("cr13")
     def test_sub_block_caching_enabled_uses_rbln_manager(self):
         # prefix caching + eligible config + sub_block_size -> RBLNKVCacheManager.

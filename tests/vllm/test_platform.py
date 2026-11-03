@@ -33,6 +33,7 @@ import pytest
 import torch
 from pydantic import ValidationError
 from vllm.config import CompilationMode, ECTransferConfig, VllmConfig
+from vllm.config.ec_manager_config import EncoderCacheManagerConfig
 from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -694,6 +695,33 @@ class TestCompileDtype:
 
 
 class TestWorkerAndScheduler:
+    @pytest.mark.parametrize(
+        "encoder_decoder,custom_manager,expected",
+        [
+            (False, None, "vllm_rbln.v1.core.rbln_scheduler.RBLNEncoderCacheManager"),
+            (True, None, None),
+            (
+                False,
+                "vllm.v1.core.encoder_cache_manager.EncoderCacheManager",
+                "vllm.v1.core.encoder_cache_manager.EncoderCacheManager",
+            ),
+        ],
+    )
+    def test_ec_encoder_cache_manager_selection(
+        self, reconfigure, encoder_decoder, custom_manager, expected
+    ):
+        def mutate(config: VllmConfig) -> None:
+            config.ec_transfer_config = ECTransferConfig(
+                ec_connector="RblnECCPUConnector", ec_role="ec_both"
+            )
+            config.model_config.is_encoder_decoder = encoder_decoder
+            config.ec_manager_config = EncoderCacheManagerConfig(
+                encoder_cache_manager_cls=custom_manager
+            )
+
+        config = reconfigure(mutate)
+        assert config.ec_manager_config.encoder_cache_manager_cls == expected
+
     @pytest.mark.parametrize("selection", [None, "0", "1"])
     def test_runner_selection_ignores_upstream_env(self, monkeypatch, selection):
         import vllm.config.vllm as upstream_config

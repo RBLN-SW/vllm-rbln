@@ -20,6 +20,7 @@ import pytest
 import torch
 import vllm.distributed.ec_transfer.ec_connector.cpu.worker as cpu_worker
 from vllm.config import ECTransferConfig
+from vllm.config.ec_manager_config import EncoderCacheManagerConfig
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorRole
 from vllm.distributed.ec_transfer.ec_connector.cpu.common import (
     ECCPUConnectorMetadata,
@@ -105,11 +106,17 @@ def ec_consumer(connect, monkeypatch):
     monkeypatch.setattr(nixl, "nixl_agent_config", object())
     monkeypatch.setattr(data, "NixlDataTransport", lambda **kwargs: Mock())
     monkeypatch.setattr(control, "ZmqClientTransport", lambda: transport)
-    scheduler = create_rbln_scheduler(
-        max_num_seqs=4, max_num_batched_tokens=8, max_model_len=64
+    connector = connect(ec_role="ec_consumer", role=ECConnectorRole.SCHEDULER)
+    monkeypatch.setattr(
+        ECConnectorFactory, "create_connector", lambda config, role: connector
     )
-    scheduler.ec_connector = connect(
-        ec_role="ec_consumer", role=ECConnectorRole.SCHEDULER
+    scheduler = create_rbln_scheduler(
+        max_num_seqs=4,
+        max_num_batched_tokens=8,
+        max_model_len=64,
+        ec_transfer_config=ECTransferConfig(
+            ec_connector="RblnECCPUConnector", ec_role="ec_consumer"
+        ),
     )
     scheduler.max_num_encoder_input_tokens = 16
     scheduler.encoder_cache_manager = type(scheduler.encoder_cache_manager)(
@@ -324,6 +331,28 @@ def test_consumer_still_fetches_uncached_inputs_in_a_mixed_request(ec_consumer):
     assert scheduler._ec_transfer_pending(request, 0)
     assert transport.connect.call_args_list == [call(("image@2", 1234))]
     assert scheduler.ec_connector.take_unavailable_requests() == {request.request_id}
+
+
+def test_consumer_preserves_explicit_manager_and_uses_connector_admission(ec_consumer):
+    original, transport = ec_consumer
+    scheduler = create_rbln_scheduler(
+        ec_transfer_config=original.vllm_config.ec_transfer_config,
+        ec_manager_config=EncoderCacheManagerConfig(
+            encoder_cache_manager_cls=(
+                "vllm.v1.core.encoder_cache_manager.EncoderCacheManager"
+            )
+        ),
+    )
+    assert type(scheduler.encoder_cache_manager) is EncoderCacheManager
+    scheduler.encoder_cache_manager = type(scheduler.encoder_cache_manager)(
+        cache_size=8
+    )
+    request = _remote_request([image_at(0, 3)])
+    scheduler.encoder_cache_manager.allocate(request, 0)
+    scheduler.encoder_cache_manager.free(request)
+
+    assert scheduler._ec_transfer_pending(request, 0)
+    assert transport.connect.call_count == 1
 
 
 def test_consumer_refetches_a_runner_hit_evicted_before_readmission(ec_consumer):

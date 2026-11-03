@@ -96,10 +96,6 @@ class RBLNScheduler(Scheduler):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        if not self.is_encoder_decoder:
-            self.encoder_cache_manager = RBLNEncoderCacheManager(
-                self.encoder_cache_manager.cache_size
-            )
 
         self.num_lookahead_tokens: int = max(
             self.num_lookahead_tokens, self.num_spec_tokens
@@ -1182,7 +1178,11 @@ class RBLNScheduler(Scheduler):
 
     def _ec_transfer_pending(self, request: Request, num_computed_tokens: int) -> bool:
         connector = self.ec_connector
-        if not isinstance(connector, RblnECCPUConnector) or not request.mm_features:
+        if (
+            not isinstance(connector, RblnECCPUConnector)
+            or not isinstance(self.encoder_cache_manager, RBLNEncoderCacheManager)
+            or not request.mm_features
+        ):
             return super()._ec_transfer_pending(request, num_computed_tokens)
         # NOTE(RBLN): local_cache_hashes identifies inputs already in the runner
         # cache so the connector skips their transfers even if its cache lacks them.

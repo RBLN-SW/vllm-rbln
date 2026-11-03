@@ -354,6 +354,20 @@ def _wire(vllm_config: "VllmConfig") -> None:
     parallel_config = vllm_config.parallel_config
     scheduler_config = vllm_config.scheduler_config
 
+    ec_config = vllm_config.ec_transfer_config
+    manager_config = vllm_config.ec_manager_config
+    if (
+        ec_config is not None
+        and ec_config.ec_connector == "RblnECCPUConnector"
+        and not vllm_config.model_config.is_encoder_decoder
+        and manager_config.encoder_cache_manager_cls is None
+    ):
+        # NOTE(RBLN): select eviction protection through the manager factory
+        # so an explicitly configured cache manager is never replaced.
+        manager_config.encoder_cache_manager_cls = (
+            "vllm_rbln.v1.core.rbln_scheduler.RBLNEncoderCacheManager"
+        )
+
     if parallel_config.worker_cls == "auto":
         parallel_config.worker_cls = "vllm_rbln.v1.worker.rbln_worker.RBLNWorker"
 

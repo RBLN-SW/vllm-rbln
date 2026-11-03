@@ -26,6 +26,7 @@ from typing import Any
 import torch
 from vllm.config import (
     CacheConfig,
+    ECTransferConfig,
     KVEventsConfig,
     KVTransferConfig,
     ModelConfig,
@@ -34,6 +35,7 @@ from vllm.config import (
     SpeculativeConfig,
     VllmConfig,
 )
+from vllm.config.ec_manager_config import EncoderCacheManagerConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
     ECConnectorBase,
     ECConnectorMetadata,
@@ -206,6 +208,8 @@ def create_rbln_scheduler(
     use_kv_connector: MockKVConfig | None = None,
     async_scheduling: bool = False,
     additional_config: dict | None = None,
+    ec_transfer_config: ECTransferConfig | None = None,
+    ec_manager_config: EncoderCacheManagerConfig | None = None,
 ) -> RBLNScheduler:
     """Build an RBLNScheduler on CPU (ported from upstream tests/v1/core/utils):
     opt-125m config only, num_gpu_blocks set manually, no KV connector."""
@@ -253,6 +257,8 @@ def create_rbln_scheduler(
         parallel_config=ParallelConfig(pipeline_parallel_size=pipeline_parallel_size),
         speculative_config=speculative_config,
         kv_transfer_config=kv_transfer_config,
+        ec_transfer_config=ec_transfer_config,
+        ec_manager_config=ec_manager_config or EncoderCacheManagerConfig(),
         kv_events_config=KVEventsConfig(
             enable_kv_cache_events=enable_kv_cache_events, publisher="null"
         ),
