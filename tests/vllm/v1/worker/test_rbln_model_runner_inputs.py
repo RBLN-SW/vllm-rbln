@@ -80,6 +80,52 @@ class TestResolveMultiModalSupport:
             runner._resolve_mm_support()
 
 
+class TestEncoderCacheReserve:
+    @pytest.mark.parametrize(
+        "dtype, expected", [(torch.bfloat16, 2**24), (torch.float32, 2**25)]
+    )
+    def test_reserves_the_scheduler_capacity_without_tp_division(
+        self, monkeypatch, dtype, expected
+    ):
+        runner = mr.RBLNModelRunner.__new__(mr.RBLNModelRunner)
+        runner.supports_mm_inputs = True
+        runner.device = SimpleNamespace(type="rbln")
+        runner.vllm_config = object()
+        runner.model_config = SimpleNamespace(get_hidden_size=lambda: 2048)
+        runner.dtype = dtype
+        runner.parallel_config = SimpleNamespace(tensor_parallel_size=4)
+        monkeypatch.setattr(
+            mr, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True)
+        )
+        budget = Mock(return_value=SimpleNamespace(encoder_cache_size=4096))
+        monkeypatch.setattr(mr, "MultiModalBudget", budget)
+
+        assert runner.encoder_cache_reserve_bytes == expected
+        assert runner.encoder_cache_reserve_bytes == expected
+        budget.assert_called_once_with(
+            runner.vllm_config, mr.MULTIMODAL_REGISTRY, enable_cache=False
+        )
+
+    @pytest.mark.parametrize(
+        "supports_mm, device, first_rank",
+        [(False, "rbln", True), (True, "cpu", True), (True, "rbln", False)],
+    )
+    def test_no_device_encoder_cache_needs_no_reserve(
+        self, monkeypatch, supports_mm, device, first_rank
+    ):
+        runner = mr.RBLNModelRunner.__new__(mr.RBLNModelRunner)
+        runner.supports_mm_inputs = supports_mm
+        runner.device = SimpleNamespace(type=device)
+        monkeypatch.setattr(
+            mr, "get_pp_group", lambda: SimpleNamespace(is_first_rank=first_rank)
+        )
+        budget = Mock()
+        monkeypatch.setattr(mr, "MultiModalBudget", budget)
+
+        assert runner.encoder_cache_reserve_bytes == 0
+        budget.assert_not_called()
+
+
 class TestGatherMultimodalEmbeddings:
     def test_scheduled_images_are_encoded_and_cached_by_hash(
         self, make_model_runner, monkeypatch

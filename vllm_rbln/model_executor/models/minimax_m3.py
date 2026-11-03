@@ -1400,19 +1400,28 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         if frames is None:
             frames = t
         merge = tower.spatial_merge_size
-        segments = []
+        device = next(tower.parameters()).device
+        output = None
         for start in range(0, t, frames):
             seg_t = min(frames, t - start)
             seg_pixels = pixel_values[start * h * w : (start + seg_t) * h * w]
-            segments.append(
-                rbln_utils.run_mm_encoder(
-                    self._mm_encoder,
-                    self._encoder_inputs(seg_pixels, [seg_t, h, w], modality),
-                    seg_t * h * w // (merge * merge),
-                    dtype=self.mm_embeds_dtype,
-                )
+            embeds = rbln_utils.run_mm_encoder(
+                self._mm_encoder,
+                self._encoder_inputs(seg_pixels, [seg_t, h, w], modality),
+                seg_t * h * w // (merge * merge),
+                dtype=self.mm_embeds_dtype,
+                device=device,
             )
-        return segments[0] if len(segments) == 1 else torch.cat(segments)
+            if output is None:
+                output = embeds.new_empty(
+                    (t * h * w // (merge * merge), embeds.shape[-1])
+                )
+            # Copy before the next segment reuses the compiled encoder output.
+            begin = start * h * w // (merge * merge)
+            count = seg_t * h * w // (merge * merge)
+            output[begin : begin + count].copy_(embeds[:count])
+        assert output is not None
+        return output
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
         outputs: list[torch.Tensor] = []

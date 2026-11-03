@@ -659,24 +659,32 @@ def test_a_video_is_encoded_in_segments_of_temporal_patches(vision_encoder_model
         torch.testing.assert_close(cos[:n, 0], t_pos.float().cos())
 
 
-def test_no_frame_limit_keeps_image_output_storage(vision_encoder_model):
+@pytest.mark.maybe_use_device
+@pytest.mark.parametrize("num_frames, frame_limit", [(1, None), (5, 2)])
+def test_encoder_cache_survives_static_output_reuse(
+    vision_encoder_model, num_frames, frame_limit
+):
+    from vllm.platforms import current_platform
+
     model = vision_encoder_model
-    model.vision_tower.vision_model.vision_segment_max_frames = None
-    outputs = []
+    device = torch.device(current_platform.device_type)
+    model.vision_tower.to(device)
+    model.vision_tower.vision_model.vision_segment_max_frames = frame_limit
+    output_buffer = torch.empty(4, 1, device=device)
 
     def encode(pixels, cos, sin, bias):
-        outputs.append(pixels[::4, :1])
-        return outputs[-1]
+        output_buffer.copy_(pixels[::4, :1])
+        return output_buffer
 
     object.__setattr__(model, "_mm_encoder", encode)
-    pixels = torch.arange(4.0).unsqueeze(1).expand(-1, 6)
+    pixels = torch.arange(num_frames * 4.0).unsqueeze(1).expand(-1, 6)
     (embeds,) = model.embed_multimodal(
-        pixel_values=pixels, image_grid_thw=torch.tensor([[1, 2, 2]])
+        pixel_values=pixels, image_grid_thw=torch.tensor([[num_frames, 2, 2]])
     )
+    output_buffer.fill_(-1)
 
-    assert len(outputs) == 1
-    assert embeds.data_ptr() == outputs[0].data_ptr()
-    torch.testing.assert_close(embeds, pixels[::4, :1])
+    assert embeds.device == output_buffer.device
+    torch.testing.assert_close(embeds.cpu(), pixels[::4, :1])
 
 
 def test_shared_bucket_is_warmed_once(vision_encoder_model):

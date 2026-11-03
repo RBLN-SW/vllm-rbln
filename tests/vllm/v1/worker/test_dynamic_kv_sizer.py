@@ -252,6 +252,7 @@ class TestComputeDynamicKvNumBlocks:
             parallel_config=SimpleNamespace(tensor_parallel_size=tp_size),
             kv_blocks_before_shrink=211,
             model_runner=SimpleNamespace(
+                encoder_cache_reserve_bytes=0,
                 kv_cache_config=SimpleNamespace(
                     num_blocks=self.HINT,
                     kv_cache_tensors=_kv_cache_tensors(num_caches),
@@ -322,6 +323,16 @@ class TestComputeDynamicKvNumBlocks:
         )
         assert full == 35 * 1024
         assert half == full // 2
+
+    def test_encoder_cache_and_copy_stream_reserves_are_additive(self):
+        sizer = self._sizer(
+            programs=[_program([HEAD_SPLIT, HEAD_SPLIT])],
+            snapshot=self._snapshot([30 * self.GIB] * 4),
+        )
+        sizer.model_runner.encoder_cache_reserve_bytes = 128 * 2**20
+        sizer.copy_stream_reserve_bytes = lambda: 64 * 2**20
+
+        assert DynamicKvSizer.compute_num_blocks(sizer) == 5 * 512 - 96
 
     def test_the_sliding_window_kernel_block_ids_cap_the_count(self, caplog):
         programs = [_program([HEAD_SPLIT])]
@@ -893,7 +904,8 @@ class TestOnlyTheShrunkModeReplacesTheEstimate:
                 mode=mode,
                 vllm_config=SimpleNamespace(),
                 model_runner=SimpleNamespace(
-                    get_kv_cache_spec=lambda: {"a": spec, "b": spec}
+                    encoder_cache_reserve_bytes=0,
+                    get_kv_cache_spec=lambda: {"a": spec, "b": spec},
                 ),
             )
 
@@ -917,10 +929,38 @@ class TestOnlyTheShrunkModeReplacesTheEstimate:
         monkeypatch.setattr(dks, "estimate_available_memory", lambda **kw: 777)
         sizer = SimpleNamespace(
             mode=dks.DynamicKvMode.DISABLED,
+            model_runner=SimpleNamespace(encoder_cache_reserve_bytes=0),
             memory_snapshot=lambda device: seen.append(device),
         )
         assert DynamicKvSizer.pre_compile_estimate(sizer, {}) == 777
         assert seen == []
+
+    @pytest.mark.parametrize("mode", list(dks.DynamicKvMode))
+    def test_encoder_cache_reserve_reaches_every_initial_estimate(
+        self, monkeypatch, mode
+    ):
+        monkeypatch.setattr(
+            dks,
+            "estimate_available_memory",
+            lambda **kw: 1000 - kw.get("reserve_bytes_per_chiplet", 0),
+        )
+        sizer = SimpleNamespace(
+            mode=mode,
+            vllm_config=SimpleNamespace(),
+            model_runner=SimpleNamespace(
+                encoder_cache_reserve_bytes=200,
+                get_kv_cache_spec=lambda: {},
+            ),
+        )
+        monkeypatch.setattr(dks, "get_kv_cache_groups", lambda *args: [])
+        monkeypatch.setattr(dks, "_max_memory_usage_bytes_from_groups", lambda *args: 0)
+        with patch.object(
+            dks.torch,
+            "rbln",
+            SimpleNamespace(is_dummy_device=lambda: True),
+            create=True,
+        ):
+            assert DynamicKvSizer.pre_compile_estimate(sizer, {}) == 800
 
 
 class TestDynamicKvFailuresRaise:

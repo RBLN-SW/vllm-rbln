@@ -647,6 +647,7 @@ class TestDetermineAvailableMemory:
         # WorkerBase always carries the field; None is what no spec decode means.
         worker.speculative_config = speculative_config
         worker.model_runner = SimpleNamespace(
+            encoder_cache_reserve_bytes=0,
             model=SimpleNamespace(
                 named_parameters=lambda: iter((params or _params()).items())
             ),
@@ -704,6 +705,7 @@ class TestDetermineAvailableMemory:
         )
         monkeypatch.setattr(dks, "_pool_bytes_per_block", lambda groups: 100)
         worker.model_runner = SimpleNamespace(
+            encoder_cache_reserve_bytes=0,
             model=SimpleNamespace(named_parameters=lambda: iter(_params().items())),
             specialized_moe_decode=False,
             bucketing_manager=SimpleNamespace(decode_batch_buckets_count=3),

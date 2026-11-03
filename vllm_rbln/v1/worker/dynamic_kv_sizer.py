@@ -270,6 +270,10 @@ class DynamicKvSizer:
         """The bytes vllm sizes the compile-time cache from: the estimate fed
         the per-chiplet snapshot on a real device, floored at one request when
         the shrink makes that estimate a placeholder."""
+        estimate_kwargs = {
+            **estimate_kwargs,
+            "reserve_bytes_per_chiplet": self.model_runner.encoder_cache_reserve_bytes,
+        }
         if self.mode is DynamicKvMode.DISABLED:
             return estimate_available_memory(**estimate_kwargs)
         # The exact DRAM figure and the driver's capacity are the resize's, not
@@ -544,6 +548,14 @@ class DynamicKvSizer:
                 "chiplet for its copy command streams.",
                 reserve_bytes,
             )
+
+        encoder_reserve = self.model_runner.encoder_cache_reserve_bytes
+        if encoder_reserve:
+            logger.info(
+                "[Dynamic KV] reserving %d bytes per chiplet for the encoder cache.",
+                encoder_reserve,
+            )
+        reserve_bytes += encoder_reserve
 
         gmu = self.cache_config.gpu_memory_utilization
         num_blocks, fits = max_num_blocks(

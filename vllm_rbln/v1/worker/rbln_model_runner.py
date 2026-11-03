@@ -18,6 +18,7 @@ from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from contextlib import nullcontext
 from copy import copy, deepcopy
+from functools import cached_property
 from typing import Any, Literal, NamedTuple, TypeAlias, cast
 
 import numpy as np
@@ -43,6 +44,8 @@ from vllm.model_executor.models.interfaces_base import (
     is_pooling_model,
     is_text_generation_model,
 )
+from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.inputs import MultiModalKwargsItem
 from vllm.multimodal.utils import group_and_batch_mm_kwargs
 from vllm.platforms import current_platform
@@ -52,7 +55,11 @@ from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.tracing import instrument
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.math_utils import cdiv
-from vllm.utils.torch_utils import PIN_MEMORY, kv_cache_dtype_str_to_dtype
+from vllm.utils.torch_utils import (
+    PIN_MEMORY,
+    get_dtype_size,
+    kv_cache_dtype_str_to_dtype,
+)
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionMetadata,
@@ -180,6 +187,7 @@ from vllm_rbln.v1.worker.dp_utils import (
     determine_batch_execution_and_padding,
 )
 from vllm_rbln.v1.worker.input_stager import InputLayout, InputStager, StagedModelInputs
+from vllm_rbln.v1.worker.kv_placement import allocation_size
 from vllm_rbln.v1.worker.utils import (
     canonical_kv_layers,
     copy_host_device_kv_blocks,
@@ -1460,9 +1468,28 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             )
         return True
 
+    @cached_property
+    def encoder_cache_reserve_bytes(self) -> int:
+        """Per-chiplet device memory kept out of the KV budget for MM outputs."""
+        if (
+            not self.supports_mm_inputs
+            or self.device.type == "cpu"
+            or not get_pp_group().is_first_rank
+        ):
+            return 0
+        budget = MultiModalBudget(
+            self.vllm_config, MULTIMODAL_REGISTRY, enable_cache=False
+        )
+        # Conservatively reserve the scheduler's full encoder-cache capacity on each
+        # chiplet rather than assuming the KV cache's sharding also applies here.
+        return allocation_size(
+            budget.encoder_cache_size
+            * self.model_config.get_hidden_size()
+            * get_dtype_size(self.dtype)
+        )
+
     def _execute_mm_encoder(self, scheduler_output: RBLNSchedulerOutput) -> None:
-        """Encode this step's scheduled multimodal items on the host into
-        ``self.encoder_cache``."""
+        """Cache this step's scheduled multimodal encoder outputs."""
         mm_hashes: list[str] = []
         mm_kwargs: list[tuple[str, MultiModalKwargsItem]] = []
         for (

@@ -680,6 +680,7 @@ def estimate_available_memory(
     num_devices_per_local_rank: int = 1,
     chiplet_memory: Mapping[Unit, ChipletMemory] | None = None,
     exact_dram: bool = False,
+    reserve_bytes_per_chiplet: int = 0,
 ) -> int:
     # We are finding max_num_blocks(x) that satisfies the following equation:
 
@@ -819,7 +820,7 @@ def estimate_available_memory(
             "specified."
         )
 
-    available_dram_bytes -= kernel_size
+    available_dram_bytes -= kernel_size + reserve_bytes_per_chiplet * rsd_size
 
     if buffer is None:
         # TODO: Accurate buffer estimation

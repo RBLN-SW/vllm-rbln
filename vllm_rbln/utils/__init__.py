@@ -24,11 +24,11 @@ def run_mm_encoder(
     num_embeddings: int,
     *,
     dtype: torch.dtype | None = None,
+    device: torch.device | str | None = "cpu",
 ) -> torch.Tensor:
+    """Return valid embeddings; device=None preserves the encoder output device."""
     embeds = encoder(*inputs)[:num_embeddings]
-    if dtype is None:
-        return embeds.cpu()
-    return embeds.to(device="cpu", dtype=dtype)
+    return embeds.to(device=device, dtype=dtype)
 
 
 def pad(

@@ -748,6 +748,21 @@ class TestEstimateAvailableMemory:
         )
         assert low < high
 
+    @pytest.mark.parametrize("num_kv_heads, replicas", [(8, 1), (2, 2)])
+    def test_encoder_reserve_is_charged_before_kv_replication(
+        self, rbln, num_kv_heads, replicas
+    ):
+        rbln("RBLN-CR13")
+        kwargs = dict(
+            model_config=_make_model_config(num_kv_heads=num_kv_heads),
+            parallel_config=_make_parallel_config(),
+            kernel_size=_GB,
+        )
+        before = estimate_available_memory(**kwargs)
+        after = estimate_available_memory(**kwargs, reserve_bytes_per_chiplet=_GB)
+
+        assert before - after == 4 * _GB // replicas
+
     def test_oom_raises_memory_error(self, rbln):
         rbln("RBLN-CA25")
         with pytest.raises(MemoryError):

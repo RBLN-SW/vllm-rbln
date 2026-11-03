@@ -628,8 +628,29 @@ class TestMmEncoder:
             "8x3": [pytest.approx(7 * MS)],
         }
 
+    @pytest.mark.parametrize("recording", [False, True])
+    @pytest.mark.parametrize("device", [None, "meta"])
+    @pytest.mark.parametrize("dtype", [None, torch.bfloat16])
+    def test_encoder_device_and_dtype_are_forwarded(
+        self, ctx, monkeypatch, recording, device, dtype
+    ):
+        monkeypatch.setattr(pm, "_ACTIVE_CTX", ctx)
+        if recording:
+            ctx.start_pass()
+        pixels = torch.ones(4, 3, device="meta" if device is None else "cpu")
+
+        output = pm.run_mm_encoder(
+            lambda pixels: pixels, [pixels], 2, device=device, dtype=dtype
+        )
+
+        if recording:
+            ctx.end_pass()
+        assert output.device == torch.device("meta")
+        assert output.dtype == (pixels.dtype if dtype is None else dtype)
+        assert output.shape == (2, 3)
+
     @pytest.mark.parametrize("model_name", ["glm", "minimax"])
-    def test_model_handoff_records_each_image_through_its_existing_cpu_copy(
+    def test_model_handoff_records_each_image_with_requested_device(
         self, ctx, clock, monkeypatch, model_name
     ):
         import vllm_rbln.utils as utils
@@ -649,11 +670,11 @@ class TestMmEncoder:
         if model_name == "minimax":
             model.mm_embeds_dtype = torch.bfloat16
         vision_model = types.SimpleNamespace(vision_segment_max_frames=None)
-        setattr(
-            model,
-            tower,
-            types.SimpleNamespace(spatial_merge_size=1, vision_model=vision_model),
-        )
+        vision_tower = torch.nn.Module()
+        vision_tower.register_parameter("anchor", torch.nn.Parameter(torch.zeros(1)))
+        vision_tower.spatial_merge_size = 1
+        vision_tower.vision_model = vision_model
+        setattr(model, tower, vision_tower)
         # MiniMax-M3 also passes the modality.
         model._encoder_inputs = lambda pixels, grid, *modality: [pixels]
         events = []
@@ -666,17 +687,15 @@ class TestMmEncoder:
                 events.append("slice")
                 return PendingOutput(self.pixels[index])
 
-            def cpu(self):
-                events.append("cpu")
-                # Completion and transfer occur at the model's existing CPU copy.
-                clock.advance(30 * MS)
-                return self.pixels.clone()
-
             def to(self, *, device, dtype):
-                assert device == "cpu"
+                assert device == (
+                    next(vision_tower.parameters()).device
+                    if model_name == "minimax"
+                    else "cpu"
+                )
                 events.append("to")
                 clock.advance(35 * MS)
-                return self.pixels.to(dtype=dtype)
+                return self.pixels.to(device=device, dtype=dtype)
 
         def encoder(pixels):
             events.append("encoder")
@@ -693,10 +712,9 @@ class TestMmEncoder:
         )
         ctx.end_pass()
 
-        handoff = "to" if model_name == "minimax" else "cpu"
         dtype = torch.bfloat16 if model_name == "minimax" else pixels.dtype
-        latency = (36 if model_name == "minimax" else 31) * MS
-        assert events == ["encoder", "slice", handoff] * 2
+        latency = 36 * MS
+        assert events == ["encoder", "slice", "to"] * 2
         torch.testing.assert_close(outputs[0], pixels[:1].to(dtype))
         torch.testing.assert_close(outputs[1], pixels[1:].to(dtype))
         assert {shape: m.latencies for shape, m in ctx._encoder.items()} == {
