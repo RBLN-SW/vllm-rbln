@@ -138,6 +138,11 @@ def _validate(vllm_config: "VllmConfig") -> None:
     # dimension (dp_utils), and spec decode, sub-block caching and the RBLN NIXL
     # connector's resume trim take it as the prefill chunk.
     if chunk is not None and chunk < max_num_batched_tokens:
+        kv_transfer = vllm_config.kv_transfer_config
+        connectors = [] if kv_transfer is None else [kv_transfer.kv_connector]
+        if connectors == ["MultiConnector"]:
+            children = kv_transfer.kv_connector_extra_config.get("connectors", [])
+            connectors = [child.get("kv_connector") for child in children]
         unsupported = [
             name
             for name, on in (
@@ -148,7 +153,18 @@ def _validate(vllm_config: "VllmConfig") -> None:
                     vllm_config.cache_config.enable_prefix_caching
                     and rbln_config.enable_sub_block_cache,
                 ),
-                ("KV transfer", vllm_config.kv_transfer_config is not None),
+                (
+                    "RBLN NIXL KV transfer",
+                    any(
+                        name
+                        in (
+                            "RblnNixlConnector",
+                            "RblnNixlPullConnector",
+                            "RblnNixlPushConnector",
+                        )
+                        for name in connectors
+                    ),
+                ),
             )
             if on
         ]

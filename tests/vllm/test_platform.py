@@ -527,7 +527,7 @@ class TestRejectedConfigs:
             "data parallelism",
             "speculative decoding",
             "sub-block prefix caching",
-            "KV transfer",
+            "RBLN NIXL KV transfer",
         ],
     )
     def test_a_prefill_chunk_below_the_token_budget_refuses(self, reconfigure, feature):
@@ -537,7 +537,7 @@ class TestRejectedConfigs:
                 _ranks(data_parallel_size=2)(config)
             elif feature == "speculative decoding":
                 config.speculative_config = SimpleNamespace(method="ngram")
-            elif feature == "KV transfer":
+            elif feature == "RBLN NIXL KV transfer":
                 config.kv_transfer_config = SimpleNamespace(
                     kv_connector="RblnNixlPushConnector"
                 )
@@ -546,6 +546,40 @@ class TestRejectedConfigs:
 
         with pytest.raises(ValueError, match=feature):
             reconfigure(mutate)
+
+    @pytest.mark.parametrize(
+        "kv_connector, extra",
+        [
+            ("RblnNixlConnector", {}),
+            (
+                "MultiConnector",
+                {"connectors": [{"kv_connector": "RblnNixlPullConnector"}]},
+            ),
+        ],
+    )
+    def test_a_prefill_chunk_below_the_token_budget_refuses_a_nixl_connector(
+        self, reconfigure, kv_connector, extra
+    ):
+        def mutate(config):
+            _prefill_chunk(64)(config)
+            config.kv_transfer_config = SimpleNamespace(
+                kv_connector=kv_connector, kv_connector_extra_config=extra
+            )
+
+        with pytest.raises(ValueError, match="RBLN NIXL KV transfer"):
+            reconfigure(mutate)
+
+    def test_a_prefill_chunk_below_the_token_budget_takes_other_connectors(
+        self, reconfigure
+    ):
+        # Only the RBLN NIXL connectors read the budget as the prefill chunk.
+        def mutate(config):
+            _prefill_chunk(64)(config)
+            config.kv_transfer_config = SimpleNamespace(
+                kv_connector="RBLNLMCacheConnectorV1", kv_connector_extra_config={}
+            )
+
+        reconfigure(mutate)
 
     @pytest.mark.parametrize("ranks", [dict(data_parallel_size=2), dict(ep=True)])
     def test_dp_and_ep_need_the_moe_tokens_mask(self, reconfigure, ranks):
