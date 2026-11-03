@@ -2122,7 +2122,7 @@ class TestExecuteModelFlushesAfterTheSubmission:
 
 
 class TestExecuteModelStampsMmPrefixSteps:
-    """A prefill spanning exactly one mm prefix range runs padded to the
+    """A prefill ending an mm prefix range it started inside runs padded to the
     smallest compiled query length holding it; anything else runs as before."""
 
     @staticmethod
