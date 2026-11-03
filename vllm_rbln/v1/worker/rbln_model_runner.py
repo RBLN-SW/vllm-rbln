@@ -3840,6 +3840,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         sig = mega_cache.config_signature(self.vllm_config)
         mega_cache.load(self.model_config.model, sig)
         with set_compile_stage("warmup"), self.offload_context():
+            # NOTE(RBLN): AoT CCL graphs share one COMM buffer per device, sized
+            # by the first graph compiled; the vision encoder needs the largest.
+            self._warmup_mm_encoder()
             self.run_model_graphs()
 
             # NOTE(RBLN): the sampler and the rejection sampler are built on the
@@ -3856,9 +3859,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             # 5. specdec (medusa)
             if isinstance(self.drafter, RBLNMedusaProposer):
                 self.drafter.dummy_run()
-
-            # 6. multimodal encoder
-            self._warmup_mm_encoder()
 
         mega_cache.save(self.model_config.model, sig)
 
