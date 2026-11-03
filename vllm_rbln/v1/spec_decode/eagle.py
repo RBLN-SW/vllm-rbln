@@ -421,7 +421,10 @@ class RBLNEagleProposer(EagleProposer):
                 last_hidden_states, hidden_states = ret_hidden_states
 
             hidden_states = hidden_states.view(-1, self.hidden_size)
-            sample_hidden_states = last_hidden_states.view(-1, self.hidden_size)
+            # Gemma4 MTP samples from its own, narrower hidden states.
+            sample_hidden_states = last_hidden_states.view(
+                -1, last_hidden_states.shape[-1]
+            )
 
             if token_indices_to_sample is not None:
                 hidden_states = hidden_states[token_indices_to_sample]
