@@ -88,7 +88,8 @@ class _MmPrefixModel(_InGraphMergeModel):
 
 
 class TestResolveMmPrefixSupport:
-    """An mm prefix LM is served only when every range runs whole in one step."""
+    """An mm prefix LM is served only when every range, or the rest of one a
+    prefix cache hit resumes, runs in one step."""
 
     @staticmethod
     def _runner(make_model_runner, monkeypatch, model, **config):
