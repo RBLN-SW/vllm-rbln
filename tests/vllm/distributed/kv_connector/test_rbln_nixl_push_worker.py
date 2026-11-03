@@ -2064,7 +2064,7 @@ class TestEarlySend:
     def test_the_offer_carries_its_work_to_the_writer_unwaited(self, monkeypatch):
         # Waiting here would hold the engine thread until the forward had wholly
         # retired, so the next step's launch could no longer overlap its tail.
-        order = []
+        order: list[str] = []
         monkeypatch.setattr(
             pw.torch.rbln, "Event", lambda: self._recording_event(order)
         )
