@@ -258,6 +258,52 @@ class TestMambaSpecGroup:
         assert ring.dtype == torch.float16
         assert axes["layer.0.conv_ring"] == 0
 
+    def test_a_gdn_pool_is_not_dynamic(self, make_model_runner, monkeypatch):
+        # The dynamic-KV resize scales the attention block count; a GDN pool
+        # and its aux caches are sized by gdn_pool_blocks, so they stay static.
+        monkeypatch.setattr(mr, "dynamic_kv_enabled", lambda _config: True)
+        runner = make_model_runner(layers=("layer.0",), init_kv_cache=False)
+        config = make_kv_cache_config(
+            runner, groups=[("layer.0",)], spec=self._state_spec(runner)
+        )
+        ctx = runner.compilation_config.static_forward_context
+        ctx["layer.0.conv_ring"] = SimpleNamespace(
+            get_aux_cache_spec=lambda cfg: RBLNBlockAuxSpec(
+                "layer.0", (3, 8, 128), torch.float16
+            )
+        )
+        _, (caches, bases, infos, axes) = self._views(runner, config)
+        runner._allocate_aux_kv_caches(config, caches, bases, infos, axes)
+        assert infos["layer.0"].dynamic_axis is None
+        assert infos["layer.0.conv_ring"].dynamic_axis is None
+
+    def test_a_gdn_pool_is_outside_the_resize_inventory(
+        self, make_model_runner, monkeypatch
+    ):
+        # The sizer reads a placement for every inventoried cache; a static
+        # pool has none.
+        monkeypatch.setattr(mr, "dynamic_kv_enabled", lambda _config: True)
+        runner = make_model_runner(layers=("layer.0",), init_kv_cache=False)
+        config = make_kv_cache_config(
+            runner, groups=[("layer.0",)], spec=self._state_spec(runner)
+        )
+        ring = SimpleNamespace(
+            get_aux_cache_spec=lambda cfg: RBLNBlockAuxSpec(
+                "layer.0", (3, 8, 128), torch.float16
+            ),
+            layer_index=1,
+        )
+        monkeypatch.setitem(
+            runner.compilation_config.static_forward_context, "layer.1", ring
+        )
+        runner.kv_cache_config = config
+        runner.initialize_attn_backend(config)
+        runner.initialize_kv_cache_tensors(
+            config, [config.kv_cache_groups[0].kv_cache_spec.block_size]
+        )
+        assert runner.kv_cache_names == ["layer.0", "layer.1"]
+        assert runner.kv_cache_allocations == {}
+
 
 class TestBlockAuxKVCaches:
     def test_initialization_inventories_shared_main_and_aux_allocations(

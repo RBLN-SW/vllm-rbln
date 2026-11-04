@@ -3424,7 +3424,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     kv_caches[layer_name] = typed_base
                     kv_cache_block_axes[layer_name] = 0
                     dynamic_axis = None
-                    if dynamic_kv_enabled(self.vllm_config):
+                    # The resize scales the attention block count; a GatedDeltaNet
+                    # pool is sized by gdn_pool_blocks and stays static.
+                    if dynamic_kv_enabled(self.vllm_config) and not isinstance(
+                        kv_cache_spec, RBLNGDNStateSpec
+                    ):
                         dynamic_axis = 0
                         torch._dynamo.mark_dynamic(typed_base, 0)
                         marked_layers.append((layer_name, 0))
@@ -3537,8 +3541,15 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.kv_caches = [kv_caches[name] for name in self.kv_cache_names]
         # The runner owns the cache storage until sizing finishes. Rebuild keys
         # on allocation so addresses are never matched across cache generations.
+        # The resize sizes the caches with a dynamic dim; a static one (a
+        # GatedDeltaNet pool, its aux) has no placement to read and stays out.
         self.kv_cache_allocations = {}
         for name, cache in zip(self.kv_cache_names, self.kv_caches):
+            if (
+                dynamic_kv_enabled(self.vllm_config)
+                and kv_cache_view_infos[name].dynamic_axis is None
+            ):
+                continue
             key = kv_cache_tensor_key(cache)
             self.kv_cache_allocations.setdefault(key, name)
         self.kv_cache_block_axes = block_axes
@@ -3579,7 +3590,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         device = self.device if use_device_tensor() else "meta"
         extent_of = kv_cache_extents(kv_cache_config)
         # A GatedDeltaNet layer's buffer is its own, a block a state of its pool
-        # (_allocate_kv_cache_tensors): so are its aux caches.
+        # (_allocate_kv_cache_tensors): so are its aux caches, static like it.
         own_blocks = {
             layer_name: gdn_pool_blocks(
                 self.vllm_config, kv_cache_config, group.kv_cache_spec
@@ -3604,16 +3615,18 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             if spec.owner in own_blocks:
                 shape = (own_blocks[spec.owner], *spec.block_shape)
                 extent: tuple[int, int] | str = spec.owner
+                axis = None
             else:
                 shape = (kv_cache_config.num_blocks, *spec.block_shape)
                 extent = extent_of[spec.owner]
+                axis = dynamic_axis
             kind = (spec.owner, shape, spec.dtype)
             key = (extent, shape, spec.dtype, ordinals[kind])
             ordinals[kind] += 1
             if (cache := tensors.get(key)) is None:
                 cache = torch.empty(shape, dtype=spec.dtype, device=device)
-                if dynamic_axis is not None:
-                    torch._dynamo.mark_dynamic(cache, dynamic_axis)
+                if axis is not None:
+                    torch._dynamo.mark_dynamic(cache, axis)
                 tensors[key] = cache
             kv_caches[layer_name] = cache
             kv_cache_bases_by_layer[layer_name] = cache
@@ -3621,7 +3634,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 view_dtype=spec.dtype,
                 view_shape=shape,
                 permute_order=tuple(range(len(shape))),
-                dynamic_axis=dynamic_axis,
+                dynamic_axis=axis,
             )
             block_axes[layer_name] = 0
             aux_layers.append(layer_name)
