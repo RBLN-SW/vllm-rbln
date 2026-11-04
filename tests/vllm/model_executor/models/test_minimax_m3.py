@@ -90,7 +90,10 @@ def test_minimax_m3_target_returns_requested_aux_states(monkeypatch, aux_layers)
 
 
 @pytest.mark.parametrize("compiled", [False, True])
-def test_image_encoding_reuses_eager_or_compiled_encoder(monkeypatch, compiled):
+@pytest.mark.parametrize("out_dtype", [torch.float32, torch.bfloat16])
+def test_image_encoding_reuses_eager_or_compiled_encoder(
+    monkeypatch, compiled, out_dtype
+):
     import vllm_rbln.model_executor.models.minimax_m3 as m3
 
     model = m3.RBLNMiniMaxM3SparseForConditionalGeneration.__new__(
@@ -99,6 +102,7 @@ def test_image_encoding_reuses_eager_or_compiled_encoder(monkeypatch, compiled):
     torch.nn.Module.__init__(model)
     model.vision_tower = torch.nn.Linear(2, 2, bias=False)
     model.vision_tower.spatial_merge_size = 1
+    model.mm_embeds_dtype = out_dtype
     encoder = torch.nn.Sequential(model.vision_tower)
     build_encoder = Mock(return_value=encoder)
     monkeypatch.setattr(m3, "_RBLNVisionEncoder", build_encoder)
@@ -110,8 +114,13 @@ def test_image_encoding_reuses_eager_or_compiled_encoder(monkeypatch, compiled):
     for _ in range(2):
         outputs = model.embed_multimodal(pixel_values=pixels, image_grid_thw=grids)
         assert len(outputs) == 2
-        torch.testing.assert_close(outputs[0], model.vision_tower(pixels[:1]))
-        torch.testing.assert_close(outputs[1], model.vision_tower(pixels[1:]))
+        torch.testing.assert_close(
+            outputs[0], model.vision_tower(pixels[:1]).to(out_dtype)
+        )
+        torch.testing.assert_close(
+            outputs[1], model.vision_tower(pixels[1:]).to(out_dtype)
+        )
+        assert model.vision_tower.weight.dtype == torch.float32
 
     if compiled:
         build_encoder.assert_not_called()
