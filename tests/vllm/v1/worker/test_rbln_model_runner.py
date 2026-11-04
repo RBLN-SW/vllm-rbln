@@ -760,7 +760,7 @@ class TestEcConsumer:
         ec_config = (
             None
             if ec_role is None
-            else ECTransferConfig(ec_connector="RblnECNixlConnector", ec_role=ec_role)
+            else ECTransferConfig(ec_connector="RblnECCPUConnector", ec_role=ec_role)
         )
         runner = _make_runner_stub(
             load_config=None,

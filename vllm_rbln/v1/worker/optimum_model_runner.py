@@ -290,10 +290,6 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         # between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
 
-        # EC role flags — ec_transfer_config is static, so cache once.
-        ec_cfg = getattr(self.vllm_config, "ec_transfer_config", None)
-        self.is_ec_producer: bool = ec_cfg is not None and ec_cfg.is_ec_producer
-
         # FIXME async_scheduling?
 
     @property
@@ -379,19 +375,22 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             # The EC producer has no decoder: encode the new requests' items and
             # publish them. The scheduler finishes an encoder-only request once
             # its prompt is consumed.
-            if self.is_ec_producer:
+            if self.vllm_config.is_mm_encoder_only:
                 with self.maybe_get_ec_connector_output(
                     scheduler_output, encoder_cache=self.encoder_cache
-                ):
+                ) as ec_connector_output:
                     for new_req in scheduler_output.scheduled_new_reqs:
                         self._execute_mm_encoder(
                             self.requests[new_req.req_id].mm_features,
                             0,
                             len(new_req.prompt_token_ids),
                         )
-                    if metrics is not None:
-                        metrics.end_pass()
-                    return make_empty_encoder_model_runner_output(scheduler_output)
+                if metrics is not None:
+                    metrics.end_pass()
+                return ModelRunnerOutput.with_ec_conn_output(
+                    make_empty_encoder_model_runner_output(scheduler_output),
+                    ec_connector_output,
+                )
 
             if not num_scheduled_tokens:
                 # FIXME If the model keeps an attention manager (Gemma3),
@@ -402,10 +401,19 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                 # It is a temporary solution.
                 if getattr(self.model, "attention_manager", None):
                     self.model.attention_manager.clear()
-                # Return empty ModelRunnerOutput if there's no work to do.
                 if metrics is not None:
                     metrics.end_pass()
-                return EMPTY_MODEL_RUNNER_OUTPUT
+                if not self.supports_mm_inputs:
+                    # Return empty ModelRunnerOutput if there's no work to do.
+                    return EMPTY_MODEL_RUNNER_OUTPUT
+                # EC send/recv even when there is no forward work to do.
+                with self.maybe_get_ec_connector_output(
+                    scheduler_output, encoder_cache=self.encoder_cache
+                ) as ec_connector_output:
+                    pass
+                return ModelRunnerOutput.with_ec_conn_output(
+                    EMPTY_MODEL_RUNNER_OUTPUT, ec_connector_output
+                )
 
             model_input, num_scheduled_tokens_np = self._prepare_inputs(
                 scheduler_output
@@ -817,7 +825,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
     def _init_mrope_positions(self, req_state: CachedRequestState) -> None:
         """Compute the prompt's MRoPE positions once, when the request arrives.
         Skipped on the EC producer, whose model proxy has no text config."""
-        if self.is_ec_producer or not supports_mrope(self.model):
+        if self.vllm_config.is_mm_encoder_only or not supports_mrope(self.model):
             return
         assert req_state.prompt_token_ids is not None
         req_state.mrope_positions, req_state.mrope_position_delta = (

@@ -227,7 +227,7 @@ class TestWarmupMultimodalEncoder:
                 runner.vllm_config,
                 "ec_transfer_config",
                 ECTransferConfig(
-                    ec_connector="RblnECNixlConnector", ec_role="ec_consumer"
+                    ec_connector="RblnECCPUConnector", ec_role="ec_consumer"
                 ),
             )
         self._fake_processor(
