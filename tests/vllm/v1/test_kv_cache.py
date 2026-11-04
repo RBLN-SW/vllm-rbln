@@ -12,18 +12,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for the RBLN sliding-window KV cache manager (v1/kv_cache.py): one
-physical block per request and prefix caching disabled, unlike the base."""
+"""Tests for the RBLN KV cache specs and managers (v1/kv_cache.py): the
+sliding-window manager keeps one physical block per request with prefix caching
+off, and the GatedDeltaNet state manager schedules on a block pool of its own
+beside the attention pool."""
 
 from collections import defaultdict
 from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.distributed.kv_events import BlockStored
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    MambaSpec,
+)
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
-from vllm_rbln.v1.kv_cache import RBLNSlidingWindowManager, RBLNSlidingWindowSpec
+from tests.vllm.v1.core.utils import make_request
+from vllm_rbln.v1.kv_cache import (
+    RBLNGDNManager,
+    RBLNGDNStateSpec,
+    RBLNSlidingWindowManager,
+    RBLNSlidingWindowSpec,
+    gdn_pool_blocks,
+)
 
 
 def _spec(*, block_size=16, sliding_window=16):
@@ -33,6 +50,16 @@ def _spec(*, block_size=16, sliding_window=16):
         head_size=8,
         dtype=torch.float16,
         sliding_window=sliding_window,
+    )
+
+
+def _gdn_spec(*, block_size=16, page_size_padded=None):
+    return RBLNGDNStateSpec(
+        shapes=((2, 4, 2, 8, 8),),
+        dtypes=(torch.int16,),
+        block_size=block_size,
+        page_size_padded=page_size_padded,
+        mamba_cache_mode="align",
     )
 
 
@@ -162,6 +189,21 @@ class TestRegistration:
         assert (
             KVCacheSpecRegistry.get_manager_class(_spec()) is RBLNSlidingWindowManager
         )
+
+    def test_platform_registers_rbln_gdn_manager_beside_upstream_mamba(self):
+        # The GDN spec resolves to its own manager while a plain MambaSpec keeps
+        # upstream's: the registration must not hijack the base class.
+        from vllm.v1.core.single_type_kv_cache_manager import (
+            register_all_kvcache_specs,
+        )
+
+        from vllm_rbln.platform import RblnPlatform
+
+        register_all_kvcache_specs(None)
+        RblnPlatform.register_custom_kv_cache_specs(None)
+        assert KVCacheSpecRegistry.get_manager_class(_gdn_spec()) is RBLNGDNManager
+        plain = MambaSpec(shapes=((2, 4),), dtypes=(torch.int16,), block_size=16)
+        assert KVCacheSpecRegistry.get_manager_class(plain) is MambaManager
 
 
 class TestCoordinatorExternalTokens:
@@ -328,3 +370,131 @@ class TestCoordinatorCallsTheOverrides:
         coord.allocate_new_blocks("r", num_tokens=1024, num_tokens_main_model=1024)
         coord.remove_skipped_blocks("r", 512, 1024)
         assert len(coord.single_type_managers[0].req_to_blocks["r"]) == 1
+
+
+class TestRBLNGDNStateSpec:
+    def test_max_memory_usage_counts_the_real_state(self):
+        # Declared at four times its state (as the attention page pads it), the
+        # spec still reports what align mode holds: two real states a request.
+        real = _gdn_spec().page_size_bytes
+        padded = _gdn_spec(page_size_padded=4 * real)
+        vllm_config = SimpleNamespace(
+            cache_config=SimpleNamespace(mamba_cache_mode="align")
+        )
+        assert padded.max_memory_usage_bytes(vllm_config) == 2 * real
+
+    def test_pool_blocks_cover_live_requests_and_the_attention_span(self):
+        vllm_config = SimpleNamespace(
+            scheduler_config=SimpleNamespace(max_num_seqs=4),
+            cache_config=SimpleNamespace(block_size=64),
+        )
+        kv_cache_config = SimpleNamespace(num_blocks=10)
+        # 2 live blocks x 4 requests + 4 states an attention block x 10 blocks
+        assert gdn_pool_blocks(vllm_config, kv_cache_config, _gdn_spec()) == 48
+
+
+class TestRBLNGDNManagerPool:
+    """Drive the real hybrid coordinator so the state pool is exercised through
+    the calls the pinned vllm makes, next to an attention group on the shared
+    pool."""
+
+    def _coordinator(self, block_size=16, num_blocks=8, enable_kv_cache_events=False):
+        from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
+        from vllm.v1.core.single_type_kv_cache_manager import (
+            register_all_kvcache_specs,
+        )
+
+        from vllm_rbln.platform import RblnPlatform
+
+        register_all_kvcache_specs(None)
+        RblnPlatform.register_custom_kv_cache_specs(None)
+        full = FullAttentionSpec(
+            block_size=block_size, num_kv_heads=2, head_size=8, dtype=torch.float16
+        )
+        gdn = _gdn_spec(block_size=block_size, page_size_padded=full.page_size_bytes)
+        config = KVCacheConfig(
+            num_blocks=num_blocks,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(["attn"], full),
+                KVCacheGroupSpec(["gdn"], gdn),
+            ],
+        )
+        return get_kv_cache_coordinator(
+            kv_cache_config=config,
+            max_model_len=block_size * 32,
+            max_in_flight_tokens=512,
+            use_eagle=False,
+            enable_caching=True,
+            enable_kv_cache_events=enable_kv_cache_events,
+            dcp_world_size=1,
+            pcp_world_size=1,
+            scheduler_block_size=block_size,
+            hash_block_size=block_size,
+        )
+
+    def _need(self, coord, request_id, num_tokens):
+        return coord.get_num_blocks_to_allocate(
+            request_id=request_id,
+            num_tokens=num_tokens,
+            new_computed_blocks=([], []),
+            num_encoder_tokens=0,
+            total_computed_tokens=0,
+            num_local_computed_tokens=0,
+            num_tokens_main_model=num_tokens,
+        )
+
+    def test_unbound_manager_refuses_to_count(self):
+        coord = self._coordinator()
+        assert isinstance(coord.single_type_managers[1], RBLNGDNManager)
+        with pytest.raises(AssertionError):
+            self._need(coord, "r", 16)
+
+    def test_state_blocks_come_from_the_bound_pool_and_count_nothing(self):
+        coord = self._coordinator(num_blocks=8)
+        state = coord.single_type_managers[1]
+        state.bind_pool(3)  # the null block and two states
+        # One attention block; the state block is not the attention pool's.
+        assert self._need(coord, "r", 16) == 1
+        attn_blocks, state_blocks = coord.allocate_new_blocks(
+            "r", num_tokens=16, num_tokens_main_model=16
+        )
+        assert [b.pool for b in attn_blocks] == [coord.block_pool]
+        assert [b.pool for b in state_blocks] == [state.block_pool]
+        assert coord.block_pool.get_num_free_blocks() == 8 - 1 - 1
+        assert state.block_pool.get_num_free_blocks() == 3 - 1 - 1
+
+    def test_full_state_pool_answers_the_attention_refusal(self):
+        coord = self._coordinator(num_blocks=8)
+        state = coord.single_type_managers[1]
+        state.bind_pool(3)
+        coord.allocate_new_blocks("r", num_tokens=16, num_tokens_main_model=16)
+        coord.allocate_new_blocks("s", num_tokens=16, num_tokens_main_model=16)
+        assert state.block_pool.get_num_free_blocks() == 0
+        # More than the attention pool could ever hold, so the step is refused.
+        assert self._need(coord, "t", 16) > coord.block_pool.num_gpu_blocks
+
+    def test_free_returns_state_blocks_to_their_pool(self):
+        coord = self._coordinator(num_blocks=8)
+        state = coord.single_type_managers[1]
+        state.bind_pool(3)
+        coord.allocate_new_blocks("r", num_tokens=16, num_tokens_main_model=16)
+        coord.free("r")
+        assert state.block_pool.get_num_free_blocks() == 3 - 1
+        assert coord.block_pool.get_num_free_blocks() == 8 - 1
+
+    def test_state_pool_events_drain_through_the_attention_pool(self):
+        # Only the attention pool's queue is ever drained (KVCacheManager
+        # .take_events), so a state block cached in the state pool must show up
+        # there, tagged with the state group.
+        coord = self._coordinator(num_blocks=8, enable_kv_cache_events=True)
+        state = coord.single_type_managers[1]
+        state.bind_pool(3)
+        request = make_request("r", list(range(16)), block_size=16)
+        coord.allocate_new_blocks("r", num_tokens=16, num_tokens_main_model=16)
+        coord.cache_blocks(request, 16)
+        stored = [
+            e for e in coord.block_pool.take_events() if isinstance(e, BlockStored)
+        ]
+        assert sorted(e.group_idx for e in stored) == [0, 1]
+        assert state.block_pool.kv_event_queue == []

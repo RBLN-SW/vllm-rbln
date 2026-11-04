@@ -2017,3 +2017,22 @@ class TestRescaleKvCacheConfig:
     def test_a_zero_block_config_is_refused(self):
         with pytest.raises(ValueError, match="cannot rescale"):
             rescale_kv_cache_config(self._cfg(0), 5)
+
+
+class TestGatedDeltaNetCacheIndices:
+    def test_a_layer_owns_a_state_and_a_conv_ring_slot(self):
+        # Two cache slots a layer: the recurrent state at the layer's own slot,
+        # its conv ring at the next, and an attention layer's cache at the first.
+        config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                layer_types=["linear_attention", "full_attention"],
+                linear_num_value_heads=32,
+            )
+        )
+        assert worker_utils.num_attn_module(config, "auto") == 2
+        assert worker_utils.extract_layer_index("model.layers.3.linear_attn", 2) == 6
+        assert (
+            worker_utils.extract_layer_index("model.layers.3.linear_attn.conv_ring", 2)
+            == 7
+        )
+        assert worker_utils.extract_layer_index("model.layers.3.self_attn.attn", 2) == 6

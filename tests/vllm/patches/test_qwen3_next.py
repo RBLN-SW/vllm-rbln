@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The RBLN GatedDeltaNet forward tracks the HF reference across a padded
-prefill chunk, a continued chunk and a decode step, on the request's state
-block. The custom ops run their CPU bodies here, so no NPU is needed."""
+"""The RBLN GatedDeltaNet layer declares the state the CR13 cores keep as a
+block in a pool of its own, and its forward tracks the HF reference across a
+padded prefill chunk, a continued chunk and a decode step on that block. The
+custom ops run their CPU bodies here, so no NPU is needed."""
 
 from types import SimpleNamespace
 
@@ -31,19 +32,22 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
 
 from tests.vllm.vllm_config import make_vllm_config
 from vllm_rbln.forward_context import set_forward_context
-from vllm_rbln.patches.qwen3_next import patched_gdn_forward
+from vllm_rbln.model_executor.models.qwen3_5 import RBLNQwen3_5ForConditionalGeneration
+from vllm_rbln.patches.qwen3_next import RBLNQwenGatedDeltaNetAttention
 from vllm_rbln.v1.attention.backends.gdn import (
     RBLNGDNAttentionMetadataBuilder,
+    gdn_state_shape,
     grouped_qkv_rows,
 )
+from vllm_rbln.v1.kv_cache import RBLNGDNStateSpec
 
 HIDDEN, HEADS_K, HEADS_V, HEAD_DIM, KERNEL = 64, 2, 4, 128, 4
 KEY_DIM, VALUE_DIM = HEADS_K * HEAD_DIM, HEADS_V * HEAD_DIM
 CONV_DIM = 2 * KEY_DIM + VALUE_DIM
 CHUNK = 128
 PREFIX = "model.layers.0.linear_attn"
-# The request's state block (the MambaSpec group's block table entry).
-BLOCK = 2
+# The state pool: the request's block, with a neighbour on each side.
+NUM_BLOCKS, BLOCK = 4, 2
 
 
 class _Proj(torch.nn.Linear):
@@ -57,6 +61,7 @@ def _layer():
     torch.manual_seed(0)
     layer = SimpleNamespace(
         prefix=PREFIX,
+        layer_index=0,
         tp_size=1,
         num_k_heads=HEADS_K,
         num_v_heads=HEADS_V,
@@ -77,9 +82,10 @@ def _layer():
     return layer
 
 
-def _grouped(layer):
+def _grouped(layer, ring):
     """The layer as RBLNQwen3_5ForConditionalGeneration.load_weights leaves it:
-    the q | k | v rows of in_proj_qkvz and conv1d regrouped by key head."""
+    the q | k | v rows of in_proj_qkvz and conv1d regrouped by key head, with
+    its conv ring beside it."""
     rows = grouped_qkv_rows(HEADS_K, HEADS_V // HEADS_K, HEAD_DIM)
     grouped = SimpleNamespace(**vars(layer))
     grouped.in_proj_qkvz = _Proj(HIDDEN, CONV_DIM + VALUE_DIM, bias=False)
@@ -87,6 +93,7 @@ def _grouped(layer):
     grouped.in_proj_qkvz.weight.data[: rows.numel()] = layer.in_proj_qkvz.weight[rows]
     grouped.conv1d = SimpleNamespace(weight=layer.conv1d.weight.clone())
     grouped.conv1d.weight[: rows.numel()] = layer.conv1d.weight[rows]
+    grouped.conv_ring = SimpleNamespace(inputs=lambda: ring)
     return grouped
 
 
@@ -143,25 +150,39 @@ def vllm_config():
     )
 
 
-def _run(layer, vllm_config, builder, hidden, common, positions, is_prefill, batch_pad):
-    metadata = builder.build(common, positions, batch_pad, is_prefill)
+def _run(
+    layer, vllm_config, builder, state, hidden, common, positions, is_prefill, pad
+):
+    metadata = builder.build(common, positions, pad, is_prefill)
+    # What the runner attaches to every step's metadata (attach_kv_cache_bindings).
+    metadata.kv_caches = [state]
+    metadata.kv_cache_view_infos = None
     with set_forward_context({PREFIX: metadata}, vllm_config):
-        return patched_gdn_forward(layer, hidden)
+        return RBLNQwenGatedDeltaNetAttention.forward(layer, hidden)
 
 
-def _ssm_state(builder) -> torch.Tensor:
-    # The block's row, dlfloat16 bits in the blocked layout -> HF [1, heads_v, dk, dv]
-    row = builder.rows.row_of[BLOCK]
-    bits = builder.states[PREFIX].ssm_state[row : row + 1]
+def _ssm_state(state: torch.Tensor) -> torch.Tensor:
+    # The block's state, dlfloat16 bits in the blocked layout -> HF [1, heads_v, dk, dv]
+    bits = state[BLOCK : BLOCK + 1]
     return unblock_state(dlf16_to_float(bits)).reshape(1, HEADS_V, HEAD_DIM, HEAD_DIM)
 
 
 def test_padded_prefill_then_decode_tracks_hf(vllm_config):
     layer = _layer()
-    device_layer = _grouped(layer)
+    # The pool's state tensor and the ring beside it, as the runner allocates them.
+    state = torch.zeros(
+        NUM_BLOCKS, *gdn_state_shape(HEADS_K, HEADS_V), dtype=torch.int16
+    )
+    ring = torch.zeros(NUM_BLOCKS, KERNEL - 1, CONV_DIM // HEAD_DIM, HEAD_DIM)
+    device_layer = _grouped(layer, ring)
     vllm_config.compilation_config.static_forward_context[PREFIX] = device_layer
+    spec = RBLNGDNStateSpec(
+        block_size=vllm_config.model_config.max_model_len,
+        shapes=(gdn_state_shape(HEADS_K, HEADS_V),),
+        dtypes=(torch.int16,),
+    )
     builder = RBLNGDNAttentionMetadataBuilder(
-        None, [PREFIX], vllm_config, torch.device("cpu")
+        spec, [PREFIX], vllm_config, torch.device("cpu")
     )
     torch.manual_seed(1)
     tokens = torch.randn(1, 70 + 58 + 1, HIDDEN)
@@ -173,15 +194,16 @@ def test_padded_prefill_then_decode_tracks_hf(vllm_config):
         device_layer,
         vllm_config,
         builder,
+        state,
         hidden,
         _common(70, 70),
         torch.arange(CHUNK),
         True,
         1,
     )
-    ref, history, state = _reference(layer, tokens[:, :70], None, None)
+    ref, history, ref_state = _reference(layer, tokens[:, :70], None, None)
     torch.testing.assert_close(out[:, :70], ref, atol=2e-3, rtol=2e-2)
-    torch.testing.assert_close(_ssm_state(builder), state, atol=2e-3, rtol=2e-2)
+    torch.testing.assert_close(_ssm_state(state), ref_state, atol=2e-3, rtol=2e-2)
 
     # Chunk 2: 58 more tokens, carrying the conv history and the recurrent state.
     hidden = torch.zeros(1, CHUNK, HIDDEN)
@@ -190,15 +212,16 @@ def test_padded_prefill_then_decode_tracks_hf(vllm_config):
         device_layer,
         vllm_config,
         builder,
+        state,
         hidden,
         _common(58, 128),
         torch.arange(70, 70 + CHUNK),
         True,
         1,
     )
-    ref, history, state = _reference(layer, tokens[:, 70:128], history, state)
+    ref, history, ref_state = _reference(layer, tokens[:, 70:128], history, ref_state)
     torch.testing.assert_close(out[:, :58], ref, atol=2e-3, rtol=2e-2)
-    torch.testing.assert_close(_ssm_state(builder), state, atol=2e-3, rtol=2e-2)
+    torch.testing.assert_close(_ssm_state(state), ref_state, atol=2e-3, rtol=2e-2)
 
     # Decode: one token on row 0 of a padded batch of two.
     hidden = torch.zeros(2, 1, HIDDEN)
@@ -207,19 +230,20 @@ def test_padded_prefill_then_decode_tracks_hf(vllm_config):
         device_layer,
         vllm_config,
         builder,
+        state,
         hidden,
         _common(1, 129),
         torch.tensor([128]),
         False,
         2,
     )
-    ref, _, state = _reference(layer, tokens[:, 128:129], history, state)
+    ref, _, ref_state = _reference(layer, tokens[:, 128:129], history, ref_state)
     torch.testing.assert_close(out[:1], ref, atol=2e-3, rtol=2e-2)
-    torch.testing.assert_close(_ssm_state(builder), state, atol=2e-3, rtol=2e-2)
-    # The padded row took its scratch row, so no other live row was touched.
-    rows = builder.states[PREFIX].ssm_state
-    assert builder.rows.row_of == {BLOCK: 0}
-    assert rows[0].any() and not rows[1:].any()
+    torch.testing.assert_close(_ssm_state(state), ref_state, atol=2e-3, rtol=2e-2)
+    # The padded row took the null block, so the request's neighbours are
+    # untouched.
+    assert not state[BLOCK - 1].any() and not state[BLOCK + 1].any()
+    assert not ring[BLOCK - 1].any() and not ring[BLOCK + 1].any()
 
 
 def test_forward_without_metadata_is_an_error(vllm_config):
@@ -228,7 +252,60 @@ def test_forward_without_metadata_is_an_error(vllm_config):
         set_forward_context({}, vllm_config),
         pytest.raises(RuntimeError, match="no RBLN GDN metadata"),
     ):
-        patched_gdn_forward(layer, torch.zeros(1, CHUNK, HIDDEN))
+        RBLNQwenGatedDeltaNetAttention.forward(layer, torch.zeros(1, CHUNK, HIDDEN))
+
+
+class TestStateSpec:
+    """The layer declares the state the CR13 cores keep, and the model declares
+    the same state for the platform's page arithmetic."""
+
+    @staticmethod
+    def _layer():
+        # 4 key heads and 8 value heads over 2 ranks: 2 key heads a rank, 2 values
+        # each.
+        layer = object.__new__(RBLNQwenGatedDeltaNetAttention)
+        layer.tp_size = 2
+        layer.num_k_heads = 4
+        layer.num_v_heads = 8
+        return layer
+
+    def test_the_layer_declares_one_core_state_a_block(self):
+        layer = self._layer()
+        assert layer.get_state_shape() == ((2, 2, 2, 128, 64),)
+        assert layer.get_state_dtype() == (torch.int16,)
+
+    def test_the_layer_spec_is_the_rbln_state_spec(self):
+        cache_config = SimpleNamespace(
+            mamba_block_size=8192,
+            mamba_page_size_padded=1 << 22,
+            mamba_cache_mode="none",
+        )
+        spec = self._layer().get_kv_cache_spec(
+            SimpleNamespace(cache_config=cache_config)
+        )
+        assert isinstance(spec, RBLNGDNStateSpec)
+        assert spec.block_size == 8192
+        # Declared at the attention page, while the state itself is one
+        # [2, 2, 2, 128, 64] of int16.
+        assert spec.page_size_bytes == 1 << 22
+        assert spec.real_page_size_bytes == 2 * 2 * 2 * 128 * 64 * 2
+
+    def test_the_model_declares_the_layers_state(self):
+        vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_text_config=SimpleNamespace(
+                    linear_num_key_heads=4, linear_num_value_heads=8
+                )
+            ),
+            parallel_config=SimpleNamespace(tensor_parallel_size=2),
+        )
+        model = RBLNQwen3_5ForConditionalGeneration
+        assert model.get_mamba_state_shape_from_config(vllm_config) == (
+            self._layer().get_state_shape()
+        )
+        assert model.get_mamba_state_dtype_from_config(vllm_config) == (
+            self._layer().get_state_dtype()
+        )
 
 
 class TestProjectQkvGate:

@@ -33,7 +33,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 
 from vllm_rbln.model_executor.models.interfaces import SupportsRBLNMultiModal
-from vllm_rbln.v1.attention.backends.gdn import grouped_qkv_rows
+from vllm_rbln.v1.attention.backends.gdn import gdn_state_shape, grouped_qkv_rows
 
 # The largest image, in patches, the compiled vision encoder takes. Attention
 # runs over the whole bucket at once, so the processor's own limit (16M pixels
@@ -135,6 +135,27 @@ class RBLNQwen3_5ForConditionalGeneration(
             for weight in (attn.in_proj_qkvz.weight, attn.conv1d.weight):
                 weight.data[: rows.numel()] = weight.data[rows]
         return loaded
+
+    @classmethod
+    def get_mamba_state_dtype_from_config(
+        cls, vllm_config: VllmConfig
+    ) -> tuple[torch.dtype]:
+        return (torch.int16,)
+
+    @classmethod
+    def get_mamba_state_shape_from_config(
+        cls, vllm_config: VllmConfig
+    ) -> tuple[tuple[int, ...]]:
+        # The state every RBLNQwenGatedDeltaNetAttention declares, for the
+        # platform's page arithmetic (patches/qwen3_next).
+        hf_config = vllm_config.model_config.hf_text_config
+        tp_size = vllm_config.parallel_config.tensor_parallel_size
+        return (
+            gdn_state_shape(
+                hf_config.linear_num_key_heads // tp_size,
+                hf_config.linear_num_value_heads // tp_size,
+            ),
+        )
 
     def compile_mm_encoder(self, compile_fn: Callable[[nn.Module], nn.Module]) -> None:
         if not self.has_vision:

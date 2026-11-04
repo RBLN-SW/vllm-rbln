@@ -15,22 +15,28 @@
 import torch
 import torch.nn.functional as F
 from rebel.ops.torch_custom_ops.causal_conv1d_ring import pack_weight
+from torch import nn
+from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
 )
 from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
 
 from vllm_rbln.patches import register_patch
+from vllm_rbln.patches.attention import _resolve_kv_cache
 from vllm_rbln.patches.registry import add_registration
 from vllm_rbln.v1.attention.backends.gdn import (
     GDN_HEAD_DIM,
     GDN_PREFILL_CHUNK,
+    RBLNGDNAttentionBackend,
     RBLNGDNAttentionMetadata,
+    gdn_state_shape,
 )
-
-_MODULE = "vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn"
-_TARGET = f"{_MODULE}.QwenGatedDeltaNetAttention"
+from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec, RBLNGDNStateSpec
+from vllm_rbln.v1.worker.utils import num_attn_module as rbln_num_attn_module
+from vllm_rbln.v1.worker.utils import pipeline_adjusted_layer_index
 
 
 @add_registration(
@@ -49,111 +55,217 @@ def register_qwen3_5() -> None:
     )
 
 
+def _layer_index(prefix: str) -> int:
+    vllm_config = get_current_vllm_config()
+    model_config = vllm_config.model_config
+    return pipeline_adjusted_layer_index(
+        prefix,
+        model_config,
+        vllm_config.parallel_config,
+        rbln_num_attn_module(model_config, vllm_config.cache_config.cache_dtype),
+    )
+
+
+class RBLNGDNConvRingCache(nn.Module, AttentionLayerBase):
+    """A GatedDeltaNet layer's short-conv ring: a block-aux cache beside the
+    layer's state, one ring a state block, addressed by the layer's block ids."""
+
+    def __init__(
+        self, prefix: str, owner: str, block_shape: tuple[int, ...], dtype: torch.dtype
+    ) -> None:
+        super().__init__()
+        self.prefix = prefix
+        self.owner = owner
+        self.block_shape = block_shape
+        self.dtype = dtype
+        self.kv_cache = torch.tensor([])
+        context = get_current_vllm_config().compilation_config.static_forward_context
+        if prefix in context:
+            raise ValueError(f"Duplicate layer name: {prefix}")
+        context[prefix] = self
+        self.layer_index = _layer_index(prefix)
+
+    def forward(self) -> None: ...
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> None:
+        return None
+
+    def get_aux_cache_spec(self, vllm_config: VllmConfig) -> RBLNBlockAuxSpec:
+        return RBLNBlockAuxSpec(self.owner, self.block_shape, self.dtype)
+
+    def get_attn_backend(self) -> type[RBLNGDNAttentionBackend]:
+        return RBLNGDNAttentionBackend
+
+    def inputs(self) -> torch.Tensor:
+        metadata = get_forward_context().attn_metadata[self.owner]
+        return _resolve_kv_cache(metadata, self.layer_index)
+
+
 @register_patch(
-    target=f"{_TARGET}.forward",
+    target="vllm.model_executor.models.qwen3_next.QwenGatedDeltaNetAttention",
+    key=f"{__name__}.RBLNQwenGatedDeltaNetAttention.qwen3_next",
     reason=(
-        "Upstream picks a Triton (CUDA), AITER or CPU-op forward by platform and "
-        "has no out-of-tree branch; this one runs the short convolution and the "
-        "delta rule as RBLN custom kernels on the backend's state rows."
+        "Qwen3-Next builds its GatedDeltaNet layer from this module's name; the "
+        "RBLN layer declares the CR13 cores' state in a pool of its own and runs "
+        "the conv and the delta rule as RBLN custom kernels."
     ),
 )
-def patched_gdn_forward(
-    self: QwenGatedDeltaNetAttention, hidden_states: torch.Tensor
-) -> torch.Tensor:
-    """
-    Args:
-        hidden_states: [batch, seq, hidden] or [batch * seq, hidden]; the batch
-            and seq come from the step's GDN metadata
-    """
-    attn_metadata = get_forward_context().attn_metadata
-    metadata = (
-        attn_metadata.get(self.prefix) if isinstance(attn_metadata, dict) else None
-    )
-    if not isinstance(metadata, RBLNGDNAttentionMetadata):
-        raise RuntimeError(f"{self.prefix}: this step carries no RBLN GDN metadata")
-    batch, seq_len = metadata.batch_size, metadata.seq_len
-    if hidden_states.numel() != batch * seq_len * hidden_states.shape[-1]:
-        raise RuntimeError(
-            f"{self.prefix}: hidden_states {tuple(hidden_states.shape)} do not hold "
-            f"the step's batch {batch} x seq {seq_len} the GDN metadata describes"
+@register_patch(
+    target="vllm.model_executor.models.qwen3_5.QwenGatedDeltaNetAttention",
+    reason=(
+        "Upstream's GatedDeltaNet layer declares a conv + ssm state page its "
+        "Triton/CUDA kernels address and picks a forward by platform, with no "
+        "out-of-tree branch; the RBLN layer declares the CR13 cores' state in a "
+        "block pool of its own, keeps the conv ring in a block-aux cache, and runs "
+        "both as RBLN custom kernels on the group's block ids."
+    ),
+)
+class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
+    def __init__(
+        self, config, vllm_config: VllmConfig, prefix: str = "", **kwargs
+    ) -> None:
+        super().__init__(config, vllm_config, prefix, **kwargs)
+        if self.head_k_dim != GDN_HEAD_DIM or self.head_v_dim != GDN_HEAD_DIM:
+            raise NotImplementedError(
+                "The RBLN GatedDeltaNet kernels take 128-wide heads, got "
+                f"{self.head_k_dim} / {self.head_v_dim}"
+            )
+        self.layer_index = _layer_index(prefix)
+        heads_k = self.num_k_heads // self.tp_size
+        ratio = self.num_v_heads // self.num_k_heads
+        self.conv_ring = RBLNGDNConvRingCache(
+            f"{prefix}.conv_ring",
+            owner=prefix,
+            block_shape=(
+                self.conv_kernel_size - 1,
+                heads_k * (2 + ratio),
+                GDN_HEAD_DIM,
+            ),
+            dtype=vllm_config.model_config.dtype,
         )
-    state = metadata.states[self.prefix]
-    tp_size = self.tp_size
-    heads_k = self.num_k_heads // tp_size
-    heads_v = self.num_v_heads // tp_size
-    ratio = heads_v // heads_k
-    key_dim = self.key_dim // tp_size
-    value_dim = self.value_dim // tp_size
-    channels = key_dim * 2 + value_dim
-    head_dim = GDN_HEAD_DIM
-    kernel = self.conv_kernel_size
 
-    # Keep the leading dims the model uses ([batch, seq] on RBLN); only the
-    # kernels need the explicit [batch, seq, ...] views.
-    mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-    gates, _ = self.in_proj_ba(hidden_states)
-    qkv, z = mixed_qkvz.split([channels, value_dim], dim=-1)
-    b, a = gates.chunk(2, dim=-1)
-    groups = heads_k * (2 + ratio)
-
-    # One conv over q | k | v, whose rows the model regrouped by key head at
-    # load time (grouped_qkv_rows): RSD cuts the conv's channels where it cuts
-    # the cores' heads, so a chiplet's conv output is what its cores read.
-    convolved = torch.ops.rbln_custom_ops.causal_conv1d_ring_tabled(
-        qkv.reshape(batch, seq_len, groups, head_dim),
-        pack_weight(
-            self.conv1d.weight.view(groups, head_dim, kernel).to(mixed_qkvz.dtype)
-        ),
-        state.conv_qkv,
-        *metadata.conv_tables,
-        state.conv_width,
-    )
-    # The cores take q / k per key head (they L2-normalize them) and v, g and
-    # beta per value head grouped under its key head: value head h is key head
-    # h // ratio's (h % ratio)-th, as HF's repeat_interleave pairs them.
-    grouped = convolved.view(batch, seq_len, heads_k, 2 + ratio, head_dim)
-    grouped = grouped.permute(0, 2, 3, 1, 4)
-    query, key = (grouped[:, :, i].contiguous() for i in (0, 1))
-    value = grouped[:, :, 2:].contiguous()
-
-    beta = torch.sigmoid(b).reshape(batch, seq_len, heads_k, ratio)
-    g = -torch.exp(self.A_log.float()) * F.softplus(a.float() + self.dt_bias.float())
-    g = g.reshape(batch, seq_len, heads_k, ratio)
-    beta, g = (x.permute(0, 2, 3, 1) for x in (beta, g))
-    if metadata.is_prefill:
-        # Padded tokens must neither decay the state nor write to it.
-        assert metadata.valid_mask is not None
-        g = g * metadata.valid_mask
-        beta = beta * metadata.valid_mask.to(beta.dtype)
-    beta, g = beta.contiguous(), g.contiguous()
-    if metadata.is_prefill:
-        core = torch.ops.rbln_custom_ops.chunk_gated_delta_rule(
-            query,
-            key,
-            value,
-            g,
-            beta,
-            state.ssm_state,
-            metadata.core_state_index,
-            metadata.core_has_initial_state,
-            GDN_PREFILL_CHUNK,
+    def get_state_shape(self) -> tuple[tuple[int, ...]]:
+        return (
+            gdn_state_shape(
+                self.num_k_heads // self.tp_size, self.num_v_heads // self.tp_size
+            ),
         )
-    else:
-        core = torch.ops.rbln_custom_ops.recurrent_gated_delta_rule(
-            query,
-            key,
-            value,
-            g,
-            beta,
-            state.ssm_state,
-            metadata.core_state_index,
+
+    def get_state_dtype(self) -> tuple[torch.dtype]:
+        return (torch.int16,)
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> RBLNGDNStateSpec:
+        cache_config = vllm_config.cache_config
+        return RBLNGDNStateSpec(
+            shapes=self.get_state_shape(),
+            dtypes=self.get_state_dtype(),
+            block_size=cache_config.mamba_block_size,
+            page_size_padded=cache_config.mamba_page_size_padded,
+            mamba_type=self.mamba_type,
+            mamba_cache_mode=cache_config.mamba_cache_mode,
         )
-    # [batch, heads_k, ratio, seq, 128] -> [batch, seq, heads_v, 128]
-    core = core.permute(0, 3, 1, 2, 4).reshape(batch, seq_len, heads_v, head_dim)
-    z = z.reshape(batch, seq_len, heads_v, head_dim)
-    gated = self.norm(core, z)
-    output, _ = self.out_proj(gated.reshape(batch, seq_len, heads_v * head_dim))
-    return output.reshape(*hidden_states.shape[:-1], output.shape[-1])
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            hidden_states: [batch, seq, hidden] or [batch * seq, hidden]; the batch
+                and seq come from the step's GDN metadata
+        """
+        attn_metadata = get_forward_context().attn_metadata
+        metadata = (
+            attn_metadata.get(self.prefix) if isinstance(attn_metadata, dict) else None
+        )
+        if not isinstance(metadata, RBLNGDNAttentionMetadata):
+            raise RuntimeError(f"{self.prefix}: this step carries no RBLN GDN metadata")
+        batch, seq_len = metadata.batch_size, metadata.seq_len
+        if hidden_states.numel() != batch * seq_len * hidden_states.shape[-1]:
+            raise RuntimeError(
+                f"{self.prefix}: hidden_states {tuple(hidden_states.shape)} do not "
+                f"hold the step's batch {batch} x seq {seq_len} the GDN metadata "
+                "describes"
+            )
+        state = _resolve_kv_cache(metadata, self.layer_index)
+        ring = self.conv_ring.inputs()
+        tp_size = self.tp_size
+        heads_k = self.num_k_heads // tp_size
+        heads_v = self.num_v_heads // tp_size
+        ratio = heads_v // heads_k
+        key_dim = self.key_dim // tp_size
+        value_dim = self.value_dim // tp_size
+        channels = key_dim * 2 + value_dim
+        head_dim = GDN_HEAD_DIM
+        kernel = self.conv_kernel_size
+
+        # Keep the leading dims the model uses ([batch, seq] on RBLN); only the
+        # kernels need the explicit [batch, seq, ...] views.
+        mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+        gates, _ = self.in_proj_ba(hidden_states)
+        qkv, z = mixed_qkvz.split([channels, value_dim], dim=-1)
+        b, a = gates.chunk(2, dim=-1)
+        groups = heads_k * (2 + ratio)
+
+        # One conv over q | k | v, whose rows the model regrouped by key head at
+        # load time (grouped_qkv_rows): RSD cuts the conv's channels where it cuts
+        # the cores' heads, so a chiplet's conv output is what its cores read.
+        convolved = torch.ops.rbln_custom_ops.causal_conv1d_ring_tabled(
+            qkv.reshape(batch, seq_len, groups, head_dim),
+            pack_weight(
+                self.conv1d.weight.view(groups, head_dim, kernel).to(mixed_qkvz.dtype)
+            ),
+            ring,
+            *metadata.conv_tables,
+            kernel - 1,
+        )
+        # The cores take q / k per key head (they L2-normalize them) and v, g and
+        # beta per value head grouped under its key head: value head h is key head
+        # h // ratio's (h % ratio)-th, as HF's repeat_interleave pairs them.
+        grouped = convolved.view(batch, seq_len, heads_k, 2 + ratio, head_dim)
+        grouped = grouped.permute(0, 2, 3, 1, 4)
+        query, key = (grouped[:, :, i].contiguous() for i in (0, 1))
+        value = grouped[:, :, 2:].contiguous()
+
+        beta = torch.sigmoid(b).reshape(batch, seq_len, heads_k, ratio)
+        g = -torch.exp(self.A_log.float()) * F.softplus(
+            a.float() + self.dt_bias.float()
+        )
+        g = g.reshape(batch, seq_len, heads_k, ratio)
+        beta, g = (x.permute(0, 2, 3, 1) for x in (beta, g))
+        if metadata.is_prefill:
+            # Padded tokens must neither decay the state nor write to it.
+            assert metadata.valid_mask is not None
+            g = g * metadata.valid_mask
+            beta = beta * metadata.valid_mask.to(beta.dtype)
+        beta, g = beta.contiguous(), g.contiguous()
+        if metadata.is_prefill:
+            core = torch.ops.rbln_custom_ops.chunk_gated_delta_rule(
+                query,
+                key,
+                value,
+                g,
+                beta,
+                state,
+                metadata.core_state_index,
+                metadata.core_has_initial_state,
+                GDN_PREFILL_CHUNK,
+                store_index=metadata.core_store_index,
+            )
+        else:
+            core = torch.ops.rbln_custom_ops.recurrent_gated_delta_rule(
+                query,
+                key,
+                value,
+                g,
+                beta,
+                state,
+                metadata.core_state_index,
+                store_index=metadata.core_store_index,
+            )
+        # [batch, heads_k, ratio, seq, 128] -> [batch, seq, heads_v, 128]
+        core = core.permute(0, 3, 1, 2, 4).reshape(batch, seq_len, heads_v, head_dim)
+        z = z.reshape(batch, seq_len, heads_v, head_dim)
+        gated = self.norm(core, z)
+        output, _ = self.out_proj(gated.reshape(batch, seq_len, heads_v * head_dim))
+        return output.reshape(*hidden_states.shape[:-1], output.shape[-1])
 
 
 @register_patch(

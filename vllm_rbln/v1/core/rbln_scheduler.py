@@ -51,6 +51,7 @@ from vllm_rbln.v1.core.utils import (
     should_defer_spec_step,
     sub_block_size_in_use,
 )
+from vllm_rbln.v1.kv_cache import RBLNGDNManager, gdn_pool_blocks
 
 logger = init_logger(__name__)
 
@@ -131,6 +132,19 @@ class RBLNScheduler(Scheduler):
         self._pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
 
         self._prefill_chunk_size = rbln_config.prefill_chunk_size
+        # The coordinator put every manager on the attention pool; a
+        # GatedDeltaNet group keeps its states in a pool of its own.
+        for group, manager in zip(
+            self.kv_cache_config.kv_cache_groups,
+            self.kv_cache_manager.coordinator.single_type_managers,
+            strict=True,
+        ):
+            if isinstance(manager, RBLNGDNManager):
+                manager.bind_pool(
+                    gdn_pool_blocks(
+                        self.vllm_config, self.kv_cache_config, group.kv_cache_spec
+                    )
+                )
 
     def _decode_demand(self) -> int:
         """Total decode demand for this step's soft (ceil(demand/pp)) cap.

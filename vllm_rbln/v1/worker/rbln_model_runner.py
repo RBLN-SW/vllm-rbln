@@ -151,7 +151,11 @@ from vllm_rbln.v1.core.utils import (
     step_is_prefill,
     sub_block_size_in_use,
 )
-from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
+from vllm_rbln.v1.kv_cache import (
+    RBLNBlockAuxSpec,
+    RBLNGDNStateSpec,
+    gdn_pool_blocks,
+)
 from vllm_rbln.v1.sample.rbln_logits_processor import build_rbln_logitsprocs
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
 from vllm_rbln.v1.sample.rbln_sampler import WARM_UP_CONFIGS, RBLNSampler
@@ -362,8 +366,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
         # indexes: [kv_cache_group_id][attn_group]
         self.attn_groups: list[list[AttentionGroup]] = []
-        # The GatedDeltaNet group whose blocks key the state rows, and its builder.
-        self.gdn_rows: tuple[int, RBLNGDNAttentionMetadataBuilder] | None = None
 
         # Set up speculative decoding.
         # NOTE(Jiayi): We put the entire draft model on the last PP rank.
@@ -638,18 +640,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
     def _update_states(self, scheduler_output: RBLNSchedulerOutput) -> None:
         """Update the cached states and the persistent batch with the scheduler
         output."""
-        if self.gdn_rows is not None:
-            # The scheduler freed these requests' blocks; their state rows go
-            # back before this step's blocks are mapped.
-            gid, gdn_builder = self.gdn_rows
-            gone = scheduler_output.finished_req_ids | set(
-                scheduler_output.preempted_req_ids or ()
-            )
-            gdn_builder.release(
-                self.requests[req_id].block_ids[gid][0]
-                for req_id in gone
-                if req_id in self.requests and self.requests[req_id].block_ids[gid]
-            )
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
@@ -1187,7 +1177,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
         spec_decode_common_attn_metadata = None
-        gdn_metadata = None
         for kv_cache_gid, _ in enumerate(kv_cache_groups):
             cm = copy(cm_base)  # shallow copy
 
@@ -1208,16 +1197,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 attn_group = self.attn_groups[kv_cache_gid][attn_gid]
                 builder = attn_group.get_metadata_builder(0)
                 if isinstance(builder, RBLNGDNAttentionMetadataBuilder):
-                    # The first GatedDeltaNet group's metadata serves them all
-                    # (see initialize_metadata_builders).
-                    if gdn_metadata is None:
-                        gdn_metadata = builder.build(
-                            common_attn_metadata=cm,
-                            positions=self.positions,
-                            batch_pad=num_reqs_padded,
-                            is_prefill=self.is_prefill,
-                        )
-                    attn_metadata_i = gdn_metadata
+                    attn_metadata_i = builder.build(
+                        common_attn_metadata=cm,
+                        positions=self.positions,
+                        batch_pad=num_reqs_padded,
+                        is_prefill=self.is_prefill,
+                    )
                 else:
                     assert isinstance(builder, RBLNFlashAttentionMetadataBuilder)
                     attn_metadata_i = builder.build(
@@ -3156,23 +3141,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     num_metadata_builders=1,  # not use ubatching
                 )
 
-        # Every GatedDeltaNet group holds one block a request for the same
-        # requests, so the first group's row map and step tensors serve every
-        # group: one set of step inputs lets the compiler build the conv rings'
-        # index tables once a step rather than once a layer.
-        gdn_builders = [
-            (gid, builder)
-            for gid, groups in enumerate(self.attn_groups)
-            for group in groups
-            if isinstance(
-                builder := group.get_metadata_builder(0),
-                RBLNGDNAttentionMetadataBuilder,
-            )
-        ]
-        for _, builder in gdn_builders[1:]:
-            gdn_builders[0][1].states.update(builder.states)
-        self.gdn_rows = gdn_builders[0] if gdn_builders else None
-
         # Initialize drafter attention backend.
         if isinstance(self.drafter, DRAFT_MODEL_PROPOSERS):
             self.drafter.initialize_attn_backend(kv_cache_config, kernel_block_sizes)
@@ -3252,7 +3220,19 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # tensor and the rest get their own. Not one pool the layers slice: a
         # graph input is a whole tensor, and dynamo refuses a slice's offset.
         device = self.device if use_device_tensor() else "meta"
-        extent_of = kv_cache_extents(kv_cache_config)
+        # A GatedDeltaNet layer's page in the config is an attention layer's
+        # alias; its state lives in a pool of its own (v1/kv_cache.py), sized here.
+        state_specs = {
+            layer_name: group.kv_cache_spec
+            for group in kv_cache_config.kv_cache_groups
+            if isinstance(group.kv_cache_spec, RBLNGDNStateSpec)
+            for layer_name in group.layer_names
+        }
+        extent_of = {
+            layer_name: extent
+            for layer_name, extent in kv_cache_extents(kv_cache_config).items()
+            if layer_name not in state_specs
+        }
         buffers = {
             extent: torch.empty(extent[1], dtype=torch.int8, device=device)
             for extent in set(extent_of.values())
@@ -3260,6 +3240,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         kv_cache_raw_tensors = {
             layer_name: buffers[extent] for layer_name, extent in extent_of.items()
         }
+        for layer_name, spec in state_specs.items():
+            num_blocks = gdn_pool_blocks(self.vllm_config, kv_cache_config, spec)
+            kv_cache_raw_tensors[layer_name] = torch.empty(
+                num_blocks * spec.real_page_size_bytes, dtype=torch.int8, device=device
+            )
 
         layer_names = set()
         for group in kv_cache_config.kv_cache_groups:
@@ -3292,7 +3277,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             for attn_group in self._kv_cache_spec_attn_group_iterator()
             for layer_name in attn_group.layer_names
         }
-        return canonical_kv_layers(kv_cache_config, layer_to_spec)
+        canonical = canonical_kv_layers(kv_cache_config, layer_to_spec)
+        # A GatedDeltaNet state layer and a block-aux cache each own a buffer.
+        canonical |= {
+            name
+            for name, spec in layer_to_spec.items()
+            if isinstance(spec, RBLNGDNStateSpec)
+        }
+        return canonical | set(self.aux_kv_cache_layers)
 
     def _reshape_kv_cache_tensors(
         self,
@@ -3337,9 +3329,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 if layer_name in self.runner_only_attn_layers:
                     continue
                 raw_tensor = kv_cache_raw_tensors[layer_name]
-                assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
-                num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
                 if isinstance(kv_cache_spec, AttentionSpec):
+                    assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
+                    num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
                     num_blocks_per_kv_block = (
                         kv_cache_spec.block_size // kernel_block_size
                     )
@@ -3410,21 +3402,22 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                         dynamic_axis=base_dynamic_axis,
                     )
                 elif isinstance(kv_cache_spec, MambaSpec):
-                    if (
+                    if isinstance(kv_cache_spec, RBLNGDNStateSpec):
+                        # One state a block in the layer's own buffer (see
+                        # _allocate_kv_cache_tensors); the config's page is an alias.
+                        num_blocks = (
+                            raw_tensor.numel() // kv_cache_spec.real_page_size_bytes
+                        )
+                    elif len(kv_cache_spec.shapes) != 1 or (
                         kv_cache_spec.real_page_size_bytes
                         != kv_cache_spec.page_size_bytes
                     ):
-                        # A page padded past its state only reserves the request's
-                        # block: a GatedDeltaNet state lives on its backend's rows
-                        # (v1/attention/backends/gdn.py), since its kernels take a
-                        # whole tensor and the compiler cannot view a page shared
-                        # with an attention layer in another dtype.
-                        continue
-                    if len(kv_cache_spec.shapes) != 1:
                         raise NotImplementedError(
                             f"{layer_name}: RBLN allocates a MambaSpec of one state "
                             f"that fills its page, got {kv_cache_spec}"
                         )
+                    else:
+                        num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
                     dtype = kv_cache_spec.dtypes[0]
                     kv_cache_shape = (num_blocks, *kv_cache_spec.shapes[0])
                     typed_base = raw_tensor.view(dtype).view(kv_cache_shape)
@@ -3490,7 +3483,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 kernel_block_sizes,
             )
         )
-
         self._allocate_aux_kv_caches(
             kv_cache_config,
             kv_caches,
@@ -3585,8 +3577,17 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         block_axes: dict[str, int],
     ) -> None:
         device = self.device if use_device_tensor() else "meta"
-        num_blocks = kv_cache_config.num_blocks
         extent_of = kv_cache_extents(kv_cache_config)
+        # A GatedDeltaNet layer's buffer is its own, a block a state of its pool
+        # (_allocate_kv_cache_tensors): so are its aux caches.
+        own_blocks = {
+            layer_name: gdn_pool_blocks(
+                self.vllm_config, kv_cache_config, group.kv_cache_spec
+            )
+            for group in kv_cache_config.kv_cache_groups
+            if isinstance(group.kv_cache_spec, RBLNGDNStateSpec)
+            for layer_name in group.layer_names
+        }
         # Sized with the KV cache: the dynamic-KV resize reads their growth from
         # the compiled placement like any KV input's.
         dynamic_axis = 0 if dynamic_kv_enabled(self.vllm_config) else None
@@ -3600,9 +3601,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 continue
             assert isinstance(spec, RBLNBlockAuxSpec), spec
             assert spec.owner in extent_of, f"{layer_name}: no owner {spec.owner}"
-            shape = (num_blocks, *spec.block_shape)
+            if spec.owner in own_blocks:
+                shape = (own_blocks[spec.owner], *spec.block_shape)
+                extent: tuple[int, int] | str = spec.owner
+            else:
+                shape = (kv_cache_config.num_blocks, *spec.block_shape)
+                extent = extent_of[spec.owner]
             kind = (spec.owner, shape, spec.dtype)
-            key = (extent_of[spec.owner], shape, spec.dtype, ordinals[kind])
+            key = (extent, shape, spec.dtype, ordinals[kind])
             ordinals[kind] += 1
             if (cache := tensors.get(key)) is None:
                 cache = torch.empty(shape, dtype=spec.dtype, device=device)

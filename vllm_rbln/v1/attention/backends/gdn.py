@@ -14,25 +14,21 @@
 
 """GatedDeltaNet (Qwen3-Next, Qwen3.5 `linear_attention`) state on RBLN.
 
-A layer's state is a `MambaSpec` KV cache group of one block a request
-(block_size = max_model_len): the scheduler holds a block for every live
-request and the group's block table names it. The state itself lives on this
-backend's rows, not in the KV cache pool: the core kernels
-(`rbln_custom_ops::chunk_gated_delta_rule` / `recurrent_gated_delta_rule` on
-their RBLN-CR13 bodies) take a whole state tensor and the compiler lowers a
-dtype view to a plain view, so a state can neither be carved out of a page nor
-share an attention layer's page. `RBLNGDNStateRows` maps each live block to a
-row; a block seen for the first time starts from zero through
-`has_initial_state`.
+A layer's recurrent state is a `MambaSpec` block in a pool of its own
+(`RBLNGDNStateSpec`, v1/kv_cache.py): one [Hk, R, 2, 128, 64] state of
+dlfloat16 bits (int16) a block, addressed by the group's block table. Its
+short-conv ring is a block-aux cache on the same block ids. The builder turns
+the block table into the rows the kernels read and write: a request loads the
+block of its last computed token and stores the block of its last scheduled
+one; a padding row does both on block 0, vLLM's null block.
 
 The cores take q / k per key head, L2-normalized in the kernel, and v, g and
 beta per value head grouped under its key head. The short conv
 (`rbln_custom_ops::causal_conv1d_ring_tabled`) runs once over q | k | v in that
-same key-head order (`grouped_qkv_rows`) and keeps one ring on the same rows;
-its index tables are built here, once a step for every layer.
+same key-head order (`grouped_qkv_rows`); its index tables are built here, once
+a step for every layer of the group.
 """
 
-from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
 import torch
@@ -49,14 +45,16 @@ from vllm.v1.attention.backends.registry import (
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec
 
-from vllm_rbln.logger import init_logger
-
-logger = init_logger(__name__)
-
 # The core kernels take 128-wide heads; the CR13 prefill kernel runs 128-token
 # chunks only.
 GDN_HEAD_DIM = 128
 GDN_PREFILL_CHUNK = 128
+
+
+def gdn_state_shape(heads_k: int, heads_v: int) -> tuple[int, ...]:
+    """One block's state as the CR13 cores keep it: each key head's
+    `heads_v / heads_k` [128, 128] states in [2, 128, 64] dlfloat16 lanes."""
+    return (heads_k, heads_v // heads_k, GDN_HEAD_DIM // 64, GDN_HEAD_DIM, 64)
 
 
 def grouped_qkv_rows(heads_k: int, ratio: int, head_dim: int) -> torch.Tensor:
@@ -72,73 +70,21 @@ def grouped_qkv_rows(heads_k: int, ratio: int, head_dim: int) -> torch.Tensor:
 
 
 @dataclass
-class GDNLayerState:
-    # [rows, width, heads_k * (2 + ratio), 128]: the conv ring of q | k | v in
-    # grouped_qkv_rows order, row p % width holding position p
-    conv_qkv: torch.Tensor
-    # [rows, heads_k, heads_v / heads_k, 2, 128, 64] int16: each [128, 128]
-    # state's dlfloat16 bits in the cores' blocked layout. The dtype selects
-    # the CR13 kernels, which address the rows per batch row.
-    ssm_state: torch.Tensor
-    conv_width: int
-
-
-@dataclass
 class RBLNGDNAttentionMetadata:
     is_prefill: bool
     batch_size: int
     seq_len: int
-    # [batch] int16 on the host: each row's state row (see RBLNGDNStateRows) and
-    # 1 where it carries a cached state. The core kernels read their indices
-    # through the const buffer (a device copy crashes the runtime).
+    # [batch] int16 on the host: the state block each row loads, the one it
+    # stores, and 1 where the loaded block carries a state. The core kernels
+    # read them through the const buffer (a device copy crashes the runtime).
     core_state_index: torch.Tensor
+    core_store_index: torch.Tensor
     core_has_initial_state: torch.Tensor
     # The conv ring's tables (ring_tables): hist_idx / ring_idx staged on the
     # device, block / count on the host (the kernel's const buffers)
     conv_tables: tuple[torch.Tensor, ...]
     # [1, 1, seq_len] float32 on prefill: 1 for valid tokens, 0 for padding
     valid_mask: torch.Tensor | None
-    states: dict[str, GDNLayerState]
-
-
-class RBLNGDNStateRows:
-    """Which state block sits on which row.
-
-    Rows [0, num_live) hold the blocks of running requests; a block is given a
-    row when it is first scheduled and gives it back when its request finishes
-    or is preempted (`release`). Rows [num_live, 2 * num_live) are scratch, one
-    per batch position: a padded row and a dummy run (block 0, vLLM's null
-    block) write there, each position its own row since the kernels take
-    distinct rows.
-    """
-
-    def __init__(self, num_live: int):
-        self.num_live = num_live
-        self.row_of: dict[int, int] = {}
-        self._free = list(range(num_live - 1, -1, -1))
-
-    def release(self, blocks: Iterable[int]) -> None:
-        for block in blocks:
-            if (row := self.row_of.pop(block, None)) is not None:
-                self._free.append(row)
-
-    def rows(self, blocks: Sequence[int], batch: int) -> list[int]:
-        """The row of each scheduled block (`blocks[b]` for batch row b)."""
-        rows = []
-        for position in range(batch):
-            block = blocks[position] if position < len(blocks) else 0
-            if block == 0:
-                rows.append(self.num_live + position)
-                continue
-            if (row := self.row_of.get(block)) is None:
-                if not self._free:
-                    raise RuntimeError(
-                        f"no free GatedDeltaNet state row for block {block}: "
-                        f"{len(self.row_of)} live blocks hold the {self.num_live} rows"
-                    )
-                row = self.row_of[block] = self._free.pop()
-            rows.append(row)
-        return rows
 
 
 @register_backend(MambaAttentionBackendEnum.GDN_ATTN, is_mamba=True)
@@ -168,56 +114,9 @@ class RBLNGDNAttentionMetadataBuilder(
     ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.prefill_chunk_size = vllm_config.scheduler_config.max_num_batched_tokens
-        self.dtype = vllm_config.model_config.dtype
-        # At most max_num_seqs requests run, and the decode batch is padded to
-        # at most max_num_seqs rows.
-        num_live = vllm_config.scheduler_config.max_num_seqs
-        self.rows = RBLNGDNStateRows(num_live)
         layers = vllm_config.compilation_config.static_forward_context
         self.conv_kernel_size = layers[layer_names[0]].conv_kernel_size
-        self.states = {
-            name: self._allocate(layers[name], 2 * num_live) for name in layer_names
-        }
         self._staged: dict[tuple, torch.Tensor] = {}
-        logger.info(
-            "GatedDeltaNet state: %d layers x %d rows (%d live blocks, %d scratch)",
-            len(layer_names),
-            2 * num_live,
-            num_live,
-            num_live,
-        )
-
-    def _allocate(self, layer, rows: int) -> GDNLayerState:
-        tp_size = layer.tp_size
-        heads_k = layer.num_k_heads // tp_size
-        heads_v = layer.num_v_heads // tp_size
-        if layer.head_k_dim != GDN_HEAD_DIM or layer.head_v_dim != GDN_HEAD_DIM:
-            raise NotImplementedError(
-                "The RBLN GatedDeltaNet kernels take 128-wide heads, got "
-                f"{layer.head_k_dim} / {layer.head_v_dim}"
-            )
-        width = layer.conv_kernel_size - 1
-        return GDNLayerState(
-            conv_qkv=torch.zeros(
-                rows,
-                width,
-                heads_k * (2 + heads_v // heads_k),
-                GDN_HEAD_DIM,
-                dtype=self.dtype,
-                device=self.device,
-            ),
-            ssm_state=torch.zeros(
-                rows,
-                heads_k,
-                heads_v // heads_k,
-                GDN_HEAD_DIM // 64,
-                GDN_HEAD_DIM,
-                64,
-                dtype=torch.int16,
-                device=self.device,
-            ),
-            conv_width=width,
-        )
 
     def _stage(self, t: torch.Tensor, slot: str) -> torch.Tensor:
         """Copy a host tensor into this builder's persistent device buffer, keyed
@@ -229,9 +128,6 @@ class RBLNGDNAttentionMetadataBuilder(
         buf.copy_(t)
         return buf
 
-    def release(self, blocks: Iterable[int]) -> None:
-        self.rows.release(blocks)
-
     def build(  # type: ignore[override]
         self,
         common_attn_metadata: CommonAttentionMetadata,
@@ -242,10 +138,9 @@ class RBLNGDNAttentionMetadataBuilder(
         num_reqs = common_attn_metadata.num_reqs
         query_start_loc = common_attn_metadata.query_start_loc[: num_reqs + 1]
         query_lens = query_start_loc[1:] - query_start_loc[:-1]
-        num_computed = common_attn_metadata.seq_lens[:num_reqs] - query_lens
+        seq_lens = common_attn_metadata.seq_lens[:num_reqs]
+        num_computed = seq_lens - query_lens
         first_positions = positions[query_start_loc[:num_reqs]]
-        # One block a request: the table is one column wide.
-        blocks = common_attn_metadata.block_table_tensor[:num_reqs, 0].tolist()
 
         if is_prefill:
             assert num_reqs == 1, "RBLN prefills one request per step"
@@ -255,12 +150,27 @@ class RBLNGDNAttentionMetadataBuilder(
             assert int(query_lens.max()) == 1, (
                 "a decode step takes one token per request"
             )
-        rows = self.rows.rows(blocks, batch)
 
         def padded(values: torch.Tensor) -> torch.Tensor:
             out = torch.zeros(batch, dtype=torch.int32)
             out[:num_reqs] = values.to(torch.int32)
             return out
+
+        # A fresh request (no computed token) takes column 0 for its load,
+        # which has_initial_state tells the kernel not to read.
+        cols = torch.stack([num_computed - 1, seq_lens - 1], dim=1).clamp(min=0)
+        cols = cols // self.kv_cache_spec.block_size
+        blocks = common_attn_metadata.block_table_tensor[:num_reqs].gather(
+            1, cols.long()
+        )
+        load_blocks = padded(blocks[:, 0])
+        store_blocks = padded(blocks[:, 1])
+        # The conv ring's tables name one block, read and written in place; a
+        # store block of its own waits on the ring kernel's store operand.
+        assert torch.equal(load_blocks, store_blocks), (
+            "a GatedDeltaNet step crossing into a new state block needs the conv "
+            "ring kernel's store operand; keep mamba_block_size at max_model_len"
+        )
 
         valid_mask = None
         if is_prefill:
@@ -270,7 +180,7 @@ class RBLNGDNAttentionMetadataBuilder(
         # A ring block holds one ring of width K - 1.
         width = self.conv_kernel_size - 1
         hist_idx, ring_idx, block, count = ring_tables(
-            torch.tensor(rows, dtype=torch.int32),
+            load_blocks,
             padded(first_positions),
             padded(query_lens),
             has_initial_state,
@@ -283,7 +193,8 @@ class RBLNGDNAttentionMetadataBuilder(
             is_prefill=is_prefill,
             batch_size=batch,
             seq_len=seq_len,
-            core_state_index=torch.tensor(rows, dtype=torch.int16),
+            core_state_index=load_blocks.to(torch.int16),
+            core_store_index=store_blocks.to(torch.int16),
             core_has_initial_state=has_initial_state.to(torch.int16),
             conv_tables=(
                 self._stage(hist_idx, "hist_idx"),
@@ -294,5 +205,4 @@ class RBLNGDNAttentionMetadataBuilder(
             valid_mask=None
             if valid_mask is None
             else self._stage(valid_mask, "valid_mask"),
-            states=self.states,
         )

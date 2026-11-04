@@ -93,8 +93,6 @@ def _make_runner_stub(**attrs):
     runner = object.__new__(RBLNModelRunner)
     runner.dp_status = None
     runner.supports_mm_inputs = False
-    # No GatedDeltaNet layers: _update_states has no state rows to release.
-    runner.gdn_rows = None
     runner.mrope_positions = None
     for key, value in attrs.items():
         setattr(runner, key, value)
@@ -628,7 +626,7 @@ class TestSelectCanonicalKvLayersPerPool:
         return SimpleNamespace(layer_names=layer_names, kv_cache_spec=spec)
 
     def _runner(self, groups):
-        r = _make_runner_stub()
+        r = _make_runner_stub(aux_kv_cache_layers=[])
         r._kv_cache_spec_attn_group_iterator = lambda: iter(groups)
         return r
 
@@ -1541,8 +1539,10 @@ class TestAllocateKvCacheTensors:
                 ),
             ],
             kv_cache_groups=[
-                SimpleNamespace(layer_names=["l0", "l1"]),
-                SimpleNamespace(layer_names=["l2"]),
+                SimpleNamespace(
+                    layer_names=["l0", "l1"], kv_cache_spec=SimpleNamespace()
+                ),
+                SimpleNamespace(layer_names=["l2"], kv_cache_spec=SimpleNamespace()),
             ],
         )
 

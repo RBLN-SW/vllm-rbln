@@ -17,15 +17,21 @@ from dataclasses import dataclass
 
 import torch
 from vllm.config import VllmConfig
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
-from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
-from vllm.v1.kv_cache_interface import SlidingWindowSpec
+from vllm.v1.core.single_type_kv_cache_manager import (
+    MambaManager,
+    SingleTypeKVCacheManager,
+)
+from vllm.v1.hisparse.block_pool import SharedEventQueueBlockPool
+from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec, SlidingWindowSpec
 from vllm.v1.request import Request
 
 
 @dataclass(frozen=True)
 class RBLNBlockAuxSpec:
-    """A per-block cache region beside a scheduled KV layer's cache."""
+    """A per-block cache region beside a scheduled KV layer's cache, addressed
+    by the owner's block ids and allocated outside the KV cache config."""
 
     owner: str
     block_shape: tuple[int, ...]
@@ -148,4 +154,89 @@ class RBLNSlidingWindowManager(SingleTypeKVCacheManager):
         pass
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
+        return 0
+
+
+@dataclass(frozen=True)
+class RBLNGDNStateSpec(MambaSpec):
+    """A GatedDeltaNet layer's recurrent state, in a block pool of its own.
+
+    The page is declared at the attention page (upstream pads a Mamba page to
+    it), so the group forms and the layout checks pass as for any Mamba layer.
+    What the worker allocates is `real_page_size_bytes` a block, in a tensor
+    sized to the state pool, and `RBLNGDNManager` draws the block ids from
+    that pool rather than the attention one.
+    """
+
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        # Upstream multiplies the declared page; the state occupies the real one.
+        pages = super().max_memory_usage_bytes(vllm_config) // self.page_size_bytes
+        return pages * self.real_page_size_bytes
+
+
+def gdn_pool_blocks(
+    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig, spec: MambaSpec
+) -> int:
+    """Blocks in a GatedDeltaNet group's pool: the two a running request holds
+    in align mode, plus a state for every state block the attention pool spans."""
+    live = 2 * vllm_config.scheduler_config.max_num_seqs
+    states_per_attention_block = vllm_config.cache_config.block_size // spec.block_size
+    return live + states_per_attention_block * kv_cache_config.num_blocks
+
+
+class RBLNGDNManager(MambaManager):
+    """`MambaManager` on a pool of its own, bound after construction.
+
+    The coordinator builds every manager on the attention pool. `bind_pool`
+    swaps this group's pool in, and from then on the manager stays out of the
+    attention count: it reports 0 while its pool has room and the attention
+    pool's refusal sentinel (`num_gpu_blocks + 1`) when it does not, the way
+    upstream's HiSparse host tier keeps its private pool out of the device one.
+    """
+
+    def __init__(
+        self, kv_cache_spec: MambaSpec, block_pool: BlockPool, **kwargs
+    ) -> None:
+        super().__init__(kv_cache_spec, block_pool, **kwargs)
+        self._attention_pool = block_pool
+
+    def bind_pool(self, num_blocks: int) -> None:
+        # Only the attention pool's event queue is ever drained
+        # (KVCacheManager.take_events), so this pool publishes into it.
+        attention_pool = self._attention_pool
+        self.block_pool = SharedEventQueueBlockPool(
+            num_gpu_blocks=num_blocks,
+            enable_caching=attention_pool.enable_caching,
+            hash_block_size=attention_pool.hash_block_size,
+            enable_kv_cache_events=attention_pool.enable_kv_cache_events,
+            event_owner=attention_pool,
+        )
+        self._null_block = self.block_pool.null_block
+
+    def get_num_blocks_to_allocate(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        total_computed_tokens: int,
+        num_local_computed_tokens: int,
+        num_tokens_main_model: int,
+        apply_admission_cap: bool = False,
+        prefill_end: int = 0,
+    ) -> int:
+        assert self.block_pool is not self._attention_pool, (
+            "RBLNGDNManager schedules on a pool of its own: call bind_pool first"
+        )
+        required = super().get_num_blocks_to_allocate(
+            request_id,
+            num_tokens,
+            new_computed_blocks,
+            total_computed_tokens,
+            num_local_computed_tokens,
+            num_tokens_main_model,
+            apply_admission_cap=apply_admission_cap,
+            prefill_end=prefill_end,
+        )
+        if required > self.block_pool.get_num_free_blocks():
+            return self._attention_pool.num_gpu_blocks + 1
         return 0
