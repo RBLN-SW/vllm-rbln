@@ -460,6 +460,16 @@ class TestIsPrefill:
         req.num_computed_tokens = req.num_tokens - 1
         assert not is_prefill(req)
 
+    def test_a_one_token_prompt_runs_alone_as_a_prefill(self):
+        sched = create_rbln_scheduler(max_num_seqs=4, block_size=16, num_blocks=10000)
+        advance_to_decode(sched, make_request("long", list(range(10)), 16))
+        sched.add_request(make_request("one", [5], 16))
+
+        out = sched.schedule()
+
+        assert list(out.num_scheduled_tokens) == ["one"]
+        assert step_is_prefill(out)
+
 
 class TestScheduleBasic:
     @pytest.mark.parametrize("policy", ["fcfs", "priority"])
@@ -1243,7 +1253,7 @@ class TestFullRunInvariants:
         ("num_tokens", "max_num_batched_tokens"),
         [
             (10, 16),  # prompt in one chunk
-            (1, 16),  # single-token prompt: no prefill step at all
+            (1, 16),  # single-token prompt: a one-token prefill step
             (33, 16),  # chunked, tail chunk of 1 token
             (32, 16),  # chunked, block-aligned
         ],
