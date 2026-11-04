@@ -615,7 +615,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
             ]
             if not self._writes_into_peer:
                 holders = holders[:1]
-            pieces = []
+            pieces: list[Piece] = []
             for j in range(groups_l):
                 group = self.tp_rank * groups_l + j
                 if group // groups_r != remote_tp_rank:
