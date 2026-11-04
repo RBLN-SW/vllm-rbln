@@ -15,7 +15,7 @@
 import pytest
 import requests
 
-from .utils import RemoteOpenAIServer
+from tests.utils import RemoteOpenAIServer
 
 MODEL_NAME = "facebook/opt-125m"
 ARGS = ["--block-size", str(2048)]
