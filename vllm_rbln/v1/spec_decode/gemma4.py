@@ -15,7 +15,6 @@ import torch
 import torch.nn as nn
 from vllm.config import get_layers_from_vllm_config
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-from vllm.model_executor.models.gemma4_mm import Gemma4ForConditionalGeneration
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import SlidingWindowSpec
 from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
@@ -42,12 +41,6 @@ class RBLNGemma4Proposer(RBLNEagleProposer):
     _setup_gemma4_kv_sharing = Gemma4Proposer._setup_gemma4_kv_sharing
     validate_same_kv_cache_group = Gemma4Proposer.validate_same_kv_cache_group
     initialize_attn_backend = Gemma4Proposer.initialize_attn_backend
-
-    def get_model_name(self, model: nn.Module) -> str:
-        # The base looks the target up by upstream's class name.
-        if isinstance(model, Gemma4ForConditionalGeneration):
-            return Gemma4ForConditionalGeneration.__name__
-        return super().get_model_name(model)
 
     def load_model(self, target_model: nn.Module) -> None:
         target_attn_layer_names = set(
