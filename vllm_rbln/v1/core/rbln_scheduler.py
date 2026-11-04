@@ -134,10 +134,10 @@ class RBLNScheduler(Scheduler):
         self._prefill_chunk_size = rbln_config.prefill_chunk_size
 
         # NOTE(RBLN): the sparse-attention ops (DSA MLA / indexer, MiniMax-M3
-        # MSA / indexer) get NULL_BLOCK_ID as null_block_id and write their
-        # context-parallel cache store's unowned rows there, so the block the
-        # pool reserves has to be that one. Checked once the KV cache manager is
-        # final (it may be swapped above).
+        # MSA / indexer, GLM5 MLA / indexer) get NULL_BLOCK_ID as null_block_id
+        # and write their context-parallel cache store's unowned rows there, so
+        # the block the pool reserves has to be that one. Checked once the KV
+        # cache manager is final (it may be swapped above).
         null_block_id = self.kv_cache_manager.block_pool.null_block.block_id
         if null_block_id != NULL_BLOCK_ID:
             raise RuntimeError(
