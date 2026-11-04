@@ -525,9 +525,11 @@ class DynamicKvSizer:
             # Disjoint sets (a target's and a drafter's): the sum is the answer.
             return flat
         sizes = {len(group_specs) for group_specs, _ in groups}
-        if sizes == {num_caches}:
-            # Every group already covers every cache, so one of them is it.
-            return list(groups[0][0])
+        if num_caches in sizes:
+            # A group covering every cache is the answer: the others bind the
+            # same caches again, whole (a split set) or in part (a KV-shared
+            # drafter such as Gemma4 MTP's).
+            return next(list(g) for g, _ in groups if len(g) == num_caches)
         raise RuntimeError(
             f"the compiled programs carry {len(flat)} KV input(s) across "
             f"{len(groups)} set(s) of {sorted(sizes)}, which neither sum to nor "

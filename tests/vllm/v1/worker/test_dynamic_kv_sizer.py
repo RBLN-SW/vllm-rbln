@@ -411,6 +411,20 @@ class TestComputeDynamicKvNumBlocks:
             DynamicKvSizer.compute_num_blocks(sizer)
         assert "summed over 3 KV input(s) from 2 set(s)" in caplog.text
 
+    def test_a_drafter_reading_the_targets_caches_adds_none(self, caplog):
+        """A KV-shared drafter (Gemma4 MTP) binds some of the target's caches;
+        the target's set already covers them."""
+        programs = [
+            _program([HEAD_SPLIT, HEAD_SPLIT], name="0/0"),
+            _program([HEAD_SPLIT], name="1/0"),
+        ]
+        sizer = self._sizer(
+            programs=programs, snapshot=self._snapshot([30 * self.GIB] * 4)
+        )
+        with caplog.at_level("INFO"):
+            DynamicKvSizer.compute_num_blocks(sizer)
+        assert "summed over 2 KV input(s) from 2 set(s)" in caplog.text
+
     def test_disjoint_sets_are_summed(self, caplog):
         """A target's and a drafter's KV are different tensors; the sum is the
         answer."""
