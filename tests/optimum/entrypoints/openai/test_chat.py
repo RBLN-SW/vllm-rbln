@@ -16,7 +16,7 @@ import openai  # use the official client for correctness check
 import pytest
 import pytest_asyncio
 
-from .utils import RemoteOpenAIServer
+from tests.utils import RemoteOpenAIServer
 
 MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
 MAX_TOKENS = 1

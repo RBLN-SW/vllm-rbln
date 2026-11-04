@@ -21,6 +21,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.logits_processor import AdapterLogitsProcessor
 
 import vllm_rbln.v1.worker.rbln_model_runner as mr
@@ -248,6 +249,24 @@ class TestWritebackBeforeReAdd:
 
         req_index = runner.input_batch.req_id_to_index["a"]
         assert runner.input_batch.token_ids_cpu[req_index, n] == 42
+
+
+class TestSeededRequest:
+    def test_seed_is_dropped_with_a_warning(
+        self, make_model_runner, monkeypatch, caplog
+    ):
+        # RBLN cannot seed a draw, so the request samples unseeded.
+        _last_rank(monkeypatch)
+        runner = make_model_runner()
+
+        with caplog.at_level("WARNING", logger=mr.logger.name):
+            runner._update_states(
+                schedule_new("seeded", sampling_params=[SamplingParams(seed=0)])
+            )
+
+        assert "Request seeded sets `seed`" in caplog.text
+        assert runner.requests["seeded"].generator is None
+        assert runner.input_batch.generators == {}
 
 
 class TestEncoderCache:
