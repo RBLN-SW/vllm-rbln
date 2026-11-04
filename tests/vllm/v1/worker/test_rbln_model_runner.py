@@ -636,6 +636,7 @@ class TestEcConsumer:
             _is_prefill_step=True,
             is_pooling_model=False,
             max_num_tokens=4,
+            prefill_chunk_size=4,
             input_ids=torch.zeros(4, dtype=torch.long),
             positions=torch.zeros(4, dtype=torch.long),
             input_stager=SimpleNamespace(
