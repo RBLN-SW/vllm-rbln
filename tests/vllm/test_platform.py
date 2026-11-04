@@ -606,6 +606,92 @@ class TestRejectedConfigs:
         with pytest.raises(ValueError, match="divisible"):
             reconfigure(_ranks(data_parallel_size=2, max_num_seqs=5))
 
+    def test_a_prefill_chunk_above_the_token_budget_is_refused(self, reconfigure):
+        with pytest.raises(ValueError, match="exceeds"):
+            reconfigure(_prefill_chunk(256))
+
+    def test_an_unset_prefill_chunk_resolves_to_the_token_budget(self, reconfigure):
+        config = reconfigure(lambda config: None)
+        assert (
+            config.additional_config.prefill_chunk_size
+            == config.scheduler_config.max_num_batched_tokens
+        )
+
+    def test_a_prefill_chunk_below_the_token_budget_is_taken(self, reconfigure):
+        config = reconfigure(_prefill_chunk(64))
+        assert config.additional_config.prefill_chunk_size == 64
+
+    @pytest.mark.parametrize(
+        "feature, enable",
+        [
+            ("data parallelism", lambda c: _ranks(data_parallel_size=2)(c)),
+            (
+                "speculative decoding",
+                lambda c: setattr(
+                    c, "speculative_config", SimpleNamespace(method="ngram")
+                ),
+            ),
+            (
+                "sub-block prefix caching",
+                lambda c: setattr(c.cache_config, "enable_prefix_caching", True),
+            ),
+            (
+                "RBLN NIXL KV transfer",
+                lambda c: setattr(
+                    c,
+                    "kv_transfer_config",
+                    SimpleNamespace(
+                        kv_connector="RblnNixlPushConnector",
+                        kv_connector_extra_config={},
+                    ),
+                ),
+            ),
+        ],
+    )
+    def test_a_prefill_chunk_below_the_token_budget_refuses(
+        self, reconfigure, feature, enable
+    ):
+        def mutate(config):
+            _prefill_chunk(64)(config)
+            enable(config)
+
+        with pytest.raises(ValueError, match=feature):
+            reconfigure(mutate)
+
+    @pytest.mark.parametrize(
+        "kv_connector, extra",
+        [
+            ("RblnNixlConnector", {}),
+            (
+                "MultiConnector",
+                {"connectors": [{"kv_connector": "RblnNixlPullConnector"}]},
+            ),
+        ],
+    )
+    def test_a_prefill_chunk_below_the_token_budget_refuses_a_nixl_connector(
+        self, reconfigure, kv_connector, extra
+    ):
+        def mutate(config):
+            _prefill_chunk(64)(config)
+            config.kv_transfer_config = SimpleNamespace(
+                kv_connector=kv_connector, kv_connector_extra_config=extra
+            )
+
+        with pytest.raises(ValueError, match="RBLN NIXL KV transfer"):
+            reconfigure(mutate)
+
+    def test_a_prefill_chunk_below_the_token_budget_takes_other_connectors(
+        self, reconfigure
+    ):
+        # Only the RBLN NIXL connectors read the budget as the prefill chunk.
+        def mutate(config):
+            _prefill_chunk(64)(config)
+            config.kv_transfer_config = SimpleNamespace(
+                kv_connector="RBLNLMCacheConnectorV1", kv_connector_extra_config={}
+            )
+
+        reconfigure(mutate)
+
     @pytest.mark.parametrize("ranks", [dict(data_parallel_size=2), dict(ep=True)])
     def test_dp_and_ep_need_the_moe_tokens_mask(self, reconfigure, ranks):
         with pytest.raises(ValueError, match="--rbln-use-moe-tokens-mask"):
@@ -679,6 +765,18 @@ def _ranks(
             config.additional_config = replace(
                 config.additional_config, use_moe_tokens_mask=moe_tokens_mask
             )
+
+    return mutate
+
+
+def _prefill_chunk(size: int):
+    """A mutator that sets --rbln-prefill-chunk-size, with sub-block caching off."""
+
+    def mutate(config: VllmConfig) -> None:
+        config.additional_config = replace(
+            config.additional_config, prefill_chunk_size=size
+        )
+        config.cache_config.enable_prefix_caching = False
 
     return mutate
 

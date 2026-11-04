@@ -166,6 +166,55 @@ def _validate(vllm_config: "VllmConfig") -> None:
             "Set --block-size within this range."
         )
 
+    chunk = rbln_config.prefill_chunk_size
+    if chunk is not None and chunk > max_num_batched_tokens:
+        raise ValueError(
+            f"--rbln-prefill-chunk-size={chunk} exceeds {max_num_batched_tokens=}."
+        )
+    # TODO(RBLN): DP ranks agree on max_num_batched_tokens as the prefill token
+    # dimension (dp_utils), and spec decode, sub-block caching and the RBLN NIXL
+    # connector's resume trim take it as the prefill chunk. Lifting a refusal
+    # means pointing that feature's sites at prefill_chunk_size; #1372 lists them.
+    if chunk is not None and chunk < max_num_batched_tokens:
+        kv_transfer = vllm_config.kv_transfer_config
+        connectors = [] if kv_transfer is None else [kv_transfer.kv_connector]
+        if connectors == ["MultiConnector"]:
+            children = kv_transfer.kv_connector_extra_config.get("connectors", [])
+            connectors = [child.get("kv_connector") for child in children]
+        unsupported = [
+            name
+            for name, on in (
+                ("data parallelism", parallel_config.data_parallel_size > 1),
+                ("speculative decoding", vllm_config.speculative_config is not None),
+                (
+                    "sub-block prefix caching",
+                    vllm_config.cache_config.enable_prefix_caching
+                    and rbln_config.enable_sub_block_cache,
+                ),
+                (
+                    "RBLN NIXL KV transfer",
+                    any(
+                        name
+                        in (
+                            "RblnNixlConnector",
+                            "RblnNixlPullConnector",
+                            "RblnNixlPushConnector",
+                        )
+                        for name in connectors
+                    ),
+                ),
+            )
+            if on
+        ]
+        if unsupported:
+            raise ValueError(
+                f"--rbln-prefill-chunk-size={chunk} below {max_num_batched_tokens=} "
+                f"is not supported with {', '.join(unsupported)} on RBLN yet."
+            )
+    # Resolved here so the scheduler and runner read one value, and compute_hash,
+    # which runs after this, keys "unset" and "set to the budget" alike.
+    rbln_config.prefill_chunk_size = chunk or max_num_batched_tokens
+
     if envs.VLLM_RBLN_COMPILE_ONLY and envs.VLLM_DISABLE_COMPILE_CACHE:
         # Compile-only compiles each graph and writes the .rbln artifact to
         # the compile cache (the runtime is built on a dummy device so no
