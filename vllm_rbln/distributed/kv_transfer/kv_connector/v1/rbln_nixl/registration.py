@@ -1024,11 +1024,14 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
                 )
                 continue
             runs = math.prod(spec.block_shape[: spec.head_axis])
-            rank_heads = (
-                band_heads // self.vllm_config.parallel_config.tensor_parallel_size
+            # An owner too small for the rank's heads holds one group of them,
+            # and its cache cuts that group.
+            entry_heads = min(
+                band_heads // self.vllm_config.parallel_config.tensor_parallel_size,
+                owner_spec.page_size_bytes // owner_spec.head_bytes,
             )
-            head_bytes, rem = divmod(spec.page_size_bytes // runs, rank_heads)
-            assert not rem, (name, spec, rank_heads)
+            head_bytes, rem = divmod(spec.page_size_bytes // runs, entry_heads)
+            assert not rem, (name, spec, entry_heads)
             self._layer_specs[name] = RblnBlockTransferSpec(
                 owner_spec.block_size,
                 spec.page_size_bytes,

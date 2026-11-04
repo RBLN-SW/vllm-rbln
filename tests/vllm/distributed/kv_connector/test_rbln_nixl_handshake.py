@@ -73,6 +73,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
     ChunkGrid,
     Piece,
     RblnNixlWorkerState,
+    RegionGeometry,
     block_rects,
     kv_chunk_tokens,
     pair_area,
@@ -8094,3 +8095,101 @@ class TestABlockPayloadPairsAcrossTp:
     def test_heads_a_slice_cannot_cut_evenly_are_refused(self):
         with pytest.raises(RuntimeError, match="do not cut evenly"):
             block_rects(self.STATE, self.SLICES, 512 * 1024, 0, 32)
+
+
+class TestAKdaHeadGroupPairsAcrossTp:
+    """GLM-5.3 at a 1024-token block between a TP1 producer and a TP4 consumer. A
+    page holds 16 KDA heads, so the producer splits its 64 into four state caches
+    a layer and the consumer keeps one; the conv ring holds q / k of every group
+    and then v of every group, a run each, per tap."""
+
+    STATE = RblnBlockTransferSpec(1024, 1024 * 512, 64, 128 * 128 * 2)
+    CONV = RblnBlockTransferSpec(1024, 4 * 3 * 32 * 64 * 2, 64, 256, 12)
+    SLICES = [0, 1, 2, 3]
+    QUARTER = 128 * 1024
+
+    @staticmethod
+    def _worker(tp_rank, state_layers=()):
+        w = object.__new__(RblnNixlPullConnectorWorker)
+        w.tp_rank = tp_rank
+        w.transfer_topo = SimpleNamespace(tp_size=4)
+        w._kda_groups = {4: 1, 1: 4}.get
+        w._block_state_layers = set(state_layers)
+        w._writes_into_peer = False
+        return w
+
+    @pytest.mark.parametrize("rank", range(4))
+    def test_a_state_reads_the_producer_cache_of_its_head_group(self, rank):
+        ours = block_rects(self.STATE, self.SLICES, self.QUARTER, rank, 4, 16 * rank)
+        theirs = block_rects(self.STATE, self.SLICES, self.QUARTER, 0, 1, 16 * rank)
+        peer = [(a, w.rect, w.length) for a, w in enumerate(theirs)]
+        pieces = [
+            pair_area(
+                w.rect,
+                w.length,
+                peer,
+                kv_per_block=1,
+                every_holder=False,
+                region_id=area,
+            )
+            for area, w in enumerate(ours)
+        ]
+        assert pieces == [
+            [Piece(0, area, 0, self.QUARTER, 4, (0, 1))] for area in range(4)
+        ]
+
+    def test_a_split_rank_names_the_heads_of_its_entry(self):
+        with pytest.raises(AssertionError, match="names its heads"):
+            block_rects(self.STATE, self.SLICES, self.QUARTER, 0, 1)
+
+    @pytest.mark.parametrize("rank", range(4))
+    def test_a_ring_run_reads_its_group_s_run_of_the_producer(self, rank):
+        w = self._worker(rank)
+        w._block_spec = lambda logical: self.CONV
+        w._logical_region_geometry = [
+            RegionGeometry(
+                ChipletSplitAxis.BLOCK,
+                4,
+                tuple(AreaPlace(0, 12288, sid) for sid in self.SLICES),
+            )
+        ]
+        meta = SimpleNamespace(kv_area_slices=[self.SLICES], block_lens=[49152] * 4)
+
+        pieces = w._conv_ring_pieces(meta, 0, 0, 0, 1)
+
+        peer_run = (2 * rank, 2 * rank + 1, 8 + rank)
+        assert pieces == [
+            [
+                Piece(
+                    (tap * 3 + kind) * 1024,
+                    area,
+                    (tap * 12 + peer_run[kind]) * 1024,
+                    1024,
+                    1,
+                    (0, 1),
+                )
+                for tap in range(4)
+                for kind in range(3)
+            ]
+            for area in range(4)
+        ]
+
+    def test_the_producer_s_caches_take_the_names_of_ours(self):
+        layer = "model.layers.1.self_attn"
+        w = self._worker(2, state_layers=[f"{layer}.attn.0"])
+        names = [f"{layer}.attn.{k}" for k in range(5)]
+        meta = _agent_meta(
+            region_names=["model.layers.0.self_attn.attn.3", *names],
+            block_lens=[8192] * 6,
+        )
+
+        renamed = w._peer_kda_names(meta, 0, 1).region_names
+
+        assert renamed == [
+            "model.layers.0.self_attn.attn.3",
+            f"{layer}.attn.0@0",
+            f"{layer}.attn.1@0",
+            f"{layer}.attn.0",
+            f"{layer}.attn.3@0",
+            f"{layer}.attn.1",
+        ]
