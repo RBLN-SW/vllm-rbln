@@ -137,7 +137,7 @@ def test_forward_runs_only_the_layers_this_rank_built(monkeypatch):
 
     class Layer(torch.nn.Module):
         def forward(self, positions, hidden_states, topk_by_layer):
-            return hidden_states + 1
+            return hidden_states + 1, None
 
     monkeypatch.setattr(envs, "VLLM_RBLN_NUM_HIDDEN_LAYERS", 2)
     monkeypatch.setattr(dist_utils, "get_pp_indices", patched_get_pp_indices)
@@ -167,6 +167,43 @@ def test_forward_runs_only_the_layers_this_rank_built(monkeypatch):
 
     # Two built layers, each adding one; nothing from the unbuilt tail.
     torch.testing.assert_close(out, torch.full((3, 8), 2.0))
+
+
+@pytest.mark.parametrize("skip_topk", [False, True])
+def test_decoder_layer_returns_topk_without_writing_the_shared_dict(
+    monkeypatch, skip_topk
+):
+    """The decoder layer may run as a nested compile region, which must not
+    write the outer `topk_by_layer`. It returns the top-k it computed, or None
+    for a skip layer that reuses its source layer's top-k."""
+    import vllm_rbln.patches.axk3.model as axk3_model
+
+    computed = torch.tensor([7])
+    received = []
+
+    def gated_mla_forward(mla, positions, hidden_states, topk_indices):
+        received.append(topk_indices)
+        return hidden_states, computed
+
+    monkeypatch.setattr(axk3_model, "_gated_mla_forward", gated_mla_forward)
+    layer = axk3_model.AXK3DecoderLayer.__new__(axk3_model.AXK3DecoderLayer)
+    torch.nn.Module.__init__(layer)
+    residual = SimpleNamespace(
+        read=lambda hidden: (hidden, None), write=lambda res, x, gate: res + x
+    )
+    layer.attn_gated_residual = layer.mlp_gated_residual = residual
+    layer.self_attn = SimpleNamespace(mla_attn=None)
+    layer.mlp = lambda x: x
+    layer.layer_idx, layer.index_source_layer, layer.skip_topk = 1, 0, skip_topk
+    source = torch.tensor([3])
+    topk_by_layer = {0: source}
+
+    hidden, topk = layer(torch.arange(2), torch.ones(2, 4), topk_by_layer)
+
+    assert list(topk_by_layer) == [0] and topk_by_layer[0] is source
+    assert received[0] is (source if skip_topk else None)
+    assert topk is (None if skip_topk else computed)
+    torch.testing.assert_close(hidden, torch.full((2, 4), 4.0))
 
 
 def test_eagle3_is_refused_on_both_aux_layer_setup_paths():

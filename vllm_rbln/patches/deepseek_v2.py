@@ -179,14 +179,14 @@ def rbln_indexer_cache_init(self, *args, **kwargs) -> None:
         self.prefix, model_config, vllm_config.parallel_config, num_attn_module
     )
 
-    # register fp16 scale cache (2-cache spec).
+    # register the per-token scale cache (2-cache spec).
     self.scale_cache = None
     if self.is_fp8_cache:
         scale = DeepseekV32IndexerCache.__new__(DeepseekV32IndexerCache)
         _original_indexer_cache_init(
             scale,
             head_dim=1,
-            dtype=torch.float16,
+            dtype=RBLNDeepseekV32IndexerScaleBackend.cache_dtype(model_config.dtype),
             prefix=f"{self.prefix}.scale_cache",
             cache_config=self.cache_config,
         )

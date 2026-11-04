@@ -39,27 +39,31 @@ def patched_rope_init(
     dtype: torch.dtype,
     init_cache: bool = True,
 ):
-    original_rope_init(
-        self,
-        head_size,
-        rotary_dim,
-        max_position_embeddings,
-        base,
-        is_neox_style,
-        dtype,
-        init_cache,
-    )
+    # fp32 ops on RBLN may run in reduced precision; compute the RoPE cache on CPU.
+    target_device = torch.get_default_device()
+    with torch.device("cpu"):
+        original_rope_init(
+            self,
+            head_size,
+            rotary_dim,
+            max_position_embeddings,
+            base,
+            is_neox_style,
+            dtype,
+            init_cache,
+        )
 
-    # For best compatibility with rbln, we use the rotate_half-style RoPE.
-    cos, sin = self.cos_sin_cache.chunk(2, dim=-1)
-    if self.is_neox_style:
-        cos = cos.repeat(1, 2)
-        sin = sin.repeat(1, 2)
-    else:
-        cos = torch.stack([cos, cos], dim=-1).reshape(cos.shape[0], -1)
-        sin = torch.stack([sin, sin], dim=-1).reshape(sin.shape[0], -1)
-    self.register_buffer("cos_cache", cos, persistent=False)
-    self.register_buffer("sin_cache", sin, persistent=False)
+        # For best compatibility with rbln, we use the rotate_half-style RoPE.
+        cos, sin = self.cos_sin_cache.chunk(2, dim=-1)
+        if self.is_neox_style:
+            cos = cos.repeat(1, 2)
+            sin = sin.repeat(1, 2)
+        else:
+            cos = torch.stack([cos, cos], dim=-1).reshape(cos.shape[0], -1)
+            sin = torch.stack([sin, sin], dim=-1).reshape(sin.shape[0], -1)
+        self.register_buffer("cos_cache", cos, persistent=False)
+        self.register_buffer("sin_cache", sin, persistent=False)
+    self.to(target_device)
 
 
 @register_patch(
