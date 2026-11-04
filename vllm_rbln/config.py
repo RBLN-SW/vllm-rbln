@@ -187,12 +187,9 @@ class OptimumRBLNConfig(RBLNConfigBase):
     derives from the vLLM settings when the model is compiled. With a
     pre-compiled model only the `device` entries apply."""
 
-    # Snapshots of a vLLM field taken before it is overwritten. vLLM already has
-    # the flag, so there is no `--rbln-*` one, but they stay settable: the
-    # platform hook writes the first into the dict before this class exists.
-    user_max_num_batched_tokens: int | None = field(default=None, metadata=_NO_FLAG)
-    """`--max-num-batched-tokens` as the user gave it, before vLLM fills in its
-    default. On this path it is the prefill chunk size to compile."""
+    prefill_chunk_size: int | None = Field(default=None, gt=0)
+    """Length of the compiled prefill graph. If None, uses optimum-rbln's
+    default when compiling, or the pre-compiled model's chunk size."""
 
     num_blocks_override: int | None = field(default=None, metadata=_NO_FLAG)
     """`--num-gpu-blocks-override` as given, before the prefix-cache block ratio

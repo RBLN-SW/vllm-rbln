@@ -20,10 +20,10 @@ from vllm_rbln.config import build_optimum_rbln_config
 from vllm_rbln.utils.optimum.converter.dispatch import _generate_model_path_name
 
 
-def _vllm_config(user_max_num_batched_tokens=None, dtype=torch.bfloat16):
+def _vllm_config(prefill_chunk_size=None, dtype=torch.bfloat16):
     additional_config = {}
-    if user_max_num_batched_tokens is not None:
-        additional_config["user_max_num_batched_tokens"] = user_max_num_batched_tokens
+    if prefill_chunk_size is not None:
+        additional_config["prefill_chunk_size"] = prefill_chunk_size
     return SimpleNamespace(
         model_config=SimpleNamespace(
             model="meta-llama/Llama-3.1-8B", max_model_len=8192, dtype=dtype
@@ -35,7 +35,7 @@ def _vllm_config(user_max_num_batched_tokens=None, dtype=torch.bfloat16):
 
 
 class TestGenerateModelPathName:
-    def test_user_max_num_batched_tokens_changes_hash(self):
+    def test_prefill_chunk_size_changes_hash(self):
         # Two runs that would compile different prefill chunk sizes must not
         # collide on the same cache key.
         name_512 = _generate_model_path_name(_vllm_config(512))
@@ -51,6 +51,13 @@ class TestGenerateModelPathName:
         assert _generate_model_path_name(
             _vllm_config(512)
         ) == _generate_model_path_name(_vllm_config(512))
+
+    def test_scheduling_budget_does_not_change_hash(self):
+        cfg = _vllm_config(256)
+        cfg.scheduler_config.max_num_batched_tokens = 8192
+        first = _generate_model_path_name(cfg)
+        cfg.scheduler_config.max_num_batched_tokens = 16384
+        assert _generate_model_path_name(cfg) == first
 
     def test_dtype_changes_hash(self):
         name_bf16 = _generate_model_path_name(_vllm_config(dtype=torch.bfloat16))

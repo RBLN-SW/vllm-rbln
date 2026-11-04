@@ -267,7 +267,7 @@ class RblnPlatform(Platform):
         """
         from vllm.engine.arg_utils import EngineArgs
 
-        from vllm_rbln.config import OptimumRBLNConfig, resolve_model_impl
+        from vllm_rbln.config import resolve_model_impl
 
         if getattr(EngineArgs, "_rbln_model_impl_patched", False):
             return
@@ -278,25 +278,20 @@ class RblnPlatform(Platform):
             model_impl = resolve_model_impl(
                 self.additional_config, self.model_impl, engine_args=self
             )
+            if model_impl == "optimum" and self.max_num_batched_tokens is not None:
+                raise ValueError(
+                    "--max-num-batched-tokens (max_num_batched_tokens) is not "
+                    "supported on the optimum model path. Use "
+                    "--rbln-prefill-chunk-size "
+                    "(additional_config={'prefill_chunk_size': ...}) "
+                    "to set the prefill graph size."
+                )
             # Upstream reads this field too, and there `transformers` means its
             # own Transformers backend, which refuses several of the models
             # optimum-rbln supports. Hand the default back so that resolution is
             # the one it would have done without us.
             self.model_impl = "auto"
-            config = self.additional_config
-            if model_impl == "optimum":
-                # The prefill chunk size that path compiles is
-                # `--max-num-batched-tokens` as the user gave it, and the call
-                # below replaces an unset one with a default, leaving
-                # `sync_from_vllm` no way to tell the two apart. Nothing else
-                # writes additional_config now, so an unset one starts here.
-                if config is None:
-                    config = self.additional_config = {}
-                if isinstance(config, dict):
-                    config["user_max_num_batched_tokens"] = self.max_num_batched_tokens
-                elif isinstance(config, OptimumRBLNConfig):
-                    config.user_max_num_batched_tokens = self.max_num_batched_tokens
-            elif self.max_num_batched_tokens is None:
+            if model_impl == "vllm" and self.max_num_batched_tokens is None:
                 self.max_num_batched_tokens = RBLN_DEFAULT_MAX_NUM_BATCHED_TOKENS
             _apply_model_impl(model_impl)
             return orig_create_engine_config(self, *args, **kwargs)

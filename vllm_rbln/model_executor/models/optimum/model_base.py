@@ -232,10 +232,7 @@ class RBLNOptimumModelBase(nn.Module):
                 block_size=get_attn_block_size(self.vllm_config),
                 max_model_len=self.model_config.max_model_len,
                 num_devices=rbln_config.num_devices_per_local_rank,
-                # Resolved during sync (from_optimum/from_vllm) into
-                # max_num_batched_tokens; pin it at compile time so the compiled
-                # model matches the value used for KV-cache block padding.
-                prefill_chunk_size=self.vllm_config.scheduler_config.max_num_batched_tokens,
+                prefill_chunk_size=rbln_config.prefill_chunk_size,
                 memory_budget=self.vllm_config.cache_config.gpu_memory_utilization,
                 rbln_overrides=rbln_overrides,
             )

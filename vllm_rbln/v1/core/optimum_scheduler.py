@@ -136,11 +136,8 @@ class RBLNOptimumScheduler(Scheduler):
             if self.scheduler_config.max_num_active_seqs is not None
             else self.max_num_running_reqs
         )
-        # Per-step token budget. Not max_num_batched_tokens: the optimum path
-        # repurposes that as the compiled prefill chunk size, and the runner
-        # prefills the whole prompt in one step (chunking is internal to the
-        # compiled binary). The budget must therefore fit a full-length prefill
-        # or a full decode batch.
+        # Optimum chunks inside the model, so a step must fit a whole prompt
+        # or a full decode batch independently of the prefill graph size.
         self.max_num_scheduled_tokens = (
             self.scheduler_config.max_num_scheduled_tokens
             if self.scheduler_config.max_num_scheduled_tokens
@@ -228,15 +225,13 @@ class RBLNOptimumScheduler(Scheduler):
         attn_block_size = rbln_config.attn_block_size
         # gemma3/gemma4: optimum-rbln's chunked prefill touches extra KV-cache
         # slots beyond the prompt (partition-alignment + trailing chunk
-        # write-extent), so `allocate_slots` must reserve them. The prefill chunk
-        # size is `max_num_batched_tokens` (set during `sync_vllm_and_optimum`);
-        # the image-prefill buckets live in `additional_config`.
+        # write-extent), so `allocate_slots` must reserve them.
         archs = getattr(vllm_config.model_config.hf_config, "architectures", None) or []
         needs_chunked_prefill_pad = any("Gemma3" in a or "Gemma4" in a for a in archs)
         prefill_chunk_size = None
         image_prefill_chunk_size = None
         if needs_chunked_prefill_pad:
-            prefill_chunk_size = self.scheduler_config.max_num_batched_tokens
+            prefill_chunk_size = rbln_config.prefill_chunk_size
             image_prefill_chunk_size = rbln_config.image_prefill_chunk_size
 
         # Create the KV cache manager.
@@ -246,9 +241,6 @@ class RBLNOptimumScheduler(Scheduler):
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
             scheduler_block_size=self.block_size,
-            # The SWA/chunked-local admission cap, which must match the actual
-            # per-step budget, not max_num_batched_tokens (the compiled chunk
-            # size). See max_num_scheduled_tokens above.
             max_in_flight_tokens=self.max_num_scheduled_tokens,
             enable_caching=self.cache_config.enable_prefix_caching,
             use_eagle=False,

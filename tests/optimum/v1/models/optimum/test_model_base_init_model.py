@@ -22,7 +22,7 @@ NPU-dependent operations are replaced with test doubles.
 import types
 
 import torch
-from transformers import Gemma4Config
+from transformers import Gemma4Config, LlamaConfig
 
 from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.model_executor.models.optimum import model_base
@@ -45,7 +45,8 @@ def _init_model_with(monkeypatch, tmp_path, hf_config) -> dict:
         "for_architecture",
         classmethod(
             lambda cls, *a, **k: types.SimpleNamespace(
-                model_cls=FakeRBLNModel, rbln_config={}
+                model_cls=FakeRBLNModel,
+                rbln_config={"prefill_chunk_size": k["prefill_chunk_size"]},
             )
         ),
     )
@@ -65,7 +66,9 @@ def _init_model_with(monkeypatch, tmp_path, hf_config) -> dict:
     obj.vllm_config = types.SimpleNamespace(
         # What `check_and_update` leaves on the config, which is what
         # `init_model` reads its options off.
-        additional_config=OptimumRBLNConfig(cached_model_path=str(tmp_path)),
+        additional_config=OptimumRBLNConfig(
+            cached_model_path=str(tmp_path), prefill_chunk_size=256
+        ),
         model_config=obj.model_config,
         scheduler_config=obj.scheduler_config,
         cache_config=types.SimpleNamespace(gpu_memory_utilization=0.9),
@@ -120,3 +123,12 @@ def test_transformers_config_is_forwarded_as_the_config_object(monkeypatch, tmp_
     assert passed["config"] is hf_config
     assert "text_config" not in passed
     assert "num_hidden_layers" not in passed
+
+
+def test_compile_uses_prefill_chunk_size_independently_of_budget(monkeypatch, tmp_path):
+    passed = _init_model_with(
+        monkeypatch,
+        tmp_path,
+        LlamaConfig(num_hidden_layers=1, architectures=["LlamaForCausalLM"]),
+    )
+    assert passed["rbln_config"]["prefill_chunk_size"] == 256

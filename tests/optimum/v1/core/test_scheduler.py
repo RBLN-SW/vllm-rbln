@@ -319,3 +319,27 @@ def test_cache_slot_id_freed_on_preemption():
     scheduler.finish_requests(requests[0].request_id, RequestStatus.FINISHED_STOPPED)
     output = scheduler.schedule()
     assert output.cache_slot_id_dict == {"1": 0}
+
+
+def test_scheduling_budget_is_independent_of_prefill_chunk_size():
+    scheduler = create_scheduler(
+        max_model_len=128, max_num_batched_tokens=256, block_size=16, num_blocks=32
+    )
+    assert scheduler.vllm_config.additional_config.prefill_chunk_size == 16
+    assert scheduler.max_num_scheduled_tokens == 128
+
+
+def test_full_prompt_is_scheduled_with_a_smaller_prefill_graph(monkeypatch):
+    monkeypatch.setenv("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
+    scheduler = create_scheduler(
+        max_model_len=8192,
+        max_num_batched_tokens=8192,
+        block_size=128,
+        outer_block_size=128,
+        num_blocks=128,
+    )
+    request = create_requests(num_requests=1, num_tokens=4096)[0]
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+    assert scheduler.vllm_config.additional_config.prefill_chunk_size == 128
+    assert output.num_scheduled_tokens[request.request_id] == 4096

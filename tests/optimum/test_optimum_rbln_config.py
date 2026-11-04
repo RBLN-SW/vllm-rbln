@@ -98,51 +98,57 @@ def test_a_shared_field_is_taken(parser):
 def test_a_no_flag_field_has_no_flag(parser):
     group = next(g for g in parser._action_groups if g.title == _GROUP_TITLE)
     flags = {a.dest for a in group._group_actions}
-    # vLLM already owns --max-num-batched-tokens, and the sync writes the other.
-    assert "rbln_user_max_num_batched_tokens" not in flags
     assert "rbln_attn_block_size" not in flags
+    assert "rbln_user_max_num_batched_tokens" not in flags
 
 
-def test_a_no_flag_field_is_still_accepted():
-    """`_capture_user_max_num_batched_tokens` writes this into the dict before
-    the class exists, so resolution has to take it."""
-    config = _resolve(OptimumRBLNConfig, {"user_max_num_batched_tokens": 512})
-    assert config.user_max_num_batched_tokens == 512
-
-
-def test_the_capture_writes_only_where_this_path_reads(monkeypatch):
-    """`--max-num-batched-tokens` is captured where the path is already known.
-
-    It lands in whichever shape `additional_config` arrived as, since neither a
-    built config nor upstream's bare string takes item assignment. What the
-    other path gets is not this suite's to say; building a native config is
-    what shows that, and the whole of tests/vllm does it.
-    """
+@pytest.mark.parametrize("budget", [0, 128, 8192])
+@pytest.mark.parametrize("model_impl", ["optimum", "transformers"])
+def test_explicit_budget_is_rejected_before_vllm_defaults(
+    monkeypatch, budget, model_impl
+):
     from vllm.engine.arg_utils import EngineArgs
 
     from vllm_rbln.platform import RblnPlatform
 
-    # Wrapped around a stub: building a real engine config needs a compiled
-    # model, and what is under test is what the wrapper writes before that.
     monkeypatch.setattr(EngineArgs, "create_engine_config", lambda self: None)
     monkeypatch.setattr(EngineArgs, "_rbln_model_impl_patched", False, raising=False)
     RblnPlatform._capture_model_impl()
-
-    def captured(additional_config):
-        # Named rather than left at `auto`, which reads the model to pick a
-        # path and there is no model on this stub.
-        args = SimpleNamespace(
-            max_num_batched_tokens=512,
-            additional_config=additional_config,
-            model_impl="optimum",
-        )
+    args = SimpleNamespace(
+        model_impl=model_impl, additional_config=None, max_num_batched_tokens=budget
+    )
+    with pytest.raises(ValueError, match="Use --rbln-prefill-chunk-size"):
         EngineArgs.create_engine_config(args)
-        return args.additional_config
 
-    assert captured(None)["user_max_num_batched_tokens"] == 512
-    assert captured({"sub_block_size": 64})["user_max_num_batched_tokens"] == 512
-    assert captured(OptimumRBLNConfig()).user_max_num_batched_tokens == 512
-    assert captured("something") == "something"
+
+@pytest.mark.parametrize("config", [None, {}, OptimumRBLNConfig()])
+def test_unset_budget_is_left_to_vllm_defaults(monkeypatch, config):
+    from vllm.engine.arg_utils import EngineArgs
+
+    from vllm_rbln.platform import RblnPlatform
+
+    monkeypatch.setattr(EngineArgs, "create_engine_config", lambda self: "created")
+    monkeypatch.setattr(EngineArgs, "_rbln_model_impl_patched", False, raising=False)
+    RblnPlatform._capture_model_impl()
+    args = SimpleNamespace(
+        model_impl="optimum", additional_config=config, max_num_batched_tokens=None
+    )
+    assert EngineArgs.create_engine_config(args) == "created"
+    assert args.max_num_batched_tokens is None
+    assert args.additional_config is config
+    if isinstance(config, dict):
+        assert config == {}
+
+
+def test_prefill_chunk_size_flag(parser):
+    args = parser.parse_args(["--rbln-prefill-chunk-size", "256"])
+    assert _resolve(OptimumRBLNConfig, args.additional_config).prefill_chunk_size == 256
+
+
+@pytest.mark.parametrize("size", [0, -1])
+def test_invalid_prefill_chunk_size_is_rejected(size):
+    with pytest.raises(ValueError, match="greater_than"):
+        _resolve(OptimumRBLNConfig, {"prefill_chunk_size": size})
 
 
 def test_the_former_overrides_key_is_accepted():
@@ -173,7 +179,7 @@ def test_only_compile_fields_change_the_hash():
     assert OptimumRBLNConfig(cached_model_path="/tmp/x").compute_hash() == base
     assert OptimumRBLNConfig(num_blocks_synced=True).compute_hash() == base
     assert OptimumRBLNConfig(use_custom_sampler=False).compute_hash() == base
-    assert OptimumRBLNConfig(user_max_num_batched_tokens=512).compute_hash() != base
+    assert OptimumRBLNConfig(prefill_chunk_size=512).compute_hash() != base
     assert OptimumRBLNConfig(sub_block_size=256).compute_hash() != base
 
 
