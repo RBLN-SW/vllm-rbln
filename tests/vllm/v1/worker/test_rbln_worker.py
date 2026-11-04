@@ -74,6 +74,8 @@ def _make_vllm_config(
             data_parallel_rank=data_parallel_rank,
             data_parallel_rank_local=data_parallel_rank_local,
             world_size_across_dp=world_size_across_dp,
+            local_world_size=world_size,
+            data_parallel_size_local=data_parallel_size,
             assigned_physical_gpu_ids=assigned_physical_gpu_ids,
             disable_custom_all_reduce=False,
         ),
@@ -1066,11 +1068,15 @@ class TestEnsureRblnHostThreadsBeforeCompile:
     @staticmethod
     def _prep(monkeypatch, planned):
         captured = []
+        monkeypatch.setattr(wm, "compute_rbln_local_omp_cpuid", lambda r, lr, pc: "0")
         monkeypatch.setattr(
-            wm, "get_rbln_planned_affinity_cpu_count", lambda r, lr, pc: planned
+            wm, "get_rbln_planned_affinity_cpu_count", lambda cpuid: planned
         )
         monkeypatch.setattr(
             wm, "set_omp_num_threads", lambda r, lr, n: captured.append(n)
+        )
+        monkeypatch.setattr(
+            "vllm_rbln.v1.worker.utils.get_cgroup_cpu_quota", lambda: None
         )
         # Neutralise the numba<->torch thread juggling (global-state side effect).
         monkeypatch.setattr(
@@ -1090,6 +1096,16 @@ class TestEnsureRblnHostThreadsBeforeCompile:
         worker._ensure_rbln_host_threads_before_compile()
         assert captured == [expected]
 
+    def test_quota_split_across_local_ranks(self, make_worker, monkeypatch):
+        # 4 local ranks share a 64-CPU quota: min(64, 64 // 4) // 2 = 8.
+        worker = make_worker(world_size=4)
+        captured = self._prep(monkeypatch, 64)
+        monkeypatch.setattr(
+            "vllm_rbln.v1.worker.utils.get_cgroup_cpu_quota", lambda: 64.0
+        )
+        worker._ensure_rbln_host_threads_before_compile()
+        assert captured == [8]
+
     def test_idempotent(self, make_worker, monkeypatch):
         # The ready-flag guard makes a second call a no-op.
         worker = make_worker()
@@ -1103,13 +1119,28 @@ class TestEnsureRblnCpuAffinityAfterWarmup:
     def test_applies_affinity_once(self, make_worker, monkeypatch):
         # Applies set_cpu_affinity exactly once (idempotent guard).
         worker = make_worker()
+        monkeypatch.setattr(wm, "compute_rbln_local_omp_cpuid", lambda r, lr, pc: "0")
         calls = []
         monkeypatch.setattr(
-            wm, "set_cpu_affinity", lambda r, lr, pc: calls.append((r, lr))
+            wm, "set_cpu_affinity", lambda r, lr, cpuid: calls.append((r, lr))
         )
         worker._ensure_rbln_cpu_affinity_after_warmup()
         worker._ensure_rbln_cpu_affinity_after_warmup()
         assert calls == [(0, 0)]
+
+    def test_binds_the_cpus_planned_before_warmup(self, make_worker, monkeypatch):
+        # The binding shrinks the allowed CPUs, so a second computation after
+        # warm-up could pick other CPUs than the thread count was sized for.
+        worker = make_worker()
+        computed = iter(["0,1,2,3", "0,1"])
+        monkeypatch.setattr(
+            wm, "compute_rbln_local_omp_cpuid", lambda r, lr, pc: next(computed)
+        )
+        bound = []
+        monkeypatch.setattr(wm, "set_cpu_affinity", lambda r, lr, c: bound.append(c))
+        planned = worker._rbln_omp_cpuid
+        worker._ensure_rbln_cpu_affinity_after_warmup()
+        assert bound == [planned]
 
 
 class TestInitWorkerDistributedEnvironment:

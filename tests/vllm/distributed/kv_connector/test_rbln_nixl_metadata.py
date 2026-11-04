@@ -472,13 +472,13 @@ class TestTransferShape:
         # inert on this side puts nothing in the metadata for it.
         assert shape.sends_token_count is False
 
-    def test_a_side_that_does_stream_sends_the_count(self):
-        # The count is how a streamed write says where the offer stops, so the
-        # side that streams has to carry it even with the other knobs off.
+    def test_a_side_that_streams_alone_sends_no_count(self):
+        # A streamed handover sends the last block whole, so with the other
+        # knobs off nothing reads the count. Mid-stream offers carry their own.
         shape = transfer_shape(
             mock_vllm_config(push_stream=True),
             self._hybrid(),
             writes_into_peer=True,
         )
 
-        assert (shape.streams_prefix, shape.sends_token_count) == (True, True)
+        assert (shape.streams_prefix, shape.sends_token_count) == (True, False)

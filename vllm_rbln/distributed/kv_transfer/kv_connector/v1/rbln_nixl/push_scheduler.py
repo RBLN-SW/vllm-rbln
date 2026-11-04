@@ -58,9 +58,9 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
     ) -> None:
         super().__init__(vllm_config, engine_id, kv_cache_config)
 
-        # How much of each request's prefix has already been offered, so a
-        # step that closes no new block offers nothing.
-        self._streamed_chunks: dict[str, int] = {}
+        # Tokens of each request's prefix already offered, so a step that
+        # releases nothing new offers nothing.
+        self._released_tokens: dict[str, int] = {}
         # Requests offered early, kept until either the lease takes over
         # (terminal finish) or their blocks go back to the allocator without
         # one, which the worker has to be told about (`push_early_flush`).
@@ -128,14 +128,6 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
         the writer -- which takes the offer at the start of a later step -- only
         ever reads KV a forward has already finished with.
         """
-        # What the offer has to grow by to be worth releasing. One prefill
-        # step is the finest unit any write can name -- the write path floors
-        # its chunk at one step (`kv_chunk_tokens`) -- so a step's worth of
-        # tokens is the right cursor here whether or not it divides a block:
-        # all this counter asks is whether the offer grew.
-        chunk = min(
-            self.vllm_config.scheduler_config.max_num_batched_tokens, self.block_size
-        )
         # The group everything here is counted in, and the one an offer carries.
         # A sliding window's group holds one block whatever the prompt length,
         # and that block is the live window the kernel keeps overwriting -- final
@@ -150,7 +142,7 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
             assert req.kv_transfer_params is not None
 
             if self._accumulate_blocks_to_save(req_id, new_block_id_groups, resumed):
-                self._streamed_chunks.pop(req_id, None)
+                self._released_tokens.pop(req_id, None)
 
             groups = self._block_ids_need_save.get(req_id)
             # A request enters the table on the step it is admitted, which is
@@ -170,18 +162,20 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
                 req.num_computed_tokens,
                 len(groups[counted]) * self.block_size,
             )
-            chunks = held // chunk
-            if chunks <= self._streamed_chunks.get(req_id, 0):
+            # A block before the last leaves once it closes. Chunk mode also
+            # releases the last one as it fills, and a write takes only the
+            # chunks of it the token count backs -- see `_stream_window`.
+            total = cdiv(req.num_prompt_tokens, self.block_size)
+            if self._shape.cuts_a_block and held > (total - 1) * self.block_size:
+                released = held
+            else:
+                released = held // self.block_size * self.block_size
+            if released <= self._released_tokens.get(req_id, 0):
                 continue
-            self._streamed_chunks[req_id] = chunks
-            meta.push_stream_total[req_id] = cdiv(
-                req.num_prompt_tokens, self.block_size
-            )
-            meta.push_stream_tokens[req_id] = held
-            # The block being filled comes too. A write takes only the chunks
-            # of it the token count backs, and a peer that takes no chunks
-            # leaves it alone -- see `_stream_window`.
-            offered = cdiv(held, self.block_size)
+            self._released_tokens[req_id] = released
+            meta.push_stream_total[req_id] = total
+            meta.push_stream_tokens[req_id] = released
+            offered = cdiv(released, self.block_size)
             meta.add_new_req_to_save(
                 request_id=req_id,
                 local_block_ids=tuple(
@@ -194,7 +188,7 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
     def request_finished(
         self, request: "Request", block_ids: "BlockIds"
     ) -> tuple[bool, dict[str, Any] | None]:
-        self._streamed_chunks.pop(request.request_id, None)
+        self._released_tokens.pop(request.request_id, None)
         # Upstream drops this only where it did not finish the request, and the
         # terminal branch is how every P-side request ends. What it holds is the
         # `Request` object, so a producer that never dropped it would carry one

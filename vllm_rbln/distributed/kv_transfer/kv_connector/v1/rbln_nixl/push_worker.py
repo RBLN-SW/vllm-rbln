@@ -1243,10 +1243,10 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
     ) -> "tuple[BlockIds, BlockIds, Span, tuple[tuple[int, int, Span], ...]] | None":
         """The part of the consumer's list this batch is the first to fill.
 
-        Whole blocks, then the pieces of a block written in chunks: at most the
-        rest of the one a previous batch left part-written and the start of the
-        one being filled now. None where a request is not streamed -- the flag
-        off, or a whole prompt offered at once -- which takes the trim instead.
+        Whole blocks, then in chunk mode the pieces of the request's last
+        block: what an earlier batch left of it, or its chunks filled so far.
+        None where a request is not streamed -- the flag off, or a whole prompt
+        offered at once -- which takes the trim instead.
 
         A streamed offer is a growing prefix of the producer's blocks, and the
         consumer registered the TAIL of the prompt, what its own cache did not
@@ -1295,17 +1295,17 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
             )
         hi = max(0, closed - offset)
 
-        # Chunks the offer holds of the block after those. None without a grid
-        # -- `_shard_chunk_grid` returns None rather than a grid of one chunk
-        # -- and none while the offer is short of the consumer's window: `hi`
-        # clamps to 0 there, and the block they would come from is one the
-        # offer does not have.
+        # Chunks the offer holds of the block after those, which only the
+        # request's last block leaves in: every other block goes whole once it
+        # closes. None without a grid -- `_shard_chunk_grid` returns None rather
+        # than a grid of one chunk -- and none while the offer is short of the
+        # consumer's window (`offset <= closed`).
         tail_chunks = 0
         if (
             chunk_grid
             and offered_tokens
             and offset <= closed < have
-            and 0 <= hi < registered
+            and hi == registered - 1
         ):
             rem = offered_tokens - closed * self.block_size
             if rem > 0:
@@ -1329,15 +1329,14 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                 chunk_span,
             )
 
-        # The block at `lo` closes with part of it already gone, so the write takes
-        # the rest in chunks and the whole-block range starts after it; writing it
-        # whole would repeat what a previous batch sent. That rest stops at `tail`
-        # where the block is the request's last, since the chunks past its tokens
-        # are the ones this mode exists not to send.
+        # The last block closes with part of it already gone, so the write takes
+        # the rest in chunks; writing it whole would repeat what a previous
+        # batch sent. That rest stops at `tail`, since the chunks past its
+        # tokens are the ones chunk mode exists not to send.
         pieces: list[tuple[int, int, Span]] = []
         first = lo
         if hi > lo and head_chunks:
-            end = tail if tail is not None and lo == registered - 1 else cpb
+            end = cpb if tail is None else tail
             if end > head_chunks:
                 pieces.append(piece(lo, (head_chunks, end)))
             first = lo + 1

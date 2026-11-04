@@ -74,8 +74,13 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.push_worker imp
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
     AreaPlace,
     ChunkGrid,
+    Piece,
     RegionGeometry,
 )
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_transfer_topology import (
+    RblnTransferTopology,
+)
+from vllm_rbln.v1.attention.backends.minimax_m3 import RBLNMiniMaxM3SparseBackend
 
 
 def _impl_layer_spec(page_size_bytes=4096, num_kv_heads=8):
@@ -156,7 +161,7 @@ def _split_kv(num_blocks):
 
 
 def _patch_worker_nixl_symbols(
-    topo, *, mamba_spec=None, uniform_spec=None, topology_cls=None
+    topo, *, mamba_spec=None, uniform_spec=None, topology_cls=None, hash_fn=None
 ):
     # The isinstance() targets get a dummy class, which the Full-attention specs
     # cannot match; a test that wants one of those branches passes the real
@@ -167,7 +172,7 @@ def _patch_worker_nixl_symbols(
     msgspec_mock.msgpack.Encoder.return_value.encode.return_value = b"meta"
     return patch_in_package(
         RblnTransferTopology=topology_cls or MagicMock(return_value=topo),
-        compute_nixl_compatibility_hash=MagicMock(return_value="hash"),
+        compute_nixl_compatibility_hash=hash_fn or MagicMock(return_value="hash"),
         MambaSpec=mamba_spec or type("MambaSpec", (), {}),
         UniformTypeKVCacheSpecs=uniform_spec or type("UniformTypeKVCacheSpecs", (), {}),
         NixlAgentMetadata=MagicMock(),
@@ -182,6 +187,34 @@ HEAD_AXIS = 2
 TOKEN_AXIS = 4
 # A latent cache, (blocks, tokens, latent), as `_mla_kv_caches` builds it.
 MLA_TOKEN_AXIS = 1
+
+
+# Pipeline stages of a model that mixes attention backends, each holding a
+# different set of them. A peer pairs with every stage, so every stage has to
+# publish the same hash.
+_STAGES = (
+    ("BACKEND_A", ("BACKEND_A", "BACKEND_B")),
+    ("BACKEND_B", ("BACKEND_B",)),
+    ("BACKEND_A", ("BACKEND_A",)),
+)
+
+
+def _hash_by_backend():
+    return MagicMock(side_effect=lambda cfg, name, **kw: f"hash:{name}")
+
+
+def _backends(names):
+    return [MagicMock(**{"get_name.return_value": name}) for name in names]
+
+
+def _hashed_backend_name():
+    """The `attn_backend_name` the last upstream hash call was given."""
+    call = registration.compute_nixl_compatibility_hash.call_args
+    assert call is not None, "nothing reached the upstream hash"
+    bound = inspect.signature(compute_nixl_compatibility_hash).bind(
+        *call.args, **call.kwargs
+    )
+    return bound.arguments["attn_backend_name"]
 
 
 def _probe_kv_shape(topo):
@@ -463,6 +496,78 @@ class TestRegisterKvCaches:
             RegionGeometry(ChipletSplitAxis.HEAD, 1, (AreaPlace(0x1000, 2048, 0),)),
             RegionGeometry(ChipletSplitAxis.HEAD, 1, (AreaPlace(0x2000, 2048, 0),)),
         ]
+        # The same check reads which regions are latents: none, here.
+        assert worker._logical_region_latent == [False, False]
+
+    def test_host_staging_records_a_latent_as_attention(self, monkeypatch):
+        # A latent whose page size matches gets past host staging's refusal,
+        # and the per-head check still has to read it as attention here.
+        worker = build_worker(
+            monkeypatch,
+            kv_buffer_device="cpu",
+            nixl_available=True,
+            layer_names=("l0", "l1"),
+        )
+        worker.nixl_wrapper = "wrapper"
+        latent = MagicMock(spec=MLAAttentionSpec)
+        latent.page_size_bytes = 4096
+        latent.num_kv_heads = 1
+        # Packed attention beside it: one region a layer, as a latent is.
+        worker._layer_specs = {"l0": _impl_layer_spec(), "l1": latent}
+        worker.block_len_per_layer = [4096] * 2
+        worker.tp_rank = 0
+        worker.kv_caches_base_addr = {
+            worker.engine_id: {worker.tp_rank: [0x1000, 0x2000]}
+        }
+        monkeypatch.setattr(
+            sys.modules["nixl_rbln"],
+            "ensure_rbln_backend",
+            lambda wrapper, device_id=0, **kw: None,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            NixlBaseConnectorWorker, "register_kv_caches", lambda self, kv: None
+        )
+        worker.register_kv_caches({"l0": "tensor", "l1": "tensor"})
+
+        assert worker._logical_region_latent == [False] * 2
+
+    def test_host_staging_publishes_one_hash_across_pipeline_stages(self, monkeypatch):
+        # This path keeps upstream's registration, whose hash takes the rank's
+        # first backend; what it publishes must not. Upstream's registration is
+        # stubbed out, so the hash and payload it would leave are seeded here.
+        names, published = [], []
+        for backend_name, backends in _STAGES:
+            worker = build_worker(
+                monkeypatch, kv_buffer_device="cpu", nixl_available=True
+            )
+            worker.backend_name = backend_name
+            worker.attn_backends = _backends(backends)
+            worker.nixl_wrapper = "wrapper"
+            worker.topo.cross_layers_blocks = False
+            worker._layer_specs = {"layer0": _impl_layer_spec()}
+            worker.block_len_per_layer = [2048, 2048]
+            worker.tp_rank = 0
+            worker.kv_caches_base_addr = {
+                worker.engine_id: {worker.tp_rank: [0x1000, 0x2000]}
+            }
+            worker.compat_hash = f"upstream-{backend_name}"
+            worker.xfer_handshake_metadata = MagicMock()
+            monkeypatch.setattr(
+                sys.modules["nixl_rbln"],
+                "ensure_rbln_backend",
+                lambda wrapper, device_id=0, **kw: None,
+                raising=False,
+            )
+            monkeypatch.setattr(
+                NixlBaseConnectorWorker, "register_kv_caches", lambda self, kv: None
+            )
+            with _patch_worker_nixl_symbols(MagicMock(), hash_fn=_hash_by_backend()):
+                worker.register_kv_caches({"layer0": "tensor"})
+                names.append(_hashed_backend_name())
+            published.append(worker.compat_hash)
+
+        assert len(set(names)) == len(set(published)) == 1
 
     @pytest.mark.parametrize(
         "stripe_width, passed",
@@ -647,6 +752,26 @@ class TestRegisterKvCachesImpl:
         )
         bound.apply_defaults()
         assert bound.arguments["transfer_mode"] == worker._TRANSFER_MODE
+
+    def test_the_compat_hash_is_equal_across_pipeline_stages(self, monkeypatch):
+        names, published = [], []
+        for backend_name, backends in _STAGES:
+            worker = _prep_impl_worker(monkeypatch)
+            worker.backend_name = backend_name
+            worker.attn_backends = _backends(backends)
+            spec = _impl_layer_spec()
+            worker._layer_specs = {"l0": spec, "l1": spec}
+            kv_caches = _impl_kv_caches(num_blocks=worker.num_blocks)
+            with _registering(
+                worker,
+                _impl_topo(_split_kv(worker.num_blocks)),
+                hash_fn=_hash_by_backend(),
+            ):
+                worker._register_kv_caches_impl(kv_caches)
+                names.append(_hashed_backend_name())
+            published.append(worker.compat_hash)
+
+        assert len(set(names)) == len(set(published)) == 1
 
     def test_region_group_ids_index_the_transfer_groups(self, monkeypatch):
         # Upstream's descriptor machinery indexes `transfer_groups`, so a
@@ -866,7 +991,7 @@ class TestRegisterKvCachesImpl:
 
         # Registration itself still serves.
         assert worker._logical_region_kv_heads == [None] * 4
-        with pytest.raises(AssertionError, match="no head band"):
+        with pytest.raises(RuntimeError, match="no head band"):
             worker._region_kv_heads(0)
 
     def test_two_models_sharing_a_per_rank_share_of_one_is_refused(self, monkeypatch):
@@ -946,27 +1071,221 @@ class TestRegisterKvCachesImpl:
         ):
             worker._register_kv_caches_impl(kv_caches)
 
-    def test_mixed_mla_and_non_mla_layers_are_rejected(self, monkeypatch):
-        # An MLA draft under a non-MLA target: the latent would be iterated as a
-        # K/V pair and the region list would count blocks as regions.
+    def _mixed_engine(self, monkeypatch, *, packed):
+        """A target attention layer `l0` beside an MSA indexer `l1`, whose latent
+        is 66 wide so that its tokens and its width cannot stand in for each
+        other."""
         worker = _prep_impl_worker(monkeypatch)
         target = _impl_layer_spec(page_size_bytes=4096, num_kv_heads=8)
         latent = MagicMock(spec=MLAAttentionSpec)
-        latent.page_size_bytes = 4096
+        latent.page_size_bytes = 64 * 66
         latent.num_kv_heads = 1
         worker._layer_specs = {"l0": target, "l1": latent}
-        kv_caches = _impl_kv_caches(num_blocks=worker.num_blocks)
+        (attention,) = _impl_kv_caches(
+            num_blocks=worker.num_blocks, names=("l0",)
+        ).values()
+        if packed:
+            # (blocks, K/V, heads, 1, tokens, dim): the same two dims carry
+            # heads and tokens, and K and V share a block.
+            attention.shape = (worker.num_blocks, 2, 8, 1, 64, 64)
+        indexer = _mla_kv_caches(
+            num_blocks=worker.num_blocks, base_ptr=0x30000, page_size_bytes=64 * 66
+        )["l0"]
+        split = _split_kv(worker.num_blocks)
+        topo = _impl_topo(
+            lambda cache, spec: (
+                [cache] if packed or spec is latent else split(cache, spec)
+            )
+        )
+        _probe_kv_shape(topo)
+        return worker, topo, {"l0": attention, "l1": indexer}
 
-        topo = _impl_topo(_split_kv(worker.num_blocks))
+    def test_a_latent_beside_packed_attention_registers_as_its_own_kind(
+        self, monkeypatch
+    ):
+        # The latent is one key-only region read in its own (blocks, tokens,
+        # latent) frame, so a cut of it is on tokens; the attention layer stays
+        # K and V in the backend's frame, two halves a block against its one.
+        worker, topo, kv_caches = self._mixed_engine(monkeypatch, packed=True)
+
+        with _registering(worker, topo, buffers=_impl_buffers(areas=4, slices=4)):
+            worker._register_kv_caches_impl(kv_caches)
+
+        assert [g.axis for g in worker._logical_region_geometry] == [
+            ChipletSplitAxis.HEAD,
+            ChipletSplitAxis.TOKEN,
+        ]
+        assert worker._logical_region_latent == [False, True]
+        assert worker._region_is_mla == [False] * 4 + [True] * 4
+        assert [worker._region_halves(r) for r in range(2)] == [2, 1]
+        # A chunk range cuts the latent's one run per token span, not two.
+        assert worker._block_runs() == [(1, 4), (4, 1)]
+
+    def test_the_real_topology_names_each_kind_s_bytes_in_both_lists(self, monkeypatch):
+        # Real routing and registration, then both lists of an equal-TP peer:
+        # a block's rows name the whole attention area and the latent area; a
+        # chunk's rows name its tokens in each attention half and head, and in
+        # the one latent area that holds them.
+        tokens, chunk, width = 64, 8, 66
+        worker = _prep_impl_worker(
+            monkeypatch, chunk_mode=True, specs=[MagicMock(spec=FullAttentionSpec)]
+        )
+        worker.attn_backends = [RBLNMiniMaxM3SparseBackend]
+        worker.vllm_config.scheduler_config.max_num_batched_tokens = chunk
+        target = _impl_layer_spec(page_size_bytes=4096, num_kv_heads=8)
+        latent = MagicMock(spec=MLAAttentionSpec)
+        latent.page_size_bytes = tokens * width
+        latent.num_kv_heads = 1
+        worker._layer_specs = {"l0": target, "l1": latent}
+        (attention,) = _impl_kv_caches(
+            num_blocks=worker.num_blocks, names=("l0",)
+        ).values()
+        attention.shape = (worker.num_blocks, 2, 8, 1, tokens, 64)
+        indexer = _mla_kv_caches(
+            num_blocks=worker.num_blocks,
+            base_ptr=0x30000,
+            page_size_bytes=tokens * width,
+        )["l0"]
+
+        with _registering(
+            worker,
+            None,
+            buffers=_impl_buffers(areas=4, slices=4),
+            topology_cls=RblnTransferTopology,
+        ):
+            worker._register_kv_caches_impl({"l0": attention, "l1": indexer})
+            # Upstream's class is faked here, so its fields are what
+            # registration hands it; ours ride the metadata registration
+            # publishes.
+            base = registration.NixlAgentMetadata.call_args.kwargs
+            published = registration.msgspec.msgpack.Encoder.return_value.encode
+            (ours,) = published.call_args.args
+
+        names = ("l0", "l1")
+        # Upstream's `__init__` and `register_kv_caches` set these; this test
+        # bypasses both.
+        worker.local_seen_layer_names = list(names)
+        worker._group_spec_types = [FullAttentionSpec]
+        worker._transfer_layer_region_indices = []
+        worker._register_shard_xfer_state("peer", 0, worker.block_size, names)
+        local = worker.nixl_wrapper.get_xfer_descs.call_args.args[0]
+        # The peer is what this engine publishes, at other addresses and with
+        # more blocks.
+        shift, peer_blocks = 0x1000000000, worker.num_blocks + 8
+        peer = RblnNixlAgentMetadata(
+            **{
+                **base,
+                "engine_id": "peer",
+                "num_blocks": peer_blocks,
+                "region_num_blocks": [peer_blocks] * len(base["kv_caches_base_addr"]),
+                "kv_caches_base_addr": [
+                    addr + shift for addr in base["kv_caches_base_addr"]
+                ],
+            },
+            kv_area_slices=ours.kv_area_slices,
+            kv_split_axes=ours.kv_split_axes,
+            kv_per_block=ours.kv_per_block,
+        )
+        # What the equal-TP branch asks of a peer before it registers one.
+        worker._check_d2d_region_pairing(peer, 1)
+        worker._check_split_axis_constraints(peer, 1)
+        remote = worker._build_fa_remote(
+            MagicMock(source_ranks_per_group=[(0,)], rank_offset_factor=0), peer, 1
+        )
+
+        bases = [
+            _area_base(entry, a) for entry in (attention, indexer) for a in range(4)
+        ]
+        lens = [1024] * 4 + [tokens // 4 * width] * 4
+        span = tokens // 4
+        # An attention area holds K then V, two heads each, a head's tokens
+        # inside it; a latent area holds one token span of the key alone.
+        head_run = tokens * 4
+
+        def check(local_ids, remote_ids, expected):
+            named = [(int(local[i][0]), int(local[i][1])) for i in local_ids]
+            assert sorted(named) == sorted(expected)
+            # The two lists pair by position.
+            assert [(int(remote[i][0]), int(remote[i][1])) for i in remote_ids] == [
+                (addr + shift, length) for addr, length in named
+            ]
+
+        for block in (0, 5):
+            check(
+                worker._get_block_descs_ids_for_shard(
+                    "peer", 0, worker.num_blocks, [[block]]
+                ),
+                worker._get_block_descs_ids_for_shard(
+                    "peer", 0, peer_blocks, [[block]]
+                ),
+                [(bases[r] + block * lens[r], lens[r]) for r in range(8)],
+            )
+            for c in range(tokens // chunk):
+                check(
+                    worker._chunk_descs_ids_for_shard(
+                        "peer", 0, worker.num_blocks, block, (c, c + 1)
+                    ),
+                    worker._chunk_descs_ids_for_shard(
+                        "peer", 0, peer_blocks, block, (c, c + 1)
+                    ),
+                    [
+                        (
+                            bases[a] + block * 1024 + run * head_run + c * chunk * 4,
+                            chunk * 4,
+                        )
+                        for a in range(4)
+                        for run in range(4)
+                    ]
+                    + [
+                        (
+                            bases[4 + c * chunk // span]
+                            + block * span * width
+                            + (c * chunk % span) * width,
+                            chunk * width,
+                        )
+                    ],
+                )
+
+    def test_a_latent_beside_split_attention_is_refused(self, monkeypatch):
+        # Split K and V make an attention layer two regions against the
+        # latent's one, which a per-engine region count cannot name.
+        worker, topo, kv_caches = self._mixed_engine(monkeypatch, packed=False)
 
         with (
-            pytest.raises(RuntimeError, match="mix MLA and non-MLA"),
-            _registering(worker, topo),
+            pytest.raises(RuntimeError, match="K and V are separate regions"),
+            _registering(worker, topo, buffers=_impl_buffers(areas=4, slices=4)),
         ):
             worker._register_kv_caches_impl(kv_caches)
 
-        # Refused before anything was registered.
         worker.nixl_wrapper.register_memory.assert_not_called()
+
+    def test_attention_inside_an_mla_engine_is_refused(self, monkeypatch):
+        # The other way round: an MLA engine's layout reads every layer as a
+        # latent, so an attention layer would be cut on its K/V axis.
+        worker, topo, kv_caches = self._mixed_engine(monkeypatch, packed=True)
+        worker.use_mla = True
+
+        with (
+            pytest.raises(RuntimeError, match="runs MLA and also holds attention"),
+            _registering(worker, topo, buffers=_impl_buffers(areas=4, slices=4)),
+        ):
+            worker._register_kv_caches_impl(kv_caches)
+
+        worker.nixl_wrapper.register_memory.assert_not_called()
+
+    def test_a_latent_takes_no_head_band_where_one_head_a_rank_would_fit_one(
+        self, monkeypatch
+    ):
+        # At TP8 an 8-head model's rank holds one head, which is also what a
+        # latent reports.
+        worker = _prep_impl_worker(monkeypatch)
+        worker.world_size = 8
+        worker.model_config.get_total_num_kv_heads.return_value = 8
+        latent = MagicMock(spec=MLAAttentionSpec)
+        latent.num_kv_heads = 1
+        worker._layer_specs = {"l1": latent}
+
+        assert worker._layer_kv_heads("l1") is None
 
     def test_cross_layer_blocks_with_differing_page_sizes_are_rejected(
         self, monkeypatch
@@ -1462,7 +1781,6 @@ class TestPublishHandshakeMetadata:
         # __init__ never ran, so the writer state shutdown() reaches through
         # __del__ is absent; silence it rather than leak an unraisable at GC.
         w.shutdown = lambda: None
-        w.compat_hash = "BASE"
         # _check_pp_constraints reads these; a plain PP producer passes.
         w.vllm_config = mock_vllm_config()
         w.vllm_config.parallel_config.pipeline_parallel_size = pp_size
@@ -1489,7 +1807,12 @@ class TestPublishHandshakeMetadata:
         pp_group = MagicMock()
         pp_group.rank_in_group = pp_rank
         pp_group.world_size = pp_size
-        with patched_in_package("get_pp_group", MagicMock(return_value=pp_group)):
+        with (
+            patched_in_package("get_pp_group", MagicMock(return_value=pp_group)),
+            patched_in_package(
+                "compute_nixl_compatibility_hash", MagicMock(return_value="BASE")
+            ),
+        ):
             w._publish_handshake_metadata(
                 self._base_meta(layer_names) if base_meta is None else base_meta
             )
@@ -1945,7 +2268,19 @@ class TestTheLayoutReachesTheDescriptors:
         topo.tp_size = 1
         topo.tp_ratio.return_value = 2
         w.transfer_topo = topo
+        w.tp_rank = 0
+        w.block_len_per_layer = [256]
         return w
+
+    @staticmethod
+    def _peer(areas):
+        # A TP1 peer: our one area's 8 heads over `areas` areas of its own.
+        return SimpleNamespace(
+            kv_area_slices=area_slices(areas, areas, 1),
+            kv_split_axes=[ChipletSplitAxis.HEAD],
+            block_size=16,
+            block_lens=[256 // areas] * areas,
+        )
 
     @pytest.mark.parametrize(
         "kv_per_block, expected",
@@ -1954,17 +2289,16 @@ class TestTheLayoutReachesTheDescriptors:
     def test_a_peer_of_a_different_width_takes_the_layout_s_kv_count(
         self, kv_per_block, expected
     ):
+        # A band read out of a packed block sits once in K and once in V.
         w = self._worker(kv_per_block)
-        meta = MagicMock()
-        meta.kv_area_slices = area_slices(2, 2, 1)
-        assert w._peer_kv_runs(meta, remote_tp_size=1) == expected
+        _, pieces = w._head_matched_plan(self._peer(2), 0, 1)
+        assert len(pieces[0]) == 2 * expected
 
     def test_a_peer_of_our_own_width_never_splits(self):
         # Both sides name whole blocks, so the layout does not matter.
         w = self._worker(PACKED)
-        meta = MagicMock()
-        meta.kv_area_slices = area_slices(1, 1, 1)
-        assert w._peer_kv_runs(meta, remote_tp_size=1) == 1
+        _, pieces = w._head_matched_plan(self._peer(1), 0, 1)
+        assert pieces == [[Piece(0, 0, 0, 256, 2 * 8, (0, 16))]]
 
     def test_a_split_alone_keeps_the_handler_off_upstream_s_fast_path(self):
         # `register_local_xfer_handler` hands a whole-engine peer to upstream's
@@ -1972,22 +2306,16 @@ class TestTheLayoutReachesTheDescriptors:
         # narrowed: upstream names a block once and our list names it per range.
         w = self._worker(PACKED)
         w.local_seen_layer_names = ["layer.0"]
+        pieces = [
+            [Piece(0, 0, 0, 128, 8, (0, 16)), Piece(128, 0, 128, 128, 8, (0, 16))]
+        ]
 
         with patch.object(
             RblnNixlPullConnectorWorker, "_register_shard_local_xfer_handler"
         ) as shard:
-            w.register_local_xfer_handler(16, kv_runs=2)
+            w.register_local_xfer_handler(16, pieces=pieces)
 
-        assert shard.call_args.kwargs["kv_runs"] == 2
-
-    def test_host_staging_never_splits(self):
-        # Host staging registers whole logical buffers and is kept off every
-        # head-matched path, so it reads a block as one range.
-        w = self._worker(PACKED)
-        w.use_host_buffer = True
-        meta = MagicMock()
-        meta.kv_area_slices = area_slices(2, 2, 1)
-        assert w._peer_kv_runs(meta, remote_tp_size=1) == 1
+        assert shard.call_args.kwargs["pieces"] == pieces
 
 
 class TestTailBlockTrim:
@@ -2044,7 +2372,7 @@ class TestTailBlockTrim:
         )
 
         assert worker._chunk_grid == worker._shard_chunk_grid(
-            range(worker.num_regions), block_size=worker.block_size, split=1
+            range(worker.num_regions), block_size=worker.block_size
         )
         assert worker._chunk_grid is not None
 
@@ -2094,7 +2422,7 @@ class TestTailBlockTrim:
         )
 
         assert [worker._region_span_index(r) for r in range(4)] == [0, 0, 1, 1]
-        assert [first for first, _, _ in worker._chunk_grid.regions[:4]] == [0, 0, 4, 4]
+        assert [first for first, _, _ in worker._chunk_grid.entries[:4]] == [0, 0, 4, 4]
 
     def test_areas_that_do_not_divide_the_block_are_refused(self, monkeypatch):
         # 6 tokens over 4 areas: no area is a whole number of them.
@@ -2228,10 +2556,10 @@ class TestChunkModeWithASlidingWindow:
             )
 
     def test_a_streamed_hybrid_on_a_context_cut_is_refused(self, monkeypatch):
-        # A hybrid stays on the whole-engine lists whichever asked for the
-        # chunks, and those lists name every region's chunks with no way to say
-        # which span holds the last token. Streaming reaches them without the
-        # knob, so the refusal cannot be the knob's alone.
+        # A hybrid that writes part of a request stays on the whole-engine
+        # lists. Streaming alone cuts no block but still counts its coverage in
+        # spans those lists were never shown to place, so the refusal cannot be
+        # the knob's alone.
         with pytest.raises(RuntimeError, match="needs a head cut"):
             self._register(
                 monkeypatch,
@@ -2252,7 +2580,7 @@ class TestChunkModeWithASlidingWindow:
             )
 
     def test_a_streamed_engine_with_no_full_group_is_refused(self, monkeypatch):
-        # Streaming names part of a block without the knob, so the refusal
+        # Streaming writes part of a request without the knob, so the refusal
         # cannot be the knob's: this engine registers, and the write path's
         # asserts then name a group it has none of, mid-transfer.
         with pytest.raises(RuntimeError, match="one full-attention"):

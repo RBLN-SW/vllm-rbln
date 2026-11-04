@@ -22,26 +22,12 @@ from vllm.model_executor.layers.minimax_rms_norm.rms_norm_tp import (
 from vllm.model_executor.models.minimax_m2 import MiniMaxM2Attention, MiniMaxM2MoE
 from vllm.sequence import IntermediateTensors
 
-from vllm_rbln import envs
 from vllm_rbln.patches import register_patch
 from vllm_rbln.v1.spec_decode.eagle3_pp import (
     AUX_COMBINED,
     aux_slots_captured,
     aux_slots_received,
 )
-
-if envs.VLLM_RBLN_NESTED_COMPILE_REGION:
-    from vllm.model_executor.models.minimax_m2 import MiniMaxM2DecoderLayer
-
-    register_patch(
-        target="vllm.model_executor.models.minimax_m2.MiniMaxM2DecoderLayer.forward",
-        owner_module=__name__,
-        reason=(
-            "Upstream MiniMax-M2 exposes no decoder compile-region hook. Preserve "
-            "decoder bodies for RBLN loop-compilation bring-up using "
-            "invoke_subgraph boundaries."
-        ),
-    )(torch.compiler.nested_compile_region(MiniMaxM2DecoderLayer.forward))
 
 
 @register_patch(
@@ -104,7 +90,7 @@ def _forward_qk(
         "([B*L, H]) around forward_qkv and reshaping back, although a numerical no-op "
         "in eager, corrupts attention on RBLN: the flatten/unflatten roundtrip "
         "perturbs the [B, L, H] layout that the compiled rotary + flash-attention path "
-        "(and --rbln-use-batch-attn-opt) is built around. "
+        "is built around. "
         "Instead we split qkv on the last dim (no reshape) and apply a locally "
         "reimplemented forward_qk -- plain RMSNorm over dim=-1, which is "
         "layout-invariant -- so q/k/v reach rotary/attn in the exact layout 0.22 used. "

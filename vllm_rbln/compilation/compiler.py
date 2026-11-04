@@ -15,11 +15,13 @@
 import inspect
 import os
 from collections.abc import Callable
+from itertools import islice
 from typing import Any, TypeVar, cast
 
 import rebel
 import torch
 from rebel import CompileContext
+from torch._dynamo.variables.invoke_subgraph import InvokeSubgraphHigherOrderVariable
 from vllm.distributed import get_dp_group, get_pp_group, get_tp_group
 
 from vllm_rbln import envs
@@ -41,8 +43,42 @@ def _ensure_torch_dynamo_configured() -> None:
     # If this flag is set, nn.modules parameters are treated as model input.
     torch._dynamo.config.inline_inbuilt_nn_modules = False
     torch._dynamo.config.cache_size_limit = 64
+    if envs.VLLM_RBLN_USE_NESTED_COMPILE_REGION:
+        # Preserve decoder boundaries even when Dynamo cannot reuse their bodies.
+        torch._dynamo.config.inline_single_use_invoke_subgraph = False
+        # Fail at a side effect inside a region. Allowing it exposes region
+        # intermediates, and the error then surfaces at an unrelated alias.
+        InvokeSubgraphHigherOrderVariable.allow_side_effects = False
 
     _DYNAMO_CONFIGURED = True
+
+
+def mark_decoder_regions(model: torch.nn.Module) -> None:
+    """Make every decoder layer of ``model`` a nested compile region.
+
+    A decoder stack is the list ``make_layers`` builds, which its owner keeps as
+    ``layers`` (``h`` or ``blocks`` in a few models) next to the
+    ``start_layer``/``end_layer`` it also sets; the layers outside that range are
+    pipeline-parallel placeholders.
+    """
+    regions: dict[type, type] = {}
+    for module in model.modules():
+        if not hasattr(module, "start_layer"):
+            continue
+        stack = next(
+            getattr(module, name)
+            for name in ("layers", "h", "blocks")
+            if hasattr(module, name)
+        )
+        for layer in islice(stack, module.start_layer, module.end_layer):
+            cls = type(layer)
+            if cls not in regions:
+                # Marked on a class, not on the instance: Dynamo then traces every
+                # call instead of taking its reuse path, which fails to lift a
+                # tensor that attention reads from a global (its scale).
+                forward = torch.compiler.nested_compile_region(cls.forward)
+                regions[cls] = type(cls.__name__, (cls,), {"forward": forward})
+            layer.__class__ = regions[cls]
 
 
 def check_dtype_option_supported() -> None:

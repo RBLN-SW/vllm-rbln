@@ -24,6 +24,8 @@ from vllm.v1.kv_cache_interface import MambaSpec
 
 import vllm_rbln.v1.worker.rbln_model_runner as mr
 from tests.vllm.v1.worker.utils import make_kv_cache_config, schedule_new
+from vllm_rbln.v1.attention.kv_cache_bindings import kv_cache_tensor_key
+from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
 
 pytestmark = pytest.mark.maybe_use_device
 
@@ -181,24 +183,124 @@ class TestLayerIndexFollowsCacheOrder:
 
 
 class TestMambaSpecGroup:
-    def test_a_state_page_binds_no_view(self, make_model_runner):
-        # The page only reserves the request's block; the GatedDeltaNet state
-        # lives on its backend's rows, so the layer gets no KV cache view.
+    def _views(self, runner, spec):
+        config = make_kv_cache_config(runner, groups=[("layer.0",)], spec=spec)
+        runner.kv_cache_config = config
+        runner.initialize_attn_backend(config)
+        raw = runner._allocate_kv_cache_tensors(config)
+        return raw, runner._reshape_kv_cache_tensors(config, raw, [spec.block_size])
+
+    def test_a_padded_state_page_binds_no_view(self, make_model_runner):
+        # A page padded past its state only reserves the request's block; the
+        # GatedDeltaNet state lives on its backend's rows, so no KV cache view.
+        runner = make_model_runner(layers=("layer.0",), init_kv_cache=False)
+        spec = MambaSpec(
+            block_size=runner.model_config.max_model_len,
+            shapes=((64, 512),),
+            dtypes=(torch.uint8,),
+            page_size_padded=2 * 64 * 512,
+        )
+        raw, (caches, bases, infos, axes) = self._views(runner, spec)
+        assert "layer.0" in raw
+        assert not caches and not bases and not infos and not axes
+
+    def test_a_state_that_fills_its_page_binds_its_blocks(self, make_model_runner):
+        # GLM-5.3's KDA state fills its page: one [num_blocks, *shape] view.
         runner = make_model_runner(layers=("layer.0",), init_kv_cache=False)
         spec = MambaSpec(
             block_size=runner.model_config.max_model_len,
             shapes=((64, 512),),
             dtypes=(torch.uint8,),
         )
-        config = make_kv_cache_config(runner, groups=[("layer.0",)], spec=spec)
-        runner.kv_cache_config = config
-        runner.initialize_attn_backend(config)
-        raw = runner._allocate_kv_cache_tensors(config)
-        caches, bases, infos, axes = runner._reshape_kv_cache_tensors(
-            config, raw, [spec.block_size]
+        _, (caches, _, _, axes) = self._views(runner, spec)
+        assert caches["layer.0"].shape == (10, 64, 512)
+        assert axes == {"layer.0": 0}
+
+
+class TestBlockAuxKVCaches:
+    def test_initialization_inventories_shared_main_and_aux_allocations(
+        self, make_model_runner, monkeypatch
+    ):
+        runner = make_model_runner(layers=("layer.0", "layer.1"), init_kv_cache=False)
+        context = runner.compilation_config.static_forward_context
+        for i, owner in ((2, "layer.0"), (3, "layer.1")):
+            module = self._aux(owner)
+            module.layer_index = i
+            monkeypatch.setitem(context, f"layer.{i}", module)
+        config = make_kv_cache_config(runner, groups=[("layer.0",), ("layer.1",)])
+        runner.initialize_kv_cache(config)
+        assert runner.kv_cache_allocations == {
+            kv_cache_tensor_key(runner.kv_caches[0]): "layer.0",
+            kv_cache_tensor_key(runner.kv_caches[2]): "layer.2",
+        }
+
+        old_allocations = runner.kv_cache_allocations.copy()
+        replacement = make_kv_cache_config(
+            runner, groups=[("layer.0",), ("layer.1",)], num_blocks=20
         )
-        assert "layer.0" in raw
-        assert not caches and not bases and not infos and not axes
+        runner.initialize_kv_cache_tensors(replacement, runner._kernel_block_sizes)
+        assert list(runner.kv_cache_allocations.values()) == list(
+            old_allocations.values()
+        )
+        assert runner.kv_cache_allocations.keys().isdisjoint(old_allocations)
+        for key, name in runner.kv_cache_allocations.items():
+            assert key == kv_cache_tensor_key(context[name].kv_cache)
+
+    @staticmethod
+    def _aux(owner, shape=(4, 64), dtype=torch.bfloat16):
+        spec = RBLNBlockAuxSpec(owner, shape, dtype)
+        return SimpleNamespace(get_aux_cache_spec=lambda _config: spec)
+
+    def _allocate(self, runner, config, monkeypatch, auxes):
+        # GLM-5.3, the one model with aux caches, runs a static KV cache.
+        monkeypatch.setattr(mr, "dynamic_kv_enabled", lambda _config: False)
+        context = runner.compilation_config.static_forward_context
+        for name, module in auxes.items():
+            monkeypatch.setitem(context, name, module)
+        caches: dict = {}
+        bases: dict = {}
+        infos: dict = {}
+        axes: dict = {}
+        runner._allocate_aux_kv_caches(config, caches, bases, infos, axes)
+        return caches, infos, axes
+
+    def test_owners_on_one_extent_share_by_ordinal(
+        self, make_model_runner, monkeypatch
+    ):
+        # Two groups overlay one extent: their layers never hold one block at
+        # once, so an owner's k-th aux cache of a kind shares the other's k-th.
+        runner = make_model_runner(layers=("layer.0", "layer.1"), init_kv_cache=False)
+        config = make_kv_cache_config(runner, groups=[("layer.0",), ("layer.1",)])
+        caches, infos, axes = self._allocate(
+            runner,
+            config,
+            monkeypatch,
+            {
+                "aux.0.a": self._aux("layer.0"),
+                "aux.0.b": self._aux("layer.0"),
+                "aux.1.a": self._aux("layer.1"),
+                "aux.1.f": self._aux("layer.1", dtype=torch.float16),
+            },
+        )
+        assert tuple(caches["aux.0.a"].shape) == (config.num_blocks, 4, 64)
+        assert caches["aux.0.a"] is not caches["aux.0.b"]
+        assert caches["aux.1.a"] is caches["aux.0.a"]
+        assert caches["aux.1.f"].dtype == torch.float16
+        assert infos["aux.1.f"].view_shape == (config.num_blocks, 4, 64)
+        assert set(axes.values()) == {0}
+
+    def test_owners_on_distinct_extents_do_not_share(
+        self, make_model_runner, monkeypatch
+    ):
+        runner = make_model_runner(layers=("layer.0", "layer.1"), init_kv_cache=False)
+        config = make_kv_cache_config(runner, groups=[("layer.0", "layer.1")])
+        caches, _, _ = self._allocate(
+            runner,
+            config,
+            monkeypatch,
+            {"aux.0": self._aux("layer.0"), "aux.1": self._aux("layer.1")},
+        )
+        assert caches["aux.0"] is not caches["aux.1"]
 
 
 class TestHostBufferCopyOp:
@@ -234,10 +336,12 @@ class TestHostBufferCopyOp:
 
 
 class TestRegisterKvCachesWithConnector:
-    """The connector is handed whatever the runner holds when it is called.
+    """The connector is handed the storage the runner holds when it is called.
 
-    The worker calls it after `initialize_kv_cache` on a run that keeps that
-    cache, and again after a dynamic-KV resize has rebuilt every tensor.
+    Each cache goes out as the runner's own tensor, or as a view of it where
+    connectors need another shape. The worker registers after
+    `initialize_kv_cache` on a run that keeps that cache, and again after a
+    dynamic-KV resize has rebuilt every tensor.
     """
 
     @staticmethod
@@ -301,6 +405,33 @@ class TestRegisterKvCachesWithConnector:
         assert [id(t) for t in registered[0].values()] == [
             id(t) for t in runner.kv_caches
         ]
+
+    def test_a_flat_cache_is_registered_with_a_unit_trailing_dim(
+        self, make_model_runner, monkeypatch
+    ):
+        # The DSA indexer's fp16 scale cache is allocated [num_blocks,
+        # block_size]. Connectors read every per-token cache with a trailing
+        # width, so they get a [num_blocks, block_size, 1] view of it; the
+        # kernels keep the flat tensor, and every other cache goes out as is.
+        registered = self._registrations(monkeypatch)
+        runner = make_model_runner(
+            layers=("layer.0", "layer.1"),
+            init_kv_cache=False,
+            additional_config={"enable_sub_block_cache": False},
+        )
+        runner.initialize_kv_cache(
+            make_kv_cache_config(runner, groups=[("layer.0", "layer.1")])
+        )
+        flat = torch.zeros(4, 16, dtype=torch.float16)
+        runner.kv_caches[1] = flat
+
+        runner.register_kv_caches_with_connector()
+
+        attn, scale = registered[0].values()
+        assert attn is runner.kv_caches[0]
+        assert tuple(scale.shape) == (4, 16, 1)
+        assert scale.data_ptr() == flat.data_ptr()
+        assert runner.kv_caches[1] is flat
 
     def test_a_rebuilt_cache_is_what_the_second_call_registers(
         self, make_model_runner, monkeypatch

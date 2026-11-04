@@ -134,7 +134,7 @@ class RBLNGptOssMxfp4MoEMethod(GptOssMxfp4MoEMethod):
         hidden_states = x.reshape(num_tokens, -1)
         masked_routing_weights = router_logits
 
-        if envs.VLLM_RBLN_NESTED_COMPILE_REGION:
+        if envs.VLLM_RBLN_USE_NESTED_COMPILE_REGION:
             # Pass each shared base into the region once; form its views inside.
             gate_blocks = layer.w13_weight[:, ::2]
             up_blocks = layer.w13_weight[:, 1::2]

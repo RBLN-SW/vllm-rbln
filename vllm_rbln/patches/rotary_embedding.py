@@ -103,17 +103,21 @@ def patched_rope_init(
     dtype: torch.dtype,
     init_cache: bool = True,
 ):
-    original_rope_init(
-        self,
-        head_size,
-        rotary_dim,
-        max_position_embeddings,
-        base,
-        is_neox_style,
-        dtype,
-        init_cache,
-    )
-    _register_rotate_half_caches(self)
+    # fp32 ops on RBLN may run in reduced precision; compute the RoPE cache on CPU.
+    target_device = torch.get_default_device()
+    with torch.device("cpu"):
+        original_rope_init(
+            self,
+            head_size,
+            rotary_dim,
+            max_position_embeddings,
+            base,
+            is_neox_style,
+            dtype,
+            init_cache,
+        )
+        _register_rotate_half_caches(self)
+    self.to(target_device)
 
 
 @register_patch(

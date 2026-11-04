@@ -23,6 +23,13 @@ from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
 class RBLNDeepseekScalingRotaryEmbedding(DeepseekScalingRotaryEmbedding):
     """DeepSeek scaling RoPE for RBLN."""
 
+    def __init__(self, *args, **kwargs) -> None:
+        # fp32 ops on RBLN may run in reduced precision; compute the RoPE cache on CPU.
+        target_device = torch.get_default_device()
+        with torch.device("cpu"):
+            super().__init__(*args, **kwargs)
+        self.to(target_device)
+
     def forward_oot(
         self,
         positions: torch.Tensor,
