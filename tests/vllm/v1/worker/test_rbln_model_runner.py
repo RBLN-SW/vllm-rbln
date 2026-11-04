@@ -421,6 +421,22 @@ def test_pooling_warmup_runs_without_language_model_head(monkeypatch):
     cache.save.assert_called_once_with("pooling", cache.config_signature.return_value)
 
 
+def test_warmup_compiles_prefill_at_the_prefill_chunk_size():
+    calls = []
+    runner = _make_runner_stub(
+        max_num_tokens=512,
+        prefill_chunk_size=256,
+        speculative_config=None,
+        bucketing_manager=SimpleNamespace(decode_batch_buckets=[1]),
+        specialized_moe_decode=False,
+        _dummy_run=lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    runner.run_model_graphs()
+
+    assert calls[0] == ((1, 256, True), {})
+
+
 @pytest.mark.parametrize("num_reqs", [1, 2])
 def test_reference_sampler_warmup_finishes(num_reqs):
     runner = _make_runner_stub(
@@ -1274,6 +1290,8 @@ class TestUpdateStates:
             requests=requests if requests is not None else {},
             num_prompt_logprobs={},
             prompt_token_arrays={},
+            num_accepted_tokens_by_req={},
+            state_pos_by_req={},
             is_pooling_model=False,
             sort_batch_by_length=False,
             kv_cache_config=SimpleNamespace(kv_cache_groups=[]),

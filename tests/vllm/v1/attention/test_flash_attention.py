@@ -170,32 +170,29 @@ class TestFlashAttentionMetadataPostInit:
         assert md.cache_seq_lens is None
         assert md.cache_offsets is None
 
-    # cache_seq_lens and cache_offsets share the exact same (buggy) handling, so
-    # every case runs against both to catch a fix/regression applied to only one.
+    # cache_seq_lens and cache_offsets share the exact same handling, so every
+    # case runs against both to catch a fix/regression applied to only one.
     CACHE_FIELDS = ["cache_seq_lens", "cache_offsets"]
 
     @pytest.mark.parametrize("field", CACHE_FIELDS)
-    def test_multielement_cache_field_raises_ambiguous(self, field):
-        # KNOWN BUG pinned: `if self.<field>` on a multi-element tensor raises.
-        # The real SWA/decode path emits [batch, 1], so it fires at batch >= 2.
-        with pytest.raises(RuntimeError, match="ambiguous"):
-            _metadata(
-                use_custom_kernel=True,
-                **{field: torch.tensor([[1], [2]], dtype=torch.int64)},
-            )
+    def test_multielement_cache_field_is_cast(self, field):
+        # The real SWA/decode path emits [batch, 1], so this is every batch >= 2.
+        md = _metadata(
+            use_custom_kernel=True,
+            **{field: torch.tensor([[1], [2]], dtype=torch.int64)},
+        )
+        assert getattr(md, field).dtype == torch.int32
 
     @pytest.mark.parametrize("field", CACHE_FIELDS)
-    def test_single_zero_cache_field_is_silently_dropped(self, field):
-        # TODO(RBLN): KNOWN BUG pinned — a 1-element tensor of value 0 is falsy,
-        # so a valid all-zero value is discarded to None instead of cast.
+    def test_single_zero_cache_field_is_cast(self, field):
+        # A fresh request computes no token, and 0 is a value like any other.
         md = _metadata(
             use_custom_kernel=True, **{field: torch.tensor([[0]], dtype=torch.int64)}
         )
-        assert getattr(md, field) is None
+        assert getattr(md, field).dtype == torch.int32
 
     @pytest.mark.parametrize("field", CACHE_FIELDS)
     def test_single_nonzero_cache_field_is_cast(self, field):
-        # The only shape that survives correctly: 1 element, != 0.
         md = _metadata(
             use_custom_kernel=True, **{field: torch.tensor([[3]], dtype=torch.int64)}
         )

@@ -15,11 +15,21 @@
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+import torch
 from vllm.config import VllmConfig
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
 from vllm.v1.kv_cache_interface import SlidingWindowSpec
 from vllm.v1.request import Request
+
+
+@dataclass(frozen=True)
+class RBLNBlockAuxSpec:
+    """A per-block cache region beside a scheduled KV layer's cache."""
+
+    owner: str
+    block_shape: tuple[int, ...]
+    dtype: torch.dtype
 
 
 @dataclass(frozen=True)
