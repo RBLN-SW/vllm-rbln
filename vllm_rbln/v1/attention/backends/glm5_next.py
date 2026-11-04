@@ -42,6 +42,41 @@ def kda_state_band(vllm_config: VllmConfig) -> tuple[int, int] | None:
     )
 
 
+KDA_STATE, KDA_CONV, KDA_DRAFT = "state", "conv", "draft"
+
+
+def kda_rank_groups(vllm_config: VllmConfig, tp_size: int) -> int:
+    """KDA state caches a layer registers on a rank of TP `tp_size`."""
+    text_config = vllm_config.model_config.hf_text_config
+    band = kda_state_band(vllm_config)
+    assert band is not None
+    page_heads = (
+        vllm_config.cache_config.block_size * text_config.kv_lora_rank // band[1]
+    )
+    return band[0] // tp_size // page_heads
+
+
+def kda_cache_name(prefix: str, role: str, group: int, rank_groups: int) -> str:
+    """The name a KDA layer gives its cache of `role` for its `group`-th state."""
+    index = {
+        KDA_STATE: group,
+        KDA_CONV: rank_groups,
+        KDA_DRAFT: rank_groups + 1 + group,
+    }[role]
+    return f"{prefix}.attn.{index}"
+
+
+def kda_cache_role(name: str, rank_groups: int) -> tuple[str, str, int]:
+    """(prefix, role, group) of a cache `kda_cache_name` named."""
+    prefix, index = name.rsplit(".attn.", 1)
+    k = int(index)
+    if k < rank_groups:
+        return prefix, KDA_STATE, k
+    if k == rank_groups:
+        return prefix, KDA_CONV, 0
+    return prefix, KDA_DRAFT, k - rank_groups - 1
+
+
 @dataclass
 class RBLNGlm5NextStateMetadata(RBLNFlashAttentionMetadata):
     load_blocks: torch.Tensor | None = None

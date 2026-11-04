@@ -91,9 +91,13 @@ from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadata,
 )
 from vllm_rbln.v1.attention.backends.glm5_next import (
+    KDA_CONV,
+    KDA_DRAFT,
+    KDA_STATE,
     RBLNGlm5NextCacheBackend,
     RBLNGlm5NextIndexerBackend,
     RBLNGlm5NextStateMetadata,
+    kda_cache_name,
 )
 from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
 from vllm_rbln.v1.worker.utils import (
@@ -413,14 +417,17 @@ class RBLNGlm5NextKDA(nn.Module):
             persistent=False,
         )
         self.states = nn.ModuleList(
-            RBLNGlm5NextStateCache(f"{prefix}.attn.{j}") for j in range(self.num_groups)
+            RBLNGlm5NextStateCache(
+                kda_cache_name(prefix, KDA_STATE, j, self.num_groups)
+            )
+            for j in range(self.num_groups)
         )
         self.positions_from = self.states[0].prefix
         spec = vllm_config.speculative_config
         self.num_drafts = spec.num_speculative_tokens if spec is not None else 0
         self.conv_ring_width = max(KDA_CONV_RING, taps - 1 + self.num_drafts)
         self.conv_state = RBLNGlm5NextAuxCache(
-            f"{prefix}.attn.{self.num_groups}",
+            kda_cache_name(prefix, KDA_CONV, 0, self.num_groups),
             self.states[0].prefix,
             (
                 self.conv_ring_width,
@@ -435,7 +442,7 @@ class RBLNGlm5NextKDA(nn.Module):
         if self.num_drafts:
             self.drafts = nn.ModuleList(
                 RBLNGlm5NextAuxCache(
-                    f"{prefix}.attn.{self.num_groups + 1 + j}",
+                    kda_cache_name(prefix, KDA_DRAFT, j, self.num_groups),
                     state.prefix,
                     (self.group_heads, self.num_drafts, 4, self.head_dim),
                     dtype,

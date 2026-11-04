@@ -238,6 +238,7 @@ def block_rects(
     area_len: int,
     rank: int,
     tp_size: int,
+    entry_first: int | None = None,
 ) -> list[BlockWindow]:
     """What each chiplet area holds of one block payload's block on one rank.
 
@@ -246,7 +247,9 @@ def block_rects(
     kernel cuts them over the chiplets: a block of runs holds the rank's heads in
     every run, an area a slice of them in every run; a block of one run holds
     `slots` groups' worth of heads (`kda_state_slot`), an area a slice of each,
-    of which the rank's group is the window it owns.
+    of which the rank's group is the window it owns. A block of one run too
+    small for the rank's heads is one of several entries splitting them, which
+    holds the heads from `entry_first` on.
     """
     slices = len(set(slice_ids))
     if not spec.band_heads:
@@ -258,6 +261,9 @@ def block_rects(
         ]
     heads = spec.band_heads // tp_size
     first = rank * heads
+    if spec.runs == 1 and area_len * slices < heads * spec.head_bytes:
+        assert entry_first is not None, "an entry of a split rank names its heads"
+        heads, first = area_len * slices // spec.head_bytes, entry_first
     per_area, rem = divmod(heads, slices)
     if rem:
         raise RuntimeError(

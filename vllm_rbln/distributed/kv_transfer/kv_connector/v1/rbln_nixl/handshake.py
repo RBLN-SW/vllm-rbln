@@ -344,6 +344,19 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
             same_everywhere = self._same_on_every_rank(logical_l)
             if same_everywhere and not latent_sent:
                 continue
+            if self._is_kda_conv_ring(logical_l):
+                ring_pieces = self._conv_ring_pieces(
+                    nixl_agent_meta,
+                    logical_l,
+                    logical_r,
+                    remote_tp_rank,
+                    remote_tp_size,
+                )
+                for area_l in areas_iter:
+                    if ring_pieces[area_l]:
+                        region_ids.append(logical_l * areas_l + area_l)
+                        plans.append(ring_pieces[area_l])
+                continue
             windows = self._block_windows(
                 nixl_agent_meta, logical_l, logical_r, remote_tp_rank, remote_tp_size
             )
@@ -497,23 +510,173 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                 "on the peer."
             )
         geometry = self._logical_region_geometry[logical_l]
+        entry_first = self._kda_entry_first(logical_l)
         ours = block_rects(
             spec,
             [place.slice_id for place in geometry.areas],
             geometry.areas[0].block_len,
             self.tp_rank,
             self.topo.tp_size,
+            entry_first,
         )
         ids_r = nixl_agent_meta.kv_area_slices[logical_r]
         first_r = logical_r * len(ids_r)
+        # `_peer_kda_names` paired the peer's cache of the same head group.
         theirs = block_rects(
             spec,
             ids_r,
             nixl_agent_meta.block_lens[first_r],
             remote_tp_rank,
             remote_tp_size,
+            entry_first,
         )
         return ours, {first_r + a: window for a, window in enumerate(theirs)}
+
+    def _kda_groups(self, tp_size: int) -> int:
+        from vllm_rbln.v1.attention.backends.glm5_next import kda_rank_groups
+
+        return kda_rank_groups(self.vllm_config, tp_size)
+
+    def _kda_entry(self, logical: int) -> tuple[str, str, int] | None:
+        """(layer prefix, role, group) of a logical region that is a KDA layer's
+        state or a cache one owns; None for any other region."""
+        from vllm_rbln.v1.attention.backends.glm5_next import kda_cache_role
+
+        if not self._block_state_layers:
+            return None
+        name = self.region_names[logical * self._kv_areas]
+        aux = self._block_aux_specs.get(name)
+        if (name if aux is None else aux.owner) not in self._block_state_layers:
+            return None
+        return kda_cache_role(name, self._kda_groups(self.topo.tp_size))
+
+    def _is_kda_conv_ring(self, logical: int) -> bool:
+        from vllm_rbln.v1.attention.backends.glm5_next import KDA_CONV
+
+        entry = self._kda_entry(logical)
+        return entry is not None and entry[1] == KDA_CONV
+
+    def _kda_entry_first(self, logical: int) -> int | None:
+        """The first model-wide head a KDA state group's cache holds here."""
+        entry = self._kda_entry(logical)
+        spec = self._block_spec(logical)
+        if entry is None or self._is_kda_conv_ring(logical) or spec is None:
+            return None
+        rank_heads = spec.band_heads // self.topo.tp_size
+        group_heads = rank_heads // self._kda_groups(self.topo.tp_size)
+        return self.tp_rank * rank_heads + entry[2] * group_heads
+
+    def _conv_ring_pieces(
+        self,
+        nixl_agent_meta: RblnNixlAgentMetadata,
+        logical_l: int,
+        logical_r: int,
+        remote_tp_rank: int,
+        remote_tp_size: int,
+    ) -> list[list[Piece]]:
+        """Per area of ours, the pieces of a KDA conv ring's block that a peer rank
+        holds.
+
+        A ring's block is, per tap, q and k of every state group and then v of
+        every group (`kda_conv`'s inputs), each one run the chiplets cut alike.
+        Each side splits its rank's heads into as many groups as its pages fit,
+        so one run of ours sits at another index of the peer's block.
+        """
+        spec = self._block_spec(logical_l)
+        assert spec is not None
+        groups_l = self._kda_groups(self.topo.tp_size)
+        groups_r = self._kda_groups(remote_tp_size)
+        taps, rem = divmod(spec.runs, 3 * groups_l)
+        assert not rem, (spec, groups_l)
+        geometry = self._logical_region_geometry[logical_l]
+        ids_r = nixl_agent_meta.kv_area_slices[logical_r]
+        if len(set(ids_r)) != geometry.slices:
+            raise RuntimeError(
+                f"RBLN NIXL D2D: KDA conv ring region {logical_l} is cut "
+                f"{geometry.slices} ways here and {len(set(ids_r))} on the peer."
+            )
+        first_r = logical_r * len(ids_r)
+        run_l = geometry.areas[0].block_len // spec.runs
+        run_r, rem = divmod(nixl_agent_meta.block_lens[first_r], taps * 3 * groups_r)
+        if rem or run_r != run_l:
+            raise RuntimeError(
+                f"RBLN NIXL D2D: a KDA conv ring run is {run_l}B a chiplet area "
+                f"here and {nixl_agent_meta.block_lens[first_r]}B over "
+                f"{taps * 3 * groups_r} runs on the peer."
+            )
+
+        def index(kind: int, group: int, groups: int) -> int:
+            return 2 * group + kind if kind < 2 else 2 * groups + group
+
+        out = []
+        for place in geometry.areas:
+            holders = [
+                first_r + a for a, sid in enumerate(ids_r) if sid == place.slice_id
+            ]
+            if not self._writes_into_peer:
+                holders = holders[:1]
+            pieces = []
+            for j in range(groups_l):
+                group = self.tp_rank * groups_l + j
+                if group // groups_r != remote_tp_rank:
+                    continue
+                for tap in range(taps):
+                    for kind in range(3):
+                        local = tap * 3 * groups_l + index(kind, j, groups_l)
+                        peer = tap * 3 * groups_r + index(
+                            kind, group % groups_r, groups_r
+                        )
+                        pieces.extend(
+                            Piece(local * run_l, region, peer * run_r, run_l, 1, (0, 1))
+                            for region in holders
+                        )
+            out.append(pieces)
+        return out
+
+    def _peer_kda_names(
+        self,
+        nixl_agent_meta: RblnNixlAgentMetadata,
+        remote_tp_rank: int,
+        remote_tp_size: int,
+    ) -> RblnNixlAgentMetadata:
+        """The peer's metadata with its KDA caches named as this rank names the
+        same head group's.
+
+        A rank splits its heads into as many state caches as its pages fit, so
+        a peer of another TP degree names one head group's caches otherwise;
+        renamed, the layer overlap pairs by group. A group no cache of ours
+        holds keeps a name of its own.
+        """
+        from vllm_rbln.v1.attention.backends.glm5_next import (
+            KDA_CONV,
+            kda_cache_name,
+            kda_cache_role,
+        )
+
+        groups_l = self._kda_groups(self.topo.tp_size)
+        groups_r = self._kda_groups(remote_tp_size)
+        if not nixl_agent_meta.region_names or groups_l == groups_r:
+            return nixl_agent_meta
+        prefixes = {
+            kda_cache_role(name, groups_l)[0] for name in self._block_state_layers
+        }
+
+        def ours(name: str) -> str:
+            prefix, sep, _ = name.rpartition(".attn.")
+            if not sep or prefix not in prefixes:
+                return name
+            _, role, group = kda_cache_role(name, groups_r)
+            if role == KDA_CONV:
+                return kda_cache_name(prefix, role, 0, groups_l)
+            group += remote_tp_rank * groups_r
+            if group // groups_l != self.tp_rank:
+                return f"{name}@{remote_tp_rank}"
+            return kda_cache_name(prefix, role, group % groups_l, groups_l)
+
+        return replace(
+            nixl_agent_meta,
+            region_names=[ours(name) for name in nixl_agent_meta.region_names],
+        )
 
     def _build_head_matched_remote(
         self,
@@ -1156,6 +1319,12 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                             )
                         )
                         continue
+                    if self._block_state_layers and self._is_head_matched_peer(
+                        remote_tp_size
+                    ):
+                        metadata = self._peer_kda_names(
+                            metadata, remote_tp_rank, remote_tp_size
+                        )
                     names = tuple(metadata.registered_layer_names)
                     self._remote_shard_layer_names[expected_engine_id][global_rank] = (
                         names
