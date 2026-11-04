@@ -633,18 +633,19 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                 is_prompt_sorted=attn_metadata.is_prompt_sorted,
             )
         elif reads_shared_kv:
+            # A key mask on top of the causal rule lowers to the flash causal
+            # function the target's full layer runs.
             assert not attn_metadata.is_prefill
-            attn_output = flash_attention_naive_decode(
+            attn_output = torch.ops.rbln_custom_ops.gqa(
                 query,
                 key,
                 value,
                 kv_cache,
-                attn_metadata.attn_masks,
-                self.scale,
                 attn_metadata.seq_lens,
+                self.scale,
                 attn_metadata.block_tables,
-                self.sinks,
-                use_custom_kernel=self.use_custom_kernel,
+                attn_mask=attn_metadata.attn_masks,
+                is_causal=True,
                 is_prompt_sorted=attn_metadata.is_prompt_sorted,
             )
         elif self.sliding_window is not None:

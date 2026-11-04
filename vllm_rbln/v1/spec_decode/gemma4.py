@@ -156,7 +156,6 @@ class RBLNGemma4Proposer(RBLNEagleProposer):
         num_reqs_padded = batch_desc.num_reqs_padded
         query_start_loc = self.arange[: num_reqs + 1]
         write_positions = torch.clamp(positions + 1, max=self.max_model_len - 1)
-        keys_full = torch.arange(self.max_model_len)
         per_layer_attn_metadata: dict[str, object] = {}
         for attn_group in self.draft_attn_groups:
             builder = attn_group.get_metadata_builder()
@@ -199,8 +198,10 @@ class RBLNGemma4Proposer(RBLNEagleProposer):
                 masks = torch.zeros(num_reqs_padded, 1, 1, num_blocks * block_size)
                 masks[:num_reqs, 0, 0] = visible.to(masks.dtype)
             else:
-                visible = keys_full[None, :] <= positions[:, None]
-                masks = torch.zeros(num_reqs_padded, 1, 1, 1, self.max_model_len)
+                # gqa masks keys over the whole block table.
+                keys = torch.arange(block_table.shape[1] * builder.block_size)
+                visible = keys[None, :] <= positions[:, None]
+                masks = torch.zeros(num_reqs_padded, 1, 1, 1, keys.numel())
                 masks[:num_reqs, 0, 0, 0] = visible.to(masks.dtype)
             attn_metadata.attn_masks = builder._stage(
                 masks.to(torch.float16 if builder.enforce_eager else torch.float32),

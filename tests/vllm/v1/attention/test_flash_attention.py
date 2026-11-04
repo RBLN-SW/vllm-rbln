@@ -929,8 +929,7 @@ class TestForwardSharedKV:
     HEADS, DIM = 8, 128
 
     @pytest.mark.parametrize(
-        "sliding_window, target",
-        [(None, "flash_attention_naive_decode"), (4, "sliding_window_attention_v1")],
+        "sliding_window, target", [(None, "gqa"), (4, "sliding_window_attention_v1")]
     )
     def test_reads_through_a_masked_op(self, cfg, monkeypatch, sliding_window, target):
         impl = make_impl(cfg, sliding_window=sliding_window)
@@ -949,6 +948,12 @@ class TestForwardSharedKV:
             monkeypatch.setattr(
                 flash_attention, name, record if name == target else _unexpected(name)
             )
+        monkeypatch.setattr(
+            torch.ops.rbln_custom_ops,
+            "gqa",
+            record if target == "gqa" else _unexpected("gqa"),
+            raising=False,
+        )
         md = RBLNFlashAttentionMetadata(
             seq_lens=torch.tensor([[6], [0]]),
             block_tables=torch.tensor([[7, 8, 9], [0, 0, 0]]),
@@ -968,5 +973,6 @@ class TestForwardSharedKV:
         args, kwargs = recorded[0]
         _q, key, value = args[:3]
         assert not key.any() and not value.any()
-        mask = args[4] if sliding_window is None else kwargs["attn_mask"]
-        assert mask is md.attn_masks
+        assert kwargs["attn_mask"] is md.attn_masks
+        if sliding_window is None:
+            assert kwargs["is_causal"]
