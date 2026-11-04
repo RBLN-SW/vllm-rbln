@@ -3584,6 +3584,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # backends for that group only supports block_size 64, we will return
         # kernel_block_size 64 and split the 256-token-block to 4 blocks with 64
         # tokens each.
+        assert self.rbln_config.prefill_chunk_size is not None  # resolved at start-up
         kernel_block_sizes = prepare_kernel_block_sizes(
             kv_cache_config,
             self.attn_groups,

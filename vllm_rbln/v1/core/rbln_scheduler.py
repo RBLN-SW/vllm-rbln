@@ -75,6 +75,7 @@ class RBLNScheduler(Scheduler):
 
         # Replace the upstream KVCacheManager with RBLNKVCacheManager
         # when sub-block prefix caching is enabled.
+        assert rbln_config.prefill_chunk_size is not None  # resolved at start-up
         sub_block_size = sub_block_size_in_use(
             enable_prefix_caching=self.cache_config.enable_prefix_caching,
             sub_block_cache=rbln_config.enable_sub_block_cache,
