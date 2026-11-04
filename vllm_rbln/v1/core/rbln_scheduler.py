@@ -130,6 +130,7 @@ class RBLNScheduler(Scheduler):
         # the soft cap a no-op. See v1/core/utils.py.
         self._pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
 
+        assert rbln_config.prefill_chunk_size is not None  # resolved at start-up
         self._prefill_chunk_size = rbln_config.prefill_chunk_size
         self._is_mm_prefix_lm = self.vllm_config.model_config.is_mm_prefix_lm
 
