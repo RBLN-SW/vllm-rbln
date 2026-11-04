@@ -16,6 +16,7 @@ from dataclasses import dataclass, fields
 from typing import ClassVar
 
 import torch
+from vllm.config import VllmConfig
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import MambaSpec
@@ -28,6 +29,17 @@ from .flash_attention import (
     RBLNFlashAttentionMetadata,
     RBLNFlashAttentionMetadataBuilder,
 )
+
+
+def kda_state_band(vllm_config: VllmConfig) -> tuple[int, int] | None:
+    """(model-wide KDA heads, bytes one head's state takes), or None off GLM-5.3."""
+    text_config = vllm_config.model_config.hf_text_config
+    if text_config.model_type != "glm5_next_text":
+        return None
+    return (
+        text_config.linear_num_heads,
+        text_config.linear_head_dim**2 * vllm_config.model_config.dtype.itemsize,
+    )
 
 
 @dataclass
