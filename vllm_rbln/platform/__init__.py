@@ -281,7 +281,7 @@ class RblnPlatform(Platform):
             if model_impl == "optimum" and self.max_num_batched_tokens is not None:
                 raise ValueError(
                     "--max-num-batched-tokens (max_num_batched_tokens) is not "
-                    "supported on the optimum model path. Use "
+                    "supported on the optimum model impl. Use "
                     "--rbln-prefill-chunk-size "
                     "(additional_config={'prefill_chunk_size': ...}) "
                     "to set the prefill graph size."

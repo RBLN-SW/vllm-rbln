@@ -81,6 +81,11 @@ class RBLNConfigBase:
     If None, uses prefill_chunk_size.
     """
 
+    prefill_chunk_size: int | None = Field(default=None, gt=0)
+    """Length of the compiled prefill graph. If None, the vllm model path uses
+    max_num_batched_tokens. The optimum model path uses optimum-rbln's default
+    when compiling, or the pre-compiled model's chunk size."""
+
 
 @vllm_config_dataclass
 class RBLNConfig(RBLNConfigBase):
@@ -100,11 +105,6 @@ class RBLNConfig(RBLNConfigBase):
 
     enable_sub_block_cache: bool = True
     """Enable sub-block prefix caching, at `sub_block_size` granularity."""
-
-    prefill_chunk_size: int | None = Field(default=None, gt=0)
-    """Length the prefill graph is compiled at, and so the longest prefill
-    chunk the scheduler hands it, below the `max_num_batched_tokens` step
-    budget. If None, uses `max_num_batched_tokens`."""
 
     specialize_moe_decode: bool = True
     """Specialize the case where every instance is at the decode stage."""
@@ -186,10 +186,6 @@ class OptimumRBLNConfig(RBLNConfigBase):
     """Entries for optimum-rbln's own model config, laid over what vllm-rbln
     derives from the vLLM settings when the model is compiled. With a
     pre-compiled model only the `device` entries apply."""
-
-    prefill_chunk_size: int | None = Field(default=None, gt=0)
-    """Length of the compiled prefill graph. If None, uses optimum-rbln's
-    default when compiling, or the pre-compiled model's chunk size."""
 
     num_blocks_override: int | None = field(default=None, metadata=_NO_FLAG)
     """`--num-gpu-blocks-override` as given, before the prefix-cache block ratio
