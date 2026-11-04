@@ -118,6 +118,19 @@ class TestStage:
         assert torch.equal(staged.input_ids.cpu(), input_ids)
         assert torch.equal(staged.positions.cpu(), positions)
 
+    def test_mrope_positions_pad_each_axis(self):
+        stager = _stager()
+        layout = _layout(num_reqs=2, num_reqs_padded=4, query_len=3, query_len_padded=8)
+        positions = torch.arange(18, dtype=torch.int64).reshape(3, 2, 3) + 100
+        staged = stager.stage(input_ids=_ids(2, 3), positions=positions, layout=layout)
+
+        expected = torch.zeros(3, 4, 8, dtype=torch.int64)
+        expected[:, :2, :3] = positions
+        assert torch.equal(staged.positions.cpu(), expected)
+        # Text positions under the same layout get their own [batch, seq] buffer.
+        text = stager.stage(input_ids=_ids(2, 3), positions=_ids(2, 3), layout=layout)
+        assert text.positions.shape == (4, 8)
+
     def test_buffers_live_on_configured_device(self):
         stager = _stager()
         staged = stager.stage(

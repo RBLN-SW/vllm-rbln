@@ -20,6 +20,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.v1.kv_cache_interface import MambaSpec
 
 import vllm_rbln.v1.worker.rbln_model_runner as mr
 from tests.vllm.v1.worker.utils import make_kv_cache_config, schedule_new
@@ -179,6 +180,41 @@ class TestLayerIndexFollowsCacheOrder:
         assert runner.kv_cache_names == list(names)
         assert [ctx[name].layer_index for name in names] == [0, 1, 2]
         assert runner.kv_caches[2] is ctx[names[-1]].kv_cache
+
+
+class TestMambaSpecGroup:
+    def _views(self, runner, spec):
+        config = make_kv_cache_config(runner, groups=[("layer.0",)], spec=spec)
+        runner.kv_cache_config = config
+        runner.initialize_attn_backend(config)
+        raw = runner._allocate_kv_cache_tensors(config)
+        return raw, runner._reshape_kv_cache_tensors(config, raw, [spec.block_size])
+
+    def test_a_padded_state_page_binds_no_view(self, make_model_runner):
+        # A page padded past its state only reserves the request's block; the
+        # GatedDeltaNet state lives on its backend's rows, so no KV cache view.
+        runner = make_model_runner(layers=("layer.0",), init_kv_cache=False)
+        spec = MambaSpec(
+            block_size=runner.model_config.max_model_len,
+            shapes=((64, 512),),
+            dtypes=(torch.uint8,),
+            page_size_padded=2 * 64 * 512,
+        )
+        raw, (caches, bases, infos, axes) = self._views(runner, spec)
+        assert "layer.0" in raw
+        assert not caches and not bases and not infos and not axes
+
+    def test_a_state_that_fills_its_page_binds_its_blocks(self, make_model_runner):
+        # GLM-5.3's KDA state fills its page: one [num_blocks, *shape] view.
+        runner = make_model_runner(layers=("layer.0",), init_kv_cache=False)
+        spec = MambaSpec(
+            block_size=runner.model_config.max_model_len,
+            shapes=((64, 512),),
+            dtypes=(torch.uint8,),
+        )
+        _, (caches, _, _, axes) = self._views(runner, spec)
+        assert caches["layer.0"].shape == (10, 64, 512)
+        assert axes == {"layer.0": 0}
 
 
 class TestBlockAuxKVCaches:

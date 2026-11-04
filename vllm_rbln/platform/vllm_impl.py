@@ -57,6 +57,16 @@ def check_and_update(vllm_config: "VllmConfig") -> None:
     _setup_runtime_env(vllm_config)
 
 
+def _uses_gated_delta_net(model_config) -> bool:
+    """GatedDeltaNet layers (Qwen3-Next, Qwen3.5): `linear_attention` in the HF
+    config's `layer_types` with GDN's split key / value heads. GLM-5.3's KDA
+    layers carry the same layer type under `linear_num_heads`."""
+    text_config = getattr(model_config, "hf_text_config", model_config.hf_config)
+    return "linear_attention" in (
+        getattr(text_config, "layer_types", None) or ()
+    ) and hasattr(text_config, "linear_num_value_heads")
+
+
 def _uses_model_parallel(parallel_config) -> bool:
     return (
         parallel_config.tensor_parallel_size > 1
@@ -75,14 +85,26 @@ def _validate(vllm_config: "VllmConfig") -> None:
     if vllm_config.lora_config is not None:
         raise ValueError("LoRA is not supported on RBLN.")
 
-    if model_config.uses_mrope:
-        # The RBLN RoPE override covers `RotaryEmbedding` and takes
-        # `[batch, seq]` positions; `MRotaryEmbedding` is a sibling class with
-        # no RBLN forward, and its native one reads a 2-D tensor as `[3, N]`.
-        raise ValueError(
-            "M-RoPE models (e.g. the Qwen2-VL family) are not supported on the "
-            "RBLN vLLM path yet. Use the optimum path."
-        )
+    if _uses_gated_delta_net(model_config):
+        if scheduler_config.max_num_batched_tokens % 128:
+            raise ValueError(
+                "The RBLN GatedDeltaNet prefill kernel runs in 128-token chunks; "
+                f"got max_num_batched_tokens="
+                f"{scheduler_config.max_num_batched_tokens}. "
+                "Set --max-num-batched-tokens to a multiple of 128."
+            )
+        if vllm_config.speculative_config is not None:
+            raise ValueError(
+                "Speculative decoding is not supported for GatedDeltaNet models on "
+                "the RBLN vLLM path yet: the decode kernel takes one token per request."
+            )
+        heads_v = model_config.hf_text_config.linear_num_value_heads
+        if (heads_v // parallel_config.tensor_parallel_size) % 4:
+            raise ValueError(
+                "The RBLN GatedDeltaNet core splits a rank's value heads over four "
+                f"chiplets; got {heads_v} heads over "
+                f"tensor_parallel_size={parallel_config.tensor_parallel_size}."
+            )
 
     text_config = getattr(model_config, "hf_text_config", model_config.hf_config)
     if (
@@ -440,6 +462,20 @@ def _override(vllm_config: "VllmConfig") -> None:
         model_config.disable_cascade_attn = True
 
     cache_config = vllm_config.cache_config
+    if _uses_gated_delta_net(model_config):
+        if cache_config.enable_prefix_caching:
+            # A GatedDeltaNet state block belongs to one request and is not
+            # content addressable, so a cache hit could not restore it.
+            logger.warning(
+                "Prefix caching is not supported for GatedDeltaNet models on the "
+                "RBLN vLLM path. Overriding cache_config.enable_prefix_caching to "
+                "False."
+            )
+            cache_config.enable_prefix_caching = False
+        # One state block a request, as upstream sizes it without prefix caching.
+        cache_config.mamba_cache_mode = "none"
+        if not cache_config.user_specified_mamba_block_size:
+            cache_config.mamba_block_size = model_config.max_model_len
     if (
         model_config.hf_text_config.model_type == "glm5_next_text"
         and cache_config.enable_prefix_caching

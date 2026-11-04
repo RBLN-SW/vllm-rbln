@@ -236,6 +236,6 @@ identifier-leading-digits = false
 locale = "en"
 extend-ignore-identifiers-re = ["NVML_*", ".*Unc.*", ".*_thw",
     ".*UE8M0.*", ".*[UE4M3|ue4m3].*", ".*eles.*",
-     ".*[Tt]h[rR].*"]
+     ".*[Tt]h[rR].*", ".*_ba"]
 extend-ignore-words-re = []
 extend-ignore-re = []
