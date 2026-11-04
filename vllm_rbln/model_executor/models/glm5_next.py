@@ -209,17 +209,21 @@ class RBLNGlm5NextAuxCache(_RBLNGlm5NextCache):
         owner: str,
         block_shape: tuple[int, ...],
         dtype: torch.dtype,
+        head_axis: int | None = None,
     ) -> None:
         super().__init__(prefix)
         self.owner = owner
         self.block_shape = block_shape
         self.dtype = dtype
+        self.head_axis = head_axis
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> None:
         return None
 
     def get_aux_cache_spec(self, vllm_config: VllmConfig) -> RBLNBlockAuxSpec:
-        return RBLNBlockAuxSpec(self.owner, self.block_shape, self.dtype)
+        return RBLNBlockAuxSpec(
+            self.owner, self.block_shape, self.dtype, self.head_axis
+        )
 
     def get_attn_backend(self) -> type[RBLNGlm5NextCacheBackend]:
         return RBLNGlm5NextCacheBackend
@@ -418,6 +422,7 @@ class RBLNGlm5NextKDA(nn.Module):
                 CONV_LANES,
             ),
             dtype,
+            head_axis=2,
         )
         self.drafts = None
         if self.num_drafts:
@@ -427,6 +432,7 @@ class RBLNGlm5NextKDA(nn.Module):
                     state.prefix,
                     (self.group_heads, self.num_drafts, 4, self.head_dim),
                     dtype,
+                    head_axis=0,
                 )
                 for j, state in enumerate(self.states)
             )
