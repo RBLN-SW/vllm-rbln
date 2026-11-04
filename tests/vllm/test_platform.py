@@ -632,10 +632,6 @@ class TestRejectedConfigs:
                 ),
             ),
             (
-                "sub-block prefix caching",
-                lambda c: setattr(c.cache_config, "enable_prefix_caching", True),
-            ),
-            (
                 "RBLN NIXL KV transfer",
                 lambda c: setattr(
                     c,
@@ -679,6 +675,15 @@ class TestRejectedConfigs:
 
         with pytest.raises(ValueError, match="RBLN NIXL KV transfer"):
             reconfigure(mutate)
+
+    def test_a_prefill_chunk_below_the_token_budget_takes_sub_block_caching(
+        self, reconfigure
+    ):
+        def mutate(config):
+            _prefill_chunk(64)(config)
+            config.cache_config.enable_prefix_caching = True
+
+        reconfigure(mutate)
 
     def test_a_prefill_chunk_below_the_token_budget_takes_other_connectors(
         self, reconfigure

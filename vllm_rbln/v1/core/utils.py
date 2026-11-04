@@ -237,7 +237,7 @@ def sub_block_size_in_use(
     enable_prefix_caching: bool,
     sub_block_cache: bool,
     block_size: int,
-    max_num_batched_tokens: int,
+    prefill_chunk_size: int,
     kv_cache_config: KVCacheConfig,
     sub_block_size: int | None = None,
 ) -> int | None:
@@ -267,18 +267,18 @@ def sub_block_size_in_use(
             )
         return None
 
-    sub_block_size = wanted or max_num_batched_tokens
+    sub_block_size = wanted or prefill_chunk_size
     eligible = RBLNKVCacheManager.can_use_sub_block_caching(
         kv_cache_config, sub_block_size
     )
-    fits = block_size >= max_num_batched_tokens >= sub_block_size
+    fits = block_size >= prefill_chunk_size >= sub_block_size
     if not wanted:
         if not (eligible and fits):
             return None
     elif not fits:
         raise ValueError(
-            "sub-block prefix caching needs block_size >= max_num_batched_tokens "
-            f">= sub_block_size, got {block_size} >= {max_num_batched_tokens} >= "
+            "sub-block prefix caching needs block_size >= prefill_chunk_size >= "
+            f"sub_block_size, got {block_size} >= {prefill_chunk_size} >= "
             f"{sub_block_size}."
         )
     elif not eligible:
@@ -289,10 +289,10 @@ def sub_block_size_in_use(
         )
     # Left until last: the equal case never asks, so a compile-only worker with
     # no NPU to name still starts on the default setting.
-    if sub_block_size != max_num_batched_tokens and not current_platform.is_cr13():
+    if sub_block_size != prefill_chunk_size and not current_platform.is_cr13():
         raise ValueError(
-            f"sub_block_size={sub_block_size} below max_num_batched_tokens="
-            f"{max_num_batched_tokens} makes a prefill chunk span two blocks, "
+            f"sub_block_size={sub_block_size} below prefill_chunk_size="
+            f"{prefill_chunk_size} makes a prefill chunk span two blocks, "
             "which needs the multi-block store that only REBEL CR13 carries; "
             f"this is {current_platform.get_device_name()}."
         )
