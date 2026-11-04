@@ -673,10 +673,10 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                 return f"{name}@{remote_tp_rank}"
             return kda_cache_name(prefix, role, group % groups_l, groups_l)
 
-        return replace(
-            nixl_agent_meta,
-            region_names=[ours(name) for name in nixl_agent_meta.region_names],
-        )
+        renamed: dict[str, Any] = {
+            "region_names": [ours(name) for name in nixl_agent_meta.region_names]
+        }
+        return replace(nixl_agent_meta, **renamed)
 
     def _build_head_matched_remote(
         self,
