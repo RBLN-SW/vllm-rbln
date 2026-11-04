@@ -11,6 +11,7 @@ declare -A group_paths=(
   [dp]=tests/vllm/distributed
   [specdec]=tests/vllm/v1/spec_decode
   [core]=tests/vllm/v1/core
+  [sample]=tests/vllm/v1/sample
 )
 
 paths=(tests/vllm)
