@@ -463,8 +463,6 @@ def _override(vllm_config: "VllmConfig") -> None:
 
     # As upstream's CUDA and ROCm platforms do: an mm prefix range attends both
     # ways, so it must never straddle two steps.
-    # TODO(RBLN): prefill pads to max_num_batched_tokens, so the text prefill
-    # graph grows with the longest mm item; give it a length of its own.
     scheduler_config = vllm_config.scheduler_config
     if (
         model_config.is_mm_prefix_lm

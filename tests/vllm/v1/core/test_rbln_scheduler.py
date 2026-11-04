@@ -863,9 +863,14 @@ class TestMmPrefixChunks:
             ),
         )
 
-    def _chunks(self, monkeypatch, features, *, num_tokens=40, budget=16):
+    def _chunks(
+        self, monkeypatch, features, *, num_tokens=40, budget=16, chunk_size=None
+    ):
         sched = create_rbln_scheduler(
-            max_num_batched_tokens=budget, max_model_len=64, block_size=16
+            max_num_batched_tokens=budget,
+            max_model_len=64,
+            block_size=16,
+            additional_config={"prefill_chunk_size": chunk_size or budget},
         )
         sched._is_mm_prefix_lm = True
         # Encoder budgeting is upstream's, and opt-125m owns no encoder.
@@ -892,6 +897,12 @@ class TestMmPrefixChunks:
         # <boi> at 9, ten soft tokens at 10..19, <eoi> at 20.
         image = self._feature("image", 9, [False] + [True] * 10 + [False])
         assert self._chunks(monkeypatch, [image]) == [10, 10, 16, 4]
+
+    def test_text_chunks_take_the_chunk_size_and_an_image_the_budget(self, monkeypatch):
+        # Soft tokens at 10..19 run as one 10-token step past the 8-token chunks.
+        image = self._feature("image", 9, [False] + [True] * 10 + [False])
+        chunks = self._chunks(monkeypatch, [image], chunk_size=8)
+        assert chunks == [8, 2, 10, 8, 8, 4]
 
     def test_each_video_frame_is_its_own_range(self, monkeypatch):
         # Two frames of four soft tokens, each between a timestamp, <boi>, <eoi>.
