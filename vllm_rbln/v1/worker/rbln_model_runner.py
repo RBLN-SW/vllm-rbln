@@ -14,6 +14,7 @@
 
 import collections
 import dataclasses
+import json
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from contextlib import nullcontext
@@ -180,7 +181,7 @@ from vllm_rbln.v1.worker.dp_utils import (
     determine_batch_execution_and_padding,
 )
 from vllm_rbln.v1.worker.input_stager import InputLayout, InputStager, StagedModelInputs
-from vllm_rbln.v1.worker.kv_placement import allocation_size
+from vllm_rbln.v1.worker.kv_placement import allocation_size, snapshot_from_driver
 from vllm_rbln.v1.worker.utils import (
     canonical_kv_layers,
     copy_host_device_kv_blocks,
@@ -632,6 +633,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         for mm_hash in scheduler_output.free_encoder_mm_hashes:
             self.encoder_cache.pop(mm_hash, None)
+        if scheduler_output.free_encoder_mm_hashes:
+            self.log_encoder_cache_memory("after_cache_eviction")
 
         # Remove the finished requests from the persistent batch.
         for req_id in scheduler_output.finished_req_ids:
@@ -1368,6 +1371,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 )
             )
 
+            self.log_encoder_cache_memory("after_mm_staging")
+
         return (
             staged_model_inputs,
             model_kwargs,
@@ -1412,6 +1417,58 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             * get_dtype_size(self.dtype)
         )
 
+    def log_encoder_cache_memory(self, stage: str, *, reset_peak: bool = False) -> None:
+        """Opt-in synchronized snapshots; allocator peaks start at the last reset."""
+        if (
+            not envs.VLLM_RBLN_LOG_ENCODER_CACHE_MEMORY
+            or not self.supports_mm_inputs
+            or self.device.type == "cpu"
+        ):
+            return
+        torch.rbln.synchronize(self.device)
+        if reset_peak:
+            torch.rbln.reset_peak_memory_stats(self.device)
+        driver = torch.rbln.mem_get_info_per_chiplet(self.device)
+        stats = torch.rbln.memory_stats_per_chiplet(self.device)
+        chiplets = []
+        for (npu, chiplet), memory in snapshot_from_driver(driver).items():
+            prefix = f"npu.{npu}.chiplet.{chiplet}."
+            chiplets.append(
+                {
+                    "npu_in_logical_device": npu,
+                    "chiplet": chiplet,
+                    "driver_total_bytes": memory.total,
+                    "driver_used_bytes": memory.used,
+                    "driver_free_bytes": driver[prefix + "free"],
+                    "driver_largest_free_bytes": driver[prefix + "largest_free"],
+                    "allocated_bytes": stats[prefix + "allocated.current"],
+                    "reserved_bytes": stats[prefix + "reserved.current"],
+                    "allocated_peak_bytes": stats[prefix + "allocated.peak"],
+                    "reserved_peak_bytes": stats[prefix + "reserved.peak"],
+                }
+            )
+        logger.info(
+            "[Encoder cache memory] %s",
+            json.dumps(
+                {
+                    "stage": stage,
+                    "rank": self.parallel_config.rank,
+                    "device": str(self.device),
+                    "peak_reset": reset_peak,
+                    "cache_items": len(self.encoder_cache),
+                    "cache_tokens": sum(
+                        t.shape[0] for t in self.encoder_cache.values()
+                    ),
+                    "cache_logical_bytes": sum(
+                        t.numel() * t.element_size()
+                        for t in self.encoder_cache.values()
+                    ),
+                    "cache_reserve_bytes_per_chiplet": self.encoder_cache_reserve_bytes,
+                    "chiplets": chiplets,
+                }
+            ),
+        )
+
     def _execute_mm_encoder(self, scheduler_output: RBLNSchedulerOutput) -> None:
         """Cache this step's scheduled multimodal encoder outputs."""
         mm_hashes: list[str] = []
@@ -1430,6 +1487,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         if not mm_kwargs:
             return
 
+        self.log_encoder_cache_memory("before_encoder")
         model = cast(SupportsMultiModal, self.model)
         encoder_outputs: list[torch.Tensor] = []
 
@@ -1442,6 +1500,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         for mm_hash, output in zip(mm_hashes, encoder_outputs):
             self.encoder_cache[mm_hash] = output
+        self.log_encoder_cache_memory("after_encoder")
 
     def _gather_mm_embeddings(
         self,

@@ -54,6 +54,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_USE_DEVICE_TENSOR: bool = True
     VLLM_RBLN_DISABLE_OFFLOAD: bool = True
     VLLM_RBLN_DISABLE_WORKER_FAIL_FAST: bool = False
+    VLLM_RBLN_LOG_ENCODER_CACHE_MEMORY: bool = False
     # Default follows VLLM_RBLN_USE_DEVICE_TENSOR (see use_auto_port), so it is
     # True unless device-tensor mode is explicitly disabled.
     VLLM_RBLN_AUTO_PORT: bool = True
@@ -285,6 +286,11 @@ environment_variables = {
         os.environ.get("VLLM_RBLN_DISABLE_WORKER_FAIL_FAST", "False").lower()
         in ("true", "1")
     ),
+    # Temporary diagnostics: synchronize and log MM cache memory at lifecycle edges.
+    "VLLM_RBLN_LOG_ENCODER_CACHE_MEMORY": lambda: (
+        os.environ.get("VLLM_RBLN_LOG_ENCODER_CACHE_MEMORY", "False").lower()
+        in ("true", "1")
+    ),
     # Auto port
     "VLLM_RBLN_AUTO_PORT": use_auto_port,
     # enforce model data type into fp32 not model_config.dtype
@@ -390,6 +396,7 @@ RBLN_COMPILE_ENV = frozenset(
 RBLN_NON_COMPILE_ENV = frozenset(
     {
         "VLLM_RBLN_DISABLE_WORKER_FAIL_FAST",
+        "VLLM_RBLN_LOG_ENCODER_CACHE_MEMORY",
         # sampler graphs compile with use_cache=False, never enter the bundle
         "VLLM_RBLN_SAMPLER",
         "VLLM_RBLN_COMPILE_STRICT_MODE",

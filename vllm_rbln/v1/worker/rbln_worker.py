@@ -490,6 +490,10 @@ class RBLNWorker(WorkerBase):
             if self.dynamic_kv.defers_kv_registration and has_kv_transfer_group():
                 self.model_runner.register_kv_caches_with_connector()
                 finalize_kv_cache_registrations(get_kv_transfer_group())
+            if envs.VLLM_RBLN_LOG_ENCODER_CACHE_MEMORY:
+                self.model_runner.log_encoder_cache_memory(
+                    "after_kv_resize", reset_peak=True
+                )
             return applied
 
     @worker_fail_fast
@@ -510,6 +514,10 @@ class RBLNWorker(WorkerBase):
                     self.model_runner.warmup_model()
                 if programs is not None:
                     self.dynamic_kv.record_programs(programs)
+                if envs.VLLM_RBLN_LOG_ENCODER_CACHE_MEMORY:
+                    self.model_runner.log_encoder_cache_memory(
+                        "after_warmup", reset_peak=True
+                    )
 
                 # Connectors that defer KV-cache registration (RBLN NIXL D2D
                 # and LMCache) finalize it here: the KV cache physical views
