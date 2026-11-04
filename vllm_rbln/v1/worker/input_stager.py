@@ -188,7 +188,9 @@ class InputStager:
         mask.zero_()
         mask[: layout.num_reqs, : layout.query_len].copy_(mm_mask, non_blocking=True)
         req_indices, token_indices = mm_mask.squeeze(-1).nonzero(as_tuple=True)
-        indices = req_indices * layout.query_len_padded + token_indices
+        indices = (req_indices * layout.query_len_padded + token_indices).to(
+            embeds.device
+        )
         offset = 0
         for rows in mm_embeds:
             count = rows.shape[0]
