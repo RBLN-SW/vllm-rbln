@@ -151,6 +151,8 @@ def test_runner_block_table_has_no_token_alignment_padding(
 
     block_table = runner.input_batch.block_table.block_tables[0].get_cpu_tensor()
     assert block_table.shape[1] == expected_width
+    assert runner.input_batch.block_table[0].slot_mapping.gpu.numel() == 4
+    assert runner.input_batch.token_ids_cpu.shape[1] == max_model_len
 
 
 def test_mask_block_table_fills_unused_slots_with_zero():
