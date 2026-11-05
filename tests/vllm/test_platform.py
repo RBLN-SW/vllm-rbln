@@ -626,12 +626,6 @@ class TestRejectedConfigs:
         [
             ("data parallelism", lambda c: _ranks(data_parallel_size=2)(c)),
             (
-                "speculative decoding",
-                lambda c: setattr(
-                    c, "speculative_config", SimpleNamespace(method="ngram")
-                ),
-            ),
-            (
                 "RBLN NIXL KV transfer",
                 lambda c: setattr(
                     c,
@@ -675,6 +669,15 @@ class TestRejectedConfigs:
 
         with pytest.raises(ValueError, match="RBLN NIXL KV transfer"):
             reconfigure(mutate)
+
+    def test_a_prefill_chunk_below_the_token_budget_takes_spec_decode(
+        self, reconfigure
+    ):
+        def mutate(config):
+            _prefill_chunk(64)(config)
+            config.speculative_config = SimpleNamespace(method="ngram")
+
+        reconfigure(mutate)
 
     def test_a_prefill_chunk_below_the_token_budget_takes_sub_block_caching(
         self, reconfigure

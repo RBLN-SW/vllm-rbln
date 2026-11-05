@@ -172,9 +172,9 @@ def _validate(vllm_config: "VllmConfig") -> None:
             f"--rbln-prefill-chunk-size={chunk} exceeds {max_num_batched_tokens=}."
         )
     # TODO(RBLN): DP ranks agree on max_num_batched_tokens as the prefill token
-    # dimension (dp_utils), and spec decode and the RBLN NIXL connector's resume
-    # trim take it as the prefill chunk. Lifting a refusal means pointing that
-    # feature's sites at prefill_chunk_size; #1372 lists them.
+    # dimension (dp_utils), and the RBLN NIXL connector's resume trim takes it
+    # as the prefill chunk. Lifting a refusal means pointing that feature's
+    # sites at prefill_chunk_size; #1372 lists them.
     if chunk is not None and chunk < max_num_batched_tokens:
         kv_transfer = vllm_config.kv_transfer_config
         connectors = [] if kv_transfer is None else [kv_transfer.kv_connector]
@@ -185,7 +185,6 @@ def _validate(vllm_config: "VllmConfig") -> None:
             name
             for name, on in (
                 ("data parallelism", parallel_config.data_parallel_size > 1),
-                ("speculative decoding", vllm_config.speculative_config is not None),
                 (
                     "RBLN NIXL KV transfer",
                     any(
@@ -345,7 +344,8 @@ def _validate_aux_hidden_states_pp_config(vllm_config: "VllmConfig") -> None:
     raise ValueError(
         f"A {vllm_config.speculative_config.method} draft consumes the target's "
         "auxiliary hidden states, and collecting them across pipeline stages "
-        "needs a per-architecture patch that this target does not have yet. "
+        "needs the target's forward to hand them on as the one combined tensor "
+        "this plugin reads, which this target's forward does not do yet. "
         "pipeline_parallel_size="
         f"{vllm_config.parallel_config.pipeline_parallel_size} is supported on "
         f"RBLN only for target architectures {sorted(AUX_PP_TARGET_ARCHS)}, but "

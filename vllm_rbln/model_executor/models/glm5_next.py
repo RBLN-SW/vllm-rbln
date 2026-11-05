@@ -81,6 +81,7 @@ from vllm.models.glm5next.common.multimodal import (
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import set_default_torch_dtype
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec, MLAAttentionSpec
 
 from vllm_rbln.model_executor.models.interfaces import SupportsRBLNMultiModal
@@ -683,6 +684,7 @@ class RBLNGlm5NextIndexer(nn.Module):
             key_table,
             self.topk,
             kpool=self.kpool,
+            null_block_id=NULL_BLOCK_ID,
         )
 
 
@@ -780,6 +782,7 @@ class RBLNGlm5NextDSA(nn.Module):
             cache_dtype=torch.float8_e4m3fn,
             kpool=self.indexer.kpool,
             is_prompt_sorted=metadata.is_prompt_sorted,
+            null_block_id=NULL_BLOCK_ID,
         )
         o = torch.matmul(o, w_uv.transpose(2, 3))  # [B, H, T, V]
         o = o.transpose(1, 2).reshape(batch, tokens, -1)
