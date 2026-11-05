@@ -203,6 +203,10 @@ class OptimumRBLNConfig(RBLNConfigBase):
     """`RBLNParams.image_prefill_chunk_size`, the image-prefill buckets
     (gemma3/gemma4) the scheduler pads against."""
 
+    compile_spec: dict[str, Any] | None = field(default=None, metadata=_DERIVED)
+    """Resolved model, dtype and optimum-rbln compile config shared by the cache
+    key and compilation. Runtime synchronization must not rewrite it."""
+
     cached_model_path: str | None = field(default=None, metadata=_DERIVED)
     """Where the compile cache holds, or will put, this model's artifact. Built
     from the fields above, so it cannot key the cache it names."""

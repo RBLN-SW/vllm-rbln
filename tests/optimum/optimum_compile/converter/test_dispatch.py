@@ -14,24 +14,50 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm_rbln.config import build_optimum_rbln_config
+from vllm_rbln.utils.optimum.converter import dispatch
 from vllm_rbln.utils.optimum.converter.dispatch import _generate_model_path_name
 
 
-def _vllm_config(user_max_num_batched_tokens=None, dtype=torch.bfloat16):
+@pytest.fixture(autouse=True)
+def compile_environment(monkeypatch, tmp_path):
+    monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path))
+    monkeypatch.setattr(dispatch, "load_compiled_rbln_config", lambda cfg: None)
+    monkeypatch.setattr(dispatch, "is_compiled_dir", lambda path: False)
+    monkeypatch.setattr(
+        "vllm_rbln.utils.optimum.converter.params._resolve_default_prefill_chunk_size",
+        lambda: 128,
+    )
+
+
+def _vllm_config(
+    user_max_num_batched_tokens=None, dtype=torch.bfloat16, *, prefix_caching=False
+):
     additional_config = {}
     if user_max_num_batched_tokens is not None:
         additional_config["user_max_num_batched_tokens"] = user_max_num_batched_tokens
-    return SimpleNamespace(
+    cfg = SimpleNamespace(
         model_config=SimpleNamespace(
-            model="meta-llama/Llama-3.1-8B", max_model_len=8192, dtype=dtype
+            model="meta-llama/Llama-3.1-8B",
+            max_model_len=8192,
+            dtype=dtype,
+            hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
         ),
-        scheduler_config=SimpleNamespace(max_num_seqs=4),
-        cache_config=SimpleNamespace(block_size=8192, gpu_memory_utilization=0.9),
+        scheduler_config=SimpleNamespace(max_num_seqs=4, max_num_batched_tokens=2048),
+        cache_config=SimpleNamespace(
+            block_size=8192,
+            gpu_memory_utilization=0.9,
+            user_specified_block_size=True,
+            enable_prefix_caching=prefix_caching,
+        ),
         additional_config=build_optimum_rbln_config(additional_config),
     )
+
+    dispatch.sync_vllm_and_optimum(cfg)
+    return cfg
 
 
 class TestGenerateModelPathName:
@@ -64,3 +90,40 @@ class TestGenerateModelPathName:
         assert _generate_model_path_name(_vllm_config()) != default
         monkeypatch.setenv("VLLM_RBLN_USE_NESTED_COMPILE_REGION", "0")
         assert _generate_model_path_name(_vllm_config()) == default
+
+    def test_default_and_explicit_chunk_share_the_compiled_artifact(self):
+        assert _generate_model_path_name(_vllm_config()) == _generate_model_path_name(
+            _vllm_config(128)
+        )
+
+    def test_key_survives_runtime_sync_and_model_path_replacement(self):
+        cfg = _vllm_config()
+        original = _generate_model_path_name(cfg)
+        cfg.model_config.model = cfg.additional_config.cached_model_path
+        cfg.cache_config.block_size = 128
+        cfg.scheduler_config.max_num_batched_tokens = 512
+        cfg.additional_config.optimum_overrides = {}
+        assert _generate_model_path_name(cfg) == original
+
+    def test_repeated_sync_preserves_the_resolved_spec(self):
+        cfg = _vllm_config()
+        spec = cfg.additional_config.compile_spec
+        path = cfg.additional_config.cached_model_path
+        dispatch.sync_vllm_and_optimum(cfg)
+        assert cfg.additional_config.compile_spec is spec
+        assert cfg.additional_config.cached_model_path == path
+
+    @pytest.mark.parametrize("key", ["device", "create_runtimes", "kvcache_num_blocks"])
+    def test_runtime_options_do_not_change_the_key(self, key):
+        cfg = _vllm_config()
+        original = _generate_model_path_name(cfg)
+        cfg.additional_config.compile_spec["rbln_config"][key] = 1
+        assert _generate_model_path_name(cfg) == original
+
+    def test_prefix_cache_sub_blocks_do_not_change_the_compiled_artifact(self):
+        cfg = _vllm_config(prefix_caching=True)
+        assert cfg.cache_config.block_size == 128
+        assert cfg.additional_config.attn_block_size == 8192
+        assert _generate_model_path_name(cfg) == _generate_model_path_name(
+            _vllm_config()
+        )

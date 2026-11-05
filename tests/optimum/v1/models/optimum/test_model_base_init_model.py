@@ -35,19 +35,14 @@ def _init_model_with(monkeypatch, tmp_path, hf_config) -> dict:
     class FakeRBLNModel:
         @classmethod
         def from_pretrained(cls, path, **kwargs):
+            passed["model"] = path
             passed.update(kwargs)
             return types.SimpleNamespace(
                 rbln_config=types.SimpleNamespace(), save_pretrained=lambda p: None
             )
 
     monkeypatch.setattr(
-        model_base.RBLNCompileSpec,
-        "for_architecture",
-        classmethod(
-            lambda cls, *a, **k: types.SimpleNamespace(
-                model_cls=FakeRBLNModel, rbln_config={}
-            )
-        ),
+        model_base.optimum.rbln, "FakeRBLNModel", FakeRBLNModel, raising=False
     )
     monkeypatch.setattr(model_base, "is_compiled_dir", lambda path: False)
     monkeypatch.setattr(model_base, "get_attn_block_size", lambda cfg: 4096)
@@ -65,13 +60,22 @@ def _init_model_with(monkeypatch, tmp_path, hf_config) -> dict:
     obj.vllm_config = types.SimpleNamespace(
         # What `check_and_update` leaves on the config, which is what
         # `init_model` reads its options off.
-        additional_config=OptimumRBLNConfig(cached_model_path=str(tmp_path)),
+        additional_config=OptimumRBLNConfig(
+            cached_model_path=str(tmp_path),
+            compile_spec={
+                "model": "compile-source",
+                "dtype": torch.bfloat16,
+                "model_cls": "FakeRBLNModel",
+                "rbln_config": {"prefill_chunk_size": 256},
+            },
+        ),
         model_config=obj.model_config,
         scheduler_config=obj.scheduler_config,
         cache_config=types.SimpleNamespace(gpu_memory_utilization=0.9),
         ec_transfer_config=None,
     )
     obj.init_model()
+    passed["compile_spec"] = obj.vllm_config.additional_config.compile_spec
     return passed
 
 
@@ -120,3 +124,15 @@ def test_transformers_config_is_forwarded_as_the_config_object(monkeypatch, tmp_
     assert passed["config"] is hf_config
     assert "text_config" not in passed
     assert "num_hidden_layers" not in passed
+
+
+def test_compilation_uses_the_spec_that_was_hashed(monkeypatch, tmp_path):
+    hf_config = types.SimpleNamespace(architectures=["Qwen3ForCausalLM"])
+    hf_config.get_text_config = lambda: types.SimpleNamespace(num_hidden_layers=2)
+    passed = _init_model_with(monkeypatch, tmp_path, hf_config)
+    assert passed["model"] == "compile-source"
+    assert passed["dtype"] == torch.bfloat16
+    assert passed["rbln_config"] == {"prefill_chunk_size": 256}
+
+    passed["rbln_config"]["prefill_chunk_size"] = 512
+    assert passed["compile_spec"]["rbln_config"]["prefill_chunk_size"] == 256

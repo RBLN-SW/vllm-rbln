@@ -15,6 +15,7 @@
 import hashlib
 import json
 import os
+from copy import deepcopy
 from typing import TYPE_CHECKING
 
 from vllm_rbln import envs
@@ -22,7 +23,6 @@ from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.logger import init_logger
 from vllm_rbln.utils.optimum.paths import is_compiled_dir
 
-from .common import get_user_max_num_batched_tokens
 from .from_optimum import sync_from_optimum
 from .from_vllm import sync_from_vllm
 from .params import load_compiled_rbln_config
@@ -59,40 +59,10 @@ def _strip_runtime_only_keys(obj: dict) -> dict:
 def _generate_model_path_name(
     vllm_config: VllmConfig,
 ) -> str:
-    # Just depends on user-provided parameters
-    model_name = str(vllm_config.model_config.model)
-    batch_size = vllm_config.scheduler_config.max_num_seqs
-    block_size = vllm_config.cache_config.block_size
-    max_model_len = vllm_config.model_config.max_model_len
     rbln_config: OptimumRBLNConfig = vllm_config.additional_config
-    num_devices = rbln_config.num_devices_per_local_rank
-    rbln_overrides = rbln_config.optimum_overrides
-    # The user's explicit max_num_batched_tokens becomes the compiled prefill
-    # chunk size (folded in by sync_from_vllm, which runs after this). Include
-    # the raw value so runs that would compile different binaries don't collide
-    # on the same cache key. `scheduler_config.max_num_batched_tokens` is still
-    # the vLLM default here, so read the raw user value instead.
-    user_max_num_batched_tokens = get_user_max_num_batched_tokens(vllm_config)
-    memory_budget = vllm_config.cache_config.gpu_memory_utilization
-
-    # FIXME: To avoid cache collisions, the cache key should also include
-    # the versions of the compiler and optimum-rbln.
-    config_dict = {
-        "model_name": model_name,
-        "batch_size": batch_size,
-        "block_size": block_size,
-        "max_model_len": max_model_len,
-        "num_devices": num_devices,
-        "dtype": str(vllm_config.model_config.dtype),
-        "max_num_batched_tokens": user_max_num_batched_tokens,
-        "memory_budget": memory_budget,
-    }
-    stripped_config = _strip_runtime_only_keys(rbln_overrides) if rbln_overrides else {}
-    if stripped_config:
-        config_dict["rbln_config"] = stripped_config
-
-    if envs.VLLM_RBLN_USE_NESTED_COMPILE_REGION:
-        config_dict["nested_compile_region"] = True
+    assert rbln_config.compile_spec is not None, "compile spec must be resolved first"
+    config_dict = _strip_runtime_only_keys(rbln_config.compile_spec)
+    model_name = str(config_dict["model"])
 
     config_json = json.dumps(config_dict, sort_keys=True, default=str)
     config_hash = hashlib.sha256(config_json.encode()).hexdigest()[:16]
@@ -115,12 +85,35 @@ def _resolve_rbln_config(vllm_config: VllmConfig) -> dict | None:
     if compiled_rbln_config is not None:
         return compiled_rbln_config
 
+    rbln_config: OptimumRBLNConfig = vllm_config.additional_config
+    if rbln_config.compile_spec is None:
+        from vllm_rbln.model_executor.models.optimum.compilation import RBLNCompileSpec
+        from vllm_rbln.utils.optimum.block_size import get_attn_block_size
+
+        resolved_config = deepcopy(vllm_config)
+        sync_from_vllm(resolved_config)
+        spec = RBLNCompileSpec.for_architecture(
+            resolved_config.model_config.hf_config,
+            batch_size=resolved_config.scheduler_config.max_num_seqs,
+            block_size=get_attn_block_size(resolved_config),
+            max_model_len=resolved_config.model_config.max_model_len,
+            num_devices=resolved_config.additional_config.num_devices_per_local_rank,
+            prefill_chunk_size=resolved_config.scheduler_config.max_num_batched_tokens,
+            memory_budget=resolved_config.cache_config.gpu_memory_utilization,
+            rbln_overrides=resolved_config.additional_config.optimum_overrides,
+        )
+        rbln_config.compile_spec = {
+            "model": str(resolved_config.model_config.model),
+            "dtype": resolved_config.model_config.dtype,
+            "model_cls": spec.model_cls.__name__,
+            "rbln_config": deepcopy(spec.rbln_config),
+        }
+
     cached_model_path = os.path.join(
         envs.VLLM_CACHE_ROOT,
         "compiled_models",
         _generate_model_path_name(vllm_config=vllm_config),
     )
-    rbln_config: OptimumRBLNConfig = vllm_config.additional_config
     rbln_config.cached_model_path = cached_model_path
     if is_compiled_dir(cached_model_path):
         logger.info("Found cached compiled model at %s", cached_model_path)
