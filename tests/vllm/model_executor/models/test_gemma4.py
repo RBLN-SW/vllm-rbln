@@ -104,6 +104,33 @@ def test_the_vision_encoder_matches_hfs(width, height):
     torch.testing.assert_close(got, expected, rtol=1e-4, atol=1e-4)
 
 
+def test_the_rotary_tables_are_built_once_not_per_image(monkeypatch):
+    # The encoder looks up HF's cos and sin for each patch in the graph, so the
+    # host computes none per image and the soft tokens stay HF's.
+    tower = _vision_tower()
+    model = _bare_model(
+        vision_tower=tower,
+        embed_vision=_Identity(),
+        model_dtype=torch.float32,
+        mm_encoder_buckets=[90],
+    )
+    first, second = _image(6, 3, num_patches=81), _image(3, 9, num_patches=81)
+    with torch.no_grad():
+        model._encode_vision(*first)
+        expected = tower(
+            pixel_values=second[0][None], pixel_position_ids=second[1][None]
+        ).last_hidden_state
+        monkeypatch.setattr(
+            tower.encoder.rotary_emb,
+            "forward",
+            Mock(side_effect=AssertionError("rotary computed per image")),
+        )
+
+        got = model._encode_vision(*second)
+
+    torch.testing.assert_close(got, expected, rtol=1e-4, atol=1e-4)
+
+
 def test_an_image_beyond_the_bucket_is_refused():
     model = _bare_model(
         vision_tower=_vision_tower(),
