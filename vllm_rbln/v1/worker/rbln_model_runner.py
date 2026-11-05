@@ -3612,10 +3612,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             ]
             if unsupported:
                 raise NotImplementedError(
-                    f"{', '.join(unsupported)} cannot move block-aux KV caches, "
-                    f"which {len(self.aux_kv_cache_specs)} layers of this model keep "
-                    "beside the KV cache: a transferred block would arrive without "
-                    "them."
+                    "Block-aux KV cache transfer is not supported by: "
+                    f"{', '.join(unsupported)}. "
+                    "Auxiliary caches must be transferred with their owners' blocks."
                 )
             for connector in connectors:
                 connector.register_block_aux_kv_caches(self.aux_kv_cache_specs)
