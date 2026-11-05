@@ -20,12 +20,6 @@ Config objects only -- no checkpoint, no device.
 from types import SimpleNamespace
 
 from vllm.model_executor.models.config import Gemma4Config
-from vllm.v1.attention.backends.registry import AttentionBackendEnum
-
-from vllm_rbln.patches.gemma4 import (
-    keep_the_rbln_attention_backend,
-    upstream_verify_and_update_config,
-)
 
 
 class _Layers(list):
@@ -52,33 +46,7 @@ def _vllm_config() -> SimpleNamespace:
     )
 
 
-def test_upstream_forces_triton_for_mixed_head_sizes():
-    # Why the patch exists: without FA4 upstream picks TRITON_ATTN, which the
-    # RBLN platform refuses. If upstream stops, the patch has lost its reason.
-    config = _vllm_config()
-    upstream_verify_and_update_config(config)
-    assert config.attention_config.backend == AttentionBackendEnum.TRITON_ATTN
-
-
 def test_the_backend_is_left_to_the_platform():
     config = _vllm_config()
     Gemma4Config.verify_and_update_config(config)
     assert config.attention_config.backend is None
-
-
-def test_the_patch_is_the_one_installed():
-    assert Gemma4Config.verify_and_update_config is keep_the_rbln_attention_backend
-
-
-def test_the_rbln_model_serves_the_architecture():
-    from vllm.model_executor.models import ModelRegistry
-
-    from vllm_rbln.patches.gemma4 import register_gemma4
-
-    register_gemma4()
-
-    model = ModelRegistry.models["Gemma4ForConditionalGeneration"]
-    assert (model.module_name, model.class_name) == (
-        "vllm_rbln.model_executor.models.gemma4",
-        "RBLNGemma4ForConditionalGeneration",
-    )

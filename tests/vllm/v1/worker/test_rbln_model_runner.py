@@ -427,7 +427,7 @@ def test_warmup_compiles_prefill_at_the_prefill_chunk_size():
     runner = _make_runner_stub(
         max_num_tokens=512,
         prefill_chunk_size=256,
-        mm_prefix_query_lens=[],
+        mm_prefix_query_len_buckets=[],
         speculative_config=None,
         bucketing_manager=SimpleNamespace(decode_batch_buckets=[1]),
         specialized_moe_decode=False,
@@ -2182,7 +2182,7 @@ class TestExecuteModelStampsMmPrefixSteps:
                 num_computed_tokens_cpu=np.array([computed], dtype=np.int32),
             ),
             requests={"r0": SimpleNamespace(mm_features=mm_features)},
-            mm_prefix_query_lens=[128, 256],
+            mm_prefix_query_len_buckets=[128, 256],
             cache_config=SimpleNamespace(kv_sharing_fast_prefill=False),
             speculative_config=None,
             is_pooling_model=False,
@@ -2251,7 +2251,7 @@ def test_warmup_compiles_one_prefill_per_mm_prefix_query_len():
     runner = _make_runner_stub(
         max_num_tokens=512,
         prefill_chunk_size=256,
-        mm_prefix_query_lens=[128, 384],
+        mm_prefix_query_len_buckets=[128, 384],
         speculative_config=None,
         bucketing_manager=SimpleNamespace(decode_batch_buckets=[1]),
         specialized_moe_decode=False,

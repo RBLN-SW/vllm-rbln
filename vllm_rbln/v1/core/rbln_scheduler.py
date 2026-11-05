@@ -151,14 +151,16 @@ class RBLNScheduler(Scheduler):
     def _mm_prefix_split(
         self, request: Request, num_computed_tokens: int, num_new_tokens: int
     ) -> int:
-        """Cut a prefill chunk on the request's mm prefix ranges.
+        """Tokens to schedule so that an mm prefix range runs as a step of its own.
 
-        A range attends to itself both ways, which a compiled graph can only do
-        over a step holding that range alone: a chunk starting a range is the
-        whole range, and any other chunk stops where the next range begins. A
-        prefix cache hit ending inside a range resumes it, and the step is the
-        rest of that range. A range step may run past the prefill chunk size, up
-        to the step budget; text chunks are capped at it.
+        A range attends to itself both ways, which a compiled graph can do only
+        when the step holds that range and nothing else. By where the step starts:
+
+        - inside a range: the rest of it, which is the whole range at its start
+          or what a prefix cache hit left of it. It may run past the prefill
+          chunk size, up to the step budget.
+        - before a range: text up to where the range begins, at most one chunk.
+        - past every range: text, at most one chunk.
         """
         for feature in request.mm_features:
             if feature.modality not in ("image", "video"):
