@@ -95,6 +95,7 @@ def _make_runner_stub(**attrs):
     runner.dp_status = None
     runner.supports_mm_inputs = False
     runner.is_mm_encoder_only = False
+    runner.ec_connector_output = None
     for key, value in attrs.items():
         setattr(runner, key, value)
     return runner

@@ -76,6 +76,7 @@ from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
     DraftTokenIds,
+    ECConnectorOutput,
     KVConnectorOutput,
     LogprobsLists,
     LogprobsTensors,
@@ -510,6 +511,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         # KV-connector output carried from execute_model() to sample_tokens()
         # (and across the PP / pooling / empty-batch paths).
         self.kv_connector_output: KVConnectorOutput | None = None
+        # The EC connector output of the step that loaded encoder outputs.
+        self.ec_connector_output: ECConnectorOutput | None = None
 
         # NOTE(RBLN): RBLN compiles a fixed decode-batch shape, so bucket to the
         # per-PP-stage decode batch (max_num_seqs // pp_size) -- the same ceiling
@@ -1424,10 +1427,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         }
 
         if self.supports_mm_inputs and is_prefill and get_pp_group().is_first_rank:
-            self._execute_mm_encoder(scheduler_output)
-            mm_embeds, mm_mask = self._gather_mm_embeddings(
-                scheduler_output, num_input_tokens
-            )
+            # An EC consumer loads the producer's encoder outputs on entry.
+            with self.maybe_get_ec_connector_output(
+                scheduler_output, encoder_cache=self.encoder_cache
+            ) as self.ec_connector_output:
+                self._execute_mm_encoder(scheduler_output)
+                mm_embeds, mm_mask = self._gather_mm_embeddings(
+                    scheduler_output, num_input_tokens
+                )
             model_kwargs["mm_embeds"], model_kwargs["mm_mask"] = (
                 self.input_stager.stage_mm_embeds(
                     mm_embeds.view(num_reqs, -1, mm_embeds.shape[-1]),
@@ -2356,7 +2363,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 prompt_logprobs_dict=prompt_logprobs_dict,
                 num_nans_in_logits=num_nans_in_logits,
                 kv_connector_output=kv_connector_output,
+                ec_connector_output=self.ec_connector_output,
             )
+            self.ec_connector_output = None
 
         if not self.use_async_scheduling:
             return output

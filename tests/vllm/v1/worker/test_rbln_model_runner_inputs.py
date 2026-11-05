@@ -30,6 +30,7 @@ from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorRole
 from vllm.distributed.ec_transfer.ec_connector.example_connector import (
     ECExampleConnector,
     ECExampleConnectorMetadata,
+    MMMeta,
 )
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
@@ -37,6 +38,7 @@ from vllm.multimodal.inputs import (
     MultiModalKwargsItem,
     PlaceholderRange,
 )
+from vllm.platforms import current_platform
 from vllm.v1.outputs import SamplerOutput
 
 import vllm_rbln.v1.worker.rbln_model_runner as mr
@@ -230,8 +232,8 @@ class TestGatherMultimodalEmbeddings:
 
 
 class TestEncoderCacheTransfer:
-    """An EC producer publishes what it encodes, through a real
-    ECExampleConnector on disk."""
+    """An EC producer publishes what it encodes, and a consumer prefills with
+    what the producer published, through a real ECExampleConnector on disk."""
 
     @staticmethod
     def _connector(monkeypatch, tmp_path, role: str) -> ECExampleConnector:
@@ -288,6 +290,40 @@ class TestEncoderCacheTransfer:
             tmp_path / "image-0" / "encoder_cache.safetensors"
         )["ec_cache"]
         torch.testing.assert_close(published, pixels[0] + 10)
+
+    def test_a_consumer_prefills_with_the_published_encoder_output(
+        self, make_model_runner, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(
+            mr,
+            "get_pp_group",
+            lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+        )
+        runner = make_model_runner()
+        hidden = runner.model_config.get_hidden_size()
+        published = torch.arange(2.0).unsqueeze(1).expand(-1, hidden) + 1
+        (tmp_path / "image-0").mkdir()
+        safetensors.torch.save_file(
+            {"ec_cache": published.contiguous()},
+            tmp_path / "image-0" / "encoder_cache.safetensors",
+        )
+        self._connector(monkeypatch, tmp_path, "ec_consumer")
+        # The example connector loads onto the platform's device type, which
+        # safetensors does not know as "rbln"; this runner gathers on the host.
+        monkeypatch.setattr(current_platform, "device_type", "cpu")
+        step = self._image_step(None, length=2)
+        step.ec_connector_metadata.add_mm_data(MMMeta.make_meta("image-0", 2))
+        runner._update_states(step)
+        runner.supports_mm_inputs = True
+        runner.is_prefill = True
+
+        _, model_kwargs = runner._preprocess(
+            step, 1, 1, 4, logits_indices=torch.tensor([3])
+        )
+
+        mm_embeds = model_kwargs["mm_embeds"].cpu().reshape(-1, hidden)[:4]
+        torch.testing.assert_close(mm_embeds[1:3], published.to(runner.dtype))
+        assert not mm_embeds[[0, 3]].any()
 
 
 class TestWarmupMultimodalEncoder:
