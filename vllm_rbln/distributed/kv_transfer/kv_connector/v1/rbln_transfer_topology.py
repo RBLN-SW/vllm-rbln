@@ -20,6 +20,8 @@ that substitutes it upstream can import it without pulling the whole connector
 package in at plugin load.
 """
 
+from dataclasses import dataclass
+
 import torch
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     EngineId,
@@ -37,6 +39,20 @@ from vllm.v1.kv_cache_interface import (
 def is_latent(layer_spec: KVCacheSpec) -> bool:
     """Whether a layer's cache is one key-only latent rather than K and V."""
     return isinstance(layer_spec, (MLAAttentionSpec, SlidingWindowMLASpec))
+
+
+@dataclass(frozen=True)
+class RblnBlockTransferSpec(KVCacheSpec):
+    """A blocks-first payload transferred whole, without token/head slicing.
+
+    Used only by the connector; the scheduler keeps the original state spec.
+    """
+
+    page_bytes: int
+
+    @property
+    def page_size_bytes(self) -> int:
+        return self.page_bytes
 
 
 class RblnTransferTopology(TransferTopology):
@@ -153,6 +169,8 @@ class RblnTransferTopology(TransferTopology):
     def get_transfer_cache_regions(
         self, cache: torch.Tensor, layer_spec: KVCacheSpec
     ) -> list[torch.Tensor] | torch.Tensor:
+        if isinstance(layer_spec, RblnBlockTransferSpec):
+            return [cache]
         if (
             self.is_mla
             or self.is_mamba

@@ -646,8 +646,14 @@ class TestMmEncoder:
         }[model_name]
         model = cls.__new__(cls)
         torch.nn.Module.__init__(model)
-        setattr(model, tower, types.SimpleNamespace(spatial_merge_size=1))
-        model._encoder_inputs = lambda pixels, grid: [pixels]
+        vision_model = types.SimpleNamespace(vision_segment_max_frames=None)
+        setattr(
+            model,
+            tower,
+            types.SimpleNamespace(spatial_merge_size=1, vision_model=vision_model),
+        )
+        # MiniMax-M3 also passes the modality.
+        model._encoder_inputs = lambda pixels, grid, *modality: [pixels]
         events = []
 
         class PendingOutput:

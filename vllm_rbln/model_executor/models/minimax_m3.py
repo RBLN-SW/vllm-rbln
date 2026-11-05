@@ -13,17 +13,19 @@
 # limitations under the License.
 
 import importlib.util
+import inspect
 import math
 import sys
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from itertools import islice
 from pathlib import Path
 from types import ModuleType
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
 from torch import nn
-from transformers import PretrainedConfig
+from transformers import BatchFeature, PretrainedConfig
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_pp_group,
@@ -76,6 +78,12 @@ from vllm.model_executor.models.utils import (
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+from vllm.transformers_utils.processors.minimax_m3 import (
+    MAX_RATIO,
+    MiniMaxM3VLImageProcessor,
+    MiniMaxM3VLVideoProcessor,
+    smart_resize,
+)
 from vllm.utils.torch_utils import (
     kv_cache_dtype_str_to_dtype,
     set_default_torch_dtype,
@@ -972,18 +980,124 @@ def _load_upstream_common(name: str) -> ModuleType:
 _mm_preprocess = _load_upstream_common("mm_preprocess")
 _vision_tower = _load_upstream_common("vision_tower")
 
+if TYPE_CHECKING:
+    from vllm.models.minimax_m3.common.mm_preprocess import (
+        MiniMaxM3VLMultiModalProcessor,
+        MiniMaxM3VLProcessingInfo,
+    )
+else:
+    MiniMaxM3VLProcessingInfo = _mm_preprocess.MiniMaxM3VLProcessingInfo
+    MiniMaxM3VLMultiModalProcessor = _mm_preprocess.MiniMaxM3VLMultiModalProcessor
 
-# Patches per image the compiled vision encoder takes: the model's largest image,
-# 1008 x 1008 px at patch_size 14 (a 72 x 72 grid).
-MM_ENCODER_PATCH_BUCKET = 5184
+
+_MIN_IMAGE_PIXELS = inspect.signature(smart_resize).parameters["min_pixels"].default
+
+
+def _max_frame_tokens(
+    processor: MiniMaxM3VLImageProcessor | MiniMaxM3VLVideoProcessor,
+    min_pixels: int,
+    max_total_pixels: int | None,
+) -> int:
+    factor = processor.patch_size * processor.merge_size
+    long_side = processor.max_long_side_pixel
+    if long_side is None:
+        minimum = min_pixels / factor**2
+        ratio = math.sqrt(MAX_RATIO)
+        enlarged = math.ceil(minimum + math.sqrt(minimum) * (ratio + 1 / ratio) + 1)
+        return max(processor.max_pixels // factor**2, enlarged)
+
+    side = max(1, math.floor(long_side / factor + 0.5))
+    short = max(1, math.floor(processor.min_short_side_pixel / factor + 0.5))
+    stretched = max(
+        1,
+        math.floor(
+            processor.min_short_side_pixel * min(MAX_RATIO, long_side) / factor + 0.5
+        ),
+    )
+    tokens = max(side**2, short * stretched)
+    if max_total_pixels is None:
+        return tokens
+    return min(tokens, max_total_pixels // factor**2)
+
+
+class _RBLNMiniMaxM3VLProcessingInfo(MiniMaxM3VLProcessingInfo):
+    def get_image_processor(self, **kwargs: object) -> MiniMaxM3VLImageProcessor:
+        kwargs = self.ctx.get_merged_mm_kwargs(kwargs, modality="image")
+        return super().get_image_processor(**kwargs)
+
+    def get_video_processor(self, **kwargs: object) -> MiniMaxM3VLVideoProcessor:
+        kwargs = self.ctx.get_merged_mm_kwargs(kwargs, modality="video")
+        return super().get_video_processor(**kwargs)
+
+    def get_max_image_tokens(self) -> int:
+        processor = self.get_image_processor()
+        return _max_frame_tokens(
+            processor, _MIN_IMAGE_PIXELS, processor.max_total_pixels
+        )
+
+    def get_max_video_frame_tokens(self) -> int:
+        processor = self.get_video_processor()
+        return _max_frame_tokens(processor, processor.min_pixels, None)
+
+    def get_num_video_tokens(
+        self,
+        *,
+        image_width: int,
+        image_height: int,
+        num_frames: int,
+        image_processor: MiniMaxM3VLVideoProcessor,
+        mm_kwargs: Mapping[str, object],
+    ) -> int:
+        processor = image_processor
+        factor = processor.patch_size * processor.merge_size
+        height, width = smart_resize(
+            image_height,
+            image_width,
+            factor=factor,
+            min_pixels=processor.min_pixels,
+            max_pixels=processor.max_pixels,
+            max_long_side_pixel=processor.max_long_side_pixel,
+            min_short_side_pixel=processor.min_short_side_pixel,
+            max_total_pixels=None,
+        )
+        t = (
+            num_frames + processor.temporal_patch_size - 1
+        ) // processor.temporal_patch_size
+        return t * height * width // factor**2
+
+
+class _RBLNMiniMaxM3VLMultiModalProcessor(MiniMaxM3VLMultiModalProcessor):
+    def _call_hf_processor(
+        self, hf_data: Mapping[str, object], hf_kwargs: Mapping[str, object]
+    ) -> BatchFeature:
+        outputs = super()._call_hf_processor(hf_data, hf_kwargs)
+
+        merge = self.info.get_image_processor().merge_size
+        for modality, max_frame_tokens in (
+            ("image", self.info.get_max_image_tokens),
+            ("video", self.info.get_max_video_frame_tokens),
+        ):
+            if f"{modality}_grid_thw" not in outputs:
+                continue
+            limit = max_frame_tokens() * merge**2
+            for grid in outputs[f"{modality}_grid_thw"].tolist():
+                if grid[1] * grid[2] > limit:
+                    raise ValueError(
+                        f"The {modality} grid {grid} has {grid[1] * grid[2]} patches "
+                        f"a frame, more than the {limit} the RBLN vision encoder is "
+                        "compiled for. Lower the request's resize limits, or raise "
+                        "the startup limits in --mm-processor-kwargs."
+                    )
+        return outputs
 
 
 class _RBLNVisionEncoder(nn.Module):
-    def __init__(self, tower: nn.Module):
+    def __init__(self, tower: nn.Module, out_dtype: torch.dtype):
         super().__init__()
         vm = tower.vision_model
         attn = vm.encoder.layers[0].self_attn
         self.tower = tower
+        self.out_dtype = out_dtype
         self.num_heads = attn.num_heads_per_partition
         self.head_dim = attn.head_dim
         w = vm.embeddings.patch_embedding.weight
@@ -1024,12 +1138,12 @@ class _RBLNVisionEncoder(nn.Module):
             mlp, _ = layer.fc2(layer.act(mlp))
             hidden = hidden + mlp
         hidden = self.tower.multi_modal_projector(hidden)
-        return self.tower.patch_merge_mlp(hidden)
+        return self.tower.patch_merge_mlp(hidden).to(self.out_dtype)
 
 
 @MULTIMODAL_REGISTRY.register_processor(
-    _mm_preprocess.MiniMaxM3VLMultiModalProcessor,
-    info=_mm_preprocess.MiniMaxM3VLProcessingInfo,
+    _RBLNMiniMaxM3VLMultiModalProcessor,
+    info=_RBLNMiniMaxM3VLProcessingInfo,
     dummy_inputs=_mm_preprocess.MiniMaxM3VLDummyInputsBuilder,
 )
 class RBLNMiniMaxM3SparseForConditionalGeneration(
@@ -1065,8 +1179,18 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         self.config = config
         self.quant_config = vllm_config.quant_config
         self.vision_tower = None
-
+        self.mm_encoder_patch_buckets: list[int] = []
+        self.mm_embeds_dtype = vllm_config.model_config.dtype
         mm_config = vllm_config.model_config.multimodal_config
+        if (
+            mm_config.get_limit_per_prompt("video") > 0
+            and config.vision_config.get("vision_segment_max_frames") is None
+        ):
+            raise ValueError(
+                "RBLN MiniMax-M3 video encoding does not support "
+                "vision_segment_max_frames=None. Disable video with "
+                "--limit-mm-per-prompt '{\"video\": 0}' to serve images or text."
+            )
         if get_pp_group().is_first_rank and any(
             mm_config.get_limit_per_prompt(m) > 0 for m in ("image", "video")
         ):
@@ -1080,6 +1204,28 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
                     quant_config=self.quant_config,
                     prefix=maybe_prefix(prefix, "vision_tower"),
                 )
+
+            info = MULTIMODAL_REGISTRY.create_processor(vllm_config.model_config).info
+            merge = info.get_image_processor().merge_size
+            bounds = []
+            if mm_config.get_limit_per_prompt("image") > 0:
+                bounds.append(info.get_max_image_tokens())
+            if mm_config.get_limit_per_prompt("video") > 0:
+                frames = self.vision_tower.vision_model.vision_segment_max_frames
+                bounds.append(frames * info.get_max_video_frame_tokens())
+
+            budgets = sorted(
+                vllm_config.additional_config.encoder_token_budgets
+            ) or sorted(set(bounds))
+            max_tokens = max(bounds)
+            if budgets[-1] < max_tokens:
+                raise ValueError(
+                    f"encoder_token_budgets {budgets} must reach "
+                    f"{max_tokens} output tokens, the processor's upper bound for "
+                    "an image or video segment. Add a budget that large, or lower "
+                    "the resize limits in --mm-processor-kwargs."
+                )
+            self.mm_encoder_patch_buckets = [b * merge**2 for b in budgets]
 
         object.__setattr__(self, "_mm_encoder", None)
 
@@ -1106,26 +1252,45 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
     def logits_processor(self) -> nn.Module:
         return self.language_model.logits_processor
 
+    def warmup_mm_encoder(self) -> None:
+        tower = self.vision_tower
+        if tower is None:
+            return
+        if self._mm_encoder is None:
+            self.compile_mm_encoder(lambda encoder: encoder)
+        assert self._mm_encoder is not None
+        vm = tower.vision_model
+        patch_dim = vm.embeddings.patch_embedding.weight[0].numel()
+        head_dim = vm.encoder.layers[0].self_attn.head_dim
+        device = next(tower.parameters()).device
+        with torch.inference_mode():
+            for bucket in self.mm_encoder_patch_buckets:
+                self._mm_encoder(
+                    torch.zeros(bucket, patch_dim, dtype=tower.dtype, device=device),
+                    torch.ones(bucket, head_dim, dtype=tower.dtype, device=device),
+                    torch.zeros(bucket, head_dim, dtype=tower.dtype, device=device),
+                    torch.zeros(1, 1, 1, bucket, dtype=tower.dtype, device=device),
+                )
+
     def compile_mm_encoder(self, compile_fn) -> None:
         # Non-first PP ranks and zero image/video limits own no vision tower.
         if self.vision_tower is None:
             return
-        encoder = _RBLNVisionEncoder(self.vision_tower).eval()
+        encoder = _RBLNVisionEncoder(self.vision_tower, self.mm_embeds_dtype).eval()
         object.__setattr__(self, "_mm_encoder", compile_fn(encoder))
 
     def _encoder_inputs(
-        self, pixel_values: torch.Tensor, grid_thw: list[int]
+        self, pixel_values: torch.Tensor, grid_thw: list[int], modality: str
     ) -> list[torch.Tensor]:
-        """Pad one image to the bucket and build its host 3D-RoPE and key mask."""
+        """Pad an image or a video segment to the bucket, and build its host
+        3D-RoPE and key mask."""
         tower = self.vision_tower
         assert tower is not None
         vm = tower.vision_model
-        bucket = MM_ENCODER_PATCH_BUCKET
         num_patches = math.prod(grid_thw)
-        assert num_patches <= bucket, (
-            f"an image of {num_patches} patches (grid {grid_thw}) exceeds the "
-            f"vision encoder's {bucket}-patch bucket"
-        )
+        fits = [b for b in self.mm_encoder_patch_buckets if b >= num_patches]
+        assert fits, f"a {modality} of {num_patches} patches (grid {grid_thw})"
+        bucket = fits[0]
         dtype = tower.dtype
         device = next(tower.parameters()).device
         patch_dim = vm.embeddings.patch_embedding.weight[0].numel()
@@ -1166,40 +1331,55 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         key_bias[..., num_patches:] = -30000.0
         return [x.to(device=device, dtype=dtype) for x in (padded, cos, sin, key_bias)]
 
-    def _encode_image(
-        self, pixel_values: torch.Tensor, grid_thw: list[int]
+    def _encode_item(
+        self, pixel_values: torch.Tensor, grid_thw: list[int], modality: str
     ) -> torch.Tensor:
-        assert self.vision_tower is not None and self._mm_encoder is not None
-        merge = self.vision_tower.spatial_merge_size
-        return rbln_utils.run_mm_encoder(
-            self._mm_encoder,
-            self._encoder_inputs(pixel_values, grid_thw),
-            math.prod(grid_thw) // (merge * merge),
-        )
+        tower = self.vision_tower
+        assert tower is not None and self._mm_encoder is not None
+        t, h, w = grid_thw
+        frames = tower.vision_model.vision_segment_max_frames
+        if frames is None:
+            frames = t
+        merge = tower.spatial_merge_size
+        segments = []
+        for start in range(0, t, frames):
+            seg_t = min(frames, t - start)
+            seg_pixels = pixel_values[start * h * w : (start + seg_t) * h * w]
+            segments.append(
+                rbln_utils.run_mm_encoder(
+                    self._mm_encoder,
+                    self._encoder_inputs(seg_pixels, [seg_t, h, w], modality),
+                    seg_t * h * w // (merge * merge),
+                )
+            )
+        return segments[0] if len(segments) == 1 else torch.cat(segments)
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
-        if "pixel_values_videos" in kwargs:
-            raise NotImplementedError(
-                "MiniMax-M3 video inputs are not supported on RBLN"
-            )
-        pixel_values = kwargs.get("pixel_values")
-        if pixel_values is None:
-            return ()
-        if self._mm_encoder is None:
-            # enforce_eager: the runner never calls compile_mm_encoder.
-            assert self.vision_tower is not None
-            encoder = _RBLNVisionEncoder(self.vision_tower).eval()
-            object.__setattr__(self, "_mm_encoder", encoder)
-        image_grid_thw = kwargs["image_grid_thw"]
-        assert isinstance(pixel_values, torch.Tensor)
-        assert isinstance(image_grid_thw, torch.Tensor)
-        grid_thw = image_grid_thw.tolist()
-        sizes = [math.prod(g) for g in grid_thw]
+        outputs: list[torch.Tensor] = []
         with torch.inference_mode():
-            return tuple(
-                self._encode_image(pv, g)
-                for pv, g in zip(pixel_values.split(sizes), grid_thw)
-            )
+            for key in kwargs:
+                if key == "pixel_values":
+                    modality = "image"
+                elif key == "pixel_values_videos":
+                    modality = "video"
+                else:
+                    continue
+                pixel_values = kwargs[key]
+                if pixel_values is None:
+                    continue
+                if self._mm_encoder is None:
+                    # enforce_eager: the runner never calls compile_mm_encoder.
+                    self.compile_mm_encoder(lambda encoder: encoder)
+                grid_thw = kwargs[f"{modality}_grid_thw"]
+                assert isinstance(pixel_values, torch.Tensor)
+                assert isinstance(grid_thw, torch.Tensor)
+                grids = grid_thw.tolist()
+                sizes = [math.prod(g) for g in grids]
+                outputs.extend(
+                    self._encode_item(pv, g, modality)
+                    for pv, g in zip(pixel_values.split(sizes), grids)
+                )
+        return tuple(outputs)
 
     def forward(
         self,
