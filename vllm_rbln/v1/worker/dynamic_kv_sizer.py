@@ -439,6 +439,7 @@ class DynamicKvSizer:
         """Per-chiplet bytes to keep out of the KV budget when the scheduler
         will run sub-block prefix caching."""
         rbln_config = self.vllm_config.additional_config
+        assert rbln_config.prefill_chunk_size is not None  # resolved at start-up
         in_use = sub_block_size_in_use(
             enable_prefix_caching=self.cache_config.enable_prefix_caching,
             sub_block_cache=rbln_config.enable_sub_block_cache,
