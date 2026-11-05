@@ -34,9 +34,13 @@ def compile_environment(monkeypatch, tmp_path):
 
 
 def _vllm_config(
-    user_max_num_batched_tokens=None, dtype=torch.bfloat16, *, prefix_caching=False
+    user_max_num_batched_tokens=None,
+    dtype=torch.bfloat16,
+    *,
+    prefix_caching=False,
+    optimum_overrides=None,
 ):
-    additional_config = {}
+    additional_config = {"optimum_overrides": optimum_overrides or {}}
     if user_max_num_batched_tokens is not None:
         additional_config["user_max_num_batched_tokens"] = user_max_num_batched_tokens
     cfg = SimpleNamespace(
@@ -126,4 +130,31 @@ class TestGenerateModelPathName:
         assert cfg.additional_config.attn_block_size == 8192
         assert _generate_model_path_name(cfg) == _generate_model_path_name(
             _vllm_config()
+        )
+
+    @pytest.mark.parametrize(
+        ("user_tokens", "overrides", "expected"),
+        [
+            (None, {}, 128),
+            (None, {"prefill_chunk_size": 256}, 256),
+            (512, {}, 512),
+            (512, {"prefill_chunk_size": 512}, 512),
+        ],
+    )
+    def test_chunk_size_is_resolved_before_cache_lookup(
+        self, monkeypatch, user_tokens, overrides, expected
+    ):
+        observed = []
+
+        def generate_name(vllm_config):
+            observed.append(vllm_config.scheduler_config.max_num_batched_tokens)
+            return _generate_model_path_name(vllm_config)
+
+        monkeypatch.setattr(dispatch, "_generate_model_path_name", generate_name)
+        cfg = _vllm_config(user_tokens, optimum_overrides=overrides)
+        assert observed == [expected]
+        assert cfg.scheduler_config.max_num_batched_tokens == expected
+        assert (
+            cfg.additional_config.compile_spec["rbln_config"]["prefill_chunk_size"]
+            == expected
         )

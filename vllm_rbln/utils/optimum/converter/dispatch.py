@@ -23,9 +23,14 @@ from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.logger import init_logger
 from vllm_rbln.utils.optimum.paths import is_compiled_dir
 
+from .common import (
+    apply_user_prefill_chunk_size,
+    is_chunked_prefill_arch,
+    update_max_num_batched_tokens,
+)
 from .from_optimum import sync_from_optimum
 from .from_vllm import sync_from_vllm
-from .params import load_compiled_rbln_config
+from .params import RBLNParams, load_compiled_rbln_config
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -89,6 +94,17 @@ def _resolve_rbln_config(vllm_config: VllmConfig) -> dict | None:
     if rbln_config.compile_spec is None:
         from vllm_rbln.model_executor.models.optimum.compilation import RBLNCompileSpec
         from vllm_rbln.utils.optimum.block_size import get_attn_block_size
+
+        if is_chunked_prefill_arch(vllm_config.model_config.hf_config):
+            overrides = rbln_config.optimum_overrides
+            params = RBLNParams.from_rbln_config(vllm_config, overrides)
+            apply_user_prefill_chunk_size(
+                vllm_config,
+                params,
+                precompiled=False,
+                override_prefill_chunk_size=overrides.get("prefill_chunk_size"),
+            )
+            update_max_num_batched_tokens(vllm_config, params)
 
         resolved_config = deepcopy(vllm_config)
         sync_from_vllm(resolved_config)
