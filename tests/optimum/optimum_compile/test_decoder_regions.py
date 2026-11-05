@@ -16,7 +16,7 @@ import pytest
 from optimum.rbln import RBLNAutoModelForCausalLM
 from transformers import GptOssConfig, PretrainedConfig, Qwen3Config
 
-from vllm_rbln.model_executor.models.optimum.compilation import RBLNCompileSpec
+from vllm_rbln.utils.optimum.compilation import RBLNCompileSpec
 
 
 @pytest.mark.parametrize("enabled", [False, True])

@@ -27,7 +27,7 @@ from .common import (
     update_block_size,
     update_max_num_batched_tokens,
 )
-from .params import RBLNParams
+from .params import RBLNParams, _resolve_num_devices
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -37,14 +37,8 @@ else:
 logger = init_logger(__name__)
 
 
-def sync_from_vllm(vllm_config: VllmConfig) -> None:
-    """
-    vllm_config.additional_config.optimum_overrides -> optimum
-    1. Parse RBLNParams from vllm_config.additional_config.optimum_overrides.
-    2. Update vllm_config based on the parsed RBLNParams
-    to ensure consistency between vLLM and RBLN configurations.
-    3. Validate the updated block size
-    """
+def sync_from_vllm(vllm_config: VllmConfig) -> RBLNParams:
+    """Resolve compile inputs and synchronize block sizes."""
     rbln_config: OptimumRBLNConfig = vllm_config.additional_config
     rbln_overrides = rbln_config.optimum_overrides
     params = RBLNParams.from_rbln_config(vllm_config, rbln_overrides)
@@ -69,6 +63,20 @@ def sync_from_vllm(vllm_config: VllmConfig) -> None:
             params.max_seq_len,
         )
         vllm_config.model_config.max_model_len = params.max_seq_len
+    params.num_devices = _resolve_num_devices(
+        rbln_overrides, default=rbln_config.num_devices_per_local_rank
+    )
+    rbln_config.num_devices_per_local_rank = params.num_devices
+
+    apply_user_prefill_chunk_size(
+        vllm_config,
+        params,
+        precompiled=False,
+        override_prefill_chunk_size=rbln_overrides.get("prefill_chunk_size"),
+    )
+
+    update_max_num_batched_tokens(vllm_config, params)
+
     if params.kvcache_block_size is not None:
         logger.info(
             "Setting block_size to %d based on additional_config.optimum_overrides",
@@ -98,22 +106,24 @@ def sync_from_vllm(vllm_config: VllmConfig) -> None:
             "`additional_config={'rbln_config': {...}}`.\n"
         )
 
-    apply_user_prefill_chunk_size(
-        vllm_config,
-        params,
-        precompiled=False,
-        override_prefill_chunk_size=rbln_overrides.get("prefill_chunk_size"),
-    )
+    if params.kvcache_block_size is None:
+        params.kvcache_block_size = (
+            rbln_config.attn_block_size
+            if vllm_config.cache_config.enable_prefix_caching
+            and rbln_config.attn_block_size is not None
+            else vllm_config.cache_config.block_size
+        )
+    assert params.kvcache_block_size is not None
 
     # Persist the image-prefill buckets (gemma3/gemma4) into additional_config.
     store_image_prefill_chunk_size(vllm_config, params.image_prefill_chunk_size)
     update_block_size(
         vllm_config,
-        vllm_config.cache_config.block_size,
+        params.kvcache_block_size,
         prefill_chunk_size=params.prefill_chunk_size,
         image_prefill_chunk_size=params.image_prefill_chunk_size,
     )
 
-    # Set max_num_batched_tokens: the prefill chunk size for decoder/multimodal
-    # models, or a full-prefill-plus-batch budget for enc-dec/pooling models.
-    update_max_num_batched_tokens(vllm_config, params)
+    params.batch_size = vllm_config.scheduler_config.max_num_seqs
+    params.max_seq_len = vllm_config.model_config.max_model_len
+    return params

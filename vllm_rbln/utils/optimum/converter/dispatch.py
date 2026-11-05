@@ -23,11 +23,6 @@ from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.logger import init_logger
 from vllm_rbln.utils.optimum.paths import is_compiled_dir
 
-from .common import (
-    apply_user_prefill_chunk_size,
-    is_chunked_prefill_arch,
-    update_max_num_batched_tokens,
-)
 from .from_optimum import sync_from_optimum
 from .from_vllm import sync_from_vllm
 from .params import RBLNParams, load_compiled_rbln_config
@@ -76,51 +71,30 @@ def _generate_model_path_name(
     return f"{sanitized_name}_{config_hash}"
 
 
-def _resolve_rbln_config(vllm_config: VllmConfig) -> dict | None:
-    """Locate a compiled ``rbln_config.json`` for this vLLM config.
-
-    1. pre-compiled path (user passed an already-compiled directory)
-    2. cache hit (hashed path already contains a compiled artifact)
-    3. cache miss (compilation still needed; stages `cached_model_path`)
-    """
-    try:
-        compiled_rbln_config = load_compiled_rbln_config(vllm_config)
-    except Exception as e:
-        raise RuntimeError("Failed to get RBLN config: %s", e) from e
-    if compiled_rbln_config is not None:
-        return compiled_rbln_config
-
+def _resolve_cached_rbln_config(
+    vllm_config: VllmConfig, compile_params: RBLNParams
+) -> dict | None:
+    """Locate a cached artifact after synchronizing the compile inputs."""
     rbln_config: OptimumRBLNConfig = vllm_config.additional_config
     if rbln_config.compile_spec is None:
-        from vllm_rbln.model_executor.models.optimum.compilation import RBLNCompileSpec
-        from vllm_rbln.utils.optimum.block_size import get_attn_block_size
+        from vllm_rbln.utils.optimum.compilation import RBLNCompileSpec
 
-        if is_chunked_prefill_arch(vllm_config.model_config.hf_config):
-            overrides = rbln_config.optimum_overrides
-            params = RBLNParams.from_rbln_config(vllm_config, overrides)
-            apply_user_prefill_chunk_size(
-                vllm_config,
-                params,
-                precompiled=False,
-                override_prefill_chunk_size=overrides.get("prefill_chunk_size"),
-            )
-            update_max_num_batched_tokens(vllm_config, params)
-
-        resolved_config = deepcopy(vllm_config)
-        sync_from_vllm(resolved_config)
+        assert compile_params.batch_size is not None
+        assert compile_params.max_seq_len is not None
+        assert compile_params.kvcache_block_size is not None
         spec = RBLNCompileSpec.for_architecture(
-            resolved_config.model_config.hf_config,
-            batch_size=resolved_config.scheduler_config.max_num_seqs,
-            block_size=get_attn_block_size(resolved_config),
-            max_model_len=resolved_config.model_config.max_model_len,
-            num_devices=resolved_config.additional_config.num_devices_per_local_rank,
-            prefill_chunk_size=resolved_config.scheduler_config.max_num_batched_tokens,
-            memory_budget=resolved_config.cache_config.gpu_memory_utilization,
-            rbln_overrides=resolved_config.additional_config.optimum_overrides,
+            vllm_config.model_config.hf_config,
+            batch_size=compile_params.batch_size,
+            block_size=compile_params.kvcache_block_size,
+            max_model_len=compile_params.max_seq_len,
+            num_devices=compile_params.num_devices,
+            prefill_chunk_size=compile_params.prefill_chunk_size,
+            memory_budget=vllm_config.cache_config.gpu_memory_utilization,
+            rbln_overrides=rbln_config.optimum_overrides,
         )
         rbln_config.compile_spec = {
-            "model": str(resolved_config.model_config.model),
-            "dtype": resolved_config.model_config.dtype,
+            "model": str(vllm_config.model_config.model),
+            "dtype": vllm_config.model_config.dtype,
             "model_cls": spec.model_cls.__name__,
             "rbln_config": deepcopy(spec.rbln_config),
         }
@@ -145,8 +119,12 @@ def sync_vllm_and_optimum(vllm_config: VllmConfig) -> None:
     If a compiled model exists, it is the source of truth (optimum→vllm).
     Otherwise stage user overrides for the upcoming compile (vllm→optimum).
     """
-    compiled_rbln_config = _resolve_rbln_config(vllm_config)
-    if compiled_rbln_config is None:
-        sync_from_vllm(vllm_config)
-    else:
-        sync_from_optimum(vllm_config, compiled_rbln_config)
+    compiled_config = load_compiled_rbln_config(vllm_config)
+    if compiled_config is not None:
+        sync_from_optimum(vllm_config, compiled_config)
+        return
+
+    compile_params = sync_from_vllm(vllm_config)
+    cached_config = _resolve_cached_rbln_config(vllm_config, compile_params)
+    if cached_config is not None:
+        sync_from_optimum(vllm_config, cached_config)

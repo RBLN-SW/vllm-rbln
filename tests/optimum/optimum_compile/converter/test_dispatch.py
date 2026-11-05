@@ -20,6 +20,7 @@ import torch
 from vllm_rbln.config import build_optimum_rbln_config
 from vllm_rbln.utils.optimum.converter import dispatch
 from vllm_rbln.utils.optimum.converter.dispatch import _generate_model_path_name
+from vllm_rbln.utils.optimum.converter.params import RBLNParams
 
 
 @pytest.fixture(autouse=True)
@@ -39,8 +40,12 @@ def _vllm_config(
     *,
     prefix_caching=False,
     optimum_overrides=None,
+    num_devices_per_local_rank=1,
 ):
-    additional_config = {"optimum_overrides": optimum_overrides or {}}
+    additional_config = {
+        "optimum_overrides": optimum_overrides or {},
+        "num_devices_per_local_rank": num_devices_per_local_rank,
+    }
     if user_max_num_batched_tokens is not None:
         additional_config["user_max_num_batched_tokens"] = user_max_num_batched_tokens
     cfg = SimpleNamespace(
@@ -158,3 +163,76 @@ class TestGenerateModelPathName:
             cfg.additional_config.compile_spec["rbln_config"]["prefill_chunk_size"]
             == expected
         )
+
+    @pytest.mark.parametrize(
+        ("dtype", "devices", "device_overrides", "expected_devices"),
+        [
+            (torch.bfloat16, 2, {}, 2),
+            (torch.bfloat16, 1, {"num_devices": 4}, 4),
+            (torch.float32, 3, {}, 3),
+        ],
+    )
+    def test_compile_inputs_are_resolved_before_cache_lookup(
+        self, monkeypatch, dtype, devices, device_overrides, expected_devices
+    ):
+        observed = []
+
+        def generate_name(vllm_config):
+            observed.append(
+                (
+                    vllm_config.scheduler_config.max_num_seqs,
+                    vllm_config.model_config.max_model_len,
+                    vllm_config.model_config.dtype,
+                    vllm_config.additional_config.num_devices_per_local_rank,
+                )
+            )
+            return _generate_model_path_name(vllm_config)
+
+        monkeypatch.setattr(dispatch, "_generate_model_path_name", generate_name)
+        cfg = _vllm_config(
+            dtype=dtype,
+            num_devices_per_local_rank=devices,
+            optimum_overrides={
+                "batch_size": 2,
+                "max_seq_len": 4096,
+                "kvcache_block_size": 4096,
+                **device_overrides,
+            },
+        )
+        assert observed == [(2, 4096, dtype, expected_devices)]
+        spec = cfg.additional_config.compile_spec
+        assert spec["dtype"] == dtype
+        assert (
+            spec["rbln_config"]["batch_size"] == cfg.scheduler_config.max_num_seqs == 2
+        )
+        assert (
+            spec["rbln_config"]["max_seq_len"] == cfg.model_config.max_model_len == 4096
+        )
+        assert spec["rbln_config"]["num_devices"] == expected_devices
+        assert cfg.additional_config.num_devices_per_local_rank == expected_devices
+
+    @pytest.mark.parametrize("prefix_caching", [False, True])
+    def test_compile_inputs_are_parsed_once(self, monkeypatch, prefix_caching):
+        parsed = []
+        parse = RBLNParams.from_rbln_config
+
+        def capture_params(cls, *args, **kwargs):
+            params = parse(*args, **kwargs)
+            parsed.append(params)
+            return params
+
+        monkeypatch.setattr(RBLNParams, "from_rbln_config", classmethod(capture_params))
+        cfg = _vllm_config(prefix_caching=prefix_caching)
+        assert len(parsed) == 1
+        spec = cfg.additional_config.compile_spec["rbln_config"]
+        assert spec["batch_size"] == parsed[0].batch_size
+        assert spec["max_seq_len"] == parsed[0].max_seq_len
+        assert spec["num_devices"] == parsed[0].num_devices
+        assert spec["prefill_chunk_size"] == parsed[0].prefill_chunk_size
+        assert parsed[0].kvcache_block_size == 8192
+
+    def test_repeated_sync_preserves_the_attention_block_size(self):
+        cfg = _vllm_config(prefix_caching=True)
+        dispatch.sync_vllm_and_optimum(cfg)
+        assert cfg.additional_config.attn_block_size == 8192
+        assert cfg.cache_config.block_size == 128

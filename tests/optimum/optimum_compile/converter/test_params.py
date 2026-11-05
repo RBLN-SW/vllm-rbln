@@ -17,7 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm_rbln.model_executor.models.optimum.compilation.multimodal.qwen import (
+from vllm_rbln.utils.optimum.compilation.multimodal.qwen import (
     get_param_qwen3_5,
 )
 from vllm_rbln.utils.optimum.converter.params import (
