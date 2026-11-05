@@ -21,6 +21,7 @@ from typing import Any
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.utils.hashing import get_hash_fn_by_name
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import init_none_hash
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
@@ -129,6 +130,21 @@ class RBLNScheduler(Scheduler):
         # ceil(demand / pp) to spread decodes across microbatches. pp == 1 makes
         # the soft cap a no-op. See v1/core/utils.py.
         self._pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
+
+        self._prefill_chunk_size = rbln_config.prefill_chunk_size
+
+        # NOTE(RBLN): the sparse-attention ops (DSA MLA / indexer, MiniMax-M3
+        # MSA / indexer, GLM5 MLA / indexer) get NULL_BLOCK_ID as null_block_id
+        # and write their context-parallel cache store's unowned rows there, so
+        # the block the pool reserves has to be that one. Checked once the KV
+        # cache manager is final (it may be swapped above).
+        null_block_id = self.kv_cache_manager.block_pool.null_block.block_id
+        if null_block_id != NULL_BLOCK_ID:
+            raise RuntimeError(
+                f"vLLM's null block is {null_block_id}, not NULL_BLOCK_ID "
+                f"({NULL_BLOCK_ID}); the RBLN sparse-attention cache store writes "
+                "to NULL_BLOCK_ID and would corrupt a live block."
+            )
 
     def _decode_demand(self) -> int:
         """Total decode demand for this step's soft (ceil(demand/pp)) cap.
@@ -285,7 +301,7 @@ class RBLNScheduler(Scheduler):
                 continue
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
-            num_new_tokens = min(num_new_tokens, token_budget)
+            num_new_tokens = min(num_new_tokens, self._prefill_chunk_size, token_budget)
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
@@ -632,6 +648,7 @@ class RBLNScheduler(Scheduler):
                     threshold = self.scheduler_config.long_prefill_token_threshold
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
+                    num_new_tokens = min(num_new_tokens, self._prefill_chunk_size)
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked

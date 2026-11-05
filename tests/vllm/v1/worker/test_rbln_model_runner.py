@@ -454,6 +454,20 @@ def test_multimodal_warmup_keys_the_bundle_on_the_encoder_buckets(monkeypatch, b
     cache.load.assert_called_once_with("m3", expected)
     cache.save.assert_called_once_with("m3", expected)
     runner._warmup_mm_encoder.assert_called_once_with()
+def test_warmup_compiles_prefill_at_the_prefill_chunk_size():
+    calls = []
+    runner = _make_runner_stub(
+        max_num_tokens=512,
+        prefill_chunk_size=256,
+        speculative_config=None,
+        bucketing_manager=SimpleNamespace(decode_batch_buckets=[1]),
+        specialized_moe_decode=False,
+        _dummy_run=lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    runner.run_model_graphs()
+
+    assert calls[0] == ((1, 256, True), {})
 
 
 @pytest.mark.parametrize("num_reqs", [1, 2])
@@ -1309,6 +1323,8 @@ class TestUpdateStates:
             requests=requests if requests is not None else {},
             num_prompt_logprobs={},
             prompt_token_arrays={},
+            num_accepted_tokens_by_req={},
+            state_pos_by_req={},
             is_pooling_model=False,
             sort_batch_by_length=False,
             kv_cache_config=SimpleNamespace(kv_cache_groups=[]),

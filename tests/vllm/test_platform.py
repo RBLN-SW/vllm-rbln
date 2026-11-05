@@ -411,6 +411,17 @@ class TestPlatformIdentity:
         }
 
 
+def _as_glm5_next(config: VllmConfig) -> None:
+    """GLM-5.3's text config on the test model: its KDA heads and MLA latent."""
+    text_config = config.model_config.hf_text_config
+    text_config.model_type = "glm5_next_text"
+    text_config.linear_num_heads = 64
+    text_config.linear_head_dim = 128
+    text_config.kv_lora_rank = 512
+    config.model_config.dtype = torch.bfloat16
+    config.cache_config.cache_dtype = "fp8"
+
+
 class TestRejectedConfigs:
     @pytest.mark.parametrize(
         ("block_size", "max_num_batched_tokens", "invalid_block_size"),
@@ -474,6 +485,88 @@ class TestRejectedConfigs:
                 reconfigure(msa(dtype))
         reconfigure(msa(torch.bfloat16))
 
+    def test_glm5_next_configs(self, reconfigure):
+        def glm5_next(*, cache_dtype="fp8", spec=None, tp=1, **cache):
+            def mutate(config):
+                _as_glm5_next(config)
+                config.cache_config.cache_dtype = cache_dtype
+                config.speculative_config = spec
+                config.parallel_config.tensor_parallel_size = tp
+                for name, value in cache.items():
+                    setattr(config.cache_config, name, value)
+
+            return mutate
+
+        def spec(method, num_speculative_tokens):
+            return SimpleNamespace(
+                method=method, num_speculative_tokens=num_speculative_tokens
+            )
+
+        reconfigure(glm5_next())
+        reconfigure(glm5_next(spec=spec("mtp", 5)))
+        with pytest.raises(ValueError, match="--kv-cache-dtype fp8"):
+            reconfigure(glm5_next(cache_dtype="auto"))
+        for method, num_speculative_tokens in (("mtp", 6), ("ngram", 1)):
+            with pytest.raises(ValueError, match="MTP head"):
+                reconfigure(glm5_next(spec=spec(method, num_speculative_tokens)))
+        block_size = _build().cache_config.block_size
+        with pytest.raises(ValueError, match="a KDA state a KV block"):
+            reconfigure(
+                glm5_next(
+                    enable_prefix_caching=True,
+                    user_specified_mamba_block_size=True,
+                    mamba_block_size=2 * block_size,
+                )
+            )
+        with pytest.raises(ValueError, match="whole KV blocks"):
+            reconfigure(
+                glm5_next(enable_prefix_caching=True, prefix_match_unit=block_size // 2)
+            )
+
+        reconfigure(glm5_next(tp=4, block_size=1024))
+        for tp, block_size in ((4, 2048), (1, 8192), (1, 192), (1, 160)):
+            with pytest.raises(ValueError, match="whole KDA head states"):
+                reconfigure(glm5_next(tp=tp, block_size=block_size))
+
+        def bf16_forced_to_fp32(config):
+            glm5_next(block_size=8192)(config)
+            config.additional_config = replace(
+                config.additional_config, enforce_model_fp32=True
+            )
+
+        reconfigure(bf16_forced_to_fp32)
+        if platform.USE_DEVICE_TENSOR:
+
+            def fp32_forced_to_fp16(config):
+                glm5_next(block_size=8192)(config)
+                config.model_config.dtype = torch.float32
+                config.model_config.enforce_eager = True
+
+            with pytest.raises(ValueError, match="whole KDA head states"):
+                reconfigure(fp32_forced_to_fp16)
+
+    def test_glm5_next_prefix_caching_with_mtp_needs_retention_0(self, reconfigure):
+        # A KDA verify step leaves no state at the end of a block it crossed, so
+        # only retention 0 (states a prefill stored) keeps prefix caching on.
+        def glm5_next_mtp(retention):
+            def mutate(config):
+                _as_glm5_next(config)
+                config.cache_config.enable_prefix_caching = True
+                # What MambaModelConfig sets up for prefix caching before the hook.
+                config.cache_config.mamba_cache_mode = "align"
+                config.cache_config.prefix_cache_retention_interval = retention
+                config.speculative_config = SimpleNamespace(
+                    method="mtp", num_speculative_tokens=1
+                )
+
+            return mutate
+
+        assert reconfigure(glm5_next_mtp(0)).cache_config.enable_prefix_caching
+        config = reconfigure(glm5_next_mtp(1))
+        assert not config.cache_config.enable_prefix_caching
+        assert config.cache_config.mamba_cache_mode == "none"
+        assert config.cache_config.mamba_block_size == config.model_config.max_model_len
+
     def test_mrope_models_are_rejected(self, reconfigure, monkeypatch):
         from vllm.config import ModelConfig
 
@@ -512,6 +605,95 @@ class TestRejectedConfigs:
     def test_dp_needs_a_divisible_token_budget(self, reconfigure):
         with pytest.raises(ValueError, match="divisible"):
             reconfigure(_ranks(data_parallel_size=2, max_num_seqs=5))
+
+    def test_a_prefill_chunk_above_the_token_budget_is_refused(self, reconfigure):
+        with pytest.raises(ValueError, match="exceeds"):
+            reconfigure(_prefill_chunk(256))
+
+    def test_an_unset_prefill_chunk_resolves_to_the_token_budget(self, reconfigure):
+        config = reconfigure(lambda config: None)
+        assert (
+            config.additional_config.prefill_chunk_size
+            == config.scheduler_config.max_num_batched_tokens
+        )
+
+    def test_a_prefill_chunk_below_the_token_budget_is_taken(self, reconfigure):
+        config = reconfigure(_prefill_chunk(64))
+        assert config.additional_config.prefill_chunk_size == 64
+
+    @pytest.mark.parametrize(
+        "feature, enable",
+        [
+            ("data parallelism", lambda c: _ranks(data_parallel_size=2)(c)),
+            (
+                "sub-block prefix caching",
+                lambda c: setattr(c.cache_config, "enable_prefix_caching", True),
+            ),
+            (
+                "RBLN NIXL KV transfer",
+                lambda c: setattr(
+                    c,
+                    "kv_transfer_config",
+                    SimpleNamespace(
+                        kv_connector="RblnNixlPushConnector",
+                        kv_connector_extra_config={},
+                    ),
+                ),
+            ),
+        ],
+    )
+    def test_a_prefill_chunk_below_the_token_budget_refuses(
+        self, reconfigure, feature, enable
+    ):
+        def mutate(config):
+            _prefill_chunk(64)(config)
+            enable(config)
+
+        with pytest.raises(ValueError, match=feature):
+            reconfigure(mutate)
+
+    @pytest.mark.parametrize(
+        "kv_connector, extra",
+        [
+            ("RblnNixlConnector", {}),
+            (
+                "MultiConnector",
+                {"connectors": [{"kv_connector": "RblnNixlPullConnector"}]},
+            ),
+        ],
+    )
+    def test_a_prefill_chunk_below_the_token_budget_refuses_a_nixl_connector(
+        self, reconfigure, kv_connector, extra
+    ):
+        def mutate(config):
+            _prefill_chunk(64)(config)
+            config.kv_transfer_config = SimpleNamespace(
+                kv_connector=kv_connector, kv_connector_extra_config=extra
+            )
+
+        with pytest.raises(ValueError, match="RBLN NIXL KV transfer"):
+            reconfigure(mutate)
+
+    def test_a_prefill_chunk_below_the_token_budget_takes_spec_decode(
+        self, reconfigure
+    ):
+        def mutate(config):
+            _prefill_chunk(64)(config)
+            config.speculative_config = SimpleNamespace(method="ngram")
+
+        reconfigure(mutate)
+
+    def test_a_prefill_chunk_below_the_token_budget_takes_other_connectors(
+        self, reconfigure
+    ):
+        # Only the RBLN NIXL connectors read the budget as the prefill chunk.
+        def mutate(config):
+            _prefill_chunk(64)(config)
+            config.kv_transfer_config = SimpleNamespace(
+                kv_connector="RBLNLMCacheConnectorV1", kv_connector_extra_config={}
+            )
+
+        reconfigure(mutate)
 
     @pytest.mark.parametrize("ranks", [dict(data_parallel_size=2), dict(ep=True)])
     def test_dp_and_ep_need_the_moe_tokens_mask(self, reconfigure, ranks):
@@ -586,6 +768,18 @@ def _ranks(
             config.additional_config = replace(
                 config.additional_config, use_moe_tokens_mask=moe_tokens_mask
             )
+
+    return mutate
+
+
+def _prefill_chunk(size: int):
+    """A mutator that sets --rbln-prefill-chunk-size, with sub-block caching off."""
+
+    def mutate(config: VllmConfig) -> None:
+        config.additional_config = replace(
+            config.additional_config, prefill_chunk_size=size
+        )
+        config.cache_config.enable_prefix_caching = False
 
     return mutate
 
