@@ -160,15 +160,10 @@ class RBLNGDNAttentionMetadataBuilder(
             out[:num_reqs] = values.to(torch.int32)
             return out
 
-        # A fresh request (no computed token) takes column 0 for its load,
-        # which has_initial_state tells the kernel not to read.
-        cols = torch.stack([num_computed - 1, seq_lens - 1], dim=1).clamp(min=0)
-        cols = cols // self.kv_cache_spec.block_size
-        blocks = common_attn_metadata.block_table_tensor[:num_reqs].gather(
-            1, cols.long()
-        )
-        load_blocks = padded(blocks[:, 0])
-        store_blocks = padded(blocks[:, 1])
+        # TODO(prefix caching): one column while mamba_block_size is the model
+        # length, so a row stores to the block it loads; a step crossing into a
+        # new block stores to the block of its last scheduled token instead.
+        blocks = padded(common_attn_metadata.block_table_tensor[:num_reqs, 0])
 
         valid_mask = None
         if is_prefill:
@@ -179,16 +174,16 @@ class RBLNGDNAttentionMetadataBuilder(
             is_prefill=is_prefill,
             batch_size=batch,
             seq_len=seq_len,
-            core_state_index=load_blocks.to(torch.int16),
-            core_store_index=store_blocks.to(torch.int16),
+            core_state_index=blocks.to(torch.int16),
+            core_store_index=blocks.to(torch.int16),
             core_has_initial_state=has_initial_state.to(torch.int16),
-            conv_state_index=self._stage(load_blocks, "conv_state_index"),
+            conv_state_index=self._stage(blocks, "conv_state_index"),
             conv_seq_idx=self._stage(padded(first_positions), "conv_seq_idx"),
             conv_query_len=self._stage(padded(query_lens), "conv_query_len"),
             conv_has_initial_state=self._stage(
                 has_initial_state, "conv_has_initial_state"
             ),
-            conv_store_index=self._stage(store_blocks, "conv_store_index"),
+            conv_store_index=self._stage(blocks, "conv_store_index"),
             valid_mask=None
             if valid_mask is None
             else self._stage(valid_mask, "valid_mask"),

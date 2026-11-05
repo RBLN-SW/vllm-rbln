@@ -52,7 +52,7 @@ def _builder():
         max_model_len=MAX_LEN, max_num_batched_tokens=128, max_num_seqs=4
     )
     spec = RBLNGDNStateSpec(
-        block_size=block_size, shapes=(gdn_state_shape(2, 4),), dtypes=(torch.int16,)
+        block_size=MAX_LEN, shapes=(gdn_state_shape(2, 4),), dtypes=(torch.bfloat16,)
     )
     return RBLNGDNAttentionMetadataBuilder(
         spec, [LAYER], vllm_config, torch.device("cpu")
@@ -61,8 +61,7 @@ def _builder():
 
 @pytest.fixture
 def builder():
-    # One block a request: mamba_block_size = max_model_len.
-    return _builder(MAX_LEN)
+    return _builder()
 
 
 def _common(
@@ -79,15 +78,14 @@ def _common(
     )
 
 
-def _assert_conv_rows(md, blocks, seq_idx, query_len, has_initial_state, store=None):
-    """kda_conv's per-row operands: the ring is stored where it was read unless
-    the step crosses into a new block."""
+def _assert_conv_rows(md, blocks, seq_idx, query_len, has_initial_state):
+    """kda_conv's per-row operands: the ring is stored where it was read."""
     want = {
         "conv_state_index": blocks,
         "conv_seq_idx": seq_idx,
         "conv_query_len": query_len,
         "conv_has_initial_state": has_initial_state,
-        "conv_store_index": blocks if store is None else store,
+        "conv_store_index": blocks,
     }
     for name, values in want.items():
         got = getattr(md, name)
@@ -123,20 +121,6 @@ class TestBuilder:
         assert md.core_has_initial_state.tolist() == [1, 1, 0, 0]
         _assert_conv_rows(md, [7, 3, 0, 0], [128, 5, 0, 0], [1, 1, 0, 0], [1, 1, 0, 0])
         assert md.valid_mask is None
-
-    def test_blocks_follow_the_table_column_of_the_position(self):
-        # Two blocks a request: tokens 0 .. 3 sit in column 0, 4 .. 7 in column 1.
-        md = _builder(4).build(_common([1], [6], [[5, 9]]), torch.tensor([5]), 1, False)
-        assert md.core_state_index.tolist() == [9]
-        assert md.core_store_index.tolist() == [9]
-
-    def test_crossing_into_a_new_block_stores_the_ring_there(self):
-        # Token 4 opens column 1: the state and the ring load block 5 (token 3)
-        # and store block 9.
-        md = _builder(4).build(_common([1], [5], [[5, 9]]), torch.tensor([4]), 1, False)
-        assert md.core_state_index.tolist() == [5]
-        assert md.core_store_index.tolist() == [9]
-        _assert_conv_rows(md, [5], [4], [1], [1], store=[9])
 
     def test_staging_buffers_are_reused(self, builder):
         positions = torch.arange(128)

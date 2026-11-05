@@ -23,8 +23,7 @@ from vllm.v1.core.single_type_kv_cache_manager import (
     MambaManager,
     SingleTypeKVCacheManager,
 )
-from vllm.v1.hisparse.block_pool import SharedEventQueueBlockPool
-from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec, SlidingWindowSpec
+from vllm.v1.kv_cache_interface import MambaSpec, SlidingWindowSpec
 from vllm.v1.request import Request
 
 
@@ -174,14 +173,11 @@ class RBLNGDNStateSpec(MambaSpec):
         return pages * self.real_page_size_bytes
 
 
-def gdn_pool_blocks(
-    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig, spec: MambaSpec
-) -> int:
-    """Blocks in a GatedDeltaNet group's pool: the two a running request holds
-    in align mode, plus a state for every state block the attention pool spans."""
-    live = 2 * vllm_config.scheduler_config.max_num_seqs
-    states_per_attention_block = vllm_config.cache_config.block_size // spec.block_size
-    return live + states_per_attention_block * kv_cache_config.num_blocks
+def gdn_pool_blocks(vllm_config: VllmConfig) -> int:
+    """Blocks in a GatedDeltaNet group's pool: one a running request (its whole
+    state, while `mamba_block_size` is the model length), doubled so this pool
+    never refuses a request the attention pool admits."""
+    return 2 * vllm_config.scheduler_config.max_num_seqs
 
 
 class RBLNGDNManager(MambaManager):
@@ -201,15 +197,12 @@ class RBLNGDNManager(MambaManager):
         self._attention_pool = block_pool
 
     def bind_pool(self, num_blocks: int) -> None:
-        # Only the attention pool's event queue is ever drained
-        # (KVCacheManager.take_events), so this pool publishes into it.
-        attention_pool = self._attention_pool
-        self.block_pool = SharedEventQueueBlockPool(
+        # Prefix caching is off for GatedDeltaNet models (platform), so the
+        # pool neither hashes its blocks nor publishes cache events.
+        self.block_pool = BlockPool(
             num_gpu_blocks=num_blocks,
-            enable_caching=attention_pool.enable_caching,
-            hash_block_size=attention_pool.hash_block_size,
-            enable_kv_cache_events=attention_pool.enable_kv_cache_events,
-            event_owner=attention_pool,
+            enable_caching=False,
+            hash_block_size=self._attention_pool.hash_block_size,
         )
         self._null_block = self.block_pool.null_block
 

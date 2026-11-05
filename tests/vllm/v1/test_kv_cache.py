@@ -22,7 +22,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from vllm.distributed.kv_events import BlockStored
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.single_type_kv_cache_manager import MambaManager
 from vllm.v1.kv_cache_interface import (
@@ -33,13 +32,11 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
-from tests.vllm.v1.core.utils import make_request
 from vllm_rbln.v1.kv_cache import (
     RBLNGDNManager,
     RBLNGDNStateSpec,
     RBLNSlidingWindowManager,
     RBLNSlidingWindowSpec,
-    gdn_pool_blocks,
 )
 
 
@@ -375,22 +372,13 @@ class TestCoordinatorCallsTheOverrides:
 class TestRBLNGDNStateSpec:
     def test_max_memory_usage_counts_the_real_state(self):
         # Declared at four times its state (as the attention page pads it), the
-        # spec still reports what align mode holds: two real states a request.
+        # spec still reports the one real state a request holds.
         real = _gdn_spec().page_size_bytes
         padded = _gdn_spec(page_size_padded=4 * real)
         vllm_config = SimpleNamespace(
-            cache_config=SimpleNamespace(mamba_cache_mode="align")
+            cache_config=SimpleNamespace(mamba_cache_mode="none")
         )
-        assert padded.max_memory_usage_bytes(vllm_config) == 2 * real
-
-    def test_pool_blocks_cover_live_requests_and_the_attention_span(self):
-        vllm_config = SimpleNamespace(
-            scheduler_config=SimpleNamespace(max_num_seqs=4),
-            cache_config=SimpleNamespace(block_size=64),
-        )
-        kv_cache_config = SimpleNamespace(num_blocks=10)
-        # 2 live blocks x 4 requests + 4 states an attention block x 10 blocks
-        assert gdn_pool_blocks(vllm_config, kv_cache_config, _gdn_spec()) == 48
+        assert padded.max_memory_usage_bytes(vllm_config) == real
 
 
 class TestRBLNGDNManagerPool:
@@ -398,7 +386,7 @@ class TestRBLNGDNManagerPool:
     the calls the pinned vllm makes, next to an attention group on the shared
     pool."""
 
-    def _coordinator(self, block_size=16, num_blocks=8, enable_kv_cache_events=False):
+    def _coordinator(self, block_size=16, num_blocks=8):
         from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
         from vllm.v1.core.single_type_kv_cache_manager import (
             register_all_kvcache_specs,
@@ -426,7 +414,7 @@ class TestRBLNGDNManagerPool:
             max_in_flight_tokens=512,
             use_eagle=False,
             enable_caching=True,
-            enable_kv_cache_events=enable_kv_cache_events,
+            enable_kv_cache_events=False,
             dcp_world_size=1,
             pcp_world_size=1,
             scheduler_block_size=block_size,
@@ -482,19 +470,3 @@ class TestRBLNGDNManagerPool:
         coord.free("r")
         assert state.block_pool.get_num_free_blocks() == 3 - 1
         assert coord.block_pool.get_num_free_blocks() == 8 - 1
-
-    def test_state_pool_events_drain_through_the_attention_pool(self):
-        # Only the attention pool's queue is ever drained (KVCacheManager
-        # .take_events), so a state block cached in the state pool must show up
-        # there, tagged with the state group.
-        coord = self._coordinator(num_blocks=8, enable_kv_cache_events=True)
-        state = coord.single_type_managers[1]
-        state.bind_pool(3)
-        request = make_request("r", list(range(16)), block_size=16)
-        coord.allocate_new_blocks("r", num_tokens=16, num_tokens_main_model=16)
-        coord.cache_blocks(request, 16)
-        stored = [
-            e for e in coord.block_pool.take_events() if isinstance(e, BlockStored)
-        ]
-        assert sorted(e.group_idx for e in stored) == [0, 1]
-        assert state.block_pool.kv_event_queue == []

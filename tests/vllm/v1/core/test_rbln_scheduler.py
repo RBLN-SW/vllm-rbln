@@ -59,10 +59,10 @@ class TestSchedulerInit:
             shapes=((2, 4, 2, 8, 8),),
             dtypes=(torch.int16,),
             block_size=16,
-            mamba_cache_mode="align",
+            mamba_cache_mode="none",
         )
         sched = create_rbln_scheduler(
-            enable_prefix_caching=True,
+            enable_prefix_caching=False,
             block_size=16,
             max_num_batched_tokens=16,
             max_model_len=8192,
@@ -78,8 +78,8 @@ class TestSchedulerInit:
         assert attn.block_pool is shared
         assert isinstance(state, RBLNGDNManager)
         assert state.block_pool is not shared
-        # 2 live blocks x 4 requests + 1 state an attention block x 10 blocks
-        assert state.block_pool.num_gpu_blocks == 18
+        # Two blocks a running request.
+        assert state.block_pool.num_gpu_blocks == 8
 
     @pytest.mark.usefixtures("cr13")
     def test_sub_block_caching_enabled_uses_rbln_manager(self):
