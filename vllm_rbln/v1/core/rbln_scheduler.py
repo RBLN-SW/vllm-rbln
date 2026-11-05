@@ -15,6 +15,8 @@
 import itertools
 import time
 from collections import deque
+from collections.abc import Iterator
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -65,7 +67,21 @@ class RBLNEncoderCacheManager(EncoderCacheManager):
 
     def __init__(self, cache_size: int) -> None:
         super().__init__(cache_size)
-        self.initial_cache_hits: set[str] = set()
+        self._initial_cache_hits: set[str] = set()
+
+    @contextmanager
+    def eviction_snapshot(self, request: Request) -> Iterator[None]:
+        # Hits remain evictable; an evicted hit must wait for transfer admission
+        # on the next step instead of being re-encoded during this pass.
+        self._initial_cache_hits = {
+            feature.identifier
+            for i, feature in enumerate(request.mm_features)
+            if self.get_cached_num_encoder_embeds(request, i) is not None
+        }
+        try:
+            yield
+        finally:
+            self._initial_cache_hits.clear()
 
     def can_allocate(
         self,
@@ -75,9 +91,7 @@ class RBLNEncoderCacheManager(EncoderCacheManager):
         num_embeds_to_schedule: int,
     ) -> bool:
         mm_hash = request.mm_features[input_id].identifier
-        if mm_hash in self.initial_cache_hits and mm_hash not in self.cached:
-            # NOTE(RBLN): consumers cannot re-encode an evicted hit locally.
-            # Defer it for a fresh transfer check on the next step.
+        if mm_hash in self._initial_cache_hits and mm_hash not in self.cached:
             return False
         return super().can_allocate(
             request, input_id, encoder_compute_budget, num_embeds_to_schedule
@@ -1228,39 +1242,38 @@ class RBLNScheduler(Scheduler):
         shift_computed_tokens: int = 0,
     ) -> tuple[list[int], int, int, list[int]]:
         cache_manager = self.encoder_cache_manager
+        connector = self.ec_connector
+        eviction_snapshot: AbstractContextManager[None] = nullcontext()
         if (
             isinstance(cache_manager, RBLNEncoderCacheManager)
-            and isinstance(self.ec_connector, RblnECCPUConnector)
+            and isinstance(connector, RblnECCPUConnector)
             and request.ec_transfer_params
         ):
-            # NOTE(RBLN): initial_cache_hits tracks hits for the eviction guard
-            # without pinning them so earlier inputs can still reclaim cache space.
-            cache_manager.initial_cache_hits = {
-                feature.identifier
-                for i, feature in enumerate(request.mm_features)
-                if cache_manager.get_cached_num_encoder_embeds(request, i) is not None
-            }
-        try:
-            scheduled = super()._try_schedule_encoder_inputs(
+            eviction_snapshot = cache_manager.eviction_snapshot(request)
+        with eviction_snapshot:
+            (
+                encoder_inputs_to_schedule,
+                adjusted_num_new_tokens,
+                adjusted_encoder_compute_budget,
+                external_load_encoder_input,
+            ) = super()._try_schedule_encoder_inputs(
                 request,
                 num_computed_tokens,
                 num_new_tokens,
                 encoder_compute_budget,
                 shift_computed_tokens,
             )
-        finally:
-            if isinstance(cache_manager, RBLNEncoderCacheManager):
-                cache_manager.initial_cache_hits.clear()
-        connector = self.ec_connector
         # NOTE(RBLN): upstream skips EC saves on runner-cache hits.
         # Reserve saves for outputs missing from the shared-memory cache.
         if (
             isinstance(connector, RblnECCPUConnector)
             and connector.is_producer
             and not self.is_encoder_decoder
-            and scheduled[1] > 0
+            and adjusted_num_new_tokens > 0
         ):
-            window_end = num_computed_tokens + scheduled[1] + shift_computed_tokens
+            window_end = (
+                num_computed_tokens + adjusted_num_new_tokens + shift_computed_tokens
+            )
             for i, feature in enumerate(request.mm_features):
                 pos = feature.mm_position
                 if (
@@ -1274,12 +1287,17 @@ class RBLNScheduler(Scheduler):
                 if cached_num_embeds == request.get_num_encoder_embeds(i):
                     connector.update_state_after_cache_hit(request, i)
         if not (
-            scheduled[0]
+            encoder_inputs_to_schedule
             and connector is not None
             and connector.is_consumer
             and not connector.is_producer
         ):
-            return scheduled
+            return (
+                encoder_inputs_to_schedule,
+                adjusted_num_new_tokens,
+                adjusted_encoder_compute_budget,
+                external_load_encoder_input,
+            )
         # NOTE(RBLN): an EC consumer compiles no vision encoder, so an image the
         # connector cannot supply fails the request; upstream encodes it locally.
         # update_from_output() fails every request in encoder_cache_mismatch_reqs.

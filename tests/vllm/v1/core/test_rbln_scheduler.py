@@ -45,8 +45,37 @@ from tests.vllm.v1.core.utils import (
 )
 from vllm_rbln.v1.core import rbln_scheduler
 from vllm_rbln.v1.core.rbln_kv_cache_manager import RBLNKVCacheManager
-from vllm_rbln.v1.core.rbln_scheduler import RBLNScheduler, RBLNSchedulerOutput
+from vllm_rbln.v1.core.rbln_scheduler import (
+    RBLNEncoderCacheManager,
+    RBLNScheduler,
+    RBLNSchedulerOutput,
+)
 from vllm_rbln.v1.core.utils import is_prefill, step_is_prefill
+
+
+@pytest.mark.parametrize("interrupt_scheduling", [False, True])
+def test_eviction_snapshot_defers_hits_only_within_its_scope(interrupt_scheduling):
+    request = make_request("cached", list(range(8)), 16, mm_features=[image_at(0, 2)])
+    replacement = make_request(
+        "replacement", list(range(8)), 16, mm_features=[image_at(2, 2)]
+    )
+    manager = RBLNEncoderCacheManager(cache_size=2)
+    manager.allocate(request, 0)
+    manager.free(request)
+
+    try:
+        with manager.eviction_snapshot(request):
+            assert manager.can_allocate(replacement, 0, 16, 0)
+            manager.allocate(replacement, 0)
+            manager.free(replacement)
+            assert not manager.can_allocate(request, 0, 16, 0)
+            if interrupt_scheduling:
+                raise RuntimeError("scheduling interrupted")
+    except RuntimeError as error:
+        assert interrupt_scheduling
+        assert str(error) == "scheduling interrupted"
+
+    assert manager.can_allocate(request, 0, 16, 0)
 
 
 class TestSchedulerInit:
