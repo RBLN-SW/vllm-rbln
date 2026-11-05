@@ -12,9 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Callable
 from typing import Union
 
 import torch
+
+
+def run_mm_encoder(
+    encoder: Callable[..., torch.Tensor],
+    inputs: list[torch.Tensor],
+    num_embeddings: int,
+) -> torch.Tensor:
+    return encoder(*inputs)[:num_embeddings].cpu()
 
 
 def pad(

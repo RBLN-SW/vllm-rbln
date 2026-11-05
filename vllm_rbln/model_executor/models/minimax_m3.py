@@ -87,6 +87,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
 )
 
+import vllm_rbln.utils as rbln_utils
 from vllm_rbln.model_executor.models.interfaces import SupportsRBLNMultiModal
 from vllm_rbln.patches.attention import _resolve_kv_cache
 from vllm_rbln.v1.attention.backends.flash_attention import _fp8_cache_dtype
@@ -1169,9 +1170,12 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         self, pixel_values: torch.Tensor, grid_thw: list[int]
     ) -> torch.Tensor:
         assert self.vision_tower is not None and self._mm_encoder is not None
-        embeds = self._mm_encoder(*self._encoder_inputs(pixel_values, grid_thw))
         merge = self.vision_tower.spatial_merge_size
-        return embeds[: math.prod(grid_thw) // (merge * merge)].cpu()
+        return rbln_utils.run_mm_encoder(
+            self._mm_encoder,
+            self._encoder_inputs(pixel_values, grid_thw),
+            math.prod(grid_thw) // (merge * merge),
+        )
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
         if "pixel_values_videos" in kwargs:
