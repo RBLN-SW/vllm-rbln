@@ -140,6 +140,7 @@ class RBLNMoERunner(MoERunner):
         router: Callable[[torch.Tensor], torch.Tensor] | torch.Tensor,
     ) -> torch.Tensor:
         assert self._quant_method is not None
+
         if self.moe_parallel_config.dp_size > 1:
             org_hidden_shape = hidden_states.shape
             R = self.moe_parallel_config.dp_size
