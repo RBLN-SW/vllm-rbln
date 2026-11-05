@@ -121,6 +121,17 @@ class TestSignatureComposition:
             {"max_soft_tokens": 70}
         ) != _signature_with_mm_kwargs({"max_soft_tokens": 280})
 
+    def test_an_encoder_only_instance_keeps_a_bundle_of_its_own(self):
+        # Its bundle holds the encoder alone, and a run with the language model
+        # has to miss it even with the dynamic KV factor equal.
+        full, encoder_only = _stub_config(), _stub_config()
+        for config in (full, encoder_only):
+            config.additional_config.use_dynamic_kv_cache = False
+        encoder_only.is_mm_encoder_only = True
+        assert mega_cache.config_signature(full) != mega_cache.config_signature(
+            encoder_only
+        )
+
     def test_other_mm_processor_kwargs_keep_the_key(self):
         # Without max_soft_tokens the key is the one a text model gets, so no
         # other model loses its bundle to this factor.

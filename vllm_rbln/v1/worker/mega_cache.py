@@ -115,6 +115,10 @@ def _warmup_graph_set_factors(vllm_config) -> str:
     # absent factor keeps every other model's existing bundle key.
     if "max_soft_tokens" in mm_kwargs:
         factors["max_soft_tokens"] = normalize_value(mm_kwargs["max_soft_tokens"])
+    # compute_hash() leaves the EC role out, and an encoder-only instance
+    # compiles the encoder alone.
+    if vllm_config.is_mm_encoder_only:
+        factors["mm_encoder_only"] = True
     return hash_factors(factors)
 
 
