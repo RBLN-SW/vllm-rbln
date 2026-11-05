@@ -24,15 +24,15 @@ one; a padding row does both on block 0, vLLM's null block.
 
 The cores take q / k per key head, L2-normalized in the kernel, and v, g and
 beta per value head grouped under its key head. The short conv
-(`rbln_custom_ops::causal_conv1d_ring_tabled`) runs once over q | k | v in that
-same key-head order (`grouped_qkv_rows`); its index tables are built here, once
-a step for every layer of the group.
+(`rbln_custom_ops::kda_conv`, fed as GLM-5.3 feeds its own) runs once over
+q | k | v in that same key-head order (`grouped_qkv_rows`); the converter builds
+its ring tables in the graph from the step's blocks and positions, and the ring
+is stored to the block the state is.
 """
 
 from dataclasses import dataclass
 
 import torch
-from rebel.ops.torch_custom_ops.causal_conv1d_ring import ring_tables
 from vllm.config import VllmConfig
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -80,9 +80,14 @@ class RBLNGDNAttentionMetadata:
     core_state_index: torch.Tensor
     core_store_index: torch.Tensor
     core_has_initial_state: torch.Tensor
-    # The conv ring's tables (ring_tables): hist_idx / ring_idx staged on the
-    # device, block / count on the host (the kernel's const buffers)
-    conv_tables: tuple[torch.Tensor, ...]
+    # [batch] int32 on the device: what kda_conv reads a row's ring by (its
+    # block, the step's first position, its valid tokens, 1 where the ring
+    # carries a state) and the block it stores the ring to.
+    conv_state_index: torch.Tensor
+    conv_seq_idx: torch.Tensor
+    conv_query_len: torch.Tensor
+    conv_has_initial_state: torch.Tensor
+    conv_store_index: torch.Tensor
     # [1, 1, seq_len] float32 on prefill: 1 for valid tokens, 0 for padding
     valid_mask: torch.Tensor | None
 
@@ -114,8 +119,6 @@ class RBLNGDNAttentionMetadataBuilder(
     ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.prefill_chunk_size = vllm_config.scheduler_config.max_num_batched_tokens
-        layers = vllm_config.compilation_config.static_forward_context
-        self.conv_kernel_size = layers[layer_names[0]].conv_kernel_size
         self._staged: dict[tuple, torch.Tensor] = {}
 
     def _stage(self, t: torch.Tensor, slot: str) -> torch.Tensor:
@@ -165,30 +168,12 @@ class RBLNGDNAttentionMetadataBuilder(
         )
         load_blocks = padded(blocks[:, 0])
         store_blocks = padded(blocks[:, 1])
-        # The conv ring's tables name one block, read and written in place; a
-        # store block of its own waits on the ring kernel's store operand.
-        assert torch.equal(load_blocks, store_blocks), (
-            "a GatedDeltaNet step crossing into a new state block needs the conv "
-            "ring kernel's store operand; keep mamba_block_size at max_model_len"
-        )
 
         valid_mask = None
         if is_prefill:
             valid_mask = (torch.arange(seq_len) < query_lens[0]).to(torch.float32)
             valid_mask = valid_mask.view(1, 1, seq_len)
         has_initial_state = padded(num_computed > 0)
-        # A ring block holds one ring of width K - 1.
-        width = self.conv_kernel_size - 1
-        hist_idx, ring_idx, block, count = ring_tables(
-            load_blocks,
-            padded(first_positions),
-            padded(query_lens),
-            has_initial_state,
-            seq_len,
-            width,
-            self.conv_kernel_size,
-            width,
-        )
         return RBLNGDNAttentionMetadata(
             is_prefill=is_prefill,
             batch_size=batch,
@@ -196,12 +181,13 @@ class RBLNGDNAttentionMetadataBuilder(
             core_state_index=load_blocks.to(torch.int16),
             core_store_index=store_blocks.to(torch.int16),
             core_has_initial_state=has_initial_state.to(torch.int16),
-            conv_tables=(
-                self._stage(hist_idx, "hist_idx"),
-                self._stage(ring_idx, "ring_idx"),
-                block,
-                count,
+            conv_state_index=self._stage(load_blocks, "conv_state_index"),
+            conv_seq_idx=self._stage(padded(first_positions), "conv_seq_idx"),
+            conv_query_len=self._stage(padded(query_lens), "conv_query_len"),
+            conv_has_initial_state=self._stage(
+                has_initial_state, "conv_has_initial_state"
             ),
+            conv_store_index=self._stage(store_blocks, "conv_store_index"),
             valid_mask=None
             if valid_mask is None
             else self._stage(valid_mask, "valid_mask"),

@@ -14,7 +14,6 @@
 
 import torch
 import torch.nn.functional as F
-from rebel.ops.torch_custom_ops.causal_conv1d_ring import pack_weight
 from torch import nn
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
@@ -131,16 +130,12 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 f"{self.head_k_dim} / {self.head_v_dim}"
             )
         self.layer_index = _layer_index(prefix)
-        heads_k = self.num_k_heads // self.tp_size
-        ratio = self.num_v_heads // self.num_k_heads
+        # One ring a block, in kda_conv's 64-lane blocks of the conv's channels.
+        channels = (2 * self.key_dim + self.value_dim) // self.tp_size
         self.conv_ring = RBLNGDNConvRingCache(
             f"{prefix}.conv_ring",
             owner=prefix,
-            block_shape=(
-                self.conv_kernel_size - 1,
-                heads_k * (2 + ratio),
-                GDN_HEAD_DIM,
-            ),
+            block_shape=(self.conv_kernel_size - 1, channels // 64, 64),
             dtype=vllm_config.model_config.dtype,
         )
 
@@ -202,19 +197,20 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         gates, _ = self.in_proj_ba(hidden_states)
         qkv, z = mixed_qkvz.split([channels, value_dim], dim=-1)
         b, a = gates.chunk(2, dim=-1)
-        groups = heads_k * (2 + ratio)
 
         # One conv over q | k | v, whose rows the model regrouped by key head at
         # load time (grouped_qkv_rows): RSD cuts the conv's channels where it cuts
         # the cores' heads, so a chiplet's conv output is what its cores read.
-        convolved = torch.ops.rbln_custom_ops.causal_conv1d_ring_tabled(
-            qkv.reshape(batch, seq_len, groups, head_dim),
-            pack_weight(
-                self.conv1d.weight.view(groups, head_dim, kernel).to(mixed_qkvz.dtype)
-            ),
+        convolved = torch.ops.rbln_custom_ops.kda_conv(
+            qkv.reshape(batch, seq_len, channels),
+            self.conv1d.weight.view(channels, kernel).to(mixed_qkvz.dtype),
             ring,
-            *metadata.conv_tables,
+            metadata.conv_state_index,
+            metadata.conv_seq_idx,
+            metadata.conv_query_len,
+            metadata.conv_has_initial_state,
             kernel - 1,
+            store_index=metadata.conv_store_index,
         )
         # The cores take q / k per key head (they L2-normalize them) and v, g and
         # beta per value head grouped under its key head: value head h is key head

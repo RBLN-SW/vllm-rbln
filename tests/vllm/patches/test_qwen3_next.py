@@ -173,7 +173,7 @@ def test_padded_prefill_then_decode_tracks_hf(vllm_config):
     state = torch.zeros(
         NUM_BLOCKS, *gdn_state_shape(HEADS_K, HEADS_V), dtype=torch.int16
     )
-    ring = torch.zeros(NUM_BLOCKS, KERNEL - 1, CONV_DIM // HEAD_DIM, HEAD_DIM)
+    ring = torch.zeros(NUM_BLOCKS, KERNEL - 1, CONV_DIM // 64, 64)
     device_layer = _grouped(layer, ring)
     vllm_config.compilation_config.static_forward_context[PREFIX] = device_layer
     spec = RBLNGDNStateSpec(
