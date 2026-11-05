@@ -276,6 +276,17 @@ class TestBuildPrefillNonCausal:
         expected[..., 0:CHUNK] = _lower_triangular(CHUNK)
         assert torch.equal(mask.float(), expected)
 
+    def test_rows_follow_the_prefill_chunk_below_the_budget(self):
+        config = make_vllm_config(
+            max_model_len=MAX_LEN,
+            max_num_batched_tokens=2 * CHUNK,
+            attention_config={"use_non_causal": True},
+            enable_prefix_caching=False,
+            additional_config={"prefill_chunk_size": CHUNK},
+        )
+        mask = self._mask(config, positions=torch.arange(4))
+        assert mask.shape == (1, 1, 1, CHUNK, MAX_LEN)
+
     def test_step_at_chunk_fills_cached_region(self, cfg_noncausal):
         # step = positions[0] = CHUNK (>= chunk): [:step] all attend, triangle after
         mask = self._mask(cfg_noncausal, positions=torch.arange(4) + CHUNK)
