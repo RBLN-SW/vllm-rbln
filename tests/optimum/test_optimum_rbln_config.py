@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 from vllm.engine.arg_utils import AsyncEngineArgs
@@ -102,38 +103,99 @@ def test_a_no_flag_field_has_no_flag(parser):
     assert "rbln_user_max_num_batched_tokens" not in flags
 
 
-@pytest.mark.parametrize("budget", [0, 128, 8192])
-@pytest.mark.parametrize("model_impl", ["optimum", "transformers"])
-def test_explicit_budget_is_rejected_before_vllm_defaults(
-    monkeypatch, budget, model_impl
-):
+@pytest.fixture
+def capture_engine_config(monkeypatch):
     from vllm.engine.arg_utils import EngineArgs
 
-    from vllm_rbln.platform import RblnPlatform
-
-    monkeypatch.setattr(EngineArgs, "create_engine_config", lambda self: None)
-    monkeypatch.setattr(EngineArgs, "_rbln_model_impl_patched", False, raising=False)
-    RblnPlatform._capture_model_impl()
-    args = SimpleNamespace(
-        model_impl=model_impl, additional_config=None, max_num_batched_tokens=budget
-    )
-    with pytest.raises(ValueError, match="Use --rbln-prefill-chunk-size"):
-        EngineArgs.create_engine_config(args)
-
-
-@pytest.mark.parametrize("config", [None, {}, OptimumRBLNConfig()])
-def test_unset_budget_is_left_to_vllm_defaults(monkeypatch, config):
-    from vllm.engine.arg_utils import EngineArgs
-
-    from vllm_rbln.platform import RblnPlatform
+    from vllm_rbln import platform
 
     monkeypatch.setattr(EngineArgs, "create_engine_config", lambda self: "created")
     monkeypatch.setattr(EngineArgs, "_rbln_model_impl_patched", False, raising=False)
-    RblnPlatform._capture_model_impl()
+    monkeypatch.setattr(platform.logger, "warning_once", Mock())
+    platform.RblnPlatform._capture_model_impl()
+    return EngineArgs.create_engine_config, platform.logger.warning_once
+
+
+@pytest.mark.parametrize("budget", [128, 8192])
+@pytest.mark.parametrize("model_impl", ["optimum", "transformers"])
+@pytest.mark.parametrize("config_kind", ["unset", "mapping", "built"])
+def test_legacy_budget_becomes_prefill_chunk_size(
+    capture_engine_config, budget, model_impl, config_kind
+):
+    create_config, warning = capture_engine_config
+    config = None
+    if config_kind == "mapping":
+        config = {"prefill_chunk_size": budget}
+    elif config_kind == "built":
+        config = OptimumRBLNConfig(prefill_chunk_size=budget)
+    args = SimpleNamespace(
+        model_impl=model_impl,
+        additional_config=config,
+        max_num_batched_tokens=budget,
+        create_model_config=lambda: SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"])
+        ),
+    )
+    assert create_config(args) == "created"
+    assert args.additional_config.prefill_chunk_size == budget
+    assert args.max_num_batched_tokens is None
+    warning.assert_called_once()
+    assert "0.14.0" in warning.call_args.args[0]
+
+
+@pytest.mark.parametrize("built", [False, True])
+@pytest.mark.parametrize(
+    ("budget", "chunk", "error"),
+    [
+        (128, 256, "Conflicting prefill chunk size"),
+        (0, None, "greater_than"),
+        (-1, None, "greater_than"),
+    ],
+)
+def test_invalid_legacy_budget_is_rejected(
+    capture_engine_config, built, budget, chunk, error
+):
+    create_config, _ = capture_engine_config
+    config = {"prefill_chunk_size": chunk}
+    if built:
+        config = OptimumRBLNConfig(**config)
+    args = SimpleNamespace(
+        model_impl="optimum",
+        additional_config=config,
+        max_num_batched_tokens=budget,
+        create_model_config=lambda: SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"])
+        ),
+    )
+    with pytest.raises(ValueError, match=error):
+        create_config(args)
+
+
+@pytest.mark.parametrize("arch", ["WhisperForConditionalGeneration", "BertModel"])
+def test_legacy_budget_is_ignored_without_chunked_prefill(capture_engine_config, arch):
+    create_config, warning = capture_engine_config
+    args = SimpleNamespace(
+        model_impl="optimum",
+        additional_config=None,
+        max_num_batched_tokens=128,
+        create_model_config=lambda: SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=[arch])
+        ),
+    )
+    assert create_config(args) == "created"
+    assert args.additional_config is None
+    assert args.max_num_batched_tokens is None
+    warning.assert_called_once()
+
+
+@pytest.mark.parametrize("config", [None, {}, OptimumRBLNConfig()])
+def test_unset_budget_is_left_to_vllm_defaults(capture_engine_config, config):
+    create_config, warning = capture_engine_config
     args = SimpleNamespace(
         model_impl="optimum", additional_config=config, max_num_batched_tokens=None
     )
-    assert EngineArgs.create_engine_config(args) == "created"
+    assert create_config(args) == "created"
+    warning.assert_not_called()
     assert args.max_num_batched_tokens is None
     assert args.additional_config is config
     if isinstance(config, dict):

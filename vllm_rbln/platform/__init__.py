@@ -278,14 +278,6 @@ class RblnPlatform(Platform):
             model_impl = resolve_model_impl(
                 self.additional_config, self.model_impl, engine_args=self
             )
-            if model_impl == "optimum" and self.max_num_batched_tokens is not None:
-                raise ValueError(
-                    "--max-num-batched-tokens (max_num_batched_tokens) is not "
-                    "supported on the optimum model impl. Use "
-                    "--rbln-prefill-chunk-size "
-                    "(additional_config={'prefill_chunk_size': ...}) "
-                    "to set the prefill graph size."
-                )
             # Upstream reads this field too, and there `transformers` means its
             # own Transformers backend, which refuses several of the models
             # optimum-rbln supports. Hand the default back so that resolution is
@@ -294,6 +286,35 @@ class RblnPlatform(Platform):
             if model_impl == "vllm" and self.max_num_batched_tokens is None:
                 self.max_num_batched_tokens = RBLN_DEFAULT_MAX_NUM_BATCHED_TOKENS
             _apply_model_impl(model_impl)
+            # TODO(vllm-rbln>=0.14.0): delete the legacy chunk-size alias.
+            if model_impl == "optimum" and self.max_num_batched_tokens is not None:
+                from dataclasses import replace
+
+                from vllm_rbln.config import build_optimum_rbln_config
+                from vllm_rbln.utils.optimum.converter.common import (
+                    is_chunked_prefill_arch,
+                )
+
+                logger.warning_once(
+                    "--max-num-batched-tokens (max_num_batched_tokens) on the "
+                    "optimum model path is deprecated and will be removed in "
+                    "0.14.0. Use --rbln-prefill-chunk-size for models that "
+                    "support chunked prefill; otherwise omit it."
+                )
+                if is_chunked_prefill_arch(self.create_model_config().hf_config):
+                    rbln_config = build_optimum_rbln_config(self.additional_config)
+                    chunk = rbln_config.prefill_chunk_size
+                    if chunk is not None and chunk != self.max_num_batched_tokens:
+                        raise ValueError(
+                            "Conflicting prefill chunk size: "
+                            f"max_num_batched_tokens ({self.max_num_batched_tokens}) "
+                            f"!= prefill_chunk_size ({chunk}). Set only "
+                            "--rbln-prefill-chunk-size."
+                        )
+                    self.additional_config = replace(
+                        rbln_config, prefill_chunk_size=self.max_num_batched_tokens
+                    )
+                self.max_num_batched_tokens = None
             return orig_create_engine_config(self, *args, **kwargs)
 
         EngineArgs.create_engine_config = create_engine_config
