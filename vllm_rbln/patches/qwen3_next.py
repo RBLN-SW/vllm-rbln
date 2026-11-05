@@ -147,7 +147,15 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         )
 
     def get_state_dtype(self) -> tuple[torch.dtype]:
-        return (torch.int16,)
+        # The CR13 cores keep the state in the activation dtype (dlfloat16
+        # inside the kernel), so the cache dtype options cannot move it.
+        _, state_dtype = super().get_state_dtype()
+        if state_dtype != self.model_config.dtype:
+            raise NotImplementedError(
+                "The RBLN GatedDeltaNet kernels keep the state in the activation "
+                f"dtype {self.model_config.dtype}, got {state_dtype}"
+            )
+        return (state_dtype,)
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> RBLNGDNStateSpec:
         cache_config = vllm_config.cache_config

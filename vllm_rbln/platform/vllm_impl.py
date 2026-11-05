@@ -472,6 +472,16 @@ def _override(vllm_config: "VllmConfig") -> None:
                 "False."
             )
             cache_config.enable_prefix_caching = False
+        if cache_config.mamba_ssm_cache_dtype != "auto":
+            # The CR13 cores keep the state in the activation dtype (dlfloat16
+            # inside the kernel); Qwen3.5's HF config asks for float32.
+            logger.warning(
+                "The RBLN GatedDeltaNet kernels keep the state in the activation "
+                "dtype. Overriding cache_config.mamba_ssm_cache_dtype from '%s' "
+                "to 'auto'.",
+                cache_config.mamba_ssm_cache_dtype,
+            )
+            cache_config.mamba_ssm_cache_dtype = "auto"
         # One state block a request, as upstream sizes it without prefix caching.
         cache_config.mamba_cache_mode = "none"
         if not cache_config.user_specified_mamba_block_size:

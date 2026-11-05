@@ -23,7 +23,6 @@ import pytest
 import torch
 import torch.nn.functional as F
 from rebel.ops.torch_custom_ops.gdn import unblock_state
-from rebel.ops.torch_custom_ops.kda import dlf16_to_float
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5RMSNormGated,
     torch_chunk_gated_delta_rule,
@@ -162,24 +161,22 @@ def _run(
 
 
 def _ssm_state(state: torch.Tensor) -> torch.Tensor:
-    # The block's state, dlfloat16 bits in the blocked layout -> HF [1, heads_v, dk, dv]
-    bits = state[BLOCK : BLOCK + 1]
-    return unblock_state(dlf16_to_float(bits)).reshape(1, HEADS_V, HEAD_DIM, HEAD_DIM)
+    # The block's state in the blocked layout -> HF [1, heads_v, dk, dv]
+    blocked = state[BLOCK : BLOCK + 1].float()
+    return unblock_state(blocked).reshape(1, HEADS_V, HEAD_DIM, HEAD_DIM)
 
 
 def test_padded_prefill_then_decode_tracks_hf(vllm_config):
     layer = _layer()
     # The pool's state tensor and the ring beside it, as the runner allocates them.
-    state = torch.zeros(
-        NUM_BLOCKS, *gdn_state_shape(HEADS_K, HEADS_V), dtype=torch.int16
-    )
+    state = torch.zeros(NUM_BLOCKS, *gdn_state_shape(HEADS_K, HEADS_V))
     ring = torch.zeros(NUM_BLOCKS, KERNEL - 1, CONV_DIM // 64, 64)
     device_layer = _grouped(layer, ring)
     vllm_config.compilation_config.static_forward_context[PREFIX] = device_layer
     spec = RBLNGDNStateSpec(
         block_size=vllm_config.model_config.max_model_len,
         shapes=(gdn_state_shape(HEADS_K, HEADS_V),),
-        dtypes=(torch.int16,),
+        dtypes=(torch.float32,),
     )
     builder = RBLNGDNAttentionMetadataBuilder(
         spec, [PREFIX], vllm_config, torch.device("cpu")
@@ -267,12 +264,23 @@ class TestStateSpec:
         layer.tp_size = 2
         layer.num_k_heads = 4
         layer.num_v_heads = 8
+        layer.model_config = SimpleNamespace(dtype=torch.bfloat16)
+        layer.cache_config = SimpleNamespace(
+            mamba_cache_dtype="auto", mamba_ssm_cache_dtype="auto"
+        )
         return layer
 
     def test_the_layer_declares_one_core_state_a_block(self):
         layer = self._layer()
         assert layer.get_state_shape() == ((2, 2, 2, 128, 64),)
-        assert layer.get_state_dtype() == (torch.int16,)
+        # The activation dtype: the kernels take no other.
+        assert layer.get_state_dtype() == (torch.bfloat16,)
+
+    def test_a_state_dtype_off_the_activation_dtype_is_refused(self):
+        layer = self._layer()
+        layer.cache_config.mamba_ssm_cache_dtype = "float32"
+        with pytest.raises(NotImplementedError, match="activation dtype"):
+            layer.get_state_dtype()
 
     def test_the_layer_spec_is_the_rbln_state_spec(self):
         cache_config = SimpleNamespace(
@@ -286,16 +294,17 @@ class TestStateSpec:
         assert isinstance(spec, RBLNGDNStateSpec)
         assert spec.block_size == 8192
         # Declared at the attention page, while the state itself is one
-        # [2, 2, 2, 128, 64] of int16.
+        # [2, 2, 2, 128, 64] of bfloat16.
         assert spec.page_size_bytes == 1 << 22
         assert spec.real_page_size_bytes == 2 * 2 * 2 * 128 * 64 * 2
 
     def test_the_model_declares_the_layers_state(self):
         vllm_config = SimpleNamespace(
             model_config=SimpleNamespace(
+                dtype=torch.bfloat16,
                 hf_text_config=SimpleNamespace(
                     linear_num_key_heads=4, linear_num_value_heads=8
-                )
+                ),
             ),
             parallel_config=SimpleNamespace(tensor_parallel_size=2),
         )

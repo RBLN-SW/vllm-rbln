@@ -15,12 +15,13 @@
 """GatedDeltaNet (Qwen3-Next, Qwen3.5 `linear_attention`) state on RBLN.
 
 A layer's recurrent state is a `MambaSpec` block in a pool of its own
-(`RBLNGDNStateSpec`, v1/kv_cache.py): one [Hk, R, 2, 128, 64] state of
-dlfloat16 bits (int16) a block, addressed by the group's block table. Its
-short-conv ring is a block-aux cache on the same block ids. The builder turns
-the block table into the rows the kernels read and write: a request loads the
-block of its last computed token and stores the block of its last scheduled
-one; a padding row does both on block 0, vLLM's null block.
+(`RBLNGDNStateSpec`, v1/kv_cache.py): one [Hk, R, 2, 128, 64] state a block
+in the activation dtype (dlfloat16 inside the kernels), addressed by the
+group's block table. Its short-conv ring is a block-aux cache on the same
+block ids. The builder turns the block table into the rows the kernels read
+and write: a request's one block (`mamba_block_size` is the model length),
+read and written in place; a padding row reads and writes block 0, vLLM's
+null block.
 
 The cores take q / k per key head, L2-normalized in the kernel, and v, g and
 beta per value head grouped under its key head. The short conv
@@ -53,7 +54,7 @@ GDN_PREFILL_CHUNK = 128
 
 def gdn_state_shape(heads_k: int, heads_v: int) -> tuple[int, ...]:
     """One block's state as the CR13 cores keep it: each key head's
-    `heads_v / heads_k` [128, 128] states in [2, 128, 64] dlfloat16 lanes."""
+    `heads_v / heads_k` [128, 128] states blocked as [2, 128, 64] lanes."""
     return (heads_k, heads_v // heads_k, GDN_HEAD_DIM // 64, GDN_HEAD_DIM, 64)
 
 

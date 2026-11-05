@@ -43,11 +43,11 @@ def test_grouped_qkv_rows_interleaves_each_key_heads_q_k_and_values():
 
 def test_state_shape_follows_the_kernels():
     # 2 value heads under each of 2 key heads, each [128, 128] state blocked as
-    # [2, 128, 64] dlfloat16 bits
+    # [2, 128, 64] lanes
     assert gdn_state_shape(2, 4) == (2, 2, 2, 128, 64)
 
 
-def _builder(block_size):
+def _builder():
     vllm_config = make_vllm_config(
         max_model_len=MAX_LEN, max_num_batched_tokens=128, max_num_seqs=4
     )

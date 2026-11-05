@@ -140,7 +140,7 @@ class RBLNQwen3_5ForConditionalGeneration(
     def get_mamba_state_dtype_from_config(
         cls, vllm_config: VllmConfig
     ) -> tuple[torch.dtype]:
-        return (torch.int16,)
+        return (vllm_config.model_config.dtype,)
 
     @classmethod
     def get_mamba_state_shape_from_config(
