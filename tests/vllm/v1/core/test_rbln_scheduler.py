@@ -77,6 +77,17 @@ class TestSchedulerInit:
         assert isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
         assert sched.kv_cache_manager.sub_block_size == 128
 
+    def test_sub_block_size_defaults_to_the_prefill_chunk_below_the_budget(self):
+        sched = create_rbln_scheduler(
+            enable_prefix_caching=True,
+            block_size=1024,
+            max_num_batched_tokens=128,
+            max_model_len=2048,
+            additional_config={"prefill_chunk_size": 64},
+        )
+        assert isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
+        assert sched.kv_cache_manager.sub_block_size == 64
+
     @pytest.mark.usefixtures("cr13")
     def test_additional_config_sets_the_sub_block_size(self):
         # RBLNConfig.sub_block_size decouples the sub-block from the chunk.

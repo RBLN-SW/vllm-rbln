@@ -1000,9 +1000,9 @@ class TestKvCopyStreamReserve:
                 additional_config=SimpleNamespace(
                     enable_sub_block_cache=sub_block_cache,
                     sub_block_size=sub_block_size,
+                    prefill_chunk_size=512,
                 )
             ),
-            scheduler_config=SimpleNamespace(max_num_batched_tokens=512),
             model_runner=SimpleNamespace(kv_cache_config=SimpleNamespace()),
         )
 
