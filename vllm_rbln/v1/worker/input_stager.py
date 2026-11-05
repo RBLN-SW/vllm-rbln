@@ -17,6 +17,7 @@ from typing import Any
 
 import torch
 from vllm.sequence import IntermediateTensors
+from vllm.v1.utils import record_function_or_nullcontext
 
 
 @dataclass(frozen=True)
@@ -80,16 +81,22 @@ class InputStager:
         hidden_states: torch.Tensor | None = None,
         layout: InputLayout,
     ) -> StagedModelInputs:
-        buf, host_buf = self._get_or_create_buffer(layout, input_ids, positions)
+        with record_function_or_nullcontext("input_stage:get_buffer"):
+            buf, host_buf = self._get_or_create_buffer(layout, input_ids, positions)
 
         assert buf.input_ids.shape == layout.shape
-        host_buf.input_ids.fill_(layout.input_pad_value)
-        host_buf.input_ids[: layout.num_reqs, : layout.query_len].copy_(input_ids)
-        buf.input_ids.copy_(host_buf.input_ids, non_blocking=True)
+        with record_function_or_nullcontext("input_stage:ids_host_fill"):
+            host_buf.input_ids.fill_(layout.input_pad_value)
+        with record_function_or_nullcontext("input_stage:ids_host_copy"):
+            host_buf.input_ids[: layout.num_reqs, : layout.query_len].copy_(input_ids)
+        with record_function_or_nullcontext("input_stage:ids_copy"):
+            buf.input_ids.copy_(host_buf.input_ids, non_blocking=True)
 
-        host_buf.positions.fill_(layout.position_pad_value)
-        host_buf.positions[: layout.num_reqs, : layout.query_len].copy_(positions)
-        buf.positions.copy_(host_buf.positions, non_blocking=True)
+        with record_function_or_nullcontext("input_stage:positions_host_copy"):
+            host_buf.positions.fill_(layout.position_pad_value)
+            host_buf.positions[: layout.num_reqs, : layout.query_len].copy_(positions)
+        with record_function_or_nullcontext("input_stage:positions_copy"):
+            buf.positions.copy_(host_buf.positions, non_blocking=True)
 
         return StagedModelInputs(
             input_ids=buf.input_ids,

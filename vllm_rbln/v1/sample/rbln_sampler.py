@@ -23,6 +23,7 @@ from vllm.v1.outputs import LogprobsTensors, SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.logprobs import batched_count_greater_than
 from vllm.v1.sample.sampler import Sampler as VLLMSampler
+from vllm.v1.utils import record_function_or_nullcontext
 
 import vllm_rbln.envs as envs
 from vllm_rbln.compilation import compile, create_compile_context
@@ -50,13 +51,15 @@ def _stage_into(owner: Any, out: torch.Tensor) -> torch.Tensor:
         or ring[0].dtype != out.dtype
         or ring[0].device != out.device
     ):
-        ring = [torch.empty_like(out) for _ in range(2)]
-        owner._sampled_token_ring = ring
-        owner._ring_slot = 0
+        with record_function_or_nullcontext("sampler:ring_alloc"):
+            ring = [torch.empty_like(out) for _ in range(2)]
+            owner._sampled_token_ring = ring
+            owner._ring_slot = 0
     buf = ring[owner._ring_slot]
     owner._ring_slot ^= 1
     # non_blocking, or the copy waits on the sampling graph.
-    buf.copy_(out, non_blocking=True)
+    with record_function_or_nullcontext("sampler:ring_d2d"):
+        buf.copy_(out, non_blocking=True)
     return buf
 
 
@@ -197,7 +200,8 @@ class RBLNSampler(VLLMSampler):
     def greedy_sample(
         self, logits: torch.Tensor, staging_owner: Any = None
     ) -> torch.Tensor:
-        out = self._compiled_greedy_sample(logits)
+        with record_function_or_nullcontext("sampler:greedy_run"):
+            out = self._compiled_greedy_sample(logits)
         return out if staging_owner is None else _stage_into(staging_owner, out)
 
     def sample(
@@ -299,13 +303,15 @@ class RBLNSampler(VLLMSampler):
         # Use float32 for the logits.
         # logits = logits.to(torch.float32)
 
-        logits = self.apply_logits_processors(
-            logits, sampling_metadata, predict_bonus_token
-        )
+        with record_function_or_nullcontext("sampler:logits_processors"):
+            logits = self.apply_logits_processors(
+                logits, sampling_metadata, predict_bonus_token
+            )
         # Sample the next token.
-        sampled, processed_logprobs = self.sample(
-            logits, sampling_metadata, staging_owner=staging_owner
-        )
+        with record_function_or_nullcontext("sampler:sample"):
+            sampled, processed_logprobs = self.sample(
+                logits, sampling_metadata, staging_owner=staging_owner
+            )
         if processed_logprobs is not None:
             raw_logprobs = processed_logprobs
 

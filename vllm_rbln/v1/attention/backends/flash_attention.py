@@ -31,6 +31,7 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec, SlidingWindowSpec
 from vllm.v1.kv_cache_layout import KVCacheLayout
+from vllm.v1.utils import record_function_or_nullcontext
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -238,9 +239,11 @@ class RBLNFlashAttentionMetadataBuilder(
                 return None
             key = (slot, t.shape, t.dtype)
             if (buf := self._staged.get(key)) is None:
-                buf = torch.empty(t.shape, dtype=t.dtype, device=self.device)
-                self._staged[key] = buf
-            buf.copy_(t)
+                with record_function_or_nullcontext(f"metadata.alloc:{slot}"):
+                    buf = torch.empty(t.shape, dtype=t.dtype, device=self.device)
+                    self._staged[key] = buf
+            with record_function_or_nullcontext(f"metadata.copy:{slot}"):
+                buf.copy_(t)
             return buf
 
         metadata.seq_lens = _stage(metadata.seq_lens, "seq_lens")

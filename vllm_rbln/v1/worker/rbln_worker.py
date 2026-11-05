@@ -65,7 +65,7 @@ from vllm.v1.outputs import (
     DraftTokenIds,
     ModelRunnerOutput,
 )
-from vllm.v1.utils import report_usage_stats
+from vllm.v1.utils import record_function_or_nullcontext, report_usage_stats
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 import vllm_rbln.envs as envs
@@ -599,7 +599,8 @@ class RBLNWorker(WorkerBase):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self.model_runner.sample_tokens(grammar_output)
+        with record_function_or_nullcontext("rbln_worker: sample_tokens"):
+            return self.model_runner.sample_tokens(grammar_output)
 
     def _send_handoff(self, tensors: dict) -> None:
         """Hand this stage's output on; a seam the metrics patch wraps."""
@@ -620,7 +621,10 @@ class RBLNWorker(WorkerBase):
         ):
             intermediate_tensors = self.model_runner.recv_intermediate_tensors()
 
-        output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
+        with record_function_or_nullcontext("rbln_worker: execute_model"):
+            output = self.model_runner.execute_model(
+                scheduler_output, intermediate_tensors
+            )
         if isinstance(output, ModelRunnerOutput | NoneType):
             return output
 
@@ -680,6 +684,9 @@ class RBLNWorker(WorkerBase):
                             is not None
                             else ("CPU", "PrivateUse1")
                         ),
+                    )
+                    self.profiler._profiler_kwargs["experimental_config"] = (
+                        torch._C._profiler._ExperimentalConfig(profile_all_threads=True)
                     )
                     logger.debug(
                         "Starting torch profiler with tarce name: %s", trace_name

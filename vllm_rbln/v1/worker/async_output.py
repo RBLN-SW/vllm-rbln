@@ -23,6 +23,7 @@ from collections import deque
 
 import torch
 from vllm.v1.outputs import AsyncModelRunnerOutput, LogprobsTensors, ModelRunnerOutput
+from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_rbln.v1.worker.utils import worker_fail_fast
 
@@ -66,22 +67,27 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
         # Keep a reference to the device tensor to avoid it being
         # deallocated until we finish copying it to the host.
         self._sampled_token_ids = sampled_token_ids
-        self._sampled_token_ids_cpu = torch.empty(
-            sampled_token_ids.shape,
-            dtype=sampled_token_ids.dtype,
-            device="cpu",
-            # Pinned, or torch-rbln turns the non_blocking copy below into a sync one.
-            pin_memory=not sampled_token_ids.is_cpu,
-        )
+        with record_function_or_nullcontext("async_output:pinned_alloc"):
+            self._sampled_token_ids_cpu = torch.empty(
+                sampled_token_ids.shape,
+                dtype=sampled_token_ids.dtype,
+                device="cpu",
+                # Pinned, or torch-rbln turns the non_blocking copy below
+                # into a sync one.
+                pin_memory=not sampled_token_ids.is_cpu,
+            )
         # Start the D2H right behind the sampler, as AsyncGPUModelRunnerOutput
         # does. From get_output() it would queue behind the next forward.
         self._copy_ready_event: torch.Event | None = None
-        while _inflight_d2h and _inflight_d2h[0][0].query():
-            _inflight_d2h.popleft()
+        with record_function_or_nullcontext("async_output:read_completed"):
+            while _inflight_d2h and _inflight_d2h[0][0].query():
+                _inflight_d2h.popleft()
         if not sampled_token_ids.is_cpu:
-            self._sampled_token_ids_cpu.copy_(sampled_token_ids, non_blocking=True)
-            self._copy_ready_event = torch.Event(device=sampled_token_ids.device)
-            self._copy_ready_event.record()
+            with record_function_or_nullcontext("async_output:d2h_submit"):
+                self._sampled_token_ids_cpu.copy_(sampled_token_ids, non_blocking=True)
+            with record_function_or_nullcontext("async_output:event_record"):
+                self._copy_ready_event = torch.Event(device=sampled_token_ids.device)
+                self._copy_ready_event.record()
             _inflight_d2h.append(
                 (self._copy_ready_event, sampled_token_ids, self._sampled_token_ids_cpu)
             )
@@ -103,36 +109,44 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
 
         Blocks until the copy finishes; the executor decides which thread calls it.
         """
-        if self._copy_ready_event is not None:
-            self.get_sampled_token_ids_cpu()
-        else:
-            # InferenceMode is thread-local, hence off here, and updating
-            # _sampled_token_ids_cpu - an inference tensor allocated under
-            # sample_tokens - in place with it off is a hard error.
-            with torch.inference_mode():
-                self._sampled_token_ids_cpu.copy_(self._sampled_token_ids)
+        with record_function_or_nullcontext("async_output:get_output"):
+            if self._copy_ready_event is not None:
+                with record_function_or_nullcontext("async_output: wait_d2h"):
+                    self.get_sampled_token_ids_cpu()
+            else:
+                # InferenceMode is thread-local, hence off here, and updating
+                # _sampled_token_ids_cpu - an inference tensor allocated under
+                # sample_tokens - in place with it off is a hard error.
+                with (
+                    torch.inference_mode(),
+                    record_function_or_nullcontext("async_output:cpu_copy"),
+                ):
+                    self._sampled_token_ids_cpu.copy_(self._sampled_token_ids)
 
-        valid_sampled_token_ids = self._sampled_token_ids_cpu.tolist()
-        for i in self._invalid_req_indices:
-            valid_sampled_token_ids[i].clear()
+            with record_function_or_nullcontext("async_output: tokens_to_list"):
+                valid_sampled_token_ids = self._sampled_token_ids_cpu.tolist()
+            for i in self._invalid_req_indices:
+                valid_sampled_token_ids[i].clear()
 
-        # The -1 placeholders the async path left in token_ids_cpu still have to be
-        # replaced by the real tokens, but not from this thread: the main thread
-        # reads token_ids_cpu in _preprocess. Queue the tokens instead and let the
-        # main thread apply them at the top of its next step.
-        # Copied: the scheduler trims these lists in place when a request stops.
-        self._pending_token_writeback.append(
-            (
-                self._req_ids,
-                [list(ids) for ids in valid_sampled_token_ids],
-                self._placeholder_pos,
-            )
-        )
+            # The -1 placeholders the async path left in token_ids_cpu still have to be
+            # replaced by the real tokens, but not from this thread: the main thread
+            # reads token_ids_cpu in _preprocess. Queue the tokens instead and let the
+            # main thread apply them at the top of its next step.
+            # Copied: the scheduler trims these lists in place when a request stops.
+            with record_function_or_nullcontext("async_output:publish_writeback"):
+                self._pending_token_writeback.append(
+                    (
+                        self._req_ids,
+                        [list(ids) for ids in valid_sampled_token_ids],
+                        self._placeholder_pos,
+                    )
+                )
 
-        output = self._model_runner_output
-        output.sampled_token_ids = valid_sampled_token_ids
-        if self._logprobs_tensors is not None:
-            # tolists() is where the logprobs D2H actually happens - on this
-            # thread, off the step's critical path.
-            output.logprobs = self._logprobs_tensors.tolists()
-        return output
+            output = self._model_runner_output
+            output.sampled_token_ids = valid_sampled_token_ids
+            if self._logprobs_tensors is not None:
+                # tolists() is where the logprobs D2H actually happens - on this
+                # thread, off the step's critical path.
+                with record_function_or_nullcontext("async_output:logprobs_to_host"):
+                    output.logprobs = self._logprobs_tensors.tolists()
+            return output

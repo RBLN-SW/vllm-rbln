@@ -1384,7 +1384,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         # For text-only models
         input_ids = self.input_ids[:num_input_tokens].view(num_reqs, -1)
         if self.use_async_scheduling:
-            self._repair_input_ids(input_ids, self.input_batch.req_ids)
+            with record_function_or_nullcontext("preprocess: _repair_input_ids"):
+                self._repair_input_ids(input_ids, self.input_batch.req_ids)
         positions = self.positions[:num_input_tokens].view(num_reqs, -1)
         inputs_embeds = None
 
@@ -1592,7 +1593,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             )
 
         if self.use_async_scheduling:
-            self._repair_async_output_token_ids()
+            with record_function_or_nullcontext("token_history:repair"):
+                self._repair_async_output_token_ids()
 
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
@@ -1680,28 +1682,31 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         if self.is_prefill or prev_sampled is None or prev_req_id_to_index is None:
             return
 
-        prev_rows, cur_rows = [], []
-        any_skipped = False
-        for cur_row, req_id in enumerate(req_ids):
-            prev_row = prev_req_id_to_index.get(req_id)
-            if prev_row is None:
-                any_skipped = True
-                continue
-            prev_rows.append(prev_row)
-            cur_rows.append(cur_row)
+        with record_function_or_nullcontext("token_feedback:row_mapping"):
+            prev_rows, cur_rows = [], []
+            any_skipped = False
+            for cur_row, req_id in enumerate(req_ids):
+                prev_row = prev_req_id_to_index.get(req_id)
+                if prev_row is None:
+                    any_skipped = True
+                    continue
+                prev_rows.append(prev_row)
+                cur_rows.append(cur_row)
         if not prev_rows:
             return
 
         # Reuse the output snapshot without reading the device ring again.
         # The output owner keeps its pinned buffer alive through this CPU merge.
         assert self._prev_async_output is not None
-        host = self._prev_async_output.get_sampled_token_ids_cpu()[:, 0]
+        with record_function_or_nullcontext("token_feedback:shared_wait"):
+            host = self._prev_async_output.get_sampled_token_ids_cpu()[:, 0]
 
         # Matching row lists can contain holes left by newly admitted requests.
-        if not any_skipped and cur_rows == prev_rows:
-            input_ids[: len(cur_rows), 0].copy_(host[: len(cur_rows)])
-        else:
-            input_ids[cur_rows, 0] = host[prev_rows].to(input_ids.dtype)
+        with record_function_or_nullcontext("token_feedback:cpu_input"):
+            if not any_skipped and cur_rows == prev_rows:
+                input_ids[: len(cur_rows), 0].copy_(host[: len(cur_rows)])
+            else:
+                input_ids[cur_rows, 0] = host[prev_rows].to(input_ids.dtype)
 
     def _repair_async_output_token_ids(self) -> None:
         """Replace the -1 tail of output_token_ids before the logits processors read it.
@@ -1724,7 +1729,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             if not req_output_token_ids or req_output_token_ids[-1] != -1:
                 continue
             if sampled is None:
-                sampled = prev_sampled[:, 0].tolist()
+                with record_function_or_nullcontext("token_history:token_to_host"):
+                    sampled = prev_sampled[:, 0].tolist()
             req_output_token_ids[-1] = sampled[prev_row]
 
     def _bookkeeping_sync(
@@ -1961,7 +1967,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
 
         # Before anything reads token_ids_cpu this step.
         if self.use_async_scheduling:
-            self._apply_pending_token_writeback()
+            with record_function_or_nullcontext(
+                "preprocess: _apply_pending_token_writeback"
+            ):
+                self._apply_pending_token_writeback()
 
         if has_kv_transfer_group():
             kv_connector_metadata = scheduler_output.kv_connector_metadata
@@ -1975,7 +1984,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
 
         with record_function_or_nullcontext("rbln_model_runner: preprocess"):
             # Update persistent batch states.
-            self._update_states(scheduler_output)
+            with record_function_or_nullcontext("preprocess: _update_states"):
+                self._update_states(scheduler_output)
 
             if self.vllm_config.is_mm_encoder_only:
                 with self.maybe_get_ec_connector_output(
@@ -2025,15 +2035,16 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
             num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
 
-            (
-                logits_indices,
-                spec_decode_metadata,
-                query_lengths,
-                num_query_tokens,
-            ) = self._prepare_inputs(
-                scheduler_output,
-                num_scheduled_tokens_np,
-            )
+            with record_function_or_nullcontext("preprocess: _prepare_inputs"):
+                (
+                    logits_indices,
+                    spec_decode_metadata,
+                    query_lengths,
+                    num_query_tokens,
+                ) = self._prepare_inputs(
+                    scheduler_output,
+                    num_scheduled_tokens_np,
+                )
 
             batch_desc, _route, num_tokens_across_dp = (
                 self._determine_batch_execution_and_padding(num_reqs, num_query_tokens)
@@ -2041,29 +2052,33 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             # A real step has work on this rank, so the group is not drained.
             assert batch_desc is not None
 
-            attn_metadata, spec_decode_common_attn_metadata = (
-                self._build_attention_metadata(
-                    num_tokens=num_query_tokens,
-                    max_query_len=int(query_lengths.max()),
-                    num_reqs=num_reqs,
-                    num_reqs_padded=batch_desc.num_reqs_padded,
-                    logits_indices=logits_indices,
-                    back_pad=self.decode_back_pad,
+            with record_function_or_nullcontext(
+                "preprocess: _build_attention_metadata"
+            ):
+                attn_metadata, spec_decode_common_attn_metadata = (
+                    self._build_attention_metadata(
+                        num_tokens=num_query_tokens,
+                        max_query_len=int(query_lengths.max()),
+                        num_reqs=num_reqs,
+                        num_reqs_padded=batch_desc.num_reqs_padded,
+                        logits_indices=logits_indices,
+                        back_pad=self.decode_back_pad,
+                    )
                 )
-            )
 
-            (
-                staged_model_inputs,
-                model_kwargs,
-                ec_connector_output,
-            ) = self._preprocess(
-                scheduler_output,
-                num_reqs,
-                batch_desc.num_reqs_padded,
-                num_query_tokens,
-                logits_indices,
-                intermediate_tensors,
-            )
+            with record_function_or_nullcontext("preprocess: _preprocess"):
+                (
+                    staged_model_inputs,
+                    model_kwargs,
+                    ec_connector_output,
+                ) = self._preprocess(
+                    scheduler_output,
+                    num_reqs,
+                    batch_desc.num_reqs_padded,
+                    num_query_tokens,
+                    logits_indices,
+                    intermediate_tensors,
+                )
 
         self._stage_attention_metadata(attn_metadata)
         # Run the model.
@@ -2308,18 +2323,21 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         if not self.use_async_scheduling:
             return output
 
-        async_output = AsyncRBLNModelRunnerOutput(
-            model_runner_output=output,
-            sampled_token_ids=sampler_output.sampled_token_ids,
-            invalid_req_indices=invalid_req_indices,
-            pending_token_writeback=self._pending_token_writeback,
-            req_ids=list(self.input_batch.req_ids),
-            placeholder_pos=dict(self._placeholder_pos),
-            logprobs_tensors=self._async_logprobs_tensors,
-            fail_fast=self.fail_fast,
-            rank=self.parallel_config.rank,
-            dp_rank=self.parallel_config.data_parallel_rank,
-        )
+        with record_function_or_nullcontext(
+            "rbln_model_runner: AsyncRBLNModelRunnerOutput"
+        ):
+            async_output = AsyncRBLNModelRunnerOutput(
+                model_runner_output=output,
+                sampled_token_ids=sampler_output.sampled_token_ids,
+                invalid_req_indices=invalid_req_indices,
+                pending_token_writeback=self._pending_token_writeback,
+                req_ids=list(self.input_batch.req_ids),
+                placeholder_pos=dict(self._placeholder_pos),
+                logprobs_tensors=self._async_logprobs_tensors,
+                fail_fast=self.fail_fast,
+                rank=self.parallel_config.rank,
+                dp_rank=self.parallel_config.data_parallel_rank,
+            )
         self._prev_async_output = async_output
         return async_output
 
