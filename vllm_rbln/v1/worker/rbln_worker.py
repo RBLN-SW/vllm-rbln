@@ -725,6 +725,10 @@ class RBLNWorker(WorkerBase):
         return
 
     def shutdown(self) -> None:
+        runner = getattr(self, "model_runner", None)
+        if runner is not None and runner._prev_async_output is not None:
+            runner._prev_async_output.get_sampled_token_ids_cpu()
+            runner._prev_async_output = None
         self._release_offload_temp_storage()
 
         # has_kv_transfer_group can be None during interpreter shutdown.

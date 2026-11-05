@@ -12,16 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# What get_output() hands to its two consumers: the returned ModelRunnerOutput,
-# which the scheduler mutates in place, and the writeback queue, which the main
-# thread drains a step later.
+# Output handling and runner feedback share an immutable CPU token snapshot.
 
 import json
 import os
 import subprocess
 import sys
 import textwrap
-from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -32,10 +29,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 
 import vllm_rbln.v1.worker.utils as worker_utils
 from vllm_rbln.v1.sample.rbln_sampler import compile_sampler, rbln_greedy_sample
-from vllm_rbln.v1.worker.async_output import (
-    AsyncRBLNModelRunnerOutput,
-    PendingTokenWriteback,
-)
+from vllm_rbln.v1.worker.async_output import AsyncRBLNModelRunnerOutput
 
 pytestmark = pytest.mark.maybe_use_device
 
@@ -55,26 +49,31 @@ def _output(req_ids):
 def _async_output(
     tokens: torch.Tensor,
     *,
+    req_ids=None,
+    placeholder_pos=None,
     invalid_req_indices=(),
     fail_fast=False,
     rank=None,
     dp_rank=None,
 ):
-    req_ids = [f"r{i}" for i in range(len(tokens))]
-    queue: PendingTokenWriteback = deque()
+    if req_ids is None:
+        req_ids = [f"r{i}" for i in range(len(tokens))]
     async_out = AsyncRBLNModelRunnerOutput(
         model_runner_output=_output(req_ids),
         sampled_token_ids=tokens,
         invalid_req_indices=list(invalid_req_indices),
-        pending_token_writeback=queue,
         req_ids=req_ids,
-        placeholder_pos={req_id: 3 for req_id in req_ids},
+        placeholder_pos=(
+            {req_id: 3 for req_id in req_ids}
+            if placeholder_pos is None
+            else placeholder_pos
+        ),
         logprobs_tensors=None,
         fail_fast=fail_fast,
         rank=rank,
         dp_rank=dp_rank,
     )
-    return async_out, queue
+    return async_out
 
 
 class TestGetOutput:
@@ -90,13 +89,13 @@ class TestGetOutput:
     def test_output_thread_failure_uses_worker_exit_policy(
         self, monkeypatch, failure_stage, fail_fast, disabled, should_exit
     ):
-        async_out, _ = _async_output(
+        async_out = _async_output(
             torch.tensor([[7]], dtype=torch.int32), fail_fast=fail_fast
         )
         error = RuntimeError("device output failed")
         if failure_stage == "copy":
             monkeypatch.setattr(
-                async_out._sampled_token_ids_cpu, "copy_", Mock(side_effect=error)
+                async_out, "get_sampled_token_ids_cpu", Mock(side_effect=error)
             )
         else:
             async_out._logprobs_tensors = SimpleNamespace(
@@ -126,12 +125,12 @@ class TestGetOutput:
     def test_output_thread_failure_names_its_rank(self, monkeypatch, capfd):
         # The decorator's receiver here is the output, not the worker, so the
         # ranks must travel with the output for the event to name them.
-        async_out, _ = _async_output(
+        async_out = _async_output(
             torch.tensor([[7]], dtype=torch.int32), fail_fast=True, rank=2, dp_rank=1
         )
         monkeypatch.setattr(
-            async_out._sampled_token_ids_cpu,
-            "copy_",
+            async_out,
+            "get_sampled_token_ids_cpu",
             Mock(side_effect=RuntimeError("device output failed")),
         )
         monkeypatch.setenv("VLLM_RBLN_DISABLE_WORKER_FAIL_FAST", "0")
@@ -160,8 +159,8 @@ class TestGetOutput:
                     from tests.vllm.v1.worker.test_async_output import _async_output
 
                     tokens = torch.tensor([[7]], dtype=torch.int32)
-                    output, _ = _async_output(tokens, fail_fast=True)
-                    output._sampled_token_ids_cpu.copy_ = Mock(
+                    output = _async_output(tokens, fail_fast=True)
+                    output.get_sampled_token_ids_cpu = Mock(
                         side_effect=RuntimeError("subprocess output copy failed")
                     )
                     thread = Thread(target=output.get_output, daemon=True)
@@ -183,7 +182,7 @@ class TestGetOutput:
         assert "subprocess output copy failed" in result.stdout + result.stderr
 
     def test_returns_the_sampled_tokens(self):
-        async_out, _ = _async_output(torch.tensor([[7], [8]], dtype=torch.int32))
+        async_out = _async_output(torch.tensor([[7], [8]], dtype=torch.int32))
         assert async_out.get_output().sampled_token_ids == [[7], [8]]
 
     @pytest.mark.use_device
@@ -194,33 +193,31 @@ class TestGetOutput:
         greedy = compile_sampler(rbln_greedy_sample, None)
         logits = torch.tensor([[0.0, 5.0, 1.0], [9.0, 0.0, 2.0]], dtype=torch.float16)
         src = greedy(logits.to("rbln")).unsqueeze(-1)
-        async_out, _ = _async_output(src)
-        # Overwrite the source, as a later step does to the ring slot. A copy
-        # issued at construction still holds the original tokens.
+        async_out = _async_output(src)
+        # A copy issued at construction must preserve the original tokens
+        # even if the device source changes before output handling.
         src.copy_(torch.tensor([[5], [6]], dtype=src.dtype).to("rbln"))
         assert async_out.get_output().sampled_token_ids == [[1], [0]]
 
     def test_clears_the_rows_the_sampler_discarded(self):
-        async_out, _ = _async_output(
+        async_out = _async_output(
             torch.tensor([[7], [8]], dtype=torch.int32), invalid_req_indices=[1]
         )
         assert async_out.get_output().sampled_token_ids == [[7], []]
 
-    def test_queues_the_tokens_for_the_writeback(self):
-        async_out, queue = _async_output(torch.tensor([[7], [8]], dtype=torch.int32))
-        async_out.get_output()
-        req_ids, tokens, placeholder_pos = queue.popleft()
-        assert req_ids == ["r0", "r1"]
-        assert tokens == [[7], [8]]
-        assert placeholder_pos == {"r0": 3, "r1": 3}
+    def test_feedback_can_read_the_snapshot_before_get_output(self):
+        source = torch.tensor([[7], [8]], dtype=torch.int32)
+        async_out = _async_output(source)
+        source.fill_(99)
+        snapshot = async_out.get_sampled_token_ids_cpu()
+        assert snapshot.tolist() == [[7], [8]]
+        assert async_out.get_output().sampled_token_ids == [[7], [8]]
+        assert async_out.get_sampled_token_ids_cpu() is snapshot
 
-    def test_the_queued_tokens_survive_an_in_place_trim_of_the_output(self):
-        # The scheduler trims sampled_token_ids[i] in place once a request stops
-        # (Scheduler._update_request_with_output), and under world_size == 1 the
-        # output reaches it by reference -- UniProcExecutor does not serialise.
-        async_out, queue = _async_output(torch.tensor([[7], [8]], dtype=torch.int32))
+    def test_snapshot_survives_an_in_place_trim_of_the_output(self):
+        async_out = _async_output(torch.tensor([[7], [8]], dtype=torch.int32))
         output = async_out.get_output()
         for ids in output.sampled_token_ids:
-            del ids[0:]
+            ids.clear()
         assert output.sampled_token_ids == [[], []]
-        assert queue.popleft()[1] == [[7], [8]]
+        assert async_out.get_sampled_token_ids_cpu().tolist() == [[7], [8]]

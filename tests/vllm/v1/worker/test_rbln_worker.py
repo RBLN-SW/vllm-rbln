@@ -375,6 +375,29 @@ class TestWorkerFailFast:
             assert excinfo.value is error
 
 
+def test_shutdown_waits_for_the_last_async_token_copy(monkeypatch):
+    from tests.vllm.v1.worker.test_async_output import _async_output
+
+    previous = _async_output(torch.tensor([[42]], dtype=torch.int32))
+    phases = []
+    wait = Mock(
+        side_effect=lambda: phases.append("copy_complete"),
+    )
+    monkeypatch.setattr(previous, "get_sampled_token_ids_cpu", wait)
+    worker = object.__new__(RBLNWorker)
+    worker.model_runner = SimpleNamespace(_prev_async_output=previous)
+    worker.profiler = None
+    worker._release_offload_temp_storage = Mock(
+        side_effect=lambda: phases.append("release_storage")
+    )
+    monkeypatch.setattr(wm, "ensure_kv_transfer_shutdown", None)
+
+    worker.shutdown()
+
+    assert phases == ["copy_complete", "release_storage"]
+    assert worker.model_runner._prev_async_output is None
+
+
 class TestConformance:
     def test_extends_worker_base(self):
         assert issubclass(RBLNWorker, WorkerBase)
@@ -1317,7 +1340,8 @@ class TestEcConnectorLifecycle:
         monkeypatch.setattr(ec_state, "_EC_CONNECTOR_AGENT", connector)
         worker = make_worker()
         worker.model_runner = SimpleNamespace(
-            load_model=lambda: connector.calls.append("load_model")
+            load_model=lambda: connector.calls.append("load_model"),
+            _prev_async_output=None,
         )
         monkeypatch.setattr(wm, "set_current_vllm_config", lambda _: nullcontext())
         monkeypatch.setattr(worker, "_release_offload_temp_storage", lambda: None)
