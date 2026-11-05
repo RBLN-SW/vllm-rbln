@@ -326,7 +326,11 @@ def test_scheduling_budget_is_independent_of_prefill_chunk_size():
         max_model_len=128, max_num_batched_tokens=256, block_size=16, num_blocks=32
     )
     assert scheduler.vllm_config.additional_config.prefill_chunk_size == 16
-    assert scheduler.max_num_scheduled_tokens == 128
+    assert scheduler.scheduler_config.max_num_batched_tokens == 128
+    assert (
+        scheduler.max_num_scheduled_tokens
+        == scheduler.scheduler_config.max_num_batched_tokens
+    )
 
 
 def test_full_prompt_is_scheduled_with_a_smaller_prefill_graph(monkeypatch):

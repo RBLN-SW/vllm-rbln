@@ -37,6 +37,7 @@ def _vllm_config(
     max_model_len: int = 8192,
     max_num_seqs: int = 4,
     max_num_batched_tokens: int = 0,
+    max_num_scheduled_tokens: int | None = None,
     max_source_positions: int | None = None,
     additional_config: dict | None = None,
 ) -> SimpleNamespace:
@@ -48,6 +49,7 @@ def _vllm_config(
         scheduler_config=SimpleNamespace(
             max_num_seqs=max_num_seqs,
             max_num_batched_tokens=max_num_batched_tokens,
+            max_num_scheduled_tokens=max_num_scheduled_tokens,
         ),
         additional_config=build_optimum_rbln_config(additional_config),
     )
@@ -75,10 +77,16 @@ class TestUpdateMaxNumBatchedTokens:
         update_max_num_batched_tokens(cfg)
         assert cfg.scheduler_config.max_num_batched_tokens == 8192
 
-    def test_larger_vllm_default_is_preserved(self):
+    def test_larger_vllm_default_is_replaced(self):
         cfg = _vllm_config(arch=DECODER_ARCH, max_num_batched_tokens=16384)
         update_max_num_batched_tokens(cfg)
-        assert cfg.scheduler_config.max_num_batched_tokens == 16384
+        assert cfg.scheduler_config.max_num_batched_tokens == 8192
+
+    @pytest.mark.parametrize("budget", [0, 256, 8192, 16384])
+    def test_explicit_scheduled_token_budget_is_rejected(self, budget):
+        cfg = _vllm_config(arch=DECODER_ARCH, max_num_scheduled_tokens=budget)
+        with pytest.raises(ValueError, match="max_num_scheduled_tokens cannot be set"):
+            update_max_num_batched_tokens(cfg)
 
     def test_enc_dec_layers_source_positions(self):
         cfg = _vllm_config(

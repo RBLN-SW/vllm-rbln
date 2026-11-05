@@ -136,16 +136,7 @@ class RBLNOptimumScheduler(Scheduler):
             if self.scheduler_config.max_num_active_seqs is not None
             else self.max_num_running_reqs
         )
-        # Optimum chunks inside the model, so a step must fit a whole prompt
-        # or a full decode batch independently of the prefill graph size.
-        self.max_num_scheduled_tokens = (
-            self.scheduler_config.max_num_scheduled_tokens
-            if self.scheduler_config.max_num_scheduled_tokens
-            else max(
-                vllm_config.model_config.max_model_len,
-                self.scheduler_config.max_num_seqs,
-            )
-        )
+        self.max_num_scheduled_tokens = self.scheduler_config.max_num_batched_tokens
         self.max_model_len = vllm_config.model_config.max_model_len
         self.enable_kv_cache_events = (
             self.kv_events_config is not None

@@ -117,8 +117,13 @@ def update_max_num_batched_tokens(vllm_config: VllmConfig) -> None:
     """
     hf_config = vllm_config.model_config.hf_config
     scheduler_config = vllm_config.scheduler_config
+    if scheduler_config.max_num_scheduled_tokens is not None:
+        raise ValueError(
+            "max_num_scheduled_tokens cannot be set on the optimum model path. "
+            "The scheduling budget is determined automatically. "
+            "Omit max_num_scheduled_tokens."
+        )
     scheduler_config.max_num_batched_tokens = max(
-        scheduler_config.max_num_batched_tokens,
         vllm_config.model_config.max_model_len,
         scheduler_config.max_num_seqs,
         getattr(hf_config, "max_source_positions", 0)

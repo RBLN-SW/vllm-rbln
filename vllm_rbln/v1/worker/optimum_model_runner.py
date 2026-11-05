@@ -233,7 +233,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         self.input_batch = RBLNInputBatch(
             max_num_reqs=self.max_num_reqs,
             max_model_len=self.max_model_len,
-            max_num_batched_tokens=rbln_config.prefill_chunk_size,
+            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
             device=self.device,
             vocab_size=self.model_config.get_vocab_size(),
             block_sizes=[cache_config.block_size],
