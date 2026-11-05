@@ -107,7 +107,6 @@ def _resolve_cached_rbln_config(
     rbln_config.cached_model_path = cached_model_path
     if is_compiled_dir(cached_model_path):
         logger.info("Found cached compiled model at %s", cached_model_path)
-        vllm_config.model_config.model = cached_model_path
         return load_compiled_rbln_config(vllm_config)
     return None
 

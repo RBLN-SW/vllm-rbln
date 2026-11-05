@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Test config forwarding to optimum-rbln during compilation on a cache miss.
+"""Test model loading paths and config forwarding to optimum-rbln.
 
 Configs defined in transformers are passed directly as objects. Other configs
 are passed as kwargs containing ``num_hidden_layers`` and, when available,
@@ -21,6 +21,7 @@ NPU-dependent operations are replaced with test doubles.
 
 import types
 
+import pytest
 import torch
 from transformers import Gemma4Config
 
@@ -29,7 +30,7 @@ from vllm_rbln.model_executor.models.optimum import model_base
 from vllm_rbln.model_executor.models.optimum.model_base import RBLNOptimumModelBase
 
 
-def _init_model_with(monkeypatch, tmp_path, hf_config) -> dict:
+def _init_model_with(monkeypatch, tmp_path, hf_config, *, precompiled=False) -> dict:
     passed = {}
 
     class FakeRBLNModel:
@@ -38,13 +39,21 @@ def _init_model_with(monkeypatch, tmp_path, hf_config) -> dict:
             passed["model"] = path
             passed.update(kwargs)
             return types.SimpleNamespace(
-                rbln_config=types.SimpleNamespace(), save_pretrained=lambda p: None
+                rbln_config=types.SimpleNamespace(),
+                save_pretrained=lambda path: passed.update(saved_to=path),
             )
 
     monkeypatch.setattr(
         model_base.optimum.rbln, "FakeRBLNModel", FakeRBLNModel, raising=False
     )
-    monkeypatch.setattr(model_base, "is_compiled_dir", lambda path: False)
+    monkeypatch.setattr(
+        model_base, "get_rbln_model_info", lambda cfg: ("fake", "FakeRBLNModel")
+    )
+    monkeypatch.setattr(
+        model_base,
+        "is_compiled_dir",
+        lambda path: precompiled and path == str(tmp_path),
+    )
     monkeypatch.setattr(model_base, "get_attn_block_size", lambda cfg: 4096)
 
     obj = RBLNOptimumModelBase.__new__(RBLNOptimumModelBase)
@@ -76,6 +85,7 @@ def _init_model_with(monkeypatch, tmp_path, hf_config) -> dict:
     )
     obj.init_model()
     passed["compile_spec"] = obj.vllm_config.additional_config.compile_spec
+    passed["source_model"] = obj.model_config.model
     return passed
 
 
@@ -136,3 +146,14 @@ def test_compilation_uses_the_spec_that_was_hashed(monkeypatch, tmp_path):
 
     passed["rbln_config"]["prefill_chunk_size"] = 512
     assert passed["compile_spec"]["rbln_config"]["prefill_chunk_size"] == 256
+
+
+@pytest.mark.parametrize("precompiled", [False, True])
+def test_model_id_is_preserved_after_loading(monkeypatch, tmp_path, precompiled):
+    hf_config = types.SimpleNamespace(architectures=["Qwen3ForCausalLM"])
+    hf_config.get_text_config = lambda: types.SimpleNamespace(num_hidden_layers=2)
+    passed = _init_model_with(monkeypatch, tmp_path, hf_config, precompiled=precompiled)
+    assert passed["source_model"] == "repo"
+    assert passed["model"] == (str(tmp_path) if precompiled else "compile-source")
+    if not precompiled:
+        assert passed["saved_to"] == str(tmp_path)

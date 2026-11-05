@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -20,7 +22,10 @@ import torch
 from vllm_rbln.config import build_optimum_rbln_config
 from vllm_rbln.utils.optimum.converter import dispatch
 from vllm_rbln.utils.optimum.converter.dispatch import _generate_model_path_name
-from vllm_rbln.utils.optimum.converter.params import RBLNParams
+from vllm_rbln.utils.optimum.converter.params import (
+    RBLNParams,
+    load_compiled_rbln_config,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -236,3 +241,34 @@ class TestGenerateModelPathName:
         dispatch.sync_vllm_and_optimum(cfg)
         assert cfg.additional_config.attn_block_size == 8192
         assert cfg.cache_config.block_size == 128
+
+    def test_cache_metadata_is_loaded_without_replacing_the_model_id(self, monkeypatch):
+        cfg = _vllm_config()
+        source_model = cfg.model_config.model
+        cache_path = Path(cfg.additional_config.cached_model_path)
+        cache_path.mkdir(parents=True)
+        metadata = {"prefill_chunk_size": 256}
+        (cache_path / "rbln_config.json").write_text(json.dumps(metadata))
+        monkeypatch.setattr(
+            dispatch, "load_compiled_rbln_config", load_compiled_rbln_config
+        )
+        monkeypatch.setattr(
+            dispatch, "is_compiled_dir", lambda path: path == str(cache_path)
+        )
+        assert dispatch._resolve_cached_rbln_config(cfg, RBLNParams()) == metadata
+        assert cfg.model_config.model == source_model
+
+        synced = []
+        monkeypatch.setattr(
+            dispatch, "sync_from_optimum", lambda cfg, data: synced.append(data)
+        )
+        monkeypatch.setattr(
+            dispatch,
+            "sync_from_vllm",
+            lambda cfg: pytest.fail(
+                "cached metadata must bypass compile input parsing"
+            ),
+        )
+        dispatch.sync_vllm_and_optimum(cfg)
+        assert synced == [metadata]
+        assert cfg.model_config.model == source_model

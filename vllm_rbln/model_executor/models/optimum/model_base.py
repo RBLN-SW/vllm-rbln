@@ -220,7 +220,6 @@ class RBLNOptimumModelBase(nn.Module):
                     valid_path,
                     rbln_config=rbln_overrides,
                 )
-                self.vllm_config.model_config.model = valid_path
         else:
             assert not self._is_ec_producer_only(), (
                 "Disaggregated Encoder is only supported for pre-compiled model."
@@ -261,7 +260,6 @@ class RBLNOptimumModelBase(nn.Module):
                 **config_override,
             )
             model.save_pretrained(cached_model_path)  # type: ignore[attr-defined]
-            self.vllm_config.model_config.model = cached_model_path
 
         self.supports_transcription_only = (
             model_cls_name == "RBLNOptimumWhisperForConditionalGeneration"

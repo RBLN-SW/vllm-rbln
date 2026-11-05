@@ -55,12 +55,15 @@ def _cfg_get_submodule(cfg: RblnConfigLike, submodule: str) -> RblnConfigLike | 
 
 
 def load_compiled_rbln_config(vllm_config: VllmConfig) -> dict | None:
-    """Load the ``rbln_config.json`` artefact written by optimum-rbln.
+    """Load optimum-rbln metadata from the model directory or compile cache.
 
-    Returns ``None`` if the model directory has no compiled artefact yet
-    (e.g. pre-compile stage or HuggingFace-only model path).
+    Returns ``None`` if neither directory contains compiled metadata.
     """
     rbln_config_path = Path(vllm_config.model_config.model) / RBLN_CONFIG_FILE
+    if not rbln_config_path.exists():
+        cached_model_path = vllm_config.additional_config.cached_model_path
+        if cached_model_path is not None:
+            rbln_config_path = Path(cached_model_path) / RBLN_CONFIG_FILE
     if not rbln_config_path.exists():  # for pytest
         logger.warning(
             "rbln_config.json not found in model directory: %s. "
