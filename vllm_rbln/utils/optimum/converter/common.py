@@ -150,10 +150,12 @@ def apply_user_prefill_chunk_size(
     """Resolve the compiled chunk size independently of the scheduling budget."""
     rbln_config: OptimumRBLNConfig = vllm_config.additional_config
     chunk = rbln_config.prefill_chunk_size
-    if (
-        is_chunked_prefill_arch(vllm_config.model_config.hf_config)
-        and chunk is not None
-    ):
+    if chunk is not None:
+        if not is_chunked_prefill_arch(vllm_config.model_config.hf_config):
+            raise ValueError(
+                "prefill_chunk_size cannot be specified for a model that does "
+                "not support chunked prefill. Omit --rbln-prefill-chunk-size."
+            )
         if precompiled and chunk != params.prefill_chunk_size:
             raise ValueError(
                 f"prefill_chunk_size ({chunk}) conflicts with the compiled "

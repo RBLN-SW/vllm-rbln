@@ -91,20 +91,24 @@ class TestUpdateMaxNumBatchedTokens:
 
 
 class TestApplyUserPrefillChunkSize:
-    def test_noop_for_pooling(self):
+    @pytest.mark.parametrize("arch", [ENC_DEC_ARCH, POOLING_ARCH])
+    @pytest.mark.parametrize("precompiled", [False, True])
+    @pytest.mark.parametrize("chunk", [128, 512])
+    def test_non_chunked_arch_rejects_user_value(self, arch, precompiled, chunk):
         cfg = _vllm_config(
-            arch=POOLING_ARCH,
-            additional_config={"prefill_chunk_size": 512},
+            arch=arch,
+            additional_config={"prefill_chunk_size": chunk},
         )
         params = RBLNParams(prefill_chunk_size=128)
-        apply_user_prefill_chunk_size(cfg, params, precompiled=False)
-        assert params.prefill_chunk_size == 128
-        assert cfg.additional_config.prefill_chunk_size == 128
+        with pytest.raises(ValueError, match="not support chunked prefill"):
+            apply_user_prefill_chunk_size(cfg, params, precompiled=precompiled)
 
-    def test_noop_when_user_unset(self):
-        cfg = _vllm_config(arch=DECODER_ARCH, additional_config={})
+    @pytest.mark.parametrize("arch", [DECODER_ARCH, ENC_DEC_ARCH, POOLING_ARCH])
+    @pytest.mark.parametrize("precompiled", [False, True])
+    def test_noop_when_user_unset(self, arch, precompiled):
+        cfg = _vllm_config(arch=arch, additional_config={})
         params = RBLNParams(prefill_chunk_size=128)
-        apply_user_prefill_chunk_size(cfg, params, precompiled=False)
+        apply_user_prefill_chunk_size(cfg, params, precompiled=precompiled)
         assert params.prefill_chunk_size == 128
         assert cfg.additional_config.prefill_chunk_size == 128
 
