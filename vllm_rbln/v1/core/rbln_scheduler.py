@@ -38,12 +38,15 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.utils import record_function_or_nullcontext
 
+import vllm_rbln.envs as rbln_envs
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.core.rbln_kv_cache_manager import (
     KVCacheCopyOp,
+    KVCacheTailOp,
     RBLNKVCacheManager,
     SubBlockMatch,
+    TailMatch,
 )
 from vllm_rbln.v1.core.utils import (
     DecodeBatchBudget,
@@ -62,6 +65,8 @@ class RBLNSchedulerOutput(SchedulerOutput):
     prefix caching."""
 
     kv_cache_copy_ops: list[KVCacheCopyOp] = field(default_factory=list)
+    # Host tail saves and loads, run in order before the copy ops.
+    kv_cache_tail_ops: list[KVCacheTailOp] = field(default_factory=list)
 
 
 class RBLNScheduler(Scheduler):
@@ -96,6 +101,7 @@ class RBLNScheduler(Scheduler):
                 hash_block_size=self.block_size,
                 sub_block_size=sub_block_size,
                 hash_fn=hash_fn,
+                tail_offload_slots=rbln_envs.VLLM_RBLN_TAIL_OFFLOAD_SLOTS,
                 use_eagle=self.use_eagle,
                 log_stats=self.log_stats,
                 enable_kv_cache_events=self.enable_kv_cache_events,
@@ -110,6 +116,12 @@ class RBLNScheduler(Scheduler):
                 self.block_size,
                 sub_block_size,
             )
+            if self.kv_cache_manager.host_tail is not None:
+                logger.info(
+                    "Tail reuse enabled: sub-blocks extend KV-connector hits, "
+                    "%d host tail slots",
+                    self.kv_cache_manager.host_tail.num_slots,
+                )
             if self.enable_kv_cache_events:
                 logger.info(
                     "NOTE that KV cache events emit at sub_block_size granularity. "
@@ -117,6 +129,14 @@ class RBLNScheduler(Scheduler):
                     "sub_block_size=%d.",
                     sub_block_size,
                 )
+
+        # Tail reuse: sub-block matches extend a connector hit instead of
+        # competing with it (see RBLNKVCacheManager.get_tail_match).
+        self._tail_reuse = (
+            isinstance(self.kv_cache_manager, RBLNKVCacheManager)
+            and self.kv_cache_manager.host_tail is not None
+        )
+        self._tail_stats_logged_at = time.monotonic()
 
         # NOTE(RBLN): Block deltas already committed in the KV cache manager
         # but not yet delivered to the model runner because the request was
@@ -495,7 +515,7 @@ class RBLNScheduler(Scheduler):
                 else:
                     step_skipped_waiting.appendleft(request_to_skip)
 
-            sub_block_match = None
+            sub_block_match: SubBlockMatch | TailMatch | None = None
 
             while token_budget > 0:
                 num_running = len(self.running) + self.num_waiting_for_streaming_input
@@ -590,7 +610,19 @@ class RBLNScheduler(Scheduler):
                         self.connector is not None
                         and request.status == RequestStatus.PREEMPTED
                     )
-                    if not resuming_with_connector:
+                    if not resuming_with_connector and self._tail_reuse:
+                        # Sub-blocks of the next block after local + connector
+                        # hits, from HBM or a host tail slot; both hits stand.
+                        assert isinstance(self.kv_cache_manager, RBLNKVCacheManager)
+                        sub_block_match = self.kv_cache_manager.get_tail_match(
+                            request,
+                            num_new_local_computed_tokens
+                            + num_external_computed_tokens,
+                            after_connector=num_external_computed_tokens > 0,
+                        )
+                        if sub_block_match is not None:
+                            num_sub_block_tokens = sub_block_match.num_tokens
+                    elif not resuming_with_connector:
                         sub_block_match, num_sub_block_tokens = (
                             self._try_sub_block_match(
                                 request,
@@ -598,7 +630,11 @@ class RBLNScheduler(Scheduler):
                                 num_external_computed_tokens,
                             )
                         )
-                    if num_sub_block_tokens > 0 and num_external_computed_tokens > 0:
+                    if (
+                        not self._tail_reuse
+                        and num_sub_block_tokens > 0
+                        and num_external_computed_tokens > 0
+                    ):
                         # Cancel the KV connector match in favor of the sub-block match
                         request.num_external_computed_tokens = 0
                         num_external_computed_tokens = 0
@@ -1033,6 +1069,9 @@ class RBLNScheduler(Scheduler):
             scheduler_output.kv_cache_copy_ops = (
                 self.kv_cache_manager.drain_pending_copy_ops()
             )
+            scheduler_output.kv_cache_tail_ops = (
+                self.kv_cache_manager.drain_pending_tail_ops()
+            )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
@@ -1137,6 +1176,24 @@ class RBLNScheduler(Scheduler):
             if scheduler_output.kv_cache_copy_ops:
                 self.kv_cache_manager.release_copy_ops(
                     scheduler_output.kv_cache_copy_ops
+                )
+            host_tail = self.kv_cache_manager.host_tail
+            now = time.monotonic()
+            if host_tail is not None and now - self._tail_stats_logged_at >= 60:
+                self._tail_stats_logged_at = now
+                s = self.kv_cache_manager.tail_stats
+                logger.info(
+                    "Tail reuse: %d saves, %d host loads (%d tokens), %d HBM "
+                    "matches after a connector hit (%d tokens), %d/%d slots "
+                    "used, %d evictions",
+                    s["saves"],
+                    s["host_loads"],
+                    s["host_tokens"],
+                    s["hbm_after_connector"],
+                    s["hbm_after_connector_tokens"],
+                    len(host_tail),
+                    host_tail.num_slots,
+                    host_tail.evictions,
                 )
 
         return result

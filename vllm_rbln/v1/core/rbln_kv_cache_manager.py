@@ -20,6 +20,7 @@ See docs/sub_block_prefix_caching.md for design overview and rationale.
 from __future__ import annotations
 
 import logging
+from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -78,6 +79,88 @@ class KVCacheCopyOp:
     dst_block_id: int
     # Number of tokens to copy (= num_matched_sub_blocks * sub_block_size).
     num_tokens: int
+
+
+@dataclass
+class KVCacheTailOp:
+    """Moves one tail block between the KV cache and a host tail slot.
+
+    ``save`` copies block ``block_id`` into host slot ``slot``; ``load`` copies
+    the slot into block ``block_id``. The whole block moves; only its first
+    ``num_tokens`` tokens are claimed. The model runner runs the ops in the
+    order they were made, before the step's copy ops, connector loads and
+    forward, so a save reads a freed block before anything can reuse it.
+    """
+
+    kind: str  # "save" | "load"
+    group_id: int
+    slot: int
+    block_id: int
+    num_tokens: int
+
+
+class HostTailIndex:
+    """Sub-block hash chains of the tail blocks offloaded to host slots.
+
+    A finished request's last, partial block is the one block a KV connector
+    that stores whole chunks cannot restore, and the upstream pool frees it
+    first. Its complete sub-blocks are kept in a host slot (LRU over
+    ``num_slots``) keyed by their chained hashes, so a later request extends a
+    full-block (or connector) hit by them at the block boundary.
+    """
+
+    def __init__(self, num_slots: int) -> None:
+        self.num_slots = num_slots
+        # slot -> sub-block hashes it holds, least recently used first.
+        self._slot_hashes: OrderedDict[int, list[BlockHash]] = OrderedDict()
+        self._hash_to_slots: dict[BlockHash, set[int]] = {}
+        self._free = list(range(num_slots - 1, -1, -1))
+        self.evictions = 0
+
+    def longest_match(self, query: Sequence[BlockHash]) -> tuple[int | None, int]:
+        """``(slot, depth)`` of the deepest chain prefix held, or ``(None, 0)``."""
+        slot, depth = None, 0
+        for d, h in enumerate(query, start=1):
+            slots = self._hash_to_slots.get(h)
+            if not slots:
+                break
+            slot, depth = next(iter(slots)), d
+        return slot, depth
+
+    def touch(self, slot: int) -> None:
+        self._slot_hashes.move_to_end(slot)
+
+    def insert(self, hashes: Sequence[BlockHash]) -> int | None:
+        """Claim a slot for ``hashes``; ``None`` when one already holds them all.
+
+        Evicts the least recently used slot when none is free. Ops run in the
+        order they are made, so a load already made from the evicted slot
+        reads it before the save made here overwrites it.
+        """
+        holders = self._hash_to_slots.get(hashes[-1])
+        if holders:
+            self.touch(next(iter(holders)))
+            return None
+        if self._free:
+            slot = self._free.pop()
+        else:
+            slot, old = self._slot_hashes.popitem(last=False)
+            self._drop(slot, old)
+            self.evictions += 1
+        self._slot_hashes[slot] = list(hashes)
+        for h in hashes:
+            self._hash_to_slots.setdefault(h, set()).add(slot)
+        return slot
+
+    def _drop(self, slot: int, hashes: list[BlockHash]) -> None:
+        for h in hashes:
+            slots = self._hash_to_slots[h]
+            slots.discard(slot)
+            if not slots:
+                del self._hash_to_slots[h]
+
+    def __len__(self) -> int:
+        return len(self._slot_hashes)
 
 
 class SubBlockHasher:
@@ -266,6 +349,23 @@ class SubBlockMatch:
 
 
 @dataclass(slots=True)
+class TailMatch:
+    """A sub-block extension at a block boundary past a connector hit.
+
+    Served from HBM (``hbm``, a ``SubBlockMatch`` copied block to block) or
+    from a host tail slot (``slot``, loaded into the request's block at
+    ``dst_req_block_index``). Apply or release it like a ``SubBlockMatch``.
+    """
+
+    request: Request
+    num_tokens: int
+    hbm: SubBlockMatch | None = None
+    slot: int | None = None
+    dst_req_block_index: int = 0
+    after_connector: bool = False
+
+
+@dataclass(slots=True)
 class _GroupPartialMatch:
     """Per-group partial match info."""
 
@@ -327,6 +427,7 @@ class RBLNKVCacheManager(KVCacheManager):
         hash_block_size: int,
         sub_block_size: int,
         hash_fn: Callable,
+        tail_offload_slots: int = 0,
         **kwargs,
     ) -> None:
         assert self.can_use_sub_block_caching(kv_cache_config, sub_block_size)
@@ -372,6 +473,24 @@ class RBLNKVCacheManager(KVCacheManager):
         self.enable_kv_cache_events = self.block_pool.enable_kv_cache_events
         self.block_pool.enable_kv_cache_events = False
         self._sub_block_event_queue: list[KVCacheEvent] = []
+
+        # Host tail tier (single group only): finished requests' tail blocks
+        # saved to host slots, matched past a connector hit. Tail ops are
+        # drained with the copy ops and run in order before them.
+        self.host_tail: HostTailIndex | None = None
+        if tail_offload_slots > 0 and len(self._group_infos) == 1:
+            self.host_tail = HostTailIndex(tail_offload_slots)
+        self.pending_tail_ops: list[KVCacheTailOp] = []
+        self.tail_stats: dict[str, int] = dict.fromkeys(
+            (
+                "saves",
+                "host_loads",
+                "host_tokens",
+                "hbm_after_connector",
+                "hbm_after_connector_tokens",
+            ),
+            0,
+        )
 
         self._install_eviction_hook()
 
@@ -465,13 +584,126 @@ class RBLNKVCacheManager(KVCacheManager):
 
         return match
 
-    def apply_sub_block_match(self, match: SubBlockMatch) -> None:
+    def get_tail_match(
+        self, request: Request, num_computed_tokens: int, after_connector: bool = False
+    ) -> TailMatch | None:
+        """Extend a hit that ends on a block boundary by sub-blocks of the next block.
+
+        ``num_computed_tokens`` is the local full-block hit plus whatever a
+        connector restores after it. The sub-blocks come from HBM (a block
+        still holding the prefix) or, when that covers less, from a host tail
+        slot. Either way the connector's hit stands: this only adds to it.
+        """
+        gi = self._group_infos[0]
+        if num_computed_tokens % gi.block_size:
+            return None
+        hbm = self.get_computed_blocks_sub_block(request, num_computed_tokens)
+        hbm_tokens = hbm.num_tokens if hbm is not None else 0
+        if self.host_tail is not None and not request.skip_reading_prefix_cache:
+            sbpb = gi.sub_blocks_per_block
+            k = num_computed_tokens // gi.block_size
+            hashes = self._get_or_compute_sub_hashes(request).hashes
+            slot, depth = self.host_tail.longest_match(
+                hashes[k * sbpb : k * sbpb + sbpb - 1]
+            )
+            # Keep the last token for the forward, as upstream does.
+            cap = (
+                (request.num_tokens - 1) - num_computed_tokens
+            ) // self.sub_block_size
+            host_tokens = min(depth, cap) * self.sub_block_size
+            if slot is not None and host_tokens > hbm_tokens:
+                if hbm is not None:
+                    self.release_sub_block_match(hbm)
+                return TailMatch(
+                    request=request,
+                    num_tokens=host_tokens,
+                    slot=slot,
+                    dst_req_block_index=k,
+                    after_connector=after_connector,
+                )
+        if hbm is None:
+            return None
+        return TailMatch(
+            request=request,
+            num_tokens=hbm_tokens,
+            hbm=hbm,
+            after_connector=after_connector,
+        )
+
+    def drain_pending_tail_ops(self) -> list[KVCacheTailOp]:
+        """Return and clear the tail saves and loads made since the last drain."""
+        ops = self.pending_tail_ops
+        self.pending_tail_ops = []
+        return ops
+
+    def _offload_tail(self, request: Request) -> None:
+        """Save a finished request's partial last block to a host tail slot.
+
+        Only complete sub-blocks count, as for the HBM index. Runs before the
+        blocks go back to the pool; the save is drained into the next step,
+        whose model runner copies it out before anything can reuse the block.
+        """
+        if self.host_tail is None or not request.is_finished():
+            return
+        gi = self._group_infos[0]
+        last_blk_idx, remainder = divmod(request.num_computed_tokens, gi.block_size)
+        num_sub_blocks = remainder // self.sub_block_size
+        if num_sub_blocks == 0:
+            return
+        block_list = self.coordinator.get_blocks(request.request_id)[0]
+        if last_blk_idx >= len(block_list):
+            return
+        start = last_blk_idx * gi.sub_blocks_per_block
+        hashes = self._get_or_compute_sub_hashes(request).hashes[
+            start : start + num_sub_blocks
+        ]
+        if len(hashes) < num_sub_blocks:
+            return
+        slot = self.host_tail.insert(hashes)
+        if slot is None:
+            return
+        self.pending_tail_ops.append(
+            KVCacheTailOp(
+                kind="save",
+                group_id=0,
+                slot=slot,
+                block_id=block_list[last_blk_idx].block_id,
+                num_tokens=num_sub_blocks * self.sub_block_size,
+            )
+        )
+        self.tail_stats["saves"] += 1
+
+    def apply_sub_block_match(self, match: SubBlockMatch | TailMatch) -> None:
         """Create copy ops from a sub-block match.
 
         Call this after ``allocate_slots`` succeeds. The source-block refs
         owned by *match* are transferred to the pending copy ops (released
-        by ``release_copy_ops``).
+        by ``release_copy_ops``). A host ``TailMatch`` becomes a tail load.
         """
+        if isinstance(match, TailMatch):
+            if match.hbm is not None:
+                if match.after_connector:
+                    self.tail_stats["hbm_after_connector"] += 1
+                    self.tail_stats["hbm_after_connector_tokens"] += match.num_tokens
+                self.apply_sub_block_match(match.hbm)
+                return
+            assert self.host_tail is not None and match.slot is not None
+            dst = self.coordinator.get_blocks(match.request.request_id)[0][
+                match.dst_req_block_index
+            ]
+            self.pending_tail_ops.append(
+                KVCacheTailOp(
+                    kind="load",
+                    group_id=0,
+                    slot=match.slot,
+                    block_id=dst.block_id,
+                    num_tokens=match.num_tokens,
+                )
+            )
+            self.host_tail.touch(match.slot)
+            self.tail_stats["host_loads"] += 1
+            self.tail_stats["host_tokens"] += match.num_tokens
+            return
         request = match.request
         blocks = self.coordinator.get_blocks(request.request_id)
 
@@ -488,12 +720,16 @@ class RBLNKVCacheManager(KVCacheManager):
                 )
             )
 
-    def release_sub_block_match(self, match: SubBlockMatch) -> None:
+    def release_sub_block_match(self, match: SubBlockMatch | TailMatch) -> None:
         """Release source-block references held by a sub-block match.
 
         Call this when discarding a match (e.g. connector provides better
-        coverage, or allocation failed).
+        coverage, or allocation failed). A host ``TailMatch`` holds nothing.
         """
+        if isinstance(match, TailMatch):
+            if match.hbm is not None:
+                self.release_sub_block_match(match.hbm)
+            return
         self.block_pool.free_blocks([gm.src_block for gm in match.group_matches])
 
     def allocate_slots(
@@ -588,6 +824,7 @@ class RBLNKVCacheManager(KVCacheManager):
     def free(self, request: Request) -> None:
         """Index any not-yet-indexed sub-blocks, free blocks, and clean up
         sub-block state for the request."""
+        self._offload_tail(request)
         self._finalize_sub_block_state(request)
         super().free(request)
 
@@ -600,6 +837,7 @@ class RBLNKVCacheManager(KVCacheManager):
         request comes through too and goes back on the waiting queue, where the
         state it needs is rebuilt from its tokens on resume.
         """
+        self._offload_tail(request)
         self._finalize_sub_block_state(request)
         return super().pop_blocks_for_free(request)
 

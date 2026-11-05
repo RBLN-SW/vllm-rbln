@@ -64,6 +64,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_USE_CUSTOM_KERNEL: bool = False
     # --- MODEL INPUT / SCHEDULING ---
     VLLM_RBLN_SUB_BLOCK_CACHE: bool = True
+    VLLM_RBLN_TAIL_OFFLOAD_SLOTS: int = 0
     VLLM_RBLN_SUB_BLOCK_SIZE: int | None = None
     # --- MOE ---
     VLLM_RBLN_SPECIALIZE_MOE_DECODE: bool = True
@@ -315,6 +316,13 @@ environment_variables = {
     "VLLM_RBLN_SUB_BLOCK_CACHE": lambda: (
         os.environ.get("VLLM_RBLN_SUB_BLOCK_CACHE", "True").lower() in ("true", "1")
     ),
+    # Host tail slots per engine (0 = off). A finished request's partial last
+    # block is saved to a host slot by sub-block hash, and a later request
+    # extends a full-block or KV-connector hit with it at the block boundary
+    # (from HBM when a block still holds it). Not a compile input.
+    "VLLM_RBLN_TAIL_OFFLOAD_SLOTS": lambda: int(
+        os.environ.get("VLLM_RBLN_TAIL_OFFLOAD_SLOTS", 0)
+    ),
     # Unset is None, not 0: RBLNConfig takes a size above zero or nothing.
     "VLLM_RBLN_SUB_BLOCK_SIZE": lambda: (
         int(size) if (size := os.environ.get("VLLM_RBLN_SUB_BLOCK_SIZE")) else None
@@ -402,6 +410,7 @@ RBLN_NON_COMPILE_ENV = frozenset(
         "VLLM_RBLN_AUTO_PORT",
         "VLLM_RBLN_SUB_BLOCK_CACHE",
         "VLLM_RBLN_SUB_BLOCK_SIZE",
+        "VLLM_RBLN_TAIL_OFFLOAD_SLOTS",
         # RBLNConfig fields: the config hash keys the bundle on these
         "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK",
         "VLLM_RBLN_ENFORCE_MODEL_FP32",

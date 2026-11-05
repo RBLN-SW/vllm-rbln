@@ -34,7 +34,7 @@ from vllm.v1.core.kv_cache_utils import (
     init_none_hash,
     maybe_convert_block_hash,
 )
-from vllm.v1.request import Request
+from vllm.v1.request import Request, RequestStatus
 
 from tests.vllm.v1.core.utils import (
     full_attention_spec,
@@ -47,6 +47,7 @@ from tests.vllm.v1.core.utils import (
     sub_block_index,
 )
 from vllm_rbln.v1.core.rbln_kv_cache_manager import (
+    HostTailIndex,
     RBLNKVCacheManager,
     SubBlockHasher,
     SubBlockIndex,
@@ -1473,3 +1474,142 @@ class TestMultiGroup:
         assert match.num_tokens == SUB_BLOCK_SIZE
         assert num_computed + match.num_tokens <= req1.num_tokens - 1
         manager.release_sub_block_match(match)
+
+
+def _tail_manager(slots: int = 2) -> RBLNKVCacheManager:
+    return RBLNKVCacheManager(
+        kv_cache_config=make_kv_cache_config([full_attention_spec(BLOCK_SIZE)], 16),
+        max_model_len=8192,
+        scheduler_block_size=BLOCK_SIZE,
+        hash_block_size=BLOCK_SIZE,
+        sub_block_size=SUB_BLOCK_SIZE,
+        hash_fn=sha256,
+        tail_offload_slots=slots,
+    )
+
+
+def _finish(manager: RBLNKVCacheManager, request: Request) -> None:
+    request.status = RequestStatus.FINISHED_STOPPED
+    manager.free(request)
+
+
+def _token_chain(num_sub_blocks: int, start: int) -> list:
+    hashes, _, _ = _hasher().hash_tokens(
+        list(range(start, start + num_sub_blocks * SUB_BLOCK_SIZE)), _plain_request()
+    )
+    return hashes
+
+
+class TestHostTailIndex:
+    def test_longest_match_follows_the_chain(self):
+        index = HostTailIndex(2)
+        chain = _token_chain(3, 0)
+        slot = index.insert(chain[:2])
+        assert index.longest_match(chain) == (slot, 2)
+        assert index.longest_match(_token_chain(3, 100)) == (None, 0)
+
+    def test_a_chain_already_held_is_not_saved_again(self):
+        index = HostTailIndex(2)
+        chain = _token_chain(3, 0)
+        assert index.insert(chain) is not None
+        assert index.insert(chain[:2]) is None
+        assert len(index) == 1
+
+    def test_full_index_evicts_the_least_recently_used_slot(self):
+        index = HostTailIndex(2)
+        a, b, c = _token_chain(1, 0), _token_chain(1, 100), _token_chain(1, 200)
+        slot_a = index.insert(a)
+        slot_b = index.insert(b)
+        index.touch(slot_a)
+        assert index.insert(c) == slot_b
+        assert index.longest_match(b) == (None, 0)
+        assert index.longest_match(a) == (slot_a, 1)
+        assert index.evictions == 1
+
+
+class TestTailOffload:
+    def test_finished_request_saves_its_partial_block(self):
+        manager = _tail_manager()
+        req = make_request("0", list(range(BLOCK_SIZE + SUB_BLOCK_SIZE + 1)), 8)
+        prefill_request(manager, req)
+        tail_block = manager.get_blocks("0").blocks[0][1].block_id
+        _finish(manager, req)
+        (op,) = manager.drain_pending_tail_ops()
+        assert (op.kind, op.block_id, op.num_tokens) == ("save", tail_block, 4)
+
+    def test_preempted_request_saves_nothing(self):
+        # A preempted request comes back and recomputes from its own blocks.
+        manager = _tail_manager()
+        req = make_request("0", list(range(BLOCK_SIZE + SUB_BLOCK_SIZE)), 8)
+        prefill_request(manager, req)
+        req.status = RequestStatus.PREEMPTED
+        manager.free(req)
+        assert manager.drain_pending_tail_ops() == []
+
+
+class TestTailMatch:
+    @staticmethod
+    def _saved_tail():
+        """A manager whose host tier holds the tail of ``tokens``, with HBM
+        cleared as if the pool had evicted everything."""
+        manager = _tail_manager()
+        tokens = list(range(BLOCK_SIZE + SUB_BLOCK_SIZE + 1))
+        req = make_request("0", tokens, 8)
+        prefill_request(manager, req)
+        _finish(manager, req)
+        manager.drain_pending_tail_ops()
+        assert manager.reset_prefix_cache()
+        return manager, tokens
+
+    def test_host_tail_extends_a_connector_hit(self):
+        manager, tokens = self._saved_tail()
+        req = make_request("1", tokens + [900 + i for i in range(6)], 8)
+        computed_blocks, num_local, _ = manager.get_computed_blocks(req)
+        assert num_local == 0
+        # A connector restores the first block; the tail comes from the host.
+        match = manager.get_tail_match(req, BLOCK_SIZE, after_connector=True)
+        assert match is not None and match.slot is not None
+        assert (match.num_tokens, match.dst_req_block_index) == (4, 1)
+        blocks = manager.allocate_slots(
+            req,
+            req.num_tokens - BLOCK_SIZE + match.num_tokens,
+            0,
+            computed_blocks,
+            num_external_computed_tokens=BLOCK_SIZE,
+        )
+        assert blocks is not None
+        manager.apply_sub_block_match(match)
+        (op,) = manager.drain_pending_tail_ops()
+        dst = manager.get_blocks("1").blocks[0][1].block_id
+        assert (op.kind, op.slot, op.block_id, op.num_tokens) == (
+            "load",
+            match.slot,
+            dst,
+            4,
+        )
+
+    def test_hbm_is_preferred_when_it_holds_as_much(self):
+        manager = _tail_manager()
+        tokens = list(range(BLOCK_SIZE + SUB_BLOCK_SIZE + 1))
+        req0 = make_request("0", tokens, 8)
+        prefill_request(manager, req0)
+        _finish(manager, req0)
+        manager.drain_pending_tail_ops()
+        req = make_request("1", tokens + [900 + i for i in range(6)], 8)
+        _, num_local, _ = manager.get_computed_blocks(req)
+        assert num_local == BLOCK_SIZE
+        match = manager.get_tail_match(req, num_local)
+        assert match is not None and match.hbm is not None and match.slot is None
+        assert match.num_tokens == 4
+        manager.release_sub_block_match(match)
+
+    def test_last_token_is_left_to_compute(self):
+        manager, tokens = self._saved_tail()
+        # The prompt ends right after the saved sub-block.
+        req = make_request("1", tokens[: BLOCK_SIZE + SUB_BLOCK_SIZE], 8)
+        assert manager.get_tail_match(req, BLOCK_SIZE) is None
+
+    def test_unaligned_boundary_matches_nothing(self):
+        manager, tokens = self._saved_tail()
+        req = make_request("1", tokens + [900] * 6, 8)
+        assert manager.get_tail_match(req, BLOCK_SIZE - 1) is None
