@@ -47,7 +47,7 @@ def test_state_shape_follows_the_kernels():
     assert gdn_state_shape(2, 4) == (2, 2, 2, 128, 64)
 
 
-def _builder():
+def _builder(block_size):
     vllm_config = make_vllm_config(
         max_model_len=MAX_LEN, max_num_batched_tokens=128, max_num_seqs=4
     )
