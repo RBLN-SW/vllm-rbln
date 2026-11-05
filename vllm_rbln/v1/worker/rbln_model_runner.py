@@ -2354,9 +2354,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         if not self.num_spec_tokens or not req_ids:
             return None
         if self.is_strict_kv_producer:
-            # A producer proposes nothing to verify. Publishing the placeholder
-            # would have the scheduler carry it as real drafts: it only drops
-            # them for a request still chunking, and the last chunk is not.
+            # A producer verifies no drafts. Its non-model proposers are skipped
+            # above, leaving _draft_token_ids unset, and the eagle placeholder
+            # is zeros nobody should schedule.
             return None
         draft_token_ids = (
             self._draft_token_ids.tolist()
@@ -2850,9 +2850,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 f"{batch_desc.num_tokens_padded} tokens the ranks settled on"
             )
 
-        # Serving pads a prefill's query to max_num_tokens whatever its length, so
-        # warm-up compiles that one width and a dummy has to land on it too.
-        query_len_padded = self.max_num_tokens if is_prefill else target_query_len
+        # Serving pads a prefill's query to prefill_chunk_size whatever its length,
+        # so warm-up compiles that one width and a dummy has to land on it too.
+        assert self.prefill_chunk_size is not None  # resolved at start-up
+        query_len_padded = self.prefill_chunk_size if is_prefill else target_query_len
 
         num_scheduled_tokens = np.array([target_query_len] * num_reqs, dtype=np.int32)
         num_tokens = int(num_scheduled_tokens.sum())
@@ -4126,17 +4127,16 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             if not self.vllm_config.is_mm_encoder_only:
                 self.run_model_graphs()
 
-                # A strict producer admits one request per step, since every step
-                # it runs is a prefill, so warm-up samples at that width.
-                batch_buckets = (
-                    [1]
-                    if self.is_strict_kv_producer
-                    else self.bucketing_manager.batch_buckets
-                )
-
                 # NOTE(RBLN): the sampler and the rejection sampler are built on
                 # the last PP rank only, so no other rank has anything to warm up here.
                 if get_pp_group().is_last_rank:
+                    # A strict producer admits one request per step, since every
+                    # step it runs is a prefill, so warm-up samples at that width.
+                    batch_buckets = (
+                        [1]
+                        if self.is_strict_kv_producer
+                        else self.bucketing_manager.batch_buckets
+                    )
                     # 4-1. sampler
                     if not self.is_pooling_model:
                         for size in batch_buckets:

@@ -16,6 +16,7 @@
 # prefill engine waits, then rejoins as decode (full match) or as a remainder
 # prefill (partial). Only reachable with a KV connector attached.
 
+import pytest
 from vllm.v1.request import RequestStatus
 
 from tests.vllm.v1.core.utils import (
@@ -176,19 +177,63 @@ class TestStrictProducerPhase:
     """A producer reads a 1-token step as a prefill so it can run the prefill
     graph."""
 
-    def test_a_one_token_prompt_is_a_prefill_step(self):
-        # The case the widening exists for: without it both prompts schedule as
-        # one decode batch and ask for a graph a producer does not compile.
+    def test_a_one_token_remainder_is_a_prefill_step(self):
+        # A remote match leaves the prompt one token, a step every other role
+        # reads as decode. A producer compiled no decode graph, so it has to read
+        # prefill.
         sched = create_rbln_scheduler(
             block_size=BLOCK_SIZE,
             num_blocks=100,
             max_num_batched_tokens=BLOCK_SIZE,
             max_model_len=MAX_LEN,
-            use_kv_connector=MockKVConfig(matched_tokens=0, kv_role="kv_producer"),
+            use_kv_connector=MockKVConfig(
+                matched_tokens=PROMPT_LEN - 1, kv_role="kv_producer"
+            ),
         )
-        sched.add_request(_local_request("a", num_tokens=1))
-        sched.add_request(_local_request("b", num_tokens=1, base=600))
+        sched.add_request(_remote_request("a"))
         out = sched.schedule()
         assert out.num_scheduled_tokens == {"a": 1}
         assert step_is_prefill(out, strict_kv_producer=True) is True
         assert step_is_prefill(out, strict_kv_producer=False) is False
+
+    @pytest.mark.parametrize(
+        ("kv_role", "scheduled"),
+        [("kv_producer", {"a": 1}), ("kv_both", {"a": 1, "b": 1})],
+    )
+    def test_one_token_remainders_run_one_per_step(self, kv_role, scheduled):
+        # Two loads land together, each leaving one prompt token. A decoding role
+        # batches them as decode; a producer has only the batch-1 prefill graph.
+        sched = create_rbln_scheduler(
+            block_size=BLOCK_SIZE,
+            num_blocks=100,
+            max_num_batched_tokens=BLOCK_SIZE,
+            max_model_len=MAX_LEN,
+            use_kv_connector=MockKVConfig(
+                matched_tokens=PROMPT_LEN - 1, is_async=True, kv_role=kv_role
+            ),
+        )
+        sched.add_request(_remote_request("a"))
+        sched.add_request(_remote_request("b", base=600))
+        out = sched.schedule()
+        _signal_kv_arrived(sched, out, "a", "b")
+
+        assert sched.schedule().num_scheduled_tokens == scheduled
+
+    def test_a_one_token_tail_finishes_before_a_waiting_prefill(self):
+        # The tail of a 17-token prompt is the producer's prefill, not a decode
+        # that a newly admitted prefill would evict, step after step.
+        sched = create_rbln_scheduler(
+            block_size=BLOCK_SIZE,
+            num_blocks=100,
+            max_num_batched_tokens=BLOCK_SIZE,
+            max_model_len=MAX_LEN,
+            use_kv_connector=MockKVConfig(kv_role="kv_producer"),
+        )
+        sched.add_request(_local_request("0", num_tokens=BLOCK_SIZE + 1))
+        sched.add_request(_local_request("1", num_tokens=BLOCK_SIZE + 1, base=600))
+        out = sched.schedule()
+        assert out.num_scheduled_tokens == {"0": BLOCK_SIZE}
+        # A partial chunk samples nothing.
+        sched.update_from_output(out, make_model_runner_output(out))
+
+        assert sched.schedule().num_scheduled_tokens == {"0": 1}
