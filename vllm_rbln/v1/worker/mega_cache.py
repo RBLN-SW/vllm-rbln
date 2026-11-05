@@ -23,6 +23,7 @@ import errno
 import hashlib
 import os
 import re
+from collections.abc import Mapping
 
 import vllm.envs as envs
 
@@ -76,12 +77,13 @@ def _npu_name() -> str:
         return "unknown"
 
 
-def _warmup_graph_set_factors(vllm_config) -> str:
+def _warmup_graph_set_factors(
+    vllm_config, extra_hash_factors: Mapping[str, object] | None = None
+) -> str:
     """Hash of the graph-shaping config that compute_hash() leaves out.
 
-    Decode buckets, KV cache input, decode query length, which drafter graphs
-    exist, which of the language model and the encoder are built. Without them
-    two runs share a bundle that only partly hits.
+    Includes caller-supplied factors for resolved graph sets. Without them
+    two runs can share a bundle that only partly hits.
     """
     from vllm.config.utils import hash_factors, normalize_value
 
@@ -111,6 +113,11 @@ def _warmup_graph_set_factors(vllm_config) -> str:
         # compute_hash() takes in the EC config but leaves its role out.
         "ec_role": ec.ec_role if ec is not None else None,
     }
+
+    if extra_hash_factors:
+        factors.update(
+            {name: normalize_value(value) for name, value in extra_hash_factors.items()}
+        )
     return hash_factors(factors)
 
 
@@ -137,12 +144,14 @@ def _stable_compute_hash(vllm_config) -> str:
                 object.__setattr__(pc, name, value)
 
 
-def config_signature(vllm_config) -> str:
+def config_signature(
+    vllm_config, extra_hash_factors: Mapping[str, object] | None = None
+) -> str:
     """vLLM config hash + warm-up graph set + rbln compile env + NPU name +
     rebel major.minor; launch- and host-stable, shared by all TP/DP ranks (the
     rank subdir isolates shards)."""
     cfg = _stable_compute_hash(vllm_config)
-    graphs = _warmup_graph_set_factors(vllm_config)
+    graphs = _warmup_graph_set_factors(vllm_config, extra_hash_factors)
     env = _compile_env_factors()
     npu = _npu_name()
     rebel_ver = _rebel_major_minor()

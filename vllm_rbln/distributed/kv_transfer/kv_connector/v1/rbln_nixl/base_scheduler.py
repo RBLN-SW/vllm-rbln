@@ -113,18 +113,20 @@ class RblnNixlSchedulerBase(NixlBaseConnectorScheduler):
         boundary below and let the rest be recomputed, the same trade upstream's
         recompute threshold makes.
 
-        A fetch covering the whole prompt leaves nothing to prefill, so it passes
-        through; the remainder decides that, not which base branch ran.
+        One remaining prompt token runs as decode. Recurrent state cannot be
+        rewound to a chunk boundary, so an unaligned partial hit is declined.
         """
         count, load_async = super().get_num_new_matched_tokens(
             request, num_computed_tokens
         )
         resume = num_computed_tokens + count
-        if resume >= request.num_prompt_tokens:
+        if resume >= request.num_prompt_tokens - 1:
             return count, load_async
         overshoot = resume % self.vllm_config.scheduler_config.max_num_batched_tokens
         if not overshoot:
             return count, load_async
+        if self._has_mamba:
+            return 0, False
         if overshoot >= count:
             # An async load of nothing trips the scheduler's own assertion, so
             # report no match at all rather than zero tokens to load.

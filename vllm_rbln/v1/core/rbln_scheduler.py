@@ -21,6 +21,7 @@ from typing import Any
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.utils.hashing import get_hash_fn_by_name
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import init_none_hash
@@ -105,11 +106,12 @@ class RBLNScheduler(Scheduler):
 
         # Replace the upstream KVCacheManager with RBLNKVCacheManager
         # when sub-block prefix caching is enabled.
+        assert rbln_config.prefill_chunk_size is not None  # resolved at start-up
         sub_block_size = sub_block_size_in_use(
             enable_prefix_caching=self.cache_config.enable_prefix_caching,
             sub_block_cache=rbln_config.enable_sub_block_cache,
             block_size=self.block_size,
-            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+            prefill_chunk_size=rbln_config.prefill_chunk_size,
             kv_cache_config=self.kv_cache_config,
             sub_block_size=rbln_config.sub_block_size,
         )
@@ -161,6 +163,19 @@ class RBLNScheduler(Scheduler):
         self._pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
 
         self._prefill_chunk_size = rbln_config.prefill_chunk_size
+
+        # NOTE(RBLN): the sparse-attention ops (DSA MLA / indexer, MiniMax-M3
+        # MSA / indexer, GLM5 MLA / indexer) get NULL_BLOCK_ID as null_block_id
+        # and write their context-parallel cache store's unowned rows there, so
+        # the block the pool reserves has to be that one. Checked once the KV
+        # cache manager is final (it may be swapped above).
+        null_block_id = self.kv_cache_manager.block_pool.null_block.block_id
+        if null_block_id != NULL_BLOCK_ID:
+            raise RuntimeError(
+                f"vLLM's null block is {null_block_id}, not NULL_BLOCK_ID "
+                f"({NULL_BLOCK_ID}); the RBLN sparse-attention cache store writes "
+                "to NULL_BLOCK_ID and would corrupt a live block."
+            )
 
     def _decode_demand(self) -> int:
         """Total decode demand for this step's soft (ceil(demand/pp)) cap.

@@ -1001,9 +1001,9 @@ class TestKvCopyStreamReserve:
                 additional_config=SimpleNamespace(
                     enable_sub_block_cache=sub_block_cache,
                     sub_block_size=sub_block_size,
+                    prefill_chunk_size=512,
                 )
             ),
-            scheduler_config=SimpleNamespace(max_num_batched_tokens=512),
             model_runner=SimpleNamespace(kv_cache_config=SimpleNamespace()),
         )
 
@@ -1173,7 +1173,7 @@ class TestReleaseKvCacheTensors:
             compilation_config=SimpleNamespace(
                 static_forward_context={"l0": layer, "aux": aux}
             ),
-            aux_kv_cache_layers=["aux"],
+            aux_kv_cache_specs={"aux": object()},
             kv_cache_allocations={kv_cache_tensor_key(layer.kv_cache): "l0"},
         )
         sizer = SimpleNamespace(

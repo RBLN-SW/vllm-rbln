@@ -22,6 +22,7 @@ from types import SimpleNamespace
 import pytest
 from vllm.config.ec_manager_config import EncoderCacheManagerConfig
 from vllm.distributed.kv_events import BlockStored, KVEventBatch
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
@@ -42,6 +43,7 @@ from tests.vllm.v1.core.utils import (
     make_request,
     prefill_request,
 )
+from vllm_rbln.v1.core import rbln_scheduler
 from vllm_rbln.v1.core.rbln_kv_cache_manager import RBLNKVCacheManager
 from vllm_rbln.v1.core.rbln_scheduler import RBLNScheduler, RBLNSchedulerOutput
 from vllm_rbln.v1.core.utils import is_prefill, step_is_prefill
@@ -60,6 +62,13 @@ class TestSchedulerInit:
         )
         sched = create_rbln_scheduler(ec_manager_config=config)
         assert type(sched.encoder_cache_manager) is EncoderCacheManager
+
+    def test_null_block_off_null_block_id_is_refused(self, monkeypatch):
+        # The sparse-attention ops write to NULL_BLOCK_ID; a pool that reserves
+        # another block must stop the scheduler from starting.
+        monkeypatch.setattr(rbln_scheduler, "NULL_BLOCK_ID", NULL_BLOCK_ID + 1)
+        with pytest.raises(RuntimeError, match="null block"):
+            create_rbln_scheduler()
 
     @pytest.mark.usefixtures("cr13")
     def test_sub_block_caching_enabled_uses_rbln_manager(self):
@@ -84,6 +93,17 @@ class TestSchedulerInit:
         )
         assert isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
         assert sched.kv_cache_manager.sub_block_size == 128
+
+    def test_sub_block_size_defaults_to_the_prefill_chunk_below_the_budget(self):
+        sched = create_rbln_scheduler(
+            enable_prefix_caching=True,
+            block_size=1024,
+            max_num_batched_tokens=128,
+            max_model_len=2048,
+            additional_config={"prefill_chunk_size": 64},
+        )
+        assert isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
+        assert sched.kv_cache_manager.sub_block_size == 64
 
     @pytest.mark.usefixtures("cr13")
     def test_additional_config_sets_the_sub_block_size(self):
