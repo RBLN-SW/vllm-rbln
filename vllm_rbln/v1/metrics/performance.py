@@ -95,9 +95,11 @@ class PerformanceContext:
         self.rank_tag = _rank_tag()
         self._graph: dict[Phase, _Metrics] = defaultdict(_Metrics)
         self._e2e: dict[Phase, _Metrics] = defaultdict(_Metrics)
+        self._host_op: dict[Phase, _Metrics] = defaultdict(_Metrics)
         self._start: float | None = None
         self._phase: Phase | None = None
         self._graph_latency: float | None = None
+        self._host_op_latency: float | None = None
 
     @property
     def in_pass(self) -> bool:
@@ -107,18 +109,22 @@ class PerformanceContext:
         self._start = time.perf_counter()
         self._phase = None
         self._graph_latency = None
+        self._host_op_latency = None
 
     def end_pass(self) -> None:
         end = time.perf_counter()
         start, self._start = self._start, None
         phase, self._phase = self._phase, None
         graph, self._graph_latency = self._graph_latency, None
+        host_op, self._host_op_latency = self._host_op_latency, None
         if start is None or phase is None or graph is None:
             # No pass was open, or it never reached the forward: an empty batch, KV
             # send/recv with no forward work, or a pass that raised.
             return
         self._e2e[phase].record(end - start)
         self._graph[phase].record(graph)
+        if host_op is not None:
+            self._host_op[phase].record(host_op)
 
     def mark_phase(self, phase: Phase) -> None:
         if self._start is not None:
@@ -128,9 +134,17 @@ class PerformanceContext:
         if self._start is not None:
             self._graph_latency = (self._graph_latency or 0.0) + latency
 
+    def add_host_op_time(self, latency: float) -> None:
+        if self._start is not None:
+            self._host_op_latency = (self._host_op_latency or 0.0) + latency
+
     def print_stats(self) -> None:
         sections: dict[str, _Metrics] = {}
-        for label, table in (("MODEL + SAMPLE", self._graph), ("E2E", self._e2e)):
+        for label, table in (
+            ("MODEL + SAMPLE", self._graph),
+            ("HOST OP", self._host_op),
+            ("E2E", self._e2e),
+        ):
             for phase in Phase:
                 if phase in table:
                     sections[f"{label} ({phase.value})"] = table[phase]

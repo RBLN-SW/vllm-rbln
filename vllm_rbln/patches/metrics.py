@@ -18,12 +18,15 @@ sums the model call, sampler, and blocking bookkeeping as MODEL + SAMPLE.
 Spec decode's postprocess gather also holds a blocking read, so its profiler
 region is included in that sum. Drafter time stays in the E2E residual.
 Non-last PP ranks close their pass after the hand-off waits on compute.
+With RBLN_RUNTIME_TIMER on, HOST OP is rebel's host-op time of the model's
+graph run.
 """
 
 import contextlib
 import functools
 import time
 
+import rebel
 from vllm.sequence import IntermediateTensors
 from vllm.v1.utils import record_function_or_nullcontext
 
@@ -104,6 +107,11 @@ def load_model(self, *args, **kwargs):
         start = time.perf_counter()
         output = executable(*call_args, **call_kwargs)
         ctx.add_graph_time(time.perf_counter() - start)
+        # The model is compiled fullgraph, so this call was one graph run on this
+        # thread. None means RBLN_RUNTIME_TIMER is off.
+        host_op_us = rebel.get_last_run_host_op_time_us()
+        if host_op_us is not None:
+            ctx.add_host_op_time(host_op_us / 1e6)
         return output
 
     self.model_executable = timed_executable
