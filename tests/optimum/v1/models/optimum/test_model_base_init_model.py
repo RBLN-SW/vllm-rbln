@@ -54,7 +54,6 @@ def _init_model_with(monkeypatch, tmp_path, hf_config, *, precompiled=False) -> 
         "is_compiled_dir",
         lambda path: precompiled and path == str(tmp_path),
     )
-    monkeypatch.setattr(model_base, "get_attn_block_size", lambda cfg: 4096)
 
     obj = RBLNOptimumModelBase.__new__(RBLNOptimumModelBase)
     obj.model_config = types.SimpleNamespace(
