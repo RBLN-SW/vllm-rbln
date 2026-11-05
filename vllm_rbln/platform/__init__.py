@@ -288,8 +288,6 @@ class RblnPlatform(Platform):
             _apply_model_impl(model_impl)
             # TODO(vllm-rbln>=0.14.0): delete the legacy chunk-size alias.
             if model_impl == "optimum" and self.max_num_batched_tokens is not None:
-                from dataclasses import replace
-
                 from vllm_rbln.config import build_optimum_rbln_config
                 from vllm_rbln.utils.optimum.converter.common import (
                     is_chunked_prefill_arch,
@@ -302,6 +300,10 @@ class RblnPlatform(Platform):
                     "--rbln-prefill-chunk-size."
                 )
                 if is_chunked_prefill_arch(self.create_model_config().hf_config):
+                    if self.max_num_batched_tokens <= 0:
+                        raise ValueError(
+                            "max_num_batched_tokens must be greater than 0."
+                        )
                     rbln_config = build_optimum_rbln_config(self.additional_config)
                     chunk = rbln_config.prefill_chunk_size
                     if chunk is not None and chunk != self.max_num_batched_tokens:
@@ -311,9 +313,8 @@ class RblnPlatform(Platform):
                             f"!= prefill_chunk_size ({chunk}). Set only "
                             "--rbln-prefill-chunk-size."
                         )
-                    self.additional_config = replace(
-                        rbln_config, prefill_chunk_size=self.max_num_batched_tokens
-                    )
+                    rbln_config.prefill_chunk_size = self.max_num_batched_tokens
+                    self.additional_config = rbln_config
                 self.max_num_batched_tokens = None
             return orig_create_engine_config(self, *args, **kwargs)
 
