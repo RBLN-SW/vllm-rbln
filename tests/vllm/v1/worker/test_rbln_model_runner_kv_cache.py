@@ -225,7 +225,8 @@ class TestMambaSpecGroup:
 
     def test_a_gdn_state_layer_gets_a_buffer_sized_by_its_pool(self, make_model_runner):
         # Not the group's extent (an alias of the attention pool): a buffer of
-        # gdn_pool_blocks states, two a running request.
+        # gdn_pool_blocks states, two a running request when one block spans
+        # the model length.
         runner = make_model_runner(layers=("layer.0",), init_kv_cache=False)
         spec = self._state_spec(runner)
         config = make_kv_cache_config(runner, groups=[("layer.0",)], spec=spec)

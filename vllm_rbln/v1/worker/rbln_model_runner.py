@@ -3241,7 +3241,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             layer_name: buffers[extent] for layer_name, extent in extent_of.items()
         }
         for layer_name, spec in state_specs.items():
-            num_blocks = gdn_pool_blocks(self.vllm_config)
+            num_blocks = gdn_pool_blocks(self.vllm_config, kv_cache_config, spec)
             kv_cache_raw_tensors[layer_name] = torch.empty(
                 num_blocks * spec.real_page_size_bytes, dtype=torch.int8, device=device
             )
@@ -3592,7 +3592,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # A GatedDeltaNet layer's buffer is its own, a block a state of its pool
         # (_allocate_kv_cache_tensors): so are its aux caches, static like it.
         own_blocks = {
-            layer_name: gdn_pool_blocks(self.vllm_config)
+            layer_name: gdn_pool_blocks(
+                self.vllm_config, kv_cache_config, group.kv_cache_spec
+            )
             for group in kv_cache_config.kv_cache_groups
             if isinstance(group.kv_cache_spec, RBLNGDNStateSpec)
             for layer_name in group.layer_names
