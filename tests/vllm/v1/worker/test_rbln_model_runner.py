@@ -454,6 +454,8 @@ def test_multimodal_warmup_keys_the_bundle_on_the_encoder_buckets(monkeypatch, b
     cache.load.assert_called_once_with("m3", expected)
     cache.save.assert_called_once_with("m3", expected)
     runner._warmup_mm_encoder.assert_called_once_with()
+
+
 def test_warmup_compiles_prefill_at_the_prefill_chunk_size():
     calls = []
     runner = _make_runner_stub(
