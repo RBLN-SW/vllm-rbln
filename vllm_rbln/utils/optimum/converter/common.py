@@ -119,9 +119,9 @@ def update_max_num_batched_tokens(vllm_config: VllmConfig) -> None:
     scheduler_config = vllm_config.scheduler_config
     if scheduler_config.max_num_scheduled_tokens is not None:
         raise ValueError(
-            "max_num_scheduled_tokens cannot be set on the optimum model path. "
+            "max_num_scheduled_tokens cannot be set on the optimum model impl. "
             "The scheduling budget is determined automatically. "
-            "Omit max_num_scheduled_tokens."
+            "Leave max_num_scheduled_tokens unset."
         )
     scheduler_config.max_num_batched_tokens = max(
         vllm_config.model_config.max_model_len,
@@ -159,13 +159,13 @@ def apply_user_prefill_chunk_size(
         if not is_chunked_prefill_arch(vllm_config.model_config.hf_config):
             raise ValueError(
                 "prefill_chunk_size cannot be specified for a model that does "
-                "not support chunked prefill. Omit --rbln-prefill-chunk-size."
+                "not support chunked prefill. Leave --rbln-prefill-chunk-size unset."
             )
         if precompiled and chunk != params.prefill_chunk_size:
             raise ValueError(
                 f"prefill_chunk_size ({chunk}) conflicts with the compiled "
                 f"prefill_chunk_size ({params.prefill_chunk_size}) in "
-                "rbln_config.json. Omit --rbln-prefill-chunk-size or recompile "
+                "rbln_config.json. Leave --rbln-prefill-chunk-size unset or recompile "
                 "the model with a matching prefill chunk size."
             )
         if not precompiled:

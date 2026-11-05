@@ -297,9 +297,9 @@ class RblnPlatform(Platform):
 
                 logger.warning_once(
                     "--max-num-batched-tokens (max_num_batched_tokens) on the "
-                    "optimum model path is deprecated and will be removed in "
-                    "0.14.0. Use --rbln-prefill-chunk-size for models that "
-                    "support chunked prefill; otherwise omit it."
+                    "optimum model impl is deprecated and will be removed in "
+                    "0.14.0. For models that support chunked prefill, use "
+                    "--rbln-prefill-chunk-size."
                 )
                 if is_chunked_prefill_arch(self.create_model_config().hf_config):
                     rbln_config = build_optimum_rbln_config(self.additional_config)
