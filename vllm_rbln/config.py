@@ -128,10 +128,9 @@ class RBLNConfig(RBLNConfigBase):
     decode_batch_bucket_manual_buckets: list[int] = field(default_factory=list)
     """Explicit decode batch sizes, used when the strategy is `manual`."""
 
-    mm_encoder_patch_buckets: dict[str, list[int]] = field(default_factory=dict)
-    """Patch buckets per modality, e.g. {"image": [1024, 2304], "video": [12288]}.
-    Missing or empty entries use the modality's processor upper bound.
-    Identical shapes share an encoder graph."""
+    encoder_token_budgets: list[int] = field(default_factory=list)
+    """Output-token capacities of compiled encoder graphs, shared across modalities.
+    Empty uses the processor upper bounds for enabled modalities."""
 
     use_w8a8: bool = False
     """Opt in to W8A8. W8A16 runs on every RBLN NPU, W8A8 only on the ones
@@ -156,7 +155,7 @@ class RBLNConfig(RBLNConfigBase):
             "use_custom_sampler",
             "enable_sub_block_cache",
             "sub_block_size",
-            "mm_encoder_patch_buckets",
+            "encoder_token_budgets",
         }
         factors = get_hash_factors(self, ignored_factors)
         # Unset and True build the same graph; only False changes the artifact.
@@ -174,12 +173,11 @@ class RBLNConfig(RBLNConfigBase):
                 "decode_batch_bucket_strategy='manual' needs at least one entry "
                 "in decode_batch_bucket_manual_buckets"
             )
-        for modality, patch_buckets in self.mm_encoder_patch_buckets.items():
-            name = f"mm_encoder_patch_buckets[{modality!r}]"
-            if any(b <= 0 for b in patch_buckets):
-                raise ValueError(f"{name} must all be > 0")
-            if len(patch_buckets) != len(set(patch_buckets)):
-                raise ValueError(f"{name} must be unique")
+        budgets = self.encoder_token_budgets
+        if any(b <= 0 for b in budgets):
+            raise ValueError("encoder_token_budgets must all be > 0")
+        if len(budgets) != len(set(budgets)):
+            raise ValueError("encoder_token_budgets must be unique")
 
 
 @vllm_config_dataclass

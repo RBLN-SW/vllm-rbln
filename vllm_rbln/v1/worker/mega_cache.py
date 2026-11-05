@@ -21,7 +21,6 @@ config-signature, rank) file under VLLM_CACHE_ROOT.
 import contextlib
 import errno
 import hashlib
-import operator
 import os
 import re
 from collections.abc import Mapping
@@ -79,12 +78,12 @@ def _npu_name() -> str:
 
 
 def _warmup_graph_set_factors(
-    vllm_config, mm_encoder_patch_buckets: Mapping[str, list[int]] | None = None
+    vllm_config, extra_hash_factors: Mapping[str, object] | None = None
 ) -> str:
     """Hash of the graph-shaping config that compute_hash() leaves out.
 
-    Decode/encoder buckets, KV cache input, decode query length, which drafter
-    graphs exist. Without them two runs share a bundle that only partly hits.
+    Includes caller-supplied factors for resolved graph sets. Without them
+    two runs can share a bundle that only partly hits.
     """
     from vllm.config.utils import hash_factors, normalize_value
 
@@ -112,13 +111,9 @@ def _warmup_graph_set_factors(
         ),
     }
 
-    if mm_encoder_patch_buckets:
-        factors["mm_encoder_patch_buckets"] = sorted(
-            {
-                operator.index(bucket)
-                for buckets in mm_encoder_patch_buckets.values()
-                for bucket in buckets
-            }
+    if extra_hash_factors:
+        factors.update(
+            {name: normalize_value(value) for name, value in extra_hash_factors.items()}
         )
     return hash_factors(factors)
 
@@ -147,13 +142,13 @@ def _stable_compute_hash(vllm_config) -> str:
 
 
 def config_signature(
-    vllm_config, mm_encoder_patch_buckets: Mapping[str, list[int]] | None = None
+    vllm_config, extra_hash_factors: Mapping[str, object] | None = None
 ) -> str:
     """vLLM config hash + warm-up graph set + rbln compile env + NPU name +
     rebel major.minor; launch- and host-stable, shared by all TP/DP ranks (the
     rank subdir isolates shards)."""
     cfg = _stable_compute_hash(vllm_config)
-    graphs = _warmup_graph_set_factors(vllm_config, mm_encoder_patch_buckets)
+    graphs = _warmup_graph_set_factors(vllm_config, extra_hash_factors)
     env = _compile_env_factors()
     npu = _npu_name()
     rebel_ver = _rebel_major_minor()

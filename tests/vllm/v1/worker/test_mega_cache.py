@@ -114,6 +114,22 @@ class TestSignatureComposition:
         static = mega_cache.config_signature(_stub_config())
         assert dynamic != static
 
+    def test_extra_graph_factors_invalidate(self):
+        config = _stub_config()
+        base = mega_cache.config_signature(config)
+        assert mega_cache.config_signature(config, extra_hash_factors={}) == base
+        factors = {"extra_graph_shapes": [8, 16], "extra_graph_version": 1}
+        first = mega_cache.config_signature(config, extra_hash_factors=factors)
+        assert first != base
+        assert (
+            mega_cache.config_signature(
+                config, extra_hash_factors=dict(reversed(factors.items()))
+            )
+            == first
+        )
+        factors["extra_graph_shapes"] = [8, 32]
+        assert mega_cache.config_signature(config, extra_hash_factors=factors) != first
+
 
 # Variables the built graph depends on and RBLNConfig does not carry, so this
 # is the only route into the key. What has to survive is the round trip through
@@ -254,17 +270,23 @@ class TestSignatureVllmConfig:
     @pytest.mark.parametrize(
         ("before", "after"),
         [
-            (None, {"image": [2304]}),
-            ({"image": [2304]}, {"image": [1024, 2304]}),
-            ({"image": [2304]}, {"image": [2304], "video": [12288]}),
+            (None, {"mm_encoder_patch_buckets": [2304]}),
+            (
+                {"mm_encoder_patch_buckets": [2304]},
+                {"mm_encoder_patch_buckets": [1024, 2304]},
+            ),
+            (
+                {"mm_encoder_patch_buckets": [2304]},
+                {"mm_encoder_patch_buckets": [2304, 12288]},
+            ),
         ],
         ids=["text-to-mm", "image-bucket-added", "video-enabled"],
     )
     def test_mm_encoder_buckets_invalidate(self, before, after):
         config = make_vllm_config()
         assert mega_cache.config_signature(
-            config, after
-        ) != mega_cache.config_signature(config, before)
+            config, extra_hash_factors=after
+        ) != mega_cache.config_signature(config, extra_hash_factors=before)
 
     @pytest.mark.parametrize(
         "options",
@@ -280,32 +302,14 @@ class TestSignatureVllmConfig:
     def test_mm_inputs_key_only_through_the_resolved_buckets(self, options):
         from vllm.config import MultiModalConfig
 
-        buckets = {"image": [2304], "video": [12288]}
+        factors = {"mm_encoder_patch_buckets": [2304, 12288]}
         config = make_vllm_config()
         config.model_config.multimodal_config = MultiModalConfig(
             limit_per_prompt={"image": 1, "video": 1}
         )
-        base = mega_cache.config_signature(config, buckets)
+        base = mega_cache.config_signature(config, extra_hash_factors=factors)
         config.model_config.multimodal_config = MultiModalConfig(**options)
-        assert mega_cache.config_signature(config, dict(reversed(buckets.items()))) == (
-            base
-        )
-
-    @pytest.mark.parametrize(
-        ("before", "after"),
-        [
-            ({"image": [12288]}, {"image": [12288], "video": [12288]}),
-            ({"image": [1024, 2304]}, {"image": [2304, 1024, 1024]}),
-            ({"image": [3264]}, {"image": [np.int64(3264)]}),
-            (None, {}),
-        ],
-        ids=["shared-bucket", "bucket-order", "numpy-bucket", "no-local-encoder"],
-    )
-    def test_equivalent_encoder_graph_sets_share_a_bundle(self, before, after):
-        config = make_vllm_config()
-        assert mega_cache.config_signature(
-            config, before
-        ) == mega_cache.config_signature(config, after)
+        assert mega_cache.config_signature(config, extra_hash_factors=factors) == base
 
     def test_speculative_tokens_invalidate(self):
         # num_spec_tokens sets the decode query_len the warm-up compiles, and

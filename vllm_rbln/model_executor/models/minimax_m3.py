@@ -1152,7 +1152,7 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         self.config = config
         self.quant_config = vllm_config.quant_config
         self.vision_tower = None
-        self.mm_encoder_patch_buckets: dict[str, list[int]] = {}
+        self.mm_encoder_patch_buckets: list[int] = []
         self.mm_embeds_dtype = vllm_config.model_config.dtype
         mm_config = vllm_config.model_config.multimodal_config
         if (
@@ -1180,39 +1180,25 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
 
             info = MULTIMODAL_REGISTRY.create_processor(vllm_config.model_config).info
             merge = info.get_image_processor().merge_size
-            bounds = {}
+            bounds = []
             if mm_config.get_limit_per_prompt("image") > 0:
-                bounds["image"] = info.get_max_image_tokens() * merge**2
+                bounds.append(info.get_max_image_tokens())
             if mm_config.get_limit_per_prompt("video") > 0:
                 frames = self.vision_tower.vision_model.vision_segment_max_frames
-                bounds["video"] = frames * info.get_max_video_frame_tokens() * merge**2
-            configured = vllm_config.additional_config.mm_encoder_patch_buckets
-            if unknown := configured.keys() - info.get_supported_mm_limits().keys():
+                bounds.append(frames * info.get_max_video_frame_tokens())
+
+            budgets = sorted(
+                vllm_config.additional_config.encoder_token_budgets
+            ) or sorted(set(bounds))
+            max_tokens = max(bounds)
+            if budgets[-1] < max_tokens:
                 raise ValueError(
-                    "Unsupported mm_encoder_patch_buckets modalities: "
-                    f"{sorted(unknown)}"
+                    f"encoder_token_budgets {budgets} must reach "
+                    f"{max_tokens} output tokens, the processor's upper bound for "
+                    "an image or video segment. Add a budget that large, or lower "
+                    "the resize limits in --mm-processor-kwargs."
                 )
-            for modality, max_patches in bounds.items():
-                buckets = sorted(configured.get(modality, [])) or [max_patches]
-                name = f"mm_encoder_patch_buckets[{modality!r}]"
-                if odd := [b for b in buckets if b % merge**2]:
-                    raise ValueError(
-                        f"{name} {odd} must be multiples of {merge**2}: "
-                        f"the encoder merges {merge} x {merge} patches into one token."
-                    )
-                reaching = [b for b in buckets if b >= max_patches]
-                if not reaching:
-                    raise ValueError(
-                        f"{name} {buckets} must reach {max_patches} patches, the "
-                        "processor's patch upper bound. Add a bucket that large, "
-                        "or lower the resize limits in --mm-processor-kwargs."
-                    )
-                if len(reaching) > 1:
-                    raise ValueError(
-                        f"{name} {reaching[1:]} would never be used: the "
-                        f"processor's patch upper bound is {max_patches}."
-                    )
-                self.mm_encoder_patch_buckets[modality] = buckets
+            self.mm_encoder_patch_buckets = [b * merge**2 for b in budgets]
 
         object.__setattr__(self, "_mm_encoder", None)
 
@@ -1251,10 +1237,7 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         head_dim = vm.encoder.layers[0].self_attn.head_dim
         device = next(tower.parameters()).device
         with torch.inference_mode():
-            buckets = {
-                b for values in self.mm_encoder_patch_buckets.values() for b in values
-            }
-            for bucket in sorted(buckets):
+            for bucket in self.mm_encoder_patch_buckets:
                 self._mm_encoder(
                     torch.zeros(bucket, patch_dim, dtype=tower.dtype, device=device),
                     torch.ones(bucket, head_dim, dtype=tower.dtype, device=device),
@@ -1278,7 +1261,7 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         assert tower is not None
         vm = tower.vision_model
         num_patches = math.prod(grid_thw)
-        fits = [b for b in self.mm_encoder_patch_buckets[modality] if b >= num_patches]
+        fits = [b for b in self.mm_encoder_patch_buckets if b >= num_patches]
         assert fits, f"a {modality} of {num_patches} patches (grid {grid_thw})"
         bucket = fits[0]
         dtype = tower.dtype

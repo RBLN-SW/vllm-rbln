@@ -113,16 +113,15 @@ def test_flags_reach_the_config(parser):
     assert config.decode_batch_bucket_manual_buckets == [1, 4, 16]
 
 
-@pytest.mark.parametrize("buckets", [{}, {"image": [1024, 2304], "video": [12288]}])
-def test_patch_buckets_accept_modality_flags(parser, buckets):
-    config = resolve(parser, ["--rbln-mm-encoder-patch-buckets", json.dumps(buckets)])
-    assert config.mm_encoder_patch_buckets == buckets
+def test_encoder_token_budgets_accept_flags(parser):
+    config = resolve(parser, ["--rbln-encoder-token-budgets", "256", "576", "3072"])
+    assert config.encoder_token_budgets == [256, 576, 3072]
 
 
-@pytest.mark.parametrize("buckets", [[], [1024, 2304]])
-def test_patch_bucket_lists_are_rejected(buckets):
-    with pytest.raises(ValueError, match="valid dictionary"):
-        build_rbln_config({"mm_encoder_patch_buckets": buckets})
+@pytest.mark.parametrize("budgets", [[], [256, 576, 3072]])
+def test_encoder_token_budgets_accept_additional_config(budgets):
+    config = build_rbln_config({"encoder_token_budgets": budgets})
+    assert config.encoder_token_budgets == budgets
 
 
 def test_coexists_with_additional_config(parser):
@@ -238,17 +237,16 @@ def test_manual_strategy_needs_buckets():
 
 
 @pytest.mark.parametrize(
-    ("buckets", "error"),
+    ("budgets", "error"),
     [
-        ({"image": [0, 2304]}, "must all be > 0"),
-        ({"image": [2304, 2304]}, "unique"),
-        ({"video": [0, 12288]}, "must all be > 0"),
-        ({"video": [12288, 12288]}, "unique"),
+        ([0, 576], "must all be > 0"),
+        ([-1, 576], "must all be > 0"),
+        ([576, 576], "unique"),
     ],
 )
-def test_mm_encoder_patch_buckets_are_positive_and_unique(buckets, error):
+def test_encoder_token_budgets_are_positive_and_unique(budgets, error):
     with pytest.raises(ValueError, match=error):
-        RBLNConfig(mm_encoder_patch_buckets=buckets)
+        RBLNConfig(encoder_token_budgets=budgets)
 
 
 @pytest.mark.parametrize("size", [0, -1])
@@ -346,8 +344,8 @@ def test_only_compile_fields_change_the_hash():
     assert RBLNConfig(enable_sub_block_cache=False).compute_hash() == base
     assert RBLNConfig(sub_block_size=64).compute_hash() == base
     # mega_cache keys on the buckets the model resolves from this one.
-    patch_buckets = RBLNConfig(mm_encoder_patch_buckets={"image": [1024, 2304]})
-    assert patch_buckets.compute_hash() == base
+    encoder_budgets = RBLNConfig(encoder_token_budgets=[256, 576])
+    assert encoder_budgets.compute_hash() == base
     assert RBLNConfig(use_w8a8=True).compute_hash() != base
     assert RBLNConfig(compile_dtype="float16").compute_hash() != base
     assert RBLNConfig(decode_batch_bucket_strategy="linear").compute_hash() != base

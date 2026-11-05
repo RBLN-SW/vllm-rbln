@@ -3833,12 +3833,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # the model directly, bypassing the connector lifecycle entirely.
         logger.info("Compile and warming up model.")
 
-        mm_encoder_patch_buckets = (
-            cast(SupportsRBLNMultiModal, self.model).mm_encoder_patch_buckets
-            if self.supports_mm_inputs
-            else None
+        extra_hash_factors: dict[str, object] = {}
+        if self.supports_mm_inputs:
+            buckets = cast(SupportsRBLNMultiModal, self.model).mm_encoder_patch_buckets
+            if buckets:
+                extra_hash_factors["mm_encoder_patch_buckets"] = buckets
+        sig = mega_cache.config_signature(
+            self.vllm_config, extra_hash_factors=extra_hash_factors
         )
-        sig = mega_cache.config_signature(self.vllm_config, mm_encoder_patch_buckets)
         mega_cache.load(self.model_config.model, sig)
         with set_compile_stage("warmup"), self.offload_context():
             self.run_model_graphs()

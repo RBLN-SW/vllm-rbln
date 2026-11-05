@@ -185,9 +185,9 @@ def _image_info(video_kwargs=None, **kwargs):
     return m3.RBLNMiniMaxM3SparseForConditionalGeneration._processor_factory.info(ctx)
 
 
-def _build_with_patch_buckets(
+def _build_with_token_budgets(
     monkeypatch,
-    buckets,
+    budgets,
     *,
     max_side=672,
     info=None,
@@ -234,73 +234,79 @@ def _build_with_patch_buckets(
             multimodal_config=SimpleNamespace(get_limit_per_prompt=limits.get),
         ),
         quant_config=None,
-        additional_config=RBLNConfig(mm_encoder_patch_buckets=buckets),
+        additional_config=RBLNConfig(encoder_token_budgets=budgets),
     )
     return cls(vllm_config=vllm_config)
 
 
 @pytest.mark.parametrize(
-    ("configured", "buckets"),
+    ("configured", "merge_size", "buckets"),
     [
         # Unset: one bucket, the processor's largest image (672 px: 48 x 48).
-        ({}, [2304]),
-        ({"image": []}, [2304]),
-        ({"image": [2304, 1024]}, [1024, 2304]),
-        ({"image": [1024, 2400]}, [1024, 2400]),
+        ([], 2, [2304]),
+        ([576, 256], 2, [1024, 2304]),
+        ([256, 600], 2, [1024, 2400]),
+        ([16, 600], 3, [144, 5400]),
     ],
 )
-def test_patch_buckets_default_to_the_processors_largest_image(
-    monkeypatch, configured, buckets
+def test_token_budgets_resolve_to_patch_buckets(
+    monkeypatch, configured, merge_size, buckets
 ):
-    model = _build_with_patch_buckets(monkeypatch, configured)
+    info = _image_info(merge_size=merge_size)
+    model = _build_with_token_budgets(monkeypatch, configured, info=info)
 
-    assert model.mm_encoder_patch_buckets == {"image": buckets}
+    assert model.mm_encoder_patch_buckets == buckets
 
 
 @pytest.mark.parametrize(
     ("limits", "buckets"),
     [
         # A video segment: 4 temporal patches of a 602,112 px frame (3072 each).
-        ({"image": 0, "video": 1}, {"video": [12288]}),
-        ({"image": 1, "video": 1}, {"image": [2304], "video": [12288]}),
+        ({"image": 0, "video": 1}, [12288]),
+        ({"image": 1, "video": 1}, [2304, 12288]),
     ],
 )
-def test_patch_buckets_default_to_one_per_enabled_modality(
-    monkeypatch, limits, buckets
-):
-    model = _build_with_patch_buckets(monkeypatch, {}, limits=limits)
+def test_default_buckets_cover_enabled_modalities(monkeypatch, limits, buckets):
+    model = _build_with_token_budgets(monkeypatch, [], limits=limits)
 
     assert model.mm_encoder_patch_buckets == buckets
 
 
-def test_patch_buckets_must_hold_a_video_segment(monkeypatch):
-    with pytest.raises(ValueError, match="must reach 12288 patches"):
-        _build_with_patch_buckets(
-            monkeypatch, {"video": [2304, 3072]}, limits={"image": 1, "video": 1}
+def test_token_budgets_must_hold_a_video_segment(monkeypatch):
+    with pytest.raises(ValueError, match="must reach 3072 output tokens"):
+        _build_with_token_budgets(
+            monkeypatch, [576, 768], limits={"image": 1, "video": 1}
         )
 
 
-def test_video_buckets_do_not_change_image_selection(monkeypatch, vision_encoder_model):
-    model = _build_with_patch_buckets(
+@pytest.mark.parametrize(
+    ("grid", "expected_bucket"),
+    [([1, 4, 4], 1024), ([1, 32, 32], 1024), ([1, 24, 48], 2304)],
+)
+def test_images_and_video_segments_share_buckets(
+    monkeypatch, vision_encoder_model, grid, expected_bucket
+):
+    model = _build_with_token_budgets(
         monkeypatch,
-        {"image": [1024, 2304], "video": [512, 12288]},
+        [256, 576, 3072],
         limits={"image": 1, "video": 1},
     )
     model.vision_tower = vision_encoder_model.vision_tower
-    pixels = torch.ones(16, 6)
+    pixels = torch.ones(math.prod(grid), 6)
 
-    image, *_ = model._encoder_inputs(pixels, [1, 4, 4], "image")
-    video, *_ = model._encoder_inputs(pixels, [1, 4, 4], "video")
+    image, *_ = model._encoder_inputs(pixels, grid, "image")
+    video, *_ = model._encoder_inputs(pixels, grid, "video")
 
-    assert image.shape[0] == 1024
-    assert video.shape[0] == 512
+    assert image.shape[0] == video.shape[0] == expected_bucket
 
 
-def test_image_buckets_allow_default_video_buckets(monkeypatch):
-    model = _build_with_patch_buckets(
-        monkeypatch, {"image": [1024, 2304]}, limits={"image": 1, "video": 1}
+def test_default_buckets_deduplicate_equal_modality_bounds(monkeypatch):
+    info = _image_info()
+    monkeypatch.setattr(info, "get_max_video_frame_tokens", lambda: 144)
+    model = _build_with_token_budgets(
+        monkeypatch, [], info=info, limits={"image": 1, "video": 1}
     )
-    assert model.mm_encoder_patch_buckets == {"image": [1024, 2304], "video": [12288]}
+    assert model.mm_encoder_patch_buckets == [2304]
 
 
 @pytest.mark.parametrize("image_limit", [0, 1])
@@ -309,9 +315,9 @@ def test_unsegmented_video_is_rejected_at_startup(
     monkeypatch, image_limit, is_first_rank
 ):
     with pytest.raises(ValueError, match="vision_segment_max_frames=None"):
-        _build_with_patch_buckets(
+        _build_with_token_budgets(
             monkeypatch,
-            {},
+            [],
             limits={"image": image_limit, "video": 1},
             segment_frames=None,
             is_first_rank=is_first_rank,
@@ -319,10 +325,10 @@ def test_unsegmented_video_is_rejected_at_startup(
 
 
 def test_image_only_allows_no_frame_limit(monkeypatch):
-    model = _build_with_patch_buckets(
-        monkeypatch, {}, limits={"image": 1, "video": 0}, segment_frames=None
+    model = _build_with_token_budgets(
+        monkeypatch, [], limits={"image": 1, "video": 0}, segment_frames=None
     )
-    assert model.mm_encoder_patch_buckets == {"image": [2304]}
+    assert model.mm_encoder_patch_buckets == [2304]
 
 
 @pytest.mark.parametrize(
@@ -333,11 +339,11 @@ def test_image_only_allows_no_frame_limit(monkeypatch):
 def test_a_rank_without_an_encoder_has_no_patch_buckets(
     monkeypatch, limits, is_first_rank
 ):
-    model = _build_with_patch_buckets(
-        monkeypatch, {}, limits=limits, is_first_rank=is_first_rank
+    model = _build_with_token_budgets(
+        monkeypatch, [], limits=limits, is_first_rank=is_first_rank
     )
     assert model.vision_tower is None
-    assert model.mm_encoder_patch_buckets == {}
+    assert model.mm_encoder_patch_buckets == []
 
 
 def test_video_budget_can_schedule_a_video_enlarged_by_min_pixels():
@@ -426,19 +432,9 @@ def test_video_budget_preserves_upstream_estimate(
     assert actual == expected
 
 
-@pytest.mark.parametrize(
-    ("configured", "max_side", "error"),
-    [
-        ({"image": [1022, 2304]}, 672, r"\[1022\] must be multiples of 4"),
-        ({"image": [1024]}, 672, "must reach 2304 patches"),
-        ({"image": [2304, 5184]}, 672, r"\[5184\] would never be used"),
-    ],
-)
-def test_unusable_patch_buckets_are_rejected_at_startup(
-    monkeypatch, configured, max_side, error
-):
-    with pytest.raises(ValueError, match=error):
-        _build_with_patch_buckets(monkeypatch, configured, max_side=max_side)
+def test_token_budgets_must_hold_an_image(monkeypatch):
+    with pytest.raises(ValueError, match="must reach 576 output tokens"):
+        _build_with_token_budgets(monkeypatch, [256])
 
 
 @pytest.fixture
@@ -466,7 +462,7 @@ def vision_encoder_model():
         vision_segment_max_frames=2,
     )
     model.vision_tower = tower
-    model.mm_encoder_patch_buckets = {"image": [16, 64], "video": [16, 64]}
+    model.mm_encoder_patch_buckets = [16, 64]
     return model
 
 
@@ -517,7 +513,7 @@ def test_no_frame_limit_keeps_image_output_storage(vision_encoder_model):
 
 def test_shared_bucket_is_warmed_once(vision_encoder_model):
     model = vision_encoder_model
-    model.mm_encoder_patch_buckets = {"image": [16, 64], "video": [64, 128]}
+    model.mm_encoder_patch_buckets = [16, 64, 128]
     encoder = Mock()
     object.__setattr__(model, "_mm_encoder", encoder)
 
@@ -565,18 +561,24 @@ def test_an_image_runs_in_the_smallest_bucket_that_holds_it(vision_encoder_model
 
 
 @pytest.mark.parametrize(
-    ("buckets", "max_side"),
+    ("buckets", "max_side", "video_limit"),
     [
-        ([2240, 2300, 2304], 672),
-        ([2208, 2240, 2304], 672),
-        ([2304, 2308, 5184], 1008),
+        ([2240, 2300, 2304], 672, 0),
+        ([2208, 2240, 2304], 672, 0),
+        ([2304, 2308, 5184], 1008, 0),
+        ([2304, 2308, 5184], 672, 0),
+        ([1024, 2304, 12288], 672, 1),
+        ([1024, 2304, 12288], 672, 0),
     ],
 )
 def test_warmup_runs_every_patch_bucket(
-    monkeypatch, vision_encoder_model, buckets, max_side
+    monkeypatch, vision_encoder_model, buckets, max_side, video_limit
 ):
-    model = _build_with_patch_buckets(
-        monkeypatch, {"image": buckets}, max_side=max_side
+    model = _build_with_token_budgets(
+        monkeypatch,
+        [b // 4 for b in buckets],
+        max_side=max_side,
+        limits={"image": 1, "video": video_limit},
     )
     model.vision_tower = vision_encoder_model.vision_tower
     warmed = []
@@ -667,8 +669,8 @@ def test_image_bound_covers_the_real_resize(monkeypatch, kwargs, size):
     info = _image_info(**kwargs)
     outputs = info.get_image_processor()(Image.new("RGB", size), return_tensors="pt")
     patches = int(outputs["image_grid_thw"].prod())
-    model = _build_with_patch_buckets(monkeypatch, {}, info=info)
-    assert model.mm_encoder_patch_buckets["image"][-1] >= patches
+    model = _build_with_token_budgets(monkeypatch, [], info=info)
+    assert model.mm_encoder_patch_buckets[-1] >= patches
     assert info.get_max_image_tokens() >= patches // 4
 
     monkeypatch.setattr(
@@ -716,10 +718,10 @@ def test_video_bound_covers_the_real_resize(monkeypatch, kwargs, size):
         == t * h * w // 4
     )
 
-    model = _build_with_patch_buckets(
-        monkeypatch, {}, info=info, limits={"image": 0, "video": 1}
+    model = _build_with_token_budgets(
+        monkeypatch, [], info=info, limits={"image": 0, "video": 1}
     )
-    assert model.mm_encoder_patch_buckets["video"][-1] >= 4 * h * w
+    assert model.mm_encoder_patch_buckets[-1] >= 4 * h * w
 
 
 def test_patch_bucket_accepts_a_non_square_image(monkeypatch):
@@ -730,10 +732,8 @@ def test_patch_bucket_accepts_a_non_square_image(monkeypatch):
         Image.new("RGB", (784, 560)), return_tensors="pt"
     )
     assert int(outputs["image_grid_thw"].prod()) == 2240
-    model = _build_with_patch_buckets(
-        monkeypatch, {"image": [2208, 2240, 2304]}, info=info
-    )
-    assert model.mm_encoder_patch_buckets == {"image": [2208, 2240, 2304]}
+    model = _build_with_token_budgets(monkeypatch, [552, 560, 576], info=info)
+    assert model.mm_encoder_patch_buckets == [2208, 2240, 2304]
 
 
 @pytest.mark.parametrize(
