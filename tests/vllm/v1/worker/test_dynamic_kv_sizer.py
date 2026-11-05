@@ -1172,7 +1172,7 @@ class TestReleaseKvCacheTensors:
             compilation_config=SimpleNamespace(
                 static_forward_context={"l0": layer, "aux": aux}
             ),
-            aux_kv_cache_layers=["aux"],
+            aux_kv_cache_specs={"aux": object()},
             kv_cache_allocations={kv_cache_tensor_key(layer.kv_cache): "l0"},
         )
         sizer = SimpleNamespace(
