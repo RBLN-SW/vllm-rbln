@@ -117,6 +117,16 @@ def test_an_image_beyond_the_bucket_is_refused():
         model._encode_vision(pixels, positions)
 
 
+def test_speculative_decoding_is_refused():
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        speculative_config=SimpleNamespace(method="mtp"),
+    )
+
+    with pytest.raises(ValueError, match="speculative decoding"):
+        RBLNGemma4ForConditionalGeneration(vllm_config=vllm_config)
+
+
 def _recording_model(buckets):
     """A model whose compiled encoder records the patch count it is called at."""
     tower = _vision_tower()

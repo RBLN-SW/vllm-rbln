@@ -194,6 +194,11 @@ class RBLNGemma4ForConditionalGeneration(
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         if vllm_config.parallel_config.data_parallel_size > 1:
             raise ValueError("Gemma4 does not support data parallel on RBLN.")
+        # TODO(RBLN): both drafter kinds wait on compiler fixes; see #1395.
+        if vllm_config.speculative_config is not None:
+            raise ValueError(
+                "Gemma4 does not support speculative decoding on RBLN yet."
+            )
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         self.mm_soft_token_cap = mm_soft_token_cap(
             MULTIMODAL_REGISTRY.create_processor(vllm_config.model_config).info
