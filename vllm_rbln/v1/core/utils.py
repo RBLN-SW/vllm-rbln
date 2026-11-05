@@ -56,7 +56,7 @@ def is_strict_kv_producer(vllm_config: VllmConfig) -> bool:
 
 def is_prefill(request: Request, *, strict_kv_producer: bool) -> bool:
     # A strict producer compiles no decode graph, so a step with one token left is
-    # a prefill too; the prefill graph takes it, padded to max_num_tokens.
+    # a prefill too; the prefill graph takes it, padded to prefill_chunk_size.
     if strict_kv_producer:
         return request.num_computed_tokens < request.num_tokens
     return (
