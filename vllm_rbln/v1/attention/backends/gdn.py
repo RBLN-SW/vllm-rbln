@@ -23,7 +23,7 @@ and write: a request's one block (`mamba_block_size` is the model length),
 read and written in place; a padding row reads and writes block 0, vLLM's
 null block.
 
-The cores take q / k per key head, L2-normalized in the kernel, and v, g and
+The delta-rule kernels take q / k per key head, L2-normalized inside, and v, g and
 beta per value head grouped under its key head. The short conv
 (`rbln_custom_ops::kda_conv`, fed as GLM-5.3 feeds its own) runs once over
 q | k | v in that same key-head order (`grouped_qkv_rows`); the converter builds
@@ -60,8 +60,8 @@ def gdn_state_shape(heads_k: int, heads_v: int) -> tuple[int, ...]:
 def grouped_qkv_rows(heads_k: int, ratio: int, head_dim: int) -> torch.Tensor:
     """The rows of [q heads | k heads | v heads] regrouped by key head: q_h, k_h,
     then key head h's `ratio` value heads, for each h. The short conv runs one
-    call over this order, so RSD's cut of its channels is the cores' cut of
-    their heads and no chiplet reads another's output."""
+    call over this order, so RSD's cut of its channels is the delta-rule
+    kernels' cut of their heads and no chiplet reads another's output."""
     q = torch.arange(heads_k).view(heads_k, 1)
     k = q + heads_k
     v = (torch.arange(heads_k * ratio) + 2 * heads_k).view(heads_k, ratio)
@@ -75,11 +75,12 @@ class RBLNGDNAttentionMetadata:
     batch_size: int
     seq_len: int
     # [batch] int16 on the host: the state block each row loads, the one it
-    # stores, and 1 where the loaded block carries a state. The core kernels
-    # read them through the const buffer (a device copy crashes the runtime).
-    core_state_index: torch.Tensor
-    core_store_index: torch.Tensor
-    core_has_initial_state: torch.Tensor
+    # stores, and 1 where the loaded block carries a state. The delta-rule
+    # kernels read them through the const buffer (a device copy crashes the
+    # runtime).
+    ssm_state_index: torch.Tensor
+    ssm_store_index: torch.Tensor
+    ssm_has_initial_state: torch.Tensor
     # [batch] int32 on the device: what kda_conv reads a row's ring by (its
     # block, the step's first position, its valid tokens, 1 where the ring
     # carries a state) and the block it stores the ring to.
@@ -173,9 +174,9 @@ class RBLNGDNAttentionMetadataBuilder(
             is_prefill=is_prefill,
             batch_size=batch,
             seq_len=seq_len,
-            core_state_index=blocks.to(torch.int16),
-            core_store_index=blocks.to(torch.int16),
-            core_has_initial_state=has_initial_state.to(torch.int16),
+            ssm_state_index=blocks.to(torch.int16),
+            ssm_store_index=blocks.to(torch.int16),
+            ssm_has_initial_state=has_initial_state.to(torch.int16),
             conv_state_index=self._stage(blocks, "conv_state_index"),
             conv_seq_idx=self._stage(padded(first_positions), "conv_seq_idx"),
             conv_query_len=self._stage(padded(query_lens), "conv_query_len"),

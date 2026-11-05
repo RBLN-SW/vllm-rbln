@@ -106,7 +106,7 @@ class RBLNGDNConvRingCache(nn.Module, AttentionLayerBase):
     key=f"{__name__}.RBLNQwenGatedDeltaNetAttention.qwen3_next",
     reason=(
         "Qwen3-Next builds its GatedDeltaNet layer from this module's name; the "
-        "RBLN layer declares the CR13 cores' state in a pool of its own and runs "
+        "RBLN layer declares the delta-rule state in a pool of its own and runs "
         "the conv and the delta rule as RBLN custom kernels."
     ),
 )
@@ -115,7 +115,7 @@ class RBLNGDNConvRingCache(nn.Module, AttentionLayerBase):
     reason=(
         "Upstream's GatedDeltaNet layer declares a conv + ssm state page its "
         "Triton/CUDA kernels address and picks a forward by platform, with no "
-        "out-of-tree branch; the RBLN layer declares the CR13 cores' state in a "
+        "out-of-tree branch; the RBLN layer declares the delta-rule state in a "
         "block pool of its own, keeps the conv ring in a block-aux cache, and runs "
         "both as RBLN custom kernels on the group's block ids."
     ),
@@ -154,7 +154,7 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         )
 
     def get_state_dtype(self) -> tuple[torch.dtype]:
-        # The CR13 cores keep the state in the activation dtype (dlfloat16
+        # The delta-rule kernels keep the state in the activation dtype (dlfloat16
         # inside the kernel), so the cache dtype options cannot move it.
         _, state_dtype = super().get_state_dtype()
         if state_dtype != self.model_config.dtype:
@@ -215,7 +215,7 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
         # One conv over q | k | v, whose rows the model regrouped by key head at
         # load time (grouped_qkv_rows): RSD cuts the conv's channels where it cuts
-        # the cores' heads, so a chiplet's conv output is what its cores read.
+        # the delta-rule kernels' heads, so a chiplet's conv output is what they read.
         convolved = torch.ops.rbln_custom_ops.kda_conv(
             qkv.reshape(batch, seq_len, channels),
             self.conv1d.weight.view(channels, kernel).to(mixed_qkvz.dtype),
@@ -227,7 +227,7 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             kernel - 1,
             store_index=metadata.conv_store_index,
         )
-        # The cores take q / k per key head (they L2-normalize them) and v, g and
+        # The delta-rule kernels take q / k a key head (L2-normalized inside), v, g and
         # beta per value head grouped under its key head: value head h is key head
         # h // ratio's (h % ratio)-th, as HF's repeat_interleave pairs them.
         grouped = convolved.view(batch, seq_len, heads_k, 2 + ratio, head_dim)
@@ -255,10 +255,10 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 g,
                 beta,
                 state,
-                metadata.core_state_index,
-                metadata.core_has_initial_state,
+                metadata.ssm_state_index,
+                metadata.ssm_has_initial_state,
                 GDN_PREFILL_CHUNK,
-                store_index=metadata.core_store_index,
+                store_index=metadata.ssm_store_index,
             )
         else:
             core = torch.ops.rbln_custom_ops.recurrent_gated_delta_rule(
@@ -268,8 +268,8 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 g,
                 beta,
                 state,
-                metadata.core_state_index,
-                store_index=metadata.core_store_index,
+                metadata.ssm_state_index,
+                store_index=metadata.ssm_store_index,
             )
         # [batch, heads_k, ratio, seq, 128] -> [batch, seq, heads_v, 128]
         core = core.permute(0, 3, 1, 2, 4).reshape(batch, seq_len, heads_v, head_dim)

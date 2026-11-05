@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The RBLN GatedDeltaNet layer declares the state the CR13 cores keep as a
-block in a pool of its own, and its forward tracks the HF reference across a
-padded prefill chunk, a continued chunk and a decode step on that block. The
+"""The RBLN GatedDeltaNet layer declares the state the delta-rule kernels keep
+as a block in a pool of its own, and its forward tracks the HF reference across
+a padded prefill chunk, a continued chunk and a decode step on that block. The
 custom ops run their CPU bodies here, so no NPU is needed."""
 
 from types import SimpleNamespace
@@ -253,8 +253,8 @@ def test_forward_without_metadata_is_an_error(vllm_config):
 
 
 class TestStateSpec:
-    """The layer declares the state the CR13 cores keep, and the model declares
-    the same state for the platform's page arithmetic."""
+    """The layer declares the state the delta-rule kernels keep, and the model
+    declares the same state for the platform's page arithmetic."""
 
     @staticmethod
     def _layer():
@@ -270,7 +270,7 @@ class TestStateSpec:
         )
         return layer
 
-    def test_the_layer_declares_one_core_state_a_block(self):
+    def test_the_layer_declares_one_ssm_state_a_block(self):
         layer = self._layer()
         assert layer.get_state_shape() == ((2, 2, 2, 128, 64),)
         # The activation dtype: the kernels take no other.

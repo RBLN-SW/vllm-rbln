@@ -98,9 +98,9 @@ class TestBuilder:
         md = builder.build(_common([70], [70], [[7]]), positions, 1, True)
         assert md.is_prefill and md.batch_size == 1 and md.seq_len == 128
         # A fresh request names its block for both, and the kernel reads none.
-        assert md.core_state_index.tolist() == [7]
-        assert md.core_store_index.tolist() == [7]
-        assert md.core_has_initial_state.tolist() == [0]
+        assert md.ssm_state_index.tolist() == [7]
+        assert md.ssm_store_index.tolist() == [7]
+        assert md.ssm_has_initial_state.tolist() == [0]
         _assert_conv_rows(md, [7], [0], [70], [0])
         assert md.valid_mask.shape == (1, 1, 128)
         assert md.valid_mask.sum() == 70 and md.valid_mask[..., :70].all()
@@ -108,17 +108,17 @@ class TestBuilder:
     def test_later_prefill_chunk_carries_state(self, builder):
         positions = torch.arange(70, 70 + 58)
         md = builder.build(_common([58], [128], [[7]]), positions, 1, True)
-        assert md.core_state_index.tolist() == [7]
-        assert md.core_has_initial_state.tolist() == [1]
+        assert md.ssm_state_index.tolist() == [7]
+        assert md.ssm_has_initial_state.tolist() == [1]
         _assert_conv_rows(md, [7], [70], [58], [1])
 
     def test_decode_pads_the_batch_onto_the_null_block(self, builder):
         positions = torch.tensor([128, 5])
         md = builder.build(_common([1, 1], [129, 6], [[7], [3]]), positions, 4, False)
         assert not md.is_prefill and md.batch_size == 4 and md.seq_len == 1
-        assert md.core_state_index.tolist() == [7, 3, 0, 0]
-        assert md.core_store_index.tolist() == [7, 3, 0, 0]
-        assert md.core_has_initial_state.tolist() == [1, 1, 0, 0]
+        assert md.ssm_state_index.tolist() == [7, 3, 0, 0]
+        assert md.ssm_store_index.tolist() == [7, 3, 0, 0]
+        assert md.ssm_has_initial_state.tolist() == [1, 1, 0, 0]
         _assert_conv_rows(md, [7, 3, 0, 0], [128, 5, 0, 0], [1, 1, 0, 0], [1, 1, 0, 0])
         assert md.valid_mask is None
 
