@@ -58,6 +58,7 @@ def _stub_config(digest: str = "cfghash"):
         ),
         model_config=SimpleNamespace(max_model_len=32),
         kv_transfer_config=None,
+        is_mm_encoder_only=False,
     )
 
 

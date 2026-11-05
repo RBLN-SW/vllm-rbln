@@ -1811,8 +1811,10 @@ class TestDynamicKvUnsupportedReason:
         block_size=16,
         max_model_len=32,
         kv_transfer_config=None,
+        is_mm_encoder_only=False,
     ):
         return SimpleNamespace(
+            is_mm_encoder_only=is_mm_encoder_only,
             additional_config=RBLNConfig(
                 use_custom_kernel=use_custom_kernel,
                 use_dynamic_kv_cache=use_dynamic_kv_cache,
@@ -1847,6 +1849,10 @@ class TestDynamicKvUnsupportedReason:
         assert "VLLM_RBLN_USE_DEVICE_TENSOR" in dynamic_kv_unsupported_reason(
             self._cfg()
         )
+
+    def test_an_encoder_only_instance_is_unsupported(self):
+        reason = dynamic_kv_unsupported_reason(self._cfg(is_mm_encoder_only=True))
+        assert "encoder-only" in reason
 
     def test_the_triton_kernels_are_unsupported(self):
         reason = dynamic_kv_unsupported_reason(self._cfg(use_custom_kernel=True))

@@ -447,6 +447,8 @@ def dynamic_kv_unsupported_reason(vllm_config: VllmConfig) -> str | None:
     is a hard failure in `DynamicKvSizer`. The optimum path is not among them --
     it installs neither the engine patch nor a worker that carries a sizer.
     """
+    if vllm_config.is_mm_encoder_only:
+        return "an encoder-only instance holds no KV cache"
     if not envs.VLLM_RBLN_USE_DEVICE_TENSOR:
         return (
             "VLLM_RBLN_USE_DEVICE_TENSOR is off, so the artifact carries no "
