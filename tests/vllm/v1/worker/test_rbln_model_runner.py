@@ -94,6 +94,7 @@ def _make_runner_stub(**attrs):
     runner = object.__new__(RBLNModelRunner)
     runner.dp_status = None
     runner.supports_mm_inputs = False
+    runner.is_mm_encoder_only = False
     for key, value in attrs.items():
         setattr(runner, key, value)
     return runner

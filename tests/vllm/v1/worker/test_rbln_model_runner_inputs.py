@@ -21,8 +21,16 @@ from unittest.mock import Mock
 
 import numpy as np
 import pytest
+import safetensors.torch
 import torch
 from vllm.config import ModelConfig
+from vllm.config.ec_transfer import ECTransferConfig
+from vllm.distributed.ec_transfer import ec_transfer_state
+from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorRole
+from vllm.distributed.ec_transfer.ec_connector.example_connector import (
+    ECExampleConnector,
+    ECExampleConnectorMetadata,
+)
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
     MultiModalFieldConfig,
@@ -221,6 +229,67 @@ class TestGatherMultimodalEmbeddings:
         torch.testing.assert_close(mask[:, 0], (expected != 0).to(runner.dtype))
 
 
+class TestEncoderCacheTransfer:
+    """An EC producer publishes what it encodes, through a real
+    ECExampleConnector on disk."""
+
+    @staticmethod
+    def _connector(monkeypatch, tmp_path, role: str) -> ECExampleConnector:
+        transfer = ECTransferConfig(
+            ec_connector="ECExampleConnector",
+            ec_role=role,
+            ec_connector_extra_config={"shared_storage_path": str(tmp_path)},
+        )
+        connector = ECExampleConnector(
+            SimpleNamespace(ec_transfer_config=transfer, model_config=None),
+            ECConnectorRole.WORKER,
+        )
+        monkeypatch.setattr(ec_transfer_state, "_EC_CONNECTOR_AGENT", connector)
+        return connector
+
+    @staticmethod
+    def _image_step(data, length: int = 1):
+        step = schedule_new("images", prompt_token_ids=[[1] * 4])
+        step.scheduled_new_reqs[0].mm_features = [
+            MultiModalFeatureSpec(
+                data=data,
+                modality="image",
+                identifier="image-0",
+                mm_position=PlaceholderRange(offset=1, length=length),
+            )
+        ]
+        step.ec_connector_metadata = ECExampleConnectorMetadata()
+        return step
+
+    def test_an_encoder_only_step_publishes_what_it_encodes(
+        self, make_model_runner, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(
+            mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+        )
+        runner = make_model_runner()
+        runner.is_mm_encoder_only = True
+        self._connector(monkeypatch, tmp_path, "ec_producer")
+        pixels = torch.tensor([[[1.0, 2.0]]])
+        (elem,) = MultiModalFieldConfig.batched("image").build_elems(
+            "pixel_values", pixels
+        )
+        step = self._image_step(MultiModalKwargsItem({"pixel_values": elem}))
+        step.scheduled_encoder_inputs = {"images": [0]}
+        runner.model = SimpleNamespace(
+            embed_multimodal=lambda *, pixel_values: tuple(pixel_values + 10)
+        )
+
+        output = runner.execute_model(step)
+
+        assert output.req_ids == ["images"]
+        assert output.sampled_token_ids == [[]]
+        published = safetensors.torch.load_file(
+            tmp_path / "image-0" / "encoder_cache.safetensors"
+        )["ec_cache"]
+        torch.testing.assert_close(published, pixels[0] + 10)
+
+
 class TestWarmupMultimodalEncoder:
     @staticmethod
     def _fake_processor(monkeypatch, pixels, *, image_limit=1):
@@ -284,6 +353,25 @@ class TestWarmupMultimodalEncoder:
 
         model.warm_up_mm_encoder.assert_called_once_with()
         model.embed_multimodal.assert_not_called()
+
+    def test_an_encoder_only_instance_warms_only_the_encoder(
+        self, make_model_runner, monkeypatch
+    ):
+        runner = make_model_runner()
+        runner.is_mm_encoder_only = True
+        warmed = []
+        monkeypatch.setattr(
+            runner, "run_model_graphs", lambda: warmed.append("language model")
+        )
+        monkeypatch.setattr(
+            runner, "_warmup_mm_encoder", lambda: warmed.append("encoder")
+        )
+        monkeypatch.setattr(mr.mega_cache, "load", lambda *args: None)
+        monkeypatch.setattr(mr.mega_cache, "save", lambda *args: None)
+
+        runner.warmup_model()
+
+        assert warmed == ["encoder"]
 
     @pytest.mark.parametrize(
         "reason", ["text_only_model", "other_pp_rank", "no_image_limit"]

@@ -34,6 +34,10 @@ from vllm.distributed import (
     init_distributed_environment,
     set_custom_all_reduce,
 )
+from vllm.distributed.ec_transfer import (
+    ensure_ec_transfer_initialized,
+    ensure_ec_transfer_shutdown,
+)
 from vllm.distributed.kv_transfer import (
     ensure_kv_transfer_initialized,
     ensure_kv_transfer_shutdown,
@@ -193,6 +197,8 @@ class RBLNWorker(WorkerBase):
 
         # Set random seed.
         set_random_seed(self.model_config.seed)
+
+        ensure_ec_transfer_initialized(self.vllm_config)
 
         # Construct the model runner
         self.model_runner: RBLNModelRunner = RBLNModelRunner(
@@ -722,6 +728,8 @@ class RBLNWorker(WorkerBase):
         # has_kv_transfer_group can be None during interpreter shutdown.
         if ensure_kv_transfer_shutdown is not None:
             ensure_kv_transfer_shutdown()
+        if ensure_ec_transfer_shutdown is not None:
+            ensure_ec_transfer_shutdown()
         if self.profiler is not None:
             self.profiler.shutdown()
 

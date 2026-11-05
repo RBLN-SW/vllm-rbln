@@ -504,3 +504,14 @@ class TestLayerIndexFollowsCachePosition:
             old is not new for old, new in zip(before, runner.kv_caches, strict=True)
         )
         self._assert_each_layer_reads_its_own_cache(runner)
+
+
+class TestGetKvCacheSpec:
+    def test_an_encoder_only_instance_asks_for_no_kv_cache(
+        self, make_model_runner, monkeypatch
+    ):
+        runner = make_model_runner()
+        assert runner.get_kv_cache_spec()
+        runner.is_mm_encoder_only = True
+
+        assert runner.get_kv_cache_spec() == {}
