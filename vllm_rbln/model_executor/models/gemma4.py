@@ -192,8 +192,6 @@ class RBLNGemma4ForConditionalGeneration(
     Gemma4ForConditionalGeneration, SupportsRBLNMultiModal, SupportsRBLNMmEncoderWarmup
 ):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
-        if vllm_config.parallel_config.data_parallel_size > 1:
-            raise ValueError("Gemma4 does not support data parallel on RBLN.")
         # TODO(RBLN): both drafter kinds wait on compiler fixes; see #1395.
         if vllm_config.speculative_config is not None:
             raise ValueError(

@@ -118,10 +118,7 @@ def test_an_image_beyond_the_bucket_is_refused():
 
 
 def test_speculative_decoding_is_refused():
-    vllm_config = SimpleNamespace(
-        parallel_config=SimpleNamespace(data_parallel_size=1),
-        speculative_config=SimpleNamespace(method="mtp"),
-    )
+    vllm_config = SimpleNamespace(speculative_config=SimpleNamespace(method="mtp"))
 
     with pytest.raises(ValueError, match="speculative decoding"):
         RBLNGemma4ForConditionalGeneration(vllm_config=vllm_config)

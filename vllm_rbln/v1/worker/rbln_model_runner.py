@@ -1473,6 +1473,17 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     f"long_prefill_token_threshold={threshold} would split a "
                     f"multimodal range of up to {longest} tokens."
                 )
+            # The MoE layers pad every DP rank's tokens to the step budget, so
+            # the padded range has to fit it.
+            if self.parallel_config.data_parallel_size > 1 and (
+                longest > self.max_num_tokens
+            ):
+                raise ValueError(
+                    f"An mm prefix step pads to {longest} tokens, above "
+                    f"max_num_batched_tokens={self.max_num_tokens}, which data "
+                    f"parallelism pads every rank's tokens to. Set "
+                    f"--max-num-batched-tokens to at least {longest}."
+                )
             # TODO(RBLN): spec decode runs a range under a shape this path does
             # not pick yet.
             if self.speculative_config is not None:
