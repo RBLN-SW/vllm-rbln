@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Fail-close ordering: engine death is published before the workers end.
+"""TCP rendezvous and fail-close ordering for the multiprocess executor.
 
 Pure logic: no worker process is started and no NPU is opened. A fake executor
 records the order in which the patched ``shutdown`` touches the response queues
@@ -20,15 +20,33 @@ and the termination wait, which is the whole point of the patch -- upstream
 waits first, so EngineCore stays parked on a response queue (and the API server
 keeps answering 200) for the length of the grace / SIGTERM / SIGKILL ladder.
 
-Every test here fails against upstream's ``shutdown`` / ``start_worker_monitor``
+The shutdown tests fail against upstream's ``shutdown`` / ``start_worker_monitor``
 run on the same fake; none of them pins behaviour the patch merely inherits.
 """
 
 import threading
 from collections.abc import Callable
+from datetime import timedelta
 from threading import Thread
 
+import torch.distributed as dist
+from vllm.v1.executor import multiproc_executor as upstream
+
+from vllm_rbln.patches import apply_registered_patches
 from vllm_rbln.patches import multiproc_executor as mpx
+
+
+def test_default_rendezvous_uses_tcp_store():
+    apply_registered_patches()
+    init_method = upstream.get_file_store_init_method()
+    assert init_method.startswith("tcp://")
+    store, rank, size = next(
+        dist.rendezvous(init_method, rank=0, world_size=1, timeout=timedelta(seconds=5))
+    )
+    assert isinstance(store, dist.TCPStore)
+    assert (rank, size) == (0, 1)
+    store.set("ready", b"R")
+    assert store.get("ready") == b"R"
 
 
 class _Queue:

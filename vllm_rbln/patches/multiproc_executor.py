@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Worker response queue fixes for the multiprocess executor.
+"""Rendezvous and worker response queue fixes for the multiprocess executor.
 
 Sizing: a KV connector makes `collective_rpc` pass `output_rank=None`, so every
 worker answers each RPC instead of only the output rank. Under pipeline
@@ -34,12 +34,31 @@ from threading import Thread
 import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed.device_communicators.shm_broadcast import Handle, MessageQueue
+from vllm.utils.network_utils import (
+    get_distributed_init_method,
+    get_loopback_ip,
+    get_open_port,
+)
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor, WorkerProc
 
 from vllm_rbln.logger import init_logger
 from vllm_rbln.patches import register_patch
 
 logger = init_logger(__name__)
+
+
+@register_patch(
+    target="vllm.v1.executor.multiproc_executor.get_file_store_init_method",
+    reason=(
+        "AoT CCL reuses the default Store for recurring host exchanges when "
+        "native host exchange is unavailable. Upstream selects FileStore for "
+        "local multiprocess execution without a platform rendezvous hook; use "
+        "TCPStore to avoid polling the filesystem before each run."
+    ),
+)
+def get_tcp_store_init_method() -> str:
+    return get_distributed_init_method(get_loopback_ip(), get_open_port())
+
 
 # Upstream's `_ensure_worker_termination` waits the configurable grace period,
 # then 4 s after SIGTERM, then SIGKILLs. The engine's wait on that ladder is
