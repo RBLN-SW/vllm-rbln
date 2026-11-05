@@ -105,7 +105,7 @@ class TestResolveMmPrefixSupport:
         runner = self._runner(make_model_runner, monkeypatch, _MmPrefixModel([64, 128]))
 
         assert runner._resolve_mm_support() is True
-        assert runner.mm_prefix_query_lens == [64, 128]
+        assert runner.mm_prefix_query_len_buckets == [64, 128]
 
     def test_a_model_naming_no_query_lens_is_refused(
         self, make_model_runner, monkeypatch

@@ -303,7 +303,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.cascade_attn_enabled = not self.model_config.disable_cascade_attn
         # Set in load_model by _resolve_mm_support.
         self.supports_mm_inputs = False
-        self.mm_prefix_query_lens: list[int] = []
+        self.mm_prefix_query_len_buckets: list[int] = []
         # The padded query length of a step prefilling one mm prefix range,
         # None on any other step. Stamped per step like is_prefill.
         self.mm_prefix_query_len: int | None = None
@@ -1480,7 +1480,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     "Speculative decoding is not supported with multimodal inputs of "
                     "an mm prefix LM on RBLN yet."
                 )
-            self.mm_prefix_query_lens = query_lens
+            self.mm_prefix_query_len_buckets = query_lens
         return True
 
     def _execute_mm_encoder(self, scheduler_output: RBLNSchedulerOutput) -> None:
@@ -2063,7 +2063,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             # ending a range it started in, at its start or where a prefix cache
             # hit resumed it, is an mm prefix step.
             self.mm_prefix_query_len = None
-            if self.is_prefill and self.mm_prefix_query_lens:
+            if self.is_prefill and self.mm_prefix_query_len_buckets:
                 first = int(self.input_batch.num_computed_tokens_cpu[0])
                 last = first + int(num_scheduled_tokens_np[0]) - 1
                 ranges = [
@@ -2075,7 +2075,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 if any(start <= first and last == end for start, end in ranges):
                     self.mm_prefix_query_len = next(
                         query_len
-                        for query_len in self.mm_prefix_query_lens
+                        for query_len in self.mm_prefix_query_len_buckets
                         if query_len > last - first
                     )
 
@@ -4033,7 +4033,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         """Every model graph once, at the shapes serving will ask for."""
         # 1. prefill, then one mm prefix step per query length
         self._dummy_run(1, self.prefill_chunk_size, True)
-        for query_len in self.mm_prefix_query_lens:
+        for query_len in self.mm_prefix_query_len_buckets:
             self._dummy_run(1, query_len, True, mm_prefix_query_len=query_len)
 
         # 2. decode
