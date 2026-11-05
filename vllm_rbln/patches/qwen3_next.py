@@ -14,6 +14,9 @@
 
 import torch
 import torch.nn.functional as F
+from rebel.ops.torch_custom_ops.gdn import CHUNK as GDN_PREFILL_CHUNK
+from rebel.ops.torch_custom_ops.gdn import HEAD_DIM as GDN_HEAD_DIM
+from rebel.ops.torch_custom_ops.kda import CONV_LANES
 from torch import nn
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
@@ -27,8 +30,6 @@ from vllm_rbln.patches import register_patch
 from vllm_rbln.patches.attention import _resolve_kv_cache
 from vllm_rbln.patches.registry import add_registration
 from vllm_rbln.v1.attention.backends.gdn import (
-    GDN_HEAD_DIM,
-    GDN_PREFILL_CHUNK,
     RBLNGDNAttentionBackend,
     RBLNGDNAttentionMetadata,
     gdn_state_shape,
@@ -124,18 +125,24 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         self, config, vllm_config: VllmConfig, prefix: str = "", **kwargs
     ) -> None:
         super().__init__(config, vllm_config, prefix, **kwargs)
+        # TODO(rebel_compiler#15378): HEAD_DIM goes away with it; the check
+        # becomes Dk == Dv, a multiple of STATE_LANES.
         if self.head_k_dim != GDN_HEAD_DIM or self.head_v_dim != GDN_HEAD_DIM:
             raise NotImplementedError(
                 "The RBLN GatedDeltaNet kernels take 128-wide heads, got "
                 f"{self.head_k_dim} / {self.head_v_dim}"
             )
         self.layer_index = _layer_index(prefix)
-        # One ring a block, in kda_conv's 64-lane blocks of the conv's channels.
+        # One ring a block, in kda_conv's lane blocks of the conv's channels.
         channels = (2 * self.key_dim + self.value_dim) // self.tp_size
         self.conv_ring = RBLNGDNConvRingCache(
             f"{prefix}.conv_ring",
             owner=prefix,
-            block_shape=(self.conv_kernel_size - 1, channels // 64, 64),
+            block_shape=(
+                self.conv_kernel_size - 1,
+                channels // CONV_LANES,
+                CONV_LANES,
+            ),
             dtype=vllm_config.model_config.dtype,
         )
 
@@ -196,7 +203,7 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         key_dim = self.key_dim // tp_size
         value_dim = self.value_dim // tp_size
         channels = key_dim * 2 + value_dim
-        head_dim = GDN_HEAD_DIM
+        head_dim = self.head_k_dim
         kernel = self.conv_kernel_size
 
         # Keep the leading dims the model uses ([batch, seq] on RBLN); only the

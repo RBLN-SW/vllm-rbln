@@ -34,6 +34,7 @@ is stored to the block the state is.
 from dataclasses import dataclass
 
 import torch
+from rebel.ops.torch_custom_ops.gdn import STATE_BLOCKS
 from vllm.config import VllmConfig
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -46,16 +47,14 @@ from vllm.v1.attention.backends.registry import (
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec
 
-# The core kernels take 128-wide heads; the CR13 prefill kernel runs 128-token
-# chunks only.
-GDN_HEAD_DIM = 128
-GDN_PREFILL_CHUNK = 128
-
 
 def gdn_state_shape(heads_k: int, heads_v: int) -> tuple[int, ...]:
-    """One block's state as the CR13 cores keep it: each key head's
-    `heads_v / heads_k` [128, 128] states blocked as [2, 128, 64] lanes."""
-    return (heads_k, heads_v // heads_k, GDN_HEAD_DIM // 64, GDN_HEAD_DIM, 64)
+    """One block's state as the delta-rule kernels keep it: each key head's
+    `heads_v / heads_k` [HEAD_DIM, HEAD_DIM] states in the kernels' lane blocks."""
+    # TODO(rebel_compiler#15378): the kernels then read the head dim off the
+    # query (any multiple of STATE_LANES, Dk == Dv) and STATE_BLOCKS goes away:
+    # take the head dim from the config and build [D / STATE_LANES, D, STATE_LANES].
+    return (heads_k, heads_v // heads_k, *STATE_BLOCKS)
 
 
 def grouped_qkv_rows(heads_k: int, ratio: int, head_dim: int) -> torch.Tensor:
