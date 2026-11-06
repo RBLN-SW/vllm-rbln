@@ -184,8 +184,7 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
     ) -> tuple[int, slice | torch.Tensor]:
         # The GatedDeltaNet state is a [max_num_seqs] on-device cache, read at
         # the cache slot forward names for each row. A batch the runner sorts by
-        # length keeps that order; elsewhere the kernels read the rows [0, B) as
-        # one block, so each request is pinned to the row of its cache slot.
+        # length keeps that order.
         if getattr(self.get_language_model().rbln_config, "requires_batch_sort", False):
             return super().decode_layout(cache_slot_ids, block_tables)
         return self.decoder_batch_size, cache_slot_ids.to(torch.long)
@@ -227,6 +226,5 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
             cache_position=model_input.input_positions,
             position_embed=model_input.position_embed,
             block_tables=model_input.block_tables,
-            # The padding rows share one free slot, as they share dummy_block.
             state_idx=model_input.cache_slot_ids.view(-1),
         ).logits
