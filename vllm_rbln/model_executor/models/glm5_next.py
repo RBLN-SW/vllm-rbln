@@ -1207,6 +1207,9 @@ class RBLNGlm5NextForConditionalGeneration(
                 )
         else:
             self.visual = PPMissingLayer()
+        self.mm_encoder_patch_buckets = (
+            [] if isinstance(self.visual, PPMissingLayer) else [VISION_PATCH_BUCKET]
+        )
         self.config.image_token_index = hf_config.image_token_id
         object.__setattr__(self, "_mm_encoder", None)
 
@@ -1218,6 +1221,30 @@ class RBLNGlm5NextForConditionalGeneration(
             return
         encoder = _RBLNGlm5NextVisionEncoder(self.visual).eval()
         object.__setattr__(self, "_mm_encoder", compile_fn(encoder))
+
+    def warmup_mm_encoder(self) -> None:
+        visual = self.visual
+        if isinstance(visual, PPMissingLayer):
+            return
+        if self._mm_encoder is None:
+            self.compile_mm_encoder(lambda encoder: encoder)
+        assert self._mm_encoder is not None
+        patch_dim = visual.patch_embed.proj.weight[0].numel()
+        head_dim = visual.blocks[0].attn.head_dim
+        with torch.inference_mode():
+            for bucket in self.mm_encoder_patch_buckets:
+                self._mm_encoder(
+                    torch.zeros(
+                        bucket, patch_dim, dtype=visual.dtype, device=visual.device
+                    ),
+                    torch.ones(
+                        bucket, head_dim, dtype=visual.dtype, device=visual.device
+                    ),
+                    torch.zeros(
+                        bucket, head_dim, dtype=visual.dtype, device=visual.device
+                    ),
+                    torch.zeros(1, 1, bucket, dtype=visual.dtype, device=visual.device),
+                )
 
     def _encoder_inputs(
         self, pixel_values: torch.Tensor, grid_thw: list[int]
