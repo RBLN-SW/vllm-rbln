@@ -43,7 +43,8 @@ def is_latent(layer_spec: KVCacheSpec) -> bool:
 
 @dataclass(frozen=True)
 class RblnBlockTransferSpec(KVCacheSpec):
-    """A blocks-first payload transferred whole, without token/head slicing.
+    """A blocks-first payload, never cut on tokens: whole where `band_heads` is
+    0, and otherwise cut by the heads it bands across TP degrees.
 
     Used only by the connector; the scheduler keeps the original state spec.
     """

@@ -1838,6 +1838,32 @@ class TestShardLocalRegions:
 
         assert w._shard_descs_per_block == {("eng", 2): (6, 6, 1, 1)}
 
+    def test_a_plan_entry_takes_the_group_of_the_peer_region_it_reads(self):
+        # A pipelined producer numbers its groups off its own stage, so the
+        # peer's groups differ from ours; #1381's trim pairs lists by them.
+        w = self._wired_worker()
+        w.kv_cache_config = MagicMock(transfer_groups=[object()])
+        w.src_xfer_handles_by_remote = {}
+        w._shard_region_group_ids = {}
+        w._shard_peer_region_group_ids = {}
+        w._shard_descs_per_block = {}
+        ids, cut = _split_plan([4, 5], 64, 2, 3)
+        more, whole = _split_plan([6, 7], 64)
+        peer_groups = [10 + i for i in range(w.num_regions)]
+
+        w._register_shard_xfer_state(
+            "eng",
+            2,
+            16,
+            ("l2", "l3"),
+            plan=(ids + more, cut + whole),
+            peer_region_group_ids=peer_groups,
+        )
+
+        expected = tuple(peer_groups[e[0].remote_region] for e in cut + whole)
+        assert w._shard_peer_region_group_ids[("eng", 2)] == expected
+        assert expected != w._shard_region_group_ids[("eng", 2)]
+
     @pytest.mark.parametrize(
         "sw_ratio, needs_own",
         [
@@ -8048,6 +8074,22 @@ class TestShardPeerGroupIds:
         assert ids == (4, 3)
 
 
+def _glm53_config(block_size=1024):
+    """GLM-5.3-Flash's KDA fields, as the backend reads them."""
+    return SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(
+                model_type="glm5_next_text",
+                linear_num_heads=64,
+                linear_head_dim=128,
+                kv_lora_rank=512,
+            ),
+            dtype=torch.bfloat16,
+        ),
+        cache_config=SimpleNamespace(block_size=block_size),
+    )
+
+
 class TestKdaPairsByHeadGroupEndToEnd:
     """GLM-5.3's KDA layer with the real numbers, through the plan a peer of
     another TP degree gets: 64 heads, a 1024-token page holding 16 of them, so
@@ -8076,18 +8118,7 @@ class TestKdaPairsByHeadGroupEndToEnd:
         w = object.__new__(cls_)
         w.tp_rank = tp_rank
         w.use_host_buffer = False
-        w.vllm_config = SimpleNamespace(
-            model_config=SimpleNamespace(
-                hf_text_config=SimpleNamespace(
-                    model_type="glm5_next_text",
-                    linear_num_heads=64,
-                    linear_head_dim=128,
-                    kv_lora_rank=512,
-                ),
-                dtype=torch.bfloat16,
-            ),
-            cache_config=SimpleNamespace(block_size=1024),
-        )
+        w.vllm_config = _glm53_config()
         w.transfer_topo = SimpleNamespace(
             tp_size=tp_size,
             total_num_kv_heads=64,
@@ -8106,9 +8137,7 @@ class TestKdaPairsByHeadGroupEndToEnd:
             RegionGeometry(
                 ChipletSplitAxis.BLOCK,
                 4,
-                tuple(
-                    AreaPlace(0, spec.page_size_bytes // 4, sid) for sid in range(4)
-                ),
+                tuple(AreaPlace(0, spec.page_size_bytes // 4, sid) for sid in range(4)),
             )
             for spec in specs
         ]
@@ -8124,6 +8153,7 @@ class TestKdaPairsByHeadGroupEndToEnd:
             kv_areas=4,
             kv_slices=4,
             kv_split_axes=[ChipletSplitAxis.BLOCK] * len(names),
+            block_size=1024,
         )
 
     @staticmethod
@@ -8170,6 +8200,54 @@ class TestKdaPairsByHeadGroupEndToEnd:
             for area in range(4)
         ]
 
+    @classmethod
+    def _checked(cls, specs=None):
+        w = cls._worker(RblnNixlPullConnectorWorker, 0, 4)
+        if specs is not None:
+            w._logical_region_block_spec = specs
+        w.block_size = 1024
+        set_shape(w, chunk_mode=False)
+        w._kv_per_block = 1
+        w._window_grid_cut = None
+        w.block_len_per_layer = [0] * w.num_regions
+        return w
+
+    def test_banded_block_payloads_pair_across_tp(self):
+        self._checked()._check_d2d_region_pairing(self._meta(1), 1)
+
+    def test_a_block_payload_without_a_band_is_refused_across_tp(self):
+        unbanded = RblnBlockTransferSpec(1024, 1024 * 512)
+        w = self._checked([unbanded, self.RING_TP4])
+
+        with pytest.raises(RuntimeError, match="unless every one of them is banded"):
+            w._check_d2d_region_pairing(self._meta(1), 1)
+
+    def test_a_plan_refusal_leaves_the_peer_unregistered(self):
+        # Upstream swallows a handshake exception, so a raise after the peer
+        # is registered would leave it registered.
+        w = self._worker(RblnNixlPullConnectorWorker, 0, 4)
+        w._remote_agents = {}
+        w.nixl_wrapper = MagicMock()
+        w._register_remote_engine_prelude = MagicMock()
+        meta = self._meta(1)
+        meta.kv_split_axes = [ChipletSplitAxis.HEAD] + meta.kv_split_axes[1:]
+        renamed = w._peer_kda_names(meta, 0, 1)
+        with (
+            patch.object(RblnNixlPullConnectorWorker, "_check_mla_constraints"),
+            patch.object(RblnNixlPullConnectorWorker, "_check_d2d_region_pairing"),
+            patch.object(RblnNixlPullConnectorWorker, "_check_split_axis_constraints"),
+            patch.object(
+                RblnNixlPullConnectorWorker, "_peer_band", return_value=(4, 4)
+            ),
+            pytest.raises(RuntimeError, match="is a block payload here"),
+        ):
+            w._add_remote_agent_head_matched(
+                renamed, 0, 1, registered_layer_names=renamed.registered_layer_names
+            )
+
+        w._register_remote_engine_prelude.assert_not_called()
+        w.nixl_wrapper.add_remote_agent.assert_not_called()
+
     @pytest.mark.parametrize("rank", range(4))
     def test_a_rank_reads_every_area_of_its_group_from_the_producer(self, rank):
         w = self._worker(RblnNixlPullConnectorWorker, rank, 4)
@@ -8195,12 +8273,10 @@ class TestKdaPairsByHeadGroupEndToEnd:
 
 
 class TestABlockPayloadPairsAcrossTp:
-    """GLM-5.3's block payloads between a TP1 producer and a TP4 consumer, both at
-    a 4096-token block over four chiplet slices. The KDA kernel cuts the heads of
-    its own view over the chiplets: the consumer's state view is four slots a
-    block, so an area holds 4 heads of every slot and the rank owns one slot's;
-    the conv ring is twelve runs (ring row x q / k / v), an area a lane slice of
-    each. A ring every rank holds alike pairs whole."""
+    """Block payloads between a TP1 producer and a TP4 consumer over four chiplet
+    slices, through `block_rects` and `pair_area` alone. The conv ring is twelve
+    runs (ring row x q / k / v), an area a lane slice of each. A payload every
+    rank holds alike pairs whole."""
 
     STATE = RblnBlockTransferSpec(4096, 4096 * 512, 64, 128 * 128 * 2)
     CONV = RblnBlockTransferSpec(4096, 4 * 3 * 32 * 64 * 2, 64, 256, 12)
@@ -8222,25 +8298,8 @@ class TestABlockPayloadPairsAcrossTp:
                 every_holder=False,
                 region_id=area,
             )
-            out.append(
-                [
-                    x._replace(
-                        local_offset=x.local_offset + w.offset,
-                        remote_offset=x.remote_offset + theirs[x.remote_region].offset,
-                    )
-                    for x in pieces
-                ]
-            )
+            out.append(pieces)
         return out
-
-    @pytest.mark.parametrize("rank", range(4))
-    def test_a_state_slice_reads_its_heads_into_the_rank_slot(self, rank):
-        quarter = 128 * 1024
-        pieces = self._pair(self.STATE, 4 * quarter, 4 * quarter, rank, 1)
-        assert pieces == [
-            [Piece(rank * quarter, rank, area * quarter, quarter, 4, (0, 1))]
-            for area in range(4)
-        ]
 
     @pytest.mark.parametrize("rank", range(4))
     def test_a_ring_slice_takes_its_heads_out_of_every_run(self, rank):
@@ -8278,7 +8337,7 @@ class TestAKdaHeadGroupPairsAcrossTp:
         w = object.__new__(RblnNixlPullConnectorWorker)
         w.tp_rank = tp_rank
         w.transfer_topo = SimpleNamespace(tp_size=4)
-        w._kda_groups = {4: 1, 1: 4}.get
+        w.vllm_config = _glm53_config()
         w._block_state_layers = set(state_layers)
         w._writes_into_peer = False
         return w
@@ -8302,10 +8361,6 @@ class TestAKdaHeadGroupPairsAcrossTp:
         assert pieces == [
             [Piece(0, area, 0, self.QUARTER, 4, (0, 1))] for area in range(4)
         ]
-
-    def test_a_split_rank_names_the_heads_of_its_entry(self):
-        with pytest.raises(AssertionError, match="names its heads"):
-            block_rects(self.STATE, self.SLICES, self.QUARTER, 0, 1)
 
     @pytest.mark.parametrize("rank", range(4))
     def test_a_ring_run_reads_its_group_s_run_of_the_producer(self, rank):

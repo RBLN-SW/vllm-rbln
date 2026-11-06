@@ -57,6 +57,13 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
     pair_area,
 )
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.attention.backends.glm5_next import (
+    KDA_CONV,
+    kda_cache_name,
+    kda_cache_role,
+    kda_rank_groups,
+    kda_state_band,
+)
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
@@ -173,6 +180,17 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                     f"peer at a tensor-parallel size {self.topo.tp_size} "
                     "divides, or use kv_buffer_device='cpu'."
                 )
+        _, peer_tp_rank = agent_key
+        # Ahead of the prelude too: the plan these come from refuses a block
+        # payload's axis or a cut that does not divide, and upstream swallows a
+        # raise once the peer is registered. They read nothing it records.
+        blocks_data = self._build_head_matched_remote(
+            nixl_agent_meta,
+            peer_tp_rank,
+            remote_tp_size,
+            registered_layer_names=registered_layer_names,
+            peer_areas=self._fan_in_peer_areas(peer_tp_rank, remote_tp_size),
+        )
         self._register_remote_engine_prelude(
             nixl_agent_meta, remote_tp_size, remote_dcp_size
         )
@@ -188,14 +206,6 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
             nixl_agent_meta, remote_tp_size, remote_dcp_size
         )
 
-        _, peer_tp_rank = agent_key
-        blocks_data = self._build_head_matched_remote(
-            nixl_agent_meta,
-            peer_tp_rank,
-            remote_tp_size,
-            registered_layer_names=registered_layer_names,
-            peer_areas=self._fan_in_peer_areas(peer_tp_rank, remote_tp_size),
-        )
         descs = self.nixl_wrapper.get_xfer_descs(blocks_data, self.nixl_memory_type)
         self.dst_xfer_side_handles[engine_id][remote_tp_rank] = (
             self.nixl_wrapper.prep_xfer_dlist(remote_agent_name, descs)
@@ -368,9 +378,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
             # payload pairs by the heads its windows name instead: a peer rank's
             # KDA group is one whole cache here, over every area.
             served = (
-                range(areas_l)
-                if same_everywhere or windows is not None
-                else areas_iter
+                range(areas_l) if same_everywhere or windows is not None else areas_iter
             )
             for area_l in served:
                 region_id = logical_l * areas_l + area_l
@@ -388,16 +396,6 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                 )
                 if not pieces:
                     continue
-                if windows is not None:
-                    local, remote = windows[0][area_l], windows[1]
-                    pieces = [
-                        x._replace(
-                            local_offset=x.local_offset + local.offset,
-                            remote_offset=x.remote_offset
-                            + remote[x.remote_region].offset,
-                        )
-                        for x in pieces
-                    ]
                 # An entry's grid is read off its first piece, and a region's
                 # pieces are cut alike: the handshake refuses incommensurate
                 # head cuts, and one side's token ranges nest in the other's.
@@ -541,15 +539,11 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         return ours, {first_r + a: window for a, window in enumerate(theirs)}
 
     def _kda_groups(self, tp_size: int) -> int:
-        from vllm_rbln.v1.attention.backends.glm5_next import kda_rank_groups
-
         return kda_rank_groups(self.vllm_config, tp_size)
 
     def _kda_entry(self, logical: int) -> tuple[str, str, int] | None:
         """(layer prefix, role, group) of a logical region that is a KDA layer's
         state or a cache one owns; None for any other region."""
-        from vllm_rbln.v1.attention.backends.glm5_next import kda_cache_role
-
         if not self._block_state_layers:
             return None
         name = self.region_names[logical * self._kv_areas]
@@ -559,8 +553,6 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         return kda_cache_role(name, self._kda_groups(self.topo.tp_size))
 
     def _is_kda_conv_ring(self, logical: int) -> bool:
-        from vllm_rbln.v1.attention.backends.glm5_next import KDA_CONV
-
         entry = self._kda_entry(logical)
         return entry is not None and entry[1] == KDA_CONV
 
@@ -655,12 +647,10 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         renamed, the layer overlap pairs by group. A group no cache of ours
         holds keeps a name of its own.
         """
-        from vllm_rbln.v1.attention.backends.glm5_next import (
-            KDA_CONV,
-            kda_cache_name,
-            kda_cache_role,
-        )
-
+        # Another model's block state has no KDA groups to name; the
+        # handshake's own refusals then speak for it.
+        if kda_state_band(self.vllm_config) is None:
+            return nixl_agent_meta
         groups_l = self._kda_groups(self.topo.tp_size)
         groups_r = self._kda_groups(remote_tp_size)
         if not nixl_agent_meta.region_names or groups_l == groups_r:
@@ -819,18 +809,24 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
             )
 
     def _block_payloads_band(self) -> bool:
-        """Whether every block payload pairs across TP degrees: a block state and
-        what it owns banded by head, anything else the same on every rank."""
+        """Whether this engine has block payloads and every one pairs across TP
+        degrees: a block state and what it owns banded by head, anything else
+        the same on every rank."""
+        if all(spec is None for spec in self._logical_region_block_spec):
+            return False
         owned_by_state = {
             name
             for name, aux in self._block_aux_specs.items()
             if aux.owner in self._block_state_layers
         }
         banded = self._block_state_layers | owned_by_state
-        return all(
-            spec.band_heads
+        payloads = [
+            (name, spec)
             for logical, name in enumerate(self.region_names[:: self._kv_areas])
-            if (spec := self._block_spec(logical)) is not None and name in banded
+            if (spec := self._block_spec(logical)) is not None
+        ]
+        return bool(payloads) and all(
+            spec.band_heads for name, spec in payloads if name in banded
         )
 
     def _check_mla_constraints(
@@ -851,7 +847,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         if (
             self.use_mla
             and self._is_head_matched_peer(remote_tp_size)
-            and not (self._block_state_layers and self._block_payloads_band())
+            and not self._block_payloads_band()
         ):
             raise RuntimeError(
                 "RBLN NIXL D2D: MLA is not supported with heterogeneous tensor "
