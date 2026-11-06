@@ -23,6 +23,7 @@ import errno
 import hashlib
 import os
 import re
+from collections.abc import Mapping
 
 import vllm.envs as envs
 
@@ -76,12 +77,13 @@ def _npu_name() -> str:
         return "unknown"
 
 
-def _warmup_graph_set_factors(vllm_config) -> str:
+def _warmup_graph_set_factors(
+    vllm_config, extra_hash_factors: Mapping[str, object] | None = None
+) -> str:
     """Hash of the graph-shaping config that compute_hash() leaves out.
 
-    Decode buckets, KV cache input, decode query length, which drafter graphs
-    exist, Gemma4's image budget. Without them two runs share a bundle that
-    only partly hits.
+    Includes caller-supplied factors for resolved graph sets. Without them
+    two runs can share a bundle that only partly hits.
     """
     from vllm.config.utils import hash_factors, normalize_value
 
@@ -90,8 +92,6 @@ def _warmup_graph_set_factors(vllm_config) -> str:
     spec = getattr(vllm_config, "speculative_config", None)
     # Not draft_parallel_config: it carries the same per-launch ports.
     draft = getattr(spec, "draft_model_config", None)
-    mm = getattr(getattr(vllm_config, "model_config", None), "multimodal_config", None)
-    mm_kwargs = getattr(mm, "mm_processor_kwargs", None) or {}
     factors: dict[str, object] = {
         "max_num_seqs": normalize_value(getattr(scheduler, "max_num_seqs", None)),
         "num_gpu_blocks_override": normalize_value(
@@ -110,11 +110,11 @@ def _warmup_graph_set_factors(vllm_config) -> str:
             getattr(spec, "draft_tensor_parallel_size", None)
         ),
     }
-    # Gemma4 compiles its vision encoder and image prefill to this budget. Only
-    # this key, and only when given: other kwargs do not shape a graph, and an
-    # absent factor keeps every other model's existing bundle key.
-    if "max_soft_tokens" in mm_kwargs:
-        factors["max_soft_tokens"] = normalize_value(mm_kwargs["max_soft_tokens"])
+
+    if extra_hash_factors:
+        factors.update(
+            {name: normalize_value(value) for name, value in extra_hash_factors.items()}
+        )
     return hash_factors(factors)
 
 
@@ -141,12 +141,14 @@ def _stable_compute_hash(vllm_config) -> str:
                 object.__setattr__(pc, name, value)
 
 
-def config_signature(vllm_config) -> str:
+def config_signature(
+    vllm_config, extra_hash_factors: Mapping[str, object] | None = None
+) -> str:
     """vLLM config hash + warm-up graph set + rbln compile env + NPU name +
     rebel major.minor; launch- and host-stable, shared by all TP/DP ranks (the
     rank subdir isolates shards)."""
     cfg = _stable_compute_hash(vllm_config)
-    graphs = _warmup_graph_set_factors(vllm_config)
+    graphs = _warmup_graph_set_factors(vllm_config, extra_hash_factors)
     env = _compile_env_factors()
     npu = _npu_name()
     rebel_ver = _rebel_major_minor()

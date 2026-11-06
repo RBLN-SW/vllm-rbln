@@ -41,7 +41,6 @@ from vllm.multimodal.parse import MultiModalDataItems
 from vllm.sequence import IntermediateTensors
 
 from vllm_rbln.model_executor.models.interfaces import (
-    SupportsRBLNMmEncoderWarmup,
     SupportsRBLNMultiModal,
 )
 
@@ -55,14 +54,32 @@ class _RBLNGemma4VisionEncoder(nn.Module):
     static graph.
 
     HF's encoder builds its mask and rotary tables in Python and dispatches
-    attention through ALL_ATTENTION_FUNCTIONS. Here the host hands in both,
-    the attention is spelled out, and the patches arrive padded to one count.
+    attention through ALL_ATTENTION_FUNCTIONS. Here the host hands in the mask,
+    the rotary tables are looked up in the graph, the attention is spelled
+    out, and the patches arrive padded to one count.
     """
 
     def __init__(self, vision_tower: nn.Module, embed_vision: nn.Module):
         super().__init__()
         self.tower = vision_tower
         self.embed_vision = embed_vision
+        # HF's cos and sin for every position along one axis, side by side: a
+        # patch's are the rows at its x and at its y. Computed on the host per
+        # image, they cost more than the encoder at the smaller buckets.
+        patch_embedder = vision_tower.patch_embedder
+        axis = torch.arange(patch_embedder.position_embedding_table.shape[1])
+        cos, sin = vision_tower.encoder.rotary_emb(
+            torch.empty(0, dtype=patch_embedder.input_proj.weight.dtype),
+            torch.stack([axis, axis], dim=-1)[None],
+        )
+        half = cos.shape[-1] // 2
+        self.register_buffer(
+            "rope_table",
+            torch.cat([cos[0, :, :half], sin[0, :, :half]], dim=-1).to(
+                patch_embedder.input_proj.weight.device
+            ),
+            persistent=False,
+        )
 
     def forward(
         self,
@@ -70,8 +87,6 @@ class _RBLNGemma4VisionEncoder(nn.Module):
         pixel_position_ids: torch.Tensor,
         padding_positions: torch.Tensor,
         key_bias: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
     ) -> torch.Tensor:
         # HF's patch embedder, with its x and y lookups made one: two lookups
         # into views of the same table fail the RBLN compiler.
@@ -87,6 +102,9 @@ class _RBLNGemma4VisionEncoder(nn.Module):
         hidden_states = hidden_states + torch.where(
             padding_positions.unsqueeze(-1), 0.0, position_embeddings
         )
+        rope = F.embedding(pixel_position_ids.clamp(min=0), self.rope_table)
+        half = rope.shape[-1] // 2
+        cos, sin = rope[..., :half].flatten(-2), rope[..., half:].flatten(-2)
         for layer in tower.encoder.layers:
             residual = hidden_states
             hidden_states = layer.input_layernorm(hidden_states)
@@ -189,11 +207,16 @@ class RBLNGemma4MultiModalProcessor(Gemma4MultiModalProcessor):
     dummy_inputs=Gemma4DummyInputsBuilder,
 )
 class RBLNGemma4ForConditionalGeneration(
-    Gemma4ForConditionalGeneration, SupportsRBLNMultiModal, SupportsRBLNMmEncoderWarmup
+    Gemma4ForConditionalGeneration, SupportsRBLNMultiModal
 ):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         if vllm_config.parallel_config.data_parallel_size > 1:
             raise ValueError("Gemma4 does not support data parallel on RBLN.")
+        # TODO(RBLN): both drafter kinds wait on compiler fixes; see #1395.
+        if vllm_config.speculative_config is not None:
+            raise ValueError(
+                "Gemma4 does not support speculative decoding on RBLN yet."
+            )
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         self.mm_soft_token_cap = mm_soft_token_cap(
             MULTIMODAL_REGISTRY.create_processor(vllm_config.model_config).info
@@ -201,7 +224,7 @@ class RBLNGemma4ForConditionalGeneration(
         # One compiled encoder shape per soft token budget up to the cap; an
         # image or frame is padded to the smallest that holds its patches.
         pool = self.config.vision_config.pooling_kernel_size
-        self.mm_encoder_buckets = [
+        self.mm_encoder_patch_buckets = [
             budget * pool**2
             for budget in _SUPPORTED_SOFT_TOKENS
             if budget <= self.mm_soft_token_cap
@@ -264,14 +287,14 @@ class RBLNGemma4ForConditionalGeneration(
         encoder = _RBLNGemma4VisionEncoder(self.vision_tower, self.embed_vision)
         object.__setattr__(self, "_mm_encoder", compile_fn(encoder.eval()))
 
-    def warm_up_mm_encoder(self) -> None:
+    def warmup_mm_encoder(self) -> None:
         if self._mm_encoder is None:
             return
         vision_config = self.config.vision_config
         pool = vision_config.pooling_kernel_size
         patch_pixels = 3 * vision_config.patch_size**2
         with torch.inference_mode():
-            for bucket in self.mm_encoder_buckets:
+            for bucket in self.mm_encoder_patch_buckets:
                 # A full grid whose sides are multiples of the pooling kernel.
                 cells = bucket // pool**2
                 rows = max(d for d in range(1, math.isqrt(cells) + 1) if cells % d == 0)
@@ -298,11 +321,11 @@ class RBLNGemma4ForConditionalGeneration(
         tower = self.vision_tower
         valid = (pixel_position_ids >= 0).all(dim=-1)
         num_patches = int(valid.sum())
-        assert num_patches <= self.mm_encoder_buckets[-1], (
+        assert num_patches <= self.mm_encoder_patch_buckets[-1], (
             f"an image of {num_patches} patches exceeds the vision encoder's "
-            f"{self.mm_encoder_buckets[-1]}-patch bucket"
+            f"{self.mm_encoder_patch_buckets[-1]}-patch bucket"
         )
-        bucket = next(b for b in self.mm_encoder_buckets if b >= num_patches)
+        bucket = next(b for b in self.mm_encoder_patch_buckets if b >= num_patches)
         # Fixed dtypes, so warm-up and serving reach the same compiled graphs.
         positions = torch.full((1, bucket, 2), -1, dtype=torch.long)
         positions[0, :num_patches] = pixel_position_ids[valid]
@@ -310,19 +333,12 @@ class RBLNGemma4ForConditionalGeneration(
         patches[0, :num_patches] = pixel_values[valid]
         padding = ~(positions >= 0).all(dim=-1)
         key_bias = torch.where(padding, _KEY_PAD_BIAS, 0.0)[:, None, None, :]
-        # The rotary tables only read the host tensor's device and dtype.
-        cos, sin = tower.encoder.rotary_emb(
-            torch.empty(0, dtype=self.model_dtype), positions
-        )
         device = next(tower.parameters()).device
         embeds = encoder(
             patches.to(device),
             positions.to(device),
             padding.to(device),
-            *(
-                x.to(device=device, dtype=self.model_dtype)
-                for x in (key_bias, cos, sin)
-            ),
+            key_bias.to(device=device, dtype=self.model_dtype),
         )
         # The patches of a grid whose sides are multiples of the pooling kernel
         # pool into the leading cells, in order.

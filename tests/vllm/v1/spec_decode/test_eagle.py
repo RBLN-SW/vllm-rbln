@@ -173,11 +173,15 @@ class TestPreprocess:
             300,
         ]
 
-    def test_prefill_pads_query_dim_to_max_tokens(self):
-        # Prefill stages the request into the full (1, max_num_tokens) graph
-        # shape, zeroing everything past the scheduled tokens.
+    def test_prefill_pads_query_dim_to_the_prefill_chunk(self, monkeypatch):
+        # Prefill stages the request into the (1, prefill_chunk_size) graph
+        # shape the target prefills at, zeroing everything past the scheduled
+        # tokens.
         proposer = make_eagle_proposer()
-        n = proposer.max_num_tokens
+        n = proposer.max_num_tokens // 2
+        monkeypatch.setattr(
+            proposer.vllm_config.additional_config, "prefill_chunk_size", n
+        )
         proposer.input_ids[:] = -1
         proposer.input_ids[:4] = torch.tensor([10, 11, 12, 13], dtype=torch.int32)
 

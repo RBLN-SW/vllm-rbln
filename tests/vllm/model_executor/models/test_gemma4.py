@@ -90,7 +90,7 @@ def test_the_vision_encoder_matches_hfs(width, height):
         vision_tower=tower,
         embed_vision=_Identity(),
         model_dtype=torch.float32,
-        mm_encoder_buckets=[90],
+        mm_encoder_patch_buckets=[90],
     )
     pixels, positions = _image(width, height, num_patches=81)
 
@@ -104,17 +104,54 @@ def test_the_vision_encoder_matches_hfs(width, height):
     torch.testing.assert_close(got, expected, rtol=1e-4, atol=1e-4)
 
 
+def test_the_rotary_tables_are_built_once_not_per_image(monkeypatch):
+    # The encoder looks up HF's cos and sin for each patch in the graph, so the
+    # host computes none per image and the soft tokens stay HF's.
+    tower = _vision_tower()
+    model = _bare_model(
+        vision_tower=tower,
+        embed_vision=_Identity(),
+        model_dtype=torch.float32,
+        mm_encoder_patch_buckets=[90],
+    )
+    first, second = _image(6, 3, num_patches=81), _image(3, 9, num_patches=81)
+    with torch.no_grad():
+        model._encode_vision(*first)
+        expected = tower(
+            pixel_values=second[0][None], pixel_position_ids=second[1][None]
+        ).last_hidden_state
+        monkeypatch.setattr(
+            tower.encoder.rotary_emb,
+            "forward",
+            Mock(side_effect=AssertionError("rotary computed per image")),
+        )
+
+        got = model._encode_vision(*second)
+
+    torch.testing.assert_close(got, expected, rtol=1e-4, atol=1e-4)
+
+
 def test_an_image_beyond_the_bucket_is_refused():
     model = _bare_model(
         vision_tower=_vision_tower(),
         embed_vision=_Identity(),
         model_dtype=torch.float32,
-        mm_encoder_buckets=[9],
+        mm_encoder_patch_buckets=[9],
     )
     pixels, positions = _image(6, 3, num_patches=18)
 
     with pytest.raises(AssertionError, match="9-patch bucket"):
         model._encode_vision(pixels, positions)
+
+
+def test_speculative_decoding_is_refused():
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        speculative_config=SimpleNamespace(method="mtp"),
+    )
+
+    with pytest.raises(ValueError, match="speculative decoding"):
+        RBLNGemma4ForConditionalGeneration(vllm_config=vllm_config)
 
 
 def _recording_model(buckets):
@@ -130,7 +167,7 @@ def _recording_model(buckets):
         vision_tower=tower,
         embed_vision=_Identity(),
         model_dtype=torch.float32,
-        mm_encoder_buckets=buckets,
+        mm_encoder_patch_buckets=buckets,
         config=SimpleNamespace(vision_config=tower.config),
     )
     object.__setattr__(model, "_mm_encoder", encoder)
@@ -152,7 +189,7 @@ def test_an_image_takes_the_smallest_bucket_holding_it(width, height, bucket):
 def test_warm_up_runs_every_bucket_once_full():
     model, calls = _recording_model([18, 45, 90])
 
-    model.warm_up_mm_encoder()
+    model.warmup_mm_encoder()
 
     assert calls == [(18, 18), (45, 45), (90, 90)]
 
@@ -161,7 +198,7 @@ def test_warm_up_without_an_encoder_runs_nothing():
     model, calls = _recording_model([18])
     object.__setattr__(model, "_mm_encoder", None)
 
-    model.warm_up_mm_encoder()
+    model.warmup_mm_encoder()
 
     assert calls == []
 

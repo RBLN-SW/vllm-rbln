@@ -21,6 +21,7 @@ from typing import Any
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.utils.hashing import get_hash_fn_by_name
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import init_none_hash
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
@@ -75,11 +76,12 @@ class RBLNScheduler(Scheduler):
 
         # Replace the upstream KVCacheManager with RBLNKVCacheManager
         # when sub-block prefix caching is enabled.
+        assert rbln_config.prefill_chunk_size is not None  # resolved at start-up
         sub_block_size = sub_block_size_in_use(
             enable_prefix_caching=self.cache_config.enable_prefix_caching,
             sub_block_cache=rbln_config.enable_sub_block_cache,
             block_size=self.block_size,
-            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+            prefill_chunk_size=rbln_config.prefill_chunk_size,
             kv_cache_config=self.kv_cache_config,
             sub_block_size=rbln_config.sub_block_size,
         )
@@ -134,17 +136,32 @@ class RBLNScheduler(Scheduler):
         self._prefill_chunk_size = rbln_config.prefill_chunk_size
         self._is_mm_prefix_lm = self.vllm_config.model_config.is_mm_prefix_lm
 
+        # NOTE(RBLN): the sparse-attention ops (DSA MLA / indexer, MiniMax-M3
+        # MSA / indexer, GLM5 MLA / indexer) get NULL_BLOCK_ID as null_block_id
+        # and write their context-parallel cache store's unowned rows there, so
+        # the block the pool reserves has to be that one. Checked once the KV
+        # cache manager is final (it may be swapped above).
+        null_block_id = self.kv_cache_manager.block_pool.null_block.block_id
+        if null_block_id != NULL_BLOCK_ID:
+            raise RuntimeError(
+                f"vLLM's null block is {null_block_id}, not NULL_BLOCK_ID "
+                f"({NULL_BLOCK_ID}); the RBLN sparse-attention cache store writes "
+                "to NULL_BLOCK_ID and would corrupt a live block."
+            )
+
     def _mm_prefix_split(
         self, request: Request, num_computed_tokens: int, num_new_tokens: int
     ) -> int:
-        """Cut a prefill chunk on the request's mm prefix ranges.
+        """Tokens to schedule so that an mm prefix range runs as a step of its own.
 
-        A range attends to itself both ways, which a compiled graph can only do
-        over a step holding that range alone: a chunk starting a range is the
-        whole range, and any other chunk stops where the next range begins. A
-        prefix cache hit ending inside a range resumes it, and the step is the
-        rest of that range. A range step may run past the prefill chunk size, up
-        to the step budget; text chunks are capped at it.
+        A range attends to itself both ways, which a compiled graph can do only
+        when the step holds that range and nothing else. By where the step starts:
+
+        - inside a range: the rest of it, which is the whole range at its start
+          or what a prefix cache hit left of it. It may run past the prefill
+          chunk size, up to the step budget.
+        - before a range: text up to where the range begins, at most one chunk.
+        - past every range: text, at most one chunk.
         """
         for feature in request.mm_features:
             if feature.modality not in ("image", "video"):

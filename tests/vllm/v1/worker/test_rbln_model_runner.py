@@ -419,7 +419,42 @@ def test_pooling_warmup_runs_without_language_model_head(monkeypatch):
     runner.warmup_model()
 
     runner.run_model_graphs.assert_called_once_with()
+    cache.config_signature.assert_called_once_with(None, extra_hash_factors={})
     cache.save.assert_called_once_with("pooling", cache.config_signature.return_value)
+
+
+@pytest.mark.parametrize(
+    "buckets",
+    [[1024, 2304, 12288], []],
+    ids=["encoder", "no-local-encoder"],
+)
+def test_multimodal_warmup_keys_the_bundle_on_the_encoder_buckets(monkeypatch, buckets):
+    from tests.vllm.vllm_config import make_vllm_config
+
+    vllm_config = make_vllm_config()
+    factors = {"mm_encoder_patch_buckets": [1024, 2304, 12288]} if buckets else {}
+    expected = mr.mega_cache.config_signature(vllm_config, extra_hash_factors=factors)
+    cache = SimpleNamespace(
+        config_signature=mr.mega_cache.config_signature, load=Mock(), save=Mock()
+    )
+    monkeypatch.setattr(mr, "mega_cache", cache)
+    monkeypatch.setattr(mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=False))
+    runner = _make_runner_stub(
+        vllm_config=vllm_config,
+        model_config=SimpleNamespace(model="m3"),
+        model=SimpleNamespace(mm_encoder_patch_buckets=buckets),
+        supports_mm_inputs=True,
+        run_model_graphs=Mock(),
+        offload_context=nullcontext,
+        drafter=None,
+        _warmup_mm_encoder=Mock(),
+    )
+
+    runner.warmup_model()
+
+    cache.load.assert_called_once_with("m3", expected)
+    cache.save.assert_called_once_with("m3", expected)
+    runner._warmup_mm_encoder.assert_called_once_with()
 
 
 def test_warmup_compiles_prefill_at_the_prefill_chunk_size():
@@ -427,7 +462,7 @@ def test_warmup_compiles_prefill_at_the_prefill_chunk_size():
     runner = _make_runner_stub(
         max_num_tokens=512,
         prefill_chunk_size=256,
-        mm_prefix_query_lens=[],
+        mm_prefix_query_len_buckets=[],
         speculative_config=None,
         bucketing_manager=SimpleNamespace(decode_batch_buckets=[1]),
         specialized_moe_decode=False,
@@ -2182,7 +2217,7 @@ class TestExecuteModelStampsMmPrefixSteps:
                 num_computed_tokens_cpu=np.array([computed], dtype=np.int32),
             ),
             requests={"r0": SimpleNamespace(mm_features=mm_features)},
-            mm_prefix_query_lens=[128, 256],
+            mm_prefix_query_len_buckets=[128, 256],
             cache_config=SimpleNamespace(kv_sharing_fast_prefill=False),
             speculative_config=None,
             is_pooling_model=False,
@@ -2251,7 +2286,7 @@ def test_warmup_compiles_one_prefill_per_mm_prefix_query_len():
     runner = _make_runner_stub(
         max_num_tokens=512,
         prefill_chunk_size=256,
-        mm_prefix_query_lens=[128, 384],
+        mm_prefix_query_len_buckets=[128, 384],
         speculative_config=None,
         bucketing_manager=SimpleNamespace(decode_batch_buckets=[1]),
         specialized_moe_decode=False,
