@@ -42,6 +42,7 @@ def sync_from_vllm(vllm_config: VllmConfig) -> None:
     """Resolve the compile spec and synchronize runtime settings from it."""
     rbln_config: OptimumRBLNConfig = vllm_config.additional_config
     if rbln_config.compile_spec is None:
+        from vllm_rbln.platform import RblnPlatform
         from vllm_rbln.utils.optimum.compilation import RBLNCompileSpec
 
         # 1. Resolve user overrides and defaults into compile inputs.
@@ -116,6 +117,7 @@ def sync_from_vllm(vllm_config: VllmConfig) -> None:
             "model_cls": spec.model_cls.__name__,
             "rbln_config": deepcopy(spec.rbln_config),
             "hf_config": vllm_config.model_config.hf_config.to_dict(),
+            "npu_name": RblnPlatform.get_device_name().strip().upper(),
         }
 
     # 3. Read resolved parameters after applying model-specific constraints.

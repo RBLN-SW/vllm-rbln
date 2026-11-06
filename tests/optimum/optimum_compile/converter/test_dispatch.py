@@ -38,6 +38,9 @@ def compile_environment(monkeypatch, tmp_path):
         "vllm_rbln.utils.optimum.converter.params._resolve_default_prefill_chunk_size",
         lambda: 128,
     )
+    monkeypatch.setattr(
+        "vllm_rbln.platform.RblnPlatform.get_device_name", lambda: "RBLN-CA25"
+    )
 
 
 def _vllm_config(
@@ -84,6 +87,32 @@ def _vllm_config(
 
 
 class TestGenerateModelPathName:
+    def test_npu_type_changes_hash(self, monkeypatch):
+        ca25 = _generate_model_path_name(_vllm_config())
+        monkeypatch.setattr(
+            "vllm_rbln.platform.RblnPlatform.get_device_name", lambda: "RBLN-CA22"
+        )
+        assert _generate_model_path_name(_vllm_config()) != ca25
+
+    def test_npu_name_is_normalized(self, monkeypatch):
+        canonical = _generate_model_path_name(_vllm_config())
+        monkeypatch.setattr(
+            "vllm_rbln.platform.RblnPlatform.get_device_name", lambda: " rbln-ca25 "
+        )
+        cfg = _vllm_config()
+        assert cfg.additional_config.compile_spec["npu_name"] == "RBLN-CA25"
+        assert _generate_model_path_name(cfg) == canonical
+
+    def test_resolved_npu_type_is_preserved(self, monkeypatch):
+        cfg = _vllm_config()
+        original = _generate_model_path_name(cfg)
+        monkeypatch.setattr(
+            "vllm_rbln.platform.RblnPlatform.get_device_name", lambda: "RBLN-CA22"
+        )
+        dispatch.sync_vllm_and_optimum(cfg)
+        assert cfg.additional_config.compile_spec["npu_name"] == "RBLN-CA25"
+        assert _generate_model_path_name(cfg) == original
+
     @pytest.mark.parametrize("prefix_caching", [False, True])
     def test_paligemma_uses_final_chunk_before_cache_lookup(
         self, monkeypatch, prefix_caching
