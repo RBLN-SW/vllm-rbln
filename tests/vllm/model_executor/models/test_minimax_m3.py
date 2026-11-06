@@ -213,7 +213,10 @@ def test_minimax_m3_without_a_draft_sends_no_aux(monkeypatch, pp_size):
 
 
 @pytest.mark.parametrize("compiled", [False, True])
-def test_image_encoding_reuses_eager_or_compiled_encoder(monkeypatch, compiled):
+@pytest.mark.parametrize("out_dtype", [torch.float32, torch.bfloat16])
+def test_image_encoding_reuses_eager_or_compiled_encoder(
+    monkeypatch, compiled, out_dtype
+):
     import vllm_rbln.model_executor.models.minimax_m3 as m3
 
     model = m3.RBLNMiniMaxM3SparseForConditionalGeneration.__new__(
@@ -222,12 +225,12 @@ def test_image_encoding_reuses_eager_or_compiled_encoder(monkeypatch, compiled):
     torch.nn.Module.__init__(model)
     model.vision_tower = torch.nn.Linear(2, 2, bias=False)
     model.vision_tower.spatial_merge_size = 1
+    model.mm_embeds_dtype = out_dtype
     model.vision_tower.vision_model = SimpleNamespace(vision_segment_max_frames=4)
     encoder = torch.nn.Sequential(model.vision_tower)
     build_encoder = Mock(return_value=encoder)
     monkeypatch.setattr(m3, "_RBLNVisionEncoder", build_encoder)
     object.__setattr__(model, "_mm_encoder", encoder if compiled else None)
-    model.mm_embeds_dtype = torch.float32
     model._encoder_inputs = Mock(side_effect=lambda pixels, grid, modality: [pixels])
     pixels = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
     grids = torch.tensor([[1, 1, 1], [1, 1, 2]])
@@ -235,17 +238,60 @@ def test_image_encoding_reuses_eager_or_compiled_encoder(monkeypatch, compiled):
     for _ in range(2):
         outputs = model.embed_multimodal(pixel_values=pixels, image_grid_thw=grids)
         assert len(outputs) == 2
-        torch.testing.assert_close(outputs[0], model.vision_tower(pixels[:1]))
-        torch.testing.assert_close(outputs[1], model.vision_tower(pixels[1:]))
+        torch.testing.assert_close(
+            outputs[0], model.vision_tower(pixels[:1]).to(out_dtype)
+        )
+        torch.testing.assert_close(
+            outputs[1], model.vision_tower(pixels[1:]).to(out_dtype)
+        )
+        assert model.vision_tower.weight.dtype == torch.float32
 
     if compiled:
         build_encoder.assert_not_called()
     else:
-        build_encoder.assert_called_once_with(model.vision_tower, torch.float32)
+        build_encoder.assert_called_once_with(model.vision_tower, out_dtype)
         assert not encoder.training
     assert model._mm_encoder is encoder
     assert "_mm_encoder" not in model._modules
     assert list(model.state_dict()) == ["vision_tower.weight"]
+
+
+@pytest.mark.parametrize("ec_consumer", [False, True])
+def test_an_image_reaches_an_ec_consumer_as_its_grid(monkeypatch, ec_consumer):
+    import vllm_rbln.model_executor.models.minimax_m3 as m3
+
+    # The registered processing info, without a checkpoint behind it.
+    info_cls = m3.RBLNMiniMaxM3SparseForConditionalGeneration._processor_factory.info
+    monkeypatch.setattr(
+        info_cls, "get_image_processor", lambda self: SimpleNamespace(merge_size=2)
+    )
+    monkeypatch.setattr(info_cls, "_get_expected_hidden_size", lambda self: None)
+    monkeypatch.setattr(
+        info_cls, "allow_missing_mm_embeddings", property(lambda self: ec_consumer)
+    )
+    parser = info_cls.__new__(info_cls).get_data_parser()
+
+    # What an EC producer publishes beside the encoder output.
+    assert parser.placeholder_metadata_fields("image") == {"image_grid_thw"}
+
+    grid = torch.tensor([[1, 4, 6]])
+    embeds = parser.parse_mm_data(
+        {"image": {"image_grid_thw": grid, "image_embeds": torch.zeros(6, 8)}}
+    )["image"]
+    assert embeds.get(0)["image_embeds"].shape == (6, 8)
+
+    grid_only = {"image": {"image_grid_thw": grid}}
+    if ec_consumer:
+        assert parser.parse_mm_data(grid_only)["image"].get_count() == 1
+    else:
+        with pytest.raises(ValueError, match="image_embeds"):
+            parser.parse_mm_data(grid_only)
+
+    # The chat parser asks for the placeholder by the content type's modality.
+    model_cls = m3.RBLNMiniMaxM3SparseForConditionalGeneration
+    assert model_cls.get_placeholder_str(
+        "image_embeds", 1
+    ) == model_cls.get_placeholder_str("image", 1)
 
 
 def test_fp32_vision_encoder_hands_out_model_dtype_embeddings():
@@ -505,7 +551,8 @@ def test_video_budget_can_schedule_a_video_enlarged_by_min_pixels():
             )
         ],
     )
-    scheduler = SimpleNamespace(
+    scheduler = object.__new__(RBLNScheduler)
+    scheduler.__dict__.update(
         is_encoder_decoder=False,
         scheduler_config=config,
         ec_connector=None,
@@ -582,6 +629,7 @@ def vision_encoder_model():
         vision_segment_max_frames=2,
     )
     model.vision_tower = tower
+    model.mm_embeds_dtype = torch.float32
     model.mm_encoder_patch_buckets = [16, 64]
     return model
 
