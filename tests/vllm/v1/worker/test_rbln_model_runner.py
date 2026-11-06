@@ -749,10 +749,14 @@ class TestEcConsumer:
         self, monkeypatch, ec_role, compiled
     ):
         compile_calls = []
-        model = SimpleNamespace(
-            logits_processor=None,
-            compile_mm_encoder=lambda compile_fn: compile_calls.append(compile_fn),
-        )
+
+        class _Model(torch.nn.Module):
+            logits_processor = None
+
+            def compile_mm_encoder(self, compile_fn):
+                compile_calls.append(compile_fn)
+
+        model = _Model()
         monkeypatch.setattr(
             mr,
             "get_model_loader",
@@ -760,7 +764,6 @@ class TestEcConsumer:
         )
         monkeypatch.setattr(mr, "build_process_group_dict", lambda: {})
         monkeypatch.setattr(mr, "compile", lambda fn, **kw: fn)
-        monkeypatch.setenv("VLLM_RBLN_USE_NESTED_COMPILE_REGION", "0")
         ec_config = (
             None
             if ec_role is None
