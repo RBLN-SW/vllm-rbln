@@ -36,6 +36,7 @@ from unittest.mock import MagicMock, call, patch
 import msgspec
 import numpy as np
 import pytest
+import torch
 from vllm.distributed.kv_transfer.kv_connector.utils import EngineTransferInfo
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlBaseConnectorWorker,
@@ -8045,6 +8046,152 @@ class TestShardPeerGroupIds:
         )
 
         assert ids == (4, 3)
+
+
+class TestKdaPairsByHeadGroupEndToEnd:
+    """GLM-5.3's KDA layer with the real numbers, through the plan a peer of
+    another TP degree gets: 64 heads, a 1024-token page holding 16 of them, so
+    the TP1 producer registers four state caches a layer and a TP4 rank one,
+    each beside its conv ring, every cache over four chiplet slices. The KDA
+    group counts and cache names are the backend's own."""
+
+    PREFIX = "model.layers.0.self_attn"
+    QUARTER = 128 * 1024
+    STATE = RblnBlockTransferSpec(1024, 1024 * 512, 64, 128 * 128 * 2)
+    # (taps, q / k / v of every group, 32 x 64 lanes) bf16, a run per row.
+    RING_TP1 = RblnBlockTransferSpec(1024, 4 * 12 * 32 * 64 * 2, 64, 256, 48)
+    RING_TP4 = RblnBlockTransferSpec(1024, 4 * 3 * 32 * 64 * 2, 64, 256, 12)
+
+    @classmethod
+    def _side(cls, tp_size):
+        groups = 4 // tp_size
+        names = [f"{cls.PREFIX}.attn.{k}" for k in range(groups + 1)]
+        ring = cls.RING_TP1 if tp_size == 1 else cls.RING_TP4
+        specs = [cls.STATE] * groups + [ring]
+        return names, specs, groups
+
+    @classmethod
+    def _worker(cls, cls_, tp_rank, tp_size):
+        names, specs, groups = cls._side(tp_size)
+        w = object.__new__(cls_)
+        w.tp_rank = tp_rank
+        w.use_host_buffer = False
+        w.vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_text_config=SimpleNamespace(
+                    model_type="glm5_next_text",
+                    linear_num_heads=64,
+                    linear_head_dim=128,
+                    kv_lora_rank=512,
+                ),
+                dtype=torch.bfloat16,
+            ),
+            cache_config=SimpleNamespace(block_size=1024),
+        )
+        w.transfer_topo = SimpleNamespace(
+            tp_size=tp_size,
+            total_num_kv_heads=64,
+            tp_ratio=lambda r: tp_size // r if tp_size >= r else -(r // tp_size),
+        )
+        w.local_seen_layer_names = list(names)
+        w._kv_areas = 4
+        w.num_regions = 4 * len(names)
+        w.region_names = [name for name in names for _ in range(4)]
+        w._block_state_layers = set(names[:groups])
+        w._block_aux_specs = {names[-1]: SimpleNamespace(owner=names[0])}
+        w._logical_region_block_spec = specs
+        w._logical_region_kv_heads = [None] * len(names)
+        w._logical_region_latent = [False] * len(names)
+        w._logical_region_geometry = [
+            RegionGeometry(
+                ChipletSplitAxis.BLOCK,
+                4,
+                tuple(
+                    AreaPlace(0, spec.page_size_bytes // 4, sid) for sid in range(4)
+                ),
+            )
+            for spec in specs
+        ]
+        return w
+
+    @classmethod
+    def _meta(cls, tp_size):
+        names, specs, _ = cls._side(tp_size)
+        return _agent_meta(
+            region_names=[name for name in names for _ in range(4)],
+            kv_caches_base_addr=[0x1000 * (i + 1) for i in range(4 * len(names))],
+            block_lens=[spec.page_size_bytes // 4 for spec in specs for _ in range(4)],
+            kv_areas=4,
+            kv_slices=4,
+            kv_split_axes=[ChipletSplitAxis.BLOCK] * len(names),
+        )
+
+    @staticmethod
+    def _plan(w, meta, remote_rank, remote_tp):
+        renamed = w._peer_kda_names(meta, remote_rank, remote_tp)
+        return w._head_matched_plan(
+            renamed,
+            remote_rank,
+            remote_tp,
+            registered_layer_names=renamed.registered_layer_names,
+            peer_areas=w._fan_in_peer_areas(remote_rank, remote_tp),
+        )
+
+    @classmethod
+    def _ring_runs(cls, rank):
+        """(our run, the TP4 rank's run) of each q / k / v row, per tap."""
+        ours = (2 * rank, 2 * rank + 1, 8 + rank)
+        return [
+            (tap * 12 + ours[kind], tap * 3 + kind)
+            for tap in range(4)
+            for kind in range(3)
+        ]
+
+    @pytest.mark.parametrize("rank", range(4))
+    def test_the_producer_writes_every_area_of_the_rank_s_group(self, rank):
+        w = self._worker(RblnNixlPushConnectorWorker, 0, 1)
+
+        region_ids, plans = self._plan(w, self._meta(4), rank, 4)
+
+        state = [(r, p) for r, p in zip(region_ids, plans) if r < 16]
+        assert state == [
+            (rank * 4 + area, [Piece(0, area, 0, self.QUARTER, 4, (0, 1))])
+            for area in range(4)
+        ]
+        ring = [(r, p) for r, p in zip(region_ids, plans) if r >= 16]
+        assert ring == [
+            (
+                16 + area,
+                [
+                    Piece(ours * 1024, 4 + area, theirs * 1024, 1024, 1, (0, 1))
+                    for ours, theirs in self._ring_runs(rank)
+                ],
+            )
+            for area in range(4)
+        ]
+
+    @pytest.mark.parametrize("rank", range(4))
+    def test_a_rank_reads_every_area_of_its_group_from_the_producer(self, rank):
+        w = self._worker(RblnNixlPullConnectorWorker, rank, 4)
+
+        region_ids, plans = self._plan(w, self._meta(1), 0, 1)
+
+        state = [(r, p) for r, p in zip(region_ids, plans) if r < 4]
+        assert state == [
+            (area, [Piece(0, rank * 4 + area, 0, self.QUARTER, 4, (0, 1))])
+            for area in range(4)
+        ]
+        ring = [(r, p) for r, p in zip(region_ids, plans) if r >= 4]
+        assert ring == [
+            (
+                4 + area,
+                [
+                    Piece(theirs * 1024, 16 + area, ours * 1024, 1024, 1, (0, 1))
+                    for ours, theirs in self._ring_runs(rank)
+                ],
+            )
+            for area in range(4)
+        ]
 
 
 class TestABlockPayloadPairsAcrossTp:
