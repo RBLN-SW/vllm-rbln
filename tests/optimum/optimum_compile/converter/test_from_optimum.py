@@ -52,7 +52,7 @@ def test_compiled_num_devices_lands_in_the_config(monkeypatch):
         "batch_size": 4,
         "max_seq_len": 128,
         "kvcache_block_size": 128,
-        "prefill_chunk_size": 128,
+        "prefill_chunk_size": 4,
         "num_devices": 2,
     }
     sync_from_optimum(vllm_config, compiled)

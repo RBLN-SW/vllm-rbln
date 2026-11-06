@@ -114,6 +114,4 @@ def sync_from_vllm(vllm_config: VllmConfig) -> None:
         image_prefill_chunk_size=params.image_prefill_chunk_size,
     )
 
-    # Set max_num_batched_tokens: the prefill chunk size for decoder/multimodal
-    # models, or a full-prefill-plus-batch budget for enc-dec/pooling models.
-    update_max_num_batched_tokens(vllm_config, params)
+    update_max_num_batched_tokens(vllm_config)

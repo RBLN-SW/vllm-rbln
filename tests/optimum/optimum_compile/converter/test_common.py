@@ -19,7 +19,6 @@ import pytest
 from vllm_rbln.config import build_optimum_rbln_config
 from vllm_rbln.utils.optimum.converter.common import (
     apply_user_prefill_chunk_size,
-    get_user_max_num_batched_tokens,
     is_chunked_prefill_arch,
     store_image_prefill_chunk_size,
     update_max_num_batched_tokens,
@@ -38,6 +37,7 @@ def _vllm_config(
     max_model_len: int = 8192,
     max_num_seqs: int = 4,
     max_num_batched_tokens: int = 0,
+    max_num_scheduled_tokens: int | None = None,
     max_source_positions: int | None = None,
     additional_config: dict | None = None,
 ) -> SimpleNamespace:
@@ -49,6 +49,7 @@ def _vllm_config(
         scheduler_config=SimpleNamespace(
             max_num_seqs=max_num_seqs,
             max_num_batched_tokens=max_num_batched_tokens,
+            max_num_scheduled_tokens=max_num_scheduled_tokens,
         ),
         additional_config=build_optimum_rbln_config(additional_config),
     )
@@ -69,77 +70,60 @@ class TestIsChunkedPrefillArch:
         )
 
 
-class TestGetUserMaxNumBatchedTokens:
-    def test_none_when_no_additional_config(self):
-        cfg = _vllm_config(arch=DECODER_ARCH, additional_config=None)
-        assert get_user_max_num_batched_tokens(cfg) is None
-
-    def test_none_when_unset(self):
-        cfg = _vllm_config(arch=DECODER_ARCH, additional_config={})
-        assert get_user_max_num_batched_tokens(cfg) is None
-
-    def test_returns_stashed_value(self):
-        cfg = _vllm_config(
-            arch=DECODER_ARCH,
-            additional_config={"user_max_num_batched_tokens": 512},
-        )
-        assert get_user_max_num_batched_tokens(cfg) == 512
-
-
 class TestUpdateMaxNumBatchedTokens:
-    def test_decoder_uses_prefill_chunk_size(self):
-        cfg = _vllm_config(arch=DECODER_ARCH, max_num_seqs=4)
-        params = RBLNParams(prefill_chunk_size=256)
-        update_max_num_batched_tokens(cfg, params)
-        assert cfg.scheduler_config.max_num_batched_tokens == 256
-
-    def test_decoder_chunk_smaller_than_batch_ok(self):
-        # The scheduler's per-step budget is decoupled from max_num_batched_tokens,
-        # so a prefill chunk smaller than max_num_seqs no longer throttles decode.
-        cfg = _vllm_config(arch=DECODER_ARCH, max_num_seqs=512)
-        params = RBLNParams(prefill_chunk_size=128)
-        update_max_num_batched_tokens(cfg, params)
-        assert cfg.scheduler_config.max_num_batched_tokens == 128
-
-    def test_pooling_uses_full_prefill_budget(self):
-        cfg = _vllm_config(arch=POOLING_ARCH, max_model_len=8192, max_num_seqs=4)
-        params = RBLNParams(prefill_chunk_size=128)
-        update_max_num_batched_tokens(cfg, params)
-        # prefill_chunk_size is ignored; budget fits a full prefill.
+    @pytest.mark.parametrize("arch", [DECODER_ARCH, POOLING_ARCH])
+    def test_budget_fits_full_prefill(self, arch):
+        cfg = _vllm_config(arch=arch, max_num_batched_tokens=256)
+        update_max_num_batched_tokens(cfg)
         assert cfg.scheduler_config.max_num_batched_tokens == 8192
+
+    def test_larger_vllm_default_is_replaced(self):
+        cfg = _vllm_config(arch=DECODER_ARCH, max_num_batched_tokens=16384)
+        update_max_num_batched_tokens(cfg)
+        assert cfg.scheduler_config.max_num_batched_tokens == 8192
+
+    @pytest.mark.parametrize("budget", [0, 256, 8192, 16384])
+    def test_explicit_scheduled_token_budget_is_rejected(self, budget):
+        cfg = _vllm_config(arch=DECODER_ARCH, max_num_scheduled_tokens=budget)
+        with pytest.raises(ValueError, match="max_num_scheduled_tokens cannot be set"):
+            update_max_num_batched_tokens(cfg)
 
     def test_enc_dec_layers_source_positions(self):
         cfg = _vllm_config(
             arch=ENC_DEC_ARCH,
             max_model_len=448,
-            max_num_seqs=4,
             max_source_positions=1500,
         )
-        params = RBLNParams(prefill_chunk_size=128)
-        update_max_num_batched_tokens(cfg, params)
+        update_max_num_batched_tokens(cfg)
         assert cfg.scheduler_config.max_num_batched_tokens == 1500
 
 
 class TestApplyUserPrefillChunkSize:
-    def test_noop_for_pooling(self):
+    @pytest.mark.parametrize("arch", [ENC_DEC_ARCH, POOLING_ARCH])
+    @pytest.mark.parametrize("precompiled", [False, True])
+    @pytest.mark.parametrize("chunk", [128, 512])
+    def test_non_chunked_arch_rejects_user_value(self, arch, precompiled, chunk):
         cfg = _vllm_config(
-            arch=POOLING_ARCH,
-            additional_config={"user_max_num_batched_tokens": 512},
+            arch=arch,
+            additional_config={"prefill_chunk_size": chunk},
         )
         params = RBLNParams(prefill_chunk_size=128)
-        apply_user_prefill_chunk_size(cfg, params, precompiled=False)
-        assert params.prefill_chunk_size == 128
+        with pytest.raises(ValueError, match="not support chunked prefill"):
+            apply_user_prefill_chunk_size(cfg, params, precompiled=precompiled)
 
-    def test_noop_when_user_unset(self):
-        cfg = _vllm_config(arch=DECODER_ARCH, additional_config={})
+    @pytest.mark.parametrize("arch", [DECODER_ARCH, ENC_DEC_ARCH, POOLING_ARCH])
+    @pytest.mark.parametrize("precompiled", [False, True])
+    def test_noop_when_user_unset(self, arch, precompiled):
+        cfg = _vllm_config(arch=arch, additional_config={})
         params = RBLNParams(prefill_chunk_size=128)
-        apply_user_prefill_chunk_size(cfg, params, precompiled=False)
+        apply_user_prefill_chunk_size(cfg, params, precompiled=precompiled)
         assert params.prefill_chunk_size == 128
+        assert cfg.additional_config.prefill_chunk_size == 128
 
     def test_compile_path_folds_user_value(self):
         cfg = _vllm_config(
             arch=DECODER_ARCH,
-            additional_config={"user_max_num_batched_tokens": 512},
+            additional_config={"prefill_chunk_size": 512},
         )
         params = RBLNParams(prefill_chunk_size=128)
         apply_user_prefill_chunk_size(cfg, params, precompiled=False)
@@ -148,7 +132,7 @@ class TestApplyUserPrefillChunkSize:
     def test_compile_path_conflict_with_rbln_override(self):
         cfg = _vllm_config(
             arch=DECODER_ARCH,
-            additional_config={"user_max_num_batched_tokens": 512},
+            additional_config={"prefill_chunk_size": 512},
         )
         params = RBLNParams(prefill_chunk_size=256)
         with pytest.raises(ValueError, match="Conflicting prefill chunk size"):
@@ -159,7 +143,7 @@ class TestApplyUserPrefillChunkSize:
     def test_precompiled_conflict_raises(self):
         cfg = _vllm_config(
             arch=DECODER_ARCH,
-            additional_config={"user_max_num_batched_tokens": 512},
+            additional_config={"prefill_chunk_size": 512},
         )
         params = RBLNParams(prefill_chunk_size=128)
         with pytest.raises(ValueError, match="conflicts with the compiled"):
@@ -168,11 +152,21 @@ class TestApplyUserPrefillChunkSize:
     def test_precompiled_match_ok(self):
         cfg = _vllm_config(
             arch=DECODER_ARCH,
-            additional_config={"user_max_num_batched_tokens": 128},
+            additional_config={"prefill_chunk_size": 128},
         )
         params = RBLNParams(prefill_chunk_size=128)
         apply_user_prefill_chunk_size(cfg, params, precompiled=True)
         assert params.prefill_chunk_size == 128
+        assert cfg.additional_config.prefill_chunk_size == 128
+
+    @pytest.mark.parametrize("precompiled", [False, True])
+    def test_scheduling_budget_does_not_set_chunk_size(self, precompiled):
+        cfg = _vllm_config(arch=DECODER_ARCH, max_num_batched_tokens=8192)
+        params = RBLNParams(prefill_chunk_size=256)
+        apply_user_prefill_chunk_size(cfg, params, precompiled=precompiled)
+        assert params.prefill_chunk_size == 256
+        assert cfg.additional_config.prefill_chunk_size == 256
+        assert cfg.scheduler_config.max_num_batched_tokens == 8192
 
 
 class TestStoreImagePrefillChunkSize:

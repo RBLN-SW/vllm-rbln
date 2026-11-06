@@ -105,9 +105,7 @@ def sync_from_optimum(
         vllm_config.model_config.max_model_len = params.max_seq_len
 
     apply_user_prefill_chunk_size(vllm_config, params, precompiled=True)
-    # Set max_num_batched_tokens: the prefill chunk size for decoder/multimodal
-    # models, or a full-prefill-plus-batch budget for enc-dec/pooling models.
-    update_max_num_batched_tokens(vllm_config, params)
+    update_max_num_batched_tokens(vllm_config)
     update_mamba_block_size(vllm_config, params)
 
     # Persist the image-prefill buckets (gemma3/gemma4) into additional_config.
