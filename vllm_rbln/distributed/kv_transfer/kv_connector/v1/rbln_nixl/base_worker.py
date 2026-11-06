@@ -49,6 +49,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_transfer_topology im
     RblnBlockTransferSpec,
 )
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.attention.backends.glm5_next import kda_state_band
 from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
 
 if TYPE_CHECKING:
@@ -82,6 +83,7 @@ class RblnNixlWorkerBase(
 
         self._block_aux_specs: dict[str, RBLNBlockAuxSpec] = {}
         self._block_state_layers: set[str] = set()
+        band_heads, head_bytes = kda_state_band(vllm_config) or (0, 0)
         groups = []
         for group in kv_cache_config.kv_cache_groups:
             specs = (
@@ -94,7 +96,9 @@ class RblnNixlWorkerBase(
             for name, spec in specs.items():
                 if isinstance(spec, MambaSpec) and len(spec.shapes) == 1:
                     self._block_state_layers.add(name)
-                    spec = RblnBlockTransferSpec(spec.block_size, spec.page_size_bytes)
+                    spec = RblnBlockTransferSpec(
+                        spec.block_size, spec.page_size_bytes, band_heads, head_bytes
+                    )
                     changed = True
                 transferred[name] = spec
             group_spec = group.kv_cache_spec
