@@ -133,6 +133,10 @@ class RBLNConfig(RBLNConfigBase):
     decode_batch_bucket_manual_buckets: list[int] = field(default_factory=list)
     """Explicit decode batch sizes, used when the strategy is `manual`."""
 
+    encoder_token_budgets: list[int] = field(default_factory=list)
+    """Output-token capacities of compiled encoder graphs, shared across modalities.
+    Empty uses the processor upper bounds for enabled modalities."""
+
     use_w8a8: bool = False
     """Opt in to W8A8. W8A16 runs on every RBLN NPU, W8A8 only on the ones
     whose kernels take an fp8 activation."""
@@ -156,6 +160,7 @@ class RBLNConfig(RBLNConfigBase):
             "use_custom_sampler",
             "enable_sub_block_cache",
             "sub_block_size",
+            "encoder_token_budgets",
         }
         factors = get_hash_factors(self, ignored_factors)
         # Unset and True build the same graph; only False changes the artifact.
@@ -173,6 +178,11 @@ class RBLNConfig(RBLNConfigBase):
                 "decode_batch_bucket_strategy='manual' needs at least one entry "
                 "in decode_batch_bucket_manual_buckets"
             )
+        budgets = self.encoder_token_budgets
+        if any(b <= 0 for b in budgets):
+            raise ValueError("encoder_token_budgets must all be > 0")
+        if len(budgets) != len(set(budgets)):
+            raise ValueError("encoder_token_budgets must be unique")
 
 
 @vllm_config_dataclass

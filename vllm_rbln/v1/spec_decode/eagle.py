@@ -713,7 +713,11 @@ class RBLNEagleProposer(EagleProposer):
             num_reqs=num_reqs,
             num_reqs_padded=num_reqs if is_prefill else num_reqs_padded,
             query_len=input_ids.shape[1],
-            query_len_padded=self.max_num_tokens if is_prefill else input_ids.shape[1],
+            query_len_padded=(
+                self.vllm_config.additional_config.prefill_chunk_size
+                if is_prefill
+                else input_ids.shape[1]
+            ),
         )
         staged = self.input_stager.stage(
             input_ids=input_ids,

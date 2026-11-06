@@ -311,7 +311,7 @@ environment_variables = {
     ),
     # --- MODEL INPUT / SCHEDULING ---
     # Enable sub-block prefix caching.
-    # Sub-block size equals max_num_batched_tokens (prefill chunk size).
+    # Sub-block size defaults to the prefill chunk size.
     "VLLM_RBLN_SUB_BLOCK_CACHE": lambda: (
         os.environ.get("VLLM_RBLN_SUB_BLOCK_CACHE", "True").lower() in ("true", "1")
     ),
