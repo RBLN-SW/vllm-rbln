@@ -88,21 +88,18 @@ class RBLNModelOptNvFp4FusedMoE(ModelOptNvFp4FusedMoE):
         gate_proj_scale = layer.w13_weight_scale[:, :intermediate_size, :]
         up_proj_scale = layer.w13_weight_scale[:, intermediate_size:, :]
 
-        out = torch.ops.rbln_custom_ops.custom_moe_glu_group_dequantize(
+        out = torch.ops.rbln_custom_ops.custom_moe(
             hidden_states,
             gate_proj_weight,
-            gate_proj_scale,
             up_proj_weight,
-            up_proj_scale,
             layer.w2_weight,
-            layer.w2_weight_scale,
             masked_routing_weights,
-            torch.tensor(self.quant_config.group_size, dtype=torch.int32),
             layer.activation.value,
-            None,  # gate_proj_bias
-            None,  # up_proj_bias
-            None,  # down_proj_bias
-            layer.expert_map,
+            gate_proj_scale=gate_proj_scale,
+            up_proj_scale=up_proj_scale,
+            down_proj_scale=layer.w2_weight_scale,
+            group_size=self.quant_config.group_size,
+            expert_map=layer.expert_map,
             gate_proj_scale_2=layer.w13_weight_scale_2[:, 0].contiguous(),
             up_proj_scale_2=layer.w13_weight_scale_2[:, 1].contiguous(),
             down_proj_scale_2=layer.w2_weight_scale_2,
