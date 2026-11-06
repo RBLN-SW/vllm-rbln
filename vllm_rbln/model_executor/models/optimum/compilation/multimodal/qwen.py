@@ -45,3 +45,24 @@ get_param_qwen3_asr = get_param_qwen2_vl
 get_param_qwen3_vl = get_param_qwen2_vl
 get_param_qwen3_vl_moe = get_param_qwen2_vl
 get_param_qwen3_5 = get_param_qwen2_vl
+
+
+def get_param_qwen3_vl_reranker(
+    batch_size: int,
+    max_model_len: int,
+    block_size: int,
+    num_devices: int,
+    memory_budget: float,
+    prefill_chunk_size: int | None = None,
+) -> dict:
+    param = get_param_qwen3_vl(
+        batch_size,
+        max_model_len,
+        block_size,
+        num_devices,
+        memory_budget,
+        prefill_chunk_size,
+    )
+    # score() never decodes, so the decode graphs would only cost memory.
+    param["phases"] = ["prefill"]
+    return param

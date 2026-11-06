@@ -19,6 +19,8 @@ import pytest
 
 from vllm_rbln.model_executor.models.optimum.compilation.multimodal.qwen import (
     get_param_qwen3_5,
+    get_param_qwen3_vl,
+    get_param_qwen3_vl_reranker,
 )
 from vllm_rbln.utils.optimum.converter.params import (
     RBLNParams,
@@ -354,3 +356,20 @@ class TestGetParamQwen35:
         assert "attn_impl" not in param
         assert "kvcache_partition_len" not in param
         assert param["max_seq_len"] == 4096
+
+
+def test_qwen3_vl_reranker_compiles_prefill_only():
+    """score() never decodes, so only the prefill graph is compiled; every other
+    parameter is the generative Qwen3-VL one."""
+    cfg = {
+        "batch_size": 1,
+        "max_model_len": 4096,
+        "block_size": 1024,
+        "num_devices": 1,
+        "memory_budget": 0.9,
+        "prefill_chunk_size": 128,
+    }
+    param = get_param_qwen3_vl_reranker(**cfg)
+
+    assert param.pop("phases") == ["prefill"]
+    assert param == get_param_qwen3_vl(**cfg)

@@ -153,6 +153,48 @@ def test_runner_block_table_has_no_token_alignment_padding(
     assert block_table.shape[1] == expected_width
 
 
+@pytest.mark.parametrize(
+    ("model_id", "hf_overrides", "expected"),
+    [
+        # Renamed to the backbone optimum-rbln compiles an embedder as.
+        ("Qwen/Qwen3-VL-Embedding-2B", None, ["Qwen3VLModel"]),
+        # Registered as it is, so the text reranker's remap must not reach it.
+        (
+            "Qwen/Qwen3-VL-Reranker-2B",
+            {
+                "architectures": ["Qwen3VLForSequenceClassification"],
+                "classifier_from_token": ["no", "yes"],
+                "is_original_qwen3_reranker": True,
+            },
+            ["Qwen3VLForSequenceClassification"],
+        ),
+    ],
+    ids=["embedding", "reranker"],
+)
+def test_runner_maps_qwen3_vl_pooling_architectures(model_id, hf_overrides, expected):
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(
+            model=model_id,
+            dtype=torch.float,
+            seed=42,
+            runner="pooling",
+            max_model_len=128,
+            hf_overrides=hf_overrides,
+        ),
+        cache_config=CacheConfig(block_size=BLOCK_SIZE, cache_dtype="auto"),
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=1,
+            max_num_batched_tokens=128,
+            max_model_len=128,
+            is_encoder_decoder=False,
+        ),
+    )
+
+    RBLNOptimumModelRunner(vllm_config, DEVICE)
+
+    assert vllm_config.model_config.hf_config.architectures == expected
+
+
 def test_mask_block_table_fills_unused_slots_with_zero():
     # vLLM ids (1-based, 0 is the null block) for a request owning 4 of 8 slots.
     block_ids = torch.tensor([7, 9, 12, 15, 0, 0, 0, 0], dtype=torch.int32)

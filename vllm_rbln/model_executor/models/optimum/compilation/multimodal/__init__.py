@@ -28,6 +28,7 @@ from .qwen import (
     get_param_qwen3_asr,
     get_param_qwen3_vl,
     get_param_qwen3_vl_moe,
+    get_param_qwen3_vl_reranker,
 )
 
 _COMPILE_MULTIMODAL_FNS: dict[
@@ -45,6 +46,7 @@ _COMPILE_MULTIMODAL_FNS: dict[
     "qwen2_5_vl": get_param_qwen2_5_vl,
     "qwen3_vl": get_param_qwen3_vl,
     "qwen3_vl_moe": get_param_qwen3_vl_moe,
+    "qwen3_vl_reranker": get_param_qwen3_vl_reranker,
     "qwen3_5": get_param_qwen3_5,
     "qwen3_asr": get_param_qwen3_asr,
 }
