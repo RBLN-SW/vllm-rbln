@@ -41,18 +41,19 @@ so each takes a `--rbln-*` flag, an `additional_config` key, or the environment 
 Turning it off while giving a `sub_block_size` is rejected,
 since the two ask for opposite things.
 
-Left unset, the sub-block size is the prefill chunk size (`max_num_batched_tokens`),
+Left unset, the sub-block size is the prefill chunk size (`--rbln-prefill-chunk-size`,
+which defaults to `max_num_batched_tokens`),
 so each prefill does not span multiple blocks.
 A smaller value decouples the two, so a prefill chunk can span two blocks.
 Storing across that boundary needs the multi-block attention store,
 which REBEL CR13 alone carries — the scheduler rejects the decoupled setting on
 any other device.
-The scheduler also requires `block_size >= max_num_batched_tokens >= sub_block_size`.
+The scheduler also requires `block_size >= prefill_chunk_size >= sub_block_size`.
 
 For cross-engine prefix-aware routing (e.g., llm-d):
 enable KV events via `--kv-events-config` in vLLM and
 set the router's token processing block size to the sub-block size:
-`--rbln-sub-block-size` when given, otherwise `--max-num-batched-tokens`
+`--rbln-sub-block-size` when given, otherwise the prefill chunk size
 (**not** `--block-size`; see [Using with llm-d](#using-with-llm-d)).
 
 ## Key components
@@ -331,7 +332,7 @@ events, and scores pods by how many consecutive blocks match.  Routing
 works iff the producer's `blockSizeTokens` equals the engine's emitted
 `block_size`, which is our sub-block size:
 `--rbln-sub-block-size` when given, otherwise the prefill chunk size
-(`--max-num-batched-tokens`).
+(`--rbln-prefill-chunk-size`, which defaults to `--max-num-batched-tokens`).
 
 > **Not** vLLM's `--block-size`.  For stock vLLM those two happen to be
 > the same knob, so generic guides tell you to align `--block-size` with

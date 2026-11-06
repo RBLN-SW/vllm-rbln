@@ -31,10 +31,14 @@ from vllm_rbln.v1.core.utils import (
 )
 
 
-def _sched_out(num_scheduled_tokens, spec=None):
+def _sched_out(num_scheduled_tokens, spec=None, new=(), cached=()):
+    """`new` / `cached`: the num_computed_tokens of the new and the cached
+    (running or resumed) requests."""
     return SimpleNamespace(
         num_scheduled_tokens=num_scheduled_tokens,
         scheduled_spec_decode_tokens=spec or {},
+        scheduled_new_reqs=[SimpleNamespace(num_computed_tokens=n) for n in new],
+        scheduled_cached_reqs=SimpleNamespace(num_computed_tokens=list(cached)),
     )
 
 
@@ -49,10 +53,19 @@ class TestStepIsPrefill:
         assert step_is_prefill(_sched_out({"a": 512})) is True
 
     def test_single_token_step_is_decode(self):
-        # Where a 1-token prompt, a chunked prefill's last token and a full
-        # remote-KV or prefix-cache match all land -- is_prefill() reports decode
-        # for each, so this has to as well.
-        assert step_is_prefill(_sched_out({"a": 1})) is False
+        # Where a chunked prefill's last token and a full remote-KV or
+        # prefix-cache match land -- is_prefill() reports decode for each, so
+        # this has to as well.
+        assert step_is_prefill(_sched_out({"a": 1}, cached=[7])) is False
+        assert step_is_prefill(_sched_out({"a": 1}, new=[7])) is False
+
+    @pytest.mark.parametrize(
+        "where", [{"new": [0]}, {"cached": [0]}], ids=["new", "resumed"]
+    )
+    def test_a_first_chunk_is_prefill_whatever_its_length(self, where):
+        # A 1-token prompt, or a first chunk cut to one token, starts a recurrent
+        # state from zero, which only the prefill kernels do.
+        assert step_is_prefill(_sched_out({"a": 1}, **where)) is True
 
     def test_drafts_do_not_inflate_the_phase(self):
         # 1 base + 4 drafts is a decode step; only the base counts.
@@ -186,7 +199,7 @@ class TestSubBlockSizeInUse:
             enable_prefix_caching=True,
             sub_block_cache=True,
             block_size=1024,
-            max_num_batched_tokens=512,
+            prefill_chunk_size=512,
             kv_cache_config=object(),
         )
         args.update(kw)
@@ -225,7 +238,7 @@ class TestSubBlockSizeInUse:
     def test_a_chunk_outside_the_block_bounds_is_rejected(self, eligible):
         eligible(True)
         with pytest.raises(ValueError, match="block_size >="):
-            self._call(block_size=256, max_num_batched_tokens=512, sub_block_size=256)
+            self._call(block_size=256, prefill_chunk_size=512, sub_block_size=256)
 
     def test_a_size_the_kv_cache_cannot_hold_is_rejected(self, eligible):
         # A size that is not a divisor of block_size, or a spec with no token
@@ -239,7 +252,7 @@ class TestSubBlockSizeInUse:
         # Nobody asked for sub-blocks here, so a chunk wider than the block
         # steps aside rather than refusing to start.
         eligible(True)
-        assert self._call(block_size=256, max_num_batched_tokens=512) is None
+        assert self._call(block_size=256, prefill_chunk_size=512) is None
 
     def test_a_size_below_the_chunk_needs_cr13(self, eligible, monkeypatch):
         # The multi-block store the decoupled size needs is CR13-only.
