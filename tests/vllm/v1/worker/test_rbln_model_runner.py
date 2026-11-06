@@ -760,6 +760,7 @@ class TestEcConsumer:
         )
         monkeypatch.setattr(mr, "build_process_group_dict", lambda: {})
         monkeypatch.setattr(mr, "compile", lambda fn, **kw: fn)
+        monkeypatch.setenv("VLLM_RBLN_USE_NESTED_COMPILE_REGION", "0")
         ec_config = (
             None
             if ec_role is None
