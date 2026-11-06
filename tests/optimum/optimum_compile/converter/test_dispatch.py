@@ -18,8 +18,10 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from transformers import Qwen3Config
 
 from vllm_rbln.config import build_optimum_rbln_config
+from vllm_rbln.platform.optimum_impl import check_and_update
 from vllm_rbln.utils.optimum.converter import dispatch
 from vllm_rbln.utils.optimum.converter.dispatch import _generate_model_path_name
 from vllm_rbln.utils.optimum.converter.params import (
@@ -75,6 +77,72 @@ def _vllm_config(
 
 
 class TestGenerateModelPathName:
+    @pytest.mark.parametrize(
+        ("runner", "reranker", "expected_arch", "expected_cls", "expected_tokens"),
+        [
+            ("pooling", False, "Qwen3Model", "RBLNQwen3Model", 1024),
+            ("pooling", True, "Qwen3ForCausalLM", "RBLNAutoModelForCausalLM", 128),
+            ("generate", False, "Qwen3ForCausalLM", "RBLNAutoModelForCausalLM", 128),
+        ],
+    )
+    def test_qwen3_architecture_is_resolved_before_cache_lookup(
+        self,
+        monkeypatch,
+        runner,
+        reranker,
+        expected_arch,
+        expected_cls,
+        expected_tokens,
+    ):
+        hf_config = Qwen3Config(
+            architectures=[
+                "Qwen3ForSequenceClassification" if reranker else "Qwen3ForCausalLM"
+            ],
+            is_original_qwen3_reranker=reranker,
+            classifier_from_token=["no", "yes"] if reranker else None,
+        )
+        cfg = SimpleNamespace(
+            model_config=SimpleNamespace(
+                model="Qwen/Qwen3-0.6B",
+                architectures=hf_config.architectures,
+                runner_type=runner,
+                hf_config=hf_config,
+                hf_text_config=hf_config,
+                multimodal_config=None,
+                max_model_len=1024,
+                dtype=torch.bfloat16,
+            ),
+            parallel_config=SimpleNamespace(
+                worker_cls="auto", tensor_parallel_size=1, pipeline_parallel_size=1
+            ),
+            scheduler_config=SimpleNamespace(
+                max_num_seqs=1, max_num_batched_tokens=2048, async_scheduling=False
+            ),
+            cache_config=SimpleNamespace(
+                block_size=1024,
+                gpu_memory_utilization=0.9,
+                user_specified_block_size=True,
+                enable_prefix_caching=False,
+            ),
+            additional_config={},
+            speculative_config=None,
+        )
+        observed = []
+
+        def generate_name(vllm_config):
+            observed.append(
+                (
+                    list(vllm_config.model_config.hf_config.architectures),
+                    vllm_config.additional_config.compile_spec["model_cls"],
+                    vllm_config.scheduler_config.max_num_batched_tokens,
+                )
+            )
+            return _generate_model_path_name(vllm_config)
+
+        monkeypatch.setattr(dispatch, "_generate_model_path_name", generate_name)
+        check_and_update(cfg)
+        assert observed == [([expected_arch], expected_cls, expected_tokens)]
+
     def test_user_max_num_batched_tokens_changes_hash(self):
         # Two runs that would compile different prefill chunk sizes must not
         # collide on the same cache key.
