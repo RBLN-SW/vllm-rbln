@@ -210,8 +210,8 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
     def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
         """Prefill writes one state row, named by ``batch_idx``; decode names the
         state row of each batch row, ``state_idx`` (see decode_layout)."""
+        assert model_input.cache_slot_ids is not None
         if model_input.is_prompt:
-            assert model_input.cache_slot_ids is not None
             return self.model.prefill_decoder(
                 inputs_embeds=model_input.inputs_embeds,
                 position_embed=model_input.position_embed,
