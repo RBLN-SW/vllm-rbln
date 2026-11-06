@@ -55,6 +55,10 @@ _RBLN_ENCODER_DECODER_MODELS: dict[str, tuple[str, str]] = {
 }
 
 _RBLN_MULTIMODAL_MODELS = {
+    "Llama4ForConditionalGeneration": (
+        "llama4",
+        "RBLNLlama4ForConditionalGeneration",
+    ),
     "LlavaNextForConditionalGeneration": (
         "llava_next",
         "RBLNLlavaNextForConditionalGeneration",
