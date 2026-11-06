@@ -18,14 +18,13 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from transformers import LlamaConfig, Qwen3Config
+from transformers import LlamaConfig, PaliGemmaConfig, Qwen3Config, WhisperConfig
 
 from vllm_rbln.config import build_optimum_rbln_config
 from vllm_rbln.platform.optimum_impl import check_and_update
 from vllm_rbln.utils.optimum.converter import dispatch
 from vllm_rbln.utils.optimum.converter.dispatch import _generate_model_path_name
 from vllm_rbln.utils.optimum.converter.params import (
-    RBLNParams,
     load_compiled_rbln_config,
 )
 
@@ -73,6 +72,9 @@ def _vllm_config(
             gpu_memory_utilization=0.9,
             user_specified_block_size=True,
             enable_prefix_caching=prefix_caching,
+            num_gpu_blocks_override=None,
+            user_specified_mamba_block_size=False,
+            mamba_block_size=None,
         ),
         additional_config=build_optimum_rbln_config(additional_config),
     )
@@ -82,6 +84,77 @@ def _vllm_config(
 
 
 class TestGenerateModelPathName:
+    @pytest.mark.parametrize("prefix_caching", [False, True])
+    def test_paligemma_uses_final_chunk_before_cache_lookup(
+        self, monkeypatch, prefix_caching
+    ):
+        observed = []
+
+        def generate_name(vllm_config):
+            observed.append(vllm_config.scheduler_config.max_num_batched_tokens)
+            return _generate_model_path_name(vllm_config)
+
+        monkeypatch.setattr(dispatch, "_generate_model_path_name", generate_name)
+        cfg = _vllm_config(
+            prefix_caching=prefix_caching,
+            hf_config=PaliGemmaConfig(
+                architectures=["PaliGemmaForConditionalGeneration"]
+            ),
+        )
+        spec = cfg.additional_config.compile_spec["rbln_config"]["language_model"]
+        assert observed == [spec["prefill_chunk_size"]] == [8192]
+        assert cfg.cache_config.block_size == 8192
+        dispatch.sync_vllm_and_optimum(cfg)
+        assert cfg.scheduler_config.max_num_batched_tokens == 8192
+
+    def test_paligemma_rejects_user_chunk_that_differs_from_final_spec(self):
+        with pytest.raises(ValueError, match="prefill_chunk_size"):
+            _vllm_config(
+                512,
+                hf_config=PaliGemmaConfig(
+                    architectures=["PaliGemmaForConditionalGeneration"]
+                ),
+            )
+
+    def test_whisper_runtime_uses_final_compile_lengths(self):
+        cfg = _vllm_config(
+            hf_config=WhisperConfig(
+                architectures=["WhisperForConditionalGeneration"],
+                max_target_positions=8192,
+            )
+        )
+        spec = cfg.additional_config.compile_spec["rbln_config"]
+        assert spec["dec_max_seq_len"] == cfg.model_config.max_model_len == 8192
+        assert spec["batch_size"] == cfg.scheduler_config.max_num_seqs == 4
+
+    def test_paligemma_cache_hit_preserves_the_final_runtime_settings(
+        self, monkeypatch
+    ):
+        hf_config = PaliGemmaConfig(architectures=["PaliGemmaForConditionalGeneration"])
+        cfg = _vllm_config(hf_config=hf_config)
+        cache_path = Path(cfg.additional_config.cached_model_path)
+        cache_path.mkdir(parents=True)
+        metadata = cfg.additional_config.compile_spec["rbln_config"]
+        metadata = json.loads(json.dumps(metadata))
+        metadata["language_model"].update(
+            kvcache_block_size=8192, kvcache_num_blocks=4, dtype="bfloat16"
+        )
+        (cache_path / "rbln_config.json").write_text(json.dumps(metadata))
+        monkeypatch.setattr(
+            dispatch, "load_compiled_rbln_config", load_compiled_rbln_config
+        )
+        monkeypatch.setattr(
+            dispatch, "is_compiled_dir", lambda path: path == str(cache_path)
+        )
+        cached = _vllm_config(hf_config=hf_config)
+        assert cached.additional_config.cached_model_path == str(cache_path)
+        assert (
+            cached.scheduler_config.max_num_batched_tokens
+            == cfg.scheduler_config.max_num_batched_tokens
+            == 8192
+        )
+        assert cached.cache_config.block_size == cfg.cache_config.block_size == 8192
+
     @pytest.mark.parametrize(
         ("runner", "reranker", "expected_arch", "expected_cls", "expected_tokens"),
         [
@@ -314,26 +387,6 @@ class TestGenerateModelPathName:
         assert spec["rbln_config"]["num_devices"] == expected_devices
         assert cfg.additional_config.num_devices_per_local_rank == expected_devices
 
-    @pytest.mark.parametrize("prefix_caching", [False, True])
-    def test_compile_inputs_are_parsed_once(self, monkeypatch, prefix_caching):
-        parsed = []
-        parse = RBLNParams.from_rbln_config
-
-        def capture_params(cls, *args, **kwargs):
-            params = parse(*args, **kwargs)
-            parsed.append(params)
-            return params
-
-        monkeypatch.setattr(RBLNParams, "from_rbln_config", classmethod(capture_params))
-        cfg = _vllm_config(prefix_caching=prefix_caching)
-        assert len(parsed) == 1
-        spec = cfg.additional_config.compile_spec["rbln_config"]
-        assert spec["batch_size"] == parsed[0].batch_size
-        assert spec["max_seq_len"] == parsed[0].max_seq_len
-        assert spec["num_devices"] == parsed[0].num_devices
-        assert spec["prefill_chunk_size"] == parsed[0].prefill_chunk_size
-        assert parsed[0].kvcache_block_size == 8192
-
     def test_repeated_sync_preserves_the_attention_block_size(self):
         cfg = _vllm_config(prefix_caching=True)
         dispatch.sync_vllm_and_optimum(cfg)
@@ -353,7 +406,7 @@ class TestGenerateModelPathName:
         monkeypatch.setattr(
             dispatch, "is_compiled_dir", lambda path: path == str(cache_path)
         )
-        assert dispatch._resolve_cached_rbln_config(cfg, RBLNParams()) == metadata
+        assert dispatch._resolve_cached_rbln_config(cfg) == metadata
         assert cfg.model_config.model == source_model
 
         synced = []

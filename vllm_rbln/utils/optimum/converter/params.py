@@ -134,7 +134,7 @@ class RBLNParams:
         batch_size = _cfg_get(cfg, "batch_size")
         # For pooling models each sequence occupies exactly one block.
         num_blocks = _cfg_get(cfg, "kvcache_num_blocks")
-        kvcache_block_size = _cfg_get(cfg, "kvcache_block_size")
+        kvcache_block_size = _resolve_kvcache_block_size(cfg, arch="pooling")
         if kvcache_block_size is None and max_seq_len is not None:
             kvcache_block_size = max_seq_len
         if num_blocks is None and batch_size is not None:
@@ -169,19 +169,20 @@ class RBLNParams:
         default_prefill_chunk_size = _resolve_default_prefill_chunk_size()
         # Fall back to a known submodule when the main module does not expose
         # these fields (e.g. language_model / text_model for some VLMs).
-        if kvcache_block_size is None:
+        if kvcache_block_size is None or batch_size is None or max_seq_len is None:
             for submodule_name in ("language_model", "text_model"):
                 sub_cfg = _cfg_get_submodule(cfg, submodule_name)
                 if sub_cfg is None:
                     continue
-                kvcache_block_size = _resolve_kvcache_block_size(
+                sub_block_size = _resolve_kvcache_block_size(
                     sub_cfg, arch=submodule_name
                 )
-                if kvcache_block_size is not None:
-                    batch_size = _cfg_get(sub_cfg, "batch_size")
-                    max_seq_len = _cfg_get(sub_cfg, "max_seq_len")
-                    num_blocks = _cfg_get(sub_cfg, "kvcache_num_blocks")
-                    break
+                if sub_block_size is not None:
+                    kvcache_block_size = sub_block_size
+                batch_size = _cfg_get(sub_cfg, "batch_size", batch_size)
+                max_seq_len = _cfg_get(sub_cfg, "max_seq_len", max_seq_len)
+                num_blocks = _cfg_get(sub_cfg, "kvcache_num_blocks", num_blocks)
+                break
 
         # prefill_chunk_size and image-prefill buckets live on the language model
         # (optimum-rbln stores them on the `language_model` sub-config; gemma3/4

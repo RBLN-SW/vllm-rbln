@@ -289,5 +289,6 @@ class RBLNCompileSpec:
                 "num_devices": num_devices,
                 "batch_size": batch_size,
                 "token_timestamps": False,
+                "dec_max_seq_len": max_model_len,
             },
         )

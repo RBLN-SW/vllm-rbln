@@ -15,7 +15,6 @@
 import hashlib
 import json
 import os
-from copy import deepcopy
 from typing import TYPE_CHECKING
 
 from vllm_rbln import envs
@@ -25,7 +24,7 @@ from vllm_rbln.utils.optimum.paths import is_compiled_dir
 
 from .from_optimum import sync_from_optimum
 from .from_vllm import sync_from_vllm
-from .params import RBLNParams, load_compiled_rbln_config
+from .params import load_compiled_rbln_config
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -72,35 +71,9 @@ def _generate_model_path_name(
     return f"{sanitized_name}_{config_hash}"
 
 
-def _resolve_cached_rbln_config(
-    vllm_config: VllmConfig, compile_params: RBLNParams
-) -> dict | None:
+def _resolve_cached_rbln_config(vllm_config: VllmConfig) -> dict | None:
     """Locate a cached artifact after synchronizing the compile inputs."""
     rbln_config: OptimumRBLNConfig = vllm_config.additional_config
-    if rbln_config.compile_spec is None:
-        from vllm_rbln.utils.optimum.compilation import RBLNCompileSpec
-
-        assert compile_params.batch_size is not None
-        assert compile_params.max_seq_len is not None
-        assert compile_params.kvcache_block_size is not None
-        spec = RBLNCompileSpec.for_architecture(
-            vllm_config.model_config.hf_config,
-            batch_size=compile_params.batch_size,
-            block_size=compile_params.kvcache_block_size,
-            max_model_len=compile_params.max_seq_len,
-            num_devices=compile_params.num_devices,
-            prefill_chunk_size=compile_params.prefill_chunk_size,
-            memory_budget=vllm_config.cache_config.gpu_memory_utilization,
-            rbln_overrides=rbln_config.optimum_overrides,
-        )
-        rbln_config.compile_spec = {
-            "model": str(vllm_config.model_config.model),
-            "dtype": vllm_config.model_config.dtype,
-            "model_cls": spec.model_cls.__name__,
-            "rbln_config": deepcopy(spec.rbln_config),
-            "hf_config": vllm_config.model_config.hf_config.to_dict(),
-        }
-
     cached_model_path = os.path.join(
         envs.VLLM_CACHE_ROOT,
         "compiled_models",
@@ -120,12 +93,15 @@ def sync_vllm_and_optimum(vllm_config: VllmConfig) -> None:
     If a compiled model exists, it is the source of truth (optimum→vllm).
     Otherwise stage user overrides for the upcoming compile (vllm→optimum).
     """
+    # 1. Synchronize from existing compiled metadata when available.
     compiled_config = load_compiled_rbln_config(vllm_config)
     if compiled_config is not None:
         sync_from_optimum(vllm_config, compiled_config)
         return
 
-    compile_params = sync_from_vllm(vllm_config)
-    cached_config = _resolve_cached_rbln_config(vllm_config, compile_params)
+    # 2. Resolve the compile spec and synchronize runtime settings from it.
+    sync_from_vllm(vllm_config)
+    # 3. Look up the finalized spec's cache and synchronize from its metadata.
+    cached_config = _resolve_cached_rbln_config(vllm_config)
     if cached_config is not None:
         sync_from_optimum(vllm_config, cached_config)
