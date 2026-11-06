@@ -38,6 +38,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
 )
 from vllm.distributed.parallel_state import get_pp_group
 
+import vllm_rbln.envs as envs
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_worker import (
     RblnNixlWorkerBase,
 )
@@ -46,6 +47,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import
     RblnNixlConnectorMetadata,
 )
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.worker.utils import abort_worker
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -100,7 +102,8 @@ class OfferedBlocks(tuple):
     #: live record carries is one the writer must not send.
     serial: int
     #: Completes when the forwards that wrote these blocks do. The writer waits
-    #: on it before reading them, so the engine thread never has to.
+    #: on it before reading them, so the engine thread never has to. None on a
+    #: handover: `request_finished` runs after the request's last forward.
     done: "torch.rbln.Event | None"
 
     def __new__(
@@ -110,7 +113,7 @@ class OfferedBlocks(tuple):
         serial: int,
         *,
         handover: bool = False,
-        done: "torch.rbln.Event | None" = None,
+        done: "torch.rbln.Event | None",
     ) -> "OfferedBlocks":
         if groups and not isinstance(groups[0], (list, tuple)):
             # Upstream rebuilds a flat list as a plain tuple of one group
@@ -171,7 +174,7 @@ class _StreamedSend:
     and `failed` cross between the two, and every access to those is under
     `_sending_transfers_lock`. `total` crosses unlocked, every write of it
     being the same value; `serial` never changes once the record is built. The
-    three `pending_offer` fields and `released_done` are the engine thread's.
+    three `pending_offer` fields are the engine thread's.
     """
 
     # Blocks this rank has closed, held for the next step to hand over. None
@@ -186,9 +189,6 @@ class _StreamedSend:
     # Whether the writer has been told about this request at all. Not derivable
     # from `pending_offer`: an aborted offer clears that without ever releasing.
     released: bool = False
-    # The event of the last offer handed to the writer. The handover carries it,
-    # because a parked handover replaces that offer and would drop its wait.
-    released_done: "torch.rbln.Event | None" = None
     # Blocks the request will hold once its whole prompt is computed, which is
     # what places the consumer's window inside our list.
     total: int | None = None
@@ -368,7 +368,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                 # Marked on the list because that is what survives the fold,
                 # riding through the parking to the batch that carries it.
                 metadata.push_finished_blocks[req_id] = OfferedBlocks(
-                    blocks, 0, send.serial, handover=True, done=send.released_done
+                    blocks, 0, send.serial, handover=True, done=None
                 )
 
     def start_early_push(self, metadata: "RblnNixlConnectorMetadata") -> None:
@@ -379,10 +379,12 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         reads it to write straight out of device memory. The two never run on
         the same request because the shape refuses host staging.
 
-        Held rather than handed over, because the forward that produced the KV
-        completes asynchronously: a write issued from here would read KV still
-        being written, silently -- the transfer reports no error. The event
-        recorded here rides the offer, and the writer waits on it before reading.
+        Held until the next step's `release_early_offers`, which hands every
+        held offer to the writer at the connector's flush site, ahead of that
+        step's handover. The event recorded here rides the offer, and the writer
+        waits on it before reading: the forward that produced the KV completes
+        asynchronously, and a write issued before it would read KV still being
+        written, silently -- the transfer reports no error.
 
         Called from `wait_for_save` rather than the completion hook so the copy
         for the step is already done: speculative decoding on the last stage
@@ -441,7 +443,6 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                 send.released = True
         for req_id, send, block_ids in offers:
             assert block_ids.done is not None
-            send.released_done = block_ids.done
             send.pending_offer = None
             send.pending_offer_tokens = 0
             send.pending_offer_done = None
@@ -669,7 +670,36 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         # nothing reaches.
         self._pending_d_registrations.pop(registration_data["request_id"], None)
         self._pending_d_registrations[request_id] = registration_data
+        self._wait_for_offer(local_block_ids)
         return super()._do_start_push_kv(request_id, local_block_ids, registration_data)
+
+    def _wait_for_offer(self, local_block_ids: BlockIds) -> None:
+        """Wait for the forwards that wrote an offer's blocks, on the writer.
+
+        Ahead of upstream's submission timer, which would report a forward still
+        running as a slow NIXL submission, and of the serial guard in
+        `_xfer_blocks_for_req`, so a request dropped during the wait is refused.
+
+        A failed wait means the device stream is broken. Upstream's writer loop
+        logs what it catches and carries on, which would drop this list and,
+        on the PUSH_REG route, the rest of that notification batch, so the
+        failure ends the worker as `worker_fail_fast` does.
+        """
+        done = getattr(local_block_ids, "done", None)
+        if done is None:
+            return
+        try:
+            done.synchronize()
+        except Exception as exc:
+            if envs.VLLM_RBLN_DISABLE_WORKER_FAIL_FAST:
+                raise
+            parallel_config = self.vllm_config.parallel_config
+            abort_worker(
+                exc,
+                where=f"{type(self).__qualname__}._wait_for_offer",
+                rank=parallel_config.rank,
+                dp_rank=parallel_config.data_parallel_rank,
+            )
 
     def _pop_matching_registration(self, request_id: str) -> dict[str, Any] | None:
         """Find the consumer's registration without consuming it.
@@ -811,11 +841,6 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         in one go.
         """
         assert meta.remote is not None and self.transfer_topo is not None
-        # Before the guard below, so a request dropped while this waits is
-        # still refused.
-        done = getattr(meta.local_block_ids, "done", None)
-        if done is not None:
-            done.synchronize()
         with self._sending_transfers_lock:
             send = self._streamed.get(req_id)
             serial = getattr(meta.local_block_ids, "serial", None)

@@ -426,7 +426,7 @@ class TestPerShardWrite:
         # The request spans two blocks; the offer carries only the first.
         worker._streamed["r0"] = pw._StreamedSend(released=True, serial=1, total=2)
         meta = self._meta(([1],), ([3, 4],))
-        meta.local_block_ids = pw.OfferedBlocks(([1],), 16, 1)
+        meta.local_block_ids = pw.OfferedBlocks(([1],), 16, 1, done=None)
 
         worker._xfer_blocks_for_req("r0", meta)
 
@@ -442,9 +442,11 @@ class TestPerShardWrite:
         worker._valid_tokens = {}
         worker._streamed["r0"] = pw._StreamedSend(released=True, serial=1, total=2)
         streamed = self._meta(([1],), ([3, 4],))
-        streamed.local_block_ids = pw.OfferedBlocks(([1],), 16 + 1, 1)
+        streamed.local_block_ids = pw.OfferedBlocks(([1],), 16 + 1, 1, done=None)
         handover = self._meta(([1, 2],), ([3, 4],))
-        handover.local_block_ids = pw.OfferedBlocks(([1, 2],), 0, 1, handover=True)
+        handover.local_block_ids = pw.OfferedBlocks(
+            ([1, 2],), 0, 1, handover=True, done=None
+        )
 
         worker._xfer_blocks_for_req("r0", streamed)
         worker._xfer_blocks_for_req("r0", handover)
@@ -1241,6 +1243,139 @@ class TestTheCompletionHookUpstreamActuallyCalls:
         assert "r-sealed" in results.finished_sending
 
 
+class TestTheWriterWaitsForTheOffer:
+    """The forward behind an offer is awaited in `_do_start_push_kv`, which every
+    upstream route to a write runs through, on both of this side's routes."""
+
+    @staticmethod
+    def _engine_handle():
+        worker = TestStreamedEngineHandleWrite._worker()
+        meta = TestStreamedEngineHandleWrite._offer(
+            worker, ([0, 1, 2, 3], [7]), ([4, 5], [6]), 16
+        )
+        return worker, meta
+
+    @staticmethod
+    def _per_shard():
+        worker = TestPerShardWrite._trimming_worker()
+        set_shape(worker, streams_prefix=True)
+        worker._streamed["r0"] = pw._StreamedSend(released=True, serial=1, total=2)
+        meta = TestPerShardWrite._meta(([1],), ([3, 4],))
+        meta.local_block_ids = pw.OfferedBlocks(([1],), 16, 1, done=None)
+        return worker, meta
+
+    @pytest.fixture(params=["per_shard", "engine_handle"])
+    def route(self, request):
+        worker, meta = getattr(self, f"_{request.param}")()
+        worker._pending_d_registrations = {}
+        return worker, meta
+
+    @staticmethod
+    def _with_work(meta, on_wait):
+        blocks = meta.local_block_ids
+        meta.local_block_ids = pw.OfferedBlocks(
+            blocks,
+            blocks.offered_tokens,
+            blocks.serial,
+            done=SimpleNamespace(synchronize=on_wait),
+        )
+        return meta
+
+    @staticmethod
+    def _start(worker, meta, submit=None):
+        """Our override over upstream's, reduced to the write it submits."""
+
+        def upstream(self, request_id, local_block_ids, registration_data):
+            if submit is not None:
+                submit()
+            self._xfer_blocks_for_req(request_id, meta)
+
+        with patch.object(NixlPushConnectorWorker, "_do_start_push_kv", upstream):
+            worker._do_start_push_kv("r0", meta.local_block_ids, {"request_id": "r0"})
+
+    def test_the_writer_waits_for_the_offer_s_work_before_its_guard(self, route):
+        # Nothing else waits on the forward before the writer reads, so this
+        # wait is what stands between a block still being written and a
+        # silent bad write.
+        worker, meta = route
+        order = []
+        lock = worker._sending_transfers_lock
+
+        class Recording:
+            def __enter__(self):
+                order.append("guard")
+                return lock.__enter__()
+
+            def __exit__(self, *exc):
+                return lock.__exit__(*exc)
+
+        worker._sending_transfers_lock = Recording()
+
+        self._start(worker, self._with_work(meta, lambda: order.append("wait")))
+
+        assert order[:2] == ["wait", "guard"]
+        assert worker.nixl_wrapper.make_prepped_xfer.called
+
+    def test_the_wait_is_outside_upstream_s_submission_timer(self, route):
+        # Upstream times the submission and warns past 200 ms, so a forward
+        # still running would read as a slow NIXL submission.
+        worker, meta = route
+        order = []
+
+        self._start(
+            worker,
+            self._with_work(meta, lambda: order.append("wait")),
+            submit=lambda: order.append("submit"),
+        )
+
+        assert order == ["wait", "submit"]
+
+    def test_a_request_dropped_during_the_wait_is_refused(self, route):
+        # A preemption can drop the record while the writer waits; its blocks
+        # then hold the re-prefill, so nothing may leave for the old list.
+        worker, meta = route
+
+        self._start(worker, self._with_work(meta, lambda: worker._streamed.pop("r0")))
+
+        assert not worker.nixl_wrapper.make_prepped_xfer.called
+
+    def test_a_failed_wait_ends_the_worker(self, route, monkeypatch):
+        # Upstream's writer loop would log it and carry on without this list.
+        worker, meta = route
+        aborted = []
+
+        def abort(exc, **kw):
+            aborted.append((exc, kw["where"]))
+            raise SystemExit(1)
+
+        setattr_in_package(monkeypatch, abort_worker=abort)
+        monkeypatch.delenv("VLLM_RBLN_DISABLE_WORKER_FAIL_FAST", raising=False)
+        boom = RuntimeError("device stream lost")
+
+        def fail():
+            raise boom
+
+        with pytest.raises(SystemExit):
+            self._start(worker, self._with_work(meta, fail))
+
+        assert aborted == [(boom, "RblnNixlPushConnectorWorker._wait_for_offer")]
+        assert not worker.nixl_wrapper.make_prepped_xfer.called
+
+    def test_a_failed_wait_raises_where_fail_fast_is_off(self, route, monkeypatch):
+        worker, meta = route
+        abort = MagicMock()
+        setattr_in_package(monkeypatch, abort_worker=abort)
+        monkeypatch.setenv("VLLM_RBLN_DISABLE_WORKER_FAIL_FAST", "1")
+
+        def fail():
+            raise RuntimeError("device stream lost")
+
+        with pytest.raises(RuntimeError, match="device stream lost"):
+            self._start(worker, self._with_work(meta, fail))
+
+        abort.assert_not_called()
+
+
 class TestFailedTransferFollowsTheWidenedContract:
     """0.30 widened `_handle_failed_transfer` and gave it an answer.
 
@@ -1297,7 +1432,10 @@ class TestStreamedEngineHandleWrite:
         """An offer built for `worker`'s record, so the write is not refused."""
         meta = TestPerShardWrite._meta(local_groups, remote_groups)
         meta.local_block_ids = pw.OfferedBlocks(
-            local_groups, tokens, worker._streamed["r0"].serial
+            local_groups,
+            tokens,
+            worker._streamed["r0"].serial,
+            done=None,
         )
         return meta
 
@@ -1305,49 +1443,6 @@ class TestStreamedEngineHandleWrite:
     def _descs(worker):
         call = worker.nixl_wrapper.make_prepped_xfer.call_args
         return list(call.args[2]), call.kwargs["notif_msg"]
-
-    def _offer_with_work(self, worker, on_wait):
-        meta = self._offer(worker, ([0, 1, 2, 3], [7]), ([4, 5], [6]), 16)
-        meta.local_block_ids = pw.OfferedBlocks(
-            meta.local_block_ids,
-            16,
-            worker._streamed["r0"].serial,
-            done=SimpleNamespace(synchronize=on_wait),
-        )
-        return meta
-
-    def test_the_writer_waits_for_the_offer_s_work_before_its_guard(self):
-        # The engine thread no longer waits, so this wait is the only thing
-        # between a block the forward is still writing and a silent bad write.
-        order = []
-        worker = self._worker()
-        lock = worker._sending_transfers_lock
-
-        class Recording:
-            def __enter__(self):
-                order.append("guard")
-                return lock.__enter__()
-
-            def __exit__(self, *exc):
-                return lock.__exit__(*exc)
-
-        worker._sending_transfers_lock = Recording()
-        meta = self._offer_with_work(worker, lambda: order.append("wait"))
-
-        worker._xfer_blocks_for_req("r0", meta)
-
-        assert order[:2] == ["wait", "guard"]
-        assert worker.nixl_wrapper.make_prepped_xfer.called
-
-    def test_a_request_dropped_during_the_wait_is_refused(self):
-        # A preemption can drop the record while the writer waits; its blocks
-        # then hold the re-prefill, so nothing may leave for the old list.
-        worker = self._worker()
-        meta = self._offer_with_work(worker, lambda: worker._streamed.pop("r0"))
-
-        worker._xfer_blocks_for_req("r0", meta)
-
-        assert not worker.nixl_wrapper.make_prepped_xfer.called
 
     def test_a_write_with_no_range_carries_the_bare_notification(self):
         # A request written in one transfer has no range to name, and the
@@ -1383,7 +1478,11 @@ class TestStreamedEngineHandleWrite:
         assert worker._own_engine_layout
         meta = self._offer(worker, ([0, 1, 2, 3], [7]), ([4, 5], [6]), 0)
         meta.local_block_ids = pw.OfferedBlocks(
-            ([0, 1, 2, 3], [7]), 0, worker._streamed["r0"].serial, handover=True
+            ([0, 1, 2, 3], [7]),
+            0,
+            worker._streamed["r0"].serial,
+            handover=True,
+            done=None,
         )
 
         worker._xfer_blocks_for_req("r0", meta)
@@ -1941,10 +2040,10 @@ class TestEarlySend:
         # and the writer's guard waves it through. Refused at construction,
         # where it is loud. The empty group below is the other side: a sliding
         # window offers `[]` for the group it does not count.
-        pw.OfferedBlocks(([], [4, 5]), 0, 7)
+        pw.OfferedBlocks(([], [4, 5]), 0, 7, done=None)
 
         with pytest.raises(RuntimeError, match="grouped per KV cache group"):
-            pw.OfferedBlocks([1, 2, 3], 0, 7)
+            pw.OfferedBlocks([1, 2, 3], 0, 7, done=None)
 
     def test_a_batch_is_filed_on_the_record_it_was_authorised_against(self):
         # The descriptors are built with the lock down, so a flush can drop the
@@ -2078,24 +2177,6 @@ class TestEarlySend:
         assert order == []
         assert blocks.done is event
         assert worker._streamed["r0"].pending_offer_done is None
-
-    def test_the_handover_carries_the_last_released_offer_s_work(self, monkeypatch):
-        # A parked handover replaces the offer ahead of it, so the offer's wait
-        # has to ride the handover too, or a fold writes blocks still in flight.
-        monkeypatch.setattr(pw.torch.rbln, "Event", lambda: self._recording_event([]))
-        worker = self._worker()
-        worker.start_early_push(self._meta(saves=["r0"]))
-        event = worker._streamed["r0"].pending_offer_done
-        worker.release_early_offers()
-        handover = self._meta(pushes=["r0"])
-        worker._seal_at_handover(handover)
-        for req_id, blocks in handover.push_finished_blocks.items():
-            worker._finished_blocks_inbox.put((req_id, blocks))
-
-        self._writer_matches_the_inbox(worker)
-
-        assert worker._push_finished_blocks["r0"].handover
-        assert worker._push_finished_blocks["r0"].done is event
 
     def test_a_step_that_closes_nothing_still_releases_what_is_held(self):
         # The release cannot wait for another closing chunk: steps that close
@@ -3430,7 +3511,10 @@ class TestStreamWindow:
         worker._shard_chunk_grids = {("eng", 0): None}
         meta = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
         meta.local_block_ids = pw.OfferedBlocks(
-            meta.local_block_ids, 3 * 16 + 8, worker._streamed["r0"].serial
+            meta.local_block_ids,
+            3 * 16 + 8,
+            worker._streamed["r0"].serial,
+            done=None,
         )
 
         worker._xfer_blocks_for_req("r0", meta)
@@ -3447,7 +3531,10 @@ class TestStreamWindow:
         worker._shard_chunk_grids = {("eng", 0): uniform_grid(2, 2, regions=2)}
         meta = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
         meta.local_block_ids = pw.OfferedBlocks(
-            meta.local_block_ids, 3 * 16 + 8, worker._streamed["r0"].serial
+            meta.local_block_ids,
+            3 * 16 + 8,
+            worker._streamed["r0"].serial,
+            done=None,
         )
 
         worker._xfer_blocks_for_req("r0", meta)
@@ -3473,7 +3560,10 @@ class TestStreamWindow:
         worker._shard_chunk_grids = {("eng", 0): uniform_grid(1, 2, regions=2, spans=2)}
         meta = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
         meta.local_block_ids = pw.OfferedBlocks(
-            meta.local_block_ids, 3 * 16 + 8, worker._streamed["r0"].serial
+            meta.local_block_ids,
+            3 * 16 + 8,
+            worker._streamed["r0"].serial,
+            done=None,
         )
 
         worker._xfer_blocks_for_req("r0", meta)
@@ -3495,7 +3585,10 @@ class TestStreamWindow:
         worker._shard_chunk_grids = {("eng", 0): uniform_grid(1, 2, regions=2, spans=2)}
         meta = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
         meta.local_block_ids = pw.OfferedBlocks(
-            meta.local_block_ids, 3 * 16 + 12, worker._streamed["r0"].serial
+            meta.local_block_ids,
+            3 * 16 + 12,
+            worker._streamed["r0"].serial,
+            done=None,
         )
 
         worker._xfer_blocks_for_req("r0", meta)
@@ -3516,13 +3609,19 @@ class TestStreamWindow:
 
         first = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
         first.local_block_ids = pw.OfferedBlocks(
-            first.local_block_ids, 3 * 16 + 8, worker._streamed["r0"].serial
+            first.local_block_ids,
+            3 * 16 + 8,
+            worker._streamed["r0"].serial,
+            done=None,
         )
         worker._xfer_blocks_for_req("r0", first)
 
         second = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
         second.local_block_ids = pw.OfferedBlocks(
-            second.local_block_ids, 4 * 16, worker._streamed["r0"].serial
+            second.local_block_ids,
+            4 * 16,
+            worker._streamed["r0"].serial,
+            done=None,
         )
         worker._xfer_blocks_for_req("r0", second)
 
@@ -3547,13 +3646,19 @@ class TestStreamWindow:
 
         first = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
         first.local_block_ids = pw.OfferedBlocks(
-            first.local_block_ids, 3 * 16 + 8, worker._streamed["r0"].serial
+            first.local_block_ids,
+            3 * 16 + 8,
+            worker._streamed["r0"].serial,
+            done=None,
         )
         worker._xfer_blocks_for_req("r0", first)
 
         second = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
         second.local_block_ids = pw.OfferedBlocks(
-            second.local_block_ids, 4 * 16, worker._streamed["r0"].serial
+            second.local_block_ids,
+            4 * 16,
+            worker._streamed["r0"].serial,
+            done=None,
         )
         worker._xfer_blocks_for_req("r0", second)
 
@@ -3573,13 +3678,19 @@ class TestStreamWindow:
 
         first = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
         first.local_block_ids = pw.OfferedBlocks(
-            first.local_block_ids, 3 * 16 + 8, worker._streamed["r0"].serial
+            first.local_block_ids,
+            3 * 16 + 8,
+            worker._streamed["r0"].serial,
+            done=None,
         )
         worker._xfer_blocks_for_req("r0", first)
 
         second = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
         second.local_block_ids = pw.OfferedBlocks(
-            second.local_block_ids, 0, worker._streamed["r0"].serial
+            second.local_block_ids,
+            0,
+            worker._streamed["r0"].serial,
+            done=None,
         )
         worker._xfer_blocks_for_req("r0", second)
 
@@ -3599,13 +3710,19 @@ class TestStreamWindow:
 
         first = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
         first.local_block_ids = pw.OfferedBlocks(
-            first.local_block_ids, 3 * 16 + 8, worker._streamed["r0"].serial
+            first.local_block_ids,
+            3 * 16 + 8,
+            worker._streamed["r0"].serial,
+            done=None,
         )
         worker._xfer_blocks_for_req("r0", first)
 
         second = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
         second.local_block_ids = pw.OfferedBlocks(
-            second.local_block_ids, 4 * 16, worker._streamed["r0"].serial
+            second.local_block_ids,
+            4 * 16,
+            worker._streamed["r0"].serial,
+            done=None,
         )
         worker._xfer_blocks_for_req("r0", second)
 
@@ -3642,7 +3759,10 @@ class TestStreamWindow:
         worker._shard_chunk_grids = {("eng", 0): uniform_grid(heads, gpb, regions=2)}
         meta = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5, 6, 7],))
         meta.local_block_ids = pw.OfferedBlocks(
-            meta.local_block_ids, 49, worker._streamed["r0"].serial
+            meta.local_block_ids,
+            49,
+            worker._streamed["r0"].serial,
+            done=None,
         )
 
         worker._xfer_blocks_for_req("r0", meta)
@@ -3716,6 +3836,7 @@ class TestStreamWindow:
                 tokens,
                 worker._streamed["r0"].serial,
                 handover=handover,
+                done=None,
             )
             worker.nixl_wrapper.make_prepped_xfer.reset_mock()
             worker._xfer_blocks_for_req("r0", meta)
@@ -3781,7 +3902,10 @@ class TestStreamWindow:
         }
         meta = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
         meta.local_block_ids = pw.OfferedBlocks(
-            meta.local_block_ids, 3 * 16 + 8, worker._streamed["r0"].serial
+            meta.local_block_ids,
+            3 * 16 + 8,
+            worker._streamed["r0"].serial,
+            done=None,
         )
 
         worker._xfer_blocks_for_req("r0", meta)
@@ -3881,7 +4005,11 @@ class TestStreamWindow:
 
         meta = TestPerShardWrite._meta(([0, 1, 2],), ([4, 5],))
         meta.local_block_ids = pw.OfferedBlocks(
-            meta.local_block_ids, 0, worker._streamed["r0"].serial, handover=True
+            meta.local_block_ids,
+            0,
+            worker._streamed["r0"].serial,
+            handover=True,
+            done=None,
         )
         worker._xfer_blocks_for_req("r0", meta)
 
