@@ -646,6 +646,8 @@ class TestMmEncoder:
         }[model_name]
         model = cls.__new__(cls)
         torch.nn.Module.__init__(model)
+        if model_name == "minimax":
+            model.mm_embeds_dtype = torch.bfloat16
         vision_model = types.SimpleNamespace(vision_segment_max_frames=None)
         setattr(
             model,
@@ -670,6 +672,12 @@ class TestMmEncoder:
                 clock.advance(30 * MS)
                 return self.pixels.clone()
 
+            def to(self, *, device, dtype):
+                assert device == "cpu"
+                events.append("to")
+                clock.advance(35 * MS)
+                return self.pixels.to(dtype=dtype)
+
         def encoder(pixels):
             events.append("encoder")
             clock.advance(1 * MS)
@@ -685,12 +693,15 @@ class TestMmEncoder:
         )
         ctx.end_pass()
 
-        assert events == ["encoder", "slice", "cpu"] * 2
-        torch.testing.assert_close(outputs[0], pixels[:1])
-        torch.testing.assert_close(outputs[1], pixels[1:])
+        handoff = "to" if model_name == "minimax" else "cpu"
+        dtype = torch.bfloat16 if model_name == "minimax" else pixels.dtype
+        latency = (36 if model_name == "minimax" else 31) * MS
+        assert events == ["encoder", "slice", handoff] * 2
+        torch.testing.assert_close(outputs[0], pixels[:1].to(dtype))
+        torch.testing.assert_close(outputs[1], pixels[1:].to(dtype))
         assert {shape: m.latencies for shape, m in ctx._encoder.items()} == {
-            "1x3": [pytest.approx(31 * MS)],
-            "2x3": [pytest.approx(31 * MS)],
+            "1x3": [pytest.approx(latency)],
+            "2x3": [pytest.approx(latency)],
         }
 
     def test_encoder_time_is_in_e2e_and_separate_from_model_time(

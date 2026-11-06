@@ -113,12 +113,12 @@ def load_model(self, *args, **kwargs):
 
 
 @functools.wraps(_run_mm_encoder)
-def run_mm_encoder(encoder, inputs, num_embeddings):
+def run_mm_encoder(encoder, inputs, num_embeddings, *, dtype=None):
     ctx = _ACTIVE_CTX
     if ctx is None or not ctx.in_pass:
-        return _run_mm_encoder(encoder, inputs, num_embeddings)
+        return _run_mm_encoder(encoder, inputs, num_embeddings, dtype=dtype)
     start = time.perf_counter()
-    output = _run_mm_encoder(encoder, inputs, num_embeddings)
+    output = _run_mm_encoder(encoder, inputs, num_embeddings, dtype=dtype)
     latency = time.perf_counter() - start
     # The existing CPU copy completes the graph and transfer without a new barrier.
     shape = "x".join(map(str, inputs[0].shape))

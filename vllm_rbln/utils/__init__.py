@@ -22,8 +22,13 @@ def run_mm_encoder(
     encoder: Callable[..., torch.Tensor],
     inputs: list[torch.Tensor],
     num_embeddings: int,
+    *,
+    dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    return encoder(*inputs)[:num_embeddings].cpu()
+    embeds = encoder(*inputs)[:num_embeddings]
+    if dtype is None:
+        return embeds.cpu()
+    return embeds.to(device="cpu", dtype=dtype)
 
 
 def pad(
