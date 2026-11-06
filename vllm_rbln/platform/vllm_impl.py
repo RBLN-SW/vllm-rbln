@@ -75,6 +75,26 @@ def _validate(vllm_config: "VllmConfig") -> None:
     if vllm_config.lora_config is not None:
         raise ValueError("LoRA is not supported on RBLN.")
 
+    if rbln_config.use_swa_ring:
+        from vllm.platforms import current_platform
+
+        cache_config = vllm_config.cache_config
+        if (
+            not current_platform.is_cr13()
+            or vllm_config.kv_transfer_config
+            or vllm_config.speculative_config
+            # Without caching, nothing tells the manager where prefill ends.
+            or (
+                not cache_config.enable_prefix_caching
+                and cache_config.prefix_cache_retention_interval != 0
+            )
+        ):
+            raise NotImplementedError(
+                "use_swa_ring needs REBEL CR13, and supports neither KV "
+                "connectors, speculative decoding, nor "
+                "prefix_cache_retention_interval without prefix caching."
+            )
+
     if model_config.uses_mrope:
         # The RBLN RoPE override covers `RotaryEmbedding` and takes
         # `[batch, seq]` positions; `MRotaryEmbedding` is a sibling class with

@@ -387,6 +387,8 @@ class RblnPlatform(Platform):
         from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
         from vllm_rbln.v1.kv_cache import (
+            RBLNRingSlidingWindowManager,
+            RBLNRingSlidingWindowSpec,
             RBLNSlidingWindowManager,
             RBLNSlidingWindowSpec,
         )
@@ -395,6 +397,11 @@ class RblnPlatform(Platform):
             RBLNSlidingWindowSpec,
             RBLNSlidingWindowManager,
             uniform_type_base_spec=RBLNSlidingWindowSpec,
+        )
+        KVCacheSpecRegistry.register(
+            RBLNRingSlidingWindowSpec,
+            RBLNRingSlidingWindowManager,
+            uniform_type_base_spec=RBLNRingSlidingWindowSpec,
         )
 
     @classmethod

@@ -328,3 +328,84 @@ class TestCoordinatorCallsTheOverrides:
         coord.allocate_new_blocks("r", num_tokens=1024, num_tokens_main_model=1024)
         coord.remove_skipped_blocks("r", 512, 1024)
         assert len(coord.single_type_managers[0].req_to_blocks["r"]) == 1
+
+
+class TestRBLNRingSlidingWindowManager:
+    def _manager(self, num_blocks):
+        from vllm.v1.core.single_type_kv_cache_manager import (
+            register_all_kvcache_specs,
+        )
+
+        from vllm_rbln.platform import RblnPlatform
+        from vllm_rbln.v1.kv_cache import RBLNRingSlidingWindowSpec
+
+        register_all_kvcache_specs(None)
+        RblnPlatform.register_custom_kv_cache_specs(None)
+        spec = RBLNRingSlidingWindowSpec(
+            block_size=16,
+            num_kv_heads=2,
+            head_size=8,
+            dtype=torch.float16,
+            sliding_window=16,
+        )
+        manager_cls = KVCacheSpecRegistry.get_manager_class(spec)
+        pool = BlockPool(
+            num_gpu_blocks=num_blocks, enable_caching=True, hash_block_size=16
+        )
+        return manager_cls(
+            spec,
+            block_pool=pool,
+            enable_caching=True,
+            kv_cache_group_id=0,
+            scheduler_block_size=16,
+        )
+
+    def _step(self, m, num_computed, num_new, prefill_end):
+        # allocate_slots' order: free what left the window, count, allocate.
+        m.remove_skipped_blocks("r", num_computed)
+        n = num_computed + num_new
+        need = m.get_num_blocks_to_allocate(
+            "r", n, [], num_computed, num_computed, n, prefill_end=prefill_end
+        )
+        return need, m.allocate_new_blocks("r", n, n)
+
+    def test_a_decode_step_recycles_only_at_the_reserve(self):
+        # A streaming session ("r" in no_recycle_ids) never recycles.
+        for reserve, no_recycle, num_new_blocks in (
+            (1, set(), 1),
+            (2, set(), 0),
+            (2, {"r"}, 1),
+        ):
+            m = self._manager(num_blocks=4)
+            m.free_block_reserve = reserve
+            m.no_recycle_ids = no_recycle
+            self._step(m, 0, 16, prefill_end=16)
+            assert self._step(m, 16, 1, prefill_end=16)[0] == num_new_blocks
+
+    def test_only_an_unshared_block_is_recycled_on_decode(self):
+        m = self._manager(num_blocks=3)
+        m.free_block_reserve = 1
+        self._step(m, 0, 16, prefill_end=17)
+        # A one-token prefill chunk.
+        assert self._step(m, 16, 1, prefill_end=17)[0] == 1
+        second = m.req_to_blocks["r"][1]
+        for pos in range(17, 32):
+            self._step(m, pos, 1, prefill_end=pos)
+        m.block_pool.touch([second])
+        assert self._step(m, 32, 1, prefill_end=32)[0] == 1
+        m.block_pool.free_blocks([second])
+        third = m.req_to_blocks["r"][2]
+        for pos in range(33, 48):
+            self._step(m, pos, 1, prefill_end=pos)
+        assert self._step(m, 48, 1, prefill_end=48) == (0, [third])
+
+    def test_the_column_a_recycled_block_leaves_is_never_cached(self):
+        # cache_blocks runs after allocation.
+        from tests.vllm.v1.core.utils import make_request
+
+        m = self._manager(num_blocks=2)
+        self._step(m, 0, 16, prefill_end=16)
+        block = m.req_to_blocks["r"][0]
+        self._step(m, 16, 1, prefill_end=16)
+        m.cache_blocks(make_request("r", list(range(17)), 16), 17, replay_boundaries=[])
+        assert block.block_hash is None

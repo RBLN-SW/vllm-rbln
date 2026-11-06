@@ -52,6 +52,7 @@ from vllm_rbln.v1.core.utils import (
     should_defer_spec_step,
     sub_block_size_in_use,
 )
+from vllm_rbln.v1.kv_cache import RBLNRingSlidingWindowManager
 
 logger = init_logger(__name__)
 
@@ -116,6 +117,16 @@ class RBLNScheduler(Scheduler):
                     "sub_block_size=%d.",
                     sub_block_size,
                 )
+
+        managers = self.kv_cache_manager.coordinator.single_type_managers
+        self._ring_managers = [
+            m for m in managers if isinstance(m, RBLNRingSlidingWindowManager)
+        ]
+        # A streaming session prefills again into the blocks it decoded into,
+        # which a recycled block cannot take, so its blocks are never recycled.
+        self._streaming_req_ids: set[str] = set()
+        for manager in self._ring_managers:
+            manager.no_recycle_ids = self._streaming_req_ids
 
         # NOTE(RBLN): Block deltas already committed in the KV cache manager
         # but not yet delivered to the model runner because the request was
@@ -241,6 +252,20 @@ class RBLNScheduler(Scheduler):
         # num_tokens_with_spec. This is general enough to cover
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
+
+        # A waiting request means memory is short: recycle at any pool level.
+        # Otherwise, a request taking a fresh block per group must still leave
+        # one per non-ring group for every other running decode.
+        if self._ring_managers:
+            num_groups = len(self.kv_cache_config.kv_cache_groups)
+            reserve = (
+                self.kv_cache_config.num_blocks
+                if self.waiting or self.kv_holding_waiting
+                else num_groups
+                + (num_groups - len(self._ring_managers)) * len(self.running)
+            )
+            for manager in self._ring_managers:
+                manager.free_block_reserve = reserve
 
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
@@ -1162,12 +1187,18 @@ class RBLNScheduler(Scheduler):
         data.all_token_ids.clear()
         return data
 
+    def add_request(self, request: Request) -> None:
+        super().add_request(request)
+        if request.resumable:
+            self._streaming_req_ids.add(request.request_id)
+
     def _free_request(
         self, request: Request, delay_free_blocks: bool = False
     ) -> dict[str, Any] | None:
         # Drop any pending runner block delta; the request is finishing and will
         # never be scheduled again.
         self._pending_runner_block_deltas.pop(request.request_id, None)
+        self._streaming_req_ids.discard(request.request_id)
         return super()._free_request(request, delay_free_blocks)
 
     def update_from_output(
