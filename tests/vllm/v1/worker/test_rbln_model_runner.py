@@ -648,6 +648,7 @@ class TestEcConsumer:
             model_config=SimpleNamespace(get_hidden_size=lambda: 2),
             encoder_cache={},
             _execute_mm_encoder=lambda so: None,
+            mm_prefix_query_len=None,
         )
         runner._gather_mm_embeddings = lambda so, n: (
             [(0, 0, runner.encoder_cache["h0"])],
@@ -2584,7 +2585,7 @@ class TestExecuteModelStampsMmPrefixSteps:
             cache_config=SimpleNamespace(kv_sharing_fast_prefill=False),
             speculative_config=None,
             is_pooling_model=False,
-            vllm_config=None,
+            vllm_config=SimpleNamespace(is_mm_encoder_only=False),
             model_executable=lambda **kw: ("HIDDEN", "LOGITS", None),
             num_prompt_logprobs=None,
             kv_cache_bases=None,
