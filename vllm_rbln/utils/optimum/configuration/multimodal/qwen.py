@@ -45,3 +45,24 @@ build_qwen3_asr_config = build_qwen2_vl_config
 build_qwen3_vl_config = build_qwen2_vl_config
 build_qwen3_vl_moe_config = build_qwen2_vl_config
 build_qwen3_5_config = build_qwen2_vl_config
+
+
+def build_qwen3_vl_reranker_config(
+    batch_size: int,
+    max_model_len: int,
+    block_size: int,
+    num_devices: int,
+    memory_budget: float,
+    prefill_chunk_size: int | None = None,
+) -> dict:
+    rbln_config = build_qwen3_vl_config(
+        batch_size,
+        max_model_len,
+        block_size,
+        num_devices,
+        memory_budget,
+        prefill_chunk_size,
+    )
+    # score() never decodes, so the decode graphs would only cost memory.
+    rbln_config["phases"] = ["prefill"]
+    return rbln_config

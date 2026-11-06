@@ -75,6 +75,11 @@ _RBLN_MULTIMODAL_MODELS = {
         "qwen3_vl",
         "RBLNQwen3VLForConditionalGeneration",
     ),
+    "Qwen3VLForSequenceClassification": (
+        "qwen3_vl_reranker",
+        "RBLNQwen3VLForConditionalGeneration",
+    ),
+    "Qwen3VLModel": ("qwen3_vl", "RBLNQwen3VLModel"),
     "Qwen3VLMoeForConditionalGeneration": (
         "qwen3_vl_moe",
         "RBLNQwen3VLMoeForConditionalGeneration",

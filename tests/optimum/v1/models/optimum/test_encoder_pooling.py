@@ -43,13 +43,17 @@ from vllm.config import (
     set_current_vllm_config,
 )
 from vllm.model_executor.layers.pooler import DispatchPooler
+from vllm.model_executor.layers.pooler.seqwise import SequencePooler
 
+from vllm_rbln.model_executor.models.optimum.base import ModelInputForRBLN
 from vllm_rbln.model_executor.models.optimum.encoder import (
     RBLNClassifierPooler,
     RBLNOptimumForEncoderModel,
 )
 from vllm_rbln.model_executor.models.optimum.model_base import RBLNOptimumModelBase
-from vllm_rbln.utils.optimum.predicates import is_qwen3_embedding
+from vllm_rbln.model_executor.models.optimum.qwen3_vl import RBLNOptimumQwen3VLModel
+from vllm_rbln.utils.optimum.predicates import is_qwen3_embedding, is_qwen3_reranker
+from vllm_rbln.utils.optimum.registry import get_rbln_model_info, is_multi_modal
 
 # (model id, expected seq_pooling_type, expected pooler) per architecture.
 # Encoder-only models are forced to CLS; the *ForSequenceClassification ones use
@@ -134,3 +138,93 @@ def test_encoder_forward_removes_padded_requests(classification):
 
     expected = hidden_states[:1].squeeze(-1) if classification else hidden_states[0, :3]
     torch.testing.assert_close(output, expected)
+
+
+VL_EMBEDDING_ID = "Qwen/Qwen3-VL-Embedding-2B"
+
+
+def _build_qwen3_vl_embedding():
+    model_config = ModelConfig(
+        model=VL_EMBEDDING_ID,
+        dtype=torch.float32,
+        seed=42,
+        runner="pooling",
+        max_model_len=128,
+    )
+    # Mirror the remap in platform/optimum_impl.check_and_update.
+    assert is_qwen3_embedding(model_config)
+    model_config.hf_config.__dict__["architectures"] = ["Qwen3VLModel"]
+    vllm_config = VllmConfig(
+        model_config=model_config,
+        cache_config=CacheConfig(block_size=16, cache_dtype="auto"),
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=1,
+            max_num_batched_tokens=128,
+            max_model_len=128,
+            is_encoder_decoder=False,
+        ),
+    )
+
+    def fake_init_model(self):
+        self.model = MagicMock()
+        self.model.get_kvcache_num_blocks.return_value = 1
+        self.model.rbln_config = SimpleNamespace(
+            dtype=torch.float32, use_multiple_decoder=False, decoder_batch_sizes=None
+        )
+        self.rbln_model_config = self.model.rbln_config
+        self.attn_impl = None
+
+    with (
+        set_current_vllm_config(vllm_config),
+        patch.object(RBLNOptimumModelBase, "init_model", fake_init_model),
+    ):
+        return RBLNOptimumQwen3VLModel(vllm_config=vllm_config)
+
+
+def test_qwen3_vl_embedding_is_not_a_reranker():
+    """It ships the generation architecture; only the pooling runner tells it
+    apart from the generative model, and the remap target is the backbone."""
+    model_config = ModelConfig(
+        model=VL_EMBEDDING_ID, dtype=torch.float32, seed=42, runner="pooling"
+    )
+    assert is_qwen3_embedding(model_config)
+    assert not is_qwen3_reranker(model_config)
+
+    generate = ModelConfig(
+        model=VL_EMBEDDING_ID, dtype=torch.float32, seed=42, runner="generate"
+    )
+    assert not is_qwen3_embedding(generate)
+
+    hf_config = model_config.hf_config
+    hf_config.__dict__["architectures"] = ["Qwen3VLModel"]
+    assert is_multi_modal(hf_config)
+    assert get_rbln_model_info(hf_config) == ("qwen3_vl", "RBLNQwen3VLModel")
+
+
+def test_qwen3_vl_embedding_pools_the_last_token():
+    model = _build_qwen3_vl_embedding()
+
+    assert model.vllm_config.model_config.pooler_config.seq_pooling_type == "LAST"
+    assert isinstance(model.pooler, SequencePooler)
+    assert model.pooler.get_supported_tasks() == {"embed"}
+    assert model.vllm_config.cache_config.enable_prefix_caching in (False, None)
+
+
+def test_qwen3_vl_embedding_forward_returns_every_position():
+    """The pooling cursor indexes a flat [num_tokens, hidden] tensor."""
+    model = _build_qwen3_vl_embedding()
+    hidden_states = torch.randn(1, 5, 8)
+    model.model.prefill_decoder = MagicMock(
+        return_value=SimpleNamespace(logits=hidden_states)
+    )
+    model_input = ModelInputForRBLN(
+        input_tokens=torch.zeros(1, 5, dtype=torch.long),
+        input_positions=torch.arange(5, dtype=torch.int32).unsqueeze(0),
+        block_tables=torch.zeros(8, dtype=torch.int16),
+        running_requests_ids=["r0"],
+        padded_batch_size=1,
+        batch_rows=slice(0, 1),
+        is_prompt=True,
+    )
+
+    torch.testing.assert_close(model(model_input), hidden_states[0])
