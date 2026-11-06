@@ -343,6 +343,7 @@ def test_only_compile_fields_change_the_hash():
     assert RBLNConfig(use_custom_sampler=False).compute_hash() == base
     assert RBLNConfig(enable_sub_block_cache=False).compute_hash() == base
     assert RBLNConfig(sub_block_size=64).compute_hash() == base
+    assert RBLNConfig(use_swa_ring=True).compute_hash() == base
     # mega_cache keys on the buckets the model resolves from this one.
     encoder_budgets = RBLNConfig(encoder_token_budgets=[256, 576])
     assert encoder_budgets.compute_hash() == base

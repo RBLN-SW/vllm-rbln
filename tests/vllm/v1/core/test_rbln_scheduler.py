@@ -1971,3 +1971,44 @@ class TestSyncKVLoads:
         # Only the 16 tokens past the hit are computed this step.
         assert output.num_scheduled_tokens[request.request_id] == 16
         assert output.has_sync_kv_loads
+
+
+def test_ring_managers_recycle_while_requests_wait_but_never_for_a_stream():
+    import torch
+    from vllm.v1.core.single_type_kv_cache_manager import (
+        register_all_kvcache_specs,
+    )
+
+    from tests.vllm.v1.core.utils import full_attention_spec, make_kv_cache_config
+    from vllm_rbln.platform import RblnPlatform
+    from vllm_rbln.v1.kv_cache import RBLNRingSlidingWindowSpec
+
+    # Built-in registration is lazy and skipped once any spec is present.
+    register_all_kvcache_specs(None)
+    RblnPlatform.register_custom_kv_cache_specs(None)
+    ring = RBLNRingSlidingWindowSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=16,
+    )
+    scheduler = create_rbln_scheduler(
+        num_blocks=64,
+        kv_cache_config=make_kv_cache_config([ring, full_attention_spec(16)], 64),
+    )
+    (manager,) = scheduler._ring_managers
+    stream, plain = create_requests(2)
+    stream.resumable = True
+    scheduler.add_request(stream)
+    scheduler.add_request(plain)
+
+    scheduler.schedule()
+    assert manager.free_block_reserve == 64  # the pool: requests were waiting
+    assert manager.no_recycle_ids == {stream.request_id}
+    scheduler.finish_requests(
+        [stream.request_id, plain.request_id], RequestStatus.FINISHED_ABORTED
+    )
+    scheduler.schedule()
+    assert manager.free_block_reserve == 2  # two KV groups, nothing running
+    assert not manager.no_recycle_ids

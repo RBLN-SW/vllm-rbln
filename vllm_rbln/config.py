@@ -145,6 +145,10 @@ class RBLNConfig(RBLNConfigBase):
     """dtype the compiled graphs run in on the device. Empty keeps the
     compiler's per-target default."""
 
+    use_swa_ring: bool = False
+    """On REBEL CR13, let decode reuse the block a sliding window has just
+    left while requests wait or the KV cache pool runs low."""
+
     def compute_hash(self) -> str:
         """Hash of the fields that change the compiled artifact.
 
@@ -161,6 +165,7 @@ class RBLNConfig(RBLNConfigBase):
             "enable_sub_block_cache",
             "sub_block_size",
             "encoder_token_budgets",
+            "use_swa_ring",
         }
         factors = get_hash_factors(self, ignored_factors)
         # Unset and True build the same graph; only False changes the artifact.
