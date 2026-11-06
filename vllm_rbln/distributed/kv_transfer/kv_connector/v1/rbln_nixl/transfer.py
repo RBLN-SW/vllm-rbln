@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections.abc import Sequence
+from collections import defaultdict
+from collections.abc import Iterable, Sequence
 from contextlib import contextmanager
 
 import numpy as np
@@ -28,6 +29,47 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
     ChunkGrid,
     RblnNixlWorkerState,
 )
+
+
+def trim_producer_to_consumer(
+    producer: BlockIds,
+    consumer: BlockIds,
+    pairs: Iterable[tuple[int, int]],
+    *,
+    consumer_name: str,
+    req_id: str,
+) -> BlockIds:
+    """End-trim each producer list to the consumer list its regions pair with.
+
+    `pairs` holds a (producer group, consumer group) per region. A pipelined
+    producer can split the same layers into more groups, so the lists pair
+    through the regions rather than by position. The consumer holds the
+    uncached suffix of the prompt, so each of its lists is the tail of the
+    producer's; a producer group no region pairs is left whole.
+    """
+    lengths: dict[int, set[int]] = defaultdict(set)
+    for producer_group, consumer_group in pairs:
+        lengths[producer_group].add(len(consumer[consumer_group]))
+    trimmed = list(producer)
+    for group, wanted in sorted(lengths.items()):
+        if len(wanted) != 1:
+            raise RuntimeError(
+                f"RBLN NIXL: producer KV group {group} of request {req_id} pairs "
+                f"with {consumer_name}'s lists of {sorted(wanted)} block(s); one "
+                "list cannot be trimmed to both."
+            )
+        (num_consumer,) = wanted
+        have = len(trimmed[group])
+        if num_consumer > have:
+            raise RuntimeError(
+                f"RBLN NIXL: consumer {consumer_name} registered {num_consumer} "
+                f"block(s) for request {req_id} in group {group}, more than the "
+                f"{have} this producer holds; the peer's advertised length "
+                "crosses the handshake, so the pair is refused rather than "
+                "trimmed to it."
+            )
+        trimmed[group] = list(trimmed[group])[have - num_consumer :]
+    return tuple(trimmed)
 
 
 def _chunk_desc_ids(
@@ -293,6 +335,18 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
                 all_descs.append(chunks_of(group[-1], (0, needed)))
             all_descs += [chunks_of(block_id, span) for block_id, span in pieces]
         return np.concatenate(all_descs) if all_descs else np.empty(0, dtype=int)
+
+    def _region_group_pairs(
+        self, engine_id: str, ranks: Iterable[int], *, producer_is_peer: bool
+    ) -> list[tuple[int, int]]:
+        """(producer group, consumer group) of every region shared with
+        `engine_id` over `ranks`, as the descriptors pair them."""
+        pairs: list[tuple[int, int]] = []
+        for rank in ranks:
+            ours = self._shard_region_group_ids[(engine_id, rank)]
+            peers = self._shard_peer_region_group_ids[(engine_id, rank)]
+            pairs += zip(peers, ours) if producer_is_peer else zip(ours, peers)
+        return pairs
 
     def _get_block_descs_ids_for_shard(
         self,

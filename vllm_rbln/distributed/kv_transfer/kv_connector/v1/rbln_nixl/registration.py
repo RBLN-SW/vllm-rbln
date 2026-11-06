@@ -430,12 +430,9 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         # Transfer region `logical * areas + area` is one area of one logical
         # region, which needs every entry over the same number of areas.
         area_counts = {len(geometry.areas) for geometry in geometries}
-        if len(area_counts) != 1:
-            raise RuntimeError(
-                "RBLN NIXL (D2D): KV entries are laid over different chiplet "
-                f"area counts {sorted(area_counts)}; a transfer region is "
-                "numbered by one."
-            )
+        # An entry sits on one area or RSD_SHARDS, and one beside wider ones
+        # was named as replicas above.
+        assert len(area_counts) == 1, area_counts
         (areas,) = area_counts
         self._kv_areas = areas
 
@@ -775,7 +772,7 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         )
         # A transfer region is numbered `logical * areas + area`, so an entry the
         # compiler left on one area (GLM-5.3 on a PP stage) is named as replicas
-        # of its one slice; its writes repeat into the same bytes.
+        # of its one slice: every transfer of it moves the slice `widest` times.
         widest = max((len(placed) for _, _, placed in cuts.values()), default=1)
         for base_addr, (axis, slices, placed) in cuts.items():
             if len(placed) == 1 < widest:

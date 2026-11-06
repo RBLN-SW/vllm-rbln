@@ -1167,7 +1167,13 @@ class TestRegisterKvCachesImpl:
         worker.local_seen_layer_names = list(names)
         worker._group_spec_types = [FullAttentionSpec]
         worker._transfer_layer_region_indices = []
-        worker._register_shard_xfer_state("peer", 0, worker.block_size, names)
+        worker._register_shard_xfer_state(
+            "peer",
+            0,
+            worker.block_size,
+            names,
+            peer_region_group_ids=[0] * worker.num_regions,
+        )
         local = worker.nixl_wrapper.get_xfer_descs.call_args.args[0]
         # The peer is what this engine publishes, at other addresses and with
         # more blocks.
@@ -1588,6 +1594,14 @@ class TestTheAxisFollowsTheShardRule:
             assert geometry.slices == 1
             assert len(geometry.areas) == 4
             assert {a.slice_id for a in geometry.areas} == {0}
+
+    def test_an_entry_on_two_areas_beside_a_cut_one_is_refused(self, monkeypatch):
+        # Only a one-area entry is named as replicas; one on two areas is
+        # refused before any area count is compared.
+        buffers = _impl_buffers(per_entry={0x10000: (4, 4), 0x20000: (2, 2)})
+
+        with pytest.raises(RuntimeError, match=r"sits on 2 chiplet area\(s\)"):
+            self._run(monkeypatch, heads=2, block_tokens=256, buffers=buffers)
 
 
 class TestTheFramesOverOneStorage:

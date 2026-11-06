@@ -512,6 +512,57 @@ class TestShardReadPath:
         assert w.nixl_wrapper.send_notif.call_count == 2
         assert len(w._recving_transfers["r0"]) == 0
 
+    @classmethod
+    def _pipelined_worker(cls, peer_groups=(0, 2)):
+        # We hold (attention, KDA) groups; the producer splits the same layers
+        # into (attention, KDA, KDA), and region 1, a KDA layer, sits in our
+        # group 1 and its group 2.
+        w = cls._read_worker(pp_size=1)
+        w.kv_cache_config = MagicMock(kv_cache_groups=[0, 1], transfer_groups=[0, 1])
+        w._shard_region_group_ids = {("eng", 0): (0, 1)}
+        w._shard_peer_region_group_ids = {("eng", 0): peer_groups}
+        return w
+
+    def test_a_whole_prompt_read_takes_each_block_from_the_producer_s_group(self):
+        w = self._pipelined_worker()
+
+        TestShardReadPath._read(w, "r0", self._meta(([1, 2], [6]), ([3, 4], [5], [7])))
+
+        call = w.nixl_wrapper.make_prepped_xfer.call_args
+        # Region 1 starts at 1 x num_blocks on both sides: ours at block 6 of
+        # group 1, the producer's at block 7 of group 2.
+        assert list(call.args[2]) == [1, 2, 14]
+        assert list(call.args[4]) == [3, 4, 15]
+
+    def test_a_partial_local_hit_reads_the_producer_s_tail(self):
+        # We had the first block cached, so only the second is read, from the
+        # end of the producer's list; the state blocks pair as before.
+        w = self._pipelined_worker()
+
+        TestShardReadPath._read(w, "r0", self._meta(([4], [6]), ([1, 2], [5], [7])))
+
+        call = w.nixl_wrapper.make_prepped_xfer.call_args
+        assert list(call.args[2]) == [4, 14]
+        assert list(call.args[4]) == [2, 15]
+        assert w._recv_failures == set()
+
+    def test_a_producer_group_paired_with_lists_of_two_lengths_fails_the_request(
+        self,
+    ):
+        # Both of our groups pair with the producer's group 0, and a hit left
+        # them different lengths: no one trim fits both, and only this request
+        # is failed, not the engine.
+        w = self._pipelined_worker(peer_groups=(0, 0))
+        w._log_failure = MagicMock()
+
+        TestShardReadPath._read(w, "r0", self._meta(([4], [6, 7]), ([1, 2], [5], [9])))
+
+        w.nixl_wrapper.make_prepped_xfer.assert_not_called()
+        assert w._recv_failures == {"r0"}
+        assert "one list cannot be trimmed to both" in str(
+            w._log_failure.call_args.kwargs["error"]
+        )
+
     def test_the_read_notification_counts_our_stages(self):
         # The parametrized case below pins this arithmetic; what this pins is
         # the call site asking for the stage factor at all. The other cases

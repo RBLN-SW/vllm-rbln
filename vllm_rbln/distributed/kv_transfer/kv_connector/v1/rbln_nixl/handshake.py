@@ -710,7 +710,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                 self.nixl_wrapper.release_dlist_handle(handle)
         for skey in [k for k in self._shard_region_group_ids if k[0] == engine_id]:
             del self._shard_region_group_ids[skey]
-            self._shard_peer_region_group_ids.pop(skey, None)
+            del self._shard_peer_region_group_ids[skey]
         for skey in [k for k in self._shard_descs_per_block if k[0] == engine_id]:
             del self._shard_descs_per_block[skey]
         for skey in [k for k in self._shard_chunk_grids if k[0] == engine_id]:
@@ -1452,13 +1452,19 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         self._shard_region_group_ids[(engine_id, global_rank)] = tuple(
             self.region_group_ids[i] for i in region_ids
         )
-        self._shard_peer_region_group_ids[(engine_id, global_rank)] = (
-            self._shard_peer_group_ids(
+        if plan is None:
+            if not peer_region_group_ids:
+                raise RuntimeError(
+                    f"RBLN NIXL: peer {engine_id} rank {global_rank} published no "
+                    "KV group per region, so its block ids cannot be paired with "
+                    "ours."
+                )
+            peer_group_ids = self._shard_peer_group_ids(
                 registered_layer_names, peer_region_group_ids, peer_areas
             )
-            if plan is None and peer_region_group_ids
-            else self._shard_region_group_ids[(engine_id, global_rank)]
-        )
+        else:
+            peer_group_ids = self._shard_region_group_ids[(engine_id, global_rank)]
+        self._shard_peer_region_group_ids[(engine_id, global_rank)] = peer_group_ids
         self._shard_descs_per_block[(engine_id, global_rank)] = (
             (1,) * len(region_ids) if pieces is None else tuple(map(len, pieces))
         )
@@ -1542,13 +1548,11 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         layer's group there can differ from ours; its block ids follow its
         numbering.
         """
-        rpl = self._regions_per_layer()
-        wanted = None if peer_areas is None else set(peer_areas)
         return tuple(
-            peer_region_group_ids[peer * rpl + k]
-            for peer, local in self._layer_overlap(registered_layer_names)
-            for k in range(rpl)
-            if wanted is None or (local * rpl + k) % self._kv_areas in wanted
+            peer_region_group_ids[peer]
+            for peer, _ in self._shard_region_pairs(
+                registered_layer_names, peer_areas=peer_areas
+            )
         )
 
     def _trim_agent_meta_to_layers(
@@ -1758,7 +1762,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                         != self.block_len_per_layer[local_region]
                     ):
                         raise RuntimeError(
-                            "RBLN NIXL block payload group or page size differs "
+                            "RBLN NIXL block payload page size differs "
                             f"for {nixl_agent_meta.region_names[peer_region]} "
                             "between P and D."
                         )

@@ -23,6 +23,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_worker import (
     RblnNixlWorkerBase,
 )
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.transfer import (
+    trim_producer_to_consumer,
+)
 from vllm_rbln.logger import init_logger
 
 if TYPE_CHECKING:
@@ -116,15 +119,31 @@ class RblnNixlPullConnectorWorker(RblnNixlWorkerBase, NixlPullConnectorWorker):
         n_prompt_blocks = sum(len(g) for g in remote_block_ids)
 
         if not prefix_hit and len(remote_block_ids) != len(local_block_ids):
-            # A pipelined producer can split the same layers into more groups.
-            # Regions pick their own side's group, so the lists need not pair,
-            # but a prefix trim does: only a whole-prompt read is expressible.
             assert len(local_block_ids) == len(self.kv_cache_config.transfer_groups)
-            assert len(local_block_ids[0]) == len(remote_block_ids[0]), (
-                f"RBLN NIXL: a local prefix hit on {req_id} against a producer "
-                f"with {len(remote_block_ids)} KV groups to our "
-                f"{len(local_block_ids)} has no group pairing to trim by"
-            )
+            try:
+                remote_block_ids = trim_producer_to_consumer(
+                    remote_block_ids,
+                    local_block_ids,
+                    self._region_group_pairs(
+                        engine_id,
+                        self._overlapping_ranks[engine_id],
+                        producer_is_peer=True,
+                    ),
+                    consumer_name="this decoder",
+                    req_id=req_id,
+                )
+            except RuntimeError as e:
+                # What this decoder had cached decides it, so it fails the
+                # request rather than the engine.
+                self._log_failure(
+                    failure_type="transfer_setup_failed",
+                    req_id=req_id,
+                    msg="Marking blocks as invalid",
+                    error=e,
+                    dst_engine_id=engine_id,
+                )
+                self._handle_failed_transfer(req_id, None, self._recv_failures)
+                return
         elif not prefix_hit:
             # _apply_prefix_caching indexes per KV-cache group, so a group-count
             # mismatch must fail loudly here rather than as an opaque IndexError.
