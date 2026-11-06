@@ -33,11 +33,11 @@ from vllm_rbln.model_executor.models.optimum.qwen3_vl import (
 
 
 class TestDecodeLayoutWiring:
-    """Exercise the REAL wrapper code (only the model mocked): decode must place
-    each running request at its ``batch_idx`` row so it meets its OWN recurrent
-    state row, regardless of the running order vLLM hands us. The state cache in
-    DRAM is fixed; the INPUT is rearranged to match it, and the runner gathers
-    the logits back to running order.
+    """Exercise the REAL wrapper code (only the model mocked): decode names the
+    cache slot of each row (``state_idx``), so every request meets its OWN
+    recurrent state whatever row it sits on. Without a batch sort the request
+    is pinned to the row of its slot; under ``requires_batch_sort`` it keeps the
+    runner's length order. The runner gathers the logits back to running order.
     """
 
     @staticmethod

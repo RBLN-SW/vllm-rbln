@@ -182,9 +182,8 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
     def decode_layout(
         self, cache_slot_ids: torch.Tensor, block_tables: torch.Tensor
     ) -> tuple[int, slice | torch.Tensor]:
-        # The GatedDeltaNet state is a [max_num_seqs] on-device cache, read at
-        # the cache slot forward names for each row. A batch the runner sorts by
-        # length keeps that order.
+        # Length sorting can place requests on rows different from their cache slots.
+        # state_idx lets each request access its own state without changing that order.
         if getattr(self.get_language_model().rbln_config, "requires_batch_sort", False):
             return super().decode_layout(cache_slot_ids, block_tables)
         return self.decoder_batch_size, cache_slot_ids.to(torch.long)
