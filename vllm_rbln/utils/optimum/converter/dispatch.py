@@ -61,7 +61,8 @@ def _generate_model_path_name(
 ) -> str:
     rbln_config: OptimumRBLNConfig = vllm_config.additional_config
     assert rbln_config.compile_spec is not None, "compile spec must be resolved first"
-    config_dict = _strip_runtime_only_keys(rbln_config.compile_spec)
+    config_dict = dict(rbln_config.compile_spec)
+    config_dict["rbln_config"] = _strip_runtime_only_keys(config_dict["rbln_config"])
     model_name = str(config_dict["model"])
 
     config_json = json.dumps(config_dict, sort_keys=True, default=str)
@@ -97,6 +98,7 @@ def _resolve_cached_rbln_config(
             "dtype": vllm_config.model_config.dtype,
             "model_cls": spec.model_cls.__name__,
             "rbln_config": deepcopy(spec.rbln_config),
+            "hf_config": vllm_config.model_config.hf_config.to_dict(),
         }
 
     cached_model_path = os.path.join(

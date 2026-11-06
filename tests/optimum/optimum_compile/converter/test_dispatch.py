@@ -18,7 +18,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from transformers import Qwen3Config
+from transformers import LlamaConfig, Qwen3Config
 
 from vllm_rbln.config import build_optimum_rbln_config
 from vllm_rbln.platform.optimum_impl import check_and_update
@@ -48,6 +48,7 @@ def _vllm_config(
     prefix_caching=False,
     optimum_overrides=None,
     num_devices_per_local_rank=1,
+    hf_config=None,
 ):
     additional_config = {
         "optimum_overrides": optimum_overrides or {},
@@ -60,7 +61,11 @@ def _vllm_config(
             model="meta-llama/Llama-3.1-8B",
             max_model_len=8192,
             dtype=dtype,
-            hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
+            hf_config=(
+                hf_config
+                if hf_config is not None
+                else LlamaConfig(architectures=["LlamaForCausalLM"])
+            ),
         ),
         scheduler_config=SimpleNamespace(max_num_seqs=4, max_num_batched_tokens=2048),
         cache_config=SimpleNamespace(
@@ -165,6 +170,30 @@ class TestGenerateModelPathName:
         name_fp32 = _generate_model_path_name(_vllm_config(dtype=torch.float32))
         assert name_bf16 != name_fp32
 
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"num_hidden_layers": 1},
+            {"layer_types": ["sliding_attention"]},
+            {"rope_parameters": {"rope_type": "linear", "factor": 2.0}},
+            {"vision_config": {"num_hidden_layers": 1}},
+            {"device": "custom_compile_target"},
+        ],
+    )
+    def test_resolved_hf_overrides_change_hash(self, overrides):
+        hf_config = LlamaConfig(architectures=["LlamaForCausalLM"])
+        hf_config.update(overrides)
+        assert _generate_model_path_name(
+            _vllm_config(hf_config=hf_config)
+        ) != _generate_model_path_name(_vllm_config())
+
+    def test_equivalent_hf_configs_share_the_compiled_artifact(self):
+        hf_config = LlamaConfig(architectures=["LlamaForCausalLM"])
+        same_config = LlamaConfig.from_dict(hf_config.to_dict())
+        assert _generate_model_path_name(
+            _vllm_config(hf_config=hf_config)
+        ) == _generate_model_path_name(_vllm_config(hf_config=same_config))
+
     def test_nested_region_changes_hash(self, monkeypatch):
         monkeypatch.delenv("VLLM_RBLN_USE_NESTED_COMPILE_REGION", raising=False)
         default = _generate_model_path_name(_vllm_config())
@@ -185,6 +214,7 @@ class TestGenerateModelPathName:
         cfg.cache_config.block_size = 128
         cfg.scheduler_config.max_num_batched_tokens = 512
         cfg.additional_config.optimum_overrides = {}
+        cfg.model_config.hf_config.num_hidden_layers = 1
         assert _generate_model_path_name(cfg) == original
 
     def test_repeated_sync_preserves_the_resolved_spec(self):
