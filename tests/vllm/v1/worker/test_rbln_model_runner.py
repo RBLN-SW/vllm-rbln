@@ -35,6 +35,7 @@ from vllm.distributed.ec_transfer.ec_connector.base import (
     ECConnectorMetadata,
     ECConnectorRole,
 )
+from vllm.multimodal.inputs import PlaceholderRange
 from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheTensor
@@ -647,6 +648,7 @@ class TestEcConsumer:
             model_config=SimpleNamespace(get_hidden_size=lambda: 2),
             encoder_cache={},
             _execute_mm_encoder=lambda so: None,
+            mm_prefix_query_len=None,
         )
         runner._gather_mm_embeddings = lambda so, n: (
             [(0, 0, runner.encoder_cache["h0"])],
@@ -823,6 +825,7 @@ def test_warmup_compiles_prefill_at_the_prefill_chunk_size():
     runner = _make_runner_stub(
         max_num_tokens=512,
         prefill_chunk_size=256,
+        mm_prefix_query_len_buckets=[],
         speculative_config=None,
         bucketing_manager=SimpleNamespace(decode_batch_buckets=[1]),
         specialized_moe_decode=False,
@@ -2534,3 +2537,131 @@ class TestExecuteModelFlushesAfterTheSubmission:
         # The entry flush recovers a stale hold, then this step's read goes out
         # only after its own submission.
         assert order == ["flush", "submit", "flush"]
+
+
+class TestExecuteModelStampsMmPrefixSteps:
+    """A prefill ending an mm prefix range it started inside runs padded to the
+    smallest compiled query length holding it; anything else runs as before."""
+
+    @staticmethod
+    def _query_len_seen(monkeypatch, *, computed, scheduled, mm_features):
+        monkeypatch.setattr(mr, "step_is_prefill", lambda so: True)
+        monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: False)
+        monkeypatch.setattr(mr, "set_forward_context", lambda *a, **kw: nullcontext())
+        monkeypatch.setattr(
+            mr, "build_kv_cache_forward_context_kwargs", lambda *a, **kw: {}
+        )
+        monkeypatch.setattr(
+            mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+        )
+        monkeypatch.setattr(
+            RBLNModelRunner,
+            "maybe_get_kv_connector_output",
+            staticmethod(lambda *a, **kw: nullcontext(None)),
+        )
+        seen = []
+        runner = _make_runner_stub(
+            execute_model_state=None,
+            use_async_scheduling=False,
+            _update_states=lambda so: None,
+            _prepare_inputs=lambda so, counts: (
+                "LOGITS_IDX",
+                None,
+                torch.tensor([scheduled], dtype=torch.int32),
+                scheduled,
+            ),
+            _determine_batch_execution_and_padding=lambda *a, **kw: _resolved_batch(
+                num_reqs_padded=1, query_len=scheduled, num_tokens_padded=None
+            ),
+            _preprocess=lambda *a, **kw: (SimpleNamespace(as_kwargs=lambda: {}), {}),
+            _bookkeeping_and_output=lambda *a, **kw: "OUTPUT",
+            input_batch=SimpleNamespace(
+                num_reqs=1,
+                req_ids=["r0"],
+                num_computed_tokens_cpu=np.array([computed], dtype=np.int32),
+            ),
+            requests={"r0": SimpleNamespace(mm_features=mm_features)},
+            mm_prefix_query_len_buckets=[128, 256],
+            cache_config=SimpleNamespace(kv_sharing_fast_prefill=False),
+            speculative_config=None,
+            is_pooling_model=False,
+            vllm_config=SimpleNamespace(is_mm_encoder_only=False),
+            model_executable=lambda **kw: ("HIDDEN", "LOGITS", None),
+            num_prompt_logprobs=None,
+            kv_cache_bases=None,
+            decode_back_pad=torch.zeros(1, dtype=torch.int32),
+        )
+
+        def build_attention_metadata(**kwargs):
+            seen.append(runner.mm_prefix_query_len)
+            return "ATTN", None
+
+        runner._build_attention_metadata = build_attention_metadata
+        runner.execute_model(
+            SimpleNamespace(
+                total_num_scheduled_tokens=scheduled,
+                num_scheduled_tokens={"r0": scheduled},
+                kv_cache_copy_ops=None,
+            )
+        )
+        return seen[0]
+
+    @staticmethod
+    def _image(offset, num_embeds):
+        # <boi>, the soft tokens, <eoi>
+        is_embed = [False] + [True] * num_embeds + [False]
+        return SimpleNamespace(
+            modality="image",
+            mm_position=PlaceholderRange(
+                offset=offset, length=len(is_embed), is_embed=torch.tensor(is_embed)
+            ),
+        )
+
+    @pytest.mark.parametrize(
+        "num_embeds, query_len", [(10, 128), (128, 128), (130, 256)]
+    )
+    def test_the_range_takes_the_smallest_length_holding_it(
+        self, monkeypatch, num_embeds, query_len
+    ):
+        seen = self._query_len_seen(
+            monkeypatch,
+            computed=5,
+            scheduled=num_embeds,
+            mm_features=[self._image(4, num_embeds)],
+        )
+        assert seen == query_len
+
+    def test_the_rest_of_a_range_a_prefix_cache_hit_resumed_is_one(self, monkeypatch):
+        # Soft tokens at 5..14; a hit ended at 9, so the step runs 9..14.
+        seen = self._query_len_seen(
+            monkeypatch, computed=9, scheduled=6, mm_features=[self._image(4, 10)]
+        )
+        assert seen == 128
+
+    def test_a_text_chunk_is_not_an_mm_prefix_step(self, monkeypatch):
+        seen = self._query_len_seen(
+            monkeypatch, computed=0, scheduled=5, mm_features=[self._image(4, 10)]
+        )
+        assert seen is None
+
+
+def test_warmup_compiles_one_prefill_per_mm_prefix_query_len():
+    calls = []
+    runner = _make_runner_stub(
+        max_num_tokens=512,
+        prefill_chunk_size=256,
+        mm_prefix_query_len_buckets=[128, 384],
+        speculative_config=None,
+        bucketing_manager=SimpleNamespace(decode_batch_buckets=[1]),
+        specialized_moe_decode=False,
+        _dummy_run=lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    runner.run_model_graphs()
+
+    # Text prefill at the chunk size, an mm prefix step up to the step budget.
+    assert calls[:3] == [
+        ((1, 256, True), {}),
+        ((1, 128, True), {"mm_prefix_query_len": 128}),
+        ((1, 384, True), {"mm_prefix_query_len": 384}),
+    ]

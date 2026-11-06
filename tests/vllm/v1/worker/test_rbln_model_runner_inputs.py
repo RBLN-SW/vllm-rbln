@@ -80,6 +80,68 @@ class TestResolveMultiModalSupport:
             runner._resolve_mm_support()
 
 
+class _MmPrefixModel(_InGraphMergeModel):
+    def __init__(self, query_lens):
+        super().__init__()
+        self.query_lens = query_lens
+
+    def get_mm_prefix_query_lens(self) -> list[int]:
+        return self.query_lens
+
+
+class TestResolveMmPrefixSupport:
+    """An mm prefix LM is served only when every range, or the rest of one a
+    prefix cache hit resumes, runs in one step."""
+
+    @staticmethod
+    def _runner(make_model_runner, monkeypatch, model, **config):
+        monkeypatch.setattr(
+            ModelConfig, "supports_multimodal_inputs", property(lambda self: True)
+        )
+        monkeypatch.setattr(ModelConfig, "is_mm_prefix_lm", property(lambda self: True))
+        runner = make_model_runner(**{"enable_prefix_caching": False, **config})
+        runner.model = model
+        return runner
+
+    def test_the_models_query_lens_are_taken(self, make_model_runner, monkeypatch):
+        runner = self._runner(make_model_runner, monkeypatch, _MmPrefixModel([64, 128]))
+
+        assert runner._resolve_mm_support() is True
+        assert runner.mm_prefix_query_len_buckets == [64, 128]
+
+    def test_a_model_naming_no_query_lens_is_refused(
+        self, make_model_runner, monkeypatch
+    ):
+        runner = self._runner(make_model_runner, monkeypatch, _InGraphMergeModel())
+
+        with pytest.raises(ValueError, match="SupportsRBLNMmPrefix"):
+            runner._resolve_mm_support()
+
+    def test_a_config_that_would_split_a_range_is_refused(
+        self, make_model_runner, monkeypatch
+    ):
+        runner = self._runner(
+            make_model_runner,
+            monkeypatch,
+            _MmPrefixModel([64, 128]),
+            long_prefill_token_threshold=64,
+        )
+
+        with pytest.raises(ValueError, match="long_prefill_token_threshold"):
+            runner._resolve_mm_support()
+
+    def test_prefix_caching_is_taken(self, make_model_runner, monkeypatch):
+        # A hit ending inside a range resumes it in a step of its own.
+        runner = self._runner(
+            make_model_runner,
+            monkeypatch,
+            _MmPrefixModel([64, 128]),
+            enable_prefix_caching=True,
+        )
+
+        assert runner._resolve_mm_support() is True
+
+
 class TestGatherMultimodalEmbeddings:
     def test_scheduled_images_are_encoded_and_cached_by_hash(
         self, make_model_runner, monkeypatch

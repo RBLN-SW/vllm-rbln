@@ -137,7 +137,7 @@ class RBLNScheduler(Scheduler):
                 kv_cache_config=self.kv_cache_config,
                 max_model_len=self.max_model_len,
                 scheduler_block_size=self.block_size,
-                hash_block_size=self.block_size,
+                hash_block_size=self.hash_block_size,
                 sub_block_size=sub_block_size,
                 hash_fn=hash_fn,
                 use_eagle=self.use_eagle,
@@ -176,7 +176,9 @@ class RBLNScheduler(Scheduler):
         # the soft cap a no-op. See v1/core/utils.py.
         self._pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
 
+        assert rbln_config.prefill_chunk_size is not None  # resolved at start-up
         self._prefill_chunk_size = rbln_config.prefill_chunk_size
+        self._is_mm_prefix_lm = self.vllm_config.model_config.is_mm_prefix_lm
 
         # NOTE(RBLN): the sparse-attention ops (DSA MLA / indexer, MiniMax-M3
         # MSA / indexer, GLM5 MLA / indexer) get NULL_BLOCK_ID as null_block_id
@@ -190,6 +192,42 @@ class RBLNScheduler(Scheduler):
                 f"({NULL_BLOCK_ID}); the RBLN sparse-attention cache store writes "
                 "to NULL_BLOCK_ID and would corrupt a live block."
             )
+
+    def _mm_prefix_split(
+        self, request: Request, num_computed_tokens: int, num_new_tokens: int
+    ) -> int:
+        """Tokens to schedule so that an mm prefix range runs as a step of its own.
+
+        A range attends to itself both ways, which a compiled graph can do only
+        when the step holds that range and nothing else. By where the step starts:
+
+        - inside a range: the rest of it, which is the whole range at its start
+          or what a prefix cache hit left of it. It may run past the prefill
+          chunk size, up to the step budget.
+        - before a range: text up to where the range begins, at most one chunk.
+        - past every range: text, at most one chunk.
+        """
+        for feature in request.mm_features:
+            if feature.modality not in ("image", "video"):
+                continue
+            for first, last in feature.mm_position.extract_embeds_range():
+                if first <= num_computed_tokens <= last:
+                    range_len = last + 1 - num_computed_tokens
+                    assert num_new_tokens >= range_len, (
+                        f"an mm prefix range of {range_len} tokens does not fit "
+                        f"the {num_new_tokens} this step can schedule"
+                    )
+                    return range_len
+                if num_computed_tokens < first:
+                    return min(
+                        num_new_tokens,
+                        first - num_computed_tokens,
+                        self._prefill_chunk_size,
+                    )
+        return min(num_new_tokens, self._prefill_chunk_size)
+
+    def _splits_on_mm_prefix(self, request: Request) -> bool:
+        return self._is_mm_prefix_lm and request.has_encoder_inputs
 
     def _decode_demand(self) -> int:
         """Total decode demand for this step's soft (ceil(demand/pp)) cap.
@@ -352,13 +390,22 @@ class RBLNScheduler(Scheduler):
                 continue
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
-            num_new_tokens = min(num_new_tokens, self._prefill_chunk_size, token_budget)
+            num_new_tokens = min(num_new_tokens, token_budget)
+            if not self._splits_on_mm_prefix(request):
+                num_new_tokens = min(num_new_tokens, self._prefill_chunk_size)
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
             num_new_tokens = min(
                 num_new_tokens, self.max_model_len - 1 - request.num_computed_tokens
             )
+
+            # Cut before scheduling encoder inputs, so that only the items this
+            # chunk overlaps are scheduled.
+            if self._splits_on_mm_prefix(request):
+                num_new_tokens = self._mm_prefix_split(
+                    request, request.num_computed_tokens, num_new_tokens
+                )
 
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
@@ -716,7 +763,8 @@ class RBLNScheduler(Scheduler):
                     threshold = self.scheduler_config.long_prefill_token_threshold
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
-                    num_new_tokens = min(num_new_tokens, self._prefill_chunk_size)
+                    if not self._splits_on_mm_prefix(request):
+                        num_new_tokens = min(num_new_tokens, self._prefill_chunk_size)
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
@@ -755,6 +803,11 @@ class RBLNScheduler(Scheduler):
                         # Guard (C) of the no-mixed-batching invariant
                         # (see the step-phase section in v1/core/utils.py).
                         break
+
+                    if self._splits_on_mm_prefix(request):
+                        num_new_tokens = self._mm_prefix_split(
+                            request, num_computed_tokens, num_new_tokens
+                        )
 
                     # Schedule encoder inputs.
                     if request.has_encoder_inputs:
