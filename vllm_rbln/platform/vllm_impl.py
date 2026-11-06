@@ -143,11 +143,6 @@ def _validate(vllm_config: "VllmConfig") -> None:
                 f"--block-size {cache_config.block_size}."
             )
 
-    if rbln_config.compile_dtype:
-        from vllm_rbln.compilation import check_dtype_option_supported
-
-        check_dtype_option_supported()
-
     # Upstream turns chunked prefill off for an engine without a KV cache, such
     # as an encoder-only instance, then validates the config again in EngineCore.
     if not (scheduler_config.enable_chunked_prefill or vllm_config.is_mm_encoder_only):
