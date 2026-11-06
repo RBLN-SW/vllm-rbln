@@ -28,6 +28,7 @@ from collections.abc import Mapping
 import vllm.envs as envs
 
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.core.utils import is_strict_kv_producer
 from vllm_rbln.v1.worker.utils import dynamic_kv_enabled
 
 logger = init_logger(__name__)
@@ -112,6 +113,8 @@ def _warmup_graph_set_factors(
         ),
         # compute_hash() takes in the EC config but leaves its role out.
         "ec_role": ec.ec_role if ec is not None else None,
+        # Not kv_role itself: only the strict producer builds a different set.
+        "prefill_only": is_strict_kv_producer(vllm_config),
     }
 
     if extra_hash_factors:

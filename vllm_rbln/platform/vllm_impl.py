@@ -25,10 +25,18 @@ from vllm_rbln.platform import use_device_tensor
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.pooling_params import PoolingParams
+    from vllm.sampling_params import SamplingParams
 
     from vllm_rbln.config import RBLNConfig
 
 logger = init_logger(__name__)
+
+# validate_request gets no config, so check_and_update keeps this process's --
+# the last one built, so this assumes one engine per process, as a server has.
+# The role is read per request, not here: VllmConfig.__post_init__ can still
+# rewrite it after the hook (KV offloading makes it kv_both).
+_vllm_config: "VllmConfig | None" = None
 
 
 def patch_upstream() -> None:
@@ -48,6 +56,8 @@ def patch_upstream() -> None:
 def check_and_update(vllm_config: "VllmConfig") -> None:
     from vllm_rbln.config import build_rbln_config
 
+    global _vllm_config
+
     # Everything below reads additional_config as an RBLNConfig.
     vllm_config.additional_config = build_rbln_config(vllm_config.additional_config)
 
@@ -55,6 +65,29 @@ def check_and_update(vllm_config: "VllmConfig") -> None:
     _override(vllm_config)
     _wire(vllm_config)
     _setup_runtime_env(vllm_config)
+    _vllm_config = vllm_config
+
+
+def validate_request(params: "SamplingParams | PoolingParams") -> None:
+    from vllm.exceptions import VLLMValidationError
+    from vllm.sampling_params import SamplingParams
+
+    from vllm_rbln.v1.core.utils import is_strict_kv_producer
+
+    if not isinstance(params, SamplingParams):
+        return
+    assert _vllm_config is not None, "validate_request ran before check_and_update"
+    if not is_strict_kv_producer(_vllm_config):
+        return
+    if params.max_tokens is None or params.max_tokens > 1:
+        raise VLLMValidationError(
+            "A strict KV producer (kv_role='kv_producer') compiles no decode "
+            "graph, so a request to it can ask for one output token only; got "
+            f"max_tokens={params.max_tokens}. Generation belongs on the decode "
+            "peer.",
+            parameter="max_tokens",
+            value=params.max_tokens,
+        )
 
 
 def _uses_model_parallel(parallel_config) -> bool:
