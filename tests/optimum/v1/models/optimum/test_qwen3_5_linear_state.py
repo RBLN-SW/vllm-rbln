@@ -86,18 +86,17 @@ class TestDecodeLayoutWiring:
         assert rows == slice(0, 2)
 
     @pytest.mark.parametrize(
-        ("batch_rows", "cache_slot_ids"),
+        "cache_slot_ids",
         [
             # Sorted [A, B, pad, pad]: A owns slot 2 and B slot 0; the padding
             # rows share free slot 1.
-            (slice(0, 2), [2, 0, 1, 1]),
+            [2, 0, 1, 1],
             # Pinned: A (slot 2) on row 2; the padding rows share free slot 0.
-            (torch.tensor([2]), [0, 0, 2, 0]),
+            [0, 0, 2, 0],
         ],
+        ids=["sorted", "pinned"],
     )
-    def test_forward_decode_names_each_rows_cache_slot(
-        self, batch_rows, cache_slot_ids
-    ):
+    def test_forward_decode_names_each_rows_cache_slot(self, cache_slot_ids):
         # Each row's state is read from the slot the runner gave that row.
         obj = self._bare_qwen3_5(max_batch_size=4)
 
@@ -116,7 +115,6 @@ class TestDecodeLayoutWiring:
         model_input = types.SimpleNamespace(
             is_prompt=False,
             padded_batch_size=4,
-            batch_rows=batch_rows,
             input_tokens=torch.zeros(4, 1, dtype=torch.int64),
             input_positions=torch.zeros(4, 1, dtype=torch.int32),
             block_tables=torch.zeros(4, 1, dtype=torch.int16),
