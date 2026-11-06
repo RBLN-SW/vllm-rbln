@@ -458,6 +458,23 @@ class TestPerShardWrite:
         ]
         assert [len(c.args[2]) for c in calls] == [2, 2]  # both areas, each time
 
+    def test_a_closing_offer_cuts_its_last_block_by_its_own_count(self):
+        # Chunk mode cuts by the count, and here it is only on the list: the
+        # worker's map has not caught up yet. Without it both areas would go.
+        worker = self._trimming_worker()
+        set_shape(worker, chunk_mode=True, streams_prefix=True)
+        worker._valid_tokens = {}
+        worker._streamed["r0"] = pw._StreamedSend(released=True, serial=1, total=2)
+        closing = self._meta(([1, 2],), ([3, 4],))
+        closing.local_block_ids = pw.OfferedBlocks(
+            ([1, 2],), 0, 1, done=None, valid_tokens=17
+        )
+
+        worker._xfer_blocks_for_req("r0", closing)
+
+        call = worker.nixl_wrapper.make_prepped_xfer.call_args
+        assert len(call.args[2]) == len(call.args[4]) == 3
+
     def test_the_handover_leaves_the_empty_area_of_the_last_block_out(self):
         # 17 tokens over two blocks: the second holds one, which is area 0's.
         worker = self._trimming_worker()
@@ -2177,6 +2194,21 @@ class TestEarlySend:
         assert order == []
         assert blocks.done is event
         assert worker._streamed["r0"].pending_offer_done is None
+
+    def test_the_closing_count_travels_on_the_offer(self):
+        # The step's metadata reaches `start_load_kv` only after the offer is
+        # released, so a count left there could arrive after the writer read.
+        worker = self._worker()
+        meta = self._meta(saves=["r0"])
+        meta.push_stream_valid_tokens["r0"] = 44
+        worker.start_early_push(meta)
+
+        worker.release_early_offers()
+
+        _, blocks = worker._finished_blocks_inbox.get_nowait()
+        assert blocks.valid_tokens == 44
+        assert worker._streamed["r0"].pending_offer_valid_tokens is None
+        assert "r0" not in worker._valid_tokens
 
     def test_a_step_that_closes_nothing_still_releases_what_is_held(self):
         # The release cannot wait for another closing chunk: steps that close
