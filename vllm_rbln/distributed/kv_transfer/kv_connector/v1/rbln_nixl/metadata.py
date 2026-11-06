@@ -72,7 +72,8 @@ class ChipletSplitAxis(Enum):
 
     ``HEAD`` means an area holds some of the shard's KV heads over every token
     of a block; ``TOKEN`` means every head over some of the tokens.
-    ``BLOCK`` is an opaque per-block payload paired only at equal TP.
+    ``BLOCK`` is a per-block payload: whole where every rank holds it alike,
+    and otherwise paired across TP degrees by the heads its spec bands.
     """
 
     HEAD = 0

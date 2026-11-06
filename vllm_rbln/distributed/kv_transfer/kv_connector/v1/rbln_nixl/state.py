@@ -225,10 +225,9 @@ def pair_area(
 
 class BlockWindow(NamedTuple):
     """What one chiplet area holds of a block payload's block on one rank: the
-    rectangle and where in the area's block its bytes sit."""
+    rectangle, and the bytes of the area's block that hold it."""
 
     rect: AreaRect
-    offset: int
     length: int
 
 
@@ -246,16 +245,15 @@ def block_rects(
     slice. A banded one cuts the rank's heads out of `spec.band_heads`, and its
     kernel cuts them over the chiplets: a block of runs holds the rank's heads in
     every run, an area a slice of them in every run; a block of one run holds
-    `slots` groups' worth of heads (`kda_state_slot`), an area a slice of each,
-    of which the rank's group is the window it owns. A block of one run too
-    small for the rank's heads is one of several entries splitting them, which
-    holds the heads from `entry_first` on.
+    one group of heads, an area a slice of it. A block of one run too small for
+    the rank's heads is one of several entries splitting them, which holds the
+    heads from `entry_first` on.
     """
     slices = len(set(slice_ids))
     if not spec.band_heads:
         return [
             BlockWindow(
-                AreaRect((0, 1), (sid * area_len, (sid + 1) * area_len)), 0, area_len
+                AreaRect((0, 1), (sid * area_len, (sid + 1) * area_len)), area_len
             )
             for sid in slice_ids
         ]
@@ -270,21 +268,15 @@ def block_rects(
             f"RBLN NIXL D2D: rank {rank} of TP {tp_size} holds {heads} heads, "
             f"which {slices} chiplet slices do not cut evenly."
         )
-    offset, length = 0, area_len
-    if spec.runs == 1:
-        length = per_area * spec.head_bytes
-        slots, rem = divmod(area_len, length)
-        if rem:
-            raise RuntimeError(
-                f"RBLN NIXL D2D: a chiplet area's {area_len}B of a block does not "
-                f"hold whole groups of {per_area} heads of {spec.head_bytes}B."
-            )
-        offset = (rank % slots) * length
+    if spec.runs == 1 and area_len != per_area * spec.head_bytes:
+        raise RuntimeError(
+            f"RBLN NIXL D2D: a chiplet area's {area_len}B of a block is not the "
+            f"{per_area} heads of {spec.head_bytes}B this rank's slice holds."
+        )
     return [
         BlockWindow(
             AreaRect((first + sid * per_area, first + (sid + 1) * per_area), (0, 1)),
-            offset,
-            length,
+            area_len,
         )
         for sid in slice_ids
     ]
@@ -440,7 +432,8 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
     #: an MSA indexer beside attention) rather than K and V.
     _logical_region_latent: list[bool]
     #: Per logical region, its block payload spec where it is cut on the BLOCK
-    #: axis, else None; empty for an engine with none (`_block_spec`).
+    #: axis, else None. Registration fills every region; the empty default and
+    #: `_block_spec`'s bound only serve a worker that never registered.
     _logical_region_block_spec: Sequence[RblnBlockTransferSpec | None] = ()
     _logical_region_kv_heads: list[int | None]
     #: This RANK's share of them, which is what a token range of an area is

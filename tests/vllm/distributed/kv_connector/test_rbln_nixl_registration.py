@@ -2620,3 +2620,54 @@ class TestChunkModeWithASlidingWindow:
                 push_stream=True,
                 cls=RblnNixlPushConnectorWorker,
             )
+
+
+class TestAKdaConvRingCutsOneGroupsHeads:
+    """GLM-5.3's conv ring beside a KDA state at block 1024: the ring holds q / k
+    / v of every group the rank's state caches split it into, so a head's run
+    is 128 channels of bf16 at every TP degree."""
+
+    @staticmethod
+    def _register(tp_size, ring_shape):
+        from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl import (
+            RblnNixlPullConnectorWorker,
+        )
+        from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_transfer_topology import (  # noqa: E501
+            RblnBlockTransferSpec,
+        )
+        from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
+
+        owner = "model.layers.0.self_attn.attn.0"
+        ring = "model.layers.0.self_attn.attn.ring"
+        w = object.__new__(RblnNixlPullConnectorWorker)
+        w.vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_text_config=SimpleNamespace(
+                    model_type="glm5_next_text",
+                    linear_num_heads=64,
+                    linear_head_dim=128,
+                    kv_lora_rank=512,
+                ),
+                dtype=torch.bfloat16,
+            ),
+            cache_config=SimpleNamespace(block_size=1024),
+            parallel_config=SimpleNamespace(tensor_parallel_size=tp_size),
+        )
+        w.kv_cache_config = SimpleNamespace(transfer_group_index_by_layer={owner: 1})
+        w._layer_specs = {
+            owner: RblnBlockTransferSpec(1024, 1024 * 512, 64, 128 * 128 * 2)
+        }
+        w._block_aux_specs = {}
+        w.register_block_aux_kv_caches(
+            {ring: RBLNBlockAuxSpec(owner, ring_shape, torch.bfloat16, head_axis=2)}
+        )
+        return w._layer_specs[ring]
+
+    @pytest.mark.parametrize(
+        "tp_size, ring_shape, runs",
+        [(1, (4, 12, 32, 64), 48), (4, (4, 3, 32, 64), 12)],
+    )
+    def test_a_head_s_run_is_its_128_channels(self, tp_size, ring_shape, runs):
+        spec = self._register(tp_size, ring_shape)
+
+        assert (spec.band_heads, spec.head_bytes, spec.runs) == (64, 256, runs)

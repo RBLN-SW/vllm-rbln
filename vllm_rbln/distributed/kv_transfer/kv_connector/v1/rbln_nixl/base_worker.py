@@ -49,6 +49,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_transfer_topology im
     RblnBlockTransferSpec,
 )
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.attention.backends.glm5_next import kda_state_band
 from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
 
 if TYPE_CHECKING:
@@ -82,8 +83,6 @@ class RblnNixlWorkerBase(
 
         self._block_aux_specs: dict[str, RBLNBlockAuxSpec] = {}
         self._block_state_layers: set[str] = set()
-        from vllm_rbln.v1.attention.backends.glm5_next import kda_state_band
-
         band_heads, head_bytes = kda_state_band(vllm_config) or (0, 0)
         groups = []
         for group in kv_cache_config.kv_cache_groups:

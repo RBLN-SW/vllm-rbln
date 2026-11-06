@@ -57,6 +57,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_transfer_topology im
     is_latent,
 )
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.attention.backends.glm5_next import kda_rank_groups
 from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
 from vllm_rbln.v1.worker.utils import canonical_kv_layers
 
@@ -1024,11 +1025,12 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
                 )
                 continue
             runs = math.prod(spec.block_shape[: spec.head_axis])
-            # An owner too small for the rank's heads holds one group of them,
-            # and its cache cuts that group.
-            entry_heads = min(
-                band_heads // self.vllm_config.parallel_config.tensor_parallel_size,
-                owner_spec.page_size_bytes // owner_spec.head_bytes,
+            # The owner is one KDA state cache of the rank's, so the cache it
+            # owns cuts that one group's heads -- as many as the backend names
+            # the caches by.
+            tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+            entry_heads = (
+                band_heads // tp_size // kda_rank_groups(self.vllm_config, tp_size)
             )
             head_bytes, rem = divmod(spec.page_size_bytes // runs, entry_heads)
             assert not rem, (name, spec, entry_heads)
