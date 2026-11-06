@@ -1827,7 +1827,12 @@ class TestShardLocalRegions:
         ids, cut = _split_plan([4, 5], 64, 2, 3)
         more, whole = _split_plan([6, 7], 64)
         w._register_shard_xfer_state(
-            "eng", 2, 16, ("l2", "l3"), plan=(ids + more, cut + whole)
+            "eng",
+            2,
+            16,
+            ("l2", "l3"),
+            plan=(ids + more, cut + whole),
+            peer_region_group_ids=[0] * w.num_regions,
         )
 
         assert w._shard_descs_per_block == {("eng", 2): (6, 6, 1, 1)}
@@ -1883,7 +1888,12 @@ class TestShardLocalRegions:
         w._shard_descs_per_block = {}
 
         w._register_shard_xfer_state(
-            "eng", 2, 16, ("l2", "l3"), plan=_split_plan([4, 5, 6, 7], 64, 2, 3)
+            "eng",
+            2,
+            16,
+            ("l2", "l3"),
+            plan=_split_plan([4, 5, 6, 7], 64, 2, 3),
+            peer_region_group_ids=[0] * w.num_regions,
         )
 
         assert w._shard_descs_per_block == {("eng", 2): (6,) * 4}
@@ -1980,7 +1990,12 @@ class TestShardLocalRegions:
             RblnNixlPullConnectorWorker, "_shard_chunk_grid", return_value=None
         ):
             w._register_shard_xfer_state(
-                "eng", 2, 16, ("l2", "l3"), plan=_split_plan([4, 5, 6, 7], 64, 2)
+                "eng",
+                2,
+                16,
+                ("l2", "l3"),
+                plan=_split_plan([4, 5, 6, 7], 64, 2),
+                peer_region_group_ids=[0] * w.num_regions,
             )
 
         assert w.src_xfer_handles_by_remote == {("eng", 2, 16): 42}
@@ -4317,7 +4332,7 @@ class TestHeadMatchedDescriptorSweep:
                         meta, peer.tp_rank, peer.tp_size, peer_areas=peer_areas
                     ),
                     remote_tp_size=peer.tp_size,
-                    peer_region_group_ids=[0] * w.num_regions,
+                    peer_region_group_ids=meta.region_group_ids,
                 )
             local = w.nixl_wrapper.get_xfer_descs.call_args.args[0]
             _assert_shard_contract(
@@ -7984,6 +7999,9 @@ class TestBlockPayloadPairing:
             patch.object(RblnNixlPullConnectorWorker, "_check_mla_constraints"),
             patch.object(
                 RblnNixlPullConnectorWorker, "_regions_per_layer", return_value=1
+            ),
+            patch.object(
+                RblnNixlPullConnectorWorker, "_is_head_matched_peer", return_value=False
             ),
             patch.object(
                 RblnNixlPullConnectorWorker, "_layer_overlap", return_value=[(0, 0)]
