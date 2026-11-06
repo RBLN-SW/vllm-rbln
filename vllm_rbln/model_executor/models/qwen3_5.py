@@ -154,6 +154,7 @@ class RBLNQwen3_5ForConditionalGeneration(
             gdn_state_shape(
                 hf_config.linear_num_key_heads // tp_size,
                 hf_config.linear_num_value_heads // tp_size,
+                hf_config.linear_key_head_dim,
             ),
         )
 

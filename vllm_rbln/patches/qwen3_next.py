@@ -15,7 +15,7 @@
 import torch
 import torch.nn.functional as F
 from rebel.ops.torch_custom_ops.gdn import CHUNK as GDN_PREFILL_CHUNK
-from rebel.ops.torch_custom_ops.gdn import HEAD_DIM as GDN_HEAD_DIM
+from rebel.ops.torch_custom_ops.gdn import STATE_LANES
 from rebel.ops.torch_custom_ops.kda import CONV_LANES
 from torch import nn
 from vllm.config import VllmConfig, get_current_vllm_config
@@ -125,12 +125,11 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         self, config, vllm_config: VllmConfig, prefix: str = "", **kwargs
     ) -> None:
         super().__init__(config, vllm_config, prefix, **kwargs)
-        # TODO(rebel_compiler#15378): HEAD_DIM goes away with it; the check
-        # becomes Dk == Dv, a multiple of STATE_LANES.
-        if self.head_k_dim != GDN_HEAD_DIM or self.head_v_dim != GDN_HEAD_DIM:
+        if self.head_k_dim != self.head_v_dim or self.head_k_dim % STATE_LANES:
             raise NotImplementedError(
-                "The RBLN GatedDeltaNet kernels take 128-wide heads, got "
-                f"{self.head_k_dim} / {self.head_v_dim}"
+                "The RBLN GatedDeltaNet kernels take one head dim for keys and "
+                f"values, a multiple of {STATE_LANES}, got {self.head_k_dim} / "
+                f"{self.head_v_dim}"
             )
         self.layer_index = _layer_index(prefix)
         # One ring a block, in kda_conv's lane blocks of the conv's channels.
@@ -149,7 +148,9 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     def get_state_shape(self) -> tuple[tuple[int, ...]]:
         return (
             gdn_state_shape(
-                self.num_k_heads // self.tp_size, self.num_v_heads // self.tp_size
+                self.num_k_heads // self.tp_size,
+                self.num_v_heads // self.tp_size,
+                self.head_k_dim,
             ),
         )
 

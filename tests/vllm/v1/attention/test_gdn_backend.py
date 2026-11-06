@@ -44,7 +44,8 @@ def test_grouped_qkv_rows_interleaves_each_key_heads_q_k_and_values():
 def test_state_shape_follows_the_kernels():
     # 2 value heads under each of 2 key heads, each [128, 128] state blocked as
     # [2, 128, 64] lanes
-    assert gdn_state_shape(2, 4) == (2, 2, 2, 128, 64)
+    assert gdn_state_shape(2, 4, 128) == (2, 2, 2, 128, 64)
+    assert gdn_state_shape(2, 4, 64) == (2, 2, 1, 64, 64)
 
 
 def _builder():
@@ -52,7 +53,9 @@ def _builder():
         max_model_len=MAX_LEN, max_num_batched_tokens=128, max_num_seqs=4
     )
     spec = RBLNGDNStateSpec(
-        block_size=MAX_LEN, shapes=(gdn_state_shape(2, 4),), dtypes=(torch.bfloat16,)
+        block_size=MAX_LEN,
+        shapes=(gdn_state_shape(2, 4, 128),),
+        dtypes=(torch.bfloat16,),
     )
     return RBLNGDNAttentionMetadataBuilder(
         spec, [LAYER], vllm_config, torch.device("cpu")

@@ -34,7 +34,7 @@ is stored to the block the state is.
 from dataclasses import dataclass
 
 import torch
-from rebel.ops.torch_custom_ops.gdn import STATE_BLOCKS
+from rebel.ops.torch_custom_ops.gdn import state_blocks
 from vllm.config import VllmConfig
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -48,13 +48,10 @@ from vllm.v1.attention.backends.registry import (
 from vllm.v1.kv_cache_interface import KVCacheSpec
 
 
-def gdn_state_shape(heads_k: int, heads_v: int) -> tuple[int, ...]:
+def gdn_state_shape(heads_k: int, heads_v: int, head_dim: int) -> tuple[int, ...]:
     """One block's state as the delta-rule kernels keep it: each key head's
-    `heads_v / heads_k` [HEAD_DIM, HEAD_DIM] states in the kernels' lane blocks."""
-    # TODO(rebel_compiler#15378): the kernels then read the head dim off the
-    # query (any multiple of STATE_LANES, Dk == Dv) and STATE_BLOCKS goes away:
-    # take the head dim from the config and build [D / STATE_LANES, D, STATE_LANES].
-    return (heads_k, heads_v // heads_k, *STATE_BLOCKS)
+    `heads_v / heads_k` [head_dim, head_dim] states in the kernels' lane blocks."""
+    return (heads_k, heads_v // heads_k, *state_blocks(head_dim))
 
 
 def grouped_qkv_rows(heads_k: int, ratio: int, head_dim: int) -> torch.Tensor:
@@ -135,20 +132,20 @@ class RBLNGDNAttentionMetadataBuilder(
     def build(  # type: ignore[override]
         self,
         common_attn_metadata: CommonAttentionMetadata,
+        positions: torch.Tensor,
+        batch_pad: int,
+        is_prefill: bool,
         skip_attn_masks: bool = False,
         back_pad: torch.Tensor | None = None,
         is_prompt_sorted: bool = False,
         num_accepted: torch.Tensor | None = None,
         state_load_pos: torch.Tensor | None = None,
-        positions: torch.Tensor,
+    ) -> RBLNGDNAttentionMetadata:
         """The flash builder's signature, so the runner calls every builder the
         same way; the draft rows are refused with speculative decoding."""
         assert num_accepted is None and state_load_pos is None, (
             "speculative decoding is refused for GatedDeltaNet models"
         )
-        batch_pad: int,
-        is_prefill: bool,
-    ) -> RBLNGDNAttentionMetadata:
         num_reqs = common_attn_metadata.num_reqs
         query_start_loc = common_attn_metadata.query_start_loc[: num_reqs + 1]
         query_lens = query_start_loc[1:] - query_start_loc[:-1]

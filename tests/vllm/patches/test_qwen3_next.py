@@ -169,13 +169,13 @@ def _ssm_state(state: torch.Tensor) -> torch.Tensor:
 def test_padded_prefill_then_decode_tracks_hf(vllm_config):
     layer = _layer()
     # The pool's state tensor and the ring beside it, as the runner allocates them.
-    state = torch.zeros(NUM_BLOCKS, *gdn_state_shape(HEADS_K, HEADS_V))
+    state = torch.zeros(NUM_BLOCKS, *gdn_state_shape(HEADS_K, HEADS_V, HEAD_DIM))
     ring = torch.zeros(NUM_BLOCKS, KERNEL - 1, CONV_DIM // 64, 64)
     device_layer = _grouped(layer, ring)
     vllm_config.compilation_config.static_forward_context[PREFIX] = device_layer
     spec = RBLNGDNStateSpec(
         block_size=vllm_config.model_config.max_model_len,
-        shapes=(gdn_state_shape(HEADS_K, HEADS_V),),
+        shapes=(gdn_state_shape(HEADS_K, HEADS_V, HEAD_DIM),),
         dtypes=(torch.float32,),
     )
     builder = RBLNGDNAttentionMetadataBuilder(
@@ -264,6 +264,7 @@ class TestStateSpec:
         layer.tp_size = 2
         layer.num_k_heads = 4
         layer.num_v_heads = 8
+        layer.head_k_dim = 128
         layer.model_config = SimpleNamespace(dtype=torch.bfloat16)
         layer.cache_config = SimpleNamespace(
             mamba_cache_dtype="auto", mamba_ssm_cache_dtype="auto"
@@ -303,7 +304,9 @@ class TestStateSpec:
             model_config=SimpleNamespace(
                 dtype=torch.bfloat16,
                 hf_text_config=SimpleNamespace(
-                    linear_num_key_heads=4, linear_num_value_heads=8
+                    linear_num_key_heads=4,
+                    linear_num_value_heads=8,
+                    linear_key_head_dim=128,
                 ),
             ),
             parallel_config=SimpleNamespace(tensor_parallel_size=2),
