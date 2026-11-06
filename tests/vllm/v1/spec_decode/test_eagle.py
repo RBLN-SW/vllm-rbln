@@ -587,6 +587,19 @@ class TestPropose:
 
 
 class TestLoadModel:
+    def test_the_rbln_gemma4_target_goes_by_upstreams_name(self):
+        # Upstream picks the target's image token attribute by class name, so
+        # every drafter, Eagle3 included, has to see the upstream one.
+        from vllm_rbln.model_executor.models.gemma4 import (
+            RBLNGemma4ForConditionalGeneration,
+        )
+
+        target = RBLNGemma4ForConditionalGeneration.__new__(
+            RBLNGemma4ForConditionalGeneration
+        )
+        name = make_eagle_proposer().get_model_name(target)
+        assert name == "Gemma4ForConditionalGeneration"
+
     @pytest.mark.parametrize("draft_needs_mm_inputs", [False, True])
     def test_multimodal_guard_uses_loaded_draft_capability(
         self, monkeypatch, draft_needs_mm_inputs

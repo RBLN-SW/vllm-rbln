@@ -710,10 +710,6 @@ class TestStage:
 class TestFlashImplInit:
     # __init__ validation guards and derived attributes. Each guard test sets the
     # other args valid so the intended check fires (the guards are ordered).
-    def test_kv_sharing_not_supported(self, cfg):
-        with pytest.raises(NotImplementedError, match="KV sharing"):
-            make_impl(cfg, kv_sharing_target_layer_name="model.layers.0.self_attn")
-
     def test_num_heads_must_divide_num_kv_heads(self, cfg):
         with pytest.raises(AssertionError):
             make_impl(cfg, num_heads=8, num_kv_heads=3)
@@ -934,3 +930,60 @@ class TestForwardSlidingWindow:
             assert mask is md.swa_attn_masks
         else:
             assert mask is None
+
+
+@pytest.mark.maybe_use_device
+class TestForwardSharedKV:
+    """A KV-shared layer passes no K/V: it reads its target's cache through the
+    op the target's own layer uses, masked, and writes zeros the mask hides."""
+
+    HEADS, DIM = 8, 128
+
+    @pytest.mark.parametrize(
+        "sliding_window, target", [(None, "gqa"), (4, "sliding_window_attention_v1")]
+    )
+    def test_reads_through_a_masked_op(self, cfg, monkeypatch, sliding_window, target):
+        impl = make_impl(cfg, sliding_window=sliding_window)
+        recorded = []
+
+        def record(*args, **kwargs):
+            recorded.append((args, kwargs))
+            return torch.zeros(2, self.HEADS, 1, 1, self.DIM)
+
+        for name in (
+            "flash_attention_naive_decode",
+            "sliding_window_attention_v1",
+            "sliding_window_attention_naive_decode",
+            "flash_causal_attention_naive_decode",
+        ):
+            monkeypatch.setattr(
+                flash_attention, name, record if name == target else _unexpected(name)
+            )
+        monkeypatch.setattr(
+            torch.ops.rbln_custom_ops,
+            "gqa",
+            record if target == "gqa" else _unexpected("gqa"),
+            raising=False,
+        )
+        md = RBLNFlashAttentionMetadata(
+            seq_lens=torch.tensor([[6], [0]]),
+            block_tables=torch.tensor([[7, 8, 9], [0, 0, 0]]),
+            is_prefill=False,
+            swa_appends=sliding_window is not None,
+            attn_masks=torch.ones(2, 1, 1, 1, 8),
+        )
+        impl.forward(
+            None,
+            torch.ones(2, self.HEADS, self.DIM),
+            None,
+            None,
+            torch.zeros(1, 1, 1, 1, 4, 1),
+            md,
+            torch.zeros(2, self.HEADS, self.DIM),
+        )
+        args, kwargs = recorded[0]
+        _q, key, value = args[:3]
+        assert not key.any() and not value.any()
+        assert kwargs["attn_mask"] is md.attn_masks
+        if sliding_window is None:
+            assert kwargs["is_causal"]
