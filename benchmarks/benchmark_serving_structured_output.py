@@ -978,7 +978,8 @@ def create_argument_parser():
         "--profile",
         action="store_true",
         help="Use Torch Profiler. The endpoint must be launched with "
-        "VLLM_TORCH_PROFILER_DIR to enable profiler.",
+        '--profiler-config \'{"profiler": "torch", '
+        '"torch_profiler_dir": "/path/to/traces"}\' to enable profiling.',
     )
     parser.add_argument(
         "--result-dir",

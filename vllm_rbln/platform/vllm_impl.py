@@ -75,6 +75,15 @@ def _validate(vllm_config: "VllmConfig") -> None:
     if vllm_config.lora_config is not None:
         raise ValueError("LoRA is not supported on RBLN.")
 
+    if vllm_config.is_mm_encoder_only and (
+        parallel_config.data_parallel_size > 1
+        or parallel_config.pipeline_parallel_size > 1
+    ):
+        raise ValueError(
+            "An encoder-only instance supports neither data nor pipeline "
+            "parallelism on RBLN."
+        )
+
     if model_config.uses_mrope:
         # The RBLN RoPE override covers `RotaryEmbedding` and takes
         # `[batch, seq]` positions; `MRotaryEmbedding` is a sibling class with
@@ -134,12 +143,9 @@ def _validate(vllm_config: "VllmConfig") -> None:
                 f"--block-size {cache_config.block_size}."
             )
 
-    if rbln_config.compile_dtype:
-        from vllm_rbln.compilation import check_dtype_option_supported
-
-        check_dtype_option_supported()
-
-    if not scheduler_config.enable_chunked_prefill:
+    # Upstream turns chunked prefill off for an engine without a KV cache, such
+    # as an encoder-only instance, then validates the config again in EngineCore.
+    if not (scheduler_config.enable_chunked_prefill or vllm_config.is_mm_encoder_only):
         raise ValueError(
             "Disabling chunked prefill is not supported on RBLN. "
             "Please enable chunked prefill by yourself."
@@ -165,6 +171,49 @@ def _validate(vllm_config: "VllmConfig") -> None:
             f"got {max_num_batched_tokens=}, {block_size=}, {max_block_size=}. "
             "Set --block-size within this range."
         )
+
+    chunk = rbln_config.prefill_chunk_size
+    if chunk is not None and chunk > max_num_batched_tokens:
+        raise ValueError(
+            f"--rbln-prefill-chunk-size={chunk} exceeds {max_num_batched_tokens=}."
+        )
+    # TODO(RBLN): DP ranks agree on max_num_batched_tokens as the prefill token
+    # dimension (dp_utils), and the RBLN NIXL connector's resume trim takes it
+    # as the prefill chunk. Lifting a refusal means pointing that feature's
+    # sites at prefill_chunk_size; #1372 lists them.
+    if chunk is not None and chunk < max_num_batched_tokens:
+        kv_transfer = vllm_config.kv_transfer_config
+        connectors = [] if kv_transfer is None else [kv_transfer.kv_connector]
+        if connectors == ["MultiConnector"]:
+            children = kv_transfer.kv_connector_extra_config.get("connectors", [])
+            connectors = [child.get("kv_connector") for child in children]
+        unsupported = [
+            name
+            for name, on in (
+                ("data parallelism", parallel_config.data_parallel_size > 1),
+                (
+                    "RBLN NIXL KV transfer",
+                    any(
+                        name
+                        in (
+                            "RblnNixlConnector",
+                            "RblnNixlPullConnector",
+                            "RblnNixlPushConnector",
+                        )
+                        for name in connectors
+                    ),
+                ),
+            )
+            if on
+        ]
+        if unsupported:
+            raise ValueError(
+                f"--rbln-prefill-chunk-size={chunk} below {max_num_batched_tokens=} "
+                f"is not supported with {', '.join(unsupported)} on RBLN yet."
+            )
+    # Resolved here so the scheduler and runner read one value, and compute_hash,
+    # which runs after this, keys "unset" and "set to the budget" alike.
+    rbln_config.prefill_chunk_size = chunk or max_num_batched_tokens
 
     if envs.VLLM_RBLN_COMPILE_ONLY and envs.VLLM_DISABLE_COMPILE_CACHE:
         # Compile-only compiles each graph and writes the .rbln artifact to
@@ -301,7 +350,8 @@ def _validate_aux_hidden_states_pp_config(vllm_config: "VllmConfig") -> None:
     raise ValueError(
         f"A {vllm_config.speculative_config.method} draft consumes the target's "
         "auxiliary hidden states, and collecting them across pipeline stages "
-        "needs a per-architecture patch that this target does not have yet. "
+        "needs the target's forward to hand them on as the one combined tensor "
+        "this plugin reads, which this target's forward does not do yet. "
         "pipeline_parallel_size="
         f"{vllm_config.parallel_config.pipeline_parallel_size} is supported on "
         f"RBLN only for target architectures {sorted(AUX_PP_TARGET_ARCHS)}, but "
@@ -417,6 +467,20 @@ def _wire(vllm_config: "VllmConfig") -> None:
     rbln_config: RBLNConfig = vllm_config.additional_config
     parallel_config = vllm_config.parallel_config
     scheduler_config = vllm_config.scheduler_config
+
+    ec_config = vllm_config.ec_transfer_config
+    manager_config = vllm_config.ec_manager_config
+    if (
+        ec_config is not None
+        and ec_config.ec_connector == "RblnECCPUConnector"
+        and not vllm_config.model_config.is_encoder_decoder
+        and manager_config.encoder_cache_manager_cls is None
+    ):
+        # NOTE(RBLN): select eviction protection through the manager factory
+        # so an explicitly configured cache manager is never replaced.
+        manager_config.encoder_cache_manager_cls = (
+            "vllm_rbln.v1.core.rbln_scheduler.RBLNEncoderCacheManager"
+        )
 
     if parallel_config.worker_cls == "auto":
         parallel_config.worker_cls = "vllm_rbln.v1.worker.rbln_worker.RBLNWorker"

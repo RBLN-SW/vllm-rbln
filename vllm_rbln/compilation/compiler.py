@@ -12,13 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import inspect
 import os
 from collections.abc import Callable
 from itertools import islice
 from typing import Any, TypeVar, cast
 
-import rebel
 import torch
 from rebel import CompileContext
 from torch._dynamo.variables.invoke_subgraph import InvokeSubgraphHigherOrderVariable
@@ -79,15 +77,6 @@ def mark_decoder_regions(model: torch.nn.Module) -> None:
                 forward = torch.compiler.nested_compile_region(cls.forward)
                 regions[cls] = type(cls.__name__, (cls,), {"forward": forward})
             layer.__class__ = regions[cls]
-
-
-def check_dtype_option_supported() -> None:
-    # Remove once the rebel-compiler pin guarantees the `dtype` option.
-    if "dtype" not in inspect.signature(rebel.compile).parameters:
-        raise ValueError(
-            "compile_dtype needs a rebel-compiler that takes `dtype` as a compile "
-            f"option; installed {rebel.__version__} does not."
-        )
 
 
 def create_compile_context(
