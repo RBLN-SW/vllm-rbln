@@ -181,10 +181,13 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
 
     def decode_layout(
         self, cache_slot_ids: torch.Tensor, block_tables: torch.Tensor
-    ) -> tuple[int, torch.Tensor]:
-        # The GatedDeltaNet linear_attention conv/recurrent state is a fixed
-        # [max_num_seqs] on-device cache indexed by batch row, so each request
-        # is pinned to its scheduler-assigned cache slot for its lifetime.
+    ) -> tuple[int, slice | torch.Tensor]:
+        # The GatedDeltaNet state is a [max_num_seqs] on-device cache, read at
+        # the cache slot forward names for each row. A batch the runner sorts by
+        # length keeps that order; elsewhere the kernels read the rows [0, B) as
+        # one block, so each request is pinned to the row of its cache slot.
+        if getattr(self.get_language_model().rbln_config, "requires_batch_sort", False):
+            return super().decode_layout(cache_slot_ids, block_tables)
         return self.decoder_batch_size, cache_slot_ids.to(torch.long)
 
     def _video_rope_kwargs(
@@ -206,8 +209,8 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
         )
 
     def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
-        """Prefill writes one state row, named by ``batch_idx``; decode arrives
-        laid out by row (see decode_layout)."""
+        """Prefill writes one state row, named by ``batch_idx``; decode names the
+        state row of each batch row, ``state_idx`` (see decode_layout)."""
         if model_input.is_prompt:
             assert model_input.cache_slot_ids is not None
             return self.model.prefill_decoder(
@@ -224,4 +227,6 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
             cache_position=model_input.input_positions,
             position_embed=model_input.position_embed,
             block_tables=model_input.block_tables,
+            # The padding rows share one free slot, as they share dummy_block.
+            state_idx=model_input.cache_slot_ids.view(-1),
         ).logits
