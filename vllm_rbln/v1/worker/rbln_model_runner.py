@@ -517,8 +517,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.prefill_batch_buckets = sorted(
             self.rbln_config.prefill_batch_buckets or [1]
         )
-        self.prefill_chunk_size = self.rbln_config.prefill_chunk_size(
-            self.max_num_tokens
+        self.prefill_chunk_buckets = sorted(
+            {
+                self.rbln_config.prefill_chunk_size(self.max_num_tokens),
+                *(self.rbln_config.prefill_chunk_buckets or []),
+            }
         )
         self.shape_config = ShapeConfig(
             decode_batch_buckets=self.bucketing_manager.decode_batch_buckets,
@@ -1356,7 +1359,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             num_reqs_padded=num_reqs_padded,
             query_len=input_ids.shape[1],
             query_len_padded=(
-                self.prefill_chunk_size if is_prefill else input_ids.shape[1]
+                min(c for c in self.prefill_chunk_buckets if c >= input_ids.shape[1])
+                if is_prefill
+                else input_ids.shape[1]
             ),
         )
         staged_model_inputs = self.input_stager.stage(
@@ -3825,7 +3830,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         """Every model graph once, at the shapes serving will ask for."""
         # 1. prefill
         for num_req in self.prefill_batch_buckets:
-            self._dummy_run(num_req, self.prefill_chunk_size, True)
+            for chunk in self.prefill_chunk_buckets:
+                self._dummy_run(num_req, chunk, True)
 
         # 2. decode
         query_lens = [1]

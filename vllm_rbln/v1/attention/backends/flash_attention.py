@@ -224,13 +224,13 @@ class RBLNFlashAttentionMetadataBuilder(
                 "--rbln-use-custom-kernel: rbln_triton_ops has no "
                 "sliding_window_attention_v1 kernel."
             )
-        if (
-            isinstance(kv_cache_spec, SlidingWindowSpec)
-            and rbln_config.max_prefill_batch > 1
+        if isinstance(kv_cache_spec, SlidingWindowSpec) and (
+            rbln_config.max_prefill_batch > 1 or rbln_config.prefill_chunk_buckets
         ):
             raise NotImplementedError(
                 "Sliding window attention is not supported with "
-                "--rbln-prefill-batch-buckets above 1 on RBLN yet."
+                "--rbln-prefill-batch-buckets above 1 or "
+                "--rbln-prefill-chunk-buckets on RBLN yet."
             )
 
         self._staged: dict[tuple, torch.Tensor] = {}

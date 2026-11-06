@@ -133,6 +133,11 @@ class RBLNConfig(RBLNConfigBase):
     them, each request in a chunk of `max_num_batched_tokens` divided by that
     size. If None, one request per prefill step."""
 
+    prefill_chunk_buckets: list[int] | None = None
+    """Shorter prefill chunk lengths to compile besides the chunk described
+    under `prefill_batch_buckets`. A step runs the shortest that holds its
+    longest chunk."""
+
     use_w8a8: bool = False
     """Opt in to W8A8. W8A16 runs on every RBLN NPU, W8A8 only on the ones
     whose kernels take an fp8 activation."""

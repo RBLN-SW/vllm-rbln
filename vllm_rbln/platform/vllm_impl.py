@@ -115,6 +115,13 @@ def _validate(vllm_config: "VllmConfig") -> None:
     max_num_batched_tokens = scheduler_config.max_num_batched_tokens
     max_block_size = 16384
     max_prefill_batch = rbln_config.max_prefill_batch
+    chunk = rbln_config.prefill_chunk_size(max_num_batched_tokens)
+    chunk_buckets = rbln_config.prefill_chunk_buckets or []
+    if not all(0 < c <= chunk for c in chunk_buckets):
+        raise ValueError(
+            f"--rbln-prefill-chunk-buckets must be within (0, {chunk}], the "
+            f"prefill chunk, got {chunk_buckets}."
+        )
 
     if max_prefill_batch == 1:
         if max_num_batched_tokens > max_block_size:
@@ -142,7 +149,6 @@ def _validate(vllm_config: "VllmConfig") -> None:
                 f"prefill batch bucket {max_prefill_batch}: each request in a "
                 "batched prefill gets an equal chunk."
             )
-        chunk = rbln_config.prefill_chunk_size(max_num_batched_tokens)
         # The compiled prefill store is wrong for a row that crosses into its
         # next block once the batch is larger than one.
         if block_size % chunk or block_size > max_block_size:
@@ -151,6 +157,8 @@ def _validate(vllm_config: "VllmConfig") -> None:
                 f"which needs a block_size that is a multiple of {chunk} and at "
                 f"most {max_block_size}, got {block_size=}."
             )
+
+    if max_prefill_batch > 1 or chunk_buckets:
         unsupported = [
             name
             for name, on in (
@@ -187,7 +195,8 @@ def _validate(vllm_config: "VllmConfig") -> None:
         ]
         if unsupported:
             raise ValueError(
-                "--rbln-prefill-batch-buckets above 1 is not supported with "
+                "--rbln-prefill-batch-buckets above 1 or "
+                "--rbln-prefill-chunk-buckets is not supported with "
                 f"{', '.join(unsupported)} on RBLN yet."
             )
 
