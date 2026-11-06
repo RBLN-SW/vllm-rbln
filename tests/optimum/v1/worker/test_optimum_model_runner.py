@@ -44,6 +44,9 @@ import vllm_rbln.v1.worker.optimum_model_runner as runner_module
 from vllm_rbln.model_executor.models.optimum.model_base import (
     RBLNOptimumMultimodalMixin,
 )
+from vllm_rbln.model_executor.models.optimum.qwen3_vl import (
+    RBLNOptimumQwen3_5ForConditionalGeneration,
+)
 from vllm_rbln.v1.core.optimum_scheduler import RBLNSchedulerOutput
 from vllm_rbln.v1.worker.optimum_model_runner import RBLNOptimumModelRunner
 
@@ -550,6 +553,96 @@ def test_prepare_decode_pins_rows_the_model_names(model_runner):
     assert model_input.cache_slot_ids[3, 0] == 3
     assert model_input.cache_slot_ids[0, 0] == 0
     assert model_input.block_tables[3, 0] != model_input.block_tables[1, 0]
+
+
+# Each request's prompt is one token repeated and it decodes at its own position,
+# so a row's input names the request on it.
+_TOKENS = {"a": 11, "c": 13, "d": 14}
+_POSITIONS = {"a": 4, "c": 5, "d": 3}
+
+
+def _rows_and_slots(model_input):
+    # The request on each row of the padded batch, read off the row's input and
+    # checked against the runner's own placement, and each row's cache slot.
+    by_token = {token: req_id for req_id, token in _TOKENS.items()}
+    rows = [by_token.get(int(t), "pad") for t in model_input.input_tokens[:, 0]]
+    positions = [_POSITIONS.get(req_id, 0) for req_id in rows]
+    assert model_input.input_positions[:, 0].tolist() == positions
+    placed = ["pad"] * model_input.padded_batch_size
+    batch_rows = torch.arange(model_input.padded_batch_size)[model_input.batch_rows]
+    for req_id, row in zip(
+        model_input.running_requests_ids, batch_rows.tolist(), strict=True
+    ):
+        placed[row] = req_id
+    assert placed == rows
+    return rows, model_input.cache_slot_ids.view(-1).tolist()
+
+
+@pytest.mark.parametrize(
+    ("requires_batch_sort", "step1", "step2"),
+    [
+        (
+            False,
+            (["a", "d", "c", "pad"], [0, 1, 2, 3]),
+            (["pad", "d", "c", "pad"], [0, 1, 2, 0]),
+        ),
+        (
+            True,
+            (["c", "a", "d", "pad"], [2, 0, 1, 3]),
+            (["c", "d", "pad", "pad"], [2, 1, 0, 0]),
+        ),
+    ],
+    ids=["pinned", "sorted"],
+)
+def test_qwen3_5_decode_rows_and_cache_slots(
+    model_runner, requires_batch_sort, step1, step2
+):
+    """Qwen3.5's decode batch over two steps, four cache slots.
+
+    a, b and c took slots 0, 1 and 2; b finished and d took slot 1. The lengths
+    are c > a > d. Step 1 decodes a, d and c; before step 2, a finishes. Each
+    request sits on the row of its slot unless the batch must stay sorted by
+    length, and the padding rows share the lowest slot the step leaves free.
+    """
+    qwen3_5 = RBLNOptimumQwen3_5ForConditionalGeneration.__new__(
+        RBLNOptimumQwen3_5ForConditionalGeneration
+    )
+    qwen3_5.decoder_batch_size = 4
+    qwen3_5.use_multiple_decoder = False
+    qwen3_5.model = SimpleNamespace(
+        rbln_config=SimpleNamespace(requires_batch_sort=requires_batch_sort)
+    )
+    model_runner.model.decode_layout = qwen3_5.decode_layout
+    model_runner.sort_batch_by_length = requires_batch_sort
+    model_runner._update_states(
+        _schedule_new_request(
+            "a",
+            "c",
+            "d",
+            block_ids=([1],),
+            outer_block_ids=[0],
+            token_ids_by_req={
+                req_id: [_TOKENS[req_id]] * length
+                for req_id, length in (("a", 5), ("c", 6), ("d", 4))
+            },
+        )
+    )
+    batch = model_runner.input_batch
+    for req_id, position in _POSITIONS.items():
+        batch.num_computed_tokens_cpu[batch.req_id_to_index[req_id]] = position
+
+    model_input = model_runner._prepare_decode(_decode_step(["a", "d", "c"], [0, 1, 2]))
+    assert _rows_and_slots(model_input) == step1
+
+    scheduler_output = _decode_scheduler_output(["d", "c"], [1, 2])
+    scheduler_output.finished_req_ids = {"a"}
+    scheduler_output.scheduled_cached_reqs.num_computed_tokens = [
+        _POSITIONS["d"],
+        _POSITIONS["c"],
+    ]
+    model_runner._update_states(scheduler_output)
+    model_input = model_runner._prepare_decode(scheduler_output)
+    assert _rows_and_slots(model_input) == step2
 
 
 def test_execute_model_keeps_the_running_rows_of_the_padded_decode_batch(
