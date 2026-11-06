@@ -555,14 +555,26 @@ def test_prepare_decode_pins_rows_the_model_names(model_runner):
     assert model_input.block_tables[3, 0] != model_input.block_tables[1, 0]
 
 
+# Each request's prompt is one token repeated and it decodes at its own position,
+# so a row's input names the request on it.
+_TOKENS = {"a": 11, "c": 13, "d": 14}
+_POSITIONS = {"a": 4, "c": 5, "d": 3}
+
+
 def _rows_and_slots(model_input):
-    # The request on each row of the padded batch, and each row's cache slot.
-    rows = ["pad"] * model_input.padded_batch_size
-    placed = torch.arange(model_input.padded_batch_size)[model_input.batch_rows]
+    # The request on each row of the padded batch, read off the row's input and
+    # checked against the runner's own placement, and each row's cache slot.
+    by_token = {token: req_id for req_id, token in _TOKENS.items()}
+    rows = [by_token.get(int(t), "pad") for t in model_input.input_tokens[:, 0]]
+    positions = [_POSITIONS.get(req_id, 0) for req_id in rows]
+    assert model_input.input_positions[:, 0].tolist() == positions
+    placed = ["pad"] * model_input.padded_batch_size
+    batch_rows = torch.arange(model_input.padded_batch_size)[model_input.batch_rows]
     for req_id, row in zip(
-        model_input.running_requests_ids, placed.tolist(), strict=True
+        model_input.running_requests_ids, batch_rows.tolist(), strict=True
     ):
-        rows[row] = req_id
+        placed[row] = req_id
+    assert placed == rows
     return rows, model_input.cache_slot_ids.view(-1).tolist()
 
 
@@ -609,15 +621,25 @@ def test_qwen3_5_decode_rows_and_cache_slots(
             "d",
             block_ids=([1],),
             outer_block_ids=[0],
-            token_ids_by_req={"a": [1] * 5, "c": [1] * 6, "d": [1] * 4},
+            token_ids_by_req={
+                req_id: [_TOKENS[req_id]] * length
+                for req_id, length in (("a", 5), ("c", 6), ("d", 4))
+            },
         )
     )
+    batch = model_runner.input_batch
+    for req_id, position in _POSITIONS.items():
+        batch.num_computed_tokens_cpu[batch.req_id_to_index[req_id]] = position
 
     model_input = model_runner._prepare_decode(_decode_step(["a", "d", "c"], [0, 1, 2]))
     assert _rows_and_slots(model_input) == step1
 
     scheduler_output = _decode_scheduler_output(["d", "c"], [1, 2])
     scheduler_output.finished_req_ids = {"a"}
+    scheduler_output.scheduled_cached_reqs.num_computed_tokens = [
+        _POSITIONS["d"],
+        _POSITIONS["c"],
+    ]
     model_runner._update_states(scheduler_output)
     model_input = model_runner._prepare_decode(scheduler_output)
     assert _rows_and_slots(model_input) == step2
