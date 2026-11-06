@@ -657,11 +657,14 @@ class TestEcConsumer:
             ec_connector_metadata=ECConnectorMetadata(), finished_req_ids=set()
         )
 
-        _, model_kwargs, ec_output = runner._preprocess(
+        _, model_kwargs, layout, ec_output = runner._preprocess(
             scheduler_output, 1, 1, 4, torch.tensor([3])
         )
 
-        assert torch.equal(model_kwargs["mm_embeds"], received.view(1, 4, 2))
+        embeds, _ = runner.input_stager.stage_mm_embeds(
+            model_kwargs["mm_embeds"], model_kwargs["mm_mask"], 2, layout
+        )
+        assert torch.equal(embeds, received.view(1, 4, 2))
         assert ec_output.finished_recving == {"h0"}
 
     def test_a_stage_that_samples_nothing_still_reports_its_loads(self):
@@ -2526,10 +2529,15 @@ class TestExecuteModelFlushesAfterTheSubmission:
                 num_reqs_padded=1, query_len=1, num_tokens_padded=1
             ),
             _build_attention_metadata=lambda **kw: ("ATTN", None),
+            attn_groups=[],
             _preprocess=lambda *a, **kw: (
                 SimpleNamespace(as_kwargs=lambda: {}),
                 {},
+                mr.InputLayout(1, 1, 1, 1),
                 None,
+            ),
+            input_stager=SimpleNamespace(
+                stage=lambda **kw: SimpleNamespace(as_kwargs=lambda: {})
             ),
             _bookkeeping_and_output=lambda *a, **kw: "OUTPUT",
             input_batch=SimpleNamespace(num_reqs=1, req_ids=["r0"]),

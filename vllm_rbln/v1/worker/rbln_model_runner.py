@@ -1101,6 +1101,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         num_reqs_padded: int,
         logits_indices: torch.Tensor | None = None,
         back_pad: torch.Tensor | None = None,
+        defer_staging: bool = False,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -1181,6 +1182,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     is_prompt_sorted=self.sort_batch_by_length,
                     num_accepted=num_accepted,
                     state_load_pos=state_load_pos,
+                    defer_staging=defer_staging,
                 )
 
                 for layer_name in attn_group.layer_names:
@@ -1383,15 +1385,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
     ) -> tuple[
         StagedModelInputs,
         dict[str, Any],
+        InputLayout,
         ECConnectorOutput | None,
     ]:
-        """
-        :return: tuple[
-            staged_model_inputs,
-            model_kwargs,
-            ec_connector_output,
-        ]
-        """
+        """Prepare CPU inputs and model kwargs before staging graph inputs."""
         # For text-only models
         input_ids = self.input_ids[:num_input_tokens].view(num_reqs, -1)
         positions = self.positions[:num_input_tokens].view(num_reqs, -1)
@@ -1411,7 +1408,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 self.prefill_chunk_size if is_prefill else input_ids.shape[1]
             ),
         )
-        staged_model_inputs = self.input_stager.stage(
+        model_inputs = StagedModelInputs(
             input_ids=input_ids,
             positions=positions,
             intermediate_tensors=intermediate_tensors,
@@ -1419,7 +1416,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             token_indices=logits_indices
             if is_prefill and self.use_wrapped_compute_logits
             else None,
-            layout=layout,
         )
 
         model_kwargs = {
@@ -1437,18 +1433,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 mm_rows, mm_mask = self._gather_mm_embeddings(
                     scheduler_output, num_input_tokens
                 )
-            model_kwargs["mm_embeds"], model_kwargs["mm_mask"] = (
-                self.input_stager.stage_mm_embeds(
-                    mm_rows,
-                    mm_mask.view(num_reqs, -1, 1),
-                    self.model_config.get_hidden_size(),
-                    layout,
-                )
-            )
+            model_kwargs["mm_embeds"] = mm_rows
+            model_kwargs["mm_mask"] = mm_mask.view(num_reqs, -1, 1)
 
         return (
-            staged_model_inputs,
+            model_inputs,
             model_kwargs,
+            layout,
             ec_connector_output,
         )
 
@@ -1993,12 +1984,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     num_reqs_padded=batch_desc.num_reqs_padded,
                     logits_indices=logits_indices,
                     back_pad=self.decode_back_pad,
+                    defer_staging=True,
                 )
             )
 
             (
-                staged_model_inputs,
+                model_inputs,
                 model_kwargs,
+                input_layout,
                 ec_connector_output,
             ) = self._preprocess(
                 scheduler_output,
@@ -2010,8 +2003,29 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             )
 
             if self.use_async_scheduling:
-                self._repair_staged_input_ids(staged_model_inputs, req_ids)
+                self._repair_staged_input_ids(model_inputs, req_ids)
 
+            staged_model_inputs = self.input_stager.stage(
+                **model_inputs.as_kwargs(), layout=input_layout
+            )
+            if (
+                self.supports_mm_inputs
+                and self.is_prefill
+                and get_pp_group().is_first_rank
+            ):
+                model_kwargs["mm_embeds"], model_kwargs["mm_mask"] = (
+                    self.input_stager.stage_mm_embeds(
+                        model_kwargs["mm_embeds"],
+                        model_kwargs["mm_mask"],
+                        self.model_config.get_hidden_size(),
+                        input_layout,
+                    )
+                )
+
+            for groups in self.attn_groups:
+                for group in groups:
+                    builder = group.get_metadata_builder(0)
+                    builder.stage(attn_metadata[group.layer_names[0]])
         # Run the model.
         # With spec decode, defer connector finalization (wait_for_save + clear
         # metadata) until after the draft runs in sample_tokens() so the draft
