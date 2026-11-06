@@ -90,7 +90,7 @@ def test_the_vision_encoder_matches_hfs(width, height):
         vision_tower=tower,
         embed_vision=_Identity(),
         model_dtype=torch.float32,
-        mm_encoder_buckets=[90],
+        mm_encoder_patch_buckets=[90],
     )
     pixels, positions = _image(width, height, num_patches=81)
 
@@ -112,7 +112,7 @@ def test_the_rotary_tables_are_built_once_not_per_image(monkeypatch):
         vision_tower=tower,
         embed_vision=_Identity(),
         model_dtype=torch.float32,
-        mm_encoder_buckets=[90],
+        mm_encoder_patch_buckets=[90],
     )
     first, second = _image(6, 3, num_patches=81), _image(3, 9, num_patches=81)
     with torch.no_grad():
@@ -136,7 +136,7 @@ def test_an_image_beyond_the_bucket_is_refused():
         vision_tower=_vision_tower(),
         embed_vision=_Identity(),
         model_dtype=torch.float32,
-        mm_encoder_buckets=[9],
+        mm_encoder_patch_buckets=[9],
     )
     pixels, positions = _image(6, 3, num_patches=18)
 
@@ -167,7 +167,7 @@ def _recording_model(buckets):
         vision_tower=tower,
         embed_vision=_Identity(),
         model_dtype=torch.float32,
-        mm_encoder_buckets=buckets,
+        mm_encoder_patch_buckets=buckets,
         config=SimpleNamespace(vision_config=tower.config),
     )
     object.__setattr__(model, "_mm_encoder", encoder)
@@ -189,7 +189,7 @@ def test_an_image_takes_the_smallest_bucket_holding_it(width, height, bucket):
 def test_warm_up_runs_every_bucket_once_full():
     model, calls = _recording_model([18, 45, 90])
 
-    model.warm_up_mm_encoder()
+    model.warmup_mm_encoder()
 
     assert calls == [(18, 18), (45, 45), (90, 90)]
 
@@ -198,7 +198,7 @@ def test_warm_up_without_an_encoder_runs_nothing():
     model, calls = _recording_model([18])
     object.__setattr__(model, "_mm_encoder", None)
 
-    model.warm_up_mm_encoder()
+    model.warmup_mm_encoder()
 
     assert calls == []
 

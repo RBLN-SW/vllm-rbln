@@ -43,7 +43,6 @@ from vllm.model_executor.models.interfaces_base import (
     is_pooling_model,
     is_text_generation_model,
 )
-from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalKwargsItem
 from vllm.multimodal.utils import group_and_batch_mm_kwargs
 from vllm.platforms import current_platform
@@ -119,13 +118,14 @@ from vllm_rbln.compilation import (
 )
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import (
+    SupportsBlockAuxKVCaches,
     flush_deferred_loads,
+    iter_kv_connectors,
 )
 from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.logger import init_logger
 from vllm_rbln.model_executor.models.interfaces import (
     SupportsRBLNMultiModal,
-    supports_rbln_mm_encoder_warmup,
     supports_rbln_mm_prefix,
     supports_rbln_multimodal,
 )
@@ -347,7 +347,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.kv_cache_block_axes: dict[str, int] = {}
         self.kv_cache_bases: list[torch.Tensor] = []
         self.kv_cache_view_infos: list[KVCacheViewInfo] = []
-        self.aux_kv_cache_layers: list[str] = []
+        self.aux_kv_cache_specs: dict[str, RBLNBlockAuxSpec] = {}
         # Set in initialize_kv_cache: a recurrent state (a MambaSpec group) under
         # speculative decoding, whose verify step replays the accepted drafts.
         self.replays_accepted_drafts = False
@@ -1421,13 +1421,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         if self.supports_mm_inputs and is_prefill and get_pp_group().is_first_rank:
             self._execute_mm_encoder(scheduler_output)
-            mm_embeds, mm_mask = self._gather_mm_embeddings(
+            mm_rows, mm_mask = self._gather_mm_embeddings(
                 scheduler_output, num_input_tokens
             )
             model_kwargs["mm_embeds"], model_kwargs["mm_mask"] = (
                 self.input_stager.stage_mm_embeds(
-                    mm_embeds.view(num_reqs, -1, mm_embeds.shape[-1]),
+                    mm_rows,
                     mm_mask.view(num_reqs, -1, 1),
+                    self.model_config.get_hidden_size(),
                     layout,
                 )
             )
@@ -1519,15 +1520,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self,
         scheduler_output: RBLNSchedulerOutput,
         num_tokens: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Scatter the cached encoder outputs over this step's flat tokens."""
-
-        hidden_size = self.model_config.get_hidden_size()
-        mm_embeds = torch.zeros(num_tokens, hidden_size, dtype=self.dtype)
+    ) -> tuple[list[tuple[int, int, torch.Tensor]], torch.Tensor]:
+        mm_rows: list[tuple[int, int, torch.Tensor]] = []
         is_mm = torch.zeros(num_tokens, dtype=torch.bool)
 
         req_start_idx = 0
-        for req_id in self.input_batch.req_ids:
+        for req_index, req_id in enumerate(self.input_batch.req_ids):
             num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
             req_state = self.requests[req_id]
             num_computed_tokens = req_state.num_computed_tokens
@@ -1559,50 +1557,42 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     f"Encoder cache miss for {mm_feature.identifier}."
                 )
 
-                dst_start = req_start_idx + start_pos - num_computed_tokens
-                dst = slice(dst_start + start_idx, dst_start + end_idx)
+                first_token = start_pos - num_computed_tokens + start_idx
+                dst_start = req_start_idx + first_token
+                dst = slice(dst_start, dst_start + end_idx - start_idx)
+                embeds = encoder_output[embeds_start:embeds_end].to(self.dtype)
                 if pos_info.is_embed is None:
-                    rows = torch.ones(end_idx - start_idx, dtype=torch.bool)
-                else:
-                    rows = pos_info.is_embed[start_idx:end_idx]
-                mm_embeds[dst][rows] = encoder_output[embeds_start:embeds_end].to(
-                    self.dtype
-                )
+                    assert embeds.shape[0] == end_idx - start_idx
+                    is_mm[dst] = True
+                    mm_rows.append((req_index, first_token, embeds))
+                    continue
+
+                rows = pos_info.is_embed[start_idx:end_idx]
                 is_mm[dst] |= rows
+                edges = torch.nn.functional.pad(rows.to(torch.int8), (1, 1)).diff()
+                run_starts = (edges == 1).nonzero().flatten().tolist()
+                run_ends = (edges == -1).nonzero().flatten().tolist()
+                taken = 0
+                for run_start, run_end in zip(run_starts, run_ends):
+                    run_rows = embeds[taken : taken + run_end - run_start]
+                    mm_rows.append((req_index, first_token + run_start, run_rows))
+                    taken += run_end - run_start
+                assert taken == embeds.shape[0]
 
             req_start_idx += num_scheduled_tokens
 
-        return mm_embeds, is_mm.to(self.dtype).unsqueeze(-1)
+        return mm_rows, is_mm.to(self.dtype).unsqueeze(-1)
 
     def _warmup_mm_encoder(self) -> None:
-        """Encode the processor's largest dummy image once before serving.
-
-        The vision encoder compiles on its first call, so without this the
-        first image request would pay for it. The dummy item is the one
-        upstream profiles the encoder with: the image size that yields the
-        most tokens, which fills the encoder's patch bucket. A model compiled
-        at several sizes runs each of them itself."""
+        """Materialize every encoder bucket before serving and sizing KV caches."""
         if not (self.supports_mm_inputs and get_pp_group().is_first_rank):
             return
-        if supports_rbln_mm_encoder_warmup(self.model):
-            self.model.warm_up_mm_encoder()
+        mm_config = self.model_config.multimodal_config
+        assert mm_config is not None
+        if all(mm_config.get_limit_per_prompt(m) <= 0 for m in ("image", "video")):
             return
-        processor = MULTIMODAL_REGISTRY.create_processor(self.model_config)
-        # Only images reach the RBLN vision encoder; the model rejects video.
-        if processor.info.allowed_mm_limits.get("image", 0) <= 0:
-            return
-        dummy_inputs = processor.get_dummy_mm_inputs(
-            mm_counts={"image": 1}, scheduler_config=self.scheduler_config
-        )
-        mm_kwargs = [("image", item) for item in dummy_inputs["mm_kwargs"]["image"]]
-
-        model = cast(SupportsMultiModal, self.model)
         with torch.inference_mode():
-            for _modality, num_items, mm_kwargs_batch in group_and_batch_mm_kwargs(
-                mm_kwargs, device="cpu"
-            ):
-                outputs = model.embed_multimodal(**mm_kwargs_batch)
-                sanity_check_mm_encoder_outputs(outputs, expected_num_items=num_items)
+            cast(SupportsRBLNMultiModal, self.model).warmup_mm_encoder()
 
     def _sample(
         self,
@@ -2975,10 +2965,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             self.supports_mm_inputs and self.is_prefill and get_pp_group().is_first_rank
         ):
             return {}
-        shape = (layout.num_reqs, layout.query_len)
         mm_embeds, mm_mask = self.input_stager.stage_mm_embeds(
-            torch.zeros(*shape, self.model_config.get_hidden_size(), dtype=self.dtype),
-            torch.zeros(*shape, 1, dtype=self.dtype),
+            [],
+            torch.zeros(layout.num_reqs, layout.query_len, 1, dtype=self.dtype),
+            self.model_config.get_hidden_size(),
             layout,
         )
         return {"mm_embeds": mm_embeds, "mm_mask": mm_mask}
@@ -3560,7 +3550,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         dynamic_axis = 0 if dynamic_kv_enabled(self.vllm_config) else None
         tensors: dict[tuple, torch.Tensor] = {}
         ordinals: defaultdict[tuple, int] = defaultdict(int)
-        aux_layers: list[str] = []
+        aux_specs: dict[str, RBLNBlockAuxSpec] = {}
         forward_context = self.compilation_config.static_forward_context
         for layer_name, module in forward_context.items():
             get_aux_spec = getattr(module, "get_aux_cache_spec", None)
@@ -3586,12 +3576,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 dynamic_axis=dynamic_axis,
             )
             block_axes[layer_name] = 0
-            aux_layers.append(layer_name)
-        self.aux_kv_cache_layers = aux_layers
+            aux_specs[layer_name] = spec
+        self.aux_kv_cache_specs = aux_specs
         if tensors:
             logger.info(
                 "Block-aux KV caches: %d layers on %d tensors, %.3f GiB",
-                len(aux_layers),
+                len(aux_specs),
                 len(tensors),
                 sum(t.numel() * t.element_size() for t in tensors.values()) / 2**30,
             )
@@ -3649,6 +3639,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # backends for that group only supports block_size 64, we will return
         # kernel_block_size 64 and split the 256-token-block to 4 blocks with 64
         # tokens each.
+        assert self.rbln_config.prefill_chunk_size is not None  # resolved at start-up
         kernel_block_sizes = prepare_kernel_block_sizes(
             kv_cache_config,
             self.attn_groups,
@@ -3656,7 +3647,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 enable_prefix_caching=self.cache_config.enable_prefix_caching,
                 sub_block_cache=self.rbln_config.enable_sub_block_cache,
                 block_size=self.cache_config.block_size,
-                max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+                prefill_chunk_size=self.rbln_config.prefill_chunk_size,
                 kv_cache_config=kv_cache_config,
                 sub_block_size=self.rbln_config.sub_block_size,
             ),
@@ -3669,6 +3660,21 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # Reinitialize need to after initialize_attn_backend
         self.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
         self.initialize_kv_cache_tensors(kv_cache_config, kernel_block_sizes)
+        if self.aux_kv_cache_specs and has_kv_transfer_group():
+            connectors = list(iter_kv_connectors(get_kv_transfer_group()))
+            unsupported = [
+                type(connector).__name__
+                for connector in connectors
+                if not isinstance(connector, SupportsBlockAuxKVCaches)
+            ]
+            if unsupported:
+                raise NotImplementedError(
+                    "Block-aux KV cache transfer is not supported by: "
+                    f"{', '.join(unsupported)}. "
+                    "Auxiliary caches must be transferred with their owners' blocks."
+                )
+            for connector in connectors:
+                connector.register_block_aux_kv_caches(self.aux_kv_cache_specs)
 
         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
         self.cache_config.num_cpu_blocks = 0
@@ -4082,7 +4088,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # the model directly, bypassing the connector lifecycle entirely.
         logger.info("Compile and warming up model.")
 
-        sig = mega_cache.config_signature(self.vllm_config)
+        extra_hash_factors: dict[str, object] = {}
+        if self.supports_mm_inputs:
+            buckets = cast(SupportsRBLNMultiModal, self.model).mm_encoder_patch_buckets
+            if buckets:
+                extra_hash_factors["mm_encoder_patch_buckets"] = buckets
+        sig = mega_cache.config_signature(
+            self.vllm_config, extra_hash_factors=extra_hash_factors
+        )
         mega_cache.load(self.model_config.model, sig)
         with set_compile_stage("warmup"), self.offload_context():
             self.run_model_graphs()

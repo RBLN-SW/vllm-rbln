@@ -30,7 +30,8 @@ class SupportsRBLNMultiModal(Protocol):
     and hands the result in as ``inputs_embeds``. The RBLN compiled graph takes a
     fixed set of inputs, so the runner instead stages the per-token embeddings as
     ``mm_embeds`` ``[B, L, H]`` and a 0/1 ``mm_mask`` ``[B, L, 1]``, and the model
-    selects between them and its text embeddings inside the graph.
+    selects between them and its text embeddings inside the graph. Where the mask
+    is 0, ``mm_embeds`` holds finite leftovers rather than zeros: select, not add.
 
     Only a model declaring this takes the runner's multimodal path. An upstream
     multimodal model accepts the two kwargs through ``**kwargs`` and ignores
@@ -38,10 +39,16 @@ class SupportsRBLNMultiModal(Protocol):
     """
 
     merges_mm_embeds_in_graph: ClassVar[Literal[True]] = True
+    mm_encoder_patch_buckets: list[int]
+    """Resolved, sorted, unique patch counts used by encoder warmup."""
 
     def compile_mm_encoder(self, compile_fn: Callable[[nn.Module], nn.Module]) -> None:
         """Compile the multimodal encoder with the runner's compile wrapper. A
         rank that owns no encoder returns without calling ``compile_fn``."""
+        ...
+
+    def warmup_mm_encoder(self) -> None:
+        """Run every encoder graph once; return if this rank owns no encoder."""
         ...
 
 
@@ -69,31 +76,9 @@ def supports_rbln_mm_prefix(model: object) -> TypeIs[SupportsRBLNMmPrefix]:
     return isinstance(model, SupportsRBLNMmPrefix)
 
 
-@runtime_checkable
-class SupportsRBLNMmEncoderWarmup(Protocol):
-    """A multimodal model whose encoder is compiled at more than one input size.
-
-    The runner's warm-up encodes the processor's one dummy item, which reaches
-    one size; such a model runs its encoder at every size itself instead.
-    """
-
-    def warm_up_mm_encoder(self) -> None:
-        """Run the compiled encoder once at every input size it serves. A rank
-        that owns no encoder returns without running it."""
-        ...
-
-
-def supports_rbln_mm_encoder_warmup(
-    model: object,
-) -> TypeIs[SupportsRBLNMmEncoderWarmup]:
-    return isinstance(model, SupportsRBLNMmEncoderWarmup)
-
-
 __all__ = [
-    "SupportsRBLNMmEncoderWarmup",
     "SupportsRBLNMmPrefix",
     "SupportsRBLNMultiModal",
-    "supports_rbln_mm_encoder_warmup",
     "supports_rbln_mm_prefix",
     "supports_rbln_multimodal",
 ]

@@ -27,6 +27,7 @@ import os
 import re
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from tests.vllm.vllm_config import make_vllm_config
@@ -113,25 +114,21 @@ class TestSignatureComposition:
         static = mega_cache.config_signature(_stub_config())
         assert dynamic != static
 
-    def test_max_soft_tokens_invalidates(self):
-        # compute_hash() leaves mm_processor_kwargs out, but Gemma4 compiles
-        # its vision encoder and image prefill to the max_soft_tokens they carry.
-        assert _signature_with_mm_kwargs(
-            {"max_soft_tokens": 70}
-        ) != _signature_with_mm_kwargs({"max_soft_tokens": 280})
-
-    def test_other_mm_processor_kwargs_keep_the_key(self):
-        # Without max_soft_tokens the key is the one a text model gets, so no
-        # other model loses its bundle to this factor.
-        text_only = mega_cache.config_signature(_stub_config())
-        assert _signature_with_mm_kwargs(None) == text_only
-        assert _signature_with_mm_kwargs({"do_pan_and_scan": True}) == text_only
-
-
-def _signature_with_mm_kwargs(kwargs) -> str:
-    config = _stub_config()
-    config.model_config.multimodal_config = SimpleNamespace(mm_processor_kwargs=kwargs)
-    return mega_cache.config_signature(config)
+    def test_extra_graph_factors_invalidate(self):
+        config = _stub_config()
+        base = mega_cache.config_signature(config)
+        assert mega_cache.config_signature(config, extra_hash_factors={}) == base
+        factors = {"extra_graph_shapes": [8, 16], "extra_graph_version": 1}
+        first = mega_cache.config_signature(config, extra_hash_factors=factors)
+        assert first != base
+        assert (
+            mega_cache.config_signature(
+                config, extra_hash_factors=dict(reversed(factors.items()))
+            )
+            == first
+        )
+        factors["extra_graph_shapes"] = [8, 32]
+        assert mega_cache.config_signature(config, extra_hash_factors=factors) != first
 
 
 # Variables the built graph depends on and RBLNConfig does not carry, so this
@@ -269,6 +266,50 @@ class TestSignatureVllmConfig:
         # and a partly-hitting bundle costs a duplicate weight set on device.
         base = mega_cache.config_signature(make_vllm_config())
         assert mega_cache.config_signature(make_vllm_config(**overrides)) != base
+
+    @pytest.mark.parametrize(
+        ("before", "after"),
+        [
+            (None, {"mm_encoder_patch_buckets": [2304]}),
+            (
+                {"mm_encoder_patch_buckets": [2304]},
+                {"mm_encoder_patch_buckets": [1024, 2304]},
+            ),
+            (
+                {"mm_encoder_patch_buckets": [2304]},
+                {"mm_encoder_patch_buckets": [2304, 12288]},
+            ),
+        ],
+        ids=["text-to-mm", "image-bucket-added", "video-enabled"],
+    )
+    def test_mm_encoder_buckets_invalidate(self, before, after):
+        config = make_vllm_config()
+        assert mega_cache.config_signature(
+            config, extra_hash_factors=after
+        ) != mega_cache.config_signature(config, extra_hash_factors=before)
+
+    @pytest.mark.parametrize(
+        "options",
+        [
+            {"limit_per_prompt": {"image": 2, "video": 1}},
+            {"limit_per_prompt": {}},
+            {"limit_per_prompt": {"image": 999, "video": 999}},
+            {"limit_per_prompt": {"image": {"count": 1, "width": 512, "height": 512}}},
+            {"mm_processor_kwargs": {"videos_kwargs": {"fps": np.int64(2)}}},
+        ],
+        ids=["count", "implicit-limit", "explicit-limit", "dummy-size", "numpy-fps"],
+    )
+    def test_mm_inputs_key_only_through_the_resolved_buckets(self, options):
+        from vllm.config import MultiModalConfig
+
+        factors = {"mm_encoder_patch_buckets": [2304, 12288]}
+        config = make_vllm_config()
+        config.model_config.multimodal_config = MultiModalConfig(
+            limit_per_prompt={"image": 1, "video": 1}
+        )
+        base = mega_cache.config_signature(config, extra_hash_factors=factors)
+        config.model_config.multimodal_config = MultiModalConfig(**options)
+        assert mega_cache.config_signature(config, extra_hash_factors=factors) == base
 
     def test_speculative_tokens_invalidate(self):
         # num_spec_tokens sets the decode query_len the warm-up compiles, and

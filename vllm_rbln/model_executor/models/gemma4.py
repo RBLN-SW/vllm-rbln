@@ -41,7 +41,6 @@ from vllm.multimodal.parse import MultiModalDataItems
 from vllm.sequence import IntermediateTensors
 
 from vllm_rbln.model_executor.models.interfaces import (
-    SupportsRBLNMmEncoderWarmup,
     SupportsRBLNMultiModal,
 )
 
@@ -208,7 +207,7 @@ class RBLNGemma4MultiModalProcessor(Gemma4MultiModalProcessor):
     dummy_inputs=Gemma4DummyInputsBuilder,
 )
 class RBLNGemma4ForConditionalGeneration(
-    Gemma4ForConditionalGeneration, SupportsRBLNMultiModal, SupportsRBLNMmEncoderWarmup
+    Gemma4ForConditionalGeneration, SupportsRBLNMultiModal
 ):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         if vllm_config.parallel_config.data_parallel_size > 1:
@@ -225,7 +224,7 @@ class RBLNGemma4ForConditionalGeneration(
         # One compiled encoder shape per soft token budget up to the cap; an
         # image or frame is padded to the smallest that holds its patches.
         pool = self.config.vision_config.pooling_kernel_size
-        self.mm_encoder_buckets = [
+        self.mm_encoder_patch_buckets = [
             budget * pool**2
             for budget in _SUPPORTED_SOFT_TOKENS
             if budget <= self.mm_soft_token_cap
@@ -288,14 +287,14 @@ class RBLNGemma4ForConditionalGeneration(
         encoder = _RBLNGemma4VisionEncoder(self.vision_tower, self.embed_vision)
         object.__setattr__(self, "_mm_encoder", compile_fn(encoder.eval()))
 
-    def warm_up_mm_encoder(self) -> None:
+    def warmup_mm_encoder(self) -> None:
         if self._mm_encoder is None:
             return
         vision_config = self.config.vision_config
         pool = vision_config.pooling_kernel_size
         patch_pixels = 3 * vision_config.patch_size**2
         with torch.inference_mode():
-            for bucket in self.mm_encoder_buckets:
+            for bucket in self.mm_encoder_patch_buckets:
                 # A full grid whose sides are multiples of the pooling kernel.
                 cells = bucket // pool**2
                 rows = max(d for d in range(1, math.isqrt(cells) + 1) if cells % d == 0)
@@ -322,11 +321,11 @@ class RBLNGemma4ForConditionalGeneration(
         tower = self.vision_tower
         valid = (pixel_position_ids >= 0).all(dim=-1)
         num_patches = int(valid.sum())
-        assert num_patches <= self.mm_encoder_buckets[-1], (
+        assert num_patches <= self.mm_encoder_patch_buckets[-1], (
             f"an image of {num_patches} patches exceeds the vision encoder's "
-            f"{self.mm_encoder_buckets[-1]}-patch bucket"
+            f"{self.mm_encoder_patch_buckets[-1]}-patch bucket"
         )
-        bucket = next(b for b in self.mm_encoder_buckets if b >= num_patches)
+        bucket = next(b for b in self.mm_encoder_patch_buckets if b >= num_patches)
         # Fixed dtypes, so warm-up and serving reach the same compiled graphs.
         positions = torch.full((1, bucket, 2), -1, dtype=torch.long)
         positions[0, :num_patches] = pixel_position_ids[valid]
