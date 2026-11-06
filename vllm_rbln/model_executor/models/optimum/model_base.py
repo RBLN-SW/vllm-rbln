@@ -14,6 +14,7 @@
 import json
 import math
 import os
+from copy import deepcopy
 from dataclasses import replace
 from typing import Any
 
@@ -40,7 +41,6 @@ from vllm_rbln.utils.optimum.paths import is_compiled_dir
 from vllm_rbln.utils.optimum.registry import get_rbln_model_info
 
 from .base import ModelInputForRBLN
-from .compilation import RBLNCompileSpec
 
 logger = init_logger(__name__)
 
@@ -220,30 +220,19 @@ class RBLNOptimumModelBase(nn.Module):
                     valid_path,
                     rbln_config=rbln_overrides,
                 )
-                self.vllm_config.model_config.model = valid_path
         else:
             assert not self._is_ec_producer_only(), (
                 "Disaggregated Encoder is only supported for pre-compiled model."
             )
             # cache miss: compile the model and save it to the cache for reuse.
-            spec = RBLNCompileSpec.for_architecture(
-                hf_config,
-                batch_size=self.scheduler_config.max_num_seqs,
-                block_size=get_attn_block_size(self.vllm_config),
-                max_model_len=self.model_config.max_model_len,
-                num_devices=rbln_config.num_devices_per_local_rank,
-                # Resolved during sync (from_optimum/from_vllm) into
-                # max_num_batched_tokens; pin it at compile time so the compiled
-                # model matches the value used for KV-cache block padding.
-                prefill_chunk_size=self.vllm_config.scheduler_config.max_num_batched_tokens,
-                memory_budget=self.vllm_config.cache_config.gpu_memory_utilization,
-                rbln_overrides=rbln_overrides,
-            )
+            spec = rbln_config.compile_spec
+            assert spec is not None, "compile spec must be resolved before loading"
+            model_cls = getattr(optimum.rbln, spec["model_cls"])
             logger.info(
                 "Compiling %s via optimum-rbln (%s) with rbln_config:\n%s",
-                self.model_config.model,
-                spec.model_cls.__name__,
-                json.dumps(spec.rbln_config, indent=2, default=str),
+                spec["model"],
+                spec["model_cls"],
+                json.dumps(spec["rbln_config"], indent=2, default=str),
             )
             # Pass transformers config objects directly to preserve all settings.
             # Config classes defined outside transformers (e.g. vLLM's qwen3_asr)
@@ -264,14 +253,13 @@ class RBLNOptimumModelBase(nn.Module):
                     if text_config is hf_config
                     else {"text_config": layer_override}
                 )
-            model = spec.model_cls.from_pretrained(
-                self.model_config.model,
-                rbln_config=spec.rbln_config,
-                dtype=self.model_config.dtype,
+            model = model_cls.from_pretrained(
+                spec["model"],
+                rbln_config=deepcopy(spec["rbln_config"]),
+                dtype=spec["dtype"],
                 **config_override,
             )
             model.save_pretrained(cached_model_path)  # type: ignore[attr-defined]
-            self.vllm_config.model_config.model = cached_model_path
 
         self.supports_transcription_only = (
             model_cls_name == "RBLNOptimumWhisperForConditionalGeneration"

@@ -24,7 +24,7 @@ def _vllm_config() -> VllmConfig:
     # Force the cache-miss branch so building the config does not look for a
     # compiled artifact. The test calls sync_from_optimum itself.
     with patch(
-        "vllm_rbln.utils.optimum.converter.dispatch._resolve_rbln_config",
+        "vllm_rbln.utils.optimum.converter.dispatch._resolve_cached_rbln_config",
         return_value=None,
     ):
         return VllmConfig(

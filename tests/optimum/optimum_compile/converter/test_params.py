@@ -17,7 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm_rbln.model_executor.models.optimum.compilation.multimodal.qwen import (
+from vllm_rbln.utils.optimum.compilation.multimodal.qwen import (
     get_param_qwen3_5,
 )
 from vllm_rbln.utils.optimum.converter.params import (
@@ -101,6 +101,12 @@ class TestParseEncDec:
 
 
 class TestParsePooling:
+    def test_reads_partition_size_from_compile_spec(self):
+        params = RBLNParams._parse_pooling(
+            {"max_seq_len": 8192, "batch_size": 4, "kvcache_partition_len": 1024}
+        )
+        assert params.kvcache_block_size == 1024
+
     def test_uses_explicit_kvcache_num_blocks(self):
         cfg = {
             "max_seq_len": 512,
@@ -125,6 +131,24 @@ class TestParsePooling:
 
 
 class TestParseMultimodal:
+    def test_reads_submodule_lengths_with_a_top_level_block_size(self):
+        params = RBLNParams._parse_multimodal(
+            {
+                "kvcache_block_size": 8192,
+                "language_model": {"batch_size": 4, "max_seq_len": 8192},
+            }
+        )
+        assert params.batch_size == 4
+        assert params.max_seq_len == 8192
+        assert params.kvcache_block_size == 8192
+
+    def test_reads_submodule_lengths_without_a_partition(self):
+        params = RBLNParams._parse_multimodal(
+            {"language_model": {"batch_size": 4, "max_seq_len": 8192}}
+        )
+        assert params.batch_size == 4
+        assert params.max_seq_len == 8192
+
     def test_top_level_fields_present(self):
         cfg = {
             "kvcache_num_blocks": 32,

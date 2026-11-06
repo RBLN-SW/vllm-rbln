@@ -15,13 +15,13 @@
 from dataclasses import dataclass
 from typing import Any
 
-from transformers import PretrainedConfig
-
 import optimum.rbln
 from optimum.rbln import (
     RBLNAutoModelForCausalLM,
     RBLNAutoModelForSpeechSeq2Seq,
 )
+from transformers import PretrainedConfig
+
 from vllm_rbln import envs
 from vllm_rbln.utils.optimum.registry import (
     get_rbln_model_info,
@@ -289,5 +289,6 @@ class RBLNCompileSpec:
                 "num_devices": num_devices,
                 "batch_size": batch_size,
                 "token_timestamps": False,
+                "dec_max_seq_len": max_model_len,
             },
         )
