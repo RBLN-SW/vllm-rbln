@@ -96,6 +96,7 @@ class RBLNGlm5NextMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
         num_accepted: torch.Tensor | None = None,
         state_load_pos: torch.Tensor | None = None,
         mm_prefix_row_ends: torch.Tensor | None = None,
+        defer_staging: bool = False,
     ) -> RBLNFlashAttentionMetadata:
         metadata = super().build(
             common_attn_metadata,
@@ -107,6 +108,7 @@ class RBLNGlm5NextMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
             is_prompt_sorted=is_prompt_sorted,
             num_accepted=num_accepted,
             mm_prefix_row_ends=mm_prefix_row_ends,
+            defer_staging=True,
         )
         num_reqs = common_attn_metadata.num_reqs
         query_start_loc = common_attn_metadata.query_start_loc
@@ -120,9 +122,11 @@ class RBLNGlm5NextMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
         if not is_prefill:
             num_computed_tokens = rbln_utils.pad(num_computed_tokens, 0, batch_pad)
             seq_lens = rbln_utils.pad(seq_lens, 0, batch_pad)
-        metadata.cache_seq_lens = self._stage(num_computed_tokens, "cache_seq_lens")
-        metadata.cache_offsets = self._stage(seq_lens, "cache_offsets")
+        metadata.cache_seq_lens = num_computed_tokens
+        metadata.cache_offsets = seq_lens
         if not isinstance(self.kv_cache_spec, MambaSpec):
+            if not defer_staging:
+                self.stage(metadata)
             return metadata
         num_computed_tokens = num_computed_tokens[:num_reqs]
         seq_lens = seq_lens[:num_reqs]
@@ -141,11 +145,20 @@ class RBLNGlm5NextMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
         if not is_prefill:
             load_blocks = rbln_utils.pad(load_blocks, 0, batch_pad)
             store_blocks = rbln_utils.pad(store_blocks, 0, batch_pad)
-        return RBLNGlm5NextStateMetadata(
+        metadata = RBLNGlm5NextStateMetadata(
             **{f.name: getattr(metadata, f.name) for f in fields(metadata)},
-            load_blocks=self._stage(load_blocks, "load_blocks"),
-            store_blocks=self._stage(store_blocks, "store_blocks"),
+            load_blocks=load_blocks,
+            store_blocks=store_blocks,
         )
+        if not defer_staging:
+            self.stage(metadata)
+        return metadata
+
+    def stage(self, metadata: RBLNFlashAttentionMetadata) -> None:
+        super().stage(metadata)
+        if isinstance(metadata, RBLNGlm5NextStateMetadata):
+            metadata.load_blocks = self._stage(metadata.load_blocks, "load_blocks")
+            metadata.store_blocks = self._stage(metadata.store_blocks, "store_blocks")
 
 
 class RBLNGlm5NextCacheBackend(AttentionBackend):
