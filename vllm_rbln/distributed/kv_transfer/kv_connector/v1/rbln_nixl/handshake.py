@@ -352,7 +352,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                     remote_tp_rank,
                     remote_tp_size,
                 )
-                for area_l in areas_iter:
+                for area_l in range(areas_l):
                     if ring_pieces[area_l]:
                         region_ids.append(logical_l * areas_l + area_l)
                         plans.append(ring_pieces[area_l])
@@ -364,8 +364,14 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                 nixl_agent_meta, logical_l, logical_r, remote_tp_rank, remote_tp_size
             )
             # A peer rank holds a band of a region's heads, which is what the
-            # area filter picks by; a latent is whole on every rank.
-            served = range(areas_l) if same_everywhere else areas_iter
+            # area filter picks by; a latent is whole on every rank. A block
+            # payload pairs by the heads its windows name instead: a peer rank's
+            # KDA group is one whole cache here, over every area.
+            served = (
+                range(areas_l)
+                if same_everywhere or windows is not None
+                else areas_iter
+            )
             for area_l in served:
                 region_id = logical_l * areas_l + area_l
                 pieces = pair_area(
@@ -380,6 +386,8 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                     every_holder=self._writes_into_peer,
                     region_id=region_id,
                 )
+                if not pieces:
+                    continue
                 if windows is not None:
                     local, remote = windows[0][area_l], windows[1]
                     pieces = [
