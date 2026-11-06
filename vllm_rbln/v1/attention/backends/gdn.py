@@ -135,7 +135,17 @@ class RBLNGDNAttentionMetadataBuilder(
     def build(  # type: ignore[override]
         self,
         common_attn_metadata: CommonAttentionMetadata,
+        skip_attn_masks: bool = False,
+        back_pad: torch.Tensor | None = None,
+        is_prompt_sorted: bool = False,
+        num_accepted: torch.Tensor | None = None,
+        state_load_pos: torch.Tensor | None = None,
         positions: torch.Tensor,
+        """The flash builder's signature, so the runner calls every builder the
+        same way; the draft rows are refused with speculative decoding."""
+        assert num_accepted is None and state_load_pos is None, (
+            "speculative decoding is refused for GatedDeltaNet models"
+        )
         batch_pad: int,
         is_prefill: bool,
     ) -> RBLNGDNAttentionMetadata:

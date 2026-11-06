@@ -1196,25 +1196,24 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
                 attn_group = self.attn_groups[kv_cache_gid][attn_gid]
                 builder = attn_group.get_metadata_builder(0)
-                if isinstance(builder, RBLNGDNAttentionMetadataBuilder):
-                    attn_metadata_i = builder.build(
-                        common_attn_metadata=cm,
-                        positions=self.positions,
-                        batch_pad=num_reqs_padded,
-                        is_prefill=self.is_prefill,
-                    )
-                else:
-                    assert isinstance(builder, RBLNFlashAttentionMetadataBuilder)
-                    attn_metadata_i = builder.build(
-                        common_attn_metadata=cm,
-                        positions=self.positions,
-                        is_prefill=self.is_prefill,
-                        batch_pad=num_reqs_padded,
-                        back_pad=back_pad,
-                        is_prompt_sorted=self.sort_batch_by_length,
-                        num_accepted=num_accepted,
-                        state_load_pos=state_load_pos,
-                    )
+                assert isinstance(
+                    builder,
+                    (
+                        RBLNFlashAttentionMetadataBuilder,
+                        RBLNGDNAttentionMetadataBuilder,
+                    ),
+                )
+
+                attn_metadata_i = builder.build(
+                    common_attn_metadata=cm,
+                    positions=self.positions,
+                    is_prefill=self.is_prefill,
+                    batch_pad=num_reqs_padded,
+                    back_pad=back_pad,
+                    is_prompt_sorted=self.sort_batch_by_length,
+                    num_accepted=num_accepted,
+                    state_load_pos=state_load_pos,
+                )
 
                 for layer_name in attn_group.layer_names:
                     attn_metadata[layer_name] = attn_metadata_i
