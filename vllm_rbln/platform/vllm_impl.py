@@ -134,11 +134,6 @@ def _validate(vllm_config: "VllmConfig") -> None:
                 f"--block-size {cache_config.block_size}."
             )
 
-    if rbln_config.compile_dtype:
-        from vllm_rbln.compilation import check_dtype_option_supported
-
-        check_dtype_option_supported()
-
     if not scheduler_config.enable_chunked_prefill:
         raise ValueError(
             "Disabling chunked prefill is not supported on RBLN. "
