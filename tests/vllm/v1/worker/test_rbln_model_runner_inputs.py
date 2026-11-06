@@ -30,6 +30,7 @@ from vllm.multimodal.inputs import (
     MultiModalKwargsItem,
     PlaceholderRange,
 )
+from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
 
 import vllm_rbln.v1.worker.rbln_model_runner as mr
@@ -37,15 +38,116 @@ from tests.vllm.v1.worker.utils import (
     MAX_MODEL_LEN,
     make_scheduler_output,
     make_speculative_config,
+    schedule_cached,
     schedule_new,
 )
-from vllm_rbln.v1.worker.input_stager import InputLayout
 
 pytestmark = pytest.mark.maybe_use_device
 
 
 class _InGraphMergeModel(torch.nn.Module):
     merges_mm_embeds_in_graph = True
+
+
+class TestPreprocessBeforeStaging:
+    @pytest.mark.parametrize("is_prefill", [False, True])
+    @pytest.mark.parametrize("is_first_rank", [False, True])
+    def test_prepared_inputs_remain_cpu_views(
+        self, make_model_runner, monkeypatch, is_prefill, is_first_rank
+    ):
+        monkeypatch.setattr(
+            mr, "get_pp_group", lambda: SimpleNamespace(is_first_rank=is_first_rank)
+        )
+        runner = make_model_runner()
+        runner.is_prefill = is_prefill
+        runner.input_ids[:3] = torch.tensor([1, 2, 3], dtype=runner.input_ids.dtype)
+        runner.positions[:3] = torch.tensor([0, 1, 2], dtype=runner.positions.dtype)
+
+        intermediate = IntermediateTensors({"hidden_states": torch.ones(1, 3, 4)})
+        prepared = runner._preprocess(
+            schedule_new("a"),
+            1,
+            2,
+            3,
+            torch.tensor([2], dtype=torch.int32),
+            intermediate,
+        )[0]
+        runner.input_ids[0] = 42
+
+        assert prepared.input_ids.tolist() == [[42, 2, 3]]
+        assert prepared.input_ids.device.type == "cpu"
+        assert prepared.positions.tolist() == [[0, 1, 2]]
+        assert (prepared.token_indices is not None) == is_prefill
+        assert prepared.intermediate_tensors is (
+            None if is_first_rank else intermediate
+        )
+
+    def test_decode_repairs_cpu_input_before_staging(
+        self, make_model_runner, monkeypatch
+    ):
+        from tests.vllm.v1.worker.test_async_output import _async_output
+
+        monkeypatch.setattr(
+            mr,
+            "get_pp_group",
+            lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+        )
+        runner = make_model_runner()
+        runner.use_async_scheduling = True
+        runner._update_states(schedule_new("a"))
+        state = runner.requests["a"]
+        n = state.num_prompt_tokens
+        state.output_token_ids.append(-1)
+        runner.input_batch.token_ids_cpu[0, n] = -1
+        runner.input_batch.num_tokens_no_spec[0] = n + 1
+        previous = _async_output(
+            torch.tensor([[42]], dtype=torch.int32),
+            req_ids=["a"],
+            placeholder_pos={"a": n},
+        )
+        runner._prev_async_output = previous
+        order = []
+        original_kwargs = runner._init_model_kwargs
+        original_readback = previous.get_sampled_token_ids_cpu
+        original_stage = runner.input_stager.stage
+        original_metadata = runner._build_attention_metadata
+
+        def kwargs():
+            order.append("cpu_kwargs")
+            return original_kwargs()
+
+        def readback():
+            order.append("readback")
+            return original_readback()
+
+        def stage(**values):
+            order.append("stage")
+            assert values["input_ids"].tolist() == [[42]]
+            return original_stage(**values)
+
+        def metadata(**values):
+            order.append("metadata")
+            return original_metadata(**values)
+
+        def forward(**values):
+            order.append("forward")
+            assert values["input_ids"][0, 0] == 42
+            return torch.zeros((1, 1, 4)), torch.zeros((1, 1, 1000)), None
+
+        monkeypatch.setattr(runner, "_init_model_kwargs", kwargs)
+        monkeypatch.setattr(previous, "get_sampled_token_ids_cpu", readback)
+        monkeypatch.setattr(runner.input_stager, "stage", stage)
+        monkeypatch.setattr(runner, "_build_attention_metadata", metadata)
+        monkeypatch.setattr(runner, "model_executable", forward, raising=False)
+
+        runner.execute_model(
+            schedule_cached(
+                req_ids=["a"], num_computed_tokens=[n], num_output_tokens=[1]
+            )
+        )
+
+        assert order == ["metadata", "cpu_kwargs", "readback", "stage", "forward"]
+        assert state.output_token_ids == [42]
 
 
 class TestResolveMultiModalSupport:
@@ -214,7 +316,9 @@ class TestGatherMultimodalEmbeddings:
         self, make_model_runner, monkeypatch, computed, with_text_holes, values
     ):
         monkeypatch.setattr(
-            mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+            mr,
+            "get_pp_group",
+            lambda: SimpleNamespace(is_last_rank=True, is_first_rank=True),
         )
         runner = make_model_runner()
         step = schedule_new(
@@ -246,17 +350,22 @@ class TestGatherMultimodalEmbeddings:
             torch.tensor([11.0, 22.0, 33.0]).unsqueeze(1).expand(-1, hidden)
         )
 
-        mm_rows, mask = runner._gather_mm_embeddings(step, num_tokens=6)
+        runner.is_prefill = True
+        runner.supports_mm_inputs = True
+        _, model_kwargs, layout, _ = runner._preprocess(
+            step, 2, 2, 6, torch.tensor([2, 5], dtype=torch.int32)
+        )
+        mask = model_kwargs["mm_mask"].reshape(6, 1)
         embeds, _ = runner.input_stager.stage_mm_embeds(
-            mm_rows,
-            mask.view(2, 3, 1),
+            model_kwargs["mm_embeds"],
+            model_kwargs["mm_mask"],
             hidden,
-            InputLayout(num_reqs=2, num_reqs_padded=2, query_len=3, query_len_padded=3),
+            layout,
         )
 
         expected = torch.tensor([0, 0, 0] + values, dtype=runner.dtype)
         torch.testing.assert_close(
-            embeds.cpu().view(6, hidden), expected[:, None].expand(-1, hidden)
+            embeds.cpu()[:, :3].reshape(6, hidden), expected[:, None].expand(-1, hidden)
         )
         torch.testing.assert_close(mask[:, 0], (expected != 0).to(runner.dtype))
 
