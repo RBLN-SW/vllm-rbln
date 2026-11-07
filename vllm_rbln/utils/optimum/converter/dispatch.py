@@ -105,17 +105,18 @@ def sync_vllm_and_optimum(vllm_config: VllmConfig) -> None:
     rbln_config = (
         load_compiled_rbln_config(artifact_path) if artifact_path is not None else None
     )
+    # 2. Resolve the compile spec and look up the corresponding cached model.
     if rbln_config is None:
-        # 2. Resolve the compile spec and look up the corresponding cached model.
         spec = resolve_compile_spec(vllm_config)
-        params = spec["params"]
-        cached_model_path = _resolve_cached_model_path(vllm_config)
-        rbln_config = load_compiled_rbln_config(cached_model_path)
-        if rbln_config is not None:
-            logger.info("Found compiled model at %s", cached_model_path)
+        artifact_path = _resolve_cached_model_path(vllm_config)
+        rbln_config = load_compiled_rbln_config(artifact_path)
     # 3. Use params from rbln_config.json if found, or from the compile spec.
-    precompiled = rbln_config is not None
     if rbln_config is not None:
+        logger.info("Found compiled model at %s", artifact_path)
         params = RBLNParams.from_rbln_config(vllm_config, rbln_config)
+        precompiled = True
+    else:
+        params = spec["params"]
+        precompiled = False
     # 4. Synchronize runtime settings once using the selected configuration.
     sync_runtime_config(vllm_config, params, precompiled=precompiled)
