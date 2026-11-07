@@ -141,6 +141,58 @@ def _set_submodule_num_devices(rbln_config: dict) -> None:
             value["num_devices"] = len(device)
 
 
+def _user_block_size(vllm_config: VllmConfig) -> int | None:
+    """Preserve the attention block when prefix caching uses smaller blocks."""
+    cache_config = vllm_config.cache_config
+    additional_config = vllm_config.additional_config
+    if not cache_config.user_specified_block_size:
+        return None
+    if (
+        cache_config.enable_prefix_caching
+        and additional_config.attn_block_size is not None
+    ):
+        return additional_config.attn_block_size
+    return cache_config.block_size
+
+
+def _require_block_size(block_size: int | None) -> int:
+    if block_size is None:
+        raise ValueError(
+            "`block_size` is required to run optimum-rbln models "
+            "in vLLM RBLN.\n"
+            "Set it via one of:\n"
+            "  1) vLLM's `block_size` argument "
+            "(e.g. `LLM(block_size=...)` or `--block-size`), or\n"
+            "  2) `kvcache_block_size` under "
+            "`additional_config={'optimum_overrides': {...}}`.\n"
+        )
+    return block_size
+
+
+def _resolve_compile_num_devices(
+    vllm_config: VllmConfig, optimum_overrides: dict[str, Any]
+) -> int:
+    num_devices = resolve_num_devices(optimum_overrides)
+    if num_devices is None:
+        num_devices = vllm_config.additional_config.num_devices_per_local_rank
+    return num_devices
+
+
+def _validate_prefill_chunk_size(
+    user_chunk: int | None, override_chunk: int | None
+) -> None:
+    if (
+        user_chunk is not None
+        and override_chunk is not None
+        and override_chunk != user_chunk
+    ):
+        raise ValueError(
+            f"Conflicting prefill chunk size: max_num_batched_tokens "
+            f"({user_chunk}) != rbln_config['prefill_chunk_size'] "
+            f"({override_chunk}). Set only one."
+        )
+
+
 def build_compile_spec(vllm_config: VllmConfig) -> RBLNCompileSpec:
     """Resolve user inputs into an owned snapshot for cache lookup and compilation."""
     from vllm_rbln.platform import RblnPlatform
@@ -214,37 +266,16 @@ def _for_decoder(
         max_model_len = model_config.max_model_len
 
     block_size = resolve_kvcache_block_size(optimum_overrides)
-    if block_size is None and cache_config.user_specified_block_size:
-        block_size = (
-            additional_config.attn_block_size
-            if cache_config.enable_prefix_caching
-            and additional_config.attn_block_size is not None
-            else cache_config.block_size
-        )
     if block_size is None:
-        raise ValueError(
-            "`block_size` is required to run optimum-rbln models "
-            "in vLLM RBLN.\n"
-            "Set it via one of:\n"
-            "  1) vLLM's `block_size` argument "
-            "(e.g. `LLM(block_size=...)` or `--block-size`), or\n"
-            "  2) `kvcache_block_size` under "
-            "`additional_config={'optimum_overrides': {...}}`.\n"
-        )
+        block_size = _user_block_size(vllm_config)
+    block_size = _require_block_size(block_size)
 
-    num_devices = resolve_num_devices(optimum_overrides)
-    if num_devices is None:
-        num_devices = additional_config.num_devices_per_local_rank
+    num_devices = _resolve_compile_num_devices(vllm_config, optimum_overrides)
 
     prefill_chunk_size = optimum_overrides.get("prefill_chunk_size")
     user_chunk = additional_config.user_max_num_batched_tokens
+    _validate_prefill_chunk_size(user_chunk, prefill_chunk_size)
     if user_chunk is not None:
-        if prefill_chunk_size is not None and prefill_chunk_size != user_chunk:
-            raise ValueError(
-                f"Conflicting prefill chunk size: max_num_batched_tokens "
-                f"({user_chunk}) != rbln_config['prefill_chunk_size'] "
-                f"({prefill_chunk_size}). Set only one."
-            )
         prefill_chunk_size = user_chunk
     if prefill_chunk_size is None:
         prefill_chunk_size = default_prefill_chunk_size()
@@ -272,8 +303,6 @@ def _for_pooling(
     import optimum.rbln
 
     model_config = vllm_config.model_config
-    cache_config = vllm_config.cache_config
-    additional_config = vllm_config.additional_config
 
     batch_size = optimum_overrides.get("batch_size")
     if batch_size is None:
@@ -285,19 +314,12 @@ def _for_pooling(
     block_size = resolve_kvcache_block_size(optimum_overrides)
     if block_size is None:
         block_size = optimum_overrides.get("max_seq_len")
-    if block_size is None and cache_config.user_specified_block_size:
-        block_size = (
-            additional_config.attn_block_size
-            if cache_config.enable_prefix_caching
-            and additional_config.attn_block_size is not None
-            else cache_config.block_size
-        )
+    if block_size is None:
+        block_size = _user_block_size(vllm_config)
     if block_size is None:
         block_size = max_model_len
 
-    num_devices = resolve_num_devices(optimum_overrides)
-    if num_devices is None:
-        num_devices = additional_config.num_devices_per_local_rank
+    num_devices = _resolve_compile_num_devices(vllm_config, optimum_overrides)
 
     _, model_cls_name = get_rbln_model_info(model_config.hf_config)
     model_cls = getattr(optimum.rbln, model_cls_name)
@@ -347,38 +369,17 @@ def _for_multimodal(
     max_model_len = override_values.get("max_seq_len", model_config.max_model_len)
 
     block_size = override_values.get("kvcache_block_size")
-    if block_size is None and cache_config.user_specified_block_size:
-        block_size = (
-            additional_config.attn_block_size
-            if cache_config.enable_prefix_caching
-            and additional_config.attn_block_size is not None
-            else cache_config.block_size
-        )
     if block_size is None:
-        raise ValueError(
-            "`block_size` is required to run optimum-rbln models "
-            "in vLLM RBLN.\n"
-            "Set it via one of:\n"
-            "  1) vLLM's `block_size` argument "
-            "(e.g. `LLM(block_size=...)` or `--block-size`), or\n"
-            "  2) `kvcache_block_size` under "
-            "`additional_config={'optimum_overrides': {...}}`.\n"
-        )
+        block_size = _user_block_size(vllm_config)
+    block_size = _require_block_size(block_size)
 
-    num_devices = resolve_num_devices(optimum_overrides)
-    if num_devices is None:
-        num_devices = additional_config.num_devices_per_local_rank
+    num_devices = _resolve_compile_num_devices(vllm_config, optimum_overrides)
 
     prefill_chunk_size = override_values.get("prefill_chunk_size")
     user_chunk = additional_config.user_max_num_batched_tokens
     override_chunk = optimum_overrides.get("prefill_chunk_size")
+    _validate_prefill_chunk_size(user_chunk, override_chunk)
     if user_chunk is not None:
-        if override_chunk is not None and override_chunk != user_chunk:
-            raise ValueError(
-                f"Conflicting prefill chunk size: max_num_batched_tokens "
-                f"({user_chunk}) != rbln_config['prefill_chunk_size'] "
-                f"({override_chunk}). Set only one."
-            )
         prefill_chunk_size = user_chunk
     model_name, model_cls_name = get_rbln_model_info(model_config.hf_config)
     if model_name == "paligemma":
@@ -418,8 +419,6 @@ def _for_enc_dec(
     from optimum.rbln import RBLNAutoModelForSpeechSeq2Seq
 
     model_config = vllm_config.model_config
-    cache_config = vllm_config.cache_config
-    additional_config = vllm_config.additional_config
     config = model_config.hf_config
 
     batch_size = optimum_overrides.get("batch_size")
@@ -430,19 +429,12 @@ def _for_enc_dec(
         max_model_len = model_config.max_model_len
 
     block_size = optimum_overrides.get("dec_max_seq_len")
-    if block_size is None and cache_config.user_specified_block_size:
-        block_size = (
-            additional_config.attn_block_size
-            if cache_config.enable_prefix_caching
-            and additional_config.attn_block_size is not None
-            else cache_config.block_size
-        )
+    if block_size is None:
+        block_size = _user_block_size(vllm_config)
     if block_size is None:
         block_size = max_model_len
 
-    num_devices = resolve_num_devices(optimum_overrides)
-    if num_devices is None:
-        num_devices = additional_config.num_devices_per_local_rank
+    num_devices = _resolve_compile_num_devices(vllm_config, optimum_overrides)
 
     architectures = getattr(config, "architectures", [])
     assert architectures[0] == "WhisperForConditionalGeneration"
