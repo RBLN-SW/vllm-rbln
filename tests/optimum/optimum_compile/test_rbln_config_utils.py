@@ -15,7 +15,7 @@
 
 import pytest
 
-from vllm_rbln.utils.optimum.rbln_config_fields import (
+from vllm_rbln.utils.optimum.rbln_config_utils import (
     _num_devices_of,
     resolve_num_devices,
 )

@@ -28,7 +28,7 @@ from transformers import PretrainedConfig
 
 from vllm_rbln import envs
 from vllm_rbln.utils.optimum.multimodal_configs import MULTIMODAL_CONFIG_BUILDERS
-from vllm_rbln.utils.optimum.rbln_config_fields import (
+from vllm_rbln.utils.optimum.rbln_config_utils import (
     default_prefill_chunk_size,
     get_field,
     language_model_configs,
@@ -222,12 +222,7 @@ def build_compile_spec(vllm_config: VllmConfig) -> RBLNCompileSpec:
     memory_budget = cache_config.gpu_memory_utilization
     prefill_chunk_size = None
     if not (encoder_decoder or pooling):
-        default_chunk = default_prefill_chunk_size()
-        prefill_chunk_size = (
-            override_values.get("prefill_chunk_size", default_chunk)
-            if multimodal
-            else optimum_overrides.get("prefill_chunk_size", default_chunk)
-        )
+        prefill_chunk_size = override_values.get("prefill_chunk_size")
         user_chunk = additional_config.user_max_num_batched_tokens
         override_chunk = optimum_overrides.get("prefill_chunk_size")
         if user_chunk is not None:
@@ -240,6 +235,8 @@ def build_compile_spec(vllm_config: VllmConfig) -> RBLNCompileSpec:
             prefill_chunk_size = user_chunk
         if multimodal and get_rbln_model_info(hf_config)[0] == "paligemma":
             prefill_chunk_size = max_model_len
+        if prefill_chunk_size is None:
+            prefill_chunk_size = default_prefill_chunk_size()
 
     # 4. Build the model config and merge only compatible overrides.
     if is_generation_arch(hf_config):

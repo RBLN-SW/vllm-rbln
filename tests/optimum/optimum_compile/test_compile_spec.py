@@ -298,3 +298,42 @@ class TestCompileCacheName:
         assert compile_cache_name(
             cfg.additional_config.compile_spec
         ) == compile_cache_name(vllm_config_factory().additional_config.compile_spec)
+
+
+@pytest.mark.parametrize(
+    "architecture, overrides, user_chunk, expected_chunk, default_calls",
+    [
+        ("LlamaForCausalLM", {}, None, 256, 1),
+        ("LlamaForCausalLM", {"prefill_chunk_size": 384}, None, 384, 0),
+        ("LlamaForCausalLM", {}, 512, 512, 0),
+        (
+            "Gemma3ForConditionalGeneration",
+            {"language_model": {"prefill_chunk_size": 384}},
+            None,
+            384,
+            0,
+        ),
+        ("PaliGemmaForConditionalGeneration", {}, None, 8192, 0),
+    ],
+)
+def test_spec_resolves_chunk_before_considering_the_npu_default(
+    monkeypatch, architecture, overrides, user_chunk, expected_chunk, default_calls
+):
+    from vllm_rbln.utils.optimum import compile_spec
+
+    calls = []
+
+    def default_chunk():
+        calls.append(True)
+        return 256
+
+    monkeypatch.setattr(compile_spec, "default_prefill_chunk_size", default_chunk)
+    cfg = _vllm_config(
+        PretrainedConfig(architectures=[architecture]),
+        optimum_overrides=overrides,
+        user_chunk=user_chunk,
+    )
+    spec = build_compile_spec(cfg)
+    decoder_config = spec.rbln_config.get("language_model", spec.rbln_config)
+    assert decoder_config["prefill_chunk_size"] == expected_chunk
+    assert len(calls) == default_calls

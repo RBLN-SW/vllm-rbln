@@ -21,9 +21,8 @@ import torch
 from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.logger import init_logger
 from vllm_rbln.utils.optimum.block_size import get_block_ratio, is_full_block_available
-from vllm_rbln.utils.optimum.rbln_config_fields import (
+from vllm_rbln.utils.optimum.rbln_config_utils import (
     RblnConfigLike,
-    default_prefill_chunk_size,
     get_field,
     language_model_configs,
     resolve_image_prefill_chunk_size,
@@ -252,6 +251,7 @@ def sync_vllm_config(
     """Apply the selected optimum-rbln config directly to vllm_config."""
     hf_config = vllm_config.model_config.hf_config
     image_prefill_chunk_size = None
+    prefill_chunk_size: int | None
     if is_enc_dec_arch(hf_config):
         batch_size = get_field(rbln_config, "batch_size")
         max_seq_len = get_field(rbln_config, "dec_max_seq_len")
@@ -274,10 +274,7 @@ def sync_vllm_config(
         batch_size = values.get("batch_size")
         max_seq_len = values.get("max_seq_len")
         kvcache_block_size = values.get("kvcache_block_size")
-        chunk_size = values.get("prefill_chunk_size")
-        prefill_chunk_size = (
-            default_prefill_chunk_size() if chunk_size is None else chunk_size
-        )
+        prefill_chunk_size = values.get("prefill_chunk_size")
         image_prefill_chunk_size = values.get("image_prefill_chunk_size")
     else:
         batch_size = get_field(rbln_config, "batch_size")
@@ -289,15 +286,17 @@ def sync_vllm_config(
             prefill_chunk_size = 128
         else:
             kvcache_block_size = resolve_kvcache_block_size(rbln_config)
-            prefill_chunk_size = get_field(
-                rbln_config, "prefill_chunk_size", default_prefill_chunk_size()
-            )
+            prefill_chunk_size = get_field(rbln_config, "prefill_chunk_size")
     num_blocks = resolve_num_blocks(hf_config, rbln_config)
     num_devices = resolve_num_devices(rbln_config)
     dtype = get_field(rbln_config, "dtype")
     additional_config: OptimumRBLNConfig = vllm_config.additional_config
     assert batch_size is not None
     assert max_seq_len is not None
+    if prefill_chunk_size is None:
+        raise ValueError(
+            "prefill_chunk_size must be specified in the selected rbln_config."
+        )
     if precompiled:
         assert num_blocks is not None, (
             "num_blocks must be specified in rbln_config.json"
