@@ -130,6 +130,21 @@ class TestResolveMmPrefixSupport:
         with pytest.raises(ValueError, match="long_prefill_token_threshold"):
             runner._resolve_mm_support()
 
+    @pytest.mark.parametrize("max_num_tokens, refused", [(64, True), (128, False)])
+    def test_dp_needs_the_budget_to_hold_the_longest_range(
+        self, make_model_runner, monkeypatch, max_num_tokens, refused
+    ):
+        # Under DP the MoE layers pad every rank's step to the budget.
+        runner = self._runner(make_model_runner, monkeypatch, _MmPrefixModel([64, 128]))
+        runner.parallel_config = SimpleNamespace(data_parallel_size=2)
+        runner.max_num_tokens = max_num_tokens
+
+        if refused:
+            with pytest.raises(ValueError, match="--max-num-batched-tokens"):
+                runner._resolve_mm_support()
+        else:
+            assert runner._resolve_mm_support() is True
+
     def test_prefix_caching_is_taken(self, make_model_runner, monkeypatch):
         # A hit ending inside a range resumes it in a step of its own.
         runner = self._runner(

@@ -68,8 +68,9 @@ class RBLNMoERunner(MoERunner):
       precomputed ``router_logits``. RBLN computes router logits *after* the DP
       multicast so routing sees the multicast token layout; the patched model
       MoE blocks (qwen/deepseek/minimax/gpt-oss) pass ``router=`` accordingly.
-      With DP=1 the router logits may come precomputed, for a model whose router
-      reads a different tensor than its experts (Gemma4 routes on the residual).
+      The router logits may come precomputed, for a model whose router reads a
+      different tensor than its experts (Gemma4 routes on the residual); under
+      DP each rank's are gathered, as the experts' input is.
     * Hidden states stay **3-D ``[B, L, H]``** throughout (RBLN convention); no
       2-D unpacking.
     * Routing (top-k + softmax/sigmoid, optional grouped-topk) is done inline and
@@ -156,9 +157,12 @@ class RBLNMoERunner(MoERunner):
                     hidden_flat, (0, 0, 0, max_pad - t), value=0.0
                 )  # [max_pad, H]
 
-            if self.use_dispatch_all2all:
+            # Each rank routes its own tokens when the all2all dispatch needs the
+            # logits first, or when they come precomputed from another tensor.
+            routes_locally = self.use_dispatch_all2all or not callable(router)
+            if routes_locally:
                 # --- Router DP path: local routing → all_gather logits ---
-                router_logits = router(hidden_states)
+                router_logits = router(hidden_states) if callable(router) else router
                 router_logits_2d = router_logits.reshape(t, -1)  # [t, E]
                 E = router_logits_2d.shape[-1]
 
@@ -175,7 +179,7 @@ class RBLNMoERunner(MoERunner):
                 all_router_logits = all_rl_flat.reshape(
                     R * max_pad, E
                 )  # [R*max_pad, E]
-            else:
+            if not self.use_dispatch_all2all:
                 # -- origin/dev path: all-gather hidden first → router on full tokens --
                 # all-gather hidden_states across DP ranks (also serves as dispatch)
                 hidden_for_gather = hidden_flat.unsqueeze(0)  # [1, max_pad, H]
@@ -184,6 +188,7 @@ class RBLNMoERunner(MoERunner):
                 )  # [R, max_pad, H]
                 gathered_hidden = all_hidden.reshape(R * max_pad, H_dim)
 
+            if not routes_locally:
                 # Router on all gathered tokens (no Router DP)
                 all_router_logits = router(gathered_hidden)  # [R*max_pad, E]
                 all_router_logits = all_router_logits.reshape(R * max_pad, -1)

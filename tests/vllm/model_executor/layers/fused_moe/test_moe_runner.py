@@ -23,6 +23,7 @@ import torch
 from vllm.model_executor.custom_op import maybe_get_oot_by_class
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
+import vllm_rbln.model_executor.layers.fused_moe.runner.moe_runner as moe_runner
 import vllm_rbln.model_executor.layers.fused_moe.utils as fused_moe_utils
 from vllm_rbln.model_executor.layers.fused_moe.runner.moe_runner import RBLNMoERunner
 from vllm_rbln.model_executor.layers.fused_moe.runner.moe_runner import (
@@ -362,21 +363,89 @@ def _routed_weights(monkeypatch, router, logits):
     return routed["weights"]
 
 
+def _routed_weights_across_dp(monkeypatch, router, logits, peer_logits, max_pad):
+    """``[E, 2 * max_pad]`` weights rank 0 of two hands the quant method on the
+    all-gather dispatch, with ``peer_logits`` arriving from rank 1."""
+    dp_metadata = SimpleNamespace(
+        num_tokens_across_dp_cpu=torch.tensor([logits.shape[1], peer_logits.shape[1]]),
+        max_pads_across_dp=torch.empty(max_pad),
+    )
+    context = SimpleNamespace(dp_metadata=dp_metadata)
+    monkeypatch.setattr(fused_moe_utils, "get_forward_context", lambda: context)
+    monkeypatch.setattr(moe_runner, "get_forward_context", lambda: context)
+
+    class _DPGroup:
+        def all_gather(self, x, dim):
+            # The logits travel flattened to [1, max_pad * E], hidden states as
+            # [1, max_pad, H]; rank 1's hidden states do not matter here.
+            if x.dim() == 2:
+                peer = peer_logits.reshape(-1, peer_logits.shape[-1])
+                peer = torch.nn.functional.pad(
+                    peer, (0, 0, 0, max_pad - peer.shape[0])
+                ).reshape(1, -1)
+            else:
+                peer = torch.zeros_like(x)
+            return torch.cat([x, peer], dim=dim)
+
+        def reduce_scatter(self, x, dim):
+            return x[: x.shape[0] // 2]
+
+    monkeypatch.setattr(moe_runner, "get_dp_group", lambda: _DPGroup())
+    routed: dict[str, torch.Tensor] = {}
+
+    class _CaptureQuantMethod:
+        def apply(self, layer, x, router_logits):
+            routed["weights"] = router_logits
+            return x
+
+    runner = object.__new__(RBLNMoERunner)
+    torch.nn.Module.__init__(runner)
+    runner.use_moe_tokens_mask = True
+    runner.use_dispatch_all2all = False
+    runner.use_combine_all2all = False
+    runner.routed_experts = SimpleNamespace(quant_method=_CaptureQuantMethod())
+    runner.top_k = 2
+    runner.moe_parallel_config = SimpleNamespace(dp_size=2, dp_rank=0)
+    runner.router = router
+    RBLNMoERunner.forward(runner, torch.zeros(*logits.shape[:2], 8), logits)
+    return routed["weights"]
+
+
 class TestGemma4Routing:
+    @staticmethod
+    def _upstream(logits):
+        from vllm.model_executor.models.gemma4 import gemma4_routing_function_torch
+
+        topk_weights, topk_ids = gemma4_routing_function_torch(
+            logits[0], 2, torch.ones(4)
+        )
+        return torch.zeros(logits.shape[1], 4).scatter_(
+            1, topk_ids.long(), topk_weights
+        )
+
     def test_precomputed_logits_route_like_upstream_gemma4(self, monkeypatch):
         # Gemma4 hands the runner logits it computed from the residual; its
         # per-expert scale is folded into down_proj, so routing sees none.
-        from vllm.model_executor.models.gemma4 import gemma4_routing_function_torch
-
         logits = torch.randn(1, 3, 4)
         router = SimpleNamespace(renormalize=True)
 
         weights = _routed_weights(monkeypatch, router, logits)
 
-        topk_weights, topk_ids = gemma4_routing_function_torch(
-            logits[0], 2, torch.ones(4)
+        torch.testing.assert_close(weights, self._upstream(logits).T)
+
+    def test_precomputed_logits_are_gathered_across_dp(self, monkeypatch):
+        # Each rank's tokens route on the logits that rank computed from its
+        # own residual; padding rows route nowhere.
+        logits, peer_logits = torch.randn(1, 3, 4), torch.randn(1, 2, 4)
+        router = SimpleNamespace(renormalize=True)
+
+        weights = _routed_weights_across_dp(
+            monkeypatch, router, logits, peer_logits, max_pad=4
         )
-        expected = torch.zeros(3, 4).scatter_(1, topk_ids.long(), topk_weights)
+
+        expected = torch.zeros(8, 4)
+        expected[:3] = self._upstream(logits)
+        expected[4:6] = self._upstream(peer_logits)
         torch.testing.assert_close(weights, expected.T)
 
 
