@@ -222,12 +222,12 @@ class RBLNOptimumModelBase(nn.Module):
             # cache miss: compile the model and save it to the cache for reuse.
             spec = additional_config.compile_spec
             assert spec is not None, "compile spec must be resolved before loading"
-            model_cls = getattr(optimum.rbln, spec["model_cls"])
+            model_cls = getattr(optimum.rbln, spec.model_cls)
             logger.info(
                 "Compiling %s via optimum-rbln (%s) with rbln_config:\n%s",
-                spec["model"],
-                spec["model_cls"],
-                json.dumps(spec["rbln_config"], indent=2, default=str),
+                spec.model,
+                spec.model_cls,
+                json.dumps(spec.rbln_config, indent=2, default=str),
             )
             # Pass transformers config objects directly to preserve all settings.
             # Config classes defined outside transformers (e.g. vLLM's qwen3_asr)
@@ -249,9 +249,9 @@ class RBLNOptimumModelBase(nn.Module):
                     else {"text_config": layer_override}
                 )
             model = model_cls.from_pretrained(
-                spec["model"],
-                rbln_config=deepcopy(spec["rbln_config"]),
-                dtype=spec["dtype"],
+                spec.model,
+                rbln_config=deepcopy(spec.rbln_config),
+                dtype=spec.dtype,
                 **config_override,
             )
             model.save_pretrained(cached_model_path)  # type: ignore[attr-defined]

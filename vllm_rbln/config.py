@@ -40,29 +40,16 @@ from dataclasses import field, fields
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
 
 from pydantic import Field
-from typing_extensions import TypedDict
 from vllm.config.utils import config as vllm_config_dataclass
 
 from vllm_rbln.logger import init_logger
-from vllm_rbln.utils.optimum.params import RBLNParams
+from vllm_rbln.utils.optimum.params import RBLNCompileSpec
 
 if TYPE_CHECKING:
     # `Field` here is pydantic's, which a field definition below calls.
     from dataclasses import Field as DataclassField
 
     from vllm.utils.argparse_utils import FlexibleArgumentParser
-
-
-class ResolvedCompileSpec(TypedDict):
-    """Serializable snapshot shared by cache lookup and optimum model loading."""
-
-    model: str
-    dtype: Any
-    model_cls: str
-    rbln_config: dict[str, Any]
-    hf_config: dict[str, Any]
-    npu_name: str
-    params: RBLNParams
 
 
 logger = init_logger(__name__)
@@ -223,17 +210,16 @@ class OptimumRBLNConfig(RBLNConfigBase):
     """`--num-gpu-blocks-override` as given, before the prefix-cache block ratio
     is applied to it."""
 
-    # Written by the sync, and carried to the processes that cannot build
-    # `RBLNParams` of their own.
+    # Written during runtime synchronization and carried to workers.
     attn_block_size: int | None = field(default=None, metadata=_DERIVED)
-    """`RBLNParams.kvcache_block_size`, when prefix caching splits the KV-cache
+    """`RuntimeSettings.kvcache_block_size`, when prefix caching splits the KV-cache
     block size from `cache_config.block_size`."""
 
     image_prefill_chunk_size: list[int] | None = field(default=None, metadata=_DERIVED)
-    """`RBLNParams.image_prefill_chunk_size`, the image-prefill buckets
+    """`RuntimeSettings.image_prefill_chunk_size`, the image-prefill buckets
     (gemma3/gemma4) the scheduler pads against."""
 
-    compile_spec: ResolvedCompileSpec | None = field(default=None, metadata=_DERIVED)
+    compile_spec: RBLNCompileSpec | None = field(default=None, metadata=_DERIVED)
     """Resolved model, dtype and optimum-rbln compile config shared by the cache
     key and compilation. Runtime synchronization must not rewrite it."""
 

@@ -12,14 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from vllm_rbln.utils.optimum.params import RBLNParams, load_compiled_rbln_config
+from vllm_rbln.utils.optimum.params import (
+    RuntimeSettings,
+    load_compiled_rbln_config,
+    read_runtime_settings,
+)
 
 from .dispatch import sync_vllm_and_optimum
-from .from_optimum import update_num_blocks
+from .runtime import update_num_blocks
 
 __all__ = [
-    "RBLNParams",
+    "RuntimeSettings",
     "load_compiled_rbln_config",
+    "read_runtime_settings",
     "sync_vllm_and_optimum",
     "update_num_blocks",
 ]

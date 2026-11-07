@@ -28,7 +28,7 @@ from transformers import Gemma4Config
 from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.model_executor.models.optimum import model_base
 from vllm_rbln.model_executor.models.optimum.model_base import RBLNOptimumModelBase
-from vllm_rbln.utils.optimum.params import RBLNParams
+from vllm_rbln.utils.optimum.params import RBLNCompileSpec
 
 
 def _init_model_with(monkeypatch, tmp_path, hf_config, *, precompiled=False) -> dict:
@@ -70,15 +70,14 @@ def _init_model_with(monkeypatch, tmp_path, hf_config, *, precompiled=False) -> 
         # `init_model` reads its options off.
         additional_config=OptimumRBLNConfig(
             cached_model_path=str(tmp_path),
-            compile_spec={
-                "model": "compile-source",
-                "dtype": torch.bfloat16,
-                "model_cls": "FakeRBLNModel",
-                "hf_config": {},
-                "npu_name": "RBLN-CA25",
-                "params": RBLNParams(prefill_chunk_size=256),
-                "rbln_config": {"prefill_chunk_size": 256},
-            },
+            compile_spec=RBLNCompileSpec(
+                model="compile-source",
+                dtype=torch.bfloat16,
+                model_cls="FakeRBLNModel",
+                hf_config={},
+                npu_name="RBLN-CA25",
+                rbln_config={"prefill_chunk_size": 256},
+            ),
         ),
         model_config=obj.model_config,
         scheduler_config=obj.scheduler_config,
@@ -147,7 +146,7 @@ def test_compilation_uses_the_spec_that_was_hashed(monkeypatch, tmp_path):
     assert passed["rbln_config"] == {"prefill_chunk_size": 256}
 
     passed["rbln_config"]["prefill_chunk_size"] = 512
-    assert passed["compile_spec"]["rbln_config"]["prefill_chunk_size"] == 256
+    assert passed["compile_spec"].rbln_config["prefill_chunk_size"] == 256
 
 
 @pytest.mark.parametrize("precompiled", [False, True])

@@ -46,6 +46,15 @@ def _cfg_get_submodule(cfg: RblnConfigLike, submodule: str) -> RblnConfigLike | 
     return getattr(cfg, submodule, None)
 
 
+def _language_model_configs(cfg: RblnConfigLike) -> list[RblnConfigLike]:
+    """Return language_model, text_model and root configs in precedence order."""
+    return [
+        sub_cfg
+        for name in ("language_model", "text_model")
+        if (sub_cfg := _cfg_get_submodule(cfg, name)) is not None
+    ] + [cfg]
+
+
 def load_compiled_rbln_config(model_path: str) -> dict | None:
     """Read metadata from an explicitly selected artifact directory."""
     rbln_config_path = Path(model_path) / RBLN_CONFIG_FILE
@@ -56,8 +65,8 @@ def load_compiled_rbln_config(model_path: str) -> dict | None:
 
 
 @dataclass
-class RBLNParams:
-    """Common model settings used for compilation and runtime synchronization."""
+class RuntimeSettings:
+    """Common vLLM runtime settings read from the selected optimum-rbln config."""
 
     num_blocks: int | None = None
     batch_size: int | None = None
@@ -72,33 +81,7 @@ class RBLNParams:
     tensor_parallel_size: int = 1
 
     @classmethod
-    def from_rbln_config(
-        cls, vllm_config: VllmConfig, rbln_config: RblnConfigLike
-    ) -> "RBLNParams":
-        """Parse rbln_config according to the model architecture."""
-        from vllm_rbln.utils.optimum.registry import (
-            is_enc_dec_arch,
-            is_multi_modal,
-            is_pooling_arch,
-        )
-
-        hf_config = vllm_config.model_config.hf_config
-
-        if is_enc_dec_arch(hf_config):
-            params = cls._parse_enc_dec(rbln_config)
-        elif is_multi_modal(hf_config):
-            params = cls._parse_multimodal(rbln_config)
-        elif is_pooling_arch(hf_config):
-            params = cls._parse_pooling(rbln_config)
-        else:
-            params = cls._parse_decoder(rbln_config)
-
-        params.num_devices = _resolve_num_devices(rbln_config)
-        params.dtype = _cfg_get(rbln_config, "dtype")
-        return params
-
-    @classmethod
-    def _parse_enc_dec(cls, cfg: RblnConfigLike) -> "RBLNParams":
+    def _parse_enc_dec(cls, cfg: RblnConfigLike) -> "RuntimeSettings":
         max_seq_len = _cfg_get(cfg, "dec_max_seq_len")
         batch_size = _cfg_get(cfg, "batch_size")
         num_blocks = _cfg_get(cfg, "kvcache_num_blocks")
@@ -112,7 +95,7 @@ class RBLNParams:
         )
 
     @classmethod
-    def _parse_pooling(cls, cfg: RblnConfigLike) -> "RBLNParams":
+    def _parse_pooling(cls, cfg: RblnConfigLike) -> "RuntimeSettings":
         max_seq_len = _cfg_get(cfg, "max_seq_len")
         batch_size = _cfg_get(cfg, "batch_size")
         # For pooling models each sequence occupies exactly one block.
@@ -130,7 +113,7 @@ class RBLNParams:
         )
 
     @classmethod
-    def _parse_decoder(cls, cfg: RblnConfigLike) -> "RBLNParams":
+    def _parse_decoder(cls, cfg: RblnConfigLike) -> "RuntimeSettings":
         kvcache_block_size = _resolve_kvcache_block_size(cfg, arch="decoder")
         default_prefill_chunk_size = _resolve_default_prefill_chunk_size()
         return cls(
@@ -144,14 +127,8 @@ class RBLNParams:
         )
 
     @classmethod
-    def _parse_multimodal(cls, cfg: RblnConfigLike) -> "RBLNParams":
-        # Language submodules take precedence field by field; absent or None
-        # values fall through to text_model, then to the top-level config.
-        sources = [
-            sub_cfg
-            for name in ("language_model", "text_model")
-            if (sub_cfg := _cfg_get_submodule(cfg, name)) is not None
-        ] + [cfg]
+    def _parse_multimodal(cls, cfg: RblnConfigLike) -> "RuntimeSettings":
+        sources = _language_model_configs(cfg)
         values: dict[str, Any] = {}
         for source in sources:
             for key in (
@@ -186,6 +163,44 @@ class RBLNParams:
             prefill_chunk_size=prefill_chunk_size,
             image_prefill_chunk_size=image_prefill_chunk_size,
         )
+
+
+@dataclass
+class RBLNCompileSpec:
+    """Serializable snapshot shared by cache lookup, compilation and runtime."""
+
+    model: str
+    dtype: Any
+    model_cls: str
+    rbln_config: dict[str, Any]
+    hf_config: dict[str, Any]
+    npu_name: str
+
+
+def read_runtime_settings(
+    vllm_config: VllmConfig, rbln_config: RblnConfigLike
+) -> "RuntimeSettings":
+    """Parse rbln_config according to the model architecture."""
+    from vllm_rbln.utils.optimum.registry import (
+        is_enc_dec_arch,
+        is_multi_modal,
+        is_pooling_arch,
+    )
+
+    hf_config = vllm_config.model_config.hf_config
+
+    if is_enc_dec_arch(hf_config):
+        settings = RuntimeSettings._parse_enc_dec(rbln_config)
+    elif is_multi_modal(hf_config):
+        settings = RuntimeSettings._parse_multimodal(rbln_config)
+    elif is_pooling_arch(hf_config):
+        settings = RuntimeSettings._parse_pooling(rbln_config)
+    else:
+        settings = RuntimeSettings._parse_decoder(rbln_config)
+
+    settings.num_devices = _resolve_num_devices(rbln_config)
+    settings.dtype = _cfg_get(rbln_config, "dtype")
+    return settings
 
 
 def _num_devices_of(cfg: RblnConfigLike) -> int | None:
@@ -233,7 +248,7 @@ def _resolve_image_prefill_chunk_size(cfg: RblnConfigLike) -> list[int] | None:
     if sizes is None:
         return None
     if isinstance(sizes, list):
-        return sizes
+        return list(sizes)
     # bool is an int subclass; reject it explicitly.
     if isinstance(sizes, int) and not isinstance(sizes, bool):
         return [sizes]

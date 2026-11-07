@@ -22,9 +22,10 @@ from vllm_rbln.utils.optimum.compilation.multimodal.qwen import (
     get_param_qwen3_5,
 )
 from vllm_rbln.utils.optimum.params import (
-    RBLNParams,
+    RuntimeSettings,
     _num_devices_of,
     _resolve_num_devices,
+    read_runtime_settings,
 )
 
 
@@ -37,19 +38,19 @@ class TestParseDecoder:
             "kvcache_block_size": 4096,
             "prefill_chunk_size": 256,
         }
-        params = RBLNParams._parse_decoder(cfg)
+        params = RuntimeSettings._parse_decoder(cfg)
         assert params.num_blocks == 16
         assert params.batch_size == 4
         assert params.max_seq_len == 8192
         assert params.kvcache_block_size == 4096
         assert params.prefill_chunk_size == 256
         # num_devices is populated by the caller
-        # (`from_rbln_config`), not `_parse_decoder`,
+        # (`read_runtime_settings`), not `_parse_decoder`,
         # so it is not asserted here.
 
     def test_none_dict_config(self):
         cfg: dict = {}
-        params = RBLNParams._parse_decoder(cfg)
+        params = RuntimeSettings._parse_decoder(cfg)
         assert params.num_blocks is None
         assert params.batch_size is None
         assert params.max_seq_len is None
@@ -62,7 +63,7 @@ class TestParseDecoder:
             "max_seq_len": 8192,
             "kvcache_block_size": 4096,
         }
-        params = RBLNParams._parse_decoder(cfg)
+        params = RuntimeSettings._parse_decoder(cfg)
         assert params.prefill_chunk_size == 128
 
     def test_kvcache_partition_len(self):
@@ -72,7 +73,7 @@ class TestParseDecoder:
             "max_seq_len": 8192,
             "kvcache_partition_len": 4096,
         }
-        params = RBLNParams._parse_decoder(cfg)
+        params = RuntimeSettings._parse_decoder(cfg)
         assert params.kvcache_block_size == 4096
 
     def test_error_duplicated_block_size(self):
@@ -84,7 +85,7 @@ class TestParseDecoder:
             "kvcache_partition_len": 2048,
         }
         with pytest.raises(AssertionError, match="kvcache_partition_len"):
-            RBLNParams._parse_decoder(cfg)
+            RuntimeSettings._parse_decoder(cfg)
 
 
 class TestParseEncDec:
@@ -94,7 +95,7 @@ class TestParseEncDec:
             "batch_size": 1,
             "dec_max_seq_len": 448,
         }
-        params = RBLNParams._parse_enc_dec(cfg)
+        params = RuntimeSettings._parse_enc_dec(cfg)
         assert params.num_blocks == 4
         assert params.batch_size == 1
         assert params.max_seq_len == 448
@@ -103,7 +104,7 @@ class TestParseEncDec:
 
 class TestParsePooling:
     def test_reads_partition_size_from_compile_spec(self):
-        params = RBLNParams._parse_pooling(
+        params = RuntimeSettings._parse_pooling(
             {"max_seq_len": 8192, "batch_size": 4, "kvcache_partition_len": 1024}
         )
         assert params.kvcache_block_size == 1024
@@ -114,7 +115,7 @@ class TestParsePooling:
             "batch_size": 8,
             "kvcache_num_blocks": 16,
         }
-        params = RBLNParams._parse_pooling(cfg)
+        params = RuntimeSettings._parse_pooling(cfg)
         assert params.num_blocks == 16
         assert params.batch_size == 8
         assert params.max_seq_len == 512
@@ -122,18 +123,18 @@ class TestParsePooling:
 
     def test_falls_back_num_blocks_to_batch_size(self):
         cfg = {"max_seq_len": 512, "batch_size": 8}
-        params = RBLNParams._parse_pooling(cfg)
+        params = RuntimeSettings._parse_pooling(cfg)
         assert params.num_blocks == 8
 
     def test_kvcache_block_size_equals_max_seq_len(self):
         cfg = {"max_seq_len": 512, "batch_size": 8}
-        params = RBLNParams._parse_pooling(cfg)
+        params = RuntimeSettings._parse_pooling(cfg)
         assert params.kvcache_block_size == 512
 
 
 class TestParseMultimodal:
     def test_reads_submodule_lengths_with_a_top_level_block_size(self):
-        params = RBLNParams._parse_multimodal(
+        params = RuntimeSettings._parse_multimodal(
             {
                 "kvcache_block_size": 8192,
                 "language_model": {"batch_size": 4, "max_seq_len": 8192},
@@ -144,7 +145,7 @@ class TestParseMultimodal:
         assert params.kvcache_block_size == 8192
 
     def test_reads_submodule_lengths_without_a_partition(self):
-        params = RBLNParams._parse_multimodal(
+        params = RuntimeSettings._parse_multimodal(
             {"language_model": {"batch_size": 4, "max_seq_len": 8192}}
         )
         assert params.batch_size == 4
@@ -175,7 +176,7 @@ class TestParseMultimodal:
                     for key, value in cfg.items()
                 }
             )
-        params = RBLNParams._parse_multimodal(cfg)
+        params = RuntimeSettings._parse_multimodal(cfg)
         assert params.batch_size == 2
         assert params.max_seq_len == 4096
         assert params.kvcache_block_size == 4096
@@ -190,7 +191,7 @@ class TestParseMultimodal:
             "max_seq_len": 4096,
             "kvcache_block_size": 128,
         }
-        params = RBLNParams._parse_multimodal(cfg)
+        params = RuntimeSettings._parse_multimodal(cfg)
         assert params.num_blocks == 32
         assert params.batch_size == 1
         assert params.max_seq_len == 4096
@@ -205,7 +206,7 @@ class TestParseMultimodal:
                 "kvcache_block_size": 64,
             },
         }
-        params = RBLNParams._parse_multimodal(cfg)
+        params = RuntimeSettings._parse_multimodal(cfg)
         assert params.num_blocks == 16
         assert params.batch_size == 2
         assert params.max_seq_len == 2048
@@ -220,7 +221,7 @@ class TestParseMultimodal:
                 "kvcache_block_size": 32,
             },
         }
-        params = RBLNParams._parse_multimodal(cfg)
+        params = RuntimeSettings._parse_multimodal(cfg)
         assert params.num_blocks == 8
         assert params.batch_size == 1
         assert params.max_seq_len == 1024
@@ -235,7 +236,7 @@ class TestParseMultimodal:
                 "kvcache_partition_len": 128,
             },
         }
-        params = RBLNParams._parse_multimodal(cfg)
+        params = RuntimeSettings._parse_multimodal(cfg)
         assert params.kvcache_block_size == 128
 
     def test_submodule_uses_submodule_batch_size(self):
@@ -248,7 +249,7 @@ class TestParseMultimodal:
                 "kvcache_partition_len": 128,
             },
         }
-        params = RBLNParams._parse_multimodal(cfg)
+        params = RuntimeSettings._parse_multimodal(cfg)
         assert params.batch_size == 2
 
 
@@ -265,11 +266,11 @@ class TestImagePrefillChunkSize:
         }
 
     def test_gemma3_int_normalized_to_list(self):
-        params = RBLNParams._parse_multimodal(self._cfg(256))
+        params = RuntimeSettings._parse_multimodal(self._cfg(256))
         assert params.image_prefill_chunk_size == [256]
 
     def test_gemma4_list_passes_through(self):
-        params = RBLNParams._parse_multimodal(self._cfg([1152, 640, 384]))
+        params = RuntimeSettings._parse_multimodal(self._cfg([1152, 640, 384]))
         assert params.image_prefill_chunk_size == [1152, 640, 384]
 
     def test_absent_is_none(self):
@@ -281,16 +282,16 @@ class TestImagePrefillChunkSize:
                 "kvcache_partition_len": 128,
             },
         }
-        params = RBLNParams._parse_multimodal(cfg)
+        params = RuntimeSettings._parse_multimodal(cfg)
         assert params.image_prefill_chunk_size is None
 
     def test_invalid_type_raises(self):
         with pytest.raises(TypeError):
-            RBLNParams._parse_multimodal(self._cfg("256"))
+            RuntimeSettings._parse_multimodal(self._cfg("256"))
 
     def test_bool_rejected(self):
         with pytest.raises(TypeError):
-            RBLNParams._parse_multimodal(self._cfg(True))
+            RuntimeSettings._parse_multimodal(self._cfg(True))
 
 
 class TestNumDevicesOf:
@@ -377,12 +378,12 @@ class TestFromRblnConfigDtype:
 
     def test_reads_dtype(self):
         cfg = {"batch_size": 4, "max_seq_len": 8192, "dtype": "bfloat16"}
-        params = RBLNParams.from_rbln_config(self._vllm_config(), cfg)
+        params = read_runtime_settings(self._vllm_config(), cfg)
         assert params.dtype == "bfloat16"
 
     def test_none_when_absent(self):
         cfg = {"batch_size": 4, "max_seq_len": 8192}
-        params = RBLNParams.from_rbln_config(self._vllm_config(), cfg)
+        params = read_runtime_settings(self._vllm_config(), cfg)
         assert params.dtype is None
 
 

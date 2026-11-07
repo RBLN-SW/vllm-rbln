@@ -24,7 +24,7 @@ from vllm_rbln.utils.optimum.registry import (
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
-    from vllm_rbln.utils.optimum.params import RBLNParams
+    from vllm_rbln.utils.optimum.params import RuntimeSettings
 else:
     VllmConfig = None
 
@@ -125,7 +125,7 @@ def get_user_max_num_batched_tokens(vllm_config: VllmConfig) -> int | None:
 
 
 def update_max_num_batched_tokens(
-    vllm_config: VllmConfig, params: "RBLNParams"
+    vllm_config: VllmConfig, settings: "RuntimeSettings"
 ) -> None:
     """Set ``scheduler_config.max_num_batched_tokens`` from the RBLN config.
 
@@ -151,7 +151,7 @@ def update_max_num_batched_tokens(
         # prefill chunk size. It does not bound the decode batch — the
         # scheduler's per-step budget (max_num_scheduled_tokens) is decoupled
         # from max_num_batched_tokens — so it may be smaller than max_num_seqs.
-        target = params.prefill_chunk_size
+        target = settings.prefill_chunk_size
 
     cur = vllm_config.scheduler_config.max_num_batched_tokens
     if cur != target:
@@ -177,43 +177,17 @@ def store_image_prefill_chunk_size(
     additional_config.image_prefill_chunk_size = image_prefill_chunk_size
 
 
-def apply_user_prefill_chunk_size(
-    vllm_config: VllmConfig,
-    params: "RBLNParams",
-    *,
-    precompiled: bool,
-    override_prefill_chunk_size: int | None = None,
+def validate_user_prefill_chunk_size(
+    vllm_config: VllmConfig, prefill_chunk_size: int
 ) -> None:
-    """Fold an explicit ``max_num_batched_tokens`` into ``params.prefill_chunk_size``.
-
-    No-op for enc-dec/pooling (they don't chunk prefill) or when the user left
-    ``max_num_batched_tokens`` unset; downstream reads only
-    ``params.prefill_chunk_size``.
-
-    Precompiled: the binary fixes the chunk size, so a differing value errors.
-    Compile: the user's value wins over the rbln_config default, but passing both
-    (``override_prefill_chunk_size``) with different values errors.
-    """
+    """Require an explicit user chunk size to match the selected model settings."""
     if not is_chunked_prefill_arch(vllm_config.model_config.hf_config):
         return
-    user_mnbt = get_user_max_num_batched_tokens(vllm_config)
-    if user_mnbt is None:
-        return
-    if precompiled:
-        if user_mnbt != params.prefill_chunk_size:
-            raise ValueError(
-                f"max_num_batched_tokens ({user_mnbt}) conflicts with the "
-                f"compiled prefill_chunk_size ({params.prefill_chunk_size}) in "
-                "rbln_config.json. Omit max_num_batched_tokens or recompile the "
-                "model with a matching prefill chunk size."
-            )
-    elif (
-        override_prefill_chunk_size is not None
-        and override_prefill_chunk_size != user_mnbt
-    ):
+    user_chunk = get_user_max_num_batched_tokens(vllm_config)
+    if user_chunk is not None and user_chunk != prefill_chunk_size:
         raise ValueError(
-            f"Conflicting prefill chunk size: max_num_batched_tokens "
-            f"({user_mnbt}) != rbln_config['prefill_chunk_size'] "
-            f"({override_prefill_chunk_size}). Set only one."
+            f"max_num_batched_tokens ({user_chunk}) conflicts with the "
+            f"compiled prefill_chunk_size ({prefill_chunk_size}) in "
+            "rbln_config.json. Omit max_num_batched_tokens or recompile the "
+            "model with a matching prefill chunk size."
         )
-    params.prefill_chunk_size = user_mnbt

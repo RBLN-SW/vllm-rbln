@@ -15,16 +15,19 @@
 import hashlib
 import json
 import os
+from dataclasses import fields
 from typing import TYPE_CHECKING, Any
 
 from vllm_rbln import envs
 from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.logger import init_logger
-from vllm_rbln.utils.optimum.params import RBLNParams, load_compiled_rbln_config
+from vllm_rbln.utils.optimum.params import (
+    load_compiled_rbln_config,
+    read_runtime_settings,
+)
 from vllm_rbln.utils.optimum.paths import resolve_compiled_model_path
 
-from .from_optimum import sync_runtime_config
-from .from_vllm import resolve_compile_spec
+from .runtime import apply_runtime_settings
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -62,11 +65,9 @@ def _generate_model_path_name(
     assert additional_config.compile_spec is not None, (
         "compile spec must be resolved first"
     )
-    # Params are derived from the same inputs and must not duplicate cache-key fields.
     config_dict: dict[str, Any] = {
-        key: value
-        for key, value in additional_config.compile_spec.items()
-        if key != "params"
+        field.name: getattr(additional_config.compile_spec, field.name)
+        for field in fields(additional_config.compile_spec)
     }
     config_dict["rbln_config"] = _strip_runtime_only_keys(config_dict["rbln_config"])
     model_name = str(config_dict["model"])
@@ -107,16 +108,22 @@ def sync_vllm_and_optimum(vllm_config: VllmConfig) -> None:
     )
     # 2. Resolve the compile spec and look up the corresponding cached model.
     if rbln_config is None:
-        spec = resolve_compile_spec(vllm_config)
+        if additional_config.compile_spec is None:
+            from vllm_rbln.utils.optimum.compilation import build_compile_spec
+
+            additional_config.compile_spec = build_compile_spec(vllm_config)
+        spec = additional_config.compile_spec
         artifact_path = _resolve_cached_model_path(vllm_config)
         rbln_config = load_compiled_rbln_config(artifact_path)
-    # 3. Use params from rbln_config.json if found, or from the compile spec.
     if rbln_config is not None:
+        # 3. Use settings from the compiled model's rbln_config.json.
         logger.info("Found compiled model at %s", artifact_path)
-        params = RBLNParams.from_rbln_config(vllm_config, rbln_config)
+        selected_config = rbln_config
         precompiled = True
     else:
-        params = spec["params"]
+        # 3. Use settings from the compile spec for a new compilation.
+        selected_config = spec.rbln_config
         precompiled = False
-    # 4. Synchronize runtime settings once using the selected configuration.
-    sync_runtime_config(vllm_config, params, precompiled=precompiled)
+    # 4. Read and apply runtime settings once from the selected configuration.
+    runtime_settings = read_runtime_settings(vllm_config, selected_config)
+    apply_runtime_settings(vllm_config, runtime_settings, precompiled=precompiled)

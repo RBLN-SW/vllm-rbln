@@ -12,12 +12,46 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
+
 import pytest
+import torch
 from optimum.rbln import RBLNAutoModelForCausalLM
 from transformers import GptOssConfig, PretrainedConfig, Qwen3Config
 
-from vllm_rbln.utils.optimum.compilation import RBLNCompileSpec
-from vllm_rbln.utils.optimum.params import RBLNParams
+from vllm_rbln.config import build_optimum_rbln_config
+from vllm_rbln.utils.optimum.compilation import build_compile_spec
+
+
+@pytest.fixture(autouse=True)
+def npu_name(monkeypatch):
+    monkeypatch.setattr(
+        "vllm_rbln.platform.RblnPlatform.get_device_name", lambda: "RBLN-CA25"
+    )
+
+
+def _vllm_config(hf_config, *, optimum_overrides=None, user_chunk=None):
+    return SimpleNamespace(
+        model_config=SimpleNamespace(
+            model="org/model",
+            dtype=torch.bfloat16,
+            max_model_len=8192,
+            hf_config=hf_config,
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=1),
+        cache_config=SimpleNamespace(
+            block_size=8192,
+            user_specified_block_size=True,
+            enable_prefix_caching=False,
+            gpu_memory_utilization=0.9,
+        ),
+        additional_config=build_optimum_rbln_config(
+            {
+                "optimum_overrides": optimum_overrides or {},
+                "user_max_num_batched_tokens": user_chunk,
+            }
+        ),
+    )
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -28,12 +62,8 @@ from vllm_rbln.utils.optimum.params import RBLNParams
 def test_decoder_region_model_selection(monkeypatch, enabled, config_cls, architecture):
     monkeypatch.setenv("VLLM_RBLN_USE_NESTED_COMPILE_REGION", str(int(enabled)))
     config = config_cls(architectures=[architecture])
-    spec = RBLNCompileSpec.for_architecture(
-        config,
-        params=RBLNParams(batch_size=1, max_seq_len=8192, kvcache_block_size=8192),
-        memory_budget=0.9,
-    )
-    assert spec.model_cls is RBLNAutoModelForCausalLM
+    spec = build_compile_spec(_vllm_config(config))
+    assert spec.model_cls == RBLNAutoModelForCausalLM.__name__
     assert spec.rbln_config.get("nested_compile_region", False) is enabled
 
 
@@ -48,11 +78,7 @@ def test_decoder_region_model_selection(monkeypatch, enabled, config_cls, archit
 def test_multimodal_decoder_option(monkeypatch, architecture, key):
     monkeypatch.setenv("VLLM_RBLN_USE_NESTED_COMPILE_REGION", "1")
     config = PretrainedConfig(architectures=[architecture])
-    spec = RBLNCompileSpec.for_architecture(
-        config,
-        params=RBLNParams(batch_size=1, max_seq_len=8192, kvcache_block_size=8192),
-        memory_budget=0.9,
-    )
+    spec = build_compile_spec(_vllm_config(config))
     decoder = spec.rbln_config[key] if key else spec.rbln_config
     assert decoder["nested_compile_region"] is True
     if key:
@@ -62,26 +88,37 @@ def test_multimodal_decoder_option(monkeypatch, architecture, key):
 def test_flag_conflicts_with_decoder_override(monkeypatch):
     monkeypatch.setenv("VLLM_RBLN_USE_NESTED_COMPILE_REGION", "1")
     with pytest.raises(ValueError, match="nested_compile_region"):
-        RBLNCompileSpec.for_architecture(
-            Qwen3Config(architectures=["Qwen3ForCausalLM"]),
-            params=RBLNParams(batch_size=1, max_seq_len=8192, kvcache_block_size=8192),
-            memory_budget=0.9,
-            optimum_overrides={"nested_compile_region": False},
+        build_compile_spec(
+            _vllm_config(
+                Qwen3Config(architectures=["Qwen3ForCausalLM"]),
+                optimum_overrides={"nested_compile_region": False},
+            )
         )
 
 
-def test_paligemma_finalizes_params_before_rendering_config():
-    params = RBLNParams(
-        batch_size=4,
-        max_seq_len=8192,
-        kvcache_block_size=8192,
-        prefill_chunk_size=128,
+def test_paligemma_compile_config_uses_full_prompt_prefill():
+    cfg = _vllm_config(
+        PretrainedConfig(architectures=["PaliGemmaForConditionalGeneration"])
     )
-    spec = RBLNCompileSpec.for_architecture(
-        PretrainedConfig(architectures=["PaliGemmaForConditionalGeneration"]),
-        params=params,
-        memory_budget=0.9,
-    )
-    assert params.prefill_chunk_size == 128
-    assert spec.params.prefill_chunk_size == 8192
+    spec = build_compile_spec(cfg)
     assert spec.rbln_config["language_model"]["prefill_chunk_size"] == 8192
+    assert cfg.additional_config.optimum_overrides == {}
+
+
+def test_dtype_override_points_to_vllm_dtype():
+    cfg = _vllm_config(
+        Qwen3Config(architectures=["Qwen3ForCausalLM"]),
+        optimum_overrides={"dtype": "bfloat16"},
+    )
+    with pytest.raises(ValueError, match="`dtype` cannot be set"):
+        build_compile_spec(cfg)
+
+
+def test_user_chunk_conflicting_with_override_is_rejected():
+    cfg = _vllm_config(
+        Qwen3Config(architectures=["Qwen3ForCausalLM"]),
+        optimum_overrides={"prefill_chunk_size": 256},
+        user_chunk=512,
+    )
+    with pytest.raises(ValueError, match="Conflicting prefill chunk size"):
+        build_compile_spec(cfg)

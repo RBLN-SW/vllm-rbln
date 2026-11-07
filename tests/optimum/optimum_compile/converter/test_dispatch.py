@@ -25,8 +25,9 @@ from vllm_rbln.platform.optimum_impl import check_and_update
 from vllm_rbln.utils.optimum.converter import dispatch
 from vllm_rbln.utils.optimum.converter.dispatch import _generate_model_path_name
 from vllm_rbln.utils.optimum.params import (
-    RBLNParams,
+    RBLNCompileSpec,
     load_compiled_rbln_config,
+    read_runtime_settings,
 )
 
 
@@ -104,7 +105,7 @@ class TestGenerateModelPathName:
             "vllm_rbln.platform.RblnPlatform.get_device_name", lambda: " rbln-ca25 "
         )
         cfg = _vllm_config()
-        assert cfg.additional_config.compile_spec["npu_name"] == "RBLN-CA25"
+        assert cfg.additional_config.compile_spec.npu_name == "RBLN-CA25"
         assert _generate_model_path_name(cfg) == canonical
 
     def test_resolved_npu_type_is_preserved(self, monkeypatch):
@@ -114,7 +115,7 @@ class TestGenerateModelPathName:
             "vllm_rbln.platform.RblnPlatform.get_device_name", lambda: "RBLN-CA22"
         )
         dispatch.sync_vllm_and_optimum(cfg)
-        assert cfg.additional_config.compile_spec["npu_name"] == "RBLN-CA25"
+        assert cfg.additional_config.compile_spec.npu_name == "RBLN-CA25"
         assert _generate_model_path_name(cfg) == original
 
     @pytest.mark.parametrize("prefix_caching", [False, True])
@@ -125,9 +126,9 @@ class TestGenerateModelPathName:
 
         def generate_name(vllm_config):
             observed.append(
-                vllm_config.additional_config.compile_spec["rbln_config"].get(
+                vllm_config.additional_config.compile_spec.rbln_config.get(
                     "language_model",
-                    vllm_config.additional_config.compile_spec["rbln_config"],
+                    vllm_config.additional_config.compile_spec.rbln_config,
                 )["prefill_chunk_size"]
             )
             return _generate_model_path_name(vllm_config)
@@ -139,7 +140,7 @@ class TestGenerateModelPathName:
                 architectures=["PaliGemmaForConditionalGeneration"]
             ),
         )
-        spec = cfg.additional_config.compile_spec["rbln_config"]["language_model"]
+        spec = cfg.additional_config.compile_spec.rbln_config["language_model"]
         assert observed == [spec["prefill_chunk_size"]] == [8192]
         assert cfg.cache_config.block_size == 8192
         dispatch.sync_vllm_and_optimum(cfg)
@@ -161,7 +162,7 @@ class TestGenerateModelPathName:
                 max_target_positions=8192,
             )
         )
-        spec = cfg.additional_config.compile_spec["rbln_config"]
+        spec = cfg.additional_config.compile_spec.rbln_config
         assert spec["dec_max_seq_len"] == cfg.model_config.max_model_len == 8192
         assert spec["batch_size"] == cfg.scheduler_config.max_num_seqs == 4
 
@@ -172,7 +173,7 @@ class TestGenerateModelPathName:
         cfg = _vllm_config(hf_config=hf_config)
         cache_path = Path(cfg.additional_config.cached_model_path)
         cache_path.mkdir(parents=True)
-        metadata = cfg.additional_config.compile_spec["rbln_config"]
+        metadata = cfg.additional_config.compile_spec.rbln_config
         metadata = json.loads(json.dumps(metadata))
         metadata["language_model"].update(
             kvcache_block_size=8192, kvcache_num_blocks=4, dtype="bfloat16"
@@ -251,8 +252,8 @@ class TestGenerateModelPathName:
             observed.append(
                 (
                     list(vllm_config.model_config.hf_config.architectures),
-                    vllm_config.additional_config.compile_spec["model_cls"],
-                    vllm_config.additional_config.compile_spec["rbln_config"].get(
+                    vllm_config.additional_config.compile_spec.model_cls,
+                    vllm_config.additional_config.compile_spec.rbln_config.get(
                         "prefill_chunk_size", 1024
                     ),
                 )
@@ -344,7 +345,7 @@ class TestGenerateModelPathName:
     def test_runtime_options_do_not_change_the_key(self, key):
         cfg = _vllm_config()
         original = _generate_model_path_name(cfg)
-        cfg.additional_config.compile_spec["rbln_config"][key] = 1
+        cfg.additional_config.compile_spec.rbln_config[key] = 1
         assert _generate_model_path_name(cfg) == original
 
     def test_prefix_cache_sub_blocks_do_not_change_the_compiled_artifact(self):
@@ -371,9 +372,9 @@ class TestGenerateModelPathName:
 
         def generate_name(vllm_config):
             observed.append(
-                vllm_config.additional_config.compile_spec["rbln_config"].get(
+                vllm_config.additional_config.compile_spec.rbln_config.get(
                     "language_model",
-                    vllm_config.additional_config.compile_spec["rbln_config"],
+                    vllm_config.additional_config.compile_spec.rbln_config,
                 )["prefill_chunk_size"]
             )
             return _generate_model_path_name(vllm_config)
@@ -383,7 +384,7 @@ class TestGenerateModelPathName:
         assert observed == [expected]
         assert cfg.scheduler_config.max_num_batched_tokens == expected
         assert (
-            cfg.additional_config.compile_spec["rbln_config"]["prefill_chunk_size"]
+            cfg.additional_config.compile_spec.rbln_config["prefill_chunk_size"]
             == expected
         )
 
@@ -403,14 +404,14 @@ class TestGenerateModelPathName:
         def generate_name(vllm_config):
             observed.append(
                 (
-                    vllm_config.additional_config.compile_spec["rbln_config"][
+                    vllm_config.additional_config.compile_spec.rbln_config[
                         "batch_size"
                     ],
-                    vllm_config.additional_config.compile_spec["rbln_config"][
+                    vllm_config.additional_config.compile_spec.rbln_config[
                         "max_seq_len"
                     ],
-                    vllm_config.additional_config.compile_spec["dtype"],
-                    vllm_config.additional_config.compile_spec["rbln_config"][
+                    vllm_config.additional_config.compile_spec.dtype,
+                    vllm_config.additional_config.compile_spec.rbln_config[
                         "num_devices"
                     ],
                 )
@@ -430,14 +431,10 @@ class TestGenerateModelPathName:
         )
         assert observed == [(2, 4096, dtype, expected_devices)]
         spec = cfg.additional_config.compile_spec
-        assert spec["dtype"] == dtype
-        assert (
-            spec["rbln_config"]["batch_size"] == cfg.scheduler_config.max_num_seqs == 2
-        )
-        assert (
-            spec["rbln_config"]["max_seq_len"] == cfg.model_config.max_model_len == 4096
-        )
-        assert spec["rbln_config"]["num_devices"] == expected_devices
+        assert spec.dtype == dtype
+        assert spec.rbln_config["batch_size"] == cfg.scheduler_config.max_num_seqs == 2
+        assert spec.rbln_config["max_seq_len"] == cfg.model_config.max_model_len == 4096
+        assert spec.rbln_config["num_devices"] == expected_devices
         assert cfg.additional_config.num_devices_per_local_rank == expected_devices
 
     def test_repeated_sync_preserves_the_attention_block_size(self):
@@ -474,11 +471,12 @@ class TestGenerateModelPathName:
 
         synced = []
         monkeypatch.setattr(
-            dispatch, "sync_runtime_config", lambda cfg, data, **kw: synced.append(data)
+            dispatch,
+            "apply_runtime_settings",
+            lambda cfg, data, **kw: synced.append(data),
         )
         monkeypatch.setattr(
-            dispatch,
-            "resolve_compile_spec",
+            "vllm_rbln.utils.optimum.compilation.build_compile_spec",
             lambda cfg: pytest.fail(
                 "cached metadata must bypass compile input parsing"
             ),
@@ -490,16 +488,24 @@ class TestGenerateModelPathName:
 
 
 def test_initial_cache_hit_applies_runtime_settings_once(monkeypatch):
-    from vllm_rbln.utils.optimum.converter import from_optimum
+    from vllm_rbln.utils.optimum.converter import runtime
 
     calls = []
-    original = from_optimum.update_block_size
+    selected_configs = []
+    read = dispatch.read_runtime_settings
+
+    def record_read(cfg, data):
+        selected_configs.append(data)
+        return read(cfg, data)
+
+    monkeypatch.setattr(dispatch, "read_runtime_settings", record_read)
+    original = runtime.update_block_size
 
     def record(*args, **kwargs):
         calls.append(args)
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(from_optimum, "update_block_size", record)
+    monkeypatch.setattr(runtime, "update_block_size", record)
     metadata = {
         "batch_size": 2,
         "max_seq_len": 4096,
@@ -514,6 +520,7 @@ def test_initial_cache_hit_applies_runtime_settings_once(monkeypatch):
         mamba_block_size=8192,
         optimum_overrides={"device": [0], "create_runtimes": False},
     )
+    assert selected_configs == [metadata]
     assert len(calls) == 1
     assert cfg.scheduler_config.max_num_seqs == 2
     assert cfg.scheduler_config.max_num_batched_tokens == 256
@@ -527,23 +534,25 @@ def test_initial_cache_hit_applies_runtime_settings_once(monkeypatch):
     assert cfg.cache_config.num_gpu_blocks == 3
 
 
-def test_resolution_does_not_apply_runtime_settings(monkeypatch):
+def test_builder_does_not_apply_runtime_settings():
     cfg = _vllm_config()
     cfg.additional_config.compile_spec = None
     cfg.additional_config.optimum_overrides = {"batch_size": 2, "max_seq_len": 4096}
-    dispatch.resolve_compile_spec(cfg)
+    from vllm_rbln.utils.optimum.compilation import build_compile_spec
+
+    spec = build_compile_spec(cfg)
     assert cfg.scheduler_config.max_num_seqs == 4
     assert cfg.model_config.max_model_len == 8192
     assert cfg.scheduler_config.max_num_batched_tokens == 128
-    assert cfg.additional_config.compile_spec is not None
-    assert cfg.additional_config.compile_spec["rbln_config"]["batch_size"] == 2
+    assert cfg.additional_config.compile_spec is None
+    assert spec.rbln_config["batch_size"] == 2
 
 
 def test_compile_snapshot_does_not_share_mutable_overrides():
     overrides = {"custom_options": {"values": [1, 2]}}
     cfg = _vllm_config(optimum_overrides=overrides)
     overrides["custom_options"]["values"].append(3)
-    assert cfg.additional_config.compile_spec["rbln_config"]["custom_options"] == {
+    assert cfg.additional_config.compile_spec.rbln_config["custom_options"] == {
         "values": [1, 2]
     }
 
@@ -585,31 +594,31 @@ def test_explicit_compiled_directory_takes_precedence(tmp_path):
         Qwen3Config(architectures=["Qwen3Model"]),
     ],
 )
-def test_cache_miss_reuses_final_params_without_reparsing(monkeypatch, hf_config):
-    parsed = []
-    original_parse = RBLNParams.from_rbln_config
+def test_runtime_settings_are_read_after_cache_lookup(monkeypatch, hf_config):
+    events = []
+    selected = []
+    generate = dispatch._generate_model_path_name
+    read = dispatch.read_runtime_settings
 
-    def parse(cfg, data):
-        parsed.append(data)
-        return original_parse(cfg, data)
+    def record_lookup(cfg):
+        events.append("lookup")
+        return generate(cfg)
 
-    monkeypatch.setattr(RBLNParams, "from_rbln_config", staticmethod(parse))
+    def record_read(cfg, data):
+        events.append("read")
+        selected.append(data)
+        return read(cfg, data)
+
+    monkeypatch.setattr(dispatch, "_generate_model_path_name", record_lookup)
+    monkeypatch.setattr(dispatch, "read_runtime_settings", record_read)
     cfg = _vllm_config(hf_config=hf_config)
-    assert len(parsed) == 1
-    assert parsed[0] is cfg.additional_config.optimum_overrides
-    params = cfg.additional_config.compile_spec["params"]
-    assert params.batch_size == cfg.scheduler_config.max_num_seqs
-    assert params.max_seq_len == cfg.model_config.max_model_len
-    assert params.kvcache_block_size == cfg.cache_config.block_size
-
-    def reject_parse(*args):
-        pytest.fail("a resolved compile spec must not be parsed again")
-
-    monkeypatch.setattr(RBLNParams, "from_rbln_config", staticmethod(reject_parse))
-    dispatch.sync_vllm_and_optimum(cfg)
+    assert events == ["lookup", "read"]
+    assert selected[0] is cfg.additional_config.compile_spec.rbln_config
+    assert cfg.scheduler_config.max_num_seqs == 4
+    assert cfg.model_config.max_model_len == 8192
 
 
-def test_resolved_params_survive_worker_serialization():
+def test_compile_spec_survives_worker_serialization():
     import pickle
 
     cfg = _vllm_config(
@@ -617,15 +626,15 @@ def test_resolved_params_survive_worker_serialization():
     )
     original_path = cfg.additional_config.cached_model_path
     cfg.additional_config = pickle.loads(pickle.dumps(cfg.additional_config))
-    params = cfg.additional_config.compile_spec["params"]
-    assert isinstance(params, RBLNParams)
-    assert params.prefill_chunk_size == 8192
+    spec = cfg.additional_config.compile_spec
+    assert isinstance(spec, RBLNCompileSpec)
+    assert spec.rbln_config["language_model"]["prefill_chunk_size"] == 8192
     dispatch.sync_vllm_and_optimum(cfg)
     assert cfg.additional_config.cached_model_path == original_path
     assert cfg.scheduler_config.max_num_batched_tokens == 8192
 
 
-def test_final_params_include_submodule_devices_and_image_buckets():
+def test_runtime_settings_include_submodule_devices_and_image_buckets():
     cfg = _vllm_config(
         hf_config=PaliGemmaConfig(architectures=["PaliGemmaForConditionalGeneration"]),
         optimum_overrides={
@@ -633,9 +642,48 @@ def test_final_params_include_submodule_devices_and_image_buckets():
         },
     )
     spec = cfg.additional_config.compile_spec
-    params = spec["params"]
-    language_model = spec["rbln_config"]["language_model"]
-    assert params.num_devices == language_model["num_devices"] == 2
+    settings = read_runtime_settings(cfg, spec.rbln_config)
+    language_model = spec.rbln_config["language_model"]
+    assert settings.num_devices == language_model["num_devices"] == 2
     assert cfg.additional_config.num_devices_per_local_rank == 2
-    assert params.image_prefill_chunk_size == [256]
+    assert settings.image_prefill_chunk_size == [256]
     assert cfg.additional_config.image_prefill_chunk_size == [256]
+
+
+def test_resolver_stores_the_builder_spec_without_repacking(monkeypatch):
+    from vllm_rbln.utils.optimum import compilation
+    from vllm_rbln.utils.optimum.params import RBLNCompileSpec
+
+    built_specs = []
+    build = compilation.build_compile_spec
+
+    def record(*args, **kwargs):
+        spec = build(*args, **kwargs)
+        built_specs.append(spec)
+        return spec
+
+    monkeypatch.setattr(compilation, "build_compile_spec", record)
+    cfg = _vllm_config()
+    assert len(built_specs) == 1
+    assert isinstance(cfg.additional_config.compile_spec, RBLNCompileSpec)
+    assert cfg.additional_config.compile_spec is built_specs[0]
+
+
+def test_runtime_settings_are_derived_from_the_spec_config():
+    cfg = _vllm_config()
+    cfg.additional_config.compile_spec.rbln_config["prefill_chunk_size"] = 256
+    dispatch.sync_vllm_and_optimum(cfg)
+    assert cfg.scheduler_config.max_num_batched_tokens == 256
+
+
+def test_runtime_image_buckets_do_not_mutate_the_compile_snapshot():
+    cfg = _vllm_config(
+        hf_config=PaliGemmaConfig(architectures=["PaliGemmaForConditionalGeneration"]),
+        optimum_overrides={"language_model": {"image_prefill_chunk_size": [512, 256]}},
+    )
+    original_key = _generate_model_path_name(cfg)
+    cfg.additional_config.image_prefill_chunk_size.append(128)
+    assert cfg.additional_config.compile_spec.rbln_config["language_model"][
+        "image_prefill_chunk_size"
+    ] == [512, 256]
+    assert _generate_model_path_name(cfg) == original_key
