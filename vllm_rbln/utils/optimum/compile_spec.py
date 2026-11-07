@@ -150,6 +150,8 @@ def build_compile_spec(vllm_config: VllmConfig) -> RBLNCompileSpec:
     model_config = vllm_config.model_config
     cache_config = vllm_config.cache_config
     additional_config = vllm_config.additional_config
+
+    # 1. Own the overrides before normalizing device placement.
     optimum_overrides = deepcopy(additional_config.optimum_overrides)
     if optimum_overrides.get("dtype") is not None:
         raise ValueError(
@@ -159,37 +161,39 @@ def build_compile_spec(vllm_config: VllmConfig) -> RBLNCompileSpec:
             "(e.g. `LLM(dtype=...)` or `--dtype`)."
         )
     _set_submodule_num_devices(optimum_overrides)
-    config = model_config.hf_config
-    enc_dec = is_enc_dec_arch(config)
-    pooling = is_pooling_arch(config)
-    multimodal = is_multi_modal(config) and not enc_dec
-    sources = (
+
+    # 2. Read override values in language_model, text_model, then root order.
+    hf_config = model_config.hf_config
+    encoder_decoder = is_enc_dec_arch(hf_config)
+    pooling = is_pooling_arch(hf_config)
+    multimodal = is_multi_modal(hf_config) and not encoder_decoder
+    override_sources = (
         language_model_configs(optimum_overrides) if multimodal else [optimum_overrides]
     )
-    compile_inputs: dict[str, Any] = {}
-    block_size = None
-    for source in sources:
-        for key in (
-            "batch_size",
-            "max_seq_len",
-            "dec_max_seq_len",
-            "prefill_chunk_size",
-        ):
+    override_values: dict[str, Any] = {}
+    for key in ("batch_size", "max_seq_len", "dec_max_seq_len", "prefill_chunk_size"):
+        for source in override_sources:
             value = get_field(source, key)
             if value is not None:
-                compile_inputs.setdefault(key, value)
-        if not enc_dec:
-            source_block_size = resolve_kvcache_block_size(source, arch="compile")
+                override_values[key] = value
+                break
+
+    block_size = None
+    if not encoder_decoder:
+        for source in override_sources:
+            # Validate both aliases even after a higher-priority size is selected.
+            source_block_size = resolve_kvcache_block_size(source)
             if block_size is None:
                 block_size = source_block_size
 
-    batch_size = compile_inputs.get(
+    # 3. Finalize compile dimensions using overrides, vLLM inputs and model rules.
+    batch_size = override_values.get(
         "batch_size", vllm_config.scheduler_config.max_num_seqs
     )
-    length_key = "dec_max_seq_len" if enc_dec else "max_seq_len"
-    max_model_len = compile_inputs.get(length_key, model_config.max_model_len)
-    if enc_dec or (pooling and block_size is None):
-        block_size = compile_inputs.get(length_key)
+    length_key = "dec_max_seq_len" if encoder_decoder else "max_seq_len"
+    max_model_len = override_values.get(length_key, model_config.max_model_len)
+    if encoder_decoder or (pooling and block_size is None):
+        block_size = override_values.get(length_key)
     if block_size is None:
         if cache_config.user_specified_block_size:
             block_size = (
@@ -198,7 +202,7 @@ def build_compile_spec(vllm_config: VllmConfig) -> RBLNCompileSpec:
                 and additional_config.attn_block_size is not None
                 else cache_config.block_size
             )
-        elif enc_dec or pooling:
+        elif encoder_decoder or pooling:
             block_size = max_model_len
         else:
             raise ValueError(
@@ -217,10 +221,10 @@ def build_compile_spec(vllm_config: VllmConfig) -> RBLNCompileSpec:
     )
     memory_budget = cache_config.gpu_memory_utilization
     prefill_chunk_size = None
-    if not (enc_dec or pooling):
+    if not (encoder_decoder or pooling):
         default_chunk = default_prefill_chunk_size()
         prefill_chunk_size = (
-            compile_inputs.get("prefill_chunk_size", default_chunk)
+            override_values.get("prefill_chunk_size", default_chunk)
             if multimodal
             else optimum_overrides.get("prefill_chunk_size", default_chunk)
         )
@@ -234,9 +238,11 @@ def build_compile_spec(vllm_config: VllmConfig) -> RBLNCompileSpec:
                     f"({override_chunk}). Set only one."
                 )
             prefill_chunk_size = user_chunk
-        if multimodal and get_rbln_model_info(config)[0] == "paligemma":
+        if multimodal and get_rbln_model_info(hf_config)[0] == "paligemma":
             prefill_chunk_size = max_model_len
-    if is_generation_arch(config):
+
+    # 4. Build the model config and merge only compatible overrides.
+    if is_generation_arch(hf_config):
         model_cls, rbln_config = _for_decoder(
             batch_size,
             block_size,
@@ -245,17 +251,17 @@ def build_compile_spec(vllm_config: VllmConfig) -> RBLNCompileSpec:
             memory_budget,
             prefill_chunk_size,
         )
-    elif is_pooling_arch(config):
+    elif is_pooling_arch(hf_config):
         model_cls, rbln_config = _for_pooling(
-            config,
+            hf_config,
             batch_size,
             block_size,
             max_model_len,
             num_devices,
         )
-    elif is_multi_modal(config):
+    elif is_multi_modal(hf_config):
         model_cls, rbln_config = _for_multimodal(
-            config,
+            hf_config,
             batch_size,
             block_size,
             max_model_len,
@@ -263,22 +269,22 @@ def build_compile_spec(vllm_config: VllmConfig) -> RBLNCompileSpec:
             memory_budget,
             prefill_chunk_size,
         )
-    elif is_enc_dec_arch(config):
+    elif is_enc_dec_arch(hf_config):
         model_cls, rbln_config = _for_enc_dec(
-            config,
+            hf_config,
             batch_size,
             block_size,
             max_model_len,
             num_devices,
         )
     else:
-        architectures = getattr(config, "architectures", [])
+        architectures = getattr(hf_config, "architectures", [])
         raise NotImplementedError(
             f"Compilation is not implemented for architecture {architectures[0]}"
         )
 
     if envs.VLLM_RBLN_USE_NESTED_COMPILE_REGION and (
-        is_generation_arch(config) or is_multi_modal(config)
+        is_generation_arch(hf_config) or is_multi_modal(hf_config)
     ):
         decoder_config = rbln_config
         for name in ("language_model", "text_model"):
@@ -300,12 +306,13 @@ def build_compile_spec(vllm_config: VllmConfig) -> RBLNCompileSpec:
             )
         _deep_merge(rbln_config, optimum_overrides)
 
+    # 5. Snapshot the exact inputs shared by cache lookup and compilation.
     return RBLNCompileSpec(
         model=str(model_config.model),
         dtype=model_config.dtype,
         model_cls=model_cls.__name__,
         rbln_config=rbln_config,
-        hf_config=deepcopy(config.to_dict()),
+        hf_config=deepcopy(hf_config.to_dict()),
         npu_name=RblnPlatform.get_device_name().strip().upper(),
     )
 

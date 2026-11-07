@@ -105,7 +105,7 @@ def resolve_image_prefill_chunk_size(cfg: RblnConfigLike) -> list[int] | None:
     )
 
 
-def resolve_kvcache_block_size(cfg: RblnConfigLike, *, arch: str) -> int | None:
+def resolve_kvcache_block_size(cfg: RblnConfigLike) -> int | None:
     """Resolve ``kvcache_block_size``, reconciling it with ``kvcache_partition_len``.
 
     Some rbln_config payloads only carry ``kvcache_partition_len``; when both
@@ -118,7 +118,7 @@ def resolve_kvcache_block_size(cfg: RblnConfigLike, *, arch: str) -> int | None:
     if kvcache_block_size is None:
         return kvcache_partition_len
     assert kvcache_partition_len == kvcache_block_size, (
-        f"kvcache_partition_len must equal kvcache_block_size for {arch} models. "
+        "kvcache_partition_len must equal kvcache_block_size. "
         "Please check the values in rbln_config.json"
     )
     return kvcache_block_size

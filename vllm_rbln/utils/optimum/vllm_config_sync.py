@@ -265,7 +265,7 @@ def sync_vllm_config(
                 value = get_field(source, key)
                 if value is not None:
                     values.setdefault(key, value)
-            block_size = resolve_kvcache_block_size(source, arch="multi-modal")
+            block_size = resolve_kvcache_block_size(source)
             if block_size is not None:
                 values.setdefault("kvcache_block_size", block_size)
             image_size = resolve_image_prefill_chunk_size(source)
@@ -283,12 +283,12 @@ def sync_vllm_config(
         batch_size = get_field(rbln_config, "batch_size")
         max_seq_len = get_field(rbln_config, "max_seq_len")
         if is_pooling_arch(hf_config):
-            kvcache_block_size = resolve_kvcache_block_size(rbln_config, arch="pooling")
+            kvcache_block_size = resolve_kvcache_block_size(rbln_config)
             if kvcache_block_size is None:
                 kvcache_block_size = max_seq_len
             prefill_chunk_size = 128
         else:
-            kvcache_block_size = resolve_kvcache_block_size(rbln_config, arch="decoder")
+            kvcache_block_size = resolve_kvcache_block_size(rbln_config)
             prefill_chunk_size = get_field(
                 rbln_config, "prefill_chunk_size", default_prefill_chunk_size()
             )
