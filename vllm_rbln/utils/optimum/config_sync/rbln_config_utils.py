@@ -12,12 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Read optimum-rbln config fields shared by compile specs and vLLM config updates.
+"""Read compiled RBLN metadata and access its configuration fields.
 
-Each reader accepts either a ``rbln_config.json`` dict or an ``RBLNModelConfig``.
+Field readers accept a ``rbln_config.json`` dict or an ``RBLNModelConfig``.
 """
 
+import json
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Union
+
+from vllm_rbln.utils.optimum.path import RBLN_CONFIG_FILE
 
 if TYPE_CHECKING:
     from optimum.rbln.configuration_utils import RBLNModelConfig
@@ -25,6 +29,15 @@ if TYPE_CHECKING:
 
 # Either a plain dict (from rbln_config.json) or an RBLNModelConfig instance.
 RblnConfigLike = Union[dict, "RBLNModelConfig"]
+
+
+def load_compiled_rbln_config(model_path: str) -> dict | None:
+    """Read rbln_config.json from the selected compiled model directory."""
+    rbln_config_path = Path(model_path) / RBLN_CONFIG_FILE
+    if not rbln_config_path.is_file():
+        return None
+    with open(rbln_config_path, encoding="utf-8") as f:
+        return json.load(f)
 
 
 def get_field(cfg: RblnConfigLike, key: str, default: Any = None) -> Any:
@@ -71,7 +84,7 @@ def _num_devices_of(cfg: RblnConfigLike) -> int | None:
     return None
 
 
-def resolve_num_devices(cfg: RblnConfigLike) -> int | None:
+def read_num_devices(cfg: RblnConfigLike) -> int | None:
     for submodule_name in ("language_model", "text_model"):
         sub_cfg = get_submodule(cfg, submodule_name)
         if sub_cfg is None:
@@ -82,7 +95,7 @@ def resolve_num_devices(cfg: RblnConfigLike) -> int | None:
     return _num_devices_of(cfg)
 
 
-def resolve_image_prefill_chunk_size(cfg: RblnConfigLike) -> list[int] | None:
+def read_image_prefill_chunk_size(cfg: RblnConfigLike) -> list[int] | None:
     """Resolve image-prefill buckets exactly as optimum-rbln persists them.
 
     optimum-rbln stores ``image_prefill_chunk_size`` under one key but with two
@@ -105,7 +118,7 @@ def resolve_image_prefill_chunk_size(cfg: RblnConfigLike) -> list[int] | None:
     )
 
 
-def resolve_kvcache_block_size(cfg: RblnConfigLike) -> int | None:
+def read_kvcache_block_size(cfg: RblnConfigLike) -> int | None:
     """Resolve ``kvcache_block_size``, reconciling it with ``kvcache_partition_len``.
 
     Some rbln_config payloads only carry ``kvcache_partition_len``; when both
@@ -122,22 +135,3 @@ def resolve_kvcache_block_size(cfg: RblnConfigLike) -> int | None:
         "Please check the values in rbln_config.json"
     )
     return kvcache_block_size
-
-
-_PREFILL_CHUNK_SIZE_BY_FAMILY = {
-    "ca": 128,  # ATOM
-    "cr": 512,  # REBEL
-}
-
-
-def default_prefill_chunk_size() -> int:
-    from vllm_rbln.platform import RblnPlatform
-
-    device_name = RblnPlatform.get_device_name().lower()
-    for family, chunk_size in _PREFILL_CHUNK_SIZE_BY_FAMILY.items():
-        if family in device_name:
-            return chunk_size
-    raise RuntimeError(
-        f"Unknown NPU device {device_name!r}; "
-        "expected an ATOM (ca) or REBEL (cr) device."
-    )

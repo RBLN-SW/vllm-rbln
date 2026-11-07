@@ -43,7 +43,7 @@ from pydantic import Field
 from vllm.config.utils import config as vllm_config_dataclass
 
 from vllm_rbln.logger import init_logger
-from vllm_rbln.utils.optimum.compile_spec import RBLNCompileSpec
+from vllm_rbln.utils.optimum.config_sync.compile_spec import RBLNCompileSpec
 
 if TYPE_CHECKING:
     # `Field` here is pydantic's, which a field definition below calls.
@@ -476,7 +476,7 @@ def _model_impl_for(engine_args: Any) -> tuple[ModelImpl, str, str]:
 
     # Owned by the optimum path, and imported here so that a run which named
     # its path, and never reaches this, does not import it at all.
-    from vllm_rbln.utils.optimum.artifacts import is_compiled_dir
+    from vllm_rbln.utils.optimum.path import is_compiled_dir
     from vllm_rbln.utils.optimum.registry import is_arch_supported
 
     model = maybe_model_redirect(engine_args.hf_config_path or engine_args.model)

@@ -14,10 +14,10 @@
 
 import json
 
-from vllm_rbln.utils.optimum.artifacts import (
+from vllm_rbln.utils.optimum.config_sync.rbln_config_utils import (
     load_compiled_rbln_config,
-    resolve_compiled_model_path,
 )
+from vllm_rbln.utils.optimum.path import resolve_compiled_model_path
 
 
 def test_metadata_loader_reads_only_the_selected_path(tmp_path):

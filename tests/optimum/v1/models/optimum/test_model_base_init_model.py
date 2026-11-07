@@ -29,8 +29,8 @@ from transformers import Gemma4Config, LlamaConfig, PretrainedConfig
 from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.model_executor.models.optimum import model_base
 from vllm_rbln.model_executor.models.optimum.model_base import RBLNOptimumModelBase
-from vllm_rbln.utils.optimum.compile_spec import RBLNCompileSpec
-from vllm_rbln.utils.optimum.rbln_config_utils import get_field
+from vllm_rbln.utils.optimum.config_sync.compile_spec import RBLNCompileSpec
+from vllm_rbln.utils.optimum.config_sync.rbln_config_utils import get_field
 
 
 class ExternalConfig(PretrainedConfig):
@@ -59,7 +59,7 @@ def _init_model_with(
         model_base, "get_rbln_model_info", lambda cfg: ("fake", "FakeRBLNModel")
     )
     monkeypatch.setattr(
-        "vllm_rbln.utils.optimum.artifacts.is_compiled_dir",
+        "vllm_rbln.utils.optimum.path.is_compiled_dir",
         lambda path: precompiled and path == str(tmp_path),
     )
 

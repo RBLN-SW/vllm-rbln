@@ -21,13 +21,13 @@ def set_npu_env_var(monkeypatch):
 
 @pytest.fixture
 def compile_environment(monkeypatch, tmp_path, set_npu_env_var):
-    from vllm_rbln.utils.optimum import sync
+    from vllm_rbln.utils.optimum.config_sync import sync
 
     monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path))
     monkeypatch.setattr(sync, "load_compiled_rbln_config", lambda path: None)
     monkeypatch.setattr(sync, "resolve_compiled_model_path", lambda model, cache: None)
     monkeypatch.setattr(
-        "vllm_rbln.utils.optimum.rbln_config_utils.default_prefill_chunk_size",
+        "vllm_rbln.utils.optimum.config_sync.compile_spec.default_prefill_chunk_size",
         lambda: 128,
     )
     monkeypatch.setattr(
@@ -43,7 +43,7 @@ def vllm_config_factory(compile_environment):
     from transformers import LlamaConfig
 
     from vllm_rbln.config import build_optimum_rbln_config
-    from vllm_rbln.utils.optimum import sync
+    from vllm_rbln.utils.optimum.config_sync import sync
 
     def make_config(
         user_max_num_batched_tokens=None,

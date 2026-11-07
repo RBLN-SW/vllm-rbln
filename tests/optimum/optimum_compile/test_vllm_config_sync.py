@@ -21,12 +21,12 @@ import torch
 from vllm.config import CacheConfig, ModelConfig, SchedulerConfig, VllmConfig
 
 from vllm_rbln.config import build_optimum_rbln_config
-from vllm_rbln.utils.optimum.vllm_config_sync import (
+from vllm_rbln.utils.optimum.config_sync.vllm_config_sync import sync_vllm_config
+from vllm_rbln.utils.optimum.config_sync.vllm_config_sync_utils import (
+    get_runtime_num_blocks,
     get_user_max_num_batched_tokens,
     is_chunked_prefill_arch,
-    resolve_num_blocks,
     store_image_prefill_chunk_size,
-    sync_vllm_config,
     update_max_num_batched_tokens,
     validate_user_prefill_chunk_size,
 )
@@ -92,7 +92,7 @@ class TestSyncDecoder:
             "prefill_chunk_size": 256,
         }
         synced = sync_config(cfg, arch=DECODER_ARCH)
-        assert resolve_num_blocks(synced.model_config.hf_config, cfg) == 16
+        assert get_runtime_num_blocks(synced.model_config.hf_config, cfg) == 16
         assert synced.scheduler_config.max_num_seqs == 4
         assert synced.model_config.max_model_len == 8192
         assert synced.cache_config.block_size == 4096
@@ -138,7 +138,7 @@ class TestSyncEncDec:
             "kvcache_block_size": 448,
         }
         synced = sync_config(cfg, arch=ENC_DEC_ARCH)
-        assert resolve_num_blocks(synced.model_config.hf_config, cfg) == 4
+        assert get_runtime_num_blocks(synced.model_config.hf_config, cfg) == 4
         assert synced.scheduler_config.max_num_seqs == 1
         assert synced.model_config.max_model_len == 448
         assert synced.cache_config.block_size == 448
@@ -166,7 +166,7 @@ class TestSyncPooling:
             "kvcache_block_size": 512,
         }
         synced = sync_config(cfg, arch="Qwen3Model")
-        assert resolve_num_blocks(synced.model_config.hf_config, cfg) == 16
+        assert get_runtime_num_blocks(synced.model_config.hf_config, cfg) == 16
         assert synced.scheduler_config.max_num_seqs == 8
         assert synced.model_config.max_model_len == 512
         assert synced.cache_config.block_size == 512
@@ -174,7 +174,7 @@ class TestSyncPooling:
     def test_encoder_pooling_batch_maps_to_vllm_blocks(self, sync_config):
         cfg = {"num_devices": 1, "max_seq_len": 512, "batch_size": 8}
         synced = sync_config(cfg, arch=POOLING_ARCH)
-        assert resolve_num_blocks(synced.model_config.hf_config, cfg) == 8
+        assert get_runtime_num_blocks(synced.model_config.hf_config, cfg) == 8
 
     def test_kvcache_block_size_equals_max_seq_len(self, sync_config):
         cfg = {"num_devices": 1, "max_seq_len": 512, "batch_size": 8}
@@ -242,7 +242,7 @@ class TestSyncMultimodal:
         assert synced.scheduler_config.max_num_seqs == 2
         assert synced.model_config.max_model_len == 4096
         assert synced.cache_config.block_size == 4096
-        assert resolve_num_blocks(synced.model_config.hf_config, cfg) == 8
+        assert get_runtime_num_blocks(synced.model_config.hf_config, cfg) == 8
         assert synced.scheduler_config.max_num_batched_tokens == 256
         assert synced.additional_config.image_prefill_chunk_size == [512, 256]
 
@@ -256,7 +256,7 @@ class TestSyncMultimodal:
             "kvcache_block_size": 128,
         }
         synced = sync_config(cfg, arch="PaliGemmaForConditionalGeneration")
-        assert resolve_num_blocks(synced.model_config.hf_config, cfg) == 32
+        assert get_runtime_num_blocks(synced.model_config.hf_config, cfg) == 32
         assert synced.scheduler_config.max_num_seqs == 1
         assert synced.model_config.max_model_len == 4096
         assert synced.cache_config.block_size == 128
@@ -273,7 +273,7 @@ class TestSyncMultimodal:
             },
         }
         synced = sync_config(cfg, arch="PaliGemmaForConditionalGeneration")
-        assert resolve_num_blocks(synced.model_config.hf_config, cfg) == 16
+        assert get_runtime_num_blocks(synced.model_config.hf_config, cfg) == 16
         assert synced.scheduler_config.max_num_seqs == 2
         assert synced.model_config.max_model_len == 2048
         assert synced.cache_config.block_size == 64
@@ -290,7 +290,7 @@ class TestSyncMultimodal:
             },
         }
         synced = sync_config(cfg, arch="PaliGemmaForConditionalGeneration")
-        assert resolve_num_blocks(synced.model_config.hf_config, cfg) == 8
+        assert get_runtime_num_blocks(synced.model_config.hf_config, cfg) == 8
         assert synced.scheduler_config.max_num_seqs == 1
         assert synced.model_config.max_model_len == 1024
         assert synced.cache_config.block_size == 32
@@ -506,7 +506,7 @@ def _engine_config() -> VllmConfig:
     # Force the cache-miss branch so building the config does not look for a
     # compiled artifact. The test calls sync_vllm_config itself.
     with patch(
-        "vllm_rbln.utils.optimum.sync.load_compiled_rbln_config",
+        "vllm_rbln.utils.optimum.config_sync.sync.load_compiled_rbln_config",
         return_value=None,
     ):
         return VllmConfig(
@@ -604,9 +604,10 @@ def test_sync_requires_resolved_compile_values(sync_config, arch, missing, preco
 
 def test_whisper_block_count_is_read_without_a_batch_size_default():
     hf_config = SimpleNamespace(architectures=[ENC_DEC_ARCH])
-    assert resolve_num_blocks(hf_config, {"batch_size": 4}) is None
+    assert get_runtime_num_blocks(hf_config, {"batch_size": 4}) is None
     assert (
-        resolve_num_blocks(hf_config, {"batch_size": 4, "kvcache_num_blocks": 8}) == 8
+        get_runtime_num_blocks(hf_config, {"batch_size": 4, "kvcache_num_blocks": 8})
+        == 8
     )
 
 

@@ -20,13 +20,13 @@ import pytest
 import torch
 from transformers import LlamaConfig, PaliGemmaConfig, Qwen3Config, WhisperConfig
 
-from vllm_rbln.platform.optimum_impl import check_and_update
-from vllm_rbln.utils.optimum import artifacts, sync
-from vllm_rbln.utils.optimum.artifacts import (
-    get_compile_cache_path,
+from vllm_rbln.utils.optimum.config_sync import sync
+from vllm_rbln.utils.optimum.config_sync.compile_spec import RBLNCompileSpec
+from vllm_rbln.utils.optimum.config_sync.compile_spec_utils import compile_cache_name
+from vllm_rbln.utils.optimum.config_sync.rbln_config_utils import (
     load_compiled_rbln_config,
 )
-from vllm_rbln.utils.optimum.compile_spec import RBLNCompileSpec, compile_cache_name
+from vllm_rbln.utils.optimum.path import get_compile_cache_path
 
 pytestmark = pytest.mark.usefixtures("compile_environment")
 
@@ -46,7 +46,7 @@ class TestSync:
             )
             return compile_cache_name(spec)
 
-        monkeypatch.setattr(artifacts, "compile_cache_name", generate_name)
+        monkeypatch.setattr(sync, "compile_cache_name", generate_name)
         cfg = vllm_config_factory(
             prefix_caching=prefix_caching,
             hf_config=PaliGemmaConfig(
@@ -128,6 +128,8 @@ class TestSync:
         expected_cls,
         expected_tokens,
     ):
+        from vllm_rbln.platform.optimum_impl import check_and_update
+
         hf_config = Qwen3Config(
             architectures=[
                 "Qwen3ForSequenceClassification" if reranker else "Qwen3ForCausalLM"
@@ -173,7 +175,7 @@ class TestSync:
             )
             return compile_cache_name(spec)
 
-        monkeypatch.setattr(artifacts, "compile_cache_name", generate_name)
+        monkeypatch.setattr(sync, "compile_cache_name", generate_name)
         check_and_update(cfg)
         assert observed == [([expected_arch], expected_cls, expected_tokens)]
 
@@ -207,7 +209,7 @@ class TestSync:
             )
             return compile_cache_name(spec)
 
-        monkeypatch.setattr(artifacts, "compile_cache_name", generate_name)
+        monkeypatch.setattr(sync, "compile_cache_name", generate_name)
         cfg = vllm_config_factory(user_tokens, optimum_overrides=overrides)
         assert observed == [expected]
         assert cfg.scheduler_config.max_num_batched_tokens == expected
@@ -246,7 +248,7 @@ class TestSync:
             )
             return compile_cache_name(spec)
 
-        monkeypatch.setattr(artifacts, "compile_cache_name", generate_name)
+        monkeypatch.setattr(sync, "compile_cache_name", generate_name)
         cfg = vllm_config_factory(
             dtype=dtype,
             num_devices_per_local_rank=devices,
@@ -299,7 +301,8 @@ class TestSync:
                 ),
             )
             assert get_compile_cache_path(
-                cfg.additional_config.compile_spec, str(cache_path.parent.parent)
+                compile_cache_name(cfg.additional_config.compile_spec),
+                str(cache_path.parent.parent),
             ) == str(cache_path)
         assert cfg.model_config.model == source_model
 
@@ -325,7 +328,7 @@ class TestSync:
 def test_initial_cache_hit_applies_vllm_config_updates_once(
     monkeypatch, vllm_config_factory
 ):
-    from vllm_rbln.utils.optimum import vllm_config_sync
+    from vllm_rbln.utils.optimum.config_sync import vllm_config_sync
 
     calls = []
     selected_configs = []
@@ -375,7 +378,7 @@ def test_builder_does_not_apply_vllm_config_updates(vllm_config_factory):
     cfg = vllm_config_factory()
     cfg.additional_config.compile_spec = None
     cfg.additional_config.optimum_overrides = {"batch_size": 2, "max_seq_len": 4096}
-    from vllm_rbln.utils.optimum.compile_spec import build_compile_spec
+    from vllm_rbln.utils.optimum.config_sync.compile_spec import build_compile_spec
 
     spec = build_compile_spec(cfg)
     assert cfg.scheduler_config.max_num_seqs == 4
@@ -411,7 +414,7 @@ def test_vllm_config_is_synced_after_cache_lookup(
 ):
     events = []
     selected = []
-    generate = artifacts.compile_cache_name
+    generate = sync.compile_cache_name
     apply = sync.sync_vllm_config
 
     def record_lookup(spec):
@@ -423,7 +426,7 @@ def test_vllm_config_is_synced_after_cache_lookup(
         selected.append(data)
         return apply(cfg, data, **kwargs)
 
-    monkeypatch.setattr(artifacts, "compile_cache_name", record_lookup)
+    monkeypatch.setattr(sync, "compile_cache_name", record_lookup)
     monkeypatch.setattr(sync, "sync_vllm_config", record_apply)
     cfg = vllm_config_factory(hf_config=hf_config)
     assert events == ["lookup", "apply"]

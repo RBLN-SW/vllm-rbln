@@ -19,13 +19,14 @@ from typing import TYPE_CHECKING
 from vllm_rbln import envs
 from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.logger import init_logger
-
-from .artifacts import (
+from vllm_rbln.utils.optimum.path import (
     get_compile_cache_path,
-    load_compiled_rbln_config,
     resolve_compiled_model_path,
 )
+
 from .compile_spec import build_compile_spec
+from .compile_spec_utils import compile_cache_name
+from .rbln_config_utils import load_compiled_rbln_config
 from .vllm_config_sync import sync_vllm_config
 
 if TYPE_CHECKING:
@@ -55,7 +56,9 @@ def sync_vllm_and_optimum(vllm_config: VllmConfig) -> None:
         if additional_config.compile_spec is None:
             additional_config.compile_spec = build_compile_spec(vllm_config)
         spec = additional_config.compile_spec
-        artifact_path = get_compile_cache_path(spec, envs.VLLM_CACHE_ROOT)
+        artifact_path = get_compile_cache_path(
+            compile_cache_name(spec), envs.VLLM_CACHE_ROOT
+        )
         additional_config.cached_model_path = artifact_path
         rbln_config = load_compiled_rbln_config(artifact_path)
     if rbln_config is not None:

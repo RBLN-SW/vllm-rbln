@@ -15,9 +15,9 @@
 
 import pytest
 
-from vllm_rbln.utils.optimum.rbln_config_utils import (
+from vllm_rbln.utils.optimum.config_sync.rbln_config_utils import (
     _num_devices_of,
-    resolve_num_devices,
+    read_num_devices,
 )
 
 
@@ -60,36 +60,36 @@ class TestNumDevicesOf:
             _num_devices_of({"_compile_cfgs": [{"num_devices": -1}]})
 
 
-class TestResolveNumDevices:
+class TestReadNumDevices:
     def test_top_level(self):
-        assert resolve_num_devices({"num_devices": 4}) == 4
+        assert read_num_devices({"num_devices": 4}) == 4
 
     def test_returns_none_when_absent(self):
-        assert resolve_num_devices({}) is None
+        assert read_num_devices({}) is None
 
     def test_reads_from_language_model_submodule(self):
         cfg = {"language_model": {"num_devices": 8}}
-        assert resolve_num_devices(cfg) == 8
+        assert read_num_devices(cfg) == 8
 
     def test_reads_from_text_model_submodule(self):
         cfg = {"text_model": {"num_devices": 8}}
-        assert resolve_num_devices(cfg) == 8
+        assert read_num_devices(cfg) == 8
 
     def test_language_model_takes_precedence_over_top_level(self):
         cfg = {"num_devices": 1, "language_model": {"num_devices": 8}}
-        assert resolve_num_devices(cfg) == 8
+        assert read_num_devices(cfg) == 8
 
     def test_language_model_preferred_over_text_model(self):
         cfg = {
             "language_model": {"num_devices": 8},
             "text_model": {"num_devices": 16},
         }
-        assert resolve_num_devices(cfg) == 8
+        assert read_num_devices(cfg) == 8
 
     def test_reads_from_submodule_compile_cfgs(self):
         cfg = {"language_model": {"_compile_cfgs": [{"num_devices": 8}]}}
-        assert resolve_num_devices(cfg) == 8
+        assert read_num_devices(cfg) == 8
 
     def test_falls_back_to_top_level_when_submodule_lacks_num_devices(self):
         cfg = {"num_devices": 4, "language_model": {"batch_size": 2}}
-        assert resolve_num_devices(cfg) == 4
+        assert read_num_devices(cfg) == 4

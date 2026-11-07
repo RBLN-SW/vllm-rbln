@@ -12,26 +12,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Define the compile spec, build it from vLLM inputs and derive its cache key.
+"""Build an owned compile spec from vLLM inputs.
 
 The spec is the single snapshot that both the compile-cache key and the
 compilation read, so the two cannot disagree.
 """
 
-import hashlib
-import json
 from copy import deepcopy
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from vllm_rbln import envs
-from vllm_rbln.utils.optimum.multimodal_configs import MULTIMODAL_CONFIG_BUILDERS
-from vllm_rbln.utils.optimum.rbln_config_utils import (
+from vllm_rbln.utils.optimum.config_sync.compile_spec_utils import (
     default_prefill_chunk_size,
+    find_override_conflicts,
+    get_compile_num_devices,
+    get_user_block_size,
+    merge_overrides,
+    require_compile_block_size,
+    set_submodule_num_devices,
+    validate_prefill_chunk_override,
+)
+from vllm_rbln.utils.optimum.config_sync.multimodal_configs import (
+    MULTIMODAL_CONFIG_BUILDERS,
+)
+from vllm_rbln.utils.optimum.config_sync.rbln_config_utils import (
     get_field,
     language_model_configs,
-    resolve_kvcache_block_size,
-    resolve_num_devices,
+    read_kvcache_block_size,
 )
 from vllm_rbln.utils.optimum.registry import (
     get_rbln_model_info,
@@ -60,141 +68,6 @@ class RBLNCompileSpec:
     npu_name: str
 
 
-# Keys that affect only loading the compiled model, not the compiled binary,
-# and therefore must be stripped before hashing so the same compiled artifact
-# is shared between compile-only and inference invocations.
-_LOAD_ONLY_KEYS: frozenset[str] = frozenset(
-    {"create_runtimes", "device", "kvcache_num_blocks"}
-)
-
-
-def _strip_load_only_keys(obj: dict) -> dict:
-    """Recursively drop :data:`_LOAD_ONLY_KEYS` from nested dict/list."""
-    if isinstance(obj, dict):
-        return {
-            k: _strip_load_only_keys(v)
-            for k, v in obj.items()
-            if k not in _LOAD_ONLY_KEYS
-        }
-    if isinstance(obj, list):
-        return [_strip_load_only_keys(item) for item in obj]
-    return obj
-
-
-def compile_cache_name(spec: RBLNCompileSpec) -> str:
-    """Hash compile-relevant spec fields into a stable artifact directory name."""
-    config_dict: dict[str, Any] = {
-        field.name: getattr(spec, field.name) for field in fields(spec)
-    }
-    config_dict["rbln_config"] = _strip_load_only_keys(config_dict["rbln_config"])
-    config_dict["hf_config"] = spec.hf_config.to_dict()
-    model_name = str(config_dict["model"])
-
-    config_json = json.dumps(config_dict, sort_keys=True, default=str)
-    config_hash = hashlib.sha256(config_json.encode()).hexdigest()[:16]
-
-    sanitized_name = model_name.replace("/", "_").replace(":", "_")
-    return f"{sanitized_name}_{config_hash}"
-
-
-def _deep_merge(base: dict, overrides: dict) -> None:
-    """Recursively merge ``overrides`` into ``base`` in place.
-
-    Nested dicts are merged key-by-key; non-dict values overwrite. This
-    preserves untouched sub-keys when the user only overrides part of a
-    nested config (e.g. ``language_model.max_seq_len`` for multimodal).
-    """
-    for key, value in overrides.items():
-        existing = base.get(key)
-        if isinstance(value, dict) and isinstance(existing, dict):
-            _deep_merge(existing, value)
-        else:
-            base[key] = value
-
-
-def _find_conflicts(base: dict, overrides: dict, _prefix: str = "") -> list[str]:
-    """Return dotted paths where ``overrides`` would overwrite an existing
-    value in ``base`` with a different one.
-
-    Mirrors ``_deep_merge``'s traversal: nested dicts recurse, leaves compare
-    by value. A key present only in ``overrides`` is not a conflict (the user
-    is adding a new knob, not clobbering a derived field).
-    """
-    conflicts: list[str] = []
-    for key, value in overrides.items():
-        if key not in base:
-            continue
-        path = f"{_prefix}{key}"
-        existing = base[key]
-        if isinstance(value, dict) and isinstance(existing, dict):
-            conflicts.extend(_find_conflicts(existing, value, f"{path}."))
-        elif existing != value:
-            conflicts.append(f"{path} (compiled={existing!r}, override={value!r})")
-    return conflicts
-
-
-def _set_submodule_num_devices(rbln_config: dict) -> None:
-    """Set each submodule's num_devices from its explicit device list."""
-    for value in rbln_config.values():
-        if not isinstance(value, dict):
-            continue
-        device = value.get("device")
-        if isinstance(device, list) and device:
-            value["num_devices"] = len(device)
-
-
-def _user_block_size(vllm_config: VllmConfig) -> int | None:
-    """Preserve the attention block when prefix caching uses smaller blocks."""
-    cache_config = vllm_config.cache_config
-    additional_config = vllm_config.additional_config
-    if not cache_config.user_specified_block_size:
-        return None
-    if (
-        cache_config.enable_prefix_caching
-        and additional_config.attn_block_size is not None
-    ):
-        return additional_config.attn_block_size
-    return cache_config.block_size
-
-
-def _require_block_size(block_size: int | None) -> int:
-    if block_size is None:
-        raise ValueError(
-            "`block_size` is required to run optimum-rbln models "
-            "in vLLM RBLN.\n"
-            "Set it via one of:\n"
-            "  1) vLLM's `block_size` argument "
-            "(e.g. `LLM(block_size=...)` or `--block-size`), or\n"
-            "  2) `kvcache_block_size` under "
-            "`additional_config={'optimum_overrides': {...}}`.\n"
-        )
-    return block_size
-
-
-def _resolve_compile_num_devices(
-    vllm_config: VllmConfig, optimum_overrides: dict[str, Any]
-) -> int:
-    num_devices = resolve_num_devices(optimum_overrides)
-    if num_devices is None:
-        num_devices = vllm_config.additional_config.num_devices_per_local_rank
-    return num_devices
-
-
-def _validate_prefill_chunk_size(
-    user_chunk: int | None, override_chunk: int | None
-) -> None:
-    if (
-        user_chunk is not None
-        and override_chunk is not None
-        and override_chunk != user_chunk
-    ):
-        raise ValueError(
-            f"Conflicting prefill chunk size: max_num_batched_tokens "
-            f"({user_chunk}) != rbln_config['prefill_chunk_size'] "
-            f"({override_chunk}). Set only one."
-        )
-
-
 def build_compile_spec(vllm_config: VllmConfig) -> RBLNCompileSpec:
     """Resolve user inputs into an owned snapshot for cache lookup and compilation."""
     from vllm_rbln.platform import RblnPlatform
@@ -210,7 +83,7 @@ def build_compile_spec(vllm_config: VllmConfig) -> RBLNCompileSpec:
             "an rbln_config field. Use vLLM's `dtype` argument instead "
             "(e.g. `LLM(dtype=...)` or `--dtype`)."
         )
-    _set_submodule_num_devices(optimum_overrides)
+    set_submodule_num_devices(optimum_overrides)
 
     hf_config = model_config.hf_config
     if is_generation_arch(hf_config):
@@ -232,13 +105,13 @@ def build_compile_spec(vllm_config: VllmConfig) -> RBLNCompileSpec:
     # mismatch would compile a model that disagrees with the runtime. Adding
     # a new key not set by the builder is allowed.
     if optimum_overrides:
-        conflicts = _find_conflicts(rbln_config, optimum_overrides)
+        conflicts = find_override_conflicts(rbln_config, optimum_overrides)
         if conflicts:
             raise ValueError(
                 "optimum_overrides conflict with vllm-derived compile config: "
                 + "; ".join(conflicts)
             )
-        _deep_merge(rbln_config, optimum_overrides)
+        merge_overrides(rbln_config, optimum_overrides)
 
     return RBLNCompileSpec(
         model=str(model_config.model),
@@ -267,16 +140,16 @@ def _for_decoder(
     if max_model_len is None:
         max_model_len = model_config.max_model_len
 
-    block_size = resolve_kvcache_block_size(optimum_overrides)
+    block_size = read_kvcache_block_size(optimum_overrides)
     if block_size is None:
-        block_size = _user_block_size(vllm_config)
-    block_size = _require_block_size(block_size)
+        block_size = get_user_block_size(vllm_config)
+    block_size = require_compile_block_size(block_size)
 
-    num_devices = _resolve_compile_num_devices(vllm_config, optimum_overrides)
+    num_devices = get_compile_num_devices(vllm_config, optimum_overrides)
 
     prefill_chunk_size = optimum_overrides.get("prefill_chunk_size")
     user_chunk = additional_config.user_max_num_batched_tokens
-    _validate_prefill_chunk_size(user_chunk, prefill_chunk_size)
+    validate_prefill_chunk_override(user_chunk, prefill_chunk_size)
     if user_chunk is not None:
         prefill_chunk_size = user_chunk
     if prefill_chunk_size is None:
@@ -313,15 +186,15 @@ def _for_pooling(
     if max_model_len is None:
         max_model_len = model_config.max_model_len
 
-    block_size = resolve_kvcache_block_size(optimum_overrides)
+    block_size = read_kvcache_block_size(optimum_overrides)
     if block_size is None:
         block_size = optimum_overrides.get("max_seq_len")
     if block_size is None:
-        block_size = _user_block_size(vllm_config)
+        block_size = get_user_block_size(vllm_config)
     if block_size is None:
         block_size = max_model_len
 
-    num_devices = _resolve_compile_num_devices(vllm_config, optimum_overrides)
+    num_devices = get_compile_num_devices(vllm_config, optimum_overrides)
 
     _, model_cls_name = get_rbln_model_info(model_config.hf_config)
     model_cls = getattr(optimum.rbln, model_cls_name)
@@ -361,7 +234,7 @@ def _for_multimodal(
             if value is not None:
                 override_values.setdefault(key, value)
         # Validate both aliases even after a higher-priority size is selected.
-        source_block_size = resolve_kvcache_block_size(source)
+        source_block_size = read_kvcache_block_size(source)
         if source_block_size is not None:
             override_values.setdefault("kvcache_block_size", source_block_size)
 
@@ -372,15 +245,15 @@ def _for_multimodal(
 
     block_size = override_values.get("kvcache_block_size")
     if block_size is None:
-        block_size = _user_block_size(vllm_config)
-    block_size = _require_block_size(block_size)
+        block_size = get_user_block_size(vllm_config)
+    block_size = require_compile_block_size(block_size)
 
-    num_devices = _resolve_compile_num_devices(vllm_config, optimum_overrides)
+    num_devices = get_compile_num_devices(vllm_config, optimum_overrides)
 
     prefill_chunk_size = override_values.get("prefill_chunk_size")
     user_chunk = additional_config.user_max_num_batched_tokens
     override_chunk = optimum_overrides.get("prefill_chunk_size")
-    _validate_prefill_chunk_size(user_chunk, override_chunk)
+    validate_prefill_chunk_override(user_chunk, override_chunk)
     if user_chunk is not None:
         prefill_chunk_size = user_chunk
     model_name, model_cls_name = get_rbln_model_info(model_config.hf_config)
@@ -432,11 +305,11 @@ def _for_enc_dec(
 
     block_size = optimum_overrides.get("dec_max_seq_len")
     if block_size is None:
-        block_size = _user_block_size(vllm_config)
+        block_size = get_user_block_size(vllm_config)
     if block_size is None:
         block_size = max_model_len
 
-    num_devices = _resolve_compile_num_devices(vllm_config, optimum_overrides)
+    num_devices = get_compile_num_devices(vllm_config, optimum_overrides)
 
     architectures = getattr(config, "architectures", [])
     assert architectures[0] == "WhisperForConditionalGeneration"

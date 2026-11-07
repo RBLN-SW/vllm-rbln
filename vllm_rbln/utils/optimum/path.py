@@ -11,15 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Locate compiled model directories and read their rbln_config.json."""
+"""Locate compiled model directories and construct cache paths."""
 
 from __future__ import annotations
 
-import json
 import os
-from pathlib import Path
-
-from .compile_spec import RBLNCompileSpec, compile_cache_name
 
 RBLN_CONFIG_FILE = "rbln_config.json"
 
@@ -40,15 +36,6 @@ def resolve_compiled_model_path(
     return None
 
 
-def load_compiled_rbln_config(model_path: str) -> dict | None:
-    """Read rbln_config.json from the selected compiled model directory."""
-    rbln_config_path = Path(model_path) / RBLN_CONFIG_FILE
-    if not rbln_config_path.is_file():
-        return None
-    with open(rbln_config_path, encoding="utf-8") as f:
-        return json.load(f)
-
-
-def get_compile_cache_path(spec: RBLNCompileSpec, cache_root: str) -> str:
-    """Return the cache location for a spec without reading or writing files."""
-    return os.path.join(cache_root, "compiled_models", compile_cache_name(spec))
+def get_compile_cache_path(cache_name: str, cache_root: str) -> str:
+    """Return the cache location without reading or writing files."""
+    return os.path.join(cache_root, "compiled_models", cache_name)

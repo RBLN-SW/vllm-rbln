@@ -39,8 +39,8 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 from vllm_rbln import envs
 from vllm_rbln.logger import init_logger
-from vllm_rbln.utils.optimum.vllm_config_sync import (
-    resolve_num_blocks,
+from vllm_rbln.utils.optimum.config_sync.vllm_config_sync_utils import (
+    get_runtime_num_blocks,
     update_num_blocks,
 )
 from vllm_rbln.v1.worker.optimum_model_runner import RBLNOptimumModelRunner
@@ -176,7 +176,7 @@ class RBLNOptimumWorker(WorkerBase):
         # the number of blocks is not set in the vLLM config yet.
         # Therefore, we need to update it here.
         if not self.model_runner.vllm_config.cache_config.num_gpu_blocks:
-            num_blocks = resolve_num_blocks(
+            num_blocks = get_runtime_num_blocks(
                 self.model_runner.vllm_config.model_config.hf_config,
                 self.model_runner.model.rbln_model_config,
             )
