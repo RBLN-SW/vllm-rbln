@@ -13,10 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .common import build_language_model_config
+from .language_model import build_language_model_config
 
 
-def build_blip2_config(
+def build_idefics3_config(
     batch_size: int,
     max_model_len: int,
     block_size: int,
@@ -32,5 +32,4 @@ def build_blip2_config(
         memory_budget,
         prefill_chunk_size,
     )
-    rbln_config = {"language_model": language_model_config}
-    return rbln_config
+    return {"text_model": language_model_config}

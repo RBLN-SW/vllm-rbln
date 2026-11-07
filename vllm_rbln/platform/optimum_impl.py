@@ -42,7 +42,7 @@ def check_and_update(vllm_config: "VllmConfig") -> None:
         is_qwen3_reranker,
     )
     from vllm_rbln.utils.optimum.registry import get_rbln_model_info, is_pooling_arch
-    from vllm_rbln.utils.optimum.setup import sync_vllm_and_optimum
+    from vllm_rbln.utils.optimum.sync import sync_vllm_and_optimum
 
     # Everything below, and the sync at the end, reads additional_config as an
     # OptimumRBLNConfig. The sync also writes its derived fields back.

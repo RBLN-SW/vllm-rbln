@@ -43,7 +43,7 @@ from pydantic import Field
 from vllm.config.utils import config as vllm_config_dataclass
 
 from vllm_rbln.logger import init_logger
-from vllm_rbln.utils.optimum.model_config import RBLNCompileSpec
+from vllm_rbln.utils.optimum.compile_spec import RBLNCompileSpec
 
 if TYPE_CHECKING:
     # `Field` here is pydantic's, which a field definition below calls.
@@ -212,11 +212,11 @@ class OptimumRBLNConfig(RBLNConfigBase):
 
     # Written during runtime synchronization and carried to workers.
     attn_block_size: int | None = field(default=None, metadata=_DERIVED)
-    """`RuntimeSettings.kvcache_block_size`, when prefix caching splits the KV-cache
-    block size from `cache_config.block_size`."""
+    """`CompiledConstraints.kvcache_block_size`, when prefix caching splits the
+    KV-cache block size from `cache_config.block_size`."""
 
     image_prefill_chunk_size: list[int] | None = field(default=None, metadata=_DERIVED)
-    """`RuntimeSettings.image_prefill_chunk_size`, the image-prefill buckets
+    """`CompiledConstraints.image_prefill_chunk_size`, the image-prefill buckets
     (gemma3/gemma4) the scheduler pads against."""
 
     compile_spec: RBLNCompileSpec | None = field(default=None, metadata=_DERIVED)

@@ -12,26 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Build optimum-rbln compile configurations from vLLM inputs."""
+"""Define the compile spec, build it from vLLM inputs and derive its cache key.
 
+The spec is the single snapshot that both the compile-cache key and the
+compilation read, so the two cannot disagree.
+"""
+
+import hashlib
+import json
 from copy import deepcopy
+from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any
 
-import optimum.rbln
-from optimum.rbln import (
-    RBLNAutoModelForCausalLM,
-    RBLNAutoModelForSpeechSeq2Seq,
-)
 from transformers import PretrainedConfig
 
 from vllm_rbln import envs
-from vllm_rbln.utils.optimum.model_config import (
-    RBLNCompileSpec,
-    _cfg_get,
-    _language_model_configs,
-    _resolve_default_prefill_chunk_size,
-    _resolve_kvcache_block_size,
-    _resolve_num_devices,
+from vllm_rbln.utils.optimum.multimodal_configs import MULTIMODAL_CONFIG_BUILDERS
+from vllm_rbln.utils.optimum.rbln_config_fields import (
+    default_prefill_chunk_size,
+    get_field,
+    language_model_configs,
+    resolve_kvcache_block_size,
+    resolve_num_devices,
 )
 from vllm_rbln.utils.optimum.registry import (
     get_rbln_model_info,
@@ -41,12 +43,74 @@ from vllm_rbln.utils.optimum.registry import (
     is_pooling_arch,
 )
 
-from .multimodal import _MULTIMODAL_CONFIG_BUILDERS
-
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 else:
     VllmConfig = None
+
+
+@dataclass
+class RBLNCompileSpec:
+    """Serializable snapshot shared by cache lookup, compilation and runtime."""
+
+    model: str
+    dtype: Any
+    model_cls: str
+    rbln_config: dict[str, Any]
+    hf_config: dict[str, Any]
+    npu_name: str
+
+
+# Keys that affect only loading the compiled model, not the compiled binary,
+# and therefore must be stripped before hashing so the same compiled artifact
+# is shared between compile-only and inference invocations.
+_LOAD_ONLY_KEYS: frozenset[str] = frozenset(
+    {"create_runtimes", "device", "kvcache_num_blocks"}
+)
+
+
+def _strip_load_only_keys(obj: dict) -> dict:
+    """Recursively drop :data:`_LOAD_ONLY_KEYS` from nested dict/list."""
+    if isinstance(obj, dict):
+        return {
+            k: _strip_load_only_keys(v)
+            for k, v in obj.items()
+            if k not in _LOAD_ONLY_KEYS
+        }
+    if isinstance(obj, list):
+        return [_strip_load_only_keys(item) for item in obj]
+    return obj
+
+
+def compile_cache_name(spec: RBLNCompileSpec) -> str:
+    """Hash compile-relevant spec fields into a stable artifact directory name."""
+    config_dict: dict[str, Any] = {
+        field.name: getattr(spec, field.name) for field in fields(spec)
+    }
+    config_dict["rbln_config"] = _strip_load_only_keys(config_dict["rbln_config"])
+    model_name = str(config_dict["model"])
+
+    config_json = json.dumps(config_dict, sort_keys=True, default=str)
+    config_hash = hashlib.sha256(config_json.encode()).hexdigest()[:16]
+
+    sanitized_name = model_name.replace("/", "_").replace(":", "_")
+    return f"{sanitized_name}_{config_hash}"
+
+
+def keep_device_overrides(obj: dict) -> dict:
+    """Recursively keep only ``device`` entries from nested dict/list.
+
+    A precompiled model accepts only device placement as a load-time override.
+    """
+    result: dict[str, Any] = {}
+    for k, v in obj.items():
+        if k == "device":
+            result[k] = v
+        elif isinstance(v, dict):
+            filtered = keep_device_overrides(v)
+            if filtered:
+                result[k] = filtered
+    return result
 
 
 def _deep_merge(base: dict, overrides: dict) -> None:
@@ -115,9 +179,7 @@ def build_compile_spec(vllm_config: VllmConfig) -> RBLNCompileSpec:
     pooling = is_pooling_arch(config)
     multimodal = is_multi_modal(config) and not enc_dec
     sources = (
-        _language_model_configs(optimum_overrides)
-        if multimodal
-        else [optimum_overrides]
+        language_model_configs(optimum_overrides) if multimodal else [optimum_overrides]
     )
     compile_inputs: dict[str, Any] = {}
     block_size = None
@@ -128,11 +190,11 @@ def build_compile_spec(vllm_config: VllmConfig) -> RBLNCompileSpec:
             "dec_max_seq_len",
             "prefill_chunk_size",
         ):
-            value = _cfg_get(source, key)
+            value = get_field(source, key)
             if value is not None:
                 compile_inputs.setdefault(key, value)
         if not enc_dec:
-            source_block_size = _resolve_kvcache_block_size(source, arch="compile")
+            source_block_size = resolve_kvcache_block_size(source, arch="compile")
             if block_size is None:
                 block_size = source_block_size
 
@@ -167,13 +229,13 @@ def build_compile_spec(vllm_config: VllmConfig) -> RBLNCompileSpec:
             block_size = cache_config.block_size
     assert block_size is not None
 
-    num_devices = _resolve_num_devices(
+    num_devices = resolve_num_devices(
         optimum_overrides, default=additional_config.num_devices_per_local_rank
     )
     memory_budget = vllm_config.cache_config.gpu_memory_utilization
     prefill_chunk_size = None
     if not (enc_dec or pooling):
-        default_chunk = _resolve_default_prefill_chunk_size()
+        default_chunk = default_prefill_chunk_size()
         prefill_chunk_size = (
             compile_inputs.get("prefill_chunk_size", default_chunk)
             if multimodal
@@ -273,6 +335,8 @@ def _for_decoder(
     memory_budget: float,
     prefill_chunk_size: int | None = None,
 ) -> tuple[Any, dict[str, Any]]:
+    from optimum.rbln import RBLNAutoModelForCausalLM
+
     rbln_config: dict[str, Any] = {
         "num_devices": num_devices,
         "batch_size": batch_size,
@@ -296,6 +360,8 @@ def _for_pooling(
     max_model_len: int,
     num_devices: int,
 ) -> tuple[Any, dict[str, Any]]:
+    import optimum.rbln
+
     _, model_cls_name = get_rbln_model_info(config)
     model_cls = getattr(optimum.rbln, model_cls_name)
     assert model_cls is not None
@@ -323,12 +389,14 @@ def _for_multimodal(
     memory_budget: float,
     prefill_chunk_size: int | None = None,
 ) -> tuple[Any, dict[str, Any]]:
+    import optimum.rbln
+
     model_name, model_cls_name = get_rbln_model_info(config)
-    compile_fn = _MULTIMODAL_CONFIG_BUILDERS.get(model_name)
+    compile_fn = MULTIMODAL_CONFIG_BUILDERS.get(model_name)
     if compile_fn is None:
         raise ValueError(
             f"Unknown multimodal model alias: {model_name}. "
-            f"Supported aliases: {sorted(_MULTIMODAL_CONFIG_BUILDERS.keys())}"
+            f"Supported aliases: {sorted(MULTIMODAL_CONFIG_BUILDERS.keys())}"
         )
     model_cls = getattr(optimum.rbln, model_cls_name)
     assert model_cls is not None
@@ -352,6 +420,8 @@ def _for_enc_dec(
     max_model_len: int,
     num_devices: int,
 ) -> tuple[Any, dict[str, Any]]:
+    from optimum.rbln import RBLNAutoModelForSpeechSeq2Seq
+
     architectures = getattr(config, "architectures", [])
     assert architectures[0] == "WhisperForConditionalGeneration"
     # Whisper does not support varying block_size or max_model_len.

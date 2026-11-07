@@ -13,10 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .common import build_language_model_config
+from .language_model import build_language_model_config
 
 
-def build_gemma3_config(
+def build_blip2_config(
     batch_size: int,
     max_model_len: int,
     block_size: int,
@@ -32,7 +32,5 @@ def build_gemma3_config(
         memory_budget,
         prefill_chunk_size,
     )
-    return {"language_model": language_model_config}
-
-
-build_gemma4_config = build_gemma3_config
+    rbln_config = {"language_model": language_model_config}
+    return rbln_config

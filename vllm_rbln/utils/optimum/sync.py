@@ -25,8 +25,8 @@ from .artifacts import (
     load_compiled_rbln_config,
     resolve_compiled_model_path,
 )
-from .model_config import read_runtime_settings
-from .runtime import apply_runtime_settings
+from .compile_spec import build_compile_spec
+from .compiled_constraints import CompiledConstraints, apply_compiled_constraints
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -39,8 +39,8 @@ logger = init_logger(__name__)
 def sync_vllm_and_optimum(vllm_config: VllmConfig) -> None:
     """Prepare compile inputs, select model settings and apply them to vLLM.
 
-    Existing artifacts determine runtime settings. On a cache miss, the resolved
-    compile spec supplies them and is retained for model compilation.
+    Existing artifacts determine the compiled constraints. On a cache miss, the
+    resolved compile spec supplies them and is retained for model compilation.
     """
     additional_config: OptimumRBLNConfig = vllm_config.additional_config
     # 1. Load rbln_config.json from the model path or a known cache path.
@@ -53,8 +53,6 @@ def sync_vllm_and_optimum(vllm_config: VllmConfig) -> None:
     # 2. Resolve the compile spec and look up the corresponding cached model.
     if rbln_config is None:
         if additional_config.compile_spec is None:
-            from vllm_rbln.utils.optimum.compilation import build_compile_spec
-
             additional_config.compile_spec = build_compile_spec(vllm_config)
         spec = additional_config.compile_spec
         artifact_path = get_compile_cache_path(spec, envs.VLLM_CACHE_ROOT)
@@ -69,6 +67,8 @@ def sync_vllm_and_optimum(vllm_config: VllmConfig) -> None:
         # 3. Use settings from the compile spec for a new compilation.
         selected_config = spec.rbln_config
         precompiled = False
-    # 4. Read and apply runtime settings once from the selected configuration.
-    runtime_settings = read_runtime_settings(vllm_config, selected_config)
-    apply_runtime_settings(vllm_config, runtime_settings, precompiled=precompiled)
+    # 4. Read and apply compiled constraints once from the selected configuration.
+    constraints = CompiledConstraints.from_rbln_config(
+        vllm_config.model_config.hf_config, selected_config
+    )
+    apply_compiled_constraints(vllm_config, constraints, precompiled=precompiled)

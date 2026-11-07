@@ -28,7 +28,7 @@ from transformers import Gemma4Config
 from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.model_executor.models.optimum import model_base
 from vllm_rbln.model_executor.models.optimum.model_base import RBLNOptimumModelBase
-from vllm_rbln.utils.optimum.model_config import RBLNCompileSpec
+from vllm_rbln.utils.optimum.compile_spec import RBLNCompileSpec
 
 
 def _init_model_with(monkeypatch, tmp_path, hf_config, *, precompiled=False) -> dict:

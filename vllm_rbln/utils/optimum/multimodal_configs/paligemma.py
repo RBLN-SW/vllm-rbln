@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # Copyright 2025 Rebellions Inc. All rights reserved.
 
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,6 +13,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .builder import build_compile_spec
+from .language_model import build_language_model_config
 
-__all__ = ["build_compile_spec"]
+
+def build_paligemma_config(
+    batch_size: int,
+    max_model_len: int,
+    block_size: int,
+    num_devices: int,
+    memory_budget: float,
+    prefill_chunk_size: int | None = None,
+) -> dict:
+    language_model_config = build_language_model_config(
+        batch_size,
+        max_model_len,
+        block_size,
+        num_devices,
+        memory_budget,
+        prefill_chunk_size,
+    )
+    rbln_config = {"language_model": language_model_config}
+    return rbln_config
