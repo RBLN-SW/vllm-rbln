@@ -50,8 +50,7 @@ def _init_model_with(monkeypatch, tmp_path, hf_config, *, precompiled=False) -> 
         model_base, "get_rbln_model_info", lambda cfg: ("fake", "FakeRBLNModel")
     )
     monkeypatch.setattr(
-        model_base,
-        "is_compiled_dir",
+        "vllm_rbln.utils.optimum.paths.is_compiled_dir",
         lambda path: precompiled and path == str(tmp_path),
     )
 
@@ -74,6 +73,8 @@ def _init_model_with(monkeypatch, tmp_path, hf_config, *, precompiled=False) -> 
                 "model": "compile-source",
                 "dtype": torch.bfloat16,
                 "model_cls": "FakeRBLNModel",
+                "hf_config": {},
+                "npu_name": "RBLN-CA25",
                 "rbln_config": {"prefill_chunk_size": 256},
             },
         ),

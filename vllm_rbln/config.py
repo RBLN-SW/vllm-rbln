@@ -40,6 +40,7 @@ from dataclasses import field, fields
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
 
 from pydantic import Field
+from typing_extensions import TypedDict
 from vllm.config.utils import config as vllm_config_dataclass
 
 from vllm_rbln.logger import init_logger
@@ -49,6 +50,18 @@ if TYPE_CHECKING:
     from dataclasses import Field as DataclassField
 
     from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+
+class ResolvedCompileSpec(TypedDict):
+    """Serializable snapshot shared by cache lookup and optimum model loading."""
+
+    model: str
+    dtype: Any
+    model_cls: str
+    rbln_config: dict[str, Any]
+    hf_config: dict[str, Any]
+    npu_name: str
+
 
 logger = init_logger(__name__)
 
@@ -218,7 +231,7 @@ class OptimumRBLNConfig(RBLNConfigBase):
     """`RBLNParams.image_prefill_chunk_size`, the image-prefill buckets
     (gemma3/gemma4) the scheduler pads against."""
 
-    compile_spec: dict[str, Any] | None = field(default=None, metadata=_DERIVED)
+    compile_spec: ResolvedCompileSpec | None = field(default=None, metadata=_DERIVED)
     """Resolved model, dtype and optimum-rbln compile config shared by the cache
     key and compilation. Runtime synchronization must not rewrite it."""
 

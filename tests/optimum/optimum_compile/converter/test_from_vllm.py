@@ -17,7 +17,7 @@ from types import SimpleNamespace
 import pytest
 
 from vllm_rbln.config import build_optimum_rbln_config
-from vllm_rbln.utils.optimum.converter.from_vllm import sync_from_vllm
+from vllm_rbln.utils.optimum.converter.from_vllm import resolve_compile_spec
 
 DECODER_ARCH = "LlamaForCausalLM"
 
@@ -35,4 +35,4 @@ class TestDtypeOverrideRejected:
     def test_raises_and_points_at_vllm_dtype(self):
         cfg = _vllm_config({"batch_size": 4, "dtype": "bfloat16"})
         with pytest.raises(ValueError, match="`dtype` cannot be set"):
-            sync_from_vllm(cfg)
+            resolve_compile_spec(cfg)

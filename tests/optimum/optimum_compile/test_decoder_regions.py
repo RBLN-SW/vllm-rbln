@@ -76,5 +76,5 @@ def test_flag_conflicts_with_decoder_override(monkeypatch):
             max_model_len=8192,
             num_devices=1,
             memory_budget=0.9,
-            rbln_overrides={"nested_compile_region": False},
+            optimum_overrides={"nested_compile_region": False},
         )

@@ -14,6 +14,7 @@
 
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -148,6 +149,39 @@ class TestParseMultimodal:
         )
         assert params.batch_size == 4
         assert params.max_seq_len == 8192
+
+    @pytest.mark.parametrize("as_object", [False, True])
+    def test_partial_submodules_resolve_each_field_by_precedence(self, as_object):
+        cfg: Any = {
+            "batch_size": 1,
+            "max_seq_len": 8192,
+            "kvcache_block_size": 8192,
+            "kvcache_num_blocks": 8,
+            "prefill_chunk_size": 128,
+            "image_prefill_chunk_size": 128,
+            "language_model": {"batch_size": 2, "max_seq_len": None},
+            "text_model": {
+                "batch_size": 3,
+                "max_seq_len": 4096,
+                "kvcache_partition_len": 4096,
+                "prefill_chunk_size": 256,
+                "image_prefill_chunk_size": [512, 256],
+            },
+        }
+        if as_object:
+            cfg = SimpleNamespace(
+                **{
+                    key: SimpleNamespace(**value) if isinstance(value, dict) else value
+                    for key, value in cfg.items()
+                }
+            )
+        params = RBLNParams._parse_multimodal(cfg)
+        assert params.batch_size == 2
+        assert params.max_seq_len == 4096
+        assert params.kvcache_block_size == 4096
+        assert params.num_blocks == 8
+        assert params.prefill_chunk_size == 256
+        assert params.image_prefill_chunk_size == [512, 256]
 
     def test_top_level_fields_present(self):
         cfg = {

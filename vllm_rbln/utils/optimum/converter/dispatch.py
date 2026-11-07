@@ -15,15 +15,15 @@
 import hashlib
 import json
 import os
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vllm_rbln import envs
 from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.logger import init_logger
-from vllm_rbln.utils.optimum.paths import is_compiled_dir
+from vllm_rbln.utils.optimum.paths import resolve_compiled_model_path
 
-from .from_optimum import sync_from_optimum
-from .from_vllm import sync_from_vllm
+from .from_optimum import sync_runtime_config
+from .from_vllm import resolve_compile_spec
 from .params import load_compiled_rbln_config
 
 if TYPE_CHECKING:
@@ -58,9 +58,11 @@ def _strip_runtime_only_keys(obj: dict) -> dict:
 def _generate_model_path_name(
     vllm_config: VllmConfig,
 ) -> str:
-    rbln_config: OptimumRBLNConfig = vllm_config.additional_config
-    assert rbln_config.compile_spec is not None, "compile spec must be resolved first"
-    config_dict = dict(rbln_config.compile_spec)
+    additional_config: OptimumRBLNConfig = vllm_config.additional_config
+    assert additional_config.compile_spec is not None, (
+        "compile spec must be resolved first"
+    )
+    config_dict: dict[str, Any] = dict(additional_config.compile_spec)
     config_dict["rbln_config"] = _strip_runtime_only_keys(config_dict["rbln_config"])
     model_name = str(config_dict["model"])
 
@@ -72,17 +74,20 @@ def _generate_model_path_name(
 
 
 def _resolve_cached_rbln_config(vllm_config: VllmConfig) -> dict | None:
-    """Locate a cached artifact after synchronizing the compile inputs."""
-    rbln_config: OptimumRBLNConfig = vllm_config.additional_config
+    """Locate a cached artifact after resolving the compile inputs."""
+    additional_config: OptimumRBLNConfig = vllm_config.additional_config
     cached_model_path = os.path.join(
         envs.VLLM_CACHE_ROOT,
         "compiled_models",
         _generate_model_path_name(vllm_config=vllm_config),
     )
-    rbln_config.cached_model_path = cached_model_path
-    if is_compiled_dir(cached_model_path):
-        logger.info("Found cached compiled model at %s", cached_model_path)
-        return load_compiled_rbln_config(vllm_config)
+    additional_config.cached_model_path = cached_model_path
+    artifact_path = resolve_compiled_model_path(
+        vllm_config.model_config.model, cached_model_path
+    )
+    if artifact_path is not None:
+        logger.info("Found compiled model at %s", artifact_path)
+        return load_compiled_rbln_config(artifact_path)
     return None
 
 
@@ -93,15 +98,23 @@ def sync_vllm_and_optimum(vllm_config: VllmConfig) -> None:
     If a compiled model exists, it is the source of truth (optimum→vllm).
     Otherwise stage user overrides for the upcoming compile (vllm→optimum).
     """
-    # 1. Synchronize from existing compiled metadata when available.
-    compiled_config = load_compiled_rbln_config(vllm_config)
-    if compiled_config is not None:
-        sync_from_optimum(vllm_config, compiled_config)
-        return
-
-    # 2. Resolve the compile spec and synchronize runtime settings from it.
-    sync_from_vllm(vllm_config)
-    # 3. Look up the finalized spec's cache and synchronize from its metadata.
-    cached_config = _resolve_cached_rbln_config(vllm_config)
-    if cached_config is not None:
-        sync_from_optimum(vllm_config, cached_config)
+    additional_config: OptimumRBLNConfig = vllm_config.additional_config
+    # 1. Prefer metadata from an explicit artifact or an already known cache.
+    artifact_path = resolve_compiled_model_path(
+        vllm_config.model_config.model, additional_config.cached_model_path
+    )
+    compile_config = (
+        load_compiled_rbln_config(artifact_path) if artifact_path is not None else None
+    )
+    if compile_config is None:
+        # 2. Resolve compile inputs before looking up their cache entry.
+        spec = resolve_compile_spec(vllm_config)
+        compile_config = _resolve_cached_rbln_config(vllm_config)
+        # 3. Use cached metadata when available, otherwise the resolved spec.
+        precompiled = compile_config is not None
+        if compile_config is None:
+            compile_config = spec["rbln_config"]
+    else:
+        precompiled = True
+    # 4. Apply runtime settings once from the selected configuration.
+    sync_runtime_config(vllm_config, compile_config, precompiled=precompiled)

@@ -20,3 +20,13 @@ def is_compiled_dir(path: str | None) -> bool:
     if not path:
         return False
     return os.path.isfile(os.path.join(path, RBLN_CONFIG_FILE))
+
+
+def resolve_compiled_model_path(
+    model_path: str, cached_model_path: str | None
+) -> str | None:
+    """Prefer an explicit compiled model directory over the generated cache."""
+    for path in (model_path, cached_model_path):
+        if is_compiled_dir(path):
+            return path
+    return None

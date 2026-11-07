@@ -17,12 +17,12 @@ from unittest.mock import patch
 import torch
 from vllm.config import CacheConfig, ModelConfig, SchedulerConfig, VllmConfig
 
-from vllm_rbln.utils.optimum.converter.from_optimum import sync_from_optimum
+from vllm_rbln.utils.optimum.converter.from_optimum import sync_runtime_config
 
 
 def _vllm_config() -> VllmConfig:
     # Force the cache-miss branch so building the config does not look for a
-    # compiled artifact. The test calls sync_from_optimum itself.
+    # compiled artifact. The test calls sync_runtime_config itself.
     with patch(
         "vllm_rbln.utils.optimum.converter.dispatch._resolve_cached_rbln_config",
         return_value=None,
@@ -55,6 +55,6 @@ def test_compiled_num_devices_lands_in_the_config(monkeypatch):
         "prefill_chunk_size": 128,
         "num_devices": 2,
     }
-    sync_from_optimum(vllm_config, compiled)
+    sync_runtime_config(vllm_config, compiled, precompiled=True)
 
     assert vllm_config.additional_config.num_devices_per_local_rank == 2

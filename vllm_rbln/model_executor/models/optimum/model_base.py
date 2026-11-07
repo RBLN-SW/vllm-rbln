@@ -37,7 +37,7 @@ from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.logger import init_logger
 from vllm_rbln.utils.optimum.block_size import get_attn_block_size
 from vllm_rbln.utils.optimum.bucket import select_bucket_size
-from vllm_rbln.utils.optimum.paths import is_compiled_dir
+from vllm_rbln.utils.optimum.paths import resolve_compiled_model_path
 from vllm_rbln.utils.optimum.registry import get_rbln_model_info
 
 from .base import ModelInputForRBLN
@@ -87,9 +87,9 @@ class KVCacheBlockAdapter:
 
     def _estimated_num_blocks(self) -> int:
         """Override estimated blocks if num_gpu_blocks_override is set."""
-        rbln_config: OptimumRBLNConfig = self.vllm_config.additional_config
-        if rbln_config.num_blocks_override is not None:
-            return rbln_config.num_blocks_override
+        additional_config: OptimumRBLNConfig = self.vllm_config.additional_config
+        if additional_config.num_blocks_override is not None:
+            return additional_config.num_blocks_override
         return int(self.estimated_kvcache_num_blocks)
 
     def is_full_block_available(self) -> bool:
@@ -182,17 +182,12 @@ class RBLNOptimumModelBase(nn.Module):
 
     def init_model(self) -> None:
         hf_config = self.model_config.hf_config
-        rbln_config: OptimumRBLNConfig = self.vllm_config.additional_config
-        cached_model_path = rbln_config.cached_model_path
-        rbln_overrides = rbln_config.optimum_overrides
+        additional_config: OptimumRBLNConfig = self.vllm_config.additional_config
+        cached_model_path = additional_config.cached_model_path
+        optimum_overrides = additional_config.optimum_overrides
         _, model_cls_name = get_rbln_model_info(hf_config)
         model_path = self.vllm_config.model_config.model
-        if is_compiled_dir(model_path):
-            valid_path = model_path
-        elif is_compiled_dir(cached_model_path):
-            valid_path = cached_model_path
-        else:
-            valid_path = None
+        valid_path = resolve_compiled_model_path(model_path, cached_model_path)
 
         if valid_path is not None:
             # pre-compiled OR cache-hit
@@ -209,23 +204,23 @@ class RBLNOptimumModelBase(nn.Module):
                 # NOTE:
                 # ``sync_vllm_and_optimum`` already narrowed user overrides
                 # down to device-only keys; we forward only those here.
-                rbln_overrides = dict(rbln_overrides)
+                optimum_overrides = dict(optimum_overrides)
                 if self._is_ec_consumer_only():
                     if not ec_enabled_model:
                         raise ValueError(
                             "Disaggregation is not supported for this model."
                         )
-                    rbln_overrides["_load_visual_runtime"] = False
+                    optimum_overrides["_load_visual_runtime"] = False
                 model = model_cls.from_pretrained(
                     valid_path,
-                    rbln_config=rbln_overrides,
+                    rbln_config=optimum_overrides,
                 )
         else:
             assert not self._is_ec_producer_only(), (
                 "Disaggregated Encoder is only supported for pre-compiled model."
             )
             # cache miss: compile the model and save it to the cache for reuse.
-            spec = rbln_config.compile_spec
+            spec = additional_config.compile_spec
             assert spec is not None, "compile spec must be resolved before loading"
             model_cls = getattr(optimum.rbln, spec["model_cls"])
             logger.info(

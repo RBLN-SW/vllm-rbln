@@ -37,8 +37,8 @@ def _apply_prefix_caching_block_size(
     assert prefill_chunk_size is not None, (
         "prefill_chunk_size must be specified in rbln_config.json"
     )
-    rbln_config: OptimumRBLNConfig = vllm_config.additional_config
-    sub_block_size = rbln_config.sub_block_size
+    additional_config: OptimumRBLNConfig = vllm_config.additional_config
+    sub_block_size = additional_config.sub_block_size
     if sub_block_size is None:
         sub_block_size = prefill_chunk_size
         logger.debug(
@@ -73,7 +73,7 @@ def _apply_prefix_caching_block_size(
             )
         )
     vllm_config.cache_config.block_size = sub_block_size
-    rbln_config.attn_block_size = kvcache_block_size
+    additional_config.attn_block_size = kvcache_block_size
 
 
 def update_block_size(
@@ -120,8 +120,8 @@ def get_user_max_num_batched_tokens(vllm_config: VllmConfig) -> int | None:
     Stashed by ``optimum_impl._capture_user_max_num_batched_tokens`` before vLLM
     fills in its default.
     """
-    rbln_config: OptimumRBLNConfig = vllm_config.additional_config
-    return rbln_config.user_max_num_batched_tokens
+    additional_config: OptimumRBLNConfig = vllm_config.additional_config
+    return additional_config.user_max_num_batched_tokens
 
 
 def update_max_num_batched_tokens(
@@ -173,8 +173,8 @@ def store_image_prefill_chunk_size(
     # RBLNKVCacheManager to size the per-image chunk in its block padding.
     if image_prefill_chunk_size is None:
         return
-    rbln_config: OptimumRBLNConfig = vllm_config.additional_config
-    rbln_config.image_prefill_chunk_size = image_prefill_chunk_size
+    additional_config: OptimumRBLNConfig = vllm_config.additional_config
+    additional_config.image_prefill_chunk_size = image_prefill_chunk_size
 
 
 def apply_user_prefill_chunk_size(

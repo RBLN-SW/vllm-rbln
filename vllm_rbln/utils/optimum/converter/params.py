@@ -26,15 +26,12 @@ else:
 
 from optimum.rbln.configuration_utils import RBLNModelConfig
 
-from vllm_rbln.logger import init_logger
 from vllm_rbln.utils.optimum.paths import RBLN_CONFIG_FILE
 from vllm_rbln.utils.optimum.registry import (
     is_enc_dec_arch,
     is_multi_modal,
     is_pooling_arch,
 )
-
-logger = init_logger(__name__)
 
 # Either a plain dict (from rbln_config.json) or an RBLNModelConfig instance.
 RblnConfigLike = Union[dict, RBLNModelConfig]
@@ -54,26 +51,13 @@ def _cfg_get_submodule(cfg: RblnConfigLike, submodule: str) -> RblnConfigLike | 
     return getattr(cfg, submodule, None)
 
 
-def load_compiled_rbln_config(vllm_config: VllmConfig) -> dict | None:
-    """Load optimum-rbln metadata from the model directory or compile cache.
-
-    Returns ``None`` if neither directory contains compiled metadata.
-    """
-    rbln_config_path = Path(vllm_config.model_config.model) / RBLN_CONFIG_FILE
-    if not rbln_config_path.exists():
-        cached_model_path = vllm_config.additional_config.cached_model_path
-        if cached_model_path is not None:
-            rbln_config_path = Path(cached_model_path) / RBLN_CONFIG_FILE
-    if not rbln_config_path.exists():  # for pytest
-        logger.warning(
-            "rbln_config.json not found in model directory: %s. "
-            "Using `block_size` from vllm_config.cache_config instead.",
-            rbln_config_path,
-        )
+def load_compiled_rbln_config(model_path: str) -> dict | None:
+    """Read metadata from an explicitly selected artifact directory."""
+    rbln_config_path = Path(model_path) / RBLN_CONFIG_FILE
+    if not rbln_config_path.is_file():
         return None
     with open(rbln_config_path, encoding="utf-8") as f:
-        rbln_config = json.load(f)
-    return rbln_config
+        return json.load(f)
 
 
 @dataclass
@@ -162,45 +146,38 @@ class RBLNParams:
 
     @classmethod
     def _parse_multimodal(cls, cfg: RblnConfigLike) -> "RBLNParams":
-        kvcache_block_size = _resolve_kvcache_block_size(cfg, arch="multi-modal")
-        batch_size = _cfg_get(cfg, "batch_size")
-        max_seq_len = _cfg_get(cfg, "max_seq_len")
-        num_blocks = _cfg_get(cfg, "kvcache_num_blocks")
-        default_prefill_chunk_size = _resolve_default_prefill_chunk_size()
-        # Fall back to a known submodule when the main module does not expose
-        # these fields (e.g. language_model / text_model for some VLMs).
-        if kvcache_block_size is None or batch_size is None or max_seq_len is None:
-            for submodule_name in ("language_model", "text_model"):
-                sub_cfg = _cfg_get_submodule(cfg, submodule_name)
-                if sub_cfg is None:
-                    continue
-                sub_block_size = _resolve_kvcache_block_size(
-                    sub_cfg, arch=submodule_name
-                )
-                if sub_block_size is not None:
-                    kvcache_block_size = sub_block_size
-                batch_size = _cfg_get(sub_cfg, "batch_size", batch_size)
-                max_seq_len = _cfg_get(sub_cfg, "max_seq_len", max_seq_len)
-                num_blocks = _cfg_get(sub_cfg, "kvcache_num_blocks", num_blocks)
-                break
-
-        # prefill_chunk_size and image-prefill buckets live on the language model
-        # (optimum-rbln stores them on the `language_model` sub-config; gemma3/4
-        # expose them via RBLNGemma{3,4}ForConditionalGenerationConfig).
-        lm_cfg = cfg
-        for submodule_name in ("language_model", "text_model"):
-            sub_cfg = _cfg_get_submodule(cfg, submodule_name)
-            if sub_cfg is not None:
-                lm_cfg = sub_cfg
-                break
-        prefill_chunk_size = _cfg_get(lm_cfg, "prefill_chunk_size")
+        # Language submodules take precedence field by field; absent or None
+        # values fall through to text_model, then to the top-level config.
+        sources = [
+            sub_cfg
+            for name in ("language_model", "text_model")
+            if (sub_cfg := _cfg_get_submodule(cfg, name)) is not None
+        ] + [cfg]
+        values: dict[str, Any] = {}
+        for source in sources:
+            for key in (
+                "batch_size",
+                "max_seq_len",
+                "kvcache_num_blocks",
+                "prefill_chunk_size",
+            ):
+                value = _cfg_get(source, key)
+                if value is not None:
+                    values.setdefault(key, value)
+            block_size = _resolve_kvcache_block_size(source, arch="multi-modal")
+            if block_size is not None:
+                values.setdefault("kvcache_block_size", block_size)
+            image_size = _resolve_image_prefill_chunk_size(source)
+            if image_size is not None:
+                values.setdefault("image_prefill_chunk_size", image_size)
+        kvcache_block_size = values.get("kvcache_block_size")
+        batch_size = values.get("batch_size")
+        max_seq_len = values.get("max_seq_len")
+        num_blocks = values.get("kvcache_num_blocks")
+        prefill_chunk_size = values.get("prefill_chunk_size")
         if prefill_chunk_size is None:
-            prefill_chunk_size = _cfg_get(
-                cfg, "prefill_chunk_size", default_prefill_chunk_size
-            )
-        image_prefill_chunk_size = _resolve_image_prefill_chunk_size(lm_cfg)
-        if image_prefill_chunk_size is None:
-            image_prefill_chunk_size = _resolve_image_prefill_chunk_size(cfg)
+            prefill_chunk_size = _resolve_default_prefill_chunk_size()
+        image_prefill_chunk_size = values.get("image_prefill_chunk_size")
 
         return cls(
             num_blocks=num_blocks,
