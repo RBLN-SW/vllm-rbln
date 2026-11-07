@@ -24,8 +24,6 @@ from copy import deepcopy
 from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any
 
-from transformers import PretrainedConfig
-
 from vllm_rbln import envs
 from vllm_rbln.utils.optimum.multimodal_configs import MULTIMODAL_CONFIG_BUILDERS
 from vllm_rbln.utils.optimum.rbln_config_utils import (
@@ -148,10 +146,8 @@ def build_compile_spec(vllm_config: VllmConfig) -> RBLNCompileSpec:
     from vllm_rbln.platform import RblnPlatform
 
     model_config = vllm_config.model_config
-    cache_config = vllm_config.cache_config
     additional_config = vllm_config.additional_config
 
-    # 1. Own the overrides before normalizing device placement.
     optimum_overrides = deepcopy(additional_config.optimum_overrides)
     if optimum_overrides.get("dtype") is not None:
         raise ValueError(
@@ -162,135 +158,20 @@ def build_compile_spec(vllm_config: VllmConfig) -> RBLNCompileSpec:
         )
     _set_submodule_num_devices(optimum_overrides)
 
-    # 2. Read override values in language_model, text_model, then root order.
     hf_config = model_config.hf_config
-    encoder_decoder = is_enc_dec_arch(hf_config)
-    pooling = is_pooling_arch(hf_config)
-    multimodal = is_multi_modal(hf_config) and not encoder_decoder
-    override_sources = (
-        language_model_configs(optimum_overrides) if multimodal else [optimum_overrides]
-    )
-    override_values: dict[str, Any] = {}
-    for key in ("batch_size", "max_seq_len", "dec_max_seq_len", "prefill_chunk_size"):
-        for source in override_sources:
-            value = get_field(source, key)
-            if value is not None:
-                override_values[key] = value
-                break
-
-    block_size = None
-    if not encoder_decoder:
-        for source in override_sources:
-            # Validate both aliases even after a higher-priority size is selected.
-            source_block_size = resolve_kvcache_block_size(source)
-            if block_size is None:
-                block_size = source_block_size
-
-    # 3. Finalize compile dimensions using overrides, vLLM inputs and model rules.
-    batch_size = override_values.get("batch_size")
-    if batch_size is None:
-        batch_size = vllm_config.scheduler_config.max_num_seqs
-    length_key = "dec_max_seq_len" if encoder_decoder else "max_seq_len"
-    max_model_len = override_values.get(length_key)
-    if max_model_len is None:
-        max_model_len = model_config.max_model_len
-    if encoder_decoder or (pooling and block_size is None):
-        block_size = override_values.get(length_key)
-    if block_size is None:
-        if cache_config.user_specified_block_size:
-            block_size = (
-                additional_config.attn_block_size
-                if cache_config.enable_prefix_caching
-                and additional_config.attn_block_size is not None
-                else cache_config.block_size
-            )
-        elif encoder_decoder or pooling:
-            block_size = max_model_len
-        else:
-            raise ValueError(
-                "`block_size` is required to run optimum-rbln models "
-                "in vLLM RBLN.\n"
-                "Set it via one of:\n"
-                "  1) vLLM's `block_size` argument "
-                "(e.g. `LLM(block_size=...)` or `--block-size`), or\n"
-                "  2) `kvcache_block_size` under "
-                "`additional_config={'optimum_overrides': {...}}`.\n"
-            )
-    assert block_size is not None
-
-    num_devices = resolve_num_devices(optimum_overrides)
-    if num_devices is None:
-        num_devices = additional_config.num_devices_per_local_rank
-    memory_budget = cache_config.gpu_memory_utilization
-    prefill_chunk_size = None
-    if not (encoder_decoder or pooling):
-        prefill_chunk_size = override_values.get("prefill_chunk_size")
-        user_chunk = additional_config.user_max_num_batched_tokens
-        override_chunk = optimum_overrides.get("prefill_chunk_size")
-        if user_chunk is not None:
-            if override_chunk is not None and override_chunk != user_chunk:
-                raise ValueError(
-                    f"Conflicting prefill chunk size: max_num_batched_tokens "
-                    f"({user_chunk}) != rbln_config['prefill_chunk_size'] "
-                    f"({override_chunk}). Set only one."
-                )
-            prefill_chunk_size = user_chunk
-        if multimodal and get_rbln_model_info(hf_config)[0] == "paligemma":
-            prefill_chunk_size = max_model_len
-        if prefill_chunk_size is None:
-            prefill_chunk_size = default_prefill_chunk_size()
-
-    # 4. Build the model config and merge only compatible overrides.
     if is_generation_arch(hf_config):
-        model_cls, rbln_config = _for_decoder(
-            batch_size,
-            block_size,
-            max_model_len,
-            num_devices,
-            memory_budget,
-            prefill_chunk_size,
-        )
+        model_cls, rbln_config = _for_decoder(vllm_config, optimum_overrides)
     elif is_pooling_arch(hf_config):
-        model_cls, rbln_config = _for_pooling(
-            hf_config,
-            batch_size,
-            block_size,
-            max_model_len,
-            num_devices,
-        )
+        model_cls, rbln_config = _for_pooling(vllm_config, optimum_overrides)
     elif is_multi_modal(hf_config):
-        model_cls, rbln_config = _for_multimodal(
-            hf_config,
-            batch_size,
-            block_size,
-            max_model_len,
-            num_devices,
-            memory_budget,
-            prefill_chunk_size,
-        )
+        model_cls, rbln_config = _for_multimodal(vllm_config, optimum_overrides)
     elif is_enc_dec_arch(hf_config):
-        model_cls, rbln_config = _for_enc_dec(
-            hf_config,
-            batch_size,
-            block_size,
-            max_model_len,
-            num_devices,
-        )
+        model_cls, rbln_config = _for_enc_dec(vllm_config, optimum_overrides)
     else:
         architectures = getattr(hf_config, "architectures", [])
         raise NotImplementedError(
             f"Compilation is not implemented for architecture {architectures[0]}"
         )
-
-    if envs.VLLM_RBLN_USE_NESTED_COMPILE_REGION and (
-        is_generation_arch(hf_config) or is_multi_modal(hf_config)
-    ):
-        decoder_config = rbln_config
-        for name in ("language_model", "text_model"):
-            if name in decoder_config:
-                decoder_config = decoder_config[name]
-                break
-        decoder_config["nested_compile_region"] = True
 
     # optimum_overrides must not overwrite fields vllm derives from its own
     # config (batch_size, max_seq_len, memory_budget, ...); a silent
@@ -305,7 +186,6 @@ def build_compile_spec(vllm_config: VllmConfig) -> RBLNCompileSpec:
             )
         _deep_merge(rbln_config, optimum_overrides)
 
-    # 5. Snapshot the exact inputs shared by cache lookup and compilation.
     return RBLNCompileSpec(
         model=str(model_config.model),
         dtype=model_config.dtype,
@@ -317,42 +197,109 @@ def build_compile_spec(vllm_config: VllmConfig) -> RBLNCompileSpec:
 
 
 def _for_decoder(
-    batch_size: int,
-    block_size: int,
-    max_model_len: int,
-    num_devices: int,
-    memory_budget: float,
-    prefill_chunk_size: int | None = None,
+    vllm_config: VllmConfig,
+    optimum_overrides: dict[str, Any],
 ) -> tuple[Any, dict[str, Any]]:
     from optimum.rbln import RBLNAutoModelForCausalLM
+
+    model_config = vllm_config.model_config
+    cache_config = vllm_config.cache_config
+    additional_config = vllm_config.additional_config
+
+    batch_size = optimum_overrides.get("batch_size")
+    if batch_size is None:
+        batch_size = vllm_config.scheduler_config.max_num_seqs
+    max_model_len = optimum_overrides.get("max_seq_len")
+    if max_model_len is None:
+        max_model_len = model_config.max_model_len
+
+    block_size = resolve_kvcache_block_size(optimum_overrides)
+    if block_size is None and cache_config.user_specified_block_size:
+        block_size = (
+            additional_config.attn_block_size
+            if cache_config.enable_prefix_caching
+            and additional_config.attn_block_size is not None
+            else cache_config.block_size
+        )
+    if block_size is None:
+        raise ValueError(
+            "`block_size` is required to run optimum-rbln models "
+            "in vLLM RBLN.\n"
+            "Set it via one of:\n"
+            "  1) vLLM's `block_size` argument "
+            "(e.g. `LLM(block_size=...)` or `--block-size`), or\n"
+            "  2) `kvcache_block_size` under "
+            "`additional_config={'optimum_overrides': {...}}`.\n"
+        )
+
+    num_devices = resolve_num_devices(optimum_overrides)
+    if num_devices is None:
+        num_devices = additional_config.num_devices_per_local_rank
+
+    prefill_chunk_size = optimum_overrides.get("prefill_chunk_size")
+    user_chunk = additional_config.user_max_num_batched_tokens
+    if user_chunk is not None:
+        if prefill_chunk_size is not None and prefill_chunk_size != user_chunk:
+            raise ValueError(
+                f"Conflicting prefill chunk size: max_num_batched_tokens "
+                f"({user_chunk}) != rbln_config['prefill_chunk_size'] "
+                f"({prefill_chunk_size}). Set only one."
+            )
+        prefill_chunk_size = user_chunk
+    if prefill_chunk_size is None:
+        prefill_chunk_size = default_prefill_chunk_size()
 
     rbln_config: dict[str, Any] = {
         "num_devices": num_devices,
         "batch_size": batch_size,
         "max_seq_len": max_model_len,
         "kvcache_block_size": block_size,
-        "memory_budget": memory_budget,
+        "memory_budget": cache_config.gpu_memory_utilization,
+        "prefill_chunk_size": prefill_chunk_size,
     }
     if block_size != max_model_len:
         rbln_config["kvcache_partition_len"] = block_size
         rbln_config["attn_impl"] = "flash_attn"
-    # Pin the compiled prefill_chunk_size to the resolved value so it stays
-    # in sync with the one used for KV-cache block padding.
-    if prefill_chunk_size is not None:
-        rbln_config["prefill_chunk_size"] = prefill_chunk_size
+    if envs.VLLM_RBLN_USE_NESTED_COMPILE_REGION:
+        rbln_config["nested_compile_region"] = True
     return RBLNAutoModelForCausalLM, rbln_config
 
 
 def _for_pooling(
-    config: PretrainedConfig,
-    batch_size: int,
-    block_size: int,
-    max_model_len: int,
-    num_devices: int,
+    vllm_config: VllmConfig,
+    optimum_overrides: dict[str, Any],
 ) -> tuple[Any, dict[str, Any]]:
     import optimum.rbln
 
-    _, model_cls_name = get_rbln_model_info(config)
+    model_config = vllm_config.model_config
+    cache_config = vllm_config.cache_config
+    additional_config = vllm_config.additional_config
+
+    batch_size = optimum_overrides.get("batch_size")
+    if batch_size is None:
+        batch_size = vllm_config.scheduler_config.max_num_seqs
+    max_model_len = optimum_overrides.get("max_seq_len")
+    if max_model_len is None:
+        max_model_len = model_config.max_model_len
+
+    block_size = resolve_kvcache_block_size(optimum_overrides)
+    if block_size is None:
+        block_size = optimum_overrides.get("max_seq_len")
+    if block_size is None and cache_config.user_specified_block_size:
+        block_size = (
+            additional_config.attn_block_size
+            if cache_config.enable_prefix_caching
+            and additional_config.attn_block_size is not None
+            else cache_config.block_size
+        )
+    if block_size is None:
+        block_size = max_model_len
+
+    num_devices = resolve_num_devices(optimum_overrides)
+    if num_devices is None:
+        num_devices = additional_config.num_devices_per_local_rank
+
+    _, model_cls_name = get_rbln_model_info(model_config.hf_config)
     model_cls = getattr(optimum.rbln, model_cls_name)
     assert model_cls is not None
 
@@ -363,7 +310,7 @@ def _for_pooling(
     }
     # FIXME: We need a more generalized logic to specify block sizes
     # as the number of supported models continues to grow.
-    architectures = getattr(config, "architectures", [])
+    architectures = getattr(model_config.hf_config, "architectures", [])
     if architectures[0] == "Qwen3Model":
         rbln_config["kvcache_block_size"] = block_size
         if block_size != max_model_len:
@@ -373,17 +320,72 @@ def _for_pooling(
 
 
 def _for_multimodal(
-    config: PretrainedConfig,
-    batch_size: int,
-    block_size: int,
-    max_model_len: int,
-    num_devices: int,
-    memory_budget: float,
-    prefill_chunk_size: int | None = None,
+    vllm_config: VllmConfig,
+    optimum_overrides: dict[str, Any],
 ) -> tuple[Any, dict[str, Any]]:
     import optimum.rbln
 
-    model_name, model_cls_name = get_rbln_model_info(config)
+    model_config = vllm_config.model_config
+    cache_config = vllm_config.cache_config
+    additional_config = vllm_config.additional_config
+
+    # Resolve each field independently: language_model, text_model, then root.
+    override_values: dict[str, Any] = {}
+    for source in language_model_configs(optimum_overrides):
+        for key in ("batch_size", "max_seq_len", "prefill_chunk_size"):
+            value = get_field(source, key)
+            if value is not None:
+                override_values.setdefault(key, value)
+        # Validate both aliases even after a higher-priority size is selected.
+        source_block_size = resolve_kvcache_block_size(source)
+        if source_block_size is not None:
+            override_values.setdefault("kvcache_block_size", source_block_size)
+
+    batch_size = override_values.get(
+        "batch_size", vllm_config.scheduler_config.max_num_seqs
+    )
+    max_model_len = override_values.get("max_seq_len", model_config.max_model_len)
+
+    block_size = override_values.get("kvcache_block_size")
+    if block_size is None and cache_config.user_specified_block_size:
+        block_size = (
+            additional_config.attn_block_size
+            if cache_config.enable_prefix_caching
+            and additional_config.attn_block_size is not None
+            else cache_config.block_size
+        )
+    if block_size is None:
+        raise ValueError(
+            "`block_size` is required to run optimum-rbln models "
+            "in vLLM RBLN.\n"
+            "Set it via one of:\n"
+            "  1) vLLM's `block_size` argument "
+            "(e.g. `LLM(block_size=...)` or `--block-size`), or\n"
+            "  2) `kvcache_block_size` under "
+            "`additional_config={'optimum_overrides': {...}}`.\n"
+        )
+
+    num_devices = resolve_num_devices(optimum_overrides)
+    if num_devices is None:
+        num_devices = additional_config.num_devices_per_local_rank
+
+    prefill_chunk_size = override_values.get("prefill_chunk_size")
+    user_chunk = additional_config.user_max_num_batched_tokens
+    override_chunk = optimum_overrides.get("prefill_chunk_size")
+    if user_chunk is not None:
+        if override_chunk is not None and override_chunk != user_chunk:
+            raise ValueError(
+                f"Conflicting prefill chunk size: max_num_batched_tokens "
+                f"({user_chunk}) != rbln_config['prefill_chunk_size'] "
+                f"({override_chunk}). Set only one."
+            )
+        prefill_chunk_size = user_chunk
+    model_name, model_cls_name = get_rbln_model_info(model_config.hf_config)
+    if model_name == "paligemma":
+        prefill_chunk_size = max_model_len
+    if prefill_chunk_size is None:
+        prefill_chunk_size = default_prefill_chunk_size()
+
     compile_fn = MULTIMODAL_CONFIG_BUILDERS.get(model_name)
     if compile_fn is None:
         raise ValueError(
@@ -399,22 +401,48 @@ def _for_multimodal(
         max_model_len,
         block_size,
         num_devices,
-        memory_budget,
+        cache_config.gpu_memory_utilization,
         prefill_chunk_size,
     )
     decoder_config = language_model_configs(rbln_config)[0]
     decoder_config["kvcache_block_size"] = block_size
+    if envs.VLLM_RBLN_USE_NESTED_COMPILE_REGION:
+        decoder_config["nested_compile_region"] = True
     return model_cls, rbln_config
 
 
 def _for_enc_dec(
-    config: PretrainedConfig,
-    batch_size: int,
-    block_size: int,
-    max_model_len: int,
-    num_devices: int,
+    vllm_config: VllmConfig,
+    optimum_overrides: dict[str, Any],
 ) -> tuple[Any, dict[str, Any]]:
     from optimum.rbln import RBLNAutoModelForSpeechSeq2Seq
+
+    model_config = vllm_config.model_config
+    cache_config = vllm_config.cache_config
+    additional_config = vllm_config.additional_config
+    config = model_config.hf_config
+
+    batch_size = optimum_overrides.get("batch_size")
+    if batch_size is None:
+        batch_size = vllm_config.scheduler_config.max_num_seqs
+    max_model_len = optimum_overrides.get("dec_max_seq_len")
+    if max_model_len is None:
+        max_model_len = model_config.max_model_len
+
+    block_size = optimum_overrides.get("dec_max_seq_len")
+    if block_size is None and cache_config.user_specified_block_size:
+        block_size = (
+            additional_config.attn_block_size
+            if cache_config.enable_prefix_caching
+            and additional_config.attn_block_size is not None
+            else cache_config.block_size
+        )
+    if block_size is None:
+        block_size = max_model_len
+
+    num_devices = resolve_num_devices(optimum_overrides)
+    if num_devices is None:
+        num_devices = additional_config.num_devices_per_local_rank
 
     architectures = getattr(config, "architectures", [])
     assert architectures[0] == "WhisperForConditionalGeneration"
