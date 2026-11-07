@@ -166,7 +166,7 @@ class TestSync:
         def generate_name(spec):
             observed.append(
                 (
-                    list(spec.hf_config["architectures"]),
+                    list(spec.hf_config.architectures),
                     spec.model_cls,
                     spec.rbln_config.get("prefill_chunk_size", 1024),
                 )

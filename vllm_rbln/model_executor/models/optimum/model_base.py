@@ -181,16 +181,15 @@ class RBLNOptimumModelBase(nn.Module):
             return int(self.scheduler_config.max_num_seqs)
 
     def init_model(self) -> None:
-        hf_config = self.model_config.hf_config
         additional_config: OptimumRBLNConfig = self.vllm_config.additional_config
         cached_model_path = additional_config.cached_model_path
         optimum_overrides = additional_config.optimum_overrides
-        _, model_cls_name = get_rbln_model_info(hf_config)
         model_path = self.vllm_config.model_config.model
         valid_path = resolve_compiled_model_path(model_path, cached_model_path)
 
         if valid_path is not None:
             # pre-compiled OR cache-hit
+            _, model_cls_name = get_rbln_model_info(self.model_config.hf_config)
             model_cls = getattr(optimum.rbln, model_cls_name)
             ec_enabled_model = model_cls_name == "RBLNQwen3VLForConditionalGeneration"
             assert model_cls is not None
@@ -222,6 +221,8 @@ class RBLNOptimumModelBase(nn.Module):
             # cache miss: compile the model and save it to the cache for reuse.
             spec = additional_config.compile_spec
             assert spec is not None, "compile spec must be resolved before loading"
+            hf_config = deepcopy(spec.hf_config)
+            _, model_cls_name = get_rbln_model_info(hf_config)
             model_cls = getattr(optimum.rbln, spec.model_cls)
             logger.info(
                 "Compiling %s via optimum-rbln (%s) with rbln_config:\n%s",
@@ -229,13 +230,10 @@ class RBLNOptimumModelBase(nn.Module):
                 spec.model_cls,
                 json.dumps(spec.rbln_config, indent=2, default=str),
             )
-            # Pass transformers config objects directly to preserve all settings.
-            # Config classes defined outside transformers (e.g. vLLM's qwen3_asr)
-            # may be incompatible with the transformers model implementation.
-            # For these configs, pass num_hidden_layers and, when available,
-            # layer_types as config kwargs instead.
-            # FIXME(optimum-rbln): Ensure RBLNGptOssForCausalLM.get_pytorch_model
-            # applies these config kwargs; it currently discards them.
+            # Transformers configs preserve model-specific state. External config
+            # classes may be incompatible with optimum-rbln, so pass layer kwargs.
+            # FIXME(optimum-rbln): RBLNGptOssForCausalLM.get_pytorch_model
+            # currently discards these config kwargs.
             if type(hf_config).__module__.startswith("transformers."):
                 config_override = {"config": hf_config}
             else:

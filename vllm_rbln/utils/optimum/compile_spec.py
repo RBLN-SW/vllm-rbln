@@ -55,7 +55,8 @@ class RBLNCompileSpec:
     dtype: Any
     model_cls: str
     rbln_config: dict[str, Any]
-    hf_config: dict[str, Any]
+    # Keep third-party config dataclasses opaque to pydantic validation.
+    hf_config: Any
     npu_name: str
 
 
@@ -86,6 +87,7 @@ def compile_cache_name(spec: RBLNCompileSpec) -> str:
         field.name: getattr(spec, field.name) for field in fields(spec)
     }
     config_dict["rbln_config"] = _strip_load_only_keys(config_dict["rbln_config"])
+    config_dict["hf_config"] = spec.hf_config.to_dict()
     model_name = str(config_dict["model"])
 
     config_json = json.dumps(config_dict, sort_keys=True, default=str)
@@ -243,7 +245,7 @@ def build_compile_spec(vllm_config: VllmConfig) -> RBLNCompileSpec:
         dtype=model_config.dtype,
         model_cls=model_cls.__name__,
         rbln_config=rbln_config,
-        hf_config=deepcopy(hf_config.to_dict()),
+        hf_config=deepcopy(hf_config),
         npu_name=RblnPlatform.get_device_name().strip().upper(),
     )
 

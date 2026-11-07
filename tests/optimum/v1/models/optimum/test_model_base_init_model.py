@@ -20,18 +20,26 @@ NPU-dependent operations are replaced with test doubles.
 """
 
 import types
+from copy import deepcopy
 
 import pytest
 import torch
-from transformers import Gemma4Config
+from transformers import Gemma4Config, LlamaConfig, PretrainedConfig
 
 from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.model_executor.models.optimum import model_base
 from vllm_rbln.model_executor.models.optimum.model_base import RBLNOptimumModelBase
 from vllm_rbln.utils.optimum.compile_spec import RBLNCompileSpec
+from vllm_rbln.utils.optimum.rbln_config_utils import get_field
 
 
-def _init_model_with(monkeypatch, tmp_path, hf_config, *, precompiled=False) -> dict:
+class ExternalConfig(PretrainedConfig):
+    pass
+
+
+def _init_model_with(
+    monkeypatch, tmp_path, hf_config, *, precompiled=False, hf_snapshot=None
+) -> dict:
     passed = {}
 
     class FakeRBLNModel:
@@ -74,7 +82,7 @@ def _init_model_with(monkeypatch, tmp_path, hf_config, *, precompiled=False) -> 
                 model="compile-source",
                 dtype=torch.bfloat16,
                 model_cls="FakeRBLNModel",
-                hf_config={},
+                hf_config=deepcopy(hf_config if hf_snapshot is None else hf_snapshot),
                 npu_name="RBLN-CA25",
                 rbln_config={"prefill_chunk_size": 256},
             ),
@@ -93,13 +101,11 @@ def _init_model_with(monkeypatch, tmp_path, hf_config, *, precompiled=False) -> 
 def test_flat_config_passes_layer_count_as_top_level_kwargs(monkeypatch, tmp_path):
     # For a flat non-transformers config, pass layer settings as top-level
     # kwargs rather than passing the config object.
-    hf_config = types.SimpleNamespace(
+    hf_config = ExternalConfig(
         architectures=["Qwen3ForCausalLM"],
         num_hidden_layers=2,
         layer_types=["full_attention", "full_attention"],
     )
-    hf_config.get_text_config = lambda: hf_config
-
     passed = _init_model_with(monkeypatch, tmp_path, hf_config)
 
     assert "config" not in passed
@@ -111,10 +117,10 @@ def test_flat_config_passes_layer_count_as_top_level_kwargs(monkeypatch, tmp_pat
 def test_composite_config_nests_layer_count_under_text_config(monkeypatch, tmp_path):
     # For a composite non-transformers config, nest the layer override under
     # text_config rather than passing it as a top-level kwarg.
-    text_config = types.SimpleNamespace(num_hidden_layers=2)
-    hf_config = types.SimpleNamespace(
+    text_config = ExternalConfig(num_hidden_layers=2)
+    hf_config = ExternalConfig(
         architectures=["Qwen3ASRForConditionalGeneration"],
-        get_text_config=lambda: text_config,
+        text_config=text_config,
     )
 
     passed = _init_model_with(monkeypatch, tmp_path, hf_config)
@@ -124,7 +130,9 @@ def test_composite_config_nests_layer_count_under_text_config(monkeypatch, tmp_p
     assert "num_hidden_layers" not in passed
 
 
-def test_transformers_config_is_forwarded_as_the_config_object(monkeypatch, tmp_path):
+def test_transformers_config_is_forwarded_as_an_owned_config_object(
+    monkeypatch, tmp_path
+):
     # gemma4's config carries per-layer state that the kwargs cannot reproduce,
     # and transformers defines the class, so the object itself goes through.
     hf_config = Gemma4Config()
@@ -132,14 +140,52 @@ def test_transformers_config_is_forwarded_as_the_config_object(monkeypatch, tmp_
 
     passed = _init_model_with(monkeypatch, tmp_path, hf_config)
 
-    assert passed["config"] is hf_config
+    assert isinstance(passed["config"], Gemma4Config)
+    assert passed["config"] is not hf_config
+    assert passed["config"].to_dict() == hf_config.to_dict()
     assert "text_config" not in passed
     assert "num_hidden_layers" not in passed
 
 
+@pytest.mark.parametrize(
+    "hf_config",
+    [
+        pytest.param(LlamaConfig(), id="transformers-flat"),
+        pytest.param(Gemma4Config(), id="transformers-composite"),
+        pytest.param(ExternalConfig(), id="external-flat"),
+        pytest.param(
+            ExternalConfig(text_config=PretrainedConfig()), id="external-composite"
+        ),
+    ],
+)
+def test_compilation_uses_hf_snapshot_after_original_changes(
+    monkeypatch, tmp_path, hf_config
+):
+    text_config = hf_config.get_text_config()
+    text_config.num_hidden_layers = 2
+    text_config.layer_types = ["full_attention", "sliding_attention"]
+    snapshot = deepcopy(hf_config)
+    text_config.num_hidden_layers = 3
+    text_config.layer_types.append("full_attention")
+
+    passed = _init_model_with(monkeypatch, tmp_path, hf_config, hf_snapshot=snapshot)
+    if "config" in passed:
+        compiled_text = passed["config"].get_text_config()
+    else:
+        compiled_text = passed.get("text_config", passed)
+    assert get_field(compiled_text, "num_hidden_layers") == 2
+    compiled_layers = get_field(compiled_text, "layer_types")
+    assert compiled_layers == ["full_attention", "sliding_attention"]
+
+    compiled_layers.append("full_attention")
+    assert passed["compile_spec"].hf_config.get_text_config().layer_types == [
+        "full_attention",
+        "sliding_attention",
+    ]
+
+
 def test_compilation_uses_the_spec_that_was_hashed(monkeypatch, tmp_path):
-    hf_config = types.SimpleNamespace(architectures=["Qwen3ForCausalLM"])
-    hf_config.get_text_config = lambda: types.SimpleNamespace(num_hidden_layers=2)
+    hf_config = ExternalConfig(architectures=["Qwen3ForCausalLM"], num_hidden_layers=2)
     passed = _init_model_with(monkeypatch, tmp_path, hf_config)
     assert passed["model"] == "compile-source"
     assert passed["dtype"] == torch.bfloat16
@@ -151,8 +197,7 @@ def test_compilation_uses_the_spec_that_was_hashed(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize("precompiled", [False, True])
 def test_model_id_is_preserved_after_loading(monkeypatch, tmp_path, precompiled):
-    hf_config = types.SimpleNamespace(architectures=["Qwen3ForCausalLM"])
-    hf_config.get_text_config = lambda: types.SimpleNamespace(num_hidden_layers=2)
+    hf_config = ExternalConfig(architectures=["Qwen3ForCausalLM"], num_hidden_layers=2)
     passed = _init_model_with(monkeypatch, tmp_path, hf_config, precompiled=precompiled)
     assert passed["source_model"] == "repo"
     assert passed["model"] == (str(tmp_path) if precompiled else "compile-source")
