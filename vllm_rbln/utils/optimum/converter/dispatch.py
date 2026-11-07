@@ -20,11 +20,11 @@ from typing import TYPE_CHECKING, Any
 from vllm_rbln import envs
 from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.logger import init_logger
+from vllm_rbln.utils.optimum.params import RBLNParams, load_compiled_rbln_config
 from vllm_rbln.utils.optimum.paths import resolve_compiled_model_path
 
 from .from_optimum import sync_runtime_config
 from .from_vllm import resolve_compile_spec
-from .params import load_compiled_rbln_config
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -62,7 +62,12 @@ def _generate_model_path_name(
     assert additional_config.compile_spec is not None, (
         "compile spec must be resolved first"
     )
-    config_dict: dict[str, Any] = dict(additional_config.compile_spec)
+    # Params are derived from the same inputs and must not duplicate cache-key fields.
+    config_dict: dict[str, Any] = {
+        key: value
+        for key, value in additional_config.compile_spec.items()
+        if key != "params"
+    }
     config_dict["rbln_config"] = _strip_runtime_only_keys(config_dict["rbln_config"])
     model_name = str(config_dict["model"])
 
@@ -103,15 +108,14 @@ def sync_vllm_and_optimum(vllm_config: VllmConfig) -> None:
     if rbln_config is None:
         # 2. Resolve the compile spec and look up the corresponding cached model.
         spec = resolve_compile_spec(vllm_config)
+        params = spec["params"]
         cached_model_path = _resolve_cached_model_path(vllm_config)
         rbln_config = load_compiled_rbln_config(cached_model_path)
         if rbln_config is not None:
             logger.info("Found compiled model at %s", cached_model_path)
-        # 3. Use the cached rbln_config.json if found, or the compile spec otherwise.
-        precompiled = rbln_config is not None
-        if rbln_config is None:
-            rbln_config = spec["rbln_config"]
-    else:
-        precompiled = True
+    # 3. Use params from rbln_config.json if found, or from the compile spec.
+    precompiled = rbln_config is not None
+    if rbln_config is not None:
+        params = RBLNParams.from_rbln_config(vllm_config, rbln_config)
     # 4. Synchronize runtime settings once using the selected configuration.
-    sync_runtime_config(vllm_config, rbln_config, precompiled=precompiled)
+    sync_runtime_config(vllm_config, params, precompiled=precompiled)

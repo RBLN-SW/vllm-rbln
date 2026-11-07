@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
@@ -23,6 +24,11 @@ from optimum.rbln import (
 from transformers import PretrainedConfig
 
 from vllm_rbln import envs
+from vllm_rbln.utils.optimum.params import (
+    RBLNParams,
+    _resolve_kvcache_block_size,
+    _resolve_num_devices,
+)
 from vllm_rbln.utils.optimum.registry import (
     get_rbln_model_info,
     is_enc_dec_arch,
@@ -90,27 +96,46 @@ def _sync_submodule_tp_with_device(rbln_config: dict) -> None:
 
 @dataclass
 class RBLNCompileSpec:
-    """Resolved (model_cls, rbln_config) ready to feed optimum-rbln."""
+    """Final common params and the matching optimum-rbln compile configuration."""
 
     model_cls: Any
     rbln_config: dict[str, Any]
+    params: RBLNParams
 
     @classmethod
     def for_architecture(
         cls,
         config: PretrainedConfig,
         *,
-        batch_size: int,
-        block_size: int,
-        max_model_len: int,
-        num_devices: int,
+        params: RBLNParams,
         memory_budget: float,
-        prefill_chunk_size: int | None = None,
         optimum_overrides: dict[str, Any] | None = None,
     ) -> "RBLNCompileSpec":
-        """Build a compile spec from vllm-rbln inputs, dispatched by architecture."""
+        """Finalize common params before rendering model-specific compile settings."""
+        params = deepcopy(params)
+        optimum_overrides = deepcopy(optimum_overrides or {})
+        _sync_submodule_tp_with_device(optimum_overrides)
+        params.num_devices = _resolve_num_devices(
+            optimum_overrides, default=params.num_devices
+        )
+        assert params.batch_size is not None
+        assert params.max_seq_len is not None
+        assert params.kvcache_block_size is not None
+        if is_multi_modal(config) and get_rbln_model_info(config)[0] == "paligemma":
+            params.prefill_chunk_size = params.max_seq_len
+        if is_pooling_arch(config) and config.architectures[0] != "Qwen3Model":
+            params.kvcache_block_size = (
+                _resolve_kvcache_block_size(optimum_overrides, arch="pooling")
+                or params.max_seq_len
+            )
+
+        batch_size = params.batch_size
+        block_size = params.kvcache_block_size
+        max_model_len = params.max_seq_len
+        num_devices = params.num_devices
+        prefill_chunk_size = params.prefill_chunk_size
         if is_generation_arch(config):
-            spec = cls._for_decoder(
+            model_cls, rbln_config = cls._for_decoder(
                 batch_size,
                 block_size,
                 max_model_len,
@@ -119,7 +144,7 @@ class RBLNCompileSpec:
                 prefill_chunk_size,
             )
         elif is_pooling_arch(config):
-            spec = cls._for_pooling(
+            model_cls, rbln_config = cls._for_pooling(
                 config,
                 batch_size,
                 block_size,
@@ -127,7 +152,7 @@ class RBLNCompileSpec:
                 num_devices,
             )
         elif is_multi_modal(config):
-            spec = cls._for_multimodal(
+            model_cls, rbln_config = cls._for_multimodal(
                 config,
                 batch_size,
                 block_size,
@@ -137,7 +162,7 @@ class RBLNCompileSpec:
                 prefill_chunk_size,
             )
         elif is_enc_dec_arch(config):
-            spec = cls._for_enc_dec(
+            model_cls, rbln_config = cls._for_enc_dec(
                 config,
                 batch_size,
                 block_size,
@@ -149,6 +174,8 @@ class RBLNCompileSpec:
             raise NotImplementedError(
                 f"Compilation is not implemented for architecture {architectures[0]}"
             )
+
+        spec = cls(model_cls=model_cls, rbln_config=rbln_config, params=params)
 
         if envs.VLLM_RBLN_USE_NESTED_COMPILE_REGION and (
             is_generation_arch(config) or is_multi_modal(config)
@@ -173,11 +200,6 @@ class RBLNCompileSpec:
                 )
             _deep_merge(spec.rbln_config, optimum_overrides)
 
-        # A submodule's tensor_parallel_size must match its device count.
-        # The user only specifies ``device`` per submodule, so derive the
-        # submodule's tensor_parallel_size from the number of devices assigned
-        # to it (e.g. ``visual.device``); falls back to the merged default.
-        _sync_submodule_tp_with_device(spec.rbln_config)
         return spec
 
     @classmethod
@@ -189,7 +211,7 @@ class RBLNCompileSpec:
         num_devices: int,
         memory_budget: float,
         prefill_chunk_size: int | None = None,
-    ) -> "RBLNCompileSpec":
+    ) -> tuple[Any, dict[str, Any]]:
         rbln_config: dict[str, Any] = {
             "num_devices": num_devices,
             "batch_size": batch_size,
@@ -203,7 +225,7 @@ class RBLNCompileSpec:
         # in sync with the one used for KV-cache block padding.
         if prefill_chunk_size is not None:
             rbln_config["prefill_chunk_size"] = prefill_chunk_size
-        return cls(model_cls=RBLNAutoModelForCausalLM, rbln_config=rbln_config)
+        return RBLNAutoModelForCausalLM, rbln_config
 
     @classmethod
     def _for_pooling(
@@ -213,7 +235,7 @@ class RBLNCompileSpec:
         block_size: int,
         max_model_len: int,
         num_devices: int,
-    ) -> "RBLNCompileSpec":
+    ) -> tuple[Any, dict[str, Any]]:
         _, model_cls_name = get_rbln_model_info(config)
         model_cls = getattr(optimum.rbln, model_cls_name)
         assert model_cls is not None
@@ -229,7 +251,7 @@ class RBLNCompileSpec:
         if architectures[0] == "Qwen3Model" and block_size != max_model_len:
             rbln_config["kvcache_partition_len"] = block_size
             rbln_config["attn_impl"] = "flash_attn"
-        return cls(model_cls=model_cls, rbln_config=rbln_config)
+        return model_cls, rbln_config
 
     @classmethod
     def _for_multimodal(
@@ -241,7 +263,7 @@ class RBLNCompileSpec:
         num_devices: int,
         memory_budget: float,
         prefill_chunk_size: int | None = None,
-    ) -> "RBLNCompileSpec":
+    ) -> tuple[Any, dict[str, Any]]:
         model_name, model_cls_name = get_rbln_model_info(config)
         compile_fn = _COMPILE_MULTIMODAL_FNS.get(model_name)
         if compile_fn is None:
@@ -261,7 +283,7 @@ class RBLNCompileSpec:
             memory_budget,
             prefill_chunk_size,
         )
-        return cls(model_cls=model_cls, rbln_config=rbln_config)
+        return model_cls, rbln_config
 
     @classmethod
     def _for_enc_dec(
@@ -271,7 +293,7 @@ class RBLNCompileSpec:
         block_size: int,
         max_model_len: int,
         num_devices: int,
-    ) -> "RBLNCompileSpec":
+    ) -> tuple[Any, dict[str, Any]]:
         architectures = getattr(config, "architectures", [])
         assert architectures[0] == "WhisperForConditionalGeneration"
         # Whisper does not support varying block_size or max_model_len.
@@ -283,12 +305,9 @@ class RBLNCompileSpec:
             f"max_target_positions ({config.max_target_positions}) "
             "from the HuggingFace config."
         )
-        return cls(
-            model_cls=RBLNAutoModelForSpeechSeq2Seq,
-            rbln_config={
-                "num_devices": num_devices,
-                "batch_size": batch_size,
-                "token_timestamps": False,
-                "dec_max_seq_len": max_model_len,
-            },
-        )
+        return RBLNAutoModelForSpeechSeq2Seq, {
+            "num_devices": num_devices,
+            "batch_size": batch_size,
+            "token_timestamps": False,
+            "dec_max_seq_len": max_model_len,
+        }

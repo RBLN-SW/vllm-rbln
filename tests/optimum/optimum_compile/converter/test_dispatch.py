@@ -24,7 +24,8 @@ from vllm_rbln.config import build_optimum_rbln_config
 from vllm_rbln.platform.optimum_impl import check_and_update
 from vllm_rbln.utils.optimum.converter import dispatch
 from vllm_rbln.utils.optimum.converter.dispatch import _generate_model_path_name
-from vllm_rbln.utils.optimum.converter.params import (
+from vllm_rbln.utils.optimum.params import (
+    RBLNParams,
     load_compiled_rbln_config,
 )
 
@@ -37,7 +38,7 @@ def compile_environment(monkeypatch, tmp_path):
         dispatch, "resolve_compiled_model_path", lambda model, cache: None
     )
     monkeypatch.setattr(
-        "vllm_rbln.utils.optimum.converter.params._resolve_default_prefill_chunk_size",
+        "vllm_rbln.utils.optimum.params._resolve_default_prefill_chunk_size",
         lambda: 128,
     )
     monkeypatch.setattr(
@@ -483,7 +484,8 @@ class TestGenerateModelPathName:
             ),
         )
         dispatch.sync_vllm_and_optimum(cfg)
-        assert synced == [metadata]
+        assert len(synced) == 1
+        assert synced[0].prefill_chunk_size == metadata["prefill_chunk_size"]
         assert cfg.model_config.model == source_model
 
 
@@ -569,3 +571,71 @@ def test_explicit_compiled_directory_takes_precedence(tmp_path):
     assert resolve_compiled_model_path(str(tmp_path / "missing"), str(cache)) == str(
         cache
     )
+
+
+@pytest.mark.parametrize(
+    "hf_config",
+    [
+        LlamaConfig(architectures=["LlamaForCausalLM"]),
+        PaliGemmaConfig(architectures=["PaliGemmaForConditionalGeneration"]),
+        WhisperConfig(
+            architectures=["WhisperForConditionalGeneration"],
+            max_target_positions=8192,
+        ),
+        Qwen3Config(architectures=["Qwen3Model"]),
+    ],
+)
+def test_cache_miss_reuses_final_params_without_reparsing(monkeypatch, hf_config):
+    parsed = []
+    original_parse = RBLNParams.from_rbln_config
+
+    def parse(cfg, data):
+        parsed.append(data)
+        return original_parse(cfg, data)
+
+    monkeypatch.setattr(RBLNParams, "from_rbln_config", staticmethod(parse))
+    cfg = _vllm_config(hf_config=hf_config)
+    assert len(parsed) == 1
+    assert parsed[0] is cfg.additional_config.optimum_overrides
+    params = cfg.additional_config.compile_spec["params"]
+    assert params.batch_size == cfg.scheduler_config.max_num_seqs
+    assert params.max_seq_len == cfg.model_config.max_model_len
+    assert params.kvcache_block_size == cfg.cache_config.block_size
+
+    def reject_parse(*args):
+        pytest.fail("a resolved compile spec must not be parsed again")
+
+    monkeypatch.setattr(RBLNParams, "from_rbln_config", staticmethod(reject_parse))
+    dispatch.sync_vllm_and_optimum(cfg)
+
+
+def test_resolved_params_survive_worker_serialization():
+    import pickle
+
+    cfg = _vllm_config(
+        hf_config=PaliGemmaConfig(architectures=["PaliGemmaForConditionalGeneration"])
+    )
+    original_path = cfg.additional_config.cached_model_path
+    cfg.additional_config = pickle.loads(pickle.dumps(cfg.additional_config))
+    params = cfg.additional_config.compile_spec["params"]
+    assert isinstance(params, RBLNParams)
+    assert params.prefill_chunk_size == 8192
+    dispatch.sync_vllm_and_optimum(cfg)
+    assert cfg.additional_config.cached_model_path == original_path
+    assert cfg.scheduler_config.max_num_batched_tokens == 8192
+
+
+def test_final_params_include_submodule_devices_and_image_buckets():
+    cfg = _vllm_config(
+        hf_config=PaliGemmaConfig(architectures=["PaliGemmaForConditionalGeneration"]),
+        optimum_overrides={
+            "language_model": {"device": [0, 1], "image_prefill_chunk_size": 256}
+        },
+    )
+    spec = cfg.additional_config.compile_spec
+    params = spec["params"]
+    language_model = spec["rbln_config"]["language_model"]
+    assert params.num_devices == language_model["num_devices"] == 2
+    assert cfg.additional_config.num_devices_per_local_rank == 2
+    assert params.image_prefill_chunk_size == [256]
+    assert cfg.additional_config.image_prefill_chunk_size == [256]

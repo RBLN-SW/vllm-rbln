@@ -22,6 +22,7 @@ from vllm_rbln.utils.optimum.block_size import (
     get_block_ratio,
     is_full_block_available,
 )
+from vllm_rbln.utils.optimum.params import RBLNParams
 
 from .common import (
     apply_user_prefill_chunk_size,
@@ -29,7 +30,6 @@ from .common import (
     update_block_size,
     update_max_num_batched_tokens,
 )
-from .params import RBLNParams
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -54,27 +54,22 @@ def _keep_only_device_keys(obj: dict) -> dict:
 
 def sync_runtime_config(
     vllm_config: VllmConfig,
-    rbln_config: dict,
+    params: RBLNParams,
     *,
     precompiled: bool,
 ) -> None:
-    """Apply runtime settings once from the selected spec or compiled metadata."""
-    params = RBLNParams.from_rbln_config(vllm_config, rbln_config)
+    """Apply finalized common settings to the vLLM runtime."""
     additional_config: OptimumRBLNConfig = vllm_config.additional_config
     assert params.batch_size is not None
     assert params.max_seq_len is not None
+    assert params.kvcache_block_size is not None
     if precompiled:
         assert params.num_blocks is not None, (
             "num_blocks must be specified in rbln_config.json"
         )
-        assert params.kvcache_block_size is not None, (
-            "kvcache_block_size must be specified in rbln_config.json"
-        )
         additional_config.optimum_overrides = _keep_only_device_keys(
             additional_config.optimum_overrides
         )
-    elif params.kvcache_block_size is None:
-        params.kvcache_block_size = params.max_seq_len
 
     # Set max_num_seqs in scheduler_config based on rbln_config.json
     if vllm_config.scheduler_config.max_num_seqs != params.batch_size:

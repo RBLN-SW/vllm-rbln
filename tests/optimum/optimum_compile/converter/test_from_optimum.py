@@ -18,6 +18,7 @@ import torch
 from vllm.config import CacheConfig, ModelConfig, SchedulerConfig, VllmConfig
 
 from vllm_rbln.utils.optimum.converter.from_optimum import sync_runtime_config
+from vllm_rbln.utils.optimum.params import RBLNParams
 
 
 def _vllm_config() -> VllmConfig:
@@ -55,6 +56,10 @@ def test_compiled_num_devices_lands_in_the_config(monkeypatch):
         "prefill_chunk_size": 128,
         "num_devices": 2,
     }
-    sync_runtime_config(vllm_config, compiled, precompiled=True)
+    sync_runtime_config(
+        vllm_config,
+        RBLNParams.from_rbln_config(vllm_config, compiled),
+        precompiled=True,
+    )
 
     assert vllm_config.additional_config.num_devices_per_local_rank == 2

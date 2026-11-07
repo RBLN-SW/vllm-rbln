@@ -20,21 +20,16 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Union
 
 if TYPE_CHECKING:
+    from optimum.rbln.configuration_utils import RBLNModelConfig
     from vllm.config import VllmConfig
 else:
     VllmConfig = None
 
-from optimum.rbln.configuration_utils import RBLNModelConfig
 
 from vllm_rbln.utils.optimum.paths import RBLN_CONFIG_FILE
-from vllm_rbln.utils.optimum.registry import (
-    is_enc_dec_arch,
-    is_multi_modal,
-    is_pooling_arch,
-)
 
 # Either a plain dict (from rbln_config.json) or an RBLNModelConfig instance.
-RblnConfigLike = Union[dict, RBLNModelConfig]
+RblnConfigLike = Union[dict, "RBLNModelConfig"]
 
 
 def _cfg_get(cfg: RblnConfigLike, key: str, default: Any = None) -> Any:
@@ -62,9 +57,7 @@ def load_compiled_rbln_config(model_path: str) -> dict | None:
 
 @dataclass
 class RBLNParams:
-    """
-    Parameters derived from an optimum-rbln `rbln_config.json`.
-    """
+    """Common model settings used for compilation and runtime synchronization."""
 
     num_blocks: int | None = None
     batch_size: int | None = None
@@ -83,6 +76,12 @@ class RBLNParams:
         cls, vllm_config: VllmConfig, rbln_config: RblnConfigLike
     ) -> "RBLNParams":
         """Parse rbln_config according to the model architecture."""
+        from vllm_rbln.utils.optimum.registry import (
+            is_enc_dec_arch,
+            is_multi_modal,
+            is_pooling_arch,
+        )
+
         hf_config = vllm_config.model_config.hf_config
 
         if is_enc_dec_arch(hf_config):

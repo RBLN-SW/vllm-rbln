@@ -24,7 +24,7 @@ from vllm_rbln.utils.optimum.converter.common import (
     store_image_prefill_chunk_size,
     update_max_num_batched_tokens,
 )
-from vllm_rbln.utils.optimum.converter.params import RBLNParams
+from vllm_rbln.utils.optimum.params import RBLNParams
 
 # Architectures picked from the RBLN registry model sets.
 DECODER_ARCH = "LlamaForCausalLM"

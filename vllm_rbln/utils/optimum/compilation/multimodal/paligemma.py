@@ -32,6 +32,5 @@ def get_param_paligemma(
         memory_budget,
         prefill_chunk_size,
     )
-    language_model_config["prefill_chunk_size"] = max_model_len
     param = {"language_model": language_model_config}
     return param

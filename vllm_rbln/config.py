@@ -44,6 +44,7 @@ from typing_extensions import TypedDict
 from vllm.config.utils import config as vllm_config_dataclass
 
 from vllm_rbln.logger import init_logger
+from vllm_rbln.utils.optimum.params import RBLNParams
 
 if TYPE_CHECKING:
     # `Field` here is pydantic's, which a field definition below calls.
@@ -61,6 +62,7 @@ class ResolvedCompileSpec(TypedDict):
     rbln_config: dict[str, Any]
     hf_config: dict[str, Any]
     npu_name: str
+    params: RBLNParams
 
 
 logger = init_logger(__name__)

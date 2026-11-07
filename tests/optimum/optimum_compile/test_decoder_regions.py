@@ -17,6 +17,7 @@ from optimum.rbln import RBLNAutoModelForCausalLM
 from transformers import GptOssConfig, PretrainedConfig, Qwen3Config
 
 from vllm_rbln.utils.optimum.compilation import RBLNCompileSpec
+from vllm_rbln.utils.optimum.params import RBLNParams
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -29,12 +30,8 @@ def test_decoder_region_model_selection(monkeypatch, enabled, config_cls, archit
     config = config_cls(architectures=[architecture])
     spec = RBLNCompileSpec.for_architecture(
         config,
-        batch_size=1,
-        block_size=8192,
-        max_model_len=8192,
-        num_devices=1,
+        params=RBLNParams(batch_size=1, max_seq_len=8192, kvcache_block_size=8192),
         memory_budget=0.9,
-        prefill_chunk_size=128,
     )
     assert spec.model_cls is RBLNAutoModelForCausalLM
     assert spec.rbln_config.get("nested_compile_region", False) is enabled
@@ -53,12 +50,8 @@ def test_multimodal_decoder_option(monkeypatch, architecture, key):
     config = PretrainedConfig(architectures=[architecture])
     spec = RBLNCompileSpec.for_architecture(
         config,
-        batch_size=1,
-        block_size=8192,
-        max_model_len=8192,
-        num_devices=1,
+        params=RBLNParams(batch_size=1, max_seq_len=8192, kvcache_block_size=8192),
         memory_budget=0.9,
-        prefill_chunk_size=128,
     )
     decoder = spec.rbln_config[key] if key else spec.rbln_config
     assert decoder["nested_compile_region"] is True
@@ -71,10 +64,24 @@ def test_flag_conflicts_with_decoder_override(monkeypatch):
     with pytest.raises(ValueError, match="nested_compile_region"):
         RBLNCompileSpec.for_architecture(
             Qwen3Config(architectures=["Qwen3ForCausalLM"]),
-            batch_size=1,
-            block_size=8192,
-            max_model_len=8192,
-            num_devices=1,
+            params=RBLNParams(batch_size=1, max_seq_len=8192, kvcache_block_size=8192),
             memory_budget=0.9,
             optimum_overrides={"nested_compile_region": False},
         )
+
+
+def test_paligemma_finalizes_params_before_rendering_config():
+    params = RBLNParams(
+        batch_size=4,
+        max_seq_len=8192,
+        kvcache_block_size=8192,
+        prefill_chunk_size=128,
+    )
+    spec = RBLNCompileSpec.for_architecture(
+        PretrainedConfig(architectures=["PaliGemmaForConditionalGeneration"]),
+        params=params,
+        memory_budget=0.9,
+    )
+    assert params.prefill_chunk_size == 128
+    assert spec.params.prefill_chunk_size == 8192
+    assert spec.rbln_config["language_model"]["prefill_chunk_size"] == 8192

@@ -21,7 +21,7 @@ import pytest
 from vllm_rbln.utils.optimum.compilation.multimodal.qwen import (
     get_param_qwen3_5,
 )
-from vllm_rbln.utils.optimum.converter.params import (
+from vllm_rbln.utils.optimum.params import (
     RBLNParams,
     _num_devices_of,
     _resolve_num_devices,

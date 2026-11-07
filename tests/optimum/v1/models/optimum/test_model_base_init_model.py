@@ -28,6 +28,7 @@ from transformers import Gemma4Config
 from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.model_executor.models.optimum import model_base
 from vllm_rbln.model_executor.models.optimum.model_base import RBLNOptimumModelBase
+from vllm_rbln.utils.optimum.params import RBLNParams
 
 
 def _init_model_with(monkeypatch, tmp_path, hf_config, *, precompiled=False) -> dict:
@@ -75,6 +76,7 @@ def _init_model_with(monkeypatch, tmp_path, hf_config, *, precompiled=False) -> 
                 "model_cls": "FakeRBLNModel",
                 "hf_config": {},
                 "npu_name": "RBLN-CA25",
+                "params": RBLNParams(prefill_chunk_size=256),
                 "rbln_config": {"prefill_chunk_size": 256},
             },
         ),

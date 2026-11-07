@@ -24,7 +24,7 @@ from vllm_rbln.utils.optimum.registry import (
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
-    from .params import RBLNParams
+    from vllm_rbln.utils.optimum.params import RBLNParams
 else:
     VllmConfig = None
 

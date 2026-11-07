@@ -16,13 +16,13 @@ from copy import deepcopy
 from typing import TYPE_CHECKING
 
 from vllm_rbln.config import OptimumRBLNConfig, ResolvedCompileSpec
+from vllm_rbln.utils.optimum.params import RBLNParams, _resolve_num_devices
 from vllm_rbln.utils.optimum.registry import (
     is_enc_dec_arch,
     is_pooling_arch,
 )
 
 from .common import apply_user_prefill_chunk_size
-from .params import RBLNParams, _resolve_num_devices
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -95,15 +95,12 @@ def resolve_compile_spec(vllm_config: VllmConfig) -> ResolvedCompileSpec:
         # 2. Finalize model-specific constraints and snapshot the compile spec.
         spec = RBLNCompileSpec.for_architecture(
             vllm_config.model_config.hf_config,
-            batch_size=input_params.batch_size,
-            block_size=input_params.kvcache_block_size,
-            max_model_len=input_params.max_seq_len,
-            num_devices=input_params.num_devices,
-            prefill_chunk_size=input_params.prefill_chunk_size,
+            params=input_params,
             memory_budget=vllm_config.cache_config.gpu_memory_utilization,
             optimum_overrides=optimum_overrides,
         )
         additional_config.compile_spec = {
+            "params": deepcopy(spec.params),
             "model": str(vllm_config.model_config.model),
             "dtype": vllm_config.model_config.dtype,
             "model_cls": spec.model_cls.__name__,
