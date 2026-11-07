@@ -73,8 +73,8 @@ def _generate_model_path_name(
     return f"{sanitized_name}_{config_hash}"
 
 
-def _resolve_cached_rbln_config(vllm_config: VllmConfig) -> dict | None:
-    """Locate a cached artifact after resolving the compile inputs."""
+def _resolve_cached_model_path(vllm_config: VllmConfig) -> str:
+    """Compute and store the cache path from the resolved compile spec."""
     additional_config: OptimumRBLNConfig = vllm_config.additional_config
     cached_model_path = os.path.join(
         envs.VLLM_CACHE_ROOT,
@@ -82,13 +82,7 @@ def _resolve_cached_rbln_config(vllm_config: VllmConfig) -> dict | None:
         _generate_model_path_name(vllm_config=vllm_config),
     )
     additional_config.cached_model_path = cached_model_path
-    artifact_path = resolve_compiled_model_path(
-        vllm_config.model_config.model, cached_model_path
-    )
-    if artifact_path is not None:
-        logger.info("Found compiled model at %s", artifact_path)
-        return load_compiled_rbln_config(artifact_path)
-    return None
+    return cached_model_path
 
 
 def sync_vllm_and_optimum(vllm_config: VllmConfig) -> None:
@@ -99,22 +93,25 @@ def sync_vllm_and_optimum(vllm_config: VllmConfig) -> None:
     Otherwise stage user overrides for the upcoming compile (vllm→optimum).
     """
     additional_config: OptimumRBLNConfig = vllm_config.additional_config
-    # 1. Prefer metadata from an explicit artifact or an already known cache.
+    # 1. Load rbln_config.json from the model path or a known cache path.
     artifact_path = resolve_compiled_model_path(
         vllm_config.model_config.model, additional_config.cached_model_path
     )
-    compile_config = (
+    rbln_config = (
         load_compiled_rbln_config(artifact_path) if artifact_path is not None else None
     )
-    if compile_config is None:
-        # 2. Resolve compile inputs before looking up their cache entry.
+    if rbln_config is None:
+        # 2. Resolve the compile spec and look up the corresponding cached model.
         spec = resolve_compile_spec(vllm_config)
-        compile_config = _resolve_cached_rbln_config(vllm_config)
-        # 3. Use cached metadata when available, otherwise the resolved spec.
-        precompiled = compile_config is not None
-        if compile_config is None:
-            compile_config = spec["rbln_config"]
+        cached_model_path = _resolve_cached_model_path(vllm_config)
+        rbln_config = load_compiled_rbln_config(cached_model_path)
+        if rbln_config is not None:
+            logger.info("Found compiled model at %s", cached_model_path)
+        # 3. Use the cached rbln_config.json if found, or the compile spec otherwise.
+        precompiled = rbln_config is not None
+        if rbln_config is None:
+            rbln_config = spec["rbln_config"]
     else:
         precompiled = True
-    # 4. Apply runtime settings once from the selected configuration.
-    sync_runtime_config(vllm_config, compile_config, precompiled=precompiled)
+    # 4. Synchronize runtime settings once using the selected configuration.
+    sync_runtime_config(vllm_config, rbln_config, precompiled=precompiled)

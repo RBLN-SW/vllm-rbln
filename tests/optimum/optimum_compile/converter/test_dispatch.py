@@ -460,7 +460,15 @@ class TestGenerateModelPathName:
             "resolve_compiled_model_path",
             lambda model, cache: str(cache_path) if cache is not None else None,
         )
-        assert dispatch._resolve_cached_rbln_config(cfg) == metadata
+        with monkeypatch.context() as scoped:
+            scoped.setattr(
+                dispatch,
+                "load_compiled_rbln_config",
+                lambda path: pytest.fail(
+                    "path resolution must not read rbln_config.json"
+                ),
+            )
+            assert dispatch._resolve_cached_model_path(cfg) == str(cache_path)
         assert cfg.model_config.model == source_model
 
         synced = []
@@ -499,7 +507,7 @@ def test_initial_cache_hit_applies_runtime_settings_once(monkeypatch):
         "dtype": "float32",
         "num_devices": 2,
     }
-    monkeypatch.setattr(dispatch, "_resolve_cached_rbln_config", lambda cfg: metadata)
+    monkeypatch.setattr(dispatch, "load_compiled_rbln_config", lambda path: metadata)
     cfg = _vllm_config(
         mamba_block_size=8192,
         optimum_overrides={"device": [0], "create_runtimes": False},

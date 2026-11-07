@@ -54,12 +54,12 @@ def _keep_only_device_keys(obj: dict) -> dict:
 
 def sync_runtime_config(
     vllm_config: VllmConfig,
-    compile_config: dict,
+    rbln_config: dict,
     *,
     precompiled: bool,
 ) -> None:
     """Apply runtime settings once from the selected spec or compiled metadata."""
-    params = RBLNParams.from_rbln_config(vllm_config, compile_config)
+    params = RBLNParams.from_rbln_config(vllm_config, rbln_config)
     additional_config: OptimumRBLNConfig = vllm_config.additional_config
     assert params.batch_size is not None
     assert params.max_seq_len is not None
