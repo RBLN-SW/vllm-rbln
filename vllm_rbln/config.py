@@ -212,12 +212,11 @@ class OptimumRBLNConfig(RBLNConfigBase):
 
     # Written during runtime synchronization and carried to workers.
     attn_block_size: int | None = field(default=None, metadata=_DERIVED)
-    """`CompiledConstraints.kvcache_block_size`, when prefix caching splits the
-    KV-cache block size from `cache_config.block_size`."""
+    """The compiled KV-cache block size, retained when prefix caching uses
+    smaller blocks in `cache_config.block_size`."""
 
     image_prefill_chunk_size: list[int] | None = field(default=None, metadata=_DERIVED)
-    """`CompiledConstraints.image_prefill_chunk_size`, the image-prefill buckets
-    (gemma3/gemma4) the scheduler pads against."""
+    """Compiled image-prefill buckets (gemma3/gemma4) used for scheduler padding."""
 
     compile_spec: RBLNCompileSpec | None = field(default=None, metadata=_DERIVED)
     """Resolved model, dtype and optimum-rbln compile config shared by the cache

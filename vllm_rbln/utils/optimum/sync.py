@@ -26,7 +26,7 @@ from .artifacts import (
     resolve_compiled_model_path,
 )
 from .compile_spec import build_compile_spec
-from .compiled_constraints import CompiledConstraints, apply_compiled_constraints
+from .vllm_config_sync import sync_vllm_config
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -39,7 +39,7 @@ logger = init_logger(__name__)
 def sync_vllm_and_optimum(vllm_config: VllmConfig) -> None:
     """Prepare compile inputs, select model settings and apply them to vLLM.
 
-    Existing artifacts determine the compiled constraints. On a cache miss, the
+    Existing artifacts determine the vLLM config updates. On a cache miss, the
     resolved compile spec supplies them and is retained for model compilation.
     """
     additional_config: OptimumRBLNConfig = vllm_config.additional_config
@@ -67,8 +67,5 @@ def sync_vllm_and_optimum(vllm_config: VllmConfig) -> None:
         # 3. Use settings from the compile spec for a new compilation.
         selected_config = spec.rbln_config
         precompiled = False
-    # 4. Read and apply compiled constraints once from the selected configuration.
-    constraints = CompiledConstraints.from_rbln_config(
-        vllm_config.model_config.hf_config, selected_config
-    )
-    apply_compiled_constraints(vllm_config, constraints, precompiled=precompiled)
+    # 4. Apply the selected configuration to vLLM once.
+    sync_vllm_config(vllm_config, selected_config, precompiled=precompiled)

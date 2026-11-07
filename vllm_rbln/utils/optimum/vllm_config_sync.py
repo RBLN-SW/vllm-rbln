@@ -12,9 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Read compiled constraints from rbln_config and apply them to vLLM."""
+"""Derive vLLM config updates from rbln_config and apply them."""
 
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -22,7 +21,6 @@ import torch
 from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.logger import init_logger
 from vllm_rbln.utils.optimum.block_size import get_block_ratio, is_full_block_available
-from vllm_rbln.utils.optimum.compile_spec import keep_device_overrides
 from vllm_rbln.utils.optimum.rbln_config_fields import (
     RblnConfigLike,
     default_prefill_chunk_size,
@@ -46,124 +44,25 @@ else:
 logger = init_logger(__name__)
 
 
-@dataclass
-class CompiledConstraints:
-    """Values the compiled graph fixes and vLLM must follow.
-
-    Read from rbln_config.json on a cache hit, or from the compile spec that
-    is about to be compiled on a cache miss.
-    """
-
-    num_blocks: int | None = None
-    batch_size: int | None = None
-    max_seq_len: int | None = None
-    kvcache_block_size: int | None = None
-    prefill_chunk_size: int = 128
-    num_devices: int = 1
-    dtype: str | None = None
-    # Image-prefill buckets for multimodal models (gemma3: single value;
-    # gemma4: descending list of 128-multiples). None for non-multimodal models.
-    image_prefill_chunk_size: list[int] | None = None
-
-    @classmethod
-    def from_rbln_config(
-        cls, hf_config: Any, rbln_config: RblnConfigLike
-    ) -> "CompiledConstraints":
-        """Parse rbln_config according to the model architecture."""
-        if is_enc_dec_arch(hf_config):
-            constraints = cls._parse_enc_dec(rbln_config)
-        elif is_multi_modal(hf_config):
-            constraints = cls._parse_multimodal(rbln_config)
-        elif is_pooling_arch(hf_config):
-            constraints = cls._parse_pooling(rbln_config)
-        else:
-            constraints = cls._parse_decoder(rbln_config)
-
-        constraints.num_devices = resolve_num_devices(rbln_config)
-        constraints.dtype = get_field(rbln_config, "dtype")
-        return constraints
-
-    @classmethod
-    def _parse_enc_dec(cls, cfg: RblnConfigLike) -> "CompiledConstraints":
-        max_seq_len = get_field(cfg, "dec_max_seq_len")
-        batch_size = get_field(cfg, "batch_size")
-        num_blocks = get_field(cfg, "kvcache_num_blocks")
-        if num_blocks is None and batch_size is not None:
-            num_blocks = batch_size
-        return cls(
-            num_blocks=num_blocks,
-            batch_size=batch_size,
-            max_seq_len=max_seq_len,
-            kvcache_block_size=max_seq_len,
+def resolve_num_blocks(hf_config: Any, rbln_config: RblnConfigLike) -> int | None:
+    """Read the compiled block count, including architecture-specific defaults."""
+    if is_enc_dec_arch(hf_config) or is_pooling_arch(hf_config):
+        num_blocks = get_field(rbln_config, "kvcache_num_blocks")
+        return (
+            num_blocks
+            if num_blocks is not None
+            else get_field(rbln_config, "batch_size")
         )
-
-    @classmethod
-    def _parse_pooling(cls, cfg: RblnConfigLike) -> "CompiledConstraints":
-        max_seq_len = get_field(cfg, "max_seq_len")
-        batch_size = get_field(cfg, "batch_size")
-        # For pooling models each sequence occupies exactly one block.
-        num_blocks = get_field(cfg, "kvcache_num_blocks")
-        kvcache_block_size = resolve_kvcache_block_size(cfg, arch="pooling")
-        if kvcache_block_size is None and max_seq_len is not None:
-            kvcache_block_size = max_seq_len
-        if num_blocks is None and batch_size is not None:
-            num_blocks = batch_size
-        return cls(
-            num_blocks=num_blocks,
-            batch_size=batch_size,
-            max_seq_len=max_seq_len,
-            kvcache_block_size=kvcache_block_size,
-        )
-
-    @classmethod
-    def _parse_decoder(cls, cfg: RblnConfigLike) -> "CompiledConstraints":
-        kvcache_block_size = resolve_kvcache_block_size(cfg, arch="decoder")
-        default_chunk = default_prefill_chunk_size()
-        return cls(
-            num_blocks=get_field(cfg, "kvcache_num_blocks"),
-            batch_size=get_field(cfg, "batch_size"),
-            max_seq_len=get_field(cfg, "max_seq_len"),
-            kvcache_block_size=kvcache_block_size,
-            prefill_chunk_size=get_field(cfg, "prefill_chunk_size", default_chunk),
-        )
-
-    @classmethod
-    def _parse_multimodal(cls, cfg: RblnConfigLike) -> "CompiledConstraints":
-        sources = language_model_configs(cfg)
-        values: dict[str, Any] = {}
-        for source in sources:
-            for key in (
-                "batch_size",
-                "max_seq_len",
-                "kvcache_num_blocks",
-                "prefill_chunk_size",
-            ):
-                value = get_field(source, key)
-                if value is not None:
-                    values.setdefault(key, value)
-            block_size = resolve_kvcache_block_size(source, arch="multi-modal")
-            if block_size is not None:
-                values.setdefault("kvcache_block_size", block_size)
-            image_size = resolve_image_prefill_chunk_size(source)
-            if image_size is not None:
-                values.setdefault("image_prefill_chunk_size", image_size)
-        kvcache_block_size = values.get("kvcache_block_size")
-        batch_size = values.get("batch_size")
-        max_seq_len = values.get("max_seq_len")
-        num_blocks = values.get("kvcache_num_blocks")
-        prefill_chunk_size = values.get("prefill_chunk_size")
-        if prefill_chunk_size is None:
-            prefill_chunk_size = default_prefill_chunk_size()
-        image_prefill_chunk_size = values.get("image_prefill_chunk_size")
-
-        return cls(
-            num_blocks=num_blocks,
-            batch_size=batch_size,
-            max_seq_len=max_seq_len,
-            kvcache_block_size=kvcache_block_size,
-            prefill_chunk_size=prefill_chunk_size,
-            image_prefill_chunk_size=image_prefill_chunk_size,
-        )
+    sources = (
+        language_model_configs(rbln_config)
+        if is_multi_modal(hf_config)
+        else [rbln_config]
+    )
+    for source in sources:
+        num_blocks = get_field(source, "kvcache_num_blocks")
+        if num_blocks is not None:
+            return num_blocks
+    return None
 
 
 def _apply_prefix_caching_block_size(
@@ -260,7 +159,7 @@ def get_user_max_num_batched_tokens(vllm_config: VllmConfig) -> int | None:
 
 
 def update_max_num_batched_tokens(
-    vllm_config: VllmConfig, constraints: "CompiledConstraints"
+    vllm_config: VllmConfig, prefill_chunk_size: int
 ) -> None:
     """Set ``scheduler_config.max_num_batched_tokens`` from the RBLN config.
 
@@ -286,7 +185,7 @@ def update_max_num_batched_tokens(
         # prefill chunk size. It does not bound the decode batch — the
         # scheduler's per-step budget (max_num_scheduled_tokens) is decoupled
         # from max_num_batched_tokens — so it may be smaller than max_num_seqs.
-        target = constraints.prefill_chunk_size
+        target = prefill_chunk_size
 
     cur = vllm_config.scheduler_config.max_num_batched_tokens
     if cur != target:
@@ -315,7 +214,7 @@ def store_image_prefill_chunk_size(
 def validate_user_prefill_chunk_size(
     vllm_config: VllmConfig, prefill_chunk_size: int
 ) -> None:
-    """Require an explicit user chunk size to match the selected model constraints."""
+    """Require an explicit user chunk size to match the selected model config."""
     if not is_chunked_prefill_arch(vllm_config.model_config.hf_config):
         return
     user_chunk = get_user_max_num_batched_tokens(vllm_config)
@@ -328,67 +227,128 @@ def validate_user_prefill_chunk_size(
         )
 
 
-def apply_compiled_constraints(
+def keep_device_overrides(obj: dict) -> dict:
+    """Recursively keep only ``device`` entries from nested dict/list.
+
+    A precompiled model accepts only device placement as a load-time override.
+    """
+    result: dict[str, Any] = {}
+    for k, v in obj.items():
+        if k == "device":
+            result[k] = v
+        elif isinstance(v, dict):
+            filtered = keep_device_overrides(v)
+            if filtered:
+                result[k] = filtered
+    return result
+
+
+def sync_vllm_config(
     vllm_config: VllmConfig,
-    constraints: CompiledConstraints,
+    rbln_config: RblnConfigLike,
     *,
     precompiled: bool,
 ) -> None:
-    """Apply compiled constraints to the vLLM config."""
+    """Apply the selected optimum-rbln config directly to vllm_config."""
+    hf_config = vllm_config.model_config.hf_config
+    image_prefill_chunk_size = None
+    if is_enc_dec_arch(hf_config):
+        batch_size = get_field(rbln_config, "batch_size")
+        max_seq_len = get_field(rbln_config, "dec_max_seq_len")
+        kvcache_block_size = max_seq_len
+        prefill_chunk_size = 128
+    elif is_multi_modal(hf_config):
+        # Resolve each field independently: language_model, text_model, then root.
+        values: dict[str, Any] = {}
+        for source in language_model_configs(rbln_config):
+            for key in ("batch_size", "max_seq_len", "prefill_chunk_size"):
+                value = get_field(source, key)
+                if value is not None:
+                    values.setdefault(key, value)
+            block_size = resolve_kvcache_block_size(source, arch="multi-modal")
+            if block_size is not None:
+                values.setdefault("kvcache_block_size", block_size)
+            image_size = resolve_image_prefill_chunk_size(source)
+            if image_size is not None:
+                values.setdefault("image_prefill_chunk_size", image_size)
+        batch_size = values.get("batch_size")
+        max_seq_len = values.get("max_seq_len")
+        kvcache_block_size = values.get("kvcache_block_size")
+        chunk_size = values.get("prefill_chunk_size")
+        prefill_chunk_size = (
+            default_prefill_chunk_size() if chunk_size is None else chunk_size
+        )
+        image_prefill_chunk_size = values.get("image_prefill_chunk_size")
+    else:
+        batch_size = get_field(rbln_config, "batch_size")
+        max_seq_len = get_field(rbln_config, "max_seq_len")
+        if is_pooling_arch(hf_config):
+            kvcache_block_size = resolve_kvcache_block_size(rbln_config, arch="pooling")
+            if kvcache_block_size is None:
+                kvcache_block_size = max_seq_len
+            prefill_chunk_size = 128
+        else:
+            kvcache_block_size = resolve_kvcache_block_size(rbln_config, arch="decoder")
+            prefill_chunk_size = get_field(
+                rbln_config, "prefill_chunk_size", default_prefill_chunk_size()
+            )
+    num_blocks = resolve_num_blocks(hf_config, rbln_config)
+    num_devices = resolve_num_devices(rbln_config)
+    dtype = get_field(rbln_config, "dtype")
     additional_config: OptimumRBLNConfig = vllm_config.additional_config
-    assert constraints.batch_size is not None
-    assert constraints.max_seq_len is not None
+    assert batch_size is not None
+    assert max_seq_len is not None
     if precompiled:
-        assert constraints.num_blocks is not None, (
+        assert num_blocks is not None, (
             "num_blocks must be specified in rbln_config.json"
         )
         additional_config.optimum_overrides = keep_device_overrides(
             additional_config.optimum_overrides
         )
 
-    if not precompiled and constraints.kvcache_block_size is None:
-        constraints.kvcache_block_size = constraints.max_seq_len
-    assert constraints.kvcache_block_size is not None
+    if not precompiled and kvcache_block_size is None:
+        kvcache_block_size = max_seq_len
+    assert kvcache_block_size is not None
 
     # Set max_num_seqs in scheduler_config based on rbln_config.json
-    if vllm_config.scheduler_config.max_num_seqs != constraints.batch_size:
+    if vllm_config.scheduler_config.max_num_seqs != batch_size:
         logger.info(
             "Updating scheduler_config.max_num_seqs from %s to %s "
             "based on rbln_config.json",
             vllm_config.scheduler_config.max_num_seqs,
-            constraints.batch_size,
+            batch_size,
         )
-        vllm_config.scheduler_config.max_num_seqs = constraints.batch_size
+        vllm_config.scheduler_config.max_num_seqs = batch_size
 
     # Set max_model_len in model_config based on rbln_config.json
-    if vllm_config.model_config.max_model_len != constraints.max_seq_len:
+    if vllm_config.model_config.max_model_len != max_seq_len:
         logger.info(
             "Updating model_config.max_model_len "
             "from %s to %s "
             "based on rbln_config.json",
             vllm_config.model_config.max_model_len,
-            constraints.max_seq_len,
+            max_seq_len,
         )
-        vllm_config.model_config.max_model_len = constraints.max_seq_len
+        vllm_config.model_config.max_model_len = max_seq_len
 
-    validate_user_prefill_chunk_size(vllm_config, constraints.prefill_chunk_size)
+    validate_user_prefill_chunk_size(vllm_config, prefill_chunk_size)
     # Set max_num_batched_tokens: the prefill chunk size for decoder/multimodal
     # models, or a full-prefill-plus-batch budget for enc-dec/pooling models.
-    update_max_num_batched_tokens(vllm_config, constraints)
+    update_max_num_batched_tokens(vllm_config, prefill_chunk_size)
 
     # Persist the image-prefill buckets (gemma3/gemma4) into additional_config.
-    store_image_prefill_chunk_size(vllm_config, constraints.image_prefill_chunk_size)
+    store_image_prefill_chunk_size(vllm_config, image_prefill_chunk_size)
     # Set block_size in cache_config based on rbln_config.json.
     update_block_size(
         vllm_config,
-        constraints.kvcache_block_size,
-        constraints.prefill_chunk_size,
-        constraints.image_prefill_chunk_size,
+        kvcache_block_size,
+        prefill_chunk_size,
+        image_prefill_chunk_size,
     )
     # The compiled model is the source of truth for dtype: vLLM must feed
     # inputs in exactly the dtype the artefact was compiled with.
-    if precompiled and constraints.dtype is not None:
-        compiled_dtype = getattr(torch, constraints.dtype)
+    if precompiled and dtype is not None:
+        compiled_dtype = getattr(torch, dtype)
         if vllm_config.model_config.dtype != compiled_dtype:
             logger.info(
                 "Updating model_config.dtype from %s to %s based on rbln_config.json",
@@ -399,11 +359,11 @@ def apply_compiled_constraints(
 
     # Set num_blocks in cache_config based on rbln_config.json
     if precompiled:
-        update_mamba_block_size(vllm_config, constraints)
-        assert constraints.num_blocks is not None
-        update_num_blocks(vllm_config, constraints.num_blocks)
+        update_mamba_block_size(vllm_config, max_seq_len)
+        assert num_blocks is not None
+        update_num_blocks(vllm_config, num_blocks)
     # The compiled model fixes num_devices too.
-    additional_config.num_devices_per_local_rank = constraints.num_devices
+    additional_config.num_devices_per_local_rank = num_devices
 
 
 def update_num_blocks(vllm_config: VllmConfig, num_blocks: int) -> None:
@@ -440,9 +400,7 @@ def update_num_blocks(vllm_config: VllmConfig, num_blocks: int) -> None:
     additional_config.num_blocks_synced = True
 
 
-def update_mamba_block_size(
-    vllm_config: VllmConfig, constraints: "CompiledConstraints"
-) -> None:
+def update_mamba_block_size(vllm_config: VllmConfig, max_seq_len: int) -> None:
     cache_config = vllm_config.cache_config
     if (
         not cache_config.user_specified_mamba_block_size
@@ -453,4 +411,4 @@ def update_mamba_block_size(
             "prefix caching is disabled, but prefix caching is enabled. "
             "RBLN does not support prefix caching for mamba/hybrid models."
         )
-        cache_config.mamba_block_size = constraints.max_seq_len
+        cache_config.mamba_block_size = max_seq_len

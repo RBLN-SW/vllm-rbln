@@ -21,12 +21,12 @@ import torch
 from vllm.config import CacheConfig, ModelConfig, SchedulerConfig, VllmConfig
 
 from vllm_rbln.config import build_optimum_rbln_config
-from vllm_rbln.utils.optimum.compiled_constraints import (
-    CompiledConstraints,
-    apply_compiled_constraints,
+from vllm_rbln.utils.optimum.vllm_config_sync import (
     get_user_max_num_batched_tokens,
     is_chunked_prefill_arch,
+    resolve_num_blocks,
     store_image_prefill_chunk_size,
+    sync_vllm_config,
     update_max_num_batched_tokens,
     validate_user_prefill_chunk_size,
 )
@@ -61,8 +61,28 @@ def _vllm_config(
     )
 
 
-class TestParseDecoder:
-    def test_full_dict_config(self):
+@pytest.fixture
+def sync_config():
+    def apply(rbln_config, *, arch=DECODER_ARCH, precompiled=False):
+        cfg = _vllm_config(arch=arch)
+        cfg.model_config.dtype = torch.float32
+        cfg.cache_config = SimpleNamespace(
+            block_size=16384,
+            user_specified_block_size=False,
+            enable_prefix_caching=False,
+            num_gpu_blocks=None,
+            num_gpu_blocks_override=None,
+            user_specified_mamba_block_size=False,
+            mamba_block_size=None,
+        )
+        sync_vllm_config(cfg, rbln_config, precompiled=precompiled)
+        return cfg
+
+    return apply
+
+
+class TestSyncDecoder:
+    def test_full_dict_config(self, sync_config):
         cfg = {
             "kvcache_num_blocks": 16,
             "batch_size": 4,
@@ -70,45 +90,38 @@ class TestParseDecoder:
             "kvcache_block_size": 4096,
             "prefill_chunk_size": 256,
         }
-        params = CompiledConstraints._parse_decoder(cfg)
-        assert params.num_blocks == 16
-        assert params.batch_size == 4
-        assert params.max_seq_len == 8192
-        assert params.kvcache_block_size == 4096
-        assert params.prefill_chunk_size == 256
-        # num_devices is populated by the caller
-        # (`CompiledConstraints.from_rbln_config`), not `_parse_decoder`,
-        # so it is not asserted here.
+        synced = sync_config(cfg, arch=DECODER_ARCH)
+        assert resolve_num_blocks(synced.model_config.hf_config, cfg) == 16
+        assert synced.scheduler_config.max_num_seqs == 4
+        assert synced.model_config.max_model_len == 8192
+        assert synced.cache_config.block_size == 4096
+        assert synced.scheduler_config.max_num_batched_tokens == 256
 
-    def test_none_dict_config(self):
-        cfg: dict = {}
-        params = CompiledConstraints._parse_decoder(cfg)
-        assert params.num_blocks is None
-        assert params.batch_size is None
-        assert params.max_seq_len is None
-        assert params.prefill_chunk_size == 128
+    def test_missing_required_fields_are_rejected(self, sync_config):
+        with pytest.raises(AssertionError):
+            sync_config({})
 
-    def test_default_prefill_chunk_size(self):
+    def test_default_prefill_chunk_size(self, sync_config):
         cfg = {
             "kvcache_num_blocks": 16,
             "batch_size": 4,
             "max_seq_len": 8192,
             "kvcache_block_size": 4096,
         }
-        params = CompiledConstraints._parse_decoder(cfg)
-        assert params.prefill_chunk_size == 128
+        synced = sync_config(cfg, arch=DECODER_ARCH)
+        assert synced.scheduler_config.max_num_batched_tokens == 128
 
-    def test_kvcache_partition_len(self):
+    def test_kvcache_partition_len(self, sync_config):
         cfg = {
             "kvcache_num_blocks": 16,
             "batch_size": 4,
             "max_seq_len": 8192,
             "kvcache_partition_len": 4096,
         }
-        params = CompiledConstraints._parse_decoder(cfg)
-        assert params.kvcache_block_size == 4096
+        synced = sync_config(cfg, arch=DECODER_ARCH)
+        assert synced.cache_config.block_size == 4096
 
-    def test_error_duplicated_block_size(self):
+    def test_error_duplicated_block_size(self, sync_config):
         cfg = {
             "kvcache_num_blocks": 16,
             "batch_size": 4,
@@ -117,74 +130,79 @@ class TestParseDecoder:
             "kvcache_partition_len": 2048,
         }
         with pytest.raises(AssertionError, match="kvcache_partition_len"):
-            CompiledConstraints._parse_decoder(cfg)
+            sync_config(cfg, arch=DECODER_ARCH)
 
 
-class TestParseEncDec:
-    def test_kvcache_block_size_equals_dec_max_seq_len(self):
+class TestSyncEncDec:
+    def test_kvcache_block_size_equals_dec_max_seq_len(self, sync_config):
         cfg = {
             "kvcache_num_blocks": 4,
             "batch_size": 1,
             "dec_max_seq_len": 448,
         }
-        params = CompiledConstraints._parse_enc_dec(cfg)
-        assert params.num_blocks == 4
-        assert params.batch_size == 1
-        assert params.max_seq_len == 448
-        assert params.kvcache_block_size == 448
+        synced = sync_config(cfg, arch=ENC_DEC_ARCH)
+        assert resolve_num_blocks(synced.model_config.hf_config, cfg) == 4
+        assert synced.scheduler_config.max_num_seqs == 1
+        assert synced.model_config.max_model_len == 448
+        assert synced.cache_config.block_size == 448
 
 
-class TestParsePooling:
-    def test_reads_partition_size_from_compile_spec(self):
-        params = CompiledConstraints._parse_pooling(
-            {"max_seq_len": 8192, "batch_size": 4, "kvcache_partition_len": 1024}
+class TestSyncPooling:
+    def test_reads_partition_size_from_compile_spec(self, sync_config):
+        synced = sync_config(
+            {"max_seq_len": 8192, "batch_size": 4, "kvcache_partition_len": 1024},
+            arch=POOLING_ARCH,
         )
-        assert params.kvcache_block_size == 1024
+        assert synced.cache_config.block_size == 1024
 
-    def test_uses_explicit_kvcache_num_blocks(self):
+    def test_uses_explicit_kvcache_num_blocks(self, sync_config):
         cfg = {
             "max_seq_len": 512,
             "batch_size": 8,
             "kvcache_num_blocks": 16,
         }
-        params = CompiledConstraints._parse_pooling(cfg)
-        assert params.num_blocks == 16
-        assert params.batch_size == 8
-        assert params.max_seq_len == 512
-        assert params.kvcache_block_size == 512
+        synced = sync_config(cfg, arch=POOLING_ARCH)
+        assert resolve_num_blocks(synced.model_config.hf_config, cfg) == 16
+        assert synced.scheduler_config.max_num_seqs == 8
+        assert synced.model_config.max_model_len == 512
+        assert synced.cache_config.block_size == 512
 
-    def test_falls_back_num_blocks_to_batch_size(self):
+    def test_falls_back_num_blocks_to_batch_size(self, sync_config):
         cfg = {"max_seq_len": 512, "batch_size": 8}
-        params = CompiledConstraints._parse_pooling(cfg)
-        assert params.num_blocks == 8
+        synced = sync_config(cfg, arch=POOLING_ARCH)
+        assert resolve_num_blocks(synced.model_config.hf_config, cfg) == 8
 
-    def test_kvcache_block_size_equals_max_seq_len(self):
+    def test_kvcache_block_size_equals_max_seq_len(self, sync_config):
         cfg = {"max_seq_len": 512, "batch_size": 8}
-        params = CompiledConstraints._parse_pooling(cfg)
-        assert params.kvcache_block_size == 512
+        synced = sync_config(cfg, arch=POOLING_ARCH)
+        assert synced.cache_config.block_size == 512
 
 
-class TestParseMultimodal:
-    def test_reads_submodule_lengths_with_a_top_level_block_size(self):
-        params = CompiledConstraints._parse_multimodal(
+class TestSyncMultimodal:
+    def test_reads_submodule_lengths_with_a_top_level_block_size(self, sync_config):
+        synced = sync_config(
             {
                 "kvcache_block_size": 8192,
                 "language_model": {"batch_size": 4, "max_seq_len": 8192},
-            }
+            },
+            arch="PaliGemmaForConditionalGeneration",
         )
-        assert params.batch_size == 4
-        assert params.max_seq_len == 8192
-        assert params.kvcache_block_size == 8192
+        assert synced.scheduler_config.max_num_seqs == 4
+        assert synced.model_config.max_model_len == 8192
+        assert synced.cache_config.block_size == 8192
 
-    def test_reads_submodule_lengths_without_a_partition(self):
-        params = CompiledConstraints._parse_multimodal(
-            {"language_model": {"batch_size": 4, "max_seq_len": 8192}}
+    def test_reads_submodule_lengths_without_a_partition(self, sync_config):
+        synced = sync_config(
+            {"language_model": {"batch_size": 4, "max_seq_len": 8192}},
+            arch="PaliGemmaForConditionalGeneration",
         )
-        assert params.batch_size == 4
-        assert params.max_seq_len == 8192
+        assert synced.scheduler_config.max_num_seqs == 4
+        assert synced.model_config.max_model_len == 8192
 
     @pytest.mark.parametrize("as_object", [False, True])
-    def test_partial_submodules_resolve_each_field_by_precedence(self, as_object):
+    def test_partial_submodules_resolve_each_field_by_precedence(
+        self, as_object, sync_config
+    ):
         cfg: Any = {
             "batch_size": 1,
             "max_seq_len": 8192,
@@ -208,28 +226,28 @@ class TestParseMultimodal:
                     for key, value in cfg.items()
                 }
             )
-        params = CompiledConstraints._parse_multimodal(cfg)
-        assert params.batch_size == 2
-        assert params.max_seq_len == 4096
-        assert params.kvcache_block_size == 4096
-        assert params.num_blocks == 8
-        assert params.prefill_chunk_size == 256
-        assert params.image_prefill_chunk_size == [512, 256]
+        synced = sync_config(cfg, arch="PaliGemmaForConditionalGeneration")
+        assert synced.scheduler_config.max_num_seqs == 2
+        assert synced.model_config.max_model_len == 4096
+        assert synced.cache_config.block_size == 4096
+        assert resolve_num_blocks(synced.model_config.hf_config, cfg) == 8
+        assert synced.scheduler_config.max_num_batched_tokens == 256
+        assert synced.additional_config.image_prefill_chunk_size == [512, 256]
 
-    def test_top_level_fields_present(self):
+    def test_top_level_fields_present(self, sync_config):
         cfg = {
             "kvcache_num_blocks": 32,
             "batch_size": 1,
             "max_seq_len": 4096,
             "kvcache_block_size": 128,
         }
-        params = CompiledConstraints._parse_multimodal(cfg)
-        assert params.num_blocks == 32
-        assert params.batch_size == 1
-        assert params.max_seq_len == 4096
-        assert params.kvcache_block_size == 128
+        synced = sync_config(cfg, arch="PaliGemmaForConditionalGeneration")
+        assert resolve_num_blocks(synced.model_config.hf_config, cfg) == 32
+        assert synced.scheduler_config.max_num_seqs == 1
+        assert synced.model_config.max_model_len == 4096
+        assert synced.cache_config.block_size == 128
 
-    def test_uses_language_model_submodule(self):
+    def test_uses_language_model_submodule(self, sync_config):
         cfg = {
             "language_model": {
                 "kvcache_num_blocks": 16,
@@ -238,13 +256,13 @@ class TestParseMultimodal:
                 "kvcache_block_size": 64,
             },
         }
-        params = CompiledConstraints._parse_multimodal(cfg)
-        assert params.num_blocks == 16
-        assert params.batch_size == 2
-        assert params.max_seq_len == 2048
-        assert params.kvcache_block_size == 64
+        synced = sync_config(cfg, arch="PaliGemmaForConditionalGeneration")
+        assert resolve_num_blocks(synced.model_config.hf_config, cfg) == 16
+        assert synced.scheduler_config.max_num_seqs == 2
+        assert synced.model_config.max_model_len == 2048
+        assert synced.cache_config.block_size == 64
 
-    def test_uses_text_model_submodule(self):
+    def test_uses_text_model_submodule(self, sync_config):
         cfg = {
             "text_model": {
                 "kvcache_num_blocks": 8,
@@ -253,13 +271,13 @@ class TestParseMultimodal:
                 "kvcache_block_size": 32,
             },
         }
-        params = CompiledConstraints._parse_multimodal(cfg)
-        assert params.num_blocks == 8
-        assert params.batch_size == 1
-        assert params.max_seq_len == 1024
-        assert params.kvcache_block_size == 32
+        synced = sync_config(cfg, arch="PaliGemmaForConditionalGeneration")
+        assert resolve_num_blocks(synced.model_config.hf_config, cfg) == 8
+        assert synced.scheduler_config.max_num_seqs == 1
+        assert synced.model_config.max_model_len == 1024
+        assert synced.cache_config.block_size == 32
 
-    def test_submodule_resolves_partition_len(self):
+    def test_submodule_resolves_partition_len(self, sync_config):
         cfg = {
             "language_model": {
                 "kvcache_num_blocks": 16,
@@ -268,10 +286,10 @@ class TestParseMultimodal:
                 "kvcache_partition_len": 128,
             },
         }
-        params = CompiledConstraints._parse_multimodal(cfg)
-        assert params.kvcache_block_size == 128
+        synced = sync_config(cfg, arch="PaliGemmaForConditionalGeneration")
+        assert synced.cache_config.block_size == 128
 
-    def test_submodule_uses_submodule_batch_size(self):
+    def test_submodule_uses_submodule_batch_size(self, sync_config):
         cfg = {
             "batch_size": 1,
             "language_model": {
@@ -281,8 +299,8 @@ class TestParseMultimodal:
                 "kvcache_partition_len": 128,
             },
         }
-        params = CompiledConstraints._parse_multimodal(cfg)
-        assert params.batch_size == 2
+        synced = sync_config(cfg, arch="PaliGemmaForConditionalGeneration")
+        assert synced.scheduler_config.max_num_seqs == 2
 
 
 class TestImagePrefillChunkSize:
@@ -297,15 +315,17 @@ class TestImagePrefillChunkSize:
             },
         }
 
-    def test_gemma3_int_normalized_to_list(self):
-        params = CompiledConstraints._parse_multimodal(self._cfg(256))
-        assert params.image_prefill_chunk_size == [256]
+    def test_gemma3_int_normalized_to_list(self, sync_config):
+        synced = sync_config(self._cfg(256), arch="PaliGemmaForConditionalGeneration")
+        assert synced.additional_config.image_prefill_chunk_size == [256]
 
-    def test_gemma4_list_passes_through(self):
-        params = CompiledConstraints._parse_multimodal(self._cfg([1152, 640, 384]))
-        assert params.image_prefill_chunk_size == [1152, 640, 384]
+    def test_gemma4_list_passes_through(self, sync_config):
+        synced = sync_config(
+            self._cfg([1152, 640, 384]), arch="PaliGemmaForConditionalGeneration"
+        )
+        assert synced.additional_config.image_prefill_chunk_size == [1152, 640, 384]
 
-    def test_absent_is_none(self):
+    def test_absent_is_none(self, sync_config):
         cfg = {
             "language_model": {
                 "kvcache_num_blocks": 16,
@@ -314,31 +334,31 @@ class TestImagePrefillChunkSize:
                 "kvcache_partition_len": 128,
             },
         }
-        params = CompiledConstraints._parse_multimodal(cfg)
-        assert params.image_prefill_chunk_size is None
+        synced = sync_config(cfg, arch="PaliGemmaForConditionalGeneration")
+        assert synced.additional_config.image_prefill_chunk_size is None
 
-    def test_invalid_type_raises(self):
+    def test_invalid_type_raises(self, sync_config):
         with pytest.raises(TypeError):
-            CompiledConstraints._parse_multimodal(self._cfg("256"))
+            sync_config(self._cfg("256"), arch="PaliGemmaForConditionalGeneration")
 
-    def test_bool_rejected(self):
+    def test_bool_rejected(self, sync_config):
         with pytest.raises(TypeError):
-            CompiledConstraints._parse_multimodal(self._cfg(True))
+            sync_config(self._cfg(True), arch="PaliGemmaForConditionalGeneration")
 
 
-class TestFromRblnConfigDtype:
-    def _hf_config(self):
-        return SimpleNamespace(architectures=["LlamaForCausalLM"])
-
-    def test_reads_dtype(self):
-        cfg = {"batch_size": 4, "max_seq_len": 8192, "dtype": "bfloat16"}
-        params = CompiledConstraints.from_rbln_config(self._hf_config(), cfg)
-        assert params.dtype == "bfloat16"
-
-    def test_none_when_absent(self):
-        cfg = {"batch_size": 4, "max_seq_len": 8192}
-        params = CompiledConstraints.from_rbln_config(self._hf_config(), cfg)
-        assert params.dtype is None
+class TestCompiledDtype:
+    @pytest.mark.parametrize("dtype", ["bfloat16", None])
+    def test_applies_compiled_dtype_when_present(self, sync_config, dtype):
+        compiled: dict[str, Any] = {
+            "batch_size": 4,
+            "max_seq_len": 8192,
+            "kvcache_block_size": 8192,
+            "kvcache_num_blocks": 4,
+        }
+        if dtype is not None:
+            compiled["dtype"] = dtype
+        cfg = sync_config(compiled, precompiled=True)
+        assert cfg.model_config.dtype == (torch.bfloat16 if dtype else torch.float32)
 
 
 class TestIsChunkedPrefillArch:
@@ -376,22 +396,22 @@ class TestGetUserMaxNumBatchedTokens:
 class TestUpdateMaxNumBatchedTokens:
     def test_decoder_uses_prefill_chunk_size(self):
         cfg = _vllm_config(arch=DECODER_ARCH, max_num_seqs=4)
-        params = CompiledConstraints(prefill_chunk_size=256)
-        update_max_num_batched_tokens(cfg, params)
+        prefill_chunk_size = 256
+        update_max_num_batched_tokens(cfg, prefill_chunk_size)
         assert cfg.scheduler_config.max_num_batched_tokens == 256
 
     def test_decoder_chunk_smaller_than_batch_ok(self):
         # The scheduler's per-step budget is decoupled from max_num_batched_tokens,
         # so a prefill chunk smaller than max_num_seqs no longer throttles decode.
         cfg = _vllm_config(arch=DECODER_ARCH, max_num_seqs=512)
-        params = CompiledConstraints(prefill_chunk_size=128)
-        update_max_num_batched_tokens(cfg, params)
+        prefill_chunk_size = 128
+        update_max_num_batched_tokens(cfg, prefill_chunk_size)
         assert cfg.scheduler_config.max_num_batched_tokens == 128
 
     def test_pooling_uses_full_prefill_budget(self):
         cfg = _vllm_config(arch=POOLING_ARCH, max_model_len=8192, max_num_seqs=4)
-        params = CompiledConstraints(prefill_chunk_size=128)
-        update_max_num_batched_tokens(cfg, params)
+        prefill_chunk_size = 128
+        update_max_num_batched_tokens(cfg, prefill_chunk_size)
         # prefill_chunk_size is ignored; budget fits a full prefill.
         assert cfg.scheduler_config.max_num_batched_tokens == 8192
 
@@ -402,8 +422,8 @@ class TestUpdateMaxNumBatchedTokens:
             max_num_seqs=4,
             max_source_positions=1500,
         )
-        params = CompiledConstraints(prefill_chunk_size=128)
-        update_max_num_batched_tokens(cfg, params)
+        prefill_chunk_size = 128
+        update_max_num_batched_tokens(cfg, prefill_chunk_size)
         assert cfg.scheduler_config.max_num_batched_tokens == 1500
 
 
@@ -413,33 +433,33 @@ class TestValidateUserPrefillChunkSize:
             arch=POOLING_ARCH,
             additional_config={"user_max_num_batched_tokens": 512},
         )
-        params = CompiledConstraints(prefill_chunk_size=128)
-        validate_user_prefill_chunk_size(cfg, params.prefill_chunk_size)
-        assert params.prefill_chunk_size == 128
+        prefill_chunk_size = 128
+        validate_user_prefill_chunk_size(cfg, prefill_chunk_size)
+        assert prefill_chunk_size == 128
 
     def test_noop_when_user_unset(self):
         cfg = _vllm_config(arch=DECODER_ARCH, additional_config={})
-        params = CompiledConstraints(prefill_chunk_size=128)
-        validate_user_prefill_chunk_size(cfg, params.prefill_chunk_size)
-        assert params.prefill_chunk_size == 128
+        prefill_chunk_size = 128
+        validate_user_prefill_chunk_size(cfg, prefill_chunk_size)
+        assert prefill_chunk_size == 128
 
     def test_precompiled_conflict_raises(self):
         cfg = _vllm_config(
             arch=DECODER_ARCH,
             additional_config={"user_max_num_batched_tokens": 512},
         )
-        params = CompiledConstraints(prefill_chunk_size=128)
+        prefill_chunk_size = 128
         with pytest.raises(ValueError, match="conflicts with the compiled"):
-            validate_user_prefill_chunk_size(cfg, params.prefill_chunk_size)
+            validate_user_prefill_chunk_size(cfg, prefill_chunk_size)
 
     def test_precompiled_match_ok(self):
         cfg = _vllm_config(
             arch=DECODER_ARCH,
             additional_config={"user_max_num_batched_tokens": 128},
         )
-        params = CompiledConstraints(prefill_chunk_size=128)
-        validate_user_prefill_chunk_size(cfg, params.prefill_chunk_size)
-        assert params.prefill_chunk_size == 128
+        prefill_chunk_size = 128
+        validate_user_prefill_chunk_size(cfg, prefill_chunk_size)
+        assert prefill_chunk_size == 128
 
 
 class TestStoreImagePrefillChunkSize:
@@ -456,7 +476,7 @@ class TestStoreImagePrefillChunkSize:
 
 def _engine_config() -> VllmConfig:
     # Force the cache-miss branch so building the config does not look for a
-    # compiled artifact. The test calls apply_compiled_constraints itself.
+    # compiled artifact. The test calls sync_vllm_config itself.
     with patch(
         "vllm_rbln.utils.optimum.sync.load_compiled_rbln_config",
         return_value=None,
@@ -489,12 +509,6 @@ def test_compiled_num_devices_lands_in_the_config(monkeypatch):
         "prefill_chunk_size": 128,
         "num_devices": 2,
     }
-    apply_compiled_constraints(
-        vllm_config,
-        CompiledConstraints.from_rbln_config(
-            vllm_config.model_config.hf_config, compiled
-        ),
-        precompiled=True,
-    )
+    sync_vllm_config(vllm_config, compiled, precompiled=True)
 
     assert vllm_config.additional_config.num_devices_per_local_rank == 2

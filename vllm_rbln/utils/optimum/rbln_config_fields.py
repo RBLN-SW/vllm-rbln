@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Read optimum-rbln config fields shared by compile specs and compiled constraints.
+"""Read optimum-rbln config fields shared by compile specs and vLLM config updates.
 
 Each reader accepts either a ``rbln_config.json`` dict or an ``RBLNModelConfig``.
 """

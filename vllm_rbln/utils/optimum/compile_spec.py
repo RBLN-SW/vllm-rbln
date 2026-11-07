@@ -97,22 +97,6 @@ def compile_cache_name(spec: RBLNCompileSpec) -> str:
     return f"{sanitized_name}_{config_hash}"
 
 
-def keep_device_overrides(obj: dict) -> dict:
-    """Recursively keep only ``device`` entries from nested dict/list.
-
-    A precompiled model accepts only device placement as a load-time override.
-    """
-    result: dict[str, Any] = {}
-    for k, v in obj.items():
-        if k == "device":
-            result[k] = v
-        elif isinstance(v, dict):
-            filtered = keep_device_overrides(v)
-            if filtered:
-                result[k] = filtered
-    return result
-
-
 def _deep_merge(base: dict, overrides: dict) -> None:
     """Recursively merge ``overrides`` into ``base`` in place.
 
