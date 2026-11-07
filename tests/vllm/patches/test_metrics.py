@@ -195,6 +195,16 @@ class TestPassAccounting:
         assert ctx._e2e[wm.Phase.DECODE].call_count == 1
         assert ctx._graph[wm.Phase.DECODE].latencies == pytest.approx([1 * MS])
 
+    def test_host_op_time_is_recorded_only_for_passes_that_report_it(self, ctx, clock):
+        ctx.start_pass()
+        ctx.mark_phase(wm.Phase.DECODE)
+        ctx.add_graph_time(8 * MS)
+        ctx.add_host_op_time(2 * MS)
+        ctx.end_pass()
+        run_pass(ctx, clock, phase=wm.Phase.DECODE, model=8 * MS)
+        assert ctx._host_op[wm.Phase.DECODE].latencies == pytest.approx([2 * MS])
+        assert ctx._graph[wm.Phase.DECODE].call_count == 2
+
     def test_marks_outside_a_pass_are_ignored(self, ctx, clock):
         # Warm-up and dummy runs reach the same code with no pass open.
         ctx.mark_phase(wm.Phase.PREFILL)
@@ -231,6 +241,20 @@ class TestReporting:
             "E2E (PREFILL)",
             "E2E (DECODE)",
             "E2E (PADDED DECODE)",
+        ]
+
+    def test_host_op_section_sits_between_the_graph_and_e2e(
+        self, ctx, clock, monkeypatch
+    ):
+        ctx.start_pass()
+        ctx.mark_phase(wm.Phase.DECODE)
+        ctx.add_graph_time(8 * MS)
+        ctx.add_host_op_time(2 * MS)
+        ctx.end_pass()
+        assert self._labels(ctx, monkeypatch) == [
+            "MODEL + SAMPLE (DECODE)",
+            "HOST OP (DECODE)",
+            "E2E (DECODE)",
         ]
 
     def test_unseen_phase_is_omitted(self, ctx, clock, monkeypatch):
@@ -580,6 +604,28 @@ class TestModelExecutable:
         runner.model_executable(step=2)
         assert ctx._graph_latency is not None
         assert calls == [{"step": 1}, {"step": 2}]
+
+    @pytest.mark.parametrize("host_op_us, expected", [(1500, [1.5 * MS]), (None, [])])
+    def test_the_graph_runs_host_op_time_joins_the_pass(
+        self, monkeypatch, host_op_us, expected
+    ):
+        def fake_load_model(self, *args, **kwargs):
+            self.model_executable = lambda: "logits"
+
+        monkeypatch.setattr(pm, "_load_model", fake_load_model)
+        # None is what rebel returns while RBLN_RUNTIME_TIMER is off.
+        monkeypatch.setattr(
+            pm.rebel, "get_last_run_host_op_time_us", lambda: host_op_us, raising=False
+        )
+        runner = _Runner()
+        pm.load_model(runner)
+        ctx = wm.get_performance_context(runner)
+
+        ctx.start_pass()
+        ctx.mark_phase(wm.Phase.DECODE)
+        runner.model_executable()
+        ctx.end_pass()
+        assert ctx._host_op[wm.Phase.DECODE].latencies == pytest.approx(expected)
 
 
 class TestTimedRegion:
