@@ -84,6 +84,7 @@ def sync_config():
 class TestSyncDecoder:
     def test_full_dict_config(self, sync_config):
         cfg = {
+            "num_devices": 1,
             "kvcache_num_blocks": 16,
             "batch_size": 4,
             "max_seq_len": 8192,
@@ -103,6 +104,7 @@ class TestSyncDecoder:
 
     def test_kvcache_partition_len(self, sync_config):
         cfg = {
+            "num_devices": 1,
             "prefill_chunk_size": 128,
             "kvcache_num_blocks": 16,
             "batch_size": 4,
@@ -114,6 +116,7 @@ class TestSyncDecoder:
 
     def test_error_duplicated_block_size(self, sync_config):
         cfg = {
+            "num_devices": 1,
             "prefill_chunk_size": 128,
             "kvcache_num_blocks": 16,
             "batch_size": 4,
@@ -128,9 +131,11 @@ class TestSyncDecoder:
 class TestSyncEncDec:
     def test_kvcache_block_size_equals_dec_max_seq_len(self, sync_config):
         cfg = {
+            "num_devices": 1,
             "kvcache_num_blocks": 4,
             "batch_size": 1,
             "dec_max_seq_len": 448,
+            "kvcache_block_size": 448,
         }
         synced = sync_config(cfg, arch=ENC_DEC_ARCH)
         assert resolve_num_blocks(synced.model_config.hf_config, cfg) == 4
@@ -142,30 +147,37 @@ class TestSyncEncDec:
 class TestSyncPooling:
     def test_reads_partition_size_from_compile_spec(self, sync_config):
         synced = sync_config(
-            {"max_seq_len": 8192, "batch_size": 4, "kvcache_partition_len": 1024},
-            arch=POOLING_ARCH,
+            {
+                "num_devices": 1,
+                "max_seq_len": 8192,
+                "batch_size": 4,
+                "kvcache_partition_len": 1024,
+            },
+            arch="Qwen3Model",
         )
         assert synced.cache_config.block_size == 1024
 
     def test_uses_explicit_kvcache_num_blocks(self, sync_config):
         cfg = {
+            "num_devices": 1,
             "max_seq_len": 512,
             "batch_size": 8,
             "kvcache_num_blocks": 16,
+            "kvcache_block_size": 512,
         }
-        synced = sync_config(cfg, arch=POOLING_ARCH)
+        synced = sync_config(cfg, arch="Qwen3Model")
         assert resolve_num_blocks(synced.model_config.hf_config, cfg) == 16
         assert synced.scheduler_config.max_num_seqs == 8
         assert synced.model_config.max_model_len == 512
         assert synced.cache_config.block_size == 512
 
-    def test_falls_back_num_blocks_to_batch_size(self, sync_config):
-        cfg = {"max_seq_len": 512, "batch_size": 8}
+    def test_encoder_pooling_batch_maps_to_vllm_blocks(self, sync_config):
+        cfg = {"num_devices": 1, "max_seq_len": 512, "batch_size": 8}
         synced = sync_config(cfg, arch=POOLING_ARCH)
         assert resolve_num_blocks(synced.model_config.hf_config, cfg) == 8
 
     def test_kvcache_block_size_equals_max_seq_len(self, sync_config):
-        cfg = {"max_seq_len": 512, "batch_size": 8}
+        cfg = {"num_devices": 1, "max_seq_len": 512, "batch_size": 8}
         synced = sync_config(cfg, arch=POOLING_ARCH)
         assert synced.cache_config.block_size == 512
 
@@ -174,6 +186,7 @@ class TestSyncMultimodal:
     def test_reads_submodule_lengths_with_a_top_level_block_size(self, sync_config):
         synced = sync_config(
             {
+                "num_devices": 1,
                 "prefill_chunk_size": 128,
                 "kvcache_block_size": 8192,
                 "language_model": {"batch_size": 4, "max_seq_len": 8192},
@@ -187,8 +200,10 @@ class TestSyncMultimodal:
     def test_reads_submodule_lengths_without_a_partition(self, sync_config):
         synced = sync_config(
             {
+                "num_devices": 1,
                 "prefill_chunk_size": 128,
                 "language_model": {"batch_size": 4, "max_seq_len": 8192},
+                "kvcache_block_size": 8192,
             },
             arch="PaliGemmaForConditionalGeneration",
         )
@@ -200,6 +215,7 @@ class TestSyncMultimodal:
         self, as_object, sync_config
     ):
         cfg: Any = {
+            "num_devices": 1,
             "batch_size": 1,
             "max_seq_len": 8192,
             "kvcache_block_size": 8192,
@@ -232,6 +248,7 @@ class TestSyncMultimodal:
 
     def test_top_level_fields_present(self, sync_config):
         cfg = {
+            "num_devices": 1,
             "prefill_chunk_size": 128,
             "kvcache_num_blocks": 32,
             "batch_size": 1,
@@ -246,6 +263,7 @@ class TestSyncMultimodal:
 
     def test_uses_language_model_submodule(self, sync_config):
         cfg = {
+            "num_devices": 1,
             "prefill_chunk_size": 128,
             "language_model": {
                 "kvcache_num_blocks": 16,
@@ -262,6 +280,7 @@ class TestSyncMultimodal:
 
     def test_uses_text_model_submodule(self, sync_config):
         cfg = {
+            "num_devices": 1,
             "prefill_chunk_size": 128,
             "text_model": {
                 "kvcache_num_blocks": 8,
@@ -278,6 +297,7 @@ class TestSyncMultimodal:
 
     def test_submodule_resolves_partition_len(self, sync_config):
         cfg = {
+            "num_devices": 1,
             "prefill_chunk_size": 128,
             "language_model": {
                 "kvcache_num_blocks": 16,
@@ -291,6 +311,7 @@ class TestSyncMultimodal:
 
     def test_submodule_uses_submodule_batch_size(self, sync_config):
         cfg = {
+            "num_devices": 1,
             "prefill_chunk_size": 128,
             "batch_size": 1,
             "language_model": {
@@ -307,6 +328,7 @@ class TestSyncMultimodal:
 class TestImagePrefillChunkSize:
     def _cfg(self, value):
         return {
+            "num_devices": 1,
             "prefill_chunk_size": 128,
             "language_model": {
                 "kvcache_num_blocks": 16,
@@ -329,6 +351,7 @@ class TestImagePrefillChunkSize:
 
     def test_absent_is_none(self, sync_config):
         cfg = {
+            "num_devices": 1,
             "prefill_chunk_size": 128,
             "language_model": {
                 "kvcache_num_blocks": 16,
@@ -353,6 +376,7 @@ class TestCompiledDtype:
     @pytest.mark.parametrize("dtype", ["bfloat16", None])
     def test_applies_compiled_dtype_when_present(self, sync_config, dtype):
         compiled: dict[str, Any] = {
+            "num_devices": 1,
             "prefill_chunk_size": 128,
             "batch_size": 4,
             "max_seq_len": 8192,
@@ -525,6 +549,7 @@ def test_missing_prefill_chunk_size_is_rejected(
     sync_config, arch, precompiled, explicit_none
 ):
     selected: dict[str, Any] = {
+        "num_devices": 1,
         "batch_size": 4,
         "max_seq_len": 8192,
         "kvcache_block_size": 4096,
@@ -545,6 +570,7 @@ def test_sync_uses_selected_chunk_without_querying_the_npu(
         lambda: pytest.fail("sync must use the selected config's prefill chunk size"),
     )
     selected = {
+        "num_devices": 1,
         "batch_size": 4,
         "max_seq_len": 8192,
         "kvcache_block_size": 4096,
@@ -553,3 +579,63 @@ def test_sync_uses_selected_chunk_without_querying_the_npu(
     }
     cfg = sync_config(selected, arch=arch, precompiled=True)
     assert cfg.scheduler_config.max_num_batched_tokens == 256
+
+
+@pytest.mark.parametrize(
+    "arch",
+    [DECODER_ARCH, ENC_DEC_ARCH, "Qwen3Model", "PaliGemmaForConditionalGeneration"],
+)
+@pytest.mark.parametrize("missing", ["kvcache_block_size", "num_devices"])
+@pytest.mark.parametrize("precompiled", [False, True])
+def test_sync_requires_resolved_compile_values(sync_config, arch, missing, precompiled):
+    selected = {
+        "batch_size": 4,
+        "max_seq_len": 8192,
+        "dec_max_seq_len": 448,
+        "kvcache_block_size": 448 if arch == ENC_DEC_ARCH else 8192,
+        "prefill_chunk_size": 256,
+        "num_devices": 2,
+        "kvcache_num_blocks": 16,
+    }
+    del selected[missing]
+    with pytest.raises(ValueError, match=missing):
+        sync_config(selected, arch=arch, precompiled=precompiled)
+
+
+def test_whisper_block_count_is_read_without_a_batch_size_default():
+    hf_config = SimpleNamespace(architectures=[ENC_DEC_ARCH])
+    assert resolve_num_blocks(hf_config, {"batch_size": 4}) is None
+    assert (
+        resolve_num_blocks(hf_config, {"batch_size": 4, "kvcache_num_blocks": 8}) == 8
+    )
+
+
+@pytest.mark.parametrize("invalid", ["missing_devices", "prefill_conflict"])
+def test_selected_settings_are_validated_before_config_is_changed(invalid):
+    overrides = {"device": [0], "memory_budget": 0.5}
+    cfg = _vllm_config(
+        arch=DECODER_ARCH,
+        additional_config={
+            "optimum_overrides": overrides,
+            "user_max_num_batched_tokens": 512,
+        },
+    )
+    selected = {
+        "batch_size": 2,
+        "max_seq_len": 4096,
+        "kvcache_block_size": 4096,
+        "kvcache_num_blocks": 16,
+        "prefill_chunk_size": 512,
+        "num_devices": 2,
+    }
+    if invalid == "missing_devices":
+        del selected["num_devices"]
+        expected_error = "num_devices"
+    else:
+        selected["prefill_chunk_size"] = 256
+        expected_error = "conflicts with the compiled"
+    with pytest.raises(ValueError, match=expected_error):
+        sync_vllm_config(cfg, selected, precompiled=True)
+    assert cfg.scheduler_config.max_num_seqs == 4
+    assert cfg.model_config.max_model_len == 8192
+    assert cfg.additional_config.optimum_overrides == overrides

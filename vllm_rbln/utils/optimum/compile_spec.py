@@ -187,11 +187,13 @@ def build_compile_spec(vllm_config: VllmConfig) -> RBLNCompileSpec:
                 block_size = source_block_size
 
     # 3. Finalize compile dimensions using overrides, vLLM inputs and model rules.
-    batch_size = override_values.get(
-        "batch_size", vllm_config.scheduler_config.max_num_seqs
-    )
+    batch_size = override_values.get("batch_size")
+    if batch_size is None:
+        batch_size = vllm_config.scheduler_config.max_num_seqs
     length_key = "dec_max_seq_len" if encoder_decoder else "max_seq_len"
-    max_model_len = override_values.get(length_key, model_config.max_model_len)
+    max_model_len = override_values.get(length_key)
+    if max_model_len is None:
+        max_model_len = model_config.max_model_len
     if encoder_decoder or (pooling and block_size is None):
         block_size = override_values.get(length_key)
     if block_size is None:
@@ -216,9 +218,9 @@ def build_compile_spec(vllm_config: VllmConfig) -> RBLNCompileSpec:
             )
     assert block_size is not None
 
-    num_devices = resolve_num_devices(
-        optimum_overrides, default=additional_config.num_devices_per_local_rank
-    )
+    num_devices = resolve_num_devices(optimum_overrides)
+    if num_devices is None:
+        num_devices = additional_config.num_devices_per_local_rank
     memory_budget = cache_config.gpu_memory_utilization
     prefill_chunk_size = None
     if not (encoder_decoder or pooling):
@@ -328,6 +330,7 @@ def _for_decoder(
         "num_devices": num_devices,
         "batch_size": batch_size,
         "max_seq_len": max_model_len,
+        "kvcache_block_size": block_size,
         "memory_budget": memory_budget,
     }
     if block_size != max_model_len:
@@ -361,9 +364,11 @@ def _for_pooling(
     # FIXME: We need a more generalized logic to specify block sizes
     # as the number of supported models continues to grow.
     architectures = getattr(config, "architectures", [])
-    if architectures[0] == "Qwen3Model" and block_size != max_model_len:
-        rbln_config["kvcache_partition_len"] = block_size
-        rbln_config["attn_impl"] = "flash_attn"
+    if architectures[0] == "Qwen3Model":
+        rbln_config["kvcache_block_size"] = block_size
+        if block_size != max_model_len:
+            rbln_config["kvcache_partition_len"] = block_size
+            rbln_config["attn_impl"] = "flash_attn"
     return model_cls, rbln_config
 
 
@@ -397,6 +402,8 @@ def _for_multimodal(
         memory_budget,
         prefill_chunk_size,
     )
+    decoder_config = language_model_configs(rbln_config)[0]
+    decoder_config["kvcache_block_size"] = block_size
     return model_cls, rbln_config
 
 
@@ -425,4 +432,5 @@ def _for_enc_dec(
         "batch_size": batch_size,
         "token_timestamps": False,
         "dec_max_seq_len": max_model_len,
+        "kvcache_block_size": block_size,
     }

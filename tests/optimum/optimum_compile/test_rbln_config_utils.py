@@ -64,8 +64,8 @@ class TestResolveNumDevices:
     def test_top_level(self):
         assert resolve_num_devices({"num_devices": 4}) == 4
 
-    def test_defaults_to_one_when_absent(self):
-        assert resolve_num_devices({}) == 1
+    def test_returns_none_when_absent(self):
+        assert resolve_num_devices({}) is None
 
     def test_reads_from_language_model_submodule(self):
         cfg = {"language_model": {"num_devices": 8}}

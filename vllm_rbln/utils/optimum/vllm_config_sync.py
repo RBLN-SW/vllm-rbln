@@ -44,14 +44,10 @@ logger = init_logger(__name__)
 
 
 def resolve_num_blocks(hf_config: Any, rbln_config: RblnConfigLike) -> int | None:
-    """Read the compiled block count, including architecture-specific defaults."""
-    if is_enc_dec_arch(hf_config) or is_pooling_arch(hf_config):
-        num_blocks = get_field(rbln_config, "kvcache_num_blocks")
-        return (
-            num_blocks
-            if num_blocks is not None
-            else get_field(rbln_config, "batch_size")
-        )
+    """Read the compiled block count or map a pooling batch to vLLM blocks."""
+    if is_pooling_arch(hf_config) and hf_config.architectures[0] != "Qwen3Model":
+        # Encoder pooling graphs have no KV cache. vLLM uses one block per sequence.
+        return get_field(rbln_config, "batch_size")
     sources = (
         language_model_configs(rbln_config)
         if is_multi_modal(hf_config)
@@ -67,9 +63,6 @@ def resolve_num_blocks(hf_config: Any, rbln_config: RblnConfigLike) -> int | Non
 def _apply_prefix_caching_block_size(
     vllm_config: VllmConfig, kvcache_block_size: int, prefill_chunk_size: int
 ) -> None:
-    assert prefill_chunk_size is not None, (
-        "prefill_chunk_size must be specified in rbln_config.json"
-    )
     additional_config: OptimumRBLNConfig = vllm_config.additional_config
     sub_block_size = additional_config.sub_block_size
     if sub_block_size is None:
@@ -112,7 +105,7 @@ def _apply_prefix_caching_block_size(
 def update_block_size(
     vllm_config: VllmConfig,
     kvcache_block_size: int,
-    prefill_chunk_size: int,
+    prefill_chunk_size: int | None,
     image_prefill_chunk_size: list[int] | None = None,
 ) -> None:
     """
@@ -123,6 +116,9 @@ def update_block_size(
     """
     vllm_config.cache_config.user_specified_block_size = True
     if vllm_config.cache_config.enable_prefix_caching:
+        assert prefill_chunk_size is not None, (
+            "prefill_chunk_size is required for prefix caching"
+        )
         _apply_prefix_caching_block_size(
             vllm_config, kvcache_block_size, prefill_chunk_size
         )
@@ -158,7 +154,7 @@ def get_user_max_num_batched_tokens(vllm_config: VllmConfig) -> int | None:
 
 
 def update_max_num_batched_tokens(
-    vllm_config: VllmConfig, prefill_chunk_size: int
+    vllm_config: VllmConfig, prefill_chunk_size: int | None
 ) -> None:
     """Set ``scheduler_config.max_num_batched_tokens`` from the RBLN config.
 
@@ -184,6 +180,7 @@ def update_max_num_batched_tokens(
         # prefill chunk size. It does not bound the decode batch — the
         # scheduler's per-step budget (max_num_scheduled_tokens) is decoupled
         # from max_num_batched_tokens — so it may be smaller than max_num_seqs.
+        assert prefill_chunk_size is not None
         target = prefill_chunk_size
 
     cur = vllm_config.scheduler_config.max_num_batched_tokens
@@ -248,15 +245,16 @@ def sync_vllm_config(
     *,
     precompiled: bool,
 ) -> None:
-    """Apply the selected optimum-rbln config directly to vllm_config."""
+    """Read and validate the selected settings, then apply them to vllm_config."""
+    # 1. Read and validate rbln_config without changing vllm_config.
     hf_config = vllm_config.model_config.hf_config
     image_prefill_chunk_size = None
     prefill_chunk_size: int | None
     if is_enc_dec_arch(hf_config):
         batch_size = get_field(rbln_config, "batch_size")
         max_seq_len = get_field(rbln_config, "dec_max_seq_len")
-        kvcache_block_size = max_seq_len
-        prefill_chunk_size = 128
+        kvcache_block_size = resolve_kvcache_block_size(rbln_config)
+        prefill_chunk_size = None
     elif is_multi_modal(hf_config):
         # Resolve each field independently: language_model, text_model, then root.
         values: dict[str, Any] = {}
@@ -279,21 +277,23 @@ def sync_vllm_config(
     else:
         batch_size = get_field(rbln_config, "batch_size")
         max_seq_len = get_field(rbln_config, "max_seq_len")
-        if is_pooling_arch(hf_config):
-            kvcache_block_size = resolve_kvcache_block_size(rbln_config)
-            if kvcache_block_size is None:
-                kvcache_block_size = max_seq_len
-            prefill_chunk_size = 128
+        if is_pooling_arch(hf_config) and hf_config.architectures[0] != "Qwen3Model":
+            # The encoder's full sequence is one vLLM block, not a KV-cache block.
+            kvcache_block_size = max_seq_len
+            prefill_chunk_size = None
         else:
             kvcache_block_size = resolve_kvcache_block_size(rbln_config)
             prefill_chunk_size = get_field(rbln_config, "prefill_chunk_size")
     num_blocks = resolve_num_blocks(hf_config, rbln_config)
     num_devices = resolve_num_devices(rbln_config)
     dtype = get_field(rbln_config, "dtype")
-    additional_config: OptimumRBLNConfig = vllm_config.additional_config
+    compiled_dtype = (
+        getattr(torch, dtype) if precompiled and dtype is not None else None
+    )
+
     assert batch_size is not None
     assert max_seq_len is not None
-    if prefill_chunk_size is None:
+    if is_chunked_prefill_arch(hf_config) and prefill_chunk_size is None:
         raise ValueError(
             "prefill_chunk_size must be specified in the selected rbln_config."
         )
@@ -301,13 +301,25 @@ def sync_vllm_config(
         assert num_blocks is not None, (
             "num_blocks must be specified in rbln_config.json"
         )
+
+    if kvcache_block_size is None:
+        raise ValueError(
+            "kvcache_block_size or kvcache_partition_len must be specified "
+            "in the selected rbln_config."
+        )
+    if num_devices is None:
+        raise ValueError("num_devices must be specified in the selected rbln_config.")
+
+    if is_chunked_prefill_arch(hf_config):
+        assert prefill_chunk_size is not None
+        validate_user_prefill_chunk_size(vllm_config, prefill_chunk_size)
+
+    # 2. Apply the selected values and convert them to vLLM's execution units.
+    additional_config: OptimumRBLNConfig = vllm_config.additional_config
+    if precompiled:
         additional_config.optimum_overrides = keep_device_overrides(
             additional_config.optimum_overrides
         )
-
-    if not precompiled and kvcache_block_size is None:
-        kvcache_block_size = max_seq_len
-    assert kvcache_block_size is not None
 
     # Set max_num_seqs in scheduler_config based on rbln_config.json
     if vllm_config.scheduler_config.max_num_seqs != batch_size:
@@ -330,7 +342,6 @@ def sync_vllm_config(
         )
         vllm_config.model_config.max_model_len = max_seq_len
 
-    validate_user_prefill_chunk_size(vllm_config, prefill_chunk_size)
     # Set max_num_batched_tokens: the prefill chunk size for decoder/multimodal
     # models, or a full-prefill-plus-batch budget for enc-dec/pooling models.
     update_max_num_batched_tokens(vllm_config, prefill_chunk_size)
@@ -346,15 +357,13 @@ def sync_vllm_config(
     )
     # The compiled model is the source of truth for dtype: vLLM must feed
     # inputs in exactly the dtype the artefact was compiled with.
-    if precompiled and dtype is not None:
-        compiled_dtype = getattr(torch, dtype)
-        if vllm_config.model_config.dtype != compiled_dtype:
-            logger.info(
-                "Updating model_config.dtype from %s to %s based on rbln_config.json",
-                vllm_config.model_config.dtype,
-                compiled_dtype,
-            )
-            vllm_config.model_config.dtype = compiled_dtype
+    if compiled_dtype is not None and vllm_config.model_config.dtype != compiled_dtype:
+        logger.info(
+            "Updating model_config.dtype from %s to %s based on rbln_config.json",
+            vllm_config.model_config.dtype,
+            compiled_dtype,
+        )
+        vllm_config.model_config.dtype = compiled_dtype
 
     # Set num_blocks in cache_config based on rbln_config.json
     if precompiled:

@@ -71,7 +71,7 @@ def _num_devices_of(cfg: RblnConfigLike) -> int | None:
     return None
 
 
-def resolve_num_devices(cfg: RblnConfigLike, *, default: int = 1) -> int:
+def resolve_num_devices(cfg: RblnConfigLike) -> int | None:
     for submodule_name in ("language_model", "text_model"):
         sub_cfg = get_submodule(cfg, submodule_name)
         if sub_cfg is None:
@@ -79,7 +79,7 @@ def resolve_num_devices(cfg: RblnConfigLike, *, default: int = 1) -> int:
         sub_val = _num_devices_of(sub_cfg)
         if sub_val is not None:
             return sub_val
-    return _num_devices_of(cfg) or default
+    return _num_devices_of(cfg)
 
 
 def resolve_image_prefill_chunk_size(cfg: RblnConfigLike) -> list[int] | None:

@@ -337,3 +337,61 @@ def test_spec_resolves_chunk_before_considering_the_npu_default(
     decoder_config = spec.rbln_config.get("language_model", spec.rbln_config)
     assert decoder_config["prefill_chunk_size"] == expected_chunk
     assert len(calls) == default_calls
+
+
+@pytest.mark.parametrize(
+    "architecture, overrides, expected",
+    [
+        ("LlamaForCausalLM", {}, (1, 8192, 8192, 1)),
+        (
+            "LlamaForCausalLM",
+            {
+                "batch_size": 2,
+                "max_seq_len": 4096,
+                "kvcache_partition_len": 1024,
+                "num_devices": 2,
+            },
+            (2, 4096, 1024, 2),
+        ),
+        ("Qwen3Model", {}, (1, 8192, 8192, 1)),
+        (
+            "Gemma3ForConditionalGeneration",
+            {
+                "language_model": {
+                    "batch_size": 2,
+                    "max_seq_len": 4096,
+                    "kvcache_block_size": 1024,
+                    "device": [0, 1],
+                }
+            },
+            (2, 4096, 1024, 2),
+        ),
+        ("WhisperForConditionalGeneration", {}, (1, 8192, 8192, 1)),
+    ],
+)
+def test_spec_contains_resolved_compile_values(architecture, overrides, expected):
+    hf_config = PretrainedConfig(
+        architectures=[architecture], max_target_positions=8192
+    )
+    spec = build_compile_spec(_vllm_config(hf_config, optimum_overrides=overrides))
+    selected = spec.rbln_config.get("language_model", spec.rbln_config)
+    length_key = (
+        "dec_max_seq_len"
+        if architecture == "WhisperForConditionalGeneration"
+        else "max_seq_len"
+    )
+    assert (
+        selected["batch_size"],
+        selected[length_key],
+        selected["kvcache_block_size"],
+        selected["num_devices"],
+    ) == expected
+
+
+def test_whisper_rejects_a_block_size_that_conflicts_with_decoder_length():
+    hf_config = PretrainedConfig(
+        architectures=["WhisperForConditionalGeneration"], max_target_positions=8192
+    )
+    cfg = _vllm_config(hf_config, optimum_overrides={"kvcache_block_size": 4096})
+    with pytest.raises(ValueError, match="kvcache_block_size"):
+        build_compile_spec(cfg)
