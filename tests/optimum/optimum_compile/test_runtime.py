@@ -13,18 +13,24 @@
 # limitations under the License.
 
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
+import torch
+from vllm.config import CacheConfig, ModelConfig, SchedulerConfig, VllmConfig
 
 from vllm_rbln.config import build_optimum_rbln_config
-from vllm_rbln.utils.optimum.converter.common import (
+from vllm_rbln.utils.optimum.model_config import RuntimeSettings, read_runtime_settings
+from vllm_rbln.utils.optimum.runtime import (
+    apply_runtime_settings,
     get_user_max_num_batched_tokens,
     is_chunked_prefill_arch,
     store_image_prefill_chunk_size,
     update_max_num_batched_tokens,
     validate_user_prefill_chunk_size,
 )
-from vllm_rbln.utils.optimum.params import RuntimeSettings
+
+pytestmark = pytest.mark.usefixtures("set_npu_env_var")
 
 # Architectures picked from the RBLN registry model sets.
 DECODER_ARCH = "LlamaForCausalLM"
@@ -165,3 +171,47 @@ class TestStoreImagePrefillChunkSize:
         cfg = _vllm_config(arch=DECODER_ARCH, additional_config={})
         store_image_prefill_chunk_size(cfg, None)
         assert cfg.additional_config.image_prefill_chunk_size is None
+
+
+def _engine_config() -> VllmConfig:
+    # Force the cache-miss branch so building the config does not look for a
+    # compiled artifact. The test calls apply_runtime_settings itself.
+    with patch(
+        "vllm_rbln.utils.optimum.setup.load_compiled_rbln_config",
+        return_value=None,
+    ):
+        return VllmConfig(
+            model_config=ModelConfig(model="facebook/opt-125m", dtype=torch.float),
+            scheduler_config=SchedulerConfig(
+                max_num_seqs=10,
+                max_num_batched_tokens=128,
+                max_model_len=128,
+                is_encoder_decoder=False,
+            ),
+            cache_config=CacheConfig(block_size=16, cache_dtype="auto"),
+            additional_config={"optimum_overrides": {"prefill_chunk_size": 4}},
+        )
+
+
+def test_compiled_num_devices_lands_in_the_config(monkeypatch):
+    """The compiled model decides num_devices. It has to reach the config every
+    worker receives, not a module attribute of the front-end process."""
+    monkeypatch.setenv("VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK", "1")
+    vllm_config = _engine_config()
+    assert vllm_config.additional_config.num_devices_per_local_rank == 1
+
+    compiled = {
+        "kvcache_num_blocks": 16,
+        "batch_size": 4,
+        "max_seq_len": 128,
+        "kvcache_block_size": 128,
+        "prefill_chunk_size": 128,
+        "num_devices": 2,
+    }
+    apply_runtime_settings(
+        vllm_config,
+        read_runtime_settings(vllm_config, compiled),
+        precompiled=True,
+    )
+
+    assert vllm_config.additional_config.num_devices_per_local_rank == 2

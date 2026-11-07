@@ -41,7 +41,7 @@ def pin_npu_per_worker(monkeypatch):
 def skip_sync_vllm_and_optimum():
     # Use the compile spec without reading rbln_config.json from disk.
     with patch(
-        "vllm_rbln.utils.optimum.converter.dispatch.load_compiled_rbln_config",
+        "vllm_rbln.utils.optimum.setup.load_compiled_rbln_config",
         return_value=None,
     ):
         yield

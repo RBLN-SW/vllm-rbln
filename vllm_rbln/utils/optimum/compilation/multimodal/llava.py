@@ -13,10 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .common import get_language_model_config
+from .common import build_language_model_config
 
 
-def get_param_llava(
+def build_llava_config(
     batch_size: int,
     max_model_len: int,
     block_size: int,
@@ -24,9 +24,9 @@ def get_param_llava(
     memory_budget: float,
     prefill_chunk_size: int | None = None,
 ) -> dict:
-    param = {
+    rbln_config = {
         "vision_tower": {"output_hidden_states": True},
-        "language_model": get_language_model_config(
+        "language_model": build_language_model_config(
             batch_size,
             max_model_len,
             block_size,
@@ -35,7 +35,7 @@ def get_param_llava(
             prefill_chunk_size,
         ),
     }
-    return param
+    return rbln_config
 
 
-get_param_llava_next = get_param_llava
+build_llava_next_config = build_llava_config

@@ -18,15 +18,14 @@ from typing import Any
 
 import pytest
 
-from vllm_rbln.utils.optimum.compilation.multimodal.qwen import (
-    get_param_qwen3_5,
-)
-from vllm_rbln.utils.optimum.params import (
+from vllm_rbln.utils.optimum.model_config import (
     RuntimeSettings,
     _num_devices_of,
     _resolve_num_devices,
     read_runtime_settings,
 )
+
+pytestmark = pytest.mark.usefixtures("set_npu_env_var")
 
 
 class TestParseDecoder:
@@ -385,31 +384,3 @@ class TestFromRblnConfigDtype:
         cfg = {"batch_size": 4, "max_seq_len": 8192}
         params = read_runtime_settings(self._vllm_config(), cfg)
         assert params.dtype is None
-
-
-class TestGetParamQwen35:
-    """Qwen3.5 takes the same parameters as the other Qwen VLMs: a block_size below
-    max_model_len partitions the cache and selects flash attention, and a block_size
-    equal to it leaves optimum's default, eager."""
-
-    cfg = {
-        "batch_size": 1,
-        "num_devices": 1,
-        "memory_budget": 0.9,
-        "prefill_chunk_size": 128,
-    }
-
-    def test_valid_partition_sets_kvcache_partition_len(self):
-        param = get_param_qwen3_5(max_model_len=4096, block_size=1024, **self.cfg)
-        assert param["attn_impl"] == "flash_attn"
-        # block_size is actually carried into the compiled model.
-        assert param["kvcache_partition_len"] == 1024
-        assert param["max_seq_len"] == 4096
-
-    def test_block_size_equal_max_model_len_leaves_eager(self):
-        # One partition is not a partition: nothing is set, so optimum keeps its
-        # default and the whole cache is one block.
-        param = get_param_qwen3_5(max_model_len=4096, block_size=4096, **self.cfg)
-        assert "attn_impl" not in param
-        assert "kvcache_partition_len" not in param
-        assert param["max_seq_len"] == 4096

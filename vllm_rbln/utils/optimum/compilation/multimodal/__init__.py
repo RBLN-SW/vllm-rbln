@@ -15,36 +15,36 @@
 
 from collections.abc import Callable
 
-from .blip2 import get_param_blip2
-from .exaone4_5 import get_param_exaone4_5
-from .gemma3 import get_param_gemma3, get_param_gemma4
-from .idefics3 import get_param_idefics3
-from .llava import get_param_llava, get_param_llava_next
-from .paligemma import get_param_paligemma
+from .blip2 import build_blip2_config
+from .exaone4_5 import build_exaone4_5_config
+from .gemma3 import build_gemma3_config, build_gemma4_config
+from .idefics3 import build_idefics3_config
+from .llava import build_llava_config, build_llava_next_config
+from .paligemma import build_paligemma_config
 from .qwen import (
-    get_param_qwen2_5_vl,
-    get_param_qwen2_vl,
-    get_param_qwen3_5,
-    get_param_qwen3_asr,
-    get_param_qwen3_vl,
-    get_param_qwen3_vl_moe,
+    build_qwen2_5_vl_config,
+    build_qwen2_vl_config,
+    build_qwen3_5_config,
+    build_qwen3_asr_config,
+    build_qwen3_vl_config,
+    build_qwen3_vl_moe_config,
 )
 
-_COMPILE_MULTIMODAL_FNS: dict[
+_MULTIMODAL_CONFIG_BUILDERS: dict[
     str, Callable[[int, int, int, int, float, int | None], dict]
 ] = {
-    "blip2": get_param_blip2,
-    "exaone4_5": get_param_exaone4_5,
-    "idefics3": get_param_idefics3,
-    "llava": get_param_llava,
-    "llava_next": get_param_llava_next,
-    "paligemma": get_param_paligemma,
-    "gemma3": get_param_gemma3,
-    "gemma4": get_param_gemma4,
-    "qwen2_vl": get_param_qwen2_vl,
-    "qwen2_5_vl": get_param_qwen2_5_vl,
-    "qwen3_vl": get_param_qwen3_vl,
-    "qwen3_vl_moe": get_param_qwen3_vl_moe,
-    "qwen3_5": get_param_qwen3_5,
-    "qwen3_asr": get_param_qwen3_asr,
+    "blip2": build_blip2_config,
+    "exaone4_5": build_exaone4_5_config,
+    "idefics3": build_idefics3_config,
+    "llava": build_llava_config,
+    "llava_next": build_llava_next_config,
+    "paligemma": build_paligemma_config,
+    "gemma3": build_gemma3_config,
+    "gemma4": build_gemma4_config,
+    "qwen2_vl": build_qwen2_vl_config,
+    "qwen2_5_vl": build_qwen2_5_vl_config,
+    "qwen3_vl": build_qwen3_vl_config,
+    "qwen3_vl_moe": build_qwen3_vl_moe_config,
+    "qwen3_5": build_qwen3_5_config,
+    "qwen3_asr": build_qwen3_asr_config,
 }

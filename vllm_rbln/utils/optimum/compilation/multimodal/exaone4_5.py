@@ -14,7 +14,7 @@
 # limitations under the License.
 
 
-def get_param_exaone4_5(
+def build_exaone4_5_config(
     batch_size: int,
     max_model_len: int,
     block_size: int,
@@ -22,7 +22,7 @@ def get_param_exaone4_5(
     memory_budget: float,
     prefill_chunk_size: int | None = None,
 ) -> dict:
-    param: dict = {
+    rbln_config: dict = {
         "num_devices": num_devices,
         "max_seq_len": max_model_len,
         "batch_size": batch_size,
@@ -31,10 +31,10 @@ def get_param_exaone4_5(
     }
     if block_size != max_model_len:
         attn_impl = "flash_attn" if block_size != max_model_len else "eager"
-        param["kvcache_partition_len"] = block_size
-        param["attn_impl"] = attn_impl
+        rbln_config["kvcache_partition_len"] = block_size
+        rbln_config["attn_impl"] = attn_impl
     # Pin prefill_chunk_size so the compiled model stays in sync with the value
     # used for KV-cache block padding.
     if prefill_chunk_size is not None:
-        param["prefill_chunk_size"] = prefill_chunk_size
-    return param
+        rbln_config["prefill_chunk_size"] = prefill_chunk_size
+    return rbln_config

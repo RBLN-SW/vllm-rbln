@@ -12,19 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import TYPE_CHECKING
+"""Apply selected model settings to the vLLM runtime."""
+
+from typing import TYPE_CHECKING, Any
+
+import torch
 
 from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.logger import init_logger
-from vllm_rbln.utils.optimum.registry import (
-    is_enc_dec_arch,
-    is_pooling_arch,
-)
+from vllm_rbln.utils.optimum.block_size import get_block_ratio, is_full_block_available
+from vllm_rbln.utils.optimum.model_config import RuntimeSettings
+from vllm_rbln.utils.optimum.registry import is_enc_dec_arch, is_pooling_arch
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-
-    from vllm_rbln.utils.optimum.params import RuntimeSettings
 else:
     VllmConfig = None
 
@@ -191,3 +192,144 @@ def validate_user_prefill_chunk_size(
             "rbln_config.json. Omit max_num_batched_tokens or recompile the "
             "model with a matching prefill chunk size."
         )
+
+
+def _keep_only_device_keys(obj: dict) -> dict:
+    """Recursively keep only ``device`` entries from nested dict/list."""
+    result: dict[str, Any] = {}
+    for k, v in obj.items():
+        if k == "device":
+            result[k] = v
+        elif isinstance(v, dict):
+            filtered = _keep_only_device_keys(v)
+            if filtered:
+                result[k] = filtered
+    return result
+
+
+def apply_runtime_settings(
+    vllm_config: VllmConfig,
+    settings: RuntimeSettings,
+    *,
+    precompiled: bool,
+) -> None:
+    """Apply finalized common settings to the vLLM runtime."""
+    additional_config: OptimumRBLNConfig = vllm_config.additional_config
+    assert settings.batch_size is not None
+    assert settings.max_seq_len is not None
+    if precompiled:
+        assert settings.num_blocks is not None, (
+            "num_blocks must be specified in rbln_config.json"
+        )
+        additional_config.optimum_overrides = _keep_only_device_keys(
+            additional_config.optimum_overrides
+        )
+
+    if not precompiled and settings.kvcache_block_size is None:
+        settings.kvcache_block_size = settings.max_seq_len
+    assert settings.kvcache_block_size is not None
+
+    # Set max_num_seqs in scheduler_config based on rbln_config.json
+    if vllm_config.scheduler_config.max_num_seqs != settings.batch_size:
+        logger.info(
+            "Updating scheduler_config.max_num_seqs from %s to %s "
+            "based on rbln_config.json",
+            vllm_config.scheduler_config.max_num_seqs,
+            settings.batch_size,
+        )
+        vllm_config.scheduler_config.max_num_seqs = settings.batch_size
+
+    # Set max_model_len in model_config based on rbln_config.json
+    if vllm_config.model_config.max_model_len != settings.max_seq_len:
+        logger.info(
+            "Updating model_config.max_model_len "
+            "from %s to %s "
+            "based on rbln_config.json",
+            vllm_config.model_config.max_model_len,
+            settings.max_seq_len,
+        )
+        vllm_config.model_config.max_model_len = settings.max_seq_len
+
+    validate_user_prefill_chunk_size(vllm_config, settings.prefill_chunk_size)
+    # Set max_num_batched_tokens: the prefill chunk size for decoder/multimodal
+    # models, or a full-prefill-plus-batch budget for enc-dec/pooling models.
+    update_max_num_batched_tokens(vllm_config, settings)
+
+    # Persist the image-prefill buckets (gemma3/gemma4) into additional_config.
+    store_image_prefill_chunk_size(vllm_config, settings.image_prefill_chunk_size)
+    # Set block_size in cache_config based on rbln_config.json.
+    update_block_size(
+        vllm_config,
+        settings.kvcache_block_size,
+        settings.prefill_chunk_size,
+        settings.image_prefill_chunk_size,
+    )
+    # The compiled model is the source of truth for dtype: vLLM must feed
+    # inputs in exactly the dtype the artefact was compiled with.
+    if precompiled and settings.dtype is not None:
+        compiled_dtype = getattr(torch, settings.dtype)
+        if vllm_config.model_config.dtype != compiled_dtype:
+            logger.info(
+                "Updating model_config.dtype from %s to %s based on rbln_config.json",
+                vllm_config.model_config.dtype,
+                compiled_dtype,
+            )
+            vllm_config.model_config.dtype = compiled_dtype
+
+    # Set num_blocks in cache_config based on rbln_config.json
+    if precompiled:
+        update_mamba_block_size(vllm_config, settings)
+        assert settings.num_blocks is not None
+        update_num_blocks(vllm_config, settings.num_blocks)
+    # The compiled model fixes num_devices too.
+    additional_config.num_devices_per_local_rank = settings.num_devices
+
+
+def update_num_blocks(vllm_config: VllmConfig, num_blocks: int) -> None:
+    # This function is called twice during startup: once in the main process
+    # when we first read rbln_config.json, and once in each subprocess when
+    # the VllmConfig is deserialized. We only want to perform the num_blocks
+    # calculation and update once, in the main process, to avoid redundant
+    # calculations and potential inconsistencies. We use an additional_config
+    # flag to track whether we have already synced num_blocks.
+    additional_config: OptimumRBLNConfig = vllm_config.additional_config
+    if additional_config.num_blocks_synced:
+        logger.debug(
+            "num_blocks already synced to %s, skipping...",
+            vllm_config.cache_config.num_gpu_blocks,
+        )
+        return
+    # num_blocks is determined by rbln_config or overridden by user.
+    if vllm_config.cache_config.num_gpu_blocks_override is not None:
+        num_blocks = vllm_config.cache_config.num_gpu_blocks_override
+        # This is kept for optimum based num blocks
+        # not considering ob-ib logic for prefix caching
+        additional_config.num_blocks_override = num_blocks
+    blk_ratio = get_block_ratio(vllm_config)
+
+    if is_full_block_available(num_blocks, vllm_config):
+        adjusted_num_blocks = num_blocks * blk_ratio + 1
+    else:
+        adjusted_num_blocks = (num_blocks - 1) * blk_ratio + 1
+
+    vllm_config.cache_config.num_gpu_blocks = adjusted_num_blocks
+
+    if vllm_config.cache_config.num_gpu_blocks_override is not None:
+        vllm_config.cache_config.num_gpu_blocks_override = adjusted_num_blocks
+    additional_config.num_blocks_synced = True
+
+
+def update_mamba_block_size(
+    vllm_config: VllmConfig, settings: "RuntimeSettings"
+) -> None:
+    cache_config = vllm_config.cache_config
+    if (
+        not cache_config.user_specified_mamba_block_size
+        and cache_config.mamba_block_size is not None
+    ):
+        assert not cache_config.enable_prefix_caching, (
+            "mamba_block_size can only be synced to max_model_len while "
+            "prefix caching is disabled, but prefix caching is enabled. "
+            "RBLN does not support prefix caching for mamba/hybrid models."
+        )
+        cache_config.mamba_block_size = settings.max_seq_len

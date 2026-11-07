@@ -18,6 +18,8 @@ import pytest
 
 from vllm_rbln.utils.optimum.registry import _RBLN_SUPPORTED_MODELS
 
+pytestmark = pytest.mark.usefixtures("set_npu_env_var")
+
 
 @pytest.mark.parametrize(
     ("arch", "model_cls_name"),

@@ -12,11 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Helpers for reading and parsing rbln_config.json parameters."""
+"""Model configuration snapshots, runtime settings and shared field interpretation."""
 
-import json
 from dataclasses import dataclass
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Union
 
 if TYPE_CHECKING:
@@ -25,8 +23,6 @@ if TYPE_CHECKING:
 else:
     VllmConfig = None
 
-
-from vllm_rbln.utils.optimum.paths import RBLN_CONFIG_FILE
 
 # Either a plain dict (from rbln_config.json) or an RBLNModelConfig instance.
 RblnConfigLike = Union[dict, "RBLNModelConfig"]
@@ -53,15 +49,6 @@ def _language_model_configs(cfg: RblnConfigLike) -> list[RblnConfigLike]:
         for name in ("language_model", "text_model")
         if (sub_cfg := _cfg_get_submodule(cfg, name)) is not None
     ] + [cfg]
-
-
-def load_compiled_rbln_config(model_path: str) -> dict | None:
-    """Read metadata from an explicitly selected artifact directory."""
-    rbln_config_path = Path(model_path) / RBLN_CONFIG_FILE
-    if not rbln_config_path.is_file():
-        return None
-    with open(rbln_config_path, encoding="utf-8") as f:
-        return json.load(f)
 
 
 @dataclass

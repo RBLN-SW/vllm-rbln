@@ -43,13 +43,13 @@ from vllm_rbln.model_executor.models.optimum.qwen3_reranker import (
     RBLNQwen3RerankerPooler,
     resolve_label_token_ids,
 )
-from vllm_rbln.utils.optimum.converter.common import is_chunked_prefill_arch
 from vllm_rbln.utils.optimum.predicates import is_qwen3_embedding, is_qwen3_reranker
 from vllm_rbln.utils.optimum.registry import (
     get_rbln_model_info,
     is_generation_arch,
     is_pooling_arch,
 )
+from vllm_rbln.utils.optimum.runtime import is_chunked_prefill_arch
 
 MODEL_ID = "Qwen/Qwen3-Reranker-0.6B"
 # Exactly what examples/optimum/pooling_models/qwen3_reranker_score_offline.py passes.

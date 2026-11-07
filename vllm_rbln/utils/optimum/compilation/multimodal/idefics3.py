@@ -13,10 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .common import get_language_model_config
+from .common import build_language_model_config
 
 
-def get_param_idefics3(
+def build_idefics3_config(
     batch_size: int,
     max_model_len: int,
     block_size: int,
@@ -24,7 +24,7 @@ def get_param_idefics3(
     memory_budget: float,
     prefill_chunk_size: int | None = None,
 ) -> dict:
-    language_model_config = get_language_model_config(
+    language_model_config = build_language_model_config(
         batch_size,
         max_model_len,
         block_size,
