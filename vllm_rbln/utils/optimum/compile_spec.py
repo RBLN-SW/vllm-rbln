@@ -147,6 +147,8 @@ def build_compile_spec(vllm_config: VllmConfig) -> RBLNCompileSpec:
     """Resolve user inputs into an owned snapshot for cache lookup and compilation."""
     from vllm_rbln.platform import RblnPlatform
 
+    model_config = vllm_config.model_config
+    cache_config = vllm_config.cache_config
     additional_config = vllm_config.additional_config
     optimum_overrides = deepcopy(additional_config.optimum_overrides)
     if optimum_overrides.get("dtype") is not None:
@@ -157,7 +159,6 @@ def build_compile_spec(vllm_config: VllmConfig) -> RBLNCompileSpec:
             "(e.g. `LLM(dtype=...)` or `--dtype`)."
         )
     _set_submodule_num_devices(optimum_overrides)
-    model_config = vllm_config.model_config
     config = model_config.hf_config
     enc_dec = is_enc_dec_arch(config)
     pooling = is_pooling_arch(config)
@@ -187,36 +188,34 @@ def build_compile_spec(vllm_config: VllmConfig) -> RBLNCompileSpec:
     )
     length_key = "dec_max_seq_len" if enc_dec else "max_seq_len"
     max_model_len = compile_inputs.get(length_key, model_config.max_model_len)
-    if enc_dec or pooling and block_size is None:
+    if enc_dec or (pooling and block_size is None):
         block_size = compile_inputs.get(length_key)
     if block_size is None:
-        cache_config = vllm_config.cache_config
-        if not cache_config.user_specified_block_size:
-            if enc_dec or pooling:
-                block_size = max_model_len
-            else:
-                raise ValueError(
-                    "`block_size` is required to run optimum-rbln models "
-                    "in vLLM RBLN.\n"
-                    "Set it via one of:\n"
-                    "  1) vLLM's `block_size` argument "
-                    "(e.g. `LLM(block_size=...)` or `--block-size`), or\n"
-                    "  2) `kvcache_block_size` under "
-                    "`additional_config={'optimum_overrides': {...}}`.\n"
-                )
-        elif (
-            cache_config.enable_prefix_caching
-            and additional_config.attn_block_size is not None
-        ):
-            block_size = additional_config.attn_block_size
+        if cache_config.user_specified_block_size:
+            block_size = (
+                additional_config.attn_block_size
+                if cache_config.enable_prefix_caching
+                and additional_config.attn_block_size is not None
+                else cache_config.block_size
+            )
+        elif enc_dec or pooling:
+            block_size = max_model_len
         else:
-            block_size = cache_config.block_size
+            raise ValueError(
+                "`block_size` is required to run optimum-rbln models "
+                "in vLLM RBLN.\n"
+                "Set it via one of:\n"
+                "  1) vLLM's `block_size` argument "
+                "(e.g. `LLM(block_size=...)` or `--block-size`), or\n"
+                "  2) `kvcache_block_size` under "
+                "`additional_config={'optimum_overrides': {...}}`.\n"
+            )
     assert block_size is not None
 
     num_devices = resolve_num_devices(
         optimum_overrides, default=additional_config.num_devices_per_local_rank
     )
-    memory_budget = vllm_config.cache_config.gpu_memory_utilization
+    memory_budget = cache_config.gpu_memory_utilization
     prefill_chunk_size = None
     if not (enc_dec or pooling):
         default_chunk = default_prefill_chunk_size()
