@@ -36,7 +36,7 @@ def patch_upstream() -> None:
 
 def check_and_update(vllm_config: "VllmConfig") -> None:
     from vllm_rbln.config import build_optimum_rbln_config
-    from vllm_rbln.utils.optimum.config_sync import sync_vllm_and_optimum
+    from vllm_rbln.utils.optimum.configuration import sync_vllm_and_optimum
     from vllm_rbln.utils.optimum.predicates import (
         forces_fp32_dtype,
         is_qwen3_embedding,

@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any
 
 from vllm_rbln import envs
 from vllm_rbln.config import OptimumRBLNCompileInputs
-from vllm_rbln.utils.optimum.config_sync.inputs import (
+from vllm_rbln.utils.optimum.configuration.inputs import (
     default_prefill_chunk_size,
     find_override_conflicts,
     get_compile_num_devices,
@@ -32,10 +32,10 @@ from vllm_rbln.utils.optimum.config_sync.inputs import (
     set_submodule_num_devices,
     validate_prefill_chunk_override,
 )
-from vllm_rbln.utils.optimum.config_sync.multimodal import (
+from vllm_rbln.utils.optimum.configuration.multimodal import (
     MULTIMODAL_CONFIG_BUILDERS,
 )
-from vllm_rbln.utils.optimum.config_sync.readers import (
+from vllm_rbln.utils.optimum.configuration.readers import (
     get_field,
     language_model_configs,
     read_kvcache_block_size,

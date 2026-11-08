@@ -21,8 +21,8 @@ import torch
 from vllm.config import CacheConfig, ModelConfig, SchedulerConfig, VllmConfig
 
 from vllm_rbln.config import build_optimum_rbln_config
-from vllm_rbln.utils.optimum.config_sync.apply import apply_to_vllm_config
-from vllm_rbln.utils.optimum.config_sync.runtime import (
+from vllm_rbln.utils.optimum.configuration.apply import apply_to_vllm_config
+from vllm_rbln.utils.optimum.configuration.runtime import (
     get_runtime_num_blocks,
     get_user_max_num_batched_tokens,
     is_chunked_prefill_arch,
@@ -506,7 +506,7 @@ def _engine_config() -> VllmConfig:
     # Force the cache-miss branch so building the config does not look for a
     # compiled artifact. The test calls apply_to_vllm_config itself.
     with patch(
-        "vllm_rbln.utils.optimum.config_sync.sync.load_compiled_rbln_config",
+        "vllm_rbln.utils.optimum.configuration.sync.load_compiled_rbln_config",
         return_value=None,
     ):
         return VllmConfig(

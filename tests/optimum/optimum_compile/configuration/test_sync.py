@@ -21,9 +21,9 @@ import torch
 from transformers import LlamaConfig, PaliGemmaConfig, Qwen3Config, WhisperConfig
 
 from vllm_rbln.config import OptimumRBLNCompileInputs
-from vllm_rbln.utils.optimum.config_sync import sync
-from vllm_rbln.utils.optimum.config_sync.inputs import compile_cache_name
-from vllm_rbln.utils.optimum.config_sync.readers import (
+from vllm_rbln.utils.optimum.configuration import sync
+from vllm_rbln.utils.optimum.configuration.inputs import compile_cache_name
+from vllm_rbln.utils.optimum.configuration.readers import (
     load_compiled_rbln_config,
 )
 from vllm_rbln.utils.optimum.path import get_compile_cache_path
@@ -332,7 +332,7 @@ class TestSync:
 def test_initial_cache_hit_applies_vllm_config_updates_once(
     monkeypatch, vllm_config_factory
 ):
-    from vllm_rbln.utils.optimum.config_sync import apply as apply_module
+    from vllm_rbln.utils.optimum.configuration import apply as apply_module
 
     calls = []
     selected_configs = []
@@ -382,7 +382,7 @@ def test_builder_does_not_apply_vllm_config_updates(vllm_config_factory):
     cfg = vllm_config_factory()
     cfg.additional_config.compile_inputs = None
     cfg.additional_config.optimum_overrides = {"batch_size": 2, "max_seq_len": 4096}
-    from vllm_rbln.utils.optimum.config_sync.prepare import prepare_compile_inputs
+    from vllm_rbln.utils.optimum.configuration.prepare import prepare_compile_inputs
 
     inputs = prepare_compile_inputs(cfg)
     assert cfg.scheduler_config.max_num_seqs == 4

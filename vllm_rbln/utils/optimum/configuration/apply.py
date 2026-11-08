@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from vllm_rbln.logger import init_logger
-from vllm_rbln.utils.optimum.config_sync.readers import (
+from vllm_rbln.utils.optimum.configuration.readers import (
     RblnConfigLike,
     get_field,
     language_model_configs,
@@ -27,7 +27,7 @@ from vllm_rbln.utils.optimum.config_sync.readers import (
     read_kvcache_block_size,
     read_num_devices,
 )
-from vllm_rbln.utils.optimum.config_sync.runtime import (
+from vllm_rbln.utils.optimum.configuration.runtime import (
     get_runtime_num_blocks,
     is_chunked_prefill_arch,
     keep_device_overrides,

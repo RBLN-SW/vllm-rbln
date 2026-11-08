@@ -20,12 +20,12 @@ from optimum.rbln import RBLNAutoModelForCausalLM
 from transformers import GptOssConfig, LlamaConfig, PretrainedConfig, Qwen3Config
 
 from vllm_rbln.config import build_optimum_rbln_config
-from vllm_rbln.utils.optimum.config_sync import sync
-from vllm_rbln.utils.optimum.config_sync.inputs import compile_cache_name
-from vllm_rbln.utils.optimum.config_sync.multimodal.qwen import (
+from vllm_rbln.utils.optimum.configuration import sync
+from vllm_rbln.utils.optimum.configuration.inputs import compile_cache_name
+from vllm_rbln.utils.optimum.configuration.multimodal.qwen import (
     build_qwen3_5_config,
 )
-from vllm_rbln.utils.optimum.config_sync.prepare import prepare_compile_inputs
+from vllm_rbln.utils.optimum.configuration.prepare import prepare_compile_inputs
 
 
 @pytest.fixture(autouse=True)
@@ -328,7 +328,7 @@ class TestCompileCacheName:
 def test_compile_inputs_resolve_chunk_before_considering_the_npu_default(
     monkeypatch, architecture, overrides, user_chunk, expected_chunk, default_calls
 ):
-    from vllm_rbln.utils.optimum.config_sync import prepare as prepare_module
+    from vllm_rbln.utils.optimum.configuration import prepare as prepare_module
 
     calls = []
 
