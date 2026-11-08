@@ -23,10 +23,10 @@ from vllm_rbln.utils.optimum.path import (
     resolve_compiled_model_path,
 )
 
-from .compile_inputs import build_compile_inputs
-from .compile_inputs_utils import compile_cache_name
-from .rbln_config_utils import load_compiled_rbln_config
-from .vllm_config_sync import sync_vllm_config
+from .apply import apply_to_vllm_config
+from .inputs import compile_cache_name
+from .prepare import prepare_compile_inputs
+from .readers import load_compiled_rbln_config
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -55,7 +55,7 @@ def sync_vllm_and_optimum(vllm_config: VllmConfig) -> None:
     # 2. Prepare compile inputs and look up the corresponding cached model.
     if rbln_config is None:
         if additional_config.compile_inputs is None:
-            additional_config.compile_inputs = build_compile_inputs(vllm_config)
+            additional_config.compile_inputs = prepare_compile_inputs(vllm_config)
         compile_inputs = additional_config.compile_inputs
         artifact_path = get_compile_cache_path(
             compile_cache_name(compile_inputs), envs.VLLM_CACHE_ROOT
@@ -72,4 +72,4 @@ def sync_vllm_and_optimum(vllm_config: VllmConfig) -> None:
         selected_config = compile_inputs.rbln_config
         precompiled = False
     # 4. Apply the selected configuration to vLLM once.
-    sync_vllm_config(vllm_config, selected_config, precompiled=precompiled)
+    apply_to_vllm_config(vllm_config, selected_config, precompiled=precompiled)

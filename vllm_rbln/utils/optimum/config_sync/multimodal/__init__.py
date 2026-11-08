@@ -16,7 +16,7 @@
 from collections.abc import Callable
 
 from .blip2 import build_blip2_config
-from .exaone4_5 import build_exaone4_5_config
+from .exaone import build_exaone4_5_config
 from .gemma import build_gemma3_config, build_gemma4_config
 from .idefics3 import build_idefics3_config
 from .llava import build_llava_config, build_llava_next_config

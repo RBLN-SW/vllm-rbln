@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .language_model import build_language_model_config
+from .language import build_language_model_config
 
 
 def build_blip2_config(

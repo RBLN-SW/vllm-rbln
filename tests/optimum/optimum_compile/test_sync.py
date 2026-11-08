@@ -22,8 +22,8 @@ from transformers import LlamaConfig, PaliGemmaConfig, Qwen3Config, WhisperConfi
 
 from vllm_rbln.config import OptimumRBLNCompileInputs
 from vllm_rbln.utils.optimum.config_sync import sync
-from vllm_rbln.utils.optimum.config_sync.compile_inputs_utils import compile_cache_name
-from vllm_rbln.utils.optimum.config_sync.rbln_config_utils import (
+from vllm_rbln.utils.optimum.config_sync.inputs import compile_cache_name
+from vllm_rbln.utils.optimum.config_sync.readers import (
     load_compiled_rbln_config,
 )
 from vllm_rbln.utils.optimum.path import get_compile_cache_path
@@ -313,12 +313,12 @@ class TestSync:
         synced = []
         monkeypatch.setattr(
             sync,
-            "sync_vllm_config",
+            "apply_to_vllm_config",
             lambda cfg, data, **kw: synced.append(data),
         )
         monkeypatch.setattr(
             sync,
-            "build_compile_inputs",
+            "prepare_compile_inputs",
             lambda cfg: pytest.fail(
                 "cached metadata must bypass compile input parsing"
             ),
@@ -332,24 +332,24 @@ class TestSync:
 def test_initial_cache_hit_applies_vllm_config_updates_once(
     monkeypatch, vllm_config_factory
 ):
-    from vllm_rbln.utils.optimum.config_sync import vllm_config_sync
+    from vllm_rbln.utils.optimum.config_sync import apply as apply_module
 
     calls = []
     selected_configs = []
-    apply = sync.sync_vllm_config
+    apply = sync.apply_to_vllm_config
 
     def record_apply(cfg, data, **kwargs):
         selected_configs.append(data)
         return apply(cfg, data, **kwargs)
 
-    monkeypatch.setattr(sync, "sync_vllm_config", record_apply)
-    original = vllm_config_sync.update_block_size
+    monkeypatch.setattr(sync, "apply_to_vllm_config", record_apply)
+    original = apply_module.update_block_size
 
     def record(*args, **kwargs):
         calls.append(args)
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(vllm_config_sync, "update_block_size", record)
+    monkeypatch.setattr(apply_module, "update_block_size", record)
     metadata = {
         "batch_size": 2,
         "max_seq_len": 4096,
@@ -382,9 +382,9 @@ def test_builder_does_not_apply_vllm_config_updates(vllm_config_factory):
     cfg = vllm_config_factory()
     cfg.additional_config.compile_inputs = None
     cfg.additional_config.optimum_overrides = {"batch_size": 2, "max_seq_len": 4096}
-    from vllm_rbln.utils.optimum.config_sync.compile_inputs import build_compile_inputs
+    from vllm_rbln.utils.optimum.config_sync.prepare import prepare_compile_inputs
 
-    inputs = build_compile_inputs(cfg)
+    inputs = prepare_compile_inputs(cfg)
     assert cfg.scheduler_config.max_num_seqs == 4
     assert cfg.model_config.max_model_len == 8192
     assert cfg.scheduler_config.max_num_batched_tokens == 128
@@ -419,7 +419,7 @@ def test_vllm_config_is_synced_after_cache_lookup(
     events = []
     selected = []
     generate = sync.compile_cache_name
-    apply = sync.sync_vllm_config
+    apply = sync.apply_to_vllm_config
 
     def record_lookup(inputs):
         events.append("lookup")
@@ -431,7 +431,7 @@ def test_vllm_config_is_synced_after_cache_lookup(
         return apply(cfg, data, **kwargs)
 
     monkeypatch.setattr(sync, "compile_cache_name", record_lookup)
-    monkeypatch.setattr(sync, "sync_vllm_config", record_apply)
+    monkeypatch.setattr(sync, "apply_to_vllm_config", record_apply)
     cfg = vllm_config_factory(hf_config=hf_config)
     assert events == ["lookup", "apply"]
     assert selected[0] is cfg.additional_config.compile_inputs.rbln_config
@@ -475,14 +475,14 @@ def test_sync_stores_the_builder_inputs_without_repacking(
     monkeypatch, vllm_config_factory
 ):
     built_inputs = []
-    build = sync.build_compile_inputs
+    build = sync.prepare_compile_inputs
 
     def record(*args, **kwargs):
         inputs = build(*args, **kwargs)
         built_inputs.append(inputs)
         return inputs
 
-    monkeypatch.setattr(sync, "build_compile_inputs", record)
+    monkeypatch.setattr(sync, "prepare_compile_inputs", record)
     cfg = vllm_config_factory()
     assert len(built_inputs) == 1
     assert isinstance(cfg.additional_config.compile_inputs, OptimumRBLNCompileInputs)

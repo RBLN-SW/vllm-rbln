@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any
 
 from vllm_rbln import envs
 from vllm_rbln.config import OptimumRBLNCompileInputs
-from vllm_rbln.utils.optimum.config_sync.compile_inputs_utils import (
+from vllm_rbln.utils.optimum.config_sync.inputs import (
     default_prefill_chunk_size,
     find_override_conflicts,
     get_compile_num_devices,
@@ -32,10 +32,10 @@ from vllm_rbln.utils.optimum.config_sync.compile_inputs_utils import (
     set_submodule_num_devices,
     validate_prefill_chunk_override,
 )
-from vllm_rbln.utils.optimum.config_sync.multimodal_configs import (
+from vllm_rbln.utils.optimum.config_sync.multimodal import (
     MULTIMODAL_CONFIG_BUILDERS,
 )
-from vllm_rbln.utils.optimum.config_sync.rbln_config_utils import (
+from vllm_rbln.utils.optimum.config_sync.readers import (
     get_field,
     language_model_configs,
     read_kvcache_block_size,
@@ -54,7 +54,7 @@ else:
     VllmConfig = None
 
 
-def build_compile_inputs(vllm_config: VllmConfig) -> OptimumRBLNCompileInputs:
+def prepare_compile_inputs(vllm_config: VllmConfig) -> OptimumRBLNCompileInputs:
     """Resolve user settings into owned inputs for cache lookup and compilation."""
     from vllm_rbln.platform import RblnPlatform
 

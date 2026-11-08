@@ -21,7 +21,7 @@ import json
 from dataclasses import fields
 from typing import TYPE_CHECKING, Any
 
-from .rbln_config_utils import read_num_devices
+from .readers import read_num_devices
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig

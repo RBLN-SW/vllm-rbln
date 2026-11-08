@@ -29,7 +29,7 @@ from transformers import Gemma4Config, LlamaConfig, PretrainedConfig
 from vllm_rbln.config import OptimumRBLNCompileInputs, OptimumRBLNConfig
 from vllm_rbln.model_executor.models.optimum import model_base
 from vllm_rbln.model_executor.models.optimum.model_base import RBLNOptimumModelBase
-from vllm_rbln.utils.optimum.config_sync.rbln_config_utils import get_field
+from vllm_rbln.utils.optimum.config_sync.readers import get_field
 
 
 class ExternalConfig(PretrainedConfig):

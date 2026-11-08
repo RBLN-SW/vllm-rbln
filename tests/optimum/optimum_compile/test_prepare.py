@@ -21,11 +21,11 @@ from transformers import GptOssConfig, LlamaConfig, PretrainedConfig, Qwen3Confi
 
 from vllm_rbln.config import build_optimum_rbln_config
 from vllm_rbln.utils.optimum.config_sync import sync
-from vllm_rbln.utils.optimum.config_sync.compile_inputs import build_compile_inputs
-from vllm_rbln.utils.optimum.config_sync.compile_inputs_utils import compile_cache_name
-from vllm_rbln.utils.optimum.config_sync.multimodal_configs.qwen import (
+from vllm_rbln.utils.optimum.config_sync.inputs import compile_cache_name
+from vllm_rbln.utils.optimum.config_sync.multimodal.qwen import (
     build_qwen3_5_config,
 )
+from vllm_rbln.utils.optimum.config_sync.prepare import prepare_compile_inputs
 
 
 @pytest.fixture(autouse=True)
@@ -67,7 +67,7 @@ def _vllm_config(hf_config, *, optimum_overrides=None, user_chunk=None):
 def test_decoder_region_model_selection(monkeypatch, enabled, config_cls, architecture):
     monkeypatch.setenv("VLLM_RBLN_USE_NESTED_COMPILE_REGION", str(int(enabled)))
     config = config_cls(architectures=[architecture])
-    inputs = build_compile_inputs(_vllm_config(config))
+    inputs = prepare_compile_inputs(_vllm_config(config))
     assert inputs.model_cls == RBLNAutoModelForCausalLM.__name__
     assert inputs.rbln_config.get("nested_compile_region", False) is enabled
 
@@ -83,7 +83,7 @@ def test_decoder_region_model_selection(monkeypatch, enabled, config_cls, archit
 def test_multimodal_decoder_option(monkeypatch, architecture, key):
     monkeypatch.setenv("VLLM_RBLN_USE_NESTED_COMPILE_REGION", "1")
     config = PretrainedConfig(architectures=[architecture])
-    inputs = build_compile_inputs(_vllm_config(config))
+    inputs = prepare_compile_inputs(_vllm_config(config))
     decoder = inputs.rbln_config[key] if key else inputs.rbln_config
     assert decoder["nested_compile_region"] is True
     if key:
@@ -93,7 +93,7 @@ def test_multimodal_decoder_option(monkeypatch, architecture, key):
 def test_flag_conflicts_with_decoder_override(monkeypatch):
     monkeypatch.setenv("VLLM_RBLN_USE_NESTED_COMPILE_REGION", "1")
     with pytest.raises(ValueError, match="nested_compile_region"):
-        build_compile_inputs(
+        prepare_compile_inputs(
             _vllm_config(
                 Qwen3Config(architectures=["Qwen3ForCausalLM"]),
                 optimum_overrides={"nested_compile_region": False},
@@ -105,7 +105,7 @@ def test_paligemma_compile_config_uses_full_prompt_prefill():
     cfg = _vllm_config(
         PretrainedConfig(architectures=["PaliGemmaForConditionalGeneration"])
     )
-    inputs = build_compile_inputs(cfg)
+    inputs = prepare_compile_inputs(cfg)
     assert inputs.rbln_config["language_model"]["prefill_chunk_size"] == 8192
     assert cfg.additional_config.optimum_overrides == {}
 
@@ -116,7 +116,7 @@ def test_dtype_override_points_to_vllm_dtype():
         optimum_overrides={"dtype": "bfloat16"},
     )
     with pytest.raises(ValueError, match="`dtype` cannot be set"):
-        build_compile_inputs(cfg)
+        prepare_compile_inputs(cfg)
 
 
 def test_user_chunk_conflicting_with_override_is_rejected():
@@ -126,7 +126,7 @@ def test_user_chunk_conflicting_with_override_is_rejected():
         user_chunk=512,
     )
     with pytest.raises(ValueError, match="Conflicting prefill chunk size"):
-        build_compile_inputs(cfg)
+        prepare_compile_inputs(cfg)
 
 
 class TestQwen35ConfigBuilder:
@@ -328,7 +328,7 @@ class TestCompileCacheName:
 def test_compile_inputs_resolve_chunk_before_considering_the_npu_default(
     monkeypatch, architecture, overrides, user_chunk, expected_chunk, default_calls
 ):
-    from vllm_rbln.utils.optimum.config_sync import compile_inputs
+    from vllm_rbln.utils.optimum.config_sync import prepare as prepare_module
 
     calls = []
 
@@ -336,13 +336,13 @@ def test_compile_inputs_resolve_chunk_before_considering_the_npu_default(
         calls.append(True)
         return 256
 
-    monkeypatch.setattr(compile_inputs, "default_prefill_chunk_size", default_chunk)
+    monkeypatch.setattr(prepare_module, "default_prefill_chunk_size", default_chunk)
     cfg = _vllm_config(
         PretrainedConfig(architectures=[architecture]),
         optimum_overrides=overrides,
         user_chunk=user_chunk,
     )
-    inputs = build_compile_inputs(cfg)
+    inputs = prepare_compile_inputs(cfg)
     decoder_config = inputs.rbln_config.get("language_model", inputs.rbln_config)
     assert decoder_config["prefill_chunk_size"] == expected_chunk
     assert len(calls) == default_calls
@@ -382,7 +382,9 @@ def test_compile_inputs_contain_resolved_values(architecture, overrides, expecte
     hf_config = PretrainedConfig(
         architectures=[architecture], max_target_positions=8192
     )
-    inputs = build_compile_inputs(_vllm_config(hf_config, optimum_overrides=overrides))
+    inputs = prepare_compile_inputs(
+        _vllm_config(hf_config, optimum_overrides=overrides)
+    )
     selected = inputs.rbln_config.get("language_model", inputs.rbln_config)
     length_key = (
         "dec_max_seq_len"
@@ -403,4 +405,4 @@ def test_whisper_rejects_a_block_size_that_conflicts_with_decoder_length():
     )
     cfg = _vllm_config(hf_config, optimum_overrides={"kvcache_block_size": 4096})
     with pytest.raises(ValueError, match="kvcache_block_size"):
-        build_compile_inputs(cfg)
+        prepare_compile_inputs(cfg)

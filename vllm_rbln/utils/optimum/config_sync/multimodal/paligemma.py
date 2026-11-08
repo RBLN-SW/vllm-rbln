@@ -13,10 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .language_model import build_language_model_config
+from .language import build_language_model_config
 
 
-def build_llava_config(
+def build_paligemma_config(
     batch_size: int,
     max_model_len: int,
     block_size: int,
@@ -24,18 +24,13 @@ def build_llava_config(
     memory_budget: float,
     prefill_chunk_size: int | None = None,
 ) -> dict:
-    rbln_config = {
-        "vision_tower": {"output_hidden_states": True},
-        "language_model": build_language_model_config(
-            batch_size,
-            max_model_len,
-            block_size,
-            num_devices,
-            memory_budget,
-            prefill_chunk_size,
-        ),
-    }
+    language_model_config = build_language_model_config(
+        batch_size,
+        max_model_len,
+        block_size,
+        num_devices,
+        memory_budget,
+        prefill_chunk_size,
+    )
+    rbln_config = {"language_model": language_model_config}
     return rbln_config
-
-
-build_llava_next_config = build_llava_config
