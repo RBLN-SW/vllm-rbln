@@ -27,6 +27,7 @@ from vllm_rbln.utils.optimum.configuration.readers import (
 )
 from vllm_rbln.utils.optimum.registry import (
     is_enc_dec_arch,
+    is_encoder_pooling_arch,
     is_multi_modal,
     is_pooling_arch,
 )
@@ -41,7 +42,7 @@ logger = init_logger(__name__)
 
 def get_runtime_num_blocks(hf_config: Any, rbln_config: RblnConfigLike) -> int | None:
     """Read the compiled block count or map a pooling batch to vLLM blocks."""
-    if is_pooling_arch(hf_config) and hf_config.architectures[0] != "Qwen3Model":
+    if is_encoder_pooling_arch(hf_config):
         # Encoder pooling graphs have no KV cache. vLLM uses one block per sequence.
         return get_field(rbln_config, "batch_size")
     sources = (

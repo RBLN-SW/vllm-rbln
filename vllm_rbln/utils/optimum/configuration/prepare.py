@@ -36,12 +36,13 @@ from vllm_rbln.utils.optimum.configuration.multimodal import (
     MULTIMODAL_CONFIG_BUILDERS,
 )
 from vllm_rbln.utils.optimum.configuration.readers import (
-    get_field,
     language_model_configs,
     read_kvcache_block_size,
+    read_language_model_fields,
 )
 from vllm_rbln.utils.optimum.registry import (
     get_rbln_model_info,
+    is_decoder_pooling_arch,
     is_enc_dec_arch,
     is_generation_arch,
     is_multi_modal,
@@ -193,8 +194,7 @@ def _for_pooling(
     }
     # FIXME: We need a more generalized logic to specify block sizes
     # as the number of supported models continues to grow.
-    architectures = getattr(model_config.hf_config, "architectures", [])
-    if architectures[0] == "Qwen3Model":
+    if is_decoder_pooling_arch(model_config.hf_config):
         rbln_config["kvcache_block_size"] = block_size
         if block_size != max_model_len:
             rbln_config["kvcache_partition_len"] = block_size
@@ -212,17 +212,13 @@ def _for_multimodal(
     cache_config = vllm_config.cache_config
     additional_config = vllm_config.additional_config
 
-    # Resolve each field independently: language_model, text_model, then root.
-    override_values: dict[str, Any] = {}
-    for source in language_model_configs(optimum_overrides):
-        for key in ("batch_size", "max_seq_len", "prefill_chunk_size"):
-            value = get_field(source, key)
-            if value is not None:
-                override_values.setdefault(key, value)
-        # Validate both aliases even after a higher-priority size is selected.
-        source_block_size = read_kvcache_block_size(source)
-        if source_block_size is not None:
-            override_values.setdefault("kvcache_block_size", source_block_size)
+    override_values = read_language_model_fields(
+        optimum_overrides,
+        "batch_size",
+        "max_seq_len",
+        "prefill_chunk_size",
+        "kvcache_block_size",
+    )
 
     batch_size = override_values.get(
         "batch_size", vllm_config.scheduler_config.max_num_seqs

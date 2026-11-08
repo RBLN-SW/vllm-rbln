@@ -14,7 +14,7 @@
 
 """Read, validate and apply the selected model settings to vLLM."""
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -22,9 +22,8 @@ from vllm_rbln.logger import init_logger
 from vllm_rbln.utils.optimum.configuration.readers import (
     RblnConfigLike,
     get_field,
-    language_model_configs,
-    read_image_prefill_chunk_size,
     read_kvcache_block_size,
+    read_language_model_fields,
     read_num_devices,
 )
 from vllm_rbln.utils.optimum.configuration.runtime import (
@@ -40,8 +39,8 @@ from vllm_rbln.utils.optimum.configuration.runtime import (
 )
 from vllm_rbln.utils.optimum.registry import (
     is_enc_dec_arch,
+    is_encoder_pooling_arch,
     is_multi_modal,
-    is_pooling_arch,
 )
 
 if TYPE_CHECKING:
@@ -71,19 +70,14 @@ def apply_to_vllm_config(
         kvcache_block_size = read_kvcache_block_size(rbln_config)
         prefill_chunk_size = None
     elif is_multi_modal(hf_config):
-        # Resolve each field independently: language_model, text_model, then root.
-        values: dict[str, Any] = {}
-        for source in language_model_configs(rbln_config):
-            for key in ("batch_size", "max_seq_len", "prefill_chunk_size"):
-                value = get_field(source, key)
-                if value is not None:
-                    values.setdefault(key, value)
-            block_size = read_kvcache_block_size(source)
-            if block_size is not None:
-                values.setdefault("kvcache_block_size", block_size)
-            image_size = read_image_prefill_chunk_size(source)
-            if image_size is not None:
-                values.setdefault("image_prefill_chunk_size", image_size)
+        values = read_language_model_fields(
+            rbln_config,
+            "batch_size",
+            "max_seq_len",
+            "prefill_chunk_size",
+            "kvcache_block_size",
+            "image_prefill_chunk_size",
+        )
         batch_size = values.get("batch_size")
         max_seq_len = values.get("max_seq_len")
         kvcache_block_size = values.get("kvcache_block_size")
@@ -92,7 +86,7 @@ def apply_to_vllm_config(
     else:
         batch_size = get_field(rbln_config, "batch_size")
         max_seq_len = get_field(rbln_config, "max_seq_len")
-        if is_pooling_arch(hf_config) and hf_config.architectures[0] != "Qwen3Model":
+        if is_encoder_pooling_arch(hf_config):
             # The encoder's full sequence is one vLLM block, not a KV-cache block.
             kvcache_block_size = max_seq_len
             prefill_chunk_size = None

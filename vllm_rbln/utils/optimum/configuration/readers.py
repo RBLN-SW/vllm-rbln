@@ -135,3 +135,23 @@ def read_kvcache_block_size(cfg: RblnConfigLike) -> int | None:
         "Please check the values in rbln_config.json"
     )
     return kvcache_block_size
+
+
+def read_language_model_fields(cfg: RblnConfigLike, *keys: str) -> dict[str, Any]:
+    """Select each field in language_model, text_model, root order, skipping None.
+
+    Visit every source so lower-priority alias conflicts are still rejected.
+    """
+    values: dict[str, Any] = {}
+    for source in language_model_configs(cfg):
+        for key in keys:
+            value: Any
+            if key == "kvcache_block_size":
+                value = read_kvcache_block_size(source)
+            elif key == "image_prefill_chunk_size":
+                value = read_image_prefill_chunk_size(source)
+            else:
+                value = get_field(source, key)
+            if value is not None:
+                values.setdefault(key, value)
+    return values
