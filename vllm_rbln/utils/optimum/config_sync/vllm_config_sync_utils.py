@@ -18,7 +18,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.logger import init_logger
 from vllm_rbln.utils.optimum.block_size import get_block_ratio, is_full_block_available
 from vllm_rbln.utils.optimum.config_sync.rbln_config_utils import (
@@ -34,6 +33,8 @@ from vllm_rbln.utils.optimum.registry import (
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+
+    from vllm_rbln.config import OptimumRBLNConfig
 
 logger = init_logger(__name__)
 

@@ -19,10 +19,10 @@ compilation read, so the two cannot disagree.
 """
 
 from copy import deepcopy
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from vllm_rbln import envs
+from vllm_rbln.config import RBLNCompileSpec
 from vllm_rbln.utils.optimum.config_sync.compile_spec_utils import (
     default_prefill_chunk_size,
     find_override_conflicts,
@@ -53,19 +53,6 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 else:
     VllmConfig = None
-
-
-@dataclass
-class RBLNCompileSpec:
-    """Serializable snapshot shared by cache lookup, compilation and runtime."""
-
-    model: str
-    dtype: Any
-    model_cls: str
-    rbln_config: dict[str, Any]
-    # Keep third-party config dataclasses opaque to pydantic validation.
-    hf_config: Any
-    npu_name: str
 
 
 def build_compile_spec(vllm_config: VllmConfig) -> RBLNCompileSpec:

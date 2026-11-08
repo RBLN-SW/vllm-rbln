@@ -18,7 +18,6 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.logger import init_logger
 from vllm_rbln.utils.optimum.config_sync.rbln_config_utils import (
     RblnConfigLike,
@@ -47,6 +46,8 @@ from vllm_rbln.utils.optimum.registry import (
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+
+    from vllm_rbln.config import OptimumRBLNConfig
 else:
     VllmConfig = None
 

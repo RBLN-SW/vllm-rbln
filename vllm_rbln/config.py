@@ -36,14 +36,13 @@ exists, and the rest are bring-up knobs -- are not fields here.
 
 import argparse
 import os
-from dataclasses import field, fields
+from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
 
 from pydantic import Field
 from vllm.config.utils import config as vllm_config_dataclass
 
 from vllm_rbln.logger import init_logger
-from vllm_rbln.utils.optimum.config_sync.compile_spec import RBLNCompileSpec
 
 if TYPE_CHECKING:
     # `Field` here is pydantic's, which a field definition below calls.
@@ -185,6 +184,19 @@ class RBLNConfig(RBLNConfigBase):
             raise ValueError("encoder_token_budgets must all be > 0")
         if len(budgets) != len(set(budgets)):
             raise ValueError("encoder_token_budgets must be unique")
+
+
+@dataclass
+class RBLNCompileSpec:
+    """Serializable snapshot shared by cache lookup, compilation and runtime."""
+
+    model: str
+    dtype: Any
+    model_cls: str
+    rbln_config: dict[str, Any]
+    # Keep third-party config dataclasses opaque to pydantic validation.
+    hf_config: Any
+    npu_name: str
 
 
 @vllm_config_dataclass

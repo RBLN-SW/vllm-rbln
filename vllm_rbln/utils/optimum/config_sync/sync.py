@@ -17,7 +17,6 @@
 from typing import TYPE_CHECKING
 
 from vllm_rbln import envs
-from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.logger import init_logger
 from vllm_rbln.utils.optimum.path import (
     get_compile_cache_path,
@@ -31,6 +30,8 @@ from .vllm_config_sync import sync_vllm_config
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+
+    from vllm_rbln.config import OptimumRBLNConfig
 else:
     VllmConfig = None
 

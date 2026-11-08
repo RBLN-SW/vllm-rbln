@@ -17,13 +17,14 @@
 import math
 from typing import TYPE_CHECKING
 
+from vllm_rbln.logger import init_logger
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+
+    from vllm_rbln.config import OptimumRBLNConfig
 else:
     VllmConfig = None
-
-from vllm_rbln.config import OptimumRBLNConfig
-from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
 

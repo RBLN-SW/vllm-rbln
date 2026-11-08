@@ -26,7 +26,7 @@ from .rbln_config_utils import read_num_devices
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
-    from .compile_spec import RBLNCompileSpec
+    from vllm_rbln.config import RBLNCompileSpec
 
 
 # Keys that affect only loading the compiled model, not the compiled binary,

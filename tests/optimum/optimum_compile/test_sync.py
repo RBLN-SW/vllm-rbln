@@ -20,8 +20,8 @@ import pytest
 import torch
 from transformers import LlamaConfig, PaliGemmaConfig, Qwen3Config, WhisperConfig
 
+from vllm_rbln.config import RBLNCompileSpec
 from vllm_rbln.utils.optimum.config_sync import sync
-from vllm_rbln.utils.optimum.config_sync.compile_spec import RBLNCompileSpec
 from vllm_rbln.utils.optimum.config_sync.compile_spec_utils import compile_cache_name
 from vllm_rbln.utils.optimum.config_sync.rbln_config_utils import (
     load_compiled_rbln_config,

@@ -14,18 +14,6 @@
 
 """Synchronize vLLM and optimum-rbln configuration."""
 
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from vllm.config import VllmConfig
+from .sync import sync_vllm_and_optimum
 
 __all__ = ["sync_vllm_and_optimum"]
-
-
-def sync_vllm_and_optimum(vllm_config: "VllmConfig") -> None:
-    """Select the compile or artifact settings and apply them to vLLM."""
-    # config.py imports compile_spec before defining its configuration classes.
-    # Load the coordinator only when those classes are available.
-    from .sync import sync_vllm_and_optimum as sync_config
-
-    sync_config(vllm_config)
