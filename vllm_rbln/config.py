@@ -241,9 +241,11 @@ class OptimumRBLNConfig(RBLNConfigBase):
     Runtime synchronization must not mutate them.
     """
 
-    cached_model_path: str | None = field(default=None, metadata=_DERIVED)
-    """Where the compile cache holds, or will put, this model's artifact. Built
-    from the fields above, so it cannot key the cache it names."""
+    artifact_path: str | None = field(default=None, metadata=_DERIVED)
+    """Artifact selected for loading, or the destination for a new compilation."""
+
+    precompiled: bool = field(default=False, metadata=_DERIVED)
+    """Whether synchronization selected an existing artifact to load."""
 
     num_blocks_synced: bool = field(default=False, metadata=_DERIVED)
     """Set once num_gpu_blocks is derived from the compiled model, so the second

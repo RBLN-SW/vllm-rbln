@@ -27,10 +27,10 @@ def is_compiled_dir(path: str | None) -> bool:
 
 
 def resolve_compiled_model_path(
-    model_path: str, cached_model_path: str | None
+    model_path: str, artifact_path: str | None
 ) -> str | None:
     """Prefer an explicit compiled model directory over the generated cache."""
-    for path in (model_path, cached_model_path):
+    for path in (model_path, artifact_path):
         if is_compiled_dir(path):
             return path
     return None

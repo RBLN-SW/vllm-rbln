@@ -26,7 +26,10 @@ from vllm_rbln.utils.optimum.configuration.inputs import compile_cache_name
 from vllm_rbln.utils.optimum.configuration.readers import (
     load_compiled_rbln_config,
 )
-from vllm_rbln.utils.optimum.path import get_compile_cache_path
+from vllm_rbln.utils.optimum.path import (
+    get_compile_cache_path,
+    resolve_compiled_model_path,
+)
 
 pytestmark = pytest.mark.usefixtures("compile_environment")
 
@@ -86,7 +89,7 @@ class TestSync:
     ):
         hf_config = PaliGemmaConfig(architectures=["PaliGemmaForConditionalGeneration"])
         cfg = vllm_config_factory(hf_config=hf_config)
-        cache_path = Path(cfg.additional_config.cached_model_path)
+        cache_path = Path(cfg.additional_config.artifact_path)
         cache_path.mkdir(parents=True)
         metadata = cfg.additional_config.compile_inputs.rbln_config
         metadata = json.loads(json.dumps(metadata))
@@ -103,7 +106,8 @@ class TestSync:
             lambda model, cache: str(cache_path) if cache is not None else None,
         )
         cached = vllm_config_factory(hf_config=hf_config)
-        assert cached.additional_config.cached_model_path == str(cache_path)
+        assert cached.additional_config.artifact_path == str(cache_path)
+        assert cached.additional_config.precompiled
         assert (
             cached.scheduler_config.max_num_batched_tokens
             == cfg.scheduler_config.max_num_batched_tokens
@@ -182,10 +186,12 @@ class TestSync:
     def test_repeated_sync_preserves_the_compile_inputs(self, vllm_config_factory):
         cfg = vllm_config_factory()
         inputs = cfg.additional_config.compile_inputs
-        path = cfg.additional_config.cached_model_path
+        path = cfg.additional_config.artifact_path
+        cfg.additional_config.precompiled = True
         sync.sync_vllm_and_optimum(cfg)
         assert cfg.additional_config.compile_inputs is inputs
-        assert cfg.additional_config.cached_model_path == path
+        assert cfg.additional_config.artifact_path == path
+        assert not cfg.additional_config.precompiled
 
     @pytest.mark.parametrize(
         ("user_tokens", "overrides", "expected"),
@@ -279,22 +285,27 @@ class TestSync:
         assert cfg.additional_config.attn_block_size == 8192
         assert cfg.cache_config.block_size == 128
 
+    @pytest.mark.parametrize("location", ["model", "cache", "generated"])
     def test_cache_metadata_is_loaded_without_replacing_the_model_id(
-        self, monkeypatch, vllm_config_factory
+        self, monkeypatch, vllm_config_factory, location
     ):
         cfg = vllm_config_factory()
-        source_model = cfg.model_config.model
-        cache_path = Path(cfg.additional_config.cached_model_path)
+        cache_path = Path(cfg.additional_config.artifact_path)
         cache_path.mkdir(parents=True)
         metadata = {"prefill_chunk_size": 256}
         (cache_path / "rbln_config.json").write_text(json.dumps(metadata))
+        if location == "model":
+            cfg.model_config.model = str(cache_path)
+        if location != "cache":
+            cfg.additional_config.artifact_path = None
+        source_model = cfg.model_config.model
         monkeypatch.setattr(
             sync, "load_compiled_rbln_config", load_compiled_rbln_config
         )
         monkeypatch.setattr(
             sync,
             "resolve_compiled_model_path",
-            lambda model, cache: str(cache_path) if cache is not None else None,
+            resolve_compiled_model_path,
         )
         with monkeypatch.context() as scoped:
             scoped.setattr(
@@ -327,6 +338,8 @@ class TestSync:
         assert len(synced) == 1
         assert synced[0]["prefill_chunk_size"] == metadata["prefill_chunk_size"]
         assert cfg.model_config.model == source_model
+        assert cfg.additional_config.artifact_path == str(cache_path)
+        assert cfg.additional_config.precompiled
 
 
 def test_initial_cache_hit_applies_vllm_config_updates_once(
@@ -372,6 +385,8 @@ def test_initial_cache_hit_applies_vllm_config_updates_once(
     assert cfg.model_config.dtype == torch.float32
     assert cfg.additional_config.num_devices_per_local_rank == 2
     assert cfg.additional_config.optimum_overrides == {"device": [0]}
+    assert cfg.additional_config.artifact_path is not None
+    assert cfg.additional_config.precompiled
     assert cfg.cache_config.mamba_block_size == 4096
     assert cfg.cache_config.num_gpu_blocks == 3
     sync.sync_vllm_and_optimum(cfg)
@@ -439,19 +454,36 @@ def test_vllm_config_is_synced_after_cache_lookup(
     assert cfg.model_config.max_model_len == 8192
 
 
-def test_compile_inputs_survive_worker_serialization(vllm_config_factory):
+@pytest.mark.parametrize("precompiled", [False, True])
+def test_compile_inputs_survive_worker_serialization(
+    monkeypatch, vllm_config_factory, precompiled
+):
     import pickle
 
     cfg = vllm_config_factory(
         hf_config=PaliGemmaConfig(architectures=["PaliGemmaForConditionalGeneration"])
     )
-    original_path = cfg.additional_config.cached_model_path
+    if precompiled:
+        metadata = json.loads(
+            json.dumps(cfg.additional_config.compile_inputs.rbln_config)
+        )
+        metadata["language_model"]["kvcache_num_blocks"] = 4
+        monkeypatch.setattr(
+            sync,
+            "load_compiled_rbln_config",
+            lambda path: metadata,
+        )
+        sync.sync_vllm_and_optimum(cfg)
+    original_path = cfg.additional_config.artifact_path
     cfg.additional_config = pickle.loads(pickle.dumps(cfg.additional_config))
     inputs = cfg.additional_config.compile_inputs
     assert isinstance(inputs, OptimumRBLNCompileInputs)
     assert inputs.rbln_config["language_model"]["prefill_chunk_size"] == 8192
+    assert cfg.additional_config.artifact_path == original_path
+    assert cfg.additional_config.precompiled is precompiled
     sync.sync_vllm_and_optimum(cfg)
-    assert cfg.additional_config.cached_model_path == original_path
+    assert cfg.additional_config.artifact_path == original_path
+    assert cfg.additional_config.precompiled is precompiled
     assert cfg.scheduler_config.max_num_batched_tokens == 8192
 
 

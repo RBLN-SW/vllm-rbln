@@ -47,7 +47,7 @@ def sync_vllm_and_optimum(vllm_config: VllmConfig) -> None:
     additional_config: OptimumRBLNConfig = vllm_config.additional_config
     # 1. Load rbln_config.json from the model path or a known cache path.
     artifact_path = resolve_compiled_model_path(
-        vllm_config.model_config.model, additional_config.cached_model_path
+        vllm_config.model_config.model, additional_config.artifact_path
     )
     rbln_config = (
         load_compiled_rbln_config(artifact_path) if artifact_path is not None else None
@@ -60,7 +60,6 @@ def sync_vllm_and_optimum(vllm_config: VllmConfig) -> None:
         artifact_path = get_compile_cache_path(
             compile_cache_name(compile_inputs), envs.VLLM_CACHE_ROOT
         )
-        additional_config.cached_model_path = artifact_path
         rbln_config = load_compiled_rbln_config(artifact_path)
     if rbln_config is not None:
         # 3. Use settings from the compiled model's rbln_config.json.
@@ -73,3 +72,5 @@ def sync_vllm_and_optimum(vllm_config: VllmConfig) -> None:
         precompiled = False
     # 4. Apply the selected configuration to vLLM once.
     apply_to_vllm_config(vllm_config, selected_config, precompiled=precompiled)
+    additional_config.artifact_path = artifact_path
+    additional_config.precompiled = precompiled

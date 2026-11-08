@@ -57,11 +57,6 @@ def _init_model_with(
     monkeypatch.setattr(
         model_base, "get_rbln_model_info", lambda cfg: ("fake", "FakeRBLNModel")
     )
-    monkeypatch.setattr(
-        "vllm_rbln.utils.optimum.path.is_compiled_dir",
-        lambda path: precompiled and path == str(tmp_path),
-    )
-
     obj = RBLNOptimumModelBase.__new__(RBLNOptimumModelBase)
     obj.model_config = types.SimpleNamespace(
         hf_config=hf_config,
@@ -76,7 +71,8 @@ def _init_model_with(
         # What `check_and_update` leaves on the config, which is what
         # `init_model` reads its options off.
         additional_config=OptimumRBLNConfig(
-            cached_model_path=str(tmp_path),
+            artifact_path=str(tmp_path),
+            precompiled=precompiled,
             compile_inputs=OptimumRBLNCompileInputs(
                 model="compile-source",
                 dtype=torch.bfloat16,
@@ -195,7 +191,11 @@ def test_compilation_uses_the_inputs_that_were_hashed(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("precompiled", [False, True])
-def test_model_id_is_preserved_after_loading(monkeypatch, tmp_path, precompiled):
+def test_model_loading_preserves_the_sync_decision_and_source_id(
+    monkeypatch, tmp_path, precompiled
+):
+    if not precompiled:
+        (tmp_path / "rbln_config.json").write_text("{}")
     hf_config = ExternalConfig(architectures=["Qwen3ForCausalLM"], num_hidden_layers=2)
     passed = _init_model_with(monkeypatch, tmp_path, hf_config, precompiled=precompiled)
     assert passed["source_model"] == "repo"

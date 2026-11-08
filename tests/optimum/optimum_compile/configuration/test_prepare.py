@@ -284,7 +284,7 @@ class TestCompileCacheName:
     def test_key_survives_sync_and_model_path_replacement(self, vllm_config_factory):
         cfg = vllm_config_factory()
         original = compile_cache_name(cfg.additional_config.compile_inputs)
-        cfg.model_config.model = cfg.additional_config.cached_model_path
+        cfg.model_config.model = cfg.additional_config.artifact_path
         cfg.cache_config.block_size = 128
         cfg.scheduler_config.max_num_batched_tokens = 512
         cfg.additional_config.optimum_overrides = {}

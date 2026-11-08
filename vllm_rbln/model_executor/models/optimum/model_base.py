@@ -37,7 +37,6 @@ from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.logger import init_logger
 from vllm_rbln.utils.optimum.block_size import get_attn_block_size
 from vllm_rbln.utils.optimum.bucket import select_bucket_size
-from vllm_rbln.utils.optimum.path import resolve_compiled_model_path
 from vllm_rbln.utils.optimum.registry import get_rbln_model_info
 
 from .base import ModelInputForRBLN
@@ -182,13 +181,10 @@ class RBLNOptimumModelBase(nn.Module):
 
     def init_model(self) -> None:
         additional_config: OptimumRBLNConfig = self.vllm_config.additional_config
-        cached_model_path = additional_config.cached_model_path
+        artifact_path = additional_config.artifact_path
         optimum_overrides = additional_config.optimum_overrides
-        model_path = self.vllm_config.model_config.model
-        valid_path = resolve_compiled_model_path(model_path, cached_model_path)
 
-        if valid_path is not None:
-            # pre-compiled OR cache-hit
+        if additional_config.precompiled:
             _, model_cls_name = get_rbln_model_info(self.model_config.hf_config)
             model_cls = getattr(optimum.rbln, model_cls_name)
             ec_enabled_model = model_cls_name == "RBLNQwen3VLForConditionalGeneration"
@@ -197,7 +193,7 @@ class RBLNOptimumModelBase(nn.Module):
             if self._is_ec_producer_only():
                 if not ec_enabled_model:
                     raise ValueError("Disaggregation is not supported for this model.")
-                visual = model_cls.load_visual_encoder(valid_path)
+                visual = model_cls.load_visual_encoder(artifact_path)
                 model = _ProducerOptimumModelProxy(visual, visual.rbln_config)
             else:
                 # NOTE:
@@ -211,7 +207,7 @@ class RBLNOptimumModelBase(nn.Module):
                         )
                     optimum_overrides["_load_visual_runtime"] = False
                 model = model_cls.from_pretrained(
-                    valid_path,
+                    artifact_path,
                     rbln_config=optimum_overrides,
                 )
         else:
@@ -254,7 +250,7 @@ class RBLNOptimumModelBase(nn.Module):
                 dtype=compile_inputs.dtype,
                 **config_override,
             )
-            model.save_pretrained(cached_model_path)  # type: ignore[attr-defined]
+            model.save_pretrained(artifact_path)  # type: ignore[attr-defined]
 
         self.supports_transcription_only = (
             model_cls_name == "RBLNOptimumWhisperForConditionalGeneration"
