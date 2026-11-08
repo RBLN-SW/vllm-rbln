@@ -264,12 +264,12 @@ class TestCompileCacheName:
         monkeypatch.setenv("VLLM_RBLN_USE_NESTED_COMPILE_REGION", "1")
         assert (
             compile_cache_name(vllm_config_factory().additional_config.compile_inputs)
-            != default
+            == default
         )
         monkeypatch.setenv("VLLM_RBLN_USE_NESTED_COMPILE_REGION", "0")
         assert (
             compile_cache_name(vllm_config_factory().additional_config.compile_inputs)
-            == default
+            != default
         )
 
     def test_default_and_explicit_chunk_share_the_compiled_artifact(

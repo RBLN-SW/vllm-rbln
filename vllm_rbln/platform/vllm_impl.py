@@ -75,6 +75,15 @@ def _validate(vllm_config: "VllmConfig") -> None:
     if vllm_config.lora_config is not None:
         raise ValueError("LoRA is not supported on RBLN.")
 
+    if vllm_config.is_mm_encoder_only and (
+        parallel_config.data_parallel_size > 1
+        or parallel_config.pipeline_parallel_size > 1
+    ):
+        raise ValueError(
+            "An encoder-only instance supports neither data nor pipeline "
+            "parallelism on RBLN."
+        )
+
     if model_config.uses_mrope:
         # The RBLN RoPE override covers `RotaryEmbedding` and takes
         # `[batch, seq]` positions; `MRotaryEmbedding` is a sibling class with
@@ -134,12 +143,9 @@ def _validate(vllm_config: "VllmConfig") -> None:
                 f"--block-size {cache_config.block_size}."
             )
 
-    if rbln_config.compile_dtype:
-        from vllm_rbln.compilation import check_dtype_option_supported
-
-        check_dtype_option_supported()
-
-    if not scheduler_config.enable_chunked_prefill:
+    # Upstream turns chunked prefill off for an engine without a KV cache, such
+    # as an encoder-only instance, then validates the config again in EngineCore.
+    if not (scheduler_config.enable_chunked_prefill or vllm_config.is_mm_encoder_only):
         raise ValueError(
             "Disabling chunked prefill is not supported on RBLN. "
             "Please enable chunked prefill by yourself."
@@ -461,6 +467,20 @@ def _wire(vllm_config: "VllmConfig") -> None:
     rbln_config: RBLNConfig = vllm_config.additional_config
     parallel_config = vllm_config.parallel_config
     scheduler_config = vllm_config.scheduler_config
+
+    ec_config = vllm_config.ec_transfer_config
+    manager_config = vllm_config.ec_manager_config
+    if (
+        ec_config is not None
+        and ec_config.ec_connector == "RblnECCPUConnector"
+        and not vllm_config.model_config.is_encoder_decoder
+        and manager_config.encoder_cache_manager_cls is None
+    ):
+        # NOTE(RBLN): select eviction protection through the manager factory
+        # so an explicitly configured cache manager is never replaced.
+        manager_config.encoder_cache_manager_cls = (
+            "vllm_rbln.v1.core.rbln_scheduler.RBLNEncoderCacheManager"
+        )
 
     if parallel_config.worker_cls == "auto":
         parallel_config.worker_cls = "vllm_rbln.v1.worker.rbln_worker.RBLNWorker"

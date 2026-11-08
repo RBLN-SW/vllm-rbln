@@ -20,9 +20,11 @@ import pytest
 from vllm.v1.request import RequestStatus
 
 from tests.vllm.v1.core.utils import (
+    ECConnectorInTransit,
     MockKVConfig,
     _drain,
     create_rbln_scheduler,
+    image_at,
     make_model_runner_output,
     make_request,
 )
@@ -210,6 +212,37 @@ class TestSubBlockVersusKVConnector:
         out = sched.schedule()
         assert out.kv_cache_copy_ops == []
         assert out.num_scheduled_tokens["1"] == req.num_tokens
+
+
+class TestSubBlockMatchOfADeferredRequest:
+    def test_waiting_for_encoder_outputs_releases_the_match(self):
+        sched = create_rbln_scheduler(
+            block_size=BLOCK_SIZE,
+            num_blocks=100,
+            max_num_batched_tokens=BLOCK_SIZE,
+            max_model_len=BLOCK_SIZE * 4,
+            enable_prefix_caching=True,
+            sub_block_size=SUB_BLOCK_SIZE,
+        )
+        seed = make_request("seed", [0] * BLOCK_SIZE, BLOCK_SIZE, max_tokens=1)
+        sched.add_request(seed)
+        out = sched.schedule()
+        seed_block = sched.kv_cache_manager.block_pool.blocks[
+            out.scheduled_new_reqs[0].block_ids[0][0]
+        ]
+        sched.update_from_output(out, make_model_runner_output(out, 0))
+        sched.ec_connector = ECConnectorInTransit()
+
+        # Shares the seed's first sub-block; the image comes after it.
+        tokens = [0] * SUB_BLOCK_SIZE + [900 + i for i in range(BLOCK_SIZE)]
+        image = image_at(SUB_BLOCK_SIZE + 8, 4)
+        sched.add_request(make_request("1", tokens, BLOCK_SIZE, mm_features=[image]))
+        # Queued behind it, so the same pass moves on to another request.
+        other = [500 + i for i in range(BLOCK_SIZE)]
+        sched.add_request(make_request("2", other, BLOCK_SIZE))
+
+        assert sched.schedule().num_scheduled_tokens == {"2": BLOCK_SIZE}
+        assert seed_block.ref_cnt == 0
 
 
 class TestSubBlockPrefixHitRun:
