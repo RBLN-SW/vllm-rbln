@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Compile-input selection, override validation and cache-key generation."""
+"""Input selection, override validation and compile-cache key generation."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ from .rbln_config_utils import read_num_devices
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
-    from vllm_rbln.config import RBLNCompileSpec
+    from vllm_rbln.config import OptimumRBLNCompileInputs
 
 
 # Keys that affect only loading the compiled model, not the compiled binary,
@@ -50,13 +50,14 @@ def _strip_load_only_keys(obj: dict) -> dict:
     return obj
 
 
-def compile_cache_name(spec: RBLNCompileSpec) -> str:
-    """Hash compile-relevant spec fields into a stable artifact directory name."""
+def compile_cache_name(compile_inputs: OptimumRBLNCompileInputs) -> str:
+    """Hash compile-relevant input fields into a stable artifact directory name."""
     config_dict: dict[str, Any] = {
-        field.name: getattr(spec, field.name) for field in fields(spec)
+        field.name: getattr(compile_inputs, field.name)
+        for field in fields(compile_inputs)
     }
     config_dict["rbln_config"] = _strip_load_only_keys(config_dict["rbln_config"])
-    config_dict["hf_config"] = spec.hf_config.to_dict()
+    config_dict["hf_config"] = compile_inputs.hf_config.to_dict()
     model_name = str(config_dict["model"])
 
     config_json = json.dumps(config_dict, sort_keys=True, default=str)

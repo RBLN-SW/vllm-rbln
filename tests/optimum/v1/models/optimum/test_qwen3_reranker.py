@@ -16,7 +16,7 @@
 The reranker reuses the *generation* graph so it can read the score off two
 vocabulary logits. These tests cover the parts that do not need an NPU:
 
-  * the HF arch is remapped to ``Qwen3ForCausalLM``, so the compile spec and
+  * the HF arch is remapped to ``Qwen3ForCausalLM``, so the compile inputs and
     optimum-rbln class match the generative path and share its artifact,
   * ``classifier_from_token`` resolves to the right vocabulary ids,
   * inputs are **left** padded, which the generation graph requires,

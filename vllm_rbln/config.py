@@ -187,8 +187,11 @@ class RBLNConfig(RBLNConfigBase):
 
 
 @dataclass
-class RBLNCompileSpec:
-    """Serializable snapshot shared by cache lookup, compilation and runtime."""
+class OptimumRBLNCompileInputs:
+    """Resolved inputs shared by cache hashing, vLLM config sync and compilation.
+
+    Must remain serializable for worker transfer via `additional_config`.
+    """
 
     model: str
     dtype: Any
@@ -230,9 +233,13 @@ class OptimumRBLNConfig(RBLNConfigBase):
     image_prefill_chunk_size: list[int] | None = field(default=None, metadata=_DERIVED)
     """Compiled image-prefill buckets (gemma3/gemma4) used for scheduler padding."""
 
-    compile_spec: RBLNCompileSpec | None = field(default=None, metadata=_DERIVED)
-    """Resolved model, dtype and optimum-rbln compile config shared by the cache
-    key and compilation. Runtime synchronization must not rewrite it."""
+    compile_inputs: OptimumRBLNCompileInputs | None = field(
+        default=None, metadata=_DERIVED
+    )
+    """Inputs shared by cache lookup and compilation.
+
+    Runtime synchronization must not mutate them.
+    """
 
     cached_model_path: str | None = field(default=None, metadata=_DERIVED)
     """Where the compile cache holds, or will put, this model's artifact. Built

@@ -145,7 +145,7 @@ class TestSyncEncDec:
 
 
 class TestSyncPooling:
-    def test_reads_partition_size_from_compile_spec(self, sync_config):
+    def test_reads_partition_size_from_compile_inputs(self, sync_config):
         synced = sync_config(
             {
                 "num_devices": 1,

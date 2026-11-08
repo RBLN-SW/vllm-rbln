@@ -23,8 +23,8 @@ from vllm_rbln.utils.optimum.path import (
     resolve_compiled_model_path,
 )
 
-from .compile_spec import build_compile_spec
-from .compile_spec_utils import compile_cache_name
+from .compile_inputs import build_compile_inputs
+from .compile_inputs_utils import compile_cache_name
 from .rbln_config_utils import load_compiled_rbln_config
 from .vllm_config_sync import sync_vllm_config
 
@@ -42,7 +42,7 @@ def sync_vllm_and_optimum(vllm_config: VllmConfig) -> None:
     """Prepare compile inputs, select model settings and apply them to vLLM.
 
     Existing artifacts determine the vLLM config updates. On a cache miss, the
-    resolved compile spec supplies them and is retained for model compilation.
+    resolved compile inputs supply them and are retained for compilation.
     """
     additional_config: OptimumRBLNConfig = vllm_config.additional_config
     # 1. Load rbln_config.json from the model path or a known cache path.
@@ -52,13 +52,13 @@ def sync_vllm_and_optimum(vllm_config: VllmConfig) -> None:
     rbln_config = (
         load_compiled_rbln_config(artifact_path) if artifact_path is not None else None
     )
-    # 2. Resolve the compile spec and look up the corresponding cached model.
+    # 2. Prepare compile inputs and look up the corresponding cached model.
     if rbln_config is None:
-        if additional_config.compile_spec is None:
-            additional_config.compile_spec = build_compile_spec(vllm_config)
-        spec = additional_config.compile_spec
+        if additional_config.compile_inputs is None:
+            additional_config.compile_inputs = build_compile_inputs(vllm_config)
+        compile_inputs = additional_config.compile_inputs
         artifact_path = get_compile_cache_path(
-            compile_cache_name(spec), envs.VLLM_CACHE_ROOT
+            compile_cache_name(compile_inputs), envs.VLLM_CACHE_ROOT
         )
         additional_config.cached_model_path = artifact_path
         rbln_config = load_compiled_rbln_config(artifact_path)
@@ -68,8 +68,8 @@ def sync_vllm_and_optimum(vllm_config: VllmConfig) -> None:
         selected_config = rbln_config
         precompiled = True
     else:
-        # 3. Use settings from the compile spec for a new compilation.
-        selected_config = spec.rbln_config
+        # 3. Use settings from the compile inputs for a new compilation.
+        selected_config = compile_inputs.rbln_config
         precompiled = False
     # 4. Apply the selected configuration to vLLM once.
     sync_vllm_config(vllm_config, selected_config, precompiled=precompiled)

@@ -39,7 +39,7 @@ def pin_npu_per_worker(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def skip_sync_vllm_and_optimum():
-    # Use the compile spec without reading rbln_config.json from disk.
+    # Use the compile inputs without reading rbln_config.json from disk.
     with patch(
         "vllm_rbln.utils.optimum.config_sync.sync.load_compiled_rbln_config",
         return_value=None,

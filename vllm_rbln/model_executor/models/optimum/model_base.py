@@ -219,16 +219,18 @@ class RBLNOptimumModelBase(nn.Module):
                 "Disaggregated Encoder is only supported for pre-compiled model."
             )
             # cache miss: compile the model and save it to the cache for reuse.
-            spec = additional_config.compile_spec
-            assert spec is not None, "compile spec must be resolved before loading"
-            hf_config = deepcopy(spec.hf_config)
+            compile_inputs = additional_config.compile_inputs
+            assert compile_inputs is not None, (
+                "compile inputs must be resolved before loading"
+            )
+            hf_config = deepcopy(compile_inputs.hf_config)
             _, model_cls_name = get_rbln_model_info(hf_config)
-            model_cls = getattr(optimum.rbln, spec.model_cls)
+            model_cls = getattr(optimum.rbln, compile_inputs.model_cls)
             logger.info(
                 "Compiling %s via optimum-rbln (%s) with rbln_config:\n%s",
-                spec.model,
-                spec.model_cls,
-                json.dumps(spec.rbln_config, indent=2, default=str),
+                compile_inputs.model,
+                compile_inputs.model_cls,
+                json.dumps(compile_inputs.rbln_config, indent=2, default=str),
             )
             # Transformers configs preserve model-specific state. External config
             # classes may be incompatible with optimum-rbln, so pass layer kwargs.
@@ -247,9 +249,9 @@ class RBLNOptimumModelBase(nn.Module):
                     else {"text_config": layer_override}
                 )
             model = model_cls.from_pretrained(
-                spec.model,
-                rbln_config=deepcopy(spec.rbln_config),
-                dtype=spec.dtype,
+                compile_inputs.model,
+                rbln_config=deepcopy(compile_inputs.rbln_config),
+                dtype=compile_inputs.dtype,
                 **config_override,
             )
             model.save_pretrained(cached_model_path)  # type: ignore[attr-defined]

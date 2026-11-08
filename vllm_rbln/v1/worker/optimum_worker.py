@@ -175,6 +175,7 @@ class RBLNOptimumWorker(WorkerBase):
         # If the model is compiled in the runner,
         # the number of blocks is not set in the vLLM config yet.
         # Therefore, we need to update it here.
+        # FIXME: Sync block counts after compilation in model_base.init_model().
         if not self.model_runner.vllm_config.cache_config.num_gpu_blocks:
             num_blocks = get_runtime_num_blocks(
                 self.model_runner.vllm_config.model_config.hf_config,
