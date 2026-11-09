@@ -1599,15 +1599,15 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             bucket = logits.shape[0]
             # Keyed off the installed sampler: only RBLNSampler takes the kwarg,
             # and the executor's golden validation swaps self.sampler after __init__.
-            staging = (
-                {"staging_owner": self}
-                if self.use_async_scheduling and isinstance(self.sampler, RBLNSampler)
-                else {}
-            )
+            extra: dict[str, Any] = {}
+            if isinstance(self.sampler, RBLNSampler):
+                extra["input_batch"] = self.input_batch
+                if self.use_async_scheduling:
+                    extra["staging_owner"] = self
             out = self.sampler(
                 logits=logits,
                 sampling_metadata=_pad_sampling_metadata(sampling_metadata, bucket),
-                **staging,
+                **extra,
             )
         else:
             if self.rbln_config.use_custom_sampler:
@@ -3018,6 +3018,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 logits=logits,
                 sampling_metadata=dummy_metadata,
             )
+            if isinstance(self.sampler, RBLNSampler):
+                self.sampler.warm_up_sparse_penalty(logits.clone(), dummy_metadata)
 
             if num_reqs > 1:
                 # A batch smaller than the bucket takes `_pad_rows`'s `torch.cat`
