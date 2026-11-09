@@ -298,7 +298,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         self.max_model_len = model_config.max_model_len
         self.max_num_tokens = scheduler_config.max_num_batched_tokens
         assert self.rbln_config.prefill_chunk_size is not None  # resolved at start-up
-        self.prefill_chunk_size = self.rbln_config.prefill_chunk_size
+        self.prefill_chunk_sizes = self.rbln_config.prefill_chunk_size
         self.max_num_reqs = scheduler_config.max_num_seqs
 
         self.dcp_world_size = self.parallel_config.decode_context_parallel_size
@@ -1403,7 +1403,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         if self.mm_prefix_query_len is not None:
             query_len_padded = self.mm_prefix_query_len
         elif is_prefill:
-            query_len_padded = self.prefill_chunk_size
+            query_len_padded = min(
+                c for c in self.prefill_chunk_sizes if c >= input_ids.shape[1]
+            )
         else:
             query_len_padded = input_ids.shape[1]
         layout = InputLayout(
@@ -3704,7 +3706,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         # backends for that group only supports block_size 64, we will return
         # kernel_block_size 64 and split the 256-token-block to 4 blocks with 64
         # tokens each.
-        assert self.rbln_config.prefill_chunk_size is not None  # resolved at start-up
         kernel_block_sizes = prepare_kernel_block_sizes(
             kv_cache_config,
             self.attn_groups,
@@ -3712,7 +3713,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 enable_prefix_caching=self.cache_config.enable_prefix_caching,
                 sub_block_cache=self.rbln_config.enable_sub_block_cache,
                 block_size=self.cache_config.block_size,
-                prefill_chunk_size=self.rbln_config.prefill_chunk_size,
+                prefill_chunk_size=self.rbln_config.max_prefill_chunk_size,
                 kv_cache_config=kv_cache_config,
                 sub_block_size=self.rbln_config.sub_block_size,
             ),
@@ -4116,7 +4117,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
     def run_model_graphs(self) -> None:
         """Every model graph once, at the shapes serving will ask for."""
         # 1. prefill, then one mm prefix step per query length
-        self._dummy_run(1, self.prefill_chunk_size, True)
+        for chunk in self.prefill_chunk_sizes:
+            self._dummy_run(1, chunk, True)
         for query_len in self.mm_prefix_query_len_buckets:
             self._dummy_run(1, query_len, True, mm_prefix_query_len=query_len)
 

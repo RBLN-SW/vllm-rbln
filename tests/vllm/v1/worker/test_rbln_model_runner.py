@@ -642,7 +642,7 @@ class TestEcConsumer:
             _is_prefill_step=True,
             is_pooling_model=False,
             max_num_tokens=4,
-            prefill_chunk_size=4,
+            prefill_chunk_sizes=[4],
             input_ids=torch.zeros(4, dtype=torch.long),
             positions=torch.zeros(4, dtype=torch.long),
             input_stager=InputStager(torch.device("cpu")),
@@ -825,11 +825,11 @@ def test_multimodal_warmup_keys_the_bundle_on_the_encoder_buckets(monkeypatch, b
     runner._warmup_mm_encoder.assert_called_once_with()
 
 
-def test_warmup_compiles_prefill_at_the_prefill_chunk_size():
+def test_warmup_compiles_prefill_at_every_prefill_chunk_size():
     calls = []
     runner = _make_runner_stub(
         max_num_tokens=512,
-        prefill_chunk_size=256,
+        prefill_chunk_sizes=[128, 256],
         mm_prefix_query_len_buckets=[],
         speculative_config=None,
         bucketing_manager=SimpleNamespace(decode_batch_buckets=[1]),
@@ -839,7 +839,34 @@ def test_warmup_compiles_prefill_at_the_prefill_chunk_size():
 
     runner.run_model_graphs()
 
-    assert calls[0] == ((1, 256, True), {})
+    assert calls[:2] == [((1, 128, True), {}), ((1, 256, True), {})]
+
+
+@pytest.mark.parametrize(("query_len", "padded"), [(100, 128), (128, 128), (129, 256)])
+def test_a_prefill_pads_to_the_shortest_chunk_size_that_holds_it(
+    monkeypatch, query_len, padded
+):
+    monkeypatch.setattr(mr, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True))
+    runner = _make_runner_stub(
+        input_ids=torch.zeros(512, dtype=torch.int32),
+        positions=torch.zeros(512, dtype=torch.int64),
+        is_prefill=True,
+        prefill_chunk_sizes=[128, 256],
+        input_stager=Mock(),
+        is_pooling_model=True,
+        _init_model_kwargs=lambda: {},
+    )
+
+    runner._preprocess(
+        Mock(),
+        num_reqs=1,
+        num_reqs_padded=1,
+        num_input_tokens=query_len,
+        logits_indices=None,
+    )
+
+    layout = runner.input_stager.stage.call_args.kwargs["layout"]
+    assert (layout.query_len, layout.query_len_padded) == (query_len, padded)
 
 
 @pytest.mark.parametrize("num_reqs", [1, 2])
@@ -2669,7 +2696,7 @@ def test_warmup_compiles_one_prefill_per_mm_prefix_query_len():
     calls = []
     runner = _make_runner_stub(
         max_num_tokens=512,
-        prefill_chunk_size=256,
+        prefill_chunk_sizes=[256],
         mm_prefix_query_len_buckets=[128, 384],
         speculative_config=None,
         bucketing_manager=SimpleNamespace(decode_batch_buckets=[1]),

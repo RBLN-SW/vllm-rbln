@@ -75,3 +75,30 @@ Example:
 
 For the configuration above the decode batch buckets are `[16, 12, 8, 4]`.
 
+
+## Prefill Chunk Bucketing
+
+`--rbln-prefill-chunk-size` sets the lengths of the prefill graphs. Each length
+compiles one `[1, length]` graph. A prefill step pads its chunk to the shortest
+length that fits, so a short prompt or the last chunk of a long prompt does not
+pad to the full length.
+
+The longest length is the most tokens the scheduler gives one request per step.
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--rbln-prefill-chunk-size` | `max_num_batched_tokens` | Prefill graph lengths. Every length must be unique and within `(0, max_num_batched_tokens]`. |
+
+In `additional_config` it takes a list or a single integer, for example
+`{"prefill_chunk_size": 512}`.
+
+Example:
+
+```bash
+--max-num-batched-tokens 1024
+--rbln-prefill-chunk-size 256 512 1024
+```
+
+This compiles prefill graphs of 256, 512 and 1024 tokens. A 1200-token prompt
+runs a 1024-token chunk on the 1024 graph, then its last 176 tokens on the 256
+graph, padded to 256.

@@ -236,6 +236,24 @@ def test_manual_strategy_needs_buckets():
         RBLNConfig(decode_batch_bucket_strategy="manual")
 
 
+@pytest.mark.parametrize(("value", "sizes"), [(512, [512]), ([512, 256], [256, 512])])
+def test_prefill_chunk_sizes_are_a_sorted_list(value, sizes):
+    config = RBLNConfig(prefill_chunk_size=value)
+    assert (config.prefill_chunk_size, config.max_prefill_chunk_size) == (
+        sizes,
+        sizes[-1],
+    )
+
+
+@pytest.mark.parametrize(
+    ("sizes", "error"),
+    [([0, 64], "must all be > 0"), ([64, 64], "unique")],
+)
+def test_prefill_chunk_sizes_are_positive_and_unique(sizes, error):
+    with pytest.raises(ValueError, match=error):
+        RBLNConfig(prefill_chunk_size=sizes)
+
+
 @pytest.mark.parametrize(
     ("budgets", "error"),
     [

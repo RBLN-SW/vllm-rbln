@@ -623,6 +623,7 @@ class TestDetermineAvailableMemory:
         specialized_moe_decode=False,
         uses_fixed_decode_window=False,
         decode_buckets=3,
+        chunk_sizes=(128,),
         drafter=None,
         speculative_config=None,
         dynamic=False,
@@ -654,6 +655,7 @@ class TestDetermineAvailableMemory:
             bucketing_manager=SimpleNamespace(
                 decode_batch_buckets_count=decode_buckets
             ),
+            prefill_chunk_sizes=chunk_sizes,
             drafter=drafter,
             get_kv_cache_spec=lambda: {},
             uses_fixed_decode_window=uses_fixed_decode_window,
@@ -707,6 +709,7 @@ class TestDetermineAvailableMemory:
             model=SimpleNamespace(named_parameters=lambda: iter(_params().items())),
             specialized_moe_decode=False,
             bucketing_manager=SimpleNamespace(decode_batch_buckets_count=3),
+            prefill_chunk_sizes=(128,),
             drafter=None,
             get_kv_cache_spec=lambda: {"a": spec, "b": spec},
         )
@@ -740,6 +743,15 @@ class TestDetermineAvailableMemory:
         # Non-spec: num_decode_query_lens == 1, so 1 + buckets(3)*1 = 4, plus
         # the specialized-MoE-decode fallback (+1 query length) = 5.
         assert cap["num_runtimes"] == 5
+
+    def test_num_runtimes_counts_every_prefill_chunk_size(
+        self, make_worker, monkeypatch
+    ):
+        cap = self._capture(
+            make_worker, monkeypatch, decode_buckets=3, chunk_sizes=(32, 64, 128)
+        )
+        # One prefill graph per chunk size (3), plus buckets(3)*1 = 6.
+        assert cap["num_runtimes"] == 6
 
     def test_no_quant_counts_int_at_16bit(self, make_worker, monkeypatch):
         assert self._capture(make_worker, monkeypatch)["n_model_bytes"] == 300

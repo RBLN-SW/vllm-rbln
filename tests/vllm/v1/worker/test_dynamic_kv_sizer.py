@@ -1001,7 +1001,7 @@ class TestKvCopyStreamReserve:
                 additional_config=SimpleNamespace(
                     enable_sub_block_cache=sub_block_cache,
                     sub_block_size=sub_block_size,
-                    prefill_chunk_size=512,
+                    max_prefill_chunk_size=512,
                 )
             ),
             model_runner=SimpleNamespace(kv_cache_config=SimpleNamespace()),

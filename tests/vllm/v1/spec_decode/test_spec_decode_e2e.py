@@ -17,6 +17,7 @@
 # suffix, eagle, eagle3 and medusa.
 
 import warnings
+from typing import Any
 
 import pytest
 from vllm import SamplingParams
@@ -41,7 +42,7 @@ NUM_LOGPROBS = 5
 
 # method -> (target model, extra LLM kwargs, speculative_config). The eagle/medusa
 # drafts cap at 2048 positions, so max_model_len is lowered for them.
-SPEC_METHODS = {
+SPEC_METHODS: dict[str, tuple[str, dict[str, Any], dict[str, Any]]] = {
     "ngram": (
         _NGRAM_TARGET,
         {},
@@ -64,6 +65,17 @@ SPEC_METHODS = {
     "eagle": (
         TARGET_MODEL,
         {"max_model_len": 2048, "tensor_parallel_size": 2},
+        {"method": "eagle", "model": _DRAFT["eagle"], "num_speculative_tokens": 3},
+    ),
+    # The target prefills the prompt on the 256 graph, the drafter on the 512 one.
+    "eagle-prefill-chunk-sizes": (
+        TARGET_MODEL,
+        {
+            "max_model_len": 2048,
+            "tensor_parallel_size": 2,
+            "max_num_batched_tokens": 512,
+            "additional_config": {"prefill_chunk_size": [256, 512]},
+        },
         {"method": "eagle", "model": _DRAFT["eagle"], "num_speculative_tokens": 3},
     ),
     "eagle3": (
@@ -120,7 +132,11 @@ def test_speculative_decoding_matches_reference(
 
     # The reference sampler, on both runs: the RBLN one compiles a graph of its
     # own, and acceptance is being compared, not sampler implementations.
-    reference_sampler = {"use_custom_sampler": False}
+    extra_kwargs = dict(extra_kwargs)
+    reference_sampler = {
+        "use_custom_sampler": False,
+        **extra_kwargs.pop("additional_config", {}),
+    }
 
     with vllm_runner(
         target, **extra_kwargs, additional_config=reference_sampler
