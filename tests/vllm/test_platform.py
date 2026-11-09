@@ -1092,22 +1092,19 @@ class TestSchedulerOverrides:
     def test_cascade_attention_is_disabled(self, configured):
         assert configured.model_config.disable_cascade_attn is True
 
-    @pytest.mark.parametrize(
-        "mm_prefix_lm, multimodal, disabled",
-        [(True, True, True), (True, False, False), (False, True, False)],
-    )
-    def test_chunked_mm_input_is_disabled_for_an_mm_prefix_lm(
-        self, reconfigure, monkeypatch, mm_prefix_lm, multimodal, disabled
+    @pytest.mark.parametrize("disabled", [False, True])
+    def test_chunked_mm_input_is_left_as_given_for_an_mm_prefix_lm(
+        self, reconfigure, monkeypatch, disabled
     ):
-        # Upstream then refuses an mm item longer than max_num_batched_tokens.
+        # The RBLN scheduler keeps a range in one step; forcing whole items into
+        # one would refuse a video longer than max_num_batched_tokens.
         from vllm.config import ModelConfig
 
-        monkeypatch.setattr(
-            ModelConfig, "is_mm_prefix_lm", property(lambda self: mm_prefix_lm)
-        )
+        monkeypatch.setattr(ModelConfig, "is_mm_prefix_lm", property(lambda self: True))
 
         def mutate(config: VllmConfig) -> None:
-            config.scheduler_config.is_multimodal_model = multimodal
+            config.scheduler_config.is_multimodal_model = True
+            config.scheduler_config.disable_chunked_mm_input = disabled
 
         config = reconfigure(mutate)
         assert config.scheduler_config.disable_chunked_mm_input is disabled

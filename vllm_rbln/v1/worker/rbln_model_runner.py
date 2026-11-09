@@ -1488,6 +1488,16 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     f"long_prefill_token_threshold={threshold} would split a "
                     f"multimodal range of up to {longest} tokens."
                 )
+            # The scheduler cuts steps on range boundaries, so what has to fit
+            # one step is the longest range as padded here, not a whole
+            # multimodal item as --disable-chunked-mm-input would require.
+            budget = self.scheduler_config.max_num_batched_tokens
+            if budget < longest:
+                raise ValueError(
+                    f"max_num_batched_tokens={budget} cannot hold an mm prefix "
+                    f"step of up to {longest} tokens; set --max-num-batched-tokens "
+                    f"(and --block-size) to at least {longest}."
+                )
             # TODO(RBLN): spec decode runs a range under a shape this path does
             # not pick yet.
             if self.speculative_config is not None:

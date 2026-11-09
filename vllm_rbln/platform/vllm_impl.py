@@ -462,20 +462,6 @@ def _override(vllm_config: "VllmConfig") -> None:
         if not cache_config.user_specified_mamba_block_size:
             cache_config.mamba_block_size = model_config.max_model_len
 
-    # As upstream's CUDA and ROCm platforms do: an mm prefix range attends both
-    # ways, so it must never straddle two steps.
-    scheduler_config = vllm_config.scheduler_config
-    if (
-        model_config.is_mm_prefix_lm
-        and scheduler_config.is_multimodal_model
-        and not scheduler_config.disable_chunked_mm_input
-    ):
-        logger.warning(
-            "Forcing --disable-chunked-mm-input for models with "
-            "multimodal-bidirectional attention."
-        )
-        scheduler_config.disable_chunked_mm_input = True
-
 
 def _wire(vllm_config: "VllmConfig") -> None:
     rbln_config: RBLNConfig = vllm_config.additional_config

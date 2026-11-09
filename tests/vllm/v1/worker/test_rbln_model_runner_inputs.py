@@ -130,6 +130,19 @@ class TestResolveMmPrefixSupport:
         with pytest.raises(ValueError, match="long_prefill_token_threshold"):
             runner._resolve_mm_support()
 
+    def test_a_budget_shorter_than_a_padded_range_is_refused(
+        self, make_model_runner, monkeypatch
+    ):
+        runner = self._runner(
+            make_model_runner,
+            monkeypatch,
+            _MmPrefixModel([64, 256]),
+            max_num_batched_tokens=128,
+        )
+
+        with pytest.raises(ValueError, match="max_num_batched_tokens=128"):
+            runner._resolve_mm_support()
+
     def test_prefix_caching_is_taken(self, make_model_runner, monkeypatch):
         # A hit ending inside a range resumes it in a step of its own.
         runner = self._runner(
