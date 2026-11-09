@@ -13,12 +13,18 @@
 # limitations under the License.
 
 from collections import defaultdict
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlBaseConnectorWorker,
+)
+from vllm.v1.kv_cache_interface import (
+    MambaSpec,
+    UniformTypeKVCacheSpecs,
+    iter_layer_specs,
 )
 
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.handshake import (
@@ -39,7 +45,11 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.transfer import (
     RblnNixlTransferMixin,
 )
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_transfer_topology import (
+    RblnBlockTransferSpec,
+)
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
 
 if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -70,7 +80,51 @@ class RblnNixlWorkerBase(
             writes_into_peer=self._writes_into_peer,
         )
 
-        super().__init__(vllm_config, engine_id, kv_cache_config)
+        self._block_aux_specs: dict[str, RBLNBlockAuxSpec] = {}
+        self._block_state_layers: set[str] = set()
+        groups = []
+        for group in kv_cache_config.kv_cache_groups:
+            specs = (
+                group.kv_cache_spec.kv_cache_specs
+                if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+                else dict.fromkeys(group.layer_names, group.kv_cache_spec)
+            )
+            transferred = {}
+            changed = False
+            for name, spec in specs.items():
+                if isinstance(spec, MambaSpec) and len(spec.shapes) == 1:
+                    self._block_state_layers.add(name)
+                    spec = RblnBlockTransferSpec(spec.block_size, spec.page_size_bytes)
+                    changed = True
+                transferred[name] = spec
+            group_spec = group.kv_cache_spec
+            if changed:
+                group_spec = (
+                    replace(group_spec, kv_cache_specs=transferred)
+                    if isinstance(group_spec, UniformTypeKVCacheSpecs)
+                    else next(iter(transferred.values()))
+                )
+            groups.append(
+                replace(group, kv_cache_spec=group_spec) if changed else group
+            )
+        # Upstream's Mamba worker requires a (conv, SSM) pair. Single-state
+        # layers instead register one indivisible payload, as do block auxiliaries.
+        transfer_config = (
+            replace(kv_cache_config, kv_cache_groups=groups)
+            if self._block_state_layers
+            else kv_cache_config
+        )
+        self._block_state_groups = {
+            i
+            for i, group in enumerate(kv_cache_config.transfer_groups)
+            if any(
+                isinstance(spec, MambaSpec) and len(spec.shapes) == 1
+                for spec in iter_layer_specs(group.kv_cache_spec)
+            )
+        }
+        if self._block_state_layers:
+            self._supports_pp_hma = True
+        super().__init__(vllm_config, engine_id, transfer_config)
 
         # The descriptor arithmetic addresses a rank's whole region, which is
         # why a context-parallel peer is refused at the handshake; ours would be

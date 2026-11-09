@@ -37,7 +37,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_METRICS: bool = False
     VLLM_RBLN_METRICS_DIR: str = ""
     VLLM_RBLN_NUMA: bool = True
-    VLLM_RBLN_USE_NESTED_COMPILE_REGION: bool = False
+    VLLM_RBLN_USE_NESTED_COMPILE_REGION: bool = True
 
     # ====================================================================
     # Read only when VLLM_RBLN_USE_VLLM_MODEL=False
@@ -202,7 +202,7 @@ environment_variables = {
     # Experimental decoder boundaries in both model paths.
     # Requires nested-region support in rebel-compiler; this does not emit loops.
     "VLLM_RBLN_USE_NESTED_COMPILE_REGION": (
-        lambda: os.environ.get("VLLM_RBLN_USE_NESTED_COMPILE_REGION", "False").lower()
+        lambda: os.environ.get("VLLM_RBLN_USE_NESTED_COMPILE_REGION", "True").lower()
         in ("true", "1")
     ),
     # Number of NPU devices per local rank (was VLLM_RBLN_TP_SIZE).
@@ -311,7 +311,7 @@ environment_variables = {
     ),
     # --- MODEL INPUT / SCHEDULING ---
     # Enable sub-block prefix caching.
-    # Sub-block size equals max_num_batched_tokens (prefill chunk size).
+    # Sub-block size defaults to the prefill chunk size.
     "VLLM_RBLN_SUB_BLOCK_CACHE": lambda: (
         os.environ.get("VLLM_RBLN_SUB_BLOCK_CACHE", "True").lower() in ("true", "1")
     ),

@@ -18,6 +18,7 @@ import types
 from typing import Any
 
 import pytest
+import torch
 from vllm.sequence import IntermediateTensors
 
 import vllm_rbln.envs as envs
@@ -242,6 +243,20 @@ class TestReporting:
 
     def test_print_stats_with_no_data(self, ctx, monkeypatch):
         assert self._labels(ctx, monkeypatch) == []
+
+    def test_encoder_sections_follow_the_passes_smallest_bucket_first(
+        self, ctx, clock, monkeypatch
+    ):
+        run_pass(ctx, clock, phase=wm.Phase.PREFILL, model=10 * MS, sample=2 * MS)
+        ctx.record_encoder("5184x1176", 40 * MS)
+        ctx.record_encoder("576x1176", 5 * MS)
+
+        assert self._labels(ctx, monkeypatch) == [
+            "MODEL + SAMPLE (PREFILL)",
+            "E2E (PREFILL)",
+            "ENCODER (576x1176)",
+            "ENCODER (5184x1176)",
+        ]
 
 
 class TestWriteMetricsJson:
@@ -582,6 +597,135 @@ class TestModelExecutable:
         assert calls == [{"step": 1}, {"step": 2}]
 
 
+class TestMmEncoder:
+    @staticmethod
+    def _encoder(clock, *, latency):
+        def encoder(pixel_values):
+            clock.advance(latency)
+            return pixel_values
+
+        return encoder
+
+    def test_a_call_is_a_sample_per_input_shape_only_while_recording(
+        self, ctx, clock, monkeypatch
+    ):
+        monkeypatch.setattr(pm, "_ACTIVE_CTX", ctx)
+        encoder = self._encoder(clock, latency=7 * MS)
+
+        pm.run_mm_encoder(encoder, [torch.zeros(4, 3)], 1)  # warm-up
+        ctx.start_pass()
+        pm.run_mm_encoder(encoder, [torch.zeros(4, 3)], 1)
+        ctx.end_pass()
+        ctx.start_pass()
+        pm.run_mm_encoder(encoder, [torch.zeros(8, 3)], 1)
+        ctx.end_pass()
+        pm.run_mm_encoder(encoder, [torch.zeros(16, 3)], 1)
+        monkeypatch.setattr(pm, "_ACTIVE_CTX", None)
+        pm.run_mm_encoder(encoder, [torch.zeros(32, 3)], 1)
+
+        assert {k: m.latencies for k, m in ctx._encoder.items()} == {
+            "4x3": [pytest.approx(7 * MS)],
+            "8x3": [pytest.approx(7 * MS)],
+        }
+
+    @pytest.mark.parametrize("model_name", ["glm", "minimax"])
+    def test_model_handoff_records_each_image_through_its_existing_cpu_copy(
+        self, ctx, clock, monkeypatch, model_name
+    ):
+        import vllm_rbln.utils as utils
+        from vllm_rbln.model_executor.models.glm5_next import (
+            RBLNGlm5NextForConditionalGeneration,
+        )
+        from vllm_rbln.model_executor.models.minimax_m3 import (
+            RBLNMiniMaxM3SparseForConditionalGeneration,
+        )
+
+        cls, tower = {
+            "glm": (RBLNGlm5NextForConditionalGeneration, "visual"),
+            "minimax": (RBLNMiniMaxM3SparseForConditionalGeneration, "vision_tower"),
+        }[model_name]
+        model = cls.__new__(cls)
+        torch.nn.Module.__init__(model)
+        if model_name == "minimax":
+            model.mm_embeds_dtype = torch.bfloat16
+        vision_model = types.SimpleNamespace(vision_segment_max_frames=None)
+        setattr(
+            model,
+            tower,
+            types.SimpleNamespace(spatial_merge_size=1, vision_model=vision_model),
+        )
+        # MiniMax-M3 also passes the modality.
+        model._encoder_inputs = lambda pixels, grid, *modality: [pixels]
+        events = []
+
+        class PendingOutput:
+            def __init__(self, pixels):
+                self.pixels = pixels
+
+            def __getitem__(self, index):
+                events.append("slice")
+                return PendingOutput(self.pixels[index])
+
+            def cpu(self):
+                events.append("cpu")
+                # Completion and transfer occur at the model's existing CPU copy.
+                clock.advance(30 * MS)
+                return self.pixels.clone()
+
+            def to(self, *, device, dtype):
+                assert device == "cpu"
+                events.append("to")
+                clock.advance(35 * MS)
+                return self.pixels.to(dtype=dtype)
+
+        def encoder(pixels):
+            events.append("encoder")
+            clock.advance(1 * MS)
+            return PendingOutput(pixels)
+
+        object.__setattr__(model, "_mm_encoder", encoder)
+        monkeypatch.setattr(utils, "run_mm_encoder", pm.run_mm_encoder)
+        monkeypatch.setattr(pm, "_ACTIVE_CTX", ctx)
+        pixels = torch.arange(9).view(3, 3)
+        ctx.start_pass()
+        outputs = model.embed_multimodal(
+            pixel_values=pixels, image_grid_thw=torch.tensor([[1, 1, 1], [1, 1, 2]])
+        )
+        ctx.end_pass()
+
+        handoff = "to" if model_name == "minimax" else "cpu"
+        dtype = torch.bfloat16 if model_name == "minimax" else pixels.dtype
+        latency = (36 if model_name == "minimax" else 31) * MS
+        assert events == ["encoder", "slice", handoff] * 2
+        torch.testing.assert_close(outputs[0], pixels[:1].to(dtype))
+        torch.testing.assert_close(outputs[1], pixels[1:].to(dtype))
+        assert {shape: m.latencies for shape, m in ctx._encoder.items()} == {
+            "1x3": [pytest.approx(latency)],
+            "2x3": [pytest.approx(latency)],
+        }
+
+    def test_encoder_time_is_in_e2e_and_separate_from_model_time(
+        self, ctx, clock, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(envs, "VLLM_RBLN_METRICS_DIR", str(tmp_path))
+        monkeypatch.setattr(pm, "_ACTIVE_CTX", ctx)
+        encoder = self._encoder(clock, latency=7 * MS)
+        ctx.start_pass()
+        ctx.mark_phase(wm.Phase.PREFILL)
+        pm.run_mm_encoder(encoder, [torch.zeros(4, 3)], 1)
+        clock.advance(2 * MS)
+        ctx.add_graph_time(2 * MS)
+        ctx.end_pass()
+        ctx.print_stats()
+
+        sections = json.loads((tmp_path / "metrics.json").read_text())["sections"]
+        assert sections["ENCODER (4x3)"]["mean_latency_ms"] == pytest.approx(7)
+        assert sections["MODEL + SAMPLE (PREFILL)"]["mean_latency_ms"] == pytest.approx(
+            2
+        )
+        assert sections["E2E (PREFILL)"]["mean_latency_ms"] == pytest.approx(9)
+
+
 class TestTimedRegion:
     """Spec decode's device wait sits in the postprocess gather, an inline region:
     timed_region must fold exactly that one into the graph sum, and only while a
@@ -658,7 +802,7 @@ class TestDescriptors:
             for d in registry.get_registered_patch_descriptors()
             if d.owner_module == "vllm_rbln.patches.metrics"
         ]
-        assert len(ours) == 9
+        assert len(ours) == 10
         for descriptor in ours:
             owner, attr = registry._resolve_patch_target_owner(descriptor.target)
             assert hasattr(owner, attr), descriptor.target

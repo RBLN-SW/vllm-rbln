@@ -251,7 +251,7 @@ class TestMambaSpecGroup:
         )
         _, (caches, bases, infos, axes) = self._views(runner, config)
         runner._allocate_aux_kv_caches(config, caches, bases, infos, axes)
-        assert runner.aux_kv_cache_layers == ["layer.0.conv_ring"]
+        assert list(runner.aux_kv_cache_specs) == ["layer.0.conv_ring"]
         ring = caches["layer.0.conv_ring"]
         num_blocks = runner.vllm_config.scheduler_config.max_num_seqs + 1
         assert ring.shape == (num_blocks, 3, 8, 128)

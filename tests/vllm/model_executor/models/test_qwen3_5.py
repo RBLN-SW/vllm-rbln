@@ -15,6 +15,8 @@
 """The RBLN Qwen3.5 image path (one padded image at a time, full attention with
 the padding masked) tracks upstream's vision tower on the same weights."""
 
+from unittest.mock import Mock
+
 import pytest
 import torch
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5VisionConfig
@@ -68,6 +70,33 @@ def visual(tmp_path):
         finally:
             destroy_model_parallel()
             destroy_distributed_environment()
+
+
+def test_warmup_runs_the_encoder_once_over_the_whole_bucket(visual):
+    # The one bucket is the processor's largest image, so the warm-up input is
+    # that whole grid with no padded rows.
+    model = RBLNQwen3_5ForConditionalGeneration.__new__(
+        RBLNQwen3_5ForConditionalGeneration
+    )
+    torch.nn.Module.__init__(model)
+    model.visual = visual
+    model.has_vision = True
+    model.encoder_grid = [1, 8, 16]
+    model.encoder_patches = 128
+    encoder = Mock(return_value=torch.zeros(128 // (MERGE * MERGE), 32))
+    model._mm_encoder = encoder
+
+    model.warmup_mm_encoder()
+
+    encoder.assert_called_once()
+    patches, pos_embeds, cos, sin, key_bias = encoder.call_args.args
+    assert patches.shape == (128, 3 * TEMPORAL * PATCH * PATCH)
+    assert pos_embeds.shape[0] == cos.shape[0] == sin.shape[0] == 128
+    assert key_bias.shape == (1, 1, 128) and not key_bias.any()
+
+    model.has_vision = False
+    model.warmup_mm_encoder()
+    encoder.assert_called_once()
 
 
 def test_image_embeddings_match_upstream(visual):

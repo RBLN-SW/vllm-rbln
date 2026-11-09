@@ -288,7 +288,7 @@ class RblnPlatform(Platform):
                 # The prefill chunk size that path compiles is
                 # `--max-num-batched-tokens` as the user gave it, and the call
                 # below replaces an unset one with a default, leaving
-                # `sync_from_vllm` no way to tell the two apart. Nothing else
+                # `prepare_compile_inputs` no way to tell the two apart. Nothing else
                 # writes additional_config now, so an unset one starts here.
                 if config is None:
                     config = self.additional_config = {}
@@ -372,6 +372,17 @@ class RblnPlatform(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
+        ec_config = vllm_config.ec_transfer_config
+        if (
+            vllm_config.is_mm_encoder_only
+            and ec_config is not None
+            and ec_config.is_ec_consumer
+        ):
+            raise ValueError(
+                "--mm-encoder-only skips the language model, so it cannot be used "
+                "on an EC consumer."
+            )
+
         _impl().check_and_update(vllm_config)
 
         parallel_config = vllm_config.parallel_config

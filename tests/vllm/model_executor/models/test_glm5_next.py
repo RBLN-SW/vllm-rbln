@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -100,6 +101,77 @@ def test_image_encoding_reuses_eager_or_compiled_encoder(monkeypatch, compiled):
     assert not encoder.training
     assert model._mm_encoder is encoder
     assert "_mm_encoder" not in model._modules
+
+
+@pytest.mark.parametrize("is_first_rank", [False, True])
+@pytest.mark.parametrize("compiled", [False, True])
+def test_encoder_buckets_are_initialized_and_warmed(
+    monkeypatch, is_first_rank, compiled
+):
+    import vllm_rbln.model_executor.models.glm5_next as glm
+
+    cls = glm.RBLNGlm5NextForConditionalGeneration
+
+    def init_language_model(self, **kwargs):
+        torch.nn.Module.__init__(self)
+        self.config = SimpleNamespace()
+
+    monkeypatch.setattr(glm.RBLNGlm5NextForCausalLM, "__init__", init_language_model)
+    monkeypatch.setattr(cls, "_mark_language_model", lambda *args: nullcontext())
+    monkeypatch.setattr(cls, "_mark_tower_model", lambda *args: nullcontext())
+    monkeypatch.setattr(
+        glm, "get_pp_group", lambda: SimpleNamespace(is_first_rank=is_first_rank)
+    )
+    monkeypatch.setattr(glm, "VISION_PATCH_BUCKET", 16)
+    visual = SimpleNamespace(
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        patch_embed=SimpleNamespace(proj=SimpleNamespace(weight=torch.zeros(3, 5))),
+        blocks=[SimpleNamespace(attn=SimpleNamespace(head_dim=4))],
+    )
+    monkeypatch.setattr(glm, "Glm5NextVisionTransformer", lambda *args, **kw: visual)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(
+                text_config=SimpleNamespace(),
+                vision_config=SimpleNamespace(rms_norm_eps=1e-6),
+                image_token_id=1,
+            )
+        )
+    )
+    model = cls(vllm_config=config)
+    encoder = Mock()
+    encoder.eval.return_value = encoder
+    build_encoder = Mock(return_value=encoder)
+    monkeypatch.setattr(glm, "_RBLNGlm5NextVisionEncoder", build_encoder)
+    compile_fn = Mock(side_effect=lambda module: module)
+    if compiled:
+        model.compile_mm_encoder(compile_fn)
+
+    model.warmup_mm_encoder()
+
+    if not is_first_rank:
+        assert model.mm_encoder_patch_buckets == []
+        build_encoder.assert_not_called()
+        compile_fn.assert_not_called()
+        encoder.assert_not_called()
+        return
+    assert model.mm_encoder_patch_buckets == [16]
+    build_encoder.assert_called_once_with(visual)
+    if compiled:
+        compile_fn.assert_called_once_with(encoder)
+    encoder.assert_called_once()
+    pixels, cos, sin, key_bias = encoder.call_args.args
+    for actual, expected in zip(
+        (pixels, cos, sin, key_bias),
+        (
+            torch.zeros(16, 5),
+            torch.ones(16, 4),
+            torch.zeros(16, 4),
+            torch.zeros(1, 1, 16),
+        ),
+    ):
+        torch.testing.assert_close(actual, expected)
 
 
 def test_vision_encoder_builds_its_inputs_from_upstream_rope(monkeypatch):

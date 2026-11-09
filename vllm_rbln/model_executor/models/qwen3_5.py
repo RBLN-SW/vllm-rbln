@@ -104,11 +104,15 @@ class RBLNQwen3_5ForConditionalGeneration(
         mm_config = vllm_config.model_config.get_multimodal_config()
         self.has_vision = mm_config.get_limit_per_prompt("image") > 0
         self.encoder_patches = 0
+        self.encoder_grid: list[int] = []
+        self.mm_encoder_patch_buckets: list[int] = []
         if self.has_vision:
             info = MULTIMODAL_REGISTRY.create_processor(vllm_config.model_config).info
             size = info.get_image_size_with_most_features()
             patch = self.visual.patch_size
-            self.encoder_patches = (size.width // patch) * (size.height // patch)
+            self.encoder_grid = [1, size.height // patch, size.width // patch]
+            self.encoder_patches = math.prod(self.encoder_grid)
+            self.mm_encoder_patch_buckets = [self.encoder_patches]
             if self.encoder_patches > MAX_ENCODER_PATCHES:
                 max_pixels = MAX_ENCODER_PATCHES * patch * patch
                 raise ValueError(
@@ -163,6 +167,20 @@ class RBLNQwen3_5ForConditionalGeneration(
             return
         encoder = _RBLNQwen3VisionEncoder(self.visual).eval()
         object.__setattr__(self, "_mm_encoder", compile_fn(encoder))
+
+    def warmup_mm_encoder(self) -> None:
+        if not self.has_vision:
+            return
+        encoder = self._mm_encoder
+        if encoder is None:
+            # enforce_eager: the runner never calls compile_mm_encoder.
+            self.compile_mm_encoder(lambda encoder: encoder)
+            encoder = self._mm_encoder
+        assert encoder is not None
+        patch_dim = self.visual.patch_embed.proj.weight[0].numel()
+        pixels = torch.zeros(self.encoder_patches, patch_dim, dtype=self.visual.dtype)
+        with torch.inference_mode():
+            encoder(*self._encoder_inputs(pixels, self.encoder_grid))
 
     def _encoder_inputs(
         self, pixel_values: torch.Tensor, grid_thw: list[int]

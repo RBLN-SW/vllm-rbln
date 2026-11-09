@@ -14,9 +14,11 @@
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from math import prod
 
 import torch
 from vllm.config import VllmConfig
+from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
@@ -36,6 +38,10 @@ class RBLNBlockAuxSpec:
     owner: str
     block_shape: tuple[int, ...]
     dtype: torch.dtype
+
+    @property
+    def page_size_bytes(self) -> int:
+        return prod(self.block_shape) * get_dtype_size(self.dtype)
 
 
 @dataclass(frozen=True)

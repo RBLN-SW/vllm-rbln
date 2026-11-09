@@ -93,14 +93,14 @@ steps:
     command:
       - "uv run --no-sync pytest -x -vvs tests/optimum/v1/worker --durations 0"
 
-  - label: ":pytest: tests/optimum/optimum_compile/converter"
+  - label: ":pytest: tests/optimum/optimum_compile/configuration"
     if_changed: *if_changed
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     resources: *cpu-only-resources
     secrets: *secrets
     depends_on: *needs_venv
     command:
-      - "uv run --no-sync pytest -x -vvs tests/optimum/optimum_compile/converter --durations 0"
+      - "uv run --no-sync pytest -x -vvs tests/optimum/optimum_compile/configuration --durations 0"
 
   - label: ":pytest: tests/optimum/test_optimum_rbln_config.py"
     if_changed: *if_changed

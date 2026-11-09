@@ -21,7 +21,10 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.config.ec_manager_config import EncoderCacheManagerConfig
 from vllm.distributed.kv_events import BlockStored, KVEventBatch
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
@@ -32,21 +35,53 @@ from vllm.v1.request import RequestStatus
 
 from tests.vllm.v1.core.utils import (
     EOS_TOKEN_ID,
+    ECConnectorInTransit,
     MockKVConfig,
     _drain,
     advance_to_decode,
     create_rbln_scheduler,
     create_requests,
     full_attention_spec,
+    image_at,
     make_model_runner_output,
     make_request,
     prefill_request,
 )
 from vllm_rbln.platform import RblnPlatform
+from vllm_rbln.v1.core import rbln_scheduler
 from vllm_rbln.v1.core.rbln_kv_cache_manager import RBLNKVCacheManager
-from vllm_rbln.v1.core.rbln_scheduler import RBLNScheduler, RBLNSchedulerOutput
+from vllm_rbln.v1.core.rbln_scheduler import (
+    RBLNEncoderCacheManager,
+    RBLNScheduler,
+    RBLNSchedulerOutput,
+)
 from vllm_rbln.v1.core.utils import is_prefill, step_is_prefill
 from vllm_rbln.v1.kv_cache import RBLNGDNManager, RBLNGDNStateSpec
+
+
+@pytest.mark.parametrize("interrupt_scheduling", [False, True])
+def test_eviction_snapshot_defers_hits_only_within_its_scope(interrupt_scheduling):
+    request = make_request("cached", list(range(8)), 16, mm_features=[image_at(0, 2)])
+    replacement = make_request(
+        "replacement", list(range(8)), 16, mm_features=[image_at(2, 2)]
+    )
+    manager = RBLNEncoderCacheManager(cache_size=2)
+    manager.allocate(request, 0)
+    manager.free(request)
+
+    try:
+        with manager.eviction_snapshot(request):
+            assert manager.can_allocate(replacement, 0, 16, 0)
+            manager.allocate(replacement, 0)
+            manager.free(replacement)
+            assert not manager.can_allocate(request, 0, 16, 0)
+            if interrupt_scheduling:
+                raise RuntimeError("scheduling interrupted")
+    except RuntimeError as error:
+        assert interrupt_scheduling
+        assert str(error) == "scheduling interrupted"
+
+    assert manager.can_allocate(request, 0, 16, 0)
 
 
 class TestSchedulerInit:
@@ -81,6 +116,26 @@ class TestSchedulerInit:
         # One block a running request plus the null block.
         assert state.block_pool.num_gpu_blocks == 5
 
+    def test_no_ec_connector_keeps_the_default_encoder_cache_manager(self):
+        sched = create_rbln_scheduler()
+        assert type(sched.encoder_cache_manager) is EncoderCacheManager
+
+    def test_explicit_encoder_cache_manager_is_preserved(self):
+        config = EncoderCacheManagerConfig(
+            encoder_cache_manager_cls=(
+                "vllm.v1.core.encoder_cache_manager.EncoderCacheManager"
+            )
+        )
+        sched = create_rbln_scheduler(ec_manager_config=config)
+        assert type(sched.encoder_cache_manager) is EncoderCacheManager
+
+    def test_null_block_off_null_block_id_is_refused(self, monkeypatch):
+        # The sparse-attention ops write to NULL_BLOCK_ID; a pool that reserves
+        # another block must stop the scheduler from starting.
+        monkeypatch.setattr(rbln_scheduler, "NULL_BLOCK_ID", NULL_BLOCK_ID + 1)
+        with pytest.raises(RuntimeError, match="null block"):
+            create_rbln_scheduler()
+
     @pytest.mark.usefixtures("cr13")
     def test_sub_block_caching_enabled_uses_rbln_manager(self):
         # prefix caching + eligible config + sub_block_size -> RBLNKVCacheManager.
@@ -104,6 +159,17 @@ class TestSchedulerInit:
         )
         assert isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
         assert sched.kv_cache_manager.sub_block_size == 128
+
+    def test_sub_block_size_defaults_to_the_prefill_chunk_below_the_budget(self):
+        sched = create_rbln_scheduler(
+            enable_prefix_caching=True,
+            block_size=1024,
+            max_num_batched_tokens=128,
+            max_model_len=2048,
+            additional_config={"prefill_chunk_size": 64},
+        )
+        assert isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
+        assert sched.kv_cache_manager.sub_block_size == 64
 
     @pytest.mark.usefixtures("cr13")
     def test_additional_config_sets_the_sub_block_size(self):
@@ -1988,3 +2054,72 @@ class TestSyncKVLoads:
         # Only the 16 tokens past the hit are computed this step.
         assert output.num_scheduled_tokens[request.request_id] == 16
         assert output.has_sync_kv_loads
+
+
+class TestEcTransferPending:
+    """A request whose encoder outputs are still in transit is held back,
+    waiting or running, and scheduled once they arrive."""
+
+    @staticmethod
+    def _scheduler():
+        sched = create_rbln_scheduler(
+            max_num_seqs=4, max_num_batched_tokens=8, max_model_len=64
+        )
+        sched.ec_connector = ECConnectorInTransit()
+        return sched
+
+    @staticmethod
+    def _request():
+        # The image sits past the first two chunks, so no chunk here encodes it.
+        return make_request("0", list(range(24)), 16, mm_features=[image_at(20, 4)])
+
+    def test_a_waiting_request(self):
+        sched = self._scheduler()
+        sched.add_request(self._request())
+
+        assert sched.schedule().num_scheduled_tokens == {}
+        sched.ec_connector.arrived = True
+        assert sched.schedule().num_scheduled_tokens == {"0": 8}
+
+    def test_a_running_request(self):
+        sched = self._scheduler()
+        sched.ec_connector.arrived = True
+        sched.add_request(self._request())
+        out = sched.schedule()
+        sched.update_from_output(out, make_model_runner_output(out))
+
+        sched.ec_connector.arrived = False
+        assert sched.schedule().num_scheduled_tokens == {}
+        sched.ec_connector.arrived = True
+        assert sched.schedule().num_scheduled_tokens == {"0": 8}
+
+
+class TestEcConsumerEncodesNothing:
+    """An image the connector cannot supply would be encoded locally, which an EC
+    consumer has no vision encoder for."""
+
+    @staticmethod
+    def _schedule(*, is_producer):
+        sched = create_rbln_scheduler(
+            max_num_seqs=4, max_num_batched_tokens=8, max_model_len=64
+        )
+        sched.ec_connector = ECConnectorInTransit(is_producer=is_producer)
+        sched.ec_connector.arrived = True
+        sched.max_num_encoder_input_tokens = 16
+        sched.encoder_cache_manager = EncoderCacheManager(cache_size=16)
+        request = make_request("0", list(range(24)), 16, mm_features=[image_at(0, 4)])
+        sched.add_request(request)
+        return sched, request, sched.schedule()
+
+    def test_the_consumer_fails_the_request(self):
+        sched, request, out = self._schedule(is_producer=False)
+
+        assert out.num_scheduled_tokens == {}
+        sched.update_from_output(out, make_model_runner_output(out))
+        assert request.status == RequestStatus.FINISHED_ERROR
+
+    def test_ec_both_encodes_it(self):
+        _, request, out = self._schedule(is_producer=True)
+
+        assert out.scheduled_encoder_inputs == {"0": [0]}
+        assert request.status == RequestStatus.RUNNING
