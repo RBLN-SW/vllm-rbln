@@ -1584,6 +1584,31 @@ class TestStreamedEngineHandleWrite:
         assert first_local == [2, 10, 60, 62, 92, 94]
         assert second_local == [30, 46]
 
+    def test_a_closing_offer_stops_a_part_written_block_at_its_own_count(self):
+        # Four chunks a block; the first batch sent two of the last block's
+        # three. The closing offer carries the count while the worker's map
+        # has none, and has to cut the rest where the map's count would.
+        def second_write(on_list):
+            worker = self._worker(grid=(2, 4))
+            worker._valid_tokens = {} if on_list else {"r0": 3 * 16 + 12}
+            worker._xfer_blocks_for_req(
+                "r0",
+                self._offer(worker, ([0, 1, 2, 3], []), ([4, 5], [6]), 3 * 16 + 8),
+            )
+            closing = self._offer(worker, ([0, 1, 2, 3], [7]), ([4, 5], [6]), 0)
+            closing.local_block_ids = pw.OfferedBlocks(
+                ([0, 1, 2, 3], [7]),
+                0,
+                worker._streamed["r0"].serial,
+                done=None,
+                valid_tokens=3 * 16 + 12 if on_list else None,
+            )
+            worker._xfer_blocks_for_req("r0", closing)
+            call = worker.nixl_wrapper.make_prepped_xfer.call_args
+            return list(call.args[2]), list(call.args[4])
+
+        assert second_write(on_list=True) == second_write(on_list=False)
+
     def test_a_handover_pairs_the_window_group_from_its_end(self):
         # Once the window fits one block, the producer's window group leads
         # with a null block while the consumer registers only the live one.
@@ -3730,6 +3755,38 @@ class TestStreamWindow:
         descs = worker.nixl_wrapper.make_prepped_xfer.call_args.args[2]
         whole = 2 * worker.num_blocks
         assert all(d >= whole for d in descs)
+        assert len(descs) == 2 * 2  # 2 regions x 2 heads x 1 chunk
+
+    def test_a_closing_offer_stops_a_part_written_block_at_its_own_count(self):
+        # The case above with the count only on the closing offer, as the
+        # scheduler sends it. The rest of the last block stops at the third
+        # chunk; without the count it would carry the fourth, which holds none.
+        worker = self._worker(total=4)
+        worker.block_size = 16
+        set_shape(worker, chunk_mode=True)
+        worker._shard_chunk_grids = {("eng", 0): uniform_grid(2, 4, regions=2)}
+        worker._valid_tokens = {}
+
+        first = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
+        first.local_block_ids = pw.OfferedBlocks(
+            first.local_block_ids,
+            3 * 16 + 8,
+            worker._streamed["r0"].serial,
+            done=None,
+        )
+        worker._xfer_blocks_for_req("r0", first)
+
+        closing = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
+        closing.local_block_ids = pw.OfferedBlocks(
+            closing.local_block_ids,
+            0,
+            worker._streamed["r0"].serial,
+            done=None,
+            valid_tokens=3 * 16 + 12,
+        )
+        worker._xfer_blocks_for_req("r0", closing)
+
+        descs = worker.nixl_wrapper.make_prepped_xfer.call_args.args[2]
         assert len(descs) == 2 * 2  # 2 regions x 2 heads x 1 chunk
 
     def test_streaming_alone_sends_the_last_block_whole_once_it_closes(self):
