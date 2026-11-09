@@ -246,75 +246,50 @@ class SparsePenaltyState:
         When a request outgrows `k` chunk slots, `k` moves to `next_k` and every
         live request is rebuilt from its full history.
         """
+        split = num_rows == 1
         while True:
             try:
-                return self._update(
-                    req_ids,
-                    prompt_fn,
-                    output_token_ids,
-                    rep,
-                    freq,
-                    pres,
-                    biases,
-                    vocab_size,
-                    num_rows,
-                )
+                live = set(req_ids)
+                for rid in [r for r in self._reqs if r not in live]:
+                    del self._reqs[rid]
+                for i, rid in enumerate(req_ids):
+                    outs = output_token_ids[i] if i < len(output_token_ids) else ()
+                    n_out = len(outs)
+                    for j, t in enumerate(outs):
+                        if t < 0:  # async placeholder
+                            n_out = j
+                            break
+                    req = self._reqs.get(rid)
+                    if req is not None and (req.split != split or n_out < req.done):
+                        req = None
+                    if req is None:
+                        req = self._reqs[rid] = _Request(
+                            split,
+                            vocab_size,
+                            self.k,
+                            float(rep[i]),
+                            float(freq[i]),
+                            float(pres[i]),
+                        )
+                        for t, v in biases.get(i, {}).items():
+                            req.add_bias(int(t), v)
+                        if req.active:
+                            for t in prompt_fn(i):
+                                if 0 <= t < vocab_size:
+                                    req.add_prompt(int(t))
+                            new_outputs = outs[:n_out]
+                        else:
+                            new_outputs = ()
+                    else:
+                        new_outputs = outs[req.done : n_out] if req.active else ()
+                    for t in new_outputs:
+                        if 0 <= t < vocab_size:
+                            req.add_output(int(t))
+                    req.done = n_out
+                break
             except _GrowK:
                 self.k = next_k(self.k)
                 self._reqs.clear()
-
-    def _update(
-        self,
-        req_ids,
-        prompt_fn,
-        output_token_ids,
-        rep,
-        freq,
-        pres,
-        biases,
-        vocab_size,
-        num_rows,
-    ):
-        split = num_rows == 1
-        live = set(req_ids)
-        for rid in [r for r in self._reqs if r not in live]:
-            del self._reqs[rid]
-
-        for i, rid in enumerate(req_ids):
-            outs = output_token_ids[i] if i < len(output_token_ids) else ()
-            n_out = len(outs)
-            for j, t in enumerate(outs):
-                if t < 0:  # async placeholder
-                    n_out = j
-                    break
-            req = self._reqs.get(rid)
-            if req is not None and (req.split != split or n_out < req.done):
-                req = None
-            if req is None:
-                req = self._reqs[rid] = _Request(
-                    split,
-                    vocab_size,
-                    self.k,
-                    float(rep[i]),
-                    float(freq[i]),
-                    float(pres[i]),
-                )
-                for t, v in biases.get(i, {}).items():
-                    req.add_bias(int(t), v)
-                if req.active:
-                    for t in prompt_fn(i):
-                        if 0 <= t < vocab_size:
-                            req.add_prompt(int(t))
-                    new_outputs = outs[:n_out]
-                else:
-                    new_outputs = ()
-            else:
-                new_outputs = outs[req.done : n_out] if req.active else ()
-            for t in new_outputs:
-                if 0 <= t < vocab_size:
-                    req.add_output(int(t))
-            req.done = n_out
-
         return self._copy_out(req_ids, vocab_size, num_rows)
 
     def _copy_out(self, req_ids, vocab_size, num_rows):
