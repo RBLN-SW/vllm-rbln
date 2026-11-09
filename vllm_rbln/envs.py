@@ -33,7 +33,6 @@ if TYPE_CHECKING:
     # ====================================================================
     VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK: int = 1
     VLLM_RBLN_SAMPLER: bool = True
-    VLLM_RBLN_SPARSE_PENALTY: bool = False
     VLLM_RBLN_ENABLE_WARM_UP: bool = True
     VLLM_RBLN_METRICS: bool = False
     VLLM_RBLN_METRICS_DIR: str = ""
@@ -211,12 +210,6 @@ environment_variables = {
     # Use customized sampler
     "VLLM_RBLN_SAMPLER": (
         lambda: os.environ.get("VLLM_RBLN_SAMPLER", "True").lower() in ("true", "1")
-    ),
-    # Apply penalties and logit bias on the touched vocab chunks only, inside the
-    # sampling graph. Requires VLLM_RBLN_SAMPLER.
-    "VLLM_RBLN_SPARSE_PENALTY": (
-        lambda: os.environ.get("VLLM_RBLN_SPARSE_PENALTY", "False").lower()
-        in ("true", "1")
     ),
     # Enable warm_up
     "VLLM_RBLN_ENABLE_WARM_UP": (
@@ -399,7 +392,6 @@ RBLN_NON_COMPILE_ENV = frozenset(
         "VLLM_RBLN_DISABLE_WORKER_FAIL_FAST",
         # sampler graphs compile with use_cache=False, never enter the bundle
         "VLLM_RBLN_SAMPLER",
-        "VLLM_RBLN_SPARSE_PENALTY",
         "VLLM_RBLN_COMPILE_STRICT_MODE",
         "VLLM_RBLN_ENABLE_WARM_UP",
         "VLLM_RBLN_METRICS",

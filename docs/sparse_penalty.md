@@ -14,19 +14,26 @@ right before temperature, softmax and top-k / top-p (or argmax).
 Key components:
 
 - `vllm_rbln.v1.sample.ops.sparse_penalty` holds the per-request host state
-  (`SparsePenaltyState`) and the device-side math (`apply_sparse_penalty`).
-- `RBLNSampler` defers logit bias and penalties to the fused sampling graph when
-  the batch qualifies, and warms those graphs up with the rest of the sampler.
+  (`SparsePenaltyState`), which turns a step's sampling metadata into a
+  `SparsePlan`, and the device-side math (`apply_sparse_penalty`).
+- `RBLNSampler` asks for a plan each step, hands upstream
+  `apply_logits_processors` the metadata without penalties and logit bias, and
+  passes the plan to `sample()`. Its `warm_up()` compiles the fused graphs with
+  the rest of the sampler.
 
 ## Enabling
 
-| Env | Default | Description |
+| Flag | Default | Description |
 | --- | --- | --- |
-| `VLLM_RBLN_SPARSE_PENALTY` | `False` | Apply penalties and logit bias inside the sampling graph. Requires `VLLM_RBLN_SAMPLER`. |
+| `--rbln-use-sparse-penalty` | `False` | Apply penalties and logit bias inside the sampling graph. Requires `use_custom_sampler`. |
 
-A step falls back to the existing path when it uses min_p, asks for processed
-logprobs, runs speculative decoding or a thinking budget, or when the vocab size
-is not a multiple of 128.
+`LLM(...)` takes it as `additional_config={"use_sparse_penalty": True}`.
+
+A step keeps the existing path when it runs speculative decoding or a thinking
+budget, when the sampler returns processed logprobs, or when the vocab size is
+not a multiple of 128. A step with min_p applies the penalties in a graph of
+their own first, since min_p reads the penalized logits, then continues on the
+existing path.
 
 ## How It Works
 
@@ -84,18 +91,22 @@ out = scatter(logits_view, cidx, v)
   is updated on every occurrence.
 - Requests are keyed by request id, so finished, new and reordered rows need no
   special handling. Padded rows of the batch bucket stay at identity.
+- Each request stores only its used slots. The tail that repeats slot 0 is
+  filled when the step's buffer is assembled.
 - A batch of one is laid out as two half-vocab rows.
 
 ### Shapes and compilation
 
-A fused graph is keyed by its kind (greedy, top-k / top-p, or penalties only),
+A fused graph is keyed by its kind (greedy, top-k / top-p, or penalties only
+for min_p steps),
 the number of rows, the row vocab size and `K`. Penalty values, bias values,
 temperature, top-k and top-p are tensor data, so changing them never
 recompiles.
 
-`K` starts at 256 chunks per row, grows by 64 up to 512 and doubles after that.
-The first bucket is compiled at warm-up. A request with an unusually long prompt
-or output can move the batch to the next bucket, which compiles once.
+`K` starts at 256 chunks per row, grows by 64 up to 512 and doubles after that
+(`next_k`). The first bucket is compiled at warm-up. A request with an unusually
+long prompt or output moves the batch to the next bucket: every live request is
+rebuilt from its full history once, and the new graphs compile once.
 
 ## Limitations
 

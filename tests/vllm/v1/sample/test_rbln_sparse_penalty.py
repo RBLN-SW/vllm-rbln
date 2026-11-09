@@ -20,6 +20,7 @@ from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
 
 from vllm_rbln.v1.sample.ops.sparse_penalty import (
+    K_MIN,
     SparsePenaltyState,
     apply_sparse_penalty,
 )
@@ -41,13 +42,21 @@ def dense_reference(logits, prompts, outputs, rep, freq, pres, biases):
     return out
 
 
-@pytest.mark.parametrize("num_rows", [1, 4, 16])
-def test_state_matches_dense_across_steps(num_rows):
+@pytest.mark.parametrize(
+    ("num_rows", "vocab", "k_min"),
+    [
+        (1, 4096, K_MIN),
+        (4, 4096, K_MIN),
+        (16, 4096, K_MIN),
+        # ~150 chunks per request outgrow 64 slots: k moves up and rebuilds.
+        (4, 16384, 64),
+    ],
+)
+def test_state_matches_dense_across_steps(num_rows, vocab, k_min):
     """Requests join, leave, reorder and grow one token per step."""
-    vocab = 4096
     rng = random.Random(0)
     torch.manual_seed(0)
-    state = SparsePenaltyState()
+    state = SparsePenaltyState(k_min=k_min)
     reqs: dict[str, dict] = {}
     for step in range(12):
         if step % 4 == 0:
@@ -69,7 +78,7 @@ def test_state_matches_dense_across_steps(num_rows):
             r["outputs"].append(rng.choice(r["prompt"] + [rng.randrange(vocab)]))
         live = [reqs[r] for r in ids]
 
-        rows, row_vocab, k, cidx, lanes = state.build(
+        rows, row_vocab, k, cidx, lanes = state.update(
             ids,
             lambda i, live=live: np.asarray(live[i]["prompt"]),
             [r["outputs"] for r in live],
@@ -95,13 +104,33 @@ def test_state_matches_dense_across_steps(num_rows):
         )
         torch.testing.assert_close(got[: len(ids)], want, atol=1e-3, rtol=1e-3)
         assert torch.equal(got[len(ids) :], logits[len(ids) :])
+    assert state.k > k_min or vocab // 64 <= k_min
 
 
-def test_sampler_matches_dense_path(monkeypatch):
-    """Greedy picks under penalties and logit bias match the upstream path."""
+def _run_sampler(params, logits, sparse: bool, expect_kinds: set[str]):
     device = current_platform.device_type
-    prompt = [11, 4000, 9000]
-    outputs = [4000, 77]
+    batch = build_input_batch(
+        [(str(i), p) for i, p in enumerate(params)],
+        device=device,
+        prompt_token_ids=[11, 4000, 9000],
+        output_token_ids=[4000, 77],
+    )
+    sampler = RBLNSampler(sparse_penalty=sparse)
+    out = sampler(logits.clone().to(device), batch.sampling_metadata, input_batch=batch)
+    # The sparse run must take the fused graphs, not fall back to upstream.
+    assert {key[0] for key in sampler._sparse_graphs} == expect_kinds
+    return out.sampled_token_ids.view(-1).cpu()
+
+
+def _logits(rows: int) -> torch.Tensor:
+    logits = torch.full((rows, VOCAB_SIZE), -2.0)
+    logits[:, 4000] = 5.0  # seen: penalties push it below 4.5
+    logits[:, 555] = 4.5
+    return logits.to(torch.bfloat16)
+
+
+def test_sampler_matches_dense_path():
+    """Greedy picks under penalties and logit bias match the upstream path."""
     params = [
         SamplingParams(temperature=0.0, repetition_penalty=1.3),
         SamplingParams(temperature=0.0, frequency_penalty=2.0, presence_penalty=1.0),
@@ -110,26 +139,21 @@ def test_sampler_matches_dense_path(monkeypatch):
             temperature=0.0, logit_bias={4000: -100.0}, repetition_penalty=1.1
         ),
     ]
-    logits = torch.full((len(params), VOCAB_SIZE), -2.0)
-    logits[:, 4000] = 5.0  # seen: penalties push it below 4.5
-    logits[:, 555] = 4.5
-    logits = logits.to(torch.bfloat16)
-
-    def run(sparse: bool) -> torch.Tensor:
-        monkeypatch.setenv("VLLM_RBLN_SPARSE_PENALTY", "1" if sparse else "0")
-        batch = build_input_batch(
-            [(str(i), p) for i, p in enumerate(params)],
-            device=device,
-            prompt_token_ids=prompt,
-            output_token_ids=outputs,
-        )
-        sampler = RBLNSampler()
-        out = sampler(
-            logits.clone().to(device), batch.sampling_metadata, input_batch=batch
-        )
-        # The sparse run must take the fused graph, not fall back to upstream.
-        assert bool(sampler._sparse_graphs) == sparse
-        return out.sampled_token_ids.view(-1).cpu()
-
-    dense, sparse = run(False), run(True)
+    logits = _logits(len(params))
+    dense = _run_sampler(params, logits, sparse=False, expect_kinds=set())
+    sparse = _run_sampler(params, logits, sparse=True, expect_kinds={"greedy"})
     assert sparse.tolist() == dense.tolist() == [555, 555, 123, 555]
+
+
+def test_min_p_reads_penalized_logits():
+    """With min_p on, penalties apply before it, through the penalize graph."""
+    params = [
+        SamplingParams(temperature=1.0, min_p=0.5, repetition_penalty=1.3),
+        SamplingParams(temperature=1.0, min_p=0.5, logit_bias={123: 100.0}),
+    ]
+    logits = _logits(len(params))
+    logits[:, 555] = 10.0  # min_p keeps only the clear winner
+    logits[1, 123] = -100.0  # bias lifts it to 0, still below 555
+    dense = _run_sampler(params, logits, sparse=False, expect_kinds=set())
+    sparse = _run_sampler(params, logits, sparse=True, expect_kinds={"penalize"})
+    assert sparse.tolist() == dense.tolist() == [555, 555]

@@ -322,6 +322,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             self.sampler = RBLNSampler(
                 logprobs_mode=self.model_config.logprobs_mode,
                 compile_context=self.compile_context,
+                sparse_penalty=self.rbln_config.use_sparse_penalty,
             )
             logger.info("Using RBLN sampler.")
         else:
@@ -3014,12 +3015,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 spec_token_ids=[[] for _ in range(num_reqs)],
             )
 
-            _ = self.sampler(
-                logits=logits,
-                sampling_metadata=dummy_metadata,
-            )
             if isinstance(self.sampler, RBLNSampler):
-                self.sampler.warm_up_sparse_penalty(logits.clone(), dummy_metadata)
+                self.sampler.warm_up(logits=logits, sampling_metadata=dummy_metadata)
+            else:
+                _ = self.sampler(logits=logits, sampling_metadata=dummy_metadata)
 
             if num_reqs > 1:
                 # A batch smaller than the bucket takes `_pad_rows`'s `torch.cat`
