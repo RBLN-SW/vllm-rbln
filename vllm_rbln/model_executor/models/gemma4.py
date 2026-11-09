@@ -44,10 +44,6 @@ from vllm_rbln.model_executor.models.interfaces import (
     SupportsRBLNMultiModal,
 )
 
-# Padding seen by the encoder's softmax: far below any real score, still
-# finite in half precision.
-_KEY_PAD_BIAS = -30000.0
-
 
 class _RBLNGemma4VisionEncoder(nn.Module):
     """Gemma4's vision tower and its projection into the text model as one
@@ -334,7 +330,9 @@ class RBLNGemma4ForConditionalGeneration(
         patches = torch.zeros(1, bucket, pixel_values.shape[-1])
         patches[0, :num_patches] = pixel_values[valid]
         padding = ~(positions >= 0).all(dim=-1)
-        key_bias = torch.where(padding, _KEY_PAD_BIAS, 0.0)[:, None, None, :]
+        key_bias = torch.where(padding, torch.finfo(self.model_dtype).min, 0.0)[
+            :, None, None, :
+        ]
         device = next(tower.parameters()).device
         embeds = encoder(
             patches.to(device),
