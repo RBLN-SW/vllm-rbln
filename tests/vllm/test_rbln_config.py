@@ -39,7 +39,7 @@ from vllm_rbln.config import (
     resolve_model_impl,
 )
 from vllm_rbln.envs import RESOLVED_MODEL_IMPL_ENV
-from vllm_rbln.utils.optimum.paths import RBLN_CONFIG_FILE
+from vllm_rbln.utils.optimum.path import RBLN_CONFIG_FILE
 
 
 @pytest.fixture(autouse=True)

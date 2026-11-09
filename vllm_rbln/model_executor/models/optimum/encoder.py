@@ -33,16 +33,12 @@ from vllm.tasks import PoolingTask
 from vllm.v1.outputs import PoolerOutput
 from vllm.v1.pool.metadata import PoolingMetadata
 
+from vllm_rbln.utils.optimum.registry import is_decoder_pooling_arch
+
 from .base import ModelInputForRBLN
 from .model_base import RBLNOptimumModelBase
 
 logger = init_logger(__name__)
-
-# Decoder-based pooling architectures that must NOT be forced to CLS pooling.
-# Qwen3 embedding/reranker (HF arch ``Qwen3ForCausalLM``) is remapped to
-# ``Qwen3Model`` by the model runner and uses LAST-token pooling, like any
-# decoder-based embedder — CLS (token 0) would be wrong for a causal model.
-_DECODER_POOLING_ARCHS = {"Qwen3Model"}
 
 
 class RBLNClassifierPooler(Pooler):
@@ -91,11 +87,9 @@ class RBLNOptimumForEncoderModel(RBLNOptimumModelBase, VllmModelForPooling):
         super().__init__(vllm_config=vllm_config)
         pooler_config = vllm_config.model_config.pooler_config
         assert pooler_config is not None
-        # Encoder-only models (e.g. BERT/RoBERTa) use CLS-token pooling, so we
-        # override vLLM's resolved sequence pooling type to CLS. Decoder-based
-        # pooling models (e.g. Qwen3 embedding) must keep their LAST-token
-        # pooling — see _DECODER_POOLING_ARCHS.
-        if not self.is_decoder_pooling_arch():
+        # Encoder-only models use CLS; decoder-based embedders keep their
+        # resolved pooling method (e.g. LAST for Qwen3 embedding).
+        if not is_decoder_pooling_arch(self.model_config.hf_config):
             pooler_config.seq_pooling_type = "CLS"
         # https://github.com/vllm-project/vllm/blob/v0.22.0/docs/models/pooling_models/scoring.md
         # vLLM groups score()-capable models into three "score types"
@@ -138,14 +132,6 @@ class RBLNOptimumForEncoderModel(RBLNOptimumModelBase, VllmModelForPooling):
             [],
         )
         return len(architectures) > 0 and "Classification" in architectures[0]
-
-    def is_decoder_pooling_arch(self):
-        architectures = getattr(
-            self.model_config.hf_config,
-            "architectures",
-            [],
-        )
-        return len(architectures) > 0 and architectures[0] in _DECODER_POOLING_ARCHS
 
     def preprocess(
         self,
