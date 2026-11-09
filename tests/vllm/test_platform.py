@@ -612,46 +612,47 @@ class TestRejectedConfigs:
 
     def test_an_unset_prefill_chunk_resolves_to_the_token_budget(self, reconfigure):
         config = reconfigure(lambda config: None)
-        assert (
-            config.additional_config.prefill_chunk_size
-            == config.scheduler_config.max_num_batched_tokens
-        )
+        assert config.additional_config.prefill_chunk_size == [
+            config.scheduler_config.max_num_batched_tokens
+        ]
 
     def test_a_prefill_chunk_below_the_token_budget_is_taken(self, reconfigure):
         config = reconfigure(_prefill_chunk(64))
-        assert config.additional_config.prefill_chunk_size == 64
+        assert config.additional_config.prefill_chunk_size == [64]
 
-    @pytest.mark.parametrize(
-        "feature, enable",
-        [
-            ("data parallelism", lambda c: _ranks(data_parallel_size=2)(c)),
-            (
-                "RBLN NIXL KV transfer",
-                lambda c: setattr(
-                    c,
-                    "kv_transfer_config",
-                    SimpleNamespace(
-                        kv_connector="RblnNixlPushConnector",
-                        kv_connector_extra_config={},
-                    ),
-                ),
-            ),
-        ],
-    )
-    def test_a_prefill_chunk_below_the_token_budget_refuses(
-        self, reconfigure, feature, enable
+    @pytest.mark.parametrize("sizes", [64, [32, 64]])
+    def test_prefill_chunk_below_the_token_budget_takes_data_parallelism(
+        self, reconfigure, sizes
     ):
         def mutate(config):
-            _prefill_chunk(64)(config)
-            enable(config)
+            _prefill_chunk(sizes)(config)
+            _ranks(data_parallel_size=2)(config)
 
-        with pytest.raises(ValueError, match=feature):
+        config = reconfigure(mutate)
+        assert config.additional_config.prefill_chunk_size == (
+            sizes if isinstance(sizes, list) else [sizes]
+        )
+
+    def test_several_prefill_chunk_sizes_refuse_non_causal_attention(self, reconfigure):
+        def mutate(config):
+            _prefill_chunk([32, 64])(config)
+            config.attention_config.use_non_causal = True
+
+        with pytest.raises(ValueError, match="non-causal attention"):
             reconfigure(mutate)
+
+    def test_one_prefill_chunk_size_keeps_non_causal_attention(self, reconfigure):
+        def mutate(config):
+            _prefill_chunk(64)(config)
+            config.attention_config.use_non_causal = True
+
+        reconfigure(mutate)
 
     @pytest.mark.parametrize(
         "kv_connector, extra",
         [
             ("RblnNixlConnector", {}),
+            ("RblnNixlPushConnector", {}),
             (
                 "MultiConnector",
                 {"connectors": [{"kv_connector": "RblnNixlPullConnector"}]},
@@ -777,7 +778,7 @@ def _ranks(
     return mutate
 
 
-def _prefill_chunk(size: int):
+def _prefill_chunk(size: int | list[int]):
     """A mutator that sets --rbln-prefill-chunk-size, with sub-block caching off."""
 
     def mutate(config: VllmConfig) -> None:
