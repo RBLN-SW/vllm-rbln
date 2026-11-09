@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import torch
 from vllm.config import VllmConfig
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.single_type_kv_cache_manager import (
     MambaManager,
@@ -186,7 +187,7 @@ class RBLNGDNStateSpec(MambaSpec):
 class RBLNGDNManager(MambaManager):
     """`MambaManager` on a pool of its own, bound after construction.
 
-    The coordinator builds every manager on the attention pool. `bind_pool`
+    The coordinator builds every manager on the attention pool. `bind_own_pool`
     swaps this group's pool in, and from then on the manager stays out of the
     attention count: it reports 0 while its pool has room and the attention
     pool's refusal sentinel (`num_gpu_blocks + 1`) when it does not, the way
@@ -199,11 +200,14 @@ class RBLNGDNManager(MambaManager):
         super().__init__(kv_cache_spec, block_pool, **kwargs)
         self._attention_pool = block_pool
 
-    def bind_pool(self, num_blocks: int) -> None:
+    def bind_own_pool(self, vllm_config: VllmConfig) -> None:
+        """Replace the attention pool this group was built with by one of its own."""
+        spec = self.kv_cache_spec
+        assert isinstance(spec, RBLNGDNStateSpec), spec
         # Prefix caching is off for GatedDeltaNet models (platform), so the
         # pool neither hashes its blocks nor publishes cache events.
         self.block_pool = BlockPool(
-            num_gpu_blocks=num_blocks,
+            num_gpu_blocks=spec.pool_blocks(vllm_config),
             enable_caching=False,
             hash_block_size=self._attention_pool.hash_block_size,
         )
@@ -221,7 +225,7 @@ class RBLNGDNManager(MambaManager):
         prefill_end: int = 0,
     ) -> int:
         assert self.block_pool is not self._attention_pool, (
-            "RBLNGDNManager schedules on a pool of its own: call bind_pool first"
+            "RBLNGDNManager schedules on a pool of its own: call bind_own_pool first"
         )
         required = super().get_num_blocks_to_allocate(
             request_id,
@@ -236,3 +240,12 @@ class RBLNGDNManager(MambaManager):
         if required > self.block_pool.get_num_free_blocks():
             return self._attention_pool.num_gpu_blocks + 1
         return 0
+
+
+def bind_own_pools(kv_cache_manager: KVCacheManager, vllm_config: VllmConfig) -> None:
+    """The coordinator built every manager on the attention pool; a manager
+    that defines `bind_own_pool` schedules on one of its own."""
+    for manager in kv_cache_manager.coordinator.single_type_managers:
+        bind = getattr(manager, "bind_own_pool", None)
+        if bind is not None:
+            bind(vllm_config)

@@ -50,6 +50,10 @@ def _spec(*, block_size=16, sliding_window=16):
     )
 
 
+# A pool of the null block and two states (max_num_seqs + 1).
+_TWO_SEQS = SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=2))
+
+
 def _gdn_spec(*, block_size=16, page_size_padded=None):
     return RBLNGDNStateSpec(
         shapes=((2, 4, 2, 8, 8),),
@@ -441,7 +445,7 @@ class TestRBLNGDNManagerPool:
     def test_state_blocks_come_from_the_bound_pool_and_count_nothing(self):
         coord = self._coordinator(num_blocks=8)
         state = coord.single_type_managers[1]
-        state.bind_pool(3)  # the null block and two states
+        state.bind_own_pool(_TWO_SEQS)
         # One attention block; the state block is not the attention pool's.
         assert self._need(coord, "r", 16) == 1
         attn_blocks, state_blocks = coord.allocate_new_blocks(
@@ -455,7 +459,7 @@ class TestRBLNGDNManagerPool:
     def test_full_state_pool_answers_the_attention_refusal(self):
         coord = self._coordinator(num_blocks=8)
         state = coord.single_type_managers[1]
-        state.bind_pool(3)
+        state.bind_own_pool(_TWO_SEQS)
         coord.allocate_new_blocks("r", num_tokens=16, num_tokens_main_model=16)
         coord.allocate_new_blocks("s", num_tokens=16, num_tokens_main_model=16)
         assert state.block_pool.get_num_free_blocks() == 0
@@ -465,7 +469,7 @@ class TestRBLNGDNManagerPool:
     def test_free_returns_state_blocks_to_their_pool(self):
         coord = self._coordinator(num_blocks=8)
         state = coord.single_type_managers[1]
-        state.bind_pool(3)
+        state.bind_own_pool(_TWO_SEQS)
         coord.allocate_new_blocks("r", num_tokens=16, num_tokens_main_model=16)
         coord.free("r")
         assert state.block_pool.get_num_free_blocks() == 3 - 1
