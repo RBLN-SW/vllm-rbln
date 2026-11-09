@@ -36,7 +36,7 @@ exists, and the rest are bring-up knobs -- are not fields here.
 
 import argparse
 import os
-from dataclasses import field, fields
+from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
 
 from pydantic import Field
@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     from dataclasses import Field as DataclassField
 
     from vllm.utils.argparse_utils import FlexibleArgumentParser
+
 
 logger = init_logger(__name__)
 
@@ -185,6 +186,22 @@ class RBLNConfig(RBLNConfigBase):
             raise ValueError("encoder_token_budgets must be unique")
 
 
+@dataclass
+class OptimumRBLNCompileInputs:
+    """Resolved inputs shared by cache hashing, vLLM config sync and compilation.
+
+    Must remain serializable for worker transfer via `additional_config`.
+    """
+
+    model: str
+    dtype: Any
+    model_cls: str
+    rbln_config: dict[str, Any]
+    # Keep third-party config dataclasses opaque to pydantic validation.
+    hf_config: Any
+    npu_name: str
+
+
 @vllm_config_dataclass
 class OptimumRBLNConfig(RBLNConfigBase):
     """RBLN NPU options for the optimum-rbln model path."""
@@ -201,19 +218,27 @@ class OptimumRBLNConfig(RBLNConfigBase):
     """`--num-gpu-blocks-override` as given, before the prefix-cache block ratio
     is applied to it."""
 
-    # Written by the sync, and carried to the processes that cannot build
-    # `RBLNParams` of their own.
+    # Written during runtime synchronization and carried to workers.
     attn_block_size: int | None = field(default=None, metadata=_DERIVED)
-    """`RBLNParams.kvcache_block_size`, when prefix caching splits the KV-cache
-    block size from `cache_config.block_size`."""
+    """The compiled KV-cache block size, retained when prefix caching uses
+    smaller blocks in `cache_config.block_size`."""
 
     image_prefill_chunk_size: list[int] | None = field(default=None, metadata=_DERIVED)
-    """`RBLNParams.image_prefill_chunk_size`, the image-prefill buckets
-    (gemma3/gemma4) the scheduler pads against."""
+    """Compiled image-prefill buckets (gemma3/gemma4) used for scheduler padding."""
 
-    cached_model_path: str | None = field(default=None, metadata=_DERIVED)
-    """Where the compile cache holds, or will put, this model's artifact. Built
-    from the fields above, so it cannot key the cache it names."""
+    compile_inputs: OptimumRBLNCompileInputs | None = field(
+        default=None, metadata=_DERIVED
+    )
+    """Inputs shared by cache lookup and compilation.
+
+    Runtime synchronization must not mutate them.
+    """
+
+    artifact_path: str | None = field(default=None, metadata=_DERIVED)
+    """Artifact selected for loading, or the destination for a new compilation."""
+
+    precompiled: bool = field(default=False, metadata=_DERIVED)
+    """Whether synchronization selected an existing artifact to load."""
 
     num_blocks_synced: bool = field(default=False, metadata=_DERIVED)
     """Set once num_gpu_blocks is derived from the compiled model, so the second
@@ -465,7 +490,7 @@ def _model_impl_for(engine_args: Any) -> tuple[ModelImpl, str, str]:
 
     # Owned by the optimum path, and imported here so that a run which named
     # its path, and never reaches this, does not import it at all.
-    from vllm_rbln.utils.optimum.paths import is_compiled_dir
+    from vllm_rbln.utils.optimum.path import is_compiled_dir
     from vllm_rbln.utils.optimum.registry import is_arch_supported
 
     model = maybe_model_redirect(engine_args.hf_config_path or engine_args.model)

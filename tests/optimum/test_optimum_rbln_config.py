@@ -238,7 +238,8 @@ def test_only_compile_fields_change_the_hash():
     """A field the sync derives cannot key the artifact it was derived from."""
     base = OptimumRBLNConfig().compute_hash()
     assert OptimumRBLNConfig(attn_block_size=64).compute_hash() == base
-    assert OptimumRBLNConfig(cached_model_path="/tmp/x").compute_hash() == base
+    assert OptimumRBLNConfig(artifact_path="/tmp/x").compute_hash() == base
+    assert OptimumRBLNConfig(precompiled=True).compute_hash() == base
     assert OptimumRBLNConfig(num_blocks_synced=True).compute_hash() == base
     assert OptimumRBLNConfig(use_custom_sampler=False).compute_hash() == base
     assert OptimumRBLNConfig(prefill_chunk_size=512).compute_hash() != base

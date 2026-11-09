@@ -12,9 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Callable
 from typing import Union
 
 import torch
+
+
+def run_mm_encoder(
+    encoder: Callable[..., torch.Tensor],
+    inputs: list[torch.Tensor],
+    num_embeddings: int,
+    *,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    embeds = encoder(*inputs)[:num_embeddings]
+    if dtype is None:
+        return embeds.cpu()
+    return embeds.to(device="cpu", dtype=dtype)
 
 
 def pad(

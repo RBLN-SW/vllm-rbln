@@ -14,6 +14,7 @@
 import json
 import math
 import os
+from copy import deepcopy
 from dataclasses import replace
 from typing import Any
 
@@ -36,11 +37,9 @@ from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.logger import init_logger
 from vllm_rbln.utils.optimum.block_size import get_attn_block_size
 from vllm_rbln.utils.optimum.bucket import select_bucket_size
-from vllm_rbln.utils.optimum.paths import is_compiled_dir
 from vllm_rbln.utils.optimum.registry import get_rbln_model_info
 
 from .base import ModelInputForRBLN
-from .compilation import RBLNCompileSpec
 
 logger = init_logger(__name__)
 
@@ -87,9 +86,9 @@ class KVCacheBlockAdapter:
 
     def _estimated_num_blocks(self) -> int:
         """Override estimated blocks if num_gpu_blocks_override is set."""
-        rbln_config: OptimumRBLNConfig = self.vllm_config.additional_config
-        if rbln_config.num_blocks_override is not None:
-            return rbln_config.num_blocks_override
+        additional_config: OptimumRBLNConfig = self.vllm_config.additional_config
+        if additional_config.num_blocks_override is not None:
+            return additional_config.num_blocks_override
         return int(self.estimated_kvcache_num_blocks)
 
     def is_full_block_available(self) -> bool:
@@ -181,21 +180,12 @@ class RBLNOptimumModelBase(nn.Module):
             return int(self.scheduler_config.max_num_seqs)
 
     def init_model(self) -> None:
-        hf_config = self.model_config.hf_config
-        rbln_config: OptimumRBLNConfig = self.vllm_config.additional_config
-        cached_model_path = rbln_config.cached_model_path
-        rbln_overrides = rbln_config.optimum_overrides
-        _, model_cls_name = get_rbln_model_info(hf_config)
-        model_path = self.vllm_config.model_config.model
-        if is_compiled_dir(model_path):
-            valid_path = model_path
-        elif is_compiled_dir(cached_model_path):
-            valid_path = cached_model_path
-        else:
-            valid_path = None
+        additional_config: OptimumRBLNConfig = self.vllm_config.additional_config
+        artifact_path = additional_config.artifact_path
+        optimum_overrides = additional_config.optimum_overrides
 
-        if valid_path is not None:
-            # pre-compiled OR cache-hit
+        if additional_config.precompiled:
+            _, model_cls_name = get_rbln_model_info(self.model_config.hf_config)
             model_cls = getattr(optimum.rbln, model_cls_name)
             ec_enabled_model = model_cls_name == "RBLNQwen3VLForConditionalGeneration"
             assert model_cls is not None
@@ -203,52 +193,45 @@ class RBLNOptimumModelBase(nn.Module):
             if self._is_ec_producer_only():
                 if not ec_enabled_model:
                     raise ValueError("Disaggregation is not supported for this model.")
-                visual = model_cls.load_visual_encoder(valid_path)
+                visual = model_cls.load_visual_encoder(artifact_path)
                 model = _ProducerOptimumModelProxy(visual, visual.rbln_config)
             else:
                 # NOTE:
                 # ``sync_vllm_and_optimum`` already narrowed user overrides
                 # down to device-only keys; we forward only those here.
-                rbln_overrides = dict(rbln_overrides)
+                optimum_overrides = dict(optimum_overrides)
                 if self._is_ec_consumer_only():
                     if not ec_enabled_model:
                         raise ValueError(
                             "Disaggregation is not supported for this model."
                         )
-                    rbln_overrides["_load_visual_runtime"] = False
+                    optimum_overrides["_load_visual_runtime"] = False
                 model = model_cls.from_pretrained(
-                    valid_path,
-                    rbln_config=rbln_overrides,
+                    artifact_path,
+                    rbln_config=optimum_overrides,
                 )
-                self.vllm_config.model_config.model = valid_path
         else:
             assert not self._is_ec_producer_only(), (
                 "Disaggregated Encoder is only supported for pre-compiled model."
             )
             # cache miss: compile the model and save it to the cache for reuse.
-            spec = RBLNCompileSpec.for_architecture(
-                hf_config,
-                batch_size=self.scheduler_config.max_num_seqs,
-                block_size=get_attn_block_size(self.vllm_config),
-                max_model_len=self.model_config.max_model_len,
-                num_devices=rbln_config.num_devices_per_local_rank,
-                prefill_chunk_size=rbln_config.prefill_chunk_size,
-                memory_budget=self.vllm_config.cache_config.gpu_memory_utilization,
-                rbln_overrides=rbln_overrides,
+            compile_inputs = additional_config.compile_inputs
+            assert compile_inputs is not None, (
+                "compile inputs must be resolved before loading"
             )
+            hf_config = deepcopy(compile_inputs.hf_config)
+            _, model_cls_name = get_rbln_model_info(hf_config)
+            model_cls = getattr(optimum.rbln, compile_inputs.model_cls)
             logger.info(
                 "Compiling %s via optimum-rbln (%s) with rbln_config:\n%s",
-                self.model_config.model,
-                spec.model_cls.__name__,
-                json.dumps(spec.rbln_config, indent=2, default=str),
+                compile_inputs.model,
+                compile_inputs.model_cls,
+                json.dumps(compile_inputs.rbln_config, indent=2, default=str),
             )
-            # Pass transformers config objects directly to preserve all settings.
-            # Config classes defined outside transformers (e.g. vLLM's qwen3_asr)
-            # may be incompatible with the transformers model implementation.
-            # For these configs, pass num_hidden_layers and, when available,
-            # layer_types as config kwargs instead.
-            # FIXME(optimum-rbln): Ensure RBLNGptOssForCausalLM.get_pytorch_model
-            # applies these config kwargs; it currently discards them.
+            # Transformers configs preserve model-specific state. External config
+            # classes may be incompatible with optimum-rbln, so pass layer kwargs.
+            # FIXME(optimum-rbln): RBLNGptOssForCausalLM.get_pytorch_model
+            # currently discards these config kwargs.
             if type(hf_config).__module__.startswith("transformers."):
                 config_override = {"config": hf_config}
             else:
@@ -261,14 +244,13 @@ class RBLNOptimumModelBase(nn.Module):
                     if text_config is hf_config
                     else {"text_config": layer_override}
                 )
-            model = spec.model_cls.from_pretrained(
-                self.model_config.model,
-                rbln_config=spec.rbln_config,
-                dtype=self.model_config.dtype,
+            model = model_cls.from_pretrained(
+                compile_inputs.model,
+                rbln_config=deepcopy(compile_inputs.rbln_config),
+                dtype=compile_inputs.dtype,
                 **config_override,
             )
-            model.save_pretrained(cached_model_path)  # type: ignore[attr-defined]
-            self.vllm_config.model_config.model = cached_model_path
+            model.save_pretrained(artifact_path)  # type: ignore[attr-defined]
 
         self.supports_transcription_only = (
             model_cls_name == "RBLNOptimumWhisperForConditionalGeneration"
