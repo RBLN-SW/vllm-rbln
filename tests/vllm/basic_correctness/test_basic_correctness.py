@@ -26,7 +26,12 @@ MODELS = [
     CompileModelSpec("google/gemma-3-1b-it"),
     # Hybrid GatedDeltaNet + gated attention, text-only (M-RoPE needs no vision here)
     CompileModelSpec(
-        "Qwen/Qwen3.5-4B", {"language_model_only": True}, num_hidden_layers=4
+        "Qwen/Qwen3.5-4B",
+        {"language_model_only": True},
+        # TODO(rebel-compiler): drop once rolling these GDN layers passes
+        # RblnTensorUnrollLayerLoop (rebel_compiler #14946).
+        envs={"RBLN_EXP_ROLL_LAYERS": "0"},
+        num_hidden_layers=4,
     ),
     # Quantization schemes
     CompileModelSpec("Qwen/Qwen3-0.6B-FP8"),

@@ -35,6 +35,9 @@ MODELS: list[CompileModelSpec] = [
         "Qwen/Qwen3.5-4B",
         {"max_num_seqs": 2, "language_model_only": True},
         chips=REBEL,
+        # TODO(rebel-compiler): drop once rolling these GDN layers passes
+        # RblnTensorUnrollLayerLoop (rebel_compiler #14946).
+        envs={"RBLN_EXP_ROLL_LAYERS": "0"},
         # 3 linear_attention layers then the first full_attention one
         num_hidden_layers=4,
     ),
