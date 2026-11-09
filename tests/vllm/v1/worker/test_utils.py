@@ -502,6 +502,15 @@ class TestGetKvCacheNames:
         with pytest.raises(NotImplementedError):
             get_kv_cache_names(caches)
 
+    def test_a_layer_reusing_a_cache_may_share_an_index(self, monkeypatch):
+        monkeypatch.setattr(current_platform, "is_cpu", lambda: False)
+        monkeypatch.setattr(current_platform, "is_cuda_alike", lambda: False)
+        monkeypatch.setattr(current_platform, "is_xpu", lambda: False)
+        caches = self._caches("model.layers.0.self_attn", "draft.layers.0.self_attn")
+        shared = {"draft.layers.0.self_attn"}
+        names = get_kv_cache_names(caches, shared_kv_cache_layers=shared)
+        assert set(names) == set(caches)
+
     def test_multi_layer_same_index_allowed_on_cpu(self, monkeypatch):
         # The other side of the branch: on cpu/cuda/xpu both names are returned.
         monkeypatch.setattr(current_platform, "is_cpu", lambda: True)

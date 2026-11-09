@@ -439,8 +439,6 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         self.block_size = vllm_config.cache_config.block_size
         self.max_model_len = vllm_config.model_config.max_model_len
 
-        if kv_sharing_target_layer_name is not None:
-            raise NotImplementedError("KV sharing is not supported in RBLN.")
         if logits_soft_cap is not None:
             logger.warning_once(
                 "RBLN Attention Backend does not support logits soft cap. "
@@ -570,6 +568,14 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
 
         # 1. query reshape for custom operation
         num_tokens = query.shape[0]
+        # A KV-shared layer reads its target's cache through an op that also
+        # writes: its zero K/V land one slot past the query, which the target
+        # overwrites before it reads, and the mask keeps them out.
+        reads_shared_kv = key is None
+        if reads_shared_kv:
+            assert value is None and attn_metadata.attn_masks is not None
+            key = query.new_zeros(num_tokens, self.num_kv_heads, self.head_size)
+            value = query.new_zeros(num_tokens, self.num_kv_heads, self.head_size)
         b_size = attn_metadata.seq_lens.shape[0]
         q_len = num_tokens // b_size
         query = query.view(b_size, q_len, self.num_heads, self.head_size).transpose(
@@ -611,7 +617,39 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         # ex) tensor[block0 : 0, block1 : 100,
         #  block2: 10, block3: 5, ...]
         # attn_output = [batch,H,4,L,D]
-        if self.sliding_window is not None:
+        if reads_shared_kv and self.sliding_window is not None:
+            # The target's sliding cache is laid out for this op alone.
+            assert attn_metadata.swa_appends and not attn_metadata.is_prefill
+            attn_output = sliding_window_attention_v1(
+                query,
+                key,
+                value,
+                kv_cache,
+                attn_metadata.seq_lens,
+                self.scale,
+                attn_metadata.block_tables,
+                self.sliding_window,
+                self.sinks,
+                attn_mask=attn_metadata.attn_masks,
+                is_prompt_sorted=attn_metadata.is_prompt_sorted,
+            )
+        elif reads_shared_kv:
+            # A key mask on top of the causal rule lowers to the flash causal
+            # function the target's full layer runs.
+            assert not attn_metadata.is_prefill
+            attn_output = torch.ops.rbln_custom_ops.gqa(
+                query,
+                key,
+                value,
+                kv_cache,
+                attn_metadata.seq_lens,
+                self.scale,
+                attn_metadata.block_tables,
+                attn_mask=attn_metadata.attn_masks,
+                is_causal=True,
+                is_prompt_sorted=attn_metadata.is_prompt_sorted,
+            )
+        elif self.sliding_window is not None:
             if attn_metadata.swa_appends:
                 # `seq_lens` is the absolute position the chunk starts at, not
                 # a length: the op resolves the window's blocks from it and the

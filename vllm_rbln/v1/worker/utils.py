@@ -22,7 +22,7 @@ import platform
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from datetime import datetime, timezone
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Literal, NoReturn, TypeVar
@@ -1407,8 +1407,12 @@ def reorder_input_batch(input_batch: "InputBatch", perm: np.ndarray) -> None:
 def get_kv_cache_names(
     kv_caches: dict[str, torch.Tensor],
     num_attn_module: int = 1,
+    shared_kv_cache_layers: Collection[str] = (),
 ) -> list[str]:
     """Return KV cache layer names ordered by layer index.
+
+    A layer reusing another's cache (a Gemma4 MTP draft layer) may share an
+    index with a layer that owns one.
 
     A deterministic, hash-seed-independent ordering is required by the KV
     connector: NIXL assigns transfer region indices in iteration order, so the
@@ -1422,7 +1426,8 @@ def get_kv_cache_names(
     kv_cache_names: list[str] = []
     for layer_index in sorted(index2name.keys()):
         layer_names = index2name[layer_index]
-        if len(layer_names) > 1 and not (
+        owners = [name for name in layer_names if name not in shared_kv_cache_layers]
+        if len(owners) > 1 and not (
             current_platform.is_cuda_alike()
             or current_platform.is_xpu()
             or current_platform.is_cpu()

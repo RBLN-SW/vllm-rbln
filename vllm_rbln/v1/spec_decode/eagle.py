@@ -19,6 +19,7 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.model_executor.models.deepseek_eagle3 import Eagle3DeepseekV2ForCausalLM
+from vllm.model_executor.models.gemma4_mm import Gemma4ForConditionalGeneration
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.spec_decode.eagle import EagleProposer
@@ -383,6 +384,13 @@ class RBLNEagleProposer(EagleProposer):
             num_rejected_tokens,
         )
 
+    def get_model_name(self, model: nn.Module) -> str:
+        # The base picks a multimodal target's image token by upstream's class
+        # name, which RBLN's Gemma4 subclass does not carry.
+        if isinstance(model, Gemma4ForConditionalGeneration):
+            return Gemma4ForConditionalGeneration.__name__
+        return super().get_model_name(model)
+
     def load_model(self, target_model: nn.Module) -> None:
         super().load_model(target_model)
         if self.supports_mm_inputs:
@@ -421,7 +429,10 @@ class RBLNEagleProposer(EagleProposer):
                 last_hidden_states, hidden_states = ret_hidden_states
 
             hidden_states = hidden_states.view(-1, self.hidden_size)
-            sample_hidden_states = last_hidden_states.view(-1, self.hidden_size)
+            # Gemma4 MTP samples from its own, narrower hidden states.
+            sample_hidden_states = last_hidden_states.view(
+                -1, last_hidden_states.shape[-1]
+            )
 
             if token_indices_to_sample is not None:
                 hidden_states = hidden_states[token_indices_to_sample]

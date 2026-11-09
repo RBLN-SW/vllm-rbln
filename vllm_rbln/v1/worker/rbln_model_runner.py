@@ -166,6 +166,7 @@ from vllm_rbln.v1.spec_decode.eagle3_pp import (
     aux_hidden_states_enabled,
     install_aux_handoff_slots,
 )
+from vllm_rbln.v1.spec_decode.gemma4 import RBLNGemma4Proposer
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
 from vllm_rbln.v1.worker import mega_cache
 from vllm_rbln.v1.worker.async_output import (
@@ -393,6 +394,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 self.drafter = RBLNMedusaProposer(self.vllm_config, self.device)
             elif self.speculative_config.method == "dflash":
                 self.drafter = RBLNDFlashProposer(self.vllm_config, self.device, self)
+            elif self.speculative_config.use_gemma4_mtp():
+                self.drafter = RBLNGemma4Proposer(self.vllm_config, self.device, self)
             elif self.speculative_config.use_eagle():
                 self.drafter = RBLNEagleProposer(self.vllm_config, self.device, self)
             else:
@@ -3561,7 +3564,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 len(self.kv_cache_bases),
                 tuple(self.kv_cache_bases[0].shape),
             )
-        self.kv_cache_names = get_kv_cache_names(kv_caches, num_attn_module)
+        self.kv_cache_names = get_kv_cache_names(
+            kv_caches, num_attn_module, self.shared_kv_cache_layers
+        )
         self.kv_caches = [kv_caches[name] for name in self.kv_cache_names]
         # The runner owns the cache storage until sizing finishes. Rebuild keys
         # on allocation so addresses are never matched across cache generations.
