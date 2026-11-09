@@ -1473,8 +1473,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 "the optimum path."
             )
         if self.model_config.is_mm_prefix_lm:
-            # A prefill chunk never splits a range, so the longest one has to
-            # fit every chunk the scheduler may cut.
+            # A prefill chunk never splits a range, so every cap the scheduler
+            # puts on a chunk has to hold the longest range.
             if not supports_rbln_mm_prefix(self.model):
                 raise ValueError(
                     f"{type(self.model).__name__} attends both ways inside its "
@@ -1484,12 +1484,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     "causally."
                 )
             longest = self.model.max_mm_prefix_range_len
-            threshold = self.scheduler_config.long_prefill_token_threshold
-            if 0 < threshold < longest:
-                raise ValueError(
-                    f"long_prefill_token_threshold={threshold} would split a "
-                    f"multimodal range of up to {longest} tokens."
-                )
+            for flag in ("long_prefill_token_threshold", "max_num_scheduled_tokens"):
+                cap = getattr(self.scheduler_config, flag)
+                if cap and cap < longest:
+                    raise ValueError(
+                        f"{flag}={cap} would split a multimodal range of up to "
+                        f"{longest} tokens."
+                    )
             chunk = self.rbln_config.max_prefill_chunk_size
             if chunk < longest:
                 raise ValueError(

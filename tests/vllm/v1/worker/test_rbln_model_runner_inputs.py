@@ -87,8 +87,8 @@ class _MmPrefixModel(_InGraphMergeModel):
 
 
 class TestResolveMmPrefixSupport:
-    """An mm prefix LM is served only when its longest range fits every prefill
-    chunk the scheduler may cut."""
+    """An mm prefix LM is served only when every cap the scheduler puts on a
+    prefill chunk holds its longest range."""
 
     @staticmethod
     def _runner(make_model_runner, monkeypatch, model, **config):
@@ -108,17 +108,17 @@ class TestResolveMmPrefixSupport:
         with pytest.raises(ValueError, match="SupportsRBLNMmPrefix"):
             runner._resolve_mm_support()
 
-    def test_a_config_that_would_split_a_range_is_refused(
-        self, make_model_runner, monkeypatch
+    @pytest.mark.parametrize(
+        "flag", ["long_prefill_token_threshold", "max_num_scheduled_tokens"]
+    )
+    def test_a_cap_that_would_split_a_range_is_refused(
+        self, make_model_runner, monkeypatch, flag
     ):
         runner = self._runner(
-            make_model_runner,
-            monkeypatch,
-            _MmPrefixModel(128),
-            long_prefill_token_threshold=64,
+            make_model_runner, monkeypatch, _MmPrefixModel(128), **{flag: 64}
         )
 
-        with pytest.raises(ValueError, match="long_prefill_token_threshold"):
+        with pytest.raises(ValueError, match=flag):
             runner._resolve_mm_support()
 
     def test_a_threshold_and_chunk_equal_to_the_longest_range_are_taken(
@@ -137,7 +137,14 @@ class TestResolveMmPrefixSupport:
     def test_a_range_longer_than_the_longest_chunk_is_refused(
         self, make_model_runner, monkeypatch
     ):
-        runner = self._runner(make_model_runner, monkeypatch, _MmPrefixModel(200))
+        # The step budget holds the range; only the longest chunk does not.
+        runner = self._runner(
+            make_model_runner,
+            monkeypatch,
+            _MmPrefixModel(200),
+            max_num_batched_tokens=256,
+            additional_config={"prefill_chunk_size": [128]},
+        )
 
         with pytest.raises(ValueError, match="--rbln-prefill-chunk-size"):
             runner._resolve_mm_support()
