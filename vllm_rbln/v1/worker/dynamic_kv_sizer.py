@@ -16,6 +16,7 @@ the state machine; `kv_placement` holds the arithmetic."""
 
 import copy
 import gc
+import math
 import os
 import re
 from collections.abc import Mapping
@@ -42,11 +43,13 @@ from vllm.v1.kv_cache_interface import (
 from vllm_rbln.compilation.backends import program_input_bindings, set_compile_stage
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.core.utils import sub_block_size_in_use
+from vllm_rbln.v1.kv_cache import RBLNGDNStateSpec
 from vllm_rbln.v1.worker.kv_placement import (
     ChipletMemory,
     KvGrowth,
     Unit,
     UnitFit,
+    allocator_reserved,
     format_fits,
     format_placements,
     kv_growth,
@@ -59,6 +62,7 @@ from vllm_rbln.v1.worker.utils import (
     compile_and_warmup_skip_reason,
     dynamic_kv_unsupported_reason,
     estimate_available_memory,
+    layers_with_spec,
     rescale_kv_cache_config,
 )
 
@@ -526,9 +530,11 @@ class DynamicKvSizer:
         device: torch.device,
         *,
         kv_resident: Mapping[Unit, int],
+        own_pool_bytes: Mapping[Unit, int] | None = None,
     ) -> tuple[int, dict[Unit, UnitFit], dict[Unit, ChipletMemory], int]:
         """Snapshot the device and size against it; `kv_resident` is what the
-        snapshot still holds of the KV cache."""
+        snapshot still holds of the KV cache, `own_pool_bytes` what the caches
+        on a pool of their own will take once reallocated."""
         snapshot, source = self.memory_snapshot(device)
         logger.info(
             "[Dynamic KV] %s memory snapshot of %s: %s",
@@ -552,6 +558,7 @@ class DynamicKvSizer:
             gpu_memory_utilization=gmu,
             kv_resident=kv_resident,
             reserve_bytes=reserve_bytes,
+            own_pool_bytes=own_pool_bytes,
         )
         logger.info(
             "[Dynamic KV] rank %d: computed_num_blocks=%d gpu_memory_utilization=%.3f "
@@ -602,9 +609,30 @@ class DynamicKvSizer:
         actually handed back; no KV cache is bound until `apply_num_blocks`."""
         growth, hint_blocks, device = self._kv_growth_from_programs()
         before, _ = self.memory_snapshot(device)
-        self.release_kv_cache_tensors(self.model_runner.kv_cache_config)
+        mr = self.model_runner
+        self.release_kv_cache_tensors(mr.kv_cache_config)
+        # GatedDeltaNet state pools and rings are sized by max_num_seqs, not by the
+        # block count; every chiplet reserves its even share before the blocks.
+        own_pool_bytes: dict[Unit, int] = {}
+        if pools := layers_with_spec(mr.kv_cache_config, RBLNGDNStateSpec):
+            sizes = [
+                # state cache
+                spec.pool_blocks(self.vllm_config) * spec.real_page_size_bytes
+                for spec in pools.values()
+            ] + [
+                # conv state cache
+                pools[aux.owner].pool_blocks(self.vllm_config)
+                * math.prod(aux.block_shape)
+                * aux.dtype.itemsize
+                for aux in mr.aux_kv_cache_specs.values()
+                if aux.owner in pools
+            ]
+            per_chiplet = [-(-size // len(growth.per_block)) for size in sizes]
+            own_pool_bytes = {
+                unit: allocator_reserved(per_chiplet) for unit in growth.per_block
+            }
         num_blocks, fits, after, _ = self._size_kv_from_snapshot(
-            growth, device, kv_resident={}
+            growth, device, kv_resident={}, own_pool_bytes=own_pool_bytes
         )
         self.log_release_shortfall(
             before, after, growth.allocated_at(hint_blocks), hint_blocks
