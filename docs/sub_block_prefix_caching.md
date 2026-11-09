@@ -41,8 +41,7 @@ so each takes a `--rbln-*` flag, an `additional_config` key, or the environment 
 Turning it off while giving a `sub_block_size` is rejected,
 since the two ask for opposite things.
 
-Left unset, the sub-block size is the prefill chunk size (`--rbln-prefill-chunk-size`,
-which defaults to `max_num_batched_tokens`),
+Left unset, the sub-block size is the prefill chunk size (the longest `--rbln-prefill-chunk-size`, which defaults to `max_num_batched_tokens`),
 so each prefill does not span multiple blocks.
 A smaller value decouples the two, so a prefill chunk can span two blocks.
 Storing across that boundary needs the multi-block attention store,
@@ -332,7 +331,7 @@ events, and scores pods by how many consecutive blocks match.  Routing
 works iff the producer's `blockSizeTokens` equals the engine's emitted
 `block_size`, which is our sub-block size:
 `--rbln-sub-block-size` when given, otherwise the prefill chunk size
-(`--rbln-prefill-chunk-size`, which defaults to `--max-num-batched-tokens`).
+(the longest `--rbln-prefill-chunk-size`, which defaults to `--max-num-batched-tokens`).
 
 > **Not** vLLM's `--block-size`.  For stock vLLM those two happen to be
 > the same knob, so generic guides tell you to align `--block-size` with
