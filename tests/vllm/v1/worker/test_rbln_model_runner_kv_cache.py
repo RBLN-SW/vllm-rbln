@@ -230,8 +230,9 @@ class TestMambaSpecGroup:
         spec = self._state_spec(runner)
         config = make_kv_cache_config(runner, groups=[("layer.0",)], spec=spec)
         raw, (caches, bases, infos, axes) = self._views(runner, config)
+        assert "layer.0" not in caches
+        runner._allocate_state_pool_caches(config, caches, bases, infos, axes)
         num_blocks = runner.vllm_config.scheduler_config.max_num_seqs + 1
-        assert raw["layer.0"].numel() == num_blocks * spec.real_page_size_bytes
         assert caches["layer.0"].shape == (num_blocks, 2, 2, 2, 128, 64)
         assert caches["layer.0"].dtype == torch.int16
         assert bases["layer.0"] is caches["layer.0"]
@@ -272,6 +273,7 @@ class TestMambaSpecGroup:
             )
         )
         _, (caches, bases, infos, axes) = self._views(runner, config)
+        runner._allocate_state_pool_caches(config, caches, bases, infos, axes)
         runner._allocate_aux_kv_caches(config, caches, bases, infos, axes)
         assert infos["layer.0"].dynamic_axis is None
         assert infos["layer.0.conv_ring"].dynamic_axis is None

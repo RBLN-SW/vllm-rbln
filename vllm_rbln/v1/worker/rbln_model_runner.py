@@ -3219,14 +3219,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # tensor and the rest get their own. Not one pool the layers slice: a
         # graph input is a whole tensor, and dynamo refuses a slice's offset.
         device = self.device if use_device_tensor() else "meta"
-        # A GatedDeltaNet layer's page in the config is an attention layer's
-        # alias; its state lives in a pool of its own (v1/kv_cache.py), sized here.
-        state_specs = layers_with_spec(kv_cache_config, RBLNGDNStateSpec)
-        extent_of = {
-            layer_name: extent
-            for layer_name, extent in kv_cache_extents(kv_cache_config).items()
-            if layer_name not in state_specs
-        }
+        extent_of = kv_cache_extents(kv_cache_config)
         buffers = {
             extent: torch.empty(extent[1], dtype=torch.int8, device=device)
             for extent in set(extent_of.values())
@@ -3234,12 +3227,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         kv_cache_raw_tensors = {
             layer_name: buffers[extent] for layer_name, extent in extent_of.items()
         }
-        for layer_name, spec in state_specs.items():
-            kv_cache_raw_tensors[layer_name] = torch.empty(
-                spec.pool_blocks(self.vllm_config) * spec.real_page_size_bytes,
-                dtype=torch.int8,
-                device=device,
-            )
 
         layer_names = set()
         for group in kv_cache_config.kv_cache_groups:
@@ -3319,14 +3306,18 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             if group.kv_cache_group_id == len(kernel_block_sizes):
                 # There may be a last group for layers without kv cache.
                 continue
+            if isinstance(kv_cache_spec, RBLNGDNStateSpec):
+                # The config's extent is an attention layer's alias; the states
+                # come from _allocate_state_pool_caches.
+                continue
             kernel_block_size = kernel_block_sizes[group.kv_cache_group_id]
             for layer_name in group.layer_names:
                 if layer_name in self.runner_only_attn_layers:
                     continue
                 raw_tensor = kv_cache_raw_tensors[layer_name]
+                assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
+                num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
                 if isinstance(kv_cache_spec, AttentionSpec):
-                    assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
-                    num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
                     num_blocks_per_kv_block = (
                         kv_cache_spec.block_size // kernel_block_size
                     )
@@ -3397,13 +3388,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                         dynamic_axis=base_dynamic_axis,
                     )
                 elif isinstance(kv_cache_spec, MambaSpec):
-                    if isinstance(kv_cache_spec, RBLNGDNStateSpec):
-                        # One state a block in the layer's own buffer (see
-                        # _allocate_kv_cache_tensors); the config's page is an alias.
-                        num_blocks = (
-                            raw_tensor.numel() // kv_cache_spec.real_page_size_bytes
-                        )
-                    elif len(kv_cache_spec.shapes) != 1 or (
+                    if len(kv_cache_spec.shapes) != 1 or (
                         kv_cache_spec.real_page_size_bytes
                         != kv_cache_spec.page_size_bytes
                     ):
@@ -3411,19 +3396,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                             f"{layer_name}: RBLN allocates a MambaSpec of one state "
                             f"that fills its page, got {kv_cache_spec}"
                         )
-                    else:
-                        num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
                     dtype = kv_cache_spec.dtypes[0]
                     kv_cache_shape = (num_blocks, *kv_cache_spec.shapes[0])
                     typed_base = raw_tensor.view(dtype).view(kv_cache_shape)
                     kv_caches[layer_name] = typed_base
                     kv_cache_block_axes[layer_name] = 0
                     dynamic_axis = None
-                    # The resize scales the attention block count; a GatedDeltaNet
-                    # pool is sized by its spec's pool_blocks and stays static.
-                    if dynamic_kv_enabled(self.vllm_config) and not isinstance(
-                        kv_cache_spec, RBLNGDNStateSpec
-                    ):
+                    if dynamic_kv_enabled(self.vllm_config):
                         dynamic_axis = 0
                         torch._dynamo.mark_dynamic(typed_base, 0)
                         marked_layers.append((layer_name, 0))
@@ -3481,6 +3460,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 kv_cache_raw_tensors,
                 kernel_block_sizes,
             )
+        )
+        self._allocate_state_pool_caches(
+            kv_cache_config,
+            kv_caches,
+            kv_cache_bases_by_layer,
+            kv_cache_view_infos,
+            block_axes,
         )
         self._allocate_aux_kv_caches(
             kv_cache_config,
@@ -3574,6 +3560,30 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         return kv_caches
 
+    def _allocate_state_pool_caches(
+        self,
+        kv_cache_config: KVCacheConfig,
+        kv_caches: dict[str, torch.Tensor],
+        kv_cache_bases_by_layer: dict[str, torch.Tensor],
+        kv_cache_view_infos: dict[str, KVCacheViewInfo],
+        block_axes: dict[str, int],
+    ) -> None:
+        # A GatedDeltaNet layer's state lives in a pool of its own (v1/kv_cache.py):
+        # one state a block, sized by the spec, static under the dynamic-KV resize.
+        device = self.device if use_device_tensor() else "meta"
+        for name, spec in layers_with_spec(kv_cache_config, RBLNGDNStateSpec).items():
+            shape = (spec.pool_blocks(self.vllm_config), *spec.shapes[0])
+            cache = torch.empty(shape, dtype=spec.dtypes[0], device=device)
+            kv_caches[name] = cache
+            kv_cache_bases_by_layer[name] = cache
+            kv_cache_view_infos[name] = KVCacheViewInfo(
+                view_dtype=spec.dtypes[0],
+                view_shape=shape,
+                permute_order=tuple(range(len(shape))),
+                dynamic_axis=None,
+            )
+            block_axes[name] = 0
+
     def _allocate_aux_kv_caches(
         self,
         kv_cache_config: KVCacheConfig,
@@ -3585,7 +3595,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         device = self.device if use_device_tensor() else "meta"
         extent_of = kv_cache_extents(kv_cache_config)
         # A GatedDeltaNet layer's buffer is its own, a block a state of its pool
-        # (_allocate_kv_cache_tensors): so are its aux caches, static like it.
+        # (_allocate_state_pool_caches): so are its aux caches, static like it.
         own = layers_with_spec(kv_cache_config, RBLNGDNStateSpec)
         # Sized with the KV cache: the dynamic-KV resize reads their growth from
         # the compiled placement like any KV input's.
