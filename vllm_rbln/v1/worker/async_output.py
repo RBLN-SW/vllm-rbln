@@ -49,7 +49,7 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
 
         # Keep a reference to the device tensor to avoid it being
         # deallocated until we finish copying it to the host.
-        self._sampled_token_ids = sampled_token_ids
+        self._sampled_token_ids: torch.Tensor | None = sampled_token_ids
         # Start the D2H right behind the sampler, as AsyncGPUModelRunnerOutput
         # does. From get_output() it would queue behind the next forward.
         self._copy_ready_event: torch.Event | None = None
@@ -74,6 +74,8 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
         """Wait for the snapshot shared by output handling and token feedback."""
         if self._copy_ready_event is not None:
             self._copy_ready_event.synchronize()
+        # Output handling may retain this object after D2H completes.
+        self._sampled_token_ids = None
         return self._sampled_token_ids_cpu
 
     @worker_fail_fast

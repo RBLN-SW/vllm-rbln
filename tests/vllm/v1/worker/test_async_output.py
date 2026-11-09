@@ -19,6 +19,7 @@ import os
 import subprocess
 import sys
 import textwrap
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -186,7 +187,8 @@ class TestGetOutput:
         assert async_out.get_output().sampled_token_ids == [[7], [8]]
 
     @pytest.mark.use_device
-    def test_device_tokens_are_copied_behind_the_sampler(self):
+    @pytest.mark.parametrize("first_reader", ["feedback", "output"])
+    def test_device_tokens_are_copied_behind_the_sampler(self, first_reader):
         # The D2H is async only if the source lives on the device. A sampler
         # output does, hence the compiled sampler; a tensor fresh from .to("rbln")
         # is still host-resident.
@@ -197,7 +199,18 @@ class TestGetOutput:
         # A copy issued at construction must preserve the original tokens
         # even if the device source changes before output handling.
         src.copy_(torch.tensor([[5], [6]], dtype=src.dtype).to("rbln"))
+        source_ref = weakref.ref(src)
+        del src
+        assert source_ref() is not None
+        copy_ready_event = async_out._copy_ready_event
+        if first_reader == "feedback":
+            assert async_out.get_sampled_token_ids_cpu().tolist() == [[1], [0]]
+        else:
+            assert async_out.get_output().sampled_token_ids == [[1], [0]]
+        assert source_ref() is None
+        assert async_out._copy_ready_event is copy_ready_event
         assert async_out.get_output().sampled_token_ids == [[1], [0]]
+        assert async_out.get_sampled_token_ids_cpu().tolist() == [[1], [0]]
 
     def test_clears_the_rows_the_sampler_discarded(self):
         async_out = _async_output(
