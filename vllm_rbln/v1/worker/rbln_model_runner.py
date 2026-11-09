@@ -151,6 +151,7 @@ from vllm_rbln.v1.core.utils import (
     decode_batch_size,
     num_base_tokens,
     resolve_propagated_token_write,
+    step_is_mm_prefix_prefill,
     step_is_prefill,
     sub_block_size_in_use,
 )
@@ -2024,25 +2025,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             )
 
         # Stamp the step's phase before any step logic reads it.
-        self.is_prefill = step_is_prefill(scheduler_output)
-        if not self.is_prefill and self.mm_prefix_query_len_buckets:
-            # A prefix cache hit can leave an mm range only its last token, a
-            # one-token step that still prefills the range's mm embeddings.
-            cached = scheduler_output.scheduled_cached_reqs
-            steps = [
-                (req.num_computed_tokens, req.mm_features)
-                for req in scheduler_output.scheduled_new_reqs
-            ] + [
-                (computed, self.requests[req_id].mm_features)
-                for req_id, computed in zip(cached.req_ids, cached.num_computed_tokens)
-            ]
-            self.is_prefill = any(
-                start <= computed == end
-                for computed, features in steps
-                for feature in features
-                if feature.modality in ("image", "video")
-                for start, end in feature.mm_position.extract_embeds_range()
-            )
+        self.is_prefill = step_is_prefill(scheduler_output) or (
+            bool(self.mm_prefix_query_len_buckets)
+            and step_is_mm_prefix_prefill(scheduler_output, self.requests)
+        )
 
         # Before anything reads token_ids_cpu this step.
         if self.use_async_scheduling:
