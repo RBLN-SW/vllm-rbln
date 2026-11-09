@@ -19,10 +19,10 @@ import torch
 from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
 
-from vllm_rbln.v1.sample.ops.sparse_penalty import (
+from vllm_rbln.v1.sample.ops.fused_penalty import (
     K_MIN,
-    SparsePenaltyState,
-    apply_sparse_penalty,
+    FusedPenaltyState,
+    apply_fused_penalty,
 )
 from vllm_rbln.v1.sample.rbln_sampler import RBLNSampler
 
@@ -64,7 +64,7 @@ def test_state_matches_dense_across_steps(num_rows, vocab, k_min):
     """Requests join, leave, reorder and grow one token per step."""
     rng = random.Random(0)
     torch.manual_seed(0)
-    state = SparsePenaltyState(k_min=k_min)
+    state = FusedPenaltyState(k_min=k_min)
     reqs: dict[str, dict] = {}
     for step in range(12):
         if step % 4 == 0:
@@ -98,7 +98,7 @@ def test_state_matches_dense_across_steps(num_rows, vocab, k_min):
             num_rows,
         )
         logits = torch.randn(num_rows, vocab) * 3
-        got = apply_sparse_penalty(
+        got = apply_fused_penalty(
             logits.clone(), cidx, lanes.float(), rows, row_vocab, k
         )
         want = dense_reference(
@@ -115,7 +115,7 @@ def test_state_matches_dense_across_steps(num_rows, vocab, k_min):
     assert state.k > k_min or vocab // 64 <= k_min
 
 
-def _run_sampler(params, logits, sparse: bool, expect_kinds: set[str]):
+def _run_sampler(params, logits, fused: bool, expect_kinds: set[str]):
     device = current_platform.device_type
     batch = build_input_batch(
         [(str(i), p) for i, p in enumerate(params)],
@@ -123,10 +123,10 @@ def _run_sampler(params, logits, sparse: bool, expect_kinds: set[str]):
         prompt_token_ids=[11, 4000, 9000],
         output_token_ids=[4000, 77],
     )
-    sampler = RBLNSampler(sparse_penalty=sparse)
+    sampler = RBLNSampler(fused_penalty=fused)
     out = sampler(logits.clone().to(device), batch.sampling_metadata, input_batch=batch)
-    # The sparse run must take the fused graphs, not fall back to upstream.
-    assert {key[0] for key in sampler._sparse_graphs} == expect_kinds
+    # The fused run must take the fused graphs, not fall back to upstream.
+    assert {key[0] for key in sampler._fused_graphs} == expect_kinds
     return out.sampled_token_ids.view(-1).cpu()
 
 
@@ -149,9 +149,9 @@ def test_sampler_matches_dense_path():
         ),
     ]
     logits = _logits(len(params))
-    dense = _run_sampler(params, logits, sparse=False, expect_kinds=set())
-    sparse = _run_sampler(params, logits, sparse=True, expect_kinds={"greedy"})
-    assert sparse.tolist() == dense.tolist() == [555, 555, 123, 555]
+    dense = _run_sampler(params, logits, fused=False, expect_kinds=set())
+    fused = _run_sampler(params, logits, fused=True, expect_kinds={"greedy"})
+    assert fused.tolist() == dense.tolist() == [555, 555, 123, 555]
 
 
 @pytest.mark.use_device
@@ -164,9 +164,9 @@ def test_min_p_reads_penalized_logits():
     logits = _logits(len(params))
     logits[:, 555] = 10.0  # min_p keeps only the clear winner
     logits[1, 123] = -100.0  # bias lifts it to 0, still below 555
-    dense = _run_sampler(params, logits, sparse=False, expect_kinds=set())
-    sparse = _run_sampler(params, logits, sparse=True, expect_kinds={"penalize"})
-    assert sparse.tolist() == dense.tolist() == [555, 555]
+    dense = _run_sampler(params, logits, fused=False, expect_kinds=set())
+    fused = _run_sampler(params, logits, fused=True, expect_kinds={"penalize"})
+    assert fused.tolist() == dense.tolist() == [555, 555]
 
 
 # The weighted row: WEIGHTED[i] weighs i + 1. The heaviest tokens are the ones the
@@ -217,7 +217,7 @@ def test_sampled_distribution_matches_upstream(params):
         prompt_token_ids=PROMPT,
         output_token_ids=OUTPUT,
     )
-    sampler = RBLNSampler(sparse_penalty=True)
+    sampler = RBLNSampler(fused_penalty=True)
     logits = row.expand(ROWS, -1).contiguous().to(device)
     samples = torch.stack(
         [
@@ -227,5 +227,5 @@ def test_sampled_distribution_matches_upstream(params):
             for _ in range(LAUNCHES)
         ]
     )
-    assert sampler._sparse_graphs, "the fused graphs were not taken"
+    assert sampler._fused_graphs, "the fused graphs were not taken"
     assert_samples_match(samples=samples, probs=expected)

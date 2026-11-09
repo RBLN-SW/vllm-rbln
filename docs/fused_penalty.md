@@ -1,4 +1,4 @@
-## Sparse Penalties Overview
+## Fused Penalties Overview
 
 Repetition, frequency and presence penalties and `logit_bias` only change the
 logits of tokens a request has already seen or explicitly biased. Upstream vLLM
@@ -7,15 +7,15 @@ logits on every decode step. On RBLN that chain runs outside the compiled
 sampler and dominates the step time once a request sets any of these
 parameters.
 
-With sparse penalties enabled, the host tracks the touched tokens per request
+With fused penalties enabled, the host tracks the touched tokens per request
 and the compiled sampling graph rewrites only the vocab chunks that hold them,
 right before temperature, softmax and top-k / top-p (or argmax).
 
 Key components:
 
-- `vllm_rbln.v1.sample.ops.sparse_penalty` holds the per-request host state
-  (`SparsePenaltyState`), which turns a step's sampling metadata into a
-  `SparsePlan`, and the device-side math (`apply_sparse_penalty`).
+- `vllm_rbln.v1.sample.ops.fused_penalty` holds the per-request host state
+  (`FusedPenaltyState`), which turns a step's sampling metadata into a
+  `FusedPenaltyPlan`, and the device-side math (`apply_fused_penalty`).
 - `RBLNSampler` asks for a plan each step, hands upstream
   `apply_logits_processors` the metadata without penalties and logit bias, and
   passes the plan to `sample()`. Its `warm_up()` compiles the fused graphs with
@@ -25,9 +25,9 @@ Key components:
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `--rbln-use-sparse-penalty` | `False` | Apply penalties and logit bias inside the sampling graph. Requires `use_custom_sampler`. |
+| `--rbln-use-fused-penalty` | `False` | Apply penalties and logit bias inside the sampling graph. Requires `use_custom_sampler`. |
 
-`LLM(...)` takes it as `additional_config={"use_sparse_penalty": True}`.
+`LLM(...)` takes it as `additional_config={"use_fused_penalty": True}`.
 
 A step keeps the existing path when it runs speculative decoding or a thinking
 budget, when the sampler returns processed logprobs, or when the vocab size is

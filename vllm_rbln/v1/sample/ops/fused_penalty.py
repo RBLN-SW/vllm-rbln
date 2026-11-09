@@ -11,7 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Sparse repetition / frequency / presence penalties and logit bias.
+"""Repetition / frequency / presence penalties and logit bias, fused into the
+sampling graph.
 
 The host keeps, per request, the 64-wide vocab chunks of the tokens it has seen
 or biased, with three lane parameters (add, mul, sub). The sampling graph
@@ -22,7 +23,7 @@ Invariants the scatter relies on:
 - Slots past a row's last used chunk repeat slot 0, so duplicate scatter
   targets always carry identical values.
 
-See docs/sparse_penalty.md.
+See docs/fused_penalty.md.
 """
 
 import dataclasses
@@ -44,7 +45,7 @@ _IDENTITY = np.zeros((3, CHUNK), np.float16)
 _IDENTITY[MUL] = 1.0
 
 
-class SparsePlan(NamedTuple):
+class FusedPenaltyPlan(NamedTuple):
     rows: int
     row_vocab: int
     k: int
@@ -160,7 +161,7 @@ class _Request:
             self.lanes[row, SUB, s, lane] = self.freq * c + self.pres
 
 
-class SparsePenaltyState:
+class FusedPenaltyState:
     """Per-request host state, updated with only the tokens added each step."""
 
     def __init__(self, k_min: int = K_MIN):
@@ -175,7 +176,7 @@ class SparsePenaltyState:
         input_batch: InputBatch,
         logits_shape: torch.Size,
         device: torch.device,
-    ) -> SparsePlan | None:
+    ) -> FusedPenaltyPlan | None:
         """The plan for this step, or None when the step keeps the upstream path."""
         num_rows, vocab_size = logits_shape
         holder = sampling_metadata.thinking_budget_state_holder
@@ -219,15 +220,15 @@ class SparsePenaltyState:
             vocab_size,
             num_rows,
         )
-        return SparsePlan(rows, row_vocab, k, cidx.to(device), lanes.to(device))
+        return FusedPenaltyPlan(rows, row_vocab, k, cidx.to(device), lanes.to(device))
 
     def identity_plan(
         self, logits_shape: torch.Size, device: torch.device
-    ) -> SparsePlan:
+    ) -> FusedPenaltyPlan:
         """A plan that changes nothing, at the current bucket. Used for warm-up."""
         num_rows, vocab_size = logits_shape
         rows, row_vocab, k, cidx, lanes = self._copy_out([], vocab_size, num_rows)
-        return SparsePlan(rows, row_vocab, k, cidx.to(device), lanes.to(device))
+        return FusedPenaltyPlan(rows, row_vocab, k, cidx.to(device), lanes.to(device))
 
     def update(
         self,
@@ -327,7 +328,7 @@ class SparsePenaltyState:
         )
 
 
-def apply_sparse_penalty(
+def apply_fused_penalty(
     logits: torch.Tensor,
     cidx: torch.Tensor,
     lanes: torch.Tensor,

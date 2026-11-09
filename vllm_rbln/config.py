@@ -102,7 +102,7 @@ class RBLNConfig(RBLNConfigBase):
     enable_sub_block_cache: bool = True
     """Enable sub-block prefix caching, at `sub_block_size` granularity."""
 
-    use_sparse_penalty: bool = False
+    use_fused_penalty: bool = False
     """Apply repetition / frequency / presence penalties and logit bias inside
     the sampling graph, on the vocab chunks they touch. Needs
     `use_custom_sampler`."""
@@ -164,7 +164,7 @@ class RBLNConfig(RBLNConfigBase):
             # Sampler graphs compile with use_cache=False, so they never enter
             # the bundle. Sub-block caching changes what runs, not what is built.
             "use_custom_sampler",
-            "use_sparse_penalty",
+            "use_fused_penalty",
             "enable_sub_block_cache",
             "sub_block_size",
             "encoder_token_budgets",

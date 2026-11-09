@@ -322,7 +322,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             self.sampler = RBLNSampler(
                 logprobs_mode=self.model_config.logprobs_mode,
                 compile_context=self.compile_context,
-                sparse_penalty=self.rbln_config.use_sparse_penalty,
+                fused_penalty=self.rbln_config.use_fused_penalty,
             )
             logger.info("Using RBLN sampler.")
         else:

@@ -29,10 +29,10 @@ import vllm_rbln.envs as envs
 from vllm_rbln.compilation import compile, create_compile_context
 from vllm_rbln.logger import init_logger
 from vllm_rbln.platform import use_device_tensor
-from vllm_rbln.v1.sample.ops.sparse_penalty import (
-    SparsePenaltyState,
-    SparsePlan,
-    apply_sparse_penalty,
+from vllm_rbln.v1.sample.ops.fused_penalty import (
+    FusedPenaltyPlan,
+    FusedPenaltyState,
+    apply_fused_penalty,
     uses_argmax_invariant_processors,
     without_deferred,
 )
@@ -99,14 +99,14 @@ def rbln_greedy_sample(logits: torch.Tensor) -> torch.Tensor:
     return torch.ops.rbln.argmax(logits)
 
 
-SparseGraphKind = Literal["penalize", "greedy", "top_k_top_p"]
+FusedGraphKind = Literal["penalize", "greedy", "top_k_top_p"]
 
 
-def _sparse_graph_fn(
-    kind: SparseGraphKind, rows: int, row_vocab: int, k: int
+def _fused_graph_fn(
+    kind: FusedGraphKind, rows: int, row_vocab: int, k: int
 ) -> Callable[..., torch.Tensor]:
     def penalize(logits, cidx, lanes):
-        return apply_sparse_penalty(logits, cidx, lanes, rows, row_vocab, k)
+        return apply_fused_penalty(logits, cidx, lanes, rows, row_vocab, k)
 
     def greedy(logits, cidx, lanes):
         return rbln_greedy_sample(penalize(logits, cidx, lanes))
@@ -201,7 +201,7 @@ class RBLNSampler(VLLMSampler):
         logprobs_mode: LogprobsMode = "raw_logprobs",
         use_fp64_gumbel: bool = False,
         compile_context: rebel.CompileContext | None = None,
-        sparse_penalty: bool = False,
+        fused_penalty: bool = False,
     ):
         super().__init__(logprobs_mode=logprobs_mode, use_fp64_gumbel=use_fp64_gumbel)
 
@@ -228,35 +228,35 @@ class RBLNSampler(VLLMSampler):
         )
 
         self._compile_context = compile_context
-        self._sparse = (
-            SparsePenaltyState()
-            if sparse_penalty and logprobs_mode in ("raw_logprobs", "raw_logits")
+        self._penalty_state = (
+            FusedPenaltyState()
+            if fused_penalty and logprobs_mode in ("raw_logprobs", "raw_logits")
             else None
         )
-        self._sparse_graphs: dict[tuple, Callable[..., torch.Tensor]] = {}
+        self._fused_graphs: dict[tuple, Callable[..., torch.Tensor]] = {}
 
-    def _sparse_graph(
-        self, kind: SparseGraphKind, plan: SparsePlan
+    def _fused_graph(
+        self, kind: FusedGraphKind, plan: FusedPenaltyPlan
     ) -> Callable[..., torch.Tensor]:
         key = (kind, plan.rows, plan.row_vocab, plan.k)
-        fn = self._sparse_graphs.get(key)
+        fn = self._fused_graphs.get(key)
         if fn is None:
-            fn = self._sparse_graphs[key] = compile_sampler(
-                _sparse_graph_fn(*key), self._compile_context
+            fn = self._fused_graphs[key] = compile_sampler(
+                _fused_graph_fn(*key), self._compile_context
             )
         return fn
 
     def warm_up(
         self, logits: torch.Tensor, sampling_metadata: SamplingMetadata
     ) -> None:
-        """Compile the graphs `sampling_metadata` reaches, sparse ones included."""
+        """Compile the graphs `sampling_metadata` reaches, fused ones included."""
         _ = self(logits=logits, sampling_metadata=sampling_metadata)
-        if self._sparse is not None:
-            plan = self._sparse.identity_plan(logits.shape, logits.device)
-            self.sample(logits.clone(), sampling_metadata, sparse=plan)
+        if self._penalty_state is not None:
+            plan = self._penalty_state.identity_plan(logits.shape, logits.device)
+            self.sample(logits.clone(), sampling_metadata, penalty=plan)
             if not sampling_metadata.all_greedy:
                 # Steps with min_p penalize before the eager processors.
-                self._sparse_graph("penalize", plan)(
+                self._fused_graph("penalize", plan)(
                     logits.clone(), plan.cidx, plan.lanes
                 )
 
@@ -272,7 +272,7 @@ class RBLNSampler(VLLMSampler):
         sampling_metadata: SamplingMetadata,
         logprobs_mode_override: LogprobsMode | None = None,
         staging_owner: Any = None,
-        sparse: SparsePlan | None = None,
+        penalty: FusedPenaltyPlan | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Sample logits based on sampling metadata.
 
@@ -296,9 +296,9 @@ class RBLNSampler(VLLMSampler):
                     processed_logprobs = logits
                 elif logprobs_mode == "processed_logprobs":
                     processed_logprobs = self.compute_logprobs(logits)
-            if sparse is not None:
-                out = self._sparse_graph("greedy", sparse)(
-                    logits, sparse.cidx, sparse.lanes
+            if penalty is not None:
+                out = self._fused_graph("greedy", penalty)(
+                    logits, penalty.cidx, penalty.lanes
                 )
                 if staging_owner is not None:
                     out = _stage_into(staging_owner, out)
@@ -315,12 +315,12 @@ class RBLNSampler(VLLMSampler):
         # if argmax_invariant processors are active, apply temperature scaling
         # before applying them.
         if uses_argmax_invariant_processors(sampling_metadata):
-            if sparse is not None:
+            if penalty is not None:
                 # min_p and friends read the penalized logits.
-                logits = self._sparse_graph("penalize", sparse)(
-                    logits, sparse.cidx, sparse.lanes
+                logits = self._fused_graph("penalize", penalty)(
+                    logits, penalty.cidx, penalty.lanes
                 )
-                sparse = None
+                penalty = None
             # Divide in place, as upstream does: allocating a second logits-sized
             # tensor here costs more than the division itself. Rows past num_reqs of
             # the padded buffer must therefore carry temperature 1.0 -- see
@@ -339,9 +339,9 @@ class RBLNSampler(VLLMSampler):
             logits.shape[-1],
             logits.device,
         )
-        if sparse is not None:
-            out = self._sparse_graph("top_k_top_p", sparse)(
-                logits, sparse.cidx, sparse.lanes, temperature, k, p
+        if penalty is not None:
+            out = self._fused_graph("top_k_top_p", penalty)(
+                logits, penalty.cidx, penalty.lanes, temperature, k, p
             )
             if staging_owner is not None:
                 out = _stage_into(staging_owner, out)
@@ -388,25 +388,25 @@ class RBLNSampler(VLLMSampler):
         # Use float32 for the logits.
         # logits = logits.to(torch.float32)
 
-        sparse = None
+        penalty = None
         if (
-            self._sparse is not None
+            self._penalty_state is not None
             and input_batch is not None
             and not predict_bonus_token
         ):
-            sparse = self._sparse.plan(
+            penalty = self._penalty_state.plan(
                 sampling_metadata, input_batch, logits.shape, logits.device
             )
         logits = self.apply_logits_processors(
             logits,
             sampling_metadata
-            if sparse is None
+            if penalty is None
             else without_deferred(sampling_metadata),
             predict_bonus_token,
         )
         # Sample the next token.
         sampled, processed_logprobs = self.sample(
-            logits, sampling_metadata, staging_owner=staging_owner, sparse=sparse
+            logits, sampling_metadata, staging_owner=staging_owner, penalty=penalty
         )
         if processed_logprobs is not None:
             raw_logprobs = processed_logprobs
