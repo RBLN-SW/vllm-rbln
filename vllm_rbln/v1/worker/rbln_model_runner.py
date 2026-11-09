@@ -75,12 +75,14 @@ from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
     DraftTokenIds,
+    ECConnectorOutput,
     KVConnectorOutput,
     LogprobsLists,
     LogprobsTensors,
     ModelRunnerOutput,
     PoolerOutput,
     SamplerOutput,
+    make_empty_encoder_model_runner_output,
 )
 from vllm.v1.sample.logits_processor import (
     LogitsProcessors,
@@ -95,6 +97,7 @@ from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import record_function_or_nullcontext
+from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.kv_connector_model_runner_mixin import (
     KVConnectorModelRunnerMixin,
@@ -252,7 +255,7 @@ class ExecuteModelState(NamedTuple):
     combined_hidden_states: torch.Tensor | None
 
 
-class RBLNModelRunner(KVConnectorModelRunnerMixin):
+class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -501,6 +504,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # KV-connector output carried from execute_model() to sample_tokens()
         # (and across the PP / pooling / empty-batch paths).
         self.kv_connector_output: KVConnectorOutput | None = None
+        # The EC-connector output, carried the same way.
+        self.ec_connector_output: ECConnectorOutput | None = None
 
         # NOTE(RBLN): RBLN compiles a fixed decode-batch shape, so bucket to the
         # per-PP-stage decode batch (max_num_seqs // pp_size) -- the same ceiling
@@ -1368,11 +1373,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
     ) -> tuple[
         StagedModelInputs,
         dict[str, Any],
+        ECConnectorOutput | None,
     ]:
         """
         :return: tuple[
             staged_model_inputs,
             model_kwargs,
+            ec_connector_output,
         ]
         """
         # For text-only models
@@ -1411,11 +1418,17 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             **self._init_model_kwargs(),
         }
 
+        ec_connector_output = None
+        # The EC connector's loads feed the gather, so they run on the same
+        # prefill steps instead of on every step.
         if self.supports_mm_inputs and is_prefill and get_pp_group().is_first_rank:
-            self._execute_mm_encoder(scheduler_output)
-            mm_rows, mm_mask = self._gather_mm_embeddings(
-                scheduler_output, num_input_tokens
-            )
+            with self.maybe_get_ec_connector_output(
+                scheduler_output, encoder_cache=self.encoder_cache
+            ) as ec_connector_output:
+                self._execute_mm_encoder(scheduler_output)
+                mm_rows, mm_mask = self._gather_mm_embeddings(
+                    scheduler_output, num_input_tokens
+                )
             model_kwargs["mm_embeds"], model_kwargs["mm_mask"] = (
                 self.input_stager.stage_mm_embeds(
                     mm_rows,
@@ -1428,6 +1441,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         return (
             staged_model_inputs,
             model_kwargs,
+            ec_connector_output,
         )
 
     def _resolve_mm_support(self) -> bool:
@@ -1480,6 +1494,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         for mm_hash, output in zip(mm_hashes, encoder_outputs):
             self.encoder_cache[mm_hash] = output
+            self.maybe_save_ec_to_connector(self.encoder_cache, mm_hash)
 
     def _gather_mm_embeddings(
         self,
@@ -1551,6 +1566,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
     def _warmup_mm_encoder(self) -> None:
         """Materialize every encoder bucket before serving and sizing KV caches."""
         if not (self.supports_mm_inputs and get_pp_group().is_first_rank):
+            return
+        if self.is_ec_consumer_only:
             return
         mm_config = self.model_config.multimodal_config
         assert mm_config is not None
@@ -1979,6 +1996,16 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             # Update persistent batch states.
             self._update_states(scheduler_output)
 
+            if self.vllm_config.is_mm_encoder_only:
+                with self.maybe_get_ec_connector_output(
+                    scheduler_output, encoder_cache=self.encoder_cache
+                ) as ec_connector_output:
+                    self._execute_mm_encoder(scheduler_output)
+                return ModelRunnerOutput.with_ec_conn_output(
+                    make_empty_encoder_model_runner_output(scheduler_output),
+                    ec_connector_output,
+                )
+
             # Process sub-block KV cache copy operations before the forward
             # pass so that partially cached blocks are populated.
             if scheduler_output.kv_cache_copy_ops:
@@ -1987,9 +2014,22 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             if not num_scheduled_tokens:
                 if not has_kv_transfer_group():
                     # Return empty ModelRunnerOutput if there's no work to do.
-                    return EMPTY_MODEL_RUNNER_OUTPUT
-                # KV send/recv even when there is no forward work to do.
-                return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+                    output = EMPTY_MODEL_RUNNER_OUTPUT
+                else:
+                    # KV send/recv even when there is no forward work to do.
+                    output = self.kv_connector_no_forward(
+                        scheduler_output, self.vllm_config
+                    )
+                # EC send/recv too, on the ranks that run the EC connector.
+                if self.supports_mm_inputs and get_pp_group().is_first_rank:
+                    with self.maybe_get_ec_connector_output(
+                        scheduler_output, encoder_cache=self.encoder_cache
+                    ) as ec_connector_output:
+                        pass
+                    output = ModelRunnerOutput.with_ec_conn_output(
+                        output, ec_connector_output
+                    )
+                return output
 
             if self.cache_config.kv_sharing_fast_prefill:
                 assert not self.num_prompt_logprobs, (
@@ -2034,6 +2074,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             (
                 staged_model_inputs,
                 model_kwargs,
+                ec_connector_output,
             ) = self._preprocess(
                 scheduler_output,
                 num_reqs,
@@ -2087,6 +2128,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 assert isinstance(hidden_states, IntermediateTensors)
                 hidden_states.kv_connector_output = kv_connector_output
                 self.kv_connector_output = kv_connector_output
+                self.ec_connector_output = ec_connector_output
                 return hidden_states
 
             if self.is_pooling_model:
@@ -2121,6 +2163,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             combined_hidden_states,
         )
         self.kv_connector_output = kv_connector_output
+        self.ec_connector_output = ec_connector_output
         return None
 
     @torch.inference_mode()
@@ -2136,6 +2179,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
             if kv_connector_output is not None:
                 output.kv_connector_output = kv_connector_output
+            output.ec_connector_output = self.ec_connector_output
+            self.ec_connector_output = None
             return output
 
         # Unpack ephemeral state.
@@ -2266,6 +2311,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # self.kv_connector_output may be modified during drafting.
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
+        ec_connector_output = self.ec_connector_output
+        self.ec_connector_output = None
 
         with record_function_or_nullcontext("rbln_model_runner: ModelRunnerOutput"):
             output = ModelRunnerOutput(
@@ -2276,6 +2323,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 prompt_logprobs_dict=prompt_logprobs_dict,
                 num_nans_in_logits=num_nans_in_logits,
                 kv_connector_output=kv_connector_output,
+                ec_connector_output=ec_connector_output,
             )
 
         if not self.use_async_scheduling:
@@ -2560,7 +2608,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 use_direct_dispatch=True,
                 dtype=self.rbln_config.compile_dtype,
             )
-            if self.supports_mm_inputs:
+            if self.supports_mm_inputs and not self.is_ec_consumer_only:
                 cast(SupportsRBLNMultiModal, self.model).compile_mm_encoder(
                     lambda encoder: compile(
                         encoder,
@@ -3675,6 +3723,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             KVCacheSpec: A dictionary mapping layer names to their KV cache
             format. Layers that do not need KV cache are not included.
         """
+        if self.vllm_config.is_mm_encoder_only:
+            return {}
         kv_cache_spec: dict[str, KVCacheSpec] = {}
         layer_type = cast(type[Any], AttentionLayerBase)
         attn_layers = get_layers_from_vllm_config(self.vllm_config, layer_type)
@@ -3741,6 +3791,17 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
     @property
     def use_wrapped_compute_logits(self) -> bool:
         return not self.is_pooling_model
+
+    @property
+    def is_ec_consumer_only(self) -> bool:
+        """It receives encoder outputs through the EC connector instead of
+        encoding them."""
+        ec_config = self.vllm_config.ec_transfer_config
+        return (
+            ec_config is not None
+            and ec_config.is_ec_consumer
+            and not ec_config.is_ec_producer
+        )
 
     def _attach_kv_cache_bindings(
         self, attn_metadata: PerLayerAttnMetadata | None
@@ -4039,22 +4100,23 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         )
         mega_cache.load(self.model_config.model, sig)
         with set_compile_stage("warmup"), self.offload_context():
-            self.run_model_graphs()
+            if not self.vllm_config.is_mm_encoder_only:
+                self.run_model_graphs()
 
-            # NOTE(RBLN): the sampler and the rejection sampler are built on the
-            # last PP rank only, so no other rank has anything to warm up here.
-            if get_pp_group().is_last_rank:
-                # 4-1. sampler
-                if not self.is_pooling_model:
-                    for size in self.bucketing_manager.batch_buckets:
-                        self._dummy_sampler_run(size)
+                # NOTE(RBLN): the sampler and the rejection sampler are built on
+                # the last PP rank only, so no other rank has anything to warm up here.
+                if get_pp_group().is_last_rank:
+                    # 4-1. sampler
+                    if not self.is_pooling_model:
+                        for size in self.bucketing_manager.batch_buckets:
+                            self._dummy_sampler_run(size)
 
-                # 4-2. rejection sampler
-                self._warmup_sampler_decode_batches()
+                    # 4-2. rejection sampler
+                    self._warmup_sampler_decode_batches()
 
-            # 5. specdec (medusa)
-            if isinstance(self.drafter, RBLNMedusaProposer):
-                self.drafter.dummy_run()
+                # 5. specdec (medusa)
+                if isinstance(self.drafter, RBLNMedusaProposer):
+                    self.drafter.dummy_run()
 
             # 6. multimodal encoder
             self._warmup_mm_encoder()

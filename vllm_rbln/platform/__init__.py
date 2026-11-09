@@ -372,6 +372,17 @@ class RblnPlatform(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
+        ec_config = vllm_config.ec_transfer_config
+        if (
+            vllm_config.is_mm_encoder_only
+            and ec_config is not None
+            and ec_config.is_ec_consumer
+        ):
+            raise ValueError(
+                "--mm-encoder-only skips the language model, so it cannot be used "
+                "on an EC consumer."
+            )
+
         _impl().check_and_update(vllm_config)
 
         parallel_config = vllm_config.parallel_config

@@ -61,6 +61,6 @@ class TestGenerateModelPathName:
         monkeypatch.delenv("VLLM_RBLN_USE_NESTED_COMPILE_REGION", raising=False)
         default = _generate_model_path_name(_vllm_config())
         monkeypatch.setenv("VLLM_RBLN_USE_NESTED_COMPILE_REGION", "1")
-        assert _generate_model_path_name(_vllm_config()) != default
-        monkeypatch.setenv("VLLM_RBLN_USE_NESTED_COMPILE_REGION", "0")
         assert _generate_model_path_name(_vllm_config()) == default
+        monkeypatch.setenv("VLLM_RBLN_USE_NESTED_COMPILE_REGION", "0")
+        assert _generate_model_path_name(_vllm_config()) != default
