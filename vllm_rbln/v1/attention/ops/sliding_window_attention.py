@@ -117,8 +117,7 @@ def sliding_window_attention_v1(
     attn_mask: torch.Tensor | None = None,
     is_prompt_sorted: bool = False,
 ) -> torch.Tensor:
-    # Without a mask the converter derives the causal window; a mask carries a
-    # bidirectional one, which only the caller can bound by its padding.
+    # Without a mask the converter derives the causal window.
     return torch.ops.rbln_custom_ops.sliding_window_attention_v1(
         q,
         k,

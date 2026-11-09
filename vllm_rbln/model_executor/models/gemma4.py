@@ -48,21 +48,14 @@ from vllm_rbln.model_executor.models.interfaces import (
 
 class _RBLNGemma4VisionEncoder(nn.Module):
     """Gemma4's vision tower and its projection into the text model as one
-    static graph.
-
-    HF's encoder builds its mask and rotary tables in Python and dispatches
-    attention through ALL_ATTENTION_FUNCTIONS. Here the host hands in the mask,
-    the rotary tables are looked up in the graph, the attention is spelled
-    out, and the patches arrive padded to one count.
-    """
+    static graph: the host hands in the mask and patches padded to one count."""
 
     def __init__(self, vision_tower: nn.Module, embed_vision: nn.Module):
         super().__init__()
         self.tower = vision_tower
         self.embed_vision = embed_vision
         # HF's cos and sin for every position along one axis, side by side: a
-        # patch's are the rows at its x and at its y. Computed on the host per
-        # image, they cost more than the encoder at the smaller buckets.
+        # patch's are the rows at its x and at its y.
         patch_embedder = vision_tower.patch_embedder
         axis = torch.arange(patch_embedder.position_embedding_table.shape[1])
         cos, sin = vision_tower.encoder.rotary_emb(
@@ -166,9 +159,8 @@ class RBLNGemma4MultiModalProcessor(Gemma4MultiModalProcessor):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        # Upstream caches the HF processor on max_soft_tokens, which Gemma4's
-        # processor takes at construction, so the first request at a budget
-        # would build one; build each allowed budget's before serving.
+        # Upstream caches one HF processor per max_soft_tokens; build each
+        # allowed budget's before serving.
         for budget in _SUPPORTED_SOFT_TOKENS:
             if budget <= self._mm_soft_token_cap:
                 self.info.get_hf_processor(max_soft_tokens=budget)
@@ -207,7 +199,6 @@ class RBLNGemma4ForConditionalGeneration(
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         if vllm_config.parallel_config.data_parallel_size > 1:
             raise ValueError("Gemma4 does not support data parallel on RBLN.")
-        # TODO(RBLN): both drafter kinds wait on compiler fixes; see #1395.
         if vllm_config.speculative_config is not None:
             raise ValueError(
                 "Gemma4 does not support speculative decoding on RBLN yet."
