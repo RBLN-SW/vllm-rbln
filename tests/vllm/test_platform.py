@@ -581,6 +581,16 @@ class TestRejectedConfigs:
 
         return mutate
 
+    def test_gated_delta_net_is_told_by_the_model_type(self):
+        from vllm_rbln.platform.vllm_impl import _uses_gated_delta_net
+
+        def config(model_type):
+            return SimpleNamespace(hf_config=SimpleNamespace(model_type=model_type))
+
+        assert _uses_gated_delta_net(config("qwen3_5_text"))
+        assert _uses_gated_delta_net(config("qwen3_next"))
+        assert not _uses_gated_delta_net(config("glm5_next_text"))
+
     def test_gdn_models_need_128_token_prefill_chunks(self, reconfigure, gdn):
         def chunk_of_192(config):
             gdn(config)

@@ -58,13 +58,12 @@ def check_and_update(vllm_config: "VllmConfig") -> None:
 
 
 def _uses_gated_delta_net(model_config) -> bool:
-    """GatedDeltaNet layers (Qwen3-Next, Qwen3.5): `linear_attention` in the HF
-    config's `layer_types` with GDN's split key / value heads. GLM-5.3's KDA
-    layers carry the same layer type under `linear_num_heads`."""
+    """A GatedDeltaNet model (Qwen3-Next, Qwen3.5) by its HF text model type.
+    GLM-5.3's KDA layers share the `linear_attention` layer type and stay out."""
+    from vllm_rbln.v1.kv_cache import GATED_DELTA_NET_MODEL_TYPES
+
     text_config = getattr(model_config, "hf_text_config", model_config.hf_config)
-    return "linear_attention" in (
-        getattr(text_config, "layer_types", None) or ()
-    ) and hasattr(text_config, "linear_num_value_heads")
+    return getattr(text_config, "model_type", None) in GATED_DELTA_NET_MODEL_TYPES
 
 
 def _uses_model_parallel(parallel_config) -> bool:

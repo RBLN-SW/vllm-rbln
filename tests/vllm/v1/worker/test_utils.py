@@ -2023,12 +2023,7 @@ class TestGatedDeltaNetCacheIndices:
     def test_a_layer_owns_a_state_and_a_conv_ring_slot(self):
         # Two cache slots a layer: the recurrent state at the layer's own slot,
         # its conv ring at the next, and an attention layer's cache at the first.
-        config = SimpleNamespace(
-            hf_config=SimpleNamespace(
-                layer_types=["linear_attention", "full_attention"],
-                linear_num_value_heads=32,
-            )
-        )
+        config = SimpleNamespace(hf_config=SimpleNamespace(model_type="qwen3_5_text"))
         assert worker_utils.num_attn_module(config, "auto") == 2
         assert worker_utils.extract_layer_index("model.layers.3.linear_attn", 2) == 6
         assert (
