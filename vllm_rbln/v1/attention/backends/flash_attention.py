@@ -160,9 +160,9 @@ class RBLNFlashAttentionMetadata:
     cache_seq_lens: torch.Tensor | None = None
     cache_offsets: torch.Tensor | None = None
     local_block_tables: torch.Tensor | None = None
+    # The shift op's decode mask, or an mm prefix step's mask in the append
+    # op's key frame.
     swa_attn_masks: torch.Tensor | None = None
-    # An mm prefix step's sliding-window mask, in the append op's key frame.
-    mm_prefix_swa_mask: torch.Tensor | None = None
 
     use_custom_kernel: bool = False
     is_prompt_sorted: bool = False
@@ -361,7 +361,6 @@ class RBLNFlashAttentionMetadataBuilder(
 
             local_block_tables = block_tables_tensor[..., :1]
 
-        mm_prefix_swa_mask = None
         if mm_prefix_query_len is not None and self.swa_appends:
             # HF's AND(sliding_window, OR(causal, blockwise)) over the strip of
             # blocks sliding_window_attention_v1 reads. The step's valid tokens
@@ -384,7 +383,7 @@ class RBLNFlashAttentionMetadataBuilder(
                 & (distance < window)
                 & ((distance >= 0) | (key >= start))
             )
-            mm_prefix_swa_mask = keep.to(
+            swa_attn_masks = keep.to(
                 torch.float16 if self.enforce_eager else torch.float32
             ).view(1, 1, mm_prefix_query_len, -1)
 
@@ -398,7 +397,6 @@ class RBLNFlashAttentionMetadataBuilder(
             cache_offsets=self._stage(cache_offsets, "cache_offsets"),
             local_block_tables=self._stage(local_block_tables, "local_block_tables"),
             swa_attn_masks=self._stage(swa_attn_masks, "swa_attn_masks"),
-            mm_prefix_swa_mask=self._stage(mm_prefix_swa_mask, "mm_prefix_swa_mask"),
             use_custom_kernel=self.use_custom_kernel,
             is_prompt_sorted=is_prompt_sorted,
             num_accepted=self._stage(
@@ -663,7 +661,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     attn_metadata.block_tables,
                     self.sliding_window,
                     self.sinks,
-                    attn_mask=attn_metadata.mm_prefix_swa_mask,
+                    attn_mask=attn_metadata.swa_attn_masks,
                     is_prompt_sorted=attn_metadata.is_prompt_sorted,
                 )
             else:
