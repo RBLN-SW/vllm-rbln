@@ -162,6 +162,9 @@ class RBLNFlashAttentionMetadata:
     local_block_tables: torch.Tensor | None = None
     # The shift op's decode mask, or the prefill mask of an mm prefix LM in the
     # append op's key frame.
+    # TODO(RBLN): fold into `attn_masks`. A builder serves one KV cache group,
+    # so sliding layers never read `attn_masks`; a sliding group then has to
+    # skip the non-causal full-width mask it builds today.
     swa_attn_masks: torch.Tensor | None = None
 
     use_custom_kernel: bool = False
