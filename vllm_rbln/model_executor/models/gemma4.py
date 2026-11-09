@@ -257,17 +257,14 @@ class RBLNGemma4ForConditionalGeneration(
 
         return super().load_weights(fold(weights))
 
-    def get_mm_prefix_query_lens(self) -> list[int]:
-        # One length per soft token budget the processor may emit, rounded up
-        # to the 128-token tiles optimum-rbln compiles image prefill at. Video
-        # frames use the smallest budget.
-        return sorted(
-            {
-                (budget + 127) // 128 * 128
-                for budget in _SUPPORTED_SOFT_TOKENS
-                if budget <= self.mm_soft_token_cap
-            }
-        )
+    def get_mm_prefix_range_lens(self) -> list[int]:
+        # One length per soft token budget the processor may emit. Video frames
+        # use the smallest budget.
+        return [
+            budget
+            for budget in _SUPPORTED_SOFT_TOKENS
+            if budget <= self.mm_soft_token_cap
+        ]
 
     def compile_mm_encoder(self, compile_fn) -> None:
         # Without an image or video limit, or off the first PP rank, upstream

@@ -204,12 +204,12 @@ def test_warm_up_without_an_encoder_runs_nothing():
 
 
 @pytest.mark.parametrize(
-    "cap, query_lens",
-    [(280, [128, 256, 384]), (1120, [128, 256, 384, 640, 1152]), (70, [128])],
+    "cap, range_lens",
+    [(280, [70, 140, 280]), (1120, [70, 140, 280, 560, 1120]), (70, [70])],
 )
-def test_one_query_len_per_soft_token_budget(cap, query_lens):
+def test_one_range_len_per_soft_token_budget(cap, range_lens):
     model = _bare_model(mm_soft_token_cap=cap)
-    assert model.get_mm_prefix_query_lens() == query_lens
+    assert model.get_mm_prefix_range_lens() == range_lens
 
 
 def _processing_info(engine_kwargs, processor_default, default_output_length):

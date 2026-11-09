@@ -81,12 +81,12 @@ class TestResolveMultiModalSupport:
 
 
 class _MmPrefixModel(_InGraphMergeModel):
-    def __init__(self, query_lens):
+    def __init__(self, range_lens):
         super().__init__()
-        self.query_lens = query_lens
+        self.range_lens = range_lens
 
-    def get_mm_prefix_query_lens(self) -> list[int]:
-        return self.query_lens
+    def get_mm_prefix_range_lens(self) -> list[int]:
+        return self.range_lens
 
 
 class TestResolveMmPrefixSupport:
@@ -103,13 +103,17 @@ class TestResolveMmPrefixSupport:
         runner.model = model
         return runner
 
-    def test_the_models_query_lens_are_taken(self, make_model_runner, monkeypatch):
-        runner = self._runner(make_model_runner, monkeypatch, _MmPrefixModel([64, 128]))
+    def test_the_models_range_lens_are_padded_to_query_lens(
+        self, make_model_runner, monkeypatch
+    ):
+        runner = self._runner(
+            make_model_runner, monkeypatch, _MmPrefixModel([64, 100, 200])
+        )
 
         assert runner._resolve_mm_support() is True
-        assert runner.mm_prefix_query_len_buckets == [64, 128]
+        assert runner.mm_prefix_query_len_buckets == [128, 256]
 
-    def test_a_model_naming_no_query_lens_is_refused(
+    def test_a_model_naming_no_range_lens_is_refused(
         self, make_model_runner, monkeypatch
     ):
         runner = self._runner(make_model_runner, monkeypatch, _InGraphMergeModel())
@@ -130,17 +134,30 @@ class TestResolveMmPrefixSupport:
         with pytest.raises(ValueError, match="long_prefill_token_threshold"):
             runner._resolve_mm_support()
 
+    def test_a_threshold_holding_the_longest_range_unpadded_is_taken(
+        self, make_model_runner, monkeypatch
+    ):
+        # The threshold caps scheduled tokens, which the 384 padding is not.
+        runner = self._runner(
+            make_model_runner,
+            monkeypatch,
+            _MmPrefixModel([280]),
+            long_prefill_token_threshold=280,
+        )
+
+        assert runner._resolve_mm_support() is True
+
     def test_a_budget_shorter_than_a_padded_range_is_refused(
         self, make_model_runner, monkeypatch
     ):
         runner = self._runner(
             make_model_runner,
             monkeypatch,
-            _MmPrefixModel([64, 256]),
-            max_num_batched_tokens=128,
+            _MmPrefixModel([64, 200]),
+            max_num_batched_tokens=200,
         )
 
-        with pytest.raises(ValueError, match="max_num_batched_tokens=128"):
+        with pytest.raises(ValueError, match="max_num_batched_tokens=200"):
             runner._resolve_mm_support()
 
     def test_prefix_caching_is_taken(self, make_model_runner, monkeypatch):

@@ -63,12 +63,12 @@ class SupportsRBLNMmPrefix(Protocol):
     Upstream attends both ways inside each multimodal embedding range through
     ``mm_prefix_range``, which its kernels read at run time. A compiled RBLN
     graph cannot, so each range is prefilled as a step of its own, padded to
-    one of the query lengths the model names here.
+    a query length the runner compiles for each range length named here.
     """
 
-    def get_mm_prefix_query_lens(self) -> list[int]:
-        """Ascending padded query lengths an mm prefix step is compiled at;
-        the largest holds the longest range the model can produce."""
+    def get_mm_prefix_range_lens(self) -> list[int]:
+        """Ascending range lengths, before padding, an mm prefix step is
+        compiled for; the largest is the longest range the model can produce."""
         ...
 
 

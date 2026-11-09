@@ -51,7 +51,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.tracing import instrument
 from vllm.utils import length_from_prompt_token_ids_or_embeds
-from vllm.utils.math_utils import cdiv
+from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.torch_utils import PIN_MEMORY, kv_cache_dtype_str_to_dtype
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -1477,18 +1477,21 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 raise ValueError(
                     f"{type(self.model).__name__} attends both ways inside its "
                     "multimodal ranges (is_mm_prefix_lm), which the RBLN vLLM path "
-                    "serves only for models naming the query lengths to compile "
-                    "those steps at (SupportsRBLNMmPrefix). Without it the ranges "
+                    "serves only for models naming the range lengths to compile "
+                    "those steps for (SupportsRBLNMmPrefix). Without it the ranges "
                     "would run causally."
                 )
-            query_lens = self.model.get_mm_prefix_query_lens()
-            longest = query_lens[-1]
+            range_lens = self.model.get_mm_prefix_range_lens()
             threshold = self.scheduler_config.long_prefill_token_threshold
-            if 0 < threshold < longest:
+            if 0 < threshold < range_lens[-1]:
                 raise ValueError(
                     f"long_prefill_token_threshold={threshold} would split a "
-                    f"multimodal range of up to {longest} tokens."
+                    f"multimodal range of up to {range_lens[-1]} tokens."
                 )
+            # Rounded up to the 128-token tiles optimum-rbln compiles image
+            # prefill at.
+            query_lens = sorted({round_up(n, 128) for n in range_lens})
+            longest = query_lens[-1]
             # The scheduler cuts steps on range boundaries, so what has to fit
             # one step is the longest range as padded here, not a whole
             # multimodal item as --disable-chunked-mm-input would require.
