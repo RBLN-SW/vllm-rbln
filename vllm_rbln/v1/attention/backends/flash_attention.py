@@ -395,7 +395,7 @@ class RBLNFlashAttentionMetadataBuilder(
                 )
                 row = torch.arange(query_len).view(-1, 1)
                 key = first_key - start + torch.arange(num_blocks * self.block_size)
-                keep = (key <= mm_prefix_row_ends.view(-1, 1)) & (row - key < window)
+                keep = (key <= mm_prefix_row_ends.view(-1, 1)) & (key > row - window)
                 swa_attn_masks = self._stage(
                     keep.to(self.model_config.dtype).view(1, 1, query_len, -1),
                     "swa_attn_masks",
