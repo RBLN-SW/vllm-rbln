@@ -2573,7 +2573,11 @@ class TestExecuteModelStampsMmPrefixSteps:
             _determine_batch_execution_and_padding=lambda *a, **kw: _resolved_batch(
                 num_reqs_padded=1, query_len=scheduled, num_tokens_padded=None
             ),
-            _preprocess=lambda *a, **kw: (SimpleNamespace(as_kwargs=lambda: {}), {}),
+            _preprocess=lambda *a, **kw: (
+                SimpleNamespace(as_kwargs=lambda: {}),
+                {},
+                None,
+            ),
             _bookkeeping_and_output=lambda *a, **kw: "OUTPUT",
             input_batch=SimpleNamespace(
                 num_reqs=1,
