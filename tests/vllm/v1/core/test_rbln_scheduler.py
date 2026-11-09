@@ -52,7 +52,7 @@ from vllm_rbln.v1.kv_cache import RBLNGDNManager, RBLNGDNStateSpec
 class TestSchedulerInit:
     def test_gdn_group_schedules_on_a_pool_of_its_own(self):
         # The GatedDeltaNet group's manager is bound to a pool sized by
-        # gdn_pool_blocks; the attention group stays on the shared pool.
+        # the spec's pool_blocks; the attention group stays on the shared pool.
         register_all_kvcache_specs(None)
         RblnPlatform.register_custom_kv_cache_specs(None)
         gdn = RBLNGDNStateSpec(

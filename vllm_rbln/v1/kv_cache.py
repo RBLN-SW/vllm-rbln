@@ -172,12 +172,11 @@ class RBLNGDNStateSpec(MambaSpec):
         pages = super().max_memory_usage_bytes(vllm_config) // self.page_size_bytes
         return pages * self.real_page_size_bytes
 
-
-def gdn_pool_blocks(vllm_config: VllmConfig) -> int:
-    """Blocks in a GatedDeltaNet group's pool: one a running request (its whole
-    state, while `mamba_block_size` is the model length) and the null block the
-    pool reserves, which the decode batch pads onto."""
-    return vllm_config.scheduler_config.max_num_seqs + 1
+    def pool_blocks(self, vllm_config: VllmConfig) -> int:
+        """Blocks in the group's pool: one a running request (its whole state,
+        while `mamba_block_size` is the model length) and the null block the
+        pool reserves, which the decode batch pads onto."""
+        return vllm_config.scheduler_config.max_num_seqs + 1
 
 
 class RBLNGDNManager(MambaManager):

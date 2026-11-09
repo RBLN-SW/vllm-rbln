@@ -517,6 +517,19 @@ def dynamic_kv_enabled(vllm_config: VllmConfig) -> bool:
     )
 
 
+_SpecT = TypeVar("_SpecT", bound=KVCacheSpec)
+
+
+def layers_with_spec(cfg: KVCacheConfig, spec_type: type[_SpecT]) -> dict[str, _SpecT]:
+    """The layers of every cache group whose spec is a `spec_type`, by name."""
+    return {
+        layer_name: group.kv_cache_spec
+        for group in cfg.kv_cache_groups
+        if isinstance(group.kv_cache_spec, spec_type)
+        for layer_name in group.layer_names
+    }
+
+
 def kv_cache_extents(cfg: KVCacheConfig) -> dict[str, tuple[int, int]]:
     """Each layer's `(start, length)` in the backing allocation.
 

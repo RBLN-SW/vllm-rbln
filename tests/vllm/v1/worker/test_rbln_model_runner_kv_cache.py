@@ -225,7 +225,7 @@ class TestMambaSpecGroup:
 
     def test_a_gdn_state_layer_gets_a_buffer_sized_by_its_pool(self, make_model_runner):
         # Not the group's extent (an alias of the attention pool): a buffer of
-        # gdn_pool_blocks states, one a running request plus the null block.
+        # pool_blocks states, one a running request plus the null block.
         runner = make_model_runner(layers=("layer.0",), init_kv_cache=False)
         spec = self._state_spec(runner)
         config = make_kv_cache_config(runner, groups=[("layer.0",)], spec=spec)
@@ -259,7 +259,7 @@ class TestMambaSpecGroup:
 
     def test_a_gdn_pool_is_not_dynamic(self, make_model_runner, monkeypatch):
         # The dynamic-KV resize scales the attention block count; a GDN pool
-        # and its aux caches are sized by gdn_pool_blocks, so they stay static.
+        # and its aux caches are sized by the spec's pool_blocks, so they stay static.
         monkeypatch.setattr(mr, "dynamic_kv_enabled", lambda _config: True)
         runner = make_model_runner(layers=("layer.0",), init_kv_cache=False)
         config = make_kv_cache_config(

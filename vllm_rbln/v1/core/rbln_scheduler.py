@@ -51,7 +51,7 @@ from vllm_rbln.v1.core.utils import (
     should_defer_spec_step,
     sub_block_size_in_use,
 )
-from vllm_rbln.v1.kv_cache import RBLNGDNManager, gdn_pool_blocks
+from vllm_rbln.v1.kv_cache import RBLNGDNManager, RBLNGDNStateSpec
 
 logger = init_logger(__name__)
 
@@ -136,7 +136,9 @@ class RBLNScheduler(Scheduler):
         # GatedDeltaNet group keeps its states in a pool of its own.
         for manager in self.kv_cache_manager.coordinator.single_type_managers:
             if isinstance(manager, RBLNGDNManager):
-                manager.bind_pool(gdn_pool_blocks(self.vllm_config))
+                spec = manager.kv_cache_spec
+                assert isinstance(spec, RBLNGDNStateSpec), spec
+                manager.bind_pool(spec.pool_blocks(self.vllm_config))
 
     def _decode_demand(self) -> int:
         """Total decode demand for this step's soft (ceil(demand/pp)) cap.
