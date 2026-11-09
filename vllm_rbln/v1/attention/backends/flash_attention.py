@@ -270,10 +270,13 @@ class RBLNFlashAttentionMetadataBuilder(
         num_accepted: torch.Tensor | None = None,
         state_load_pos: torch.Tensor | None = None,
         mm_prefix_row_ends: torch.Tensor | None = None,
+        swa_masks: dict[tuple[int, int], torch.Tensor] | None = None,
     ) -> RBLNFlashAttentionMetadata:
         """`mm_prefix_row_ends`, on a prefill of an mm prefix LM, holds for each
         padded row of the step the last step-local row it may read: itself, or
-        its range's last position for an mm row. None on any other step."""
+        its range's last position for an mm row. None on any other step.
+        `swa_masks` is the step's staged masks by (window, block size), shared
+        by its sliding builders."""
         num_reqs = common_attn_metadata.num_reqs
         # NOTE(RBLN): vllm-rbln keeps attention metadata on the host and copies
         # to the device only when constructing RBLNFlashAttentionMetadata below.
@@ -356,9 +359,12 @@ class RBLNFlashAttentionMetadataBuilder(
                 # Generate sliding window attention mask for decode
                 # mask[b, s] = 1.0 if s <= cache_seq_lens[b] else 0.0
                 positions = torch.arange(sliding_window)[None, :]
-                swa_attn_masks = torch.where(positions - cache_seq_lens > 0, 0.0, 1.0)[
-                    :, None, None, :
-                ]
+                swa_attn_masks = self._stage(
+                    torch.where(positions - cache_seq_lens > 0, 0.0, 1.0)[
+                        :, None, None, :
+                    ],
+                    "swa_attn_masks",
+                )
 
             local_block_tables = block_tables_tensor[..., :1]
 
@@ -366,20 +372,27 @@ class RBLNFlashAttentionMetadataBuilder(
             # HF's AND(sliding_window, OR(causal, same range)) over the strip of
             # blocks sliding_window_attention_v1 reads: a row reads keys up to
             # its row end, inside the window.
-            assert is_prefill and num_reqs == 1
-            query_len = mm_prefix_row_ends.numel()
-            start = int(seq_idx[0])
+            assert is_prefill and num_reqs == 1 and swa_masks is not None
             window = self.kv_cache_spec.sliding_window
-            num_blocks = (
-                window + query_len - 1 + self.block_size - 1
-            ) // self.block_size + 1
-            first_key = max(start - window + 1, 0) // self.block_size * self.block_size
-            row = torch.arange(query_len).view(-1, 1)
-            key = first_key - start + torch.arange(num_blocks * self.block_size)
-            keep = (key <= mm_prefix_row_ends.view(-1, 1)) & (row - key < window)
-            swa_attn_masks = keep.to(
-                torch.float16 if self.enforce_eager else torch.float32
-            ).view(1, 1, query_len, -1)
+            if (swa_attn_masks := swa_masks.get((window, self.block_size))) is None:
+                query_len = mm_prefix_row_ends.numel()
+                start = int(seq_idx[0])
+                num_blocks = (
+                    window + query_len - 1 + self.block_size - 1
+                ) // self.block_size + 1
+                first_key = (
+                    max(start - window + 1, 0) // self.block_size * self.block_size
+                )
+                row = torch.arange(query_len).view(-1, 1)
+                key = first_key - start + torch.arange(num_blocks * self.block_size)
+                keep = (key <= mm_prefix_row_ends.view(-1, 1)) & (row - key < window)
+                swa_attn_masks = self._stage(
+                    keep.to(
+                        torch.float16 if self.enforce_eager else torch.float32
+                    ).view(1, 1, query_len, -1),
+                    "swa_attn_masks",
+                )
+                swa_masks[(window, self.block_size)] = swa_attn_masks
 
         attn_metadata = RBLNFlashAttentionMetadata(
             seq_lens=self._stage(seq_idx, "seq_idx"),
@@ -390,7 +403,7 @@ class RBLNFlashAttentionMetadataBuilder(
             cache_seq_lens=self._stage(cache_seq_lens, "cache_seq_lens"),
             cache_offsets=self._stage(cache_offsets, "cache_offsets"),
             local_block_tables=self._stage(local_block_tables, "local_block_tables"),
-            swa_attn_masks=self._stage(swa_attn_masks, "swa_attn_masks"),
+            swa_attn_masks=swa_attn_masks,
             use_custom_kernel=self.use_custom_kernel,
             is_prompt_sorted=is_prompt_sorted,
             num_accepted=self._stage(

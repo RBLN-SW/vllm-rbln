@@ -583,6 +583,7 @@ class TestBuildMmPrefixSlidingWindow:
                 batch_pad=1,
                 is_prefill=True,
                 mm_prefix_row_ends=row_ends,
+                swa_masks={},
             )
             assert md.swa_attn_masks.shape[-2] == query_len
             outputs.append(
@@ -651,8 +652,28 @@ class TestBuildMmPrefixSlidingWindow:
             batch_pad=1,
             is_prefill=True,
             mm_prefix_row_ends=torch.arange(8),
+            swa_masks={},
         )
         assert md.swa_attn_masks is None
+
+    def test_the_sliding_groups_of_a_step_share_one_staged_mask(self, cfg):
+        args = (
+            _cam(num_reqs=1, query_start_loc=[0, 6], seq_lens=[6], block_table=[[1]]),
+            torch.arange(6),
+        )
+        swa_masks: dict[tuple[int, int], torch.Tensor] = {}
+        kwargs = dict(
+            batch_pad=1,
+            is_prefill=True,
+            mm_prefix_row_ends=torch.arange(8),
+            swa_masks=swa_masks,
+        )
+        first = self._builder(cfg).build(*args, **kwargs)
+        second = self._builder(cfg).build(*args, **kwargs)
+        full = make_builder(cfg).build(*args, **kwargs)
+
+        assert second.swa_attn_masks is first.swa_attn_masks
+        assert full.swa_attn_masks is None
 
 
 class TestBuildOutputAssembly:
