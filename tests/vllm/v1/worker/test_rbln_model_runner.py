@@ -108,6 +108,7 @@ def _make_runner_stub(**attrs):
     runner = object.__new__(RBLNModelRunner)
     runner.dp_status = None
     runner.supports_mm_inputs = False
+    runner.mm_prefix_query_len_buckets = []
     for key, value in attrs.items():
         setattr(runner, key, value)
     return runner
@@ -2549,7 +2550,6 @@ class TestExecuteModelStampsMmPrefixSteps:
 
     @staticmethod
     def _query_len_seen(monkeypatch, *, computed, scheduled, mm_features):
-        monkeypatch.setattr(mr, "step_is_prefill", lambda so: True)
         monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: False)
         monkeypatch.setattr(mr, "set_forward_context", lambda *a, **kw: nullcontext())
         monkeypatch.setattr(
@@ -2609,6 +2609,11 @@ class TestExecuteModelStampsMmPrefixSteps:
             SimpleNamespace(
                 total_num_scheduled_tokens=scheduled,
                 num_scheduled_tokens={"r0": scheduled},
+                scheduled_spec_decode_tokens={},
+                scheduled_new_reqs=[],
+                scheduled_cached_reqs=SimpleNamespace(
+                    req_ids=["r0"], num_computed_tokens=[computed]
+                ),
                 kv_cache_copy_ops=None,
             )
         )
@@ -2643,6 +2648,13 @@ class TestExecuteModelStampsMmPrefixSteps:
         # Soft tokens at 5..14; a hit ended at 9, so the step runs 9..14.
         seen = self._query_len_seen(
             monkeypatch, computed=9, scheduled=6, mm_features=[self._image(4, 10)]
+        )
+        assert seen == 128
+
+    def test_a_hit_leaving_a_range_its_last_token_prefills_it(self, monkeypatch):
+        # Soft tokens at 5..14; a hit ended at 14, so one token is left.
+        seen = self._query_len_seen(
+            monkeypatch, computed=14, scheduled=1, mm_features=[self._image(4, 10)]
         )
         assert seen == 128
 
