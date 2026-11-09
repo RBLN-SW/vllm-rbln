@@ -16,6 +16,13 @@
 The host keeps, per request, the 64-wide vocab chunks of the tokens it has seen
 or biased, with three lane parameters (add, mul, sub). The sampling graph
 gathers only those chunks, penalizes them, and scatters them back.
+
+Invariants the scatter relies on:
+- A lane no token touched holds (0, 1, 0), so rewriting it is a no-op.
+- Slots past a row's last used chunk repeat slot 0, so duplicate scatter
+  targets always carry identical values.
+
+See docs/sparse_penalty.md.
 """
 
 from collections.abc import Callable, Sequence
