@@ -751,10 +751,14 @@ class TestEcConsumer:
         self, monkeypatch, ec_role, compiled
     ):
         compile_calls = []
-        model = SimpleNamespace(
-            logits_processor=None,
-            compile_mm_encoder=lambda compile_fn: compile_calls.append(compile_fn),
-        )
+
+        class _Model(torch.nn.Module):
+            logits_processor = None
+
+            def compile_mm_encoder(self, compile_fn):
+                compile_calls.append(compile_fn)
+
+        model = _Model()
         monkeypatch.setattr(
             mr,
             "get_model_loader",
