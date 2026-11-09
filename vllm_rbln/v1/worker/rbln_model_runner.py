@@ -3596,7 +3596,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         extent_of = kv_cache_extents(kv_cache_config)
         # A GatedDeltaNet layer's buffer is its own, a block a state of its pool
         # (_allocate_state_pool_caches): so are its aux caches, static like it.
-        own = layers_with_spec(kv_cache_config, RBLNGDNStateSpec)
+        own_pool_specs = layers_with_spec(kv_cache_config, RBLNGDNStateSpec)
         # Sized with the KV cache: the dynamic-KV resize reads their growth from
         # the compiled placement like any KV input's.
         dynamic_axis = 0 if dynamic_kv_enabled(self.vllm_config) else None
@@ -3610,19 +3610,19 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 continue
             assert isinstance(spec, RBLNBlockAuxSpec), spec
             assert spec.owner in extent_of, f"{layer_name}: no owner {spec.owner}"
-            if spec.owner in own:
+            if spec.owner in own_pool_specs:
                 shape = (
-                    own[spec.owner].pool_blocks(self.vllm_config),
+                    own_pool_specs[spec.owner].pool_blocks(self.vllm_config),
                     *spec.block_shape,
                 )
-                extent: tuple[int, int] | str = spec.owner
+                share_key: tuple[int, int] | str = spec.owner
                 axis = None
             else:
                 shape = (kv_cache_config.num_blocks, *spec.block_shape)
-                extent = extent_of[spec.owner]
+                share_key = extent_of[spec.owner]
                 axis = dynamic_axis
             kind = (spec.owner, shape, spec.dtype)
-            key = (extent, shape, spec.dtype, ordinals[kind])
+            key = (share_key, shape, spec.dtype, ordinals[kind])
             ordinals[kind] += 1
             if (cache := tensors.get(key)) is None:
                 cache = torch.empty(shape, dtype=spec.dtype, device=device)
