@@ -238,7 +238,10 @@ class RBLNWorker(WorkerBase):
             spec_enabled and not self.model_runner.uses_fixed_decode_window
         )
         num_decode_query_lens = 2 if variable_decode_query_lens else 1
-        num_runtimes = 1 + decode_batch_buckets_count * num_decode_query_lens
+        num_runtimes = (
+            len(self.model_runner.prefill_chunk_sizes)
+            + decode_batch_buckets_count * num_decode_query_lens
+        )
         if has_specialized_moe_decode:
             num_runtimes += num_decode_query_lens
             if variable_decode_query_lens:

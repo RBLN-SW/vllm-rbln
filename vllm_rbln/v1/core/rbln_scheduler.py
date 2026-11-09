@@ -76,12 +76,11 @@ class RBLNScheduler(Scheduler):
 
         # Replace the upstream KVCacheManager with RBLNKVCacheManager
         # when sub-block prefix caching is enabled.
-        assert rbln_config.prefill_chunk_size is not None  # resolved at start-up
         sub_block_size = sub_block_size_in_use(
             enable_prefix_caching=self.cache_config.enable_prefix_caching,
             sub_block_cache=rbln_config.enable_sub_block_cache,
             block_size=self.block_size,
-            prefill_chunk_size=rbln_config.prefill_chunk_size,
+            prefill_chunk_size=rbln_config.max_prefill_chunk_size,
             kv_cache_config=self.kv_cache_config,
             sub_block_size=rbln_config.sub_block_size,
         )
@@ -132,7 +131,7 @@ class RBLNScheduler(Scheduler):
         # the soft cap a no-op. See v1/core/utils.py.
         self._pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
 
-        self._prefill_chunk_size = rbln_config.prefill_chunk_size
+        self._prefill_chunk_size = rbln_config.max_prefill_chunk_size
 
         # NOTE(RBLN): the sparse-attention ops (DSA MLA / indexer, MiniMax-M3
         # MSA / indexer, GLM5 MLA / indexer) get NULL_BLOCK_ID as null_block_id
