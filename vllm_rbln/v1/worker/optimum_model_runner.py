@@ -1188,7 +1188,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             return
         if not self.use_rbln_sampler:
             logger.info(
-                "Skip dummy sampler run since it is only used in RBLN_SAMPLER=1"
+                "Skip dummy sampler run since --rbln-use-custom-sampler is disabled"
             )
             return
 

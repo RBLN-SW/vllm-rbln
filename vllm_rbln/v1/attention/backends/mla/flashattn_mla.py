@@ -25,6 +25,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.mla.index_group import SparseMLAIndexGroupBuilder
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 from vllm_rbln.logger import init_logger
 
@@ -252,6 +253,7 @@ class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
                 attn_metadata.block_tables,
                 topk_indices,
                 is_prompt_sorted=attn_metadata.is_prompt_sorted,
+                null_block_id=NULL_BLOCK_ID,
             )
             return self._v_up_proj(attn_output, layer.W_UV)
 

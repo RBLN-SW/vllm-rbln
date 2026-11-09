@@ -199,7 +199,7 @@ class TestSubBlockSizeInUse:
             enable_prefix_caching=True,
             sub_block_cache=True,
             block_size=1024,
-            max_num_batched_tokens=512,
+            prefill_chunk_size=512,
             kv_cache_config=object(),
         )
         args.update(kw)
@@ -238,7 +238,7 @@ class TestSubBlockSizeInUse:
     def test_a_chunk_outside_the_block_bounds_is_rejected(self, eligible):
         eligible(True)
         with pytest.raises(ValueError, match="block_size >="):
-            self._call(block_size=256, max_num_batched_tokens=512, sub_block_size=256)
+            self._call(block_size=256, prefill_chunk_size=512, sub_block_size=256)
 
     def test_a_size_the_kv_cache_cannot_hold_is_rejected(self, eligible):
         # A size that is not a divisor of block_size, or a spec with no token
@@ -252,7 +252,7 @@ class TestSubBlockSizeInUse:
         # Nobody asked for sub-blocks here, so a chunk wider than the block
         # steps aside rather than refusing to start.
         eligible(True)
-        assert self._call(block_size=256, max_num_batched_tokens=512) is None
+        assert self._call(block_size=256, prefill_chunk_size=512) is None
 
     def test_a_size_below_the_chunk_needs_cr13(self, eligible, monkeypatch):
         # The multi-block store the decoupled size needs is CR13-only.
