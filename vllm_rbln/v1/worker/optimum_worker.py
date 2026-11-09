@@ -39,7 +39,10 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 from vllm_rbln import envs
 from vllm_rbln.logger import init_logger
-from vllm_rbln.utils.optimum.converter import RBLNParams, update_num_blocks
+from vllm_rbln.utils.optimum.configuration.runtime import (
+    get_runtime_num_blocks,
+    update_num_blocks,
+)
 from vllm_rbln.v1.worker.optimum_model_runner import RBLNOptimumModelRunner
 from vllm_rbln.v1.worker.utils import (
     RblnProfilerWrapper,
@@ -172,15 +175,16 @@ class RBLNOptimumWorker(WorkerBase):
         # If the model is compiled in the runner,
         # the number of blocks is not set in the vLLM config yet.
         # Therefore, we need to update it here.
+        # FIXME: Sync block counts after compilation in model_base.init_model().
         if not self.model_runner.vllm_config.cache_config.num_gpu_blocks:
-            params = RBLNParams.from_rbln_config(
-                self.model_runner.vllm_config,
+            num_blocks = get_runtime_num_blocks(
+                self.model_runner.vllm_config.model_config.hf_config,
                 self.model_runner.model.rbln_model_config,
             )
-            assert params.num_blocks is not None, (
+            assert num_blocks is not None, (
                 "num_blocks must be specified in rbln_config.json"
             )
-            update_num_blocks(self.model_runner.vllm_config, params.num_blocks)
+            update_num_blocks(self.model_runner.vllm_config, num_blocks)
         # num_gpu_blocks must be set after update_num_blocks is called.
         num_gpu_blocks = adapter.get_available_num_blocks()
         validation_blocks = self.model_runner.vllm_config.cache_config.num_gpu_blocks

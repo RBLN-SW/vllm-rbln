@@ -1,4 +1,4 @@
-# Copyright 2026 Rebellions Inc. All rights reserved.
+# Copyright 2025 Rebellions Inc. All rights reserved.
 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,12 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
 
-RBLN_CONFIG_FILE = "rbln_config.json"
+"""Synchronize vLLM and optimum-rbln configuration."""
 
+from .sync import sync_vllm_and_optimum
 
-def is_compiled_dir(path: str | None) -> bool:
-    if not path:
-        return False
-    return os.path.isfile(os.path.join(path, RBLN_CONFIG_FILE))
+__all__ = ["sync_vllm_and_optimum"]
