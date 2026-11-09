@@ -578,7 +578,7 @@ class TestBuildMmPrefixSlidingWindow:
                 is_prefill=True,
                 mm_prefix_query_len=query_len if is_mm_prefix else None,
             )
-            assert (md.mm_prefix_swa_mask is not None) == is_mm_prefix
+            assert (md.swa_attn_masks is not None) == is_mm_prefix
             out = flash_attention.sliding_window_attention_v1(
                 *(chunk(t) for t in (q, k, v)),
                 kv_cache,
@@ -586,7 +586,7 @@ class TestBuildMmPrefixSlidingWindow:
                 scale,
                 md.block_tables,
                 self.WINDOW,
-                attn_mask=md.mm_prefix_swa_mask,
+                attn_mask=md.swa_attn_masks,
             )
             outputs.append(out[..., : e - s, :])
         expected = self._dense(q, k, v, scale, mm_ranges)
@@ -625,7 +625,7 @@ class TestBuildMmPrefixSlidingWindow:
             is_prefill=True,
             mm_prefix_query_len=8,
         )
-        assert md.mm_prefix_swa_mask is None
+        assert md.swa_attn_masks is None
 
 
 class TestBuildOutputAssembly:
@@ -914,7 +914,7 @@ class TestForwardSlidingWindow:
             block_tables=torch.tensor([7, 8, 9]),
             is_prefill=True,
             swa_appends=True,
-            mm_prefix_swa_mask=mask,
+            swa_attn_masks=mask,
         )
         kwargs: dict[str, object] = {}
         self._forward(cfg, monkeypatch, "sliding_window_attention_v1", md, kwargs)
