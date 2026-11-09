@@ -2628,7 +2628,7 @@ class TestExecuteModelStampsMmPrefixSteps:
         )
 
         def build_attention_metadata(**kwargs):
-            seen.append(runner.mm_prefix_query_len)
+            seen.append(kwargs["mm_prefix_row_ends"])
             return "ATTN", None
 
         runner._build_attention_metadata = build_attention_metadata
@@ -2669,21 +2669,24 @@ class TestExecuteModelStampsMmPrefixSteps:
             scheduled=num_embeds,
             mm_features=[self._image(4, num_embeds)],
         )
-        assert seen == query_len
+        # Every range row reads up to the range's end; padding ends at itself.
+        expected = torch.arange(query_len)
+        expected[:num_embeds] = num_embeds - 1
+        assert torch.equal(seen, expected)
 
     def test_the_rest_of_a_range_a_prefix_cache_hit_resumed_is_one(self, monkeypatch):
         # Soft tokens at 5..14; a hit ended at 9, so the step runs 9..14.
         seen = self._query_len_seen(
             monkeypatch, computed=9, scheduled=6, mm_features=[self._image(4, 10)]
         )
-        assert seen == 128
+        assert seen.numel() == 128 and seen[:6].tolist() == [5] * 6
 
     def test_a_hit_leaving_a_range_its_last_token_prefills_it(self, monkeypatch):
         # Soft tokens at 5..14; a hit ended at 14, so one token is left.
         seen = self._query_len_seen(
             monkeypatch, computed=14, scheduled=1, mm_features=[self._image(4, 10)]
         )
-        assert seen == 128
+        assert seen.numel() == 128 and seen[0] == 0
 
     def test_a_text_chunk_is_not_an_mm_prefix_step(self, monkeypatch):
         seen = self._query_len_seen(

@@ -160,11 +160,8 @@ class RBLNFlashAttentionMetadata:
     cache_seq_lens: torch.Tensor | None = None
     cache_offsets: torch.Tensor | None = None
     local_block_tables: torch.Tensor | None = None
-    # The shift op's decode mask, or an mm prefix step's mask in the append
-    # op's key frame.
-    # TODO(RBLN): fold into `attn_masks`. A builder serves one KV cache group,
-    # so sliding layers never read `attn_masks`; a sliding group then has to
-    # skip the non-causal full-width mask it builds today.
+    # The shift op's decode mask, or the prefill mask of an mm prefix LM in the
+    # append op's key frame.
     swa_attn_masks: torch.Tensor | None = None
 
     use_custom_kernel: bool = False
@@ -272,10 +269,11 @@ class RBLNFlashAttentionMetadataBuilder(
         is_prompt_sorted: bool = False,
         num_accepted: torch.Tensor | None = None,
         state_load_pos: torch.Tensor | None = None,
-        mm_prefix_query_len: int | None = None,
+        mm_prefix_row_ends: torch.Tensor | None = None,
     ) -> RBLNFlashAttentionMetadata:
-        """`mm_prefix_query_len` is the padded query length of a step that
-        prefills one mm prefix range and nothing else, None on any other step."""
+        """`mm_prefix_row_ends`, on a prefill of an mm prefix LM, holds for each
+        padded row of the step the last step-local row it may read: itself, or
+        its range's last position for an mm row. None on any other step."""
         num_reqs = common_attn_metadata.num_reqs
         # NOTE(RBLN): vllm-rbln keeps attention metadata on the host and copies
         # to the device only when constructing RBLNFlashAttentionMetadata below.
@@ -364,31 +362,24 @@ class RBLNFlashAttentionMetadataBuilder(
 
             local_block_tables = block_tables_tensor[..., :1]
 
-        if mm_prefix_query_len is not None and self.swa_appends:
-            # HF's AND(sliding_window, OR(causal, blockwise)) over the strip of
-            # blocks sliding_window_attention_v1 reads. The step's valid tokens
-            # are the one range; padded rows and keys stay masked, as a
-            # bidirectional window would otherwise reach them.
+        if mm_prefix_row_ends is not None and self.swa_appends:
+            # HF's AND(sliding_window, OR(causal, same range)) over the strip of
+            # blocks sliding_window_attention_v1 reads: a row reads keys up to
+            # its row end, inside the window.
             assert is_prefill and num_reqs == 1
+            query_len = mm_prefix_row_ends.numel()
             start = int(seq_idx[0])
-            num_valid = int(query_seq_lens_cpu[0])
             window = self.kv_cache_spec.sliding_window
             num_blocks = (
-                window + mm_prefix_query_len - 1 + self.block_size - 1
+                window + query_len - 1 + self.block_size - 1
             ) // self.block_size + 1
             first_key = max(start - window + 1, 0) // self.block_size * self.block_size
-            row = torch.arange(mm_prefix_query_len).view(-1, 1)
-            key = first_key + torch.arange(num_blocks * self.block_size).view(1, -1)
-            distance = start + row - key
-            keep = (
-                (row < num_valid)
-                & (key < start + num_valid)
-                & (distance < window)
-                & ((distance >= 0) | (key >= start))
-            )
+            row = torch.arange(query_len).view(-1, 1)
+            key = first_key - start + torch.arange(num_blocks * self.block_size)
+            keep = (key <= mm_prefix_row_ends.view(-1, 1)) & (row - key < window)
             swa_attn_masks = keep.to(
                 torch.float16 if self.enforce_eager else torch.float32
-            ).view(1, 1, mm_prefix_query_len, -1)
+            ).view(1, 1, query_len, -1)
 
         attn_metadata = RBLNFlashAttentionMetadata(
             seq_lens=self._stage(seq_idx, "seq_idx"),
@@ -705,9 +696,8 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                 v_quantize_scale = layer._v_scale
                 cache_dtype = _fp8_cache_dtype(self.kv_cache_dtype)
                 if attn_metadata.is_prefill:
-                    # Full layers stay causal in an mm prefix step too: HF and
-                    # upstream Gemma4 apply the bidirectional range only on
-                    # sliding layers.
+                    # Full layers stay causal on an mm prefix LM: HF and upstream
+                    # Gemma4 apply the ranges on sliding layers only.
                     attn_output = flash_causal_attention_naive_prefill(
                         query,
                         key,

@@ -1097,6 +1097,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         num_reqs_padded: int,
         logits_indices: torch.Tensor | None = None,
         back_pad: torch.Tensor | None = None,
+        mm_prefix_row_ends: torch.Tensor | None = None,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -1177,7 +1178,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     is_prompt_sorted=self.sort_batch_by_length,
                     num_accepted=num_accepted,
                     state_load_pos=state_load_pos,
-                    mm_prefix_query_len=self.mm_prefix_query_len,
+                    mm_prefix_row_ends=mm_prefix_row_ends,
                 )
 
                 for layer_name in attn_group.layer_names:
@@ -2112,6 +2113,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             # ending a range it started in, at its start or where a prefix cache
             # hit resumed it, is an mm prefix step.
             self.mm_prefix_query_len = None
+            mm_prefix_row_ends = None
             if self.is_prefill and self.mm_prefix_query_len_buckets:
                 first = int(self.input_batch.num_computed_tokens_cpu[0])
                 last = first + int(num_scheduled_tokens_np[0]) - 1
@@ -2127,6 +2129,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                         for query_len in self.mm_prefix_query_len_buckets
                         if query_len > last - first
                     )
+                    mm_prefix_row_ends = torch.arange(self.mm_prefix_query_len)
+                    mm_prefix_row_ends[: last - first + 1] = last - first
 
             batch_desc, _route, num_tokens_across_dp = (
                 self._determine_batch_execution_and_padding(num_reqs, num_query_tokens)
@@ -2142,6 +2146,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     num_reqs_padded=batch_desc.num_reqs_padded,
                     logits_indices=logits_indices,
                     back_pad=self.decode_back_pad,
+                    mm_prefix_row_ends=mm_prefix_row_ends,
                 )
             )
 
@@ -2940,6 +2945,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             max_query_len=target_query_len,
             num_reqs=num_reqs,
             num_reqs_padded=batch_desc.num_reqs_padded,
+            mm_prefix_row_ends=None
+            if mm_prefix_query_len is None
+            else torch.arange(mm_prefix_query_len),
         )
 
         if is_idle:

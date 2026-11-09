@@ -517,7 +517,7 @@ class TestBuildSlidingWindowAppend:
 
 
 class TestBuildMmPrefixSlidingWindow:
-    """An mm prefix step's sliding-window mask, checked by running
+    """The sliding-window mask of an mm prefix LM's prefill, checked by running
     sliding_window_attention_v1's eager reference over a whole prompt chunk by
     chunk and comparing it with dense attention under HF Gemma4's sliding rule:
     AND(window, OR(causal, same mm prefix range))."""
@@ -545,7 +545,8 @@ class TestBuildMmPrefixSlidingWindow:
         logits = (q @ k.transpose(-1, -2) * scale).masked_fill(~keep, float("-inf"))
         return logits.softmax(-1) @ v
 
-    def _run(self, cfg, chunks, mm_ranges, *, padding=3, checked=None):
+    def _outputs(self, cfg, chunks, mm_ranges, *, padding=3, masked=True):
+        """q, k, v, scale and each chunk's output over its padded rows."""
         torch.manual_seed(0)
         n = chunks[-1][1]
         shape = (1, self.HEADS, 1, n, self.DIM)
@@ -558,9 +559,14 @@ class TestBuildMmPrefixSlidingWindow:
         builder = self._builder(cfg)
         outputs = []
         for s, e in chunks:
-            # A prefix cache hit can resume a range mid-way; the step is its tail.
-            is_mm_prefix = any(rs <= s and e == re for rs, re in mm_ranges)
-            query_len = e - s + padding if is_mm_prefix else e - s
+            query_len = e - s + padding
+            # Step-local: a text or padding row ends at itself, an mm row at
+            # its range's last position.
+            row_ends = torch.arange(query_len)
+            for rs, re in mm_ranges:
+                if rs < e and re > s:
+                    assert re <= e, "a range straddles two steps"
+                    row_ends[max(rs - s, 0) : re - s] = re - 1 - s
 
             def chunk(t, s=s, e=e, query_len=query_len):
                 pad = t.new_zeros(*t.shape[:-2], query_len - (e - s), self.DIM)
@@ -576,19 +582,25 @@ class TestBuildMmPrefixSlidingWindow:
                 torch.arange(s, e),
                 batch_pad=1,
                 is_prefill=True,
-                mm_prefix_query_len=query_len if is_mm_prefix else None,
+                mm_prefix_row_ends=row_ends,
             )
-            assert (md.swa_attn_masks is not None) == is_mm_prefix
-            out = flash_attention.sliding_window_attention_v1(
-                *(chunk(t) for t in (q, k, v)),
-                kv_cache,
-                md.seq_lens,
-                scale,
-                md.block_tables,
-                self.WINDOW,
-                attn_mask=md.swa_attn_masks,
+            assert md.swa_attn_masks.shape[-2] == query_len
+            outputs.append(
+                flash_attention.sliding_window_attention_v1(
+                    *(chunk(t) for t in (q, k, v)),
+                    kv_cache,
+                    md.seq_lens,
+                    scale,
+                    md.block_tables,
+                    self.WINDOW,
+                    attn_mask=md.swa_attn_masks if masked else None,
+                )
             )
-            outputs.append(out[..., : e - s, :])
+        return q, k, v, scale, outputs
+
+    def _run(self, cfg, chunks, mm_ranges, *, checked=None):
+        q, k, v, scale, outputs = self._outputs(cfg, chunks, mm_ranges)
+        outputs = [out[..., : e - s, :] for out, (s, e) in zip(outputs, chunks)]
         expected = self._dense(q, k, v, scale, mm_ranges)
         if checked is not None:
             # Only the chunk at that index; a single layer's cached K/V do not
@@ -600,6 +612,13 @@ class TestBuildMmPrefixSlidingWindow:
     def test_a_range_inside_the_window(self, cfg):
         assert self._run(cfg, [(0, 9), (9, 16), (16, 20)], [(9, 16)]) < 1e-5
 
+    def test_text_and_a_whole_range_share_a_chunk(self, cfg):
+        chunks = [(0, 6), (6, 20), (20, 24)]
+        assert self._run(cfg, chunks, [(9, 16)]) < 1e-5
+
+    def test_two_ranges_in_one_chunk(self, cfg):
+        assert self._run(cfg, [(0, 4), (4, 22)], [(5, 10), (12, 20)]) < 1e-5
+
     def test_a_range_longer_than_the_window_is_clipped_by_it(self, cfg):
         # The grant reaches back no further than the window, as HF clips it.
         assert self._run(cfg, [(0, 5), (5, 20), (20, 24)], [(5, 20)]) < 1e-5
@@ -608,14 +627,22 @@ class TestBuildMmPrefixSlidingWindow:
         assert self._run(cfg, [(0, 6), (6, 13)], [(0, 6)]) < 1e-5
 
     def test_a_range_resumed_mid_way_by_a_prefix_cache_hit(self, cfg):
-        # The cached head [9, 12) is behind every query of the tail [12, 16), so
-        # the step's own mask already sees it.
-        chunks = [(0, 9), (9, 16), (12, 16)]
+        # The cached head [9, 12) is behind every query of the step [12, 20),
+        # so the step's own mask already sees it.
+        chunks = [(0, 9), (9, 16), (12, 20)]
         assert self._run(cfg, chunks, [(9, 16)], checked=2) < 1e-5
 
     def test_a_long_range_resumed_mid_way_is_still_clipped_by_the_window(self, cfg):
-        chunks = [(0, 5), (5, 20), (15, 20)]
+        chunks = [(0, 5), (5, 20), (15, 24)]
         assert self._run(cfg, chunks, [(5, 20)], checked=2) < 1e-5
+
+    def test_a_text_chunk_matches_the_unmasked_causal_op(self, cfg):
+        # Padded rows included: each ends at itself, as the causal op reads it.
+        chunks = [(0, 6), (6, 17)]
+        *_, masked = self._outputs(cfg, chunks, [])
+        *_, causal = self._outputs(cfg, chunks, [], masked=False)
+        for a, b in zip(masked, causal):
+            assert torch.allclose(a, b, atol=1e-6)
 
     def test_a_full_attention_group_builds_no_mask(self, cfg):
         md = make_builder(cfg).build(
@@ -623,7 +650,7 @@ class TestBuildMmPrefixSlidingWindow:
             torch.arange(4),
             batch_pad=1,
             is_prefill=True,
-            mm_prefix_query_len=8,
+            mm_prefix_row_ends=torch.arange(8),
         )
         assert md.swa_attn_masks is None
 
@@ -907,7 +934,7 @@ class TestForwardSlidingWindow:
         assert kwargs["attn_mask"] is None
         assert window == self.WINDOW
 
-    def test_an_mm_prefix_step_hands_the_op_its_mask(self, cfg, monkeypatch):
+    def test_a_prefill_mask_on_the_metadata_reaches_the_op(self, cfg, monkeypatch):
         mask = torch.ones(1, 1, 1, 8)
         md = RBLNFlashAttentionMetadata(
             seq_lens=torch.tensor([[6]]),
