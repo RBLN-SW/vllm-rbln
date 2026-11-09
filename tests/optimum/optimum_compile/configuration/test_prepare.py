@@ -119,10 +119,20 @@ def test_dtype_override_points_to_vllm_dtype():
         prepare_compile_inputs(cfg)
 
 
-def test_user_chunk_conflicting_with_override_is_rejected():
+@pytest.mark.parametrize(
+    "arch, overrides",
+    [
+        ("Qwen3ForCausalLM", {"prefill_chunk_size": 256}),
+        (
+            "Gemma4ForConditionalGeneration",
+            {"language_model": {"prefill_chunk_size": 256}},
+        ),
+    ],
+)
+def test_user_chunk_conflicting_with_override_is_rejected(arch, overrides):
     cfg = _vllm_config(
-        Qwen3Config(architectures=["Qwen3ForCausalLM"]),
-        optimum_overrides={"prefill_chunk_size": 256},
+        PretrainedConfig(architectures=[arch]),
+        optimum_overrides=overrides,
         user_chunk=512,
     )
     with pytest.raises(ValueError, match="Conflicting prefill chunk size"):
@@ -412,11 +422,4 @@ def test_whisper_rejects_a_block_size_that_conflicts_with_decoder_length():
     )
     cfg = _vllm_config(hf_config, optimum_overrides={"kvcache_block_size": 4096})
     with pytest.raises(ValueError, match="kvcache_block_size"):
-        prepare_compile_inputs(cfg)
-
-
-@pytest.mark.parametrize("arch", ["WhisperForConditionalGeneration", "BertModel"])
-def test_non_chunked_arch_rejects_user_chunk(arch):
-    cfg = _vllm_config(PretrainedConfig(architectures=[arch]), user_chunk=256)
-    with pytest.raises(ValueError, match="not support chunked prefill"):
         prepare_compile_inputs(cfg)

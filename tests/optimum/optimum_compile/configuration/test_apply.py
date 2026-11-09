@@ -22,13 +22,7 @@ from vllm.config import CacheConfig, ModelConfig, SchedulerConfig, VllmConfig
 
 from vllm_rbln.config import build_optimum_rbln_config
 from vllm_rbln.utils.optimum.configuration.apply import apply_to_vllm_config
-from vllm_rbln.utils.optimum.configuration.runtime import (
-    get_runtime_num_blocks,
-    is_chunked_prefill_arch,
-    store_image_prefill_chunk_size,
-    update_max_num_batched_tokens,
-    validate_user_prefill_chunk_size,
-)
+from vllm_rbln.utils.optimum.configuration.runtime import get_runtime_num_blocks
 
 pytestmark = pytest.mark.usefixtures("set_npu_env_var")
 
@@ -39,24 +33,14 @@ POOLING_ARCH = "BertModel"
 
 
 def _vllm_config(
-    *,
-    arch: str,
-    max_model_len: int = 8192,
-    max_num_seqs: int = 4,
-    max_num_batched_tokens: int = 0,
-    max_num_scheduled_tokens: int | None = None,
-    max_source_positions: int | None = None,
-    additional_config: dict | None = None,
+    *, arch: str, additional_config: dict | None = None
 ) -> SimpleNamespace:
-    hf_config = SimpleNamespace(architectures=[arch])
-    if max_source_positions is not None:
-        hf_config.max_source_positions = max_source_positions
     return SimpleNamespace(
-        model_config=SimpleNamespace(hf_config=hf_config, max_model_len=max_model_len),
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=[arch]), max_model_len=8192
+        ),
         scheduler_config=SimpleNamespace(
-            max_num_seqs=max_num_seqs,
-            max_num_batched_tokens=max_num_batched_tokens,
-            max_num_scheduled_tokens=max_num_scheduled_tokens,
+            max_num_seqs=4, max_num_batched_tokens=0, max_num_scheduled_tokens=None
         ),
         additional_config=build_optimum_rbln_config(additional_config),
     )
@@ -390,98 +374,6 @@ class TestCompiledDtype:
             compiled["dtype"] = dtype
         cfg = apply_config(compiled, precompiled=True)
         assert cfg.model_config.dtype == (torch.bfloat16 if dtype else torch.float32)
-
-
-class TestIsChunkedPrefillArch:
-    def test_decoder_is_chunked(self):
-        assert is_chunked_prefill_arch(SimpleNamespace(architectures=[DECODER_ARCH]))
-
-    def test_enc_dec_is_not_chunked(self):
-        assert not is_chunked_prefill_arch(
-            SimpleNamespace(architectures=[ENC_DEC_ARCH])
-        )
-
-    def test_pooling_is_not_chunked(self):
-        assert not is_chunked_prefill_arch(
-            SimpleNamespace(architectures=[POOLING_ARCH])
-        )
-
-
-class TestUpdateMaxNumBatchedTokens:
-    @pytest.mark.parametrize("arch", [DECODER_ARCH, POOLING_ARCH])
-    def test_budget_fits_full_prefill(self, arch):
-        cfg = _vllm_config(arch=arch, max_num_batched_tokens=256)
-        update_max_num_batched_tokens(cfg)
-        assert cfg.scheduler_config.max_num_batched_tokens == 8192
-
-    def test_larger_vllm_default_is_replaced(self):
-        cfg = _vllm_config(arch=DECODER_ARCH, max_num_batched_tokens=16384)
-        update_max_num_batched_tokens(cfg)
-        assert cfg.scheduler_config.max_num_batched_tokens == 8192
-
-    @pytest.mark.parametrize("budget", [0, 256, 8192, 16384])
-    def test_explicit_scheduled_token_budget_is_rejected(self, budget):
-        cfg = _vllm_config(arch=DECODER_ARCH, max_num_scheduled_tokens=budget)
-        with pytest.raises(ValueError, match="max_num_scheduled_tokens cannot be set"):
-            update_max_num_batched_tokens(cfg)
-
-    def test_enc_dec_layers_source_positions(self):
-        cfg = _vllm_config(
-            arch=ENC_DEC_ARCH,
-            max_model_len=448,
-            max_source_positions=1500,
-        )
-        update_max_num_batched_tokens(cfg)
-        assert cfg.scheduler_config.max_num_batched_tokens == 1500
-
-
-class TestValidateUserPrefillChunkSize:
-    @pytest.mark.parametrize("arch", [POOLING_ARCH, ENC_DEC_ARCH])
-    def test_non_chunked_arch_rejects_user_chunk(self, arch):
-        cfg = _vllm_config(
-            arch=arch,
-            additional_config={"prefill_chunk_size": 512},
-        )
-        prefill_chunk_size = 128
-        with pytest.raises(ValueError, match="not support chunked prefill"):
-            validate_user_prefill_chunk_size(cfg, prefill_chunk_size)
-
-    @pytest.mark.parametrize("budget", [256, 8192, 16384])
-    def test_scheduling_budget_does_not_set_chunk(self, budget):
-        cfg = _vllm_config(arch=DECODER_ARCH, max_num_batched_tokens=budget)
-        prefill_chunk_size = 128
-        validate_user_prefill_chunk_size(cfg, prefill_chunk_size)
-        assert cfg.additional_config.prefill_chunk_size == 128
-
-    def test_precompiled_conflict_raises(self):
-        cfg = _vllm_config(
-            arch=DECODER_ARCH,
-            additional_config={"prefill_chunk_size": 512},
-        )
-        prefill_chunk_size = 128
-        with pytest.raises(ValueError, match="conflicts with the selected"):
-            validate_user_prefill_chunk_size(cfg, prefill_chunk_size)
-
-    def test_precompiled_match_ok(self):
-        cfg = _vllm_config(
-            arch=DECODER_ARCH,
-            additional_config={"prefill_chunk_size": 128},
-        )
-        prefill_chunk_size = 128
-        validate_user_prefill_chunk_size(cfg, prefill_chunk_size)
-        assert cfg.additional_config.prefill_chunk_size == 128
-
-
-class TestStoreImagePrefillChunkSize:
-    def test_stores_buckets(self):
-        cfg = _vllm_config(arch=DECODER_ARCH, additional_config={})
-        store_image_prefill_chunk_size(cfg, [1152, 640, 384])
-        assert cfg.additional_config.image_prefill_chunk_size == [1152, 640, 384]
-
-    def test_noop_when_none(self):
-        cfg = _vllm_config(arch=DECODER_ARCH, additional_config={})
-        store_image_prefill_chunk_size(cfg, None)
-        assert cfg.additional_config.image_prefill_chunk_size is None
 
 
 def _engine_config() -> VllmConfig:

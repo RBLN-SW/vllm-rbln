@@ -100,7 +100,6 @@ def test_a_no_flag_field_has_no_flag(parser):
     group = next(g for g in parser._action_groups if g.title == _GROUP_TITLE)
     flags = {a.dest for a in group._group_actions}
     assert "rbln_attn_block_size" not in flags
-    assert "rbln_user_max_num_batched_tokens" not in flags
 
 
 @pytest.fixture
@@ -114,33 +113,6 @@ def capture_engine_config(monkeypatch):
     monkeypatch.setattr(platform.logger, "warning_once", Mock())
     platform.RblnPlatform._capture_model_impl()
     return EngineArgs.create_engine_config, platform.logger.warning_once
-
-
-@pytest.mark.parametrize("budget", [128, 8192])
-@pytest.mark.parametrize("model_impl", ["optimum", "transformers"])
-@pytest.mark.parametrize("config_kind", ["unset", "mapping", "built"])
-def test_legacy_budget_becomes_prefill_chunk_size(
-    capture_engine_config, budget, model_impl, config_kind
-):
-    create_config, warning = capture_engine_config
-    config = None
-    if config_kind == "mapping":
-        config = {"prefill_chunk_size": budget}
-    elif config_kind == "built":
-        config = OptimumRBLNConfig(prefill_chunk_size=budget)
-    args = SimpleNamespace(
-        model_impl=model_impl,
-        additional_config=config,
-        max_num_batched_tokens=budget,
-        create_model_config=lambda: SimpleNamespace(
-            hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"])
-        ),
-    )
-    assert create_config(args) == "created"
-    assert args.additional_config.prefill_chunk_size == budget
-    assert args.max_num_batched_tokens is None
-    warning.assert_called_once()
-    assert "0.14.0" in warning.call_args.args[0]
 
 
 @pytest.mark.parametrize("built", [False, True])

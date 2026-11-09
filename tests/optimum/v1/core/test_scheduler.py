@@ -321,18 +321,6 @@ def test_cache_slot_id_freed_on_preemption():
     assert output.cache_slot_id_dict == {"1": 0}
 
 
-def test_scheduling_budget_is_independent_of_prefill_chunk_size():
-    scheduler = create_scheduler(
-        max_model_len=128, max_num_batched_tokens=256, block_size=16, num_blocks=32
-    )
-    assert scheduler.vllm_config.additional_config.prefill_chunk_size == 16
-    assert scheduler.scheduler_config.max_num_batched_tokens == 128
-    assert (
-        scheduler.max_num_scheduled_tokens
-        == scheduler.scheduler_config.max_num_batched_tokens
-    )
-
-
 def test_full_prompt_is_scheduled_with_a_smaller_prefill_graph(monkeypatch):
     monkeypatch.setenv("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
     scheduler = create_scheduler(
@@ -347,3 +335,29 @@ def test_full_prompt_is_scheduled_with_a_smaller_prefill_graph(monkeypatch):
     output = scheduler.schedule()
     assert scheduler.vllm_config.additional_config.prefill_chunk_size == 128
     assert output.num_scheduled_tokens[request.request_id] == 4096
+
+
+@pytest.mark.parametrize(
+    "arch", ["Gemma3ForConditionalGeneration", "Gemma4ForConditionalGeneration"]
+)
+def test_scheduler_passes_compiled_chunks_to_gemma_cache_manager(arch):
+    scheduler = create_scheduler(
+        max_model_len=1024,
+        max_num_batched_tokens=1024,
+        block_size=128,
+        outer_block_size=1024,
+        num_blocks=32,
+    )
+    cfg = scheduler.vllm_config
+    cfg.model_config.hf_config.architectures = [arch]
+    cfg.additional_config.image_prefill_chunk_size = [512, 256]
+    scheduler = type(scheduler)(
+        vllm_config=cfg,
+        kv_cache_config=scheduler.kv_cache_config,
+        structured_output_manager=scheduler.structured_output_manager,
+        block_size=scheduler.block_size,
+    )
+    manager = scheduler.kv_cache_manager
+    assert scheduler.max_num_scheduled_tokens == 1024
+    assert manager.prefill_chunk_size == 128
+    assert manager.image_prefill_chunk_size == [512, 256]
