@@ -605,6 +605,22 @@ class TestRejectedConfigs:
         assert config.cache_config.mamba_block_size == config.model_config.max_model_len
         assert config.cache_config.mamba_cache_mode == "none"
 
+    def test_gdn_mamba_block_below_the_model_length_is_refused(self, reconfigure, gdn):
+        def mamba_block(fraction):
+            def mutate(config):
+                gdn(config)
+                config.cache_config.user_specified_mamba_block_size = True
+                config.cache_config.mamba_block_size = (
+                    config.model_config.max_model_len // fraction
+                )
+
+            return mutate
+
+        with pytest.raises(ValueError, match="span the model length"):
+            reconfigure(mamba_block(2))
+        config = reconfigure(mamba_block(1))
+        assert config.cache_config.mamba_block_size == config.model_config.max_model_len
+
     def test_gdn_state_keeps_the_activation_dtype(self, reconfigure, gdn):
         def float32_state(config):
             gdn(config)

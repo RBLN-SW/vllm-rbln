@@ -93,6 +93,16 @@ def _validate(vllm_config: "VllmConfig") -> None:
                 f"{scheduler_config.max_num_batched_tokens}. "
                 "Set --max-num-batched-tokens to a multiple of 128."
             )
+        if (
+            vllm_config.cache_config.user_specified_mamba_block_size
+            and vllm_config.cache_config.mamba_block_size < model_config.max_model_len
+        ):
+            raise ValueError(
+                "The RBLN GatedDeltaNet state is one block a request, so the Mamba "
+                "block has to span the model length; got --mamba-block-size "
+                f"{vllm_config.cache_config.mamba_block_size} for max_model_len "
+                f"{model_config.max_model_len}."
+            )
         if vllm_config.speculative_config is not None:
             raise ValueError(
                 "Speculative decoding is not supported for GatedDeltaNet models on "

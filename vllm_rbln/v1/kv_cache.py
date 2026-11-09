@@ -175,9 +175,9 @@ class RBLNGDNStateSpec(MambaSpec):
 
 def gdn_pool_blocks(vllm_config: VllmConfig) -> int:
     """Blocks in a GatedDeltaNet group's pool: one a running request (its whole
-    state, while `mamba_block_size` is the model length), doubled so this pool
-    never refuses a request the attention pool admits."""
-    return 2 * vllm_config.scheduler_config.max_num_seqs
+    state, while `mamba_block_size` is the model length) and the null block the
+    pool reserves, which the decode batch pads onto."""
+    return vllm_config.scheduler_config.max_num_seqs + 1
 
 
 class RBLNGDNManager(MambaManager):

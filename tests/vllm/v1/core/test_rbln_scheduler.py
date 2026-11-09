@@ -78,8 +78,8 @@ class TestSchedulerInit:
         assert attn.block_pool is shared
         assert isinstance(state, RBLNGDNManager)
         assert state.block_pool is not shared
-        # Two blocks a running request.
-        assert state.block_pool.num_gpu_blocks == 8
+        # One block a running request plus the null block.
+        assert state.block_pool.num_gpu_blocks == 5
 
     @pytest.mark.usefixtures("cr13")
     def test_sub_block_caching_enabled_uses_rbln_manager(self):

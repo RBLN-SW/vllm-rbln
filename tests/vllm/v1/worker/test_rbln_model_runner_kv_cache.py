@@ -225,12 +225,12 @@ class TestMambaSpecGroup:
 
     def test_a_gdn_state_layer_gets_a_buffer_sized_by_its_pool(self, make_model_runner):
         # Not the group's extent (an alias of the attention pool): a buffer of
-        # gdn_pool_blocks states, two a running request.
+        # gdn_pool_blocks states, one a running request plus the null block.
         runner = make_model_runner(layers=("layer.0",), init_kv_cache=False)
         spec = self._state_spec(runner)
         config = make_kv_cache_config(runner, groups=[("layer.0",)], spec=spec)
         raw, (caches, bases, infos, axes) = self._views(runner, config)
-        num_blocks = 2 * runner.vllm_config.scheduler_config.max_num_seqs
+        num_blocks = runner.vllm_config.scheduler_config.max_num_seqs + 1
         assert raw["layer.0"].numel() == num_blocks * spec.real_page_size_bytes
         assert caches["layer.0"].shape == (num_blocks, 2, 2, 2, 128, 64)
         assert caches["layer.0"].dtype == torch.int16
@@ -252,7 +252,7 @@ class TestMambaSpecGroup:
         runner._allocate_aux_kv_caches(config, caches, bases, infos, axes)
         assert runner.aux_kv_cache_layers == ["layer.0.conv_ring"]
         ring = caches["layer.0.conv_ring"]
-        num_blocks = 2 * runner.vllm_config.scheduler_config.max_num_seqs
+        num_blocks = runner.vllm_config.scheduler_config.max_num_seqs + 1
         assert ring.shape == (num_blocks, 3, 8, 128)
         assert ring.dtype == torch.float16
         assert axes["layer.0.conv_ring"] == 0
