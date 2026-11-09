@@ -153,17 +153,17 @@ def get_compile_num_devices(
 
 
 def validate_prefill_chunk_override(
-    user_chunk: int | None, override_chunk: int | None
+    prefill_chunk_size: int | None, override_prefill_chunk_size: int | None
 ) -> None:
     if (
-        user_chunk is not None
-        and override_chunk is not None
-        and override_chunk != user_chunk
+        prefill_chunk_size is not None
+        and override_prefill_chunk_size is not None
+        and override_prefill_chunk_size != prefill_chunk_size
     ):
         raise ValueError(
             f"Conflicting prefill chunk size: --rbln-prefill-chunk-size "
-            f"({user_chunk}) != optimum_overrides['prefill_chunk_size'] "
-            f"({override_chunk}). Set only one."
+            f"({prefill_chunk_size}) != optimum_overrides['prefill_chunk_size'] "
+            f"({override_prefill_chunk_size}). Set only one."
         )
 
 

@@ -172,25 +172,29 @@ def store_image_prefill_chunk_size(
 
 
 def validate_user_prefill_chunk_size(
-    vllm_config: VllmConfig, prefill_chunk_size: int | None
+    vllm_config: VllmConfig, resolved_prefill_chunk_size: int | None
 ) -> None:
-    """Require an explicit user chunk size to match the selected model config."""
+    """Require an explicit chunk size to match the resolved model config."""
+    # resolved_prefill_chunk_size comes from:
+    # 1. A cached artifact's rbln_config on a cache hit.
+    # 2. The user-provided precompiled model's rbln_config.
+    # 3. New compile inputs, including model-specific chunk-size constraints.
     additional_config: OptimumRBLNConfig = vllm_config.additional_config
-    user_chunk = additional_config.prefill_chunk_size
-    if user_chunk is not None:
+    prefill_chunk_size = additional_config.prefill_chunk_size
+    if prefill_chunk_size is not None:
         if not is_chunked_prefill_arch(vllm_config.model_config.hf_config):
             raise ValueError(
                 "prefill_chunk_size cannot be specified for a model that does "
                 "not support chunked prefill. Leave --rbln-prefill-chunk-size unset."
             )
-        if user_chunk != prefill_chunk_size:
+        if prefill_chunk_size != resolved_prefill_chunk_size:
             raise ValueError(
-                f"prefill_chunk_size ({user_chunk}) conflicts with the selected "
-                f"prefill_chunk_size ({prefill_chunk_size}) in rbln_config. "
-                "Leave --rbln-prefill-chunk-size unset or select a model "
-                "with a matching prefill chunk size."
+                f"Requested prefill_chunk_size ({prefill_chunk_size}) does not match "
+                f"the resolved model configuration ({resolved_prefill_chunk_size}). "
+                "Leave --rbln-prefill-chunk-size unset to use the model configuration, "
+                "or compile or load a model with a matching prefill chunk size."
             )
-    additional_config.prefill_chunk_size = prefill_chunk_size
+    additional_config.prefill_chunk_size = resolved_prefill_chunk_size
 
 
 def keep_device_overrides(obj: dict) -> dict:

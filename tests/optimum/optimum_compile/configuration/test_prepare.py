@@ -35,7 +35,7 @@ def npu_name(monkeypatch):
     )
 
 
-def _vllm_config(hf_config, *, optimum_overrides=None, user_chunk=None):
+def _vllm_config(hf_config, *, optimum_overrides=None, prefill_chunk_size=None):
     return SimpleNamespace(
         model_config=SimpleNamespace(
             model="org/model",
@@ -53,7 +53,7 @@ def _vllm_config(hf_config, *, optimum_overrides=None, user_chunk=None):
         additional_config=build_optimum_rbln_config(
             {
                 "optimum_overrides": optimum_overrides or {},
-                "prefill_chunk_size": user_chunk,
+                "prefill_chunk_size": prefill_chunk_size,
             }
         ),
     )
@@ -129,11 +129,11 @@ def test_dtype_override_points_to_vllm_dtype():
         ),
     ],
 )
-def test_user_chunk_conflicting_with_override_is_rejected(arch, overrides):
+def test_prefill_chunk_size_conflicting_with_override_is_rejected(arch, overrides):
     cfg = _vllm_config(
         PretrainedConfig(architectures=[arch]),
         optimum_overrides=overrides,
-        user_chunk=512,
+        prefill_chunk_size=512,
     )
     with pytest.raises(ValueError, match="Conflicting prefill chunk size"):
         prepare_compile_inputs(cfg)
@@ -327,7 +327,7 @@ class TestCompileCacheName:
 
 
 @pytest.mark.parametrize(
-    "architecture, overrides, user_chunk, expected_chunk, default_calls",
+    "architecture, overrides, prefill_chunk_size, expected_chunk, default_calls",
     [
         ("LlamaForCausalLM", {}, None, 256, 1),
         ("LlamaForCausalLM", {"prefill_chunk_size": 384}, None, 384, 0),
@@ -343,7 +343,12 @@ class TestCompileCacheName:
     ],
 )
 def test_compile_inputs_resolve_chunk_before_considering_the_npu_default(
-    monkeypatch, architecture, overrides, user_chunk, expected_chunk, default_calls
+    monkeypatch,
+    architecture,
+    overrides,
+    prefill_chunk_size,
+    expected_chunk,
+    default_calls,
 ):
     from vllm_rbln.utils.optimum.configuration import prepare as prepare_module
 
@@ -357,7 +362,7 @@ def test_compile_inputs_resolve_chunk_before_considering_the_npu_default(
     cfg = _vllm_config(
         PretrainedConfig(architectures=[architecture]),
         optimum_overrides=overrides,
-        user_chunk=user_chunk,
+        prefill_chunk_size=prefill_chunk_size,
     )
     inputs = prepare_compile_inputs(cfg)
     decoder_config = inputs.rbln_config.get("language_model", inputs.rbln_config)

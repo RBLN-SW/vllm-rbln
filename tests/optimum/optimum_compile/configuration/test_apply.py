@@ -511,7 +511,7 @@ def test_selected_settings_are_validated_before_config_is_changed(invalid):
         expected_error = "num_devices"
     else:
         selected["prefill_chunk_size"] = 256
-        expected_error = "conflicts with the selected"
+        expected_error = "does not match the resolved model configuration"
     with pytest.raises(ValueError, match=expected_error):
         apply_to_vllm_config(cfg, selected, precompiled=True)
     assert cfg.scheduler_config.max_num_seqs == 4
