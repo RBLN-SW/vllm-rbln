@@ -26,7 +26,15 @@ from vllm_rbln.v1.sample.ops.sparse_penalty import (
 )
 from vllm_rbln.v1.sample.rbln_sampler import RBLNSampler
 
-from .utils import VOCAB_SIZE, build_input_batch
+from .test_rbln_sampler import npu_top_k_top_p
+from .utils import (
+    VOCAB_SIZE,
+    assert_samples_match,
+    build_input_batch,
+    evenly_spaced_token_ids,
+    expected_probs,
+    logits_from_weights,
+)
 
 
 def dense_reference(logits, prompts, outputs, rep, freq, pres, biases):
@@ -129,6 +137,7 @@ def _logits(rows: int) -> torch.Tensor:
     return logits.to(torch.bfloat16)
 
 
+@pytest.mark.use_device
 def test_sampler_matches_dense_path():
     """Greedy picks under penalties and logit bias match the upstream path."""
     params = [
@@ -145,6 +154,7 @@ def test_sampler_matches_dense_path():
     assert sparse.tolist() == dense.tolist() == [555, 555, 123, 555]
 
 
+@pytest.mark.use_device
 def test_min_p_reads_penalized_logits():
     """With min_p on, penalties apply before it, through the penalize graph."""
     params = [
@@ -157,3 +167,65 @@ def test_min_p_reads_penalized_logits():
     dense = _run_sampler(params, logits, sparse=False, expect_kinds=set())
     sparse = _run_sampler(params, logits, sparse=True, expect_kinds={"penalize"})
     assert sparse.tolist() == dense.tolist() == [555, 555]
+
+
+# The weighted row: WEIGHTED[i] weighs i + 1. The heaviest tokens are the ones the
+# prompt and output repeat, so penalties and bias reshape the distribution.
+WEIGHTED = evenly_spaced_token_ids(num_ids=32).tolist()
+PROMPT = WEIGHTED[26:32]
+OUTPUT = [WEIGHTED[31], WEIGHTED[30], WEIGHTED[31]]
+BIAS = {WEIGHTED[20]: 1.5, WEIGHTED[29]: -100.0}
+ROWS, LAUNCHES = 256, 40
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        SamplingParams(
+            temperature=0.8,
+            top_p=0.99,
+            top_k=30,
+            repetition_penalty=1.05,
+            logit_bias=BIAS,
+        ),
+        SamplingParams(
+            temperature=1.0,
+            repetition_penalty=1.3,
+            frequency_penalty=0.5,
+            presence_penalty=0.3,
+        ),
+        SamplingParams(temperature=1.0, top_k=8, logit_bias=BIAS),
+        SamplingParams(temperature=1.0, min_p=0.05, repetition_penalty=1.3),
+    ],
+    ids=["temp_topp_topk_rep_bias", "rep_freq_pres", "topk_bias", "min_p_rep"],
+)
+@pytest.mark.use_device
+def test_sampled_distribution_matches_upstream(params):
+    """Samples follow upstream's distribution under penalties and logit bias."""
+    device = current_platform.device_type
+    row = logits_from_weights(weights=range(1, 33))
+    expected = expected_probs(
+        logits=row.unsqueeze(0),
+        params=[params],
+        top_k_top_p=npu_top_k_top_p,
+        prompt_token_ids=PROMPT,
+        output_token_ids=OUTPUT,
+    )[0]
+    batch = build_input_batch(
+        [(str(i), params) for i in range(ROWS)],
+        device=device,
+        prompt_token_ids=PROMPT,
+        output_token_ids=OUTPUT,
+    )
+    sampler = RBLNSampler(sparse_penalty=True)
+    logits = row.expand(ROWS, -1).contiguous().to(device)
+    samples = torch.stack(
+        [
+            sampler(logits.clone(), batch.sampling_metadata, input_batch=batch)
+            .sampled_token_ids.view(-1)
+            .cpu()
+            for _ in range(LAUNCHES)
+        ]
+    )
+    assert sampler._sparse_graphs, "the fused graphs were not taken"
+    assert_samples_match(samples=samples, probs=expected)

@@ -54,6 +54,7 @@ class SparsePlan(NamedTuple):
 
 def supports_vocab(vocab_size: int) -> bool:
     # A batch of one is split into two half-vocab rows.
+    # TODO: drop the split once the pinned compiler fixes batch-1 chunk gather.
     return vocab_size % (2 * CHUNK) == 0
 
 
