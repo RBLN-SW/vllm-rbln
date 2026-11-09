@@ -222,12 +222,6 @@ class RBLNGemma4ForConditionalGeneration(
                 "the most soft tokens an image may take; add a budget that large "
                 "or lower max_soft_tokens."
             )
-        if budgets[-1] > rbln_config.max_prefill_chunk_size:
-            raise ValueError(
-                f"encoder_token_budgets {budgets} go past the longest prefill "
-                f"chunk ({rbln_config.max_prefill_chunk_size}), which no image "
-                "range may exceed; drop the larger budgets."
-            )
         pool = self.config.vision_config.pooling_kernel_size
         self.mm_encoder_patch_buckets = [budget * pool**2 for budget in budgets]
         self._mm_encoder: Callable[..., torch.Tensor] | None
