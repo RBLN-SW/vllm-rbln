@@ -682,8 +682,11 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
 
         A failed wait means the device stream is broken. Upstream's writer loop
         logs what it catches and carries on, which would drop this list and,
-        on the PUSH_REG route, the rest of that notification batch, so the
-        failure ends the worker as `worker_fail_fast` does.
+        on the PUSH_REG route, the rest of that notification batch. The writer
+        thread has no path to raise into the engine, so the failure ends the
+        process under any executor. `worker_fail_fast` does that only under
+        `MultiprocExecutor` and re-raises otherwise; with an in-process engine
+        (`VLLM_ENABLE_V1_MULTIPROCESSING=0`) this also ends the caller.
         """
         done = getattr(local_block_ids, "done", None)
         if done is None:
