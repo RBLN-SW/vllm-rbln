@@ -68,6 +68,11 @@ def sync_vllm_and_optimum(vllm_config: VllmConfig) -> None:
         precompiled = True
     else:
         # 3. Use settings from the compile inputs for a new compilation.
+        logger.warning(
+            "The compiled model was not found in the cache. "
+            "If you already have a compiled model, set `model` to the "
+            "directory containing its rbln_config.json to reuse it.",
+        )
         selected_config = compile_inputs.rbln_config
         precompiled = False
     # 4. Apply the selected configuration to vLLM once.
