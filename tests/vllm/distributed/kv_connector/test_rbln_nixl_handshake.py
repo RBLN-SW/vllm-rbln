@@ -8094,8 +8094,8 @@ class TestKdaPairsByHeadGroupEndToEnd:
     """GLM-5.3's KDA layer with the real numbers, through the plan a peer of
     another TP degree gets: 64 heads, a 1024-token page holding 16 of them, so
     the TP1 producer registers four state caches a layer and a TP4 rank one,
-    each beside its conv ring, every cache over four chiplet slices. The KDA
-    group counts and cache names are the backend's own."""
+    each beside its conv ring and its MTP draft, every cache over four chiplet
+    slices. The KDA group counts and cache names are the backend's own."""
 
     PREFIX = "model.layers.0.self_attn"
     QUARTER = 128 * 1024
@@ -8103,13 +8103,16 @@ class TestKdaPairsByHeadGroupEndToEnd:
     # (taps, q / k / v of every group, 32 x 64 lanes) bf16, a run per row.
     RING_TP1 = RblnBlockTransferSpec(1024, 4 * 12 * 32 * 64 * 2, 64, 256, 48)
     RING_TP4 = RblnBlockTransferSpec(1024, 4 * 3 * 32 * 64 * 2, 64, 256, 12)
+    # (16 heads, one draft, 4, 128) bf16, K=1.
+    DRAFT = RblnBlockTransferSpec(1024, 16 * 4 * 128 * 2, 64, 4 * 128 * 2)
+    DRAFT_QUARTER = 4 * 4 * 128 * 2
 
     @classmethod
     def _side(cls, tp_size):
         groups = 4 // tp_size
-        names = [f"{cls.PREFIX}.attn.{k}" for k in range(groups + 1)]
+        names = [f"{cls.PREFIX}.attn.{k}" for k in range(2 * groups + 1)]
         ring = cls.RING_TP1 if tp_size == 1 else cls.RING_TP4
-        specs = [cls.STATE] * groups + [ring]
+        specs = [cls.STATE] * groups + [ring] + [cls.DRAFT] * groups
         return names, specs, groups
 
     @classmethod
@@ -8129,7 +8132,10 @@ class TestKdaPairsByHeadGroupEndToEnd:
         w.num_regions = 4 * len(names)
         w.region_names = [name for name in names for _ in range(4)]
         w._block_state_layers = set(names[:groups])
-        w._block_aux_specs = {names[-1]: SimpleNamespace(owner=names[0])}
+        w._block_aux_specs = {names[groups]: SimpleNamespace(owner=names[0])} | {
+            names[groups + 1 + j]: SimpleNamespace(owner=names[j])
+            for j in range(groups)
+        }
         w._logical_region_block_spec = specs
         w._logical_region_kv_heads = [None] * len(names)
         w._logical_region_latent = [False] * len(names)
@@ -8177,28 +8183,124 @@ class TestKdaPairsByHeadGroupEndToEnd:
             for kind in range(3)
         ]
 
+    @classmethod
+    def _tp1_plan(cls, rank):
+        """The TP1 side's plan with TP4 rank `rank`, whichever side moves the
+        bytes: every area of that group's state and draft, its ring runs."""
+        return (
+            [
+                (rank * 4 + area, [Piece(0, area, 0, cls.QUARTER, 4, (0, 1))])
+                for area in range(4)
+            ]
+            + [
+                (
+                    16 + area,
+                    [
+                        Piece(ours * 1024, 4 + area, theirs * 1024, 1024, 1, (0, 1))
+                        for ours, theirs in cls._ring_runs(rank)
+                    ],
+                )
+                for area in range(4)
+            ]
+            + [
+                (
+                    (5 + rank) * 4 + area,
+                    [Piece(0, 8 + area, 0, cls.DRAFT_QUARTER, 4, (0, 1))],
+                )
+                for area in range(4)
+            ]
+        )
+
+    @classmethod
+    def _tp4_plan(cls, rank):
+        """TP4 rank `rank`'s plan with the TP1 side, the same pairs seen from it."""
+        return (
+            [
+                (area, [Piece(0, rank * 4 + area, 0, cls.QUARTER, 4, (0, 1))])
+                for area in range(4)
+            ]
+            + [
+                (
+                    4 + area,
+                    [
+                        Piece(theirs * 1024, 16 + area, ours * 1024, 1024, 1, (0, 1))
+                        for ours, theirs in cls._ring_runs(rank)
+                    ],
+                )
+                for area in range(4)
+            ]
+            + [
+                (
+                    8 + area,
+                    [Piece(0, (5 + rank) * 4 + area, 0, cls.DRAFT_QUARTER, 4, (0, 1))],
+                )
+                for area in range(4)
+            ]
+        )
+
+    @classmethod
+    def _handshaken(cls, cls_, tp_rank, tp_size, remote_tp):
+        """The plan of every peer rank the real handshake loop registers."""
+        ratio = (
+            tp_size // remote_tp if tp_size >= remote_tp else -(remote_tp // tp_size)
+        )
+        w = _make_worker(
+            tp_ratio=ratio,
+            tp_target_ranks=tuple(range(remote_tp)) if ratio < 0 else (0,),
+            host_buffer=False,
+            cls=cls_,
+        )
+        kda = cls._worker(cls_, tp_rank, tp_size)
+        for name in (
+            "tp_rank",
+            "vllm_config",
+            "local_seen_layer_names",
+            "_kv_areas",
+            "num_regions",
+            "region_names",
+            "_block_state_layers",
+            "_block_aux_specs",
+            "_logical_region_block_spec",
+            "_logical_region_kv_heads",
+            "_logical_region_latent",
+            "_logical_region_geometry",
+        ):
+            setattr(w, name, getattr(kda, name))
+        w.vllm_config.parallel_config = SimpleNamespace(pipeline_parallel_size=1)
+        w.transfer_topo.tp_size = tp_size
+        w.transfer_topo.total_num_kv_heads = 64
+        plans = {}
+
+        def register(meta, rank, remote_tp_size, dcp_size, registered_layer_names):
+            plans[rank] = list(
+                zip(
+                    *w._head_matched_plan(
+                        meta,
+                        rank,
+                        remote_tp_size,
+                        registered_layer_names=registered_layer_names,
+                        peer_areas=w._fan_in_peer_areas(rank, remote_tp_size),
+                    )
+                )
+            )
+            return f"agent-{rank}"
+
+        w._add_remote_agent_head_matched = register
+        meta = cls._meta(remote_tp)
+        with (
+            patch.object(cls_, "_query_agent_meta", lambda *_: (meta, 0.0, 0.0)),
+            _patched_socket(_FakeSock(pp_size=1)),
+        ):
+            w._nixl_handshake("h", 1234, remote_tp, "eng")
+        return plans
+
     @pytest.mark.parametrize("rank", range(4))
     def test_the_producer_writes_every_area_of_the_rank_s_group(self, rank):
         w = self._worker(RblnNixlPushConnectorWorker, 0, 1)
 
         region_ids, plans = self._plan(w, self._meta(4), rank, 4)
 
-        state = [(r, p) for r, p in zip(region_ids, plans) if r < 16]
-        assert state == [
-            (rank * 4 + area, [Piece(0, area, 0, self.QUARTER, 4, (0, 1))])
-            for area in range(4)
-        ]
-        ring = [(r, p) for r, p in zip(region_ids, plans) if r >= 16]
-        assert ring == [
-            (
-                16 + area,
-                [
-                    Piece(ours * 1024, 4 + area, theirs * 1024, 1024, 1, (0, 1))
-                    for ours, theirs in self._ring_runs(rank)
-                ],
-            )
-            for area in range(4)
-        ]
+        assert list(zip(region_ids, plans)) == self._tp1_plan(rank)
 
     @classmethod
     def _checked(cls, specs=None):
@@ -8254,22 +8356,38 @@ class TestKdaPairsByHeadGroupEndToEnd:
 
         region_ids, plans = self._plan(w, self._meta(1), 0, 1)
 
-        state = [(r, p) for r, p in zip(region_ids, plans) if r < 4]
-        assert state == [
-            (area, [Piece(0, rank * 4 + area, 0, self.QUARTER, 4, (0, 1))])
-            for area in range(4)
-        ]
-        ring = [(r, p) for r, p in zip(region_ids, plans) if r >= 4]
-        assert ring == [
-            (
-                4 + area,
-                [
-                    Piece(theirs * 1024, 16 + area, ours * 1024, 1024, 1, (0, 1))
-                    for ours, theirs in self._ring_runs(rank)
-                ],
-            )
-            for area in range(4)
-        ]
+        assert list(zip(region_ids, plans)) == self._tp4_plan(rank)
+
+    @pytest.mark.parametrize("rank", range(4))
+    def test_a_tp1_decoder_reads_every_area_of_each_group_from_its_rank(self, rank):
+        # The pull mirror of the push case: the reader holds fewer ranks, so
+        # the area filter applies to it and must not narrow a KDA cache.
+        w = self._worker(RblnNixlPullConnectorWorker, 0, 1)
+
+        region_ids, plans = self._plan(w, self._meta(4), rank, 4)
+
+        assert list(zip(region_ids, plans)) == self._tp1_plan(rank)
+
+    @pytest.mark.parametrize("rank", range(4))
+    def test_a_tp4_producer_writes_every_area_of_its_group_into_a_tp1_peer(self, rank):
+        w = self._worker(RblnNixlPushConnectorWorker, rank, 4)
+
+        region_ids, plans = self._plan(w, self._meta(1), 0, 1)
+
+        assert list(zip(region_ids, plans)) == self._tp4_plan(rank)
+
+    @pytest.mark.parametrize("rank", range(4))
+    def test_the_handshake_hands_a_tp4_reader_its_group_s_caches(self, rank):
+        # Through the loop that renames the peer's KDA caches: the TP1
+        # producer's `attn.1` is a state cache, a TP4 rank's is its conv ring.
+        plans = self._handshaken(RblnNixlPullConnectorWorker, rank, 4, 1)
+
+        assert plans == {0: self._tp4_plan(rank)}
+
+    def test_the_handshake_hands_a_tp1_writer_every_rank_s_group(self):
+        plans = self._handshaken(RblnNixlPushConnectorWorker, 0, 1, 4)
+
+        assert plans == {rank: self._tp1_plan(rank) for rank in range(4)}
 
 
 class TestABlockPayloadPairsAcrossTp:

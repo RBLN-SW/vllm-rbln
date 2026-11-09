@@ -2625,10 +2625,11 @@ class TestChunkModeWithASlidingWindow:
 class TestAKdaConvRingCutsOneGroupsHeads:
     """GLM-5.3's conv ring beside a KDA state at block 1024: the ring holds q / k
     / v of every group the rank's state caches split it into, so a head's run
-    is 128 channels of bf16 at every TP degree."""
+    is 128 channels of bf16 at every TP degree. An MTP draft beside the same
+    state leads with that group's heads."""
 
     @staticmethod
-    def _register(tp_size, ring_shape):
+    def _register(tp_size, ring_shape, head_axis=2):
         from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl import (
             RblnNixlPullConnectorWorker,
         )
@@ -2659,7 +2660,11 @@ class TestAKdaConvRingCutsOneGroupsHeads:
         }
         w._block_aux_specs = {}
         w.register_block_aux_kv_caches(
-            {ring: RBLNBlockAuxSpec(owner, ring_shape, torch.bfloat16, head_axis=2)}
+            {
+                ring: RBLNBlockAuxSpec(
+                    owner, ring_shape, torch.bfloat16, head_axis=head_axis
+                )
+            }
         )
         return w._layer_specs[ring]
 
@@ -2671,3 +2676,9 @@ class TestAKdaConvRingCutsOneGroupsHeads:
         spec = self._register(tp_size, ring_shape)
 
         assert (spec.band_heads, spec.head_bytes, spec.runs) == (64, 256, runs)
+
+    @pytest.mark.parametrize("tp_size", [1, 4])
+    def test_a_draft_s_head_is_its_drafts_of_one_head(self, tp_size):
+        spec = self._register(tp_size, (16, 1, 4, 128), head_axis=0)
+
+        assert (spec.band_heads, spec.head_bytes, spec.runs) == (64, 4 * 128 * 2, 1)
