@@ -148,8 +148,11 @@ def test_legacy_budget_becomes_prefill_chunk_size(
     ("budget", "chunk", "error"),
     [
         (128, 256, "Conflicting prefill chunk size"),
-        (0, None, "max_num_batched_tokens must be greater than 0"),
-        (-1, None, "max_num_batched_tokens must be greater than 0"),
+        (0, None, "greater_than"),
+        (-1, None, "greater_than"),
+        (128.5, None, "int_from_float"),
+        (float("nan"), None, "finite_number"),
+        (float("inf"), None, "finite_number"),
     ],
 )
 def test_invalid_legacy_budget_is_rejected(

@@ -265,6 +265,7 @@ class RblnPlatform(Platform):
         `create_engine_config`, too late to wrap it, and `patches/` is the
         vllm model path's alone while this has to run on both.
         """
+        from vllm.config.utils import replace
         from vllm.engine.arg_utils import EngineArgs
 
         from vllm_rbln.config import resolve_model_impl
@@ -300,10 +301,6 @@ class RblnPlatform(Platform):
                     "--rbln-prefill-chunk-size."
                 )
                 if is_chunked_prefill_arch(self.create_model_config().hf_config):
-                    if self.max_num_batched_tokens <= 0:
-                        raise ValueError(
-                            "max_num_batched_tokens must be greater than 0."
-                        )
                     rbln_config = build_optimum_rbln_config(self.additional_config)
                     chunk = rbln_config.prefill_chunk_size
                     if chunk is not None and chunk != self.max_num_batched_tokens:
@@ -313,8 +310,9 @@ class RblnPlatform(Platform):
                             f"!= prefill_chunk_size ({chunk}). Set only "
                             "--rbln-prefill-chunk-size."
                         )
-                    rbln_config.prefill_chunk_size = self.max_num_batched_tokens
-                    self.additional_config = rbln_config
+                    self.additional_config = replace(
+                        rbln_config, prefill_chunk_size=self.max_num_batched_tokens
+                    )
                 self.max_num_batched_tokens = None
             return orig_create_engine_config(self, *args, **kwargs)
 
