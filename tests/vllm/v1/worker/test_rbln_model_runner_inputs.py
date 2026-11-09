@@ -22,7 +22,7 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 import torch
-from vllm.config import ModelConfig
+from vllm.config import ECTransferConfig, ModelConfig
 from vllm.config.multimodal import MultiModalConfig
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
@@ -201,7 +201,8 @@ class TestWarmupMultimodalEncoder:
         warmup.assert_called_once_with()
 
     @pytest.mark.parametrize(
-        "reason", ["text_only_model", "other_pp_rank", "no_image_or_video"]
+        "reason",
+        ["text_only_model", "other_pp_rank", "no_image_or_video", "ec_consumer"],
     )
     def test_skips_when_nothing_can_reach_the_encoder(
         self, make_model_runner, monkeypatch, reason
@@ -213,6 +214,14 @@ class TestWarmupMultimodalEncoder:
         )
         runner = make_model_runner()
         runner.supports_mm_inputs = reason != "text_only_model"
+        if reason == "ec_consumer":
+            monkeypatch.setattr(
+                runner.vllm_config,
+                "ec_transfer_config",
+                ECTransferConfig(
+                    ec_connector="RblnECNixlConnector", ec_role="ec_consumer"
+                ),
+            )
         limit = 0 if reason == "no_image_or_video" else 1
         runner.model_config.multimodal_config = MultiModalConfig(
             limit_per_prompt={"image": limit, "video": limit}

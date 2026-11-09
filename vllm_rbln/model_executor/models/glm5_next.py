@@ -84,6 +84,7 @@ from vllm.utils.torch_utils import set_default_torch_dtype
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec, MLAAttentionSpec
 
+import vllm_rbln.utils as rbln_utils
 from vllm_rbln.model_executor.models.interfaces import SupportsRBLNMultiModal
 from vllm_rbln.patches.attention import _resolve_kv_cache
 from vllm_rbln.v1.attention.backends.flash_attention import (
@@ -1207,6 +1208,9 @@ class RBLNGlm5NextForConditionalGeneration(
                 )
         else:
             self.visual = PPMissingLayer()
+        self.mm_encoder_patch_buckets = (
+            [] if isinstance(self.visual, PPMissingLayer) else [VISION_PATCH_BUCKET]
+        )
         self.config.image_token_index = hf_config.image_token_id
         object.__setattr__(self, "_mm_encoder", None)
 
@@ -1218,6 +1222,30 @@ class RBLNGlm5NextForConditionalGeneration(
             return
         encoder = _RBLNGlm5NextVisionEncoder(self.visual).eval()
         object.__setattr__(self, "_mm_encoder", compile_fn(encoder))
+
+    def warmup_mm_encoder(self) -> None:
+        visual = self.visual
+        if isinstance(visual, PPMissingLayer):
+            return
+        if self._mm_encoder is None:
+            self.compile_mm_encoder(lambda encoder: encoder)
+        assert self._mm_encoder is not None
+        patch_dim = visual.patch_embed.proj.weight[0].numel()
+        head_dim = visual.blocks[0].attn.head_dim
+        with torch.inference_mode():
+            for bucket in self.mm_encoder_patch_buckets:
+                self._mm_encoder(
+                    torch.zeros(
+                        bucket, patch_dim, dtype=visual.dtype, device=visual.device
+                    ),
+                    torch.ones(
+                        bucket, head_dim, dtype=visual.dtype, device=visual.device
+                    ),
+                    torch.zeros(
+                        bucket, head_dim, dtype=visual.dtype, device=visual.device
+                    ),
+                    torch.zeros(1, 1, bucket, dtype=visual.dtype, device=visual.device),
+                )
 
     def _encoder_inputs(
         self, pixel_values: torch.Tensor, grid_thw: list[int]
@@ -1279,7 +1307,9 @@ class RBLNGlm5NextForConditionalGeneration(
         merge2 = self.visual.spatial_merge_size**2
         with torch.inference_mode():
             return tuple(
-                encoder(*self._encoder_inputs(pv, g))[: n // merge2].cpu()
+                rbln_utils.run_mm_encoder(
+                    encoder, self._encoder_inputs(pv, g), n // merge2
+                )
                 for pv, g, n in zip(pixel_values.split(sizes), grid_thw, sizes)
             )
 

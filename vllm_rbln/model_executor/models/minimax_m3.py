@@ -20,7 +20,7 @@ from collections.abc import Iterable, Mapping
 from itertools import islice
 from pathlib import Path
 from types import ModuleType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn.functional as F
@@ -33,6 +33,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import get_forward_context
+from vllm.inputs import ModalityData
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe import (
@@ -76,6 +77,12 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.inputs import ImageItem, MultiModalFieldConfig
+from vllm.multimodal.parse import (
+    DictEmbeddingItems,
+    ModalityDataItems,
+    MultiModalDataParser,
+)
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.processors.minimax_m3 import (
@@ -95,6 +102,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
 )
 
+import vllm_rbln.utils as rbln_utils
 from vllm_rbln.model_executor.models.interfaces import SupportsRBLNMultiModal
 from vllm_rbln.patches.attention import _resolve_kv_cache
 from vllm_rbln.v1.attention.backends.flash_attention import _fp8_cache_dtype
@@ -1020,6 +1028,13 @@ def _max_frame_tokens(
 
 
 class _RBLNMiniMaxM3VLProcessingInfo(MiniMaxM3VLProcessingInfo):
+    def get_data_parser(self) -> MultiModalDataParser:
+        return _RBLNMiniMaxM3VLDataParser(
+            self.get_image_processor().merge_size,
+            expected_hidden_size=self._get_expected_hidden_size(),
+            allow_missing_mm_embeddings=self.allow_missing_mm_embeddings,
+        )
+
     def get_image_processor(self, **kwargs: object) -> MiniMaxM3VLImageProcessor:
         kwargs = self.ctx.get_merged_mm_kwargs(kwargs, modality="image")
         return super().get_image_processor(**kwargs)
@@ -1140,6 +1155,48 @@ class _RBLNVisionEncoder(nn.Module):
         return self.tower.patch_merge_mlp(hidden).to(self.out_dtype)
 
 
+class _RBLNMiniMaxM3VLDataParser(MultiModalDataParser):
+    # NOTE(RBLN): upstream declares none for MiniMax-M3, so an EC producer
+    # publishes no grid and an image cannot reach a consumer as a metadata-only
+    # reference. Declared as Qwen2-VL does for image transfers.
+    embedding_fields = {
+        "image": {"image_embeds": "values", "image_grid_thw": "metadata"},
+    }
+
+    def __init__(self, merge_size: int, *args, **kwargs) -> None:
+        self._merge_size = merge_size
+        super().__init__(*args, **kwargs)
+
+    def _parse_image_data(
+        self,
+        data: dict[str, torch.Tensor] | ModalityData[ImageItem],
+    ) -> ModalityDataItems[Any, Any] | None:
+        if not isinstance(data, dict):
+            return super()._parse_image_data(data)
+
+        def fields_config(
+            hf_inputs: Mapping[str, torch.Tensor],
+        ) -> Mapping[str, MultiModalFieldConfig]:
+            grid_thw = hf_inputs["image_grid_thw"]
+            return {
+                "image_embeds": MultiModalFieldConfig.flat_from_sizes(
+                    "image", grid_thw.prod(-1) // self._merge_size**2
+                ),
+                "image_grid_thw": MultiModalFieldConfig.batched(
+                    "image", keep_on_cpu=True
+                ),
+            }
+
+        required, optional = self.embedding_field_sets("image")
+        return DictEmbeddingItems(
+            data,
+            modality="image",
+            required_fields=required,
+            optional_fields=optional,
+            fields_factory=fields_config,
+        )
+
+
 @MULTIMODAL_REGISTRY.register_processor(
     _RBLNMiniMaxM3VLMultiModalProcessor,
     info=_RBLNMiniMaxM3VLProcessingInfo,
@@ -1166,7 +1223,10 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
-        if modality == "image":
+        # The chat parser asks with "image_embeds" for an image sent as embeddings,
+        # as the EPD proxy sends one to an EC consumer. Qwen2-VL matches it the
+        # same way.
+        if modality.startswith("image"):
             return _mm_preprocess.MiniMaxM3VLProcessingInfo.IMAGE_TOKEN
         if modality == "video":
             return _mm_preprocess.MiniMaxM3VLProcessingInfo.VIDEO_TOKEN
@@ -1344,10 +1404,14 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         for start in range(0, t, frames):
             seg_t = min(frames, t - start)
             seg_pixels = pixel_values[start * h * w : (start + seg_t) * h * w]
-            embeds = self._mm_encoder(
-                *self._encoder_inputs(seg_pixels, [seg_t, h, w], modality)
+            segments.append(
+                rbln_utils.run_mm_encoder(
+                    self._mm_encoder,
+                    self._encoder_inputs(seg_pixels, [seg_t, h, w], modality),
+                    seg_t * h * w // (merge * merge),
+                    dtype=self.mm_embeds_dtype,
+                )
             )
-            segments.append(embeds[: seg_t * h * w // (merge * merge)].cpu())
         return segments[0] if len(segments) == 1 else torch.cat(segments)
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:

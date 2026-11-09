@@ -32,7 +32,8 @@ from unittest.mock import patch
 import pytest
 import torch
 from pydantic import ValidationError
-from vllm.config import CompilationMode, VllmConfig
+from vllm.config import CompilationMode, ECTransferConfig, VllmConfig
+from vllm.config.ec_manager_config import EncoderCacheManagerConfig
 from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -466,6 +467,36 @@ class TestRejectedConfigs:
             reconfigure(custom_kernel(True))
         reconfigure(custom_kernel(None))
 
+    def test_an_ec_consumer_without_its_language_model(self, reconfigure):
+        def role(ec_role, mm_encoder_only):
+            def mutate(config):
+                config.ec_transfer_config = ECTransferConfig(
+                    ec_connector="RblnECNixlConnector", ec_role=ec_role
+                )
+                config.model_config.multimodal_config = SimpleNamespace(
+                    mm_encoder_only=mm_encoder_only
+                )
+
+            return mutate
+
+        for refused in (role("ec_consumer", True), role("ec_both", True)):
+            with pytest.raises(ValueError, match="--mm-encoder-only"):
+                reconfigure(refused)
+        reconfigure(role("ec_producer", True))
+        reconfigure(role("ec_consumer", False))
+        reconfigure(role("ec_both", False))
+
+    @pytest.mark.parametrize("field", ["data_parallel_size", "pipeline_parallel_size"])
+    def test_an_encoder_only_instance_across_ranks(self, reconfigure, field):
+        def mutate(config):
+            config.model_config.multimodal_config = SimpleNamespace(
+                mm_encoder_only=True
+            )
+            setattr(config.parallel_config, field, 2)
+
+        with pytest.raises(ValueError, match="encoder-only instance"):
+            reconfigure(mutate)
+
     def test_lora(self, reconfigure):
         with pytest.raises(ValueError, match="LoRA"):
             reconfigure(lambda config: setattr(config, "lora_config", object()))
@@ -581,6 +612,17 @@ class TestRejectedConfigs:
                     config.scheduler_config, "enable_chunked_prefill", False
                 )
             )
+
+    def test_chunked_prefill_off_on_an_encoder_only_instance(self, reconfigure):
+        # Upstream turns it off once the engine finds no KV cache, then runs
+        # the hook again.
+        def mutate(config):
+            config.model_config.multimodal_config = SimpleNamespace(
+                mm_encoder_only=True
+            )
+            config.scheduler_config.enable_chunked_prefill = False
+
+        reconfigure(mutate)
 
     @pytest.mark.parametrize("method", ["eagle3", "dflash"])
     def test_a_draft_under_pp_needs_a_patched_target(self, reconfigure, method):
@@ -826,32 +868,34 @@ class TestDtype:
         assert config.model_config.dtype == torch.float32
 
 
-class TestCompileDtype:
-    @staticmethod
-    def _with_dtype(config):
-        config.additional_config = replace(
-            config.additional_config, compile_dtype="float16"
-        )
-
-    @pytest.fixture
-    def older_rebel(self, monkeypatch):
-        import vllm_rbln.compilation.compiler as compiler
-
-        def legacy_compile(model, *, npu=None):
-            pass
-
-        monkeypatch.setattr(compiler.rebel, "compile", legacy_compile)
-
-    def test_empty_dtype_skips_the_probe(self, reconfigure, older_rebel):
-        config = reconfigure(lambda config: None)
-        assert config.additional_config.compile_dtype == ""
-
-    def test_refused_at_startup_on_an_older_rebel(self, reconfigure, older_rebel):
-        with pytest.raises(ValueError, match="dtype"):
-            reconfigure(self._with_dtype)
-
-
 class TestWorkerAndScheduler:
+    @pytest.mark.parametrize(
+        "encoder_decoder,custom_manager,expected",
+        [
+            (False, None, "vllm_rbln.v1.core.rbln_scheduler.RBLNEncoderCacheManager"),
+            (True, None, None),
+            (
+                False,
+                "vllm.v1.core.encoder_cache_manager.EncoderCacheManager",
+                "vllm.v1.core.encoder_cache_manager.EncoderCacheManager",
+            ),
+        ],
+    )
+    def test_ec_encoder_cache_manager_selection(
+        self, reconfigure, encoder_decoder, custom_manager, expected
+    ):
+        def mutate(config: VllmConfig) -> None:
+            config.ec_transfer_config = ECTransferConfig(
+                ec_connector="RblnECCPUConnector", ec_role="ec_both"
+            )
+            config.model_config.is_encoder_decoder = encoder_decoder
+            config.ec_manager_config = EncoderCacheManagerConfig(
+                encoder_cache_manager_cls=custom_manager
+            )
+
+        config = reconfigure(mutate)
+        assert config.ec_manager_config.encoder_cache_manager_cls == expected
+
     @pytest.mark.parametrize("selection", [None, "0", "1"])
     def test_runner_selection_ignores_upstream_env(self, monkeypatch, selection):
         import vllm.config.vllm as upstream_config

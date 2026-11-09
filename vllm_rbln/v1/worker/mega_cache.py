@@ -92,6 +92,7 @@ def _warmup_graph_set_factors(
     spec = getattr(vllm_config, "speculative_config", None)
     # Not draft_parallel_config: it carries the same per-launch ports.
     draft = getattr(spec, "draft_model_config", None)
+    ec = vllm_config.ec_transfer_config
     factors: dict[str, object] = {
         "max_num_seqs": normalize_value(getattr(scheduler, "max_num_seqs", None)),
         "num_gpu_blocks_override": normalize_value(
@@ -109,6 +110,8 @@ def _warmup_graph_set_factors(
         "draft_tensor_parallel_size": normalize_value(
             getattr(spec, "draft_tensor_parallel_size", None)
         ),
+        # compute_hash() takes in the EC config but leaves its role out.
+        "ec_role": ec.ec_role if ec is not None else None,
     }
 
     if extra_hash_factors:

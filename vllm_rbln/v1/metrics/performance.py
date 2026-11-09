@@ -100,10 +100,15 @@ class PerformanceContext:
         self._phase: Phase | None = None
         self._graph_latency: float | None = None
         self._host_op_latency: float | None = None
+        # Multimodal encoder graph calls
+        self._encoder: dict[str, _Metrics] = defaultdict(_Metrics)
 
     @property
     def in_pass(self) -> bool:
         return self._start is not None
+
+    def record_encoder(self, label: str, latency: float) -> None:
+        self._encoder[label].record(latency)
 
     def start_pass(self) -> None:
         self._start = time.perf_counter()
@@ -148,6 +153,8 @@ class PerformanceContext:
             for phase in Phase:
                 if phase in table:
                     sections[f"{label} ({phase.value})"] = table[phase]
+        for shape in sorted(self._encoder, key=lambda s: tuple(map(int, s.split("x")))):
+            sections[f"ENCODER ({shape})"] = self._encoder[shape]
         name = f"{self.name} | {self.rank_tag}" if self.rank_tag else self.name
         logger.info("%s", "\n".join(_render_metrics_report(name, sections)))
         _write_metrics_json(self.name, self.rank_tag, sections)
