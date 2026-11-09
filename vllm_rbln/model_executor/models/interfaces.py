@@ -60,16 +60,14 @@ def supports_rbln_multimodal(model: object) -> TypeIs[SupportsRBLNMultiModal]:
 class SupportsRBLNMmPrefix(Protocol):
     """An mm prefix LM (upstream's ``is_mm_prefix_lm``) the RBLN vLLM path serves.
 
-    Upstream attends both ways inside each multimodal embedding range through
-    ``mm_prefix_range``, which its kernels read at run time. A compiled RBLN
-    graph cannot, so each range is prefilled as a step of its own, padded to
-    a query length the runner compiles for each range length named here.
+    Each multimodal embedding range attends both ways on sliding layers only. A
+    prefill chunk never splits a range, and each row reads keys up to its range's
+    end.
     """
 
-    def get_mm_prefix_range_lens(self) -> list[int]:
-        """Ascending range lengths, before padding, an mm prefix step is
-        compiled for; the largest is the longest range the model can produce."""
-        ...
+    max_mm_prefix_range_len: int
+    """The most positions one embeds range can span; the longest prefill chunk
+    must hold it."""
 
 
 def supports_rbln_mm_prefix(model: object) -> TypeIs[SupportsRBLNMmPrefix]:

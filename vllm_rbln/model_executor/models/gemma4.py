@@ -41,6 +41,7 @@ from vllm.multimodal.parse import MultiModalDataItems
 from vllm.sequence import IntermediateTensors
 
 from vllm_rbln.model_executor.models.interfaces import (
+    SupportsRBLNMmPrefix,
     SupportsRBLNMultiModal,
 )
 
@@ -138,8 +139,7 @@ class _RBLNGemma4VisionEncoder(nn.Module):
 
 def mm_soft_token_cap(info: Gemma4ProcessingInfo) -> int:
     """The most soft tokens an image may take: the engine's max_soft_tokens,
-    else the HF image processor's own. Encoder and image prefill compile to it.
-    """
+    else the HF image processor's own."""
     model_config = info.ctx.model_config
     cap, _ = _get_max_soft_tokens(info.ctx.get_merged_mm_kwargs({}))
     if cap is None:
@@ -162,7 +162,7 @@ def mm_soft_token_cap(info: Gemma4ProcessingInfo) -> int:
 
 class RBLNGemma4MultiModalProcessor(Gemma4MultiModalProcessor):
     """Upstream's processor, refusing per request an image budget above the
-    one the vision encoder and image prefill compile to."""
+    engine's."""
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -190,8 +190,7 @@ class RBLNGemma4MultiModalProcessor(Gemma4MultiModalProcessor):
             if isinstance(budget, int) and budget > self._mm_soft_token_cap:
                 raise ValueError(
                     f"max_soft_tokens={budget} is above the engine's image budget "
-                    f"of {self._mm_soft_token_cap}, which the vision encoder and "
-                    "image prefill are compiled to; raise it with "
+                    f"of {self._mm_soft_token_cap}; raise it with "
                     "--mm-processor-kwargs at start-up."
                 )
         return super()._apply_hf_processor_main(mm_items, hf_kwargs)
@@ -203,7 +202,7 @@ class RBLNGemma4MultiModalProcessor(Gemma4MultiModalProcessor):
     dummy_inputs=Gemma4DummyInputsBuilder,
 )
 class RBLNGemma4ForConditionalGeneration(
-    Gemma4ForConditionalGeneration, SupportsRBLNMultiModal
+    Gemma4ForConditionalGeneration, SupportsRBLNMultiModal, SupportsRBLNMmPrefix
 ):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         if vllm_config.parallel_config.data_parallel_size > 1:
@@ -214,16 +213,17 @@ class RBLNGemma4ForConditionalGeneration(
                 "Gemma4 does not support speculative decoding on RBLN yet."
             )
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-        self.mm_soft_token_cap = mm_soft_token_cap(
+        cap = mm_soft_token_cap(
             MULTIMODAL_REGISTRY.create_processor(vllm_config.model_config).info
         )
+        # Video frames take the smallest budget, so an image at the cap is the
+        # longest range.
+        self.max_mm_prefix_range_len = cap
         # One compiled encoder shape per soft token budget up to the cap; an
         # image or frame is padded to the smallest that holds its patches.
         pool = self.config.vision_config.pooling_kernel_size
         self.mm_encoder_patch_buckets = [
-            budget * pool**2
-            for budget in _SUPPORTED_SOFT_TOKENS
-            if budget <= self.mm_soft_token_cap
+            budget * pool**2 for budget in _SUPPORTED_SOFT_TOKENS if budget <= cap
         ]
         self._mm_encoder: Callable[..., torch.Tensor] | None
         object.__setattr__(self, "_mm_encoder", None)
@@ -256,15 +256,6 @@ class RBLNGemma4ForConditionalGeneration(
             assert not downs, f"no per_expert_scale for {sorted(downs)}"
 
         return super().load_weights(fold(weights))
-
-    def get_mm_prefix_range_lens(self) -> list[int]:
-        # One length per soft token budget the processor may emit. Video frames
-        # use the smallest budget.
-        return [
-            budget
-            for budget in _SUPPORTED_SOFT_TOKENS
-            if budget <= self.mm_soft_token_cap
-        ]
 
     def compile_mm_encoder(self, compile_fn) -> None:
         # Without an image or video limit, or off the first PP rank, upstream

@@ -108,7 +108,7 @@ def _make_runner_stub(**attrs):
     runner = object.__new__(RBLNModelRunner)
     runner.dp_status = None
     runner.supports_mm_inputs = False
-    runner.mm_prefix_query_len_buckets = []
+    runner.model_config = SimpleNamespace(is_mm_prefix_lm=False)
     for key, value in attrs.items():
         setattr(runner, key, value)
     return runner
@@ -649,7 +649,6 @@ class TestEcConsumer:
             model_config=SimpleNamespace(get_hidden_size=lambda: 2),
             encoder_cache={},
             _execute_mm_encoder=lambda so: None,
-            mm_prefix_query_len=None,
         )
         runner._gather_mm_embeddings = lambda so, n: (
             [(0, 0, runner.encoder_cache["h0"])],
@@ -830,7 +829,6 @@ def test_warmup_compiles_prefill_at_every_prefill_chunk_size():
     runner = _make_runner_stub(
         max_num_tokens=512,
         prefill_chunk_sizes=[128, 256],
-        mm_prefix_query_len_buckets=[],
         speculative_config=None,
         bucketing_manager=SimpleNamespace(decode_batch_buckets=[1]),
         specialized_moe_decode=False,
@@ -842,16 +840,24 @@ def test_warmup_compiles_prefill_at_every_prefill_chunk_size():
     assert calls[:2] == [((1, 128, True), {}), ((1, 256, True), {})]
 
 
-@pytest.mark.parametrize(("query_len", "padded"), [(100, 128), (128, 128), (129, 256)])
+@pytest.mark.parametrize(
+    ("chunk_sizes", "query_len", "padded"),
+    [
+        ([128, 256], 100, 128),
+        ([128, 256], 128, 128),
+        ([128, 256], 129, 256),
+        ([64, 256], 100, 256),
+    ],
+)
 def test_a_prefill_pads_to_the_shortest_chunk_size_that_holds_it(
-    monkeypatch, query_len, padded
+    monkeypatch, chunk_sizes, query_len, padded
 ):
     monkeypatch.setattr(mr, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True))
     runner = _make_runner_stub(
         input_ids=torch.zeros(512, dtype=torch.int32),
         positions=torch.zeros(512, dtype=torch.int64),
         is_prefill=True,
-        prefill_chunk_sizes=[128, 256],
+        prefill_chunk_sizes=chunk_sizes,
         input_stager=Mock(),
         is_pooling_model=True,
         _init_model_kwargs=lambda: {},
@@ -1414,6 +1420,19 @@ class TestDummyRunPadding:
         runner._dummy_run(1, 4, is_prefill=True)
 
         assert captured["layout"].num_reqs_padded == 1
+
+    @pytest.mark.parametrize("is_prefill", [True, False])
+    def test_an_mm_prefix_lm_warms_its_prefill_up_masked(self, monkeypatch, is_prefill):
+        # The masked graph serving runs: text rows that each end at themselves.
+        runner, captured = self._runner(monkeypatch, reqs_across_dp=[1, 1, 1, 1])
+        runner.model_config = SimpleNamespace(is_mm_prefix_lm=True)
+        runner._dummy_run(1, 4, is_prefill=is_prefill)
+
+        row_ends = captured["attn"]["mm_prefix_row_ends"]
+        if is_prefill:
+            assert torch.equal(row_ends, torch.arange(4))
+        else:
+            assert row_ends is None
 
     def test_warmup_pin_is_the_token_dimension(self, monkeypatch):
         # Warm-up dictates the dimension it wants compiled -- the group agreement
@@ -2572,11 +2591,20 @@ class TestExecuteModelFlushesAfterTheSubmission:
 
 
 class TestExecuteModelStampsMmPrefixSteps:
-    """A prefill ending an mm prefix range it started inside runs padded to the
-    smallest compiled query length holding it; anything else runs as before."""
+    """Every prefill of an mm prefix LM hands the builders step-local row ends,
+    padded to the step's chunk length: a text or padding row ends at itself, an
+    mm row at its range's last position."""
 
     @staticmethod
-    def _query_len_seen(monkeypatch, *, computed, scheduled, mm_features):
+    def _row_ends_seen(
+        monkeypatch,
+        *,
+        computed,
+        scheduled,
+        mm_features,
+        chunk_sizes=(128, 256),
+        is_mm_prefix_lm=True,
+    ):
         monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: False)
         monkeypatch.setattr(mr, "set_forward_context", lambda *a, **kw: nullcontext())
         monkeypatch.setattr(
@@ -2616,7 +2644,8 @@ class TestExecuteModelStampsMmPrefixSteps:
                 num_computed_tokens_cpu=np.array([computed], dtype=np.int32),
             ),
             requests={"r0": SimpleNamespace(mm_features=mm_features)},
-            mm_prefix_query_len_buckets=[128, 256],
+            model_config=SimpleNamespace(is_mm_prefix_lm=is_mm_prefix_lm),
+            prefill_chunk_sizes=list(chunk_sizes),
             cache_config=SimpleNamespace(kv_sharing_fast_prefill=False),
             speculative_config=None,
             is_pooling_model=False,
@@ -2657,61 +2686,45 @@ class TestExecuteModelStampsMmPrefixSteps:
             ),
         )
 
-    @pytest.mark.parametrize(
-        "num_embeds, query_len", [(10, 128), (128, 128), (130, 256)]
-    )
-    def test_the_range_takes_the_smallest_length_holding_it(
-        self, monkeypatch, num_embeds, query_len
-    ):
-        seen = self._query_len_seen(
-            monkeypatch,
-            computed=5,
-            scheduled=num_embeds,
-            mm_features=[self._image(4, num_embeds)],
+    def test_text_and_a_whole_range_share_the_chunk(self, monkeypatch):
+        # Soft tokens at 5..14 inside a 20-token step.
+        seen = self._row_ends_seen(
+            monkeypatch, computed=0, scheduled=20, mm_features=[self._image(4, 10)]
         )
-        # Every range row reads up to the range's end; padding ends at itself.
-        expected = torch.arange(query_len)
-        expected[:num_embeds] = num_embeds - 1
+        expected = torch.arange(128)
+        expected[5:15] = 14
         assert torch.equal(seen, expected)
 
-    def test_the_rest_of_a_range_a_prefix_cache_hit_resumed_is_one(self, monkeypatch):
-        # Soft tokens at 5..14; a hit ended at 9, so the step runs 9..14.
-        seen = self._query_len_seen(
-            monkeypatch, computed=9, scheduled=6, mm_features=[self._image(4, 10)]
+    def test_the_row_ends_take_the_staged_chunk_length(self, monkeypatch):
+        # _preprocess pads a 100-token prefill to 256 here, and so must these.
+        seen = self._row_ends_seen(
+            monkeypatch,
+            computed=0,
+            scheduled=100,
+            mm_features=[self._image(4, 10)],
+            chunk_sizes=(64, 256),
         )
-        assert seen.numel() == 128 and seen[:6].tolist() == [5] * 6
+        assert seen.numel() == 256
 
-    def test_a_hit_leaving_a_range_its_last_token_prefills_it(self, monkeypatch):
-        # Soft tokens at 5..14; a hit ended at 14, so one token is left.
-        seen = self._query_len_seen(
-            monkeypatch, computed=14, scheduled=1, mm_features=[self._image(4, 10)]
+    def test_the_rest_of_a_range_a_prefix_cache_hit_resumed(self, monkeypatch):
+        # Soft tokens at 5..14; a hit ended at 9, so rows 0..5 end at 14.
+        seen = self._row_ends_seen(
+            monkeypatch, computed=9, scheduled=8, mm_features=[self._image(4, 10)]
         )
-        assert seen.numel() == 128 and seen[0] == 0
+        assert seen[:8].tolist() == [5] * 6 + [6, 7]
 
-    def test_a_text_chunk_is_not_an_mm_prefix_step(self, monkeypatch):
-        seen = self._query_len_seen(
+    def test_a_text_chunk_reads_causally(self, monkeypatch):
+        seen = self._row_ends_seen(
             monkeypatch, computed=0, scheduled=5, mm_features=[self._image(4, 10)]
         )
+        assert torch.equal(seen, torch.arange(128))
+
+    def test_any_other_model_gets_none(self, monkeypatch):
+        seen = self._row_ends_seen(
+            monkeypatch,
+            computed=0,
+            scheduled=20,
+            mm_features=[self._image(4, 10)],
+            is_mm_prefix_lm=False,
+        )
         assert seen is None
-
-
-def test_warmup_compiles_one_prefill_per_mm_prefix_query_len():
-    calls = []
-    runner = _make_runner_stub(
-        max_num_tokens=512,
-        prefill_chunk_sizes=[256],
-        mm_prefix_query_len_buckets=[128, 384],
-        speculative_config=None,
-        bucketing_manager=SimpleNamespace(decode_batch_buckets=[1]),
-        specialized_moe_decode=False,
-        _dummy_run=lambda *args, **kwargs: calls.append((args, kwargs)),
-    )
-
-    runner.run_model_graphs()
-
-    # Text prefill at the chunk size, an mm prefix step up to the step budget.
-    assert calls[:3] == [
-        ((1, 256, True), {}),
-        ((1, 128, True), {"mm_prefix_query_len": 128}),
-        ((1, 384, True), {"mm_prefix_query_len": 384}),
-    ]

@@ -81,17 +81,14 @@ class TestResolveMultiModalSupport:
 
 
 class _MmPrefixModel(_InGraphMergeModel):
-    def __init__(self, range_lens):
+    def __init__(self, max_mm_prefix_range_len):
         super().__init__()
-        self.range_lens = range_lens
-
-    def get_mm_prefix_range_lens(self) -> list[int]:
-        return self.range_lens
+        self.max_mm_prefix_range_len = max_mm_prefix_range_len
 
 
 class TestResolveMmPrefixSupport:
-    """An mm prefix LM is served only when every range, or the rest of one a
-    prefix cache hit resumes, runs in one step."""
+    """An mm prefix LM is served only when its longest range fits every prefill
+    chunk the scheduler may cut."""
 
     @staticmethod
     def _runner(make_model_runner, monkeypatch, model, **config):
@@ -103,17 +100,7 @@ class TestResolveMmPrefixSupport:
         runner.model = model
         return runner
 
-    def test_the_models_range_lens_are_padded_to_query_lens(
-        self, make_model_runner, monkeypatch
-    ):
-        runner = self._runner(
-            make_model_runner, monkeypatch, _MmPrefixModel([64, 100, 200])
-        )
-
-        assert runner._resolve_mm_support() is True
-        assert runner.mm_prefix_query_len_buckets == [128, 256]
-
-    def test_a_model_naming_no_range_lens_is_refused(
+    def test_a_model_naming_no_longest_range_is_refused(
         self, make_model_runner, monkeypatch
     ):
         runner = self._runner(make_model_runner, monkeypatch, _InGraphMergeModel())
@@ -127,45 +114,39 @@ class TestResolveMmPrefixSupport:
         runner = self._runner(
             make_model_runner,
             monkeypatch,
-            _MmPrefixModel([64, 128]),
+            _MmPrefixModel(128),
             long_prefill_token_threshold=64,
         )
 
         with pytest.raises(ValueError, match="long_prefill_token_threshold"):
             runner._resolve_mm_support()
 
-    def test_a_threshold_holding_the_longest_range_unpadded_is_taken(
+    def test_a_threshold_and_chunk_equal_to_the_longest_range_are_taken(
         self, make_model_runner, monkeypatch
     ):
-        # The threshold caps scheduled tokens, which the 384 padding is not.
         runner = self._runner(
             make_model_runner,
             monkeypatch,
-            _MmPrefixModel([280]),
+            _MmPrefixModel(280),
             long_prefill_token_threshold=280,
+            max_num_batched_tokens=280,
         )
 
         assert runner._resolve_mm_support() is True
 
-    def test_a_budget_shorter_than_a_padded_range_is_refused(
+    def test_a_range_longer_than_the_longest_chunk_is_refused(
         self, make_model_runner, monkeypatch
     ):
-        runner = self._runner(
-            make_model_runner,
-            monkeypatch,
-            _MmPrefixModel([64, 200]),
-            max_num_batched_tokens=200,
-        )
+        runner = self._runner(make_model_runner, monkeypatch, _MmPrefixModel(200))
 
-        with pytest.raises(ValueError, match="max_num_batched_tokens=200"):
+        with pytest.raises(ValueError, match="--rbln-prefill-chunk-size"):
             runner._resolve_mm_support()
 
     def test_prefix_caching_is_taken(self, make_model_runner, monkeypatch):
-        # A hit ending inside a range resumes it in a step of its own.
         runner = self._runner(
             make_model_runner,
             monkeypatch,
-            _MmPrefixModel([64, 128]),
+            _MmPrefixModel(128),
             enable_prefix_caching=True,
         )
 

@@ -203,15 +203,6 @@ def test_warm_up_without_an_encoder_runs_nothing():
     assert calls == []
 
 
-@pytest.mark.parametrize(
-    "cap, range_lens",
-    [(280, [70, 140, 280]), (1120, [70, 140, 280, 560, 1120]), (70, [70])],
-)
-def test_one_range_len_per_soft_token_budget(cap, range_lens):
-    model = _bare_model(mm_soft_token_cap=cap)
-    assert model.get_mm_prefix_range_lens() == range_lens
-
-
 def _processing_info(engine_kwargs, processor_default, default_output_length):
     """Upstream's merge: the request's kwargs over the engine's."""
     image_processor = SimpleNamespace(max_soft_tokens=processor_default)
