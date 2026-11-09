@@ -151,7 +151,6 @@ from vllm_rbln.v1.core.utils import (
     decode_batch_size,
     num_base_tokens,
     resolve_propagated_token_write,
-    step_is_mm_prefix_prefill,
     step_is_prefill,
     sub_block_size_in_use,
 )
@@ -2021,10 +2020,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             )
 
         # Stamp the step's phase before any step logic reads it.
-        self.is_prefill = step_is_prefill(scheduler_output) or (
-            self.model_config.is_mm_prefix_lm
-            and step_is_mm_prefix_prefill(scheduler_output, self.requests)
-        )
+        self.is_prefill = step_is_prefill(scheduler_output)
 
         # Before anything reads token_ids_cpu this step.
         if self.use_async_scheduling:

@@ -20,15 +20,12 @@
 from types import SimpleNamespace
 
 import pytest
-import torch
-from vllm.multimodal.inputs import PlaceholderRange
 
 from vllm_rbln.v1.core.utils import (
     decode_batch_size,
     num_base_tokens,
     resolve_propagated_token_write,
     should_defer_spec_step,
-    step_is_mm_prefix_prefill,
     step_is_prefill,
     sub_block_size_in_use,
 )
@@ -82,49 +79,6 @@ class TestStepIsPrefill:
         # Pinned because any() picks the safe side: a prefill graph can still
         # take a single-token query, a decode graph cannot take a chunk.
         assert step_is_prefill(_sched_out({"a": 1, "b": 512})) is True
-
-
-class TestStepIsMmPrefixPrefill:
-    # An image at offset 4: <boi> at 4, soft tokens at 5..14, <eoi> at 15.
-    IMAGE = SimpleNamespace(
-        modality="image",
-        mm_position=PlaceholderRange(
-            offset=4, length=12, is_embed=torch.tensor([False] + [True] * 10 + [False])
-        ),
-    )
-
-    def _step(self, computed, *, new):
-        if new:
-            return SimpleNamespace(
-                scheduled_new_reqs=[
-                    SimpleNamespace(
-                        num_computed_tokens=computed, mm_features=[self.IMAGE]
-                    )
-                ],
-                scheduled_cached_reqs=SimpleNamespace(
-                    req_ids=[], num_computed_tokens=[]
-                ),
-            )
-        return SimpleNamespace(
-            scheduled_new_reqs=[],
-            scheduled_cached_reqs=SimpleNamespace(
-                req_ids=["a"], num_computed_tokens=[computed]
-            ),
-        )
-
-    @pytest.mark.parametrize("new", [True, False], ids=["new", "cached"])
-    def test_a_step_on_a_ranges_last_token_prefills_it(self, new):
-        requests = {"a": SimpleNamespace(mm_features=[self.IMAGE])}
-        assert step_is_mm_prefix_prefill(self._step(14, new=new), requests) is True
-
-    @pytest.mark.parametrize("computed", [9, 15, 20])
-    def test_any_other_position_is_left_alone(self, computed):
-        # Inside the range, on its <eoi>, or past the prompt.
-        requests = {"a": SimpleNamespace(mm_features=[self.IMAGE])}
-        assert (
-            step_is_mm_prefix_prefill(self._step(computed, new=False), requests)
-            is False
-        )
 
 
 @pytest.mark.parametrize(

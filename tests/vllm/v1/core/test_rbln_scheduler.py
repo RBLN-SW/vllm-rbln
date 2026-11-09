@@ -916,27 +916,28 @@ class TestSchedulePrefillAllocation:
 
 
 class TestMmPrefixChunks:
-    """Prefill chunks of an mm prefix LM are cut on its embedding ranges."""
+    """Prefill chunks of an mm prefix LM never split an image or video-frame
+    embeds range: text and whole ranges share a chunk."""
 
     @staticmethod
-    def _feature(modality: str, offset: int, is_embed: list[bool]):
+    def _feature(modality: str, offset: int, is_embed: list[bool], name=None):
         return MultiModalFeatureSpec(
             data=None,
             modality=modality,
-            identifier=f"{modality}-{offset}",
+            identifier=name or f"{modality}-{offset}",
             mm_position=PlaceholderRange(
                 offset=offset, length=len(is_embed), is_embed=torch.tensor(is_embed)
             ),
         )
 
-    def _chunks(
-        self, monkeypatch, features, *, num_tokens=40, budget=16, chunk_size=None
-    ):
+    @staticmethod
+    def _scheduler(monkeypatch, *, budget=16, chunk_size=None, **kwargs):
         sched = create_rbln_scheduler(
             max_num_batched_tokens=budget,
-            max_model_len=64,
-            block_size=16,
+            max_model_len=128,
+            block_size=budget,
             additional_config={"prefill_chunk_size": chunk_size or budget},
+            **kwargs,
         )
         sched._is_mm_prefix_lm = True
         # Encoder budgeting is upstream's, and opt-125m owns no encoder.
@@ -950,42 +951,95 @@ class TestMmPrefixChunks:
                 [],
             ),
         )
-        req = make_request("a", list(range(num_tokens)), 16, mm_features=features)
+        return sched
+
+    @staticmethod
+    def _prefill(sched, req):
         sched.add_request(req)
         chunks = []
-        while req.num_computed_tokens < num_tokens:
+        while req.num_computed_tokens < req.num_prompt_tokens:
             out = sched.schedule()
-            chunks.append(out.num_scheduled_tokens["a"])
+            chunks.append(out.num_scheduled_tokens[req.request_id])
             sched.update_from_output(out, make_model_runner_output(out))
         return chunks
 
-    def test_an_image_runs_alone_between_text_chunks(self, monkeypatch):
-        # <boi> at 9, ten soft tokens at 10..19, <eoi> at 20.
-        image = self._feature("image", 9, [False] + [True] * 10 + [False])
-        assert self._chunks(monkeypatch, [image]) == [10, 10, 16, 4]
+    def _chunks(self, monkeypatch, features, *, num_tokens=40, **kwargs):
+        sched = self._scheduler(monkeypatch, **kwargs)
+        req = make_request("a", list(range(num_tokens)), 16, mm_features=features)
+        return self._prefill(sched, req)
 
-    def test_text_chunks_take_the_chunk_size_and_an_image_the_budget(self, monkeypatch):
-        # Soft tokens at 10..19 run as one 10-token step past the 8-token chunks.
+    def test_text_and_an_image_share_a_chunk(self, monkeypatch):
+        # <boi> at 2, soft tokens at 3..12, <eoi> at 13.
+        image = self._feature("image", 2, [False] + [True] * 10 + [False])
+        assert self._chunks(monkeypatch, [image]) == [16, 16, 8]
+
+    def test_a_range_the_chunk_would_cut_moves_whole_to_the_next_step(
+        self, monkeypatch
+    ):
+        # Soft tokens at 10..19: the first chunk ends before them.
         image = self._feature("image", 9, [False] + [True] * 10 + [False])
+        assert self._chunks(monkeypatch, [image]) == [10, 16, 14]
+
+    def test_an_image_takes_the_chunk_size_not_the_budget(self, monkeypatch):
+        # Soft tokens at 10..15 fit the second 8-token chunk.
+        image = self._feature("image", 9, [False] + [True] * 6 + [False])
         chunks = self._chunks(monkeypatch, [image], chunk_size=8)
-        assert chunks == [8, 2, 10, 8, 8, 4]
+        assert chunks == [8] * 5
+
+    def test_no_step_exceeds_the_longest_chunk(self, monkeypatch):
+        image = self._feature("image", 9, [False] + [True] * 10 + [False])
+        chunks = self._chunks(monkeypatch, [image], chunk_size=[8, 16])
+        assert chunks == [10, 16, 14]
 
     def test_each_video_frame_is_its_own_range(self, monkeypatch):
-        # Two frames of four soft tokens, each between a timestamp, <boi>, <eoi>.
+        # Two frames of four soft tokens, each between a timestamp, <boi>, <eoi>:
+        # soft tokens at 4..7 and 11..14, so only the second frame is cut.
         frame = [False, False] + [True] * 4 + [False]
         video = self._feature("video", 2, frame * 2)
-        assert self._chunks(monkeypatch, [video], num_tokens=24) == [4, 4, 3, 4, 9]
-
-    def test_a_prefix_cache_hit_inside_a_range_resumes_its_rest(self):
-        # Soft tokens at 10..19; a hit ending at 14 leaves 14..19 for one step.
-        image = self._feature("image", 9, [False] + [True] * 10 + [False])
-        sched = create_rbln_scheduler(max_num_batched_tokens=16, max_model_len=64)
-        req = make_request("a", list(range(40)), 16, mm_features=[image])
-        assert sched._mm_prefix_split(req, 14, 16) == 6
+        chunks = self._chunks(monkeypatch, [video], num_tokens=24, chunk_size=13)
+        assert chunks == [11, 13]
 
     def test_audio_is_not_an_mm_prefix_range(self, monkeypatch):
         audio = self._feature("audio", 4, [True] * 8)
         assert self._chunks(monkeypatch, [audio], num_tokens=24) == [16, 8]
+
+    def _prefix_hit_inside_a_range(self, monkeypatch, second_image):
+        # Soft tokens at 20..40, <eoi> at 41. The second request shares the first
+        # 32-token block with the first, so its prefix cache hit ends at 32,
+        # inside the range.
+        first = self._feature("image", 19, [False] + [True] * 21 + [False], "x")
+        sched = self._scheduler(monkeypatch, budget=32, enable_prefix_caching=True)
+        self._prefill(
+            sched, make_request("a", list(range(64)), 32, mm_features=[first])
+        )
+        features = [first]
+        if second_image:
+            # Soft tokens at 46..75, which a step from 32 would cut.
+            features.append(
+                self._feature("image", 45, [False] + [True] * 30 + [False], "y")
+            )
+        tokens = list(range(42)) + [100 + t for t in range(38)]
+        req = make_request("b", tokens, 32, mm_features=features)
+        sched.add_request(req)
+        out = sched.schedule()
+        return req.num_computed_tokens, out.num_scheduled_tokens["b"]
+
+    def test_a_prefix_hit_inside_a_range_runs_its_rest_with_the_text(self, monkeypatch):
+        # The rest 32..40, <eoi> and the text after it, in one multi-token step.
+        computed, scheduled = self._prefix_hit_inside_a_range(monkeypatch, False)
+        assert (computed - scheduled, scheduled) == (32, 32)
+
+    def test_a_resumed_range_then_one_the_chunk_would_cut(self, monkeypatch):
+        # The step stops before the second image's soft tokens at 46.
+        computed, scheduled = self._prefix_hit_inside_a_range(monkeypatch, True)
+        assert (computed - scheduled, scheduled) == (32, 14)
+
+    def test_a_hit_on_a_ranges_last_token_runs_it_with_the_text_after(self):
+        # Soft tokens at 10..19; a hit ending at 19 leaves the range's last token.
+        image = self._feature("image", 9, [False] + [True] * 10 + [False])
+        sched = create_rbln_scheduler(max_num_batched_tokens=16, max_model_len=64)
+        req = make_request("a", list(range(40)), 16, mm_features=[image])
+        assert sched._mm_prefix_split(req, 19, 16) == 16
 
 
 class TestScheduleSpecDecodeCap:

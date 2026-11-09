@@ -194,35 +194,28 @@ class RBLNScheduler(Scheduler):
     def _mm_prefix_split(
         self, request: Request, num_computed_tokens: int, num_new_tokens: int
     ) -> int:
-        """Tokens to schedule so that an mm prefix range runs as a step of its own.
-
-        A range attends to itself both ways, which a compiled graph can do only
-        when the step holds that range and nothing else. By where the step starts:
-
-        - inside a range: the rest of it, which is the whole range at its start
-          or what a prefix cache hit left of it. It may run past the prefill
-          chunk size, up to the step budget.
-        - before a range: text up to where the range begins, at most one chunk.
-        - past every range: text, at most one chunk.
+        """Tokens to schedule so that no image or video-frame range straddles two
+        steps: the chunk ends before a range it would cut, and a chunk resuming
+        inside a range runs past its end, since a one-token step reads as a decode.
         """
+        end = num_computed_tokens + num_new_tokens
+        resumed_last = None
         for feature in request.mm_features:
             if feature.modality not in ("image", "video"):
                 continue
             for first, last in feature.mm_position.extract_embeds_range():
-                if first <= num_computed_tokens <= last:
-                    range_len = last + 1 - num_computed_tokens
-                    assert num_new_tokens >= range_len, (
-                        f"an mm prefix range of {range_len} tokens does not fit "
-                        f"the {num_new_tokens} this step can schedule"
+                if first < num_computed_tokens <= last:
+                    resumed_last = last
+                elif num_computed_tokens <= first < end <= last:
+                    assert first > num_computed_tokens, (
+                        f"an mm prefix range of {last + 1 - first} tokens does not "
+                        f"fit the {num_new_tokens}-token step"
                     )
-                    return range_len
-                if num_computed_tokens < first:
-                    return min(
-                        num_new_tokens,
-                        first - num_computed_tokens,
-                        self._prefill_chunk_size,
-                    )
-        return min(num_new_tokens, self._prefill_chunk_size)
+                    end = first
+        assert resumed_last is None or end > resumed_last + 1, (
+            "a step resuming inside an mm prefix range must run past it"
+        )
+        return end - num_computed_tokens
 
     def _splits_on_mm_prefix(self, request: Request) -> bool:
         return self._is_mm_prefix_lm and request.has_encoder_inputs
@@ -388,9 +381,7 @@ class RBLNScheduler(Scheduler):
                 continue
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
-            num_new_tokens = min(num_new_tokens, token_budget)
-            if not self._splits_on_mm_prefix(request):
-                num_new_tokens = min(num_new_tokens, self._prefill_chunk_size)
+            num_new_tokens = min(num_new_tokens, self._prefill_chunk_size, token_budget)
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
@@ -761,8 +752,7 @@ class RBLNScheduler(Scheduler):
                     threshold = self.scheduler_config.long_prefill_token_threshold
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
-                    if not self._splits_on_mm_prefix(request):
-                        num_new_tokens = min(num_new_tokens, self._prefill_chunk_size)
+                    num_new_tokens = min(num_new_tokens, self._prefill_chunk_size)
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked

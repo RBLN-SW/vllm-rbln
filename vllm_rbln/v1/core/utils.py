@@ -33,7 +33,6 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
-    from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
 
 # is_prefill reads the request's remaining tokens; step_is_prefill reads the
@@ -63,31 +62,6 @@ def step_is_prefill(scheduler_output: SchedulerOutput) -> bool:
         )
         > 1
         for req_id in scheduler_output.num_scheduled_tokens
-    )
-
-
-def step_is_mm_prefix_prefill(
-    scheduler_output: SchedulerOutput, requests: dict[str, CachedRequestState]
-) -> bool:
-    """Whether a request's step starts on the last token of an image or video
-    range, as a prefix cache hit can leave it: one scheduled token, which
-    step_is_prefill reads as a decode, yet the range's mm embeddings still have
-    to be prefilled. `requests` supplies the cached requests' mm features, which
-    the scheduler output carries only for new requests."""
-    cached = scheduler_output.scheduled_cached_reqs
-    steps = [
-        (req.num_computed_tokens, req.mm_features)
-        for req in scheduler_output.scheduled_new_reqs
-    ] + [
-        (computed, requests[req_id].mm_features)
-        for req_id, computed in zip(cached.req_ids, cached.num_computed_tokens)
-    ]
-    return any(
-        start <= computed == end
-        for computed, features in steps
-        for feature in features
-        if feature.modality in ("image", "video")
-        for start, end in feature.mm_position.extract_embeds_range()
     )
 
 
