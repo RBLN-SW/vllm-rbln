@@ -712,6 +712,24 @@ class TestBuildMmPrefixSlidingWindow:
         assert second.swa_attn_masks is first.swa_attn_masks
         assert full.swa_attn_masks is None
 
+    @pytest.mark.parametrize("enforce_eager", [True, False])
+    def test_the_mask_takes_the_model_dtype(self, enforce_eager):
+        cfg = make_vllm_config(
+            max_model_len=MAX_LEN, max_num_batched_tokens=CHUNK, dtype="bfloat16"
+        )
+        builder = self._builder(cfg)
+        # Eager needs device tensors to build a config; only the builder reads it.
+        builder.enforce_eager = enforce_eager
+        md = builder.build(
+            _cam(num_reqs=1, query_start_loc=[0, 6], seq_lens=[6], block_table=[[1]]),
+            torch.arange(6),
+            batch_pad=1,
+            is_prefill=True,
+            mm_prefix_row_ends=torch.arange(8),
+            swa_masks={},
+        )
+        assert md.swa_attn_masks.dtype == torch.bfloat16
+
 
 class TestBuildOutputAssembly:
     @pytest.mark.parametrize("is_prefill", [True, False])
