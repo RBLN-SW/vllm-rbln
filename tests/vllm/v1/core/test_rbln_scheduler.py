@@ -987,8 +987,9 @@ class TestMmPrefixChunks:
         assert chunks == [8] * 5
 
     def test_no_step_exceeds_the_longest_chunk(self, monkeypatch):
+        # The 32-token budget would hold the whole rest; the longest chunk caps it.
         image = self._feature("image", 9, [False] + [True] * 10 + [False])
-        chunks = self._chunks(monkeypatch, [image], chunk_size=[8, 16])
+        chunks = self._chunks(monkeypatch, [image], budget=32, chunk_size=[8, 16])
         assert chunks == [10, 16, 14]
 
     def test_each_video_frame_is_its_own_range(self, monkeypatch):

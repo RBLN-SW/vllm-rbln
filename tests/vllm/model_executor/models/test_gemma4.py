@@ -211,8 +211,8 @@ def test_warm_up_refuses_a_budget_with_no_grid_inside_the_tower():
         model.warmup_mm_encoder()
 
 
-def _built_buckets(monkeypatch, *, cap, budgets):
-    """The encoder buckets construction resolves, upstream's model left out."""
+def _built_model(monkeypatch, *, cap, budgets):
+    """The model as construction resolves it, upstream's model left out."""
     monkeypatch.setattr(
         Gemma4ForConditionalGeneration,
         "__init__",
@@ -238,7 +238,7 @@ def _built_buckets(monkeypatch, *, cap, budgets):
             additional_config=SimpleNamespace(encoder_token_budgets=budgets),
         )
     )
-    return model.mm_encoder_patch_buckets
+    return model
 
 
 @pytest.mark.parametrize(
@@ -248,12 +248,18 @@ def _built_buckets(monkeypatch, *, cap, budgets):
 def test_the_encoder_buckets_follow_encoder_token_budgets(
     monkeypatch, budgets, buckets
 ):
-    assert _built_buckets(monkeypatch, cap=280, budgets=budgets) == buckets
+    model = _built_model(monkeypatch, cap=280, budgets=budgets)
+    assert model.mm_encoder_patch_buckets == buckets
+
+
+def test_the_longest_range_is_the_cap_not_the_largest_budget(monkeypatch):
+    model = _built_model(monkeypatch, cap=280, budgets=[300, 100])
+    assert model.max_mm_prefix_range_len == 280
 
 
 def test_budgets_that_cannot_encode_an_image_at_the_cap_are_refused(monkeypatch):
     with pytest.raises(ValueError, match="must reach max_soft_tokens=280"):
-        _built_buckets(monkeypatch, cap=280, budgets=[70, 140])
+        _built_model(monkeypatch, cap=280, budgets=[70, 140])
 
 
 def _processing_info(engine_kwargs, processor_default, default_output_length):

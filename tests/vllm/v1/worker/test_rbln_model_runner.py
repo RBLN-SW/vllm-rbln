@@ -2590,7 +2590,7 @@ class TestExecuteModelFlushesAfterTheSubmission:
         assert order == ["flush", "submit", "flush"]
 
 
-class TestExecuteModelStampsMmPrefixSteps:
+class TestExecuteModelMmPrefixRowEnds:
     """Every prefill of an mm prefix LM hands the builders step-local row ends,
     padded to the step's chunk length: a text or padding row ends at itself, an
     mm row at its range's last position."""
@@ -2693,6 +2693,23 @@ class TestExecuteModelStampsMmPrefixSteps:
         )
         expected = torch.arange(128)
         expected[5:15] = 14
+        assert torch.equal(seen, expected)
+
+    def test_each_video_frame_ends_at_its_own_range(self, monkeypatch):
+        # Two frames, soft tokens at 4..7 and 11..14, in one 20-token step.
+        is_embed = ([False, False] + [True] * 4 + [False]) * 2
+        video = SimpleNamespace(
+            modality="video",
+            mm_position=PlaceholderRange(
+                offset=2, length=len(is_embed), is_embed=torch.tensor(is_embed)
+            ),
+        )
+        seen = self._row_ends_seen(
+            monkeypatch, computed=0, scheduled=20, mm_features=[video]
+        )
+        expected = torch.arange(128)
+        expected[4:8] = 7
+        expected[11:15] = 14
         assert torch.equal(seen, expected)
 
     def test_the_row_ends_take_the_staged_chunk_length(self, monkeypatch):

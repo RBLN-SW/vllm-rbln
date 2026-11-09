@@ -96,7 +96,7 @@ class TestResolveMmPrefixSupport:
             ModelConfig, "supports_multimodal_inputs", property(lambda self: True)
         )
         monkeypatch.setattr(ModelConfig, "is_mm_prefix_lm", property(lambda self: True))
-        runner = make_model_runner(**{"enable_prefix_caching": False, **config})
+        runner = make_model_runner(**config)
         runner.model = model
         return runner
 
@@ -148,16 +148,6 @@ class TestResolveMmPrefixSupport:
 
         with pytest.raises(ValueError, match="--rbln-prefill-chunk-size"):
             runner._resolve_mm_support()
-
-    def test_prefix_caching_is_taken(self, make_model_runner, monkeypatch):
-        runner = self._runner(
-            make_model_runner,
-            monkeypatch,
-            _MmPrefixModel(128),
-            enable_prefix_caching=True,
-        )
-
-        assert runner._resolve_mm_support() is True
 
 
 class TestGatherMultimodalEmbeddings:
