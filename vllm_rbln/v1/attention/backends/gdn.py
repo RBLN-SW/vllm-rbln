@@ -47,6 +47,8 @@ from vllm.v1.attention.backends.registry import (
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec
 
+from vllm_rbln.v1.attention.kv_cache_bindings import KVCacheViewInfo
+
 
 def gdn_state_shape(heads_k: int, heads_v: int, head_dim: int) -> tuple[int, ...]:
     """One block's state as the delta-rule kernels keep it: each key head's
@@ -88,6 +90,9 @@ class RBLNGDNAttentionMetadata:
     conv_store_index: torch.Tensor
     # [1, 1, seq_len] float32 on prefill: 1 for valid tokens, 0 for padding
     valid_mask: torch.Tensor | None
+    # Attached by the runner (attach_kv_cache_bindings), as on the flash metadata.
+    kv_caches: list[torch.Tensor] | None = None
+    kv_cache_view_infos: list[KVCacheViewInfo] | None = None
 
 
 @register_backend(MambaAttentionBackendEnum.GDN_ATTN, is_mamba=True)
