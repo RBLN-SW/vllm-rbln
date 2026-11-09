@@ -160,9 +160,9 @@ class RBLNSlidingWindowManager(SingleTypeKVCacheManager):
 class RBLNGDNStateSpec(MambaSpec):
     """A GatedDeltaNet layer's recurrent state, in a block pool of its own.
 
-    The page is declared at the attention page (upstream pads a Mamba page to
-    it), so the group forms and the layout checks pass as for any Mamba layer.
-    What the worker allocates is `real_page_size_bytes` a block, in a tensor
+    Upstream pads the page to the attention page when it groups the layers, so
+    the group forms and the layout checks pass as for any Mamba layer. What
+    the worker allocates is `real_page_size_bytes` a block, in a tensor
     sized to the state pool, and `RBLNGDNManager` draws the block ids from
     that pool rather than the attention one.
     """

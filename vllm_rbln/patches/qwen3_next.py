@@ -171,7 +171,6 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             shapes=self.get_state_shape(),
             dtypes=self.get_state_dtype(),
             block_size=cache_config.mamba_block_size,
-            page_size_padded=cache_config.mamba_page_size_padded,
             mamba_type=self.mamba_type,
             mamba_cache_mode=cache_config.mamba_cache_mode,
         )

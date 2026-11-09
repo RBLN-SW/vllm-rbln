@@ -284,19 +284,15 @@ class TestStateSpec:
             layer.get_state_dtype()
 
     def test_the_layer_spec_is_the_rbln_state_spec(self):
-        cache_config = SimpleNamespace(
-            mamba_block_size=8192,
-            mamba_page_size_padded=1 << 22,
-            mamba_cache_mode="none",
-        )
+        cache_config = SimpleNamespace(mamba_block_size=8192, mamba_cache_mode="none")
         spec = self._layer().get_kv_cache_spec(
             SimpleNamespace(cache_config=cache_config)
         )
         assert isinstance(spec, RBLNGDNStateSpec)
         assert spec.block_size == 8192
-        # Declared at the attention page, while the state itself is one
-        # [2, 2, 2, 128, 64] of bfloat16.
-        assert spec.page_size_bytes == 1 << 22
+        # One [2, 2, 2, 128, 64] of bfloat16; upstream pads the page to the
+        # attention page when it groups the layers.
+        assert spec.page_size_bytes == spec.real_page_size_bytes
         assert spec.real_page_size_bytes == 2 * 2 * 2 * 128 * 64 * 2
 
     def test_the_model_declares_the_layers_state(self):
