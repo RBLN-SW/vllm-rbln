@@ -55,7 +55,7 @@ from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 from vllm_rbln import envs
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.logger import init_logger
-from vllm_rbln.v1.kv_cache import GATED_DELTA_NET_MODEL_TYPES, RBLNSlidingWindowSpec
+from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 from vllm_rbln.v1.worker.kv_placement import ChipletMemory, Unit
 
 if TYPE_CHECKING:
@@ -272,7 +272,7 @@ def num_attn_module(model_config, cache_dtype) -> int:
         return 3 if is_fp8 else 2
     # A GatedDeltaNet layer (Qwen3-Next, Qwen3.5) keeps its recurrent state
     # and its conv ring.
-    if getattr(text_config, "model_type", None) in GATED_DELTA_NET_MODEL_TYPES:
+    if getattr(text_config, "model_type", None) in ("qwen3_next", "qwen3_5_text"):
         return 2
     # MiniMax-M3 MSA: the indexer key cache next to the GQA K/V cache. Dense
     # layers own only K/V; the runner re-indexes layers by bound position.

@@ -157,10 +157,6 @@ class RBLNSlidingWindowManager(SingleTypeKVCacheManager):
         return 0
 
 
-# HF text model types whose `linear_attention` layers are GatedDeltaNet.
-GATED_DELTA_NET_MODEL_TYPES = ("qwen3_next", "qwen3_5_text")
-
-
 @dataclass(frozen=True)
 class RBLNGDNStateSpec(MambaSpec):
     """A GatedDeltaNet layer's recurrent state, in a block pool of its own.

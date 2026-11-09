@@ -60,10 +60,8 @@ def check_and_update(vllm_config: "VllmConfig") -> None:
 def _uses_gated_delta_net(model_config) -> bool:
     """A GatedDeltaNet model (Qwen3-Next, Qwen3.5) by its HF text model type.
     GLM-5.3's KDA layers share the `linear_attention` layer type and stay out."""
-    from vllm_rbln.v1.kv_cache import GATED_DELTA_NET_MODEL_TYPES
-
     text_config = getattr(model_config, "hf_text_config", model_config.hf_config)
-    return getattr(text_config, "model_type", None) in GATED_DELTA_NET_MODEL_TYPES
+    return getattr(text_config, "model_type", None) in ("qwen3_next", "qwen3_5_text")
 
 
 def _uses_model_parallel(parallel_config) -> bool:
