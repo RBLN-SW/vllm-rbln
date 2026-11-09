@@ -13,8 +13,8 @@
 # limitations under the License.
 
 """The RBLN Gemma4 model's own parts, on CPU and without a checkpoint: the
-vision encoder against HF's, the mm prefix query lengths, and the in-graph
-merge of image embeddings."""
+vision encoder against HF's, its graph buckets, and the in-graph merge of
+image embeddings."""
 
 from types import SimpleNamespace
 from typing import Any
@@ -201,6 +201,66 @@ def test_warm_up_without_an_encoder_runs_nothing():
     model.warmup_mm_encoder()
 
     assert calls == []
+
+
+def test_warm_up_refuses_a_budget_with_no_grid_inside_the_tower():
+    # Seven cells only lay out as 1 x 7, 21 patches wide; the table holds 16.
+    model, calls = _recording_model([7 * POOL**2])
+
+    with pytest.raises(ValueError, match="no warm-up grid"):
+        model.warmup_mm_encoder()
+
+
+def _built_buckets(monkeypatch, *, cap, budgets, chunk=1120):
+    """The encoder buckets construction resolves, upstream's model left out."""
+    monkeypatch.setattr(
+        Gemma4ForConditionalGeneration,
+        "__init__",
+        lambda self, **kw: nn.Module.__init__(self),
+    )
+    monkeypatch.setattr(gemma4, "mm_soft_token_cap", lambda info: cap)
+    monkeypatch.setattr(
+        gemma4,
+        "MULTIMODAL_REGISTRY",
+        SimpleNamespace(
+            create_processor=lambda model_config: SimpleNamespace(info=None)
+        ),
+    )
+    model = RBLNGemma4ForConditionalGeneration.__new__(
+        RBLNGemma4ForConditionalGeneration
+    )
+    model.config = SimpleNamespace(vision_config=SimpleNamespace(pooling_kernel_size=3))
+    model.__init__(
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(data_parallel_size=1),
+            speculative_config=None,
+            model_config=None,
+            additional_config=SimpleNamespace(
+                encoder_token_budgets=budgets, max_prefill_chunk_size=chunk
+            ),
+        )
+    )
+    return model.mm_encoder_patch_buckets
+
+
+@pytest.mark.parametrize(
+    "budgets, buckets",
+    [([], [70 * 9, 140 * 9, 280 * 9]), ([300, 100], [100 * 9, 300 * 9])],
+)
+def test_the_encoder_buckets_follow_encoder_token_budgets(
+    monkeypatch, budgets, buckets
+):
+    assert _built_buckets(monkeypatch, cap=280, budgets=budgets) == buckets
+
+
+def test_budgets_that_cannot_encode_an_image_at_the_cap_are_refused(monkeypatch):
+    with pytest.raises(ValueError, match="must reach max_soft_tokens=280"):
+        _built_buckets(monkeypatch, cap=280, budgets=[70, 140])
+
+
+def test_a_budget_past_the_longest_prefill_chunk_is_refused(monkeypatch):
+    with pytest.raises(ValueError, match="longest prefill chunk"):
+        _built_buckets(monkeypatch, cap=280, budgets=[280, 560], chunk=512)
 
 
 def _processing_info(engine_kwargs, processor_default, default_output_length):

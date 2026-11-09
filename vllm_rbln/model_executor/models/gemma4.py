@@ -219,12 +219,26 @@ class RBLNGemma4ForConditionalGeneration(
         # Video frames take the smallest budget, so an image at the cap is the
         # longest range.
         self.max_mm_prefix_range_len = cap
-        # One compiled encoder shape per soft token budget up to the cap; an
-        # image or frame is padded to the smallest that holds its patches.
-        pool = self.config.vision_config.pooling_kernel_size
-        self.mm_encoder_patch_buckets = [
-            budget * pool**2 for budget in _SUPPORTED_SOFT_TOKENS if budget <= cap
+        # One compiled encoder shape per budget; an image or frame is padded to
+        # the smallest that holds its patches.
+        rbln_config = vllm_config.additional_config
+        budgets = sorted(rbln_config.encoder_token_budgets) or [
+            budget for budget in _SUPPORTED_SOFT_TOKENS if budget <= cap
         ]
+        if budgets[-1] < cap:
+            raise ValueError(
+                f"encoder_token_budgets {budgets} must reach max_soft_tokens={cap}, "
+                "the most soft tokens an image may take; add a budget that large "
+                "or lower max_soft_tokens."
+            )
+        if budgets[-1] > rbln_config.max_prefill_chunk_size:
+            raise ValueError(
+                f"encoder_token_budgets {budgets} go past the longest prefill "
+                f"chunk ({rbln_config.max_prefill_chunk_size}), which no image "
+                "range may exceed; drop the larger budgets."
+            )
+        pool = self.config.vision_config.pooling_kernel_size
+        self.mm_encoder_patch_buckets = [budget * pool**2 for budget in budgets]
         self._mm_encoder: Callable[..., torch.Tensor] | None
         object.__setattr__(self, "_mm_encoder", None)
 
@@ -277,11 +291,18 @@ class RBLNGemma4ForConditionalGeneration(
         vision_config = self.config.vision_config
         pool = vision_config.pooling_kernel_size
         patch_pixels = 3 * vision_config.patch_size**2
+        axis_len = self.vision_tower.patch_embedder.position_embedding_table.shape[1]
         with torch.inference_mode():
             for bucket in self.mm_encoder_patch_buckets:
                 # A full grid whose sides are multiples of the pooling kernel.
                 cells = bucket // pool**2
                 rows = max(d for d in range(1, math.isqrt(cells) + 1) if cells % d == 0)
+                if cells // rows * pool > axis_len:
+                    raise ValueError(
+                        f"An encoder budget of {cells} soft tokens has no warm-up "
+                        f"grid within the vision tower's {axis_len} "
+                        "positions per axis; pick a budget with closer factors."
+                    )
                 ys, xs = torch.meshgrid(
                     torch.arange(rows * pool),
                     torch.arange(cells // rows * pool),
