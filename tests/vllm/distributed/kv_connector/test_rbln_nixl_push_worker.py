@@ -822,6 +822,14 @@ class TestTrimToConsumerBlocks:
         )
         assert trimmed == ([2], [5, 6], [8])
 
+    def test_a_consumer_list_with_no_blocks_trims_ours_to_none(self):
+        # Slicing by `[-num_remote:]` read `[-0:]` here, the whole list, and
+        # would have sent every block to a consumer that registered none.
+        trimmed = RblnNixlPushConnectorWorker._trim_to_consumer_blocks(
+            ([1, 2], [5, 6]), ([], [9]), "eng0", "req0", [(0, 0), (1, 1)]
+        )
+        assert trimmed == ([], [6])
+
 
 class TestWriterCompletionAccounting:
     """0.26 counts a pushed request's writers itself, so this side must not.
