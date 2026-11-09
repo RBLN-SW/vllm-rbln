@@ -602,6 +602,20 @@ class TestRejectedConfigs:
         config = reconfigure(gdn)
         assert config.cache_config.enable_prefix_caching is False
 
+    def test_gdn_models_run_on_a_single_rank(self, reconfigure, gdn):
+        for parallel in (
+            dict(tensor_parallel_size=2),
+            dict(pipeline_parallel_size=2),
+            dict(data_parallel_size=2),
+        ):
+
+            def widened(config, parallel=parallel):
+                gdn(config)
+                _ranks(**parallel)(config)
+
+            with pytest.raises(ValueError, match="single rank"):
+                reconfigure(widened)
+
     def test_gdn_models_reject_speculative_decoding(self, reconfigure, gdn):
         def speculative(config):
             gdn(config)

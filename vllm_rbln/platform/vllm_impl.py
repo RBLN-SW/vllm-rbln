@@ -100,6 +100,18 @@ def _validate(vllm_config: "VllmConfig") -> None:
                 f"{vllm_config.cache_config.mamba_block_size} for max_model_len "
                 f"{model_config.max_model_len}."
             )
+        if (
+            parallel_config.tensor_parallel_size > 1
+            or parallel_config.pipeline_parallel_size > 1
+            or parallel_config.data_parallel_size > 1
+        ):
+            raise ValueError(
+                "GatedDeltaNet models run on a single rank on the RBLN vLLM path "
+                f"for now; got tensor_parallel_size="
+                f"{parallel_config.tensor_parallel_size}, pipeline_parallel_size="
+                f"{parallel_config.pipeline_parallel_size}, data_parallel_size="
+                f"{parallel_config.data_parallel_size}."
+            )
         if vllm_config.speculative_config is not None:
             raise ValueError(
                 "Speculative decoding is not supported for GatedDeltaNet models on "
