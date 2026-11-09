@@ -229,6 +229,16 @@ class RBLNFlashAttentionMetadataBuilder(
                 "--rbln-use-custom-kernel: rbln_triton_ops has no "
                 "sliding_window_attention_v1 kernel."
             )
+        if self.model_config.is_mm_prefix_lm and isinstance(
+            kv_cache_spec, RBLNSlidingWindowSpec
+        ):
+            raise NotImplementedError(
+                "Multimodal ranges of an mm prefix LM attend both ways on sliding "
+                "layers, which needs the masked sliding_window_attention_v1 of "
+                "REBEL CR13; this device's sliding-window kernel is causal only. "
+                "Serve it with every --limit-mm-per-prompt modality 0 and without "
+                "--enable-mm-embeds."
+            )
 
         self._staged: dict[tuple, torch.Tensor] = {}
 

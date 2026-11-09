@@ -516,6 +516,43 @@ class TestBuildSlidingWindowAppend:
             make_builder(cfg_custom_kernel, sliding_window=4)
 
 
+class TestMmPrefixOnTheShiftKernel:
+    """The shift kernel takes no mask, so an mm prefix LM that may receive
+    multimodal ranges cannot run its sliding layers there."""
+
+    @staticmethod
+    def _cfg(**engine_args):
+        # Upstream clears is_mm_prefix_lm only when every modality is 0 and
+        # --enable-mm-embeds is off.
+        return make_vllm_config(
+            model="google/gemma-4-26B-A4B-it",
+            max_model_len=64,
+            block_size=64,
+            max_num_batched_tokens=64,
+            **engine_args,
+        )
+
+    @pytest.mark.parametrize(
+        "engine_args",
+        [
+            {"limit_mm_per_prompt": {"image": 1, "video": 0}},
+            {"limit_mm_per_prompt": {"image": 0, "video": 0}, "enable_mm_embeds": True},
+        ],
+        ids=["image", "mm_embeds"],
+    )
+    def test_is_refused(self, engine_args):
+        with pytest.raises(NotImplementedError, match="--limit-mm-per-prompt"):
+            make_builder(self._cfg(**engine_args), sliding_window=4, appends_kv=False)
+
+    def test_text_only_is_served(self):
+        cfg = self._cfg(limit_mm_per_prompt={"image": 0, "video": 0})
+        make_builder(cfg, sliding_window=4, appends_kv=False)
+
+    def test_the_append_kernel_is_served(self):
+        cfg = self._cfg(limit_mm_per_prompt={"image": 1, "video": 0})
+        assert make_builder(cfg, sliding_window=4).swa_appends
+
+
 class TestBuildMmPrefixSlidingWindow:
     """The sliding-window mask of an mm prefix LM's prefill, checked by running
     sliding_window_attention_v1's eager reference over a whole prompt chunk by
