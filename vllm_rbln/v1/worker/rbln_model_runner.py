@@ -2355,8 +2355,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         )
         self._prev_sampled_host = (
             sampler_output.sampled_token_ids,
-            async_output._sampled_token_ids_cpu,
-            async_output._copy_ready_event,
+            *async_output.host_copy(),
         )
         return async_output
 
