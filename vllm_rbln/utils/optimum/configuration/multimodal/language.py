@@ -13,10 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .common import get_language_model_config
 
-
-def get_param_idefics3(
+def build_language_model_config(
     batch_size: int,
     max_model_len: int,
     block_size: int,
@@ -24,12 +22,19 @@ def get_param_idefics3(
     memory_budget: float,
     prefill_chunk_size: int | None = None,
 ) -> dict:
-    language_model_config = get_language_model_config(
-        batch_size,
-        max_model_len,
-        block_size,
-        num_devices,
-        memory_budget,
-        prefill_chunk_size,
-    )
-    return {"text_model": language_model_config}
+    rbln_config: dict = {
+        "use_inputs_embeds": True,
+        "batch_size": batch_size,
+        "max_seq_len": max_model_len,
+        "num_devices": num_devices,
+        "memory_budget": memory_budget,
+    }
+    if block_size != max_model_len:
+        attn_impl = "flash_attn" if block_size != max_model_len else "eager"
+        rbln_config["attn_impl"] = attn_impl
+        rbln_config["kvcache_partition_len"] = block_size
+    # Pin prefill_chunk_size so the compiled model stays in sync with the value
+    # used for KV-cache block padding.
+    if prefill_chunk_size is not None:
+        rbln_config["prefill_chunk_size"] = prefill_chunk_size
+    return rbln_config
