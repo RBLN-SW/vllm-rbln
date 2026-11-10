@@ -13,10 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .common import get_language_model_config
+from .language import build_language_model_config
 
 
-def get_param_paligemma(
+def build_blip2_config(
     batch_size: int,
     max_model_len: int,
     block_size: int,
@@ -24,7 +24,7 @@ def get_param_paligemma(
     memory_budget: float,
     prefill_chunk_size: int | None = None,
 ) -> dict:
-    language_model_config = get_language_model_config(
+    language_model_config = build_language_model_config(
         batch_size,
         max_model_len,
         block_size,
@@ -32,6 +32,5 @@ def get_param_paligemma(
         memory_budget,
         prefill_chunk_size,
     )
-    language_model_config["prefill_chunk_size"] = max_model_len
-    param = {"language_model": language_model_config}
-    return param
+    rbln_config = {"language_model": language_model_config}
+    return rbln_config

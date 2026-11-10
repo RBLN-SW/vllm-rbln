@@ -41,7 +41,11 @@ def image_url(image: str) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://127.0.0.1:8000/v1")
-    parser.add_argument("--image", required=True, help="Local path or URL.")
+    parser.add_argument(
+        "--image",
+        default="https://vllm-public-assets.s3.us-west-2.amazonaws.com/multimodal_asset/lion.jpg",
+        help="Local path or URL.",
+    )
     parser.add_argument("--prompt", default="What is in this image?")
     parser.add_argument("--max-tokens", type=int, default=64)
     args = parser.parse_args()
