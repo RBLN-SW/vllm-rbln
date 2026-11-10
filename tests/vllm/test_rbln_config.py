@@ -39,7 +39,7 @@ from vllm_rbln.config import (
     resolve_model_impl,
 )
 from vllm_rbln.envs import RESOLVED_MODEL_IMPL_ENV
-from vllm_rbln.utils.optimum.paths import RBLN_CONFIG_FILE
+from vllm_rbln.utils.optimum.path import RBLN_CONFIG_FILE
 
 
 @pytest.fixture(autouse=True)
@@ -111,6 +111,17 @@ def test_flags_reach_the_config(parser):
     assert config.use_custom_sampler is False
     assert config.decode_batch_bucket_strategy == "manual"
     assert config.decode_batch_bucket_manual_buckets == [1, 4, 16]
+
+
+def test_encoder_token_budgets_accept_flags(parser):
+    config = resolve(parser, ["--rbln-encoder-token-budgets", "256", "576", "3072"])
+    assert config.encoder_token_budgets == [256, 576, 3072]
+
+
+@pytest.mark.parametrize("budgets", [[], [256, 576, 3072]])
+def test_encoder_token_budgets_accept_additional_config(budgets):
+    config = build_rbln_config({"encoder_token_budgets": budgets})
+    assert config.encoder_token_budgets == budgets
 
 
 def test_coexists_with_additional_config(parser):
@@ -225,6 +236,19 @@ def test_manual_strategy_needs_buckets():
         RBLNConfig(decode_batch_bucket_strategy="manual")
 
 
+@pytest.mark.parametrize(
+    ("budgets", "error"),
+    [
+        ([0, 576], "must all be > 0"),
+        ([-1, 576], "must all be > 0"),
+        ([576, 576], "unique"),
+    ],
+)
+def test_encoder_token_budgets_are_positive_and_unique(budgets, error):
+    with pytest.raises(ValueError, match=error):
+        RBLNConfig(encoder_token_budgets=budgets)
+
+
 @pytest.mark.parametrize("size", [0, -1])
 def test_a_sub_block_size_of_zero_or_less_is_rejected(size):
     """`sub_block_size_in_use()` takes a size or None, so the field refuses
@@ -319,6 +343,9 @@ def test_only_compile_fields_change_the_hash():
     assert RBLNConfig(use_custom_sampler=False).compute_hash() == base
     assert RBLNConfig(enable_sub_block_cache=False).compute_hash() == base
     assert RBLNConfig(sub_block_size=64).compute_hash() == base
+    # mega_cache keys on the buckets the model resolves from this one.
+    encoder_budgets = RBLNConfig(encoder_token_budgets=[256, 576])
+    assert encoder_budgets.compute_hash() == base
     assert RBLNConfig(use_w8a8=True).compute_hash() != base
     assert RBLNConfig(compile_dtype="float16").compute_hash() != base
     assert RBLNConfig(decode_batch_bucket_strategy="linear").compute_hash() != base

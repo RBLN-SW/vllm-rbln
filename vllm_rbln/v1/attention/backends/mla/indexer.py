@@ -2,10 +2,15 @@
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# You may obtain a copy of the License at:
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 #
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 from typing import ClassVar
 
@@ -66,7 +71,28 @@ class RBLNDeepseekV32IndexerBackend(AttentionBackend):
 
 
 class RBLNDeepseekV32IndexerScaleBackend(RBLNDeepseekV32IndexerBackend):
-    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16]
+    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
+
+    @classmethod
+    def cache_dtype(cls, model_dtype: torch.dtype) -> torch.dtype:
+        """dtype of the scale cache that sits next to an fp8 indexer key cache.
+
+        The fp8 indexer kernel declares the scale cache in the compute dtype,
+        so the cache takes the model dtype. An fp16 cache under a bf16 model
+        gets a bf16 physical view, and copying one 2048-token block of 7 layers
+        into or out of it takes about 0.6 ms instead of 0.07 ms (DeepSeek-V3.2,
+        RBLN-CR13). A model dtype without an indexer kernel is refused here
+        rather than surfacing later as an unsupported backend dtype.
+        """
+        if model_dtype not in cls.supported_dtypes:
+            names = " or ".join(
+                str(d).removeprefix("torch.") for d in cls.supported_dtypes
+            )
+            raise ValueError(
+                f"The fp8 DSA indexer needs a {names} model dtype on RBLN; "
+                f"got dtype={model_dtype}. Pass --dtype bfloat16."
+            )
+        return model_dtype
 
     @staticmethod
     def get_name() -> str:

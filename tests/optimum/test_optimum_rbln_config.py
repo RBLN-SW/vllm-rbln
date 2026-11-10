@@ -1,11 +1,11 @@
 # Copyright 2026 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -19,7 +19,6 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-from vllm.config import CacheConfig
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
@@ -167,101 +166,12 @@ def test_the_former_prefix_block_size_key_is_accepted():
     assert config.sub_block_size == 256
 
 
-@pytest.mark.parametrize(
-    "num_blocks, override_blocks",
-    [(None, None), (None, 0), (None, 16), (16, None), (16, 16), (16, 32)],
-)
-@pytest.mark.parametrize(
-    "architecture, decoder_key",
-    [
-        ("LlamaForCausalLM", None),
-        ("Gemma3ForConditionalGeneration", "language_model"),
-        ("Idefics3ForConditionalGeneration", "text_model"),
-    ],
-)
-@pytest.mark.parametrize("utilization", [0.5, 0.9, 1.0])
-def test_explicit_blocks_normalize_memory_utilization_with_log(
-    monkeypatch,
-    caplog,
-    num_blocks,
-    override_blocks,
-    architecture,
-    decoder_key,
-    utilization,
-):
-    from vllm_rbln.platform.optimum_impl import check_and_update
-    from vllm_rbln.utils.optimum import converter, predicates
-
-    synced_utilizations = []
-    monkeypatch.setattr(
-        converter,
-        "sync_vllm_and_optimum",
-        lambda cfg: synced_utilizations.append(cfg.cache_config.gpu_memory_utilization),
-    )
-    monkeypatch.setattr(predicates, "forces_fp32_dtype", lambda cfg: False)
-    hf_config = SimpleNamespace(architectures=[architecture])
-    cache_config = CacheConfig(
-        num_gpu_blocks_override=num_blocks,
-        gpu_memory_utilization=utilization,
-        enable_prefix_caching=False,
-    )
-    overrides = (
-        {} if override_blocks is None else {"kvcache_num_blocks": override_blocks}
-    )
-    cfg = SimpleNamespace(
-        additional_config={
-            "optimum_overrides": {decoder_key: overrides} if decoder_key else overrides
-        },
-        cache_config=cache_config,
-        model_config=SimpleNamespace(
-            multimodal_config=None,
-            hf_config=hf_config,
-            hf_text_config=hf_config,
-            architectures=hf_config.architectures,
-        ),
-        parallel_config=SimpleNamespace(
-            worker_cls="auto", tensor_parallel_size=1, pipeline_parallel_size=1
-        ),
-        scheduler_config=SimpleNamespace(async_scheduling=False),
-        speculative_config=None,
-    )
-    if num_blocks == 16 and override_blocks == 32:
-        key = rf"{decoder_key}\." if decoder_key else ""
-        with pytest.raises(
-            ValueError,
-            match=rf"num_gpu_blocks_override=16.*optimum_overrides\.{key}kvcache_num_blocks=32",
-        ):
-            check_and_update(cfg)
-        assert synced_utilizations == []
-        assert cache_config.gpu_memory_utilization == utilization
-        assert cache_config.num_gpu_blocks_override == num_blocks
-        return
-
-    with caplog.at_level("INFO", logger="vllm_rbln.platform.optimum_impl"):
-        check_and_update(cfg)
-    explicit_blocks = num_blocks is not None or override_blocks == 16
-    expected_utilization = 1.0 if explicit_blocks else utilization
-    assert cache_config.gpu_memory_utilization == expected_utilization
-    assert synced_utilizations == [expected_utilization]
-    assert cache_config.num_gpu_blocks_override == num_blocks
-    messages = [
-        r.getMessage()
-        for r in caplog.records
-        if "Setting gpu_memory_utilization" in r.getMessage()
-    ]
-    if explicit_blocks and utilization != 1.0:
-        assert len(messages) == 1
-        assert f"from {utilization} to 1.0" in messages[0]
-        assert "explicit KV cache block count=16" in messages[0]
-    else:
-        assert messages == []
-
-
 def test_only_compile_fields_change_the_hash():
     """A field the sync derives cannot key the artifact it was derived from."""
     base = OptimumRBLNConfig().compute_hash()
     assert OptimumRBLNConfig(attn_block_size=64).compute_hash() == base
-    assert OptimumRBLNConfig(cached_model_path="/tmp/x").compute_hash() == base
+    assert OptimumRBLNConfig(artifact_path="/tmp/x").compute_hash() == base
+    assert OptimumRBLNConfig(precompiled=True).compute_hash() == base
     assert OptimumRBLNConfig(num_blocks_synced=True).compute_hash() == base
     assert OptimumRBLNConfig(use_custom_sampler=False).compute_hash() == base
     assert OptimumRBLNConfig(user_max_num_batched_tokens=512).compute_hash() != base

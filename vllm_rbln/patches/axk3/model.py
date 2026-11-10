@@ -2,22 +2,30 @@
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# You may obtain a copy of the License at:
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 #
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """A.X K3 on top of the vendored A.X K2 model.
 
 K3 keeps K2's gated MLA (fused output gate in q_b_proj), DSA indexer and MoE,
-and changes three things, all following the checkpoint's ``modeling_axk3.py``:
+and changes two things, both following the checkpoint's ``modeling_axk3.py``:
 
 - Gated Residual replaces both pre-norms and ``model.norm``: the residual is
   ``num_streams`` copies of the hidden state, each block reads a gated mean of
   them and writes its output back with a per-stream gate.
 - Index-share: only every ``index_topk_freq``-th layer owns an indexer; the
   others reuse the top-k of their source layer from the same forward.
-- The indexer reads the pre-``q_a_layernorm`` q latent (K2 feeds the normed one).
+
+The indexer reads the post-``q_a_layernorm`` q latent, as in K2. The
+checkpoint's ``modeling_axk3.py`` feeds it the pre-norm one, which the trained
+weights do not match.
 """
 
 import contextlib
@@ -54,8 +62,10 @@ _AXK2ForCausalLM: Any = _k2.AXK2ForCausalLM
 class AXK3GatedResidual(nn.Module):
     """Gated Residual read/write over ``num_streams`` residual branches.
 
-    Numerics follow ``AXK3GatedResidual`` in ``modeling_axk3.py``: fp32 RMSNorm
-    statistics, the read gate applied in fp32, the write gate kept in fp32.
+    Numerics follow ``AXK3GatedResidual`` in ``modeling_axk3.py`` with fp32
+    RMSNorm statistics. The read and write gates and the write product run in
+    the activation dtype instead of fp32 (the projections feeding them are
+    bf16 already).
     """
 
     def __init__(
@@ -98,7 +108,7 @@ class AXK3GatedResidual(nn.Module):
         return x.view(*x.shape[:-1], self.num_streams, self.hidden_size)
 
     def read(self, residual: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """[..., n*h] -> (block input [..., h], write gate [..., n] fp32 or None)."""
+        """[..., n*h] -> (block input [..., h], write gate [..., n] or None)."""
         n = self.num_streams
         # vLLM's RMSNorm over one row per (token, stream), so the norm lowers
         # like every other RMSNorm; a hand-written [T, n, 1] statistic left a
@@ -110,14 +120,19 @@ class AXK3GatedResidual(nn.Module):
         u = self._streams(normed.view_as(residual)) * gamma
         u = u.to(residual.dtype).view_as(residual)
 
+        # The gates stay in the activation dtype. The projections already
+        # return bf16, so an fp32 gate only re-ran the bias add, the sigmoid
+        # and the stream mean wider, and the casts around them kept each
+        # projection, its bias and its sigmoid from fusing into one device op.
+        # The stream mean still accumulates in fp32 on device.
         z = F.silu(self.read_down(u)[0] / n)
-        gate = torch.sigmoid(self.read_up(z)[0].float())
-        block_input = self._streams(gate * u.float()).mean(dim=-2).to(residual.dtype)
+        gate = torch.sigmoid(self.read_up(z)[0])
+        block_input = self._streams(gate * u).mean(dim=-2)
 
         write_gate = None
         if self.write_proj is not None:
             write_gate = 2.0 * torch.sigmoid(
-                (self.write_proj(u)[0] / n).float() + self.write_bias
+                self.write_proj(u)[0] / n + self.write_bias.to(u.dtype)
             )
         return block_input, write_gate
 
@@ -125,7 +140,9 @@ class AXK3GatedResidual(nn.Module):
         self, residual: torch.Tensor, y: torch.Tensor, write_gate: torch.Tensor
     ) -> torch.Tensor:
         """R'_i = R_i + s_i * y."""
-        scaled = (write_gate.unsqueeze(-1) * y.float().unsqueeze(-2)).to(residual.dtype)
+        # y and the gate are bf16 and the product goes straight back to bf16,
+        # so an fp32 multiply only added a cast on each side of it.
+        scaled = (write_gate.unsqueeze(-1) * y.unsqueeze(-2)).to(residual.dtype)
         return (self._streams(residual) + scaled).view_as(residual)
 
 
@@ -155,7 +172,7 @@ def _gated_mla_forward(
     """K2's gated MLA forward, returning the top-k it attended with.
 
     ``mla`` is the AXK2GatedMultiHeadLatentAttentionWrapper. A layer that owns
-    an indexer computes the top-k from the pre-norm q latent; a skip layer is
+    an indexer computes the top-k from the post-norm q latent; a skip layer is
     handed its source layer's top-k.
     """
     batch_size, seq_len, _ = hidden_states.shape
@@ -183,9 +200,7 @@ def _gated_mla_forward(
     k_pe = k_pe.squeeze(2)
 
     if mla.indexer is not None:
-        topk_indices = mla.indexer(
-            hidden_states, q_c_prenorm, positions, mla.indexer_rope_emb
-        )
+        topk_indices = mla.indexer(hidden_states, q_c, positions, mla.indexer_rope_emb)
 
     attn_out = mla.mla_attn(
         q,
@@ -242,7 +257,7 @@ class AXK3DecoderLayer(_AXK2DecoderLayer):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         topk_by_layer: dict[int, torch.Tensor],
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         residual = hidden_states
         x, write_gate = self.attn_gated_residual.read(hidden_states)
         x, topk_indices = _gated_mla_forward(
@@ -251,13 +266,14 @@ class AXK3DecoderLayer(_AXK2DecoderLayer):
             x,
             topk_by_layer[self.index_source_layer] if self.skip_topk else None,
         )
-        topk_by_layer[self.layer_idx] = topk_indices
         hidden_states = self.attn_gated_residual.write(residual, x, write_gate)
 
         residual = hidden_states
         x, write_gate = self.mlp_gated_residual.read(hidden_states)
         x = self.mlp(x)
-        return self.mlp_gated_residual.write(residual, x, write_gate)
+        hidden_states = self.mlp_gated_residual.write(residual, x, write_gate)
+        # A nested compile region must not write topk_by_layer; the caller does.
+        return hidden_states, None if self.skip_topk else topk_indices
 
 
 @support_torch_compile
@@ -336,7 +352,9 @@ class AXK3Model(nn.Module):
         # `make_layers` pads the list to the full depth with `PPMissingLayer`,
         # which returns its first argument; walk only the layers this rank built.
         for layer in islice(self.layers, self.start_layer, self.end_layer):
-            hidden_states = layer(positions, hidden_states, topk_by_layer)
+            hidden_states, topk_indices = layer(positions, hidden_states, topk_by_layer)
+            if topk_indices is not None:
+                topk_by_layer[layer.layer_idx] = topk_indices
 
         hidden_states, _ = self.final_gated_residual.read(hidden_states)
         return hidden_states

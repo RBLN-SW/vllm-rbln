@@ -127,6 +127,17 @@ steps:
           - *sync
           - "bash .buildkite/pipelines/vllm-rbln/scripts/run-e2e.sh --group core ${PYTEST_E2E_ARGS:-}"
 
+      - <<: *e2e
+        label: "sample"
+        key: "vllm-rbln-e2e-sample-cr13"
+        resources:
+          npu:
+            count: 1
+            product: "RBLN-CR13"
+        command:
+          - *sync
+          - "bash .buildkite/pipelines/vllm-rbln/scripts/run-e2e.sh --group sample ${PYTEST_E2E_ARGS:-}"
+
       # - <<: *e2e
       #   label: "others"
       #   key: "vllm-rbln-e2e-others-cr13"

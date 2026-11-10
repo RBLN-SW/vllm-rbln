@@ -2,10 +2,15 @@
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# You may obtain a copy of the License at:
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 #
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 from itertools import islice
 
@@ -13,6 +18,7 @@ import torch
 from vllm.distributed import get_pp_group
 from vllm.forward_context import get_forward_context
 from vllm.sequence import IntermediateTensors
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 from vllm_rbln.patches.attention import _resolve_kv_cache
 from vllm_rbln.patches.axk2.loader import load_frozen_module
@@ -70,8 +76,9 @@ def _rbln_indexer_forward(
     k_cache = _resolve_kv_cache(attn_metadata, self.k_cache.layer_index)
 
     # fp8 indexer cache is a 2-cache spec: fp8_e4m3 values here plus a companion
-    # fp16 per-position scale cache. Registered by the DeepseekV32IndexerCache
-    # patch only when --kv-cache-dtype is fp8*, so this stays None on the bf16 path.
+    # per-position scale cache in the model dtype. Registered by the
+    # DeepseekV32IndexerCache patch only when --kv-cache-dtype is fp8*, so this
+    # stays None on the bf16 path.
     scale_cache = None
     if getattr(self.k_cache, "scale_cache", None) is not None:
         scale_cache = _resolve_kv_cache(
@@ -92,6 +99,7 @@ def _rbln_indexer_forward(
         self.topk_tokens,
         scale_cache,
         is_prompt_sorted=attn_metadata.is_prompt_sorted,
+        null_block_id=NULL_BLOCK_ID,
     )
 
 

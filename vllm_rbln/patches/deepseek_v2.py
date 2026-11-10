@@ -22,6 +22,7 @@ from vllm.model_executor.models.deepseek_v2 import (
     DeepseekV2MoE,
     DeepseekV32IndexerCache,
 )
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 from vllm_rbln.logger import init_logger
 from vllm_rbln.patches import register_patch
@@ -179,14 +180,14 @@ def rbln_indexer_cache_init(self, *args, **kwargs) -> None:
         self.prefix, model_config, vllm_config.parallel_config, num_attn_module
     )
 
-    # register fp16 scale cache (2-cache spec).
+    # register the per-token scale cache (2-cache spec).
     self.scale_cache = None
     if self.is_fp8_cache:
         scale = DeepseekV32IndexerCache.__new__(DeepseekV32IndexerCache)
         _original_indexer_cache_init(
             scale,
             head_dim=1,
-            dtype=torch.float16,
+            dtype=RBLNDeepseekV32IndexerScaleBackend.cache_dtype(model_config.dtype),
             prefix=f"{self.prefix}.scale_cache",
             cache_config=self.cache_config,
         )
@@ -272,5 +273,6 @@ def rbln_indexer_forward(
         self.topk_tokens,
         scale_cache,
         is_prompt_sorted=attn_metadata.is_prompt_sorted,
+        null_block_id=NULL_BLOCK_ID,
     )
     return topk_index

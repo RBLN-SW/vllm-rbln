@@ -21,6 +21,7 @@ import json
 import math
 import os
 import subprocess
+import sys
 import tempfile
 from collections import Counter
 from pathlib import Path
@@ -28,7 +29,13 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 import yaml
-from lane import agent_bin, case_status
+from lane import (
+    agent_bin,
+    case_status,
+    load_targets,
+    perf_cases,
+    restore_ci_targets,
+)
 
 ROOT = Path(__file__).resolve().parents[4]
 
@@ -112,99 +119,120 @@ def build_report(results, *, run_id, chip, build_url, branch, commit):
     rows = [[{"type": "raw_text", "text": title} for title in titles]]
     markdown = ["| " + " | ".join(titles) + " |", "|" + "---|" * len(titles)]
     completed = planned = 0
-    targets = pipelines / "scripts/perf/targets"
-    for path in sorted([*targets.glob("*.yaml"), *targets.glob("*.yml")]):
-        target = yaml.safe_load(path.read_text())
-        if target.get("chips") and chip not in target["chips"]:
-            continue
-        for launch in sorted(target["serve_params"]):
-            for bench in sorted(target["bench_params"]):
-                planned += 1
-                directory = (
-                    results
-                    / "perf-results"
-                    / run_id
-                    / chip
-                    / path.stem
-                    / launch
-                    / bench
+    snapshot = results / "ci-targets" / run_id
+    targets = {}
+    source = None
+    if (snapshot / "snapshot.tar.gz").exists():
+        source = restore_ci_targets(snapshot)
+        targets = load_targets(snapshot / "perf", chip, "perf")
+    for name, target in targets.items():
+        for launch, bench in sorted(perf_cases(target)):
+            planned += 1
+            directory = results / "perf-results" / run_id / chip / name / launch / bench
+            result_file = directory / "result.json"
+            result = (
+                json.loads(result_file.read_text()) if result_file.exists() else None
+            )
+            status = case_status(result)
+            measurements = result["rows"] if result else []
+            case_ok = status == "ok"
+            metrics = (
+                ("output_throughput", 1),
+                ("total_token_throughput", 1),
+                ("mean_ttft_ms", 1000),
+                ("mean_tpot_ms", 1),
+            )
+            for row in measurements:
+                case_ok &= (
+                    int(row["completed"]) == int(row["num_prompts"])
+                    and int(row["failed"]) == 0
+                    and all(
+                        row.get(key) is not None and math.isfinite(float(row[key]))
+                        for key, _ in metrics
+                    )
                 )
-                result_file = directory / "result.json"
-                result = (
-                    json.loads(result_file.read_text())
-                    if result_file.exists()
-                    else None
+            completed += case_ok
+            degraded |= not case_ok
+            url = (result or {}).get("job_url") or build_url
+            parts = urlsplit(url)
+            if parts.fragment:
+                query = dict(parse_qsl(parts.query)) | {"job": parts.fragment}
+                url = urlunsplit(parts._replace(query=urlencode(query), fragment=""))
+            number = str(planned)
+            link = {
+                "type": "rich_text",
+                "elements": [
+                    {
+                        "type": "rich_text_section",
+                        "elements": [
+                            {"type": "link", "text": number, "url": url},
+                        ],
+                    },
+                ],
+            }
+            if result is None:
+                failure = "MISSING"
+            elif result["exit_code"] is None:
+                failure = "INCOMPLETE"
+            else:
+                failure = "FAILED"
+            for row in measurements or [{}]:
+                case = f"{launch} / {bench}"
+                if not case_ok:
+                    case = f"❌ {case} ({failure})"
+                cells = [target["model"].rsplit("/", 1)[-1], case]
+                for key, scale in metrics:
+                    value = row.get(key)
+                    cells.append(
+                        f"{float(value) / scale:.1f}" if value is not None else "—"
+                    )
+                rows.append(
+                    [link, *({"type": "raw_text", "text": cell} for cell in cells)]
                 )
-                status = case_status(result)
-                measurements = result["rows"] if result else []
-                case_ok = status == "ok"
-                metrics = (
-                    ("output_throughput", 1),
-                    ("total_token_throughput", 1),
-                    ("mean_ttft_ms", 1000),
-                    ("mean_tpot_ms", 1),
+                markdown.append(
+                    "| " + " | ".join([f"[{number}]({url})", *cells]) + " |"
                 )
-                for row in measurements:
-                    case_ok &= (
-                        int(row["completed"]) == int(row["num_prompts"])
-                        and int(row["failed"]) == 0
-                        and all(
-                            row.get(key) is not None and math.isfinite(float(row[key]))
-                            for key, _ in metrics
-                        )
-                    )
-                completed += case_ok
-                degraded |= not case_ok
-                url = (result or {}).get("job_url") or build_url
-                parts = urlsplit(url)
-                if parts.fragment:
-                    query = dict(parse_qsl(parts.query)) | {"job": parts.fragment}
-                    url = urlunsplit(
-                        parts._replace(query=urlencode(query), fragment="")
-                    )
-                number = str(planned)
-                link = {
-                    "type": "rich_text",
-                    "elements": [
-                        {
-                            "type": "rich_text_section",
-                            "elements": [
-                                {"type": "link", "text": number, "url": url},
-                            ],
-                        },
-                    ],
-                }
-                if result is None:
-                    failure = "MISSING"
-                elif result["exit_code"] is None:
-                    failure = "INCOMPLETE"
-                else:
-                    failure = "FAILED"
-                for row in measurements or [{}]:
-                    case = f"{launch} / {bench}"
-                    if not case_ok:
-                        case = f"❌ {case} ({failure})"
-                    cells = [target["model"].rsplit("/", 1)[-1], case]
-                    for key, scale in metrics:
-                        value = row.get(key)
-                        cells.append(
-                            f"{float(value) / scale:.1f}" if value is not None else "—"
-                        )
-                    rows.append(
-                        [link, *({"type": "raw_text", "text": cell} for cell in cells)]
-                    )
-                    markdown.append(
-                        "| " + " | ".join([f"[{number}]({url})", *cells]) + " |"
-                    )
-    if not planned:
-        raise ValueError(f"No perf cases configured for {chip}")
+    if planned:
+        perf = (
+            f"{completed}/{planned} cases completed · {chip}\n"
+            f"Targets: {source['repo']} @ {source['commit']}"
+        )
+    else:
+        perf = "CI target preparation failed: target snapshot is missing"
+        degraded = True
+
+    sys.path.insert(0, str(Path(__file__).with_name("sampler-perf")))
+    from run_benchmarks import sampler_summary
+
+    sampler_path = results / "sampler-perf-results" / run_id / chip / "manifest.json"
+    sampler = None
+    sampler_url = build_url
+    if sampler_path.is_file():
+        try:
+            manifest = json.loads(sampler_path.read_text())
+            if manifest["chip"] not in (None, chip):
+                raise ValueError("sampler result chip does not match nightly report")
+            if source is None:
+                raise ValueError("CI targets snapshot is missing")
+            sampler_targets = f"Targets: {source['repo']} @ {source['commit']}"
+            sampler = sampler_summary(manifest)
+        except (ValueError, KeyError, TypeError, OSError) as error:
+            sampler_text = f"INVALID: Sampler Perf results ({error})."
+            degraded = True
+        else:
+            sampler_url = manifest.get("job_url") or build_url
+            sampler_text = sampler["text"] + "\n" + sampler_targets
+            degraded |= sampler["degraded"]
+    else:
+        sampler_text = "MISSING: Sampler Perf manifest was not uploaded."
+        degraded = True
 
     title = f"vllm-rbln {branch} nightly build"
     build_number = urlsplit(build_url).path.rstrip("/").rsplit("/", 1)[-1]
     sections = [
         "*Tests*\n" + "\n".join(tests),
         "*Examples*\n" + examples,
-        f"*Perf*\n{completed}/{planned} cases completed · {chip}",
+        "*Perf*\n" + perf,
     ]
     text = (
         f"{'⚠️' if degraded else '✅'} *{title} <{build_url}|#{build_number}> "
@@ -212,17 +240,42 @@ def build_report(results, *, run_id, chip, build_url, branch, commit):
     )
     blocks = [
         {"type": "section", "text": {"type": "mrkdwn", "text": text}},
-        {
-            "type": "table",
-            "column_settings": [
-                {"align": "right"},
-                {"is_wrapped": True},
-                {"is_wrapped": True},
-                *({"align": "right"} for _ in range(4)),
-            ],
-            "rows": rows,
-        },
     ]
+    if planned:
+        blocks.append(
+            {
+                "type": "table",
+                "column_settings": [
+                    {"align": "right"},
+                    {"is_wrapped": True},
+                    {"is_wrapped": True},
+                    *({"align": "right"} for _ in range(4)),
+                ],
+                "rows": rows,
+            }
+        )
+    sampler_section = f"*Sampler Perf*\n{sampler_text}\n<{sampler_url}|Job and details>"
+    blocks.append(
+        {"type": "section", "text": {"type": "mrkdwn", "text": sampler_section}}
+    )
+    if sampler is not None:
+        blocks.append(
+            {
+                "type": "table",
+                "column_settings": [
+                    {"is_wrapped": True},
+                    {"is_wrapped": True},
+                    {"align": "right"},
+                    {"is_wrapped": True},
+                    *({"align": "right"} for _ in sampler["titles"][4:]),
+                ],
+                "rows": [
+                    [{"type": "raw_text", "text": cell} for cell in row]
+                    for row in [sampler["titles"], *sampler["rows"]]
+                ],
+            }
+        )
+    text += "\n\n" + sampler_section
     annotation = (
         f"**{title} [#{build_number}]({build_url}) ({commit[:8]})**\n\n"
         + "\n\n".join(
@@ -233,6 +286,8 @@ def build_report(results, *, run_id, chip, build_url, branch, commit):
         )
         + "\n\n"
         + "\n".join(markdown)
+        + f"\n\n**Sampler Perf**\n{sampler_text}\n\n[Job and details]({sampler_url})"
+        + ("\n\n" + sampler["markdown"] if sampler is not None else "")
     )
     return (
         {"text": text, "blocks": blocks, "unfurl_links": False, "unfurl_media": False},
@@ -289,16 +344,30 @@ def main():
                 "pytest-results/**/result.json",
                 "example-results/**/results.json",
                 f"perf-results/{args.run_id}/{args.chip}/**/result.json",
+                f"sampler-perf-results/{args.run_id}/{args.chip}/manifest.json",
+                f"ci-targets/{args.run_id}/snapshot.tar.gz",
             ):
+                scope = (
+                    ["--step", "nightly-targets-prepare"]
+                    if pattern.startswith("ci-targets/")
+                    else []
+                )
                 found = subprocess.run(
-                    [agent, "artifact", "search", pattern, "--allow-empty-results"],
+                    [
+                        agent,
+                        "artifact",
+                        "search",
+                        pattern,
+                        "--allow-empty-results",
+                        *scope,
+                    ],
                     check=True,
                     capture_output=True,
                     text=True,
                 )
                 if found.stdout.strip():
                     subprocess.run(
-                        [agent, "artifact", "download", pattern, str(results)],
+                        [agent, "artifact", "download", pattern, str(results), *scope],
                         check=True,
                     )
         payload, annotation, degraded = build_report(

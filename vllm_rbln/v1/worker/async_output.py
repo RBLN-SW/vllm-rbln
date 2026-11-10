@@ -31,6 +31,12 @@ from vllm_rbln.v1.worker.utils import worker_fail_fast
 # sampled token ids per request, and where each request's placeholder landed.
 PendingTokenWriteback = deque[tuple[list[str], list[list[int]], dict[str, int]]]
 
+# Non-output ranks drop their output without get_output(), and torch-rbln frees a
+# pinned buffer at once, pending D2H or not. Hold each copy's tensors here until
+# its event completes instead of blocking on it.
+# TODO(torch-rbln): drop once its pinned allocator defers frees like CUDA's.
+_inflight_d2h: deque[tuple[torch.Event, torch.Tensor, torch.Tensor]] = deque()
+
 
 class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
     def __init__(
@@ -70,20 +76,19 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
         # Start the D2H right behind the sampler, as AsyncGPUModelRunnerOutput
         # does. From get_output() it would queue behind the next forward.
         self._copy_ready_event: torch.Event | None = None
+        while _inflight_d2h and _inflight_d2h[0][0].query():
+            _inflight_d2h.popleft()
         if not sampled_token_ids.is_cpu:
             self._sampled_token_ids_cpu.copy_(sampled_token_ids, non_blocking=True)
             self._copy_ready_event = torch.Event(device=sampled_token_ids.device)
             self._copy_ready_event.record()
+            _inflight_d2h.append(
+                (self._copy_ready_event, sampled_token_ids, self._sampled_token_ids_cpu)
+            )
         # Logprobs ride the same deferral. Only the dense form is free of the
         # tokens: the topk form indexes by the sampled ids, so building it pulls
         # them to the host mid-step and serialises what async just decoupled.
         self._logprobs_tensors = logprobs_tensors
-
-    def __del__(self):
-        # Non-output ranks drop this without get_output(). The pinned buffer is
-        # freed at once, so the pending D2H must land before that.
-        if self._copy_ready_event is not None:
-            self._copy_ready_event.synchronize()
 
     @worker_fail_fast
     def get_output(self) -> ModelRunnerOutput:

@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -15,48 +15,18 @@
 """KV-cache block calculation and synchronisation helpers."""
 
 import math
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
+
+from vllm_rbln.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+
+    from vllm_rbln.config import OptimumRBLNConfig
 else:
     VllmConfig = None
 
-from vllm_rbln.config import OptimumRBLNConfig
-from vllm_rbln.logger import init_logger
-
 logger = init_logger(__name__)
-
-
-def resolve_explicit_num_blocks(
-    num_gpu_blocks_override: int | None,
-    rbln_overrides: dict[str, Any] | None,
-) -> int | None:
-    """Resolve user block counts before vLLM's block-size conversion."""
-    decoder_overrides = rbln_overrides or {}
-    prefix = ""
-    for name in ("language_model", "text_model"):
-        if name in decoder_overrides:
-            decoder_overrides = decoder_overrides[name]
-            prefix = f"{name}."
-            break
-    num_blocks = decoder_overrides.get("kvcache_num_blocks")
-    if num_blocks == 0:
-        num_blocks = None
-    if (
-        num_gpu_blocks_override is not None
-        and num_blocks is not None
-        and num_gpu_blocks_override != num_blocks
-    ):
-        raise ValueError(
-            "Conflicting KV cache block counts: "
-            f"num_gpu_blocks_override={num_gpu_blocks_override}, "
-            f"optimum_overrides.{prefix}kvcache_num_blocks={num_blocks}. "
-            "Specify only one or use matching values."
-        )
-    return (
-        num_gpu_blocks_override if num_gpu_blocks_override is not None else num_blocks
-    )
 
 
 # FIXME This will be refactored with RBLNPrefixKVCacheManager in the future

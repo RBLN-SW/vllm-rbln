@@ -29,8 +29,6 @@ from importlib import metadata
 from pathlib import Path
 from typing import Any
 
-import yaml
-
 # The lanes share a directory, not a package.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -41,6 +39,7 @@ from lane import (  # noqa: E402
     devices_needed,
     download_results,
     host_chip,
+    load_targets,
     measured_pipeline,
     output_dir,
     publish_summary,
@@ -49,8 +48,6 @@ from lane import (  # noqa: E402
     write_repro,
     write_result,
 )
-
-_HERE = Path(__file__).resolve().parent
 
 
 def _facts(payload: dict[str, Any], tasks: list[str]) -> dict[str, str]:
@@ -287,7 +284,7 @@ def main() -> int:
     for action in ("run", "pipeline", "summary"):
         command = commands.add_parser(action)
         command.add_argument("targets", nargs="*", help="target names (default: all)")
-        command.add_argument("--targets-dir", type=Path, default=_HERE / "targets")
+        command.add_argument("--targets-dir", type=Path)
         command.add_argument("--chip", required=action != "run")
         command.add_argument(
             "--run-id",
@@ -299,16 +296,10 @@ def main() -> int:
             command.add_argument("--launch")
         elif action == "summary":
             command.add_argument("--download", action="store_true")
+        elif action == "pipeline":
+            command.add_argument("--snapshot", action="store_true")
     args = parser.parse_args()
-
-    paths = sorted([*args.targets_dir.glob("*.yaml"), *args.targets_dir.glob("*.yml")])
-    if args.targets:
-        wanted = set(args.targets)
-        paths = [p for p in paths if p.stem in wanted]
-        if missing := wanted - {p.stem for p in paths}:
-            parser.error(f"no such target: {', '.join(sorted(missing))}")
-    if not paths:
-        parser.error(f"no targets under {args.targets_dir}")
+    args.targets_dir = args.targets_dir or Path("ci-targets") / args.run_id / "lm-eval"
 
     if args.action == "run":
         chip = host_chip()
@@ -317,12 +308,12 @@ def main() -> int:
         if args.chip is not None and args.chip != chip:
             parser.error(f"expected chip {args.chip}, host reports {chip}")
         args.chip = chip
-    targets = {path.stem: yaml.safe_load(path.read_text()) for path in paths}
-    targets = {
-        name: target
-        for name, target in targets.items()
-        if not target.get("chips") or args.chip in target["chips"]
-    }
+    targets = load_targets(args.targets_dir, args.chip, "lm-eval")
+    if args.targets:
+        wanted = set(args.targets)
+        if missing := wanted - targets.keys():
+            parser.error(f"no such target: {', '.join(sorted(missing))}")
+        targets = {name: target for name, target in targets.items() if name in wanted}
     cases = [
         (name, launch)
         for name, target in targets.items()
@@ -344,6 +335,7 @@ def main() -> int:
             chip=args.chip,
             run_id=args.run_id,
             targets_dir=args.targets_dir,
+            snapshot=args.snapshot,
         )
         print(json.dumps(pipeline))
         return 0

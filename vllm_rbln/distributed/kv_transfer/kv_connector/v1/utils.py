@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -27,6 +27,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
 )
 
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
 
 logger = init_logger(__name__)
 
@@ -56,6 +57,21 @@ class SupportsDeferredLoad(Protocol):
     """
 
     def flush_deferred_load(self) -> None: ...
+
+
+@runtime_checkable
+class SupportsBlockAuxKVCaches(Protocol):
+    """A connector that moves the block-aux caches with their owners' blocks.
+
+    A block-aux cache (`RBLNBlockAuxSpec`) is outside the KV cache config: its block
+    `b` belongs to block `b` of the owner layer's cache, so it moves with the owner
+    group's blocks. The runner calls this before the warm-up, and
+    `register_kv_caches` later hands the caches over under the same names.
+    """
+
+    def register_block_aux_kv_caches(
+        self, specs: dict[str, RBLNBlockAuxSpec]
+    ) -> None: ...
 
 
 def iter_kv_connectors(

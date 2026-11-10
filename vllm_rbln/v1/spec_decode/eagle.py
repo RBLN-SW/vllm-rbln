@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -713,7 +713,11 @@ class RBLNEagleProposer(EagleProposer):
             num_reqs=num_reqs,
             num_reqs_padded=num_reqs if is_prefill else num_reqs_padded,
             query_len=input_ids.shape[1],
-            query_len_padded=self.max_num_tokens if is_prefill else input_ids.shape[1],
+            query_len_padded=(
+                self.vllm_config.additional_config.prefill_chunk_size
+                if is_prefill
+                else input_ids.shape[1]
+            ),
         )
         staged = self.input_stager.stage(
             input_ids=input_ids,

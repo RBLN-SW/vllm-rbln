@@ -496,6 +496,41 @@ class TestRegisterKvCaches:
             RegionGeometry(ChipletSplitAxis.HEAD, 1, (AreaPlace(0x1000, 2048, 0),)),
             RegionGeometry(ChipletSplitAxis.HEAD, 1, (AreaPlace(0x2000, 2048, 0),)),
         ]
+        # The same check reads which regions are latents: none, here.
+        assert worker._logical_region_latent == [False, False]
+
+    def test_host_staging_records_a_latent_as_attention(self, monkeypatch):
+        # A latent whose page size matches gets past host staging's refusal,
+        # and the per-head check still has to read it as attention here.
+        worker = build_worker(
+            monkeypatch,
+            kv_buffer_device="cpu",
+            nixl_available=True,
+            layer_names=("l0", "l1"),
+        )
+        worker.nixl_wrapper = "wrapper"
+        latent = MagicMock(spec=MLAAttentionSpec)
+        latent.page_size_bytes = 4096
+        latent.num_kv_heads = 1
+        # Packed attention beside it: one region a layer, as a latent is.
+        worker._layer_specs = {"l0": _impl_layer_spec(), "l1": latent}
+        worker.block_len_per_layer = [4096] * 2
+        worker.tp_rank = 0
+        worker.kv_caches_base_addr = {
+            worker.engine_id: {worker.tp_rank: [0x1000, 0x2000]}
+        }
+        monkeypatch.setattr(
+            sys.modules["nixl_rbln"],
+            "ensure_rbln_backend",
+            lambda wrapper, device_id=0, **kw: None,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            NixlBaseConnectorWorker, "register_kv_caches", lambda self, kv: None
+        )
+        worker.register_kv_caches({"l0": "tensor", "l1": "tensor"})
+
+        assert worker._logical_region_latent == [False] * 2
 
     def test_host_staging_publishes_one_hash_across_pipeline_stages(self, monkeypatch):
         # This path keeps upstream's registration, whose hash takes the rank's
@@ -956,7 +991,7 @@ class TestRegisterKvCachesImpl:
 
         # Registration itself still serves.
         assert worker._logical_region_kv_heads == [None] * 4
-        with pytest.raises(AssertionError, match="no head band"):
+        with pytest.raises(RuntimeError, match="no head band"):
             worker._region_kv_heads(0)
 
     def test_two_models_sharing_a_per_rank_share_of_one_is_refused(self, monkeypatch):
@@ -1237,6 +1272,20 @@ class TestRegisterKvCachesImpl:
             worker._register_kv_caches_impl(kv_caches)
 
         worker.nixl_wrapper.register_memory.assert_not_called()
+
+    def test_a_latent_takes_no_head_band_where_one_head_a_rank_would_fit_one(
+        self, monkeypatch
+    ):
+        # At TP8 an 8-head model's rank holds one head, which is also what a
+        # latent reports.
+        worker = _prep_impl_worker(monkeypatch)
+        worker.world_size = 8
+        worker.model_config.get_total_num_kv_heads.return_value = 8
+        latent = MagicMock(spec=MLAAttentionSpec)
+        latent.num_kv_heads = 1
+        worker._layer_specs = {"l1": latent}
+
+        assert worker._layer_kv_heads("l1") is None
 
     def test_cross_layer_blocks_with_differing_page_sizes_are_rejected(
         self, monkeypatch
@@ -1926,6 +1975,8 @@ class TestPublishHandshakeMetadata:
         w._kv_per_block = 1
         w.kv_buffer_device = "cpu"
         w._has_mamba = False
+        w._block_state_layers = set()
+        w._block_aux_specs = {}
         w._use_rbln_nixl_backend = False
         w.xfer_handshake_metadata = MagicMock(
             agent_metadata_bytes=msgspec.msgpack.encode(self._base_meta())
@@ -2249,7 +2300,7 @@ class TestTheLayoutReachesTheDescriptors:
         # Both sides name whole blocks, so the layout does not matter.
         w = self._worker(PACKED)
         _, pieces = w._head_matched_plan(self._peer(1), 0, 1)
-        assert pieces == [[Piece(0, 0, 0, 256, 2 * 8)]]
+        assert pieces == [[Piece(0, 0, 0, 256, 2 * 8, (0, 16))]]
 
     def test_a_split_alone_keeps_the_handler_off_upstream_s_fast_path(self):
         # `register_local_xfer_handler` hands a whole-engine peer to upstream's
@@ -2257,7 +2308,9 @@ class TestTheLayoutReachesTheDescriptors:
         # narrowed: upstream names a block once and our list names it per range.
         w = self._worker(PACKED)
         w.local_seen_layer_names = ["layer.0"]
-        pieces = [[Piece(0, 0, 0, 128, 8), Piece(128, 0, 128, 128, 8)]]
+        pieces = [
+            [Piece(0, 0, 0, 128, 8, (0, 16)), Piece(128, 0, 128, 128, 8, (0, 16))]
+        ]
 
         with patch.object(
             RblnNixlPullConnectorWorker, "_register_shard_local_xfer_handler"
@@ -2371,7 +2424,7 @@ class TestTailBlockTrim:
         )
 
         assert [worker._region_span_index(r) for r in range(4)] == [0, 0, 1, 1]
-        assert [first for first, _, _ in worker._chunk_grid.regions[:4]] == [0, 0, 4, 4]
+        assert [first for first, _, _ in worker._chunk_grid.entries[:4]] == [0, 0, 4, 4]
 
     def test_areas_that_do_not_divide_the_block_are_refused(self, monkeypatch):
         # 6 tokens over 4 areas: no area is a whole number of them.

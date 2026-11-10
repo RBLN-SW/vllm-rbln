@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -30,6 +30,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_transfer_topology im
     RblnTransferTopology,
 )
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
 
 logger = init_logger(__name__)
 
@@ -40,21 +41,24 @@ RequestTail = tuple[int | None, int | None, tuple[tuple[int, tuple[int, int]], .
 
 
 class ChunkGrid(NamedTuple):
-    """How a chunk range cuts one descriptor list's regions.
+    """How a chunk range cuts one descriptor list's regions, or, for a peer of
+    another TP degree, its entries, each one token range of a region.
 
-    One chunk width serves the whole engine, so a block is `chunks_per_block`
-    chunks in every region however the compiler spread its tokens: an area of
-    a context cut holds a window of them, a region of a head cut all of them.
-    Regions still differ in how many runs a chunk is, which is why the range
-    is indexed by a running sum rather than a stride.
+    One chunk width serves the whole list, so a block is `chunks_per_block`
+    chunks in every entry however the compiler spread its tokens: an area of
+    a context cut holds a window of them, a region of a head cut all of them,
+    and an entry split off a region on the peer's token ranges one range, as
+    a head cut meeting a context cut, or a latent in fewer ranges than the
+    peer's, is split. Entries still differ in how many runs a chunk is, so
+    the range is indexed by a running sum of them.
     """
 
     chunks_per_block: int
-    #: Per region of the list, in its order: (the first chunk of a block it
+    #: Per entry of the list, in its order: (the first chunk of a block it
     #: holds, byte runs one chunk of it is, chunks it holds). Runs are 0 where
-    #: the region holds one chunk or part of one: its whole-block descriptor
+    #: the entry holds one chunk or part of one: its whole-block descriptor
     #: names that, so the range carries nothing for it.
-    regions: tuple[tuple[int, int, int], ...]
+    entries: tuple[tuple[int, int, int], ...]
 
 
 class AreaPlace(NamedTuple):
@@ -79,6 +83,20 @@ class RegionGeometry(NamedTuple):
     areas: tuple[AreaPlace, ...]
 
 
+class AreaRect(NamedTuple):
+    """What one chiplet area holds of one logical region's block.
+
+    Inside one of K and V the area lays its heads outermost and each head's
+    tokens inside it, so a token range of one head is one contiguous run of
+    bytes.
+    """
+
+    #: `[lo, hi)` in model-wide KV heads.
+    heads: tuple[int, int]
+    #: `[lo, hi)` in tokens of the block.
+    tokens: tuple[int, int]
+
+
 class Piece(NamedTuple):
     """One contiguous range on each side of a transfer, per block."""
 
@@ -88,22 +106,14 @@ class Piece(NamedTuple):
     length: int
     #: The `(K/V, head)` rows the piece is, each a run a token chunk cuts.
     rows: int
-
-
-def area_heads(
-    slices: int, slice_id: int, *, first_head: int, heads: int
-) -> tuple[int, int]:
-    """`[lo, hi)` in model-wide KV heads of a slice of a rank's `heads` from
-    `first_head`."""
-    per_slice = heads // slices
-    lo = first_head + slice_id * per_slice
-    return lo, lo + per_slice
+    #: `[lo, hi)` in tokens of the block, the same on both sides.
+    tokens: tuple[int, int]
 
 
 def pair_area(
-    local: tuple[int, int],
+    local: AreaRect,
     local_page: int,
-    peer_areas: Sequence[tuple[int, tuple[int, int], int]],
+    peer_areas: Sequence[tuple[int, AreaRect, int]],
     *,
     kv_per_block: int,
     every_holder: bool,
@@ -111,79 +121,103 @@ def pair_area(
 ) -> list[Piece]:
     """The pieces one local area exchanges with one peer rank's areas.
 
-    `local` and each peer area are a `[lo, hi)` of model-wide KV heads, and
-    `peer_areas` is `(region id, heads, block length)` per area. A piece is
-    where two areas' heads overlap, one range of heads on both sides, and K
-    with V merge into one piece where both sides hold the same heads. Areas
-    holding the same heads are replicas: a read takes the first, a write every
-    one.
+    `peer_areas` is `(region id, rectangle, block length)` per area. A piece
+    is the intersection of two rectangles, so it is one run per head on both
+    sides; heads merge into one piece where both sides hold the same token
+    range, and K with V where both sides hold the same rectangle. Areas
+    holding the same rectangle are replicas: a read takes the first, a write
+    every one.
 
-    Ordered by peer heads, then holder, then K/V -- the order both descriptor
-    lists are built in.
+    Ordered by peer rectangle, then head run, then holder, then K/V -- the
+    order both descriptor lists are built in.
     """
-    lh0, lh1 = local
-    holders: dict[tuple[int, int], list[tuple[int, int]]] = {}
-    for region, heads, page in peer_areas:
-        holders.setdefault(heads, []).append((region, page))
+    (lh0, lh1), (lt0, lt1) = local
+    holders: dict[AreaRect, list[tuple[int, int]]] = {}
+    for region, rect, page in peer_areas:
+        holders.setdefault(rect, []).append((region, page))
     pieces: list[Piece] = []
     covered = 0
-    for heads in sorted(holders):
-        rh0, rh1 = heads
+    for rect in sorted(holders):
+        (rh0, rh1), (rt0, rt1) = rect
         h0, h1 = max(lh0, rh0), min(lh1, rh1)
-        if h0 >= h1:
+        t0, t1 = max(lt0, rt0), min(lt1, rt1)
+        if h0 >= h1 or t0 >= t1:
             continue
-        covered += h1 - h0
-        for remote_region, page in (
-            holders[heads] if every_holder else holders[heads][:1]
-        ):
-            if heads == local:
-                if page != local_page:
+        covered += (h1 - h0) * (t1 - t0)
+        whole = rect == local
+        same_tokens = (t0, t1) == (lt0, lt1) == (rt0, rt1)
+        runs = [(h0, h1)] if same_tokens else [(h, h + 1) for h in range(h0, h1)]
+        for run_lo, run_hi in runs:
+            for remote_region, page in (
+                holders[rect] if every_holder else holders[rect][:1]
+            ):
+                if whole:
+                    if page != local_page:
+                        raise RuntimeError(
+                            f"RBLN NIXL D2D: peer region {remote_region} holds what "
+                            f"local region {region_id} does in {page}B a "
+                            f"block, against {local_page}B here."
+                        )
+                    pieces.append(
+                        Piece(
+                            0,
+                            remote_region,
+                            0,
+                            local_page,
+                            kv_per_block * (run_hi - run_lo),
+                            (t0, t1),
+                        )
+                    )
+                    continue
+                if page % kv_per_block:
                     raise RuntimeError(
-                        f"RBLN NIXL D2D: peer region {remote_region} holds the same "
-                        f"heads as local region {region_id} in {page}B a block, "
-                        f"against {local_page}B here."
+                        f"RBLN NIXL D2D: peer region {remote_region} block length "
+                        f"{page}B does not divide into {kv_per_block} range(s) "
+                        "of K and V."
                     )
-                pieces.append(
-                    Piece(0, remote_region, 0, local_page, kv_per_block * (h1 - h0))
-                )
-                continue
-            if page % kv_per_block:
-                raise RuntimeError(
-                    f"RBLN NIXL D2D: peer region {remote_region} block length "
-                    f"{page}B does not divide into {kv_per_block} range(s) "
-                    "of K and V."
-                )
-            half_l, half_r = local_page // kv_per_block, page // kv_per_block
-            if half_r % (rh1 - rh0):
-                raise RuntimeError(
-                    f"RBLN NIXL D2D: region {remote_region}'s {half_r}B does not "
-                    f"split into {rh1 - rh0} heads."
-                )
-            head_l, head_r = half_l // (lh1 - lh0), half_r // (rh1 - rh0)
-            if head_l != head_r:
-                raise RuntimeError(
-                    f"RBLN NIXL D2D: a KV head is {head_l}B a block in local "
-                    f"region {region_id} and {head_r}B in peer region "
-                    f"{remote_region}."
-                )
-            length = (h1 - h0) * head_l
-            off_l, off_r = (h0 - lh0) * head_l, (h0 - rh0) * head_r
-            for kv in range(kv_per_block):
-                pieces.append(
-                    Piece(
-                        kv * half_l + off_l,
-                        remote_region,
-                        kv * half_r + off_r,
-                        length,
-                        h1 - h0,
+                half_l, half_r = local_page // kv_per_block, page // kv_per_block
+                if half_r % (rh1 - rh0):
+                    raise RuntimeError(
+                        f"RBLN NIXL D2D: region {remote_region}'s {half_r}B does "
+                        f"not split into {rh1 - rh0} heads."
                     )
-                )
-    if covered != lh1 - lh0:
-        offered = ", ".join(f"{h0}..{h1 - 1}" for h0, h1 in sorted(holders))
+                head_l, head_r = half_l // (lh1 - lh0), half_r // (rh1 - rh0)
+                if head_l * (rt1 - rt0) != head_r * (lt1 - lt0):
+                    raise RuntimeError(
+                        f"RBLN NIXL D2D: a KV head is {head_l}B a block over "
+                        f"{lt1 - lt0} token(s) in local region {region_id} and "
+                        f"{head_r}B over {rt1 - rt0} in peer region {remote_region}."
+                    )
+                if same_tokens:
+                    length = (run_hi - run_lo) * head_l
+                    off_l = (run_lo - lh0) * head_l
+                    off_r = (run_lo - rh0) * head_r
+                else:
+                    # Exact: ours by the cache's own shape, the peer's by the
+                    # per-token check above.
+                    token_l, token_r = head_l // (lt1 - lt0), head_r // (rt1 - rt0)
+                    length = (t1 - t0) * token_l
+                    off_l = (run_lo - lh0) * head_l + (t0 - lt0) * token_l
+                    off_r = (run_lo - rh0) * head_r + (t0 - rt0) * token_r
+                for kv in range(kv_per_block):
+                    pieces.append(
+                        Piece(
+                            kv * half_l + off_l,
+                            remote_region,
+                            kv * half_r + off_r,
+                            length,
+                            run_hi - run_lo,
+                            (t0, t1),
+                        )
+                    )
+    if covered != (lh1 - lh0) * (lt1 - lt0):
+        offered = ", ".join(
+            f"{h0}..{h1 - 1} x {t0}..{t1 - 1}" for (h0, h1), (t0, t1) in sorted(holders)
+        )
         raise RuntimeError(
-            f"RBLN NIXL D2D: local region {region_id} holds heads {lh0}..{lh1 - 1}, "
-            f"and part of that is outside the peer's range: the areas offered "
-            f"({offered}) do not cover it exactly once."
+            f"RBLN NIXL D2D: local region {region_id} holds heads {lh0}..{lh1 - 1} "
+            f"over tokens {lt0}..{lt1 - 1}, and part of that is outside the peer's "
+            f"range: the areas offered ({offered}) do not cover it exactly once."
         )
     return pieces
 
@@ -210,7 +244,8 @@ def kv_chunk_tokens(
     Args:
         block_tokens: tokens one block holds.
         span_tokens: the token range one descriptor of each region covers -- a
-            block, or one chiplet area's range where a context cut gives it one.
+            block, or one chiplet area's range where a context cut gives it one,
+            and the token range each entry holds.
         prefill_step_tokens: ``max_num_batched_tokens``. Named for the step
             rather than the chunk it is, because the chunk this returns is the
             other one and the two are compared here.
@@ -342,6 +377,9 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
     #: names no run.
     _logical_region_local_heads: list[int | None]
     local_seen_layer_names: list[str]
+    _block_state_layers: set[str]
+    _block_state_groups: set[int]
+    _block_aux_specs: dict[str, RBLNBlockAuxSpec]
     compat_hash: str | None
 
     _remote_shard_layer_names: defaultdict[str, dict[int, tuple[str, ...]]]
@@ -350,11 +388,11 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
     src_xfer_handles_by_remote: dict[tuple[str, int, int], int]
     _borrowed_src_handles: set[tuple[str, int, int]]
     _shard_region_group_ids: dict[tuple[str, int], tuple[int, ...]]
-    #: Per peer shard, descriptors a block of each region of its list is.
+    #: Per peer shard, descriptors a block of each entry of its list is.
     _shard_descs_per_block: dict[tuple[str, int], tuple[int, ...]]
     _shard_chunk_grids: dict[tuple[str, int], ChunkGrid | None]
-    #: Per peer shard, which token range of a block each region of its list
-    #: holds (`_region_span_index`).
+    #: Per peer shard, which token range of a block the region of each entry
+    #: of its list holds (`_region_span_index`).
     _shard_region_spans: dict[tuple[str, int], tuple[int, ...]]
     _chunk_grid: ChunkGrid | None
     #: `_window_grid()` for this engine, parked so a transfer does
@@ -589,15 +627,21 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         *,
         block_size: int,
         rows: Sequence[int] | None = None,
+        token_ranges: Sequence[tuple[int, int]] | None = None,
     ) -> ChunkGrid | None:
         """The chunk range over a list of `region_ids`, in that order.
 
-        The runs are `rows` per region where a peer pairing cut each into
-        pieces (`Piece.rows`), and otherwise `_block_runs`; the chunk is what a
-        prefill step leaves of the block, at a width that cuts every region's
-        span or takes several whole. None where every region's span is one
-        chunk -- what a step at or above one asks for -- so neither list grows.
-        None off chunk mode too: a streamed write on its own sends whole blocks.
+        Each entry holds a token range of the block, at `rows` byte runs a
+        range: where a peer pairing cut the regions into pieces, its
+        `token_ranges` (`Piece.tokens`) and `rows` (`Piece.rows`), and
+        otherwise the area's span and `_block_runs`. The chunk is what a
+        prefill step leaves of the block, at a width that cuts every span and
+        range or takes it whole, and an entry is placed by its range, which
+        starts at a multiple of its width since one side's ranges nest in the
+        other's. None where every one of our spans is one chunk, as a step at
+        or above one asks, so neither list grows, even where entries are finer
+        than our spans; None off chunk mode too: a streamed write on its own
+        sends whole blocks.
         """
         if not self._shape.cuts_a_block:
             return None
@@ -606,9 +650,23 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
             assert block_size % spans == 0, (
                 f"RBLN NIXL: {spans} span(s) do not tile a {block_size}-token block"
             )
+        if token_ranges is None:
+            assert rows is None, "rows describe pieces, which come with token ranges"
+            token_ranges, rows = [], []
+            for region_id in region_ids:
+                spans, runs = cuts[region_id // self._kv_areas]
+                lo = self._region_span_index(region_id) * (block_size // spans)
+                token_ranges.append((lo, lo + block_size // spans))
+                rows.append(runs)
+        assert rows is not None and len(rows) == len(token_ranges) == len(region_ids), (
+            f"{len(region_ids)} entries, rows {rows}, token ranges {token_ranges}"
+        )
         chunk_tokens = kv_chunk_tokens(
             block_tokens=block_size,
-            span_tokens=sorted({block_size // spans for spans, _ in cuts}),
+            span_tokens=sorted(
+                {block_size // spans for spans, _ in cuts}
+                | {hi - lo for lo, hi in token_ranges}
+            ),
             prefill_step_tokens=(
                 self.vllm_config.scheduler_config.max_num_batched_tokens
             ),
@@ -617,18 +675,22 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         chunks_per_block = block_size // chunk_tokens
         if all(spans == chunks_per_block for spans, _ in cuts):
             return None
-        regions = []
-        for i, region_id in enumerate(region_ids):
-            spans, runs = cuts[region_id // self._kv_areas]
-            if rows is not None:
-                runs = rows[i]
-            span = self._region_span_index(region_id)
-            if spans >= chunks_per_block:
-                regions.append((span * chunks_per_block // spans, 0, 1))
-                continue
-            chunks = chunks_per_block // spans
-            regions.append((span * chunks, runs, chunks))
-        return ChunkGrid(chunks_per_block, tuple(regions))
+        # The width was picked to cut each range or take it whole, and a range
+        # starts at a multiple of its length or of a chunk.
+        assert all(
+            ((hi - lo) % chunk_tokens == 0 or chunk_tokens % (hi - lo) == 0)
+            and lo % min(hi - lo, chunk_tokens) == 0
+            for lo, hi in token_ranges
+        ), f"{chunk_tokens}-token chunks against token ranges {token_ranges}"
+        return ChunkGrid(
+            chunks_per_block,
+            tuple(
+                (lo // chunk_tokens, 0, 1)
+                if hi - lo <= chunk_tokens
+                else (lo // chunk_tokens, runs, (hi - lo) // chunk_tokens)
+                for (lo, hi), runs in zip(token_ranges, rows)
+            ),
+        )
 
     def _block_runs(self) -> list[tuple[int, int]]:
         """Per logical region, `(token spans a block is cut into, byte runs one
@@ -813,7 +875,7 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         # derived from is the block size this list was built with.
         grid = self._shard_chunk_grid(range(len(ranges)), block_size=block_size)
         if grid is not None:
-            grids.append([(runs, chunks) for _, runs, chunks in grid.regions])
+            grids.append([(runs, chunks) for _, runs, chunks in grid.entries])
         descs_data = np.concatenate(
             [
                 self._chunk_range_descs(ranges, num_blocks=num_blocks, grids=g)
@@ -852,11 +914,11 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
     ) -> tuple[int, np.ndarray]:
         """Prepare this shard's local descriptors, optionally twice over.
 
-        `pieces` is, per region, the ranges a peer of another TP degree pairs
-        it in (`pair_area`); None names every region whole. A piece sent to
+        `pieces` is, per entry, the ranges a peer of another TP degree pairs
+        its region in (`pair_area`); None names every region whole. A piece sent to
         several replicas repeats here while the remote list advances.
 
-        `chunk_grid` says, per region, how many byte runs one piece is spread
+        `chunk_grid` says, per entry, how many byte runs one piece is spread
         over and how many token chunks each run is cut into. Given, a second
         range of descriptors follows the first over the same addresses, naming
         those chunks -- the shape `swa_window_mode` already uses for a shorter
@@ -876,7 +938,7 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
             assert len(pieces) == len(region_ids)
             assert block_size_ratio == 1
 
-        # Per region, `(offset, length)` of each piece of a block.
+        # Per entry, `(offset, length)` of each piece of a block.
         ranges: list[np.ndarray] = []
         for i, region_id in enumerate(region_ids):
             if pieces is None:
@@ -894,8 +956,8 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         # itself, so the first pass is what this built before `chunk_grid`.
         passes = [[(1, 1)] * len(region_ids)]
         if chunk_grid is not None:
-            assert len(chunk_grid.regions) == len(region_ids)
-            passes.append([(runs, chunks) for _, runs, chunks in chunk_grid.regions])
+            assert len(chunk_grid.entries) == len(region_ids)
+            passes.append([(runs, chunks) for _, runs, chunks in chunk_grid.entries])
         blocks = np.arange(num_blocks, dtype=np.uint64)[:, None]
         for grids in passes:
             for region_id, span, grid in zip(region_ids, ranges, grids):
@@ -918,7 +980,7 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
                 len(descs_data),
                 len(descs_data) - whole,
                 chunk_grid.chunks_per_block,
-                sorted({(runs, chunks) for _, runs, chunks in chunk_grid.regions}),
+                sorted({(runs, chunks) for _, runs, chunks in chunk_grid.entries}),
             )
         descs = self.nixl_wrapper.get_xfer_descs(descs_data, self.nixl_memory_type)
         return (
