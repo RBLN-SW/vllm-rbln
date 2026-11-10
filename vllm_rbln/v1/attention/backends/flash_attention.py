@@ -153,6 +153,7 @@ class RBLNFlashAttentionMetadata:
     # For RBLN Attention
     is_prefill: bool
     attn_masks: torch.Tensor | None = None
+    mm_prefix_row_ends: torch.Tensor | None = None
     kv_caches: list[torch.Tensor] | None = None
     kv_cache_view_infos: list[KVCacheViewInfo] | None = None
 
@@ -160,8 +161,6 @@ class RBLNFlashAttentionMetadata:
     cache_seq_lens: torch.Tensor | None = None
     cache_offsets: torch.Tensor | None = None
     local_block_tables: torch.Tensor | None = None
-    # The shift op's decode mask, or the prefill mask of an mm prefix LM in the
-    # append op's key frame.
     # TODO(RBLN): fold into `attn_masks`. A builder serves one KV cache group,
     # so sliding layers never read `attn_masks`; a sliding group then has to
     # skip the non-causal full-width mask it builds today.
@@ -283,13 +282,10 @@ class RBLNFlashAttentionMetadataBuilder(
         num_accepted: torch.Tensor | None = None,
         state_load_pos: torch.Tensor | None = None,
         mm_prefix_row_ends: torch.Tensor | None = None,
-        swa_masks: dict[tuple[int, int], torch.Tensor] | None = None,
     ) -> RBLNFlashAttentionMetadata:
         """`mm_prefix_row_ends`, on a prefill of an mm prefix LM, holds for each
         padded row of the step the last step-local row it may read: itself, or
-        its range's last position for an mm row. None on any other step.
-        `swa_masks` is the step's staged masks by (window, block size), shared
-        by its sliding builders."""
+        its range's last position for an mm row. None on any other step."""
         num_reqs = common_attn_metadata.num_reqs
         # NOTE(RBLN): vllm-rbln keeps attention metadata on the host and copies
         # to the device only when constructing RBLNFlashAttentionMetadata below.
@@ -381,35 +377,12 @@ class RBLNFlashAttentionMetadataBuilder(
 
             local_block_tables = block_tables_tensor[..., :1]
 
-        if mm_prefix_row_ends is not None and self.swa_appends:
-            # HF's AND(sliding_window, OR(causal, same range)) over the strip of
-            # blocks sliding_window_attention_v1 reads: a row reads keys up to
-            # its row end, inside the window.
-            assert is_prefill and num_reqs == 1 and swa_masks is not None
-            window = self.kv_cache_spec.sliding_window
-            if (swa_attn_masks := swa_masks.get((window, self.block_size))) is None:
-                query_len = mm_prefix_row_ends.numel()
-                start = int(seq_idx[0])
-                num_blocks = (
-                    window + query_len - 1 + self.block_size - 1
-                ) // self.block_size + 1
-                first_key = (
-                    max(start - window + 1, 0) // self.block_size * self.block_size
-                )
-                row = torch.arange(query_len).view(-1, 1)
-                key = first_key - start + torch.arange(num_blocks * self.block_size)
-                keep = (key <= mm_prefix_row_ends.view(-1, 1)) & (key > row - window)
-                swa_attn_masks = self._stage(
-                    keep.to(self.model_config.dtype).view(1, 1, query_len, -1),
-                    "swa_attn_masks",
-                )
-                swa_masks[(window, self.block_size)] = swa_attn_masks
-
         attn_metadata = RBLNFlashAttentionMetadata(
             seq_lens=self._stage(seq_idx, "seq_idx"),
             block_tables=self._stage(block_tables_tensor, "block_tables"),
             is_prefill=is_prefill,
             attn_masks=self._stage(attn_masks, "attn_masks"),
+            mm_prefix_row_ends=self._stage(mm_prefix_row_ends, "mm_prefix_row_ends"),
             swa_appends=self.swa_appends,
             cache_seq_lens=self._stage(cache_seq_lens, "cache_seq_lens"),
             cache_offsets=self._stage(cache_offsets, "cache_offsets"),
@@ -628,6 +601,27 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         # attn_output = [batch,H,4,L,D]
         if self.sliding_window is not None:
             if attn_metadata.swa_appends:
+                attn_mask = None
+                if attn_metadata.mm_prefix_row_ends is not None and layer.use_mm_prefix:
+                    assert attn_metadata.is_prefill and b_size == 1
+                    window = self.sliding_window
+                    block_size = kv_cache.size(-2)
+                    num_blocks = (window + q_len - 1 + block_size - 1) // block_size + 1
+                    start = attn_metadata.seq_lens.reshape(1, 1)
+                    first_key = (
+                        torch.clamp(start - window + 1, min=0)
+                        // block_size
+                        * block_size
+                    )
+                    row = torch.arange(q_len, device=query.device).view(-1, 1)
+                    key_positions = (
+                        first_key
+                        - start
+                        + torch.arange(num_blocks * block_size, device=query.device)
+                    )
+                    row_ends = attn_metadata.mm_prefix_row_ends.view(-1, 1)
+                    keep = (key_positions <= row_ends) & (key_positions > row - window)
+                    attn_mask = keep.to(query.dtype).view(1, 1, q_len, -1)
                 # `seq_lens` is the absolute position the chunk starts at, not
                 # a length: the op resolves the window's blocks from it and the
                 # whole table.
@@ -641,7 +635,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     attn_metadata.block_tables,
                     self.sliding_window,
                     self.sinks,
-                    attn_mask=attn_metadata.swa_attn_masks,
+                    attn_mask=attn_mask,
                     is_prompt_sorted=attn_metadata.is_prompt_sorted,
                 )
             else:

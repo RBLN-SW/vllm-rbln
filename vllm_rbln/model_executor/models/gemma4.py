@@ -26,6 +26,7 @@ from transformers import BatchFeature
 from transformers.models.gemma4.modeling_gemma4 import apply_multidimensional_rope
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
+from vllm.model_executor.models.gemma4 import Gemma4Attention
 from vllm.model_executor.models.gemma4_mm import (
     _SUPPORTED_SOFT_TOKENS,
     Gemma4DummyInputsBuilder,
@@ -204,6 +205,9 @@ class RBLNGemma4ForConditionalGeneration(
                 "Gemma4 does not support speculative decoding on RBLN yet."
             )
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        for module in self.modules():
+            if isinstance(module, Gemma4Attention):
+                module.attn.use_mm_prefix &= module.is_sliding
         cap = mm_soft_token_cap(
             MULTIMODAL_REGISTRY.create_processor(vllm_config.model_config).info
         )

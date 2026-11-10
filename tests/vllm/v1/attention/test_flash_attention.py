@@ -14,6 +14,7 @@
 
 
 from dataclasses import fields
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -559,7 +560,19 @@ class TestBuildMmPrefixSlidingWindow:
     chunk and comparing it with dense attention under HF Gemma4's sliding rule:
     AND(window, OR(causal, same mm prefix range))."""
 
-    WINDOW, BLOCK, HEADS, GROUPS, DIM = 8, 4, 2, 2, 8
+    WINDOW, BLOCK, HEADS, GROUPS, DIM = 8, 4, 2, 2, 32
+
+    def test_only_row_ends_are_staged(self, cfg):
+        row_ends = torch.tensor([0, 3, 3, 3, 4, 5, 6, 7])
+        md = self._builder(cfg).build(
+            _cam(num_reqs=1, query_start_loc=[0, 6], seq_lens=[6], block_table=[[1]]),
+            torch.arange(6),
+            batch_pad=1,
+            is_prefill=True,
+            mm_prefix_row_ends=row_ends,
+        )
+        assert md.swa_attn_masks is None
+        assert torch.equal(md.mm_prefix_row_ends, row_ends)
 
     def _builder(self, cfg):
         spec = make_attention_spec(
@@ -582,7 +595,7 @@ class TestBuildMmPrefixSlidingWindow:
         logits = (q @ k.transpose(-1, -2) * scale).masked_fill(~keep, float("-inf"))
         return logits.softmax(-1) @ v
 
-    def _outputs(self, cfg, chunks, mm_ranges, *, padding=3, masked=True):
+    def _outputs(self, cfg, chunks, mm_ranges, *, padding=3, masked=True, backend=None):
         """q, k, v, scale and each chunk's output over its padded rows."""
         torch.manual_seed(0)
         n = chunks[-1][1]
@@ -594,6 +607,17 @@ class TestBuildMmPrefixSlidingWindow:
         kv_cache = torch.zeros(num_blocks, 2, self.HEADS, 1, self.BLOCK, self.DIM)
         block_table = torch.randperm(num_blocks - 1)[: n // self.BLOCK + 2] + 1
         builder = self._builder(cfg)
+        impl = make_impl(
+            cfg,
+            num_heads=self.HEADS * self.GROUPS,
+            num_kv_heads=self.HEADS,
+            head_size=self.DIM,
+            scale=self.DIM**-0.5,
+            sliding_window=self.WINDOW,
+        )
+        forward = impl.forward
+        if backend is not None:
+            forward = torch.compile(forward, backend=backend, fullgraph=True)
         outputs = []
         for s, e in chunks:
             query_len = e - s + padding
@@ -620,21 +644,43 @@ class TestBuildMmPrefixSlidingWindow:
                 batch_pad=1,
                 is_prefill=True,
                 mm_prefix_row_ends=row_ends,
-                swa_masks={},
             )
-            assert md.swa_attn_masks.shape[-2] == query_len
+            assert md.swa_attn_masks is None
+            qs, ks, vs = (
+                chunk(t).reshape(-1, query_len, self.DIM).transpose(0, 1)
+                for t in (q, k, v)
+            )
+            output = torch.empty_like(qs)
+            forward(
+                SimpleNamespace(use_mm_prefix=masked),
+                qs,
+                ks,
+                vs,
+                kv_cache,
+                md,
+                output,
+            )
             outputs.append(
-                flash_attention.sliding_window_attention_v1(
-                    *(chunk(t) for t in (q, k, v)),
-                    kv_cache,
-                    md.seq_lens,
-                    scale,
-                    md.block_tables,
-                    self.WINDOW,
-                    attn_mask=md.swa_attn_masks if masked else None,
+                output.transpose(0, 1).reshape(
+                    1, self.HEADS, self.GROUPS, query_len, self.DIM
                 )
             )
         return q, k, v, scale, outputs
+
+    def test_row_ends_and_start_stay_dynamic_in_one_graph(self, cfg):
+        graphs = []
+
+        def backend(graph, inputs):
+            graphs.append(graph)
+            return graph.forward
+
+        chunks = [(0, 8), (8, 16), (16, 24)]
+        ranges = [(1, 6), (10, 16)]
+        q, k, v, scale, outputs = self._outputs(cfg, chunks, ranges, backend=backend)
+        expected = self._dense(q, k, v, scale, ranges)
+        actual = torch.cat([out[..., :8, :] for out in outputs], dim=-2)
+        torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+        assert len(graphs) == 1
 
     def _run(self, cfg, chunks, mm_ranges, *, checked=None):
         q, k, v, scale, outputs = self._outputs(cfg, chunks, mm_ranges)
@@ -689,46 +735,8 @@ class TestBuildMmPrefixSlidingWindow:
             batch_pad=1,
             is_prefill=True,
             mm_prefix_row_ends=torch.arange(8),
-            swa_masks={},
         )
         assert md.swa_attn_masks is None
-
-    def test_the_sliding_groups_of_a_step_share_one_staged_mask(self, cfg):
-        args = (
-            _cam(num_reqs=1, query_start_loc=[0, 6], seq_lens=[6], block_table=[[1]]),
-            torch.arange(6),
-        )
-        swa_masks: dict[tuple[int, int], torch.Tensor] = {}
-        kwargs = dict(
-            batch_pad=1,
-            is_prefill=True,
-            mm_prefix_row_ends=torch.arange(8),
-            swa_masks=swa_masks,
-        )
-        first = self._builder(cfg).build(*args, **kwargs)
-        second = self._builder(cfg).build(*args, **kwargs)
-        full = make_builder(cfg).build(*args, **kwargs)
-
-        assert second.swa_attn_masks is first.swa_attn_masks
-        assert full.swa_attn_masks is None
-
-    @pytest.mark.parametrize("enforce_eager", [True, False])
-    def test_the_mask_takes_the_model_dtype(self, enforce_eager):
-        cfg = make_vllm_config(
-            max_model_len=MAX_LEN, max_num_batched_tokens=CHUNK, dtype="bfloat16"
-        )
-        builder = self._builder(cfg)
-        # Eager needs device tensors to build a config; only the builder reads it.
-        builder.enforce_eager = enforce_eager
-        md = builder.build(
-            _cam(num_reqs=1, query_start_loc=[0, 6], seq_lens=[6], block_table=[[1]]),
-            torch.arange(6),
-            batch_pad=1,
-            is_prefill=True,
-            mm_prefix_row_ends=torch.arange(8),
-            swa_masks={},
-        )
-        assert md.swa_attn_masks.dtype == torch.bfloat16
 
 
 class TestBuildOutputAssembly:
@@ -927,7 +935,17 @@ class TestForwardSlidingWindow:
     WINDOW = 4
     HEADS, DIM = 8, 128  # make_impl defaults; num_queries_per_kv is 1
 
-    def _forward(self, cfg, monkeypatch, target, metadata, kwargs_out=None):
+    def _forward(
+        self,
+        cfg,
+        monkeypatch,
+        target,
+        metadata,
+        kwargs_out=None,
+        *,
+        use_mm_prefix=False,
+        dtype=torch.float32,
+    ):
         impl = make_impl(cfg, sliding_window=self.WINDOW)
         b_size = metadata.seq_lens.shape[0]
         recorded = []
@@ -946,9 +964,9 @@ class TestForwardSlidingWindow:
             monkeypatch.setattr(
                 flash_attention, name, record if name == target else _unexpected(name)
             )
-        qkv = torch.zeros(b_size, self.HEADS, self.DIM)
+        qkv = torch.zeros(b_size, self.HEADS, self.DIM, dtype=dtype)
         impl.forward(
-            None,  # layer: only the flash causal branch reads it
+            SimpleNamespace(use_mm_prefix=use_mm_prefix),
             qkv,
             qkv,
             qkv,
@@ -1010,18 +1028,37 @@ class TestForwardSlidingWindow:
         assert kwargs["attn_mask"] is None
         assert window == self.WINDOW
 
-    def test_a_prefill_mask_on_the_metadata_reaches_the_op(self, cfg, monkeypatch):
-        mask = torch.ones(1, 1, 1, 8)
+    @pytest.mark.parametrize("use_mm_prefix", [False, True])
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+    def test_model_policy_selects_the_mask(
+        self, cfg, monkeypatch, use_mm_prefix, dtype
+    ):
         md = RBLNFlashAttentionMetadata(
             seq_lens=torch.tensor([[6]]),
             block_tables=torch.tensor([7, 8, 9]),
             is_prefill=True,
             swa_appends=True,
-            swa_attn_masks=mask,
+            mm_prefix_row_ends=torch.tensor([0]),
         )
         kwargs: dict[str, object] = {}
-        self._forward(cfg, monkeypatch, "sliding_window_attention_v1", md, kwargs)
-        assert kwargs["attn_mask"] is mask
+        self._forward(
+            cfg,
+            monkeypatch,
+            "sliding_window_attention_v1",
+            md,
+            kwargs,
+            use_mm_prefix=use_mm_prefix,
+            dtype=dtype,
+        )
+        if use_mm_prefix:
+            mask = kwargs["attn_mask"]
+            assert isinstance(mask, torch.Tensor)
+            assert mask.dtype == dtype
+            torch.testing.assert_close(
+                mask.flatten(), torch.tensor([0, 0, 0, 1, 1, 1, 1, 0], dtype=dtype)
+            )
+        else:
+            assert kwargs["attn_mask"] is None
 
     @pytest.mark.parametrize("is_prompt_sorted", [True, False])
     def test_shift_decode_mask_follows_prompt_sorting(

@@ -24,6 +24,7 @@ import pytest
 import torch
 from torch import nn
 from transformers import Gemma4VisionConfig, Gemma4VisionModel
+from vllm.model_executor.models.gemma4 import Gemma4Attention
 from vllm.model_executor.models.gemma4_mm import Gemma4ForConditionalGeneration
 
 import vllm_rbln.model_executor.models.gemma4 as gemma4
@@ -211,12 +212,17 @@ def test_warm_up_refuses_a_budget_with_no_grid_inside_the_tower():
         model.warmup_mm_encoder()
 
 
-def _built_model(monkeypatch, *, cap, budgets):
+def _built_model(monkeypatch, *, cap, budgets, attention_layers=()):
     """The model as construction resolves it, upstream's model left out."""
+
+    def upstream_init(self, **kwargs):
+        nn.Module.__init__(self)
+        self.layers = nn.ModuleList(attention_layers)
+
     monkeypatch.setattr(
         Gemma4ForConditionalGeneration,
         "__init__",
-        lambda self, **kw: nn.Module.__init__(self),
+        upstream_init,
     )
     monkeypatch.setattr(gemma4, "mm_soft_token_cap", lambda info: cap)
     monkeypatch.setattr(
@@ -239,6 +245,22 @@ def _built_model(monkeypatch, *, cap, budgets):
         )
     )
     return model
+
+
+@pytest.mark.parametrize("use_mm_prefix", [False, True])
+def test_mm_prefix_is_enabled_only_on_sliding_layers(monkeypatch, use_mm_prefix):
+    layers = []
+    for is_sliding in (True, False):
+        layer = Gemma4Attention.__new__(Gemma4Attention)
+        nn.Module.__init__(layer)
+        layer.is_sliding = is_sliding
+        layer.attn = SimpleNamespace(use_mm_prefix=use_mm_prefix)
+        layers.append(layer)
+
+    model = _built_model(monkeypatch, cap=280, budgets=[], attention_layers=layers)
+
+    assert model.layers[0].attn.use_mm_prefix == use_mm_prefix
+    assert model.layers[1].attn.use_mm_prefix is False
 
 
 @pytest.mark.parametrize(
