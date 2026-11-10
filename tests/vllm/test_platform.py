@@ -598,12 +598,119 @@ class TestRejectedConfigs:
         assert config.cache_config.mamba_cache_mode == "none"
         assert config.cache_config.mamba_block_size == config.model_config.max_model_len
 
-    def test_mrope_models_are_rejected(self, reconfigure, monkeypatch):
-        from vllm.config import ModelConfig
+    @pytest.fixture
+    def gdn(self, monkeypatch):
+        """The hook sees a GatedDeltaNet model with Qwen3.5-4B's 32 value heads."""
+        from vllm_rbln.platform import vllm_impl
 
-        monkeypatch.setattr(ModelConfig, "uses_mrope", property(lambda self: True))
-        with pytest.raises(ValueError, match="M-RoPE"):
-            reconfigure(lambda config: None)
+        monkeypatch.setattr(
+            vllm_impl, "_uses_gated_delta_net", lambda model_config: True
+        )
+
+        def mutate(config):
+            model_config = config.model_config
+            text_config = model_config.hf_text_config
+            text_config.linear_num_value_heads = 32
+            # 32 x 8 x a token's K and V: a state fills a full-attention page
+            # at block_size 256.
+            text_config.linear_key_head_dim = 8
+            text_config.linear_value_head_dim = (
+                2
+                * model_config.get_num_kv_heads(config.parallel_config)
+                * model_config.get_head_size()
+            )
+            config.cache_config.block_size = 256
+
+        return mutate
+
+    def test_gated_delta_net_is_told_by_the_model_type(self):
+        from vllm_rbln.platform.vllm_impl import _uses_gated_delta_net
+
+        def config(model_type):
+            return SimpleNamespace(hf_config=SimpleNamespace(model_type=model_type))
+
+        assert _uses_gated_delta_net(config("qwen3_5_text"))
+        assert _uses_gated_delta_net(config("qwen3_next"))
+        assert not _uses_gated_delta_net(config("glm5_next_text"))
+
+    def test_gdn_models_need_128_token_prefill_chunks(self, reconfigure, gdn):
+        def chunk_of_192(config):
+            gdn(config)
+            config.scheduler_config.max_num_batched_tokens = 192
+
+        with pytest.raises(ValueError, match="multiple of 128"):
+            reconfigure(chunk_of_192)
+        # A 128-multiple passes, and prefix caching is switched off for the model.
+        config = reconfigure(gdn)
+        assert config.cache_config.enable_prefix_caching is False
+
+    def test_gdn_models_run_on_a_single_rank(self, reconfigure, gdn):
+        for parallel in (
+            dict(tensor_parallel_size=2),
+            dict(pipeline_parallel_size=2),
+            dict(data_parallel_size=2),
+        ):
+
+            def widened(config, parallel=parallel):
+                gdn(config)
+                _ranks(**parallel)(config)
+
+            with pytest.raises(ValueError, match="single rank"):
+                reconfigure(widened)
+
+    def test_gdn_models_reject_speculative_decoding(self, reconfigure, gdn):
+        def speculative(config):
+            gdn(config)
+            config.speculative_config = object()
+
+        with pytest.raises(ValueError, match="Speculative decoding"):
+            reconfigure(speculative)
+
+    def test_gdn_state_fills_a_full_attention_page(self, reconfigure, gdn):
+        def doubled_block(config):
+            gdn(config)
+            config.cache_config.block_size *= 2
+
+        with pytest.raises(ValueError, match="full-attention layer's page"):
+            reconfigure(doubled_block)
+
+    def test_gdn_state_is_one_block_a_request(self, reconfigure, gdn):
+        config = reconfigure(gdn)
+        assert config.cache_config.mamba_block_size == config.model_config.max_model_len
+        assert config.cache_config.mamba_cache_mode == "none"
+
+    def test_gdn_mamba_block_below_the_model_length_is_refused(self, reconfigure, gdn):
+        def mamba_block(fraction):
+            def mutate(config):
+                gdn(config)
+                config.cache_config.user_specified_mamba_block_size = True
+                config.cache_config.mamba_block_size = (
+                    config.model_config.max_model_len // fraction
+                )
+
+            return mutate
+
+        with pytest.raises(ValueError, match="span the model length"):
+            reconfigure(mamba_block(2))
+        config = reconfigure(mamba_block(1))
+        assert config.cache_config.mamba_block_size == config.model_config.max_model_len
+
+    def test_gdn_state_keeps_the_activation_dtype(self, reconfigure, gdn):
+        def float32_state(config):
+            gdn(config)
+            # What upstream's Qwen3.5 hook takes from the HF config's mamba_ssm_dtype.
+            config.cache_config.mamba_ssm_cache_dtype = "float32"
+
+        config = reconfigure(float32_state)
+        assert config.cache_config.mamba_ssm_cache_dtype == "auto"
+
+    def test_gdn_value_heads_split_over_the_chiplets(self, reconfigure, gdn):
+        def six_heads(config):
+            gdn(config)
+            config.model_config.hf_text_config.linear_num_value_heads = 6
+
+        with pytest.raises(ValueError, match="four chiplets"):
+            reconfigure(six_heads)
 
     def test_chunked_prefill_off(self, reconfigure):
         with pytest.raises(ValueError, match="chunked prefill"):
