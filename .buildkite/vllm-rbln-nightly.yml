@@ -138,6 +138,17 @@ steps:
           - *sync
           - "uv run --no-sync python .buildkite/pipelines/vllm-rbln/scripts/run_examples.py pooling"
 
+      - <<: *examples
+        label: "ec_disagg"
+        key: "nightly-examples-vllm-ec_disagg"
+        resources:
+          npu:
+            count: 8
+            product: "RBLN-CR13"
+        command:
+          - *sync
+          - "uv run --no-sync python .buildkite/pipelines/vllm-rbln/scripts/run_examples.py ec_disagg"
+
   # Measured, not gated: soft_fail keeps the build green and no measured lane
   # appears in the deploy step's depends_on.
 
