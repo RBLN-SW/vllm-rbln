@@ -411,19 +411,22 @@ class AXK3Model(nn.Module):
     ) -> torch.Tensor:
         """Prefill with the Gated Residual as the token-cut axk3_gr_* ops."""
         topk_by_layer: dict[int, torch.Tensor] = {}
-        # Every stream starts as the embedding. A weightless op, so the first
-        # layer's parameters stay inside the first layer and it keeps the form
-        # of the others for the layer loop.
-        residual = torch.ops.rbln_custom_ops.axk3_gr_streams(embeds)
+        # Every stream starts as the embedding: [B, T, h] -> [B, n, T, h]. The
+        # first streams and the final read run once per model and stay plain
+        # ops, which the compiler keeps cut by tokens as well.
+        residual = (
+            embeds.unsqueeze(-3)
+            .expand(*embeds.shape[:-2], self.num_streams, *embeds.shape[-2:])
+            .contiguous()
+        )
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             residual, topk_indices = layer(positions, residual, topk_by_layer)
             if topk_indices is not None:
                 topk_by_layer[layer.layer_idx] = topk_indices
-        gr = self.final_gated_residual
-        u = torch.ops.rbln_custom_ops.axk3_gr_norm_last(
-            residual, gr.gamma, gr.norm.variance_epsilon
-        )
-        return _gr_read(u, gr)
+        # [B, n, T, h] -> [B, T, n*h], the plain residual layout
+        hidden = residual.transpose(-3, -2).reshape(*embeds.shape[:-1], -1)
+        hidden, _ = self.final_gated_residual.read(hidden)
+        return hidden
 
 
 _NO_EAGLE3 = (
