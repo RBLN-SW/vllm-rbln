@@ -147,8 +147,8 @@ class AXK3GatedResidual(nn.Module):
 _GR_SHARD = os.environ.get("AXK3_GR_SHARD", "0") == "1"
 
 
-def _gr_write_args(gr: AXK3GatedResidual) -> tuple:
-    """The read parameters the write side needs: norm scale and write gate."""
+def _gr_norm_args(gr: AXK3GatedResidual) -> tuple:
+    """A read's parameters for axk3_gr_norm: norm scale and write gate."""
     return gr.gamma, gr.write_proj.weight, gr.write_bias, gr.norm.variance_epsilon
 
 
@@ -299,24 +299,25 @@ class AXK3DecoderLayer(_AXK2DecoderLayer):
 
         Takes the residual [B, n, T, h] and returns it with both block outputs
         written in. Every layer, the first one too, starts with the norm of its
-        own attention read and ends with the update of the MLP output, so the
+        own attention read and ends with the write of the MLP output, so the
         layers have one form for the layer loop, each holds only its own
-        parameters, the MoE partial sums meet their update inside the layer, and
+        parameters, the MoE partial sums meet their write inside the layer, and
         only the token-cut residual crosses the layer boundary.
         """
         ops = torch.ops.rbln_custom_ops
         gr = self.attn_gated_residual
-        u, gate = ops.axk3_gr_norm(residual, *_gr_write_args(gr))
+        u, gate = ops.axk3_gr_norm(residual, *_gr_norm_args(gr))
         x, topk_indices = _gated_mla_forward(
             self.self_attn.mla_attn,
             positions,
             _gr_read(u, gr),
             topk_by_layer[self.index_source_layer] if self.skip_topk else None,
         )
+        residual = ops.axk3_gr_write(residual, x, gate)
         gr = self.mlp_gated_residual
-        residual, u, gate = ops.axk3_gr_write(residual, x, gate, *_gr_write_args(gr))
+        u, gate = ops.axk3_gr_norm(residual, *_gr_norm_args(gr))
         y = self.mlp(_gr_read(u, gr))
-        residual = ops.axk3_gr_update(residual, y, gate)
+        residual = ops.axk3_gr_write(residual, y, gate)
         return residual, None if self.skip_topk else topk_indices
 
 
