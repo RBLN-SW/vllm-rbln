@@ -1431,7 +1431,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 scheduler_output, encoder_cache=self.encoder_cache
             ) as ec_connector_output:
                 self._execute_mm_encoder(scheduler_output)
-                self._execute_mm_encoder(scheduler_output)
                 mm_embeds, mm_mask = self._gather_mm_embeddings(
                     scheduler_output, num_input_tokens
                 )

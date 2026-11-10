@@ -193,6 +193,7 @@ class InputStager:
         )
         offset = 0
         for rows in mm_embeds:
+            rows = rows.to(device=embeds.device, dtype=embeds.dtype)
             count = rows.shape[0]
             # Replaces per-run embeds[req_index, start:start + count].copy_(rows).
             # Boolean assignment would use torch-rbln's CPU fallback.

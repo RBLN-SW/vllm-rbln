@@ -315,17 +315,25 @@ class TestHiddenStates:
 
 @pytest.mark.maybe_use_device
 class TestMultimodalEmbeddings:
+    @pytest.mark.parametrize(
+        "source_on_cpu", [True, False], ids=["cpu_source", "device_source"]
+    )
+    @pytest.mark.parametrize("source_dtype", [torch.bfloat16, torch.float32])
     @pytest.mark.parametrize("split_first", [False, True])
     def test_scatters_embeddings_across_text_holes_and_padded_requests(
-        self, split_first
+        self, split_first, source_dtype, source_on_cpu
     ):
         stager = _stager()
+        source_device = torch.device("cpu") if source_on_cpu else stager.device
         first = torch.arange(8, dtype=torch.bfloat16).reshape(2, 4) + 1
         second = torch.full((1, 4), 7.0, dtype=torch.bfloat16)
         mask = torch.tensor([[[1], [0], [1]], [[1], [0], [0]]], dtype=torch.bfloat16)
         sources = [first[:1], first[1:], second] if split_first else [first, second]
         staged, staged_mask = stager.stage_mm_embeds(
-            [rows.to(stager.device) for rows in sources], mask, 4, _layout()
+            [rows.to(device=source_device, dtype=source_dtype) for rows in sources],
+            mask,
+            4,
+            _layout(),
         )
         expected = torch.zeros(4, 8, 4, dtype=torch.bfloat16)
         expected[0, 0] = first[0]
@@ -339,7 +347,7 @@ class TestMultimodalEmbeddings:
         # A later step rewrites only its own positions; the mask hides the rest.
         third = torch.full((1, 4), 9.0, dtype=torch.bfloat16)
         next_embeds, next_mask = stager.stage_mm_embeds(
-            [third.to(stager.device)],
+            [third.to(device=source_device, dtype=source_dtype)],
             torch.tensor([[[1], [0]]], dtype=torch.bfloat16),
             4,
             _layout(num_reqs=1, query_len=2),
