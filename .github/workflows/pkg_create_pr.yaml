@@ -10,6 +10,13 @@ on:
         description: "Optimum version to update"
         required: true
         type: string
+    secrets:
+      GIT_PAT:
+        required: true
+      UDC_NEXUS_USERNAME:
+        required: true
+      UDC_NEXUS_PASSWORD:
+        required: true
 
 jobs:
   create-pr:
@@ -27,7 +34,8 @@ jobs:
 
       - name: Install uv
         run: |
-          curl -LsSf https://astral.sh/uv/install.sh | sh
+          curl -LsSf -o uv-install.sh https://astral.sh/uv/install.sh
+          sh uv-install.sh
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           
       - name: Update Optimum Version in uv
@@ -35,9 +43,10 @@ jobs:
         env:
           UV_INDEX_RBLN_NEXUS_NIGHTLY_USERNAME: ${{ secrets.UDC_NEXUS_USERNAME }}
           UV_INDEX_RBLN_NEXUS_NIGHTLY_PASSWORD: ${{ secrets.UDC_NEXUS_PASSWORD }}
+          OPTIMUM_VERSION: ${{ inputs.optimum-version }}
         run: |
           set -euo pipefail
-          VERSION="${{ inputs.optimum-version }}"
+          VERSION="$OPTIMUM_VERSION"
           VERSION="${VERSION#v}"
 
           CEILING=$(python -c 'import re, sys; m = re.match(r"(\d+)\.(\d+)\.(\d+)", sys.argv[1]) or sys.exit(f"cannot derive a patch-line ceiling from {sys.argv[1]!r}"); print(f"{m[1]}.{m[2]}.{int(m[3]) + 1}")' "${VERSION}")

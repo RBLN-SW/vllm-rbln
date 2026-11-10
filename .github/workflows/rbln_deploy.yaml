@@ -6,6 +6,9 @@ on:
       version:
         required: true
         type: string
+    secrets:
+      PKG_ORG_GATE:
+        required: true
 
 jobs:
   deploy:
