@@ -615,7 +615,23 @@ class TestBuildMmPrefixSlidingWindow:
             scale=self.DIM**-0.5,
             sliding_window=self.WINDOW,
         )
-        forward = impl.forward
+        from vllm_rbln.model_executor.models.gemma4 import _build_mm_prefix_sliding_mask
+
+        layer = torch.nn.Module()
+        layer.mm_prefix_mask = None
+
+        def forward(layer, query, key, value, cache, metadata, output):
+            if masked:
+                layer.mm_prefix_mask = _build_mm_prefix_sliding_mask(
+                    metadata.mm_prefix_row_ends,
+                    metadata.seq_lens,
+                    self.WINDOW,
+                    self.BLOCK,
+                    query.dtype,
+                )
+            impl.forward(layer, query, key, value, cache, metadata, output)
+            layer.mm_prefix_mask = None
+
         if backend is not None:
             forward = torch.compile(forward, backend=backend, fullgraph=True)
         outputs = []
@@ -652,7 +668,7 @@ class TestBuildMmPrefixSlidingWindow:
             )
             output = torch.empty_like(qs)
             forward(
-                SimpleNamespace(use_mm_prefix=masked),
+                layer,
                 qs,
                 ks,
                 vs,
@@ -943,7 +959,7 @@ class TestForwardSlidingWindow:
         metadata,
         kwargs_out=None,
         *,
-        use_mm_prefix=False,
+        mm_prefix_mask=None,
         dtype=torch.float32,
     ):
         impl = make_impl(cfg, sliding_window=self.WINDOW)
@@ -966,7 +982,7 @@ class TestForwardSlidingWindow:
             )
         qkv = torch.zeros(b_size, self.HEADS, self.DIM, dtype=dtype)
         impl.forward(
-            SimpleNamespace(use_mm_prefix=use_mm_prefix),
+            SimpleNamespace(mm_prefix_mask=mm_prefix_mask),
             qkv,
             qkv,
             qkv,
@@ -1030,15 +1046,22 @@ class TestForwardSlidingWindow:
 
     @pytest.mark.parametrize("use_mm_prefix", [False, True])
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
-    def test_model_policy_selects_the_mask(
-        self, cfg, monkeypatch, use_mm_prefix, dtype
-    ):
+    def test_model_mask_is_forwarded(self, cfg, monkeypatch, use_mm_prefix, dtype):
         md = RBLNFlashAttentionMetadata(
             seq_lens=torch.tensor([[6]]),
             block_tables=torch.tensor([7, 8, 9]),
             is_prefill=True,
             swa_appends=True,
             mm_prefix_row_ends=torch.tensor([0]),
+        )
+        from vllm_rbln.model_executor.models.gemma4 import _build_mm_prefix_sliding_mask
+
+        model_mask = (
+            _build_mm_prefix_sliding_mask(
+                md.mm_prefix_row_ends, md.seq_lens, self.WINDOW, self.WINDOW, dtype
+            )
+            if use_mm_prefix
+            else None
         )
         kwargs: dict[str, object] = {}
         self._forward(
@@ -1047,9 +1070,10 @@ class TestForwardSlidingWindow:
             "sliding_window_attention_v1",
             md,
             kwargs,
-            use_mm_prefix=use_mm_prefix,
+            mm_prefix_mask=model_mask,
             dtype=dtype,
         )
+        assert kwargs["attn_mask"] is model_mask
         if use_mm_prefix:
             mask = kwargs["attn_mask"]
             assert isinstance(mask, torch.Tensor)

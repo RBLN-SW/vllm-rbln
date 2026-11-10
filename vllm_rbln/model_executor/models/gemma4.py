@@ -26,6 +26,7 @@ from transformers import BatchFeature
 from transformers.models.gemma4.modeling_gemma4 import apply_multidimensional_rope
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.models.gemma4 import Gemma4Attention
 from vllm.model_executor.models.gemma4_mm import (
     _SUPPORTED_SOFT_TOKENS,
@@ -45,6 +46,42 @@ from vllm_rbln.model_executor.models.interfaces import (
     SupportsRBLNMmPrefix,
     SupportsRBLNMultiModal,
 )
+from vllm_rbln.patches.attention import _resolve_kv_cache
+
+
+def _build_mm_prefix_sliding_mask(
+    row_end_offsets: torch.Tensor,
+    chunk_start_position: torch.Tensor,
+    sliding_window: int,
+    block_size: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Build a mask over the kernel's block-aligned key strip.
+
+    Positions are absolute token indices; offsets are relative to the chunk
+    start. Row end offsets include the last key each query may attend to.
+    """
+    query_length = row_end_offsets.numel()
+    num_key_blocks = (
+        sliding_window + query_length - 1 + block_size - 1
+    ) // block_size + 1
+    chunk_start_position = chunk_start_position.reshape(1, 1)
+    earliest_key_position = torch.clamp(
+        chunk_start_position - sliding_window + 1, min=0
+    )
+    first_key_block_start_position = earliest_key_position // block_size * block_size
+    query_offsets = torch.arange(query_length, device=row_end_offsets.device).view(
+        -1, 1
+    )
+    key_offsets = (
+        first_key_block_start_position
+        - chunk_start_position
+        + torch.arange(num_key_blocks * block_size, device=row_end_offsets.device)
+    )
+    allowed_keys = (key_offsets <= row_end_offsets.view(-1, 1)) & (
+        key_offsets > query_offsets - sliding_window
+    )
+    return allowed_keys.to(dtype).view(1, 1, query_length, -1)
 
 
 class _RBLNGemma4VisionEncoder(nn.Module):
@@ -205,9 +242,13 @@ class RBLNGemma4ForConditionalGeneration(
                 "Gemma4 does not support speculative decoding on RBLN yet."
             )
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        self.mm_prefix_attn_layers: list[nn.Module] = []
         for module in self.modules():
             if isinstance(module, Gemma4Attention):
                 module.attn.use_mm_prefix &= module.is_sliding
+                if module.attn.use_mm_prefix:
+                    module.attn.mm_prefix_mask = None
+                    self.mm_prefix_attn_layers.append(module.attn)
         cap = mm_soft_token_cap(
             MULTIMODAL_REGISTRY.create_processor(vllm_config.model_config).info
         )
@@ -381,6 +422,21 @@ class RBLNGemma4ForConditionalGeneration(
         mm_mask: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor | IntermediateTensors:
+        if self.mm_prefix_attn_layers:
+            layer = self.mm_prefix_attn_layers[0]
+            metadata = get_forward_context().attn_metadata[layer.layer_name]
+            if metadata.mm_prefix_row_ends is not None:
+                assert metadata.is_prefill and metadata.swa_appends
+                mask = _build_mm_prefix_sliding_mask(
+                    metadata.mm_prefix_row_ends,
+                    metadata.seq_lens,
+                    layer.sliding_window,
+                    _resolve_kv_cache(metadata, layer.layer_index).size(-2),
+                    self.model_dtype,
+                )
+                # Workaround: transient layer state keeps shared masks inside the graph.
+                for layer in self.mm_prefix_attn_layers:
+                    layer.mm_prefix_mask = mask
         if (
             mm_embeds is not None
             and inputs_embeds is None
@@ -390,6 +446,9 @@ class RBLNGemma4ForConditionalGeneration(
             text_embeds = self.language_model.embed_input_ids(input_ids)
             inputs_embeds = torch.where(mm_mask > 0.5, mm_embeds, text_embeds)
             input_ids = None
-        return super().forward(
+        output = super().forward(
             input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs
         )
+        for layer in self.mm_prefix_attn_layers:
+            layer.mm_prefix_mask = None
+        return output

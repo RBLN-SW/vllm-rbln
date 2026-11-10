@@ -16,6 +16,7 @@
 vision encoder against HF's, its graph buckets, and the in-graph merge of
 image embeddings."""
 
+import operator
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
@@ -24,11 +25,14 @@ import pytest
 import torch
 from torch import nn
 from transformers import Gemma4VisionConfig, Gemma4VisionModel
+from vllm.forward_context import override_forward_context
 from vllm.model_executor.models.gemma4 import Gemma4Attention
 from vllm.model_executor.models.gemma4_mm import Gemma4ForConditionalGeneration
 
 import vllm_rbln.model_executor.models.gemma4 as gemma4
+from vllm_rbln.compilation.compiler import compile, mark_decoder_regions
 from vllm_rbln.model_executor.models.gemma4 import RBLNGemma4ForConditionalGeneration
+from vllm_rbln.v1.attention.backends.flash_attention import RBLNFlashAttentionMetadata
 
 POOL = 3
 
@@ -43,6 +47,7 @@ def _bare_model(**attrs) -> RBLNGemma4ForConditionalGeneration:
         RBLNGemma4ForConditionalGeneration
     )
     nn.Module.__init__(model)
+    model.mm_prefix_attn_layers = []
     object.__setattr__(model, "_mm_encoder", None)
     for key, value in attrs.items():
         setattr(model, key, value)
@@ -462,3 +467,84 @@ def test_image_embeddings_replace_their_tokens_in_the_graph(monkeypatch):
     assert out == "HIDDEN"
     assert seen["input_ids"] is None
     assert seen["inputs_embeds"][0, :, 0].tolist() == [1.0, 9.0, 3.0]
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+def test_prefix_mask_is_shared_and_does_not_escape_forward(monkeypatch, compiled):
+    class Decoder(nn.Module):
+        def __init__(self, index):
+            super().__init__()
+            self.attn = nn.Module()
+            self.attn.layer_name = f"layer.{index}"
+            self.attn.layer_index = index
+            self.attn.sliding_window = 4
+            self.attn.mm_prefix_mask = None
+
+        def forward(self, x):
+            return x + self.attn.mm_prefix_mask[0, 0, 1, 3]
+
+    def upstream_forward(self, input_ids, positions, *args, **kwargs):
+        masks = [layer.attn.mm_prefix_mask for layer in self.layers]
+        assert masks[0] is not None
+        assert all(mask is masks[0] for mask in masks)
+        for layer in self.layers:
+            positions = layer(positions)
+        return positions
+
+    monkeypatch.setattr(Gemma4ForConditionalGeneration, "forward", upstream_forward)
+    model = _bare_model(
+        layers=nn.ModuleList([Decoder(i) for i in range(3)]),
+        start_layer=0,
+        end_layer=3,
+        model_dtype=torch.float32,
+    )
+    model.mm_prefix_attn_layers = [layer.attn for layer in model.layers]
+    metadata = RBLNFlashAttentionMetadata(
+        seq_lens=torch.tensor([[0]]),
+        block_tables=torch.arange(4),
+        is_prefill=True,
+        swa_appends=True,
+        mm_prefix_row_ends=torch.tensor([0, 3, 3, 3]),
+        kv_caches=[torch.zeros(4, 2, 1, 1, 4, 32) for _ in model.layers],
+    )
+    context = SimpleNamespace(
+        attn_metadata={
+            layer.layer_name: metadata for layer in model.mm_prefix_attn_layers
+        },
+        additional_kwargs={},
+        dp_metadata=None,
+    )
+    graphs = []
+
+    def backend(graph, inputs, **options):
+        graphs.append(graph)
+        return graph.forward
+
+    forward = model.forward
+    if compiled:
+        mark_decoder_regions(model)
+        forward = compile(
+            forward,
+            backend=backend,
+            fullgraph=True,
+            use_direct_dispatch=True,
+            use_cache=False,
+        )
+    with override_forward_context(context):
+        for row_ends, expected in [([0, 3, 3, 3], 3), ([0, 1, 2, 3], 0)]:
+            metadata.mm_prefix_row_ends = torch.tensor(row_ends)
+            result = forward(None, torch.zeros(4))
+            torch.testing.assert_close(result, torch.full((4,), float(expected)))
+            assert all(
+                layer.mm_prefix_mask is None for layer in model.mm_prefix_attn_layers
+            )
+            assert metadata.swa_attn_masks is None
+    if compiled:
+        assert len(graphs) == 1
+        nodes = list(graphs[0].graph.nodes)
+        assert sum(node.target is operator.and_ for node in nodes) == 1
+        assert len(nodes[-1].args[0]) == 1
+        assert (
+            sum(node.target is torch.ops.higher_order.invoke_subgraph for node in nodes)
+            == 3
+        )
