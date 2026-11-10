@@ -87,7 +87,7 @@ The longest length is the most tokens the scheduler gives one request per step.
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `--rbln-prefill-chunk-size` | `max_num_batched_tokens` | Prefill graph lengths. Every length must be unique and within `(0, max_num_batched_tokens]`. |
+| `--rbln-prefill-chunk-size` | `max_num_batched_tokens` | Prefill graph lengths. Every length must be unique, within `(0, max_num_batched_tokens]`, and no longer than `--max-num-scheduled-tokens` when that is set. |
 
 In `additional_config` it takes a list or a single integer, for example
 `{"prefill_chunk_size": 512}`.

@@ -175,7 +175,17 @@ def _validate(vllm_config: "VllmConfig") -> None:
     chunks = rbln_config.prefill_chunk_size or [max_num_batched_tokens]
     if max(chunks) > max_num_batched_tokens:
         raise ValueError(
-            f"--rbln-prefill-chunk-size={chunks} exceeds {max_num_batched_tokens=}."
+            f"prefill_chunk_size={chunks} exceeds {max_num_batched_tokens=}."
+        )
+
+    max_num_scheduled_tokens = scheduler_config.max_num_scheduled_tokens
+    if (
+        max_num_scheduled_tokens is not None
+        and chunks != [max_num_batched_tokens]
+        and max(chunks) > max_num_scheduled_tokens
+    ):
+        raise ValueError(
+            f"prefill_chunk_size={chunks} exceeds {max_num_scheduled_tokens=}."
         )
     # TODO(RBLN): The RBLN NIXL connector's resume trim takes
     # max_num_batched_tokens as the prefill chunk. Lifting the refusal means
@@ -211,9 +221,8 @@ def _validate(vllm_config: "VllmConfig") -> None:
         ]
         if unsupported:
             raise ValueError(
-                f"--rbln-prefill-chunk-size={chunks} below "
-                f"{max_num_batched_tokens=} is not supported with "
-                f"{', '.join(unsupported)} on RBLN yet."
+                f"prefill_chunk_size={chunks} below {max_num_batched_tokens=} "
+                f"is not supported with {', '.join(unsupported)} on RBLN yet."
             )
     # Resolved here so the scheduler and runner read one value, and compute_hash,
     # which runs after this, keys "unset" and "set to the budget" alike.
