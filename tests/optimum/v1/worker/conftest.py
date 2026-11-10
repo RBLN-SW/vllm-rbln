@@ -19,10 +19,9 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def skip_sync_vllm_and_optimum():
-    # Force `compiled_rbln_config = None` so sync_vllm_and_optimum() takes the
-    # sync_from_vllm() path instead of resolving a real compiled config.
+    # Use the compile inputs without reading rbln_config.json from disk.
     with patch(
-        "vllm_rbln.utils.optimum.converter.dispatch._resolve_rbln_config",
+        "vllm_rbln.utils.optimum.configuration.sync.load_compiled_rbln_config",
         return_value=None,
     ):
         yield

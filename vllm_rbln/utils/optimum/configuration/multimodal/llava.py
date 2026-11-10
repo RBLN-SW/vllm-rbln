@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2026 Rebellions Inc. All rights reserved.
+# Copyright 2025 Rebellions Inc. All rights reserved.
 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,8 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .language import build_language_model_config
 
-def get_param_exaone4_5(
+
+def build_llava_config(
     batch_size: int,
     max_model_len: int,
     block_size: int,
@@ -22,19 +24,18 @@ def get_param_exaone4_5(
     memory_budget: float,
     prefill_chunk_size: int | None = None,
 ) -> dict:
-    param: dict = {
-        "num_devices": num_devices,
-        "max_seq_len": max_model_len,
-        "batch_size": batch_size,
-        "use_inputs_embeds": True,
-        "memory_budget": memory_budget,
+    rbln_config = {
+        "vision_tower": {"output_hidden_states": True},
+        "language_model": build_language_model_config(
+            batch_size,
+            max_model_len,
+            block_size,
+            num_devices,
+            memory_budget,
+            prefill_chunk_size,
+        ),
     }
-    if block_size != max_model_len:
-        attn_impl = "flash_attn" if block_size != max_model_len else "eager"
-        param["kvcache_partition_len"] = block_size
-        param["attn_impl"] = attn_impl
-    # Pin prefill_chunk_size so the compiled model stays in sync with the value
-    # used for KV-cache block padding.
-    if prefill_chunk_size is not None:
-        param["prefill_chunk_size"] = prefill_chunk_size
-    return param
+    return rbln_config
+
+
+build_llava_next_config = build_llava_config
