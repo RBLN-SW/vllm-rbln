@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2025 Rebellions Inc. All rights reserved.
+# Copyright 2026 Rebellions Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .common import get_param_language_model
+from .language import build_language_model_wrapper_config
 
-get_param_gemma3 = get_param_language_model
-get_param_gemma4 = get_param_gemma3
+build_llama4_config = build_language_model_wrapper_config

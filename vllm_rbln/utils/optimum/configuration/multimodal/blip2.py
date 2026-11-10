@@ -13,6 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .common import get_param_language_model
+from .language import build_language_model_wrapper_config
 
-get_param_blip2 = get_param_language_model
+build_blip2_config = build_language_model_wrapper_config

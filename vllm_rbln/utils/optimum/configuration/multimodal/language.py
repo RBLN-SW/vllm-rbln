@@ -14,7 +14,7 @@
 # limitations under the License.
 
 
-def get_language_model_config(
+def build_language_model_config(
     batch_size: int,
     max_model_len: int,
     block_size: int,
@@ -22,7 +22,7 @@ def get_language_model_config(
     memory_budget: float,
     prefill_chunk_size: int | None = None,
 ) -> dict:
-    param: dict = {
+    rbln_config: dict = {
         "use_inputs_embeds": True,
         "batch_size": batch_size,
         "max_seq_len": max_model_len,
@@ -31,16 +31,16 @@ def get_language_model_config(
     }
     if block_size != max_model_len:
         attn_impl = "flash_attn" if block_size != max_model_len else "eager"
-        param["attn_impl"] = attn_impl
-        param["kvcache_partition_len"] = block_size
+        rbln_config["attn_impl"] = attn_impl
+        rbln_config["kvcache_partition_len"] = block_size
     # Pin prefill_chunk_size so the compiled model stays in sync with the value
     # used for KV-cache block padding.
     if prefill_chunk_size is not None:
-        param["prefill_chunk_size"] = prefill_chunk_size
-    return param
+        rbln_config["prefill_chunk_size"] = prefill_chunk_size
+    return rbln_config
 
 
-def get_param_language_model(
+def build_language_model_wrapper_config(
     batch_size: int,
     max_model_len: int,
     block_size: int,
@@ -49,7 +49,7 @@ def get_param_language_model(
     prefill_chunk_size: int | None = None,
 ) -> dict:
     return {
-        "language_model": get_language_model_config(
+        "language_model": build_language_model_config(
             batch_size,
             max_model_len,
             block_size,

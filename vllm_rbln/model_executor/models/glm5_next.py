@@ -2,7 +2,7 @@
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# You may obtain a copy of the License at:
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 #
@@ -84,6 +84,7 @@ from vllm.utils.torch_utils import set_default_torch_dtype
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec, MLAAttentionSpec
 
+import vllm_rbln.utils as rbln_utils
 from vllm_rbln.model_executor.models.interfaces import SupportsRBLNMultiModal
 from vllm_rbln.patches.attention import _resolve_kv_cache
 from vllm_rbln.v1.attention.backends.flash_attention import (
@@ -1306,7 +1307,9 @@ class RBLNGlm5NextForConditionalGeneration(
         merge2 = self.visual.spatial_merge_size**2
         with torch.inference_mode():
             return tuple(
-                encoder(*self._encoder_inputs(pv, g))[: n // merge2].cpu()
+                rbln_utils.run_mm_encoder(
+                    encoder, self._encoder_inputs(pv, g), n // merge2
+                )
                 for pv, g, n in zip(pixel_values.split(sizes), grid_thw, sizes)
             )
 
