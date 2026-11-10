@@ -76,6 +76,7 @@ def test_decoder_region_model_selection(monkeypatch, enabled, config_cls, archit
     "architecture, key",
     [
         ("Gemma3ForConditionalGeneration", "language_model"),
+        ("Llama4ForConditionalGeneration", "language_model"),
         ("Idefics3ForConditionalGeneration", "text_model"),
         ("Qwen3VLForConditionalGeneration", None),
     ],

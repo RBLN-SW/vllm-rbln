@@ -19,6 +19,7 @@ from .blip2 import build_blip2_config
 from .exaone import build_exaone4_5_config
 from .gemma import build_gemma3_config, build_gemma4_config
 from .idefics3 import build_idefics3_config
+from .llama4 import build_llama4_config
 from .llava import build_llava_config, build_llava_next_config
 from .paligemma import build_paligemma_config
 from .qwen import (
@@ -36,6 +37,7 @@ MULTIMODAL_CONFIG_BUILDERS: dict[
     "blip2": build_blip2_config,
     "exaone4_5": build_exaone4_5_config,
     "idefics3": build_idefics3_config,
+    "llama4": build_llama4_config,
     "llava": build_llava_config,
     "llava_next": build_llava_next_config,
     "paligemma": build_paligemma_config,
