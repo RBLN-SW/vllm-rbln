@@ -84,30 +84,35 @@ def _fp8_cache_dtype(kv_cache_dtype: str) -> torch.dtype | None:
 
 def _build_mm_prefix_sliding_mask(
     query: torch.Tensor,
-    row_ends: torch.Tensor,
-    chunk_start: torch.Tensor,
-    window: int,
+    row_end_offsets: torch.Tensor,
+    chunk_start_position: torch.Tensor,
+    sliding_window: int,
     block_size: int,
 ) -> torch.Tensor:
     """Build a mask over the kernel's block-aligned key strip.
 
-    Query positions and row ends are chunk-local; translate the absolute
-    block positions into that same coordinate frame before comparing them.
+    Positions are absolute token indices; offsets are relative to the chunk
+    start. Row end offsets include the last key each query may attend to.
     """
-    q_len = query.size(-2)
-    num_blocks = (window + q_len - 1 + block_size - 1) // block_size + 1
-    chunk_start = chunk_start.reshape(1, 1)
-    first_key = torch.clamp(chunk_start - window + 1, min=0) // block_size * block_size
-    query_positions = torch.arange(q_len, device=query.device).view(-1, 1)
-    key_positions = (
-        first_key
-        - chunk_start
-        + torch.arange(num_blocks * block_size, device=query.device)
+    query_length = query.size(-2)
+    num_key_blocks = (
+        sliding_window + query_length - 1 + block_size - 1
+    ) // block_size + 1
+    chunk_start_position = chunk_start_position.reshape(1, 1)
+    earliest_key_position = torch.clamp(
+        chunk_start_position - sliding_window + 1, min=0
     )
-    keep = (key_positions <= row_ends.view(-1, 1)) & (
-        key_positions > query_positions - window
+    first_key_block_start_position = earliest_key_position // block_size * block_size
+    query_offsets = torch.arange(query_length, device=query.device).view(-1, 1)
+    key_offsets = (
+        first_key_block_start_position
+        - chunk_start_position
+        + torch.arange(num_key_blocks * block_size, device=query.device)
     )
-    return keep.to(query.dtype).view(1, 1, q_len, -1)
+    allowed_keys = (key_offsets <= row_end_offsets.view(-1, 1)) & (
+        key_offsets > query_offsets - sliding_window
+    )
+    return allowed_keys.to(query.dtype).view(1, 1, query_length, -1)
 
 
 @register_backend(AttentionBackendEnum.FLASH_ATTN)
