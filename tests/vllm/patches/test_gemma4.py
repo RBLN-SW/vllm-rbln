@@ -50,3 +50,41 @@ def test_the_backend_is_left_to_the_platform():
     config = _vllm_config()
     Gemma4Config.verify_and_update_config(config)
     assert config.attention_config.backend is None
+
+
+def test_the_moe_block_routes_the_runner_on_the_residual():
+    import torch
+
+    from vllm_rbln.patches.gemma4 import patched_gemma4_decoder_layer_forward
+
+    def same(x):
+        return x
+
+    seen = {}
+
+    def experts(*, hidden_states, router):
+        seen["logits"] = router(hidden_states)
+        return hidden_states
+
+    layer = SimpleNamespace(
+        input_layernorm=same,
+        self_attn=lambda positions, hidden_states: hidden_states,
+        post_attention_layernorm=same,
+        pre_feedforward_layernorm=same,
+        mlp=same,
+        enable_moe_block=True,
+        post_feedforward_layernorm_1=same,
+        pre_feedforward_layernorm_2=lambda x: x * 3,
+        router=lambda x: x + 100,
+        experts=experts,
+        post_feedforward_layernorm_2=same,
+        post_feedforward_layernorm=same,
+        per_layer_input_gate=None,
+        layer_scalar=torch.ones(1),
+    )
+    hidden_states = torch.randn(1, 2, 4)
+
+    patched_gemma4_decoder_layer_forward(layer, torch.arange(2), hidden_states, None)
+
+    # The residual after attention is 2x; the experts' input (6x) is ignored.
+    torch.testing.assert_close(seen["logits"], hidden_states * 2 + 100)

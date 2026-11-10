@@ -68,8 +68,6 @@ class RBLNMoERunner(MoERunner):
       precomputed ``router_logits``. RBLN computes router logits *after* the DP
       multicast so routing sees the multicast token layout; the patched model
       MoE blocks (qwen/deepseek/minimax/gpt-oss) pass ``router=`` accordingly.
-      With DP=1 the router logits may come precomputed, for a model whose router
-      reads a different tensor than its experts (Gemma4 routes on the residual).
     * Hidden states stay **3-D ``[B, L, H]``** throughout (RBLN convention); no
       2-D unpacking.
     * Routing (top-k + softmax/sigmoid, optional grouped-topk) is done inline and
@@ -137,7 +135,7 @@ class RBLNMoERunner(MoERunner):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        router: Callable[[torch.Tensor], torch.Tensor] | torch.Tensor,
+        router: Callable[[torch.Tensor], torch.Tensor],
     ) -> torch.Tensor:
         assert self._quant_method is not None
 
@@ -423,7 +421,7 @@ class RBLNMoERunner(MoERunner):
             return final_hidden_states
 
         # --- DP == 1 path ---
-        router_logits = router(hidden_states) if callable(router) else router
+        router_logits = router(hidden_states)
 
         # topk + softmax → masked_routing_weights
         orig_shape = hidden_states.shape

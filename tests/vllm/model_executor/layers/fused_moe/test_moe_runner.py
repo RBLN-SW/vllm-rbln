@@ -358,7 +358,7 @@ def _routed_weights(monkeypatch, router, logits):
     runner.top_k = 2
     runner.moe_parallel_config = SimpleNamespace(dp_size=1, dp_rank=0)
     runner.router = router
-    RBLNMoERunner.forward(runner, torch.zeros(*logits.shape[:2], 8), logits)
+    RBLNMoERunner.forward(runner, torch.zeros(*logits.shape[:2], 8), lambda _: logits)
     return routed["weights"]
 
 
