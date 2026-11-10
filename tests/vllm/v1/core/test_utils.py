@@ -21,6 +21,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.vllm.v1.core.utils import full_attention_spec, make_kv_cache_config
 from vllm_rbln.v1.core.utils import (
     decode_batch_size,
     num_base_tokens,
@@ -199,7 +200,7 @@ class TestSubBlockSizeInUse:
             enable_prefix_caching=True,
             sub_block_cache=True,
             block_size=1024,
-            prefill_chunk_size=512,
+            prefill_chunk_sizes=[512],
             kv_cache_config=object(),
         )
         args.update(kw)
@@ -208,6 +209,17 @@ class TestSubBlockSizeInUse:
     def test_defaults_to_the_prefill_chunk(self, eligible):
         eligible(True)
         assert self._call() == 512
+
+    def test_defaults_to_the_longest_chunk_the_kv_cache_holds(self, cr13):
+        # 768 does not divide the 1024 block; 256 and 512 do.
+        kv = make_kv_cache_config([full_attention_spec(1024)])
+        sizes = [256, 512, 768]
+        assert self._call(prefill_chunk_sizes=sizes, kv_cache_config=kv) == 512
+
+    def test_a_default_below_the_longest_chunk_needs_cr13(self):
+        kv = make_kv_cache_config([full_attention_spec(1024)])
+        sizes = [256, 512, 768]
+        assert self._call(prefill_chunk_sizes=sizes, kv_cache_config=kv) is None
 
     def test_none_without_prefix_caching(self, eligible):
         eligible(True)
@@ -238,7 +250,7 @@ class TestSubBlockSizeInUse:
     def test_a_chunk_outside_the_block_bounds_is_rejected(self, eligible):
         eligible(True)
         with pytest.raises(ValueError, match="block_size >="):
-            self._call(block_size=256, prefill_chunk_size=512, sub_block_size=256)
+            self._call(block_size=256, prefill_chunk_sizes=[512], sub_block_size=256)
 
     def test_a_size_the_kv_cache_cannot_hold_is_rejected(self, eligible):
         # A size that is not a divisor of block_size, or a spec with no token
@@ -252,7 +264,7 @@ class TestSubBlockSizeInUse:
         # Nobody asked for sub-blocks here, so a chunk wider than the block
         # steps aside rather than refusing to start.
         eligible(True)
-        assert self._call(block_size=256, prefill_chunk_size=512) is None
+        assert self._call(block_size=256, prefill_chunk_sizes=[512]) is None
 
     def test_a_size_below_the_chunk_needs_cr13(self, eligible, monkeypatch):
         # The multi-block store the decoupled size needs is CR13-only.

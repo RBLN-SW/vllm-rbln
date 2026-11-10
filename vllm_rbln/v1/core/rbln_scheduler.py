@@ -118,13 +118,16 @@ class RBLNScheduler(Scheduler):
 
         rbln_config: RBLNConfig = self.vllm_config.additional_config
 
+        prefill_chunk_sizes = rbln_config.prefill_chunk_size
+        assert prefill_chunk_sizes is not None  # resolved at start-up
+
         # Replace the upstream KVCacheManager with RBLNKVCacheManager
         # when sub-block prefix caching is enabled.
         sub_block_size = sub_block_size_in_use(
             enable_prefix_caching=self.cache_config.enable_prefix_caching,
             sub_block_cache=rbln_config.enable_sub_block_cache,
             block_size=self.block_size,
-            prefill_chunk_size=rbln_config.max_prefill_chunk_size,
+            prefill_chunk_sizes=prefill_chunk_sizes,
             kv_cache_config=self.kv_cache_config,
             sub_block_size=rbln_config.sub_block_size,
         )
@@ -160,6 +163,15 @@ class RBLNScheduler(Scheduler):
                     "sub_block_size=%d.",
                     sub_block_size,
                 )
+        elif (
+            self.cache_config.enable_prefix_caching
+            and rbln_config.enable_sub_block_cache
+        ):
+            logger.info(
+                "Sub-block prefix caching off: block_size=%d, prefill_chunk_size=%s",
+                self.block_size,
+                prefill_chunk_sizes,
+            )
 
         # NOTE(RBLN): Block deltas already committed in the KV cache manager
         # but not yet delivered to the model runner because the request was

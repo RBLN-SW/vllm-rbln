@@ -79,7 +79,7 @@ class RBLNConfigBase:
 
     sub_block_size: int | None = Field(default=None, gt=0)
     """Token granularity for prefix cache hit calculation.
-    If None, uses the longest prefill_chunk_size.
+    If None, uses the longest prefill_chunk_size that divides block_size.
     """
 
 

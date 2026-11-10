@@ -3637,7 +3637,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 enable_prefix_caching=self.cache_config.enable_prefix_caching,
                 sub_block_cache=self.rbln_config.enable_sub_block_cache,
                 block_size=self.cache_config.block_size,
-                prefill_chunk_size=self.rbln_config.max_prefill_chunk_size,
+                prefill_chunk_sizes=self.prefill_chunk_sizes,
                 kv_cache_config=kv_cache_config,
                 sub_block_size=self.rbln_config.sub_block_size,
             ),
