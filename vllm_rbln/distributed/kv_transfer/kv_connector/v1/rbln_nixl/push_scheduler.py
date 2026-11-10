@@ -48,7 +48,9 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
     prefill has finished can leave while the rest of it is still being
     computed -- on later pipeline stages, or in this rank's own later chunks.
     What it offers is a prefix of the list the request's end would have
-    offered; the end still carries the block that prefix never closes.
+    offered, and on the step that schedules the closing chunk the whole list
+    where one offer can carry it. Otherwise the end still carries the block
+    the prefix never closes.
     """
 
     _writes_into_peer: ClassVar[bool] = True
@@ -100,8 +102,8 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
         )
         meta.push_early_flush = flush
         self._early_sent -= flush
-        # Only the handover carries the request's last block; a streamed offer
-        # is a closed prefix and never reaches it.
+        # The handover's count. A closing offer carries its own, in
+        # `push_stream_valid_tokens`.
         meta.valid_tokens = {
             req_id: self._valid_tokens.pop(req_id)
             for req_id in meta.push_finished_blocks
@@ -112,7 +114,8 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
     def _build_stream_meta(
         self, meta: RblnNixlConnectorMetadata, scheduler_output: SchedulerOutput
     ) -> None:
-        """Offer the prefix a prefill has closed, on every step it grows.
+        """Offer the prefix a prefill has closed on every step it grows, and the
+        whole list on the step that schedules the closing chunk.
 
         The offer is the accumulated prefix, not the step's new blocks. The
         writer parks an unmatched offer by overwriting what it held for the
@@ -124,9 +127,10 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
         chunk and drops its accumulation there: one method serving both would
         put a mode switch in the one host staging depends on.
 
-        `closed` counts blocks whose tokens were computed before this step, so
-        the writer -- which takes the offer at the start of a later step -- only
-        ever reads KV a forward has already finished with.
+        A prefix offer counts tokens computed before this step. The closing
+        offer also names this step's tokens, which are safe to read because the
+        offer carries the event recorded after this step's forward, and the
+        writer waits on it before reading.
         """
         # The group everything here is counted in, and the one an offer carries.
         # A sliding window's group holds one block whatever the prompt length,
@@ -162,11 +166,28 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
                 req.num_computed_tokens,
                 len(groups[counted]) * self.block_size,
             )
+            total = cdiv(req.num_prompt_tokens, self.block_size)
+            # The step that schedules the closing chunk offers the whole list,
+            # so the last block leaves at the next batch's entry instead of
+            # queueing behind `request_finished`, the batch after it and each
+            # stage's turn.
+            after_step = (
+                req.num_computed_tokens + scheduler_output.num_scheduled_tokens[req_id]
+            )
+            closing = (
+                # An offer never carries the window group.
+                len(groups) == 1
+                and after_step >= req.num_prompt_tokens
+                # The accumulation lags a step on a resume, and an offer must
+                # not name tokens no block of ours holds.
+                and len(groups[counted]) * self.block_size >= after_step
+            )
+            if closing:
+                released = after_step
             # A block before the last leaves once it closes. Chunk mode also
             # releases the last one as it fills, and a write takes only the
             # chunks of it the token count backs -- see `_stream_window`.
-            total = cdiv(req.num_prompt_tokens, self.block_size)
-            if self._shape.cuts_a_block and held > (total - 1) * self.block_size:
+            elif self._shape.cuts_a_block and held > (total - 1) * self.block_size:
                 released = held
             else:
                 released = held // self.block_size * self.block_size
@@ -174,7 +195,12 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
                 continue
             self._released_tokens[req_id] = released
             meta.push_stream_total[req_id] = total
-            meta.push_stream_tokens[req_id] = released
+            if closing:
+                # Without a prefix count the worker reads the list as whole.
+                if self._sends_token_count:
+                    meta.push_stream_valid_tokens[req_id] = after_step
+            else:
+                meta.push_stream_tokens[req_id] = released
             offered = cdiv(released, self.block_size)
             meta.add_new_req_to_save(
                 request_id=req_id,

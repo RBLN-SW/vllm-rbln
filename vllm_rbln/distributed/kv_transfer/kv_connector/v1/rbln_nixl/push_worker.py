@@ -101,6 +101,10 @@ class OfferedBlocks(tuple):
     #: record when the blocks are about to be reused, so a list whose number no
     #: live record carries is one the writer must not send.
     serial: int
+    #: The request's final token count where this list reaches its last block
+    #: ahead of the handover. None elsewhere, where the writer reads the
+    #: handover's count.
+    valid_tokens: int | None
     #: Completes when the forwards that wrote these blocks do. The writer waits
     #: on it before reading them, so the engine thread never has to. None on a
     #: handover: `request_finished` runs after the request's last forward.
@@ -114,6 +118,7 @@ class OfferedBlocks(tuple):
         *,
         handover: bool = False,
         done: "torch.rbln.Event | None",
+        valid_tokens: int | None = None,
     ) -> "OfferedBlocks":
         if groups and not isinstance(groups[0], (list, tuple)):
             # Upstream rebuilds a flat list as a plain tuple of one group
@@ -131,6 +136,7 @@ class OfferedBlocks(tuple):
         self.handover = handover
         self.serial = serial
         self.done = done
+        self.valid_tokens = valid_tokens
         return self
 
 
@@ -174,7 +180,7 @@ class _StreamedSend:
     and `failed` cross between the two, and every access to those is under
     `_sending_transfers_lock`. `total` crosses unlocked, every write of it
     being the same value; `serial` never changes once the record is built. The
-    three `pending_offer` fields are the engine thread's.
+    four `pending_offer` fields are the engine thread's.
     """
 
     # Blocks this rank has closed, held for the next step to hand over. None
@@ -186,6 +192,8 @@ class _StreamedSend:
     # Completes when the device work that wrote those blocks does. Set and
     # cleared with the offer.
     pending_offer_done: "torch.rbln.Event | None" = None
+    # The request's final count, where that offer is its closing chunk's.
+    pending_offer_valid_tokens: int | None = None
     # Whether the writer has been told about this request at all. Not derivable
     # from `pending_offer`: an aborted offer clears that without ever releasing.
     released: bool = False
@@ -345,7 +353,9 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         streamed is the prefix of blocks a prefill CLOSED, and a prompt's last
         block is closed by nothing -- its tokens end mid-block. The handover
         carries the whole list, so it covers that tail, and the writer sends
-        only the part past what it already wrote.
+        only the part past what it already wrote. Where the closing chunk's
+        offer already carried the whole list, that part is empty and the
+        handover only ends the request.
 
         Runs before the call that hands the same metadata to the writer, which
         puts these very objects in its inbox. Marked rather than
@@ -401,6 +411,9 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
             send.pending_offer = meta.local_block_ids
             send.pending_offer_tokens = metadata.push_stream_tokens.get(req_id, 0)
             send.pending_offer_done = done
+            send.pending_offer_valid_tokens = metadata.push_stream_valid_tokens.get(
+                req_id
+            )
             total = metadata.push_stream_total.get(req_id)
             if total is not None:
                 send.total = total
@@ -431,6 +444,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                     send.pending_offer_tokens,
                     send.serial,
                     done=send.pending_offer_done,
+                    valid_tokens=send.pending_offer_valid_tokens,
                 ),
             )
             for req_id, send in self._streamed.items()
@@ -446,6 +460,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
             send.pending_offer = None
             send.pending_offer_tokens = 0
             send.pending_offer_done = None
+            send.pending_offer_valid_tokens = None
             self._finished_blocks_inbox.put((req_id, block_ids))
         self._push_writer_wake.set()
 
@@ -803,6 +818,11 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
             self.consumer_notification_counts_by_req.pop(req_id, None)
         return finished
 
+    def _final_tokens(self, req_id: ReqId, meta: "ReqMeta") -> int | None:
+        """The request's final token count, off the list where it rides one."""
+        on_list = getattr(meta.local_block_ids, "valid_tokens", None)
+        return on_list if on_list is not None else self._valid_tokens.get(req_id)
+
     def _forget_send(self, req_id: ReqId) -> None:
         """Drop what this side tracked for a request it is done pushing."""
         self._streamed.pop(req_id, None)
@@ -816,7 +836,8 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         somewhere it is not, and the count paired with it then describes a
         block the batch does not have. The scheduler sends the total with every
         offer for exactly this. A batch that is the whole list answers for
-        itself -- the handover, and every write of an unstreamed request.
+        itself -- the closing chunk's offer, the handover, and every write of
+        an unstreamed request.
 
         Both are the scheduler's blocks. `in_batch` would be the kernel's where
         upstream splits a logical block, but `__init__` pins the ratio back to
@@ -894,7 +915,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                 )
             tail: AbstractContextManager = (
                 self._tail_viewed_as(
-                    self._valid_tokens.get(req_id),
+                    self._final_tokens(req_id, meta),
                     # The request's own block count: 0.30 trims this route
                     # inside `_xfer_blocks`, after the count is taken.
                     self._prompt_blocks(meta.local_physical_block_ids),
@@ -943,14 +964,15 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         units = {self._chunks_per_block(grid) for grid in grids}
         chunk_grid = grids[0] if len(units) == 1 else None
         cpb = self._chunks_per_block(chunk_grid)
-        # Only the handover carries the request's final token count, and that
-        # is what says how many chunks of its last block hold tokens. The
+        # Only a list that reaches the request's last block -- the closing
+        # offer or the handover -- has its final token count, and that is what
+        # says how many chunks of its last block hold tokens. The
         # descriptor builders below derive the same number from the count they
         # are handed; the window needs it too, to stop a block it writes in
         # pieces at the same place.
         needed = self._tail_chunks(
             self._blocks_in_request(streamed, n_prompt_blocks),
-            self._valid_tokens.get(req_id),
+            self._final_tokens(req_id, meta),
             chunk_grid=chunk_grid,
         )
         window = self._stream_window(
@@ -975,7 +997,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         # span counts in chunks now, so the consumer's end is that many past
         # its last block rather than the block count itself.
         tail_tokens = (
-            self._valid_tokens.get(req_id) if span[1] == registered * cpb else None
+            self._final_tokens(req_id, meta) if span[1] == registered * cpb else None
         )
         n_write_blocks = sum(len(g) for g in local_block_ids)
         if not n_write_blocks and not pieces:
@@ -1099,7 +1121,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         cpb = self._chunks_per_block(self._chunk_grid)
         needed = self._tail_chunks(
             self._blocks_in_request(streamed, n_prompt_blocks),
-            self._valid_tokens.get(req_id),
+            self._final_tokens(req_id, meta),
             chunk_grid=self._chunk_grid,
         )
         offered_tokens = getattr(meta.local_block_ids, "offered_tokens", 0)
@@ -1152,7 +1174,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
             cpb,
         )
         tail_tokens = (
-            self._valid_tokens.get(req_id) if span[1] == registered * cpb else None
+            self._final_tokens(req_id, meta) if span[1] == registered * cpb else None
         )
         if not sum(len(g) for g in local_block_ids) and not pieces:
             logger.debug("streamed write req %s: nothing new to push", req_id)
@@ -1290,8 +1312,9 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
 
         Whole blocks, then in chunk mode the pieces of the request's last
         block: what an earlier batch left of it, or its chunks filled so far.
-        None where a request is not streamed -- the flag off, or a whole prompt
-        offered at once -- which takes the trim instead.
+        None where no offer reached the request -- the flag off, or a prompt
+        the scheduler never offered, such as a hybrid's shorter than a block --
+        which takes the trim instead.
 
         A streamed offer is a growing prefix of the producer's blocks, and the
         consumer registered the TAIL of the prompt, what its own cache did not
@@ -1325,7 +1348,8 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         # while it holds nothing else; once it carries the block being filled, a
         # peer that takes no chunks would write that one whole -- KV this rank has
         # not computed. So the token count decides, and the length is left to the
-        # handover offer, which carries no count.
+        # lists that carry the whole list -- the closing offer and the handover
+        # -- which carry no prefix count.
         closed = offered_tokens // self.block_size if offered_tokens else have
         # Upstream truncates a P-side request so no decode step is scheduled,
         # and the allocator therefore leases it the prompt's blocks and no
