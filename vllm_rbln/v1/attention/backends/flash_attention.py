@@ -720,8 +720,6 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                 v_quantize_scale = layer._v_scale
                 cache_dtype = _fp8_cache_dtype(self.kv_cache_dtype)
                 if attn_metadata.is_prefill:
-                    # Full layers stay causal on an mm prefix LM: HF and upstream
-                    # Gemma4 apply the ranges on sliding layers only.
                     attn_output = flash_causal_attention_naive_prefill(
                         query,
                         key,
