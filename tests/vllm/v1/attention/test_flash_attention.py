@@ -135,6 +135,7 @@ class TestFlashAttentionBackendStatic:
             192,
             224,
             256,
+            512,
         ]
 
     def test_get_name(self):
