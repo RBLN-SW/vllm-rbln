@@ -35,8 +35,6 @@ from vllm_rbln.v1.attention.backends.gdn_attn import (
     gdn_state_shape,
 )
 from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
-from vllm_rbln.v1.worker.utils import num_attn_module as rbln_num_attn_module
-from vllm_rbln.v1.worker.utils import pipeline_adjusted_layer_index
 
 
 @add_registration(
@@ -55,20 +53,13 @@ def register_qwen3_5() -> None:
     )
 
 
-def _layer_index(prefix: str) -> int:
-    vllm_config = get_current_vllm_config()
-    model_config = vllm_config.model_config
-    return pipeline_adjusted_layer_index(
-        prefix,
-        model_config,
-        vllm_config.parallel_config,
-        rbln_num_attn_module(model_config, vllm_config.cache_config.cache_dtype),
-    )
-
-
 class RBLNGDNConvRingCache(nn.Module, AttentionLayerBase):
     """A GatedDeltaNet layer's short-conv ring: a block-aux cache beside the
     layer's state, one ring a state block, addressed by the layer's block ids."""
+
+    # This cache's position among the graph's KV cache inputs. The runner binds
+    # it once the caches exist and requires the attribute beforehand.
+    layer_index = 0
 
     def __init__(
         self, prefix: str, owner: str, block_shape: tuple[int, ...], dtype: torch.dtype
@@ -83,7 +74,6 @@ class RBLNGDNConvRingCache(nn.Module, AttentionLayerBase):
         if prefix in context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         context[prefix] = self
-        self.layer_index = _layer_index(prefix)
 
     def forward(self) -> None: ...
 
@@ -121,6 +111,9 @@ class RBLNGDNConvRingCache(nn.Module, AttentionLayerBase):
     ),
 )
 class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
+    # The state cache's position, bound by the runner as the conv ring's is.
+    layer_index = 0
+
     def __init__(
         self, config, vllm_config: VllmConfig, prefix: str = "", **kwargs
     ) -> None:
@@ -131,7 +124,6 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 f"values, a multiple of {STATE_LANES}, got {self.head_k_dim} / "
                 f"{self.head_v_dim}"
             )
-        self.layer_index = _layer_index(prefix)
         model_config = vllm_config.model_config
         self.num_kv_heads = model_config.get_num_kv_heads(vllm_config.parallel_config)
         self.kv_head_size = model_config.get_head_size()
