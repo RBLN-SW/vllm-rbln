@@ -143,15 +143,18 @@ class RblnNixlConnectorMetadata(NixlConnectorMetadata):
         # window begins can only be found from the total -- and the prefix
         # offered mid-stream is shorter than it.
         self.push_stream_total: dict[ReqId, int] = {}
-        # Tokens of KV the offered prefix holds. Distinct from `valid_tokens`,
-        # which is the request's final count and only exists once it is over:
-        # an offer is a prefix of a request still being computed, and how much
-        # of its last block is filled is what a write smaller than a block
-        # needs to know.
+        # Tokens of KV the offered prefix holds. Distinct from the request's
+        # final count: an offer is a prefix of a request still being computed,
+        # and how much of its last block is filled is what a write smaller than
+        # a block needs to know.
         self.push_stream_tokens: dict[ReqId, int] = {}
-        # Tokens of KV the offered block list holds, so a last block that is not
-        # full can leave the areas above its final token behind. Absent where
-        # the count is unknown, which keeps the whole block.
+        # The final count of a request whose closing chunk this step schedules,
+        # for the offer that carries its whole list. It rides that offer, so it
+        # reaches the writer with the list rather than a step behind it.
+        self.push_stream_valid_tokens: dict[ReqId, int] = {}
+        # The final count for a handover, so a last block that is not full can
+        # leave the areas above its final token behind. Absent where the count
+        # is unknown, which keeps the whole block.
         self.valid_tokens: dict[ReqId, int] = {}
 
     @classmethod
@@ -309,7 +312,8 @@ class TransferShape:
         """Whether a write cuts a block into chunks.
 
         Only chunk mode does. A streamed write on its own sends whole blocks:
-        the ones the prefill has closed, and the last one at the handover.
+        the ones the prefill has closed, and the last one with the closing
+        chunk or at the handover.
         """
         return self.chunk_mode
 
