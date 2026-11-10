@@ -36,10 +36,9 @@ MODELS: list[CompileModelSpec] = [
         {"max_num_seqs": 2, "language_model_only": True},
         chips=REBEL,
         # TODO(rebel-compiler): drop once rolling these GDN layers passes
-        # RblnTensorUnrollLayerLoop (rebel_compiler #14946).
-        envs={"RBLN_EXP_ROLL_LAYERS": "0"},
-        # 3 linear_attention layers then the first full_attention one
-        num_hidden_layers=4,
+        # RblnTensorUnrollLayerLoop. Without nested regions there is
+        # nothing to roll; a release compiler ignores RBLN_EXP_ROLL_LAYERS.
+        envs={"VLLM_RBLN_USE_NESTED_COMPILE_REGION": "0"},
     ),
     CompileModelSpec(
         "Qwen/Qwen3-30B-A3B",

@@ -24,14 +24,13 @@ MODELS = [
     CompileModelSpec("meta-llama/Llama-3.2-1B-Instruct"),
     CompileModelSpec("Qwen/Qwen3-0.6B"),
     CompileModelSpec("google/gemma-3-1b-it"),
-    # Hybrid GatedDeltaNet + gated attention, text-only (M-RoPE needs no vision here)
     CompileModelSpec(
         "Qwen/Qwen3.5-4B",
-        {"language_model_only": True},
+        {"language_model_only": True},  # text-only (M-RoPE needs no vision here)
         # TODO(rebel-compiler): drop once rolling these GDN layers passes
-        # RblnTensorUnrollLayerLoop (rebel_compiler #14946).
-        envs={"RBLN_EXP_ROLL_LAYERS": "0"},
-        num_hidden_layers=4,
+                # RblnTensorUnrollLayerLoop. Without nested regions there is
+                # nothing to roll; a release compiler ignores RBLN_EXP_ROLL_LAYERS.
+                envs={"VLLM_RBLN_USE_NESTED_COMPILE_REGION": "0"},
     ),
     # Quantization schemes
     CompileModelSpec("Qwen/Qwen3-0.6B-FP8"),
