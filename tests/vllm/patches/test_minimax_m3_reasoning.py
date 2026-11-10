@@ -12,22 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 """MiniMax-M3's reasoning state comes from the generation prompt alone.
 
-The tokenizer and the cases are vllm-project/vllm#63492's
-(`tests/reasoning/test_minimax_m3_reasoning_parser.py`), cut to what the
-patch changes.
+The tokenizer and the prompt are vllm-project/vllm#63492's
+(`tests/reasoning/test_minimax_m3_reasoning_parser.py`). Every case but the
+last fails without the registration.
 """
 
 import string
 from collections.abc import Sequence
 
 import pytest
+from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+from vllm.parser.parser_manager import ParserManager
+from vllm.reasoning import ReasoningParserManager
 from vllm.reasoning.minimax_m3_reasoning_parser import MiniMaxM3ReasoningParser
 
 from vllm_rbln.patches.minimax_m3_reasoning import (
-    patched_is_reasoning_end,
-    patched_is_reasoning_end_streaming,
+    PARSER_NAME,
+    register_minimax_m3_reasoning_parser,
+)
+from vllm_rbln.reasoning.minimax_m3_reasoning_parser import (
+    RBLNMiniMaxM3ReasoningParser,
 )
 
 
@@ -105,43 +112,63 @@ PROMPT = (
 )
 
 
+@pytest.fixture(autouse=True)
+def registered() -> None:
+    register_minimax_m3_reasoning_parser()
+
+
 @pytest.fixture
-def parser_and_tokenizer() -> tuple[MiniMaxM3ReasoningParser, MiniMaxM3Tokenizer]:
-    tokenizer = MiniMaxM3Tokenizer()
-    return MiniMaxM3ReasoningParser(tokenizer), tokenizer
+def tokenizer() -> MiniMaxM3Tokenizer:
+    return MiniMaxM3Tokenizer()
 
 
-def test_the_patch_is_the_one_installed():
-    assert MiniMaxM3ReasoningParser.is_reasoning_end is patched_is_reasoning_end
-    assert (
-        MiniMaxM3ReasoningParser.is_reasoning_end_streaming
-        is patched_is_reasoning_end_streaming
-    )
+@pytest.fixture
+def parser(tokenizer) -> MiniMaxM3ReasoningParser:
+    return ReasoningParserManager.get_reasoning_parser(PARSER_NAME)(tokenizer)
 
 
-def test_prompt_markers_do_not_end_reasoning(parser_and_tokenizer):
-    parser, tokenizer = parser_and_tokenizer
+def test_the_name_resolves_to_the_rbln_parser():
+    parser_cls = ReasoningParserManager.get_reasoning_parser(PARSER_NAME)
 
+    assert parser_cls is RBLNMiniMaxM3ReasoningParser
+
+
+def test_prompt_markers_do_not_end_reasoning(parser, tokenizer):
     assert not parser.is_reasoning_end(tokenizer.encode(PROMPT))
-    assert not parser.is_reasoning_end(tokenizer.encode(PROMPT + "<mm:think>ab"))
-    assert parser.is_reasoning_end(tokenizer.encode(PROMPT + "<mm:think>a</mm:think>"))
-    assert parser.is_reasoning_end(tokenizer.encode(PROMPT + "</mm:think>Berlin"))
 
 
-def test_streaming_end_check_ignores_prompt_markers(parser_and_tokenizer):
-    parser, tokenizer = parser_and_tokenizer
-    prompt_ids = tokenizer.encode(PROMPT)
+def test_streaming_end_check_ignores_prompt_markers(parser, tokenizer):
     open_ids = tokenizer.encode("<mm:think>ab")
-    closed_ids = tokenizer.encode("</mm:think>")
 
-    assert not parser.is_reasoning_end_streaming(prompt_ids + open_ids, open_ids[-1:])
-    assert parser.is_reasoning_end_streaming(
-        prompt_ids + open_ids + closed_ids, closed_ids
+    assert not parser.is_reasoning_end_streaming(
+        tokenizer.encode(PROMPT) + open_ids, open_ids[-1:]
     )
 
 
-def test_output_without_a_message_begin_token_is_read_whole(parser_and_tokenizer):
-    parser, tokenizer = parser_and_tokenizer
+def test_a_streamed_response_keeps_its_reasoning_out_of_content(tokenizer):
+    # The serving path: Parser.parse_delta asks is_reasoning_end(prompt) on the
+    # first delta and, on True, sends every later delta to content.
+    parser_cls = ParserManager.get_parser(reasoning_parser_name=PARSER_NAME)
+    parser = parser_cls(tokenizer)
+    request = ChatCompletionRequest(
+        model="minimax-m3", messages=[{"role": "user", "content": "And Germany?"}]
+    )
+    prompt_ids = tokenizer.encode(PROMPT)
 
-    assert parser.is_reasoning_end(tokenizer.encode("<mm:think>a</mm:think>b"))
-    assert not parser.is_reasoning_end(tokenizer.encode("<mm:think>a"))
+    reasoning, content = [], []
+    for char in "<mm:think>ab</mm:think>Berlin":
+        delta = parser.parse_delta(
+            char, tokenizer.encode(char), request, prompt_ids, finished=False
+        )
+        if delta is not None:
+            reasoning.append(delta.reasoning or "")
+            content.append(delta.content or "")
+
+    assert "".join(reasoning) == "ab"
+    assert "".join(content) == "Berlin"
+
+
+def test_upstream_does_not_carry_the_fix():
+    # The removal condition: once this fails, delete the parser, its
+    # registration and this file.
+    assert not hasattr(MiniMaxM3ReasoningParser, "_last_message_ids")
