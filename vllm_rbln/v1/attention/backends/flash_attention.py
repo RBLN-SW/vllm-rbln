@@ -82,6 +82,34 @@ def _fp8_cache_dtype(kv_cache_dtype: str) -> torch.dtype | None:
     }.get(kv_cache_dtype)
 
 
+def _build_mm_prefix_sliding_mask(
+    query: torch.Tensor,
+    row_ends: torch.Tensor,
+    chunk_start: torch.Tensor,
+    window: int,
+    block_size: int,
+) -> torch.Tensor:
+    """Build a mask over the kernel's block-aligned key strip.
+
+    Query positions and row ends are chunk-local; translate the absolute
+    block positions into that same coordinate frame before comparing them.
+    """
+    q_len = query.size(-2)
+    num_blocks = (window + q_len - 1 + block_size - 1) // block_size + 1
+    chunk_start = chunk_start.reshape(1, 1)
+    first_key = torch.clamp(chunk_start - window + 1, min=0) // block_size * block_size
+    query_positions = torch.arange(q_len, device=query.device).view(-1, 1)
+    key_positions = (
+        first_key
+        - chunk_start
+        + torch.arange(num_blocks * block_size, device=query.device)
+    )
+    keep = (key_positions <= row_ends.view(-1, 1)) & (
+        key_positions > query_positions - window
+    )
+    return keep.to(query.dtype).view(1, 1, q_len, -1)
+
+
 @register_backend(AttentionBackendEnum.FLASH_ATTN)
 class RBLNFlashAttentionBackend(AttentionBackend):
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
@@ -604,24 +632,13 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                 attn_mask = None
                 if attn_metadata.mm_prefix_row_ends is not None and layer.use_mm_prefix:
                     assert attn_metadata.is_prefill and b_size == 1
-                    window = self.sliding_window
-                    block_size = kv_cache.size(-2)
-                    num_blocks = (window + q_len - 1 + block_size - 1) // block_size + 1
-                    start = attn_metadata.seq_lens.reshape(1, 1)
-                    first_key = (
-                        torch.clamp(start - window + 1, min=0)
-                        // block_size
-                        * block_size
+                    attn_mask = _build_mm_prefix_sliding_mask(
+                        query,
+                        attn_metadata.mm_prefix_row_ends,
+                        attn_metadata.seq_lens,
+                        self.sliding_window,
+                        kv_cache.size(-2),
                     )
-                    row = torch.arange(q_len, device=query.device).view(-1, 1)
-                    key_positions = (
-                        first_key
-                        - start
-                        + torch.arange(num_blocks * block_size, device=query.device)
-                    )
-                    row_ends = attn_metadata.mm_prefix_row_ends.view(-1, 1)
-                    keep = (key_positions <= row_ends) & (key_positions > row - window)
-                    attn_mask = keep.to(query.dtype).view(1, 1, q_len, -1)
                 # `seq_lens` is the absolute position the chunk starts at, not
                 # a length: the op resolves the window's blocks from it and the
                 # whole table.
