@@ -16,10 +16,10 @@
 from collections.abc import Callable
 
 from .blip2 import get_param_blip2
-from .common import get_param_llama4
 from .exaone4_5 import get_param_exaone4_5
 from .gemma3 import get_param_gemma3, get_param_gemma4
 from .idefics3 import get_param_idefics3
+from .llama4 import get_param_llama4
 from .llava import get_param_llava, get_param_llava_next
 from .paligemma import get_param_paligemma
 from .qwen import (

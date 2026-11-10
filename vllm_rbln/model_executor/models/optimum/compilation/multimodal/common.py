@@ -40,7 +40,7 @@ def get_language_model_config(
     return param
 
 
-def get_param_llama4(
+def get_param_language_model(
     batch_size: int,
     max_model_len: int,
     block_size: int,

@@ -13,26 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .common import get_language_model_config
+from .common import get_param_language_model
 
-
-def get_param_gemma3(
-    batch_size: int,
-    max_model_len: int,
-    block_size: int,
-    num_devices: int,
-    memory_budget: float,
-    prefill_chunk_size: int | None = None,
-) -> dict:
-    language_model_config = get_language_model_config(
-        batch_size,
-        max_model_len,
-        block_size,
-        num_devices,
-        memory_budget,
-        prefill_chunk_size,
-    )
-    return {"language_model": language_model_config}
-
-
+get_param_gemma3 = get_param_language_model
 get_param_gemma4 = get_param_gemma3
