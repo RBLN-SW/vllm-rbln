@@ -601,7 +601,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         # attn_output = [batch,H,4,L,D]
         if self.sliding_window is not None:
             if attn_metadata.swa_appends:
-                attn_mask = getattr(layer, "mm_prefix_mask", None)
+                attn_mask = attn_metadata.swa_attn_masks
                 # `seq_lens` is the absolute position the chunk starts at, not
                 # a length: the op resolves the window's blocks from it and the
                 # whole table.

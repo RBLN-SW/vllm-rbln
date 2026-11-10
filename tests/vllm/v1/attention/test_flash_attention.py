@@ -618,11 +618,10 @@ class TestBuildMmPrefixSlidingWindow:
         from vllm_rbln.model_executor.models.gemma4 import _build_mm_prefix_sliding_mask
 
         layer = torch.nn.Module()
-        layer.mm_prefix_mask = None
 
         def forward(layer, query, key, value, cache, metadata, output):
             if masked:
-                layer.mm_prefix_mask = _build_mm_prefix_sliding_mask(
+                metadata.swa_attn_masks = _build_mm_prefix_sliding_mask(
                     metadata.mm_prefix_row_ends,
                     metadata.seq_lens,
                     self.WINDOW,
@@ -630,7 +629,7 @@ class TestBuildMmPrefixSlidingWindow:
                     query.dtype,
                 )
             impl.forward(layer, query, key, value, cache, metadata, output)
-            layer.mm_prefix_mask = None
+            metadata.swa_attn_masks = None
 
         if backend is not None:
             forward = torch.compile(forward, backend=backend, fullgraph=True)
@@ -980,9 +979,10 @@ class TestForwardSlidingWindow:
             monkeypatch.setattr(
                 flash_attention, name, record if name == target else _unexpected(name)
             )
+        metadata.swa_attn_masks = mm_prefix_mask
         qkv = torch.zeros(b_size, self.HEADS, self.DIM, dtype=dtype)
         impl.forward(
-            SimpleNamespace(mm_prefix_mask=mm_prefix_mask),
+            SimpleNamespace(),
             qkv,
             qkv,
             qkv,

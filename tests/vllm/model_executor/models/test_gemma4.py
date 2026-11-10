@@ -25,7 +25,7 @@ import pytest
 import torch
 from torch import nn
 from transformers import Gemma4VisionConfig, Gemma4VisionModel
-from vllm.forward_context import override_forward_context
+from vllm.forward_context import get_forward_context, override_forward_context
 from vllm.model_executor.models.gemma4 import Gemma4Attention
 from vllm.model_executor.models.gemma4_mm import Gemma4ForConditionalGeneration
 
@@ -478,13 +478,17 @@ def test_prefix_mask_is_shared_and_does_not_escape_forward(monkeypatch, compiled
             self.attn.layer_name = f"layer.{index}"
             self.attn.layer_index = index
             self.attn.sliding_window = 4
-            self.attn.mm_prefix_mask = None
+            self.attn.impl = SimpleNamespace(scale=torch.tensor(1.0))
 
         def forward(self, x):
-            return x + self.attn.mm_prefix_mask[0, 0, 1, 3]
+            metadata = get_forward_context().attn_metadata[self.attn.layer_name]
+            return x * self.attn.impl.scale + metadata.swa_attn_masks[0, 0, 1, 3]
 
     def upstream_forward(self, input_ids, positions, *args, **kwargs):
-        masks = [layer.attn.mm_prefix_mask for layer in self.layers]
+        masks = [
+            get_forward_context().attn_metadata[layer.attn.layer_name].swa_attn_masks
+            for layer in self.layers
+        ]
         assert masks[0] is not None
         assert all(mask is masks[0] for mask in masks)
         for layer in self.layers:
@@ -535,14 +539,14 @@ def test_prefix_mask_is_shared_and_does_not_escape_forward(monkeypatch, compiled
             metadata.mm_prefix_row_ends = torch.tensor(row_ends)
             result = forward(None, torch.zeros(4))
             torch.testing.assert_close(result, torch.full((4,), float(expected)))
-            assert all(
-                layer.mm_prefix_mask is None for layer in model.mm_prefix_attn_layers
-            )
             assert metadata.swa_attn_masks is None
     if compiled:
         assert len(graphs) == 1
         nodes = list(graphs[0].graph.nodes)
         assert sum(node.target is operator.and_ for node in nodes) == 1
+        assert not any(
+            node.op == "placeholder" and "scale" in str(node.target) for node in nodes
+        )
         assert len(nodes[-1].args[0]) == 1
         assert (
             sum(node.target is torch.ops.higher_order.invoke_subgraph for node in nodes)

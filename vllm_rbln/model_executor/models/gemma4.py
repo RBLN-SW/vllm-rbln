@@ -247,7 +247,6 @@ class RBLNGemma4ForConditionalGeneration(
             if isinstance(module, Gemma4Attention):
                 module.attn.use_mm_prefix &= module.is_sliding
                 if module.attn.use_mm_prefix:
-                    module.attn.mm_prefix_mask = None
                     self.mm_prefix_attn_layers.append(module.attn)
         cap = mm_soft_token_cap(
             MULTIMODAL_REGISTRY.create_processor(vllm_config.model_config).info
@@ -422,9 +421,11 @@ class RBLNGemma4ForConditionalGeneration(
         mm_mask: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor | IntermediateTensors:
+        saved_masks = []
         if self.mm_prefix_attn_layers:
+            attn_metadata = get_forward_context().attn_metadata
             layer = self.mm_prefix_attn_layers[0]
-            metadata = get_forward_context().attn_metadata[layer.layer_name]
+            metadata = attn_metadata[layer.layer_name]
             if metadata.mm_prefix_row_ends is not None:
                 assert metadata.is_prefill and metadata.swa_appends
                 mask = _build_mm_prefix_sliding_mask(
@@ -434,9 +435,16 @@ class RBLNGemma4ForConditionalGeneration(
                     _resolve_kv_cache(metadata, layer.layer_index).size(-2),
                     self.model_dtype,
                 )
-                # Workaround: transient layer state keeps shared masks inside the graph.
-                for layer in self.mm_prefix_attn_layers:
-                    layer.mm_prefix_mask = mask
+                # Workaround: borrow metadata without mutating Attention modules.
+                saved_masks = [
+                    (
+                        attn_metadata[layer.layer_name],
+                        attn_metadata[layer.layer_name].swa_attn_masks,
+                    )
+                    for layer in self.mm_prefix_attn_layers
+                ]
+                for metadata, _ in saved_masks:
+                    metadata.swa_attn_masks = mask
         if (
             mm_embeds is not None
             and inputs_embeds is None
@@ -449,6 +457,6 @@ class RBLNGemma4ForConditionalGeneration(
         output = super().forward(
             input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs
         )
-        for layer in self.mm_prefix_attn_layers:
-            layer.mm_prefix_mask = None
+        for metadata, original_mask in saved_masks:
+            metadata.swa_attn_masks = original_mask
         return output
