@@ -23,6 +23,7 @@ from optimum.rbln import (
     RBLNAutoModelForSpeechSeq2Seq,
 )
 from vllm_rbln import envs
+from vllm_rbln.utils.optimum.kv_cache_blocks import resolve_explicit_num_blocks
 from vllm_rbln.utils.optimum.registry import (
     get_rbln_model_info,
     is_enc_dec_arch,
@@ -155,7 +156,10 @@ class RBLNCompileSpec:
                 if name in decoder_config:
                     decoder_config = decoder_config[name]
                     break
-            if num_gpu_blocks_override is None:
+            if (
+                resolve_explicit_num_blocks(num_gpu_blocks_override, rbln_overrides)
+                is None
+            ):
                 decoder_config["memory_budget"] = memory_budget
             if envs.VLLM_RBLN_USE_NESTED_COMPILE_REGION:
                 decoder_config["nested_compile_region"] = True

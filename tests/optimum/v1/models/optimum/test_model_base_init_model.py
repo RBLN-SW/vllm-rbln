@@ -37,6 +37,7 @@ def _init_model_with(
     hf_config,
     num_gpu_blocks_override=None,
     gpu_memory_utilization=0.9,
+    optimum_overrides=None,
 ) -> dict:
     passed = {}
 
@@ -73,9 +74,7 @@ def _init_model_with(
         # `init_model` reads its options off.
         additional_config=OptimumRBLNConfig(
             cached_model_path=str(tmp_path),
-            optimum_overrides={"kvcache_num_blocks": num_gpu_blocks_override}
-            if num_gpu_blocks_override is not None
-            else {},
+            optimum_overrides=optimum_overrides or {},
         ),
         model_config=obj.model_config,
         scheduler_config=obj.scheduler_config,
@@ -137,23 +136,36 @@ def test_transformers_config_is_forwarded_as_the_config_object(monkeypatch, tmp_
 
 
 @pytest.mark.parametrize(
-    "num_blocks, utilization", [(None, 0.5), (None, 0.9), (16, 1.0)]
+    "num_blocks, override_blocks, utilization",
+    [
+        (None, None, 0.5),
+        (None, None, 0.9),
+        (None, 0, 0.9),
+        (None, 16, 1.0),
+        (16, 16, 1.0),
+    ],
 )
 def test_validated_vllm_cache_settings_select_compile_budget(
-    monkeypatch, tmp_path, num_blocks, utilization
+    monkeypatch, tmp_path, num_blocks, override_blocks, utilization
 ):
     monkeypatch.setenv("RBLN_FORCE_NPU_NAME", "RBLN-CA25")
     build_spec = model_base.RBLNCompileSpec.for_architecture
     config = LlamaConfig(architectures=["LlamaForCausalLM"], num_hidden_layers=2)
-    passed = _init_model_with(monkeypatch, tmp_path, config, num_blocks, utilization)
+    overrides = (
+        {} if override_blocks is None else {"kvcache_num_blocks": override_blocks}
+    )
+    passed = _init_model_with(
+        monkeypatch, tmp_path, config, num_blocks, utilization, overrides
+    )
     spec = build_spec(config, **passed["compile_kwargs"])
     validated = RBLNLlamaForCausalLMConfig(**spec.rbln_config)
-    expected_budget = utilization if num_blocks is None else None
+    explicit_blocks = num_blocks is not None or override_blocks == 16
+    expected_budget = None if explicit_blocks else utilization
     assert passed["compile_kwargs"]["memory_budget"] == utilization
     assert passed["compile_kwargs"]["num_gpu_blocks_override"] == num_blocks
-    if num_blocks is None:
-        assert spec.rbln_config["memory_budget"] == utilization
-    else:
+    if explicit_blocks:
         assert "memory_budget" not in spec.rbln_config
+    else:
+        assert spec.rbln_config["memory_budget"] == utilization
     assert validated.memory_budget == expected_budget
-    assert validated.kvcache_num_blocks == (num_blocks or 0)
+    assert validated.kvcache_num_blocks == (override_blocks or 0)

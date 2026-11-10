@@ -167,10 +167,27 @@ def test_the_former_prefix_block_size_key_is_accepted():
     assert config.sub_block_size == 256
 
 
-@pytest.mark.parametrize("num_blocks", [None, 16])
+@pytest.mark.parametrize(
+    "num_blocks, override_blocks",
+    [(None, None), (None, 0), (None, 16), (16, None), (16, 16), (16, 32)],
+)
+@pytest.mark.parametrize(
+    "architecture, decoder_key",
+    [
+        ("LlamaForCausalLM", None),
+        ("Gemma3ForConditionalGeneration", "language_model"),
+        ("Idefics3ForConditionalGeneration", "text_model"),
+    ],
+)
 @pytest.mark.parametrize("utilization", [0.5, 0.9, 1.0])
 def test_explicit_blocks_normalize_memory_utilization_with_log(
-    monkeypatch, caplog, num_blocks, utilization
+    monkeypatch,
+    caplog,
+    num_blocks,
+    override_blocks,
+    architecture,
+    decoder_key,
+    utilization,
 ):
     from vllm_rbln.platform.optimum_impl import check_and_update
     from vllm_rbln.utils.optimum import converter, predicates
@@ -182,14 +199,19 @@ def test_explicit_blocks_normalize_memory_utilization_with_log(
         lambda cfg: synced_utilizations.append(cfg.cache_config.gpu_memory_utilization),
     )
     monkeypatch.setattr(predicates, "forces_fp32_dtype", lambda cfg: False)
-    hf_config = SimpleNamespace(architectures=["LlamaForCausalLM"])
+    hf_config = SimpleNamespace(architectures=[architecture])
     cache_config = CacheConfig(
         num_gpu_blocks_override=num_blocks,
         gpu_memory_utilization=utilization,
         enable_prefix_caching=False,
     )
+    overrides = (
+        {} if override_blocks is None else {"kvcache_num_blocks": override_blocks}
+    )
     cfg = SimpleNamespace(
-        additional_config={},
+        additional_config={
+            "optimum_overrides": {decoder_key: overrides} if decoder_key else overrides
+        },
         cache_config=cache_config,
         model_config=SimpleNamespace(
             multimodal_config=None,
@@ -203,9 +225,22 @@ def test_explicit_blocks_normalize_memory_utilization_with_log(
         scheduler_config=SimpleNamespace(async_scheduling=False),
         speculative_config=None,
     )
+    if num_blocks == 16 and override_blocks == 32:
+        key = rf"{decoder_key}\." if decoder_key else ""
+        with pytest.raises(
+            ValueError,
+            match=rf"num_gpu_blocks_override=16.*optimum_overrides\.{key}kvcache_num_blocks=32",
+        ):
+            check_and_update(cfg)
+        assert synced_utilizations == []
+        assert cache_config.gpu_memory_utilization == utilization
+        assert cache_config.num_gpu_blocks_override == num_blocks
+        return
+
     with caplog.at_level("INFO", logger="vllm_rbln.platform.optimum_impl"):
         check_and_update(cfg)
-    expected_utilization = 1.0 if num_blocks is not None else utilization
+    explicit_blocks = num_blocks is not None or override_blocks == 16
+    expected_utilization = 1.0 if explicit_blocks else utilization
     assert cache_config.gpu_memory_utilization == expected_utilization
     assert synced_utilizations == [expected_utilization]
     assert cache_config.num_gpu_blocks_override == num_blocks
@@ -214,10 +249,10 @@ def test_explicit_blocks_normalize_memory_utilization_with_log(
         for r in caplog.records
         if "Setting gpu_memory_utilization" in r.getMessage()
     ]
-    if num_blocks is not None and utilization != 1.0:
+    if explicit_blocks and utilization != 1.0:
         assert len(messages) == 1
         assert f"from {utilization} to 1.0" in messages[0]
-        assert f"num_gpu_blocks_override={num_blocks}" in messages[0]
+        assert "explicit KV cache block count=16" in messages[0]
     else:
         assert messages == []
 

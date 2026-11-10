@@ -37,27 +37,28 @@ def patch_upstream() -> None:
 def check_and_update(vllm_config: "VllmConfig") -> None:
     from vllm_rbln.config import build_optimum_rbln_config
     from vllm_rbln.utils.optimum.converter import sync_vllm_and_optimum
+    from vllm_rbln.utils.optimum.kv_cache_blocks import resolve_explicit_num_blocks
     from vllm_rbln.utils.optimum.predicates import forces_fp32_dtype
     from vllm_rbln.utils.optimum.registry import is_pooling_arch
-
-    cache_config = vllm_config.cache_config
-    if (
-        cache_config.num_gpu_blocks_override is not None
-        and cache_config.gpu_memory_utilization != 1.0
-    ):
-        logger.info(
-            "Setting gpu_memory_utilization from %s to 1.0 because "
-            "num_gpu_blocks_override=%d is set.",
-            cache_config.gpu_memory_utilization,
-            cache_config.num_gpu_blocks_override,
-        )
-        cache_config.gpu_memory_utilization = 1.0
 
     # Everything below, and the sync at the end, reads additional_config as an
     # OptimumRBLNConfig. The sync also writes its derived fields back.
     vllm_config.additional_config = build_optimum_rbln_config(
         vllm_config.additional_config
     )
+    cache_config = vllm_config.cache_config
+    num_blocks = resolve_explicit_num_blocks(
+        cache_config.num_gpu_blocks_override,
+        vllm_config.additional_config.optimum_overrides,
+    )
+    if num_blocks is not None and cache_config.gpu_memory_utilization != 1.0:
+        logger.info(
+            "Setting gpu_memory_utilization from %s to 1.0 because "
+            "an explicit KV cache block count=%d is set.",
+            cache_config.gpu_memory_utilization,
+            num_blocks,
+        )
+        cache_config.gpu_memory_utilization = 1.0
 
     model_config = vllm_config.model_config
     parallel_config = vllm_config.parallel_config
