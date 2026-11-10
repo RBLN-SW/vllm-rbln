@@ -20,17 +20,26 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 import torch
 from vllm.config import (
     CacheConfig,
+    ECTransferConfig,
+    KVEventsConfig,
     KVTransferConfig,
     ModelConfig,
     ParallelConfig,
     SchedulerConfig,
     SpeculativeConfig,
     VllmConfig,
+)
+from vllm.config.ec_manager_config import EncoderCacheManagerConfig
+from vllm.distributed.ec_transfer.ec_connector.base import (
+    ECConnectorBase,
+    ECConnectorMetadata,
+    ECConnectorRole,
 )
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -39,6 +48,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorOutput,
 )
 from vllm.lora.request import LoRARequest
+from vllm.multimodal.inputs import (
+    MultiModalFeatureSpec,
+    MultiModalKwargsItem,
+    PlaceholderRange,
+)
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
@@ -132,13 +146,57 @@ if "MockKVConnector" not in KVConnectorFactory._registry:
     )
 
 
+class ECConnectorInTransit(ECConnectorBase):
+    """A scheduler-side EC consumer whose encoder outputs arrive when told to."""
+
+    def __init__(self, *, is_producer: bool = False) -> None:
+        super().__init__(
+            SimpleNamespace(
+                ec_transfer_config=SimpleNamespace(
+                    is_ec_producer=is_producer, is_ec_consumer=True
+                )
+            ),
+            ECConnectorRole.SCHEDULER,
+        )
+        self.arrived = False
+
+    def ensure_cache_available(self, request, num_computed_tokens):
+        return self.arrived
+
+    def has_cache_item(self, identifier):
+        return False
+
+    def update_state_after_alloc(self, request, index):
+        pass
+
+    def build_connector_meta(self, scheduler_output):
+        return ECConnectorMetadata()
+
+    def start_load_caches(self, encoder_cache, **kwargs):
+        raise AssertionError("worker-side only")
+
+    def save_caches(self, encoder_cache, mm_hash, **kwargs):
+        raise AssertionError("worker-side only")
+
+
+def image_at(offset: int, length: int) -> MultiModalFeatureSpec:
+    return MultiModalFeatureSpec(
+        data=MultiModalKwargsItem.dummy(),
+        modality="image",
+        identifier=f"image@{offset}",
+        mm_position=PlaceholderRange(offset=offset, length=length),
+    )
+
+
 def create_rbln_scheduler(
     *,
     model: str = "facebook/opt-125m",
     max_num_seqs: int = 16,
+    max_num_active_seqs: int | None = None,
     max_num_batched_tokens: int = 16,
     enable_chunked_prefill: bool = True,
     enable_prefix_caching: bool = False,
+    enable_kv_cache_events: bool = False,
     long_prefill_token_threshold: int = 0,
     num_blocks: int = 10000,
     block_size: int = 16,
@@ -150,6 +208,8 @@ def create_rbln_scheduler(
     use_kv_connector: MockKVConfig | None = None,
     async_scheduling: bool = False,
     additional_config: dict | None = None,
+    ec_transfer_config: ECTransferConfig | None = None,
+    ec_manager_config: EncoderCacheManagerConfig | None = None,
 ) -> RBLNScheduler:
     """Build an RBLNScheduler on CPU (ported from upstream tests/v1/core/utils):
     opt-125m config only, num_gpu_blocks set manually, no KV connector."""
@@ -160,6 +220,7 @@ def create_rbln_scheduler(
         max_model_len = max_num_batched_tokens
     scheduler_config = SchedulerConfig(
         max_num_seqs=max_num_seqs,
+        max_num_active_seqs=max_num_active_seqs,
         max_num_batched_tokens=max_num_batched_tokens,
         max_model_len=max_model_len,
         long_prefill_token_threshold=long_prefill_token_threshold,
@@ -196,6 +257,11 @@ def create_rbln_scheduler(
         parallel_config=ParallelConfig(pipeline_parallel_size=pipeline_parallel_size),
         speculative_config=speculative_config,
         kv_transfer_config=kv_transfer_config,
+        ec_transfer_config=ec_transfer_config,
+        ec_manager_config=ec_manager_config or EncoderCacheManagerConfig(),
+        kv_events_config=KVEventsConfig(
+            enable_kv_cache_events=enable_kv_cache_events, publisher="null"
+        ),
         additional_config={
             # RBLNConfig takes a size above zero or nothing at all.
             **({"sub_block_size": sub_block_size} if sub_block_size else {}),

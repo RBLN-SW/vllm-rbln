@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -15,6 +15,7 @@
 
 import os
 import time
+from functools import cached_property
 from types import NoneType
 from typing import TYPE_CHECKING, Any
 
@@ -33,6 +34,12 @@ from vllm.distributed import (
     init_distributed_environment,
     set_custom_all_reduce,
 )
+from vllm.distributed.ec_transfer import (
+    ensure_ec_transfer_initialized,
+    ensure_ec_transfer_shutdown,
+    get_ec_transfer,
+    has_ec_transfer,
+)
 from vllm.distributed.kv_transfer import (
     ensure_kv_transfer_initialized,
     ensure_kv_transfer_shutdown,
@@ -44,6 +51,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.distributed.parallel_state import get_dp_group, get_pp_group, get_tp_group
 from vllm.platforms import current_platform
+from vllm.platforms.interface import set_assigned_physical_gpu_ids
 from vllm.profiler.wrapper import TorchProfilerWrapper
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
@@ -61,7 +69,6 @@ from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 import vllm_rbln.envs as envs
-from vllm_rbln.config import RBLNConfig
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import (
     finalize_kv_cache_registrations,
 )
@@ -71,12 +78,16 @@ from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
 from vllm_rbln.v1.worker.utils import (
     RblnProfilerWrapper,
     compile_and_warmup_skip_reason,
+    compute_rbln_local_omp_cpuid,
     dynamic_kv_enabled,
     estimate_model_kernel_size,
+    get_default_num_threads,
+    get_num_local_ranks,
     get_rbln_planned_affinity_cpu_count,
     read_rbln_card_dram_used_bytes,
     set_cpu_affinity,
     set_omp_num_threads,
+    set_preferred_memory_node,
     worker_fail_fast,
 )
 
@@ -127,40 +138,39 @@ class RBLNWorker(WorkerBase):
         logger.warning("Sleep mode is not supported on RBLN, ignore it.")
         pass
 
-    def _init_device_env(self) -> None:
-        rbln_config: RBLNConfig = self.vllm_config.additional_config
-        env_var = current_platform.device_control_env_var
-        num_devices = rbln_config.num_devices_per_local_rank
+    def discard(self, tags: tuple[str, ...]) -> None:
+        raise RuntimeError("Selective discard is not supported on RBLN.")
 
-        dp_rank = self.parallel_config.data_parallel_rank_local or 0
-        slot = dp_rank * self.parallel_config.world_size + self.local_rank
-        first = slot * num_devices
-        # The visible variant, because every worker process is handed a data
-        # parallel mapping of one device per rank that the logical variant
-        # prefers (MultiprocExecutor.worker_main), and a rank owning
-        # num_devices NPUs cannot be described by one entry.
+    def _init_device_env(self) -> None:
+        env_var = current_platform.device_control_env_var
+
+        # As upstream's GPU worker: vLLM's per-DP-rank mapping, which carries
+        # --device-ids, decides the device; without one the pool in env_var does.
+        # Published here because UniProcExecutor, unlike worker_main, does not.
+        # In-process DP (InprocClient) gets no mapping, so offset into the pool
+        # by the local DP rank, as upstream's GPU worker does.
+        assigned = self.parallel_config.assigned_physical_gpu_ids
+        if assigned is not None:
+            set_assigned_physical_gpu_ids(assigned)
+            device_id = self.local_rank
+        else:
+            dp_rank = self.parallel_config.data_parallel_rank_local or 0
+            device_id = dp_rank * self.parallel_config.world_size + self.local_rank
         try:
-            selected = [
-                current_platform.visible_device_id_to_physical_device_id(first + offset)
-                for offset in range(num_devices)
-            ]
+            selected = current_platform.device_id_to_physical_device_id(device_id)
         except IndexError as e:
             raise ValueError(
-                f"rank slot {slot} needs {num_devices} NPU(s) from index "
-                f"{first} of {env_var}={os.environ.get(env_var, '')!r}. "
-                "One entry per NPU is expected."
+                f"device index {device_id} (local rank {self.local_rank}) has no "
+                f"NPU in assigned_physical_gpu_ids={assigned} / "
+                f"{env_var}={os.environ.get(env_var, '')!r}."
             ) from e
 
-        selected_devices = ",".join(str(device) for device in selected)
-        os.environ[env_var] = selected_devices
+        os.environ[env_var] = str(selected)
         logger.info(
             "Local rank: %d, Selected devices: %s",
             self.local_rank,
-            selected_devices,
+            selected,
         )
-
-        if num_devices > 1:
-            os.environ["RBLN_NPUS_PER_DEVICE"] = str(num_devices)
 
     @worker_fail_fast
     @instrument(span_name="Init device")
@@ -184,6 +194,8 @@ class RBLNWorker(WorkerBase):
             self.local_rank,
             current_platform.dist_backend,
         )
+        # Before model load and warm-up, whose host pages the decode loop reuses.
+        set_preferred_memory_node(self.rank, self.local_rank, self._rbln_omp_cpuid)
 
         # Set random seed.
         set_random_seed(self.model_config.seed)
@@ -204,6 +216,9 @@ class RBLNWorker(WorkerBase):
     def load_model(self):
         with set_current_vllm_config(self.vllm_config):
             self.model_runner.load_model()
+
+        if has_ec_transfer():
+            get_ec_transfer().start_worker_services()
 
     @torch.inference_mode()
     @worker_fail_fast
@@ -336,13 +351,11 @@ class RBLNWorker(WorkerBase):
 
         logger.info("n_model_bytes = %.2f GB", n_model_bytes / 1024**3)
 
-        rbln_config: RBLNConfig = self.vllm_config.additional_config
         estimate_kwargs = dict(
             model_config=self.model_config,
             parallel_config=self.parallel_config,
             num_runtimes=num_runtimes,
             gpu_memory_utilization=self.cache_config.gpu_memory_utilization,
-            num_devices_per_local_rank=rbln_config.num_devices_per_local_rank,
         )
 
         speculative_config = self.speculative_config
@@ -654,19 +667,18 @@ class RBLNWorker(WorkerBase):
 
             # Create the profiler wrapper only on the first start call
             if self.profiler is None:
-                from vllm.profiler.wrapper import TorchProfilerActivityMap
-
-                activities = ["CPU"]
-                if "RBLN" in TorchProfilerActivityMap:
-                    activities.append("RBLN")
-
                 profiler_type = self.profiler_config.profiler
                 if profiler_type == "torch":
                     self.profiler = TorchProfilerWrapper(
                         self.profiler_config,
                         worker_name=trace_name,
                         local_rank=self.local_rank,
-                        activities=activities,
+                        activities=(
+                            self.profiler_config.torch_profiler_activities
+                            if self.profiler_config.torch_profiler_activities
+                            is not None
+                            else ("CPU", "PrivateUse1")
+                        ),
                     )
                     logger.debug(
                         "Starting torch profiler with tarce name: %s", trace_name
@@ -718,6 +730,8 @@ class RBLNWorker(WorkerBase):
         # has_kv_transfer_group can be None during interpreter shutdown.
         if ensure_kv_transfer_shutdown is not None:
             ensure_kv_transfer_shutdown()
+        if ensure_ec_transfer_shutdown is not None:
+            ensure_ec_transfer_shutdown()
         if self.profiler is not None:
             self.profiler.shutdown()
 
@@ -737,6 +751,13 @@ class RBLNWorker(WorkerBase):
         if num_removed:
             logger.info("Released %d RBLN offload temp file(s)", num_removed)
 
+    @cached_property
+    def _rbln_omp_cpuid(self) -> str:
+        # Computed once: the CPUs it reads shrink once the binding is applied.
+        return compute_rbln_local_omp_cpuid(
+            self.rank, self.local_rank, self.parallel_config
+        )
+
     def _ensure_rbln_host_threads_before_compile(self) -> None:
         """Set OpenMP / torch / numba threads before ``warm_up_model()`` without
         CPU affinity.
@@ -750,12 +771,10 @@ class RBLNWorker(WorkerBase):
         if self._rbln_host_threads_before_compile_ready:
             return
 
-        allocated_cpus = get_rbln_planned_affinity_cpu_count(
-            self.rank,
-            self.local_rank,
-            self.parallel_config,
+        allocated_cpus = get_rbln_planned_affinity_cpu_count(self._rbln_omp_cpuid)
+        num_threads = get_default_num_threads(
+            allocated_cpus, get_num_local_ranks(self.parallel_config)
         )
-        num_threads = max(2, allocated_cpus // 2)
         set_omp_num_threads(
             self.rank,
             self.local_rank,
@@ -784,11 +803,7 @@ class RBLNWorker(WorkerBase):
         if self._rbln_cpu_affinity_applied:
             return
 
-        set_cpu_affinity(
-            self.rank,
-            self.local_rank,
-            self.parallel_config,
-        )
+        set_cpu_affinity(self.rank, self.local_rank, self._rbln_omp_cpuid)
         self._rbln_cpu_affinity_applied = True
 
 
@@ -840,3 +855,6 @@ def init_worker_distributed_environment(
         parallel_config.tensor_parallel_size,
         parallel_config.pipeline_parallel_size,
     )
+
+    # Before any KV cache work: an EC encoder-only instance allocates none.
+    ensure_ec_transfer_initialized(vllm_config)

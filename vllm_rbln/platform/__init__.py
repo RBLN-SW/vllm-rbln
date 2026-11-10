@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -20,6 +20,7 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.config.logging import LoggingConfig
     from vllm.utils.argparse_utils import FlexibleArgumentParser
     from vllm.v1.attention.selector import AttentionSelectorConfig
 
@@ -28,11 +29,12 @@ else:
     VllmConfig = None
 
 import rebel
+import vllm.logger as vllm_logger
 from torch._dynamo import register_backend
 from vllm.logger import init_logger
 from vllm.platforms import Platform, PlatformEnum
 
-import vllm_rbln.logger  # noqa: F401
+import vllm_rbln.logger
 from vllm_rbln import envs
 
 logger = init_logger(__name__)
@@ -40,11 +42,28 @@ logger = init_logger(__name__)
 # any engine code reads a variable.
 envs.publish_to_vllm_envs()
 
+_configure_upstream_logging = vllm_logger._configure_vllm_root_logger
+
+
+def _configure_logging(config: "LoggingConfig | None" = None) -> None:
+    _configure_upstream_logging(config)
+    vllm_rbln.logger._sync_logging_config(config)
+
+
+# No logging callback exists for a separate namespace. This must precede
+# argument parsing and cover both model paths, before the patch registry runs.
+vllm_logger._configure_vllm_root_logger = _configure_logging
+
 # Assigned by `_apply_model_impl`, which this module calls once at the bottom
-# and `register_ops` calls again once the arguments name the model path. Eight
-# modules copy this name into their own namespace, and every one of them imports
-# after both.
+# and `register_ops` calls again once the arguments name the model path. Read it
+# through `use_device_tensor()`: a copy bound at import keeps the import-time guess.
 USE_DEVICE_TENSOR: bool = False
+
+
+def use_device_tensor() -> bool:
+    return USE_DEVICE_TENSOR
+
+
 # RBLN default for an unset max_num_seqs (upstream vLLM defaults to 256).
 RBLN_DEFAULT_MAX_NUM_SEQS = 1
 RBLN_DEFAULT_MAX_NUM_BATCHED_TOKENS = 512
@@ -208,6 +227,33 @@ class RblnPlatform(Platform):
         EngineArgs._rbln_max_num_seqs_patched = True
 
     @classmethod
+    def _use_v1_model_runner(cls) -> None:
+        """Fix runner selection before either model path builds its config.
+
+        Upstream has no platform hook for this property. The registry only
+        reaches the vllm model path, while both RBLN runners need V1 semantics.
+        """
+        from vllm.config import VllmConfig
+        from vllm.platforms import current_platform
+
+        if not isinstance(current_platform, cls):
+            return
+        if getattr(VllmConfig, "_rbln_runner_patched", False):
+            return
+
+        original_getter = vars(VllmConfig)["use_v2_model_runner"].fget
+
+        def use_v2_model_runner(config):
+            if original_getter(config):
+                logger.warning_once(
+                    "RBLN uses its own model runner; V2 selection is ignored."
+                )
+            return False
+
+        VllmConfig.use_v2_model_runner = property(use_v2_model_runner)
+        VllmConfig._rbln_runner_patched = True
+
+    @classmethod
     def _capture_model_impl(cls) -> None:
         """Adopt the model path as soon as the arguments name it.
 
@@ -242,7 +288,7 @@ class RblnPlatform(Platform):
                 # The prefill chunk size that path compiles is
                 # `--max-num-batched-tokens` as the user gave it, and the call
                 # below replaces an unset one with a default, leaving
-                # `sync_from_vllm` no way to tell the two apart. Nothing else
+                # `prepare_compile_inputs` no way to tell the two apart. Nothing else
                 # writes additional_config now, so an unset one starts here.
                 if config is None:
                     config = self.additional_config = {}
@@ -283,6 +329,7 @@ class RblnPlatform(Platform):
     def pre_register_and_update(
         cls, parser: "FlexibleArgumentParser | None" = None
     ) -> None:
+        cls._use_v1_model_runner()
         # Early enough that vLLM has read neither the device-control env var nor
         # max_num_seqs, which is still None here.
         cls._adopt_deprecated_device_control_env_var()
@@ -325,10 +372,15 @@ class RblnPlatform(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
-        if vllm_config.use_v2_model_runner:
+        ec_config = vllm_config.ec_transfer_config
+        if (
+            vllm_config.is_mm_encoder_only
+            and ec_config is not None
+            and ec_config.is_ec_consumer
+        ):
             raise ValueError(
-                "Model runner V2 is not supported for RBLN backend. "
-                "Set VLLM_USE_V2_MODEL_RUNNER=0."
+                "--mm-encoder-only skips the language model, so it cannot be used "
+                "on an EC consumer."
             )
 
         _impl().check_and_update(vllm_config)

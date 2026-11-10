@@ -95,10 +95,10 @@ def patched_get_mla_prefill_backend(vllm_config) -> type[_RBLNNoOpMLAPrefillBack
         "MLAAttention.get_kv_cache_spec"
     ),
     reason=(
-        "fp8 DSA MLA stores the latent cache as an RBLN-packed 768-byte int8 row "
+        "fp8 DSA MLA stores the latent cache as an RBLN-packed 768-byte uint8 row "
         "(512 fp8 kv_c + fp16 scale + k_pe), quantized/packed in-kernel by the "
         "sparse_attn_deepseek_mla fp8 kernel. The compiler routes fp8 vs bf16 by "
-        "the cache channel width (768 != 576), so allocate head_size=768 int8. "
+        "the cache channel width (768 != 576), so allocate head_size=768 uint8. "
         "cache_dtype_str stays 'auto' so the page size is the plain "
         "head_size*itemsize (768B), not the upstream fp8_ds_mla 656B layout. "
         "Only the sparse (DSA) path packs this way; a dense MLA layer keeps the "
@@ -121,7 +121,7 @@ def patched_mla_get_kv_cache_spec(self: MLAAttention, vllm_config):
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
             head_size=packed_head_size,
-            dtype=torch.int8,
+            dtype=torch.uint8,
             cache_dtype_str="auto",
         )
     return mla_attention_original_get_kv_cache_spec(self, vllm_config)

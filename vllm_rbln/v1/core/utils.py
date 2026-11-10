@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -35,34 +35,25 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 
-# --- Step phase: prefill graph or decode graph -------------------------------
-#
-# RBLN compiles a graph per shape, so a step runs one graph or the other, never a
-# mix. Two functions answer which, because the scheduler decides the phase but
-# every PP rank has to arrive at the same answer:
-#
-#   is_prefill(request)         2 or more tokens left to compute. The definition,
-#                               on pre-advance state only the scheduler holds.
-#   step_is_prefill(sched_out)  2 or more non-draft tokens scheduled. The same
-#                               phase, from what every rank receives alike.
-#
-# They can disagree only on a prefill scheduled exactly 1 token. That does not
-# happen: with 1 token left, is_prefill() already reports decode, which is where
-# a 1-token prompt, a chunked prefill's last token, a full remote-KV match and a
-# full prefix-cache match all land -- and no clamp in schedule() cuts a chunk
-# that short. The scheduler tests pin both views together across whole runs.
-#
-# If that ever breaks, an unfinished prompt runs on the decode graph, and
-# is_intermediate_chunked_prefill falls with it since it ANDs the phase: the step
-# gets sampled and drafts get proposed with no anchor token, landing drafts on a
-# request that is still prefilling.
+# is_prefill reads the request's remaining tokens; step_is_prefill reads the
+# scheduled non-draft token count shared by all PP ranks. Encoder scheduling
+# can truncate an unfinished prompt to one token, so these views can disagree.
+# A decode step classification therefore does not imply a completed prompt.
 
 
 def is_prefill(request: Request) -> bool:
-    return request.num_computed_tokens < request.num_tokens - 1
+    return (
+        request.num_computed_tokens == 0
+        or request.num_computed_tokens < request.num_tokens - 1
+    )
 
 
 def step_is_prefill(scheduler_output: SchedulerOutput) -> bool:
+    if any(req.num_computed_tokens == 0 for req in scheduler_output.scheduled_new_reqs):
+        return True
+    if 0 in scheduler_output.scheduled_cached_reqs.num_computed_tokens:
+        # Resumed from preemption, recomputing from the start.
+        return True
     return any(
         num_base_tokens(
             scheduler_output.num_scheduled_tokens,
@@ -246,7 +237,7 @@ def sub_block_size_in_use(
     enable_prefix_caching: bool,
     sub_block_cache: bool,
     block_size: int,
-    max_num_batched_tokens: int,
+    prefill_chunk_size: int,
     kv_cache_config: KVCacheConfig,
     sub_block_size: int | None = None,
 ) -> int | None:
@@ -276,18 +267,18 @@ def sub_block_size_in_use(
             )
         return None
 
-    sub_block_size = wanted or max_num_batched_tokens
+    sub_block_size = wanted or prefill_chunk_size
     eligible = RBLNKVCacheManager.can_use_sub_block_caching(
         kv_cache_config, sub_block_size
     )
-    fits = block_size >= max_num_batched_tokens >= sub_block_size
+    fits = block_size >= prefill_chunk_size >= sub_block_size
     if not wanted:
         if not (eligible and fits):
             return None
     elif not fits:
         raise ValueError(
-            "sub-block prefix caching needs block_size >= max_num_batched_tokens "
-            f">= sub_block_size, got {block_size} >= {max_num_batched_tokens} >= "
+            "sub-block prefix caching needs block_size >= prefill_chunk_size >= "
+            f"sub_block_size, got {block_size} >= {prefill_chunk_size} >= "
             f"{sub_block_size}."
         )
     elif not eligible:
@@ -298,10 +289,10 @@ def sub_block_size_in_use(
         )
     # Left until last: the equal case never asks, so a compile-only worker with
     # no NPU to name still starts on the default setting.
-    if sub_block_size != max_num_batched_tokens and not current_platform.is_cr13():
+    if sub_block_size != prefill_chunk_size and not current_platform.is_cr13():
         raise ValueError(
-            f"sub_block_size={sub_block_size} below max_num_batched_tokens="
-            f"{max_num_batched_tokens} makes a prefill chunk span two blocks, "
+            f"sub_block_size={sub_block_size} below prefill_chunk_size="
+            f"{prefill_chunk_size} makes a prefill chunk span two blocks, "
             "which needs the multi-block store that only REBEL CR13 carries; "
             f"this is {current_platform.get_device_name()}."
         )

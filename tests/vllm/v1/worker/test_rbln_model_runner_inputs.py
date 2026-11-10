@@ -17,10 +17,19 @@
 # sampler's output back.
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
 import torch
+from vllm.config import ECTransferConfig, ModelConfig
+from vllm.config.multimodal import MultiModalConfig
+from vllm.multimodal.inputs import (
+    MultiModalFeatureSpec,
+    MultiModalFieldConfig,
+    MultiModalKwargsItem,
+    PlaceholderRange,
+)
 from vllm.v1.outputs import SamplerOutput
 
 import vllm_rbln.v1.worker.rbln_model_runner as mr
@@ -30,8 +39,199 @@ from tests.vllm.v1.worker.utils import (
     make_speculative_config,
     schedule_new,
 )
+from vllm_rbln.v1.worker.input_stager import InputLayout
 
 pytestmark = pytest.mark.maybe_use_device
+
+
+class _InGraphMergeModel(torch.nn.Module):
+    merges_mm_embeds_in_graph = True
+
+
+class TestResolveMultiModalSupport:
+    @staticmethod
+    def _multimodal(monkeypatch, value: bool) -> None:
+        monkeypatch.setattr(
+            ModelConfig, "supports_multimodal_inputs", property(lambda self: value)
+        )
+
+    def test_a_text_model_stays_off_the_path(self, make_model_runner, monkeypatch):
+        runner = make_model_runner()
+        self._multimodal(monkeypatch, False)
+        runner.model = _InGraphMergeModel()
+
+        assert runner._resolve_mm_support() is False
+
+    def test_a_model_that_merges_in_graph_opts_in(self, make_model_runner, monkeypatch):
+        runner = make_model_runner()
+        self._multimodal(monkeypatch, True)
+        runner.model = _InGraphMergeModel()
+
+        assert runner._resolve_mm_support() is True
+
+    def test_any_other_multimodal_model_is_refused(
+        self, make_model_runner, monkeypatch
+    ):
+        runner = make_model_runner()
+        self._multimodal(monkeypatch, True)
+        runner.model = SimpleNamespace(embed_multimodal=lambda **kw: ())
+
+        with pytest.raises(ValueError, match="SupportsRBLNMultiModal"):
+            runner._resolve_mm_support()
+
+
+class TestGatherMultimodalEmbeddings:
+    def test_scheduled_images_are_encoded_and_cached_by_hash(
+        self, make_model_runner, monkeypatch
+    ):
+        monkeypatch.setattr(
+            mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+        )
+        runner = make_model_runner()
+        step = schedule_new("images")
+        pixels = torch.tensor([[[1.0, 2.0]], [[3.0, 4.0]]])
+        elems = MultiModalFieldConfig.batched("image").build_elems(
+            "pixel_values", pixels
+        )
+        step.scheduled_new_reqs[0].mm_features = [
+            MultiModalFeatureSpec(
+                data=MultiModalKwargsItem({"pixel_values": elem}),
+                modality="image",
+                identifier=f"image-{i}",
+                mm_position=PlaceholderRange(offset=i, length=1),
+            )
+            for i, elem in enumerate(elems)
+        ]
+        step.scheduled_encoder_inputs = {"images": [1, 0]}
+        runner._update_states(step)
+        calls = []
+
+        def embed_multimodal(*, pixel_values):
+            calls.append(pixel_values.clone())
+            return tuple(pixel_values + 10)
+
+        runner.model = SimpleNamespace(embed_multimodal=embed_multimodal)
+        runner._execute_mm_encoder(step)
+
+        assert len(calls) == 1
+        torch.testing.assert_close(calls[0], pixels.flip(0))
+        torch.testing.assert_close(runner.encoder_cache["image-0"], pixels[0] + 10)
+        torch.testing.assert_close(runner.encoder_cache["image-1"], pixels[1] + 10)
+
+    @pytest.mark.parametrize(
+        "computed, with_text_holes, values",
+        [
+            (0, True, [0, 0, 11]),
+            (2, True, [11, 0, 22]),
+            (3, True, [0, 22, 33]),
+            (6, True, [0, 0, 0]),
+            (0, False, [0, 0, 11]),
+            (3, False, [22, 33, 0]),
+        ],
+    )
+    def test_chunk_boundaries_preserve_text_holes_and_request_order(
+        self, make_model_runner, monkeypatch, computed, with_text_holes, values
+    ):
+        monkeypatch.setattr(
+            mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+        )
+        runner = make_model_runner()
+        step = schedule_new(
+            "text",
+            "image",
+            prompt_token_ids=[[1] * 12, [1] * 12],
+            num_computed_tokens=[0, computed],
+            num_scheduled_tokens=[3, 3],
+        )
+        step.scheduled_new_reqs[1].mm_features = [
+            MultiModalFeatureSpec(
+                data=None,
+                modality="image",
+                identifier="image-hash",
+                mm_position=PlaceholderRange(
+                    offset=2,
+                    length=5 if with_text_holes else 3,
+                    is_embed=(
+                        torch.tensor([True, False, True, True, False])
+                        if with_text_holes
+                        else None
+                    ),
+                ),
+            )
+        ]
+        runner._update_states(step)
+        hidden = runner.model_config.get_hidden_size()
+        runner.encoder_cache["image-hash"] = (
+            torch.tensor([11.0, 22.0, 33.0]).unsqueeze(1).expand(-1, hidden)
+        )
+
+        mm_rows, mask = runner._gather_mm_embeddings(step, num_tokens=6)
+        embeds, _ = runner.input_stager.stage_mm_embeds(
+            mm_rows,
+            mask.view(2, 3, 1),
+            hidden,
+            InputLayout(num_reqs=2, num_reqs_padded=2, query_len=3, query_len_padded=3),
+        )
+
+        expected = torch.tensor([0, 0, 0] + values, dtype=runner.dtype)
+        torch.testing.assert_close(
+            embeds.cpu().view(6, hidden), expected[:, None].expand(-1, hidden)
+        )
+        torch.testing.assert_close(mask[:, 0], (expected != 0).to(runner.dtype))
+
+
+class TestWarmupMultimodalEncoder:
+    @pytest.mark.parametrize("limits", [{"image": 1, "video": 0}, {"image": 0}])
+    def test_warms_the_models_encoder_graphs(
+        self, make_model_runner, monkeypatch, limits
+    ):
+        monkeypatch.setattr(
+            mr, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True)
+        )
+        runner = make_model_runner()
+        runner.supports_mm_inputs = True
+        runner.model_config.multimodal_config = MultiModalConfig(
+            limit_per_prompt=limits
+        )
+        warmup = Mock()
+        runner.model = SimpleNamespace(warmup_mm_encoder=warmup)
+
+        runner._warmup_mm_encoder()
+
+        warmup.assert_called_once_with()
+
+    @pytest.mark.parametrize(
+        "reason",
+        ["text_only_model", "other_pp_rank", "no_image_or_video", "ec_consumer"],
+    )
+    def test_skips_when_nothing_can_reach_the_encoder(
+        self, make_model_runner, monkeypatch, reason
+    ):
+        monkeypatch.setattr(
+            mr,
+            "get_pp_group",
+            lambda: SimpleNamespace(is_first_rank=reason != "other_pp_rank"),
+        )
+        runner = make_model_runner()
+        runner.supports_mm_inputs = reason != "text_only_model"
+        if reason == "ec_consumer":
+            monkeypatch.setattr(
+                runner.vllm_config,
+                "ec_transfer_config",
+                ECTransferConfig(
+                    ec_connector="RblnECNixlConnector", ec_role="ec_consumer"
+                ),
+            )
+        limit = 0 if reason == "no_image_or_video" else 1
+        runner.model_config.multimodal_config = MultiModalConfig(
+            limit_per_prompt={"image": limit, "video": limit}
+        )
+        warmup = Mock()
+        runner.model = SimpleNamespace(warmup_mm_encoder=warmup)
+
+        runner._warmup_mm_encoder()
+
+        warmup.assert_not_called()
 
 
 def _decode_ready(
@@ -106,6 +306,54 @@ class TestPrepareInputsSpecDecode:
         assert runner.positions[:1].tolist() == [3]
         assert runner.seq_lens[:1].tolist() == [4]
         assert logits_indices.tolist() == [0]
+
+
+class TestPrepareInputsReplaysAcceptedDrafts:
+    @pytest.mark.parametrize("num_spec_tokens", [2, 3, 5])
+    def test_context_end_reports_unsupported_replay_window(
+        self, make_model_runner, monkeypatch, num_spec_tokens
+    ):
+        runner = make_model_runner()
+        _decode_ready(
+            runner,
+            monkeypatch,
+            num_spec_tokens=num_spec_tokens,
+            num_computed=runner.max_model_len - 2,
+        )
+        runner.replays_accepted_drafts = True
+
+        with pytest.raises(
+            NotImplementedError, match="recurrent-state replay.*max_model_len"
+        ) as exc:
+            runner._prepare_inputs(
+                make_scheduler_output(num_scheduled_tokens={"a": 1}),
+                np.array([1], dtype=np.int32),
+            )
+        assert f"num_speculative_tokens={num_spec_tokens}" in str(exc.value)
+        assert f"max_model_len={runner.max_model_len}" in str(exc.value)
+
+    def test_verify_resumes_from_the_previous_steps_state(
+        self, make_model_runner, monkeypatch
+    ):
+        runner = make_model_runner()
+        _decode_ready(runner, monkeypatch, num_spec_tokens=2)
+        runner.replays_accepted_drafts = True
+        verify = make_scheduler_output(
+            num_scheduled_tokens={"a": 3}, spec_decode_tokens={"a": [11, 12]}
+        )
+        runner._prepare_inputs(verify, np.array([3], dtype=np.int32))
+        assert runner.state_load_pos[0] == 2
+
+        runner.input_batch.num_computed_tokens_cpu[0] = 5
+        runner.input_batch.num_tokens_no_spec[0] = 5
+        runner.input_batch.num_accepted_tokens_cpu[0] = 2
+        runner._prepare_inputs(verify, np.array([3], dtype=np.int32))
+        assert runner.state_load_pos[0] == 5
+
+        attn_metadata, _ = runner._build_attention_metadata(
+            num_tokens=3, num_reqs=1, max_query_len=3, num_reqs_padded=2
+        )
+        assert attn_metadata["layer.0"].num_accepted.view(-1).tolist() == [1, 0]
 
 
 class TestPrepareInputsFixedWindow:
@@ -264,3 +512,43 @@ class TestBookkeepingSyncSpecDecode:
 
         assert runner.requests["req_0"].output_token_ids == [101, 102]
         assert runner.requests["req_1"].output_token_ids == [201]
+
+    def test_recounts_the_accepted_tokens_every_step(
+        self, make_model_runner, monkeypatch
+    ):
+        monkeypatch.setattr(
+            mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+        )
+        runner = make_model_runner(async_scheduling=False)
+        runner.replays_accepted_drafts = True
+        runner._update_states(schedule_new("req_0", "req_1"))
+        batch = runner.input_batch
+        batch.num_tokens_no_spec[:2] = [3, 3]
+        runner.discard_request_mask[:2] = False
+
+        def step(sampled_token_ids: list[list[int]]) -> list[int]:
+            num_tokens = 2 * len(sampled_token_ids[0])
+            runner._bookkeeping_sync(
+                scheduler_output=make_scheduler_output(
+                    num_scheduled_tokens={"req_0": num_tokens // 2, "req_1": 1}
+                ),
+                sampler_output=SamplerOutput(
+                    sampled_token_ids=torch.tensor(
+                        sampled_token_ids, dtype=torch.int32, device=runner.device
+                    ),
+                    logprobs_tensors=None,
+                ),
+                logits=None,
+                hidden_states=torch.zeros(
+                    (num_tokens, runner.model_config.get_hidden_size()),
+                    dtype=runner.dtype,
+                ),
+                num_scheduled_tokens=num_tokens,
+            )
+            assert [
+                runner.num_accepted_tokens_by_req[r] for r in ("req_0", "req_1")
+            ] == batch.num_accepted_tokens_cpu[:2].tolist()
+            return batch.num_accepted_tokens_cpu[:2].tolist()
+
+        assert step([[101, 102], [201, -1]]) == [2, 1]
+        assert step([[103], [202]]) == [1, 1]

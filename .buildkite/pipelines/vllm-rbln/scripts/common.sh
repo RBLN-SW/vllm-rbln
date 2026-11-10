@@ -44,8 +44,11 @@ log_to() {
 }
 
 run_pytest() {
+  local -a report_args=()
   if [ -n "${BUILDKITE:-}" ]; then
     echo "--- :pytest: pytest (${LANE_NAME})"
+    export PYTHONPATH="$PWD/.buildkite/pipelines/vllm-rbln/scripts${PYTHONPATH:+:$PYTHONPATH}"
+    report_args=(-p lane --ci-result-dir "$PWD/pytest-results/${BUILDKITE_STEP_KEY}/${BUILDKITE_JOB_ID}")
   fi
-  uv run --no-sync pytest "$@"
+  uv run --no-sync pytest "${report_args[@]}" "$@"
 }

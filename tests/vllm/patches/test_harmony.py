@@ -23,7 +23,10 @@ import pytest
 from vllm.entrypoints.openai.parser.harmony_utils import get_encoding
 from vllm.parser.harmony import ChunkResult, HarmonyParser
 
-from vllm_rbln.patches.harmony import patched_process_chunk
+from vllm_rbln.patches.harmony import (
+    patched_count_reasoning_tokens,
+    patched_process_chunk,
+)
 
 _ANSWER = (
     "<|channel|>analysis<|message|>think<|end|>"
@@ -52,6 +55,7 @@ def harmony_parser() -> HarmonyParser:
 
 def test_the_patch_is_the_one_installed():
     assert HarmonyParser.process_chunk is patched_process_chunk
+    assert HarmonyParser.count_reasoning_tokens is patched_count_reasoning_tokens
 
 
 def test_a_stop_token_where_start_is_due_does_not_raise(harmony_parser):
@@ -98,3 +102,15 @@ def test_the_stream_ends_cleanly_after_the_skipped_tokens(harmony_parser):
     flushed = harmony_parser.flush()
 
     assert all(not segment.delta for segment in flushed)
+
+
+def test_counting_reasoning_past_the_stop_token_does_not_raise(harmony_parser):
+    # count_reasoning_tokens re-parses from scratch when the token count it
+    # cached differs, which is the case for a parser that saw nothing yet.
+    parsed = _encode(_ANSWER)
+    trailing = _encode("\n\nand more text after the end")
+
+    with_tail = harmony_parser.count_reasoning_tokens(parsed + trailing)
+    alone = HarmonyParser(tokenizer=None).count_reasoning_tokens(parsed)
+
+    assert with_tail == alone > 0

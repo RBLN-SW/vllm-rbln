@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -226,7 +226,9 @@ class MemoryPoolManager:
         self._pooled_tensor = torch.zeros(max_model_len // ob_size, dtype=self.dtype)
 
     def get_tensor_for_blocks(self, block_ids: list[int]) -> torch.Tensor:
-        self._pooled_tensor.fill_(-1)
+        # Pad unused slots with block 0, not a -1 sentinel, as mask_block_table
+        # does: the attention kernel reads every slot of a live partition.
+        self._pooled_tensor.fill_(0)
 
         if block_ids:
             value = torch.tensor(block_ids, dtype=self.dtype)

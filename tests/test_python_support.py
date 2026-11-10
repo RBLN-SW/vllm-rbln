@@ -1,11 +1,11 @@
 # Copyright 2026 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -17,6 +17,7 @@ from urllib.parse import unquote
 
 import pytest
 import tomllib
+from packaging.markers import Marker
 from packaging.specifiers import SpecifierSet
 from packaging.tags import compatible_tags, cpython_tags
 from packaging.utils import parse_wheel_filename
@@ -56,10 +57,24 @@ def test_minors_are_discovered() -> None:
 
 @pytest.mark.parametrize("minor", _minors(), ids=lambda minor: f"3.{minor}")
 def test_lock_covers_every_admitted_minor(minor: int) -> None:
+    environment = {
+        "python_version": f"3.{minor}",
+        "python_full_version": f"3.{minor}.0",
+        "sys_platform": "linux",
+        "platform_machine": "x86_64",
+    }
     gaps = [
         f"{package['name']}=={package['version']}"
         for package in _load("uv.lock")["package"]
-        if package.get("wheels") and not _installable(package, minor)
+        if package.get("wheels")
+        and (
+            not package.get("resolution-markers")
+            or any(
+                Marker(marker).evaluate(environment)
+                for marker in package["resolution-markers"]
+            )
+        )
+        and not _installable(package, minor)
     ]
     assert not gaps, (
         f"`requires-python` admits 3.{minor}, but uv.lock has no distribution "

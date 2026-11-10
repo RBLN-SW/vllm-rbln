@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -35,9 +35,9 @@ if TYPE_CHECKING:
     VLLM_RBLN_SAMPLER: bool = True
     VLLM_RBLN_ENABLE_WARM_UP: bool = True
     VLLM_RBLN_METRICS: bool = False
-    VLLM_RBLN_METRICS_FILE: str = ""
     VLLM_RBLN_METRICS_DIR: str = ""
     VLLM_RBLN_NUMA: bool = True
+    VLLM_RBLN_USE_NESTED_COMPILE_REGION: bool = True
 
     # ====================================================================
     # Read only when VLLM_RBLN_USE_VLLM_MODEL=False
@@ -50,7 +50,6 @@ if TYPE_CHECKING:
     # --- COMPILE / RUNTIME ---
     VLLM_RBLN_COMPILE_STRICT_MODE: bool = True
     VLLM_RBLN_COMPILE_ONLY: bool = False
-    VLLM_RBLN_NESTED_COMPILE_REGION: bool = False
     VLLM_RBLN_NUM_HIDDEN_LAYERS: int = 0
     VLLM_RBLN_USE_DEVICE_TENSOR: bool = True
     VLLM_RBLN_DISABLE_OFFLOAD: bool = True
@@ -62,7 +61,6 @@ if TYPE_CHECKING:
     # --- DYNAMIC KV CACHE ---
     VLLM_RBLN_USE_DYNAMIC_KV_CACHE: bool = True
     # --- ATTENTION ---
-    VLLM_RBLN_BATCH_ATTN_OPT: bool = False
     VLLM_RBLN_USE_CUSTOM_KERNEL: bool = False
     # --- MODEL INPUT / SCHEDULING ---
     VLLM_RBLN_SUB_BLOCK_CACHE: bool = True
@@ -201,6 +199,12 @@ environment_variables = {
     # ====================================================================
     # Common: read regardless of the VLLM_RBLN_USE_VLLM_MODEL value
     # ====================================================================
+    # Experimental decoder boundaries in both model paths.
+    # Requires nested-region support in rebel-compiler; this does not emit loops.
+    "VLLM_RBLN_USE_NESTED_COMPILE_REGION": (
+        lambda: os.environ.get("VLLM_RBLN_USE_NESTED_COMPILE_REGION", "True").lower()
+        in ("true", "1")
+    ),
     # Number of NPU devices per local rank (was VLLM_RBLN_TP_SIZE).
     "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK": get_num_devices_per_local_rank,
     # Use customized sampler
@@ -216,10 +220,6 @@ environment_variables = {
     "VLLM_RBLN_METRICS": (
         lambda: os.environ.get("VLLM_RBLN_METRICS", "False").lower() in ("true", "1")
     ),
-    # Mirror the final performance report to this file (in addition to stdout).
-    # The worker pid is appended before the extension to keep TP/DP workers
-    # from clobbering each other. Empty disables file output.
-    "VLLM_RBLN_METRICS_FILE": lambda: os.environ.get("VLLM_RBLN_METRICS_FILE", ""),
     # Directory for per-worker JSON performance reports (empty disables).
     "VLLM_RBLN_METRICS_DIR": lambda: os.environ.get("VLLM_RBLN_METRICS_DIR", ""),
     # Enable NUMA-based CPU affinity binding for OpenMP threads
@@ -252,12 +252,6 @@ environment_variables = {
             os.environ.get("VLLM_RBLN_COMPILE_ONLY", "False").lower() in ("true", "1")
         )
     ),
-    # Experimental decoder boundaries for MiniMax-M2 and GPT-OSS.
-    # Requires nested-region support in rebel-compiler; this does not emit loops.
-    "VLLM_RBLN_NESTED_COMPILE_REGION": (
-        lambda: os.environ.get("VLLM_RBLN_NESTED_COMPILE_REGION", "False").lower()
-        in ("true", "1")
-    ),
     # Build only the first N decoder layers and leave the rest as
     # `PPMissingLayer`, to cut compile time during bring-up. 0 disables the
     # truncation. The HF config is left untouched, so layer indices still line
@@ -287,10 +281,10 @@ environment_variables = {
         )
     ),
     # Disable only for debugging worker failures without terminating the worker.
-    "VLLM_RBLN_DISABLE_WORKER_FAIL_FAST": lambda: os.environ.get(
-        "VLLM_RBLN_DISABLE_WORKER_FAIL_FAST", "False"
-    ).lower()
-    in ("true", "1"),
+    "VLLM_RBLN_DISABLE_WORKER_FAIL_FAST": lambda: (
+        os.environ.get("VLLM_RBLN_DISABLE_WORKER_FAIL_FAST", "False").lower()
+        in ("true", "1")
+    ),
     # Auto port
     "VLLM_RBLN_AUTO_PORT": use_auto_port,
     # enforce model data type into fp32 not model_config.dtype
@@ -310,12 +304,6 @@ environment_variables = {
         )
     ),
     # --- ATTENTION ---
-    # Use batch attention optimization for paged attention
-    "VLLM_RBLN_BATCH_ATTN_OPT": (
-        lambda: (
-            os.environ.get("VLLM_RBLN_BATCH_ATTN_OPT", "False").lower() in ("true", "1")
-        )
-    ),
     "VLLM_RBLN_USE_CUSTOM_KERNEL": (
         lambda: (
             os.environ.get("RBLN_USE_CUSTOM_KERNEL", "False").lower() in ("true", "1")
@@ -323,7 +311,7 @@ environment_variables = {
     ),
     # --- MODEL INPUT / SCHEDULING ---
     # Enable sub-block prefix caching.
-    # Sub-block size equals max_num_batched_tokens (prefill chunk size).
+    # Sub-block size defaults to the prefill chunk size.
     "VLLM_RBLN_SUB_BLOCK_CACHE": lambda: (
         os.environ.get("VLLM_RBLN_SUB_BLOCK_CACHE", "True").lower() in ("true", "1")
     ),
@@ -394,7 +382,7 @@ RBLN_COMPILE_ENV = frozenset(
     {
         "VLLM_RBLN_USE_VLLM_MODEL",
         "VLLM_RBLN_NUM_HIDDEN_LAYERS",
-        "VLLM_RBLN_NESTED_COMPILE_REGION",
+        "VLLM_RBLN_USE_NESTED_COMPILE_REGION",
         "VLLM_RBLN_USE_DEVICE_TENSOR",
     }
 )
@@ -407,7 +395,6 @@ RBLN_NON_COMPILE_ENV = frozenset(
         "VLLM_RBLN_COMPILE_STRICT_MODE",
         "VLLM_RBLN_ENABLE_WARM_UP",
         "VLLM_RBLN_METRICS",
-        "VLLM_RBLN_METRICS_FILE",
         "VLLM_RBLN_METRICS_DIR",
         "VLLM_RBLN_NUMA",
         "VLLM_RBLN_COMPILE_ONLY",
@@ -418,7 +405,6 @@ RBLN_NON_COMPILE_ENV = frozenset(
         # RBLNConfig fields: the config hash keys the bundle on these
         "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK",
         "VLLM_RBLN_ENFORCE_MODEL_FP32",
-        "VLLM_RBLN_BATCH_ATTN_OPT",
         "VLLM_RBLN_USE_CUSTOM_KERNEL",
         "VLLM_RBLN_USE_DYNAMIC_KV_CACHE",
         "VLLM_RBLN_SPECIALIZE_MOE_DECODE",

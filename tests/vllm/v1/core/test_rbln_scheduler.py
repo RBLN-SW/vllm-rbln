@@ -20,6 +20,10 @@ import inspect
 from types import SimpleNamespace
 
 import pytest
+from vllm.config.ec_manager_config import EncoderCacheManagerConfig
+from vllm.distributed.kv_events import BlockStored, KVEventBatch
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.metrics.stats import PrefixCacheStats
@@ -28,21 +32,73 @@ from vllm.v1.request import RequestStatus
 
 from tests.vllm.v1.core.utils import (
     EOS_TOKEN_ID,
+    ECConnectorInTransit,
     MockKVConfig,
     _drain,
     advance_to_decode,
     create_rbln_scheduler,
     create_requests,
+    image_at,
     make_model_runner_output,
     make_request,
     prefill_request,
 )
+from vllm_rbln.v1.core import rbln_scheduler
 from vllm_rbln.v1.core.rbln_kv_cache_manager import RBLNKVCacheManager
-from vllm_rbln.v1.core.rbln_scheduler import RBLNScheduler, RBLNSchedulerOutput
+from vllm_rbln.v1.core.rbln_scheduler import (
+    RBLNEncoderCacheManager,
+    RBLNScheduler,
+    RBLNSchedulerOutput,
+)
 from vllm_rbln.v1.core.utils import is_prefill, step_is_prefill
 
 
+@pytest.mark.parametrize("interrupt_scheduling", [False, True])
+def test_eviction_snapshot_defers_hits_only_within_its_scope(interrupt_scheduling):
+    request = make_request("cached", list(range(8)), 16, mm_features=[image_at(0, 2)])
+    replacement = make_request(
+        "replacement", list(range(8)), 16, mm_features=[image_at(2, 2)]
+    )
+    manager = RBLNEncoderCacheManager(cache_size=2)
+    manager.allocate(request, 0)
+    manager.free(request)
+
+    try:
+        with manager.eviction_snapshot(request):
+            assert manager.can_allocate(replacement, 0, 16, 0)
+            manager.allocate(replacement, 0)
+            manager.free(replacement)
+            assert not manager.can_allocate(request, 0, 16, 0)
+            if interrupt_scheduling:
+                raise RuntimeError("scheduling interrupted")
+    except RuntimeError as error:
+        assert interrupt_scheduling
+        assert str(error) == "scheduling interrupted"
+
+    assert manager.can_allocate(request, 0, 16, 0)
+
+
 class TestSchedulerInit:
+    def test_no_ec_connector_keeps_the_default_encoder_cache_manager(self):
+        sched = create_rbln_scheduler()
+        assert type(sched.encoder_cache_manager) is EncoderCacheManager
+
+    def test_explicit_encoder_cache_manager_is_preserved(self):
+        config = EncoderCacheManagerConfig(
+            encoder_cache_manager_cls=(
+                "vllm.v1.core.encoder_cache_manager.EncoderCacheManager"
+            )
+        )
+        sched = create_rbln_scheduler(ec_manager_config=config)
+        assert type(sched.encoder_cache_manager) is EncoderCacheManager
+
+    def test_null_block_off_null_block_id_is_refused(self, monkeypatch):
+        # The sparse-attention ops write to NULL_BLOCK_ID; a pool that reserves
+        # another block must stop the scheduler from starting.
+        monkeypatch.setattr(rbln_scheduler, "NULL_BLOCK_ID", NULL_BLOCK_ID + 1)
+        with pytest.raises(RuntimeError, match="null block"):
+            create_rbln_scheduler()
+
     @pytest.mark.usefixtures("cr13")
     def test_sub_block_caching_enabled_uses_rbln_manager(self):
         # prefix caching + eligible config + sub_block_size -> RBLNKVCacheManager.
@@ -66,6 +122,17 @@ class TestSchedulerInit:
         )
         assert isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
         assert sched.kv_cache_manager.sub_block_size == 128
+
+    def test_sub_block_size_defaults_to_the_prefill_chunk_below_the_budget(self):
+        sched = create_rbln_scheduler(
+            enable_prefix_caching=True,
+            block_size=1024,
+            max_num_batched_tokens=128,
+            max_model_len=2048,
+            additional_config={"prefill_chunk_size": 64},
+        )
+        assert isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
+        assert sched.kv_cache_manager.sub_block_size == 64
 
     @pytest.mark.usefixtures("cr13")
     def test_additional_config_sets_the_sub_block_size(self):
@@ -171,6 +238,83 @@ class TestPendingRunnerBlockDeltas:
 
 
 class TestUpdateFromOutput:
+    @pytest.mark.usefixtures("cr13")
+    @pytest.mark.parametrize("async_scheduling", [False, True])
+    @pytest.mark.parametrize("async_load", [False, True])
+    def test_connector_loaded_prefix_events_survive_scheduling_ahead(
+        self, monkeypatch, async_scheduling, async_load
+    ):
+        sched = create_rbln_scheduler(
+            enable_prefix_caching=True,
+            enable_kv_cache_events=True,
+            block_size=16,
+            sub_block_size=8,
+            max_num_batched_tokens=16,
+            max_model_len=128,
+            async_scheduling=async_scheduling,
+            use_kv_connector=MockKVConfig(matched_tokens=32, is_async=async_load),
+        )
+        published: list[KVEventBatch] = []
+        monkeypatch.setattr(sched.kv_event_publisher, "publish", published.append)
+        request = make_request("remote", list(range(40)), 16)
+        request.kv_transfer_params = {"do_remote_prefill": True}
+        sched.add_request(request)
+        out = sched.schedule()
+        if async_load:
+            assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+            assert out.total_num_scheduled_tokens == 0
+            sched.update_from_output(
+                out,
+                make_model_runner_output(out, finished_recving={request.request_id}),
+            )
+            out = sched.schedule()
+        assert out.num_scheduled_tokens[request.request_id] == 8
+        if async_scheduling:
+            ahead = sched.schedule()
+            assert ahead.num_scheduled_tokens[request.request_id] > 0
+        sched.update_from_output(out, make_model_runner_output(out, 1))
+        if async_scheduling:
+            sched.update_from_output(ahead, make_model_runner_output(ahead, 2))
+        events = [e for batch in published for e in batch.events]
+        events.extend(sched.kv_cache_manager.take_events())
+        stored = [e for e in events if isinstance(e, BlockStored)]
+        assert [t for e in stored for t in e.token_ids] == list(range(40))
+
+    @pytest.mark.usefixtures("cr13")
+    def test_preempted_remote_request_reannounces_after_cache_reset(self):
+        sched = create_rbln_scheduler(
+            enable_prefix_caching=True,
+            enable_kv_cache_events=True,
+            block_size=16,
+            sub_block_size=8,
+            max_num_batched_tokens=16,
+            max_model_len=128,
+            use_kv_connector=MockKVConfig(matched_tokens=32),
+        )
+        request = make_request("remote", list(range(40)), 16)
+        request.kv_transfer_params = {"do_remote_prefill": True}
+        sched.add_request(request)
+        out = sched.schedule()
+        sched.update_from_output(out, make_model_runner_output(out, 1))
+        manager = sched.kv_cache_manager
+        initial = [e for e in manager.take_events() if isinstance(e, BlockStored)]
+        assert [t for e in initial for t in e.token_ids] == list(range(40))
+
+        sched.running.remove(request)
+        sched._preempt_request(request, 0.0)
+        assert request.status == RequestStatus.PREEMPTED
+        assert manager.reset_prefix_cache()
+        manager.take_events()
+
+        out = sched.schedule()
+        sched.update_from_output(out, make_model_runner_output(out, 2))
+
+        restored = [e for e in manager.take_events() if isinstance(e, BlockStored)]
+        assert [t for e in restored for t in e.token_ids] == list(range(40))
+        assert [h for e in restored for h in e.block_hashes] == [
+            h for e in initial for h in e.block_hashes
+        ]
+
     def test_asserts_rbln_scheduler_output(self):
         # A non-RBLNSchedulerOutput trips the assert on the first line.
         sched = create_rbln_scheduler()
@@ -382,8 +526,120 @@ class TestIsPrefill:
         req.num_computed_tokens = req.num_tokens - 1
         assert not is_prefill(req)
 
+    def test_a_one_token_prompt_runs_alone_as_a_prefill(self):
+        sched = create_rbln_scheduler(max_num_seqs=4, block_size=16, num_blocks=10000)
+        advance_to_decode(sched, make_request("long", list(range(10)), 16))
+        sched.add_request(make_request("one", [5], 16))
+
+        out = sched.schedule()
+
+        assert list(out.num_scheduled_tokens) == ["one"]
+        assert step_is_prefill(out)
+
 
 class TestScheduleBasic:
+    @pytest.mark.parametrize("policy", ["fcfs", "priority"])
+    def test_kv_holder_runs_before_blockless_request_under_kv_pressure(self, policy):
+        sched = create_rbln_scheduler(
+            policy=policy,
+            num_blocks=6,
+            block_size=64,
+            max_num_batched_tokens=64,
+            max_model_len=512,
+            use_kv_connector=MockKVConfig(matched_tokens=192, is_async=True),
+        )
+        local = create_requests(
+            1,
+            req_ids=["local"],
+            num_tokens=256,
+            block_size=64,
+            max_tokens=1,
+            priority=0,
+        )[0]
+        remote = create_requests(
+            1,
+            req_ids=["remote"],
+            num_tokens=192,
+            block_size=64,
+            max_tokens=1,
+            priority=10,
+        )[0]
+        local.status = RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR
+        remote.kv_transfer_params = {"do_remote_prefill": True}
+        sched.add_request(local)
+        sched.add_request(remote)
+
+        output = sched.schedule()
+        assert output.total_num_scheduled_tokens == 0
+        assert list(sched.waiting) == [local]
+        assert list(sched.kv_holding_waiting) == [remote]
+        assert sched.deferred_waiting == {local, remote}
+        pool = sched.kv_cache_manager.block_pool
+        assert pool.get_num_free_blocks() < 4
+
+        local.status = RequestStatus.WAITING
+        sched.update_from_output(
+            output, make_model_runner_output(output, finished_recving={"remote"})
+        )
+        output = sched.schedule()
+        assert output.num_scheduled_tokens == {"remote": 1}
+        assert remote not in sched.deferred_waiting
+        sched.update_from_output(output, make_model_runner_output(output, 1))
+
+        output = sched.schedule()
+        assert output.num_scheduled_tokens == {"local": 64}
+        assert not sched.deferred_waiting
+        sched.update_from_output(output, make_model_runner_output(output, 1))
+        _drain(sched)
+        assert sched.get_num_unfinished_requests() == 0
+        assert pool.get_num_free_blocks() == 5
+
+    @pytest.mark.parametrize("receive_complete", [False, True])
+    def test_aborting_deferred_remote_load_cleans_up_queues(self, receive_complete):
+        sched = create_rbln_scheduler(
+            use_kv_connector=MockKVConfig(matched_tokens=16, is_async=True)
+        )
+        request = create_requests(1, num_tokens=16)[0]
+        request.kv_transfer_params = {"do_remote_prefill": True}
+        sched.add_request(request)
+        output = sched.schedule()
+        assert request in sched.kv_holding_waiting
+        assert request in sched.deferred_waiting
+        if receive_complete:
+            sched.update_from_output(
+                output,
+                make_model_runner_output(output, finished_recving={request.request_id}),
+            )
+
+        sched.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+
+        assert not sched.kv_holding_waiting
+        assert not sched.deferred_waiting
+        assert sched.get_request_counts() == (0, 0)
+        stats = sched.make_stats()
+        assert stats.num_skipped_waiting_reqs == 0
+
+    def test_pending_kv_lookup_stays_in_blockless_waiting_queue(self, monkeypatch):
+        sched = create_rbln_scheduler(use_kv_connector=MockKVConfig())
+        request = create_requests(1)[0]
+        sched.add_request(request)
+        monkeypatch.setattr(
+            sched.connector, "get_num_new_matched_tokens", lambda *args: (None, False)
+        )
+
+        assert sched.schedule().total_num_scheduled_tokens == 0
+        assert list(sched.waiting) == [request]
+        assert not sched.kv_holding_waiting
+        stats = sched.make_stats()
+        assert stats.num_waiting_reqs == 0
+        assert stats.num_skipped_waiting_reqs == 1
+
+        monkeypatch.setattr(
+            sched.connector, "get_num_new_matched_tokens", lambda *args: (0, False)
+        )
+        assert sched.schedule().num_scheduled_tokens == {request.request_id: 10}
+        assert not sched.deferred_waiting
+
     @pytest.mark.usefixtures("cr13")
     @pytest.mark.parametrize("sub_block", [False, True])
     @pytest.mark.parametrize("preempted", [False, True])
@@ -494,6 +750,22 @@ class TestScheduleNoMixedBatching:
         assert req_a.request_id not in out.num_scheduled_tokens
         assert req_b.request_id in out.num_scheduled_tokens
 
+    def test_decode_back_from_eviction_ships_no_token_copy(self):
+        # The evicted decode returns outside prev_step_scheduled_req_ids, where
+        # upstream attaches all of its tokens; the RBLN runner never reads them.
+        sched = create_rbln_scheduler(
+            max_num_batched_tokens=128, block_size=128, num_blocks=10000
+        )
+        req_a = create_requests(1, num_tokens=64, req_ids=["A"])[0]
+        advance_to_decode(sched, req_a)
+        req_b = create_requests(1, num_tokens=64, req_ids=["B"])[0]
+        sched.add_request(req_b)
+        out = sched.schedule()
+        sched.update_from_output(out, make_model_runner_output(out, 1))
+        out = sched.schedule()
+        assert req_a.request_id in out.scheduled_cached_reqs.req_ids
+        assert out.scheduled_cached_reqs.all_token_ids == {}
+
 
 class TestScheduleDecodeBatchLimit:
     def test_decode_batch_capped_by_pipeline_parallel(self):
@@ -580,6 +852,24 @@ class TestSchedulePrefillAllocation:
         out = sched.schedule()
         assert req_a.request_id not in out.num_scheduled_tokens
         assert out.num_scheduled_tokens[req_b.request_id] == max_num_batched_tokens
+
+    def test_prefill_chunks_are_capped_at_the_prefill_chunk_size(self):
+        # The step budget stays 128; the prefill graph is compiled at 64.
+        sched = create_rbln_scheduler(
+            max_num_batched_tokens=128,
+            max_model_len=256,
+            block_size=128,
+            num_blocks=10000,
+            additional_config={"prefill_chunk_size": 64},
+        )
+        req = create_requests(1, num_tokens=200, block_size=128)[0]
+        sched.add_request(req)
+        chunks = []
+        while req.num_computed_tokens < 200:
+            out = sched.schedule()
+            chunks.append(out.num_scheduled_tokens[req.request_id])
+            sched.update_from_output(out, make_model_runner_output(out))
+        assert chunks == [64, 64, 64, 8]
 
     def test_partial_block_is_cached_once_decode_fills_it(self):
         # A prompt that stops mid-block leaves it uncached until decode supplies
@@ -1047,7 +1337,7 @@ class TestFullRunInvariants:
         ("num_tokens", "max_num_batched_tokens"),
         [
             (10, 16),  # prompt in one chunk
-            (1, 16),  # single-token prompt: no prefill step at all
+            (1, 16),  # single-token prompt: a one-token prefill step
             (33, 16),  # chunked, tail chunk of 1 token
             (32, 16),  # chunked, block-aligned
         ],
@@ -1098,6 +1388,35 @@ class TestFullRunInvariants:
 class TestRunningQueueCapacity:
     # Borrowed from upstream test_async_scheduler.test_running_queue: how
     # concurrency is capped over a run. RBLN caps running at max_num_seqs // pp.
+    @pytest.mark.parametrize(
+        ("active_cap", "paused_streaming"), [(1, False), (2, False), (2, True)]
+    )
+    def test_capacity_limited_by_max_num_active_seqs(
+        self, active_cap, paused_streaming
+    ):
+        sched = create_rbln_scheduler(max_num_seqs=4, max_num_active_seqs=active_cap)
+        if paused_streaming:
+            session = create_requests(1, max_tokens=1, req_ids=["paused"])[0]
+            session.resumable = True
+            advance_to_decode(sched, session)
+            assert session.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+
+        reqs = create_requests(3, num_tokens=10, max_tokens=6)
+        for request in reqs:
+            sched.add_request(request)
+        peak = 0
+
+        def check(out):
+            nonlocal peak
+            active = len(sched.running) + sched.num_waiting_for_streaming_input
+            assert active <= active_cap
+            peak = max(peak, active)
+
+        _drain(sched, per_step=check)
+        assert peak == active_cap
+        assert all(request.is_finished() for request in reqs)
+        assert sched.max_num_running_reqs == 4
+
     def test_capacity_limited_by_max_num_seqs(self):
         sched = create_rbln_scheduler(max_num_seqs=2, block_size=16, num_blocks=10000)
         reqs = create_requests(5, num_tokens=10, max_tokens=6)
@@ -1698,3 +2017,72 @@ class TestSyncKVLoads:
         # Only the 16 tokens past the hit are computed this step.
         assert output.num_scheduled_tokens[request.request_id] == 16
         assert output.has_sync_kv_loads
+
+
+class TestEcTransferPending:
+    """A request whose encoder outputs are still in transit is held back,
+    waiting or running, and scheduled once they arrive."""
+
+    @staticmethod
+    def _scheduler():
+        sched = create_rbln_scheduler(
+            max_num_seqs=4, max_num_batched_tokens=8, max_model_len=64
+        )
+        sched.ec_connector = ECConnectorInTransit()
+        return sched
+
+    @staticmethod
+    def _request():
+        # The image sits past the first two chunks, so no chunk here encodes it.
+        return make_request("0", list(range(24)), 16, mm_features=[image_at(20, 4)])
+
+    def test_a_waiting_request(self):
+        sched = self._scheduler()
+        sched.add_request(self._request())
+
+        assert sched.schedule().num_scheduled_tokens == {}
+        sched.ec_connector.arrived = True
+        assert sched.schedule().num_scheduled_tokens == {"0": 8}
+
+    def test_a_running_request(self):
+        sched = self._scheduler()
+        sched.ec_connector.arrived = True
+        sched.add_request(self._request())
+        out = sched.schedule()
+        sched.update_from_output(out, make_model_runner_output(out))
+
+        sched.ec_connector.arrived = False
+        assert sched.schedule().num_scheduled_tokens == {}
+        sched.ec_connector.arrived = True
+        assert sched.schedule().num_scheduled_tokens == {"0": 8}
+
+
+class TestEcConsumerEncodesNothing:
+    """An image the connector cannot supply would be encoded locally, which an EC
+    consumer has no vision encoder for."""
+
+    @staticmethod
+    def _schedule(*, is_producer):
+        sched = create_rbln_scheduler(
+            max_num_seqs=4, max_num_batched_tokens=8, max_model_len=64
+        )
+        sched.ec_connector = ECConnectorInTransit(is_producer=is_producer)
+        sched.ec_connector.arrived = True
+        sched.max_num_encoder_input_tokens = 16
+        sched.encoder_cache_manager = EncoderCacheManager(cache_size=16)
+        request = make_request("0", list(range(24)), 16, mm_features=[image_at(0, 4)])
+        sched.add_request(request)
+        return sched, request, sched.schedule()
+
+    def test_the_consumer_fails_the_request(self):
+        sched, request, out = self._schedule(is_producer=False)
+
+        assert out.num_scheduled_tokens == {}
+        sched.update_from_output(out, make_model_runner_output(out))
+        assert request.status == RequestStatus.FINISHED_ERROR
+
+    def test_ec_both_encodes_it(self):
+        _, request, out = self._schedule(is_producer=True)
+
+        assert out.scheduled_encoder_inputs == {"0": [0]}
+        assert request.status == RequestStatus.RUNNING

@@ -15,16 +15,16 @@
 from vllm_rbln.compilation.backends import rbln_backend, set_compile_stage
 from vllm_rbln.compilation.compiler import (
     build_process_group_dict,
-    check_dtype_option_supported,
     compile,
     create_compile_context,
+    mark_decoder_regions,
 )
 
 __all__ = [
     "build_process_group_dict",
-    "check_dtype_option_supported",
     "compile",
     "create_compile_context",
+    "mark_decoder_regions",
     "rbln_backend",
     "set_compile_stage",
 ]

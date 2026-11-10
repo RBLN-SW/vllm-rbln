@@ -67,6 +67,7 @@ class InputStager:
         self._buffers: dict[tuple, InputBuffer] = {}
         self._hidden_state_buffers: dict[tuple, torch.Tensor] = {}
         self._token_indices_buffers: dict[tuple[torch.dtype, int], torch.Tensor] = {}
+        self._mm_embeds_buffers: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 
     def stage(
         self,
@@ -156,6 +157,41 @@ class InputStager:
             non_blocking=True,
         )
         return buf
+
+    def stage_mm_embeds(
+        self,
+        mm_rows: list[tuple[int, int, torch.Tensor]],
+        mm_mask: torch.Tensor,
+        hidden_size: int,
+        layout: InputLayout,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Pad a multimodal model's 0 / 1 mask [R, L, 1] to the layout as text
+        (mask 0), and copy each ``(request, first token, [N, H] rows)`` run of
+        vision embeddings into a [R, L, H] buffer in the mask's dtype."""
+        key = (layout.shape, mm_mask.dtype, hidden_size)
+        if (bufs := self._mm_embeds_buffers.get(key)) is None:
+            bufs = (
+                torch.zeros(
+                    (*layout.shape, hidden_size),
+                    dtype=mm_mask.dtype,
+                    device=self.device,
+                ),
+                torch.empty(
+                    (*layout.shape, 1), dtype=mm_mask.dtype, device=self.device
+                ),
+            )
+            self._mm_embeds_buffers[key] = bufs
+
+        embeds, mask = bufs
+        mask.zero_()
+        mask[: layout.num_reqs, : layout.query_len].copy_(mm_mask, non_blocking=True)
+        for req_index, start, rows in mm_rows:
+            assert req_index < layout.num_reqs
+            assert start + rows.shape[0] <= layout.query_len
+            embeds[req_index, start : start + rows.shape[0]].copy_(
+                rows, non_blocking=True
+            )
+        return bufs
 
     def _stage_token_indices(
         self,

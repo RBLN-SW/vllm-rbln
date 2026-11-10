@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The two `SpeculativeConfig` patches: the draft's expert parallelism, and the
-drafting reservation DFlash does not need.
+"""The drafting reservation DFlash does not need.
 
 Config objects only -- no checkpoint, no device.
 """
@@ -23,46 +22,12 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-from vllm.config import ParallelConfig, SpeculativeConfig, VllmConfig
+from vllm.config import SpeculativeConfig, VllmConfig
 
 from vllm_rbln.patches.speculative_config import (
-    _orig_create_draft_parallel_config,
-    create_draft_parallel_config,
     max_num_new_slots_for_drafting,
     upstream_max_num_new_slots_for_drafting,
 )
-
-
-def test_the_draft_never_inherits_expert_parallelism():
-    # A MoE target with an EAGLE-family head: upstream forwards the flag and
-    # `verify_with_parallel_config` then refuses the head for having no experts.
-    target = ParallelConfig(tensor_parallel_size=1, enable_expert_parallel=True)
-
-    draft = create_draft_parallel_config(target, 1)
-
-    assert not draft.enable_expert_parallel
-
-
-def test_everything_else_still_comes_from_upstream():
-    # Why this delegates instead of building a ParallelConfig of its own: a
-    # hand-rolled copy silently drops whatever field upstream adds next.
-    target = ParallelConfig(
-        tensor_parallel_size=1,
-        enable_expert_parallel=True,
-        max_parallel_loading_workers=3,
-    )
-
-    ours = create_draft_parallel_config(target, 2)
-    theirs = _orig_create_draft_parallel_config(target, 2)
-    theirs.enable_expert_parallel = False
-
-    assert ours == theirs
-
-
-def test_the_patch_is_the_one_installed():
-    assert (
-        SpeculativeConfig.create_draft_parallel_config is create_draft_parallel_config
-    )
 
 
 def _spec_config(method: str, *, num_speculative_tokens: int = 3) -> SpeculativeConfig:

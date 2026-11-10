@@ -80,15 +80,16 @@ def _run_local_decode(sched, req):
 
 class TestAwaitingRemoteKV:
     def test_async_load_parks_the_request_without_scheduling_it(self):
-        # An async remote match must not consume budget: no tokens, and the
-        # request moves to the skipped queue so it is retried, not re-examined.
+        # An async remote match consumes no token budget, but its reserved KV
+        # blocks keep it in the KV-holding queue while the load is deferred.
         sched = _scheduler(matched_tokens=BLOCK_SIZE)
         req = _remote_request("0")
         out = _park_awaiting_remote_kv(sched, req)
 
         assert out.num_scheduled_tokens == {}
         assert len(sched.waiting) == 0
-        assert len(sched.skipped_waiting) == 1
+        assert list(sched.kv_holding_waiting) == [req]
+        assert sched.deferred_waiting == {req}
         # Set even though the KV has not landed yet, so the eventual promotion
         # knows where to resume.
         assert req.num_computed_tokens == BLOCK_SIZE

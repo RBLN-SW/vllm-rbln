@@ -172,7 +172,7 @@ def _scheduler(*, use_host_buffer=False, cls=RblnNixlPullConnectorScheduler):
     sched._has_mamba = False
     sched.vllm_config.scheduler_config.max_num_batched_tokens = 512
     if cls is RblnNixlPushConnectorScheduler:
-        sched._streamed_chunks = {}
+        sched._released_tokens = {}
         sched._push_pending_registrations = {}
         sched._push_registration_deadlines = {}
         sched._push_registration_timeout = 480
@@ -463,7 +463,7 @@ class TestSchedulerCleanupReachesBothDirections:
         monkeypatch.setattr(direction_cls, "request_finished", record)
         scheduler = object.__new__(scheduler_cls)
         scheduler._block_ids_need_save = {"r0": ([1, 2],)}
-        scheduler._streamed_chunks = {"r0": 2}
+        scheduler._released_tokens = {"r0": 2}
         scheduler._valid_tokens = {}
         scheduler._reqs_need_save = {"r0": object()}
 
@@ -480,7 +480,7 @@ class TestSchedulerCleanupReachesBothDirections:
             assert scheduler._reqs_need_save == {}
             # The offered prefix goes with it: a retry reusing the id would
             # otherwise be thought to have already streamed what it has not.
-            assert scheduler._streamed_chunks == {}
+            assert scheduler._released_tokens == {}
 
 
 class TestRejectedBeforeScheduling:
@@ -523,9 +523,9 @@ class TestRejectedBeforeScheduling:
 
 
 class TestEarlyOfferOnTheWritePath:
-    """A prefill is offered to the writer as its chunks close blocks, so what
-    it has finished can leave while the rest is still being computed. The
-    direct path has no save of its own, so the offer is the only reader of the
+    """A prefill is offered to the writer as it closes blocks, so what it has
+    finished can leave while the rest is still being computed. The direct path
+    has no save of its own, so the offer is the only reader of the
     accumulation there."""
 
     @staticmethod
@@ -548,37 +548,162 @@ class TestEarlyOfferOnTheWritePath:
         sched.vllm_config.scheduler_config.max_num_batched_tokens = chunk
         return sched
 
-    def test_an_offer_carries_the_block_being_filled(self):
-        # Half a block computed: the block holding it comes with the offer, and
-        # the token count says how much of it is there. Offering only closed
-        # blocks leaves that half until the request ends.
+    @pytest.mark.parametrize("chunk_mode", [False, True])
+    def test_a_block_short_of_the_last_is_offered_only_once_it_closes(self, chunk_mode):
+        # Half a block computed, far from the prompt's end: only the closed
+        # block comes. Chunk mode cuts the last block alone, so it changes
+        # nothing here.
         sched = self._chunking_scheduler(8)
+        set_shape(sched, chunk_mode=chunk_mode)
         req = _Request("prefill", num_prompt_tokens=512)
         sched._reqs_need_save["prefill"] = req
         req.num_computed_tokens = 24
 
         meta = sched.build_connector_meta(_sched_output("prefill", ([1, 2],), 24))
 
-        assert meta.reqs_to_save["prefill"].local_block_ids == ([1, 2],)
-        assert meta.push_stream_tokens["prefill"] == 24
+        assert meta.reqs_to_save["prefill"].local_block_ids == ([1],)
+        assert meta.push_stream_tokens["prefill"] == 16
 
-    def test_an_offer_grows_by_a_chunk_rather_than_by_a_block(self):
-        # A step that closes no block still closes a chunk, and today that
-        # step offers nothing at all.
+    def test_chunk_mode_cuts_no_block_but_the_last(self):
+        # 24 of a 44-token prompt: the filling block is the one before the
+        # last, so it waits to close even in chunk mode.
+        sched = self._chunking_scheduler(8)
+        set_shape(sched, chunk_mode=True)
+        req = _Request("prefill", num_prompt_tokens=44)
+        sched._reqs_need_save["prefill"] = req
+        req.num_computed_tokens = 24
+
+        meta = sched.build_connector_meta(_sched_output("prefill", ([1, 2, 3],), 8))
+
+        assert meta.reqs_to_save["prefill"].local_block_ids == ([1],)
+
+    def test_a_step_that_closes_no_block_offers_nothing(self):
+        # Each offer wakes the writer, and a step inside a block short of the
+        # last has nothing new for it.
         sched = self._chunking_scheduler(8)
         req = _Request("prefill", num_prompt_tokens=512)
         sched._reqs_need_save["prefill"] = req
         req.num_computed_tokens = 8
-        sched.build_connector_meta(_sched_output("prefill", ([1, 2],), 8))
-        assert sched._streamed_chunks == {"prefill": 1}
+        meta = sched.build_connector_meta(_sched_output("prefill", ([1, 2],), 8))
+        assert "prefill" not in meta.reqs_to_save
+        assert sched._released_tokens == {}
 
         req.num_computed_tokens = 16
         meta = sched.build_connector_meta(
             _sched_output("prefill", ([1, 2],), 16, is_new=False)
         )
 
-        assert "prefill" in meta.reqs_to_save
-        assert meta.push_stream_tokens["prefill"] == 16
+        assert meta.reqs_to_save["prefill"].local_block_ids == ([1],)
+        assert sched._released_tokens == {"prefill": 16}
+
+    @pytest.mark.parametrize(
+        ("chunk_mode", "offered"), [(False, None), (True, ([1, 2, 3],))]
+    )
+    def test_only_chunk_mode_offers_the_last_block_as_it_fills(
+        self, chunk_mode, offered
+    ):
+        # 44 tokens: the last block holds 32..44. Off chunk mode it waits for
+        # the handover whole; on it, each step that fills more of it is an
+        # offer, and the token count says how much.
+        sched = self._chunking_scheduler(8)
+        set_shape(sched, chunk_mode=chunk_mode)
+        req = _Request("prefill", num_prompt_tokens=44)
+        sched._reqs_need_save["prefill"] = req
+        req.num_computed_tokens = 32
+        sched.build_connector_meta(_sched_output("prefill", ([1, 2, 3],), 8))
+
+        req.num_computed_tokens = 40
+        meta = sched.build_connector_meta(
+            _sched_output("prefill", ([1, 2, 3],), 2, is_new=False)
+        )
+
+        if offered is None:
+            assert "prefill" not in meta.reqs_to_save
+        else:
+            assert meta.reqs_to_save["prefill"].local_block_ids == offered
+            assert meta.push_stream_tokens["prefill"] == 40
+
+    @pytest.mark.parametrize("chunk_mode", [False, True])
+    def test_the_closing_step_offers_the_whole_list(self, chunk_mode):
+        # The last block leaves at the next batch's entry instead of queueing
+        # behind the handover's `request_finished` and each stage's turn.
+        sched = self._chunking_scheduler(8)
+        set_shape(sched, chunk_mode=chunk_mode)
+        req = _Request("prefill", num_prompt_tokens=44)
+        sched._reqs_need_save["prefill"] = req
+        req.num_computed_tokens = 40
+
+        meta = sched.build_connector_meta(_sched_output("prefill", ([1, 2, 3],), 4))
+
+        assert meta.reqs_to_save["prefill"].local_block_ids == ([1, 2, 3],)
+        assert meta.push_stream_total["prefill"] == 3
+        assert "prefill" not in meta.push_stream_tokens
+        assert meta.push_stream_valid_tokens == ({"prefill": 44} if chunk_mode else {})
+        # The count rides the offer, not the handover's field the worker
+        # adopts a step later.
+        assert meta.valid_tokens == {}
+
+    def test_a_prompt_that_finishes_in_one_step_is_offered_whole(self):
+        # Nothing was computed before the step, so no prefix count backs it.
+        sched = self._chunking_scheduler(8)
+        set_shape(sched, chunk_mode=True)
+        req = _Request("prefill", num_prompt_tokens=20)
+        sched._reqs_need_save["prefill"] = req
+        req.num_computed_tokens = 0
+
+        meta = sched.build_connector_meta(_sched_output("prefill", ([1, 2],), 20))
+
+        assert meta.reqs_to_save["prefill"].local_block_ids == ([1, 2],)
+        assert meta.push_stream_valid_tokens == {"prefill": 20}
+
+    def test_a_block_aligned_closing_step_offers_the_last_block(self):
+        # After a 32-token prefix, the closed blocks alone count 32 again; only
+        # the closing count names the block the step fills.
+        sched = self._chunking_scheduler(8)
+        set_shape(sched, chunk_mode=True)
+        req = _Request("prefill", num_prompt_tokens=44)
+        sched._reqs_need_save["prefill"] = req
+        req.num_computed_tokens = 32
+        first = sched.build_connector_meta(_sched_output("prefill", ([1, 2, 3],), 8))
+        assert first.push_stream_tokens["prefill"] == 32
+
+        meta = sched.build_connector_meta(
+            _sched_output("prefill", ([1, 2, 3],), 12, is_new=False)
+        )
+
+        assert meta.reqs_to_save["prefill"].local_block_ids == ([1, 2, 3],)
+        assert meta.push_stream_valid_tokens == {"prefill": 44}
+
+    def test_a_closing_step_short_of_its_blocks_stays_a_prefix(self):
+        # The accumulation lags by a step on a resume; a whole-list offer then
+        # would name KV that no block of ours holds.
+        sched = self._chunking_scheduler(8)
+        set_shape(sched, chunk_mode=True)
+        req = _Request("prefill", num_prompt_tokens=44)
+        sched._reqs_need_save["prefill"] = req
+        req.num_computed_tokens = 40
+
+        meta = sched.build_connector_meta(_sched_output("prefill", ([1, 2],), 4))
+
+        assert meta.reqs_to_save["prefill"].local_block_ids == ([1, 2],)
+        assert meta.push_stream_tokens["prefill"] == 32
+        assert meta.push_stream_valid_tokens == {}
+
+    def test_a_hybrid_leaves_its_closing_step_to_the_handover(self):
+        # Offers never carry the window group, so a whole-list offer would pair
+        # an empty window list against the consumer's, which the engine-handle
+        # route refuses -- and the request would then wait for the lease.
+        sched = self._chunking_scheduler(8)
+        set_shape(sched, chunk_mode=True)
+        req = _Request("prefill", num_prompt_tokens=44)
+        sched._reqs_need_save["prefill"] = req
+        req.num_computed_tokens = 40
+
+        meta = sched.build_connector_meta(_sched_output("prefill", ([1, 2, 3], [9]), 4))
+
+        assert meta.reqs_to_save["prefill"].local_block_ids == ([1, 2, 3], [])
+        assert meta.push_stream_tokens["prefill"] == 40
+        assert meta.push_stream_valid_tokens == {}
 
     def test_a_hybrid_offers_its_full_attention_blocks_and_no_window(self):
         # The window's group holds one block whatever the prompt length, so a
@@ -594,26 +719,26 @@ class TestEarlyOfferOnTheWritePath:
             _sched_output("prefill", ([1, 2, 3], [9]), 40)
         )
 
-        assert meta.reqs_to_save["prefill"].local_block_ids == ([1, 2, 3], [])
-        assert meta.push_stream_tokens["prefill"] == 40
+        assert meta.reqs_to_save["prefill"].local_block_ids == ([1, 2], [])
+        assert meta.push_stream_tokens["prefill"] == 32
 
-    def test_a_part_chunk_does_not_count_as_a_whole_one(self):
-        # The cursor rounds DOWN: counting the chunk a step reached into as
-        # done would make the next step, which actually closes it, look like no
-        # progress -- and that step's offer would never go out.
+    def test_a_part_block_does_not_count_as_a_whole_one(self):
+        # The cursor rounds DOWN: counting the block a step reached into as
+        # closed would make the next step, which actually closes it, look like
+        # no progress -- and that step's offer would never go out.
         sched = self._chunking_scheduler(8)
         req = _Request("prefill", num_prompt_tokens=512)
         sched._reqs_need_save["prefill"] = req
 
-        req.num_computed_tokens = 44  # five whole chunks of eight, and half a sixth
+        req.num_computed_tokens = 44  # two whole blocks of sixteen, and part of a third
         first = sched.build_connector_meta(_sched_output("prefill", ([1, 2, 3],), 44))
-        assert "prefill" in first.reqs_to_save
+        assert first.reqs_to_save["prefill"].local_block_ids == ([1, 2],)
 
         sched._reqs_need_save["prefill"] = req
-        req.num_computed_tokens = 48  # the sixth chunk closes here
+        req.num_computed_tokens = 48  # the third block closes here
         second = sched.build_connector_meta(_sched_output("prefill", ([1, 2, 3],), 48))
 
-        assert "prefill" in second.reqs_to_save
+        assert second.reqs_to_save["prefill"].local_block_ids == ([1, 2, 3],)
         assert second.push_stream_tokens["prefill"] == 48
 
     def test_the_window_s_group_is_not_the_one_counted(self):
@@ -631,8 +756,8 @@ class TestEarlyOfferOnTheWritePath:
             _sched_output("prefill", ([9], [1, 2, 3]), 40)
         )
 
-        assert meta.reqs_to_save["prefill"].local_block_ids == ([], [1, 2, 3])
-        assert meta.push_stream_tokens["prefill"] == 40
+        assert meta.reqs_to_save["prefill"].local_block_ids == ([], [1, 2])
+        assert meta.push_stream_tokens["prefill"] == 32
 
     def test_an_offer_never_names_tokens_no_block_of_ours_holds(self):
         # A step can compute past the blocks we have -- the accumulation lags
@@ -706,7 +831,7 @@ class TestEarlyOfferOnTheWritePath:
         sched._reqs_need_save["preempted"] = req
         req.num_computed_tokens = 64
         sched.build_connector_meta(_sched_output("preempted", ([1, 2, 3],), 64))
-        assert sched._streamed_chunks == {"preempted": 3}
+        assert sched._released_tokens == {"preempted": 48}
 
         req.num_computed_tokens = 32
         meta = sched.build_connector_meta(
@@ -1044,12 +1169,12 @@ class TestTailTokenCountOnTheWritePath:
             self._finish(monkeypatch, True, trim=False, window=True)._valid_tokens == {}
         )
 
-    def test_streaming_alone_collects_the_count(self, monkeypatch):
-        # And the third knob asks for it on its own account: a streamed write
-        # says where the offer stops, which is the same count.
+    def test_streaming_alone_collects_no_count(self, monkeypatch):
+        # Without chunk mode a streamed handover sends the last block whole, so
+        # nothing reads the count. Mid-stream offers carry their own.
         sched = self._finish(monkeypatch, True, trim=False, stream=True)
 
-        assert sched._valid_tokens == {"r0": 33}
+        assert sched._valid_tokens == {}
 
     def test_the_handover_carries_the_count_to_the_worker(self):
         # The positive direction of the case below: the count the scheduler

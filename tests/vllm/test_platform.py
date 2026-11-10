@@ -22,6 +22,9 @@ from __future__ import annotations
 
 import copy
 import os
+import subprocess
+import sys
+import textwrap
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -29,7 +32,8 @@ from unittest.mock import patch
 import pytest
 import torch
 from pydantic import ValidationError
-from vllm.config import CompilationMode, VllmConfig
+from vllm.config import CompilationMode, ECTransferConfig, VllmConfig
+from vllm.config.ec_manager_config import EncoderCacheManagerConfig
 from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -54,10 +58,9 @@ _ENGINE_ARGS = dict(
     enable_chunked_prefill=True,
 )
 
-# Modules that bind platform.USE_DEVICE_TENSOR into their own namespace at
-# import. _apply_model_impl cannot reach them, so none may be imported before
-# the model path is resolved.
-_DEVICE_FLAG_COPIERS = frozenset(
+# Modules that read the device flag. The DP launcher of vllm-rbln-executor
+# imports them before the model path is resolved.
+_DEVICE_FLAG_READERS = frozenset(
     {
         "vllm_rbln.patches.deepseek_mtp",
         "vllm_rbln.platform.vllm_impl",
@@ -114,6 +117,233 @@ def reconfigure(configured):
 @pytest.fixture(autouse=True)
 def isolated_standalone_env(monkeypatch):
     monkeypatch.setenv(_STANDALONE, _UNTOUCHED)
+
+
+@pytest.fixture
+def run_logging_probe(tmp_path):
+    def run(probe, bootstrap_logging, color):
+        result = subprocess.run(
+            [sys.executable, "-c", textwrap.dedent(probe), str(tmp_path)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={
+                **os.environ,
+                "VLLM_CONFIGURE_LOGGING": bootstrap_logging,
+                "VLLM_LOGGING_LEVEL": "INFO",
+                "VLLM_LOGGING_CONFIG_PATH": "",
+                "VLLM_LOGGING_COLOR": color,
+                "NO_COLOR": "",
+            },
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+
+    return run
+
+
+@pytest.mark.parametrize("bootstrap_logging", ["0", "1"])
+@pytest.mark.parametrize("color", ["0", "1"])
+def test_logging_initialization_honors_upstream_config(
+    run_logging_probe, bootstrap_logging, color
+):
+    run_logging_probe(
+        r"""
+        import logging
+        import os
+        import re
+        import sys
+        from copy import deepcopy
+
+        from vllm.config.logging import LoggingConfig
+        from vllm.logger import configure_logging
+
+        configure_logging(LoggingConfig(configure_logging=True, log_level="ERROR"))
+        import vllm_rbln.platform
+        import vllm_rbln.logger as rbln_logger
+
+        assert logging.getLogger("vllm_rbln").getEffectiveLevel() == logging.ERROR
+        defaults = deepcopy(rbln_logger.DEFAULT_LOGGIN_CONFIG)
+        os.environ["VLLM_CONFIGURE_LOGGING"] = "1"
+        os.environ["VLLM_LOGGING_LEVEL"] = "DEBUG"
+        rbln_logger._configure_vllm_root_logger()
+        assert rbln_logger.DEFAULT_LOGGIN_CONFIG == defaults
+        source = sys.modules[LoggingConfig.__module__].__file__
+        record = logging.LogRecord(
+            "vllm_rbln.logging_test", logging.ERROR, source, 7, "path marker", (), None
+        )
+        root = logging.getLogger("vllm_rbln")
+        rendered = root.handlers[0].formatter.format(record)
+        assert "[config/logging.py:7]" in re.sub(r"\x1b\[[0-9;]*m", "", rendered)
+        """,
+        bootstrap_logging,
+        color,
+    )
+
+
+@pytest.mark.parametrize("bootstrap_logging", ["0", "1"])
+@pytest.mark.parametrize("color", ["0", "1"])
+def test_logging_reconfiguration_preserves_rbln_output(
+    run_logging_probe, bootstrap_logging, color
+):
+    run_logging_probe(
+        r"""
+        import io
+        import logging
+        import re
+        import sys
+        from contextlib import closing
+        from pathlib import Path
+
+        from vllm.config.logging import LoggingConfig
+        from vllm.logger import configure_logging, init_logger
+
+        import vllm_rbln.platform
+        from vllm_rbln.logger import make_file_handler
+
+        root = logging.getLogger("vllm_rbln")
+        source = sys.modules[LoggingConfig.__module__].__file__
+        record = logging.LogRecord(
+            "vllm_rbln.logging_test", logging.ERROR, source, 7, "path marker", (), None
+        )
+        configure_logging(LoggingConfig(configure_logging=True, log_level="INFO"))
+        console, = root.handlers
+        output = io.StringIO()
+        console.setStream(output)
+        formatter = console.formatter
+        logger = init_logger("vllm_rbln.logging_test")
+        file_path = Path(sys.argv[1]) / "metrics.log"
+        file_handler = make_file_handler(str(file_path))
+        logger.addHandler(file_handler)
+
+        for level in ("INFO", "ERROR", "DEBUG", "INFO"):
+            configure_logging(LoggingConfig(configure_logging=True, log_level=level))
+            assert root.getEffectiveLevel() == getattr(logging, level)
+            assert root.handlers == [console]
+            assert type(console.formatter) is type(formatter)
+            assert console.stream is output
+            assert logger.handlers == [file_handler]
+            output.seek(0)
+            output.truncate()
+            logger.debug("debug marker")
+            logger.info("info marker")
+            logger.error("error marker")
+            logger.handle(record)
+            text = re.sub(r"\x1b\[[0-9;]*m", "", output.getvalue())
+            assert ("debug marker" in text) == (level == "DEBUG"), text
+            assert ("info marker" in text) == (level != "ERROR"), text
+            assert text.count("error marker") == 1, text
+            assert all(line.startswith("[vllm-rbln] ") for line in text.splitlines())
+            assert "pid=" not in text
+            location = "config/logging.py" if level == "DEBUG" else "logging.py"
+            assert f"[{location}:7]" in text, text
+            assert f"[{location}:7]" in file_path.read_text().splitlines()[-1]
+            level_path = Path(sys.argv[1]) / f"{level}.log"
+            with closing(make_file_handler(str(level_path))) as level_handler:
+                level_handler.handle(record)
+            assert f"[{location}:7]" in level_path.read_text()
+
+        configure_logging(LoggingConfig(configure_logging=False, log_level="ERROR"))
+        assert root.getEffectiveLevel() == logging.INFO
+        logger.info("file marker")
+        file_handler.flush()
+        assert "[vllm-rbln] INFO" in file_path.read_text()
+        assert "file marker" in file_path.read_text()
+        logger.removeHandler(file_handler)
+        file_handler.close()
+        """,
+        bootstrap_logging,
+        color,
+    )
+
+
+@pytest.mark.parametrize("bootstrap_logging", ["0", "1"])
+@pytest.mark.parametrize("color", ["0", "1"])
+def test_logging_custom_config_and_default_transition(
+    run_logging_probe, bootstrap_logging, color
+):
+    run_logging_probe(
+        r"""
+        import io
+        import json
+        import logging
+        import re
+        import sys
+        from contextlib import redirect_stdout
+        from pathlib import Path
+
+        from vllm.config.logging import LoggingConfig
+        from vllm.logger import configure_logging, init_logger
+
+        import vllm_rbln.platform
+        from vllm_rbln.logger import make_file_handler
+
+        configure_logging(LoggingConfig(configure_logging=True, log_level="INFO"))
+        root = logging.getLogger("vllm_rbln")
+        output = io.StringIO()
+        root.handlers[0].setStream(output)
+        logger = init_logger("vllm_rbln.logging_test")
+
+        custom_path = Path(sys.argv[1]) / "logging.json"
+        custom_path.write_text(json.dumps({
+            "version": 1,
+            "incremental": True,
+            "handlers": {"vllm_rbln": {"level": "ERROR"}},
+            "loggers": {"vllm_rbln": {"level": "WARNING"}},
+        }))
+        configure_logging(LoggingConfig(
+            configure_logging=True,
+            log_level="DEBUG",
+            pylogging_config_file=str(custom_path),
+        ))
+        assert root.getEffectiveLevel() == logging.WARNING
+        output.seek(0)
+        output.truncate()
+        logger.warning("filtered marker")
+        logger.error("incremental marker")
+        assert "filtered marker" not in output.getvalue()
+        assert output.getvalue().count("incremental marker") == 1
+
+        for name in ("application_console", "vllm_rbln"):
+            custom_path.write_text(json.dumps({
+                "version": 1,
+                "disable_existing_loggers": False,
+                "formatters": {"custom": {"format": "[custom] %(message)s"}},
+                "handlers": {name: {
+                    "class": "logging.StreamHandler",
+                    "stream": "ext://sys.stdout",
+                    "formatter": "custom",
+                }},
+                "loggers": {"vllm_rbln": {
+                    "handlers": [name], "level": "INFO", "propagate": False,
+                }},
+            }))
+            output = io.StringIO()
+            with redirect_stdout(output):
+                configure_logging(LoggingConfig(
+                    configure_logging=True, pylogging_config_file=str(custom_path),
+                ))
+                persistent_path = Path(sys.argv[1]) / f"{name}.log"
+                persistent = make_file_handler(str(persistent_path))
+                root.addHandler(persistent)
+                logger.info("custom marker")
+                assert output.getvalue().strip() == "[custom] custom marker"
+                output.seek(0)
+                output.truncate()
+                configure_logging(LoggingConfig(
+                    configure_logging=True, log_level="INFO",
+                ))
+                logger.info("transition marker")
+            text = re.sub(r"\x1b\[[0-9;]*m", "", output.getvalue())
+            assert text.count("transition marker") == 1, text
+            assert text.startswith("[vllm-rbln] "), text
+            assert persistent in root.handlers
+            assert "transition marker" in persistent_path.read_text()
+            root.removeHandler(persistent)
+            persistent.close()
+        """,
+        bootstrap_logging,
+        color,
+    )
 
 
 class TestPlatformIdentity:
@@ -182,6 +412,17 @@ class TestPlatformIdentity:
         }
 
 
+def _as_glm5_next(config: VllmConfig) -> None:
+    """GLM-5.3's text config on the test model: its KDA heads and MLA latent."""
+    text_config = config.model_config.hf_text_config
+    text_config.model_type = "glm5_next_text"
+    text_config.linear_num_heads = 64
+    text_config.linear_head_dim = 128
+    text_config.kv_lora_rank = 512
+    config.model_config.dtype = torch.bfloat16
+    config.cache_config.cache_dtype = "fp8"
+
+
 class TestRejectedConfigs:
     @pytest.mark.parametrize(
         ("block_size", "max_num_batched_tokens", "invalid_block_size"),
@@ -214,14 +455,6 @@ class TestRejectedConfigs:
         ):
             _build(block_size=16384, max_num_batched_tokens=16385)
 
-    def test_v2_model_runner(self, monkeypatch, reconfigure):
-        # The refusal reads VllmConfig.use_v2_model_runner, and how upstream
-        # resolves that from the env or from a feature that forces V2 is its
-        # own business. Set the property it reads, not the env behind it.
-        monkeypatch.setattr(VllmConfig, "use_v2_model_runner", True)
-        with pytest.raises(ValueError, match="VLLM_USE_V2_MODEL_RUNNER"):
-            reconfigure(lambda config: None)
-
     def test_an_explicit_dynamic_kv_on_an_unsizable_config(self, reconfigure):
         def custom_kernel(dynamic):
             def mutate(config):
@@ -234,9 +467,143 @@ class TestRejectedConfigs:
             reconfigure(custom_kernel(True))
         reconfigure(custom_kernel(None))
 
+    def test_an_ec_consumer_without_its_language_model(self, reconfigure):
+        def role(ec_role, mm_encoder_only):
+            def mutate(config):
+                config.ec_transfer_config = ECTransferConfig(
+                    ec_connector="RblnECNixlConnector", ec_role=ec_role
+                )
+                config.model_config.multimodal_config = SimpleNamespace(
+                    mm_encoder_only=mm_encoder_only
+                )
+
+            return mutate
+
+        for refused in (role("ec_consumer", True), role("ec_both", True)):
+            with pytest.raises(ValueError, match="--mm-encoder-only"):
+                reconfigure(refused)
+        reconfigure(role("ec_producer", True))
+        reconfigure(role("ec_consumer", False))
+        reconfigure(role("ec_both", False))
+
+    @pytest.mark.parametrize("field", ["data_parallel_size", "pipeline_parallel_size"])
+    def test_an_encoder_only_instance_across_ranks(self, reconfigure, field):
+        def mutate(config):
+            config.model_config.multimodal_config = SimpleNamespace(
+                mm_encoder_only=True
+            )
+            setattr(config.parallel_config, field, 2)
+
+        with pytest.raises(ValueError, match="encoder-only instance"):
+            reconfigure(mutate)
+
     def test_lora(self, reconfigure):
         with pytest.raises(ValueError, match="LoRA"):
             reconfigure(lambda config: setattr(config, "lora_config", object()))
+
+    def test_msa_models_need_bfloat16(self, reconfigure):
+        def msa(dtype):
+            def mutate(config):
+                config.model_config.hf_text_config.sparse_attention_config = {
+                    "sparse_attention_freq": [0, 1]
+                }
+                config.model_config.dtype = dtype
+
+            return mutate
+
+        for dtype in (torch.float16, torch.float32):
+            with pytest.raises(ValueError, match="bfloat16 only"):
+                reconfigure(msa(dtype))
+        reconfigure(msa(torch.bfloat16))
+
+    def test_glm5_next_configs(self, reconfigure):
+        def glm5_next(*, cache_dtype="fp8", spec=None, tp=1, **cache):
+            def mutate(config):
+                _as_glm5_next(config)
+                config.cache_config.cache_dtype = cache_dtype
+                config.speculative_config = spec
+                config.parallel_config.tensor_parallel_size = tp
+                for name, value in cache.items():
+                    setattr(config.cache_config, name, value)
+
+            return mutate
+
+        def spec(method, num_speculative_tokens):
+            return SimpleNamespace(
+                method=method, num_speculative_tokens=num_speculative_tokens
+            )
+
+        reconfigure(glm5_next())
+        reconfigure(glm5_next(spec=spec("mtp", 5)))
+        with pytest.raises(ValueError, match="--kv-cache-dtype fp8"):
+            reconfigure(glm5_next(cache_dtype="auto"))
+        for method, num_speculative_tokens in (("mtp", 6), ("ngram", 1)):
+            with pytest.raises(ValueError, match="MTP head"):
+                reconfigure(glm5_next(spec=spec(method, num_speculative_tokens)))
+        block_size = _build().cache_config.block_size
+        with pytest.raises(ValueError, match="a KDA state a KV block"):
+            reconfigure(
+                glm5_next(
+                    enable_prefix_caching=True,
+                    user_specified_mamba_block_size=True,
+                    mamba_block_size=2 * block_size,
+                )
+            )
+        with pytest.raises(ValueError, match="whole KV blocks"):
+            reconfigure(
+                glm5_next(enable_prefix_caching=True, prefix_match_unit=block_size // 2)
+            )
+
+        reconfigure(glm5_next(tp=4, block_size=1024))
+        for tp, block_size in ((4, 2048), (1, 8192), (1, 192), (1, 160)):
+            with pytest.raises(ValueError, match="whole KDA head states"):
+                reconfigure(glm5_next(tp=tp, block_size=block_size))
+
+        def bf16_forced_to_fp32(config):
+            glm5_next(block_size=8192)(config)
+            config.additional_config = replace(
+                config.additional_config, enforce_model_fp32=True
+            )
+
+        reconfigure(bf16_forced_to_fp32)
+        if platform.USE_DEVICE_TENSOR:
+
+            def fp32_forced_to_fp16(config):
+                glm5_next(block_size=8192)(config)
+                config.model_config.dtype = torch.float32
+                config.model_config.enforce_eager = True
+
+            with pytest.raises(ValueError, match="whole KDA head states"):
+                reconfigure(fp32_forced_to_fp16)
+
+    def test_glm5_next_prefix_caching_with_mtp_needs_retention_0(self, reconfigure):
+        # A KDA verify step leaves no state at the end of a block it crossed, so
+        # only retention 0 (states a prefill stored) keeps prefix caching on.
+        def glm5_next_mtp(retention):
+            def mutate(config):
+                _as_glm5_next(config)
+                config.cache_config.enable_prefix_caching = True
+                # What MambaModelConfig sets up for prefix caching before the hook.
+                config.cache_config.mamba_cache_mode = "align"
+                config.cache_config.prefix_cache_retention_interval = retention
+                config.speculative_config = SimpleNamespace(
+                    method="mtp", num_speculative_tokens=1
+                )
+
+            return mutate
+
+        assert reconfigure(glm5_next_mtp(0)).cache_config.enable_prefix_caching
+        config = reconfigure(glm5_next_mtp(1))
+        assert not config.cache_config.enable_prefix_caching
+        assert config.cache_config.mamba_cache_mode == "none"
+        assert config.cache_config.mamba_block_size == config.model_config.max_model_len
+
+    def test_mrope_models_are_rejected(self, reconfigure, monkeypatch):
+        from vllm.config import ModelConfig
+
+        monkeypatch.setattr(ModelConfig, "uses_mrope", property(lambda self: True))
+        with pytest.raises(ValueError, match="M-RoPE"):
+            reconfigure(lambda config: None)
 
     def test_chunked_prefill_off(self, reconfigure):
         with pytest.raises(ValueError, match="chunked prefill"):
@@ -246,27 +613,134 @@ class TestRejectedConfigs:
                 )
             )
 
-    def test_eagle3_under_pp_needs_a_patched_target(self, reconfigure):
-        # The default model is a plain LlamaForCausalLM, whose forward still
-        # collects aux hidden states with a stage-local index. Asserting through
-        # the hook rather than on the validator directly is the point: it is what
-        # shows the guard is reached at all.
-        with pytest.raises(ValueError, match="EAGLE3 with pipeline_parallel_size"):
-            reconfigure(_eagle3_under_pp())
+    def test_chunked_prefill_off_on_an_encoder_only_instance(self, reconfigure):
+        # Upstream turns it off once the engine finds no KV cache, then runs
+        # the hook again.
+        def mutate(config):
+            config.model_config.multimodal_config = SimpleNamespace(
+                mm_encoder_only=True
+            )
+            config.scheduler_config.enable_chunked_prefill = False
+
+        reconfigure(mutate)
+
+    @pytest.mark.parametrize("method", ["eagle3", "dflash"])
+    def test_a_draft_under_pp_needs_a_patched_target(self, reconfigure, method):
+        # The default model is a plain LlamaForCausalLM, which 0.30 made
+        # pipeline-aware but which packs a handoff key per tensor rather than the
+        # combined one this side reads. Asserting through the hook rather than on
+        # the validator directly is the point: it is what shows the guard is
+        # reached at all.
+        with pytest.raises(ValueError, match="auxiliary hidden states"):
+            reconfigure(_aux_draft_under_pp(method=method))
 
     def test_eagle3_under_pp_accepts_a_patched_target(self, reconfigure):
-        reconfigure(_eagle3_under_pp(arch="MiniMaxM2ForCausalLM"))
+        reconfigure(_aux_draft_under_pp(arch="MiniMaxM2ForCausalLM"))
 
     def test_eagle3_under_pp_accepts_a_draft_with_aux_off(self, reconfigure):
         # Nothing is captured anywhere then, so upstream's forward is harmless.
-        reconfigure(_eagle3_under_pp(eagle_config={"use_aux_hidden_state": False}))
+        reconfigure(_aux_draft_under_pp(eagle_config={"use_aux_hidden_state": False}))
 
     def test_eagle3_at_pp1_is_not_gated(self, reconfigure):
-        reconfigure(_eagle3_under_pp(pp_size=1))
+        reconfigure(_aux_draft_under_pp(pp_size=1))
 
     def test_dp_needs_a_divisible_token_budget(self, reconfigure):
         with pytest.raises(ValueError, match="divisible"):
             reconfigure(_ranks(data_parallel_size=2, max_num_seqs=5))
+
+    def test_a_prefill_chunk_above_the_token_budget_is_refused(self, reconfigure):
+        with pytest.raises(ValueError, match="exceeds"):
+            reconfigure(_prefill_chunk(256))
+
+    def test_an_unset_prefill_chunk_resolves_to_the_token_budget(self, reconfigure):
+        config = reconfigure(lambda config: None)
+        assert (
+            config.additional_config.prefill_chunk_size
+            == config.scheduler_config.max_num_batched_tokens
+        )
+
+    def test_a_prefill_chunk_below_the_token_budget_is_taken(self, reconfigure):
+        config = reconfigure(_prefill_chunk(64))
+        assert config.additional_config.prefill_chunk_size == 64
+
+    @pytest.mark.parametrize(
+        "feature, enable",
+        [
+            ("data parallelism", lambda c: _ranks(data_parallel_size=2)(c)),
+            (
+                "RBLN NIXL KV transfer",
+                lambda c: setattr(
+                    c,
+                    "kv_transfer_config",
+                    SimpleNamespace(
+                        kv_connector="RblnNixlPushConnector",
+                        kv_connector_extra_config={},
+                    ),
+                ),
+            ),
+        ],
+    )
+    def test_a_prefill_chunk_below_the_token_budget_refuses(
+        self, reconfigure, feature, enable
+    ):
+        def mutate(config):
+            _prefill_chunk(64)(config)
+            enable(config)
+
+        with pytest.raises(ValueError, match=feature):
+            reconfigure(mutate)
+
+    @pytest.mark.parametrize(
+        "kv_connector, extra",
+        [
+            ("RblnNixlConnector", {}),
+            (
+                "MultiConnector",
+                {"connectors": [{"kv_connector": "RblnNixlPullConnector"}]},
+            ),
+        ],
+    )
+    def test_a_prefill_chunk_below_the_token_budget_refuses_a_nixl_connector(
+        self, reconfigure, kv_connector, extra
+    ):
+        def mutate(config):
+            _prefill_chunk(64)(config)
+            config.kv_transfer_config = SimpleNamespace(
+                kv_connector=kv_connector, kv_connector_extra_config=extra
+            )
+
+        with pytest.raises(ValueError, match="RBLN NIXL KV transfer"):
+            reconfigure(mutate)
+
+    def test_a_prefill_chunk_below_the_token_budget_takes_spec_decode(
+        self, reconfigure
+    ):
+        def mutate(config):
+            _prefill_chunk(64)(config)
+            config.speculative_config = SimpleNamespace(method="ngram")
+
+        reconfigure(mutate)
+
+    def test_a_prefill_chunk_below_the_token_budget_takes_sub_block_caching(
+        self, reconfigure
+    ):
+        def mutate(config):
+            _prefill_chunk(64)(config)
+            config.cache_config.enable_prefix_caching = True
+
+        reconfigure(mutate)
+
+    def test_a_prefill_chunk_below_the_token_budget_takes_other_connectors(
+        self, reconfigure
+    ):
+        # Only the RBLN NIXL connectors read the budget as the prefill chunk.
+        def mutate(config):
+            _prefill_chunk(64)(config)
+            config.kv_transfer_config = SimpleNamespace(
+                kv_connector="RBLNLMCacheConnectorV1", kv_connector_extra_config={}
+            )
+
+        reconfigure(mutate)
 
     @pytest.mark.parametrize("ranks", [dict(data_parallel_size=2), dict(ep=True)])
     def test_dp_and_ep_need_the_moe_tokens_mask(self, reconfigure, ranks):
@@ -285,8 +759,14 @@ class TestRejectedConfigs:
         assert RBLNConfig().use_moe_tokens_mask is True
 
 
-def _eagle3_under_pp(*, arch: str | None = None, eagle_config=None, pp_size: int = 2):
-    """A mutator that puts an EAGLE3 draft on a pipeline-parallel target.
+def _aux_draft_under_pp(
+    *,
+    arch: str | None = None,
+    eagle_config=None,
+    pp_size: int = 2,
+    method: str = "eagle3",
+):
+    """A mutator that puts an aux-consuming draft on a pipeline-parallel target.
 
     EngineArgs would have to resolve a real draft checkpoint to build this, so the
     speculative config is a stand-in shaped like the fields the guard reads.
@@ -297,10 +777,16 @@ def _eagle3_under_pp(*, arch: str | None = None, eagle_config=None, pp_size: int
         # The guard runs after the per-stage decode batch check, which would
         # otherwise raise first and mask it.
         config.scheduler_config.max_num_seqs = pp_size * 2
+        if method == "dflash":
+            # So does DFlash's prefill chunk check, which this stand-in would
+            # otherwise trip with an unset budget.
+            config.scheduler_config.max_num_scheduled_tokens = (
+                config.scheduler_config.max_num_batched_tokens
+            )
         if arch is not None:
             config.model_config.hf_config.architectures = [arch]
         config.speculative_config = SimpleNamespace(
-            method="eagle3",
+            method=method,
             draft_model_config=SimpleNamespace(
                 hf_config=SimpleNamespace(eagle_config=eagle_config)
             ),
@@ -329,6 +815,18 @@ def _ranks(
             config.additional_config = replace(
                 config.additional_config, use_moe_tokens_mask=moe_tokens_mask
             )
+
+    return mutate
+
+
+def _prefill_chunk(size: int):
+    """A mutator that sets --rbln-prefill-chunk-size, with sub-block caching off."""
+
+    def mutate(config: VllmConfig) -> None:
+        config.additional_config = replace(
+            config.additional_config, prefill_chunk_size=size
+        )
+        config.cache_config.enable_prefix_caching = False
 
     return mutate
 
@@ -370,32 +868,66 @@ class TestDtype:
         assert config.model_config.dtype == torch.float32
 
 
-class TestCompileDtype:
-    @staticmethod
-    def _with_dtype(config):
-        config.additional_config = replace(
-            config.additional_config, compile_dtype="float16"
-        )
-
-    @pytest.fixture
-    def older_rebel(self, monkeypatch):
-        import vllm_rbln.compilation.compiler as compiler
-
-        def legacy_compile(model, *, npu=None):
-            pass
-
-        monkeypatch.setattr(compiler.rebel, "compile", legacy_compile)
-
-    def test_empty_dtype_skips_the_probe(self, reconfigure, older_rebel):
-        config = reconfigure(lambda config: None)
-        assert config.additional_config.compile_dtype == ""
-
-    def test_refused_at_startup_on_an_older_rebel(self, reconfigure, older_rebel):
-        with pytest.raises(ValueError, match="dtype"):
-            reconfigure(self._with_dtype)
-
-
 class TestWorkerAndScheduler:
+    @pytest.mark.parametrize(
+        "encoder_decoder,custom_manager,expected",
+        [
+            (False, None, "vllm_rbln.v1.core.rbln_scheduler.RBLNEncoderCacheManager"),
+            (True, None, None),
+            (
+                False,
+                "vllm.v1.core.encoder_cache_manager.EncoderCacheManager",
+                "vllm.v1.core.encoder_cache_manager.EncoderCacheManager",
+            ),
+        ],
+    )
+    def test_ec_encoder_cache_manager_selection(
+        self, reconfigure, encoder_decoder, custom_manager, expected
+    ):
+        def mutate(config: VllmConfig) -> None:
+            config.ec_transfer_config = ECTransferConfig(
+                ec_connector="RblnECCPUConnector", ec_role="ec_both"
+            )
+            config.model_config.is_encoder_decoder = encoder_decoder
+            config.ec_manager_config = EncoderCacheManagerConfig(
+                encoder_cache_manager_cls=custom_manager
+            )
+
+        config = reconfigure(mutate)
+        assert config.ec_manager_config.encoder_cache_manager_cls == expected
+
+    @pytest.mark.parametrize("selection", [None, "0", "1"])
+    def test_runner_selection_ignores_upstream_env(self, monkeypatch, selection):
+        import vllm.config.vllm as upstream_config
+
+        monkeypatch.setattr(upstream_config, "HAS_TRITON", True)
+        if selection is None:
+            monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
+        else:
+            monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", selection)
+        with patch.object(platform.logger, "warning_once") as warning:
+            config = _build()
+            assert config.use_v2_model_runner is False
+        assert config.parallel_config.worker_cls == (
+            "vllm_rbln.v1.worker.rbln_worker.RBLNWorker"
+        )
+        assert os.environ.get("VLLM_USE_V2_MODEL_RUNNER") == selection
+        assert warning.called is (selection != "0")
+        if warning.called:
+            assert "V2 selection is ignored" in warning.call_args.args[0]
+
+    def test_v2_scoring_is_rejected(self, monkeypatch):
+        from vllm.exceptions import VLLMValidationError
+        from vllm.sampling_params import SamplingParams
+        from vllm.v1.engine.input_processor import InputProcessor
+
+        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+        processor = InputProcessor(_build())
+        with pytest.raises(VLLMValidationError, match="requires the V2 model runner"):
+            processor._validate_params(
+                SamplingParams(prompt_logprob_token_ids=[1]), ("generate",)
+            )
+
     def test_auto_worker_becomes_the_rbln_worker(self, configured):
         assert (
             configured.parallel_config.worker_cls
@@ -1153,13 +1685,7 @@ class TestModelImpl:
             )
         assert os.environ[platform.envs.RESOLVED_MODEL_IMPL_ENV] == _UNTOUCHED
 
-    def test_the_modules_that_copy_the_device_flag_import_late(self):
-        """They bind USE_DEVICE_TENSOR at their own import.
-
-        That is only correct while none of them is imported before the path is
-        resolved, so the platform module is the only one _apply_model_impl has
-        to reach. A new early import here would silently pin a stale value.
-        """
+    def test_register_ops_applies_no_patch_before_the_path_is_resolved(self):
         import subprocess
         import sys
 
@@ -1170,10 +1696,7 @@ class TestModelImpl:
             "vllm_rbln.register_model();"
             "vllm_rbln.register_ops();"
             "applied = sys.modules.get('vllm_rbln.patches.registry');"
-            "print(applied and applied._applied_patch_keys,"
-            " [m for m in sys.modules if m in COPIERS])".replace(
-                "COPIERS", repr(_DEVICE_FLAG_COPIERS)
-            )
+            "print(applied and applied._applied_patch_keys)"
         )
         out = subprocess.run(
             [sys.executable, "-c", probe],
@@ -1187,6 +1710,31 @@ class TestModelImpl:
             },
         )
         assert out.returncode == 0, out.stderr[-2000:]
-        # "None []": the registry was never imported, so nothing was applied and
-        # no module bound a stale USE_DEVICE_TENSOR.
-        assert out.stdout.strip().endswith("None []"), out.stdout
+        assert out.stdout.strip().endswith("None"), out.stdout
+
+    def test_a_module_imported_before_resolution_reads_the_resolved_flag(self):
+        import subprocess
+        import sys
+
+        probe = (
+            "import importlib, sys;"
+            "from vllm.platforms import current_platform;"
+            "from vllm_rbln import platform;"
+            "mods = [importlib.import_module(m) for m in sorted(READERS)];"
+            "platform._apply_model_impl('vllm');"
+            "print(platform.USE_DEVICE_TENSOR,"
+            " [m.__name__ for m in mods if hasattr(m, 'USE_DEVICE_TENSOR')])"
+        ).replace("READERS", repr(_DEVICE_FLAG_READERS))
+        out = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env={
+                k: v
+                for k, v in os.environ.items()
+                if not k.startswith("VLLM_RBLN")
+                and k != platform.envs.RESOLVED_MODEL_IMPL_ENV
+            },
+        )
+        assert out.returncode == 0, out.stderr[-2000:]
+        assert out.stdout.strip().endswith("True []"), out.stdout

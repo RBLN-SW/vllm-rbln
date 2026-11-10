@@ -16,14 +16,14 @@
 Backport of vllm-project/vllm#59254 (issue vllm-project/vllm#50690). With
 ``ignore_eos`` a request keeps sampling after ``<|return|>`` or ``<|call|>``,
 and the next token is not the ``<|start|>`` the parser expects.
-``process_chunk`` let that ``HarmonyError`` escape, and the chat completion
-answered HTTP 500. The body is upstream's, unchanged from v0.26.0 through
-v0.30.0, plus upstream's ``try``/``except`` around ``process``. It is kept
-identical so that this module is deleted, not merged.
+``process_chunk`` and ``count_reasoning_tokens`` let that ``HarmonyError``
+escape, and the chat completion answers HTTP 500. Both bodies are v0.32.0's,
+which are v0.31.0's plus the ``try``/``except`` around ``process``. They are
+kept identical so that this module is deleted, not merged.
 
 Like every registry patch, it applies on the vllm model path only.
 
-TODO(vllm>=0.31.0): delete this module, its test and the assert below.
+TODO(vllm>=0.32.0): delete this module, its test and the assert below.
 """
 
 from collections.abc import Sequence
@@ -31,13 +31,16 @@ from importlib.metadata import version
 
 from openai_harmony import HarmonyError
 from packaging.version import Version
+from vllm.entrypoints.openai.parser.harmony_utils import (
+    get_streamable_parser_for_assistant,
+)
 from vllm.parser.harmony import ChunkResult, HarmonyParser, Segment
 
 from vllm_rbln.patches import register_patch
 
-assert Version(version("vllm")) < Version("0.31.0"), (
-    "vllm-project/vllm#59254 merged after v0.30.0. Once this vllm carries it, "
-    "delete vllm_rbln/patches/harmony.py, its import in "
+assert Version(version("vllm")) < Version("0.32.0"), (
+    "v0.32.0 is the first vllm release that carries vllm-project/vllm#59254. "
+    "Delete vllm_rbln/patches/harmony.py, its import in "
     "vllm_rbln/patches/__init__.py and tests/vllm/patches/test_harmony.py."
 )
 
@@ -45,11 +48,11 @@ assert Version(version("vllm")) < Version("0.31.0"), (
 @register_patch(
     target="vllm.parser.harmony.HarmonyParser.process_chunk",
     reason=(
-        "Upstream's process_chunk lets a HarmonyError escape when a token "
+        "v0.31.0's process_chunk lets a HarmonyError escape when a token "
         "follows <|return|> or <|call|>, which a request with ignore_eos always "
-        "produces, and the streaming chat completion fails with HTTP 500. "
-        "vllm-project/vllm#59254 skips the token instead, and no release the "
-        "pin can take carries it yet."
+        "produces, and the chat completion fails with HTTP 500. "
+        "vllm-project/vllm#59254 skips the token instead; v0.31.0 was cut "
+        "before it merged."
     ),
     key="vllm_rbln.patches.harmony.process_chunk",
     owner_module="vllm_rbln.patches.harmony",
@@ -75,7 +78,7 @@ def patched_process_chunk(self: HarmonyParser, token_ids: Sequence[int]) -> Chun
         else:
             self._current_message_tokens.append(token_id)
 
-        if channel == "analysis" or (channel == "commentary" and recipient is not None):
+        if self._is_reasoning_token(token_id, channel, recipient):
             reasoning_token_count += 1
 
         segments.append(
@@ -87,7 +90,38 @@ def patched_process_chunk(self: HarmonyParser, token_ids: Sequence[int]) -> Chun
             )
         )
 
+    self._num_counted_tokens += len(token_ids)
+    self._num_reasoning_tokens += reasoning_token_count
     return ChunkResult(
         segments=segments,
         reasoning_token_count=reasoning_token_count,
     )
+
+
+@register_patch(
+    target="vllm.parser.harmony.HarmonyParser.count_reasoning_tokens",
+    reason=(
+        "count_reasoning_tokens re-parses the output with a fresh parser and "
+        "raises the same HarmonyError on a token after <|return|> or <|call|>. "
+        "vllm-project/vllm#59254 skips the token here too."
+    ),
+    key="vllm_rbln.patches.harmony.count_reasoning_tokens",
+    owner_module="vllm_rbln.patches.harmony",
+)
+def patched_count_reasoning_tokens(
+    self: HarmonyParser, token_ids: Sequence[int]
+) -> int:
+    if len(token_ids) == self._num_counted_tokens:
+        return self._num_reasoning_tokens
+
+    parser = get_streamable_parser_for_assistant()
+    count = 0
+    for token_id in token_ids:
+        try:
+            parser.process(token_id)
+        except HarmonyError:
+            continue
+        recipient = self._normalize_recipient(parser.current_recipient)
+        if self._is_reasoning_token(token_id, parser.current_channel, recipient):
+            count += 1
+    return count

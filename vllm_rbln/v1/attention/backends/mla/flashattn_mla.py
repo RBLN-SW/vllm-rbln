@@ -2,10 +2,15 @@
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# You may obtain a copy of the License at:
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 #
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 # RBLN MLA backend: minimal port of vLLM FlashAttn MLA using custom ops for
 # compilation.  Reuses vLLM MLA common types and metadata builder.
 
@@ -25,6 +30,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.mla.index_group import SparseMLAIndexGroupBuilder
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 from vllm_rbln.logger import init_logger
 
@@ -141,8 +147,12 @@ class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
                 "Only decoder self-attention is implemented for FlashAttnMLAImpl"
             )
 
+        # MLAAttention hands every sparse layer the top-k buffer, including an
+        # index-share skip layer that owns no indexer and reads another layer's
+        # top-k.
+        is_sparse = self.indexer is not None or topk_indices_buffer is not None
         if is_quantized_kv_cache(self.kv_cache_dtype) and not (
-            self.kv_cache_dtype.startswith("fp8") and self.indexer is not None
+            self.kv_cache_dtype.startswith("fp8") and is_sparse
         ):
             # Only the sparse (DSA) path packs an fp8 latent cache the kernel can
             # read; a dense MLA layer would be handed a cache its bf16 kernel
@@ -247,6 +257,8 @@ class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
                 attn_metadata.seq_lens.to(torch.int32),
                 attn_metadata.block_tables,
                 topk_indices,
+                is_prompt_sorted=attn_metadata.is_prompt_sorted,
+                null_block_id=NULL_BLOCK_ID,
             )
             return self._v_up_proj(attn_output, layer.W_UV)
 
@@ -264,6 +276,7 @@ class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
             attn_metadata.seq_lens,
             attn_metadata.block_tables,
             self.scale_tensor,
+            is_prompt_sorted=attn_metadata.is_prompt_sorted,
         )
 
         # attn_output: [B, H, S, kv_lora_rank] → V-up projection → [B, S, H*v_head_dim]

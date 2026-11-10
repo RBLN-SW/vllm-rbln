@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -38,6 +38,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
 )
 from vllm.distributed.parallel_state import get_pp_group
 
+import vllm_rbln.envs as envs
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_worker import (
     RblnNixlWorkerBase,
 )
@@ -46,6 +47,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import
     RblnNixlConnectorMetadata,
 )
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.worker.utils import abort_worker
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -56,6 +58,10 @@ if TYPE_CHECKING:
         ReqMeta,
     )
     from vllm.v1.kv_cache_interface import KVCacheConfig
+
+    from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
+        ChunkGrid,
+    )
 
 logger = init_logger(__name__)
 
@@ -95,6 +101,14 @@ class OfferedBlocks(tuple):
     #: record when the blocks are about to be reused, so a list whose number no
     #: live record carries is one the writer must not send.
     serial: int
+    #: The request's final token count where this list reaches its last block
+    #: ahead of the handover. None elsewhere, where the writer reads the
+    #: handover's count.
+    valid_tokens: int | None
+    #: Completes when the forwards that wrote these blocks do. The writer waits
+    #: on it before reading them, so the engine thread never has to. None on a
+    #: handover: `request_finished` runs after the request's last forward.
+    done: "torch.rbln.Event | None"
 
     def __new__(
         cls,
@@ -103,6 +117,8 @@ class OfferedBlocks(tuple):
         serial: int,
         *,
         handover: bool = False,
+        done: "torch.rbln.Event | None",
+        valid_tokens: int | None = None,
     ) -> "OfferedBlocks":
         if groups and not isinstance(groups[0], (list, tuple)):
             # Upstream rebuilds a flat list as a plain tuple of one group
@@ -119,6 +135,8 @@ class OfferedBlocks(tuple):
         self.offered_tokens = offered_tokens
         self.handover = handover
         self.serial = serial
+        self.done = done
+        self.valid_tokens = valid_tokens
         return self
 
 
@@ -162,7 +180,7 @@ class _StreamedSend:
     and `failed` cross between the two, and every access to those is under
     `_sending_transfers_lock`. `total` crosses unlocked, every write of it
     being the same value; `serial` never changes once the record is built. The
-    three `pending_offer` fields are the engine thread's.
+    four `pending_offer` fields are the engine thread's.
     """
 
     # Blocks this rank has closed, held for the next step to hand over. None
@@ -174,6 +192,8 @@ class _StreamedSend:
     # Completes when the device work that wrote those blocks does. Set and
     # cleared with the offer.
     pending_offer_done: "torch.rbln.Event | None" = None
+    # The request's final count, where that offer is its closing chunk's.
+    pending_offer_valid_tokens: int | None = None
     # Whether the writer has been told about this request at all. Not derivable
     # from `pending_offer`: an aborted offer clears that without ever releasing.
     released: bool = False
@@ -333,7 +353,9 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         streamed is the prefix of blocks a prefill CLOSED, and a prompt's last
         block is closed by nothing -- its tokens end mid-block. The handover
         carries the whole list, so it covers that tail, and the writer sends
-        only the part past what it already wrote.
+        only the part past what it already wrote. Where the closing chunk's
+        offer already carried the whole list, that part is empty and the
+        handover only ends the request.
 
         Runs before the call that hands the same metadata to the writer, which
         puts these very objects in its inbox. Marked rather than
@@ -356,7 +378,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                 # Marked on the list because that is what survives the fold,
                 # riding through the parking to the batch that carries it.
                 metadata.push_finished_blocks[req_id] = OfferedBlocks(
-                    blocks, 0, send.serial, handover=True
+                    blocks, 0, send.serial, handover=True, done=None
                 )
 
     def start_early_push(self, metadata: "RblnNixlConnectorMetadata") -> None:
@@ -367,10 +389,12 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         reads it to write straight out of device memory. The two never run on
         the same request because the shape refuses host staging.
 
-        Held rather than handed over, because the forward that produced the KV
-        completes asynchronously: a write issued from here would read KV still
-        being written, silently -- the transfer reports no error. The event
-        recorded here is what `release_early_offers` waits on before releasing.
+        Held until the next step's `release_early_offers`, which hands every
+        held offer to the writer at the connector's flush site, ahead of that
+        step's handover. The event recorded here rides the offer, and the writer
+        waits on it before reading: the forward that produced the KV completes
+        asynchronously, and a write issued before it would read KV still being
+        written, silently -- the transfer reports no error.
 
         Called from `wait_for_save` rather than the completion hook so the copy
         for the step is already done: speculative decoding on the last stage
@@ -387,6 +411,9 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
             send.pending_offer = meta.local_block_ids
             send.pending_offer_tokens = metadata.push_stream_tokens.get(req_id, 0)
             send.pending_offer_done = done
+            send.pending_offer_valid_tokens = metadata.push_stream_valid_tokens.get(
+                req_id
+            )
             total = metadata.push_stream_total.get(req_id)
             if total is not None:
                 send.total = total
@@ -394,12 +421,14 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
     def release_early_offers(self) -> None:
         """Hand the previous step's held offers to the writer.
 
-        Waits for the device work behind an offer before letting it go. Called
-        from the connector's flush site, past the submission that work retires
-        behind, so the wait is a check rather than a stall, and ahead of the
-        handover, so a request whose handover lands on this step is written by
-        its offer too. Every offer goes on the step that reaches here --
-        `_seal_at_handover` marks only what has been released.
+        The device work behind an offer travels with it, and the writer waits
+        on it. Waiting here, at the start of the next step, would hold the
+        engine thread until the previous forward finished, so the next step
+        could not be prepared while it ran and the NPU would idle for that
+        preparation. Called ahead of the handover, so a request whose handover lands
+        on this step is written by its offer too. Every offer goes on the step
+        that reaches here -- `_seal_at_handover` marks only what has been
+        released.
 
         What guarantees a next step: an unfinished request keeps the engine
         stepping, and a finished one keeps it stepping on the connector's
@@ -411,7 +440,11 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                 req_id,
                 send,
                 OfferedBlocks(
-                    send.pending_offer, send.pending_offer_tokens, send.serial
+                    send.pending_offer,
+                    send.pending_offer_tokens,
+                    send.serial,
+                    done=send.pending_offer_done,
+                    valid_tokens=send.pending_offer_valid_tokens,
                 ),
             )
             for req_id, send in self._streamed.items()
@@ -423,12 +456,11 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
             for _, send, _ in offers:
                 send.released = True
         for req_id, send, block_ids in offers:
-            done = send.pending_offer_done
-            assert done is not None
-            done.synchronize()
+            assert block_ids.done is not None
             send.pending_offer = None
             send.pending_offer_tokens = 0
             send.pending_offer_done = None
+            send.pending_offer_valid_tokens = None
             self._finished_blocks_inbox.put((req_id, block_ids))
         self._push_writer_wake.set()
 
@@ -653,7 +685,39 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         # nothing reaches.
         self._pending_d_registrations.pop(registration_data["request_id"], None)
         self._pending_d_registrations[request_id] = registration_data
+        self._wait_for_offer(local_block_ids)
         return super()._do_start_push_kv(request_id, local_block_ids, registration_data)
+
+    def _wait_for_offer(self, local_block_ids: BlockIds) -> None:
+        """Wait for the forwards that wrote an offer's blocks, on the writer.
+
+        Ahead of upstream's submission timer, which would report a forward still
+        running as a slow NIXL submission, and of the serial guard in
+        `_xfer_blocks_for_req`, so a request dropped during the wait is refused.
+
+        A failed wait means the device stream is broken. Upstream's writer loop
+        logs what it catches and carries on, which would drop this list and,
+        on the PUSH_REG route, the rest of that notification batch. The writer
+        thread has no path to raise into the engine, so the failure ends the
+        process under any executor. `worker_fail_fast` does that only under
+        `MultiprocExecutor` and re-raises otherwise; with an in-process engine
+        (`VLLM_ENABLE_V1_MULTIPROCESSING=0`) this also ends the caller.
+        """
+        done = getattr(local_block_ids, "done", None)
+        if done is None:
+            return
+        try:
+            done.synchronize()
+        except Exception as exc:
+            if envs.VLLM_RBLN_DISABLE_WORKER_FAIL_FAST:
+                raise
+            parallel_config = self.vllm_config.parallel_config
+            abort_worker(
+                exc,
+                where=f"{type(self).__qualname__}._wait_for_offer",
+                rank=parallel_config.rank,
+                dp_rank=parallel_config.data_parallel_rank,
+            )
 
     def _pop_matching_registration(self, request_id: str) -> dict[str, Any] | None:
         """Find the consumer's registration without consuming it.
@@ -754,6 +818,11 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
             self.consumer_notification_counts_by_req.pop(req_id, None)
         return finished
 
+    def _final_tokens(self, req_id: ReqId, meta: "ReqMeta") -> int | None:
+        """The request's final token count, off the list where it rides one."""
+        on_list = getattr(meta.local_block_ids, "valid_tokens", None)
+        return on_list if on_list is not None else self._valid_tokens.get(req_id)
+
     def _forget_send(self, req_id: ReqId) -> None:
         """Drop what this side tracked for a request it is done pushing."""
         self._streamed.pop(req_id, None)
@@ -767,7 +836,8 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         somewhere it is not, and the count paired with it then describes a
         block the batch does not have. The scheduler sends the total with every
         offer for exactly this. A batch that is the whole list answers for
-        itself -- the handover, and every write of an unstreamed request.
+        itself -- the closing chunk's offer, the handover, and every write of
+        an unstreamed request.
 
         Both are the scheduler's blocks. `in_batch` would be the kernel's where
         upstream splits a logical block, but `__init__` pins the ratio back to
@@ -845,7 +915,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                 )
             tail: AbstractContextManager = (
                 self._tail_viewed_as(
-                    self._valid_tokens.get(req_id),
+                    self._final_tokens(req_id, meta),
                     # The request's own block count: 0.30 trims this route
                     # inside `_xfer_blocks`, after the count is taken.
                     self._prompt_blocks(meta.local_physical_block_ids),
@@ -888,20 +958,22 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
 
         # One window serves every peer of this request, and `issued_hwm` is
         # the request's, so the peers have to agree on the unit it counts in.
-        # Where they do not, none of them gets chunks.
-        grids = {self._shard_chunk_grids[(engine_id, r)] for r in peer_ranks}
-        chunk_grid = grids.pop() if len(grids) == 1 else None
-        cps = 1 if chunk_grid is None else chunk_grid[1]
+        # Where they do not, none of them gets chunks. Which regions hold a
+        # chunk is each shard's own grid's to say, so only the unit is compared.
+        grids = [self._shard_chunk_grids[(engine_id, r)] for r in peer_ranks]
+        units = {self._chunks_per_block(grid) for grid in grids}
+        chunk_grid = grids[0] if len(units) == 1 else None
         cpb = self._chunks_per_block(chunk_grid)
-        # Only the handover carries the request's final token count, and that
-        # is what says how many chunks of its last block hold tokens. The
+        # Only a list that reaches the request's last block -- the closing
+        # offer or the handover -- has its final token count, and that is what
+        # says how many chunks of its last block hold tokens. The
         # descriptor builders below derive the same number from the count they
         # are handed; the window needs it too, to stop a block it writes in
         # pieces at the same place.
         needed = self._tail_chunks(
             self._blocks_in_request(streamed, n_prompt_blocks),
-            self._valid_tokens.get(req_id),
-            chunks_per_span=cps,
+            self._final_tokens(req_id, meta),
+            chunk_grid=chunk_grid,
         )
         window = self._stream_window(
             req_id,
@@ -925,7 +997,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         # span counts in chunks now, so the consumer's end is that many past
         # its last block rather than the block count itself.
         tail_tokens = (
-            self._valid_tokens.get(req_id) if span[1] == registered * cpb else None
+            self._final_tokens(req_id, meta) if span[1] == registered * cpb else None
         )
         n_write_blocks = sum(len(g) for g in local_block_ids)
         if not n_write_blocks and not pieces:
@@ -964,7 +1036,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
             # The chunks come from the second range of the same two lists, so
             # they join this batch rather than costing it a second transfer --
             # and one range keeps the notification single.
-            for local_block, remote_block, span_ix, chunk_span in pieces:
+            for local_block, remote_block, chunk_span in pieces:
                 remote_descs = np.concatenate(
                     (
                         remote_descs,
@@ -974,7 +1046,6 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                             self.dst_num_blocks[engine_id],
                             remote_block,
                             chunk_span,
-                            span_ix=span_ix,
                         ),
                     )
                 )
@@ -987,7 +1058,6 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                             self.num_blocks,
                             local_block,
                             chunk_span,
-                            span_ix=span_ix,
                         ),
                     )
                 )
@@ -1048,12 +1118,11 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         # which is what would leave nothing to count in.
         assert n_prompt_blocks is not None and counted is not None
         registered = len(remote_block_ids[counted])
-        cps = 1 if self._chunk_grid is None else self._chunk_grid[1]
         cpb = self._chunks_per_block(self._chunk_grid)
         needed = self._tail_chunks(
             self._blocks_in_request(streamed, n_prompt_blocks),
-            self._valid_tokens.get(req_id),
-            chunks_per_span=cps,
+            self._final_tokens(req_id, meta),
+            chunk_grid=self._chunk_grid,
         )
         offered_tokens = getattr(meta.local_block_ids, "offered_tokens", 0)
         window = self._stream_window(
@@ -1079,25 +1148,24 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                 "two block lists count different things."
             )
         local_block_ids, remote_block_ids, span, pieces = window
-        # Align the groups the way upstream aligns them before it reads them:
-        # a streamed batch empties the window's group on our side while the
-        # consumer keeps the block it registered for it, and the two lists
-        # have to name the same descriptors.
-        pairs = [
-            (loc[: len(rem)], rem[: len(loc)])
+        if not offered_tokens and not all(
+            len(loc) >= len(rem) and (len(rem) or not len(loc))
             for loc, rem in zip(local_block_ids, remote_block_ids)
-        ]
-        # The truncation above is what keeps the window's block off a streamed
-        # batch. On the handover it must drop nothing: a consumer that
-        # registered no block for a group would lose it here silently and then
-        # decode against a window nobody wrote.
-        assert offered_tokens or all(len(loc) == len(rem) for loc, rem in pairs), (
-            f"RBLN NIXL push: the handover of request {req_id} pairs block "
-            f"lists of lengths {[len(g) for g in local_block_ids]} against "
-            f"{[len(g) for g in remote_block_ids]}."
-        )
-        local_block_ids = tuple(loc for loc, _ in pairs)
-        remote_block_ids = tuple(rem for _, rem in pairs)
+        ):
+            raise RuntimeError(
+                f"RBLN NIXL push: the handover of request {req_id} pairs block "
+                f"lists of lengths {[len(g) for g in local_block_ids]} against "
+                f"{[len(g) for g in remote_block_ids]}."
+            )
+        # The consumer registers the suffix of each group, so the lists pair from
+        # the end: a streamed batch empties the window group on our side, and a
+        # handover may carry a leading null block the consumer never registered.
+        paired_local, paired_remote = [], []
+        for loc, rem in zip(local_block_ids, remote_block_ids):
+            n = min(len(loc), len(rem))
+            paired_local.append(loc[len(loc) - n :])
+            paired_remote.append(rem[len(rem) - n :])
+        local_block_ids, remote_block_ids = tuple(paired_local), tuple(paired_remote)
         notif_id = self._with_coverage(
             self._xfer_notif_id(
                 engine_id, meta.remote.request_id, remote_info.remote_tp_size
@@ -1106,7 +1174,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
             cpb,
         )
         tail_tokens = (
-            self._valid_tokens.get(req_id) if span[1] == registered * cpb else None
+            self._final_tokens(req_id, meta) if span[1] == registered * cpb else None
         )
         if not sum(len(g) for g in local_block_ids) and not pieces:
             logger.debug("streamed write req %s: nothing new to push", req_id)
@@ -1115,7 +1183,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         # Each side parks its own pieces: one call describes one list, and the
         # block ids in it are that side's.
         with self._tail_viewed_as(
-            tail_tokens, n_prompt_blocks, tuple((b, s, c) for _, b, s, c in pieces)
+            tail_tokens, n_prompt_blocks, tuple((b, c) for _, b, c in pieces)
         ):
             remote_descs = self._compute_desc_ids(
                 remote_block_ids,
@@ -1124,7 +1192,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                 remote_info.remote_physical_blocks_per_logical,
             )
         with self._tail_viewed_as(
-            tail_tokens, n_prompt_blocks, tuple((b, s, c) for b, _, s, c in pieces)
+            tail_tokens, n_prompt_blocks, tuple((b, c) for b, _, c in pieces)
         ):
             local_descs = self._compute_desc_ids(
                 local_block_ids,
@@ -1223,6 +1291,11 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                 # flush gave up on it past its deadline. Filed here either
                 # way -- these handles are in flight, and upstream's map is
                 # what releases them.
+                if streamed is not None or len(handles) < len(writes):
+                    # Held out of upstream's success report: a flush already
+                    # returned this request's blocks, and a lost submission is
+                    # one upstream holds back from its own report too.
+                    self._send_failures.add(req_id)
                 self._sending_transfers[req_id].extend(handles)
 
     def _stream_window(
@@ -1231,19 +1304,17 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         local_block_ids: BlockIds,
         remote_block_ids: BlockIds,
         remote_expand: int = 1,
-        chunk_grid: tuple[int, int] | None = None,
+        chunk_grid: "ChunkGrid | None" = None,
         offered_tokens: int = 0,
         tail: int | None = None,
-    ) -> (
-        "tuple[BlockIds, BlockIds, Span, tuple[tuple[int, int, int | None, Span], ...]]"
-        " | None"
-    ):
+    ) -> "tuple[BlockIds, BlockIds, Span, tuple[tuple[int, int, Span], ...]] | None":
         """The part of the consumer's list this batch is the first to fill.
 
-        Whole blocks, then the pieces of a block written in chunks: at most the
-        rest of the one a previous batch left part-written and the start of the
-        one being filled now. None where a request is not streamed -- the flag
-        off, or a whole prompt offered at once -- which takes the trim instead.
+        Whole blocks, then in chunk mode the pieces of the request's last
+        block: what an earlier batch left of it, or its chunks filled so far.
+        None where no offer reached the request -- the flag off, or a prompt
+        the scheduler never offered, such as a hybrid's shorter than a block --
+        which takes the trim instead.
 
         A streamed offer is a growing prefix of the producer's blocks, and the
         consumer registered the TAIL of the prompt, what its own cache did not
@@ -1268,18 +1339,17 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         offset = total * expand - registered
         have = len(local_block_ids[f])
         assert send is not None
-        # Chunks of a BLOCK. The grid cuts one span and a context cut gives a
-        # block several, so a count taken off the token total has to divide by
-        # the block's own number -- the unit `_tail_chunks` and the coverage
-        # range are already in.
-        cps = 1 if chunk_grid is None else chunk_grid[1]
+        # Chunks of a BLOCK, the unit `_tail_chunks` and the coverage range are
+        # already in. Which regions hold a chunk is the descriptor builders'
+        # business, so a piece here crosses areas freely.
         cpb = self._chunks_per_block(chunk_grid)
         lo = send.issued_hwm
         # How many of our blocks the offer has CLOSED. Its length says so only
         # while it holds nothing else; once it carries the block being filled, a
         # peer that takes no chunks would write that one whole -- KV this rank has
         # not computed. So the token count decides, and the length is left to the
-        # handover offer, which carries no count.
+        # lists that carry the whole list -- the closing offer and the handover
+        # -- which carry no prefix count.
         closed = offered_tokens // self.block_size if offered_tokens else have
         # Upstream truncates a P-side request so no decode step is scheduled,
         # and the allocator therefore leases it the prompt's blocks and no
@@ -1294,17 +1364,17 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
             )
         hi = max(0, closed - offset)
 
-        # Chunks the offer holds of the block after those. None without a grid
-        # -- `_shard_chunk_grid` returns None rather than a grid of one chunk
-        # -- and none while the offer is short of the consumer's window: `hi`
-        # clamps to 0 there, and the block they would come from is one the
-        # offer does not have.
+        # Chunks the offer holds of the block after those, which only the
+        # request's last block leaves in: every other block goes whole once it
+        # closes. None without a grid -- `_shard_chunk_grid` returns None rather
+        # than a grid of one chunk -- and none while the offer is short of the
+        # consumer's window (`offset <= closed`).
         tail_chunks = 0
         if (
             chunk_grid
             and offered_tokens
             and offset <= closed < have
-            and 0 <= hi < registered
+            and hi == registered - 1
         ):
             rem = offered_tokens - closed * self.block_size
             if rem > 0:
@@ -1321,54 +1391,27 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                 (),
             )
 
-        def piece(
-            index: int, span_ix: int | None, chunk_span: "Span"
-        ) -> tuple[int, int, int | None, "Span"]:
+        def piece(index: int, chunk_span: "Span") -> tuple[int, int, "Span"]:
             return (
                 local_block_ids[f][offset + index],
                 remote_block_ids[f][index],
-                span_ix,
                 chunk_span,
             )
 
-        def over_spans(
-            index: int, first_chunk: int, past: int
-        ) -> list[tuple[int, int, int | None, "Span"]]:
-            """One piece per span the chunks `[first_chunk, past)` touch.
-
-            A chunk range is indexed inside a span, and every span carries the
-            same indices, so a range crossing one cannot be a single piece.
-            `None` is the head cut, whose one span is the block itself.
-            """
-            out = []
-            while first_chunk < past:
-                span_ix, within = divmod(first_chunk, cps)
-                end = min(past, (span_ix + 1) * cps)
-                out.append(
-                    piece(
-                        index,
-                        span_ix if cpb > cps else None,
-                        (within, end - span_ix * cps),
-                    )
-                )
-                first_chunk = end
-            return out
-
-        # The block at `lo` closes with part of it already gone, so the write takes
-        # the rest in chunks and the whole-block range starts after it; writing it
-        # whole would repeat what a previous batch sent. That rest stops at `tail`
-        # where the block is the request's last, since the chunks past its tokens
-        # are the ones this mode exists not to send.
-        pieces: list[tuple[int, int, int | None, Span]] = []
+        # The last block closes with part of it already gone, so the write takes
+        # the rest in chunks; writing it whole would repeat what a previous
+        # batch sent. That rest stops at `tail`, since the chunks past its
+        # tokens are the ones chunk mode exists not to send.
+        pieces: list[tuple[int, int, Span]] = []
         first = lo
         if hi > lo and head_chunks:
-            end = tail if tail is not None and lo == registered - 1 else cpb
+            end = cpb if tail is None else tail
             if end > head_chunks:
-                pieces += over_spans(lo, head_chunks, end)
+                pieces.append(piece(lo, (head_chunks, end)))
             first = lo + 1
         tail_lo = head_chunks if hi == lo else 0
         if tail_chunks > tail_lo:
-            pieces += over_spans(hi, tail_lo, tail_chunks)
+            pieces.append(piece(hi, (tail_lo, tail_chunks)))
 
         send.issued_hwm = hi
         send.issued_chunks = (

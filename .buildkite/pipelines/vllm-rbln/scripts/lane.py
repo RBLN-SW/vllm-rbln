@@ -12,20 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""What the perf and lm-eval drivers both need: which chip and how many devices
-this host has, how a target's env and flags become a command, and how to run one
-with its output kept."""
+"""Shared CI target snapshots, device budgets, commands, and results."""
 
 from __future__ import annotations
 
+import argparse
+import base64
 import glob
+import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
+import sys
+import tarfile
+import tempfile
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import yaml
+
+_TARGET_DIRS = ("perf", "lm-eval", "sampler-perf")
 _RSD_ENV = "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK"
 _RSD_SERVE = "rbln_num_devices_per_local_rank"
 _PARALLEL_KEYS = (
@@ -87,6 +96,81 @@ def build_cmd(base: list[str], params: dict[str, Any]) -> list[str]:
     from vllm.benchmarks.sweep.param_sweep import ParameterSweepItem
 
     return ParameterSweepItem(params).apply_to_cmd(base)
+
+
+def perf_cases(target: dict[str, Any]) -> list[tuple[str, str]]:
+    launches = target["serve_params"]
+    benches = target["bench_params"]
+    for bench, params in benches.items():
+        if "serve" not in params:
+            continue
+        selected = params["serve"]
+        if (
+            not isinstance(selected, list)
+            or not selected
+            or not all(isinstance(name, str) for name in selected)
+        ):
+            raise ValueError(f"{bench}: serve must be a non-empty list of launch names")
+        if unknown := set(selected) - launches.keys():
+            raise ValueError(
+                f"{bench}: unknown serve names: {', '.join(sorted(unknown))}"
+            )
+
+    return [
+        (launch, bench)
+        for launch in launches
+        for bench, params in benches.items()
+        if "serve" not in params or launch in params["serve"]
+    ]
+
+
+def load_targets(directory: Path, chip: str, lane: str) -> dict[str, Any]:
+    paths = sorted([*directory.glob("*.yaml"), *directory.glob("*.yml")])
+    if not paths:
+        raise ValueError(f"No {lane} targets under {directory}")
+    targets = {}
+    for path in paths:
+        target = yaml.safe_load(path.read_text())
+        if not isinstance(target, dict) or not isinstance(target.get("model"), str):
+            raise ValueError(f"{path}: model must be a string")
+        fields = ("serve", "serve_params", "bench_params" if lane == "perf" else "eval")
+        for field in fields:
+            if not isinstance(target.get(field), dict):
+                raise ValueError(f"{path}: {field} must be a mapping")
+        if not target["serve_params"]:
+            raise ValueError(f"{path}: no launches configured")
+        if lane == "perf":
+            if not perf_cases(target):
+                raise ValueError(f"{path}: no perf cases configured")
+        else:
+            assert lane == "lm-eval"
+            tasks = target["eval"].get("tasks")
+            if (
+                not isinstance(tasks, list)
+                or not tasks
+                or not all(isinstance(task, str) and task for task in tasks)
+            ):
+                raise ValueError(
+                    f"{path}: eval.tasks must be a non-empty list of names"
+                )
+        for overrides in target["serve_params"].values():
+            devices_needed(target["serve"] | overrides, target_env(target))
+        if not target.get("chips") or chip in target["chips"]:
+            targets[path.stem] = target
+    if not targets:
+        raise ValueError(f"No {lane} cases configured for {chip}")
+    return targets
+
+
+def restore_ci_targets(directory: Path) -> dict[str, Any]:
+    with tarfile.open(directory / "snapshot.tar.gz") as archive:
+        for name in _TARGET_DIRS:
+            if (directory / name).exists():
+                shutil.rmtree(directory / name)
+        archive.extractall(directory, filter="data")
+    source = json.loads((directory / "source.json").read_text())
+    print(f"CI targets: {source['repo']}@{source['commit']}", flush=True)
+    return source
 
 
 _LANE_ENV = {
@@ -168,7 +252,7 @@ def run_logged(cmd: list[str], log: Path, env: dict[str, str]) -> int:
         tee.wait()
 
 
-def _agent_bin() -> str | None:
+def agent_bin() -> str | None:
     """A containerized step gets the agent bind-mounted into the build root
     rather than installed, so `which` alone finds nothing."""
     if found := shutil.which("buildkite-agent"):
@@ -185,6 +269,174 @@ def _agent_bin() -> str | None:
         if os.access(candidate, os.X_OK):
             return str(candidate)
     return None
+
+
+def write_result(out: Path, result: dict[str, Any]) -> None:
+    """Keep result.json readable when a job is interrupted during a write."""
+    temporary = out / "result.tmp"
+    temporary.write_text(json.dumps(result))
+    temporary.replace(out / "result.json")
+
+
+def start_case(out: Path, *, resume: bool = False) -> dict[str, Any]:
+    if out.exists() and not resume:
+        raise ValueError(f"Cannot overwrite {out}; use a new --run-id")
+    out.mkdir(parents=True, exist_ok=True)
+    build_url = os.environ.get("BUILDKITE_BUILD_URL")
+    job_id = os.environ.get("BUILDKITE_JOB_ID")
+    result: dict[str, Any] = {
+        "exit_code": None,
+        "job_url": f"{build_url}?job={job_id}" if build_url and job_id else None,
+        "rows": [],
+    }
+    write_result(out, result)
+    return result
+
+
+def case_status(result: dict[str, Any] | None) -> str:
+    if result is None:
+        return "no result"
+    if result["exit_code"] is None:
+        return "incomplete"
+    if result["exit_code"] != 0:
+        return f"failed (exit {result['exit_code']})"
+    if not result["rows"]:
+        return "no results"
+    return "ok"
+
+
+def pytest_addoption(parser):
+    parser.addoption("--ci-result-dir", help="Write structured CI test counts here")
+
+
+def pytest_sessionstart(session):
+    if directory := session.config.getoption("ci_result_dir"):
+        start_case(Path(directory))
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    if directory := config.getoption("ci_result_dir"):
+        out = Path(directory)
+        result = json.loads((out / "result.json").read_text())
+        result["exit_code"] = int(exitstatus)
+        result["counts"] = {
+            label: len(terminalreporter.stats.get(category, []))
+            for label, category in (
+                ("passed", "passed"),
+                ("failed", "failed"),
+                ("errors", "error"),
+                ("skipped", "skipped"),
+                ("xfailed", "xfailed"),
+                ("xpassed", "xpassed"),
+            )
+        }
+        write_result(out, result)
+
+
+def download_results(lane: str, run_id: str, chip: str) -> None:
+    agent = agent_bin()
+    if agent is None:
+        raise RuntimeError("buildkite-agent is required to download results")
+    pattern = f"{lane}-results/{run_id}/{chip}/**/result.json"
+    found = subprocess.run(
+        [agent, "artifact", "search", pattern, "--allow-empty-results"],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    if found.stdout.strip():
+        subprocess.run([agent, "artifact", "download", pattern, "."], check=True)
+
+
+def measured_pipeline(
+    lane: str,
+    driver: Path,
+    targets: dict[str, Any],
+    cases: list[tuple[str, ...]],
+    *,
+    chip: str,
+    run_id: str,
+    targets_dir: Path,
+    snapshot: bool = False,
+) -> dict[str, Any]:
+    root = Path(__file__).resolve().parents[4]
+    template = yaml.safe_load((root / ".buildkite/vllm-rbln-nightly.yml").read_text())[
+        f"_{lane.replace('-', '_')}"
+    ]
+    chip_name = chip.removeprefix("RBLN-")
+    prefix = f"nightly-{lane}-{chip_name.lower()}"
+    setup_commands = ()
+    if snapshot:
+        setup_commands = (
+            "uv run --no-project --python 3.12 --with pyyaml python "
+            + shlex.join(
+                [
+                    str(Path(__file__).resolve().relative_to(root)),
+                    "restore",
+                    "--run-id",
+                    run_id,
+                ]
+            ),
+        )
+    driver = driver.relative_to(root)
+    runner = driver.with_name(driver.stem.replace("_", "-") + ".sh")
+    common = [
+        "--chip",
+        chip,
+        "--run-id",
+        run_id,
+        "--targets-dir",
+        os.path.relpath(targets_dir, root),
+    ]
+    steps = []
+    for case in cases:
+        name, launch = case[:2]
+        target = targets[name]
+        serve = target["serve"] | target["serve_params"][launch]
+        selection = [
+            arg
+            for flag, value in zip(("--launch", "--bench"), case[1:])
+            for arg in (flag, value)
+        ]
+        command = shlex.join(["bash", str(runner), name, *selection, *common])
+        steps.append(
+            template
+            | {
+                "label": " / ".join(case),
+                "key": f"{prefix}-{'-'.join(case)}".replace(".", "_"),
+                "resources": {
+                    "npu": {
+                        "count": devices_needed(serve, target_env(target)),
+                        "product": chip,
+                    }
+                },
+                "command": [*setup_commands, *template["command"], command],
+            }
+        )
+    summary = template | {
+        "label": "summary",
+        "key": f"{prefix}-summary",
+        "depends_on": [step["key"] for step in steps],
+        "allow_dependency_failure": True,
+        "timeout_in_minutes": 10,
+        "artifact_paths": [f"{lane}-results/{run_id}/{chip}/**/summary.md"],
+        "command": "uv run --no-project --python 3.12 --with pyyaml python "
+        + shlex.join([str(driver), "summary", *targets, *common, "--download"]),
+    }
+    if setup_commands:
+        summary["command"] = [*setup_commands, summary["command"]]
+    for key in ("agents", "secrets", "plugins"):
+        del summary[key]
+    steps.append(summary)
+    return {
+        "steps": [
+            {
+                "group": f"[{chip_name}] {lane}",
+                "key": prefix,
+                "steps": steps,
+            }
+        ]
+    }
 
 
 def publish_summary(
@@ -225,7 +477,7 @@ def _publish_summary(
 
     if not on_ci:
         return
-    agent = _agent_bin()
+    agent = agent_bin()
     if agent is None:
         print("  summary: no buildkite-agent found; annotation skipped", flush=True)
         return
@@ -247,3 +499,159 @@ def _publish_summary(
     if done.returncode:
         detail = done.stderr.strip() or done.stdout.strip()
         print(f"  summary: annotate failed ({done.returncode}): {detail}", flush=True)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Prepare or restore CI target snapshots"
+    )
+    commands = parser.add_subparsers(dest="action", required=True)
+    for action in ("prepare", "restore"):
+        command = commands.add_parser(action)
+        if action == "prepare":
+            command.add_argument("--chip", required=True)
+        command.add_argument(
+            "--run-id",
+            default=os.environ.get("BUILDKITE_BUILD_ID")
+            or datetime.now().strftime("%Y%m%d_%H%M%S"),
+        )
+    args = parser.parse_args()
+    snapshot = Path("ci-targets") / args.run_id
+    if args.action == "restore":
+        agent = agent_bin()
+        if agent is None:
+            raise RuntimeError("buildkite-agent is required to download CI targets")
+        subprocess.run(
+            [
+                agent,
+                "artifact",
+                "download",
+                str(snapshot / "snapshot.tar.gz"),
+                ".",
+                "--step",
+                "nightly-targets-prepare",
+            ],
+            check=True,
+        )
+        restore_ci_targets(snapshot)
+        return 0
+
+    assert args.action == "prepare"
+    agent = agent_bin() if os.environ.get("BUILDKITE") else None
+    if os.environ.get("BUILDKITE") and agent is None:
+        raise RuntimeError("buildkite-agent is required to pin CI targets")
+    recorded = ""
+    if agent:
+        recorded = subprocess.run(
+            [agent, "meta-data", "get", "ci-target-repo-source", "--default", ""],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    if recorded:
+        source = json.loads(recorded)
+        repo, commit = source["repo"], source["commit"]
+    else:
+        repo = os.environ.get("CI_TARGET_REPO_URL")
+        if not repo:
+            parser.error("CI_TARGET_REPO_URL must name the target repository")
+        commit = os.environ.get("CI_TARGET_REPO_COMMIT", "")
+        source = {
+            "repo": repo,
+            "branch": os.environ.get("CI_TARGET_REPO_BRANCH") or "main",
+            "requested_commit": commit,
+        }
+    if commit and not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", commit):
+        parser.error("CI_TARGET_REPO_COMMIT must be a full commit SHA")
+    ref = commit or f"refs/heads/{source['branch']}"
+    git_env = os.environ | {"GIT_TERMINAL_PROMPT": "0"}
+    if token := os.environ.get("GIT_PAT"):
+        auth = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+        git_env |= {
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "http.https://github.com/.extraheader",
+            "GIT_CONFIG_VALUE_0": f"Authorization: Basic {auth}",
+        }
+    snapshot.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory() as temporary:
+        checkout = Path(temporary)
+        subprocess.run(["git", "init", "--quiet", str(checkout)], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(checkout),
+                "fetch",
+                "--quiet",
+                "--depth=1",
+                repo,
+                ref,
+            ],
+            env=git_env,
+            check=True,
+        )
+        resolved = subprocess.run(
+            ["git", "-C", str(checkout), "rev-parse", "FETCH_HEAD^{commit}"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if commit and resolved != commit.lower():
+            raise ValueError(f"Expected target commit {commit}, got {resolved}")
+        source["commit"] = resolved
+        if agent and not recorded:
+            subprocess.run(
+                [
+                    agent,
+                    "meta-data",
+                    "set",
+                    "ci-target-repo-source",
+                    json.dumps(source),
+                ],
+                check=True,
+            )
+        archive_path = checkout / "targets.tar"
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(checkout),
+                "archive",
+                "--format=tar",
+                f"--output={archive_path}",
+                resolved,
+                *_TARGET_DIRS,
+            ],
+            check=True,
+        )
+        content = checkout / "content"
+        with tarfile.open(archive_path) as archive:
+            archive.extractall(content, filter="data")
+        for name in ("perf", "lm-eval"):
+            load_targets(content / name, args.chip, name)
+        subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).with_name("sampler-perf") / "run_benchmarks.py"),
+                "--config",
+                str(content / "sampler-perf" / "benchmark-configs.yaml"),
+                "--output-dir",
+                str(checkout / "sampler-validation"),
+                "--dry-run",
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        manifest = snapshot / "source.json"
+        manifest.write_text(json.dumps(source, indent=2) + "\n")
+        with tarfile.open(snapshot / "snapshot.tar.gz", "w:gz") as archive:
+            for name in _TARGET_DIRS:
+                archive.add(content / name, arcname=name)
+            archive.add(manifest, arcname="source.json")
+    restore_ci_targets(snapshot)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

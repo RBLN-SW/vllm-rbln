@@ -21,6 +21,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from torch._dynamo.variables.invoke_subgraph import InvokeSubgraphHigherOrderVariable
 
 import vllm_rbln.compilation.compiler as compiler
 from vllm_rbln.compilation import (
@@ -40,10 +41,14 @@ def _dynamo_isolation():
         cfg.inline_inbuilt_nn_modules,
         cfg.cache_size_limit,
         compiler._DYNAMO_CONFIGURED,
+        cfg.inline_single_use_invoke_subgraph,
+        InvokeSubgraphHigherOrderVariable.allow_side_effects,
     )
     yield
     cfg.inline_inbuilt_nn_modules, cfg.cache_size_limit = saved[0], saved[1]
     compiler._DYNAMO_CONFIGURED = saved[2]
+    cfg.inline_single_use_invoke_subgraph = saved[3]
+    InvokeSubgraphHigherOrderVariable.allow_side_effects = saved[4]
 
 
 @pytest.fixture
@@ -206,15 +211,24 @@ class TestCompileOptions:
 
 
 class TestEnsureTorchDynamoConfigured:
-    def test_sets_rbln_flags(self):
+    @pytest.mark.parametrize("nested", [False, True])
+    def test_sets_rbln_flags(self, monkeypatch, nested):
         # Applies the RBLN dynamo settings (nn.Module params must not become
-        # graph inputs; larger cache size limit).
+        # graph inputs; larger cache size limit). Nested compile regions also
+        # keep single-use regions and reject side effects inside a region.
+        monkeypatch.setattr(
+            compiler.envs, "VLLM_RBLN_USE_NESTED_COMPILE_REGION", nested
+        )
         compiler._DYNAMO_CONFIGURED = False
         torch._dynamo.config.inline_inbuilt_nn_modules = True
         torch._dynamo.config.cache_size_limit = 8
+        torch._dynamo.config.inline_single_use_invoke_subgraph = True
+        InvokeSubgraphHigherOrderVariable.allow_side_effects = True
         compiler._ensure_torch_dynamo_configured()
         assert torch._dynamo.config.inline_inbuilt_nn_modules is False
         assert torch._dynamo.config.cache_size_limit == 64
+        assert torch._dynamo.config.inline_single_use_invoke_subgraph is not nested
+        assert InvokeSubgraphHigherOrderVariable.allow_side_effects is not nested
 
     def test_idempotent(self):
         # After the first call the guard makes further calls no-ops.
@@ -224,6 +238,59 @@ class TestEnsureTorchDynamoConfigured:
         torch._dynamo.config.inline_inbuilt_nn_modules = True
         compiler._ensure_torch_dynamo_configured()
         assert torch._dynamo.config.inline_inbuilt_nn_modules is True
+
+
+@pytest.mark.parametrize("stack", ["layers", "h", "blocks"])
+def test_mark_decoder_regions_marks_only_the_built_decoder_layers(monkeypatch, stack):
+    # A make_layers stack, under each name upstream gives it, with a PP
+    # placeholder past end_layer, next to a `layers` list that make_layers did
+    # not build: only the stack's two built layers become regions, sharing a body.
+    from vllm.model_executor.models.utils import PPMissingLayer
+
+    class Layer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = torch.nn.Linear(4, 4)
+
+        def forward(self, x):
+            return self.proj(x) + x
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = torch.nn.Module()
+            self.encoder.layers = torch.nn.ModuleList([Layer()])
+            self.start_layer, self.end_layer = 0, 2
+            layers = torch.nn.ModuleList([Layer(), Layer(), PPMissingLayer()])
+            setattr(self, stack, layers)
+
+        def forward(self, x):
+            x = self.encoder.layers[0](x)
+            for layer in getattr(self, stack)[self.start_layer : self.end_layer]:
+                x = layer(x)
+            return x
+
+    monkeypatch.setattr(compiler.envs, "VLLM_RBLN_USE_NESTED_COMPILE_REGION", True)
+    compiler._DYNAMO_CONFIGURED = False
+    compiler._ensure_torch_dynamo_configured()
+    model = Model()
+    compiler.mark_decoder_regions(model)
+
+    graphs = []
+
+    def backend(gm, example_inputs):
+        graphs.append(gm)
+        return gm.forward
+
+    torch._dynamo.reset()
+    torch.compile(model, backend=backend, fullgraph=True)(torch.randn(2, 4))
+    calls = [
+        node
+        for node in graphs[0].graph.nodes
+        if node.target is torch.ops.higher_order.invoke_subgraph
+    ]
+    assert len(calls) == 2
+    assert len({node.args[0].target for node in calls}) == 1
 
 
 class TestBuildProcessGroupDict:
@@ -273,18 +340,3 @@ class TestCompilerConformance:
         params = inspect.signature(CompileContext).parameters
         assert "use_weight_sharing" in params
         assert "use_global_ctx" not in params  # deprecated kwargs
-
-    def test_dtype_check_refuses_an_older_rebel(self, monkeypatch):
-        def legacy_compile(model, *, npu=None):
-            pass
-
-        monkeypatch.setattr(compiler.rebel, "compile", legacy_compile)
-        with pytest.raises(ValueError, match="dtype"):
-            compiler.check_dtype_option_supported()
-
-    def test_dtype_check_passes_when_rebel_takes_it(self, monkeypatch):
-        def new_compile(model, *, npu=None, dtype=None):
-            pass
-
-        monkeypatch.setattr(compiler.rebel, "compile", new_compile)
-        compiler.check_dtype_option_supported()

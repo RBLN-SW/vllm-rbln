@@ -302,13 +302,9 @@ def test_declared_default_matches_resolved(monkeypatch, name):
     assert type(resolved).__name__ in _annotation_names(annotation)
 
 
-@pytest.mark.parametrize(
-    "name", ["VLLM_USE_V2_MODEL_RUNNER", "VLLM_DISABLE_COMPILE_CACHE"]
-)
-def test_upstream_variables_reachable(name):
-    """``platform/__init__.py`` and ``platform/vllm_impl.py`` read these
-    upstream names off ``vllm_rbln.envs`` via the ``__getattr__`` fallthrough
-    to ``vllm.envs`` (surfaced in ``__dir__``)."""
+def test_upstream_variable_reachable():
+    """The compile-cache flag reaches upstream through the env fallthrough."""
+    name = "VLLM_DISABLE_COMPILE_CACHE"
     assert name in dir(envs)
     getattr(envs, name)
 

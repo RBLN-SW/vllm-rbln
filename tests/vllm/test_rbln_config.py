@@ -22,6 +22,7 @@ import logging
 import pathlib
 import re
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 from vllm.engine.arg_utils import AsyncEngineArgs
@@ -38,7 +39,7 @@ from vllm_rbln.config import (
     resolve_model_impl,
 )
 from vllm_rbln.envs import RESOLVED_MODEL_IMPL_ENV
-from vllm_rbln.utils.optimum.paths import RBLN_CONFIG_FILE
+from vllm_rbln.utils.optimum.path import RBLN_CONFIG_FILE
 
 
 @pytest.fixture(autouse=True)
@@ -81,10 +82,13 @@ def test_every_field_gets_a_flag(parser):
     }
 
 
-def test_a_field_of_the_other_path_is_rejected():
+@pytest.mark.parametrize(
+    "entry", [{"optimum_overrides": {}}, {"num_devices_per_local_rank": 2}]
+)
+def test_a_field_of_the_other_path_is_rejected(entry):
     """Both paths' flags are registered, so the class is what narrows them."""
     with pytest.raises(ValueError, match="are not fields"):
-        build_rbln_config({"optimum_overrides": {}})
+        build_rbln_config(entry)
 
 
 def test_defaults_when_nothing_is_passed(parser):
@@ -96,8 +100,6 @@ def test_flags_reach_the_config(parser):
         parser,
         [
             "--no-rbln-use-custom-sampler",
-            "--rbln-num-devices-per-local-rank",
-            "4",
             "--rbln-decode-batch-bucket-strategy",
             "manual",
             "--rbln-decode-batch-bucket-manual-buckets",
@@ -107,9 +109,19 @@ def test_flags_reach_the_config(parser):
         ],
     )
     assert config.use_custom_sampler is False
-    assert config.num_devices_per_local_rank == 4
     assert config.decode_batch_bucket_strategy == "manual"
     assert config.decode_batch_bucket_manual_buckets == [1, 4, 16]
+
+
+def test_encoder_token_budgets_accept_flags(parser):
+    config = resolve(parser, ["--rbln-encoder-token-budgets", "256", "576", "3072"])
+    assert config.encoder_token_budgets == [256, 576, 3072]
+
+
+@pytest.mark.parametrize("budgets", [[], [256, 576, 3072]])
+def test_encoder_token_budgets_accept_additional_config(budgets):
+    config = build_rbln_config({"encoder_token_budgets": budgets})
+    assert config.encoder_token_budgets == budgets
 
 
 def test_coexists_with_additional_config(parser):
@@ -164,6 +176,37 @@ def test_unknown_key_is_rejected():
         build_rbln_config({"use_custom_samplerr": False})
 
 
+@pytest.mark.parametrize("raw", ["1", "0", ""])
+def test_removed_batch_attention_env_warns_and_is_ignored(monkeypatch, raw):
+    monkeypatch.setenv("VLLM_RBLN_BATCH_ATTN_OPT", raw)
+    with patch("vllm_rbln.config.logger.warning_once") as warning:
+        assert build_rbln_config() == RBLNConfig()
+    warning.assert_called_once()
+    assert "VLLM_RBLN_BATCH_ATTN_OPT" in warning.call_args.args[0]
+    assert "has been removed and is ignored" in warning.call_args.args[0]
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_removed_batch_attention_key_warns_before_rejection(value):
+    with (
+        patch("vllm_rbln.config.logger.warning_once") as warning,
+        pytest.raises(ValueError, match="use_batch_attn_opt.*are not fields"),
+    ):
+        build_rbln_config({"use_batch_attn_opt": value})
+    warning.assert_called_once()
+    assert (
+        "additional_config.use_batch_attn_opt has been removed"
+        in warning.call_args.args[0]
+    )
+
+
+def test_absent_batch_attention_settings_do_not_warn(monkeypatch):
+    monkeypatch.delenv("VLLM_RBLN_BATCH_ATTN_OPT", raising=False)
+    with patch("vllm_rbln.config.logger.warning_once") as warning:
+        build_rbln_config()
+    warning.assert_not_called()
+
+
 def test_a_config_of_the_other_path_is_rejected():
     """Two ways to hand a resolution the wrong class, and one message for both.
 
@@ -191,6 +234,19 @@ def test_upstream_key_is_rejected():
 def test_manual_strategy_needs_buckets():
     with pytest.raises(ValueError, match="needs at least one entry"):
         RBLNConfig(decode_batch_bucket_strategy="manual")
+
+
+@pytest.mark.parametrize(
+    ("budgets", "error"),
+    [
+        ([0, 576], "must all be > 0"),
+        ([-1, 576], "must all be > 0"),
+        ([576, 576], "unique"),
+    ],
+)
+def test_encoder_token_budgets_are_positive_and_unique(budgets, error):
+    with pytest.raises(ValueError, match=error):
+        RBLNConfig(encoder_token_budgets=budgets)
 
 
 @pytest.mark.parametrize("size", [0, -1])
@@ -287,6 +343,9 @@ def test_only_compile_fields_change_the_hash():
     assert RBLNConfig(use_custom_sampler=False).compute_hash() == base
     assert RBLNConfig(enable_sub_block_cache=False).compute_hash() == base
     assert RBLNConfig(sub_block_size=64).compute_hash() == base
+    # mega_cache keys on the buckets the model resolves from this one.
+    encoder_budgets = RBLNConfig(encoder_token_budgets=[256, 576])
+    assert encoder_budgets.compute_hash() == base
     assert RBLNConfig(use_w8a8=True).compute_hash() != base
     assert RBLNConfig(compile_dtype="float16").compute_hash() != base
     assert RBLNConfig(decode_batch_bucket_strategy="linear").compute_hash() != base

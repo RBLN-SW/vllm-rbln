@@ -24,6 +24,9 @@ from vllm.model_executor.layers.quantization.modelopt import (
 from vllm_rbln.model_executor.layers.quantization.modelopt_fp8 import (
     RBLNModelOptFp8LinearMethod,
 )
+from vllm_rbln.model_executor.layers.quantization.modelopt_mxfp8 import (
+    RBLNModelOptMxFp8LinearMethod,
+)
 from vllm_rbln.model_executor.layers.quantization.nvfp4 import (
     RBLNModelOptNvFp4FusedMoE,
 )
@@ -69,6 +72,22 @@ def register_rbln_modelopt_mixed_config() -> None:
     )
 )
 def register_rbln_modelopt_fp8_linear_method() -> None:
-    LINEAR_METHOD_BUILDERS["FP8"] = lambda config, prefix: (
-        RBLNModelOptFp8LinearMethod(config)
+    LINEAR_METHOD_BUILDERS["FP8"] = lambda config, prefix: RBLNModelOptFp8LinearMethod(
+        config
+    )
+
+
+@add_registration(
+    reason=(
+        "vLLM's generic MXFP8 linear method either quantizes activations too "
+        "(DeepGEMM W8A8 on CUDA) or dequantizes the weight to bf16 once at "
+        "load. RBLN keeps the e4m3 weight and e8m0 block scales as loaded and "
+        "dequantizes per 32-element group in the compiled graph (W8A16), so the "
+        "weight stays one byte on the device. LINEAR_METHOD_BUILDERS is the "
+        "hook build_linear_method reads first."
+    )
+)
+def register_rbln_modelopt_mxfp8_linear_method() -> None:
+    LINEAR_METHOD_BUILDERS["MXFP8"] = lambda config, prefix: (
+        RBLNModelOptMxFp8LinearMethod()
     )

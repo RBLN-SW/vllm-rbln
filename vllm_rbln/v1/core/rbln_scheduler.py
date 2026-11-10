@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -14,12 +14,17 @@
 
 import itertools
 import time
+from collections import deque
+from collections.abc import Iterator
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any
 
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.utils.hashing import get_hash_fn_by_name
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import init_none_hash
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
@@ -29,7 +34,7 @@ from vllm.v1.core.sched.output import (
     NewRequestData,
     SchedulerOutput,
 )
-from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
+from vllm.v1.core.sched.request_queue import RequestQueue, SchedulingPolicy
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutputs
 from vllm.v1.outputs import ModelRunnerOutput
@@ -37,6 +42,9 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_rbln.config import RBLNConfig
+from vllm_rbln.distributed.ec_transfer.ec_connector.rbln_ec_cpu_connector import (
+    RblnECCPUConnector,
+)
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.core.rbln_kv_cache_manager import (
     KVCacheCopyOp,
@@ -54,6 +62,42 @@ from vllm_rbln.v1.core.utils import (
 logger = init_logger(__name__)
 
 
+class RBLNEncoderCacheManager(EncoderCacheManager):
+    """Defers runner hits evicted by an earlier input in the scheduling pass."""
+
+    def __init__(self, cache_size: int) -> None:
+        super().__init__(cache_size)
+        self._initial_cache_hits: set[str] = set()
+
+    @contextmanager
+    def eviction_snapshot(self, request: Request) -> Iterator[None]:
+        # Hits remain evictable; an evicted hit must wait for transfer admission
+        # on the next step instead of being re-encoded during this pass.
+        self._initial_cache_hits = {
+            feature.identifier
+            for i, feature in enumerate(request.mm_features)
+            if self.get_cached_num_encoder_embeds(request, i) is not None
+        }
+        try:
+            yield
+        finally:
+            self._initial_cache_hits.clear()
+
+    def can_allocate(
+        self,
+        request: Request,
+        input_id: int,
+        encoder_compute_budget: int,
+        num_embeds_to_schedule: int,
+    ) -> bool:
+        mm_hash = request.mm_features[input_id].identifier
+        if mm_hash in self._initial_cache_hits and mm_hash not in self.cached:
+            return False
+        return super().can_allocate(
+            request, input_id, encoder_compute_budget, num_embeds_to_schedule
+        )
+
+
 @dataclass
 class RBLNSchedulerOutput(SchedulerOutput):
     """SchedulerOutput extended with KV cache copy operations for sub-block
@@ -63,6 +107,8 @@ class RBLNSchedulerOutput(SchedulerOutput):
 
 
 class RBLNScheduler(Scheduler):
+    encoder_cache_manager: EncoderCacheManager
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
 
@@ -74,11 +120,12 @@ class RBLNScheduler(Scheduler):
 
         # Replace the upstream KVCacheManager with RBLNKVCacheManager
         # when sub-block prefix caching is enabled.
+        assert rbln_config.prefill_chunk_size is not None  # resolved at start-up
         sub_block_size = sub_block_size_in_use(
             enable_prefix_caching=self.cache_config.enable_prefix_caching,
             sub_block_cache=rbln_config.enable_sub_block_cache,
             block_size=self.block_size,
-            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+            prefill_chunk_size=rbln_config.prefill_chunk_size,
             kv_cache_config=self.kv_cache_config,
             sub_block_size=rbln_config.sub_block_size,
         )
@@ -128,6 +175,21 @@ class RBLNScheduler(Scheduler):
         # ceil(demand / pp) to spread decodes across microbatches. pp == 1 makes
         # the soft cap a no-op. See v1/core/utils.py.
         self._pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
+
+        self._prefill_chunk_size = rbln_config.prefill_chunk_size
+
+        # NOTE(RBLN): the sparse-attention ops (DSA MLA / indexer, MiniMax-M3
+        # MSA / indexer, GLM5 MLA / indexer) get NULL_BLOCK_ID as null_block_id
+        # and write their context-parallel cache store's unowned rows there, so
+        # the block the pool reserves has to be that one. Checked once the KV
+        # cache manager is final (it may be swapped above).
+        null_block_id = self.kv_cache_manager.block_pool.null_block.block_id
+        if null_block_id != NULL_BLOCK_ID:
+            raise RuntimeError(
+                f"vLLM's null block is {null_block_id}, not NULL_BLOCK_ID "
+                f"({NULL_BLOCK_ID}); the RBLN sparse-attention cache store writes "
+                "to NULL_BLOCK_ID and would corrupt a live block."
+            )
 
     def _decode_demand(self) -> int:
         """Total decode demand for this step's soft (ceil(demand/pp)) cap.
@@ -266,6 +328,12 @@ class RBLNScheduler(Scheduler):
                 req_index += 1
                 continue
 
+            if self._ec_transfer_pending(
+                request, request.num_computed_tokens - request.num_output_placeholders
+            ):
+                req_index += 1
+                continue
+
             num_new_tokens = (
                 request.num_tokens_with_spec
                 + request.num_output_placeholders
@@ -284,7 +352,7 @@ class RBLNScheduler(Scheduler):
                 continue
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
-            num_new_tokens = min(num_new_tokens, token_budget)
+            num_new_tokens = min(num_new_tokens, self._prefill_chunk_size, token_budget)
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
@@ -466,15 +534,27 @@ class RBLNScheduler(Scheduler):
             # new prefill requests into the running batch.
             prefill_token_budget = self.max_num_scheduled_tokens
 
-            step_skipped_waiting = create_request_queue(self.policy)
+            step_skipped_waiting: deque[Request] = deque()
+            step_skipped_kv_holding: deque[Request] = deque()
+
+            def skip_request(from_queue: RequestQueue) -> None:
+                request_to_skip = from_queue.pop_request()
+                self.deferred_waiting.add(request_to_skip)
+                if self._holds_kv_blocks(request_to_skip):
+                    step_skipped_kv_holding.appendleft(request_to_skip)
+                else:
+                    step_skipped_waiting.appendleft(request_to_skip)
+
             sub_block_match = None
 
-            while (self.waiting or self.skipped_waiting) and token_budget > 0:
-                if len(self.running) == self.max_num_running_reqs:
+            while token_budget > 0:
+                num_running = len(self.running) + self.num_waiting_for_streaming_input
+                if num_running >= self.max_num_active_reqs:
                     break
 
-                request_queue = self._select_waiting_queue_for_scheduling()
-                assert request_queue is not None
+                request_queue = self.kv_holding_waiting or self.waiting
+                if not request_queue:
+                    break
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
@@ -489,17 +569,8 @@ class RBLNScheduler(Scheduler):
                 if not decode_budget.can_admit(apply_soft_cap=apply_soft_cap):
                     break
 
-                # try to promote blocked statuses while traversing skipped queue.
-                if self._is_blocked_waiting_status(
-                    request.status
-                ) and not self._try_promote_blocked_waiting_request(request):
-                    if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
-                        logger.debug(
-                            "%s is still in WAITING_FOR_REMOTE_KVS state.",
-                            request_id,
-                        )
-                    request_queue.pop_request()
-                    step_skipped_waiting.prepend_request(request)
+                if not self._handle_blocked_waiting_request(request):
+                    skip_request(request_queue)
                     continue
 
                 # Check that adding the request still respects the max_loras
@@ -513,8 +584,7 @@ class RBLNScheduler(Scheduler):
                     )
                 ):
                     # Scheduling would exceed max_loras, skip.
-                    request_queue.pop_request()
-                    step_skipped_waiting.prepend_request(request)
+                    skip_request(request_queue)
                     continue
 
                 num_external_computed_tokens = 0
@@ -550,8 +620,7 @@ class RBLNScheduler(Scheduler):
                             # The request cannot be scheduled because
                             # the KVConnector couldn't determine
                             # the number of matched tokens.
-                            request_queue.pop_request()
-                            step_skipped_waiting.prepend_request(request)
+                            skip_request(request_queue)
                             continue
 
                         request.num_external_computed_tokens = ext_tokens
@@ -594,6 +663,19 @@ class RBLNScheduler(Scheduler):
                     )
                     assert num_computed_tokens <= request.num_tokens
 
+                    # Skip request with pending mm encoding prefetches
+                    if self._ec_transfer_pending(request, num_computed_tokens):
+                        # NOTE(RBLN): the next request overwrites the match, so
+                        # release it here.
+                        if sub_block_match is not None:
+                            assert isinstance(self.kv_cache_manager, RBLNKVCacheManager)
+                            self.kv_cache_manager.release_sub_block_match(
+                                sub_block_match
+                            )
+                            sub_block_match = None
+                        skip_request(request_queue)
+                        continue
+
                     # Track first scheduled prefill, not post-preemption repeat prefills
                     if request.prefill_stats is not None:
                         assert num_computed_tokens <= request.num_prompt_tokens
@@ -613,6 +695,10 @@ class RBLNScheduler(Scheduler):
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
 
+                    if self._ec_transfer_pending(request, num_computed_tokens):
+                        skip_request(request_queue)
+                        continue
+
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
                 new_encoder_compute_budget = encoder_compute_budget
@@ -630,6 +716,7 @@ class RBLNScheduler(Scheduler):
                     threshold = self.scheduler_config.long_prefill_token_threshold
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
+                    num_new_tokens = min(num_new_tokens, self._prefill_chunk_size)
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
@@ -782,12 +869,10 @@ class RBLNScheduler(Scheduler):
                         request, num_new_local_computed_tokens + num_sub_block_tokens
                     )
 
-                request = request_queue.pop_request()
                 if load_kv_async:
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
-                    step_skipped_waiting.prepend_request(request)
                     # Set num_computed_tokens even though KVs are not yet loaded.
                     # request.num_computed_tokens will not be used anywhere until
                     # the request finished the KV transfer.
@@ -802,8 +887,11 @@ class RBLNScheduler(Scheduler):
                     # _update_waiting_for_remote_kv will then cache
                     # only the successfully loaded tokens.
                     request.num_computed_tokens = num_computed_tokens
+                    skip_request(request_queue)
                     continue
 
+                request = request_queue.pop_request()
+                self.deferred_waiting.discard(request)
                 self.running.append(request)
                 if num_external_computed_tokens > 0:
                     # load_kv_async is False here
@@ -903,8 +991,10 @@ class RBLNScheduler(Scheduler):
                 self.kv_cache_manager.release_sub_block_match(sub_block_match)
 
             # re-queue requests skipped in this pass ahead of older skipped items.
+            if step_skipped_kv_holding:
+                self.kv_holding_waiting.prepend_requests(step_skipped_kv_holding)
             if step_skipped_waiting:
-                self.skipped_waiting.prepend_requests(step_skipped_waiting)
+                self.waiting.prepend_requests(step_skipped_waiting)
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
@@ -1081,6 +1171,12 @@ class RBLNScheduler(Scheduler):
                 lo = max(0, req.num_computed_tokens - self.num_spec_tokens)
                 hi = req.num_computed_tokens + base
                 data.new_token_ids[idx] = req.all_token_ids[lo:hi]
+        # NOTE(RBLN): the RBLN model runner never reads
+        # CachedRequestData.all_token_ids. After a prefill-only step every decode
+        # request is outside prev_step_scheduled_req_ids, so upstream ships a full
+        # token copy for each of them, and under the mp executor the worker
+        # unpickles it on the critical path before the next decode.
+        data.all_token_ids.clear()
         return data
 
     def _free_request(
@@ -1111,6 +1207,107 @@ class RBLNScheduler(Scheduler):
                 )
 
         return result
+
+    def _ec_transfer_pending(self, request: Request, num_computed_tokens: int) -> bool:
+        connector = self.ec_connector
+        if (
+            not isinstance(connector, RblnECCPUConnector)
+            or not isinstance(self.encoder_cache_manager, RBLNEncoderCacheManager)
+            or not request.mm_features
+        ):
+            return super()._ec_transfer_pending(request, num_computed_tokens)
+        # NOTE(RBLN): local_cache_hashes identifies inputs already in the runner
+        # cache so the connector skips their transfers even if its cache lacks them.
+        local_cache_hashes = set()
+        if not self.is_encoder_decoder:
+            for i, feature in enumerate(request.mm_features):
+                pos = feature.mm_position
+                if pos.offset + pos.length <= num_computed_tokens:
+                    continue
+                cached_num_embeds = (
+                    self.encoder_cache_manager.get_cached_num_encoder_embeds(request, i)
+                )
+                if cached_num_embeds == request.get_num_encoder_embeds(i):
+                    local_cache_hashes.add(feature.identifier)
+        return not connector.ensure_cache_available(
+            request, num_computed_tokens, local_cache_hashes=local_cache_hashes
+        )
+
+    def _try_schedule_encoder_inputs(
+        self,
+        request: Request,
+        num_computed_tokens: int,
+        num_new_tokens: int,
+        encoder_compute_budget: int,
+        shift_computed_tokens: int = 0,
+    ) -> tuple[list[int], int, int, list[int]]:
+        cache_manager = self.encoder_cache_manager
+        connector = self.ec_connector
+        eviction_snapshot: AbstractContextManager[None] = nullcontext()
+        if (
+            isinstance(cache_manager, RBLNEncoderCacheManager)
+            and isinstance(connector, RblnECCPUConnector)
+            and request.ec_transfer_params
+        ):
+            eviction_snapshot = cache_manager.eviction_snapshot(request)
+        with eviction_snapshot:
+            (
+                encoder_inputs_to_schedule,
+                adjusted_num_new_tokens,
+                adjusted_encoder_compute_budget,
+                external_load_encoder_input,
+            ) = super()._try_schedule_encoder_inputs(
+                request,
+                num_computed_tokens,
+                num_new_tokens,
+                encoder_compute_budget,
+                shift_computed_tokens,
+            )
+        # NOTE(RBLN): upstream skips EC saves on runner-cache hits.
+        # Reserve saves for outputs missing from the shared-memory cache.
+        if (
+            isinstance(connector, RblnECCPUConnector)
+            and connector.is_producer
+            and not self.is_encoder_decoder
+            and adjusted_num_new_tokens > 0
+        ):
+            window_end = (
+                num_computed_tokens + adjusted_num_new_tokens + shift_computed_tokens
+            )
+            for i, feature in enumerate(request.mm_features):
+                pos = feature.mm_position
+                if (
+                    pos.offset >= window_end
+                    or pos.offset + pos.length <= num_computed_tokens
+                ):
+                    continue
+                cached_num_embeds = (
+                    self.encoder_cache_manager.get_cached_num_encoder_embeds(request, i)
+                )
+                if cached_num_embeds == request.get_num_encoder_embeds(i):
+                    connector.update_state_after_cache_hit(request, i)
+        if not (
+            encoder_inputs_to_schedule
+            and connector is not None
+            and connector.is_consumer
+            and not connector.is_producer
+        ):
+            return (
+                encoder_inputs_to_schedule,
+                adjusted_num_new_tokens,
+                adjusted_encoder_compute_budget,
+                external_load_encoder_input,
+            )
+        # NOTE(RBLN): an EC consumer compiles no vision encoder, so an image the
+        # connector cannot supply fails the request; upstream encodes it locally.
+        # update_from_output() fails every request in encoder_cache_mismatch_reqs.
+        logger.error(
+            "EC consumer: request %s has an image the EC connector cannot supply, "
+            "and this instance compiles no vision encoder; failing the request.",
+            request.request_id,
+        )
+        self.encoder_cache_mismatch_reqs.add(request.request_id)
+        return [], 0, encoder_compute_budget, []
 
     def _try_sub_block_match(
         self,

@@ -33,6 +33,7 @@ from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.models.interfaces import (
+    SupportsMultiModal,
     supports_eagle3,
     supports_realtime,
     supports_transcription,
@@ -42,6 +43,8 @@ from vllm.model_executor.models.interfaces_base import (
     is_pooling_model,
     is_text_generation_model,
 )
+from vllm.multimodal.inputs import MultiModalKwargsItem
+from vllm.multimodal.utils import group_and_batch_mm_kwargs
 from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
@@ -72,12 +75,14 @@ from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
     DraftTokenIds,
+    ECConnectorOutput,
     KVConnectorOutput,
     LogprobsLists,
     LogprobsTensors,
     ModelRunnerOutput,
     PoolerOutput,
     SamplerOutput,
+    make_empty_encoder_model_runner_output,
 )
 from vllm.v1.sample.logits_processor import (
     LogitsProcessors,
@@ -92,6 +97,7 @@ from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import record_function_or_nullcontext
+from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.kv_connector_model_runner_mixin import (
     KVConnectorModelRunnerMixin,
@@ -102,6 +108,7 @@ from vllm.v1.worker.utils import (
     KVCacheGroupSpec,
     KVCacheSpec,
     add_kv_sharing_layers_to_kv_cache_groups,
+    sanity_check_mm_encoder_outputs,
 )
 
 from vllm_rbln import envs
@@ -109,15 +116,22 @@ from vllm_rbln.compilation import (
     build_process_group_dict,
     compile,
     create_compile_context,
+    mark_decoder_regions,
     set_compile_stage,
 )
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import (
+    SupportsBlockAuxKVCaches,
     flush_deferred_loads,
+    iter_kv_connectors,
 )
 from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.logger import init_logger
-from vllm_rbln.platform import USE_DEVICE_TENSOR
+from vllm_rbln.model_executor.models.interfaces import (
+    SupportsRBLNMultiModal,
+    supports_rbln_multimodal,
+)
+from vllm_rbln.platform import use_device_tensor
 from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadataBuilder,
 )
@@ -127,6 +141,7 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
     build_kv_cache_base_bindings,
     build_kv_cache_forward_context_kwargs,
     kv_cache_dynamic_axis,
+    kv_cache_tensor_key,
     validate_shared_attention_kv_cache_contiguity,
 )
 from vllm_rbln.v1.core.rbln_kv_cache_manager import KVCacheCopyOp
@@ -138,7 +153,7 @@ from vllm_rbln.v1.core.utils import (
     step_is_prefill,
     sub_block_size_in_use,
 )
-from vllm_rbln.v1.sample.ops.top_k_top_p import TOP_P_CLAMP
+from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
 from vllm_rbln.v1.sample.rbln_logits_processor import build_rbln_logitsprocs
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
 from vllm_rbln.v1.sample.rbln_sampler import WARM_UP_CONFIGS, RBLNSampler
@@ -146,7 +161,7 @@ from vllm_rbln.v1.spec_decode import DRAFT_MODEL_PROPOSERS
 from vllm_rbln.v1.spec_decode.dflash import RBLNDFlashProposer
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.eagle3_pp import (
-    eagle3_aux_hidden_states_enabled,
+    aux_hidden_states_enabled,
     install_aux_handoff_slots,
 )
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
@@ -240,7 +255,7 @@ class ExecuteModelState(NamedTuple):
     combined_hidden_states: torch.Tensor | None
 
 
-class RBLNModelRunner(KVConnectorModelRunnerMixin):
+class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -280,19 +295,22 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # These will be overridden in load_model()
         self.max_model_len = model_config.max_model_len
         self.max_num_tokens = scheduler_config.max_num_batched_tokens
+        self.prefill_chunk_size = self.rbln_config.prefill_chunk_size
         self.max_num_reqs = scheduler_config.max_num_seqs
 
         self.dcp_world_size = self.parallel_config.decode_context_parallel_size
 
         # Model-related.
         self.cascade_attn_enabled = not self.model_config.disable_cascade_attn
+        # Set in load_model by _resolve_mm_support.
+        self.supports_mm_inputs = False
 
-        # TODO(RBLN): Multi-modal data support
+        self.encoder_cache: dict[str, torch.Tensor] = {}
 
         # NOTE(RBLN): Compilation context for marking the KV cache address as static.
         self.compile_context = (
             create_compile_context(use_weight_sharing=True, use_global_ctx=True)
-            if not USE_DEVICE_TENSOR
+            if not use_device_tensor()
             else None
         )
         self.runtime_holder: list = []
@@ -326,9 +344,18 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.kv_cache_block_axes: dict[str, int] = {}
         self.kv_cache_bases: list[torch.Tensor] = []
         self.kv_cache_view_infos: list[KVCacheViewInfo] = []
+        self.aux_kv_cache_specs: dict[str, RBLNBlockAuxSpec] = {}
+        # Set in initialize_kv_cache: a recurrent state (a MambaSpec group) under
+        # speculative decoding, whose verify step replays the accepted drafts.
+        self.replays_accepted_drafts = False
+        self.num_accepted_tokens_by_req: dict[str, int] = {}
+        # Under replays_accepted_drafts, the last position of each request's previous
+        # step: the recurrent state's block that step stored, which the next loads.
+        self.state_pos_by_req: dict[str, int] = {}
         # KV cache layer names in layer-index order; the deterministic
         # ordering the KV connector relies on for region<->layer agreement.
         self.kv_cache_names: list[str] = []
+        self.kv_cache_allocations: dict[tuple, str] = {}
         # Initialize in initialize_kv_cache_tensors
         self.cross_layers_kv_cache: torch.Tensor | None = None
         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
@@ -346,7 +373,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             | RBLNDFlashProposer
             | None
         ) = None
-        self.use_aux_hidden_state_outputs = eagle3_aux_hidden_states_enabled(
+        self.use_aux_hidden_state_outputs = aux_hidden_states_enabled(
             self.speculative_config
         )
 
@@ -359,10 +386,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 self.drafter = RBLNMedusaProposer(self.vllm_config, self.device)
             elif self.speculative_config.method == "dflash":
                 self.drafter = RBLNDFlashProposer(self.vllm_config, self.device, self)
-                # Upstream turns this on unconditionally for DFlash: the
-                # drafter reduces the target's aux states through its own
-                # projection, as eagle3 does.
-                self.use_aux_hidden_state_outputs = True
             elif self.speculative_config.use_eagle():
                 self.drafter = RBLNEagleProposer(self.vllm_config, self.device, self)
             else:
@@ -389,6 +412,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
+        self.prompt_token_arrays: dict[str, np.ndarray] = {}
         self.num_prompt_logprobs: dict[str, int] = {}
 
         # Input Batch
@@ -438,6 +462,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.query_start_loc_np = self.query_start_loc.numpy()
         self.decode_back_pad = torch.zeros(self.max_num_reqs, dtype=torch.int32)
         self.decode_back_pad_np = self.decode_back_pad.numpy()
+        self.state_load_pos = torch.zeros(self.max_num_reqs, dtype=torch.int32)
+        self.state_load_pos_np = self.state_load_pos.numpy()
         self.seq_lens = torch.zeros(self.max_num_tokens, dtype=torch.int32)
         self.seq_lens_np = self.seq_lens.numpy()
         self.discard_request_mask = torch.zeros(self.max_num_reqs, dtype=torch.bool)
@@ -477,6 +503,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # KV-connector output carried from execute_model() to sample_tokens()
         # (and across the PP / pooling / empty-batch paths).
         self.kv_connector_output: KVConnectorOutput | None = None
+        # The EC-connector output, carried the same way.
+        self.ec_connector_output: ECConnectorOutput | None = None
 
         # NOTE(RBLN): RBLN compiles a fixed decode-batch shape, so bucket to the
         # per-PP-stage decode batch (max_num_seqs // pp_size) -- the same ceiling
@@ -501,13 +529,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             parallel_config.data_parallel_size > 1
             and self.rbln_config.specialize_moe_decode
         )
-        # The batched dynamic decode kernel (REBEL CR13, or any device with
-        # --rbln-use-batch-attn-opt) processes the first valid_batch[p] rows of
-        # partition p and early-exits on the rest, which is only correct when
-        # rows are sorted by descending sequence length.
-        self.sort_batch_by_length = (
-            current_platform.is_cr13() or self.rbln_config.use_batch_attn_opt
-        )
+        # The batched dynamic decode kernel on REBEL CR13 processes the first
+        # valid_batch[p] rows of partition p and early-exits on the rest, which
+        # is only correct when rows are sorted by descending sequence length.
+        self.sort_batch_by_length = current_platform.is_cr13()
 
         # Static, so the per-step decision only has to supply this step's counts.
         self.shape_config = ShapeConfig(
@@ -518,7 +543,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         )
 
         self.offload_context = nullcontext
-        if USE_DEVICE_TENSOR and not envs.VLLM_RBLN_DISABLE_OFFLOAD:
+        if use_device_tensor() and not envs.VLLM_RBLN_DISABLE_OFFLOAD:
             self.offload_context = torch.rbln.offload
 
         # What this step's ranks reported. The draft decides its own shapes from
@@ -616,6 +641,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+            self.prompt_token_arrays.pop(req_id, None)
+            self.num_accepted_tokens_by_req.pop(req_id, None)
+            self.state_pos_by_req.pop(req_id, None)
+
+        for mm_hash in scheduler_output.free_encoder_mm_hashes:
+            self.encoder_cache.pop(mm_hash, None)
 
         # Remove the finished requests from the persistent batch.
         for req_id in scheduler_output.finished_req_ids:
@@ -726,6 +757,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     req_state.output_token_ids.append(new_token_ids[-1])
                 elif num_new_tokens > 0:
                     req_state.output_token_ids.extend(new_token_ids[-num_new_tokens:])
+                if self.replays_accepted_drafts:
+                    num_accepted_tokens = max(num_new_tokens, 1)
+                    self.num_accepted_tokens_by_req[req_id] = num_accepted_tokens
+                    if req_index is not None:
+                        self.input_batch.num_accepted_tokens_cpu[req_index] = (
+                            num_accepted_tokens
+                        )
             elif num_output_tokens < len(req_state.output_token_ids):
                 # Some output tokens were discarded due to a sync-KV-load
                 # failure. Align the cached state.
@@ -749,6 +787,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 # The request is resumed from preemption.
                 # Replace the existing block IDs with the new ones.
                 req_state.block_ids = new_block_ids
+                # It recomputes on the new blocks: no drafts of a past step to replay.
+                self.num_accepted_tokens_by_req.pop(req_id, None)
+                self.state_pos_by_req.pop(req_id, None)
 
             if req_index is None:
                 # The request is not in the persistent batch.
@@ -796,12 +837,27 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # Add the new or resumed requests to the persistent batch.
         # The smaller empty indices are filled first.
         for request in reqs_to_add:
-            # FIXME(huijong.jeong): remove this once our rbln.top_k_top_p gets revised.
-            if self.rbln_config.use_custom_sampler and (
-                sampling_params := request.sampling_params
-            ):
-                sampling_params.top_p = min(sampling_params.top_p, TOP_P_CLAMP)
-            self.input_batch.add_request(request)
+            # A prefill-only step evicts every decode request, so each one is re-added
+            # here once per prefill, and converting the prompt list is most of
+            # add_request. Fill the row from an array made on the first add, and give
+            # logits processors back the list.
+            prompt = request.prompt_token_ids
+            if prompt is not None:
+                array = self.prompt_token_arrays.get(request.req_id)
+                if array is None:
+                    array = np.asarray(prompt, dtype=np.int32)
+                    self.prompt_token_arrays[request.req_id] = array
+                request.prompt_token_ids = array
+            req_index = self.input_batch.add_request(request)
+            request.prompt_token_ids = prompt
+            if request.req_id in self.num_accepted_tokens_by_req:
+                self.input_batch.num_accepted_tokens_cpu[req_index] = (
+                    self.num_accepted_tokens_by_req[request.req_id]
+                )
+            if request.sampling_params:
+                added = self.input_batch.batch_update_builder.added
+                index, params, _, output_token_ids = added[-1]
+                added[-1] = (index, params, prompt, output_token_ids)
             self.input_batch.update_req_spec_token_ids(request, scheduled_spec_tokens)
 
         # Condense the batched states if there are gaps left by removed requests
@@ -821,6 +877,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         """
         self.input_batch.remove_request(req_id)
         req_state = self.requests[req_id]
+        # The prompt changes here, sometimes in place, so drop its cached array.
+        self.prompt_token_arrays.pop(req_id, None)
 
         req_state.prompt_token_ids = new_req_data.prompt_token_ids
         req_state.mm_features = new_req_data.mm_features
@@ -888,6 +946,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             front_pad = np.maximum(
                 0, num_computed + query_lengths - self.max_model_len
             ).astype(np.int32)
+            if self.replays_accepted_drafts and front_pad.any():
+                raise NotImplementedError(
+                    "RBLN speculative decoding with recurrent-state replay does not "
+                    "support shifting the fixed decode window at max_model_len. "
+                    f"num_speculative_tokens={self.num_spec_tokens}, "
+                    f"max_model_len={self.max_model_len}, "
+                    f"front_pad={front_pad.tolist()}."
+                )
             back_pad = slack - front_pad
         else:
             query_lengths = logical_num_tokens
@@ -952,6 +1018,17 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             self.input_batch.num_computed_tokens_cpu[:num_reqs] + logical_num_tokens
         )
         self.seq_lens_np[num_reqs:].fill(0)
+
+        if self.replays_accepted_drafts:
+            for i, req_id in enumerate(self.input_batch.req_ids):
+                self.state_load_pos_np[i] = self.state_pos_by_req.get(
+                    req_id, self.input_batch.num_computed_tokens_cpu[i] - 1
+                )
+                # TODO(RBLN, #1370): handle output rollback when tracking state
+                # positions. This advances before forward and is not restored if
+                # the step is discarded. RBLN NIXL currently rejects Mamba
+                # groups, blocking this load-failure path.
+                self.state_pos_by_req[req_id] = int(self.seq_lens_np[i]) - 1
 
         num_tokens = [self.requests[r].num_tokens for r in self.input_batch.req_ids]
         num_tokens_np = np.array(num_tokens, dtype=np.int32)
@@ -1053,6 +1130,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 logits_indices
             )
 
+        num_accepted = state_load_pos = None
+        if self.replays_accepted_drafts and not self.is_prefill:
+            num_accepted = torch.from_numpy(
+                np.maximum(self.input_batch.num_accepted_tokens_cpu[:num_reqs] - 1, 0)
+            ).to(torch.int32)
+            state_load_pos = self.state_load_pos[:num_reqs]
+
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
         spec_decode_common_attn_metadata = None
@@ -1083,6 +1167,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     is_prefill=self.is_prefill,
                     batch_pad=num_reqs_padded,
                     back_pad=back_pad,
+                    is_prompt_sorted=self.sort_batch_by_length,
+                    num_accepted=num_accepted,
+                    state_load_pos=state_load_pos,
                 )
 
                 for layer_name in attn_group.layer_names:
@@ -1276,6 +1363,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
     def _preprocess(
         self,
+        scheduler_output: RBLNSchedulerOutput,
         num_reqs: int,
         num_reqs_padded: int,
         num_input_tokens: int,
@@ -1284,11 +1372,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
     ) -> tuple[
         StagedModelInputs,
         dict[str, Any],
+        ECConnectorOutput | None,
     ]:
         """
         :return: tuple[
             staged_model_inputs,
             model_kwargs,
+            ec_connector_output,
         ]
         """
         # For text-only models
@@ -1306,7 +1396,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             num_reqs=num_reqs,
             num_reqs_padded=num_reqs_padded,
             query_len=input_ids.shape[1],
-            query_len_padded=self.max_num_tokens if is_prefill else input_ids.shape[1],
+            query_len_padded=(
+                self.prefill_chunk_size if is_prefill else input_ids.shape[1]
+            ),
         )
         staged_model_inputs = self.input_stager.stage(
             input_ids=input_ids,
@@ -1323,10 +1415,163 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             **self._init_model_kwargs(),
         }
 
+        ec_connector_output = None
+        # The EC connector's loads feed the gather, so they run on the same
+        # prefill steps instead of on every step.
+        if self.supports_mm_inputs and is_prefill and get_pp_group().is_first_rank:
+            with self.maybe_get_ec_connector_output(
+                scheduler_output, encoder_cache=self.encoder_cache
+            ) as ec_connector_output:
+                self._execute_mm_encoder(scheduler_output)
+                mm_rows, mm_mask = self._gather_mm_embeddings(
+                    scheduler_output, num_input_tokens
+                )
+            model_kwargs["mm_embeds"], model_kwargs["mm_mask"] = (
+                self.input_stager.stage_mm_embeds(
+                    mm_rows,
+                    mm_mask.view(num_reqs, -1, 1),
+                    self.model_config.get_hidden_size(),
+                    layout,
+                )
+            )
+
         return (
             staged_model_inputs,
             model_kwargs,
+            ec_connector_output,
         )
+
+    def _resolve_mm_support(self) -> bool:
+        """Whether this runner feeds image embeddings to the loaded model.
+
+        A multimodal model that does not merge them inside its graph would get
+        the staged `mm_embeds` / `mm_mask` through `**kwargs` and ignore them:
+        the encoder would run for nothing and the request would be answered as
+        text. Refuse that instead of serving it wrong."""
+        if not self.model_config.supports_multimodal_inputs:
+            return False
+        if not supports_rbln_multimodal(self.model):
+            raise ValueError(
+                f"{type(self.model).__name__} takes multimodal inputs, but the RBLN "
+                "vLLM path serves them only for models that merge image embeddings "
+                "inside the compiled graph (SupportsRBLNMultiModal). Serve it "
+                "text-only with --limit-mm-per-prompt (every modality 0), or use "
+                "the optimum path."
+            )
+        return True
+
+    def _execute_mm_encoder(self, scheduler_output: RBLNSchedulerOutput) -> None:
+        """Encode this step's scheduled multimodal items on the host into
+        ``self.encoder_cache``."""
+        mm_hashes: list[str] = []
+        mm_kwargs: list[tuple[str, MultiModalKwargsItem]] = []
+        for (
+            req_id,
+            encoder_input_ids,
+        ) in scheduler_output.scheduled_encoder_inputs.items():
+            req_state = self.requests[req_id]
+            for mm_input_id in encoder_input_ids:
+                mm_feature = req_state.mm_features[mm_input_id]
+                if mm_feature.data is None:
+                    continue
+                mm_hashes.append(mm_feature.identifier)
+                mm_kwargs.append((mm_feature.modality, mm_feature.data))
+        if not mm_kwargs:
+            return
+
+        model = cast(SupportsMultiModal, self.model)
+        encoder_outputs: list[torch.Tensor] = []
+
+        for _modality, num_items, mm_kwargs_batch in group_and_batch_mm_kwargs(
+            mm_kwargs, device="cpu"
+        ):
+            outputs = model.embed_multimodal(**mm_kwargs_batch)
+            sanity_check_mm_encoder_outputs(outputs, expected_num_items=num_items)
+            encoder_outputs.extend(outputs)
+
+        for mm_hash, output in zip(mm_hashes, encoder_outputs):
+            self.encoder_cache[mm_hash] = output
+            self.maybe_save_ec_to_connector(self.encoder_cache, mm_hash)
+
+    def _gather_mm_embeddings(
+        self,
+        scheduler_output: RBLNSchedulerOutput,
+        num_tokens: int,
+    ) -> tuple[list[tuple[int, int, torch.Tensor]], torch.Tensor]:
+        mm_rows: list[tuple[int, int, torch.Tensor]] = []
+        is_mm = torch.zeros(num_tokens, dtype=torch.bool)
+
+        req_start_idx = 0
+        for req_index, req_id in enumerate(self.input_batch.req_ids):
+            num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
+            req_state = self.requests[req_id]
+            num_computed_tokens = req_state.num_computed_tokens
+
+            for mm_feature in req_state.mm_features:
+                pos_info = mm_feature.mm_position
+                start_pos = pos_info.offset
+                num_encoder_tokens = pos_info.length
+
+                if start_pos >= num_computed_tokens + num_scheduled_tokens:
+                    break
+                if start_pos + num_encoder_tokens <= num_computed_tokens:
+                    continue
+
+                # [start_idx, end_idx) of the placeholder that this step covers.
+                start_idx = max(num_computed_tokens - start_pos, 0)
+                end_idx = min(
+                    num_computed_tokens - start_pos + num_scheduled_tokens,
+                    num_encoder_tokens,
+                )
+                embeds_start, embeds_end = pos_info.get_embeds_indices_in_range(
+                    start_idx, end_idx
+                )
+                if embeds_start == embeds_end:
+                    continue
+
+                encoder_output = self.encoder_cache.get(mm_feature.identifier)
+                assert encoder_output is not None, (
+                    f"Encoder cache miss for {mm_feature.identifier}."
+                )
+
+                first_token = start_pos - num_computed_tokens + start_idx
+                dst_start = req_start_idx + first_token
+                dst = slice(dst_start, dst_start + end_idx - start_idx)
+                embeds = encoder_output[embeds_start:embeds_end].to(self.dtype)
+                if pos_info.is_embed is None:
+                    assert embeds.shape[0] == end_idx - start_idx
+                    is_mm[dst] = True
+                    mm_rows.append((req_index, first_token, embeds))
+                    continue
+
+                rows = pos_info.is_embed[start_idx:end_idx]
+                is_mm[dst] |= rows
+                edges = torch.nn.functional.pad(rows.to(torch.int8), (1, 1)).diff()
+                run_starts = (edges == 1).nonzero().flatten().tolist()
+                run_ends = (edges == -1).nonzero().flatten().tolist()
+                taken = 0
+                for run_start, run_end in zip(run_starts, run_ends):
+                    run_rows = embeds[taken : taken + run_end - run_start]
+                    mm_rows.append((req_index, first_token + run_start, run_rows))
+                    taken += run_end - run_start
+                assert taken == embeds.shape[0]
+
+            req_start_idx += num_scheduled_tokens
+
+        return mm_rows, is_mm.to(self.dtype).unsqueeze(-1)
+
+    def _warmup_mm_encoder(self) -> None:
+        """Materialize every encoder bucket before serving and sizing KV caches."""
+        if not (self.supports_mm_inputs and get_pp_group().is_first_rank):
+            return
+        if self.is_ec_consumer_only:
+            return
+        mm_config = self.model_config.multimodal_config
+        assert mm_config is not None
+        if all(mm_config.get_limit_per_prompt(m) <= 0 for m in ("image", "video")):
+            return
+        with torch.inference_mode():
+            cast(SupportsRBLNMultiModal, self.model).warmup_mm_encoder()
 
     def _sample(
         self,
@@ -1561,9 +1806,16 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                         logprobs_tensors=logprobs_tensors,
                     )
                 )
+            if self.replays_accepted_drafts:
+                for i, (req_id, ids) in enumerate(
+                    zip(self.input_batch.req_ids, valid_sampled_token_ids)
+                ):
+                    num_accepted_tokens = max(len(ids), 1)
+                    self.input_batch.num_accepted_tokens_cpu[i] = num_accepted_tokens
+                    self.num_accepted_tokens_by_req[req_id] = num_accepted_tokens
         else:
-            # The sampled tokens and the logprobs stay on device; the D2H is
-            # deferred to AsyncRBLNModelRunnerOutput.get_output().
+            # The sampled tokens and the logprobs stay on device;
+            # AsyncRBLNModelRunnerOutput copies them to the host.
             if logprobs_tensors is not None:
                 logger.warning_once(
                     "Requesting logprobs adds host CPU work to every decode "
@@ -1741,6 +1993,16 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             # Update persistent batch states.
             self._update_states(scheduler_output)
 
+            if self.vllm_config.is_mm_encoder_only:
+                with self.maybe_get_ec_connector_output(
+                    scheduler_output, encoder_cache=self.encoder_cache
+                ) as ec_connector_output:
+                    self._execute_mm_encoder(scheduler_output)
+                return ModelRunnerOutput.with_ec_conn_output(
+                    make_empty_encoder_model_runner_output(scheduler_output),
+                    ec_connector_output,
+                )
+
             # Process sub-block KV cache copy operations before the forward
             # pass so that partially cached blocks are populated.
             if scheduler_output.kv_cache_copy_ops:
@@ -1749,9 +2011,22 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             if not num_scheduled_tokens:
                 if not has_kv_transfer_group():
                     # Return empty ModelRunnerOutput if there's no work to do.
-                    return EMPTY_MODEL_RUNNER_OUTPUT
-                # KV send/recv even when there is no forward work to do.
-                return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+                    output = EMPTY_MODEL_RUNNER_OUTPUT
+                else:
+                    # KV send/recv even when there is no forward work to do.
+                    output = self.kv_connector_no_forward(
+                        scheduler_output, self.vllm_config
+                    )
+                # EC send/recv too, on the ranks that run the EC connector.
+                if self.supports_mm_inputs and get_pp_group().is_first_rank:
+                    with self.maybe_get_ec_connector_output(
+                        scheduler_output, encoder_cache=self.encoder_cache
+                    ) as ec_connector_output:
+                        pass
+                    output = ModelRunnerOutput.with_ec_conn_output(
+                        output, ec_connector_output
+                    )
+                return output
 
             if self.cache_config.kv_sharing_fast_prefill:
                 assert not self.num_prompt_logprobs, (
@@ -1796,7 +2071,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             (
                 staged_model_inputs,
                 model_kwargs,
+                ec_connector_output,
             ) = self._preprocess(
+                scheduler_output,
                 num_reqs,
                 batch_desc.num_reqs_padded,
                 num_query_tokens,
@@ -1848,6 +2125,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 assert isinstance(hidden_states, IntermediateTensors)
                 hidden_states.kv_connector_output = kv_connector_output
                 self.kv_connector_output = kv_connector_output
+                self.ec_connector_output = ec_connector_output
                 return hidden_states
 
             if self.is_pooling_model:
@@ -1882,6 +2160,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             combined_hidden_states,
         )
         self.kv_connector_output = kv_connector_output
+        self.ec_connector_output = ec_connector_output
         return None
 
     @torch.inference_mode()
@@ -1897,6 +2176,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
             if kv_connector_output is not None:
                 output.kv_connector_output = kv_connector_output
+            output.ec_connector_output = self.ec_connector_output
+            self.ec_connector_output = None
             return output
 
         # Unpack ephemeral state.
@@ -2027,6 +2308,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # self.kv_connector_output may be modified during drafting.
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
+        ec_connector_output = self.ec_connector_output
+        self.ec_connector_output = None
 
         with record_function_or_nullcontext("rbln_model_runner: ModelRunnerOutput"):
             output = ModelRunnerOutput(
@@ -2037,6 +2320,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 prompt_logprobs_dict=prompt_logprobs_dict,
                 num_nans_in_logits=num_nans_in_logits,
                 kv_connector_output=kv_connector_output,
+                ec_connector_output=ec_connector_output,
             )
 
         if not self.use_async_scheduling:
@@ -2198,6 +2482,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             self.model = model_loader.load_model(
                 vllm_config=self.vllm_config, model_config=self.model_config
             )
+        self.supports_mm_inputs = self._resolve_mm_support()
 
         if hasattr(self.model, "logits_processor"):
             self.logits_processor = self.model.logits_processor
@@ -2234,6 +2519,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             install_aux_handoff_slots(self.model)
 
         self._make_weights_contiguous()
+        if envs.VLLM_RBLN_USE_NESTED_COMPILE_REGION:
+            mark_decoder_regions(self.model)
 
         # NOTE(RBLN): This wrapper is designed to be compiled by torch.compile.
         # It handles the forward pass of the underlying model and computes
@@ -2299,7 +2586,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         if self.model_config.enforce_eager:
             self.model_executable = model_wrapper
-            self.compute_logits = self.model.compute_logits
         else:
             process_group_dict = build_process_group_dict()
             self.model_executable = compile(
@@ -2307,8 +2593,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 dynamic=False,
                 fullgraph=True,
                 compile_context=self.compile_context,
-                num_devices=self.rbln_config.num_devices_per_local_rank,
-                model_trace_method="export" if USE_DEVICE_TENSOR else "",
+                num_devices=1,
+                model_trace_method="export" if use_device_tensor() else "",
                 process_group_dict=process_group_dict,
                 guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
                 runtime_holder=self.runtime_holder,
@@ -2319,22 +2605,22 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 use_direct_dispatch=True,
                 dtype=self.rbln_config.compile_dtype,
             )
-            # NOTE(RBLN): We compile compute_logits separately to cover cases when
-            # `self.use_wrapped_compute_logits` is `False`
-            self.compute_logits = compile(
-                self.model.compute_logits,
-                dynamic=False,
-                fullgraph=True,
-                compile_context=self.compile_context,
-                num_devices=self.rbln_config.num_devices_per_local_rank,
-                model_trace_method="export" if USE_DEVICE_TENSOR else "",
-                process_group_dict=process_group_dict,
-                guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
-                runtime_holder=self.runtime_holder,
-                mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
-                use_static_output=True,
-                dtype=self.rbln_config.compile_dtype,
-            )
+            if self.supports_mm_inputs and not self.is_ec_consumer_only:
+                cast(SupportsRBLNMultiModal, self.model).compile_mm_encoder(
+                    lambda encoder: compile(
+                        encoder,
+                        dynamic=False,
+                        fullgraph=True,
+                        compile_context=self.compile_context,
+                        num_devices=1,
+                        model_trace_method="export" if use_device_tensor() else "",
+                        process_group_dict=process_group_dict,
+                        guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
+                        runtime_holder=self.runtime_holder,
+                        mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
+                        use_static_output=True,
+                    )
+                )
 
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
         """Extract Eagle3 auxiliary layer indices from speculative config.
@@ -2610,6 +2896,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 batch_desc.num_reqs_padded, target_query_len
             )
 
+        layout = InputLayout(
+            num_reqs=num_reqs,
+            num_reqs_padded=batch_desc.num_reqs_padded,
+            query_len=target_query_len,
+            query_len_padded=target_query_len,
+        )
         # NOTE(RBLN): Clone tensors to make tensors non-view tensors.
         staged_model_input = self.input_stager.stage(
             input_ids=input_ids.view(num_reqs, target_query_len),
@@ -2617,12 +2909,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
             token_indices=token_indices,
-            layout=InputLayout(
-                num_reqs=num_reqs,
-                num_reqs_padded=batch_desc.num_reqs_padded,
-                query_len=target_query_len,
-                query_len_padded=target_query_len,
-            ),
+            layout=layout,
         )
 
         with set_forward_context(
@@ -2633,7 +2920,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             num_padded_tokens=batch_desc.num_tokens_padded,
             **build_kv_cache_forward_context_kwargs(self.kv_cache_bases),
         ):
-            _ = self.model_executable(**staged_model_input.as_kwargs())
+            _ = self.model_executable(
+                **staged_model_input.as_kwargs(), **self._dummy_mm_kwargs(layout)
+            )
             # The submission a step with no forward of its own was waiting for.
             if not warmup and has_kv_transfer_group():
                 flush_deferred_loads(get_kv_transfer_group())
@@ -2657,6 +2946,20 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 self.drafter.dummy_run(num_reqs, draft_query_len, False)
 
         self.input_batch.num_tokens_no_spec[:num_reqs] = 0
+
+    def _dummy_mm_kwargs(self, layout: InputLayout) -> dict[str, torch.Tensor]:
+        """All-text ``mm_embeds`` / ``mm_mask`` for a dummy prefill"""
+        if not (
+            self.supports_mm_inputs and self.is_prefill and get_pp_group().is_first_rank
+        ):
+            return {}
+        mm_embeds, mm_mask = self.input_stager.stage_mm_embeds(
+            [],
+            torch.zeros(layout.num_reqs, layout.query_len, 1, dtype=self.dtype),
+            self.model_config.get_hidden_size(),
+            layout,
+        )
+        return {"mm_embeds": mm_embeds, "mm_mask": mm_mask}
 
     @torch.inference_mode()
     def _dummy_sampler_run(self, num_reqs: int) -> None:
@@ -2848,7 +3151,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             assert not isinstance(
                 kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec
             )
-            assert not isinstance(kv_cache_group.kv_cache_spec, MambaSpec)
+            # A MambaSpec group without prefix caching (one state block a request)
+            # has block_size = max_model_len, so its table is one block wide.
             block_size = kv_cache_group.kv_cache_spec.block_size
             block_sizes.append(block_size)
             max_num_blocks_per_req = cdiv(max_model_len, block_size)
@@ -2900,7 +3204,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # One buffer per extent, so the layers that alias one cache get one
         # tensor and the rest get their own. Not one pool the layers slice: a
         # graph input is a whole tensor, and dynamo refuses a slice's offset.
-        device = self.device if USE_DEVICE_TENSOR else "meta"
+        device = self.device if use_device_tensor() else "meta"
         extent_of = kv_cache_extents(kv_cache_config)
         buffers = {
             extent: torch.empty(extent[1], dtype=torch.int8, device=device)
@@ -3053,9 +3357,36 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                         marked_layers.append((layer_name, view_dynamic_axis))
                     kv_cache_base_tensors[layer_name] = typed_base
                     kv_cache_view_infos[layer_name] = KVCacheViewInfo(
+                        view_dtype=dtype,
                         view_shape=kv_cache_shape,
                         permute_order=tuple(inv_order),
                         dynamic_axis=base_dynamic_axis,
+                    )
+                elif isinstance(kv_cache_spec, MambaSpec):
+                    if len(kv_cache_spec.shapes) != 1 or (
+                        kv_cache_spec.real_page_size_bytes
+                        != kv_cache_spec.page_size_bytes
+                    ):
+                        raise NotImplementedError(
+                            f"{layer_name}: RBLN allocates a MambaSpec of one state "
+                            f"that fills its page, got {kv_cache_spec}"
+                        )
+                    dtype = kv_cache_spec.dtypes[0]
+                    kv_cache_shape = (num_blocks, *kv_cache_spec.shapes[0])
+                    typed_base = raw_tensor.view(dtype).view(kv_cache_shape)
+                    kv_caches[layer_name] = typed_base
+                    kv_cache_block_axes[layer_name] = 0
+                    dynamic_axis = None
+                    if dynamic_kv_enabled(self.vllm_config):
+                        dynamic_axis = 0
+                        torch._dynamo.mark_dynamic(typed_base, 0)
+                        marked_layers.append((layer_name, 0))
+                    kv_cache_base_tensors[layer_name] = typed_base
+                    kv_cache_view_infos[layer_name] = KVCacheViewInfo(
+                        view_dtype=dtype,
+                        view_shape=kv_cache_shape,
+                        permute_order=tuple(range(len(kv_cache_shape))),
+                        dynamic_axis=dynamic_axis,
                     )
                 else:
                     raise NotImplementedError
@@ -3106,6 +3437,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             )
         )
 
+        self._allocate_aux_kv_caches(
+            kv_cache_config,
+            kv_caches,
+            kv_cache_bases_by_layer,
+            kv_cache_view_infos,
+            block_axes,
+        )
+
         # Set up cross-layer KV cache sharing
         for layer_name, target_layer_name in self.shared_kv_cache_layers.items():
             logger.debug("%s reuses KV cache of %s", layer_name, target_layer_name)
@@ -3150,12 +3489,25 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             )
         self.kv_cache_names = get_kv_cache_names(kv_caches, num_attn_module)
         self.kv_caches = [kv_caches[name] for name in self.kv_cache_names]
+        # The runner owns the cache storage until sizing finishes. Rebuild keys
+        # on allocation so addresses are never matched across cache generations.
+        self.kv_cache_allocations = {}
+        for name, cache in zip(self.kv_cache_names, self.kv_caches):
+            key = kv_cache_tensor_key(cache)
+            self.kv_cache_allocations.setdefault(key, name)
         self.kv_cache_block_axes = block_axes
         forward_context = self.compilation_config.static_forward_context
         for layer_name, kv_cache in kv_caches.items():
             forward_context[layer_name].kv_cache = kv_cache
+        # A layer reads the cache at its position in this list. The index set at
+        # construction assumes `num_attn_module` caches per layer, which a layer
+        # owning fewer (a MiniMax-M3 dense layer has no indexer cache) breaks.
+        for position, layer_name in enumerate(self.kv_cache_names):
+            layer = forward_context[layer_name]
+            assert hasattr(layer, "layer_index"), layer_name
+            layer.layer_index = position
 
-        if not USE_DEVICE_TENSOR and not self.model_config.enforce_eager:
+        if not use_device_tensor() and not self.model_config.enforce_eager:
             # `mark_static_address` is last-write-wins on storage->name. Pin to
             # one canonical layer per pool so the runtime, the connector's host
             # buffers, and the runtime copy path address the same name (and the
@@ -3169,6 +3521,68 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 self.compile_context.mark_static_address(kv_cache, name)
 
         return kv_caches
+
+    def _allocate_aux_kv_caches(
+        self,
+        kv_cache_config: KVCacheConfig,
+        kv_caches: dict[str, torch.Tensor],
+        kv_cache_bases_by_layer: dict[str, torch.Tensor],
+        kv_cache_view_infos: dict[str, KVCacheViewInfo],
+        block_axes: dict[str, int],
+    ) -> None:
+        device = self.device if use_device_tensor() else "meta"
+        num_blocks = kv_cache_config.num_blocks
+        extent_of = kv_cache_extents(kv_cache_config)
+        # Sized with the KV cache: the dynamic-KV resize reads their growth from
+        # the compiled placement like any KV input's.
+        dynamic_axis = 0 if dynamic_kv_enabled(self.vllm_config) else None
+        tensors: dict[tuple, torch.Tensor] = {}
+        ordinals: defaultdict[tuple, int] = defaultdict(int)
+        aux_specs: dict[str, RBLNBlockAuxSpec] = {}
+        forward_context = self.compilation_config.static_forward_context
+        for layer_name, module in forward_context.items():
+            get_aux_spec = getattr(module, "get_aux_cache_spec", None)
+            if get_aux_spec is None or (spec := get_aux_spec(self.vllm_config)) is None:
+                continue
+            assert isinstance(spec, RBLNBlockAuxSpec), spec
+            assert spec.owner in extent_of, f"{layer_name}: no owner {spec.owner}"
+            shape = (num_blocks, *spec.block_shape)
+            kind = (spec.owner, shape, spec.dtype)
+            key = (extent_of[spec.owner], shape, spec.dtype, ordinals[kind])
+            ordinals[kind] += 1
+            if (cache := tensors.get(key)) is None:
+                cache = torch.empty(shape, dtype=spec.dtype, device=device)
+                if dynamic_axis is not None:
+                    torch._dynamo.mark_dynamic(cache, dynamic_axis)
+                tensors[key] = cache
+            kv_caches[layer_name] = cache
+            kv_cache_bases_by_layer[layer_name] = cache
+            kv_cache_view_infos[layer_name] = KVCacheViewInfo(
+                view_dtype=spec.dtype,
+                view_shape=shape,
+                permute_order=tuple(range(len(shape))),
+                dynamic_axis=dynamic_axis,
+            )
+            block_axes[layer_name] = 0
+            aux_specs[layer_name] = spec
+        self.aux_kv_cache_specs = aux_specs
+        if tensors:
+            logger.info(
+                "Block-aux KV caches: %d layers on %d tensors, %.3f GiB",
+                len(aux_specs),
+                len(tensors),
+                sum(t.numel() * t.element_size() for t in tensors.values()) / 2**30,
+            )
+            if (
+                dynamic_axis is None
+                and self.cache_config.num_gpu_blocks_override is None
+            ):
+                # vllm sized num_blocks by the KV cache groups' pages alone; the
+                # dynamic-KV resize counts these tensors.
+                logger.warning(
+                    "Block-aux KV caches are outside the KV cache memory budget; "
+                    "size the block count for them (num_gpu_blocks_override)."
+                )
 
     def maybe_add_kv_sharing_layers_to_kv_cache_groups(
         self, kv_cache_config: KVCacheConfig
@@ -3202,6 +3616,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         """Initialize KV cache based on `kv_cache_config`."""
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
+        self.replays_accepted_drafts = self.speculative_config is not None and any(
+            isinstance(group.kv_cache_spec, MambaSpec)
+            for group in kv_cache_config.kv_cache_groups
+        )
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
         self.initialize_attn_backend(kv_cache_config)
         # The kernel block size for all KV cache groups. For example, if
@@ -3209,6 +3627,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # backends for that group only supports block_size 64, we will return
         # kernel_block_size 64 and split the 256-token-block to 4 blocks with 64
         # tokens each.
+        assert self.rbln_config.prefill_chunk_size is not None  # resolved at start-up
         kernel_block_sizes = prepare_kernel_block_sizes(
             kv_cache_config,
             self.attn_groups,
@@ -3216,7 +3635,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 enable_prefix_caching=self.cache_config.enable_prefix_caching,
                 sub_block_cache=self.rbln_config.enable_sub_block_cache,
                 block_size=self.cache_config.block_size,
-                max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+                prefill_chunk_size=self.rbln_config.prefill_chunk_size,
                 kv_cache_config=kv_cache_config,
                 sub_block_size=self.rbln_config.sub_block_size,
             ),
@@ -3229,6 +3648,21 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # Reinitialize need to after initialize_attn_backend
         self.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
         self.initialize_kv_cache_tensors(kv_cache_config, kernel_block_sizes)
+        if self.aux_kv_cache_specs and has_kv_transfer_group():
+            connectors = list(iter_kv_connectors(get_kv_transfer_group()))
+            unsupported = [
+                type(connector).__name__
+                for connector in connectors
+                if not isinstance(connector, SupportsBlockAuxKVCaches)
+            ]
+            if unsupported:
+                raise NotImplementedError(
+                    "Block-aux KV cache transfer is not supported by: "
+                    f"{', '.join(unsupported)}. "
+                    "Auxiliary caches must be transferred with their owners' blocks."
+                )
+            for connector in connectors:
+                connector.register_block_aux_kv_caches(self.aux_kv_cache_specs)
 
         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
         self.cache_config.num_cpu_blocks = 0
@@ -3250,7 +3684,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         The worker drives this instead of `initialize_kv_cache`: a dynamic-KV
         resize replaces every tensor after warm-up, so the caches worth
-        registering are the ones standing at that point.
+        registering are the ones standing at that point. A connector may get a
+        view rather than the runner's tensor, so it must not re-point one with
+        `set_()`: the runner's tensor would stay on the old storage.
         """
         if not has_kv_transfer_group():
             return
@@ -3261,12 +3697,18 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 self.cross_layers_kv_cache, self.cross_layers_attn_backend
             )
         else:
-            # Every layer, in layer-index order, as upstream hands them over:
-            # a token-level connector (LMCache) addresses each layer through its
-            # own view. RBLN NIXL registers storage and picks one layer per
-            # buffer itself.
+            # Every layer, in layer-index order: a token-level connector (LMCache)
+            # addresses each layer through its own view, and RBLN NIXL registers
+            # storage and picks one layer per buffer. The DSA indexer scale cache
+            # stays flat for the kernels (no squeeze on a dynamic input); connectors
+            # get it as [num_blocks, block_size, 1], like the other RBLN MLA caches.
             kv_transfer_group.register_kv_caches(
-                dict(zip(self.kv_cache_names, self.kv_caches, strict=True))
+                {
+                    name: cache.unsqueeze(-1) if cache.dim() == 2 else cache
+                    for name, cache in zip(
+                        self.kv_cache_names, self.kv_caches, strict=True
+                    )
+                }
             )
 
         kv_transfer_group.set_host_xfer_buffer_ops(self._copy_host_device_kv_blocks)
@@ -3279,6 +3721,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             KVCacheSpec: A dictionary mapping layer names to their KV cache
             format. Layers that do not need KV cache are not included.
         """
+        if self.vllm_config.is_mm_encoder_only:
+            return {}
         kv_cache_spec: dict[str, KVCacheSpec] = {}
         layer_type = cast(type[Any], AttentionLayerBase)
         attn_layers = get_layers_from_vllm_config(self.vllm_config, layer_type)
@@ -3345,6 +3789,17 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
     @property
     def use_wrapped_compute_logits(self) -> bool:
         return not self.is_pooling_model
+
+    @property
+    def is_ec_consumer_only(self) -> bool:
+        """It receives encoder outputs through the EC connector instead of
+        encoding them."""
+        ec_config = self.vllm_config.ec_transfer_config
+        return (
+            ec_config is not None
+            and ec_config.is_ec_consumer
+            and not ec_config.is_ec_producer
+        )
 
     def _attach_kv_cache_bindings(
         self, attn_metadata: PerLayerAttnMetadata | None
@@ -3584,7 +4039,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
     def run_model_graphs(self) -> None:
         """Every model graph once, at the shapes serving will ask for."""
         # 1. prefill
-        self._dummy_run(1, self.max_num_tokens, True)
+        self._dummy_run(1, self.prefill_chunk_size, True)
 
         # 2. decode
         query_lens = [1]
@@ -3632,35 +4087,36 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # the model directly, bypassing the connector lifecycle entirely.
         logger.info("Compile and warming up model.")
 
-        sig = mega_cache.config_signature(self.vllm_config)
+        extra_hash_factors: dict[str, object] = {}
+        if self.supports_mm_inputs:
+            buckets = cast(SupportsRBLNMultiModal, self.model).mm_encoder_patch_buckets
+            if buckets:
+                extra_hash_factors["mm_encoder_patch_buckets"] = buckets
+        sig = mega_cache.config_signature(
+            self.vllm_config, extra_hash_factors=extra_hash_factors
+        )
         mega_cache.load(self.model_config.model, sig)
         with set_compile_stage("warmup"), self.offload_context():
-            self.run_model_graphs()
+            if not self.vllm_config.is_mm_encoder_only:
+                self.run_model_graphs()
 
-            # 3. compute_logits
-            if not self.use_wrapped_compute_logits:
-                for size in self.bucketing_manager.batch_buckets:
-                    hidden_states = torch.randn(
-                        (size, self.model_config.get_hidden_size()),
-                        device=self.device,
-                        dtype=self.dtype,
-                    )
-                    _ = self.compute_logits(hidden_states)
+                # NOTE(RBLN): the sampler and the rejection sampler are built on
+                # the last PP rank only, so no other rank has anything to warm up here.
+                if get_pp_group().is_last_rank:
+                    # 4-1. sampler
+                    if not self.is_pooling_model:
+                        for size in self.bucketing_manager.batch_buckets:
+                            self._dummy_sampler_run(size)
 
-            # NOTE(RBLN): the sampler and the rejection sampler are built on the
-            # last PP rank only, so no other rank has anything to warm up here.
-            if get_pp_group().is_last_rank:
-                # 4-1. sampler
-                if not self.is_pooling_model:
-                    for size in self.bucketing_manager.batch_buckets:
-                        self._dummy_sampler_run(size)
+                    # 4-2. rejection sampler
+                    self._warmup_sampler_decode_batches()
 
-                # 4-2. rejection sampler
-                self._warmup_sampler_decode_batches()
+                # 5. specdec (medusa)
+                if isinstance(self.drafter, RBLNMedusaProposer):
+                    self.drafter.dummy_run()
 
-            # 5. specdec (medusa)
-            if isinstance(self.drafter, RBLNMedusaProposer):
-                self.drafter.dummy_run()
+            # 6. multimodal encoder
+            self._warmup_mm_encoder()
 
         mega_cache.save(self.model_config.model, sig)
 
@@ -3688,7 +4144,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self,
         copy_ops: list[KVCacheCopyOp],
     ) -> None:
-        if not USE_DEVICE_TENSOR and not self.model_config.enforce_eager:
+        if not use_device_tensor() and not self.model_config.enforce_eager:
             # NOTE(RBLN): The runtime KV-copy interface is no longer actively maintained
             # in this path (--model-impl vllm).
             for op in copy_ops:

@@ -35,7 +35,7 @@ from .utils import (
 @pytest.mark.parametrize(
     ("key", "expected"),
     [
-        ("VLLM_RBLN_BATCH_ATTN_OPT", True),
+        ("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", True),
         # Bare RBLN_ names belong to the host and the compiler, not to the
         # package under test, so the shell keeps them.
         ("RBLN_DEVICES", False),
@@ -60,7 +60,7 @@ def test_is_scrubbed_classification(key, expected):
 def test_scrub_env_removes_reports_and_preserves():
     """The three observable halves of the contract, in one pass."""
     environ = {
-        "VLLM_RBLN_BATCH_ATTN_OPT": "1",
+        "VLLM_RBLN_USE_DYNAMIC_KV_CACHE": "1",
         "RBLN_USE_CUSTOM_KERNEL": "1",
         "RBLN_DEVICES": "0,1",
         "PATH": "/usr/bin",
@@ -68,7 +68,10 @@ def test_scrub_env_removes_reports_and_preserves():
     removed = scrub_env(environ)
 
     # Reported with values, so pytest_report_header can show what it took.
-    assert removed == {"VLLM_RBLN_BATCH_ATTN_OPT": "1", "RBLN_USE_CUSTOM_KERNEL": "1"}
+    assert removed == {
+        "VLLM_RBLN_USE_DYNAMIC_KV_CACHE": "1",
+        "RBLN_USE_CUSTOM_KERNEL": "1",
+    }
     # Mutated in place, and nothing else was touched.
     assert environ == {"RBLN_DEVICES": "0,1", "PATH": "/usr/bin"}
 
@@ -138,15 +141,15 @@ class TestDeviceInventory:
         assert rbln_device_count() == mounted
 
     @pytest.mark.parametrize(
-        ("kwargs", "rsd", "expected"),
+        ("kwargs", "expected"),
         [
-            ({}, 1, 1),
-            ({"tensor_parallel_size": 2, "data_parallel_size": 4}, 1, 8),
-            ({"pipeline_parallel_size": 2}, 2, 4),
+            ({}, 1),
+            ({"tensor_parallel_size": 2, "data_parallel_size": 4}, 8),
+            ({"pipeline_parallel_size": 2, "tensor_parallel_size": 2}, 4),
         ],
     )
-    def test_devices_needed_multiplies_every_axis(self, kwargs, rsd, expected):
-        assert devices_needed(kwargs, rsd) == expected
+    def test_devices_needed_multiplies_every_axis(self, kwargs, expected):
+        assert devices_needed(kwargs) == expected
 
 
 def test_scrub_covers_every_name_the_env_table_reads():
