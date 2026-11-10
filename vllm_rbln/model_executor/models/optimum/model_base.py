@@ -37,6 +37,7 @@ from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.logger import init_logger
 from vllm_rbln.utils.optimum.block_size import get_attn_block_size
 from vllm_rbln.utils.optimum.bucket import select_bucket_size
+from vllm_rbln.utils.optimum.configuration.readers import has_packed_kv_cache
 from vllm_rbln.utils.optimum.registry import get_rbln_model_info
 
 from .base import ModelInputForRBLN
@@ -284,6 +285,7 @@ class RBLNOptimumModelBase(nn.Module):
 
 class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
     attn_impl: str | None
+    packed_kv_cache: bool
 
     def setup_decoder_mixin(
         self,
@@ -294,6 +296,7 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
         decoder_batch_sizes: list[int],
     ):
         self.attn_impl = attn_impl
+        self.packed_kv_cache = has_packed_kv_cache(self.model.rbln_config)
         self.use_multiple_decoder = use_multiple_decoder
         # FIXME: self.batch_size != self.decoder_batch_size ?
         self.decoder_batch_size = default_batch_size
@@ -341,7 +344,8 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
             block_tables: Destination block IDs of the request.
 
         Raises:
-            KVCacheCopyError: A block copy failed (e.g. device OOM). The
+            KVCacheCopyError: A block copy failed (e.g. device OOM, or a
+                rebel-compiler without the packed KV cache API). The
                 destination blocks may be partially written; the caller must
                 fall back to a full prefill, which overwrites them all.
         """
@@ -355,7 +359,7 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
                 f"({len(cached_lengths)})"
             )
 
-        prefill_decoder = self.get_prefill_decoder()
+        runtime = self.get_prefill_decoder().runtime
         # Convert to list once for efficiency
         dst_blocks = block_tables.tolist()
 
@@ -363,9 +367,12 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
             zip(cached_block_tables, dst_blocks)
         ):
             try:
-                prefill_decoder.runtime._copy_kv_cache(
-                    src_block, dst_block, cached_lengths[block_idx]
+                copy_kv_cache = (
+                    runtime._copy_packed_kv_cache
+                    if self.packed_kv_cache
+                    else runtime._copy_kv_cache
                 )
+                copy_kv_cache(src_block, dst_block, cached_lengths[block_idx])
                 logger.debug(
                     "Successfully copied KV cache from block %d to block %d",
                     src_block,
