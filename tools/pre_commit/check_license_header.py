@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -17,19 +17,12 @@ import re
 import sys
 from enum import Enum
 
-# Minimum valid copyright year (the project's first year). Any year from this
-# onward is accepted -- we intentionally do NOT cap at the current year, so the
-# check never depends on the system clock and never rejects a "future" year.
 MIN_YEAR = 2025
-
-# Year stamped on a header auto-added to a file that has none. Defaults to the
-# current year, but any year >= MIN_YEAR is valid, so this is only a sensible
-# default and is never enforced as an upper bound.
-NEW_HEADER_YEAR = datetime.date.today().year
+CURRENT_YEAR = datetime.date.today().year
 
 
 def _year_ok(year):
-    return int(year) >= MIN_YEAR
+    return MIN_YEAR <= int(year) <= CURRENT_YEAR
 
 
 # Matches the Rebellions copyright line with any 4-digit year. The trailing
@@ -37,9 +30,6 @@ def _year_ok(year):
 # recognized as a copyright line (year validity is checked separately).
 COPYRIGHT_RE = re.compile(r"#\s*Copyright\s+(?P<year>\d{4})\s+Rebellions Inc\.")
 
-# A single representative line from the Apache license body. We detect the body
-# by this marker rather than by an exact multi-line match, so files that differ
-# only in separator style (blank line vs. "#") are still treated as complete.
 LICENSE_MARKER = '# Licensed under the Apache License, Version 2.0 (the "License");'
 
 
@@ -53,9 +43,9 @@ LICENSE_BODY_LINES = [
     '# Licensed under the Apache License, Version 2.0 (the "License");\n',
     "# you may not use this file except in compliance with the License.\n",
     "# You may obtain a copy of the License at:\n",
-    "\n",
+    "#\n",
     "#     http://www.apache.org/licenses/LICENSE-2.0\n",
-    "\n",
+    "#\n",
     "# Unless required by applicable law or agreed to in writing, software\n",
     '# distributed under the License is distributed on an "AS IS" BASIS,\n',
     "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n",
@@ -72,7 +62,9 @@ class LicenseStatus(Enum):
     MISSING_LICENSE = "missing_license"  # Has copyright, missing body
     MISSING_COPYRIGHT = "missing_copyright"  # Has body, missing copyright
     MISSING_BOTH = "missing_both"  # Neither present
-    WRONG_YEAR = "wrong_year"  # Copyright present but year not allowed
+    NON_CANONICAL = "non_canonical"  # Complete header with inconsistent formatting
+    INVALID_LICENSE = "invalid_license"  # Incomplete or misplaced license body
+    WRONG_YEAR = "wrong_year"  # Copyright year outside the allowed range
 
 
 def check_license_header_status(file_path):
@@ -83,31 +75,58 @@ def check_license_header_status(file_path):
     if not lines:
         return LicenseStatus.EMPTY
 
-    has_copyright = False
-    copyright_year_ok = False
-    has_license_body = False
+    header_end = 0
+    while header_end < len(lines) and (
+        not lines[header_end].strip() or lines[header_end].lstrip().startswith("#")
+    ):
+        header_end += 1
 
-    for line in lines:
-        stripped = line.strip()
-        match = COPYRIGHT_RE.match(stripped)
+    copyright_index = None
+    license_index = None
+    for i, line in enumerate(lines[:header_end]):
+        match = COPYRIGHT_RE.match(line.strip())
         if match:
-            has_copyright = True
-            if _year_ok(match.group("year")):
-                copyright_year_ok = True
-        if stripped == LICENSE_MARKER:
-            has_license_body = True
+            if not _year_ok(match.group("year")):
+                return LicenseStatus.WRONG_YEAR
+            copyright_index = i
+        if line.strip() == LICENSE_MARKER:
+            license_index = i
 
-    if has_copyright and not copyright_year_ok:
-        return LicenseStatus.WRONG_YEAR
-
-    if copyright_year_ok and has_license_body:
+    if license_index is not None:
+        body_end = _license_body_end(lines, license_index)
+        if body_end is None:
+            return LicenseStatus.INVALID_LICENSE
+        if copyright_index is None:
+            return LicenseStatus.MISSING_COPYRIGHT
+        if copyright_index >= license_index or any(
+            line.strip() not in ("", "#")
+            for line in lines[copyright_index + 1 : license_index]
+        ):
+            return LicenseStatus.INVALID_LICENSE
+        match = COPYRIGHT_RE.match(lines[copyright_index].strip())
+        block = [_copyright_line(match.group("year")), "#\n", *LICENSE_BODY_LINES]
+        if lines[copyright_index:body_end] != block:
+            return LicenseStatus.NON_CANONICAL
         return LicenseStatus.COMPLETE
-    elif copyright_year_ok and not has_license_body:
+    if copyright_index is not None:
         return LicenseStatus.MISSING_LICENSE
-    elif not copyright_year_ok and has_license_body:
-        return LicenseStatus.MISSING_COPYRIGHT
-    else:
-        return LicenseStatus.MISSING_BOTH
+    return LicenseStatus.MISSING_BOTH
+
+
+def _license_body_end(lines, start):
+    """Recognize the full body, allowing legacy separator and URL-intro styles."""
+    for offset, expected in enumerate(LICENSE_BODY_LINES):
+        if start + offset >= len(lines):
+            return None
+        actual = lines[start + offset].strip()
+        if expected.strip() == "#":
+            if actual not in ("", "#"):
+                return None
+        elif actual != expected.strip() and (
+            offset != 2 or actual != expected.strip().removesuffix(":")
+        ):
+            return None
+    return start + len(LICENSE_BODY_LINES)
 
 
 def _header_insert_index(lines):
@@ -129,25 +148,47 @@ def add_header(file_path, status):
 
     if status == LicenseStatus.MISSING_BOTH:
         idx = _header_insert_index(lines)
-        block = [_copyright_line(NEW_HEADER_YEAR), "\n", *LICENSE_BODY_LINES]
+        block = [_copyright_line(CURRENT_YEAR), "#\n", *LICENSE_BODY_LINES]
         lines[idx:idx] = block
 
     elif status == LicenseStatus.MISSING_LICENSE:
         # Insert the license body right after the existing copyright line.
         for i, line in enumerate(lines):
             if COPYRIGHT_RE.match(line.strip()):
-                lines[i + 1 : i + 1] = ["\n", *LICENSE_BODY_LINES]
+                end = i + 1
+                while end < len(lines) and lines[end].strip() in ("", "#"):
+                    end += 1
+                lines[i + 1 : end] = ["#\n", *LICENSE_BODY_LINES, "\n"]
                 break
 
     elif status == LicenseStatus.MISSING_COPYRIGHT:
         # Insert the copyright line just before the license body.
         for i, line in enumerate(lines):
             if line.strip() == LICENSE_MARKER:
-                lines[i:i] = [_copyright_line(NEW_HEADER_YEAR), "\n"]
+                lines[i:i] = [_copyright_line(CURRENT_YEAR), "#\n"]
+                end = _license_body_end(lines, i + 2)
+                lines[i + 2 : end] = LICENSE_BODY_LINES
+                break
+
+    elif status == LicenseStatus.NON_CANONICAL:
+        for i, line in enumerate(lines):
+            match = COPYRIGHT_RE.match(line.strip())
+            if match:
+                start = next(
+                    j
+                    for j in range(i + 1, len(lines))
+                    if lines[j].strip() == LICENSE_MARKER
+                )
+                end = _license_body_end(lines, start)
+                lines[i:end] = [
+                    _copyright_line(match.group("year")),
+                    "#\n",
+                    *LICENSE_BODY_LINES,
+                ]
                 break
 
     else:
-        return  # COMPLETE / EMPTY / WRONG_YEAR are not auto-fixed.
+        return
 
     with open(file_path, "w", encoding="UTF-8") as file:
         file.writelines(lines)
@@ -158,8 +199,10 @@ def main():
         LicenseStatus.MISSING_BOTH: [],
         LicenseStatus.MISSING_COPYRIGHT: [],
         LicenseStatus.MISSING_LICENSE: [],
+        LicenseStatus.NON_CANONICAL: [],
     }
     wrong_year = []
+    invalid_license = []
 
     for file_path in sys.argv[1:]:
         status = check_license_header_status(file_path)
@@ -168,13 +211,15 @@ def main():
             add_header(file_path, status)
         elif status == LicenseStatus.WRONG_YEAR:
             wrong_year.append(file_path)
+        elif status == LicenseStatus.INVALID_LICENSE:
+            invalid_license.append(file_path)
 
-    failed = any(fixed.values()) or wrong_year
+    failed = any(fixed.values()) or wrong_year or invalid_license
 
     if any(fixed.values()):
         print(
-            "The following files were missing the RBLN License header "
-            "(auto-added; please review and re-stage):"
+            "The following files had missing or non-canonical RBLN license headers "
+            "(auto-fixed; please review and re-stage):"
         )
         for paths in fixed.values():
             for file_path in paths:
@@ -182,10 +227,18 @@ def main():
 
     if wrong_year:
         print(
-            f"The following files have a copyright year earlier than "
-            f"{MIN_YEAR} (fix the year manually):"
+            f"The following files have a copyright year outside "
+            f"{MIN_YEAR}-{CURRENT_YEAR} (fix the year manually):"
         )
         for file_path in wrong_year:
+            print(f"  {file_path}")
+
+    if invalid_license:
+        print(
+            "The following files have incomplete or misplaced Apache license bodies "
+            "(fix manually):"
+        )
+        for file_path in invalid_license:
             print(f"  {file_path}")
 
     sys.exit(1 if failed else 0)
