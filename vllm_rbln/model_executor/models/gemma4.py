@@ -24,7 +24,6 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import BatchFeature
 from transformers.models.gemma4.modeling_gemma4 import apply_multidimensional_rope
-from vllm import forward_context
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
 from vllm.model_executor.models.gemma4 import Gemma4Attention
@@ -45,10 +44,6 @@ from vllm.sequence import IntermediateTensors
 from vllm_rbln.model_executor.models.interfaces import (
     SupportsRBLNMmPrefix,
     SupportsRBLNMultiModal,
-)
-from vllm_rbln.patches.attention import _resolve_kv_cache
-from vllm_rbln.v1.attention.backends.flash_attention import (
-    _build_mm_prefix_sliding_mask,
 )
 
 
@@ -210,12 +205,9 @@ class RBLNGemma4ForConditionalGeneration(
                 "Gemma4 does not support speculative decoding on RBLN yet."
             )
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-        self.mm_prefix_attn_layers: list[nn.Module] = []
         for module in self.modules():
             if isinstance(module, Gemma4Attention):
                 module.attn.use_mm_prefix &= module.is_sliding
-                if module.attn.use_mm_prefix:
-                    self.mm_prefix_attn_layers.append(module.attn)
         cap = mm_soft_token_cap(
             MULTIMODAL_REGISTRY.create_processor(vllm_config.model_config).info
         )
@@ -389,26 +381,6 @@ class RBLNGemma4ForConditionalGeneration(
         mm_mask: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor | IntermediateTensors:
-        if self.mm_prefix_attn_layers:
-            attn_metadata = forward_context.get_forward_context().attn_metadata
-            assert isinstance(attn_metadata, dict)
-            masks: dict[tuple[int, int], torch.Tensor] = {}
-            for layer in self.mm_prefix_attn_layers:
-                metadata = attn_metadata[layer.layer_name]
-                if metadata.mm_prefix_row_ends is None:
-                    continue
-                assert metadata.is_prefill and metadata.swa_appends
-                block_size = _resolve_kv_cache(metadata, layer.layer_index).size(-2)
-                mask_key = (layer.sliding_window, block_size)
-                if mask_key not in masks:
-                    masks[mask_key] = _build_mm_prefix_sliding_mask(
-                        metadata.mm_prefix_row_ends,
-                        metadata.seq_lens,
-                        layer.sliding_window,
-                        block_size,
-                        self.model_dtype,
-                    )
-                metadata.swa_attn_masks = masks[mask_key]
         if (
             mm_embeds is not None
             and inputs_embeds is None

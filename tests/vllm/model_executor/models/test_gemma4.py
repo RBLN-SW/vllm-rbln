@@ -16,7 +16,6 @@
 vision encoder against HF's, its graph buckets, and the in-graph merge of
 image embeddings."""
 
-import operator
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
@@ -30,7 +29,6 @@ from vllm.model_executor.models.gemma4_mm import Gemma4ForConditionalGeneration
 
 import vllm_rbln.model_executor.models.gemma4 as gemma4
 from vllm_rbln.model_executor.models.gemma4 import RBLNGemma4ForConditionalGeneration
-from vllm_rbln.v1.attention.backends.flash_attention import RBLNFlashAttentionMetadata
 
 POOL = 3
 
@@ -45,7 +43,6 @@ def _bare_model(**attrs) -> RBLNGemma4ForConditionalGeneration:
         RBLNGemma4ForConditionalGeneration
     )
     nn.Module.__init__(model)
-    model.mm_prefix_attn_layers = []
     object.__setattr__(model, "_mm_encoder", None)
     for key, value in attrs.items():
         setattr(model, key, value)
@@ -465,58 +462,3 @@ def test_image_embeddings_replace_their_tokens_in_the_graph(monkeypatch):
     assert out == "HIDDEN"
     assert seen["input_ids"] is None
     assert seen["inputs_embeds"][0, :, 0].tolist() == [1.0, 9.0, 3.0]
-
-
-@pytest.mark.parametrize("compiled", [False, True])
-def test_prefix_mask_is_shared_across_layers_and_refreshed_each_step(
-    monkeypatch, compiled
-):
-    layers = [
-        SimpleNamespace(layer_name=f"layer.{i}", layer_index=i, sliding_window=4)
-        for i in range(3)
-    ]
-    caches = [torch.zeros(4, 2, 1, 1, 4, 32) for _ in layers]
-    metadata = {
-        layer.layer_name: RBLNFlashAttentionMetadata(
-            seq_lens=torch.tensor([[0]]),
-            block_tables=torch.arange(4),
-            is_prefill=True,
-            swa_appends=True,
-            mm_prefix_row_ends=torch.tensor([0, 3, 3, 3]),
-            kv_caches=caches,
-        )
-        for layer in layers
-    }
-    context = SimpleNamespace(attn_metadata=metadata, additional_kwargs={})
-    monkeypatch.setattr("vllm.forward_context.get_forward_context", lambda: context)
-    monkeypatch.setattr(
-        "vllm_rbln.patches.attention.get_forward_context", lambda: context
-    )
-
-    def upstream_forward(self, *args, **kwargs):
-        masks = [md.swa_attn_masks for md in metadata.values()]
-        assert masks[0] is not None
-        assert all(mask is masks[0] for mask in masks)
-        return masks[0]
-
-    monkeypatch.setattr(Gemma4ForConditionalGeneration, "forward", upstream_forward)
-    model = _bare_model(mm_prefix_attn_layers=layers, model_dtype=torch.float32)
-    graphs = []
-
-    def backend(graph, inputs):
-        graphs.append(graph)
-        return graph.forward
-
-    forward = (
-        torch.compile(model, backend=backend, fullgraph=True) if compiled else model
-    )
-    first = forward(None, torch.arange(4))
-    for md in metadata.values():
-        md.mm_prefix_row_ends = torch.arange(4)
-    second = forward(None, torch.arange(4))
-    assert first is not second
-    assert first[0, 0, 1, 3] == 1
-    assert second[0, 0, 1, 3] == 0
-    if compiled:
-        assert len(graphs) == 1
-        assert sum(node.target is operator.and_ for node in graphs[0].graph.nodes) == 1

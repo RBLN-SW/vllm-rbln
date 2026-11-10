@@ -615,18 +615,7 @@ class TestBuildMmPrefixSlidingWindow:
             scale=self.DIM**-0.5,
             sliding_window=self.WINDOW,
         )
-
-        def forward(layer, query, key, value, cache, metadata, output):
-            if masked:
-                metadata.swa_attn_masks = flash_attention._build_mm_prefix_sliding_mask(
-                    metadata.mm_prefix_row_ends,
-                    metadata.seq_lens,
-                    self.WINDOW,
-                    self.BLOCK,
-                    query.dtype,
-                )
-            impl.forward(layer, query, key, value, cache, metadata, output)
-
+        forward = impl.forward
         if backend is not None:
             forward = torch.compile(forward, backend=backend, fullgraph=True)
         outputs = []
@@ -1051,9 +1040,6 @@ class TestForwardSlidingWindow:
             swa_appends=True,
             mm_prefix_row_ends=torch.tensor([0]),
         )
-        md.swa_attn_masks = flash_attention._build_mm_prefix_sliding_mask(
-            md.mm_prefix_row_ends, md.seq_lens, self.WINDOW, self.WINDOW, dtype
-        )
         kwargs: dict[str, object] = {}
         self._forward(
             cfg,
@@ -1066,7 +1052,6 @@ class TestForwardSlidingWindow:
         )
         if use_mm_prefix:
             mask = kwargs["attn_mask"]
-            assert mask is md.swa_attn_masks
             assert isinstance(mask, torch.Tensor)
             assert mask.dtype == dtype
             torch.testing.assert_close(
