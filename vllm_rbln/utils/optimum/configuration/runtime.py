@@ -19,11 +19,14 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from vllm_rbln.logger import init_logger
-from vllm_rbln.utils.optimum.block_size import get_block_ratio, is_full_block_available
 from vllm_rbln.utils.optimum.configuration.readers import (
     RblnConfigLike,
     get_field,
     language_model_configs,
+)
+from vllm_rbln.utils.optimum.kv_cache_blocks import (
+    get_block_ratio,
+    is_full_block_available,
 )
 from vllm_rbln.utils.optimum.registry import (
     is_enc_dec_arch,

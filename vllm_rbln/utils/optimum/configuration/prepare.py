@@ -29,6 +29,7 @@ from vllm_rbln.utils.optimum.configuration.inputs import (
     get_user_block_size,
     merge_overrides,
     require_compile_block_size,
+    resolve_explicit_num_blocks,
     set_submodule_num_devices,
     validate_prefill_chunk_override,
 )
@@ -87,6 +88,16 @@ def prepare_compile_inputs(vllm_config: VllmConfig) -> OptimumRBLNCompileInputs:
             f"Compilation is not implemented for architecture {architectures[0]}"
         )
 
+    num_blocks = resolve_explicit_num_blocks(
+        vllm_config.cache_config.num_gpu_blocks_override, optimum_overrides
+    )
+    explicit_decoder_blocks = num_blocks is not None and (
+        is_generation_arch(hf_config) or is_multi_modal(hf_config)
+    )
+    if explicit_decoder_blocks:
+        decoder_config = language_model_configs(rbln_config)[0]
+        del decoder_config["memory_budget"]
+
     # optimum_overrides must not overwrite fields vllm derives from its own
     # config (batch_size, max_seq_len, memory_budget, ...); a silent
     # mismatch would compile a model that disagrees with the runtime. Adding
@@ -99,6 +110,9 @@ def prepare_compile_inputs(vllm_config: VllmConfig) -> OptimumRBLNCompileInputs:
                 + "; ".join(conflicts)
             )
         merge_overrides(rbln_config, optimum_overrides)
+
+    if explicit_decoder_blocks:
+        decoder_config["kvcache_num_blocks"] = num_blocks
 
     return OptimumRBLNCompileInputs(
         model=str(model_config.model),

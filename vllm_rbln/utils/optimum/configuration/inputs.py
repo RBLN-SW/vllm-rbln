@@ -21,7 +21,7 @@ import json
 from dataclasses import fields
 from typing import TYPE_CHECKING, Any
 
-from .readers import read_num_devices
+from .readers import read_language_model_fields, read_num_devices
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -150,6 +150,32 @@ def get_compile_num_devices(
     if num_devices is None:
         num_devices = vllm_config.additional_config.num_devices_per_local_rank
     return num_devices
+
+
+def resolve_explicit_num_blocks(
+    num_gpu_blocks_override: int | None,
+    optimum_overrides: dict[str, Any],
+) -> int | None:
+    """Resolve user block counts before vLLM's block-size conversion."""
+    num_blocks = read_language_model_fields(
+        optimum_overrides, "kvcache_num_blocks"
+    ).get("kvcache_num_blocks")
+    if num_blocks == 0:
+        num_blocks = None
+    if (
+        num_gpu_blocks_override is not None
+        and num_blocks is not None
+        and num_gpu_blocks_override != num_blocks
+    ):
+        raise ValueError(
+            "Conflicting KV cache block counts: "
+            f"num_gpu_blocks_override={num_gpu_blocks_override}, "
+            f"kvcache_num_blocks={num_blocks} in optimum_overrides. "
+            "Specify only one or use matching values."
+        )
+    return (
+        num_gpu_blocks_override if num_gpu_blocks_override is not None else num_blocks
+    )
 
 
 def validate_prefill_chunk_override(

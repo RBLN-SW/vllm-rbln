@@ -18,7 +18,13 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from transformers import LlamaConfig, PaliGemmaConfig, Qwen3Config, WhisperConfig
+from transformers import (
+    LlamaConfig,
+    PaliGemmaConfig,
+    PretrainedConfig,
+    Qwen3Config,
+    WhisperConfig,
+)
 
 from vllm_rbln.config import OptimumRBLNCompileInputs
 from vllm_rbln.utils.optimum.configuration import sync
@@ -35,6 +41,76 @@ pytestmark = pytest.mark.usefixtures("compile_environment")
 
 
 class TestSync:
+    @pytest.mark.parametrize(
+        "num_blocks, override_blocks",
+        [(None, 16), (16, None), (16, 16), (None, 0), (None, None)],
+    )
+    @pytest.mark.parametrize("utilization", [0.5, 0.9, 1.0])
+    @pytest.mark.parametrize(
+        "architecture, key",
+        [
+            ("LlamaForCausalLM", None),
+            ("Gemma3ForConditionalGeneration", "language_model"),
+            ("Idefics3ForConditionalGeneration", "text_model"),
+        ],
+    )
+    def test_explicit_blocks_normalize_utilization_before_cache_lookup(
+        self,
+        monkeypatch,
+        vllm_config_factory,
+        num_blocks,
+        override_blocks,
+        utilization,
+        architecture,
+        key,
+    ):
+        observed = []
+        prepare = sync.prepare_compile_inputs
+
+        def record(cfg):
+            observed.append(cfg.cache_config.gpu_memory_utilization)
+            return prepare(cfg)
+
+        monkeypatch.setattr(sync, "prepare_compile_inputs", record)
+        overrides = (
+            {} if override_blocks is None else {"kvcache_num_blocks": override_blocks}
+        )
+        cfg = vllm_config_factory(
+            optimum_overrides={key: overrides} if key else overrides,
+            hf_config=PretrainedConfig(architectures=[architecture]),
+            num_gpu_blocks_override=num_blocks,
+            gpu_memory_utilization=utilization,
+        )
+        explicit_blocks = num_blocks is not None or override_blocks == 16
+        expected_utilization = 1.0 if explicit_blocks else utilization
+        assert cfg.cache_config.gpu_memory_utilization == expected_utilization
+        assert observed == [expected_utilization]
+        assert cfg.cache_config.num_gpu_blocks_override == num_blocks
+
+    @pytest.mark.parametrize("key", [None, "language_model", "text_model"])
+    def test_conflicting_blocks_fail_before_cache_lookup(
+        self, monkeypatch, vllm_config_factory, key
+    ):
+        from unittest.mock import Mock
+
+        resolve_path = Mock(wraps=sync.resolve_compiled_model_path)
+        monkeypatch.setattr(sync, "resolve_compiled_model_path", resolve_path)
+        overrides = {"kvcache_num_blocks": 32}
+        architecture = {
+            None: "LlamaForCausalLM",
+            "language_model": "Gemma3ForConditionalGeneration",
+            "text_model": "Idefics3ForConditionalGeneration",
+        }[key]
+        with pytest.raises(
+            ValueError, match="num_gpu_blocks_override=16.*kvcache_num_blocks=32"
+        ):
+            vllm_config_factory(
+                optimum_overrides={key: overrides} if key else overrides,
+                num_gpu_blocks_override=16,
+                hf_config=PretrainedConfig(architectures=[architecture]),
+            )
+        resolve_path.assert_not_called()
+
     @pytest.mark.parametrize("prefix_caching", [False, True])
     def test_paligemma_uses_final_chunk_before_cache_lookup(
         self, monkeypatch, prefix_caching, vllm_config_factory
@@ -161,6 +237,7 @@ class TestSync:
             cache_config=SimpleNamespace(
                 block_size=1024,
                 gpu_memory_utilization=0.9,
+                num_gpu_blocks_override=None,
                 user_specified_block_size=True,
                 enable_prefix_caching=False,
             ),

@@ -49,6 +49,7 @@ def _vllm_config(hf_config, *, optimum_overrides=None, user_chunk=None):
             user_specified_block_size=True,
             enable_prefix_caching=False,
             gpu_memory_utilization=0.9,
+            num_gpu_blocks_override=None,
         ),
         additional_config=build_optimum_rbln_config(
             {
@@ -88,6 +89,48 @@ def test_multimodal_decoder_option(monkeypatch, architecture, key):
     assert decoder["nested_compile_region"] is True
     if key:
         assert "nested_compile_region" not in inputs.rbln_config
+
+
+@pytest.mark.parametrize(
+    "num_blocks, override_blocks, expected_blocks",
+    [
+        (None, None, None),
+        (None, 0, None),
+        (None, 16, 16),
+        (16, None, 16),
+        (16, 0, 16),
+        (16, 16, 16),
+    ],
+)
+@pytest.mark.parametrize(
+    "architecture, key",
+    [
+        ("LlamaForCausalLM", None),
+        ("Qwen3VLForConditionalGeneration", None),
+        ("Gemma3ForConditionalGeneration", "language_model"),
+        ("Idefics3ForConditionalGeneration", "text_model"),
+    ],
+)
+def test_explicit_blocks_replace_automatic_memory_budget(
+    architecture, key, num_blocks, override_blocks, expected_blocks
+):
+    overrides = (
+        {} if override_blocks is None else {"kvcache_num_blocks": override_blocks}
+    )
+    overrides = {key: overrides} if key else overrides
+    cfg = _vllm_config(
+        PretrainedConfig(architectures=[architecture]), optimum_overrides=overrides
+    )
+    cfg.cache_config.num_gpu_blocks_override = num_blocks
+    inputs = prepare_compile_inputs(cfg)
+    decoder = inputs.rbln_config[key] if key else inputs.rbln_config
+    if expected_blocks is None:
+        assert decoder["memory_budget"] == 0.9
+    else:
+        assert "memory_budget" not in decoder
+        assert decoder["kvcache_num_blocks"] == expected_blocks
+    assert cfg.additional_config.optimum_overrides == overrides
+    assert cfg.cache_config.num_gpu_blocks_override == num_blocks
 
 
 def test_flag_conflicts_with_decoder_override(monkeypatch):
