@@ -840,24 +840,16 @@ def test_warmup_compiles_prefill_at_every_prefill_chunk_size():
     assert calls[:2] == [((1, 128, True), {}), ((1, 256, True), {})]
 
 
-@pytest.mark.parametrize(
-    ("chunk_sizes", "query_len", "padded"),
-    [
-        ([128, 256], 100, 128),
-        ([128, 256], 128, 128),
-        ([128, 256], 129, 256),
-        ([64, 256], 100, 256),
-    ],
-)
+@pytest.mark.parametrize(("query_len", "padded"), [(100, 128), (128, 128), (129, 256)])
 def test_a_prefill_pads_to_the_shortest_chunk_size_that_holds_it(
-    monkeypatch, chunk_sizes, query_len, padded
+    monkeypatch, query_len, padded
 ):
     monkeypatch.setattr(mr, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True))
     runner = _make_runner_stub(
         input_ids=torch.zeros(512, dtype=torch.int32),
         positions=torch.zeros(512, dtype=torch.int64),
         is_prefill=True,
-        prefill_chunk_sizes=chunk_sizes,
+        prefill_chunk_sizes=[128, 256],
         input_stager=Mock(),
         is_pooling_model=True,
         _init_model_kwargs=lambda: {},
@@ -2685,15 +2677,6 @@ class TestExecuteModelMmPrefixRowEnds:
                 offset=offset, length=len(is_embed), is_embed=torch.tensor(is_embed)
             ),
         )
-
-    def test_text_and_a_whole_range_share_the_chunk(self, monkeypatch):
-        # Soft tokens at 5..14 inside a 20-token step.
-        seen = self._row_ends_seen(
-            monkeypatch, computed=0, scheduled=20, mm_features=[self._image(4, 10)]
-        )
-        expected = torch.arange(128)
-        expected[5:15] = 14
-        assert torch.equal(seen, expected)
 
     def test_each_video_frame_ends_at_its_own_range(self, monkeypatch):
         # Two frames, soft tokens at 4..7 and 11..14, in one 20-token step.

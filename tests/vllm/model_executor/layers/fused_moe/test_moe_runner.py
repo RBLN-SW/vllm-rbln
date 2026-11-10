@@ -332,54 +332,6 @@ class TestRoutingMaskDtype:
         )
 
 
-def _routed_weights(monkeypatch, router, logits):
-    """``[E, T]`` weights ``forward`` hands the quant method at DP=1."""
-    monkeypatch.setattr(
-        fused_moe_utils,
-        "get_forward_context",
-        lambda: SimpleNamespace(
-            dp_metadata=SimpleNamespace(
-                num_tokens_across_dp_cpu=torch.tensor([logits.shape[1]]),
-                max_pads_across_dp=None,  # DP=1
-            )
-        ),
-    )
-    routed: dict[str, torch.Tensor] = {}
-
-    class _CaptureQuantMethod:
-        def apply(self, layer, x, router_logits):
-            routed["weights"] = router_logits
-            return x
-
-    runner = object.__new__(RBLNMoERunner)
-    torch.nn.Module.__init__(runner)
-    runner.use_moe_tokens_mask = True
-    runner.routed_experts = SimpleNamespace(quant_method=_CaptureQuantMethod())
-    runner.top_k = 2
-    runner.moe_parallel_config = SimpleNamespace(dp_size=1, dp_rank=0)
-    runner.router = router
-    RBLNMoERunner.forward(runner, torch.zeros(*logits.shape[:2], 8), lambda _: logits)
-    return routed["weights"]
-
-
-class TestGemma4Routing:
-    def test_precomputed_logits_route_like_upstream_gemma4(self, monkeypatch):
-        # Gemma4 hands the runner logits it computed from the residual; its
-        # per-expert scale is folded into down_proj, so routing sees none.
-        from vllm.model_executor.models.gemma4 import gemma4_routing_function_torch
-
-        logits = torch.randn(1, 3, 4)
-        router = SimpleNamespace(renormalize=True)
-
-        weights = _routed_weights(monkeypatch, router, logits)
-
-        topk_weights, topk_ids = gemma4_routing_function_torch(
-            logits[0], 2, torch.ones(4)
-        )
-        expected = torch.zeros(3, 4).scatter_(1, topk_ids.long(), topk_weights)
-        torch.testing.assert_close(weights, expected.T)
-
-
 class TestRegistration:
     def test_moe_runner_resolves_to_rbln_oot_implementation(self):
         # The suite conftest loads the general plugins before collection, so

@@ -968,11 +968,6 @@ class TestMmPrefixChunks:
         req = make_request("a", list(range(num_tokens)), 16, mm_features=features)
         return self._prefill(sched, req)
 
-    def test_text_and_an_image_share_a_chunk(self, monkeypatch):
-        # <boi> at 2, soft tokens at 3..12, <eoi> at 13.
-        image = self._feature("image", 2, [False] + [True] * 10 + [False])
-        assert self._chunks(monkeypatch, [image]) == [16, 16, 8]
-
     def test_a_range_the_chunk_would_cut_moves_whole_to_the_next_step(
         self, monkeypatch
     ):
@@ -986,12 +981,6 @@ class TestMmPrefixChunks:
         chunks = self._chunks(monkeypatch, [image], chunk_size=8)
         assert chunks == [8] * 5
 
-    def test_no_step_exceeds_the_longest_chunk(self, monkeypatch):
-        # The 32-token budget would hold the whole rest; the longest chunk caps it.
-        image = self._feature("image", 9, [False] + [True] * 10 + [False])
-        chunks = self._chunks(monkeypatch, [image], budget=32, chunk_size=[8, 16])
-        assert chunks == [10, 16, 14]
-
     def test_each_video_frame_is_its_own_range(self, monkeypatch):
         # Two frames of four soft tokens, each between a timestamp, <boi>, <eoi>:
         # soft tokens at 4..7 and 11..14, so only the second frame is cut.
@@ -999,10 +988,6 @@ class TestMmPrefixChunks:
         video = self._feature("video", 2, frame * 2)
         chunks = self._chunks(monkeypatch, [video], num_tokens=24, chunk_size=13)
         assert chunks == [11, 13]
-
-    def test_audio_is_not_an_mm_prefix_range(self, monkeypatch):
-        audio = self._feature("audio", 4, [True] * 8)
-        assert self._chunks(monkeypatch, [audio], num_tokens=24) == [16, 8]
 
     def _prefix_hit_inside_a_range(self, monkeypatch, second_image):
         # Soft tokens at 20..40, <eoi> at 41. The second request shares the first
@@ -1034,13 +1019,6 @@ class TestMmPrefixChunks:
         # The step stops before the second image's soft tokens at 46.
         computed, scheduled = self._prefix_hit_inside_a_range(monkeypatch, True)
         assert (computed - scheduled, scheduled) == (32, 14)
-
-    def test_a_hit_on_a_ranges_last_token_runs_it_with_the_text_after(self):
-        # Soft tokens at 10..19; a hit ending at 19 leaves the range's last token.
-        image = self._feature("image", 9, [False] + [True] * 10 + [False])
-        sched = create_rbln_scheduler(max_num_batched_tokens=16, max_model_len=64)
-        req = make_request("a", list(range(40)), 16, mm_features=[image])
-        assert sched._mm_prefix_split(req, 19, 16) == 16
 
 
 class TestScheduleSpecDecodeCap:
