@@ -235,13 +235,13 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         )
         g = g.reshape(batch, seq_len, heads_k, ratio)
         beta, g = (x.permute(0, 2, 3, 1) for x in (beta, g))
-        if metadata.is_prefill:
+        if metadata.num_prefills > 0:
             # Padded tokens must neither decay the state nor write to it.
             assert metadata.valid_mask is not None
             g = g * metadata.valid_mask
             beta = beta * metadata.valid_mask.to(beta.dtype)
         beta, g = beta.contiguous(), g.contiguous()
-        if metadata.is_prefill:
+        if metadata.num_prefills > 0:
             core = torch.ops.rbln_custom_ops.chunk_gated_delta_rule(
                 query,
                 key,
@@ -249,10 +249,10 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 g,
                 beta,
                 state,
-                metadata.ssm_state_index,
-                metadata.ssm_has_initial_state,
+                metadata.prefill_state_indices,
+                metadata.prefill_has_initial_state,
                 GDN_PREFILL_CHUNK,
-                store_index=metadata.ssm_store_index,
+                store_index=metadata.store_state_indices,
             )
         else:
             core = torch.ops.rbln_custom_ops.recurrent_gated_delta_rule(
@@ -262,8 +262,8 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 g,
                 beta,
                 state,
-                metadata.ssm_state_index,
-                store_index=metadata.ssm_store_index,
+                metadata.non_spec_state_indices_tensor,
+                store_index=metadata.store_state_indices,
             )
         # [batch, heads_k, ratio, seq, 128] -> [batch, seq, heads_v, 128]
         core = core.permute(0, 3, 1, 2, 4).reshape(batch, seq_len, heads_v, head_dim)

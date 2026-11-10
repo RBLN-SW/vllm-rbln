@@ -28,6 +28,7 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
     torch_chunk_gated_delta_rule,
     torch_recurrent_gated_delta_rule,
 )
+from vllm.config import set_current_vllm_config
 from vllm.v1.kv_cache_interface import MambaSpec
 
 from tests.vllm.vllm_config import make_vllm_config
@@ -139,6 +140,7 @@ def _reference(layer, hidden, conv_history, recurrent_state):
 def _common(query_len: int, seq_len: int) -> SimpleNamespace:
     return SimpleNamespace(
         num_reqs=1,
+        num_actual_tokens=query_len,
         query_start_loc=torch.tensor([0, query_len], dtype=torch.int32),
         seq_lens=torch.tensor([seq_len], dtype=torch.int32),
         block_table_tensor=torch.tensor([[BLOCK]], dtype=torch.int32),
@@ -185,9 +187,10 @@ def test_padded_prefill_then_decode_tracks_hf(vllm_config):
         shapes=(KV_BLOCK,),
         dtypes=(torch.float32,),
     )
-    builder = RBLNGDNAttentionMetadataBuilder(
-        spec, [PREFIX], vllm_config, torch.device("cpu")
-    )
+    with set_current_vllm_config(vllm_config):
+        builder = RBLNGDNAttentionMetadataBuilder(
+            spec, [PREFIX], vllm_config, torch.device("cpu")
+        )
     torch.manual_seed(1)
     tokens = torch.randn(1, 70 + 58 + 1, HIDDEN)
 

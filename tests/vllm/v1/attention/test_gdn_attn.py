@@ -60,9 +60,11 @@ def _builder():
         shapes=(gdn_state_shape(1, 256, 128),),
         dtypes=(torch.bfloat16,),
     )
-    return RBLNGDNAttentionMetadataBuilder(
-        spec, [LAYER], vllm_config, torch.device("cpu")
-    )
+    # The flash builder it extends reads the config it is built under.
+    with set_current_vllm_config(vllm_config):
+        return RBLNGDNAttentionMetadataBuilder(
+            spec, [LAYER], vllm_config, torch.device("cpu")
+        )
 
 
 @pytest.fixture
@@ -78,6 +80,7 @@ def _common(
         starts.append(starts[-1] + n)
     return SimpleNamespace(
         num_reqs=len(query_lens),
+        num_actual_tokens=starts[-1],
         query_start_loc=torch.tensor(starts, dtype=torch.int32),
         seq_lens=torch.tensor(seq_lens, dtype=torch.int32),
         block_table_tensor=torch.tensor(block_table, dtype=torch.int32),
@@ -102,11 +105,18 @@ class TestBuilder:
     def test_first_prefill_chunk(self, builder):
         positions = torch.arange(128)
         md = builder.build(_common([70], [70], [[7]]), positions, 1, True)
-        assert md.is_prefill and md.batch_size == 1 and md.seq_len == 128
+        assert (md.num_prefills, md.num_prefill_tokens, md.num_decodes) == (1, 70, 0)
+        assert md.is_prefill
+        assert md.num_actual_tokens == 70
+        assert md.batch_size == 1 and md.seq_len == 128
         # A fresh request names its block for both, and the kernel reads none.
-        assert md.ssm_state_index.tolist() == [7]
-        assert md.ssm_store_index.tolist() == [7]
-        assert md.ssm_has_initial_state.tolist() == [0]
+        # The chunk kernel's inputs are the step's, as upstream names them.
+        assert md.prefill_state_indices is md.non_spec_state_indices_tensor
+        assert md.prefill_has_initial_state is md.has_initial_state
+        assert md.prefill_state_indices.dtype == torch.int16
+        assert md.prefill_state_indices.tolist() == [7]
+        assert md.store_state_indices.tolist() == [7]
+        assert md.prefill_has_initial_state.tolist() == [0]
         _assert_conv_rows(md, [7], [0], [70], [0])
         assert md.valid_mask.shape == (1, 1, 128)
         assert md.valid_mask.sum() == 70 and md.valid_mask[..., :70].all()
@@ -114,17 +124,21 @@ class TestBuilder:
     def test_later_prefill_chunk_carries_state(self, builder):
         positions = torch.arange(70, 70 + 58)
         md = builder.build(_common([58], [128], [[7]]), positions, 1, True)
-        assert md.ssm_state_index.tolist() == [7]
-        assert md.ssm_has_initial_state.tolist() == [1]
+        assert md.num_prefill_tokens == 58
+        assert md.prefill_state_indices.tolist() == [7]
+        assert md.prefill_has_initial_state.tolist() == [1]
         _assert_conv_rows(md, [7], [70], [58], [1])
 
     def test_decode_pads_the_batch_onto_the_null_block(self, builder):
         positions = torch.tensor([128, 5])
         md = builder.build(_common([1, 1], [129, 6], [[7], [3]]), positions, 4, False)
-        assert not md.is_prefill and md.batch_size == 4 and md.seq_len == 1
-        assert md.ssm_state_index.tolist() == [7, 3, 0, 0]
-        assert md.ssm_store_index.tolist() == [7, 3, 0, 0]
-        assert md.ssm_has_initial_state.tolist() == [1, 1, 0, 0]
+        assert (md.num_prefills, md.num_decodes, md.num_decode_tokens) == (0, 2, 2)
+        assert not md.is_prefill
+        assert md.batch_size == 4 and md.seq_len == 1
+        assert md.non_spec_state_indices_tensor.tolist() == [7, 3, 0, 0]
+        assert md.store_state_indices.tolist() == [7, 3, 0, 0]
+        # The chunk kernel's inputs belong to a prefill step.
+        assert md.has_initial_state is None and md.prefill_state_indices is None
         _assert_conv_rows(md, [7, 3, 0, 0], [128, 5, 0, 0], [1, 1, 0, 0], [1, 1, 0, 0])
         assert md.valid_mask is None
 

@@ -37,18 +37,18 @@ is stored to the block the state is.
 from dataclasses import dataclass
 
 import torch
-from vllm.config import VllmConfig
-from vllm.v1.attention.backend import (
-    AttentionBackend,
-    AttentionMetadataBuilder,
-    CommonAttentionMetadata,
-)
+from vllm.v1.attention.backend import AttentionBackend, CommonAttentionMetadata
+from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.registry import (
     MambaAttentionBackendEnum,
     register_backend,
 )
-from vllm.v1.kv_cache_interface import KVCacheSpec
+from vllm.v1.attention.backends.utils import mamba_get_block_table_tensor
 
+import vllm_rbln.utils as rbln_utils
+from vllm_rbln.v1.attention.backends.flash_attention import (
+    RBLNFlashAttentionMetadataBuilder,
+)
 from vllm_rbln.v1.attention.kv_cache_bindings import KVCacheViewInfo
 
 
@@ -72,18 +72,28 @@ def grouped_qkv_rows(heads_k: int, ratio: int, head_dim: int) -> torch.Tensor:
     return (heads * head_dim + torch.arange(head_dim)).reshape(-1)
 
 
-@dataclass
-class RBLNGDNAttentionMetadata:
-    is_prefill: bool
+@dataclass(kw_only=True)
+class RBLNGDNAttentionMetadata(GDNAttentionMetadata):
+    """Upstream's GDN metadata as one RBLN step fills it, and the operands the
+    RBLN kernels take beside it.
+
+    A step is one prefill request (`num_prefills` 1) or a decode batch
+    (`num_decodes` requests), never both and never speculative, so the
+    `spec_*` fields stay unset, as do the ones upstream fills for its own
+    kernels (chunk indices, query start locs, the causal_conv1d pointers).
+    `non_spec_state_indices_tensor` (the state block each row loads) and
+    `has_initial_state` (1 where that block carries a state, prefill only) are
+    padded to the step's batch and kept [batch] int16 on the host: the
+    delta-rule kernels read them through the const buffer (a device copy
+    crashes the runtime). As upstream, a prefill step names them again as the
+    chunk kernel's `prefill_state_indices` and `prefill_has_initial_state`.
+    """
+
+    # The compiled step: [1, prefill chunk] or [padded batch, 1].
     batch_size: int
     seq_len: int
-    # [batch] int16 on the host: the state block each row loads, the one it
-    # stores, and 1 where the loaded block carries a state. The delta-rule
-    # kernels read them through the const buffer (a device copy crashes the
-    # runtime).
-    ssm_state_index: torch.Tensor
-    ssm_store_index: torch.Tensor
-    ssm_has_initial_state: torch.Tensor
+    # [batch] int16 on the host: the state block each row stores.
+    store_state_indices: torch.Tensor
     # [batch] int32 on the device: what kda_conv reads a row's ring by (its
     # block, the step's first position, its valid tokens, 1 where the ring
     # carries a state) and the block it stores the ring to.
@@ -97,6 +107,11 @@ class RBLNGDNAttentionMetadata:
     # Attached by the runner (attach_kv_cache_bindings), as on the flash metadata.
     kv_caches: list[torch.Tensor] | None = None
     kv_cache_view_infos: list[KVCacheViewInfo] | None = None
+
+    @property
+    def is_prefill(self) -> bool:
+        """The step kind the dispatcher keys its graph on, as the flash metadata's."""
+        return self.num_prefills > 0
 
 
 @register_backend(MambaAttentionBackendEnum.GDN_ATTN, is_mamba=True)
@@ -114,29 +129,9 @@ class RBLNGDNAttentionBackend(AttentionBackend):
         return True
 
 
-class RBLNGDNAttentionMetadataBuilder(
-    AttentionMetadataBuilder[RBLNGDNAttentionMetadata]
-):
-    def __init__(
-        self,
-        kv_cache_spec: KVCacheSpec,
-        layer_names: list[str],
-        vllm_config: VllmConfig,
-        device: torch.device,
-    ):
-        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-        self.prefill_chunk_size = vllm_config.scheduler_config.max_num_batched_tokens
-        self._staged: dict[tuple, torch.Tensor] = {}
-
-    def _stage(self, t: torch.Tensor, slot: str) -> torch.Tensor:
-        """Copy a host tensor into this builder's persistent device buffer, keyed
-        by name so same-shaped tensors never share one (see the flash builder)."""
-        key = (slot, t.shape, t.dtype)
-        if (buf := self._staged.get(key)) is None:
-            buf = torch.empty(t.shape, dtype=t.dtype, device=self.device)
-            self._staged[key] = buf
-        buf.copy_(t)
-        return buf
+class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
+    """The flash builder for its step shape and staged device buffers; the
+    metadata it builds is the GDN kernels'."""
 
     def build(  # type: ignore[override]
         self,
@@ -150,49 +145,66 @@ class RBLNGDNAttentionMetadataBuilder(
         num_accepted: torch.Tensor | None = None,
         state_load_pos: torch.Tensor | None = None,
     ) -> RBLNGDNAttentionMetadata:
-        """The flash builder's signature, so the runner calls every builder the
-        same way; the draft rows are refused with speculative decoding."""
+        """The draft rows are refused with speculative decoding."""
         assert num_accepted is None and state_load_pos is None, (
             "speculative decoding is refused for GatedDeltaNet models"
         )
-        num_reqs = common_attn_metadata.num_reqs
-        query_start_loc = common_attn_metadata.query_start_loc[: num_reqs + 1]
+        m = common_attn_metadata
+        num_reqs = m.num_reqs
+        query_start_loc = m.query_start_loc[: num_reqs + 1]
         query_lens = query_start_loc[1:] - query_start_loc[:-1]
-        seq_lens = common_attn_metadata.seq_lens[:num_reqs]
-        num_computed = seq_lens - query_lens
+        context_lens_tensor = m.seq_lens[:num_reqs] - query_lens
         first_positions = positions[query_start_loc[:num_reqs]]
 
         if is_prefill:
             assert num_reqs == 1, "RBLN prefills one request per step"
-            batch, seq_len = 1, self.prefill_chunk_size
+            batch, seq_len = 1, self.chunked_prefill_size
+            num_prefills, num_prefill_tokens, num_decodes = 1, int(query_lens[0]), 0
         else:
             batch, seq_len = batch_pad, 1
             assert int(query_lens.max()) == 1, (
                 "a decode step takes one token per request"
             )
+            num_prefills, num_prefill_tokens, num_decodes = 0, 0, num_reqs
 
         def padded(values: torch.Tensor) -> torch.Tensor:
-            out = torch.zeros(batch, dtype=torch.int32)
-            out[:num_reqs] = values.to(torch.int32)
-            return out
+            return rbln_utils.pad(values.to(torch.int32), 0, batch)
 
         # TODO(prefix caching): one column while mamba_block_size is the model
         # length, so a row stores to the block it loads; a step crossing into a
         # new block stores to the block of its last scheduled token instead.
-        blocks = padded(common_attn_metadata.block_table_tensor[:num_reqs, 0])
+        block_table_tensor = mamba_get_block_table_tensor(
+            m.block_table_tensor,
+            m.seq_lens,
+            self.kv_cache_spec,
+            self.vllm_config.cache_config.mamba_cache_mode,
+        )
+        blocks = padded(block_table_tensor[:num_reqs, 0])
+        non_spec_state_indices_tensor = blocks.to(torch.int16)
 
         valid_mask = None
         if is_prefill:
             valid_mask = (torch.arange(seq_len) < query_lens[0]).to(torch.float32)
             valid_mask = valid_mask.view(1, 1, seq_len)
-        has_initial_state = padded(num_computed > 0)
+        has_initial_state = padded(context_lens_tensor > 0)
+        prefill_has_initial_state = (
+            has_initial_state.to(torch.int16) if is_prefill else None
+        )
         return RBLNGDNAttentionMetadata(
-            is_prefill=is_prefill,
+            num_prefills=num_prefills,
+            num_prefill_tokens=num_prefill_tokens,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decodes,
+            num_spec_decodes=0,
+            num_spec_decode_tokens=0,
+            num_actual_tokens=m.num_actual_tokens,
+            has_initial_state=prefill_has_initial_state,
+            non_spec_state_indices_tensor=non_spec_state_indices_tensor,
+            prefill_state_indices=non_spec_state_indices_tensor if is_prefill else None,
+            prefill_has_initial_state=prefill_has_initial_state,
             batch_size=batch,
             seq_len=seq_len,
-            ssm_state_index=blocks.to(torch.int16),
-            ssm_store_index=blocks.to(torch.int16),
-            ssm_has_initial_state=has_initial_state.to(torch.int16),
+            store_state_indices=blocks.to(torch.int16),
             conv_state_index=self._stage(blocks, "conv_state_index"),
             conv_seq_idx=self._stage(padded(first_positions), "conv_seq_idx"),
             conv_query_len=self._stage(padded(query_lens), "conv_query_len"),
