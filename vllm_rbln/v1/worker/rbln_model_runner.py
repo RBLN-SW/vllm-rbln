@@ -332,6 +332,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         # async scheduling is the runner's concern; the copy into them is
         # enqueued by the sampler, next to the launch that produces the source.
         self._prev_token_host_buffer: torch.Tensor | None = None
+        # Last step's sampled tokens, as (device, host copy, copy event).
+        self._prev_sampled_host: (
+            tuple[torch.Tensor, torch.Tensor, torch.Event | None] | None
+        ) = None
         self._sampled_token_ring: list[torch.Tensor] = []
         self._ring_slot = 0
         self._async_logprobs_tensors: LogprobsTensors | None = None
@@ -1741,8 +1745,18 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             if not req_output_token_ids or req_output_token_ids[-1] != -1:
                 continue
             if sampled is None:
-                sampled = prev_sampled[:, 0].tolist()
+                sampled = self._prev_sampled_tokens(prev_sampled)
             req_output_token_ids[-1] = sampled[prev_row]
+
+    def _prev_sampled_tokens(self, prev_sampled: torch.Tensor) -> list[int]:
+        # Read the async output's D2H, which queues ahead of this step's forward.
+        # prev_sampled.tolist() would wait for that forward to finish.
+        host = self._prev_sampled_host
+        if host is not None and host[0] is prev_sampled:
+            if host[2] is not None:
+                host[2].synchronize()
+            return host[1][:, 0].tolist()
+        return prev_sampled[:, 0].tolist()
 
     def _bookkeeping_sync(
         self,
@@ -2338,6 +2352,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             fail_fast=self.fail_fast,
             rank=self.parallel_config.rank,
             dp_rank=self.parallel_config.data_parallel_rank,
+        )
+        self._prev_sampled_host = (
+            sampler_output.sampled_token_ids,
+            async_output._sampled_token_ids_cpu,
+            async_output._copy_ready_event,
         )
         return async_output
 
