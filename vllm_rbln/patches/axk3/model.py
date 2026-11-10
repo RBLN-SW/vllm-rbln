@@ -24,6 +24,7 @@ weights do not match.
 """
 
 import contextlib
+import os
 from itertools import islice
 from typing import Any
 
@@ -140,6 +141,23 @@ class AXK3GatedResidual(nn.Module):
         return (self._streams(residual) + scaled).view_as(residual)
 
 
+# AXK3_GR_SHARD=1: prefill (T > 1) runs the Gated Residual as the
+# rbln_custom_ops::axk3_gr_* ops, which the compiler cuts by tokens so the
+# residual stays split over the chiplets.
+_GR_SHARD = os.environ.get("AXK3_GR_SHARD", "0") == "1"
+
+
+def _gr_write_args(gr: AXK3GatedResidual) -> tuple:
+    """The read parameters the write side needs: norm scale and write gate."""
+    return gr.gamma, gr.write_proj.weight, gr.write_bias, gr.norm.variance_epsilon
+
+
+def _gr_read(u: torch.Tensor, gr: AXK3GatedResidual) -> torch.Tensor:
+    return torch.ops.rbln_custom_ops.axk3_gr_read(
+        u, gr.read_down.weight, gr.read_up.weight
+    )
+
+
 @contextlib.contextmanager
 def _without_indexer():
     """Build a K2 attention layer with no indexer of its own.
@@ -252,6 +270,8 @@ class AXK3DecoderLayer(_AXK2DecoderLayer):
         hidden_states: torch.Tensor,
         topk_by_layer: dict[int, torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if _GR_SHARD and hidden_states.shape[-2] > 1:
+            return self._forward_gr_shard(positions, hidden_states, topk_by_layer)
         residual = hidden_states
         x, write_gate = self.attn_gated_residual.read(hidden_states)
         x, topk_indices = _gated_mla_forward(
@@ -268,6 +288,36 @@ class AXK3DecoderLayer(_AXK2DecoderLayer):
         hidden_states = self.mlp_gated_residual.write(residual, x, write_gate)
         # A nested compile region must not write topk_by_layer; the caller does.
         return hidden_states, None if self.skip_topk else topk_indices
+
+    def _forward_gr_shard(
+        self,
+        positions: torch.Tensor,
+        residual: torch.Tensor,
+        topk_by_layer: dict[int, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Prefill layer on the token-cut axk3_gr_* ops.
+
+        Takes the residual [B, n, T, h] and returns it with both block outputs
+        written in. Every layer, the first one too, starts with the norm of its
+        own attention read and ends with the update of the MLP output, so the
+        layers have one form for the layer loop, each holds only its own
+        parameters, the MoE partial sums meet their update inside the layer, and
+        only the token-cut residual crosses the layer boundary.
+        """
+        ops = torch.ops.rbln_custom_ops
+        gr = self.attn_gated_residual
+        u, gate = ops.axk3_gr_norm(residual, *_gr_write_args(gr))
+        x, topk_indices = _gated_mla_forward(
+            self.self_attn.mla_attn,
+            positions,
+            _gr_read(u, gr),
+            topk_by_layer[self.index_source_layer] if self.skip_topk else None,
+        )
+        gr = self.mlp_gated_residual
+        residual, u, gate = ops.axk3_gr_write(residual, x, gate, *_gr_write_args(gr))
+        y = self.mlp(_gr_read(u, gr))
+        residual = ops.axk3_gr_update(residual, y, gate)
+        return residual, None if self.skip_topk else topk_indices
 
 
 @support_torch_compile
@@ -339,6 +389,8 @@ class AXK3Model(nn.Module):
     ) -> torch.Tensor:
         if inputs_embeds is None:
             inputs_embeds = self.embed_input_ids(input_ids)
+        if _GR_SHARD and inputs_embeds.shape[-2] > 1:
+            return self._forward_gr_shard(positions, inputs_embeds)
         # Every stream starts as the embedding.
         hidden_states = torch.cat([inputs_embeds] * self.num_streams, dim=-1)
 
@@ -352,6 +404,25 @@ class AXK3Model(nn.Module):
 
         hidden_states, _ = self.final_gated_residual.read(hidden_states)
         return hidden_states
+
+    def _forward_gr_shard(
+        self, positions: torch.Tensor, embeds: torch.Tensor
+    ) -> torch.Tensor:
+        """Prefill with the Gated Residual as the token-cut axk3_gr_* ops."""
+        topk_by_layer: dict[int, torch.Tensor] = {}
+        # Every stream starts as the embedding. A weightless op, so the first
+        # layer's parameters stay inside the first layer and it keeps the form
+        # of the others for the layer loop.
+        residual = torch.ops.rbln_custom_ops.axk3_gr_streams(embeds)
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
+            residual, topk_indices = layer(positions, residual, topk_by_layer)
+            if topk_indices is not None:
+                topk_by_layer[layer.layer_idx] = topk_indices
+        gr = self.final_gated_residual
+        u = torch.ops.rbln_custom_ops.axk3_gr_norm_last(
+            residual, gr.gamma, gr.norm.variance_epsilon
+        )
+        return _gr_read(u, gr)
 
 
 _NO_EAGLE3 = (
