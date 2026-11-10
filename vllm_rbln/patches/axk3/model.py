@@ -141,10 +141,23 @@ class AXK3GatedResidual(nn.Module):
         return (self._streams(residual) + scaled).view_as(residual)
 
 
-# AXK3_GR_SHARD=1: prefill (T > 1) runs the Gated Residual as the
+# AXK3_GR_SHARD=1: a prefill chunk runs the Gated Residual as the
 # rbln_custom_ops::axk3_gr_* ops, which the compiler cuts by tokens so the
 # residual stays split over the chiplets.
 _GR_SHARD = os.environ.get("AXK3_GR_SHARD", "0") == "1"
+
+
+# The token cut splits T over the 4 CR13 chiplets, so it pays for a prefill chunk
+# only. A few tokens (a spec decode verify) keep the plain ops, as decode does;
+# cutting them by B instead is left to the spec decode work.
+_GR_SHARD_MIN_TOKENS = 256
+_GR_SHARD_NODES = 4
+
+
+def _use_gr_shard(tokens: int) -> bool:
+    return (
+        _GR_SHARD and tokens >= _GR_SHARD_MIN_TOKENS and tokens % _GR_SHARD_NODES == 0
+    )
 
 
 def _gr_norm_args(gr: AXK3GatedResidual) -> tuple:
@@ -270,7 +283,7 @@ class AXK3DecoderLayer(_AXK2DecoderLayer):
         hidden_states: torch.Tensor,
         topk_by_layer: dict[int, torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        if _GR_SHARD and hidden_states.shape[-2] > 1:
+        if _use_gr_shard(hidden_states.shape[-2]):
             return self._forward_gr_shard(positions, hidden_states, topk_by_layer)
         residual = hidden_states
         x, write_gate = self.attn_gated_residual.read(hidden_states)
@@ -390,7 +403,7 @@ class AXK3Model(nn.Module):
     ) -> torch.Tensor:
         if inputs_embeds is None:
             inputs_embeds = self.embed_input_ids(input_ids)
-        if _GR_SHARD and inputs_embeds.shape[-2] > 1:
+        if _use_gr_shard(inputs_embeds.shape[-2]):
             return self._forward_gr_shard(positions, inputs_embeds)
         # Every stream starts as the embedding.
         hidden_states = torch.cat([inputs_embeds] * self.num_streams, dim=-1)
