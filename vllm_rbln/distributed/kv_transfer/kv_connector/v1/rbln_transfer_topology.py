@@ -1,11 +1,11 @@
 # Copyright 2026 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -19,6 +19,8 @@ It lives beside the connector rather than inside it so that the patch module
 that substitutes it upstream can import it without pulling the whole connector
 package in at plugin load.
 """
+
+from dataclasses import dataclass
 
 import torch
 from vllm.distributed.kv_transfer.kv_connector.utils import (
@@ -37,6 +39,20 @@ from vllm.v1.kv_cache_interface import (
 def is_latent(layer_spec: KVCacheSpec) -> bool:
     """Whether a layer's cache is one key-only latent rather than K and V."""
     return isinstance(layer_spec, (MLAAttentionSpec, SlidingWindowMLASpec))
+
+
+@dataclass(frozen=True)
+class RblnBlockTransferSpec(KVCacheSpec):
+    """A blocks-first payload transferred whole, without token/head slicing.
+
+    Used only by the connector; the scheduler keeps the original state spec.
+    """
+
+    page_bytes: int
+
+    @property
+    def page_size_bytes(self) -> int:
+        return self.page_bytes
 
 
 class RblnTransferTopology(TransferTopology):
@@ -77,9 +93,12 @@ class RblnTransferTopology(TransferTopology):
         # for a distinctive count to land on.
         mock_blocks, mock_tokens = 1234567, 7907
         mock_heads = 1 if self.is_mla else 7919
+        # A compressing cache (GLM-5.3's indexer, first on a later PP stage)
+        # holds block_size // ratio rows, so ask for a multiple of the ratio.
+        ratio = getattr(backend, "compress_ratio", 1)
         shape = backend.get_kv_cache_shape(
             num_blocks=mock_blocks,
-            block_size=mock_tokens,
+            block_size=mock_tokens * ratio,
             num_kv_heads=mock_heads,
             head_size=1,
         )
@@ -153,6 +172,8 @@ class RblnTransferTopology(TransferTopology):
     def get_transfer_cache_regions(
         self, cache: torch.Tensor, layer_spec: KVCacheSpec
     ) -> list[torch.Tensor] | torch.Tensor:
+        if isinstance(layer_spec, RblnBlockTransferSpec):
+            return [cache]
         if (
             self.is_mla
             or self.is_mamba

@@ -27,7 +27,9 @@ import os
 import re
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
+from vllm.config import KVTransferConfig
 
 from tests.vllm.vllm_config import make_vllm_config
 from vllm_rbln.v1.worker import mega_cache, rbln_model_runner
@@ -58,6 +60,8 @@ def _stub_config(digest: str = "cfghash"):
         ),
         model_config=SimpleNamespace(max_model_len=32),
         kv_transfer_config=None,
+        ec_transfer_config=None,
+        is_mm_encoder_only=False,
     )
 
 
@@ -112,6 +116,36 @@ class TestSignatureComposition:
         enabled = False
         static = mega_cache.config_signature(_stub_config())
         assert dynamic != static
+
+    def test_each_ec_role_keys_its_own_bundle(self, monkeypatch):
+        # Given the same flags, a producer builds only the encoder, a consumer
+        # only the language model, and ec_both both. Dynamic KV off is when
+        # nothing else splits their keys.
+        monkeypatch.setattr(mega_cache, "dynamic_kv_enabled", lambda config: False)
+
+        def signature(ec_role):
+            config = _stub_config()
+            config.ec_transfer_config = SimpleNamespace(ec_role=ec_role)
+            return mega_cache.config_signature(config)
+
+        roles = ("ec_producer", "ec_consumer", "ec_both")
+        assert len({signature(role) for role in roles}) == len(roles)
+
+    def test_extra_graph_factors_invalidate(self):
+        config = _stub_config()
+        base = mega_cache.config_signature(config)
+        assert mega_cache.config_signature(config, extra_hash_factors={}) == base
+        factors = {"extra_graph_shapes": [8, 16], "extra_graph_version": 1}
+        first = mega_cache.config_signature(config, extra_hash_factors=factors)
+        assert first != base
+        assert (
+            mega_cache.config_signature(
+                config, extra_hash_factors=dict(reversed(factors.items()))
+            )
+            == first
+        )
+        factors["extra_graph_shapes"] = [8, 32]
+        assert mega_cache.config_signature(config, extra_hash_factors=factors) != first
 
 
 # Variables the built graph depends on and RBLNConfig does not carry, so this
@@ -250,6 +284,50 @@ class TestSignatureVllmConfig:
         base = mega_cache.config_signature(make_vllm_config())
         assert mega_cache.config_signature(make_vllm_config(**overrides)) != base
 
+    @pytest.mark.parametrize(
+        ("before", "after"),
+        [
+            (None, {"mm_encoder_patch_buckets": [2304]}),
+            (
+                {"mm_encoder_patch_buckets": [2304]},
+                {"mm_encoder_patch_buckets": [1024, 2304]},
+            ),
+            (
+                {"mm_encoder_patch_buckets": [2304]},
+                {"mm_encoder_patch_buckets": [2304, 12288]},
+            ),
+        ],
+        ids=["text-to-mm", "image-bucket-added", "video-enabled"],
+    )
+    def test_mm_encoder_buckets_invalidate(self, before, after):
+        config = make_vllm_config()
+        assert mega_cache.config_signature(
+            config, extra_hash_factors=after
+        ) != mega_cache.config_signature(config, extra_hash_factors=before)
+
+    @pytest.mark.parametrize(
+        "options",
+        [
+            {"limit_per_prompt": {"image": 2, "video": 1}},
+            {"limit_per_prompt": {}},
+            {"limit_per_prompt": {"image": 999, "video": 999}},
+            {"limit_per_prompt": {"image": {"count": 1, "width": 512, "height": 512}}},
+            {"mm_processor_kwargs": {"videos_kwargs": {"fps": np.int64(2)}}},
+        ],
+        ids=["count", "implicit-limit", "explicit-limit", "dummy-size", "numpy-fps"],
+    )
+    def test_mm_inputs_key_only_through_the_resolved_buckets(self, options):
+        from vllm.config import MultiModalConfig
+
+        factors = {"mm_encoder_patch_buckets": [2304, 12288]}
+        config = make_vllm_config()
+        config.model_config.multimodal_config = MultiModalConfig(
+            limit_per_prompt={"image": 1, "video": 1}
+        )
+        base = mega_cache.config_signature(config, extra_hash_factors=factors)
+        config.model_config.multimodal_config = MultiModalConfig(**options)
+        assert mega_cache.config_signature(config, extra_hash_factors=factors) == base
+
     def test_speculative_tokens_invalidate(self):
         # num_spec_tokens sets the decode query_len the warm-up compiles, and
         # SpeculativeConfig.compute_hash() keys only on the eagle3 factors.
@@ -274,6 +352,30 @@ class TestSignatureVllmConfig:
         cr03 = mega_cache.config_signature(make_vllm_config())
         monkeypatch.setenv("RBLN_FORCE_NPU_NAME", "RBLN-CR13")
         assert mega_cache.config_signature(make_vllm_config()) != cr03
+
+    @staticmethod
+    def _role_config(role):
+        return make_vllm_config(
+            kv_transfer_config=KVTransferConfig(
+                kv_connector="RblnNixlConnector", kv_role=role
+            )
+        )
+
+    @pytest.mark.parametrize("kv_role", ["kv_both", "kv_consumer"])
+    def test_the_producer_role_invalidates(self, kv_role):
+        # A producer compiles no decode graph, so its bundle is a strict subset
+        # of the others'. KVTransferConfig.compute_hash() has no factors, so
+        # without this the two share a signature and the decoding side reads a
+        # bundle with its decode graphs missing as warm.
+        producer = mega_cache.config_signature(self._role_config("kv_producer"))
+        assert mega_cache.config_signature(self._role_config(kv_role)) != producer
+
+    def test_the_roles_that_decode_share_one_bundle(self):
+        # kv_both and kv_consumer compile the same graphs, so splitting them
+        # would only buy a cold compile.
+        assert mega_cache.config_signature(
+            self._role_config("kv_both")
+        ) == mega_cache.config_signature(self._role_config("kv_consumer"))
 
     def test_every_factor_is_a_real_field(self):
         # A getattr default would drop an axis from the key on an upstream rename.

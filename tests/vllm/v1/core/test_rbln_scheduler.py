@@ -20,7 +20,10 @@ import inspect
 from types import SimpleNamespace
 
 import pytest
+from vllm.config.ec_manager_config import EncoderCacheManagerConfig
 from vllm.distributed.kv_events import BlockStored, KVEventBatch
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.metrics.stats import PrefixCacheStats
@@ -29,21 +32,73 @@ from vllm.v1.request import RequestStatus
 
 from tests.vllm.v1.core.utils import (
     EOS_TOKEN_ID,
+    ECConnectorInTransit,
     MockKVConfig,
     _drain,
     advance_to_decode,
     create_rbln_scheduler,
     create_requests,
+    image_at,
     make_model_runner_output,
     make_request,
     prefill_request,
 )
+from vllm_rbln.v1.core import rbln_scheduler
 from vllm_rbln.v1.core.rbln_kv_cache_manager import RBLNKVCacheManager
-from vllm_rbln.v1.core.rbln_scheduler import RBLNScheduler, RBLNSchedulerOutput
+from vllm_rbln.v1.core.rbln_scheduler import (
+    RBLNEncoderCacheManager,
+    RBLNScheduler,
+    RBLNSchedulerOutput,
+)
 from vllm_rbln.v1.core.utils import is_prefill, step_is_prefill
 
 
+@pytest.mark.parametrize("interrupt_scheduling", [False, True])
+def test_eviction_snapshot_defers_hits_only_within_its_scope(interrupt_scheduling):
+    request = make_request("cached", list(range(8)), 16, mm_features=[image_at(0, 2)])
+    replacement = make_request(
+        "replacement", list(range(8)), 16, mm_features=[image_at(2, 2)]
+    )
+    manager = RBLNEncoderCacheManager(cache_size=2)
+    manager.allocate(request, 0)
+    manager.free(request)
+
+    try:
+        with manager.eviction_snapshot(request):
+            assert manager.can_allocate(replacement, 0, 16, 0)
+            manager.allocate(replacement, 0)
+            manager.free(replacement)
+            assert not manager.can_allocate(request, 0, 16, 0)
+            if interrupt_scheduling:
+                raise RuntimeError("scheduling interrupted")
+    except RuntimeError as error:
+        assert interrupt_scheduling
+        assert str(error) == "scheduling interrupted"
+
+    assert manager.can_allocate(request, 0, 16, 0)
+
+
 class TestSchedulerInit:
+    def test_no_ec_connector_keeps_the_default_encoder_cache_manager(self):
+        sched = create_rbln_scheduler()
+        assert type(sched.encoder_cache_manager) is EncoderCacheManager
+
+    def test_explicit_encoder_cache_manager_is_preserved(self):
+        config = EncoderCacheManagerConfig(
+            encoder_cache_manager_cls=(
+                "vllm.v1.core.encoder_cache_manager.EncoderCacheManager"
+            )
+        )
+        sched = create_rbln_scheduler(ec_manager_config=config)
+        assert type(sched.encoder_cache_manager) is EncoderCacheManager
+
+    def test_null_block_off_null_block_id_is_refused(self, monkeypatch):
+        # The sparse-attention ops write to NULL_BLOCK_ID; a pool that reserves
+        # another block must stop the scheduler from starting.
+        monkeypatch.setattr(rbln_scheduler, "NULL_BLOCK_ID", NULL_BLOCK_ID + 1)
+        with pytest.raises(RuntimeError, match="null block"):
+            create_rbln_scheduler()
+
     @pytest.mark.usefixtures("cr13")
     def test_sub_block_caching_enabled_uses_rbln_manager(self):
         # prefix caching + eligible config + sub_block_size -> RBLNKVCacheManager.
@@ -67,6 +122,17 @@ class TestSchedulerInit:
         )
         assert isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
         assert sched.kv_cache_manager.sub_block_size == 128
+
+    def test_sub_block_size_defaults_to_the_prefill_chunk_below_the_budget(self):
+        sched = create_rbln_scheduler(
+            enable_prefix_caching=True,
+            block_size=1024,
+            max_num_batched_tokens=128,
+            max_model_len=2048,
+            additional_config={"prefill_chunk_size": 64},
+        )
+        assert isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
+        assert sched.kv_cache_manager.sub_block_size == 64
 
     @pytest.mark.usefixtures("cr13")
     def test_additional_config_sets_the_sub_block_size(self):
@@ -456,9 +522,28 @@ class TestIsPrefill:
         # num_computed < num_tokens - 1 is prefill; the last-token point is not.
         req = create_requests(1, num_tokens=10)[0]
         req.num_computed_tokens = 5
-        assert is_prefill(req)
+        assert is_prefill(req, strict_kv_producer=False)
         req.num_computed_tokens = req.num_tokens - 1
-        assert not is_prefill(req)
+        assert not is_prefill(req, strict_kv_producer=False)
+
+    def test_is_prefill_boundary_on_a_strict_producer(self):
+        # A producer has no decode graph, so the last-token point is a prefill
+        # too; only a fully computed request is left on the decode side.
+        req = create_requests(1, num_tokens=10)[0]
+        req.num_computed_tokens = req.num_tokens - 1
+        assert is_prefill(req, strict_kv_producer=True)
+        req.num_computed_tokens = req.num_tokens
+        assert not is_prefill(req, strict_kv_producer=True)
+
+    def test_a_one_token_prompt_runs_alone_as_a_prefill(self):
+        sched = create_rbln_scheduler(max_num_seqs=4, block_size=16, num_blocks=10000)
+        advance_to_decode(sched, make_request("long", list(range(10)), 16))
+        sched.add_request(make_request("one", [5], 16))
+
+        out = sched.schedule()
+
+        assert list(out.num_scheduled_tokens) == ["one"]
+        assert step_is_prefill(out, strict_kv_producer=False)
 
 
 class TestScheduleBasic:
@@ -777,6 +862,24 @@ class TestSchedulePrefillAllocation:
         assert req_a.request_id not in out.num_scheduled_tokens
         assert out.num_scheduled_tokens[req_b.request_id] == max_num_batched_tokens
 
+    def test_prefill_chunks_are_capped_at_the_prefill_chunk_size(self):
+        # The step budget stays 128; the prefill graph is compiled at 64.
+        sched = create_rbln_scheduler(
+            max_num_batched_tokens=128,
+            max_model_len=256,
+            block_size=128,
+            num_blocks=10000,
+            additional_config={"prefill_chunk_size": 64},
+        )
+        req = create_requests(1, num_tokens=200, block_size=128)[0]
+        sched.add_request(req)
+        chunks = []
+        while req.num_computed_tokens < 200:
+            out = sched.schedule()
+            chunks.append(out.num_scheduled_tokens[req.request_id])
+            sched.update_from_output(out, make_model_runner_output(out))
+        assert chunks == [64, 64, 64, 8]
+
     def test_partial_block_is_cached_once_decode_fills_it(self):
         # A prompt that stops mid-block leaves it uncached until decode supplies
         # the missing token.
@@ -1015,7 +1118,7 @@ class TestAsyncMaxTokensSkip:
     """
 
     @staticmethod
-    def _drain_async(sched, token=7, max_steps=50):
+    def _drain_async(sched, token=7, max_steps=50, per_step=None):
         """One output in flight, the way the engine's batch queue drives async:
         schedule() runs a step ahead of the update_from_output() for the step
         before it. That lag is what leaves num_output_placeholders above zero,
@@ -1027,6 +1130,8 @@ class TestAsyncMaxTokensSkip:
             scheduled = bool(out.num_scheduled_tokens)
             if scheduled:
                 steps += 1
+                if per_step is not None:
+                    per_step(out)
             if pending is not None:
                 sched.update_from_output(*pending)
             pending = (out, make_model_runner_output(out, token)) if scheduled else None
@@ -1194,7 +1299,7 @@ class TestPortDriftConformance:
 # check the invariants hold at every step.
 
 
-def _check_phase_agrees(sched, out) -> bool:
+def _check_phase_agrees(sched, out, *, strict_kv_producer: bool = False) -> bool:
     """The scheduler's phase for a step against the phase the runner derives from
     it, and that the step carries only one of the two. Returns the phase.
 
@@ -1209,11 +1314,14 @@ def _check_phase_agrees(sched, out) -> bool:
                 SimpleNamespace(
                     num_computed_tokens=req.num_computed_tokens - chunk,
                     num_tokens=req.num_tokens,
-                )
+                ),
+                strict_kv_producer=strict_kv_producer,
             )
         )
     assert len(phases) <= 1, "a step mixed prefill and decode"
-    assert step_is_prefill(out) is (phases == {True}), (
+    assert step_is_prefill(out, strict_kv_producer=strict_kv_producer) is (
+        phases == {True}
+    ), (
         f"phase {phases} but chunks {out.num_scheduled_tokens} "
         f"(spec {out.scheduled_spec_decode_tokens})"
     )
@@ -1239,11 +1347,46 @@ class TestFullRunInvariants:
         assert all(r.is_finished() for r in reqs)
         assert sched.running == []
 
+    @pytest.mark.parametrize("async_scheduling", [False, True])
+    # The input processor refuses max_tokens=4 on a producer; it stays here as
+    # the scheduler's invariant for a request that gets past that check.
+    @pytest.mark.parametrize("max_tokens", [1, 4])
+    # 17 against a 16-token step chunks the prompt and leaves a one-token tail.
+    @pytest.mark.parametrize("num_tokens", [10, 17])
+    def test_a_producer_reads_prefill_at_every_step_of_a_full_drain(
+        self, async_scheduling, max_tokens, num_tokens
+    ):
+        # The scheduler's and the runner's phase views agree, one request per
+        # step, across a whole run. Async schedules each step with the last
+        # one's output still in flight.
+        sched = create_rbln_scheduler(
+            async_scheduling=async_scheduling,
+            max_num_seqs=4,
+            block_size=16,
+            num_blocks=10000,
+            max_num_batched_tokens=16,
+            max_model_len=64,
+            use_kv_connector=MockKVConfig(matched_tokens=0, kv_role="kv_producer"),
+        )
+        reqs = create_requests(6, num_tokens=num_tokens, max_tokens=max_tokens)
+        for r in reqs:
+            sched.add_request(r)
+
+        def check(out):
+            assert _check_phase_agrees(sched, out, strict_kv_producer=True)
+            assert len(list(out.num_scheduled_tokens)) == 1
+
+        if async_scheduling:
+            TestAsyncMaxTokensSkip._drain_async(sched, per_step=check)
+        else:
+            _drain(sched, per_step=check)
+        assert all(r.is_finished() for r in reqs)
+
     @pytest.mark.parametrize(
         ("num_tokens", "max_num_batched_tokens"),
         [
             (10, 16),  # prompt in one chunk
-            (1, 16),  # single-token prompt: no prefill step at all
+            (1, 16),  # single-token prompt: a one-token prefill step
             (33, 16),  # chunked, tail chunk of 1 token
             (32, 16),  # chunked, block-aligned
         ],
@@ -1579,12 +1722,12 @@ class TestNoSpecDuringPrefill:
         )[0]
         sched.add_request(req)
         out = sched.schedule()  # first prefill chunk
-        assert is_prefill(req)
+        assert is_prefill(req, strict_kv_producer=False)
         sched.update_from_output(out, make_model_runner_output(out, 0))
 
         req.spec_token_ids = [1] * 4  # spec present, but still prefilling
         out2 = sched.schedule()
-        assert is_prefill(req)
+        assert is_prefill(req, strict_kv_producer=False)
         assert out2.num_scheduled_tokens[req.request_id] == 32  # a full prefill chunk
         assert req.request_id not in out2.scheduled_spec_decode_tokens
 
@@ -1683,7 +1826,9 @@ class TestDecodeCapMachinery:
         )
         for r in reqs:
             advance_to_decode(sched, r)
-        running_decodes = sum(1 for r in sched.running if not is_prefill(r))
+        running_decodes = sum(
+            1 for r in sched.running if not is_prefill(r, strict_kv_producer=False)
+        )
         out = sched.schedule()
         # At most ceil(active / pp) decodes admitted this step, and at least one.
         assert 1 <= len(out.num_scheduled_tokens) <= math.ceil(running_decodes / 2)
@@ -1923,3 +2068,72 @@ class TestSyncKVLoads:
         # Only the 16 tokens past the hit are computed this step.
         assert output.num_scheduled_tokens[request.request_id] == 16
         assert output.has_sync_kv_loads
+
+
+class TestEcTransferPending:
+    """A request whose encoder outputs are still in transit is held back,
+    waiting or running, and scheduled once they arrive."""
+
+    @staticmethod
+    def _scheduler():
+        sched = create_rbln_scheduler(
+            max_num_seqs=4, max_num_batched_tokens=8, max_model_len=64
+        )
+        sched.ec_connector = ECConnectorInTransit()
+        return sched
+
+    @staticmethod
+    def _request():
+        # The image sits past the first two chunks, so no chunk here encodes it.
+        return make_request("0", list(range(24)), 16, mm_features=[image_at(20, 4)])
+
+    def test_a_waiting_request(self):
+        sched = self._scheduler()
+        sched.add_request(self._request())
+
+        assert sched.schedule().num_scheduled_tokens == {}
+        sched.ec_connector.arrived = True
+        assert sched.schedule().num_scheduled_tokens == {"0": 8}
+
+    def test_a_running_request(self):
+        sched = self._scheduler()
+        sched.ec_connector.arrived = True
+        sched.add_request(self._request())
+        out = sched.schedule()
+        sched.update_from_output(out, make_model_runner_output(out))
+
+        sched.ec_connector.arrived = False
+        assert sched.schedule().num_scheduled_tokens == {}
+        sched.ec_connector.arrived = True
+        assert sched.schedule().num_scheduled_tokens == {"0": 8}
+
+
+class TestEcConsumerEncodesNothing:
+    """An image the connector cannot supply would be encoded locally, which an EC
+    consumer has no vision encoder for."""
+
+    @staticmethod
+    def _schedule(*, is_producer):
+        sched = create_rbln_scheduler(
+            max_num_seqs=4, max_num_batched_tokens=8, max_model_len=64
+        )
+        sched.ec_connector = ECConnectorInTransit(is_producer=is_producer)
+        sched.ec_connector.arrived = True
+        sched.max_num_encoder_input_tokens = 16
+        sched.encoder_cache_manager = EncoderCacheManager(cache_size=16)
+        request = make_request("0", list(range(24)), 16, mm_features=[image_at(0, 4)])
+        sched.add_request(request)
+        return sched, request, sched.schedule()
+
+    def test_the_consumer_fails_the_request(self):
+        sched, request, out = self._schedule(is_producer=False)
+
+        assert out.num_scheduled_tokens == {}
+        sched.update_from_output(out, make_model_runner_output(out))
+        assert request.status == RequestStatus.FINISHED_ERROR
+
+    def test_ec_both_encodes_it(self):
+        _, request, out = self._schedule(is_producer=True)
+
+        assert out.scheduled_encoder_inputs == {"0": [0]}
+        assert request.status == RequestStatus.RUNNING

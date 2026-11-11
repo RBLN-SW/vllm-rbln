@@ -1,11 +1,11 @@
 # Copyright 2026 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -23,10 +23,12 @@ import errno
 import hashlib
 import os
 import re
+from collections.abc import Mapping
 
 import vllm.envs as envs
 
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.core.utils import is_strict_kv_producer
 from vllm_rbln.v1.worker.utils import dynamic_kv_enabled
 
 logger = init_logger(__name__)
@@ -76,11 +78,13 @@ def _npu_name() -> str:
         return "unknown"
 
 
-def _warmup_graph_set_factors(vllm_config) -> str:
+def _warmup_graph_set_factors(
+    vllm_config, extra_hash_factors: Mapping[str, object] | None = None
+) -> str:
     """Hash of the graph-shaping config that compute_hash() leaves out.
 
-    Decode buckets, KV cache input, decode query length, which drafter graphs
-    exist. Without them two runs share a bundle that only partly hits.
+    Includes caller-supplied factors for resolved graph sets. Without them
+    two runs can share a bundle that only partly hits.
     """
     from vllm.config.utils import hash_factors, normalize_value
 
@@ -89,6 +93,7 @@ def _warmup_graph_set_factors(vllm_config) -> str:
     spec = getattr(vllm_config, "speculative_config", None)
     # Not draft_parallel_config: it carries the same per-launch ports.
     draft = getattr(spec, "draft_model_config", None)
+    ec = vllm_config.ec_transfer_config
     factors: dict[str, object] = {
         "max_num_seqs": normalize_value(getattr(scheduler, "max_num_seqs", None)),
         "num_gpu_blocks_override": normalize_value(
@@ -106,7 +111,16 @@ def _warmup_graph_set_factors(vllm_config) -> str:
         "draft_tensor_parallel_size": normalize_value(
             getattr(spec, "draft_tensor_parallel_size", None)
         ),
+        # compute_hash() takes in the EC config but leaves its role out.
+        "ec_role": ec.ec_role if ec is not None else None,
+        # Not kv_role itself: only the strict producer builds a different set.
+        "prefill_only": is_strict_kv_producer(vllm_config),
     }
+
+    if extra_hash_factors:
+        factors.update(
+            {name: normalize_value(value) for name, value in extra_hash_factors.items()}
+        )
     return hash_factors(factors)
 
 
@@ -133,12 +147,14 @@ def _stable_compute_hash(vllm_config) -> str:
                 object.__setattr__(pc, name, value)
 
 
-def config_signature(vllm_config) -> str:
+def config_signature(
+    vllm_config, extra_hash_factors: Mapping[str, object] | None = None
+) -> str:
     """vLLM config hash + warm-up graph set + rbln compile env + NPU name +
     rebel major.minor; launch- and host-stable, shared by all TP/DP ranks (the
     rank subdir isolates shards)."""
     cfg = _stable_compute_hash(vllm_config)
-    graphs = _warmup_graph_set_factors(vllm_config)
+    graphs = _warmup_graph_set_factors(vllm_config, extra_hash_factors)
     env = _compile_env_factors()
     npu = _npu_name()
     rebel_ver = _rebel_major_minor()

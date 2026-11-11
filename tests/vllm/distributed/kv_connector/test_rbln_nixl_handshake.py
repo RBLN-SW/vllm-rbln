@@ -150,6 +150,8 @@ def _agent_meta(**overrides):
     overrides.setdefault(
         "kv_split_axes", [ChipletSplitAxis.HEAD] * len(overrides["kv_area_slices"])
     )
+    base_addrs = overrides.get("kv_caches_base_addr", [0x1000])
+    overrides.setdefault("region_group_ids", [0] * len(base_addrs))
     fields = dict(
         engine_id="eng",
         agent_metadata=b"agent",
@@ -787,14 +789,37 @@ class TestPpHandshakeFanout:
 
         assert sliced.kv_area_slices == [[1, 0], [0, 1]]
 
-    def test_trim_agent_meta_to_layers_rejects_a_non_contiguous_span(self):
+    def test_trim_agent_meta_to_layers_keeps_non_contiguous_regions_aligned(self):
         w = object.__new__(RblnNixlPullConnectorWorker)
         w._kv_per_block = 1
         w.local_seen_layer_names = ["layer.0", "layer.2"]
         w.num_regions = 2
-        meta = _agent_meta(kv_caches_base_addr=[0xA, 0xB, 0xC], block_lens=[1, 2, 3])
-        with pytest.raises(RuntimeError, match="non-contiguous"):
-            w._trim_agent_meta_to_layers(meta, [(0, 0), (2, 1)])
+        meta = _agent_meta(
+            kv_caches_base_addr=[0xA, 0xB, 0xC],
+            block_lens=[1, 2, 3],
+            block_strides=[4, 8, 12],
+            region_names=["layer.0", "layer.1", "layer.2"],
+            region_group_ids=[0, 0, 1],
+            region_num_blocks=[8, 9, 10],
+            region_mem_types=["VRAM"] * 3,
+            kv_split_axes=[
+                ChipletSplitAxis.HEAD,
+                ChipletSplitAxis.TOKEN,
+                ChipletSplitAxis.BLOCK,
+            ],
+        )
+
+        sliced = w._trim_agent_meta_to_layers(meta, [(0, 0), (2, 1)])
+
+        assert sliced.kv_caches_base_addr == [0xA, 0xC]
+        assert sliced.block_lens == [1, 3]
+        assert sliced.block_strides == [4, 12]
+        assert sliced.region_names == ["layer.0", "layer.2"]
+        assert sliced.region_group_ids == [0, 1]
+        assert sliced.region_num_blocks == [8, 10]
+        assert sliced.region_mem_types == ["VRAM", "VRAM"]
+        assert sliced.kv_split_axes == [ChipletSplitAxis.HEAD, ChipletSplitAxis.BLOCK]
+        assert sliced.kv_area_slices == [[0], [0]]
 
     def test_non_pp_producer_wider_than_our_band_is_narrowed(self):
         # The producer runs no pipeline parallelism, but ours is finer, so it
@@ -1458,6 +1483,7 @@ class TestShardLocalRegions:
         w._kv_per_block = 1
         w.local_seen_layer_names = list(local_names)
         w.num_regions = num_regions
+        w.region_group_ids = [0] * num_regions
         set_shape(w, chunk_mode=False)
         return w
 
@@ -1593,6 +1619,7 @@ class TestShardLocalRegions:
         per_block = split * fanout
         key = ("eng", 0)
         w._shard_region_group_ids = {key: (0,) * len(regions)}
+        w._shard_peer_region_group_ids = dict(w._shard_region_group_ids)
         w._shard_descs_per_block[key] = (per_block,) * len(regions)
         w._shard_chunk_grids[key] = uniform_grid(2, 2, regions=4)
 
@@ -1620,6 +1647,7 @@ class TestShardLocalRegions:
         w = self._wired_worker()
         key = ("eng", 0)
         w._shard_region_group_ids = {key: (0,) * 4}
+        w._shard_peer_region_group_ids = dict(w._shard_region_group_ids)
         w._shard_descs_per_block[key] = (1,) * 4
         w._shard_chunk_grids[key] = uniform_grid(2, 2, regions=4)
 
@@ -1632,6 +1660,7 @@ class TestShardLocalRegions:
         w = self._wired_worker()
         key = ("eng", 0)
         w._shard_region_group_ids = {key: (0,) * 4}
+        w._shard_peer_region_group_ids = dict(w._shard_region_group_ids)
         w._shard_descs_per_block[key] = (1,) * 4
         w._shard_chunk_grids[key] = None
 
@@ -1714,6 +1743,7 @@ class TestShardLocalRegions:
         w.kv_cache_config = MagicMock(transfer_groups=[object()])
         w.src_xfer_handles_by_remote = {}
         w._shard_region_group_ids = {}
+        w._shard_peer_region_group_ids = dict(w._shard_region_group_ids)
 
         with (
             patch.object(
@@ -1723,7 +1753,9 @@ class TestShardLocalRegions:
                 RblnNixlPullConnectorWorker, "register_local_xfer_handler"
             ) as own_handle,
         ):
-            w._register_shard_xfer_state("eng", 2, 16, ("l2", "l3"))
+            w._register_shard_xfer_state(
+                "eng", 2, 16, ("l2", "l3"), peer_region_group_ids=[0] * w.num_regions
+            )
 
         assert w._borrowed_src_handles == {("eng", 2, 16)}
         assert w.src_xfer_handles_by_remote[("eng", 2, 16)] == 7
@@ -1737,12 +1769,41 @@ class TestShardLocalRegions:
         w.kv_cache_config = MagicMock(transfer_groups=[object()])
         w.src_xfer_handles_by_remote = {}
         w._shard_region_group_ids = {}
+        w._shard_peer_region_group_ids = dict(w._shard_region_group_ids)
 
-        w._register_shard_xfer_state("eng", 2, 16, ("l2", "l3"))
+        w._register_shard_xfer_state(
+            "eng", 2, 16, ("l2", "l3"), peer_region_group_ids=[0] * w.num_regions
+        )
 
         assert w.src_xfer_handles_by_remote == {("eng", 2, 16): 42}
         # One group id per region of the shard: layers l2,l3 x rpl 2 = 4.
         assert w._shard_region_group_ids == {("eng", 2): (0, 0, 0, 0)}
+
+    def test_register_shard_xfer_state_records_the_peer_s_groups(self):
+        # A pipelined producer numbers its groups off its own stage, so the
+        # same regions sit in other groups there than here.
+        w = self._wired_worker()
+        w.kv_cache_config = MagicMock(transfer_groups=[object()])
+        w.src_xfer_handles_by_remote = {}
+        w._shard_region_group_ids = {}
+        w._shard_peer_region_group_ids = {}
+
+        w._register_shard_xfer_state(
+            "eng", 2, 16, ("l2", "l3"), peer_region_group_ids=[3, 3, 4, 4]
+        )
+
+        assert w._shard_region_group_ids == {("eng", 2): (0, 0, 0, 0)}
+        assert w._shard_peer_region_group_ids == {("eng", 2): (3, 3, 4, 4)}
+
+    def test_a_peer_that_publishes_no_groups_is_refused(self):
+        w = self._wired_worker()
+        w.kv_cache_config = MagicMock(transfer_groups=[object()])
+        w.src_xfer_handles_by_remote = {}
+        w._shard_region_group_ids = {}
+        w._shard_peer_region_group_ids = {}
+
+        with pytest.raises(RuntimeError, match="published no KV group"):
+            w._register_shard_xfer_state("eng", 2, 16, ("l2", "l3"))
 
     def test_register_shard_xfer_state_records_each_regions_pieces(self):
         # `_shard_descs_per_block` is what the read path multiplies a (region,
@@ -1754,6 +1815,7 @@ class TestShardLocalRegions:
         w.kv_cache_config = MagicMock(transfer_groups=[object()])
         w.src_xfer_handles_by_remote = {}
         w._shard_region_group_ids = {}
+        w._shard_peer_region_group_ids = dict(w._shard_region_group_ids)
         w._shard_descs_per_block = {}
 
         # Regions 4 and 5 in two pieces sent to three copies each, 6 and 7 whole.
@@ -1812,6 +1874,7 @@ class TestShardLocalRegions:
         w.kv_cache_config = MagicMock(transfer_groups=[object()])
         w.src_xfer_handles_by_remote = {}
         w._shard_region_group_ids = {}
+        w._shard_peer_region_group_ids = dict(w._shard_region_group_ids)
         w._shard_descs_per_block = {}
 
         w._register_shard_xfer_state(
@@ -1831,7 +1894,9 @@ class TestShardLocalRegions:
                 return_value=(42, []),
             ) as register,
         ):
-            w._register_shard_xfer_state("eng", 2, 16, ("l2", "l3"))
+            w._register_shard_xfer_state(
+                "eng", 2, 16, ("l2", "l3"), peer_region_group_ids=[0] * w.num_regions
+            )
 
         assert register.call_args.kwargs["chunk_grid"] == grid
 
@@ -1859,6 +1924,7 @@ class TestShardLocalRegions:
         w.kv_cache_config = MagicMock(transfer_groups=[object()])
         w.src_xfer_handles_by_remote = {}
         w._shard_region_group_ids = {}
+        w._shard_peer_region_group_ids = dict(w._shard_region_group_ids)
         w._shard_descs_per_block = {}
         # The geometry the grid is read off: 8 heads over 4 areas is 2 a
         # region, and 512B over a 16-token block is 16B a token.
@@ -1887,6 +1953,7 @@ class TestShardLocalRegions:
                 plan=None
                 if rows is None
                 else _split_plan([4, 5, 6, 7], 512, 2, rows=rows),
+                peer_region_group_ids=[0] * w.num_regions,
             )
 
         grid = uniform_grid(*expected, regions=4)
@@ -1902,6 +1969,7 @@ class TestShardLocalRegions:
         w.kv_cache_config = MagicMock(transfer_groups=[object()])
         w.src_xfer_handles_by_remote = {}
         w._shard_region_group_ids = {}
+        w._shard_peer_region_group_ids = dict(w._shard_region_group_ids)
 
         with patch.object(
             RblnNixlPullConnectorWorker, "_shard_chunk_grid", return_value=None
@@ -1924,21 +1992,28 @@ class TestShardLocalRegions:
         w.kv_cache_config = MagicMock(transfer_groups=[object()])
         w.src_xfer_handles_by_remote = {}
         w._shard_region_group_ids = {}
+        w._shard_peer_region_group_ids = dict(w._shard_region_group_ids)
 
-        w._register_shard_xfer_state("eng", 2, 16, ("l2", "l3"))
+        w._register_shard_xfer_state(
+            "eng", 2, 16, ("l2", "l3"), peer_region_group_ids=[0] * w.num_regions
+        )
 
         assert w._shard_region_spans[("eng", 2)] == (1, 0, 1, 0)
 
-    def test_register_shard_xfer_state_rejects_multiple_groups(self):
-        # The single-group assumption is what makes the all-zero tuple above
-        # right; more than one group has to fail rather than mislabel regions.
+    def test_register_shard_xfer_state_preserves_multiple_groups(self):
         w = self._wired_worker()
         w.kv_cache_config = MagicMock(transfer_groups=[object(), object()])
+        w.region_group_ids = [0, 0, 1, 1, 0, 0, 1, 1]
         w.src_xfer_handles_by_remote = {}
         w._shard_region_group_ids = {}
+        w._shard_peer_region_group_ids = dict(w._shard_region_group_ids)
 
-        with pytest.raises(AssertionError, match="single KV-cache group"):
-            w._register_shard_xfer_state("eng", 2, 16, ("l2", "l3"))
+        w._register_shard_xfer_state(
+            "eng", 2, 16, ("l1", "l2"), peer_region_group_ids=[0] * w.num_regions
+        )
+
+        assert w.src_xfer_handles_by_remote == {("eng", 2, 16): 42}
+        assert w._shard_region_group_ids == {("eng", 2): (1, 1, 0, 0)}
 
 
 @dataclass(frozen=True)
@@ -2117,6 +2192,7 @@ class TestAnEngineCutOnTwoAxes:
         remote = w._build_fa_remote(plan, peer, block_size_ratio=1)
         key = ("peer", 0)
         w._shard_region_group_ids = {key: (0,) * len(region_ids)}
+        w._shard_peer_region_group_ids = dict(w._shard_region_group_ids)
         w._shard_descs_per_block = {key: (1,) * len(region_ids)}
         w._shard_chunk_grids = {key: grid}
         local = [tuple(int(x) for x in d) for d in local]
@@ -4012,9 +4088,11 @@ def _shard_worker(w, *, layouts, num_blocks, chunked):
     w.block_len_per_layer = [lay.block_len for lay in layouts]
     w.kv_caches_base_addr = {"eng": {w.tp_rank: _region_bases(layouts, num_blocks)}}
     w.kv_cache_config = MagicMock(transfer_groups=[MagicMock()])
+    w.region_group_ids = [0] * len(layouts)
     w.nixl_wrapper = MagicMock()
     w.src_xfer_handles_by_remote = {}
     w._shard_region_group_ids = {}
+    w._shard_peer_region_group_ids = dict(w._shard_region_group_ids)
     w._shard_descs_per_block = {}
     w._shard_chunk_grids = {}
     w._shard_region_spans = {}
@@ -4234,6 +4312,7 @@ class TestHeadMatchedDescriptorSweep:
                         meta, peer.tp_rank, peer.tp_size, peer_areas=peer_areas
                     ),
                     remote_tp_size=peer.tp_size,
+                    peer_region_group_ids=[0] * w.num_regions,
                 )
             local = w.nixl_wrapper.get_xfer_descs.call_args.args[0]
             _assert_shard_contract(
@@ -4441,6 +4520,7 @@ class TestAHeadCutMeetsAContextCutAcrossTp:
                 peer_areas=areas,
                 plan=w._head_matched_plan(meta, rank, tp_r, peer_areas=areas),
                 remote_tp_size=tp_r,
+                peer_region_group_ids=[0] * w.num_regions,
             )
             local = w.nixl_wrapper.get_xfer_descs.call_args.args[0]
             mine = _decode_units(
@@ -4825,7 +4905,13 @@ class TestStageDescriptorSweep:
                 remote = w._build_fa_remote(
                     TestPeerRegionView._plan(), meta, block_size_ratio=1
                 )
-                w._register_shard_xfer_state("p", rank, _TOKENS, tuple(layers))
+                w._register_shard_xfer_state(
+                    "p",
+                    rank,
+                    _TOKENS,
+                    tuple(layers),
+                    peer_region_group_ids=[0] * w.num_regions,
+                )
             local = w.nixl_wrapper.get_xfer_descs.call_args.args[0]
             _assert_shard_contract(
                 w,
@@ -6208,7 +6294,7 @@ class TestD2DRegionPairing:
         topo.get_engine_info.return_value = MagicMock(remote_tp_size=1)
         topo.block_size_ratio.return_value = 1
         w.transfer_topo = topo
-        return w
+        return fill_region_geometry(w, areas=1, axes=[ChipletSplitAxis.HEAD] * n_local)
 
     @staticmethod
     def _meta(n_regions, n_layers=7):
@@ -6289,6 +6375,7 @@ class TestCleanupRemoteEngine:
         w.nixl_wrapper = MagicMock()
         w.src_xfer_handles_by_remote = {("eng", 0, 16): 100}
         w._shard_region_group_ids = {("eng", 0): (0,)}
+        w._shard_peer_region_group_ids = dict(w._shard_region_group_ids)
         w._shard_descs_per_block = {("eng", 0): (1,)}
         w._shard_chunk_grids = {("eng", 0): None}
         w._shard_region_spans = {("eng", 0): (0,)}
@@ -6321,6 +6408,7 @@ class TestCleanupRemoteEngine:
             ("eng", 1): (0,),
             ("other", 0): (0,),
         }
+        w._shard_peer_region_group_ids = dict(w._shard_region_group_ids)
         w._shard_descs_per_block = {
             ("eng", 0): (1,),
             ("eng", 1): (2,),
@@ -6368,6 +6456,7 @@ class TestCleanupRemoteEngine:
         w.src_xfer_handles_by_remote = {("eng", 0, 16): 100, ("eng", 1, 16): 101}
         w._borrowed_src_handles = {("eng", 1, 16)}
         w._shard_region_group_ids = {}
+        w._shard_peer_region_group_ids = dict(w._shard_region_group_ids)
         w._shard_descs_per_block = {}
         w._shard_chunk_grids = {}
         w._remote_shard_layer_names = defaultdict(dict)
@@ -7404,7 +7493,7 @@ class TestTwoLayoutsNeverPair:
         topo = MagicMock()
         topo.tp_ratio.return_value = 1
         w.transfer_topo = topo
-        return w
+        return fill_region_geometry(w, areas=1, axes=[ChipletSplitAxis.HEAD])
 
     @staticmethod
     def _meta(kv_per_block):
@@ -7457,7 +7546,7 @@ class TestTwoKernelGeometriesNeverPair:
         topo = MagicMock()
         topo.tp_ratio.return_value = 1
         w.transfer_topo = topo
-        return w
+        return fill_region_geometry(w, areas=1, axes=[ChipletSplitAxis.HEAD])
 
     @staticmethod
     def _meta(swa_kernel_block):
@@ -7514,7 +7603,7 @@ class TestAPackedBlockNeedsAnEqualPeerBlockSize:
         # Unequal TP pairs by head band and refuses this on its own; the path
         # this guards is the one that reaches upstream.
         w._is_head_matched_peer = lambda _: False
-        return w
+        return fill_region_geometry(w, areas=1, axes=[ChipletSplitAxis.HEAD])
 
     @staticmethod
     def _meta():
@@ -7863,3 +7952,73 @@ class TestMetadataTakenMidSweep:
         # Reading the live view would raise here; the sweep still covers every
         # read it set out to, including the one taken from under it.
         assert w._recv_failures == {"r0", "r1", "r2"}
+
+
+class _PassedThePayloadCheck(Exception):
+    pass
+
+
+class TestBlockPayloadPairing:
+    @staticmethod
+    def _validate(peer_block_len, peer_group):
+        # One KDA state region a side, the peer's in its own group numbering.
+        w = object.__new__(RblnNixlPullConnectorWorker)
+        w._logical_region_geometry = [SimpleNamespace(axis=ChipletSplitAxis.BLOCK)]
+        w.block_len_per_layer = [4096]
+        w.region_group_ids = [1]
+        meta = MagicMock(spec=RblnNixlAgentMetadata)
+        meta.registered_layer_names = ("l0",)
+        meta.region_names = ["l0.state"]
+        meta.block_lens = [peer_block_len]
+        meta.region_group_ids = [peer_group]
+        meta.pp_size = 2
+        meta.engine_id = "eng"
+        with (
+            patch.object(RblnNixlPullConnectorWorker, "_check_d2d_region_pairing"),
+            patch.object(RblnNixlPullConnectorWorker, "_check_split_axis_constraints"),
+            patch.object(RblnNixlPullConnectorWorker, "_check_mla_constraints"),
+            patch.object(
+                RblnNixlPullConnectorWorker, "_regions_per_layer", return_value=1
+            ),
+            patch.object(
+                RblnNixlPullConnectorWorker, "_layer_overlap", return_value=[(0, 0)]
+            ),
+        ):
+            w.transfer_topo = MagicMock()
+            w.transfer_topo.get_engine_info.side_effect = _PassedThePayloadCheck
+            with pytest.raises(_PassedThePayloadCheck):
+                w._validate_remote_agent_handshake(meta, remote_tp_size=1)
+
+    def test_a_page_of_another_size_is_refused_by_name(self):
+        with pytest.raises(RuntimeError, match="page size differs for l0.state"):
+            self._validate(peer_block_len=2048, peer_group=1)
+
+    def test_a_page_in_another_group_pairs(self):
+        # A pipelined producer numbers its groups off its own stage.
+        self._validate(peer_block_len=4096, peer_group=3)
+
+
+class TestShardPeerGroupIds:
+    @staticmethod
+    def _worker():
+        # Our band is the last two of a peer stage's four layers, two regions
+        # a layer over two chiplet areas.
+        w = object.__new__(RblnNixlPullConnectorWorker)
+        w.local_seen_layer_names = ["l2", "l3"]
+        w.num_regions = 4
+        w._kv_areas = 2
+        return w
+
+    def test_a_layer_takes_its_group_from_the_peer_s_position(self):
+        ids = self._worker()._shard_peer_group_ids(
+            ("l0", "l1", "l2", "l3"), [0, 0, 1, 1, 5, 5, 6, 6], None
+        )
+
+        assert ids == (5, 5, 6, 6)
+
+    def test_the_peer_s_areas_narrow_it_as_they_do_our_regions(self):
+        ids = self._worker()._shard_peer_group_ids(
+            ("l0", "l1", "l2", "l3"), [0, 0, 1, 1, 5, 4, 6, 3], [1]
+        )
+
+        assert ids == (4, 3)

@@ -18,6 +18,8 @@ sums the model call, sampler, and blocking bookkeeping as MODEL + SAMPLE.
 Spec decode's postprocess gather also holds a blocking read, so its profiler
 region is included in that sum. Drafter time stays in the E2E residual.
 Non-last PP ranks close their pass after the hand-off waits on compute.
+Multimodal encoder calls through their existing CPU output copy are reported
+per input shape as ENCODER. Input preparation is outside that interval.
 """
 
 import contextlib
@@ -28,6 +30,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_rbln.patches import register_patch
+from vllm_rbln.utils import run_mm_encoder as _run_mm_encoder
 from vllm_rbln.v1.metrics.performance import (
     _CTX_ATTR,
     PerformanceContext,
@@ -107,6 +110,20 @@ def load_model(self, *args, **kwargs):
         return output
 
     self.model_executable = timed_executable
+
+
+@functools.wraps(_run_mm_encoder)
+def run_mm_encoder(encoder, inputs, num_embeddings, *, dtype=None):
+    ctx = _ACTIVE_CTX
+    if ctx is None or not ctx.in_pass:
+        return _run_mm_encoder(encoder, inputs, num_embeddings, dtype=dtype)
+    start = time.perf_counter()
+    output = _run_mm_encoder(encoder, inputs, num_embeddings, dtype=dtype)
+    latency = time.perf_counter() - start
+    # The existing CPU copy completes the graph and transfer without a new barrier.
+    shape = "x".join(map(str, inputs[0].shape))
+    ctx.record_encoder(shape, latency)
+    return output
 
 
 @functools.wraps(_determine_batch_execution_and_padding)
@@ -216,6 +233,12 @@ def _register_patches() -> None:
             bookkeeping_sync,
             "Holds the step's first blocking read of the sampler output, which the "
             "graph slice would otherwise miss.",
+        ),
+        (
+            "vllm_rbln.utils.run_mm_encoder",
+            run_mm_encoder,
+            "The per-image CPU handoff is the existing blocking boundary for "
+            "encoder execution; the runner only sees a batch of completed outputs.",
         ),
         (
             f"{_RUNNER}._determine_batch_execution_and_padding",

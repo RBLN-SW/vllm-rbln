@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -36,7 +36,7 @@ exists, and the rest are bring-up knobs -- are not fields here.
 
 import argparse
 import os
-from dataclasses import field, fields
+from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
 
 from pydantic import Field
@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     from dataclasses import Field as DataclassField
 
     from vllm.utils.argparse_utils import FlexibleArgumentParser
+
 
 logger = init_logger(__name__)
 
@@ -101,6 +102,11 @@ class RBLNConfig(RBLNConfigBase):
     enable_sub_block_cache: bool = True
     """Enable sub-block prefix caching, at `sub_block_size` granularity."""
 
+    prefill_chunk_size: int | None = Field(default=None, gt=0)
+    """Length the prefill graph is compiled at, and so the longest prefill
+    chunk the scheduler hands it, below the `max_num_batched_tokens` step
+    budget. If None, uses `max_num_batched_tokens`."""
+
     specialize_moe_decode: bool = True
     """Specialize the case where every instance is at the decode stage."""
 
@@ -128,6 +134,10 @@ class RBLNConfig(RBLNConfigBase):
     decode_batch_bucket_manual_buckets: list[int] = field(default_factory=list)
     """Explicit decode batch sizes, used when the strategy is `manual`."""
 
+    encoder_token_budgets: list[int] = field(default_factory=list)
+    """Output-token capacities of compiled encoder graphs, shared across modalities.
+    Empty uses the processor upper bounds for enabled modalities."""
+
     use_w8a8: bool = False
     """Opt in to W8A8. W8A16 runs on every RBLN NPU, W8A8 only on the ones
     whose kernels take an fp8 activation."""
@@ -151,6 +161,7 @@ class RBLNConfig(RBLNConfigBase):
             "use_custom_sampler",
             "enable_sub_block_cache",
             "sub_block_size",
+            "encoder_token_budgets",
         }
         factors = get_hash_factors(self, ignored_factors)
         # Unset and True build the same graph; only False changes the artifact.
@@ -168,6 +179,27 @@ class RBLNConfig(RBLNConfigBase):
                 "decode_batch_bucket_strategy='manual' needs at least one entry "
                 "in decode_batch_bucket_manual_buckets"
             )
+        budgets = self.encoder_token_budgets
+        if any(b <= 0 for b in budgets):
+            raise ValueError("encoder_token_budgets must all be > 0")
+        if len(budgets) != len(set(budgets)):
+            raise ValueError("encoder_token_budgets must be unique")
+
+
+@dataclass
+class OptimumRBLNCompileInputs:
+    """Resolved inputs shared by cache hashing, vLLM config sync and compilation.
+
+    Must remain serializable for worker transfer via `additional_config`.
+    """
+
+    model: str
+    dtype: Any
+    model_cls: str
+    rbln_config: dict[str, Any]
+    # Keep third-party config dataclasses opaque to pydantic validation.
+    hf_config: Any
+    npu_name: str
 
 
 @vllm_config_dataclass
@@ -193,19 +225,27 @@ class OptimumRBLNConfig(RBLNConfigBase):
     """`--num-gpu-blocks-override` as given, before the prefix-cache block ratio
     is applied to it."""
 
-    # Written by the sync, and carried to the processes that cannot build
-    # `RBLNParams` of their own.
+    # Written during runtime synchronization and carried to workers.
     attn_block_size: int | None = field(default=None, metadata=_DERIVED)
-    """`RBLNParams.kvcache_block_size`, when prefix caching splits the KV-cache
-    block size from `cache_config.block_size`."""
+    """The compiled KV-cache block size, retained when prefix caching uses
+    smaller blocks in `cache_config.block_size`."""
 
     image_prefill_chunk_size: list[int] | None = field(default=None, metadata=_DERIVED)
-    """`RBLNParams.image_prefill_chunk_size`, the image-prefill buckets
-    (gemma3/gemma4) the scheduler pads against."""
+    """Compiled image-prefill buckets (gemma3/gemma4) used for scheduler padding."""
 
-    cached_model_path: str | None = field(default=None, metadata=_DERIVED)
-    """Where the compile cache holds, or will put, this model's artifact. Built
-    from the fields above, so it cannot key the cache it names."""
+    compile_inputs: OptimumRBLNCompileInputs | None = field(
+        default=None, metadata=_DERIVED
+    )
+    """Inputs shared by cache lookup and compilation.
+
+    Runtime synchronization must not mutate them.
+    """
+
+    artifact_path: str | None = field(default=None, metadata=_DERIVED)
+    """Artifact selected for loading, or the destination for a new compilation."""
+
+    precompiled: bool = field(default=False, metadata=_DERIVED)
+    """Whether synchronization selected an existing artifact to load."""
 
     num_blocks_synced: bool = field(default=False, metadata=_DERIVED)
     """Set once num_gpu_blocks is derived from the compiled model, so the second
@@ -457,7 +497,7 @@ def _model_impl_for(engine_args: Any) -> tuple[ModelImpl, str, str]:
 
     # Owned by the optimum path, and imported here so that a run which named
     # its path, and never reaches this, does not import it at all.
-    from vllm_rbln.utils.optimum.paths import is_compiled_dir
+    from vllm_rbln.utils.optimum.path import is_compiled_dir
     from vllm_rbln.utils.optimum.registry import is_arch_supported
 
     model = maybe_model_redirect(engine_args.hf_config_path or engine_args.model)

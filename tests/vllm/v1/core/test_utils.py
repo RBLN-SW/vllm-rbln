@@ -23,6 +23,7 @@ import pytest
 
 from vllm_rbln.v1.core.utils import (
     decode_batch_size,
+    is_strict_kv_producer,
     num_base_tokens,
     resolve_propagated_token_write,
     should_defer_spec_step,
@@ -31,10 +32,21 @@ from vllm_rbln.v1.core.utils import (
 )
 
 
-def _sched_out(num_scheduled_tokens, spec=None):
+def _sched_out(num_scheduled_tokens, spec=None, new=(), cached=()):
+    """`new` / `cached`: the num_computed_tokens of the new and the cached
+    (running or resumed) requests."""
     return SimpleNamespace(
         num_scheduled_tokens=num_scheduled_tokens,
         scheduled_spec_decode_tokens=spec or {},
+        scheduled_new_reqs=[SimpleNamespace(num_computed_tokens=n) for n in new],
+        scheduled_cached_reqs=SimpleNamespace(num_computed_tokens=list(cached)),
+    )
+
+
+def _phase(num_scheduled_tokens, spec=None, *, producer=False, new=(), cached=()):
+    return step_is_prefill(
+        _sched_out(num_scheduled_tokens, spec, new, cached),
+        strict_kv_producer=producer,
     )
 
 
@@ -43,29 +55,84 @@ class TestStepIsPrefill:
     # non-draft token for some request.
 
     def test_decode_step(self):
-        assert step_is_prefill(_sched_out({"a": 1, "b": 1})) is False
+        assert _phase({"a": 1, "b": 1}) is False
 
     def test_prefill_chunk(self):
-        assert step_is_prefill(_sched_out({"a": 512})) is True
+        assert _phase({"a": 512}) is True
 
     def test_single_token_step_is_decode(self):
-        # Where a 1-token prompt, a chunked prefill's last token and a full
-        # remote-KV or prefix-cache match all land -- is_prefill() reports decode
-        # for each, so this has to as well.
-        assert step_is_prefill(_sched_out({"a": 1})) is False
+        # Where a chunked prefill's last token and a full remote-KV or
+        # prefix-cache match land -- is_prefill() reports decode for each, so
+        # this has to as well.
+        assert _phase({"a": 1}, cached=[7]) is False
+        assert _phase({"a": 1}, new=[7]) is False
+
+    @pytest.mark.parametrize(
+        "where", [{"new": [0]}, {"cached": [0]}], ids=["new", "resumed"]
+    )
+    def test_a_first_chunk_is_prefill_whatever_its_length(self, where):
+        # A 1-token prompt, or a first chunk cut to one token, starts a recurrent
+        # state from zero, which only the prefill kernels do.
+        assert _phase({"a": 1}, **where) is True
 
     def test_drafts_do_not_inflate_the_phase(self):
         # 1 base + 4 drafts is a decode step; only the base counts.
-        assert step_is_prefill(_sched_out({"a": 5}, spec={"a": [1, 2, 3, 4]})) is False
+        assert _phase({"a": 5}, spec={"a": [1, 2, 3, 4]}) is False
 
     def test_empty_step(self):
-        assert step_is_prefill(_sched_out({})) is False
+        assert _phase({}) is False
 
     def test_a_mixed_step_reads_prefill(self):
         # Unreachable (the scheduler never mixes) and asserted against there.
         # Pinned because any() picks the safe side: a prefill graph can still
         # take a single-token query, a decode graph cannot take a chunk.
-        assert step_is_prefill(_sched_out({"a": 1, "b": 512})) is True
+        assert _phase({"a": 1, "b": 512}) is True
+
+
+class TestStepIsPrefillOnAStrictProducer:
+    # A producer compiles no decode graph, so the 1-token cases have to read
+    # prefill instead.
+
+    def test_single_token_step_is_prefill(self):
+        assert _phase({"a": 1}, producer=True) is True
+
+    @pytest.mark.parametrize("producer", [False, True])
+    def test_a_chunk_is_prefill_either_way(self, producer):
+        assert _phase({"a": 512}, producer=producer) is True
+
+    def test_drafts_alone_do_not_make_it_prefill(self):
+        # The widened threshold counts base tokens, not scheduled ones: a
+        # draft-only step stays out of the phase on both sides.
+        assert _phase({"a": 4}, spec={"a": [1, 2, 3, 4]}, producer=True) is False
+
+    def test_empty_step(self):
+        assert _phase({}, producer=True) is False
+
+
+class TestIsStrictKvProducer:
+    # kv_both is a producer to upstream and decodes here, so the two must not
+    # be read through KVTransferConfig.is_kv_producer.
+
+    @pytest.mark.parametrize(
+        "kv_role, expected",
+        [("kv_producer", True), ("kv_both", False), ("kv_consumer", False)],
+    )
+    def test_only_the_strict_role_qualifies(self, kv_role, expected):
+        config = SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(
+                kv_connector="RblnNixlConnector", kv_role=kv_role
+            )
+        )
+        assert is_strict_kv_producer(config) is expected
+
+    def test_a_role_without_a_connector_is_not_one(self):
+        config = SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(kv_connector=None, kv_role="kv_producer")
+        )
+        assert is_strict_kv_producer(config) is False
+
+    def test_no_transfer_config(self):
+        assert is_strict_kv_producer(SimpleNamespace(kv_transfer_config=None)) is False
 
 
 @pytest.mark.parametrize(
@@ -186,7 +253,7 @@ class TestSubBlockSizeInUse:
             enable_prefix_caching=True,
             sub_block_cache=True,
             block_size=1024,
-            max_num_batched_tokens=512,
+            prefill_chunk_size=512,
             kv_cache_config=object(),
         )
         args.update(kw)
@@ -225,7 +292,7 @@ class TestSubBlockSizeInUse:
     def test_a_chunk_outside_the_block_bounds_is_rejected(self, eligible):
         eligible(True)
         with pytest.raises(ValueError, match="block_size >="):
-            self._call(block_size=256, max_num_batched_tokens=512, sub_block_size=256)
+            self._call(block_size=256, prefill_chunk_size=512, sub_block_size=256)
 
     def test_a_size_the_kv_cache_cannot_hold_is_rejected(self, eligible):
         # A size that is not a divisor of block_size, or a spec with no token
@@ -239,7 +306,7 @@ class TestSubBlockSizeInUse:
         # Nobody asked for sub-blocks here, so a chunk wider than the block
         # steps aside rather than refusing to start.
         eligible(True)
-        assert self._call(block_size=256, max_num_batched_tokens=512) is None
+        assert self._call(block_size=256, prefill_chunk_size=512) is None
 
     def test_a_size_below_the_chunk_needs_cr13(self, eligible, monkeypatch):
         # The multi-block store the decoupled size needs is CR13-only.

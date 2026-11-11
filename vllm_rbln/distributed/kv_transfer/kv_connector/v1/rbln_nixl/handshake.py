@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -519,6 +519,13 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         if self.use_host_buffer:
             return
         tp_ratio = self.topo.tp_ratio(remote_tp_size)
+        if any(
+            g.axis is ChipletSplitAxis.BLOCK for g in self._logical_region_geometry
+        ) and (tp_ratio != 1 or nixl_agent_meta.block_size != self.block_size):
+            raise RuntimeError(
+                "RBLN NIXL block state and auxiliary caches require equal "
+                "P/D tensor parallel sizes and block sizes."
+            )
         if tp_ratio != 1 and self._shape.has_swa:
             raise RuntimeError(
                 "RBLN NIXL D2D: sliding-window attention is not supported with "
@@ -703,6 +710,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                 self.nixl_wrapper.release_dlist_handle(handle)
         for skey in [k for k in self._shard_region_group_ids if k[0] == engine_id]:
             del self._shard_region_group_ids[skey]
+            del self._shard_peer_region_group_ids[skey]
         for skey in [k for k in self._shard_descs_per_block if k[0] == engine_id]:
             del self._shard_descs_per_block[skey]
         for skey in [k for k in self._shard_chunk_grids if k[0] == engine_id]:
@@ -1137,6 +1145,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                         peer_areas=peer_areas,
                         plan=plan,
                         remote_tp_size=remote_tp_size,
+                        peer_region_group_ids=metadata.region_group_ids,
                     )
                     overlapping.append(global_rank)
         # Published once, not accumulated: a handshake that raises partway
@@ -1382,6 +1391,9 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         # the whole-engine list the only place such a range can sit.
         return (
             pp_size > 1
+            or any(
+                g.axis is ChipletSplitAxis.BLOCK for g in self._logical_region_geometry
+            )
             or partial
             or fan_in
             or pieces
@@ -1397,6 +1409,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         peer_areas: list[int] | None = None,
         plan: tuple[list[int], list[list[Piece]]] | None = None,
         remote_tp_size: int = 1,
+        peer_region_group_ids: list[int] | None = None,
     ) -> None:
         """Register one peer shard's local list and what indexes into it.
 
@@ -1436,12 +1449,22 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                 chunk_grid=chunk_grid,
             )
         self.src_xfer_handles_by_remote[key] = handle
-        n_groups = len(self.kv_cache_config.transfer_groups)
-        assert n_groups == 1, (
-            "RBLN NIXL per-shard transfers support a single KV-cache group, "
-            f"got {n_groups}"
+        self._shard_region_group_ids[(engine_id, global_rank)] = tuple(
+            self.region_group_ids[i] for i in region_ids
         )
-        self._shard_region_group_ids[(engine_id, global_rank)] = (0,) * len(region_ids)
+        if plan is None:
+            if not peer_region_group_ids:
+                raise RuntimeError(
+                    f"RBLN NIXL: peer {engine_id} rank {global_rank} published no "
+                    "KV group per region, so its block ids cannot be paired with "
+                    "ours."
+                )
+            peer_group_ids = self._shard_peer_group_ids(
+                registered_layer_names, peer_region_group_ids, peer_areas
+            )
+        else:
+            peer_group_ids = self._shard_region_group_ids[(engine_id, global_rank)]
+        self._shard_peer_region_group_ids[(engine_id, global_rank)] = peer_group_ids
         self._shard_descs_per_block[(engine_id, global_rank)] = (
             (1,) * len(region_ids) if pieces is None else tuple(map(len, pieces))
         )
@@ -1513,6 +1536,25 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         (band,) = bands
         return band
 
+    def _shard_peer_group_ids(
+        self,
+        registered_layer_names: tuple[str, ...],
+        peer_region_group_ids: list[int],
+        peer_areas: list[int] | None,
+    ) -> tuple[int, ...]:
+        """The peer's group of each region `_shard_local_region_ids` lists.
+
+        A pipelined producer numbers its groups off its own stage layout, so a
+        layer's group there can differ from ours; its block ids follow its
+        numbering.
+        """
+        return tuple(
+            peer_region_group_ids[peer]
+            for peer, _ in self._shard_region_pairs(
+                registered_layer_names, peer_areas=peer_areas
+            )
+        )
+
     def _trim_agent_meta_to_layers(
         self, nixl_agent_meta: RblnNixlAgentMetadata, overlap: list[tuple[int, int]]
     ) -> NixlAgentMetadata:
@@ -1527,18 +1569,10 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         """
         rpl = self._regions_per_layer()
         peer_positions = [peer_pos for peer_pos, _ in overlap]
-        start, end = peer_positions[0], peer_positions[-1] + 1
-        if peer_positions != list(range(start, end)):
-            raise RuntimeError(
-                "RBLN NIXL PP: this rank owns a non-contiguous part of producer "
-                f"stage layers {peer_positions}; the pipelines must divide the "
-                "same layer sequence."
-            )
-        lo, hi = start * rpl, end * rpl
+        region_ids = [p * rpl + i for p in peer_positions for i in range(rpl)]
         trimmed: dict[str, Any] = {
-            "kv_caches_base_addr": nixl_agent_meta.kv_caches_base_addr[lo:hi],
-            "block_lens": nixl_agent_meta.block_lens[lo:hi],
-            "block_strides": nixl_agent_meta.block_strides[lo:hi],
+            field: [getattr(nixl_agent_meta, field)[i] for i in region_ids]
+            for field in ("kv_caches_base_addr", "block_lens", "block_strides")
         }
         # One entry a logical region rather than an area, so the same layers
         # are a shorter window of them.
@@ -1546,8 +1580,10 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
             nixl_agent_meta.registered_layer_names
         )
         for name in ("kv_split_axes", "kv_area_slices"):
-            trimmed[name] = getattr(nixl_agent_meta, name)[
-                start * per_layer : end * per_layer
+            trimmed[name] = [
+                getattr(nixl_agent_meta, name)[p * per_layer + i]
+                for p in peer_positions
+                for i in range(per_layer)
             ]
         # The rest arrived with 0.30.0 and are region-indexed the same way, so
         # they follow the window. Optional on the wire: a peer that sends none
@@ -1560,7 +1596,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         ):
             value = getattr(nixl_agent_meta, field)
             if value is not None:
-                trimmed[field] = value[lo:hi]
+                trimmed[field] = [value[i] for i in region_ids]
         return replace(nixl_agent_meta, **trimmed)
 
     def _validate_head_matched_handshake(
@@ -1713,6 +1749,23 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         self._check_d2d_region_pairing(nixl_agent_meta, remote_tp_size)
         self._check_split_axis_constraints(nixl_agent_meta, remote_tp_size)
         self._check_mla_constraints(nixl_agent_meta, remote_tp_size)
+        if any(g.axis is ChipletSplitAxis.BLOCK for g in self._logical_region_geometry):
+            rpl = self._regions_per_layer()
+            for peer, local in self._layer_overlap(
+                nixl_agent_meta.registered_layer_names
+            ):
+                for area in range(rpl):
+                    peer_region = peer * rpl + area
+                    local_region = local * rpl + area
+                    if (
+                        nixl_agent_meta.block_lens[peer_region]
+                        != self.block_len_per_layer[local_region]
+                    ):
+                        raise RuntimeError(
+                            "RBLN NIXL block payload page size differs "
+                            f"for {nixl_agent_meta.region_names[peer_region]} "
+                            "between P and D."
+                        )
         if nixl_agent_meta.pp_size <= 1:
             if self._is_head_matched_peer(remote_tp_size):
                 self._validate_head_matched_handshake(

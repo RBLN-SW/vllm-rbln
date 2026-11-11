@@ -19,7 +19,6 @@ import torch
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 from vllm_rbln.v1.sample import rbln_rejection_sampler as module
 from vllm_rbln.v1.sample.ops.top_k_top_p import (
@@ -32,6 +31,8 @@ from vllm_rbln.v1.sample.rbln_rejection_sampler import (
     PLACEHOLDER_TOKEN_ID,
     RBLNRejectionSamplerImpl,
 )
+
+from .utils import build_input_batch
 
 DEVICE = torch.device("cpu")
 VOCAB_SIZE = 8
@@ -217,40 +218,6 @@ def test_mixed_top_k_and_top_p():
     )
 
 
-def build_input_batch(requests: list[tuple[str, SamplingParams]]) -> InputBatch:
-    """Feed real `SamplingParams` through an `InputBatch`, as the runner does.
-
-    Metadata built this way carries whatever vLLM's own bookkeeping puts there,
-    rather than the values a test picked.
-    """
-    input_batch = InputBatch(
-        max_num_reqs=8,
-        max_model_len=64,
-        max_num_batched_tokens=64,
-        device=DEVICE,
-        vocab_size=VOCAB_SIZE,
-        block_sizes=[16],
-        kernel_block_sizes=[16],
-        max_num_blocks_per_req=[4],
-    )
-    for req_id, params in requests:
-        input_batch.add_request(
-            CachedRequestState(
-                req_id=req_id,
-                prompt_token_ids=[1, 2, 3],
-                mm_features=None,
-                sampling_params=params,
-                pooling_params=None,
-                generator=None,
-                block_ids=([0, 1],),
-                num_computed_tokens=0,
-                output_token_ids=[],
-            )
-        )
-    input_batch.refresh_metadata()
-    return input_batch
-
-
 def test_greedy_request_of_a_mixed_batch_carries_neutral_top_k_top_p():
     """The upstream contract the greedy detection rests on.
 
@@ -262,11 +229,13 @@ def test_greedy_request_of_a_mixed_batch_carries_neutral_top_k_top_p():
     # The greedy request asks for both filters; the random ones are what make
     # vLLM materialize the per-request tensors for the whole batch.
     input_batch = build_input_batch(
-        [
+        requests=[
             ("greedy", SamplingParams(temperature=0.0, top_k=4, top_p=0.5)),
             ("random_top_k", SamplingParams(temperature=1.0, top_k=4)),
             ("random_top_p", SamplingParams(temperature=1.0, top_p=0.9)),
-        ]
+        ],
+        vocab_size=VOCAB_SIZE,
+        device=DEVICE,
     )
 
     metadata = input_batch.sampling_metadata
@@ -302,7 +271,9 @@ ROW_KINDS = [
 def test_every_row_kind_gets_its_own_top_k_top_p():
     """All five kinds in one batch, since the op reads k/p per row."""
     input_batch = build_input_batch(
-        [(name, params) for name, params, _, _ in ROW_KINDS]
+        requests=[(name, params) for name, params, _, _ in ROW_KINDS],
+        vocab_size=VOCAB_SIZE,
+        device=DEVICE,
     )
 
     top_k, top_p = build_op_top_k_top_p(
