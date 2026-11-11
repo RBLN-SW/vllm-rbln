@@ -83,11 +83,14 @@ compiles one `[1, length]` graph. A prefill step pads its chunk to the shortest
 length that fits, so a short prompt or the last chunk of a long prompt does not
 pad to the full length.
 
+Each additional length adds a prefill graph to compile and keep on the device,
+leaving less memory for the KV cache.
+
 The longest length is the most tokens the scheduler gives one request per step.
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `--rbln-prefill-chunk-size` | `max_num_batched_tokens` | Prefill graph lengths. Every length must be unique and within `(0, max_num_batched_tokens]`. |
+| `--rbln-prefill-chunk-size` | `max_num_batched_tokens` | Prefill graph lengths. Every length must be unique, within `(0, max_num_batched_tokens]`, and no longer than `--max-num-scheduled-tokens` when that is set. |
 
 In `additional_config` it takes a list or a single integer, for example
 `{"prefill_chunk_size": 512}`.

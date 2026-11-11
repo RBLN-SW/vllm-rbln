@@ -47,6 +47,8 @@ A smaller value decouples the two, so a prefill chunk can span two blocks.
 Storing across that boundary needs the multi-block attention store,
 which REBEL CR13 alone carries — the scheduler rejects the decoupled setting on
 any other device.
+When the longest `--rbln-prefill-chunk-size` does not divide `block_size`, REBEL CR13 takes the
+longest one that does; any other device runs without sub-block caching.
 The scheduler also requires `block_size >= prefill_chunk_size >= sub_block_size`.
 
 For cross-engine prefix-aware routing (e.g., llm-d):
@@ -330,8 +332,9 @@ configured block size, looks those keys up in the index it builds from our
 events, and scores pods by how many consecutive blocks match.  Routing
 works iff the producer's `blockSizeTokens` equals the engine's emitted
 `block_size`, which is our sub-block size:
-`--rbln-sub-block-size` when given, otherwise the prefill chunk size
-(the longest `--rbln-prefill-chunk-size`, which defaults to `--max-num-batched-tokens`).
+`--rbln-sub-block-size` when given, otherwise the longest
+`--rbln-prefill-chunk-size` that divides `--block-size`
+(the flag defaults to `--max-num-batched-tokens`).
 
 > **Not** vLLM's `--block-size`.  For stock vLLM those two happen to be
 > the same knob, so generic guides tell you to align `--block-size` with
