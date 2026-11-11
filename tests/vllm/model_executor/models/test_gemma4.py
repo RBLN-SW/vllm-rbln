@@ -178,14 +178,6 @@ def test_warm_up_runs_every_bucket_once_full():
     assert calls == [(18, 18), (45, 45), (90, 90)]
 
 
-def test_warm_up_refuses_a_budget_with_no_grid_inside_the_tower():
-    # Seven cells only lay out as 1 x 7, 21 patches wide; the table holds 16.
-    model, calls = _recording_model([7 * POOL**2])
-
-    with pytest.raises(ValueError, match="no warm-up grid"):
-        model.warmup_mm_encoder()
-
-
 def _built_model(monkeypatch, *, cap, budgets):
     """The model as construction resolves it, upstream's model left out."""
     monkeypatch.setattr(
@@ -218,7 +210,7 @@ def _built_model(monkeypatch, *, cap, budgets):
 
 @pytest.mark.parametrize(
     "budgets, buckets",
-    [([], [70 * 9, 140 * 9, 280 * 9]), ([300, 100], [100 * 9, 300 * 9])],
+    [([], [70 * 9, 140 * 9, 280 * 9]), ([560, 70], [70 * 9, 560 * 9])],
 )
 def test_the_encoder_buckets_follow_encoder_token_budgets(
     monkeypatch, budgets, buckets
@@ -228,13 +220,18 @@ def test_the_encoder_buckets_follow_encoder_token_budgets(
 
 
 def test_the_longest_range_is_the_cap_not_the_largest_budget(monkeypatch):
-    model = _built_model(monkeypatch, cap=280, budgets=[300, 100])
+    model = _built_model(monkeypatch, cap=280, budgets=[560, 70])
     assert model.max_mm_prefix_range_len == 280
 
 
 def test_budgets_that_cannot_encode_an_image_at_the_cap_are_refused(monkeypatch):
     with pytest.raises(ValueError, match="must reach max_soft_tokens=280"):
         _built_model(monkeypatch, cap=280, budgets=[70, 140])
+
+
+def test_budgets_the_processor_never_emits_are_refused(monkeypatch):
+    with pytest.raises(ValueError, match=r"\[100, 300\] are not Gemma4"):
+        _built_model(monkeypatch, cap=280, budgets=[300, 100, 280])
 
 
 def _processing_info(engine_kwargs, processor_default, default_output_length):
