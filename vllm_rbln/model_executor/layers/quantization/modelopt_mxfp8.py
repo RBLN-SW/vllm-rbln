@@ -14,9 +14,19 @@
 
 import torch
 from torch.nn.parameter import Parameter
+from vllm.model_executor.layers.fused_moe import (
+    FusedMoEConfig,
+    FusedMoEMethodBase,
+    RoutedExperts,
+)
 from vllm.model_executor.layers.linear import (
     LinearMethodBase,
     register_weight_loader_v2_supported_method,
+)
+from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+from vllm.model_executor.layers.quantization.modelopt import (
+    ModelOptMxFp8Config,
+    ModelOptMxFp8FusedMoE,
 )
 from vllm.model_executor.parameter import (
     GroupQuantScaleParameter,
@@ -100,3 +110,95 @@ class RBLNModelOptMxFp8LinearMethod(LinearMethodBase):
             * layer.weight_scale.to(x.dtype)[:, :, None]
         ).view(out_features, in_features)
         return torch.nn.functional.linear(x, weight, bias)
+
+
+class RBLNModelOptMxFp8FusedMoE(ModelOptMxFp8FusedMoE):
+    """MXFP8 MoE that runs the RBLN group-dequantise custom op.
+
+    The e4m3 weights and raw uint8 e8m0 scales go to the op as loaded; the
+    uint8 scale is what routes it to the packed MoE kernel, which dequantises
+    per 32-element group on the device (W8A16).
+    """
+
+    def __init__(self, quant_config: ModelOptMxFp8Config, moe: FusedMoEConfig) -> None:
+        # Do not call ModelOptMxFp8FusedMoE.__init__(): it selects an upstream
+        # CUDA/ROCm MXFP8 backend.
+        FusedMoEMethodBase.__init__(self, moe)
+        self.weight_block_size = [1, MXFP8_GROUP_SIZE]
+        self.quant_config = quant_config
+        self.mxfp8_backend = None
+        self.experts_cls = None
+
+    @property
+    def is_monolithic(self) -> bool:
+        # Prevent vLLM from trying to initialize modular-kernel plumbing.
+        # RBLNMoERunner.forward calls apply() directly.
+        return True
+
+    def get_fused_moe_quant_config(self, layer: torch.nn.Module):
+        return None
+
+    def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+        self._check_weight_dtypes(layer)
+        layer.w13_weight = Parameter(layer.w13_weight.data, requires_grad=False)
+        layer.w2_weight = Parameter(layer.w2_weight.data, requires_grad=False)
+        layer.w13_weight_scale = Parameter(
+            layer.w13_weight_scale.data, requires_grad=False
+        )
+        layer.w2_weight_scale = Parameter(
+            layer.w2_weight_scale.data, requires_grad=False
+        )
+
+    def apply(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        **kwargs: object,
+    ) -> torch.Tensor:
+        orig_shape = x.shape
+        num_tokens = orig_shape[:-1].numel()
+        hidden_states = x.reshape(num_tokens, -1)
+        masked_routing_weights = router_logits
+
+        # w13 stacks gate (w1) then up (w3) along the output dim.
+        intermediate_size = layer.w13_weight.shape[1] // 2
+        gate_proj_weight = layer.w13_weight[:, :intermediate_size, :]
+        up_proj_weight = layer.w13_weight[:, intermediate_size:, :]
+        gate_proj_scale = layer.w13_weight_scale[:, :intermediate_size, :]
+        up_proj_scale = layer.w13_weight_scale[:, intermediate_size:, :]
+
+        out = torch.ops.rbln_custom_ops.custom_moe_glu_group_dequantize(
+            hidden_states,
+            gate_proj_weight,
+            gate_proj_scale,
+            up_proj_weight,
+            up_proj_scale,
+            layer.w2_weight,
+            layer.w2_weight_scale,
+            masked_routing_weights,
+            torch.tensor(MXFP8_GROUP_SIZE, dtype=torch.int32),
+            layer.activation.value,
+            None,  # gate_proj_bias
+            None,  # up_proj_bias
+            None,  # down_proj_bias
+            layer.expert_map,
+            swiglu_alpha=layer.swiglu_alpha,
+            swiglu_limit=layer.swiglu_limit,
+            swiglu_beta=layer.swiglu_beta,
+        )
+        return out.reshape(orig_shape)
+
+    def apply_monolithic(self, layer, x, router_logits, input_ids=None):
+        raise RuntimeError
+
+
+class RBLNModelOptMxFp8Config(ModelOptMxFp8Config):
+    """ModelOpt MXFP8 config for RBLN: routed experts take the RBLN MoE method."""
+
+    def get_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> QuantizeMethodBase | None:
+        if isinstance(layer, RoutedExperts) and not self.is_layer_excluded(prefix):
+            return RBLNModelOptMxFp8FusedMoE(self, layer.moe_config)
+        return super().get_quant_method(layer, prefix)

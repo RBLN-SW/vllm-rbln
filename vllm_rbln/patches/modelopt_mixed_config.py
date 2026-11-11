@@ -25,6 +25,7 @@ from vllm_rbln.model_executor.layers.quantization.modelopt_fp8 import (
     RBLNModelOptFp8LinearMethod,
 )
 from vllm_rbln.model_executor.layers.quantization.modelopt_mxfp8 import (
+    RBLNModelOptMxFp8Config,
     RBLNModelOptMxFp8LinearMethod,
 )
 from vllm_rbln.model_executor.layers.quantization.nvfp4 import (
@@ -91,3 +92,15 @@ def register_rbln_modelopt_mxfp8_linear_method() -> None:
     LINEAR_METHOD_BUILDERS["MXFP8"] = lambda config, prefix: (
         RBLNModelOptMxFp8LinearMethod()
     )
+
+
+@add_registration(
+    reason=(
+        "Override the built-in ModelOpt MXFP8 config so routed-expert MoE layers "
+        "run the RBLN group-dequantise custom op instead of upstream's "
+        "CUDA/ROCm MXFP8 MoE backends. MiniMax checkpoints tag the method "
+        "`mxfp8`."
+    )
+)
+def register_rbln_modelopt_mxfp8_config() -> None:
+    register_quantization_config("mxfp8")(RBLNModelOptMxFp8Config)
