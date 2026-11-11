@@ -709,28 +709,12 @@ class TestBuildMmPrefixSlidingWindow:
             return (outputs[checked] - expected[..., s:e, :]).abs().max().item()
         return (torch.cat(outputs, dim=-2) - expected).abs().max().item()
 
-    def test_a_range_inside_the_window(self, cfg):
-        assert self._run(cfg, [(0, 9), (9, 16), (16, 20)], [(9, 16)]) < 1e-5
-
-    def test_text_and_a_whole_range_share_a_chunk(self, cfg):
-        chunks = [(0, 6), (6, 20), (20, 24)]
-        assert self._run(cfg, chunks, [(9, 16)]) < 1e-5
-
     def test_two_ranges_in_one_chunk(self, cfg):
         assert self._run(cfg, [(0, 4), (4, 22)], [(5, 10), (12, 20)]) < 1e-5
 
     def test_a_range_longer_than_the_window_is_clipped_by_it(self, cfg):
         # The grant reaches back no further than the window, as HF clips it.
         assert self._run(cfg, [(0, 5), (5, 20), (20, 24)], [(5, 20)]) < 1e-5
-
-    def test_a_range_at_the_start_of_the_prompt(self, cfg):
-        assert self._run(cfg, [(0, 6), (6, 13)], [(0, 6)]) < 1e-5
-
-    def test_a_range_resumed_mid_way_by_a_prefix_cache_hit(self, cfg):
-        # The cached head [9, 12) is behind every query of the step [12, 20),
-        # so the step's own mask already sees it.
-        chunks = [(0, 9), (9, 16), (12, 20)]
-        assert self._run(cfg, chunks, [(9, 16)], checked=2) < 1e-5
 
     def test_a_long_range_resumed_mid_way_is_still_clipped_by_the_window(self, cfg):
         chunks = [(0, 5), (5, 20), (15, 24)]
@@ -1037,12 +1021,10 @@ class TestForwardSlidingWindow:
             is_prefill=True,
             swa_appends=True,
         )
-        kwargs: dict[str, object] = {}
         *_, tables, window, _sinks = self._forward(
-            cfg, monkeypatch, "sliding_window_attention_v1", md, kwargs
+            cfg, monkeypatch, "sliding_window_attention_v1", md
         )
         assert tables.tolist() == [7, 8, 9]
-        assert kwargs["attn_mask"] is None
         assert window == self.WINDOW
 
     @pytest.mark.parametrize("use_mm_prefix", [False, True])

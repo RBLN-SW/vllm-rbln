@@ -1,11 +1,11 @@
 # Copyright 2026 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -28,6 +28,7 @@ from collections.abc import Mapping
 import vllm.envs as envs
 
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.core.utils import is_strict_kv_producer
 from vllm_rbln.v1.worker.utils import dynamic_kv_enabled
 
 logger = init_logger(__name__)
@@ -112,6 +113,8 @@ def _warmup_graph_set_factors(
         ),
         # compute_hash() takes in the EC config but leaves its role out.
         "ec_role": ec.ec_role if ec is not None else None,
+        # Not kv_role itself: only the strict producer builds a different set.
+        "prefill_only": is_strict_kv_producer(vllm_config),
     }
 
     if extra_hash_factors:

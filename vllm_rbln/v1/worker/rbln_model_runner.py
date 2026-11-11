@@ -149,6 +149,7 @@ from vllm_rbln.v1.core.rbln_kv_cache_manager import KVCacheCopyOp
 from vllm_rbln.v1.core.rbln_scheduler import RBLNSchedulerOutput
 from vllm_rbln.v1.core.utils import (
     decode_batch_size,
+    is_strict_kv_producer,
     num_base_tokens,
     resolve_propagated_token_write,
     step_is_prefill,
@@ -526,6 +527,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             type(self.bucketing_manager).__name__,
             self.bucketing_manager.decode_batch_buckets,
         )
+
+        self.is_strict_kv_producer = is_strict_kv_producer(vllm_config)
 
         self.specialized_moe_decode = (
             parallel_config.data_parallel_size > 1
@@ -1489,13 +1492,39 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                         f"{flag}={cap} would split a multimodal range of up to "
                         f"{longest} tokens."
                     )
-            chunk = self.rbln_config.max_prefill_chunk_size
-            if chunk < longest:
+            chunks = self.rbln_config.prefill_chunk_size
+            assert chunks is not None  # resolved at start-up
+            if max(chunks) < longest:
+                # The example keeps a chunk dividing --block-size, so the default
+                # sub-block prefix caching still has one to take.
+                block_size = self.cache_config.block_size
+                fit = block_size
+                while fit % 2 == 0 and fit // 2 >= longest:
+                    fit //= 2
+                fit = max(fit, longest)
+                small = min(chunks)
+                example = (
+                    f"--max-num-batched-tokens {fit} "
+                    f"--rbln-prefill-chunk-size {small},{fit}"
+                    + (f" --block-size {fit}" if fit > block_size else "")
+                )
+                if block_size % small == 0:
+                    tight = -(-longest // 128) * 128
+                    example += (
+                        f", or --max-num-batched-tokens {tight} "
+                        f"--rbln-prefill-chunk-size {small},{tight}"
+                    )
                 raise ValueError(
-                    f"The longest prefill chunk ({chunk}) cannot hold a multimodal "
-                    f"range of up to {longest} tokens; set --rbln-prefill-chunk-size "
-                    f"(with --max-num-batched-tokens and --block-size) to at least "
-                    f"{longest}, or lower max_soft_tokens."
+                    f"--rbln-prefill-chunk-size {chunks} cannot serve "
+                    f"max_soft_tokens={longest}. The prefill chunk sizes need:\n"
+                    f"  1. each at most --max-num-batched-tokens, which is at most "
+                    f"--block-size ({block_size});\n"
+                    f"  2. the longest at least max_soft_tokens ({longest}), since "
+                    "an image or video frame runs in one chunk;\n"
+                    f"  3. for sub-block prefix caching, one that divides "
+                    f"--block-size ({block_size}).\n"
+                    f"For example {example}. Or lower max_soft_tokens in "
+                    "--mm-processor-kwargs."
                 )
             # TODO(RBLN): the drafter's builders get no row ends, so its sliding
             # layers would run the ranges causally.
@@ -2019,7 +2048,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             )
 
         # Stamp the step's phase before any step logic reads it.
-        self.is_prefill = step_is_prefill(scheduler_output)
+        self.is_prefill = step_is_prefill(
+            scheduler_output, strict_kv_producer=self.is_strict_kv_producer
+        )
 
         # Before anything reads token_ids_cpu this step.
         if self.use_async_scheduling:
@@ -2306,7 +2337,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             if spec_config.use_eagle():
                 if input_fits_in_drafter:
                     propose_draft_token_ids(sampler_output.sampled_token_ids)
-            else:
+            elif not self.is_strict_kv_producer:
+                # The proposers here hold no KV of their own, so on a producer
+                # they would only build drafts nobody verifies. The draft-model
+                # ones took the branch above, where the first pass still runs to
+                # write the KV the consumer's drafter reads.
                 propose_drafts_after_bookkeeping = input_fits_in_drafter
 
             if not input_fits_in_drafter:
@@ -2408,6 +2443,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         req_ids = self.input_batch.req_ids.copy()
         if not self.num_spec_tokens or not req_ids:
+            return None
+        if self.is_strict_kv_producer:
+            # A producer verifies no drafts. Its non-model proposers are skipped
+            # above, leaving _draft_token_ids unset, and the eagle placeholder
+            # is zeros nobody should schedule.
             return None
         draft_token_ids = (
             self._draft_token_ids.tolist()
@@ -2901,6 +2941,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 f"{batch_desc.num_tokens_padded} tokens the ranks settled on"
             )
 
+        # Match serving's prefill bucket for the decided query length.
+        query_len_padded = (
+            min(c for c in self.prefill_chunk_sizes if c >= target_query_len)
+            if is_prefill
+            else target_query_len
+        )
+
         num_scheduled_tokens = np.array([target_query_len] * num_reqs, dtype=np.int32)
         num_tokens = int(num_scheduled_tokens.sum())
         # The decided length, not the requested one, is what the buffers below are
@@ -2926,7 +2973,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             max_query_len=target_query_len,
             num_reqs=num_reqs,
             num_reqs_padded=batch_desc.num_reqs_padded,
-            mm_prefix_row_ends=torch.arange(target_query_len)
+            mm_prefix_row_ends=torch.arange(query_len_padded)
             if is_prefill and self.model_config.is_mm_prefix_lm
             else None,
         )
@@ -2961,14 +3008,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             intermediate_tensors = None
         else:
             intermediate_tensors = self._create_or_get_intermediate_tensors(
-                batch_desc.num_reqs_padded, target_query_len
+                batch_desc.num_reqs_padded, query_len_padded
             )
 
         layout = InputLayout(
             num_reqs=num_reqs,
             num_reqs_padded=batch_desc.num_reqs_padded,
             query_len=target_query_len,
-            query_len_padded=target_query_len,
+            query_len_padded=query_len_padded,
         )
         # NOTE(RBLN): Clone tensors to make tensors non-view tensors.
         staged_model_input = self.input_stager.stage(
@@ -3011,7 +3058,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 draft_query_len = query_len
                 if self.uses_fixed_decode_window and self.num_spec_tokens == 1:
                     draft_query_len = target_query_len
-                self.drafter.dummy_run(num_reqs, draft_query_len, False)
+                self.drafter.dummy_run(num_reqs, draft_query_len, is_prefill)
 
         self.input_batch.num_tokens_no_spec[:num_reqs] = 0
 
@@ -3702,7 +3749,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 enable_prefix_caching=self.cache_config.enable_prefix_caching,
                 sub_block_cache=self.rbln_config.enable_sub_block_cache,
                 block_size=self.cache_config.block_size,
-                prefill_chunk_size=self.rbln_config.max_prefill_chunk_size,
+                prefill_chunk_sizes=self.prefill_chunk_sizes,
                 kv_cache_config=kv_cache_config,
                 sub_block_size=self.rbln_config.sub_block_size,
             ),
@@ -4103,13 +4150,18 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 bonus_logits=bonus_kwargs.get("bonus_logits"),
             )
 
-    def run_model_graphs(self) -> None:
-        """Every model graph once, at the shapes serving will ask for."""
-        # 1. prefill
-        for chunk in self.prefill_chunk_sizes:
-            self._dummy_run(1, chunk, True)
+    def decode_graph_shapes(self) -> list[tuple[int, int, int | None]]:
+        """(num_reqs, query_len, num_tokens_padded_override) per decode graph.
 
-        # 2. decode
+        Warm-up runs one dummy per entry and the KV-cache estimate reserves one
+        command-stream buffer per entry.
+
+        Empty on a strict KV producer: every step it runs is a prefill step, so
+        a decode runtime would only hold a buffer the KV cache can have instead.
+        """
+        if self.is_strict_kv_producer:
+            return []
+
         query_lens = [1]
         if self.speculative_config:
             spec_query_len = self.speculative_config.num_speculative_tokens + 1
@@ -4118,9 +4170,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 if self.uses_fixed_decode_window
                 else [1, spec_query_len]
             )
-        for num_req in self.bucketing_manager.decode_batch_buckets:
-            for query_len in query_lens:
-                self._dummy_run(num_req, query_len, False)
+        shapes: list[tuple[int, int, int | None]] = [
+            (num_req, query_len, None)
+            for num_req in self.bucketing_manager.decode_batch_buckets
+            for query_len in query_lens
+        ]
 
         if self.specialized_moe_decode:
             # NOTE(RBLN): Compile decode graphs with prefill-sized padding to
@@ -4128,24 +4182,25 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             # rank prefills). Warm-up is symmetric, so it cannot reach those
             # shapes on its own: it pins the token dimension the ANY_PREFILL
             # and QLEN_ASYM routes would ask for, which the small-bucket decode
-            # graphs from 2. decode above cannot satisfy.
+            # graphs above cannot satisfy.
             num_req = self.bucketing_manager.decode_batch_buckets[-1]
-            for query_len in query_lens:
-                self._dummy_run(
-                    num_req,
-                    query_len,
-                    False,
-                    num_tokens_padded_override=self.max_num_tokens,
-                )
+            shapes += [
+                (num_req, query_len, self.max_num_tokens) for query_len in query_lens
+            ]
             if self.speculative_config and not self.uses_fixed_decode_window:
                 # Cover DP-asymmetric decode where a peer runs spec decode.
-                self._dummy_run(
-                    num_req,
-                    1,
-                    False,
-                    num_tokens_padded_override=num_req
-                    * (self.speculative_config.num_speculative_tokens + 1),
-                )
+                spec_query_len = self.speculative_config.num_speculative_tokens + 1
+                shapes.append((num_req, 1, num_req * spec_query_len))
+        return shapes
+
+    def run_model_graphs(self) -> None:
+        """Every model graph once, at the shapes serving will ask for."""
+        for chunk in self.prefill_chunk_sizes:
+            self._dummy_run(1, chunk, True)
+        for num_reqs, query_len, override in self.decode_graph_shapes():
+            self._dummy_run(
+                num_reqs, query_len, False, num_tokens_padded_override=override
+            )
 
     def warmup_model(self) -> None:
         # NOTE(RBLN): Warm-up must not route through execute_model() while a
@@ -4171,13 +4226,21 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 # NOTE(RBLN): the sampler and the rejection sampler are built on
                 # the last PP rank only, so no other rank has anything to warm up here.
                 if get_pp_group().is_last_rank:
+                    # A strict producer admits one request per step, since every
+                    # step it runs is a prefill, so warm-up samples at that width.
+                    batch_buckets = (
+                        [1]
+                        if self.is_strict_kv_producer
+                        else self.bucketing_manager.batch_buckets
+                    )
                     # 4-1. sampler
                     if not self.is_pooling_model:
-                        for size in self.bucketing_manager.batch_buckets:
+                        for size in batch_buckets:
                             self._dummy_sampler_run(size)
 
-                    # 4-2. rejection sampler
-                    self._warmup_sampler_decode_batches()
+                    # 4-2. rejection sampler -- a producer verifies no drafts.
+                    if not self.is_strict_kv_producer:
+                        self._warmup_sampler_decode_batches()
 
                 # 5. specdec (medusa)
                 if isinstance(self.drafter, RBLNMedusaProposer):

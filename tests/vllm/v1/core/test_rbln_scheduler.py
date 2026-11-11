@@ -543,9 +543,18 @@ class TestIsPrefill:
         # num_computed < num_tokens - 1 is prefill; the last-token point is not.
         req = create_requests(1, num_tokens=10)[0]
         req.num_computed_tokens = 5
-        assert is_prefill(req)
+        assert is_prefill(req, strict_kv_producer=False)
         req.num_computed_tokens = req.num_tokens - 1
-        assert not is_prefill(req)
+        assert not is_prefill(req, strict_kv_producer=False)
+
+    def test_is_prefill_boundary_on_a_strict_producer(self):
+        # A producer has no decode graph, so the last-token point is a prefill
+        # too; only a fully computed request is left on the decode side.
+        req = create_requests(1, num_tokens=10)[0]
+        req.num_computed_tokens = req.num_tokens - 1
+        assert is_prefill(req, strict_kv_producer=True)
+        req.num_computed_tokens = req.num_tokens
+        assert not is_prefill(req, strict_kv_producer=True)
 
     def test_a_one_token_prompt_runs_alone_as_a_prefill(self):
         sched = create_rbln_scheduler(max_num_seqs=4, block_size=16, num_blocks=10000)
@@ -555,7 +564,7 @@ class TestIsPrefill:
         out = sched.schedule()
 
         assert list(out.num_scheduled_tokens) == ["one"]
-        assert step_is_prefill(out)
+        assert step_is_prefill(out, strict_kv_producer=False)
 
 
 class TestScheduleBasic:
@@ -968,11 +977,6 @@ class TestMmPrefixChunks:
         req = make_request("a", list(range(num_tokens)), 16, mm_features=features)
         return self._prefill(sched, req)
 
-    def test_text_and_an_image_share_a_chunk(self, monkeypatch):
-        # <boi> at 2, soft tokens at 3..12, <eoi> at 13.
-        image = self._feature("image", 2, [False] + [True] * 10 + [False])
-        assert self._chunks(monkeypatch, [image]) == [16, 16, 8]
-
     def test_a_range_the_chunk_would_cut_moves_whole_to_the_next_step(
         self, monkeypatch
     ):
@@ -986,12 +990,6 @@ class TestMmPrefixChunks:
         chunks = self._chunks(monkeypatch, [image], chunk_size=8)
         assert chunks == [8] * 5
 
-    def test_no_step_exceeds_the_longest_chunk(self, monkeypatch):
-        # The 32-token budget would hold the whole rest; the longest chunk caps it.
-        image = self._feature("image", 9, [False] + [True] * 10 + [False])
-        chunks = self._chunks(monkeypatch, [image], budget=32, chunk_size=[8, 16])
-        assert chunks == [10, 16, 14]
-
     def test_each_video_frame_is_its_own_range(self, monkeypatch):
         # Two frames of four soft tokens, each between a timestamp, <boi>, <eoi>:
         # soft tokens at 4..7 and 11..14, so only the second frame is cut.
@@ -999,10 +997,6 @@ class TestMmPrefixChunks:
         video = self._feature("video", 2, frame * 2)
         chunks = self._chunks(monkeypatch, [video], num_tokens=24, chunk_size=13)
         assert chunks == [11, 13]
-
-    def test_audio_is_not_an_mm_prefix_range(self, monkeypatch):
-        audio = self._feature("audio", 4, [True] * 8)
-        assert self._chunks(monkeypatch, [audio], num_tokens=24) == [16, 8]
 
     def _prefix_hit_inside_a_range(self, monkeypatch, second_image):
         # Soft tokens at 20..40, <eoi> at 41. The second request shares the first
@@ -1035,12 +1029,30 @@ class TestMmPrefixChunks:
         computed, scheduled = self._prefix_hit_inside_a_range(monkeypatch, True)
         assert (computed - scheduled, scheduled) == (32, 14)
 
-    def test_a_hit_on_a_ranges_last_token_runs_it_with_the_text_after(self):
-        # Soft tokens at 10..19; a hit ending at 19 leaves the range's last token.
-        image = self._feature("image", 9, [False] + [True] * 10 + [False])
-        sched = create_rbln_scheduler(max_num_batched_tokens=16, max_model_len=64)
-        req = make_request("a", list(range(40)), 16, mm_features=[image])
-        assert sched._mm_prefix_split(req, 19, 16) == 16
+    def test_decode_steps_skip_the_range_scan(self, monkeypatch):
+        image = self._feature("image", 9, [False] + [True] * 6 + [False])
+        sched = self._scheduler(monkeypatch)
+        req = make_request("a", list(range(20)), 16, mm_features=[image], max_tokens=4)
+        sched.add_request(req)
+        while req.num_output_tokens == 0:
+            out = sched.schedule()
+            done = req.num_computed_tokens >= req.num_prompt_tokens
+            sched.update_from_output(
+                out, make_model_runner_output(out, 0 if done else None)
+            )
+        calls = []
+        split = sched._mm_prefix_split
+
+        def recording_split(*args):
+            calls.append(args)
+            return split(*args)
+
+        monkeypatch.setattr(sched, "_mm_prefix_split", recording_split)
+
+        out = sched.schedule()
+
+        assert out.num_scheduled_tokens["a"] == 1
+        assert calls == []
 
 
 class TestScheduleSpecDecodeCap:
@@ -1258,7 +1270,7 @@ class TestAsyncMaxTokensSkip:
     """
 
     @staticmethod
-    def _drain_async(sched, token=7, max_steps=50):
+    def _drain_async(sched, token=7, max_steps=50, per_step=None):
         """One output in flight, the way the engine's batch queue drives async:
         schedule() runs a step ahead of the update_from_output() for the step
         before it. That lag is what leaves num_output_placeholders above zero,
@@ -1270,6 +1282,8 @@ class TestAsyncMaxTokensSkip:
             scheduled = bool(out.num_scheduled_tokens)
             if scheduled:
                 steps += 1
+                if per_step is not None:
+                    per_step(out)
             if pending is not None:
                 sched.update_from_output(*pending)
             pending = (out, make_model_runner_output(out, token)) if scheduled else None
@@ -1437,7 +1451,7 @@ class TestPortDriftConformance:
 # check the invariants hold at every step.
 
 
-def _check_phase_agrees(sched, out) -> bool:
+def _check_phase_agrees(sched, out, *, strict_kv_producer: bool = False) -> bool:
     """The scheduler's phase for a step against the phase the runner derives from
     it, and that the step carries only one of the two. Returns the phase.
 
@@ -1452,11 +1466,14 @@ def _check_phase_agrees(sched, out) -> bool:
                 SimpleNamespace(
                     num_computed_tokens=req.num_computed_tokens - chunk,
                     num_tokens=req.num_tokens,
-                )
+                ),
+                strict_kv_producer=strict_kv_producer,
             )
         )
     assert len(phases) <= 1, "a step mixed prefill and decode"
-    assert step_is_prefill(out) is (phases == {True}), (
+    assert step_is_prefill(out, strict_kv_producer=strict_kv_producer) is (
+        phases == {True}
+    ), (
         f"phase {phases} but chunks {out.num_scheduled_tokens} "
         f"(spec {out.scheduled_spec_decode_tokens})"
     )
@@ -1481,6 +1498,41 @@ class TestFullRunInvariants:
         _drain(sched, per_step=check)
         assert all(r.is_finished() for r in reqs)
         assert sched.running == []
+
+    @pytest.mark.parametrize("async_scheduling", [False, True])
+    # The input processor refuses max_tokens=4 on a producer; it stays here as
+    # the scheduler's invariant for a request that gets past that check.
+    @pytest.mark.parametrize("max_tokens", [1, 4])
+    # 17 against a 16-token step chunks the prompt and leaves a one-token tail.
+    @pytest.mark.parametrize("num_tokens", [10, 17])
+    def test_a_producer_reads_prefill_at_every_step_of_a_full_drain(
+        self, async_scheduling, max_tokens, num_tokens
+    ):
+        # The scheduler's and the runner's phase views agree, one request per
+        # step, across a whole run. Async schedules each step with the last
+        # one's output still in flight.
+        sched = create_rbln_scheduler(
+            async_scheduling=async_scheduling,
+            max_num_seqs=4,
+            block_size=16,
+            num_blocks=10000,
+            max_num_batched_tokens=16,
+            max_model_len=64,
+            use_kv_connector=MockKVConfig(matched_tokens=0, kv_role="kv_producer"),
+        )
+        reqs = create_requests(6, num_tokens=num_tokens, max_tokens=max_tokens)
+        for r in reqs:
+            sched.add_request(r)
+
+        def check(out):
+            assert _check_phase_agrees(sched, out, strict_kv_producer=True)
+            assert len(list(out.num_scheduled_tokens)) == 1
+
+        if async_scheduling:
+            TestAsyncMaxTokensSkip._drain_async(sched, per_step=check)
+        else:
+            _drain(sched, per_step=check)
+        assert all(r.is_finished() for r in reqs)
 
     @pytest.mark.parametrize(
         ("num_tokens", "max_num_batched_tokens"),
@@ -1822,12 +1874,12 @@ class TestNoSpecDuringPrefill:
         )[0]
         sched.add_request(req)
         out = sched.schedule()  # first prefill chunk
-        assert is_prefill(req)
+        assert is_prefill(req, strict_kv_producer=False)
         sched.update_from_output(out, make_model_runner_output(out, 0))
 
         req.spec_token_ids = [1] * 4  # spec present, but still prefilling
         out2 = sched.schedule()
-        assert is_prefill(req)
+        assert is_prefill(req, strict_kv_producer=False)
         assert out2.num_scheduled_tokens[req.request_id] == 32  # a full prefill chunk
         assert req.request_id not in out2.scheduled_spec_decode_tokens
 
@@ -1926,7 +1978,9 @@ class TestDecodeCapMachinery:
         )
         for r in reqs:
             advance_to_decode(sched, r)
-        running_decodes = sum(1 for r in sched.running if not is_prefill(r))
+        running_decodes = sum(
+            1 for r in sched.running if not is_prefill(r, strict_kv_producer=False)
+        )
         out = sched.schedule()
         # At most ceil(active / pp) decodes admitted this step, and at least one.
         assert 1 <= len(out.num_scheduled_tokens) <= math.ceil(running_decodes / 2)

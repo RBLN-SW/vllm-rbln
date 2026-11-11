@@ -277,6 +277,14 @@ class RBLNGemma4ForConditionalGeneration(
             raise ValueError(
                 "Gemma4 does not support speculative decoding on RBLN yet."
             )
+        # Upstream fills per-layer inputs in its own embed_input_ids, which the
+        # in-graph merge of mm embeddings (forward) bypasses.
+        text_config = vllm_config.model_config.hf_config.text_config
+        if getattr(text_config, "hidden_size_per_layer_input", None):
+            raise ValueError(
+                "Gemma4 variants with per-layer inputs (E2B, E4B) are not "
+                "supported on RBLN yet."
+            )
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         self.mm_prefix_max_model_len = vllm_config.model_config.max_model_len
         self.mm_prefix_attn_layers: list[nn.Module] = []
@@ -299,6 +307,12 @@ class RBLNGemma4ForConditionalGeneration(
         budgets = sorted(rbln_config.encoder_token_budgets) or [
             budget for budget in _SUPPORTED_SOFT_TOKENS if budget <= cap
         ]
+        if unsupported := sorted(set(budgets) - set(_SUPPORTED_SOFT_TOKENS)):
+            raise ValueError(
+                f"encoder_token_budgets {unsupported} are not Gemma4 soft token "
+                f"budgets; pick from {list(_SUPPORTED_SOFT_TOKENS)}, the counts "
+                "its image processor emits."
+            )
         if budgets[-1] < cap:
             raise ValueError(
                 f"encoder_token_budgets {budgets} must reach max_soft_tokens={cap}, "
@@ -359,18 +373,11 @@ class RBLNGemma4ForConditionalGeneration(
         vision_config = self.config.vision_config
         pool = vision_config.pooling_kernel_size
         patch_pixels = 3 * vision_config.patch_size**2
-        axis_len = self.vision_tower.patch_embedder.position_embedding_table.shape[1]
         with torch.inference_mode():
             for bucket in self.mm_encoder_patch_buckets:
                 # A full grid whose sides are multiples of the pooling kernel.
                 cells = bucket // pool**2
                 rows = max(d for d in range(1, math.isqrt(cells) + 1) if cells % d == 0)
-                if cells // rows * pool > axis_len:
-                    raise ValueError(
-                        f"An encoder budget of {cells} soft tokens has no warm-up "
-                        f"grid within the vision tower's {axis_len} "
-                        "positions per axis; pick a budget with closer factors."
-                    )
                 ys, xs = torch.meshgrid(
                     torch.arange(rows * pool),
                     torch.arange(cells // rows * pool),

@@ -247,7 +247,11 @@ def test_prefill_chunk_sizes_are_a_sorted_list(value, sizes):
 
 @pytest.mark.parametrize(
     ("sizes", "error"),
-    [([0, 64], "must all be > 0"), ([64, 64], "unique")],
+    [
+        ([], "must not be empty"),
+        ([0, 64], "must all be > 0"),
+        ([64, 64], "unique"),
+    ],
 )
 def test_prefill_chunk_sizes_are_positive_and_unique(sizes, error):
     with pytest.raises(ValueError, match=error):

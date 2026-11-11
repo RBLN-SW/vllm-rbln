@@ -14,13 +14,10 @@
 
 import torch
 from vllm.config import VllmConfig
-from vllm.model_executor.models.config import Gemma4Config
 from vllm.model_executor.models.gemma4 import Gemma4DecoderLayer
 
 from vllm_rbln.patches import register_patch
 from vllm_rbln.patches.registry import add_registration
-
-upstream_verify_and_update_config = Gemma4Config.verify_and_update_config
 
 
 @register_patch(

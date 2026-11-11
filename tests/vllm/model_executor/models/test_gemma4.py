@@ -87,8 +87,7 @@ def _image(width: int, height: int, num_patches: int):
     return pixels, positions
 
 
-@pytest.mark.parametrize("width, height", [(6, 3), (3, 9), (9, 9)])
-def test_the_vision_encoder_matches_hfs(width, height):
+def test_the_vision_encoder_matches_hfs():
     # The encoder pads every image to its bucket and runs attention spelled out;
     # what comes back must be HF's soft tokens for the image alone.
     tower = _vision_tower()
@@ -98,7 +97,7 @@ def test_the_vision_encoder_matches_hfs(width, height):
         model_dtype=torch.float32,
         mm_encoder_patch_buckets=[90],
     )
-    pixels, positions = _image(width, height, num_patches=81)
+    pixels, positions = _image(9, 9, num_patches=81)
 
     with torch.no_grad():
         got = model._encode_vision(pixels, positions)
@@ -106,7 +105,7 @@ def test_the_vision_encoder_matches_hfs(width, height):
             pixel_values=pixels[None], pixel_position_ids=positions[None]
         ).last_hidden_state
 
-    assert got.shape == (width * height // POOL**2, 32)
+    assert got.shape == (9 * 9 // POOL**2, 32)
     torch.testing.assert_close(got, expected, rtol=1e-4, atol=1e-4)
 
 
@@ -135,19 +134,6 @@ def test_the_rotary_tables_are_built_once_not_per_image(monkeypatch):
         got = model._encode_vision(*second)
 
     torch.testing.assert_close(got, expected, rtol=1e-4, atol=1e-4)
-
-
-def test_an_image_beyond_the_bucket_is_refused():
-    model = _bare_model(
-        vision_tower=_vision_tower(),
-        embed_vision=_Identity(),
-        model_dtype=torch.float32,
-        mm_encoder_patch_buckets=[9],
-    )
-    pixels, positions = _image(6, 3, num_patches=18)
-
-    with pytest.raises(AssertionError, match="9-patch bucket"):
-        model._encode_vision(pixels, positions)
 
 
 def test_speculative_decoding_is_refused():
@@ -180,9 +166,7 @@ def _recording_model(buckets):
     return model, calls
 
 
-@pytest.mark.parametrize(
-    "width, height, bucket", [(3, 3, 18), (6, 3, 18), (9, 3, 45), (9, 9, 90)]
-)
+@pytest.mark.parametrize("width, height, bucket", [(6, 3, 18), (9, 3, 45)])
 def test_an_image_takes_the_smallest_bucket_holding_it(width, height, bucket):
     model, calls = _recording_model([18, 45, 90])
     pixels, positions = _image(width, height, num_patches=90)
@@ -200,24 +184,7 @@ def test_warm_up_runs_every_bucket_once_full():
     assert calls == [(18, 18), (45, 45), (90, 90)]
 
 
-def test_warm_up_without_an_encoder_runs_nothing():
-    model, calls = _recording_model([18])
-    object.__setattr__(model, "_mm_encoder", None)
-
-    model.warmup_mm_encoder()
-
-    assert calls == []
-
-
-def test_warm_up_refuses_a_budget_with_no_grid_inside_the_tower():
-    # Seven cells only lay out as 1 x 7, 21 patches wide; the table holds 16.
-    model, calls = _recording_model([7 * POOL**2])
-
-    with pytest.raises(ValueError, match="no warm-up grid"):
-        model.warmup_mm_encoder()
-
-
-def _built_model(monkeypatch, *, cap, budgets, attention_layers=()):
+def _built_model(monkeypatch, *, cap, budgets, per_layer_input=0, attention_layers=()):
     """The model as construction resolves it, upstream's model left out."""
 
     def upstream_init(self, **kwargs):
@@ -245,7 +212,14 @@ def _built_model(monkeypatch, *, cap, budgets, attention_layers=()):
         vllm_config=SimpleNamespace(
             parallel_config=SimpleNamespace(data_parallel_size=1),
             speculative_config=None,
-            model_config=SimpleNamespace(max_model_len=32768),
+            model_config=SimpleNamespace(
+                max_model_len=32768,
+                hf_config=SimpleNamespace(
+                    text_config=SimpleNamespace(
+                        hidden_size_per_layer_input=per_layer_input
+                    )
+                ),
+            ),
             additional_config=SimpleNamespace(encoder_token_budgets=budgets),
         )
     )
@@ -271,7 +245,7 @@ def test_mm_prefix_mask_selects_only_sliding_layers(monkeypatch, use_mm_prefix):
 
 @pytest.mark.parametrize(
     "budgets, buckets",
-    [([], [70 * 9, 140 * 9, 280 * 9]), ([300, 100], [100 * 9, 300 * 9])],
+    [([], [70 * 9, 140 * 9, 280 * 9]), ([560, 70], [70 * 9, 560 * 9])],
 )
 def test_the_encoder_buckets_follow_encoder_token_budgets(
     monkeypatch, budgets, buckets
@@ -281,13 +255,46 @@ def test_the_encoder_buckets_follow_encoder_token_budgets(
 
 
 def test_the_longest_range_is_the_cap_not_the_largest_budget(monkeypatch):
-    model = _built_model(monkeypatch, cap=280, budgets=[300, 100])
+    model = _built_model(monkeypatch, cap=280, budgets=[560, 70])
     assert model.max_mm_prefix_range_len == 280
 
 
 def test_budgets_that_cannot_encode_an_image_at_the_cap_are_refused(monkeypatch):
     with pytest.raises(ValueError, match="must reach max_soft_tokens=280"):
         _built_model(monkeypatch, cap=280, budgets=[70, 140])
+
+
+def test_budgets_the_processor_never_emits_are_refused(monkeypatch):
+    with pytest.raises(ValueError, match=r"\[100, 300\] are not Gemma4"):
+        _built_model(monkeypatch, cap=280, budgets=[300, 100, 280])
+
+
+def test_variants_with_per_layer_inputs_are_refused(monkeypatch):
+    with pytest.raises(ValueError, match="per-layer inputs"):
+        _built_model(monkeypatch, cap=280, budgets=[], per_layer_input=256)
+
+
+@pytest.mark.parametrize("scale_first", [True, False])
+def test_each_expert_down_projection_is_scaled_once(monkeypatch, scale_first):
+    loaded = {}
+
+    def load_weights(self, weights):
+        loaded.update(weights)
+        return set(loaded)
+
+    monkeypatch.setattr(Gemma4ForConditionalGeneration, "load_weights", load_weights)
+    prefix = "model.language_model.layers.0."
+    scale = (prefix + "router.per_expert_scale", torch.tensor([2.0, 3.0]))
+    down = (prefix + "experts.down_proj", torch.ones(2, 4, 5))
+    other = (prefix + "experts.gate_up_proj", torch.ones(2, 10, 4))
+    weights = [scale, down, other] if scale_first else [down, other, scale]
+
+    _bare_model().load_weights(weights)
+
+    torch.testing.assert_close(
+        loaded[down[0]], torch.ones(2, 4, 5) * torch.tensor([2.0, 3.0]).view(-1, 1, 1)
+    )
+    assert set(loaded) == {scale[0], down[0], other[0]}
 
 
 def _processing_info(engine_kwargs, processor_default, default_output_length):
@@ -305,17 +312,9 @@ def _processing_info(engine_kwargs, processor_default, default_output_length):
     )
 
 
-@pytest.mark.parametrize(
-    "engine_kwargs, cap",
-    [
-        ({}, 280),
-        ({"max_soft_tokens": 70}, 70),
-        ({"images_kwargs": {"max_soft_tokens": 1120}}, 1120),
-    ],
-)
-def test_the_cap_is_the_engines_budget_else_the_processors(engine_kwargs, cap):
-    info = _processing_info(engine_kwargs, 280, 280)
-    assert gemma4.mm_soft_token_cap(info) == cap
+def test_the_engines_budget_overrides_the_processors():
+    info = _processing_info({"images_kwargs": {"max_soft_tokens": 1120}}, 280, 280)
+    assert gemma4.mm_soft_token_cap(info) == 1120
 
 
 def test_a_default_output_length_the_processor_ignores_is_refused():

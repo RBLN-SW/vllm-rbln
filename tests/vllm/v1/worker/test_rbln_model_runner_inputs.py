@@ -134,20 +134,31 @@ class TestResolveMmPrefixSupport:
 
         assert runner._resolve_mm_support() is True
 
-    def test_a_range_longer_than_the_longest_chunk_is_refused(
+    def test_a_range_longer_than_the_longest_chunk_is_refused_with_a_fix(
         self, make_model_runner, monkeypatch
     ):
         # The step budget holds the range; only the longest chunk does not.
         runner = self._runner(
             make_model_runner,
             monkeypatch,
-            _MmPrefixModel(200),
-            max_num_batched_tokens=256,
-            additional_config={"prefill_chunk_size": [128]},
+            _MmPrefixModel(1120),
+            max_num_batched_tokens=512,
+            block_size=8192,
+            additional_config={"prefill_chunk_size": [512]},
         )
 
-        with pytest.raises(ValueError, match="--rbln-prefill-chunk-size"):
+        with pytest.raises(ValueError) as refused:
             runner._resolve_mm_support()
+        message = str(refused.value)
+        assert (
+            "--max-num-batched-tokens 2048 --rbln-prefill-chunk-size 512,2048"
+            in message
+        )
+        assert "--rbln-prefill-chunk-size 512,1152" in message
+        assert (
+            "max_soft_tokens (1120)" in message
+            and "divides --block-size (8192)" in message
+        )
 
 
 class TestGatherMultimodalEmbeddings:
@@ -622,3 +633,46 @@ class TestBookkeepingSyncSpecDecode:
 
         assert step([[101, 102], [201, -1]]) == [2, 1]
         assert step([[103], [202]]) == [1, 1]
+
+
+@pytest.mark.parametrize(
+    ("kv_role", "prefill"), [("kv_producer", True), ("kv_both", False)]
+)
+def test_a_producer_stages_its_last_prompt_token_as_a_prefill(
+    make_model_runner, monkeypatch, kv_role, prefill
+):
+    # A full prefix hit leaves one prompt token. A producer compiled only the
+    # prefill graph, so the step has to reach the model at that graph's width.
+    from vllm.config import KVTransferConfig
+
+    monkeypatch.setattr(
+        mr,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: False)
+    runner = make_model_runner(
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="RblnNixlConnector", kv_role=kv_role
+        )
+    )
+    staged = {}
+
+    def model(**kwargs):
+        staged.update(kwargs)
+        return torch.zeros(1, 1, 8), torch.zeros(1, 8), None
+
+    runner.model_executable = model
+
+    runner.execute_model(
+        schedule_new("a", num_computed_tokens=[2], num_scheduled_tokens=[1])
+    )
+
+    assert runner.is_prefill is prefill
+    assert staged["input_ids"][0, 0].item() == 3
+    assert staged["positions"][0, 0].item() == 2
+    if prefill:
+        assert staged["input_ids"].shape == (1, runner.prefill_chunk_sizes[0])
+        assert staged["token_indices"].tolist() == [0]
+    else:
+        assert staged["input_ids"].shape[1] == 1

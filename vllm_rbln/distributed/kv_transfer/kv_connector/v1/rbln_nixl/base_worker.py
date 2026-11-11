@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -244,6 +244,7 @@ class RblnNixlWorkerBase(
         # drops the entry without releasing what other peers still use.
         self._borrowed_src_handles: set[tuple[str, int, int]] = set()
         self._shard_region_group_ids: dict[tuple[str, int], tuple[int, ...]] = {}
+        self._shard_peer_region_group_ids: dict[tuple[str, int], tuple[int, ...]] = {}
         # How many descriptors a block of each of that shard's regions is: the
         # pieces a peer of another TP degree pairs it in (`pair_area`), else one.
         self._shard_descs_per_block: dict[tuple[str, int], tuple[int, ...]] = {}

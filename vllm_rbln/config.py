@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -79,7 +79,7 @@ class RBLNConfigBase:
 
     sub_block_size: int | None = Field(default=None, gt=0)
     """Token granularity for prefix cache hit calculation.
-    If None, uses the longest prefill_chunk_size.
+    If None, uses the longest prefill_chunk_size that divides block_size.
     """
 
 
@@ -201,6 +201,8 @@ class RBLNConfig(RBLNConfigBase):
             raise ValueError("encoder_token_budgets must be unique")
         sizes = self.prefill_chunk_size
         if sizes is not None:
+            if not sizes:
+                raise ValueError("prefill_chunk_size must not be empty")
             if any(s <= 0 for s in sizes):
                 raise ValueError("prefill_chunk_size must all be > 0")
             if len(sizes) != len(set(sizes)):
