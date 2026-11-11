@@ -51,6 +51,7 @@ def _vllm_config(hf_config, *, optimum_overrides=None, user_chunk=None):
             user_specified_block_size=True,
             enable_prefix_caching=False,
             gpu_memory_utilization=0.9,
+            num_gpu_blocks_override=None,
         ),
         additional_config=build_optimum_rbln_config(
             {
@@ -91,6 +92,90 @@ def test_multimodal_decoder_option(monkeypatch, architecture, key):
     assert decoder["nested_compile_region"] is True
     if key:
         assert "nested_compile_region" not in inputs.rbln_config
+
+
+@pytest.mark.parametrize(
+    "num_blocks, override_blocks, expected_blocks",
+    [
+        (None, None, None),
+        (None, 0, None),
+        (None, 16, 16),
+        (16, None, 16),
+        (16, 0, 16),
+        (16, 16, 16),
+    ],
+)
+@pytest.mark.parametrize(
+    "architecture, key",
+    [
+        ("LlamaForCausalLM", None),
+        ("Qwen3VLForConditionalGeneration", None),
+        ("Gemma3ForConditionalGeneration", "language_model"),
+        ("Idefics3ForConditionalGeneration", "text_model"),
+    ],
+)
+def test_explicit_blocks_replace_automatic_memory_budget(
+    architecture, key, num_blocks, override_blocks, expected_blocks
+):
+    overrides = (
+        {} if override_blocks is None else {"kvcache_num_blocks": override_blocks}
+    )
+    overrides = {key: overrides} if key else overrides
+    cfg = _vllm_config(
+        PretrainedConfig(architectures=[architecture]), optimum_overrides=overrides
+    )
+    cfg.cache_config.num_gpu_blocks_override = num_blocks
+    inputs = prepare_compile_config(cfg)
+    decoder = inputs.rbln_config[key] if key else inputs.rbln_config
+    if expected_blocks is None:
+        assert decoder["memory_budget"] == 0.9
+    else:
+        assert "memory_budget" not in decoder
+        assert decoder["kvcache_num_blocks"] == expected_blocks
+    assert cfg.additional_config.optimum_overrides == overrides
+    assert cfg.cache_config.num_gpu_blocks_override == num_blocks
+    assert cfg.cache_config.gpu_memory_utilization == 0.9
+
+
+@pytest.mark.parametrize("memory_budget", [0.8, None])
+@pytest.mark.parametrize("block_source", ["vllm", "optimum"])
+@pytest.mark.parametrize(
+    "architecture, decoder_key, budget_key",
+    [
+        ("LlamaForCausalLM", None, None),
+        ("Qwen3VLForConditionalGeneration", None, None),
+        ("Gemma3ForConditionalGeneration", "language_model", "language_model"),
+        ("Gemma3ForConditionalGeneration", "language_model", None),
+        ("Idefics3ForConditionalGeneration", "text_model", "text_model"),
+        ("Idefics3ForConditionalGeneration", "text_model", None),
+    ],
+)
+def test_explicit_blocks_validate_memory_budget_override(
+    architecture, decoder_key, budget_key, block_source, memory_budget
+):
+    overrides: dict = {}
+    decoder_overrides = (
+        overrides.setdefault(decoder_key, {}) if decoder_key else overrides
+    )
+    if block_source == "optimum":
+        decoder_overrides["kvcache_num_blocks"] = 16
+    budget_overrides = overrides.setdefault(budget_key, {}) if budget_key else overrides
+    budget_overrides["memory_budget"] = memory_budget
+    cfg = _vllm_config(
+        PretrainedConfig(architectures=[architecture]), optimum_overrides=overrides
+    )
+    if block_source == "vllm":
+        cfg.cache_config.num_gpu_blocks_override = 16
+
+    if memory_budget is not None:
+        with pytest.raises(ValueError, match="memory_budget.*explicit.*block count"):
+            prepare_compile_config(cfg)
+    else:
+        inputs = prepare_compile_config(cfg)
+        decoder = inputs.rbln_config[decoder_key] if decoder_key else inputs.rbln_config
+        assert decoder.get("memory_budget") is None
+        assert decoder["kvcache_num_blocks"] == 16
+    assert cfg.additional_config.optimum_overrides == overrides
 
 
 def test_flag_conflicts_with_decoder_override(monkeypatch):

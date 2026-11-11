@@ -46,6 +46,17 @@ def apply_runtime_config(
     prefill_chunk_size = runtime_config.prefill_chunk_size
     compiled_dtype = runtime_config.compiled_dtype
     additional_config: OptimumRBLNConfig = vllm_config.additional_config
+    cache_config = vllm_config.cache_config
+    utilization = runtime_config.gpu_memory_utilization
+    if cache_config.gpu_memory_utilization != utilization:
+        logger.info(
+            "Setting gpu_memory_utilization from %s to %s because "
+            "an explicit KV cache block count=%d is set.",
+            cache_config.gpu_memory_utilization,
+            utilization,
+            runtime_config.explicit_num_blocks,
+        )
+        cache_config.gpu_memory_utilization = utilization
     if runtime_config.precompiled:
         additional_config.optimum_overrides = keep_device_overrides(
             additional_config.optimum_overrides

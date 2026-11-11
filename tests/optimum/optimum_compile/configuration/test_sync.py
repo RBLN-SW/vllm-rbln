@@ -18,7 +18,13 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from transformers import LlamaConfig, PaliGemmaConfig, Qwen3Config, WhisperConfig
+from transformers import (
+    LlamaConfig,
+    PaliGemmaConfig,
+    PretrainedConfig,
+    Qwen3Config,
+    WhisperConfig,
+)
 
 from vllm_rbln.config import OptimumRBLNCompileConfig
 from vllm_rbln.utils.optimum.configuration import sync
@@ -35,6 +41,86 @@ pytestmark = pytest.mark.usefixtures("compile_environment")
 
 
 class TestSync:
+    @pytest.mark.parametrize(
+        "num_blocks, override_blocks",
+        [(None, 16), (16, None), (16, 16), (None, 0), (None, None)],
+    )
+    @pytest.mark.parametrize("utilization", [0.5, 0.9, 1.0])
+    @pytest.mark.parametrize(
+        "architecture, key",
+        [
+            ("LlamaForCausalLM", None),
+            ("Gemma3ForConditionalGeneration", "language_model"),
+            ("Idefics3ForConditionalGeneration", "text_model"),
+        ],
+    )
+    def test_explicit_blocks_apply_prepared_utilization_after_cache_lookup(
+        self,
+        monkeypatch,
+        vllm_config_factory,
+        num_blocks,
+        override_blocks,
+        utilization,
+        architecture,
+        key,
+    ):
+        observed = []
+        prepare = sync.prepare_compile_config
+
+        def record(cfg, **kwargs):
+            observed.append(cfg.cache_config.gpu_memory_utilization)
+            return prepare(cfg, **kwargs)
+
+        monkeypatch.setattr(sync, "prepare_compile_config", record)
+        overrides = (
+            {} if override_blocks is None else {"kvcache_num_blocks": override_blocks}
+        )
+        cfg = vllm_config_factory(
+            optimum_overrides={key: overrides} if key else overrides,
+            hf_config=PretrainedConfig(architectures=[architecture]),
+            num_gpu_blocks_override=num_blocks,
+            gpu_memory_utilization=utilization,
+        )
+        explicit_blocks = num_blocks is not None or override_blocks == 16
+        expected_utilization = 1.0 if explicit_blocks else utilization
+        assert cfg.cache_config.gpu_memory_utilization == expected_utilization
+        assert observed == [utilization]
+        assert cfg.cache_config.num_gpu_blocks_override == num_blocks
+
+    @pytest.mark.parametrize("key", [None, "language_model", "text_model"])
+    @pytest.mark.parametrize(
+        "overrides, error",
+        [
+            (
+                {"kvcache_num_blocks": 32},
+                "num_gpu_blocks_override=16.*kvcache_num_blocks=32",
+            ),
+            (
+                {"kvcache_num_blocks": 16, "memory_budget": 0.8},
+                "memory_budget.*explicit.*block count",
+            ),
+        ],
+    )
+    def test_conflicting_blocks_fail_before_cache_lookup(
+        self, monkeypatch, vllm_config_factory, key, overrides, error
+    ):
+        from unittest.mock import Mock
+
+        cache_path = Mock(wraps=sync.get_compile_cache_path)
+        monkeypatch.setattr(sync, "get_compile_cache_path", cache_path)
+        architecture = {
+            None: "LlamaForCausalLM",
+            "language_model": "Gemma3ForConditionalGeneration",
+            "text_model": "Idefics3ForConditionalGeneration",
+        }[key]
+        with pytest.raises(ValueError, match=error):
+            vllm_config_factory(
+                optimum_overrides={key: overrides} if key else overrides,
+                num_gpu_blocks_override=16,
+                hf_config=PretrainedConfig(architectures=[architecture]),
+            )
+        cache_path.assert_not_called()
+
     @pytest.mark.parametrize("prefix_caching", [False, True])
     def test_paligemma_uses_final_chunk_before_cache_lookup(
         self, monkeypatch, prefix_caching, vllm_config_factory
@@ -161,9 +247,9 @@ class TestSync:
             cache_config=SimpleNamespace(
                 block_size=1024,
                 gpu_memory_utilization=0.9,
+                num_gpu_blocks_override=None,
                 user_specified_block_size=True,
                 enable_prefix_caching=False,
-                num_gpu_blocks_override=None,
             ),
             additional_config={},
             speculative_config=None,
@@ -344,16 +430,20 @@ class TestSync:
         assert cfg.additional_config.precompiled
 
 
+@pytest.mark.parametrize("num_blocks", [None, 2])
 def test_initial_cache_hit_applies_vllm_config_updates_once(
-    monkeypatch, vllm_config_factory
+    monkeypatch, vllm_config_factory, caplog, num_blocks
 ):
     from vllm_rbln.utils.optimum.configuration import apply as apply_module
 
-    calls = []
+    calls: list = []
     selected_configs = []
     apply = sync.apply_runtime_config
 
     def record_apply(cfg, data, **kwargs):
+        assert cfg.cache_config.gpu_memory_utilization == (
+            0.9 if not calls or num_blocks is None else 1.0
+        )
         selected_configs.append(data)
         return apply(cfg, data, **kwargs)
 
@@ -375,9 +465,11 @@ def test_initial_cache_hit_applies_vllm_config_updates_once(
         "num_devices": 2,
     }
     monkeypatch.setattr(sync, "load_compiled_rbln_config", lambda path: metadata)
+    monkeypatch.setattr(sync, "resolve_compiled_model_path", lambda *args: "compiled")
     cfg = vllm_config_factory(
         mamba_block_size=8192,
         optimum_overrides={"device": [0], "create_runtimes": False},
+        num_gpu_blocks_override=num_blocks,
     )
     assert len(selected_configs) == 1
     assert selected_configs[0].max_num_seqs == metadata["batch_size"]
@@ -393,6 +485,12 @@ def test_initial_cache_hit_applies_vllm_config_updates_once(
     assert cfg.additional_config.precompiled
     assert cfg.cache_config.mamba_block_size == 4096
     assert cfg.cache_config.num_gpu_blocks == 3
+    assert cfg.additional_config.compile_config is None
+    assert cfg.cache_config.gpu_memory_utilization == (
+        0.9 if num_blocks is None else 1.0
+    )
+    if num_blocks is not None:
+        assert "explicit KV cache block count=2" in caplog.text
     sync.sync_vllm_and_optimum(cfg)
     assert cfg.cache_config.num_gpu_blocks == 3
 
