@@ -12,120 +12,41 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Read, validate and apply the selected model settings to vLLM."""
+"""Apply validated runtime settings to vLLM."""
 
 from typing import TYPE_CHECKING
 
-import torch
-
 from vllm_rbln.logger import init_logger
-from vllm_rbln.utils.optimum.configuration.readers import (
-    RblnConfigLike,
-    get_field,
-    read_kvcache_block_size,
-    read_language_model_fields,
-    read_num_devices,
-)
-from vllm_rbln.utils.optimum.configuration.runtime import (
-    get_runtime_num_blocks,
-    is_chunked_prefill_arch,
+from vllm_rbln.utils.optimum.configuration.execution import (
     keep_device_overrides,
     store_image_prefill_chunk_size,
     update_block_size,
     update_mamba_block_size,
     update_max_num_batched_tokens,
     update_num_blocks,
-    validate_user_prefill_chunk_size,
-)
-from vllm_rbln.utils.optimum.registry import (
-    is_enc_dec_arch,
-    is_encoder_pooling_arch,
-    is_multi_modal,
 )
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
-    from vllm_rbln.config import OptimumRBLNConfig
+    from vllm_rbln.config import OptimumRBLNConfig, OptimumRBLNRuntimeConfig
 else:
     VllmConfig = None
 
 logger = init_logger(__name__)
 
 
-def apply_to_vllm_config(
+def apply_runtime_config(
     vllm_config: VllmConfig,
-    rbln_config: RblnConfigLike,
-    *,
-    precompiled: bool,
+    runtime_config: "OptimumRBLNRuntimeConfig",
 ) -> None:
-    """Read and validate the selected settings, then apply them to vllm_config."""
-    # 1. Read and validate rbln_config without changing vllm_config.
-    hf_config = vllm_config.model_config.hf_config
-    image_prefill_chunk_size = None
-    prefill_chunk_size: int | None
-    if is_enc_dec_arch(hf_config):
-        batch_size = get_field(rbln_config, "batch_size")
-        max_seq_len = get_field(rbln_config, "dec_max_seq_len")
-        kvcache_block_size = read_kvcache_block_size(rbln_config)
-        prefill_chunk_size = None
-    elif is_multi_modal(hf_config):
-        values = read_language_model_fields(
-            rbln_config,
-            "batch_size",
-            "max_seq_len",
-            "prefill_chunk_size",
-            "kvcache_block_size",
-            "image_prefill_chunk_size",
-        )
-        batch_size = values.get("batch_size")
-        max_seq_len = values.get("max_seq_len")
-        kvcache_block_size = values.get("kvcache_block_size")
-        prefill_chunk_size = values.get("prefill_chunk_size")
-        image_prefill_chunk_size = values.get("image_prefill_chunk_size")
-    else:
-        batch_size = get_field(rbln_config, "batch_size")
-        max_seq_len = get_field(rbln_config, "max_seq_len")
-        if is_encoder_pooling_arch(hf_config):
-            # The encoder's full sequence is one vLLM block, not a KV-cache block.
-            kvcache_block_size = max_seq_len
-            prefill_chunk_size = None
-        else:
-            kvcache_block_size = read_kvcache_block_size(rbln_config)
-            prefill_chunk_size = get_field(rbln_config, "prefill_chunk_size")
-    num_blocks = get_runtime_num_blocks(hf_config, rbln_config)
-    num_devices = read_num_devices(rbln_config)
-    dtype = get_field(rbln_config, "dtype")
-    compiled_dtype = (
-        getattr(torch, dtype) if precompiled and dtype is not None else None
-    )
-
-    assert batch_size is not None
-    assert max_seq_len is not None
-    if is_chunked_prefill_arch(hf_config) and prefill_chunk_size is None:
-        raise ValueError(
-            "prefill_chunk_size must be specified in the selected rbln_config."
-        )
-    if precompiled:
-        assert num_blocks is not None, (
-            "num_blocks must be specified in rbln_config.json"
-        )
-
-    if kvcache_block_size is None:
-        raise ValueError(
-            "kvcache_block_size or kvcache_partition_len must be specified "
-            "in the selected rbln_config."
-        )
-    if num_devices is None:
-        raise ValueError("num_devices must be specified in the selected rbln_config.")
-
-    if is_chunked_prefill_arch(hf_config):
-        assert prefill_chunk_size is not None
-        validate_user_prefill_chunk_size(vllm_config, prefill_chunk_size)
-
-    # 2. Apply the selected values and convert them to vLLM's execution units.
+    """Apply validated values and convert them to vLLM's execution units."""
+    batch_size = runtime_config.batch_size
+    max_seq_len = runtime_config.max_seq_len
+    prefill_chunk_size = runtime_config.prefill_chunk_size
+    compiled_dtype = runtime_config.dtype
     additional_config: OptimumRBLNConfig = vllm_config.additional_config
-    if precompiled:
+    if runtime_config.precompiled:
         additional_config.optimum_overrides = keep_device_overrides(
             additional_config.optimum_overrides
         )
@@ -156,13 +77,13 @@ def apply_to_vllm_config(
     update_max_num_batched_tokens(vllm_config, prefill_chunk_size)
 
     # Persist the image-prefill buckets (gemma3/gemma4) into additional_config.
-    store_image_prefill_chunk_size(vllm_config, image_prefill_chunk_size)
+    store_image_prefill_chunk_size(vllm_config, runtime_config.image_prefill_chunk_size)
     # Set block_size in cache_config based on rbln_config.json.
     update_block_size(
         vllm_config,
-        kvcache_block_size,
+        runtime_config.kvcache_block_size,
         prefill_chunk_size,
-        image_prefill_chunk_size,
+        runtime_config.image_prefill_chunk_size,
     )
     # The compiled model is the source of truth for dtype: vLLM must feed
     # inputs in exactly the dtype the artefact was compiled with.
@@ -175,9 +96,9 @@ def apply_to_vllm_config(
         vllm_config.model_config.dtype = compiled_dtype
 
     # Set num_blocks in cache_config based on rbln_config.json
-    if precompiled:
+    if runtime_config.precompiled:
         update_mamba_block_size(vllm_config, max_seq_len)
-        assert num_blocks is not None
-        update_num_blocks(vllm_config, num_blocks)
+        assert runtime_config.num_blocks is not None
+        update_num_blocks(vllm_config, runtime_config.num_blocks)
     # The compiled model fixes num_devices too.
-    additional_config.num_devices_per_local_rank = num_devices
+    additional_config.num_devices_per_local_rank = runtime_config.num_devices

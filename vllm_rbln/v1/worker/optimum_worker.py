@@ -39,10 +39,8 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 from vllm_rbln import envs
 from vllm_rbln.logger import init_logger
-from vllm_rbln.utils.optimum.configuration.runtime import (
-    get_runtime_num_blocks,
-    update_num_blocks,
-)
+from vllm_rbln.utils.optimum.configuration.execution import update_num_blocks
+from vllm_rbln.utils.optimum.configuration.runtime_config import prepare_runtime_config
 from vllm_rbln.v1.worker.optimum_model_runner import RBLNOptimumModelRunner
 from vllm_rbln.v1.worker.utils import (
     RblnProfilerWrapper,
@@ -177,10 +175,12 @@ class RBLNOptimumWorker(WorkerBase):
         # Therefore, we need to update it here.
         # FIXME: Sync block counts after compilation in model_base.init_model().
         if not self.model_runner.vllm_config.cache_config.num_gpu_blocks:
-            num_blocks = get_runtime_num_blocks(
-                self.model_runner.vllm_config.model_config.hf_config,
+            runtime_config = prepare_runtime_config(
+                self.model_runner.vllm_config,
                 self.model_runner.model.rbln_model_config,
+                precompiled=True,
             )
+            num_blocks = runtime_config.num_blocks
             assert num_blocks is not None, (
                 "num_blocks must be specified in rbln_config.json"
             )

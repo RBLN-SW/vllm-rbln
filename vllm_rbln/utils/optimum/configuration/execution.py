@@ -12,14 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Derive and apply vLLM execution settings from the selected RBLN config."""
+"""Convert and apply prepared RBLN settings to vLLM execution units."""
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
 from vllm_rbln.logger import init_logger
-from vllm_rbln.utils.optimum.block_size import get_block_ratio, is_full_block_available
+from vllm_rbln.utils.optimum.block_size import (
+    get_block_ratio,
+    is_full_block_available,
+)
 from vllm_rbln.utils.optimum.configuration.readers import (
     RblnConfigLike,
     get_field,
@@ -246,9 +249,7 @@ def update_num_blocks(vllm_config: VllmConfig, num_blocks: int) -> None:
             vllm_config.cache_config.num_gpu_blocks,
         )
         return
-    # num_blocks is determined by rbln_config or overridden by user.
     if vllm_config.cache_config.num_gpu_blocks_override is not None:
-        num_blocks = vllm_config.cache_config.num_gpu_blocks_override
         # This is kept for optimum based num blocks
         # not considering ob-ib logic for prefix caching
         additional_config.num_blocks_override = num_blocks

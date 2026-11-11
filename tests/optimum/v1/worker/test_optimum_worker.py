@@ -23,7 +23,76 @@ from vllm.v1.worker.worker_base import WorkerBase
 
 import vllm_rbln.v1.worker.optimum_worker as optimum_worker
 import vllm_rbln.v1.worker.utils as worker_utils
+from vllm_rbln.config import build_optimum_rbln_config
+from vllm_rbln.model_executor.models.optimum.model_base import KVCacheBlockAdapter
 from vllm_rbln.v1.worker.optimum_worker import RBLNOptimumWorker
+
+
+@pytest.mark.parametrize(
+    "prefix_caching, override, expected_blocks",
+    [(False, None, 8), (False, 4, 4), (True, None, 29), (True, 4, 13)],
+)
+@pytest.mark.parametrize("config_as_object", [False, True])
+def test_memory_sizing_applies_prepared_block_count(
+    make_worker,
+    monkeypatch,
+    prefix_caching,
+    override,
+    expected_blocks,
+    config_as_object,
+):
+    cfg = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
+            max_model_len=8192,
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=2),
+        cache_config=SimpleNamespace(
+            enable_prefix_caching=prefix_caching,
+            block_size=256 if prefix_caching else 1024,
+            num_gpu_blocks=None,
+            num_gpu_blocks_override=override,
+            gpu_memory_utilization=1.0,
+        ),
+        additional_config=build_optimum_rbln_config({}),
+    )
+    cfg.additional_config.attn_block_size = 1024
+    metadata = {
+        "batch_size": 2,
+        "max_seq_len": 8192,
+        "kvcache_block_size": 1024,
+        "kvcache_num_blocks": 8,
+        "prefill_chunk_size": 256,
+        "num_devices": 1,
+    }
+    worker = make_worker(ProfilerConfig())
+    worker.model_runner = SimpleNamespace(
+        vllm_config=cfg,
+        is_ec_producer_only=False,
+        get_kv_cache_spec=lambda: {"layer": None},
+        model=SimpleNamespace(
+            kv_block_adapter=KVCacheBlockAdapter(cfg, 8),
+            rbln_model_config=(
+                SimpleNamespace(**metadata, dtype=torch.bfloat16)
+                if config_as_object
+                else {**metadata, "dtype": "bfloat16"}
+            ),
+        ),
+    )
+    monkeypatch.setattr(optimum_worker, "get_uniform_page_size", lambda specs: 128)
+    observed = []
+    update = optimum_worker.update_num_blocks
+
+    def record(config, num_blocks):
+        observed.append(num_blocks)
+        update(config, num_blocks)
+
+    monkeypatch.setattr(optimum_worker, "update_num_blocks", record)
+
+    assert worker.determine_available_memory() == expected_blocks * 128
+    assert worker.determine_available_memory() == expected_blocks * 128
+    assert observed == [8 if override is None else override]
+    assert cfg.additional_config.num_blocks_override == override
 
 
 def _fake_super_init(

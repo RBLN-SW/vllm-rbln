@@ -26,7 +26,7 @@ import pytest
 import torch
 from transformers import Gemma4Config, LlamaConfig, PretrainedConfig
 
-from vllm_rbln.config import OptimumRBLNCompileInputs, OptimumRBLNConfig
+from vllm_rbln.config import OptimumRBLNCompileConfig, OptimumRBLNConfig
 from vllm_rbln.model_executor.models.optimum import model_base
 from vllm_rbln.model_executor.models.optimum.model_base import RBLNOptimumModelBase
 from vllm_rbln.utils.optimum.configuration.readers import get_field
@@ -73,7 +73,7 @@ def _init_model_with(
         additional_config=OptimumRBLNConfig(
             artifact_path=str(tmp_path),
             precompiled=precompiled,
-            compile_inputs=OptimumRBLNCompileInputs(
+            compile_config=OptimumRBLNCompileConfig(
                 model="compile-source",
                 dtype=torch.bfloat16,
                 model_cls="FakeRBLNModel",
@@ -88,7 +88,7 @@ def _init_model_with(
         ec_transfer_config=None,
     )
     obj.init_model()
-    passed["compile_inputs"] = obj.vllm_config.additional_config.compile_inputs
+    passed["compile_config"] = obj.vllm_config.additional_config.compile_config
     passed["source_model"] = obj.model_config.model
     return passed
 
@@ -173,7 +173,7 @@ def test_compilation_uses_hf_snapshot_after_original_changes(
     assert compiled_layers == ["full_attention", "sliding_attention"]
 
     compiled_layers.append("full_attention")
-    assert passed["compile_inputs"].hf_config.get_text_config().layer_types == [
+    assert passed["compile_config"].hf_config.get_text_config().layer_types == [
         "full_attention",
         "sliding_attention",
     ]
@@ -187,7 +187,7 @@ def test_compilation_uses_the_inputs_that_were_hashed(monkeypatch, tmp_path):
     assert passed["rbln_config"] == {"prefill_chunk_size": 256}
 
     passed["rbln_config"]["prefill_chunk_size"] = 512
-    assert passed["compile_inputs"].rbln_config["prefill_chunk_size"] == 256
+    assert passed["compile_config"].rbln_config["prefill_chunk_size"] == 256
 
 
 @pytest.mark.parametrize("precompiled", [False, True])
