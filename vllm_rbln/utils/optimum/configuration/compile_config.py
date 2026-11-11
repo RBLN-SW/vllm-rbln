@@ -34,7 +34,7 @@ from vllm_rbln.utils.optimum.registry import (
 )
 
 from .multimodal import MULTIMODAL_CONFIG_BUILDERS
-from .readers import (
+from .rbln_config import (
     language_model_configs,
     read_kvcache_block_size,
     read_language_model_fields,

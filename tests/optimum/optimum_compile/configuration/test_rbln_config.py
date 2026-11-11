@@ -15,7 +15,7 @@
 
 import pytest
 
-from vllm_rbln.utils.optimum.configuration.readers import (
+from vllm_rbln.utils.optimum.configuration.rbln_config import (
     _num_devices_of,
     read_num_devices,
 )

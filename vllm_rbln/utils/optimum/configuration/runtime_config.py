@@ -33,7 +33,7 @@ from vllm_rbln.utils.optimum.registry import (
     is_pooling_arch,
 )
 
-from .readers import (
+from .rbln_config import (
     RblnConfigLike,
     get_field,
     language_model_configs,

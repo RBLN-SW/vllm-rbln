@@ -24,7 +24,7 @@ from vllm_rbln.utils.optimum.path import (
 )
 
 from .compile_config import compile_cache_name, prepare_compile_config
-from .readers import load_compiled_rbln_config
+from .rbln_config import load_compiled_rbln_config
 from .runtime_config import apply_runtime_config, prepare_runtime_config
 
 if TYPE_CHECKING:

@@ -23,7 +23,7 @@ from transformers import LlamaConfig, PaliGemmaConfig, Qwen3Config, WhisperConfi
 from vllm_rbln.config import OptimumRBLNCompileConfig
 from vllm_rbln.utils.optimum.configuration import sync
 from vllm_rbln.utils.optimum.configuration.compile_config import compile_cache_name
-from vllm_rbln.utils.optimum.configuration.readers import (
+from vllm_rbln.utils.optimum.configuration.rbln_config import (
     load_compiled_rbln_config,
 )
 from vllm_rbln.utils.optimum.path import (
