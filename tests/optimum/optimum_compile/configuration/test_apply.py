@@ -671,7 +671,7 @@ def test_runtime_block_count_is_resolved_before_apply(
     if override is not None:
         cfg.additional_config.optimum_overrides = {"kvcache_num_blocks": override}
     prepared = prepare_runtime_config(cfg, selected, precompiled=True)
-    assert prepared.num_blocks == (8 if override is None else override)
+    assert prepared.model_num_blocks == (8 if override is None else override)
     assert cfg.cache_config.num_gpu_blocks is None
     if override is not None:
         cfg.cache_config.num_gpu_blocks_override = override + 1
@@ -681,7 +681,7 @@ def test_runtime_block_count_is_resolved_before_apply(
     assert cfg.cache_config.num_gpu_blocks == expected_blocks
     assert cfg.additional_config.num_blocks_override == override
     repeated = prepare_runtime_config(cfg, selected, precompiled=True)
-    assert repeated.num_blocks == prepared.num_blocks
+    assert repeated.model_num_blocks == prepared.model_num_blocks
     apply_runtime_config(cfg, repeated)
     assert cfg.cache_config.num_gpu_blocks == expected_blocks
 

@@ -380,8 +380,8 @@ def test_initial_cache_hit_applies_vllm_config_updates_once(
         optimum_overrides={"device": [0], "create_runtimes": False},
     )
     assert len(selected_configs) == 1
-    assert selected_configs[0].batch_size == metadata["batch_size"]
-    assert selected_configs[0].num_devices == metadata["num_devices"]
+    assert selected_configs[0].max_num_seqs == metadata["batch_size"]
+    assert selected_configs[0].num_devices_per_local_rank == metadata["num_devices"]
     assert len(calls) == 1
     assert cfg.scheduler_config.max_num_seqs == 2
     assert cfg.scheduler_config.max_num_batched_tokens == 256
@@ -455,8 +455,8 @@ def test_vllm_config_is_synced_after_cache_lookup(
     monkeypatch.setattr(sync, "apply_runtime_config", record_apply)
     cfg = vllm_config_factory(hf_config=hf_config)
     assert events == ["lookup", "apply"]
-    assert selected[0].batch_size == 4
-    assert selected[0].max_seq_len == 8192
+    assert selected[0].max_num_seqs == 4
+    assert selected[0].max_model_len == 8192
     assert cfg.scheduler_config.max_num_seqs == 4
     assert cfg.model_config.max_model_len == 8192
 

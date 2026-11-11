@@ -39,6 +39,7 @@ import os
 from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
 
+import torch
 from pydantic import Field
 from vllm.config.utils import config as vllm_config_dataclass
 
@@ -206,14 +207,14 @@ class OptimumRBLNCompileConfig:
 class OptimumRBLNRuntimeConfig:
     """Validated model settings ready to apply to vLLM after artifact selection."""
 
-    batch_size: int
-    max_seq_len: int
-    kvcache_block_size: int
+    max_num_seqs: int
+    max_model_len: int
+    block_size: int
     prefill_chunk_size: int | None
     image_prefill_chunk_size: list[int] | None
-    num_blocks: int | None
-    num_devices: int
-    dtype: Any
+    model_num_blocks: int | None
+    num_devices_per_local_rank: int
+    compiled_dtype: torch.dtype | None
     precompiled: bool
 
 

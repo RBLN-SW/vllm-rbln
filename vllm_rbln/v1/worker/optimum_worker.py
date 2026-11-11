@@ -180,7 +180,7 @@ class RBLNOptimumWorker(WorkerBase):
                 self.model_runner.model.rbln_model_config,
                 precompiled=True,
             )
-            num_blocks = runtime_config.num_blocks
+            num_blocks = runtime_config.model_num_blocks
             assert num_blocks is not None, (
                 "num_blocks must be specified in rbln_config.json"
             )

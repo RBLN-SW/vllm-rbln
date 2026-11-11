@@ -41,10 +41,10 @@ def apply_runtime_config(
     runtime_config: "OptimumRBLNRuntimeConfig",
 ) -> None:
     """Apply validated values and convert them to vLLM's execution units."""
-    batch_size = runtime_config.batch_size
-    max_seq_len = runtime_config.max_seq_len
+    max_num_seqs = runtime_config.max_num_seqs
+    max_model_len = runtime_config.max_model_len
     prefill_chunk_size = runtime_config.prefill_chunk_size
-    compiled_dtype = runtime_config.dtype
+    compiled_dtype = runtime_config.compiled_dtype
     additional_config: OptimumRBLNConfig = vllm_config.additional_config
     if runtime_config.precompiled:
         additional_config.optimum_overrides = keep_device_overrides(
@@ -52,25 +52,25 @@ def apply_runtime_config(
         )
 
     # Set max_num_seqs in scheduler_config based on rbln_config.json
-    if vllm_config.scheduler_config.max_num_seqs != batch_size:
+    if vllm_config.scheduler_config.max_num_seqs != max_num_seqs:
         logger.info(
             "Updating scheduler_config.max_num_seqs from %s to %s "
             "based on rbln_config.json",
             vllm_config.scheduler_config.max_num_seqs,
-            batch_size,
+            max_num_seqs,
         )
-        vllm_config.scheduler_config.max_num_seqs = batch_size
+        vllm_config.scheduler_config.max_num_seqs = max_num_seqs
 
     # Set max_model_len in model_config based on rbln_config.json
-    if vllm_config.model_config.max_model_len != max_seq_len:
+    if vllm_config.model_config.max_model_len != max_model_len:
         logger.info(
             "Updating model_config.max_model_len "
             "from %s to %s "
             "based on rbln_config.json",
             vllm_config.model_config.max_model_len,
-            max_seq_len,
+            max_model_len,
         )
-        vllm_config.model_config.max_model_len = max_seq_len
+        vllm_config.model_config.max_model_len = max_model_len
 
     # Set max_num_batched_tokens: the prefill chunk size for decoder/multimodal
     # models, or a full-prefill-plus-batch budget for enc-dec/pooling models.
@@ -81,7 +81,7 @@ def apply_runtime_config(
     # Set block_size in cache_config based on rbln_config.json.
     update_block_size(
         vllm_config,
-        runtime_config.kvcache_block_size,
+        runtime_config.block_size,
         prefill_chunk_size,
         runtime_config.image_prefill_chunk_size,
     )
@@ -97,8 +97,10 @@ def apply_runtime_config(
 
     # Set num_blocks in cache_config based on rbln_config.json
     if runtime_config.precompiled:
-        update_mamba_block_size(vllm_config, max_seq_len)
-        assert runtime_config.num_blocks is not None
-        update_num_blocks(vllm_config, runtime_config.num_blocks)
+        update_mamba_block_size(vllm_config, max_model_len)
+        assert runtime_config.model_num_blocks is not None
+        update_num_blocks(vllm_config, runtime_config.model_num_blocks)
     # The compiled model fixes num_devices too.
-    additional_config.num_devices_per_local_rank = runtime_config.num_devices
+    additional_config.num_devices_per_local_rank = (
+        runtime_config.num_devices_per_local_rank
+    )

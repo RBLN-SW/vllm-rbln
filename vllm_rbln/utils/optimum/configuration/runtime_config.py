@@ -120,13 +120,13 @@ def prepare_runtime_config(
             else cache_config.num_gpu_blocks_override
         )
     return OptimumRBLNRuntimeConfig(
-        batch_size=batch_size,
-        max_seq_len=max_seq_len,
-        kvcache_block_size=kvcache_block_size,
+        max_num_seqs=batch_size,
+        max_model_len=max_seq_len,
+        block_size=kvcache_block_size,
         prefill_chunk_size=prefill_chunk_size,
         image_prefill_chunk_size=image_prefill_chunk_size,
-        num_blocks=num_blocks,
-        num_devices=num_devices,
-        dtype=compiled_dtype,
+        model_num_blocks=num_blocks,
+        num_devices_per_local_rank=num_devices,
+        compiled_dtype=compiled_dtype,
         precompiled=precompiled,
     )
