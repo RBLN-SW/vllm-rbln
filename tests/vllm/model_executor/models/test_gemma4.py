@@ -245,6 +245,29 @@ def test_variants_with_per_layer_inputs_are_refused(monkeypatch):
         _built_model(monkeypatch, cap=280, budgets=[], per_layer_input=256)
 
 
+@pytest.mark.parametrize("scale_first", [True, False])
+def test_each_expert_down_projection_is_scaled_once(monkeypatch, scale_first):
+    loaded = {}
+
+    def load_weights(self, weights):
+        loaded.update(weights)
+        return set(loaded)
+
+    monkeypatch.setattr(Gemma4ForConditionalGeneration, "load_weights", load_weights)
+    prefix = "model.language_model.layers.0."
+    scale = (prefix + "router.per_expert_scale", torch.tensor([2.0, 3.0]))
+    down = (prefix + "experts.down_proj", torch.ones(2, 4, 5))
+    other = (prefix + "experts.gate_up_proj", torch.ones(2, 10, 4))
+    weights = [scale, down, other] if scale_first else [down, other, scale]
+
+    _bare_model().load_weights(weights)
+
+    torch.testing.assert_close(
+        loaded[down[0]], torch.ones(2, 4, 5) * torch.tensor([2.0, 3.0]).view(-1, 1, 1)
+    )
+    assert set(loaded) == {scale[0], down[0], other[0]}
+
+
 def _processing_info(engine_kwargs, processor_default, default_output_length):
     """Upstream's merge: the request's kwargs over the engine's."""
     image_processor = SimpleNamespace(max_soft_tokens=processor_default)
