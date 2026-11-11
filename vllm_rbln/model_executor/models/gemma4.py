@@ -281,10 +281,12 @@ class RBLNGemma4ForConditionalGeneration(
         self.mm_prefix_max_model_len = vllm_config.model_config.max_model_len
         self.mm_prefix_attn_layers: list[nn.Module] = []
         for module in self.modules():
-            if isinstance(module, Gemma4Attention):
-                module.attn.use_mm_prefix &= module.is_sliding
-                if module.attn.use_mm_prefix:
-                    self.mm_prefix_attn_layers.append(module.attn)
+            if (
+                isinstance(module, Gemma4Attention)
+                and module.is_sliding
+                and module.attn.use_mm_prefix
+            ):
+                self.mm_prefix_attn_layers.append(module.attn)
         cap = mm_soft_token_cap(
             MULTIMODAL_REGISTRY.create_processor(vllm_config.model_config).info
         )

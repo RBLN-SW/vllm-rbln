@@ -245,7 +245,7 @@ def _built_model(monkeypatch, *, cap, budgets, attention_layers=()):
         vllm_config=SimpleNamespace(
             parallel_config=SimpleNamespace(data_parallel_size=1),
             speculative_config=None,
-            model_config=None,
+            model_config=SimpleNamespace(max_model_len=32768),
             additional_config=SimpleNamespace(encoder_token_budgets=budgets),
         )
     )
@@ -253,7 +253,7 @@ def _built_model(monkeypatch, *, cap, budgets, attention_layers=()):
 
 
 @pytest.mark.parametrize("use_mm_prefix", [False, True])
-def test_mm_prefix_is_enabled_only_on_sliding_layers(monkeypatch, use_mm_prefix):
+def test_mm_prefix_mask_selects_only_sliding_layers(monkeypatch, use_mm_prefix):
     layers = []
     for is_sliding in (True, False):
         layer = Gemma4Attention.__new__(Gemma4Attention)
@@ -265,7 +265,8 @@ def test_mm_prefix_is_enabled_only_on_sliding_layers(monkeypatch, use_mm_prefix)
     model = _built_model(monkeypatch, cap=280, budgets=[], attention_layers=layers)
 
     assert model.layers[0].attn.use_mm_prefix == use_mm_prefix
-    assert model.layers[1].attn.use_mm_prefix is False
+    assert model.layers[1].attn.use_mm_prefix == use_mm_prefix
+    assert model.mm_prefix_attn_layers == ([layers[0].attn] if use_mm_prefix else [])
 
 
 @pytest.mark.parametrize(

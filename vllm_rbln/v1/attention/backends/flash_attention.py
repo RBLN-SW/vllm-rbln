@@ -601,7 +601,6 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         # attn_output = [batch,H,4,L,D]
         if self.sliding_window is not None:
             if attn_metadata.swa_appends:
-                attn_mask = attn_metadata.swa_attn_masks
                 # `seq_lens` is the absolute position the chunk starts at, not
                 # a length: the op resolves the window's blocks from it and the
                 # whole table.
@@ -615,7 +614,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     attn_metadata.block_tables,
                     self.sliding_window,
                     self.sinks,
-                    attn_mask=attn_mask,
+                    attn_mask=attn_metadata.swa_attn_masks,
                     is_prompt_sorted=attn_metadata.is_prompt_sorted,
                 )
             else:
