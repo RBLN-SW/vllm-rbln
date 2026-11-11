@@ -35,8 +35,8 @@ from optimum.rbln.transformers.models.decoderonly import (
 )
 from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.logger import init_logger
+from vllm_rbln.utils.optimum.block_size import get_attn_block_size
 from vllm_rbln.utils.optimum.bucket import select_bucket_size
-from vllm_rbln.utils.optimum.kv_cache_blocks import get_attn_block_size
 from vllm_rbln.utils.optimum.registry import get_rbln_model_info
 
 from .base import ModelInputForRBLN
