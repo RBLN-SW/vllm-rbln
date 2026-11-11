@@ -90,7 +90,7 @@ def test_state_matches_dense_across_steps(num_rows, vocab, base):
             r["outputs"].append(rng.choice(r["prompt"] + [rng.randrange(vocab)]))
         live = [reqs[r] for r in ids]
 
-        step = state.update(
+        plan = state.update(
             ids,
             lambda i, live=live: np.asarray(live[i]["prompt"]),
             [r["outputs"] for r in live],
@@ -101,8 +101,8 @@ def test_state_matches_dense_across_steps(num_rows, vocab, base):
             vocab,
             num_rows,
         )
-        assert step is not None
-        rows, row_vocab, k, cidx, lanes = step
+        assert plan is not None
+        rows, row_vocab, k, cidx, lanes = plan
         assert k in buckets
         ks.append(k)
         logits = torch.randn(num_rows, vocab) * 3
