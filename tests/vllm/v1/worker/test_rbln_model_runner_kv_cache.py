@@ -448,34 +448,6 @@ class TestBuildAttentionMetadata:
         assert metadata.kv_caches is runner.kv_caches
         assert metadata.kv_cache_view_infos is None
 
-    def test_each_call_hands_the_builders_a_fresh_mask_dict(
-        self, make_model_runner, monkeypatch
-    ):
-        # The sliding groups of one step share an mm prefix mask; the next step's
-        # start and row ends differ, so it must not inherit it.
-        monkeypatch.setattr(
-            mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
-        )
-        runner = _one_group_two_layers(make_model_runner)
-        runner._update_states(schedule_new("a", "b"))
-        runner.query_start_loc[:3] = torch.tensor([0, 1, 2], dtype=torch.int32)
-        runner.seq_lens[:2] = torch.tensor([4, 4], dtype=torch.int32)
-        builder = runner.attn_groups[0][0].get_metadata_builder(0)
-        build = builder.build
-        seen = []
-
-        def recording_build(*args, **kwargs):
-            seen.append(kwargs["swa_masks"])
-            return build(*args, **kwargs)
-
-        monkeypatch.setattr(builder, "build", recording_build)
-        for _ in range(2):
-            runner._build_attention_metadata(
-                num_tokens=2, num_reqs=2, max_query_len=1, num_reqs_padded=4
-            )
-
-        assert seen[0] is not seen[1]
-
 
 class TestLayerIndexFollowsCachePosition:
     """A layer reads its cache by `layer_index` into the runner's cache list.

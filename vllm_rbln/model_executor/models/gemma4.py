@@ -26,6 +26,8 @@ from transformers import BatchFeature
 from transformers.models.gemma4.modeling_gemma4 import apply_multidimensional_rope
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
+from vllm.forward_context import get_forward_context
+from vllm.model_executor.models.gemma4 import Gemma4Attention
 from vllm.model_executor.models.gemma4_mm import (
     _SUPPORTED_SOFT_TOKENS,
     Gemma4DummyInputsBuilder,
@@ -44,6 +46,46 @@ from vllm_rbln.model_executor.models.interfaces import (
     SupportsRBLNMmPrefix,
     SupportsRBLNMultiModal,
 )
+from vllm_rbln.patches.attention import _resolve_kv_cache
+
+
+def _build_mm_prefix_sliding_mask(
+    row_end_offsets: torch.Tensor,
+    chunk_start_position: torch.Tensor,
+    sliding_window: int,
+    block_size: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Build a mask over the kernel's block-aligned key strip.
+
+    Positions are absolute token indices; offsets are relative to the chunk
+    start. Row end offsets include the last key each query may attend to.
+    """
+    query_length = row_end_offsets.numel()
+    num_key_blocks = (
+        sliding_window + query_length - 1 + block_size - 1
+    ) // block_size + 1
+    chunk_start_position = chunk_start_position.to(torch.int32).reshape(1, 1)
+    first_key_block_start_position = (
+        torch.clamp(chunk_start_position - sliding_window + 1, min=0)
+        // block_size
+        * block_size
+    )
+    query_offsets = torch.arange(
+        query_length, device=row_end_offsets.device, dtype=torch.int32
+    ).view(-1, 1)
+    key_offsets = (
+        first_key_block_start_position
+        - chunk_start_position
+        + torch.arange(
+            num_key_blocks * block_size,
+            device=row_end_offsets.device,
+            dtype=torch.int32,
+        )
+    )
+    within_prefix = key_offsets <= row_end_offsets.to(torch.int32).view(-1, 1)
+    within_window = key_offsets > query_offsets - sliding_window
+    return (within_prefix & within_window).to(dtype).view(1, 1, query_length, -1)
 
 
 class _RBLNGemma4VisionEncoder(nn.Module):
@@ -212,6 +254,14 @@ class RBLNGemma4ForConditionalGeneration(
                 "supported on RBLN yet."
             )
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        self.mm_prefix_attn_layers: list[nn.Module] = []
+        for module in self.modules():
+            if (
+                isinstance(module, Gemma4Attention)
+                and module.is_sliding
+                and module.attn.use_mm_prefix
+            ):
+                self.mm_prefix_attn_layers.append(module.attn)
         cap = mm_soft_token_cap(
             MULTIMODAL_REGISTRY.create_processor(vllm_config.model_config).info
         )
@@ -384,6 +434,30 @@ class RBLNGemma4ForConditionalGeneration(
         mm_mask: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor | IntermediateTensors:
+        saved_masks = []
+        if self.mm_prefix_attn_layers:
+            attn_metadata = get_forward_context().attn_metadata
+            layer = self.mm_prefix_attn_layers[0]
+            metadata = attn_metadata[layer.layer_name]
+            if metadata.mm_prefix_row_ends is not None:
+                assert metadata.is_prefill and metadata.swa_appends
+                mask = _build_mm_prefix_sliding_mask(
+                    metadata.mm_prefix_row_ends,
+                    metadata.seq_lens,
+                    layer.sliding_window,
+                    _resolve_kv_cache(metadata, layer.layer_index).size(-2),
+                    self.model_dtype,
+                )
+                # Workaround: borrow metadata without mutating Attention modules.
+                saved_masks = [
+                    (
+                        attn_metadata[layer.layer_name],
+                        attn_metadata[layer.layer_name].swa_attn_masks,
+                    )
+                    for layer in self.mm_prefix_attn_layers
+                ]
+                for metadata, _ in saved_masks:
+                    metadata.swa_attn_masks = mask
         if (
             mm_embeds is not None
             and inputs_embeds is None
@@ -393,6 +467,9 @@ class RBLNGemma4ForConditionalGeneration(
             text_embeds = self.language_model.embed_input_ids(input_ids)
             inputs_embeds = torch.where(mm_mask > 0.5, mm_embeds, text_embeds)
             input_ids = None
-        return super().forward(
+        output = super().forward(
             input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs
         )
+        for metadata, original_mask in saved_masks:
+            metadata.swa_attn_masks = original_mask
+        return output
