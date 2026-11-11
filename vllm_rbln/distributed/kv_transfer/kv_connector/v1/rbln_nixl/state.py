@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -388,6 +388,7 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
     src_xfer_handles_by_remote: dict[tuple[str, int, int], int]
     _borrowed_src_handles: set[tuple[str, int, int]]
     _shard_region_group_ids: dict[tuple[str, int], tuple[int, ...]]
+    _shard_peer_region_group_ids: dict[tuple[str, int], tuple[int, ...]]
     #: Per peer shard, descriptors a block of each entry of its list is.
     _shard_descs_per_block: dict[tuple[str, int], tuple[int, ...]]
     _shard_chunk_grids: dict[tuple[str, int], ChunkGrid | None]
@@ -558,17 +559,29 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         The order here IS the descriptor order -- the local dlist and
         `_build_head_matched_remote` walk these axes in the same nesting.
         """
+        return [
+            local
+            for _, local in self._shard_region_pairs(
+                registered_layer_names, peer_areas=peer_areas
+            )
+        ]
+
+    def _shard_region_pairs(
+        self,
+        registered_layer_names: tuple[str, ...] | list[str],
+        peer_areas: list[int] | None = None,
+    ) -> list[tuple[int, int]]:
+        """(peer region, our region) of each region `_shard_local_region_ids`
+        lists, in its order: one walk, so the peer's side cannot drift from
+        the descriptor order."""
         rpl = self._regions_per_layer()
-        layer_indices = [
-            local for _, local in self._layer_overlap(registered_layer_names)
+        wanted = None if peer_areas is None else set(peer_areas)
+        return [
+            (peer * rpl + k, local * rpl + k)
+            for peer, local in self._layer_overlap(registered_layer_names)
+            for k in range(rpl)
+            if wanted is None or (local * rpl + k) % self._kv_areas in wanted
         ]
-        region_ids = [
-            layer_idx * rpl + k for layer_idx in layer_indices for k in range(rpl)
-        ]
-        if peer_areas is None:
-            return region_ids
-        wanted = set(peer_areas)
-        return [r for r in region_ids if r % self._kv_areas in wanted]
 
     def get_backend_aware_kv_block_len(
         self, layer_idx: int, first_split: bool = True, mamba_view: bool = False
