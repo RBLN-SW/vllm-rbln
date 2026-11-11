@@ -55,7 +55,6 @@ def _build_mm_prefix_sliding_mask(
     sliding_window: int,
     block_size: int,
     dtype: torch.dtype,
-    max_model_len: int,
 ) -> torch.Tensor:
     """Build a mask over the kernel's block-aligned key strip.
 
@@ -67,38 +66,11 @@ def _build_mm_prefix_sliding_mask(
         sliding_window + query_length - 1 + block_size - 1
     ) // block_size + 1
     chunk_start_position = chunk_start_position.to(torch.int32).reshape(1, 1)
-    num_boundaries = (max_model_len + block_size - 1) // block_size
-    boundary_group_size = min(256, (num_boundaries + 63) // 64 * 64)
-    earliest_key_position = torch.clamp(
-        chunk_start_position.expand(1, boundary_group_size) - sliding_window + 1,
-        min=0,
+    first_key_block_start_position = (
+        torch.clamp(chunk_start_position - sliding_window + 1, min=0)
+        // block_size
+        * block_size
     )
-    block_count = torch.zeros(
-        (1, num_key_blocks * block_size),
-        device=row_end_offsets.device,
-        dtype=torch.int32,
-    )
-    # BF16 sums are exact through 256; accumulate larger counts in int32.
-    for offset in range(0, num_boundaries, boundary_group_size):
-        boundaries = (
-            torch.arange(
-                offset + 1,
-                offset + boundary_group_size + 1,
-                device=row_end_offsets.device,
-                dtype=torch.int32,
-            )
-            * block_size
-        )
-        count = (
-            (earliest_key_position >= boundaries)
-            .to(torch.bfloat16)
-            .sum(dim=-1, keepdim=True)
-        )
-        # Expand and cast through int16 to keep the conversion on device.
-        block_count = block_count + count.expand(1, num_key_blocks * block_size).to(
-            torch.int16
-        ).to(torch.int32)
-    first_key_block_start_position = block_count * block_size
     query_offsets = torch.arange(
         query_length, device=row_end_offsets.device, dtype=torch.int32
     ).view(-1, 1)
@@ -111,13 +83,9 @@ def _build_mm_prefix_sliding_mask(
             dtype=torch.int32,
         )
     )
-    # Int32 device comparisons require at least one full-shape operand.
-    key_offsets = key_offsets.expand(query_length, num_key_blocks * block_size)
-    within_prefix = (key_offsets <= row_end_offsets.to(torch.int32).view(-1, 1)).to(
-        dtype
-    )
-    within_window = (key_offsets > query_offsets - sliding_window).to(dtype)
-    return (within_prefix * within_window).view(1, 1, query_length, -1)
+    within_prefix = key_offsets <= row_end_offsets.to(torch.int32).view(-1, 1)
+    within_window = key_offsets > query_offsets - sliding_window
+    return (within_prefix & within_window).to(dtype).view(1, 1, query_length, -1)
 
 
 class _RBLNGemma4VisionEncoder(nn.Module):
@@ -286,7 +254,6 @@ class RBLNGemma4ForConditionalGeneration(
                 "supported on RBLN yet."
             )
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-        self.mm_prefix_max_model_len = vllm_config.model_config.max_model_len
         self.mm_prefix_attn_layers: list[nn.Module] = []
         for module in self.modules():
             if (
@@ -480,7 +447,6 @@ class RBLNGemma4ForConditionalGeneration(
                     layer.sliding_window,
                     _resolve_kv_cache(metadata, layer.layer_index).size(-2),
                     self.model_dtype,
-                    self.mm_prefix_max_model_len,
                 )
                 # Workaround: borrow metadata without mutating Attention modules.
                 saved_masks = [

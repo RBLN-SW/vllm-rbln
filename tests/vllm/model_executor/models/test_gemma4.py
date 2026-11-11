@@ -501,7 +501,6 @@ def test_prefix_mask_is_shared_and_does_not_escape_forward(monkeypatch, compiled
         start_layer=0,
         end_layer=3,
         model_dtype=torch.float32,
-        mm_prefix_max_model_len=16,
     )
     model.mm_prefix_attn_layers = [layer.attn for layer in model.layers]
     metadata = RBLNFlashAttentionMetadata(
@@ -564,7 +563,6 @@ def test_prefix_mask_block_boundaries(start):
         1024,
         1024,
         torch.bfloat16,
-        max_model_len=524288,
     )
     first_key = max(start - 1024 + 1, 0) // 1024 * 1024
     keys = torch.arange(mask.size(-1), dtype=torch.int64) + first_key
