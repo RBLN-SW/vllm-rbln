@@ -1494,33 +1494,36 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             chunks = self.rbln_config.prefill_chunk_size
             assert chunks is not None  # resolved at start-up
             if max(chunks) < longest:
-                # Suggest a chunk dividing --block-size, so the default sub-block
-                # prefix caching still has one to take.
+                # The example keeps a chunk dividing --block-size, so the default
+                # sub-block prefix caching still has one to take.
                 block_size = self.cache_config.block_size
                 fit = block_size
                 while fit % 2 == 0 and fit // 2 >= longest:
                     fit //= 2
                 fit = max(fit, longest)
                 small = min(chunks)
-                hint = (
-                    f"for example --max-num-batched-tokens {fit} "
+                example = (
+                    f"--max-num-batched-tokens {fit} "
                     f"--rbln-prefill-chunk-size {small},{fit}"
                     + (f" --block-size {fit}" if fit > block_size else "")
                 )
                 if current_platform.is_cr13() and block_size % small == 0:
                     tight = -(-longest // 128) * 128
-                    hint += (
-                        f". On this REBEL CR13 a tighter --max-num-batched-tokens "
-                        f"{tight} --rbln-prefill-chunk-size {small},{tight} also "
-                        f"works: keep a chunk that divides --block-size "
-                        f"({block_size}), here {small}, and sub-block prefix "
-                        "caching runs at it"
+                    example += (
+                        f", or on this REBEL CR13 --max-num-batched-tokens {tight} "
+                        f"--rbln-prefill-chunk-size {small},{tight}"
                     )
                 raise ValueError(
-                    f"Every image or video frame has to fit one prefill chunk, and "
-                    f"the longest prefill chunk ({max(chunks)}) is shorter than the "
-                    f"{longest} soft tokens one can take (max_soft_tokens). Raise "
-                    f"the chunk, {hint}. Or lower max_soft_tokens in "
+                    f"--rbln-prefill-chunk-size {chunks} cannot serve "
+                    f"max_soft_tokens={longest}. The prefill chunk sizes need:\n"
+                    f"  1. each at most --max-num-batched-tokens, which is at most "
+                    f"--block-size ({block_size});\n"
+                    f"  2. the longest at least max_soft_tokens ({longest}), since "
+                    "an image or video frame runs in one chunk;\n"
+                    f"  3. for sub-block prefix caching, one that divides "
+                    f"--block-size ({block_size}); off REBEL CR13 it has to be "
+                    "the longest.\n"
+                    f"For example {example}. Or lower max_soft_tokens in "
                     "--mm-processor-kwargs."
                 )
             # TODO(RBLN): the drafter's builders get no row ends, so its sliding
