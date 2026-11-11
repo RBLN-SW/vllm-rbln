@@ -134,12 +134,10 @@ class TestResolveMmPrefixSupport:
 
         assert runner._resolve_mm_support() is True
 
-    @pytest.mark.parametrize("cr13", [False, True])
     def test_a_range_longer_than_the_longest_chunk_is_refused_with_a_fix(
-        self, make_model_runner, monkeypatch, cr13
+        self, make_model_runner, monkeypatch
     ):
         # The step budget holds the range; only the longest chunk does not.
-        monkeypatch.setattr(mr.current_platform, "is_cr13", lambda: cr13)
         runner = self._runner(
             make_model_runner,
             monkeypatch,
@@ -156,7 +154,7 @@ class TestResolveMmPrefixSupport:
             "--max-num-batched-tokens 2048 --rbln-prefill-chunk-size 512,2048"
             in message
         )
-        assert ("--rbln-prefill-chunk-size 512,1152" in message) == cr13
+        assert "--rbln-prefill-chunk-size 512,1152" in message
         assert (
             "max_soft_tokens (1120)" in message
             and "divides --block-size (8192)" in message

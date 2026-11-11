@@ -1507,10 +1507,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     f"--rbln-prefill-chunk-size {small},{fit}"
                     + (f" --block-size {fit}" if fit > block_size else "")
                 )
-                if current_platform.is_cr13() and block_size % small == 0:
+                if block_size % small == 0:
                     tight = -(-longest // 128) * 128
                     example += (
-                        f", or on this REBEL CR13 --max-num-batched-tokens {tight} "
+                        f", or --max-num-batched-tokens {tight} "
                         f"--rbln-prefill-chunk-size {small},{tight}"
                     )
                 raise ValueError(
@@ -1521,8 +1521,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     f"  2. the longest at least max_soft_tokens ({longest}), since "
                     "an image or video frame runs in one chunk;\n"
                     f"  3. for sub-block prefix caching, one that divides "
-                    f"--block-size ({block_size}); off REBEL CR13 it has to be "
-                    "the longest.\n"
+                    f"--block-size ({block_size}).\n"
                     f"For example {example}. Or lower max_soft_tokens in "
                     "--mm-processor-kwargs."
                 )
