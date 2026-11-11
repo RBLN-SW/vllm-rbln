@@ -303,6 +303,7 @@ class TestPerShardWrite:
         w.kv_cache_config = MagicMock(kv_cache_groups=[0])
         # single group, 2 regions per shard
         w._shard_region_group_ids = {("eng", r): (0, 0) for r in range(ranks)}
+        w._shard_peer_region_group_ids = dict(w._shard_region_group_ids)
         # Written together with the group ids by _register_shard_xfer_state, so a
         # shard the write path can reach always has both.
         w._shard_descs_per_block = {("eng", r): (1, 1) for r in range(ranks)}
@@ -350,6 +351,34 @@ class TestPerShardWrite:
         # The request settles only once every WRITE it issued has completed.
         assert len(worker._sending_transfers["r0"]) == 2
 
+    @classmethod
+    def _pipelined_writer(cls):
+        # We are a pipelined producer with (attention, KDA, KDA) groups, the
+        # consumer holds (attention, KDA), and region 1, a KDA layer, sits in
+        # our group 2 and its group 1.
+        worker = cls._writing_worker(ranks=1)
+        worker._shard_region_group_ids = {("eng", 0): (0, 2)}
+        worker._shard_peer_region_group_ids = {("eng", 0): (0, 1)}
+        return worker
+
+    def test_a_whole_prompt_write_names_each_block_in_the_consumer_s_group(self):
+        worker = self._pipelined_writer()
+
+        worker._xfer_blocks_for_req("r0", self._meta(([1, 2], [5], [7]), ([3, 4], [6])))
+
+        call = worker.nixl_wrapper.make_prepped_xfer.call_args
+        assert list(call.args[2]) == [1, 2, 15]
+        assert list(call.args[4]) == [3, 4, 14]
+
+    def test_a_consumer_s_prefix_hit_writes_our_tail(self):
+        worker = self._pipelined_writer()
+
+        worker._xfer_blocks_for_req("r0", self._meta(([1, 2], [5], [7]), ([4], [6])))
+
+        call = worker.nixl_wrapper.make_prepped_xfer.call_args
+        assert list(call.args[2]) == [2, 15]
+        assert list(call.args[4]) == [4, 14]
+
     def test_a_mixed_axis_engine_writes_whole_blocks_without_a_chunk_range(self):
         # A target cut on tokens beside a draft cut on heads spreads a block
         # over different spans, so with no chunk range the block itself is the
@@ -363,6 +392,7 @@ class TestPerShardWrite:
         )
         worker._shard_region_spans = {("eng", 0): (0, 1, 0, 0)}
         worker._shard_region_group_ids = {("eng", 0): (0, 0, 0, 0)}
+        worker._shard_peer_region_group_ids = dict(worker._shard_region_group_ids)
         worker._shard_descs_per_block = {("eng", 0): (1,) * 4}
         coverage = []
 
@@ -389,6 +419,9 @@ class TestPerShardWrite:
             ("eng", 1): uniform_grid(1, 2, regions=1),
         }
         worker._shard_region_group_ids[("eng", 1)] = (0,)
+        worker._shard_peer_region_group_ids[("eng", 1)] = (
+            worker._shard_region_group_ids[("eng", 1)]
+        )
         worker._shard_descs_per_block[("eng", 1)] = (1,)
         worker._shard_region_spans[("eng", 1)] = (0,)
         coverage = []
@@ -785,7 +818,7 @@ class TestPerShardWrite:
 class TestTrimToConsumerBlocks:
     def test_more_blocks_than_the_consumer_registered_trims_the_head(self):
         trimmed = RblnNixlPushConnectorWorker._trim_to_consumer_blocks(
-            ([1, 2, 3, 4],), ([7, 8],), "eng0", "req0"
+            ([1, 2, 3, 4],), ([7, 8],), "eng0", "req0", [(0, 0)]
         )
         assert trimmed == ([3, 4],)
 
@@ -794,11 +827,27 @@ class TestTrimToConsumerBlocks:
         # and the message has to name the pair an operator has to go look at.
         with pytest.raises(RuntimeError) as excinfo:
             RblnNixlPushConnectorWorker._trim_to_consumer_blocks(
-                ([1],), ([7, 8],), "eng0", "req0"
+                ([1],), ([7, 8],), "eng0", "req0", [(0, 0)]
             )
         msg = str(excinfo.value)
         assert "eng0" in msg and "req0" in msg
         assert "registered 2 block(s)" in msg and "the 1 this producer holds" in msg
+
+    def test_a_producer_group_pairs_by_region_not_by_position(self):
+        # Our group 2 pairs with the consumer's group 1, so it is the one
+        # trimmed to that list; our group 1 pairs with nothing and stays whole.
+        trimmed = RblnNixlPushConnectorWorker._trim_to_consumer_blocks(
+            ([1, 2], [5, 6], [7, 8]), ([2], [9]), "eng0", "req0", [(0, 0), (2, 1)]
+        )
+        assert trimmed == ([2], [5, 6], [8])
+
+    def test_a_consumer_list_with_no_blocks_trims_ours_to_none(self):
+        # Slicing by `[-num_remote:]` read `[-0:]` here, the whole list, and
+        # would have sent every block to a consumer that registered none.
+        trimmed = RblnNixlPushConnectorWorker._trim_to_consumer_blocks(
+            ([1, 2], [5, 6]), ([], [9]), "eng0", "req0", [(0, 0), (1, 1)]
+        )
+        assert trimmed == ([], [6])
 
 
 class TestWriterCompletionAccounting:
@@ -2619,6 +2668,7 @@ class TestCoverageNotif:
         # length describes no request.
         worker = TestPerShardWrite._writing_worker(ranks=1)
         worker._shard_region_group_ids = {("eng", 0): (0, 0)}
+        worker._shard_peer_region_group_ids = dict(worker._shard_region_group_ids)
         worker._group_specs = [
             MagicMock(spec=SlidingWindowSpec),
             MagicMock(),  # full attention, and the second group at that

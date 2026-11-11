@@ -210,17 +210,21 @@ class RBLNGlm5NextAuxCache(_RBLNGlm5NextCache):
         owner: str,
         block_shape: tuple[int, ...],
         dtype: torch.dtype,
+        prefix_cacheable: bool = True,
     ) -> None:
         super().__init__(prefix)
         self.owner = owner
         self.block_shape = block_shape
         self.dtype = dtype
+        self.prefix_cacheable = prefix_cacheable
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> None:
         return None
 
     def get_aux_cache_spec(self, vllm_config: VllmConfig) -> RBLNBlockAuxSpec:
-        return RBLNBlockAuxSpec(self.owner, self.block_shape, self.dtype)
+        return RBLNBlockAuxSpec(
+            self.owner, self.block_shape, self.dtype, self.prefix_cacheable
+        )
 
     def get_attn_backend(self) -> type[RBLNGlm5NextCacheBackend]:
         return RBLNGlm5NextCacheBackend
@@ -428,6 +432,7 @@ class RBLNGlm5NextKDA(nn.Module):
                     state.prefix,
                     (self.group_heads, self.num_drafts, 4, self.head_dim),
                     dtype,
+                    prefix_cacheable=False,
                 )
                 for j, state in enumerate(self.states)
             )
@@ -629,6 +634,7 @@ class RBLNGlm5NextIndexer(nn.Module):
             f"{attn_prefix}.attn.{SLOT_DSA_LATENT}",
             (self.tail_ring, 2 * self.head_dim),
             torch.bfloat16,
+            prefix_cacheable=False,
         )
 
     @torch.no_grad()

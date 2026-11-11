@@ -93,9 +93,12 @@ class RblnTransferTopology(TransferTopology):
         # for a distinctive count to land on.
         mock_blocks, mock_tokens = 1234567, 7907
         mock_heads = 1 if self.is_mla else 7919
+        # A compressing cache (GLM-5.3's indexer, first on a later PP stage)
+        # holds block_size // ratio rows, so ask for a multiple of the ratio.
+        ratio = getattr(backend, "compress_ratio", 1)
         shape = backend.get_kv_cache_shape(
             num_blocks=mock_blocks,
-            block_size=mock_tokens,
+            block_size=mock_tokens * ratio,
             num_kv_heads=mock_heads,
             head_size=1,
         )

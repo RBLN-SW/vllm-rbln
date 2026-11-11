@@ -27,11 +27,19 @@ from vllm.v1.request import Request
 
 @dataclass(frozen=True)
 class RBLNBlockAuxSpec:
-    """A per-block cache region beside a scheduled KV layer's cache."""
+    """A per-block cache region beside a scheduled KV layer's cache.
+
+    `prefix_cacheable=False` means this region's previous contents do not affect
+    the result when a prefix resumes at a block boundary, so it need not be saved
+    or restored. The buffer must still be allocated and readable: kernels may read
+    it physically (the tail ring with two or more MTP drafts, masked draft rows).
+    It is per aux region, not vLLM's group-level `KVCacheSpec.prefix_cacheable`.
+    """
 
     owner: str
     block_shape: tuple[int, ...]
     dtype: torch.dtype
+    prefix_cacheable: bool = True
 
     @property
     def page_size_bytes(self) -> int:
