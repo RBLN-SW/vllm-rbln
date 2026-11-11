@@ -36,10 +36,6 @@ MODELS: list[CompileModelSpec] = [
         # the block size at which a GatedDeltaNet state fills a full-attention page
         {"max_num_seqs": 2, "language_model_only": True, "block_size": 256},
         chips=REBEL,
-        # TODO(rebel-compiler): drop once rolling these GDN layers passes
-        # RblnTensorUnrollLayerLoop. Without nested regions there is
-        # nothing to roll; a release compiler ignores RBLN_EXP_ROLL_LAYERS.
-        envs={"VLLM_RBLN_USE_NESTED_COMPILE_REGION": "0"},
     ),
     CompileModelSpec(
         "Qwen/Qwen3-30B-A3B",
