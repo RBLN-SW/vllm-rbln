@@ -89,8 +89,12 @@ out = scatter(logits_view, cidx, v)
 - After that, each step adds only the output tokens produced since the last
   step. A token is penalized once, however often it repeats; its frequency term
   is updated on every occurrence.
-- Requests are keyed by request id, so finished, new and reordered rows need no
-  special handling. Padded rows of the batch bucket stay at identity.
+- Requests are keyed by request id, so new and reordered rows need no special
+  handling. A request's state is dropped when it finishes, not when a step
+  leaves it out: a prefill step lists only the new request. Padded rows of the
+  batch bucket stay at identity.
+- The prompt is folded in only with a repetition penalty. Frequency and
+  presence read output tokens only, so they never take slots for the prompt.
 - Each request stores only its used slots. The tail that repeats slot 0 is
   filled when the step's buffer is assembled.
 - A batch of one is laid out as two half-vocab rows.

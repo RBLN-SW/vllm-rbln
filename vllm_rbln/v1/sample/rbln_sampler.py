@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from types import FunctionType
 from typing import Any, Literal
 
@@ -249,6 +249,11 @@ class RBLNSampler(VLLMSampler):
                 _fused_graph_fn(*key), self._compile_context
             )
         return fn
+
+    def forget_requests(self, req_ids: Iterable[str]) -> None:
+        """Drop the fused-penalty state of finished requests."""
+        if self._penalty_state is not None:
+            self._penalty_state.forget(req_ids)
 
     def warm_up(
         self, logits: torch.Tensor, sampling_metadata: SamplingMetadata

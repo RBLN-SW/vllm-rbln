@@ -152,6 +152,40 @@ def test_k_drops_back_after_a_long_request_leaves():
     assert _update(state, {"a": [1], "b": [3]}, vocab, 2)[2] == 64
 
 
+def test_a_prefill_step_keeps_the_decoding_requests():
+    # Prefill and decode never share a step, so a prefill step lists only the
+    # new request. The decoding ones must not be rebuilt after it.
+    state = FusedPenaltyState()
+    vocab = 16384
+    decode = {"a": [1, 2, 3], "b": [4, 5, 6]}
+    _update(state, decode, vocab, 2)
+    kept = {rid: state._reqs[rid] for rid in decode}
+    _update(state, {"c": [7, 8]}, vocab, 1)
+    _update(state, decode, vocab, 2)
+    assert all(state._reqs[rid] is req for rid, req in kept.items())
+    state.forget(["a", "c"])
+    assert set(state._reqs) == {"b"}
+
+
+def test_frequency_only_request_takes_no_prompt_slots():
+    state = FusedPenaltyState()
+    vocab = 16384
+    prompt = [c * 64 for c in range(200)]
+    step = state.update(
+        ["r"],
+        lambda i: np.asarray(prompt),
+        [[3, 3, 5000]],
+        np.ones(1),
+        np.full(1, 0.5),
+        np.zeros(1),
+        {},
+        vocab,
+        2,
+    )
+    assert step is not None
+    assert state._reqs["r"].used == 2  # chunks of 3 and 5000 only
+
+
 def test_request_past_the_cap_keeps_the_upstream_path():
     vocab = 151936  # 2374 chunks, cap 2368
     fits = {"r": [c * 64 for c in range(2368)]}

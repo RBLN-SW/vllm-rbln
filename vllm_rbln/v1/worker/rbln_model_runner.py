@@ -656,6 +656,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         # Remove the finished requests from the persistent batch.
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
+        if isinstance(self.sampler, RBLNSampler):
+            self.sampler.forget_requests(scheduler_output.finished_req_ids)
 
         scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()
         cached_req_ids = self.input_batch.req_id_to_index.keys()

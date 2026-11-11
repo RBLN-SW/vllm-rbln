@@ -27,7 +27,7 @@ See docs/fused_penalty.md.
 """
 
 import dataclasses
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from typing import NamedTuple
 
 import numpy as np
@@ -111,6 +111,7 @@ class _Request:
         "freq",
         "pres",
         "active",
+        "repeats",
         "slots",
         "seen",
         "counts",
@@ -134,6 +135,7 @@ class _Request:
         self.freq = float(freq)
         self.pres = float(pres)
         self.active = rep != 1.0 or self.freq != 0.0 or self.pres != 0.0
+        self.repeats = rep != 1.0
         rows = 2 if split else 1
         self.slots: list[dict[int, int]] = [{} for _ in range(rows)]
         self.seen: set[int] = set()
@@ -182,7 +184,8 @@ class _Request:
             self.lanes[row, MUL, s, lane] = self.rep
 
     def add_output(self, token: int) -> None:
-        self.add_prompt(token)
+        if self.repeats:
+            self.add_prompt(token)
         if self.freq or self.pres:
             c = self.counts[token] = self.counts.get(token, 0) + 1
             row, s, lane = self._lane(token)
@@ -253,6 +256,12 @@ class FusedPenaltyState:
         rows, row_vocab, k, cidx, lanes = step
         return FusedPenaltyPlan(rows, row_vocab, k, cidx.to(device), lanes.to(device))
 
+    def forget(self, req_ids: Iterable[str]) -> None:
+        """Drop finished requests. A step lists only the requests it schedules,
+        so absence from one step does not mean a request is gone."""
+        for rid in req_ids:
+            self._reqs.pop(rid, None)
+
     def k_buckets(self, logits_shape: torch.Size) -> tuple[int, ...]:
         """Every `k` a plan for `logits_shape` can take."""
         return k_buckets(row_layout(*logits_shape)[1], self.base_buckets)
@@ -284,9 +293,6 @@ class FusedPenaltyState:
         them uses more chunks than any bucket holds.
         """
         split = num_rows == 1
-        live = set(req_ids)
-        for rid in [r for r in self._reqs if r not in live]:
-            del self._reqs[rid]
         for i, rid in enumerate(req_ids):
             outs = output_token_ids[i] if i < len(output_token_ids) else ()
             n_out = len(outs)
@@ -309,9 +315,11 @@ class FusedPenaltyState:
                 for t, v in biases.get(i, {}).items():
                     req.add_bias(int(t), v)
                 if req.active:
-                    for t in prompt_fn(i):
-                        if 0 <= t < vocab_size:
-                            req.add_prompt(int(t))
+                    # Frequency and presence only read output tokens.
+                    if req.repeats:
+                        for t in prompt_fn(i):
+                            if 0 <= t < vocab_size:
+                                req.add_prompt(int(t))
                     new_outputs = outs[:n_out]
                 else:
                     new_outputs = ()
