@@ -1,11 +1,11 @@
 # Copyright 2026 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -93,9 +93,12 @@ class RblnTransferTopology(TransferTopology):
         # for a distinctive count to land on.
         mock_blocks, mock_tokens = 1234567, 7907
         mock_heads = 1 if self.is_mla else 7919
+        # A compressing cache (GLM-5.3's indexer, first on a later PP stage)
+        # holds block_size // ratio rows, so ask for a multiple of the ratio.
+        ratio = getattr(backend, "compress_ratio", 1)
         shape = backend.get_kv_cache_shape(
             num_blocks=mock_blocks,
-            block_size=mock_tokens,
+            block_size=mock_tokens * ratio,
             num_kv_heads=mock_heads,
             head_size=1,
         )

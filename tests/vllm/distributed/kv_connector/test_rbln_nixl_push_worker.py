@@ -303,6 +303,7 @@ class TestPerShardWrite:
         w.kv_cache_config = MagicMock(kv_cache_groups=[0])
         # single group, 2 regions per shard
         w._shard_region_group_ids = {("eng", r): (0, 0) for r in range(ranks)}
+        w._shard_peer_region_group_ids = dict(w._shard_region_group_ids)
         # Written together with the group ids by _register_shard_xfer_state, so a
         # shard the write path can reach always has both.
         w._shard_descs_per_block = {("eng", r): (1, 1) for r in range(ranks)}
@@ -350,6 +351,34 @@ class TestPerShardWrite:
         # The request settles only once every WRITE it issued has completed.
         assert len(worker._sending_transfers["r0"]) == 2
 
+    @classmethod
+    def _pipelined_writer(cls):
+        # We are a pipelined producer with (attention, KDA, KDA) groups, the
+        # consumer holds (attention, KDA), and region 1, a KDA layer, sits in
+        # our group 2 and its group 1.
+        worker = cls._writing_worker(ranks=1)
+        worker._shard_region_group_ids = {("eng", 0): (0, 2)}
+        worker._shard_peer_region_group_ids = {("eng", 0): (0, 1)}
+        return worker
+
+    def test_a_whole_prompt_write_names_each_block_in_the_consumer_s_group(self):
+        worker = self._pipelined_writer()
+
+        worker._xfer_blocks_for_req("r0", self._meta(([1, 2], [5], [7]), ([3, 4], [6])))
+
+        call = worker.nixl_wrapper.make_prepped_xfer.call_args
+        assert list(call.args[2]) == [1, 2, 15]
+        assert list(call.args[4]) == [3, 4, 14]
+
+    def test_a_consumer_s_prefix_hit_writes_our_tail(self):
+        worker = self._pipelined_writer()
+
+        worker._xfer_blocks_for_req("r0", self._meta(([1, 2], [5], [7]), ([4], [6])))
+
+        call = worker.nixl_wrapper.make_prepped_xfer.call_args
+        assert list(call.args[2]) == [2, 15]
+        assert list(call.args[4]) == [4, 14]
+
     def test_a_mixed_axis_engine_writes_whole_blocks_without_a_chunk_range(self):
         # A target cut on tokens beside a draft cut on heads spreads a block
         # over different spans, so with no chunk range the block itself is the
@@ -363,6 +392,7 @@ class TestPerShardWrite:
         )
         worker._shard_region_spans = {("eng", 0): (0, 1, 0, 0)}
         worker._shard_region_group_ids = {("eng", 0): (0, 0, 0, 0)}
+        worker._shard_peer_region_group_ids = dict(worker._shard_region_group_ids)
         worker._shard_descs_per_block = {("eng", 0): (1,) * 4}
         coverage = []
 
@@ -389,6 +419,9 @@ class TestPerShardWrite:
             ("eng", 1): uniform_grid(1, 2, regions=1),
         }
         worker._shard_region_group_ids[("eng", 1)] = (0,)
+        worker._shard_peer_region_group_ids[("eng", 1)] = (
+            worker._shard_region_group_ids[("eng", 1)]
+        )
         worker._shard_descs_per_block[("eng", 1)] = (1,)
         worker._shard_region_spans[("eng", 1)] = (0,)
         coverage = []
@@ -457,6 +490,23 @@ class TestPerShardWrite:
             b"RBLNS:0:2:4:2:",
         ]
         assert [len(c.args[2]) for c in calls] == [2, 2]  # both areas, each time
+
+    def test_a_closing_offer_cuts_its_last_block_by_its_own_count(self):
+        # Chunk mode cuts by the count, and here it is only on the list: the
+        # worker's map has not caught up yet. Without it both areas would go.
+        worker = self._trimming_worker()
+        set_shape(worker, chunk_mode=True, streams_prefix=True)
+        worker._valid_tokens = {}
+        worker._streamed["r0"] = pw._StreamedSend(released=True, serial=1, total=2)
+        closing = self._meta(([1, 2],), ([3, 4],))
+        closing.local_block_ids = pw.OfferedBlocks(
+            ([1, 2],), 0, 1, done=None, valid_tokens=17
+        )
+
+        worker._xfer_blocks_for_req("r0", closing)
+
+        call = worker.nixl_wrapper.make_prepped_xfer.call_args
+        assert len(call.args[2]) == len(call.args[4]) == 3
 
     def test_the_handover_leaves_the_empty_area_of_the_last_block_out(self):
         # 17 tokens over two blocks: the second holds one, which is area 0's.
@@ -768,7 +818,7 @@ class TestPerShardWrite:
 class TestTrimToConsumerBlocks:
     def test_more_blocks_than_the_consumer_registered_trims_the_head(self):
         trimmed = RblnNixlPushConnectorWorker._trim_to_consumer_blocks(
-            ([1, 2, 3, 4],), ([7, 8],), "eng0", "req0"
+            ([1, 2, 3, 4],), ([7, 8],), "eng0", "req0", [(0, 0)]
         )
         assert trimmed == ([3, 4],)
 
@@ -777,11 +827,27 @@ class TestTrimToConsumerBlocks:
         # and the message has to name the pair an operator has to go look at.
         with pytest.raises(RuntimeError) as excinfo:
             RblnNixlPushConnectorWorker._trim_to_consumer_blocks(
-                ([1],), ([7, 8],), "eng0", "req0"
+                ([1],), ([7, 8],), "eng0", "req0", [(0, 0)]
             )
         msg = str(excinfo.value)
         assert "eng0" in msg and "req0" in msg
         assert "registered 2 block(s)" in msg and "the 1 this producer holds" in msg
+
+    def test_a_producer_group_pairs_by_region_not_by_position(self):
+        # Our group 2 pairs with the consumer's group 1, so it is the one
+        # trimmed to that list; our group 1 pairs with nothing and stays whole.
+        trimmed = RblnNixlPushConnectorWorker._trim_to_consumer_blocks(
+            ([1, 2], [5, 6], [7, 8]), ([2], [9]), "eng0", "req0", [(0, 0), (2, 1)]
+        )
+        assert trimmed == ([2], [5, 6], [8])
+
+    def test_a_consumer_list_with_no_blocks_trims_ours_to_none(self):
+        # Slicing by `[-num_remote:]` read `[-0:]` here, the whole list, and
+        # would have sent every block to a consumer that registered none.
+        trimmed = RblnNixlPushConnectorWorker._trim_to_consumer_blocks(
+            ([1, 2], [5, 6]), ([], [9]), "eng0", "req0", [(0, 0), (1, 1)]
+        )
+        assert trimmed == ([], [6])
 
 
 class TestWriterCompletionAccounting:
@@ -1567,6 +1633,31 @@ class TestStreamedEngineHandleWrite:
         assert first_local == [2, 10, 60, 62, 92, 94]
         assert second_local == [30, 46]
 
+    def test_a_closing_offer_stops_a_part_written_block_at_its_own_count(self):
+        # Four chunks a block; the first batch sent two of the last block's
+        # three. The closing offer carries the count while the worker's map
+        # has none, and has to cut the rest where the map's count would.
+        def second_write(on_list):
+            worker = self._worker(grid=(2, 4))
+            worker._valid_tokens = {} if on_list else {"r0": 3 * 16 + 12}
+            worker._xfer_blocks_for_req(
+                "r0",
+                self._offer(worker, ([0, 1, 2, 3], []), ([4, 5], [6]), 3 * 16 + 8),
+            )
+            closing = self._offer(worker, ([0, 1, 2, 3], [7]), ([4, 5], [6]), 0)
+            closing.local_block_ids = pw.OfferedBlocks(
+                ([0, 1, 2, 3], [7]),
+                0,
+                worker._streamed["r0"].serial,
+                done=None,
+                valid_tokens=3 * 16 + 12 if on_list else None,
+            )
+            worker._xfer_blocks_for_req("r0", closing)
+            call = worker.nixl_wrapper.make_prepped_xfer.call_args
+            return list(call.args[2]), list(call.args[4])
+
+        assert second_write(on_list=True) == second_write(on_list=False)
+
     def test_a_handover_pairs_the_window_group_from_its_end(self):
         # Once the window fits one block, the producer's window group leads
         # with a null block while the consumer registers only the live one.
@@ -2178,6 +2269,21 @@ class TestEarlySend:
         assert blocks.done is event
         assert worker._streamed["r0"].pending_offer_done is None
 
+    def test_the_closing_count_travels_on_the_offer(self):
+        # The step's metadata reaches `start_load_kv` only after the offer is
+        # released, so a count left there could arrive after the writer read.
+        worker = self._worker()
+        meta = self._meta(saves=["r0"])
+        meta.push_stream_valid_tokens["r0"] = 44
+        worker.start_early_push(meta)
+
+        worker.release_early_offers()
+
+        _, blocks = worker._finished_blocks_inbox.get_nowait()
+        assert blocks.valid_tokens == 44
+        assert worker._streamed["r0"].pending_offer_valid_tokens is None
+        assert "r0" not in worker._valid_tokens
+
     def test_a_step_that_closes_nothing_still_releases_what_is_held(self):
         # The release cannot wait for another closing chunk: steps that close
         # one are not every step, and the offer would sit until one came.
@@ -2562,6 +2668,7 @@ class TestCoverageNotif:
         # length describes no request.
         worker = TestPerShardWrite._writing_worker(ranks=1)
         worker._shard_region_group_ids = {("eng", 0): (0, 0)}
+        worker._shard_peer_region_group_ids = dict(worker._shard_region_group_ids)
         worker._group_specs = [
             MagicMock(spec=SlidingWindowSpec),
             MagicMock(),  # full attention, and the second group at that
@@ -3698,6 +3805,38 @@ class TestStreamWindow:
         descs = worker.nixl_wrapper.make_prepped_xfer.call_args.args[2]
         whole = 2 * worker.num_blocks
         assert all(d >= whole for d in descs)
+        assert len(descs) == 2 * 2  # 2 regions x 2 heads x 1 chunk
+
+    def test_a_closing_offer_stops_a_part_written_block_at_its_own_count(self):
+        # The case above with the count only on the closing offer, as the
+        # scheduler sends it. The rest of the last block stops at the third
+        # chunk; without the count it would carry the fourth, which holds none.
+        worker = self._worker(total=4)
+        worker.block_size = 16
+        set_shape(worker, chunk_mode=True)
+        worker._shard_chunk_grids = {("eng", 0): uniform_grid(2, 4, regions=2)}
+        worker._valid_tokens = {}
+
+        first = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
+        first.local_block_ids = pw.OfferedBlocks(
+            first.local_block_ids,
+            3 * 16 + 8,
+            worker._streamed["r0"].serial,
+            done=None,
+        )
+        worker._xfer_blocks_for_req("r0", first)
+
+        closing = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
+        closing.local_block_ids = pw.OfferedBlocks(
+            closing.local_block_ids,
+            0,
+            worker._streamed["r0"].serial,
+            done=None,
+            valid_tokens=3 * 16 + 12,
+        )
+        worker._xfer_blocks_for_req("r0", closing)
+
+        descs = worker.nixl_wrapper.make_prepped_xfer.call_args.args[2]
         assert len(descs) == 2 * 2  # 2 regions x 2 heads x 1 chunk
 
     def test_streaming_alone_sends_the_last_block_whole_once_it_closes(self):
