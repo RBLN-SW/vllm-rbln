@@ -273,9 +273,7 @@ class TestStateSpec:
         layer.num_kv_heads = 4
         layer.kv_head_size = 256
         layer.model_config = SimpleNamespace(dtype=torch.bfloat16)
-        layer.cache_config = SimpleNamespace(
-            block_size=256, mamba_cache_dtype="auto", mamba_ssm_cache_dtype="auto"
-        )
+        layer.cache_config = SimpleNamespace(block_size=256)
         return layer
 
     def test_the_layer_declares_one_ssm_state_a_block(self):
@@ -284,11 +282,11 @@ class TestStateSpec:
         # The activation dtype: the kernels take no other.
         assert layer.get_state_dtype() == (torch.bfloat16,)
 
-    def test_a_state_dtype_off_the_activation_dtype_is_refused(self):
+    def test_a_cache_dtype_option_does_not_move_the_state_dtype(self):
         layer = self._layer()
+        # What upstream's Qwen3.5 hook takes from the HF config's mamba_ssm_dtype.
         layer.cache_config.mamba_ssm_cache_dtype = "float32"
-        with pytest.raises(NotImplementedError, match="activation dtype"):
-            layer.get_state_dtype()
+        assert layer.get_state_dtype() == (torch.bfloat16,)
 
     def test_the_model_declares_the_layers_state(self):
         vllm_config = SimpleNamespace(

@@ -695,15 +695,6 @@ class TestRejectedConfigs:
         config = reconfigure(mamba_block(1))
         assert config.cache_config.mamba_block_size == config.model_config.max_model_len
 
-    def test_gdn_state_keeps_the_activation_dtype(self, reconfigure, gdn):
-        def float32_state(config):
-            gdn(config)
-            # What upstream's Qwen3.5 hook takes from the HF config's mamba_ssm_dtype.
-            config.cache_config.mamba_ssm_cache_dtype = "float32"
-
-        config = reconfigure(float32_state)
-        assert config.cache_config.mamba_ssm_cache_dtype == "auto"
-
     def test_gdn_value_heads_split_over_the_chiplets(self, reconfigure, gdn):
         def six_heads(config):
             gdn(config)

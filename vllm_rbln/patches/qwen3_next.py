@@ -151,15 +151,11 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         )
 
     def get_state_dtype(self) -> tuple[torch.dtype]:
-        # The delta-rule kernels keep the state in the activation dtype (dlfloat16
-        # inside the kernel), so the cache dtype options cannot move it.
-        _, state_dtype = super().get_state_dtype()
-        if state_dtype != self.model_config.dtype:
-            raise NotImplementedError(
-                "The RBLN GatedDeltaNet kernels keep the state in the activation "
-                f"dtype {self.model_config.dtype}, got {state_dtype}"
-            )
-        return (state_dtype,)
+        # The delta-rule kernels take the state in the dtype of q / k / v, so it
+        # is declared in that dtype (the activation dtype).
+        # TODO(RBLN): support cache_config.mamba_ssm_cache_dtype (float32, from
+        # the Qwen3.5 HF config's mamba_ssm_dtype).
+        return (self.model_config.dtype,)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """
