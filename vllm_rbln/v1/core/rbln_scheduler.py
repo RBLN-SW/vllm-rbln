@@ -168,7 +168,7 @@ class RBLNScheduler(Scheduler):
             self.cache_config.enable_prefix_caching
             and rbln_config.enable_sub_block_cache
         ):
-            logger.info(
+            logger.warning(
                 "Sub-block prefix caching off: block_size=%d, prefill_chunk_size=%s",
                 self.block_size,
                 prefill_chunk_sizes,

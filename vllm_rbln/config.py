@@ -199,6 +199,8 @@ class RBLNConfig(RBLNConfigBase):
             raise ValueError("encoder_token_budgets must be unique")
         sizes = self.prefill_chunk_size
         if sizes is not None:
+            if not sizes:
+                raise ValueError("prefill_chunk_size must not be empty")
             if any(s <= 0 for s in sizes):
                 raise ValueError("prefill_chunk_size must all be > 0")
             if len(sizes) != len(set(sizes)):
