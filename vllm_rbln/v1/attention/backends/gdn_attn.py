@@ -134,6 +134,10 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
     """The flash builder for its step shape and staged device buffers; the
     metadata it builds is the GDN kernels'."""
 
+    def _padded(self, values: torch.Tensor, batch: int) -> torch.Tensor:
+        """`values` as int32, padded with 0 to the step's `batch` rows."""
+        return rbln_utils.pad(values.to(torch.int32), 0, batch)
+
     def build(  # type: ignore[override]
         self,
         common_attn_metadata: CommonAttentionMetadata,
@@ -168,18 +172,16 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
             )
             num_prefills, num_prefill_tokens, num_decodes = 0, 0, num_reqs
 
-        def padded(values: torch.Tensor) -> torch.Tensor:
-            return rbln_utils.pad(values.to(torch.int32), 0, batch)
-
         def state_blocks(num_tokens: torch.Tensor) -> torch.Tensor:
             """Each request's block holding its state after `num_tokens` tokens."""
-            return padded(
+            return self._padded(
                 mamba_get_block_table_tensor(
                     m.block_table_tensor[:num_reqs],
                     num_tokens,
                     self.kv_cache_spec,
                     self.vllm_config.cache_config.mamba_cache_mode,
-                )[:, 0]
+                )[:, 0],
+                batch,
             )
 
         load_blocks = state_blocks(context_lens_tensor)
@@ -190,7 +192,7 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
         if is_prefill:
             valid_mask = (torch.arange(seq_len) < query_lens[0]).to(torch.float32)
             valid_mask = valid_mask.view(1, 1, seq_len)
-        has_initial_state = padded(context_lens_tensor > 0)
+        has_initial_state = self._padded(context_lens_tensor > 0, batch)
         prefill_has_initial_state = (
             has_initial_state.to(torch.int16) if is_prefill else None
         )
@@ -210,8 +212,12 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
             seq_len=seq_len,
             store_state_indices=store_blocks.to(torch.int16),
             conv_state_index=self._stage(load_blocks, "conv_state_index"),
-            conv_seq_idx=self._stage(padded(first_positions), "conv_seq_idx"),
-            conv_query_len=self._stage(padded(query_lens), "conv_query_len"),
+            conv_seq_idx=self._stage(
+                self._padded(first_positions, batch), "conv_seq_idx"
+            ),
+            conv_query_len=self._stage(
+                self._padded(query_lens, batch), "conv_query_len"
+            ),
             conv_has_initial_state=self._stage(
                 has_initial_state, "conv_has_initial_state"
             ),
