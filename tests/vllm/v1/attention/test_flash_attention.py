@@ -627,6 +627,7 @@ class TestBuildMmPrefixSlidingWindow:
                     self.WINDOW,
                     self.BLOCK,
                     query.dtype,
+                    max_model_len=n,
                 )
             impl.forward(layer, query, key, value, cache, metadata, output)
             metadata.swa_attn_masks = None
@@ -1058,7 +1059,12 @@ class TestForwardSlidingWindow:
 
         model_mask = (
             _build_mm_prefix_sliding_mask(
-                md.mm_prefix_row_ends, md.seq_lens, self.WINDOW, self.WINDOW, dtype
+                md.mm_prefix_row_ends,
+                md.seq_lens,
+                self.WINDOW,
+                self.WINDOW,
+                dtype,
+                max_model_len=16,
             )
             if use_mm_prefix
             else None

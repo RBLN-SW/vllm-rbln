@@ -501,6 +501,7 @@ def test_prefix_mask_is_shared_and_does_not_escape_forward(monkeypatch, compiled
         start_layer=0,
         end_layer=3,
         model_dtype=torch.float32,
+        mm_prefix_max_model_len=16,
     )
     model.mm_prefix_attn_layers = [layer.attn for layer in model.layers]
     metadata = RBLNFlashAttentionMetadata(
@@ -552,3 +553,23 @@ def test_prefix_mask_is_shared_and_does_not_escape_forward(monkeypatch, compiled
             sum(node.target is torch.ops.higher_order.invoke_subgraph for node in nodes)
             == 3
         )
+
+
+@pytest.mark.parametrize("start", [0, 1023, 1024, 1025, 262144, 264192])
+def test_prefix_mask_block_boundaries(start):
+    row_ends = torch.tensor([0, 3, 3, 3])
+    mask = gemma4._build_mm_prefix_sliding_mask(
+        row_ends,
+        torch.tensor([[start]]),
+        1024,
+        1024,
+        torch.bfloat16,
+        max_model_len=524288,
+    )
+    first_key = max(start - 1024 + 1, 0) // 1024 * 1024
+    keys = torch.arange(mask.size(-1), dtype=torch.int64) + first_key
+    rows = torch.arange(4, dtype=torch.int64) + start
+    expected = (keys[None, :] <= (row_ends + start)[:, None]) & (
+        keys[None, :] > (rows - 1024)[:, None]
+    )
+    torch.testing.assert_close(mask[0, 0], expected.to(mask.dtype), rtol=0, atol=0)
