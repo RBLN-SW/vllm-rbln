@@ -21,10 +21,11 @@ sharing a buffer are one graph input with one chiplet cut. The delta-rule
 kernels read a block as the [Hk, R, 2, 128, 64] state it holds, in the
 activation dtype (dlfloat16 inside the kernels), addressed by the group's
 block table. Its short-conv ring is a block-aux cache on the same
-block ids. The builder turns the block table into the rows the kernels read
-and write: a request's one block (`mamba_block_size` is the model length),
-read and written in place; a padding row reads and writes block 0, vLLM's
-null block.
+block ids. The builder turns the block table into the blocks the kernels read
+and write: that of a request's last computed token and that of its last
+scheduled one. They differ only under prefix caching ("align", a state a KV
+block), when a step enters a new block. A padding row reads and writes block
+0, vLLM's null block.
 
 The delta-rule kernels take q / k per key head, L2-normalized inside, and v, g and
 beta per value head grouped under its key head. The short conv
@@ -170,17 +171,20 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
         def padded(values: torch.Tensor) -> torch.Tensor:
             return rbln_utils.pad(values.to(torch.int32), 0, batch)
 
-        # TODO(prefix caching): one column while mamba_block_size is the model
-        # length, so a row stores to the block it loads; a step crossing into a
-        # new block stores to the block of its last scheduled token instead.
-        block_table_tensor = mamba_get_block_table_tensor(
-            m.block_table_tensor,
-            m.seq_lens,
-            self.kv_cache_spec,
-            self.vllm_config.cache_config.mamba_cache_mode,
-        )
-        blocks = padded(block_table_tensor[:num_reqs, 0])
-        non_spec_state_indices_tensor = blocks.to(torch.int16)
+        def state_blocks(num_tokens: torch.Tensor) -> torch.Tensor:
+            """Each request's block holding its state after `num_tokens` tokens."""
+            return padded(
+                mamba_get_block_table_tensor(
+                    m.block_table_tensor[:num_reqs],
+                    num_tokens,
+                    self.kv_cache_spec,
+                    self.vllm_config.cache_config.mamba_cache_mode,
+                )[:, 0]
+            )
+
+        load_blocks = state_blocks(context_lens_tensor)
+        store_blocks = state_blocks(m.seq_lens[:num_reqs])
+        non_spec_state_indices_tensor = load_blocks.to(torch.int16)
 
         valid_mask = None
         if is_prefill:
@@ -204,14 +208,14 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
             prefill_has_initial_state=prefill_has_initial_state,
             batch_size=batch,
             seq_len=seq_len,
-            store_state_indices=blocks.to(torch.int16),
-            conv_state_index=self._stage(blocks, "conv_state_index"),
+            store_state_indices=store_blocks.to(torch.int16),
+            conv_state_index=self._stage(load_blocks, "conv_state_index"),
             conv_seq_idx=self._stage(padded(first_positions), "conv_seq_idx"),
             conv_query_len=self._stage(padded(query_lens), "conv_query_len"),
             conv_has_initial_state=self._stage(
                 has_initial_state, "conv_has_initial_state"
             ),
-            conv_store_index=self._stage(blocks, "conv_store_index"),
+            conv_store_index=self._stage(store_blocks, "conv_store_index"),
             valid_mask=None
             if valid_mask is None
             else self._stage(valid_mask, "valid_mask"),
