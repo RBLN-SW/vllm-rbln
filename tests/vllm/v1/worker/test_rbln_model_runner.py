@@ -1697,6 +1697,7 @@ class TestUpdateStates:
             sort_batch_by_length=False,
             kv_cache_config=SimpleNamespace(kv_cache_groups=[]),
             rbln_config=RBLNConfig(),
+            sampler=None,
         )
 
     def test_new_request_added(self, monkeypatch):
@@ -1721,6 +1722,19 @@ class TestUpdateStates:
         r._update_states(_sched(finished=["r0"]))
         assert "r0" not in r.input_batch.req_id_to_index
         assert "r0" not in r.requests
+
+    def test_finished_request_forgets_fused_penalty_state(self, monkeypatch):
+        # Only finishing drops it: a prefill step leaves decoding requests out.
+        sampler = object.__new__(mr.RBLNSampler)
+        sampler.forget_requests = MagicMock()
+        r = self._runner(
+            monkeypatch,
+            input_batch=_input_batch(1),
+            requests={"r0": _cached_state("r0")},
+        )
+        r.sampler = sampler
+        r._update_states(_sched(finished=["r0"]))
+        sampler.forget_requests.assert_called_once_with(["r0"])
 
     def test_unscheduled_request_removed(self, monkeypatch):
         # r0 is cached but not scheduled (and not resumed) -> dropped.
