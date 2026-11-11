@@ -65,23 +65,30 @@ def _build_mm_prefix_sliding_mask(
     num_key_blocks = (
         sliding_window + query_length - 1 + block_size - 1
     ) // block_size + 1
-    chunk_start_position = chunk_start_position.reshape(1, 1)
+    chunk_start_position = chunk_start_position.to(torch.int32).reshape(1, 1)
     earliest_key_position = torch.clamp(
         chunk_start_position - sliding_window + 1, min=0
     )
     first_key_block_start_position = earliest_key_position // block_size * block_size
-    query_offsets = torch.arange(query_length, device=row_end_offsets.device).view(
-        -1, 1
-    )
+    query_offsets = torch.arange(
+        query_length, device=row_end_offsets.device, dtype=torch.int32
+    ).view(-1, 1)
     key_offsets = (
         first_key_block_start_position
         - chunk_start_position
-        + torch.arange(num_key_blocks * block_size, device=row_end_offsets.device)
+        + torch.arange(
+            num_key_blocks * block_size,
+            device=row_end_offsets.device,
+            dtype=torch.int32,
+        )
     )
-    allowed_keys = (key_offsets <= row_end_offsets.view(-1, 1)) & (
-        key_offsets > query_offsets - sliding_window
+    # Int32 device comparisons require at least one full-shape operand.
+    key_offsets = key_offsets.expand(query_length, num_key_blocks * block_size)
+    within_prefix = (key_offsets <= row_end_offsets.to(torch.int32).view(-1, 1)).to(
+        dtype
     )
-    return allowed_keys.to(dtype).view(1, 1, query_length, -1)
+    within_window = (key_offsets > query_offsets - sliding_window).to(dtype)
+    return (within_prefix * within_window).view(1, 1, query_length, -1)
 
 
 class _RBLNGemma4VisionEncoder(nn.Module):

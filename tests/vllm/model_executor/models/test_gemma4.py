@@ -543,7 +543,7 @@ def test_prefix_mask_is_shared_and_does_not_escape_forward(monkeypatch, compiled
     if compiled:
         assert len(graphs) == 1
         nodes = list(graphs[0].graph.nodes)
-        assert sum(node.target is operator.and_ for node in nodes) == 1
+        assert sum(node.target is operator.le for node in nodes) == 1
         assert not any(
             node.op == "placeholder" and "scale" in str(node.target) for node in nodes
         )
