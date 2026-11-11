@@ -18,6 +18,7 @@ from copy import deepcopy
 from dataclasses import replace
 from typing import Any
 
+import rebel
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
@@ -367,12 +368,16 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
             zip(cached_block_tables, dst_blocks)
         ):
             try:
-                copy_kv_cache = (
-                    runtime._copy_packed_kv_cache
+                # A split cache leaves packing out, so that a rebel-compiler
+                # from before the packed KV cache still copies it.
+                packing = (
+                    {"packing": rebel.KVCachePacking.PACKED}
                     if self.packed_kv_cache
-                    else runtime._copy_kv_cache
+                    else {}
                 )
-                copy_kv_cache(src_block, dst_block, cached_lengths[block_idx])
+                runtime._copy_kv_cache(
+                    src_block, dst_block, cached_lengths[block_idx], **packing
+                )
                 logger.debug(
                     "Successfully copied KV cache from block %d to block %d",
                     src_block,

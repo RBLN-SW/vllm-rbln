@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The prefix-cache copy picks the runtime KV cache API by the compiled cache layout."""
+"""The prefix-cache copy tells the runtime how the compiled model packs its KV cache."""
 
+import enum
 from types import SimpleNamespace
 
 import pytest
+import rebel
 import torch
 import torch.nn as nn
 
@@ -31,8 +33,15 @@ PACKED_SHAPE = [4, 2, 2, 1, 256, 64]
 SPLIT_SHAPE = [4, 2, 256, 64]
 
 
+class KVCachePacking(enum.Enum):
+    """Stands in for rebel.KVCachePacking, which the pinned rebel-compiler may lack."""
+
+    SPLIT = "split"
+    PACKED = "packed"
+
+
 class SplitOnlyRuntime:
-    """A rebel runtime from before the packed KV cache API."""
+    """A rebel runtime from before the packed KV cache."""
 
     def __init__(self) -> None:
         self.copies: list[tuple[str, int, int, int]] = []
@@ -42,8 +51,14 @@ class SplitOnlyRuntime:
 
 
 class Runtime(SplitOnlyRuntime):
-    def _copy_packed_kv_cache(self, src: int, dst: int, size: int) -> None:
-        self.copies.append(("packed", src, dst, size))
+    def _copy_kv_cache(
+        self,
+        src: int,
+        dst: int,
+        size: int,
+        packing: KVCachePacking = KVCachePacking.SPLIT,
+    ) -> None:
+        self.copies.append((packing.value, src, dst, size))
 
 
 class DecoderModel(nn.Module, RBLNOptimumDecoderMixin):
@@ -70,32 +85,43 @@ def no_logits_processor(monkeypatch):
     monkeypatch.setattr(model_base, "LogitsProcessor", lambda *args, **kwargs: None)
 
 
+@pytest.fixture
+def runtime(monkeypatch) -> Runtime:
+    monkeypatch.setattr(rebel, "KVCachePacking", KVCachePacking, raising=False)
+    return Runtime()
+
+
+@pytest.fixture
+def split_only_runtime(monkeypatch) -> SplitOnlyRuntime:
+    monkeypatch.delattr(rebel, "KVCachePacking", raising=False)
+    return SplitOnlyRuntime()
+
+
 @pytest.mark.parametrize(
-    ("cache_shape", "api"), [(SPLIT_SHAPE, "split"), (PACKED_SHAPE, "packed")]
+    ("cache_shape", "packing"), [(SPLIT_SHAPE, "split"), (PACKED_SHAPE, "packed")]
 )
-def test_copies_through_the_api_of_the_cache_layout(cache_shape, api):
-    runtime = Runtime()
+def test_copies_with_the_packing_of_the_cache_layout(cache_shape, packing, runtime):
     model = DecoderModel(cache_shape, runtime)
 
     model.copy_cached_kv_blocks([3, 5], [16, 7], torch.tensor([1, 2]))
 
-    assert runtime.copies == [(api, 3, 1, 16), (api, 5, 2, 7)]
+    assert runtime.copies == [(packing, 3, 1, 16), (packing, 5, 2, 7)]
 
 
-def test_split_cache_copies_on_a_runtime_without_the_packed_api():
-    runtime = SplitOnlyRuntime()
-    model = DecoderModel(SPLIT_SHAPE, runtime)
+def test_split_cache_copies_on_a_rebel_compiler_without_packing(split_only_runtime):
+    model = DecoderModel(SPLIT_SHAPE, split_only_runtime)
 
     model.copy_cached_kv_blocks([3], [16], torch.tensor([1]))
 
-    assert runtime.copies == [("split", 3, 1, 16)]
+    assert split_only_runtime.copies == [("split", 3, 1, 16)]
 
 
-def test_packed_cache_on_a_runtime_without_the_packed_api_fails_the_copy():
-    runtime = SplitOnlyRuntime()
-    model = DecoderModel(PACKED_SHAPE, runtime)
+def test_packed_cache_on_a_rebel_compiler_without_packing_fails_the_copy(
+    split_only_runtime,
+):
+    model = DecoderModel(PACKED_SHAPE, split_only_runtime)
 
     # The runner falls back to a full prefill on this error.
-    with pytest.raises(KVCacheCopyError, match="_copy_packed_kv_cache"):
+    with pytest.raises(KVCacheCopyError, match="KVCachePacking"):
         model.copy_cached_kv_blocks([3], [16], torch.tensor([1]))
-    assert runtime.copies == []
+    assert split_only_runtime.copies == []
