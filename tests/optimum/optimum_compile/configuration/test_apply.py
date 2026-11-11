@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from copy import deepcopy
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
@@ -684,6 +685,99 @@ def test_runtime_block_count_is_resolved_before_apply(
     assert repeated.model_num_blocks == prepared.model_num_blocks
     apply_runtime_config(cfg, repeated)
     assert cfg.cache_config.num_gpu_blocks == expected_blocks
+
+
+@pytest.mark.parametrize(
+    "sub_block_size, prefill_chunk_size, mamba_block_size, error, message",
+    [
+        (384, 256, None, ValueError, "not divisible.*prefill_chunk_size"),
+        (2048, 256, None, ValueError, "greater than.*kvcache_block_size"),
+        (768, 256, None, ValueError, "not divisible.*sub_block_size"),
+        (None, 384, None, ValueError, "not divisible.*sub_block_size"),
+        (256, 256, 4096, AssertionError, "mamba_block_size can only be synced"),
+    ],
+)
+def test_block_constraints_are_validated_without_changing_config(
+    apply_config, sub_block_size, prefill_chunk_size, mamba_block_size, error, message
+):
+    selected = {
+        "batch_size": 2,
+        "max_seq_len": 8192,
+        "kvcache_block_size": 1024,
+        "kvcache_num_blocks": 16,
+        "prefill_chunk_size": prefill_chunk_size,
+        "num_devices": 1,
+    }
+    cfg = apply_config(selected)
+    cfg.cache_config.enable_prefix_caching = True
+    cfg.cache_config.mamba_block_size = mamba_block_size
+    cfg.additional_config.sub_block_size = sub_block_size
+    cfg.additional_config.optimum_overrides = {"device": [0], "create_runtimes": False}
+    cfg.scheduler_config.max_num_seqs = 4
+    cfg.model_config.max_model_len = 16384
+    before = deepcopy(cfg)
+
+    with pytest.raises(error, match=message):
+        prepare_runtime_config(cfg, selected, precompiled=True)
+
+    assert cfg == before
+
+
+@pytest.mark.parametrize("sub_block_size, expected_size", [(None, 256), (512, 512)])
+def test_prefix_block_sizes_are_resolved_before_apply(
+    apply_config, sub_block_size, expected_size
+):
+    selected = {
+        "batch_size": 2,
+        "max_seq_len": 8192,
+        "kvcache_block_size": 1024,
+        "kvcache_num_blocks": 16,
+        "prefill_chunk_size": 256,
+        "num_devices": 1,
+    }
+    cfg = apply_config(selected)
+    cfg.cache_config.enable_prefix_caching = True
+    cfg.additional_config.sub_block_size = sub_block_size
+    before = deepcopy(cfg)
+
+    prepared = prepare_runtime_config(cfg, selected, precompiled=True)
+
+    assert cfg == before
+    assert prepared.block_size == expected_size
+    assert prepared.attn_block_size == 1024
+    apply_runtime_config(cfg, prepared)
+    assert cfg.cache_config.block_size == expected_size
+    assert cfg.additional_config.attn_block_size == 1024
+
+
+@pytest.mark.parametrize(
+    "user_specified, precompiled, expected_size",
+    [(False, True, 8192), (True, True, 4096), (False, False, 4096)],
+)
+def test_mamba_block_size_is_resolved_before_apply(
+    apply_config, user_specified, precompiled, expected_size
+):
+    selected = {
+        "batch_size": 2,
+        "max_seq_len": 8192,
+        "kvcache_block_size": 1024,
+        "kvcache_num_blocks": 16,
+        "prefill_chunk_size": 256,
+        "num_devices": 1,
+    }
+    cfg = apply_config(selected)
+    cfg.cache_config.mamba_block_size = 4096
+    cfg.cache_config.user_specified_mamba_block_size = user_specified
+    cfg.cache_config.enable_prefix_caching = user_specified
+    cfg.model_config.max_model_len = 16384
+    before = deepcopy(cfg)
+
+    prepared = prepare_runtime_config(cfg, selected, precompiled=precompiled)
+
+    assert cfg == before
+    assert prepared.mamba_block_size == expected_size
+    apply_runtime_config(cfg, prepared)
+    assert cfg.cache_config.mamba_block_size == expected_size
 
 
 @pytest.mark.parametrize("invalid", ["missing_devices", "prefill_conflict"])

@@ -53,6 +53,8 @@ def test_memory_sizing_applies_prepared_block_count(
             num_gpu_blocks=None,
             num_gpu_blocks_override=override,
             gpu_memory_utilization=1.0,
+            user_specified_mamba_block_size=False,
+            mamba_block_size=None,
         ),
         additional_config=build_optimum_rbln_config({}),
     )
