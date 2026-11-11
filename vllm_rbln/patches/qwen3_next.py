@@ -57,10 +57,6 @@ class RBLNGDNConvRingCache(nn.Module, AttentionLayerBase):
     """A GatedDeltaNet layer's short-conv ring: a block-aux cache beside the
     layer's state, one ring a state block, addressed by the layer's block ids."""
 
-    # This cache's position among the graph's KV cache inputs. The runner binds
-    # it once the caches exist and requires the attribute beforehand.
-    layer_index = 0
-
     def __init__(
         self, prefix: str, owner: str, block_shape: tuple[int, ...], dtype: torch.dtype
     ) -> None:
@@ -70,6 +66,9 @@ class RBLNGDNConvRingCache(nn.Module, AttentionLayerBase):
         self.block_shape = block_shape
         self.dtype = dtype
         self.kv_cache = torch.tensor([])
+        # This cache's position among the graph's KV cache inputs: the runner
+        # assigns it once the caches exist.
+        self.layer_index: int | None = None
         context = get_current_vllm_config().compilation_config.static_forward_context
         if prefix in context:
             raise ValueError(f"Duplicate layer name: {prefix}")
@@ -88,6 +87,7 @@ class RBLNGDNConvRingCache(nn.Module, AttentionLayerBase):
 
     def inputs(self) -> torch.Tensor:
         metadata = get_forward_context().attn_metadata[self.owner]
+        assert self.layer_index is not None, self.prefix
         return _resolve_kv_cache(metadata, self.layer_index)
 
 
@@ -111,9 +111,6 @@ class RBLNGDNConvRingCache(nn.Module, AttentionLayerBase):
     ),
 )
 class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
-    # The state cache's position, bound by the runner as the conv ring's is.
-    layer_index = 0
-
     def __init__(
         self, config, vllm_config: VllmConfig, prefix: str = "", **kwargs
     ) -> None:
@@ -124,6 +121,9 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 f"values, a multiple of {STATE_LANES}, got {self.head_k_dim} / "
                 f"{self.head_v_dim}"
             )
+        # The state cache's position among the graph's KV cache inputs: the
+        # runner assigns it once the caches exist.
+        self.layer_index: int | None = None
         model_config = vllm_config.model_config
         self.num_kv_heads = model_config.get_num_kv_heads(vllm_config.parallel_config)
         self.kv_head_size = model_config.get_head_size()
@@ -180,6 +180,7 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 f"hold the step's batch {batch} x seq {seq_len} the GDN metadata "
                 "describes"
             )
+        assert self.layer_index is not None, self.prefix
         state = _resolve_kv_cache(metadata, self.layer_index)
         ring = self.conv_ring.inputs()
         tp_size = self.tp_size
