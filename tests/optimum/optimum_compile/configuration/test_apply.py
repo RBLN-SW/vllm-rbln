@@ -21,16 +21,16 @@ import torch
 from vllm.config import CacheConfig, ModelConfig, SchedulerConfig, VllmConfig
 
 from vllm_rbln.config import build_optimum_rbln_config
-from vllm_rbln.utils.optimum.configuration.apply import apply_runtime_config
-from vllm_rbln.utils.optimum.configuration.execution import (
+from vllm_rbln.utils.optimum.configuration.runtime_config import (
+    apply_runtime_config,
     get_runtime_num_blocks,
     get_user_max_num_batched_tokens,
     is_chunked_prefill_arch,
+    prepare_runtime_config,
     store_image_prefill_chunk_size,
     update_max_num_batched_tokens,
     validate_user_prefill_chunk_size,
 )
-from vllm_rbln.utils.optimum.configuration.runtime_config import prepare_runtime_config
 
 pytestmark = pytest.mark.usefixtures("set_npu_env_var")
 

@@ -347,7 +347,7 @@ class TestSync:
 def test_initial_cache_hit_applies_vllm_config_updates_once(
     monkeypatch, vllm_config_factory
 ):
-    from vllm_rbln.utils.optimum.configuration import apply as apply_module
+    from vllm_rbln.utils.optimum.configuration import runtime_config as runtime_module
 
     calls = []
     selected_configs = []
@@ -358,13 +358,13 @@ def test_initial_cache_hit_applies_vllm_config_updates_once(
         return apply(cfg, data, **kwargs)
 
     monkeypatch.setattr(sync, "apply_runtime_config", record_apply)
-    original = apply_module.update_block_size
+    original = runtime_module.update_block_size
 
     def record(*args, **kwargs):
         calls.append(args)
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(apply_module, "update_block_size", record)
+    monkeypatch.setattr(runtime_module, "update_block_size", record)
     metadata = {
         "batch_size": 2,
         "max_seq_len": 4096,
