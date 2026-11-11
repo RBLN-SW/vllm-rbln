@@ -1020,6 +1020,31 @@ class TestMmPrefixChunks:
         computed, scheduled = self._prefix_hit_inside_a_range(monkeypatch, True)
         assert (computed - scheduled, scheduled) == (32, 14)
 
+    def test_decode_steps_skip_the_range_scan(self, monkeypatch):
+        image = self._feature("image", 9, [False] + [True] * 6 + [False])
+        sched = self._scheduler(monkeypatch)
+        req = make_request("a", list(range(20)), 16, mm_features=[image], max_tokens=4)
+        sched.add_request(req)
+        while req.num_output_tokens == 0:
+            out = sched.schedule()
+            done = req.num_computed_tokens >= req.num_prompt_tokens
+            sched.update_from_output(
+                out, make_model_runner_output(out, 0 if done else None)
+            )
+        calls = []
+        split = sched._mm_prefix_split
+
+        def recording_split(*args):
+            calls.append(args)
+            return split(*args)
+
+        monkeypatch.setattr(sched, "_mm_prefix_split", recording_split)
+
+        out = sched.schedule()
+
+        assert out.num_scheduled_tokens["a"] == 1
+        assert calls == []
+
 
 class TestScheduleSpecDecodeCap:
     _BS = 1024

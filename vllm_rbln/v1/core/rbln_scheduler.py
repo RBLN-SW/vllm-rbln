@@ -218,7 +218,13 @@ class RBLNScheduler(Scheduler):
         return end - num_computed_tokens
 
     def _splits_on_mm_prefix(self, request: Request) -> bool:
-        return self._is_mm_prefix_lm and request.has_encoder_inputs
+        # Past the prompt, every range is behind the cursor; a preempted request
+        # recomputes from 0 and is cut again.
+        return (
+            self._is_mm_prefix_lm
+            and request.has_encoder_inputs
+            and request.num_computed_tokens < request.num_prompt_tokens
+        )
 
     def _decode_demand(self) -> int:
         """Total decode demand for this step's soft (ceil(demand/pp)) cap.
