@@ -103,12 +103,17 @@ the number of rows, the row vocab size and `K`. Penalty values, bias values,
 temperature, top-k and top-p are tensor data, so changing them never
 recompiles.
 
-`K` starts at 256 chunks per row, grows by 64 up to 512 and doubles after that
-(`next_k`). The first bucket is compiled at warm-up. A request with an unusually
-long prompt or output moves the batch to the next bucket: every live request is
-rebuilt from its full history once, and the new graphs compile once.
+`K` comes from a fixed set per row size: 256, 512, 1024 and a cap, the largest
+multiple of 64 within the row's chunk count (1152 for the half rows of a batch of
+one and 2368 for full rows, with a 151936 vocab). Each step uses the smallest
+`K` that fits the live requests, so it drops back once a long request leaves.
+Every graph key has its own code object, and warm-up compiles every `K`, so
+serving never compiles a new graph.
+
+A request that touches more chunks than the cap takes the existing path for that
+step.
 
 ## Limitations
 
 - Lane parameters are uploaded as fp16.
-- The vocab size must be a multiple of 128.
+- The vocab size must be a multiple of 128 and at least 8192.

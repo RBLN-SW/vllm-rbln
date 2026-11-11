@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from collections.abc import Callable
+from types import FunctionType
 from typing import Any, Literal
 
 import rebel
@@ -120,7 +121,10 @@ def _fused_graph_fn(
         "greedy": greedy,
         "top_k_top_p": top_k_top_p,
     }
-    return graphs[kind]
+    fn = graphs[kind]
+    # Dynamo caps compiled entries per code object, so each key gets its own.
+    code = fn.__code__.replace(co_name=f"fused_{kind}_{rows}x{row_vocab}_k{k}")
+    return FunctionType(code, fn.__globals__, code.co_name, None, fn.__closure__)
 
 
 def compile_sampler(
@@ -249,10 +253,13 @@ class RBLNSampler(VLLMSampler):
     def warm_up(
         self, logits: torch.Tensor, sampling_metadata: SamplingMetadata
     ) -> None:
-        """Compile the graphs `sampling_metadata` reaches, fused ones included."""
+        """Compile the graphs `sampling_metadata` reaches, fused ones at every k."""
         _ = self(logits=logits, sampling_metadata=sampling_metadata)
-        if self._penalty_state is not None:
-            plan = self._penalty_state.identity_plan(logits.shape, logits.device)
+        state = self._penalty_state
+        if state is None:
+            return
+        for k in state.k_buckets(logits.shape):
+            plan = state.identity_plan(logits.shape, logits.device, k)
             self.sample(logits.clone(), sampling_metadata, penalty=plan)
             if not sampling_metadata.all_greedy:
                 # Steps with min_p penalize before the eager processors.

@@ -20,9 +20,11 @@ from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
 
 from vllm_rbln.v1.sample.ops.fused_penalty import (
-    K_MIN,
+    K_BUCKETS,
     FusedPenaltyState,
     apply_fused_penalty,
+    k_buckets,
+    row_layout,
 )
 from vllm_rbln.v1.sample.rbln_sampler import RBLNSampler
 
@@ -51,20 +53,22 @@ def dense_reference(logits, prompts, outputs, rep, freq, pres, biases):
 
 
 @pytest.mark.parametrize(
-    ("num_rows", "vocab", "k_min"),
+    ("num_rows", "vocab", "base"),
     [
-        (1, 4096, K_MIN),
-        (4, 4096, K_MIN),
-        (16, 4096, K_MIN),
-        # ~150 chunks per request outgrow 64 slots: k moves up and rebuilds.
-        (4, 16384, 64),
+        (1, 16384, K_BUCKETS),
+        (4, 16384, K_BUCKETS),
+        (16, 16384, K_BUCKETS),
+        # ~150 chunks per request outgrow 64 slots: k moves up a bucket.
+        (4, 16384, (64, 128)),
     ],
 )
-def test_state_matches_dense_across_steps(num_rows, vocab, k_min):
+def test_state_matches_dense_across_steps(num_rows, vocab, base):
     """Requests join, leave, reorder and grow one token per step."""
     rng = random.Random(0)
     torch.manual_seed(0)
-    state = FusedPenaltyState(k_min=k_min)
+    state = FusedPenaltyState(base)
+    buckets = k_buckets(row_layout(num_rows, vocab)[1], base)
+    ks = []
     reqs: dict[str, dict] = {}
     for step in range(12):
         if step % 4 == 0:
@@ -86,7 +90,7 @@ def test_state_matches_dense_across_steps(num_rows, vocab, k_min):
             r["outputs"].append(rng.choice(r["prompt"] + [rng.randrange(vocab)]))
         live = [reqs[r] for r in ids]
 
-        rows, row_vocab, k, cidx, lanes = state.update(
+        step = state.update(
             ids,
             lambda i, live=live: np.asarray(live[i]["prompt"]),
             [r["outputs"] for r in live],
@@ -97,6 +101,10 @@ def test_state_matches_dense_across_steps(num_rows, vocab, k_min):
             vocab,
             num_rows,
         )
+        assert step is not None
+        rows, row_vocab, k, cidx, lanes = step
+        assert k in buckets
+        ks.append(k)
         logits = torch.randn(num_rows, vocab) * 3
         got = apply_fused_penalty(
             logits.clone(), cidx, lanes.float(), rows, row_vocab, k
@@ -112,7 +120,44 @@ def test_state_matches_dense_across_steps(num_rows, vocab, k_min):
         )
         torch.testing.assert_close(got[: len(ids)], want, atol=1e-3, rtol=1e-3)
         assert torch.equal(got[len(ids) :], logits[len(ids) :])
-    assert state.k > k_min or vocab // 64 <= k_min
+    assert max(ks) > buckets[0] or len(buckets) == 1
+
+
+def _update(state, prompts, vocab, num_rows):
+    """One step over `prompts`, a {request id: prompt} dict."""
+    return state.update(
+        list(prompts),
+        lambda i: np.asarray(list(prompts.values())[i]),
+        [[] for _ in prompts],
+        np.full(len(prompts), 1.05),
+        np.zeros(len(prompts)),
+        np.zeros(len(prompts)),
+        {},
+        vocab,
+        num_rows,
+    )
+
+
+def test_k_buckets_stay_within_the_row():
+    # 1187 and 2374 chunks: K past the row's chunk count fails to compile.
+    assert k_buckets(151936 // 2) == (256, 512, 1024, 1152)
+    assert k_buckets(151936) == (256, 512, 1024, 2368)
+
+
+def test_k_drops_back_after_a_long_request_leaves():
+    state = FusedPenaltyState((64, 128))
+    vocab = 16384  # 256 chunks per row
+    long_prompt = [c * 64 for c in range(200)]
+    assert _update(state, {"long": long_prompt, "a": [1]}, vocab, 2)[2] == 256
+    assert _update(state, {"a": [1], "b": [3]}, vocab, 2)[2] == 64
+
+
+def test_request_past_the_cap_keeps_the_upstream_path():
+    vocab = 151936  # 2374 chunks, cap 2368
+    fits = {"r": [c * 64 for c in range(2368)]}
+    over = {"r": [c * 64 for c in range(2370)]}
+    assert _update(FusedPenaltyState(), fits, vocab, 2)[2] == 2368
+    assert _update(FusedPenaltyState(), over, vocab, 2) is None
 
 
 def _run_sampler(params, logits, fused: bool, expect_kinds: set[str]):

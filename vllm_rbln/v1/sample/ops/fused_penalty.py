@@ -38,7 +38,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.worker.gpu_input_batch import InputBatch
 
 CHUNK = 64
-K_MIN = 256
+K_BUCKETS = (256, 512, 1024)
 ADD, MUL, SUB = 0, 1, 2
 
 _IDENTITY = np.zeros((3, CHUNK), np.float16)
@@ -53,15 +53,29 @@ class FusedPenaltyPlan(NamedTuple):
     lanes: torch.Tensor  # [rows, 3, k, CHUNK] fp16 (add, mul, sub)
 
 
-def supports_vocab(vocab_size: int) -> bool:
+def row_layout(num_rows: int, vocab_size: int) -> tuple[int, int]:
+    """(rows, row_vocab) of the fused graph for a batch of `num_rows`."""
     # A batch of one is split into two half-vocab rows.
     # TODO: drop the split once the pinned compiler fixes batch-1 chunk gather.
-    return vocab_size % (2 * CHUNK) == 0
+    per_req = 2 if num_rows == 1 else 1
+    return num_rows * per_req, vocab_size // per_req
 
 
-def next_k(k: int) -> int:
-    """Chunk-slot bucket after `k`: +64 up to 512, then doubling."""
-    return k + CHUNK if k < 512 else k * 2
+def k_cap(row_vocab: int) -> int:
+    """Most chunk slots a row can use. A graph with more fails to compile."""
+    # TODO: use the plain chunk count once the pinned compiler pads gather and
+    # scatter indices itself (rebel_compiler#15631).
+    return row_vocab // CHUNK // CHUNK * CHUNK
+
+
+def k_buckets(row_vocab: int, base: Sequence[int] = K_BUCKETS) -> tuple[int, ...]:
+    """The chunk-slot counts a row of `row_vocab` compiles graphs for."""
+    cap = k_cap(row_vocab)
+    return tuple(sorted({b for b in base if b < cap} | {cap}))
+
+
+def supports_vocab(vocab_size: int) -> bool:
+    return vocab_size % (2 * CHUNK) == 0 and k_cap(vocab_size // 2) > 0
 
 
 def uses_argmax_invariant_processors(sampling_metadata: SamplingMetadata) -> bool:
@@ -87,10 +101,6 @@ def without_deferred(sampling_metadata: SamplingMetadata) -> SamplingMetadata:
     )
 
 
-class _GrowK(Exception):
-    pass
-
-
 class _Request:
     """Append-only lane store of one request. Slots fill in first-seen order."""
 
@@ -110,7 +120,13 @@ class _Request:
     )
 
     def __init__(
-        self, split: bool, vocab_size: int, k: int, rep: float, freq: float, pres: float
+        self,
+        split: bool,
+        vocab_size: int,
+        capacity: int,
+        rep: float,
+        freq: float,
+        pres: float,
     ):
         self.split = split
         self.half = vocab_size // 2
@@ -123,8 +139,20 @@ class _Request:
         self.seen: set[int] = set()
         self.counts: dict[int, int] = {}
         self.done = 0
-        self.cidx = np.zeros((rows, k), np.int32)
-        self.lanes = np.empty((rows, 3, k, CHUNK), np.float16)
+        self.cidx = np.zeros((rows, capacity), np.int32)
+        self.lanes = np.empty((rows, 3, capacity, CHUNK), np.float16)
+
+    @property
+    def used(self) -> int:
+        return max(len(s) for s in self.slots)
+
+    def _grow(self) -> None:
+        n = self.cidx.shape[1]
+        cidx = np.zeros((self.cidx.shape[0], 2 * n), np.int32)
+        lanes = np.empty((self.lanes.shape[0], 3, 2 * n, CHUNK), np.float16)
+        cidx[:, :n] = self.cidx
+        lanes[:, :, :n] = self.lanes
+        self.cidx, self.lanes = cidx, lanes
 
     def _lane(self, token: int) -> tuple[int, int, int]:
         """(row, slot, lane) of `token`, taking a new slot on first touch."""
@@ -137,7 +165,7 @@ class _Request:
         if s is None:
             s = len(slots)
             if s >= self.cidx.shape[1]:
-                raise _GrowK
+                self._grow()
             slots[chunk] = s
             self.cidx[row, s] = chunk
             self.lanes[row, :, s] = _IDENTITY
@@ -164,8 +192,8 @@ class _Request:
 class FusedPenaltyState:
     """Per-request host state, updated with only the tokens added each step."""
 
-    def __init__(self, k_min: int = K_MIN):
-        self.k = k_min
+    def __init__(self, base_buckets: Sequence[int] = K_BUCKETS):
+        self.base_buckets = tuple(base_buckets)
         self._reqs: dict[str, _Request] = {}
         self._cidx: np.ndarray | None = None
         self._lanes: np.ndarray | None = None
@@ -209,7 +237,7 @@ class FusedPenaltyState:
         def prompt(i: int) -> np.ndarray:
             return input_batch.token_ids_cpu[i, : input_batch.num_prompt_tokens[i]]
 
-        rows, row_vocab, k, cidx, lanes = self.update(
+        step = self.update(
             input_batch.req_ids[:n],
             prompt,
             outputs,
@@ -220,14 +248,21 @@ class FusedPenaltyState:
             vocab_size,
             num_rows,
         )
+        if step is None:
+            return None
+        rows, row_vocab, k, cidx, lanes = step
         return FusedPenaltyPlan(rows, row_vocab, k, cidx.to(device), lanes.to(device))
 
+    def k_buckets(self, logits_shape: torch.Size) -> tuple[int, ...]:
+        """Every `k` a plan for `logits_shape` can take."""
+        return k_buckets(row_layout(*logits_shape)[1], self.base_buckets)
+
     def identity_plan(
-        self, logits_shape: torch.Size, device: torch.device
+        self, logits_shape: torch.Size, device: torch.device, k: int
     ) -> FusedPenaltyPlan:
-        """A plan that changes nothing, at the current bucket. Used for warm-up."""
+        """A plan that changes nothing, at chunk-slot count `k`. Used for warm-up."""
         num_rows, vocab_size = logits_shape
-        rows, row_vocab, k, cidx, lanes = self._copy_out([], vocab_size, num_rows)
+        rows, row_vocab, k, cidx, lanes = self._copy_out([], vocab_size, num_rows, k)
         return FusedPenaltyPlan(rows, row_vocab, k, cidx.to(device), lanes.to(device))
 
     def update(
@@ -241,70 +276,70 @@ class FusedPenaltyState:
         biases: dict[int, dict[int, float]],
         vocab_size: int,
         num_rows: int,
-    ) -> tuple[int, int, int, torch.Tensor, torch.Tensor]:
+    ) -> tuple[int, int, int, torch.Tensor, torch.Tensor] | None:
         """Fold this step's tokens in and return (rows, row_vocab, k, cidx, lanes).
 
         `num_rows` is the padded batch. Rows past `len(req_ids)` are identity.
-        When a request outgrows `k` chunk slots, `k` moves to `next_k` and every
-        live request is rebuilt from its full history.
+        `k` is the smallest bucket that fits the live requests. None when one of
+        them uses more chunks than any bucket holds.
         """
         split = num_rows == 1
-        while True:
-            try:
-                live = set(req_ids)
-                for rid in [r for r in self._reqs if r not in live]:
-                    del self._reqs[rid]
-                for i, rid in enumerate(req_ids):
-                    outs = output_token_ids[i] if i < len(output_token_ids) else ()
-                    n_out = len(outs)
-                    for j, t in enumerate(outs):
-                        if t < 0:  # async placeholder
-                            n_out = j
-                            break
-                    req = self._reqs.get(rid)
-                    if req is not None and (req.split != split or n_out < req.done):
-                        req = None
-                    if req is None:
-                        req = self._reqs[rid] = _Request(
-                            split,
-                            vocab_size,
-                            self.k,
-                            float(rep[i]),
-                            float(freq[i]),
-                            float(pres[i]),
-                        )
-                        for t, v in biases.get(i, {}).items():
-                            req.add_bias(int(t), v)
-                        if req.active:
-                            for t in prompt_fn(i):
-                                if 0 <= t < vocab_size:
-                                    req.add_prompt(int(t))
-                            new_outputs = outs[:n_out]
-                        else:
-                            new_outputs = ()
-                    else:
-                        new_outputs = outs[req.done : n_out] if req.active else ()
-                    for t in new_outputs:
+        live = set(req_ids)
+        for rid in [r for r in self._reqs if r not in live]:
+            del self._reqs[rid]
+        for i, rid in enumerate(req_ids):
+            outs = output_token_ids[i] if i < len(output_token_ids) else ()
+            n_out = len(outs)
+            for j, t in enumerate(outs):
+                if t < 0:  # async placeholder
+                    n_out = j
+                    break
+            req = self._reqs.get(rid)
+            if req is not None and (req.split != split or n_out < req.done):
+                req = None
+            if req is None:
+                req = self._reqs[rid] = _Request(
+                    split,
+                    vocab_size,
+                    self.base_buckets[0],
+                    float(rep[i]),
+                    float(freq[i]),
+                    float(pres[i]),
+                )
+                for t, v in biases.get(i, {}).items():
+                    req.add_bias(int(t), v)
+                if req.active:
+                    for t in prompt_fn(i):
                         if 0 <= t < vocab_size:
-                            req.add_output(int(t))
-                    req.done = n_out
-                break
-            except _GrowK:
-                self.k = next_k(self.k)
-                self._reqs.clear()
-        return self._copy_out(req_ids, vocab_size, num_rows)
+                            req.add_prompt(int(t))
+                    new_outputs = outs[:n_out]
+                else:
+                    new_outputs = ()
+            else:
+                new_outputs = outs[req.done : n_out] if req.active else ()
+            for t in new_outputs:
+                if 0 <= t < vocab_size:
+                    req.add_output(int(t))
+            req.done = n_out
 
-    def _copy_out(self, req_ids, vocab_size, num_rows):
-        per_req = 2 if num_rows == 1 else 1
-        rows = num_rows * per_req
+        need = max((self._reqs[rid].used for rid in req_ids), default=0)
+        row_vocab = row_layout(num_rows, vocab_size)[1]
+        k = next((b for b in k_buckets(row_vocab, self.base_buckets) if b >= need), 0)
+        if not k:
+            return None
+        return self._copy_out(req_ids, vocab_size, num_rows, k)
+
+    def _copy_out(self, req_ids, vocab_size, num_rows, k):
+        rows, row_vocab = row_layout(num_rows, vocab_size)
+        per_req = rows // num_rows
         if (
             self._cidx is None
             or self._lanes is None
             or self._cidx.shape[0] < rows
-            or self._cidx.shape[1] != self.k
+            or self._cidx.shape[1] != k
         ):
-            self._cidx = np.zeros((rows, self.k), np.int32)
-            self._lanes = np.empty((rows, 3, self.k, CHUNK), np.float16)
+            self._cidx = np.zeros((rows, k), np.int32)
+            self._lanes = np.empty((rows, 3, k, CHUNK), np.float16)
         cidx, lanes = self._cidx[:rows], self._lanes[:rows]
         for out in range(rows):
             i, r = divmod(out, per_req)
@@ -321,8 +356,8 @@ class FusedPenaltyState:
             lanes[out, :, n:] = req.lanes[r, :, :1]
         return (
             rows,
-            vocab_size // per_req,
-            self.k,
+            row_vocab,
+            k,
             torch.from_numpy(cidx),
             torch.from_numpy(lanes),
         )
