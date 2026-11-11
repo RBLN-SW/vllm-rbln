@@ -322,7 +322,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             self.sampler = RBLNSampler(
                 logprobs_mode=self.model_config.logprobs_mode,
                 compile_context=self.compile_context,
-                fused_penalty=self.rbln_config.use_fused_penalty,
+                fused_sampling=self.rbln_config.use_fused_sampling,
             )
             logger.info("Using RBLN sampler.")
         else:
@@ -886,6 +886,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         req_state = self.requests[req_id]
         # The prompt changes here, sometimes in place, so drop its cached array.
         self.prompt_token_arrays.pop(req_id, None)
+        # Same id, new prompt and params: the fused-sampling state starts over.
+        if isinstance(self.sampler, RBLNSampler):
+            self.sampler.forget_requests([req_id])
 
         req_state.prompt_token_ids = new_req_data.prompt_token_ids
         req_state.mm_features = new_req_data.mm_features

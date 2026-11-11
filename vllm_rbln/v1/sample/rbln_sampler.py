@@ -205,7 +205,7 @@ class RBLNSampler(VLLMSampler):
         logprobs_mode: LogprobsMode = "raw_logprobs",
         use_fp64_gumbel: bool = False,
         compile_context: rebel.CompileContext | None = None,
-        fused_penalty: bool = False,
+        fused_sampling: bool = False,
     ):
         super().__init__(logprobs_mode=logprobs_mode, use_fp64_gumbel=use_fp64_gumbel)
 
@@ -234,7 +234,7 @@ class RBLNSampler(VLLMSampler):
         self._compile_context = compile_context
         self._penalty_state = (
             FusedPenaltyState()
-            if fused_penalty and logprobs_mode in ("raw_logprobs", "raw_logits")
+            if fused_sampling and logprobs_mode in ("raw_logprobs", "raw_logits")
             else None
         )
         self._fused_graphs: dict[tuple, Callable[..., torch.Tensor]] = {}

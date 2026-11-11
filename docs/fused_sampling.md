@@ -1,4 +1,10 @@
-## Fused Penalties Overview
+## Fused Sampling Overview
+
+`use_fused_sampling` moves the sampling step's logits processing into the
+compiled sampling graph. It covers repetition, frequency and presence penalties
+and `logit_bias`.
+
+### Fused penalties
 
 Repetition, frequency and presence penalties and `logit_bias` only change the
 logits of tokens a request has already seen or explicitly biased. Upstream vLLM
@@ -25,9 +31,9 @@ Key components:
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `--rbln-use-fused-penalty` | `False` | Apply penalties and logit bias inside the sampling graph. Requires `use_custom_sampler`. |
+| `--rbln-use-fused-sampling` | `False` | Run penalties and logit bias inside the sampling graph. Requires `use_custom_sampler`. |
 
-`LLM(...)` takes it as `additional_config={"use_fused_penalty": True}`.
+`LLM(...)` takes it as `additional_config={"use_fused_sampling": True}`.
 
 A step keeps the existing path when it runs speculative decoding or a thinking
 budget, when the sampler returns processed logprobs, or when the vocab size is

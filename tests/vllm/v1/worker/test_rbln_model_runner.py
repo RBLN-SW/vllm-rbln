@@ -1736,6 +1736,28 @@ class TestUpdateStates:
         r._update_states(_sched(finished=["r0"]))
         sampler.forget_requests.assert_called_once_with(["r0"])
 
+    def test_streaming_turn_forgets_fused_sampling_state(self, monkeypatch):
+        # A new turn reuses the id with a new prompt and params.
+        sampler = object.__new__(mr.RBLNSampler)
+        sampler.forget_requests = MagicMock()
+        r = self._runner(
+            monkeypatch,
+            input_batch=_input_batch(1),
+            requests={"r0": _cached_state("r0")},
+        )
+        r.sampler = sampler
+        new_data = SimpleNamespace(
+            prompt_token_ids=[1, 2, 3],
+            mm_features=[],
+            prompt_embeds=None,
+            sampling_params=SamplingParams(),
+            pooling_params=None,
+            block_ids=([0],),
+            num_computed_tokens=0,
+        )
+        r._update_streaming_request("r0", new_data)
+        sampler.forget_requests.assert_called_once_with(["r0"])
+
     def test_unscheduled_request_removed(self, monkeypatch):
         # r0 is cached but not scheduled (and not resumed) -> dropped.
         r = self._runner(monkeypatch, input_batch=_input_batch(1))

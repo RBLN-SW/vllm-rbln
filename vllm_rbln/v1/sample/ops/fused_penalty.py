@@ -23,7 +23,7 @@ Invariants the scatter relies on:
 - Slots past a row's last used chunk repeat slot 0, so duplicate scatter
   targets always carry identical values.
 
-See docs/fused_penalty.md.
+See docs/fused_sampling.md.
 """
 
 import dataclasses

@@ -202,7 +202,7 @@ def _run_sampler(params, logits, fused: bool, expect_kinds: set[str]):
         prompt_token_ids=[11, 4000, 9000],
         output_token_ids=[4000, 77],
     )
-    sampler = RBLNSampler(fused_penalty=fused)
+    sampler = RBLNSampler(fused_sampling=fused)
     out = sampler(logits.clone().to(device), batch.sampling_metadata, input_batch=batch)
     # The fused run must take the fused graphs, not fall back to upstream.
     assert {key[0] for key in sampler._fused_graphs} == expect_kinds
@@ -296,7 +296,7 @@ def test_sampled_distribution_matches_upstream(params):
         prompt_token_ids=PROMPT,
         output_token_ids=OUTPUT,
     )
-    sampler = RBLNSampler(fused_penalty=True)
+    sampler = RBLNSampler(fused_sampling=True)
     logits = row.expand(ROWS, -1).contiguous().to(device)
     samples = torch.stack(
         [
