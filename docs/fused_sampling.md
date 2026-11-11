@@ -1,8 +1,8 @@
 ## Fused Sampling Overview
 
 `use_fused_sampling` moves the sampling step's logits processing into the
-compiled sampling graph. It covers repetition, frequency and presence penalties
-and `logit_bias`.
+compiled sampling graph. It covers repetition, frequency and presence penalties,
+`logit_bias` and `min_p`.
 
 ### Fused penalties
 
@@ -31,15 +31,19 @@ Key components:
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `--rbln-use-fused-sampling` | `False` | Run penalties and logit bias inside the sampling graph. Requires `use_custom_sampler`. |
+| `--rbln-use-fused-sampling` | `False` | Run penalties, logit bias and min_p inside the sampling graph. Requires `use_custom_sampler`. |
 
 `LLM(...)` takes it as `additional_config={"use_fused_sampling": True}`.
 
 A step keeps the existing path when it runs speculative decoding or a thinking
 budget, when the sampler returns processed logprobs, or when the vocab size is
-not a multiple of 128. A step with min_p applies the penalties in a graph of
-their own first, since min_p reads the penalized logits, then continues on the
-existing path.
+not a multiple of 128.
+
+min_p also runs in a graph with this option on. A step with min_p applies the
+penalties in a graph of their own first, since min_p reads the penalized
+logits, then runs temperature, min_p and top-k / top-p as one graph. min_p is
+checked as `logit >= max_logit + log(min_p)`, which needs no softmax. A step
+with any other argmax-invariant logits processor keeps the existing path.
 
 ## How It Works
 
