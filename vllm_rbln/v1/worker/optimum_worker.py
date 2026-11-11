@@ -39,8 +39,10 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 from vllm_rbln import envs
 from vllm_rbln.logger import init_logger
-from vllm_rbln.utils.optimum.configuration.execution import update_num_blocks
-from vllm_rbln.utils.optimum.configuration.runtime_config import prepare_runtime_config
+from vllm_rbln.utils.optimum.configuration.runtime_config import (
+    prepare_runtime_config,
+    update_num_blocks,
+)
 from vllm_rbln.v1.worker.optimum_model_runner import RBLNOptimumModelRunner
 from vllm_rbln.v1.worker.utils import (
     RblnProfilerWrapper,
