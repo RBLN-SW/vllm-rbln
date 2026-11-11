@@ -138,6 +138,18 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
         """`values` as int32, padded with 0 to the step's `batch` rows."""
         return rbln_utils.pad(values.to(torch.int32), 0, batch)
 
+    def _get_state_blocks(
+        self, block_table: torch.Tensor, num_tokens: torch.Tensor, batch: int
+    ) -> torch.Tensor:
+        """Each request's block holding its state after `num_tokens` tokens."""
+        blocks = mamba_get_block_table_tensor(
+            block_table,
+            num_tokens,
+            self.kv_cache_spec,
+            self.vllm_config.cache_config.mamba_cache_mode,
+        )
+        return self._padded(blocks[:, 0], batch)
+
     def build(  # type: ignore[override]
         self,
         common_attn_metadata: CommonAttentionMetadata,
@@ -172,20 +184,9 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
             )
             num_prefills, num_prefill_tokens, num_decodes = 0, 0, num_reqs
 
-        def state_blocks(num_tokens: torch.Tensor) -> torch.Tensor:
-            """Each request's block holding its state after `num_tokens` tokens."""
-            return self._padded(
-                mamba_get_block_table_tensor(
-                    m.block_table_tensor[:num_reqs],
-                    num_tokens,
-                    self.kv_cache_spec,
-                    self.vllm_config.cache_config.mamba_cache_mode,
-                )[:, 0],
-                batch,
-            )
-
-        load_blocks = state_blocks(context_lens_tensor)
-        store_blocks = state_blocks(m.seq_lens[:num_reqs])
+        block_table = m.block_table_tensor[:num_reqs]
+        load_blocks = self._get_state_blocks(block_table, context_lens_tensor, batch)
+        store_blocks = self._get_state_blocks(block_table, m.seq_lens[:num_reqs], batch)
         non_spec_state_indices_tensor = load_blocks.to(torch.int16)
 
         valid_mask = None
