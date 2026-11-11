@@ -34,7 +34,7 @@ from vllm_rbln.utils.optimum.registry import (
 )
 
 from .compile_config import resolve_explicit_num_blocks
-from .readers import (
+from .rbln_config import (
     RblnConfigLike,
     get_field,
     language_model_configs,
