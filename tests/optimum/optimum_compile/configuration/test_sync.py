@@ -26,9 +26,9 @@ from transformers import (
     WhisperConfig,
 )
 
-from vllm_rbln.config import OptimumRBLNCompileInputs
+from vllm_rbln.config import OptimumRBLNCompileConfig
 from vllm_rbln.utils.optimum.configuration import sync
-from vllm_rbln.utils.optimum.configuration.inputs import compile_cache_name
+from vllm_rbln.utils.optimum.configuration.compile_config import compile_cache_name
 from vllm_rbln.utils.optimum.configuration.readers import (
     load_compiled_rbln_config,
 )
@@ -54,7 +54,7 @@ class TestSync:
             ("Idefics3ForConditionalGeneration", "text_model"),
         ],
     )
-    def test_explicit_blocks_normalize_utilization_before_cache_lookup(
+    def test_explicit_blocks_apply_prepared_utilization_after_cache_lookup(
         self,
         monkeypatch,
         vllm_config_factory,
@@ -65,13 +65,13 @@ class TestSync:
         key,
     ):
         observed = []
-        prepare = sync.prepare_compile_inputs
+        prepare = sync.prepare_compile_config
 
-        def record(cfg):
+        def record(cfg, **kwargs):
             observed.append(cfg.cache_config.gpu_memory_utilization)
-            return prepare(cfg)
+            return prepare(cfg, **kwargs)
 
-        monkeypatch.setattr(sync, "prepare_compile_inputs", record)
+        monkeypatch.setattr(sync, "prepare_compile_config", record)
         overrides = (
             {} if override_blocks is None else {"kvcache_num_blocks": override_blocks}
         )
@@ -84,32 +84,42 @@ class TestSync:
         explicit_blocks = num_blocks is not None or override_blocks == 16
         expected_utilization = 1.0 if explicit_blocks else utilization
         assert cfg.cache_config.gpu_memory_utilization == expected_utilization
-        assert observed == [expected_utilization]
+        assert observed == [utilization]
         assert cfg.cache_config.num_gpu_blocks_override == num_blocks
 
     @pytest.mark.parametrize("key", [None, "language_model", "text_model"])
+    @pytest.mark.parametrize(
+        "overrides, error",
+        [
+            (
+                {"kvcache_num_blocks": 32},
+                "num_gpu_blocks_override=16.*kvcache_num_blocks=32",
+            ),
+            (
+                {"kvcache_num_blocks": 16, "memory_budget": 0.8},
+                "memory_budget.*explicit.*block count",
+            ),
+        ],
+    )
     def test_conflicting_blocks_fail_before_cache_lookup(
-        self, monkeypatch, vllm_config_factory, key
+        self, monkeypatch, vllm_config_factory, key, overrides, error
     ):
         from unittest.mock import Mock
 
-        resolve_path = Mock(wraps=sync.resolve_compiled_model_path)
-        monkeypatch.setattr(sync, "resolve_compiled_model_path", resolve_path)
-        overrides = {"kvcache_num_blocks": 32}
+        cache_path = Mock(wraps=sync.get_compile_cache_path)
+        monkeypatch.setattr(sync, "get_compile_cache_path", cache_path)
         architecture = {
             None: "LlamaForCausalLM",
             "language_model": "Gemma3ForConditionalGeneration",
             "text_model": "Idefics3ForConditionalGeneration",
         }[key]
-        with pytest.raises(
-            ValueError, match="num_gpu_blocks_override=16.*kvcache_num_blocks=32"
-        ):
+        with pytest.raises(ValueError, match=error):
             vllm_config_factory(
                 optimum_overrides={key: overrides} if key else overrides,
                 num_gpu_blocks_override=16,
                 hf_config=PretrainedConfig(architectures=[architecture]),
             )
-        resolve_path.assert_not_called()
+        cache_path.assert_not_called()
 
     @pytest.mark.parametrize("prefix_caching", [False, True])
     def test_paligemma_uses_final_chunk_before_cache_lookup(
@@ -132,7 +142,7 @@ class TestSync:
                 architectures=["PaliGemmaForConditionalGeneration"]
             ),
         )
-        inputs = cfg.additional_config.compile_inputs.rbln_config["language_model"]
+        inputs = cfg.additional_config.compile_config.rbln_config["language_model"]
         assert observed == [inputs["prefill_chunk_size"]] == [8192]
         assert cfg.cache_config.block_size == 8192
         sync.sync_vllm_and_optimum(cfg)
@@ -156,7 +166,7 @@ class TestSync:
                 max_target_positions=8192,
             )
         )
-        inputs = cfg.additional_config.compile_inputs.rbln_config
+        inputs = cfg.additional_config.compile_config.rbln_config
         assert inputs["dec_max_seq_len"] == cfg.model_config.max_model_len == 8192
         assert inputs["batch_size"] == cfg.scheduler_config.max_num_seqs == 4
 
@@ -167,7 +177,7 @@ class TestSync:
         cfg = vllm_config_factory(hf_config=hf_config)
         cache_path = Path(cfg.additional_config.artifact_path)
         cache_path.mkdir(parents=True)
-        metadata = cfg.additional_config.compile_inputs.rbln_config
+        metadata = cfg.additional_config.compile_config.rbln_config
         metadata = json.loads(json.dumps(metadata))
         metadata["language_model"].update(
             kvcache_block_size=8192, kvcache_num_blocks=4, dtype="bfloat16"
@@ -260,13 +270,13 @@ class TestSync:
         check_and_update(cfg)
         assert observed == [([expected_arch], expected_cls, expected_tokens)]
 
-    def test_repeated_sync_preserves_the_compile_inputs(self, vllm_config_factory):
+    def test_repeated_sync_preserves_the_compile_config(self, vllm_config_factory):
         cfg = vllm_config_factory()
-        inputs = cfg.additional_config.compile_inputs
+        inputs = cfg.additional_config.compile_config
         path = cfg.additional_config.artifact_path
         cfg.additional_config.precompiled = True
         sync.sync_vllm_and_optimum(cfg)
-        assert cfg.additional_config.compile_inputs is inputs
+        assert cfg.additional_config.compile_config is inputs
         assert cfg.additional_config.artifact_path == path
         assert not cfg.additional_config.precompiled
 
@@ -297,7 +307,7 @@ class TestSync:
         assert observed == [expected]
         assert cfg.scheduler_config.max_num_batched_tokens == expected
         assert (
-            cfg.additional_config.compile_inputs.rbln_config["prefill_chunk_size"]
+            cfg.additional_config.compile_config.rbln_config["prefill_chunk_size"]
             == expected
         )
 
@@ -309,7 +319,7 @@ class TestSync:
             (torch.float32, 3, {}, 3),
         ],
     )
-    def test_compile_inputs_are_resolved_before_cache_lookup(
+    def test_compile_config_is_resolved_before_cache_lookup(
         self,
         monkeypatch,
         dtype,
@@ -343,7 +353,7 @@ class TestSync:
             },
         )
         assert observed == [(2, 4096, dtype, expected_devices)]
-        inputs = cfg.additional_config.compile_inputs
+        inputs = cfg.additional_config.compile_config
         assert inputs.dtype == dtype
         assert (
             inputs.rbln_config["batch_size"] == cfg.scheduler_config.max_num_seqs == 2
@@ -369,7 +379,8 @@ class TestSync:
         cfg = vllm_config_factory()
         cache_path = Path(cfg.additional_config.artifact_path)
         cache_path.mkdir(parents=True)
-        metadata = {"prefill_chunk_size": 256}
+        metadata = dict(cfg.additional_config.compile_config.rbln_config)
+        metadata.update(prefill_chunk_size=256, kvcache_num_blocks=4)
         (cache_path / "rbln_config.json").write_text(json.dumps(metadata))
         if location == "model":
             cfg.model_config.model = str(cache_path)
@@ -393,7 +404,7 @@ class TestSync:
                 ),
             )
             assert get_compile_cache_path(
-                compile_cache_name(cfg.additional_config.compile_inputs),
+                compile_cache_name(cfg.additional_config.compile_config),
                 str(cache_path.parent.parent),
             ) == str(cache_path)
         assert cfg.model_config.model == source_model
@@ -401,38 +412,42 @@ class TestSync:
         synced = []
         monkeypatch.setattr(
             sync,
-            "apply_to_vllm_config",
+            "apply_runtime_config",
             lambda cfg, data, **kw: synced.append(data),
         )
         monkeypatch.setattr(
             sync,
-            "prepare_compile_inputs",
+            "prepare_compile_config",
             lambda cfg: pytest.fail(
-                "cached metadata must bypass compile input parsing"
+                "cached metadata must bypass compile config preparation"
             ),
         )
         sync.sync_vllm_and_optimum(cfg)
         assert len(synced) == 1
-        assert synced[0]["prefill_chunk_size"] == metadata["prefill_chunk_size"]
+        assert synced[0].prefill_chunk_size == metadata["prefill_chunk_size"]
         assert cfg.model_config.model == source_model
         assert cfg.additional_config.artifact_path == str(cache_path)
         assert cfg.additional_config.precompiled
 
 
+@pytest.mark.parametrize("num_blocks", [None, 2])
 def test_initial_cache_hit_applies_vllm_config_updates_once(
-    monkeypatch, vllm_config_factory
+    monkeypatch, vllm_config_factory, caplog, num_blocks
 ):
     from vllm_rbln.utils.optimum.configuration import apply as apply_module
 
-    calls = []
+    calls: list = []
     selected_configs = []
-    apply = sync.apply_to_vllm_config
+    apply = sync.apply_runtime_config
 
     def record_apply(cfg, data, **kwargs):
+        assert cfg.cache_config.gpu_memory_utilization == (
+            0.9 if not calls or num_blocks is None else 1.0
+        )
         selected_configs.append(data)
         return apply(cfg, data, **kwargs)
 
-    monkeypatch.setattr(sync, "apply_to_vllm_config", record_apply)
+    monkeypatch.setattr(sync, "apply_runtime_config", record_apply)
     original = apply_module.update_block_size
 
     def record(*args, **kwargs):
@@ -450,11 +465,15 @@ def test_initial_cache_hit_applies_vllm_config_updates_once(
         "num_devices": 2,
     }
     monkeypatch.setattr(sync, "load_compiled_rbln_config", lambda path: metadata)
+    monkeypatch.setattr(sync, "resolve_compiled_model_path", lambda *args: "compiled")
     cfg = vllm_config_factory(
         mamba_block_size=8192,
         optimum_overrides={"device": [0], "create_runtimes": False},
+        num_gpu_blocks_override=num_blocks,
     )
-    assert selected_configs == [metadata]
+    assert len(selected_configs) == 1
+    assert selected_configs[0].batch_size == metadata["batch_size"]
+    assert selected_configs[0].num_devices == metadata["num_devices"]
     assert len(calls) == 1
     assert cfg.scheduler_config.max_num_seqs == 2
     assert cfg.scheduler_config.max_num_batched_tokens == 256
@@ -466,29 +485,37 @@ def test_initial_cache_hit_applies_vllm_config_updates_once(
     assert cfg.additional_config.precompiled
     assert cfg.cache_config.mamba_block_size == 4096
     assert cfg.cache_config.num_gpu_blocks == 3
+    assert cfg.additional_config.compile_config is None
+    assert cfg.cache_config.gpu_memory_utilization == (
+        0.9 if num_blocks is None else 1.0
+    )
+    if num_blocks is not None:
+        assert "explicit KV cache block count=2" in caplog.text
     sync.sync_vllm_and_optimum(cfg)
     assert cfg.cache_config.num_gpu_blocks == 3
 
 
 def test_builder_does_not_apply_vllm_config_updates(vllm_config_factory):
     cfg = vllm_config_factory()
-    cfg.additional_config.compile_inputs = None
+    cfg.additional_config.compile_config = None
     cfg.additional_config.optimum_overrides = {"batch_size": 2, "max_seq_len": 4096}
-    from vllm_rbln.utils.optimum.configuration.prepare import prepare_compile_inputs
+    from vllm_rbln.utils.optimum.configuration.compile_config import (
+        prepare_compile_config,
+    )
 
-    inputs = prepare_compile_inputs(cfg)
+    inputs = prepare_compile_config(cfg)
     assert cfg.scheduler_config.max_num_seqs == 4
     assert cfg.model_config.max_model_len == 8192
     assert cfg.scheduler_config.max_num_batched_tokens == 128
-    assert cfg.additional_config.compile_inputs is None
+    assert cfg.additional_config.compile_config is None
     assert inputs.rbln_config["batch_size"] == 2
 
 
-def test_compile_inputs_do_not_share_mutable_overrides(vllm_config_factory):
+def test_compile_config_does_not_share_mutable_overrides(vllm_config_factory):
     overrides = {"custom_options": {"values": [1, 2]}}
     cfg = vllm_config_factory(optimum_overrides=overrides)
     overrides["custom_options"]["values"].append(3)
-    assert cfg.additional_config.compile_inputs.rbln_config["custom_options"] == {
+    assert cfg.additional_config.compile_config.rbln_config["custom_options"] == {
         "values": [1, 2]
     }
 
@@ -511,7 +538,7 @@ def test_vllm_config_is_synced_after_cache_lookup(
     events = []
     selected = []
     generate = sync.compile_cache_name
-    apply = sync.apply_to_vllm_config
+    apply = sync.apply_runtime_config
 
     def record_lookup(inputs):
         events.append("lookup")
@@ -523,16 +550,17 @@ def test_vllm_config_is_synced_after_cache_lookup(
         return apply(cfg, data, **kwargs)
 
     monkeypatch.setattr(sync, "compile_cache_name", record_lookup)
-    monkeypatch.setattr(sync, "apply_to_vllm_config", record_apply)
+    monkeypatch.setattr(sync, "apply_runtime_config", record_apply)
     cfg = vllm_config_factory(hf_config=hf_config)
     assert events == ["lookup", "apply"]
-    assert selected[0] is cfg.additional_config.compile_inputs.rbln_config
+    assert selected[0].batch_size == 4
+    assert selected[0].max_seq_len == 8192
     assert cfg.scheduler_config.max_num_seqs == 4
     assert cfg.model_config.max_model_len == 8192
 
 
 @pytest.mark.parametrize("precompiled", [False, True])
-def test_compile_inputs_survive_worker_serialization(
+def test_compile_config_survives_worker_serialization(
     monkeypatch, vllm_config_factory, precompiled
 ):
     import pickle
@@ -542,7 +570,7 @@ def test_compile_inputs_survive_worker_serialization(
     )
     if precompiled:
         metadata = json.loads(
-            json.dumps(cfg.additional_config.compile_inputs.rbln_config)
+            json.dumps(cfg.additional_config.compile_config.rbln_config)
         )
         metadata["language_model"]["kvcache_num_blocks"] = 4
         monkeypatch.setattr(
@@ -553,8 +581,8 @@ def test_compile_inputs_survive_worker_serialization(
         sync.sync_vllm_and_optimum(cfg)
     original_path = cfg.additional_config.artifact_path
     cfg.additional_config = pickle.loads(pickle.dumps(cfg.additional_config))
-    inputs = cfg.additional_config.compile_inputs
-    assert isinstance(inputs, OptimumRBLNCompileInputs)
+    inputs = cfg.additional_config.compile_config
+    assert isinstance(inputs, OptimumRBLNCompileConfig)
     assert inputs.rbln_config["language_model"]["prefill_chunk_size"] == 8192
     assert cfg.additional_config.artifact_path == original_path
     assert cfg.additional_config.precompiled is precompiled
@@ -573,7 +601,7 @@ def test_vllm_config_updates_include_submodule_devices_and_image_buckets(
             "language_model": {"device": [0, 1], "image_prefill_chunk_size": 256}
         },
     )
-    inputs = cfg.additional_config.compile_inputs
+    inputs = cfg.additional_config.compile_config
     language_model = inputs.rbln_config["language_model"]
     assert language_model["num_devices"] == 2
     assert cfg.additional_config.num_devices_per_local_rank == 2
@@ -584,35 +612,35 @@ def test_sync_stores_the_builder_inputs_without_repacking(
     monkeypatch, vllm_config_factory
 ):
     built_inputs = []
-    build = sync.prepare_compile_inputs
+    build = sync.prepare_compile_config
 
     def record(*args, **kwargs):
         inputs = build(*args, **kwargs)
         built_inputs.append(inputs)
         return inputs
 
-    monkeypatch.setattr(sync, "prepare_compile_inputs", record)
+    monkeypatch.setattr(sync, "prepare_compile_config", record)
     cfg = vllm_config_factory()
     assert len(built_inputs) == 1
-    assert isinstance(cfg.additional_config.compile_inputs, OptimumRBLNCompileInputs)
-    assert cfg.additional_config.compile_inputs is built_inputs[0]
+    assert isinstance(cfg.additional_config.compile_config, OptimumRBLNCompileConfig)
+    assert cfg.additional_config.compile_config is built_inputs[0]
 
 
-def test_vllm_config_updates_are_derived_from_compile_inputs(vllm_config_factory):
+def test_vllm_config_updates_are_derived_from_compile_config(vllm_config_factory):
     cfg = vllm_config_factory()
-    cfg.additional_config.compile_inputs.rbln_config["prefill_chunk_size"] = 256
+    cfg.additional_config.compile_config.rbln_config["prefill_chunk_size"] = 256
     sync.sync_vllm_and_optimum(cfg)
     assert cfg.scheduler_config.max_num_batched_tokens == 256
 
 
-def test_image_buckets_do_not_mutate_the_compile_inputs(vllm_config_factory):
+def test_image_buckets_do_not_mutate_the_compile_config(vllm_config_factory):
     cfg = vllm_config_factory(
         hf_config=PaliGemmaConfig(architectures=["PaliGemmaForConditionalGeneration"]),
         optimum_overrides={"language_model": {"image_prefill_chunk_size": [512, 256]}},
     )
-    original_key = compile_cache_name(cfg.additional_config.compile_inputs)
+    original_key = compile_cache_name(cfg.additional_config.compile_config)
     cfg.additional_config.image_prefill_chunk_size.append(128)
-    assert cfg.additional_config.compile_inputs.rbln_config["language_model"][
+    assert cfg.additional_config.compile_config.rbln_config["language_model"][
         "image_prefill_chunk_size"
     ] == [512, 256]
-    assert compile_cache_name(cfg.additional_config.compile_inputs) == original_key
+    assert compile_cache_name(cfg.additional_config.compile_config) == original_key

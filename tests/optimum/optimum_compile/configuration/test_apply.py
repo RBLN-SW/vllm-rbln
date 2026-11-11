@@ -21,8 +21,8 @@ import torch
 from vllm.config import CacheConfig, ModelConfig, SchedulerConfig, VllmConfig
 
 from vllm_rbln.config import build_optimum_rbln_config
-from vllm_rbln.utils.optimum.configuration.apply import apply_to_vllm_config
-from vllm_rbln.utils.optimum.configuration.runtime import (
+from vllm_rbln.utils.optimum.configuration.apply import apply_runtime_config
+from vllm_rbln.utils.optimum.configuration.execution import (
     get_runtime_num_blocks,
     get_user_max_num_batched_tokens,
     is_chunked_prefill_arch,
@@ -30,6 +30,7 @@ from vllm_rbln.utils.optimum.configuration.runtime import (
     update_max_num_batched_tokens,
     validate_user_prefill_chunk_size,
 )
+from vllm_rbln.utils.optimum.configuration.runtime_config import prepare_runtime_config
 
 pytestmark = pytest.mark.usefixtures("set_npu_env_var")
 
@@ -74,8 +75,10 @@ def apply_config():
             num_gpu_blocks_override=None,
             user_specified_mamba_block_size=False,
             mamba_block_size=None,
+            gpu_memory_utilization=0.9,
         )
-        apply_to_vllm_config(cfg, rbln_config, precompiled=precompiled)
+        prepared = prepare_runtime_config(cfg, rbln_config, precompiled=precompiled)
+        apply_runtime_config(cfg, prepared)
         return cfg
 
     return run
@@ -145,7 +148,7 @@ class TestApplyEncDec:
 
 
 class TestApplyPooling:
-    def test_reads_partition_size_from_compile_inputs(self, apply_config):
+    def test_reads_partition_size_from_compile_config(self, apply_config):
         synced = apply_config(
             {
                 "num_devices": 1,
@@ -504,7 +507,7 @@ class TestStoreImagePrefillChunkSize:
 
 def _engine_config() -> VllmConfig:
     # Force the cache-miss branch so building the config does not look for a
-    # compiled artifact. The test calls apply_to_vllm_config itself.
+    # compiled artifact. The test calls apply_runtime_config itself.
     with patch(
         "vllm_rbln.utils.optimum.configuration.sync.load_compiled_rbln_config",
         return_value=None,
@@ -537,7 +540,8 @@ def test_compiled_num_devices_lands_in_the_config(monkeypatch):
         "prefill_chunk_size": 128,
         "num_devices": 2,
     }
-    apply_to_vllm_config(vllm_config, compiled, precompiled=True)
+    prepared = prepare_runtime_config(vllm_config, compiled, precompiled=True)
+    apply_runtime_config(vllm_config, prepared)
 
     assert vllm_config.additional_config.num_devices_per_local_rank == 2
 
@@ -613,6 +617,39 @@ def test_whisper_block_count_is_read_without_a_batch_size_default():
     )
 
 
+@pytest.mark.parametrize("precompiled", [False, True])
+def test_prepared_settings_are_owned_and_applied_without_reading_metadata(
+    apply_config, precompiled
+):
+    selected = {
+        "batch_size": 2,
+        "max_seq_len": 4096,
+        "kvcache_block_size": 4096,
+        "kvcache_num_blocks": 16,
+        "prefill_chunk_size": 256,
+        "num_devices": 2,
+        "dtype": "bfloat16",
+    }
+    cfg = apply_config(selected)
+    cfg.scheduler_config.max_num_seqs = 4
+    cfg.model_config.max_model_len = 8192
+    cfg.cache_config.num_gpu_blocks_override = 16
+    prepared = prepare_runtime_config(cfg, selected, precompiled=precompiled)
+    assert cfg.scheduler_config.max_num_seqs == 4
+    assert cfg.model_config.max_model_len == 8192
+    assert cfg.cache_config.gpu_memory_utilization == 0.9
+    selected.clear()
+
+    apply_runtime_config(cfg, prepared)
+
+    assert cfg.scheduler_config.max_num_seqs == 2
+    assert cfg.model_config.max_model_len == 4096
+    assert cfg.scheduler_config.max_num_batched_tokens == 256
+    assert cfg.additional_config.num_devices_per_local_rank == 2
+    assert cfg.cache_config.gpu_memory_utilization == 1.0
+    assert cfg.model_config.dtype == (torch.bfloat16 if precompiled else torch.float32)
+
+
 @pytest.mark.parametrize("invalid", ["missing_devices", "prefill_conflict"])
 def test_selected_settings_are_validated_before_config_is_changed(invalid):
     overrides = {"device": [0], "memory_budget": 0.5}
@@ -638,7 +675,7 @@ def test_selected_settings_are_validated_before_config_is_changed(invalid):
         selected["prefill_chunk_size"] = 256
         expected_error = "conflicts with the compiled"
     with pytest.raises(ValueError, match=expected_error):
-        apply_to_vllm_config(cfg, selected, precompiled=True)
+        prepare_runtime_config(cfg, selected, precompiled=True)
     assert cfg.scheduler_config.max_num_seqs == 4
     assert cfg.model_config.max_model_len == 8192
     assert cfg.additional_config.optimum_overrides == overrides

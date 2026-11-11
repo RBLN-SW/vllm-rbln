@@ -187,8 +187,8 @@ class RBLNConfig(RBLNConfigBase):
 
 
 @dataclass
-class OptimumRBLNCompileInputs:
-    """Resolved inputs shared by cache hashing, vLLM config sync and compilation.
+class OptimumRBLNCompileConfig:
+    """Resolved model compilation settings shared by cache hashing and compilation.
 
     Must remain serializable for worker transfer via `additional_config`.
     """
@@ -200,6 +200,23 @@ class OptimumRBLNCompileInputs:
     # Keep third-party config dataclasses opaque to pydantic validation.
     hf_config: Any
     npu_name: str
+
+
+@dataclass
+class OptimumRBLNRuntimeConfig:
+    """Validated model settings ready to apply to vLLM after artifact selection."""
+
+    batch_size: int
+    max_seq_len: int
+    kvcache_block_size: int
+    prefill_chunk_size: int | None
+    image_prefill_chunk_size: list[int] | None
+    num_blocks: int | None
+    num_devices: int
+    dtype: Any
+    gpu_memory_utilization: float
+    explicit_num_blocks: int | None
+    precompiled: bool
 
 
 @vllm_config_dataclass
@@ -233,10 +250,10 @@ class OptimumRBLNConfig(RBLNConfigBase):
     image_prefill_chunk_size: list[int] | None = field(default=None, metadata=_DERIVED)
     """Compiled image-prefill buckets (gemma3/gemma4) used for scheduler padding."""
 
-    compile_inputs: OptimumRBLNCompileInputs | None = field(
+    compile_config: OptimumRBLNCompileConfig | None = field(
         default=None, metadata=_DERIVED
     )
-    """Inputs shared by cache lookup and compilation.
+    """Settings shared by cache lookup and compilation.
 
     Runtime synchronization must not mutate them.
     """

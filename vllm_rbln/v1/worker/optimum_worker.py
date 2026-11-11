@@ -39,7 +39,7 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 from vllm_rbln import envs
 from vllm_rbln.logger import init_logger
-from vllm_rbln.utils.optimum.configuration.runtime import (
+from vllm_rbln.utils.optimum.configuration.execution import (
     get_runtime_num_blocks,
     update_num_blocks,
 )

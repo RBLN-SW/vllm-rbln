@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Derive and apply vLLM execution settings from the selected RBLN config."""
+"""Convert and apply prepared RBLN settings to vLLM execution units."""
 
 from __future__ import annotations
 
