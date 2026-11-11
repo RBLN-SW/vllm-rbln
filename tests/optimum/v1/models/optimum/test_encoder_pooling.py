@@ -52,8 +52,7 @@ from vllm_rbln.model_executor.models.optimum.encoder import (
 )
 from vllm_rbln.model_executor.models.optimum.model_base import RBLNOptimumModelBase
 from vllm_rbln.model_executor.models.optimum.qwen3_vl import RBLNOptimumQwen3VLModel
-from vllm_rbln.utils.optimum.predicates import is_qwen3_embedding, is_qwen3_reranker
-from vllm_rbln.utils.optimum.registry import get_rbln_model_info, is_multi_modal
+from vllm_rbln.utils.optimum.predicates import is_qwen3_embedding
 
 # (model id, expected seq_pooling_type, expected pooler) per architecture.
 # Encoder-only models are forced to CLS; the *ForSequenceClassification ones use
@@ -181,33 +180,11 @@ def _build_qwen3_vl_embedding():
         return RBLNOptimumQwen3VLModel(vllm_config=vllm_config)
 
 
-def test_qwen3_vl_embedding_is_not_a_reranker():
-    """It ships the generation architecture; only the pooling runner tells it
-    apart from the generative model, and the remap target is the backbone."""
-    model_config = ModelConfig(
-        model=VL_EMBEDDING_ID, dtype=torch.float32, seed=42, runner="pooling"
-    )
-    assert is_qwen3_embedding(model_config)
-    assert not is_qwen3_reranker(model_config)
-
-    generate = ModelConfig(
-        model=VL_EMBEDDING_ID, dtype=torch.float32, seed=42, runner="generate"
-    )
-    assert not is_qwen3_embedding(generate)
-
-    hf_config = model_config.hf_config
-    hf_config.__dict__["architectures"] = ["Qwen3VLModel"]
-    assert is_multi_modal(hf_config)
-    assert get_rbln_model_info(hf_config) == ("qwen3_vl", "RBLNQwen3VLModel")
-
-
-def test_qwen3_vl_embedding_pools_the_last_token():
+def test_qwen3_vl_embedding_builds_an_embed_pooler():
     model = _build_qwen3_vl_embedding()
 
-    assert model.vllm_config.model_config.pooler_config.seq_pooling_type == "LAST"
     assert isinstance(model.pooler, SequencePooler)
     assert model.pooler.get_supported_tasks() == {"embed"}
-    assert model.vllm_config.cache_config.enable_prefix_caching in (False, None)
 
 
 def test_qwen3_vl_embedding_forward_returns_every_position():

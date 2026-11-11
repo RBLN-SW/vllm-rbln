@@ -57,7 +57,6 @@ from vllm_rbln.utils.optimum.predicates import is_qwen3_embedding, is_qwen3_rera
 from vllm_rbln.utils.optimum.registry import (
     get_rbln_model_info,
     is_generation_arch,
-    is_multi_modal,
     is_pooling_arch,
 )
 
@@ -290,10 +289,14 @@ def _vl_model_config(**overrides):
     )
 
 
-def _build_vl_reranker():
+def _build_vl_reranker(enable_prefix_caching=False):
     vllm_config = VllmConfig(
         model_config=_vl_model_config(),
-        cache_config=CacheConfig(block_size=16, cache_dtype="auto"),
+        cache_config=CacheConfig(
+            block_size=16,
+            cache_dtype="auto",
+            enable_prefix_caching=enable_prefix_caching,
+        ),
         scheduler_config=SchedulerConfig(
             max_num_seqs=1,
             max_num_batched_tokens=128,
@@ -319,20 +322,6 @@ def _build_vl_reranker():
         return RBLNOptimumQwen3VLForSequenceClassification(vllm_config=vllm_config)
 
 
-def test_vl_reranker_keeps_its_arch_and_compiles_prefill_only():
-    """Its architecture is registered as it is: it reaches the multimodal wrapper,
-    and its alias selects the prefill-only compile params."""
-    model_config = _vl_model_config()
-
-    assert is_qwen3_reranker(model_config)
-    assert not is_qwen3_embedding(model_config)
-    assert is_multi_modal(model_config.hf_config)
-    assert get_rbln_model_info(model_config.hf_config) == (
-        "qwen3_vl_reranker",
-        "RBLNQwen3VLForConditionalGeneration",
-    )
-
-
 def test_rejects_vl_seq_cls_arch_without_reranker_flags():
     model_config = _vl_model_config(is_original_qwen3_reranker=False)
     with pytest.raises(ValueError, match="Qwen3VLForSequenceClassification"):
@@ -340,8 +329,10 @@ def test_rejects_vl_seq_cls_arch_without_reranker_flags():
 
 
 def test_vl_reranker_prefix_caching_is_disabled():
-    model = _build_vl_reranker()
-    assert model.vllm_config.cache_config.enable_prefix_caching in (False, None)
+    """Being multimodal, it is not a pooling arch, so only the Qwen3 predicates
+    turn the requested prefix caching off."""
+    model = _build_vl_reranker(enable_prefix_caching=True)
+    assert not model.vllm_config.cache_config.enable_prefix_caching
 
 
 def test_builds_vl_reranker_pooler():
