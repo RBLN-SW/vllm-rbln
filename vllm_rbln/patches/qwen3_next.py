@@ -12,23 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import replace
+
 import torch
 import torch.nn.functional as F
 from rebel.ops.torch_custom_ops.gdn import CHUNK as GDN_PREFILL_CHUNK
 from rebel.ops.torch_custom_ops.gdn import STATE_LANES
 from rebel.ops.torch_custom_ops.kda import CONV_LANES
 from torch import nn
-from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.config import VllmConfig, get_current_vllm_config, set_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
 )
 from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
+from vllm.v1.kv_cache_interface import MambaSpec
 
 from vllm_rbln.patches import register_patch
 from vllm_rbln.patches.attention import _resolve_kv_cache
 from vllm_rbln.patches.registry import add_registration
+from vllm_rbln.v1.attention.backends.flash_attention import RBLNFlashAttentionBackend
 from vllm_rbln.v1.attention.backends.gdn_attn import (
     RBLNGDNAttentionBackend,
     RBLNGDNAttentionMetadata,
@@ -144,10 +148,33 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         )
 
     def get_state_shape(self) -> tuple[tuple[int, ...]]:
-        return (
-            gdn_state_shape(
-                self.num_kv_heads, self.cache_config.block_size, self.kv_head_size
+        """Physical KV block shape, resolved under the current vLLM config."""
+        shape = RBLNFlashAttentionBackend.get_kv_cache_shape(
+            num_blocks=1,
+            block_size=self.cache_config.block_size,
+            num_kv_heads=self.num_kv_heads,
+            head_size=self.kv_head_size,
+        )[1:]
+        assert shape[0] == 2, (
+            f"GDN requires KV blocks shaped [2, Hkv, 1, B, Dh], got {shape}"
+        )
+        return (shape,)
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> MambaSpec:
+        with set_current_vllm_config(vllm_config):
+            physical_spec = super().get_kv_cache_spec(vllm_config)
+        assert isinstance(physical_spec, MambaSpec)
+        # Replace only shapes and page_size_padded; retain all other spec fields.
+        return replace(
+            physical_spec,
+            shapes=(
+                gdn_state_shape(
+                    self.num_v_heads // self.tp_size,
+                    self.head_k_dim,
+                    self.head_v_dim,
+                ),
             ),
+            page_size_padded=physical_spec.page_size_bytes,
         )
 
     def get_state_dtype(self) -> tuple[torch.dtype]:

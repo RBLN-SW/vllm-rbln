@@ -666,13 +666,22 @@ class TestRejectedConfigs:
         with pytest.raises(ValueError, match="Speculative decoding"):
             reconfigure(speculative)
 
-    def test_gdn_state_fills_a_full_attention_page(self, reconfigure, gdn):
-        def doubled_block(config):
+    @pytest.mark.parametrize("block_size", [256, 512, 1024])
+    def test_gdn_state_fits_a_full_attention_page(self, reconfigure, gdn, block_size):
+        def sized_block(config):
             gdn(config)
-            config.cache_config.block_size *= 2
+            config.cache_config.block_size = block_size
 
-        with pytest.raises(ValueError, match="full-attention layer's page"):
-            reconfigure(doubled_block)
+        config = reconfigure(sized_block)
+        assert config.cache_config.block_size == block_size
+
+    def test_gdn_state_rejects_an_undersized_attention_page(self, reconfigure, gdn):
+        def smaller_block(config):
+            gdn(config)
+            config.cache_config.block_size //= 2
+
+        with pytest.raises(ValueError, match="must fit in a full-attention"):
+            reconfigure(smaller_block)
 
     def test_gdn_state_is_one_block_a_request(self, reconfigure, gdn):
         config = reconfigure(gdn)

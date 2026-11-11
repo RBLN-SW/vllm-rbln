@@ -150,14 +150,14 @@ class RBLNQwen3_5ForConditionalGeneration(
     def get_mamba_state_shape_from_config(
         cls, vllm_config: VllmConfig
     ) -> tuple[tuple[int, ...]]:
-        # The state every RBLNQwenGatedDeltaNetAttention declares, for the
-        # platform's page arithmetic (patches/qwen3_next).
         model_config = vllm_config.model_config
+        text_config = model_config.hf_text_config
         return (
             gdn_state_shape(
-                model_config.get_num_kv_heads(vllm_config.parallel_config),
-                vllm_config.cache_config.block_size,
-                model_config.get_head_size(),
+                text_config.linear_num_value_heads
+                // vllm_config.parallel_config.tensor_parallel_size,
+                text_config.linear_key_head_dim,
+                text_config.linear_value_head_dim,
             ),
         )
 
