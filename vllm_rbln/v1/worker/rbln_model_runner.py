@@ -1491,13 +1491,37 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                         f"{flag}={cap} would split a multimodal range of up to "
                         f"{longest} tokens."
                     )
-            chunk = self.rbln_config.max_prefill_chunk_size
-            if chunk < longest:
+            chunks = self.rbln_config.prefill_chunk_size
+            assert chunks is not None  # resolved at start-up
+            if max(chunks) < longest:
+                # Suggest a chunk dividing --block-size, so the default sub-block
+                # prefix caching still has one to take.
+                block_size = self.cache_config.block_size
+                fit = block_size
+                while fit % 2 == 0 and fit // 2 >= longest:
+                    fit //= 2
+                fit = max(fit, longest)
+                small = min(chunks)
+                hint = (
+                    f"for example --max-num-batched-tokens {fit} "
+                    f"--rbln-prefill-chunk-size {small},{fit}"
+                    + (f" --block-size {fit}" if fit > block_size else "")
+                )
+                if current_platform.is_cr13() and block_size % small == 0:
+                    tight = -(-longest // 128) * 128
+                    hint += (
+                        f". On this REBEL CR13 a tighter --max-num-batched-tokens "
+                        f"{tight} --rbln-prefill-chunk-size {small},{tight} also "
+                        f"works: keep a chunk that divides --block-size "
+                        f"({block_size}), here {small}, and sub-block prefix "
+                        "caching runs at it"
+                    )
                 raise ValueError(
-                    f"The longest prefill chunk ({chunk}) cannot hold a multimodal "
-                    f"range of up to {longest} tokens; set --rbln-prefill-chunk-size "
-                    f"(with --max-num-batched-tokens and --block-size) to at least "
-                    f"{longest}, or lower max_soft_tokens."
+                    f"Every image or video frame has to fit one prefill chunk, and "
+                    f"the longest prefill chunk ({max(chunks)}) is shorter than the "
+                    f"{longest} soft tokens one can take (max_soft_tokens). Raise "
+                    f"the chunk, {hint}. Or lower max_soft_tokens in "
+                    "--mm-processor-kwargs."
                 )
             # TODO(RBLN): the drafter's builders get no row ends, so its sliding
             # layers would run the ranges causally.

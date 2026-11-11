@@ -134,20 +134,29 @@ class TestResolveMmPrefixSupport:
 
         assert runner._resolve_mm_support() is True
 
-    def test_a_range_longer_than_the_longest_chunk_is_refused(
-        self, make_model_runner, monkeypatch
+    @pytest.mark.parametrize("cr13", [False, True])
+    def test_a_range_longer_than_the_longest_chunk_is_refused_with_a_fix(
+        self, make_model_runner, monkeypatch, cr13
     ):
         # The step budget holds the range; only the longest chunk does not.
+        monkeypatch.setattr(mr.current_platform, "is_cr13", lambda: cr13)
         runner = self._runner(
             make_model_runner,
             monkeypatch,
-            _MmPrefixModel(200),
-            max_num_batched_tokens=256,
-            additional_config={"prefill_chunk_size": [128]},
+            _MmPrefixModel(1120),
+            max_num_batched_tokens=512,
+            block_size=8192,
+            additional_config={"prefill_chunk_size": [512]},
         )
 
-        with pytest.raises(ValueError, match="--rbln-prefill-chunk-size"):
+        with pytest.raises(ValueError) as refused:
             runner._resolve_mm_support()
+        message = str(refused.value)
+        assert (
+            "--max-num-batched-tokens 2048 --rbln-prefill-chunk-size 512,2048"
+            in message
+        )
+        assert ("--rbln-prefill-chunk-size 512,1152" in message) == cr13
 
 
 class TestGatherMultimodalEmbeddings:
