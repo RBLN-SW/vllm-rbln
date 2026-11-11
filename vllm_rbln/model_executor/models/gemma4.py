@@ -203,6 +203,14 @@ class RBLNGemma4ForConditionalGeneration(
             raise ValueError(
                 "Gemma4 does not support speculative decoding on RBLN yet."
             )
+        # Upstream fills per-layer inputs in its own embed_input_ids, which the
+        # in-graph merge of mm embeddings (forward) bypasses.
+        text_config = vllm_config.model_config.hf_config.text_config
+        if getattr(text_config, "hidden_size_per_layer_input", None):
+            raise ValueError(
+                "Gemma4 variants with per-layer inputs (E2B, E4B) are not "
+                "supported on RBLN yet."
+            )
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         cap = mm_soft_token_cap(
             MULTIMODAL_REGISTRY.create_processor(vllm_config.model_config).info

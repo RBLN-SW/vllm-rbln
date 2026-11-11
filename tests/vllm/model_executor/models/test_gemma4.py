@@ -178,7 +178,7 @@ def test_warm_up_runs_every_bucket_once_full():
     assert calls == [(18, 18), (45, 45), (90, 90)]
 
 
-def _built_model(monkeypatch, *, cap, budgets):
+def _built_model(monkeypatch, *, cap, budgets, per_layer_input=0):
     """The model as construction resolves it, upstream's model left out."""
     monkeypatch.setattr(
         Gemma4ForConditionalGeneration,
@@ -201,7 +201,13 @@ def _built_model(monkeypatch, *, cap, budgets):
         vllm_config=SimpleNamespace(
             parallel_config=SimpleNamespace(data_parallel_size=1),
             speculative_config=None,
-            model_config=None,
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    text_config=SimpleNamespace(
+                        hidden_size_per_layer_input=per_layer_input
+                    )
+                )
+            ),
             additional_config=SimpleNamespace(encoder_token_budgets=budgets),
         )
     )
@@ -232,6 +238,11 @@ def test_budgets_that_cannot_encode_an_image_at_the_cap_are_refused(monkeypatch)
 def test_budgets_the_processor_never_emits_are_refused(monkeypatch):
     with pytest.raises(ValueError, match=r"\[100, 300\] are not Gemma4"):
         _built_model(monkeypatch, cap=280, budgets=[300, 100, 280])
+
+
+def test_variants_with_per_layer_inputs_are_refused(monkeypatch):
+    with pytest.raises(ValueError, match="per-layer inputs"):
+        _built_model(monkeypatch, cap=280, budgets=[], per_layer_input=256)
 
 
 def _processing_info(engine_kwargs, processor_default, default_output_length):
