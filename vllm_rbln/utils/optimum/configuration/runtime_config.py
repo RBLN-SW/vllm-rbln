@@ -121,6 +121,49 @@ def prepare_runtime_config(
 
     cache_config = vllm_config.cache_config
     additional_config = vllm_config.additional_config
+    block_size = kvcache_block_size
+    attn_block_size = None
+    if cache_config.enable_prefix_caching:
+        assert prefill_chunk_size is not None, (
+            "prefill_chunk_size is required for prefix caching"
+        )
+        sub_block_size = additional_config.sub_block_size
+        if sub_block_size is None:
+            sub_block_size = prefill_chunk_size
+        else:
+            if sub_block_size % prefill_chunk_size != 0:
+                raise ValueError(
+                    f"sub_block_size ({sub_block_size}) is not divisible "
+                    f"by prefill_chunk_size ({prefill_chunk_size}). "
+                    "Please check the value of prefill_chunk_size in rbln_config.json"
+                )
+            if sub_block_size > kvcache_block_size:
+                raise ValueError(
+                    f"sub_block_size ({sub_block_size}) is greater than "
+                    f"kvcache_block_size ({kvcache_block_size}). "
+                    "Please check the value of kvcache_block_size in rbln_config.json"
+                )
+        if kvcache_block_size % sub_block_size != 0:
+            raise ValueError(
+                f"kvcache_block_size ({kvcache_block_size}) is not divisible "
+                f"by sub_block_size ({sub_block_size}). "
+                "Please check the value of sub_block_size in additional_config"
+            )
+        block_size = sub_block_size
+        attn_block_size = kvcache_block_size
+
+    mamba_block_size = cache_config.mamba_block_size
+    if (
+        precompiled
+        and not cache_config.user_specified_mamba_block_size
+        and mamba_block_size is not None
+    ):
+        assert not cache_config.enable_prefix_caching, (
+            "mamba_block_size can only be synced to max_model_len while "
+            "prefix caching is disabled, but prefix caching is enabled. "
+            "RBLN does not support prefix caching for mamba/hybrid models."
+        )
+        mamba_block_size = max_seq_len
     if cache_config.num_gpu_blocks_override is not None:
         num_blocks = (
             additional_config.num_blocks_override
@@ -130,7 +173,9 @@ def prepare_runtime_config(
     return OptimumRBLNRuntimeConfig(
         max_num_seqs=batch_size,
         max_model_len=max_seq_len,
-        block_size=kvcache_block_size,
+        block_size=block_size,
+        attn_block_size=attn_block_size,
+        mamba_block_size=mamba_block_size,
         prefill_chunk_size=prefill_chunk_size,
         image_prefill_chunk_size=image_prefill_chunk_size,
         model_num_blocks=num_blocks,
@@ -186,8 +231,7 @@ def apply_runtime_config(
     update_block_size(
         vllm_config,
         runtime_config.block_size,
-        prefill_chunk_size,
-        runtime_config.image_prefill_chunk_size,
+        runtime_config.attn_block_size,
     )
     # The compiled model is the source of truth for dtype: vLLM must feed
     # inputs in exactly the dtype the artefact was compiled with.
@@ -201,7 +245,7 @@ def apply_runtime_config(
 
     # Set num_blocks in cache_config based on rbln_config.json
     if runtime_config.precompiled:
-        update_mamba_block_size(vllm_config, max_model_len)
+        vllm_config.cache_config.mamba_block_size = runtime_config.mamba_block_size
         assert runtime_config.model_num_blocks is not None
         update_num_blocks(vllm_config, runtime_config.model_num_blocks)
     # The compiled model fixes num_devices too.
@@ -227,77 +271,25 @@ def get_runtime_num_blocks(hf_config: Any, rbln_config: RblnConfigLike) -> int |
     return None
 
 
-def _apply_prefix_caching_block_size(
-    vllm_config: VllmConfig, kvcache_block_size: int, prefill_chunk_size: int
-) -> None:
-    additional_config: OptimumRBLNConfig = vllm_config.additional_config
-    sub_block_size = additional_config.sub_block_size
-    if sub_block_size is None:
-        sub_block_size = prefill_chunk_size
-        logger.debug(
-            "Sub-block size is set to %s based on prefill_chunk_size",
-            sub_block_size,
-        )
-    else:
-        if sub_block_size % prefill_chunk_size != 0:
-            raise ValueError(
-                "sub_block_size ({}) is not divisible "
-                "by prefill_chunk_size ({}). "
-                "Please check the value of prefill_chunk_size "
-                "in rbln_config.json".format(sub_block_size, prefill_chunk_size)
-            )
-        if sub_block_size > kvcache_block_size:
-            raise ValueError(
-                "sub_block_size ({}) is greater than "
-                "kvcache_block_size ({}). "
-                "Please check the value of kvcache_block_size "
-                "in rbln_config.json".format(sub_block_size, kvcache_block_size)
-            )
-        logger.debug(
-            "Sub-block size is set to %s based on additional_config",
-            sub_block_size,
-        )
-    if kvcache_block_size % sub_block_size != 0:
-        raise ValueError(
-            "kvcache_block_size ({}) is not divisible "
-            "by sub_block_size ({}). "
-            "Please check the value of sub_block_size in additional_config".format(
-                kvcache_block_size, sub_block_size
-            )
-        )
-    vllm_config.cache_config.block_size = sub_block_size
-    additional_config.attn_block_size = kvcache_block_size
-
-
 def update_block_size(
     vllm_config: VllmConfig,
-    kvcache_block_size: int,
-    prefill_chunk_size: int | None,
-    image_prefill_chunk_size: list[int] | None = None,
+    block_size: int,
+    attn_block_size: int | None,
 ) -> None:
-    """
-    Update the block size in the vllm_config based on the provided kvcache_block_size
-    and prefill_chunk_size. For models with prefix caching enabled, the block size
-    is set to the sub-block size, which is determined based on the prefill_chunk_size
-    and user-provided sub_block_size.
-    """
+    """Apply the prepared vLLM block size and attention block size."""
     vllm_config.cache_config.user_specified_block_size = True
-    if vllm_config.cache_config.enable_prefix_caching:
-        assert prefill_chunk_size is not None, (
-            "prefill_chunk_size is required for prefix caching"
+    if attn_block_size is not None:
+        vllm_config.cache_config.block_size = block_size
+        vllm_config.additional_config.attn_block_size = attn_block_size
+        logger.debug("Sub-block size is set to %s for prefix caching", block_size)
+    elif vllm_config.cache_config.block_size != block_size:
+        logger.info(
+            "Updating model_cache_config.block_size from %s to %s "
+            "based on rbln_config.json",
+            vllm_config.cache_config.block_size,
+            block_size,
         )
-        _apply_prefix_caching_block_size(
-            vllm_config, kvcache_block_size, prefill_chunk_size
-        )
-    else:
-        if vllm_config.cache_config.block_size != kvcache_block_size:
-            logger.info(
-                "Updating model_cache_config.block_size from %s to %s "
-                "based on rbln_config.json",
-                vllm_config.cache_config.block_size,
-                kvcache_block_size,
-            )
-            vllm_config.cache_config.block_size = kvcache_block_size
+        vllm_config.cache_config.block_size = block_size
 
 
 def is_chunked_prefill_arch(hf_config) -> bool:
@@ -432,17 +424,3 @@ def update_num_blocks(vllm_config: VllmConfig, num_blocks: int) -> None:
     if vllm_config.cache_config.num_gpu_blocks_override is not None:
         vllm_config.cache_config.num_gpu_blocks_override = adjusted_num_blocks
     additional_config.num_blocks_synced = True
-
-
-def update_mamba_block_size(vllm_config: VllmConfig, max_seq_len: int) -> None:
-    cache_config = vllm_config.cache_config
-    if (
-        not cache_config.user_specified_mamba_block_size
-        and cache_config.mamba_block_size is not None
-    ):
-        assert not cache_config.enable_prefix_caching, (
-            "mamba_block_size can only be synced to max_model_len while "
-            "prefix caching is disabled, but prefix caching is enabled. "
-            "RBLN does not support prefix caching for mamba/hybrid models."
-        )
-        cache_config.mamba_block_size = max_seq_len

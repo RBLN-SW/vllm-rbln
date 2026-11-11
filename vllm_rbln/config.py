@@ -205,11 +205,17 @@ class OptimumRBLNCompileConfig:
 
 @dataclass
 class OptimumRBLNRuntimeConfig:
-    """Validated model settings ready to apply to vLLM after artifact selection."""
+    """Validated model settings ready to apply to vLLM after artifact selection.
+
+    block_size uses vLLM allocation units; attn_block_size retains the model's
+    attention block size when prefix caching is enabled.
+    """
 
     max_num_seqs: int
     max_model_len: int
     block_size: int
+    attn_block_size: int | None
+    mamba_block_size: int | None
     prefill_chunk_size: int | None
     image_prefill_chunk_size: list[int] | None
     model_num_blocks: int | None

@@ -164,6 +164,8 @@ class TestSync:
                 user_specified_block_size=True,
                 enable_prefix_caching=False,
                 num_gpu_blocks_override=None,
+                user_specified_mamba_block_size=False,
+                mamba_block_size=None,
             ),
             additional_config={},
             speculative_config=None,
