@@ -121,7 +121,8 @@ def test_axk3_registers_its_mla_convertor(monkeypatch):
     assert convertor_cls(config, config).is_deepseek_mla()
 
 
-def test_forward_runs_only_the_layers_this_rank_built(monkeypatch):
+@pytest.mark.parametrize("num_tokens", [1, 3], ids=["decode", "prefill"])
+def test_forward_runs_only_the_layers_this_rank_built(monkeypatch, num_tokens):
     """`VLLM_RBLN_NUM_HIDDEN_LAYERS` builds the first N layers by shrinking the
     `end_layer` that `make_layers` sees; the list it returns still has one entry
     per layer, the rest `PPMissingLayer`. That placeholder returns its first
@@ -160,13 +161,13 @@ def test_forward_runs_only_the_layers_this_rank_built(monkeypatch):
     model.final_gated_residual = SimpleNamespace(read=lambda hidden: (hidden, None))
 
     out = model.forward(
-        input_ids=torch.zeros(3, dtype=torch.long),
-        positions=torch.arange(3),
+        input_ids=torch.zeros(num_tokens, dtype=torch.long),
+        positions=torch.arange(num_tokens),
         intermediate_tensors=None,
     )
 
     # Two built layers, each adding one; nothing from the unbuilt tail.
-    torch.testing.assert_close(out, torch.full((3, 8), 2.0))
+    torch.testing.assert_close(out, torch.full((num_tokens, 8), 2.0))
 
 
 @pytest.mark.parametrize("skip_topk", [False, True])
@@ -204,6 +205,73 @@ def test_decoder_layer_returns_topk_without_writing_the_shared_dict(
     assert received[0] is (source if skip_topk else None)
     assert topk is (None if skip_topk else computed)
     torch.testing.assert_close(hidden, torch.full((2, 4), 4.0))
+
+
+def test_prefill_chunk_matches_decoding_its_tokens_one_at_a_time(monkeypatch):
+    """A prefill chunk runs the layers' Gated Residuals as the axk3_gr_* ops on
+    the residual [B, n, T, h], decode as the plain read and write on
+    [B, T, n*h]. With token-local blocks, the chunk has to give what decoding
+    its tokens one at a time gives."""
+    import vllm.distributed.parallel_state as parallel_state
+    from vllm.config import set_current_vllm_config
+
+    import vllm_rbln.patches.axk3.model as axk3_model
+    from tests.vllm.vllm_config import make_vllm_config
+
+    torch.manual_seed(0)
+    # The axk3_gr_* ops fix n at 4.
+    num_streams, hidden, tokens = 4, 64, 3
+
+    def gated_residual(has_write=True):
+        gr = axk3_model.AXK3GatedResidual(
+            hidden, num_streams, 64, 1e-6, has_write=has_write
+        )
+        for param in gr.parameters():
+            param.data.normal_(std=0.1)
+        return gr
+
+    def decoder_layer(idx):
+        layer = axk3_model.AXK3DecoderLayer.__new__(axk3_model.AXK3DecoderLayer)
+        torch.nn.Module.__init__(layer)
+        layer.attn_gated_residual = gated_residual()
+        layer.mlp_gated_residual = gated_residual()
+        layer.self_attn = SimpleNamespace(mla_attn=None)
+        layer.mlp = torch.tanh
+        layer.layer_idx, layer.index_source_layer, layer.skip_topk = idx, idx, False
+        return layer
+
+    monkeypatch.setattr(
+        axk3_model,
+        "_gated_mla_forward",
+        lambda mla, positions, x, topk_indices: (torch.sin(x), None),
+    )
+    monkeypatch.setattr(
+        parallel_state, "_TP", SimpleNamespace(world_size=1, rank_in_group=0)
+    )
+    model = axk3_model.AXK3Model.__new__(axk3_model.AXK3Model)
+    torch.nn.Module.__init__(model)
+    model.num_streams = num_streams
+    with set_current_vllm_config(make_vllm_config()):
+        model.layers = torch.nn.ModuleList([decoder_layer(0), decoder_layer(1)])
+        model.final_gated_residual = gated_residual(has_write=False)
+    model.start_layer, model.end_layer = 0, 2
+    embeds = torch.randn(1, tokens, hidden)
+    plain_reads = []
+    plain_read = axk3_model.AXK3GatedResidual.read
+
+    def read(gr, residual):
+        plain_reads.append(gr)
+        return plain_read(gr, residual)
+
+    monkeypatch.setattr(axk3_model.AXK3GatedResidual, "read", read)
+
+    def forward(t):
+        return model.forward(None, torch.arange(tokens)[t], None, embeds[:, t])
+
+    chunk = forward(slice(None))
+    assert plain_reads == [model.final_gated_residual]
+    decoded = torch.cat([forward(slice(t, t + 1)) for t in range(tokens)], dim=1)
+    torch.testing.assert_close(chunk, decoded)
 
 
 def test_eagle3_is_refused_on_both_aux_layer_setup_paths():
