@@ -218,8 +218,6 @@ def _validate(vllm_config: "VllmConfig") -> None:
         text_config.model_type == "glm5_next_text"
         or _uses_gated_delta_net(model_config)
     ):
-        # A recurrent state (KDA, GatedDeltaNet) is checkpointed a KV block
-        # ("align"), and a kernel loads one whole: no hit inside a block.
         if (
             cache_config.user_specified_mamba_block_size
             and cache_config.mamba_block_size != cache_config.block_size
