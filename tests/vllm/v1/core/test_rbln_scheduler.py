@@ -20,12 +20,15 @@ import inspect
 from types import SimpleNamespace
 
 import pytest
+import torch
 from vllm.config.ec_manager_config import EncoderCacheManagerConfig
 from vllm.distributed.kv_events import BlockStored, KVEventBatch
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
+from vllm.v1.kv_cache_interface import KVCacheGroupSpec
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import RequestStatus
@@ -38,11 +41,13 @@ from tests.vllm.v1.core.utils import (
     advance_to_decode,
     create_rbln_scheduler,
     create_requests,
+    full_attention_spec,
     image_at,
     make_model_runner_output,
     make_request,
     prefill_request,
 )
+from vllm_rbln.platform import RblnPlatform
 from vllm_rbln.v1.core import rbln_scheduler
 from vllm_rbln.v1.core.rbln_kv_cache_manager import RBLNKVCacheManager
 from vllm_rbln.v1.core.rbln_scheduler import (
@@ -51,6 +56,7 @@ from vllm_rbln.v1.core.rbln_scheduler import (
     RBLNSchedulerOutput,
 )
 from vllm_rbln.v1.core.utils import is_prefill, step_is_prefill
+from vllm_rbln.v1.kv_cache import RBLNGDNManager, RBLNGDNStateSpec
 
 
 @pytest.mark.parametrize("interrupt_scheduling", [False, True])
@@ -79,6 +85,37 @@ def test_eviction_snapshot_defers_hits_only_within_its_scope(interrupt_schedulin
 
 
 class TestSchedulerInit:
+    def test_gdn_group_schedules_on_a_pool_of_its_own(self):
+        # The GatedDeltaNet group's manager is bound to a pool sized by
+        # the spec's pool_blocks; the attention group stays on the shared pool.
+        register_all_kvcache_specs(None)
+        RblnPlatform.register_custom_kv_cache_specs(None)
+        gdn = RBLNGDNStateSpec(
+            shapes=((2, 4, 2, 8, 8),),
+            dtypes=(torch.int16,),
+            block_size=16,
+            mamba_cache_mode="none",
+        )
+        sched = create_rbln_scheduler(
+            enable_prefix_caching=False,
+            block_size=16,
+            max_num_batched_tokens=16,
+            max_model_len=8192,
+            max_num_seqs=4,
+            num_blocks=10,
+            kv_cache_groups=[
+                KVCacheGroupSpec(["attn"], full_attention_spec(16)),
+                KVCacheGroupSpec(["gdn"], gdn),
+            ],
+        )
+        shared = sched.kv_cache_manager.block_pool
+        attn, state = sched.kv_cache_manager.coordinator.single_type_managers
+        assert attn.block_pool is shared
+        assert isinstance(state, RBLNGDNManager)
+        assert state.block_pool is not shared
+        # One block a running request plus the null block.
+        assert state.block_pool.num_gpu_blocks == 5
+
     def test_no_ec_connector_keeps_the_default_encoder_cache_manager(self):
         sched = create_rbln_scheduler()
         assert type(sched.encoder_cache_manager) is EncoderCacheManager

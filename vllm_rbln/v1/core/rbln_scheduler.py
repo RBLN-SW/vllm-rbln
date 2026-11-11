@@ -58,6 +58,7 @@ from vllm_rbln.v1.core.utils import (
     should_defer_spec_step,
     sub_block_size_in_use,
 )
+from vllm_rbln.v1.kv_cache import bind_own_pools
 
 logger = init_logger(__name__)
 
@@ -177,6 +178,7 @@ class RBLNScheduler(Scheduler):
         self._pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
 
         self._prefill_chunk_size = rbln_config.prefill_chunk_size
+        bind_own_pools(self.kv_cache_manager, self.vllm_config)
 
         # NOTE(RBLN): the sparse-attention ops (DSA MLA / indexer, MiniMax-M3
         # MSA / indexer, GLM5 MLA / indexer) get NULL_BLOCK_ID as null_block_id

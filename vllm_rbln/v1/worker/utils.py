@@ -222,7 +222,7 @@ def extract_layer_index(layer_name: str, num_attn_module: int = 1) -> int:
         sub = int_vals[1]
     elif "scale" in layer_name:
         sub = 2
-    elif "indexer" in layer_name:
+    elif "indexer" in layer_name or "conv_ring" in layer_name:
         sub = 1
     else:
         sub = 0
@@ -267,6 +267,10 @@ def num_attn_module(model_config, cache_dtype) -> int:
     if hasattr(text_config, "index_topk") or hasattr(hf_config, "index_topk"):
         is_fp8 = bool(cache_dtype) and cache_dtype.startswith("fp8")
         return 3 if is_fp8 else 2
+    # A GatedDeltaNet layer (Qwen3-Next, Qwen3.5) keeps its recurrent state
+    # and its conv ring.
+    if getattr(text_config, "model_type", None) in ("qwen3_next", "qwen3_5_text"):
+        return 2
     # MiniMax-M3 MSA: the indexer key cache next to the GQA K/V cache. Dense
     # layers own only K/V; the runner re-indexes layers by bound position.
     if getattr(text_config, "sparse_attention_config", None) or getattr(
@@ -499,6 +503,19 @@ def dynamic_kv_enabled(vllm_config: VllmConfig) -> bool:
         rbln_config.use_dynamic_kv_cache is not False
         and dynamic_kv_unsupported_reason(vllm_config) is None
     )
+
+
+_SpecT = TypeVar("_SpecT", bound=KVCacheSpec)
+
+
+def layers_with_spec(cfg: KVCacheConfig, spec_type: type[_SpecT]) -> dict[str, _SpecT]:
+    """The layers of every cache group whose spec is a `spec_type`, by name."""
+    return {
+        layer_name: group.kv_cache_spec
+        for group in cfg.kv_cache_groups
+        if isinstance(group.kv_cache_spec, spec_type)
+        for layer_name in group.layer_names
+    }
 
 
 def kv_cache_extents(cfg: KVCacheConfig) -> dict[str, tuple[int, int]]:

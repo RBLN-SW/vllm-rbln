@@ -32,6 +32,15 @@ _MINIMAX_BASE = CompileModelSpec(
 
 MODELS: list[CompileModelSpec] = [
     CompileModelSpec(
+        "Qwen/Qwen3.5-4B",
+        {"max_num_seqs": 2, "language_model_only": True},
+        chips=REBEL,
+        # TODO(rebel-compiler): drop once rolling these GDN layers passes
+        # RblnTensorUnrollLayerLoop. Without nested regions there is
+        # nothing to roll; a release compiler ignores RBLN_EXP_ROLL_LAYERS.
+        envs={"VLLM_RBLN_USE_NESTED_COMPILE_REGION": "0"},
+    ),
+    CompileModelSpec(
         "Qwen/Qwen3-30B-A3B",
         {
             "max_num_seqs": 1,

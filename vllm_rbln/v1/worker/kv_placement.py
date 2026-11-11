@@ -362,6 +362,7 @@ class UnitFit:
     used: int
     kv_resident: int
     reserve: int
+    own_pool: int
     base: int
     per_block: int
     num_blocks: int
@@ -374,9 +375,14 @@ def max_num_blocks(
     gpu_memory_utilization: float,
     kv_resident: Mapping[Unit, int],
     reserve_bytes: int = 0,
+    own_pool_bytes: Mapping[Unit, int] | None = None,
 ) -> tuple[int, dict[Unit, UnitFit]]:
     """Largest `num_blocks` with `base + allocated(n) <= total * gmu` on every
-    unit the KV cache grows on, `base = used - kv_resident + reserve_bytes`."""
+    unit the KV cache grows on, `base = used - kv_resident + reserve_bytes +
+    own_pool_bytes`. `own_pool_bytes` is what the caches on a pool of their own
+    (a GatedDeltaNet state pool), which the block count does not size, will take
+    once allocated."""
+    own_pool_bytes = own_pool_bytes or {}
     if not 0 < gpu_memory_utilization <= 1:
         raise ValueError(
             f"gpu_memory_utilization must be in (0, 1], got {gpu_memory_utilization}"
@@ -389,11 +395,17 @@ def max_num_blocks(
         )
     room: dict[Unit, int] = {}
     linear: dict[Unit, int] = {}
+    bases: dict[Unit, int] = {}
     for unit, per_block in growth.per_block.items():
         mem = snapshot[unit]
         budget = int(mem.total * gpu_memory_utilization)
-        base = mem.used - int(kv_resident.get(unit, 0)) + reserve_bytes
-        room[unit] = budget - base
+        bases[unit] = (
+            mem.used
+            - int(kv_resident.get(unit, 0))
+            + reserve_bytes
+            + own_pool_bytes.get(unit, 0)
+        )
+        room[unit] = budget - bases[unit]
         linear[unit] = max(0, room[unit] // per_block)
 
     def fits_all(n: int) -> bool:
@@ -416,7 +428,8 @@ def max_num_blocks(
             used=mem.used,
             kv_resident=int(kv_resident.get(unit, 0)),
             reserve=reserve_bytes,
-            base=mem.used - int(kv_resident.get(unit, 0)) + reserve_bytes,
+            own_pool=own_pool_bytes.get(unit, 0),
+            base=bases[unit],
             per_block=per_block,
             num_blocks=linear[unit],
         )
@@ -426,7 +439,8 @@ def max_num_blocks(
 def format_fits(fits: Mapping[Unit, UnitFit]) -> str:
     return " ".join(
         f"{n}:{c}(total={f.total} budget={f.budget} used={f.used} "
-        f"kv_resident={f.kv_resident} reserve={f.reserve} base={f.base} "
+        f"kv_resident={f.kv_resident} reserve={f.reserve} own_pool={f.own_pool} "
+        f"base={f.base} "
         f"per_block={f.per_block} "
         f"blocks={f.num_blocks})"
         for (n, c), f in sorted(fits.items())

@@ -107,6 +107,7 @@ def _make_runner_stub(**attrs):
     runner = object.__new__(RBLNModelRunner)
     runner.dp_status = None
     runner.supports_mm_inputs = False
+    runner.mrope_positions = None
     for key, value in attrs.items():
         setattr(runner, key, value)
     return runner
@@ -772,7 +773,9 @@ class TestEcConsumer:
         runner = _make_runner_stub(
             load_config=None,
             vllm_config=SimpleNamespace(ec_transfer_config=ec_config),
-            model_config=SimpleNamespace(model="m", enforce_eager=False),
+            model_config=SimpleNamespace(
+                model="m", enforce_eager=False, uses_mrope=False
+            ),
             offload_context=nullcontext,
             _resolve_mm_support=lambda: True,
             drafter=None,
@@ -1026,7 +1029,7 @@ class TestSelectCanonicalKvLayersPerPool:
         return SimpleNamespace(layer_names=layer_names, kv_cache_spec=spec)
 
     def _runner(self, groups):
-        r = _make_runner_stub()
+        r = _make_runner_stub(aux_kv_cache_specs={})
         r._kv_cache_spec_attn_group_iterator = lambda: iter(groups)
         return r
 
@@ -1939,8 +1942,10 @@ class TestAllocateKvCacheTensors:
                 ),
             ],
             kv_cache_groups=[
-                SimpleNamespace(layer_names=["l0", "l1"]),
-                SimpleNamespace(layer_names=["l2"]),
+                SimpleNamespace(
+                    layer_names=["l0", "l1"], kv_cache_spec=SimpleNamespace()
+                ),
+                SimpleNamespace(layer_names=["l2"], kv_cache_spec=SimpleNamespace()),
             ],
         )
 

@@ -494,6 +494,24 @@ class TestMaxNumBlocks:
         assert fits[(0, 0)].reserve == 64 * 2**20
         assert fits[(0, 0)].base == 10 * self.GIB + 64 * 2**20
 
+    def test_own_pool_bytes_are_charged_as_base(self):
+        growth = self._growth()
+        snapshot = self._snapshot({(0, 0): 10 * self.GIB, (1, 0): 10 * self.GIB})
+        plain, _ = max_num_blocks(
+            snapshot, growth, gpu_memory_utilization=1.0, kv_resident={}
+        )
+        reserved, fits = max_num_blocks(
+            snapshot,
+            growth,
+            gpu_memory_utilization=1.0,
+            kv_resident={},
+            own_pool_bytes={(0, 0): 64 * 2**20, (1, 0): 0},
+        )
+        assert reserved == plain - 32
+        assert fits[(0, 0)].own_pool == 64 * 2**20
+        assert fits[(0, 0)].base == 10 * self.GIB + 64 * 2**20
+        assert fits[(1, 0)].base == 10 * self.GIB
+
     def test_gpu_memory_utilization_scales_the_budget(self):
         growth = self._growth()
         snapshot = self._snapshot({(0, 0): 0, (1, 0): 0})

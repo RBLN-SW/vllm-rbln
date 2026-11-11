@@ -23,10 +23,15 @@ from unittest.mock import patch
 
 import pytest
 import torch
-from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheGroupSpec,
+    SlidingWindowSpec,
+)
 
 import vllm_rbln.v1.worker.dynamic_kv_sizer as dks
 from vllm_rbln.v1.attention.kv_cache_bindings import kv_cache_tensor_key
+from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec, RBLNGDNStateSpec
 from vllm_rbln.v1.worker.dynamic_kv_sizer import DynamicKvSizer
 
 S0 = ("symbol", "s0")
@@ -260,6 +265,7 @@ class TestComputeDynamicKvNumBlocks:
                 _kernel_block_sizes=list(kernel_block_sizes),
                 kv_cache_allocations=allocations,
                 kv_caches=list(caches.values()),
+                aux_kv_cache_specs={},
             ),
             programs=list(programs),
             program_inputs=bindings,
@@ -300,6 +306,28 @@ class TestComputeDynamicKvNumBlocks:
         # The first snapshot is the before-release reading the shortfall check
         # compares against; the count is sized from the one after it.
         assert order == ["snapshot", "release", "snapshot"]
+
+    def test_own_pools_take_their_share_before_the_blocks(self):
+        # A GatedDeltaNet pool of max_num_seqs + 1 = 5 states of 4 MiB and its
+        # ring of 5 x 64 KiB, split evenly over the 4 chiplets: a 5 MiB shard
+        # maps a 20 MiB segment and an 80 KiB one a 2 MiB segment, per chiplet.
+        programs = [_program([HEAD_SPLIT], name="0/0")]
+        state = RBLNGDNStateSpec(
+            shapes=((2048, 1024),), dtypes=(torch.float16,), block_size=8192
+        )
+        sizer = self._sizer(
+            programs=programs,
+            snapshot=self._snapshot([30 * self.GIB] * 4),
+            kv_cache_groups=[KVCacheGroupSpec(["gdn"], state)],
+        )
+        sizer.vllm_config = SimpleNamespace(
+            scheduler_config=SimpleNamespace(max_num_seqs=4)
+        )
+        sizer.model_runner.aux_kv_cache_specs = {
+            "gdn.conv_ring": RBLNBlockAuxSpec("gdn", (1, 512, 64), torch.float16)
+        }
+        # (35 GiB - 30 GiB - 22 MiB) / 1 MiB = 5120 - 22 blocks
+        assert DynamicKvSizer.compute_num_blocks(sizer) == 5 * 1024 - 22
 
     def test_the_copy_stream_reserve_comes_off_every_chiplet(self):
         programs = [_program([HEAD_SPLIT, HEAD_SPLIT], name="0/0")]

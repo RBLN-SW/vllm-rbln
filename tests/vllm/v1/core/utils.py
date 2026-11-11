@@ -208,6 +208,7 @@ def create_rbln_scheduler(
     use_kv_connector: MockKVConfig | None = None,
     async_scheduling: bool = False,
     additional_config: dict | None = None,
+    kv_cache_groups: Sequence[KVCacheGroupSpec] | None = None,
     ec_transfer_config: ECTransferConfig | None = None,
     ec_manager_config: EncoderCacheManagerConfig | None = None,
 ) -> RBLNScheduler:
@@ -271,7 +272,11 @@ def create_rbln_scheduler(
     kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,
         kv_cache_tensors=[],
-        kv_cache_groups=[KVCacheGroupSpec(["layer"], full_attention_spec(block_size))],
+        kv_cache_groups=(
+            list(kv_cache_groups)
+            if kv_cache_groups is not None
+            else [KVCacheGroupSpec(["layer"], full_attention_spec(block_size))]
+        ),
     )
     cache_config.num_gpu_blocks = num_blocks
     scheduler_cls = RBLNAsyncScheduler if async_scheduling else RBLNScheduler

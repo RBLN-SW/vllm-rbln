@@ -20,11 +20,12 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.v1.kv_cache_interface import MambaSpec
 
 import vllm_rbln.v1.worker.rbln_model_runner as mr
 from tests.vllm.v1.worker.utils import make_kv_cache_config, schedule_new
 from vllm_rbln.v1.attention.kv_cache_bindings import kv_cache_tensor_key
-from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
+from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec, RBLNGDNStateSpec
 
 pytestmark = pytest.mark.maybe_use_device
 
@@ -179,6 +180,130 @@ class TestLayerIndexFollowsCacheOrder:
         assert runner.kv_cache_names == list(names)
         assert [ctx[name].layer_index for name in names] == [0, 1, 2]
         assert runner.kv_caches[2] is ctx[names[-1]].kv_cache
+
+
+class TestMambaSpecGroup:
+    def _views(self, runner, config):
+        runner.kv_cache_config = config
+        runner.initialize_attn_backend(config)
+        raw = runner._allocate_kv_cache_tensors(config)
+        return raw, runner._reshape_kv_cache_tensors(
+            config, raw, [config.kv_cache_groups[0].kv_cache_spec.block_size]
+        )
+
+    def _state_spec(self, runner):
+        return RBLNGDNStateSpec(
+            block_size=runner.model_config.max_model_len,
+            shapes=((2, 2, 2, 128, 64),),
+            dtypes=(torch.int16,),
+        )
+
+    def test_a_state_that_fills_its_page_binds_its_blocks(self, make_model_runner):
+        # GLM-5.3's KDA state fills its page: one [num_blocks, *shape] view.
+        runner = make_model_runner(layers=("layer.0",), init_kv_cache=False)
+        spec = MambaSpec(
+            block_size=runner.model_config.max_model_len,
+            shapes=((64, 512),),
+            dtypes=(torch.uint8,),
+        )
+        config = make_kv_cache_config(runner, groups=[("layer.0",)], spec=spec)
+        _, (caches, _, _, axes) = self._views(runner, config)
+        assert caches["layer.0"].shape == (10, 64, 512)
+        assert axes == {"layer.0": 0}
+
+    def test_a_padded_state_page_is_refused(self, make_model_runner):
+        runner = make_model_runner(layers=("layer.0",), init_kv_cache=False)
+        spec = MambaSpec(
+            block_size=runner.model_config.max_model_len,
+            shapes=((64, 512),),
+            dtypes=(torch.uint8,),
+            page_size_padded=2 * 64 * 512,
+        )
+        config = make_kv_cache_config(runner, groups=[("layer.0",)], spec=spec)
+        with pytest.raises(NotImplementedError, match="fills its page"):
+            self._views(runner, config)
+
+    def test_a_gdn_state_layer_gets_a_buffer_sized_by_its_pool(self, make_model_runner):
+        # Not the group's extent (an alias of the attention pool): a buffer of
+        # pool_blocks states, one a running request plus the null block.
+        runner = make_model_runner(layers=("layer.0",), init_kv_cache=False)
+        spec = self._state_spec(runner)
+        config = make_kv_cache_config(runner, groups=[("layer.0",)], spec=spec)
+        raw, (caches, bases, infos, axes) = self._views(runner, config)
+        assert "layer.0" not in caches
+        runner._allocate_state_pool_caches(config, caches, bases, infos, axes)
+        num_blocks = runner.vllm_config.scheduler_config.max_num_seqs + 1
+        assert caches["layer.0"].shape == (num_blocks, 2, 2, 2, 128, 64)
+        assert caches["layer.0"].dtype == torch.int16
+        assert bases["layer.0"] is caches["layer.0"]
+        assert axes == {"layer.0": 0}
+
+    def test_an_aux_cache_takes_its_gdn_owners_block_count(self, make_model_runner):
+        runner = make_model_runner(layers=("layer.0",), init_kv_cache=False)
+        config = make_kv_cache_config(
+            runner, groups=[("layer.0",)], spec=self._state_spec(runner)
+        )
+        ctx = runner.compilation_config.static_forward_context
+        ctx["layer.0.conv_ring"] = SimpleNamespace(
+            get_aux_cache_spec=lambda cfg: RBLNBlockAuxSpec(
+                "layer.0", (3, 8, 128), torch.float16
+            )
+        )
+        _, (caches, bases, infos, axes) = self._views(runner, config)
+        runner._allocate_aux_kv_caches(config, caches, bases, infos, axes)
+        assert list(runner.aux_kv_cache_specs) == ["layer.0.conv_ring"]
+        ring = caches["layer.0.conv_ring"]
+        num_blocks = runner.vllm_config.scheduler_config.max_num_seqs + 1
+        assert ring.shape == (num_blocks, 3, 8, 128)
+        assert ring.dtype == torch.float16
+        assert axes["layer.0.conv_ring"] == 0
+
+    def test_a_gdn_pool_is_not_dynamic(self, make_model_runner, monkeypatch):
+        # The dynamic-KV resize scales the attention block count; a GDN pool
+        # and its aux caches are sized by the spec's pool_blocks, so they stay static.
+        monkeypatch.setattr(mr, "dynamic_kv_enabled", lambda _config: True)
+        runner = make_model_runner(layers=("layer.0",), init_kv_cache=False)
+        config = make_kv_cache_config(
+            runner, groups=[("layer.0",)], spec=self._state_spec(runner)
+        )
+        ctx = runner.compilation_config.static_forward_context
+        ctx["layer.0.conv_ring"] = SimpleNamespace(
+            get_aux_cache_spec=lambda cfg: RBLNBlockAuxSpec(
+                "layer.0", (3, 8, 128), torch.float16
+            )
+        )
+        _, (caches, bases, infos, axes) = self._views(runner, config)
+        runner._allocate_state_pool_caches(config, caches, bases, infos, axes)
+        runner._allocate_aux_kv_caches(config, caches, bases, infos, axes)
+        assert infos["layer.0"].dynamic_axis is None
+        assert infos["layer.0.conv_ring"].dynamic_axis is None
+
+    def test_a_gdn_pool_is_outside_the_resize_inventory(
+        self, make_model_runner, monkeypatch
+    ):
+        # The sizer reads a placement for every inventoried cache; a static
+        # pool has none.
+        monkeypatch.setattr(mr, "dynamic_kv_enabled", lambda _config: True)
+        runner = make_model_runner(layers=("layer.0",), init_kv_cache=False)
+        config = make_kv_cache_config(
+            runner, groups=[("layer.0",)], spec=self._state_spec(runner)
+        )
+        ring = SimpleNamespace(
+            get_aux_cache_spec=lambda cfg: RBLNBlockAuxSpec(
+                "layer.0", (3, 8, 128), torch.float16
+            ),
+            layer_index=1,
+        )
+        monkeypatch.setitem(
+            runner.compilation_config.static_forward_context, "layer.1", ring
+        )
+        runner.kv_cache_config = config
+        runner.initialize_attn_backend(config)
+        runner.initialize_kv_cache_tensors(
+            config, [config.kv_cache_groups[0].kv_cache_spec.block_size]
+        )
+        assert runner.kv_cache_names == ["layer.0", "layer.1"]
+        assert runner.kv_cache_allocations == {}
 
 
 class TestBlockAuxKVCaches:
