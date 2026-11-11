@@ -1,5 +1,5 @@
 version = 1
-revision = 5
+revision = 3
 requires-python = ">=3.10, <3.15"
 resolution-markers = [
     "python_full_version >= '3.14' and platform_machine == 'x86_64' and sys_platform == 'linux'",
@@ -1227,20 +1227,9 @@ wheels = [
 ]
 
 [[package]]
-name = "intel-cmplr-lib-ur"
-version = "2024.2.1"
-source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
-wheels = [
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/intel-cmplr-lib-ur/2024.2.1/intel_cmplr_lib_ur-2024.2.1-py2.py3-none-manylinux1_x86_64.whl", hash = "sha256:8b78d58ab501d6e5a582967be80fdbf7b03b33279135a303da36dbf11f481ed7" },
-]
-
-[[package]]
 name = "intel-openmp"
 version = "2024.2.1"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
-dependencies = [
-    { name = "intel-cmplr-lib-ur" },
-]
 wheels = [
     { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/intel-openmp/2024.2.1/intel_openmp-2024.2.1-py2.py3-none-manylinux1_x86_64.whl", hash = "sha256:21892ea07a9c6e164707d2b44e6f396f9f2ab6cc7e108755011fad59b596182a" },
 ]
@@ -3216,17 +3205,17 @@ wheels = [
 
 [[package]]
 name = "torch-rbln"
-version = "0.12.1a0"
+version = "0.12.1a1"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
 dependencies = [
     { name = "torch" },
 ]
 wheels = [
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.12.1a0/torch_rbln-0.12.1a0-cp310-cp310-manylinux_2_34_x86_64.whl", hash = "md5:a3dca2fd2768e45c8ee24a2a593ca10d" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.12.1a0/torch_rbln-0.12.1a0-cp311-cp311-manylinux_2_34_x86_64.whl", hash = "md5:13e4c0b018d45baadab44cf243942673" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.12.1a0/torch_rbln-0.12.1a0-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "md5:122521c30038549bb58bd13d4afe2587" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.12.1a0/torch_rbln-0.12.1a0-cp313-cp313-manylinux_2_34_x86_64.whl", hash = "md5:9c5f3a6f866657b9501f1e2a2e14cc78" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.12.1a0/torch_rbln-0.12.1a0-cp314-cp314-manylinux_2_34_x86_64.whl", hash = "md5:a7fd3c288758b69a5c6925072a2f0e1f" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.12.1a1/torch_rbln-0.12.1a1-cp310-cp310-manylinux_2_34_x86_64.whl", hash = "md5:93bfbb5046da5f8daa1e9f459bf4ef6b" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.12.1a1/torch_rbln-0.12.1a1-cp311-cp311-manylinux_2_34_x86_64.whl", hash = "md5:97fbe318aaeaa29abddcea8f176aa051" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.12.1a1/torch_rbln-0.12.1a1-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "md5:793a51177826a2ac2157d76aa762158d" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.12.1a1/torch_rbln-0.12.1a1-cp313-cp313-manylinux_2_34_x86_64.whl", hash = "md5:130b65a97cd565000765f27fbea9c536" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.12.1a1/torch_rbln-0.12.1a1-cp314-cp314-manylinux_2_34_x86_64.whl", hash = "md5:5fd6a680928176b61f02b4b4b92b4c98" },
 ]
 
 [[package]]
@@ -3642,7 +3631,7 @@ requires-dist = [
     { name = "setuptools-scm", marker = "extra == 'build'" },
     { name = "simphile", marker = "extra == 'dev'" },
     { name = "torch", index = "https://download.pytorch.org/whl/cpu" },
-    { name = "torch-rbln", marker = "platform_machine == 'x86_64'", specifier = ">=0.12.1a0,<0.12.2" },
+    { name = "torch-rbln", marker = "platform_machine == 'x86_64'", specifier = ">=0.12.1a1,<0.12.2" },
     { name = "torchaudio", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torchcodec", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torchvision", index = "https://download.pytorch.org/whl/cpu" },
