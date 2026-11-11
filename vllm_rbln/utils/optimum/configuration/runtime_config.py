@@ -33,6 +33,7 @@ from vllm_rbln.utils.optimum.registry import (
     is_pooling_arch,
 )
 
+from .compile_config import resolve_explicit_num_blocks
 from .rbln_config import (
     RblnConfigLike,
     get_field,
@@ -164,12 +165,10 @@ def prepare_runtime_config(
             "RBLN does not support prefix caching for mamba/hybrid models."
         )
         mamba_block_size = max_seq_len
+    explicit_num_blocks = resolve_explicit_num_blocks(vllm_config)
     if cache_config.num_gpu_blocks_override is not None:
-        num_blocks = (
-            additional_config.num_blocks_override
-            if additional_config.num_blocks_synced
-            else cache_config.num_gpu_blocks_override
-        )
+        assert explicit_num_blocks is not None
+        num_blocks = explicit_num_blocks
     return OptimumRBLNRuntimeConfig(
         max_num_seqs=batch_size,
         max_model_len=max_seq_len,
@@ -181,6 +180,12 @@ def prepare_runtime_config(
         model_num_blocks=num_blocks,
         num_devices_per_local_rank=num_devices,
         compiled_dtype=compiled_dtype,
+        gpu_memory_utilization=(
+            1.0
+            if explicit_num_blocks is not None
+            else cache_config.gpu_memory_utilization
+        ),
+        explicit_num_blocks=explicit_num_blocks,
         precompiled=precompiled,
     )
 
@@ -195,6 +200,17 @@ def apply_runtime_config(
     prefill_chunk_size = runtime_config.prefill_chunk_size
     compiled_dtype = runtime_config.compiled_dtype
     additional_config: OptimumRBLNConfig = vllm_config.additional_config
+    cache_config = vllm_config.cache_config
+    utilization = runtime_config.gpu_memory_utilization
+    if cache_config.gpu_memory_utilization != utilization:
+        logger.info(
+            "Setting gpu_memory_utilization from %s to %s because "
+            "an explicit KV cache block count=%d is set.",
+            cache_config.gpu_memory_utilization,
+            utilization,
+            runtime_config.explicit_num_blocks,
+        )
+        cache_config.gpu_memory_utilization = utilization
     if runtime_config.precompiled:
         additional_config.optimum_overrides = keep_device_overrides(
             additional_config.optimum_overrides

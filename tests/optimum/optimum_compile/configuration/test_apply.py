@@ -647,7 +647,7 @@ def test_prepared_settings_are_owned_and_applied_without_reading_metadata(
     assert cfg.model_config.max_model_len == 4096
     assert cfg.scheduler_config.max_num_batched_tokens == 256
     assert cfg.additional_config.num_devices_per_local_rank == 2
-    assert cfg.cache_config.gpu_memory_utilization == 0.9
+    assert cfg.cache_config.gpu_memory_utilization == 1.0
     assert cfg.model_config.dtype == (torch.bfloat16 if precompiled else torch.float32)
 
 

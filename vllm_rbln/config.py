@@ -221,6 +221,8 @@ class OptimumRBLNRuntimeConfig:
     model_num_blocks: int | None
     num_devices_per_local_rank: int
     compiled_dtype: torch.dtype | None
+    gpu_memory_utilization: float
+    explicit_num_blocks: int | None
     precompiled: bool
 
 

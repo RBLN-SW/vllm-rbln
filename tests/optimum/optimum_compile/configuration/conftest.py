@@ -54,6 +54,8 @@ def vllm_config_factory(compile_environment):
         num_devices_per_local_rank=1,
         mamba_block_size=None,
         hf_config=None,
+        num_gpu_blocks_override=None,
+        gpu_memory_utilization=0.9,
     ):
         additional_config = {
             "optimum_overrides": optimum_overrides or {},
@@ -79,10 +81,10 @@ def vllm_config_factory(compile_environment):
             ),
             cache_config=SimpleNamespace(
                 block_size=8192,
-                gpu_memory_utilization=0.9,
+                gpu_memory_utilization=gpu_memory_utilization,
                 user_specified_block_size=True,
                 enable_prefix_caching=prefix_caching,
-                num_gpu_blocks_override=None,
+                num_gpu_blocks_override=num_gpu_blocks_override,
                 user_specified_mamba_block_size=False,
                 mamba_block_size=mamba_block_size,
             ),

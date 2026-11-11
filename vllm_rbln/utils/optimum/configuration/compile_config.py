@@ -204,12 +204,52 @@ def default_prefill_chunk_size() -> int:
     )
 
 
+def resolve_explicit_num_blocks(vllm_config: VllmConfig) -> int | None:
+    """Resolve and validate user block counts before vLLM's block conversion."""
+    additional_config = vllm_config.additional_config
+    cache_config = vllm_config.cache_config
+    optimum_overrides = additional_config.optimum_overrides
+    num_gpu_blocks_override = (
+        additional_config.num_blocks_override
+        if additional_config.num_blocks_synced
+        else cache_config.num_gpu_blocks_override
+    )
+    num_blocks = read_language_model_fields(
+        optimum_overrides, "kvcache_num_blocks"
+    ).get("kvcache_num_blocks")
+    if num_blocks == 0:
+        num_blocks = None
+    if (
+        num_gpu_blocks_override is not None
+        and num_blocks is not None
+        and num_gpu_blocks_override != num_blocks
+    ):
+        raise ValueError(
+            "Conflicting KV cache block counts: "
+            f"num_gpu_blocks_override={num_gpu_blocks_override}, "
+            f"kvcache_num_blocks={num_blocks} in optimum_overrides. "
+            "Specify only one or use matching values."
+        )
+    if num_gpu_blocks_override is not None:
+        num_blocks = num_gpu_blocks_override
+    if num_blocks is not None and any(
+        source.get("memory_budget") is not None
+        for source in language_model_configs(optimum_overrides)
+    ):
+        raise ValueError(
+            "memory_budget cannot be set in optimum_overrides when an "
+            "explicit KV cache block count is specified."
+        )
+    return num_blocks
+
+
 def prepare_compile_config(vllm_config: VllmConfig) -> OptimumRBLNCompileConfig:
     """Resolve user settings into an owned config for cache lookup and compilation."""
     from vllm_rbln.platform import RblnPlatform
 
     model_config = vllm_config.model_config
     additional_config = vllm_config.additional_config
+    num_blocks = resolve_explicit_num_blocks(vllm_config)
 
     optimum_overrides = deepcopy(additional_config.optimum_overrides)
     if optimum_overrides.get("dtype") is not None:
@@ -236,6 +276,13 @@ def prepare_compile_config(vllm_config: VllmConfig) -> OptimumRBLNCompileConfig:
             f"Compilation is not implemented for architecture {architectures[0]}"
         )
 
+    explicit_decoder_blocks = num_blocks is not None and (
+        is_generation_arch(hf_config) or is_multi_modal(hf_config)
+    )
+    if explicit_decoder_blocks:
+        decoder_config = language_model_configs(rbln_config)[0]
+        del decoder_config["memory_budget"]
+
     # optimum_overrides must not overwrite fields vllm derives from its own
     # config (batch_size, max_seq_len, memory_budget, ...); a silent
     # mismatch would compile a model that disagrees with the runtime. Adding
@@ -248,6 +295,9 @@ def prepare_compile_config(vllm_config: VllmConfig) -> OptimumRBLNCompileConfig:
                 + "; ".join(conflicts)
             )
         merge_overrides(rbln_config, optimum_overrides)
+
+    if explicit_decoder_blocks:
+        decoder_config["kvcache_num_blocks"] = num_blocks
 
     return OptimumRBLNCompileConfig(
         model=str(model_config.model),
