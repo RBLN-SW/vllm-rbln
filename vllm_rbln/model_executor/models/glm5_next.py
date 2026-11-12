@@ -530,6 +530,12 @@ class RBLNGlm5NextKDA(nn.Module):
         for j, ((state, load, store, _), (qj, kj, vj)) in enumerate(
             zip(group_states, group_qkv)
         ):
+            state = state.view(
+                state.shape[0],
+                self.group_heads,
+                state.shape[1] // self.group_heads,
+                state.shape[2],
+            )
             channels = slice(j * group_channels, (j + 1) * group_channels)
             heads = slice(j * self.group_heads, (j + 1) * self.group_heads)
             gj, bj = g[:, heads], beta[:, heads]
