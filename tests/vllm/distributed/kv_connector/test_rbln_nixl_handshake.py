@@ -36,6 +36,7 @@ from unittest.mock import MagicMock, call, patch
 import msgspec
 import numpy as np
 import pytest
+import torch
 from vllm.distributed.kv_transfer.kv_connector.utils import EngineTransferInfo
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlBaseConnectorWorker,
@@ -73,11 +74,16 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
     ChunkGrid,
     Piece,
     RblnNixlWorkerState,
+    RegionGeometry,
+    block_rects,
     kv_chunk_tokens,
     pair_area,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.transfer import (
     _chunk_desc_ids,
+)
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_transfer_topology import (
+    RblnBlockTransferSpec,
 )
 
 
@@ -1822,10 +1828,41 @@ class TestShardLocalRegions:
         ids, cut = _split_plan([4, 5], 64, 2, 3)
         more, whole = _split_plan([6, 7], 64)
         w._register_shard_xfer_state(
-            "eng", 2, 16, ("l2", "l3"), plan=(ids + more, cut + whole)
+            "eng",
+            2,
+            16,
+            ("l2", "l3"),
+            plan=(ids + more, cut + whole),
+            peer_region_group_ids=[0] * w.num_regions,
         )
 
         assert w._shard_descs_per_block == {("eng", 2): (6, 6, 1, 1)}
+
+    def test_a_plan_entry_takes_the_group_of_the_peer_region_it_reads(self):
+        # A pipelined producer numbers its groups off its own stage, so the
+        # peer's groups differ from ours; #1381's trim pairs lists by them.
+        w = self._wired_worker()
+        w.kv_cache_config = MagicMock(transfer_groups=[object()])
+        w.src_xfer_handles_by_remote = {}
+        w._shard_region_group_ids = {}
+        w._shard_peer_region_group_ids = {}
+        w._shard_descs_per_block = {}
+        ids, cut = _split_plan([4, 5], 64, 2, 3)
+        more, whole = _split_plan([6, 7], 64)
+        peer_groups = [10 + i for i in range(w.num_regions)]
+
+        w._register_shard_xfer_state(
+            "eng",
+            2,
+            16,
+            ("l2", "l3"),
+            plan=(ids + more, cut + whole),
+            peer_region_group_ids=peer_groups,
+        )
+
+        expected = tuple(peer_groups[e[0].remote_region] for e in cut + whole)
+        assert w._shard_peer_region_group_ids[("eng", 2)] == expected
+        assert expected != w._shard_region_group_ids[("eng", 2)]
 
     @pytest.mark.parametrize(
         "sw_ratio, needs_own",
@@ -1878,7 +1915,12 @@ class TestShardLocalRegions:
         w._shard_descs_per_block = {}
 
         w._register_shard_xfer_state(
-            "eng", 2, 16, ("l2", "l3"), plan=_split_plan([4, 5, 6, 7], 64, 2, 3)
+            "eng",
+            2,
+            16,
+            ("l2", "l3"),
+            plan=_split_plan([4, 5, 6, 7], 64, 2, 3),
+            peer_region_group_ids=[0] * w.num_regions,
         )
 
         assert w._shard_descs_per_block == {("eng", 2): (6,) * 4}
@@ -1975,7 +2017,12 @@ class TestShardLocalRegions:
             RblnNixlPullConnectorWorker, "_shard_chunk_grid", return_value=None
         ):
             w._register_shard_xfer_state(
-                "eng", 2, 16, ("l2", "l3"), plan=_split_plan([4, 5, 6, 7], 64, 2)
+                "eng",
+                2,
+                16,
+                ("l2", "l3"),
+                plan=_split_plan([4, 5, 6, 7], 64, 2),
+                peer_region_group_ids=[0] * w.num_regions,
             )
 
         assert w.src_xfer_handles_by_remote == {("eng", 2, 16): 42}
@@ -4312,7 +4359,7 @@ class TestHeadMatchedDescriptorSweep:
                         meta, peer.tp_rank, peer.tp_size, peer_areas=peer_areas
                     ),
                     remote_tp_size=peer.tp_size,
-                    peer_region_group_ids=[0] * w.num_regions,
+                    peer_region_group_ids=meta.region_group_ids,
                 )
             local = w.nixl_wrapper.get_xfer_descs.call_args.args[0]
             _assert_shard_contract(
@@ -7981,6 +8028,9 @@ class TestBlockPayloadPairing:
                 RblnNixlPullConnectorWorker, "_regions_per_layer", return_value=1
             ),
             patch.object(
+                RblnNixlPullConnectorWorker, "_is_head_matched_peer", return_value=False
+            ),
+            patch.object(
                 RblnNixlPullConnectorWorker, "_layer_overlap", return_value=[(0, 0)]
             ),
         ):
@@ -8022,3 +8072,462 @@ class TestShardPeerGroupIds:
         )
 
         assert ids == (4, 3)
+
+
+def _glm53_config(block_size=1024):
+    """GLM-5.3-Flash's KDA fields, as the backend reads them."""
+    return SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(
+                model_type="glm5_next_text",
+                linear_num_heads=64,
+                linear_head_dim=128,
+                kv_lora_rank=512,
+            ),
+            dtype=torch.bfloat16,
+        ),
+        cache_config=SimpleNamespace(block_size=block_size),
+    )
+
+
+class TestKdaPairsByHeadGroupEndToEnd:
+    """GLM-5.3's KDA layer with the real numbers, through the plan a peer of
+    another TP degree gets: 64 heads, a 1024-token page holding 16 of them, so
+    the TP1 producer registers four state caches a layer and a TP4 rank one,
+    each beside its conv ring and its MTP draft, every cache over four chiplet
+    slices. The KDA group counts and cache names are the backend's own."""
+
+    PREFIX = "model.layers.0.self_attn"
+    QUARTER = 128 * 1024
+    STATE = RblnBlockTransferSpec(1024, 1024 * 512, 64, 128 * 128 * 2)
+    # (taps, q / k / v of every group, 32 x 64 lanes) bf16, a run per row.
+    RING_TP1 = RblnBlockTransferSpec(1024, 4 * 12 * 32 * 64 * 2, 64, 256, 48)
+    RING_TP4 = RblnBlockTransferSpec(1024, 4 * 3 * 32 * 64 * 2, 64, 256, 12)
+    # (16 heads, one draft, 4, 128) bf16, K=1.
+    DRAFT = RblnBlockTransferSpec(1024, 16 * 4 * 128 * 2, 64, 4 * 128 * 2)
+    DRAFT_QUARTER = 4 * 4 * 128 * 2
+
+    @classmethod
+    def _side(cls, tp_size):
+        groups = 4 // tp_size
+        names = [f"{cls.PREFIX}.attn.{k}" for k in range(2 * groups + 1)]
+        ring = cls.RING_TP1 if tp_size == 1 else cls.RING_TP4
+        specs = [cls.STATE] * groups + [ring] + [cls.DRAFT] * groups
+        return names, specs, groups
+
+    @classmethod
+    def _worker(cls, cls_, tp_rank, tp_size):
+        names, specs, groups = cls._side(tp_size)
+        w = object.__new__(cls_)
+        w.tp_rank = tp_rank
+        w.use_host_buffer = False
+        w.vllm_config = _glm53_config()
+        w.transfer_topo = SimpleNamespace(
+            tp_size=tp_size,
+            total_num_kv_heads=64,
+            tp_ratio=lambda r: tp_size // r if tp_size >= r else -(r // tp_size),
+        )
+        w.local_seen_layer_names = list(names)
+        w._kv_areas = 4
+        w.num_regions = 4 * len(names)
+        w.region_names = [name for name in names for _ in range(4)]
+        w._block_state_layers = set(names[:groups])
+        w._block_aux_specs = {names[groups]: SimpleNamespace(owner=names[0])} | {
+            names[groups + 1 + j]: SimpleNamespace(owner=names[j])
+            for j in range(groups)
+        }
+        w._logical_region_block_spec = specs
+        w._logical_region_kv_heads = [None] * len(names)
+        w._logical_region_latent = [False] * len(names)
+        w._logical_region_geometry = [
+            RegionGeometry(
+                ChipletSplitAxis.BLOCK,
+                4,
+                tuple(AreaPlace(0, spec.page_size_bytes // 4, sid) for sid in range(4)),
+            )
+            for spec in specs
+        ]
+        return w
+
+    @classmethod
+    def _meta(cls, tp_size):
+        names, specs, _ = cls._side(tp_size)
+        return _agent_meta(
+            region_names=[name for name in names for _ in range(4)],
+            kv_caches_base_addr=[0x1000 * (i + 1) for i in range(4 * len(names))],
+            block_lens=[spec.page_size_bytes // 4 for spec in specs for _ in range(4)],
+            kv_areas=4,
+            kv_slices=4,
+            kv_split_axes=[ChipletSplitAxis.BLOCK] * len(names),
+            block_size=1024,
+        )
+
+    @staticmethod
+    def _plan(w, meta, remote_rank, remote_tp):
+        renamed = w._peer_kda_names(meta, remote_rank, remote_tp)
+        return w._head_matched_plan(
+            renamed,
+            remote_rank,
+            remote_tp,
+            registered_layer_names=renamed.registered_layer_names,
+            peer_areas=w._fan_in_peer_areas(remote_rank, remote_tp),
+        )
+
+    @classmethod
+    def _ring_runs(cls, rank):
+        """(our run, the TP4 rank's run) of each q / k / v row, per tap."""
+        ours = (2 * rank, 2 * rank + 1, 8 + rank)
+        return [
+            (tap * 12 + ours[kind], tap * 3 + kind)
+            for tap in range(4)
+            for kind in range(3)
+        ]
+
+    @classmethod
+    def _tp1_plan(cls, rank):
+        """The TP1 side's plan with TP4 rank `rank`, whichever side moves the
+        bytes: every area of that group's state and draft, its ring runs."""
+        return (
+            [
+                (rank * 4 + area, [Piece(0, area, 0, cls.QUARTER, 4, (0, 1))])
+                for area in range(4)
+            ]
+            + [
+                (
+                    16 + area,
+                    [
+                        Piece(ours * 1024, 4 + area, theirs * 1024, 1024, 1, (0, 1))
+                        for ours, theirs in cls._ring_runs(rank)
+                    ],
+                )
+                for area in range(4)
+            ]
+            + [
+                (
+                    (5 + rank) * 4 + area,
+                    [Piece(0, 8 + area, 0, cls.DRAFT_QUARTER, 4, (0, 1))],
+                )
+                for area in range(4)
+            ]
+        )
+
+    @classmethod
+    def _tp4_plan(cls, rank):
+        """TP4 rank `rank`'s plan with the TP1 side, the same pairs seen from it."""
+        return (
+            [
+                (area, [Piece(0, rank * 4 + area, 0, cls.QUARTER, 4, (0, 1))])
+                for area in range(4)
+            ]
+            + [
+                (
+                    4 + area,
+                    [
+                        Piece(theirs * 1024, 16 + area, ours * 1024, 1024, 1, (0, 1))
+                        for ours, theirs in cls._ring_runs(rank)
+                    ],
+                )
+                for area in range(4)
+            ]
+            + [
+                (
+                    8 + area,
+                    [Piece(0, (5 + rank) * 4 + area, 0, cls.DRAFT_QUARTER, 4, (0, 1))],
+                )
+                for area in range(4)
+            ]
+        )
+
+    @classmethod
+    def _handshaken(cls, cls_, tp_rank, tp_size, remote_tp):
+        """The plan of every peer rank the real handshake loop registers."""
+        ratio = (
+            tp_size // remote_tp if tp_size >= remote_tp else -(remote_tp // tp_size)
+        )
+        w = _make_worker(
+            tp_ratio=ratio,
+            tp_target_ranks=tuple(range(remote_tp)) if ratio < 0 else (0,),
+            host_buffer=False,
+            cls=cls_,
+        )
+        kda = cls._worker(cls_, tp_rank, tp_size)
+        for name in (
+            "tp_rank",
+            "vllm_config",
+            "local_seen_layer_names",
+            "_kv_areas",
+            "num_regions",
+            "region_names",
+            "_block_state_layers",
+            "_block_aux_specs",
+            "_logical_region_block_spec",
+            "_logical_region_kv_heads",
+            "_logical_region_latent",
+            "_logical_region_geometry",
+        ):
+            setattr(w, name, getattr(kda, name))
+        w.vllm_config.parallel_config = SimpleNamespace(pipeline_parallel_size=1)
+        w.transfer_topo.tp_size = tp_size
+        w.transfer_topo.total_num_kv_heads = 64
+        plans = {}
+
+        def register(meta, rank, remote_tp_size, dcp_size, registered_layer_names):
+            plans[rank] = list(
+                zip(
+                    *w._head_matched_plan(
+                        meta,
+                        rank,
+                        remote_tp_size,
+                        registered_layer_names=registered_layer_names,
+                        peer_areas=w._fan_in_peer_areas(rank, remote_tp_size),
+                    )
+                )
+            )
+            return f"agent-{rank}"
+
+        w._add_remote_agent_head_matched = register
+        meta = cls._meta(remote_tp)
+        with (
+            patch.object(cls_, "_query_agent_meta", lambda *_: (meta, 0.0, 0.0)),
+            _patched_socket(_FakeSock(pp_size=1)),
+        ):
+            w._nixl_handshake("h", 1234, remote_tp, "eng")
+        return plans
+
+    @pytest.mark.parametrize("rank", range(4))
+    def test_the_producer_writes_every_area_of_the_rank_s_group(self, rank):
+        w = self._worker(RblnNixlPushConnectorWorker, 0, 1)
+
+        region_ids, plans = self._plan(w, self._meta(4), rank, 4)
+
+        assert list(zip(region_ids, plans)) == self._tp1_plan(rank)
+
+    @classmethod
+    def _checked(cls, specs=None):
+        w = cls._worker(RblnNixlPullConnectorWorker, 0, 4)
+        if specs is not None:
+            w._logical_region_block_spec = specs
+        w.block_size = 1024
+        set_shape(w, chunk_mode=False)
+        w._kv_per_block = 1
+        w._window_grid_cut = None
+        w.block_len_per_layer = [0] * w.num_regions
+        return w
+
+    def test_banded_block_payloads_pair_across_tp(self):
+        self._checked()._check_d2d_region_pairing(self._meta(1), 1)
+
+    def test_a_block_payload_without_a_band_is_refused_across_tp(self):
+        unbanded = RblnBlockTransferSpec(1024, 1024 * 512)
+        w = self._checked([unbanded, self.RING_TP4])
+
+        with pytest.raises(RuntimeError, match="unless every one of them is banded"):
+            w._check_d2d_region_pairing(self._meta(1), 1)
+
+    def test_a_plan_refusal_leaves_the_peer_unregistered(self):
+        # Upstream swallows a handshake exception, so a raise after the peer
+        # is registered would leave it registered.
+        w = self._worker(RblnNixlPullConnectorWorker, 0, 4)
+        w._remote_agents = {}
+        w.nixl_wrapper = MagicMock()
+        w._register_remote_engine_prelude = MagicMock()
+        meta = self._meta(1)
+        meta.kv_split_axes = [ChipletSplitAxis.HEAD] + meta.kv_split_axes[1:]
+        renamed = w._peer_kda_names(meta, 0, 1)
+        with (
+            patch.object(RblnNixlPullConnectorWorker, "_check_mla_constraints"),
+            patch.object(RblnNixlPullConnectorWorker, "_check_d2d_region_pairing"),
+            patch.object(RblnNixlPullConnectorWorker, "_check_split_axis_constraints"),
+            patch.object(
+                RblnNixlPullConnectorWorker, "_peer_band", return_value=(4, 4)
+            ),
+            pytest.raises(RuntimeError, match="is a block payload here"),
+        ):
+            w._add_remote_agent_head_matched(
+                renamed, 0, 1, registered_layer_names=renamed.registered_layer_names
+            )
+
+        w._register_remote_engine_prelude.assert_not_called()
+        w.nixl_wrapper.add_remote_agent.assert_not_called()
+
+    @pytest.mark.parametrize("rank", range(4))
+    def test_a_rank_reads_every_area_of_its_group_from_the_producer(self, rank):
+        w = self._worker(RblnNixlPullConnectorWorker, rank, 4)
+
+        region_ids, plans = self._plan(w, self._meta(1), 0, 1)
+
+        assert list(zip(region_ids, plans)) == self._tp4_plan(rank)
+
+    @pytest.mark.parametrize("rank", range(4))
+    def test_a_tp1_decoder_reads_every_area_of_each_group_from_its_rank(self, rank):
+        # The pull mirror of the push case: the reader holds fewer ranks, so
+        # the area filter applies to it and must not narrow a KDA cache.
+        w = self._worker(RblnNixlPullConnectorWorker, 0, 1)
+
+        region_ids, plans = self._plan(w, self._meta(4), rank, 4)
+
+        assert list(zip(region_ids, plans)) == self._tp1_plan(rank)
+
+    @pytest.mark.parametrize("rank", range(4))
+    def test_a_tp4_producer_writes_every_area_of_its_group_into_a_tp1_peer(self, rank):
+        w = self._worker(RblnNixlPushConnectorWorker, rank, 4)
+
+        region_ids, plans = self._plan(w, self._meta(1), 0, 1)
+
+        assert list(zip(region_ids, plans)) == self._tp4_plan(rank)
+
+    @pytest.mark.parametrize("rank", range(4))
+    def test_the_handshake_hands_a_tp4_reader_its_group_s_caches(self, rank):
+        # Through the loop that renames the peer's KDA caches: the TP1
+        # producer's `attn.1` is a state cache, a TP4 rank's is its conv ring.
+        plans = self._handshaken(RblnNixlPullConnectorWorker, rank, 4, 1)
+
+        assert plans == {0: self._tp4_plan(rank)}
+
+    def test_the_handshake_hands_a_tp1_writer_every_rank_s_group(self):
+        plans = self._handshaken(RblnNixlPushConnectorWorker, 0, 1, 4)
+
+        assert plans == {rank: self._tp1_plan(rank) for rank in range(4)}
+
+
+class TestABlockPayloadPairsAcrossTp:
+    """Block payloads between a TP1 producer and a TP4 consumer over four chiplet
+    slices, through `block_rects` and `pair_area` alone. The conv ring is twelve
+    runs (ring row x q / k / v), an area a lane slice of each. A payload every
+    rank holds alike pairs whole."""
+
+    STATE = RblnBlockTransferSpec(4096, 4096 * 512, 64, 128 * 128 * 2)
+    CONV = RblnBlockTransferSpec(4096, 4 * 3 * 32 * 64 * 2, 64, 256, 12)
+    TAIL = RblnBlockTransferSpec(4096, 4 * 256 * 2)
+    SLICES = [0, 1, 2, 3]
+
+    def _pair(self, spec, area_len_l, area_len_r, rank, kv_per_block, slices=None):
+        slices = slices or self.SLICES
+        ours = block_rects(spec, slices, area_len_l, rank, 4)
+        theirs = block_rects(spec, slices, area_len_r, 0, 1)
+        peer = [(a, w.rect, w.length) for a, w in enumerate(theirs)]
+        out = []
+        for area, w in enumerate(ours):
+            pieces = pair_area(
+                w.rect,
+                w.length,
+                peer,
+                kv_per_block=kv_per_block,
+                every_holder=False,
+                region_id=area,
+            )
+            out.append(pieces)
+        return out
+
+    @pytest.mark.parametrize("rank", range(4))
+    def test_a_ring_slice_takes_its_heads_out_of_every_run(self, rank):
+        pieces = self._pair(self.CONV, 12288, 49152, rank, 12)
+        assert pieces == [
+            [
+                Piece(run * 1024, rank, run * 4096 + area * 1024, 1024, 4, (0, 1))
+                for run in range(12)
+            ]
+            for area in range(4)
+        ]
+
+    def test_a_payload_every_rank_holds_is_read_whole_from_the_first_replica(self):
+        pieces = self._pair(self.TAIL, 2048, 2048, 2, 1, slices=[0] * 4)
+        assert pieces == [[Piece(0, 0, 0, 2048, 1, (0, 2048))]] * 4
+
+    def test_heads_a_slice_cannot_cut_evenly_are_refused(self):
+        with pytest.raises(RuntimeError, match="do not cut evenly"):
+            block_rects(self.STATE, self.SLICES, 512 * 1024, 0, 32)
+
+
+class TestAKdaHeadGroupPairsAcrossTp:
+    """GLM-5.3 at a 1024-token block between a TP1 producer and a TP4 consumer. A
+    page holds 16 KDA heads, so the producer splits its 64 into four state caches
+    a layer and the consumer keeps one; the conv ring holds q / k of every group
+    and then v of every group, a run each, per tap."""
+
+    STATE = RblnBlockTransferSpec(1024, 1024 * 512, 64, 128 * 128 * 2)
+    CONV = RblnBlockTransferSpec(1024, 4 * 3 * 32 * 64 * 2, 64, 256, 12)
+    SLICES = [0, 1, 2, 3]
+    QUARTER = 128 * 1024
+
+    @staticmethod
+    def _worker(tp_rank, state_layers=()):
+        w = object.__new__(RblnNixlPullConnectorWorker)
+        w.tp_rank = tp_rank
+        w.transfer_topo = SimpleNamespace(tp_size=4)
+        w.vllm_config = _glm53_config()
+        w._block_state_layers = set(state_layers)
+        w._writes_into_peer = False
+        return w
+
+    @pytest.mark.parametrize("rank", range(4))
+    def test_a_state_reads_the_producer_cache_of_its_head_group(self, rank):
+        ours = block_rects(self.STATE, self.SLICES, self.QUARTER, rank, 4, 16 * rank)
+        theirs = block_rects(self.STATE, self.SLICES, self.QUARTER, 0, 1, 16 * rank)
+        peer = [(a, w.rect, w.length) for a, w in enumerate(theirs)]
+        pieces = [
+            pair_area(
+                w.rect,
+                w.length,
+                peer,
+                kv_per_block=1,
+                every_holder=False,
+                region_id=area,
+            )
+            for area, w in enumerate(ours)
+        ]
+        assert pieces == [
+            [Piece(0, area, 0, self.QUARTER, 4, (0, 1))] for area in range(4)
+        ]
+
+    @pytest.mark.parametrize("rank", range(4))
+    def test_a_ring_run_reads_its_group_s_run_of_the_producer(self, rank):
+        w = self._worker(rank)
+        w._block_spec = lambda logical: self.CONV
+        w._logical_region_geometry = [
+            RegionGeometry(
+                ChipletSplitAxis.BLOCK,
+                4,
+                tuple(AreaPlace(0, 12288, sid) for sid in self.SLICES),
+            )
+        ]
+        meta = SimpleNamespace(kv_area_slices=[self.SLICES], block_lens=[49152] * 4)
+
+        pieces = w._conv_ring_pieces(meta, 0, 0, 0, 1)
+
+        peer_run = (2 * rank, 2 * rank + 1, 8 + rank)
+        assert pieces == [
+            [
+                Piece(
+                    (tap * 3 + kind) * 1024,
+                    area,
+                    (tap * 12 + peer_run[kind]) * 1024,
+                    1024,
+                    1,
+                    (0, 1),
+                )
+                for tap in range(4)
+                for kind in range(3)
+            ]
+            for area in range(4)
+        ]
+
+    def test_the_producer_s_caches_take_the_names_of_ours(self):
+        layer = "model.layers.1.self_attn"
+        w = self._worker(2, state_layers=[f"{layer}.attn.0"])
+        names = [f"{layer}.attn.{k}" for k in range(5)]
+        meta = _agent_meta(
+            region_names=["model.layers.0.self_attn.attn.3", *names],
+            block_lens=[8192] * 6,
+        )
+
+        renamed = w._peer_kda_names(meta, 0, 1).region_names
+
+        assert renamed == [
+            "model.layers.0.self_attn.attn.3",
+            f"{layer}.attn.0@0",
+            f"{layer}.attn.1@0",
+            f"{layer}.attn.0",
+            f"{layer}.attn.3@0",
+            f"{layer}.attn.1",
+        ]
