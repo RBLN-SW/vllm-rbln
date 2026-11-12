@@ -74,6 +74,8 @@ def _layer():
         head_v_dim=HEAD_DIM,
         conv_kernel_size=KERNEL,
         conv_dim=CONV_DIM,
+        num_drafts=0,
+        drafts=None,
     )
     layer.in_proj_qkvz = _Proj(HIDDEN, CONV_DIM + VALUE_DIM, bias=False)
     layer.in_proj_ba = _Proj(HIDDEN, 2 * HEADS_V, bias=False)
@@ -155,9 +157,18 @@ def vllm_config():
 
 
 def _run(
-    layer, vllm_config, builder, state, hidden, common, positions, is_prefill, pad
+    layer,
+    vllm_config,
+    builder,
+    state,
+    hidden,
+    common,
+    positions,
+    is_prefill,
+    pad,
+    **window,
 ):
-    metadata = builder.build(common, positions, pad, is_prefill)
+    metadata = builder.build(common, positions, pad, is_prefill, **window)
     # What the runner attaches to every step's metadata (attach_kv_cache_bindings).
     metadata.kv_caches = [state]
     metadata.kv_cache_view_infos = None
@@ -253,6 +264,114 @@ def test_padded_prefill_then_decode_tracks_hf(vllm_config):
     assert not ring[BLOCK - 1].any() and not ring[BLOCK + 1].any()
 
 
+def _decoded(vllm_config, num_drafts: int, windows):
+    """A 70-token prefill, then `windows` of (tokens, position, valid tokens,
+    drafts of the window before that were accepted) on a bfloat16 layer, the
+    16-bit activations the verify kernel takes. Returns each window's outputs
+    and the state it left."""
+    layer = _layer()
+    # A slow decay, so a token missing from the state shows.
+    layer.A_log = torch.full((HEADS_V,), -3.0)
+    dtype = torch.bfloat16
+    state = torch.zeros(NUM_BLOCKS, *KV_BLOCK, dtype=dtype)
+    ring = torch.zeros(
+        NUM_BLOCKS, KERNEL - 1 + num_drafts, 1, CONV_DIM // 64, 64, dtype=dtype
+    )
+    device_layer = _grouped(layer, ring)
+    for name in ("in_proj_qkvz", "in_proj_ba", "norm", "out_proj"):
+        getattr(device_layer, name).to(dtype)
+    device_layer.num_drafts = num_drafts
+    if num_drafts:
+        ratio = HEADS_V // HEADS_K
+        drafts = torch.zeros(
+            NUM_BLOCKS, HEADS_K, 2 * ratio + 1, num_drafts, HEAD_DIM, dtype=dtype
+        )
+        device_layer.drafts = SimpleNamespace(inputs=lambda: drafts)
+    vllm_config.compilation_config.static_forward_context[PREFIX] = device_layer
+    spec = MambaSpec(
+        block_size=vllm_config.model_config.max_model_len,
+        shapes=(KV_BLOCK,),
+        dtypes=(dtype,),
+    )
+    with set_current_vllm_config(vllm_config):
+        builder = RBLNGDNAttentionMetadataBuilder(
+            spec, [PREFIX], vllm_config, torch.device("cpu")
+        )
+    torch.manual_seed(1)
+    hidden = torch.zeros(1, CHUNK, HIDDEN, dtype=dtype)
+    hidden[:, :70] = torch.randn(1, 70, HIDDEN)
+    _run(
+        device_layer,
+        vllm_config,
+        builder,
+        state,
+        hidden,
+        _common(70, 70),
+        torch.arange(CHUNK),
+        True,
+        1,
+    )
+    outputs, states = [], []
+    for tokens, position, valid, accepted in windows:
+        width = tokens.shape[0]
+        hidden = torch.zeros(2, width, HIDDEN, dtype=dtype)
+        hidden[0] = tokens
+        window = {}
+        if num_drafts:
+            window = {
+                "back_pad": torch.tensor([width - valid]),
+                "num_accepted": torch.tensor([accepted]),
+            }
+        out = _run(
+            device_layer,
+            vllm_config,
+            builder,
+            state,
+            hidden,
+            _common(width, position + valid),
+            torch.arange(position, position + width),
+            False,
+            2,
+            **window,
+        )
+        outputs.append(out[0].float())
+        states.append(_ssm_state(state))
+    return outputs, states
+
+
+def test_verify_steps_stand_for_the_decode_steps_of_their_accepted_tokens(
+    vllm_config,
+):
+    """An MTP step takes a confirmed token and two drafts, keeps the state
+    after the confirmed token only and replays the accepted drafts on the next
+    step, so a rejected draft leaves no trace in the state or the conv ring."""
+    torch.manual_seed(2)
+    x = torch.randn(5, HIDDEN)
+    wrong = torch.randn(2, HIDDEN)
+    pad = torch.zeros(HIDDEN)
+    plain, plain_states = _decoded(
+        vllm_config, 0, [(x[i : i + 1], 70 + i, 1, 0) for i in range(5)]
+    )
+    verified, verified_states = _decoded(
+        vllm_config,
+        2,
+        [
+            # The first decode step carries no draft.
+            (torch.stack([x[0], pad, pad]), 70, 1, 0),
+            # x[2] is accepted, the draft after it rejected.
+            (torch.stack([x[1], x[2], wrong[0]]), 71, 3, 0),
+            (torch.stack([x[3], x[4], wrong[1]]), 73, 3, 1),
+        ],
+    )
+    close = {"atol": 1e-2, "rtol": 0}
+    torch.testing.assert_close(verified[0][:1], plain[0], **close)
+    torch.testing.assert_close(verified[1][:2], torch.cat(plain[1:3]), **close)
+    torch.testing.assert_close(verified[2][:2], torch.cat(plain[3:5]), **close)
+    # The state after x[0], x[1] and x[3]: each window's confirmed token.
+    for window, step in enumerate((0, 1, 3)):
+        torch.testing.assert_close(verified_states[window], plain_states[step], **close)
+
+
 def test_forward_without_metadata_is_an_error(vllm_config):
     layer = _layer()
     with (
@@ -281,6 +400,21 @@ class TestStateSpec:
         assert layer.get_state_shape() == ((2, 4, 1, 256, 256),)
         # The activation dtype: the kernels take no other.
         assert layer.get_state_dtype() == (torch.bfloat16,)
+
+    def test_the_state_takes_no_block_a_draft(self):
+        layer = self._layer()
+        vllm_config = SimpleNamespace(
+            cache_config=SimpleNamespace(
+                mamba_block_size=8192,
+                mamba_page_size_padded=None,
+                mamba_cache_mode="none",
+                use_kda_recoverssm=False,
+            ),
+            num_speculative_tokens=3,
+        )
+        # Upstream keeps a state block a draft; the RBLN verify kernel keeps the
+        # drafts in the layer's draft buffer instead.
+        assert layer.get_kv_cache_spec(vllm_config).num_speculative_blocks == 0
 
     def test_a_cache_dtype_option_does_not_move_the_state_dtype(self):
         layer = self._layer()

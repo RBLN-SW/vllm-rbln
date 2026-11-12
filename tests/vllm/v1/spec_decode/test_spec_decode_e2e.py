@@ -14,7 +14,7 @@
 
 # Speculative decoding is a pure optimization: drafts are verified against the
 # target, so greedy output with a method ON must equal spec OFF. Covers ngram,
-# suffix, eagle, eagle3 and medusa.
+# suffix, eagle, eagle3, medusa and mtp.
 
 import warnings
 
@@ -76,12 +76,19 @@ SPEC_METHODS = {
         {"max_model_len": 2048},
         {"method": "medusa", "model": MEDUSA_DRAFT, "num_speculative_tokens": 3},
     ),
+    # The target's own MTP head; text-only, at the block size a GatedDeltaNet
+    # state fills a full-attention page (as basic_correctness runs the model).
+    "mtp": (
+        "Qwen/Qwen3.5-4B",
+        {"language_model_only": True, "block_size": 256},
+        {"method": "mtp", "num_speculative_tokens": 3},
+    ),
 }
 
 # Methods whose draft path should land accepted tokens on the repetitive prompt.
 # medusa is excluded: its only small ungated checkpoint is random-init, so
 # acceptance there would measure model quality, not the code path.
-_EXPECT_ACCEPTANCE = {"ngram", "suffix", "eagle", "eagle3"}
+_EXPECT_ACCEPTANCE = {"ngram", "suffix", "eagle", "eagle3", "mtp"}
 
 
 @pytest.fixture(autouse=True)
@@ -112,9 +119,13 @@ def _pin_aux_layers(request, monkeypatch):
 @pytest.mark.model_compile
 @pytest.mark.parametrize("method", SPEC_METHODS)
 def test_speculative_decoding_matches_reference(
-    vllm_runner, method: str, whole_model: bool
+    vllm_runner, method: str, whole_model: bool, monkeypatch
 ) -> None:
     target, extra_kwargs, spec_config = SPEC_METHODS[method]
+    if method == "mtp":
+        # TODO(rebel-compiler): drop with basic_correctness's Qwen3.5 entry, once
+        # rolling its GDN layers passes RblnTensorUnrollLayerLoop.
+        monkeypatch.setenv("VLLM_RBLN_USE_NESTED_COMPILE_REGION", "0")
     if draft := spec_config.get("model"):
         spec_config = {**spec_config, "model": local_weights_path(draft)}
 

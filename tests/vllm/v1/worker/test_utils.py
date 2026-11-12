@@ -1921,14 +1921,19 @@ class TestRescaleKvCacheConfig:
 
 
 class TestGatedDeltaNetCacheIndices:
-    def test_a_layer_owns_a_state_and_a_conv_ring_slot(self):
-        # Two cache slots a layer: the recurrent state at the layer's own slot,
-        # its conv ring at the next, and an attention layer's cache at the first.
+    def test_a_layer_owns_a_state_a_conv_ring_and_a_draft_slot(self):
+        # Three cache slots a layer: the recurrent state at the layer's own slot,
+        # its conv ring at the next, its MTP draft buffer at the third, and an
+        # attention layer's cache at the first.
         config = SimpleNamespace(hf_config=SimpleNamespace(model_type="qwen3_5_text"))
-        assert worker_utils.num_attn_module(config, "auto") == 2
-        assert worker_utils.extract_layer_index("model.layers.3.linear_attn", 2) == 6
+        assert worker_utils.num_attn_module(config, "auto") == 3
+        assert worker_utils.extract_layer_index("model.layers.3.linear_attn", 3) == 9
         assert (
-            worker_utils.extract_layer_index("model.layers.3.linear_attn.conv_ring", 2)
-            == 7
+            worker_utils.extract_layer_index("model.layers.3.linear_attn.conv_ring", 3)
+            == 10
         )
-        assert worker_utils.extract_layer_index("model.layers.3.self_attn.attn", 2) == 6
+        assert (
+            worker_utils.extract_layer_index("model.layers.3.linear_attn.drafts", 3)
+            == 11
+        )
+        assert worker_utils.extract_layer_index("model.layers.3.self_attn.attn", 3) == 9

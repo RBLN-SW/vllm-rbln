@@ -299,6 +299,16 @@ class TestInitGuards:
         proposer = make_eagle_proposer()
         assert proposer.supports_mm_inputs
 
+    def test_an_mrope_draft_keeps_one_row_of_positions(self, monkeypatch):
+        from vllm.config import ModelConfig
+
+        # Upstream allocates the M-RoPE rows only for such a draft (Qwen3.5's
+        # MTP head); a text-only draft step reads one row.
+        monkeypatch.setattr(ModelConfig, "uses_mrope", property(lambda self: True))
+        monkeypatch.setattr(ModelConfig, "mrope_num_dims", property(lambda self: 3))
+        proposer = make_eagle_proposer()
+        assert proposer.positions.shape == (proposer.max_positions,)
+
     def test_rejects_extra_input_slots(self, monkeypatch):
         # Parallel drafting / draft-model spec decode needs input slots the
         # staged drafter inputs have no room for; construction, not the first
