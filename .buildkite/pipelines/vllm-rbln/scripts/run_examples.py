@@ -39,15 +39,17 @@ from vllm_rbln import envs as rbln_envs
 ROOT = Path(__file__).resolve().parents[4]
 EXAMPLES = ROOT / "examples/vllm"
 SPECDEC = "features/speculative_decoding/"
-GROUPS = ("basic", "features", "specdec", "mtp", "dflash", "pooling")
-DEVICES = {"features": 4, "mtp": 8, "dflash": 4}
+EC_DISAGG = "features/ec_disagg/"
+GROUPS = ("basic", "features", "specdec", "mtp", "dflash", "pooling", "ec_disagg")
+DEVICES = {"features": 4, "mtp": 8, "dflash": 4, "ec_disagg": 5}
 
 
 @dataclass(frozen=True)
 class Example:
     path: Path
     args: tuple[str, ...] = ()
-    serve: tuple[str, ...] = ()
+    # Started together; the last one's /health gates the clients.
+    serve: tuple[tuple[str, ...], ...] = ()
 
     @property
     def name(self) -> str:
@@ -64,13 +66,15 @@ def collect(group: str) -> list[Example]:
     directory = EXAMPLES / (
         "features/speculative_decoding"
         if group in ("specdec", "mtp", "dflash")
+        else EC_DISAGG
+        if group == "ec_disagg"
         else group
     )
     cases = []
     guard = ast.dump(ast.parse("__name__ == '__main__'", mode="eval").body)
     for path in sorted(directory.rglob("*.py")):
         relative = path.relative_to(EXAMPLES).as_posix()
-        if group == "features" and relative.startswith(SPECDEC):
+        if group == "features" and relative.startswith((SPECDEC, EC_DISAGG)):
             continue
         if group in ("specdec", "mtp", "dflash"):
             filename = (
@@ -90,7 +94,16 @@ def collect(group: str) -> list[Example]:
         commands = re.findall(r"(?m)^([ \t]+vllm serve[^\n]*(?:\n[ \t]+[^\n]+)*)", doc)
         if len(commands) > 1 or ("vllm serve" in doc and not commands):
             raise ValueError(f"{relative}: expected one indented vllm serve command")
-        serve = tuple(shlex.split(commands[0].replace("\\\n", ""))) if commands else ()
+        serve = (
+            (tuple(shlex.split(commands[0].replace("\\\n", ""))),) if commands else ()
+        )
+        if group == "ec_disagg":
+            # The proxy's /health is 200 only once the producer and the
+            # consumer it fronts both answer theirs.
+            serve = tuple(
+                ("bash", str(directory / f"serve_ec_{role}.sh"))
+                for role in ("producer", "consumer", "proxy")
+            )
         if group == "specdec":
             cases.extend(
                 Example(path, ("--method", method))
@@ -150,8 +163,8 @@ def main() -> int:
     if args.list:
         for case in cases:
             print(case.name)
-            if case.serve:
-                print(f"  server: {shlex.join(case.serve)}")
+            for command in case.serve:
+                print(f"  server: {shlex.join(command)}")
             print(f"  client: {shlex.join(case.command)}")
         print(f"Total: {len(cases)} cases")
         return 0
@@ -180,30 +193,42 @@ def main() -> int:
             f"client-{client_index}": case.command
             for client_index, case in enumerate(clients)
         }
-        if serve:
-            commands = {"serve": list(serve)} | commands
+        commands = {
+            f"serve-{server_index}": list(command)
+            for server_index, command in enumerate(serve)
+        } | commands
         print(write_repro(launch, {}, commands), flush=True)
         with contextlib.ExitStack() as stack:
             if serve:
                 try:
-                    server = stack.enter_context(
-                        process(list(serve), launch / "server.log", env)
-                    )
+                    servers = [
+                        stack.enter_context(
+                            process(
+                                list(command),
+                                launch / f"server-{server_index}.log",
+                                env,
+                            )
+                        )
+                        for server_index, command in enumerate(serve)
+                    ]
+                    gate = serve[-1]
                     host = (
-                        serve[serve.index("--host") + 1]
-                        if "--host" in serve
+                        gate[gate.index("--host") + 1]
+                        if "--host" in gate
                         else "localhost"
                     )
                     port = "8000"
                     for flag in ("--port", "-p"):
-                        if flag in serve:
-                            port = serve[serve.index(flag) + 1]
+                        if flag in gate:
+                            port = gate[gate.index(flag) + 1]
                     deadline = time.monotonic() + args.timeout
                     while True:
-                        if server.poll() is not None:
-                            raise RuntimeError(
-                                f"Server exited with code {server.returncode}"
-                            )
+                        for server in servers:
+                            if server.poll() is not None:
+                                raise RuntimeError(
+                                    f"Server {shlex.join(server.args)} exited"
+                                    f" with code {server.returncode}"
+                                )
                         if time.monotonic() >= deadline:
                             raise TimeoutError(
                                 f"Server was not ready within {args.timeout} seconds"

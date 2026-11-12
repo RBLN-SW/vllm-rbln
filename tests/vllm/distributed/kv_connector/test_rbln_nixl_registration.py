@@ -1167,7 +1167,13 @@ class TestRegisterKvCachesImpl:
         worker.local_seen_layer_names = list(names)
         worker._group_spec_types = [FullAttentionSpec]
         worker._transfer_layer_region_indices = []
-        worker._register_shard_xfer_state("peer", 0, worker.block_size, names)
+        worker._register_shard_xfer_state(
+            "peer",
+            0,
+            worker.block_size,
+            names,
+            peer_region_group_ids=[0] * worker.num_regions,
+        )
         local = worker.nixl_wrapper.get_xfer_descs.call_args.args[0]
         # The peer is what this engine publishes, at other addresses and with
         # more blocks.
@@ -1570,10 +1576,31 @@ class TestTheAxisFollowsTheShardRule:
         with pytest.raises(RuntimeError, match="does not tile"):
             self._run(monkeypatch, heads=6, slices=4)
 
-    def test_entries_over_different_area_counts_are_refused(self, monkeypatch):
+    def test_an_entry_on_one_area_is_named_as_replicas_beside_a_cut_one(
+        self, monkeypatch
+    ):
         buffers = _impl_buffers(per_entry={0x10000: (4, 4), 0x20000: (1, 1)})
 
-        with pytest.raises(RuntimeError, match="different chiplet area counts"):
+        worker = self._run(monkeypatch, heads=2, block_tokens=256, buffers=buffers)
+
+        assert worker._kv_areas == 4
+        one_area = [
+            g
+            for g in worker._logical_region_geometry
+            if len({a.device_addr for a in g.areas}) == 1
+        ]
+        assert one_area
+        for geometry in one_area:
+            assert geometry.slices == 1
+            assert len(geometry.areas) == 4
+            assert {a.slice_id for a in geometry.areas} == {0}
+
+    def test_an_entry_on_two_areas_beside_a_cut_one_is_refused(self, monkeypatch):
+        # Only a one-area entry is named as replicas; one on two areas is
+        # refused before any area count is compared.
+        buffers = _impl_buffers(per_entry={0x10000: (4, 4), 0x20000: (2, 2)})
+
+        with pytest.raises(RuntimeError, match=r"sits on 2 chiplet area\(s\)"):
             self._run(monkeypatch, heads=2, block_tokens=256, buffers=buffers)
 
 
@@ -2593,3 +2620,65 @@ class TestChunkModeWithASlidingWindow:
                 push_stream=True,
                 cls=RblnNixlPushConnectorWorker,
             )
+
+
+class TestAKdaConvRingCutsOneGroupsHeads:
+    """GLM-5.3's conv ring beside a KDA state at block 1024: the ring holds q / k
+    / v of every group the rank's state caches split it into, so a head's run
+    is 128 channels of bf16 at every TP degree. An MTP draft beside the same
+    state leads with that group's heads."""
+
+    @staticmethod
+    def _register(tp_size, ring_shape, head_axis=2):
+        from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl import (
+            RblnNixlPullConnectorWorker,
+        )
+        from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_transfer_topology import (  # noqa: E501
+            RblnBlockTransferSpec,
+        )
+        from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
+
+        owner = "model.layers.0.self_attn.attn.0"
+        ring = "model.layers.0.self_attn.attn.ring"
+        w = object.__new__(RblnNixlPullConnectorWorker)
+        w.vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_text_config=SimpleNamespace(
+                    model_type="glm5_next_text",
+                    linear_num_heads=64,
+                    linear_head_dim=128,
+                    kv_lora_rank=512,
+                ),
+                dtype=torch.bfloat16,
+            ),
+            cache_config=SimpleNamespace(block_size=1024),
+            parallel_config=SimpleNamespace(tensor_parallel_size=tp_size),
+        )
+        w.kv_cache_config = SimpleNamespace(transfer_group_index_by_layer={owner: 1})
+        w._layer_specs = {
+            owner: RblnBlockTransferSpec(1024, 1024 * 512, 64, 128 * 128 * 2)
+        }
+        w._block_aux_specs = {}
+        w.register_block_aux_kv_caches(
+            {
+                ring: RBLNBlockAuxSpec(
+                    owner, ring_shape, torch.bfloat16, head_axis=head_axis
+                )
+            }
+        )
+        return w._layer_specs[ring]
+
+    @pytest.mark.parametrize(
+        "tp_size, ring_shape, runs",
+        [(1, (4, 12, 32, 64), 48), (4, (4, 3, 32, 64), 12)],
+    )
+    def test_a_head_s_run_is_its_128_channels(self, tp_size, ring_shape, runs):
+        spec = self._register(tp_size, ring_shape)
+
+        assert (spec.band_heads, spec.head_bytes, spec.runs) == (64, 256, runs)
+
+    @pytest.mark.parametrize("tp_size", [1, 4])
+    def test_a_draft_s_head_is_its_drafts_of_one_head(self, tp_size):
+        spec = self._register(tp_size, (16, 1, 4, 128), head_axis=0)
+
+        assert (spec.band_heads, spec.head_bytes, spec.runs) == (64, 4 * 128 * 2, 1)

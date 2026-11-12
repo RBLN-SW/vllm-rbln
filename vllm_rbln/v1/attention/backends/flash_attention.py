@@ -210,7 +210,7 @@ class RBLNFlashAttentionMetadataBuilder(
         self.use_custom_kernel = rbln_config.use_custom_kernel
 
         self.block_size = kv_cache_spec.block_size
-        self.chunked_prefill_size = rbln_config.prefill_chunk_size
+        self.chunked_prefill_size = rbln_config.max_prefill_chunk_size
         self.enforce_eager = get_current_vllm_config().model_config.enforce_eager
         # Causality is per model, not per process: each model builds its
         # attention under its own config, and upstream sets `use_non_causal` on

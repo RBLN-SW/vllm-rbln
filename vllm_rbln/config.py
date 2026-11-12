@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -39,7 +39,7 @@ import os
 from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from vllm.config.utils import config as vllm_config_dataclass
 
 from vllm_rbln.logger import init_logger
@@ -79,7 +79,7 @@ class RBLNConfigBase:
 
     sub_block_size: int | None = Field(default=None, gt=0)
     """Token granularity for prefix cache hit calculation.
-    If None, uses prefill_chunk_size.
+    If None, uses the longest prefill_chunk_size that divides block_size.
     """
 
 
@@ -107,10 +107,12 @@ class RBLNConfig(RBLNConfigBase):
     graph: repetition / frequency / presence penalties and logit bias, on the
     vocab chunks they touch. Needs `use_custom_sampler`."""
 
-    prefill_chunk_size: int | None = Field(default=None, gt=0)
-    """Length the prefill graph is compiled at, and so the longest prefill
-    chunk the scheduler hands it, below the `max_num_batched_tokens` step
-    budget. If None, uses `max_num_batched_tokens`."""
+    prefill_chunk_size: list[int] | None = None
+    """Lengths the prefill graphs are compiled at. A prefill step runs the
+    shortest that holds its chunk, and the longest is the longest prefill chunk
+    the scheduler hands one, below the `max_num_batched_tokens` step budget. A
+    single length keeps one prefill graph. If None, uses
+    `max_num_batched_tokens`."""
 
     specialize_moe_decode: bool = True
     """Specialize the case where every instance is at the decode stage."""
@@ -174,6 +176,17 @@ class RBLNConfig(RBLNConfigBase):
         factors["use_dynamic_kv_cache"] = self.use_dynamic_kv_cache is not False
         return hash_factors(factors)
 
+    @field_validator("prefill_chunk_size", mode="before")
+    @classmethod
+    def _one_prefill_chunk_size_is_a_list(cls, value: Any) -> Any:
+        return [value] if isinstance(value, int) else value
+
+    @property
+    def max_prefill_chunk_size(self) -> int:
+        """The longest prefill chunk."""
+        assert self.prefill_chunk_size is not None  # resolved at start-up
+        return max(self.prefill_chunk_size)
+
     def __post_init__(self) -> None:
         buckets = self.decode_batch_bucket_manual_buckets
         if any(b <= 0 for b in buckets):
@@ -190,6 +203,15 @@ class RBLNConfig(RBLNConfigBase):
             raise ValueError("encoder_token_budgets must all be > 0")
         if len(budgets) != len(set(budgets)):
             raise ValueError("encoder_token_budgets must be unique")
+        sizes = self.prefill_chunk_size
+        if sizes is not None:
+            if not sizes:
+                raise ValueError("prefill_chunk_size must not be empty")
+            if any(s <= 0 for s in sizes):
+                raise ValueError("prefill_chunk_size must all be > 0")
+            if len(sizes) != len(set(sizes)):
+                raise ValueError("prefill_chunk_size must be unique")
+            self.prefill_chunk_size = sorted(sizes)
 
 
 @dataclass
