@@ -125,19 +125,19 @@ class _Request:
     """Append-only lane store of one request. Slots fill in first-seen order."""
 
     __slots__ = (
-        "split",
-        "half",
-        "rep",
-        "freq",
-        "pres",
-        "active",
-        "repeats",
+        "is_vocab_split",
+        "half_vocab_size",
+        "repetition_penalty",
+        "frequency_penalty",
+        "presence_penalty",
+        "has_penalties",
+        "has_repetition_penalty",
         "fits",
-        "slots",
-        "seen",
-        "counts",
-        "done",
-        "cidx",
+        "chunk_to_slot_by_row",
+        "seen_token_ids",
+        "output_token_counts",
+        "num_processed_output_tokens",
+        "chunk_indices",
         "lanes",
     )
 
@@ -150,48 +150,52 @@ class _Request:
         freq: float,
         pres: float,
     ):
-        self.split = split
-        self.half = vocab_size // 2
-        self.rep = np.float16(rep)
-        self.freq = float(freq)
-        self.pres = float(pres)
-        self.active = rep != 1.0 or self.freq != 0.0 or self.pres != 0.0
-        self.repeats = rep != 1.0
-        self.fits = not self.repeats or _FP16_TINY <= rep <= _FP16_MAX
+        self.is_vocab_split = split
+        self.half_vocab_size = vocab_size // 2
+        self.repetition_penalty = np.float16(rep)
+        self.frequency_penalty = float(freq)
+        self.presence_penalty = float(pres)
+        self.has_penalties = (
+            rep != 1.0 or self.frequency_penalty != 0.0 or self.presence_penalty != 0.0
+        )
+        self.has_repetition_penalty = rep != 1.0
+        self.fits = not self.has_repetition_penalty or _FP16_TINY <= rep <= _FP16_MAX
         rows = 2 if split else 1
-        self.slots: list[dict[int, int]] = [{} for _ in range(rows)]
-        self.seen: set[int] = set()
-        self.counts: dict[int, int] = {}
-        self.done = 0
-        self.cidx = np.zeros((rows, capacity), np.int32)
+        self.chunk_to_slot_by_row: list[dict[int, int]] = [{} for _ in range(rows)]
+        self.seen_token_ids: set[int] = set()
+        self.output_token_counts: dict[int, int] = {}
+        self.num_processed_output_tokens = 0
+        self.chunk_indices = np.zeros((rows, capacity), np.int32)
         self.lanes = np.empty((rows, 3, capacity, CHUNK), np.float16)
 
     @property
     def used(self) -> int:
-        return max(len(s) for s in self.slots)
+        return max(len(s) for s in self.chunk_to_slot_by_row)
 
     def _grow(self) -> None:
-        n = self.cidx.shape[1]
-        cidx = np.zeros((self.cidx.shape[0], 2 * n), np.int32)
+        n = self.chunk_indices.shape[1]
+        cidx = np.zeros((self.chunk_indices.shape[0], 2 * n), np.int32)
         lanes = np.empty((self.lanes.shape[0], 3, 2 * n, CHUNK), np.float16)
-        cidx[:, :n] = self.cidx
+        cidx[:, :n] = self.chunk_indices
         lanes[:, :, :n] = self.lanes
-        self.cidx, self.lanes = cidx, lanes
+        self.chunk_indices, self.lanes = cidx, lanes
 
     def _lane(self, token: int) -> tuple[int, int, int]:
         """(row, slot, lane) of `token`, taking a new slot on first touch."""
         row, t = (
-            (1, token - self.half) if self.split and token >= self.half else (0, token)
+            (1, token - self.half_vocab_size)
+            if self.is_vocab_split and token >= self.half_vocab_size
+            else (0, token)
         )
-        slots = self.slots[row]
+        slots = self.chunk_to_slot_by_row[row]
         chunk = t // CHUNK
         s = slots.get(chunk)
         if s is None:
             s = len(slots)
-            if s >= self.cidx.shape[1]:
+            if s >= self.chunk_indices.shape[1]:
                 self._grow()
             slots[chunk] = s
-            self.cidx[row, s] = chunk
+            self.chunk_indices[row, s] = chunk
             self.lanes[row, :, s] = _IDENTITY
         return row, s, t % CHUNK
 
@@ -203,17 +207,19 @@ class _Request:
         self.lanes[row, ADD, s, lane] = value
 
     def add_prompt(self, token: int) -> None:
-        if token not in self.seen:
-            self.seen.add(token)
+        if token not in self.seen_token_ids:
+            self.seen_token_ids.add(token)
             row, s, lane = self._lane(token)
-            self.lanes[row, MUL, s, lane] = self.rep
+            self.lanes[row, MUL, s, lane] = self.repetition_penalty
 
     def add_output(self, token: int) -> None:
-        if self.repeats:
+        if self.has_repetition_penalty:
             self.add_prompt(token)
-        if self.freq or self.pres:
-            c = self.counts[token] = self.counts.get(token, 0) + 1
-            sub = self.freq * c + self.pres
+        if self.frequency_penalty or self.presence_penalty:
+            c = self.output_token_counts[token] = (
+                self.output_token_counts.get(token, 0) + 1
+            )
+            sub = self.frequency_penalty * c + self.presence_penalty
             if abs(sub) > _FP16_MAX:
                 self.fits = False
                 return
@@ -327,13 +333,17 @@ class FusedPenaltyState:
         for i, rid in enumerate(req_ids):
             outs = output_token_ids[i] if i < len(output_token_ids) else ()
             n_out = len(outs)
-            for j, t in enumerate(outs):
-                if t < 0:  # async placeholder
+            req = self._reqs.get(rid)
+            if req is not None and (
+                req.is_vocab_split != split or n_out < req.num_processed_output_tokens
+            ):
+                req = None
+            # The folded prefix holds only resolved token ids.
+            start = req.num_processed_output_tokens if req is not None else 0
+            for j in range(start, n_out):
+                if outs[j] < 0:  # async placeholder
                     n_out = j
                     break
-            req = self._reqs.get(rid)
-            if req is not None and (req.split != split or n_out < req.done):
-                req = None
             if req is None:
                 req = self._reqs[rid] = _Request(
                     split,
@@ -345,9 +355,9 @@ class FusedPenaltyState:
                 )
                 for t, v in biases.get(i, {}).items():
                     req.add_bias(int(t), v)
-                if req.active:
+                if req.has_penalties:
                     # Frequency and presence only read output tokens.
-                    if req.repeats:
+                    if req.has_repetition_penalty:
                         for t in prompt_fn(i):
                             if 0 <= t < vocab_size:
                                 req.add_prompt(int(t))
@@ -355,11 +365,15 @@ class FusedPenaltyState:
                 else:
                     new_outputs = ()
             else:
-                new_outputs = outs[req.done : n_out] if req.active else ()
+                new_outputs = (
+                    outs[req.num_processed_output_tokens : n_out]
+                    if req.has_penalties
+                    else ()
+                )
             for t in new_outputs:
                 if 0 <= t < vocab_size:
                     req.add_output(int(t))
-            req.done = n_out
+            req.num_processed_output_tokens = n_out
 
         if not all(self._reqs[rid].fits for rid in req_ids):
             return None
@@ -385,14 +399,14 @@ class FusedPenaltyState:
         for out in range(rows):
             i, r = divmod(out, per_req)
             req = self._reqs[req_ids[i]] if i < len(req_ids) else None
-            n = len(req.slots[r]) if req is not None else 0
+            n = len(req.chunk_to_slot_by_row[r]) if req is not None else 0
             if n == 0:
                 cidx[out] = 0
                 lanes[out] = _IDENTITY[:, None, :]
                 continue
             assert req is not None
-            cidx[out, :n] = req.cidx[r, :n]
-            cidx[out, n:] = req.cidx[r, 0]
+            cidx[out, :n] = req.chunk_indices[r, :n]
+            cidx[out, n:] = req.chunk_indices[r, 0]
             lanes[out, :, :n] = req.lanes[r, :, :n]
             lanes[out, :, n:] = req.lanes[r, :, :1]
         return (
