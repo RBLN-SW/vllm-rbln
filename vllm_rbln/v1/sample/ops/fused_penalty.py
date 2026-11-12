@@ -33,13 +33,21 @@ from typing import NamedTuple
 import numpy as np
 import torch
 from vllm.v1.sample.logits_processor import LogitsProcessors
-from vllm.v1.sample.logits_processor.builtin import LogitBiasLogitsProcessor
+from vllm.v1.sample.logits_processor.builtin import (
+    LogitBiasLogitsProcessor,
+    MinTokensLogitsProcessor,
+)
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.worker.gpu_input_batch import InputBatch
 
 CHUNK = 64
 K_BUCKETS = (256, 512, 1024)
 ADD, MUL, SUB = 0, 1, 2
+
+# Lanes are fp16: a value outside its finite normal range keeps the request on
+# the existing path rather than turning into inf or 0.
+_FP16_MAX = float(np.finfo(np.float16).max)
+_FP16_TINY = float(np.finfo(np.float16).tiny)
 
 _IDENTITY = np.zeros((3, CHUNK), np.float16)
 _IDENTITY[MUL] = 1.0
@@ -87,7 +95,9 @@ def uses_argmax_invariant_processors(sampling_metadata: SamplingMetadata) -> boo
     )
 
 
-def without_deferred(sampling_metadata: SamplingMetadata) -> SamplingMetadata:
+def without_penalties_and_logit_bias(
+    sampling_metadata: SamplingMetadata,
+) -> SamplingMetadata:
     """The metadata upstream `apply_logits_processors` should see when penalties
     and logit bias run in the sampling graph instead."""
     return dataclasses.replace(
@@ -98,6 +108,16 @@ def without_deferred(sampling_metadata: SamplingMetadata) -> SamplingMetadata:
             for p in sampling_metadata.logitsprocs.all
             if not isinstance(p, LogitBiasLogitsProcessor)
         ),
+    )
+
+
+def keeps_logit_bias_order(sampling_metadata: SamplingMetadata) -> bool:
+    """Whether running logit bias in the graph, after the eager processors, keeps
+    upstream's order. Upstream applies it before custom non-argmax-invariant
+    processors, which may read the biased logits."""
+    return all(
+        isinstance(p, (LogitBiasLogitsProcessor, MinTokensLogitsProcessor))
+        for p in sampling_metadata.logitsprocs.non_argmax_invariant
     )
 
 
@@ -112,6 +132,7 @@ class _Request:
         "pres",
         "active",
         "repeats",
+        "fits",
         "slots",
         "seen",
         "counts",
@@ -136,6 +157,7 @@ class _Request:
         self.pres = float(pres)
         self.active = rep != 1.0 or self.freq != 0.0 or self.pres != 0.0
         self.repeats = rep != 1.0
+        self.fits = not self.repeats or _FP16_TINY <= rep <= _FP16_MAX
         rows = 2 if split else 1
         self.slots: list[dict[int, int]] = [{} for _ in range(rows)]
         self.seen: set[int] = set()
@@ -174,6 +196,9 @@ class _Request:
         return row, s, t % CHUNK
 
     def add_bias(self, token: int, value: float) -> None:
+        if abs(value) > _FP16_MAX:
+            self.fits = False
+            return
         row, s, lane = self._lane(token)
         self.lanes[row, ADD, s, lane] = value
 
@@ -188,8 +213,12 @@ class _Request:
             self.add_prompt(token)
         if self.freq or self.pres:
             c = self.counts[token] = self.counts.get(token, 0) + 1
+            sub = self.freq * c + self.pres
+            if abs(sub) > _FP16_MAX:
+                self.fits = False
+                return
             row, s, lane = self._lane(token)
-            self.lanes[row, SUB, s, lane] = self.freq * c + self.pres
+            self.lanes[row, SUB, s, lane] = sub
 
 
 class FusedPenaltyState:
@@ -224,6 +253,8 @@ class FusedPenaltyState:
             {},
         )
         if sampling_metadata.no_penalties and not biases:
+            return None
+        if biases and not keeps_logit_bias_order(sampling_metadata):
             return None
 
         n = input_batch.num_reqs
@@ -330,6 +361,8 @@ class FusedPenaltyState:
                     req.add_output(int(t))
             req.done = n_out
 
+        if not all(self._reqs[rid].fits for rid in req_ids):
+            return None
         need = max((self._reqs[rid].used for rid in req_ids), default=0)
         row_vocab = row_layout(num_rows, vocab_size)[1]
         k = next((b for b in k_buckets(row_vocab, self.base_buckets) if b >= need), 0)

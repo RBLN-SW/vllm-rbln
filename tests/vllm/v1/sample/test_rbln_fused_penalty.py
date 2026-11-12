@@ -12,18 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import random
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
 import torch
 from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
+from vllm.v1.sample.logits_processor.builtin import LogitBiasLogitsProcessor
 
 from vllm_rbln.v1.sample.ops.fused_penalty import (
     K_BUCKETS,
     FusedPenaltyState,
     apply_fused_penalty,
     k_buckets,
+    keeps_logit_bias_order,
     row_layout,
 )
 from vllm_rbln.v1.sample.rbln_sampler import RBLNSampler
@@ -184,6 +188,51 @@ def test_frequency_only_request_takes_no_prompt_slots():
     )
     assert step is not None
     assert state._reqs["r"].used == 2  # chunks of 3 and 5000 only
+
+
+def _one_request(state, *, rep=1.0, freq=0.0, outputs=(), bias=None):
+    return state.update(
+        ["r"],
+        lambda i: np.asarray([1, 2]),
+        [list(outputs)],
+        np.full(1, rep),
+        np.full(1, freq),
+        np.zeros(1),
+        {0: bias} if bias else {},
+        16384,
+        2,
+    )
+
+
+def test_values_past_fp16_keep_the_upstream_path():
+    # Lanes are fp16. Past its range a value would turn into inf or 0.
+    assert _one_request(FusedPenaltyState(), rep=1.05, outputs=[3] * 4) is not None
+    assert _one_request(FusedPenaltyState(), freq=-2.0, outputs=[3] * 32760) is None
+    assert _one_request(FusedPenaltyState(), rep=1e-6) is None
+    assert _one_request(FusedPenaltyState(), rep=1.05, bias={5: 1e6}) is None
+
+
+def test_logit_bias_with_a_custom_processor_keeps_the_upstream_path():
+    bias = object.__new__(LogitBiasLogitsProcessor)
+    bias.biases = {0: {5: 1.0}}
+    md = SimpleNamespace(
+        thinking_budget_state_holder=None,
+        no_penalties=True,
+        logitsprocs=SimpleNamespace(non_argmax_invariant=[bias, SimpleNamespace()]),
+    )
+    assert not keeps_logit_bias_order(md)
+    assert FusedPenaltyState().plan(md, None, (2, 16384), "cpu") is None
+
+
+def test_warm_up_skips_fused_graphs_for_an_unsupported_vocab(monkeypatch):
+    monkeypatch.setattr(RBLNSampler, "__call__", lambda self, **kw: None)
+    sampler = object.__new__(RBLNSampler)
+    sampler._penalty_state = FusedPenaltyState()
+    sampler.sample = MagicMock()
+    sampler._fused_graph = MagicMock()
+    sampler.warm_up(torch.zeros(2, 50257), SimpleNamespace(all_greedy=False))
+    sampler.sample.assert_not_called()
+    sampler._fused_graph.assert_not_called()
 
 
 def test_request_past_the_cap_keeps_the_upstream_path():

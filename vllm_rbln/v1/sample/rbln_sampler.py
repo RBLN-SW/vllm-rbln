@@ -34,8 +34,9 @@ from vllm_rbln.v1.sample.ops.fused_penalty import (
     FusedPenaltyPlan,
     FusedPenaltyState,
     apply_fused_penalty,
+    supports_vocab,
     uses_argmax_invariant_processors,
-    without_deferred,
+    without_penalties_and_logit_bias,
 )
 from vllm_rbln.v1.sample.ops.top_k_top_p import build_op_top_k_top_p
 
@@ -261,7 +262,7 @@ class RBLNSampler(VLLMSampler):
         """Compile the graphs `sampling_metadata` reaches, fused ones at every k."""
         _ = self(logits=logits, sampling_metadata=sampling_metadata)
         state = self._penalty_state
-        if state is None:
+        if state is None or not supports_vocab(logits.shape[-1]):
             return
         for k in state.k_buckets(logits.shape):
             plan = state.identity_plan(logits.shape, logits.device, k)
@@ -413,7 +414,7 @@ class RBLNSampler(VLLMSampler):
             logits,
             sampling_metadata
             if penalty is None
-            else without_deferred(sampling_metadata),
+            else without_penalties_and_logit_bias(sampling_metadata),
             predict_bonus_token,
         )
         # Sample the next token.
