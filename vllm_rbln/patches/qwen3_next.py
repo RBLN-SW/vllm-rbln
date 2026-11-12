@@ -146,7 +146,10 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     def get_state_shape(self) -> tuple[tuple[int, ...]]:
         return (
             gdn_state_shape(
-                self.num_kv_heads, self.cache_config.block_size, self.kv_head_size
+                self.num_v_heads // self.tp_size,
+                self.num_kv_heads,
+                self.cache_config.block_size,
+                self.kv_head_size,
             ),
         )
 

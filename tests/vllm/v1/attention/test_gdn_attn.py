@@ -17,6 +17,7 @@ read it: the state blocks a request loads and stores come from the group's
 block table, and the conv ring is read and stored by the same blocks as the
 state."""
 
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -44,12 +45,15 @@ def test_grouped_qkv_rows_interleaves_each_key_heads_q_k_and_values():
     assert grouped_qkv_rows(2, 1, 2).tolist() == [0, 1, 4, 5, 8, 9, 2, 3, 6, 7, 10, 11]
 
 
-def test_state_block_is_the_flash_backends_kv_block():
-    # A GDN layer and an attention layer on one buffer are one graph input only
-    # while both declare a block the same way.
+def test_state_block_is_the_flash_backends_kv_block_by_value_head():
+    # 2 KV heads and 16 value heads, fewer KV heads than chiplets: the state is
+    # the attention block's bytes, a value head an entry of the axis the
+    # delta-rule kernels cut.
     with set_current_vllm_config(make_vllm_config()):
-        cache = RBLNFlashAttentionBackend.get_kv_cache_shape(1, 256, 4, 256)
-    assert gdn_state_shape(4, 256, 256) == cache[1:]
+        cache = RBLNFlashAttentionBackend.get_kv_cache_shape(1, 256, 2, 256)
+    state = gdn_state_shape(16, 2, 256, 256)
+    assert state == (2, 16, 1, 32, 256)
+    assert math.prod(state) == math.prod(cache[1:])
 
 
 def _builder(block_size: int = MAX_LEN, mamba_cache_mode: str = "none"):
@@ -59,7 +63,7 @@ def _builder(block_size: int = MAX_LEN, mamba_cache_mode: str = "none"):
     vllm_config.cache_config.mamba_cache_mode = mamba_cache_mode
     spec = MambaSpec(
         block_size=block_size,
-        shapes=(gdn_state_shape(1, 256, 128),),
+        shapes=(gdn_state_shape(4, 1, 256, 128),),
         dtypes=(torch.bfloat16,),
         mamba_cache_mode=mamba_cache_mode,
     )

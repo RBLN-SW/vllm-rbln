@@ -15,17 +15,17 @@
 """GatedDeltaNet (Qwen3-Next, Qwen3.5 `linear_attention`) state on RBLN.
 
 A layer's recurrent state is a `MambaSpec` block of the pool the attention
-layers schedule on, declared as the full-attention KV block it fills (the
-platform holds block_size to that), so a GDN layer and an attention layer
-sharing a buffer are one graph input with one chiplet cut. The delta-rule
-kernels read a block as the [Hk, R, 2, 128, 64] state it holds, in the
-activation dtype (dlfloat16 inside the kernels), addressed by the group's
-block table. Its short-conv ring is a block-aux cache on the same
-block ids. The builder turns the block table into the blocks the kernels read
-and write: that of a request's last computed token and that of its last
-scheduled one. They differ only under prefix caching ("align", a state a KV
-block), when a step enters a new block. A padding row reads and writes block
-0, vLLM's null block.
+layers schedule on: a full-attention KV block's bytes (the platform holds
+block_size to that) viewed with the value heads on the KV head axis. A GDN
+layer and an attention layer sharing a buffer are two views of it, each cut
+over the chiplets on the axis its kernels take. The delta-rule kernels read a
+block as the [Hk, R, 2, 128, 64] state it holds, in the activation dtype
+(dlfloat16 inside the kernels), addressed by the group's block table. Its
+short-conv ring is a block-aux cache on the same block ids. The builder turns
+the block table into the blocks the kernels read and write: that of a
+request's last computed token and that of its last scheduled one. They differ
+only under prefix caching ("align", a state a KV block), when a step enters a
+new block. A padding row reads and writes block 0, vLLM's null block.
 
 The delta-rule kernels take q / k per key head, L2-normalized inside, and v, g and
 beta per value head grouped under its key head. The short conv
@@ -54,11 +54,15 @@ from vllm_rbln.v1.attention.kv_cache_bindings import KVCacheViewInfo
 
 
 def gdn_state_shape(
-    num_kv_heads: int, block_size: int, head_size: int
+    num_value_heads: int, num_kv_heads: int, block_size: int, head_size: int
 ) -> tuple[int, ...]:
-    """One block's state, declared as the full-attention KV block whose bytes it
-    is ([2, Hkv, 1, block_size, head_size], RBLNFlashAttentionBackend's block)."""
-    return (2, num_kv_heads, 1, block_size, head_size)
+    """One block's state: the bytes of a full-attention KV block ([2, Hkv, 1,
+    block_size, head_size], RBLNFlashAttentionBackend's block) with the value
+    heads where its KV heads are. The delta-rule kernels cut that axis over the
+    chiplets, and a model's KV heads can be fewer than the chiplets."""
+    rows, rest = divmod(num_kv_heads * block_size, num_value_heads)
+    assert rest == 0, "a value head's state fills whole rows of the block"
+    return (2, num_value_heads, 1, rows, head_size)
 
 
 def grouped_qkv_rows(heads_k: int, ratio: int, head_dim: int) -> torch.Tensor:

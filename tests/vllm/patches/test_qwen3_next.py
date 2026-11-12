@@ -49,8 +49,8 @@ PREFIX = "model.layers.0.linear_attn"
 # The state cache: the request's block, with a neighbour on each side.
 NUM_BLOCKS, BLOCK = 4, 2
 # A full-attention KV block of the layer's HEADS_V * HEAD_DIM * HEAD_DIM state
-# elements: 1 KV head, 256 tokens, head size 128.
-KV_BLOCK = gdn_state_shape(1, 256, 128)
+# elements, by value head: 1 KV head, 256 tokens, head size 128.
+KV_BLOCK = gdn_state_shape(HEADS_V, 1, 256, 128)
 
 
 class _Proj(torch.nn.Linear):
@@ -263,13 +263,16 @@ def test_forward_without_metadata_is_an_error(vllm_config):
 
 
 class TestStateSpec:
-    """The layer declares its state as a full-attention KV block, and the model
-    declares the same state for the platform's page arithmetic."""
+    """The layer declares its state as a full-attention KV block by value head,
+    and the model declares the same state for the platform's page arithmetic."""
 
     @staticmethod
     def _layer():
-        # The attention layers keep 4 KV heads of 256, 256 tokens a block.
+        # The attention layers keep 4 KV heads of 256, 256 tokens a block; the
+        # layer has 32 value heads.
         layer = object.__new__(RBLNQwenGatedDeltaNetAttention)
+        layer.num_v_heads = 32
+        layer.tp_size = 1
         layer.num_kv_heads = 4
         layer.kv_head_size = 256
         layer.model_config = SimpleNamespace(dtype=torch.bfloat16)
@@ -278,7 +281,7 @@ class TestStateSpec:
 
     def test_the_layer_declares_one_ssm_state_a_block(self):
         layer = self._layer()
-        assert layer.get_state_shape() == ((2, 4, 1, 256, 256),)
+        assert layer.get_state_shape() == ((2, 32, 1, 32, 256),)
         # The activation dtype: the kernels take no other.
         assert layer.get_state_dtype() == (torch.bfloat16,)
 
@@ -292,10 +295,11 @@ class TestStateSpec:
         vllm_config = SimpleNamespace(
             model_config=SimpleNamespace(
                 dtype=torch.bfloat16,
+                hf_text_config=SimpleNamespace(linear_num_value_heads=32),
                 get_num_kv_heads=lambda parallel_config: 4,
                 get_head_size=lambda: 256,
             ),
-            parallel_config=None,
+            parallel_config=SimpleNamespace(tensor_parallel_size=1),
             cache_config=SimpleNamespace(block_size=256),
         )
         model = RBLNQwen3_5ForConditionalGeneration
