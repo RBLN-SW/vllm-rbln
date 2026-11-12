@@ -39,7 +39,6 @@ import os
 from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
 
-import torch
 from pydantic import Field
 from vllm.config.utils import config as vllm_config_dataclass
 
@@ -201,27 +200,6 @@ class OptimumRBLNCompileConfig:
     # Keep third-party config dataclasses opaque to pydantic validation.
     hf_config: Any
     npu_name: str
-
-
-@dataclass
-class OptimumRBLNRuntimeConfig:
-    """Validated model settings ready to apply to vLLM after artifact selection.
-
-    block_size uses vLLM allocation units; attn_block_size retains the model's
-    attention block size when prefix caching is enabled.
-    """
-
-    max_num_seqs: int
-    max_model_len: int
-    block_size: int
-    attn_block_size: int | None
-    mamba_block_size: int | None
-    prefill_chunk_size: int | None
-    image_prefill_chunk_size: list[int] | None
-    model_num_blocks: int | None
-    num_devices_per_local_rank: int
-    compiled_dtype: torch.dtype | None
-    precompiled: bool
 
 
 @vllm_config_dataclass
