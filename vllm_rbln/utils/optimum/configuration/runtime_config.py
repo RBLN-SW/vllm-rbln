@@ -164,12 +164,6 @@ def prepare_runtime_config(
             "RBLN does not support prefix caching for mamba/hybrid models."
         )
         mamba_block_size = max_seq_len
-    if cache_config.num_gpu_blocks_override is not None:
-        num_blocks = (
-            additional_config.num_blocks_override
-            if additional_config.num_blocks_synced
-            else cache_config.num_gpu_blocks_override
-        )
     return OptimumRBLNRuntimeConfig(
         max_num_seqs=batch_size,
         max_model_len=max_seq_len,
@@ -178,7 +172,7 @@ def prepare_runtime_config(
         mamba_block_size=mamba_block_size,
         prefill_chunk_size=prefill_chunk_size,
         image_prefill_chunk_size=image_prefill_chunk_size,
-        model_num_blocks=num_blocks,
+        model_num_blocks=resolve_runtime_num_blocks(vllm_config, rbln_config),
         num_devices_per_local_rank=num_devices,
         compiled_dtype=compiled_dtype,
         precompiled=precompiled,
@@ -252,6 +246,21 @@ def apply_runtime_config(
     additional_config.num_devices_per_local_rank = (
         runtime_config.num_devices_per_local_rank
     )
+
+
+def resolve_runtime_num_blocks(
+    vllm_config: VllmConfig, rbln_config: RblnConfigLike
+) -> int | None:
+    """Select the model block count before conversion to vLLM allocation units."""
+    cache_config = vllm_config.cache_config
+    additional_config = vllm_config.additional_config
+    if cache_config.num_gpu_blocks_override is not None:
+        return (
+            additional_config.num_blocks_override
+            if additional_config.num_blocks_synced
+            else cache_config.num_gpu_blocks_override
+        )
+    return get_runtime_num_blocks(vllm_config.model_config.hf_config, rbln_config)
 
 
 def get_runtime_num_blocks(hf_config: Any, rbln_config: RblnConfigLike) -> int | None:
