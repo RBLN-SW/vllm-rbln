@@ -18,10 +18,12 @@ answers, and re-checking that the resized pool can hold one request."""
 from types import SimpleNamespace
 
 import pytest
+from vllm.v1.kv_cache_interface import MambaSpec
 
 import vllm_rbln.patches.dynamic_kv as dk
 from vllm_rbln.patches.dynamic_kv import (
     check_enough_kv_cache_blocks_after_resize,
+    check_kv_cache_blocks_cover_max_num_seqs,
     resolve_rank_num_blocks,
 )
 
@@ -208,3 +210,35 @@ def test_groups_sharing_the_pool_are_summed():
     check_enough_kv_cache_blocks_after_resize(cfg, _kv(7, *specs))
     with pytest.raises(ValueError, match="needs 7"):
         check_enough_kv_cache_blocks_after_resize(cfg, _kv(6, *specs))
+
+
+def _mamba_spec():
+    # Only the type matters to the max_num_seqs check.
+    return MambaSpec.__new__(MambaSpec)
+
+
+@pytest.mark.parametrize(("num_blocks", "max_num_seqs"), [(65, 64), (1220, 64), (2, 1)])
+def test_recurrent_state_pool_covers_the_batch(num_blocks, max_num_seqs):
+    check_kv_cache_blocks_cover_max_num_seqs(
+        _config(1024, 32768, max_num_seqs=max_num_seqs),
+        _kv(num_blocks, _full_spec(1024), _mamba_spec()),
+    )
+
+
+@pytest.mark.parametrize(("num_blocks", "max_num_seqs"), [(64, 64), (4, 64), (1, 1)])
+def test_recurrent_state_pool_smaller_than_the_batch_is_rejected(
+    num_blocks, max_num_seqs
+):
+    with pytest.raises(ValueError, match=f"max_num_seqs={max_num_seqs}") as excinfo:
+        check_kv_cache_blocks_cover_max_num_seqs(
+            _config(1024, 32768, max_num_seqs=max_num_seqs),
+            _kv(num_blocks, _full_spec(1024), _mamba_spec()),
+        )
+    assert str(num_blocks) in str(excinfo.value)
+
+
+def test_attention_only_pool_is_not_held_to_the_batch():
+    # A decode batch only caps concurrency there (see test_accepts_a_pool_that_fits).
+    check_kv_cache_blocks_cover_max_num_seqs(
+        _config(8192, 32768, max_num_seqs=64), _kv(5, _full_spec(8192))
+    )

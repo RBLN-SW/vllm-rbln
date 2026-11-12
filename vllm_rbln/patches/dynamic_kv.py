@@ -24,7 +24,7 @@ from vllm.config import VllmConfig
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_utils import get_kv_cache_capacity
 from vllm.v1.engine.core import EngineCore
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 
 from vllm_rbln.logger import init_logger
 from vllm_rbln.patches.registry import register_patch
@@ -128,6 +128,7 @@ def patched_initialize_kv_caches(
         num_blocks,
     )
     check_enough_kv_cache_blocks_after_resize(vllm_config, kv_cache_config)
+    check_kv_cache_blocks_cover_max_num_seqs(vllm_config, kv_cache_config)
     _log_gpu_kv_cache_size(vllm_config, kv_cache_config)
     return kv_cache_config
 
@@ -156,6 +157,38 @@ def check_enough_kv_cache_blocks_after_resize(
         f"{vllm_config.model_config.max_model_len} across "
         f"{len(kv_cache_config.kv_cache_groups)} KV cache group(s), plus the null "
         "block. Reduce max_model_len, raise "
+        "gpu_memory_utilization, or give the model more devices."
+    )
+
+
+def check_kv_cache_blocks_cover_max_num_seqs(
+    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
+) -> None:
+    """Fail loudly when a pool holding recurrent states has fewer blocks than a
+    batch has rows.
+
+    A recurrent-state group (MambaSpec: Qwen3.5's GDN state in a KV cache
+    block) takes one block a batch row, and its kernels were compiled against
+    a symbolic block count traced at COMPILE_KV_CACHE_NUM_BLOCKS, so the
+    compiler could not check the cache against the batch and defers that check
+    to here, where the count is real. A pool of attention groups alone only
+    caps concurrency with fewer blocks and is not checked.
+    """
+    if not any(
+        isinstance(group.kv_cache_spec, MambaSpec)
+        for group in kv_cache_config.kv_cache_groups
+    ):
+        return
+    max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+    # -1: the block pool keeps block 0 as the null block.
+    usable = kv_cache_config.num_blocks - 1
+    if usable >= max_num_seqs:
+        return
+    raise ValueError(
+        f"The KV cache sized from the compiled placement holds "
+        f"{kv_cache_config.num_blocks} blocks ({usable} usable after the null "
+        f"block), fewer than max_num_seqs={max_num_seqs}: its recurrent-state "
+        "kernels address one block a batch row. Lower max_num_seqs, raise "
         "gpu_memory_utilization, or give the model more devices."
     )
 
