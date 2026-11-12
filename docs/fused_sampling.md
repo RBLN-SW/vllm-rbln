@@ -43,6 +43,34 @@ existing path.
 
 ## How It Works
 
+### One decode step
+
+```
+                 host                                         device
+ ------------------------------------------------   ------------------------------
+ model forward ---------------------------------->   logits [batch, vocab]
+                                                              |
+ RBLNSampler.forward                                          |
+   FusedPenaltyState.plan()                                   |
+     for each request in the batch:                           |
+       new request    -> fold prompt (rep only),              |
+                         logit_bias, outputs so far           |
+       known request  -> fold only the outputs                |
+                         added since the last step            |
+     K = smallest bucket >= most slots any row uses           |
+     copy out cidx [rows, K], lanes [rows, 3, K, 64]          |
+          |                                                   v
+          +------------------ upload --------------->   fused sampling graph
+                                                          gather -> formula -> scatter
+                                                          -> temperature -> softmax
+                                                          -> top-k / top-p (or argmax)
+                                                              |
+ next step  <---------------------------------------   sampled tokens
+```
+
+The host work grows with the number of new tokens per step, not with the vocab
+size. The device work grows with `K`, not with the vocab size.
+
 ### What each token gets
 
 For a token `t` of a request, upstream applies, in this order:
@@ -70,16 +98,56 @@ unchanged.
 
 ### Chunk layout
 
-The logits are viewed as `[rows, vocab / 64, 64]`. For each row the host keeps:
+The logits are viewed as `[rows, vocab / 64, 64]`. A chunk is 64 consecutive
+token ids, so token `t` sits in chunk `t // 64` at lane `t % 64`. A request
+touches a few hundred tokens, so only a few hundred of the 2374 chunks of a
+151936 vocab ever change.
 
-- `cidx [rows, K]`: the chunk ids this row touches, in the order first seen.
-- `lanes [rows, 3, K, 64]`: `(add, mul, sub)` for every lane of those chunks.
+A slot is one entry in a row's compact list of touched chunks. The first chunk a
+request touches takes slot 0, the next new chunk takes slot 1, and so on. A token
+in a chunk that already has a slot reuses that slot. For each row the host keeps:
 
-`K` is the number of chunk slots. Slots past the last used one repeat slot 0, so
-the gather and scatter always see `K` chunks and duplicate targets carry the
-same values.
+- `cidx [rows, K]`: the chunk id held by each slot.
+- `lanes [rows, 3, K, 64]`: `(add, mul, sub)` for every lane of each slot's
+  chunk.
 
-The device graph is then:
+For example, with prompt tokens 5, 70 and 100 and a repetition penalty, token 5
+takes slot 0 for chunk 0, token 70 takes slot 1 for chunk 1, and token 100 is
+also in chunk 1 and reuses slot 1. So `cidx = [0, 1, ...]`, slot 0 holds
+`mul = rep` at lane 5, and slot 1 holds it at lanes 6 and 36. Every other lane
+stays at identity.
+
+`K` is the number of slots a graph is compiled for. It is fixed per graph so the
+shapes stay static, and a row usually uses fewer slots than `K`. Unused slots
+repeat slot 0 (same chunk id, same lanes), so the gather and scatter always see
+`K` chunks and duplicate scatter targets write the same values.
+
+The same example drawn out, with `K = 4` to keep it small (real buckets start
+at 256):
+
+```
+ logits row, viewed as chunks of 64 lanes
+   chunk 0              chunk 1                   chunk 2   ...   chunk 2373
+ [ ....5.......... ] [ ......6.....36...... ] [ ........ ] ... [ ........ ]
+
+ host state for this row
+   slot      0    1    2    3
+   cidx    [ 0 ,  1 ,  0 ,  0 ]        slots 2, 3 are unused and repeat slot 0
+   lanes   [ L0,  L1,  L0,  L0 ]       L0: mul = rep at lane 5
+                                       L1: mul = rep at lanes 6, 36
+                                       every other lane: (add, mul, sub) = (0, 1, 0)
+
+ device graph
+   1. gather    v = logits[cidx]                     [K, 64]: chunks 0, 1, 0, 0
+   2. formula   v = v + add
+                v = v / mul  if v > 0  else  v * mul
+                v = v - sub                          identity lanes keep their value
+   3. scatter   logits[cidx] = v                     chunk 0 gets the same values 3 times
+                                                     chunks 2 .. 2373 are never read or written
+   4. temperature -> softmax -> top-k / top-p (or argmax) on the full row
+```
+
+In tensor form, for all rows at once:
 
 ```
 v   = gather(logits_view, cidx) + add          # [rows, K, 64]
@@ -93,7 +161,7 @@ out = scatter(logits_view, cidx, v)
 - A new request is filled from its prompt, its output so far and its
   `logit_bias`.
 - After that, each step adds only the output tokens produced since the last
-  step. A token is penalized once, however often it repeats; its frequency term
+  step. A token is penalized once, however often it repeats. Its frequency term
   is updated on every occurrence.
 - Requests are keyed by request id, so new and reordered rows need no special
   handling. A request's state is dropped when it finishes, not when a step
