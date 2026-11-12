@@ -16,6 +16,7 @@
 vision encoder against HF's, its graph buckets, and the in-graph merge of
 image embeddings."""
 
+import operator
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
@@ -24,10 +25,14 @@ import pytest
 import torch
 from torch import nn
 from transformers import Gemma4VisionConfig, Gemma4VisionModel
+from vllm.forward_context import get_forward_context, override_forward_context
+from vllm.model_executor.models.gemma4 import Gemma4Attention
 from vllm.model_executor.models.gemma4_mm import Gemma4ForConditionalGeneration
 
 import vllm_rbln.model_executor.models.gemma4 as gemma4
+from vllm_rbln.compilation.compiler import compile, mark_decoder_regions
 from vllm_rbln.model_executor.models.gemma4 import RBLNGemma4ForConditionalGeneration
+from vllm_rbln.v1.attention.backends.flash_attention import RBLNFlashAttentionMetadata
 
 POOL = 3
 
@@ -42,6 +47,7 @@ def _bare_model(**attrs) -> RBLNGemma4ForConditionalGeneration:
         RBLNGemma4ForConditionalGeneration
     )
     nn.Module.__init__(model)
+    model.mm_prefix_attn_layers = []
     object.__setattr__(model, "_mm_encoder", None)
     for key, value in attrs.items():
         setattr(model, key, value)
@@ -178,12 +184,17 @@ def test_warm_up_runs_every_bucket_once_full():
     assert calls == [(18, 18), (45, 45), (90, 90)]
 
 
-def _built_model(monkeypatch, *, cap, budgets, per_layer_input=0):
+def _built_model(monkeypatch, *, cap, budgets, per_layer_input=0, attention_layers=()):
     """The model as construction resolves it, upstream's model left out."""
+
+    def upstream_init(self, **kwargs):
+        nn.Module.__init__(self)
+        self.layers = nn.ModuleList(attention_layers)
+
     monkeypatch.setattr(
         Gemma4ForConditionalGeneration,
         "__init__",
-        lambda self, **kw: nn.Module.__init__(self),
+        upstream_init,
     )
     monkeypatch.setattr(gemma4, "mm_soft_token_cap", lambda info: cap)
     monkeypatch.setattr(
@@ -202,16 +213,34 @@ def _built_model(monkeypatch, *, cap, budgets, per_layer_input=0):
             parallel_config=SimpleNamespace(data_parallel_size=1),
             speculative_config=None,
             model_config=SimpleNamespace(
+                max_model_len=32768,
                 hf_config=SimpleNamespace(
                     text_config=SimpleNamespace(
                         hidden_size_per_layer_input=per_layer_input
                     )
-                )
+                ),
             ),
             additional_config=SimpleNamespace(encoder_token_budgets=budgets),
         )
     )
     return model
+
+
+@pytest.mark.parametrize("use_mm_prefix", [False, True])
+def test_mm_prefix_mask_selects_only_sliding_layers(monkeypatch, use_mm_prefix):
+    layers = []
+    for is_sliding in (True, False):
+        layer = Gemma4Attention.__new__(Gemma4Attention)
+        nn.Module.__init__(layer)
+        layer.is_sliding = is_sliding
+        layer.attn = SimpleNamespace(use_mm_prefix=use_mm_prefix)
+        layers.append(layer)
+
+    model = _built_model(monkeypatch, cap=280, budgets=[], attention_layers=layers)
+
+    assert model.layers[0].attn.use_mm_prefix == use_mm_prefix
+    assert model.layers[1].attn.use_mm_prefix == use_mm_prefix
+    assert model.mm_prefix_attn_layers == ([layers[0].attn] if use_mm_prefix else [])
 
 
 @pytest.mark.parametrize(
@@ -438,3 +467,107 @@ def test_image_embeddings_replace_their_tokens_in_the_graph(monkeypatch):
     assert out == "HIDDEN"
     assert seen["input_ids"] is None
     assert seen["inputs_embeds"][0, :, 0].tolist() == [1.0, 9.0, 3.0]
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+def test_prefix_mask_is_shared_and_does_not_escape_forward(monkeypatch, compiled):
+    class Decoder(nn.Module):
+        def __init__(self, index):
+            super().__init__()
+            self.attn = nn.Module()
+            self.attn.layer_name = f"layer.{index}"
+            self.attn.layer_index = index
+            self.attn.sliding_window = 4
+            self.attn.impl = SimpleNamespace(scale=torch.tensor(1.0))
+
+        def forward(self, x):
+            metadata = get_forward_context().attn_metadata[self.attn.layer_name]
+            return x * self.attn.impl.scale + metadata.swa_attn_masks[0, 0, 1, 3]
+
+    def upstream_forward(self, input_ids, positions, *args, **kwargs):
+        masks = [
+            get_forward_context().attn_metadata[layer.attn.layer_name].swa_attn_masks
+            for layer in self.layers
+        ]
+        assert masks[0] is not None
+        assert all(mask is masks[0] for mask in masks)
+        for layer in self.layers:
+            positions = layer(positions)
+        return positions
+
+    monkeypatch.setattr(Gemma4ForConditionalGeneration, "forward", upstream_forward)
+    model = _bare_model(
+        layers=nn.ModuleList([Decoder(i) for i in range(3)]),
+        start_layer=0,
+        end_layer=3,
+        model_dtype=torch.float32,
+    )
+    model.mm_prefix_attn_layers = [layer.attn for layer in model.layers]
+    metadata = RBLNFlashAttentionMetadata(
+        seq_lens=torch.tensor([[0]]),
+        block_tables=torch.arange(4),
+        is_prefill=True,
+        swa_appends=True,
+        mm_prefix_row_ends=torch.tensor([0, 3, 3, 3]),
+        kv_caches=[torch.zeros(4, 2, 1, 1, 4, 32) for _ in model.layers],
+    )
+    context = SimpleNamespace(
+        attn_metadata={
+            layer.layer_name: metadata for layer in model.mm_prefix_attn_layers
+        },
+        additional_kwargs={},
+        dp_metadata=None,
+    )
+    graphs = []
+
+    def backend(graph, inputs, **options):
+        graphs.append(graph)
+        return graph.forward
+
+    forward = model.forward
+    if compiled:
+        mark_decoder_regions(model)
+        forward = compile(
+            forward,
+            backend=backend,
+            fullgraph=True,
+            use_direct_dispatch=True,
+            use_cache=False,
+        )
+    with override_forward_context(context):
+        for row_ends, expected in [([0, 3, 3, 3], 3), ([0, 1, 2, 3], 0)]:
+            metadata.mm_prefix_row_ends = torch.tensor(row_ends)
+            result = forward(None, torch.zeros(4))
+            torch.testing.assert_close(result, torch.full((4,), float(expected)))
+            assert metadata.swa_attn_masks is None
+    if compiled:
+        assert len(graphs) == 1
+        nodes = list(graphs[0].graph.nodes)
+        assert sum(node.target is operator.le for node in nodes) == 1
+        assert not any(
+            node.op == "placeholder" and "scale" in str(node.target) for node in nodes
+        )
+        assert len(nodes[-1].args[0]) == 1
+        assert (
+            sum(node.target is torch.ops.higher_order.invoke_subgraph for node in nodes)
+            == 3
+        )
+
+
+@pytest.mark.parametrize("start", [0, 1023, 1024, 1025, 262144, 264192])
+def test_prefix_mask_block_boundaries(start):
+    row_ends = torch.tensor([0, 3, 3, 3])
+    mask = gemma4._build_mm_prefix_sliding_mask(
+        row_ends,
+        torch.tensor([[start]]),
+        1024,
+        1024,
+        torch.bfloat16,
+    )
+    first_key = max(start - 1024 + 1, 0) // 1024 * 1024
+    keys = torch.arange(mask.size(-1), dtype=torch.int64) + first_key
+    rows = torch.arange(4, dtype=torch.int64) + start
+    expected = (keys[None, :] <= (row_ends + start)[:, None]) & (
+        keys[None, :] > (rows - 1024)[:, None]
+    )
+    torch.testing.assert_close(mask[0, 0], expected.to(mask.dtype), rtol=0, atol=0)

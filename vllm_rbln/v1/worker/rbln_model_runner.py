@@ -1146,7 +1146,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
         spec_decode_common_attn_metadata = None
-        swa_masks: dict[tuple[int, int], torch.Tensor] = {}
         for kv_cache_gid, _ in enumerate(kv_cache_groups):
             cm = copy(cm_base)  # shallow copy
 
@@ -1178,7 +1177,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     num_accepted=num_accepted,
                     state_load_pos=state_load_pos,
                     mm_prefix_row_ends=mm_prefix_row_ends,
-                    swa_masks=swa_masks,
                 )
 
                 for layer_name in attn_group.layer_names:
