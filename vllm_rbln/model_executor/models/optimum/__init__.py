@@ -48,6 +48,8 @@ from .qwen3_reranker import RBLNOptimumQwen3RerankerModel
 from .qwen3_vl import (  # noqa: F401
     RBLNOptimumQwen3_5ForConditionalGeneration,
     RBLNOptimumQwen3VLForConditionalGeneration,
+    RBLNOptimumQwen3VLForSequenceClassification,
+    RBLNOptimumQwen3VLModel,
     RBLNOptimumQwen3VLMoeForConditionalGeneration,
 )
 from .sliding_window import RBLNOptimumSlidingWindowAttentionForCausalLM  # noqa: F401

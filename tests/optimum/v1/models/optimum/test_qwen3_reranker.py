@@ -22,6 +22,9 @@ vocabulary logits. These tests cover the parts that do not need an NPU:
   * inputs are **left** padded, which the generation graph requires,
   * ``forward`` reduces the vocabulary to ``logit_yes - logit_no``, and the
     pooler's sigmoid on that equals the 2-way softmax.
+
+Qwen3-VL-Reranker is scored the same way, but keeps its own architecture name,
+which selects a prefill-only compile and the multimodal wrapper.
 """
 
 from types import SimpleNamespace
@@ -37,11 +40,15 @@ from vllm.config import (
     set_current_vllm_config,
 )
 
+from vllm_rbln.model_executor.models.optimum.base import ModelInputForRBLN
 from vllm_rbln.model_executor.models.optimum.model_base import RBLNOptimumModelBase
 from vllm_rbln.model_executor.models.optimum.qwen3_reranker import (
     RBLNOptimumQwen3RerankerModel,
     RBLNQwen3RerankerPooler,
     resolve_label_token_ids,
+)
+from vllm_rbln.model_executor.models.optimum.qwen3_vl import (
+    RBLNOptimumQwen3VLForSequenceClassification,
 )
 from vllm_rbln.utils.optimum.configuration.runtime import (
     is_chunked_prefill_arch,
@@ -260,5 +267,102 @@ def test_forward_reduces_to_2_way_softmax():
     out = model.forward(model_input)
 
     assert out.shape == (num_requests, 1)
+    expected = torch.softmax(logits[:, 0, [NO_ID, YES_ID]], dim=-1)[:, 1]
+    torch.testing.assert_close(torch.sigmoid(out.squeeze(-1)), expected)
+
+
+VL_MODEL_ID = "Qwen/Qwen3-VL-Reranker-2B"
+VL_RERANKER_OVERRIDES = {
+    **RERANKER_OVERRIDES,
+    "architectures": ["Qwen3VLForSequenceClassification"],
+}
+
+
+def _vl_model_config(**overrides):
+    return ModelConfig(
+        model=VL_MODEL_ID,
+        dtype=torch.float32,
+        seed=42,
+        runner="pooling",
+        max_model_len=128,
+        hf_overrides={**VL_RERANKER_OVERRIDES, **overrides},
+    )
+
+
+def _build_vl_reranker(enable_prefix_caching=False):
+    vllm_config = VllmConfig(
+        model_config=_vl_model_config(),
+        cache_config=CacheConfig(
+            block_size=16,
+            cache_dtype="auto",
+            enable_prefix_caching=enable_prefix_caching,
+        ),
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=1,
+            max_num_batched_tokens=128,
+            max_model_len=128,
+            is_encoder_decoder=False,
+        ),
+    )
+
+    # Fake ONLY the optimum-rbln compile/load step; the rest is the real path.
+    def fake_init_model(self):
+        self.model = MagicMock()
+        self.model.get_kvcache_num_blocks.return_value = 1
+        self.model.rbln_config = SimpleNamespace(
+            dtype=torch.float32, use_multiple_decoder=False, decoder_batch_sizes=None
+        )
+        self.rbln_model_config = self.model.rbln_config
+        self.attn_impl = None
+
+    with (
+        set_current_vllm_config(vllm_config),
+        patch.object(RBLNOptimumModelBase, "init_model", fake_init_model),
+    ):
+        return RBLNOptimumQwen3VLForSequenceClassification(vllm_config=vllm_config)
+
+
+def test_rejects_vl_seq_cls_arch_without_reranker_flags():
+    model_config = _vl_model_config(is_original_qwen3_reranker=False)
+    with pytest.raises(ValueError, match="Qwen3VLForSequenceClassification"):
+        is_qwen3_reranker(model_config)
+
+
+def test_vl_reranker_prefix_caching_is_disabled():
+    """Being multimodal, it is not a pooling arch, so only the Qwen3 predicates
+    turn the requested prefix caching off."""
+    model = _build_vl_reranker(enable_prefix_caching=True)
+    assert not model.vllm_config.cache_config.enable_prefix_caching
+
+
+def test_builds_vl_reranker_pooler():
+    model = _build_vl_reranker()
+
+    assert isinstance(model.pooler, RBLNQwen3RerankerPooler)
+    assert model.pooler.get_supported_tasks() == {"classify"}
+    assert (model.false_id, model.true_id) == (NO_ID, YES_ID)
+
+
+def test_vl_forward_reduces_to_2_way_softmax():
+    """sigmoid(forward()) must equal softmax over the yes/no logits."""
+    model = _build_vl_reranker()
+    vocab_size = model.model_config.hf_text_config.vocab_size
+
+    torch.manual_seed(0)
+    # The prefill graph returns the final position only: [1, 1, vocab_size].
+    logits = torch.randn(1, 1, vocab_size)
+    model.model.prefill_decoder = MagicMock(return_value=SimpleNamespace(logits=logits))
+    model_input = ModelInputForRBLN(
+        input_tokens=torch.zeros(1, 5, dtype=torch.long),
+        input_positions=torch.arange(5, dtype=torch.int32).unsqueeze(0),
+        block_tables=torch.zeros(8, dtype=torch.int16),
+        running_requests_ids=["r0"],
+        padded_batch_size=1,
+        batch_rows=slice(0, 1),
+        is_prompt=True,
+    )
+    out = model.forward(model_input)
+
+    assert out.shape == (1, 1)
     expected = torch.softmax(logits[:, 0, [NO_ID, YES_ID]], dim=-1)[:, 1]
     torch.testing.assert_close(torch.sigmoid(out.squeeze(-1)), expected)

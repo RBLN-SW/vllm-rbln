@@ -18,7 +18,13 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from transformers import LlamaConfig, PaliGemmaConfig, Qwen3Config, WhisperConfig
+from transformers import (
+    LlamaConfig,
+    PaliGemmaConfig,
+    Qwen3Config,
+    Qwen3VLConfig,
+    WhisperConfig,
+)
 
 from vllm_rbln.config import OptimumRBLNCompileInputs
 from vllm_rbln.utils.optimum.configuration import sync
@@ -182,6 +188,75 @@ class TestSync:
         monkeypatch.setattr(sync, "compile_cache_name", generate_name)
         check_and_update(cfg)
         assert observed == [([expected_arch], expected_cls, expected_tokens)]
+
+    @pytest.mark.parametrize(
+        ("reranker", "expected_arch", "expected_cls", "expected_phases"),
+        [
+            (False, "Qwen3VLModel", "RBLNQwen3VLModel", None),
+            (
+                True,
+                "Qwen3VLForSequenceClassification",
+                "RBLNQwen3VLForConditionalGeneration",
+                ["prefill"],
+            ),
+        ],
+        ids=["embedding", "reranker"],
+    )
+    def test_qwen3_vl_pooling_architecture_is_resolved_before_cache_lookup(
+        self, monkeypatch, reranker, expected_arch, expected_cls, expected_phases
+    ):
+        from vllm_rbln.platform.optimum_impl import check_and_update
+
+        hf_config = Qwen3VLConfig(
+            architectures=[
+                "Qwen3VLForSequenceClassification"
+                if reranker
+                else "Qwen3VLForConditionalGeneration"
+            ],
+            is_original_qwen3_reranker=reranker,
+            classifier_from_token=["no", "yes"] if reranker else None,
+        )
+        cfg = SimpleNamespace(
+            model_config=SimpleNamespace(
+                model="Qwen/Qwen3-VL-2B",
+                architectures=hf_config.architectures,
+                runner_type="pooling",
+                hf_config=hf_config,
+                hf_text_config=hf_config.text_config,
+                multimodal_config=None,
+                max_model_len=1024,
+                dtype=torch.bfloat16,
+            ),
+            parallel_config=SimpleNamespace(
+                worker_cls="auto", tensor_parallel_size=1, pipeline_parallel_size=1
+            ),
+            scheduler_config=SimpleNamespace(
+                max_num_seqs=1, max_num_batched_tokens=2048, async_scheduling=False
+            ),
+            cache_config=SimpleNamespace(
+                block_size=1024,
+                gpu_memory_utilization=0.9,
+                user_specified_block_size=True,
+                enable_prefix_caching=False,
+            ),
+            additional_config={},
+            speculative_config=None,
+        )
+        observed = []
+
+        def generate_name(inputs):
+            observed.append(
+                (
+                    list(inputs.hf_config.architectures),
+                    inputs.model_cls,
+                    inputs.rbln_config.get("phases"),
+                )
+            )
+            return compile_cache_name(inputs)
+
+        monkeypatch.setattr(sync, "compile_cache_name", generate_name)
+        check_and_update(cfg)
+        assert observed == [([expected_arch], expected_cls, expected_phases)]
 
     def test_repeated_sync_preserves_the_compile_inputs(self, vllm_config_factory):
         cfg = vllm_config_factory()

@@ -48,7 +48,11 @@ def check_and_update(vllm_config: "VllmConfig") -> None:
         is_qwen3_embedding,
         is_qwen3_reranker,
     )
-    from vllm_rbln.utils.optimum.registry import get_rbln_model_info, is_pooling_arch
+    from vllm_rbln.utils.optimum.registry import (
+        get_rbln_model_info,
+        is_multi_modal,
+        is_pooling_arch,
+    )
 
     # Everything below, and the sync at the end, reads additional_config as an
     # OptimumRBLNConfig. The sync also writes its derived fields back.
@@ -66,17 +70,22 @@ def check_and_update(vllm_config: "VllmConfig") -> None:
     # this only has to cover the RBLN side.
     get_rbln_model_info(model_config)
 
+    is_vl = is_multi_modal(model_config.hf_config)
     if is_qwen3_reranker(model_config):
         # Callers pass `Qwen3ForSequenceClassification`, which is how vLLM
         # selects convert=classify; optimum-rbln has no such class. Map it
         # back to `Qwen3ForCausalLM`: the score comes from two vocabulary
         # logits, so the graph needs lm_head, which `Qwen3Model` would drop.
-        model_config.hf_config.architectures = ["Qwen3ForCausalLM"]
+        # `Qwen3VLForSequenceClassification` is registered as it is.
+        if not is_vl:
+            model_config.hf_config.architectures = ["Qwen3ForCausalLM"]
     elif is_qwen3_embedding(model_config):
-        # The architecture of Qwen3-Embedding model in huggingface
-        # is `Qwen3ForCausalLM`. But it have to be mapped to `Qwen3Model`
-        # for optimum-rbln.
-        model_config.hf_config.architectures = ["Qwen3Model"]
+        # Qwen3-Embedding and Qwen3-VL-Embedding ship the generation
+        # architecture, but optimum-rbln compiles an embedder as the bare
+        # backbone, `Qwen3Model` or `Qwen3VLModel`.
+        model_config.hf_config.architectures = [
+            "Qwen3VLModel" if is_vl else "Qwen3Model"
+        ]
 
     if model_config.multimodal_config is not None:
         # Optimum visual graphs expect pixels normalized by the CPU processor.
