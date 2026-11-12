@@ -53,9 +53,10 @@ existing path.
  RBLNSampler.forward                                          |
    FusedPenaltyState.plan()                                   |
      for each request in the batch:                           |
-       new request    -> fold prompt (rep only),              |
-                         logit_bias, outputs so far           |
-       known request  -> fold only the outputs                |
+       new request    -> write its prompt (rep only),         |
+                         logit_bias and outputs so far        |
+                         into its lanes                       |
+       known request  -> write only the outputs               |
                          added since the last step            |
      K = smallest bucket >= most slots any row uses           |
      copy out cidx [rows, K], lanes [rows, 3, K, 64]          |
@@ -167,7 +168,7 @@ out = scatter(logits_view, cidx, v)
   handling. A request's state is dropped when it finishes, not when a step
   leaves it out: a prefill step lists only the new request. Padded rows of the
   batch bucket stay at identity.
-- The prompt is folded in only with a repetition penalty. Frequency and
+- The prompt is written into the lanes only with a repetition penalty. Frequency and
   presence read output tokens only, so they never take slots for the prompt.
 - Each request stores only its used slots. The tail that repeats slot 0 is
   filled when the step's buffer is assembled.

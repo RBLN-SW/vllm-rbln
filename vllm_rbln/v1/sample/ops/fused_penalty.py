@@ -323,7 +323,8 @@ class FusedPenaltyState:
         vocab_size: int,
         num_rows: int,
     ) -> tuple[int, int, int, torch.Tensor, torch.Tensor] | None:
-        """Fold this step's tokens in and return (rows, row_vocab, k, cidx, lanes).
+        """Write this step's new tokens into the lanes. Return
+        (rows, row_vocab, k, cidx, lanes).
 
         `num_rows` is the padded batch. Rows past `len(req_ids)` are identity.
         `k` is the smallest bucket that fits the live requests. None when one of
@@ -338,7 +339,7 @@ class FusedPenaltyState:
                 req.is_vocab_split != split or n_out < req.num_processed_output_tokens
             ):
                 req = None
-            # The folded prefix holds only resolved token ids.
+            # Tokens already written are all resolved ids.
             start = req.num_processed_output_tokens if req is not None else 0
             for j in range(start, n_out):
                 if outs[j] < 0:  # async placeholder
