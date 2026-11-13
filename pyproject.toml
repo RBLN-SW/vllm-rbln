@@ -43,8 +43,8 @@ dependencies = [
     "torchvision",
     "torchaudio",
     "torchcodec",
-    "torch-rbln>=0.12.0,<0.12.1 ; platform_machine == 'x86_64'",
-    "optimum-rbln>=0.12.1a7,<0.12.2",
+    "torch-rbln>=0.12.1a1,<0.12.2 ; platform_machine == 'x86_64'",
+    "optimum-rbln>=0.12.1a9,<0.12.2",
 ]
 
 [project.optional-dependencies]
@@ -75,7 +75,7 @@ dev = [
 ]
 
 runtime = [
-    "rebel-compiler>=0.12.1.dev483,<0.12.2",
+    "rebel-compiler>=0.12.1.dev618,<0.12.2",
 ]
 kv_connectors = [
     "nixl-rbln>=0.12.0rc1,<0.12.1",

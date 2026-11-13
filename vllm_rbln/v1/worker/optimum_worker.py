@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -39,8 +39,8 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 from vllm_rbln import envs
 from vllm_rbln.logger import init_logger
-from vllm_rbln.utils.optimum.configuration.runtime import (
-    get_runtime_num_blocks,
+from vllm_rbln.utils.optimum.configuration.runtime_config import (
+    resolve_runtime_num_blocks,
     update_num_blocks,
 )
 from vllm_rbln.v1.worker.optimum_model_runner import RBLNOptimumModelRunner
@@ -175,10 +175,9 @@ class RBLNOptimumWorker(WorkerBase):
         # If the model is compiled in the runner,
         # the number of blocks is not set in the vLLM config yet.
         # Therefore, we need to update it here.
-        # FIXME: Sync block counts after compilation in model_base.init_model().
         if not self.model_runner.vllm_config.cache_config.num_gpu_blocks:
-            num_blocks = get_runtime_num_blocks(
-                self.model_runner.vllm_config.model_config.hf_config,
+            num_blocks = resolve_runtime_num_blocks(
+                self.model_runner.vllm_config,
                 self.model_runner.model.rbln_model_config,
             )
             assert num_blocks is not None, (

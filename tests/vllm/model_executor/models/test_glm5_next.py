@@ -208,3 +208,49 @@ def test_vision_encoder_builds_its_inputs_from_upstream_rope(monkeypatch):
     torch.testing.assert_close(sin[:8], angles.sin())
     assert (cos[8:] == 1).all() and not sin[8:].any()
     assert not key_bias[..., :8].any() and (key_bias[..., 8:] < -1e4).all()
+
+
+def test_only_scratch_aux_caches_are_left_out_of_prefix_caching(monkeypatch):
+    import vllm.distributed.parallel_state as parallel_state
+    from vllm.config import set_current_vllm_config
+
+    import vllm_rbln.model_executor.models.glm5_next as glm
+    from tests.vllm.vllm_config import make_vllm_config
+
+    config = make_vllm_config(block_size=128)
+    text = config.model_config.hf_text_config
+    text.linear_num_heads = 4
+    text.linear_head_dim = 128
+    text.linear_lower_bound = -5.0
+    text.linear_conv_kernel_dim = 4
+    text.kv_lora_rank = 512
+    text.index_kpool = glm.RBLNGlm5NextIndexerBackend.compress_ratio
+    text.index_n_heads = 2
+    text.index_head_dim = 32
+    text.index_topk = 4 * text.index_kpool
+    text.q_lora_rank = 64
+    config.model_config.dtype = torch.bfloat16
+    config.cache_config.cache_dtype = "fp8"
+    config.speculative_config = SimpleNamespace(num_speculative_tokens=2)
+    monkeypatch.setattr(
+        parallel_state, "_TP", SimpleNamespace(world_size=1, rank_in_group=0)
+    )
+    with set_current_vllm_config(config):
+        glm.RBLNGlm5NextKDA(text, "model.layers.0.self_attn")
+        glm.RBLNGlm5NextIndexer(text, "model.layers.1.self_attn.indexer")
+
+    context = config.compilation_config.static_forward_context
+    flags = {
+        name: module.get_aux_cache_spec(config).prefix_cacheable
+        for name, module in context.items()
+        if hasattr(module, "get_aux_cache_spec")
+    }
+    assert flags == {
+        # KDA: two state groups, then the conv ring and a draft cache per group.
+        "model.layers.0.self_attn.attn.2": True,
+        "model.layers.0.self_attn.attn.3": False,
+        "model.layers.0.self_attn.attn.4": False,
+        # DSA indexer: the key scales, then the tail ring.
+        "model.layers.1.self_attn.attn.2": True,
+        "model.layers.1.self_attn.attn.3": False,
+    }

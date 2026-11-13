@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -439,12 +439,11 @@ class DynamicKvSizer:
         """Per-chiplet bytes to keep out of the KV budget when the scheduler
         will run sub-block prefix caching."""
         rbln_config = self.vllm_config.additional_config
-        assert rbln_config.prefill_chunk_size is not None  # resolved at start-up
         in_use = sub_block_size_in_use(
             enable_prefix_caching=self.cache_config.enable_prefix_caching,
             sub_block_cache=rbln_config.enable_sub_block_cache,
             block_size=self.cache_config.block_size,
-            prefill_chunk_size=rbln_config.prefill_chunk_size,
+            prefill_chunk_sizes=rbln_config.prefill_chunk_size,
             kv_cache_config=self.model_runner.kv_cache_config,
             sub_block_size=rbln_config.sub_block_size,
         )

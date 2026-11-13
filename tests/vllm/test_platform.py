@@ -652,48 +652,57 @@ class TestRejectedConfigs:
         with pytest.raises(ValueError, match="exceeds"):
             reconfigure(_prefill_chunk(256))
 
+    def test_prefill_chunk_above_max_num_scheduled_tokens_is_refused(self, reconfigure):
+        def mutate(config):
+            _prefill_chunk([32, 64])(config)
+            config.scheduler_config.max_num_scheduled_tokens = 32
+
+        with pytest.raises(ValueError, match="max_num_scheduled_tokens"):
+            reconfigure(mutate)
+
     def test_an_unset_prefill_chunk_resolves_to_the_token_budget(self, reconfigure):
         config = reconfigure(lambda config: None)
-        assert (
-            config.additional_config.prefill_chunk_size
-            == config.scheduler_config.max_num_batched_tokens
-        )
+        assert config.additional_config.prefill_chunk_size == [
+            config.scheduler_config.max_num_batched_tokens
+        ]
 
     def test_a_prefill_chunk_below_the_token_budget_is_taken(self, reconfigure):
         config = reconfigure(_prefill_chunk(64))
-        assert config.additional_config.prefill_chunk_size == 64
+        assert config.additional_config.prefill_chunk_size == [64]
 
-    @pytest.mark.parametrize(
-        "feature, enable",
-        [
-            ("data parallelism", lambda c: _ranks(data_parallel_size=2)(c)),
-            (
-                "RBLN NIXL KV transfer",
-                lambda c: setattr(
-                    c,
-                    "kv_transfer_config",
-                    SimpleNamespace(
-                        kv_connector="RblnNixlPushConnector",
-                        kv_connector_extra_config={},
-                    ),
-                ),
-            ),
-        ],
-    )
-    def test_a_prefill_chunk_below_the_token_budget_refuses(
-        self, reconfigure, feature, enable
+    @pytest.mark.parametrize("sizes", [64, [32, 64]])
+    def test_prefill_chunk_below_the_token_budget_takes_data_parallelism(
+        self, reconfigure, sizes
     ):
         def mutate(config):
-            _prefill_chunk(64)(config)
-            enable(config)
+            _prefill_chunk(sizes)(config)
+            _ranks(data_parallel_size=2)(config)
 
-        with pytest.raises(ValueError, match=feature):
+        config = reconfigure(mutate)
+        assert config.additional_config.prefill_chunk_size == (
+            sizes if isinstance(sizes, list) else [sizes]
+        )
+
+    def test_several_prefill_chunk_sizes_refuse_non_causal_attention(self, reconfigure):
+        def mutate(config):
+            _prefill_chunk([32, 64])(config)
+            config.attention_config.use_non_causal = True
+
+        with pytest.raises(ValueError, match="non-causal attention"):
             reconfigure(mutate)
+
+    def test_one_prefill_chunk_size_keeps_non_causal_attention(self, reconfigure):
+        def mutate(config):
+            _prefill_chunk(64)(config)
+            config.attention_config.use_non_causal = True
+
+        reconfigure(mutate)
 
     @pytest.mark.parametrize(
         "kv_connector, extra",
         [
             ("RblnNixlConnector", {}),
+            ("RblnNixlPushConnector", {}),
             (
                 "MultiConnector",
                 {"connectors": [{"kv_connector": "RblnNixlPullConnector"}]},
@@ -819,7 +828,7 @@ def _ranks(
     return mutate
 
 
-def _prefill_chunk(size: int):
+def _prefill_chunk(size: int | list[int]):
     """A mutator that sets --rbln-prefill-chunk-size, with sub-block caching off."""
 
     def mutate(config: VllmConfig) -> None:
@@ -1449,6 +1458,53 @@ class TestDflashTokenBudget:
             config.scheduler_config.max_num_scheduled_tokens = 8
 
         assert reconfigure(mutate).scheduler_config.max_num_scheduled_tokens == 8
+
+
+class TestStrictProducerRequests:
+    # The config is built right before validating, since the hook keeps the
+    # last config built in this process and reads its role per request.
+    @staticmethod
+    def _validate(kv_role, max_tokens, **engine_kwargs):
+        from vllm.config import KVTransferConfig
+        from vllm.sampling_params import SamplingParams
+
+        _build(
+            kv_transfer_config=KVTransferConfig(
+                kv_connector="RblnNixlConnector", kv_role=kv_role
+            ),
+            **engine_kwargs,
+        )
+        RblnPlatform.validate_request(None, SamplingParams(max_tokens=max_tokens))
+
+    @pytest.mark.parametrize("max_tokens", [2, None])
+    def test_a_producer_refuses_more_than_one_output_token(self, max_tokens):
+        from vllm.exceptions import VLLMValidationError
+
+        # A client error, so the API server returns the message to the caller.
+        with pytest.raises(VLLMValidationError, match=f"got max_tokens={max_tokens}"):
+            self._validate("kv_producer", max_tokens)
+
+    def test_a_producer_accepts_the_prefill_leg(self):
+        self._validate("kv_producer", 1)
+
+    def test_a_producer_leaves_pooling_alone(self):
+        from vllm.config import KVTransferConfig
+        from vllm.pooling_params import PoolingParams
+
+        _build(
+            kv_transfer_config=KVTransferConfig(
+                kv_connector="RblnNixlConnector", kv_role="kv_producer"
+            )
+        )
+        RblnPlatform.validate_request(None, PoolingParams())
+
+    @pytest.mark.parametrize("kv_role", ["kv_both", "kv_consumer"])
+    def test_a_role_that_decodes_accepts_any_length(self, kv_role):
+        self._validate(kv_role, None)
+
+    def test_kv_offloading_turns_a_producer_into_a_role_that_decodes(self):
+        # Upstream rewrites the role to kv_both after the platform hook runs.
+        self._validate("kv_producer", 4, kv_offloading_size=1)
 
 
 # Resolving the vllm path reads the host's device now that RBLN-CA* refuses it,

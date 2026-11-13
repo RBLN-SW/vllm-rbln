@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -39,7 +39,7 @@ import os
 from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from vllm.config.utils import config as vllm_config_dataclass
 
 from vllm_rbln.logger import init_logger
@@ -79,18 +79,19 @@ class RBLNConfigBase:
 
     sub_block_size: int | None = Field(default=None, gt=0)
     """Token granularity for prefix cache hit calculation.
-    If None, uses prefill_chunk_size.
+    If None, uses the longest prefill_chunk_size that divides block_size.
     """
-
-    prefill_chunk_size: int | None = Field(default=None, gt=0)
-    """Length of the compiled prefill graph. If None, the vllm model path uses
-    max_num_batched_tokens. The optimum model path uses optimum-rbln's default
-    when compiling, or the pre-compiled model's chunk size."""
 
 
 @vllm_config_dataclass
 class RBLNConfig(RBLNConfigBase):
     """RBLN NPU options for the vllm model path."""
+
+    prefill_chunk_size: list[int] | None = None
+    """Prefill graph lengths for the vllm model path. Each step uses the shortest
+    compiled length that fits its chunk. The longest length limits one request's
+    prefill chunk within the max_num_batched_tokens step budget. A single length
+    compiles one prefill graph. If None, uses [max_num_batched_tokens]."""
 
     enforce_model_fp32: bool = False
     """Force the model dtype to fp32 instead of model_config.dtype."""
@@ -168,6 +169,17 @@ class RBLNConfig(RBLNConfigBase):
         factors["use_dynamic_kv_cache"] = self.use_dynamic_kv_cache is not False
         return hash_factors(factors)
 
+    @field_validator("prefill_chunk_size", mode="before")
+    @classmethod
+    def _one_prefill_chunk_size_is_a_list(cls, value: Any) -> Any:
+        return [value] if isinstance(value, int) else value
+
+    @property
+    def max_prefill_chunk_size(self) -> int:
+        """The longest prefill chunk."""
+        assert self.prefill_chunk_size is not None  # resolved at start-up
+        return max(self.prefill_chunk_size)
+
     def __post_init__(self) -> None:
         buckets = self.decode_batch_bucket_manual_buckets
         if any(b <= 0 for b in buckets):
@@ -184,11 +196,20 @@ class RBLNConfig(RBLNConfigBase):
             raise ValueError("encoder_token_budgets must all be > 0")
         if len(budgets) != len(set(budgets)):
             raise ValueError("encoder_token_budgets must be unique")
+        sizes = self.prefill_chunk_size
+        if sizes is not None:
+            if not sizes:
+                raise ValueError("prefill_chunk_size must not be empty")
+            if any(s <= 0 for s in sizes):
+                raise ValueError("prefill_chunk_size must all be > 0")
+            if len(sizes) != len(set(sizes)):
+                raise ValueError("prefill_chunk_size must be unique")
+            self.prefill_chunk_size = sorted(sizes)
 
 
 @dataclass
-class OptimumRBLNCompileInputs:
-    """Resolved inputs shared by cache hashing, vLLM config sync and compilation.
+class OptimumRBLNCompileConfig:
+    """Resolved model compilation settings shared by cache hashing and compilation.
 
     Must remain serializable for worker transfer via `additional_config`.
     """
@@ -205,6 +226,22 @@ class OptimumRBLNCompileInputs:
 @vllm_config_dataclass
 class OptimumRBLNConfig(RBLNConfigBase):
     """RBLN NPU options for the optimum-rbln model path."""
+
+    prefill_chunk_size: int | None = Field(default=None, gt=0)
+    """Length of the compiled prefill graph. Accepts one length. If None, uses
+    optimum-rbln's default when compiling, or the pre-compiled model's chunk
+    size. Independent of the max_num_batched_tokens step budget."""
+
+    @field_validator("prefill_chunk_size", mode="before")
+    @classmethod
+    def _one_prefill_chunk_size_is_an_int(cls, value: Any) -> Any:
+        if isinstance(value, list):
+            if len(value) != 1:
+                raise ValueError(
+                    "The optimum model path requires exactly one prefill_chunk_size."
+                )
+            return value[0]
+        return value
 
     num_devices_per_local_rank: int = 1
     """Number of NPU devices assigned to each local rank."""
@@ -226,10 +263,10 @@ class OptimumRBLNConfig(RBLNConfigBase):
     image_prefill_chunk_size: list[int] | None = field(default=None, metadata=_DERIVED)
     """Compiled image-prefill buckets (gemma3/gemma4) used for scheduler padding."""
 
-    compile_inputs: OptimumRBLNCompileInputs | None = field(
+    compile_config: OptimumRBLNCompileConfig | None = field(
         default=None, metadata=_DERIVED
     )
-    """Inputs shared by cache lookup and compilation.
+    """Settings shared by cache lookup and compilation.
 
     Runtime synchronization must not mutate them.
     """
@@ -262,8 +299,9 @@ class OptimumRBLNConfig(RBLNConfigBase):
         return hash_factors(get_hash_factors(self, ignored_factors))
 
 
-# Every class a `--rbln-*` flag can belong to.
-_CONFIG_CLASSES: tuple[type[RBLNConfigBase], ...] = (OptimumRBLNConfig, RBLNConfig)
+# The first class supplies shared CLI types. Parse prefill lengths as a list;
+# the optimum config validates that it contains exactly one length.
+_CONFIG_CLASSES: tuple[type[RBLNConfigBase], ...] = (RBLNConfig, OptimumRBLNConfig)
 
 # TODO(vllm-rbln>=0.14.0): delete. Former additional_config keys, still accepted
 # with a warning.
