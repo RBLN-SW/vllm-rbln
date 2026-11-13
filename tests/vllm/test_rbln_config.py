@@ -285,6 +285,7 @@ def test_only_compile_fields_change_the_hash():
     """
     base = RBLNConfig().compute_hash()
     assert RBLNConfig(use_custom_sampler=False).compute_hash() == base
+    assert RBLNConfig(use_fused_sampling=True).compute_hash() == base
     assert RBLNConfig(enable_sub_block_cache=False).compute_hash() == base
     assert RBLNConfig(sub_block_size=64).compute_hash() == base
     assert RBLNConfig(use_w8a8=True).compute_hash() != base

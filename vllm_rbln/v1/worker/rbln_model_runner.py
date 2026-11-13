@@ -304,6 +304,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             self.sampler = RBLNSampler(
                 logprobs_mode=self.model_config.logprobs_mode,
                 compile_context=self.compile_context,
+                fused_sampling=self.rbln_config.use_fused_sampling,
             )
             logger.info("Using RBLN sampler.")
         else:
@@ -313,6 +314,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # async scheduling is the runner's concern; the copy into them is
         # enqueued by the sampler, next to the launch that produces the source.
         self._prev_token_host_buffer: torch.Tensor | None = None
+        # Last step's sampled tokens, as (device, host copy, copy event).
+        self._prev_sampled_host: (
+            tuple[torch.Tensor, torch.Tensor, torch.Event | None] | None
+        ) = None
         self._sampled_token_ring: list[torch.Tensor] = []
         self._ring_slot = 0
         self._async_logprobs_tensors: LogprobsTensors | None = None
@@ -620,6 +625,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # Remove the finished requests from the persistent batch.
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
+        if isinstance(self.sampler, RBLNSampler):
+            self.sampler.forget_requests(scheduler_output.finished_req_ids)
 
         scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()
         cached_req_ids = self.input_batch.req_id_to_index.keys()
@@ -821,6 +828,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         """
         self.input_batch.remove_request(req_id)
         req_state = self.requests[req_id]
+        # Same id, new prompt and params: the fused-sampling state starts over.
+        if isinstance(self.sampler, RBLNSampler):
+            self.sampler.forget_requests([req_id])
 
         req_state.prompt_token_ids = new_req_data.prompt_token_ids
         req_state.mm_features = new_req_data.mm_features
@@ -1354,15 +1364,15 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             bucket = logits.shape[0]
             # Keyed off the installed sampler: only RBLNSampler takes the kwarg,
             # and the executor's golden validation swaps self.sampler after __init__.
-            staging = (
-                {"staging_owner": self}
-                if self.use_async_scheduling and isinstance(self.sampler, RBLNSampler)
-                else {}
-            )
+            extra: dict[str, Any] = {}
+            if isinstance(self.sampler, RBLNSampler):
+                extra["input_batch"] = self.input_batch
+                if self.use_async_scheduling:
+                    extra["staging_owner"] = self
             out = self.sampler(
                 logits=logits,
                 sampling_metadata=_pad_sampling_metadata(sampling_metadata, bucket),
-                **staging,
+                **extra,
             )
         else:
             if self.rbln_config.use_custom_sampler:
@@ -1495,8 +1505,18 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             if not req_output_token_ids or req_output_token_ids[-1] != -1:
                 continue
             if sampled is None:
-                sampled = prev_sampled[:, 0].tolist()
+                sampled = self._prev_sampled_tokens(prev_sampled)
             req_output_token_ids[-1] = sampled[prev_row]
+
+    def _prev_sampled_tokens(self, prev_sampled: torch.Tensor) -> list[int]:
+        # Read the async output's D2H, which queues ahead of this step's forward.
+        # prev_sampled.tolist() would wait for that forward to finish.
+        host = self._prev_sampled_host
+        if host is not None and host[0] is prev_sampled:
+            if host[2] is not None:
+                host[2].synchronize()
+            return host[1][:, 0].tolist()
+        return prev_sampled[:, 0].tolist()
 
     def _bookkeeping_sync(
         self,
@@ -2033,6 +2053,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             fail_fast=self.fail_fast,
             rank=self.parallel_config.rank,
             dp_rank=self.parallel_config.data_parallel_rank,
+        )
+        self._prev_sampled_host = (
+            sampler_output.sampled_token_ids,
+            *async_output.host_copy(),
         )
         return async_output
 
@@ -2691,10 +2715,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 spec_token_ids=[[] for _ in range(num_reqs)],
             )
 
-            _ = self.sampler(
-                logits=logits,
-                sampling_metadata=dummy_metadata,
-            )
+            if isinstance(self.sampler, RBLNSampler):
+                self.sampler.warm_up(logits=logits, sampling_metadata=dummy_metadata)
+            else:
+                _ = self.sampler(logits=logits, sampling_metadata=dummy_metadata)
 
             if num_reqs > 1:
                 # A batch smaller than the bucket takes `_pad_rows`'s `torch.cat`
