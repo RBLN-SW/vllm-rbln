@@ -80,6 +80,87 @@ class TestResolveMultiModalSupport:
             runner._resolve_mm_support()
 
 
+class _MmPrefixModel(_InGraphMergeModel):
+    def __init__(self, max_mm_prefix_range_len):
+        super().__init__()
+        self.max_mm_prefix_range_len = max_mm_prefix_range_len
+
+
+class TestResolveMmPrefixSupport:
+    """An mm prefix LM is served only when every cap the scheduler puts on a
+    prefill chunk holds its longest range."""
+
+    @staticmethod
+    def _runner(make_model_runner, monkeypatch, model, **config):
+        monkeypatch.setattr(
+            ModelConfig, "supports_multimodal_inputs", property(lambda self: True)
+        )
+        monkeypatch.setattr(ModelConfig, "is_mm_prefix_lm", property(lambda self: True))
+        runner = make_model_runner(**config)
+        runner.model = model
+        return runner
+
+    def test_a_model_naming_no_longest_range_is_refused(
+        self, make_model_runner, monkeypatch
+    ):
+        runner = self._runner(make_model_runner, monkeypatch, _InGraphMergeModel())
+
+        with pytest.raises(ValueError, match="SupportsRBLNMmPrefix"):
+            runner._resolve_mm_support()
+
+    @pytest.mark.parametrize(
+        "flag", ["long_prefill_token_threshold", "max_num_scheduled_tokens"]
+    )
+    def test_a_cap_that_would_split_a_range_is_refused(
+        self, make_model_runner, monkeypatch, flag
+    ):
+        runner = self._runner(
+            make_model_runner, monkeypatch, _MmPrefixModel(128), **{flag: 64}
+        )
+
+        with pytest.raises(ValueError, match=flag):
+            runner._resolve_mm_support()
+
+    def test_a_threshold_and_chunk_equal_to_the_longest_range_are_taken(
+        self, make_model_runner, monkeypatch
+    ):
+        runner = self._runner(
+            make_model_runner,
+            monkeypatch,
+            _MmPrefixModel(280),
+            long_prefill_token_threshold=280,
+            max_num_batched_tokens=280,
+        )
+
+        assert runner._resolve_mm_support() is True
+
+    def test_a_range_longer_than_the_longest_chunk_is_refused_with_a_fix(
+        self, make_model_runner, monkeypatch
+    ):
+        # The step budget holds the range; only the longest chunk does not.
+        runner = self._runner(
+            make_model_runner,
+            monkeypatch,
+            _MmPrefixModel(1120),
+            max_num_batched_tokens=512,
+            block_size=8192,
+            additional_config={"prefill_chunk_size": [512]},
+        )
+
+        with pytest.raises(ValueError) as refused:
+            runner._resolve_mm_support()
+        message = str(refused.value)
+        assert (
+            "--max-num-batched-tokens 2048 --rbln-prefill-chunk-size 512,2048"
+            in message
+        )
+        assert "--rbln-prefill-chunk-size 512,1152" in message
+        assert (
+            "max_soft_tokens (1120)" in message
+            and "divides --block-size (8192)" in message
+        )
+
+
 class TestGatherMultimodalEmbeddings:
     def test_scheduled_images_are_encoded_and_cached_by_hash(
         self, make_model_runner, monkeypatch
@@ -552,3 +633,46 @@ class TestBookkeepingSyncSpecDecode:
 
         assert step([[101, 102], [201, -1]]) == [2, 1]
         assert step([[103], [202]]) == [1, 1]
+
+
+@pytest.mark.parametrize(
+    ("kv_role", "prefill"), [("kv_producer", True), ("kv_both", False)]
+)
+def test_a_producer_stages_its_last_prompt_token_as_a_prefill(
+    make_model_runner, monkeypatch, kv_role, prefill
+):
+    # A full prefix hit leaves one prompt token. A producer compiled only the
+    # prefill graph, so the step has to reach the model at that graph's width.
+    from vllm.config import KVTransferConfig
+
+    monkeypatch.setattr(
+        mr,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: False)
+    runner = make_model_runner(
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="RblnNixlConnector", kv_role=kv_role
+        )
+    )
+    staged = {}
+
+    def model(**kwargs):
+        staged.update(kwargs)
+        return torch.zeros(1, 1, 8), torch.zeros(1, 8), None
+
+    runner.model_executable = model
+
+    runner.execute_model(
+        schedule_new("a", num_computed_tokens=[2], num_scheduled_tokens=[1])
+    )
+
+    assert runner.is_prefill is prefill
+    assert staged["input_ids"][0, 0].item() == 3
+    assert staged["positions"][0, 0].item() == 2
+    if prefill:
+        assert staged["input_ids"].shape == (1, runner.prefill_chunk_sizes[0])
+        assert staged["token_indices"].tolist() == [0]
+    else:
+        assert staged["input_ids"].shape[1] == 1

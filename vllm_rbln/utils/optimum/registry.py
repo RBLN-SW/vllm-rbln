@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -55,6 +55,10 @@ _RBLN_ENCODER_DECODER_MODELS: dict[str, tuple[str, str]] = {
 }
 
 _RBLN_MULTIMODAL_MODELS = {
+    "Llama4ForConditionalGeneration": (
+        "llama4",
+        "RBLNLlama4ForConditionalGeneration",
+    ),
     "LlavaNextForConditionalGeneration": (
         "llava_next",
         "RBLNLlavaNextForConditionalGeneration",
@@ -133,6 +137,22 @@ def is_multi_modal(config: PretrainedConfig) -> bool:
 
 def is_pooling_arch(config: PretrainedConfig) -> bool:
     return is_arch_supported(config, _RBLN_EMBEDDING_MODELS)
+
+
+# Qwen3 embeddings are remapped from Qwen3ForCausalLM to Qwen3Model first.
+# These checks classify architecture names. Only Qwen3Model is decoder pooling.
+# Architecture        Decoder pooling  Encoder pooling
+# Qwen3Model          True             False
+# Qwen3ForCausalLM    False            False
+def is_decoder_pooling_arch(config: PretrainedConfig) -> bool:
+    """Whether pooling uses a decoder graph with a KV cache."""
+    architectures = getattr(config, "architectures", None) or []
+    return bool(architectures) and architectures[0] == "Qwen3Model"
+
+
+def is_encoder_pooling_arch(config: PretrainedConfig) -> bool:
+    """Whether pooling uses an encoder graph without a KV cache."""
+    return is_pooling_arch(config) and not is_decoder_pooling_arch(config)
 
 
 def is_enc_dec_arch(config: PretrainedConfig) -> bool:

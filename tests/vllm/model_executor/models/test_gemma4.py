@@ -1,0 +1,596 @@
+# Copyright 2026 Rebellions Inc. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at:
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""The RBLN Gemma4 model's own parts, on CPU and without a checkpoint: the
+vision encoder against HF's, its graph buckets, and the in-graph merge of
+image embeddings."""
+
+import operator
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import Mock
+
+import pytest
+import torch
+from torch import nn
+from transformers import Gemma4VisionConfig, Gemma4VisionModel
+from vllm.forward_context import get_forward_context, override_forward_context
+from vllm.model_executor.models.gemma4 import Gemma4Attention
+from vllm.model_executor.models.gemma4_mm import Gemma4ForConditionalGeneration
+
+import vllm_rbln.model_executor.models.gemma4 as gemma4
+from vllm_rbln.compilation.compiler import compile, mark_decoder_regions
+from vllm_rbln.model_executor.models.gemma4 import RBLNGemma4ForConditionalGeneration
+from vllm_rbln.v1.attention.backends.flash_attention import RBLNFlashAttentionMetadata
+
+POOL = 3
+
+
+class _Identity(nn.Module):
+    def forward(self, inputs_embeds):
+        return inputs_embeds
+
+
+def _bare_model(**attrs) -> RBLNGemma4ForConditionalGeneration:
+    model = RBLNGemma4ForConditionalGeneration.__new__(
+        RBLNGemma4ForConditionalGeneration
+    )
+    nn.Module.__init__(model)
+    model.mm_prefix_attn_layers = []
+    object.__setattr__(model, "_mm_encoder", None)
+    for key, value in attrs.items():
+        setattr(model, key, value)
+    return model
+
+
+def _vision_tower() -> Gemma4VisionModel:
+    torch.manual_seed(0)
+    config = Gemma4VisionConfig(
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        patch_size=2,
+        pooling_kernel_size=POOL,
+        position_embedding_size=16,
+        standardize=True,
+    )
+    tower = Gemma4VisionModel(config).eval()
+    with torch.no_grad():
+        for param in tower.parameters():
+            param.normal_(std=0.2)
+        tower.std_bias.normal_()
+        tower.std_scale.uniform_(0.5, 1.5)
+    return tower
+
+
+def _image(width: int, height: int, num_patches: int):
+    """A row-major patch grid, padded the way the processor pads it."""
+    grid = [(x, y) for y in range(height) for x in range(width)]
+    positions = torch.full((num_patches, 2), -1)
+    positions[: len(grid)] = torch.tensor(grid)
+    pixels = torch.rand(num_patches, 3 * 2 * 2)
+    pixels[len(grid) :] = 0
+    return pixels, positions
+
+
+def test_the_vision_encoder_matches_hfs():
+    # The encoder pads every image to its bucket and runs attention spelled out;
+    # what comes back must be HF's soft tokens for the image alone.
+    tower = _vision_tower()
+    model = _bare_model(
+        vision_tower=tower,
+        embed_vision=_Identity(),
+        model_dtype=torch.float32,
+        mm_encoder_patch_buckets=[90],
+    )
+    pixels, positions = _image(9, 9, num_patches=81)
+
+    with torch.no_grad():
+        got = model._encode_vision(pixels, positions)
+        expected = tower(
+            pixel_values=pixels[None], pixel_position_ids=positions[None]
+        ).last_hidden_state
+
+    assert got.shape == (9 * 9 // POOL**2, 32)
+    torch.testing.assert_close(got, expected, rtol=1e-4, atol=1e-4)
+
+
+def test_the_rotary_tables_are_built_once_not_per_image(monkeypatch):
+    # The encoder looks up HF's cos and sin for each patch in the graph, so the
+    # host computes none per image and the soft tokens stay HF's.
+    tower = _vision_tower()
+    model = _bare_model(
+        vision_tower=tower,
+        embed_vision=_Identity(),
+        model_dtype=torch.float32,
+        mm_encoder_patch_buckets=[90],
+    )
+    first, second = _image(6, 3, num_patches=81), _image(3, 9, num_patches=81)
+    with torch.no_grad():
+        model._encode_vision(*first)
+        expected = tower(
+            pixel_values=second[0][None], pixel_position_ids=second[1][None]
+        ).last_hidden_state
+        monkeypatch.setattr(
+            tower.encoder.rotary_emb,
+            "forward",
+            Mock(side_effect=AssertionError("rotary computed per image")),
+        )
+
+        got = model._encode_vision(*second)
+
+    torch.testing.assert_close(got, expected, rtol=1e-4, atol=1e-4)
+
+
+def test_speculative_decoding_is_refused():
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        speculative_config=SimpleNamespace(method="mtp"),
+    )
+
+    with pytest.raises(ValueError, match="speculative decoding"):
+        RBLNGemma4ForConditionalGeneration(vllm_config=vllm_config)
+
+
+def _recording_model(buckets):
+    """A model whose compiled encoder records the patch count it is called at."""
+    tower = _vision_tower()
+    calls = []
+
+    def encoder(patches, positions, padding, *rest):
+        calls.append((patches.shape[1], int((~padding).sum())))
+        return torch.zeros(1, patches.shape[1] // POOL**2, 32)
+
+    model = _bare_model(
+        vision_tower=tower,
+        embed_vision=_Identity(),
+        model_dtype=torch.float32,
+        mm_encoder_patch_buckets=buckets,
+        config=SimpleNamespace(vision_config=tower.config),
+    )
+    object.__setattr__(model, "_mm_encoder", encoder)
+    return model, calls
+
+
+@pytest.mark.parametrize("width, height, bucket", [(6, 3, 18), (9, 3, 45)])
+def test_an_image_takes_the_smallest_bucket_holding_it(width, height, bucket):
+    model, calls = _recording_model([18, 45, 90])
+    pixels, positions = _image(width, height, num_patches=90)
+
+    model._encode_vision(pixels, positions)
+
+    assert calls == [(bucket, width * height)]
+
+
+def test_warm_up_runs_every_bucket_once_full():
+    model, calls = _recording_model([18, 45, 90])
+
+    model.warmup_mm_encoder()
+
+    assert calls == [(18, 18), (45, 45), (90, 90)]
+
+
+def _built_model(monkeypatch, *, cap, budgets, per_layer_input=0, attention_layers=()):
+    """The model as construction resolves it, upstream's model left out."""
+
+    def upstream_init(self, **kwargs):
+        nn.Module.__init__(self)
+        self.layers = nn.ModuleList(attention_layers)
+
+    monkeypatch.setattr(
+        Gemma4ForConditionalGeneration,
+        "__init__",
+        upstream_init,
+    )
+    monkeypatch.setattr(gemma4, "mm_soft_token_cap", lambda info: cap)
+    monkeypatch.setattr(
+        gemma4,
+        "MULTIMODAL_REGISTRY",
+        SimpleNamespace(
+            create_processor=lambda model_config: SimpleNamespace(info=None)
+        ),
+    )
+    model = RBLNGemma4ForConditionalGeneration.__new__(
+        RBLNGemma4ForConditionalGeneration
+    )
+    model.config = SimpleNamespace(vision_config=SimpleNamespace(pooling_kernel_size=3))
+    model.__init__(
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(data_parallel_size=1),
+            speculative_config=None,
+            model_config=SimpleNamespace(
+                max_model_len=32768,
+                hf_config=SimpleNamespace(
+                    text_config=SimpleNamespace(
+                        hidden_size_per_layer_input=per_layer_input
+                    )
+                ),
+            ),
+            additional_config=SimpleNamespace(encoder_token_budgets=budgets),
+        )
+    )
+    return model
+
+
+@pytest.mark.parametrize("use_mm_prefix", [False, True])
+def test_mm_prefix_mask_selects_only_sliding_layers(monkeypatch, use_mm_prefix):
+    layers = []
+    for is_sliding in (True, False):
+        layer = Gemma4Attention.__new__(Gemma4Attention)
+        nn.Module.__init__(layer)
+        layer.is_sliding = is_sliding
+        layer.attn = SimpleNamespace(use_mm_prefix=use_mm_prefix)
+        layers.append(layer)
+
+    model = _built_model(monkeypatch, cap=280, budgets=[], attention_layers=layers)
+
+    assert model.layers[0].attn.use_mm_prefix == use_mm_prefix
+    assert model.layers[1].attn.use_mm_prefix == use_mm_prefix
+    assert model.mm_prefix_attn_layers == ([layers[0].attn] if use_mm_prefix else [])
+
+
+@pytest.mark.parametrize(
+    "budgets, buckets",
+    [([], [70 * 9, 140 * 9, 280 * 9]), ([560, 70], [70 * 9, 560 * 9])],
+)
+def test_the_encoder_buckets_follow_encoder_token_budgets(
+    monkeypatch, budgets, buckets
+):
+    model = _built_model(monkeypatch, cap=280, budgets=budgets)
+    assert model.mm_encoder_patch_buckets == buckets
+
+
+def test_the_longest_range_is_the_cap_not_the_largest_budget(monkeypatch):
+    model = _built_model(monkeypatch, cap=280, budgets=[560, 70])
+    assert model.max_mm_prefix_range_len == 280
+
+
+def test_budgets_that_cannot_encode_an_image_at_the_cap_are_refused(monkeypatch):
+    with pytest.raises(ValueError, match="must reach max_soft_tokens=280"):
+        _built_model(monkeypatch, cap=280, budgets=[70, 140])
+
+
+def test_budgets_the_processor_never_emits_are_refused(monkeypatch):
+    with pytest.raises(ValueError, match=r"\[100, 300\] are not Gemma4"):
+        _built_model(monkeypatch, cap=280, budgets=[300, 100, 280])
+
+
+def test_variants_with_per_layer_inputs_are_refused(monkeypatch):
+    with pytest.raises(ValueError, match="per-layer inputs"):
+        _built_model(monkeypatch, cap=280, budgets=[], per_layer_input=256)
+
+
+@pytest.mark.parametrize("scale_first", [True, False])
+def test_each_expert_down_projection_is_scaled_once(monkeypatch, scale_first):
+    loaded = {}
+
+    def load_weights(self, weights):
+        loaded.update(weights)
+        return set(loaded)
+
+    monkeypatch.setattr(Gemma4ForConditionalGeneration, "load_weights", load_weights)
+    prefix = "model.language_model.layers.0."
+    scale = (prefix + "router.per_expert_scale", torch.tensor([2.0, 3.0]))
+    down = (prefix + "experts.down_proj", torch.ones(2, 4, 5))
+    other = (prefix + "experts.gate_up_proj", torch.ones(2, 10, 4))
+    weights = [scale, down, other] if scale_first else [down, other, scale]
+
+    _bare_model().load_weights(weights)
+
+    torch.testing.assert_close(
+        loaded[down[0]], torch.ones(2, 4, 5) * torch.tensor([2.0, 3.0]).view(-1, 1, 1)
+    )
+    assert set(loaded) == {scale[0], down[0], other[0]}
+
+
+def _processing_info(engine_kwargs, processor_default, default_output_length):
+    """Upstream's merge: the request's kwargs over the engine's."""
+    image_processor = SimpleNamespace(max_soft_tokens=processor_default)
+    vision_config = SimpleNamespace(default_output_length=default_output_length)
+    return SimpleNamespace(
+        ctx=SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(vision_config=vision_config)
+            ),
+            get_merged_mm_kwargs=lambda kwargs: {**engine_kwargs, **kwargs},
+        ),
+        get_hf_processor=lambda: SimpleNamespace(image_processor=image_processor),
+    )
+
+
+def test_the_engines_budget_overrides_the_processors():
+    info = _processing_info({"images_kwargs": {"max_soft_tokens": 1120}}, 280, 280)
+    assert gemma4.mm_soft_token_cap(info) == 1120
+
+
+def test_a_default_output_length_the_processor_ignores_is_refused():
+    # HF would cut a 280-token image that upstream counts as 70.
+    info = _processing_info({}, 280, 70)
+    with pytest.raises(ValueError, match="--mm-processor-kwargs"):
+        gemma4.mm_soft_token_cap(info)
+    info = _processing_info({"max_soft_tokens": 70}, 280, 70)
+    assert gemma4.mm_soft_token_cap(info) == 70
+
+
+def test_an_unsupported_budget_is_refused():
+    info = _processing_info({"max_soft_tokens": 100}, 280, 280)
+    with pytest.raises(ValueError, match="not one of"):
+        gemma4.mm_soft_token_cap(info)
+
+
+@pytest.mark.parametrize(
+    "num_images, request_kwargs, refused",
+    [
+        (1, {"max_soft_tokens": 560}, True),
+        (1, {"max_soft_tokens": 280}, False),
+        (1, {}, False),
+        # Video frames take their own budget whatever the request says.
+        (0, {"max_soft_tokens": 560}, False),
+    ],
+)
+def test_a_request_budget_above_the_cap_is_refused(
+    monkeypatch, num_images, request_kwargs, refused
+):
+    upstream = Mock(return_value="processed")
+    monkeypatch.setattr(
+        gemma4.Gemma4MultiModalProcessor, "_apply_hf_processor_main", upstream
+    )
+    processor = gemma4.RBLNGemma4MultiModalProcessor.__new__(
+        gemma4.RBLNGemma4MultiModalProcessor
+    )
+    processor.info = _processing_info({}, 280, 280)
+    items = SimpleNamespace(get_count=lambda modality, strict: num_images)
+
+    if refused:
+        with pytest.raises(ValueError, match="--mm-processor-kwargs"):
+            processor._apply_hf_processor_main(items, request_kwargs)
+        upstream.assert_not_called()
+    else:
+        assert processor._apply_hf_processor_main(items, request_kwargs) == "processed"
+
+
+def test_construction_builds_the_hf_processor_of_every_allowed_budget(monkeypatch):
+    # Upstream caches the HF processor per max_soft_tokens; building each one
+    # up front keeps a request's first use of a budget from paying for it.
+    info = _processing_info({}, 280, 280)
+    built = []
+    plain = info.get_hf_processor
+
+    def get_hf_processor(**kwargs):
+        built.append(kwargs)
+        return plain()
+
+    info.get_hf_processor = get_hf_processor
+
+    def upstream_init(self, *args, **kwargs):
+        self.info = info
+
+    monkeypatch.setattr(gemma4.Gemma4MultiModalProcessor, "__init__", upstream_init)
+    gemma4.RBLNGemma4MultiModalProcessor()
+
+    assert [kwargs["max_soft_tokens"] for kwargs in built if kwargs] == [70, 140, 280]
+
+
+def test_video_frames_are_regrouped_per_video(monkeypatch):
+    model = _bare_model()
+    monkeypatch.setattr(
+        model, "_encode_vision", lambda pixels, positions: pixels[:1].clone()
+    )
+    frames = torch.arange(5.0).view(5, 1, 1).expand(5, 2, 1)
+
+    videos = model._process_video_input(
+        {
+            "pixel_values_videos": frames,
+            "pixel_position_ids_videos": torch.zeros(5, 2, 2),
+            "video_frame_counts": torch.tensor([2, 3]),
+        }
+    )
+
+    assert [v.flatten().tolist() for v in videos] == [[0.0, 1.0], [2.0, 3.0, 4.0]]
+
+
+@pytest.mark.parametrize(
+    "first_rank, limits, compiled",
+    [
+        (True, {"image": 1, "video": 0}, True),
+        (True, {"image": 0, "video": 1}, True),
+        (True, {"image": 0, "video": 0, "audio": 1}, False),
+        (False, {"image": 1, "video": 1}, False),
+    ],
+)
+def test_the_encoder_compiles_only_where_the_tower_lives(
+    monkeypatch, first_rank, limits, compiled
+):
+    monkeypatch.setattr(
+        gemma4, "get_pp_group", lambda: SimpleNamespace(is_first_rank=first_rank)
+    )
+    built = nn.Identity()
+    monkeypatch.setattr(
+        gemma4, "_RBLNGemma4VisionEncoder", lambda tower, embed_vision: built
+    )
+    model = _bare_model(
+        vision_tower=nn.Identity(),
+        embed_vision=nn.Identity(),
+        multimodal_config=SimpleNamespace(
+            get_limit_per_prompt=lambda modality: limits.get(modality, 0)
+        ),
+    )
+    runtime = Mock()
+    compile_fn = Mock(return_value=runtime)
+
+    model.compile_mm_encoder(compile_fn)
+
+    if compiled:
+        compile_fn.assert_called_once_with(built)
+        assert model._mm_encoder is runtime
+    else:
+        compile_fn.assert_not_called()
+        assert model._mm_encoder is None
+
+
+def test_image_embeddings_replace_their_tokens_in_the_graph(monkeypatch):
+    monkeypatch.setattr(
+        gemma4, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True)
+    )
+    seen: dict[str, Any] = {}
+
+    def upstream_forward(self, input_ids, positions, intermediate_tensors, embeds):
+        seen.update(input_ids=input_ids, inputs_embeds=embeds)
+        return "HIDDEN"
+
+    monkeypatch.setattr(Gemma4ForConditionalGeneration, "forward", upstream_forward)
+    model = _bare_model(
+        language_model=SimpleNamespace(
+            embed_input_ids=lambda ids: ids[..., None].float().expand(*ids.shape, 2)
+        )
+    )
+    input_ids = torch.tensor([[1, 2, 3]])
+    mm_embeds = torch.full((1, 3, 2), 9.0)
+    mm_mask = torch.tensor([[[0.0], [1.0], [0.0]]])
+
+    out = model(input_ids, None, mm_embeds=mm_embeds, mm_mask=mm_mask)
+
+    assert out == "HIDDEN"
+    assert seen["input_ids"] is None
+    assert seen["inputs_embeds"][0, :, 0].tolist() == [1.0, 9.0, 3.0]
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+def test_prefix_mask_is_shared_and_does_not_escape_forward(monkeypatch, compiled):
+    class Decoder(nn.Module):
+        def __init__(self, index):
+            super().__init__()
+            self.attn = nn.Module()
+            self.attn.layer_name = f"layer.{index}"
+            self.attn.layer_index = index
+            self.attn.sliding_window = 4
+            self.attn.impl = SimpleNamespace(scale=torch.tensor(1.0))
+
+        def forward(self, x):
+            metadata = get_forward_context().attn_metadata[self.attn.layer_name]
+            return x * self.attn.impl.scale + metadata.swa_attn_masks[0, 0, 1, 3]
+
+    def upstream_forward(self, input_ids, positions, *args, **kwargs):
+        masks = [
+            get_forward_context().attn_metadata[layer.attn.layer_name].swa_attn_masks
+            for layer in self.layers
+        ]
+        assert masks[0] is not None
+        assert all(mask is masks[0] for mask in masks)
+        for layer in self.layers:
+            positions = layer(positions)
+        return positions
+
+    monkeypatch.setattr(Gemma4ForConditionalGeneration, "forward", upstream_forward)
+    model = _bare_model(
+        layers=nn.ModuleList([Decoder(i) for i in range(3)]),
+        start_layer=0,
+        end_layer=3,
+        model_dtype=torch.float32,
+    )
+    model.mm_prefix_attn_layers = [layer.attn for layer in model.layers]
+    metadata = RBLNFlashAttentionMetadata(
+        seq_lens=torch.tensor([[0]]),
+        block_tables=torch.arange(4),
+        is_prefill=True,
+        swa_appends=True,
+        mm_prefix_row_ends=torch.tensor([0, 3, 3, 3]),
+        kv_caches=[torch.zeros(4, 2, 1, 1, 4, 32) for _ in model.layers],
+    )
+    context = SimpleNamespace(
+        attn_metadata={
+            layer.layer_name: metadata for layer in model.mm_prefix_attn_layers
+        },
+        additional_kwargs={},
+        dp_metadata=None,
+    )
+    graphs = []
+
+    def backend(graph, inputs, **options):
+        graphs.append(graph)
+        return graph.forward
+
+    forward = model.forward
+    if compiled:
+        mark_decoder_regions(model)
+        forward = compile(
+            forward,
+            backend=backend,
+            fullgraph=True,
+            use_direct_dispatch=True,
+            use_cache=False,
+        )
+    with override_forward_context(context):
+        for row_ends, expected in [([0, 3, 3, 3], 3), ([0, 1, 2, 3], 0)]:
+            metadata.mm_prefix_row_ends = torch.tensor(row_ends)
+            result = forward(None, torch.zeros(4))
+            torch.testing.assert_close(result, torch.full((4,), float(expected)))
+            assert metadata.swa_attn_masks is None
+    if compiled:
+        assert len(graphs) == 1
+        nodes = list(graphs[0].graph.nodes)
+        assert sum(node.target is operator.le for node in nodes) == 1
+        assert len(nodes[-1].args[0]) == 1
+        assert (
+            sum(node.target is torch.ops.higher_order.invoke_subgraph for node in nodes)
+            == 3
+        )
+
+
+def test_prefix_mask_is_restored_when_forward_raises(monkeypatch):
+    def upstream_forward(self, *args, **kwargs):
+        raise RuntimeError("forward failed")
+
+    monkeypatch.setattr(Gemma4ForConditionalGeneration, "forward", upstream_forward)
+    attn = SimpleNamespace(layer_name="layer.0", layer_index=0, sliding_window=4)
+    model = _bare_model(model_dtype=torch.float32)
+    model.mm_prefix_attn_layers = [attn]
+    metadata = RBLNFlashAttentionMetadata(
+        seq_lens=torch.tensor([[0]]),
+        block_tables=torch.arange(4),
+        is_prefill=True,
+        swa_appends=True,
+        mm_prefix_row_ends=torch.tensor([0, 3, 3, 3]),
+        kv_caches=[torch.zeros(4, 2, 1, 1, 4, 32)],
+    )
+    context = SimpleNamespace(
+        attn_metadata={"layer.0": metadata}, additional_kwargs={}, dp_metadata=None
+    )
+
+    with override_forward_context(context), pytest.raises(RuntimeError):
+        model.forward(None, torch.zeros(4))
+
+    assert metadata.swa_attn_masks is None
+
+
+@pytest.mark.parametrize("start", [0, 1023, 1024, 1025, 262144, 264192])
+def test_prefix_mask_block_boundaries(start):
+    row_ends = torch.tensor([0, 3, 3, 3])
+    mask = gemma4._build_mm_prefix_sliding_mask(
+        row_ends,
+        torch.tensor([[start]]),
+        1024,
+        1024,
+        torch.bfloat16,
+    )
+    first_key = max(start - 1024 + 1, 0) // 1024 * 1024
+    keys = torch.arange(mask.size(-1), dtype=torch.int64) + first_key
+    rows = torch.arange(4, dtype=torch.int64) + start
+    expected = (keys[None, :] <= (row_ends + start)[:, None]) & (
+        keys[None, :] > (rows - 1024)[:, None]
+    )
+    torch.testing.assert_close(mask[0, 0], expected.to(mask.dtype), rtol=0, atol=0)

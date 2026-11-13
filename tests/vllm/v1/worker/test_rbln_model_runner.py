@@ -35,6 +35,7 @@ from vllm.distributed.ec_transfer.ec_connector.base import (
     ECConnectorMetadata,
     ECConnectorRole,
 )
+from vllm.multimodal.inputs import PlaceholderRange
 from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheTensor
@@ -103,10 +104,13 @@ def _resolved_batch(
 
 def _make_runner_stub(**attrs):
     # Text-only runner without __init__; tests supply method-specific state.
-    # A dummy step can read dp_status before anything publishes one.
+    # __init__ always sets dp_status and is_strict_kv_producer, and the step
+    # phase and the dummy step read them before anything publishes one.
     runner = object.__new__(RBLNModelRunner)
     runner.dp_status = None
+    runner.is_strict_kv_producer = False
     runner.supports_mm_inputs = False
+    runner.model_config = SimpleNamespace(is_mm_prefix_lm=False)
     for key, value in attrs.items():
         setattr(runner, key, value)
     return runner
@@ -455,7 +459,7 @@ class TestEncoderOnly:
 
     def test_execute_model_encodes_and_samples_nothing(self, monkeypatch):
         order: list[str] = []
-        monkeypatch.setattr(mr, "step_is_prefill", lambda so: True)
+        monkeypatch.setattr(mr, "step_is_prefill", lambda so, **kw: True)
         monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: False)
         runner = _make_runner_stub(
             vllm_config=SimpleNamespace(is_mm_encoder_only=True),
@@ -512,7 +516,7 @@ class TestEncoderOnly:
     @pytest.mark.parametrize("num_scheduled_tokens", [{"r0": 3}, {}])
     def test_the_step_reports_finished_sends(self, monkeypatch, num_scheduled_tokens):
         monkeypatch.setattr(ec_state, "_EC_CONNECTOR_AGENT", _SendingECConnector("h0"))
-        monkeypatch.setattr(mr, "step_is_prefill", lambda so: True)
+        monkeypatch.setattr(mr, "step_is_prefill", lambda so, **kw: True)
         monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: False)
         runner = _make_runner_stub(
             vllm_config=SimpleNamespace(is_mm_encoder_only=True),
@@ -640,7 +644,7 @@ class TestEcConsumer:
             _is_prefill_step=True,
             is_pooling_model=False,
             max_num_tokens=4,
-            prefill_chunk_size=4,
+            prefill_chunk_sizes=[4],
             input_ids=torch.zeros(4, dtype=torch.long),
             positions=torch.zeros(4, dtype=torch.long),
             input_stager=InputStager(torch.device("cpu")),
@@ -687,7 +691,7 @@ class TestEcConsumer:
             "_EC_CONNECTOR_AGENT",
             _ReceivingECConnector("h0", torch.ones(1, 2)),
         )
-        monkeypatch.setattr(mr, "step_is_prefill", lambda so: False)
+        monkeypatch.setattr(mr, "step_is_prefill", lambda so, **kw: False)
         monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: False)
         monkeypatch.setattr(
             mr, "get_pp_group", lambda: SimpleNamespace(is_first_rank=first_rank)
@@ -749,10 +753,14 @@ class TestEcConsumer:
         self, monkeypatch, ec_role, compiled
     ):
         compile_calls = []
-        model = SimpleNamespace(
-            logits_processor=None,
-            compile_mm_encoder=lambda compile_fn: compile_calls.append(compile_fn),
-        )
+
+        class _Model(torch.nn.Module):
+            logits_processor = None
+
+            def compile_mm_encoder(self, compile_fn):
+                compile_calls.append(compile_fn)
+
+        model = _Model()
         monkeypatch.setattr(
             mr,
             "get_model_loader",
@@ -818,11 +826,11 @@ def test_multimodal_warmup_keys_the_bundle_on_the_encoder_buckets(monkeypatch, b
     runner._warmup_mm_encoder.assert_called_once_with()
 
 
-def test_warmup_compiles_prefill_at_the_prefill_chunk_size():
+def test_warmup_compiles_prefill_at_every_prefill_chunk_size():
     calls = []
     runner = _make_runner_stub(
         max_num_tokens=512,
-        prefill_chunk_size=256,
+        prefill_chunk_sizes=[128, 256],
         speculative_config=None,
         bucketing_manager=SimpleNamespace(decode_batch_buckets=[1]),
         specialized_moe_decode=False,
@@ -831,7 +839,65 @@ def test_warmup_compiles_prefill_at_the_prefill_chunk_size():
 
     runner.run_model_graphs()
 
-    assert calls[0] == ((1, 256, True), {})
+    assert calls[:2] == [((1, 128, True), {}), ((1, 256, True), {})]
+
+
+@pytest.mark.parametrize(("query_len", "padded"), [(100, 128), (128, 128), (129, 256)])
+def test_a_prefill_pads_to_the_shortest_chunk_size_that_holds_it(
+    monkeypatch, query_len, padded
+):
+    monkeypatch.setattr(mr, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True))
+    runner = _make_runner_stub(
+        input_ids=torch.zeros(512, dtype=torch.int32),
+        positions=torch.zeros(512, dtype=torch.int64),
+        is_prefill=True,
+        prefill_chunk_sizes=[128, 256],
+        input_stager=Mock(),
+        is_pooling_model=True,
+        _init_model_kwargs=lambda: {},
+    )
+
+    runner._preprocess(
+        Mock(),
+        num_reqs=1,
+        num_reqs_padded=1,
+        num_input_tokens=query_len,
+        logits_indices=None,
+    )
+
+    layout = runner.input_stager.stage.call_args.kwargs["layout"]
+    assert (layout.query_len, layout.query_len_padded) == (query_len, padded)
+
+
+@pytest.mark.parametrize(
+    ("strict_kv_producer", "sampled", "verifies"),
+    [(True, [1], False), (False, [1, 2, 4], True)],
+)
+def test_a_producer_warms_the_sampler_at_one_request(
+    monkeypatch, strict_kv_producer, sampled, verifies
+):
+    # A producer step carries one request and verifies no drafts; a width or
+    # sampler warm-up skips is one serving would compile on first use.
+    cache = SimpleNamespace(config_signature=Mock(), load=Mock(), save=Mock())
+    monkeypatch.setattr(mr, "mega_cache", cache)
+    monkeypatch.setattr(mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True))
+    runner = _make_runner_stub(
+        is_strict_kv_producer=strict_kv_producer,
+        vllm_config=SimpleNamespace(is_mm_encoder_only=False),
+        model_config=SimpleNamespace(model="m"),
+        is_pooling_model=False,
+        run_model_graphs=Mock(),
+        offload_context=nullcontext,
+        bucketing_manager=SimpleNamespace(batch_buckets=[1, 2, 4]),
+        drafter=None,
+        _dummy_sampler_run=Mock(),
+        _warmup_sampler_decode_batches=Mock(),
+    )
+
+    runner.warmup_model()
+
+    assert [c.args[0] for c in runner._dummy_sampler_run.call_args_list] == sampled
+    assert runner._warmup_sampler_decode_batches.called is verifies
 
 
 @pytest.mark.parametrize("num_reqs", [1, 2])
@@ -1340,6 +1406,7 @@ class TestDummyRunPadding:
                 num_computed_tokens_cpu=np.zeros(8, dtype=np.int32),
             ),
             max_num_tokens=128,
+            prefill_chunk_sizes=[64],
             max_num_reqs=8,
             seq_lens_np=np.zeros(8, dtype=np.int32),
             query_start_loc_np=np.zeros(16, dtype=np.int32),
@@ -1379,6 +1446,49 @@ class TestDummyRunPadding:
         runner._dummy_run(1, 4, is_prefill=True)
 
         assert captured["layout"].num_reqs_padded == 1
+
+    @pytest.mark.parametrize("is_prefill", [True, False])
+    def test_an_mm_prefix_lm_warms_its_prefill_up_masked(self, monkeypatch, is_prefill):
+        # The masked graph serving runs: text rows that each end at themselves,
+        # one per row of the prefill width the step pads to.
+        runner, captured = self._runner(monkeypatch, reqs_across_dp=[1, 1, 1, 1])
+        runner.model_config = SimpleNamespace(is_mm_prefix_lm=True)
+        runner.prefill_chunk_sizes = [8, 64]
+        runner._dummy_run(1, 4, is_prefill=is_prefill)
+
+        row_ends = captured["attn"]["mm_prefix_row_ends"]
+        if is_prefill:
+            assert torch.equal(row_ends, torch.arange(8))
+        else:
+            assert row_ends is None
+
+    @pytest.mark.parametrize(("query_len", "padded"), [(1, 32), (32, 32), (33, 64)])
+    def test_a_dummy_prefill_pads_to_the_width_warm_up_compiled(
+        self, monkeypatch, query_len, padded
+    ):
+        # A serving dummy must use one of the prefill widths warm-up compiled.
+        runner, captured = self._runner(monkeypatch, reqs_across_dp=[1, 1, 1, 1])
+        runner.prefill_chunk_sizes = [32, 64]
+        runner._dummy_run(1, padded, is_prefill=True)
+        warmed = captured["layout"].shape
+        assert warmed == (1, padded)
+
+        runner, captured = self._runner(monkeypatch, reqs_across_dp=[1, 1, 1, 1])
+        runner.prefill_chunk_sizes = [32, 64]
+        monkeypatch.setattr(
+            runner,
+            "_determine_batch_execution_and_padding",
+            lambda *a, **kw: _resolved_batch(
+                num_reqs_padded=1, query_len=query_len, num_tokens_padded=128
+            ),
+        )
+        runner._dummy_run(1, 1, is_prefill=True, warmup=False)
+        assert captured["layout"].shape == warmed
+
+        # A decode dummy still runs at the length it is given; only prefill pads.
+        runner, captured = self._runner(monkeypatch, reqs_across_dp=[1, 1, 1, 1])
+        runner._dummy_run(1, 1, is_prefill=False, warmup=False)
+        assert captured["layout"].shape != warmed
 
     def test_warmup_pin_is_the_token_dimension(self, monkeypatch):
         # Warm-up dictates the dimension it wants compiled -- the group agreement
@@ -1693,6 +1803,7 @@ class TestUpdateStates:
             sort_batch_by_length=False,
             kv_cache_config=SimpleNamespace(kv_cache_groups=[]),
             rbln_config=RBLNConfig(),
+            sampler=None,
         )
 
     def test_new_request_added(self, monkeypatch):
@@ -1717,6 +1828,41 @@ class TestUpdateStates:
         r._update_states(_sched(finished=["r0"]))
         assert "r0" not in r.input_batch.req_id_to_index
         assert "r0" not in r.requests
+
+    def test_finished_request_forgets_fused_penalty_state(self, monkeypatch):
+        # Only finishing drops it: a prefill step leaves decoding requests out.
+        sampler = object.__new__(mr.RBLNSampler)
+        sampler.forget_requests = MagicMock()
+        r = self._runner(
+            monkeypatch,
+            input_batch=_input_batch(1),
+            requests={"r0": _cached_state("r0")},
+        )
+        r.sampler = sampler
+        r._update_states(_sched(finished=["r0"]))
+        sampler.forget_requests.assert_called_once_with(["r0"])
+
+    def test_streaming_turn_forgets_fused_sampling_state(self, monkeypatch):
+        # A new turn reuses the id with a new prompt and params.
+        sampler = object.__new__(mr.RBLNSampler)
+        sampler.forget_requests = MagicMock()
+        r = self._runner(
+            monkeypatch,
+            input_batch=_input_batch(1),
+            requests={"r0": _cached_state("r0")},
+        )
+        r.sampler = sampler
+        new_data = SimpleNamespace(
+            prompt_token_ids=[1, 2, 3],
+            mm_features=[],
+            prompt_embeds=None,
+            sampling_params=SamplingParams(),
+            pooling_params=None,
+            block_ids=([0],),
+            num_computed_tokens=0,
+        )
+        r._update_streaming_request("r0", new_data)
+        sampler.forget_requests.assert_called_once_with(["r0"])
 
     def test_unscheduled_request_removed(self, monkeypatch):
         # r0 is cached but not scheduled (and not resumed) -> dropped.
@@ -2072,6 +2218,7 @@ class TestRepairAsyncOutputTokenIds:
                 ),
                 prev_req_id_to_index=prev_index,
             ),
+            _prev_sampled_host=None,
         )
 
     def test_replaces_the_placeholder_tail(self):
@@ -2128,6 +2275,27 @@ class TestRepairAsyncOutputTokenIds:
         )
         r._repair_async_output_token_ids()
         assert ids == [[], [8, 11]]
+
+    def test_reads_the_async_host_copy_of_the_same_step(self):
+        # The device read would queue behind this step's forward.
+        ids = [[7, -1]]
+        r = self._runner(
+            req_ids=["a"], output_token_ids=ids, prev_index={"a": 0}, prev_tokens=[10]
+        )
+        event = SimpleNamespace(synchronize=lambda: None)
+        prev = r.input_batch.prev_sampled_token_ids
+        r._prev_sampled_host = (prev, torch.tensor([[20]]), event)
+        r._repair_async_output_token_ids()
+        assert ids == [[7, 20]]
+
+    def test_ignores_a_host_copy_from_another_step(self):
+        ids = [[7, -1]]
+        r = self._runner(
+            req_ids=["a"], output_token_ids=ids, prev_index={"a": 0}, prev_tokens=[10]
+        )
+        r._prev_sampled_host = (torch.tensor([[10]]), torch.tensor([[20]]), None)
+        r._repair_async_output_token_ids()
+        assert ids == [[7, 10]]
 
 
 class TestApplyPendingTokenWriteback:
@@ -2198,6 +2366,7 @@ class TestDummyRunDraftParticipation:
         # there, and the draft leg has to skip cleanly.
         attrs = dict(
             max_num_tokens=64,
+            prefill_chunk_sizes=[64],
             max_num_reqs=8,
             speculative_config=make_speculative_config("eagle"),
             num_spec_tokens=cls.NUM_SPEC,
@@ -2206,7 +2375,7 @@ class TestDummyRunDraftParticipation:
             positions=torch.zeros(64, dtype=torch.int64),
             input_batch=SimpleNamespace(num_tokens_no_spec=np.zeros(8, dtype=np.int32)),
             seq_lens_np=np.zeros(8, dtype=np.int32),
-            model_config=SimpleNamespace(dtype=torch.float16),
+            model_config=SimpleNamespace(dtype=torch.float16, is_mm_prefix_lm=False),
             device=torch.device("cpu"),
             vllm_config=SimpleNamespace(),
             kv_cache_bases=None,
@@ -2282,6 +2451,13 @@ class TestDummyRunDraftParticipation:
         runner._dummy_run(1, 1, is_prefill=False, warmup=False)
         drafter.dummy_run.assert_called_once_with(1, 1, False)
 
+    def test_an_idle_producer_runs_its_draft_as_a_prefill(self, monkeypatch):
+        # A producer's idle rank runs the prefill graph beside prefilling peers,
+        # so its draft has to report the same phase to the DP decision.
+        runner, drafter = self._runner(monkeypatch, has_drafter=True)
+        runner._dummy_run(1, 1, is_prefill=True, warmup=False)
+        drafter.dummy_run.assert_called_once_with(1, 1, True)
+
     @pytest.mark.parametrize("requested", [1, 1 + NUM_SPEC])
     def test_warmup_compiles_the_draft_at_the_window_length(
         self, monkeypatch, requested
@@ -2324,9 +2500,10 @@ class TestDummyRunPPIntermediateTensors:
 
         runner = _make_runner_stub(
             model=SimpleNamespace(make_empty_intermediate_tensors=make_empty),
-            model_config=SimpleNamespace(dtype=torch.float16),
+            model_config=SimpleNamespace(dtype=torch.float16, is_mm_prefix_lm=False),
             device=torch.device("cpu"),
             max_num_tokens=64,
+            prefill_chunk_sizes=[32],
             max_num_reqs=8,
             speculative_config=None,
             # Gates the drafter leg; __init__ always sets it.
@@ -2378,6 +2555,16 @@ class TestDummyRunPPIntermediateTensors:
         assert captured["layout"].num_reqs == 1
         assert captured["layout"].num_reqs_padded == 8
 
+    def test_prefill_intermediate_tensors_match_the_staged_width(self, monkeypatch):
+        # The stager pads a prefill's rows to prefill_chunk_size but passes
+        # intermediate tensors through, so the sender built them at that width.
+        # Sizing them from the unpadded length instead splits the two apart.
+        runner, captured = self._runner(monkeypatch, num_reqs_padded=1, query_len=1)
+        runner._dummy_run(1, 1, is_prefill=True, warmup=False)
+        _, width = captured["layout"].shape
+        assert width == runner.prefill_chunk_sizes[-1]
+        assert captured["intermediate_tensors"]["h"].shape == (1, width, self.HIDDEN)
+
 
 class TestExecuteModelRecoversADeferredLoad:
     """A read the dummy step never issued goes out on the next execute_model.
@@ -2393,7 +2580,7 @@ class TestExecuteModelRecoversADeferredLoad:
     @staticmethod
     def _runner(monkeypatch):
         order: list[str] = []
-        monkeypatch.setattr(mr, "step_is_prefill", lambda so: False)
+        monkeypatch.setattr(mr, "step_is_prefill", lambda so, **kw: False)
         connector = SimpleNamespace(
             handle_preemptions=lambda meta: order.append(f"preemptions:{meta}")
         )
@@ -2467,7 +2654,7 @@ class TestExecuteModelFlushesAfterTheSubmission:
     def _runner(monkeypatch):
         order: list[str] = []
         connector = SimpleNamespace(handle_preemptions=lambda meta: None)
-        monkeypatch.setattr(mr, "step_is_prefill", lambda so: False)
+        monkeypatch.setattr(mr, "step_is_prefill", lambda so, **kw: False)
         monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: True)
         monkeypatch.setattr(mr, "get_kv_transfer_group", lambda: connector)
         monkeypatch.setattr(mr, "flush_deferred_loads", lambda c: order.append("flush"))
@@ -2534,3 +2721,262 @@ class TestExecuteModelFlushesAfterTheSubmission:
         # The entry flush recovers a stale hold, then this step's read goes out
         # only after its own submission.
         assert order == ["flush", "submit", "flush"]
+
+
+class TestExecuteModelMmPrefixRowEnds:
+    """Every prefill of an mm prefix LM hands the builders step-local row ends,
+    padded to the step's chunk length: a text or padding row ends at itself, an
+    mm row at its range's last position."""
+
+    @staticmethod
+    def _row_ends_seen(
+        monkeypatch,
+        *,
+        computed,
+        scheduled,
+        mm_features,
+        chunk_sizes=(128, 256),
+        is_mm_prefix_lm=True,
+    ):
+        monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: False)
+        monkeypatch.setattr(mr, "set_forward_context", lambda *a, **kw: nullcontext())
+        monkeypatch.setattr(
+            mr, "build_kv_cache_forward_context_kwargs", lambda *a, **kw: {}
+        )
+        monkeypatch.setattr(
+            mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+        )
+        monkeypatch.setattr(
+            RBLNModelRunner,
+            "maybe_get_kv_connector_output",
+            staticmethod(lambda *a, **kw: nullcontext(None)),
+        )
+        seen = []
+        runner = _make_runner_stub(
+            execute_model_state=None,
+            use_async_scheduling=False,
+            _update_states=lambda so: None,
+            _prepare_inputs=lambda so, counts: (
+                "LOGITS_IDX",
+                None,
+                torch.tensor([scheduled], dtype=torch.int32),
+                scheduled,
+            ),
+            _determine_batch_execution_and_padding=lambda *a, **kw: _resolved_batch(
+                num_reqs_padded=1, query_len=scheduled, num_tokens_padded=None
+            ),
+            _preprocess=lambda *a, **kw: (
+                SimpleNamespace(as_kwargs=lambda: {}),
+                {},
+                None,
+            ),
+            _bookkeeping_and_output=lambda *a, **kw: "OUTPUT",
+            input_batch=SimpleNamespace(
+                num_reqs=1,
+                req_ids=["r0"],
+                num_computed_tokens_cpu=np.array([computed], dtype=np.int32),
+            ),
+            requests={"r0": SimpleNamespace(mm_features=mm_features)},
+            model_config=SimpleNamespace(is_mm_prefix_lm=is_mm_prefix_lm),
+            prefill_chunk_sizes=list(chunk_sizes),
+            cache_config=SimpleNamespace(kv_sharing_fast_prefill=False),
+            speculative_config=None,
+            is_pooling_model=False,
+            vllm_config=SimpleNamespace(is_mm_encoder_only=False),
+            model_executable=lambda **kw: ("HIDDEN", "LOGITS", None),
+            num_prompt_logprobs=None,
+            kv_cache_bases=None,
+            decode_back_pad=torch.zeros(1, dtype=torch.int32),
+        )
+
+        def build_attention_metadata(**kwargs):
+            seen.append(kwargs["mm_prefix_row_ends"])
+            return "ATTN", None
+
+        runner._build_attention_metadata = build_attention_metadata
+        runner.execute_model(
+            SimpleNamespace(
+                total_num_scheduled_tokens=scheduled,
+                num_scheduled_tokens={"r0": scheduled},
+                scheduled_spec_decode_tokens={},
+                scheduled_new_reqs=[],
+                scheduled_cached_reqs=SimpleNamespace(
+                    req_ids=["r0"], num_computed_tokens=[computed]
+                ),
+                kv_cache_copy_ops=None,
+            )
+        )
+        return seen[0]
+
+    @staticmethod
+    def _image(offset, num_embeds):
+        # <boi>, the soft tokens, <eoi>
+        is_embed = [False] + [True] * num_embeds + [False]
+        return SimpleNamespace(
+            modality="image",
+            mm_position=PlaceholderRange(
+                offset=offset, length=len(is_embed), is_embed=torch.tensor(is_embed)
+            ),
+        )
+
+    def test_each_video_frame_ends_at_its_own_range(self, monkeypatch):
+        # Two frames, soft tokens at 4..7 and 11..14, in one 20-token step.
+        is_embed = ([False, False] + [True] * 4 + [False]) * 2
+        video = SimpleNamespace(
+            modality="video",
+            mm_position=PlaceholderRange(
+                offset=2, length=len(is_embed), is_embed=torch.tensor(is_embed)
+            ),
+        )
+        seen = self._row_ends_seen(
+            monkeypatch, computed=0, scheduled=20, mm_features=[video]
+        )
+        expected = torch.arange(128)
+        expected[4:8] = 7
+        expected[11:15] = 14
+        assert torch.equal(seen, expected)
+
+    def test_the_row_ends_take_the_staged_chunk_length(self, monkeypatch):
+        # _preprocess pads a 100-token prefill to 256 here, and so must these.
+        seen = self._row_ends_seen(
+            monkeypatch,
+            computed=0,
+            scheduled=100,
+            mm_features=[self._image(4, 10)],
+            chunk_sizes=(64, 256),
+        )
+        assert seen.numel() == 256
+
+    def test_the_rest_of_a_range_a_prefix_cache_hit_resumed(self, monkeypatch):
+        # Soft tokens at 5..14; a hit ended at 9, so rows 0..5 end at 14.
+        seen = self._row_ends_seen(
+            monkeypatch, computed=9, scheduled=8, mm_features=[self._image(4, 10)]
+        )
+        assert seen[:8].tolist() == [5] * 6 + [6, 7]
+
+    def test_a_text_chunk_reads_causally(self, monkeypatch):
+        seen = self._row_ends_seen(
+            monkeypatch, computed=0, scheduled=5, mm_features=[self._image(4, 10)]
+        )
+        assert torch.equal(seen, torch.arange(128))
+
+    def test_any_other_model_gets_none(self, monkeypatch):
+        seen = self._row_ends_seen(
+            monkeypatch,
+            computed=0,
+            scheduled=20,
+            mm_features=[self._image(4, 10)],
+            is_mm_prefix_lm=False,
+        )
+        assert seen is None
+
+
+@pytest.mark.maybe_use_device
+@pytest.mark.parametrize(
+    ("kv_role", "decodes"), [("kv_producer", False), ("kv_both", True)]
+)
+def test_a_runner_built_for_a_producer_has_no_decode_graph(
+    make_model_runner, kv_role, decodes
+):
+    # The role is read once, when the runner is built.
+    from vllm.config import KVTransferConfig
+
+    runner = make_model_runner(
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="RblnNixlConnector", kv_role=kv_role
+        ),
+        init_kv_cache=False,
+    )
+    assert bool(runner.decode_graph_shapes()) is decodes
+
+
+class TestDecodeGraphShapes:
+    # The list warm-up iterates and the KV-cache estimate counts, so what it
+    # must hold is that it matches the dummies run_model_graphs issues.
+    @staticmethod
+    def _runner(*, buckets, specialized, num_spec=None, fixed_window=False):
+        spec = None
+        if num_spec is not None:
+            spec = SimpleNamespace(num_speculative_tokens=num_spec)
+        return SimpleNamespace(
+            speculative_config=spec,
+            uses_fixed_decode_window=fixed_window,
+            bucketing_manager=SimpleNamespace(decode_batch_buckets=buckets),
+            specialized_moe_decode=specialized,
+            max_num_tokens=512,
+            prefill_chunk_sizes=[128, 256],
+            is_strict_kv_producer=False,
+        )
+
+    def _dummies(self, runner):
+        calls = []
+        runner._dummy_run = lambda *a, **kw: calls.append((a, kw))
+        runner.decode_graph_shapes = lambda: mr.RBLNModelRunner.decode_graph_shapes(
+            runner
+        )
+        mr.RBLNModelRunner.run_model_graphs(runner)
+        return calls
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"buckets": [1, 2, 4], "specialized": False},
+            {"buckets": [1, 2, 4], "specialized": True},
+            {"buckets": [1, 2, 4], "specialized": True, "num_spec": 3},
+            {
+                "buckets": [1, 2, 4],
+                "specialized": True,
+                "num_spec": 3,
+                "fixed_window": True,
+            },
+        ],
+    )
+    def test_one_dummy_per_shape_plus_the_prefill(self, kwargs):
+        runner = self._runner(**kwargs)
+        shapes = mr.RBLNModelRunner.decode_graph_shapes(runner)
+        calls = self._dummies(runner)
+        assert len(calls) == len(shapes) + 2
+        assert [args for args, _ in calls[:2]] == [(1, 128, True), (1, 256, True)]
+        for (num_reqs, query_len, override), (args, kw) in zip(shapes, calls[2:]):
+            assert args == (num_reqs, query_len, False)
+            assert kw == {"num_tokens_padded_override": override}
+
+    @pytest.mark.parametrize(
+        ("kwargs", "expected"),
+        [
+            (
+                {"buckets": [1, 2, 4], "specialized": True},
+                [(1, 1, None), (2, 1, None), (4, 1, None), (4, 1, 512)],
+            ),
+            (
+                {"buckets": [1, 4], "specialized": True, "num_spec": 3},
+                [(1, 1, None), (1, 4, None), (4, 1, None), (4, 4, None)]
+                # The last is the top bucket, one token, padded to what a
+                # drafting peer would stage.
+                + [(4, 1, 512), (4, 4, 512), (4, 1, 16)],
+            ),
+            (
+                {
+                    "buckets": [1, 4],
+                    "specialized": False,
+                    "num_spec": 3,
+                    "fixed_window": True,
+                },
+                [(1, 4, None), (4, 4, None)],
+            ),
+        ],
+    )
+    def test_the_decode_set_a_decoding_role_compiles(self, kwargs, expected):
+        # Matching the dummies against this list cannot catch a shape the list
+        # itself drops.
+        runner = self._runner(**kwargs)
+        assert mr.RBLNModelRunner.decode_graph_shapes(runner) == expected
+
+    def test_a_strict_producer_compiles_no_decode_graph(self):
+        # Every step a producer runs is a prefill step, so the decode set it
+        # warms is empty -- which is what the assertion below reads.
+        runner = self._runner(buckets=[1, 2, 4], specialized=True, num_spec=3)
+        runner.is_strict_kv_producer = True
+        assert mr.RBLNModelRunner.decode_graph_shapes(runner) == []
+        calls = self._dummies(runner)
+        assert [args for args, _ in calls] == [(1, 128, True), (1, 256, True)]

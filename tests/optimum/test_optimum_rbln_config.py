@@ -1,11 +1,11 @@
 # Copyright 2026 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -170,7 +170,8 @@ def test_only_compile_fields_change_the_hash():
     """A field the sync derives cannot key the artifact it was derived from."""
     base = OptimumRBLNConfig().compute_hash()
     assert OptimumRBLNConfig(attn_block_size=64).compute_hash() == base
-    assert OptimumRBLNConfig(cached_model_path="/tmp/x").compute_hash() == base
+    assert OptimumRBLNConfig(artifact_path="/tmp/x").compute_hash() == base
+    assert OptimumRBLNConfig(precompiled=True).compute_hash() == base
     assert OptimumRBLNConfig(num_blocks_synced=True).compute_hash() == base
     assert OptimumRBLNConfig(use_custom_sampler=False).compute_hash() == base
     assert OptimumRBLNConfig(user_max_num_batched_tokens=512).compute_hash() != base

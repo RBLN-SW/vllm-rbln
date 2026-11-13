@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -37,7 +37,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_METRICS: bool = False
     VLLM_RBLN_METRICS_DIR: str = ""
     VLLM_RBLN_NUMA: bool = True
-    VLLM_RBLN_USE_NESTED_COMPILE_REGION: bool = False
+    VLLM_RBLN_USE_NESTED_COMPILE_REGION: bool = True
 
     # ====================================================================
     # Read only when VLLM_RBLN_USE_VLLM_MODEL=False
@@ -202,7 +202,7 @@ environment_variables = {
     # Experimental decoder boundaries in both model paths.
     # Requires nested-region support in rebel-compiler; this does not emit loops.
     "VLLM_RBLN_USE_NESTED_COMPILE_REGION": (
-        lambda: os.environ.get("VLLM_RBLN_USE_NESTED_COMPILE_REGION", "False").lower()
+        lambda: os.environ.get("VLLM_RBLN_USE_NESTED_COMPILE_REGION", "True").lower()
         in ("true", "1")
     ),
     # Number of NPU devices per local rank (was VLLM_RBLN_TP_SIZE).

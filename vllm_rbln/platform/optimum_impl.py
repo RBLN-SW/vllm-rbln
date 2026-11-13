@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -22,6 +22,8 @@ from vllm.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.pooling_params import PoolingParams
+    from vllm.sampling_params import SamplingParams
 
 logger = init_logger(__name__)
 
@@ -34,11 +36,19 @@ def patch_upstream() -> None:
     topk_topp_sampler.apply_top_k_top_p = topk_topp_sampler.apply_top_k_top_p_pytorch
 
 
+def validate_request(params: "SamplingParams | PoolingParams") -> None:
+    pass
+
+
 def check_and_update(vllm_config: "VllmConfig") -> None:
     from vllm_rbln.config import build_optimum_rbln_config
-    from vllm_rbln.utils.optimum.converter import sync_vllm_and_optimum
-    from vllm_rbln.utils.optimum.predicates import forces_fp32_dtype
-    from vllm_rbln.utils.optimum.registry import is_pooling_arch
+    from vllm_rbln.utils.optimum.configuration import sync_vllm_and_optimum
+    from vllm_rbln.utils.optimum.predicates import (
+        forces_fp32_dtype,
+        is_qwen3_embedding,
+        is_qwen3_reranker,
+    )
+    from vllm_rbln.utils.optimum.registry import get_rbln_model_info, is_pooling_arch
 
     # Everything below, and the sync at the end, reads additional_config as an
     # OptimumRBLNConfig. The sync also writes its derived fields back.
@@ -49,6 +59,24 @@ def check_and_update(vllm_config: "VllmConfig") -> None:
     model_config = vllm_config.model_config
     parallel_config = vllm_config.parallel_config
     scheduler_config = vllm_config.scheduler_config
+
+    # Raises if the architecture has no optimum-rbln counterpart. Must run
+    # before the remap below, which rewrites it to an optimum-rbln-internal
+    # name. vLLM has already rejected anything it cannot resolve itself, so
+    # this only has to cover the RBLN side.
+    get_rbln_model_info(model_config)
+
+    if is_qwen3_reranker(model_config):
+        # Callers pass `Qwen3ForSequenceClassification`, which is how vLLM
+        # selects convert=classify; optimum-rbln has no such class. Map it
+        # back to `Qwen3ForCausalLM`: the score comes from two vocabulary
+        # logits, so the graph needs lm_head, which `Qwen3Model` would drop.
+        model_config.hf_config.architectures = ["Qwen3ForCausalLM"]
+    elif is_qwen3_embedding(model_config):
+        # The architecture of Qwen3-Embedding model in huggingface
+        # is `Qwen3ForCausalLM`. But it have to be mapped to `Qwen3Model`
+        # for optimum-rbln.
+        model_config.hf_config.architectures = ["Qwen3Model"]
 
     if model_config.multimodal_config is not None:
         # Optimum visual graphs expect pixels normalized by the CPU processor.

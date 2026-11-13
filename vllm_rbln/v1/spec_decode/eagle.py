@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -55,6 +55,9 @@ logger = init_logger(__name__)
 
 
 class RBLNEagleProposer(EagleProposer):
+    # A producer's warm-up stops after the first pass, which is prefill-shaped.
+    warms_up_decode_graphs_on_a_producer = False
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -168,6 +171,11 @@ class RBLNEagleProposer(EagleProposer):
                 inputs_embeds=inputs_embeds,
                 token_indices_to_sample=token_indices_to_sample_padded,
             )
+
+        # A strict producer never verifies a draft, and has no decoding peer to
+        # wait for.
+        if self.runner.is_strict_kv_producer:
+            return draft_ids.new_zeros((num_reqs, self.num_speculative_tokens))
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1:
@@ -586,7 +594,7 @@ class RBLNEagleProposer(EagleProposer):
                 token_indices_to_sample=token_indices_to_sample_padded,
             )
 
-        if self.num_speculative_tokens == 1:
+        if self.num_speculative_tokens == 1 or self.runner.is_strict_kv_producer:
             return
 
         common_attn_metadata.num_actual_tokens = num_reqs
@@ -714,7 +722,7 @@ class RBLNEagleProposer(EagleProposer):
             num_reqs_padded=num_reqs if is_prefill else num_reqs_padded,
             query_len=input_ids.shape[1],
             query_len_padded=(
-                self.vllm_config.additional_config.prefill_chunk_size
+                self.vllm_config.additional_config.max_prefill_chunk_size
                 if is_prefill
                 else input_ids.shape[1]
             ),
