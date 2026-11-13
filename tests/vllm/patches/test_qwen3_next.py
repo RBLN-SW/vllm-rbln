@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The RBLN GatedDeltaNet layer's logical state spec and physical KV cache.
+"""The RBLN GatedDeltaNet layer's physical state spec and KV cache.
 Its forward tracks the HF reference across
 a padded prefill chunk, a continued chunk and a decode step on that block. The
 custom ops run their CPU bodies here, so no NPU is needed."""
@@ -39,7 +39,6 @@ from vllm_rbln.patches.qwen3_next import RBLNQwenGatedDeltaNetAttention
 from vllm_rbln.v1.attention.backends.flash_attention import RBLNFlashAttentionBackend
 from vllm_rbln.v1.attention.backends.gdn_attn import (
     RBLNGDNAttentionMetadataBuilder,
-    gdn_state_shape,
     grouped_qkv_rows,
 )
 from vllm_rbln.v1.attention.kv_cache_bindings import (
@@ -210,6 +209,8 @@ def test_padded_prefill_then_decode_tracks_hf(
     block_size, shared_binding, chunk_sizes, steps
 ):
     vllm_config = make_vllm_config(
+        model="JackFram/llama-68m",
+        max_model_len=2048,
         max_num_batched_tokens=max(chunk_sizes),
         max_num_seqs=2,
         dtype="float32",
@@ -230,7 +231,7 @@ def test_padded_prefill_then_decode_tracks_hf(
     vllm_config.compilation_config.static_forward_context[PREFIX] = device_layer
     spec = MambaSpec(
         block_size=vllm_config.model_config.max_model_len,
-        shapes=(gdn_state_shape(HEADS_V, HEAD_DIM, HEAD_DIM),),
+        shapes=(kv_block,),
         dtypes=(torch.float32,),
         page_size_padded=state[0].numel() * state.element_size(),
     )
@@ -306,7 +307,7 @@ def test_forward_without_metadata_is_an_error(vllm_config):
 
 
 class TestStateSpec:
-    """Logical state specs and physical KV views share one padded allocation."""
+    """State specs describe the physical KV page used by the runner."""
 
     @staticmethod
     def _layer():
@@ -330,7 +331,7 @@ class TestStateSpec:
         "value_heads, block_size", [(32, 256), (32, 1024), (48, 384), (48, 1024)]
     )
     @pytest.mark.parametrize("explicit_padding", [False, True])
-    def test_spec_separates_valid_state_from_page(
+    def test_spec_uses_full_attention_page(
         self, value_heads, block_size, explicit_padding
     ):
         layer = self._layer()
@@ -344,10 +345,10 @@ class TestStateSpec:
             additional_config=RBLNConfig(),
         )
         spec = layer.get_kv_cache_spec(config)
-        assert spec.shapes == ((value_heads, 128, 128),)
-        assert spec.real_page_size_bytes == value_heads * 128 * 128 * 2
+        assert spec.shapes == ((2, 4, 1, block_size, 256),)
+        assert spec.real_page_size_bytes == spec.page_size_bytes
         assert spec.page_size_bytes == 2 * 4 * block_size * 256 * 2
-        assert spec.page_size_padded == spec.page_size_bytes
+        assert spec.page_size_padded == layer.cache_config.mamba_page_size_padded
         assert spec.block_size == config.cache_config.mamba_block_size
 
     def test_layer_cache_uses_full_attention_layout(self):
@@ -372,7 +373,7 @@ class TestStateSpec:
         layer.cache_config.mamba_ssm_cache_dtype = "float32"
         assert layer.get_state_dtype() == (torch.bfloat16,)
 
-    def test_the_model_declares_the_layers_state(self):
+    def test_model_state_sizing_uses_valid_shape(self):
         layer = self._layer()
         vllm_config = SimpleNamespace(
             model_config=SimpleNamespace(
@@ -389,9 +390,7 @@ class TestStateSpec:
             additional_config=RBLNConfig(),
         )
         model = RBLNQwen3_5ForConditionalGeneration
-        assert model.get_mamba_state_shape_from_config(vllm_config) == (
-            layer.get_kv_cache_spec(vllm_config).shapes
-        )
+        assert model.get_mamba_state_shape_from_config(vllm_config) == ((48, 128, 128),)
         assert model.get_mamba_state_dtype_from_config(vllm_config) == (
             self._layer().get_state_dtype()
         )

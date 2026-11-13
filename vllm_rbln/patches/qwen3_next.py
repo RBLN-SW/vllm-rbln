@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import replace
-
 import torch
 import torch.nn.functional as F
 from rebel.ops.torch_custom_ops.gdn import CHUNK as GDN_PREFILL_CHUNK
@@ -27,7 +25,7 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
 )
 from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
-from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.kv_cache_interface import KVCacheSpec
 
 from vllm_rbln.patches import register_patch
 from vllm_rbln.patches.attention import _resolve_kv_cache
@@ -36,7 +34,6 @@ from vllm_rbln.v1.attention.backends.flash_attention import RBLNFlashAttentionBa
 from vllm_rbln.v1.attention.backends.gdn_attn import (
     RBLNGDNAttentionBackend,
     RBLNGDNAttentionMetadata,
-    gdn_state_shape,
 )
 from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
 
@@ -160,22 +157,9 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         )
         return (shape,)
 
-    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> MambaSpec:
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
         with set_current_vllm_config(vllm_config):
-            physical_spec = super().get_kv_cache_spec(vllm_config)
-        assert isinstance(physical_spec, MambaSpec)
-        # Replace only shapes and page_size_padded; retain all other spec fields.
-        return replace(
-            physical_spec,
-            shapes=(
-                gdn_state_shape(
-                    self.num_v_heads // self.tp_size,
-                    self.head_k_dim,
-                    self.head_v_dim,
-                ),
-            ),
-            page_size_padded=physical_spec.page_size_bytes,
-        )
+            return super().get_kv_cache_spec(vllm_config)
 
     def get_state_dtype(self) -> tuple[torch.dtype]:
         # The delta-rule kernels take the state in the dtype of q / k / v, so it

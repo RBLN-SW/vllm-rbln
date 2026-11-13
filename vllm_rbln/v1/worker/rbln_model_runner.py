@@ -22,7 +22,7 @@ from typing import Any, Literal, NamedTuple, TypeAlias, cast
 
 import numpy as np
 import torch
-from vllm.config import VllmConfig, get_layers_from_vllm_config, set_current_vllm_config
+from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.config.cache import CacheConfig
 from vllm.distributed.kv_transfer import (
     get_kv_transfer_group,
@@ -137,7 +137,6 @@ from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadataBuilder,
 )
 from vllm_rbln.v1.attention.backends.gdn_attn import (
-    RBLNGDNAttentionBackend,
     RBLNGDNAttentionMetadataBuilder,
 )
 from vllm_rbln.v1.attention.kv_cache_bindings import (
@@ -3443,10 +3442,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                         dynamic_axis=base_dynamic_axis,
                     )
                 elif isinstance(kv_cache_spec, MambaSpec):
-                    is_gdn = attn_backend is RBLNGDNAttentionBackend
                     if len(kv_cache_spec.shapes) != 1 or (
-                        not is_gdn
-                        and kv_cache_spec.real_page_size_bytes
+                        kv_cache_spec.real_page_size_bytes
                         != kv_cache_spec.page_size_bytes
                     ):
                         raise NotImplementedError(
@@ -3454,14 +3451,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                             f"that fills its page, got {kv_cache_spec}"
                         )
                     dtype = kv_cache_spec.dtypes[0]
-                    if is_gdn:
-                        layer = self.compilation_config.static_forward_context[
-                            layer_name
-                        ]
-                        with set_current_vllm_config(self.vllm_config):
-                            kv_cache_shape = (num_blocks, *layer.get_state_shape()[0])
-                    else:
-                        kv_cache_shape = (num_blocks, *kv_cache_spec.shapes[0])
+                    kv_cache_shape = (num_blocks, *kv_cache_spec.shapes[0])
                     typed_base = raw_tensor.view(dtype).view(kv_cache_shape)
                     kv_caches[layer_name] = typed_base
                     kv_cache_block_axes[layer_name] = 0

@@ -14,12 +14,11 @@
 
 """GatedDeltaNet (Qwen3-Next, Qwen3.5 `linear_attention`) state on RBLN.
 
-A layer's `MambaSpec` describes its unpadded recurrent state and pads its
-page to the full-attention KV capacity. The runner binds the physical KV
-shape from the layer, so sharing layers use one graph input and one chiplet
-cut. The kernels then read and write one contiguous state prefix per local
-page, sized from Q/K/V, and preserve trailing padding. State uses the activation dtype
-(dlfloat16 inside the kernels).
+A layer's `MambaSpec` describes a full-attention KV page, including unused
+capacity. The runner binds that shape so sharing layers use one graph input
+and one chiplet cut. The kernels size a contiguous state prefix per local
+page from Q/K/V and preserve trailing padding. State uses the activation
+dtype (dlfloat16 inside the kernels).
 
 The builder addresses a request's one state block by its group's block table;
 `mamba_block_size` is the model length. A padding batch row uses null block 0.

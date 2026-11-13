@@ -49,11 +49,9 @@ def _one_group_two_layers(make_model_runner):
 
 
 class TestReshapeKVCacheTensors:
-    @pytest.mark.parametrize(
-        "value_heads, block_size", [(32, 256), (32, 1024), (48, 384), (48, 1024)]
-    )
+    @pytest.mark.parametrize("block_size", [256, 384, 1024])
     def test_padded_gdn_keeps_shared_kv_view(
-        self, make_model_runner, tmp_path, value_heads, block_size
+        self, make_model_runner, tmp_path, block_size
     ):
         LlamaConfig(
             hidden_size=1024,
@@ -76,9 +74,6 @@ class TestReshapeKVCacheTensors:
         )
         layer = object.__new__(RBLNQwenGatedDeltaNetAttention)
         layer.layer_index = None
-        layer.num_kv_heads = 4
-        layer.kv_head_size = 256
-        layer.cache_config = config.cache_config
         runner.compilation_config.static_forward_context["layer.1"] = layer
         cache_config = make_kv_cache_config(
             runner,
@@ -89,7 +84,7 @@ class TestReshapeKVCacheTensors:
         attention_spec = cache_config.kv_cache_groups[0].kv_cache_spec
         state_spec = MambaSpec(
             block_size=config.model_config.max_model_len,
-            shapes=((value_heads, 128, 128),),
+            shapes=((2, 4, 1, block_size, 256),),
             dtypes=(torch.bfloat16,),
             page_size_padded=attention_spec.page_size_bytes,
             mamba_type=layer.mamba_type,
@@ -110,10 +105,10 @@ class TestReshapeKVCacheTensors:
         assert len(runner.kv_cache_bases) == 1
         info = runner.kv_cache_view_infos[layer.layer_index]
         state = materialize_kv_cache_view(runner.kv_cache_bases, info)
-        assert tuple(state.shape) == (4, *layer.get_state_shape()[0])
+        assert tuple(state.shape) == (4, *state_spec.shapes[0])
         assert kv_cache_tensor_key(state) == kv_cache_tensor_key(caches["layer.0"])
         assert state.stride(0) * state.element_size() == state_spec.page_size_bytes
-        assert state_spec.real_page_size_bytes <= state_spec.page_size_bytes
+        assert state_spec.real_page_size_bytes == state_spec.page_size_bytes
 
     # Technique from upstream's test_kv_cache_stride_order: drive the real
     # backend rather than a fake, so the assertions hold for the backend in use.
