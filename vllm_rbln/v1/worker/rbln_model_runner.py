@@ -3483,7 +3483,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             kv_cache_view_infos,
         )
 
-        self.kv_cache_names = get_kv_cache_names(kv_caches)
+        forward_context = self.compilation_config.static_forward_context
+        self.kv_cache_names = get_kv_cache_names(
+            {name: forward_context[name] for name in kv_caches}
+        )
         self._update_kv_cache_base_bindings(
             kv_cache_bases_by_layer,
             kv_cache_view_infos,
@@ -3513,7 +3516,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             key = kv_cache_tensor_key(cache)
             self.kv_cache_allocations.setdefault(key, name)
         self.kv_cache_block_axes = block_axes
-        forward_context = self.compilation_config.static_forward_context
         for layer_name, kv_cache in kv_caches.items():
             forward_context[layer_name].kv_cache = kv_cache
         # Cache indices are positions in this rank's actual cache list, including

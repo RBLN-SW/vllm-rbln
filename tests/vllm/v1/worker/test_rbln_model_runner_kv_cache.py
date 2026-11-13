@@ -103,8 +103,10 @@ class TestLayerIndexFollowsCacheOrder:
     decoder layer."""
 
     @staticmethod
-    def _bind(make_model_runner, monkeypatch, names, **text_config):
-        runner = make_model_runner(layers=names, init_kv_cache=False)
+    def _bind(make_model_runner, monkeypatch, names, cache_orders, **text_config):
+        runner = make_model_runner(
+            layers=names, cache_orders=cache_orders, init_kv_cache=False
+        )
         # The test config is memoized, so put the attributes back afterwards.
         for key, value in text_config.items():
             monkeypatch.setattr(
@@ -134,6 +136,7 @@ class TestLayerIndexFollowsCacheOrder:
             make_model_runner,
             monkeypatch,
             names,
+            cache_orders=dict(zip(names, [(0, 0), (1, 0), (1, 1), (2, 0)])),
             sparse_attention_config={"sparse_attention_freq": [0, 1, 0]},
         )
         assert runner.kv_cache_names == list(names)
@@ -149,7 +152,12 @@ class TestLayerIndexFollowsCacheOrder:
             for layer in (0, 1)
             for module in ("attn", "indexer.k_cache", "indexer.k_cache.scale_cache")
         )
-        runner, after = self._bind(make_model_runner, monkeypatch, names)
+        runner, after = self._bind(
+            make_model_runner,
+            monkeypatch,
+            names,
+            cache_orders={name: (i // 3, i % 3) for i, name in enumerate(names)},
+        )
         assert runner.kv_cache_names == list(names)
         assert after == {name: i for i, name in enumerate(names)}
 
@@ -186,13 +194,14 @@ class TestBlockAuxKVCaches:
         context = runner.compilation_config.static_forward_context
         for i, owner in ((2, "layer.0"), (3, "layer.1")):
             module = self._aux(owner)
-            module.layer_index = i
+            module.layer_index = None
+            module.kv_cache_order = (context[owner].kv_cache_order[0], 1)
             monkeypatch.setitem(context, f"layer.{i}", module)
         config = make_kv_cache_config(runner, groups=[("layer.0",), ("layer.1",)])
         runner.initialize_kv_cache(config)
         assert runner.kv_cache_allocations == {
             kv_cache_tensor_key(runner.kv_caches[0]): "layer.0",
-            kv_cache_tensor_key(runner.kv_caches[2]): "layer.2",
+            kv_cache_tensor_key(runner.kv_caches[1]): "layer.2",
         }
 
         old_allocations = runner.kv_cache_allocations.copy()
@@ -479,7 +488,16 @@ class TestLayerIndexFollowsCachePosition:
         assert sorted(positions) == list(range(len(cls.LAYERS)))
 
     def test_after_initialization_and_after_a_rebind(self, make_model_runner):
-        runner = make_model_runner(layers=self.LAYERS, init_kv_cache=False)
+        runner = make_model_runner(
+            layers=self.LAYERS,
+            init_kv_cache=False,
+            cache_orders=dict(
+                zip(
+                    self.LAYERS,
+                    [(0, 0), (0, 1), (0, 2), (1, 0), (2, 0), (2, 1), (2, 2)],
+                )
+            ),
+        )
 
         runner.initialize_kv_cache(
             make_kv_cache_config(runner, groups=[(name,) for name in self.LAYERS])

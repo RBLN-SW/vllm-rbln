@@ -67,6 +67,7 @@ from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
     WeightsMapper,
+    extract_layer_index,
     is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -112,8 +113,9 @@ KDA_QK_NORM_EPS = 1e-6
 
 
 class _RBLNGlm5NextCache(nn.Module, AttentionLayerBase):
-    def __init__(self, prefix: str) -> None:
+    def __init__(self, prefix: str, *, kv_cache_order: tuple[int, int]) -> None:
         super().__init__()
+        self.kv_cache_order = kv_cache_order
         self.prefix = prefix
         self.kv_cache = torch.tensor([])
         vllm_config = get_current_vllm_config()
@@ -168,8 +170,10 @@ class RBLNGlm5NextPagedCache(_RBLNGlm5NextCache):
         dtype: torch.dtype,
         tokens_per_state: int,
         backend: type,
+        *,
+        kv_cache_order: tuple[int, int],
     ) -> None:
-        super().__init__(prefix)
+        super().__init__(prefix, kv_cache_order=kv_cache_order)
         self.head_size = head_size
         self.dtype = dtype
         self.tokens_per_state = tokens_per_state
@@ -206,8 +210,10 @@ class RBLNGlm5NextAuxCache(_RBLNGlm5NextCache):
         dtype: torch.dtype,
         prefix_cacheable: bool = True,
         head_axis: int | None = None,
+        *,
+        kv_cache_order: tuple[int, int],
     ) -> None:
-        super().__init__(prefix)
+        super().__init__(prefix, kv_cache_order=kv_cache_order)
         self.owner = owner
         self.block_shape = block_shape
         self.dtype = dtype
@@ -406,9 +412,11 @@ class RBLNGlm5NextKDA(nn.Module):
             torch.empty(3 * self.num_groups, proj // self.num_groups, taps),
             persistent=False,
         )
+        decoder_layer = extract_layer_index(prefix)
         self.states = nn.ModuleList(
             RBLNGlm5NextStateCache(
-                kda_cache_name(prefix, KDA_STATE, j, self.num_groups)
+                kda_cache_name(prefix, KDA_STATE, j, self.num_groups),
+                kv_cache_order=(decoder_layer, j),
             )
             for j in range(self.num_groups)
         )
@@ -427,6 +435,7 @@ class RBLNGlm5NextKDA(nn.Module):
             ),
             dtype,
             head_axis=2,
+            kv_cache_order=(self.states[0].kv_cache_order[0], self.num_groups),
         )
         self.drafts = None
         if self.num_drafts:
@@ -438,6 +447,7 @@ class RBLNGlm5NextKDA(nn.Module):
                     dtype,
                     prefix_cacheable=False,
                     head_axis=0,
+                    kv_cache_order=(state.kv_cache_order[0], self.num_groups + 1 + j),
                 )
                 for j, state in enumerate(self.states)
             )
@@ -613,18 +623,21 @@ class RBLNGlm5NextIndexer(nn.Module):
 
         self.block_size = get_current_vllm_config().cache_config.block_size
         attn_prefix = prefix.rsplit(".indexer", 1)[0]
+        decoder_layer = extract_layer_index(attn_prefix)
         self.key_cache = RBLNGlm5NextPagedCache(
             f"{attn_prefix}.attn.{SLOT_DSA_INDEX_KEY}",
             self.head_dim,
             torch.float8_e4m3fn,
             kpool,
             RBLNGlm5NextIndexerBackend,
+            kv_cache_order=(decoder_layer, SLOT_DSA_INDEX_KEY),
         )
         self.scale_cache = RBLNGlm5NextAuxCache(
             f"{attn_prefix}.attn.{SLOT_DSA_INDEX_SCALE}",
             f"{attn_prefix}.attn.{SLOT_DSA_INDEX_KEY}",
             (self.block_size // kpool,),
             torch.float16,
+            kv_cache_order=(self.key_cache.kv_cache_order[0], SLOT_DSA_INDEX_SCALE),
         )
         # The tail ring: the raw (key | gate) rows of a request's latest positions,
         # slot p % ring. A verify with rejected drafts starts the next step back inside
@@ -640,6 +653,7 @@ class RBLNGlm5NextIndexer(nn.Module):
             (self.tail_ring, 2 * self.head_dim),
             torch.bfloat16,
             prefix_cacheable=False,
+            kv_cache_order=(decoder_layer, SLOT_DSA_INDEX_TAIL),
         )
 
     @torch.no_grad()
@@ -760,6 +774,7 @@ class RBLNGlm5NextDSA(nn.Module):
             torch.uint8,
             1,
             RBLNGlm5NextCacheBackend,
+            kv_cache_order=(extract_layer_index(prefix), SLOT_DSA_LATENT),
         )
         self.scale = self.qk_nope_head_dim**-0.5
 

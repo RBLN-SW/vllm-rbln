@@ -473,71 +473,36 @@ class TestEstimateModelKernelSize:
 
 
 class TestGetKvCacheNames:
-    @staticmethod
-    def _caches(*names):
-        return {n: torch.empty(0) for n in names}
-
-    def test_orders_by_layer_index(self):
-        # Returned ordered by extracted layer index, not dict insertion order.
-        caches = self._caches(
-            "model.layers.2.self_attn",
-            "model.layers.0.self_attn",
-            "model.layers.1.self_attn",
-        )
-        assert get_kv_cache_names(caches) == [
-            "model.layers.0.self_attn",
-            "model.layers.1.self_attn",
-            "model.layers.2.self_attn",
-        ]
-
     @pytest.mark.parametrize(
         "names",
         [
-            (
-                "model.layers.0.self_attn.attn",
-                "model.layers.0.self_attn.indexer.k_cache",
-                "model.layers.0.self_attn.indexer.k_cache.scale_cache",
-                "model.layers.1.self_attn.attn",
-                "model.layers.2.self_attn.attn",
-                "model.layers.2.self_attn.indexer.k_cache",
-            ),
-            (
-                "model.layers.2.self_attn.attn.0",
-                "model.layers.2.self_attn.attn.9",
-                "model.layers.2.self_attn.attn.10",
-                "model.layers.3.self_attn.attn.0",
-                "model.layers.10.self_attn.attn.0",
-            ),
-            (
-                "model.layers.0.self_attn.attn",
-                "model.layers.1.linear_attn",
-                "model.layers.1.linear_attn.conv_ring",
-                "model.layers.2.self_attn.attn",
-            ),
+            ("main", "keys", "scale", "next"),
+            ("scale.99", "conv_ring.8", "main.0", "indexer.1"),
         ],
-        ids=["sparse-indexer", "numeric-slots", "conv-ring"],
     )
-    def test_orders_actual_caches_without_model_configuration(self, names):
-        assert get_kv_cache_names(self._caches(*reversed(names))) == list(names)
+    def test_declared_order_is_independent_of_names_and_registration(self, names):
+        orders = [(3, 0), (3, 1), (3, 10), (7, 0)]
+        layers = {
+            name: SimpleNamespace(kv_cache_order=order)
+            for name, order in reversed(list(zip(names, orders)))
+        }
+        assert get_kv_cache_names(layers) == list(names)
 
-    def test_multi_layer_same_index_raises(self, monkeypatch):
-        # Two layers at one index on a non-cpu/cuda/xpu platform -> not supported.
-        monkeypatch.setattr(current_platform, "is_cpu", lambda: False)
-        monkeypatch.setattr(current_platform, "is_cuda_alike", lambda: False)
-        monkeypatch.setattr(current_platform, "is_xpu", lambda: False)
-        caches = self._caches("model.layers.0.self_attn", "model.layers.0.cross_attn")
-        with pytest.raises(NotImplementedError):
-            get_kv_cache_names(caches)
+    def test_missing_declaration_is_an_error(self):
+        with pytest.raises(ValueError, match="main.*kv_cache_order"):
+            get_kv_cache_names({"main": SimpleNamespace()})
 
-    def test_multi_layer_same_index_allowed_on_cpu(self, monkeypatch):
-        # The other side of the branch: on cpu/cuda/xpu both names are returned.
-        monkeypatch.setattr(current_platform, "is_cpu", lambda: True)
-        monkeypatch.setattr(current_platform, "is_cuda_alike", lambda: False)
-        monkeypatch.setattr(current_platform, "is_xpu", lambda: False)
-        caches = self._caches("model.layers.0.self_attn", "model.layers.0.cross_attn")
-        names = get_kv_cache_names(caches)
-        assert set(names) == set(caches)
-        assert len(names) == 2
+    def test_duplicate_order_is_an_error(self):
+        layers = {
+            name: SimpleNamespace(kv_cache_order=(3, 0)) for name in ("main", "other")
+        }
+        with pytest.raises(ValueError, match="main.*other|other.*main"):
+            get_kv_cache_names(layers)
+
+    @pytest.mark.parametrize("order", [(3,), (3, -1), ("3", 0), [3, 0]])
+    def test_invalid_declaration_is_an_error(self, order):
+        with pytest.raises(ValueError, match="main.*kv_cache_order"):
+            get_kv_cache_names({"main": SimpleNamespace(kv_cache_order=order)})
 
 
 class TestPrepareKernelBlockSizes:

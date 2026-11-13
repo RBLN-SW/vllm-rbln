@@ -269,6 +269,8 @@ class TestIndexerCacheBackends:
         cache = self._indexer_cache(monkeypatch, model_dtype)
         assert cache.dtype == torch.float8_e4m3fn
         assert cache.scale_cache.dtype == model_dtype
+        assert cache.kv_cache_order == (0, 1)
+        assert cache.scale_cache.kv_cache_order == (0, 2)
         assert (
             cache.scale_cache.get_attn_backend() is RBLNDeepseekV32IndexerScaleBackend
         )
@@ -293,3 +295,27 @@ class TestIndexerCacheBackends:
         spec = SimpleNamespace(num_kv_heads=1, head_size=head_size)
         order = backend.get_kv_cache_stride_order()
         assert kv_cache_dynamic_axis(backend, 4, 2048, spec, "fp8", order) == 0
+
+
+def test_longcat_declares_a_slot_for_each_attention(monkeypatch):
+    from vllm_rbln.patches import mla as patch
+    from vllm_rbln.v1.worker.utils import get_kv_cache_names
+
+    def upstream_init(self):
+        self.layer_idx = 7
+        self.self_attn = [
+            SimpleNamespace(mla_attn=SimpleNamespace(mla_attn=SimpleNamespace()))
+            for _ in range(2)
+        ]
+
+    monkeypatch.setattr(patch, "longcat_decoder_original_init", upstream_init)
+    owner = SimpleNamespace()
+    patch.patched_longcat_decoder_init(owner)
+    caches = {
+        "first": owner.self_attn[0].mla_attn.mla_attn,
+        "second": owner.self_attn[1].mla_attn.mla_attn,
+    }
+    assert get_kv_cache_names(dict(reversed(list(caches.items())))) == [
+        "first",
+        "second",
+    ]

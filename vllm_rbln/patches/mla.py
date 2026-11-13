@@ -21,6 +21,8 @@ import torch
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.model_executor.layers.attention import mla_attention as _mla_attention_mod
 from vllm.model_executor.layers.attention.mla_attention import MLAAttention
+from vllm.model_executor.models.longcat_flash import FlashDecoderLayer
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.model_executor.utils import replace_parameter
 
 from vllm_rbln.model_executor.layers.quantization.modelopt_fp8 import (
@@ -29,6 +31,7 @@ from vllm_rbln.model_executor.layers.quantization.modelopt_fp8 import (
 from vllm_rbln.patches import register_patch
 from vllm_rbln.patches.attention import _resolve_kv_cache
 
+longcat_decoder_original_init = FlashDecoderLayer.__init__
 mla_attention_original_init = MLAAttention.__init__
 mla_attention_original_process_weights = MLAAttention.process_weights_after_loading
 mla_attention_original_get_kv_cache_spec = MLAAttention.get_kv_cache_spec
@@ -135,6 +138,10 @@ def patched_mla_attention_init(self: MLAAttention, *args, **kwargs) -> None:
     mla_attention_original_init(self, *args, **kwargs)
 
     self.layer_index = None
+    self.kv_cache_order = (
+        extract_layer_index(self.layer_name.partition(".self_attn")[0]),
+        0,
+    )
 
 
 @register_patch(
@@ -223,3 +230,16 @@ def patched_mla_process_weights(self: MLAAttention, act_dtype: torch.dtype) -> N
         replace_parameter(self, "W_UK_T", self.W_UK_T.unsqueeze(0))
     if hasattr(self, "W_UV"):
         replace_parameter(self, "W_UV", self.W_UV.unsqueeze(0))
+
+
+@register_patch(
+    target="vllm.model_executor.models.longcat_flash.FlashDecoderLayer.__init__",
+    reason=(
+        "Longcat owns two MLA caches per decoder layer, but upstream has no hook "
+        "to declare their distinct RBLN cache-order slots."
+    ),
+)
+def patched_longcat_decoder_init(self: FlashDecoderLayer, *args, **kwargs) -> None:
+    longcat_decoder_original_init(self, *args, **kwargs)
+    for slot, attention in enumerate(self.self_attn):
+        attention.mla_attn.mla_attn.kv_cache_order = (self.layer_idx, slot)

@@ -22,6 +22,7 @@ from vllm.model_executor.models.deepseek_v2 import (
     DeepseekV2MoE,
     DeepseekV32IndexerCache,
 )
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 from vllm_rbln.logger import init_logger
@@ -170,6 +171,7 @@ def rbln_indexer_cache_init(self, *args, **kwargs) -> None:
 
     model_config = vllm_config.model_config
     self.layer_index = None
+    self.kv_cache_order = (extract_layer_index(self.prefix), 1)
 
     # register the per-token scale cache (2-cache spec).
     self.scale_cache = None
@@ -184,6 +186,7 @@ def rbln_indexer_cache_init(self, *args, **kwargs) -> None:
         )
         scale.get_attn_backend = lambda: RBLNDeepseekV32IndexerScaleBackend
         scale.layer_index = None
+        scale.kv_cache_order = (self.kv_cache_order[0], 2)
         self.scale_cache = scale
 
 

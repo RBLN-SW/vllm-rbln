@@ -21,7 +21,7 @@ import platform
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Literal, NoReturn, TypeVar
@@ -1258,38 +1258,27 @@ def reorder_input_batch(input_batch: "InputBatch", perm: np.ndarray) -> None:
         ]
 
 
-def get_kv_cache_names(layer_names: Iterable[str]) -> list[str]:
-    """Order actual caches by decoder layer and cache slot, without a model-wide
-    cache count. Numeric slots take precedence over indexer/scale suffixes.
+def get_kv_cache_names(cache_layers: Mapping[str, Any]) -> list[str]:
+    """Order caches by their declared (decoder layer, cache slot).
 
-    NIXL uses this order for transfer regions, so it must not depend on dict
-    insertion order or the process's hash seed.
+    NIXL uses this order for transfer regions, so every cache must declare a
+    unique key independent of its name, registration order, and hash seed.
     """
-    slots: dict[tuple[int, int], list[str]] = defaultdict(list)
-    for layer_name in layer_names:
-        indices = [int(part) for part in layer_name.split(".") if part.isdecimal()]
-        assert indices, f"layer name {layer_name} has no integer layer index"
-        if len(indices) >= 2:
-            sub = indices[1]
-        elif "scale" in layer_name:
-            sub = 2
-        elif "indexer" in layer_name or "conv_ring" in layer_name:
-            sub = 1
-        else:
-            sub = 0
-        slots[indices[0], sub].append(layer_name)
-
-    ordered: list[str] = []
-    for slot in sorted(slots):
-        names = slots[slot]
-        if len(names) > 1 and not (
-            current_platform.is_cuda_alike()
-            or current_platform.is_xpu()
-            or current_platform.is_cpu()
+    names_by_order: dict[tuple[int, int], str] = {}
+    for name, layer in cache_layers.items():
+        order = getattr(layer, "kv_cache_order", None)
+        if (
+            not isinstance(order, tuple)
+            or len(order) != 2
+            or any(type(value) is not int or value < 0 for value in order)
         ):
-            raise NotImplementedError(f"Multiple KV caches occupy slot {slot}: {names}")
-        ordered.extend(sorted(names))
-    return ordered
+            raise ValueError(f"{name}: invalid or missing kv_cache_order: {order!r}")
+        if order in names_by_order:
+            raise ValueError(
+                f"Duplicate kv_cache_order {order}: {names_by_order[order]} and {name}"
+            )
+        names_by_order[order] = name
+    return [names_by_order[order] for order in sorted(names_by_order)]
 
 
 def copy_host_device_kv_blocks(
