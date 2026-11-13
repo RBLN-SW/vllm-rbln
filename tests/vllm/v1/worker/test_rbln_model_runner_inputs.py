@@ -80,6 +80,87 @@ class TestResolveMultiModalSupport:
             runner._resolve_mm_support()
 
 
+class _MmPrefixModel(_InGraphMergeModel):
+    def __init__(self, max_mm_prefix_range_len):
+        super().__init__()
+        self.max_mm_prefix_range_len = max_mm_prefix_range_len
+
+
+class TestResolveMmPrefixSupport:
+    """An mm prefix LM is served only when every cap the scheduler puts on a
+    prefill chunk holds its longest range."""
+
+    @staticmethod
+    def _runner(make_model_runner, monkeypatch, model, **config):
+        monkeypatch.setattr(
+            ModelConfig, "supports_multimodal_inputs", property(lambda self: True)
+        )
+        monkeypatch.setattr(ModelConfig, "is_mm_prefix_lm", property(lambda self: True))
+        runner = make_model_runner(**config)
+        runner.model = model
+        return runner
+
+    def test_a_model_naming_no_longest_range_is_refused(
+        self, make_model_runner, monkeypatch
+    ):
+        runner = self._runner(make_model_runner, monkeypatch, _InGraphMergeModel())
+
+        with pytest.raises(ValueError, match="SupportsRBLNMmPrefix"):
+            runner._resolve_mm_support()
+
+    @pytest.mark.parametrize(
+        "flag", ["long_prefill_token_threshold", "max_num_scheduled_tokens"]
+    )
+    def test_a_cap_that_would_split_a_range_is_refused(
+        self, make_model_runner, monkeypatch, flag
+    ):
+        runner = self._runner(
+            make_model_runner, monkeypatch, _MmPrefixModel(128), **{flag: 64}
+        )
+
+        with pytest.raises(ValueError, match=flag):
+            runner._resolve_mm_support()
+
+    def test_a_threshold_and_chunk_equal_to_the_longest_range_are_taken(
+        self, make_model_runner, monkeypatch
+    ):
+        runner = self._runner(
+            make_model_runner,
+            monkeypatch,
+            _MmPrefixModel(280),
+            long_prefill_token_threshold=280,
+            max_num_batched_tokens=280,
+        )
+
+        assert runner._resolve_mm_support() is True
+
+    def test_a_range_longer_than_the_longest_chunk_is_refused_with_a_fix(
+        self, make_model_runner, monkeypatch
+    ):
+        # The step budget holds the range; only the longest chunk does not.
+        runner = self._runner(
+            make_model_runner,
+            monkeypatch,
+            _MmPrefixModel(1120),
+            max_num_batched_tokens=512,
+            block_size=8192,
+            additional_config={"prefill_chunk_size": [512]},
+        )
+
+        with pytest.raises(ValueError) as refused:
+            runner._resolve_mm_support()
+        message = str(refused.value)
+        assert (
+            "--max-num-batched-tokens 2048 --rbln-prefill-chunk-size 512,2048"
+            in message
+        )
+        assert "--rbln-prefill-chunk-size 512,1152" in message
+        assert (
+            "max_soft_tokens (1120)" in message
+            and "divides --block-size (8192)" in message
+        )
+
+
 class TestGatherMultimodalEmbeddings:
     def test_scheduled_images_are_encoded_and_cached_by_hash(
         self, make_model_runner, monkeypatch

@@ -140,7 +140,7 @@ class RBLNScheduler(Scheduler):
                 kv_cache_config=self.kv_cache_config,
                 max_model_len=self.max_model_len,
                 scheduler_block_size=self.block_size,
-                hash_block_size=self.block_size,
+                hash_block_size=self.hash_block_size,
                 sub_block_size=sub_block_size,
                 hash_fn=hash_fn,
                 use_eagle=self.use_eagle,
@@ -190,6 +190,7 @@ class RBLNScheduler(Scheduler):
         self._strict_kv_producer = is_strict_kv_producer(self.vllm_config)
 
         self._prefill_chunk_size = rbln_config.max_prefill_chunk_size
+        self._is_mm_prefix_lm = self.vllm_config.model_config.is_mm_prefix_lm
 
         # NOTE(RBLN): the sparse-attention ops (DSA MLA / indexer, MiniMax-M3
         # MSA / indexer, GLM5 MLA / indexer) get NULL_BLOCK_ID as null_block_id
@@ -203,6 +204,41 @@ class RBLNScheduler(Scheduler):
                 f"({NULL_BLOCK_ID}); the RBLN sparse-attention cache store writes "
                 "to NULL_BLOCK_ID and would corrupt a live block."
             )
+
+    def _mm_prefix_split(
+        self, request: Request, num_computed_tokens: int, num_new_tokens: int
+    ) -> int:
+        """Tokens to schedule so that no image or video-frame range straddles two
+        steps: the chunk ends before a range it would cut, and a chunk resuming
+        inside a range runs past its end, since a one-token step reads as a decode.
+        """
+        end = num_computed_tokens + num_new_tokens
+        resumed_last = None
+        for feature in request.mm_features:
+            if feature.modality not in ("image", "video"):
+                continue
+            for first, last in feature.mm_position.extract_embeds_range():
+                if first < num_computed_tokens <= last:
+                    resumed_last = last
+                elif num_computed_tokens <= first < end <= last:
+                    assert first > num_computed_tokens, (
+                        f"an mm prefix range of {last + 1 - first} tokens does not "
+                        f"fit the {num_new_tokens}-token step"
+                    )
+                    end = first
+        assert resumed_last is None or end > resumed_last + 1, (
+            "a step resuming inside an mm prefix range must run past it"
+        )
+        return end - num_computed_tokens
+
+    def _splits_on_mm_prefix(self, request: Request) -> bool:
+        # Past the prompt, every range is behind the cursor; a preempted request
+        # recomputes from 0 and is cut again.
+        return (
+            self._is_mm_prefix_lm
+            and request.has_encoder_inputs
+            and request.num_computed_tokens < request.num_prompt_tokens
+        )
 
     def _decode_demand(self) -> int:
         """Total decode demand for this step's soft (ceil(demand/pp)) cap.
@@ -379,6 +415,13 @@ class RBLNScheduler(Scheduler):
             num_new_tokens = min(
                 num_new_tokens, self.max_model_len - 1 - request.num_computed_tokens
             )
+
+            # Cut before scheduling encoder inputs, so that only the items this
+            # chunk overlaps are scheduled.
+            if self._splits_on_mm_prefix(request):
+                num_new_tokens = self._mm_prefix_split(
+                    request, request.num_computed_tokens, num_new_tokens
+                )
 
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
@@ -785,6 +828,11 @@ class RBLNScheduler(Scheduler):
                         # Guard (C) of the no-mixed-batching invariant
                         # (see the step-phase section in v1/core/utils.py).
                         break
+
+                    if self._splits_on_mm_prefix(request):
+                        num_new_tokens = self._mm_prefix_split(
+                            request, num_computed_tokens, num_new_tokens
+                        )
 
                     # Schedule encoder inputs.
                     if request.has_encoder_inputs:
