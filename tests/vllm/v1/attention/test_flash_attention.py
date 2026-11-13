@@ -615,6 +615,9 @@ class TestBuildMmPrefixSlidingWindow:
             scale=self.DIM**-0.5,
             sliding_window=self.WINDOW,
         )
+        # The impl puts its scale on the configured device (the NPU in the
+        # device-tensor lane); this test runs the op's CPU reference.
+        impl.scale = impl.scale.cpu()
         from vllm_rbln.model_executor.models.gemma4 import _build_mm_prefix_sliding_mask
 
         layer = torch.nn.Module()

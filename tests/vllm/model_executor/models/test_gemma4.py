@@ -544,9 +544,6 @@ def test_prefix_mask_is_shared_and_does_not_escape_forward(monkeypatch, compiled
         assert len(graphs) == 1
         nodes = list(graphs[0].graph.nodes)
         assert sum(node.target is operator.le for node in nodes) == 1
-        assert not any(
-            node.op == "placeholder" and "scale" in str(node.target) for node in nodes
-        )
         assert len(nodes[-1].args[0]) == 1
         assert (
             sum(node.target is torch.ops.higher_order.invoke_subgraph for node in nodes)
