@@ -490,6 +490,36 @@ class TestGetKvCacheNames:
             "model.layers.2.self_attn",
         ]
 
+    @pytest.mark.parametrize(
+        "names",
+        [
+            (
+                "model.layers.0.self_attn.attn",
+                "model.layers.0.self_attn.indexer.k_cache",
+                "model.layers.0.self_attn.indexer.k_cache.scale_cache",
+                "model.layers.1.self_attn.attn",
+                "model.layers.2.self_attn.attn",
+                "model.layers.2.self_attn.indexer.k_cache",
+            ),
+            (
+                "model.layers.2.self_attn.attn.0",
+                "model.layers.2.self_attn.attn.9",
+                "model.layers.2.self_attn.attn.10",
+                "model.layers.3.self_attn.attn.0",
+                "model.layers.10.self_attn.attn.0",
+            ),
+            (
+                "model.layers.0.self_attn.attn",
+                "model.layers.1.linear_attn",
+                "model.layers.1.linear_attn.conv_ring",
+                "model.layers.2.self_attn.attn",
+            ),
+        ],
+        ids=["sparse-indexer", "numeric-slots", "conv-ring"],
+    )
+    def test_orders_actual_caches_without_model_configuration(self, names):
+        assert get_kv_cache_names(self._caches(*reversed(names))) == list(names)
+
     def test_multi_layer_same_index_raises(self, monkeypatch):
         # Two layers at one index on a non-cpu/cuda/xpu platform -> not supported.
         monkeypatch.setattr(current_platform, "is_cpu", lambda: False)

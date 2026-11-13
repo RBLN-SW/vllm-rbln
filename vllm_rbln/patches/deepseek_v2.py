@@ -31,12 +31,6 @@ from vllm_rbln.v1.attention.backends.mla.indexer import (
     RBLNDeepseekV32IndexerBackend,
     RBLNDeepseekV32IndexerScaleBackend,
 )
-from vllm_rbln.v1.worker.utils import (
-    num_attn_module as rbln_num_attn_module,
-)
-from vllm_rbln.v1.worker.utils import (
-    pipeline_adjusted_layer_index,
-)
 
 logger = init_logger(__name__)
 _original_indexer_cache_init = DeepseekV32IndexerCache.__init__
@@ -159,9 +153,9 @@ def patched_deepseek_v2_attention_forward(
 @register_patch(
     target="vllm.model_executor.models.deepseek_v2.DeepseekV32IndexerCache.__init__",
     reason=(
-        "Give the indexer KV cache the RBLN head_dim/dtype "
-        "and a layer_index that accounts for the extra indexer module per decoder "
-        "layer (num_attn_module=2), so the runner binds a distinct cache for it."
+        "Upstream uses a CUDA indexer cache layout and has no companion scale "
+        "cache for RBLN fp8 keys; RBLN also needs a cache index assigned by the "
+        "runner after allocation."
     ),
 )
 def rbln_indexer_cache_init(self, *args, **kwargs) -> None:
@@ -175,10 +169,7 @@ def rbln_indexer_cache_init(self, *args, **kwargs) -> None:
     self.dtype = torch.float8_e4m3fn if self.is_fp8_cache else torch.bfloat16
 
     model_config = vllm_config.model_config
-    num_attn_module = rbln_num_attn_module(model_config, cache_dtype)
-    self.layer_index = pipeline_adjusted_layer_index(
-        self.prefix, model_config, vllm_config.parallel_config, num_attn_module
-    )
+    self.layer_index = None
 
     # register the per-token scale cache (2-cache spec).
     self.scale_cache = None
@@ -192,9 +183,7 @@ def rbln_indexer_cache_init(self, *args, **kwargs) -> None:
             cache_config=self.cache_config,
         )
         scale.get_attn_backend = lambda: RBLNDeepseekV32IndexerScaleBackend
-        scale.layer_index = pipeline_adjusted_layer_index(
-            scale.prefix, model_config, vllm_config.parallel_config, num_attn_module
-        )
+        scale.layer_index = None
         self.scale_cache = scale
 
 

@@ -252,8 +252,6 @@ class TestIndexerCacheBackends:
         )
         monkeypatch.setattr(patch, "_original_indexer_cache_init", upstream_init)
         monkeypatch.setattr(vllm.config, "get_current_vllm_config", lambda: vllm_config)
-        monkeypatch.setattr(patch, "rbln_num_attn_module", lambda *_: 3)
-        monkeypatch.setattr(patch, "pipeline_adjusted_layer_index", lambda *_: 0)
         cache = patch.DeepseekV32IndexerCache.__new__(patch.DeepseekV32IndexerCache)
         patch.rbln_indexer_cache_init(
             cache,

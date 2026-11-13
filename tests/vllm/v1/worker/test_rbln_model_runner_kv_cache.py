@@ -99,9 +99,8 @@ class TestKVCacheBaseBindings:
 
 class TestLayerIndexFollowsCacheOrder:
     """`initialize_kv_cache_tensors` gives every layer the position of its cache
-    in `kv_cache_names`. The construction-time index assumes `num_attn_module`
-    caches per decoder layer, which a layer owning fewer breaks for every
-    layer after it."""
+    in `kv_cache_names`, including models with different cache counts per
+    decoder layer."""
 
     @staticmethod
     def _bind(make_model_runner, monkeypatch, names, **text_config):
@@ -112,7 +111,7 @@ class TestLayerIndexFollowsCacheOrder:
                 runner.model_config.hf_text_config, key, value, raising=False
             )
         ctx = runner.compilation_config.static_forward_context
-        before = {name: ctx[name].layer_index for name in names}
+        assert all(ctx[name].layer_index is None for name in names)
 
         runner.initialize_kv_cache(make_kv_cache_config(runner, groups=[names]))
 
@@ -120,7 +119,7 @@ class TestLayerIndexFollowsCacheOrder:
         # Whatever the index, it must reach the layer's own bound cache.
         for name in names:
             assert runner.kv_caches[after[name]] is ctx[name].kv_cache
-        return runner, before, after
+        return runner, after
 
     def test_minimax_m3_dense_layers_own_no_indexer_cache(
         self, make_model_runner, monkeypatch
@@ -131,16 +130,11 @@ class TestLayerIndexFollowsCacheOrder:
             "model.layers.1.self_attn.attn.indexer",  # ... and the indexer keys
             "model.layers.2.self_attn.attn",  # dense again
         )
-        runner, before, after = self._bind(
+        runner, after = self._bind(
             make_model_runner,
             monkeypatch,
             names,
             sparse_attention_config={"sparse_attention_freq": [0, 1, 0]},
-        )
-        # Construction indexed by decoder layer, so two caches collided.
-        assert (
-            before["model.layers.1.self_attn.attn"]
-            == before["model.layers.1.self_attn.attn.indexer"]
         )
         assert runner.kv_cache_names == list(names)
         assert after == {name: i for i, name in enumerate(names)}
@@ -149,25 +143,28 @@ class TestLayerIndexFollowsCacheOrder:
         self, make_model_runner, monkeypatch
     ):
         # DeepSeek-V3.2 / A.X-K3 under KV8: MLA latent, indexer keys, and the
-        # indexer's fp16 scale cache, so `num_attn_module` is 3.
-        monkeypatch.setattr(mr, "rbln_num_attn_module", lambda *args, **kwargs: 3)
+        # indexer's fp16 scale cache.
         names = tuple(
             f"model.layers.{layer}.self_attn.{module}"
             for layer in (0, 1)
             for module in ("attn", "indexer.k_cache", "indexer.k_cache.scale_cache")
         )
-        runner, _, after = self._bind(make_model_runner, monkeypatch, names)
+        runner, after = self._bind(make_model_runner, monkeypatch, names)
         assert runner.kv_cache_names == list(names)
         assert after == {name: i for i, name in enumerate(names)}
 
-    def test_mtp_layer_sits_after_the_target_layers(self, make_model_runner):
+    @pytest.mark.parametrize("last_stage", [False, True])
+    def test_mtp_layer_sits_after_the_target_layers(
+        self, make_model_runner, last_stage
+    ):
         from tests.vllm.v1.worker.utils import make_runner_config
 
         config = make_runner_config()
         num_layers = config.model_config.get_total_num_hidden_layers()
+        start = num_layers - 2 if last_stage else 0
         names = (
-            "model.layers.0.self_attn.attn",
-            "model.layers.1.self_attn.attn",
+            f"model.layers.{start}.self_attn.attn",
+            f"model.layers.{start + 1}.self_attn.attn",
             # An MTP / nextn layer is named past the target's layer count.
             f"model.layers.{num_layers}.self_attn.attn",
         )
@@ -452,10 +449,8 @@ class TestBuildAttentionMetadata:
 class TestLayerIndexFollowsCachePosition:
     """A layer reads its cache by `layer_index` into the runner's cache list.
 
-    Construction numbers the layers as if every decoder layer owned
-    `num_attn_module` caches. A layer that owns fewer -- an index-share skip
-    layer with no indexer cache -- shifts every later one, so after binding the
-    runner gives each layer the position the bound list actually has for it.
+    Index-share skip layers own no indexer cache. Binding must use the actual
+    list position, including after a dynamic-KV resize.
     """
 
     # The fp8 DSA layout, three caches per decoder layer: the attention cache,
@@ -483,10 +478,7 @@ class TestLayerIndexFollowsCachePosition:
         # One slot each: no two layers resolve to the same cache.
         assert sorted(positions) == list(range(len(cls.LAYERS)))
 
-    def test_after_initialization_and_after_a_rebind(
-        self, make_model_runner, monkeypatch
-    ):
-        monkeypatch.setattr(mr, "rbln_num_attn_module", lambda *args, **kwargs: 3)
+    def test_after_initialization_and_after_a_rebind(self, make_model_runner):
         runner = make_model_runner(layers=self.LAYERS, init_kv_cache=False)
 
         runner.initialize_kv_cache(

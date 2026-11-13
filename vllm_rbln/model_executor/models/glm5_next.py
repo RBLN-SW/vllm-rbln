@@ -100,10 +100,6 @@ from vllm_rbln.v1.attention.backends.glm5_next import (
     kda_cache_name,
 )
 from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
-from vllm_rbln.v1.worker.utils import (
-    num_attn_module as rbln_num_attn_module,
-)
-from vllm_rbln.v1.worker.utils import pipeline_adjusted_layer_index
 
 SLOT_DSA_LATENT, SLOT_DSA_INDEX_KEY, SLOT_DSA_INDEX_SCALE, SLOT_DSA_INDEX_TAIL = range(
     4
@@ -125,13 +121,7 @@ class _RBLNGlm5NextCache(nn.Module, AttentionLayerBase):
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
-        model_config = vllm_config.model_config
-        self.layer_index = pipeline_adjusted_layer_index(
-            prefix,
-            model_config,
-            vllm_config.parallel_config,
-            rbln_num_attn_module(model_config, vllm_config.cache_config.cache_dtype),
-        )
+        self.layer_index: int | None = None
 
     def forward(self) -> None: ...
 

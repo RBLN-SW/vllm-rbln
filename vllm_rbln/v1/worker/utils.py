@@ -21,7 +21,7 @@ import platform
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from datetime import datetime, timezone
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Literal, NoReturn, TypeVar
@@ -202,78 +202,6 @@ RBLN_DEV_DIR = "/dev"
 
 # 144 GiB of quad-chiplet DRAM minus the 4 GiB system region
 REBEL_DRAM_NBYTES = 144 * 2**30 - 4 * 2**30
-
-
-def extract_layer_index(layer_name: str, num_attn_module: int = 1) -> int:
-    int_vals: list[int] = []
-    for subname in layer_name.split("."):
-        try:
-            int_vals.append(int(subname))
-        except ValueError:
-            continue
-    if num_attn_module <= 1 or "attn" not in layer_name:
-        assert len(int_vals) == 1, (
-            f"layer name {layer_name} should only contain one integer"
-        )
-        return int_vals[0]
-    assert int_vals, f"layer name {layer_name} has no integer layer index"
-    base = int_vals[0]
-    if len(int_vals) >= 2:
-        sub = int_vals[1]
-    elif "scale" in layer_name:
-        sub = 2
-    elif "indexer" in layer_name:
-        sub = 1
-    else:
-        sub = 0
-    return base * num_attn_module + sub
-
-
-def pipeline_adjusted_layer_index(
-    layer_name: str,
-    model_config,
-    parallel_config,
-    num_attn_module: int,
-) -> int:
-    raw_layer_index = extract_layer_index(layer_name, num_attn_module)
-    if model_config is None:
-        return raw_layer_index
-
-    start, end = model_config.get_layers_start_end_indices(parallel_config)
-    total_num_hidden_layers = model_config.get_total_num_hidden_layers()
-    if raw_layer_index >= total_num_hidden_layers * num_attn_module:
-        # MTP/nextn layers are named past the target's layer count
-        # (mtp_start_layer_idx == num_hidden_layers), so their KV cache sits
-        # right after the target layers in the compacted per-rank cache list.
-        return (end - start) * num_attn_module + (
-            raw_layer_index - total_num_hidden_layers * num_attn_module
-        )
-    return raw_layer_index - start * num_attn_module
-
-
-def num_attn_module(model_config, cache_dtype) -> int:
-    hf_config = model_config.hf_config
-    if getattr(hf_config, "model_type", None) == "longcat_flash":
-        return 2
-    text_config = getattr(model_config, "hf_text_config", hf_config)
-    # GLM uses an upper bound for per-layer index spacing, not a cache count.
-    # KDA needs up to 2 * num_groups + 1 slots; num_groups <= linear_num_heads.
-    # MTP uses the same bound although its DSA layers have only four slots.
-    # Cache binding compacts the actual entries into consecutive indices.
-    if getattr(text_config, "model_type", None) in ("glm5_next_text", "glm5_next_mtp"):
-        return 2 * text_config.linear_num_heads + 1
-    # A DSA model puts the lightning-indexer key cache next to MLA: 2 modules,
-    # or 3 when the indexer cache is fp8 (a companion scale cache).
-    if hasattr(text_config, "index_topk") or hasattr(hf_config, "index_topk"):
-        is_fp8 = bool(cache_dtype) and cache_dtype.startswith("fp8")
-        return 3 if is_fp8 else 2
-    # MiniMax-M3 MSA: the indexer key cache next to the GQA K/V cache. Dense
-    # layers own only K/V; the runner re-indexes layers by bound position.
-    if getattr(text_config, "sparse_attention_config", None) or getattr(
-        hf_config, "sparse_attention_config", None
-    ):
-        return 2
-    return 1
 
 
 def get_rbln_visible_card_indices() -> list[int]:
@@ -1330,34 +1258,38 @@ def reorder_input_batch(input_batch: "InputBatch", perm: np.ndarray) -> None:
         ]
 
 
-def get_kv_cache_names(
-    kv_caches: dict[str, torch.Tensor],
-    num_attn_module: int = 1,
-) -> list[str]:
-    """Return KV cache layer names ordered by layer index.
+def get_kv_cache_names(layer_names: Iterable[str]) -> list[str]:
+    """Order actual caches by decoder layer and cache slot, without a model-wide
+    cache count. Numeric slots take precedence over indexer/scale suffixes.
 
-    A deterministic, hash-seed-independent ordering is required by the KV
-    connector: NIXL assigns transfer region indices in iteration order, so the
-    P/D region <-> layer agreement breaks if the order varies between runs.
-    Adapted from ``vllm.v1.worker.utils.bind_kv_cache``.
+    NIXL uses this order for transfer regions, so it must not depend on dict
+    insertion order or the process's hash seed.
     """
-    index2name: dict[int, list[str]] = defaultdict(list)
-    for layer_name in kv_caches:
-        index2name[extract_layer_index(layer_name, num_attn_module)].append(layer_name)
+    slots: dict[tuple[int, int], list[str]] = defaultdict(list)
+    for layer_name in layer_names:
+        indices = [int(part) for part in layer_name.split(".") if part.isdecimal()]
+        assert indices, f"layer name {layer_name} has no integer layer index"
+        if len(indices) >= 2:
+            sub = indices[1]
+        elif "scale" in layer_name:
+            sub = 2
+        elif "indexer" in layer_name or "conv_ring" in layer_name:
+            sub = 1
+        else:
+            sub = 0
+        slots[indices[0], sub].append(layer_name)
 
-    kv_cache_names: list[str] = []
-    for layer_index in sorted(index2name.keys()):
-        layer_names = index2name[layer_index]
-        if len(layer_names) > 1 and not (
+    ordered: list[str] = []
+    for slot in sorted(slots):
+        names = slots[slot]
+        if len(names) > 1 and not (
             current_platform.is_cuda_alike()
             or current_platform.is_xpu()
             or current_platform.is_cpu()
         ):
-            # Multiple layers sharing one index (e.g. encoder-decoder cross +
-            # self attention) is only known-safe on GPU/CPU runners.
-            raise NotImplementedError
-        kv_cache_names.extend(layer_names)
-    return kv_cache_names
+            raise NotImplementedError(f"Multiple KV caches occupy slot {slot}: {names}")
+        ordered.extend(sorted(names))
+    return ordered
 
 
 def copy_host_device_kv_blocks(

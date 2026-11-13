@@ -218,6 +218,18 @@ class TestBuildKvCacheBaseBindings:
         _, view_infos = build_kv_cache_base_bindings(bases, infos)
         assert [vi.select_index for vi in view_infos] == [0, 1, 2]
 
+    def test_view_infos_follow_the_supplied_cache_order(self):
+        names = [_layer(2), _layer(0), _layer(1)]
+        shared = torch.zeros(1)
+        bases = {name: shared for name in reversed(names)}
+        infos = {name: KVCacheViewInfo(select_index=i) for i, name in enumerate(names)}
+        base_tensors, view_infos = build_kv_cache_base_bindings(
+            bases, infos, layer_names=names
+        )
+        assert len(base_tensors) == 1 and base_tensors[0] is shared
+        assert [vi.select_index for vi in view_infos] == [0, 1, 2]
+        assert [vi.base_index for vi in view_infos] == [0, 0, 0]
+
 
 class TestMaterializeKvCacheView:
     def test_reshape_permute_select_roundtrip(self):
