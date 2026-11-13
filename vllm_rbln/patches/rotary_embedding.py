@@ -18,12 +18,10 @@ from vllm.model_executor.layers.rotary_embedding.base import (
     RotaryEmbeddingBase,
 )
 from vllm.model_executor.layers.rotary_embedding.common import rotate_gptj, rotate_neox
-from vllm.model_executor.layers.rotary_embedding.mrope import MRotaryEmbedding
 
 from vllm_rbln.patches import register_patch
 
 original_rope_init = RotaryEmbedding.__init__
-original_mrope_init = MRotaryEmbedding.__init__
 
 
 def _register_rotate_half_caches(self: RotaryEmbeddingBase) -> None:
@@ -152,93 +150,4 @@ def patched_rope_forward_oot(
     sin = self.sin_cache.index_select(0, positions_flat).view(
         batch_size, 1, seq_len, -1
     )
-    return _apply_rotate_half(self, batch_size, seq_len, cos, sin, query, key)
-
-
-@register_patch(
-    target="vllm.model_executor.layers.rotary_embedding.mrope.MRotaryEmbedding.__init__",
-    reason=(
-        "MRotaryEmbedding is a sibling of RotaryEmbedding, so the RotaryEmbedding "
-        "patch never builds the rotate-half caches its RBLN forward reads. The "
-        "per-channel axis table replaces upstream's strided section writes, which "
-        "the compiler cannot lower."
-    ),
-)
-def patched_mrope_init(self: MRotaryEmbedding, *args, **kwargs) -> None:
-    original_mrope_init(self, *args, **kwargs)
-    _register_rotate_half_caches(self)
-    if not self.mrope_section:
-        return
-    # Which of the T/H/W position axes each rotary channel takes: interleaved
-    # [THWTHW...TT] (upstream apply_interleaved_rope) or chunked [TTT..HHH..WWW].
-    half = self.rotary_dim // 2
-    if self.mrope_interleaved:
-        channel = torch.arange(half)
-        axis = torch.zeros(half, dtype=torch.long)
-        for index in (1, 2):
-            selected = (channel % 3 == index) & (
-                channel < self.mrope_section[index] * 3
-            )
-            axis = torch.where(selected, torch.full_like(axis, index), axis)
-    else:
-        axis = torch.repeat_interleave(
-            torch.arange(3), torch.tensor(self.mrope_section)
-        )
-    # The rotate-half caches lay the half out twice (neox) or pairwise (gptj).
-    axis = axis.repeat(2) if self.is_neox_style else axis.repeat_interleave(2)
-    self.register_buffer("mrope_axis_table", axis, persistent=False)
-
-
-@register_patch(
-    target="vllm.model_executor.layers.rotary_embedding.mrope.MRotaryEmbedding.forward_oot",
-    reason=(
-        "MRotaryEmbedding has no RBLN forward, and its native one reads a 2-D "
-        "positions tensor as [3, N]; the RBLN layout is [batch, seq], with "
-        "[3, batch, seq] for multimodal positions."
-    ),
-)
-def patched_mrope_forward_oot(
-    self: MRotaryEmbedding,
-    positions: torch.Tensor,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    offsets: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Args:
-        positions: [batch_size, seq_len] for text, where every axis shares the
-            position, or [3, batch_size, seq_len] holding the T/H/W positions
-        query: [batch_size, seq_len, num_heads * head_size] or
-            [batch_size * seq_len, num_heads * head_size]
-        key: the same layout with num_kv_heads
-    """
-    if offsets is not None:
-        positions = positions + offsets
-
-    if positions.ndim == 2:
-        batch_size, seq_len = positions.shape
-        positions_flat = positions.flatten()
-        cos = self.cos_cache.index_select(0, positions_flat).view(
-            batch_size, 1, seq_len, -1
-        )
-        sin = self.sin_cache.index_select(0, positions_flat).view(
-            batch_size, 1, seq_len, -1
-        )
-        return _apply_rotate_half(self, batch_size, seq_len, cos, sin, query, key)
-
-    assert positions.ndim == 3 and positions.shape[0] == 3, positions.shape
-    assert self.mrope_section, "multimodal positions need mrope_section"
-    batch_size, seq_len = positions.shape[1], positions.shape[2]
-    positions_flat = positions.flatten()
-    cos_axes = self.cos_cache.index_select(0, positions_flat).view(
-        3, batch_size, 1, seq_len, -1
-    )
-    sin_axes = self.sin_cache.index_select(0, positions_flat).view(
-        3, batch_size, 1, seq_len, -1
-    )
-    table = self.mrope_axis_table
-    cos = torch.where(table == 1, cos_axes[1], cos_axes[0])
-    cos = torch.where(table == 2, cos_axes[2], cos)
-    sin = torch.where(table == 1, sin_axes[1], sin_axes[0])
-    sin = torch.where(table == 2, sin_axes[2], sin)
     return _apply_rotate_half(self, batch_size, seq_len, cos, sin, query, key)

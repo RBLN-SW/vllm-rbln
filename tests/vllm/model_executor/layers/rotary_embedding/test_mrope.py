@@ -21,6 +21,7 @@ from vllm.config import set_current_vllm_config
 from vllm.model_executor.layers.rotary_embedding.mrope import MRotaryEmbedding
 
 from tests.vllm.vllm_config import make_vllm_config
+from vllm_rbln.model_executor.layers.rotary_embedding.mrope import RBLNMRotaryEmbedding
 
 # Qwen3.5 shape: head 256 with partial_rotary_factor 0.25, sections summing to 32.
 HEAD_SIZE = 256
@@ -39,7 +40,7 @@ def _rope(
 ) -> MRotaryEmbedding:
     # A CustomOp reads the compilation config while it is constructed.
     with set_current_vllm_config(vllm_config):
-        return MRotaryEmbedding(
+        rope = MRotaryEmbedding(
             HEAD_SIZE,
             ROTARY_DIM,
             max_position_embeddings=64,
@@ -49,6 +50,9 @@ def _rope(
             mrope_section=SECTION,
             mrope_interleaved=interleaved,
         )
+    # Upstream's class resolves to the registered RBLN one.
+    assert isinstance(rope, RBLNMRotaryEmbedding)
+    return rope
 
 
 def _qk():
