@@ -55,7 +55,7 @@ from vllm.distributed import (
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe import (
-    FusedMoE,
+    FusedMoEFactory,
     GateLinear,
     fused_moe_make_expert_params_mapping,
 )
@@ -217,7 +217,7 @@ class RBLNDeepseekV4PagedCache(nn.Module, AttentionLayerBase):
             num_kv_heads=1,
             head_size=self.width,
             dtype=self.dtype,
-            compress_ratio=self.compress_ratio,
+            tokens_per_state=self.compress_ratio,
         )
 
     def forward(self) -> None: ...
@@ -309,11 +309,10 @@ class RBLNDeepseekV4Rope(nn.Module):
     Compressed layers use YaRN with ``compress_rope_theta``; pure-SWA layers the base
     ``rope_theta`` without YaRN (the reference's ``original_seq_len = 0``).
 
-    Written as ``x * cos + rotate_gptj(x) * sin`` over pair-duplicated cos / sin (as the RBLN
-    RotaryEmbedding patch) so the compiler can lower the rotation to its rotary primitive; the
-    nope channels pass around it (slice + concat). The inverse rotation (-theta) is
-    ``x * cos - rotate_gptj(x) * sin`` over the same tables: the subtract is the pattern the
-    compiler maps to the primitive's inverse rotation.
+    Written as ``x * cos + rotate_gptj(x) * sin`` over pair-duplicated cos / sin at the rotated
+    tensor's rank (as the RBLN RotaryEmbedding patch) so the compiler lowers the rotation to its
+    rotary primitive; the nope channels pass around it (slice + concat). The inverse rotation
+    (-theta) is the same expression over a negated sin table, so it lowers the same way.
     """
 
     def __init__(self, config: PretrainedConfig, compress_ratio: int, max_pos: int) -> None:
@@ -340,6 +339,7 @@ class RBLNDeepseekV4Rope(nn.Module):
         sin = table[:, half:].repeat_interleave(2, dim=-1)
         self.register_buffer("cos_cache", cos, persistent=False)
         self.register_buffer("sin_cache", sin, persistent=False)
+        self.register_buffer("neg_sin_cache", -sin, persistent=False)
 
     def forward(
         self, x: torch.Tensor, positions: torch.Tensor, inverse: bool = False
@@ -348,14 +348,12 @@ class RBLNDeepseekV4Rope(nn.Module):
         batch, seq_len = positions.shape[0], positions.shape[1]
         flat = positions.flatten()
         cos = self.cos_cache.index_select(0, flat).view(batch, seq_len, -1).to(x.dtype)
-        sin = self.sin_cache.index_select(0, flat).view(batch, seq_len, -1).to(x.dtype)
+        sin_cache = self.neg_sin_cache if inverse else self.sin_cache
+        sin = sin_cache.index_select(0, flat).view(batch, seq_len, -1).to(x.dtype)
         for _ in range(x.dim() - 3):
             cos, sin = cos.unsqueeze(-2), sin.unsqueeze(-2)
         nope, rope = x[..., : -self.rope_dim], x[..., -self.rope_dim :]
-        if inverse:
-            rot = rope * cos - rotate_gptj(rope) * sin
-        else:
-            rot = rope * cos + rotate_gptj(rope) * sin
+        rot = rope * cos + rotate_gptj(rope) * sin
         return torch.cat([nope, rot], dim=-1)
 
 
@@ -367,26 +365,6 @@ def _hc_scale_vec(scale: torch.Tensor, hc: int) -> torch.Tensor:
     s = scale.detach().to("cpu", torch.float32)
     vec = torch.cat([s[0].expand(hc), s[1].expand(hc), s[2].expand(hc * hc)])
     return vec.to(scale.device)
-
-
-def _hc_split_sinkhorn(
-    mixes: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor, hc: int,
-    iters: int, eps: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """The reference ``hc_split_sinkhorn``: mixes [..., (2 + hc) * hc] -> pre [.., hc],
-    post [.., hc], comb [.., hc, hc] (Sinkhorn-normalized). ``hc_scale`` is the per-mix
-    expansion of the checkpoint's 3 scales (``_hc_scale_vec``): one multiply, one constant."""
-    z = mixes * hc_scale + hc_base
-    pre = torch.sigmoid(z[..., :hc]) + eps
-    post = 2 * torch.sigmoid(z[..., hc : 2 * hc])
-    comb = z[..., 2 * hc :]
-    comb = comb.unflatten(-1, (hc, hc))
-    comb = comb.softmax(dim=-1) + eps
-    comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
-    for _ in range(iters - 1):
-        comb = comb / (comb.sum(dim=-1, keepdim=True) + eps)
-        comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
-    return pre, post, comb
 
 
 # --------------------------------------------------------------------------------------------
@@ -507,7 +485,11 @@ class RBLNDeepseekV4Indexer(nn.Module):
         weights = weights.float() * self.weight_scale
         k_cache, block_table = _paged_inputs(self.k_cache)
         k_scale = _resolve_kv_cache(_metadata(self.k_scale.prefix), self.k_scale.layer_index)
-        return torch.ops.rbln_custom_ops.sparse_attn_deepseek_v4_indexer(
+        # [NB * f, E] f16: one scale a compressed key, key block b's at scale row b * f
+        k_scale = k_scale.reshape(-1, k_cache.shape[1])
+        # GLM-5.3's kpool indexer has the V4 compressed-key indexer's contract (store the step's
+        # candidates, pick among e < (p + 1) // 4, ascending, -1 tail).
+        return torch.ops.rbln_custom_ops.sparse_attn_glm5_indexer(
             q.transpose(1, 2).contiguous(),
             k_cur.contiguous(),
             k_cache,
@@ -517,6 +499,7 @@ class RBLNDeepseekV4Indexer(nn.Module):
             query_len,
             block_table,
             self.topk,
+            None,
             4,
         )
 
@@ -781,7 +764,7 @@ class RBLNDeepseekV4MoE(nn.Module):
             quant_config,
             f"{prefix}.shared_experts",
         )
-        self.experts = FusedMoE(
+        self.experts = FusedMoEFactory(
             num_experts=config.n_routed_experts,
             top_k=self.top_k,
             hidden_size=config.hidden_size,
@@ -865,37 +848,37 @@ class RBLNDeepseekV4DecoderLayer(nn.Module):
         self.hc_attn_scale_vec = _hc_scale_vec(self.hc_attn_scale, self.hc_mult)
         self.hc_ffn_scale_vec = _hc_scale_vec(self.hc_ffn_scale, self.hc_mult)
 
-    def _hc_pre(self, x: torch.Tensor, fn, scale, base):
-        # x [B, L, hc, H] -> y [B, L, H], post [B, L, hc], comb [B, L, hc, hc]
-        xf = x.flatten(2).float()
-        rsqrt = torch.rsqrt(xf.square().mean(dim=-1, keepdim=True) + self.norm_eps)
-        mixes = F.linear(xf, fn) * rsqrt
-        pre, post, comb = _hc_split_sinkhorn(
-            mixes, scale, base, self.hc_mult, self.hc_iters, self.hc_eps
+    def _sublayer(self, streams, fn, scale, base, norm, sublayer, *args) -> torch.Tensor:
+        """streams [B, n, T, H]: mix the n streams into the sublayer's input, run it, and add its
+        output back into the streams (the reference hc_pre / hc_post; the RMS norm of the
+        flattened streams before the mix projection is the same as V4's rsqrt after it)."""
+        batch, n, tokens, hidden = streams.shape
+        flat = streams.transpose(1, 2).reshape(batch, tokens, n * hidden).float()
+        flat = flat * torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.norm_eps)
+        z = F.linear(flat, fn) * scale + base
+        z_pre, z_post = z[..., :n], z[..., n : 2 * n]
+        comb = torch.ops.rbln_custom_ops.sinkhorn_normalize(
+            z[..., 2 * n :], iters=self.hc_iters, eps=self.hc_eps
         )
-        y = (pre.unsqueeze(-1) * x.float()).sum(dim=2)
-        return y.to(x.dtype), post, comb
-
-    @staticmethod
-    def _hc_post(x, residual, post, comb):
-        # x [B, L, H], residual [B, L, hc, H] -> [B, L, hc, H]
-        y = post.unsqueeze(-1) * x.float().unsqueeze(-2) + (
-            comb.unsqueeze(-1) * residual.float().unsqueeze(-2)
-        ).sum(dim=2)
-        return y.to(x.dtype)
+        streams_f32 = streams.float()
+        x = torch.ops.rbln_custom_ops.hc_stream_reduce(streams_f32, z_pre, eps=self.hc_eps)
+        x = sublayer(norm(x.to(streams.dtype)), *args)
+        return torch.ops.rbln_custom_ops.hc_residual_add(
+            x.float(), streams_f32, z_post, comb, post_mult=2.0
+        ).to(streams.dtype)
 
     def forward(
-        self, positions: torch.Tensor, x: torch.Tensor, input_ids: torch.Tensor
+        self, positions: torch.Tensor, streams: torch.Tensor, input_ids: torch.Tensor
     ) -> torch.Tensor:
-        residual = x
-        h, post, comb = self._hc_pre(x, self.hc_attn_fn, self.hc_attn_scale_vec, self.hc_attn_base)
-        h = self.attn(positions, self.attn_norm(h))
-        x = self._hc_post(h, residual, post, comb)
-
-        residual = x
-        h, post, comb = self._hc_pre(x, self.hc_ffn_fn, self.hc_ffn_scale_vec, self.hc_ffn_base)
-        h = self.ffn(self.ffn_norm(h), input_ids)
-        return self._hc_post(h, residual, post, comb)
+        """streams [B, n, T, H] -> [B, n, T, H]."""
+        streams = self._sublayer(
+            streams, self.hc_attn_fn, self.hc_attn_scale_vec, self.hc_attn_base,
+            self.attn_norm, lambda h: self.attn(positions, h),
+        )
+        return self._sublayer(
+            streams, self.hc_ffn_fn, self.hc_ffn_scale_vec, self.hc_ffn_base,
+            self.ffn_norm, lambda h: self.ffn(h, input_ids),
+        )
 
 
 class RBLNDeepseekV4Model(nn.Module):
@@ -938,12 +921,15 @@ class RBLNDeepseekV4Model(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
-    def _hc_head(self, x: torch.Tensor) -> torch.Tensor:
-        xf = x.flatten(2).float()
-        rsqrt = torch.rsqrt(xf.square().mean(dim=-1, keepdim=True) + self.norm_eps)
-        mixes = F.linear(xf, self.hc_head_fn) * rsqrt
-        pre = torch.sigmoid(mixes * self.hc_head_scale + self.hc_head_base) + self.hc_eps
-        return (pre.unsqueeze(-1) * x.float()).sum(dim=2).to(x.dtype)
+    def _hc_head(self, streams: torch.Tensor) -> torch.Tensor:
+        """streams [B, n, T, H] -> [B, T, H]: the head's gate (sigmoid + eps) over the streams."""
+        batch, n, tokens, hidden = streams.shape
+        flat = streams.transpose(1, 2).reshape(batch, tokens, n * hidden).float()
+        flat = flat * torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.norm_eps)
+        z_pre = F.linear(flat, self.hc_head_fn) * self.hc_head_scale + self.hc_head_base
+        return torch.ops.rbln_custom_ops.hc_stream_reduce(
+            streams.float(), z_pre, eps=self.hc_eps
+        ).to(streams.dtype)
 
     def forward(
         self,
@@ -953,10 +939,11 @@ class RBLNDeepseekV4Model(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
         h = inputs_embeds if inputs_embeds is not None else self.embed_input_ids(input_ids)
-        h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)  # [B, L, hc, H]
+        batch, tokens, hidden = h.shape
+        streams = h.unsqueeze(1).expand(batch, self.hc_mult, tokens, hidden).contiguous()
         for layer in self.layers[self.start_layer : self.end_layer]:
-            h = layer(positions, h, input_ids)
-        return self.norm(self._hc_head(h))
+            streams = layer(positions, streams, input_ids)
+        return self.norm(self._hc_head(streams))
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return fused_moe_make_expert_params_mapping(
@@ -1081,5 +1068,7 @@ class RBLNDeepseekV4ForCausalLM(nn.Module, SupportsPP):
         return self.model.get_expert_mapping()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self, skip_prefixes=["model.mtp.", "mtp."])
+        # the MTP head is not modeled
+        weights = ((n, w) for n, w in weights if not n.startswith(("model.mtp.", "mtp.")))
+        loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
