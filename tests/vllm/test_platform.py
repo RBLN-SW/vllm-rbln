@@ -541,7 +541,7 @@ class TestRejectedConfigs:
             with pytest.raises(ValueError, match="MTP head"):
                 reconfigure(glm5_next(spec=spec(method, num_speculative_tokens)))
         block_size = _build().cache_config.block_size
-        with pytest.raises(ValueError, match="a KDA state a KV block"):
+        with pytest.raises(ValueError, match="a recurrent state a KV block"):
             reconfigure(
                 glm5_next(
                     enable_prefix_caching=True,
@@ -640,9 +640,7 @@ class TestRejectedConfigs:
 
         with pytest.raises(ValueError, match="multiple of 128"):
             reconfigure(chunk_of_192)
-        # A 128-multiple passes, and prefix caching is switched off for the model.
-        config = reconfigure(gdn)
-        assert config.cache_config.enable_prefix_caching is False
+        reconfigure(gdn)
 
     def test_gdn_models_run_on_a_single_rank(self, reconfigure, gdn):
         for parallel in (
@@ -682,26 +680,23 @@ class TestRejectedConfigs:
         with pytest.raises(ValueError, match="full-attention layer's page"):
             reconfigure(doubled_block)
 
-    def test_gdn_state_is_one_block_a_request(self, reconfigure, gdn):
-        config = reconfigure(gdn)
-        assert config.cache_config.mamba_block_size == config.model_config.max_model_len
-        assert config.cache_config.mamba_cache_mode == "none"
-
-    def test_gdn_mamba_block_below_the_model_length_is_refused(self, reconfigure, gdn):
-        def mamba_block(fraction):
+    def test_gdn_prefix_caching_keeps_a_state_a_kv_block(self, reconfigure, gdn):
+        def cached(**cache):
             def mutate(config):
                 gdn(config)
-                config.cache_config.user_specified_mamba_block_size = True
-                config.cache_config.mamba_block_size = (
-                    config.model_config.max_model_len // fraction
-                )
+                config.cache_config.enable_prefix_caching = True
+                for name, value in cache.items():
+                    setattr(config.cache_config, name, value)
 
             return mutate
 
-        with pytest.raises(ValueError, match="span the model length"):
-            reconfigure(mamba_block(2))
-        config = reconfigure(mamba_block(1))
-        assert config.cache_config.mamba_block_size == config.model_config.max_model_len
+        assert reconfigure(cached()).cache_config.enable_prefix_caching
+        with pytest.raises(ValueError, match="a recurrent state a KV block"):
+            reconfigure(
+                cached(user_specified_mamba_block_size=True, mamba_block_size=512)
+            )
+        with pytest.raises(ValueError, match="whole KV blocks"):
+            reconfigure(cached(prefix_match_unit=128))
 
     def test_gdn_value_heads_split_over_the_chiplets(self, reconfigure, gdn):
         def six_heads(config):

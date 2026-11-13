@@ -21,10 +21,11 @@ sharing a buffer are one graph input with one chiplet cut. The delta-rule
 kernels read a block as the [Hk, R, 2, 128, 64] state it holds, in the
 activation dtype (dlfloat16 inside the kernels), addressed by the group's
 block table. Its short-conv ring is a block-aux cache on the same
-block ids. The builder turns the block table into the rows the kernels read
-and write: a request's one block (`mamba_block_size` is the model length),
-read and written in place; a padding row reads and writes block 0, vLLM's
-null block.
+block ids. The builder turns the block table into the blocks the kernels read
+and write: that of a request's last computed token and that of its last
+scheduled one. They differ only under prefix caching ("align", a state a KV
+block), when a step enters a new block. A padding row reads and writes block
+0, vLLM's null block.
 
 The delta-rule kernels take q / k per key head, L2-normalized inside, and v, g and
 beta per value head grouped under its key head. The short conv
@@ -137,6 +138,18 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
         """`values` as int32, padded with 0 to the step's `batch` rows."""
         return rbln_utils.pad(values.to(torch.int32), 0, batch)
 
+    def _get_state_blocks(
+        self, block_table: torch.Tensor, num_tokens: torch.Tensor, batch: int
+    ) -> torch.Tensor:
+        """Each request's block holding its state after `num_tokens` tokens."""
+        blocks = mamba_get_block_table_tensor(
+            block_table,
+            num_tokens,
+            self.kv_cache_spec,
+            self.vllm_config.cache_config.mamba_cache_mode,
+        )
+        return self._padded(blocks[:, 0], batch)
+
     def build(  # type: ignore[override]
         self,
         common_attn_metadata: CommonAttentionMetadata,
@@ -171,17 +184,10 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
             )
             num_prefills, num_prefill_tokens, num_decodes = 0, 0, num_reqs
 
-        # TODO(prefix caching): one column while mamba_block_size is the model
-        # length, so a row stores to the block it loads; a step crossing into a
-        # new block stores to the block of its last scheduled token instead.
-        block_table_tensor = mamba_get_block_table_tensor(
-            m.block_table_tensor,
-            m.seq_lens,
-            self.kv_cache_spec,
-            self.vllm_config.cache_config.mamba_cache_mode,
-        )
-        blocks = self._padded(block_table_tensor[:num_reqs, 0], batch)
-        non_spec_state_indices_tensor = blocks.to(torch.int16)
+        block_table = m.block_table_tensor[:num_reqs]
+        load_blocks = self._get_state_blocks(block_table, context_lens_tensor, batch)
+        store_blocks = self._get_state_blocks(block_table, m.seq_lens[:num_reqs], batch)
+        non_spec_state_indices_tensor = load_blocks.to(torch.int16)
 
         valid_mask = None
         if is_prefill:
@@ -205,8 +211,8 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
             prefill_has_initial_state=prefill_has_initial_state,
             batch_size=batch,
             seq_len=seq_len,
-            store_state_indices=blocks.to(torch.int16),
-            conv_state_index=self._stage(blocks, "conv_state_index"),
+            store_state_indices=store_blocks.to(torch.int16),
+            conv_state_index=self._stage(load_blocks, "conv_state_index"),
             conv_seq_idx=self._stage(
                 self._padded(first_positions, batch), "conv_seq_idx"
             ),
@@ -216,7 +222,7 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
             conv_has_initial_state=self._stage(
                 has_initial_state, "conv_has_initial_state"
             ),
-            conv_store_index=self._stage(blocks, "conv_store_index"),
+            conv_store_index=self._stage(store_blocks, "conv_store_index"),
             valid_mask=None
             if valid_mask is None
             else self._stage(valid_mask, "valid_mask"),

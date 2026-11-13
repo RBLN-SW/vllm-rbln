@@ -125,16 +125,6 @@ def _validate(vllm_config: "VllmConfig") -> None:
                 "Set --max-num-batched-tokens to a multiple of 128."
             )
         if (
-            vllm_config.cache_config.user_specified_mamba_block_size
-            and vllm_config.cache_config.mamba_block_size < model_config.max_model_len
-        ):
-            raise ValueError(
-                "The RBLN GatedDeltaNet state is one block a request, so the Mamba "
-                "block has to span the model length; got --mamba-block-size "
-                f"{vllm_config.cache_config.mamba_block_size} for max_model_len "
-                f"{model_config.max_model_len}."
-            )
-        if (
             parallel_config.tensor_parallel_size > 1
             or parallel_config.pipeline_parallel_size > 1
             or parallel_config.data_parallel_size > 1
@@ -222,26 +212,29 @@ def _validate(vllm_config: "VllmConfig") -> None:
                 f"num_speculative_tokens 1 to 5 only; got method={spec.method!r}, "
                 f"num_speculative_tokens={spec.num_speculative_tokens}."
             )
-        cache_config = vllm_config.cache_config
+
+    cache_config = vllm_config.cache_config
+    if cache_config.enable_prefix_caching and (
+        text_config.model_type == "glm5_next_text"
+        or _uses_gated_delta_net(model_config)
+    ):
         if (
-            cache_config.enable_prefix_caching
-            and cache_config.user_specified_mamba_block_size
+            cache_config.user_specified_mamba_block_size
             and cache_config.mamba_block_size != cache_config.block_size
         ):
             raise ValueError(
-                "GLM-5.3 prefix caching keeps a KDA state a KV block on RBLN; "
+                "Prefix caching keeps a recurrent state a KV block on RBLN; "
                 f"got --mamba-block-size {cache_config.mamba_block_size} and "
                 f"--block-size {cache_config.block_size}."
             )
         if (
-            cache_config.enable_prefix_caching
-            and cache_config.prefix_match_unit is not None
+            cache_config.prefix_match_unit is not None
             and cache_config.prefix_match_unit < cache_config.block_size
         ):
             raise ValueError(
-                "GLM-5.3 prefix caching on RBLN hits whole KV blocks only; got "
-                f"--prefix-match-unit {cache_config.prefix_match_unit} below "
-                f"--block-size {cache_config.block_size}."
+                "Prefix caching with a recurrent state hits whole KV blocks only on "
+                f"RBLN; got --prefix-match-unit {cache_config.prefix_match_unit} "
+                f"below --block-size {cache_config.block_size}."
             )
 
     # Upstream turns chunked prefill off for an engine without a KV cache, such
@@ -560,20 +553,6 @@ def _override(vllm_config: "VllmConfig") -> None:
         model_config.disable_cascade_attn = True
 
     cache_config = vllm_config.cache_config
-    if _uses_gated_delta_net(model_config):
-        if cache_config.enable_prefix_caching:
-            # A GatedDeltaNet state block belongs to one request and is not
-            # content addressable, so a cache hit could not restore it.
-            logger.warning(
-                "Prefix caching is not supported for GatedDeltaNet models on the "
-                "RBLN vLLM path. Overriding cache_config.enable_prefix_caching to "
-                "False."
-            )
-            cache_config.enable_prefix_caching = False
-        # One state block a request, as upstream sizes it without prefix caching.
-        cache_config.mamba_cache_mode = "none"
-        if not cache_config.user_specified_mamba_block_size:
-            cache_config.mamba_block_size = model_config.max_model_len
     if (
         model_config.hf_text_config.model_type == "glm5_next_text"
         and cache_config.enable_prefix_caching
