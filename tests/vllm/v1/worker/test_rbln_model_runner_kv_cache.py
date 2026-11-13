@@ -210,9 +210,60 @@ class TestBlockAuxKVCaches:
         for key, name in runner.kv_cache_allocations.items():
             assert key == kv_cache_tensor_key(context[name].kv_cache)
 
+    def test_connectors_register_only_the_transferred_aux_specs(
+        self, make_model_runner, monkeypatch
+    ):
+        # The GLM-5.3 kinds: a conv ring, a tail ring that is not prefix-cacheable
+        # but must still move, and a KDA draft no peer reads. A strict producer does
+        # not allocate the draft, so registering it would unpair the peers.
+        aux_specs: list = []
+        connector = SimpleNamespace(register_block_aux_kv_caches=aux_specs.append)
+        monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: True)
+        monkeypatch.setattr(mr, "get_kv_transfer_group", lambda: connector)
+        runner = self._runner_with_aux(make_model_runner, monkeypatch, transferred=2)
+        assert set(runner.aux_kv_cache_specs) == {"layer.1", "layer.2", "layer.3"}
+        assert [set(specs) for specs in aux_specs] == [{"layer.1", "layer.2"}]
+
+    @pytest.mark.parametrize("transferred", [0, 2])
+    def test_a_connector_without_aux_support_is_refused_only_with_aux_to_move(
+        self, make_model_runner, monkeypatch, transferred
+    ):
+        monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: True)
+        monkeypatch.setattr(mr, "get_kv_transfer_group", lambda: SimpleNamespace())
+        if transferred:
+            with pytest.raises(NotImplementedError, match="not supported by"):
+                self._runner_with_aux(make_model_runner, monkeypatch, transferred)
+        else:
+            self._runner_with_aux(make_model_runner, monkeypatch, transferred)
+
+    def _runner_with_aux(self, make_model_runner, monkeypatch, transferred):
+        """A runner whose `layer.0` owns the first `transferred` of the two moved
+        GLM-5.3 aux kinds (conv ring, tail ring) and a draft, KV cache initialized."""
+        runner = make_model_runner(init_kv_cache=False)
+        context = runner.compilation_config.static_forward_context
+        moved = [self._aux("layer.0"), self._aux("layer.0", prefix_cacheable=False)]
+        draft = self._aux("layer.0", prefix_cacheable=False, enable_kv_transfer=False)
+        for i, module in enumerate([*moved[:transferred], draft], start=1):
+            module.layer_index = i
+            monkeypatch.setitem(context, f"layer.{i}", module)
+        runner.initialize_kv_cache(make_kv_cache_config(runner, groups=[("layer.0",)]))
+        return runner
+
     @staticmethod
-    def _aux(owner, shape=(4, 64), dtype=torch.bfloat16):
-        spec = RBLNBlockAuxSpec(owner, shape, dtype)
+    def _aux(
+        owner,
+        shape=(4, 64),
+        dtype=torch.bfloat16,
+        prefix_cacheable=True,
+        enable_kv_transfer=True,
+    ):
+        spec = RBLNBlockAuxSpec(
+            owner,
+            shape,
+            dtype,
+            prefix_cacheable=prefix_cacheable,
+            enable_kv_transfer=enable_kv_transfer,
+        )
         return SimpleNamespace(get_aux_cache_spec=lambda _config: spec)
 
     def _allocate(self, runner, config, monkeypatch, auxes):

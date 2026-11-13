@@ -210,9 +210,10 @@ def test_vision_encoder_builds_its_inputs_from_upstream_rope(monkeypatch):
     assert not key_bias[..., :8].any() and (key_bias[..., 8:] < -1e4).all()
 
 
-def test_only_scratch_aux_caches_are_left_out_of_prefix_caching(monkeypatch):
+@pytest.mark.parametrize("kv_role", [None, "kv_both", "kv_consumer", "kv_producer"])
+def test_aux_cache_flags_and_drafts_by_kv_role(monkeypatch, kv_role):
     import vllm.distributed.parallel_state as parallel_state
-    from vllm.config import set_current_vllm_config
+    from vllm.config import KVTransferConfig, set_current_vllm_config
 
     import vllm_rbln.model_executor.models.glm5_next as glm
     from tests.vllm.vllm_config import make_vllm_config
@@ -232,25 +233,36 @@ def test_only_scratch_aux_caches_are_left_out_of_prefix_caching(monkeypatch):
     config.model_config.dtype = torch.bfloat16
     config.cache_config.cache_dtype = "fp8"
     config.speculative_config = SimpleNamespace(num_speculative_tokens=2)
+    if kv_role is not None:
+        config.kv_transfer_config = KVTransferConfig(
+            kv_connector="RblnNixlConnector", kv_role=kv_role
+        )
     monkeypatch.setattr(
         parallel_state, "_TP", SimpleNamespace(world_size=1, rank_in_group=0)
     )
     with set_current_vllm_config(config):
-        glm.RBLNGlm5NextKDA(text, "model.layers.0.self_attn")
+        kda = glm.RBLNGlm5NextKDA(text, "model.layers.0.self_attn")
         glm.RBLNGlm5NextIndexer(text, "model.layers.1.self_attn.indexer")
 
     context = config.compilation_config.static_forward_context
     flags = {
-        name: module.get_aux_cache_spec(config).prefix_cacheable
+        name: (spec.prefix_cacheable, spec.enable_kv_transfer)
         for name, module in context.items()
         if hasattr(module, "get_aux_cache_spec")
+        for spec in (module.get_aux_cache_spec(config),)
     }
-    assert flags == {
-        # KDA: two state groups, then the conv ring and a draft cache per group.
-        "model.layers.0.self_attn.attn.2": True,
-        "model.layers.0.self_attn.attn.3": False,
-        "model.layers.0.self_attn.attn.4": False,
-        # DSA indexer: the key scales, then the tail ring.
-        "model.layers.1.self_attn.attn.2": True,
-        "model.layers.1.self_attn.attn.3": False,
+    # KDA: two state groups, then the conv ring, then a draft cache per group on
+    # a role that verifies.
+    # DSA indexer: the key scales, then the tail ring.
+    expected = {
+        "model.layers.0.self_attn.attn.2": (True, True),
+        "model.layers.1.self_attn.attn.2": (True, True),
+        "model.layers.1.self_attn.attn.3": (False, True),
     }
+    # A strict producer never verifies, so it has no draft cache to place.
+    if kv_role != "kv_producer":
+        expected["model.layers.0.self_attn.attn.3"] = (False, False)
+        expected["model.layers.0.self_attn.attn.4"] = (False, False)
+    assert flags == expected
+    # The ring still makes room for the drafts, so every role's blocks match.
+    assert kda.conv_ring_width == 5  # 4 taps - 1 + 2 drafts, above KDA_CONV_RING
