@@ -29,6 +29,7 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
     torch_recurrent_gated_delta_rule,
 )
 from vllm.config import set_current_vllm_config
+from vllm.model_executor.models.qwen3_5 import Qwen3_5ForConditionalGeneration
 from vllm.v1.kv_cache_interface import MambaSpec
 
 from tests.vllm.vllm_config import make_vllm_config
@@ -39,7 +40,6 @@ from vllm_rbln.patches.qwen3_next import RBLNQwenGatedDeltaNetAttention
 from vllm_rbln.v1.attention.backends.flash_attention import RBLNFlashAttentionBackend
 from vllm_rbln.v1.attention.backends.gdn_attn import (
     RBLNGDNAttentionMetadataBuilder,
-    grouped_qkv_rows,
 )
 from vllm_rbln.v1.attention.kv_cache_bindings import (
     KVCacheViewInfo,
@@ -87,18 +87,30 @@ def _layer():
     return layer
 
 
-def _grouped(layer, ring):
+def _grouped(layer, ring, monkeypatch):
     """The layer as RBLNQwen3_5ForConditionalGeneration.load_weights leaves it:
     the q | k | v rows of in_proj_qkvz and conv1d regrouped by key head, with
     its conv ring beside it."""
-    rows = grouped_qkv_rows(HEADS_K, HEADS_V // HEADS_K, HEAD_DIM)
     grouped = SimpleNamespace(**vars(layer))
     grouped.in_proj_qkvz = _Proj(HIDDEN, CONV_DIM + VALUE_DIM, bias=False)
     grouped.in_proj_qkvz.weight.data = layer.in_proj_qkvz.weight.data.clone()
-    grouped.in_proj_qkvz.weight.data[: rows.numel()] = layer.in_proj_qkvz.weight[rows]
     grouped.conv1d = SimpleNamespace(weight=layer.conv1d.weight.clone())
-    grouped.conv1d.weight[: rows.numel()] = layer.conv1d.weight[rows]
     grouped.conv_ring = SimpleNamespace(inputs=lambda: ring)
+    # The model's own regrouping, over a checkpoint its parent has loaded. The
+    # second decoder layer is a full-attention one, which it passes over.
+    monkeypatch.setattr(
+        Qwen3_5ForConditionalGeneration, "load_weights", lambda self, weights: set()
+    )
+    model = RBLNQwen3_5ForConditionalGeneration.__new__(
+        RBLNQwen3_5ForConditionalGeneration
+    )
+    torch.nn.Module.__init__(model)
+    model.language_model = SimpleNamespace(
+        model=SimpleNamespace(
+            layers=[SimpleNamespace(linear_attn=grouped), SimpleNamespace()]
+        )
+    )
+    model.load_weights([])
     return grouped
 
 
@@ -198,7 +210,7 @@ def _ssm_state(state: torch.Tensor) -> torch.Tensor:
     ],
 )
 def test_padded_prefill_then_decode_tracks_hf(
-    block_size, shared_binding, chunk_sizes, steps
+    monkeypatch, block_size, shared_binding, chunk_sizes, steps
 ):
     vllm_config = make_vllm_config(
         model="JackFram/llama-68m",
@@ -219,7 +231,7 @@ def test_padded_prefill_then_decode_tracks_hf(
     state.flatten(1)[:, state_elements:] = 13
     before = state.clone()
     ring = torch.zeros(NUM_BLOCKS, KERNEL - 1, 1, CONV_DIM // 64, 64)
-    device_layer = _grouped(layer, ring)
+    device_layer = _grouped(layer, ring, monkeypatch)
     vllm_config.compilation_config.static_forward_context[PREFIX] = device_layer
     spec = MambaSpec(
         block_size=vllm_config.model_config.max_model_len,
