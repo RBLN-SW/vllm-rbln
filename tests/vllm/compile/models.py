@@ -32,6 +32,12 @@ _MINIMAX_BASE = CompileModelSpec(
 
 MODELS: list[CompileModelSpec] = [
     CompileModelSpec(
+        "Qwen/Qwen3.5-9B",
+        # the block size at which a GatedDeltaNet state fills a full-attention page
+        {"max_num_seqs": 2, "language_model_only": True, "block_size": 256},
+        chips=REBEL,
+    ),
+    CompileModelSpec(
         "Qwen/Qwen3-30B-A3B",
         {
             "max_num_seqs": 1,
