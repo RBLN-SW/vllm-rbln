@@ -554,6 +554,32 @@ def test_prefix_mask_is_shared_and_does_not_escape_forward(monkeypatch, compiled
         )
 
 
+def test_prefix_mask_is_restored_when_forward_raises(monkeypatch):
+    def upstream_forward(self, *args, **kwargs):
+        raise RuntimeError("forward failed")
+
+    monkeypatch.setattr(Gemma4ForConditionalGeneration, "forward", upstream_forward)
+    attn = SimpleNamespace(layer_name="layer.0", layer_index=0, sliding_window=4)
+    model = _bare_model(model_dtype=torch.float32)
+    model.mm_prefix_attn_layers = [attn]
+    metadata = RBLNFlashAttentionMetadata(
+        seq_lens=torch.tensor([[0]]),
+        block_tables=torch.arange(4),
+        is_prefill=True,
+        swa_appends=True,
+        mm_prefix_row_ends=torch.tensor([0, 3, 3, 3]),
+        kv_caches=[torch.zeros(4, 2, 1, 1, 4, 32)],
+    )
+    context = SimpleNamespace(
+        attn_metadata={"layer.0": metadata}, additional_kwargs={}, dp_metadata=None
+    )
+
+    with override_forward_context(context), pytest.raises(RuntimeError):
+        model.forward(None, torch.zeros(4))
+
+    assert metadata.swa_attn_masks is None
+
+
 @pytest.mark.parametrize("start", [0, 1023, 1024, 1025, 262144, 264192])
 def test_prefix_mask_block_boundaries(start):
     row_ends = torch.tensor([0, 3, 3, 3])

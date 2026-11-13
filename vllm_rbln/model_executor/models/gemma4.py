@@ -458,18 +458,19 @@ class RBLNGemma4ForConditionalGeneration(
                 ]
                 for metadata, _ in saved_masks:
                     metadata.swa_attn_masks = mask
-        if (
-            mm_embeds is not None
-            and inputs_embeds is None
-            and get_pp_group().is_first_rank
-        ):
-            assert mm_mask is not None
-            text_embeds = self.language_model.embed_input_ids(input_ids)
-            inputs_embeds = torch.where(mm_mask > 0.5, mm_embeds, text_embeds)
-            input_ids = None
-        output = super().forward(
-            input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs
-        )
-        for metadata, original_mask in saved_masks:
-            metadata.swa_attn_masks = original_mask
-        return output
+        try:
+            if (
+                mm_embeds is not None
+                and inputs_embeds is None
+                and get_pp_group().is_first_rank
+            ):
+                assert mm_mask is not None
+                text_embeds = self.language_model.embed_input_ids(input_ids)
+                inputs_embeds = torch.where(mm_mask > 0.5, mm_embeds, text_embeds)
+                input_ids = None
+            return super().forward(
+                input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs
+            )
+        finally:
+            for metadata, original_mask in saved_masks:
+                metadata.swa_attn_masks = original_mask
