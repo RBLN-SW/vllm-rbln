@@ -2201,7 +2201,7 @@ class TestRepairAsyncOutputTokenIds:
                 ),
                 prev_req_id_to_index=prev_index,
             ),
-            _prev_sampled_host=None,
+            _prev_sampled_host_copy=None,
         )
 
     def test_replaces_the_placeholder_tail(self):
@@ -2265,20 +2265,42 @@ class TestRepairAsyncOutputTokenIds:
         r = self._runner(
             req_ids=["a"], output_token_ids=ids, prev_index={"a": 0}, prev_tokens=[10]
         )
-        event = SimpleNamespace(synchronize=lambda: None)
+        host_tokens = torch.full((1, 1), -1, dtype=torch.int32)
+        event = Mock()
+        event.synchronize.side_effect = lambda: host_tokens.fill_(20)
         prev = r.input_batch.prev_sampled_token_ids
-        r._prev_sampled_host = (prev, torch.tensor([[20]]), event)
+        r._prev_sampled_host_copy = (prev, host_tokens, event)
         r._repair_async_output_token_ids()
         assert ids == [[7, 20]]
+        event.synchronize.assert_called_once_with()
+
+    def test_reads_cpu_tokens_before_the_output_thread_runs(self):
+        from tests.vllm.v1.worker.test_async_output import _async_output
+
+        ids = [[7, -1]]
+        r = self._runner(
+            req_ids=["a"], output_token_ids=ids, prev_index={"a": 0}, prev_tokens=[10]
+        )
+        previous_tokens = r.input_batch.prev_sampled_token_ids
+        async_output, queue = _async_output(previous_tokens)
+        async_output._sampled_token_ids_cpu.fill_(-1)
+        r._prev_sampled_host_copy = async_output.host_copy()
+
+        r._repair_async_output_token_ids()
+
+        assert ids == [[7, 10]]
+        assert not queue
 
     def test_ignores_a_host_copy_from_another_step(self):
         ids = [[7, -1]]
         r = self._runner(
             req_ids=["a"], output_token_ids=ids, prev_index={"a": 0}, prev_tokens=[10]
         )
-        r._prev_sampled_host = (torch.tensor([[10]]), torch.tensor([[20]]), None)
+        event = Mock()
+        r._prev_sampled_host_copy = (torch.tensor([[10]]), torch.tensor([[20]]), event)
         r._repair_async_output_token_ids()
         assert ids == [[7, 10]]
+        event.synchronize.assert_not_called()
 
 
 class TestApplyPendingTokenWriteback:
