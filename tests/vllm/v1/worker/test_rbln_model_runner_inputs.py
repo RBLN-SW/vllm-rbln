@@ -287,6 +287,23 @@ class TestMRopePositions:
 
         assert runner.mrope_positions[:, 0].tolist() == [num_computed + self.DELTA] * 3
 
+    def test_a_streaming_update_rebuilds_the_requests_table(
+        self, make_model_runner, monkeypatch
+    ):
+        runner = self._runner(make_model_runner, monkeypatch)
+        grown = [*self.PROMPT, 9, 10]
+        runner.model.get_mrope_input_positions = lambda ids, features: (
+            torch.arange(len(ids)).expand(3, -1),
+            len(ids),
+        )
+
+        # The same request id again: a streaming session's longer prompt.
+        runner._update_states(schedule_new("a", prompt_token_ids=[grown]))
+
+        request = runner.requests["a"]
+        assert request.mrope_positions.shape == (3, len(grown))
+        assert request.mrope_position_delta == len(grown)
+
 
 def _decode_ready(
     runner,

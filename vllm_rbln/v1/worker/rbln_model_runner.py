@@ -719,15 +719,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             )
             self.requests[req_id] = req_state
             if self.mrope_positions is not None:
-                assert req_state.prompt_token_ids is not None, (
-                    "M-RoPE positions need the prompt's token ids"
-                )
-                (
-                    req_state.mrope_positions,
-                    req_state.mrope_position_delta,
-                ) = cast(SupportsMRoPE, self.model).get_mrope_input_positions(
-                    req_state.prompt_token_ids, req_state.mm_features
-                )
+                self._init_mrope_positions(req_state)
 
             if sampling_params and sampling_params.prompt_logprobs is not None:
                 self.num_prompt_logprobs[req_id] = (
@@ -916,7 +908,21 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         # `prompt_token_ids`.
         req_state.output_token_ids.clear()
 
+        if self.mrope_positions is not None:
+            self._init_mrope_positions(req_state)
+
         return req_state
+
+    def _init_mrope_positions(self, req_state: CachedRequestState) -> None:
+        assert req_state.prompt_token_ids is not None, (
+            "M-RoPE positions need the prompt's token ids"
+        )
+        (
+            req_state.mrope_positions,
+            req_state.mrope_position_delta,
+        ) = cast(SupportsMRoPE, self.model).get_mrope_input_positions(
+            req_state.prompt_token_ids, req_state.mm_features
+        )
 
     def _get_cumsum_and_arange(
         self,
