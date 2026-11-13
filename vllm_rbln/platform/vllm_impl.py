@@ -261,10 +261,13 @@ def _validate(vllm_config: "VllmConfig") -> None:
     # which runs after this, keys "unset" and "set to the budget" alike.
     rbln_config.prefill_chunk_size = chunks
 
-    # The FP8 indexer scale store cannot span blocks. Its per-token caches
-    # share block_size, so the default is the largest bucket dividing that block.
+    # DSA constructors select the indexer by index_topk. Its FP8 scale store
+    # cannot span blocks; its per-token caches share the configured block_size.
     if (
-        text_config.model_type == "axk3"
+        (
+            hasattr(text_config, "index_topk")
+            or hasattr(model_config.hf_config, "index_topk")
+        )
         and vllm_config.cache_config.cache_dtype.startswith("fp8")
         and vllm_config.cache_config.enable_prefix_caching
         and rbln_config.enable_sub_block_cache
@@ -280,7 +283,7 @@ def _validate(vllm_config: "VllmConfig") -> None:
             and sub_block_size < rbln_config.max_prefill_chunk_size
         ):
             raise ValueError(
-                "A.X-K3's FP8 DSA indexer scale cache requires sub_block_size to "
+                "The FP8 DSA indexer scale cache requires sub_block_size to "
                 "equal the largest prefill bucket "
                 f"({rbln_config.max_prefill_chunk_size}); got {sub_block_size} "
                 f"with prefill_chunk_size={chunks}. Set --rbln-sub-block-size to "
