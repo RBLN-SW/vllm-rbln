@@ -42,6 +42,9 @@ MODELS = [
         # RblnTensorUnrollLayerLoop. Without nested regions there is
         # nothing to roll; a release compiler ignores RBLN_EXP_ROLL_LAYERS.
         envs={"VLLM_RBLN_USE_NESTED_COMPILE_REGION": "0"},
+        # The fourth layer is the first full-attention one: with it the state
+        # and the attention cache share a buffer.
+        num_hidden_layers=4,
     ),
     # Quantization schemes
     CompileModelSpec("Qwen/Qwen3-0.6B-FP8"),
