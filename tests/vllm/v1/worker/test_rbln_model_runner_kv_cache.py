@@ -21,14 +21,17 @@ from types import SimpleNamespace
 import pytest
 import torch
 from transformers import LlamaConfig
+from vllm.config import set_current_vllm_config
 from vllm.engine.arg_utils import EngineArgs
 from vllm.v1.kv_cache_interface import MambaSpec
 
 import vllm_rbln.v1.worker.rbln_model_runner as mr
 from tests.vllm.v1.worker.utils import make_kv_cache_config, schedule_new
-from vllm_rbln.patches.qwen3_next import RBLNQwenGatedDeltaNetAttention
-from vllm_rbln.v1.attention.backends.flash_attention import RBLNFlashAttentionBackend
-from vllm_rbln.v1.attention.backends.gdn_attn import RBLNGDNAttentionBackend
+from vllm_rbln.patches.qwen3_next import (
+    RBLNGDNConvRingCache,
+    RBLNQwenGatedDeltaNetAttention,
+)
+from vllm_rbln.v1.attention.backends.gdn_attn import RBLNGDNAttentionMetadata
 from vllm_rbln.v1.attention.kv_cache_bindings import (
     kv_cache_tensor_key,
     materialize_kv_cache_view,
@@ -48,65 +51,64 @@ def _one_group_two_layers(make_model_runner):
     return runner
 
 
+def _attention_and_gdn(make_model_runner, tmp_path, block_size, attention, gdn):
+    """A runner with a full-attention layer and a GatedDeltaNet layer, a group
+    each, the state declared as that attention's KV block. Returns it with the
+    cache config to initialize it from."""
+    LlamaConfig(
+        hidden_size=1024,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        max_position_embeddings=8192,
+        architectures=["LlamaForCausalLM"],
+    ).save_pretrained(tmp_path)
+    config = EngineArgs(
+        model=str(tmp_path),
+        dtype="bfloat16",
+        block_size=block_size,
+        max_model_len=8192,
+        max_num_batched_tokens=128,
+        max_num_seqs=4,
+        enable_chunked_prefill=True,
+    ).create_engine_config()
+    runner = make_model_runner(
+        vllm_config=config, layers=(attention, gdn), init_kv_cache=False
+    )
+    layer = object.__new__(RBLNQwenGatedDeltaNetAttention)
+    layer.layer_index = None
+    runner.compilation_config.static_forward_context[gdn] = layer
+    cache_config = make_kv_cache_config(
+        runner, groups=[(attention,), (gdn,)], num_blocks=4, block_size=block_size
+    )
+    attention_spec = cache_config.kv_cache_groups[0].kv_cache_spec
+    cache_config.kv_cache_groups[1].kv_cache_spec = MambaSpec(
+        block_size=config.model_config.max_model_len,
+        shapes=((2, 4, 1, block_size, 256),),
+        dtypes=(torch.bfloat16,),
+        page_size_padded=attention_spec.page_size_bytes,
+        mamba_type=layer.mamba_type,
+    )
+    return runner, cache_config
+
+
 class TestReshapeKVCacheTensors:
     @pytest.mark.parametrize("block_size", [256, 384, 1024])
     def test_padded_gdn_keeps_shared_kv_view(
         self, make_model_runner, tmp_path, block_size
     ):
-        LlamaConfig(
-            hidden_size=1024,
-            num_attention_heads=4,
-            num_key_value_heads=4,
-            max_position_embeddings=8192,
-            architectures=["LlamaForCausalLM"],
-        ).save_pretrained(tmp_path)
-        config = EngineArgs(
-            model=str(tmp_path),
-            dtype="bfloat16",
-            block_size=block_size,
-            max_model_len=8192,
-            max_num_batched_tokens=128,
-            max_num_seqs=4,
-            enable_chunked_prefill=True,
-        ).create_engine_config()
-        runner = make_model_runner(
-            vllm_config=config, layers=("layer.0", "layer.1"), init_kv_cache=False
+        runner, cache_config = _attention_and_gdn(
+            make_model_runner, tmp_path, block_size, "layer.0", "layer.1"
         )
-        layer = object.__new__(RBLNQwenGatedDeltaNetAttention)
-        layer.layer_index = None
-        runner.compilation_config.static_forward_context["layer.1"] = layer
-        cache_config = make_kv_cache_config(
-            runner,
-            groups=[("layer.0",), ("layer.1",)],
-            num_blocks=4,
-            block_size=block_size,
-        )
-        attention_spec = cache_config.kv_cache_groups[0].kv_cache_spec
-        state_spec = MambaSpec(
-            block_size=config.model_config.max_model_len,
-            shapes=((2, 4, 1, block_size, 256),),
-            dtypes=(torch.bfloat16,),
-            page_size_padded=attention_spec.page_size_bytes,
-            mamba_type=layer.mamba_type,
-        )
-        cache_config.kv_cache_groups[1].kv_cache_spec = state_spec
-        runner.kv_cache_config = cache_config
-        runner.attn_groups = [
-            [
-                mr.AttentionGroup(
-                    RBLNFlashAttentionBackend, ["layer.0"], attention_spec, 0
-                )
-            ],
-            [mr.AttentionGroup(RBLNGDNAttentionBackend, ["layer.1"], state_spec, 1)],
-        ]
-        caches = runner.initialize_kv_cache_tensors(
-            cache_config, [block_size, state_spec.block_size]
-        )
+        runner.initialize_kv_cache(cache_config)
+        context = runner.compilation_config.static_forward_context
+        state_spec = cache_config.kv_cache_groups[1].kv_cache_spec
         assert len(runner.kv_cache_bases) == 1
-        info = runner.kv_cache_view_infos[layer.layer_index]
+        info = runner.kv_cache_view_infos[context["layer.1"].layer_index]
         state = materialize_kv_cache_view(runner.kv_cache_bases, info)
         assert tuple(state.shape) == (4, *state_spec.shapes[0])
-        assert kv_cache_tensor_key(state) == kv_cache_tensor_key(caches["layer.0"])
+        assert kv_cache_tensor_key(state) == kv_cache_tensor_key(
+            context["layer.0"].kv_cache
+        )
         assert state.stride(0) * state.element_size() == state_spec.page_size_bytes
         assert state_spec.real_page_size_bytes == state_spec.page_size_bytes
 
@@ -517,6 +519,74 @@ class TestBuildAttentionMetadata:
         metadata = attn_metadata["layer.0"]
         assert metadata.kv_caches is runner.kv_caches
         assert metadata.kv_cache_view_infos is None
+
+
+class TestGatedDeltaNetOnTheAttentionPool:
+    """A GatedDeltaNet state on the pool of a full-attention cache, with its
+    conv ring beside it: the caches in decoder order, and a step built from
+    each group's own block table over the one base both views share."""
+
+    GDN = "model.layers.0.linear_attn"
+    RING = "model.layers.0.linear_attn.conv_ring"
+    ATTN = "model.layers.1.self_attn.attn"
+
+    @pytest.fixture
+    def runner(self, make_model_runner, monkeypatch, tmp_path):
+        # The attention layer is created first; the decoder runs it second.
+        runner, cache_config = _attention_and_gdn(
+            make_model_runner, tmp_path, 256, self.ATTN, self.GDN
+        )
+        # Two caches a decoder layer, as num_attn_module counts Qwen3.5's.
+        monkeypatch.setattr(
+            runner.model_config.hf_text_config,
+            "model_type",
+            "qwen3_5_text",
+            raising=False,
+        )
+        with set_current_vllm_config(runner.vllm_config):
+            RBLNGDNConvRingCache(
+                self.RING,
+                owner=self.GDN,
+                block_shape=(3, 1, 2, 64),
+                dtype=torch.bfloat16,
+            )
+        runner.initialize_kv_cache(cache_config)
+        return runner
+
+    def test_caches_follow_the_decoder_order(self, runner):
+        names = [self.GDN, self.RING, self.ATTN]
+        assert runner.kv_cache_names == names
+        context = runner.compilation_config.static_forward_context
+        for position, name in enumerate(names):
+            assert context[name].layer_index == position
+            assert runner.kv_caches[position] is context[name].kv_cache
+
+    def test_each_group_builds_from_its_own_block_table(self, runner, monkeypatch):
+        monkeypatch.setattr(
+            mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+        )
+        # A request's (attention blocks, state blocks).
+        runner._update_states(
+            schedule_new("a", "b", block_ids=[([1], [2]), ([3], [1])])
+        )
+        runner.query_start_loc[:3] = torch.tensor([0, 1, 2], dtype=torch.int32)
+        runner.seq_lens[:2] = torch.tensor([4, 4], dtype=torch.int32)
+
+        attn_metadata, _ = runner._build_attention_metadata(
+            num_tokens=2, num_reqs=2, max_query_len=1, num_reqs_padded=4
+        )
+
+        attention, state = attn_metadata[self.ATTN], attn_metadata[self.GDN]
+        assert attention.block_tables[:2, 0].tolist() == [1, 3]
+        assert isinstance(state, RBLNGDNAttentionMetadata)
+        assert state.non_spec_state_indices_tensor.tolist() == [2, 1, 0, 0]
+        # The two views are recipes over one base, which reaches the graph once.
+        infos = runner.kv_cache_view_infos
+        assert state.kv_cache_view_infos is attention.kv_cache_view_infos is infos
+        state_info, ring_info, attention_info = infos
+        assert state_info.base_index == attention_info.base_index
+        assert state_info.view_shape == attention_info.view_shape
+        assert ring_info.base_index != state_info.base_index
 
 
 class TestLayerIndexFollowsCachePosition:
