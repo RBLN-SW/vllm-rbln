@@ -105,11 +105,17 @@ class RBLNGlm5NextMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
             self.stage(metadata)
         return metadata
 
-    def stage(self, metadata: RBLNFlashAttentionMetadata) -> None:
-        super().stage(metadata)
+    def stage(
+        self, metadata: RBLNFlashAttentionMetadata, buffer_index: int = 0
+    ) -> None:
+        super().stage(metadata, buffer_index)
         if isinstance(metadata, RBLNGlm5NextStateMetadata):
-            metadata.load_blocks = self._stage(metadata.load_blocks, "load_blocks")
-            metadata.store_blocks = self._stage(metadata.store_blocks, "store_blocks")
+            metadata.load_blocks = self._stage(
+                metadata.load_blocks, "load_blocks", buffer_index
+            )
+            metadata.store_blocks = self._stage(
+                metadata.store_blocks, "store_blocks", buffer_index
+            )
 
 
 class RBLNGlm5NextCacheBackend(AttentionBackend):

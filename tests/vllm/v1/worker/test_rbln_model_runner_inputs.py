@@ -30,6 +30,7 @@ from vllm.multimodal.inputs import (
     MultiModalKwargsItem,
     PlaceholderRange,
 )
+from vllm.sampling_params import SamplingParams
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
 
@@ -148,6 +149,120 @@ class TestPreprocessBeforeStaging:
 
         assert order == ["metadata", "cpu_kwargs", "readback", "stage", "forward"]
         assert state.output_token_ids == [42]
+
+    @staticmethod
+    def _device_feedback_step(make_model_runner, monkeypatch, num_reqs=4):
+        from tests.vllm.v1.worker.test_async_output import _async_output
+
+        monkeypatch.setattr(
+            mr,
+            "get_pp_group",
+            lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+        )
+        runner = make_model_runner(async_scheduling=True)
+        req_ids = list("abcd")[:num_reqs]
+        runner._update_states(
+            schedule_new(
+                *req_ids, sampling_params=[SamplingParams(temperature=0)] * num_reqs
+            )
+        )
+        positions = {}
+        for row, req_id in enumerate(req_ids):
+            state = runner.requests[req_id]
+            n = positions[req_id] = state.num_prompt_tokens
+            state.output_token_ids.append(-1)
+            runner.input_batch.token_ids_cpu[row, n] = -1
+            runner.input_batch.num_tokens_no_spec[row] = n + 1
+        tokens = torch.tensor(
+            [[42], [65536], [7], [9]], dtype=torch.int32, device="rbln"
+        )
+        previous = _async_output(
+            tokens[:num_reqs], req_ids=req_ids, placeholder_pos=positions
+        )
+        runner._prev_async_output = previous
+        runner._prev_device_token_ids = tokens
+        scheduled = schedule_cached(
+            req_ids=req_ids,
+            num_computed_tokens=list(positions.values()),
+            num_output_tokens=[1] * num_reqs,
+        )
+        return runner, previous, tokens, scheduled
+
+    @pytest.mark.use_device
+    @pytest.mark.parametrize("num_reqs", [3, 4])
+    @pytest.mark.parametrize("consume_output_first", [False, True])
+    def test_device_feedback_submits_forward_before_readback(
+        self, make_model_runner, monkeypatch, consume_output_first, num_reqs
+    ):
+        runner, previous, tokens, scheduled = self._device_feedback_step(
+            make_model_runner, monkeypatch, num_reqs
+        )
+        expected = [[42], [65536], [7], [9]][:num_reqs]
+        if consume_output_first:
+            assert previous.get_output().sampled_token_ids == expected
+            assert previous._sampled_token_ids is None
+        order = []
+        original_readback = previous.get_sampled_token_ids_cpu
+
+        def readback():
+            order.append("readback")
+            return original_readback()
+
+        def forward(**values):
+            order.append("forward")
+            assert values["input_ids"] is tokens
+            for state in runner.requests.values():
+                assert state.output_token_ids == [-1]
+            return torch.zeros((4, 1, 4)), torch.zeros((4, 1, 1000)), None
+
+        monkeypatch.setattr(previous, "get_sampled_token_ids_cpu", readback)
+        monkeypatch.setattr(runner, "model_executable", forward, raising=False)
+        runner.execute_model(scheduled)
+
+        assert order == ["forward", "readback"]
+        assert [
+            state.output_token_ids for state in runner.requests.values()
+        ] == expected
+        assert runner._device_input_ids is tokens
+
+    @pytest.mark.use_device
+    @pytest.mark.parametrize(
+        "mismatch", ["reordered", "padding", "missing_placeholder", "rollback"]
+    )
+    def test_device_feedback_repairs_before_forward_when_ineligible(
+        self, make_model_runner, monkeypatch, mismatch
+    ):
+        runner, previous, tokens, scheduled = self._device_feedback_step(
+            make_model_runner, monkeypatch
+        )
+        if mismatch == "reordered":
+            previous.req_ids.reverse()
+        elif mismatch == "padding":
+            runner._prev_device_token_ids = torch.cat(
+                [tokens, tokens.new_zeros((2, 1))]
+            )
+        elif mismatch == "missing_placeholder":
+            previous.placeholder_pos.pop("a")
+        else:
+            scheduled.scheduled_cached_reqs.num_computed_tokens[0] -= 1
+            scheduled.scheduled_cached_reqs.num_output_tokens[0] = 0
+        order = []
+        original_readback = previous.get_sampled_token_ids_cpu
+
+        def readback():
+            order.append("readback")
+            return original_readback()
+
+        def forward(**values):
+            order.append("forward")
+            return torch.zeros((4, 1, 4)), torch.zeros((4, 1, 1000)), None
+
+        monkeypatch.setattr(previous, "get_sampled_token_ids_cpu", readback)
+        monkeypatch.setattr(runner, "model_executable", forward, raising=False)
+        runner.execute_model(scheduled)
+
+        assert order == ["readback", "forward"]
+        assert runner._device_input_ids is None
 
 
 class TestResolveMultiModalSupport:

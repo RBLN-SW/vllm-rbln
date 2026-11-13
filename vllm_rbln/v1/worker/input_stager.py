@@ -79,21 +79,30 @@ class InputStager:
         token_indices: torch.Tensor | None = None,
         hidden_states: torch.Tensor | None = None,
         layout: InputLayout,
+        buffer_index: int = 0,
     ) -> StagedModelInputs:
-        buf, host_buf = self._get_or_create_buffer(layout, input_ids, positions)
+        buf, host_buf = self._get_or_create_buffer(
+            layout, input_ids, positions, buffer_index
+        )
 
         assert buf.input_ids.shape == layout.shape
-        host_buf.input_ids.fill_(layout.input_pad_value)
-        host_buf.input_ids[: layout.num_reqs, : layout.query_len].copy_(input_ids)
+        if input_ids.is_cpu:
+            host_buf.input_ids.fill_(layout.input_pad_value)
+            host_buf.input_ids[: layout.num_reqs, : layout.query_len].copy_(input_ids)
+            buf.input_ids.copy_(host_buf.input_ids, non_blocking=True)
+            staged_input_ids = buf.input_ids
+        else:
+            assert input_ids.device == buf.input_ids.device
+            assert input_ids.shape == layout.shape
+            staged_input_ids = input_ids
 
         host_buf.positions.fill_(layout.position_pad_value)
         host_buf.positions[: layout.num_reqs, : layout.query_len].copy_(positions)
 
-        buf.input_ids.copy_(host_buf.input_ids, non_blocking=True)
         buf.positions.copy_(host_buf.positions, non_blocking=True)
 
         return StagedModelInputs(
-            input_ids=buf.input_ids,
+            input_ids=staged_input_ids,
             positions=buf.positions,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
@@ -106,8 +115,10 @@ class InputStager:
         layout: InputLayout,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        buffer_index: int = 0,
     ) -> tuple[InputBuffer, InputBuffer]:
         key = (
+            buffer_index,
             layout.shape,
             input_ids.dtype,
             positions.dtype,

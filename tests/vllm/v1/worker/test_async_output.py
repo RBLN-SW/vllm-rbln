@@ -56,6 +56,7 @@ def _async_output(
     fail_fast=False,
     rank=None,
     dp_rank=None,
+    device_input_ids=None,
 ):
     if req_ids is None:
         req_ids = [f"r{i}" for i in range(len(tokens))]
@@ -73,11 +74,33 @@ def _async_output(
         fail_fast=fail_fast,
         rank=rank,
         dp_rank=dp_rank,
+        device_input_ids=device_input_ids,
     )
     return async_out
 
 
 class TestGetOutput:
+    def test_retains_device_inputs_until_consumer_readback_finishes(self):
+        input_ids = torch.tensor([[7]], dtype=torch.int32)
+        input_ref = weakref.ref(input_ids)
+        producer = _async_output(input_ids)
+        consumer = _async_output(
+            torch.tensor([[8]], dtype=torch.int32), device_input_ids=input_ids
+        )
+        completed = []
+
+        def finish_readback():
+            assert input_ref() is not None
+            completed.append(True)
+
+        consumer._copy_ready_event = SimpleNamespace(synchronize=finish_readback)
+        del input_ids
+        assert producer.get_sampled_token_ids_cpu().tolist() == [[7]]
+        assert input_ref() is not None
+        assert consumer.get_sampled_token_ids_cpu().tolist() == [[8]]
+        assert completed == [True]
+        assert input_ref() is None
+
     @pytest.mark.parametrize("failure_stage", ["copy", "logprobs"])
     @pytest.mark.parametrize(
         ("fail_fast", "disabled", "should_exit"),

@@ -730,6 +730,10 @@ class RBLNWorker(WorkerBase):
         if runner is not None and runner._prev_async_output is not None:
             runner._prev_async_output.get_sampled_token_ids_cpu()
             runner._prev_async_output = None
+            runner._prev_device_token_ids = None
+        if runner is not None and runner._device_input_ids is not None:
+            torch.rbln.synchronize()
+            runner._device_input_ids = None
         self._release_offload_temp_storage()
 
         # has_kv_transfer_group can be None during interpreter shutdown.

@@ -152,9 +152,45 @@ class TestStage:
         assert staged.input_ids.device.type == current_platform.device_type
         assert staged.positions.device.type == current_platform.device_type
 
+    @pytest.mark.use_device
+    def test_device_input_ids_pass_through_without_a_copy(self, monkeypatch):
+        stager = InputStager(torch.device("rbln"))
+        input_ids = _ids(2, 1).to("rbln")
+        positions = _ids(2, 1, base=10)
+        original_copy = torch.Tensor.copy_
+
+        def copy(dst, src, *args, **kwargs):
+            assert src is not input_ids, "Device feedback must not copy input IDs"
+            return original_copy(dst, src, *args, **kwargs)
+
+        monkeypatch.setattr(torch.Tensor, "copy_", copy)
+        staged = stager.stage(
+            input_ids=input_ids,
+            positions=positions,
+            layout=_layout(
+                num_reqs=2, num_reqs_padded=2, query_len=1, query_len_padded=1
+            ),
+        )
+        assert staged.input_ids is input_ids
+        assert torch.equal(staged.positions.cpu(), positions)
+
 
 @pytest.mark.maybe_use_device
 class TestBufferReuse:
+    def test_buffer_indices_keep_positions_independent(self):
+        stager = _stager()
+        values = dict(input_ids=_ids(2, 3), layout=_layout())
+        first = stager.stage(**values, positions=_ids(2, 3, base=10))
+        second = stager.stage(**values, positions=_ids(2, 3, base=20), buffer_index=1)
+        assert first.positions is not second.positions
+        assert torch.equal(first.positions.cpu()[:2, :3], _ids(2, 3, base=10))
+        assert torch.equal(second.positions.cpu()[:2, :3], _ids(2, 3, base=20))
+        reused = stager.stage(**values, positions=_ids(2, 3, base=30), buffer_index=0)
+        assert reused.positions is first.positions
+        assert reused.input_ids is first.input_ids
+        assert torch.equal(second.positions.cpu()[:2, :3], _ids(2, 3, base=20))
+        assert torch.equal(reused.positions.cpu()[:2, :3], _ids(2, 3, base=30))
+
     def test_same_layout_and_dtype_reuses_buffer(self):
         stager = _stager()
         layout = _layout()

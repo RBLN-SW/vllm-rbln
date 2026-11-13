@@ -534,6 +534,20 @@ class TestBuildOutputAssembly:
 
 
 class TestStage:
+    def test_alternating_slots_preserve_inflight_metadata(self, cfg):
+        builder = make_builder(cfg)
+        first, second, third = (_metadata() for _ in range(3))
+        first.seq_lens.fill_(3)
+        second.seq_lens.fill_(4)
+        third.seq_lens.fill_(5)
+        builder.stage(first, buffer_index=0)
+        builder.stage(second, buffer_index=1)
+        assert first.seq_lens.tolist() == [[3]]
+        assert second.seq_lens.tolist() == [[4]]
+        builder.stage(third, buffer_index=0)
+        assert third.seq_lens is first.seq_lens
+        assert second.seq_lens.tolist() == [[4]]
+
     def test_none_passthrough(self, cfg):
         # None in -> None out; there is nothing to stage.
         assert make_builder(cfg)._stage(None, "x") is None

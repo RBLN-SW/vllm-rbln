@@ -312,6 +312,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         self.runtime_holder: list = []
 
         self.use_async_scheduling = self.scheduler_config.async_scheduling
+        self.use_async_device_feedback = (
+            self.use_async_scheduling
+            and use_device_tensor()
+            and parallel_config.tensor_parallel_size == 1
+            and parallel_config.pipeline_parallel_size == 1
+            and parallel_config.data_parallel_size == 1
+        )
 
         # Sampler
         if self.rbln_config.use_custom_sampler:
@@ -325,6 +332,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
 
         # Async scheduling state.
         self._prev_async_output: AsyncRBLNModelRunnerOutput | None = None
+        self._prev_device_token_ids: torch.Tensor | None = None
+        self._device_input_ids: torch.Tensor | None = None
+        self._input_buffer_index = 0
         self._async_logprobs_tensors: LogprobsTensors | None = None
         self._placeholder_pos: dict[str, int] = {}
 
@@ -1614,6 +1624,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 sampling_metadata,
             )
 
+        if self.use_async_scheduling and self.use_async_device_feedback:
+            self._prev_device_token_ids = out.sampled_token_ids
         return _depad_sampler_output(out, num_reqs)
 
     def _repair_staged_input_ids(
@@ -1673,6 +1685,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         # The runner owns this reference even on ranks without get_output().
         # Release only after D2H completes; the output thread keeps its own ref.
         self._prev_async_output = None
+        self._prev_device_token_ids = None
 
     def _bookkeeping_sync(
         self,
@@ -2002,11 +2015,54 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 intermediate_tensors,
             )
 
+            device_feedback = None
             if self.use_async_scheduling:
-                self._repair_staged_input_ids(model_inputs, req_ids)
+                previous = self._prev_async_output
+                previous_tokens = self._prev_device_token_ids
+                sampling_metadata = self.input_batch.sampling_metadata
+                if (
+                    self.use_async_device_feedback
+                    and previous is not None
+                    and previous_tokens is not None
+                    and not self.is_prefill
+                    and self.speculative_config is None
+                    and not self.uses_fixed_decode_window
+                    and not self.supports_mm_inputs
+                    and not self.is_pooling_model
+                    and sampling_metadata.all_greedy
+                    and sampling_metadata.no_penalties
+                    and not self.input_batch.logitsprocs_need_output_token_ids
+                    and previous.req_ids == req_ids
+                    and not previous_tokens.is_cpu
+                    and previous_tokens.device.type == self.device.type
+                    and previous_tokens.dtype == model_inputs.input_ids.dtype
+                    and previous_tokens.shape
+                    == input_layout.shape
+                    == (input_layout.num_reqs_padded, 1)
+                    and all(
+                        previous.placeholder_pos.get(req_id) == position
+                        and position + 1 == self.input_batch.num_tokens_no_spec[row]
+                        and position - self.requests[req_id].num_prompt_tokens
+                        == len(self.requests[req_id].output_token_ids) - 1
+                        for row, (req_id, position) in enumerate(
+                            zip(req_ids, model_inputs.positions[:, 0].tolist())
+                        )
+                    )
+                ):
+                    device_feedback = previous_tokens
+                    model_inputs.input_ids = previous_tokens
+                else:
+                    self._repair_staged_input_ids(model_inputs, req_ids)
+
+                if self.use_async_device_feedback:
+                    # Each forward consumes the previous readback before returning.
+                    # That completion protects slot reuse two steps later.
+                    self._input_buffer_index ^= 1
 
             staged_model_inputs = self.input_stager.stage(
-                **model_inputs.as_kwargs(), layout=input_layout
+                **model_inputs.as_kwargs(),
+                layout=input_layout,
+                buffer_index=self._input_buffer_index,
             )
             if (
                 self.supports_mm_inputs
@@ -2025,7 +2081,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             for groups in self.attn_groups:
                 for group in groups:
                     builder = group.get_metadata_builder(0)
-                    builder.stage(attn_metadata[group.layer_names[0]])
+                    builder.stage(
+                        attn_metadata[group.layer_names[0]],
+                        buffer_index=self._input_buffer_index,
+                    )
         # Run the model.
         # With spec decode, defer connector finalization (wait_for_save + clear
         # metadata) until after the draft runs in sample_tokens() so the draft
@@ -2054,6 +2113,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 **staged_model_inputs.as_kwargs(),
                 **model_kwargs,
             )
+            if device_feedback is not None:
+                self._device_input_ids = device_feedback
+                self._repair_staged_input_ids()
             # Submitted, not awaited: a held read now runs against an idle host.
             if has_kv_transfer_group():
                 flush_deferred_loads(get_kv_transfer_group())
@@ -2272,7 +2334,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             fail_fast=self.fail_fast,
             rank=self.parallel_config.rank,
             dp_rank=self.parallel_config.data_parallel_rank,
+            device_input_ids=self._device_input_ids,
         )
+        self._device_input_ids = None
         assert self._prev_async_output is None
         self._prev_async_output = async_output
         return async_output

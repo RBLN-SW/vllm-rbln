@@ -230,36 +230,51 @@ class RBLNFlashAttentionMetadataBuilder(
 
         self._staged: dict[tuple, torch.Tensor] = {}
 
-    def _stage(self, t: torch.Tensor | None, slot: str) -> torch.Tensor | None:
+    def _stage(
+        self, t: torch.Tensor | None, slot: str, buffer_index: int = 0
+    ) -> torch.Tensor | None:
         """Copy a host tensor into this builder's persistent device buffer.
 
         `slot` must be unique per logical tensor: cache_seq_lens and
         cache_offsets share both shape and dtype, so keying on those alone
         would silently make them share one buffer.
 
-        The returned tensor is overwritten by the next stage() call, so the
-        caller must run the forward pass before staging again.
+        The caller must finish consuming a slot before staging into it again.
         """
         if t is None:
             return None
-        key = (slot, t.shape, t.dtype)
+        key = (buffer_index, slot, t.shape, t.dtype)
         if (buf := self._staged.get(key)) is None:
             buf = torch.empty(t.shape, dtype=t.dtype, device=self.device)
             self._staged[key] = buf
         buf.copy_(t)
         return buf
 
-    def stage(self, metadata: RBLNFlashAttentionMetadata) -> None:
-        metadata.seq_lens = self._stage(metadata.seq_lens, "seq_idx")
-        metadata.block_tables = self._stage(metadata.block_tables, "block_tables")
-        metadata.attn_masks = self._stage(metadata.attn_masks, "attn_masks")
-        metadata.cache_seq_lens = self._stage(metadata.cache_seq_lens, "cache_seq_lens")
-        metadata.cache_offsets = self._stage(metadata.cache_offsets, "cache_offsets")
-        metadata.local_block_tables = self._stage(
-            metadata.local_block_tables, "local_block_tables"
+    def stage(
+        self, metadata: RBLNFlashAttentionMetadata, buffer_index: int = 0
+    ) -> None:
+        metadata.seq_lens = self._stage(metadata.seq_lens, "seq_idx", buffer_index)
+        metadata.block_tables = self._stage(
+            metadata.block_tables, "block_tables", buffer_index
         )
-        metadata.swa_attn_masks = self._stage(metadata.swa_attn_masks, "swa_attn_masks")
-        metadata.num_accepted = self._stage(metadata.num_accepted, "num_accepted")
+        metadata.attn_masks = self._stage(
+            metadata.attn_masks, "attn_masks", buffer_index
+        )
+        metadata.cache_seq_lens = self._stage(
+            metadata.cache_seq_lens, "cache_seq_lens", buffer_index
+        )
+        metadata.cache_offsets = self._stage(
+            metadata.cache_offsets, "cache_offsets", buffer_index
+        )
+        metadata.local_block_tables = self._stage(
+            metadata.local_block_tables, "local_block_tables", buffer_index
+        )
+        metadata.swa_attn_masks = self._stage(
+            metadata.swa_attn_masks, "swa_attn_masks", buffer_index
+        )
+        metadata.num_accepted = self._stage(
+            metadata.num_accepted, "num_accepted", buffer_index
+        )
 
     def reorder_batch(
         self, input_batch: "InputBatch", scheduler_output: "SchedulerOutput"

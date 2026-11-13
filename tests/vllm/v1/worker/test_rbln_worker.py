@@ -379,7 +379,11 @@ def test_shutdown_waits_for_the_last_async_token_copy(monkeypatch):
     )
     monkeypatch.setattr(previous, "get_sampled_token_ids_cpu", wait)
     worker = object.__new__(RBLNWorker)
-    worker.model_runner = SimpleNamespace(_prev_async_output=previous)
+    worker.model_runner = SimpleNamespace(
+        _prev_async_output=previous,
+        _prev_device_token_ids=None,
+        _device_input_ids=None,
+    )
     worker.profiler = None
     worker._release_offload_temp_storage = Mock(
         side_effect=lambda: phases.append("release_storage")
@@ -390,6 +394,36 @@ def test_shutdown_waits_for_the_last_async_token_copy(monkeypatch):
 
     assert phases == ["copy_complete", "release_storage"]
     assert worker.model_runner._prev_async_output is None
+
+
+def test_shutdown_waits_for_an_unsampled_device_feedback_forward(monkeypatch):
+    input_ids = torch.tensor([[42]], dtype=torch.int32)
+    runner = SimpleNamespace(
+        _prev_async_output=None,
+        _prev_device_token_ids=None,
+        _device_input_ids=input_ids,
+    )
+    phases = []
+
+    def synchronize():
+        assert runner._device_input_ids is input_ids
+        phases.append("forward_complete")
+
+    def release_storage():
+        assert runner._device_input_ids is None
+        phases.append("release_storage")
+
+    worker = object.__new__(RBLNWorker)
+    worker.model_runner = runner
+    worker.profiler = None
+    worker._release_offload_temp_storage = release_storage
+    monkeypatch.setattr(torch.rbln, "synchronize", synchronize)
+    monkeypatch.setattr(wm, "ensure_kv_transfer_shutdown", None)
+    monkeypatch.setattr(wm, "ensure_ec_transfer_shutdown", None)
+
+    worker.shutdown()
+
+    assert phases == ["forward_complete", "release_storage"]
 
 
 class TestConformance:
@@ -1272,7 +1306,10 @@ class TestEcConnectorLifecycle:
         monkeypatch.setattr(ec_state, "_EC_CONNECTOR_AGENT", connector)
         worker = make_worker()
         worker.model_runner = SimpleNamespace(
-            load_model=lambda: connector.calls.append("load_model")
+            load_model=lambda: connector.calls.append("load_model"),
+            _prev_async_output=None,
+            _prev_device_token_ids=None,
+            _device_input_ids=None,
         )
         monkeypatch.setattr(wm, "set_current_vllm_config", lambda _: nullcontext())
         monkeypatch.setattr(worker, "_release_offload_temp_storage", lambda: None)

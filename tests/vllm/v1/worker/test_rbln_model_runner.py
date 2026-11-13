@@ -107,7 +107,11 @@ def _make_runner_stub(**attrs):
     runner.dp_status = None
     runner.supports_mm_inputs = False
     runner.use_async_scheduling = False
+    runner.use_async_device_feedback = False
     runner._prev_async_output = None
+    runner._prev_device_token_ids = None
+    runner._device_input_ids = None
+    runner._input_buffer_index = 0
     for key, value in attrs.items():
         setattr(runner, key, value)
     return runner
@@ -385,6 +389,23 @@ class TestSamplePadding:
             rejection_sampler=rejection_sampler,
         )
         return runner, rejection_sampler
+
+    def test_device_feedback_retains_padded_sampler_storage(self):
+        tokens = torch.tensor([[42], [65536], [7], [9]], dtype=torch.int32)
+        padded = SamplerOutput(sampled_token_ids=tokens, logprobs_tensors=None)
+        runner, _ = self._runner(padded, sampler=True)
+        runner.use_async_scheduling = True
+        runner.use_async_device_feedback = True
+        runner.input_batch.num_reqs = 3
+        runner.input_batch.sampling_metadata = _sampling_metadata(3)
+        runner.sampler = Mock(return_value=padded)
+
+        result = runner._sample(torch.zeros((4, 10)), None)
+
+        assert runner._prev_device_token_ids is tokens
+        assert result.sampled_token_ids.shape == (3, 1)
+        assert result.sampled_token_ids.data_ptr() == tokens.data_ptr()
+        assert result.sampled_token_ids.tolist() == [[42], [65536], [7]]
 
     def test_compiled_rejection_sampler_uses_per_stage_batch_bound(self):
         output = SamplerOutput(
