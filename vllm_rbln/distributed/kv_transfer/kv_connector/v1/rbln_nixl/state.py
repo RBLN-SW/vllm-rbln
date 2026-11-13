@@ -27,6 +27,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import
     connector_option,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_transfer_topology import (
+    RblnBlockTransferSpec,
     RblnTransferTopology,
 )
 from vllm_rbln.logger import init_logger
@@ -222,6 +223,65 @@ def pair_area(
     return pieces
 
 
+class BlockWindow(NamedTuple):
+    """What one chiplet area holds of a block payload's block on one rank: the
+    rectangle, and the bytes of the area's block that hold it."""
+
+    rect: AreaRect
+    length: int
+
+
+def block_rects(
+    spec: RblnBlockTransferSpec,
+    slice_ids: Sequence[int],
+    area_len: int,
+    rank: int,
+    tp_size: int,
+    entry_first: int | None = None,
+) -> list[BlockWindow]:
+    """What each chiplet area holds of one block payload's block on one rank.
+
+    A payload every rank holds alike is one head over the block's bytes, cut by
+    slice. A banded one cuts the rank's heads out of `spec.band_heads`, and its
+    kernel cuts them over the chiplets: a block of runs holds the rank's heads in
+    every run, an area a slice of them in every run; a block of one run holds
+    one group of heads, an area a slice of it. A block of one run too small for
+    the rank's heads is one of several entries splitting them, which holds the
+    heads from `entry_first` on.
+    """
+    slices = len(set(slice_ids))
+    if not spec.band_heads:
+        return [
+            BlockWindow(
+                AreaRect((0, 1), (sid * area_len, (sid + 1) * area_len)), area_len
+            )
+            for sid in slice_ids
+        ]
+    heads = spec.band_heads // tp_size
+    first = rank * heads
+    if spec.runs == 1 and area_len * slices < heads * spec.head_bytes:
+        assert entry_first is not None, "an entry of a split rank names its heads"
+        heads, first = area_len * slices // spec.head_bytes, entry_first
+    per_area, rem = divmod(heads, slices)
+    if rem:
+        raise RuntimeError(
+            f"RBLN NIXL D2D: rank {rank} of TP {tp_size} holds {heads} heads, "
+            f"which {slices} chiplet slices do not cut evenly."
+        )
+    if spec.runs == 1 and area_len != per_area * spec.head_bytes:
+        raise RuntimeError(
+            f"RBLN NIXL D2D: a chiplet area's {area_len}B of a block is not the "
+            f"{per_area} heads of {spec.head_bytes}B this rank's slice holds."
+        )
+    return [
+        BlockWindow(
+            AreaRect((first + sid * per_area, first + (sid + 1) * per_area), (0, 1)),
+            area_len,
+        )
+        for sid in slice_ids
+    ]
+
+
 def kv_chunk_tokens(
     *,
     block_tokens: int,
@@ -371,13 +431,17 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
     #: Per logical region, whether it is a key-only latent (an MLA cache, or
     #: an MSA indexer beside attention) rather than K and V.
     _logical_region_latent: list[bool]
+    #: Per logical region, its block payload spec where it is cut on the BLOCK
+    #: axis, else None. Registration fills every region; the empty default and
+    #: `_block_spec`'s bound only serve a worker that never registered.
+    _logical_region_block_spec: Sequence[RblnBlockTransferSpec | None] = ()
     _logical_region_kv_heads: list[int | None]
     #: This RANK's share of them, which is what a token range of an area is
     #: one byte run per. `_logical_region_kv_heads` is a band across ranks and
     #: names no run.
     _logical_region_local_heads: list[int | None]
     local_seen_layer_names: list[str]
-    _block_state_layers: set[str]
+    _block_state_layers: frozenset[str] | set[str] = frozenset()
     _block_state_groups: set[int]
     _block_aux_specs: dict[str, RBLNBlockAuxSpec]
     compat_hash: str | None
@@ -527,9 +591,24 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
             pairs.append((peer_pos, matches[occurrence]))
         return pairs
 
+    def _block_spec(self, logical: int) -> RblnBlockTransferSpec | None:
+        specs = self._logical_region_block_spec
+        return specs[logical] if logical < len(specs) else None
+
     def _region_halves(self, logical: int) -> int:
-        """How many of K and V a block of a logical region holds."""
+        """How many of K and V a block of a logical region holds; for a banded
+        block payload, how many runs of its heads."""
+        spec = self._block_spec(logical)
+        if spec is not None:
+            return spec.runs if spec.band_heads else 1
         return 1 if self._logical_region_latent[logical] else self._kv_per_block
+
+    def _same_on_every_rank(self, logical: int) -> bool:
+        """Whether every TP rank holds a logical region's bytes alike."""
+        spec = self._block_spec(logical)
+        if spec is not None:
+            return not spec.band_heads
+        return self._logical_region_latent[logical]
 
     def _logical_regions_per_layer(self) -> int:
         return len(self._logical_region_geometry) // len(self.local_seen_layer_names)

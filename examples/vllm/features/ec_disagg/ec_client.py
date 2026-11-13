@@ -43,7 +43,7 @@ def main() -> None:
     parser.add_argument("--base-url", default="http://127.0.0.1:8000/v1")
     parser.add_argument(
         "--image",
-        default="https://vllm-public-assets.s3.us-west-2.amazonaws.com/multimodal_asset/lion.jpg",
+        default="https://vllm-public-assets.s3.us-west-2.amazonaws.com/vision_model_images/stop_sign.jpg",
         help="Local path or URL.",
     )
     parser.add_argument("--prompt", default="What is in this image?")

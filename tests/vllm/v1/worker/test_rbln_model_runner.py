@@ -642,7 +642,7 @@ class TestEcConsumer:
             _is_prefill_step=True,
             is_pooling_model=False,
             max_num_tokens=4,
-            prefill_chunk_size=4,
+            prefill_chunk_sizes=[4],
             input_ids=torch.zeros(4, dtype=torch.long),
             positions=torch.zeros(4, dtype=torch.long),
             input_stager=InputStager(torch.device("cpu")),
@@ -824,11 +824,11 @@ def test_multimodal_warmup_keys_the_bundle_on_the_encoder_buckets(monkeypatch, b
     runner._warmup_mm_encoder.assert_called_once_with()
 
 
-def test_warmup_compiles_prefill_at_the_prefill_chunk_size():
+def test_warmup_compiles_prefill_at_every_prefill_chunk_size():
     calls = []
     runner = _make_runner_stub(
         max_num_tokens=512,
-        prefill_chunk_size=256,
+        prefill_chunk_sizes=[128, 256],
         speculative_config=None,
         bucketing_manager=SimpleNamespace(decode_batch_buckets=[1]),
         specialized_moe_decode=False,
@@ -837,7 +837,34 @@ def test_warmup_compiles_prefill_at_the_prefill_chunk_size():
 
     runner.run_model_graphs()
 
-    assert calls[0] == ((1, 256, True), {})
+    assert calls[:2] == [((1, 128, True), {}), ((1, 256, True), {})]
+
+
+@pytest.mark.parametrize(("query_len", "padded"), [(100, 128), (128, 128), (129, 256)])
+def test_a_prefill_pads_to_the_shortest_chunk_size_that_holds_it(
+    monkeypatch, query_len, padded
+):
+    monkeypatch.setattr(mr, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True))
+    runner = _make_runner_stub(
+        input_ids=torch.zeros(512, dtype=torch.int32),
+        positions=torch.zeros(512, dtype=torch.int64),
+        is_prefill=True,
+        prefill_chunk_sizes=[128, 256],
+        input_stager=Mock(),
+        is_pooling_model=True,
+        _init_model_kwargs=lambda: {},
+    )
+
+    runner._preprocess(
+        Mock(),
+        num_reqs=1,
+        num_reqs_padded=1,
+        num_input_tokens=query_len,
+        logits_indices=None,
+    )
+
+    layout = runner.input_stager.stage.call_args.kwargs["layout"]
+    assert (layout.query_len, layout.query_len_padded) == (query_len, padded)
 
 
 @pytest.mark.parametrize(
@@ -1377,7 +1404,7 @@ class TestDummyRunPadding:
                 num_computed_tokens_cpu=np.zeros(8, dtype=np.int32),
             ),
             max_num_tokens=128,
-            prefill_chunk_size=64,
+            prefill_chunk_sizes=[64],
             max_num_reqs=8,
             seq_lens_np=np.zeros(8, dtype=np.int32),
             query_start_loc_np=np.zeros(16, dtype=np.int32),
@@ -1418,16 +1445,26 @@ class TestDummyRunPadding:
 
         assert captured["layout"].num_reqs_padded == 1
 
-    def test_a_dummy_prefill_pads_to_the_width_warm_up_compiled(self, monkeypatch):
-        # Serving pads every prefill to prefill_chunk_size, so that is the one
-        # width warm-up builds. A dummy prefill has to land on it whatever length
-        # it is handed -- an idle rank reports the minimal entry, not the staged
-        # width.
+    @pytest.mark.parametrize(("query_len", "padded"), [(1, 32), (32, 32), (33, 64)])
+    def test_a_dummy_prefill_pads_to_the_width_warm_up_compiled(
+        self, monkeypatch, query_len, padded
+    ):
+        # A serving dummy must use one of the prefill widths warm-up compiled.
         runner, captured = self._runner(monkeypatch, reqs_across_dp=[1, 1, 1, 1])
-        runner._dummy_run(1, runner.prefill_chunk_size, is_prefill=True)
+        runner.prefill_chunk_sizes = [32, 64]
+        runner._dummy_run(1, padded, is_prefill=True)
         warmed = captured["layout"].shape
+        assert warmed == (1, padded)
 
         runner, captured = self._runner(monkeypatch, reqs_across_dp=[1, 1, 1, 1])
+        runner.prefill_chunk_sizes = [32, 64]
+        monkeypatch.setattr(
+            runner,
+            "_determine_batch_execution_and_padding",
+            lambda *a, **kw: _resolved_batch(
+                num_reqs_padded=1, query_len=query_len, num_tokens_padded=128
+            ),
+        )
         runner._dummy_run(1, 1, is_prefill=True, warmup=False)
         assert captured["layout"].shape == warmed
 
@@ -2254,7 +2291,7 @@ class TestDummyRunDraftParticipation:
         # there, and the draft leg has to skip cleanly.
         attrs = dict(
             max_num_tokens=64,
-            prefill_chunk_size=64,
+            prefill_chunk_sizes=[64],
             max_num_reqs=8,
             speculative_config=make_speculative_config("eagle"),
             num_spec_tokens=cls.NUM_SPEC,
@@ -2391,7 +2428,7 @@ class TestDummyRunPPIntermediateTensors:
             model_config=SimpleNamespace(dtype=torch.float16),
             device=torch.device("cpu"),
             max_num_tokens=64,
-            prefill_chunk_size=32,
+            prefill_chunk_sizes=[32],
             max_num_reqs=8,
             speculative_config=None,
             # Gates the drafter leg; __init__ always sets it.
@@ -2450,7 +2487,7 @@ class TestDummyRunPPIntermediateTensors:
         runner, captured = self._runner(monkeypatch, num_reqs_padded=1, query_len=1)
         runner._dummy_run(1, 1, is_prefill=True, warmup=False)
         _, width = captured["layout"].shape
-        assert width == runner.prefill_chunk_size
+        assert width == runner.prefill_chunk_sizes[-1]
         assert captured["intermediate_tensors"]["h"].shape == (1, width, self.HIDDEN)
 
 
@@ -2644,7 +2681,7 @@ class TestDecodeGraphShapes:
             bucketing_manager=SimpleNamespace(decode_batch_buckets=buckets),
             specialized_moe_decode=specialized,
             max_num_tokens=512,
-            prefill_chunk_size=256,
+            prefill_chunk_sizes=[128, 256],
             is_strict_kv_producer=False,
         )
 
@@ -2675,9 +2712,9 @@ class TestDecodeGraphShapes:
         runner = self._runner(**kwargs)
         shapes = mr.RBLNModelRunner.decode_graph_shapes(runner)
         calls = self._dummies(runner)
-        assert len(calls) == len(shapes) + 1
-        assert calls[0][0] == (1, runner.prefill_chunk_size, True)
-        for (num_reqs, query_len, override), (args, kw) in zip(shapes, calls[1:]):
+        assert len(calls) == len(shapes) + 2
+        assert [args for args, _ in calls[:2]] == [(1, 128, True), (1, 256, True)]
+        for (num_reqs, query_len, override), (args, kw) in zip(shapes, calls[2:]):
             assert args == (num_reqs, query_len, False)
             assert kw == {"num_tokens_padded_override": override}
 
@@ -2719,5 +2756,4 @@ class TestDecodeGraphShapes:
         runner.is_strict_kv_producer = True
         assert mr.RBLNModelRunner.decode_graph_shapes(runner) == []
         calls = self._dummies(runner)
-        assert len(calls) == 1
-        assert calls[0][0] == (1, runner.prefill_chunk_size, True)
+        assert [args for args, _ in calls] == [(1, 128, True), (1, 256, True)]
