@@ -317,6 +317,11 @@ def _validate(vllm_config: "VllmConfig") -> None:
                     "non-causal attention",
                     len(chunks) > 1 and vllm_config.attention_config.use_non_causal,
                 ),
+                # The GatedDeltaNet metadata sizes a prefill step at the longest chunk.
+                (
+                    "GatedDeltaNet models",
+                    len(chunks) > 1 and _uses_gated_delta_net(model_config),
+                ),
             )
             if on
         ]

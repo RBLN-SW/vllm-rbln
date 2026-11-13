@@ -666,6 +666,14 @@ class TestRejectedConfigs:
         with pytest.raises(ValueError, match="Speculative decoding"):
             reconfigure(speculative)
 
+    def test_gdn_models_take_one_prefill_chunk_size(self, reconfigure, gdn):
+        def bucketed(config):
+            gdn(config)
+            _prefill_chunk([64, 128])(config)
+
+        with pytest.raises(ValueError, match="GatedDeltaNet models"):
+            reconfigure(bucketed)
+
     def test_gdn_state_fills_a_full_attention_page(self, reconfigure, gdn):
         def doubled_block(config):
             gdn(config)
