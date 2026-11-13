@@ -2182,7 +2182,7 @@ class TestRepairStagedInputIds:
         logits = torch.zeros(batch_size, 201088, dtype=torch.float32)
         logits[torch.arange(batch_size), expected] = 20
         greedy = compile_sampler(rbln_greedy_sample, None)
-        source = greedy(logits.to("rbln")).unsqueeze(-1)
+        source = greedy(logits.to("rbln"))
         r = self._runner(
             prev_index={req_id: i for i, req_id in enumerate(req_ids)},
             prev_tokens=expected,
