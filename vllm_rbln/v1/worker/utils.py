@@ -1262,13 +1262,16 @@ def get_kv_cache_names(cache_layers: Mapping[str, Any]) -> list[str]:
     """Order caches by their numeric module path and optional auxiliary slot.
 
     Numbered attention modules and cache groups already encode their order.
-    Unnumbered auxiliary caches declare `kv_cache_slot`; main caches use 0.
+    Unnumbered auxiliary caches declare `kv_cache_slot`; the default is 0.
+
+    Examples:
+        Standard attention cache: layers.3.self_attn.attn -> (3, 0).
+        GLM-5.3 (2 state groups, speculative decoding on): .attn.0/1=state,
+        .2=conv, .3/4=draft buffers with num_speculative_tokens records each.
+        DeepSeek indexer: layers.3.self_attn.indexer.k_cache -> (3, 1).
+        DeepSeek scale: layers.3.self_attn.indexer.k_cache.scale_cache -> (3, 2).
+        MiniMax indexer: layers.3.self_attn.attn.indexer -> (3, 1).
     """
-    # GLM-5.3 (2 state groups, speculative decoding on): .attn.0/1=state, .2=conv,
-    # .3/4=draft buffers; each holds num_speculative_tokens draft records.
-    # DeepSeek indexer: layers.3.self_attn.indexer.k_cache -> (3, 1).
-    # DeepSeek scale: layers.3.self_attn.indexer.k_cache.scale_cache -> (3, 2).
-    # MiniMax indexer: layers.3.self_attn.attn.indexer -> (3, 1).
     names_by_order: dict[tuple[int, ...], str] = {}
     for name, layer in cache_layers.items():
         path = tuple(int(part) for part in name.split(".") if part.isdecimal())
