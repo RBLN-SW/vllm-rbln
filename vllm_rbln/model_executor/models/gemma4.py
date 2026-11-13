@@ -27,7 +27,8 @@ from transformers.models.gemma4.modeling_gemma4 import apply_multidimensional_ro
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
 from vllm.forward_context import get_forward_context
-from vllm.model_executor.models.gemma4 import Gemma4Attention
+from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+from vllm.model_executor.models.gemma4 import Gemma4Attention, Gemma4MLP
 from vllm.model_executor.models.gemma4_mm import (
     _SUPPORTED_SOFT_TOKENS,
     Gemma4DummyInputsBuilder,
@@ -170,6 +171,24 @@ class _RBLNGemma4VisionEncoder(nn.Module):
         if tower.config.standardize:
             pooled = (pooled - tower.std_bias.float()) * tower.std_scale.float()
         return self.embed_vision(inputs_embeds=pooled.to(dtype))
+
+
+def split_gate_up_weights(model: nn.Module) -> None:
+    """Give every Gemma4MLP its gate and up weights apart, as the patched
+    Gemma4MLP.forward reads them. Each TP rank holds [gate shard; up shard],
+    so the halves line up per rank."""
+    for mlp in model.modules():
+        if not isinstance(mlp, Gemma4MLP):
+            continue
+        if not isinstance(mlp.gate_up_proj.quant_method, UnquantizedLinearMethod):
+            raise ValueError(
+                "Gemma4 on RBLN splits the MLP gate_up weight and serves "
+                "unquantized weights only."
+            )
+        gate, up = mlp.gate_up_proj.weight.detach().chunk(2, dim=0)
+        mlp.gate_weight = nn.Parameter(gate.clone(), requires_grad=False)
+        mlp.up_weight = nn.Parameter(up.clone(), requires_grad=False)
+        del mlp.gate_up_proj.weight
 
 
 def mm_soft_token_cap(info: Gemma4ProcessingInfo) -> int:
@@ -318,7 +337,9 @@ class RBLNGemma4ForConditionalGeneration(
                 yield name, w
             assert not downs, f"no per_expert_scale for {sorted(downs)}"
 
-        return super().load_weights(fold(weights))
+        loaded = super().load_weights(fold(weights))
+        split_gate_up_weights(self)
+        return loaded
 
     def compile_mm_encoder(self, compile_fn) -> None:
         # Without an image or video limit, or off the first PP rank, upstream

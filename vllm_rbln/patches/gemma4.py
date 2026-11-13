@@ -13,8 +13,9 @@
 # limitations under the License.
 
 import torch
+import torch.nn.functional as F
 from vllm.config import VllmConfig
-from vllm.model_executor.models.gemma4 import Gemma4DecoderLayer
+from vllm.model_executor.models.gemma4 import Gemma4DecoderLayer, Gemma4MLP
 
 from vllm_rbln.patches import register_patch
 from vllm_rbln.patches.registry import add_registration
@@ -104,3 +105,18 @@ def register_gemma4() -> None:
         "Gemma4ForConditionalGeneration",
         "vllm_rbln.model_executor.models.gemma4:RBLNGemma4ForConditionalGeneration",
     )
+
+
+@register_patch(
+    target="vllm.model_executor.models.gemma4.Gemma4MLP.forward",
+    reason=(
+        "Upstream halves one merged gate_up matmul; separate gate and up "
+        "matmuls compile better on RBLN. RBLNGemma4 splits the weight at load "
+        "(split_gate_up_weights) and this forward runs the two halves."
+    ),
+)
+def split_gate_up_mlp_forward(self: Gemma4MLP, x: torch.Tensor) -> torch.Tensor:
+    gate = F.linear(x, self.gate_weight)
+    up = F.linear(x, self.up_weight)
+    x, _ = self.down_proj(F.gelu(gate, approximate=self.act_fn.approximate) * up)
+    return x

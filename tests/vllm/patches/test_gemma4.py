@@ -88,3 +88,30 @@ def test_the_moe_block_routes_the_runner_on_the_residual():
 
     # The residual after attention is 2x; the experts' input (6x) is ignored.
     torch.testing.assert_close(seen["logits"], hidden_states * 2 + 100)
+
+
+def test_the_split_mlp_matches_the_merged_one():
+    import torch
+    from torch import nn
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+    from vllm.model_executor.models.gemma4 import Gemma4MLP
+
+    from vllm_rbln.model_executor.models.gemma4 import split_gate_up_weights
+    from vllm_rbln.patches.gemma4 import split_gate_up_mlp_forward
+
+    torch.manual_seed(0)
+    mlp = Gemma4MLP.__new__(Gemma4MLP)
+    nn.Module.__init__(mlp)
+    mlp.gate_up_proj = nn.Module()
+    mlp.gate_up_proj.weight = nn.Parameter(torch.randn(2 * 8, 4))
+    mlp.gate_up_proj.quant_method = UnquantizedLinearMethod()
+    mlp.act_fn = SimpleNamespace(approximate="tanh")
+    mlp.down_proj = lambda x: (x.sum(-1, keepdim=True), None)
+    x = torch.randn(3, 4)
+    gate, up = (x @ mlp.gate_up_proj.weight.T).chunk(2, dim=-1)
+    merged = (nn.functional.gelu(gate, approximate="tanh") * up).sum(-1, keepdim=True)
+
+    split_gate_up_weights(mlp)
+
+    torch.testing.assert_close(split_gate_up_mlp_forward(mlp, x), merged)
+    assert not hasattr(mlp.gate_up_proj, "weight")
