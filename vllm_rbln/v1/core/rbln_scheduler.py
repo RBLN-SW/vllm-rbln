@@ -119,14 +119,16 @@ class RBLNScheduler(Scheduler):
 
         rbln_config: RBLNConfig = self.vllm_config.additional_config
 
+        prefill_chunk_sizes = rbln_config.prefill_chunk_size
+        assert prefill_chunk_sizes is not None  # resolved at start-up
+
         # Replace the upstream KVCacheManager with RBLNKVCacheManager
         # when sub-block prefix caching is enabled.
-        assert rbln_config.prefill_chunk_size is not None  # resolved at start-up
         sub_block_size = sub_block_size_in_use(
             enable_prefix_caching=self.cache_config.enable_prefix_caching,
             sub_block_cache=rbln_config.enable_sub_block_cache,
             block_size=self.block_size,
-            prefill_chunk_size=rbln_config.prefill_chunk_size,
+            prefill_chunk_sizes=prefill_chunk_sizes,
             kv_cache_config=self.kv_cache_config,
             sub_block_size=rbln_config.sub_block_size,
         )
@@ -162,6 +164,15 @@ class RBLNScheduler(Scheduler):
                     "sub_block_size=%d.",
                     sub_block_size,
                 )
+        elif (
+            self.cache_config.enable_prefix_caching
+            and rbln_config.enable_sub_block_cache
+        ):
+            logger.warning(
+                "Sub-block prefix caching off: block_size=%d, prefill_chunk_size=%s",
+                self.block_size,
+                prefill_chunk_sizes,
+            )
 
         # NOTE(RBLN): Block deltas already committed in the KV cache manager
         # but not yet delivered to the model runner because the request was
@@ -178,7 +189,7 @@ class RBLNScheduler(Scheduler):
         self._pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
         self._strict_kv_producer = is_strict_kv_producer(self.vllm_config)
 
-        self._prefill_chunk_size = rbln_config.prefill_chunk_size
+        self._prefill_chunk_size = rbln_config.max_prefill_chunk_size
 
         # NOTE(RBLN): the sparse-attention ops (DSA MLA / indexer, MiniMax-M3
         # MSA / indexer, GLM5 MLA / indexer) get NULL_BLOCK_ID as null_block_id
@@ -384,7 +395,9 @@ class RBLNScheduler(Scheduler):
                     request.num_computed_tokens,
                     num_new_tokens,
                     encoder_compute_budget,
-                    shift_computed_tokens=1 if self.use_eagle else 0,
+                    # NOTE(RBLN): the drafter takes no mm embeddings, so EAGLE needs
+                    # no shifted encoder window.
+                    shift_computed_tokens=0,
                 )
 
             if self.need_mamba_block_aligned_split:
@@ -785,7 +798,9 @@ class RBLNScheduler(Scheduler):
                             num_computed_tokens,
                             num_new_tokens,
                             encoder_compute_budget,
-                            shift_computed_tokens=1 if self.use_eagle else 0,
+                            # NOTE(RBLN): the drafter takes no mm
+                            # embeddings, so EAGLE needs no shifted encoder window.
+                            shift_computed_tokens=0,
                         )
                         if num_new_tokens == 0:
                             # The request cannot be scheduled.
@@ -1249,6 +1264,18 @@ class RBLNScheduler(Scheduler):
         return not connector.ensure_cache_available(
             request, num_computed_tokens, local_cache_hashes=local_cache_hashes
         )
+
+    def _free_encoder_inputs(self, request: Request) -> None:
+        # NOTE(RBLN): upstream defers the free by the drafter's look-ahead, but
+        # the RBLN drafter reads no mm embeddings.
+        if self.is_encoder_decoder:
+            super()._free_encoder_inputs(request)
+            return
+        num_computed = request.num_computed_tokens - request.num_output_placeholders
+        for input_id in list(self.encoder_cache_manager.get_cached_input_ids(request)):
+            pos = request.mm_features[input_id].mm_position
+            if pos.offset + pos.length <= num_computed:
+                self._free_encoder_input(request, input_id)
 
     def _try_schedule_encoder_inputs(
         self,
