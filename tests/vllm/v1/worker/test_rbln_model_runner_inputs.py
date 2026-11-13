@@ -645,7 +645,7 @@ def test_a_producer_stages_its_last_prompt_token_as_a_prefill(
     assert staged["input_ids"][0, 0].item() == 3
     assert staged["positions"][0, 0].item() == 2
     if prefill:
-        assert staged["input_ids"].shape == (1, runner.prefill_chunk_size)
+        assert staged["input_ids"].shape == (1, runner.prefill_chunk_sizes[0])
         assert staged["token_indices"].tolist() == [0]
     else:
         assert staged["input_ids"].shape[1] == 1

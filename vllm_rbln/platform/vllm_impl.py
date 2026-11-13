@@ -117,12 +117,11 @@ def _validate(vllm_config: "VllmConfig") -> None:
         raise ValueError("LoRA is not supported on RBLN.")
 
     if _uses_gated_delta_net(model_config):
-        if scheduler_config.max_num_batched_tokens % 128:
+        if rbln_config.use_custom_kernel:
             raise ValueError(
-                "The RBLN GatedDeltaNet prefill kernel runs in 128-token chunks; "
-                f"got max_num_batched_tokens="
-                f"{scheduler_config.max_num_batched_tokens}. "
-                "Set --max-num-batched-tokens to a multiple of 128."
+                "GatedDeltaNet models do not take --rbln-use-custom-kernel on the "
+                "RBLN vLLM path yet: its attention kernels read the KV cache in "
+                "another layout than the state, which shares that cache's blocks."
             )
         if (
             vllm_config.cache_config.user_specified_mamba_block_size
@@ -272,16 +271,31 @@ def _validate(vllm_config: "VllmConfig") -> None:
             "Set --block-size within this range."
         )
 
-    chunk = rbln_config.prefill_chunk_size
-    if chunk is not None and chunk > max_num_batched_tokens:
+    chunks = rbln_config.prefill_chunk_size or [max_num_batched_tokens]
+    if max(chunks) > max_num_batched_tokens:
         raise ValueError(
-            f"--rbln-prefill-chunk-size={chunk} exceeds {max_num_batched_tokens=}."
+            f"prefill_chunk_size={chunks} exceeds {max_num_batched_tokens=}."
         )
-    # TODO(RBLN): DP ranks agree on max_num_batched_tokens as the prefill token
-    # dimension (dp_utils), and the RBLN NIXL connector's resume trim takes it
-    # as the prefill chunk. Lifting a refusal means pointing that feature's
-    # sites at prefill_chunk_size; #1372 lists them.
-    if chunk is not None and chunk < max_num_batched_tokens:
+
+    max_num_scheduled_tokens = scheduler_config.max_num_scheduled_tokens
+    if (
+        max_num_scheduled_tokens is not None
+        and chunks != [max_num_batched_tokens]
+        and max(chunks) > max_num_scheduled_tokens
+    ):
+        raise ValueError(
+            f"prefill_chunk_size={chunks} exceeds {max_num_scheduled_tokens=}."
+        )
+    if _uses_gated_delta_net(model_config) and any(chunk % 128 for chunk in chunks):
+        raise ValueError(
+            "The RBLN GatedDeltaNet prefill kernel runs in 128-token chunks; got "
+            f"prefill_chunk_size={chunks}. Each has to be a multiple of 128 "
+            "(--rbln-prefill-chunk-size, or --max-num-batched-tokens without it)."
+        )
+    # TODO(RBLN): The RBLN NIXL connector's resume trim takes
+    # max_num_batched_tokens as the prefill chunk. Lifting the refusal means
+    # pointing its sites at prefill_chunk_size; #1372 lists them.
+    if min(chunks) < max_num_batched_tokens:
         kv_transfer = vllm_config.kv_transfer_config
         connectors = [] if kv_transfer is None else [kv_transfer.kv_connector]
         if connectors == ["MultiConnector"]:
@@ -290,7 +304,6 @@ def _validate(vllm_config: "VllmConfig") -> None:
         unsupported = [
             name
             for name, on in (
-                ("data parallelism", parallel_config.data_parallel_size > 1),
                 (
                     "RBLN NIXL KV transfer",
                     any(
@@ -303,17 +316,22 @@ def _validate(vllm_config: "VllmConfig") -> None:
                         for name in connectors
                     ),
                 ),
+                # The non-causal prefill mask is built at the longest chunk.
+                (
+                    "non-causal attention",
+                    len(chunks) > 1 and vllm_config.attention_config.use_non_causal,
+                ),
             )
             if on
         ]
         if unsupported:
             raise ValueError(
-                f"--rbln-prefill-chunk-size={chunk} below {max_num_batched_tokens=} "
+                f"prefill_chunk_size={chunks} below {max_num_batched_tokens=} "
                 f"is not supported with {', '.join(unsupported)} on RBLN yet."
             )
     # Resolved here so the scheduler and runner read one value, and compute_hash,
     # which runs after this, keys "unset" and "set to the budget" alike.
-    rbln_config.prefill_chunk_size = chunk or max_num_batched_tokens
+    rbln_config.prefill_chunk_size = chunks
 
     if envs.VLLM_RBLN_COMPILE_ONLY and envs.VLLM_DISABLE_COMPILE_CACHE:
         # Compile-only compiles each graph and writes the .rbln artifact to

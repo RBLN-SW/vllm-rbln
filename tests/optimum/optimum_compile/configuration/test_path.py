@@ -14,7 +14,7 @@
 
 import json
 
-from vllm_rbln.utils.optimum.configuration.readers import (
+from vllm_rbln.utils.optimum.configuration.rbln_config import (
     load_compiled_rbln_config,
 )
 from vllm_rbln.utils.optimum.path import resolve_compiled_model_path

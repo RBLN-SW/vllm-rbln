@@ -2137,3 +2137,27 @@ class TestEcConsumerEncodesNothing:
 
         assert out.scheduled_encoder_inputs == {"0": [0]}
         assert request.status == RequestStatus.RUNNING
+
+
+def test_eagle_steps_through_adjacent_images_with_a_one_image_encoder_cache():
+    """The drafter's look-ahead shifted the encoder window into the second image
+    and deferred freeing the first, so with a cache that holds one image the
+    request scheduled zero tokens forever."""
+    sched = create_rbln_scheduler(
+        max_num_seqs=4, max_num_batched_tokens=8, max_model_len=64
+    )
+    # ngram is what the helper builds without a draft model; these are what
+    # EAGLE sets.
+    sched.use_eagle = True
+    sched.num_prefill_lookahead = 1
+    sched.max_num_encoder_input_tokens = 4
+    sched.encoder_cache_manager = EncoderCacheManager(cache_size=4)
+    request = make_request(
+        "0", list(range(16)), 16, mm_features=[image_at(4, 4), image_at(8, 4)]
+    )
+    sched.add_request(request)
+
+    for _ in range(2):
+        out = sched.schedule()
+        assert out.num_scheduled_tokens == {"0": 8}
+        sched.update_from_output(out, make_model_runner_output(out))
