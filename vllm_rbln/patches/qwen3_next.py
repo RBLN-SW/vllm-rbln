@@ -93,15 +93,6 @@ class RBLNGDNConvRingCache(nn.Module, AttentionLayerBase):
 
 
 @register_patch(
-    target="vllm.model_executor.models.qwen3_next.QwenGatedDeltaNetAttention",
-    key=f"{__name__}.RBLNQwenGatedDeltaNetAttention.qwen3_next",
-    reason=(
-        "Qwen3-Next builds its GatedDeltaNet layer from this module's name; the "
-        "RBLN layer declares the delta-rule state as a full-attention KV block and "
-        "runs the conv and the delta rule as RBLN custom kernels."
-    ),
-)
-@register_patch(
     target="vllm.model_executor.models.qwen3_5.QwenGatedDeltaNetAttention",
     reason=(
         "Upstream's GatedDeltaNet layer declares a conv + ssm state page its "

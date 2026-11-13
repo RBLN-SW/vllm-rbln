@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""GatedDeltaNet (Qwen3-Next, Qwen3.5 `linear_attention`) state on RBLN.
+"""GatedDeltaNet (Qwen3.5 `linear_attention`) state on RBLN.
 
 A layer's `MambaSpec` describes a full-attention KV page, including unused
 capacity. The runner binds that shape so sharing layers use one graph input
