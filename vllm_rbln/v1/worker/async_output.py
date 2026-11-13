@@ -37,6 +37,7 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
         fail_fast: bool,
         rank: int | None = None,
         dp_rank: int | None = None,
+        device_input_ids: torch.Tensor | None = None,
     ):
         self.fail_fast = fail_fast
         # Named in the fatal event when get_output() fails on the output thread.
@@ -50,6 +51,8 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
         # Keep a reference to the device tensor to avoid it being
         # deallocated until we finish copying it to the host.
         self._sampled_token_ids: torch.Tensor | None = sampled_token_ids
+        # Aliased feedback belongs to this forward's completion, not its producer's.
+        self._device_input_ids = device_input_ids
         # Start the D2H right behind the sampler, as AsyncGPUModelRunnerOutput
         # does. From get_output() it would queue behind the next forward.
         self._copy_ready_event: torch.Event | None = None
@@ -76,6 +79,7 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
             self._copy_ready_event.synchronize()
         # Output handling may retain this object after D2H completes.
         self._sampled_token_ids = None
+        self._device_input_ids = None
         return self._sampled_token_ids_cpu
 
     @worker_fail_fast

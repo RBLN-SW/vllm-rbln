@@ -826,6 +826,24 @@ class TestStage:
             assert staged.device.type == current_platform.device_type, name
             assert torch.equal(staged.cpu(), tensor), name
 
+    @pytest.mark.parametrize("field", ["seq_lens", "mm_prefix_row_ends"])
+    def test_alternating_slots_preserve_inflight_metadata(self, cfg, field):
+        builder = make_builder(cfg)
+        first, second, third = (
+            _metadata(mm_prefix_row_ends=torch.ones(1, 1, dtype=torch.int32))
+            for _ in range(3)
+        )
+        getattr(first, field).fill_(3)
+        getattr(second, field).fill_(4)
+        getattr(third, field).fill_(5)
+        builder.stage(first, buffer_index=0)
+        builder.stage(second, buffer_index=1)
+        assert getattr(first, field).tolist() == [[3]]
+        assert getattr(second, field).tolist() == [[4]]
+        builder.stage(third, buffer_index=0)
+        assert getattr(third, field) is getattr(first, field)
+        assert getattr(second, field).tolist() == [[4]]
+
     def test_none_passthrough(self, cfg):
         # None in -> None out; there is nothing to stage.
         assert make_builder(cfg)._stage(None, "x") is None
