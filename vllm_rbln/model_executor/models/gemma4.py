@@ -173,11 +173,13 @@ class _RBLNGemma4VisionEncoder(nn.Module):
         return self.embed_vision(inputs_embeds=pooled.to(dtype))
 
 
-def split_gate_up_weights(model: nn.Module) -> None:
+def split_gate_up_weights(model: nn.Module) -> set[str]:
     """Give every Gemma4MLP its gate and up weights apart, as the patched
-    Gemma4MLP.forward reads them. Each TP rank holds [gate shard; up shard],
-    so the halves line up per rank."""
-    for mlp in model.modules():
+    Gemma4MLP.forward reads them, and return their names for the loader's
+    check. Each TP rank holds [gate shard; up shard], so the halves line up
+    per rank."""
+    names = set()
+    for prefix, mlp in model.named_modules():
         if not isinstance(mlp, Gemma4MLP):
             continue
         if not isinstance(mlp.gate_up_proj.quant_method, UnquantizedLinearMethod):
@@ -189,6 +191,10 @@ def split_gate_up_weights(model: nn.Module) -> None:
         mlp.gate_weight = nn.Parameter(gate.clone(), requires_grad=False)
         mlp.up_weight = nn.Parameter(up.clone(), requires_grad=False)
         del mlp.gate_up_proj.weight
+        names |= {
+            f"{prefix}.{name}".lstrip(".") for name in ("gate_weight", "up_weight")
+        }
+    return names
 
 
 def mm_soft_token_cap(info: Gemma4ProcessingInfo) -> int:
@@ -337,9 +343,7 @@ class RBLNGemma4ForConditionalGeneration(
                 yield name, w
             assert not downs, f"no per_expert_scale for {sorted(downs)}"
 
-        loaded = super().load_weights(fold(weights))
-        split_gate_up_weights(self)
-        return loaded
+        return super().load_weights(fold(weights)) | split_gate_up_weights(self)
 
     def compile_mm_encoder(self, compile_fn) -> None:
         # Without an image or video limit, or off the first PP rank, upstream

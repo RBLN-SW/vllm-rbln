@@ -111,7 +111,7 @@ def test_the_split_mlp_matches_the_merged_one():
     gate, up = (x @ mlp.gate_up_proj.weight.T).chunk(2, dim=-1)
     merged = (nn.functional.gelu(gate, approximate="tanh") * up).sum(-1, keepdim=True)
 
-    split_gate_up_weights(mlp)
+    assert split_gate_up_weights(mlp) == {"gate_weight", "up_weight"}
 
     torch.testing.assert_close(split_gate_up_mlp_forward(mlp, x), merged)
     assert not hasattr(mlp.gate_up_proj, "weight")
