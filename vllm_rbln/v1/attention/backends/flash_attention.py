@@ -267,6 +267,7 @@ class RBLNFlashAttentionMetadataBuilder(
         is_prompt_sorted: bool = False,
         num_accepted: torch.Tensor | None = None,
         state_load_pos: torch.Tensor | None = None,
+        query_len_padded: int | None = None,
     ) -> RBLNFlashAttentionMetadata:
         num_reqs = common_attn_metadata.num_reqs
         # NOTE(RBLN): vllm-rbln keeps attention metadata on the host and copies

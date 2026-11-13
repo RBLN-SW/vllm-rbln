@@ -38,7 +38,6 @@ from vllm.v1.attention.backends.registry import (
 from vllm.v1.attention.backends.utils import mamba_get_block_table_tensor
 
 import vllm_rbln.utils as rbln_utils
-from vllm_rbln.config import RBLNConfig
 from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadataBuilder,
 )
@@ -133,6 +132,7 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
         is_prompt_sorted: bool = False,
         num_accepted: torch.Tensor | None = None,
         state_load_pos: torch.Tensor | None = None,
+        query_len_padded: int | None = None,
     ) -> RBLNGDNAttentionMetadata:
         """The draft rows are refused with speculative decoding."""
         assert num_accepted is None and state_load_pos is None, (
@@ -147,14 +147,10 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
 
         if is_prefill:
             assert num_reqs == 1, "RBLN prefills one request per step"
+            # The prefill chunk the runner pads this step to.
+            assert query_len_padded is not None
+            batch, seq_len = 1, query_len_padded
             num_prefills, num_prefill_tokens, num_decodes = 1, int(query_lens[0]), 0
-            # The runner pads a prefill step to the shortest chunk that holds it.
-            rbln_config: RBLNConfig = self.vllm_config.additional_config
-            assert rbln_config.prefill_chunk_size is not None  # resolved at start-up
-            batch = 1
-            seq_len = min(
-                c for c in rbln_config.prefill_chunk_size if c >= num_prefill_tokens
-            )
         else:
             batch, seq_len = batch_pad, 1
             assert int(query_lens.max()) == 1, (

@@ -173,7 +173,9 @@ def _run(
     pad,
     shared_binding,
 ):
-    metadata = builder.build(common, positions, pad, is_prefill)
+    metadata = builder.build(
+        common, positions, pad, is_prefill, query_len_padded=hidden.shape[1]
+    )
     bases = [state] if shared_binding else []
     infos = (
         [KVCacheViewInfo(base_index=0, view_shape=tuple(state.shape))]
@@ -201,24 +203,23 @@ def _ssm_state(state: torch.Tensor) -> torch.Tensor:
 @pytest.mark.parametrize("block_size", [256, 1024])
 @pytest.mark.parametrize("shared_binding", [False, True])
 @pytest.mark.parametrize(
-    "chunk_sizes, steps",
+    "steps",
     [
         # (valid tokens, the prefill window they are padded to) a step
-        ([128], [(70, 128), (58, 128)]),
-        # The long step takes the long window, the rest of the prompt the short.
-        ([128, 256], [(200, 256), (58, 128)]),
+        [(70, 128), (58, 128)],
+        # A long step in the long window, the rest of the prompt in the short.
+        [(200, 256), (58, 128)],
     ],
 )
 def test_padded_prefill_then_decode_tracks_hf(
-    monkeypatch, block_size, shared_binding, chunk_sizes, steps
+    monkeypatch, block_size, shared_binding, steps
 ):
     vllm_config = make_vllm_config(
         model="JackFram/llama-68m",
         max_model_len=2048,
-        max_num_batched_tokens=max(chunk_sizes),
+        max_num_batched_tokens=max(window for _, window in steps),
         max_num_seqs=2,
         dtype="float32",
-        additional_config={"prefill_chunk_size": chunk_sizes},
     )
     layer = _layer()
     # The state cache and the ring beside it, as the runner allocates them.

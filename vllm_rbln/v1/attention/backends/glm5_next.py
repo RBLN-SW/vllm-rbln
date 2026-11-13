@@ -95,6 +95,7 @@ class RBLNGlm5NextMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
         is_prompt_sorted: bool = False,
         num_accepted: torch.Tensor | None = None,
         state_load_pos: torch.Tensor | None = None,
+        query_len_padded: int | None = None,
     ) -> RBLNFlashAttentionMetadata:
         metadata = super().build(
             common_attn_metadata,
