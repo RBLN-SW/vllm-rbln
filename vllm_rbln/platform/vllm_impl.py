@@ -92,10 +92,10 @@ def validate_request(params: "SamplingParams | PoolingParams") -> None:
 
 
 def _uses_gated_delta_net(model_config) -> bool:
-    """A GatedDeltaNet model (Qwen3-Next, Qwen3.5) by its HF text model type.
-    GLM-5.3's KDA layers share the `linear_attention` layer type and stay out."""
+    """A GatedDeltaNet model (Qwen3.5) by its HF text model type. GLM-5.3's KDA
+    layers share the `linear_attention` layer type and stay out."""
     text_config = getattr(model_config, "hf_text_config", model_config.hf_config)
-    return getattr(text_config, "model_type", None) in ("qwen3_next", "qwen3_5_text")
+    return getattr(text_config, "model_type", None) == "qwen3_5_text"
 
 
 def _uses_model_parallel(parallel_config) -> bool:
@@ -194,6 +194,12 @@ def _validate(vllm_config: "VllmConfig") -> None:
         )
 
     text_config = getattr(model_config, "hf_text_config", model_config.hf_config)
+    if getattr(text_config, "model_type", None) == "qwen3_next":
+        raise ValueError(
+            "Qwen3-Next is not supported on the RBLN vLLM path yet: its "
+            "GatedDeltaNet projections are interleaved by key head, a layout the "
+            "RBLN layer does not read."
+        )
     if (
         getattr(text_config, "sparse_attention_config", None)
         and model_config.dtype != torch.bfloat16

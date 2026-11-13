@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""GatedDeltaNet (Qwen3-Next, Qwen3.5 `linear_attention`) state on RBLN.
+"""GatedDeltaNet (Qwen3.5 `linear_attention`) state on RBLN.
 
 A layer's recurrent state is a `MambaSpec` block of the pool the attention
 layers schedule on, declared as the full-attention KV block it fills (the

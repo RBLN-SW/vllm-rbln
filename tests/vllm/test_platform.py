@@ -630,8 +630,15 @@ class TestRejectedConfigs:
             return SimpleNamespace(hf_config=SimpleNamespace(model_type=model_type))
 
         assert _uses_gated_delta_net(config("qwen3_5_text"))
-        assert _uses_gated_delta_net(config("qwen3_next"))
+        assert not _uses_gated_delta_net(config("qwen3_next"))
         assert not _uses_gated_delta_net(config("glm5_next_text"))
+
+    def test_qwen3_next_is_refused(self, reconfigure):
+        def qwen3_next(config):
+            config.model_config.hf_text_config.model_type = "qwen3_next"
+
+        with pytest.raises(ValueError, match="Qwen3-Next"):
+            reconfigure(qwen3_next)
 
     def test_gdn_models_need_128_token_prefill_chunks(self, reconfigure, gdn):
         def chunk_of_192(config):
