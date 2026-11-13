@@ -1,11 +1,11 @@
 # Copyright 2026 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -16,7 +16,7 @@
 The reranker reuses the *generation* graph so it can read the score off two
 vocabulary logits. These tests cover the parts that do not need an NPU:
 
-  * the HF arch is remapped to ``Qwen3ForCausalLM``, so the compile spec and
+  * the HF arch is remapped to ``Qwen3ForCausalLM``, so the compile config and
     optimum-rbln class match the generative path and share its artifact,
   * ``classifier_from_token`` resolves to the right vocabulary ids,
   * inputs are **left** padded, which the generation graph requires,
@@ -43,7 +43,9 @@ from vllm_rbln.model_executor.models.optimum.qwen3_reranker import (
     RBLNQwen3RerankerPooler,
     resolve_label_token_ids,
 )
-from vllm_rbln.utils.optimum.converter.common import is_chunked_prefill_arch
+from vllm_rbln.utils.optimum.configuration.runtime_config import (
+    is_chunked_prefill_arch,
+)
 from vllm_rbln.utils.optimum.predicates import is_qwen3_embedding, is_qwen3_reranker
 from vllm_rbln.utils.optimum.registry import (
     get_rbln_model_info,

@@ -2,7 +2,7 @@
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# You may obtain a copy of the License at:
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 #
@@ -63,6 +63,12 @@ class RBLNDFlashProposer(DFlashProposer):
     # Read by `_determine_batch_execution_and_padding`. `_require_dense_drafter`
     # is what keeps it false.
     draft_has_moe = False
+
+    # Read by the KV estimate. A producer's warm-up still runs the
+    # decode-shaped query pass: it is the only warm-up pass that binds the
+    # draft's KV, and the connector cannot register what has no device memory
+    # behind it.
+    warms_up_decode_graphs_on_a_producer = True
 
     @staticmethod
     def _require_dense_drafter(draft_model) -> None:
@@ -167,6 +173,16 @@ class RBLNDFlashProposer(DFlashProposer):
             num_context,
             valid_ctx_lens,
         )
+
+        if self.runner.is_strict_kv_producer:
+            # The context write above is what the consumer's drafter reads; the
+            # drafts this pass would build are verified by nobody here.
+            return torch.zeros(
+                num_reqs,
+                self.num_speculative_tokens,
+                device=self.device,
+                dtype=torch.int64,
+            )
 
         draft_ids = self._run_query_pass(
             common_attn_metadata,

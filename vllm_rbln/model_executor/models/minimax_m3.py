@@ -2,7 +2,7 @@
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# You may obtain a copy of the License at:
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 #
@@ -102,6 +102,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
 )
 
+import vllm_rbln.utils as rbln_utils
 from vllm_rbln.model_executor.models.interfaces import SupportsRBLNMultiModal
 from vllm_rbln.patches.attention import _resolve_kv_cache
 from vllm_rbln.v1.attention.backends.flash_attention import _fp8_cache_dtype
@@ -1403,12 +1404,12 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         for start in range(0, t, frames):
             seg_t = min(frames, t - start)
             seg_pixels = pixel_values[start * h * w : (start + seg_t) * h * w]
-            embeds = self._mm_encoder(
-                *self._encoder_inputs(seg_pixels, [seg_t, h, w], modality)
-            )
             segments.append(
-                embeds[: seg_t * h * w // (merge * merge)].to(
-                    device="cpu", dtype=self.mm_embeds_dtype
+                rbln_utils.run_mm_encoder(
+                    self._mm_encoder,
+                    self._encoder_inputs(seg_pixels, [seg_t, h, w], modality),
+                    seg_t * h * w // (merge * merge),
+                    dtype=self.mm_embeds_dtype,
                 )
             )
         return segments[0] if len(segments) == 1 else torch.cat(segments)

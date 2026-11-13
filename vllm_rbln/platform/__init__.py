@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -21,6 +21,9 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.config.logging import LoggingConfig
+    from vllm.inputs import EngineInput
+    from vllm.pooling_params import PoolingParams
+    from vllm.sampling_params import SamplingParams
     from vllm.utils.argparse_utils import FlexibleArgumentParser
     from vllm.v1.attention.selector import AttentionSelectorConfig
 
@@ -288,7 +291,7 @@ class RblnPlatform(Platform):
                 # The prefill chunk size that path compiles is
                 # `--max-num-batched-tokens` as the user gave it, and the call
                 # below replaces an unset one with a default, leaving
-                # `sync_from_vllm` no way to tell the two apart. Nothing else
+                # `prepare_compile_config` no way to tell the two apart. Nothing else
                 # writes additional_config now, so an unset one starts here.
                 if config is None:
                     config = self.additional_config = {}
@@ -392,6 +395,14 @@ class RblnPlatform(Platform):
                 "executor backend; use 'mp' for supported multi-worker execution.",
                 parallel_config.distributed_executor_backend,
             )
+
+    @classmethod
+    def validate_request(
+        cls,
+        processed_inputs: "EngineInput",
+        params: "SamplingParams | PoolingParams",
+    ) -> None:
+        _impl().validate_request(params)
 
     @classmethod
     def register_custom_kv_cache_specs(cls, vllm_config: "VllmConfig") -> None:
