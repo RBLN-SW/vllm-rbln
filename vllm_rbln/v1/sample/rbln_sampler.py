@@ -101,6 +101,15 @@ def rbln_greedy_sample(logits: torch.Tensor) -> torch.Tensor:
     return torch.ops.rbln.argmax(logits)
 
 
+def _as_batch_tensor(t: torch.Tensor | None) -> torch.Tensor | None:
+    # Dynamo guards on the dispatch key set. Batch-owned tensors carry
+    # ADInplaceOrView and step-made inference tensors do not, so copy the latter.
+    if t is None or not t.is_inference():
+        return t
+    with torch.inference_mode(False):
+        return t.clone()
+
+
 FusedGraphKind = Literal["penalize", "greedy", "top_k_top_p"]
 
 
@@ -354,7 +363,12 @@ class RBLNSampler(VLLMSampler):
         )
         if penalty is not None:
             out = self._fused_graph("top_k_top_p", penalty)(
-                logits, penalty.cidx, penalty.lanes, temperature, k, p
+                logits,
+                penalty.cidx,
+                penalty.lanes,
+                _as_batch_tensor(temperature),
+                _as_batch_tensor(k),
+                _as_batch_tensor(p),
             )
             if staging_owner is not None:
                 out = _stage_into(staging_owner, out)

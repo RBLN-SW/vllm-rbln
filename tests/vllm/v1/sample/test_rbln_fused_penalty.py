@@ -297,6 +297,31 @@ def test_min_p_reads_penalized_logits():
     assert fused.tolist() == dense.tolist() == [555, 555]
 
 
+@pytest.mark.use_device
+def test_mixed_batch_reuses_the_warmed_fused_graph():
+    """A mixed batch builds temperature, top_k and top_p as step tensors. The
+    fused graph warmed on batch buffers must take them without recompiling."""
+    device = current_platform.device_type
+    rand = SamplingParams(
+        temperature=0.8, top_k=30, top_p=0.99, repetition_penalty=1.05
+    )
+    greedy = SamplingParams(temperature=0.0, repetition_penalty=1.05)
+    kw = dict(device=device, prompt_token_ids=[11, 4000], output_token_ids=[77])
+    warm = build_input_batch([(str(i), rand) for i in range(4)], **kw)
+    mixed = build_input_batch(
+        [(str(i), p) for i, p in enumerate([rand, greedy, rand, greedy])], **kw
+    )
+    sampler = RBLNSampler(fused_sampling=True)
+    logits = _logits(4).to(device)
+    graphs = torch._dynamo.utils.counters["stats"]
+    with torch.inference_mode():
+        sampler(logits.clone(), warm.sampling_metadata, input_batch=warm)
+        before = graphs["unique_graphs"]
+        sampler(logits.clone(), mixed.sampling_metadata, input_batch=mixed)
+    assert {key[0] for key in sampler._fused_graphs} == {"top_k_top_p"}
+    assert graphs["unique_graphs"] == before
+
+
 # The weighted row: WEIGHTED[i] weighs i + 1. The heaviest tokens are the ones the
 # prompt and output repeat, so penalties and bias reshape the distribution.
 WEIGHTED = evenly_spaced_token_ids(num_ids=32).tolist()
