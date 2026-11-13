@@ -36,6 +36,7 @@ import torch
 from vllm.v1.attention.backend import AttentionBackend, MultipleOf
 
 from .flash_attention import RBLNFlashAttentionMetadataBuilder
+from .glm5_next import RBLNGlm5NextMetadataBuilder
 
 # The packed KV8 row: 448 fp8 nope | 64 pad | 64 f16 scale lanes | 64 bf16 rope.
 DSV4_KV8_ROW_BYTES = 768
@@ -63,7 +64,9 @@ class _RBLNDeepseekV4CacheBackend(AttentionBackend):
 
     @staticmethod
     def get_builder_cls() -> type["RBLNFlashAttentionMetadataBuilder"]:
-        return RBLNFlashAttentionMetadataBuilder
+        # GLM-5.3's builder: cache_seq_lens / cache_offsets for every cache, and a MambaSpec
+        # cache's (the rings') load / store blocks
+        return RBLNGlm5NextMetadataBuilder
 
     @classmethod
     def get_kv_cache_shape(
@@ -88,11 +91,8 @@ class _RBLNDeepseekV4CacheBackend(AttentionBackend):
 
 
 class RBLNDeepseekV4RingBackend(_RBLNDeepseekV4CacheBackend):
-    """SWA ring and compressor state: one ``[window, width]`` slot per request.
-
-    The ring is declared as an ``RBLNSlidingWindowSpec`` of ``head_size = width / 2`` (the spec
-    budgets K + V), so a page is one ``width``-wide row per position.
-    """
+    """SWA ring and compressor state: a ``MambaSpec`` state of one ``[window, width]`` ring a
+    request (the runner shapes it from the spec); the slot is the state's block id."""
 
     @staticmethod
     def get_name() -> str:

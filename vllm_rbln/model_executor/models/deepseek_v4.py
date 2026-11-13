@@ -83,7 +83,7 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.models.deepseek_v4.nvidia.model import _make_deepseek_v4_weights_mapper
 from vllm.sequence import IntermediateTensors
-from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
+from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec, MLAAttentionSpec
 
 from vllm_rbln.logger import init_logger
 from vllm_rbln.patches.attention import _resolve_kv_cache
@@ -93,7 +93,7 @@ from vllm_rbln.v1.attention.backends.deepseek_v4 import (
     RBLNDeepseekV4RingBackend,
     dsv4_paged_backend,
 )
-from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
+from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
 
 logger = init_logger(__name__)
 
@@ -154,8 +154,8 @@ def _metadata(prefix: str):
 class RBLNDeepseekV4RingCache(nn.Module, AttentionLayerBase):
     """A per-request ring: ``[slot, window, width]`` (the SWA ring or a compressor state).
 
-    ``RBLNSlidingWindowSpec`` budgets K + V, so it is declared with half the row width and
-    the backend reshapes the page to one ``width``-wide row per position.
+    A ``MambaSpec`` state (one block a request, as GLM-5.3's KDA states): the slot a step
+    reads / writes is the state's block id (the metadata's load / store blocks).
     """
 
     def __init__(
@@ -163,7 +163,6 @@ class RBLNDeepseekV4RingCache(nn.Module, AttentionLayerBase):
         dtype: torch.dtype,
     ) -> None:
         super().__init__()
-        assert width % 2 == 0
         self.prefix = prefix
         self.window = window
         self.width = width
@@ -173,12 +172,11 @@ class RBLNDeepseekV4RingCache(nn.Module, AttentionLayerBase):
         self.layer_index = _cache_ordinal(layer_id, slot)
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        return RBLNSlidingWindowSpec(
-            block_size=self.window,
-            num_kv_heads=1,
-            head_size=self.width // 2,
-            dtype=self.dtype,
-            sliding_window=self.window,
+        return MambaSpec(
+            block_size=vllm_config.cache_config.mamba_block_size,
+            shapes=((self.window, self.width),),
+            dtypes=(self.dtype,),
+            mamba_cache_mode=vllm_config.cache_config.mamba_cache_mode,
         )
 
     def forward(self) -> None: ...
@@ -187,21 +185,31 @@ class RBLNDeepseekV4RingCache(nn.Module, AttentionLayerBase):
         return RBLNDeepseekV4RingBackend
 
 
+def _paged_block_size(vllm_config: VllmConfig, compress_ratio: int) -> int:
+    block_size = vllm_config.cache_config.block_size
+    unit = DSV4_MIN_BLOCK_ENTRIES * compress_ratio
+    if block_size % unit == 0:
+        return block_size
+    if unit % block_size == 0:
+        return unit
+    raise ValueError(
+        f"DeepSeek-V4: --block-size {block_size} and the ratio-{compress_ratio} cache's "
+        f"{unit}-token unit ({DSV4_MIN_BLOCK_ENTRIES} entries a block) do not divide"
+    )
+
+
 class RBLNDeepseekV4PagedCache(nn.Module, AttentionLayerBase):
     """A paged cache of compressed entries (``block_size / r`` a block): the compressed KV
-    (768-byte KV8 rows), the indexer key (fp8) or its scale (f16)."""
+    (768-byte KV8 rows) or the indexer key (fp8). Every paged cache is in one attention group
+    (one block table), so all take the cache config's block size."""
 
     def __init__(
         self, prefix: str, layer_id: int, slot: int, compress_ratio: int, width: int,
-        dtype: torch.dtype, blocks_per_key_block: int = 1,
+        dtype: torch.dtype,
     ) -> None:
         super().__init__()
         self.prefix = prefix
         self.compress_ratio = compress_ratio
-        # > 1 for the indexer scale cache: its block spans that many key blocks' tokens, so its
-        # page equals the key cache's and vLLM's page unification keeps the two in step (the
-        # indexer converter views it as [NB * n, E] and addresses key block b as b * n).
-        self.blocks_per_key_block = blocks_per_key_block
         self.width = width
         self.dtype = dtype
         self.kv_cache = torch.tensor([])
@@ -210,10 +218,11 @@ class RBLNDeepseekV4PagedCache(nn.Module, AttentionLayerBase):
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         # The CP kernels cut a block into 4 shards of whole 64-entry chunks: at least 256
-        # entries a block (HCA: 32768 tokens).
-        block_size = max(vllm_config.cache_config.block_size, DSV4_MIN_BLOCK_ENTRIES * self.compress_ratio)
+        # entries a block. An HCA cache (ratio 128) takes 32768-token blocks, past RBLN's
+        # --block-size cap, so it is an attention group of its own.
+        block_size = _paged_block_size(vllm_config, self.compress_ratio)
         return MLAAttentionSpec(
-            block_size=block_size * self.blocks_per_key_block,
+            block_size=block_size,
             num_kv_heads=1,
             head_size=self.width,
             dtype=self.dtype,
@@ -226,21 +235,47 @@ class RBLNDeepseekV4PagedCache(nn.Module, AttentionLayerBase):
         return dsv4_paged_backend(self.compress_ratio)
 
 
+class RBLNDeepseekV4AuxCache(nn.Module, AttentionLayerBase):
+    """A per-block cache beside a paged one (the indexer's f16 key scale, one a key row),
+    addressed by its owner's block ids (as GLM-5.3's)."""
+
+    def __init__(
+        self, prefix: str, layer_id: int, slot: int, owner: RBLNDeepseekV4PagedCache,
+        dtype: torch.dtype,
+    ) -> None:
+        super().__init__()
+        self.prefix = prefix
+        # the owner's name and ratio only (not the module: it would become a child of this one)
+        self.owner_prefix = owner.prefix
+        self.owner_ratio = owner.compress_ratio
+        self.dtype = dtype
+        self.kv_cache = torch.tensor([])
+        _register_layer(self, prefix)
+        self.layer_index = _cache_ordinal(layer_id, slot)
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> None:
+        return None
+
+    def get_aux_cache_spec(self, vllm_config: VllmConfig) -> RBLNBlockAuxSpec:
+        rows = _paged_block_size(vllm_config, self.owner_ratio) // self.owner_ratio
+        return RBLNBlockAuxSpec(self.owner_prefix, (rows,), self.dtype)
+
+    def forward(self) -> None: ...
+
+    def get_attn_backend(self):
+        return dsv4_paged_backend(self.owner_ratio)
+
+    def inputs(self) -> torch.Tensor:
+        return _resolve_kv_cache(_metadata(self.owner_prefix), self.layer_index)
+
+
 def _ring_inputs(cache: RBLNDeepseekV4RingCache) -> tuple[torch.Tensor, ...]:
-    """(ring tensor, slot [B, 1], query_len [B, 1]) of a ring cache."""
+    """(ring tensor [N, window, width], slot [B, 1], query_len [B, 1]) of a ring cache."""
     metadata = _metadata(cache.prefix)
     ring = _resolve_kv_cache(metadata, cache.layer_index)
-    # The hybrid allocator unifies page sizes by growing a smaller spec's block size, so a
-    # ring's page may hold k rings: view them as k slots and take a request's first.
-    rings_per_page = ring.numel() // (ring.shape[0] * cache.window * cache.width)
-    assert ring.numel() == ring.shape[0] * rings_per_page * cache.window * cache.width, (
-        f"{cache.prefix}: page of {ring.numel() // ring.shape[0]} elements is not whole rings "
-        f"of {cache.window} x {cache.width}"
-    )
-    ring = ring.view(ring.shape[0] * rings_per_page, cache.window, cache.width)
-    # [B, 1] like cache_offsets: a flat [B] device input only the host reads has no device
-    # consumer, and the compiler then leaves it without a per-node address (ISSUES B10).
-    slots = metadata.local_block_tables.reshape(-1, 1).to(torch.int32) * rings_per_page
+    # [B, 1]: a flat [B] device input only the host reads has no device consumer (ISSUES AR13).
+    # Without prefix caching a request's state is one block: read and written in place.
+    slots = metadata.load_blocks.reshape(-1, 1).to(torch.int32)
     query_len = metadata.cache_offsets - metadata.cache_seq_lens
     return ring, slots, query_len.to(torch.int32)
 
@@ -466,11 +501,9 @@ class RBLNDeepseekV4Indexer(nn.Module):
             f"{prefix}.k_cache.{SLOT_IDX_K}", layer_id, SLOT_IDX_K, 4, self.head_dim,
             torch.float8_e4m3fn,
         )
-        self.k_scale = RBLNDeepseekV4PagedCache(
-            f"{prefix}.k_scale.{SLOT_IDX_SCALE}", layer_id, SLOT_IDX_SCALE, 4, 1,
+        self.k_scale = RBLNDeepseekV4AuxCache(
+            f"{prefix}.k_scale.{SLOT_IDX_SCALE}", layer_id, SLOT_IDX_SCALE, self.k_cache,
             torch.float16,
-            # one f16 scale a key row of head_dim fp8 bytes: the key cache's page
-            blocks_per_key_block=self.head_dim // 2,
         )
 
     def forward(
@@ -484,9 +517,7 @@ class RBLNDeepseekV4Indexer(nn.Module):
         weights, _ = self.weights_proj(x)
         weights = weights.float() * self.weight_scale
         k_cache, block_table = _paged_inputs(self.k_cache)
-        k_scale = _resolve_kv_cache(_metadata(self.k_scale.prefix), self.k_scale.layer_index)
-        # [NB * f, E] f16: one scale a compressed key, key block b's at scale row b * f
-        k_scale = k_scale.reshape(-1, k_cache.shape[1])
+        k_scale = self.k_scale.inputs()  # [NB, E] f16: one scale a compressed key
         # GLM-5.3's kpool indexer has the V4 compressed-key indexer's contract (store the step's
         # candidates, pick among e < (p + 1) // 4, ascending, -1 tail).
         return torch.ops.rbln_custom_ops.sparse_attn_glm5_indexer(
@@ -607,7 +638,8 @@ class RBLNDeepseekV4Attention(nn.Module):
                 self.indexer = RBLNDeepseekV4Indexer(
                     config, layer_id, self.rope, quant_config, f"{prefix}.indexer"
                 )
-        self.scale_tensor = torch.tensor(self.head_dim**-0.5, dtype=torch.float32)
+        # a Python float: a compile-time constant every RSD node holds
+        self.scale = self.head_dim**-0.5
 
     def finalize_wo_a(self) -> None:
         """wo_a as the [1, g, d, r] bf16 batched-matmul weight, dequantized once on the host after
@@ -618,8 +650,8 @@ class RBLNDeepseekV4Attention(nn.Module):
         if hasattr(method, "dequantized_weight"):
             block_n, block_k = (int(v) for v in method.weight_block_size)
             n, k = weight.shape
-            if hasattr(self.wo_a, "weight_scale"):  # folded already: [N, K / 128]
-                scale = self.wo_a.weight_scale.detach().to("cpu", torch.float32)
+            if hasattr(self.wo_a, "weight_scale_t"):  # folded already: [K / 128, N]
+                scale = self.wo_a.weight_scale_t.detach().to("cpu", torch.float32).t()
             else:  # load_weights runs before the fold: the checkpoint's [N / 128, K / 128]
                 from vllm_rbln.model_executor.layers.quantization.deepseek_v4 import e8m0_to_bf16
 
@@ -653,14 +685,14 @@ class RBLNDeepseekV4Attention(nn.Module):
         kv = self.rope(self.kv_norm(kv), positions)  # [B, L, 512]
 
         swa, swa_slot, query_len = _ring_inputs(self.swa_cache)
-        seq_idx = _metadata(self.swa_cache.prefix).seq_lens.to(torch.int32)
+        seq_idx = _metadata(self.swa_cache.prefix).cache_seq_lens.to(torch.int32)
         common = (
             q.transpose(1, 2).contiguous(),
             kv.contiguous(),
             swa,
             swa_slot,
             self.attn_sink,
-            self.scale_tensor.to(x.device),
+            self.scale,
             seq_idx,
             query_len,
         )

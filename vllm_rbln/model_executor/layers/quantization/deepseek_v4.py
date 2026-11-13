@@ -70,9 +70,12 @@ class RBLNDeepseekV4BlockFp8LinearMethod(Fp8LinearMethod):
             scale = e8m0_to_bf16(scale)
         else:
             scale = scale.to(torch.bfloat16)
-        scale = scale.repeat_interleave(block_n, dim=0)[:out_features].contiguous().to(device)
+        scale = scale.repeat_interleave(block_n, dim=0)[:out_features]
         layer.weight = Parameter(weight, requires_grad=False)
-        layer.weight_scale = Parameter(scale, requires_grad=False)
+        # Kept [K / 128, N] (the transpose the graph reads back as [N, K / 128]): the compiler's
+        # group dequant takes the scale K-group major, and a cut of K over the RSD nodes leaves
+        # a K / 128 / 4 (16) lane axis no transpose primitive takes, where this one cancels.
+        layer.weight_scale_t = Parameter(scale.t().contiguous().to(device), requires_grad=False)
         del layer.weight_scale_inv
 
     def dequantized_weight(self, layer: torch.nn.Module, dtype: torch.dtype) -> torch.Tensor:
@@ -80,7 +83,7 @@ class RBLNDeepseekV4BlockFp8LinearMethod(Fp8LinearMethod):
         block_k = int(self.weight_block_size[1])
         return (
             layer.weight.view(out_features, in_features // block_k, block_k).to(dtype)
-            * layer.weight_scale.to(dtype)[:, :, None]
+            * layer.weight_scale_t.t().to(dtype)[:, :, None]
         ).view(out_features, in_features)
 
     def apply(
@@ -120,11 +123,22 @@ class RBLNDeepseekV4Mxfp4MoEMethod(Mxfp4MoEMethod):
         return None
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
-        layer.w13_weight = Parameter(layer.w13_weight.data, requires_grad=False)
+        # gate / up as their own whole weights: a slice of w13 in the graph reaches the MoE
+        # kernel's weight load as a view of the constant, which codegen refuses (the load's DRAM
+        # buffer must be a root). Split on the host, once.
+        def param(t: torch.Tensor) -> Parameter:
+            return Parameter(t.contiguous(), requires_grad=False)
+
+        device = layer.w13_weight.device
+        w13 = layer.w13_weight.data.to("cpu")
+        s13 = e8m0_to_bf16(layer.w13_weight_scale.data).to("cpu")
+        inter = w13.shape[1] // 2
+        layer.w1_weight = param(w13[:, :inter].to(device))
+        layer.w3_weight = param(w13[:, inter:].to(device))
+        layer.w1_weight_scale = param(s13[:, :inter].to(device))
+        layer.w3_weight_scale = param(s13[:, inter:].to(device))
+        del layer.w13_weight, layer.w13_weight_scale
         layer.w2_weight = Parameter(layer.w2_weight.data, requires_grad=False)
-        layer.w13_weight_scale = Parameter(
-            e8m0_to_bf16(layer.w13_weight_scale.data), requires_grad=False
-        )
         layer.w2_weight_scale = Parameter(
             e8m0_to_bf16(layer.w2_weight_scale.data), requires_grad=False
         )
@@ -139,13 +153,12 @@ class RBLNDeepseekV4Mxfp4MoEMethod(Mxfp4MoEMethod):
         orig_shape = x.shape
         hidden_states = x.reshape(orig_shape[:-1].numel(), -1)
         # router_logits is the runner's [E, T] masked routing weights.
-        intermediate_size = layer.w13_weight.shape[1] // 2
         out = torch.ops.rbln_custom_ops.custom_moe_glu_group_dequantize(
             hidden_states,
-            layer.w13_weight[:, :intermediate_size, :],
-            layer.w13_weight_scale[:, :intermediate_size, :],
-            layer.w13_weight[:, intermediate_size:, :],
-            layer.w13_weight_scale[:, intermediate_size:, :],
+            layer.w1_weight,
+            layer.w1_weight_scale,
+            layer.w3_weight,
+            layer.w3_weight_scale,
             layer.w2_weight,
             layer.w2_weight_scale,
             router_logits,
