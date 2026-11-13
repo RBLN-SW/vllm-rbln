@@ -802,7 +802,10 @@ class RBLNScheduler(Scheduler):
                             # The request cannot be scheduled.
                             break
 
-                if self.need_mamba_block_aligned_split:
+                # NOTE(RBLN): an async remote load computes no chunk this step, so
+                # the split would clip its 0 tokens to 0 and break before
+                # allocation, leaving the request in WAITING forever.
+                if self.need_mamba_block_aligned_split and not load_kv_async:
                     num_new_tokens = self._mamba_block_aligned_split(
                         request,
                         num_new_tokens,
