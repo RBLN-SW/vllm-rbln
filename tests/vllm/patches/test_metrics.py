@@ -196,6 +196,16 @@ class TestPassAccounting:
         assert ctx._e2e[wm.Phase.DECODE].call_count == 1
         assert ctx._graph[wm.Phase.DECODE].latencies == pytest.approx([1 * MS])
 
+    def test_host_op_time_is_recorded_only_for_passes_that_report_it(self, ctx, clock):
+        ctx.start_pass()
+        ctx.mark_phase(wm.Phase.DECODE)
+        ctx.add_graph_time(8 * MS)
+        ctx.add_host_op_time(2 * MS)
+        ctx.end_pass()
+        run_pass(ctx, clock, phase=wm.Phase.DECODE, model=8 * MS)
+        assert ctx._host_op[wm.Phase.DECODE].latencies == pytest.approx([2 * MS])
+        assert ctx._graph[wm.Phase.DECODE].call_count == 2
+
     def test_marks_outside_a_pass_are_ignored(self, ctx, clock):
         # Warm-up and dummy runs reach the same code with no pass open.
         ctx.mark_phase(wm.Phase.PREFILL)
@@ -232,6 +242,20 @@ class TestReporting:
             "E2E (PREFILL)",
             "E2E (DECODE)",
             "E2E (PADDED DECODE)",
+        ]
+
+    def test_host_op_section_sits_between_the_graph_and_e2e(
+        self, ctx, clock, monkeypatch
+    ):
+        ctx.start_pass()
+        ctx.mark_phase(wm.Phase.DECODE)
+        ctx.add_graph_time(8 * MS)
+        ctx.add_host_op_time(2 * MS)
+        ctx.end_pass()
+        assert self._labels(ctx, monkeypatch) == [
+            "MODEL + SAMPLE (DECODE)",
+            "HOST OP (DECODE)",
+            "E2E (DECODE)",
         ]
 
     def test_unseen_phase_is_omitted(self, ctx, clock, monkeypatch):
@@ -595,6 +619,45 @@ class TestModelExecutable:
         runner.model_executable(step=2)
         assert ctx._graph_latency is not None
         assert calls == [{"step": 1}, {"step": 2}]
+
+    @pytest.mark.parametrize(
+        "before, run_times_us, expected",
+        [
+            pytest.param(1000, [1500], [1.5 * MS], id="one-run"),
+            pytest.param(1000, [600, 900], [1.5 * MS], id="multiple-runs"),
+            pytest.param(1000, [], [0], id="no-run"),
+            pytest.param(None, [1500], [1.5 * MS], id="first-run"),
+            pytest.param(None, [0], [0], id="first-zero-time-run"),
+            pytest.param(None, [], [], id="no-timed-run"),
+        ],
+    )
+    def test_the_calls_accumulated_host_op_time_joins_the_pass(
+        self, monkeypatch, before, run_times_us, expected
+    ):
+        accumulated_us = before
+
+        def fake_load_model(self, *args, **kwargs):
+            def executable():
+                nonlocal accumulated_us
+                for elapsed_us in run_times_us:
+                    accumulated_us = (accumulated_us or 0) + elapsed_us
+                return "logits"
+
+            self.model_executable = executable
+
+        monkeypatch.setattr(pm, "_load_model", fake_load_model)
+        monkeypatch.setattr(
+            pm.rebel, "get_accumulated_host_op_time_us", lambda: accumulated_us
+        )
+        runner = _Runner()
+        pm.load_model(runner)
+        ctx = wm.get_performance_context(runner)
+
+        ctx.start_pass()
+        ctx.mark_phase(wm.Phase.DECODE)
+        assert runner.model_executable() == "logits"
+        ctx.end_pass()
+        assert ctx._host_op[wm.Phase.DECODE].latencies == pytest.approx(expected)
 
 
 class TestMmEncoder:
