@@ -77,14 +77,14 @@ def _common(
     )
 
 
-def _assert_conv_rows(md, blocks, seq_idx, query_len, has_initial_state):
+def _assert_conv_rows(md, blocks, start_positions, query_lens, has_initial_state):
     """kda_conv's per-row operands: the ring is stored where it was read."""
     want = {
-        "conv_state_index": blocks,
-        "conv_seq_idx": seq_idx,
-        "conv_query_len": query_len,
+        "conv_load_blocks": blocks,
+        "conv_start_positions": start_positions,
+        "conv_query_lens": query_lens,
         "conv_has_initial_state": has_initial_state,
-        "conv_store_index": blocks,
+        "conv_store_blocks": blocks,
     }
     for name, values in want.items():
         got = getattr(md, name)
@@ -156,5 +156,5 @@ class TestBuilder:
         second = builder.build(
             _common([58], [128], [[7]]), positions, 1, True, query_len_padded=128
         )
-        assert first.conv_state_index.data_ptr() == second.conv_state_index.data_ptr()
+        assert first.conv_load_blocks.data_ptr() == second.conv_load_blocks.data_ptr()
         _assert_conv_rows(second, [7], [0], [58], [1])

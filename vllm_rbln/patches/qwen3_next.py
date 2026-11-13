@@ -182,9 +182,9 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         state = _resolve_kv_cache(metadata, self.layer_index)
         ring = self.conv_ring.inputs()
         tp_size = self.tp_size
-        heads_k = self.num_k_heads // tp_size
-        heads_v = self.num_v_heads // tp_size
-        ratio = heads_v // heads_k
+        num_k_heads = self.num_k_heads // tp_size
+        num_v_heads = self.num_v_heads // tp_size
+        ratio = num_v_heads // num_k_heads
         key_dim = self.key_dim // tp_size
         value_dim = self.value_dim // tp_size
         channels = key_dim * 2 + value_dim
@@ -205,26 +205,26 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             qkv.reshape(batch, seq_len, 1, channels),
             self.conv1d.weight.view(1, channels, kernel).to(mixed_qkvz.dtype),
             ring,
-            metadata.conv_state_index,
-            metadata.conv_seq_idx,
-            metadata.conv_query_len,
+            metadata.conv_load_blocks,
+            metadata.conv_start_positions,
+            metadata.conv_query_lens,
             metadata.conv_has_initial_state,
             kernel - 1,
-            store_index=metadata.conv_store_index,
+            store_index=metadata.conv_store_blocks,
         )
         # The delta-rule kernels take q / k a key head (L2-normalized inside), v, g and
         # beta per value head grouped under its key head: value head h is key head
         # h // ratio's (h % ratio)-th, as HF's repeat_interleave pairs them.
-        grouped = convolved.view(batch, seq_len, heads_k, 2 + ratio, head_dim)
+        grouped = convolved.view(batch, seq_len, num_k_heads, 2 + ratio, head_dim)
         grouped = grouped.permute(0, 2, 3, 1, 4)
         query, key = (grouped[:, :, i].contiguous() for i in (0, 1))
         value = grouped[:, :, 2:].contiguous()
 
-        beta = torch.sigmoid(b).reshape(batch, seq_len, heads_k, ratio)
+        beta = torch.sigmoid(b).reshape(batch, seq_len, num_k_heads, ratio)
         g = -torch.exp(self.A_log.float()) * F.softplus(
             a.float() + self.dt_bias.float()
         )
-        g = g.reshape(batch, seq_len, heads_k, ratio)
+        g = g.reshape(batch, seq_len, num_k_heads, ratio)
         beta, g = (x.permute(0, 2, 3, 1) for x in (beta, g))
         if metadata.num_prefills > 0:
             # Padded tokens must neither decay the state nor write to it.
@@ -256,11 +256,13 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 metadata.non_spec_state_indices_tensor,
                 store_index=metadata.store_state_indices,
             )
-        # [batch, heads_k, ratio, seq, 128] -> [batch, seq, heads_v, 128]
-        core = core.permute(0, 3, 1, 2, 4).reshape(batch, seq_len, heads_v, head_dim)
-        z = z.reshape(batch, seq_len, heads_v, head_dim)
+        # [batch, num_k_heads, ratio, seq, 128] -> [batch, seq, num_v_heads, 128]
+        core = core.permute(0, 3, 1, 2, 4).reshape(
+            batch, seq_len, num_v_heads, head_dim
+        )
+        z = z.reshape(batch, seq_len, num_v_heads, head_dim)
         gated = self.norm(core, z)
-        output, _ = self.out_proj(gated.reshape(batch, seq_len, heads_v * head_dim))
+        output, _ = self.out_proj(gated.reshape(batch, seq_len, num_v_heads * head_dim))
         return output.reshape(*hidden_states.shape[:-1], output.shape[-1])
 
 

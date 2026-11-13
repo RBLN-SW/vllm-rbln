@@ -190,7 +190,7 @@ def _run(
 
 
 def _ssm_state(state: torch.Tensor) -> torch.Tensor:
-    # The block's bytes as the blocked state they hold -> HF [1, heads_v, dk, dv]
+    # The block's bytes as the blocked state they hold -> HF [1, num_v_heads, dk, dv]
     blocked = (
         state[BLOCK]
         .flatten()[: HEADS_V * HEAD_DIM * HEAD_DIM]

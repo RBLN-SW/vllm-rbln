@@ -44,14 +44,14 @@ from vllm_rbln.v1.attention.backends.flash_attention import (
 from vllm_rbln.v1.attention.kv_cache_bindings import KVCacheViewInfo
 
 
-def grouped_qkv_rows(heads_k: int, ratio: int, head_dim: int) -> torch.Tensor:
+def grouped_qkv_rows(num_k_heads: int, ratio: int, head_dim: int) -> torch.Tensor:
     """The rows of [q heads | k heads | v heads] regrouped by key head: q_h, k_h,
     then key head h's `ratio` value heads, for each h. The short conv runs one
     call over this order, so RSD's cut of its channels is the delta-rule
     kernels' cut of their heads and no chiplet reads another's output."""
-    q = torch.arange(heads_k).view(heads_k, 1)
-    k = q + heads_k
-    v = (torch.arange(heads_k * ratio) + 2 * heads_k).view(heads_k, ratio)
+    q = torch.arange(num_k_heads).view(num_k_heads, 1)
+    k = q + num_k_heads
+    v = (torch.arange(num_k_heads * ratio) + 2 * num_k_heads).view(num_k_heads, ratio)
     heads = torch.cat([q, k, v], dim=1).reshape(-1, 1)
     return (heads * head_dim + torch.arange(head_dim)).reshape(-1)
 
@@ -81,11 +81,11 @@ class RBLNGDNAttentionMetadata(GDNAttentionMetadata):
     # [batch] int32 on the device: what kda_conv reads a row's ring by (its
     # block, the step's first position, its valid tokens, 1 where the ring
     # carries a state) and the block it stores the ring to.
-    conv_state_index: torch.Tensor
-    conv_seq_idx: torch.Tensor
-    conv_query_len: torch.Tensor
+    conv_load_blocks: torch.Tensor
+    conv_start_positions: torch.Tensor
+    conv_query_lens: torch.Tensor
     conv_has_initial_state: torch.Tensor
-    conv_store_index: torch.Tensor
+    conv_store_blocks: torch.Tensor
     # [1, 1, seq_len] float32 on prefill: 1 for valid tokens, 0 for padding
     valid_mask: torch.Tensor | None
     # Attached by the runner (attach_kv_cache_bindings), as on the flash metadata.
@@ -147,16 +147,26 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
 
         if is_prefill:
             assert num_reqs == 1, "RBLN prefills one request per step"
-            # The prefill chunk the runner pads this step to.
             assert query_len_padded is not None
-            batch, seq_len = 1, query_len_padded
-            num_prefills, num_prefill_tokens, num_decodes = 1, int(query_lens[0]), 0
+
+            batch_size = 1
+            # The prefill chunk the runner pads this step to.
+            seq_len = query_len_padded
+
+            num_prefills = 1
+            num_prefill_tokens = int(query_lens[0])
+            num_decodes = 0
         else:
-            batch, seq_len = batch_pad, 1
             assert int(query_lens.max()) == 1, (
                 "a decode step takes one token per request"
             )
-            num_prefills, num_prefill_tokens, num_decodes = 0, 0, num_reqs
+
+            batch_size = batch_pad
+            seq_len = 1
+
+            num_prefills = 0
+            num_prefill_tokens = 0
+            num_decodes = num_reqs
 
         # TODO(prefix caching): one column while mamba_block_size is the model
         # length, so a row stores to the block it loads; a step crossing into a
@@ -167,14 +177,14 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
             self.kv_cache_spec,
             self.vllm_config.cache_config.mamba_cache_mode,
         )
-        blocks = self._padded(block_table_tensor[:num_reqs, 0], batch)
+        blocks = self._padded(block_table_tensor[:num_reqs, 0], batch_size)
         non_spec_state_indices_tensor = blocks.to(torch.int16)
 
         valid_mask = None
         if is_prefill:
             valid_mask = (torch.arange(seq_len) < query_lens[0]).to(torch.float32)
             valid_mask = valid_mask.view(1, 1, seq_len)
-        has_initial_state = self._padded(context_lens_tensor > 0, batch)
+        has_initial_state = self._padded(context_lens_tensor > 0, batch_size)
         prefill_has_initial_state = (
             has_initial_state.to(torch.int16) if is_prefill else None
         )
@@ -190,20 +200,20 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
             non_spec_state_indices_tensor=non_spec_state_indices_tensor,
             prefill_state_indices=non_spec_state_indices_tensor if is_prefill else None,
             prefill_has_initial_state=prefill_has_initial_state,
-            batch_size=batch,
+            batch_size=batch_size,
             seq_len=seq_len,
             store_state_indices=blocks.to(torch.int16),
-            conv_state_index=self._stage(blocks, "conv_state_index"),
-            conv_seq_idx=self._stage(
-                self._padded(first_positions, batch), "conv_seq_idx"
+            conv_load_blocks=self._stage(blocks, "conv_load_blocks"),
+            conv_start_positions=self._stage(
+                self._padded(first_positions, batch_size), "conv_start_positions"
             ),
-            conv_query_len=self._stage(
-                self._padded(query_lens, batch), "conv_query_len"
+            conv_query_lens=self._stage(
+                self._padded(query_lens, batch_size), "conv_query_lens"
             ),
             conv_has_initial_state=self._stage(
                 has_initial_state, "conv_has_initial_state"
             ),
-            conv_store_index=self._stage(blocks, "conv_store_index"),
+            conv_store_blocks=self._stage(blocks, "conv_store_blocks"),
             valid_mask=None
             if valid_mask is None
             else self._stage(valid_mask, "valid_mask"),
