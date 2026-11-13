@@ -1144,8 +1144,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         request count is still needed -- the decode branch of the builder pads
         the batch to it.
         """
-        kv_cache_groups = self.kv_cache_config.kv_cache_groups
-        if len(kv_cache_groups) == 0:
+        if len(kv_cache_groups := self.kv_cache_config.kv_cache_groups) == 0:
             return {}, None
 
         attn_metadata: PerLayerAttnMetadata = {}
