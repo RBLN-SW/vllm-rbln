@@ -138,7 +138,9 @@ class RBLNConfig(RBLNConfigBase):
 
     encoder_token_budgets: list[int] = field(default_factory=list)
     """Output-token capacities of compiled encoder graphs, shared across modalities.
-    Empty uses the processor upper bounds for enabled modalities."""
+    Empty lets the model choose: MiniMax-M3 takes the processor upper bounds of
+    the enabled modalities, Gemma4 every supported soft token budget up to
+    max_soft_tokens."""
 
     use_w8a8: bool = False
     """Opt in to W8A8. W8A16 runs on every RBLN NPU, W8A8 only on the ones

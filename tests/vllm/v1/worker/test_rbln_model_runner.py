@@ -35,6 +35,7 @@ from vllm.distributed.ec_transfer.ec_connector.base import (
     ECConnectorMetadata,
     ECConnectorRole,
 )
+from vllm.multimodal.inputs import PlaceholderRange
 from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheTensor
@@ -109,6 +110,7 @@ def _make_runner_stub(**attrs):
     runner.dp_status = None
     runner.is_strict_kv_producer = False
     runner.supports_mm_inputs = False
+    runner.model_config = SimpleNamespace(is_mm_prefix_lm=False)
     for key, value in attrs.items():
         setattr(runner, key, value)
     return runner
@@ -1445,6 +1447,21 @@ class TestDummyRunPadding:
 
         assert captured["layout"].num_reqs_padded == 1
 
+    @pytest.mark.parametrize("is_prefill", [True, False])
+    def test_an_mm_prefix_lm_warms_its_prefill_up_masked(self, monkeypatch, is_prefill):
+        # The masked graph serving runs: text rows that each end at themselves,
+        # one per row of the prefill width the step pads to.
+        runner, captured = self._runner(monkeypatch, reqs_across_dp=[1, 1, 1, 1])
+        runner.model_config = SimpleNamespace(is_mm_prefix_lm=True)
+        runner.prefill_chunk_sizes = [8, 64]
+        runner._dummy_run(1, 4, is_prefill=is_prefill)
+
+        row_ends = captured["attn"]["mm_prefix_row_ends"]
+        if is_prefill:
+            assert torch.equal(row_ends, torch.arange(8))
+        else:
+            assert row_ends is None
+
     @pytest.mark.parametrize(("query_len", "padded"), [(1, 32), (32, 32), (33, 64)])
     def test_a_dummy_prefill_pads_to_the_width_warm_up_compiled(
         self, monkeypatch, query_len, padded
@@ -2300,7 +2317,7 @@ class TestDummyRunDraftParticipation:
             positions=torch.zeros(64, dtype=torch.int64),
             input_batch=SimpleNamespace(num_tokens_no_spec=np.zeros(8, dtype=np.int32)),
             seq_lens_np=np.zeros(8, dtype=np.int32),
-            model_config=SimpleNamespace(dtype=torch.float16),
+            model_config=SimpleNamespace(dtype=torch.float16, is_mm_prefix_lm=False),
             device=torch.device("cpu"),
             vllm_config=SimpleNamespace(),
             kv_cache_bases=None,
@@ -2425,7 +2442,7 @@ class TestDummyRunPPIntermediateTensors:
 
         runner = _make_runner_stub(
             model=SimpleNamespace(make_empty_intermediate_tensors=make_empty),
-            model_config=SimpleNamespace(dtype=torch.float16),
+            model_config=SimpleNamespace(dtype=torch.float16, is_mm_prefix_lm=False),
             device=torch.device("cpu"),
             max_num_tokens=64,
             prefill_chunk_sizes=[32],
@@ -2646,6 +2663,154 @@ class TestExecuteModelFlushesAfterTheSubmission:
         # The entry flush recovers a stale hold, then this step's read goes out
         # only after its own submission.
         assert order == ["flush", "submit", "flush"]
+
+
+class TestExecuteModelMmPrefixRowEnds:
+    """Every prefill of an mm prefix LM hands the builders step-local row ends,
+    padded to the step's chunk length: a text or padding row ends at itself, an
+    mm row at its range's last position."""
+
+    @staticmethod
+    def _row_ends_seen(
+        monkeypatch,
+        *,
+        computed,
+        scheduled,
+        mm_features,
+        chunk_sizes=(128, 256),
+        is_mm_prefix_lm=True,
+    ):
+        monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: False)
+        monkeypatch.setattr(mr, "set_forward_context", lambda *a, **kw: nullcontext())
+        monkeypatch.setattr(
+            mr, "build_kv_cache_forward_context_kwargs", lambda *a, **kw: {}
+        )
+        monkeypatch.setattr(
+            mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+        )
+        monkeypatch.setattr(
+            RBLNModelRunner,
+            "maybe_get_kv_connector_output",
+            staticmethod(lambda *a, **kw: nullcontext(None)),
+        )
+        seen = []
+        runner = _make_runner_stub(
+            execute_model_state=None,
+            use_async_scheduling=False,
+            _update_states=lambda so: None,
+            _prepare_inputs=lambda so, counts: (
+                "LOGITS_IDX",
+                None,
+                torch.tensor([scheduled], dtype=torch.int32),
+                scheduled,
+            ),
+            _determine_batch_execution_and_padding=lambda *a, **kw: _resolved_batch(
+                num_reqs_padded=1, query_len=scheduled, num_tokens_padded=None
+            ),
+            _preprocess=lambda *a, **kw: (
+                SimpleNamespace(as_kwargs=lambda: {}),
+                {},
+                None,
+            ),
+            _bookkeeping_and_output=lambda *a, **kw: "OUTPUT",
+            input_batch=SimpleNamespace(
+                num_reqs=1,
+                req_ids=["r0"],
+                num_computed_tokens_cpu=np.array([computed], dtype=np.int32),
+            ),
+            requests={"r0": SimpleNamespace(mm_features=mm_features)},
+            model_config=SimpleNamespace(is_mm_prefix_lm=is_mm_prefix_lm),
+            prefill_chunk_sizes=list(chunk_sizes),
+            cache_config=SimpleNamespace(kv_sharing_fast_prefill=False),
+            speculative_config=None,
+            is_pooling_model=False,
+            vllm_config=SimpleNamespace(is_mm_encoder_only=False),
+            model_executable=lambda **kw: ("HIDDEN", "LOGITS", None),
+            num_prompt_logprobs=None,
+            kv_cache_bases=None,
+            decode_back_pad=torch.zeros(1, dtype=torch.int32),
+        )
+
+        def build_attention_metadata(**kwargs):
+            seen.append(kwargs["mm_prefix_row_ends"])
+            return "ATTN", None
+
+        runner._build_attention_metadata = build_attention_metadata
+        runner.execute_model(
+            SimpleNamespace(
+                total_num_scheduled_tokens=scheduled,
+                num_scheduled_tokens={"r0": scheduled},
+                scheduled_spec_decode_tokens={},
+                scheduled_new_reqs=[],
+                scheduled_cached_reqs=SimpleNamespace(
+                    req_ids=["r0"], num_computed_tokens=[computed]
+                ),
+                kv_cache_copy_ops=None,
+            )
+        )
+        return seen[0]
+
+    @staticmethod
+    def _image(offset, num_embeds):
+        # <boi>, the soft tokens, <eoi>
+        is_embed = [False] + [True] * num_embeds + [False]
+        return SimpleNamespace(
+            modality="image",
+            mm_position=PlaceholderRange(
+                offset=offset, length=len(is_embed), is_embed=torch.tensor(is_embed)
+            ),
+        )
+
+    def test_each_video_frame_ends_at_its_own_range(self, monkeypatch):
+        # Two frames, soft tokens at 4..7 and 11..14, in one 20-token step.
+        is_embed = ([False, False] + [True] * 4 + [False]) * 2
+        video = SimpleNamespace(
+            modality="video",
+            mm_position=PlaceholderRange(
+                offset=2, length=len(is_embed), is_embed=torch.tensor(is_embed)
+            ),
+        )
+        seen = self._row_ends_seen(
+            monkeypatch, computed=0, scheduled=20, mm_features=[video]
+        )
+        expected = torch.arange(128)
+        expected[4:8] = 7
+        expected[11:15] = 14
+        assert torch.equal(seen, expected)
+
+    def test_the_row_ends_take_the_staged_chunk_length(self, monkeypatch):
+        # _preprocess pads a 100-token prefill to 256 here, and so must these.
+        seen = self._row_ends_seen(
+            monkeypatch,
+            computed=0,
+            scheduled=100,
+            mm_features=[self._image(4, 10)],
+            chunk_sizes=(64, 256),
+        )
+        assert seen.numel() == 256
+
+    def test_the_rest_of_a_range_a_prefix_cache_hit_resumed(self, monkeypatch):
+        # Soft tokens at 5..14; a hit ended at 9, so rows 0..5 end at 14.
+        seen = self._row_ends_seen(
+            monkeypatch, computed=9, scheduled=8, mm_features=[self._image(4, 10)]
+        )
+        assert seen[:8].tolist() == [5] * 6 + [6, 7]
+
+    def test_a_text_chunk_reads_causally(self, monkeypatch):
+        seen = self._row_ends_seen(
+            monkeypatch, computed=0, scheduled=5, mm_features=[self._image(4, 10)]
+        )
+        assert torch.equal(seen, torch.arange(128))
+
+    def test_any_other_model_gets_none(self, monkeypatch):
+        seen = self._row_ends_seen(
+            monkeypatch,
+            computed=0,
+            scheduled=20,
+            mm_features=[self._image(4, 10)],
+            is_mm_prefix_lm=False,
+        )
+        assert seen is None
 
 
 @pytest.mark.maybe_use_device
