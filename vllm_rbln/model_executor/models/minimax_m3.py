@@ -354,11 +354,8 @@ class RBLNMiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
         head_dim: int,
         prefix: str,
         cache_config: CacheConfig | None = None,
-        *,
-        kv_cache_order: tuple[int, int],
     ) -> None:
         super().__init__()
-        self.kv_cache_order = kv_cache_order
         self.kv_cache = torch.tensor([])
         self.head_dim = head_dim
         vllm_config = get_current_vllm_config()
@@ -376,6 +373,7 @@ class RBLNMiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
         self.layer_index: int | None = None
+        self.kv_cache_slot = 1
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         # Key-only: MLAAttentionSpec budgets one vector per token (not K + V).
@@ -506,13 +504,11 @@ class RBLNMiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         compilation_config.static_forward_context[self.layer_name] = self
         self.kv_cache = torch.tensor([])  # replaced by the runner's bind
         self.layer_index: int | None = None
-        self.kv_cache_order = (layer_id, 0)
 
         self.indexer_cache = RBLNMiniMaxM3IndexerCache(
             head_dim=self.idx_head_dim,
             prefix=f"{self.layer_name}.indexer",
             cache_config=cache_config,
-            kv_cache_order=(self.kv_cache_order[0], 1),
         )
 
         self.scale_tensor = torch.tensor(

@@ -476,33 +476,41 @@ class TestGetKvCacheNames:
     @pytest.mark.parametrize(
         "names",
         [
-            ("main", "keys", "scale", "next"),
-            ("scale.99", "conv_ring.8", "main.0", "indexer.1"),
+            ("model.layers.2.attn", "model.layers.10.attn"),
+            (
+                "model.layers.3.self_attn.0.attn",
+                "model.layers.3.self_attn.1.attn",
+                "model.layers.4.self_attn.0.attn",
+            ),
+            (
+                "model.layers.2.attn.0",
+                "model.layers.2.attn.9",
+                "model.layers.2.attn.10",
+                "model.layers.3.attn.0",
+            ),
         ],
+        ids=["decoder-layers", "longcat", "glm-slots"],
     )
-    def test_declared_order_is_independent_of_names_and_registration(self, names):
-        orders = [(3, 0), (3, 1), (3, 10), (7, 0)]
-        layers = {
-            name: SimpleNamespace(kv_cache_order=order)
-            for name, order in reversed(list(zip(names, orders)))
-        }
+    def test_orders_by_numeric_path(self, names):
+        layers = {name: SimpleNamespace() for name in reversed(names)}
         assert get_kv_cache_names(layers) == list(names)
 
-    def test_missing_declaration_is_an_error(self):
-        with pytest.raises(ValueError, match="main.*kv_cache_order"):
-            get_kv_cache_names({"main": SimpleNamespace()})
+    @pytest.mark.parametrize("aux_name", ["indexer", "renamed", "conv_ring"])
+    def test_only_unnumbered_aux_caches_declare_a_slot(self, aux_name):
+        main = "model.layers.3.attn"
+        aux = f"{main}.{aux_name}"
+        scale = f"{aux}.scales"
+        layers = {
+            scale: SimpleNamespace(kv_cache_slot=2),
+            aux: SimpleNamespace(kv_cache_slot=1),
+            main: SimpleNamespace(),
+        }
+        assert get_kv_cache_names(layers) == [main, aux, scale]
 
     def test_duplicate_order_is_an_error(self):
-        layers = {
-            name: SimpleNamespace(kv_cache_order=(3, 0)) for name in ("main", "other")
-        }
+        layers = {name: SimpleNamespace() for name in ("layer.3.main", "layer.3.other")}
         with pytest.raises(ValueError, match="main.*other|other.*main"):
             get_kv_cache_names(layers)
-
-    @pytest.mark.parametrize("order", [(3,), (3, -1), ("3", 0), [3, 0]])
-    def test_invalid_declaration_is_an_error(self, order):
-        with pytest.raises(ValueError, match="main.*kv_cache_order"):
-            get_kv_cache_names({"main": SimpleNamespace(kv_cache_order=order)})
 
 
 class TestPrepareKernelBlockSizes:

@@ -210,7 +210,7 @@ def test_vision_encoder_builds_its_inputs_from_upstream_rope(monkeypatch):
     assert not key_bias[..., :8].any() and (key_bias[..., 8:] < -1e4).all()
 
 
-def test_kda_and_indexer_cache_declarations(monkeypatch):
+def test_only_scratch_aux_caches_are_left_out_of_prefix_caching(monkeypatch):
     import vllm.distributed.parallel_state as parallel_state
     from vllm.config import set_current_vllm_config
 
@@ -236,23 +236,8 @@ def test_kda_and_indexer_cache_declarations(monkeypatch):
         parallel_state, "_TP", SimpleNamespace(world_size=1, rank_in_group=0)
     )
     with set_current_vllm_config(config):
-        kda = glm.RBLNGlm5NextKDA(text, "model.layers.0.self_attn")
-        indexer = glm.RBLNGlm5NextIndexer(text, "model.layers.1.self_attn.indexer")
-
-    from vllm_rbln.v1.worker.utils import get_kv_cache_names
-
-    expected = [
-        *kda.states,
-        kda.conv_state,
-        *kda.drafts,
-        indexer.key_cache,
-        indexer.scale_cache,
-        indexer.tail_cache,
-    ]
-    caches = {
-        f"renamed_{i}": module for i, module in reversed(list(enumerate(expected)))
-    }
-    assert get_kv_cache_names(caches) == [f"renamed_{i}" for i in range(len(expected))]
+        glm.RBLNGlm5NextKDA(text, "model.layers.0.self_attn")
+        glm.RBLNGlm5NextIndexer(text, "model.layers.1.self_attn.indexer")
 
     context = config.compilation_config.static_forward_context
     flags = {

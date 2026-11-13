@@ -20,7 +20,6 @@ from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.layers.attention.kv_transfer_utils import (
     maybe_transfer_kv_layer,
 )
-from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionMetadata, AttentionType
 from vllm.v1.kv_cache_interface import (
@@ -216,10 +215,6 @@ def patched_attention_init(self: Attention, *args, **kwargs) -> None:
     attention_original_init(self, *args, **kwargs)
 
     self.layer_index = None
-    self.kv_cache_order = (
-        extract_layer_index(self.layer_name.partition(".self_attn")[0]),
-        0,
-    )
 
 
 @register_patch(

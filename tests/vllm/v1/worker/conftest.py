@@ -49,7 +49,7 @@ def make_model_runner():
         layers: tuple[str, ...] = ("layer.0",),
         kv_sharing: dict[str, str] | None = None,
         kv_cache_config=None,
-        cache_orders: dict[str, tuple[int, int]] | None = None,
+        cache_slots: dict[str, int] | None = None,
         init_kv_cache: bool = True,
         **config_overrides: Any,
     ) -> Any:
@@ -73,9 +73,9 @@ def make_model_runner():
                 kv_sharing_target_layer_name=(kv_sharing or {}).get(name),
             )
 
-        for name, order in (cache_orders or {}).items():
+        for name, slot in (cache_slots or {}).items():
             layer = config.compilation_config.static_forward_context[name]
-            layer.kv_cache_order = order
+            layer.kv_cache_slot = slot
 
         runner = RBLNModelRunner(config, torch.device(current_platform.device_type))
         # On by default: __init__ leaves a placeholder input_batch that

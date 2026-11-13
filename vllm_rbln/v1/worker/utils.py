@@ -1259,23 +1259,20 @@ def reorder_input_batch(input_batch: "InputBatch", perm: np.ndarray) -> None:
 
 
 def get_kv_cache_names(cache_layers: Mapping[str, Any]) -> list[str]:
-    """Order caches by their declared (decoder layer, cache slot).
+    """Order caches by their numeric module path and optional auxiliary slot.
 
-    NIXL uses this order for transfer regions, so every cache must declare a
-    unique key independent of its name, registration order, and hash seed.
+    Numbered attention modules and cache groups already encode their order.
+    Unnumbered auxiliary caches declare `kv_cache_slot`; main caches use 0.
     """
-    names_by_order: dict[tuple[int, int], str] = {}
+    names_by_order: dict[tuple[int, ...], str] = {}
     for name, layer in cache_layers.items():
-        order = getattr(layer, "kv_cache_order", None)
-        if (
-            not isinstance(order, tuple)
-            or len(order) != 2
-            or any(type(value) is not int or value < 0 for value in order)
-        ):
-            raise ValueError(f"{name}: invalid or missing kv_cache_order: {order!r}")
+        path = tuple(int(part) for part in name.split(".") if part.isdecimal())
+        if not path:
+            raise ValueError(f"KV cache {name} has no numeric layer path")
+        order = (*path, getattr(layer, "kv_cache_slot", 0))
         if order in names_by_order:
             raise ValueError(
-                f"Duplicate kv_cache_order {order}: {names_by_order[order]} and {name}"
+                f"Duplicate KV cache order {order}: {names_by_order[order]} and {name}"
             )
         names_by_order[order] = name
     return [names_by_order[order] for order in sorted(names_by_order)]

@@ -103,15 +103,10 @@ class TestLayerIndexFollowsCacheOrder:
     decoder layer."""
 
     @staticmethod
-    def _bind(make_model_runner, monkeypatch, names, cache_orders, **text_config):
+    def _bind(make_model_runner, names, cache_slots):
         runner = make_model_runner(
-            layers=names, cache_orders=cache_orders, init_kv_cache=False
+            layers=names, cache_slots=cache_slots, init_kv_cache=False
         )
-        # The test config is memoized, so put the attributes back afterwards.
-        for key, value in text_config.items():
-            monkeypatch.setattr(
-                runner.model_config.hf_text_config, key, value, raising=False
-            )
         ctx = runner.compilation_config.static_forward_context
         assert all(ctx[name].layer_index is None for name in names)
 
@@ -123,9 +118,7 @@ class TestLayerIndexFollowsCacheOrder:
             assert runner.kv_caches[after[name]] is ctx[name].kv_cache
         return runner, after
 
-    def test_minimax_m3_dense_layers_own_no_indexer_cache(
-        self, make_model_runner, monkeypatch
-    ):
+    def test_minimax_m3_dense_layers_own_no_indexer_cache(self, make_model_runner):
         names = (
             "model.layers.0.self_attn.attn",  # dense: K/V only
             "model.layers.1.self_attn.attn",  # sparse: K/V ...
@@ -134,17 +127,13 @@ class TestLayerIndexFollowsCacheOrder:
         )
         runner, after = self._bind(
             make_model_runner,
-            monkeypatch,
             names,
-            cache_orders=dict(zip(names, [(0, 0), (1, 0), (1, 1), (2, 0)])),
-            sparse_attention_config={"sparse_attention_freq": [0, 1, 0]},
+            cache_slots={names[2]: 1},
         )
         assert runner.kv_cache_names == list(names)
         assert after == {name: i for i, name in enumerate(names)}
 
-    def test_dsa_fp8_keeps_three_caches_per_layer_in_order(
-        self, make_model_runner, monkeypatch
-    ):
+    def test_dsa_fp8_keeps_three_caches_per_layer_in_order(self, make_model_runner):
         # DeepSeek-V3.2 / A.X-K3 under KV8: MLA latent, indexer keys, and the
         # indexer's fp16 scale cache.
         names = tuple(
@@ -154,9 +143,8 @@ class TestLayerIndexFollowsCacheOrder:
         )
         runner, after = self._bind(
             make_model_runner,
-            monkeypatch,
             names,
-            cache_orders={name: (i // 3, i % 3) for i, name in enumerate(names)},
+            cache_slots={name: i % 3 for i, name in enumerate(names) if i % 3},
         )
         assert runner.kv_cache_names == list(names)
         assert after == {name: i for i, name in enumerate(names)}
@@ -195,13 +183,12 @@ class TestBlockAuxKVCaches:
         for i, owner in ((2, "layer.0"), (3, "layer.1")):
             module = self._aux(owner)
             module.layer_index = None
-            module.kv_cache_order = (context[owner].kv_cache_order[0], 1)
             monkeypatch.setitem(context, f"layer.{i}", module)
         config = make_kv_cache_config(runner, groups=[("layer.0",), ("layer.1",)])
         runner.initialize_kv_cache(config)
         assert runner.kv_cache_allocations == {
             kv_cache_tensor_key(runner.kv_caches[0]): "layer.0",
-            kv_cache_tensor_key(runner.kv_caches[1]): "layer.2",
+            kv_cache_tensor_key(runner.kv_caches[2]): "layer.2",
         }
 
         old_allocations = runner.kv_cache_allocations.copy()
@@ -491,12 +478,9 @@ class TestLayerIndexFollowsCachePosition:
         runner = make_model_runner(
             layers=self.LAYERS,
             init_kv_cache=False,
-            cache_orders=dict(
-                zip(
-                    self.LAYERS,
-                    [(0, 0), (0, 1), (0, 2), (1, 0), (2, 0), (2, 1), (2, 2)],
-                )
-            ),
+            cache_slots={
+                self.LAYERS[i]: slot for i, slot in ((1, 1), (2, 2), (5, 1), (6, 2))
+            },
         )
 
         runner.initialize_kv_cache(
