@@ -217,7 +217,7 @@ class TestGetOutput:
         # is still host-resident.
         greedy = compile_sampler(rbln_greedy_sample, None)
         logits = torch.tensor([[0.0, 5.0, 1.0], [9.0, 0.0, 2.0]], dtype=torch.float16)
-        src = greedy(logits.to("rbln")).unsqueeze(-1)
+        src = greedy(logits.to("rbln"))
         async_out = _async_output(src)
         # A copy issued at construction must preserve the original tokens
         # even if the device source changes before output handling.

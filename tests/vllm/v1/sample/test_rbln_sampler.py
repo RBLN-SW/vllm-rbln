@@ -97,6 +97,23 @@ def test_all_greedy_batch_takes_the_argmax_op(sampler, op_args, dtype):
     assert (samples == WEIGHTED[20]).all(), samples.unique().tolist()
 
 
+@pytest.mark.use_device
+@pytest.mark.parametrize("batch_size", [1, 4])
+def test_compiled_greedy_output_keeps_token_rows(sampler, batch_size):
+    expected = torch.tensor([0, 32768, 65536, 151935][:batch_size], dtype=torch.int32)
+    logits = torch.zeros(batch_size, 151936, dtype=torch.bfloat16)
+    logits[torch.arange(batch_size), expected.long()] = 8
+    logits = logits.to(current_platform.device_type)
+
+    compiled_tokens = sampler._compiled_greedy_sample(logits)
+    assert compiled_tokens.shape == (batch_size, 1)
+    torch.testing.assert_close(compiled_tokens.cpu(), expected[:, None])
+
+    tokens = sampler.greedy_sample(logits)
+    assert tokens.shape == (batch_size,)
+    torch.testing.assert_close(tokens.cpu(), expected)
+
+
 ########################### sampled distributions ###########################
 # The weighted row: WEIGHTED[i] weighs i + 1, the tail holds 1%.
 ROWS = 256

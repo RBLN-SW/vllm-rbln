@@ -70,8 +70,8 @@ def rbln_greedy_sample(logits: torch.Tensor) -> torch.Tensor:
     To avoid self parameter issues when torch.compile is used,
     we define this as a static method.
     """
-    # NOTE(RBLN): argmax op is registered in the compiler
-    return torch.ops.rbln.argmax(logits)
+    # The compiled producer must retain the token axis for the decoder's row layout.
+    return torch.ops.rbln.argmax(logits).view(-1, 1)
 
 
 def _as_batch_tensor(t: torch.Tensor | None) -> torch.Tensor | None:
@@ -253,7 +253,7 @@ class RBLNSampler(VLLMSampler):
                 )
 
     def greedy_sample(self, logits: torch.Tensor) -> torch.Tensor:
-        return self._compiled_greedy_sample(logits)
+        return self._compiled_greedy_sample(logits).squeeze(-1)
 
     def sample(
         self,
