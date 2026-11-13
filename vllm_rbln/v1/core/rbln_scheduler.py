@@ -395,7 +395,9 @@ class RBLNScheduler(Scheduler):
                     request.num_computed_tokens,
                     num_new_tokens,
                     encoder_compute_budget,
-                    shift_computed_tokens=1 if self.use_eagle else 0,
+                    # NOTE(RBLN): the drafter takes no mm embeddings, so EAGLE needs
+                    # no shifted encoder window.
+                    shift_computed_tokens=0,
                 )
 
             if self.need_mamba_block_aligned_split:
@@ -796,7 +798,9 @@ class RBLNScheduler(Scheduler):
                             num_computed_tokens,
                             num_new_tokens,
                             encoder_compute_budget,
-                            shift_computed_tokens=1 if self.use_eagle else 0,
+                            # NOTE(RBLN): the drafter takes no mm
+                            # embeddings, so EAGLE needs no shifted encoder window.
+                            shift_computed_tokens=0,
                         )
                         if num_new_tokens == 0:
                             # The request cannot be scheduled.
@@ -1260,6 +1264,18 @@ class RBLNScheduler(Scheduler):
         return not connector.ensure_cache_available(
             request, num_computed_tokens, local_cache_hashes=local_cache_hashes
         )
+
+    def _free_encoder_inputs(self, request: Request) -> None:
+        # NOTE(RBLN): upstream defers the free by the drafter's look-ahead, but
+        # the RBLN drafter reads no mm embeddings.
+        if self.is_encoder_decoder:
+            super()._free_encoder_inputs(request)
+            return
+        num_computed = request.num_computed_tokens - request.num_output_placeholders
+        for input_id in list(self.encoder_cache_manager.get_cached_input_ids(request)):
+            pos = request.mm_features[input_id].mm_position
+            if pos.offset + pos.length <= num_computed:
+                self._free_encoder_input(request, input_id)
 
     def _try_schedule_encoder_inputs(
         self,
