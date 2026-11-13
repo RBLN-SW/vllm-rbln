@@ -82,16 +82,22 @@ class RBLNConfigBase:
     If None, uses the longest prefill_chunk_size that divides block_size.
     """
 
+    prefill_chunk_size: list[int] | None = None
+    """Compiled prefill graph lengths. The vllm model path accepts multiple
+    lengths and uses the shortest that fits each chunk; if unset, it uses
+    [max_num_batched_tokens]. The optimum model path accepts exactly one length;
+    if unset, it uses optimum-rbln's default when compiling or the pre-compiled
+    model's chunk size. Independent of the scheduling token budget."""
+
+    @field_validator("prefill_chunk_size", mode="before")
+    @classmethod
+    def _normalize_prefill_chunk_size(cls, value: Any) -> Any:
+        return [value] if isinstance(value, int) else value
+
 
 @vllm_config_dataclass
 class RBLNConfig(RBLNConfigBase):
     """RBLN NPU options for the vllm model path."""
-
-    prefill_chunk_size: list[int] | None = None
-    """Prefill graph lengths for the vllm model path. Each step uses the shortest
-    compiled length that fits its chunk. The longest length limits one request's
-    prefill chunk within the max_num_batched_tokens step budget. A single length
-    compiles one prefill graph. If None, uses [max_num_batched_tokens]."""
 
     enforce_model_fp32: bool = False
     """Force the model dtype to fp32 instead of model_config.dtype."""
@@ -169,11 +175,6 @@ class RBLNConfig(RBLNConfigBase):
         factors["use_dynamic_kv_cache"] = self.use_dynamic_kv_cache is not False
         return hash_factors(factors)
 
-    @field_validator("prefill_chunk_size", mode="before")
-    @classmethod
-    def _one_prefill_chunk_size_is_a_list(cls, value: Any) -> Any:
-        return [value] if isinstance(value, int) else value
-
     @property
     def max_prefill_chunk_size(self) -> int:
         """The longest prefill chunk."""
@@ -227,21 +228,24 @@ class OptimumRBLNCompileConfig:
 class OptimumRBLNConfig(RBLNConfigBase):
     """RBLN NPU options for the optimum-rbln model path."""
 
-    prefill_chunk_size: int | None = Field(default=None, gt=0)
-    """Length of the compiled prefill graph. Accepts one length. If None, uses
-    optimum-rbln's default when compiling, or the pre-compiled model's chunk
-    size. Independent of the max_num_batched_tokens step budget."""
-
-    @field_validator("prefill_chunk_size", mode="before")
+    @field_validator("prefill_chunk_size")
     @classmethod
-    def _one_prefill_chunk_size_is_an_int(cls, value: Any) -> Any:
-        if isinstance(value, list):
+    def _validate_prefill_chunk_size(cls, value: list[int] | None) -> list[int] | None:
+        if value is not None:
             if len(value) != 1:
                 raise ValueError(
                     "The optimum model path requires exactly one prefill_chunk_size."
                 )
-            return value[0]
+            if value[0] <= 0:
+                raise ValueError("prefill_chunk_size must be greater than 0")
         return value
+
+    @property
+    def single_prefill_chunk_size(self) -> int | None:
+        """The single prefill length used by optimum-rbln."""
+        return (
+            self.prefill_chunk_size[0] if self.prefill_chunk_size is not None else None
+        )
 
     num_devices_per_local_rank: int = 1
     """Number of NPU devices assigned to each local rank."""
@@ -299,9 +303,8 @@ class OptimumRBLNConfig(RBLNConfigBase):
         return hash_factors(get_hash_factors(self, ignored_factors))
 
 
-# The first class supplies shared CLI types. Parse prefill lengths as a list;
-# the optimum config validates that it contains exactly one length.
-_CONFIG_CLASSES: tuple[type[RBLNConfigBase], ...] = (RBLNConfig, OptimumRBLNConfig)
+# Every class a `--rbln-*` flag can belong to.
+_CONFIG_CLASSES: tuple[type[RBLNConfigBase], ...] = (OptimumRBLNConfig, RBLNConfig)
 
 # TODO(vllm-rbln>=0.14.0): delete. Former additional_config keys, still accepted
 # with a warning.

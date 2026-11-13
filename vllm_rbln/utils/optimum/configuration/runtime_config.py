@@ -240,7 +240,9 @@ def apply_runtime_config(
         )
         vllm_config.model_config.max_model_len = max_model_len
 
-    additional_config.prefill_chunk_size = prefill_chunk_size
+    additional_config.prefill_chunk_size = (
+        [prefill_chunk_size] if prefill_chunk_size is not None else None
+    )
     update_max_num_batched_tokens(vllm_config)
 
     # Persist the image-prefill buckets (gemma3/gemma4) into additional_config.
@@ -366,7 +368,7 @@ def validate_user_prefill_chunk_size(
 ) -> None:
     """Require an explicit chunk size to match the resolved model config."""
     additional_config: OptimumRBLNConfig = vllm_config.additional_config
-    prefill_chunk_size = additional_config.prefill_chunk_size
+    prefill_chunk_size = additional_config.single_prefill_chunk_size
     if prefill_chunk_size is not None:
         if not is_chunked_prefill_arch(vllm_config.model_config.hf_config):
             raise ValueError(

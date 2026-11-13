@@ -295,7 +295,7 @@ def _for_decoder(
 
     num_devices = get_compile_num_devices(vllm_config, optimum_overrides)
 
-    prefill_chunk_size = additional_config.prefill_chunk_size
+    prefill_chunk_size = additional_config.single_prefill_chunk_size
     override_prefill_chunk_size = optimum_overrides.get("prefill_chunk_size")
     validate_prefill_chunk_override(prefill_chunk_size, override_prefill_chunk_size)
     if prefill_chunk_size is None:
@@ -393,7 +393,7 @@ def _for_multimodal(
 
     num_devices = get_compile_num_devices(vllm_config, optimum_overrides)
 
-    prefill_chunk_size = additional_config.prefill_chunk_size
+    prefill_chunk_size = additional_config.single_prefill_chunk_size
     override_prefill_chunk_size = override_values.get("prefill_chunk_size")
     validate_prefill_chunk_override(prefill_chunk_size, override_prefill_chunk_size)
     if prefill_chunk_size is None:
@@ -408,7 +408,7 @@ def _for_multimodal(
                 max_model_len,
             )
         prefill_chunk_size = max_model_len
-        additional_config.prefill_chunk_size = prefill_chunk_size
+        additional_config.prefill_chunk_size = [prefill_chunk_size]
     if prefill_chunk_size is None:
         prefill_chunk_size = default_prefill_chunk_size()
 

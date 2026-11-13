@@ -333,7 +333,7 @@ def test_full_prompt_is_scheduled_with_a_smaller_prefill_graph(monkeypatch):
     request = create_requests(num_requests=1, num_tokens=4096)[0]
     scheduler.add_request(request)
     output = scheduler.schedule()
-    assert scheduler.vllm_config.additional_config.prefill_chunk_size == 128
+    assert scheduler.vllm_config.additional_config.prefill_chunk_size == [128]
     assert output.num_scheduled_tokens[request.request_id] == 4096
 
 

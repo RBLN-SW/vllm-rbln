@@ -222,7 +222,7 @@ class RBLNOptimumScheduler(Scheduler):
         prefill_chunk_size = None
         image_prefill_chunk_size = None
         if needs_chunked_prefill_pad:
-            prefill_chunk_size = rbln_config.prefill_chunk_size
+            prefill_chunk_size = rbln_config.single_prefill_chunk_size
             image_prefill_chunk_size = rbln_config.image_prefill_chunk_size
 
         # Create the KV cache manager.

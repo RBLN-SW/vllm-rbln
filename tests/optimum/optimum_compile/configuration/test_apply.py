@@ -88,7 +88,7 @@ class TestApplyDecoder:
         assert synced.model_config.max_model_len == 8192
         assert synced.cache_config.block_size == 4096
         assert synced.scheduler_config.max_num_batched_tokens == 8192
-        assert synced.additional_config.prefill_chunk_size == 256
+        assert synced.additional_config.prefill_chunk_size == [256]
 
     def test_missing_required_fields_are_rejected(self, apply_config):
         with pytest.raises(AssertionError):
@@ -236,7 +236,7 @@ class TestApplyMultimodal:
         assert synced.cache_config.block_size == 4096
         assert get_runtime_num_blocks(synced.model_config.hf_config, cfg) == 8
         assert synced.scheduler_config.max_num_batched_tokens == 4096
-        assert synced.additional_config.prefill_chunk_size == 256
+        assert synced.additional_config.prefill_chunk_size == [256]
         assert synced.additional_config.image_prefill_chunk_size == [512, 256]
 
     def test_top_level_fields_present(self, apply_config):
@@ -460,7 +460,7 @@ def test_apply_uses_selected_chunk_without_querying_the_npu(
     }
     cfg = apply_config(selected, arch=arch, precompiled=True)
     assert cfg.scheduler_config.max_num_batched_tokens == 8192
-    assert cfg.additional_config.prefill_chunk_size == 256
+    assert cfg.additional_config.prefill_chunk_size == [256]
 
 
 @pytest.mark.parametrize(
@@ -523,7 +523,7 @@ def test_prepared_settings_are_owned_and_applied_without_reading_metadata(
     assert cfg.scheduler_config.max_num_seqs == 2
     assert cfg.model_config.max_model_len == 4096
     assert cfg.scheduler_config.max_num_batched_tokens == 4096
-    assert cfg.additional_config.prefill_chunk_size == 256
+    assert cfg.additional_config.prefill_chunk_size == [256]
     assert cfg.additional_config.num_devices_per_local_rank == 2
     assert cfg.cache_config.gpu_memory_utilization == 0.9
     assert cfg.model_config.dtype == (torch.bfloat16 if precompiled else torch.float32)

@@ -305,7 +305,7 @@ class RblnPlatform(Platform):
                 )
                 if is_chunked_prefill_arch(self.create_model_config().hf_config):
                     rbln_config = build_optimum_rbln_config(self.additional_config)
-                    chunk = rbln_config.prefill_chunk_size
+                    chunk = rbln_config.single_prefill_chunk_size
                     if chunk is not None and chunk != self.max_num_batched_tokens:
                         raise ValueError(
                             "Conflicting prefill chunk size: "
@@ -314,7 +314,7 @@ class RblnPlatform(Platform):
                             "--rbln-prefill-chunk-size."
                         )
                     self.additional_config = replace(
-                        rbln_config, prefill_chunk_size=self.max_num_batched_tokens
+                        rbln_config, prefill_chunk_size=[self.max_num_batched_tokens]
                     )
                 self.max_num_batched_tokens = None
             return orig_create_engine_config(self, *args, **kwargs)

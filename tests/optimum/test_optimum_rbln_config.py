@@ -120,8 +120,8 @@ def capture_engine_config(monkeypatch):
     ("budget", "chunk", "error"),
     [
         (128, 256, "Conflicting prefill chunk size"),
-        (0, None, "greater_than"),
-        (-1, None, "greater_than"),
+        (0, None, "greater than 0"),
+        (-1, None, "greater than 0"),
         (128.5, None, "int_from_float"),
         (float("nan"), None, "finite_number"),
         (float("inf"), None, "finite_number"),
@@ -180,12 +180,31 @@ def test_unset_budget_is_left_to_vllm_defaults(capture_engine_config, config):
 def test_prefill_chunk_size_flag(parser):
     args = parser.parse_args(["--rbln-prefill-chunk-size", "256"])
     assert args.additional_config["prefill_chunk_size"] == [256]
-    assert _resolve(OptimumRBLNConfig, args.additional_config).prefill_chunk_size == 256
+    assert _resolve(OptimumRBLNConfig, args.additional_config).prefill_chunk_size == [
+        256
+    ]
 
 
-def test_prefill_chunk_size_accepts_one_length():
-    config = _resolve(OptimumRBLNConfig, {"prefill_chunk_size": [256]})
-    assert config.prefill_chunk_size == 256
+@pytest.mark.parametrize("reverse_classes", [False, True])
+def test_prefill_chunk_cli_type_is_independent_of_class_order(
+    monkeypatch, reverse_classes
+):
+    from vllm_rbln import config
+
+    if reverse_classes:
+        monkeypatch.setattr(config, "_CONFIG_CLASSES", config._CONFIG_CLASSES[::-1])
+    parser = AsyncEngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(["--rbln-prefill-chunk-size", "256", "512"])
+    assert args.additional_config["prefill_chunk_size"] == [256, 512]
+    with pytest.raises(ValueError, match="exactly one prefill_chunk_size"):
+        _resolve(OptimumRBLNConfig, args.additional_config)
+
+
+@pytest.mark.parametrize("size", [256, [256]])
+def test_prefill_chunk_size_accepts_one_length(size):
+    config = _resolve(OptimumRBLNConfig, {"prefill_chunk_size": size})
+    assert config.prefill_chunk_size == [256]
+    assert config.single_prefill_chunk_size == 256
 
 
 @pytest.mark.parametrize("sizes", [[], [256, 512]])
@@ -194,9 +213,9 @@ def test_prefill_chunk_size_rejects_multiple_or_missing_lengths(sizes):
         _resolve(OptimumRBLNConfig, {"prefill_chunk_size": sizes})
 
 
-@pytest.mark.parametrize("size", [0, -1])
+@pytest.mark.parametrize("size", [0, -1, [0], [-1]])
 def test_invalid_prefill_chunk_size_is_rejected(size):
-    with pytest.raises(ValueError, match="greater_than"):
+    with pytest.raises(ValueError, match="greater than 0"):
         _resolve(OptimumRBLNConfig, {"prefill_chunk_size": size})
 
 
@@ -230,6 +249,9 @@ def test_only_compile_fields_change_the_hash():
     assert OptimumRBLNConfig(num_blocks_synced=True).compute_hash() == base
     assert OptimumRBLNConfig(use_custom_sampler=False).compute_hash() == base
     assert OptimumRBLNConfig(prefill_chunk_size=512).compute_hash() != base
+    assert OptimumRBLNConfig(prefill_chunk_size=512).compute_hash() == (
+        OptimumRBLNConfig(prefill_chunk_size=[512]).compute_hash()
+    )
     assert OptimumRBLNConfig(sub_block_size=256).compute_hash() != base
 
 

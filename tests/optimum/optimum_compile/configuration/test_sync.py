@@ -70,7 +70,7 @@ class TestSync:
         cfg = vllm_config_factory(prefill_chunk_size, hf_config=hf_config)
         inputs = cfg.additional_config.compile_config
         assert inputs.rbln_config["language_model"]["prefill_chunk_size"] == 8192
-        assert cfg.additional_config.prefill_chunk_size == 8192
+        assert cfg.additional_config.prefill_chunk_size == [8192]
         assert cfg.scheduler_config.max_num_batched_tokens == 8192
         assert ("Adjusting prefill_chunk_size" in caplog.text) == (
             prefill_chunk_size == 512
@@ -91,7 +91,7 @@ class TestSync:
         cached = vllm_config_factory(prefill_chunk_size, hf_config=hf_config)
         assert cached.additional_config.precompiled
         assert cached.additional_config.artifact_path == str(cache_path)
-        assert cached.additional_config.prefill_chunk_size == 8192
+        assert cached.additional_config.prefill_chunk_size == [8192]
         assert cached.scheduler_config.max_num_batched_tokens == 8192
 
     def test_whisper_runtime_uses_final_compile_lengths(self, vllm_config_factory):
@@ -226,6 +226,7 @@ class TestSync:
             (None, {}, 128),
             (None, {"prefill_chunk_size": 256}, 256),
             (512, {}, 512),
+            ([512], {}, 512),
             (512, {"prefill_chunk_size": 512}, 512),
         ],
     )
@@ -246,7 +247,7 @@ class TestSync:
         cfg = vllm_config_factory(prefill_chunk_size, optimum_overrides=overrides)
         assert observed == [expected]
         assert cfg.scheduler_config.max_num_batched_tokens == 8192
-        assert cfg.additional_config.prefill_chunk_size == expected
+        assert cfg.additional_config.prefill_chunk_size == [expected]
         assert (
             cfg.additional_config.compile_config.rbln_config["prefill_chunk_size"]
             == expected
@@ -262,7 +263,7 @@ class TestSync:
         cached = vllm_config_factory(prefill_chunk_size, optimum_overrides=overrides)
         assert cached.additional_config.precompiled
         assert cached.additional_config.artifact_path == str(cache_path)
-        assert cached.additional_config.prefill_chunk_size == expected
+        assert cached.additional_config.prefill_chunk_size == [expected]
         assert cached.scheduler_config.max_num_batched_tokens == 8192
 
     @pytest.mark.parametrize(
@@ -425,7 +426,7 @@ def test_initial_cache_hit_applies_vllm_config_updates_once(
     assert len(calls) == 1
     assert cfg.scheduler_config.max_num_seqs == 2
     assert cfg.scheduler_config.max_num_batched_tokens == 4096
-    assert cfg.additional_config.prefill_chunk_size == 256
+    assert cfg.additional_config.prefill_chunk_size == [256]
     assert cfg.model_config.max_model_len == 4096
     assert cfg.model_config.dtype == torch.float32
     assert cfg.additional_config.num_devices_per_local_rank == 2
@@ -450,7 +451,7 @@ def test_builder_does_not_apply_vllm_config_updates(vllm_config_factory):
     assert cfg.scheduler_config.max_num_seqs == 4
     assert cfg.model_config.max_model_len == 8192
     assert cfg.scheduler_config.max_num_batched_tokens == 8192
-    assert cfg.additional_config.prefill_chunk_size == 128
+    assert cfg.additional_config.prefill_chunk_size == [128]
     assert cfg.additional_config.compile_config is None
     assert inputs.rbln_config["batch_size"] == 2
 
@@ -528,6 +529,7 @@ def test_compile_config_survives_worker_serialization(
     inputs = cfg.additional_config.compile_config
     assert isinstance(inputs, OptimumRBLNCompileConfig)
     assert inputs.rbln_config["language_model"]["prefill_chunk_size"] == 8192
+    assert cfg.additional_config.prefill_chunk_size == [8192]
     assert cfg.additional_config.artifact_path == original_path
     assert cfg.additional_config.precompiled is precompiled
     sync.sync_vllm_and_optimum(cfg)
@@ -598,7 +600,7 @@ def test_engine_args_resolve_legacy_and_explicit_chunks_identically(
     ).save_pretrained(model_dir)
     keys = []
     for legacy in [False, True]:
-        config = {} if legacy else {"prefill_chunk_size": 256}
+        config = {} if legacy else {"prefill_chunk_size": [256]}
         if built:
             config = OptimumRBLNConfig(**config)
         cfg = EngineArgs(
@@ -614,7 +616,7 @@ def test_engine_args_resolve_legacy_and_explicit_chunks_identically(
         ).create_engine_config()
         inputs = cfg.additional_config.compile_config
         assert inputs.rbln_config["prefill_chunk_size"] == 256
-        assert cfg.additional_config.prefill_chunk_size == 256
+        assert cfg.additional_config.prefill_chunk_size == [256]
         assert cfg.scheduler_config.max_num_batched_tokens == 1024
         keys.append(compile_cache_name(inputs))
     assert keys[0] == keys[1]
@@ -633,7 +635,7 @@ def test_sync_sizes_budget_for_full_prompt_or_decode_batch(
         optimum_overrides={"max_seq_len": max_seq_len, "batch_size": batch_size},
     )
     assert cfg.scheduler_config.max_num_batched_tokens == expected
-    assert cfg.additional_config.prefill_chunk_size == 128
+    assert cfg.additional_config.prefill_chunk_size == [128]
     assert cfg.additional_config.compile_config.rbln_config["prefill_chunk_size"] == 128
 
 
@@ -680,7 +682,7 @@ def test_precompiled_model_resolves_or_rejects_prefill_chunk_size(
         sync.sync_vllm_and_optimum(cfg)
         assert cfg.additional_config.precompiled
         assert cfg.additional_config.compile_config is None
-        assert cfg.additional_config.prefill_chunk_size == 256
+        assert cfg.additional_config.prefill_chunk_size == [256]
         assert cfg.scheduler_config.max_num_batched_tokens == 8192
 
 
