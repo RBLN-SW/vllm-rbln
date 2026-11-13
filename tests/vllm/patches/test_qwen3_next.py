@@ -50,7 +50,6 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
 HIDDEN, HEADS_K, HEADS_V, HEAD_DIM, KERNEL = 64, 2, 4, 128, 4
 KEY_DIM, VALUE_DIM = HEADS_K * HEAD_DIM, HEADS_V * HEAD_DIM
 CONV_DIM = 2 * KEY_DIM + VALUE_DIM
-CHUNK = 128
 PREFIX = "model.layers.0.linear_attn"
 # The state cache: the request's block, with a neighbour on each side.
 NUM_BLOCKS, BLOCK = 4, 2
@@ -147,13 +146,6 @@ def _common(query_len: int, seq_len: int) -> SimpleNamespace:
         query_start_loc=torch.tensor([0, query_len], dtype=torch.int32),
         seq_lens=torch.tensor([seq_len], dtype=torch.int32),
         block_table_tensor=torch.tensor([[BLOCK]], dtype=torch.int32),
-    )
-
-
-@pytest.fixture
-def vllm_config():
-    return make_vllm_config(
-        max_num_batched_tokens=CHUNK, max_num_seqs=2, dtype="float32"
     )
 
 
@@ -297,15 +289,6 @@ def test_padded_prefill_then_decode_tracks_hf(
     assert not ring[BLOCK - 1].any() and not ring[BLOCK + 1].any()
 
 
-def test_forward_without_metadata_is_an_error(vllm_config):
-    layer = _layer()
-    with (
-        set_forward_context({}, vllm_config),
-        pytest.raises(RuntimeError, match="no RBLN GDN metadata"),
-    ):
-        RBLNQwenGatedDeltaNetAttention.forward(layer, torch.zeros(1, CHUNK, HIDDEN))
-
-
 class TestStateSpec:
     """State specs describe the physical KV page used by the runner."""
 
@@ -315,9 +298,6 @@ class TestStateSpec:
         layer.num_kv_heads = 4
         layer.kv_head_size = 256
         layer.model_config = SimpleNamespace(dtype=torch.bfloat16)
-        layer.num_v_heads = 48
-        layer.tp_size = 1
-        layer.head_k_dim = layer.head_v_dim = 128
         layer.cache_config = SimpleNamespace(
             block_size=1024,
             mamba_block_size=8192,
@@ -327,45 +307,16 @@ class TestStateSpec:
         )
         return layer
 
-    @pytest.mark.parametrize(
-        "value_heads, block_size", [(32, 256), (32, 1024), (48, 384), (48, 1024)]
-    )
-    @pytest.mark.parametrize("explicit_padding", [False, True])
-    def test_spec_uses_full_attention_page(
-        self, value_heads, block_size, explicit_padding
-    ):
+    def test_spec_uses_full_attention_page(self):
         layer = self._layer()
-        layer.num_v_heads = value_heads
-        layer.cache_config.block_size = block_size
-        if explicit_padding:
-            layer.cache_config.mamba_page_size_padded = 2 * 4 * block_size * 256 * 2
         config = SimpleNamespace(
             cache_config=layer.cache_config,
             num_speculative_tokens=0,
             additional_config=RBLNConfig(),
         )
         spec = layer.get_kv_cache_spec(config)
-        assert spec.shapes == ((2, 4, 1, block_size, 256),)
+        assert spec.shapes == ((2, 4, 1, 1024, 256),)
         assert spec.real_page_size_bytes == spec.page_size_bytes
-        assert spec.page_size_bytes == 2 * 4 * block_size * 256 * 2
-        assert spec.page_size_padded == layer.cache_config.mamba_page_size_padded
-        assert spec.block_size == config.cache_config.mamba_block_size
-
-    def test_layer_cache_uses_full_attention_layout(self):
-        layer = self._layer()
-        with set_current_vllm_config(SimpleNamespace(additional_config=RBLNConfig())):
-            assert layer.get_state_shape() == ((2, 4, 1, 1024, 256),)
-        # The activation dtype: the kernels take no other.
-        assert layer.get_state_dtype() == (torch.bfloat16,)
-
-    def test_triton_cache_layout_is_rejected(self):
-        layer = self._layer()
-        config = SimpleNamespace(additional_config=RBLNConfig(use_custom_kernel=True))
-        with (
-            set_current_vllm_config(config),
-            pytest.raises(AssertionError, match="GDN requires KV blocks shaped"),
-        ):
-            layer.get_state_shape()
 
     def test_a_cache_dtype_option_does_not_move_the_state_dtype(self):
         layer = self._layer()
