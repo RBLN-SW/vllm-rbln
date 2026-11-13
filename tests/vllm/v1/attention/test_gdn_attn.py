@@ -24,10 +24,8 @@ from vllm.config import set_current_vllm_config
 from vllm.v1.kv_cache_interface import MambaSpec
 
 from tests.vllm.vllm_config import make_vllm_config
-from vllm_rbln.v1.attention.backends.flash_attention import RBLNFlashAttentionBackend
 from vllm_rbln.v1.attention.backends.gdn_attn import (
     RBLNGDNAttentionMetadataBuilder,
-    gdn_state_shape,
     grouped_qkv_rows,
 )
 
@@ -43,14 +41,6 @@ def test_grouped_qkv_rows_interleaves_each_key_heads_q_k_and_values():
     assert grouped_qkv_rows(2, 1, 2).tolist() == [0, 1, 4, 5, 8, 9, 2, 3, 6, 7, 10, 11]
 
 
-def test_state_block_is_the_flash_backends_kv_block():
-    # A GDN layer and an attention layer on one buffer are one graph input only
-    # while both declare a block the same way.
-    with set_current_vllm_config(make_vllm_config()):
-        cache = RBLNFlashAttentionBackend.get_kv_cache_shape(1, 256, 4, 256)
-    assert gdn_state_shape(4, 256, 256) == cache[1:]
-
-
 def _builder(max_num_batched_tokens: int = 128, **engine_args):
     vllm_config = make_vllm_config(
         max_model_len=MAX_LEN,
@@ -60,7 +50,7 @@ def _builder(max_num_batched_tokens: int = 128, **engine_args):
     )
     spec = MambaSpec(
         block_size=MAX_LEN,
-        shapes=(gdn_state_shape(1, 256, 128),),
+        shapes=((4, 128, 128),),
         dtypes=(torch.bfloat16,),
     )
     # The flash builder it extends reads the config it is built under.

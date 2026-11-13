@@ -14,24 +14,16 @@
 
 """GatedDeltaNet (Qwen3.5 `linear_attention`) state on RBLN.
 
-A layer's recurrent state is a `MambaSpec` block of the pool the attention
-layers schedule on, declared as the full-attention KV block it fills (the
-platform holds block_size to that), so a GDN layer and an attention layer
-sharing a buffer are one graph input with one chiplet cut. The delta-rule
-kernels read a block as the [Hk, R, 2, 128, 64] state it holds, in the
-activation dtype (dlfloat16 inside the kernels), addressed by the group's
-block table. Its short-conv ring is a block-aux cache on the same
-block ids. The builder turns the block table into the rows the kernels read
-and write: a request's one block (`mamba_block_size` is the model length),
-read and written in place; a padding row reads and writes block 0, vLLM's
-null block.
+A layer's `MambaSpec` describes a full-attention KV page, including unused
+capacity. The runner binds that shape so sharing layers use one graph input
+and one chiplet cut. The kernels size a contiguous state prefix per local
+page from Q/K/V and preserve trailing padding. State uses the activation
+dtype (dlfloat16 inside the kernels).
 
-The delta-rule kernels take q / k per key head, L2-normalized inside, and v, g and
-beta per value head grouped under its key head. The short conv
-(`rbln_custom_ops::kda_conv`, fed as GLM-5.3 feeds its own) runs once over
-q | k | v in that same key-head order (`grouped_qkv_rows`); the converter builds
-its ring tables in the graph from the step's blocks and positions, and the ring
-is stored to the block the state is.
+The builder addresses a request's one state block by its group's block table;
+`mamba_block_size` is the model length. A padding batch row uses null block 0.
+The short-conv ring is a block-aux cache on those same block ids. Its channels
+and the delta-rule heads share the key-head order from `grouped_qkv_rows`.
 """
 
 from dataclasses import dataclass
@@ -51,14 +43,6 @@ from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadataBuilder,
 )
 from vllm_rbln.v1.attention.kv_cache_bindings import KVCacheViewInfo
-
-
-def gdn_state_shape(
-    num_kv_heads: int, block_size: int, head_size: int
-) -> tuple[int, ...]:
-    """One block's state, declared as the full-attention KV block whose bytes it
-    is ([2, Hkv, 1, block_size, head_size], RBLNFlashAttentionBackend's block)."""
-    return (2, num_kv_heads, 1, block_size, head_size)
 
 
 def grouped_qkv_rows(heads_k: int, ratio: int, head_dim: int) -> torch.Tensor:

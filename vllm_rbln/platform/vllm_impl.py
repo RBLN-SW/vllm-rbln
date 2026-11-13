@@ -157,9 +157,8 @@ def _validate(vllm_config: "VllmConfig") -> None:
                 f"chiplets; got {heads_v} heads over "
                 f"tensor_parallel_size={parallel_config.tensor_parallel_size}."
             )
-        # A state block comes from the pool the attention layers schedule on and
-        # is declared as the full-attention KV block the kernels read it from, so
-        # a block has to hold exactly one layer's state.
+        # State and attention share a pool page; its physical capacity must
+        # cover the recurrent state, with any remainder as padding.
         text_config = model_config.hf_text_config
         cache_config = vllm_config.cache_config
         token_bytes = (
@@ -176,11 +175,11 @@ def _validate(vllm_config: "VllmConfig") -> None:
             * text_config.linear_value_head_dim
             * get_dtype_size(model_config.dtype)
         )
-        if cache_config.block_size * token_bytes != state_bytes:
+        if cache_config.block_size * token_bytes < state_bytes:
             raise ValueError(
                 "A GatedDeltaNet state takes a block of the attention pool on RBLN, "
-                f"so its {state_bytes} bytes have to be a full-attention layer's "
-                f"page ({token_bytes} bytes a token): set --block-size "
+                f"so its {state_bytes} bytes must fit in a full-attention layer's "
+                f"page ({token_bytes} bytes a token): set --block-size to at least "
                 f"{state_bytes / token_bytes:g}; got {cache_config.block_size}."
             )
 

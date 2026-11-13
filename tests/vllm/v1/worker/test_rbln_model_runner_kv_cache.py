@@ -20,10 +20,19 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from transformers import LlamaConfig
+from vllm.engine.arg_utils import EngineArgs
+from vllm.v1.kv_cache_interface import MambaSpec
 
 import vllm_rbln.v1.worker.rbln_model_runner as mr
 from tests.vllm.v1.worker.utils import make_kv_cache_config, schedule_new
-from vllm_rbln.v1.attention.kv_cache_bindings import kv_cache_tensor_key
+from vllm_rbln.patches.qwen3_next import RBLNQwenGatedDeltaNetAttention
+from vllm_rbln.v1.attention.backends.flash_attention import RBLNFlashAttentionBackend
+from vllm_rbln.v1.attention.backends.gdn_attn import RBLNGDNAttentionBackend
+from vllm_rbln.v1.attention.kv_cache_bindings import (
+    kv_cache_tensor_key,
+    materialize_kv_cache_view,
+)
 from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
 
 pytestmark = pytest.mark.maybe_use_device
@@ -40,6 +49,67 @@ def _one_group_two_layers(make_model_runner):
 
 
 class TestReshapeKVCacheTensors:
+    @pytest.mark.parametrize("block_size", [256, 384, 1024])
+    def test_padded_gdn_keeps_shared_kv_view(
+        self, make_model_runner, tmp_path, block_size
+    ):
+        LlamaConfig(
+            hidden_size=1024,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            max_position_embeddings=8192,
+            architectures=["LlamaForCausalLM"],
+        ).save_pretrained(tmp_path)
+        config = EngineArgs(
+            model=str(tmp_path),
+            dtype="bfloat16",
+            block_size=block_size,
+            max_model_len=8192,
+            max_num_batched_tokens=128,
+            max_num_seqs=4,
+            enable_chunked_prefill=True,
+        ).create_engine_config()
+        runner = make_model_runner(
+            vllm_config=config, layers=("layer.0", "layer.1"), init_kv_cache=False
+        )
+        layer = object.__new__(RBLNQwenGatedDeltaNetAttention)
+        layer.layer_index = None
+        runner.compilation_config.static_forward_context["layer.1"] = layer
+        cache_config = make_kv_cache_config(
+            runner,
+            groups=[("layer.0",), ("layer.1",)],
+            num_blocks=4,
+            block_size=block_size,
+        )
+        attention_spec = cache_config.kv_cache_groups[0].kv_cache_spec
+        state_spec = MambaSpec(
+            block_size=config.model_config.max_model_len,
+            shapes=((2, 4, 1, block_size, 256),),
+            dtypes=(torch.bfloat16,),
+            page_size_padded=attention_spec.page_size_bytes,
+            mamba_type=layer.mamba_type,
+        )
+        cache_config.kv_cache_groups[1].kv_cache_spec = state_spec
+        runner.kv_cache_config = cache_config
+        runner.attn_groups = [
+            [
+                mr.AttentionGroup(
+                    RBLNFlashAttentionBackend, ["layer.0"], attention_spec, 0
+                )
+            ],
+            [mr.AttentionGroup(RBLNGDNAttentionBackend, ["layer.1"], state_spec, 1)],
+        ]
+        caches = runner.initialize_kv_cache_tensors(
+            cache_config, [block_size, state_spec.block_size]
+        )
+        assert len(runner.kv_cache_bases) == 1
+        info = runner.kv_cache_view_infos[layer.layer_index]
+        state = materialize_kv_cache_view(runner.kv_cache_bases, info)
+        assert tuple(state.shape) == (4, *state_spec.shapes[0])
+        assert kv_cache_tensor_key(state) == kv_cache_tensor_key(caches["layer.0"])
+        assert state.stride(0) * state.element_size() == state_spec.page_size_bytes
+        assert state_spec.real_page_size_bytes == state_spec.page_size_bytes
+
     # Technique from upstream's test_kv_cache_stride_order: drive the real
     # backend rather than a fake, so the assertions hold for the backend in use.
     def test_backend_stride_order_permutes_base_but_not_the_view(

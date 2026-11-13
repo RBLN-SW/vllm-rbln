@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The RBLN GatedDeltaNet layer declares its state as the full-attention KV
-block it fills, and its forward tracks the HF reference across
+"""The RBLN GatedDeltaNet layer's physical state spec and KV cache.
+Its forward tracks the HF reference across
 a padded prefill chunk, a continued chunk and a decode step on that block. The
 custom ops run their CPU bodies here, so no NPU is needed."""
 
@@ -32,13 +32,19 @@ from vllm.config import set_current_vllm_config
 from vllm.v1.kv_cache_interface import MambaSpec
 
 from tests.vllm.vllm_config import make_vllm_config
+from vllm_rbln.config import RBLNConfig
 from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.model_executor.models.qwen3_5 import RBLNQwen3_5ForConditionalGeneration
 from vllm_rbln.patches.qwen3_next import RBLNQwenGatedDeltaNetAttention
+from vllm_rbln.v1.attention.backends.flash_attention import RBLNFlashAttentionBackend
 from vllm_rbln.v1.attention.backends.gdn_attn import (
     RBLNGDNAttentionMetadataBuilder,
-    gdn_state_shape,
     grouped_qkv_rows,
+)
+from vllm_rbln.v1.attention.kv_cache_bindings import (
+    KVCacheViewInfo,
+    attach_kv_cache_bindings,
+    build_kv_cache_forward_context_kwargs,
 )
 
 HIDDEN, HEADS_K, HEADS_V, HEAD_DIM, KERNEL = 64, 2, 4, 128, 4
@@ -48,9 +54,6 @@ CHUNK = 128
 PREFIX = "model.layers.0.linear_attn"
 # The state cache: the request's block, with a neighbour on each side.
 NUM_BLOCKS, BLOCK = 4, 2
-# A full-attention KV block of the layer's HEADS_V * HEAD_DIM * HEAD_DIM state
-# elements: 1 KV head, 256 tokens, head size 128.
-KV_BLOCK = gdn_state_shape(1, 256, 128)
 
 
 class _Proj(torch.nn.Linear):
@@ -155,13 +158,28 @@ def vllm_config():
 
 
 def _run(
-    layer, vllm_config, builder, state, hidden, common, positions, is_prefill, pad
+    layer,
+    vllm_config,
+    builder,
+    state,
+    hidden,
+    common,
+    positions,
+    is_prefill,
+    pad,
+    shared_binding,
 ):
     metadata = builder.build(common, positions, pad, is_prefill)
-    # What the runner attaches to every step's metadata (attach_kv_cache_bindings).
-    metadata.kv_caches = [state]
-    metadata.kv_cache_view_infos = None
-    with set_forward_context({PREFIX: metadata}, vllm_config):
+    bases = [state] if shared_binding else []
+    infos = (
+        [KVCacheViewInfo(base_index=0, view_shape=tuple(state.shape))]
+        if shared_binding
+        else []
+    )
+    attach_kv_cache_bindings(metadata, [state], bases, infos)
+    with set_forward_context(
+        {PREFIX: metadata}, vllm_config, **build_kv_cache_forward_context_kwargs(bases)
+    ):
         return RBLNQwenGatedDeltaNetAttention.forward(layer, hidden)
 
 
@@ -169,12 +187,15 @@ def _ssm_state(state: torch.Tensor) -> torch.Tensor:
     # The block's bytes as the blocked state they hold -> HF [1, heads_v, dk, dv]
     blocked = (
         state[BLOCK]
+        .flatten()[: HEADS_V * HEAD_DIM * HEAD_DIM]
         .float()
         .reshape(1, HEADS_K, HEADS_V // HEADS_K, *state_blocks(HEAD_DIM))
     )
     return unblock_state(blocked).reshape(1, HEADS_V, HEAD_DIM, HEAD_DIM)
 
 
+@pytest.mark.parametrize("block_size", [256, 1024])
+@pytest.mark.parametrize("shared_binding", [False, True])
 @pytest.mark.parametrize(
     "chunk_sizes, steps",
     [
@@ -184,8 +205,12 @@ def _ssm_state(state: torch.Tensor) -> torch.Tensor:
         ([128, 256], [(200, 256), (58, 128)]),
     ],
 )
-def test_padded_prefill_then_decode_tracks_hf(chunk_sizes, steps):
+def test_padded_prefill_then_decode_tracks_hf(
+    block_size, shared_binding, chunk_sizes, steps
+):
     vllm_config = make_vllm_config(
+        model="JackFram/llama-68m",
+        max_model_len=2048,
         max_num_batched_tokens=max(chunk_sizes),
         max_num_seqs=2,
         dtype="float32",
@@ -193,14 +218,22 @@ def test_padded_prefill_then_decode_tracks_hf(chunk_sizes, steps):
     )
     layer = _layer()
     # The state cache and the ring beside it, as the runner allocates them.
-    state = torch.zeros(NUM_BLOCKS, *KV_BLOCK)
+    with set_current_vllm_config(vllm_config):
+        kv_block = RBLNFlashAttentionBackend.get_kv_cache_shape(1, block_size, 1, 128)[
+            1:
+        ]
+    state = torch.zeros(NUM_BLOCKS, *kv_block)
+    state_elements = HEADS_V * HEAD_DIM * HEAD_DIM
+    state.flatten(1)[:, state_elements:] = 13
+    before = state.clone()
     ring = torch.zeros(NUM_BLOCKS, KERNEL - 1, 1, CONV_DIM // 64, 64)
     device_layer = _grouped(layer, ring)
     vllm_config.compilation_config.static_forward_context[PREFIX] = device_layer
     spec = MambaSpec(
         block_size=vllm_config.model_config.max_model_len,
-        shapes=(KV_BLOCK,),
+        shapes=(kv_block,),
         dtypes=(torch.float32,),
+        page_size_padded=state[0].numel() * state.element_size(),
     )
     with set_current_vllm_config(vllm_config):
         builder = RBLNGDNAttentionMetadataBuilder(
@@ -226,6 +259,7 @@ def test_padded_prefill_then_decode_tracks_hf(chunk_sizes, steps):
             torch.arange(start, start + window),
             True,
             1,
+            shared_binding,
         )
         ref, history, ref_state = _reference(
             layer, tokens[:, start : start + valid], history, ref_state
@@ -247,13 +281,19 @@ def test_padded_prefill_then_decode_tracks_hf(chunk_sizes, steps):
         torch.tensor([total]),
         False,
         2,
+        shared_binding,
     )
     ref, _, ref_state = _reference(layer, tokens[:, total:], history, ref_state)
     torch.testing.assert_close(out[:1], ref, atol=2e-3, rtol=2e-2)
     torch.testing.assert_close(_ssm_state(state), ref_state, atol=2e-3, rtol=2e-2)
     # The padded row took the null block, so the request's neighbours are
     # untouched.
-    assert not state[BLOCK - 1].any() and not state[BLOCK + 1].any()
+    torch.testing.assert_close(
+        state[[BLOCK - 1, BLOCK + 1]], before[[BLOCK - 1, BLOCK + 1]]
+    )
+    torch.testing.assert_close(
+        state.flatten(1)[:, state_elements:], before.flatten(1)[:, state_elements:]
+    )
     assert not ring[BLOCK - 1].any() and not ring[BLOCK + 1].any()
 
 
@@ -267,24 +307,65 @@ def test_forward_without_metadata_is_an_error(vllm_config):
 
 
 class TestStateSpec:
-    """The layer declares its state as a full-attention KV block, and the model
-    declares the same state for the platform's page arithmetic."""
+    """State specs describe the physical KV page used by the runner."""
 
     @staticmethod
     def _layer():
-        # The attention layers keep 4 KV heads of 256, 256 tokens a block.
         layer = object.__new__(RBLNQwenGatedDeltaNetAttention)
         layer.num_kv_heads = 4
         layer.kv_head_size = 256
         layer.model_config = SimpleNamespace(dtype=torch.bfloat16)
-        layer.cache_config = SimpleNamespace(block_size=256)
+        layer.num_v_heads = 48
+        layer.tp_size = 1
+        layer.head_k_dim = layer.head_v_dim = 128
+        layer.cache_config = SimpleNamespace(
+            block_size=1024,
+            mamba_block_size=8192,
+            mamba_page_size_padded=None,
+            mamba_cache_mode="none",
+            use_kda_recoverssm=False,
+        )
         return layer
 
-    def test_the_layer_declares_one_ssm_state_a_block(self):
+    @pytest.mark.parametrize(
+        "value_heads, block_size", [(32, 256), (32, 1024), (48, 384), (48, 1024)]
+    )
+    @pytest.mark.parametrize("explicit_padding", [False, True])
+    def test_spec_uses_full_attention_page(
+        self, value_heads, block_size, explicit_padding
+    ):
         layer = self._layer()
-        assert layer.get_state_shape() == ((2, 4, 1, 256, 256),)
+        layer.num_v_heads = value_heads
+        layer.cache_config.block_size = block_size
+        if explicit_padding:
+            layer.cache_config.mamba_page_size_padded = 2 * 4 * block_size * 256 * 2
+        config = SimpleNamespace(
+            cache_config=layer.cache_config,
+            num_speculative_tokens=0,
+            additional_config=RBLNConfig(),
+        )
+        spec = layer.get_kv_cache_spec(config)
+        assert spec.shapes == ((2, 4, 1, block_size, 256),)
+        assert spec.real_page_size_bytes == spec.page_size_bytes
+        assert spec.page_size_bytes == 2 * 4 * block_size * 256 * 2
+        assert spec.page_size_padded == layer.cache_config.mamba_page_size_padded
+        assert spec.block_size == config.cache_config.mamba_block_size
+
+    def test_layer_cache_uses_full_attention_layout(self):
+        layer = self._layer()
+        with set_current_vllm_config(SimpleNamespace(additional_config=RBLNConfig())):
+            assert layer.get_state_shape() == ((2, 4, 1, 1024, 256),)
         # The activation dtype: the kernels take no other.
         assert layer.get_state_dtype() == (torch.bfloat16,)
+
+    def test_triton_cache_layout_is_rejected(self):
+        layer = self._layer()
+        config = SimpleNamespace(additional_config=RBLNConfig(use_custom_kernel=True))
+        with (
+            set_current_vllm_config(config),
+            pytest.raises(AssertionError, match="GDN requires KV blocks shaped"),
+        ):
+            layer.get_state_shape()
 
     def test_a_cache_dtype_option_does_not_move_the_state_dtype(self):
         layer = self._layer()
@@ -292,20 +373,24 @@ class TestStateSpec:
         layer.cache_config.mamba_ssm_cache_dtype = "float32"
         assert layer.get_state_dtype() == (torch.bfloat16,)
 
-    def test_the_model_declares_the_layers_state(self):
+    def test_model_state_sizing_uses_valid_shape(self):
+        layer = self._layer()
         vllm_config = SimpleNamespace(
             model_config=SimpleNamespace(
                 dtype=torch.bfloat16,
-                get_num_kv_heads=lambda parallel_config: 4,
-                get_head_size=lambda: 256,
+                hf_text_config=SimpleNamespace(
+                    linear_num_value_heads=48,
+                    linear_key_head_dim=128,
+                    linear_value_head_dim=128,
+                ),
             ),
-            parallel_config=None,
-            cache_config=SimpleNamespace(block_size=256),
+            parallel_config=SimpleNamespace(tensor_parallel_size=1),
+            cache_config=layer.cache_config,
+            num_speculative_tokens=0,
+            additional_config=RBLNConfig(),
         )
         model = RBLNQwen3_5ForConditionalGeneration
-        assert model.get_mamba_state_shape_from_config(vllm_config) == (
-            self._layer().get_state_shape()
-        )
+        assert model.get_mamba_state_shape_from_config(vllm_config) == ((48, 128, 128),)
         assert model.get_mamba_state_dtype_from_config(vllm_config) == (
             self._layer().get_state_dtype()
         )
