@@ -20,6 +20,9 @@ the next forward is already in flight.
 """
 
 from collections import deque
+from collections.abc import Mapping
+from dataclasses import dataclass
+from types import MappingProxyType
 
 import torch
 from vllm.v1.outputs import AsyncModelRunnerOutput, LogprobsTensors, ModelRunnerOutput
@@ -36,6 +39,20 @@ PendingTokenWriteback = deque[tuple[list[str], list[list[int]], dict[str, int]]]
 # its event completes instead of blocking on it.
 # TODO(torch-rbln): drop once its pinned allocator defers frees like CUDA's.
 _inflight_d2h: deque[tuple[torch.Event, torch.Tensor, torch.Tensor]] = deque()
+
+
+@dataclass(frozen=True)
+class SampledTokenState:
+    """One step's tokens, host buffer, event, and request-row snapshot.
+
+    CPU sources fill the host buffer in get_output(); device sources use D2H.
+    Request rows are separate from InputBatch's mutable valid-request view.
+    """
+
+    source_token_ids: torch.Tensor
+    host_buffer: torch.Tensor
+    copy_ready_event: torch.Event | None
+    request_id_to_index: Mapping[str, int]
 
 
 class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
@@ -60,13 +77,9 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
         self._invalid_req_indices = invalid_req_indices
         # For the token_ids_cpu write-back, applied by the main thread.
         self._pending_token_writeback = pending_token_writeback
-        self._req_ids = req_ids
         self._placeholder_pos = placeholder_pos
 
-        # Keep a reference to the device tensor to avoid it being
-        # deallocated until we finish copying it to the host.
-        self._sampled_token_ids = sampled_token_ids
-        self._sampled_token_ids_cpu = torch.empty(
+        host_buffer = torch.empty(
             sampled_token_ids.shape,
             dtype=sampled_token_ids.dtype,
             device="cpu",
@@ -75,30 +88,26 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
         )
         # Start the D2H right behind the sampler, as AsyncGPUModelRunnerOutput
         # does. From get_output() it would queue behind the next forward.
-        self._copy_ready_event: torch.Event | None = None
+        copy_ready_event: torch.Event | None = None
         while _inflight_d2h and _inflight_d2h[0][0].query():
             _inflight_d2h.popleft()
         if not sampled_token_ids.is_cpu:
-            self._sampled_token_ids_cpu.copy_(sampled_token_ids, non_blocking=True)
-            self._copy_ready_event = torch.Event(device=sampled_token_ids.device)
-            self._copy_ready_event.record()
-            _inflight_d2h.append(
-                (self._copy_ready_event, sampled_token_ids, self._sampled_token_ids_cpu)
-            )
+            host_buffer.copy_(sampled_token_ids, non_blocking=True)
+            copy_ready_event = torch.Event(device=sampled_token_ids.device)
+            copy_ready_event.record()
+            _inflight_d2h.append((copy_ready_event, sampled_token_ids, host_buffer))
+        self.sampled_token_state = SampledTokenState(
+            source_token_ids=sampled_token_ids,
+            host_buffer=host_buffer,
+            copy_ready_event=copy_ready_event,
+            request_id_to_index=MappingProxyType(
+                {req_id: i for i, req_id in enumerate(req_ids)}
+            ),
+        )
         # Logprobs ride the same deferral. Only the dense form is free of the
         # tokens: the topk form indexes by the sampled ids, so building it pulls
         # them to the host mid-step and serialises what async just decoupled.
         self._logprobs_tensors = logprobs_tensors
-
-    def host_copy(self) -> tuple[torch.Tensor, torch.Tensor, torch.Event | None]:
-        """Return (source, host tokens, readiness event). Wait on the event before
-        reading host tokens; CPU sources are immediately readable without one.
-        """
-        source_token_ids = self._sampled_token_ids
-        host_token_ids = (
-            source_token_ids if source_token_ids.is_cpu else self._sampled_token_ids_cpu
-        )
-        return source_token_ids, host_token_ids, self._copy_ready_event
 
     @worker_fail_fast
     def get_output(self) -> ModelRunnerOutput:
@@ -106,16 +115,17 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
 
         Blocks until the copy finishes; the executor decides which thread calls it.
         """
-        if self._copy_ready_event is not None:
-            self._copy_ready_event.synchronize()
+        token_state = self.sampled_token_state
+        if token_state.copy_ready_event is not None:
+            token_state.copy_ready_event.synchronize()
         else:
             # InferenceMode is thread-local, hence off here, and updating
-            # _sampled_token_ids_cpu - an inference tensor allocated under
+            # host_buffer - an inference tensor allocated under
             # sample_tokens - in place with it off is a hard error.
             with torch.inference_mode():
-                self._sampled_token_ids_cpu.copy_(self._sampled_token_ids)
+                token_state.host_buffer.copy_(token_state.source_token_ids)
 
-        valid_sampled_token_ids = self._sampled_token_ids_cpu.tolist()
+        valid_sampled_token_ids = token_state.host_buffer.tolist()
         for i in self._invalid_req_indices:
             valid_sampled_token_ids[i].clear()
 
@@ -126,7 +136,7 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
         # Copied: the scheduler trims these lists in place when a request stops.
         self._pending_token_writeback.append(
             (
-                self._req_ids,
+                list(token_state.request_id_to_index),
                 [list(ids) for ids in valid_sampled_token_ids],
                 self._placeholder_pos,
             )

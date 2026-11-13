@@ -1232,7 +1232,9 @@ def test_async_output_inherits_runner_fail_fast_policy(
     )
     output = runner.sample_tokens(None)
     error = RuntimeError("runner output copy failed")
-    monkeypatch.setattr(output._sampled_token_ids_cpu, "copy_", Mock(side_effect=error))
+    monkeypatch.setattr(
+        output.sampled_token_state.host_buffer, "copy_", Mock(side_effect=error)
+    )
     monkeypatch.setenv("VLLM_RBLN_DISABLE_WORKER_FAIL_FAST", "0")
     exit_process = Mock(side_effect=SystemExit(70))
     monkeypatch.setattr(worker_utils.os, "_exit", exit_process)
@@ -2201,7 +2203,7 @@ class TestRepairAsyncOutputTokenIds:
                 ),
                 prev_req_id_to_index=prev_index,
             ),
-            _prev_sampled_host_copy=None,
+            _previous_sampled_tokens=None,
         )
 
     def test_replaces_the_placeholder_tail(self):
@@ -2269,7 +2271,12 @@ class TestRepairAsyncOutputTokenIds:
         event = Mock()
         event.synchronize.side_effect = lambda: host_tokens.fill_(20)
         prev = r.input_batch.prev_sampled_token_ids
-        r._prev_sampled_host_copy = (prev, host_tokens, event)
+        r._previous_sampled_tokens = mr.SampledTokenState(
+            source_token_ids=prev,
+            host_buffer=host_tokens,
+            copy_ready_event=event,
+            request_id_to_index={"a": 0},
+        )
         r._repair_async_output_token_ids()
         assert ids == [[7, 20]]
         event.synchronize.assert_called_once_with()
@@ -2283,8 +2290,8 @@ class TestRepairAsyncOutputTokenIds:
         )
         previous_tokens = r.input_batch.prev_sampled_token_ids
         async_output, queue = _async_output(previous_tokens)
-        async_output._sampled_token_ids_cpu.fill_(-1)
-        r._prev_sampled_host_copy = async_output.host_copy()
+        async_output.sampled_token_state.host_buffer.fill_(-1)
+        r._previous_sampled_tokens = async_output.sampled_token_state
 
         r._repair_async_output_token_ids()
 
@@ -2297,7 +2304,12 @@ class TestRepairAsyncOutputTokenIds:
             req_ids=["a"], output_token_ids=ids, prev_index={"a": 0}, prev_tokens=[10]
         )
         event = Mock()
-        r._prev_sampled_host_copy = (torch.tensor([[10]]), torch.tensor([[20]]), event)
+        r._previous_sampled_tokens = mr.SampledTokenState(
+            source_token_ids=torch.tensor([[10]]),
+            host_buffer=torch.tensor([[20]]),
+            copy_ready_event=event,
+            request_id_to_index={"a": 0},
+        )
         r._repair_async_output_token_ids()
         assert ids == [[7, 10]]
         event.synchronize.assert_not_called()

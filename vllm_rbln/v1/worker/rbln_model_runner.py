@@ -170,6 +170,7 @@ from vllm_rbln.v1.worker import mega_cache
 from vllm_rbln.v1.worker.async_output import (
     AsyncRBLNModelRunnerOutput,
     PendingTokenWriteback,
+    SampledTokenState,
 )
 from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
 from vllm_rbln.v1.worker.dp_utils import (
@@ -334,10 +335,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         # async scheduling is the runner's concern; the copy into them is
         # enqueued by the sampler, next to the launch that produces the source.
         self._prev_token_host_buffer: torch.Tensor | None = None
-        # Last step's sampled tokens, as (source, host tokens, readiness event).
-        self._prev_sampled_host_copy: (
-            tuple[torch.Tensor, torch.Tensor, torch.Event | None] | None
-        ) = None
+        self._previous_sampled_tokens: SampledTokenState | None = None
         self._sampled_token_ring: list[torch.Tensor] = []
         self._ring_slot = 0
         self._async_logprobs_tensors: LogprobsTensors | None = None
@@ -1762,16 +1760,18 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
     def _prev_sampled_tokens(self, prev_sampled: torch.Tensor) -> list[int]:
         # Read the async output's D2H, which queues ahead of this step's forward.
         # prev_sampled.tolist() would wait for that forward to finish.
-        host_copy = self._prev_sampled_host_copy
-        if host_copy is None:
+        token_state = self._previous_sampled_tokens
+        if token_state is None:
             return prev_sampled[:, 0].tolist()
 
-        source_token_ids, host_token_ids, copy_ready_event = host_copy
-        if source_token_ids is not prev_sampled:
+        if token_state.source_token_ids is not prev_sampled:
             return prev_sampled[:, 0].tolist()
 
-        if copy_ready_event is not None:
-            copy_ready_event.synchronize()
+        if token_state.copy_ready_event is not None:
+            token_state.copy_ready_event.synchronize()
+            host_token_ids = token_state.host_buffer
+        else:
+            host_token_ids = token_state.source_token_ids
         return host_token_ids[:, 0].tolist()
 
     def _bookkeeping_sync(
@@ -2375,7 +2375,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             rank=self.parallel_config.rank,
             dp_rank=self.parallel_config.data_parallel_rank,
         )
-        self._prev_sampled_host_copy = async_output.host_copy()
+        self._previous_sampled_tokens = async_output.sampled_token_state
         return async_output
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:

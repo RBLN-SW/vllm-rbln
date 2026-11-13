@@ -55,12 +55,14 @@ def _output(req_ids):
 def _async_output(
     tokens: torch.Tensor,
     *,
+    req_ids=None,
     invalid_req_indices=(),
     fail_fast=False,
     rank=None,
     dp_rank=None,
 ):
-    req_ids = [f"r{i}" for i in range(len(tokens))]
+    if req_ids is None:
+        req_ids = [f"r{i}" for i in range(len(tokens))]
     queue: PendingTokenWriteback = deque()
     async_out = AsyncRBLNModelRunnerOutput(
         model_runner_output=_output(req_ids),
@@ -96,7 +98,9 @@ class TestGetOutput:
         error = RuntimeError("device output failed")
         if failure_stage == "copy":
             monkeypatch.setattr(
-                async_out._sampled_token_ids_cpu, "copy_", Mock(side_effect=error)
+                async_out.sampled_token_state.host_buffer,
+                "copy_",
+                Mock(side_effect=error),
             )
         else:
             async_out._logprobs_tensors = SimpleNamespace(
@@ -130,7 +134,7 @@ class TestGetOutput:
             torch.tensor([[7]], dtype=torch.int32), fail_fast=True, rank=2, dp_rank=1
         )
         monkeypatch.setattr(
-            async_out._sampled_token_ids_cpu,
+            async_out.sampled_token_state.host_buffer,
             "copy_",
             Mock(side_effect=RuntimeError("device output failed")),
         )
@@ -161,7 +165,7 @@ class TestGetOutput:
 
                     tokens = torch.tensor([[7]], dtype=torch.int32)
                     output, _ = _async_output(tokens, fail_fast=True)
-                    output._sampled_token_ids_cpu.copy_ = Mock(
+                    output.sampled_token_state.host_buffer.copy_ = Mock(
                         side_effect=RuntimeError("subprocess output copy failed")
                     )
                     thread = Thread(target=output.get_output, daemon=True)
@@ -186,18 +190,6 @@ class TestGetOutput:
         async_out, _ = _async_output(torch.tensor([[7], [8]], dtype=torch.int32))
         assert async_out.get_output().sampled_token_ids == [[7], [8]]
 
-    def test_cpu_host_copy_is_readable_before_get_output(self):
-        tokens = torch.tensor([[7], [8]], dtype=torch.int32)
-        async_out, queue = _async_output(tokens)
-        async_out._sampled_token_ids_cpu.fill_(-1)
-
-        source_tokens, host_tokens, copy_ready_event = async_out.host_copy()
-
-        assert source_tokens is tokens
-        assert copy_ready_event is None
-        assert host_tokens.tolist() == [[7], [8]]
-        assert not queue
-
     @pytest.mark.use_device
     def test_device_tokens_are_copied_behind_the_sampler(self):
         # The D2H is async only if the source lives on the device. A sampler
@@ -207,14 +199,14 @@ class TestGetOutput:
         logits = torch.tensor([[0.0, 5.0, 1.0], [9.0, 0.0, 2.0]], dtype=torch.float16)
         src = greedy(logits.to("rbln")).unsqueeze(-1)
         async_out, _ = _async_output(src)
-        source_tokens, host_tokens, copy_ready_event = async_out.host_copy()
-        assert source_tokens is src
-        assert copy_ready_event is not None
+        token_state = async_out.sampled_token_state
+        assert token_state.source_token_ids is src
+        assert token_state.copy_ready_event is not None
         # Overwrite the source, as a later step does to the ring slot. A copy
         # issued at construction still holds the original tokens.
         src.copy_(torch.tensor([[5], [6]], dtype=src.dtype).to("rbln"))
-        copy_ready_event.synchronize()
-        assert host_tokens.tolist() == [[1], [0]]
+        token_state.copy_ready_event.synchronize()
+        assert token_state.host_buffer.tolist() == [[1], [0]]
         assert async_out.get_output().sampled_token_ids == [[1], [0]]
 
     def test_clears_the_rows_the_sampler_discarded(self):
@@ -230,6 +222,24 @@ class TestGetOutput:
         assert req_ids == ["r0", "r1"]
         assert tokens == [[7], [8]]
         assert placeholder_pos == {"r0": 3, "r1": 3}
+
+    def test_writeback_preserves_request_rows_after_the_caller_reorders_ids(self):
+        req_ids = ["a", "b", "c"]
+        async_out, queue = _async_output(
+            torch.tensor([[7], [8], [9]], dtype=torch.int32),
+            req_ids=req_ids,
+            invalid_req_indices=[1],
+        )
+        req_ids.reverse()
+
+        async_out.get_output()
+
+        written_req_ids, tokens, _ = queue.popleft()
+        assert dict(zip(written_req_ids, tokens)) == {
+            "a": [7],
+            "b": [],
+            "c": [9],
+        }
 
     def test_the_queued_tokens_survive_an_in_place_trim_of_the_output(self):
         # The scheduler trims sampled_token_ids[i] in place once a request stops
