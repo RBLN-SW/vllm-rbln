@@ -56,4 +56,27 @@ def supports_rbln_multimodal(model: object) -> TypeIs[SupportsRBLNMultiModal]:
     return getattr(model, "merges_mm_embeds_in_graph", False) is True
 
 
-__all__ = ["SupportsRBLNMultiModal", "supports_rbln_multimodal"]
+@runtime_checkable
+class SupportsRBLNMmPrefix(Protocol):
+    """An mm prefix LM (upstream's ``is_mm_prefix_lm``) the RBLN vLLM path serves.
+
+    Each multimodal embedding range attends both ways on sliding layers only. A
+    prefill chunk never splits a range, and each row reads keys up to its range's
+    end.
+    """
+
+    max_mm_prefix_range_len: int
+    """The most positions one embeds range can span; the longest prefill chunk
+    must hold it."""
+
+
+def supports_rbln_mm_prefix(model: object) -> TypeIs[SupportsRBLNMmPrefix]:
+    return isinstance(model, SupportsRBLNMmPrefix)
+
+
+__all__ = [
+    "SupportsRBLNMmPrefix",
+    "SupportsRBLNMultiModal",
+    "supports_rbln_mm_prefix",
+    "supports_rbln_multimodal",
+]

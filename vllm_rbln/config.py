@@ -138,7 +138,9 @@ class RBLNConfig(RBLNConfigBase):
 
     encoder_token_budgets: list[int] = field(default_factory=list)
     """Output-token capacities of compiled encoder graphs, shared across modalities.
-    Empty uses the processor upper bounds for enabled modalities."""
+    Empty lets the model choose: MiniMax-M3 takes the processor upper bounds of
+    the enabled modalities, Gemma4 every supported soft token budget up to
+    max_soft_tokens."""
 
     use_w8a8: bool = False
     """Opt in to W8A8. W8A16 runs on every RBLN NPU, W8A8 only on the ones
@@ -209,8 +211,8 @@ class RBLNConfig(RBLNConfigBase):
 
 
 @dataclass
-class OptimumRBLNCompileInputs:
-    """Resolved inputs shared by cache hashing, vLLM config sync and compilation.
+class OptimumRBLNCompileConfig:
+    """Resolved model compilation settings shared by cache hashing and compilation.
 
     Must remain serializable for worker transfer via `additional_config`.
     """
@@ -255,10 +257,10 @@ class OptimumRBLNConfig(RBLNConfigBase):
     image_prefill_chunk_size: list[int] | None = field(default=None, metadata=_DERIVED)
     """Compiled image-prefill buckets (gemma3/gemma4) used for scheduler padding."""
 
-    compile_inputs: OptimumRBLNCompileInputs | None = field(
+    compile_config: OptimumRBLNCompileConfig | None = field(
         default=None, metadata=_DERIVED
     )
-    """Inputs shared by cache lookup and compilation.
+    """Settings shared by cache lookup and compilation.
 
     Runtime synchronization must not mutate them.
     """
