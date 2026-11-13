@@ -186,6 +186,18 @@ class TestGetOutput:
         async_out, _ = _async_output(torch.tensor([[7], [8]], dtype=torch.int32))
         assert async_out.get_output().sampled_token_ids == [[7], [8]]
 
+    def test_cpu_host_copy_is_readable_before_get_output(self):
+        tokens = torch.tensor([[7], [8]], dtype=torch.int32)
+        async_out, queue = _async_output(tokens)
+        async_out._sampled_token_ids_cpu.fill_(-1)
+
+        source_tokens, host_tokens, copy_ready_event = async_out.host_copy()
+
+        assert source_tokens is tokens
+        assert copy_ready_event is None
+        assert host_tokens.tolist() == [[7], [8]]
+        assert not queue
+
     @pytest.mark.use_device
     def test_device_tokens_are_copied_behind_the_sampler(self):
         # The D2H is async only if the source lives on the device. A sampler
@@ -195,9 +207,14 @@ class TestGetOutput:
         logits = torch.tensor([[0.0, 5.0, 1.0], [9.0, 0.0, 2.0]], dtype=torch.float16)
         src = greedy(logits.to("rbln")).unsqueeze(-1)
         async_out, _ = _async_output(src)
+        source_tokens, host_tokens, copy_ready_event = async_out.host_copy()
+        assert source_tokens is src
+        assert copy_ready_event is not None
         # Overwrite the source, as a later step does to the ring slot. A copy
         # issued at construction still holds the original tokens.
         src.copy_(torch.tensor([[5], [6]], dtype=src.dtype).to("rbln"))
+        copy_ready_event.synchronize()
+        assert host_tokens.tolist() == [[1], [0]]
         assert async_out.get_output().sampled_token_ids == [[1], [0]]
 
     def test_clears_the_rows_the_sampler_discarded(self):

@@ -90,9 +90,15 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
         # them to the host mid-step and serialises what async just decoupled.
         self._logprobs_tensors = logprobs_tensors
 
-    def host_copy(self) -> tuple[torch.Tensor, torch.Event | None]:
-        """The sampled-token D2H host buffer and its event (None: no D2H)."""
-        return self._sampled_token_ids_cpu, self._copy_ready_event
+    def host_copy(self) -> tuple[torch.Tensor, torch.Tensor, torch.Event | None]:
+        """Return (source, host tokens, readiness event). Wait on the event before
+        reading host tokens; CPU sources are immediately readable without one.
+        """
+        source_token_ids = self._sampled_token_ids
+        host_token_ids = (
+            source_token_ids if source_token_ids.is_cpu else self._sampled_token_ids_cpu
+        )
+        return source_token_ids, host_token_ids, self._copy_ready_event
 
     @worker_fail_fast
     def get_output(self) -> ModelRunnerOutput:
