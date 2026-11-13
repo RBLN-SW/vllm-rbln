@@ -1670,26 +1670,26 @@ class TestProcessKvCacheCopyOps:
 
     def test_eager_copy_mla_indexer_scale(self, monkeypatch):
         monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", True)
-        # DeepSeek-V3.2 carries three MLA-family caches and the indexer scale
-        # one is (num_blocks, block_tokens) -- no trailing head axis.
-        latent = torch.zeros(4, 8, 2)
-        scale = torch.zeros(4, 8)
-        latent[1] = 7.0
-        scale[1] = 9.0
+        latent = torch.zeros(4, 8, 768, dtype=torch.uint8)
+        indexer = torch.zeros(4, 8, 128, dtype=torch.float8_e4m3fn)
+        scale = torch.zeros(4, 8, dtype=torch.bfloat16)
+        caches = [latent, indexer, scale]
+        for i, cache in enumerate(caches):
+            shape = (8,) + (1,) * (cache.ndim - 2)
+            cache[1].copy_(torch.arange(8).view(shape) + i + 1)
         r = _make_runner_stub(
-            kv_caches=[latent, scale],
-            kv_cache_names=["latent", "scale"],
-            kv_cache_block_axes={"latent": 0, "scale": 0},
-            kv_cache_config=_copy_groups(["latent", "scale"]),
+            kv_caches=caches,
+            kv_cache_names=["latent", "indexer", "scale"],
+            kv_cache_block_axes={"latent": 0, "indexer": 0, "scale": 0},
+            kv_cache_config=_copy_groups(["latent", "indexer", "scale"]),
             _kernel_block_sizes=[8],
             model_config=SimpleNamespace(use_mla=True, enforce_eager=True),
             runtime_holder=[None],
         )
         r._process_kv_cache_copy_ops([KVCacheCopyOp(0, 1, 2, 3)])
-        assert (latent[2, :3, :] == 7.0).all()
-        assert (latent[2, 3:, :] == 0.0).all()
-        assert (scale[2, :3] == 9.0).all()
-        assert (scale[2, 3:] == 0.0).all()
+        for cache in caches:
+            assert torch.equal(cache[2, :3].float(), cache[1, :3].float())
+            assert torch.count_nonzero(cache[2, 3:].float()) == 0
 
     def test_only_the_op_group_is_copied(self, monkeypatch):
         monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", True)

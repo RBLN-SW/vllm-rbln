@@ -261,6 +261,33 @@ def _validate(vllm_config: "VllmConfig") -> None:
     # which runs after this, keys "unset" and "set to the budget" alike.
     rbln_config.prefill_chunk_size = chunks
 
+    # The FP8 indexer scale store cannot span blocks. Its per-token caches
+    # share block_size, so the default is the largest bucket dividing that block.
+    if (
+        text_config.model_type == "axk3"
+        and vllm_config.cache_config.cache_dtype.startswith("fp8")
+        and vllm_config.cache_config.enable_prefix_caching
+        and rbln_config.enable_sub_block_cache
+    ):
+        sub_block_size = rbln_config.sub_block_size
+        if sub_block_size is None:
+            sub_block_size = max(
+                (c for c in chunks if block_size > c and block_size % c == 0),
+                default=None,
+            )
+        if (
+            sub_block_size is not None
+            and sub_block_size < rbln_config.max_prefill_chunk_size
+        ):
+            raise ValueError(
+                "A.X-K3's FP8 DSA indexer scale cache requires sub_block_size to "
+                "equal the largest prefill bucket "
+                f"({rbln_config.max_prefill_chunk_size}); got {sub_block_size} "
+                f"with prefill_chunk_size={chunks}. Set --rbln-sub-block-size to "
+                f"{rbln_config.max_prefill_chunk_size} and use a --block-size "
+                "that is a larger multiple of it."
+            )
+
     if envs.VLLM_RBLN_COMPILE_ONLY and envs.VLLM_DISABLE_COMPILE_CACHE:
         # Compile-only compiles each graph and writes the .rbln artifact to
         # the compile cache (the runtime is built on a dummy device so no

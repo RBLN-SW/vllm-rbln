@@ -648,6 +648,59 @@ class TestRejectedConfigs:
         with pytest.raises(ValueError, match="divisible"):
             reconfigure(_ranks(data_parallel_size=2, max_num_seqs=5))
 
+    @pytest.mark.parametrize("cache_dtype", ["auto", "fp8", "fp8_e4m3"])
+    @pytest.mark.parametrize(
+        "chunks, sub_block_size, crosses_blocks",
+        [
+            (None, None, False),
+            (None, 128, False),
+            (None, 64, True),
+            ([64, 128], None, False),
+            ([64, 128], 128, False),
+            ([64, 128], 64, True),
+            ([32, 64], None, False),
+            ([32, 64], 64, False),
+            ([32, 64], 32, True),
+            ([64, 96], None, True),
+            ([64, 96], 64, True),
+        ],
+    )
+    def test_axk3_fp8_sub_blocks_keep_a_prefill_in_one_block(
+        self, reconfigure, cache_dtype, chunks, sub_block_size, crosses_blocks
+    ):
+        def axk3(config):
+            config.model_config.hf_text_config.model_type = "axk3"
+            config.cache_config.cache_dtype = cache_dtype
+            config.cache_config.enable_prefix_caching = True
+            config.additional_config.sub_block_size = sub_block_size
+            config.additional_config.prefill_chunk_size = chunks
+
+        if cache_dtype.startswith("fp8") and crosses_blocks:
+            with pytest.raises(ValueError, match="FP8 DSA indexer scale cache"):
+                reconfigure(axk3)
+        else:
+            reconfigure(axk3)
+
+    @pytest.mark.parametrize(
+        "model_type, prefix_caching, sub_block_cache",
+        [
+            ("minimax_m3", True, True),
+            ("axk3", False, True),
+            ("axk3", True, False),
+        ],
+    )
+    def test_fp8_scale_limit_only_applies_to_active_axk3_sub_blocks(
+        self, reconfigure, model_type, prefix_caching, sub_block_cache
+    ):
+        def mutate(config):
+            config.model_config.hf_text_config.model_type = model_type
+            config.cache_config.cache_dtype = "fp8"
+            config.cache_config.enable_prefix_caching = prefix_caching
+            config.additional_config.enable_sub_block_cache = sub_block_cache
+            config.additional_config.prefill_chunk_size = [64, 96]
+
+        reconfigure(mutate)
+
     def test_a_prefill_chunk_above_the_token_budget_is_refused(self, reconfigure):
         with pytest.raises(ValueError, match="exceeds"):
             reconfigure(_prefill_chunk(256))
