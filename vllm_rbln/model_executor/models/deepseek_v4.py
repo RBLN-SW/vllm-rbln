@@ -39,6 +39,7 @@ The MTP head is not modeled; its weights are skipped.
 import math
 from collections.abc import Iterable
 from functools import cache
+from itertools import islice
 
 import torch
 import torch.nn.functional as F
@@ -973,7 +974,9 @@ class RBLNDeepseekV4Model(nn.Module):
         h = inputs_embeds if inputs_embeds is not None else self.embed_input_ids(input_ids)
         batch, tokens, hidden = h.shape
         streams = h.unsqueeze(1).expand(batch, self.hc_mult, tokens, hidden).contiguous()
-        for layer in self.layers[self.start_layer : self.end_layer]:
+        # islice, not a slice: slicing a ModuleList builds a new one while tracing, and Dynamo
+        # then lifts every layer weight as a graph input instead of keeping it a constant.
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
             streams = layer(positions, streams, input_ids)
         return self.norm(self._hc_head(streams))
 
