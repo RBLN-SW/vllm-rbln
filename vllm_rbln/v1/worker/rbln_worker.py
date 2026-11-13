@@ -15,7 +15,6 @@
 
 import os
 import time
-from functools import cached_property
 from types import NoneType
 from typing import TYPE_CHECKING, Any
 
@@ -78,7 +77,6 @@ from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
 from vllm_rbln.v1.worker.utils import (
     RblnProfilerWrapper,
     compile_and_warmup_skip_reason,
-    compute_rbln_local_omp_cpuid,
     dynamic_kv_enabled,
     estimate_model_kernel_size,
     get_default_num_threads,
@@ -87,7 +85,6 @@ from vllm_rbln.v1.worker.utils import (
     read_rbln_card_dram_used_bytes,
     set_cpu_affinity,
     set_omp_num_threads,
-    set_preferred_memory_node,
     worker_fail_fast,
 )
 
@@ -194,8 +191,6 @@ class RBLNWorker(WorkerBase):
             self.local_rank,
             current_platform.dist_backend,
         )
-        # Before model load and warm-up, whose host pages the decode loop reuses.
-        set_preferred_memory_node(self.rank, self.local_rank, self._rbln_omp_cpuid)
 
         # Set random seed.
         set_random_seed(self.model_config.seed)
@@ -224,14 +219,15 @@ class RBLNWorker(WorkerBase):
     @worker_fail_fast
     def determine_available_memory(self) -> int:
         """Estimate KV-cache DRAM, discounting the fixed command-stream buffers
-        that warm-up's compiled decode runtimes reserve.
+        that warm-up's compiled runtimes reserve.
 
-        One runtime per (decode bucket, query length): non-spec has a single
-        query length (1); spec adds a second (num_spec + 1) per bucket;
-        specialized-MoE decode repeats those plus one DP-asymmetric spec dummy.
-        A draft model, when present, adds its own -- one per bucket, plus the
-        specialized-MoE fallback. Counting all of them keeps the KV-block estimate
-        from over-reserving and OOMing at runtime.
+        One per decode graph and prefill chunk size the runner will compile. A draft
+        model, when present, adds one, and a bucket's worth more (plus the
+        specialized-MoE fallback) wherever the runner compiles decode graphs --
+        or one more on a producer whose drafter still warms its decode pass.
+        Counting them keeps the KV-block estimate from over-reserving and OOMing
+        at runtime; the draft's share can still fall short of what a drafter
+        compiles.
         """
         params_dict = dict(self.model_runner.model.named_parameters())
         device_name = current_platform.get_device_name().lower()
@@ -242,16 +238,12 @@ class RBLNWorker(WorkerBase):
             self.model_runner.bucketing_manager.decode_batch_buckets_count
         )
 
-        spec_enabled = self.speculative_config is not None
-        variable_decode_query_lens = (
-            spec_enabled and not self.model_runner.uses_fixed_decode_window
+        # Read off the runner that compiles them, so this count and
+        # run_model_graphs cannot drift apart.
+        decode_graph_shapes = self.model_runner.decode_graph_shapes()
+        num_runtimes = len(self.model_runner.prefill_chunk_sizes) + len(
+            decode_graph_shapes
         )
-        num_decode_query_lens = 2 if variable_decode_query_lens else 1
-        num_runtimes = 1 + decode_batch_buckets_count * num_decode_query_lens
-        if has_specialized_moe_decode:
-            num_runtimes += num_decode_query_lens
-            if variable_decode_query_lens:
-                num_runtimes += 1
 
         ratio: float = 1.0
         if self.model_config.quantization is not None:
@@ -369,6 +361,8 @@ class RBLNWorker(WorkerBase):
         )
 
         if draft_model is not None and draft_model_config is not None:
+            # draft_model is read off the drafter, so it cannot be absent here.
+            assert drafter is not None
             if draft_parallel_config is None:
                 draft_parallel_config = self.parallel_config
 
@@ -392,12 +386,19 @@ class RBLNWorker(WorkerBase):
                 n_model_bytes=n_model_bytes,
             )
 
-            # Draft runtimes: one per bucket, plus the specialized-MoE fallback.
+            # Draft runtimes: one, plus the decode set the drafter warms.
             # TODO(RBLN): an undercount since the draft started compiling both decode
             # query lengths. Reserving for what it actually compiles needs the count
             # split by speculative method, which the medusa path would want too.
-            num_draft_runtimes = 1 + decode_batch_buckets_count
-            if has_specialized_moe_decode:
+            num_draft_runtimes = 1
+            if decode_graph_shapes:
+                num_draft_runtimes += decode_batch_buckets_count
+                if has_specialized_moe_decode:
+                    num_draft_runtimes += 1
+            elif drafter.warms_up_decode_graphs_on_a_producer:
+                # run_model_graphs issues one drafter dummy on a producer, so
+                # the decode buckets collapse to the one query length it warms.
+                # The shapes a drafter compiles per dummy are the TODO's share.
                 num_draft_runtimes += 1
             draft_n_model_bytes = 0
 
@@ -701,13 +702,11 @@ class RBLNWorker(WorkerBase):
 
     @worker_fail_fast
     def execute_dummy_batch(self) -> None:
-        # Serving-time DP-idle step: this rank has no real work. Run a non-warmup
-        # dummy (warmup=False) so it contributes a minimal (num_reqs=1, qlen=1)
-        # entry to the cross-DP collective, is EXCLUDED from the shape decision,
-        # then adopts the busy-decided shape and runs the same compiled decode
-        # graph the busy ranks run -- so an idle rank never drags the collective
-        # into a fall-back route nor lands on an uncompiled shape.
-        self.model_runner._dummy_run(1, 1, is_prefill=False, warmup=False)
+        # A strict producer has no decode graph to adopt, so its idle step asks
+        # for the prefill one; _dummy_run pads that to the width warm-up built.
+        self.model_runner._dummy_run(
+            1, 1, is_prefill=self.model_runner.is_strict_kv_producer, warmup=False
+        )
 
     # def add_lora(self, lora_request: LoRARequest) -> bool:
     #     return self.model_runner.add_lora(lora_request)
@@ -752,13 +751,6 @@ class RBLNWorker(WorkerBase):
         if num_removed:
             logger.info("Released %d RBLN offload temp file(s)", num_removed)
 
-    @cached_property
-    def _rbln_omp_cpuid(self) -> str:
-        # Computed once: the CPUs it reads shrink once the binding is applied.
-        return compute_rbln_local_omp_cpuid(
-            self.rank, self.local_rank, self.parallel_config
-        )
-
     def _ensure_rbln_host_threads_before_compile(self) -> None:
         """Set OpenMP / torch / numba threads before ``warm_up_model()`` without
         CPU affinity.
@@ -772,7 +764,11 @@ class RBLNWorker(WorkerBase):
         if self._rbln_host_threads_before_compile_ready:
             return
 
-        allocated_cpus = get_rbln_planned_affinity_cpu_count(self._rbln_omp_cpuid)
+        allocated_cpus = get_rbln_planned_affinity_cpu_count(
+            self.rank,
+            self.local_rank,
+            self.parallel_config,
+        )
         num_threads = get_default_num_threads(
             allocated_cpus, get_num_local_ranks(self.parallel_config)
         )
@@ -804,7 +800,11 @@ class RBLNWorker(WorkerBase):
         if self._rbln_cpu_affinity_applied:
             return
 
-        set_cpu_affinity(self.rank, self.local_rank, self._rbln_omp_cpuid)
+        set_cpu_affinity(
+            self.rank,
+            self.local_rank,
+            self.parallel_config,
+        )
         self._rbln_cpu_affinity_applied = True
 
 
