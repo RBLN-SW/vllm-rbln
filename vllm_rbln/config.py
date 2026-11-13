@@ -83,11 +83,14 @@ class RBLNConfigBase:
     """
 
     prefill_chunk_size: list[int] | None = None
-    """Compiled prefill graph lengths. The vllm model path accepts multiple
-    lengths and uses the shortest that fits each chunk; if unset, it uses
-    [max_num_batched_tokens]. The optimum model path accepts exactly one length;
-    if unset, it uses optimum-rbln's default when compiling or the pre-compiled
-    model's chunk size. Independent of the scheduling token budget."""
+    """Compiled prefill graph lengths, separate from the scheduling token budget.
+
+    The vllm model path accepts multiple lengths and chooses the shortest that
+    fits each chunk. If unset, it uses [max_num_batched_tokens].
+
+    The optimum model path accepts exactly one length. If unset, it uses
+    optimum-rbln's default for compilation or the pre-compiled model's chunk size.
+    """
 
     @field_validator("prefill_chunk_size", mode="before")
     @classmethod
