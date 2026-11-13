@@ -491,13 +491,13 @@ class TestGetKvCacheNames:
         assert get_kv_cache_names(layers) == list(names)
 
     @pytest.mark.parametrize("aux_name", ["indexer", "renamed", "conv_ring"])
-    def test_only_unnumbered_aux_caches_declare_a_slot(self, aux_name):
+    def test_only_unnumbered_aux_caches_declare_a_subindex(self, aux_name):
         main = "model.layers.3.attn"
         aux = f"{main}.{aux_name}"
         scale = f"{aux}.scales"
         layers = {
-            scale: SimpleNamespace(kv_cache_slot=2),
-            aux: SimpleNamespace(kv_cache_slot=1),
+            scale: SimpleNamespace(kv_cache_subindex=2),
+            aux: SimpleNamespace(kv_cache_subindex=1),
             main: SimpleNamespace(),
         }
         assert get_kv_cache_names(layers) == [main, aux, scale]

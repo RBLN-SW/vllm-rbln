@@ -373,7 +373,7 @@ class RBLNMiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
         self.layer_index: int | None = None
-        self.kv_cache_slot = 1
+        self.kv_cache_subindex = 1
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         # Key-only: MLAAttentionSpec budgets one vector per token (not K + V).

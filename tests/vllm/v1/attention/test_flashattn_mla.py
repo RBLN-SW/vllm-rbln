@@ -269,8 +269,8 @@ class TestIndexerCacheBackends:
         cache = self._indexer_cache(monkeypatch, model_dtype)
         assert cache.dtype == torch.float8_e4m3fn
         assert cache.scale_cache.dtype == model_dtype
-        assert cache.kv_cache_slot == 1
-        assert cache.scale_cache.kv_cache_slot == 2
+        assert cache.kv_cache_subindex == 1
+        assert cache.scale_cache.kv_cache_subindex == 2
         assert (
             cache.scale_cache.get_attn_backend() is RBLNDeepseekV32IndexerScaleBackend
         )

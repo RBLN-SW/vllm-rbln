@@ -103,9 +103,9 @@ class TestLayerIndexFollowsCacheOrder:
     decoder layer."""
 
     @staticmethod
-    def _bind(make_model_runner, names, cache_slots):
+    def _bind(make_model_runner, names, cache_subindices):
         runner = make_model_runner(
-            layers=names, cache_slots=cache_slots, init_kv_cache=False
+            layers=names, cache_subindices=cache_subindices, init_kv_cache=False
         )
         ctx = runner.compilation_config.static_forward_context
         assert all(ctx[name].layer_index is None for name in names)
@@ -128,7 +128,7 @@ class TestLayerIndexFollowsCacheOrder:
         runner, after = self._bind(
             make_model_runner,
             names,
-            cache_slots={names[2]: 1},
+            cache_subindices={names[2]: 1},
         )
         assert runner.kv_cache_names == list(names)
         assert after == {name: i for i, name in enumerate(names)}
@@ -144,7 +144,7 @@ class TestLayerIndexFollowsCacheOrder:
         runner, after = self._bind(
             make_model_runner,
             names,
-            cache_slots={name: i % 3 for i, name in enumerate(names) if i % 3},
+            cache_subindices={name: i % 3 for i, name in enumerate(names) if i % 3},
         )
         assert runner.kv_cache_names == list(names)
         assert after == {name: i for i, name in enumerate(names)}
@@ -478,8 +478,9 @@ class TestLayerIndexFollowsCachePosition:
         runner = make_model_runner(
             layers=self.LAYERS,
             init_kv_cache=False,
-            cache_slots={
-                self.LAYERS[i]: slot for i, slot in ((1, 1), (2, 2), (5, 1), (6, 2))
+            cache_subindices={
+                self.LAYERS[i]: subindex
+                for i, subindex in ((1, 1), (2, 2), (5, 1), (6, 2))
             },
         )
 

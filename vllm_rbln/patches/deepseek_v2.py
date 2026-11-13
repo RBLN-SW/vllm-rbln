@@ -170,7 +170,7 @@ def rbln_indexer_cache_init(self, *args, **kwargs) -> None:
 
     model_config = vllm_config.model_config
     self.layer_index = None
-    self.kv_cache_slot = 1
+    self.kv_cache_subindex = 1
 
     # register the per-token scale cache (2-cache spec).
     self.scale_cache = None
@@ -185,7 +185,7 @@ def rbln_indexer_cache_init(self, *args, **kwargs) -> None:
         )
         scale.get_attn_backend = lambda: RBLNDeepseekV32IndexerScaleBackend
         scale.layer_index = None
-        scale.kv_cache_slot = 2
+        scale.kv_cache_subindex = 2
         self.scale_cache = scale
 
 
