@@ -117,6 +117,12 @@ def _validate(vllm_config: "VllmConfig") -> None:
         raise ValueError("LoRA is not supported on RBLN.")
 
     if _uses_gated_delta_net(model_config):
+        if rbln_config.use_custom_kernel:
+            raise ValueError(
+                "GatedDeltaNet models do not take --rbln-use-custom-kernel on the "
+                "RBLN vLLM path yet: its attention kernels read the KV cache in "
+                "another layout than the state, which shares that cache's blocks."
+            )
         if (
             vllm_config.cache_config.user_specified_mamba_block_size
             and vllm_config.cache_config.mamba_block_size < model_config.max_model_len

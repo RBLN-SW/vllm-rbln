@@ -670,6 +670,14 @@ class TestRejectedConfigs:
         with pytest.raises(ValueError, match="Speculative decoding"):
             reconfigure(speculative)
 
+    def test_gdn_models_reject_the_custom_kernel_option(self, reconfigure, gdn):
+        def custom_kernel(config):
+            gdn(config)
+            config.additional_config.use_custom_kernel = True
+
+        with pytest.raises(ValueError, match="rbln-use-custom-kernel"):
+            reconfigure(custom_kernel)
+
     def test_every_gdn_prefill_chunk_size_is_a_multiple_of_128(self, reconfigure, gdn):
         def chunks(sizes):
             def mutate(config):
