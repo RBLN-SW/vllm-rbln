@@ -689,6 +689,16 @@ class TestRejectedConfigs:
         with pytest.raises(ValueError, match="rbln-use-custom-kernel"):
             reconfigure(custom_kernel)
 
+    def test_gdn_models_keep_the_kv_cache_in_the_activation_dtype(
+        self, reconfigure, gdn
+    ):
+        def fp8_cache(config):
+            gdn(config)
+            config.cache_config.cache_dtype = "fp8"
+
+        with pytest.raises(ValueError, match="kv-cache-dtype"):
+            reconfigure(fp8_cache)
+
     def test_every_gdn_prefill_chunk_size_is_a_multiple_of_128(self, reconfigure, gdn):
         def chunks(sizes):
             def mutate(config):

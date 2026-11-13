@@ -161,13 +161,19 @@ def _validate(vllm_config: "VllmConfig") -> None:
         # cover the recurrent state, with any remainder as padding.
         text_config = model_config.hf_text_config
         cache_config = vllm_config.cache_config
+        kv_dtype = kv_cache_dtype_str_to_dtype(cache_config.cache_dtype, model_config)
+        if kv_dtype != model_config.dtype:
+            raise ValueError(
+                "A GatedDeltaNet state is declared in the activation dtype as a "
+                "full-attention KV block on RBLN, so the KV cache has to keep "
+                f"that dtype; got --kv-cache-dtype {cache_config.cache_dtype} "
+                f"for dtype {model_config.dtype}."
+            )
         token_bytes = (
             2
             * model_config.get_num_kv_heads(parallel_config)
             * model_config.get_head_size()
-            * get_dtype_size(
-                kv_cache_dtype_str_to_dtype(cache_config.cache_dtype, model_config)
-            )
+            * get_dtype_size(kv_dtype)
         )
         state_bytes = (
             heads_v
