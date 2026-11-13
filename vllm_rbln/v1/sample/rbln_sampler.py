@@ -38,6 +38,7 @@ from vllm_rbln.v1.sample.ops.fused_penalty import (
     uses_argmax_invariant_processors,
     without_penalties_and_logit_bias,
 )
+from vllm_rbln.v1.sample.ops.min_p import apply_min_p, graph_log_min_p
 from vllm_rbln.v1.sample.ops.top_k_top_p import build_op_top_k_top_p
 
 logger = init_logger(__name__)
@@ -91,6 +92,20 @@ def rbln_top_k_top_p_sample(
     return sampled
 
 
+def rbln_min_p_sample(
+    logits: torch.Tensor,
+    temperature: torch.Tensor,
+    k: torch.Tensor,
+    p: torch.Tensor,
+    log_min_p: torch.Tensor,
+) -> torch.Tensor:
+    """Temperature, min_p, then top-k top-p. `k` and `p` are never None here, so
+    one graph serves every filter combination."""
+    logits = logits.div_(temperature.to(logits.dtype).unsqueeze(dim=1))
+    probs = torch.nn.functional.softmax(apply_min_p(logits, log_min_p), dim=-1)
+    return torch.ops.rbln.top_k_top_p(probs, k, p)
+
+
 def rbln_greedy_sample(logits: torch.Tensor) -> torch.Tensor:
     """Implementation of RBLN greedy sampling.
 
@@ -99,6 +114,31 @@ def rbln_greedy_sample(logits: torch.Tensor) -> torch.Tensor:
     """
     # NOTE(RBLN): argmax op is registered in the compiler
     return torch.ops.rbln.argmax(logits)
+
+
+_KEEP_ALL: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _filled_top_k_top_p(
+    k: torch.Tensor | None,
+    p: torch.Tensor | None,
+    rows: int,
+    vocab: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`k` and `p` with an unused filter spelled as keep-everything."""
+    if k is None or p is None:
+        key = (rows, vocab, device)
+        if key not in _KEEP_ALL:
+            with torch.inference_mode(False):
+                _KEEP_ALL[key] = (
+                    torch.full((rows,), vocab, dtype=torch.int32, device=device),
+                    torch.ones((rows,), dtype=torch.float32, device=device),
+                )
+        keep_k, keep_p = _KEEP_ALL[key]
+        k = keep_k if k is None else k
+        p = keep_p if p is None else p
+    return _as_batch_tensor(k), _as_batch_tensor(p)
 
 
 def _as_batch_tensor(t: torch.Tensor | None) -> torch.Tensor | None:
@@ -248,6 +288,11 @@ class RBLNSampler(VLLMSampler):
             else None
         )
         self._fused_graphs: dict[tuple, Callable[..., torch.Tensor]] = {}
+        self._compiled_min_p_sample = (
+            compile_sampler(rbln_min_p_sample, compile_context)
+            if self._penalty_state is not None
+            else None
+        )
 
     def _fused_graph(
         self, kind: FusedGraphKind, plan: FusedPenaltyPlan
@@ -271,13 +316,32 @@ class RBLNSampler(VLLMSampler):
         """Compile the graphs `sampling_metadata` reaches, fused ones at every k."""
         _ = self(logits=logits, sampling_metadata=sampling_metadata)
         state = self._penalty_state
-        if state is None or not supports_vocab(logits.shape[-1]):
+        if state is None:
+            return
+        min_p_sample = self._compiled_min_p_sample
+        temperature = sampling_metadata.temperature
+        if (
+            min_p_sample is not None
+            and temperature is not None
+            and not sampling_metadata.all_greedy
+        ):
+            rows, vocab = logits.shape
+            top_k, top_p = _filled_top_k_top_p(None, None, rows, vocab, logits.device)
+            min_p_sample(
+                logits.clone(),
+                _as_batch_tensor(temperature),
+                top_k,
+                top_p,
+                torch.full((rows,), float("-inf"), device=logits.device),
+            )
+        if not supports_vocab(logits.shape[-1]):
             return
         for k in state.k_buckets(logits.shape):
             plan = state.identity_plan(logits.shape, logits.device, k)
             self.sample(logits.clone(), sampling_metadata, penalty=plan)
             if not sampling_metadata.all_greedy:
-                # Steps with min_p penalize before the eager processors.
+                # Steps with min_p or other argmax-invariant processors
+                # penalize first.
                 self._fused_graph("penalize", plan)(
                     logits.clone(), plan.cidx, plan.lanes
                 )
@@ -332,6 +396,25 @@ class RBLNSampler(VLLMSampler):
         temperature = sampling_metadata.temperature
         if not sampling_metadata.all_random:
             temperature = torch.where(temperature < _SAMPLING_EPS, 1.0, temperature)
+
+        min_p_sample = self._compiled_min_p_sample
+        log_min_p = (
+            graph_log_min_p(sampling_metadata, logits.shape[0], logits.device)
+            if min_p_sample is not None
+            else None
+        )
+        if min_p_sample is not None and log_min_p is not None:
+            if penalty is not None:
+                logits = self._fused_graph("penalize", penalty)(
+                    logits, penalty.cidx, penalty.lanes
+                )
+            rows, vocab = logits.shape
+            k, p = build_op_top_k_top_p(sampling_metadata, rows, vocab, logits.device)
+            k, p = _filled_top_k_top_p(k, p, rows, vocab, logits.device)
+            out = min_p_sample(logits, _as_batch_tensor(temperature), k, p, log_min_p)
+            if staging_owner is not None:
+                out = _stage_into(staging_owner, out)
+            return out, None
 
         argmax_invariant = sampling_metadata.logitsprocs.argmax_invariant
         # if argmax_invariant processors are active, apply temperature scaling
