@@ -335,8 +335,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         # async scheduling is the runner's concern; the copy into them is
         # enqueued by the sampler, next to the launch that produces the source.
         self._prev_token_host_buffer: torch.Tensor | None = None
-        # Last step's sampled tokens, as (device, host copy, copy event).
-        self._prev_sampled_host: (
+        # Last step's sampled tokens, as (source, host tokens, readiness event).
+        self._prev_sampled_host_copy: (
             tuple[torch.Tensor, torch.Tensor, torch.Event | None] | None
         ) = None
         self._sampled_token_ring: list[torch.Tensor] = []
@@ -1831,12 +1831,17 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
     def _prev_sampled_tokens(self, prev_sampled: torch.Tensor) -> list[int]:
         # Read the async output's D2H, which queues ahead of this step's forward.
         # prev_sampled.tolist() would wait for that forward to finish.
-        host = self._prev_sampled_host
-        if host is not None and host[0] is prev_sampled:
-            if host[2] is not None:
-                host[2].synchronize()
-            return host[1][:, 0].tolist()
-        return prev_sampled[:, 0].tolist()
+        host_copy = self._prev_sampled_host_copy
+        if host_copy is None:
+            return prev_sampled[:, 0].tolist()
+
+        source_token_ids, host_token_ids, copy_ready_event = host_copy
+        if source_token_ids is not prev_sampled:
+            return prev_sampled[:, 0].tolist()
+
+        if copy_ready_event is not None:
+            copy_ready_event.synchronize()
+        return host_token_ids[:, 0].tolist()
 
     def _bookkeeping_sync(
         self,
@@ -2458,10 +2463,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             rank=self.parallel_config.rank,
             dp_rank=self.parallel_config.data_parallel_rank,
         )
-        self._prev_sampled_host = (
-            sampler_output.sampled_token_ids,
-            *async_output.host_copy(),
-        )
+        self._prev_sampled_host_copy = async_output.host_copy()
         return async_output
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
