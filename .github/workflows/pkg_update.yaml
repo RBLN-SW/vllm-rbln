@@ -10,6 +10,13 @@ on:
           description: Version of optimum-rbln to add
           required: true
           type: string
+    secrets:
+      GIT_PAT:
+        required: true
+      UDC_NEXUS_USERNAME:
+        required: true
+      UDC_NEXUS_PASSWORD:
+        required: true
 
 jobs:
   check-skip:
@@ -31,15 +38,17 @@ jobs:
 
       - name: Target Optimum Version
         id: optimum-version
+        env:
+          OPTIMUM_VERSION: ${{ inputs.optimum-version }}
         run: |
-          if [ "${{ inputs.optimum-version }}" == "latest" ]; then
+          if [ "$OPTIMUM_VERSION" == "latest" ]; then
             # Get the latest version from PyPI
             # Can be mismatched Version when it's not released to PyPI yet.
             VERSION=$(curl -s https://pypi.org/pypi/optimum-rbln/json | \
                       jq -r '.releases | keys | .[]' | \
                       python .github/scripts/parsing_latest_version.py)
           else
-            VERSION=${{ inputs.optimum-version }}
+            VERSION="$OPTIMUM_VERSION"
           fi
           # Remove 'v' prefix if present
           VERSION="${VERSION#v}"
@@ -71,7 +80,10 @@ jobs:
     with:
       python-version: ${{ inputs.python-version }}
       optimum-version: ${{ needs.check-skip.outputs.target-version }}
-    secrets: inherit
+    secrets:
+      GIT_PAT: ${{ secrets.GIT_PAT }}
+      UDC_NEXUS_USERNAME: ${{ secrets.UDC_NEXUS_USERNAME }}
+      UDC_NEXUS_PASSWORD: ${{ secrets.UDC_NEXUS_PASSWORD }}
 
   summary:
     runs-on: rbln-sw-k8s-general
