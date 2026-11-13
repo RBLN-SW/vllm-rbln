@@ -30,7 +30,8 @@ class RBLNUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         if moe.swiglu_limit is not None:
             raise NotImplementedError(
                 "RBLN unquantized MoE does not support "
-                f"swiglu_limit={moe.swiglu_limit}: custom_moe_glu has no SwiGLU clamp"
+                f"swiglu_limit={moe.swiglu_limit}: custom_moe has no SwiGLU clamp "
+                "on 16-bit weights"
             )
         super().__init__(moe)
 
@@ -56,16 +57,13 @@ class RBLNUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         hidden_states = x.reshape(num_tokens, -1)
         masked_routing_weights = router_logits
 
-        final_hidden_states = torch.ops.rbln_custom_ops.custom_moe_glu(
+        final_hidden_states = torch.ops.rbln_custom_ops.custom_moe(
             hidden_states,
             gate_proj_weight,
             up_proj_weight,
             down_proj_weight,
             masked_routing_weights,
             layer.activation.value,
-            layer.expert_map,
-            None,
-            None,
-            None,
+            expert_map=layer.expert_map,
         )
         return final_hidden_states.reshape(orig_shape)

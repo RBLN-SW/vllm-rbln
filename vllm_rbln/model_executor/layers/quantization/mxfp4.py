@@ -32,6 +32,10 @@ from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
 
+# custom_moe's weight_dtype for fp4 weights: two values a byte in a uint8
+# container. The E8M0 (uint8) scales make it MXFP4.
+_MXFP4_WEIGHT_DTYPE = "float4_e2m1fn"
+
 
 class RBLNGptOssMxfp4Config(GptOssMxfp4Config):
     """GPT-OSS MXFP4 quantization config for RBLN.
@@ -57,8 +61,9 @@ class RBLNGptOssMxfp4MoEMethod(GptOssMxfp4MoEMethod):
         self.mxfp4_backend = Mxfp4MoeBackend.NONE
         self.moe_kernel = None
 
-        self.swiglu_alpha = torch.tensor(1.702, dtype=torch.float32)
-        self.swiglu_limit = torch.tensor(7.0, dtype=torch.float32)
+        # GPT-OSS's SwiGLU-OAI alpha / clamp limit.
+        self.swiglu_alpha = 1.702
+        self.swiglu_limit = 7.0
 
     @property
     def is_monolithic(self) -> bool:
@@ -147,21 +152,23 @@ class RBLNGptOssMxfp4MoEMethod(GptOssMxfp4MoEMethod):
             gate_scales, up_scales = layer.gate_proj_scales, layer.up_proj_scales
             gate_bias, up_bias = layer.gate_proj_bias, layer.up_proj_bias
 
-        out = torch.ops.rbln_custom_ops.custom_moe_glu_mxfp4(
+        out = torch.ops.rbln_custom_ops.custom_moe(
             hidden_states,
             gate_blocks,
-            gate_scales,
-            gate_bias,
             up_blocks,
-            up_scales,
-            up_bias,
             layer.down_proj_blocks,
-            layer.down_proj_scales,
-            layer.down_proj_bias,
             masked_routing_weights,
-            self.swiglu_alpha,
-            self.swiglu_limit,
-            layer.expert_map,
+            "swigluoai",
+            gate_proj_scale=gate_scales,
+            up_proj_scale=up_scales,
+            down_proj_scale=layer.down_proj_scales,
+            weight_dtype=_MXFP4_WEIGHT_DTYPE,
+            gate_proj_bias=gate_bias,
+            up_proj_bias=up_bias,
+            down_proj_bias=layer.down_proj_bias,
+            swiglu_alpha=self.swiglu_alpha,
+            swiglu_limit=self.swiglu_limit,
+            expert_map=layer.expert_map,
         )
         return out.reshape(orig_shape)
 
