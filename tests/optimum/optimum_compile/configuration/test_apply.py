@@ -25,12 +25,7 @@ from vllm_rbln.config import build_optimum_rbln_config
 from vllm_rbln.utils.optimum.configuration.runtime_config import (
     apply_runtime_config,
     get_runtime_num_blocks,
-    get_user_max_num_batched_tokens,
-    is_chunked_prefill_arch,
     prepare_runtime_config,
-    store_image_prefill_chunk_size,
-    update_max_num_batched_tokens,
-    validate_user_prefill_chunk_size,
 )
 
 pytestmark = pytest.mark.usefixtures("set_npu_env_var")
@@ -527,7 +522,8 @@ def test_prepared_settings_are_owned_and_applied_without_reading_metadata(
 
     assert cfg.scheduler_config.max_num_seqs == 2
     assert cfg.model_config.max_model_len == 4096
-    assert cfg.scheduler_config.max_num_batched_tokens == 256
+    assert cfg.scheduler_config.max_num_batched_tokens == 4096
+    assert cfg.additional_config.prefill_chunk_size == 256
     assert cfg.additional_config.num_devices_per_local_rank == 2
     assert cfg.cache_config.gpu_memory_utilization == 0.9
     assert cfg.model_config.dtype == (torch.bfloat16 if precompiled else torch.float32)
@@ -662,7 +658,15 @@ def test_mamba_block_size_is_resolved_before_apply(
     assert cfg.cache_config.mamba_block_size == expected_size
 
 
-@pytest.mark.parametrize("invalid", ["missing_devices", "prefill_conflict"])
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "missing_devices",
+        "prefill_conflict",
+        "zero_scheduling_budget",
+        "scheduling_budget",
+    ],
+)
 def test_selected_settings_are_validated_before_config_is_changed(invalid):
     overrides = {"device": [0], "memory_budget": 0.5}
     cfg = _vllm_config(
@@ -683,11 +687,15 @@ def test_selected_settings_are_validated_before_config_is_changed(invalid):
     if invalid == "missing_devices":
         del selected["num_devices"]
         expected_error = "num_devices"
-    else:
+    elif invalid == "prefill_conflict":
         selected["prefill_chunk_size"] = 256
         expected_error = "does not match the resolved model configuration"
+    else:
+        cfg.scheduler_config.max_num_scheduled_tokens = (
+            0 if invalid == "zero_scheduling_budget" else 256
+        )
+        expected_error = "max_num_scheduled_tokens cannot be set"
+    before = deepcopy(cfg)
     with pytest.raises(ValueError, match=expected_error):
         prepare_runtime_config(cfg, selected, precompiled=True)
-    assert cfg.scheduler_config.max_num_seqs == 4
-    assert cfg.model_config.max_model_len == 8192
-    assert cfg.additional_config.optimum_overrides == overrides
+    assert cfg == before

@@ -179,7 +179,19 @@ def test_unset_budget_is_left_to_vllm_defaults(capture_engine_config, config):
 
 def test_prefill_chunk_size_flag(parser):
     args = parser.parse_args(["--rbln-prefill-chunk-size", "256"])
+    assert args.additional_config["prefill_chunk_size"] == [256]
     assert _resolve(OptimumRBLNConfig, args.additional_config).prefill_chunk_size == 256
+
+
+def test_prefill_chunk_size_accepts_one_length():
+    config = _resolve(OptimumRBLNConfig, {"prefill_chunk_size": [256]})
+    assert config.prefill_chunk_size == 256
+
+
+@pytest.mark.parametrize("sizes", [[], [256, 512]])
+def test_prefill_chunk_size_rejects_multiple_or_missing_lengths(sizes):
+    with pytest.raises(ValueError, match="exactly one prefill_chunk_size"):
+        _resolve(OptimumRBLNConfig, {"prefill_chunk_size": sizes})
 
 
 @pytest.mark.parametrize("size", [0, -1])

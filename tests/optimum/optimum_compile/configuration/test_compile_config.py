@@ -216,27 +216,11 @@ class TestCompileCacheName:
         )
         assert name_512 != name_256
 
-    def test_unset_differs_from_explicit(self, vllm_config_factory):
-        name_unset = compile_cache_name(
-            vllm_config_factory(None).additional_config.compile_config
-        )
-        name_512 = compile_cache_name(
-            vllm_config_factory(512).additional_config.compile_config
-        )
-        assert name_unset != name_512
-
-    def test_same_value_same_hash(self, vllm_config_factory):
-        assert compile_cache_name(
-            vllm_config_factory(512).additional_config.compile_config
-        ) == compile_cache_name(
-            vllm_config_factory(512).additional_config.compile_config
-        )
-
     def test_scheduling_budget_does_not_change_hash(self, vllm_config_factory):
         first = vllm_config_factory(256, max_num_batched_tokens=8192)
         second = vllm_config_factory(256, max_num_batched_tokens=16384)
-        assert compile_cache_name(first.additional_config.compile_inputs) == (
-            compile_cache_name(second.additional_config.compile_inputs)
+        assert compile_cache_name(first.additional_config.compile_config) == (
+            compile_cache_name(second.additional_config.compile_config)
         )
 
     def test_dtype_changes_hash(self, vllm_config_factory):
@@ -345,7 +329,7 @@ class TestCompileCacheName:
         ("PaliGemmaForConditionalGeneration", {}, None, 8192, 0),
     ],
 )
-def test_compile_inputs_resolve_chunk_before_considering_the_npu_default(
+def test_compile_config_resolve_chunk_before_considering_the_npu_default(
     monkeypatch,
     architecture,
     overrides,
