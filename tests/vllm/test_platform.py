@@ -633,12 +633,16 @@ class TestRejectedConfigs:
         assert not _uses_gated_delta_net(config("qwen3_next"))
         assert not _uses_gated_delta_net(config("glm5_next_text"))
 
-    def test_qwen3_next_is_refused(self, reconfigure):
-        def qwen3_next(config):
-            config.model_config.hf_text_config.model_type = "qwen3_next"
+    @pytest.mark.parametrize(
+        "model_type, name",
+        [("qwen3_next", "Qwen3-Next"), ("qwen3_5_moe_text", "Qwen3.5-MoE")],
+    )
+    def test_other_gdn_models_are_refused(self, reconfigure, model_type, name):
+        def other_model(config):
+            config.model_config.hf_text_config.model_type = model_type
 
-        with pytest.raises(ValueError, match="Qwen3-Next"):
-            reconfigure(qwen3_next)
+        with pytest.raises(ValueError, match=name):
+            reconfigure(other_model)
 
     def test_gdn_models_need_128_token_prefill_chunks(self, reconfigure, gdn):
         def chunk_of_192(config):

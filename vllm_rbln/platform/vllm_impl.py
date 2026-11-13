@@ -200,6 +200,12 @@ def _validate(vllm_config: "VllmConfig") -> None:
             "GatedDeltaNet projections are interleaved by key head, a layout the "
             "RBLN layer does not read."
         )
+    if getattr(text_config, "model_type", None) == "qwen3_5_moe_text":
+        raise ValueError(
+            "Qwen3.5-MoE is not supported on the RBLN vLLM path yet: it builds "
+            "the RBLN GatedDeltaNet layer, whose weight regrouping and platform "
+            "rules cover the dense Qwen3.5 models only."
+        )
     if (
         getattr(text_config, "sparse_attention_config", None)
         and model_config.dtype != torch.bfloat16
