@@ -26,7 +26,6 @@ from vllm.v1.kv_cache_interface import MambaSpec
 from tests.vllm.vllm_config import make_vllm_config
 from vllm_rbln.v1.attention.backends.gdn_attn import (
     RBLNGDNAttentionMetadataBuilder,
-    gdn_state_shape,
     grouped_qkv_rows,
 )
 
@@ -51,7 +50,7 @@ def _builder(max_num_batched_tokens: int = 128, **engine_args):
     )
     spec = MambaSpec(
         block_size=MAX_LEN,
-        shapes=(gdn_state_shape(4, 128, 128),),
+        shapes=((4, 128, 128),),
         dtypes=(torch.bfloat16,),
     )
     # The flash builder it extends reads the config it is built under.

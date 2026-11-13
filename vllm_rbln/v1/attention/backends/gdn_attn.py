@@ -45,13 +45,6 @@ from vllm_rbln.v1.attention.backends.flash_attention import (
 from vllm_rbln.v1.attention.kv_cache_bindings import KVCacheViewInfo
 
 
-def gdn_state_shape(
-    num_value_heads: int, key_head_dim: int, value_head_dim: int
-) -> tuple[int, int, int]:
-    """Unpadded recurrent state, independent of the attention block size."""
-    return (num_value_heads, key_head_dim, value_head_dim)
-
-
 def grouped_qkv_rows(heads_k: int, ratio: int, head_dim: int) -> torch.Tensor:
     """The rows of [q heads | k heads | v heads] regrouped by key head: q_h, k_h,
     then key head h's `ratio` value heads, for each h. The short conv runs one
