@@ -46,6 +46,7 @@ from vllm.v1.attention.backends.registry import (
 from vllm.v1.attention.backends.utils import mamba_get_block_table_tensor
 
 import vllm_rbln.utils as rbln_utils
+from vllm_rbln.config import RBLNConfig
 from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadataBuilder,
 )
@@ -162,8 +163,14 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
 
         if is_prefill:
             assert num_reqs == 1, "RBLN prefills one request per step"
-            batch, seq_len = 1, self.chunked_prefill_size
             num_prefills, num_prefill_tokens, num_decodes = 1, int(query_lens[0]), 0
+            # The runner pads a prefill step to the shortest chunk that holds it.
+            rbln_config: RBLNConfig = self.vllm_config.additional_config
+            assert rbln_config.prefill_chunk_size is not None  # resolved at start-up
+            batch = 1
+            seq_len = min(
+                c for c in rbln_config.prefill_chunk_size if c >= num_prefill_tokens
+            )
         else:
             batch, seq_len = batch_pad, 1
             assert int(query_lens.max()) == 1, (

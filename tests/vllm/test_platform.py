@@ -637,6 +637,10 @@ class TestRejectedConfigs:
         def chunk_of_192(config):
             gdn(config)
             config.scheduler_config.max_num_batched_tokens = 192
+            # Unset, so the prefill chunk is the token budget.
+            config.additional_config = replace(
+                config.additional_config, prefill_chunk_size=None
+            )
 
         with pytest.raises(ValueError, match="multiple of 128"):
             reconfigure(chunk_of_192)
@@ -666,13 +670,19 @@ class TestRejectedConfigs:
         with pytest.raises(ValueError, match="Speculative decoding"):
             reconfigure(speculative)
 
-    def test_gdn_models_take_one_prefill_chunk_size(self, reconfigure, gdn):
-        def bucketed(config):
-            gdn(config)
-            _prefill_chunk([64, 128])(config)
+    def test_every_gdn_prefill_chunk_size_is_a_multiple_of_128(self, reconfigure, gdn):
+        def chunks(sizes):
+            def mutate(config):
+                gdn(config)
+                config.scheduler_config.max_num_batched_tokens = 256
+                _prefill_chunk(sizes)(config)
 
-        with pytest.raises(ValueError, match="GatedDeltaNet models"):
-            reconfigure(bucketed)
+            return mutate
+
+        with pytest.raises(ValueError, match="multiple of 128"):
+            reconfigure(chunks([64, 256]))
+        config = reconfigure(chunks([128, 256]))
+        assert config.additional_config.prefill_chunk_size == [128, 256]
 
     def test_gdn_state_fills_a_full_attention_page(self, reconfigure, gdn):
         def doubled_block(config):

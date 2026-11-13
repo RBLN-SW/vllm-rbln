@@ -117,13 +117,6 @@ def _validate(vllm_config: "VllmConfig") -> None:
         raise ValueError("LoRA is not supported on RBLN.")
 
     if _uses_gated_delta_net(model_config):
-        if scheduler_config.max_num_batched_tokens % 128:
-            raise ValueError(
-                "The RBLN GatedDeltaNet prefill kernel runs in 128-token chunks; "
-                f"got max_num_batched_tokens="
-                f"{scheduler_config.max_num_batched_tokens}. "
-                "Set --max-num-batched-tokens to a multiple of 128."
-            )
         if (
             vllm_config.cache_config.user_specified_mamba_block_size
             and vllm_config.cache_config.mamba_block_size < model_config.max_model_len
@@ -288,6 +281,12 @@ def _validate(vllm_config: "VllmConfig") -> None:
         raise ValueError(
             f"prefill_chunk_size={chunks} exceeds {max_num_scheduled_tokens=}."
         )
+    if _uses_gated_delta_net(model_config) and any(chunk % 128 for chunk in chunks):
+        raise ValueError(
+            "The RBLN GatedDeltaNet prefill kernel runs in 128-token chunks; got "
+            f"prefill_chunk_size={chunks}. Each has to be a multiple of 128 "
+            "(--rbln-prefill-chunk-size, or --max-num-batched-tokens without it)."
+        )
     # TODO(RBLN): The RBLN NIXL connector's resume trim takes
     # max_num_batched_tokens as the prefill chunk. Lifting the refusal means
     # pointing its sites at prefill_chunk_size; #1372 lists them.
@@ -316,11 +315,6 @@ def _validate(vllm_config: "VllmConfig") -> None:
                 (
                     "non-causal attention",
                     len(chunks) > 1 and vllm_config.attention_config.use_non_causal,
-                ),
-                # The GatedDeltaNet metadata sizes a prefill step at the longest chunk.
-                (
-                    "GatedDeltaNet models",
-                    len(chunks) > 1 and _uses_gated_delta_net(model_config),
                 ),
             )
             if on

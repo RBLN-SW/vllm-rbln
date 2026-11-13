@@ -175,7 +175,22 @@ def _ssm_state(state: torch.Tensor) -> torch.Tensor:
     return unblock_state(blocked).reshape(1, HEADS_V, HEAD_DIM, HEAD_DIM)
 
 
-def test_padded_prefill_then_decode_tracks_hf(vllm_config):
+@pytest.mark.parametrize(
+    "chunk_sizes, steps",
+    [
+        # (valid tokens, the prefill window they are padded to) a step
+        ([128], [(70, 128), (58, 128)]),
+        # The long step takes the long window, the rest of the prompt the short.
+        ([128, 256], [(200, 256), (58, 128)]),
+    ],
+)
+def test_padded_prefill_then_decode_tracks_hf(chunk_sizes, steps):
+    vllm_config = make_vllm_config(
+        max_num_batched_tokens=max(chunk_sizes),
+        max_num_seqs=2,
+        dtype="float32",
+        additional_config={"prefill_chunk_size": chunk_sizes},
+    )
     layer = _layer()
     # The state cache and the ring beside it, as the runner allocates them.
     state = torch.zeros(NUM_BLOCKS, *KV_BLOCK)
@@ -192,59 +207,48 @@ def test_padded_prefill_then_decode_tracks_hf(vllm_config):
             spec, [PREFIX], vllm_config, torch.device("cpu")
         )
     torch.manual_seed(1)
-    tokens = torch.randn(1, 70 + 58 + 1, HIDDEN)
+    total = sum(valid for valid, _ in steps)
+    tokens = torch.randn(1, total + 1, HIDDEN)
 
-    # Chunk 1: 70 valid tokens in a 128-token prefill window, no carried state.
-    hidden = torch.zeros(1, CHUNK, HIDDEN)
-    hidden[:, :70] = tokens[:, :70]
-    out = _run(
-        device_layer,
-        vllm_config,
-        builder,
-        state,
-        hidden,
-        _common(70, 70),
-        torch.arange(CHUNK),
-        True,
-        1,
-    )
-    ref, history, ref_state = _reference(layer, tokens[:, :70], None, None)
-    torch.testing.assert_close(out[:, :70], ref, atol=2e-3, rtol=2e-2)
-    torch.testing.assert_close(_ssm_state(state), ref_state, atol=2e-3, rtol=2e-2)
-
-    # Chunk 2: 58 more tokens, carrying the conv history and the recurrent state.
-    hidden = torch.zeros(1, CHUNK, HIDDEN)
-    hidden[:, :58] = tokens[:, 70:128]
-    out = _run(
-        device_layer,
-        vllm_config,
-        builder,
-        state,
-        hidden,
-        _common(58, 128),
-        torch.arange(70, 70 + CHUNK),
-        True,
-        1,
-    )
-    ref, history, ref_state = _reference(layer, tokens[:, 70:128], history, ref_state)
-    torch.testing.assert_close(out[:, :58], ref, atol=2e-3, rtol=2e-2)
-    torch.testing.assert_close(_ssm_state(state), ref_state, atol=2e-3, rtol=2e-2)
+    # Each prefill step pads its valid tokens to a window and carries the conv
+    # history and the recurrent state of the steps before it.
+    start, history, ref_state = 0, None, None
+    for valid, window in steps:
+        hidden = torch.zeros(1, window, HIDDEN)
+        hidden[:, :valid] = tokens[:, start : start + valid]
+        out = _run(
+            device_layer,
+            vllm_config,
+            builder,
+            state,
+            hidden,
+            _common(valid, start + valid),
+            torch.arange(start, start + window),
+            True,
+            1,
+        )
+        ref, history, ref_state = _reference(
+            layer, tokens[:, start : start + valid], history, ref_state
+        )
+        torch.testing.assert_close(out[:, :valid], ref, atol=2e-3, rtol=2e-2)
+        torch.testing.assert_close(_ssm_state(state), ref_state, atol=2e-3, rtol=2e-2)
+        start += valid
 
     # Decode: one token on row 0 of a padded batch of two.
     hidden = torch.zeros(2, 1, HIDDEN)
-    hidden[0] = tokens[:, 128]
+    hidden[0] = tokens[:, total]
     out = _run(
         device_layer,
         vllm_config,
         builder,
         state,
         hidden,
-        _common(1, 129),
-        torch.tensor([128]),
+        _common(1, total + 1),
+        torch.tensor([total]),
         False,
         2,
     )
-    ref, _, ref_state = _reference(layer, tokens[:, 128:129], history, ref_state)
+    ref, _, ref_state = _reference(layer, tokens[:, total:], history, ref_state)
     torch.testing.assert_close(out[:1], ref, atol=2e-3, rtol=2e-2)
     torch.testing.assert_close(_ssm_state(state), ref_state, atol=2e-3, rtol=2e-2)
     # The padded row took the null block, so the request's neighbours are

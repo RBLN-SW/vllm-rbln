@@ -51,9 +51,12 @@ def test_state_block_is_the_flash_backends_kv_block():
     assert gdn_state_shape(4, 256, 256) == cache[1:]
 
 
-def _builder():
+def _builder(max_num_batched_tokens: int = 128, **engine_args):
     vllm_config = make_vllm_config(
-        max_model_len=MAX_LEN, max_num_batched_tokens=128, max_num_seqs=4
+        max_model_len=MAX_LEN,
+        max_num_batched_tokens=max_num_batched_tokens,
+        max_num_seqs=4,
+        **engine_args,
     )
     spec = MambaSpec(
         block_size=MAX_LEN,
@@ -120,6 +123,16 @@ class TestBuilder:
         _assert_conv_rows(md, [7], [0], [70], [0])
         assert md.valid_mask.shape == (1, 1, 128)
         assert md.valid_mask.sum() == 70 and md.valid_mask[..., :70].all()
+
+    def test_a_prefill_step_takes_the_shortest_chunk_size_that_holds_it(self):
+        builder = _builder(256, additional_config={"prefill_chunk_size": [128, 256]})
+        for tokens, chunk in ((70, 128), (128, 128), (129, 256)):
+            md = builder.build(
+                _common([tokens], [tokens], [[7]]), torch.arange(chunk), 1, True
+            )
+            assert md.seq_len == chunk
+            assert md.valid_mask.shape == (1, 1, chunk)
+            assert md.valid_mask.sum() == tokens
 
     def test_later_prefill_chunk_carries_state(self, builder):
         positions = torch.arange(70, 70 + 58)
