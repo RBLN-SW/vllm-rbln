@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any
 
 from vllm_rbln import envs
 from vllm_rbln.config import OptimumRBLNCompileConfig
+from vllm_rbln.logger import init_logger
 from vllm_rbln.utils.optimum.registry import (
     get_rbln_model_info,
     is_decoder_pooling_arch,
@@ -45,6 +46,8 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 else:
     VllmConfig = None
+
+logger = init_logger(__name__)
 
 
 # Keys that affect only loading the compiled model, not the compiled binary,
@@ -211,6 +214,15 @@ def prepare_compile_config(vllm_config: VllmConfig) -> OptimumRBLNCompileConfig:
     model_config = vllm_config.model_config
     additional_config = vllm_config.additional_config
 
+    if additional_config.prefill_chunk_size is not None and (
+        is_enc_dec_arch(model_config.hf_config)
+        or is_pooling_arch(model_config.hf_config)
+    ):
+        raise ValueError(
+            "prefill_chunk_size cannot be specified for a model that does "
+            "not support chunked prefill. Leave --rbln-prefill-chunk-size unset."
+        )
+
     optimum_overrides = deepcopy(additional_config.optimum_overrides)
     if optimum_overrides.get("dtype") is not None:
         raise ValueError(
@@ -283,11 +295,11 @@ def _for_decoder(
 
     num_devices = get_compile_num_devices(vllm_config, optimum_overrides)
 
-    prefill_chunk_size = optimum_overrides.get("prefill_chunk_size")
-    user_chunk = additional_config.user_max_num_batched_tokens
-    validate_prefill_chunk_override(user_chunk, prefill_chunk_size)
-    if user_chunk is not None:
-        prefill_chunk_size = user_chunk
+    prefill_chunk_size = additional_config.single_prefill_chunk_size
+    override_prefill_chunk_size = optimum_overrides.get("prefill_chunk_size")
+    validate_prefill_chunk_override(prefill_chunk_size, override_prefill_chunk_size)
+    if prefill_chunk_size is None:
+        prefill_chunk_size = override_prefill_chunk_size
     if prefill_chunk_size is None:
         prefill_chunk_size = default_prefill_chunk_size()
 
@@ -381,15 +393,22 @@ def _for_multimodal(
 
     num_devices = get_compile_num_devices(vllm_config, optimum_overrides)
 
-    prefill_chunk_size = override_values.get("prefill_chunk_size")
-    user_chunk = additional_config.user_max_num_batched_tokens
-    override_chunk = optimum_overrides.get("prefill_chunk_size")
-    validate_prefill_chunk_override(user_chunk, override_chunk)
-    if user_chunk is not None:
-        prefill_chunk_size = user_chunk
+    prefill_chunk_size = additional_config.single_prefill_chunk_size
+    override_prefill_chunk_size = override_values.get("prefill_chunk_size")
+    validate_prefill_chunk_override(prefill_chunk_size, override_prefill_chunk_size)
+    if prefill_chunk_size is None:
+        prefill_chunk_size = override_prefill_chunk_size
     model_name, model_cls_name = get_rbln_model_info(model_config.hf_config)
     if model_name == "paligemma":
+        if prefill_chunk_size is not None and prefill_chunk_size != max_model_len:
+            logger.warning(
+                "PaliGemma requires full-prompt prefill. Adjusting "
+                "prefill_chunk_size from %s to max_model_len (%s).",
+                prefill_chunk_size,
+                max_model_len,
+            )
         prefill_chunk_size = max_model_len
+        additional_config.prefill_chunk_size = [prefill_chunk_size]
     if prefill_chunk_size is None:
         prefill_chunk_size = default_prefill_chunk_size()
 

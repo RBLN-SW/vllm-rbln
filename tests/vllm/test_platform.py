@@ -1586,7 +1586,7 @@ class TestModelImpl:
         monkeypatch.setenv(platform.envs.RESOLVED_MODEL_IMPL_ENV, _UNTOUCHED)
         platform._apply_model_impl("vllm")
 
-        config = _build()
+        config = _build(max_num_batched_tokens=None)
 
         assert isinstance(config.additional_config, OptimumRBLNConfig)
         assert RblnPlatform.device_type == "cpu"
