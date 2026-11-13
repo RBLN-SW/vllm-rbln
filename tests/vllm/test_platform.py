@@ -658,13 +658,21 @@ class TestRejectedConfigs:
             with pytest.raises(ValueError, match="single rank"):
                 reconfigure(widened)
 
-    def test_gdn_models_reject_speculative_decoding(self, reconfigure, gdn):
-        def speculative(config):
-            gdn(config)
-            config.speculative_config = object()
+    def test_gdn_models_speculate_with_their_mtp_head_only(self, reconfigure, gdn):
+        def speculative(method, num_speculative_tokens):
+            def mutate(config):
+                gdn(config)
+                config.speculative_config = SimpleNamespace(
+                    method=method, num_speculative_tokens=num_speculative_tokens
+                )
 
-        with pytest.raises(ValueError, match="Speculative decoding"):
-            reconfigure(speculative)
+            return mutate
+
+        for method, drafts in (("eagle", 1), ("mtp", 0), ("mtp", 6)):
+            with pytest.raises(ValueError, match="num_speculative_tokens 1 to 5"):
+                reconfigure(speculative(method, drafts))
+        for drafts in (1, 5):
+            reconfigure(speculative("mtp", drafts))
 
     def test_gdn_models_take_one_prefill_chunk_size(self, reconfigure, gdn):
         def bucketed(config):

@@ -146,10 +146,15 @@ def _validate(vllm_config: "VllmConfig") -> None:
                 f"{parallel_config.pipeline_parallel_size}, data_parallel_size="
                 f"{parallel_config.data_parallel_size}."
             )
-        if vllm_config.speculative_config is not None:
+        spec = vllm_config.speculative_config
+        if spec is not None and (
+            spec.method != "mtp" or not 1 <= spec.num_speculative_tokens <= 5
+        ):
             raise ValueError(
-                "Speculative decoding is not supported for GatedDeltaNet models on "
-                "the RBLN vLLM path yet: the decode kernel takes one token per request."
+                "GatedDeltaNet speculative decoding on RBLN runs the model's MTP "
+                "head with num_speculative_tokens 1 to 5 only; got "
+                f"method={spec.method!r}, "
+                f"num_speculative_tokens={spec.num_speculative_tokens}."
             )
         heads_v = model_config.hf_text_config.linear_num_value_heads
         if (heads_v // parallel_config.tensor_parallel_size) % 4:

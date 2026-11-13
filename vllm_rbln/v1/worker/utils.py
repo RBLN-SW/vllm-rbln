@@ -220,7 +220,7 @@ def extract_layer_index(layer_name: str, num_attn_module: int = 1) -> int:
     base = int_vals[0]
     if len(int_vals) >= 2:
         sub = int_vals[1]
-    elif "scale" in layer_name:
+    elif "scale" in layer_name or "drafts" in layer_name:
         sub = 2
     elif "indexer" in layer_name or "conv_ring" in layer_name:
         sub = 1
@@ -267,10 +267,10 @@ def num_attn_module(model_config, cache_dtype) -> int:
     if hasattr(text_config, "index_topk") or hasattr(hf_config, "index_topk"):
         is_fp8 = bool(cache_dtype) and cache_dtype.startswith("fp8")
         return 3 if is_fp8 else 2
-    # A GatedDeltaNet layer (Qwen3-Next, Qwen3.5) keeps its recurrent state
-    # and its conv ring.
+    # A GatedDeltaNet layer (Qwen3-Next, Qwen3.5) keeps its recurrent state,
+    # its conv ring and, under MTP, its draft buffer.
     if getattr(text_config, "model_type", None) in ("qwen3_next", "qwen3_5_text"):
-        return 2
+        return 3
     # MiniMax-M3 MSA: the indexer key cache next to the GQA K/V cache. Dense
     # layers own only K/V; the runner re-indexes layers by bound position.
     if getattr(text_config, "sparse_attention_config", None) or getattr(

@@ -71,6 +71,11 @@ class RBLNEagleProposer(EagleProposer):
         # still gets the NPU, where the draft model itself keeps running.
         super().__init__(vllm_config, torch.device("cpu"), runner)
         self.device = device
+        if self.uses_mrope:
+            # The parent keeps M-RoPE positions only. A draft here is text-only
+            # (`load_model` refuses multimodal embeddings), where the M-RoPE
+            # dimensions are identical, so it runs on one row as the runner does.
+            self.positions = torch.zeros(self.max_positions, dtype=torch.int64)
 
         if self.needs_extra_input_slots:
             raise NotImplementedError(

@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import replace
+
 import torch
 import torch.nn.functional as F
 from rebel.ops.torch_custom_ops.gdn import CHUNK as GDN_PREFILL_CHUNK
@@ -25,6 +27,7 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
 )
 from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
+from vllm.v1.kv_cache_interface import KVCacheSpec
 
 from vllm_rbln.patches import register_patch
 from vllm_rbln.patches.attention import _resolve_kv_cache
@@ -51,20 +54,31 @@ def register_qwen3_5() -> None:
         "Qwen3_5ForConditionalGeneration",
         "vllm_rbln.model_executor.models.qwen3_5:RBLNQwen3_5ForConditionalGeneration",
     )
+    # The MTP drafter vLLM's speculative config selects for a qwen3_5 target.
+    ModelRegistry.register_model(
+        "Qwen3_5MTP", "vllm_rbln.model_executor.models.qwen3_5:RBLNQwen3_5MTP"
+    )
 
 
-class RBLNGDNConvRingCache(nn.Module, AttentionLayerBase):
-    """A GatedDeltaNet layer's short-conv ring: a block-aux cache beside the
-    layer's state, one ring a state block, addressed by the layer's block ids."""
+class RBLNGDNBlockAuxCache(nn.Module, AttentionLayerBase):
+    """A block-aux cache beside a GatedDeltaNet layer's state (its short-conv
+    ring, its MTP draft buffer): one row a state block, addressed by the
+    layer's block ids."""
 
     def __init__(
-        self, prefix: str, owner: str, block_shape: tuple[int, ...], dtype: torch.dtype
+        self,
+        prefix: str,
+        owner: str,
+        block_shape: tuple[int, ...],
+        dtype: torch.dtype,
+        prefix_cacheable: bool = True,
     ) -> None:
         super().__init__()
         self.prefix = prefix
         self.owner = owner
         self.block_shape = block_shape
         self.dtype = dtype
+        self.prefix_cacheable = prefix_cacheable
         self.kv_cache = torch.tensor([])
         # This cache's position among the graph's KV cache inputs: the runner
         # assigns it once the caches exist.
@@ -80,7 +94,9 @@ class RBLNGDNConvRingCache(nn.Module, AttentionLayerBase):
         return None
 
     def get_aux_cache_spec(self, vllm_config: VllmConfig) -> RBLNBlockAuxSpec:
-        return RBLNBlockAuxSpec(self.owner, self.block_shape, self.dtype)
+        return RBLNBlockAuxSpec(
+            self.owner, self.block_shape, self.dtype, self.prefix_cacheable
+        )
 
     def get_attn_backend(self) -> type[RBLNGDNAttentionBackend]:
         return RBLNGDNAttentionBackend
@@ -127,21 +143,44 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         model_config = vllm_config.model_config
         self.num_kv_heads = model_config.get_num_kv_heads(vllm_config.parallel_config)
         self.kv_head_size = model_config.get_head_size()
+        spec = vllm_config.speculative_config
+        self.num_drafts = spec.num_speculative_tokens if spec is not None else 0
         # One ring a block, in kda_conv's stacked form ([W, P=1, C / 64, 64]): the
         # kernel takes it as allocated, and the converter's reshape of the
-        # unstacked form cannot carry the cache's dynamic block count.
+        # unstacked form cannot carry the cache's dynamic block count. W holds
+        # the taps before a step's first token and the step's MTP drafts.
         channels = (2 * self.key_dim + self.value_dim) // self.tp_size
-        self.conv_ring = RBLNGDNConvRingCache(
+        self.conv_ring = RBLNGDNBlockAuxCache(
             f"{prefix}.conv_ring",
             owner=prefix,
             block_shape=(
-                self.conv_kernel_size - 1,
+                self.conv_kernel_size - 1 + self.num_drafts,
                 1,
                 channels // CONV_LANES,
                 CONV_LANES,
             ),
             dtype=vllm_config.model_config.dtype,
         )
+        # gdn_verify's draft buffer, [Hk, 2R + 1, K, D] a state block: a step's
+        # drafts as (k, v, g, beta) records, which the next step replays. A
+        # prefix resuming at a block boundary has none to replay.
+        self.drafts = None
+        if self.num_drafts:
+            heads_k = self.num_k_heads // self.tp_size
+            ratio = self.num_v_heads // self.num_k_heads
+            self.drafts = RBLNGDNBlockAuxCache(
+                f"{prefix}.drafts",
+                owner=prefix,
+                block_shape=(heads_k, 2 * ratio + 1, self.num_drafts, self.head_k_dim),
+                dtype=vllm_config.model_config.dtype,
+                prefix_cacheable=False,
+            )
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+        # The verify kernel replays accepted drafts from the draft buffer, so
+        # the state takes none of upstream's per-draft blocks.
+        spec = super().get_kv_cache_spec(vllm_config)
+        return replace(spec, num_speculative_blocks=0)
 
     def get_state_shape(self) -> tuple[tuple[int, ...]]:
         return (
@@ -207,7 +246,7 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             metadata.conv_seq_idx,
             metadata.conv_query_len,
             metadata.conv_has_initial_state,
-            kernel - 1,
+            kernel - 1 + self.num_drafts,
             store_index=metadata.conv_store_index,
         )
         # The delta-rule kernels take q / k a key head (L2-normalized inside), v, g and
@@ -243,7 +282,7 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 GDN_PREFILL_CHUNK,
                 store_index=metadata.store_state_indices,
             )
-        else:
+        elif self.drafts is None:
             core = torch.ops.rbln_custom_ops.recurrent_gated_delta_rule(
                 query,
                 key,
@@ -253,6 +292,25 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 state,
                 metadata.non_spec_state_indices_tensor,
                 store_index=metadata.store_state_indices,
+            )
+        else:
+            # The state cannot roll back: the verify stores it after token 0 and
+            # buffers the drafts, which the next step replays as far as they
+            # were accepted.
+            assert seq_len == self.num_drafts + 1, seq_len
+            core = torch.ops.rbln_custom_ops.gdn_verify(
+                query,
+                key,
+                value,
+                g,
+                beta,
+                state,
+                self.drafts.inputs(),
+                metadata.non_spec_state_indices_tensor,
+                metadata.num_accepted,
+                metadata.non_spec_state_indices_tensor,
+                metadata.store_state_indices,
+                metadata.store_state_indices,
             )
         # [batch, heads_k, ratio, seq, 128] -> [batch, seq, heads_v, 128]
         core = core.permute(0, 3, 1, 2, 4).reshape(batch, seq_len, heads_v, head_dim)

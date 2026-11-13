@@ -78,8 +78,8 @@ class RBLNGDNAttentionMetadata(GDNAttentionMetadata):
     RBLN kernels take beside it.
 
     A step is one prefill request (`num_prefills` 1) or a decode batch
-    (`num_decodes` requests), never both and never speculative, so the
-    `spec_*` fields stay unset, as do the ones upstream fills for its own
+    (`num_decodes` requests), never both. MTP drafts ride the decode rows, so
+    the `spec_*` fields stay unset, as do the ones upstream fills for its own
     kernels (chunk indices, query start locs, the causal_conv1d pointers).
     `non_spec_state_indices_tensor` (the state block each row loads) and
     `has_initial_state` (1 where that block carries a state, prefill only) are
@@ -89,7 +89,7 @@ class RBLNGDNAttentionMetadata(GDNAttentionMetadata):
     chunk kernel's `prefill_state_indices` and `prefill_has_initial_state`.
     """
 
-    # The compiled step: [1, prefill chunk] or [padded batch, 1].
+    # The compiled step: [1, prefill chunk] or [padded batch, 1 + MTP drafts].
     batch_size: int
     seq_len: int
     # [batch] int16 on the host: the state block each row stores.
@@ -104,6 +104,9 @@ class RBLNGDNAttentionMetadata(GDNAttentionMetadata):
     conv_store_index: torch.Tensor
     # [1, 1, seq_len] float32 on prefill: 1 for valid tokens, 0 for padding
     valid_mask: torch.Tensor | None
+    # [batch] int32 on the device under MTP: how many drafts of each row's
+    # previous step were accepted, which the verify kernel replays.
+    num_accepted: torch.Tensor | None = None
     # Attached by the runner (attach_kv_cache_bindings), as on the flash metadata.
     kv_caches: list[torch.Tensor] | None = None
     kv_cache_view_infos: list[KVCacheViewInfo] | None = None
@@ -149,15 +152,17 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
         num_accepted: torch.Tensor | None = None,
         state_load_pos: torch.Tensor | None = None,
     ) -> RBLNGDNAttentionMetadata:
-        """The draft rows are refused with speculative decoding."""
-        assert num_accepted is None and state_load_pos is None, (
-            "speculative decoding is refused for GatedDeltaNet models"
-        )
+        """A request's state stays in its one block, so `state_load_pos`, the
+        position its previous step stored at, picks no other."""
         m = common_attn_metadata
         num_reqs = m.num_reqs
         query_start_loc = m.query_start_loc[: num_reqs + 1]
         query_lens = query_start_loc[1:] - query_start_loc[:-1]
-        context_lens_tensor = m.seq_lens[:num_reqs] - query_lens
+        # An MTP decode window is padded at the back to 1 + drafts tokens.
+        valid_lens = query_lens
+        if back_pad is not None:
+            valid_lens = query_lens - back_pad[:num_reqs]
+        context_lens_tensor = m.seq_lens[:num_reqs] - valid_lens
         first_positions = positions[query_start_loc[:num_reqs]]
 
         if is_prefill:
@@ -165,9 +170,9 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
             batch, seq_len = 1, self.chunked_prefill_size
             num_prefills, num_prefill_tokens, num_decodes = 1, int(query_lens[0]), 0
         else:
-            batch, seq_len = batch_pad, 1
-            assert int(query_lens.max()) == 1, (
-                "a decode step takes one token per request"
+            batch, seq_len = batch_pad, int(query_lens.max())
+            assert bool((query_lens == seq_len).all()), (
+                "a decode step takes as many tokens for every request"
             )
             num_prefills, num_prefill_tokens, num_decodes = 0, 0, num_reqs
 
@@ -211,7 +216,7 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
                 self._padded(first_positions, batch), "conv_seq_idx"
             ),
             conv_query_len=self._stage(
-                self._padded(query_lens, batch), "conv_query_len"
+                self._padded(valid_lens, batch), "conv_query_len"
             ),
             conv_has_initial_state=self._stage(
                 has_initial_state, "conv_has_initial_state"
@@ -220,4 +225,7 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
             valid_mask=None
             if valid_mask is None
             else self._stage(valid_mask, "valid_mask"),
+            num_accepted=None
+            if num_accepted is None
+            else self._stage(self._padded(num_accepted, batch), "num_accepted"),
         )

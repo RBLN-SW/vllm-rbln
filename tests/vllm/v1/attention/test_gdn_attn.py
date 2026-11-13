@@ -142,6 +142,27 @@ class TestBuilder:
         _assert_conv_rows(md, [7, 3, 0, 0], [128, 5, 0, 0], [1, 1, 0, 0], [1, 1, 0, 0])
         assert md.valid_mask is None
 
+    def test_verify_window_is_padded_at_the_back(self, builder):
+        # Two drafts a step. Row 0 carries its token and both drafts (positions
+        # 128 .. 130); row 1 only its token (5), padded to the window at the back.
+        positions = torch.tensor([128, 129, 130, 5, 5, 5])
+        md = builder.build(
+            _common([3, 3], [131, 6], [[7], [3]]),
+            positions,
+            4,
+            False,
+            back_pad=torch.tensor([0, 2]),
+            num_accepted=torch.tensor([2, 0], dtype=torch.int32),
+            state_load_pos=torch.tensor([127, 4], dtype=torch.int32),
+        )
+        assert md.batch_size == 4 and md.seq_len == 3
+        assert md.non_spec_state_indices_tensor.tolist() == [7, 3, 0, 0]
+        assert md.store_state_indices.tolist() == [7, 3, 0, 0]
+        # The ring takes a row's valid tokens only.
+        _assert_conv_rows(md, [7, 3, 0, 0], [128, 5, 0, 0], [3, 1, 0, 0], [1, 1, 0, 0])
+        assert md.num_accepted.dtype == torch.int32
+        assert md.num_accepted.tolist() == [2, 0, 0, 0]
+
     def test_staging_buffers_are_reused(self, builder):
         positions = torch.arange(128)
         first = builder.build(_common([70], [70], [[7]]), positions, 1, True)
