@@ -1265,9 +1265,10 @@ def get_kv_cache_names(cache_layers: Mapping[str, Any]) -> list[str]:
     Unnumbered auxiliary caches declare `kv_cache_slot`; main caches use 0.
     """
     # Main: layers.3.self_attn.attn -> (3, 0).
-    # Longcat: layers.3.self_attn.1.attn -> (3, 1, 0).
-    # GLM-5.3: layers.3.self_attn.attn.10 -> (3, 10, 0).
-    # DeepSeek/MiniMax indexers use (3, 1); DeepSeek scale caches use (3, 2).
+    # GLM-5.3 state/conv/draft: layers.3.self_attn.attn.10 -> (3, 10, 0).
+    # DeepSeek indexer: layers.3.self_attn.indexer.k_cache -> (3, 1).
+    # DeepSeek scale: layers.3.self_attn.indexer.k_cache.scale_cache -> (3, 2).
+    # MiniMax indexer: layers.3.self_attn.attn.indexer -> (3, 1).
     names_by_order: dict[tuple[int, ...], str] = {}
     for name, layer in cache_layers.items():
         path = tuple(int(part) for part in name.split(".") if part.isdecimal())

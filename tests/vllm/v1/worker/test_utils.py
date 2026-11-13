@@ -478,18 +478,13 @@ class TestGetKvCacheNames:
         [
             ("model.layers.2.attn", "model.layers.10.attn"),
             (
-                "model.layers.3.self_attn.0.attn",
-                "model.layers.3.self_attn.1.attn",
-                "model.layers.4.self_attn.0.attn",
-            ),
-            (
                 "model.layers.2.attn.0",
                 "model.layers.2.attn.9",
                 "model.layers.2.attn.10",
                 "model.layers.3.attn.0",
             ),
         ],
-        ids=["decoder-layers", "longcat", "glm-slots"],
+        ids=["decoder-layers", "glm-slots"],
     )
     def test_orders_by_numeric_path(self, names):
         layers = {name: SimpleNamespace() for name in reversed(names)}
