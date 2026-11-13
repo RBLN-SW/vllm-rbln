@@ -15,6 +15,7 @@
 import torch
 import torch.nn.functional as F
 from vllm.config import VllmConfig
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.models.gemma4 import Gemma4DecoderLayer, Gemma4MLP
 
 from vllm_rbln.patches import register_patch
@@ -35,13 +36,63 @@ def keep_the_rbln_attention_backend(vllm_config: VllmConfig) -> None:
     """Leave the attention backend to the RBLN platform."""
 
 
+def _is_prefill() -> bool:
+    attn_metadata = get_forward_context().attn_metadata
+    if isinstance(attn_metadata, dict):
+        attn_metadata = next(iter(attn_metadata.values()), None)
+    return attn_metadata is not None and attn_metadata.is_prefill
+
+
+def _dense_prefill_forward(
+    self: Gemma4DecoderLayer,
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+    **kwargs,
+) -> tuple[torch.Tensor, None]:
+    """Upstream's dense layer with each residual add and norm as
+    rbln_custom_ops::{residual_read,gemma4_dense_residual_write}, which the compiler
+    cuts by tokens over the chiplets: the residual stays split between blocks
+    instead of collecting on one chiplet. Each norm passes its own eps."""
+    ops = torch.ops.rbln_custom_ops
+    x = ops.residual_read(
+        hidden_states,
+        self.input_layernorm.weight,
+        self.input_layernorm.variance_epsilon,
+    )
+    x = self.self_attn(positions=positions, hidden_states=x, **kwargs)
+    hidden_states = ops.gemma4_dense_residual_write(
+        hidden_states,
+        x,
+        self.post_attention_layernorm.weight,
+        self.post_attention_layernorm.variance_epsilon,
+    )
+    x = ops.residual_read(
+        hidden_states,
+        self.pre_feedforward_layernorm.weight,
+        self.pre_feedforward_layernorm.variance_epsilon,
+    )
+    x = self.mlp(x)
+    hidden_states = ops.gemma4_dense_residual_write(
+        hidden_states,
+        x,
+        self.post_feedforward_layernorm.weight,
+        self.post_feedforward_layernorm.variance_epsilon,
+    )
+    # The layer scalar stays upstream's multiply: it runs on each chiplet's
+    # token slice and keeps the scalar a constant the decode graph shares.
+    return hidden_states * self.layer_scalar, None
+
+
 @register_patch(
     target="vllm.model_executor.models.gemma4.Gemma4DecoderLayer.forward",
     reason=(
         "Gemma4 routes on the residual, not on the experts' input, and hands "
         "upstream's MoE runner precomputed logits. RBLNMoERunner takes a router "
         "callable instead, as the patched qwen/deepseek/minimax/gpt-oss MoE "
-        "blocks pass it; this forward is upstream's with that one call changed."
+        "blocks pass it; this forward is upstream's with that one call changed. "
+        "A dense layer in prefill runs its residual adds and norms as "
+        "rbln_custom_ops::{residual_read,gemma4_dense_residual_write} instead, which the "
+        "compiler cuts by tokens so the residual stays split across chiplets."
     ),
 )
 def patched_gemma4_decoder_layer_forward(
@@ -52,6 +103,17 @@ def patched_gemma4_decoder_layer_forward(
     per_layer_input: torch.Tensor | None = None,
     **kwargs,
 ) -> tuple[torch.Tensor, None]:
+    # MoE and per-layer-input layers read the residual again or add to it
+    # before the scalar, which the two dense ops do not cover; decode is not cut.
+    # A compiler without the ops keeps the plain path.
+    if (
+        not self.enable_moe_block
+        and per_layer_input is None
+        and _is_prefill()
+        and hasattr(torch.ops.rbln_custom_ops, "residual_read")
+    ):
+        return _dense_prefill_forward(self, positions, hidden_states, **kwargs)
+
     residual = hidden_states
     hidden_states = self.input_layernorm(residual)
     hidden_states = self.self_attn(
