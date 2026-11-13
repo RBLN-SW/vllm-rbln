@@ -116,23 +116,6 @@ from vllm_rbln.v1.spec_decode.eagle3_pp import (
     aux_slots_captured,
     aux_slots_received,
 )
-from vllm_rbln.v1.worker.utils import (
-    num_attn_module as rbln_num_attn_module,
-)
-from vllm_rbln.v1.worker.utils import (
-    pipeline_adjusted_layer_index,
-)
-
-
-def _layer_index_of(prefix: str) -> int:
-    vllm_config = get_current_vllm_config()
-    model_config = vllm_config.model_config
-    num_attn_module = rbln_num_attn_module(
-        model_config, vllm_config.cache_config.cache_dtype
-    )
-    return pipeline_adjusted_layer_index(
-        prefix, model_config, vllm_config.parallel_config, num_attn_module
-    )
 
 
 def _per_head_norm(
@@ -389,7 +372,8 @@ class RBLNMiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
-        self.layer_index = _layer_index_of(prefix)
+        self.layer_index: int | None = None
+        self.kv_cache_subindex = 1
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         # Key-only: MLAAttentionSpec budgets one vector per token (not K + V).
@@ -519,7 +503,7 @@ class RBLNMiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             raise ValueError(f"Duplicate layer name: {self.layer_name}")
         compilation_config.static_forward_context[self.layer_name] = self
         self.kv_cache = torch.tensor([])  # replaced by the runner's bind
-        self.layer_index = _layer_index_of(self.layer_name)
+        self.layer_index: int | None = None
 
         self.indexer_cache = RBLNMiniMaxM3IndexerCache(
             head_dim=self.idx_head_dim,

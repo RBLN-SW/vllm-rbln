@@ -191,9 +191,6 @@ from vllm_rbln.v1.worker.utils import (
     prepare_kernel_block_sizes,
     reorder_input_batch,
 )
-from vllm_rbln.v1.worker.utils import (
-    num_attn_module as rbln_num_attn_module,
-)
 
 logger = init_logger(__name__)
 
@@ -3577,13 +3574,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             kv_cache_view_infos,
         )
 
-        num_attn_module = rbln_num_attn_module(
-            self.model_config, self.cache_config.cache_dtype
+        forward_context = self.compilation_config.static_forward_context
+        self.kv_cache_names = get_kv_cache_names(
+            {name: forward_context[name] for name in kv_caches}
         )
         self._update_kv_cache_base_bindings(
             kv_cache_bases_by_layer,
             kv_cache_view_infos,
-            num_attn_module,
         )
         if dynamic_kv_enabled(self.vllm_config) and self.kv_cache_bases:
             # With shared bases these are the graph inputs and the per-layer
@@ -3602,7 +3599,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 len(self.kv_cache_bases),
                 tuple(self.kv_cache_bases[0].shape),
             )
-        self.kv_cache_names = get_kv_cache_names(kv_caches, num_attn_module)
         self.kv_caches = [kv_caches[name] for name in self.kv_cache_names]
         # The runner owns the cache storage until sizing finishes. Rebuild keys
         # on allocation so addresses are never matched across cache generations.
@@ -3611,12 +3607,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             key = kv_cache_tensor_key(cache)
             self.kv_cache_allocations.setdefault(key, name)
         self.kv_cache_block_axes = block_axes
-        forward_context = self.compilation_config.static_forward_context
         for layer_name, kv_cache in kv_caches.items():
             forward_context[layer_name].kv_cache = kv_cache
-        # A layer reads the cache at its position in this list. The index set at
-        # construction assumes `num_attn_module` caches per layer, which a layer
-        # owning fewer (a MiniMax-M3 dense layer has no indexer cache) breaks.
+        # Cache indices are positions in this rank's actual cache list, including
+        # auxiliary caches and MTP layers, and are assigned only after allocation.
         for position, layer_name in enumerate(self.kv_cache_names):
             layer = forward_context[layer_name]
             assert hasattr(layer, "layer_index"), layer_name
@@ -3994,7 +3988,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         self,
         kv_cache_bases_by_layer: dict[str, torch.Tensor],
         kv_cache_view_infos_by_layer: dict[str, KVCacheViewInfo],
-        num_attn_module: int,
     ) -> None:
         if not kv_cache_view_infos_by_layer:
             self.kv_cache_bases = []
@@ -4004,7 +3997,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         kv_cache_bases, kv_cache_view_infos = build_kv_cache_base_bindings(
             kv_cache_bases_by_layer,
             kv_cache_view_infos_by_layer,
-            num_attn_module=num_attn_module,
+            layer_names=self.kv_cache_names,
         )
         # If no deduplication occurred (each layer has its own unique base),
         # the new system adds overhead without benefit — disable it.

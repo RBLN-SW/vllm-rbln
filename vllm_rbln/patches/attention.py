@@ -14,7 +14,7 @@
 from typing import TYPE_CHECKING, Any
 
 import torch
-from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.layers.attention.kv_transfer_utils import (
@@ -36,12 +36,6 @@ from vllm_rbln.v1.attention.backends.flash_attention import (
 )
 from vllm_rbln.v1.attention.kv_cache_bindings import materialize_kv_cache_view
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
-from vllm_rbln.v1.worker.utils import (
-    num_attn_module as rbln_num_attn_module,
-)
-from vllm_rbln.v1.worker.utils import (
-    pipeline_adjusted_layer_index,
-)
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention import MLAAttention
@@ -50,32 +44,17 @@ attention_original_init = Attention.__init__
 attention_original_forward = Attention.forward
 
 
-def _record_pipeline_layer_index(self: "Attention | MLAAttention") -> None:
-    vllm_config = get_current_vllm_config()
-    model_config = vllm_config.model_config
-    num_attn_module = (
-        rbln_num_attn_module(model_config, vllm_config.cache_config.cache_dtype)
-        if model_config is not None
-        else 1
-    )
-    self.layer_index = pipeline_adjusted_layer_index(
-        self.layer_name,
-        model_config,
-        vllm_config.parallel_config,
-        num_attn_module,
-    )
-
-
 # NOTE(RBLN) - To represent kv cache as model input,
 # modify attention instead of using the attention layer's embedded
 # kv cache (self.kv_cache); use attention metadata's kv cache.
 # attention metadata's kv cache must equal the attention layer's
 # embedded kv cache.
 def _resolve_kv_cache(
-    attn_metadata: RBLNFlashAttentionMetadata, layer_index: int
+    attn_metadata: RBLNFlashAttentionMetadata, layer_index: int | None
 ) -> torch.Tensor:
     """Resolve the KV cache for a given layer, either from deduplicated
     base tensors (for torch.export compatibility) or from the direct list."""
+    assert layer_index is not None, "KV cache has not been bound by the runner"
     kv_cache_view_infos = getattr(attn_metadata, "kv_cache_view_infos", None)
     forward_context = get_forward_context()
     additional_kwargs = getattr(forward_context, "additional_kwargs", {}) or {}
@@ -228,16 +207,14 @@ def patched_attention_forward(
 @register_patch(
     target="vllm.model_executor.layers.attention.attention.Attention.__init__",
     reason=(
-        "RBLN needs Attention initialization to record a pipeline-adjusted "
-        "layer index so external KV-cache bindings can resolve the matching "
-        "per-layer cache tensor."
+        "RBLN resolves KV caches through indices assigned by the runner after "
+        "allocation; upstream Attention does not declare this binding field."
     ),
 )
 def patched_attention_init(self: Attention, *args, **kwargs) -> None:
     attention_original_init(self, *args, **kwargs)
 
-    # NOTE(RBLN): Layer index is required to use external binding KV cache.
-    _record_pipeline_layer_index(self)
+    self.layer_index = None
 
 
 @register_patch(

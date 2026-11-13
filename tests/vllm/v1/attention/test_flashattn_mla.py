@@ -252,8 +252,6 @@ class TestIndexerCacheBackends:
         )
         monkeypatch.setattr(patch, "_original_indexer_cache_init", upstream_init)
         monkeypatch.setattr(vllm.config, "get_current_vllm_config", lambda: vllm_config)
-        monkeypatch.setattr(patch, "rbln_num_attn_module", lambda *_: 3)
-        monkeypatch.setattr(patch, "pipeline_adjusted_layer_index", lambda *_: 0)
         cache = patch.DeepseekV32IndexerCache.__new__(patch.DeepseekV32IndexerCache)
         patch.rbln_indexer_cache_init(
             cache,
@@ -271,6 +269,8 @@ class TestIndexerCacheBackends:
         cache = self._indexer_cache(monkeypatch, model_dtype)
         assert cache.dtype == torch.float8_e4m3fn
         assert cache.scale_cache.dtype == model_dtype
+        assert cache.kv_cache_subindex == 1
+        assert cache.scale_cache.kv_cache_subindex == 2
         assert (
             cache.scale_cache.get_attn_backend() is RBLNDeepseekV32IndexerScaleBackend
         )

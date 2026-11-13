@@ -20,8 +20,6 @@ from typing import Any
 
 import torch
 
-from vllm_rbln.v1.worker.utils import extract_layer_index
-
 
 def _storage_key(tensor: torch.Tensor) -> tuple[int, int]:
     """Return a hashable key that identifies the tensor's underlying storage.
@@ -63,16 +61,18 @@ class KVCacheViewInfo:
 def build_kv_cache_base_bindings(
     kv_cache_bases_by_layer: dict[str, torch.Tensor],
     kv_cache_view_infos_by_layer: dict[str, KVCacheViewInfo],
-    num_attn_module: int = 1,
+    *,
+    layer_names: Sequence[str],
 ) -> tuple[list[torch.Tensor], list[KVCacheViewInfo]]:
     """Deduplicate KV cache inputs by storage and capture per-layer view info."""
+    if len(layer_names) != len(kv_cache_view_infos_by_layer) or set(layer_names) != set(
+        kv_cache_view_infos_by_layer
+    ):
+        raise ValueError("KV cache order must name every cache exactly once")
     base_tensors: list[torch.Tensor] = []
     view_infos: list[KVCacheViewInfo] = []
     base_index_by_view: dict[tuple[torch.device, int, int, int, int], int] = {}
 
-    layer_names = _get_ordered_layer_names(
-        kv_cache_view_infos_by_layer, num_attn_module
-    )
     for layer_name in layer_names:
         base_tensor = kv_cache_bases_by_layer[layer_name]
         # The byte window and not just the storage: layers share a buffer only
@@ -244,17 +244,3 @@ def validate_shared_attention_kv_cache_contiguity(
             "Shared attention KV cache tensors must be contiguous. "
             f"Non-contiguous layers: {layer_summaries}"
         )
-
-
-def _get_ordered_layer_names(
-    kv_caches: dict[str, torch.Tensor], num_attn_module: int
-) -> list[str]:
-    index_to_names: dict[int, list[str]] = defaultdict(list)
-    for layer_name in kv_caches:
-        layer_index = extract_layer_index(layer_name, num_attn_module)
-        index_to_names[layer_index].append(layer_name)
-
-    ordered_layer_names: list[str] = []
-    for layer_index in sorted(index_to_names):
-        ordered_layer_names.extend(index_to_names[layer_index])
-    return ordered_layer_names
