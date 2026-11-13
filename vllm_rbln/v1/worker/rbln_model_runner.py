@@ -1708,7 +1708,20 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 sampling_metadata,
             )
 
-        return _depad_sampler_output(out, num_reqs)
+        out = _depad_sampler_output(out, num_reqs)
+        force_file = __import__("os").environ.get("DSV4_FORCE_SEQ")  # local debug only
+        if force_file:
+            import json as _json
+
+            if not hasattr(self, "_dsv4_force_seq"):
+                with open(force_file) as f:
+                    self._dsv4_force_seq = _json.load(f)
+            seq = self._dsv4_force_seq
+            for i in range(num_reqs):
+                n = int(self.input_batch.num_tokens_no_spec[i])
+                if n < len(seq):
+                    out.sampled_token_ids[i, 0] = seq[n]
+        return out
 
     def _apply_pending_token_writeback(self) -> None:
         """Put the real sampled tokens where every reader can see them.

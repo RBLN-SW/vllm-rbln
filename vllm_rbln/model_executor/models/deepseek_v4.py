@@ -37,6 +37,7 @@ The MTP head is not modeled; its weights are skipped.
 """
 
 import math
+import os
 from collections.abc import Iterable
 from functools import cache
 from itertools import islice
@@ -976,7 +977,10 @@ class RBLNDeepseekV4Model(nn.Module):
         streams = h.unsqueeze(1).expand(batch, self.hc_mult, tokens, hidden).contiguous()
         # islice, not a slice: slicing a ModuleList builds a new one while tracing, and Dynamo
         # then lifts every layer weight as a graph input instead of keeping it a constant.
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        _end = self.end_layer
+        if os.environ.get("DSV4_DEBUG_LAYERS"):  # local debug only
+            _end = self.start_layer + int(os.environ["DSV4_DEBUG_LAYERS"])
+        for layer in islice(self.layers, self.start_layer, _end):
             streams = layer(positions, streams, input_ids)
         return self.norm(self._hc_head(streams))
 
