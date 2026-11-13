@@ -620,17 +620,34 @@ class TestModelExecutable:
         assert ctx._graph_latency is not None
         assert calls == [{"step": 1}, {"step": 2}]
 
-    @pytest.mark.parametrize("host_op_us, expected", [(1500, [1.5 * MS]), (None, [])])
-    def test_the_graph_runs_host_op_time_joins_the_pass(
-        self, monkeypatch, host_op_us, expected
+    @pytest.mark.parametrize(
+        "before, run_times_us, expected",
+        [
+            pytest.param(1000, [1500], [1.5 * MS], id="one-run"),
+            pytest.param(1000, [600, 900], [1.5 * MS], id="multiple-runs"),
+            pytest.param(1000, [], [0], id="no-run"),
+            pytest.param(None, [1500], [1.5 * MS], id="first-run"),
+            pytest.param(None, [0], [0], id="first-zero-time-run"),
+            pytest.param(None, [], [], id="no-timed-run"),
+        ],
+    )
+    def test_the_calls_accumulated_host_op_time_joins_the_pass(
+        self, monkeypatch, before, run_times_us, expected
     ):
+        accumulated_us = before
+
         def fake_load_model(self, *args, **kwargs):
-            self.model_executable = lambda: "logits"
+            def executable():
+                nonlocal accumulated_us
+                for elapsed_us in run_times_us:
+                    accumulated_us = (accumulated_us or 0) + elapsed_us
+                return "logits"
+
+            self.model_executable = executable
 
         monkeypatch.setattr(pm, "_load_model", fake_load_model)
-        # None is what rebel returns while RBLN_RUNTIME_TIMER is off.
         monkeypatch.setattr(
-            pm.rebel, "get_last_run_host_op_time_us", lambda: host_op_us, raising=False
+            pm.rebel, "get_accumulated_host_op_time_us", lambda: accumulated_us
         )
         runner = _Runner()
         pm.load_model(runner)
@@ -638,7 +655,7 @@ class TestModelExecutable:
 
         ctx.start_pass()
         ctx.mark_phase(wm.Phase.DECODE)
-        runner.model_executable()
+        assert runner.model_executable() == "logits"
         ctx.end_pass()
         assert ctx._host_op[wm.Phase.DECODE].latencies == pytest.approx(expected)
 
