@@ -22,6 +22,7 @@ import contextlib
 import dataclasses
 import errno
 import inspect
+import json
 import logging
 import os
 import re
@@ -29,7 +30,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from vllm.config import KVTransferConfig
+from vllm.config import KVTransferConfig, ParallelConfig
 
 from tests.vllm.vllm_config import make_vllm_config
 from vllm_rbln.v1.worker import mega_cache, rbln_model_runner
@@ -58,7 +59,13 @@ def _stub_config(digest: str = "cfghash"):
             num_gpu_blocks_override=None,
             gpu_memory_utilization=0.9,
         ),
-        model_config=SimpleNamespace(max_model_len=32),
+        parallel_config=ParallelConfig(),
+        model_config=SimpleNamespace(
+            max_model_len=32,
+            generation_config="auto",
+            override_generation_config={},
+            try_get_generation_config=dict,
+        ),
         kv_transfer_config=None,
         ec_transfer_config=None,
         is_mm_encoder_only=False,
@@ -414,6 +421,48 @@ class TestSignatureVllmConfig:
             assert mega_cache.config_signature(config) == base, name
             object.__setattr__(config.parallel_config, name, original)
 
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"override_generation_config": {"top_p": 0.9}},
+            {"generation_config": "vllm"},
+        ],
+        ids=["override_generation_config", "generation_config"],
+    )
+    def test_sampling_defaults_do_not_invalidate(self, overrides):
+        base = mega_cache.config_signature(make_vllm_config())
+        assert mega_cache.config_signature(make_vllm_config(**overrides)) == base
+
+    def test_non_sampling_override_invalidates(self):
+        base = mega_cache.config_signature(make_vllm_config())
+        other = make_vllm_config(
+            override_generation_config={"attn_temperature_tuning": True}
+        )
+        assert mega_cache.config_signature(other) != base
+
+    @pytest.mark.parametrize(
+        ("update", "same"),
+        [({"top_p": 0.5}, True), ({"suppress_tokens": [1, 2]}, False)],
+        ids=["sampling-only", "suppress_tokens"],
+    )
+    def test_generation_config_dir_keys_on_its_content(self, tmp_path, update, same):
+        base_config = make_vllm_config()
+        src = os.path.join(base_config.model_config.model, "generation_config.json")
+        with open(src) as f:
+            content = json.load(f)
+        content.update(update)
+        (tmp_path / "generation_config.json").write_text(json.dumps(content))
+        base = mega_cache.config_signature(base_config)
+        other = mega_cache.config_signature(
+            make_vllm_config(generation_config=str(tmp_path))
+        )
+        assert (other == base) is same
+
+    def test_generation_config_fields_restored(self):
+        config = make_vllm_config(override_generation_config={"top_p": 0.9})
+        mega_cache.config_signature(config)
+        assert config.model_config.override_generation_config == {"top_p": 0.9}
+
     def test_port_fields_restored(self):
         config = make_vllm_config()
         object.__setattr__(config.parallel_config, "_coord_store_port", 38735)
@@ -759,3 +808,22 @@ class TestConformance:
         from torch.compiler._cache import CacheArtifactFactory
 
         assert CacheArtifactFactory.create("rbln", "M:probe", b"").type() == "rbln"
+
+    def test_sampling_default_keys_match_upstream(self):
+        # Upstream keeps its list local to get_diff_sampling_param(); probe it
+        # with every candidate name so an added or dropped key fails here.
+        from transformers import GenerationConfig
+        from vllm import SamplingParams
+
+        candidates = (
+            set(GenerationConfig().to_dict())
+            | set(SamplingParams.__struct_fields__)
+            | mega_cache._SAMPLING_DEFAULT_KEYS
+        )
+        config = make_vllm_config(
+            generation_config="vllm",
+            override_generation_config=dict.fromkeys(candidates, 0),
+        )
+        upstream = set(config.model_config.get_diff_sampling_param())
+        upstream = {"max_new_tokens" if k == "max_tokens" else k for k in upstream}
+        assert upstream == mega_cache._SAMPLING_DEFAULT_KEYS

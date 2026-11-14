@@ -19,6 +19,7 @@ config-signature, rank) file under VLLM_CACHE_ROOT.
 """
 
 import contextlib
+import dataclasses
 import errno
 import hashlib
 import os
@@ -78,6 +79,22 @@ def _npu_name() -> str:
         return "unknown"
 
 
+# Copy of the request-default keys local to
+# ModelConfig.get_diff_sampling_param().
+_SAMPLING_DEFAULT_KEYS = frozenset(
+    {
+        "repetition_penalty",
+        "presence_penalty",
+        "frequency_penalty",
+        "temperature",
+        "top_k",
+        "top_p",
+        "min_p",
+        "max_new_tokens",
+    }
+)
+
+
 def _warmup_graph_set_factors(
     vllm_config, extra_hash_factors: Mapping[str, object] | None = None
 ) -> str:
@@ -124,48 +141,66 @@ def _warmup_graph_set_factors(
     return hash_factors(factors)
 
 
-def _stable_compute_hash(vllm_config) -> str:
-    """compute_hash() leaks per-launch auto-queried ports via ParallelConfig
-    port fields; zero them around the call so the hash is launch-stable."""
-    import dataclasses
+def _generation_config_factors(model_config) -> str:
+    from vllm.config.utils import hash_factors, normalize_value
 
-    pc = getattr(vllm_config, "parallel_config", None)
-    saved: dict = {}
-    if pc is not None and dataclasses.is_dataclass(pc):
-        for field in dataclasses.fields(pc):
-            if "port" in field.name.lower():
-                try:
-                    saved[field.name] = getattr(pc, field.name)
-                    object.__setattr__(pc, field.name, 0)
-                except Exception:  # pylint: disable=broad-exception-caught
-                    saved.pop(field.name, None)
+    effective = model_config.try_get_generation_config()
+    effective.update(model_config.override_generation_config)
+    return hash_factors(
+        {
+            k: normalize_value(v)
+            for k, v in effective.items()
+            if k not in _SAMPLING_DEFAULT_KEYS and k != "transformers_version"
+        }
+    )
+
+
+@contextlib.contextmanager
+def _patched(obj, values: Mapping[str, object]):
+    saved = {name: getattr(obj, name) for name in values}
     try:
-        return vllm_config.compute_hash()
+        for name, value in values.items():
+            object.__setattr__(obj, name, value)
+        yield
     finally:
         for name, value in saved.items():
-            with contextlib.suppress(Exception):
-                object.__setattr__(pc, name, value)
+            object.__setattr__(obj, name, value)
+
+
+def _stable_compute_hash(vllm_config) -> str:
+    """compute_hash() with the per-launch ParallelConfig ports zeroed and the
+    generation config reset; _generation_config_factors() keys the latter."""
+    pc = vllm_config.parallel_config
+    ports = {f.name: 0 for f in dataclasses.fields(pc) if "port" in f.name.lower()}
+    generation = {"generation_config": "auto", "override_generation_config": {}}
+    with _patched(pc, ports), _patched(vllm_config.model_config, generation):
+        return vllm_config.compute_hash()
 
 
 def config_signature(
     vllm_config, extra_hash_factors: Mapping[str, object] | None = None
 ) -> str:
-    """vLLM config hash + warm-up graph set + rbln compile env + NPU name +
-    rebel major.minor; launch- and host-stable, shared by all TP/DP ranks (the
-    rank subdir isolates shards)."""
+    """vLLM config hash + generation config + warm-up graph set + rbln compile
+    env + NPU name + rebel major.minor; launch- and host-stable, shared by all
+    TP/DP ranks (the rank subdir isolates shards)."""
     cfg = _stable_compute_hash(vllm_config)
+    gen = _generation_config_factors(vllm_config.model_config)
     graphs = _warmup_graph_set_factors(vllm_config, extra_hash_factors)
     env = _compile_env_factors()
     npu = _npu_name()
     rebel_ver = _rebel_major_minor()
     digest = hashlib.sha1(
-        "|".join([cfg, graphs, env, f"npu={npu}", f"rebel={rebel_ver}"]).encode("utf-8")
+        "|".join([cfg, gen, graphs, env, f"npu={npu}", f"rebel={rebel_ver}"]).encode(
+            "utf-8"
+        )
     )
     sig = digest.hexdigest()[:16]
     logger.info(
-        "mega-cache config_signature=%s (cfg=%s graphs=%s env=%s npu=%s rebel=%s)",
+        "mega-cache config_signature=%s (cfg=%s gen=%s graphs=%s env=%s npu=%s "
+        "rebel=%s)",
         sig,
         cfg[:8],
+        gen[:8],
         graphs[:8],
         env[:8],
         npu,
