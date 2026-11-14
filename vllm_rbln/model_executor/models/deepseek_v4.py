@@ -644,7 +644,7 @@ class RBLNDeepseekV4Attention(nn.Module):
             slot=SLOT_SWA,
             window=self.window,
             width=DSV4_KV8_ROW_BYTES,
-            dtype=torch.int8,
+            dtype=torch.uint8,
         )
         self.compressor = None
         self.cmp_cache = None
@@ -656,7 +656,7 @@ class RBLNDeepseekV4Attention(nn.Module):
             )
             self.cmp_cache = RBLNDeepseekV4PagedCache(
                 f"{prefix}.cmp_cache.{SLOT_CMP}", layer_id, SLOT_CMP, self.compress_ratio,
-                DSV4_KV8_ROW_BYTES, torch.int8,
+                DSV4_KV8_ROW_BYTES, torch.uint8,
             )
             if self.compress_ratio == 4:
                 self.indexer = RBLNDeepseekV4Indexer(
