@@ -20,6 +20,7 @@ import torch
 import torch.nn.functional as F
 from rebel.ops.torch_custom_ops.kda import CHUNK as KDA_CHUNK
 from rebel.ops.torch_custom_ops.kda import CONV_LANES
+from rebel.ops.torch_custom_ops.mhc import mhc_post, mhc_pre
 from rebel.ops.torch_custom_ops.sparse_attn_glm5 import hadamard_128
 from torch import nn
 from transformers import PretrainedConfig
@@ -880,24 +881,25 @@ class RBLNGlm5NextDecoderLayer(nn.Module):
             )
 
     def _sublayer(self, streams, fn, scale, base, norm, sublayer) -> torch.Tensor:
-        batch, n, tokens, hidden = streams.shape
-        flat = streams.transpose(1, 2).reshape(batch, tokens, n * hidden).float()
-        flat = flat * torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.rms_eps)
-        z = F.linear(flat, fn) * scale + base
-        z_pre, z_post = z[..., :n], z[..., n : 2 * n]
-        comb = torch.ops.rbln_custom_ops.sinkhorn_normalize(
-            z[..., 2 * n :],
+        # The compiler picks the path by the token count: a prefill chunk runs the
+        # glm_mhc kernels, which keep the streams cut by tokens over the chiplets;
+        # a short step runs the plain mHC ops. A cut path keeps the streams fp32.
+        x, state = mhc_pre(
+            streams,
+            fn,
+            scale,
+            base,
+            rms_eps=self.rms_eps,
+            hc_eps=self.hc_eps,
             iters=self.sinkhorn_iters,
-            eps=self.hc_eps,
         )
-        streams_f32 = streams.float()
-        x = torch.ops.rbln_custom_ops.hc_stream_reduce(
-            streams_f32, z_pre, eps=self.hc_eps
-        ).to(streams.dtype)
-        x = sublayer(norm(x))
-        return torch.ops.rbln_custom_ops.hc_residual_add(
-            x.float(), streams_f32, z_post, comb, post_mult=self.post_mult
-        ).to(streams.dtype)
+        return mhc_post(
+            sublayer(norm(x)),
+            state,
+            post_mult=self.post_mult,
+            iters=self.sinkhorn_iters,
+            hc_eps=self.hc_eps,
+        )
 
     def forward(self, streams: torch.Tensor) -> torch.Tensor:
         """streams [B, n, T, H] -> [B, n, T, H]."""
@@ -1036,8 +1038,11 @@ class RBLNGlm5NextModel(nn.Module):
             flat = intermediate_tensors["streams"]
             batch, tokens, _ = flat.shape
             streams = flat.view(batch, tokens, self.n, -1).transpose(1, 2).contiguous()
+        dtype = streams.dtype
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             streams = layer(streams)
+        # A prefill chunk keeps the streams fp32 between sublayers (bf16 values).
+        streams = streams.to(dtype)
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
                 {"streams": streams.transpose(1, 2).reshape(batch, tokens, -1)}
