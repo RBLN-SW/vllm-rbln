@@ -22,6 +22,7 @@ import contextlib
 import dataclasses
 import errno
 import inspect
+import json
 import logging
 import os
 import re
@@ -62,6 +63,7 @@ def _stub_config(digest: str = "cfghash"):
             max_model_len=32,
             generation_config="auto",
             override_generation_config={},
+            try_get_generation_config=dict,
         ),
         kv_transfer_config=None,
         ec_transfer_config=None,
@@ -431,6 +433,33 @@ class TestSignatureVllmConfig:
         # WARM_UP_CONFIGS fixes which variants compile.
         base = mega_cache.config_signature(make_vllm_config())
         assert mega_cache.config_signature(make_vllm_config(**overrides)) == base
+
+    def test_non_sampling_override_invalidates(self):
+        # Llama4 reads attn_temperature_tuning from it at model build.
+        base = mega_cache.config_signature(make_vllm_config())
+        other = make_vllm_config(
+            override_generation_config={"attn_temperature_tuning": True}
+        )
+        assert mega_cache.config_signature(other) != base
+
+    @pytest.mark.parametrize(
+        ("update", "same"),
+        [({"top_p": 0.5}, True), ({"suppress_tokens": [1, 2]}, False)],
+        ids=["sampling-only", "suppress_tokens"],
+    )
+    def test_generation_config_dir_keys_on_its_content(self, tmp_path, update, same):
+        # Gemma4 bakes suppress_tokens into the wrapped compute_logits.
+        base_config = make_vllm_config()
+        src = os.path.join(base_config.model_config.model, "generation_config.json")
+        with open(src) as f:
+            content = json.load(f)
+        content.update(update)
+        (tmp_path / "generation_config.json").write_text(json.dumps(content))
+        base = mega_cache.config_signature(base_config)
+        other = mega_cache.config_signature(
+            make_vllm_config(generation_config=str(tmp_path))
+        )
+        assert (other == base) is same
 
     def test_generation_config_fields_restored(self):
         config = make_vllm_config(override_generation_config={"top_p": 0.9})

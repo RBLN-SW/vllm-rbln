@@ -78,6 +78,23 @@ def _npu_name() -> str:
         return "unknown"
 
 
+# ModelConfig.get_diff_sampling_param()'s request defaults, plus the version
+# stamp to_diff_dict() fills from the installed transformers.
+_OFF_GRAPH_GENERATION_KEYS = frozenset(
+    {
+        "transformers_version",
+        "repetition_penalty",
+        "presence_penalty",
+        "frequency_penalty",
+        "temperature",
+        "top_k",
+        "top_p",
+        "min_p",
+        "max_new_tokens",
+    }
+)
+
+
 def _warmup_graph_set_factors(
     vllm_config, extra_hash_factors: Mapping[str, object] | None = None
 ) -> str:
@@ -94,6 +111,9 @@ def _warmup_graph_set_factors(
     # Not draft_parallel_config: it carries the same per-launch ports.
     draft = getattr(spec, "draft_model_config", None)
     ec = vllm_config.ec_transfer_config
+    mc = vllm_config.model_config
+    generation = mc.try_get_generation_config()
+    generation.update(mc.override_generation_config)
     factors: dict[str, object] = {
         "max_num_seqs": normalize_value(getattr(scheduler, "max_num_seqs", None)),
         "num_gpu_blocks_override": normalize_value(
@@ -115,6 +135,10 @@ def _warmup_graph_set_factors(
         "ec_role": ec.ec_role if ec is not None else None,
         # Not kv_role itself: only the strict producer builds a different set.
         "prefill_only": is_strict_kv_producer(vllm_config),
+        # By content, not by path; sampling defaults reach the sampler at runtime.
+        "generation_config": normalize_value(
+            {k: v for k, v in generation.items() if k not in _OFF_GRAPH_GENERATION_KEYS}
+        ),
     }
 
     if extra_hash_factors:
@@ -126,8 +150,9 @@ def _warmup_graph_set_factors(
 
 def _stable_compute_hash(vllm_config) -> str:
     """compute_hash() leaks per-launch auto-queried ports via ParallelConfig
-    port fields, and keys on the request sampling defaults, which shape no
-    graph; reset both around the call so the hash is launch-stable."""
+    port fields; zero them around the call so the hash is launch-stable. The
+    generation config is reset too and keyed by content in
+    _warmup_graph_set_factors() instead."""
     import dataclasses
 
     pc = getattr(vllm_config, "parallel_config", None)
