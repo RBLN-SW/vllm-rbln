@@ -126,7 +126,8 @@ def _warmup_graph_set_factors(
 
 def _stable_compute_hash(vllm_config) -> str:
     """compute_hash() leaks per-launch auto-queried ports via ParallelConfig
-    port fields; zero them around the call so the hash is launch-stable."""
+    port fields, and keys on the request sampling defaults, which shape no
+    graph; reset both around the call so the hash is launch-stable."""
     import dataclasses
 
     pc = getattr(vllm_config, "parallel_config", None)
@@ -139,12 +140,21 @@ def _stable_compute_hash(vllm_config) -> str:
                     object.__setattr__(pc, field.name, 0)
                 except Exception:  # pylint: disable=broad-exception-caught
                     saved.pop(field.name, None)
+    mc = vllm_config.model_config
+    saved_mc = {
+        "generation_config": mc.generation_config,
+        "override_generation_config": mc.override_generation_config,
+    }
+    object.__setattr__(mc, "generation_config", "auto")
+    object.__setattr__(mc, "override_generation_config", {})
     try:
         return vllm_config.compute_hash()
     finally:
         for name, value in saved.items():
             with contextlib.suppress(Exception):
                 object.__setattr__(pc, name, value)
+        for name, value in saved_mc.items():
+            object.__setattr__(mc, name, value)
 
 
 def config_signature(

@@ -58,7 +58,11 @@ def _stub_config(digest: str = "cfghash"):
             num_gpu_blocks_override=None,
             gpu_memory_utilization=0.9,
         ),
-        model_config=SimpleNamespace(max_model_len=32),
+        model_config=SimpleNamespace(
+            max_model_len=32,
+            generation_config="auto",
+            override_generation_config={},
+        ),
         kv_transfer_config=None,
         ec_transfer_config=None,
         is_mm_encoder_only=False,
@@ -413,6 +417,25 @@ class TestSignatureVllmConfig:
             object.__setattr__(config.parallel_config, name, probe)
             assert mega_cache.config_signature(config) == base, name
             object.__setattr__(config.parallel_config, name, original)
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"override_generation_config": {"top_p": 0.9}},
+            {"generation_config": "vllm"},
+        ],
+        ids=["override_generation_config", "generation_config"],
+    )
+    def test_sampling_defaults_do_not_invalidate(self, overrides):
+        # Request sampling values reach the sampler graphs as runtime inputs;
+        # WARM_UP_CONFIGS fixes which variants compile.
+        base = mega_cache.config_signature(make_vllm_config())
+        assert mega_cache.config_signature(make_vllm_config(**overrides)) == base
+
+    def test_generation_config_fields_restored(self):
+        config = make_vllm_config(override_generation_config={"top_p": 0.9})
+        mega_cache.config_signature(config)
+        assert config.model_config.override_generation_config == {"top_p": 0.9}
 
     def test_port_fields_restored(self):
         config = make_vllm_config()
