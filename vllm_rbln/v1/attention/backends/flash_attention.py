@@ -160,6 +160,9 @@ class RBLNFlashAttentionMetadata:
     swa_appends: bool = False
     cache_seq_lens: torch.Tensor | None = None
     cache_offsets: torch.Tensor | None = None
+    # cache_offsets - cache_seq_lens computed on the host: deriving it in the graph runs
+    # device int32 ops whose result a later kernel reads unreliably (DeepSeek-V4, TEMP).
+    cache_query_lens: torch.Tensor | None = None
     local_block_tables: torch.Tensor | None = None
     # TODO(RBLN): fold into `attn_masks`. A builder serves one KV cache group,
     # so sliding layers never read `attn_masks`; a sliding group then has to

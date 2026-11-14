@@ -122,6 +122,9 @@ class RBLNGlm5NextMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
             seq_lens = rbln_utils.pad(seq_lens, 0, batch_pad)
         metadata.cache_seq_lens = self._stage(num_computed_tokens, "cache_seq_lens")
         metadata.cache_offsets = self._stage(seq_lens, "cache_offsets")
+        metadata.cache_query_lens = self._stage(
+            (seq_lens - num_computed_tokens).to(torch.int32), "cache_query_lens"
+        )
         if not isinstance(self.kv_cache_spec, MambaSpec):
             return metadata
         num_computed_tokens = num_computed_tokens[:num_reqs]
