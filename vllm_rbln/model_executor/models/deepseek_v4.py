@@ -382,6 +382,10 @@ class RBLNDeepseekV4Rope(nn.Module):
         self, x: torch.Tensor, positions: torch.Tensor, inverse: bool = False
     ) -> torch.Tensor:
         """x [B, L, ..., D]; positions [B, L]. Rotates x[..., -rope_dim:]."""
+        if x.dim() == 3:
+            # The compiler fuses a rotation over a 4- or 5-D tensor only; a head-less [B, L, D]
+            # one (kv, compressed entries) would leave its channel shuffle on the host.
+            return self.forward(x.unsqueeze(2), positions, inverse).squeeze(2)
         batch, seq_len = positions.shape[0], positions.shape[1]
         flat = positions.flatten()
         cos = self.cos_cache.index_select(0, flat).view(batch, seq_len, -1).to(x.dtype)
