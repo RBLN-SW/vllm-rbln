@@ -342,6 +342,20 @@ def _rope_table(
     return torch.cat([angles.cos(), angles.sin()], dim=-1)  # [max_pos, rope_dim]
 
 
+_ROPES: dict[tuple, "RBLNDeepseekV4Rope"] = {}
+
+
+def _shared_rope(config: PretrainedConfig, compress_ratio: int, max_pos: int):
+    """One rope module per kind (the plain SWA layers', the compressed layers'), shared by the
+    layers as vLLM's get_rope shares its cache: a table a layer owns is a per-layer constant of
+    the rolled layer loop, so its cos / sin lookup could not leave the loop and ran on the host
+    once a layer; a shared one is loop-invariant and hoisted ahead of it."""
+    key = (bool(compress_ratio), max_pos, id(config))
+    if key not in _ROPES:
+        _ROPES[key] = RBLNDeepseekV4Rope(config, compress_ratio, max_pos)
+    return _ROPES[key]
+
+
 class RBLNDeepseekV4Rope(nn.Module):
     """Interleaved (GPT-J pair) RoPE on the last ``rope_dim`` channels.
 
@@ -623,7 +637,7 @@ class RBLNDeepseekV4Attention(nn.Module):
         )
 
         max_pos = vllm_config.model_config.max_model_len
-        self.rope = RBLNDeepseekV4Rope(config, self.compress_ratio, max_pos)
+        self.rope = _shared_rope(config, self.compress_ratio, max_pos)
         self.swa_cache = RBLNDeepseekV4RingCache(
             prefix=f"{prefix}.swa_cache.{SLOT_SWA}",
             layer_id=layer_id,
