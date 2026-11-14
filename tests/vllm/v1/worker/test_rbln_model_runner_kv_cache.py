@@ -20,9 +20,10 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.v1.kv_cache_interface import SlidingWindowSpec
 
 import vllm_rbln.v1.worker.rbln_model_runner as mr
-from tests.vllm.v1.worker.utils import make_kv_cache_config, schedule_new
+from tests.vllm.v1.worker.utils import BLOCK_SIZE, make_kv_cache_config, schedule_new
 from vllm_rbln.v1.attention.kv_cache_bindings import kv_cache_tensor_key
 from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
 
@@ -95,6 +96,45 @@ class TestKVCacheBaseBindings:
         runner = make_model_runner()
         assert runner.kv_cache_bases == []
         assert runner.kv_cache_view_infos == []
+
+    def test_a_shared_buffer_is_bound_in_the_full_attention_shape(
+        self, make_model_runner
+    ):
+        # A sliding-window layer ahead of a full-attention one on one buffer, its
+        # kernel on its window: the two views differ, and the graph input must
+        # be the full-attention layer's, the one the static address names.
+        window = BLOCK_SIZE // 4
+        runner = make_model_runner(
+            layers=("layer.0", "layer.1"),
+            init_kv_cache=False,
+        )
+        full = make_kv_cache_config(runner).kv_cache_groups[0].kv_cache_spec
+        sliding = SlidingWindowSpec(
+            block_size=full.block_size,
+            num_kv_heads=full.num_kv_heads,
+            head_size=full.head_size,
+            dtype=full.dtype,
+            sliding_window=window,
+        )
+        runner.initialize_kv_cache(
+            make_kv_cache_config(
+                groups=[("layer.0",), ("layer.1",)], specs=[sliding, full]
+            )
+        )
+        window_info, full_info = runner.kv_cache_view_infos
+        assert window_info.view_shape != full_info.view_shape
+        assert [tuple(b.shape) for b in runner.kv_cache_bases] == [full_info.view_shape]
+
+
+class TestSubBlockSettingAtKvInit:
+    def test_a_sub_block_setting_is_refused_before_warm_up(self, make_model_runner):
+        # The scheduler refuses it too, but only once warm-up has run.
+        runner = make_model_runner(
+            init_kv_cache=False,
+            additional_config={"enable_sub_block_cache": False, "sub_block_size": 16},
+        )
+        with pytest.raises(ValueError, match="enable_sub_block_cache=False"):
+            runner.initialize_kv_cache(make_kv_cache_config(runner))
 
 
 class TestLayerIndexFollowsCacheOrder:
@@ -209,6 +249,26 @@ class TestBlockAuxKVCaches:
         assert runner.kv_cache_allocations.keys().isdisjoint(old_allocations)
         for key, name in runner.kv_cache_allocations.items():
             assert key == kv_cache_tensor_key(context[name].kv_cache)
+
+    def test_each_aux_tensor_is_bound_as_a_graph_input(
+        self, make_model_runner, monkeypatch
+    ):
+        # Two aux kinds on one owner make two aux tensors; each must reach the
+        # graph inputs.
+        runner = make_model_runner(layers=("layer.0", "layer.1"), init_kv_cache=False)
+        context = runner.compilation_config.static_forward_context
+        for i, dtype in ((2, torch.bfloat16), (3, torch.float16)):
+            module = self._aux("layer.0", dtype=dtype)
+            module.layer_index = i
+            monkeypatch.setitem(context, f"layer.{i}", module)
+        config = make_kv_cache_config(runner, groups=[("layer.0",), ("layer.1",)])
+        runner.initialize_kv_cache(config)
+        aux_keys = {
+            kv_cache_tensor_key(context[name].kv_cache)
+            for name in ("layer.2", "layer.3")
+        }
+        assert len(aux_keys) == 2
+        assert aux_keys <= {kv_cache_tensor_key(base) for base in runner.kv_cache_bases}
 
     @staticmethod
     def _aux(owner, shape=(4, 64), dtype=torch.bfloat16):
