@@ -811,3 +811,24 @@ class TestConformance:
         from torch.compiler._cache import CacheArtifactFactory
 
         assert CacheArtifactFactory.create("rbln", "M:probe", b"").type() == "rbln"
+
+    def test_off_graph_generation_keys_match_upstream_sampling_defaults(self):
+        # Upstream keeps its list local to get_diff_sampling_param(); probe it
+        # with every candidate name so an added or dropped key fails here.
+        from transformers import GenerationConfig
+        from vllm import SamplingParams
+
+        candidates = (
+            set(GenerationConfig().to_dict())
+            | set(SamplingParams.__struct_fields__)
+            | mega_cache._OFF_GRAPH_GENERATION_KEYS
+        )
+        config = make_vllm_config(
+            generation_config="vllm",
+            override_generation_config=dict.fromkeys(candidates, 0),
+        )
+        upstream = set(config.model_config.get_diff_sampling_param())
+        upstream = {"max_new_tokens" if k == "max_tokens" else k for k in upstream}
+        assert upstream == mega_cache._OFF_GRAPH_GENERATION_KEYS - {
+            "transformers_version"
+        }
