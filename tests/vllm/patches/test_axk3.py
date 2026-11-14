@@ -143,6 +143,13 @@ def test_forward_runs_only_the_layers_this_rank_built(monkeypatch):
     monkeypatch.setattr(dist_utils, "get_pp_indices", patched_get_pp_indices)
     group = SimpleNamespace(rank_in_group=0, world_size=1)
     monkeypatch.setattr(parallel_state, "get_pp_group", lambda: group)
+    monkeypatch.setattr(
+        axk3_model,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            attn_metadata={"attn": SimpleNamespace(is_prefill=False)}
+        ),
+    )
 
     model = axk3_model.AXK3Model.__new__(axk3_model.AXK3Model)
     torch.nn.Module.__init__(model)
@@ -204,6 +211,104 @@ def test_decoder_layer_returns_topk_without_writing_the_shared_dict(
     assert received[0] is (source if skip_topk else None)
     assert topk is (None if skip_topk else computed)
     torch.testing.assert_close(hidden, torch.full((2, 4), 4.0))
+
+
+@pytest.fixture
+def gated_residual_model(monkeypatch):
+    """A two-layer AXK3Model with real Gated Residuals and token-local blocks.
+
+    `step.is_prefill` is the flag the model reads from the forward context, and
+    `read_dims` collects the rank of the residual each read was given.
+    """
+    import vllm.distributed.parallel_state as parallel_state
+    from vllm.config import set_current_vllm_config
+
+    import vllm_rbln.patches.axk3.model as axk3_model
+    from tests.vllm.vllm_config import make_vllm_config
+
+    torch.manual_seed(0)
+    # The axk3_gr_* ops fix n at 4.
+    num_streams, hidden = 4, 64
+
+    def gated_residual(has_write=True):
+        gr = axk3_model.AXK3GatedResidual(
+            hidden, num_streams, 64, 1e-6, has_write=has_write
+        )
+        for param in gr.parameters():
+            param.data.normal_(std=0.1)
+        return gr
+
+    def decoder_layer(idx):
+        layer = axk3_model.AXK3DecoderLayer.__new__(axk3_model.AXK3DecoderLayer)
+        torch.nn.Module.__init__(layer)
+        layer.attn_gated_residual = gated_residual()
+        layer.mlp_gated_residual = gated_residual()
+        layer.self_attn = SimpleNamespace(mla_attn=None)
+        layer.mlp = torch.tanh
+        layer.layer_idx, layer.index_source_layer, layer.skip_topk = idx, idx, False
+        return layer
+
+    monkeypatch.setattr(
+        axk3_model,
+        "_gated_mla_forward",
+        lambda mla, positions, x, topk_indices: (torch.sin(x), None),
+    )
+    monkeypatch.setattr(
+        parallel_state, "_TP", SimpleNamespace(world_size=1, rank_in_group=0)
+    )
+    model = axk3_model.AXK3Model.__new__(axk3_model.AXK3Model)
+    torch.nn.Module.__init__(model)
+    model.num_streams = num_streams
+    with set_current_vllm_config(make_vllm_config()):
+        model.layers = torch.nn.ModuleList([decoder_layer(0), decoder_layer(1)])
+        model.final_gated_residual = gated_residual(has_write=False)
+    model.start_layer, model.end_layer = 0, 2
+
+    step = SimpleNamespace(is_prefill=True)
+    monkeypatch.setattr(
+        axk3_model,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata={"attn": step}),
+    )
+    read_dims = []
+    plain_read = axk3_model.AXK3GatedResidual.read
+
+    def read(gr, residual):
+        read_dims.append(residual.dim())
+        return plain_read(gr, residual)
+
+    monkeypatch.setattr(axk3_model.AXK3GatedResidual, "read", read)
+    return SimpleNamespace(model=model, step=step, read_dims=read_dims, hidden=hidden)
+
+
+def test_prefill_chunk_matches_decoding_its_tokens_one_at_a_time(gated_residual_model):
+    built = gated_residual_model
+    tokens = 3
+    embeds = torch.randn(1, tokens, built.hidden)
+
+    def forward(t):
+        return built.model.forward(None, torch.arange(tokens)[t], None, embeds[:, t])
+
+    chunk = forward(slice(None))
+    # Both layers read a token-cut residual; only the final read, which has no
+    # write gate for axk3_gr_norm to fuse, gets the plain layout.
+    assert built.read_dims == [4, 4, 4, 4, 3]
+
+    built.step.is_prefill = False
+    decoded = torch.cat([forward(slice(t, t + 1)) for t in range(tokens)], dim=1)
+    torch.testing.assert_close(chunk, decoded)
+
+
+def test_a_multi_token_decode_step_keeps_the_plain_gated_residual(gated_residual_model):
+    built = gated_residual_model
+    built.step.is_prefill = False
+    tokens = 3
+
+    built.model.forward(
+        None, torch.arange(tokens), None, torch.randn(1, tokens, built.hidden)
+    )
+
+    assert built.read_dims == [3] * 5
 
 
 def test_eagle3_is_refused_on_both_aux_layer_setup_paths():

@@ -38,6 +38,7 @@ from torch import nn
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -109,6 +110,19 @@ class AXK3GatedResidual(nn.Module):
 
     def read(self, residual: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         """[..., n*h] -> (block input [..., h], write gate [..., n] or None)."""
+        if residual.dim() == 4:
+            u, write_gate = torch.ops.rbln_custom_ops.axk3_gr_norm(
+                residual,
+                self.gamma,
+                self.write_proj.weight,
+                self.write_bias,
+                self.norm.variance_epsilon,
+            )
+            block_input = torch.ops.rbln_custom_ops.axk3_gr_read(
+                u, self.read_down.weight, self.read_up.weight
+            )
+            return block_input, write_gate
+
         n = self.num_streams
         # vLLM's RMSNorm over one row per (token, stream), so the norm lowers
         # like every other RMSNorm; a hand-written [T, n, 1] statistic left a
@@ -140,6 +154,9 @@ class AXK3GatedResidual(nn.Module):
         self, residual: torch.Tensor, y: torch.Tensor, write_gate: torch.Tensor
     ) -> torch.Tensor:
         """R'_i = R_i + s_i * y."""
+        if residual.dim() == 4:
+            return torch.ops.rbln_custom_ops.axk3_gr_write(residual, y, write_gate)
+
         # y and the gate are bf16 and the product goes straight back to bf16,
         # so an fp32 multiply only added a cast on each side of it.
         scaled = (write_gate.unsqueeze(-1) * y.unsqueeze(-2)).to(residual.dtype)
@@ -345,8 +362,21 @@ class AXK3Model(nn.Module):
     ) -> torch.Tensor:
         if inputs_embeds is None:
             inputs_embeds = self.embed_input_ids(input_ids)
+        attn_metadata = get_forward_context().attn_metadata
+        if isinstance(attn_metadata, dict):
+            attn_metadata = next(iter(attn_metadata.values()))
+        is_prefill = attn_metadata.is_prefill
+
         # Every stream starts as the embedding.
-        hidden_states = torch.cat([inputs_embeds] * self.num_streams, dim=-1)
+        if is_prefill:
+            streams = (
+                *inputs_embeds.shape[:-2],
+                self.num_streams,
+                *inputs_embeds.shape[-2:],
+            )
+            hidden_states = inputs_embeds.unsqueeze(-3).expand(streams).contiguous()
+        else:
+            hidden_states = torch.cat([inputs_embeds] * self.num_streams, dim=-1)
 
         topk_by_layer: dict[int, torch.Tensor] = {}
         # `make_layers` pads the list to the full depth with `PPMissingLayer`,
@@ -356,6 +386,10 @@ class AXK3Model(nn.Module):
             if topk_indices is not None:
                 topk_by_layer[layer.layer_idx] = topk_indices
 
+        if is_prefill:
+            hidden_states = hidden_states.transpose(-3, -2).reshape(
+                *inputs_embeds.shape[:-1], -1
+            )
         hidden_states, _ = self.final_gated_residual.read(hidden_states)
         return hidden_states
 
