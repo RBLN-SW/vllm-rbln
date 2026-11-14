@@ -22,7 +22,7 @@ Per decoder layer (``compress_ratio`` 0 / 4 / 128):
 * compressor state CSA, HCA     ``[N, W, 2C]`` f32 ring, one slot per request (and a
                                 second one for the CSA indexer's compressor)
 
-The 768-byte row is ``rbln_custom_ops``' KV8 row (``sparse_attn_deepseek_v4``). The ring
+The 768-byte row is ``rbln_custom_ops``' KV8 row (``sparse_attn_deepseek_v4_csa`` / ``_hca``). The ring
 caches use ``RBLNSlidingWindowSpec`` (one block per request, prefix caching off); the paged ones
 ``MLAAttentionSpec`` with ``compress_ratio`` (a block of ``block_size`` tokens stores
 ``block_size / r`` entries). All reuse ``RBLNFlashAttentionMetadataBuilder``: the kernels take its

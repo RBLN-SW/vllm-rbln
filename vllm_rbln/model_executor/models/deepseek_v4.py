@@ -24,9 +24,9 @@ and weight names (through upstream's name mapper) and computes the way the refer
 * attention is MQA with one 512-channel entry (448 nope + 64 rope) per token, K == V. Every
   layer keeps the last ``sliding_window`` raw tokens; CSA layers (compress ratio 4) add the
   indexer's top-k compressed entries, HCA layers (128) all compressed entries; one softmax with
-  a per-head sink. The three pieces are ``rbln_custom_ops.deepseek_v4_compressor`` /
-  ``sparse_attn_deepseek_v4_indexer`` / ``sparse_attn_deepseek_v4``, which read and write their
-  caches (graph inputs, resolved from the attention metadata);
+  a per-head sink. The pieces are ``rbln_custom_ops.deepseek_v4_compressor``, the GLM-5.3
+  indexer (CSA) and ``sparse_attn_deepseek_v4_csa`` / ``_hca`` / ``_swa``, which read and write
+  their caches (graph inputs, resolved from the attention metadata);
 * the indexer keeps the DeepSeek-V3.2 fp8 key cache; no Hadamard, no FP4 simulation;
 * the output de-rotates its rope channels and goes through the grouped ``wo_a`` (bmm) + ``wo_b``;
 * MoE goes through the RBLN ``MoERunner``: sqrt-softplus scores with the routing bias, or the
@@ -709,17 +709,14 @@ class RBLNDeepseekV4Attention(nn.Module):
         if self.compress_ratio:
             kv_cmp = self.compressor(x, seq_idx).contiguous()
             cmp_cache, cmp_block_table = _paged_inputs(self.cmp_cache)
-            topk_index = None
-            if self.indexer is not None:
+            compressed = (self.compress_ratio, kv_cmp, cmp_cache, cmp_block_table)
+            if self.indexer is not None:  # CSA: the indexer's top-k entries
                 topk_index = self.indexer(x, qr, positions, seq_idx, query_len)
-            o = torch.ops.rbln_custom_ops.sparse_attn_deepseek_v4(
-                *common,
-                self.compress_ratio,
-                kv_cmp,
-                cmp_cache,
-                cmp_block_table,
-                topk_index,
-            )
+                o = torch.ops.rbln_custom_ops.sparse_attn_deepseek_v4_csa(
+                    *common, *compressed, topk_index
+                )
+            else:  # HCA: every completed entry
+                o = torch.ops.rbln_custom_ops.sparse_attn_deepseek_v4_hca(*common, *compressed)
         else:
             o = torch.ops.rbln_custom_ops.sparse_attn_deepseek_v4_swa(*common)
         # o [B, H, L, D]
