@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     # --- COMPILE / RUNTIME ---
     VLLM_RBLN_COMPILE_STRICT_MODE: bool = True
     VLLM_RBLN_COMPILE_ONLY: bool = False
+    VLLM_RBLN_DECLARE_HELD_PV: bool = False
     VLLM_RBLN_NUM_HIDDEN_LAYERS: int = 0
     VLLM_RBLN_USE_DEVICE_TENSOR: bool = True
     VLLM_RBLN_DISABLE_OFFLOAD: bool = True
@@ -252,6 +253,14 @@ environment_variables = {
             os.environ.get("VLLM_RBLN_COMPILE_ONLY", "False").lower() in ("true", "1")
         )
     ),
+    # Pass "declare_held_pv" to the rbln backend: a graph input fed by another
+    # graph's output takes that output's on-device layout, skipping relocation.
+    "VLLM_RBLN_DECLARE_HELD_PV": (
+        lambda: (
+            os.environ.get("VLLM_RBLN_DECLARE_HELD_PV", "False").lower()
+            in ("true", "1")
+        )
+    ),
     # Build only the first N decoder layers and leave the rest as
     # `PPMissingLayer`, to cut compile time during bring-up. 0 disables the
     # truncation. The HF config is left untouched, so layer indices still line
@@ -384,6 +393,7 @@ RBLN_COMPILE_ENV = frozenset(
         "VLLM_RBLN_NUM_HIDDEN_LAYERS",
         "VLLM_RBLN_USE_NESTED_COMPILE_REGION",
         "VLLM_RBLN_USE_DEVICE_TENSOR",
+        "VLLM_RBLN_DECLARE_HELD_PV",
     }
 )
 

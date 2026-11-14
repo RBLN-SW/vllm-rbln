@@ -142,6 +142,18 @@ class TestCompileOptions:
         compile(object(), mode=["foo"])
         assert captured_compile["options"]["mode"] == ["foo", "compile_only"]
 
+    def test_declare_held_pv_off_by_default(self, captured_compile, monkeypatch):
+        monkeypatch.setattr(compiler.envs, "VLLM_RBLN_DECLARE_HELD_PV", False)
+        compile(object())
+        assert "declare_held_pv" not in captured_compile["options"]
+
+    def test_declare_held_pv_forwarded_when_env_set(
+        self, captured_compile, monkeypatch
+    ):
+        monkeypatch.setattr(compiler.envs, "VLLM_RBLN_DECLARE_HELD_PV", True)
+        compile(object())
+        assert captured_compile["options"]["declare_held_pv"] is True
+
     def test_cache_dir_defaults_under_cache_root(self, captured_compile, monkeypatch):
         # Default cache_dir is VLLM_CACHE_ROOT/rbln.
         monkeypatch.setattr(compiler.envs, "VLLM_DISABLE_COMPILE_CACHE", False)

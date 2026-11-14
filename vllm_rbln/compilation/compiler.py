@@ -156,6 +156,8 @@ def compile(
     set_option("global_device_id", global_device_id)
     set_option("use_static_output", use_static_output)
     set_option("dtype", dtype)
+    if envs.VLLM_RBLN_DECLARE_HELD_PV:
+        set_option("declare_held_pv", True)
     if use_cache and not envs.VLLM_DISABLE_COMPILE_CACHE:
         set_option("cache_dir", cache_dir or os.path.join(envs.VLLM_CACHE_ROOT, "rbln"))
         set_option("mega_cache_only", True)
