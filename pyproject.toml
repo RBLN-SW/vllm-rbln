@@ -78,7 +78,7 @@ runtime = [
     "rebel-compiler>=0.12.1.dev618,<0.12.2",
 ]
 kv_connectors = [
-    "nixl-rbln>=0.12.0rc1,<0.12.1",
+    "nixl-rbln>=0.12.1.dev0,<0.12.2",
     "lmcache-rbln>=0.12.1.dev19,<0.12.2",
 ]
 

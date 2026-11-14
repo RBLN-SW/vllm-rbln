@@ -1755,15 +1755,14 @@ wheels = [
 
 [[package]]
 name = "nixl-rbln"
-version = "0.12.0rc1"
+version = "0.12.1.dev11+g7bf6a0b14"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
 dependencies = [
     { name = "nixl" },
     { name = "rebel-compiler" },
-    { name = "torch-rbln" },
 ]
 wheels = [
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/nixl-rbln/0.12.0rc1/nixl_rbln-0.12.0rc1-py3-none-manylinux_2_34_x86_64.whl", hash = "md5:86bdea9a316de5f2820d688beeae3c49" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/nixl-rbln/0.12.1.dev11+g7bf6a0b14/nixl_rbln-0.12.1.dev11+g7bf6a0b14-py3-none-manylinux_2_34_x86_64.whl", hash = "md5:c436a914f53f7be8fcf15b8eefe58a6f" },
 ]
 
 [[package]]
@@ -3625,7 +3624,7 @@ requires-dist = [
     { name = "fire", marker = "extra == 'dev'" },
     { name = "huggingface-hub", marker = "extra == 'dev'" },
     { name = "lmcache-rbln", marker = "extra == 'kv-connectors'", specifier = ">=0.12.1.dev19,<0.12.2" },
-    { name = "nixl-rbln", marker = "extra == 'kv-connectors'", specifier = ">=0.12.0rc1,<0.12.1" },
+    { name = "nixl-rbln", marker = "extra == 'kv-connectors'", specifier = ">=0.12.1.dev0,<0.12.2" },
     { name = "optimum-rbln", specifier = ">=0.12.1a10,<0.12.2", index = "https://pypi.org/simple/" },
     { name = "packaging", marker = "extra == 'dev'" },
     { name = "pynvml", marker = "extra == 'dev'" },
