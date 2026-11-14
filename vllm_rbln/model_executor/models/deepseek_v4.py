@@ -830,7 +830,8 @@ class RBLNDeepseekV4MoE(nn.Module):
             if not self.is_hash:
                 return logits
             eids = eids_local if extra is None else extra
-            return logits, eids[:, : self.top_k].to(torch.int32)
+            # bf16 ids as they are: the router masks with a compare, no int cast
+            return logits, eids[:, : self.top_k]
 
         if self.is_hash:
             route.gather_extra = eids_local

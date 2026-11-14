@@ -65,14 +65,33 @@ def _apply_sqrtsoftplus_topk(
     top_k,
     renormalize,
     e_score_correction_bias=None,
-    forced_ids=None,  # [T, top_k] int
+    forced_ids=None,  # [T, top_k] expert ids (any dtype holding them exactly)
 ):
     """DeepSeek-V4 routing: scores sqrt(softplus(logits)); experts from the top-k of
     scores + bias, or `forced_ids` (hash routing); weights are the unbiased scores,
     renormalized. Returns [E, T]."""
     scores_t = F.softplus(router_logits_2d.float()).sqrt().transpose(0, 1)  # [E, T]
     if forced_ids is not None:
-        selected_experts = forced_ids.to(torch.int64).transpose(0, 1)  # [top_k, T]
+        # Hash routing: the experts are given, so no top-k to fuse the gather / scatter into
+        # (they would run on the host, once a layer). Mask the scores with a one-hot of the
+        # ids instead, compares on the ids as they come (a bf16 table row is exact for ids
+        # < 256): elementwise work the device runs. The renormalizing sum over the experts is
+        # a ones-row matmul (a column sum of a [E, 1] decode tensor stays on the host).
+        ids_t = forced_ids.transpose(0, 1).float()  # [top_k, T]
+        experts = torch.arange(
+            scores_t.shape[0], device=scores_t.device, dtype=torch.float32
+        ).unsqueeze(1)  # [E, 1]
+        mask = torch.zeros_like(scores_t)
+        for k in range(top_k):
+            mask = mask + (experts == ids_t[k : k + 1]).float()
+        topk_weights = scores_t * mask.clamp_max(1.0)  # [E, T]
+        if renormalize:
+            ones = torch.ones(
+                1, scores_t.shape[0], device=scores_t.device, dtype=scores_t.dtype
+            )
+            denom = torch.matmul(ones, topk_weights)  # [1, T]
+            topk_weights = topk_weights / denom.clamp_min(1e-20)
+        return topk_weights
     else:
         scores_for_topk = scores_t
         if e_score_correction_bias is not None:
