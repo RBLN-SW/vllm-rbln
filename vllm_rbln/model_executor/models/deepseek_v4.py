@@ -349,7 +349,8 @@ class RBLNDeepseekV4Rope(nn.Module):
     Written as ``x * cos + rotate_gptj(x) * sin`` over pair-duplicated cos / sin at the rotated
     tensor's rank (as the RBLN RotaryEmbedding patch) so the compiler lowers the rotation to its
     rotary primitive; the nope channels pass around it (slice + concat). The inverse rotation
-    (-theta) is the same expression over a negated sin table, so it lowers the same way.
+    (-theta) is ``x * cos - rotate_gptj(x) * sin``, which the compiler lowers to the same
+    primitive over a negated sin.
     """
 
     def __init__(self, config: PretrainedConfig, compress_ratio: int, max_pos: int) -> None:
@@ -376,7 +377,6 @@ class RBLNDeepseekV4Rope(nn.Module):
         sin = table[:, half:].repeat_interleave(2, dim=-1)
         self.register_buffer("cos_cache", cos, persistent=False)
         self.register_buffer("sin_cache", sin, persistent=False)
-        self.register_buffer("neg_sin_cache", -sin, persistent=False)
 
     def forward(
         self, x: torch.Tensor, positions: torch.Tensor, inverse: bool = False
@@ -385,12 +385,14 @@ class RBLNDeepseekV4Rope(nn.Module):
         batch, seq_len = positions.shape[0], positions.shape[1]
         flat = positions.flatten()
         cos = self.cos_cache.index_select(0, flat).view(batch, seq_len, -1).to(x.dtype)
-        sin_cache = self.neg_sin_cache if inverse else self.sin_cache
-        sin = sin_cache.index_select(0, flat).view(batch, seq_len, -1).to(x.dtype)
+        sin = self.sin_cache.index_select(0, flat).view(batch, seq_len, -1).to(x.dtype)
         for _ in range(x.dim() - 3):
             cos, sin = cos.unsqueeze(-2), sin.unsqueeze(-2)
         nope, rope = x[..., : -self.rope_dim], x[..., -self.rope_dim :]
-        rot = rope * cos + rotate_gptj(rope) * sin
+        if inverse:
+            rot = rope * cos - rotate_gptj(rope) * sin
+        else:
+            rot = rope * cos + rotate_gptj(rope) * sin
         return torch.cat([nope, rot], dim=-1)
 
 
