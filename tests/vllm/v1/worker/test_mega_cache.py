@@ -30,7 +30,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from vllm.config import KVTransferConfig
+from vllm.config import KVTransferConfig, ParallelConfig
 
 from tests.vllm.vllm_config import make_vllm_config
 from vllm_rbln.v1.worker import mega_cache, rbln_model_runner
@@ -59,6 +59,7 @@ def _stub_config(digest: str = "cfghash"):
             num_gpu_blocks_override=None,
             gpu_memory_utilization=0.9,
         ),
+        parallel_config=ParallelConfig(),
         model_config=SimpleNamespace(
             max_model_len=32,
             generation_config="auto",
@@ -429,13 +430,10 @@ class TestSignatureVllmConfig:
         ids=["override_generation_config", "generation_config"],
     )
     def test_sampling_defaults_do_not_invalidate(self, overrides):
-        # Request sampling values reach the sampler graphs as runtime inputs;
-        # WARM_UP_CONFIGS fixes which variants compile.
         base = mega_cache.config_signature(make_vllm_config())
         assert mega_cache.config_signature(make_vllm_config(**overrides)) == base
 
     def test_non_sampling_override_invalidates(self):
-        # Llama4 reads attn_temperature_tuning from it at model build.
         base = mega_cache.config_signature(make_vllm_config())
         other = make_vllm_config(
             override_generation_config={"attn_temperature_tuning": True}
@@ -448,7 +446,6 @@ class TestSignatureVllmConfig:
         ids=["sampling-only", "suppress_tokens"],
     )
     def test_generation_config_dir_keys_on_its_content(self, tmp_path, update, same):
-        # Gemma4 bakes suppress_tokens into the wrapped compute_logits.
         base_config = make_vllm_config()
         src = os.path.join(base_config.model_config.model, "generation_config.json")
         with open(src) as f:
@@ -812,7 +809,7 @@ class TestConformance:
 
         assert CacheArtifactFactory.create("rbln", "M:probe", b"").type() == "rbln"
 
-    def test_off_graph_generation_keys_match_upstream_sampling_defaults(self):
+    def test_sampling_default_keys_match_upstream(self):
         # Upstream keeps its list local to get_diff_sampling_param(); probe it
         # with every candidate name so an added or dropped key fails here.
         from transformers import GenerationConfig
@@ -821,7 +818,7 @@ class TestConformance:
         candidates = (
             set(GenerationConfig().to_dict())
             | set(SamplingParams.__struct_fields__)
-            | mega_cache._OFF_GRAPH_GENERATION_KEYS
+            | mega_cache._SAMPLING_DEFAULT_KEYS
         )
         config = make_vllm_config(
             generation_config="vllm",
@@ -829,6 +826,4 @@ class TestConformance:
         )
         upstream = set(config.model_config.get_diff_sampling_param())
         upstream = {"max_new_tokens" if k == "max_tokens" else k for k in upstream}
-        assert upstream == mega_cache._OFF_GRAPH_GENERATION_KEYS - {
-            "transformers_version"
-        }
+        assert upstream == mega_cache._SAMPLING_DEFAULT_KEYS

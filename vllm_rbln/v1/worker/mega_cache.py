@@ -19,6 +19,7 @@ config-signature, rank) file under VLLM_CACHE_ROOT.
 """
 
 import contextlib
+import dataclasses
 import errno
 import hashlib
 import os
@@ -78,11 +79,10 @@ def _npu_name() -> str:
         return "unknown"
 
 
-# ModelConfig.get_diff_sampling_param()'s request defaults, plus the version
-# stamp to_diff_dict() fills from the installed transformers.
-_OFF_GRAPH_GENERATION_KEYS = frozenset(
+# Copy of the request-default keys local to
+# ModelConfig.get_diff_sampling_param().
+_SAMPLING_DEFAULT_KEYS = frozenset(
     {
-        "transformers_version",
         "repetition_penalty",
         "presence_penalty",
         "frequency_penalty",
@@ -111,9 +111,6 @@ def _warmup_graph_set_factors(
     # Not draft_parallel_config: it carries the same per-launch ports.
     draft = getattr(spec, "draft_model_config", None)
     ec = vllm_config.ec_transfer_config
-    mc = vllm_config.model_config
-    generation = mc.try_get_generation_config()
-    generation.update(mc.override_generation_config)
     factors: dict[str, object] = {
         "max_num_seqs": normalize_value(getattr(scheduler, "max_num_seqs", None)),
         "num_gpu_blocks_override": normalize_value(
@@ -135,10 +132,6 @@ def _warmup_graph_set_factors(
         "ec_role": ec.ec_role if ec is not None else None,
         # Not kv_role itself: only the strict producer builds a different set.
         "prefill_only": is_strict_kv_producer(vllm_config),
-        # By content, not by path; sampling defaults reach the sampler at runtime.
-        "generation_config": normalize_value(
-            {k: v for k, v in generation.items() if k not in _OFF_GRAPH_GENERATION_KEYS}
-        ),
     }
 
     if extra_hash_factors:
@@ -148,59 +141,66 @@ def _warmup_graph_set_factors(
     return hash_factors(factors)
 
 
-def _stable_compute_hash(vllm_config) -> str:
-    """compute_hash() leaks per-launch auto-queried ports via ParallelConfig
-    port fields; zero them around the call so the hash is launch-stable. The
-    generation config is reset too and keyed by content in
-    _warmup_graph_set_factors() instead."""
-    import dataclasses
+def _generation_config_factors(model_config) -> str:
+    from vllm.config.utils import hash_factors, normalize_value
 
-    pc = getattr(vllm_config, "parallel_config", None)
-    saved: dict = {}
-    if pc is not None and dataclasses.is_dataclass(pc):
-        for field in dataclasses.fields(pc):
-            if "port" in field.name.lower():
-                try:
-                    saved[field.name] = getattr(pc, field.name)
-                    object.__setattr__(pc, field.name, 0)
-                except Exception:  # pylint: disable=broad-exception-caught
-                    saved.pop(field.name, None)
-    mc = vllm_config.model_config
-    saved_mc = {
-        "generation_config": mc.generation_config,
-        "override_generation_config": mc.override_generation_config,
-    }
-    object.__setattr__(mc, "generation_config", "auto")
-    object.__setattr__(mc, "override_generation_config", {})
+    effective = model_config.try_get_generation_config()
+    effective.update(model_config.override_generation_config)
+    return hash_factors(
+        {
+            k: normalize_value(v)
+            for k, v in effective.items()
+            if k not in _SAMPLING_DEFAULT_KEYS and k != "transformers_version"
+        }
+    )
+
+
+@contextlib.contextmanager
+def _patched(obj, values: Mapping[str, object]):
+    saved = {name: getattr(obj, name) for name in values}
     try:
-        return vllm_config.compute_hash()
+        for name, value in values.items():
+            object.__setattr__(obj, name, value)
+        yield
     finally:
         for name, value in saved.items():
-            with contextlib.suppress(Exception):
-                object.__setattr__(pc, name, value)
-        for name, value in saved_mc.items():
-            object.__setattr__(mc, name, value)
+            object.__setattr__(obj, name, value)
+
+
+def _stable_compute_hash(vllm_config) -> str:
+    """compute_hash() with the per-launch ParallelConfig ports zeroed and the
+    generation config reset; _generation_config_factors() keys the latter."""
+    pc = vllm_config.parallel_config
+    ports = {f.name: 0 for f in dataclasses.fields(pc) if "port" in f.name.lower()}
+    generation = {"generation_config": "auto", "override_generation_config": {}}
+    with _patched(pc, ports), _patched(vllm_config.model_config, generation):
+        return vllm_config.compute_hash()
 
 
 def config_signature(
     vllm_config, extra_hash_factors: Mapping[str, object] | None = None
 ) -> str:
-    """vLLM config hash + warm-up graph set + rbln compile env + NPU name +
-    rebel major.minor; launch- and host-stable, shared by all TP/DP ranks (the
-    rank subdir isolates shards)."""
+    """vLLM config hash + generation config + warm-up graph set + rbln compile
+    env + NPU name + rebel major.minor; launch- and host-stable, shared by all
+    TP/DP ranks (the rank subdir isolates shards)."""
     cfg = _stable_compute_hash(vllm_config)
+    gen = _generation_config_factors(vllm_config.model_config)
     graphs = _warmup_graph_set_factors(vllm_config, extra_hash_factors)
     env = _compile_env_factors()
     npu = _npu_name()
     rebel_ver = _rebel_major_minor()
     digest = hashlib.sha1(
-        "|".join([cfg, graphs, env, f"npu={npu}", f"rebel={rebel_ver}"]).encode("utf-8")
+        "|".join([cfg, gen, graphs, env, f"npu={npu}", f"rebel={rebel_ver}"]).encode(
+            "utf-8"
+        )
     )
     sig = digest.hexdigest()[:16]
     logger.info(
-        "mega-cache config_signature=%s (cfg=%s graphs=%s env=%s npu=%s rebel=%s)",
+        "mega-cache config_signature=%s (cfg=%s gen=%s graphs=%s env=%s npu=%s "
+        "rebel=%s)",
         sig,
         cfg[:8],
+        gen[:8],
         graphs[:8],
         env[:8],
         npu,
