@@ -15,9 +15,9 @@
 import torch
 from vllm.model_executor.layers.rotary_embedding.mrope import MRotaryEmbedding
 
-from vllm_rbln.patches.rotary_embedding import (
-    _apply_rotate_half,
-    _register_rotate_half_caches,
+from vllm_rbln.model_executor.layers.rotary_embedding.common import (
+    apply_rotate_half,
+    register_rotate_half_caches,
 )
 
 
@@ -31,7 +31,7 @@ class RBLNMRotaryEmbedding(MRotaryEmbedding):
         target_device = torch.get_default_device()
         with torch.device("cpu"):
             super().__init__(*args, **kwargs)
-            _register_rotate_half_caches(self)
+            register_rotate_half_caches(self)
             if self.mrope_section:
                 # Which of the T/H/W position axes each rotary channel takes:
                 # interleaved [THWTHW...TT] (upstream apply_interleaved_rope)
@@ -86,7 +86,7 @@ class RBLNMRotaryEmbedding(MRotaryEmbedding):
             sin = self.sin_cache.index_select(0, positions_flat).view(
                 batch_size, 1, seq_len, -1
             )
-            return _apply_rotate_half(self, batch_size, seq_len, cos, sin, query, key)
+            return apply_rotate_half(self, batch_size, seq_len, cos, sin, query, key)
 
         assert positions.ndim == 3 and positions.shape[0] == 3, positions.shape
         assert self.mrope_section, "multimodal positions need mrope_section"
@@ -103,4 +103,4 @@ class RBLNMRotaryEmbedding(MRotaryEmbedding):
         cos = torch.where(table == 2, cos_axes[2], cos)
         sin = torch.where(table == 1, sin_axes[1], sin_axes[0])
         sin = torch.where(table == 2, sin_axes[2], sin)
-        return _apply_rotate_half(self, batch_size, seq_len, cos, sin, query, key)
+        return apply_rotate_half(self, batch_size, seq_len, cos, sin, query, key)
