@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.10, <3.15"
 resolution-markers = [
     "python_full_version >= '3.14' and platform_machine == 'x86_64' and sys_platform == 'linux'",
@@ -1227,9 +1227,20 @@ wheels = [
 ]
 
 [[package]]
+name = "intel-cmplr-lib-ur"
+version = "2024.2.1"
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+wheels = [
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/intel-cmplr-lib-ur/2024.2.1/intel_cmplr_lib_ur-2024.2.1-py2.py3-none-manylinux1_x86_64.whl", hash = "sha256:8b78d58ab501d6e5a582967be80fdbf7b03b33279135a303da36dbf11f481ed7" },
+]
+
+[[package]]
 name = "intel-openmp"
 version = "2024.2.1"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+dependencies = [
+    { name = "intel-cmplr-lib-ur" },
+]
 wheels = [
     { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/intel-openmp/2024.2.1/intel_openmp-2024.2.1-py2.py3-none-manylinux1_x86_64.whl", hash = "sha256:21892ea07a9c6e164707d2b44e6f396f9f2ab6cc7e108755011fad59b596182a" },
 ]
@@ -1989,7 +2000,7 @@ wheels = [
 
 [[package]]
 name = "optimum-rbln"
-version = "0.12.1a9"
+version = "0.12.1a10"
 source = { registry = "https://pypi.org/simple/" }
 dependencies = [
     { name = "accelerate" },
@@ -2003,9 +2014,9 @@ dependencies = [
     { name = "transformers" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/bd/71/12ccbf941a09f4ec2a7c7d33ed616554762f68e1bc0196bc546d9494d7b7/optimum_rbln-0.12.1a9.tar.gz", hash = "sha256:b55d3ece1e223b377a526a6b5d292786bc7c69b1b03349f80f71015aa755b412", size = 715360, upload-time = "2026-11-10T06:50:26.014Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/72/7b/50be5a156cdd44d7ff2cf49a5f85ab8119d7c865576a1ea2ab2dd1e85b31/optimum_rbln-0.12.1a10.tar.gz", hash = "sha256:6801e40ed5624980e68567ff7ac36dd436d840f428b4fa46229222fca3878bf5", size = 716351, upload-time = "2026-11-13T09:01:28.832Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/6a/3b/783aab807556ee792ee02cae9b363c7efdddd088897ebf8b83b22b48b60e/optimum_rbln-0.12.1a9-py3-none-any.whl", hash = "sha256:51c2bfa23ed7612cc392ec5af0da2b60f153b565ac894ca12f56bfb356c81df4", size = 787444, upload-time = "2026-11-10T06:50:23.914Z" },
+    { url = "https://files.pythonhosted.org/packages/8c/d1/97ac275908b4f32cbc302e344956fa453a226642fee7bb4210f5c6a88092/optimum_rbln-0.12.1a10-py3-none-any.whl", hash = "sha256:cf1a82050fdaaec0b66f98d693edeb691741af020c6726560f3025a88050d34e", size = 787034, upload-time = "2026-11-13T09:01:26.716Z" },
 ]
 
 [[package]]
@@ -3615,7 +3626,7 @@ requires-dist = [
     { name = "huggingface-hub", marker = "extra == 'dev'" },
     { name = "lmcache-rbln", marker = "extra == 'kv-connectors'", specifier = ">=0.12.1.dev19,<0.12.2" },
     { name = "nixl-rbln", marker = "extra == 'kv-connectors'", specifier = ">=0.12.0rc1,<0.12.1" },
-    { name = "optimum-rbln", specifier = ">=0.12.1a9,<0.12.2", index = "https://pypi.org/simple/" },
+    { name = "optimum-rbln", specifier = ">=0.12.1a10,<0.12.2", index = "https://pypi.org/simple/" },
     { name = "packaging", marker = "extra == 'dev'" },
     { name = "pynvml", marker = "extra == 'dev'" },
     { name = "pytest", marker = "extra == 'test'" },
