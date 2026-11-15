@@ -1191,6 +1191,16 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
 
                 for layer_name in attn_group.layer_names:
                     attn_metadata[layer_name] = attn_metadata_i
+                if __import__("os").environ.get("DSV4_LOG_META"):  # local debug only
+                    def _v(name, md=attn_metadata_i):
+                        t = getattr(md, name, None)
+                        return None if t is None else t.detach().cpu().flatten()[:4].tolist()
+                    logger.info(
+                        "DSV4_META g%d %s prefill=%s seq_lens=%s offsets=%s load=%s store=%s",
+                        kv_cache_gid, attn_group.layer_names[0], self.is_prefill,
+                        _v("cache_seq_lens"), _v("cache_offsets"), _v("load_blocks"),
+                        _v("store_blocks"),
+                    )
 
         self._attach_kv_cache_bindings(attn_metadata)
 
@@ -1721,6 +1731,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 n = int(self.input_batch.num_tokens_no_spec[i])
                 if n < len(seq):
                     out.sampled_token_ids[i, 0] = seq[n]
+        if __import__("os").environ.get("DSV4_DUMP_KV"):  # local debug only
+            self._dsv4_dump_kv(None, tag="after")
         return out
 
     def _apply_pending_token_writeback(self) -> None:
@@ -2068,6 +2080,42 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
 
         return intermediate_tensors
 
+    def _dsv4_dump_kv(self, scheduler_output, tag: str = "before") -> None:
+        """Local debug only: every cache on the host (DSV4_DUMP_KV=<dir>): once before the
+        first step (nothing in flight yet), then after each sampled step."""
+        import os
+
+        if not self.kv_caches:
+            return
+        if tag == "before":
+            if getattr(self, "_dsv4_dumped_init", False) or not (
+                scheduler_output.total_num_scheduled_tokens
+            ):
+                return
+            self._dsv4_dumped_init = True
+            step = 0
+            # device memory keeps a previous run's rows: start from zeros so a diff shows writes
+            # (DSV4_DUMP_KV_NOZERO=1 keeps them: a run as it is, its first dump the memory found)
+            if not os.environ.get("DSV4_DUMP_KV_NOZERO"):
+                for cache in self.kv_caches:
+                    cache.zero_()
+        else:
+            step = getattr(self, "_dsv4_dump_step", 0)
+            self._dsv4_dump_step = step + 1
+            if step >= int(os.environ.get("DSV4_DUMP_KV_STEPS", "4")):
+                return
+        caches = {}
+        for name, cache in zip(self.kv_cache_names, self.kv_caches):
+            t = cache.detach().cpu()
+            caches[name] = t.view(torch.uint8) if t.element_size() == 1 else t
+        spans = {
+            name: (cache.data_ptr(), cache.untyped_storage().data_ptr(),
+                   cache.numel() * cache.element_size(), tuple(cache.shape), str(cache.dtype))
+            for name, cache in zip(self.kv_cache_names, self.kv_caches)
+        }
+        torch.save({"caches": caches, "spans": spans},
+                   f"{os.environ['DSV4_DUMP_KV']}/{tag}{step}.pt")
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -2080,6 +2128,30 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 "after execute_model() returns None."
             )
 
+        if __import__("os").environ.get("DSV4_DUMP_KV"):  # local debug only
+            self._dsv4_dump_kv(scheduler_output)
+        # local debug only: DSV4_INIT_KV=nan|zero fills every cache once before the first step
+        # (byte 0xFF is NaN in fp8 e4m3 and in bf16), so a read of a never-written row shows.
+        if __import__("os").environ.get("DSV4_INIT_KV") and not getattr(self, "_dsv4_kv_init", False):
+            self._dsv4_kv_init = True
+            nan = __import__("os").environ["DSV4_INIT_KV"] == "nan"
+            rand = __import__("os").environ["DSV4_INIT_KV"] == "rand"
+            only = __import__("os").environ.get("DSV4_INIT_KV_ONLY")  # rand these, zero the rest
+            for name, cache in zip(self.kv_cache_names, self.kv_caches):
+                print("DSV4_KV_NAME", name, tuple(cache.shape), cache.dtype, flush=True)
+                if only and only not in name:
+                    cache.view(torch.uint8).fill_(0)
+                elif rand:  # garbage bytes, as device memory a fresh process finds
+                    raw = cache.view(torch.uint8)
+                    raw.copy_(torch.randint(0, 256, raw.shape, dtype=torch.uint8))
+                elif cache.element_size() == 1:
+                    cache.view(torch.uint8).fill_(0xFF if nan else 0)
+                else:
+                    cache.fill_(float("nan") if nan else 0.0)
+        if __import__("os").environ.get("D10_BIND_LOG") and not getattr(self, "_d10_spans", False):
+            self._d10_spans = True
+            for name, cache in zip(self.kv_cache_names, self.kv_caches):
+                print(f"D10_CACHE {name} ptr={cache.data_ptr()} shape={tuple(cache.shape)}", flush=True)
         # Stamp the step's phase before any step logic reads it.
         self.is_prefill = step_is_prefill(
             scheduler_output, strict_kv_producer=self.is_strict_kv_producer
