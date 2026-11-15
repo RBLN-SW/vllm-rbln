@@ -83,6 +83,12 @@ def register_deepseek_v4_mamba_config() -> None:
                     "copies, which are not supported on RBLN yet. "
                     "Use --no-enable-prefix-caching."
                 )
+            speculative = vllm_config.speculative_config
+            if speculative is not None and speculative.num_speculative_tokens > 3:
+                raise ValueError(
+                    "DeepSeek-V4 on RBLN supports at most 3 speculative tokens; "
+                    "longer verification needs unaligned multi-block compression."
+                )
             super().verify_and_update_config(vllm_config)
 
     MODELS_CONFIG_MAP["DeepseekV4ForCausalLM"] = RBLNDeepseekV4Config

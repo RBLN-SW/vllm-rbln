@@ -171,9 +171,13 @@ class RBLNDeepseekV4RingCache(nn.Module, AttentionLayerBase):
         self.layer_index = _cache_ordinal(layer_id, slot)
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        speculative = vllm_config.speculative_config
+        drafts = speculative.num_speculative_tokens if speculative is not None else 0
+        # Preserve rollback history with the kernels' power-of-two ring geometry.
+        capacity = 1 << (self.window + drafts - 1).bit_length()
         return RBLNDeepseekV4StateSpec(
             block_size=vllm_config.cache_config.mamba_block_size,
-            shapes=((self.window, self.width),),
+            shapes=((capacity, self.width),),
             dtypes=(self.dtype,),
             mamba_cache_mode=vllm_config.cache_config.mamba_cache_mode,
         )

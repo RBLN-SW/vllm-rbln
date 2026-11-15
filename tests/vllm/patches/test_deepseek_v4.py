@@ -45,6 +45,27 @@ def test_prefix_caching_requires_ring_checkpoints():
         MODELS_CONFIG_MAP["DeepseekV4ForCausalLM"].verify_and_update_config(config)
 
 
+@pytest.mark.parametrize("drafts", [4, 8])
+def test_speculation_rejects_unsupported_verification_geometry(monkeypatch, drafts):
+    from vllm.model_executor.models.config import (
+        MODELS_CONFIG_MAP,
+        DeepseekV4ForCausalLMConfig,
+    )
+
+    monkeypatch.setattr(
+        DeepseekV4ForCausalLMConfig,
+        "verify_and_update_config",
+        classmethod(lambda cls, cfg: None),
+    )
+
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(enable_prefix_caching=False),
+        speculative_config=SimpleNamespace(num_speculative_tokens=drafts),
+    )
+    with pytest.raises(ValueError, match="at most 3"):
+        MODELS_CONFIG_MAP["DeepseekV4ForCausalLM"].verify_and_update_config(config)
+
+
 @pytest.mark.parametrize("layers", [2, 3])
 def test_pp_replan_preserves_reconciled_block_count(layers):
     config = SimpleNamespace(

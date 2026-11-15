@@ -29,6 +29,32 @@ def test_paged_block_size_follows_the_cache_shard_contract(block_size, ratio, ex
     assert _paged_block_size(config, ratio) == expected
 
 
+@pytest.mark.parametrize("history", [8, 128])
+@pytest.mark.parametrize("drafts", [0, 1, 3, 8])
+def test_ring_capacity_preserves_history_across_rejected_drafts(history, drafts):
+    from vllm_rbln.model_executor.models.deepseek_v4 import RBLNDeepseekV4RingCache
+
+    ring = RBLNDeepseekV4RingCache.__new__(RBLNDeepseekV4RingCache)
+    torch.nn.Module.__init__(ring)
+    ring.window, ring.width, ring.dtype = history, 768, torch.uint8
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(mamba_block_size=1048576, mamba_cache_mode="none"),
+        speculative_config=SimpleNamespace(num_speculative_tokens=drafts)
+        if drafts
+        else None,
+    )
+    rows = ring.get_kv_cache_spec(config).shapes[0][0]
+    tokens = list(range(rows))
+    start = rows
+    for p in range(start, start + drafts + 1):
+        tokens[p % rows] = p
+    next_query = start + 1
+    for p in range(next_query - history + 1, next_query):
+        assert tokens[p % rows] == p
+    if not drafts:
+        assert rows == history
+
+
 @pytest.mark.parametrize("target_layers", [6, 43])
 def test_mtp_compression_uses_checkpoint_tail(target_layers):
     from vllm_rbln.model_executor.models.deepseek_v4 import _compress_ratio
