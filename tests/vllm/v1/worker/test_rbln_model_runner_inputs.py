@@ -287,6 +287,24 @@ class TestMRopePositions:
 
         assert runner.mrope_positions[:, 0].tolist() == [num_computed + self.DELTA] * 3
 
+    def test_a_step_across_the_prompt_end_takes_both(
+        self, make_model_runner, monkeypatch
+    ):
+        # A preempted request runs its prompt's tail and its outputs again.
+        runner = self._runner(make_model_runner, monkeypatch)
+        runner.input_batch.num_computed_tokens_cpu[0] = 2
+        runner.input_batch.num_tokens_no_spec[0] = len(self.PROMPT) + 2
+        runner._is_prefill_step = True
+
+        runner._prepare_inputs(
+            make_scheduler_output(num_scheduled_tokens={"a": 4}),
+            np.array([4], dtype=np.int32),
+        )
+
+        past_prompt = torch.tensor([4, 5]) + self.DELTA
+        expected = torch.cat([self.TABLE[:, 2:], past_prompt.expand(3, -1)], dim=1)
+        assert torch.equal(runner.mrope_positions[:, :4], expected)
+
     def test_a_streaming_update_rebuilds_the_requests_table(
         self, make_model_runner, monkeypatch
     ):

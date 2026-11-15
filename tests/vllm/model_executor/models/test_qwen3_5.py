@@ -59,7 +59,6 @@ def visual(tmp_path):
                 temporal_patch_size=TEMPORAL,
                 num_position_embeddings=64,
                 out_hidden_size=32,
-                deepstack_visual_indexes=[],
                 hidden_act="gelu_pytorch_tanh",
             )
             torch.manual_seed(0)
