@@ -116,7 +116,11 @@ def _validate(vllm_config: "VllmConfig") -> None:
     if vllm_config.lora_config is not None:
         raise ValueError("LoRA is not supported on RBLN.")
 
-    if _uses_gated_delta_net(model_config):
+    # An encoder-only instance builds no language model, so no GDN layer.
+    uses_gdn = (
+        _uses_gated_delta_net(model_config) and not vllm_config.is_mm_encoder_only
+    )
+    if uses_gdn:
         if rbln_config.use_custom_kernel:
             raise ValueError(
                 "GatedDeltaNet models do not take --rbln-use-custom-kernel on the "
@@ -313,7 +317,7 @@ def _validate(vllm_config: "VllmConfig") -> None:
         raise ValueError(
             f"prefill_chunk_size={chunks} exceeds {max_num_scheduled_tokens=}."
         )
-    if _uses_gated_delta_net(model_config) and any(chunk % 128 for chunk in chunks):
+    if uses_gdn and any(chunk % 128 for chunk in chunks):
         raise ValueError(
             "The RBLN GatedDeltaNet prefill kernel runs in 128-token chunks; got "
             f"prefill_chunk_size={chunks}. Each has to be a multiple of 128 "

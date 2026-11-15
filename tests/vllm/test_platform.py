@@ -730,6 +730,21 @@ class TestRejectedConfigs:
         with pytest.raises(ValueError, match="must fit in a full-attention"):
             reconfigure(smaller_block)
 
+    def test_gdn_rules_skip_an_encoder_only_instance(self, reconfigure, gdn):
+        # Neither the state's page nor the prefill kernel's chunk is met.
+        def encoder_only(config):
+            gdn(config)
+            config.model_config.multimodal_config = SimpleNamespace(
+                mm_encoder_only=True
+            )
+            config.scheduler_config.max_num_batched_tokens = 192
+            config.additional_config = replace(
+                config.additional_config, prefill_chunk_size=None
+            )
+            config.cache_config.block_size = 192
+
+        reconfigure(encoder_only)
+
     def test_gdn_state_is_one_block_a_request(self, reconfigure, gdn):
         config = reconfigure(gdn)
         assert config.cache_config.mamba_block_size == config.model_config.max_model_len
