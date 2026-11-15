@@ -28,11 +28,10 @@ import torch
 import torch.rbln  # noqa: F401  # a hard dependency; see pyproject.
 from vllm.config import VllmConfig
 from vllm.platforms import current_platform
-from vllm.v1.core.kv_cache_utils import (
-    _max_memory_usage_bytes_from_groups,
-    _pool_bytes_per_block,
-    get_kv_cache_groups,
-)
+# Looked up on the module at call time: vllm-rbln patches these (DeepSeek-V4's
+# own groups) after this module may have been imported, and a name bound here
+# would keep upstream's version.
+from vllm.v1.core import kv_cache_utils
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
@@ -290,13 +289,15 @@ class DynamicKvSizer:
         estimate = estimate_available_memory(**estimate_kwargs)
         if self.mode is not DynamicKvMode.ACTIVE:
             return estimate
-        groups = get_kv_cache_groups(
+        groups = kv_cache_utils.get_kv_cache_groups(
             self.vllm_config, dict(self.model_runner.get_kv_cache_spec())
         )
         # Mirrors vllm's capacity check, which holds back the null block.
-        one_request = _max_memory_usage_bytes_from_groups(self.vllm_config, groups)
+        one_request = kv_cache_utils._max_memory_usage_bytes_from_groups(
+            self.vllm_config, groups
+        )
         if groups:
-            one_request += _pool_bytes_per_block(groups)
+            one_request += kv_cache_utils._pool_bytes_per_block(groups)
         if estimate < one_request:
             logger.warning(
                 "[Dynamic KV] the pre-compile estimate (%.2f GiB) is short of one "
