@@ -120,7 +120,7 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # One ring a block, in kda_conv's stacked form ([W, P=1, C / 64, 64]): the
         # kernel takes it as allocated, and the converter's reshape of the
         # unstacked form cannot carry the cache's dynamic block count.
-        channels = (2 * self.key_dim + self.value_dim) // self.tp_size
+        channels = self.conv_dim // self.tp_size
         self.conv_ring = RBLNGDNConvRingCache(
             f"{prefix}.conv_ring",
             owner=prefix,
@@ -168,9 +168,8 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         num_k_heads = self.num_k_heads // tp_size
         num_v_heads = self.num_v_heads // tp_size
         ratio = num_v_heads // num_k_heads
-        key_dim = self.key_dim // tp_size
         value_dim = self.value_dim // tp_size
-        channels = key_dim * 2 + value_dim
+        channels = self.conv_dim // tp_size
         head_dim = self.head_k_dim
         kernel = self.conv_kernel_size
 
