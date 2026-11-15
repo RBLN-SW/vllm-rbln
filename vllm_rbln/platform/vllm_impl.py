@@ -154,7 +154,9 @@ def _validate(vllm_config: "VllmConfig") -> None:
                 "Speculative decoding is not supported for GatedDeltaNet models on "
                 "the RBLN vLLM path yet: the decode kernel takes one token per request."
             )
-        num_v_heads = model_config.hf_text_config.linear_num_value_heads
+        text_config = model_config.hf_text_config
+        num_v_heads = text_config.linear_num_value_heads
+        # Per rank, so the rule holds as it is once TP is supported.
         if (num_v_heads // parallel_config.tensor_parallel_size) % 4:
             raise ValueError(
                 "The RBLN GatedDeltaNet core splits a rank's value heads over four "
@@ -163,7 +165,6 @@ def _validate(vllm_config: "VllmConfig") -> None:
             )
         # State and attention share a pool page; its physical capacity must
         # cover the recurrent state, with any remainder as padding.
-        text_config = model_config.hf_text_config
         cache_config = vllm_config.cache_config
         kv_dtype = kv_cache_dtype_str_to_dtype(cache_config.cache_dtype, model_config)
         if kv_dtype != model_config.dtype:
