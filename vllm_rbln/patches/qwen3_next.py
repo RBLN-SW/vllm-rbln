@@ -154,19 +154,13 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             hidden_states: [batch, seq, hidden] or [batch * seq, hidden]; the batch
                 and seq come from the step's GDN metadata
         """
-        attn_metadata = get_forward_context().attn_metadata
-        metadata = (
-            attn_metadata.get(self.prefix) if isinstance(attn_metadata, dict) else None
-        )
-        if not isinstance(metadata, RBLNGDNAttentionMetadata):
-            raise RuntimeError(f"{self.prefix}: this step carries no RBLN GDN metadata")
+        metadata = get_forward_context().attn_metadata[self.prefix]
+        assert isinstance(metadata, RBLNGDNAttentionMetadata), type(metadata)
         batch, seq_len = metadata.batch_size, metadata.seq_len
-        if hidden_states.numel() != batch * seq_len * hidden_states.shape[-1]:
-            raise RuntimeError(
-                f"{self.prefix}: hidden_states {tuple(hidden_states.shape)} do not "
-                f"hold the step's batch {batch} x seq {seq_len} the GDN metadata "
-                "describes"
-            )
+        assert hidden_states.numel() == batch * seq_len * hidden_states.shape[-1], (
+            f"{self.prefix}: hidden_states {tuple(hidden_states.shape)} do not hold "
+            f"the step's batch {batch} x seq {seq_len}"
+        )
         assert self.layer_index is not None, self.prefix
         state = _resolve_kv_cache(metadata, self.layer_index)
         ring = self.conv_ring.inputs()
