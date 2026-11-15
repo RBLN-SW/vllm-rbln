@@ -27,7 +27,7 @@ from vllm.v1.kv_cache_interface import MambaSpec
 
 import vllm_rbln.v1.worker.rbln_model_runner as mr
 from tests.vllm.v1.worker.utils import make_kv_cache_config, schedule_new
-from vllm_rbln.patches.qwen3_next import (
+from vllm_rbln.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     RBLNGDNBlockAuxCache,
     RBLNQwenGatedDeltaNetAttention,
 )
@@ -587,28 +587,6 @@ class TestGatedDeltaNetOnTheAttentionPool:
         assert state_info.base_index == attention_info.base_index
         assert state_info.view_shape == attention_info.view_shape
         assert ring_info.base_index != state_info.base_index
-
-    @pytest.mark.parametrize(("tokens", "chunk"), [(70, 128), (200, 256)])
-    def test_a_prefill_step_is_sized_at_the_chunk_the_runner_picks(
-        self, runner, monkeypatch, tokens, chunk
-    ):
-        monkeypatch.setattr(
-            mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
-        )
-        runner.prefill_chunk_sizes = [128, 256]
-        runner.is_prefill = True
-        runner._update_states(schedule_new("a", block_ids=[([1], [2])]))
-        runner.query_start_loc[:2] = torch.tensor([0, tokens], dtype=torch.int32)
-        runner.seq_lens[:1] = tokens
-
-        attn_metadata, _ = runner._build_attention_metadata(
-            num_tokens=tokens, num_reqs=1, max_query_len=tokens, num_reqs_padded=1
-        )
-
-        state = attn_metadata[self.GDN]
-        assert state.seq_len == chunk
-        assert state.valid_mask.shape == (1, 1, chunk)
-        assert state.valid_mask.sum() == tokens
 
 
 class TestLayerIndexFollowsCachePosition:

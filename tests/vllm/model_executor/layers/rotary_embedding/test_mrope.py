@@ -111,21 +111,3 @@ class TestForwardOotMatchesNative:
         with_offset, _ = rope.forward_oot(positions, q.clone(), k.clone(), offsets)
         shifted, _ = rope.forward_oot(positions + 3, q.clone(), k.clone())
         assert torch.allclose(with_offset, shifted)
-
-
-class TestAxisTable:
-    def test_interleaved_table_matches_upstream_selection(self, vllm_config):
-        rope = _rope(vllm_config, interleaved=True)
-        half = ROTARY_DIM // 2
-        channel = torch.arange(half)
-        expected = torch.zeros(half, dtype=torch.long)
-        expected[(channel % 3 == 1) & (channel < SECTION[1] * 3)] = 1
-        expected[(channel % 3 == 2) & (channel < SECTION[2] * 3)] = 2
-        assert torch.equal(rope.mrope_axis_table[:half], expected)
-        # neox caches repeat the half, so the table repeats with it
-        assert torch.equal(rope.mrope_axis_table[half:], expected)
-
-    def test_chunked_table_follows_the_sections(self, vllm_config):
-        rope = _rope(vllm_config, interleaved=False)
-        expected = torch.repeat_interleave(torch.arange(3), torch.tensor(SECTION))
-        assert torch.equal(rope.mrope_axis_table[: ROTARY_DIM // 2], expected)

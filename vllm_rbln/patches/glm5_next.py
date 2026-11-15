@@ -80,3 +80,102 @@ def _build_pp_balanced_mamba_group_count():
         )
 
     return _pp_balanced_mamba_group_count
+
+
+@register_patch(
+    target="vllm.v1.core.kv_cache_utils._get_kv_cache_groups_glm5_next",
+    reason=(
+        "Upstream exposes no group-placement hook. Its KDA groups make "
+        "whole-pool graph inputs cross attention periods inconsistently. "
+        "Groups aligned with attention phases while retaining scheduler's group count."
+    ),
+    build=True,
+)
+def _build_glm5_next_phase_groups():
+    from vllm.distributed.utils import get_pp_indices
+    from vllm.model_executor.models.utils import extract_layer_index
+    from vllm.v1.core.kv_cache_utils import _get_kv_cache_groups_glm5_next
+    from vllm.v1.kv_cache_interface import MambaSpec, MLAAttentionSpec
+
+    @functools.wraps(_get_kv_cache_groups_glm5_next)
+    def phase_groups(vllm_config, kv_cache_spec):
+        groups = _get_kv_cache_groups_glm5_next(vllm_config, kv_cache_spec)
+        if groups is None:
+            return groups
+        config = vllm_config.model_config.hf_text_config
+        if config.model_type not in ("glm5_next", "glm5_next_text"):
+            return groups
+        if vllm_config.kv_transfer_config is not None:
+            return groups
+
+        layer_types = config.layer_types
+        period = next(
+            p
+            for p in range(1, len(layer_types) + 1)
+            if all(kind == layer_types[i % p] for i, kind in enumerate(layer_types))
+        )
+        states = sorted(
+            (
+                extract_layer_index(name.rsplit(".", 1)[0]),
+                int(name.rsplit(".", 1)[1]),
+                name,
+            )
+            for name, spec in kv_cache_spec.items()
+            if isinstance(spec, MambaSpec)
+        )
+        phases = sorted({(layer % period, shard) for layer, shard, _ in states})
+        state_groups = [g for g in groups if isinstance(g.kv_cache_spec, MambaSpec)]
+
+        if len(phases) > len(state_groups):
+            return groups
+
+        mla_layers = [
+            extract_layer_index(name.rsplit(".", 1)[0])
+            for name, spec in kv_cache_spec.items()
+            if type(spec) is MLAAttentionSpec and spec.tokens_per_state == 1
+        ]
+        phase_ids = {phase: i for i, phase in enumerate(phases)}
+        state_layers = {name: layer for layer, _, name in states}
+        names: list[list[str]] = [[] for _ in state_groups]
+        pp_size = vllm_config.parallel_config.pipeline_parallel_size
+        total_layers = vllm_config.model_config.get_total_num_hidden_layers()
+        for rank in range(pp_size):
+            start, end = get_pp_indices(total_layers, rank, pp_size)
+            num_target_layers = min(end, total_layers) - start
+            if rank == pp_size - 1:
+                # Draft attention belongs to the last stage and also owns slots.
+                end = max(end, max(mla_layers) + 1, states[-1][0] + 1)
+            # Carrying a stage's device input peels one period; rolling needs
+            # two more. Avoid enlarging aux pools on stages too short to roll.
+            if pp_size > 1 and num_target_layers < 3 * period:
+                for selected, group in zip(names, state_groups):
+                    selected.extend(
+                        name
+                        for name in group.layer_names
+                        if start <= state_layers[name] < end
+                    )
+                continue
+            capacity = sum(start <= layer < end for layer in mla_layers)
+            local: list[list[str]] = [[] for _ in state_groups]
+            overflow = []
+            for layer, shard, name in states:
+                if start <= layer < end:
+                    group_id = phase_ids[layer % period, shard]
+                    if len(local[group_id]) < capacity:
+                        local[group_id].append(name)
+                    else:
+                        overflow.append(name)
+
+            extra_groups = len(state_groups) - len(phases)
+            assert not overflow or extra_groups > 0
+            for i, name in enumerate(overflow):
+                local[len(phases) + i % extra_groups].append(name)
+            assert all(len(group) <= capacity for group in local)
+            for selected, stage_names in zip(names, local):
+                selected.extend(stage_names)
+
+        for group, selected in zip(state_groups, names):
+            group.layer_names = selected
+        return groups
+
+    return phase_groups

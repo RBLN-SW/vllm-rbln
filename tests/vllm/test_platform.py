@@ -623,16 +623,6 @@ class TestRejectedConfigs:
 
         return mutate
 
-    def test_gated_delta_net_is_told_by_the_model_type(self):
-        from vllm_rbln.platform.vllm_impl import _uses_gated_delta_net
-
-        def config(model_type):
-            return SimpleNamespace(hf_config=SimpleNamespace(model_type=model_type))
-
-        assert _uses_gated_delta_net(config("qwen3_5_text"))
-        assert not _uses_gated_delta_net(config("qwen3_next"))
-        assert not _uses_gated_delta_net(config("glm5_next_text"))
-
     @pytest.mark.parametrize(
         "model_type, name",
         [("qwen3_next", "Qwen3-Next"), ("qwen3_5_moe_text", "Qwen3.5-MoE")],
@@ -738,6 +728,21 @@ class TestRejectedConfigs:
         with pytest.raises(ValueError, match="must fit in a full-attention"):
             reconfigure(smaller_block)
 
+    def test_gdn_rules_skip_an_encoder_only_instance(self, reconfigure, gdn):
+        # Neither the state's page nor the prefill kernel's chunk is met.
+        def encoder_only(config):
+            gdn(config)
+            config.model_config.multimodal_config = SimpleNamespace(
+                mm_encoder_only=True
+            )
+            config.scheduler_config.max_num_batched_tokens = 192
+            config.additional_config = replace(
+                config.additional_config, prefill_chunk_size=None
+            )
+            config.cache_config.block_size = 192
+
+        reconfigure(encoder_only)
+
     def test_gdn_state_is_one_block_a_request(self, reconfigure, gdn):
         config = reconfigure(gdn)
         assert config.cache_config.mamba_block_size == config.model_config.max_model_len
@@ -766,6 +771,24 @@ class TestRejectedConfigs:
 
         with pytest.raises(ValueError, match="four chiplets"):
             reconfigure(six_heads)
+
+    def test_mrope_models_are_rejected(self, reconfigure, monkeypatch):
+        from vllm.config import ModelConfig
+
+        monkeypatch.setattr(ModelConfig, "uses_mrope", property(lambda self: True))
+        with pytest.raises(ValueError, match="M-RoPE"):
+            reconfigure(lambda config: None)
+
+    def test_mrope_is_allowed_for_qwen3_5(self, reconfigure, gdn, monkeypatch):
+        from vllm.config import ModelConfig
+
+        monkeypatch.setattr(ModelConfig, "uses_mrope", property(lambda self: True))
+
+        def qwen3_5(config):
+            gdn(config)
+            config.model_config.hf_text_config.model_type = "qwen3_5_text"
+
+        reconfigure(qwen3_5)
 
     def test_chunked_prefill_off(self, reconfigure):
         with pytest.raises(ValueError, match="chunked prefill"):

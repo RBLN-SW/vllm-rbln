@@ -116,7 +116,11 @@ def _validate(vllm_config: "VllmConfig") -> None:
     if vllm_config.lora_config is not None:
         raise ValueError("LoRA is not supported on RBLN.")
 
-    if _uses_gated_delta_net(model_config):
+    # An encoder-only instance builds no language model, so no GDN layer.
+    uses_gdn = (
+        _uses_gated_delta_net(model_config) and not vllm_config.is_mm_encoder_only
+    )
+    if uses_gdn:
         if rbln_config.use_custom_kernel:
             raise ValueError(
                 "GatedDeltaNet models do not take --rbln-use-custom-kernel on the "
@@ -155,7 +159,9 @@ def _validate(vllm_config: "VllmConfig") -> None:
                 f"method={spec.method!r}, "
                 f"num_speculative_tokens={spec.num_speculative_tokens}."
             )
-        num_v_heads = model_config.hf_text_config.linear_num_value_heads
+        text_config = model_config.hf_text_config
+        num_v_heads = text_config.linear_num_value_heads
+        # Per rank, so the rule holds as it is once TP is supported.
         if (num_v_heads // parallel_config.tensor_parallel_size) % 4:
             raise ValueError(
                 "The RBLN GatedDeltaNet core splits a rank's value heads over four "
@@ -164,7 +170,6 @@ def _validate(vllm_config: "VllmConfig") -> None:
             )
         # State and attention share a pool page; its physical capacity must
         # cover the recurrent state, with any remainder as padding.
-        text_config = model_config.hf_text_config
         cache_config = vllm_config.cache_config
         kv_dtype = kv_cache_dtype_str_to_dtype(cache_config.cache_dtype, model_config)
         if kv_dtype != model_config.dtype:
@@ -215,6 +220,15 @@ def _validate(vllm_config: "VllmConfig") -> None:
             "Qwen3.5-MoE is not supported on the RBLN vLLM path yet: it builds "
             "the RBLN GatedDeltaNet layer, whose weight regrouping and platform "
             "rules cover the dense Qwen3.5 models only."
+        )
+    if (
+        model_config.uses_mrope
+        and getattr(text_config, "model_type", None) != "qwen3_5_text"
+    ):
+        # The RBLN M-RoPE forward has run on Qwen3.5 only.
+        raise ValueError(
+            "M-RoPE models other than Qwen3.5 (e.g. the Qwen2-VL family) are not "
+            "supported on the RBLN vLLM path yet. Use the optimum path."
         )
     if (
         getattr(text_config, "sparse_attention_config", None)
@@ -309,7 +323,7 @@ def _validate(vllm_config: "VllmConfig") -> None:
         raise ValueError(
             f"prefill_chunk_size={chunks} exceeds {max_num_scheduled_tokens=}."
         )
-    if _uses_gated_delta_net(model_config) and any(chunk % 128 for chunk in chunks):
+    if uses_gdn and any(chunk % 128 for chunk in chunks):
         raise ValueError(
             "The RBLN GatedDeltaNet prefill kernel runs in 128-token chunks; got "
             f"prefill_chunk_size={chunks}. Each has to be a multiple of 128 "
