@@ -890,11 +890,17 @@ class TestOnlyTheShrunkModeReplacesTheEstimate:
         """The floor exists because the shrink makes the estimate a placeholder.
         Every other mode serves this estimate, so raising it resizes the pool."""
         spec = SimpleNamespace()
-        monkeypatch.setattr(dks, "get_kv_cache_groups", lambda cfg, spec: ["g"])
         monkeypatch.setattr(
-            dks, "_max_memory_usage_bytes_from_groups", lambda cfg, groups: 8000
+            dks.kv_cache_utils, "get_kv_cache_groups", lambda cfg, spec: ["g"]
         )
-        monkeypatch.setattr(dks, "_pool_bytes_per_block", lambda groups: 100)
+        monkeypatch.setattr(
+            dks.kv_cache_utils,
+            "_max_memory_usage_bytes_from_groups",
+            lambda cfg, groups: 8000,
+        )
+        monkeypatch.setattr(
+            dks.kv_cache_utils, "_pool_bytes_per_block", lambda groups: 100
+        )
         monkeypatch.setattr(dks, "estimate_available_memory", lambda **kw: 999)
 
         def sizer(mode):
