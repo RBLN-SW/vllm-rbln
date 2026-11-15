@@ -16,7 +16,8 @@
 
 The checkpoint module tree follows upstream vLLM. CSA, HCA and sliding-window
 attention use compiler custom ops; mHC mixing and inverse RoPE use torch.
-MTP is not supported.
+The target returns flat pre-hc-head streams for MTP; compute_logits applies
+its hc head and final norm to the sampled rows.
 """
 
 import math
@@ -101,7 +102,11 @@ def _layer_slots(compress_ratio: int) -> tuple[int, ...]:
 
 def _compress_ratio(config: PretrainedConfig, layer_id: int) -> int:
     ratios = config.compress_ratios
-    return int(ratios[layer_id]) if layer_id < len(ratios) else 0
+    num_mtp = getattr(config, "num_nextn_predict_layers", 0) or 0
+    if num_mtp and layer_id >= config.num_hidden_layers:
+        # Truncating target layers must not move MTP ratios away from the tail.
+        layer_id = len(ratios) - num_mtp + (layer_id - config.num_hidden_layers)
+    return int(ratios[layer_id]) if 0 <= layer_id < len(ratios) else 0
 
 
 def _cache_ordinal(layer_id: int, slot: int) -> int:
@@ -1075,6 +1080,102 @@ class RBLNDeepseekV4DecoderLayer(nn.Module):
         )
 
 
+def _load_deepseek_v4_weights(
+    module: nn.Module,
+    config: PretrainedConfig,
+    weights: Iterable[tuple[str, torch.Tensor]],
+    layers: list[nn.Module],
+) -> set[str]:
+    """Load target or MTP decoder weights using names relative to ``module``."""
+    stacked_params_mapping = [
+        ("gate_up_proj", "w1", 0),
+        ("gate_up_proj", "w3", 1),
+        ("attn.fused_wqa_wkv", "attn.wq_a", 0),
+        ("attn.fused_wqa_wkv", "attn.wkv", 1),
+        ("compressor.fused_wkv_wgate", "compressor.wkv", 0),
+        ("compressor.fused_wkv_wgate", "compressor.wgate", 1),
+    ]
+    tp_rank = get_tensor_model_parallel_rank()
+    tp_size = get_tensor_model_parallel_world_size()
+    n_local_heads = config.num_attention_heads // tp_size
+    params_dict = dict(module.named_parameters())
+    expert_mapping = fused_moe_make_expert_params_mapping(
+        module,
+        ckpt_gate_proj_name="w1",
+        ckpt_down_proj_name="w2",
+        ckpt_up_proj_name="w3",
+        num_experts=config.n_routed_experts,
+    )
+    loaded_params: set[str] = set()
+    for name, loaded_weight in weights:
+        if ".mtp." in name or name.startswith("mtp.") or ".mtp" in name.split(".")[0]:
+            continue
+        if ".experts." in name and ".shared_experts." not in name:
+            # Packed e2m1 (I8) and e8m0 scales are byte containers: keep the bytes.
+            if loaded_weight.dtype in (torch.int8, torch.float8_e8m0fnu):
+                loaded_weight = loaded_weight.view(torch.uint8)
+            for param_name, weight_name, expert_id, shard_id in expert_mapping:
+                if weight_name not in name:
+                    continue
+                mapped = name.replace(weight_name, param_name)
+                if is_pp_missing_parameter(mapped, module) or mapped not in params_dict:
+                    continue
+                param = params_dict[mapped]
+                param.weight_loader(
+                    param, loaded_weight, mapped, shard_id=shard_id, expert_id=expert_id
+                )
+                loaded_params.add(mapped)
+                break
+            continue
+        for param_name, weight_name, stacked_shard_id in stacked_params_mapping:
+            if weight_name not in name:
+                continue
+            mapped = name.replace(weight_name, param_name)
+            if is_pp_missing_parameter(mapped, module) or mapped not in params_dict:
+                break
+            param = params_dict[mapped]
+            param.weight_loader(param, loaded_weight, stacked_shard_id)
+            loaded_params.add(mapped)
+            break
+        else:
+            if is_pp_missing_parameter(name, module) or name not in params_dict:
+                continue
+            param = params_dict[name]
+            if name.endswith("attn_sink"):
+                start = tp_rank * n_local_heads
+                param.data.copy_(loaded_weight[start : start + n_local_heads])
+            elif name.endswith("tid2eid"):
+                param.data.zero_()
+                param.data[:, : loaded_weight.shape[1]].copy_(
+                    loaded_weight.to(torch.bfloat16)
+                )
+            else:
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+            loaded_params.add(name)
+    for layer in layers:
+        if hasattr(layer, "finalize_hc_scales"):
+            layer.finalize_hc_scales()
+        if hasattr(layer, "attn"):
+            layer.attn.finalize_wo_a()
+    return loaded_params
+
+
+def _hc_head_hidden(
+    flat, hc_mult, fn, scale, base, norm_eps, hc_eps, norm
+) -> torch.Tensor:
+    """Reduce flat pre-hc-head streams [..., n * H] and normalize to [..., H]."""
+    lead = flat.shape[:-1]
+    hidden = flat.shape[-1] // hc_mult
+    rows = flat.reshape(1, -1, hc_mult * hidden)  # [1, N, n * H]
+    x = rows.float()
+    x = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + norm_eps)
+    z_pre = F.linear(x, fn) * scale + base
+    streams = rows.reshape(1, -1, hc_mult, hidden).transpose(1, 2)  # [1, n, N, H]
+    out = torch.ops.rbln_custom_ops.hc_stream_reduce(streams.float(), z_pre, eps=hc_eps)
+    return norm(out.to(flat.dtype)).reshape(*lead, hidden)
+
+
 class RBLNDeepseekV4Model(nn.Module):
     fall_back_to_pt_during_load = False
 
@@ -1117,17 +1218,6 @@ class RBLNDeepseekV4Model(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
-    def _hc_head(self, streams: torch.Tensor) -> torch.Tensor:
-        """streams [B, n, T, H] -> [B, T, H]: the head's gate (sigmoid + eps) over the
-        streams."""
-        batch, n, tokens, hidden = streams.shape
-        flat = streams.transpose(1, 2).reshape(batch, tokens, n * hidden).float()
-        flat = flat * torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.norm_eps)
-        z_pre = F.linear(flat, self.hc_head_fn) * self.hc_head_scale + self.hc_head_base
-        return torch.ops.rbln_custom_ops.hc_stream_reduce(
-            streams.float(), z_pre, eps=self.hc_eps
-        ).to(streams.dtype)
-
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -1147,7 +1237,21 @@ class RBLNDeepseekV4Model(nn.Module):
         # Slicing ModuleList during tracing lifts weights into graph inputs.
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             streams = layer(positions, streams, input_ids)
-        return self.norm(self._hc_head(streams))
+        # MTP consumes pre-hc-head streams; compute_logits applies the head and norm.
+        return streams.transpose(1, 2).reshape(batch, tokens, self.hc_mult * hidden)
+
+    def head_hidden(self, flat_streams: torch.Tensor) -> torch.Tensor:
+        """[..., n * H] flat streams -> [..., H]: the hc head and the final norm."""
+        return _hc_head_hidden(
+            flat_streams,
+            self.hc_mult,
+            self.hc_head_fn,
+            self.hc_head_scale,
+            self.hc_head_base,
+            self.norm_eps,
+            self.hc_eps,
+            self.norm,
+        )
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return fused_moe_make_expert_params_mapping(
@@ -1159,85 +1263,7 @@ class RBLNDeepseekV4Model(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            ("gate_up_proj", "w1", 0),
-            ("gate_up_proj", "w3", 1),
-            ("attn.fused_wqa_wkv", "attn.wq_a", 0),
-            ("attn.fused_wqa_wkv", "attn.wkv", 1),
-            ("compressor.fused_wkv_wgate", "compressor.wkv", 0),
-            ("compressor.fused_wkv_wgate", "compressor.wgate", 1),
-        ]
-        tp_rank = get_tensor_model_parallel_rank()
-        tp_size = get_tensor_model_parallel_world_size()
-        n_local_heads = self.config.num_attention_heads // tp_size
-        params_dict = dict(self.named_parameters())
-        expert_mapping = self.get_expert_mapping()
-        loaded_params: set[str] = set()
-        for name, loaded_weight in weights:
-            if (
-                ".mtp." in name
-                or name.startswith("mtp.")
-                or ".mtp" in name.split(".")[0]
-            ):
-                continue
-            if ".experts." in name and ".shared_experts." not in name:
-                # Packed e2m1 (I8) and e8m0 scales are byte containers: keep the bytes.
-                if loaded_weight.dtype in (torch.int8, torch.float8_e8m0fnu):
-                    loaded_weight = loaded_weight.view(torch.uint8)
-                for param_name, weight_name, expert_id, shard_id in expert_mapping:
-                    if weight_name not in name:
-                        continue
-                    mapped = name.replace(weight_name, param_name)
-                    if (
-                        is_pp_missing_parameter(mapped, self)
-                        or mapped not in params_dict
-                    ):
-                        continue
-                    param = params_dict[mapped]
-                    param.weight_loader(
-                        param,
-                        loaded_weight,
-                        mapped,
-                        shard_id=shard_id,
-                        expert_id=expert_id,
-                    )
-                    loaded_params.add(mapped)
-                    break
-                continue
-            for param_name, weight_name, stacked_shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                mapped = name.replace(weight_name, param_name)
-                if is_pp_missing_parameter(mapped, self) or mapped not in params_dict:
-                    break
-                param = params_dict[mapped]
-                param.weight_loader(param, loaded_weight, stacked_shard_id)
-                loaded_params.add(mapped)
-                break
-            else:
-                if is_pp_missing_parameter(name, self) or name not in params_dict:
-                    continue
-                param = params_dict[name]
-                if name.endswith("attn_sink"):
-                    start = tp_rank * n_local_heads
-                    param.data.copy_(loaded_weight[start : start + n_local_heads])
-                elif name.endswith("tid2eid"):
-                    param.data.zero_()
-                    param.data[:, : loaded_weight.shape[1]].copy_(
-                        loaded_weight.to(torch.bfloat16)
-                    )
-                else:
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
-                loaded_params.add(name)
-        for layer in self.layers:
-            if hasattr(layer, "finalize_hc_scales"):
-                layer.finalize_hc_scales()
-            if hasattr(layer, "attn"):
-                layer.attn.finalize_wo_a()
-        return loaded_params
+        return _load_deepseek_v4_weights(self, self.config, weights, list(self.layers))
 
 
 class RBLNDeepseekV4ForCausalLM(nn.Module, SupportsPP):
@@ -1281,15 +1307,190 @@ class RBLNDeepseekV4ForCausalLM(nn.Module, SupportsPP):
         return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
-        return self.logits_processor(self.lm_head, hidden_states)
+        # hidden_states: the flat pre-hc_head streams of the sampled rows
+        return self.logits_processor(
+            self.lm_head, self.model.head_hidden(hidden_states)
+        )
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # the MTP head is not modeled
+        # the MTP head's weights are RBLNDeepseekV4MTP's
         weights = (
             (n, w) for n, w in weights if not n.startswith(("model.mtp.", "mtp."))
         )
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+
+
+# ------------------------------------------------------------------------------
+# MTP (multi-token prediction) draft head
+# ------------------------------------------------------------------------------
+
+
+class RBLNDeepseekV4MTPLayer(RBLNDeepseekV4DecoderLayer):
+    """Apply the checkpoint's SWA MTP layer to projected streams and embeddings.
+
+    Position-zero embeddings are retained, matching the GLM-5.3 MTP path.
+    """
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str) -> None:
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        config = vllm_config.model_config.hf_text_config
+        quant_config = vllm_config.quant_config
+        hidden = config.hidden_size
+        self.enorm = RBLNRMSNorm(hidden, self.norm_eps)
+        self.hnorm = RBLNRMSNorm(hidden, self.norm_eps)
+        self.e_proj = ReplicatedLinear(
+            hidden,
+            hidden,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.e_proj",
+        )
+        self.h_proj = ReplicatedLinear(
+            hidden,
+            hidden,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.h_proj",
+        )
+        hc_dim = self.hc_mult * hidden
+        for name, shape in (
+            ("hc_head_fn", (self.hc_mult, hc_dim)),
+            ("hc_head_base", (self.hc_mult,)),
+            ("hc_head_scale", (1,)),
+        ):
+            self.register_parameter(
+                name,
+                nn.Parameter(
+                    torch.empty(shape, dtype=torch.float32), requires_grad=False
+                ),
+            )
+        self.shared_head = nn.Module()
+        self.shared_head.norm = RBLNRMSNorm(hidden, self.norm_eps)
+
+    def forward_mtp(
+        self,
+        positions: torch.Tensor,
+        inputs_embeds: torch.Tensor,
+        previous: torch.Tensor,
+        input_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """inputs_embeds [B, T, H], previous [B, T, n * H] (flat pre-hc_head streams) ->
+        [B, T, n * H], this layer's flat pre-hc_head streams."""
+        batch, tokens, hidden = inputs_embeds.shape
+        n = self.hc_mult
+        e = self.e_proj(self.enorm(inputs_embeds))[0]  # [B, T, H]
+        h = self.h_proj(self.hnorm(previous.reshape(batch, tokens, n, hidden)))[0]
+        streams = (h + e.unsqueeze(2)).transpose(1, 2).contiguous()  # [B, n, T, H]
+        streams = self.forward(positions, streams, input_ids)
+        return streams.transpose(1, 2).reshape(batch, tokens, n * hidden)
+
+    def head_hidden(self, flat_streams: torch.Tensor) -> torch.Tensor:
+        return _hc_head_hidden(
+            flat_streams,
+            self.hc_mult,
+            self.hc_head_fn,
+            self.hc_head_scale,
+            self.hc_head_base,
+            self.norm_eps,
+            self.hc_eps,
+            self.shared_head.norm,
+        )
+
+
+class RBLNDeepseekV4MTPModel(nn.Module):
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__()
+        config = vllm_config.model_config.hf_text_config
+        self.config = config
+        self.mtp_start_layer_idx = config.num_hidden_layers
+        self.num_mtp_layers = config.num_nextn_predict_layers
+        self.layers = nn.ModuleDict(
+            {
+                str(idx): RBLNDeepseekV4MTPLayer(
+                    vllm_config=vllm_config, prefix=f"{prefix}.layers.{idx}"
+                )
+                for idx in range(
+                    self.mtp_start_layer_idx,
+                    self.mtp_start_layer_idx + self.num_mtp_layers,
+                )
+            }
+        )
+        self.embed_tokens = VocabParallelEmbedding(
+            config.vocab_size, config.hidden_size, prefix=f"{prefix}.embed_tokens"
+        )
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # The draft wrapper maps MTP names to layers.{num_hidden_layers + i}.*.
+        return _load_deepseek_v4_weights(
+            self, self.config, weights, list(self.layers.values())
+        )
+
+
+class RBLNDeepseekV4MTP(nn.Module):
+    """MTP draft model sharing target embeddings and lm_head.
+
+    Previous hidden states are the target's flat pre-hc-head streams.
+    """
+
+    has_own_lm_head = False
+    hf_to_vllm_mapper = RBLNDeepseekV4ForCausalLM.hf_to_vllm_mapper
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__()
+        config = vllm_config.model_config.hf_text_config
+        self.config = config
+        self.model = RBLNDeepseekV4MTPModel(
+            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+        )
+        self._mtp_layers = list(self.model.layers.values())
+        self.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            prefix=maybe_prefix(prefix, "lm_head"),
+        )
+        self.logits_processor = LogitsProcessor(config.vocab_size)
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.embed_tokens(input_ids)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
+        spec_step_index: int = 0,
+    ) -> torch.Tensor:
+        # Upstream expects one tensor: flat streams serve both the logits and
+        # the next drafting step's previous hidden states.
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_input_ids(input_ids)
+        layer = self._mtp_layers[spec_step_index % len(self._mtp_layers)]
+        return layer.forward_mtp(positions, inputs_embeds, hidden_states, input_ids)
+
+    def compute_logits(
+        self, hidden_states: torch.Tensor, spec_step_index: int = 0
+    ) -> torch.Tensor | None:
+        layer = self._mtp_layers[spec_step_index % len(self._mtp_layers)]
+        return self.logits_processor(self.lm_head, layer.head_hidden(hidden_states))
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        start = self.config.num_hidden_layers
+
+        def mtp_only():
+            # Decoder weights use target-offset indices; the draft norm belongs to
+            # shared_head. Embeddings and lm_head are shared with the target.
+            for name, weight in weights:
+                if not name.startswith("mtp."):
+                    continue
+                _, idx, rest = name.split(".", 2)
+                if rest.startswith("norm."):
+                    rest = "shared_head." + rest
+                yield f"layers.{start + int(idx)}.{rest}", weight
+
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(mtp_only(), mapper=self.hf_to_vllm_mapper)

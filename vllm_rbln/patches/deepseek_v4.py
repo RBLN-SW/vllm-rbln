@@ -33,6 +33,8 @@ def register_deepseek_v4() -> None:
     ModelRegistry.register_model(
         "DeepseekV4ForCausalLM", f"{_MODULE}:RBLNDeepseekV4ForCausalLM"
     )
+    # the MTP draft head (speculative method "mtp")
+    ModelRegistry.register_model("DeepSeekV4MTPModel", f"{_MODULE}:RBLNDeepseekV4MTP")
 
 
 @add_registration(
