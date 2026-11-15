@@ -186,7 +186,7 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # the delta-rule kernels' heads, so a chiplet's conv output is what they read.
         convolved = torch.ops.rbln_custom_ops.kda_conv(
             qkv.reshape(batch, seq_len, 1, channels),
-            self.conv1d.weight.view(1, channels, kernel).to(mixed_qkvz.dtype),
+            self.conv1d.weight.view(1, channels, kernel),
             ring,
             metadata.conv_load_blocks,
             metadata.conv_start_positions,
