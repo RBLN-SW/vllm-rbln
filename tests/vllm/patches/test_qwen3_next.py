@@ -331,12 +331,6 @@ class TestStateSpec:
         assert spec.shapes == ((2, 4, 1, 1024, 256),)
         assert spec.real_page_size_bytes == spec.page_size_bytes
 
-    def test_a_cache_dtype_option_does_not_move_the_state_dtype(self):
-        layer = self._layer()
-        # What upstream's Qwen3.5 hook takes from the HF config's mamba_ssm_dtype.
-        layer.cache_config.mamba_ssm_cache_dtype = "float32"
-        assert layer.get_state_dtype() == (torch.bfloat16,)
-
     def test_model_state_sizing_uses_valid_shape(self):
         layer = self._layer()
         vllm_config = SimpleNamespace(

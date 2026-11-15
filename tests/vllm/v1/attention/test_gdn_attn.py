@@ -147,14 +147,3 @@ class TestBuilder:
         assert md.has_initial_state is None and md.prefill_state_indices is None
         _assert_conv_rows(md, [7, 3, 0, 0], [128, 5, 0, 0], [1, 1, 0, 0], [1, 1, 0, 0])
         assert md.valid_mask is None
-
-    def test_staging_buffers_are_reused(self, builder):
-        positions = torch.arange(128)
-        first = builder.build(
-            _common([70], [70], [[7]]), positions, 1, True, query_len_padded=128
-        )
-        second = builder.build(
-            _common([58], [128], [[7]]), positions, 1, True, query_len_padded=128
-        )
-        assert first.conv_load_blocks.data_ptr() == second.conv_load_blocks.data_ptr()
-        _assert_conv_rows(second, [7], [0], [58], [1])

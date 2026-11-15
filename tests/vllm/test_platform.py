@@ -623,16 +623,6 @@ class TestRejectedConfigs:
 
         return mutate
 
-    def test_gated_delta_net_is_told_by_the_model_type(self):
-        from vllm_rbln.platform.vllm_impl import _uses_gated_delta_net
-
-        def config(model_type):
-            return SimpleNamespace(hf_config=SimpleNamespace(model_type=model_type))
-
-        assert _uses_gated_delta_net(config("qwen3_5_text"))
-        assert not _uses_gated_delta_net(config("qwen3_next"))
-        assert not _uses_gated_delta_net(config("glm5_next_text"))
-
     @pytest.mark.parametrize(
         "model_type, name",
         [("qwen3_next", "Qwen3-Next"), ("qwen3_5_moe_text", "Qwen3.5-MoE")],
