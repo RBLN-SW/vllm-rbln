@@ -134,7 +134,6 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
         state_load_pos: torch.Tensor | None = None,
         query_len_padded: int | None = None,
     ) -> RBLNGDNAttentionMetadata:
-        """The draft rows are refused with speculative decoding."""
         assert num_accepted is None and state_load_pos is None, (
             "speculative decoding is refused for GatedDeltaNet models"
         )

@@ -109,6 +109,7 @@ def test_image_embeddings_match_upstream(visual):
     )
     torch.nn.Module.__init__(model)
     model.visual = visual
+    model.has_vision = True
     model.encoder_patches = 128
     model._mm_encoder = None
 
