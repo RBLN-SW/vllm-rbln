@@ -73,9 +73,8 @@ class RBLNGDNAttentionMetadata(GDNAttentionMetadata):
     chunk kernel's `prefill_state_indices` and `prefill_has_initial_state`.
     """
 
-    # The compiled step: [1, prefill chunk] or [padded batch, 1].
+    # The compiled step's batch: 1 on prefill, the padded batch on decode.
     batch_size: int
-    seq_len: int
     # [batch] int16 on the host: the state block each row stores.
     store_state_indices: torch.Tensor
     # [batch] int32 on the device: what kda_conv reads a row's ring by (its
@@ -86,7 +85,8 @@ class RBLNGDNAttentionMetadata(GDNAttentionMetadata):
     conv_query_lens: torch.Tensor
     conv_has_initial_state: torch.Tensor
     conv_store_blocks: torch.Tensor
-    # [1, 1, seq_len] float32 on prefill: 1 for valid tokens, 0 for padding
+    # [1, 1, largest prefill chunk] float32 on prefill: 1 for valid tokens, 0
+    # for padding. The layer takes the step's chunk of it.
     valid_mask: torch.Tensor | None
     # Attached by the runner (attach_kv_cache_bindings), as on the flash metadata.
     kv_caches: list[torch.Tensor] | None = None
@@ -133,7 +133,6 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
         num_accepted: torch.Tensor | None = None,
         state_load_pos: torch.Tensor | None = None,
         mm_prefix_row_ends: torch.Tensor | None = None,
-        query_len_padded: int | None = None,
     ) -> RBLNGDNAttentionMetadata:
         assert num_accepted is None and state_load_pos is None, (
             "speculative decoding is refused for GatedDeltaNet models"
@@ -147,12 +146,8 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
 
         if is_prefill:
             assert num_reqs == 1, "RBLN prefills one request per step"
-            assert query_len_padded is not None
 
             batch_size = 1
-            # The prefill chunk the runner pads this step to.
-            seq_len = query_len_padded
-
             num_prefills = 1
             num_prefill_tokens = int(query_lens[0])
             num_decodes = 0
@@ -162,8 +157,6 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
             )
 
             batch_size = batch_pad
-            seq_len = 1
-
             num_prefills = 0
             num_prefill_tokens = 0
             num_decodes = num_reqs
@@ -182,8 +175,9 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
 
         valid_mask = None
         if is_prefill:
-            valid_mask = (torch.arange(seq_len) < query_lens[0]).to(torch.float32)
-            valid_mask = valid_mask.view(1, 1, seq_len)
+            max_chunk = self.chunked_prefill_size
+            valid_mask = (torch.arange(max_chunk) < query_lens[0]).to(torch.float32)
+            valid_mask = valid_mask.view(1, 1, max_chunk)
         has_initial_state = self._padded(context_lens_tensor > 0, batch_size)
         prefill_has_initial_state = (
             has_initial_state.to(torch.int16) if is_prefill else None
@@ -201,7 +195,6 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
             prefill_state_indices=non_spec_state_indices_tensor if is_prefill else None,
             prefill_has_initial_state=prefill_has_initial_state,
             batch_size=batch_size,
-            seq_len=seq_len,
             store_state_indices=blocks.to(torch.int16),
             conv_load_blocks=self._stage(blocks, "conv_load_blocks"),
             conv_start_positions=self._stage(

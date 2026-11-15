@@ -176,9 +176,7 @@ def _run(
     pad,
     shared_binding,
 ):
-    metadata = builder.build(
-        common, positions, pad, is_prefill, query_len_padded=hidden.shape[1]
-    )
+    metadata = builder.build(common, positions, pad, is_prefill)
     bases = [state] if shared_binding else []
     infos = (
         [KVCacheViewInfo(base_index=0, view_shape=tuple(state.shape))]

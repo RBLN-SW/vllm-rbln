@@ -1143,11 +1143,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             ].numpy()
             start = end
 
-    def _padded_query_len(self, query_len: int, is_prefill: bool) -> int:
-        """The length a step's query is padded to: a prefill's chunk, and a
-        decode's own."""
-        return self._padded_prefill_len(query_len) if is_prefill else query_len
-
     def _build_attention_metadata(
         self,
         num_tokens: int,
@@ -1244,9 +1239,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     num_accepted=num_accepted,
                     state_load_pos=state_load_pos,
                     mm_prefix_row_ends=mm_prefix_row_ends,
-                    query_len_padded=self._padded_query_len(
-                        max_query_len, self.is_prefill
-                    ),
                 )
 
                 for layer_name in attn_group.layer_names:
@@ -1471,7 +1463,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             assert intermediate_tensors is not None
 
         is_prefill = self.is_prefill
-        query_len_padded = self._padded_query_len(input_ids.shape[1], is_prefill)
+        query_len_padded = (
+            self._padded_prefill_len(input_ids.shape[1])
+            if is_prefill
+            else input_ids.shape[1]
+        )
         layout = InputLayout(
             num_reqs=num_reqs,
             num_reqs_padded=num_reqs_padded,
@@ -3027,7 +3023,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 f"{batch_desc.num_tokens_padded} tokens the ranks settled on"
             )
 
-        query_len_padded = self._padded_query_len(target_query_len, is_prefill)
+        # Match serving's prefill bucket for the decided query length.
+        query_len_padded = (
+            min(c for c in self.prefill_chunk_sizes if c >= target_query_len)
+            if is_prefill
+            else target_query_len
+        )
 
         num_scheduled_tokens = np.array([target_query_len] * num_reqs, dtype=np.int32)
         num_tokens = int(num_scheduled_tokens.sum())

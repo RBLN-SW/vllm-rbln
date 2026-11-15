@@ -136,15 +136,17 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         """
         Args:
             hidden_states: [batch, seq, hidden] or [batch * seq, hidden]; the batch
-                and seq come from the step's GDN metadata
+                comes from the step's GDN metadata
         """
         metadata = get_forward_context().attn_metadata[self.prefix]
         assert isinstance(metadata, RBLNGDNAttentionMetadata), type(metadata)
-        batch, seq_len = metadata.batch_size, metadata.seq_len
-        assert hidden_states.numel() == batch * seq_len * hidden_states.shape[-1], (
+        batch = metadata.batch_size
+        num_tokens = hidden_states.numel() // hidden_states.shape[-1]
+        assert num_tokens % batch == 0, (
             f"{self.prefix}: hidden_states {tuple(hidden_states.shape)} do not hold "
-            f"the step's batch {batch} x seq {seq_len}"
+            f"the step's batch {batch}"
         )
+        seq_len = num_tokens // batch
         assert self.layer_index is not None, self.prefix
         state = _resolve_kv_cache(metadata, self.layer_index)
         ring = self.conv_ring.inputs()
@@ -195,8 +197,9 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         if metadata.is_prefill:
             # Padded tokens must neither decay the state nor write to it.
             assert metadata.valid_mask is not None
-            g = g * metadata.valid_mask
-            beta = beta * metadata.valid_mask.to(beta.dtype)
+            valid_mask = metadata.valid_mask[..., :seq_len]
+            g = g * valid_mask
+            beta = beta * valid_mask.to(beta.dtype)
             core = torch.ops.rbln_custom_ops.chunk_gated_delta_rule(
                 query,
                 key,
