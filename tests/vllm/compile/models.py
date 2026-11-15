@@ -36,6 +36,9 @@ MODELS: list[CompileModelSpec] = [
         # the block size at which a GatedDeltaNet state fills a full-attention page
         {"max_num_seqs": 2, "language_model_only": True, "block_size": 256},
         chips=REBEL,
+        # The fourth layer is the first full-attention one: with it the state
+        # and the attention cache share a buffer.
+        num_hidden_layers=4,
     ),
     CompileModelSpec(
         "Qwen/Qwen3-30B-A3B",

@@ -20,7 +20,7 @@ from rebel.ops.torch_custom_ops.gdn import CHUNK as GDN_PREFILL_CHUNK
 from rebel.ops.torch_custom_ops.gdn import STATE_LANES
 from rebel.ops.torch_custom_ops.kda import CONV_LANES
 from torch import nn
-from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.config import VllmConfig, get_current_vllm_config, set_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
@@ -32,10 +32,10 @@ from vllm.v1.kv_cache_interface import KVCacheSpec
 from vllm_rbln.patches import register_patch
 from vllm_rbln.patches.attention import _resolve_kv_cache
 from vllm_rbln.patches.registry import add_registration
+from vllm_rbln.v1.attention.backends.flash_attention import RBLNFlashAttentionBackend
 from vllm_rbln.v1.attention.backends.gdn_attn import (
     RBLNGDNAttentionBackend,
     RBLNGDNAttentionMetadata,
-    gdn_state_shape,
 )
 from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
 
@@ -108,15 +108,6 @@ class RBLNGDNBlockAuxCache(nn.Module, AttentionLayerBase):
 
 
 @register_patch(
-    target="vllm.model_executor.models.qwen3_next.QwenGatedDeltaNetAttention",
-    key=f"{__name__}.RBLNQwenGatedDeltaNetAttention.qwen3_next",
-    reason=(
-        "Qwen3-Next builds its GatedDeltaNet layer from this module's name; the "
-        "RBLN layer declares the delta-rule state as a full-attention KV block and "
-        "runs the conv and the delta rule as RBLN custom kernels."
-    ),
-)
-@register_patch(
     target="vllm.model_executor.models.qwen3_5.QwenGatedDeltaNetAttention",
     reason=(
         "Upstream's GatedDeltaNet layer declares a conv + ssm state page its "
@@ -176,18 +167,25 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 prefix_cacheable=False,
             )
 
+    def get_state_shape(self) -> tuple[tuple[int, ...]]:
+        """Physical KV block shape, resolved under the current vLLM config."""
+        shape = RBLNFlashAttentionBackend.get_kv_cache_shape(
+            num_blocks=1,
+            block_size=self.cache_config.block_size,
+            num_kv_heads=self.num_kv_heads,
+            head_size=self.kv_head_size,
+        )[1:]
+        assert shape[0] == 2, (
+            f"GDN requires KV blocks shaped [2, Hkv, 1, B, Dh], got {shape}"
+        )
+        return (shape,)
+
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
         # The verify kernel replays accepted drafts from the draft buffer, so
         # the state takes none of upstream's per-draft blocks.
-        spec = super().get_kv_cache_spec(vllm_config)
+        with set_current_vllm_config(vllm_config):
+            spec = super().get_kv_cache_spec(vllm_config)
         return replace(spec, num_speculative_blocks=0)
-
-    def get_state_shape(self) -> tuple[tuple[int, ...]]:
-        return (
-            gdn_state_shape(
-                self.num_kv_heads, self.cache_config.block_size, self.kv_head_size
-            ),
-        )
 
     def get_state_dtype(self) -> tuple[torch.dtype]:
         # The delta-rule kernels take the state in the dtype of q / k / v, so it
@@ -219,9 +217,9 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         state = _resolve_kv_cache(metadata, self.layer_index)
         ring = self.conv_ring.inputs()
         tp_size = self.tp_size
-        heads_k = self.num_k_heads // tp_size
-        heads_v = self.num_v_heads // tp_size
-        ratio = heads_v // heads_k
+        num_k_heads = self.num_k_heads // tp_size
+        num_v_heads = self.num_v_heads // tp_size
+        ratio = num_v_heads // num_k_heads
         key_dim = self.key_dim // tp_size
         value_dim = self.value_dim // tp_size
         channels = key_dim * 2 + value_dim
@@ -242,26 +240,26 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             qkv.reshape(batch, seq_len, 1, channels),
             self.conv1d.weight.view(1, channels, kernel).to(mixed_qkvz.dtype),
             ring,
-            metadata.conv_state_index,
-            metadata.conv_seq_idx,
-            metadata.conv_query_len,
+            metadata.conv_load_blocks,
+            metadata.conv_start_positions,
+            metadata.conv_query_lens,
             metadata.conv_has_initial_state,
             kernel - 1 + self.num_drafts,
-            store_index=metadata.conv_store_index,
+            store_index=metadata.conv_store_blocks,
         )
         # The delta-rule kernels take q / k a key head (L2-normalized inside), v, g and
         # beta per value head grouped under its key head: value head h is key head
         # h // ratio's (h % ratio)-th, as HF's repeat_interleave pairs them.
-        grouped = convolved.view(batch, seq_len, heads_k, 2 + ratio, head_dim)
+        grouped = convolved.view(batch, seq_len, num_k_heads, 2 + ratio, head_dim)
         grouped = grouped.permute(0, 2, 3, 1, 4)
         query, key = (grouped[:, :, i].contiguous() for i in (0, 1))
         value = grouped[:, :, 2:].contiguous()
 
-        beta = torch.sigmoid(b).reshape(batch, seq_len, heads_k, ratio)
+        beta = torch.sigmoid(b).reshape(batch, seq_len, num_k_heads, ratio)
         g = -torch.exp(self.A_log.float()) * F.softplus(
             a.float() + self.dt_bias.float()
         )
-        g = g.reshape(batch, seq_len, heads_k, ratio)
+        g = g.reshape(batch, seq_len, num_k_heads, ratio)
         beta, g = (x.permute(0, 2, 3, 1) for x in (beta, g))
         if metadata.num_prefills > 0:
             # Padded tokens must neither decay the state nor write to it.
@@ -312,11 +310,13 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 metadata.store_state_indices,
                 metadata.store_state_indices,
             )
-        # [batch, heads_k, ratio, seq, 128] -> [batch, seq, heads_v, 128]
-        core = core.permute(0, 3, 1, 2, 4).reshape(batch, seq_len, heads_v, head_dim)
-        z = z.reshape(batch, seq_len, heads_v, head_dim)
+        # [batch, num_k_heads, ratio, seq, 128] -> [batch, seq, num_v_heads, 128]
+        core = core.permute(0, 3, 1, 2, 4).reshape(
+            batch, seq_len, num_v_heads, head_dim
+        )
+        z = z.reshape(batch, seq_len, num_v_heads, head_dim)
         gated = self.norm(core, z)
-        output, _ = self.out_proj(gated.reshape(batch, seq_len, heads_v * head_dim))
+        output, _ = self.out_proj(gated.reshape(batch, seq_len, num_v_heads * head_dim))
         return output.reshape(*hidden_states.shape[:-1], output.shape[-1])
 
 

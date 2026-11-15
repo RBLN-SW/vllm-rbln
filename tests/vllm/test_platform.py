@@ -630,13 +630,28 @@ class TestRejectedConfigs:
             return SimpleNamespace(hf_config=SimpleNamespace(model_type=model_type))
 
         assert _uses_gated_delta_net(config("qwen3_5_text"))
-        assert _uses_gated_delta_net(config("qwen3_next"))
+        assert not _uses_gated_delta_net(config("qwen3_next"))
         assert not _uses_gated_delta_net(config("glm5_next_text"))
+
+    @pytest.mark.parametrize(
+        "model_type, name",
+        [("qwen3_next", "Qwen3-Next"), ("qwen3_5_moe_text", "Qwen3.5-MoE")],
+    )
+    def test_other_gdn_models_are_refused(self, reconfigure, model_type, name):
+        def other_model(config):
+            config.model_config.hf_text_config.model_type = model_type
+
+        with pytest.raises(ValueError, match=name):
+            reconfigure(other_model)
 
     def test_gdn_models_need_128_token_prefill_chunks(self, reconfigure, gdn):
         def chunk_of_192(config):
             gdn(config)
             config.scheduler_config.max_num_batched_tokens = 192
+            # Unset, so the prefill chunk is the token budget.
+            config.additional_config = replace(
+                config.additional_config, prefill_chunk_size=None
+            )
 
         with pytest.raises(ValueError, match="multiple of 128"):
             reconfigure(chunk_of_192)
@@ -674,13 +689,54 @@ class TestRejectedConfigs:
         for drafts in (1, 5):
             reconfigure(speculative("mtp", drafts))
 
-    def test_gdn_state_fills_a_full_attention_page(self, reconfigure, gdn):
-        def doubled_block(config):
+    def test_gdn_models_reject_the_custom_kernel_option(self, reconfigure, gdn):
+        def custom_kernel(config):
             gdn(config)
-            config.cache_config.block_size *= 2
+            config.additional_config.use_custom_kernel = True
 
-        with pytest.raises(ValueError, match="full-attention layer's page"):
-            reconfigure(doubled_block)
+        with pytest.raises(ValueError, match="rbln-use-custom-kernel"):
+            reconfigure(custom_kernel)
+
+    def test_gdn_models_keep_the_kv_cache_in_the_activation_dtype(
+        self, reconfigure, gdn
+    ):
+        def fp8_cache(config):
+            gdn(config)
+            config.cache_config.cache_dtype = "fp8"
+
+        with pytest.raises(ValueError, match="kv-cache-dtype"):
+            reconfigure(fp8_cache)
+
+    def test_every_gdn_prefill_chunk_size_is_a_multiple_of_128(self, reconfigure, gdn):
+        def chunks(sizes):
+            def mutate(config):
+                gdn(config)
+                config.scheduler_config.max_num_batched_tokens = 256
+                _prefill_chunk(sizes)(config)
+
+            return mutate
+
+        with pytest.raises(ValueError, match="multiple of 128"):
+            reconfigure(chunks([64, 256]))
+        config = reconfigure(chunks([128, 256]))
+        assert config.additional_config.prefill_chunk_size == [128, 256]
+
+    @pytest.mark.parametrize("block_size", [256, 512, 1024])
+    def test_gdn_state_fits_a_full_attention_page(self, reconfigure, gdn, block_size):
+        def sized_block(config):
+            gdn(config)
+            config.cache_config.block_size = block_size
+
+        config = reconfigure(sized_block)
+        assert config.cache_config.block_size == block_size
+
+    def test_gdn_state_rejects_an_undersized_attention_page(self, reconfigure, gdn):
+        def smaller_block(config):
+            gdn(config)
+            config.cache_config.block_size //= 2
+
+        with pytest.raises(ValueError, match="must fit in a full-attention"):
+            reconfigure(smaller_block)
 
     def test_gdn_state_is_one_block_a_request(self, reconfigure, gdn):
         config = reconfigure(gdn)
@@ -758,48 +814,57 @@ class TestRejectedConfigs:
         with pytest.raises(ValueError, match="exceeds"):
             reconfigure(_prefill_chunk(256))
 
+    def test_prefill_chunk_above_max_num_scheduled_tokens_is_refused(self, reconfigure):
+        def mutate(config):
+            _prefill_chunk([32, 64])(config)
+            config.scheduler_config.max_num_scheduled_tokens = 32
+
+        with pytest.raises(ValueError, match="max_num_scheduled_tokens"):
+            reconfigure(mutate)
+
     def test_an_unset_prefill_chunk_resolves_to_the_token_budget(self, reconfigure):
         config = reconfigure(lambda config: None)
-        assert (
-            config.additional_config.prefill_chunk_size
-            == config.scheduler_config.max_num_batched_tokens
-        )
+        assert config.additional_config.prefill_chunk_size == [
+            config.scheduler_config.max_num_batched_tokens
+        ]
 
     def test_a_prefill_chunk_below_the_token_budget_is_taken(self, reconfigure):
         config = reconfigure(_prefill_chunk(64))
-        assert config.additional_config.prefill_chunk_size == 64
+        assert config.additional_config.prefill_chunk_size == [64]
 
-    @pytest.mark.parametrize(
-        "feature, enable",
-        [
-            ("data parallelism", lambda c: _ranks(data_parallel_size=2)(c)),
-            (
-                "RBLN NIXL KV transfer",
-                lambda c: setattr(
-                    c,
-                    "kv_transfer_config",
-                    SimpleNamespace(
-                        kv_connector="RblnNixlPushConnector",
-                        kv_connector_extra_config={},
-                    ),
-                ),
-            ),
-        ],
-    )
-    def test_a_prefill_chunk_below_the_token_budget_refuses(
-        self, reconfigure, feature, enable
+    @pytest.mark.parametrize("sizes", [64, [32, 64]])
+    def test_prefill_chunk_below_the_token_budget_takes_data_parallelism(
+        self, reconfigure, sizes
     ):
         def mutate(config):
-            _prefill_chunk(64)(config)
-            enable(config)
+            _prefill_chunk(sizes)(config)
+            _ranks(data_parallel_size=2)(config)
 
-        with pytest.raises(ValueError, match=feature):
+        config = reconfigure(mutate)
+        assert config.additional_config.prefill_chunk_size == (
+            sizes if isinstance(sizes, list) else [sizes]
+        )
+
+    def test_several_prefill_chunk_sizes_refuse_non_causal_attention(self, reconfigure):
+        def mutate(config):
+            _prefill_chunk([32, 64])(config)
+            config.attention_config.use_non_causal = True
+
+        with pytest.raises(ValueError, match="non-causal attention"):
             reconfigure(mutate)
+
+    def test_one_prefill_chunk_size_keeps_non_causal_attention(self, reconfigure):
+        def mutate(config):
+            _prefill_chunk(64)(config)
+            config.attention_config.use_non_causal = True
+
+        reconfigure(mutate)
 
     @pytest.mark.parametrize(
         "kv_connector, extra",
         [
             ("RblnNixlConnector", {}),
+            ("RblnNixlPushConnector", {}),
             (
                 "MultiConnector",
                 {"connectors": [{"kv_connector": "RblnNixlPullConnector"}]},
@@ -925,7 +990,7 @@ def _ranks(
     return mutate
 
 
-def _prefill_chunk(size: int):
+def _prefill_chunk(size: int | list[int]):
     """A mutator that sets --rbln-prefill-chunk-size, with sub-block caching off."""
 
     def mutate(config: VllmConfig) -> None:

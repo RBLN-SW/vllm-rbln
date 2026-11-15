@@ -44,6 +44,7 @@ from . import (
     metrics,
     minimax_m2,
     minimax_m3,
+    minimax_m3_reasoning,
     mla,
     model_arch_config,
     modelopt_mixed_config,

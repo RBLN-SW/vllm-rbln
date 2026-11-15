@@ -628,6 +628,7 @@ class TestDetermineAvailableMemory:
         params=None,
         specialized_moe_decode=False,
         decode_buckets=3,
+        chunk_sizes=(128,),
         decode_graph_shapes=((1, 1, None), (2, 1, None), (4, 1, None)),
         drafter=None,
         speculative_config=None,
@@ -660,6 +661,7 @@ class TestDetermineAvailableMemory:
             bucketing_manager=SimpleNamespace(
                 decode_batch_buckets_count=decode_buckets
             ),
+            prefill_chunk_sizes=chunk_sizes,
             drafter=drafter,
             get_kv_cache_spec=lambda: {},
             decode_graph_shapes=lambda: list(decode_graph_shapes),
@@ -713,6 +715,7 @@ class TestDetermineAvailableMemory:
             model=SimpleNamespace(named_parameters=lambda: iter(_params().items())),
             specialized_moe_decode=False,
             bucketing_manager=SimpleNamespace(decode_batch_buckets_count=3),
+            prefill_chunk_sizes=(128,),
             decode_graph_shapes=lambda: [(b, 1, None) for b in (1, 2, 4)],
             drafter=None,
             get_kv_cache_spec=lambda: {"a": spec, "b": spec},
@@ -751,6 +754,21 @@ class TestDetermineAvailableMemory:
             decode_graph_shapes=[(b, 1, None) for b in (1, 2, 4)] + [(4, 1, 512)],
         )
         assert cap["num_runtimes"] == 5
+
+    @pytest.mark.parametrize(
+        ("decode_shapes", "expected"),
+        [([], 3), ([(1, 1, None), (2, 1, None), (4, 1, None)], 6)],
+    )
+    def test_num_runtimes_counts_every_prefill_chunk_size(
+        self, make_worker, monkeypatch, decode_shapes, expected
+    ):
+        cap = self._capture(
+            make_worker,
+            monkeypatch,
+            chunk_sizes=(32, 64, 128),
+            decode_graph_shapes=decode_shapes,
+        )
+        assert cap["num_runtimes"] == expected
 
     def test_no_quant_counts_int_at_16bit(self, make_worker, monkeypatch):
         assert self._capture(make_worker, monkeypatch)["n_model_bytes"] == 300

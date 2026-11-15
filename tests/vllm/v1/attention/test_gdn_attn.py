@@ -24,10 +24,8 @@ from vllm.config import set_current_vllm_config
 from vllm.v1.kv_cache_interface import MambaSpec
 
 from tests.vllm.vllm_config import make_vllm_config
-from vllm_rbln.v1.attention.backends.flash_attention import RBLNFlashAttentionBackend
 from vllm_rbln.v1.attention.backends.gdn_attn import (
     RBLNGDNAttentionMetadataBuilder,
-    gdn_state_shape,
     grouped_qkv_rows,
 )
 
@@ -43,21 +41,13 @@ def test_grouped_qkv_rows_interleaves_each_key_heads_q_k_and_values():
     assert grouped_qkv_rows(2, 1, 2).tolist() == [0, 1, 4, 5, 8, 9, 2, 3, 6, 7, 10, 11]
 
 
-def test_state_block_is_the_flash_backends_kv_block():
-    # A GDN layer and an attention layer on one buffer are one graph input only
-    # while both declare a block the same way.
-    with set_current_vllm_config(make_vllm_config()):
-        cache = RBLNFlashAttentionBackend.get_kv_cache_shape(1, 256, 4, 256)
-    assert gdn_state_shape(4, 256, 256) == cache[1:]
-
-
 def _builder():
     vllm_config = make_vllm_config(
         max_model_len=MAX_LEN, max_num_batched_tokens=128, max_num_seqs=4
     )
     spec = MambaSpec(
         block_size=MAX_LEN,
-        shapes=(gdn_state_shape(1, 256, 128),),
+        shapes=((4, 128, 128),),
         dtypes=(torch.bfloat16,),
     )
     # The flash builder it extends reads the config it is built under.
@@ -87,14 +77,14 @@ def _common(
     )
 
 
-def _assert_conv_rows(md, blocks, seq_idx, query_len, has_initial_state):
+def _assert_conv_rows(md, blocks, start_positions, query_lens, has_initial_state):
     """kda_conv's per-row operands: the ring is stored where it was read."""
     want = {
-        "conv_state_index": blocks,
-        "conv_seq_idx": seq_idx,
-        "conv_query_len": query_len,
+        "conv_load_blocks": blocks,
+        "conv_start_positions": start_positions,
+        "conv_query_lens": query_lens,
         "conv_has_initial_state": has_initial_state,
-        "conv_store_index": blocks,
+        "conv_store_blocks": blocks,
     }
     for name, values in want.items():
         got = getattr(md, name)
@@ -104,7 +94,9 @@ def _assert_conv_rows(md, blocks, seq_idx, query_len, has_initial_state):
 class TestBuilder:
     def test_first_prefill_chunk(self, builder):
         positions = torch.arange(128)
-        md = builder.build(_common([70], [70], [[7]]), positions, 1, True)
+        md = builder.build(
+            _common([70], [70], [[7]]), positions, 1, True, query_len_padded=128
+        )
         assert (md.num_prefills, md.num_prefill_tokens, md.num_decodes) == (1, 70, 0)
         assert md.is_prefill
         assert md.num_actual_tokens == 70
@@ -121,9 +113,23 @@ class TestBuilder:
         assert md.valid_mask.shape == (1, 1, 128)
         assert md.valid_mask.sum() == 70 and md.valid_mask[..., :70].all()
 
+    def test_a_prefill_step_is_sized_at_the_chunk_the_runner_hands_it(self, builder):
+        md = builder.build(
+            _common([70], [70], [[7]]),
+            torch.arange(256),
+            1,
+            True,
+            query_len_padded=256,
+        )
+        assert md.seq_len == 256
+        assert md.valid_mask.shape == (1, 1, 256)
+        assert md.valid_mask.sum() == 70
+
     def test_later_prefill_chunk_carries_state(self, builder):
         positions = torch.arange(70, 70 + 58)
-        md = builder.build(_common([58], [128], [[7]]), positions, 1, True)
+        md = builder.build(
+            _common([58], [128], [[7]]), positions, 1, True, query_len_padded=128
+        )
         assert md.num_prefill_tokens == 58
         assert md.prefill_state_indices.tolist() == [7]
         assert md.prefill_has_initial_state.tolist() == [1]
@@ -165,7 +171,11 @@ class TestBuilder:
 
     def test_staging_buffers_are_reused(self, builder):
         positions = torch.arange(128)
-        first = builder.build(_common([70], [70], [[7]]), positions, 1, True)
-        second = builder.build(_common([58], [128], [[7]]), positions, 1, True)
-        assert first.conv_state_index.data_ptr() == second.conv_state_index.data_ptr()
+        first = builder.build(
+            _common([70], [70], [[7]]), positions, 1, True, query_len_padded=128
+        )
+        second = builder.build(
+            _common([58], [128], [[7]]), positions, 1, True, query_len_padded=128
+        )
+        assert first.conv_load_blocks.data_ptr() == second.conv_load_blocks.data_ptr()
         _assert_conv_rows(second, [7], [0], [58], [1])
