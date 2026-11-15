@@ -33,7 +33,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 
 from vllm_rbln.model_executor.models.interfaces import SupportsRBLNMultiModal
-from vllm_rbln.v1.attention.backends.gdn_attn import gdn_state_shape, grouped_qkv_rows
+from vllm_rbln.v1.attention.backends.gdn_attn import grouped_qkv_rows
 
 # The largest image, in patches, the compiled vision encoder takes. Attention
 # runs over the whole bucket at once, so the processor's own limit (16M pixels
@@ -126,7 +126,7 @@ class RBLNQwen3_5ForConditionalGeneration(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loaded = super().load_weights(weights)
         # The checkpoint's [q | k | v] rows in key-head groups, the order the
-        # GatedDeltaNet conv runs them in (patches/qwen3_next).
+        # GatedDeltaNet conv runs them in (RBLNQwenGatedDeltaNetAttention).
         for layer in self.language_model.model.layers:
             attn = getattr(layer, "linear_attn", None)
             if attn is None:
@@ -150,14 +150,14 @@ class RBLNQwen3_5ForConditionalGeneration(
     def get_mamba_state_shape_from_config(
         cls, vllm_config: VllmConfig
     ) -> tuple[tuple[int, ...]]:
-        # The state every RBLNQwenGatedDeltaNetAttention declares, for the
-        # platform's page arithmetic (patches/qwen3_next).
         model_config = vllm_config.model_config
+        text_config = model_config.hf_text_config
         return (
-            gdn_state_shape(
-                model_config.get_num_kv_heads(vllm_config.parallel_config),
-                vllm_config.cache_config.block_size,
-                model_config.get_head_size(),
+            (
+                text_config.linear_num_value_heads
+                // vllm_config.parallel_config.tensor_parallel_size,
+                text_config.linear_key_head_dim,
+                text_config.linear_value_head_dim,
             ),
         )
 
@@ -225,8 +225,9 @@ class RBLNQwen3_5ForConditionalGeneration(
         encoder = self._mm_encoder
         if encoder is None:
             # enforce_eager: the runner never calls compile_mm_encoder.
-            encoder = _RBLNQwen3VisionEncoder(self.visual).eval()
-            object.__setattr__(self, "_mm_encoder", encoder)
+            self.compile_mm_encoder(lambda encoder: encoder)
+            encoder = self._mm_encoder
+        assert encoder is not None
         grid_thw = image_input["image_grid_thw"].tolist()
         sizes = [math.prod(g) for g in grid_thw]
         merge = self.visual.spatial_merge_size

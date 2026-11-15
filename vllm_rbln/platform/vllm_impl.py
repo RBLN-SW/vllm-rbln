@@ -92,10 +92,10 @@ def validate_request(params: "SamplingParams | PoolingParams") -> None:
 
 
 def _uses_gated_delta_net(model_config) -> bool:
-    """A GatedDeltaNet model (Qwen3-Next, Qwen3.5) by its HF text model type.
-    GLM-5.3's KDA layers share the `linear_attention` layer type and stay out."""
+    """A GatedDeltaNet model (Qwen3.5) by its HF text model type. GLM-5.3's KDA
+    layers share the `linear_attention` layer type and stay out."""
     text_config = getattr(model_config, "hf_text_config", model_config.hf_config)
-    return getattr(text_config, "model_type", None) in ("qwen3_next", "qwen3_5_text")
+    return getattr(text_config, "model_type", None) == "qwen3_5_text"
 
 
 def _uses_model_parallel(parallel_config) -> bool:
@@ -116,13 +116,16 @@ def _validate(vllm_config: "VllmConfig") -> None:
     if vllm_config.lora_config is not None:
         raise ValueError("LoRA is not supported on RBLN.")
 
-    if _uses_gated_delta_net(model_config):
-        if scheduler_config.max_num_batched_tokens % 128:
+    # An encoder-only instance builds no language model, so no GDN layer.
+    uses_gdn = (
+        _uses_gated_delta_net(model_config) and not vllm_config.is_mm_encoder_only
+    )
+    if uses_gdn:
+        if rbln_config.use_custom_kernel:
             raise ValueError(
-                "The RBLN GatedDeltaNet prefill kernel runs in 128-token chunks; "
-                f"got max_num_batched_tokens="
-                f"{scheduler_config.max_num_batched_tokens}. "
-                "Set --max-num-batched-tokens to a multiple of 128."
+                "GatedDeltaNet models do not take --rbln-use-custom-kernel on the "
+                "RBLN vLLM path yet: its attention kernels read the KV cache in "
+                "another layout than the state, which shares that cache's blocks."
             )
         if (
             parallel_config.tensor_parallel_size > 1
@@ -141,37 +144,43 @@ def _validate(vllm_config: "VllmConfig") -> None:
                 "Speculative decoding is not supported for GatedDeltaNet models on "
                 "the RBLN vLLM path yet: the decode kernel takes one token per request."
             )
-        heads_v = model_config.hf_text_config.linear_num_value_heads
-        if (heads_v // parallel_config.tensor_parallel_size) % 4:
+        text_config = model_config.hf_text_config
+        num_v_heads = text_config.linear_num_value_heads
+        # Per rank, so the rule holds as it is once TP is supported.
+        if (num_v_heads // parallel_config.tensor_parallel_size) % 4:
             raise ValueError(
                 "The RBLN GatedDeltaNet core splits a rank's value heads over four "
-                f"chiplets; got {heads_v} heads over "
+                f"chiplets; got {num_v_heads} heads over "
                 f"tensor_parallel_size={parallel_config.tensor_parallel_size}."
             )
-        # A state block comes from the pool the attention layers schedule on and
-        # is declared as the full-attention KV block the kernels read it from, so
-        # a block has to hold exactly one layer's state.
-        text_config = model_config.hf_text_config
+        # State and attention share a pool page; its physical capacity must
+        # cover the recurrent state, with any remainder as padding.
         cache_config = vllm_config.cache_config
+        kv_dtype = kv_cache_dtype_str_to_dtype(cache_config.cache_dtype, model_config)
+        if kv_dtype != model_config.dtype:
+            raise ValueError(
+                "A GatedDeltaNet state is declared in the activation dtype as a "
+                "full-attention KV block on RBLN, so the KV cache has to keep "
+                f"that dtype; got --kv-cache-dtype {cache_config.cache_dtype} "
+                f"for dtype {model_config.dtype}."
+            )
         token_bytes = (
             2
             * model_config.get_num_kv_heads(parallel_config)
             * model_config.get_head_size()
-            * get_dtype_size(
-                kv_cache_dtype_str_to_dtype(cache_config.cache_dtype, model_config)
-            )
+            * get_dtype_size(kv_dtype)
         )
         state_bytes = (
-            heads_v
+            num_v_heads
             * text_config.linear_key_head_dim
             * text_config.linear_value_head_dim
             * get_dtype_size(model_config.dtype)
         )
-        if cache_config.block_size * token_bytes != state_bytes:
+        if cache_config.block_size * token_bytes < state_bytes:
             raise ValueError(
                 "A GatedDeltaNet state takes a block of the attention pool on RBLN, "
-                f"so its {state_bytes} bytes have to be a full-attention layer's "
-                f"page ({token_bytes} bytes a token): set --block-size "
+                f"so its {state_bytes} bytes must fit in a full-attention layer's "
+                f"page ({token_bytes} bytes a token): set --block-size to at least "
                 f"{state_bytes / token_bytes:g}; got {cache_config.block_size}."
             )
 
@@ -185,6 +194,27 @@ def _validate(vllm_config: "VllmConfig") -> None:
         )
 
     text_config = getattr(model_config, "hf_text_config", model_config.hf_config)
+    if getattr(text_config, "model_type", None) == "qwen3_next":
+        raise ValueError(
+            "Qwen3-Next is not supported on the RBLN vLLM path yet: its "
+            "GatedDeltaNet projections are interleaved by key head, a layout the "
+            "RBLN layer does not read."
+        )
+    if getattr(text_config, "model_type", None) == "qwen3_5_moe_text":
+        raise ValueError(
+            "Qwen3.5-MoE is not supported on the RBLN vLLM path yet: it builds "
+            "the RBLN GatedDeltaNet layer, whose weight regrouping and platform "
+            "rules cover the dense Qwen3.5 models only."
+        )
+    if (
+        model_config.uses_mrope
+        and getattr(text_config, "model_type", None) != "qwen3_5_text"
+    ):
+        # The RBLN M-RoPE forward has run on Qwen3.5 only.
+        raise ValueError(
+            "M-RoPE models other than Qwen3.5 (e.g. the Qwen2-VL family) are not "
+            "supported on the RBLN vLLM path yet. Use the optimum path."
+        )
     if (
         getattr(text_config, "sparse_attention_config", None)
         and model_config.dtype != torch.bfloat16
@@ -215,8 +245,7 @@ def _validate(vllm_config: "VllmConfig") -> None:
 
     cache_config = vllm_config.cache_config
     if cache_config.enable_prefix_caching and (
-        text_config.model_type == "glm5_next_text"
-        or _uses_gated_delta_net(model_config)
+        text_config.model_type == "glm5_next_text" or uses_gdn
     ):
         if (
             cache_config.user_specified_mamba_block_size
@@ -266,16 +295,31 @@ def _validate(vllm_config: "VllmConfig") -> None:
             "Set --block-size within this range."
         )
 
-    chunk = rbln_config.prefill_chunk_size
-    if chunk is not None and chunk > max_num_batched_tokens:
+    chunks = rbln_config.prefill_chunk_size or [max_num_batched_tokens]
+    if max(chunks) > max_num_batched_tokens:
         raise ValueError(
-            f"--rbln-prefill-chunk-size={chunk} exceeds {max_num_batched_tokens=}."
+            f"prefill_chunk_size={chunks} exceeds {max_num_batched_tokens=}."
         )
-    # TODO(RBLN): DP ranks agree on max_num_batched_tokens as the prefill token
-    # dimension (dp_utils), and the RBLN NIXL connector's resume trim takes it
-    # as the prefill chunk. Lifting a refusal means pointing that feature's
-    # sites at prefill_chunk_size; #1372 lists them.
-    if chunk is not None and chunk < max_num_batched_tokens:
+
+    max_num_scheduled_tokens = scheduler_config.max_num_scheduled_tokens
+    if (
+        max_num_scheduled_tokens is not None
+        and chunks != [max_num_batched_tokens]
+        and max(chunks) > max_num_scheduled_tokens
+    ):
+        raise ValueError(
+            f"prefill_chunk_size={chunks} exceeds {max_num_scheduled_tokens=}."
+        )
+    if uses_gdn and any(chunk % 128 for chunk in chunks):
+        raise ValueError(
+            "The RBLN GatedDeltaNet prefill kernel runs in 128-token chunks; got "
+            f"prefill_chunk_size={chunks}. Each has to be a multiple of 128 "
+            "(--rbln-prefill-chunk-size, or --max-num-batched-tokens without it)."
+        )
+    # TODO(RBLN): The RBLN NIXL connector's resume trim takes
+    # max_num_batched_tokens as the prefill chunk. Lifting the refusal means
+    # pointing its sites at prefill_chunk_size; #1372 lists them.
+    if min(chunks) < max_num_batched_tokens:
         kv_transfer = vllm_config.kv_transfer_config
         connectors = [] if kv_transfer is None else [kv_transfer.kv_connector]
         if connectors == ["MultiConnector"]:
@@ -284,7 +328,6 @@ def _validate(vllm_config: "VllmConfig") -> None:
         unsupported = [
             name
             for name, on in (
-                ("data parallelism", parallel_config.data_parallel_size > 1),
                 (
                     "RBLN NIXL KV transfer",
                     any(
@@ -297,17 +340,22 @@ def _validate(vllm_config: "VllmConfig") -> None:
                         for name in connectors
                     ),
                 ),
+                # The non-causal prefill mask is built at the longest chunk.
+                (
+                    "non-causal attention",
+                    len(chunks) > 1 and vllm_config.attention_config.use_non_causal,
+                ),
             )
             if on
         ]
         if unsupported:
             raise ValueError(
-                f"--rbln-prefill-chunk-size={chunk} below {max_num_batched_tokens=} "
+                f"prefill_chunk_size={chunks} below {max_num_batched_tokens=} "
                 f"is not supported with {', '.join(unsupported)} on RBLN yet."
             )
     # Resolved here so the scheduler and runner read one value, and compute_hash,
     # which runs after this, keys "unset" and "set to the budget" alike.
-    rbln_config.prefill_chunk_size = chunk or max_num_batched_tokens
+    rbln_config.prefill_chunk_size = chunks
 
     if envs.VLLM_RBLN_COMPILE_ONLY and envs.VLLM_DISABLE_COMPILE_CACHE:
         # Compile-only compiles each graph and writes the .rbln artifact to

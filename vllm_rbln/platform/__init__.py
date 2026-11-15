@@ -291,7 +291,7 @@ class RblnPlatform(Platform):
                 # The prefill chunk size that path compiles is
                 # `--max-num-batched-tokens` as the user gave it, and the call
                 # below replaces an unset one with a default, leaving
-                # `prepare_compile_inputs` no way to tell the two apart. Nothing else
+                # `prepare_compile_config` no way to tell the two apart. Nothing else
                 # writes additional_config now, so an unset one starts here.
                 if config is None:
                     config = self.additional_config = {}

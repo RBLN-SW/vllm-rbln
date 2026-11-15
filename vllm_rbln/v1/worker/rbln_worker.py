@@ -221,7 +221,7 @@ class RBLNWorker(WorkerBase):
         """Estimate KV-cache DRAM, discounting the fixed command-stream buffers
         that warm-up's compiled runtimes reserve.
 
-        One per decode graph the runner will compile, plus the prefill. A draft
+        One per decode graph and prefill chunk size the runner will compile. A draft
         model, when present, adds one, and a bucket's worth more (plus the
         specialized-MoE fallback) wherever the runner compiles decode graphs --
         or one more on a producer whose drafter still warms its decode pass.
@@ -241,7 +241,9 @@ class RBLNWorker(WorkerBase):
         # Read off the runner that compiles them, so this count and
         # run_model_graphs cannot drift apart.
         decode_graph_shapes = self.model_runner.decode_graph_shapes()
-        num_runtimes = 1 + len(decode_graph_shapes)
+        num_runtimes = len(self.model_runner.prefill_chunk_sizes) + len(
+            decode_graph_shapes
+        )
 
         ratio: float = 1.0
         if self.model_config.quantization is not None:

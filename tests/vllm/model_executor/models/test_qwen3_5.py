@@ -59,7 +59,6 @@ def visual(tmp_path):
                 temporal_patch_size=TEMPORAL,
                 num_position_embeddings=64,
                 out_hidden_size=32,
-                deepstack_visual_indexes=[],
                 hidden_act="gelu_pytorch_tanh",
             )
             torch.manual_seed(0)
@@ -110,6 +109,7 @@ def test_image_embeddings_match_upstream(visual):
     )
     torch.nn.Module.__init__(model)
     model.visual = visual
+    model.has_vision = True
     model.encoder_patches = 128
     model._mm_encoder = None
 
