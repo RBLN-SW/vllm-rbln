@@ -130,7 +130,7 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 channels // CONV_LANES,
                 CONV_LANES,
             ),
-            dtype=vllm_config.model_config.dtype,
+            dtype=model_config.dtype,
         )
 
     def get_state_shape(self) -> tuple[tuple[int, ...]]:
@@ -208,19 +208,17 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         )
         g = g.reshape(batch, seq_len, num_k_heads, ratio)
         beta, g = (x.permute(0, 2, 3, 1) for x in (beta, g))
-        if metadata.num_prefills > 0:
+        if metadata.is_prefill:
             # Padded tokens must neither decay the state nor write to it.
             assert metadata.valid_mask is not None
             g = g * metadata.valid_mask
             beta = beta * metadata.valid_mask.to(beta.dtype)
-        beta, g = beta.contiguous(), g.contiguous()
-        if metadata.num_prefills > 0:
             core = torch.ops.rbln_custom_ops.chunk_gated_delta_rule(
                 query,
                 key,
                 value,
-                g,
-                beta,
+                g.contiguous(),
+                beta.contiguous(),
                 state,
                 metadata.prefill_state_indices,
                 metadata.prefill_has_initial_state,
@@ -232,8 +230,8 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 query,
                 key,
                 value,
-                g,
-                beta,
+                g.contiguous(),
+                beta.contiguous(),
                 state,
                 metadata.non_spec_state_indices_tensor,
                 store_index=metadata.store_state_indices,
