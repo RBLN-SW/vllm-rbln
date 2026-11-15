@@ -30,7 +30,12 @@ def test_mtp_compression_uses_checkpoint_tail(target_layers):
     assert _compress_ratio(config, target_layers) == 0
 
 
-def test_target_preserves_streams_for_drafting():
+@pytest.mark.parametrize("stages", [1, 2, 3])
+@pytest.mark.parametrize("tokens", [1, 3])
+def test_target_preserves_streams_for_drafting(monkeypatch, stages, tokens):
+    from vllm.sequence import IntermediateTensors
+
+    import vllm_rbln.model_executor.models.deepseek_v4 as dsv4
     from vllm_rbln.model_executor.models.deepseek_v4 import RBLNDeepseekV4Model
 
     class StampStreams(torch.nn.Module):
@@ -46,12 +51,45 @@ def test_target_preserves_streams_for_drafting():
     model.hc_head_scale = torch.ones(1)
     model.norm_eps, model.hc_eps = 1e-5, 1e-6
     model.norm = torch.nn.Identity()
-    model.layers = torch.nn.ModuleList([StampStreams()])
-    model.start_layer, model.end_layer = 0, 1
-    embeddings = torch.arange(12, dtype=torch.float32).reshape(2, 3, 2)
-    result = model(None, None, None, inputs_embeds=embeddings)
-    expected = torch.cat([embeddings + i for i in range(4)], dim=-1)
+    model.layers = torch.nn.ModuleList([StampStreams() for _ in range(6)])
+    embeddings = torch.arange(4 * tokens, dtype=torch.float32).reshape(2, tokens, 2)
+    intermediate = None
+    for rank in range(stages):
+        group = SimpleNamespace(
+            is_first_rank=rank == 0, is_last_rank=rank == stages - 1
+        )
+        monkeypatch.setattr(dsv4, "get_pp_group", lambda group=group: group)
+        model.start_layer, model.end_layer = (
+            rank * 6 // stages,
+            (rank + 1) * 6 // stages,
+        )
+        result = model(
+            None, None, intermediate, inputs_embeds=embeddings if rank == 0 else None
+        )
+        if rank < stages - 1:
+            assert isinstance(result, IntermediateTensors)
+            assert result["streams"].shape == (2, tokens, 8)
+            intermediate = result
+    expected = torch.cat([embeddings + 6 * i for i in range(4)], dim=-1)
     torch.testing.assert_close(result, expected)
+
+
+@pytest.mark.parametrize("stages", [1, 2])
+def test_mtp_loads_own_embedding_on_last_pp_stage(monkeypatch, stages):
+    import vllm_rbln.model_executor.models.deepseek_v4 as dsv4
+
+    group = SimpleNamespace(world_size=stages, is_last_rank=True)
+    monkeypatch.setattr(dsv4, "get_pp_group", lambda: group)
+    model = dsv4.RBLNDeepseekV4MTP.__new__(dsv4.RBLNDeepseekV4MTP)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(num_hidden_layers=43)
+    model.model = torch.nn.Module()
+    model.model.embed_tokens = torch.nn.Embedding(4, 2)
+    model.model.embed_tokens.weight.data.zero_()
+    weight = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    model.load_weights(iter([("embed.weight", weight)]))
+    expected = weight if stages > 1 else torch.zeros_like(weight)
+    torch.testing.assert_close(model.model.embed_tokens.weight, expected)
 
 
 @pytest.mark.parametrize("sampled_only", [False, True])
