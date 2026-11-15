@@ -91,8 +91,9 @@ def _dense_prefill_forward(
         "callable instead, as the patched qwen/deepseek/minimax/gpt-oss MoE "
         "blocks pass it; this forward is upstream's with that one call changed. "
         "A dense layer in prefill runs its residual adds and norms as "
-        "rbln_custom_ops::{residual_read,gemma4_dense_residual_write} instead, which the "
-        "compiler cuts by tokens so the residual stays split across chiplets."
+        "rbln_custom_ops::{residual_read,gemma4_dense_residual_write} instead, "
+        "which the compiler cuts by tokens so the residual stays split across "
+        "chiplets."
     ),
 )
 def patched_gemma4_decoder_layer_forward(

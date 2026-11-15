@@ -225,6 +225,12 @@ def test_a_per_layer_input_keeps_the_plain_layer(monkeypatch):
     layer.per_layer_projection = lambda x: x.repeat(1, 1, 8)
     layer.post_per_layer_input_norm = lambda x: x
 
-    _run(layer, torch.randn(1, 8, 64), True, monkeypatch, per_layer_input=torch.randn(1, 8, 8))
+    _run(
+        layer,
+        torch.randn(1, 8, 64),
+        True,
+        monkeypatch,
+        per_layer_input=torch.randn(1, 8, 8),
+    )
 
     assert calls == []
