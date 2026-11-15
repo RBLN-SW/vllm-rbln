@@ -89,9 +89,6 @@ logger = init_logger(__name__)
 # compress
 # ratio needs, and `_cache_ordinal` maps (layer, slot) to the position in the runner's
 # compacted cache list.
-# A compressed-cache block holds whole 64-entry chunks on each of the 4 RSD shards.
-DSV4_MIN_BLOCK_ENTRIES = 256
-
 SLOT_SWA, SLOT_CMP, SLOT_IDX_K, SLOT_IDX_SCALE, SLOT_STATE, SLOT_IDX_STATE = range(6)
 DSV4_NUM_CACHE_SLOTS = 6
 
@@ -189,7 +186,10 @@ class RBLNDeepseekV4RingCache(nn.Module, AttentionLayerBase):
 
 def _paged_block_size(vllm_config: VllmConfig, compress_ratio: int) -> int:
     block_size = vllm_config.cache_config.block_size
-    unit = DSV4_MIN_BLOCK_ENTRIES * compress_ratio
+    # CSA cuts entries over four chiplets; HCA replicates them under head TP.
+    # Each physical block must contain whole 64-entry chunks.
+    entries = 64 if compress_ratio == 128 else 256
+    unit = entries * compress_ratio
     if block_size % unit == 0:
         return block_size
     if unit % block_size == 0:
@@ -197,16 +197,12 @@ def _paged_block_size(vllm_config: VllmConfig, compress_ratio: int) -> int:
     raise ValueError(
         f"DeepSeek-V4: --block-size {block_size} and the "
         f"ratio-{compress_ratio} cache's "
-        f"{unit}-token unit ({DSV4_MIN_BLOCK_ENTRIES} entries a block) do not divide"
+        f"{unit}-token unit ({entries} entries a block) do not divide"
     )
 
 
 class RBLNDeepseekV4PagedCache(nn.Module, AttentionLayerBase):
-    """A paged cache of compressed entries (``block_size / r`` a block): the compressed
-    KV
-    (768-byte KV8 rows) or the indexer key (fp8). Every paged cache is in one attention
-    group
-    (one block table), so all take the cache config's block size."""
+    """Compressed KV8 entries or fp8 indexer keys, grouped by token block size."""
 
     def __init__(
         self,
@@ -227,11 +223,6 @@ class RBLNDeepseekV4PagedCache(nn.Module, AttentionLayerBase):
         self.layer_index = _cache_ordinal(layer_id, slot)
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        # The CP kernels cut a block into 4 shards of whole 64-entry chunks: at least
-        # 256
-        # entries a block. An HCA cache (ratio 128) takes 32768-token blocks, past
-        # RBLN's
-        # --block-size cap, so it is an attention group of its own.
         block_size = _paged_block_size(vllm_config, self.compress_ratio)
         return MLAAttentionSpec(
             block_size=block_size,

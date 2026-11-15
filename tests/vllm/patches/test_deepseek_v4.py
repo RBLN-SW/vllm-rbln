@@ -28,6 +28,23 @@ from vllm_rbln.patches.deepseek_v4 import deepseek_v4_kv_cache_groups
 from vllm_rbln.v1.attention.backends.deepseek_v4 import RBLNDeepseekV4StateSpec
 
 
+def test_prefix_caching_requires_ring_checkpoints():
+    from vllm.model_executor.models.config import MODELS_CONFIG_MAP
+
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(architecture="DeepseekV4ForCausalLM"),
+        cache_config=SimpleNamespace(
+            enable_prefix_caching=True,
+            mamba_cache_mode="none",
+            mamba_block_size=None,
+            block_size=2048,
+        ),
+        scheduler_config=SimpleNamespace(enable_chunked_prefill=True),
+    )
+    with pytest.raises(ValueError, match="ring-state checkpoint"):
+        MODELS_CONFIG_MAP["DeepseekV4ForCausalLM"].verify_and_update_config(config)
+
+
 @pytest.mark.parametrize("layers", [2, 3])
 def test_pp_replan_preserves_reconciled_block_count(layers):
     config = SimpleNamespace(

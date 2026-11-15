@@ -18,6 +18,17 @@ import pytest
 import torch
 
 
+@pytest.mark.parametrize(
+    "block_size,ratio,expected",
+    [(2048, 4, 2048), (2048, 128, 8192), (8192, 128, 8192), (16384, 128, 16384)],
+)
+def test_paged_block_size_follows_the_cache_shard_contract(block_size, ratio, expected):
+    from vllm_rbln.model_executor.models.deepseek_v4 import _paged_block_size
+
+    config = SimpleNamespace(cache_config=SimpleNamespace(block_size=block_size))
+    assert _paged_block_size(config, ratio) == expected
+
+
 @pytest.mark.parametrize("target_layers", [6, 43])
 def test_mtp_compression_uses_checkpoint_tail(target_layers):
     from vllm_rbln.model_executor.models.deepseek_v4 import _compress_ratio

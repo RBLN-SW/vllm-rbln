@@ -75,7 +75,15 @@ def register_deepseek_v4_mamba_config() -> None:
     )
 
     class RBLNDeepseekV4Config(DeepseekV4ForCausalLMConfig, MambaModelConfig):
-        pass
+        @classmethod
+        def verify_and_update_config(cls, vllm_config) -> None:
+            if vllm_config.cache_config.enable_prefix_caching:
+                raise ValueError(
+                    "DeepSeek-V4 prefix caching requires ring-state checkpoint "
+                    "copies, which are not supported on RBLN yet. "
+                    "Use --no-enable-prefix-caching."
+                )
+            super().verify_and_update_config(vllm_config)
 
     MODELS_CONFIG_MAP["DeepseekV4ForCausalLM"] = RBLNDeepseekV4Config
 

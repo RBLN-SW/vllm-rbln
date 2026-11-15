@@ -12,23 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""DeepSeek-V4 (CSA / HCA / SWA) cache backends for RBLN. KV8 only.
+"""DeepSeek-V4 KV8 cache backends for CSA, HCA and SWA.
 
-Per decoder layer (``compress_ratio`` 0 / 4 / 128):
-
-* SWA ring every layer ``[N, window, 768]`` u8, one slot per request * compressed
-KV CSA, HCA paged ``[NB, block / r, 768]`` u8 * indexer key CSA paged ``[NB, block
-/ 4, 128]`` fp8 + ``[.., 1]`` f16 scale * compressor state CSA, HCA ``[N, W, 2C]``
-f32 ring, one slot per request (and a second one for the CSA indexer's compressor)
-
-The 768-byte row is ``rbln_custom_ops``' KV8 row (``sparse_attn_deepseek_v4_csa``
-/ ``_hca``). The ring caches use ``RBLNSlidingWindowSpec`` (one block per request,
-prefix caching off); the paged ones ``MLAAttentionSpec`` with ``compress_ratio``
-(a block of ``block_size`` tokens stores ``block_size / r`` entries). All reuse
-``RBLNFlashAttentionMetadataBuilder``: the kernels take its ``seq_lens`` (cache
-position) and ``block_tables``, and the ring ones its ``local_block_tables`` and
-``cache_seq_lens`` / ``cache_offsets`` (their difference is the step's query
-length)."""
+Paged caches use MLAAttentionSpec: compressed KV rows are 768 bytes, indexer
+keys are 128 fp8 values, and each block holds block_size / compress_ratio rows.
+The indexer scale is a block auxiliary. SWA and compressor rings use MambaSpec
+with one state per request; prefix checkpoint copies are not supported yet.
+GLM-5.3 metadata supplies block tables, positions and state slots.
+"""
 
 from typing import ClassVar
 
