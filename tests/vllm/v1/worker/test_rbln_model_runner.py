@@ -1387,6 +1387,7 @@ class TestDummyRunPadding:
 
         def stage(**kwargs):
             captured["layout"] = kwargs["layout"]
+            captured["positions"] = kwargs["positions"]
             return SimpleNamespace(as_kwargs=lambda: {})
 
         # Two buckets, so a padded count can differ from a raw one at all.
@@ -1475,6 +1476,16 @@ class TestDummyRunPadding:
         runner, captured = self._runner(monkeypatch, reqs_across_dp=[1, 1, 1, 1])
         runner._dummy_run(1, 1, is_prefill=False, warmup=False)
         assert captured["layout"].shape != warmed
+
+    def test_an_mrope_model_gets_positions_on_three_axes(self, monkeypatch):
+        # The graph an M-RoPE model warms up takes [3, batch, seq] positions.
+        runner, captured = self._runner(monkeypatch, reqs_across_dp=[1, 1, 1, 1])
+        runner._dummy_run(1, 4, is_prefill=True)
+        assert captured["positions"].shape == (1, 4)
+
+        runner.mrope_positions = torch.zeros(3, 128, dtype=torch.int64)
+        runner._dummy_run(1, 4, is_prefill=True)
+        assert captured["positions"].shape == (3, 1, 4)
 
     def test_warmup_pin_is_the_token_dimension(self, monkeypatch):
         # Warm-up dictates the dimension it wants compiled -- the group agreement
