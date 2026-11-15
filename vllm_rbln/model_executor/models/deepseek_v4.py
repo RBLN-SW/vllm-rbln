@@ -176,6 +176,7 @@ class RBLNDeepseekV4RingCache(nn.Module, AttentionLayerBase):
         # Preserve rollback history with the kernels' power-of-two ring geometry.
         capacity = 1 << (self.window + drafts - 1).bit_length()
         return RBLNDeepseekV4StateSpec(
+            num_state_slots=vllm_config.scheduler_config.max_num_seqs + 1,
             block_size=vllm_config.cache_config.mamba_block_size,
             shapes=((capacity, self.width),),
             dtypes=(self.dtype,),

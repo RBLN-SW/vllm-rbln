@@ -196,8 +196,8 @@ def _build_deepseek_v4_kv_cache_groups():
     target="vllm.v1.core.kv_cache_utils._get_kv_cache_bytes_per_block",
     reason=(
         "Upstream's largest-group estimate cannot represent DeepSeek-V4's "
-        "separate per-layer regions. PP block-count reconciliation and dynamic "
-        "KV sizing need the sum of layer pages used by the config builder."
+        "separate per-layer regions. PP reconciliation needs a linear initial "
+        "estimate; dynamic KV sizing measures the smaller fixed state allocations."
     ),
     build=True,
 )
@@ -237,6 +237,9 @@ def _build_deepseek_v4_kv_cache_config():
     from vllm.v1.core import kv_cache_utils
     from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheTensor
 
+    from vllm_rbln.v1.attention.backends.deepseek_v4 import RBLNDeepseekV4StateSpec
+    from vllm_rbln.v1.kv_cache import RBLNFixedKVCacheTensor
+
     original = kv_cache_utils.get_kv_cache_config_from_groups
 
     @functools.wraps(original)
@@ -248,23 +251,44 @@ def _build_deepseek_v4_kv_cache_config():
         )
         if pages is None:
             return original(vllm_config, kv_cache_groups, available_memory)
+        # PP reconciliation reconstructs a count from N * bytes_per_block.
+        # Keep that conservative initial estimate; dynamic KV sizing reclaims
+        # the difference after measuring fixed state and paged allocations.
         bytes_per_block = sum(page for _, page in pages)
         num_blocks = kv_cache_utils.may_override_num_blocks(
             vllm_config, available_memory // bytes_per_block
         )
-        size = bytes_per_block * num_blocks
+        state_slots = {
+            name: group.kv_cache_spec.num_state_slots
+            for group in kv_cache_groups
+            if isinstance(group.kv_cache_spec, RBLNDeepseekV4StateSpec)
+            for name in group.layer_names
+        }
+        size = sum(page * state_slots.get(name, num_blocks) for name, page in pages)
+        if (
+            vllm_config.cache_config.num_gpu_blocks_override is None
+            and size > available_memory
+        ):
+            raise ValueError(
+                "DeepSeek-V4 fixed state slots exceed the available KV budget; "
+                "reduce max_num_seqs or increase the KV memory budget."
+            )
         tensors, offset = [], 0
         for name, page in pages:
+            extent = page * state_slots.get(name, num_blocks)
+            tensor_type = (
+                RBLNFixedKVCacheTensor if name in state_slots else KVCacheTensor
+            )
             tensors.append(
-                KVCacheTensor(
+                tensor_type(
                     size=size,
                     layers=[name],
-                    layer_stride=page * num_blocks,
+                    layer_stride=extent,
                     block_stride=page,
                     offset=offset,
                 )
             )
-            offset += page * num_blocks
+            offset += extent
         return KVCacheConfig(
             num_blocks=num_blocks,
             kv_cache_tensors=tensors,

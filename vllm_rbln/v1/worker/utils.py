@@ -565,6 +565,19 @@ def rescale_kv_cache_config(cfg: KVCacheConfig, num_blocks: int) -> None:
     if old_num_blocks <= 0:
         raise ValueError(f"cannot rescale a KV cache config of {old_num_blocks} blocks")
     cfg.num_blocks = num_blocks
+    from vllm_rbln.v1.kv_cache import RBLNFixedKVCacheTensor
+
+    if any(isinstance(t, RBLNFixedKVCacheTensor) for t in cfg.kv_cache_tensors):
+        offset = 0
+        for tensor in cfg.kv_cache_tensors:
+            assert len(tensor.layers) == 1
+            if not isinstance(tensor, RBLNFixedKVCacheTensor):
+                tensor.layer_stride = tensor.block_stride * num_blocks
+            tensor.offset = offset
+            offset += tensor.layer_stride
+        for tensor in cfg.kv_cache_tensors:
+            tensor.size = offset
+        return
     for kv_tensor in cfg.kv_cache_tensors:
         kv_tensor.size = (kv_tensor.size * num_blocks) // old_num_blocks
         kv_tensor.layer_stride = (kv_tensor.layer_stride * num_blocks) // old_num_blocks

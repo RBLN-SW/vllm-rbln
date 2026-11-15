@@ -21,6 +21,7 @@ with one state per request; prefix checkpoint copies are not supported yet.
 GLM-5.3 metadata supplies block tables, positions and state slots.
 """
 
+from dataclasses import dataclass
 from typing import ClassVar
 
 import torch
@@ -35,8 +36,11 @@ DSV4_KV8_ROW_BYTES = 768
 DSV4_INDEX_HEAD_DIM = 128
 
 
+@dataclass(frozen=True, kw_only=True)
 class RBLNDeepseekV4StateSpec(MambaSpec):
-    """A ring state allocated separately from every other layer's cache."""
+    """A ring on a bounded state pool, independent of paged attention IDs."""
+
+    num_state_slots: int
 
 
 class _RBLNDeepseekV4CacheBackend(AttentionBackend):

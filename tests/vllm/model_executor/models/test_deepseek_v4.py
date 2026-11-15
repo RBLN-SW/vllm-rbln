@@ -39,6 +39,7 @@ def test_ring_capacity_preserves_history_across_rejected_drafts(history, drafts)
     ring.window, ring.width, ring.dtype = history, 768, torch.uint8
     config = SimpleNamespace(
         cache_config=SimpleNamespace(mamba_block_size=1048576, mamba_cache_mode="none"),
+        scheduler_config=SimpleNamespace(max_num_seqs=2),
         speculative_config=SimpleNamespace(num_speculative_tokens=drafts)
         if drafts
         else None,
