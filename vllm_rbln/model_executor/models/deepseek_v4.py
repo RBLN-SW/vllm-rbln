@@ -27,6 +27,7 @@ from itertools import islice
 
 import torch
 import torch.nn.functional as F
+from rebel.ops.torch_custom_ops.mhc import mhc_post, mhc_pre
 from torch import nn
 from transformers import PretrainedConfig
 from vllm.config import VllmConfig, get_current_vllm_config
@@ -1035,27 +1036,19 @@ class RBLNDeepseekV4DecoderLayer(nn.Module):
     def _sublayer(
         self, streams, fn, scale, base, norm, sublayer, *args
     ) -> torch.Tensor:
-        """streams [B, n, T, H]: mix the n streams into the sublayer's input, run it,
-        and add its
-        output back into the streams (the reference hc_pre / hc_post; the RMS norm of
-        the
-        flattened streams before the mix projection is the same as V4's rsqrt after
-        it)."""
-        batch, n, tokens, hidden = streams.shape
-        flat = streams.transpose(1, 2).reshape(batch, tokens, n * hidden).float()
-        flat = flat * torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.norm_eps)
-        z = F.linear(flat, fn) * scale + base
-        z_pre, z_post = z[..., :n], z[..., n : 2 * n]
-        comb = torch.ops.rbln_custom_ops.sinkhorn_normalize(
-            z[..., 2 * n :], iters=self.hc_iters, eps=self.hc_eps
-        )
-        streams_f32 = streams.float()
-        x = torch.ops.rbln_custom_ops.hc_stream_reduce(
-            streams_f32, z_pre, eps=self.hc_eps
+        """Run a sublayer with token-cut mHC for prefill chunks."""
+        x, state = mhc_pre(
+            streams,
+            fn,
+            scale,
+            base,
+            rms_eps=self.norm_eps,
+            hc_eps=self.hc_eps,
+            iters=self.hc_iters,
         )
         x = sublayer(norm(x.to(streams.dtype)), *args)
-        return torch.ops.rbln_custom_ops.hc_residual_add(
-            x.float(), streams_f32, z_post, comb, post_mult=2.0
+        return mhc_post(
+            x, state, post_mult=2.0, iters=self.hc_iters, hc_eps=self.hc_eps
         ).to(streams.dtype)
 
     def forward(
