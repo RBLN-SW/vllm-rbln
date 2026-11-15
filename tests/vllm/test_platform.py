@@ -759,6 +759,24 @@ class TestRejectedConfigs:
         with pytest.raises(ValueError, match="four chiplets"):
             reconfigure(six_heads)
 
+    def test_mrope_models_are_rejected(self, reconfigure, monkeypatch):
+        from vllm.config import ModelConfig
+
+        monkeypatch.setattr(ModelConfig, "uses_mrope", property(lambda self: True))
+        with pytest.raises(ValueError, match="M-RoPE"):
+            reconfigure(lambda config: None)
+
+    def test_mrope_is_allowed_for_qwen3_5(self, reconfigure, gdn, monkeypatch):
+        from vllm.config import ModelConfig
+
+        monkeypatch.setattr(ModelConfig, "uses_mrope", property(lambda self: True))
+
+        def qwen3_5(config):
+            gdn(config)
+            config.model_config.hf_text_config.model_type = "qwen3_5_text"
+
+        reconfigure(qwen3_5)
+
     def test_chunked_prefill_off(self, reconfigure):
         with pytest.raises(ValueError, match="chunked prefill"):
             reconfigure(

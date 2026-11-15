@@ -212,6 +212,15 @@ def _validate(vllm_config: "VllmConfig") -> None:
             "rules cover the dense Qwen3.5 models only."
         )
     if (
+        model_config.uses_mrope
+        and getattr(text_config, "model_type", None) != "qwen3_5_text"
+    ):
+        # The RBLN M-RoPE forward has run on Qwen3.5 only.
+        raise ValueError(
+            "M-RoPE models other than Qwen3.5 (e.g. the Qwen2-VL family) are not "
+            "supported on the RBLN vLLM path yet. Use the optimum path."
+        )
+    if (
         getattr(text_config, "sparse_attention_config", None)
         and model_config.dtype != torch.bfloat16
     ):
