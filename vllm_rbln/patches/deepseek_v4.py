@@ -159,6 +159,42 @@ def _build_deepseek_v4_kv_cache_groups():
 
 
 @register_patch(
+    target="vllm.v1.core.kv_cache_utils._get_kv_cache_bytes_per_block",
+    reason=(
+        "The RBLN DeepSeek-V4 config (get_kv_cache_config_from_groups below) "
+        "gives every layer its own region, so a block costs the sum of every "
+        "layer's page, not upstream's largest group. get_kv_cache_configs "
+        "re-plans the PP stages at min_num_blocks * this, and the dynamic KV "
+        "sizer sizes the pool with it: both must use the bytes the config "
+        "divides by."
+    ),
+    build=True,
+)
+def _build_deepseek_v4_bytes_per_block():
+    import torch
+    from vllm.v1.core import kv_cache_utils
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    original = kv_cache_utils._get_kv_cache_bytes_per_block
+
+    @functools.wraps(original)
+    def _get_kv_cache_bytes_per_block(kv_cache_groups):
+        # no vllm_config here: the V4 groups are told by their uint8 SWA ring
+        # (every V4 layer has one; GLM-5.3's states are not uint8)
+        v4 = any(
+            isinstance(g.kv_cache_spec, MambaSpec)
+            and torch.uint8 in g.kv_cache_spec.dtypes
+            for g in kv_cache_groups
+        )
+        pages = _deepseek_v4_pages(kv_cache_groups) if v4 else None
+        if pages is None:
+            return original(kv_cache_groups)
+        return sum(page for _, page in pages)
+
+    return _get_kv_cache_bytes_per_block
+
+
+@register_patch(
     target="vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups",
     reason=(
         "The RBLN DeepSeek-V4 groups (deepseek_v4_kv_cache_groups) give every layer its own "

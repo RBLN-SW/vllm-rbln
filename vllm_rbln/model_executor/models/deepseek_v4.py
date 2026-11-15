@@ -94,6 +94,7 @@ from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
     is_pp_missing_parameter,
+    make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
 )
@@ -1226,14 +1227,20 @@ class RBLNDeepseekV4Model(nn.Module):
         self.hc_mult = config.hc_mult
         self.hc_eps = config.hc_eps
         self.norm_eps = config.rms_norm_eps
-        if get_pp_group().world_size > 1:
-            raise NotImplementedError("RBLN DeepSeek-V4 does not support PP yet")
-
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=quant_config,
-            prefix=f"{prefix}.embed_tokens",
+        # PP: the first stage embeds, a stage hands the next its streams [B, n, T, H]
+        # as [B, T, n * H] ("streams"), the last returns them flat (the hc head runs in
+        # compute_logits); each stage's caches are its own layers' (_cache_ordinal)
+        if get_pp_group().is_first_rank:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=f"{prefix}.embed_tokens",
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
+        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
+            ["streams"], config.hc_mult * config.hidden_size
         )
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
@@ -1263,16 +1270,27 @@ class RBLNDeepseekV4Model(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        h = (
-            inputs_embeds
-            if inputs_embeds is not None
-            else self.embed_input_ids(input_ids)
-        )
-        batch, tokens, hidden = h.shape
-        streams = (
-            h.unsqueeze(1).expand(batch, self.hc_mult, tokens, hidden).contiguous()
-        )
+    ) -> torch.Tensor | IntermediateTensors:
+        if get_pp_group().is_first_rank:
+            h = (
+                inputs_embeds
+                if inputs_embeds is not None
+                else self.embed_input_ids(input_ids)
+            )
+            batch, tokens, hidden = h.shape
+            streams = (
+                h.unsqueeze(1).expand(batch, self.hc_mult, tokens, hidden).contiguous()
+            )
+        else:
+            assert intermediate_tensors is not None
+            flat_in = intermediate_tensors["streams"]
+            batch, tokens, _ = flat_in.shape
+            hidden = flat_in.shape[-1] // self.hc_mult
+            streams = (
+                flat_in.view(batch, tokens, self.hc_mult, hidden)
+                .transpose(1, 2)
+                .contiguous()
+            )
         # islice, not a slice: slicing a ModuleList builds a new one while tracing, and
         # Dynamo
         # then lifts every layer weight as a graph input instead of keeping it a
@@ -1285,7 +1303,10 @@ class RBLNDeepseekV4Model(nn.Module):
         # [B, n, T, H] -> [B, T, n * H]: the pre-hc_head streams, which the MTP head
         # takes as
         # its previous hidden states; compute_logits runs the hc head and the norm
-        return streams.transpose(1, 2).reshape(batch, tokens, self.hc_mult * hidden)
+        flat = streams.transpose(1, 2).reshape(batch, tokens, self.hc_mult * hidden)
+        if not get_pp_group().is_last_rank:
+            return IntermediateTensors({"streams": flat})
+        return flat
 
     def head_hidden(self, flat_streams: torch.Tensor) -> torch.Tensor:
         """[..., n * H] flat streams -> [..., H]: the hc head and the final norm."""
@@ -1332,13 +1353,19 @@ class RBLNDeepseekV4ForCausalLM(nn.Module, SupportsPP):
         self.model = RBLNDeepseekV4Model(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=None,
-            prefix=maybe_prefix(prefix, "lm_head"),
-        )
+        if get_pp_group().is_last_rank:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=None,
+                prefix=maybe_prefix(prefix, "lm_head"),
+            )
+        else:
+            self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config.vocab_size)
+        self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
+            self.model.make_empty_intermediate_tensors
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -1539,11 +1566,17 @@ class RBLNDeepseekV4MTP(nn.Module):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         start = self.config.num_hidden_layers
 
+        own_embed = get_pp_group().world_size > 1
+
         def mtp_only():
             # `mtp.{i}.x` -> `layers.{start + i}.x` (its final norm ->
-            # shared_head.norm); the
-            # target's weights (and lm_head / embed, shared) are not the draft's
+            # shared_head.norm). The target's weights are not the draft's, and its
+            # lm_head / embedding are shared -- except the embedding under PP, which
+            # sits on the first stage, not on the drafter's (the last).
             for name, weight in weights:
+                if own_embed and name == "embed.weight":
+                    yield name, weight
+                    continue
                 if not name.startswith("mtp."):
                     continue
                 _, idx, rest = name.split(".", 2)
