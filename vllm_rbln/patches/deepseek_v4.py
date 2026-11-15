@@ -188,18 +188,16 @@ def _build_deepseek_v4_kv_cache_groups():
     build=True,
 )
 def _build_deepseek_v4_bytes_per_block():
-    import torch
     from vllm.v1.core import kv_cache_utils
-    from vllm.v1.kv_cache_interface import MambaSpec
+
+    from vllm_rbln.v1.attention.backends.deepseek_v4 import RBLNDeepseekV4StateSpec
 
     original = kv_cache_utils._get_kv_cache_bytes_per_block
 
     @functools.wraps(original)
     def _get_kv_cache_bytes_per_block(kv_cache_groups):
-        # This API has no model config; V4's SWA rings are uint8 Mamba states.
         v4 = any(
-            isinstance(g.kv_cache_spec, MambaSpec)
-            and torch.uint8 in g.kv_cache_spec.dtypes
+            isinstance(g.kv_cache_spec, RBLNDeepseekV4StateSpec)
             for g in kv_cache_groups
         )
         pages = _deepseek_v4_pages(kv_cache_groups) if v4 else None

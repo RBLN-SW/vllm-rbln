@@ -17,9 +17,15 @@ from types import SimpleNamespace
 import pytest
 import torch
 from vllm.v1.core import kv_cache_utils
-from vllm.v1.kv_cache_interface import KVCacheGroupSpec, MambaSpec, MLAAttentionSpec
+from vllm.v1.kv_cache_interface import (
+    KVCacheGroupSpec,
+    MambaSpec,
+    MLAAttentionSpec,
+    UniformTypeKVCacheSpecs,
+)
 
 from vllm_rbln.patches.deepseek_v4 import deepseek_v4_kv_cache_groups
+from vllm_rbln.v1.attention.backends.deepseek_v4 import RBLNDeepseekV4StateSpec
 
 
 @pytest.mark.parametrize("layers", [2, 3])
@@ -37,7 +43,7 @@ def test_pp_replan_preserves_reconciled_block_count(layers):
         specs[f"layers.{layer}.attn"] = MLAAttentionSpec(
             block_size=16, num_kv_heads=1, head_size=32, dtype=torch.uint8
         )
-        specs[f"layers.{layer}.ring"] = MambaSpec(
+        specs[f"layers.{layer}.ring"] = RBLNDeepseekV4StateSpec(
             block_size=16, shapes=((8, 32),), dtypes=(torch.uint8,)
         )
     groups = deepseek_v4_kv_cache_groups(config, specs)
@@ -48,12 +54,40 @@ def test_pp_replan_preserves_reconciled_block_count(layers):
     assert sum(t.layer_stride for t in replanned.kv_cache_tensors) == memory
 
 
-def test_non_v4_states_keep_upstream_block_accounting():
-    spec = MambaSpec(block_size=16, shapes=((8, 32),), dtypes=(torch.bfloat16,))
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.uint8])
+def test_non_v4_states_keep_upstream_block_accounting(dtype):
+    spec = MambaSpec(block_size=16, shapes=((8, 32),), dtypes=(dtype,))
     groups = [
         KVCacheGroupSpec(["layer.0", "layer.1"], spec),
         KVCacheGroupSpec(["layer.2"], spec),
     ]
     assert (
         kv_cache_utils._get_kv_cache_bytes_per_block(groups) == 2 * spec.page_size_bytes
+    )
+
+
+def test_glm_states_do_not_add_to_the_shared_attention_pool():
+    specs = {
+        "mla": MLAAttentionSpec(
+            block_size=16, num_kv_heads=1, head_size=32, dtype=torch.uint8
+        ),
+        "indexer": MLAAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=16,
+            dtype=torch.uint8,
+            tokens_per_state=4,
+        ),
+    }
+    uniform = UniformTypeKVCacheSpecs.from_specs(specs)
+    assert uniform is not None
+    groups = [
+        KVCacheGroupSpec(list(specs), uniform),
+        KVCacheGroupSpec(
+            ["kda"],
+            MambaSpec(block_size=16, shapes=((16, 32),), dtypes=(torch.uint8,)),
+        ),
+    ]
+    assert kv_cache_utils._get_kv_cache_bytes_per_block(groups) == sum(
+        spec.page_size_bytes for spec in specs.values()
     )

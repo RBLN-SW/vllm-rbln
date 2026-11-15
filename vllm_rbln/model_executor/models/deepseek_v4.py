@@ -69,7 +69,7 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.models.deepseek_v4.nvidia.model import _make_deepseek_v4_weights_mapper
 from vllm.sequence import IntermediateTensors
-from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec, MLAAttentionSpec
+from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
 from vllm_rbln.logger import init_logger
 from vllm_rbln.patches.attention import _resolve_kv_cache
@@ -77,6 +77,7 @@ from vllm_rbln.v1.attention.backends.deepseek_v4 import (
     DSV4_INDEX_HEAD_DIM,
     DSV4_KV8_ROW_BYTES,
     RBLNDeepseekV4RingBackend,
+    RBLNDeepseekV4StateSpec,
     dsv4_paged_backend,
 )
 from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
@@ -173,7 +174,7 @@ class RBLNDeepseekV4RingCache(nn.Module, AttentionLayerBase):
         self.layer_index = _cache_ordinal(layer_id, slot)
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        return MambaSpec(
+        return RBLNDeepseekV4StateSpec(
             block_size=vllm_config.cache_config.mamba_block_size,
             shapes=((self.window, self.width),),
             dtypes=(self.dtype,),

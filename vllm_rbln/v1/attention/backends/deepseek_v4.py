@@ -34,6 +34,7 @@ from typing import ClassVar
 
 import torch
 from vllm.v1.attention.backend import AttentionBackend, MultipleOf
+from vllm.v1.kv_cache_interface import MambaSpec
 
 from .flash_attention import RBLNFlashAttentionMetadataBuilder
 from .glm5_next import RBLNGlm5NextMetadataBuilder
@@ -41,6 +42,10 @@ from .glm5_next import RBLNGlm5NextMetadataBuilder
 # The packed KV8 row: 448 fp8 nope | 64 pad | 64 f16 scale lanes | 64 bf16 rope.
 DSV4_KV8_ROW_BYTES = 768
 DSV4_INDEX_HEAD_DIM = 128
+
+
+class RBLNDeepseekV4StateSpec(MambaSpec):
+    """A ring state allocated separately from every other layer's cache."""
 
 
 class _RBLNDeepseekV4CacheBackend(AttentionBackend):
