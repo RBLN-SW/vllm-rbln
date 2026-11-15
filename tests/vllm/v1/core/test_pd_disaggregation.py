@@ -108,6 +108,17 @@ class TestAwaitingRemoteKV:
         assert req.status == RequestStatus.WAITING_FOR_REMOTE_KVS
         assert out2.num_scheduled_tokens == {}
 
+    def test_async_load_parks_under_mamba_block_aligned_split(self):
+        # Prefix caching on a hybrid model turns the Mamba split on. The async
+        # load schedules no tokens, so the split must not gate it.
+        sched = _scheduler(matched_tokens=BLOCK_SIZE)
+        sched.need_mamba_block_aligned_split = True
+        req = _remote_request("0")
+        out = _park_awaiting_remote_kv(sched, req)
+
+        assert out.num_scheduled_tokens == {}
+        assert list(sched.kv_holding_waiting) == [req]
+
 
 class TestPartialMatchRemainder:
     def test_remainder_runs_alone_evicting_decodes_then_reaches_decode(self):

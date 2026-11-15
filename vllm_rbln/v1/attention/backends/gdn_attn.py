@@ -132,6 +132,7 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
         is_prompt_sorted: bool = False,
         num_accepted: torch.Tensor | None = None,
         state_load_pos: torch.Tensor | None = None,
+        mm_prefix_row_ends: torch.Tensor | None = None,
         query_len_padded: int | None = None,
     ) -> RBLNGDNAttentionMetadata:
         assert num_accepted is None and state_load_pos is None, (

@@ -95,6 +95,7 @@ class RBLNGlm5NextMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
         is_prompt_sorted: bool = False,
         num_accepted: torch.Tensor | None = None,
         state_load_pos: torch.Tensor | None = None,
+        mm_prefix_row_ends: torch.Tensor | None = None,
         query_len_padded: int | None = None,
     ) -> RBLNFlashAttentionMetadata:
         metadata = super().build(
@@ -106,6 +107,7 @@ class RBLNGlm5NextMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
             back_pad=back_pad,
             is_prompt_sorted=is_prompt_sorted,
             num_accepted=num_accepted,
+            mm_prefix_row_ends=mm_prefix_row_ends,
         )
         num_reqs = common_attn_metadata.num_reqs
         query_start_loc = common_attn_metadata.query_start_loc
