@@ -42,6 +42,7 @@ from vllm.model_executor.models.gemma4_mm import (
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.parse import MultiModalDataItems
 from vllm.sequence import IntermediateTensors
+from vllm.utils.math_utils import round_up
 
 from vllm_rbln.model_executor.models.interfaces import (
     SupportsRBLNMmPrefix,
@@ -278,7 +279,22 @@ class RBLNGemma4ForConditionalGeneration(
                 "Gemma4 variants with per-layer inputs (E2B, E4B) are not "
                 "supported on RBLN yet."
             )
-        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        # Padded gate/up rows are zero, so gelu(0) * 0 meets zero down columns.
+        # The config is shared, so the padded width lives only while building.
+        mlp_width = text_config.intermediate_size
+        padded = mlp_width
+        if multiple := vllm_config.additional_config.gemma4_mlp_pad_multiple:
+            if vllm_config.quant_config is not None:
+                raise NotImplementedError(
+                    "gemma4_mlp_pad_multiple pads weights, not quantization scales."
+                )
+            padded = round_up(mlp_width, multiple)
+        text_config.intermediate_size = padded
+        try:
+            super().__init__(vllm_config=vllm_config, prefix=prefix)
+        finally:
+            text_config.intermediate_size = mlp_width
+        self.mlp_widths = (mlp_width, padded)
         self.mm_prefix_attn_layers: list[nn.Module] = []
         for module in self.modules():
             if (
@@ -340,6 +356,15 @@ class RBLNGemma4ForConditionalGeneration(
                     else:
                         downs[key] = w
                         continue
+                width, padded = self.mlp_widths
+                if "language_model" in name and width != padded:
+                    # A double-wide layer pads to twice the padded width.
+                    if name.endswith(("mlp.gate_proj.weight", "mlp.up_proj.weight")):
+                        w = F.pad(
+                            w, (0, 0, 0, padded * w.shape[0] // width - w.shape[0])
+                        )
+                    elif name.endswith("mlp.down_proj.weight"):
+                        w = F.pad(w, (0, padded * w.shape[1] // width - w.shape[1]))
                 yield name, w
             assert not downs, f"no per_expert_scale for {sorted(downs)}"
 

@@ -170,6 +170,11 @@ class RBLNConfig(RBLNConfigBase):
     """dtype the compiled graphs run in on the device. Empty keeps the
     compiler's per-target default."""
 
+    gemma4_mlp_pad_multiple: int | None = Field(default=None, gt=0)
+    """Gemma4 only: zero-pad the MLP intermediate size up to a multiple of this,
+    so that every DNC of a chiplet gets an equal slice of each MLP weight and
+    the weight loads straight into the DNCs."""
+
     def compute_hash(self) -> str:
         """Hash of the fields that change the compiled artifact.
 

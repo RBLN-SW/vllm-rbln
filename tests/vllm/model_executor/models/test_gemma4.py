@@ -216,11 +216,14 @@ def _built_model(monkeypatch, *, cap, budgets, per_layer_input=0, attention_laye
                 max_model_len=32768,
                 hf_config=SimpleNamespace(
                     text_config=SimpleNamespace(
-                        hidden_size_per_layer_input=per_layer_input
+                        hidden_size_per_layer_input=per_layer_input,
+                        intermediate_size=64,
                     )
                 ),
             ),
-            additional_config=SimpleNamespace(encoder_token_budgets=budgets),
+            additional_config=SimpleNamespace(
+                encoder_token_budgets=budgets, gemma4_mlp_pad_multiple=None
+            ),
         )
     )
     return model
@@ -289,7 +292,7 @@ def test_each_expert_down_projection_is_scaled_once(monkeypatch, scale_first):
     other = (prefix + "experts.gate_up_proj", torch.ones(2, 10, 4))
     weights = [scale, down, other] if scale_first else [down, other, scale]
 
-    _bare_model().load_weights(weights)
+    _bare_model(mlp_widths=(4, 4)).load_weights(weights)
 
     torch.testing.assert_close(
         loaded[down[0]], torch.ones(2, 4, 5) * torch.tensor([2.0, 3.0]).view(-1, 1, 1)
@@ -594,3 +597,69 @@ def test_prefix_mask_block_boundaries(start):
         keys[None, :] > (rows - 1024)[:, None]
     )
     torch.testing.assert_close(mask[0, 0], expected.to(mask.dtype), rtol=0, atol=0)
+
+
+def _padding_config(text_config, quant_config=None):
+    return SimpleNamespace(
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        speculative_config=None,
+        quant_config=quant_config,
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(text_config=text_config)
+        ),
+        additional_config=SimpleNamespace(gemma4_mlp_pad_multiple=16),
+    )
+
+
+def test_the_mlp_is_built_at_the_padded_width(monkeypatch):
+    text_config = SimpleNamespace(intermediate_size=20)
+    vllm_config = _padding_config(text_config)
+    built = []
+
+    def upstream_init(self, *, vllm_config, prefix):
+        built.append(text_config.intermediate_size)
+        raise StopIteration
+
+    monkeypatch.setattr(Gemma4ForConditionalGeneration, "__init__", upstream_init)
+    with pytest.raises(StopIteration):
+        RBLNGemma4ForConditionalGeneration(vllm_config=vllm_config)
+    assert built == [32]
+    assert text_config.intermediate_size == 20
+
+
+def test_padding_a_quantized_checkpoint_is_refused():
+    vllm_config = _padding_config(SimpleNamespace(intermediate_size=20), object())
+    with pytest.raises(NotImplementedError, match="quantization scales"):
+        RBLNGemma4ForConditionalGeneration(vllm_config=vllm_config)
+
+
+def test_mlp_weights_are_zero_padded_to_the_built_width(monkeypatch):
+    loaded = {}
+    monkeypatch.setattr(
+        Gemma4ForConditionalGeneration,
+        "load_weights",
+        lambda self, weights: loaded.update(weights) or set(loaded),
+    )
+    model = _bare_model(mlp_widths=(2, 4))
+    prefix = "model.language_model.layers.0.mlp."
+    wide = "model.language_model.layers.1.mlp."  # a double-wide layer
+    gate, down = torch.ones(2, 3), torch.ones(3, 2)
+    vision = torch.ones(2, 3)
+    model.load_weights(
+        [
+            (prefix + "gate_proj.weight", gate),
+            (prefix + "down_proj.weight", down),
+            (wide + "up_proj.weight", torch.ones(4, 3)),
+            (wide + "down_proj.weight", torch.ones(3, 4)),
+            ("model.vision_tower.encoder.layers.0.mlp.gate_proj.weight", vision),
+        ]
+    )
+    assert loaded[wide + "up_proj.weight"].shape == (8, 3)
+    assert loaded[wide + "down_proj.weight"].shape == (3, 8)
+    assert torch.equal(
+        loaded[prefix + "gate_proj.weight"], torch.cat([gate, torch.zeros(2, 3)])
+    )
+    assert torch.equal(
+        loaded[prefix + "down_proj.weight"], torch.cat([down, torch.zeros(3, 2)], 1)
+    )
+    assert loaded["model.vision_tower.encoder.layers.0.mlp.gate_proj.weight"] is vision
