@@ -126,7 +126,7 @@ class RBLNQwen3_5ForConditionalGeneration(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loaded = super().load_weights(weights)
         # The checkpoint's [q | k | v] rows in key-head groups, the order the
-        # GatedDeltaNet conv runs them in (patches/qwen3_next).
+        # GatedDeltaNet conv runs them in (RBLNQwenGatedDeltaNetAttention).
         for layer in self.language_model.model.layers:
             attn = getattr(layer, "linear_attn", None)
             if attn is None:

@@ -27,7 +27,7 @@ from vllm.v1.kv_cache_interface import MambaSpec
 
 import vllm_rbln.v1.worker.rbln_model_runner as mr
 from tests.vllm.v1.worker.utils import make_kv_cache_config, schedule_new
-from vllm_rbln.patches.qwen3_next import (
+from vllm_rbln.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     RBLNGDNConvRingCache,
     RBLNQwenGatedDeltaNetAttention,
 )
