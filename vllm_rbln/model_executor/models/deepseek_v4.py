@@ -315,9 +315,7 @@ def _ring_inputs(cache: RBLNDeepseekV4RingCache) -> tuple[torch.Tensor, ...]:
     # AR13).
     # Without prefix caching a request's state is one block: read and written in place.
     slots = metadata.load_blocks.reshape(-1, 1).to(torch.int32)
-    # host-computed (see RBLNFlashAttentionMetadata.cache_query_lens): an in-graph subtract
-    # here left the ring / state stores reading a garbage length
-    query_len = metadata.cache_query_lens
+    query_len = metadata.cache_offsets - metadata.cache_seq_lens
     return ring, slots, query_len.to(torch.int32)
 
 
