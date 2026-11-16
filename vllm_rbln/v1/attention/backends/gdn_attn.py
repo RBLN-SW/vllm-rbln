@@ -130,6 +130,24 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
         )
         return self._padded(blocks[:, 0], batch)
 
+    def stage(self, metadata: RBLNGDNAttentionMetadata) -> None:  # type: ignore[override]
+        metadata.has_initial_state = self._stage(
+            metadata.has_initial_state, "has_initial_state"
+        )
+        metadata.conv_load_blocks = self._stage(
+            metadata.conv_load_blocks, "conv_load_blocks"
+        )
+        metadata.conv_start_positions = self._stage(
+            metadata.conv_start_positions, "conv_start_positions"
+        )
+        metadata.conv_query_lens = self._stage(
+            metadata.conv_query_lens, "conv_query_lens"
+        )
+        metadata.conv_store_blocks = self._stage(
+            metadata.conv_store_blocks, "conv_store_blocks"
+        )
+        metadata.valid_mask = self._stage(metadata.valid_mask, "valid_mask")
+
     def build(  # type: ignore[override]
         self,
         common_attn_metadata: CommonAttentionMetadata,
@@ -142,6 +160,7 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
         num_accepted: torch.Tensor | None = None,
         state_load_pos: torch.Tensor | None = None,
         mm_prefix_row_ends: torch.Tensor | None = None,
+        defer_staging: bool = False,
     ) -> RBLNGDNAttentionMetadata:
         assert num_accepted is None and state_load_pos is None, (
             "speculative decoding is refused for GatedDeltaNet models"
@@ -183,7 +202,7 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
             max_chunk = self.chunked_prefill_size
             valid_mask = (torch.arange(max_chunk) < query_lens[0]).to(torch.float32)
             valid_mask = valid_mask.view(1, 1, max_chunk)
-        return RBLNGDNAttentionMetadata(
+        metadata = RBLNGDNAttentionMetadata(
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
             num_decodes=num_decodes,
@@ -191,21 +210,16 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
             num_spec_decodes=0,
             num_spec_decode_tokens=0,
             num_actual_tokens=m.num_actual_tokens,
-            has_initial_state=self._stage(
-                self._padded(context_lens_tensor > 0, batch_size), "has_initial_state"
-            ),
+            has_initial_state=self._padded(context_lens_tensor > 0, batch_size),
             batch_size=batch_size,
             load_blocks=load_blocks.to(torch.int16),
             store_blocks=store_blocks.to(torch.int16),
-            conv_load_blocks=self._stage(load_blocks, "conv_load_blocks"),
-            conv_start_positions=self._stage(
-                self._padded(first_positions, batch_size), "conv_start_positions"
-            ),
-            conv_query_lens=self._stage(
-                self._padded(query_lens, batch_size), "conv_query_lens"
-            ),
-            conv_store_blocks=self._stage(store_blocks, "conv_store_blocks"),
-            valid_mask=None
-            if valid_mask is None
-            else self._stage(valid_mask, "valid_mask"),
+            conv_load_blocks=load_blocks,
+            conv_start_positions=self._padded(first_positions, batch_size),
+            conv_query_lens=self._padded(query_lens, batch_size),
+            conv_store_blocks=store_blocks,
+            valid_mask=valid_mask,
         )
+        if not defer_staging:
+            self.stage(metadata)
+        return metadata

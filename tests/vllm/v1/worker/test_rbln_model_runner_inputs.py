@@ -83,9 +83,11 @@ class TestPreprocessBeforeStaging:
             None if is_first_rank else intermediate
         )
 
-    @pytest.mark.parametrize("num_kv_groups", [1, 2])
+    @pytest.mark.parametrize(
+        ("num_kv_groups", "use_gdn"), [(1, False), (2, False), (2, True)]
+    )
     def test_decode_repairs_cpu_input_before_staging(
-        self, make_model_runner, monkeypatch, num_kv_groups
+        self, make_model_runner, monkeypatch, num_kv_groups, use_gdn
     ):
         """Keep CPU preparation ahead of blocking copies in the current pipeline."""
         from tests.vllm.v1.worker.test_async_output import _async_output
@@ -100,6 +102,22 @@ class TestPreprocessBeforeStaging:
         runner.initialize_kv_cache(
             make_kv_cache_config(runner, groups=[(layer,) for layer in layers])
         )
+        if use_gdn:
+            from vllm.v1.kv_cache_interface import MambaSpec
+
+            group = runner.attn_groups[-1][0]
+            group.metadata_builders = [
+                mr.RBLNGDNAttentionMetadataBuilder(
+                    MambaSpec(
+                        block_size=MAX_MODEL_LEN,
+                        shapes=((4, 128, 128),),
+                        dtypes=(torch.bfloat16,),
+                    ),
+                    group.layer_names,
+                    runner.vllm_config,
+                    runner.device,
+                )
+            ]
         runner.use_async_scheduling = True
         runner._update_states(schedule_new("a", block_ids=[tuple([0] for _ in layers)]))
         state = runner.requests["a"]
@@ -119,6 +137,7 @@ class TestPreprocessBeforeStaging:
         original_stage = runner.input_stager.stage
         original_metadata = runner._build_attention_metadata
         original_metadata_stage = mr.RBLNFlashAttentionMetadataBuilder.stage
+        original_gdn_stage = mr.RBLNGDNAttentionMetadataBuilder.stage
 
         def kwargs():
             order.append("cpu_kwargs")
@@ -139,6 +158,8 @@ class TestPreprocessBeforeStaging:
 
         def metadata_stage(builder, values):
             order.append("metadata_stage")
+            if isinstance(builder, mr.RBLNGDNAttentionMetadataBuilder):
+                return original_gdn_stage(builder, values)
             return original_metadata_stage(builder, values)
 
         def forward(**values):
@@ -153,6 +174,7 @@ class TestPreprocessBeforeStaging:
         monkeypatch.setattr(
             mr.RBLNFlashAttentionMetadataBuilder, "stage", metadata_stage
         )
+        monkeypatch.setattr(mr.RBLNGDNAttentionMetadataBuilder, "stage", metadata_stage)
         monkeypatch.setattr(runner, "model_executable", forward, raising=False)
 
         runner.execute_model(
