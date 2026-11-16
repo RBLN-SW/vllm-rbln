@@ -421,8 +421,10 @@ class TestRBLNMambaManager:
         assert blocks[0].is_null and not blocks[2].is_null
         assert blocks[1].is_null is not producer
 
-    @pytest.mark.parametrize("boundary", [32, None])
-    def test_consumer_receives_and_caches_the_boundary_state(self, boundary):
+    @pytest.mark.parametrize(
+        ("boundary", "cached"), [(32, True), (None, False), (16, False)]
+    )
+    def test_consumer_receives_and_caches_the_boundary_state(self, boundary, cached):
         coord = self._coordinator()
         state = coord.single_type_managers[1]
         params = {"do_remote_prefill": True}
@@ -447,7 +449,7 @@ class TestRBLNMambaManager:
         assert num_free - coord.block_pool.get_num_free_blocks() == num_to_allocate
 
         blocks = state.req_to_blocks["d"]
-        assert [b.is_null for b in blocks] == [True, boundary is None, False]
+        assert [b.is_null for b in blocks] == [True, not cached, False]
         coord.cache_blocks(request, num_external)
         _, hit_length, _ = coord.find_longest_cache_hit(request.block_hashes, 39)
-        assert hit_length == (32 if boundary else 0)
+        assert hit_length == (32 if cached else 0)

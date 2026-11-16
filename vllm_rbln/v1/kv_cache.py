@@ -19,6 +19,7 @@ from math import prod
 
 import torch
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.single_type_kv_cache_manager import (
@@ -27,6 +28,8 @@ from vllm.v1.core.single_type_kv_cache_manager import (
 )
 from vllm.v1.kv_cache_interface import MambaSpec, SlidingWindowSpec
 from vllm.v1.request import Request
+
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -241,10 +244,18 @@ class RBLNMambaManager(MambaManager):
         block_idx = prompt_boundary_block(
             num_local_computed_tokens + num_external_computed_tokens, self.block_size
         )
-        assert block_idx == boundary // self.block_size - 1, (
-            f"{request_id}: the producer's boundary {boundary} is not the last one "
-            f"of the {num_external_computed_tokens} token(s) it sends"
-        )
+        if block_idx != boundary // self.block_size - 1:
+            # The value comes from the peer; the running state alone still
+            # serves the request, so a mismatch only costs the cache entry.
+            logger.warning(
+                "%s: ignoring %s=%d, not the last block boundary of the %d "
+                "token(s) received",
+                request_id,
+                REMOTE_STATE_BOUNDARY,
+                boundary,
+                num_local_computed_tokens + num_external_computed_tokens,
+            )
+            return
         self._received_boundary[request_id] = block_idx
 
     @contextmanager
