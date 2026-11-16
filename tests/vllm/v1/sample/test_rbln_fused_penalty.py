@@ -303,12 +303,13 @@ def test_min_p_reads_penalized_logits():
 
 
 @pytest.mark.use_device
-def test_mixed_batch_reuses_the_warmed_fused_graph():
+@pytest.mark.parametrize("min_p", [0.0, 0.05])
+def test_mixed_batch_reuses_the_warmed_fused_graph(min_p):
     """A mixed batch builds temperature, top_k and top_p as step tensors. The
     fused graph warmed on batch buffers must take them without recompiling."""
     device = current_platform.device_type
     rand = SamplingParams(
-        temperature=0.8, top_k=30, top_p=0.99, repetition_penalty=1.05
+        temperature=0.8, top_k=30, top_p=0.99, repetition_penalty=1.05, min_p=min_p
     )
     greedy = SamplingParams(temperature=0.0, repetition_penalty=1.05)
     kw = dict(device=device, prompt_token_ids=[11, 4000], output_token_ids=[77])
@@ -316,14 +317,16 @@ def test_mixed_batch_reuses_the_warmed_fused_graph():
     mixed = build_input_batch(
         [(str(i), p) for i, p in enumerate([rand, greedy, rand, greedy])], **kw
     )
-    sampler = RBLNSampler(fused_sampling=True)
+    sampler = RBLNSampler()
     logits = _logits(4).to(device)
     graphs = torch._dynamo.utils.counters["stats"]
     with torch.inference_mode():
         sampler(logits.clone(), warm.sampling_metadata, input_batch=warm)
         before = graphs["unique_graphs"]
         sampler(logits.clone(), mixed.sampling_metadata, input_batch=mixed)
-    assert {key[0] for key in sampler._fused_graphs} == {"top_k_top_p"}
+    assert {key[0] for key in sampler._fused_graphs} == {
+        "penalize" if min_p else "top_k_top_p"
+    }
     assert graphs["unique_graphs"] == before
 
 

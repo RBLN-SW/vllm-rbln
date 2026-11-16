@@ -102,7 +102,7 @@ class RBLNConfig(RBLNConfigBase):
     enable_sub_block_cache: bool = True
     """Enable sub-block prefix caching, at `sub_block_size` granularity."""
 
-    use_fused_sampling: bool = False
+    use_fused_sampling: bool = True
     """Run the sampling step's logits processing inside the compiled sampling
     graph: repetition / frequency / presence penalties and logit bias, on the
     vocab chunks they touch, and min_p. Needs `use_custom_sampler`."""
