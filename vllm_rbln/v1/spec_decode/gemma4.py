@@ -20,6 +20,7 @@ from vllm.v1.kv_cache_interface import SlidingWindowSpec
 from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
 
 from vllm_rbln.forward_context import set_forward_context
+from vllm_rbln.model_executor.models.gemma4 import split_gate_up_weights
 from vllm_rbln.v1.attention.kv_cache_bindings import (
     attach_kv_cache_bindings,
     build_kv_cache_forward_context_kwargs,
@@ -50,6 +51,7 @@ class RBLNGemma4Proposer(RBLNEagleProposer):
             ).keys()
         )
         super().load_model(target_model)
+        split_gate_up_weights(self.model)
         self._setup_gemma4_kv_sharing(target_attn_layer_names)
 
     def propose(

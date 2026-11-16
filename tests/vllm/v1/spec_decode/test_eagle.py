@@ -1125,6 +1125,39 @@ class TestBuildDummyAttnMetadata:
 
 
 class TestGemma4Drafting:
+    def test_loading_prepares_the_assistant_mlp_for_its_patched_forward(
+        self, monkeypatch
+    ):
+        from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+        from vllm.model_executor.models.gemma4 import Gemma4MLP
+
+        from vllm_rbln.v1.spec_decode import gemma4 as gemma4_module
+
+        base = make_eagle_proposer()
+        proposer = gemma4_module.RBLNGemma4Proposer(base.vllm_config, base.device, None)
+        mlp = Gemma4MLP.__new__(Gemma4MLP)
+        torch.nn.Module.__init__(mlp)
+        mlp.gate_up_proj = torch.nn.Module()
+        weight = torch.arange(64, dtype=torch.float32).view(16, 4) / 64
+        mlp.gate_up_proj.weight = torch.nn.Parameter(weight)
+        mlp.gate_up_proj.quant_method = UnquantizedLinearMethod()
+        mlp.act_fn = SimpleNamespace(approximate="tanh")
+        mlp.down_proj = lambda x: (x.sum(-1, keepdim=True), None)
+        monkeypatch.setattr(gemma4_module, "get_layers_from_vllm_config", lambda *a: {})
+        monkeypatch.setattr(proposer, "_setup_gemma4_kv_sharing", lambda *a: None)
+        monkeypatch.setattr(
+            eagle_module.RBLNEagleProposer,
+            "load_model",
+            lambda self, target: setattr(self, "model", mlp),
+        )
+        proposer.load_model(torch.nn.Identity())
+        inputs = torch.ones(2, 4)
+        gate, up = (inputs @ weight.T).chunk(2, dim=-1)
+        expected = (torch.nn.functional.gelu(gate, approximate="tanh") * up).sum(
+            -1, keepdim=True
+        )
+        torch.testing.assert_close(mlp(inputs), expected)
+
     @pytest.mark.parametrize(
         "strict_producer, intermediate", [(False, False), (True, False), (False, True)]
     )
