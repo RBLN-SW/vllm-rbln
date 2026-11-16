@@ -64,15 +64,17 @@ class RBLNGDNAttentionMetadata(GDNAttentionMetadata):
 
     A step is one prefill request or a decode batch, never both and never
     speculative, so the `spec_*` fields and the ones for upstream's own kernels
-    stay unset. The state indices are padded to the step's batch and stay int16
+    stay unset. The state blocks are padded to the step's batch and stay int16
     on the host: the kernels read them through the const buffer, and a device
     copy crashes the runtime.
     """
 
     # The compiled step's batch: 1 on prefill, the padded batch on decode.
     batch_size: int
-    # [batch] int16 on the host: the state block each row stores.
-    store_state_indices: torch.Tensor
+    # [batch] int16 on the host: the block each row loads its state from and
+    # the block it stores it to.
+    load_blocks: torch.Tensor
+    store_blocks: torch.Tensor
     # [batch] int32 on the device: kda_conv's per-row operands.
     conv_load_blocks: torch.Tensor
     conv_start_positions: torch.Tensor
@@ -174,7 +176,6 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
         store_blocks = self._get_state_blocks(
             block_table, m.seq_lens[:num_reqs], batch_size
         )
-        non_spec_state_indices_tensor = load_blocks.to(torch.int16)
 
         valid_mask = None
         if is_prefill:
@@ -194,11 +195,10 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
             num_spec_decode_tokens=0,
             num_actual_tokens=m.num_actual_tokens,
             has_initial_state=prefill_has_initial_state,
-            non_spec_state_indices_tensor=non_spec_state_indices_tensor,
-            prefill_state_indices=non_spec_state_indices_tensor if is_prefill else None,
             prefill_has_initial_state=prefill_has_initial_state,
             batch_size=batch_size,
-            store_state_indices=store_blocks.to(torch.int16),
+            load_blocks=load_blocks.to(torch.int16),
+            store_blocks=store_blocks.to(torch.int16),
             conv_load_blocks=self._stage(load_blocks, "conv_load_blocks"),
             conv_start_positions=self._stage(
                 self._padded(first_positions, batch_size), "conv_start_positions"

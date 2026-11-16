@@ -118,12 +118,10 @@ class TestBuilder:
         assert md.num_actual_tokens == 70
         assert md.batch_size == 1
         # A fresh request names its block for both, and the kernel reads none.
-        # The chunk kernel's inputs are the step's, as upstream names them.
-        assert md.prefill_state_indices is md.non_spec_state_indices_tensor
+        assert md.load_blocks.dtype == md.store_blocks.dtype == torch.int16
+        assert md.load_blocks.tolist() == md.store_blocks.tolist() == [7]
+        # The chunk kernel's initial-state flag is the step's, as upstream names it.
         assert md.prefill_has_initial_state is md.has_initial_state
-        assert md.prefill_state_indices.dtype == torch.int16
-        assert md.prefill_state_indices.tolist() == [7]
-        assert md.store_state_indices.tolist() == [7]
         assert md.prefill_has_initial_state.tolist() == [0]
         _assert_conv_rows(md, [7], [0], [70], [0])
         assert md.valid_mask.shape == (1, 1, 128)
@@ -140,7 +138,7 @@ class TestBuilder:
         positions = torch.arange(70, 70 + 58)
         md = builder.build(_common([58], [128], [[7]]), positions, 1, True)
         assert md.num_prefill_tokens == 58
-        assert md.prefill_state_indices.tolist() == [7]
+        assert md.load_blocks.tolist() == [7]
         assert md.prefill_has_initial_state.tolist() == [1]
         _assert_conv_rows(md, [7], [70], [58], [1])
 
@@ -150,10 +148,10 @@ class TestBuilder:
         assert (md.num_prefills, md.num_decodes, md.num_decode_tokens) == (0, 2, 2)
         assert not md.is_prefill
         assert md.batch_size == 4
-        assert md.non_spec_state_indices_tensor.tolist() == [7, 3, 0, 0]
-        assert md.store_state_indices.tolist() == [7, 3, 0, 0]
-        # The chunk kernel's inputs belong to a prefill step.
-        assert md.has_initial_state is None and md.prefill_state_indices is None
+        assert md.load_blocks.tolist() == [7, 3, 0, 0]
+        assert md.store_blocks.tolist() == [7, 3, 0, 0]
+        # The chunk kernel's initial-state flag belongs to a prefill step.
+        assert md.has_initial_state is None and md.prefill_has_initial_state is None
         _assert_conv_rows(md, [7, 3, 0, 0], [128, 5, 0, 0], [1, 1, 0, 0], [1, 1, 0, 0])
         assert md.valid_mask is None
 
@@ -172,8 +170,8 @@ class TestBuilder:
         positions = torch.arange(computed, computed + 128)
         common = _common([query_len], [computed + query_len], [[10, 11, 12, 13]])
         md = aligned.build(common, positions, 1, True)
-        assert md.prefill_state_indices.tolist() == [load]
-        assert md.store_state_indices.tolist() == [store]
+        assert md.load_blocks.tolist() == [load]
+        assert md.store_blocks.tolist() == [store]
         _assert_conv_rows(
             md, [load], [computed], [query_len], [int(computed > 0)], [store]
         )
@@ -183,8 +181,8 @@ class TestBuilder:
         positions = torch.tensor([255, 256])
         common = _common([1, 1], [256, 257], [[10, 11], [20, 21]])
         md = aligned.build(common, positions, 4, False)
-        assert md.non_spec_state_indices_tensor.tolist() == [10, 20, 0, 0]
-        assert md.store_state_indices.tolist() == [10, 21, 0, 0]
+        assert md.load_blocks.tolist() == [10, 20, 0, 0]
+        assert md.store_blocks.tolist() == [10, 21, 0, 0]
         _assert_conv_rows(
             md,
             [10, 20, 0, 0],

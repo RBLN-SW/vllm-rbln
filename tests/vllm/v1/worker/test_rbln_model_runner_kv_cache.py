@@ -645,7 +645,7 @@ class TestGatedDeltaNetOnTheAttentionPool:
         attention, state = attn_metadata[self.ATTN], attn_metadata[self.GDN]
         assert attention.block_tables[:2, 0].tolist() == [1, 3]
         assert isinstance(state, RBLNGDNAttentionMetadata)
-        assert state.non_spec_state_indices_tensor.tolist() == [2, 1, 0, 0]
+        assert state.load_blocks.tolist() == [2, 1, 0, 0]
         # The two views are recipes over one base, which reaches the graph once.
         infos = runner.kv_cache_view_infos
         assert state.kv_cache_view_infos is attention.kv_cache_view_infos is infos
