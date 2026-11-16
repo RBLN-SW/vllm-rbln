@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -155,3 +155,20 @@ def read_language_model_fields(cfg: RblnConfigLike, *keys: str) -> dict[str, Any
             if value is not None:
                 values.setdefault(key, value)
     return values
+
+
+def has_packed_kv_cache(cfg: RblnConfigLike) -> bool:
+    """Whether each layer keeps its K and V in one ``[num_blocks, 2, ...]`` tensor.
+
+    optimum-rbln records the shape of every cache tensor in ``cache_metas``.
+    Models compiled before this layout keep K and V in separate tensors, and
+    older ones record no ``cache_metas`` at all.
+    """
+    for source in language_model_configs(cfg):
+        cache_metas = get_field(source, "cache_metas")
+        if cache_metas:
+            return any(
+                len(shape) == 6 and shape[1] == 2
+                for shape in (get_field(meta, "shape") for meta in cache_metas)
+            )
+    return False

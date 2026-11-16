@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -27,11 +27,22 @@ from vllm.v1.request import Request
 
 @dataclass(frozen=True)
 class RBLNBlockAuxSpec:
-    """A per-block cache region beside a scheduled KV layer's cache."""
+    """A per-block cache region beside a scheduled KV layer's cache.
+
+    `prefix_cacheable=False` means this region's previous contents do not affect
+    the result when a prefix resumes at a block boundary, so it need not be saved
+    or restored. The buffer must still be allocated and readable: kernels may read
+    it physically (the tail ring with two or more MTP drafts, masked draft rows).
+    It is per aux region, not vLLM's group-level `KVCacheSpec.prefix_cacheable`.
+    """
 
     owner: str
     block_shape: tuple[int, ...]
     dtype: torch.dtype
+    prefix_cacheable: bool = True
+    # The axis of block_shape a TP rank's share of its owner's heads cuts, each
+    # index before it one run of them; None where every rank holds the same bytes.
+    head_axis: int | None = None
 
     @property
     def page_size_bytes(self) -> int:

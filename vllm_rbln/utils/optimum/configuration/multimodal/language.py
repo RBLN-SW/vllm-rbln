@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -38,3 +38,23 @@ def build_language_model_config(
     if prefill_chunk_size is not None:
         rbln_config["prefill_chunk_size"] = prefill_chunk_size
     return rbln_config
+
+
+def build_language_model_wrapper_config(
+    batch_size: int,
+    max_model_len: int,
+    block_size: int,
+    num_devices: int,
+    memory_budget: float,
+    prefill_chunk_size: int | None = None,
+) -> dict:
+    return {
+        "language_model": build_language_model_config(
+            batch_size,
+            max_model_len,
+            block_size,
+            num_devices,
+            memory_budget,
+            prefill_chunk_size,
+        ),
+    }

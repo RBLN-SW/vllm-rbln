@@ -1,17 +1,18 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from collections import Counter
 from collections.abc import Iterable
 from typing import Any
@@ -56,6 +57,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_transfer_topology im
     is_latent,
 )
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.attention.backends.glm5_next import kda_rank_groups
 from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
 from vllm_rbln.v1.worker.utils import canonical_kv_layers
 
@@ -430,12 +432,9 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         # Transfer region `logical * areas + area` is one area of one logical
         # region, which needs every entry over the same number of areas.
         area_counts = {len(geometry.areas) for geometry in geometries}
-        if len(area_counts) != 1:
-            raise RuntimeError(
-                "RBLN NIXL (D2D): KV entries are laid over different chiplet "
-                f"area counts {sorted(area_counts)}; a transfer region is "
-                "numbered by one."
-            )
+        # An entry sits on one area or RSD_SHARDS, and one beside wider ones
+        # was named as replicas above.
+        assert len(area_counts) == 1, area_counts
         (areas,) = area_counts
         self._kv_areas = areas
 
@@ -467,6 +466,10 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         self._logical_region_kv_heads = self._logical_head_bands(layer_regions)
         self._logical_region_local_heads = list(logical_kv_heads)
         self._logical_region_latent = list(logical_mla)
+        self._logical_region_block_spec = [
+            spec if isinstance(spec, RblnBlockTransferSpec) else None
+            for _, spec, _, _ in regions
+        ]
 
         self.num_regions = len(places)
         if self.topo.virtually_split_kv_in_blocks:
@@ -773,6 +776,13 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
             "a sliding-window group reads a storage no registered KV entry "
             "holds, although `canonical_kv_layers` keeps one layer per buffer"
         )
+        # A transfer region is numbered `logical * areas + area`, so an entry the
+        # compiler left on one area (GLM-5.3 on a PP stage) is named as replicas
+        # of its one slice: every transfer of it moves the slice `widest` times.
+        widest = max((len(placed) for _, _, placed in cuts.values()), default=1)
+        for base_addr, (axis, slices, placed) in cuts.items():
+            if len(placed) == 1 < widest:
+                cuts[base_addr] = (axis, slices, placed * widest)
         geometries = []
         for entry, spec, offset, block_len in regions:
             axis, slices, placed = cuts[entry.data_ptr()]
@@ -989,6 +999,7 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         # Host staging records no latents; the per-head check a pipelined peer
         # reaches through this path reads every region as attention.
         self._logical_region_latent = [False] * len(self._logical_region_geometry)
+        self._logical_region_block_spec = [None] * len(self._logical_region_geometry)
         # Re-wrap upstream's published handshake metadata with this stage's PP
         # identity and chiplet geometry (no-op degrade for pp_size == 1).
         if self.xfer_handshake_metadata is not None:
@@ -1007,8 +1018,28 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
             if name in self._layer_specs and name not in self._block_aux_specs:
                 raise ValueError(f"Block-aux cache {name} shadows a scheduled cache")
             owner_spec = self._unwrapped_layer_spec(spec.owner)
+            band_heads = getattr(owner_spec, "band_heads", 0)
+            if spec.head_axis is None or not band_heads:
+                self._layer_specs[name] = RblnBlockTransferSpec(
+                    owner_spec.block_size, spec.page_size_bytes
+                )
+                continue
+            runs = math.prod(spec.block_shape[: spec.head_axis])
+            # The owner is one KDA state cache of the rank's, so the cache it
+            # owns cuts that one group's heads -- as many as the backend names
+            # the caches by.
+            tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+            entry_heads = (
+                band_heads // tp_size // kda_rank_groups(self.vllm_config, tp_size)
+            )
+            head_bytes, rem = divmod(spec.page_size_bytes // runs, entry_heads)
+            assert not rem, (name, spec, entry_heads)
             self._layer_specs[name] = RblnBlockTransferSpec(
-                owner_spec.block_size, spec.page_size_bytes
+                owner_spec.block_size,
+                spec.page_size_bytes,
+                band_heads,
+                head_bytes,
+                runs,
             )
         self._block_aux_specs = dict(specs)
 

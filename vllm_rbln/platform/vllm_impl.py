@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -25,10 +25,18 @@ from vllm_rbln.platform import use_device_tensor
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.pooling_params import PoolingParams
+    from vllm.sampling_params import SamplingParams
 
     from vllm_rbln.config import RBLNConfig
 
 logger = init_logger(__name__)
+
+# validate_request gets no config, so check_and_update keeps this process's --
+# the last one built, so this assumes one engine per process, as a server has.
+# The role is read per request, not here: VllmConfig.__post_init__ can still
+# rewrite it after the hook (KV offloading makes it kv_both).
+_vllm_config: "VllmConfig | None" = None
 
 
 def patch_upstream() -> None:
@@ -48,6 +56,8 @@ def patch_upstream() -> None:
 def check_and_update(vllm_config: "VllmConfig") -> None:
     from vllm_rbln.config import build_rbln_config
 
+    global _vllm_config
+
     # Everything below reads additional_config as an RBLNConfig.
     vllm_config.additional_config = build_rbln_config(vllm_config.additional_config)
 
@@ -55,6 +65,29 @@ def check_and_update(vllm_config: "VllmConfig") -> None:
     _override(vllm_config)
     _wire(vllm_config)
     _setup_runtime_env(vllm_config)
+    _vllm_config = vllm_config
+
+
+def validate_request(params: "SamplingParams | PoolingParams") -> None:
+    from vllm.exceptions import VLLMValidationError
+    from vllm.sampling_params import SamplingParams
+
+    from vllm_rbln.v1.core.utils import is_strict_kv_producer
+
+    if not isinstance(params, SamplingParams):
+        return
+    assert _vllm_config is not None, "validate_request ran before check_and_update"
+    if not is_strict_kv_producer(_vllm_config):
+        return
+    if params.max_tokens is None or params.max_tokens > 1:
+        raise VLLMValidationError(
+            "A strict KV producer (kv_role='kv_producer') compiles no decode "
+            "graph, so a request to it can ask for one output token only; got "
+            f"max_tokens={params.max_tokens}. Generation belongs on the decode "
+            "peer.",
+            parameter="max_tokens",
+            value=params.max_tokens,
+        )
 
 
 def _uses_model_parallel(parallel_config) -> bool:
@@ -172,16 +205,25 @@ def _validate(vllm_config: "VllmConfig") -> None:
             "Set --block-size within this range."
         )
 
-    chunk = rbln_config.prefill_chunk_size
-    if chunk is not None and chunk > max_num_batched_tokens:
+    chunks = rbln_config.prefill_chunk_size or [max_num_batched_tokens]
+    if max(chunks) > max_num_batched_tokens:
         raise ValueError(
-            f"--rbln-prefill-chunk-size={chunk} exceeds {max_num_batched_tokens=}."
+            f"prefill_chunk_size={chunks} exceeds {max_num_batched_tokens=}."
         )
-    # TODO(RBLN): DP ranks agree on max_num_batched_tokens as the prefill token
-    # dimension (dp_utils), and the RBLN NIXL connector's resume trim takes it
-    # as the prefill chunk. Lifting a refusal means pointing that feature's
-    # sites at prefill_chunk_size; #1372 lists them.
-    if chunk is not None and chunk < max_num_batched_tokens:
+
+    max_num_scheduled_tokens = scheduler_config.max_num_scheduled_tokens
+    if (
+        max_num_scheduled_tokens is not None
+        and chunks != [max_num_batched_tokens]
+        and max(chunks) > max_num_scheduled_tokens
+    ):
+        raise ValueError(
+            f"prefill_chunk_size={chunks} exceeds {max_num_scheduled_tokens=}."
+        )
+    # TODO(RBLN): The RBLN NIXL connector's resume trim takes
+    # max_num_batched_tokens as the prefill chunk. Lifting the refusal means
+    # pointing its sites at prefill_chunk_size; #1372 lists them.
+    if min(chunks) < max_num_batched_tokens:
         kv_transfer = vllm_config.kv_transfer_config
         connectors = [] if kv_transfer is None else [kv_transfer.kv_connector]
         if connectors == ["MultiConnector"]:
@@ -190,7 +232,6 @@ def _validate(vllm_config: "VllmConfig") -> None:
         unsupported = [
             name
             for name, on in (
-                ("data parallelism", parallel_config.data_parallel_size > 1),
                 (
                     "RBLN NIXL KV transfer",
                     any(
@@ -203,17 +244,22 @@ def _validate(vllm_config: "VllmConfig") -> None:
                         for name in connectors
                     ),
                 ),
+                # The non-causal prefill mask is built at the longest chunk.
+                (
+                    "non-causal attention",
+                    len(chunks) > 1 and vllm_config.attention_config.use_non_causal,
+                ),
             )
             if on
         ]
         if unsupported:
             raise ValueError(
-                f"--rbln-prefill-chunk-size={chunk} below {max_num_batched_tokens=} "
+                f"prefill_chunk_size={chunks} below {max_num_batched_tokens=} "
                 f"is not supported with {', '.join(unsupported)} on RBLN yet."
             )
     # Resolved here so the scheduler and runner read one value, and compute_hash,
     # which runs after this, keys "unset" and "set to the budget" alike.
-    rbln_config.prefill_chunk_size = chunk or max_num_batched_tokens
+    rbln_config.prefill_chunk_size = chunks
 
     if envs.VLLM_RBLN_COMPILE_ONLY and envs.VLLM_DISABLE_COMPILE_CACHE:
         # Compile-only compiles each graph and writes the .rbln artifact to

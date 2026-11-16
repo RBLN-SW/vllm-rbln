@@ -91,6 +91,7 @@ class MockKVConfig:
 
     matched_tokens: int = 0
     is_async: bool = False
+    kv_role: str = "kv_both"
 
 
 class _MockKVConnectorMetadata(KVConnectorMetadata):
@@ -208,6 +209,8 @@ def create_rbln_scheduler(
     use_kv_connector: MockKVConfig | None = None,
     async_scheduling: bool = False,
     additional_config: dict | None = None,
+    kv_cache_config: KVCacheConfig | None = None,
+    hash_block_size: int | None = None,
     ec_transfer_config: ECTransferConfig | None = None,
     ec_manager_config: EncoderCacheManagerConfig | None = None,
 ) -> RBLNScheduler:
@@ -244,7 +247,7 @@ def create_rbln_scheduler(
     if use_kv_connector is not None:
         kv_transfer_config = KVTransferConfig(
             kv_connector="MockKVConnector",
-            kv_role="kv_both",
+            kv_role=use_kv_connector.kv_role,
             kv_connector_extra_config={
                 "matched_tokens": use_kv_connector.matched_tokens,
                 "is_async": use_kv_connector.is_async,
@@ -268,17 +271,21 @@ def create_rbln_scheduler(
             **(additional_config or {}),
         },
     )
-    kv_cache_config = KVCacheConfig(
-        num_blocks=num_blocks,
-        kv_cache_tensors=[],
-        kv_cache_groups=[KVCacheGroupSpec(["layer"], full_attention_spec(block_size))],
-    )
+    if kv_cache_config is None:
+        kv_cache_config = KVCacheConfig(
+            num_blocks=num_blocks,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(["layer"], full_attention_spec(block_size))
+            ],
+        )
     cache_config.num_gpu_blocks = num_blocks
     scheduler_cls = RBLNAsyncScheduler if async_scheduling else RBLNScheduler
     return scheduler_cls(
         vllm_config=vllm_config,
         kv_cache_config=kv_cache_config,
         block_size=block_size,
+        hash_block_size=hash_block_size,
         log_stats=True,
         structured_output_manager=StructuredOutputManager(vllm_config),
     )

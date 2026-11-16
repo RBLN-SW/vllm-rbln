@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -39,7 +39,7 @@ import os
 from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from vllm.config.utils import config as vllm_config_dataclass
 
 from vllm_rbln.logger import init_logger
@@ -79,7 +79,7 @@ class RBLNConfigBase:
 
     sub_block_size: int | None = Field(default=None, gt=0)
     """Token granularity for prefix cache hit calculation.
-    If None, uses prefill_chunk_size.
+    If None, uses the longest prefill_chunk_size that divides block_size.
     """
 
 
@@ -102,10 +102,17 @@ class RBLNConfig(RBLNConfigBase):
     enable_sub_block_cache: bool = True
     """Enable sub-block prefix caching, at `sub_block_size` granularity."""
 
-    prefill_chunk_size: int | None = Field(default=None, gt=0)
-    """Length the prefill graph is compiled at, and so the longest prefill
-    chunk the scheduler hands it, below the `max_num_batched_tokens` step
-    budget. If None, uses `max_num_batched_tokens`."""
+    use_fused_sampling: bool = False
+    """Run the sampling step's logits processing inside the compiled sampling
+    graph: repetition / frequency / presence penalties and logit bias, on the
+    vocab chunks they touch. Needs `use_custom_sampler`."""
+
+    prefill_chunk_size: list[int] | None = None
+    """Lengths the prefill graphs are compiled at. A prefill step runs the
+    shortest that holds its chunk, and the longest is the longest prefill chunk
+    the scheduler hands one, below the `max_num_batched_tokens` step budget. A
+    single length keeps one prefill graph. If None, uses
+    `max_num_batched_tokens`."""
 
     specialize_moe_decode: bool = True
     """Specialize the case where every instance is at the decode stage."""
@@ -136,7 +143,9 @@ class RBLNConfig(RBLNConfigBase):
 
     encoder_token_budgets: list[int] = field(default_factory=list)
     """Output-token capacities of compiled encoder graphs, shared across modalities.
-    Empty uses the processor upper bounds for enabled modalities."""
+    Empty lets the model choose: MiniMax-M3 takes the processor upper bounds of
+    the enabled modalities, Gemma4 every supported soft token budget up to
+    max_soft_tokens."""
 
     use_w8a8: bool = False
     """Opt in to W8A8. W8A16 runs on every RBLN NPU, W8A8 only on the ones
@@ -159,6 +168,7 @@ class RBLNConfig(RBLNConfigBase):
             # Sampler graphs compile with use_cache=False, so they never enter
             # the bundle. Sub-block caching changes what runs, not what is built.
             "use_custom_sampler",
+            "use_fused_sampling",
             "enable_sub_block_cache",
             "sub_block_size",
             "encoder_token_budgets",
@@ -167,6 +177,17 @@ class RBLNConfig(RBLNConfigBase):
         # Unset and True build the same graph; only False changes the artifact.
         factors["use_dynamic_kv_cache"] = self.use_dynamic_kv_cache is not False
         return hash_factors(factors)
+
+    @field_validator("prefill_chunk_size", mode="before")
+    @classmethod
+    def _one_prefill_chunk_size_is_a_list(cls, value: Any) -> Any:
+        return [value] if isinstance(value, int) else value
+
+    @property
+    def max_prefill_chunk_size(self) -> int:
+        """The longest prefill chunk."""
+        assert self.prefill_chunk_size is not None  # resolved at start-up
+        return max(self.prefill_chunk_size)
 
     def __post_init__(self) -> None:
         buckets = self.decode_batch_bucket_manual_buckets
@@ -184,11 +205,20 @@ class RBLNConfig(RBLNConfigBase):
             raise ValueError("encoder_token_budgets must all be > 0")
         if len(budgets) != len(set(budgets)):
             raise ValueError("encoder_token_budgets must be unique")
+        sizes = self.prefill_chunk_size
+        if sizes is not None:
+            if not sizes:
+                raise ValueError("prefill_chunk_size must not be empty")
+            if any(s <= 0 for s in sizes):
+                raise ValueError("prefill_chunk_size must all be > 0")
+            if len(sizes) != len(set(sizes)):
+                raise ValueError("prefill_chunk_size must be unique")
+            self.prefill_chunk_size = sorted(sizes)
 
 
 @dataclass
-class OptimumRBLNCompileInputs:
-    """Resolved inputs shared by cache hashing, vLLM config sync and compilation.
+class OptimumRBLNCompileConfig:
+    """Resolved model compilation settings shared by cache hashing and compilation.
 
     Must remain serializable for worker transfer via `additional_config`.
     """
@@ -233,10 +263,10 @@ class OptimumRBLNConfig(RBLNConfigBase):
     image_prefill_chunk_size: list[int] | None = field(default=None, metadata=_DERIVED)
     """Compiled image-prefill buckets (gemma3/gemma4) used for scheduler padding."""
 
-    compile_inputs: OptimumRBLNCompileInputs | None = field(
+    compile_config: OptimumRBLNCompileConfig | None = field(
         default=None, metadata=_DERIVED
     )
-    """Inputs shared by cache lookup and compilation.
+    """Settings shared by cache lookup and compilation.
 
     Runtime synchronization must not mutate them.
     """

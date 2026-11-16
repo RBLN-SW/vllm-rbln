@@ -2,7 +2,7 @@
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# You may obtain a copy of the License at:
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 #
@@ -91,9 +91,13 @@ from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadata,
 )
 from vllm_rbln.v1.attention.backends.glm5_next import (
+    KDA_CONV,
+    KDA_DRAFT,
+    KDA_STATE,
     RBLNGlm5NextCacheBackend,
     RBLNGlm5NextIndexerBackend,
     RBLNGlm5NextStateMetadata,
+    kda_cache_name,
 )
 from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
 from vllm_rbln.v1.worker.utils import (
@@ -210,17 +214,27 @@ class RBLNGlm5NextAuxCache(_RBLNGlm5NextCache):
         owner: str,
         block_shape: tuple[int, ...],
         dtype: torch.dtype,
+        prefix_cacheable: bool = True,
+        head_axis: int | None = None,
     ) -> None:
         super().__init__(prefix)
         self.owner = owner
         self.block_shape = block_shape
         self.dtype = dtype
+        self.prefix_cacheable = prefix_cacheable
+        self.head_axis = head_axis
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> None:
         return None
 
     def get_aux_cache_spec(self, vllm_config: VllmConfig) -> RBLNBlockAuxSpec:
-        return RBLNBlockAuxSpec(self.owner, self.block_shape, self.dtype)
+        return RBLNBlockAuxSpec(
+            self.owner,
+            self.block_shape,
+            self.dtype,
+            prefix_cacheable=self.prefix_cacheable,
+            head_axis=self.head_axis,
+        )
 
     def get_attn_backend(self) -> type[RBLNGlm5NextCacheBackend]:
         return RBLNGlm5NextCacheBackend
@@ -403,14 +417,17 @@ class RBLNGlm5NextKDA(nn.Module):
             persistent=False,
         )
         self.states = nn.ModuleList(
-            RBLNGlm5NextStateCache(f"{prefix}.attn.{j}") for j in range(self.num_groups)
+            RBLNGlm5NextStateCache(
+                kda_cache_name(prefix, KDA_STATE, j, self.num_groups)
+            )
+            for j in range(self.num_groups)
         )
         self.positions_from = self.states[0].prefix
         spec = vllm_config.speculative_config
         self.num_drafts = spec.num_speculative_tokens if spec is not None else 0
         self.conv_ring_width = max(KDA_CONV_RING, taps - 1 + self.num_drafts)
         self.conv_state = RBLNGlm5NextAuxCache(
-            f"{prefix}.attn.{self.num_groups}",
+            kda_cache_name(prefix, KDA_CONV, 0, self.num_groups),
             self.states[0].prefix,
             (
                 self.conv_ring_width,
@@ -419,15 +436,18 @@ class RBLNGlm5NextKDA(nn.Module):
                 CONV_LANES,
             ),
             dtype,
+            head_axis=2,
         )
         self.drafts = None
         if self.num_drafts:
             self.drafts = nn.ModuleList(
                 RBLNGlm5NextAuxCache(
-                    f"{prefix}.attn.{self.num_groups + 1 + j}",
+                    kda_cache_name(prefix, KDA_DRAFT, j, self.num_groups),
                     state.prefix,
                     (self.group_heads, self.num_drafts, 4, self.head_dim),
                     dtype,
+                    prefix_cacheable=False,
+                    head_axis=0,
                 )
                 for j, state in enumerate(self.states)
             )
@@ -629,6 +649,7 @@ class RBLNGlm5NextIndexer(nn.Module):
             f"{attn_prefix}.attn.{SLOT_DSA_LATENT}",
             (self.tail_ring, 2 * self.head_dim),
             torch.bfloat16,
+            prefix_cacheable=False,
         )
 
     @torch.no_grad()

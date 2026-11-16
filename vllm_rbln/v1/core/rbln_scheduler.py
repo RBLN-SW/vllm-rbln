@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -54,6 +54,7 @@ from vllm_rbln.v1.core.rbln_kv_cache_manager import (
 from vllm_rbln.v1.core.utils import (
     DecodeBatchBudget,
     is_prefill,
+    is_strict_kv_producer,
     num_base_tokens,
     should_defer_spec_step,
     sub_block_size_in_use,
@@ -118,14 +119,16 @@ class RBLNScheduler(Scheduler):
 
         rbln_config: RBLNConfig = self.vllm_config.additional_config
 
+        prefill_chunk_sizes = rbln_config.prefill_chunk_size
+        assert prefill_chunk_sizes is not None  # resolved at start-up
+
         # Replace the upstream KVCacheManager with RBLNKVCacheManager
         # when sub-block prefix caching is enabled.
-        assert rbln_config.prefill_chunk_size is not None  # resolved at start-up
         sub_block_size = sub_block_size_in_use(
             enable_prefix_caching=self.cache_config.enable_prefix_caching,
             sub_block_cache=rbln_config.enable_sub_block_cache,
             block_size=self.block_size,
-            prefill_chunk_size=rbln_config.prefill_chunk_size,
+            prefill_chunk_sizes=prefill_chunk_sizes,
             kv_cache_config=self.kv_cache_config,
             sub_block_size=rbln_config.sub_block_size,
         )
@@ -137,7 +140,7 @@ class RBLNScheduler(Scheduler):
                 kv_cache_config=self.kv_cache_config,
                 max_model_len=self.max_model_len,
                 scheduler_block_size=self.block_size,
-                hash_block_size=self.block_size,
+                hash_block_size=self.hash_block_size,
                 sub_block_size=sub_block_size,
                 hash_fn=hash_fn,
                 use_eagle=self.use_eagle,
@@ -161,6 +164,15 @@ class RBLNScheduler(Scheduler):
                     "sub_block_size=%d.",
                     sub_block_size,
                 )
+        elif (
+            self.cache_config.enable_prefix_caching
+            and rbln_config.enable_sub_block_cache
+        ):
+            logger.warning(
+                "Sub-block prefix caching off: block_size=%d, prefill_chunk_size=%s",
+                self.block_size,
+                prefill_chunk_sizes,
+            )
 
         # NOTE(RBLN): Block deltas already committed in the KV cache manager
         # but not yet delivered to the model runner because the request was
@@ -175,8 +187,10 @@ class RBLNScheduler(Scheduler):
         # ceil(demand / pp) to spread decodes across microbatches. pp == 1 makes
         # the soft cap a no-op. See v1/core/utils.py.
         self._pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
+        self._strict_kv_producer = is_strict_kv_producer(self.vllm_config)
 
-        self._prefill_chunk_size = rbln_config.prefill_chunk_size
+        self._prefill_chunk_size = rbln_config.max_prefill_chunk_size
+        self._is_mm_prefix_lm = self.vllm_config.model_config.is_mm_prefix_lm
 
         # NOTE(RBLN): the sparse-attention ops (DSA MLA / indexer, MiniMax-M3
         # MSA / indexer, GLM5 MLA / indexer) get NULL_BLOCK_ID as null_block_id
@@ -191,6 +205,41 @@ class RBLNScheduler(Scheduler):
                 "to NULL_BLOCK_ID and would corrupt a live block."
             )
 
+    def _mm_prefix_split(
+        self, request: Request, num_computed_tokens: int, num_new_tokens: int
+    ) -> int:
+        """Tokens to schedule so that no image or video-frame range straddles two
+        steps: the chunk ends before a range it would cut, and a chunk resuming
+        inside a range runs past its end, since a one-token step reads as a decode.
+        """
+        end = num_computed_tokens + num_new_tokens
+        resumed_last = None
+        for feature in request.mm_features:
+            if feature.modality not in ("image", "video"):
+                continue
+            for first, last in feature.mm_position.extract_embeds_range():
+                if first < num_computed_tokens <= last:
+                    resumed_last = last
+                elif num_computed_tokens <= first < end <= last:
+                    assert first > num_computed_tokens, (
+                        f"an mm prefix range of {last + 1 - first} tokens does not "
+                        f"fit the {num_new_tokens}-token step"
+                    )
+                    end = first
+        assert resumed_last is None or end > resumed_last + 1, (
+            "a step resuming inside an mm prefix range must run past it"
+        )
+        return end - num_computed_tokens
+
+    def _splits_on_mm_prefix(self, request: Request) -> bool:
+        # Past the prompt, every range is behind the cursor; a preempted request
+        # recomputes from 0 and is cut again.
+        return (
+            self._is_mm_prefix_lm
+            and request.has_encoder_inputs
+            and request.num_computed_tokens < request.num_prompt_tokens
+        )
+
     def _decode_demand(self) -> int:
         """Total decode demand for this step's soft (ceil(demand/pp)) cap.
 
@@ -202,7 +251,11 @@ class RBLNScheduler(Scheduler):
         running), so this snapshot is exact even as the running/ready split
         shifts during the waiting loop.
         """
-        num_running_decodes = sum(1 for r in self.running if not is_prefill(r))
+        num_running_decodes = sum(
+            1
+            for r in self.running
+            if not is_prefill(r, strict_kv_producer=self._strict_kv_producer)
+        )
         num_ready_remote_kv = len(self.finished_recving_kv_req_ids)
         return num_running_decodes + num_ready_remote_kv
 
@@ -306,7 +359,10 @@ class RBLNScheduler(Scheduler):
         # section in v1/core/utils.py.
         req_index = (
             len(self.running) - 1
-            if self.running and is_prefill(self.running[-1])
+            if self.running
+            and is_prefill(
+                self.running[-1], strict_kv_producer=self._strict_kv_producer
+            )
             else 0
         )
         while req_index < len(self.running) and token_budget > 0:
@@ -360,6 +416,13 @@ class RBLNScheduler(Scheduler):
                 num_new_tokens, self.max_model_len - 1 - request.num_computed_tokens
             )
 
+            # Cut before scheduling encoder inputs, so that only the items this
+            # chunk overlaps are scheduled.
+            if self._splits_on_mm_prefix(request):
+                num_new_tokens = self._mm_prefix_split(
+                    request, request.num_computed_tokens, num_new_tokens
+                )
+
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
             external_load_encoder_input: list[int] = []
@@ -375,7 +438,9 @@ class RBLNScheduler(Scheduler):
                     request.num_computed_tokens,
                     num_new_tokens,
                     encoder_compute_budget,
-                    shift_computed_tokens=1 if self.use_eagle else 0,
+                    # NOTE(RBLN): the drafter takes no mm embeddings, so EAGLE needs
+                    # no shifted encoder window.
+                    shift_computed_tokens=0,
                 )
 
             if self.need_mamba_block_aligned_split:
@@ -528,7 +593,13 @@ class RBLNScheduler(Scheduler):
         if (
             not preempted_reqs
             and self._pause_state == PauseState.UNPAUSED
-            and not (scheduled_running_reqs and is_prefill(scheduled_running_reqs[0]))
+            and not (
+                scheduled_running_reqs
+                and is_prefill(
+                    scheduled_running_reqs[0],
+                    strict_kv_producer=self._strict_kv_producer,
+                )
+            )
         ):
             # NOTE(RBLN): refresh the token budget to determine whether we can schedule
             # new prefill requests into the running batch.
@@ -738,7 +809,9 @@ class RBLNScheduler(Scheduler):
                     num_new_tokens = min(num_new_tokens, prefill_token_budget)
                     assert num_new_tokens > 0
 
-                    if is_prefill(request) and (
+                    if is_prefill(
+                        request, strict_kv_producer=self._strict_kv_producer
+                    ) and (
                         len(scheduled_new_reqs) > 0 or len(scheduled_resumed_reqs) > 0
                     ):
                         # NOTE(RBLN): Only a request that will run as a LOCAL prefill
@@ -756,6 +829,11 @@ class RBLNScheduler(Scheduler):
                         # (see the step-phase section in v1/core/utils.py).
                         break
 
+                    if self._splits_on_mm_prefix(request):
+                        num_new_tokens = self._mm_prefix_split(
+                            request, num_computed_tokens, num_new_tokens
+                        )
+
                     # Schedule encoder inputs.
                     if request.has_encoder_inputs:
                         (
@@ -768,13 +846,18 @@ class RBLNScheduler(Scheduler):
                             num_computed_tokens,
                             num_new_tokens,
                             encoder_compute_budget,
-                            shift_computed_tokens=1 if self.use_eagle else 0,
+                            # NOTE(RBLN): the drafter takes no mm
+                            # embeddings, so EAGLE needs no shifted encoder window.
+                            shift_computed_tokens=0,
                         )
                         if num_new_tokens == 0:
                             # The request cannot be scheduled.
                             break
 
-                if self.need_mamba_block_aligned_split:
+                # NOTE(RBLN): an async remote load computes no chunk this step, so
+                # the split would clip its 0 tokens to 0 and break before
+                # allocation, leaving the request in WAITING forever.
+                if self.need_mamba_block_aligned_split and not load_kv_async:
                     num_new_tokens = self._mamba_block_aligned_split(
                         request,
                         num_new_tokens,
@@ -932,7 +1015,7 @@ class RBLNScheduler(Scheduler):
                         if self.ec_connector is not None:
                             self.ec_connector.update_state_after_alloc(request, i)
 
-                if not is_prefill(request):
+                if not is_prefill(request, strict_kv_producer=self._strict_kv_producer):
                     # NOTE(RBLN): A decode-ready request joins the decode batch
                     # here, regardless of how it became decode-ready -- a FULL
                     # remote-KV match promoted from WAITING_FOR_REMOTE_KVS, a full
@@ -941,10 +1024,10 @@ class RBLNScheduler(Scheduler):
                     # the no-mixed-batching eviction block below and runs as a lone
                     # prefill, reaching decode via the running loop on a later step.)
                     #
-                    # is_prefill is False here, so num_computed == num_tokens - 1
-                    # and (given the earlier `assert num_new_tokens > 0`)
-                    # num_new_tokens == 1 -- the single-token decode precondition.
-                    # Kept as a sanity check.
+                    # On a decoding role is_prefill is False only at
+                    # num_computed == num_tokens - 1, so num_new_tokens == 1 given
+                    # the earlier `assert num_new_tokens > 0`. A producer widens
+                    # is_prefill past this branch and never arrives. Sanity check.
                     assert num_new_tokens == 1, (
                         f"decode-ready request {request_id} has "
                         f"num_new_tokens={num_new_tokens} (expected 1)."
@@ -1232,6 +1315,18 @@ class RBLNScheduler(Scheduler):
         return not connector.ensure_cache_available(
             request, num_computed_tokens, local_cache_hashes=local_cache_hashes
         )
+
+    def _free_encoder_inputs(self, request: Request) -> None:
+        # NOTE(RBLN): upstream defers the free by the drafter's look-ahead, but
+        # the RBLN drafter reads no mm embeddings.
+        if self.is_encoder_decoder:
+            super()._free_encoder_inputs(request)
+            return
+        num_computed = request.num_computed_tokens - request.num_output_placeholders
+        for input_id in list(self.encoder_cache_manager.get_cached_input_ids(request)):
+            pos = request.mm_features[input_id].mm_position
+            if pos.offset + pos.length <= num_computed:
+                self._free_encoder_input(request, input_id)
 
     def _try_schedule_encoder_inputs(
         self,
