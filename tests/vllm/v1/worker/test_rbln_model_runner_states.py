@@ -280,6 +280,75 @@ class TestAcceptedTokensReAdd:
 
 
 class TestTokenFeedbackBeforeReAdd:
+    def test_custom_processor_receives_completed_token_history(
+        self, make_model_runner, monkeypatch
+    ):
+        from vllm.v1.sample.logits_processor import LogitsProcessor
+        from vllm.v1.sample.logits_processor.builtin import process_dict_updates
+
+        from tests.vllm.v1.worker.test_async_output import _async_output
+
+        class CachesLastToken(LogitsProcessor):
+            def __init__(self, vllm_config, device, is_pin_memory):
+                self.histories = {}
+                self.last_tokens = {}
+
+            def is_argmax_invariant(self):
+                return False
+
+            def update_state(self, batch_update):
+                process_dict_updates(
+                    self.histories,
+                    batch_update,
+                    lambda params, prompt, output: output,
+                )
+                self.last_tokens = {
+                    row: history[-1]
+                    for row, history in self.histories.items()
+                    if history
+                }
+
+            def apply(self, logits):
+                for row, token in self.last_tokens.items():
+                    logits[row, token] = float("-inf")
+                return logits
+
+        _last_rank(monkeypatch)
+        runner = make_model_runner(logits_processors=[CachesLastToken])
+        runner.use_async_scheduling = True
+        runner._update_states(schedule_new("a"))
+        state = runner.requests["a"]
+        n = state.num_prompt_tokens
+        state.output_token_ids.append(-1)
+        runner.input_batch.token_ids_cpu[0, n] = -1
+        runner.input_batch.num_tokens_no_spec[0] = n + 1
+        previous = _async_output(
+            torch.tensor([[42]], dtype=torch.int32),
+            req_ids=["a"],
+            placeholder_pos={"a": n},
+        )
+        assert previous.get_output().sampled_token_ids == [[42]]
+        runner._prev_async_output = previous
+
+        runner._update_states(
+            schedule_cached(
+                req_ids=["a"], num_computed_tokens=[n], num_output_tokens=[1]
+            )
+        )
+        runner._repair_staged_input_ids()
+        processor = next(
+            proc
+            for proc in runner.input_batch.logitsprocs.all
+            if isinstance(proc, CachesLastToken)
+        )
+        logits = torch.full((1, 128), float("-inf"))
+        logits[0, 42] = 10
+        logits[0, 43] = 9
+
+        assert processor.apply(logits).argmax(-1).item() == 43
+        assert processor.last_tokens == {0: 42}
+        assert state.output_token_ids == [42]
+
     @pytest.mark.parametrize("repair_during_prefill", [False, True])
     def test_evicted_decode_comes_back_with_its_sampled_token(
         self, make_model_runner, monkeypatch, repair_during_prefill

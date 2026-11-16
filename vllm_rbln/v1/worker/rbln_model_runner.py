@@ -663,13 +663,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         cached_req_ids = self.input_batch.req_id_to_index.keys()
         resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
 
-        # Re-adding a request builds its CPU row from cached history. Repair that
-        # history before it is read, or before a streaming update replaces it.
+        # Re-added requests and custom logits processor updates consume history.
+        # Repair it before those reads or a streaming update replaces it.
         if (
             self.use_async_scheduling
             and self._prev_async_output is not None
             and (
-                any(
+                self.input_batch.logitsprocs_need_output_token_ids
+                or any(
                     req_id in self._prev_async_output.placeholder_pos
                     and (req_id not in cached_req_ids or req_id in resumed_req_ids)
                     for req_id in scheduler_output.scheduled_cached_reqs.req_ids
