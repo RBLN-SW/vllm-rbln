@@ -361,6 +361,8 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         # The graph's small inputs, one set per shape. The same tensors every
         # step keep the runtime's bindings; a fresh address is re-bound.
         self._graph_input_buffers: dict[tuple, dict[str, torch.Tensor]] = {}
+        # Per shape: the sampling-params key last staged, and what it staged.
+        self._staged_sampling_inputs: dict[tuple, tuple[tuple, tuple]] = {}
 
     def rejection_sample(
         self,
@@ -475,48 +477,72 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
                 draft_per_batch[i, :n] = draft_token_ids[src_offset : src_offset + n]
                 src_offset += n
 
-        if sampling_metadata.all_greedy:
-            top_k, top_p = bufs["greedy_top_k"], None
+        # Sampling params change only when the batch does, so their staging copies
+        # are skipped while the source tensors are unchanged. The per-token
+        # temperature depends on the draft counts unless every row is full.
+        sampling_key = (
+            _sampling_params_key(sampling_metadata, bonus_logits is not None)
+            if padded_len == N
+            else None
+        )
+        staged = self._staged_sampling_inputs.get(key)
+        if (
+            sampling_key is not None
+            and staged is not None
+            and staged[0] == sampling_key
+        ):
+            top_k, top_p, reshaped_temperature, bonus_temperature = staged[1]
         else:
-            top_k, top_p = build_op_top_k_top_p(
-                sampling_metadata,
-                batch_size,
-                vocab_size,
-                device,
-            )
-
-            if top_k is not None:
-                top_k = bufs["top_k"].copy_(top_k)
-            if top_p is not None:
-                top_p = bufs["top_p"].copy_(top_p)
-
-        # NOTE(RBLN): Per-row temperature for the divide inside the graph. Padding
-        # and greedy rows must carry 1.0 -- a 0 would divide by zero.
-        reshaped_temperature = bufs["ones"]
-        bonus_temperature = None
-        temperature = sampling_metadata.temperature
-        if not sampling_metadata.all_greedy and temperature is not None:
-            reshaped_temperature = bufs["temperature"]
-            if not sampling_metadata.all_random:
-                temperature = torch.where(
-                    temperature == GREEDY_TEMPERATURE,
-                    temperature.new_ones(()),
-                    temperature,
-                )
-            if bonus_logits is not None:
-                bonus_temperature = bufs["bonus_temperature"]
-                bonus_temperature.copy_(temperature)
-            if padded_len == N:
-                # Full K drafts everywhere, so request r's draft c sits at
-                # r * K + c. The input must stay directly allocated: an
-                # `expand(...).reshape(-1)` view is rejected in `prepare_inputs`.
-                reshaped_temperature.view(batch_size, max_spec_len).copy_(
-                    temperature.unsqueeze(1)
-                )
+            if sampling_metadata.all_greedy:
+                top_k, top_p = bufs["greedy_top_k"], None
             else:
-                reshaped_temperature.fill_(1)
-                reshaped_temperature[:N] = expand_batch_to_tokens(
-                    temperature, cu_num_draft_tokens, num_tokens
+                top_k, top_p = build_op_top_k_top_p(
+                    sampling_metadata,
+                    batch_size,
+                    vocab_size,
+                    device,
+                )
+
+                if top_k is not None:
+                    top_k = bufs["top_k"].copy_(top_k)
+                if top_p is not None:
+                    top_p = bufs["top_p"].copy_(top_p)
+
+            # NOTE(RBLN): Per-row temperature for the divide inside the graph.
+            # Padding and greedy rows must carry 1.0 -- a 0 would divide by zero.
+            reshaped_temperature = bufs["ones"]
+            bonus_temperature = None
+            temperature = sampling_metadata.temperature
+            if not sampling_metadata.all_greedy and temperature is not None:
+                reshaped_temperature = bufs["temperature"]
+                if not sampling_metadata.all_random:
+                    temperature = torch.where(
+                        temperature == GREEDY_TEMPERATURE,
+                        temperature.new_ones(()),
+                        temperature,
+                    )
+                if bonus_logits is not None:
+                    bonus_temperature = bufs["bonus_temperature"]
+                    bonus_temperature.copy_(temperature)
+                if padded_len == N:
+                    # Full K drafts everywhere, so request r's draft c sits at
+                    # r * K + c. The input must stay directly allocated: an
+                    # `expand(...).reshape(-1)` view is rejected in `prepare_inputs`.
+                    reshaped_temperature.view(batch_size, max_spec_len).copy_(
+                        temperature.unsqueeze(1)
+                    )
+                else:
+                    reshaped_temperature.fill_(1)
+                    reshaped_temperature[:N] = expand_batch_to_tokens(
+                        temperature, cu_num_draft_tokens, num_tokens
+                    )
+            if sampling_key is None:
+                # This step overwrote the shared buffers with per-token values.
+                self._staged_sampling_inputs.pop(key, None)
+            else:
+                self._staged_sampling_inputs[key] = (
+                    sampling_key,
+                    (top_k, top_p, reshaped_temperature, bonus_temperature),
                 )
 
         cu_num_draft_tokens_t = bufs["cu_num_draft_tokens"]
@@ -564,6 +590,34 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         assert logits.ndim == 2
         assert cu_num_draft_tokens.ndim == 1
         return logits
+
+
+def _sampling_params_key(
+    sampling_metadata: SamplingMetadata, bonus_in_graph: bool
+) -> tuple | None:
+    """Identity and version of the tensors the staged sampling inputs read.
+
+    The version counter moves on every in-place write, which is how the input
+    batch refreshes these tensors. None disables reuse.
+    """
+
+    def ident(t: torch.Tensor | None) -> tuple | None:
+        if t is None:
+            return None
+        return (t.data_ptr(), tuple(t.shape), t._version)
+
+    try:
+        return (
+            sampling_metadata.all_greedy,
+            sampling_metadata.all_random,
+            bonus_in_graph,
+            ident(sampling_metadata.temperature),
+            ident(sampling_metadata.top_k),
+            ident(sampling_metadata.top_p),
+        )
+    except RuntimeError:
+        # Inference tensors carry no version counter.
+        return None
 
 
 def rbln_rejection_sample(
