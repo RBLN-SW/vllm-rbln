@@ -282,9 +282,75 @@ class TestBlockAuxKVCaches:
         for key, name in runner.kv_cache_allocations.items():
             assert key == kv_cache_tensor_key(context[name].kv_cache)
 
+    def test_connectors_register_only_the_transferred_aux_specs(
+        self, make_model_runner, monkeypatch
+    ):
+        # The GLM-5.3 kinds: a conv ring, a tail ring that is not prefix-cacheable
+        # but must still move, and a KDA draft only this engine's verify reads.
+        aux_specs: list = []
+        connector = SimpleNamespace(register_block_aux_kv_caches=aux_specs.append)
+        monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: True)
+        monkeypatch.setattr(mr, "get_kv_transfer_group", lambda: connector)
+        runner = self._runner_with_aux(
+            make_model_runner,
+            monkeypatch,
+            [
+                self._aux("layer.0"),
+                self._aux("layer.0", prefix_cacheable=False),
+                self._aux("layer.0", prefix_cacheable=False, verify_only=True),
+            ],
+        )
+        assert set(runner.aux_kv_cache_specs) == {"layer.1", "layer.2", "layer.3"}
+        assert [set(specs) for specs in aux_specs] == [{"layer.1", "layer.2"}]
+
+    @pytest.mark.parametrize("strict_producer", [False, True])
+    def test_a_strict_producer_does_not_allocate_a_verify_only_aux(
+        self, make_model_runner, monkeypatch, strict_producer
+    ):
+        draft = self._aux("layer.0", verify_only=True)
+        runner = self._runner_with_aux(
+            make_model_runner,
+            monkeypatch,
+            [self._aux("layer.0"), draft],
+            strict_producer=strict_producer,
+        )
+        if strict_producer:
+            assert set(runner.aux_kv_cache_specs) == {"layer.1"}
+            assert "layer.2" not in runner.kv_cache_names
+            # Unbound, its own index could name another layer's cache.
+            assert draft.layer_index is None
+        else:
+            assert set(runner.aux_kv_cache_specs) == {"layer.1", "layer.2"}
+            assert draft.layer_index == runner.kv_cache_names.index("layer.2")
+
+    def _runner_with_aux(
+        self, make_model_runner, monkeypatch, auxes, strict_producer=False
+    ):
+        """A runner whose `layer.{1..}` are `auxes`, KV cache initialized."""
+        runner = make_model_runner(init_kv_cache=False)
+        runner.is_strict_kv_producer = strict_producer
+        context = runner.compilation_config.static_forward_context
+        for i, module in enumerate(auxes, start=1):
+            module.layer_index = i
+            monkeypatch.setitem(context, f"layer.{i}", module)
+        runner.initialize_kv_cache(make_kv_cache_config(runner, groups=[("layer.0",)]))
+        return runner
+
     @staticmethod
-    def _aux(owner, shape=(4, 64), dtype=torch.bfloat16):
-        spec = RBLNBlockAuxSpec(owner, shape, dtype)
+    def _aux(
+        owner,
+        shape=(4, 64),
+        dtype=torch.bfloat16,
+        prefix_cacheable=True,
+        verify_only=False,
+    ):
+        spec = RBLNBlockAuxSpec(
+            owner,
+            shape,
+            dtype,
+            prefix_cacheable=prefix_cacheable,
+            verify_only=verify_only,
+        )
         return SimpleNamespace(get_aux_cache_spec=lambda _config: spec)
 
     def _allocate(self, runner, config, monkeypatch, auxes):
