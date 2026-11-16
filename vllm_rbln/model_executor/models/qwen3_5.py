@@ -45,11 +45,6 @@ from vllm.sequence import IntermediateTensors
 from vllm_rbln.model_executor.models.interfaces import SupportsRBLNMultiModal
 from vllm_rbln.v1.attention.backends.gdn_attn import grouped_qkv_rows
 
-# The largest vision encoder bucket, in patches: the largest one run on a
-# device. The processor's own limit for Qwen3.5 (16M pixels) is four times
-# that, so --mm-processor-kwargs '{"max_pixels": N}' has to lower it.
-MAX_ENCODER_PATCHES = 16384
-
 
 class _RBLNQwen3VisionEncoder(nn.Module):
     """Qwen3-VL's vision transformer on one padded image, without the cu_seqlens
@@ -171,15 +166,6 @@ class RBLNQwen3_5ForConditionalGeneration(
                     "that large, or lower max_pixels in --mm-processor-kwargs."
                 )
             self.mm_encoder_patch_buckets = [b * merge**2 for b in budgets]
-            largest = self.mm_encoder_patch_buckets[-1]
-            if largest > MAX_ENCODER_PATCHES:
-                max_pixels = MAX_ENCODER_PATCHES * patch * patch
-                raise ValueError(
-                    f"The largest vision encoder bucket has {largest} patches; the "
-                    f"RBLN vision encoder takes at most {MAX_ENCODER_PATCHES}. Limit "
-                    f"it with --mm-processor-kwargs '{{\"max_pixels\": {max_pixels}}}' "
-                    "or less, or serve text-only with --language-model-only."
-                )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loaded = super().load_weights(weights)

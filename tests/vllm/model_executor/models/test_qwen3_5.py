@@ -124,19 +124,10 @@ def test_token_budgets_resolve_to_patch_buckets(monkeypatch, budgets, buckets):
     assert model.mm_encoder_patch_buckets == buckets
 
 
-@pytest.mark.parametrize(
-    ("budgets", "message"),
-    [
-        # No bucket would hold the processor's largest image.
-        ([64], "must reach 256 output tokens"),
-        ([8192], "at most 16384"),
-    ],
-)
-def test_token_budgets_the_encoder_cannot_serve_are_refused(
-    monkeypatch, budgets, message
-):
-    with pytest.raises(ValueError, match=message):
-        _build_with_token_budgets(monkeypatch, budgets)
+def test_token_budgets_below_the_largest_image_are_refused(monkeypatch):
+    # No bucket would hold the processor's largest image.
+    with pytest.raises(ValueError, match="must reach 256 output tokens"):
+        _build_with_token_budgets(monkeypatch, [64])
 
 
 def test_a_request_image_above_the_start_up_limit_is_refused(monkeypatch):
