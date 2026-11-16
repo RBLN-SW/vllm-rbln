@@ -163,6 +163,7 @@ def load_targets(directory: Path, chip: str, lane: str) -> dict[str, Any]:
 
 
 def restore_ci_targets(directory: Path) -> dict[str, Any]:
+    # nosemgrep: trailofbits.python.tarfile-extractall-traversal.tarfile-extractall-traversal  # noqa: E501
     with tarfile.open(directory / "snapshot.tar.gz") as archive:
         for name in _TARGET_DIRS:
             if (directory / name).exists():
@@ -625,6 +626,7 @@ def main() -> int:
             check=True,
         )
         content = checkout / "content"
+        # nosemgrep: trailofbits.python.tarfile-extractall-traversal.tarfile-extractall-traversal  # noqa: E501
         with tarfile.open(archive_path) as archive:
             archive.extractall(content, filter="data")
         for name in ("perf", "lm-eval"):

@@ -31,7 +31,10 @@ on:
 jobs:
   update-pkg:
     uses: ./.github/workflows/pkg_update.yaml
-    secrets: inherit
+    secrets:
+      GIT_PAT: ${{ secrets.GIT_PAT }}
+      UDC_NEXUS_USERNAME: ${{ secrets.UDC_NEXUS_USERNAME }}
+      UDC_NEXUS_PASSWORD: ${{ secrets.UDC_NEXUS_PASSWORD }}
     with:
       python-version: ${{ inputs.python-version }}
       optimum-version: ${{ inputs.optimum-version }}
