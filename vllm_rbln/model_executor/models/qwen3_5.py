@@ -193,8 +193,7 @@ class RBLNQwen3_5ForConditionalGeneration(
         self, pixel_values: torch.Tensor, grid_thw: list[int]
     ) -> list[torch.Tensor]:
         """Pad one image to the bucket and build its position embeddings and key
-        mask on the host, as upstream's fast_pos_embed_interpolate and
-        rot_pos_emb do on the tower's device (and with Triton when it imports)."""
+        mask on the host; upstream builds them on the tower's device."""
         visual = self.visual
         bucket = self.encoder_patches
         num_patches = math.prod(grid_thw)
