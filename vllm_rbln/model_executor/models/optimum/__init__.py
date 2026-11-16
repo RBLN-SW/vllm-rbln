@@ -91,8 +91,8 @@ def load_model(vllm_config: VllmConfig) -> nn.Module:
                 "Encoder-decoder models are not supportedsince vLLM RBLN v0.10.1"
             )
     elif is_qwen3_reranker(model_config):
-        # Scored through the generation graph, so the HF arch was remapped to
-        # Qwen3ForCausalLM and the pooling dispatch below would miss it.
+        # Scored through the generation graph, so Qwen3ForSequenceClassification
+        # is a generation arch and the pooling dispatch below would miss it.
         assert vllm_config.cache_config.enable_prefix_caching in (False, None), (
             "Prefix caching is not supported with pooling models. Please set "
             "`enable_prefix_caching` to False."

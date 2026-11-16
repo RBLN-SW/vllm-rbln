@@ -16,15 +16,14 @@
 The reranker reuses the *generation* graph so it can read the score off two
 vocabulary logits. These tests cover the parts that do not need an NPU:
 
-  * the HF arch is remapped to ``Qwen3ForCausalLM``, so the compile inputs and
-    optimum-rbln class match the generative path and share its artifact,
+  * the HF arch stays ``Qwen3ForSequenceClassification``, which selects
+    ``RBLNQwen3ForCausalLM`` compiled prefill-only,
   * ``classifier_from_token`` resolves to the right vocabulary ids,
   * inputs are **left** padded, which the generation graph requires,
   * ``forward`` reduces the vocabulary to ``logit_yes - logit_no``, and the
     pooler's sigmoid on that equals the 2-way softmax.
 
-Qwen3-VL-Reranker is scored the same way, but keeps its own architecture name,
-which selects a prefill-only compile and the multimodal wrapper.
+Qwen3-VL-Reranker is scored the same way, through the multimodal wrapper.
 """
 
 from types import SimpleNamespace
@@ -82,9 +81,6 @@ def _model_config(**overrides):
 
 def _build_reranker(max_seq_len=16, batch_size=2):
     model_config = _model_config()
-    # Mirror RBLNOptimumModelRunner's remap.
-    assert is_qwen3_reranker(model_config)
-    model_config.hf_config.__dict__["architectures"] = ["Qwen3ForCausalLM"]
     vllm_config = VllmConfig(
         model_config=model_config,
         cache_config=CacheConfig(block_size=16, cache_dtype="auto"),
@@ -107,14 +103,6 @@ def _build_reranker(max_seq_len=16, batch_size=2):
         patch.object(RBLNOptimumModelBase, "init_model", fake_init_model),
     ):
         return RBLNOptimumQwen3RerankerModel(vllm_config=vllm_config)
-
-
-def test_predicate_survives_arch_remap():
-    """The predicate keys on classifier_from_token, not the arch name."""
-    model_config = _model_config()
-    assert is_qwen3_reranker(model_config)
-    model_config.hf_config.__dict__["architectures"] = ["Qwen3ForCausalLM"]
-    assert is_qwen3_reranker(model_config), "must still hold after the remap"
 
 
 def test_label_token_ids():
@@ -158,7 +146,10 @@ def test_registered_as_a_generation_arch():
     assert is_generation_arch(hf_config)
     assert not is_pooling_arch(hf_config)
     assert is_chunked_prefill_arch(hf_config)
-    assert get_rbln_model_info(hf_config) == ("qwen3", "RBLNQwen3ForCausalLM")
+    assert get_rbln_model_info(hf_config) == (
+        "qwen3_reranker",
+        "RBLNQwen3ForCausalLM",
+    )
 
 
 def _bare_config(tokens):

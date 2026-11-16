@@ -122,11 +122,32 @@ class TestSync:
         assert cached.cache_config.block_size == cfg.cache_config.block_size == 8192
 
     @pytest.mark.parametrize(
-        ("runner", "reranker", "expected_arch", "expected_cls", "expected_tokens"),
+        (
+            "runner",
+            "reranker",
+            "expected_arch",
+            "expected_cls",
+            "expected_tokens",
+            "expected_phases",
+        ),
         [
-            ("pooling", False, "Qwen3Model", "RBLNQwen3Model", 1024),
-            ("pooling", True, "Qwen3ForCausalLM", "RBLNAutoModelForCausalLM", 128),
-            ("generate", False, "Qwen3ForCausalLM", "RBLNAutoModelForCausalLM", 128),
+            ("pooling", False, "Qwen3Model", "RBLNQwen3Model", 1024, None),
+            (
+                "pooling",
+                True,
+                "Qwen3ForSequenceClassification",
+                "RBLNAutoModelForCausalLM",
+                128,
+                ["prefill"],
+            ),
+            (
+                "generate",
+                False,
+                "Qwen3ForCausalLM",
+                "RBLNAutoModelForCausalLM",
+                128,
+                None,
+            ),
         ],
     )
     def test_qwen3_architecture_is_resolved_before_cache_lookup(
@@ -137,6 +158,7 @@ class TestSync:
         expected_arch,
         expected_cls,
         expected_tokens,
+        expected_phases,
     ):
         from vllm_rbln.platform.optimum_impl import check_and_update
 
@@ -181,13 +203,16 @@ class TestSync:
                     list(inputs.hf_config.architectures),
                     inputs.model_cls,
                     inputs.rbln_config.get("prefill_chunk_size", 1024),
+                    inputs.rbln_config.get("phases"),
                 )
             )
             return compile_cache_name(inputs)
 
         monkeypatch.setattr(sync, "compile_cache_name", generate_name)
         check_and_update(cfg)
-        assert observed == [([expected_arch], expected_cls, expected_tokens)]
+        assert observed == [
+            ([expected_arch], expected_cls, expected_tokens, expected_phases)
+        ]
 
     @pytest.mark.parametrize(
         ("reranker", "expected_arch", "expected_cls", "expected_phases"),

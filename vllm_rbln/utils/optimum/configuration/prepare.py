@@ -155,6 +155,10 @@ def _for_decoder(
         rbln_config["attn_impl"] = "flash_attn"
     if envs.VLLM_RBLN_USE_NESTED_COMPILE_REGION:
         rbln_config["nested_compile_region"] = True
+
+    if get_rbln_model_info(model_config.hf_config)[0] == "qwen3_reranker":
+        # score() never decodes, so the decode graphs would only cost memory.
+        rbln_config["phases"] = ["prefill"]
     return RBLNAutoModelForCausalLM, rbln_config
 
 
