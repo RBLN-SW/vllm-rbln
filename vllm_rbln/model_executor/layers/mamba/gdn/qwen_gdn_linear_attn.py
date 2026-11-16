@@ -14,7 +14,6 @@
 
 import torch
 import torch.nn.functional as F
-from rebel.ops.torch_custom_ops.gdn import CHUNK as GDN_PREFILL_CHUNK
 from rebel.ops.torch_custom_ops.gdn import STATE_LANES
 from rebel.ops.torch_custom_ops.kda import CONV_LANES
 from torch import nn
@@ -209,7 +208,6 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 state,
                 metadata.prefill_state_indices,
                 metadata.prefill_has_initial_state,
-                GDN_PREFILL_CHUNK,
                 store_index=metadata.store_state_indices,
             )
         else:
