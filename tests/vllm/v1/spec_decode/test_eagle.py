@@ -629,6 +629,48 @@ class TestPropose:
 
 
 class TestLoadModel:
+    def test_wrapper_keeps_the_assistants_hidden_width(self, monkeypatch):
+        proposer = make_eagle_proposer(num_speculative_tokens=1)
+        width = proposer.hidden_size // 2
+
+        class Assistant(torch.nn.Module):
+            def forward(self, *, input_ids, positions, hidden_states, inputs_embeds):
+                return hidden_states[:, :width].contiguous(), hidden_states + 1
+
+            def compute_logits(self, hidden_states):
+                assert hidden_states.shape == (2, width)
+                return hidden_states
+
+        self._stub_super_load_model(monkeypatch, Assistant())
+        monkeypatch.setattr(proposer, "model_returns_tuple", lambda: True)
+        monkeypatch.setattr(
+            proposer.vllm_config.speculative_config, "enforce_eager", True
+        )
+        proposer.load_model(target_model=object())
+        hidden = torch.zeros(4, proposer.hidden_size)
+        hidden[torch.arange(4), torch.arange(4) + 1] = 1
+        output, ids = proposer.model_executable(
+            input_ids=torch.zeros(4, dtype=torch.int32),
+            positions=torch.arange(4),
+            hidden_states=hidden,
+            token_indices_to_sample=torch.tensor([0, 2]),
+        )
+        torch.testing.assert_close(output, hidden[[0, 2]] + 1)
+        assert ids.tolist() == [1, 3]
+
+    def test_the_rbln_gemma4_target_goes_by_upstreams_name(self):
+        # Upstream picks the target's image token attribute by class name, so
+        # every drafter, Eagle3 included, has to see the upstream one.
+        from vllm_rbln.model_executor.models.gemma4 import (
+            RBLNGemma4ForConditionalGeneration,
+        )
+
+        target = RBLNGemma4ForConditionalGeneration.__new__(
+            RBLNGemma4ForConditionalGeneration
+        )
+        name = make_eagle_proposer().get_model_name(target)
+        assert name == "Gemma4ForConditionalGeneration"
+
     @pytest.mark.parametrize("draft_needs_mm_inputs", [False, True])
     def test_multimodal_guard_uses_loaded_draft_capability(
         self, monkeypatch, draft_needs_mm_inputs
@@ -1080,3 +1122,86 @@ class TestBuildDummyAttnMetadata:
         )
         cad = proposer._build_dummy_attn_metadata(num_reqs=3, num_tokens_per_req=2)
         assert cad.block_table_tensor.shape == (3, 128)
+
+
+class TestGemma4Drafting:
+    @pytest.mark.parametrize(
+        "strict_producer, intermediate", [(False, False), (True, False), (False, True)]
+    )
+    def test_steps_keep_positions_and_feed_back_tokens_and_hidden_states(
+        self, monkeypatch, strict_producer, intermediate
+    ):
+        from vllm_rbln.v1.spec_decode import gemma4 as gemma4_module
+
+        base = make_eagle_proposer(num_speculative_tokens=3)
+        proposer = gemma4_module.RBLNGemma4Proposer(base.vllm_config, base.device, None)
+        _wire_runner(
+            proposer,
+            num_reqs=2,
+            intermediate_chunk=intermediate,
+            strict_kv_producer=strict_producer,
+        )
+        monkeypatch.setattr(
+            gemma4_module, "set_forward_context", lambda *a, **k: nullcontext()
+        )
+        monkeypatch.setattr(proposer, "_build_draft_step", lambda n, p: ({}, n, {}))
+        seen = []
+        static_ids = torch.zeros(2, dtype=torch.long)
+
+        def executable(*, input_ids, positions, hidden_states, **kwargs):
+            seen.append((positions.clone(), hidden_states.clone()))
+            static_ids.copy_(input_ids.view(-1).long() + 1)
+            return hidden_states.view(2, -1) + 1, static_ids
+
+        proposer.model_executable = executable
+        result = _call_propose(proposer)
+        if strict_producer or intermediate:
+            assert seen == []
+            assert result.tolist() == [[0, 0, 0], [0, 0, 0]]
+        else:
+            assert result.tolist() == [[31, 32, 33], [32, 33, 34]]
+            for step, (positions, hidden) in enumerate(seen):
+                assert positions.flatten().tolist() == [1, 3]
+                torch.testing.assert_close(hidden, torch.full_like(hidden, step))
+
+    @pytest.mark.parametrize("position", [2, 3, 10, 11, 30])
+    def test_sliding_mask_keeps_the_oldest_key_at_a_block_boundary(
+        self, monkeypatch, position
+    ):
+        from tests.vllm.v1.attention.utils import make_attention_spec, make_builder
+        from tests.vllm.vllm_config import make_vllm_config
+        from vllm_rbln.v1.spec_decode import gemma4 as gemma4_module
+
+        base = make_eagle_proposer()
+        proposer = gemma4_module.RBLNGemma4Proposer(base.vllm_config, base.device, None)
+        _wire_runner(proposer, num_reqs=1)
+        proposer.max_model_len = 32
+        cfg = make_vllm_config(max_model_len=32, max_num_batched_tokens=8)
+        builder = make_builder(
+            cfg, spec=make_attention_spec(block_size=4, sliding_window=8)
+        )
+        block_size = builder.block_size
+        table = torch.arange((32 + block_size - 1) // block_size).view(1, -1)
+        proposer.runner.input_batch.block_table = [
+            SimpleNamespace(get_cpu_tensor=lambda: table)
+        ]
+        proposer.draft_attn_groups = [
+            SimpleNamespace(
+                get_metadata_builder=lambda: builder,
+                kv_cache_group_id=0,
+                layer_names=["draft.layer"],
+            )
+        ]
+        monkeypatch.setattr(gemma4_module, "attach_kv_cache_bindings", lambda *a: None)
+        monkeypatch.setattr(
+            gemma4_module, "build_kv_cache_forward_context_kwargs", lambda *a: {}
+        )
+        metadata, _, _ = proposer._build_draft_step(1, torch.tensor([position]))
+        md = metadata["draft.layer"]
+        assert md.seq_lens.flatten().tolist() == [position + 1]
+        first_key = max(position - 7, 0) // block_size * block_size
+        visible = md.attn_masks.flatten().nonzero().flatten() + first_key
+        assert visible.tolist() == list(range(max(position - 7, 0), position + 1))
+        assert (
+            md.attn_masks.numel() == ((8 + block_size) // block_size + 1) * block_size
+        )

@@ -136,13 +136,15 @@ def test_the_rotary_tables_are_built_once_not_per_image(monkeypatch):
     torch.testing.assert_close(got, expected, rtol=1e-4, atol=1e-4)
 
 
-def test_speculative_decoding_is_refused():
+def test_a_drafter_other_than_the_mtp_assistant_is_refused():
     vllm_config = SimpleNamespace(
         parallel_config=SimpleNamespace(data_parallel_size=1),
-        speculative_config=SimpleNamespace(method="mtp"),
+        speculative_config=SimpleNamespace(
+            method="eagle3", use_gemma4_mtp=lambda: False
+        ),
     )
 
-    with pytest.raises(ValueError, match="speculative decoding"):
+    with pytest.raises(ValueError, match="only with its MTP assistant"):
         RBLNGemma4ForConditionalGeneration(vllm_config=vllm_config)
 
 
