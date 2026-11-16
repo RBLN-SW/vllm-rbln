@@ -29,7 +29,10 @@ jobs:
         run: |
           curl -LsSf https://astral.sh/uv/install.sh | sh
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-          
+
+      - name: Install packaging library for comparing against the declared range
+        run: pip install packaging
+
       - name: Update Optimum Version in uv
         id: uv-update-optimum-rbln
         env:
@@ -40,14 +43,39 @@ jobs:
           VERSION="${{ inputs.optimum-version }}"
           VERSION="${VERSION#v}"
 
-          CEILING=$(python -c 'import re, sys; m = re.match(r"(\d+)\.(\d+)\.(\d+)", sys.argv[1]) or sys.exit(f"cannot derive a patch-line ceiling from {sys.argv[1]!r}"); print(f"{m[1]}.{m[2]}.{int(m[3]) + 1}")' "${VERSION}")
+          # The declared range already admits most new releases, and in that case
+          # only uv.lock has to move. Raising the floor on every alpha narrows the
+          # range for everyone downstream and buys nothing: the lock is what pins
+          # the version we actually resolve to.
+          IN_RANGE=$(python - "${VERSION}" <<'PY'
+          import pathlib, re, sys
+          from packaging.specifiers import SpecifierSet
+          from packaging.version import Version
 
-          # Bump optimum-rbln in pyproject.toml and refresh uv.lock in one step.
+          text = pathlib.Path("pyproject.toml").read_text()
+          match = re.search(r'"optimum-rbln([^"]*)"', text)
+          if match is None:
+              sys.exit("optimum-rbln is not declared in pyproject.toml")
+          spec = SpecifierSet(match.group(1))
+          print("yes" if spec.contains(Version(sys.argv[1]), prereleases=True) else "no")
+          PY
+          )
+
+          if [ "${IN_RANGE}" = "yes" ]; then
+            echo "${VERSION} satisfies the declared range; refreshing uv.lock only"
+            UPDATE=(uv lock --upgrade-package "optimum-rbln==${VERSION}")
+          else
+            # Outside the declared range, so the range itself has to move with it.
+            CEILING=$(python -c 'import re, sys; m = re.match(r"(\d+)\.(\d+)\.(\d+)", sys.argv[1]) or sys.exit(f"cannot derive a patch-line ceiling from {sys.argv[1]!r}"); print(f"{m[1]}.{m[2]}.{int(m[3]) + 1}")' "${VERSION}")
+            echo "${VERSION} falls outside the declared range; widening it to >=${VERSION},<${CEILING}"
+            UPDATE=(uv add "optimum-rbln>=${VERSION},<${CEILING}" --upgrade-package optimum-rbln)
+          fi
+
           for i in {1..6}; do
-            uv add "optimum-rbln>=${VERSION},<${CEILING}" --upgrade-package optimum-rbln && exit 0
+            "${UPDATE[@]}" && exit 0
             sleep 10
           done
-          echo "::error::uv add failed after retries"
+          echo "::error::${UPDATE[0]} failed after retries"
           exit 1
 
       - name: Create PR for updated files
