@@ -38,10 +38,6 @@ MODELS = [
         # text-only (M-RoPE needs no vision here); the block size at which a
         # GatedDeltaNet state fills a full-attention page
         {"language_model_only": True, "block_size": 256},
-        # TODO(rebel-compiler): drop once rolling these GDN layers passes
-        # RblnTensorUnrollLayerLoop. Without nested regions there is
-        # nothing to roll; a release compiler ignores RBLN_EXP_ROLL_LAYERS.
-        envs={"VLLM_RBLN_USE_NESTED_COMPILE_REGION": "0"},
         # The fourth layer is the first full-attention one: with it the state
         # and the attention cache share a buffer.
         num_hidden_layers=4,
