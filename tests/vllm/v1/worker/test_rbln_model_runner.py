@@ -653,7 +653,7 @@ class TestEcConsumer:
             _execute_mm_encoder=lambda so: None,
         )
         runner._gather_mm_embeddings = lambda so, n: (
-            [(0, 0, runner.encoder_cache["h0"])],
+            [runner.encoder_cache["h0"]],
             torch.ones(n, 1),
         )
         scheduler_output = SimpleNamespace(
