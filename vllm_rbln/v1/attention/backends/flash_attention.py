@@ -142,7 +142,7 @@ class RBLNFlashAttentionBackend(AttentionBackend):
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
-        return [32, 64, 80, 96, 128, 160, 192, 224, 256]
+        return [32, 64, 80, 96, 128, 160, 192, 224, 256, 512]
 
 
 @dataclass
@@ -153,6 +153,7 @@ class RBLNFlashAttentionMetadata:
     # For RBLN Attention
     is_prefill: bool
     attn_masks: torch.Tensor | None = None
+    mm_prefix_row_ends: torch.Tensor | None = None
     kv_caches: list[torch.Tensor] | None = None
     kv_cache_view_infos: list[KVCacheViewInfo] | None = None
 
@@ -160,6 +161,9 @@ class RBLNFlashAttentionMetadata:
     cache_seq_lens: torch.Tensor | None = None
     cache_offsets: torch.Tensor | None = None
     local_block_tables: torch.Tensor | None = None
+    # TODO(RBLN): fold into `attn_masks`. A builder serves one KV cache group,
+    # so sliding layers never read `attn_masks`; a sliding group then has to
+    # skip the non-causal full-width mask it builds today.
     swa_attn_masks: torch.Tensor | None = None
 
     use_custom_kernel: bool = False
@@ -227,6 +231,16 @@ class RBLNFlashAttentionMetadataBuilder(
                 "--rbln-use-custom-kernel: rbln_triton_ops has no "
                 "sliding_window_attention_v1 kernel."
             )
+        if self.model_config.is_mm_prefix_lm and isinstance(
+            kv_cache_spec, RBLNSlidingWindowSpec
+        ):
+            raise NotImplementedError(
+                "Multimodal ranges of an mm prefix LM attend both ways on sliding "
+                "layers, which needs the masked sliding_window_attention_v1 of "
+                "REBEL CR13; this device's sliding-window kernel is causal only. "
+                "Serve it with every --limit-mm-per-prompt modality 0 and without "
+                "--enable-mm-embeds."
+            )
 
         self._staged: dict[tuple, torch.Tensor] = {}
 
@@ -267,7 +281,11 @@ class RBLNFlashAttentionMetadataBuilder(
         is_prompt_sorted: bool = False,
         num_accepted: torch.Tensor | None = None,
         state_load_pos: torch.Tensor | None = None,
+        mm_prefix_row_ends: torch.Tensor | None = None,
     ) -> RBLNFlashAttentionMetadata:
+        """`mm_prefix_row_ends`, on a prefill of an mm prefix LM, holds for each
+        padded row of the step the last step-local row it may read: itself, or
+        its range's last position for an mm row. None on any other step."""
         num_reqs = common_attn_metadata.num_reqs
         # NOTE(RBLN): vllm-rbln keeps attention metadata on the host and copies
         # to the device only when constructing RBLNFlashAttentionMetadata below.
@@ -350,9 +368,12 @@ class RBLNFlashAttentionMetadataBuilder(
                 # Generate sliding window attention mask for decode
                 # mask[b, s] = 1.0 if s <= cache_seq_lens[b] else 0.0
                 positions = torch.arange(sliding_window)[None, :]
-                swa_attn_masks = torch.where(positions - cache_seq_lens > 0, 0.0, 1.0)[
-                    :, None, None, :
-                ]
+                swa_attn_masks = self._stage(
+                    torch.where(positions - cache_seq_lens > 0, 0.0, 1.0)[
+                        :, None, None, :
+                    ],
+                    "swa_attn_masks",
+                )
 
             local_block_tables = block_tables_tensor[..., :1]
 
@@ -361,11 +382,12 @@ class RBLNFlashAttentionMetadataBuilder(
             block_tables=self._stage(block_tables_tensor, "block_tables"),
             is_prefill=is_prefill,
             attn_masks=self._stage(attn_masks, "attn_masks"),
+            mm_prefix_row_ends=self._stage(mm_prefix_row_ends, "mm_prefix_row_ends"),
             swa_appends=self.swa_appends,
             cache_seq_lens=self._stage(cache_seq_lens, "cache_seq_lens"),
             cache_offsets=self._stage(cache_offsets, "cache_offsets"),
             local_block_tables=self._stage(local_block_tables, "local_block_tables"),
-            swa_attn_masks=self._stage(swa_attn_masks, "swa_attn_masks"),
+            swa_attn_masks=swa_attn_masks,
             use_custom_kernel=self.use_custom_kernel,
             is_prompt_sorted=is_prompt_sorted,
             num_accepted=self._stage(
@@ -592,6 +614,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     attn_metadata.block_tables,
                     self.sliding_window,
                     self.sinks,
+                    attn_mask=attn_metadata.swa_attn_masks,
                     is_prompt_sorted=attn_metadata.is_prompt_sorted,
                 )
             else:
