@@ -29,7 +29,6 @@ from .qwen import (
     build_qwen3_asr_config,
     build_qwen3_vl_config,
     build_qwen3_vl_moe_config,
-    build_qwen3_vl_reranker_config,
 )
 
 MULTIMODAL_CONFIG_BUILDERS: dict[
@@ -49,7 +48,7 @@ MULTIMODAL_CONFIG_BUILDERS: dict[
     "qwen3_vl": build_qwen3_vl_config,
     "qwen3_vl_embedding": build_qwen3_vl_config,
     "qwen3_vl_moe": build_qwen3_vl_moe_config,
-    "qwen3_vl_reranker": build_qwen3_vl_reranker_config,
+    "qwen3_vl_reranker": build_qwen3_vl_config,
     "qwen3_5": build_qwen3_5_config,
     "qwen3_asr": build_qwen3_asr_config,
 }

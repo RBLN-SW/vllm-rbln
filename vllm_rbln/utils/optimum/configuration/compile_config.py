@@ -419,6 +419,8 @@ def _for_multimodal(
     decoder_config["kvcache_block_size"] = block_size
     if envs.VLLM_RBLN_USE_NESTED_COMPILE_REGION:
         decoder_config["nested_compile_region"] = True
+    if model_name == "qwen3_vl_reranker":
+        decoder_config["phases"] = ["prefill"]
     return model_cls, rbln_config
 
 
