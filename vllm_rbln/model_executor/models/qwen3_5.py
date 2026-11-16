@@ -97,11 +97,19 @@ class RBLNQwen3_5ForConditionalGeneration(
     Qwen3_5ForConditionalGeneration, SupportsRBLNMultiModal
 ):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "model"):
+        # A video that reached the encoder would fail there and take the engine
+        # down with it, so the engine starts only with video off.
+        mm_config = vllm_config.model_config.get_multimodal_config()
+        if mm_config.get_limit_per_prompt("video") > 0:
+            raise NotImplementedError(
+                "Qwen3.5 video inputs are not supported on RBLN. Disable video "
+                "with --limit-mm-per-prompt '{\"video\": 0}' to serve images or "
+                "text."
+            )
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         object.__setattr__(self, "_mm_encoder", None)
         # Upstream builds no vision tower when images are off (a placeholder
         # stands in for it).
-        mm_config = vllm_config.model_config.get_multimodal_config()
         self.has_vision = mm_config.get_limit_per_prompt("image") > 0
         self.encoder_patches = 0
         self.encoder_grid: list[int] = []
@@ -237,9 +245,6 @@ class RBLNQwen3_5ForConditionalGeneration(
                 out = encoder(*self._encoder_inputs(pixels, grid))
                 embeds.append(out[: math.prod(grid) // (merge * merge)].cpu())
         return tuple(embeds)
-
-    def _process_video_input(self, video_input) -> tuple[torch.Tensor, ...]:
-        raise NotImplementedError("Qwen3.5 video inputs are not supported on RBLN")
 
     def forward(
         self,
