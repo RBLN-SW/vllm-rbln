@@ -1240,13 +1240,14 @@ class _RBLNGlm5NextMultiModalProcessor(Glm5NextMultiModalProcessor):
             pixels = "pixel_values" if modality == "image" else "pixel_values_videos"
             if outputs.get(pixels) is None:
                 continue
-            limit = self.info.get_max_frame_tokens(modality) * merge**2
+            limit = self.info.get_max_frame_tokens(modality)
             for _, h, w in outputs[f"{modality}_grid_thw"].tolist():
-                if h * w > limit:
+                if h * w > limit * merge**2:
                     raise ValueError(
-                        f"The {modality} has {h * w} patches per temporal frame, "
-                        f"more than the {limit} the RBLN vision encoder is "
-                        "compiled for. Lower the request's max_image_tokens, "
+                        f"The {modality} has {h * w // merge**2} encoder output "
+                        f"tokens per temporal group, more than the {limit} the "
+                        "RBLN vision encoder is compiled for. "
+                        "Lower the request's max_image_tokens, "
                         "or raise it at startup in --mm-processor-kwargs."
                     )
         return outputs
@@ -1277,7 +1278,12 @@ class _RBLNGlm5NextMultiModalProcessor(Glm5NextMultiModalProcessor):
             timestamps = item["timestamps"].data
             assert isinstance(grid, torch.Tensor)
             assert isinstance(timestamps, torch.Tensor)
-            assert len(timestamps) == int(grid[0])
+            grid_t = int(grid[0])
+            if len(timestamps) != grid_t:
+                raise ValueError(
+                    "Video timestamp count does not match video_grid_thw[0]: "
+                    f"{len(timestamps)} timestamps for grid_t={grid_t}."
+                )
             frame = [config.image_start_token_id]
             frame += [config.image_token_id] * (int(grid[1] * grid[2]) // merge2)
             frame += [config.image_end_token_id]

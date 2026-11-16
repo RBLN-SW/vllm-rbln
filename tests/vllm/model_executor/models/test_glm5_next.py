@@ -427,23 +427,27 @@ def test_request_frame_size_cannot_exceed_startup_bound(monkeypatch, modality, w
         get_max_frame_tokens=lambda modality: 4,
     )
     if width > 4:
-        with pytest.raises(ValueError, match="more than the 16"):
+        with pytest.raises(
+            ValueError,
+            match="8 encoder output tokens per temporal group, more than the 4",
+        ):
             processor._apply_hf_processor_main(None, {})
     else:
         assert processor._apply_hf_processor_main(None, {}) is outputs
 
 
 @pytest.mark.parametrize(
-    "sample,indices,kwargs,timestamps",
+    "sample,frames,indices,kwargs,timestamps",
     [
-        (True, list(range(30)), {}, [0, 1, 2]),
-        (True, list(range(30)), {"fps": 1.0}, [0, 2]),
-        (False, list(range(5)), {}, [0, 0, 0]),
-        (False, [0, 0, 1, 1, 2], {}, [0, 0, 0]),
+        (True, 30, list(range(30)), {}, [0, 1, 2]),
+        (True, 30, list(range(30)), {"fps": 1.0}, [0, 2]),
+        (False, 5, list(range(5)), {}, [0, 0, 0]),
+        (False, 5, [0, 0, 1, 1, 2], {}, [0, 0, 0]),
+        pytest.param(False, 5, [0, 1], {}, None, id="timestamp-count-mismatch"),
     ],
 )
 def test_video_placeholders_follow_processed_frames(
-    sample, indices, kwargs, timestamps
+    sample, frames, indices, kwargs, timestamps
 ):
     import numpy as np
     from tokenizers import Tokenizer
@@ -505,7 +509,6 @@ def test_video_placeholders_follow_processed_frames(
     processor = glm._RBLNGlm5NextMultiModalProcessor(
         info, glm.Glm4vDummyInputsBuilder(info)
     )
-    frames = len(indices)
     video = np.zeros((frames, 112, 112, 3), dtype=np.uint8)
     metadata = dict(
         total_num_frames=frames,
@@ -523,6 +526,11 @@ def test_video_placeholders_follow_processed_frames(
         hf_processor_mm_kwargs=kwargs,
         cache=MultiModalProcessorOnlyCache(ctx.model_config),
     )
+
+    if timestamps is None:
+        with pytest.raises(ValueError, match="1 timestamps for grid_t=3"):
+            processor.apply(inputs, TimingContext(enabled=False))
+        return
 
     for _ in range(2):
         output = processor.apply(inputs, TimingContext(enabled=False))
