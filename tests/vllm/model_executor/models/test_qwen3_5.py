@@ -86,17 +86,15 @@ def test_a_video_limit_above_zero_is_refused(limits):
 
 
 def _build_with_token_budgets(monkeypatch, budgets):
-    """The model with upstream's construction stubbed out: a 512 x 512 largest
-    image (1024 patches, 256 output tokens) and the given budgets."""
+    """The model with upstream's construction stubbed out: a largest image of
+    256 output tokens (1024 patches) and the given budgets."""
 
     def init(self, *, vllm_config, prefix="model"):
         torch.nn.Module.__init__(self)
-        self.visual = SimpleNamespace(patch_size=PATCH, spatial_merge_size=MERGE)
+        self.visual = SimpleNamespace(spatial_merge_size=MERGE)
 
     monkeypatch.setattr(qwen3_5.Qwen3_5ForConditionalGeneration, "__init__", init)
-    info = SimpleNamespace(
-        get_image_size_with_most_features=lambda: SimpleNamespace(height=512, width=512)
-    )
+    info = SimpleNamespace(get_max_image_tokens=lambda: 256)
     monkeypatch.setattr(
         qwen3_5.MULTIMODAL_REGISTRY, "get_processing_info", lambda model_config: info
     )
@@ -131,14 +129,11 @@ def test_token_budgets_below_the_largest_image_are_refused(monkeypatch):
 
 
 def test_a_request_image_above_the_start_up_limit_is_refused(monkeypatch):
-    # The engine starts with a 512 x 512 limit: 1024 patches.
+    # The engine starts with a limit of 256 output tokens: 1024 patches.
     processor = RBLNQwen3_5MultiModalProcessor.__new__(RBLNQwen3_5MultiModalProcessor)
-    largest = SimpleNamespace(height=512, width=512)
     processor.info = SimpleNamespace(
-        get_image_size_with_most_features=lambda: largest,
-        get_hf_config=lambda: SimpleNamespace(
-            vision_config=SimpleNamespace(patch_size=PATCH)
-        ),
+        get_max_image_tokens=lambda: 256,
+        get_image_processor=lambda: SimpleNamespace(merge_size=MERGE),
     )
     grids = torch.tensor([[1, 32, 32]])
     monkeypatch.setattr(

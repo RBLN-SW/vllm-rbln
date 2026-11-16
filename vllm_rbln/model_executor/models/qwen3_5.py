@@ -108,17 +108,15 @@ class RBLNQwen3_5MultiModalProcessor(Qwen3VLMultiModalProcessor):
         hf_kwargs: Mapping[str, object],
     ) -> BatchFeature:
         outputs = super()._apply_hf_processor_main(mm_items, hf_kwargs)
-        grids = outputs.get("image_grid_thw")
-        if grids is not None:
-            size = self.info.get_image_size_with_most_features()
-            patch = self.info.get_hf_config().vision_config.patch_size
-            limit = (size.height // patch) * (size.width // patch)
-            for t, h, w in grids.tolist():
-                if t * h * w > limit:
+        if "image_grid_thw" in outputs:
+            merge = self.info.get_image_processor().merge_size
+            limit = self.info.get_max_image_tokens() * merge**2
+            for grid in outputs["image_grid_thw"].tolist():
+                if math.prod(grid) > limit:
                     raise ValueError(
-                        f"The image has {t * h * w} patches, more than the {limit} "
-                        "the RBLN vision encoder is compiled for. Lower the "
-                        "request's max_pixels, or raise it at start-up in "
+                        f"The image grid {grid} has {math.prod(grid)} patches, more "
+                        f"than the {limit} the RBLN vision encoder is compiled for. "
+                        "Lower the request's max_pixels, or raise it at start-up in "
                         "--mm-processor-kwargs."
                     )
         return outputs
@@ -150,10 +148,8 @@ class RBLNQwen3_5ForConditionalGeneration(
         self.mm_encoder_patch_buckets: list[int] = []
         if self.has_vision:
             info = MULTIMODAL_REGISTRY.get_processing_info(vllm_config.model_config)
-            size = info.get_image_size_with_most_features()
-            patch = self.visual.patch_size
             merge = self.visual.spatial_merge_size
-            max_tokens = (size.height // patch) * (size.width // patch) // merge**2
+            max_tokens = info.get_max_image_tokens()
             # One compiled encoder shape per budget; an image is padded to the
             # smallest that holds its patches.
             budgets = sorted(vllm_config.additional_config.encoder_token_budgets) or [
