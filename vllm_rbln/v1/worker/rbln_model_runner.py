@@ -3791,12 +3791,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         # Reinitialize need to after initialize_attn_backend
         self.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
         self.initialize_kv_cache_tensors(kv_cache_config, kernel_block_sizes)
-        transferred_aux_specs = {
-            name: spec
-            for name, spec in self.aux_kv_cache_specs.items()
-            if not spec.verify_only
-        }
-        if transferred_aux_specs and has_kv_transfer_group():
+        if self.aux_kv_cache_specs and has_kv_transfer_group():
             connectors = list(iter_kv_connectors(get_kv_transfer_group()))
             unsupported = [
                 type(connector).__name__
@@ -3809,6 +3804,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     f"{', '.join(unsupported)}. "
                     "Auxiliary caches must be transferred with their owners' blocks."
                 )
+            transferred_aux_specs = {
+                name: spec
+                for name, spec in self.aux_kv_cache_specs.items()
+                if not spec.verify_only
+            }
             for connector in connectors:
                 connector.register_block_aux_kv_caches(transferred_aux_specs)
 

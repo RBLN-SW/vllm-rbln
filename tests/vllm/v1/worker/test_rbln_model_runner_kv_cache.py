@@ -231,20 +231,6 @@ class TestBlockAuxKVCaches:
         assert set(runner.aux_kv_cache_specs) == {"layer.1", "layer.2", "layer.3"}
         assert [set(specs) for specs in aux_specs] == [{"layer.1", "layer.2"}]
 
-    @pytest.mark.parametrize("with_moved_aux", [False, True])
-    def test_a_connector_without_aux_support_is_refused_only_with_aux_to_move(
-        self, make_model_runner, monkeypatch, with_moved_aux
-    ):
-        monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: True)
-        monkeypatch.setattr(mr, "get_kv_transfer_group", lambda: SimpleNamespace())
-        auxes = [self._aux("layer.0", verify_only=True)]
-        if with_moved_aux:
-            auxes.append(self._aux("layer.0"))
-            with pytest.raises(NotImplementedError, match="not supported by"):
-                self._runner_with_aux(make_model_runner, monkeypatch, auxes)
-        else:
-            self._runner_with_aux(make_model_runner, monkeypatch, auxes)
-
     @pytest.mark.parametrize("strict_producer", [False, True])
     def test_a_strict_producer_does_not_allocate_a_verify_only_aux(
         self, make_model_runner, monkeypatch, strict_producer
