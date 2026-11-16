@@ -3685,6 +3685,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 continue
             assert isinstance(spec, RBLNBlockAuxSpec), spec
             assert spec.owner in extent_of, f"{layer_name}: no owner {spec.owner}"
+            if spec.verify_only and self.is_strict_kv_producer:
+                # No graph a strict producer compiles places it. Its module's
+                # construction-time layer_index could name another layer's cache.
+                module.layer_index = None
+                continue
             shape = (num_blocks, *spec.block_shape)
             kind = (spec.owner, shape, spec.dtype)
             key = (extent_of[spec.owner], shape, spec.dtype, ordinals[kind])
@@ -3799,8 +3804,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     f"{', '.join(unsupported)}. "
                     "Auxiliary caches must be transferred with their owners' blocks."
                 )
+            transferred_aux_specs = {
+                name: spec
+                for name, spec in self.aux_kv_cache_specs.items()
+                if not spec.verify_only
+            }
             for connector in connectors:
-                connector.register_block_aux_kv_caches(self.aux_kv_cache_specs)
+                connector.register_block_aux_kv_caches(transferred_aux_specs)
 
         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
         self.cache_config.num_cpu_blocks = 0
