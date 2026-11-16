@@ -1007,9 +1007,11 @@ class TestKvCopyStreamReserve:
         "dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "fp8"]
     )
     @pytest.mark.parametrize("sub_block_size", [None, 512], ids=["default", "explicit"])
-    @pytest.mark.parametrize("chunks", [[256, 512], [256, 512, 768]])
-    def test_grouped_attention_reserves_for_the_scheduler(
-        self, main_spec, dtype, sub_block_size, chunks, cr13
+    @pytest.mark.parametrize(
+        "chunks, crosses_blocks", [([256, 512], False), ([256, 512, 768], True)]
+    )
+    def test_grouped_attention_matches_the_scheduler(
+        self, main_spec, dtype, sub_block_size, chunks, crosses_blocks, cr13
     ):
         from vllm_rbln.v1.core.utils import sub_block_size_in_use
 
@@ -1051,24 +1053,44 @@ class TestKvCopyStreamReserve:
             ),
         )
         scheduler_config = generate_scheduler_kv_cache_config([config])
+        text_config = SimpleNamespace()
+        if main_spec is MLAAttentionSpec:
+            text_config.index_topk = 2048
+        model_config = SimpleNamespace(
+            hf_text_config=text_config, hf_config=SimpleNamespace()
+        )
+        cache_dtype = "fp8" if dtype is torch.float8_e4m3fn else "auto"
+        rejected = packed_mla and crosses_blocks
         for kv_config in (config, scheduler_config):
-            assert (
-                sub_block_size_in_use(
+            with (
+                pytest.raises(ValueError, match="FP8 DSA indexer scale cache")
+                if rejected
+                else nullcontext()
+            ):
+                result = sub_block_size_in_use(
                     enable_prefix_caching=True,
                     sub_block_cache=True,
                     block_size=1024,
                     prefill_chunk_sizes=chunks,
                     kv_cache_config=kv_config,
+                    model_config=model_config,
+                    cache_dtype=cache_dtype,
                     sub_block_size=sub_block_size,
                 )
-                == 512
-            )
+                assert result == 512
         sizer = self._sizer(sub_block_size=sub_block_size, prefill_chunk_sizes=chunks)
         sizer.model_runner.kv_cache_config = config
-        assert (
-            DynamicKvSizer.copy_stream_reserve_bytes(sizer)
-            == dks.DYNAMIC_KV_COPY_STREAM_RESERVE_BYTES
-        )
+        sizer.vllm_config.model_config = model_config
+        sizer.cache_config.cache_dtype = cache_dtype
+        with (
+            pytest.raises(ValueError, match="FP8 DSA indexer scale cache")
+            if rejected
+            else nullcontext()
+        ):
+            assert (
+                DynamicKvSizer.copy_stream_reserve_bytes(sizer)
+                == dks.DYNAMIC_KV_COPY_STREAM_RESERVE_BYTES
+            )
 
     @staticmethod
     def _sizer(
@@ -1080,14 +1102,17 @@ class TestKvCopyStreamReserve:
     ):
         return SimpleNamespace(
             cache_config=SimpleNamespace(
-                enable_prefix_caching=prefix_caching, block_size=1024
+                enable_prefix_caching=prefix_caching,
+                block_size=1024,
+                cache_dtype="auto",
             ),
             vllm_config=SimpleNamespace(
+                model_config=SimpleNamespace(),
                 additional_config=SimpleNamespace(
                     enable_sub_block_cache=sub_block_cache,
                     sub_block_size=sub_block_size,
                     prefill_chunk_size=list(prefill_chunk_sizes),
-                )
+                ),
             ),
             model_runner=SimpleNamespace(kv_cache_config=SimpleNamespace()),
         )

@@ -130,6 +130,8 @@ class RBLNScheduler(Scheduler):
             block_size=self.block_size,
             prefill_chunk_sizes=prefill_chunk_sizes,
             kv_cache_config=self.kv_cache_config,
+            model_config=self.vllm_config.model_config,
+            cache_dtype=self.cache_config.cache_dtype,
             sub_block_size=rbln_config.sub_block_size,
         )
         if sub_block_size is not None:
