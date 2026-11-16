@@ -95,6 +95,36 @@ _SAMPLING_DEFAULT_KEYS = frozenset(
 )
 
 
+@contextlib.contextmanager
+def _patched(obj, values: Mapping[str, object]):
+    if obj is None:
+        yield
+        return
+    saved = {name: getattr(obj, name) for name in values}
+    try:
+        for name, value in values.items():
+            object.__setattr__(obj, name, value)
+        yield
+    finally:
+        for name, value in saved.items():
+            object.__setattr__(obj, name, value)
+
+
+_REQUEST_LIMIT_FIELDS = {"max_logprobs": 0}
+
+
+def _draft_model(vllm_config):
+    spec = getattr(vllm_config, "speculative_config", None)
+    return getattr(spec, "draft_model_config", None)
+
+
+def _draft_model_hash(draft) -> str | None:
+    if draft is None:
+        return None
+    with _patched(draft, _REQUEST_LIMIT_FIELDS):
+        return draft.compute_hash()
+
+
 def _warmup_graph_set_factors(
     vllm_config, extra_hash_factors: Mapping[str, object] | None = None
 ) -> str:
@@ -109,7 +139,7 @@ def _warmup_graph_set_factors(
     cache = getattr(vllm_config, "cache_config", None)
     spec = getattr(vllm_config, "speculative_config", None)
     # Not draft_parallel_config: it carries the same per-launch ports.
-    draft = getattr(spec, "draft_model_config", None)
+    draft = _draft_model(vllm_config)
     ec = vllm_config.ec_transfer_config
     factors: dict[str, object] = {
         "max_num_seqs": normalize_value(getattr(scheduler, "max_num_seqs", None)),
@@ -124,7 +154,7 @@ def _warmup_graph_set_factors(
             getattr(spec, "num_speculative_tokens", None)
         ),
         "spec_method": normalize_value(getattr(spec, "method", None)),
-        "draft_model": draft.compute_hash() if draft is not None else None,
+        "draft_model": _draft_model_hash(draft),
         "draft_tensor_parallel_size": normalize_value(
             getattr(spec, "draft_tensor_parallel_size", None)
         ),
@@ -155,25 +185,22 @@ def _generation_config_factors(model_config) -> str:
     )
 
 
-@contextlib.contextmanager
-def _patched(obj, values: Mapping[str, object]):
-    saved = {name: getattr(obj, name) for name in values}
-    try:
-        for name, value in values.items():
-            object.__setattr__(obj, name, value)
-        yield
-    finally:
-        for name, value in saved.items():
-            object.__setattr__(obj, name, value)
-
-
 def _stable_compute_hash(vllm_config) -> str:
-    """compute_hash() with the per-launch ParallelConfig ports zeroed and the
-    generation config reset; _generation_config_factors() keys the latter."""
+    """compute_hash() with the per-launch ParallelConfig ports zeroed, the
+    request limits pinned, and the generation config reset;
+    _generation_config_factors() keys the latter."""
     pc = vllm_config.parallel_config
     ports = {f.name: 0 for f in dataclasses.fields(pc) if "port" in f.name.lower()}
-    generation = {"generation_config": "auto", "override_generation_config": {}}
-    with _patched(pc, ports), _patched(vllm_config.model_config, generation):
+    model_fields = {
+        "generation_config": "auto",
+        "override_generation_config": {},
+        **_REQUEST_LIMIT_FIELDS,
+    }
+    with (
+        _patched(pc, ports),
+        _patched(vllm_config.model_config, model_fields),
+        _patched(_draft_model(vllm_config), _REQUEST_LIMIT_FIELDS),
+    ):
         return vllm_config.compute_hash()
 
 

@@ -32,7 +32,7 @@ import numpy as np
 import pytest
 from vllm.config import KVTransferConfig, ParallelConfig
 
-from tests.vllm.vllm_config import make_vllm_config
+from tests.vllm.vllm_config import DEFAULT_MODEL, local_model_path, make_vllm_config
 from vllm_rbln.v1.worker import mega_cache, rbln_model_runner
 
 MODEL = "meta-llama/Llama-3"
@@ -65,6 +65,7 @@ def _stub_config(digest: str = "cfghash"):
             generation_config="auto",
             override_generation_config={},
             try_get_generation_config=dict,
+            max_logprobs=20,
         ),
         kv_transfer_config=None,
         ec_transfer_config=None,
@@ -462,6 +463,28 @@ class TestSignatureVllmConfig:
         config = make_vllm_config(override_generation_config={"top_p": 0.9})
         mega_cache.config_signature(config)
         assert config.model_config.override_generation_config == {"top_p": 0.9}
+
+    def test_max_logprobs_does_not_invalidate(self):
+        base = mega_cache.config_signature(make_vllm_config())
+        assert mega_cache.config_signature(make_vllm_config(max_logprobs=-1)) == base
+
+    def test_max_logprobs_does_not_invalidate_the_draft(self):
+        def spec_config(max_logprobs):
+            return make_vllm_config(
+                max_logprobs=max_logprobs,
+                speculative_config={
+                    "method": "draft_model",
+                    "model": local_model_path(DEFAULT_MODEL),
+                    "num_speculative_tokens": 2,
+                },
+            )
+
+        base = spec_config(20)
+        assert base.speculative_config.draft_model_config is not None
+        assert mega_cache.config_signature(
+            spec_config(-1)
+        ) == mega_cache.config_signature(base)
+        assert base.speculative_config.draft_model_config.max_logprobs == 20
 
     def test_port_fields_restored(self):
         config = make_vllm_config()
