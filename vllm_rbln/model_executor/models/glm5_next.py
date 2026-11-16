@@ -115,6 +115,18 @@ from vllm_rbln.v1.worker.utils import (
 )
 from vllm_rbln.v1.worker.utils import pipeline_adjusted_layer_index
 
+try:
+    # A compiler with this kernel also cuts the mhc_* kernels of a decode batch
+    # by rows (or runs a small batch whole) and lays out decode's weights around
+    # them as prefill's; an older one keeps decode on the plain mHC ops.
+    from rebel.core.custom_converter.kernel_table.mhc import (  # noqa: F401
+        KERNEL_MHC_READ_ROWS,
+    )
+except ImportError:
+    _CUTS_THE_DECODE_MHC = False
+else:
+    _CUTS_THE_DECODE_MHC = True
+
 SLOT_DSA_LATENT, SLOT_DSA_INDEX_KEY, SLOT_DSA_INDEX_SCALE, SLOT_DSA_INDEX_TAIL = range(
     4
 )
@@ -897,10 +909,11 @@ class RBLNGlm5NextDecoderLayer(nn.Module):
     def _sublayer(self, streams, fn, scale, base, norm, sublayer) -> torch.Tensor:
         ops = torch.ops.rbln_custom_ops
         streams_f32 = streams.float()
-        if is_prefill_step():
-            # The compiler cuts the mhc_* kernels by tokens over the chiplets, so
-            # the streams stay split between sublayers (fp32 holding bf16 values)
-            # and only the sublayer input is gathered.
+        if _CUTS_THE_DECODE_MHC or is_prefill_step():
+            # The compiler cuts the mhc_* kernels over the chiplets, by tokens in
+            # prefill and by batch rows in decode, so the streams stay split
+            # between sublayers (fp32 holding bf16 values) and only the sublayer
+            # input is gathered.
             logits = ops.mhc_mix(streams_f32, fn, scale, base, eps=self.rms_eps)
             x = ops.mhc_read(streams_f32, logits, eps=self.hc_eps).to(norm.weight.dtype)
             y = sublayer(norm(x))
@@ -1072,7 +1085,14 @@ class RBLNGlm5NextModel(nn.Module):
             return IntermediateTensors(
                 {"streams": streams.transpose(1, 2).reshape(batch, tokens, -1)}
             )
-        return self.norm(streams.mean(dim=1))
+        hidden = streams.mean(dim=1)
+        if _CUTS_THE_DECODE_MHC and not is_prefill_step():
+            # A read gathers the rows; left cut, they would reach lm_head, whose
+            # weight takes the layout prefill gives it.
+            return torch.ops.rbln_custom_ops.residual_read(
+                hidden, self.norm.weight, self.norm.variance_epsilon
+            )
+        return self.norm(hidden)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         return _load_glm5_next_weights(
