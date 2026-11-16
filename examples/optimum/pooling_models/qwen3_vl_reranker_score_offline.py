@@ -12,17 +12,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# The inputs and score() calls follow upstream vLLM's Qwen3-VL-Reranker example:
+# https://github.com/vllm-project/vllm/blob/main/examples/pooling/score/vision_reranker_offline.py
+
 import fire
 from huggingface_hub import hf_hub_download
 from vllm import LLM
+from vllm.multimodal.utils import encode_image_url, fetch_image
 
-IMAGE_URL = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg"
-QUERY = "A woman playing with her dog on a beach at sunset."
-DOCUMENTS = [
-    {"content": [{"type": "image_url", "image_url": {"url": IMAGE_URL}}]},
-    {"content": [{"type": "text", "text": "A woman walks her dog along the shore."}]},
-    # Deliberately irrelevant, to show the scores separate.
-    {"content": [{"type": "text", "text": "City skyline at night."}]},
+query = "A woman playing with her dog on a beach at sunset."
+document = (
+    "A woman shares a joyful moment with her golden retriever on a sun-drenched "
+    "beach at sunset, as the dog offers its paw in a heartwarming display of "
+    "companionship and trust."
+)
+image_url = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg"
+documents = [
+    {
+        "type": "text",
+        "text": document,
+    },
+    {
+        "type": "image_url",
+        "image_url": {"url": image_url},
+    },
+    {
+        "type": "image_url",
+        "image_url": {"url": encode_image_url(fetch_image(image_url))},
+    },
 ]
 
 
@@ -55,8 +72,42 @@ def main(
     with open(template_path) as f:
         chat_template = f.read()
 
-    outputs = llm.score(QUERY, DOCUMENTS, chat_template=chat_template)
-    print(f"scores: {[output.outputs.score for output in outputs]}")
+    print("Query: string & Document: string")
+    outputs = llm.score(query, document)
+    print("Relevance scores:", [output.outputs.score for output in outputs])
+
+    print("Query: string & Document: text")
+    outputs = llm.score(query, {"content": [documents[0]]}, chat_template=chat_template)
+    print("Relevance scores:", [output.outputs.score for output in outputs])
+
+    print("Query: string & Document: image url")
+    outputs = llm.score(query, {"content": [documents[1]]}, chat_template=chat_template)
+    print("Relevance scores:", [output.outputs.score for output in outputs])
+
+    print("Query: string & Document: image base64")
+    outputs = llm.score(query, {"content": [documents[2]]}, chat_template=chat_template)
+    print("Relevance scores:", [output.outputs.score for output in outputs])
+
+    print("Query: string & Document: text + image url")
+    outputs = llm.score(
+        query,
+        {"content": [documents[0], documents[1]]},
+        chat_template=chat_template,
+    )
+    print("Relevance scores:", [output.outputs.score for output in outputs])
+
+    print("Query: string & Document: list")
+    outputs = llm.score(
+        query,
+        [
+            document,
+            {"content": [documents[0]]},
+            {"content": [documents[1]]},
+            {"content": [documents[0], documents[1]]},
+        ],
+        chat_template=chat_template,
+    )
+    print("Relevance scores:", [output.outputs.score for output in outputs])
 
 
 if __name__ == "__main__":

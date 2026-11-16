@@ -12,38 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# The inputs and embed() calls follow upstream vLLM's Qwen3-VL-Embedding example:
+# https://github.com/vllm-project/vllm/blob/main/examples/pooling/embed/vision_embedding_offline.py
+
 import fire
-import torch
-from transformers import AutoProcessor
 from vllm import LLM
 from vllm.multimodal.utils import fetch_image
+from vllm.utils.print_utils import print_embeddings
 
-IMAGE_URL = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg"
-TEXTS = [
-    "A woman playing with her dog on a beach at sunset.",
-    "City skyline view from a high-rise building at night.",
-]
+image_url = "https://vllm-public-assets.s3.us-west-2.amazonaws.com/multimodal_asset/cat_snow.jpg"
+text = "A cat standing in the snow."
+multi_modal_data = {"image": fetch_image(image_url)}
 
-
-def build_input(processor, text=None, image=None):
-    content = []
-    if image is not None:
-        content.append({"type": "image"})
-    if text is not None:
-        content.append({"type": "text", "text": text})
-    messages = [
-        {
-            "role": "system",
-            "content": [{"type": "text", "text": "Represent the user's input."}],
-        },
-        {"role": "user", "content": content},
-    ]
-    prompt = processor.apply_chat_template(
-        messages, add_generation_prompt=True, tokenize=False
-    )
-    if image is None:
-        return prompt
-    return {"prompt": prompt, "multi_modal_data": {"image": image}}
+default_instruction = "Represent the user's input."
+image_placeholder = "<|vision_start|><|image_pad|><|vision_end|>"
+prompt_text = (
+    f"<|im_start|>system\n{default_instruction}<|im_end|>\n"
+    f"<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n"
+)
+prompt_image = (
+    f"<|im_start|>system\n{default_instruction}<|im_end|>\n"
+    f"<|im_start|>user\n{image_placeholder}<|im_end|>\n<|im_start|>assistant\n"
+)
+prompt_image_text = (
+    f"<|im_start|>system\n{default_instruction}<|im_end|>\n"
+    f"<|im_start|>user\n{image_placeholder}{text}<|im_end|>\n<|im_start|>assistant\n"
+)
 
 
 def main(
@@ -51,25 +45,43 @@ def main(
     vit_max_seq_len: int = 16384,
     model: str = "Qwen/Qwen3-VL-Embedding-2B",
 ):
+    # Unlike upstream, images are not pre-resized with qwen-vl-utils: the
+    # processor's own max_pixels keeps each image within vit_max_seq_len.
     llm = LLM(
         model=model,
         runner="pooling",
         block_size=4096,
         max_model_len=max_model_len,
+        limit_mm_per_prompt={"image": 1},
         # optimum-rbln requires the vision encoder's patch budget per image.
         additional_config={
             "optimum_overrides": {"visual": {"max_seq_len": vit_max_seq_len}}
         },
     )
-    processor = AutoProcessor.from_pretrained(model)
 
-    inputs = [build_input(processor, text=text) for text in TEXTS]
-    inputs.append(build_input(processor, image=fetch_image(IMAGE_URL)))
-    outputs = llm.embed(inputs)
+    print("Text embedding output:")
+    outputs = llm.embed(prompt_text, use_tqdm=False)
+    print_embeddings(outputs[0].outputs.embedding)
 
-    embeddings = torch.stack([torch.tensor(o.outputs.embedding) for o in outputs])
-    scores = embeddings[:-1] @ embeddings[-1]
-    print(f"text-image scores: {scores.tolist()}")
+    print("Image embedding output:")
+    outputs = llm.embed(
+        {
+            "prompt": prompt_image,
+            "multi_modal_data": multi_modal_data,
+        },
+        use_tqdm=False,
+    )
+    print_embeddings(outputs[0].outputs.embedding)
+
+    print("Image+Text embedding output:")
+    outputs = llm.embed(
+        {
+            "prompt": prompt_image_text,
+            "multi_modal_data": multi_modal_data,
+        },
+        use_tqdm=False,
+    )
+    print_embeddings(outputs[0].outputs.embedding)
 
 
 if __name__ == "__main__":
