@@ -225,6 +225,7 @@ class RBLNGlm5NextAuxCache(_RBLNGlm5NextCache):
         dtype: torch.dtype,
         prefix_cacheable: bool = True,
         head_axis: int | None = None,
+        verify_only: bool = False,
     ) -> None:
         super().__init__(prefix)
         self.owner = owner
@@ -232,6 +233,7 @@ class RBLNGlm5NextAuxCache(_RBLNGlm5NextCache):
         self.dtype = dtype
         self.prefix_cacheable = prefix_cacheable
         self.head_axis = head_axis
+        self.verify_only = verify_only
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> None:
         return None
@@ -243,12 +245,14 @@ class RBLNGlm5NextAuxCache(_RBLNGlm5NextCache):
             self.dtype,
             prefix_cacheable=self.prefix_cacheable,
             head_axis=self.head_axis,
+            verify_only=self.verify_only,
         )
 
     def get_attn_backend(self) -> type[RBLNGlm5NextCacheBackend]:
         return RBLNGlm5NextCacheBackend
 
     def inputs(self) -> torch.Tensor:
+        assert self.layer_index is not None, f"{self.prefix} was not allocated"
         metadata = get_forward_context().attn_metadata[self.owner]
         return _resolve_kv_cache(metadata, self.layer_index)
 
@@ -457,6 +461,7 @@ class RBLNGlm5NextKDA(nn.Module):
                     dtype,
                     prefix_cacheable=False,
                     head_axis=0,
+                    verify_only=True,
                 )
                 for j, state in enumerate(self.states)
             )

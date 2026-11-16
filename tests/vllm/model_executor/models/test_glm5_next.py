@@ -249,7 +249,7 @@ def test_vision_encoder_builds_its_inputs_from_upstream_rope(monkeypatch):
     assert not key_bias[..., :8].any() and (key_bias[..., 8:] < -1e4).all()
 
 
-def test_only_scratch_aux_caches_are_left_out_of_prefix_caching(monkeypatch):
+def test_aux_cache_flags_and_an_unallocated_draft(monkeypatch):
     import vllm.distributed.parallel_state as parallel_state
     from vllm.config import set_current_vllm_config
 
@@ -280,19 +280,25 @@ def test_only_scratch_aux_caches_are_left_out_of_prefix_caching(monkeypatch):
 
     context = config.compilation_config.static_forward_context
     flags = {
-        name: module.get_aux_cache_spec(config).prefix_cacheable
+        name: (spec.prefix_cacheable, spec.verify_only)
         for name, module in context.items()
         if hasattr(module, "get_aux_cache_spec")
+        for spec in (module.get_aux_cache_spec(config),)
     }
     assert flags == {
         # KDA: two state groups, then the conv ring and a draft cache per group.
-        "model.layers.0.self_attn.attn.2": True,
-        "model.layers.0.self_attn.attn.3": False,
-        "model.layers.0.self_attn.attn.4": False,
+        "model.layers.0.self_attn.attn.2": (True, False),
+        "model.layers.0.self_attn.attn.3": (False, True),
+        "model.layers.0.self_attn.attn.4": (False, True),
         # DSA indexer: the key scales, then the tail ring.
-        "model.layers.1.self_attn.attn.2": True,
-        "model.layers.1.self_attn.attn.3": False,
+        "model.layers.1.self_attn.attn.2": (True, False),
+        "model.layers.1.self_attn.attn.3": (False, False),
     }
+    # A strict producer leaves the drafts unallocated, with no layer index.
+    draft = context["model.layers.0.self_attn.attn.3"]
+    draft.layer_index = None
+    with pytest.raises(AssertionError, match="was not allocated"):
+        draft.inputs()
 
 
 @pytest.mark.parametrize("video_first", [False, True])
