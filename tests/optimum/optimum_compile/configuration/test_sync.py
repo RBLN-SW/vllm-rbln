@@ -62,16 +62,37 @@ class TestSync:
         sync.sync_vllm_and_optimum(cfg)
         assert cfg.scheduler_config.max_num_batched_tokens == 8192
 
-    def test_paligemma_rejects_user_chunk_that_differs_from_final_inputs(
-        self, vllm_config_factory
+    @pytest.mark.parametrize("prefill_chunk_size", [None, 512, 8192])
+    def test_paligemma_normalizes_chunk_for_compilation_and_runtime(
+        self, monkeypatch, caplog, prefill_chunk_size, vllm_config_factory
     ):
-        with pytest.raises(ValueError, match="prefill_chunk_size"):
-            vllm_config_factory(
-                512,
-                hf_config=PaliGemmaConfig(
-                    architectures=["PaliGemmaForConditionalGeneration"]
-                ),
-            )
+        hf_config = PaliGemmaConfig(architectures=["PaliGemmaForConditionalGeneration"])
+        cfg = vllm_config_factory(prefill_chunk_size, hf_config=hf_config)
+        inputs = cfg.additional_config.compile_config
+        assert inputs.rbln_config["language_model"]["prefill_chunk_size"] == 8192
+        assert cfg.additional_config.prefill_chunk_size == [8192]
+        assert cfg.scheduler_config.max_num_batched_tokens == 8192
+        assert ("Adjusting prefill_chunk_size" in caplog.text) == (
+            prefill_chunk_size == 512
+        )
+        reference = vllm_config_factory(hf_config=hf_config)
+        assert compile_cache_name(inputs) == compile_cache_name(
+            reference.additional_config.compile_config
+        )
+
+        cache_path = Path(cfg.additional_config.artifact_path)
+        cache_path.mkdir(parents=True)
+        metadata = json.loads(json.dumps(inputs.rbln_config))
+        metadata["language_model"]["kvcache_num_blocks"] = 4
+        (cache_path / "rbln_config.json").write_text(json.dumps(metadata))
+        monkeypatch.setattr(
+            sync, "load_compiled_rbln_config", load_compiled_rbln_config
+        )
+        cached = vllm_config_factory(prefill_chunk_size, hf_config=hf_config)
+        assert cached.additional_config.precompiled
+        assert cached.additional_config.artifact_path == str(cache_path)
+        assert cached.additional_config.prefill_chunk_size == [8192]
+        assert cached.scheduler_config.max_num_batched_tokens == 8192
 
     def test_whisper_runtime_uses_final_compile_lengths(self, vllm_config_factory):
         cfg = vllm_config_factory(
@@ -156,7 +177,10 @@ class TestSync:
                 worker_cls="auto", tensor_parallel_size=1, pipeline_parallel_size=1
             ),
             scheduler_config=SimpleNamespace(
-                max_num_seqs=1, max_num_batched_tokens=2048, async_scheduling=False
+                max_num_seqs=1,
+                max_num_batched_tokens=2048,
+                max_num_scheduled_tokens=None,
+                async_scheduling=False,
             ),
             cache_config=SimpleNamespace(
                 block_size=1024,
@@ -197,16 +221,17 @@ class TestSync:
         assert not cfg.additional_config.precompiled
 
     @pytest.mark.parametrize(
-        ("user_tokens", "overrides", "expected"),
+        ("prefill_chunk_size", "overrides", "expected"),
         [
             (None, {}, 128),
             (None, {"prefill_chunk_size": 256}, 256),
             (512, {}, 512),
+            ([512], {}, 512),
             (512, {"prefill_chunk_size": 512}, 512),
         ],
     )
     def test_chunk_size_is_resolved_before_cache_lookup(
-        self, monkeypatch, user_tokens, overrides, expected, vllm_config_factory
+        self, monkeypatch, prefill_chunk_size, overrides, expected, vllm_config_factory
     ):
         observed = []
 
@@ -219,13 +244,27 @@ class TestSync:
             return compile_cache_name(inputs)
 
         monkeypatch.setattr(sync, "compile_cache_name", generate_name)
-        cfg = vllm_config_factory(user_tokens, optimum_overrides=overrides)
+        cfg = vllm_config_factory(prefill_chunk_size, optimum_overrides=overrides)
         assert observed == [expected]
-        assert cfg.scheduler_config.max_num_batched_tokens == expected
+        assert cfg.scheduler_config.max_num_batched_tokens == 8192
+        assert cfg.additional_config.prefill_chunk_size == [expected]
         assert (
             cfg.additional_config.compile_config.rbln_config["prefill_chunk_size"]
             == expected
         )
+        cache_path = Path(cfg.additional_config.artifact_path)
+        cache_path.mkdir(parents=True)
+        metadata = dict(cfg.additional_config.compile_config.rbln_config)
+        metadata["kvcache_num_blocks"] = 4
+        (cache_path / "rbln_config.json").write_text(json.dumps(metadata))
+        monkeypatch.setattr(
+            sync, "load_compiled_rbln_config", load_compiled_rbln_config
+        )
+        cached = vllm_config_factory(prefill_chunk_size, optimum_overrides=overrides)
+        assert cached.additional_config.precompiled
+        assert cached.additional_config.artifact_path == str(cache_path)
+        assert cached.additional_config.prefill_chunk_size == [expected]
+        assert cached.scheduler_config.max_num_batched_tokens == 8192
 
     @pytest.mark.parametrize(
         ("dtype", "devices", "device_overrides", "expected_devices"),
@@ -296,7 +335,7 @@ class TestSync:
         cache_path = Path(cfg.additional_config.artifact_path)
         cache_path.mkdir(parents=True)
         metadata = dict(cfg.additional_config.compile_config.rbln_config)
-        metadata.update(prefill_chunk_size=256, kvcache_num_blocks=4)
+        metadata["kvcache_num_blocks"] = 4
         (cache_path / "rbln_config.json").write_text(json.dumps(metadata))
         if location == "model":
             cfg.model_config.model = str(cache_path)
@@ -386,7 +425,8 @@ def test_initial_cache_hit_applies_vllm_config_updates_once(
     assert selected_configs[0].num_devices_per_local_rank == metadata["num_devices"]
     assert len(calls) == 1
     assert cfg.scheduler_config.max_num_seqs == 2
-    assert cfg.scheduler_config.max_num_batched_tokens == 256
+    assert cfg.scheduler_config.max_num_batched_tokens == 4096
+    assert cfg.additional_config.prefill_chunk_size == [256]
     assert cfg.model_config.max_model_len == 4096
     assert cfg.model_config.dtype == torch.float32
     assert cfg.additional_config.num_devices_per_local_rank == 2
@@ -410,7 +450,8 @@ def test_builder_does_not_apply_vllm_config_updates(vllm_config_factory):
     inputs = prepare_compile_config(cfg)
     assert cfg.scheduler_config.max_num_seqs == 4
     assert cfg.model_config.max_model_len == 8192
-    assert cfg.scheduler_config.max_num_batched_tokens == 128
+    assert cfg.scheduler_config.max_num_batched_tokens == 8192
+    assert cfg.additional_config.prefill_chunk_size == [128]
     assert cfg.additional_config.compile_config is None
     assert inputs.rbln_config["batch_size"] == 2
 
@@ -488,6 +529,7 @@ def test_compile_config_survives_worker_serialization(
     inputs = cfg.additional_config.compile_config
     assert isinstance(inputs, OptimumRBLNCompileConfig)
     assert inputs.rbln_config["language_model"]["prefill_chunk_size"] == 8192
+    assert cfg.additional_config.prefill_chunk_size == [8192]
     assert cfg.additional_config.artifact_path == original_path
     assert cfg.additional_config.precompiled is precompiled
     sync.sync_vllm_and_optimum(cfg)
@@ -530,13 +572,6 @@ def test_sync_stores_the_builder_inputs_without_repacking(
     assert cfg.additional_config.compile_config is built_inputs[0]
 
 
-def test_vllm_config_updates_are_derived_from_compile_config(vllm_config_factory):
-    cfg = vllm_config_factory()
-    cfg.additional_config.compile_config.rbln_config["prefill_chunk_size"] = 256
-    sync.sync_vllm_and_optimum(cfg)
-    assert cfg.scheduler_config.max_num_batched_tokens == 256
-
-
 def test_image_buckets_do_not_mutate_the_compile_config(vllm_config_factory):
     cfg = vllm_config_factory(
         hf_config=PaliGemmaConfig(architectures=["PaliGemmaForConditionalGeneration"]),
@@ -548,3 +583,140 @@ def test_image_buckets_do_not_mutate_the_compile_config(vllm_config_factory):
         "image_prefill_chunk_size"
     ] == [512, 256]
     assert compile_cache_name(cfg.additional_config.compile_config) == original_key
+
+
+@pytest.mark.parametrize("model_impl", ["optimum", "transformers"])
+@pytest.mark.parametrize("built", [False, True])
+def test_engine_args_resolve_legacy_and_explicit_chunks_identically(
+    tmp_path, model_impl, built
+):
+    from vllm.engine.arg_utils import EngineArgs
+
+    from vllm_rbln.config import OptimumRBLNConfig
+
+    model_dir = tmp_path / "model"
+    LlamaConfig(
+        architectures=["LlamaForCausalLM"], max_position_embeddings=1024
+    ).save_pretrained(model_dir)
+    keys = []
+    for legacy in [False, True]:
+        config = {} if legacy else {"prefill_chunk_size": [256]}
+        if built:
+            config = OptimumRBLNConfig(**config)
+        cfg = EngineArgs(
+            model=str(model_dir),
+            model_impl=model_impl,
+            max_model_len=1024,
+            max_num_seqs=4,
+            block_size=1024,
+            dtype="bfloat16",
+            skip_tokenizer_init=True,
+            max_num_batched_tokens=256 if legacy else None,
+            additional_config=config,
+        ).create_engine_config()
+        inputs = cfg.additional_config.compile_config
+        assert inputs.rbln_config["prefill_chunk_size"] == 256
+        assert cfg.additional_config.prefill_chunk_size == [256]
+        assert cfg.scheduler_config.max_num_batched_tokens == 1024
+        keys.append(compile_cache_name(inputs))
+    assert keys[0] == keys[1]
+
+
+@pytest.mark.parametrize(
+    ("max_seq_len", "batch_size", "initial_budget", "expected"),
+    [(8192, 4, 256, 8192), (8192, 4, 16384, 8192), (128, 256, 8192, 256)],
+)
+def test_sync_sizes_budget_for_full_prompt_or_decode_batch(
+    vllm_config_factory, max_seq_len, batch_size, initial_budget, expected
+):
+    cfg = vllm_config_factory(
+        128,
+        max_num_batched_tokens=initial_budget,
+        optimum_overrides={"max_seq_len": max_seq_len, "batch_size": batch_size},
+    )
+    assert cfg.scheduler_config.max_num_batched_tokens == expected
+    assert cfg.additional_config.prefill_chunk_size == [128]
+    assert cfg.additional_config.compile_config.rbln_config["prefill_chunk_size"] == 128
+
+
+@pytest.mark.parametrize("budget", [0, 256])
+def test_sync_rejects_an_explicit_scheduling_budget(vllm_config_factory, budget):
+    with pytest.raises(ValueError, match="max_num_scheduled_tokens cannot be set"):
+        vllm_config_factory(128, max_num_scheduled_tokens=budget)
+
+
+@pytest.mark.parametrize(
+    "arch", ["LlamaForCausalLM", "PaliGemmaForConditionalGeneration"]
+)
+@pytest.mark.parametrize("chunk", [None, 256, 512])
+def test_precompiled_model_resolves_or_rejects_prefill_chunk_size(
+    monkeypatch, tmp_path, vllm_config_factory, chunk, arch
+):
+    model_dir = tmp_path / "compiled"
+    model_dir.mkdir()
+    metadata: dict[str, object] = {
+        "batch_size": 4,
+        "max_seq_len": 8192,
+        "kvcache_block_size": 8192,
+        "kvcache_num_blocks": 4,
+        "prefill_chunk_size": 256,
+        "num_devices": 1,
+    }
+    if arch == "PaliGemmaForConditionalGeneration":
+        metadata = {"language_model": metadata}
+    (model_dir / "rbln_config.json").write_text(json.dumps(metadata))
+    monkeypatch.setattr(sync, "load_compiled_rbln_config", load_compiled_rbln_config)
+    monkeypatch.setattr(
+        sync, "resolve_compiled_model_path", resolve_compiled_model_path
+    )
+    cfg = vllm_config_factory(
+        chunk, hf_config=LlamaConfig(architectures=[arch]), sync_config=False
+    )
+    cfg.model_config.model = str(model_dir)
+    if chunk == 512:
+        with pytest.raises(
+            ValueError, match="does not match the resolved model configuration"
+        ):
+            sync.sync_vllm_and_optimum(cfg)
+    else:
+        sync.sync_vllm_and_optimum(cfg)
+        assert cfg.additional_config.precompiled
+        assert cfg.additional_config.compile_config is None
+        assert cfg.additional_config.prefill_chunk_size == [256]
+        assert cfg.scheduler_config.max_num_batched_tokens == 8192
+
+
+@pytest.mark.parametrize("arch", ["WhisperForConditionalGeneration", "BertModel"])
+@pytest.mark.parametrize("precompiled", [False, True])
+def test_sync_rejects_prefill_chunk_size_for_non_chunked_models(
+    monkeypatch, vllm_config_factory, arch, precompiled
+):
+    if precompiled:
+        metadata = {
+            "batch_size": 4,
+            "max_seq_len": 8192,
+            "dec_max_seq_len": 8192,
+            "kvcache_block_size": 8192,
+            "kvcache_num_blocks": 4,
+            "num_devices": 1,
+        }
+        monkeypatch.setattr(sync, "load_compiled_rbln_config", lambda path: metadata)
+        monkeypatch.setattr(
+            sync, "resolve_compiled_model_path", lambda model, cache: "/compiled"
+        )
+    with pytest.raises(ValueError, match="not support chunked prefill"):
+        vllm_config_factory(256, hf_config=LlamaConfig(architectures=[arch]))
+
+
+def test_sync_whisper_budget_includes_source_positions(vllm_config_factory):
+    cfg = vllm_config_factory(
+        hf_config=WhisperConfig(
+            architectures=["WhisperForConditionalGeneration"],
+            max_target_positions=448,
+            max_source_positions=1500,
+        ),
+        optimum_overrides={"dec_max_seq_len": 448},
+    )
+    assert cfg.model_config.max_model_len == 448
+    assert cfg.scheduler_config.max_num_batched_tokens == 1500
+    assert cfg.additional_config.prefill_chunk_size is None
