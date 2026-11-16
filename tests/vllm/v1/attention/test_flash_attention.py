@@ -1092,6 +1092,39 @@ class TestForwardSharedKV:
 
     HEADS, DIM = 8, 128
 
+    def test_sliding_reads_preserve_shared_prefix_blocks(self, cfg):
+        torch.manual_seed(0)
+        impl = make_impl(cfg, sliding_window=8, scale=self.DIM**-0.5)
+        impl.scale = impl.scale.cpu()
+        cache = torch.randn(7, 2, self.HEADS, 1, 4, self.DIM)
+        original = cache.clone()
+        tables = torch.tensor([[1, 2, 3, 5], [1, 2, 4, 6]])
+        query = torch.randn(2, self.HEADS, self.DIM)
+        masks = torch.zeros(2, 1, 1, 16)
+        masks[0, ..., 3:11] = 1
+        masks[1, ..., :8] = 1
+        md = RBLNFlashAttentionMetadata(
+            seq_lens=torch.tensor([[11], [12]]),
+            block_tables=tables,
+            is_prefill=False,
+            swa_appends=True,
+            attn_masks=masks,
+        )
+        output = torch.empty_like(query)
+        impl.forward(None, query, None, None, cache, md, output)
+        for row, end in enumerate((11, 12)):
+            start = end - 8
+            keys, values = [
+                torch.cat([original[b, kv, :, 0] for b in tables[row]], dim=1)
+                for kv in (0, 1)
+            ]
+            logits = (query[row, :, None] * keys[:, start:end]).sum(-1) * impl.scale
+            expected = (logits.softmax(-1)[..., None] * values[:, start:end]).sum(1)
+            torch.testing.assert_close(output[row], expected)
+        original[3, :, :, 0, 3] = 0
+        original[6, :, :, 0, 0] = 0
+        torch.testing.assert_close(cache, original, rtol=0, atol=0)
+
     @pytest.mark.parametrize(
         "sliding_window, target", [(None, "gqa"), (4, "sliding_window_attention_v1")]
     )
