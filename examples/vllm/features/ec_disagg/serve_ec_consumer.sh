@@ -3,7 +3,7 @@
 # Copyright 2026 Rebellions Inc. All rights reserved.
 #
 # Start the EC consumer: the prefill+decode instance on the vllm model path. It
-# reads each image's encoder output from the producer over NIXL instead of
+# reads each image's encoder output into RBLN memory over NIXL instead of
 # encoding the image itself.
 #
 # Usage:
@@ -22,7 +22,10 @@ MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-512}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"
 BLOCK_SIZE="${BLOCK_SIZE:-8192}"
 IMAGE_LIMIT="${IMAGE_LIMIT:-1}"
-EC_CPU_BYTES="${EC_CPU_BYTES:-1073741824}"
+EC_BUFFER_BYTES="${EC_BUFFER_BYTES:-1073741824}"
+EC_PRODUCER_HOST="${EC_PRODUCER_HOST:-127.0.0.1}"
+EC_PRODUCER_PORT="${EC_PRODUCER_PORT:-16100}"
+EC_LISTEN_IP="${EC_LISTEN_IP:-auto}"
 
 export RBLN_DEVICES="${RBLN_DEVICES:-0,1,2,3}"
 
@@ -39,7 +42,12 @@ exec vllm serve "$MODEL" \
     --enable-request-id-headers \
     --limit-mm-per-prompt "{\"image\": $IMAGE_LIMIT, \"video\": 0}" \
     --ec-transfer-config "{
-        \"ec_connector\": \"RblnECCPUConnector\",
+        \"ec_connector\": \"RblnECDeviceConnector\",
         \"ec_role\": \"ec_consumer\",
-        \"ec_connector_extra_config\": {\"ec_cpu_bytes\": $EC_CPU_BYTES}
+        \"ec_connector_extra_config\": {
+            \"device_buffer_bytes\": $EC_BUFFER_BYTES,
+            \"producer_host\": \"$EC_PRODUCER_HOST\",
+            \"producer_port\": $EC_PRODUCER_PORT,
+            \"listen_ip\": \"$EC_LISTEN_IP\"
+        }
     }"

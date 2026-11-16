@@ -230,8 +230,6 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         chiplet areas its entry's storage is held in, register one MR per area,
         and feed the resulting transfer tables into upstream's transfer state.
         """
-        import nixl_rbln
-
         self.transfer_topo = RblnTransferTopology(
             tp_rank=self.tp_rank,
             tp_size=self.world_size,
@@ -398,20 +396,16 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
                 "K/V regions."
             )
 
-        rbln_ctx_ptr = rebel.context_of(sample_kv_cache).rbln_ctx_ptr
+        from vllm_rbln.distributed.nixl_device import register_device_regions
 
-        nixl_rbln.ensure_rbln_backend(
-            self.nixl_wrapper,
-            device_id,
-            rbln_ctx_ptr=rbln_ctx_ptr,
-            **self._backend_extra,
-        )
         geometries, area_descs = self._region_geometries(regions)
         self._registered_descs.append(
-            self.nixl_wrapper.register_memory(
-                [(addr, size, device_id, "") for addr, size in area_descs],
-                mem_type=self.nixl_memory_type,
-                backends=["RBLN"],
+            register_device_regions(
+                self.nixl_wrapper,
+                area_descs,
+                device_id=device_id,
+                rbln_ctx_ptr=rebel.context_of(sample_kv_cache).rbln_ctx_ptr,
+                backend_options=self._backend_extra,
             )
         )
         self.device_id = device_id

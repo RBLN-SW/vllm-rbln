@@ -31,3 +31,8 @@ def register_rbln_ec_connectors() -> None:
         "vllm_rbln.distributed.ec_transfer.ec_connector.rbln_ec_cpu_connector",
         "RblnECCPUConnector",
     )
+    ECConnectorFactory.register_connector(
+        "RblnECDeviceConnector",
+        "vllm_rbln.distributed.ec_transfer.ec_connector.rbln_ec_device_connector",
+        "RblnECDeviceConnector",
+    )

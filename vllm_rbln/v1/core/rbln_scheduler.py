@@ -45,6 +45,9 @@ from vllm_rbln.config import RBLNConfig
 from vllm_rbln.distributed.ec_transfer.ec_connector.rbln_ec_cpu_connector import (
     RblnECCPUConnector,
 )
+from vllm_rbln.distributed.ec_transfer.ec_connector.rbln_ec_device_connector import (
+    RblnECDeviceConnector,
+)
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.core.rbln_kv_cache_manager import (
     KVCacheCopyOp,
@@ -1264,10 +1267,13 @@ class RBLNScheduler(Scheduler):
                 shift_computed_tokens,
             )
         # NOTE(RBLN): upstream skips EC saves on runner-cache hits.
-        # Reserve saves for outputs missing from the shared-memory cache.
+        # Device consumers acknowledge snapshots even on runner-cache hits.
         if (
-            isinstance(connector, RblnECCPUConnector)
-            and connector.is_producer
+            (
+                isinstance(connector, RblnECDeviceConnector)
+                or isinstance(connector, RblnECCPUConnector)
+                and connector.is_producer
+            )
             and not self.is_encoder_decoder
             and adjusted_num_new_tokens > 0
         ):
