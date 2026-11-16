@@ -371,6 +371,60 @@ class TestMultimodalEmbeddings:
         torch.testing.assert_close(empty_mask.cpu(), torch.zeros_like(expected_mask))
 
 
+@pytest.mark.use_device
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_stage_mm_embeds_has_no_d2h(dtype):
+    from rebel.core.torch_compile import rbln_backend
+
+    device = torch.device("rbln:0")
+    stager = InputStager(device)
+    layout = _layout(query_len=6)
+    mm_mask = torch.zeros(2, 6, 1, dtype=dtype)
+    mm_mask[0, 1:3] = 1
+    mm_mask[0, 5] = 1
+    mm_mask[1, 0] = 1
+    expected = torch.arange(4 * 64, dtype=torch.float32).reshape(4, 64).to(dtype)
+    lhs = torch.eye(4, dtype=dtype).to(device)
+    rhs = expected.to(device)
+    matmul = torch.compile(
+        torch.matmul,
+        backend=rbln_backend,
+        fullgraph=True,
+        dynamic=False,
+        options={"dtype": str(dtype).removeprefix("torch."), "use_static_output": True},
+    )
+    previous = None
+    for _ in range(2):
+        # Refresh the device output after correctness checks synchronize host data.
+        source = matmul(lhs, rhs)
+        with torch.rbln.explain(with_stack=True) as trace:
+            staged, mask = stager.stage_mm_embeds(
+                [source[:2], source[2:]], mm_mask, 64, layout
+            )
+            torch.rbln.synchronize(device)
+        residency = trace.dump()["runtime_residency"]
+        assert residency["available"], trace.report()
+        assert residency["real_host_sync_d2h"] == {"count": 0, "bytes": 0}, residency
+        with torch.rbln.explain(with_stack=True) as cpu_trace:
+            host_source = source.cpu()
+        assert cpu_trace.dump()["runtime_residency"]["real_host_sync_d2h"] == {
+            "count": 1,
+            "bytes": source.numel() * source.element_size(),
+        }
+        torch.testing.assert_close(host_source, expected, atol=0, rtol=0)
+        if previous is not None:
+            assert staged is previous
+        previous = staged
+        expected_staged = torch.zeros(4, 8, 64, dtype=dtype)
+        expected_staged[0, 1:3] = expected[:2]
+        expected_staged[0, 5] = expected[2]
+        expected_staged[1, 0] = expected[3]
+        torch.testing.assert_close(staged.cpu(), expected_staged, atol=0, rtol=0)
+        expected_mask = torch.zeros(4, 8, 1, dtype=dtype)
+        expected_mask[:2, :6] = mm_mask
+        torch.testing.assert_close(mask.cpu(), expected_mask, atol=0, rtol=0)
+
+
 @pytest.mark.maybe_use_device
 class TestPassthrough:
     def test_intermediate_and_embeds_passed_through(self):
