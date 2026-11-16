@@ -57,6 +57,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.push_scheduler 
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.push_worker import (
     RblnNixlPushConnectorWorker,
 )
+from vllm_rbln.v1.kv_cache import REMOTE_STATE_BOUNDARY
 
 
 @dataclass
@@ -379,6 +380,61 @@ class TestRequestFinished:
         assert params is not None
         assert params["do_remote_prefill"] is True
         assert "empty" not in sched._reqs_need_send
+
+
+class TestStateBoundaryExchange:
+    """A single-state SSM group also exchanges the block-boundary state held in
+    the slot before the running one: an attention group, then an SSM group."""
+
+    @staticmethod
+    def _scheduler():
+        sched = _scheduler()
+        sched._is_hma_required = True
+        sched._has_mamba = True
+        sched._ssm_state_slots_are_positional = False
+        sched.blocks_per_sw = [0, 0]
+        sched._ssm_spec_blocks = [None, 0]
+        sched.kv_cache_config.transfer_groups = (
+            SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16)),
+        ) * 2
+        return sched
+
+    @pytest.mark.parametrize(
+        ("block_ids", "expected"),
+        [
+            # Producer, whole lists: the boundary block is kept, or already freed.
+            (([1, 2, 3], [0, 7, 8]), ([1, 2, 3], [7, 8])),
+            (([1, 2, 3], [0, 0, 8]), ([1, 2, 3], [8])),
+            # Consumer, unhashed lists: a boundary block allocated, or not.
+            (([4, 5, 6], [3, 9]), ([4, 5, 6], [3, 9])),
+            (([4, 5, 6], [9]), ([4, 5, 6], [9])),
+        ],
+    )
+    def test_clip_keeps_a_live_boundary_block(self, block_ids, expected):
+        assert self._scheduler().get_exchange_clipped_blocks(block_ids) == expected
+
+    @pytest.mark.parametrize(
+        ("num_tokens", "ssm_blocks", "sent", "boundary"),
+        [
+            (39, [0, 7, 8], [7, 8], 32),
+            (39, [0, 0, 8], [8], None),
+            # Block-aligned: block 1 is the boundary state, block 0 superseded.
+            (32, [7, 8], [8], None),
+        ],
+    )
+    def test_producer_names_the_boundary_it_sends(
+        self, num_tokens, ssm_blocks, sent, boundary
+    ):
+        sched = self._scheduler()
+        req = _Request(
+            "p", num_prompt_tokens=num_tokens, num_computed_tokens=num_tokens
+        )
+        req.status = RequestStatus.FINISHED_LENGTH_CAPPED
+
+        delay, params = sched.request_finished(req, ([1, 2, 3], ssm_blocks))
+        assert delay is True
+        assert params["remote_block_ids"][1] == sent
+        assert params.get(REMOTE_STATE_BOUNDARY) == boundary
 
 
 class TestChunkAlignedFetch:

@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from math import prod
 
@@ -20,8 +21,11 @@ import torch
 from vllm.config import VllmConfig
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
-from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
-from vllm.v1.kv_cache_interface import SlidingWindowSpec
+from vllm.v1.core.single_type_kv_cache_manager import (
+    MambaManager,
+    SingleTypeKVCacheManager,
+)
+from vllm.v1.kv_cache_interface import MambaSpec, SlidingWindowSpec
 from vllm.v1.request import Request
 
 
@@ -173,3 +177,156 @@ class RBLNSlidingWindowManager(SingleTypeKVCacheManager):
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         return 0
+
+
+#: kv_transfer_params key a producer sets to the token count its extra recurrent
+#: state block ends at, so a consumer knows to allocate and cache a block for it.
+REMOTE_STATE_BOUNDARY = "remote_state_boundary"
+
+
+def prompt_boundary_block(num_prompt_tokens: int, block_size: int) -> int | None:
+    """The block holding the state at the prompt's last block boundary, when that
+    is not the block holding the prompt's last state."""
+    if num_prompt_tokens < block_size or num_prompt_tokens % block_size == 0:
+        return None
+    return num_prompt_tokens // block_size - 1
+
+
+@dataclass(frozen=True)
+class RBLNMambaSpec(MambaSpec):
+    """A recurrent state the RBLN KV connector moves with its block-boundary state."""
+
+
+class RBLNMambaManager(MambaManager):
+    """Carries a prompt's last block-boundary state across a P/D transfer.
+
+    In align mode a transfer moves only the running state. That serves the
+    request, but the consumer holds no state at a block boundary, so a repeat of
+    the prompt there misses the prefix cache. The producer keeps its boundary
+    block until the transfer releases it; the consumer allocates a block for it
+    and caches it once received, as if it had computed it.
+    """
+
+    def __init__(self, kv_cache_spec: MambaSpec, block_pool, **kwargs) -> None:
+        super().__init__(kv_cache_spec, block_pool, **kwargs)
+        self._kept_boundary: dict[str, int] = {}
+        self._received_boundary: dict[str, int] = {}
+
+    def track_transfer(
+        self,
+        request: Request,
+        num_local_computed_tokens: int,
+        num_external_computed_tokens: int,
+    ) -> None:
+        """Note a request's boundary block before its first allocation."""
+        if self.mamba_cache_mode != "align" or not self.enable_caching:
+            return
+        params = request.kv_transfer_params or {}
+        request_id = request.request_id
+        if params.get("do_remote_decode"):
+            block_idx = prompt_boundary_block(
+                request.num_prompt_tokens, self.block_size
+            )
+            if block_idx is not None:
+                self._kept_boundary[request_id] = block_idx
+            return
+        self._received_boundary.pop(request_id, None)
+        boundary = params.get(REMOTE_STATE_BOUNDARY)
+        if (
+            boundary is None
+            or num_external_computed_tokens == 0
+            or num_local_computed_tokens >= boundary
+        ):
+            return
+        block_idx = prompt_boundary_block(
+            num_local_computed_tokens + num_external_computed_tokens, self.block_size
+        )
+        assert block_idx == boundary // self.block_size - 1, (
+            f"{request_id}: the producer's boundary {boundary} is not the last one "
+            f"of the {num_external_computed_tokens} token(s) it sends"
+        )
+        self._received_boundary[request_id] = block_idx
+
+    @contextmanager
+    def _boundary_shielded(self, request_id: str) -> Iterator[None]:
+        # Upstream frees every state block behind the running one; hiding the
+        # kept block as null for the call is what both its paths skip.
+        block_idx = self._kept_boundary.get(request_id)
+        blocks = self.req_to_blocks.get(request_id, [])
+        if block_idx is None or block_idx >= len(blocks) or blocks[block_idx].is_null:
+            yield
+            return
+        block = blocks[block_idx]
+        blocks[block_idx] = self._null_block
+        try:
+            yield
+        finally:
+            blocks[block_idx] = block
+
+    def remove_skipped_blocks(
+        self,
+        request_id: str,
+        processed_computed_tokens: int,
+        num_prompt_tokens: int | None = None,
+    ) -> None:
+        with self._boundary_shielded(request_id):
+            super().remove_skipped_blocks(
+                request_id, processed_computed_tokens, num_prompt_tokens
+            )
+
+    def get_num_blocks_to_allocate(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        total_computed_tokens: int,
+        num_local_computed_tokens: int,
+        num_tokens_main_model: int,
+        apply_admission_cap: bool = False,
+        prefill_end: int = 0,
+    ) -> int:
+        num_blocks = super().get_num_blocks_to_allocate(
+            request_id,
+            num_tokens,
+            new_computed_blocks,
+            total_computed_tokens,
+            num_local_computed_tokens,
+            num_tokens_main_model,
+            apply_admission_cap=apply_admission_cap,
+            prefill_end=prefill_end,
+        )
+        if request_id in self._received_boundary and not self.req_to_blocks.get(
+            request_id
+        ):
+            num_blocks += 1
+        return num_blocks
+
+    def allocate_external_computed_blocks(
+        self,
+        request_id: str,
+        num_local_computed_tokens: int,
+        num_external_computed_tokens: int,
+    ) -> None:
+        super().allocate_external_computed_blocks(
+            request_id, num_local_computed_tokens, num_external_computed_tokens
+        )
+        block_idx = self._received_boundary.pop(request_id, None)
+        if block_idx is None:
+            return
+        blocks = self.req_to_blocks[request_id]
+        assert block_idx < len(blocks) - 1 and blocks[block_idx].is_null, (
+            f"{request_id}: no null slot {block_idx} before the running state"
+        )
+        (block,) = self.block_pool.get_new_blocks(1)
+        blocks[block_idx] = block
+        if self._record_new_block_ids:
+            self.new_block_ids.append(block.block_id)
+        # The block counted as cached while it was a null placeholder.
+        self.num_cached_block[request_id] = min(
+            self.num_cached_block.get(request_id, 0), block_idx
+        )
+
+    def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
+        self._kept_boundary.pop(request_id, None)
+        self._received_boundary.pop(request_id, None)
+        return super().pop_blocks_for_free(request_id)

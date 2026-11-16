@@ -82,7 +82,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import set_default_torch_dtype
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
-from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec, MLAAttentionSpec
+from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
 import vllm_rbln.utils as rbln_utils
 from vllm_rbln.model_executor.models.interfaces import SupportsRBLNMultiModal
@@ -99,7 +99,7 @@ from vllm_rbln.v1.attention.backends.glm5_next import (
     RBLNGlm5NextStateMetadata,
     kda_cache_name,
 )
-from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
+from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec, RBLNMambaSpec
 from vllm_rbln.v1.worker.utils import (
     num_attn_module as rbln_num_attn_module,
 )
@@ -145,7 +145,7 @@ class RBLNGlm5NextStateCache(_RBLNGlm5NextCache):
             vllm_config.cache_config.block_size,
             vllm_config.model_config.hf_text_config.kv_lora_rank,
         )
-        return MambaSpec(
+        return RBLNMambaSpec(
             block_size=vllm_config.cache_config.mamba_block_size,
             shapes=(latent_block,),
             dtypes=(torch.uint8,),

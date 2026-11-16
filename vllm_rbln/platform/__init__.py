@@ -406,9 +406,12 @@ class RblnPlatform(Platform):
 
     @classmethod
     def register_custom_kv_cache_specs(cls, vllm_config: "VllmConfig") -> None:
+        from vllm.v1.kv_cache_interface import MambaSpec
         from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
         from vllm_rbln.v1.kv_cache import (
+            RBLNMambaManager,
+            RBLNMambaSpec,
             RBLNSlidingWindowManager,
             RBLNSlidingWindowSpec,
         )
@@ -417,6 +420,9 @@ class RblnPlatform(Platform):
             RBLNSlidingWindowSpec,
             RBLNSlidingWindowManager,
             uniform_type_base_spec=RBLNSlidingWindowSpec,
+        )
+        KVCacheSpecRegistry.register(
+            RBLNMambaSpec, RBLNMambaManager, uniform_type_base_spec=MambaSpec
         )
 
     @classmethod
