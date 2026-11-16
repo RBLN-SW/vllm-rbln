@@ -31,6 +31,7 @@ from vllm_rbln.v1.attention.backends.mla.indexer import (
     RBLNDeepseekV32IndexerBackend,
     RBLNDeepseekV32IndexerScaleBackend,
 )
+from vllm_rbln.v1.spec_decode import pass_state
 from vllm_rbln.v1.worker.utils import (
     num_attn_module as rbln_num_attn_module,
 )
@@ -247,7 +248,7 @@ def rbln_indexer_forward(
     k_indexer_cur = k.contiguous()
 
     forward_context = get_forward_context()
-    attn_metadata = forward_context.attn_metadata
+    attn_metadata = pass_state.select(forward_context.attn_metadata)
     if isinstance(attn_metadata, dict):
         attn_metadata = attn_metadata[self.k_cache.prefix]
     k_cache = _resolve_kv_cache(attn_metadata, self.k_cache.layer_index)

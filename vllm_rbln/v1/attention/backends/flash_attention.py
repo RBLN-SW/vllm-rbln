@@ -243,6 +243,7 @@ class RBLNFlashAttentionMetadataBuilder(
             )
 
         self._staged: dict[tuple, torch.Tensor] = {}
+        self._staging_slot = 0
 
     def _stage(self, t: torch.Tensor | None, slot: str) -> torch.Tensor | None:
         """Copy a host tensor into this builder's persistent device buffer.
@@ -251,14 +252,13 @@ class RBLNFlashAttentionMetadataBuilder(
         cache_offsets share both shape and dtype, so keying on those alone
         would silently make them share one buffer.
 
-        The returned tensor is overwritten by the next build() call, so the
-        caller must run the forward pass before building again. That holds
-        because each AttentionGroup owns its own builder instance and every
-        build() is immediately followed by a forward.
+        The returned tensor is overwritten by the next build() with the same
+        `staging_slot`, so the caller must run the forward pass before building
+        again with that slot.
         """
         if t is None:
             return None
-        key = (slot, t.shape, t.dtype)
+        key = (slot, self._staging_slot, t.shape, t.dtype)
         if (buf := self._staged.get(key)) is None:
             buf = torch.empty(t.shape, dtype=t.dtype, device=self.device)
             self._staged[key] = buf
@@ -282,10 +282,15 @@ class RBLNFlashAttentionMetadataBuilder(
         num_accepted: torch.Tensor | None = None,
         state_load_pos: torch.Tensor | None = None,
         mm_prefix_row_ends: torch.Tensor | None = None,
+        staging_slot: int = 0,
     ) -> RBLNFlashAttentionMetadata:
         """`mm_prefix_row_ends`, on a prefill of an mm prefix LM, holds for each
         padded row of the step the last step-local row it may read: itself, or
-        its range's last position for an mm row. None on any other step."""
+        its range's last position for an mm row. None on any other step.
+
+        Builds sharing a `staging_slot` share device buffers; distinct slots let
+        several builds feed one forward."""
+        self._staging_slot = staging_slot
         num_reqs = common_attn_metadata.num_reqs
         # NOTE(RBLN): vllm-rbln keeps attention metadata on the host and copies
         # to the device only when constructing RBLNFlashAttentionMetadata below.

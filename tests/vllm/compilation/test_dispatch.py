@@ -470,3 +470,17 @@ class TestForwardContextKey:
         monkeypatch.setattr(dispatch, "get_forward_context", lambda: ctx)
         monkeypatch.setattr(dispatch, "has_kv_transfer_group", lambda: False)
         assert dispatch._forward_context_key() == (None, None, False)
+
+    def test_reads_a_per_pass_metadata_list_from_its_first_entry(self, monkeypatch):
+        # An unrolled drafter region passes one metadata dict per pass.
+        ctx = SimpleNamespace(
+            attn_metadata=[
+                {"layer": SimpleNamespace(is_prefill=False)},
+                {"layer": SimpleNamespace(is_prefill=False)},
+            ],
+            dp_metadata=None,
+        )
+        monkeypatch.setattr(dispatch, "is_forward_context_available", lambda: True)
+        monkeypatch.setattr(dispatch, "get_forward_context", lambda: ctx)
+        monkeypatch.setattr(dispatch, "has_kv_transfer_group", lambda: False)
+        assert dispatch._forward_context_key() == (False, None, False)
