@@ -1803,6 +1803,7 @@ class TestUpdateStates:
             sort_batch_by_length=False,
             kv_cache_config=SimpleNamespace(kv_cache_groups=[]),
             rbln_config=RBLNConfig(),
+            sampler=None,
         )
 
     def test_new_request_added(self, monkeypatch):
@@ -1827,6 +1828,41 @@ class TestUpdateStates:
         r._update_states(_sched(finished=["r0"]))
         assert "r0" not in r.input_batch.req_id_to_index
         assert "r0" not in r.requests
+
+    def test_finished_request_forgets_fused_penalty_state(self, monkeypatch):
+        # Only finishing drops it: a prefill step leaves decoding requests out.
+        sampler = object.__new__(mr.RBLNSampler)
+        sampler.forget_requests = MagicMock()
+        r = self._runner(
+            monkeypatch,
+            input_batch=_input_batch(1),
+            requests={"r0": _cached_state("r0")},
+        )
+        r.sampler = sampler
+        r._update_states(_sched(finished=["r0"]))
+        sampler.forget_requests.assert_called_once_with(["r0"])
+
+    def test_streaming_turn_forgets_fused_sampling_state(self, monkeypatch):
+        # A new turn reuses the id with a new prompt and params.
+        sampler = object.__new__(mr.RBLNSampler)
+        sampler.forget_requests = MagicMock()
+        r = self._runner(
+            monkeypatch,
+            input_batch=_input_batch(1),
+            requests={"r0": _cached_state("r0")},
+        )
+        r.sampler = sampler
+        new_data = SimpleNamespace(
+            prompt_token_ids=[1, 2, 3],
+            mm_features=[],
+            prompt_embeds=None,
+            sampling_params=SamplingParams(),
+            pooling_params=None,
+            block_ids=([0],),
+            num_computed_tokens=0,
+        )
+        r._update_streaming_request("r0", new_data)
+        sampler.forget_requests.assert_called_once_with(["r0"])
 
     def test_unscheduled_request_removed(self, monkeypatch):
         # r0 is cached but not scheduled (and not resumed) -> dropped.
@@ -2182,6 +2218,7 @@ class TestRepairAsyncOutputTokenIds:
                 ),
                 prev_req_id_to_index=prev_index,
             ),
+            _prev_sampled_host=None,
         )
 
     def test_replaces_the_placeholder_tail(self):
@@ -2238,6 +2275,27 @@ class TestRepairAsyncOutputTokenIds:
         )
         r._repair_async_output_token_ids()
         assert ids == [[], [8, 11]]
+
+    def test_reads_the_async_host_copy_of_the_same_step(self):
+        # The device read would queue behind this step's forward.
+        ids = [[7, -1]]
+        r = self._runner(
+            req_ids=["a"], output_token_ids=ids, prev_index={"a": 0}, prev_tokens=[10]
+        )
+        event = SimpleNamespace(synchronize=lambda: None)
+        prev = r.input_batch.prev_sampled_token_ids
+        r._prev_sampled_host = (prev, torch.tensor([[20]]), event)
+        r._repair_async_output_token_ids()
+        assert ids == [[7, 20]]
+
+    def test_ignores_a_host_copy_from_another_step(self):
+        ids = [[7, -1]]
+        r = self._runner(
+            req_ids=["a"], output_token_ids=ids, prev_index={"a": 0}, prev_tokens=[10]
+        )
+        r._prev_sampled_host = (torch.tensor([[10]]), torch.tensor([[20]]), None)
+        r._repair_async_output_token_ids()
+        assert ids == [[7, 10]]
 
 
 class TestApplyPendingTokenWriteback:
