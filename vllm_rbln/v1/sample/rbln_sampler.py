@@ -288,7 +288,7 @@ class RBLNSampler(VLLMSampler):
                 out = self._fused_graph("greedy", penalty)(
                     logits, penalty.cidx, penalty.lanes
                 )
-                return out, processed_logprobs
+                return out.squeeze(-1), processed_logprobs
             return self.greedy_sample(logits), processed_logprobs
 
         assert sampling_metadata.temperature is not None

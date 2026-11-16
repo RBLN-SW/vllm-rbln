@@ -376,16 +376,20 @@ class TestPadDepad:
 
 
 class TestSamplePadding:
+    @pytest.mark.parametrize("batch_size", [1, 4])
     def test_custom_sampler_applies_fused_penalties_to_the_live_batch(
-        self, monkeypatch
+        self, monkeypatch, batch_size
     ):
         import vllm_rbln.v1.sample.rbln_sampler as sampling
         from tests.vllm.v1.sample.utils import build_input_batch
 
         monkeypatch.setattr(sampling, "compile_sampler", lambda fn, _: fn)
-        monkeypatch.setattr(sampling, "rbln_greedy_sample", lambda x: x.argmax(dim=-1))
+        monkeypatch.setattr(torch.ops.rbln, "argmax", lambda x: x.argmax(dim=-1))
         batch = build_input_batch(
-            [("a", SamplingParams(temperature=0.0, repetition_penalty=1.2))],
+            [
+                (str(i), SamplingParams(temperature=0.0, repetition_penalty=1.2))
+                for i in range(batch_size)
+            ],
             vocab_size=16384,
             output_token_ids=[42],
         )
@@ -393,12 +397,12 @@ class TestSamplePadding:
         runner = _make_runner_stub(
             sampler=sampler, input_batch=batch, _is_prefill_step=False
         )
-        logits = torch.zeros(1, 16384)
-        logits[0, 42], logits[0, 43] = 6.0, 5.5
+        logits = torch.zeros(batch_size, 16384)
+        logits[:, 42], logits[:, 43] = 6.0, 5.5
 
         output = runner._sample(logits, None)
 
-        assert output.sampled_token_ids.tolist() == [[43]]
+        assert output.sampled_token_ids.tolist() == [[43]] * batch_size
         assert {key[0] for key in sampler._fused_graphs} == {"greedy"}
 
     @staticmethod
