@@ -243,14 +243,17 @@ def test_the_dense_decode_residual_runs_on_the_cut_ops(monkeypatch):
 @pytest.mark.parametrize("prefill", [False, True])
 def test_the_final_norm_reads_only_the_decode_residual(monkeypatch, prefill):
     import torch
+    from vllm.config import set_current_vllm_config
 
+    from tests.vllm.vllm_config import make_vllm_config
     from vllm_rbln.patches import gemma4
 
     torch.manual_seed(0)
     calls = _token_cut_ops(monkeypatch)
     monkeypatch.setattr(gemma4, "_CUTS_THE_DECODE_RESIDUAL", True)
     monkeypatch.setattr(gemma4, "_is_prefill", lambda: prefill)
-    norm = gemma4.ResidualReadNorm(64, eps=1e-6)
+    with set_current_vllm_config(make_vllm_config()):
+        norm = gemma4.ResidualReadNorm(64, eps=1e-6)
     norm.weight.data = 1.0 + 0.1 * torch.randn(64)
     x = torch.randn(8, 1, 64)
 
