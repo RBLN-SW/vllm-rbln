@@ -71,6 +71,16 @@ def visual(tmp_path):
             destroy_distributed_environment()
 
 
+@pytest.mark.parametrize(
+    "limits", [{"image": 1}, {"image": 1, "video": 1}], ids=["unset", "set"]
+)
+def test_a_video_limit_above_zero_is_refused(limits):
+    # An unset limit counts: upstream reads it as 999.
+    vllm_config = make_vllm_config(model="Qwen/Qwen3.5-4B", limit_mm_per_prompt=limits)
+    with pytest.raises(NotImplementedError, match="--limit-mm-per-prompt"):
+        RBLNQwen3_5ForConditionalGeneration(vllm_config=vllm_config)
+
+
 def test_warmup_runs_the_encoder_once_over_the_whole_bucket(visual):
     # The one bucket is the processor's largest image, so the warm-up input is
     # that whole grid with no padded rows.

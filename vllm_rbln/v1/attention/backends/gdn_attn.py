@@ -14,18 +14,18 @@
 
 """GatedDeltaNet (Qwen3.5 `linear_attention`) state on RBLN.
 
-A layer's `MambaSpec` describes a full-attention KV page, including unused
-capacity. The runner binds that shape so sharing layers use one graph input
-and one chiplet cut. The kernels size a contiguous state prefix per local
-page from Q/K/V and preserve trailing padding. State uses the activation
-dtype (dlfloat16 inside the kernels).
+A layer's state is a `MambaSpec` block declared as a full-attention KV page, so
+the layers sharing a buffer are one graph input with one chiplet cut. The
+kernels read a state prefix of each local page and preserve the trailing
+padding. A padding row uses null block 0.
 
-The builder addresses the blocks the kernels read and write by the group's
-block table: that of a request's last computed token and that of its last
-scheduled one. They differ only under prefix caching ("align", a state a KV
-block), when a step enters a new block. A padding batch row uses null block 0.
-The short-conv ring is a block-aux cache on those same block ids. Its channels
-and the delta-rule heads share the key-head order from `grouped_qkv_rows`.
+The builder addresses the block a row loads (its last computed token's) and
+the block it stores to (its last scheduled token's) by the group's block table.
+They differ only under prefix caching ("align", a state a KV block), when a
+step enters a new block.
+
+The short-conv ring is a block-aux cache on the same block ids, its channels
+in the delta-rule kernels' key-head order (`grouped_qkv_rows`).
 """
 
 from dataclasses import dataclass
@@ -48,9 +48,8 @@ from vllm_rbln.v1.attention.kv_cache_bindings import KVCacheViewInfo
 
 def grouped_qkv_rows(num_k_heads: int, ratio: int, head_dim: int) -> torch.Tensor:
     """The rows of [q heads | k heads | v heads] regrouped by key head: q_h, k_h,
-    then key head h's `ratio` value heads, for each h. The short conv runs one
-    call over this order, so RSD's cut of its channels is the delta-rule
-    kernels' cut of their heads and no chiplet reads another's output."""
+    then key head h's `ratio` value heads. The short conv runs in this order so
+    that RSD cuts its channels where it cuts the delta-rule kernels' heads."""
     q = torch.arange(num_k_heads).view(num_k_heads, 1)
     k = q + num_k_heads
     v = (torch.arange(num_k_heads * ratio) + 2 * num_k_heads).view(num_k_heads, ratio)
@@ -60,28 +59,21 @@ def grouped_qkv_rows(num_k_heads: int, ratio: int, head_dim: int) -> torch.Tenso
 
 @dataclass(kw_only=True)
 class RBLNGDNAttentionMetadata(GDNAttentionMetadata):
-    """Upstream's GDN metadata as one RBLN step fills it, and the operands the
-    RBLN kernels take beside it.
+    """Upstream's GDN metadata for one RBLN step, plus the operands of the RBLN
+    kernels.
 
-    A step is one prefill request (`num_prefills` 1) or a decode batch
-    (`num_decodes` requests), never both and never speculative, so the
-    `spec_*` fields stay unset, as do the ones upstream fills for its own
-    kernels (chunk indices, query start locs, the causal_conv1d pointers).
-    `non_spec_state_indices_tensor` (the state block each row loads) and
-    `has_initial_state` (1 where that block carries a state, prefill only) are
-    padded to the step's batch and kept [batch] int16 on the host: the
-    delta-rule kernels read them through the const buffer (a device copy
-    crashes the runtime). As upstream, a prefill step names them again as the
-    chunk kernel's `prefill_state_indices` and `prefill_has_initial_state`.
+    A step is one prefill request or a decode batch, never both and never
+    speculative, so the `spec_*` fields and the ones for upstream's own kernels
+    stay unset. The state indices are padded to the step's batch and stay int16
+    on the host: the kernels read them through the const buffer, and a device
+    copy crashes the runtime.
     """
 
     # The compiled step's batch: 1 on prefill, the padded batch on decode.
     batch_size: int
     # [batch] int16 on the host: the state block each row stores.
     store_state_indices: torch.Tensor
-    # [batch] int32 on the device: what kda_conv reads a row's ring by (its
-    # block, the step's first position, its valid tokens, 1 where the ring
-    # carries a state) and the block it stores the ring to.
+    # [batch] int32 on the device: kda_conv's per-row operands.
     conv_load_blocks: torch.Tensor
     conv_start_positions: torch.Tensor
     conv_query_lens: torch.Tensor

@@ -22,9 +22,8 @@ from vllm_rbln.model_executor.layers.rotary_embedding.common import (
 
 
 class RBLNMRotaryEmbedding(MRotaryEmbedding):
-    """M-RoPE for RBLN: the rotate-half caches of the RBLN RoPE forward, and a
-    per-channel axis table in place of upstream's strided section writes, which
-    the compiler cannot lower."""
+    """M-RoPE for RBLN's [B, S] and [3, B, S] position layouts, using rotate-half
+    caches and a per-channel T/H/W axis table."""
 
     def __init__(self, *args, **kwargs) -> None:
         # fp32 ops on RBLN may run in reduced precision; compute the RoPE cache on CPU.

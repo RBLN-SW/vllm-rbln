@@ -14,7 +14,6 @@
 
 import torch
 import torch.nn.functional as F
-from rebel.ops.torch_custom_ops.gdn import CHUNK as GDN_PREFILL_CHUNK
 from rebel.ops.torch_custom_ops.gdn import STATE_LANES
 from rebel.ops.torch_custom_ops.kda import CONV_LANES
 from torch import nn
@@ -46,8 +45,7 @@ class RBLNGDNConvRingCache(nn.Module, AttentionLayerBase):
         self.block_shape = block_shape
         self.dtype = dtype
         self.kv_cache = torch.tensor([])
-        # This cache's position among the graph's KV cache inputs: the runner
-        # assigns it once the caches exist.
+        # Index among the graph's KV cache inputs, assigned by the runner.
         self.layer_index: int | None = None
         context = get_current_vllm_config().compilation_config.static_forward_context
         if prefix in context:
@@ -79,9 +77,8 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     def __init__(
         self, config, vllm_config: VllmConfig, prefix: str = "", **kwargs
     ) -> None:
-        # Registered out of tree, so every model building upstream's layer
-        # lands here; only the RBLN Qwen3.5 class, which this architecture
-        # resolves to, regroups the weights for it.
+        # Registered out of tree, so other models that build upstream's layer land
+        # here too; only the RBLN Qwen3.5 class regroups the weights for it.
         architecture = vllm_config.model_config.architecture
         if architecture != "Qwen3_5ForConditionalGeneration":
             raise NotImplementedError(
@@ -95,15 +92,13 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 f"values, a multiple of {STATE_LANES}, got {self.head_k_dim} / "
                 f"{self.head_v_dim}"
             )
-        # The state cache's position among the graph's KV cache inputs: the
-        # runner assigns it once the caches exist.
+        # Index among the graph's KV cache inputs, assigned by the runner.
         self.layer_index: int | None = None
         model_config = vllm_config.model_config
         self.num_kv_heads = model_config.get_num_kv_heads(vllm_config.parallel_config)
         self.kv_head_size = model_config.get_head_size()
-        # One ring a block, in kda_conv's stacked form ([W, P=1, C / 64, 64]): the
-        # kernel takes it as allocated, and the converter's reshape of the
-        # unstacked form cannot carry the cache's dynamic block count.
+        # One ring a block, in kda_conv's stacked form [W, 1, C / 64, 64]: a
+        # reshape of the unstacked form cannot carry the dynamic block count.
         channels = self.conv_dim // self.tp_size
         self.conv_ring = RBLNGDNConvRingCache(
             f"{prefix}.conv_ring",
@@ -126,10 +121,9 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         )
 
     def get_state_dtype(self) -> tuple[torch.dtype]:
-        # The delta-rule kernels take the state in the dtype of q / k / v, so it
-        # is declared in that dtype (the activation dtype).
-        # TODO(RBLN): support cache_config.mamba_ssm_cache_dtype (float32, from
-        # the Qwen3.5 HF config's mamba_ssm_dtype).
+        # The delta-rule kernels take the state in the activation dtype.
+        # TODO(RBLN): support cache_config.mamba_ssm_cache_dtype (float32 in the
+        # Qwen3.5 HF config).
         return (self.model_config.dtype,)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -166,9 +160,7 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         qkv, z = mixed_qkvz.split([channels, value_dim], dim=-1)
         b, a = gates.chunk(2, dim=-1)
 
-        # One conv over q | k | v, whose rows the model regrouped by key head at
-        # load time (grouped_qkv_rows): RSD cuts the conv's channels where it cuts
-        # the delta-rule kernels' heads, so a chiplet's conv output is what they read.
+        # One conv over q | k | v in key-head order (grouped_qkv_rows).
         convolved = torch.ops.rbln_custom_ops.kda_conv(
             qkv.reshape(batch, seq_len, 1, channels),
             self.conv1d.weight.view(1, channels, kernel),
@@ -180,9 +172,8 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             kernel - 1,
             store_index=metadata.conv_store_blocks,
         )
-        # The delta-rule kernels take q / k a key head (L2-normalized inside), v, g and
-        # beta per value head grouped under its key head: value head h is key head
-        # h // ratio's (h % ratio)-th, as HF's repeat_interleave pairs them.
+        # The delta-rule kernels take q / k per key head (L2-normalized inside) and
+        # v, g, beta per value head, grouped under its key head as HF pairs them.
         grouped = convolved.view(batch, seq_len, num_k_heads, 2 + ratio, head_dim)
         grouped = grouped.permute(0, 2, 3, 1, 4)
         query, key = (grouped[:, :, i].contiguous() for i in (0, 1))
@@ -209,7 +200,6 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 state,
                 metadata.prefill_state_indices,
                 metadata.prefill_has_initial_state,
-                GDN_PREFILL_CHUNK,
                 store_index=metadata.store_state_indices,
             )
         else:
