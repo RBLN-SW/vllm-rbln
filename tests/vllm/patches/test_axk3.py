@@ -140,6 +140,8 @@ def test_forward_runs_only_the_layers_this_rank_built(monkeypatch):
             return hidden_states + 1, None
 
     monkeypatch.setattr(envs, "VLLM_RBLN_NUM_HIDDEN_LAYERS", 2)
+    # The plain decode streams, whichever compiler is installed.
+    monkeypatch.setattr(axk3_model, "_CUTS_THE_DECODE_GR", False, raising=False)
     monkeypatch.setattr(dist_utils, "get_pp_indices", patched_get_pp_indices)
     group = SimpleNamespace(rank_in_group=0, world_size=1)
     monkeypatch.setattr(parallel_state, "get_pp_group", lambda: group)
@@ -315,13 +317,23 @@ def test_a_decode_batch_runs_the_gated_residual_ops(gated_residual_model, monkey
     def forward():
         return built.model.forward(None, torch.zeros(8, 1), None, embeds)
 
+    def norm_last(residual, gamma, eps):
+        """axk3_gr_norm_last, which a compiler before the decode cut lacks."""
+        rows = residual.float()
+        normed = rows * torch.rsqrt(rows.pow(2).mean(dim=-1, keepdim=True) + eps)
+        gain = gamma.view(residual.shape[1], 1, -1).float()
+        return (normed * gain).to(residual.dtype)
+
     plain = forward()
     built.read_dims.clear()
     monkeypatch.setattr(axk3_model, "_CUTS_THE_DECODE_GR", True)
+    monkeypatch.setattr(
+        torch.ops.rbln_custom_ops, "axk3_gr_norm_last", norm_last, raising=False
+    )
     cut = forward()
 
-    # As in prefill: both layers read [B, n, T, h], the final read the plain layout.
-    assert built.read_dims == [4, 4, 4, 4, 3]
+    # Every read, the final one too, takes [B, n, T, h].
+    assert built.read_dims == [4, 4, 4, 4, 4]
     torch.testing.assert_close(cut, plain)
 
 

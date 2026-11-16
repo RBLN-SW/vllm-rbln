@@ -123,13 +123,19 @@ class AXK3GatedResidual(nn.Module):
     def read(self, residual: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         """[..., n*h] -> (block input [..., h], write gate [..., n] or None)."""
         if residual.dim() == 4:
-            u, write_gate = torch.ops.rbln_custom_ops.axk3_gr_norm(
-                residual,
-                self.gamma,
-                self.write_proj.weight,
-                self.write_bias,
-                self.norm.variance_epsilon,
-            )
+            write_gate = None
+            if self.write_proj is None:
+                u = torch.ops.rbln_custom_ops.axk3_gr_norm_last(
+                    residual, self.gamma, self.norm.variance_epsilon
+                )
+            else:
+                u, write_gate = torch.ops.rbln_custom_ops.axk3_gr_norm(
+                    residual,
+                    self.gamma,
+                    self.write_proj.weight,
+                    self.write_bias,
+                    self.norm.variance_epsilon,
+                )
             block_input = torch.ops.rbln_custom_ops.axk3_gr_read(
                 u, self.read_down.weight, self.read_up.weight
             )
@@ -397,7 +403,9 @@ class AXK3Model(nn.Module):
             if topk_indices is not None:
                 topk_by_layer[layer.layer_idx] = topk_indices
 
-        if on_gr_ops:
+        # Prefill runs the final read plain; a decode batch cut by rows reads on
+        # the ops, so the rows are gathered before lm_head.
+        if attn_metadata.is_prefill:
             hidden_states = hidden_states.transpose(-3, -2).reshape(
                 *inputs_embeds.shape[:-1], -1
             )
