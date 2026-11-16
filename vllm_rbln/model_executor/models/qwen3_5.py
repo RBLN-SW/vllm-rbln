@@ -13,31 +13,41 @@
 # limitations under the License.
 """Qwen3.5 (Qwen3_5ForConditionalGeneration) with images on the vllm model path.
 
-The vision tower runs as its own compiled graph at one fixed patch bucket: an
-image is padded to the bucket, its rotary and learned position embeddings are
-built on the host, and a key mask hides the padding. The image embeddings
-reach the language model through the runner's staged `mm_embeds` / `mm_mask`
-(SupportsRBLNMultiModal), merged inside the compiled graph.
+The vision tower runs as its own compiled graph at fixed patch buckets
+(`encoder_token_budgets`): an image is padded to the smallest bucket that holds
+it, its rotary and learned position embeddings are built on the host, and a key
+mask hides the padding. The image embeddings reach the language model through
+the runner's staged `mm_embeds` / `mm_mask` (SupportsRBLNMultiModal), merged
+inside the compiled graph.
 """
 
 import math
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+from transformers import BatchFeature
 from vllm.config import VllmConfig
-from vllm.model_executor.models.qwen3_5 import Qwen3_5ForConditionalGeneration
-from vllm.model_executor.models.qwen3_vl import pos_embed_interpolate_native
+from vllm.model_executor.models.qwen3_5 import (
+    Qwen3_5ForConditionalGeneration,
+    Qwen3_5ProcessingInfo,
+)
+from vllm.model_executor.models.qwen3_vl import (
+    Qwen3VLDummyInputsBuilder,
+    Qwen3VLMultiModalProcessor,
+    pos_embed_interpolate_native,
+)
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.parse import MultiModalDataItems
 from vllm.sequence import IntermediateTensors
 
 from vllm_rbln.model_executor.models.interfaces import SupportsRBLNMultiModal
 from vllm_rbln.v1.attention.backends.gdn_attn import grouped_qkv_rows
 
-# The largest image, in patches, the compiled vision encoder takes. Attention
-# runs over the whole bucket at once, so the processor's own limit (16M pixels
-# for Qwen3.5) does not fit; --mm-processor-kwargs '{"max_pixels": N}' sets it.
+# The largest vision encoder bucket, in patches: the largest one run on a
+# device. The processor's own limit for Qwen3.5 (16M pixels) is four times
+# that, so --mm-processor-kwargs '{"max_pixels": N}' has to lower it.
 MAX_ENCODER_PATCHES = 16384
 
 
@@ -93,6 +103,37 @@ class _RBLNQwen3VisionEncoder(nn.Module):
         return self.visual.merger(x)
 
 
+class RBLNQwen3_5MultiModalProcessor(Qwen3VLMultiModalProcessor):
+    """Upstream's processor, refusing per request an image above the engine's
+    start-up limit, which the vision encoder buckets are sized to hold."""
+
+    def _apply_hf_processor_main(
+        self,
+        mm_items: MultiModalDataItems,
+        hf_kwargs: Mapping[str, object],
+    ) -> BatchFeature:
+        outputs = super()._apply_hf_processor_main(mm_items, hf_kwargs)
+        grids = outputs.get("image_grid_thw")
+        if grids is not None:
+            size = self.info.get_image_size_with_most_features()
+            patch = self.info.get_hf_config().vision_config.patch_size
+            limit = (size.height // patch) * (size.width // patch)
+            for t, h, w in grids.tolist():
+                if t * h * w > limit:
+                    raise ValueError(
+                        f"The image has {t * h * w} patches, more than the {limit} "
+                        "the RBLN vision encoder is compiled for. Lower the "
+                        "request's max_pixels, or raise it at start-up in "
+                        "--mm-processor-kwargs."
+                    )
+        return outputs
+
+
+@MULTIMODAL_REGISTRY.register_processor(
+    RBLNQwen3_5MultiModalProcessor,
+    info=Qwen3_5ProcessingInfo,
+    dummy_inputs=Qwen3VLDummyInputsBuilder,
+)
 class RBLNQwen3_5ForConditionalGeneration(
     Qwen3_5ForConditionalGeneration, SupportsRBLNMultiModal
 ):
@@ -111,24 +152,33 @@ class RBLNQwen3_5ForConditionalGeneration(
         # Upstream builds no vision tower when images are off (a placeholder
         # stands in for it).
         self.has_vision = mm_config.get_limit_per_prompt("image") > 0
-        self.encoder_patches = 0
-        self.encoder_grid: list[int] = []
         self.mm_encoder_patch_buckets: list[int] = []
         if self.has_vision:
             info = MULTIMODAL_REGISTRY.get_processing_info(vllm_config.model_config)
             size = info.get_image_size_with_most_features()
             patch = self.visual.patch_size
-            self.encoder_grid = [1, size.height // patch, size.width // patch]
-            self.encoder_patches = math.prod(self.encoder_grid)
-            self.mm_encoder_patch_buckets = [self.encoder_patches]
-            if self.encoder_patches > MAX_ENCODER_PATCHES:
+            merge = self.visual.spatial_merge_size
+            max_tokens = (size.height // patch) * (size.width // patch) // merge**2
+            # One compiled encoder shape per budget; an image is padded to the
+            # smallest that holds its patches.
+            budgets = sorted(vllm_config.additional_config.encoder_token_budgets) or [
+                max_tokens
+            ]
+            if budgets[-1] < max_tokens:
+                raise ValueError(
+                    f"encoder_token_budgets {budgets} must reach {max_tokens} output "
+                    "tokens, the processor's upper bound for an image. Add a budget "
+                    "that large, or lower max_pixels in --mm-processor-kwargs."
+                )
+            self.mm_encoder_patch_buckets = [b * merge**2 for b in budgets]
+            largest = self.mm_encoder_patch_buckets[-1]
+            if largest > MAX_ENCODER_PATCHES:
                 max_pixels = MAX_ENCODER_PATCHES * patch * patch
                 raise ValueError(
-                    f"The largest image the processor accepts has "
-                    f"{self.encoder_patches} patches; the RBLN vision encoder takes "
-                    f"at most {MAX_ENCODER_PATCHES}. Limit it with --mm-processor-"
-                    f"kwargs '{{\"max_pixels\": {max_pixels}}}' or less, or serve "
-                    "text-only with --language-model-only."
+                    f"The largest vision encoder bucket has {largest} patches; the "
+                    f"RBLN vision encoder takes at most {MAX_ENCODER_PATCHES}. Limit "
+                    f"it with --mm-processor-kwargs '{{\"max_pixels\": {max_pixels}}}' "
+                    "or less, or serve text-only with --language-model-only."
                 )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -184,23 +234,33 @@ class RBLNQwen3_5ForConditionalGeneration(
             self.compile_mm_encoder(lambda encoder: encoder)
             encoder = self._mm_encoder
         assert encoder is not None
-        patch_dim = self.visual.patch_embed.proj.weight[0].numel()
-        pixels = torch.zeros(self.encoder_patches, patch_dim, dtype=self.visual.dtype)
+        visual = self.visual
+        patch_dim = visual.patch_embed.proj.weight[0].numel()
+        rotary_dim = visual.blocks[0].attn.hidden_size_per_attention_head // 2
+        kwargs = {"dtype": visual.dtype, "device": visual.device}
         with torch.inference_mode():
-            encoder(*self._encoder_inputs(pixels, self.encoder_grid))
+            for bucket in self.mm_encoder_patch_buckets:
+                encoder(
+                    torch.zeros(bucket, patch_dim, **kwargs),
+                    torch.zeros(bucket, visual.hidden_size, **kwargs),
+                    torch.ones(bucket, rotary_dim, **kwargs),
+                    torch.zeros(bucket, rotary_dim, **kwargs),
+                    torch.zeros(1, 1, bucket, **kwargs),
+                )
 
     def _encoder_inputs(
         self, pixel_values: torch.Tensor, grid_thw: list[int]
     ) -> list[torch.Tensor]:
-        """Pad one image to the bucket and build its position embeddings and key
+        """Pad one image to its bucket and build its position embeddings and key
         mask on the host; upstream builds them on the tower's device."""
         visual = self.visual
-        bucket = self.encoder_patches
         num_patches = math.prod(grid_thw)
-        assert num_patches <= bucket, (
+        fits = [b for b in self.mm_encoder_patch_buckets if b >= num_patches]
+        assert fits, (
             f"an image of {num_patches} patches (grid {grid_thw}) exceeds the "
-            f"vision encoder's {bucket}-patch bucket"
+            f"vision encoder's {self.mm_encoder_patch_buckets[-1]}-patch bucket"
         )
+        bucket = fits[0]
         dtype = visual.dtype
         t, h, w = grid_thw
         patches = torch.zeros(bucket, pixel_values.shape[-1], dtype=dtype)
