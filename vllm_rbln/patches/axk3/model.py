@@ -59,6 +59,18 @@ _k2: Any = _axk2_model._module
 _AXK2DecoderLayer: Any = _k2.AXK2DecoderLayer
 _AXK2ForCausalLM: Any = _k2.AXK2ForCausalLM
 
+try:
+    # A compiler with this kernel cuts the decode Gated Residual by batch rows and
+    # lays out decode's weights around the axk3_gr_* ops as prefill's; an older one
+    # fails to share them, so decode keeps the plain Gated Residual there.
+    from rebel.core.custom_converter.kernel_table.gated_residual import (  # noqa: F401
+        KERNEL_AXK3_GR_READ_ROWS,
+    )
+except ImportError:
+    _CUTS_THE_DECODE_GR = False
+else:
+    _CUTS_THE_DECODE_GR = True
+
 
 class AXK3GatedResidual(nn.Module):
     """Gated Residual read/write over ``num_streams`` residual branches.
@@ -363,9 +375,11 @@ class AXK3Model(nn.Module):
         if inputs_embeds is None:
             inputs_embeds = self.embed_input_ids(input_ids)
         is_prefill = is_prefill_step()
+        # The layers run the axk3_gr_* ops on [B, n, T, h] streams.
+        on_gr_ops = is_prefill or _CUTS_THE_DECODE_GR
 
         # Every stream starts as the embedding.
-        if is_prefill:
+        if on_gr_ops:
             streams = (
                 *inputs_embeds.shape[:-2],
                 self.num_streams,
@@ -383,7 +397,7 @@ class AXK3Model(nn.Module):
             if topk_indices is not None:
                 topk_by_layer[layer.layer_idx] = topk_indices
 
-        if is_prefill:
+        if on_gr_ops:
             hidden_states = hidden_states.transpose(-3, -2).reshape(
                 *inputs_embeds.shape[:-1], -1
             )
