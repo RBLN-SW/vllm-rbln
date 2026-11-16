@@ -49,7 +49,7 @@ from vllm_rbln.model_executor.models.optimum.qwen3_reranker import (
 from vllm_rbln.model_executor.models.optimum.qwen3_vl import (
     RBLNOptimumQwen3VLForSequenceClassification,
 )
-from vllm_rbln.utils.optimum.configuration.runtime import (
+from vllm_rbln.utils.optimum.configuration.runtime_config import (
     is_chunked_prefill_arch,
 )
 from vllm_rbln.utils.optimum.predicates import is_qwen3_embedding, is_qwen3_reranker

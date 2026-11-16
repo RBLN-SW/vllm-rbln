@@ -13,10 +13,13 @@
 # limitations under the License.
 
 
+from types import SimpleNamespace
+
 import pytest
 
-from vllm_rbln.utils.optimum.configuration.readers import (
+from vllm_rbln.utils.optimum.configuration.rbln_config import (
     _num_devices_of,
+    has_packed_kv_cache,
     read_num_devices,
 )
 
@@ -93,3 +96,37 @@ class TestReadNumDevices:
     def test_falls_back_to_top_level_when_submodule_lacks_num_devices(self):
         cfg = {"num_devices": 4, "language_model": {"batch_size": 2}}
         assert read_num_devices(cfg) == 4
+
+
+class TestHasPackedKvCache:
+    def test_packed_cache(self):
+        cfg = {
+            "cache_metas": [
+                {"name": "past_key_values_0", "shape": [4, 2, 2, 1, 256, 64]}
+            ]
+        }
+        assert has_packed_kv_cache(cfg)
+
+    def test_separate_k_and_v(self):
+        cfg = {
+            "cache_metas": [
+                {"name": "past_key_values_0", "shape": [4, 2, 256, 64]},
+                {"name": "past_key_values_1", "shape": [4, 2, 256, 64]},
+            ]
+        }
+        assert not has_packed_kv_cache(cfg)
+
+    def test_without_cache_metas(self):
+        assert not has_packed_kv_cache({"kvcache_num_blocks": 4})
+
+    def test_reads_the_language_model(self):
+        cfg = {
+            "language_model": {"cache_metas": [{"shape": [4, 2, 2, 1, 256, 64]}]},
+            "vision_tower": {},
+        }
+        assert has_packed_kv_cache(cfg)
+
+    def test_reads_config_objects(self):
+        # Two blocks of a packed cache, e.g. eager attention with batch 2.
+        meta = SimpleNamespace(shape=[2, 2, 2, 1, 256, 64])
+        assert has_packed_kv_cache(SimpleNamespace(cache_metas=[meta]))
