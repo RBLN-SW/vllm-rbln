@@ -115,7 +115,7 @@ class RBLNQwen3_5ForConditionalGeneration(
         self.encoder_grid: list[int] = []
         self.mm_encoder_patch_buckets: list[int] = []
         if self.has_vision:
-            info = MULTIMODAL_REGISTRY.create_processor(vllm_config.model_config).info
+            info = MULTIMODAL_REGISTRY.get_processing_info(vllm_config.model_config)
             size = info.get_image_size_with_most_features()
             patch = self.visual.patch_size
             self.encoder_grid = [1, size.height // patch, size.width // patch]
