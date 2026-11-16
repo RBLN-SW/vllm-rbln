@@ -48,6 +48,7 @@ from vllm_rbln.model_executor.models.interfaces import (
     SupportsRBLNMultiModal,
 )
 from vllm_rbln.patches.attention import _resolve_kv_cache
+from vllm_rbln.patches.gemma4 import ResidualReadNorm
 
 
 def _build_mm_prefix_sliding_mask(
@@ -279,6 +280,9 @@ class RBLNGemma4ForConditionalGeneration(
                 "supported on RBLN yet."
             )
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        self.language_model.model.norm = ResidualReadNorm(
+            text_config.hidden_size, eps=text_config.rms_norm_eps
+        )
         self.mm_prefix_attn_layers: list[nn.Module] = []
         for module in self.modules():
             if (

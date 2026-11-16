@@ -16,6 +16,7 @@ import torch
 import torch.nn.functional as F
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
+from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.models.gemma4 import Gemma4DecoderLayer, Gemma4MLP
 
 from vllm_rbln.patches import register_patch
@@ -43,7 +44,20 @@ def _is_prefill() -> bool:
     return attn_metadata is not None and attn_metadata.is_prefill
 
 
-def _dense_prefill_forward(
+try:
+    # A compiler with this kernel cuts the decode residual by batch rows and lays
+    # out decode's weights around the ops as prefill's; an older one fails to
+    # share them, so decode keeps the plain path there.
+    from rebel.core.custom_converter.kernel_table.residual import (  # noqa: F401
+        KERNEL_RESIDUAL_READ_ROWS,
+    )
+except ImportError:
+    _CUTS_THE_DECODE_RESIDUAL = False
+else:
+    _CUTS_THE_DECODE_RESIDUAL = True
+
+
+def _dense_cut_forward(
     self: Gemma4DecoderLayer,
     positions: torch.Tensor,
     hidden_states: torch.Tensor,
@@ -51,8 +65,9 @@ def _dense_prefill_forward(
 ) -> tuple[torch.Tensor, None]:
     """Upstream's dense layer with each residual add and norm as
     rbln_custom_ops::{residual_read,gemma4_dense_residual_write}, which the compiler
-    cuts by tokens over the chiplets: the residual stays split between blocks
-    instead of collecting on one chiplet. Each norm passes its own eps."""
+    cuts over the chiplets, by tokens in prefill and by batch rows in decode: the
+    residual stays split between blocks instead of collecting on one chiplet.
+    Each norm passes its own eps."""
     ops = torch.ops.rbln_custom_ops
     x = ops.residual_read(
         hidden_states,
@@ -90,10 +105,10 @@ def _dense_prefill_forward(
         "upstream's MoE runner precomputed logits. RBLNMoERunner takes a router "
         "callable instead, as the patched qwen/deepseek/minimax/gpt-oss MoE "
         "blocks pass it; this forward is upstream's with that one call changed. "
-        "A dense layer in prefill runs its residual adds and norms as "
+        "A dense layer runs its residual adds and norms as "
         "rbln_custom_ops::{residual_read,gemma4_dense_residual_write} instead, "
-        "which the compiler cuts by tokens so the residual stays split across "
-        "chiplets."
+        "which the compiler cuts by tokens or batch rows so the residual stays "
+        "split across chiplets."
     ),
 )
 def patched_gemma4_decoder_layer_forward(
@@ -105,15 +120,17 @@ def patched_gemma4_decoder_layer_forward(
     **kwargs,
 ) -> tuple[torch.Tensor, None]:
     # MoE and per-layer-input layers read the residual again or add to it
-    # before the scalar, which the two dense ops do not cover; decode is not cut.
-    # A compiler without the ops keeps the plain path.
+    # before the scalar, which the two dense ops do not cover. A compiler
+    # without the ops keeps the plain path.
     if (
         not self.enable_moe_block
         and per_layer_input is None
-        and _is_prefill()
-        and hasattr(torch.ops.rbln_custom_ops, "residual_read")
+        and (
+            _CUTS_THE_DECODE_RESIDUAL
+            or (_is_prefill() and hasattr(torch.ops.rbln_custom_ops, "residual_read"))
+        )
     ):
-        return _dense_prefill_forward(self, positions, hidden_states, **kwargs)
+        return _dense_cut_forward(self, positions, hidden_states, **kwargs)
 
     residual = hidden_states
     hidden_states = self.input_layernorm(residual)
@@ -151,6 +168,24 @@ def patched_gemma4_decoder_layer_forward(
         )
 
     return hidden_states * self.layer_scalar, None
+
+
+class ResidualReadNorm(RMSNorm):
+    """Gemma4's final norm, as rbln_custom_ops::residual_read in decode on a
+    compiler that cuts the decode residual by batch rows. The read gathers the
+    rows; left cut, they would reach lm_head, whose weight is embed_tokens' and
+    takes the layout prefill gives it."""
+
+    def forward(
+        self, x: torch.Tensor, residual: torch.Tensor | None = None
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if _CUTS_THE_DECODE_RESIDUAL and not _is_prefill():
+            # The patched layers carry the residual in hidden_states.
+            assert residual is None
+            return torch.ops.rbln_custom_ops.residual_read(
+                x, self.weight, self.variance_epsilon
+            )
+        return super().forward(x, residual)
 
 
 @add_registration(

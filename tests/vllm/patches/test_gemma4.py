@@ -13,13 +13,14 @@
 # limitations under the License.
 
 """Gemma4 on RBLN: the attention backend choice, the decoder layer forward
-(MoE routing, the dense prefill residual on the token-cut ops) and the split MLP.
+(MoE routing, the dense residual on the cut ops), the final norm and the split MLP.
 
 Config objects and stand-in layers only -- no checkpoint, no device.
 """
 
 from types import SimpleNamespace
 
+import pytest
 from vllm.model_executor.models.config import Gemma4Config
 
 
@@ -206,14 +207,57 @@ def test_the_dense_prefill_residual_runs_on_the_token_cut_ops(monkeypatch):
     torch.testing.assert_close(cut, plain)
 
 
-def test_decode_keeps_the_plain_layer(monkeypatch):
+def test_decode_on_a_compiler_without_the_decode_cut_keeps_the_plain_layer(
+    monkeypatch,
+):
     import torch
 
+    from vllm_rbln.patches import gemma4
+
     calls = _token_cut_ops(monkeypatch)
+    monkeypatch.setattr(gemma4, "_CUTS_THE_DECODE_RESIDUAL", False)
 
     _run(_dense_layer(), torch.randn(4, 1, 64), False, monkeypatch)
 
     assert calls == []
+
+
+def test_the_dense_decode_residual_runs_on_the_cut_ops(monkeypatch):
+    import torch
+
+    from vllm_rbln.patches import gemma4
+
+    torch.manual_seed(0)
+    calls = _token_cut_ops(monkeypatch)
+    layer = _dense_layer()
+    hidden_states = torch.randn(8, 1, 64)
+
+    monkeypatch.setattr(gemma4, "_CUTS_THE_DECODE_RESIDUAL", True)
+    cut = _run(layer, hidden_states, False, monkeypatch)
+    assert calls == ["read", "write", "read", "write"]
+    monkeypatch.setattr(gemma4, "_CUTS_THE_DECODE_RESIDUAL", False)
+    plain = _run(layer, hidden_states, False, monkeypatch)
+    torch.testing.assert_close(cut, plain)
+
+
+@pytest.mark.parametrize("prefill", [False, True])
+def test_the_final_norm_reads_only_the_decode_residual(monkeypatch, prefill):
+    import torch
+
+    from vllm_rbln.patches import gemma4
+
+    torch.manual_seed(0)
+    calls = _token_cut_ops(monkeypatch)
+    monkeypatch.setattr(gemma4, "_CUTS_THE_DECODE_RESIDUAL", True)
+    monkeypatch.setattr(gemma4, "_is_prefill", lambda: prefill)
+    norm = gemma4.ResidualReadNorm(64, eps=1e-6)
+    norm.weight.data = 1.0 + 0.1 * torch.randn(64)
+    x = torch.randn(8, 1, 64)
+
+    out = norm(x)
+
+    assert calls == ([] if prefill else ["read"])
+    torch.testing.assert_close(out, _rms_norm(x, norm.weight.data, 1e-6))
 
 
 def test_a_per_layer_input_keeps_the_plain_layer(monkeypatch):
