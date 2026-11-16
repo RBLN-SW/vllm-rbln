@@ -36,6 +36,7 @@ from vllm.v1.outputs import SamplerOutput
 import vllm_rbln.v1.worker.rbln_model_runner as mr
 from tests.vllm.v1.worker.utils import (
     MAX_MODEL_LEN,
+    make_kv_cache_config,
     make_scheduler_output,
     make_speculative_config,
     schedule_cached,
@@ -82,9 +83,11 @@ class TestPreprocessBeforeStaging:
             None if is_first_rank else intermediate
         )
 
+    @pytest.mark.parametrize("num_kv_groups", [1, 2])
     def test_decode_repairs_cpu_input_before_staging(
-        self, make_model_runner, monkeypatch
+        self, make_model_runner, monkeypatch, num_kv_groups
     ):
+        """Keep CPU preparation ahead of blocking copies in the current pipeline."""
         from tests.vllm.v1.worker.test_async_output import _async_output
 
         monkeypatch.setattr(
@@ -92,9 +95,13 @@ class TestPreprocessBeforeStaging:
             "get_pp_group",
             lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
         )
-        runner = make_model_runner()
+        layers = tuple(f"layer.{index}" for index in range(num_kv_groups))
+        runner = make_model_runner(layers=layers, init_kv_cache=False)
+        runner.initialize_kv_cache(
+            make_kv_cache_config(runner, groups=[(layer,) for layer in layers])
+        )
         runner.use_async_scheduling = True
-        runner._update_states(schedule_new("a"))
+        runner._update_states(schedule_new("a", block_ids=[tuple([0] for _ in layers)]))
         state = runner.requests["a"]
         n = state.num_prompt_tokens
         state.output_token_ids.append(-1)
@@ -111,6 +118,7 @@ class TestPreprocessBeforeStaging:
         original_readback = previous.get_sampled_token_ids_cpu
         original_stage = runner.input_stager.stage
         original_metadata = runner._build_attention_metadata
+        original_metadata_stage = mr.RBLNFlashAttentionMetadataBuilder.stage
 
         def kwargs():
             order.append("cpu_kwargs")
@@ -129,6 +137,10 @@ class TestPreprocessBeforeStaging:
             order.append("metadata")
             return original_metadata(**values)
 
+        def metadata_stage(builder, values):
+            order.append("metadata_stage")
+            return original_metadata_stage(builder, values)
+
         def forward(**values):
             order.append("forward")
             assert values["input_ids"][0, 0] == 42
@@ -138,6 +150,9 @@ class TestPreprocessBeforeStaging:
         monkeypatch.setattr(previous, "get_sampled_token_ids_cpu", readback)
         monkeypatch.setattr(runner.input_stager, "stage", stage)
         monkeypatch.setattr(runner, "_build_attention_metadata", metadata)
+        monkeypatch.setattr(
+            mr.RBLNFlashAttentionMetadataBuilder, "stage", metadata_stage
+        )
         monkeypatch.setattr(runner, "model_executable", forward, raising=False)
 
         runner.execute_model(
@@ -146,7 +161,17 @@ class TestPreprocessBeforeStaging:
             )
         )
 
-        assert order == ["metadata", "cpu_kwargs", "readback", "stage", "forward"]
+        readback_index = order.index("readback")
+        forward_index = order.index("forward")
+        assert order.index("metadata") < readback_index
+        assert order.index("cpu_kwargs") < readback_index
+        assert readback_index < order.index("stage") < forward_index
+        assert order.count("metadata_stage") == num_kv_groups
+        assert all(
+            readback_index < index < forward_index
+            for index, phase in enumerate(order)
+            if phase == "metadata_stage"
+        )
         assert state.output_token_ids == [42]
 
 
