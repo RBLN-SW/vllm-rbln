@@ -15,6 +15,7 @@
 """The RBLN Qwen3.5 image path (one padded image at a time, full attention with
 the padding masked) tracks upstream's vision tower on the same weights."""
 
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -30,8 +31,11 @@ from vllm.distributed import (
 from vllm.model_executor.models.qwen3_vl import Qwen3_VisionTransformer
 
 from tests.vllm.vllm_config import make_vllm_config
+from vllm_rbln.config import RBLNConfig
+from vllm_rbln.model_executor.models import qwen3_5
 from vllm_rbln.model_executor.models.qwen3_5 import (
     RBLNQwen3_5ForConditionalGeneration,
+    RBLNQwen3_5MultiModalProcessor,
 )
 
 PATCH, MERGE, TEMPORAL = 16, 2, 2
@@ -81,36 +85,119 @@ def test_a_video_limit_above_zero_is_refused(limits):
         RBLNQwen3_5ForConditionalGeneration(vllm_config=vllm_config)
 
 
-def test_warmup_runs_the_encoder_once_over_the_whole_bucket(visual):
-    # The one bucket is the processor's largest image, so the warm-up input is
-    # that whole grid with no padded rows.
+def _build_with_token_budgets(monkeypatch, budgets):
+    """The model with upstream's construction stubbed out: a largest image of
+    256 output tokens (1024 patches) and the given budgets."""
+
+    def init(self, *, vllm_config, prefix="model"):
+        torch.nn.Module.__init__(self)
+        self.visual = SimpleNamespace(spatial_merge_size=MERGE)
+
+    monkeypatch.setattr(qwen3_5.Qwen3_5ForConditionalGeneration, "__init__", init)
+    info = SimpleNamespace(get_max_image_tokens=lambda: 256)
+    monkeypatch.setattr(
+        qwen3_5.MULTIMODAL_REGISTRY, "get_processing_info", lambda model_config: info
+    )
+    limits = {"image": 1, "video": 0}
+    mm_config = SimpleNamespace(get_limit_per_prompt=limits.get)
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(get_multimodal_config=lambda: mm_config),
+        additional_config=RBLNConfig(encoder_token_budgets=budgets),
+    )
+    return RBLNQwen3_5ForConditionalGeneration(vllm_config=vllm_config)
+
+
+@pytest.mark.parametrize(
+    ("budgets", "buckets"),
+    [
+        # Unset: one bucket, the processor's largest image.
+        ([], [1024]),
+        ([256, 64], [256, 1024]),
+        ([64, 300], [256, 1200]),
+    ],
+)
+def test_token_budgets_resolve_to_patch_buckets(monkeypatch, budgets, buckets):
+    model = _build_with_token_budgets(monkeypatch, budgets)
+
+    assert model.mm_encoder_patch_buckets == buckets
+
+
+def test_token_budgets_below_the_largest_image_are_refused(monkeypatch):
+    # No bucket would hold the processor's largest image.
+    with pytest.raises(ValueError, match="must reach 256 output tokens"):
+        _build_with_token_budgets(monkeypatch, [64])
+
+
+def test_a_request_image_above_the_start_up_limit_is_refused(monkeypatch):
+    # The engine starts with a limit of 256 output tokens: 1024 patches.
+    processor = RBLNQwen3_5MultiModalProcessor.__new__(RBLNQwen3_5MultiModalProcessor)
+    processor.info = SimpleNamespace(
+        get_max_image_tokens=lambda: 256,
+        get_image_processor=lambda: SimpleNamespace(merge_size=MERGE),
+    )
+    grids = torch.tensor([[1, 32, 32]])
+    monkeypatch.setattr(
+        qwen3_5.Qwen3VLMultiModalProcessor,
+        "_apply_hf_processor_main",
+        lambda self, mm_items, hf_kwargs: {"image_grid_thw": grids},
+    )
+
+    assert processor._apply_hf_processor_main(None, {})["image_grid_thw"] is grids
+
+    # A request that raised max_pixels: 34 x 32 = 1088 patches.
+    grids = torch.tensor([[1, 32, 32], [1, 34, 32]])
+    with pytest.raises(ValueError, match="1088 patches, more than the 1024"):
+        processor._apply_hf_processor_main(None, {})
+
+
+def test_warmup_runs_the_encoder_once_over_each_bucket(visual):
     model = RBLNQwen3_5ForConditionalGeneration.__new__(
         RBLNQwen3_5ForConditionalGeneration
     )
     torch.nn.Module.__init__(model)
     model.visual = visual
     model.has_vision = True
-    model.encoder_grid = [1, 8, 16]
-    model.encoder_patches = 128
-    encoder = Mock(return_value=torch.zeros(128 // (MERGE * MERGE), 32))
+    model.mm_encoder_patch_buckets = [64, 128]
+    encoder = Mock(return_value=torch.zeros(1, 32))
     model._mm_encoder = encoder
 
     model.warmup_mm_encoder()
 
-    encoder.assert_called_once()
-    patches, pos_embeds, cos, sin, key_bias = encoder.call_args.args
-    assert patches.shape == (128, 3 * TEMPORAL * PATCH * PATCH)
-    assert pos_embeds.shape[0] == cos.shape[0] == sin.shape[0] == 128
-    assert key_bias.shape == (1, 1, 128) and not key_bias.any()
+    assert encoder.call_count == 2
+    for call, bucket in zip(encoder.call_args_list, [64, 128]):
+        patches, pos_embeds, cos, sin, key_bias = call.args
+        assert patches.shape == (bucket, 3 * TEMPORAL * PATCH * PATCH)
+        assert pos_embeds.shape[0] == cos.shape[0] == sin.shape[0] == bucket
+        assert key_bias.shape == (1, 1, bucket) and not key_bias.any()
 
     model.has_vision = False
     model.warmup_mm_encoder()
-    encoder.assert_called_once()
+    assert encoder.call_count == 2
+
+
+@pytest.mark.parametrize(
+    ("grid", "bucket"), [([1, 6, 4], 64), ([1, 8, 8], 64), ([1, 8, 12], 128)]
+)
+def test_an_image_takes_the_smallest_bucket_that_holds_it(visual, grid, bucket):
+    model = RBLNQwen3_5ForConditionalGeneration.__new__(
+        RBLNQwen3_5ForConditionalGeneration
+    )
+    torch.nn.Module.__init__(model)
+    model.visual = visual
+    model.mm_encoder_patch_buckets = [64, 128]
+    num_patches = grid[0] * grid[1] * grid[2]
+    pixels = torch.zeros(num_patches, 3 * TEMPORAL * PATCH * PATCH)
+
+    patches, _, _, _, key_bias = model._encoder_inputs(pixels, grid)
+
+    assert patches.shape[0] == bucket
+    assert int((key_bias == 0).sum()) == num_patches
 
 
 def test_image_embeddings_match_upstream(visual):
-    # Two images of different grids, each smaller than the bucket, so the
-    # per-image split, the padding and the key mask all take part.
+    # Two images of different grids, each smaller than its bucket (128 and 64
+    # patches), so the per-image split, the bucket choice, the padding and the
+    # key mask all take part.
     grids = [[1, 8, 12], [1, 6, 4]]
     sizes = [t * h * w for t, h, w in grids]
     pixels = torch.randn(sum(sizes), 3 * TEMPORAL * PATCH * PATCH)
@@ -120,7 +207,7 @@ def test_image_embeddings_match_upstream(visual):
     torch.nn.Module.__init__(model)
     model.visual = visual
     model.has_vision = True
-    model.encoder_patches = 128
+    model.mm_encoder_patch_buckets = [64, 128]
     model._mm_encoder = None
 
     with torch.inference_mode():
