@@ -77,6 +77,7 @@ def make_worker(monkeypatch, tmp_path_factory):
         swa_window_mode: bool = False,
         register: bool = True,
         stripe_width: int | None = None,
+        enable_multi_lane_striping: str | None = None,
         chunk_mode: bool = False,
         prefill_step: int | None = None,
     ) -> Any:
@@ -90,6 +91,7 @@ def make_worker(monkeypatch, tmp_path_factory):
             ),
             block_size=geometry.block_size,
             stripe_width=stripe_width,
+            enable_multi_lane_striping=enable_multi_lane_striping,
         )
         # Left open for the test's duration: get_current_attn_backends reads it
         # during __init__, and later production calls read it again.

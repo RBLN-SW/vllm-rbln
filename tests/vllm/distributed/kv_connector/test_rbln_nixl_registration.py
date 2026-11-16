@@ -58,6 +58,7 @@ from tests.vllm.distributed.kv_connector.utils import (
     window_mode,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl import (
+    base_worker,
     registration,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
@@ -443,20 +444,18 @@ class TestRegisterKvCaches:
         assert worker._logical_num_blocks == 128
 
     @pytest.mark.parametrize(
-        "stripe_width, passed",
-        [(None, {}), (0, {"stripe_width": 0}), (4096, {"stripe_width": 4096})],
+        "options",
+        [{}, {"enable_multi_lane_striping": "on"}, {"stripe_width": 0}],
     )
-    def test_host_bounce_creates_backend_and_delegates(
-        self, monkeypatch, stripe_width, passed
-    ):
+    def test_host_bounce_creates_backend_and_delegates(self, monkeypatch, options):
         # Host-bounce with the adapter creates the RBLN backend on the agent,
-        # then delegates registration to upstream. The width rides on that
-        # call, which is the only place this path can pass one.
+        # then delegates registration to upstream. The striping options ride on
+        # that call, which is the only place this path can pass them.
         worker = build_worker(
             monkeypatch,
             kv_buffer_device="cpu",
             nixl_available=True,
-            stripe_width=stripe_width,
+            **options,
         )
         worker.nixl_wrapper = "wrapper"
         worker._layer_specs = {"layer0": _impl_layer_spec()}
@@ -484,7 +483,7 @@ class TestRegisterKvCaches:
             lambda self, kv: delegated.append(kv),
         )
         worker.register_kv_caches({"layer0": "tensor"})
-        assert ensured == [("wrapper", 0, passed)]
+        assert ensured == [("wrapper", 0, options)]
         assert delegated == [{"layer0": "tensor"}]
         assert worker._pending_kv_caches is None
         # Host staging needs the per-region counts too: a pipelined peer reaches
@@ -570,19 +569,17 @@ class TestRegisterKvCaches:
         assert len(set(names)) == len(set(published)) == 1
 
     @pytest.mark.parametrize(
-        "stripe_width, passed",
-        [(None, {}), (0, {"stripe_width": 0}), (4096, {"stripe_width": 4096})],
+        "options",
+        [{}, {"enable_multi_lane_striping": "on"}, {"stripe_width": 0}],
     )
-    def test_a_stripe_width_reaches_the_adapter_only_when_named(
-        self, monkeypatch, stripe_width, passed
-    ):
+    def test_striping_reaches_the_adapter_only_when_named(self, monkeypatch, options):
         # 0 is a width the adapter takes, so it cannot stand for the knob
         # nobody set; absence is what keeps the plugin's own default.
         worker = build_worker(
             monkeypatch,
             kv_buffer_device="cpu",
             nixl_available=True,
-            stripe_width=stripe_width,
+            **options,
         )
         worker.nixl_wrapper = "wrapper"
         worker._layer_specs = {"layer0": _impl_layer_spec()}
@@ -608,13 +605,33 @@ class TestRegisterKvCaches:
         )
         worker.register_kv_caches({"layer0": "tensor"})
 
-        assert seen == [passed]
+        assert seen == [options]
+
+    @pytest.mark.parametrize("value", [True, 0])
+    def test_striping_given_a_non_string_is_refused(self, monkeypatch, value):
+        # The adapter takes "on" / "off"; a JSON `true` or the old numeric
+        # width would otherwise reach the plugin as something it never named.
+        with pytest.raises(RuntimeError, match="enable_multi_lane_striping"):
+            build_worker(monkeypatch, enable_multi_lane_striping=value)
 
     def test_a_stripe_width_given_a_bool_is_refused(self, monkeypatch):
         # It goes through the same typed knob path as the rest: read straight
         # off the extra config, `true` would arrive as a one-byte stripe.
         with pytest.raises(RuntimeError, match="stripe_width"):
             build_worker(monkeypatch, stripe_width=True)
+
+    def test_a_deprecated_stripe_width_warns(self, monkeypatch):
+        with patch.object(base_worker.logger, "warning_once") as warning:
+            build_worker(monkeypatch, stripe_width=0)
+
+        warning.assert_called_once()
+        assert "stripe_width" in warning.call_args.args[0]
+
+    def test_a_stripe_width_without_the_adapter_does_not_warn(self, monkeypatch):
+        with patch.object(base_worker.logger, "warning_once") as warning:
+            build_worker(monkeypatch, nixl_available=False, stripe_width=0)
+
+        warning.assert_not_called()
 
     def test_host_bounce_rejects_differing_per_layer_sizes(self, monkeypatch):
         # Pins the refusal at this path's own point rather than upstream's assert.
@@ -2104,17 +2121,15 @@ class TestD2dRegistrationReachesTheAdapterAndThePeer:
         )
 
     @pytest.mark.parametrize(
-        "stripe_width, passed",
-        [(None, {}), (0, {"stripe_width": 0}), (4096, {"stripe_width": 4096})],
+        "options",
+        [{}, {"enable_multi_lane_striping": "on"}, {"stripe_width": 0}],
     )
-    def test_a_stripe_width_reaches_the_adapter_only_when_named(
-        self, make_worker, stripe_width, passed
-    ):
+    def test_striping_reaches_the_adapter_only_when_named(self, make_worker, options):
         # A backend-lifecycle override, and this path creates the backend just
         # before it registers -- so this is where it has to ride. The 0 case is
         # what separates "nobody named it" from a width of zero.
-        make_worker(stripe_width=stripe_width)
-        assert sys.modules["nixl_rbln"].backend_kwargs_seen == [passed]
+        make_worker(**options)
+        assert sys.modules["nixl_rbln"].backend_kwargs_seen == [options]
 
     def test_registration_republishes_what_a_peer_pairs_on(self, make_worker):
         # Upstream's publish carries no layer names and no chiplet geometry, so

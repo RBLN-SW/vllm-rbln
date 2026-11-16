@@ -65,6 +65,7 @@ def engine_config(
     block_size: int = BLOCK_SIZE,
     kv_role: str = "kv_both",
     stripe_width: int | None = None,
+    enable_multi_lane_striping: str | None = None,
 ) -> Any:
     """A real VllmConfig with a kv_transfer_config, through EngineArgs.
 
@@ -93,9 +94,14 @@ def engine_config(
             kv_connector="RblnNixlConnector",
             kv_role=kv_role,
             kv_buffer_device=kv_buffer_device,
-            kv_connector_extra_config=(
-                {} if stripe_width is None else {"stripe_width": stripe_width}
-            ),
+            kv_connector_extra_config={
+                key: value
+                for key, value in (
+                    ("stripe_width", stripe_width),
+                    ("enable_multi_lane_striping", enable_multi_lane_striping),
+                )
+                if value is not None
+            },
         ),
         **extra,
     )
@@ -966,6 +972,7 @@ def build_worker(
     pp_size=1,
     dcp_size=1,
     pcp_size=1,
+    enable_multi_lane_striping=None,
     stripe_width=None,
     layer_names=("layer0",),
     chunk_mode=False,
@@ -1045,6 +1052,7 @@ def build_worker(
         chunk_mode=chunk_mode,
         chunk_tokens=chunk_tokens,
         swa_window_mode=swa_window_mode,
+        enable_multi_lane_striping=enable_multi_lane_striping,
         stripe_width=stripe_width,
         push_stream=push_stream,
         link_down_exit_s=link_down_exit_s,

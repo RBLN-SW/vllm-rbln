@@ -84,20 +84,24 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
     #: Whether nixl-rbln is installed, so the RBLN backend can be asked for.
     _use_rbln_nixl_backend: bool
     _pending_kv_caches: dict[str, torch.Tensor] | None
-    #: None where nobody named one, which is not the same as a width of 0.
+    #: None where nobody named one, which keeps the plugin default.
+    _enable_multi_lane_striping: str | None
+    #: Deprecated alias of the above; 0 is a value, so None marks absence.
     _stripe_width: int | None
 
     @property
-    def _backend_extra(self) -> dict[str, int]:
+    def _backend_extra(self) -> dict[str, str | int]:
         """What the adapter takes beyond the arguments every call passes.
 
-        0 is a width the adapter accepts and a missing one means "keep the
-        plugin default", so the test is on absence, not on truthiness. Both
-        calls that reach the adapter read it from here.
+        A missing option keeps the plugin default, so the test is on absence,
+        not on truthiness. Both calls that reach the adapter read it from here.
         """
-        if self._stripe_width is None:
-            return {}
-        return {"stripe_width": self._stripe_width}
+        extra: dict[str, str | int] = {}
+        if self._enable_multi_lane_striping is not None:
+            extra["enable_multi_lane_striping"] = self._enable_multi_lane_striping
+        if self._stripe_width is not None:
+            extra["stripe_width"] = self._stripe_width
+        return extra
 
     def _check_pp_constraints(self) -> None:
         if self.vllm_config.parallel_config.pipeline_parallel_size <= 1:

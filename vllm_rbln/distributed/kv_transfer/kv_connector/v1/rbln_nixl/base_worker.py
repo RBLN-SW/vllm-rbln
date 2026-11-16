@@ -194,11 +194,22 @@ class RblnNixlWorkerBase(
                         "upstream built, and a second range extends neither."
                     )
 
-        # 0 is a width the adapter takes, so it cannot stand for "nobody named
-        # one" -- this knob carries its absence instead.
+        # Absence keeps the plugin default; the plugin refuses anything but
+        # "on" and "off" when the backend is created.
+        self._enable_multi_lane_striping = connector_option(
+            vllm_config, "enable_multi_lane_striping", None, takes=str
+        )
+        # TODO: delete, with the key. The adapter still takes it as a deprecated
+        # alias, maps 0 / 1 onto "on" / "off" and lets it win over the new key.
         self._stripe_width = connector_option(
             vllm_config, "stripe_width", None, takes=int
         )
+        if self._stripe_width is not None and self._use_rbln_nixl_backend:
+            logger.warning_once(
+                "RBLN NIXL: kv_connector_extra_config['stripe_width'] will be "
+                "deprecated soon. Use 'enable_multi_lane_striping' instead "
+                '(stripe_width 0 is "on", 1 is "off").'
+            )
 
         self._pending_kv_caches: dict[str, torch.Tensor] | None = None
 
