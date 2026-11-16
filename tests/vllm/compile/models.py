@@ -33,8 +33,15 @@ _MINIMAX_BASE = CompileModelSpec(
 MODELS: list[CompileModelSpec] = [
     CompileModelSpec(
         "Qwen/Qwen3.5-9B",
-        # the block size at which a GatedDeltaNet state fills a full-attention page
-        {"max_num_seqs": 2, "language_model_only": True, "block_size": 256},
+        # the block size at which a GatedDeltaNet state fills a full-attention
+        # page. Under prefix caching a request holds two state blocks a GDN group:
+        # 32 + 3 * 2 + the null block.
+        {
+            "max_num_seqs": 2,
+            "language_model_only": True,
+            "block_size": 256,
+            "num_gpu_blocks_override": 39,
+        },
         chips=REBEL,
         # The fourth layer is the first full-attention one: with it the state
         # and the attention cache share a buffer.

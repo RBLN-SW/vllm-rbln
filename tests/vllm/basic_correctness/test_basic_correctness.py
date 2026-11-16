@@ -36,8 +36,9 @@ MODELS = [
     CompileModelSpec(
         "Qwen/Qwen3.5-4B",
         # text-only (M-RoPE needs no vision here); the block size at which a
-        # GatedDeltaNet state fills a full-attention page
-        {"language_model_only": True, "block_size": 256},
+        # GatedDeltaNet state fills a full-attention page. Under prefix caching a
+        # request holds two state blocks a GDN group: 32 + 3 * 2 + the null block.
+        {"language_model_only": True, "block_size": 256, "num_gpu_blocks_override": 39},
         # The fourth layer is the first full-attention one: with it the state
         # and the attention cache share a buffer.
         num_hidden_layers=4,
