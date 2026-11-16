@@ -17,7 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm_rbln.utils.optimum.configuration.readers import (
+from vllm_rbln.utils.optimum.configuration.rbln_config import (
     _num_devices_of,
     has_packed_kv_cache,
     read_num_devices,

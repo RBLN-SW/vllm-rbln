@@ -27,7 +27,7 @@ def compile_environment(monkeypatch, tmp_path, set_npu_env_var):
     monkeypatch.setattr(sync, "load_compiled_rbln_config", lambda path: None)
     monkeypatch.setattr(sync, "resolve_compiled_model_path", lambda model, cache: None)
     monkeypatch.setattr(
-        "vllm_rbln.utils.optimum.configuration.prepare.default_prefill_chunk_size",
+        "vllm_rbln.utils.optimum.configuration.compile_config.default_prefill_chunk_size",
         lambda: 128,
     )
     monkeypatch.setattr(

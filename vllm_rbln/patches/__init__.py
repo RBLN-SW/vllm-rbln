@@ -35,6 +35,7 @@ from . import (
     ec_connector_factory,
     engine_core,
     fp8_moe_method,
+    gemma4,
     glm5_next,
     gpt_oss,
     gpt_oss_mxfp4_config,
