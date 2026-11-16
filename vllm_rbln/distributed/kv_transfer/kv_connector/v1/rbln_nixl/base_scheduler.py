@@ -26,6 +26,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     ReqId,
 )
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.core.sched.output import SchedulerOutput
 
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
@@ -36,6 +37,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
     every_local_link_down,
 )
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.kv_cache import prompt_boundary_block
 
 if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -81,6 +83,68 @@ class RblnNixlSchedulerBase(NixlBaseConnectorScheduler):
     def _sends_token_count(self) -> bool:
         """Whether the worker needs a request's token count in the metadata."""
         return self._shape.sends_token_count
+
+    @property
+    def _carries_boundary_state(self) -> bool:
+        """Whether a single-state SSM group also exchanges its block-boundary
+        state. A reader learns it from the producer's `remote_state_boundary`;
+        a writer's consumer allocates before that, so it is the opt-in."""
+        return not self._writes_into_peer or self._shape.push_boundary_state
+
+    def get_exchange_clipped_blocks(
+        self, block_ids: BlockIds, clip_ssm: bool = True
+    ) -> BlockIds:
+        """Also keep a single-state SSM group's block-boundary state.
+
+        NOTE(RBLN): upstream keeps only the running state, so the consumer can
+        decode but never caches the prompt. `RBLNMambaManager` holds the state at
+        the prompt's last block boundary in the slot right before the running
+        one -- kept by a producer, allocated by a consumer expecting it -- so a
+        live block there goes along. Both ends clip the same way, and a consumer
+        holding only the running state pairs with the tail of a producer's two.
+        """
+        clipped = super().get_exchange_clipped_blocks(block_ids, clip_ssm)
+        if (
+            not clip_ssm
+            or not clipped
+            or not self._is_hma_required
+            or self._ssm_state_slots_are_positional
+            or not self._carries_boundary_state
+        ):
+            return clipped
+        selected = self.kv_cache_config.select_transfer_block_ids(block_ids)
+        out = list(clipped)
+        for i, blocks in enumerate(selected):
+            n_spec = self._ssm_spec_blocks[i]
+            if n_spec is None or len(blocks) < 2:
+                continue
+            if n_spec := min(n_spec, len(blocks) - 1):
+                blocks = blocks[:-n_spec]
+            if len(blocks) >= 2 and blocks[-2] != NULL_BLOCK_ID:
+                out[i] = list(blocks[-2:])
+        return tuple(out)
+
+    def _drop_superseded_states(
+        self, num_tokens: int, block_ids: BlockIds
+    ) -> tuple[BlockIds, int | None]:
+        """A producer's clipped lists without a superseded state, and the token
+        count the boundary state they still carry ends at, if any.
+
+        A block-aligned prompt's running state is its boundary state; the slot
+        before it then holds a superseded one not yet freed.
+        """
+        groups = self.kv_cache_config.transfer_groups
+        out = list(block_ids)
+        boundary = None
+        for i, blocks in enumerate(out):
+            if self._ssm_spec_blocks[i] is None or len(blocks) != 2:
+                continue
+            block_size = groups[i].kv_cache_spec.block_size
+            if prompt_boundary_block(num_tokens, block_size) is None:
+                out[i] = blocks[-1:]
+            else:
+                boundary = num_tokens // block_size * block_size
+        return tuple(out), boundary
 
     def has_pending_push_work(self) -> bool:
         # The worker's exit runs on a step, and an idle engine does not step.

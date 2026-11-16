@@ -387,8 +387,12 @@ class TestStateBoundaryExchange:
     the slot before the running one: an attention group, then an SSM group."""
 
     @staticmethod
-    def _scheduler():
-        sched = _scheduler()
+    def _scheduler(cls=RblnNixlPullConnectorScheduler, push_boundary_state=False):
+        sched = _scheduler(cls=cls)
+        sched._shape = shape(
+            writes_into_peer=cls._writes_into_peer,
+            push_boundary_state=push_boundary_state,
+        )
         sched._is_hma_required = True
         sched._has_mamba = True
         sched._ssm_state_slots_are_positional = False
@@ -412,6 +416,84 @@ class TestStateBoundaryExchange:
     )
     def test_clip_keeps_a_live_boundary_block(self, block_ids, expected):
         assert self._scheduler().get_exchange_clipped_blocks(block_ids) == expected
+        writer = self._scheduler(RblnNixlPushConnectorScheduler, True)
+        assert writer.get_exchange_clipped_blocks(block_ids) == expected
+
+    def test_a_writer_without_the_opt_in_clips_as_upstream(self):
+        writer = self._scheduler(RblnNixlPushConnectorScheduler)
+        clipped = writer.get_exchange_clipped_blocks(([1, 2, 3], [0, 7, 8]))
+        assert clipped == ([1, 2, 3], [8])
+
+    @pytest.mark.parametrize(
+        ("num_prompt_tokens", "opt_in", "boundary"),
+        [
+            # One token backs off, leaving 39 to transfer: block 1 holds 32.
+            (40, True, 32),
+            # 32 transfer, block-aligned: the running state is the boundary one.
+            (33, True, None),
+            (40, False, None),
+        ],
+    )
+    def test_a_writers_consumer_names_the_boundary_it_receives(
+        self, num_prompt_tokens, opt_in, boundary
+    ):
+        sched = self._scheduler(RblnNixlPushConnectorScheduler, opt_in)
+        req = _Request(
+            "d",
+            num_prompt_tokens=num_prompt_tokens,
+            prompt_token_ids=list(range(num_prompt_tokens)),
+            kv_transfer_params={"do_remote_prefill": True},
+        )
+
+        assert sched.get_num_new_matched_tokens(req, 0) == (
+            num_prompt_tokens - 1,
+            True,
+        )
+        assert req.kv_transfer_params.get(REMOTE_STATE_BOUNDARY) == boundary
+
+    @pytest.mark.parametrize(
+        ("num_tokens", "ssm_blocks", "sent"),
+        [(39, [0, 7, 8], [7, 8]), (32, [7, 8], [8])],
+    )
+    def test_a_writer_hands_over_no_superseded_state(
+        self, num_tokens, ssm_blocks, sent
+    ):
+        sched = self._scheduler(RblnNixlPushConnectorScheduler, True)
+        sched._stop_heartbeat = lambda _req_id: None
+        req = _Request(
+            "p", num_prompt_tokens=num_tokens, num_computed_tokens=num_tokens
+        )
+        req.status = RequestStatus.FINISHED_LENGTH_CAPPED
+
+        delay, params = sched.request_finished(req, ([1, 2, 3], ssm_blocks))
+
+        assert delay is True
+        handed_over = ([1, 2, 3], sent)
+        assert params["remote_block_ids"] == handed_over
+        assert sched._finished_request_blocks["p"] == handed_over
+        assert sched._newly_finished_push_blocks["p"] == handed_over
+        assert REMOTE_STATE_BOUNDARY not in params
+
+    @pytest.mark.parametrize(
+        ("caching", "mode", "ok"),
+        [(True, "align", True), (False, "none", False), (True, "all", False)],
+    )
+    def test_the_opt_in_needs_align_mode_prefix_caching(
+        self, monkeypatch, caching, mode, ok
+    ):
+        def stub_init(self, cfg, _engine_id, kv_cache_config):
+            self._has_mamba = True
+
+        monkeypatch.setattr(NixlPushConnectorScheduler, "__init__", stub_init)
+        config = mock_vllm_config(push_boundary_state=True)
+        config.cache_config.enable_prefix_caching = caching
+        config.cache_config.mamba_cache_mode = mode
+
+        if ok:
+            RblnNixlPushConnectorScheduler(config, "eng", _kv_config([MagicMock()]))
+        else:
+            with pytest.raises(AssertionError, match="push_boundary_state"):
+                RblnNixlPushConnectorScheduler(config, "eng", _kv_config([MagicMock()]))
 
     @pytest.mark.parametrize(
         ("num_tokens", "ssm_blocks", "sent", "boundary"),

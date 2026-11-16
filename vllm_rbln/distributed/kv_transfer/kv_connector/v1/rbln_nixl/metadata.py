@@ -289,6 +289,10 @@ class TransferShape:
     groups: int
     use_host_buffer: bool
     writes_into_peer: bool
+    #: Whether a write also carries a recurrent group's block-boundary state.
+    #: The consumer allocates for it before the producer is known, so both
+    #: ends opt in, and the compatibility hash keeps a one-sided opt-in apart.
+    push_boundary_state: bool
 
     @property
     def has_window_range(self) -> bool:
@@ -359,6 +363,9 @@ def transfer_shape(
     chunk_mode = connector_option(vllm_config, "chunk_mode", False)
     wants_window = connector_option(vllm_config, "swa_window_mode", False)
     wants_stream = connector_option(vllm_config, "push_stream", False)
+    push_boundary_state = writes_into_peer and connector_option(
+        vllm_config, "push_boundary_state", False
+    )
 
     # Only the side that originates bytes into a peer sends a prefix early, so
     # the knob is inert on the other -- and a shape that let it through there
@@ -395,6 +402,7 @@ def transfer_shape(
         groups=len(specs),
         use_host_buffer=use_host_buffer,
         writes_into_peer=writes_into_peer,
+        push_boundary_state=push_boundary_state,
     )
 
 
@@ -403,6 +411,7 @@ def rbln_compat_hash(
     *,
     writes_into_peer: bool,
     cross_layers_blocks: bool,
+    push_boundary_state: bool = False,
     speculative_config: "SpeculativeConfig | None" = None,
 ) -> str:
     """Fold the RBLN schema version and the factors upstream's hash drops into
@@ -425,6 +434,9 @@ def rbln_compat_hash(
         "rbln_writes_into_peer": writes_into_peer,
         "rbln_cross_layers_blocks": cross_layers_blocks,
     }
+    if push_boundary_state:
+        # Added only when on, so a peer predating the knob still pairs.
+        factors["rbln_push_boundary_state"] = True
     if speculative_config is not None and (
         speculative_config.use_eagle() or speculative_config.uses_draft_model()
     ):

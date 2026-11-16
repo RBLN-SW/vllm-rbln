@@ -840,6 +840,7 @@ def shape(**over) -> TransferShape:
         groups=1,
         use_host_buffer=False,
         writes_into_peer=False,
+        push_boundary_state=False,
     )
     _couple(fields, over)
     return TransferShape(**fields)

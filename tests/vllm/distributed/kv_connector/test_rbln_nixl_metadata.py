@@ -234,6 +234,25 @@ class TestRblnCompatHash:
             "BASE", writes_into_peer=False, cross_layers_blocks=True
         ) != rbln_compat_hash("BASE", writes_into_peer=False, cross_layers_blocks=False)
 
+    def test_a_one_sided_push_boundary_state_does_not_pair(self):
+        # The consumer allocates the boundary block before it knows the
+        # producer; a producer without the opt-in would leave it unwritten.
+        def hashed(**opt_in):
+            return rbln_compat_hash(
+                "BASE", writes_into_peer=True, cross_layers_blocks=False, **opt_in
+            )
+
+        assert hashed(push_boundary_state=True) != hashed()
+        assert hashed(push_boundary_state=False) == hashed()
+
+    @pytest.mark.parametrize(
+        ("writes_into_peer", "expected"), [(True, True), (False, False)]
+    )
+    def test_push_boundary_state_is_a_writer_knob(self, writes_into_peer, expected):
+        config = mock_vllm_config(push_boundary_state=True)
+        result = transfer_shape(config, [], writes_into_peer=writes_into_peer)
+        assert result.push_boundary_state is expected
+
     @staticmethod
     def _spec_config(*, method="eagle3", model="draft-a", revision=None):
         draft_model_config = MagicMock()
