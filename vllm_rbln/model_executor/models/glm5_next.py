@@ -99,7 +99,6 @@ from vllm_rbln.v1.attention.backends.glm5_next import (
     RBLNGlm5NextStateMetadata,
     kda_cache_name,
 )
-from vllm_rbln.v1.core.utils import is_strict_kv_producer
 from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
 from vllm_rbln.v1.worker.utils import (
     num_attn_module as rbln_num_attn_module,
@@ -217,7 +216,7 @@ class RBLNGlm5NextAuxCache(_RBLNGlm5NextCache):
         dtype: torch.dtype,
         prefix_cacheable: bool = True,
         head_axis: int | None = None,
-        enable_kv_transfer: bool = True,
+        verify_only: bool = False,
     ) -> None:
         super().__init__(prefix)
         self.owner = owner
@@ -225,7 +224,7 @@ class RBLNGlm5NextAuxCache(_RBLNGlm5NextCache):
         self.dtype = dtype
         self.prefix_cacheable = prefix_cacheable
         self.head_axis = head_axis
-        self.enable_kv_transfer = enable_kv_transfer
+        self.verify_only = verify_only
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> None:
         return None
@@ -237,13 +236,14 @@ class RBLNGlm5NextAuxCache(_RBLNGlm5NextCache):
             self.dtype,
             prefix_cacheable=self.prefix_cacheable,
             head_axis=self.head_axis,
-            enable_kv_transfer=self.enable_kv_transfer,
+            verify_only=self.verify_only,
         )
 
     def get_attn_backend(self) -> type[RBLNGlm5NextCacheBackend]:
         return RBLNGlm5NextCacheBackend
 
     def inputs(self) -> torch.Tensor:
+        assert self.layer_index is not None, f"{self.prefix} was not allocated"
         metadata = get_forward_context().attn_metadata[self.owner]
         return _resolve_kv_cache(metadata, self.layer_index)
 
@@ -442,11 +442,8 @@ class RBLNGlm5NextKDA(nn.Module):
             dtype,
             head_axis=2,
         )
-        # Only kda_verify reads the drafts, and a strict producer never verifies:
-        # no graph it compiles would place them. conv_ring_width still counts
-        # num_drafts, so the ring's blocks match the decode peer's.
         self.drafts = None
-        if self.num_drafts and not is_strict_kv_producer(vllm_config):
+        if self.num_drafts:
             self.drafts = nn.ModuleList(
                 RBLNGlm5NextAuxCache(
                     kda_cache_name(prefix, KDA_DRAFT, j, self.num_groups),
@@ -455,7 +452,7 @@ class RBLNGlm5NextKDA(nn.Module):
                     dtype,
                     prefix_cacheable=False,
                     head_axis=0,
-                    enable_kv_transfer=False,
+                    verify_only=True,
                 )
                 for j, state in enumerate(self.states)
             )
@@ -563,12 +560,11 @@ class RBLNGlm5NextKDA(nn.Module):
                 o = torch.ops.rbln_custom_ops.kda_prefill(
                     qj, kj, vj, gj, bj, state, load, has_initial_state, None, store
                 )[:, :, :tokens]
-            elif not self.num_drafts:
+            elif self.drafts is None:
                 o = torch.ops.rbln_custom_ops.kda_decode(
                     qj, kj, vj, gj, bj, state, load, None, store
                 )
             else:
-                assert self.drafts is not None, "a strict KV producer never verifies"
                 assert tokens == self.num_drafts + 1, tokens
                 o = torch.ops.rbln_custom_ops.kda_verify(
                     qj,

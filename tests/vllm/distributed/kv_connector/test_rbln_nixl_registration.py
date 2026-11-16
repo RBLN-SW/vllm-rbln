@@ -429,6 +429,16 @@ class TestRegisterKvCaches:
 
         assert list(worker._pending_kv_caches) == ["l0"]
 
+    def test_an_aux_cache_whose_spec_was_not_registered_is_dropped(self, monkeypatch):
+        # The runner registers only the aux specs to transfer, then hands every
+        # cache over, a verify-only draft's too.
+        worker = build_worker(monkeypatch, kv_buffer_device="rbln", layer_names=("l0",))
+        worker._block_aux_specs = {"ring": SimpleNamespace(owner="l0")}
+
+        worker.register_kv_caches({"l0": "tensor", "ring": "tensor", "draft": "tensor"})
+
+        assert list(worker._pending_kv_caches) == ["l0", "ring"]
+
     def test_the_block_count_comes_from_the_allocation_not_the_estimate(
         self, monkeypatch
     ):

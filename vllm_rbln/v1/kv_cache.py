@@ -35,17 +35,18 @@ class RBLNBlockAuxSpec:
     it physically (the tail ring with two or more MTP drafts, masked draft rows).
     It is per aux region, not vLLM's group-level `KVCacheSpec.prefix_cacheable`.
 
-    `enable_kv_transfer=False` means no other engine reads this region: a request's
-    first step on a peer reads none of it, so no KV connector registers it. It is the
-    aux counterpart of vLLM's `KVCacheGroupSpec.enable_kv_transfer`, and does not
-    follow from `prefix_cacheable`: the tail ring resumes mid-block on a decode peer.
+    `verify_only=True` means only a spec-decode verify step reads this region, and
+    only what an earlier verify on the same engine wrote. A strict KV producer never
+    verifies, so it does not allocate the region, and a request's first verify on a
+    peer reads none of it, so no KV connector registers it on any role. It does not
+    follow from `prefix_cacheable=False`: the tail ring resumes mid-block on a peer.
     """
 
     owner: str
     block_shape: tuple[int, ...]
     dtype: torch.dtype
     prefix_cacheable: bool = True
-    enable_kv_transfer: bool = True
+    verify_only: bool = False
     # The axis of block_shape a TP rank's share of its owner's heads cuts, each
     # index before it one run of them; None where every rank holds the same bytes.
     head_axis: int | None = None

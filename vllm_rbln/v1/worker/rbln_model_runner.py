@@ -3685,6 +3685,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 continue
             assert isinstance(spec, RBLNBlockAuxSpec), spec
             assert spec.owner in extent_of, f"{layer_name}: no owner {spec.owner}"
+            if spec.verify_only and self.is_strict_kv_producer:
+                # No graph a strict producer compiles places it. Its module's
+                # construction-time layer_index could name another layer's cache.
+                module.layer_index = None
+                continue
             shape = (num_blocks, *spec.block_shape)
             kind = (spec.owner, shape, spec.dtype)
             key = (extent_of[spec.owner], shape, spec.dtype, ordinals[kind])
@@ -3789,7 +3794,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         transferred_aux_specs = {
             name: spec
             for name, spec in self.aux_kv_cache_specs.items()
-            if spec.enable_kv_transfer
+            if not spec.verify_only
         }
         if transferred_aux_specs and has_kv_transfer_group():
             connectors = list(iter_kv_connectors(get_kv_transfer_group()))
