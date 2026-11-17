@@ -3,4 +3,20 @@
 
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
-run_pytest tests/vllm -m 'not model_compile' -v --durations 25 "$@"
+paths=(tests/vllm)
+if [ "${1:-}" = "--group" ]; then
+  if [ "$#" -lt 2 ]; then
+    echo "--group requires a group name" >&2
+    exit 2
+  fi
+  group="$2"
+  case "$group" in
+    sample) paths=(tests/vllm/v1/sample) ;;
+    others) paths+=(--ignore tests/vllm/v1/sample) ;;
+    *) echo "unknown unit group: $group" >&2; exit 2 ;;
+  esac
+  LANE_NAME="${LANE_NAME}-$group"
+  shift 2
+fi
+
+run_pytest "${paths[@]}" -m 'not model_compile' -v --durations 25 "$@"

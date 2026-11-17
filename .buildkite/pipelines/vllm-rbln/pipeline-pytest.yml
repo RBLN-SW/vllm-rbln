@@ -75,12 +75,22 @@ _e2e: &e2e
   timeout_in_minutes: "${PYTEST_E2E_TIMEOUT:-60}"
 
 steps:
-  - <<: *pytest
-    label: ":pytest: [CR13] pytest (unit)"
+  - group: ":pytest: [CR13] pytest (unit)"
     key: "vllm-rbln-pytest-cr13"
-    command:
-      - *sync
-      - "bash .buildkite/pipelines/vllm-rbln/scripts/run-unit.sh"
+    steps:
+      - <<: *pytest
+        label: "unit-sample"
+        key: "vllm-rbln-pytest-unit-sample-cr13"
+        command:
+          - *sync
+          - "bash .buildkite/pipelines/vllm-rbln/scripts/run-unit.sh --group sample"
+
+      - <<: *pytest
+        label: "unit-others"
+        key: "vllm-rbln-pytest-unit-others-cr13"
+        command:
+          - *sync
+          - "bash .buildkite/pipelines/vllm-rbln/scripts/run-unit.sh --group others"
 
   - group: ":pytest: [CR13] pytest (e2e)"
     key: "vllm-rbln-pytest-e2e-cr13"
