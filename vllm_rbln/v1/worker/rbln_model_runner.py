@@ -140,6 +140,7 @@ from vllm_rbln.v1.attention.backends.flash_attention import (
 from vllm_rbln.v1.attention.backends.gdn_attn import (
     RBLNGDNAttentionMetadataBuilder,
 )
+from vllm_rbln.v1.attention.backends.mla.indexer import RBLNDeepseekV32IndexerBackend
 from vllm_rbln.v1.attention.kv_cache_bindings import (
     KVCacheViewInfo,
     attach_kv_cache_bindings,
@@ -3826,6 +3827,20 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         )
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
         self.initialize_attn_backend(kv_cache_config)
+        # NOTE(RBLN): FP8 DSA scale stores silently drop writes past a KV block.
+        if self.cache_config.cache_dtype.startswith("fp8"):
+            for group in self._kv_cache_spec_attn_group_iterator():
+                if group.backend is RBLNDeepseekV32IndexerBackend:
+                    block_size = group.kv_cache_spec.block_size
+                    if any(block_size % c for c in self.prefill_chunk_sizes):
+                        raise ValueError(
+                            "The FP8 DSA indexer scale cache requires block_size "
+                            f"({block_size}) to be a multiple of every prefill "
+                            "bucket; got "
+                            f"prefill_chunk_size={self.prefill_chunk_sizes}. "
+                            "A scale update cannot cross a KV block, even when "
+                            "prefix or sub-block caching is disabled."
+                        )
         # The kernel block size for all KV cache groups. For example, if
         # kv_cache_manager uses block_size 256 for a given group, but the attention
         # backends for that group only supports block_size 64, we will return
@@ -3840,6 +3855,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 block_size=self.cache_config.block_size,
                 prefill_chunk_sizes=self.prefill_chunk_sizes,
                 kv_cache_config=kv_cache_config,
+                model_config=self.model_config,
+                cache_dtype=self.cache_config.cache_dtype,
                 sub_block_size=self.rbln_config.sub_block_size,
             ),
         )

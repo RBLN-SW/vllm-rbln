@@ -54,7 +54,7 @@ class EagleDraftConvertor(ModelArchConfigConvertorBase):
         return convertor_cls(target, target, revision=self.revision).is_deepseek_mla()
 
 
-def _register_convertor(
+def register_convertor(
     model_type: str, convertor_cls: type[ModelArchConfigConvertorBase]
 ) -> None:
     existing = MODEL_ARCH_CONFIG_CONVERTORS.get(model_type)
@@ -71,7 +71,7 @@ def _register_convertor(
 def register_mla_convertor(model_type: str) -> None:
     """Make ``model_type`` an MLA model by its ``kv_lora_rank``. Called from the
     model's own registration, next to its ``ModelRegistry.register_model``."""
-    _register_convertor(model_type, KvLoraRankMLAConvertor)
+    register_convertor(model_type, KvLoraRankMLAConvertor)
 
 
 @add_registration(
@@ -83,11 +83,12 @@ def register_mla_convertor(model_type: str) -> None:
     )
 )
 def register_eagle_draft_convertor() -> None:
-    _register_convertor("eagle", EagleDraftConvertor)
+    register_convertor("eagle", EagleDraftConvertor)
 
 
 __all__ = [
     "EagleDraftConvertor",
     "KvLoraRankMLAConvertor",
+    "register_convertor",
     "register_mla_convertor",
 ]
