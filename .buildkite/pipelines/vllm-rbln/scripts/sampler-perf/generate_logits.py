@@ -372,11 +372,13 @@ def save_logits(
     path = Path(path)
     _validate_artifact(logits, metadata)
     path.parent.mkdir(parents=True, exist_ok=True)
+    # nosemgrep: pickles-in-pytorch -- our own artifact; loads use weights_only
     torch.save({"logits": logits.contiguous(), "metadata": metadata}, path)
 
 
 def load_logits(path: Path) -> tuple[torch.Tensor, dict[str, Any]]:
     """Load a torch.save Tensor or logits/metadata dictionary on CPU."""
+    # nosemgrep: pickles-in-pytorch -- weights_only=True blocks arbitrary objects
     artifact = torch.load(path, map_location="cpu", weights_only=True)
     if isinstance(artifact, torch.Tensor):
         logits = artifact.detach().contiguous()

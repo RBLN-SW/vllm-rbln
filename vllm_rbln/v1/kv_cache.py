@@ -34,12 +34,19 @@ class RBLNBlockAuxSpec:
     or restored. The buffer must still be allocated and readable: kernels may read
     it physically (the tail ring with two or more MTP drafts, masked draft rows).
     It is per aux region, not vLLM's group-level `KVCacheSpec.prefix_cacheable`.
+
+    `verify_only=True` means only a spec-decode verify step reads this region, and
+    only what an earlier verify on the same engine wrote. A strict KV producer never
+    verifies, so it does not allocate the region, and a request's first verify on a
+    peer reads none of it, so no KV connector registers it on any role. It does not
+    follow from `prefix_cacheable=False`: the tail ring resumes mid-block on a peer.
     """
 
     owner: str
     block_shape: tuple[int, ...]
     dtype: torch.dtype
     prefix_cacheable: bool = True
+    verify_only: bool = False
     # The axis of block_shape a TP rank's share of its owner's heads cuts, each
     # index before it one run of them; None where every rank holds the same bytes.
     head_axis: int | None = None

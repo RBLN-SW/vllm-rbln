@@ -315,6 +315,95 @@ class TestWarmupMultimodalEncoder:
         warmup.assert_not_called()
 
 
+class TestMRopePositions:
+    # A prompt whose T / H / W positions differ per axis, with the negative
+    # delta of an image that spans fewer positions than tokens.
+    PROMPT = [5, 6, 7, 8]
+    TABLE = torch.tensor([[0, 1, 1, 2], [0, 1, 2, 2], [0, 2, 1, 2]])
+    DELTA = -1
+
+    def _runner(self, make_model_runner, monkeypatch):
+        monkeypatch.setattr(
+            mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+        )
+        runner = make_model_runner()
+        runner.model = SimpleNamespace(
+            get_mrope_input_positions=lambda ids, features: (
+                self.TABLE[:, : len(ids)],
+                self.DELTA,
+            )
+        )
+        runner.mrope_positions = torch.zeros(3, runner.max_num_tokens, dtype=torch.long)
+        runner._update_states(
+            schedule_new("a", prompt_token_ids=[self.PROMPT], num_scheduled_tokens=[3])
+        )
+        return runner
+
+    def test_a_prompt_chunk_reads_the_requests_table(
+        self, make_model_runner, monkeypatch
+    ):
+        runner = self._runner(make_model_runner, monkeypatch)
+        runner._is_prefill_step = True
+
+        runner._prepare_inputs(
+            make_scheduler_output(num_scheduled_tokens={"a": 3}),
+            np.array([3], dtype=np.int32),
+        )
+
+        assert torch.equal(runner.mrope_positions[:, :3], self.TABLE[:, :3])
+
+    def test_a_token_past_the_prompt_takes_its_position_plus_delta(
+        self, make_model_runner, monkeypatch
+    ):
+        runner = self._runner(make_model_runner, monkeypatch)
+        num_computed = len(self.PROMPT)
+        runner.input_batch.num_computed_tokens_cpu[0] = num_computed
+        runner.input_batch.num_tokens_no_spec[0] = num_computed + 1
+        runner._is_prefill_step = False
+
+        runner._prepare_inputs(
+            make_scheduler_output(num_scheduled_tokens={"a": 1}),
+            np.array([1], dtype=np.int32),
+        )
+
+        assert runner.mrope_positions[:, 0].tolist() == [num_computed + self.DELTA] * 3
+
+    def test_a_step_across_the_prompt_end_takes_both(
+        self, make_model_runner, monkeypatch
+    ):
+        # A preempted request runs its prompt's tail and its outputs again.
+        runner = self._runner(make_model_runner, monkeypatch)
+        runner.input_batch.num_computed_tokens_cpu[0] = 2
+        runner.input_batch.num_tokens_no_spec[0] = len(self.PROMPT) + 2
+        runner._is_prefill_step = True
+
+        runner._prepare_inputs(
+            make_scheduler_output(num_scheduled_tokens={"a": 4}),
+            np.array([4], dtype=np.int32),
+        )
+
+        past_prompt = torch.tensor([4, 5]) + self.DELTA
+        expected = torch.cat([self.TABLE[:, 2:], past_prompt.expand(3, -1)], dim=1)
+        assert torch.equal(runner.mrope_positions[:, :4], expected)
+
+    def test_a_streaming_update_rebuilds_the_requests_table(
+        self, make_model_runner, monkeypatch
+    ):
+        runner = self._runner(make_model_runner, monkeypatch)
+        grown = [*self.PROMPT, 9, 10]
+        runner.model.get_mrope_input_positions = lambda ids, features: (
+            torch.arange(len(ids)).expand(3, -1),
+            len(ids),
+        )
+
+        # The same request id again: a streaming session's longer prompt.
+        runner._update_states(schedule_new("a", prompt_token_ids=[grown]))
+
+        request = runner.requests["a"]
+        assert request.mrope_positions.shape == (3, len(grown))
+        assert request.mrope_position_delta == len(grown)
+
+
 def _decode_ready(
     runner,
     monkeypatch,

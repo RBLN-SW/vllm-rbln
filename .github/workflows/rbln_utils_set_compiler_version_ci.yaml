@@ -20,8 +20,10 @@ jobs:
     runs-on: rbln-sw-k8s-general
     steps:
       - name: Write compiler-version info for vLLM RBLN CIs
+        env:
+          COMPILER_VERSION: ${{ inputs.version }}
         run: |
-          echo "COMPILER_VERSION=${{ inputs.version }}" >> ./compiler-version-for-vllm-rbln
+          echo "COMPILER_VERSION=$COMPILER_VERSION" >> ./compiler-version-for-vllm-rbln
           cat ./compiler-version-for-vllm-rbln
 
       - name: Upload compiler-version for vLLM RBLN CIs
