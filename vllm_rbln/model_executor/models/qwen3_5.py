@@ -117,7 +117,8 @@ class RBLNQwen3_5MultiModalProcessor(Qwen3VLMultiModalProcessor):
                         f"The image grid {grid} has {math.prod(grid)} patches, more "
                         f"than the {limit} the RBLN vision encoder is compiled for. "
                         "Lower the request's max_pixels, or raise it at start-up in "
-                        "--mm-processor-kwargs."
+                        "--mm-processor-kwargs (and add a budget that reaches it if "
+                        "encoder_token_budgets is set)."
                     )
         return outputs
 
