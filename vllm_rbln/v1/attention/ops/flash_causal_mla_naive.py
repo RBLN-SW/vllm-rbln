@@ -17,6 +17,7 @@
 # at execution time.
 
 import torch
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 
 def paged_flash_causal_mla_naive_prefill(
@@ -39,6 +40,7 @@ def paged_flash_causal_mla_naive_prefill(
         block_tables,
         scale,
         is_prompt_sorted=is_prompt_sorted,
+        null_block_id=NULL_BLOCK_ID,
     )
 
 
@@ -62,4 +64,5 @@ def paged_flash_causal_mla_naive_decode(
         block_tables,
         scale,
         is_prompt_sorted=is_prompt_sorted,
+        null_block_id=NULL_BLOCK_ID,
     )

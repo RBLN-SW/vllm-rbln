@@ -36,6 +36,11 @@ _sync: &sync |
 _dshm: &dshm
   - kubernetes:
       podSpecPatch:
+        tolerations:
+          - key: rebellions.ai/dedicated
+            operator: Equal
+            value: framework.sw
+            effect: NoSchedule
         containers:
           - name: container-0
             volumeMounts:

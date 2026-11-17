@@ -12,16 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Config-time MLA answers for the vendored models and their EAGLE drafts."""
+"""Config-time answers for the vendored models and their drafts."""
 
 from types import SimpleNamespace
 
 import pytest
+from vllm.config import SpeculativeConfig
+from vllm.transformers_utils.config import get_hf_text_config
+from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
 from vllm.transformers_utils.model_arch_config_convertor import (
     MODEL_ARCH_CONFIG_CONVERTORS,
     ModelArchConfigConvertorBase,
 )
 
+from vllm_rbln.patches.glm5_next import register_glm5_next_mtp_convertor
 from vllm_rbln.patches.model_arch_config import (
     EagleDraftConvertor,
     KvLoraRankMLAConvertor,
@@ -93,3 +97,23 @@ class TestEagleDraftConvertor:
         register_eagle_draft_convertor()
 
         assert MODEL_ARCH_CONFIG_CONVERTORS["eagle"] is EagleDraftConvertor
+
+
+def test_a_glm5_next_mtp_draft_counts_its_mtp_layers(monkeypatch):
+    # Upstream renames a GLM-5.3 target's config for its MTP draft and keeps the
+    # target's num_hidden_layers there; the base convertor would report that.
+    monkeypatch.delitem(MODEL_ARCH_CONFIG_CONVERTORS, "glm5_next_mtp", raising=False)
+    config = Glm5NextConfig(
+        architectures=["Glm5NextForCausalLM"],
+        text_config={"num_hidden_layers": 45, "num_nextn_predict_layers": 2},
+    )
+    draft = SpeculativeConfig.hf_config_override(config)
+
+    register_glm5_next_mtp_convertor()
+
+    # The lookup ModelConfig.get_model_arch_config makes.
+    convertor_cls = MODEL_ARCH_CONFIG_CONVERTORS.get(
+        draft.model_type, ModelArchConfigConvertorBase
+    )
+    convertor = convertor_cls(draft, get_hf_text_config(draft))
+    assert convertor.get_num_hidden_layers() == 2

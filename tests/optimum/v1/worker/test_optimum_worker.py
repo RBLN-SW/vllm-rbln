@@ -46,7 +46,7 @@ def test_memory_sizing_applies_prepared_block_count(
             hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
             max_model_len=8192,
         ),
-        scheduler_config=SimpleNamespace(max_num_seqs=2),
+        scheduler_config=SimpleNamespace(max_num_seqs=2, max_num_scheduled_tokens=None),
         cache_config=SimpleNamespace(
             enable_prefix_caching=prefix_caching,
             block_size=256 if prefix_caching else 1024,

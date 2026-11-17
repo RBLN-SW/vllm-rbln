@@ -22,6 +22,8 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from vllm.outputs import CompletionOutput, RequestOutput
+from vllm.v1.engine.output_processor import RequestOutputCollector
 
 import tests.vllm.runners as runners
 from tests.vllm.runners import AsyncVllmRunner, DPRequest
@@ -32,19 +34,8 @@ from tests.vllm.vllm_config import DEFAULT_MODEL, local_model_path
 MODEL = local_model_path(DEFAULT_MODEL)
 
 
-class _FakeCompletion:
-    def __init__(self, token_ids: list[int], text: str) -> None:
-        self.token_ids = token_ids
-        self.text = text
-
-
-class _FakeRequestOutput:
-    def __init__(self, token_ids: list[int], text: str) -> None:
-        self.outputs = [_FakeCompletion(token_ids, text)]
-
-
 class _FakeEngine:
-    """Stands in for AsyncLLM: records submissions, yields streams the test
+    """Stands in for AsyncLLM: records submissions, produces outputs the test
     scripts. ``gate`` holds every request until all of them have arrived."""
 
     def __init__(self) -> None:
@@ -54,50 +45,100 @@ class _FakeEngine:
         self.gate: asyncio.Event | None = None
         self.expected_in_flight: int | None = None
         self.never_finish: set[str] = set()
-        self.yield_nothing = False
+        self.output_error: Exception | None = None
+        self.registration_error = False
         self.steps = 2
+        self.paused = False
+        self.events: list[tuple] = []
+        self.pending: list[tuple[str, int, RequestOutputCollector]] = []
+        self.tasks: dict[str, asyncio.Task] = {}
+        self.aborted: list[str] = []
 
-    async def _stream(self, request_id: str, max_tokens: int):
+    async def pause_generation(self, *, mode, clear_cache) -> None:
+        self.paused = True
+        self.events.append(("pause", mode, clear_cache))
+
+    async def resume_generation(self) -> None:
+        self.events.append(("resume", len(self.submissions)))
+        self.paused = False
+        for request_id, max_tokens, queue in self.pending:
+            self.tasks[request_id] = asyncio.create_task(
+                self._stream(request_id, max_tokens, queue)
+            )
+        self.pending.clear()
+
+    async def _stream(self, request_id: str, max_tokens: int, queue):
         if self.gate is not None:
             if len(self.submissions) == self.expected_in_flight:
                 self.gate.set()
             await self.gate.wait()
         if request_id in self.never_finish:
             await asyncio.Event().wait()  # pending forever
-        if self.yield_nothing:
+        if self.output_error is not None:
+            queue.put(self.output_error)
             return
         # Later requests finish first, so ordering cannot follow completion.
         await asyncio.sleep(0.01 * (len(self.submissions) - self._index(request_id)))
         token_ids = list(range(max_tokens))
         for step in range(self.steps):
-            yield _FakeRequestOutput(token_ids, f"{request_id}-step{step}")
+            queue.put(
+                RequestOutput(
+                    request_id=request_id,
+                    prompt=None,
+                    prompt_token_ids=None,
+                    prompt_logprobs=None,
+                    outputs=[
+                        CompletionOutput(
+                            index=0,
+                            token_ids=token_ids,
+                            text=f"{request_id}-step{step}",
+                            cumulative_logprob=None,
+                            logprobs=None,
+                        )
+                    ],
+                    finished=step == self.steps - 1,
+                )
+            )
+            await asyncio.sleep(0)
 
     def _index(self, request_id: str) -> int:
         ids = [sub["request_id"] for sub in self.submissions]
         return ids.index(request_id)
 
-    def generate(
+    async def add_request(
         self,
-        prompt,
-        sampling_params,
         request_id: str,
+        prompt,
+        params,
         *,
         data_parallel_rank: int | None = None,
         **kwargs,
     ):
+        if self.registration_error:
+            raise RuntimeError("request registration failed")
+        self.events.append(("add", request_id, self.paused))
         self.submissions.append(
             dict(
                 prompt=prompt,
                 request_id=request_id,
                 dp_rank=data_parallel_rank,
-                temperature=sampling_params.temperature,
-                max_tokens=sampling_params.max_tokens,
+                temperature=params.temperature,
+                max_tokens=params.max_tokens,
+                logprobs=params.logprobs,
             )
         )
-        return self._stream(request_id, sampling_params.max_tokens)
+        queue = RequestOutputCollector(params.output_kind, request_id)
+        self.pending.append((request_id, params.max_tokens, queue))
+        return queue
+
+    async def abort(self, request_id, *, internal) -> None:
+        self.aborted.append(request_id)
+        self.tasks[request_id].cancel()
 
     def shutdown(self, timeout: float | None = None) -> None:
         self.shutdown_calls += 1
+        for task in self.tasks.values():
+            task.cancel()
 
 
 @pytest.fixture
@@ -128,6 +169,25 @@ def test_runner_defaults_apply_and_kwargs_override(fake_engine):
 
 
 class TestSubmission:
+    @pytest.mark.parametrize("num_logprobs", [None, 5])
+    def test_requests_are_registered_before_resume(self, fake_engine, num_logprobs):
+        requests = [DPRequest("a", 4, 0), DPRequest("b", 4, 0)]
+        with AsyncVllmRunner(MODEL) as runner:
+            if num_logprobs is None:
+                runner.generate_greedy(requests)
+            else:
+                runner.generate_greedy_logprobs(requests, num_logprobs)
+
+        assert fake_engine.events == [
+            ("pause", "keep", False),
+            ("add", "dp-req-0", True),
+            ("add", "dp-req-1", True),
+            ("resume", 2),
+        ]
+        assert [sub["logprobs"] for sub in fake_engine.submissions] == [
+            num_logprobs
+        ] * 2
+
     def test_requests_reach_their_pinned_rank(self, fake_engine):
         requests = [
             DPRequest("a", 4, dp_rank=0),
@@ -192,15 +252,25 @@ class TestFailureModes:
             pytest.raises(TimeoutError, match="dp_rank=3"),
         ):
             runner.generate_greedy([DPRequest("a", 2, dp_rank=3)])
+        assert fake_engine.aborted == ["dp-req-0"]
 
-    def test_stream_without_output_is_not_a_type_error(self, fake_engine):
-        # A rank whose engine died can close the stream having produced nothing.
-        fake_engine.yield_nothing = True
+    def test_output_error_is_propagated(self, fake_engine):
+        fake_engine.output_error = RuntimeError("request failed")
         with (
             AsyncVllmRunner(MODEL) as runner,
-            pytest.raises(AssertionError, match="without producing any output"),
+            pytest.raises(RuntimeError, match="request failed"),
         ):
             runner.generate_greedy([DPRequest("a", 2, dp_rank=1)])
+
+    def test_registration_failure_resumes_scheduler(self, fake_engine):
+        fake_engine.registration_error = True
+        with (
+            AsyncVllmRunner(MODEL) as runner,
+            pytest.raises(RuntimeError, match="request registration failed"),
+        ):
+            runner.generate_greedy([DPRequest("a", 2, dp_rank=1)])
+        assert fake_engine.events == [("pause", "keep", False), ("resume", 0)]
+        assert not fake_engine.paused
 
 
 class TestLifecycle:

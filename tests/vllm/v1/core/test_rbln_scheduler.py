@@ -20,14 +20,16 @@ import inspect
 from types import SimpleNamespace
 
 import pytest
+import torch
 from vllm.config.ec_manager_config import EncoderCacheManagerConfig
 from vllm.distributed.kv_events import BlockStored, KVEventBatch
+from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.metrics.stats import PrefixCacheStats
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.request import RequestStatus
 
 from tests.vllm.v1.core.utils import (
@@ -38,10 +40,13 @@ from tests.vllm.v1.core.utils import (
     advance_to_decode,
     create_rbln_scheduler,
     create_requests,
+    full_attention_spec,
     image_at,
+    make_kv_cache_config,
     make_model_runner_output,
     make_request,
     prefill_request,
+    sliding_window_spec,
 )
 from vllm_rbln.v1.core import rbln_scheduler
 from vllm_rbln.v1.core.rbln_kv_cache_manager import RBLNKVCacheManager
@@ -156,6 +161,22 @@ class TestSchedulerInit:
             additional_config={"enable_sub_block_cache": False},
         )
         assert not isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
+
+    def test_sub_block_manager_hashes_at_the_engine_hash_block_size(self):
+        # Mixed group block sizes: the engine hashes requests at the gcd and
+        # schedules at the lcm, and the manager must be told the gcd.
+        sched = create_rbln_scheduler(
+            enable_prefix_caching=True,
+            block_size=2048,
+            hash_block_size=1024,
+            max_num_batched_tokens=128,
+            max_model_len=4096,
+            kv_cache_config=make_kv_cache_config(
+                [full_attention_spec(2048), sliding_window_spec(1024, 1024)],
+                num_blocks=64,
+            ),
+        )
+        assert isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
 
     def test_disabled_falls_back_to_base_manager(self):
         # prefix caching off -> plain KVCacheManager.
@@ -901,6 +922,137 @@ class TestSchedulePrefillAllocation:
         sched.schedule()
 
         assert block.block_hash is not None
+
+
+class TestMmPrefixChunks:
+    """Prefill chunks of an mm prefix LM never split an image or video-frame
+    embeds range: text and whole ranges share a chunk."""
+
+    @staticmethod
+    def _feature(modality: str, offset: int, is_embed: list[bool], name=None):
+        return MultiModalFeatureSpec(
+            data=None,
+            modality=modality,
+            identifier=name or f"{modality}-{offset}",
+            mm_position=PlaceholderRange(
+                offset=offset, length=len(is_embed), is_embed=torch.tensor(is_embed)
+            ),
+        )
+
+    @staticmethod
+    def _scheduler(monkeypatch, *, budget=16, chunk_size=None, **kwargs):
+        sched = create_rbln_scheduler(
+            max_num_batched_tokens=budget,
+            max_model_len=128,
+            block_size=budget,
+            additional_config={"prefill_chunk_size": chunk_size or budget},
+            **kwargs,
+        )
+        sched._is_mm_prefix_lm = True
+        # Encoder budgeting is upstream's, and opt-125m owns no encoder.
+        monkeypatch.setattr(
+            sched,
+            "_try_schedule_encoder_inputs",
+            lambda request, computed, new, budget, shift_computed_tokens: (
+                [],
+                new,
+                budget,
+                [],
+            ),
+        )
+        return sched
+
+    @staticmethod
+    def _prefill(sched, req):
+        sched.add_request(req)
+        chunks = []
+        while req.num_computed_tokens < req.num_prompt_tokens:
+            out = sched.schedule()
+            chunks.append(out.num_scheduled_tokens[req.request_id])
+            sched.update_from_output(out, make_model_runner_output(out))
+        return chunks
+
+    def _chunks(self, monkeypatch, features, *, num_tokens=40, **kwargs):
+        sched = self._scheduler(monkeypatch, **kwargs)
+        req = make_request("a", list(range(num_tokens)), 16, mm_features=features)
+        return self._prefill(sched, req)
+
+    def test_a_range_the_chunk_would_cut_moves_whole_to_the_next_step(
+        self, monkeypatch
+    ):
+        # Soft tokens at 10..19: the first chunk ends before them.
+        image = self._feature("image", 9, [False] + [True] * 10 + [False])
+        assert self._chunks(monkeypatch, [image]) == [10, 16, 14]
+
+    def test_an_image_takes_the_chunk_size_not_the_budget(self, monkeypatch):
+        # Soft tokens at 10..15 fit the second 8-token chunk.
+        image = self._feature("image", 9, [False] + [True] * 6 + [False])
+        chunks = self._chunks(monkeypatch, [image], chunk_size=8)
+        assert chunks == [8] * 5
+
+    def test_each_video_frame_is_its_own_range(self, monkeypatch):
+        # Two frames of four soft tokens, each between a timestamp, <boi>, <eoi>:
+        # soft tokens at 4..7 and 11..14, so only the second frame is cut.
+        frame = [False, False] + [True] * 4 + [False]
+        video = self._feature("video", 2, frame * 2)
+        chunks = self._chunks(monkeypatch, [video], num_tokens=24, chunk_size=13)
+        assert chunks == [11, 13]
+
+    def _prefix_hit_inside_a_range(self, monkeypatch, second_image):
+        # Soft tokens at 20..40, <eoi> at 41. The second request shares the first
+        # 32-token block with the first, so its prefix cache hit ends at 32,
+        # inside the range.
+        first = self._feature("image", 19, [False] + [True] * 21 + [False], "x")
+        sched = self._scheduler(monkeypatch, budget=32, enable_prefix_caching=True)
+        self._prefill(
+            sched, make_request("a", list(range(64)), 32, mm_features=[first])
+        )
+        features = [first]
+        if second_image:
+            # Soft tokens at 46..75, which a step from 32 would cut.
+            features.append(
+                self._feature("image", 45, [False] + [True] * 30 + [False], "y")
+            )
+        tokens = list(range(42)) + [100 + t for t in range(38)]
+        req = make_request("b", tokens, 32, mm_features=features)
+        sched.add_request(req)
+        out = sched.schedule()
+        return req.num_computed_tokens, out.num_scheduled_tokens["b"]
+
+    def test_a_prefix_hit_inside_a_range_runs_its_rest_with_the_text(self, monkeypatch):
+        # The rest 32..40, <eoi> and the text after it, in one multi-token step.
+        computed, scheduled = self._prefix_hit_inside_a_range(monkeypatch, False)
+        assert (computed - scheduled, scheduled) == (32, 32)
+
+    def test_a_resumed_range_then_one_the_chunk_would_cut(self, monkeypatch):
+        # The step stops before the second image's soft tokens at 46.
+        computed, scheduled = self._prefix_hit_inside_a_range(monkeypatch, True)
+        assert (computed - scheduled, scheduled) == (32, 14)
+
+    def test_decode_steps_skip_the_range_scan(self, monkeypatch):
+        image = self._feature("image", 9, [False] + [True] * 6 + [False])
+        sched = self._scheduler(monkeypatch)
+        req = make_request("a", list(range(20)), 16, mm_features=[image], max_tokens=4)
+        sched.add_request(req)
+        while req.num_output_tokens == 0:
+            out = sched.schedule()
+            done = req.num_computed_tokens >= req.num_prompt_tokens
+            sched.update_from_output(
+                out, make_model_runner_output(out, 0 if done else None)
+            )
+        calls = []
+        split = sched._mm_prefix_split
+
+        def recording_split(*args):
+            calls.append(args)
+            return split(*args)
+
+        monkeypatch.setattr(sched, "_mm_prefix_split", recording_split)
+
+        out = sched.schedule()
+
+        assert out.num_scheduled_tokens["a"] == 1
+        assert calls == []
 
 
 class TestScheduleSpecDecodeCap:
@@ -2050,6 +2202,102 @@ class TestDraftingLookahead:
         assert seen == [0]
 
 
+class TestAdmissionCoversFirstDecodeStep:
+    """An admitted prefill runs alone to completion, so admission has to cover
+    its first spec decode step: the lookahead its last chunk allocates and the
+    sampled and draft tokens after it. Admitted on the prompt alone while decodes
+    held the pool, the request preempted itself there and threw its prefill
+    away, and each re-admission evicted the decodes for another prefill."""
+
+    BLOCK = 16
+    NUM_SPEC_TOKENS = 3
+
+    def _admit_beside_decodes(self, prompt_len, **config):
+        """Two decodes take two blocks each, leaving two of the six free, then
+        a prompt of ``prompt_len`` arrives. Returns the scheduler and it."""
+        sched = create_rbln_scheduler(
+            block_size=self.BLOCK,
+            max_num_batched_tokens=self.BLOCK,
+            max_model_len=4 * self.BLOCK,
+            num_blocks=7,
+            max_num_seqs=4,
+            num_speculative_tokens=self.NUM_SPEC_TOKENS,
+            **config,
+        )
+        for n in range(2):
+            prompt = [100 * (n + 1) + i for i in range(self.BLOCK + 1)]
+            sched.add_request(make_request(f"d{n}", prompt, self.BLOCK, max_tokens=8))
+        while any(
+            r.num_computed_tokens < r.num_prompt_tokens for r in sched.requests.values()
+        ):
+            self._step(sched)
+
+        request = make_request(
+            "v", [900 + i for i in range(prompt_len)], self.BLOCK, max_tokens=4
+        )
+        sched.add_request(request)
+        return sched, request
+
+    def _run(self, sched):
+        for _ in range(100):
+            if not sched.requests:
+                break
+            self._step(sched)
+
+    def test_a_prompt_short_of_its_lookahead_does_not_livelock_the_decodes(self):
+        # Without prefix caching a resumed prompt restarts from its first chunk,
+        # which fits and evicts the decodes; its last chunk then preempts it
+        # again. A prefix hit would make the resume start on that last chunk,
+        # whose own allocation fails before the decodes are evicted.
+        sched, _ = self._admit_beside_decodes(32, enable_prefix_caching=False)
+        self._run(sched)
+
+        assert not sched.requests
+
+    @classmethod
+    def _step(cls, sched):
+        out = sched.schedule()
+        output = make_model_runner_output(out)
+        # A partial prefill samples nothing; a full prompt or a decode samples
+        # one token and is drafted for.
+        sampled = [
+            sched.requests[rid].num_computed_tokens >= sched.requests[rid].num_tokens
+            for rid in output.req_ids
+        ]
+        output.sampled_token_ids = [[7] if s else [] for s in sampled]
+        sched.update_from_output(out, output)
+        sched.update_draft_token_ids(
+            DraftTokenIds(
+                output.req_ids,
+                [[7] * cls.NUM_SPEC_TOKENS if s else [] for s in sampled],
+            )
+        )
+
+    @pytest.mark.usefixtures("cr13")
+    # Both prompts take two chunks. 32: the last chunk's lookahead needs a third
+    # block. 26: 26 + 3 fits two blocks, but the first decode step needs
+    # 26 + 1 + 3 + 3 slots.
+    @pytest.mark.parametrize("prompt_len", [32, 26])
+    @pytest.mark.parametrize("sub_block_cache", [False, True])
+    def test_prompt_finishes_unpreempted_while_decodes_hold_the_pool(
+        self, prompt_len, sub_block_cache
+    ):
+        sched, request = self._admit_beside_decodes(
+            prompt_len,
+            enable_prefix_caching=True,
+            sub_block_size=8 if sub_block_cache else None,
+            additional_config={"enable_sub_block_cache": sub_block_cache},
+        )
+        # The check sits in the scheduler so it covers both managers.
+        assert isinstance(sched.kv_cache_manager, RBLNKVCacheManager) == (
+            sub_block_cache
+        )
+        self._run(sched)
+
+        assert not sched.requests
+        assert request.num_preemptions == 0
+
+
 class TestSyncKVLoads:
     """The model runner starts a connector's loads after the forward unless the
     step says it holds a synchronous one, so a step that admits a synchronous
@@ -2137,3 +2385,27 @@ class TestEcConsumerEncodesNothing:
 
         assert out.scheduled_encoder_inputs == {"0": [0]}
         assert request.status == RequestStatus.RUNNING
+
+
+def test_eagle_steps_through_adjacent_images_with_a_one_image_encoder_cache():
+    """The drafter's look-ahead shifted the encoder window into the second image
+    and deferred freeing the first, so with a cache that holds one image the
+    request scheduled zero tokens forever."""
+    sched = create_rbln_scheduler(
+        max_num_seqs=4, max_num_batched_tokens=8, max_model_len=64
+    )
+    # ngram is what the helper builds without a draft model; these are what
+    # EAGLE sets.
+    sched.use_eagle = True
+    sched.num_prefill_lookahead = 1
+    sched.max_num_encoder_input_tokens = 4
+    sched.encoder_cache_manager = EncoderCacheManager(cache_size=4)
+    request = make_request(
+        "0", list(range(16)), 16, mm_features=[image_at(4, 4), image_at(8, 4)]
+    )
+    sched.add_request(request)
+
+    for _ in range(2):
+        out = sched.schedule()
+        assert out.num_scheduled_tokens == {"0": 8}
+        sched.update_from_output(out, make_model_runner_output(out))

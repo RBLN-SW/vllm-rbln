@@ -16,6 +16,7 @@
 # compile/warmup control flow, reachable on CPU once WorkerBase.__init__ is
 # patched out. Device execution stays in the e2e tier.
 
+import functools
 import inspect
 import json
 import os
@@ -32,7 +33,12 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from torch._dynamo.exc import BackendCompilerFailed
-from vllm.config import ECTransferConfig, ProfilerConfig, get_current_vllm_config
+from vllm.config import (
+    ECTransferConfig,
+    ModelConfig,
+    ProfilerConfig,
+    get_current_vllm_config,
+)
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorRole
 from vllm.distributed.ec_transfer.ec_connector.factory import ECConnectorFactory
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
@@ -628,14 +634,22 @@ class TestDetermineAvailableMemory:
         params=None,
         specialized_moe_decode=False,
         decode_buckets=3,
+        chunk_sizes=(128,),
         decode_graph_shapes=((1, 1, None), (2, 1, None), (4, 1, None)),
         drafter=None,
         speculative_config=None,
         dynamic=False,
+        kernel_size=lambda **kw: 111,
     ):
         vcfg = _make_vllm_config(quantization=quantization)
         vcfg.additional_config.use_dynamic_kv_cache = None if dynamic else False
         vcfg.model_config.hf_config = hf_config
+
+        def get_num_layers(parallel_config):
+            assert parallel_config is vcfg.parallel_config
+            return 2
+
+        vcfg.model_config.get_num_layers = get_num_layers
         worker = make_worker(vllm_config=vcfg, device_name=device_name)
         worker.device = torch.device("cpu")
         captured: dict = {}
@@ -648,7 +662,7 @@ class TestDetermineAvailableMemory:
         # The worker hands the kwargs to the sizer, which is where the formula
         # is called from on both the dynamic and the default path.
         monkeypatch.setattr(dks, "estimate_available_memory", record)
-        monkeypatch.setattr(wm, "estimate_model_kernel_size", lambda **kw: 111)
+        monkeypatch.setattr(wm, "estimate_model_kernel_size", kernel_size)
         monkeypatch.setattr(dks, "get_kv_cache_groups", lambda cfg, spec: [])
         # WorkerBase always carries the field; None is what no spec decode means.
         worker.speculative_config = speculative_config
@@ -660,6 +674,7 @@ class TestDetermineAvailableMemory:
             bucketing_manager=SimpleNamespace(
                 decode_batch_buckets_count=decode_buckets
             ),
+            prefill_chunk_sizes=chunk_sizes,
             drafter=drafter,
             get_kv_cache_spec=lambda: {},
             decode_graph_shapes=lambda: list(decode_graph_shapes),
@@ -713,6 +728,7 @@ class TestDetermineAvailableMemory:
             model=SimpleNamespace(named_parameters=lambda: iter(_params().items())),
             specialized_moe_decode=False,
             bucketing_manager=SimpleNamespace(decode_batch_buckets_count=3),
+            prefill_chunk_sizes=(128,),
             decode_graph_shapes=lambda: [(b, 1, None) for b in (1, 2, 4)],
             drafter=None,
             get_kv_cache_spec=lambda: {"a": spec, "b": spec},
@@ -751,6 +767,21 @@ class TestDetermineAvailableMemory:
             decode_graph_shapes=[(b, 1, None) for b in (1, 2, 4)] + [(4, 1, 512)],
         )
         assert cap["num_runtimes"] == 5
+
+    @pytest.mark.parametrize(
+        ("decode_shapes", "expected"),
+        [([], 3), ([(1, 1, None), (2, 1, None), (4, 1, None)], 6)],
+    )
+    def test_num_runtimes_counts_every_prefill_chunk_size(
+        self, make_worker, monkeypatch, decode_shapes, expected
+    ):
+        cap = self._capture(
+            make_worker,
+            monkeypatch,
+            chunk_sizes=(32, 64, 128),
+            decode_graph_shapes=decode_shapes,
+        )
+        assert cap["num_runtimes"] == expected
 
     def test_no_quant_counts_int_at_16bit(self, make_worker, monkeypatch):
         assert self._capture(make_worker, monkeypatch)["n_model_bytes"] == 300
@@ -815,7 +846,9 @@ class TestDetermineAvailableMemory:
             warms_up_decode_graphs_on_a_producer=False,
         )
         spec = SimpleNamespace(
-            draft_model_config=SimpleNamespace(quantization=None),
+            draft_model_config=SimpleNamespace(
+                quantization=None, get_total_num_hidden_layers=lambda: 1
+            ),
             draft_parallel_config=None,
             method="eagle",
         )
@@ -832,6 +865,62 @@ class TestDetermineAvailableMemory:
         # 1 + buckets(3)*1 = 4 (no MoE); draft = 1 + buckets(3) = 4. Total 8.
         assert cap["num_runtimes"] == 8
 
+    def test_drafter_counts_its_own_layers_under_a_pp_layer_partition(
+        self, make_worker, monkeypatch
+    ):
+        # A target partition and a layer truncation are both set; the drafter is
+        # built whole on one stage, so it counts the draft config's five layers.
+        # The target's own count comes from _capture's stub.
+        monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "1,1")
+        monkeypatch.setenv("VLLM_RBLN_NUM_HIDDEN_LAYERS", "2")
+        draft_config = SimpleNamespace(
+            quantization=None,
+            get_total_num_hidden_layers=lambda: 5,
+            get_vocab_size=lambda: 64,
+            get_hidden_size=lambda: 32,
+        )
+        # Upstream's own layer getters, so a count taken through the drafter's
+        # single-stage parallel config reads the partition as upstream does.
+        for name in ("get_layers_start_end_indices", "get_num_layers"):
+            setattr(
+                draft_config,
+                name,
+                functools.partial(getattr(ModelConfig, name), draft_config),
+            )
+        drafter = SimpleNamespace(
+            model=SimpleNamespace(
+                parameters=lambda: iter([torch.zeros(6144, dtype=torch.float16)])
+            ),
+            warms_up_decode_graphs_on_a_producer=False,
+        )
+        spec = SimpleNamespace(
+            draft_model_config=draft_config,
+            draft_parallel_config=SimpleNamespace(
+                tensor_parallel_size=1, pipeline_parallel_size=1, rank=0
+            ),
+            method="mtp",
+        )
+        target_layers = []
+
+        def kernel_size(**kw):
+            if kw["model_config"] is not draft_config:
+                target_layers.append(kw.get("num_layers"))
+                return 111
+            return worker_utils.estimate_model_kernel_size(
+                **kw, default_bits_per_param=16
+            )
+
+        cap = self._capture(
+            make_worker,
+            monkeypatch,
+            drafter=drafter,
+            speculative_config=spec,
+            kernel_size=kernel_size,
+        )
+        # Five layers of 2 MiB-aligned weights plus the lm_head's 2 MiB.
+        assert cap["kernel_size"] == 111 + 6 * 2**21
+        assert target_layers == [2]
+
     def test_medusa_on_a_producer_reserves_one_draft_runtime(
         self, make_worker, monkeypatch
     ):
@@ -843,7 +932,9 @@ class TestDetermineAvailableMemory:
             parameters=lambda: iter([torch.zeros(20, dtype=torch.float16)])
         )
         spec = SimpleNamespace(
-            draft_model_config=SimpleNamespace(quantization=None),
+            draft_model_config=SimpleNamespace(
+                quantization=None, get_total_num_hidden_layers=lambda: 1
+            ),
             draft_parallel_config=None,
             method="medusa",
         )
@@ -871,7 +962,9 @@ class TestDetermineAvailableMemory:
             warms_up_decode_graphs_on_a_producer=warms_up_decode,
         )
         spec = SimpleNamespace(
-            draft_model_config=SimpleNamespace(quantization=None),
+            draft_model_config=SimpleNamespace(
+                quantization=None, get_total_num_hidden_layers=lambda: 1
+            ),
             draft_parallel_config=None,
             method="dflash" if warms_up_decode else "eagle",
         )
@@ -899,7 +992,9 @@ class TestDetermineAvailableMemory:
             warms_up_decode_graphs_on_a_producer=False,
         )
         spec = SimpleNamespace(
-            draft_model_config=SimpleNamespace(quantization=None),
+            draft_model_config=SimpleNamespace(
+                quantization=None, get_total_num_hidden_layers=lambda: 1
+            ),
             draft_parallel_config=None,
             method="eagle",
         )

@@ -20,7 +20,10 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
+from vllm.v1.kv_cache_interface import MambaSpec
 
+from tests.vllm.v1.core.utils import full_attention_spec, make_kv_cache_config
 from vllm_rbln.v1.core.utils import (
     decode_batch_size,
     is_strict_kv_producer,
@@ -253,8 +256,10 @@ class TestSubBlockSizeInUse:
             enable_prefix_caching=True,
             sub_block_cache=True,
             block_size=1024,
-            prefill_chunk_size=512,
+            prefill_chunk_sizes=[512],
             kv_cache_config=object(),
+            model_config=SimpleNamespace(),
+            cache_dtype="auto",
         )
         args.update(kw)
         return sub_block_size_in_use(**args)
@@ -262,6 +267,17 @@ class TestSubBlockSizeInUse:
     def test_defaults_to_the_prefill_chunk(self, eligible):
         eligible(True)
         assert self._call() == 512
+
+    def test_defaults_to_the_longest_chunk_the_kv_cache_holds(self, cr13):
+        # 768 does not divide the 1024 block; 256 and 512 do.
+        kv = make_kv_cache_config([full_attention_spec(1024)])
+        sizes = [256, 512, 768]
+        assert self._call(prefill_chunk_sizes=sizes, kv_cache_config=kv) == 512
+
+    def test_a_default_below_the_longest_chunk_needs_cr13(self):
+        kv = make_kv_cache_config([full_attention_spec(1024)])
+        sizes = [256, 512, 768]
+        assert self._call(prefill_chunk_sizes=sizes, kv_cache_config=kv) is None
 
     def test_none_without_prefix_caching(self, eligible):
         eligible(True)
@@ -292,7 +308,7 @@ class TestSubBlockSizeInUse:
     def test_a_chunk_outside_the_block_bounds_is_rejected(self, eligible):
         eligible(True)
         with pytest.raises(ValueError, match="block_size >="):
-            self._call(block_size=256, prefill_chunk_size=512, sub_block_size=256)
+            self._call(block_size=256, prefill_chunk_sizes=[512], sub_block_size=256)
 
     def test_a_size_the_kv_cache_cannot_hold_is_rejected(self, eligible):
         # A size that is not a divisor of block_size, or a spec with no token
@@ -306,7 +322,7 @@ class TestSubBlockSizeInUse:
         # Nobody asked for sub-blocks here, so a chunk wider than the block
         # steps aside rather than refusing to start.
         eligible(True)
-        assert self._call(block_size=256, prefill_chunk_size=512) is None
+        assert self._call(block_size=256, prefill_chunk_sizes=[512]) is None
 
     def test_a_size_below_the_chunk_needs_cr13(self, eligible, monkeypatch):
         # The multi-block store the decoupled size needs is CR13-only.
@@ -319,3 +335,115 @@ class TestSubBlockSizeInUse:
             platform.rebel, "get_npu_name", lambda *a, **kw: "RBLN-CR13"
         )
         assert self._call(sub_block_size=128) == 128
+
+    @pytest.mark.parametrize("model_type", ["deepseek_v32", "axk2", "axk3"])
+    @pytest.mark.parametrize("cache_dtype", ["auto", "fp8", "fp8_e4m3"])
+    @pytest.mark.parametrize(
+        "chunks, sub_block_size, crosses_blocks, expected_size",
+        [
+            ([128], None, False, 128),
+            ([128], 128, False, 128),
+            ([128], 64, True, 64),
+            ([64, 128], None, False, 128),
+            ([64, 128], 128, False, 128),
+            ([64, 128], 64, True, 64),
+            ([32, 64], None, False, 64),
+            ([32, 64], 64, False, 64),
+            ([32, 64], 32, True, 32),
+            ([64, 96], None, True, 64),
+            ([64, 96], 64, True, 64),
+        ],
+    )
+    def test_fp8_dsa_sub_blocks_keep_a_prefill_in_one_block(
+        self,
+        model_type,
+        cache_dtype,
+        chunks,
+        sub_block_size,
+        crosses_blocks,
+        expected_size,
+        cr13,
+    ):
+        model_config = SimpleNamespace(
+            hf_text_config=SimpleNamespace(model_type=model_type, index_topk=2048),
+            hf_config=SimpleNamespace(),
+        )
+        args = dict(
+            model_config=model_config,
+            cache_dtype=cache_dtype,
+            kv_cache_config=make_kv_cache_config([full_attention_spec(1024)]),
+            prefill_chunk_sizes=chunks,
+            sub_block_size=sub_block_size,
+        )
+        if cache_dtype.startswith("fp8") and crosses_blocks:
+            with pytest.raises(ValueError, match="FP8 DSA indexer scale cache"):
+                self._call(**args)
+        else:
+            assert self._call(**args) == expected_size
+
+    @pytest.mark.parametrize(
+        "model_type, has_indexer, prefix_caching, sub_block_cache",
+        [
+            ("minimax_m3", False, True, True),
+            ("axk3", False, True, True),
+            ("axk3", True, False, True),
+            ("axk3", True, True, False),
+        ],
+    )
+    def test_fp8_scale_limit_only_applies_to_active_dsa_sub_blocks(
+        self, model_type, has_indexer, prefix_caching, sub_block_cache, cr13
+    ):
+        text_config = SimpleNamespace(model_type=model_type)
+        if has_indexer:
+            text_config.index_topk = 2048
+        result = self._call(
+            enable_prefix_caching=prefix_caching,
+            sub_block_cache=sub_block_cache,
+            model_config=SimpleNamespace(
+                hf_text_config=text_config, hf_config=SimpleNamespace()
+            ),
+            cache_dtype="fp8",
+            kv_cache_config=make_kv_cache_config([full_attention_spec(1024)]),
+            prefill_chunk_sizes=[64, 96],
+        )
+        assert result == (64 if prefix_caching and sub_block_cache else None)
+
+    def test_fp8_dsa_with_mamba_cache_is_not_enabled(self):
+        config = make_kv_cache_config(
+            [
+                full_attention_spec(1024),
+                MambaSpec(
+                    block_size=1024,
+                    shapes=((1024, 512),),
+                    dtypes=(torch.uint8,),
+                    mamba_cache_mode="align",
+                ),
+            ]
+        )
+        model_config = SimpleNamespace(
+            hf_text_config=SimpleNamespace(
+                model_type="glm5_next_text", index_topk=2048
+            ),
+            hf_config=SimpleNamespace(),
+        )
+        assert (
+            self._call(
+                model_config=model_config,
+                cache_dtype="fp8",
+                kv_cache_config=config,
+                prefill_chunk_sizes=[64, 96],
+            )
+            is None
+        )
+
+    def test_fp8_dsa_indexer_on_outer_config(self, cr13):
+        with pytest.raises(ValueError, match="FP8 DSA indexer scale cache"):
+            self._call(
+                model_config=SimpleNamespace(
+                    hf_text_config=SimpleNamespace(),
+                    hf_config=SimpleNamespace(index_topk=2048),
+                ),
+                cache_dtype="fp8",
+                kv_cache_config=make_kv_cache_config([full_attention_spec(1024)]),
+                sub_block_size=256,
+            )

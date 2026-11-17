@@ -80,6 +80,87 @@ class TestResolveMultiModalSupport:
             runner._resolve_mm_support()
 
 
+class _MmPrefixModel(_InGraphMergeModel):
+    def __init__(self, max_mm_prefix_range_len):
+        super().__init__()
+        self.max_mm_prefix_range_len = max_mm_prefix_range_len
+
+
+class TestResolveMmPrefixSupport:
+    """An mm prefix LM is served only when every cap the scheduler puts on a
+    prefill chunk holds its longest range."""
+
+    @staticmethod
+    def _runner(make_model_runner, monkeypatch, model, **config):
+        monkeypatch.setattr(
+            ModelConfig, "supports_multimodal_inputs", property(lambda self: True)
+        )
+        monkeypatch.setattr(ModelConfig, "is_mm_prefix_lm", property(lambda self: True))
+        runner = make_model_runner(**config)
+        runner.model = model
+        return runner
+
+    def test_a_model_naming_no_longest_range_is_refused(
+        self, make_model_runner, monkeypatch
+    ):
+        runner = self._runner(make_model_runner, monkeypatch, _InGraphMergeModel())
+
+        with pytest.raises(ValueError, match="SupportsRBLNMmPrefix"):
+            runner._resolve_mm_support()
+
+    @pytest.mark.parametrize(
+        "flag", ["long_prefill_token_threshold", "max_num_scheduled_tokens"]
+    )
+    def test_a_cap_that_would_split_a_range_is_refused(
+        self, make_model_runner, monkeypatch, flag
+    ):
+        runner = self._runner(
+            make_model_runner, monkeypatch, _MmPrefixModel(128), **{flag: 64}
+        )
+
+        with pytest.raises(ValueError, match=flag):
+            runner._resolve_mm_support()
+
+    def test_a_threshold_and_chunk_equal_to_the_longest_range_are_taken(
+        self, make_model_runner, monkeypatch
+    ):
+        runner = self._runner(
+            make_model_runner,
+            monkeypatch,
+            _MmPrefixModel(280),
+            long_prefill_token_threshold=280,
+            max_num_batched_tokens=280,
+        )
+
+        assert runner._resolve_mm_support() is True
+
+    def test_a_range_longer_than_the_longest_chunk_is_refused_with_a_fix(
+        self, make_model_runner, monkeypatch
+    ):
+        # The step budget holds the range; only the longest chunk does not.
+        runner = self._runner(
+            make_model_runner,
+            monkeypatch,
+            _MmPrefixModel(1120),
+            max_num_batched_tokens=512,
+            block_size=8192,
+            additional_config={"prefill_chunk_size": [512]},
+        )
+
+        with pytest.raises(ValueError) as refused:
+            runner._resolve_mm_support()
+        message = str(refused.value)
+        assert (
+            "--max-num-batched-tokens 2048 --rbln-prefill-chunk-size 512,2048"
+            in message
+        )
+        assert "--rbln-prefill-chunk-size 512,1152" in message
+        assert (
+            "max_soft_tokens (1120)" in message
+            and "divides --block-size (8192)" in message
+        )
+
+
 class TestGatherMultimodalEmbeddings:
     def test_scheduled_images_are_encoded_and_cached_by_hash(
         self, make_model_runner, monkeypatch
@@ -232,6 +313,95 @@ class TestWarmupMultimodalEncoder:
         runner._warmup_mm_encoder()
 
         warmup.assert_not_called()
+
+
+class TestMRopePositions:
+    # A prompt whose T / H / W positions differ per axis, with the negative
+    # delta of an image that spans fewer positions than tokens.
+    PROMPT = [5, 6, 7, 8]
+    TABLE = torch.tensor([[0, 1, 1, 2], [0, 1, 2, 2], [0, 2, 1, 2]])
+    DELTA = -1
+
+    def _runner(self, make_model_runner, monkeypatch):
+        monkeypatch.setattr(
+            mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+        )
+        runner = make_model_runner()
+        runner.model = SimpleNamespace(
+            get_mrope_input_positions=lambda ids, features: (
+                self.TABLE[:, : len(ids)],
+                self.DELTA,
+            )
+        )
+        runner.mrope_positions = torch.zeros(3, runner.max_num_tokens, dtype=torch.long)
+        runner._update_states(
+            schedule_new("a", prompt_token_ids=[self.PROMPT], num_scheduled_tokens=[3])
+        )
+        return runner
+
+    def test_a_prompt_chunk_reads_the_requests_table(
+        self, make_model_runner, monkeypatch
+    ):
+        runner = self._runner(make_model_runner, monkeypatch)
+        runner._is_prefill_step = True
+
+        runner._prepare_inputs(
+            make_scheduler_output(num_scheduled_tokens={"a": 3}),
+            np.array([3], dtype=np.int32),
+        )
+
+        assert torch.equal(runner.mrope_positions[:, :3], self.TABLE[:, :3])
+
+    def test_a_token_past_the_prompt_takes_its_position_plus_delta(
+        self, make_model_runner, monkeypatch
+    ):
+        runner = self._runner(make_model_runner, monkeypatch)
+        num_computed = len(self.PROMPT)
+        runner.input_batch.num_computed_tokens_cpu[0] = num_computed
+        runner.input_batch.num_tokens_no_spec[0] = num_computed + 1
+        runner._is_prefill_step = False
+
+        runner._prepare_inputs(
+            make_scheduler_output(num_scheduled_tokens={"a": 1}),
+            np.array([1], dtype=np.int32),
+        )
+
+        assert runner.mrope_positions[:, 0].tolist() == [num_computed + self.DELTA] * 3
+
+    def test_a_step_across_the_prompt_end_takes_both(
+        self, make_model_runner, monkeypatch
+    ):
+        # A preempted request runs its prompt's tail and its outputs again.
+        runner = self._runner(make_model_runner, monkeypatch)
+        runner.input_batch.num_computed_tokens_cpu[0] = 2
+        runner.input_batch.num_tokens_no_spec[0] = len(self.PROMPT) + 2
+        runner._is_prefill_step = True
+
+        runner._prepare_inputs(
+            make_scheduler_output(num_scheduled_tokens={"a": 4}),
+            np.array([4], dtype=np.int32),
+        )
+
+        past_prompt = torch.tensor([4, 5]) + self.DELTA
+        expected = torch.cat([self.TABLE[:, 2:], past_prompt.expand(3, -1)], dim=1)
+        assert torch.equal(runner.mrope_positions[:, :4], expected)
+
+    def test_a_streaming_update_rebuilds_the_requests_table(
+        self, make_model_runner, monkeypatch
+    ):
+        runner = self._runner(make_model_runner, monkeypatch)
+        grown = [*self.PROMPT, 9, 10]
+        runner.model.get_mrope_input_positions = lambda ids, features: (
+            torch.arange(len(ids)).expand(3, -1),
+            len(ids),
+        )
+
+        # The same request id again: a streaming session's longer prompt.
+        runner._update_states(schedule_new("a", prompt_token_ids=[grown]))
+
+        request = runner.requests["a"]
+        assert request.mrope_positions.shape == (3, len(grown))
+        assert request.mrope_position_delta == len(grown)
 
 
 def _decode_ready(
@@ -591,7 +761,7 @@ def test_a_producer_stages_its_last_prompt_token_as_a_prefill(
     assert staged["input_ids"][0, 0].item() == 3
     assert staged["positions"][0, 0].item() == 2
     if prefill:
-        assert staged["input_ids"].shape == (1, runner.prefill_chunk_size)
+        assert staged["input_ids"].shape == (1, runner.prefill_chunk_sizes[0])
         assert staged["token_indices"].tolist() == [0]
     else:
         assert staged["input_ids"].shape[1] == 1
