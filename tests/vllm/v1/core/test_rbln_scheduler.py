@@ -2417,12 +2417,16 @@ class TestStateBoundaryAdmission:
 
     @staticmethod
     def _scheduler(monkeypatch, *, sends_state_boundary):
+        from vllm.v1.core.single_type_kv_cache_manager import (
+            register_all_kvcache_specs,
+        )
         from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec
 
         from tests.vllm.v1.core.utils import MockKVConnector
         from vllm_rbln.platform import RblnPlatform
         from vllm_rbln.v1.kv_cache import RBLNMambaSpec
 
+        register_all_kvcache_specs(None)
         RblnPlatform.register_custom_kv_cache_specs(None)
         monkeypatch.setattr(
             MockKVConnector,
