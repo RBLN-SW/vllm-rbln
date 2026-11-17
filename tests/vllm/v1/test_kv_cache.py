@@ -641,6 +641,7 @@ class TestRBLNSingleBlockSlidingWindowManager:
             self._step(m, pos, num_new, resumable=True)
         assert m.req_to_blocks["r"][0] is first
 
-    def test_a_window_wider_than_the_block_is_refused(self):
+    @pytest.mark.parametrize("sliding_window", [8, 17])
+    def test_a_window_not_as_wide_as_the_block_is_refused(self, sliding_window):
         with pytest.raises(NotImplementedError, match="use_swa_single_block"):
-            self._manager(sliding_window=17)
+            self._manager(sliding_window=sliding_window)
