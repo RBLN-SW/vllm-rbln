@@ -588,6 +588,51 @@ class TestMmPrefixOnTheShiftKernel:
         assert make_builder(cfg, sliding_window=4).swa_appends
 
 
+class TestBuildSingleBlockSlidingWindowDecode:
+    def _spec(self, sliding_window):
+        from vllm_rbln.v1.kv_cache import RBLNSingleBlockSlidingWindowSpec
+
+        return RBLNSingleBlockSlidingWindowSpec(
+            block_size=64,
+            num_kv_heads=4,
+            head_size=64,
+            dtype=torch.float16,
+            sliding_window=sliding_window,
+        )
+
+    def _build(self, cfg, positions, batch_pad, sliding_window=64, is_prefill=False):
+        n = len(positions)
+        cam = _cam(
+            num_reqs=n,
+            query_start_loc=list(range(n + 1)),
+            seq_lens=[p + 1 for p in positions],
+            block_table=[list(range(10, 18))] * n,
+        )
+        builder = make_builder(cfg, spec=self._spec(sliding_window))
+        return builder.build(
+            cam,
+            torch.tensor(positions + [0] * 8),
+            batch_pad=batch_pad,
+            is_prefill=is_prefill,
+        )
+
+    def test_the_append_kernel_reads_the_block_of_the_last_key_twice(self, cfg):
+        # Position 200's last key is in column 3, and
+        # position 192 enters column 3 with its last key still in column 2.
+        table = list(range(10, 18))
+        for position, column in ((200, 3), (192, 2), (50, 0)):
+            md = self._build(cfg, [position], 1)
+            expected = list(table)
+            if column:
+                expected[column - 1] = expected[column]
+            assert md.block_tables.tolist() == [expected]
+            assert md.seq_lens.tolist() == [[position]]
+
+    def test_prefill_reads_the_table_as_it_is(self, cfg):
+        md = self._build(cfg, [200], 1, is_prefill=True)
+        assert md.block_tables.reshape(-1).tolist() == list(range(10, 18))
+
+
 class TestBuildMmPrefixSlidingWindow:
     """The sliding-window mask of an mm prefix LM's prefill, checked by running
     sliding_window_attention_v1's eager reference over a whole prompt chunk by

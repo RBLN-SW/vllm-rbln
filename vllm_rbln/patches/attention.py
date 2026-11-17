@@ -32,7 +32,10 @@ from vllm_rbln.patches import register_patch
 from vllm_rbln.patches.registry import MIN_PATCH_PRIORITY
 from vllm_rbln.v1.attention.backends.flash_attention import RBLNFlashAttentionBackend
 from vllm_rbln.v1.attention.kv_cache_bindings import resolve_kv_cache
-from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
+from vllm_rbln.v1.kv_cache import (
+    RBLNSingleBlockSlidingWindowSpec,
+    RBLNSlidingWindowSpec,
+)
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention import MLAAttention
@@ -182,7 +185,8 @@ def patched_attention_forward(
         "A sliding-window layer needs the RBLN spec for the kernel that "
         "shifts the window in place: one block per request, no reclaim, no "
         "prefix sharing. REBEL CR13 carries sliding_window_attention_v1, "
-        "which appends into several blocks and takes upstream's spec."
+        "which appends into several blocks and takes upstream's spec; "
+        "upstream's manager cannot keep a window in one block."
     ),
 )
 def patched_get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
@@ -198,6 +202,11 @@ def patched_get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         spec_cls = (
             SlidingWindowSpec if current_platform.is_cr13() else RBLNSlidingWindowSpec
         )
+        if (
+            spec_cls is SlidingWindowSpec
+            and vllm_config.additional_config.use_swa_single_block
+        ):
+            spec_cls = RBLNSingleBlockSlidingWindowSpec
         return spec_cls(
             block_size=block_size,
             num_kv_heads=self.num_kv_heads,

@@ -175,6 +175,10 @@ class RBLNConfig(RBLNConfigBase):
     """dtype the compiled graphs run in on the device. Empty keeps the
     compiler's per-target default."""
 
+    use_swa_single_block: bool = False
+    """On REBEL CR13, keep a decoding request's sliding window in one block:
+    decode reads that block alone and the blocks before it are freed."""
+
     def compute_hash(self) -> str:
         """Hash of the fields that change the compiled artifact.
 
