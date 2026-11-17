@@ -162,19 +162,27 @@ def test_a_request_image_above_the_start_up_limit_is_refused(monkeypatch):
             vision_config=SimpleNamespace(spatial_merge_size=MERGE)
         ),
     )
-    grids = torch.tensor([[1, 32, 32]])
+    outputs = {
+        "pixel_values": torch.zeros(1),
+        "image_grid_thw": torch.tensor([[1, 32, 32]]),
+    }
     monkeypatch.setattr(
         qwen3_5.Qwen3VLMultiModalProcessor,
         "_apply_hf_processor_main",
-        lambda self, mm_items, hf_kwargs: {"image_grid_thw": grids},
+        lambda self, mm_items, hf_kwargs: outputs,
     )
 
-    assert processor._apply_hf_processor_main(None, {})["image_grid_thw"] is grids
+    assert processor._apply_hf_processor_main(None, {}) is outputs
 
     # A request that raised max_pixels: 34 x 32 = 1088 patches.
     grids = torch.tensor([[1, 32, 32], [1, 34, 32]])
+    outputs = {"pixel_values": torch.zeros(1), "image_grid_thw": grids}
     with pytest.raises(ValueError, match="1088 patches, more than the 1024"):
         processor._apply_hf_processor_main(None, {})
+
+    # Sent as embeddings, the same grids skip the encoder and are let through.
+    outputs = {"image_embeds": torch.zeros(1), "image_grid_thw": grids}
+    assert processor._apply_hf_processor_main(None, {}) is outputs
 
 
 def test_warmup_runs_the_encoder_once_over_each_bucket(visual):

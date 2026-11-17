@@ -108,7 +108,8 @@ class RBLNQwen3_5MultiModalProcessor(Qwen3VLMultiModalProcessor):
         hf_kwargs: Mapping[str, object],
     ) -> BatchFeature:
         outputs = super()._apply_hf_processor_main(mm_items, hf_kwargs)
-        if "image_grid_thw" in outputs:
+        # An image sent as image_embeds has a grid too, but skips the encoder.
+        if "pixel_values" in outputs:
             merge = self.info.get_hf_config().vision_config.spatial_merge_size
             limit = self.info.get_max_image_tokens() * merge**2
             for grid in outputs["image_grid_thw"].tolist():
