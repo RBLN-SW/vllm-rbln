@@ -405,7 +405,7 @@ class AXK3Model(nn.Module):
 
         # Prefill runs the final read plain; a decode batch cut by rows reads on
         # the ops, so the rows are gathered before lm_head.
-        if attn_metadata.is_prefill:
+        if is_prefill:
             hidden_states = hidden_states.transpose(-3, -2).reshape(
                 *inputs_embeds.shape[:-1], -1
             )
