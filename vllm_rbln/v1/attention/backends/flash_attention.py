@@ -43,7 +43,7 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
     KVCacheViewInfo,
     attention_block_axis,
 )
-from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
+from vllm_rbln.v1.kv_cache import RBLNRingSlidingWindowSpec, RBLNSlidingWindowSpec
 
 from ..ops.attention_naive import (
     attention_naive_decode,
@@ -344,6 +344,16 @@ class RBLNFlashAttentionMetadataBuilder(
                 for batch_index, batch_step in enumerate(seq_lens_cpu):
                     decode_attention_mask[batch_index, :, :, :, : batch_step + 1] = 1
                 attn_masks = decode_attention_mask
+
+        if isinstance(self.kv_cache_spec, RBLNRingSlidingWindowSpec) and not is_prefill:
+            # The append kernel reads the column before the last key's too,
+            # where the table still names a block the manager has freed.
+            column = (seq_idx[:, 0] - 1).clamp(min=0) // self.block_size
+            rows = torch.nonzero(column).view(-1)
+            block_tables_tensor = block_tables_tensor.clone()
+            block_tables_tensor[rows, column[rows] - 1] = block_tables_tensor[
+                rows, column[rows]
+            ]
 
         cache_seq_lens = None
         cache_offsets = None

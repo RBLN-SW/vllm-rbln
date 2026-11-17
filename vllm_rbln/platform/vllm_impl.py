@@ -203,6 +203,27 @@ def _validate(vllm_config: "VllmConfig") -> None:
             "parallelism on RBLN."
         )
 
+    if rbln_config.use_swa_ring:
+        from vllm.platforms import current_platform
+
+        cache_config = vllm_config.cache_config
+        if (
+            not current_platform.is_cr13()
+            or vllm_config.kv_transfer_config
+            # A verify step writes more rows than a window's block has spare.
+            or vllm_config.speculative_config is not None
+            # Without caching, nothing tells the manager where prefill ends.
+            or (
+                not cache_config.enable_prefix_caching
+                and cache_config.prefix_cache_retention_interval != 0
+            )
+        ):
+            raise NotImplementedError(
+                "use_swa_ring needs REBEL CR13 and supports neither KV "
+                "connectors, speculative decoding nor "
+                "prefix_cache_retention_interval without prefix caching."
+            )
+
     text_config = getattr(model_config, "hf_text_config", model_config.hf_config)
     if getattr(text_config, "model_type", None) == "qwen3_next":
         raise ValueError(

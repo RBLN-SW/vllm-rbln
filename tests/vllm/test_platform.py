@@ -501,6 +501,31 @@ class TestRejectedConfigs:
         with pytest.raises(ValueError, match="LoRA"):
             reconfigure(lambda config: setattr(config, "lora_config", object()))
 
+    def test_swa_ring_refuses_what_it_cannot_serve(self, reconfigure, monkeypatch):
+        from vllm.platforms import current_platform
+
+        monkeypatch.setattr(current_platform, "is_cr13", lambda: True)
+
+        def ring(config):
+            config.additional_config.use_swa_ring = True
+
+        def retention_without_caching(config):
+            ring(config)
+            config.cache_config.enable_prefix_caching = False
+            config.cache_config.prefix_cache_retention_interval = None
+
+        def speculative(config):
+            ring(config)
+            config.speculative_config = SimpleNamespace(method="mtp")
+
+        reconfigure(ring)
+        for mutate in (retention_without_caching, speculative):
+            with pytest.raises(NotImplementedError, match="use_swa_ring"):
+                reconfigure(mutate)
+        monkeypatch.setattr(current_platform, "is_cr13", lambda: False)
+        with pytest.raises(NotImplementedError, match="use_swa_ring"):
+            reconfigure(ring)
+
     def test_msa_models_need_bfloat16(self, reconfigure):
         def msa(dtype):
             def mutate(config):

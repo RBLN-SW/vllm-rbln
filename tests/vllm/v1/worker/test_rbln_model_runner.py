@@ -1682,6 +1682,24 @@ class TestProcessKvCacheCopyOps:
         assert (dst[..., :3, :] == 5.0).all()
         assert (dst[..., 3:, :] == 0.0).all()
 
+    def test_eager_copy_from_a_start_row(self, monkeypatch):
+        monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", True)
+        kv = torch.zeros(4, 2, 1, 1, 8, 2)
+        kv[1] = 5.0
+        r = _make_runner_stub(
+            kv_caches=[kv],
+            kv_cache_names=["l0"],
+            kv_cache_block_axes={"l0": 0},
+            kv_cache_config=_copy_groups(["l0"]),
+            _kernel_block_sizes=[8],
+            model_config=SimpleNamespace(use_mla=False, enforce_eager=True),
+            runtime_holder=[None],
+        )
+        r._process_kv_cache_copy_ops([KVCacheCopyOp(0, 1, 2, 3, start=4)])
+        assert (kv[2][..., 4:7, :] == 5.0).all()
+        assert (kv[2][..., :4, :] == 0.0).all()
+        assert (kv[2][..., 7:, :] == 0.0).all()
+
     def test_eager_copy_mla(self, monkeypatch):
         monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", True)
         kv = torch.zeros(4, 8, 2)  # (num_blocks, block_tokens, dim)

@@ -48,6 +48,7 @@ from tests.vllm.v1.core.utils import (
     sub_block_index,
 )
 from vllm_rbln.v1.core.rbln_kv_cache_manager import (
+    KVCacheCopyOp,
     RBLNKVCacheManager,
     SubBlockHasher,
     SubBlockIndex,
@@ -1392,6 +1393,37 @@ class TestDrainReleaseCopyOps:
         assert len(ops) == 1
         assert manager.pending_copy_ops == []
         manager.release_copy_ops(ops)
+
+    def test_a_ring_groups_window_copies_drain_with_their_group(self):
+        from vllm_rbln.platform import RblnPlatform
+        from vllm_rbln.v1.kv_cache import RBLNRingSlidingWindowSpec
+
+        RblnPlatform.register_custom_kv_cache_specs(None)
+        ring_spec = RBLNRingSlidingWindowSpec(
+            block_size=8,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.float32,
+            sliding_window=8,
+        )
+        manager = RBLNKVCacheManager(
+            kv_cache_config=make_kv_cache_config(
+                [full_attention_spec(8), ring_spec], 20
+            ),
+            max_model_len=8192,
+            scheduler_block_size=8,
+            hash_block_size=8,
+            sub_block_size=4,
+            hash_fn=sha256,
+        )
+        ring = manager.coordinator.single_type_managers[1]
+        manager.block_pool.touch([manager.block_pool.blocks[3]])
+        ring.pending_copies = [(3, 4, 5)]
+        ops = manager.drain_pending_copy_ops()
+        assert ops == [KVCacheCopyOp(1, 3, 4, 3, 5)]
+        assert ring.pending_copies == []
+        manager.release_copy_ops(ops)
+        assert manager.block_pool.blocks[3].ref_cnt == 0
 
     def test_release_copy_ops_frees_src_refs(self):
         # release_copy_ops frees the source-block refs of the drained ops.

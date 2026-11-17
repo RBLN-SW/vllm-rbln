@@ -4419,8 +4419,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     srcs.append(kv_cache[src, :nt])
                 else:
                     axis = self.kv_cache_block_axes[layer_name]
-                    dsts.append(kv_cache.select(axis, dst)[..., :nt, :])
-                    srcs.append(kv_cache.select(axis, src)[..., :nt, :])
+                    rows = slice(op.start, op.start + nt)
+                    dsts.append(kv_cache.select(axis, dst)[..., rows, :])
+                    srcs.append(kv_cache.select(axis, src)[..., rows, :])
         torch._foreach_copy_(dsts, srcs)
 
 

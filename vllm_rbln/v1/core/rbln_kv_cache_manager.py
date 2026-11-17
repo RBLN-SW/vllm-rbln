@@ -49,7 +49,7 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_rbln.logger import init_logger
-from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
+from vllm_rbln.v1.kv_cache import RBLNRingSlidingWindowManager, RBLNSlidingWindowSpec
 
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_utils import KVCacheBlock
@@ -79,6 +79,8 @@ class KVCacheCopyOp:
     dst_block_id: int
     # Number of tokens to copy (= num_matched_sub_blocks * sub_block_size).
     num_tokens: int
+    # First row copied.
+    start: int = 0
 
 
 class SubBlockHasher:
@@ -550,6 +552,13 @@ class RBLNKVCacheManager(KVCacheManager):
         """
         ops = self.pending_copy_ops
         self.pending_copy_ops = []
+        for gid, manager in enumerate(self.coordinator.single_type_managers):
+            if isinstance(manager, RBLNRingSlidingWindowManager):
+                ops += [
+                    KVCacheCopyOp(gid, src, dst, manager.block_size - start, start)
+                    for src, dst, start in manager.pending_copies
+                ]
+                manager.pending_copies = []
         return ops
 
     def release_copy_ops(self, ops: list[KVCacheCopyOp]) -> None:

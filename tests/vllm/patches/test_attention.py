@@ -26,7 +26,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 
 from vllm_rbln.patches import attention
 from vllm_rbln.patches.attention import patched_get_kv_cache_spec
-from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
+from vllm_rbln.v1.kv_cache import RBLNRingSlidingWindowSpec, RBLNSlidingWindowSpec
 
 
 def _layer(sliding_window):
@@ -40,10 +40,11 @@ def _layer(sliding_window):
     )
 
 
-def _config(use_mla=False):
+def _config(use_mla=False, use_swa_ring=False):
     return SimpleNamespace(
         cache_config=SimpleNamespace(block_size=32),
         model_config=SimpleNamespace(use_mla=use_mla),
+        additional_config=SimpleNamespace(use_swa_ring=use_swa_ring),
     )
 
 
@@ -62,6 +63,11 @@ class TestSlidingWindowSpec:
         cr13(True)
         spec = patched_get_kv_cache_spec(_layer(16), _config())
         assert type(spec) is SlidingWindowSpec
+
+    def test_cr13_selects_the_ring_spec_when_asked(self, cr13):
+        cr13(True)
+        spec = patched_get_kv_cache_spec(_layer(16), _config(use_swa_ring=True))
+        assert type(spec) is RBLNRingSlidingWindowSpec
 
     def test_otherwise_the_rbln_spec(self, cr13):
         # The shift kernel holds the window in one block, which only
