@@ -408,7 +408,9 @@ class RblnPlatform(Platform):
     def register_custom_kv_cache_specs(cls, vllm_config: "VllmConfig") -> None:
         from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
+        from vllm_rbln.v1.attention.backends.deepseek_v4 import RBLNDeepseekV4StateSpec
         from vllm_rbln.v1.kv_cache import (
+            RBLNDeepseekV4StateManager,
             RBLNSlidingWindowManager,
             RBLNSlidingWindowSpec,
         )
@@ -417,6 +419,11 @@ class RblnPlatform(Platform):
             RBLNSlidingWindowSpec,
             RBLNSlidingWindowManager,
             uniform_type_base_spec=RBLNSlidingWindowSpec,
+        )
+        KVCacheSpecRegistry.register(
+            RBLNDeepseekV4StateSpec,
+            RBLNDeepseekV4StateManager,
+            uniform_type_base_spec=RBLNDeepseekV4StateSpec,
         )
 
     @classmethod
