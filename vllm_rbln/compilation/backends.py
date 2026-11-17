@@ -29,6 +29,9 @@ logger = init_logger(__name__)
 
 _compile_counter = itertools.count(1)
 _current_stage = ContextVar("rbln_backend_current_stage", default="runtime")
+program_input_bindings: ContextVar[dict[int, tuple[tuple, ...]] | None] = ContextVar(
+    "rbln_program_input_bindings", default=None
+)
 _SELF_FILE = Path(__file__).resolve()
 
 _DTYPE_SHORT = {
@@ -133,7 +136,18 @@ def _rbln_backend(
         _find_rbln_callsite(),
         "; ".join(parts),
     )
-    return rbln_torch_compile_backend(graph, example_inputs, **kwargs)
+    runtime = rbln_torch_compile_backend(graph, example_inputs, **kwargs)
+    # Captured programs carry this runtime and tensor-input order. Snapshot
+    # byte-window keys here so sizing does not depend on input views surviving.
+    if (bindings := program_input_bindings.get()) is not None:
+        from vllm_rbln.v1.attention.kv_cache_bindings import kv_cache_tensor_key
+
+        bindings[id(runtime)] = tuple(
+            kv_cache_tensor_key(x)
+            for x in example_inputs
+            if isinstance(x, torch.Tensor)
+        )
+    return runtime
 
 
 rbln_backend = _rbln_backend

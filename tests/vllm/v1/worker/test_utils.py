@@ -1706,6 +1706,7 @@ class TestDynamicKvUnsupportedReason:
         block_size=16,
         max_model_len=32,
         kv_transfer_config=None,
+        is_mm_encoder_only=False,
     ):
         return SimpleNamespace(
             additional_config=RBLNConfig(
@@ -1720,6 +1721,7 @@ class TestDynamicKvUnsupportedReason:
             cache_config=SimpleNamespace(block_size=block_size),
             model_config=SimpleNamespace(max_model_len=max_model_len),
             kv_transfer_config=kv_transfer_config,
+            is_mm_encoder_only=is_mm_encoder_only,
         )
 
     @staticmethod
@@ -1746,6 +1748,10 @@ class TestDynamicKvUnsupportedReason:
     def test_the_triton_kernels_are_unsupported(self):
         reason = dynamic_kv_unsupported_reason(self._cfg(use_custom_kernel=True))
         assert "RBLN_USE_CUSTOM_KERNEL" in reason
+
+    def test_an_encoder_only_instance_is_unsupported(self):
+        reason = dynamic_kv_unsupported_reason(self._cfg(is_mm_encoder_only=True))
+        assert "holds no KV cache" in reason
 
     @pytest.mark.parametrize(
         ("config_overrides", "expected"),
@@ -1912,3 +1918,17 @@ class TestRescaleKvCacheConfig:
     def test_a_zero_block_config_is_refused(self):
         with pytest.raises(ValueError, match="cannot rescale"):
             rescale_kv_cache_config(self._cfg(0), 5)
+
+
+class TestGatedDeltaNetCacheIndices:
+    def test_a_layer_owns_a_state_and_a_conv_ring_slot(self):
+        # Two cache slots a layer: the recurrent state at the layer's own slot,
+        # its conv ring at the next, and an attention layer's cache at the first.
+        config = SimpleNamespace(hf_config=SimpleNamespace(model_type="qwen3_5_text"))
+        assert worker_utils.num_attn_module(config, "auto") == 2
+        assert worker_utils.extract_layer_index("model.layers.3.linear_attn", 2) == 6
+        assert (
+            worker_utils.extract_layer_index("model.layers.3.linear_attn.conv_ring", 2)
+            == 7
+        )
+        assert worker_utils.extract_layer_index("model.layers.3.self_attn.attn", 2) == 6

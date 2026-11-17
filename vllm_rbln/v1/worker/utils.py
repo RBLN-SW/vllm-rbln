@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -222,7 +222,7 @@ def extract_layer_index(layer_name: str, num_attn_module: int = 1) -> int:
         sub = int_vals[1]
     elif "scale" in layer_name:
         sub = 2
-    elif "indexer" in layer_name:
+    elif "indexer" in layer_name or "conv_ring" in layer_name:
         sub = 1
     else:
         sub = 0
@@ -256,11 +256,20 @@ def num_attn_module(model_config, cache_dtype) -> int:
     if getattr(hf_config, "model_type", None) == "longcat_flash":
         return 2
     text_config = getattr(model_config, "hf_text_config", hf_config)
+    # GLM uses an upper bound for per-layer index spacing, not a cache count.
+    # KDA needs up to 2 * num_groups + 1 slots; num_groups <= linear_num_heads.
+    # MTP uses the same bound although its DSA layers have only four slots.
+    # Cache binding compacts the actual entries into consecutive indices.
+    if getattr(text_config, "model_type", None) in ("glm5_next_text", "glm5_next_mtp"):
+        return 2 * text_config.linear_num_heads + 1
     # A DSA model puts the lightning-indexer key cache next to MLA: 2 modules,
     # or 3 when the indexer cache is fp8 (a companion scale cache).
     if hasattr(text_config, "index_topk") or hasattr(hf_config, "index_topk"):
         is_fp8 = bool(cache_dtype) and cache_dtype.startswith("fp8")
         return 3 if is_fp8 else 2
+    # A GatedDeltaNet layer (Qwen3.5) keeps its recurrent state and its conv ring.
+    if getattr(text_config, "model_type", None) == "qwen3_5_text":
+        return 2
     # MiniMax-M3 MSA: the indexer key cache next to the GQA K/V cache. Dense
     # layers own only K/V; the runner re-indexes layers by bound position.
     if getattr(text_config, "sparse_attention_config", None) or getattr(
@@ -476,6 +485,8 @@ def dynamic_kv_unsupported_reason(vllm_config: VllmConfig) -> str | None:
                 "among the connectors the dynamic-KV resize is open for "
                 f"({', '.join(DYNAMIC_KV_SUPPORTED_CONNECTORS)})"
             )
+    if vllm_config.is_mm_encoder_only:
+        return "this instance runs the multimodal encoder only and holds no KV cache"
     return None
 
 

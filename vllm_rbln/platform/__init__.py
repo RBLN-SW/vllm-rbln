@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -21,6 +21,9 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.config.logging import LoggingConfig
+    from vllm.inputs import EngineInput
+    from vllm.pooling_params import PoolingParams
+    from vllm.sampling_params import SamplingParams
     from vllm.utils.argparse_utils import FlexibleArgumentParser
     from vllm.v1.attention.selector import AttentionSelectorConfig
 
@@ -265,9 +268,10 @@ class RblnPlatform(Platform):
         `create_engine_config`, too late to wrap it, and `patches/` is the
         vllm model path's alone while this has to run on both.
         """
+        from vllm.config.utils import replace
         from vllm.engine.arg_utils import EngineArgs
 
-        from vllm_rbln.config import OptimumRBLNConfig, resolve_model_impl
+        from vllm_rbln.config import resolve_model_impl
 
         if getattr(EngineArgs, "_rbln_model_impl_patched", False):
             return
@@ -283,22 +287,36 @@ class RblnPlatform(Platform):
             # optimum-rbln supports. Hand the default back so that resolution is
             # the one it would have done without us.
             self.model_impl = "auto"
-            config = self.additional_config
-            if model_impl == "optimum":
-                # The prefill chunk size that path compiles is
-                # `--max-num-batched-tokens` as the user gave it, and the call
-                # below replaces an unset one with a default, leaving
-                # `sync_from_vllm` no way to tell the two apart. Nothing else
-                # writes additional_config now, so an unset one starts here.
-                if config is None:
-                    config = self.additional_config = {}
-                if isinstance(config, dict):
-                    config["user_max_num_batched_tokens"] = self.max_num_batched_tokens
-                elif isinstance(config, OptimumRBLNConfig):
-                    config.user_max_num_batched_tokens = self.max_num_batched_tokens
-            elif self.max_num_batched_tokens is None:
+            if model_impl == "vllm" and self.max_num_batched_tokens is None:
                 self.max_num_batched_tokens = RBLN_DEFAULT_MAX_NUM_BATCHED_TOKENS
             _apply_model_impl(model_impl)
+            # TODO(vllm-rbln>=0.14.0): delete the legacy chunk-size alias.
+            if model_impl == "optimum" and self.max_num_batched_tokens is not None:
+                from vllm_rbln.config import build_optimum_rbln_config
+                from vllm_rbln.utils.optimum.configuration.runtime_config import (
+                    is_chunked_prefill_arch,
+                )
+
+                logger.warning_once(
+                    "--max-num-batched-tokens (max_num_batched_tokens) on the "
+                    "optimum model impl is deprecated and will be removed in "
+                    "0.14.0. To set the prefill chunk size explicitly, use "
+                    "--rbln-prefill-chunk-size."
+                )
+                if is_chunked_prefill_arch(self.create_model_config().hf_config):
+                    rbln_config = build_optimum_rbln_config(self.additional_config)
+                    chunk = rbln_config.single_prefill_chunk_size
+                    if chunk is not None and chunk != self.max_num_batched_tokens:
+                        raise ValueError(
+                            "Conflicting prefill chunk size: "
+                            f"max_num_batched_tokens ({self.max_num_batched_tokens}) "
+                            f"!= prefill_chunk_size ({chunk}). Set only "
+                            "--rbln-prefill-chunk-size."
+                        )
+                    self.additional_config = replace(
+                        rbln_config, prefill_chunk_size=[self.max_num_batched_tokens]
+                    )
+                self.max_num_batched_tokens = None
             return orig_create_engine_config(self, *args, **kwargs)
 
         EngineArgs.create_engine_config = create_engine_config
@@ -372,6 +390,17 @@ class RblnPlatform(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
+        ec_config = vllm_config.ec_transfer_config
+        if (
+            vllm_config.is_mm_encoder_only
+            and ec_config is not None
+            and ec_config.is_ec_consumer
+        ):
+            raise ValueError(
+                "--mm-encoder-only skips the language model, so it cannot be used "
+                "on an EC consumer."
+            )
+
         _impl().check_and_update(vllm_config)
 
         parallel_config = vllm_config.parallel_config
@@ -381,6 +410,14 @@ class RblnPlatform(Platform):
                 "executor backend; use 'mp' for supported multi-worker execution.",
                 parallel_config.distributed_executor_backend,
             )
+
+    @classmethod
+    def validate_request(
+        cls,
+        processed_inputs: "EngineInput",
+        params: "SamplingParams | PoolingParams",
+    ) -> None:
+        _impl().validate_request(params)
 
     @classmethod
     def register_custom_kv_cache_specs(cls, vllm_config: "VllmConfig") -> None:

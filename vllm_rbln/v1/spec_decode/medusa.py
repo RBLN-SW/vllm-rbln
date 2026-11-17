@@ -33,6 +33,9 @@ if TYPE_CHECKING:
 
 
 class RBLNMedusaProposer(MedusaProposer):
+    # Its one graph carries no phase, so warm-up builds no decode shape here.
+    warms_up_decode_graphs_on_a_producer = False
+
     def __init__(
         self,
         vllm_config: VllmConfig,

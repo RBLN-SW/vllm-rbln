@@ -23,6 +23,15 @@ from tests.vllm.utils import check_logprobs_close
 MODELS = [
     CompileModelSpec("meta-llama/Llama-3.2-1B-Instruct"),
     CompileModelSpec("Qwen/Qwen3-0.6B"),
+    # The last 64-token chunk pads to 128, not to the 256 budget.
+    CompileModelSpec(
+        "Qwen/Qwen3-0.6B",
+        {
+            "max_num_batched_tokens": 256,
+            "additional_config": {"prefill_chunk_size": [128, 256]},
+        },
+        id="Qwen3-0.6B-prefill-chunk-sizes",
+    ),
     CompileModelSpec("google/gemma-3-1b-it"),
     # Quantization schemes
     CompileModelSpec("Qwen/Qwen3-0.6B-FP8"),

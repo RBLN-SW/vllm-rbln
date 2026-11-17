@@ -423,7 +423,7 @@ class TestSwaWindowDelegation:
             lambda self, *args, **kwargs: "shard",
         )
 
-        two_copies = [[Piece(0, 0, 0, 64, 1), Piece(0, 1, 0, 64, 1)]]
+        two_copies = [[Piece(0, 0, 0, 64, 1, (0, 1)), Piece(0, 1, 0, 64, 1, (0, 1))]]
         assert worker.register_local_xfer_handler(64, pieces=two_copies) == "shard"
 
     def test_add_remote_agent_delegates_when_no_swa(self, monkeypatch):

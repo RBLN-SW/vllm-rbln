@@ -36,6 +36,11 @@ _sync: &sync |
 _dshm: &dshm
   - kubernetes:
       podSpecPatch:
+        tolerations:
+          - key: rebellions.ai/dedicated
+            operator: Equal
+            value: framework.sw
+            effect: NoSchedule
         containers:
           - name: container-0
             volumeMounts:
@@ -126,6 +131,17 @@ steps:
         command:
           - *sync
           - "bash .buildkite/pipelines/vllm-rbln/scripts/run-e2e.sh --group core ${PYTEST_E2E_ARGS:-}"
+
+      - <<: *e2e
+        label: "sample"
+        key: "vllm-rbln-e2e-sample-cr13"
+        resources:
+          npu:
+            count: 1
+            product: "RBLN-CR13"
+        command:
+          - *sync
+          - "bash .buildkite/pipelines/vllm-rbln/scripts/run-e2e.sh --group sample ${PYTEST_E2E_ARGS:-}"
 
       # - <<: *e2e
       #   label: "others"

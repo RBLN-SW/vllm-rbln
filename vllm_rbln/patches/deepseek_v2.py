@@ -22,6 +22,7 @@ from vllm.model_executor.models.deepseek_v2 import (
     DeepseekV2MoE,
     DeepseekV32IndexerCache,
 )
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 from vllm_rbln.logger import init_logger
 from vllm_rbln.patches import register_patch
@@ -272,5 +273,6 @@ def rbln_indexer_forward(
         self.topk_tokens,
         scale_cache,
         is_prompt_sorted=attn_metadata.is_prompt_sorted,
+        null_block_id=NULL_BLOCK_ID,
     )
     return topk_index

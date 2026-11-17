@@ -2,10 +2,15 @@
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# You may obtain a copy of the License at:
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 #
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """A.X K3 on top of the vendored A.X K2 model.
 
@@ -45,7 +50,6 @@ from vllm.model_executor.models.utils import (
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
-from vllm_rbln import envs
 from vllm_rbln.patches.axk2 import model as _axk2_model
 
 # Loaded at import time from the frozen copy, so mypy cannot see its classes
@@ -58,8 +62,10 @@ _AXK2ForCausalLM: Any = _k2.AXK2ForCausalLM
 class AXK3GatedResidual(nn.Module):
     """Gated Residual read/write over ``num_streams`` residual branches.
 
-    Numerics follow ``AXK3GatedResidual`` in ``modeling_axk3.py``: fp32 RMSNorm
-    statistics, the read gate applied in fp32, the write gate kept in fp32.
+    Numerics follow ``AXK3GatedResidual`` in ``modeling_axk3.py`` with fp32
+    RMSNorm statistics. The read and write gates and the write product run in
+    the activation dtype instead of fp32 (the projections feeding them are
+    bf16 already).
     """
 
     def __init__(
@@ -102,7 +108,7 @@ class AXK3GatedResidual(nn.Module):
         return x.view(*x.shape[:-1], self.num_streams, self.hidden_size)
 
     def read(self, residual: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """[..., n*h] -> (block input [..., h], write gate [..., n] fp32 or None)."""
+        """[..., n*h] -> (block input [..., h], write gate [..., n] or None)."""
         n = self.num_streams
         # vLLM's RMSNorm over the h axis of [..., n, h], so the norm lowers like
         # every other RMSNorm; a hand-written [..., n, 1] statistic left a host
@@ -113,14 +119,19 @@ class AXK3GatedResidual(nn.Module):
         u = normed * self.gamma.view(n, self.hidden_size).float()
         u = u.to(residual.dtype).view_as(residual)
 
+        # The gates stay in the activation dtype. The projections already
+        # return bf16, so an fp32 gate only re-ran the bias add, the sigmoid
+        # and the stream mean wider, and the casts around them kept each
+        # projection, its bias and its sigmoid from fusing into one device op.
+        # The stream mean still accumulates in fp32 on device.
         z = F.silu(self.read_down(u)[0] / n)
-        gate = torch.sigmoid(self.read_up(z)[0].float())
-        block_input = self._streams(gate * u.float()).mean(dim=-2).to(residual.dtype)
+        gate = torch.sigmoid(self.read_up(z)[0])
+        block_input = self._streams(gate * u).mean(dim=-2)
 
         write_gate = None
         if self.write_proj is not None:
             write_gate = 2.0 * torch.sigmoid(
-                (self.write_proj(u)[0] / n).float() + self.write_bias
+                self.write_proj(u)[0] / n + self.write_bias.to(u.dtype)
             )
         return block_input, write_gate
 
@@ -128,7 +139,9 @@ class AXK3GatedResidual(nn.Module):
         self, residual: torch.Tensor, y: torch.Tensor, write_gate: torch.Tensor
     ) -> torch.Tensor:
         """R'_i = R_i + s_i * y."""
-        scaled = (write_gate.unsqueeze(-1) * y.float().unsqueeze(-2)).to(residual.dtype)
+        # y and the gate are bf16 and the product goes straight back to bf16,
+        # so an fp32 multiply only added a cast on each side of it.
+        scaled = (write_gate.unsqueeze(-1) * y.unsqueeze(-2)).to(residual.dtype)
         return (self._streams(residual) + scaled).view_as(residual)
 
 
@@ -258,11 +271,8 @@ class AXK3DecoderLayer(_AXK2DecoderLayer):
         x, write_gate = self.mlp_gated_residual.read(hidden_states)
         x = self.mlp(x)
         hidden_states = self.mlp_gated_residual.write(residual, x, write_gate)
+        # A nested compile region must not write topk_by_layer; the caller does.
         return hidden_states, None if self.skip_topk else topk_indices
-
-    if envs.VLLM_RBLN_USE_NESTED_COMPILE_REGION:
-        # The region must not write topk_by_layer; forward returns its top-k instead.
-        forward = torch.compiler.nested_compile_region(forward)
 
 
 @support_torch_compile

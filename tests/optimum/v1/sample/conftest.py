@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -39,10 +39,9 @@ def pin_npu_per_worker(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def skip_sync_vllm_and_optimum():
-    # Force `compiled_rbln_config = None` so sync_vllm_and_optimum() takes the
-    # sync_from_vllm() path instead of resolving a real compiled config.
+    # Use the compile inputs without reading rbln_config.json from disk.
     with patch(
-        "vllm_rbln.utils.optimum.converter.dispatch._resolve_rbln_config",
+        "vllm_rbln.utils.optimum.configuration.sync.load_compiled_rbln_config",
         return_value=None,
     ):
         yield

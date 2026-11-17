@@ -1,11 +1,11 @@
 # Copyright 2026 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -15,7 +15,16 @@ from dataclasses import replace
 from typing import Any
 
 import torch
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.layers.pooler import Pooler
+from vllm.model_executor.layers.pooler.activations import PoolerNormalize
+from vllm.model_executor.layers.pooler.seqwise import (
+    EmbeddingPoolerHead,
+    SequencePooler,
+    get_seq_pooling_method,
+)
+from vllm.model_executor.models import VllmModelForPooling
 from vllm.model_executor.models.qwen2_5_vl import (
     Qwen2_5_VLVideoPixelInputs,
 )
@@ -27,6 +36,7 @@ from .qwen2_vl import (
     RBLNOptimumQwen2_5_VLForConditionalGeneration,
     split_by_grid_thw,
 )
+from .qwen3_reranker import RBLNQwen3RerankerPooler, resolve_label_token_ids
 
 logger = init_logger(__name__)
 
@@ -157,6 +167,56 @@ class RBLNOptimumQwen3VLForConditionalGeneration(
         return self.model.prefill_decoder(**prefill_kwargs).logits
 
 
+class RBLNOptimumQwen3VLForSequenceClassification(
+    RBLNOptimumQwen3VLForConditionalGeneration, VllmModelForPooling
+):
+    """Qwen3-VL-Reranker, scored like Qwen3-Reranker (see qwen3_reranker.py)
+    from the "yes" and "no" logits at the last prompt position."""
+
+    is_pooling_model = True
+    pooler: Pooler
+
+    def __init__(self, vllm_config: VllmConfig) -> None:
+        super().__init__(vllm_config=vllm_config)
+        self.false_id, self.true_id = resolve_label_token_ids(vllm_config.model_config)
+        self.pooler = RBLNQwen3RerankerPooler()
+
+    def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
+        # [1, 1, vocab_size]: the prefill graph keeps the last position only.
+        logits = super().forward(model_input, **kwargs)[:, -1]
+        score_logits = logits[:, self.true_id] - logits[:, self.false_id]
+        return score_logits.unsqueeze(-1).to(self.model_config.head_dtype)
+
+
+class RBLNOptimumQwen3VLModel(
+    RBLNOptimumQwen3VLForConditionalGeneration, VllmModelForPooling
+):
+    """Qwen3-VL-Embedding on optimum-rbln's ``RBLNQwen3VLModel``, whose prefill
+    graph has no lm_head and returns the normed hidden state of every position."""
+
+    is_pooling_model = True
+    pooler: Pooler
+
+    def __init__(self, vllm_config: VllmConfig) -> None:
+        super().__init__(vllm_config=vllm_config)
+        pooler_config = vllm_config.model_config.pooler_config
+        assert pooler_config is not None
+        # The checkpoint ships no sentence-transformers Dense layer, so there is
+        # no projector to load.
+        self.pooler = SequencePooler(
+            pooling=get_seq_pooling_method(pooler_config.get_seq_pooling_type()),
+            head=EmbeddingPoolerHead(
+                head_dtype=vllm_config.model_config.head_dtype,
+                projector=None,
+                activation=PoolerNormalize(),
+            ),
+        )
+
+    def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
+        # [1, num_tokens, hidden] -> [num_tokens, hidden] for the pooling cursor.
+        return super().forward(model_input, **kwargs)[0]
+
+
 class RBLNOptimumQwen3VLMoeForConditionalGeneration(
     RBLNOptimumQwen3VLForConditionalGeneration
 ):
@@ -181,10 +241,11 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
 
     def decode_layout(
         self, cache_slot_ids: torch.Tensor, block_tables: torch.Tensor
-    ) -> tuple[int, torch.Tensor]:
-        # The GatedDeltaNet linear_attention conv/recurrent state is a fixed
-        # [max_num_seqs] on-device cache indexed by batch row, so each request
-        # is pinned to its scheduler-assigned cache slot for its lifetime.
+    ) -> tuple[int, slice | torch.Tensor]:
+        # Length sorting can place requests on rows different from their cache slots.
+        # state_idx lets each request access its own state without changing that order.
+        if getattr(self.get_language_model().rbln_config, "requires_batch_sort", False):
+            return super().decode_layout(cache_slot_ids, block_tables)
         return self.decoder_batch_size, cache_slot_ids.to(torch.long)
 
     def _video_rope_kwargs(
@@ -206,10 +267,10 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
         )
 
     def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
-        """Prefill writes one state row, named by ``batch_idx``; decode arrives
-        laid out by row (see decode_layout)."""
+        """Prefill writes one state row, named by ``batch_idx``; decode names the
+        state row of each batch row, ``state_idx`` (see decode_layout)."""
+        assert model_input.cache_slot_ids is not None
         if model_input.is_prompt:
-            assert model_input.cache_slot_ids is not None
             return self.model.prefill_decoder(
                 inputs_embeds=model_input.inputs_embeds,
                 position_embed=model_input.position_embed,
@@ -224,4 +285,5 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
             cache_position=model_input.input_positions,
             position_embed=model_input.position_embed,
             block_tables=model_input.block_tables,
+            state_idx=model_input.cache_slot_ids.view(-1),
         ).logits

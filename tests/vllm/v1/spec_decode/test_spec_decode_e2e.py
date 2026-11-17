@@ -17,9 +17,12 @@
 # suffix, eagle, eagle3 and medusa.
 
 import warnings
+from typing import Any
 
 import pytest
+from vllm import SamplingParams
 from vllm.config import SpeculativeConfig
+from vllm.inputs import TokensPrompt
 
 from tests.vllm.utils import check_outputs_almost_equal
 from tests.vllm.v1.spec_decode.utils import (
@@ -39,7 +42,7 @@ NUM_LOGPROBS = 5
 
 # method -> (target model, extra LLM kwargs, speculative_config). The eagle/medusa
 # drafts cap at 2048 positions, so max_model_len is lowered for them.
-SPEC_METHODS = {
+SPEC_METHODS: dict[str, tuple[str, dict[str, Any], dict[str, Any]]] = {
     "ngram": (
         _NGRAM_TARGET,
         {},
@@ -62,6 +65,17 @@ SPEC_METHODS = {
     "eagle": (
         TARGET_MODEL,
         {"max_model_len": 2048, "tensor_parallel_size": 2},
+        {"method": "eagle", "model": _DRAFT["eagle"], "num_speculative_tokens": 3},
+    ),
+    # The target prefills the prompt on the 256 graph, the drafter on the 512 one.
+    "eagle-prefill-chunk-sizes": (
+        TARGET_MODEL,
+        {
+            "max_model_len": 2048,
+            "tensor_parallel_size": 2,
+            "max_num_batched_tokens": 512,
+            "additional_config": {"prefill_chunk_size": [256, 512]},
+        },
         {"method": "eagle", "model": _DRAFT["eagle"], "num_speculative_tokens": 3},
     ),
     "eagle3": (
@@ -118,7 +132,11 @@ def test_speculative_decoding_matches_reference(
 
     # The reference sampler, on both runs: the RBLN one compiles a graph of its
     # own, and acceptance is being compared, not sampler implementations.
-    reference_sampler = {"use_custom_sampler": False}
+    extra_kwargs = dict(extra_kwargs)
+    reference_sampler = {
+        "use_custom_sampler": False,
+        **extra_kwargs.pop("additional_config", {}),
+    }
 
     with vllm_runner(
         target, **extra_kwargs, additional_config=reference_sampler
@@ -152,4 +170,57 @@ def test_speculative_decoding_matches_reference(
     # can realistically hit, require at least one acceptance. Truncated layers
     # leave the draft's predictions unrelated to the target's, so nothing hits.
     if method in _EXPECT_ACCEPTANCE and whole_model:
+        assert accepted > 0, f"spec:{method} accepted no draft tokens"
+
+
+# Qwen3's generation_config.json samples with top_k=20, so a request that sets
+# nothing still carries a top-k the output can be held to.
+SAMPLED_TARGET = "Qwen/Qwen3-0.6B"
+DEFAULT_TOP_K = 20
+
+
+@pytest.mark.model_compile
+@pytest.mark.parametrize("method", ["ngram"])
+def test_sampled_speculative_decoding_stays_in_the_top_k(
+    vllm_runner, method: str, whole_model: bool
+) -> None:
+    """Random rows through the RBLN rejection graph, one with its own top_k and
+    one with the model's defaults, must sample only within that top_k."""
+    spec_config = SPEC_METHODS[method][2]
+    explicit = SamplingParams(
+        temperature=1.0, top_k=5, max_tokens=MAX_TOKENS, ignore_eos=True
+    )
+    with vllm_runner(
+        SAMPLED_TARGET, max_num_seqs=4, speculative_config=spec_config
+    ) as spec_model:
+        defaults = spec_model.llm.get_default_sampling_params()
+        assert defaults.top_k == DEFAULT_TOP_K
+        defaults.max_tokens = MAX_TOKENS
+        params = [explicit, defaults] * 2
+        outputs = spec_model.llm.generate([PROMPT] * len(params), params)
+        accepted = spec_model.spec_decode_accepted_tokens()
+
+    # A reference engine without drafts ranks every sampled token after its own
+    # prefix. Rounding differs between the two, so a token at the cut may slip
+    # a few ranks: allow twice the top_k.
+    checks = [
+        (o.prompt_token_ids + list(o.outputs[0].token_ids[:i]), token, p.top_k)
+        for p, o in zip(params, outputs)
+        for i, token in enumerate(o.outputs[0].token_ids)
+    ]
+    with vllm_runner(
+        SAMPLED_TARGET, max_num_seqs=4, max_logprobs=2 * DEFAULT_TOP_K
+    ) as ref_model:
+        ranked = ref_model.llm.generate(
+            [TokensPrompt(prompt_token_ids=prefix) for prefix, _, _ in checks],
+            [
+                SamplingParams(temperature=0.0, max_tokens=1, logprobs=2 * top_k)
+                for _, _, top_k in checks
+            ],
+        )
+
+    for (_, token, top_k), out in zip(checks, ranked):
+        top = out.outputs[0].logprobs[0]
+        assert token in top, f"top_k={top_k} sampled {token} outside {list(top)}"
+    if whole_model:
         assert accepted > 0, f"spec:{method} accepted no draft tokens"

@@ -1,11 +1,11 @@
 # Copyright 2026 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -19,14 +19,17 @@ config-signature, rank) file under VLLM_CACHE_ROOT.
 """
 
 import contextlib
+import dataclasses
 import errno
 import hashlib
 import os
 import re
+from collections.abc import Mapping
 
 import vllm.envs as envs
 
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.core.utils import is_strict_kv_producer
 from vllm_rbln.v1.worker.utils import dynamic_kv_enabled
 
 logger = init_logger(__name__)
@@ -76,11 +79,59 @@ def _npu_name() -> str:
         return "unknown"
 
 
-def _warmup_graph_set_factors(vllm_config) -> str:
+# Copy of the request-default keys local to
+# ModelConfig.get_diff_sampling_param().
+_SAMPLING_DEFAULT_KEYS = frozenset(
+    {
+        "repetition_penalty",
+        "presence_penalty",
+        "frequency_penalty",
+        "temperature",
+        "top_k",
+        "top_p",
+        "min_p",
+        "max_new_tokens",
+    }
+)
+
+
+@contextlib.contextmanager
+def _patched(obj, values: Mapping[str, object]):
+    if obj is None:
+        yield
+        return
+    saved = {name: getattr(obj, name) for name in values}
+    try:
+        for name, value in values.items():
+            object.__setattr__(obj, name, value)
+        yield
+    finally:
+        for name, value in saved.items():
+            object.__setattr__(obj, name, value)
+
+
+_REQUEST_LIMIT_FIELDS = {"max_logprobs": 0}
+
+
+def _draft_model(vllm_config):
+    spec = getattr(vllm_config, "speculative_config", None)
+    return getattr(spec, "draft_model_config", None)
+
+
+def _draft_model_hash(draft) -> str | None:
+    if draft is None:
+        return None
+    with _patched(draft, _REQUEST_LIMIT_FIELDS):
+        return draft.compute_hash()
+
+
+def _warmup_graph_set_factors(
+    vllm_config, extra_hash_factors: Mapping[str, object] | None = None
+) -> str:
     """Hash of the graph-shaping config that compute_hash() leaves out.
 
-    Decode buckets, KV cache input, decode query length, which drafter graphs
-    exist. Without them two runs share a bundle that only partly hits.
+    Includes caller-supplied factors for resolved graph sets. Without them
+    two runs can share a bundle that only partly hits.
     """
     from vllm.config.utils import hash_factors, normalize_value
 
@@ -88,7 +139,8 @@ def _warmup_graph_set_factors(vllm_config) -> str:
     cache = getattr(vllm_config, "cache_config", None)
     spec = getattr(vllm_config, "speculative_config", None)
     # Not draft_parallel_config: it carries the same per-launch ports.
-    draft = getattr(spec, "draft_model_config", None)
+    draft = _draft_model(vllm_config)
+    ec = vllm_config.ec_transfer_config
     factors: dict[str, object] = {
         "max_num_seqs": normalize_value(getattr(scheduler, "max_num_seqs", None)),
         "num_gpu_blocks_override": normalize_value(
@@ -102,54 +154,80 @@ def _warmup_graph_set_factors(vllm_config) -> str:
             getattr(spec, "num_speculative_tokens", None)
         ),
         "spec_method": normalize_value(getattr(spec, "method", None)),
-        "draft_model": draft.compute_hash() if draft is not None else None,
+        "draft_model": _draft_model_hash(draft),
         "draft_tensor_parallel_size": normalize_value(
             getattr(spec, "draft_tensor_parallel_size", None)
         ),
+        # compute_hash() takes in the EC config but leaves its role out.
+        "ec_role": ec.ec_role if ec is not None else None,
+        # Not kv_role itself: only the strict producer builds a different set.
+        "prefill_only": is_strict_kv_producer(vllm_config),
     }
+
+    if extra_hash_factors:
+        factors.update(
+            {name: normalize_value(value) for name, value in extra_hash_factors.items()}
+        )
     return hash_factors(factors)
 
 
+def _generation_config_factors(model_config) -> str:
+    from vllm.config.utils import hash_factors, normalize_value
+
+    effective = model_config.try_get_generation_config()
+    effective.update(model_config.override_generation_config)
+    return hash_factors(
+        {
+            k: normalize_value(v)
+            for k, v in effective.items()
+            if k not in _SAMPLING_DEFAULT_KEYS and k != "transformers_version"
+        }
+    )
+
+
 def _stable_compute_hash(vllm_config) -> str:
-    """compute_hash() leaks per-launch auto-queried ports via ParallelConfig
-    port fields; zero them around the call so the hash is launch-stable."""
-    import dataclasses
-
-    pc = getattr(vllm_config, "parallel_config", None)
-    saved: dict = {}
-    if pc is not None and dataclasses.is_dataclass(pc):
-        for field in dataclasses.fields(pc):
-            if "port" in field.name.lower():
-                try:
-                    saved[field.name] = getattr(pc, field.name)
-                    object.__setattr__(pc, field.name, 0)
-                except Exception:  # pylint: disable=broad-exception-caught
-                    saved.pop(field.name, None)
-    try:
+    """compute_hash() with the per-launch ParallelConfig ports zeroed, the
+    request limits pinned, and the generation config reset;
+    _generation_config_factors() keys the latter."""
+    pc = vllm_config.parallel_config
+    ports = {f.name: 0 for f in dataclasses.fields(pc) if "port" in f.name.lower()}
+    model_fields = {
+        "generation_config": "auto",
+        "override_generation_config": {},
+        **_REQUEST_LIMIT_FIELDS,
+    }
+    with (
+        _patched(pc, ports),
+        _patched(vllm_config.model_config, model_fields),
+        _patched(_draft_model(vllm_config), _REQUEST_LIMIT_FIELDS),
+    ):
         return vllm_config.compute_hash()
-    finally:
-        for name, value in saved.items():
-            with contextlib.suppress(Exception):
-                object.__setattr__(pc, name, value)
 
 
-def config_signature(vllm_config) -> str:
-    """vLLM config hash + warm-up graph set + rbln compile env + NPU name +
-    rebel major.minor; launch- and host-stable, shared by all TP/DP ranks (the
-    rank subdir isolates shards)."""
+def config_signature(
+    vllm_config, extra_hash_factors: Mapping[str, object] | None = None
+) -> str:
+    """vLLM config hash + generation config + warm-up graph set + rbln compile
+    env + NPU name + rebel major.minor; launch- and host-stable, shared by all
+    TP/DP ranks (the rank subdir isolates shards)."""
     cfg = _stable_compute_hash(vllm_config)
-    graphs = _warmup_graph_set_factors(vllm_config)
+    gen = _generation_config_factors(vllm_config.model_config)
+    graphs = _warmup_graph_set_factors(vllm_config, extra_hash_factors)
     env = _compile_env_factors()
     npu = _npu_name()
     rebel_ver = _rebel_major_minor()
     digest = hashlib.sha1(
-        "|".join([cfg, graphs, env, f"npu={npu}", f"rebel={rebel_ver}"]).encode("utf-8")
+        "|".join([cfg, gen, graphs, env, f"npu={npu}", f"rebel={rebel_ver}"]).encode(
+            "utf-8"
+        )
     )
     sig = digest.hexdigest()[:16]
     logger.info(
-        "mega-cache config_signature=%s (cfg=%s graphs=%s env=%s npu=%s rebel=%s)",
+        "mega-cache config_signature=%s (cfg=%s gen=%s graphs=%s env=%s npu=%s "
+        "rebel=%s)",
         sig,
         cfg[:8],
+        gen[:8],
         graphs[:8],
         env[:8],
         npu,

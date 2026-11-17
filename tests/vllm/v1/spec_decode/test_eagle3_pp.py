@@ -24,6 +24,7 @@ from types import SimpleNamespace
 import pytest
 from vllm.model_executor.models.minimax_m2 import MiniMaxM2Model
 
+from vllm_rbln.model_executor.models.minimax_m3 import RBLNMiniMaxM3Model
 from vllm_rbln.patches.axk2.model import AXK2Model
 from vllm_rbln.platform.vllm_impl import _validate_aux_hidden_states_pp_config
 from vllm_rbln.v1.spec_decode.eagle3_pp import (
@@ -33,12 +34,20 @@ from vllm_rbln.v1.spec_decode.eagle3_pp import (
 
 SUPPORTED = "MiniMaxM2ForCausalLM"
 SUPPORTED_AXK2 = "AXK2ForCausalLM"
+SUPPORTED_M3 = "MiniMaxM3SparseForConditionalGeneration"
+SUPPORTED_M3_TEXT = "MiniMaxM3SparseForCausalLM"
 UNSUPPORTED = "LlamaForCausalLM"
 
-# Each allowlisted architecture, with the class whose patched `forward` carries the
-# aux states across the split. Growing the allowlist has to touch this map, and the
-# assertion below then bites if the patch itself is missing.
-PATCHED_FORWARD_OWNERS = {SUPPORTED: MiniMaxM2Model, SUPPORTED_AXK2: AXK2Model}
+# Each allowlisted architecture, with the class whose `forward` carries the aux
+# states across the split: a replaced forward, or one the plugin's model defines.
+# Growing the allowlist has to touch this map, and the assertion below then bites
+# if that forward does not use the combined key.
+AUX_FORWARD_OWNERS = {
+    SUPPORTED: MiniMaxM2Model,
+    SUPPORTED_AXK2: AXK2Model,
+    SUPPORTED_M3_TEXT: RBLNMiniMaxM3Model,
+    SUPPORTED_M3: RBLNMiniMaxM3Model,
+}
 
 
 def _config(arch: str, pp_size: int, method="eagle3", eagle_config=None):
@@ -59,17 +68,19 @@ def _config(arch: str, pp_size: int, method="eagle3", eagle_config=None):
     )
 
 
-def test_the_allowlist_and_the_patched_forwards_agree():
-    assert set(PATCHED_FORWARD_OWNERS) == set(AUX_PP_TARGET_ARCHS)
-    for arch, model_cls in PATCHED_FORWARD_OWNERS.items():
-        assert model_cls.forward.__module__.startswith("vllm_rbln."), (
+def test_the_allowlist_and_the_aux_forwards_agree():
+    assert set(AUX_FORWARD_OWNERS) == set(AUX_PP_TARGET_ARCHS)
+    for arch, model_cls in AUX_FORWARD_OWNERS.items():
+        assert "AUX_COMBINED" in model_cls.forward.__code__.co_names, (
             f"{arch} is allowlisted for aux hidden states under pipeline "
-            f"parallelism, but "
-            f"{model_cls.__name__}.forward is still upstream's"
+            f"parallelism, but {model_cls.__name__}.forward does not use the "
+            "combined key"
         )
 
 
-@pytest.mark.parametrize("arch", [SUPPORTED, SUPPORTED_AXK2])
+@pytest.mark.parametrize(
+    "arch", [SUPPORTED, SUPPORTED_AXK2, SUPPORTED_M3_TEXT, SUPPORTED_M3]
+)
 def test_a_supported_target_is_accepted(arch):
     _validate_aux_hidden_states_pp_config(_config(arch, 4))
 
