@@ -550,8 +550,8 @@ class RBLNKVCacheManager(KVCacheManager):
         the model runner finishes the copies.  The caller must call
         :meth:`release_copy_ops` afterwards to free the refs.
         """
-        ops = self.pending_copy_ops
-        self.pending_copy_ops = []
+        # A ring's copy goes first: a sub-block hit lands on rows it covers.
+        ops: list[KVCacheCopyOp] = []
         for gid, manager in enumerate(self.coordinator.single_type_managers):
             if isinstance(manager, RBLNRingSlidingWindowManager):
                 ops += [
@@ -559,6 +559,8 @@ class RBLNKVCacheManager(KVCacheManager):
                     for src, dst, start in manager.pending_copies
                 ]
                 manager.pending_copies = []
+        ops += self.pending_copy_ops
+        self.pending_copy_ops = []
         return ops
 
     def release_copy_ops(self, ops: list[KVCacheCopyOp]) -> None:

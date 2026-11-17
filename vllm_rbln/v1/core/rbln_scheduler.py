@@ -135,6 +135,9 @@ class RBLNScheduler(Scheduler):
             cache_dtype=self.cache_config.cache_dtype,
             sub_block_size=rbln_config.sub_block_size,
         )
+        if rbln_config.use_swa_ring and sub_block_size is None:
+            # Only RBLNKVCacheManager hands the ring's copies to the runner.
+            raise NotImplementedError("use_swa_ring needs sub-block prefix caching.")
         if sub_block_size is not None:
             hash_fn = get_hash_fn_by_name(self.cache_config.prefix_caching_hash_algo)
             init_none_hash(hash_fn)
