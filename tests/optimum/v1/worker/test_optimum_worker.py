@@ -59,14 +59,7 @@ def test_memory_sizing_applies_prepared_block_count(
         additional_config=build_optimum_rbln_config({}),
     )
     cfg.additional_config.attn_block_size = 1024
-    metadata = {
-        "batch_size": 2,
-        "max_seq_len": 8192,
-        "kvcache_block_size": 1024,
-        "kvcache_num_blocks": 8,
-        "prefill_chunk_size": 256,
-        "num_devices": 1,
-    }
+    metadata = {"kvcache_num_blocks": 8}
     worker = make_worker(ProfilerConfig())
     worker.model_runner = SimpleNamespace(
         vllm_config=cfg,
@@ -75,9 +68,7 @@ def test_memory_sizing_applies_prepared_block_count(
         model=SimpleNamespace(
             kv_block_adapter=KVCacheBlockAdapter(cfg, 8),
             rbln_model_config=(
-                SimpleNamespace(**metadata, dtype=torch.bfloat16)
-                if config_as_object
-                else {**metadata, "dtype": "bfloat16"}
+                SimpleNamespace(**metadata) if config_as_object else metadata
             ),
         ),
     )
