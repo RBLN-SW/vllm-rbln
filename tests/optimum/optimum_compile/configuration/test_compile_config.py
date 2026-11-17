@@ -37,7 +37,7 @@ def npu_name(monkeypatch):
     )
 
 
-def _vllm_config(hf_config, *, optimum_overrides=None, user_chunk=None):
+def _vllm_config(hf_config, *, optimum_overrides=None, prefill_chunk_size=None):
     return SimpleNamespace(
         model_config=SimpleNamespace(
             model="org/model",
@@ -55,7 +55,7 @@ def _vllm_config(hf_config, *, optimum_overrides=None, user_chunk=None):
         additional_config=build_optimum_rbln_config(
             {
                 "optimum_overrides": optimum_overrides or {},
-                "user_max_num_batched_tokens": user_chunk,
+                "prefill_chunk_size": prefill_chunk_size,
             }
         ),
     )
@@ -122,11 +122,21 @@ def test_dtype_override_points_to_vllm_dtype():
         prepare_compile_config(cfg)
 
 
-def test_user_chunk_conflicting_with_override_is_rejected():
+@pytest.mark.parametrize(
+    "arch, overrides",
+    [
+        ("Qwen3ForCausalLM", {"prefill_chunk_size": 256}),
+        (
+            "Gemma4ForConditionalGeneration",
+            {"language_model": {"prefill_chunk_size": 256}},
+        ),
+    ],
+)
+def test_prefill_chunk_size_conflicting_with_override_is_rejected(arch, overrides):
     cfg = _vllm_config(
-        Qwen3Config(architectures=["Qwen3ForCausalLM"]),
-        optimum_overrides={"prefill_chunk_size": 256},
-        user_chunk=512,
+        PretrainedConfig(architectures=[arch]),
+        optimum_overrides=overrides,
+        prefill_chunk_size=512,
     )
     with pytest.raises(ValueError, match="Conflicting prefill chunk size"):
         prepare_compile_config(cfg)
@@ -195,7 +205,7 @@ class TestCompileCacheName:
         assert cfg.additional_config.compile_config.npu_name == "RBLN-CA25"
         assert compile_cache_name(cfg.additional_config.compile_config) == original
 
-    def test_user_max_num_batched_tokens_changes_hash(self, vllm_config_factory):
+    def test_prefill_chunk_size_changes_hash(self, vllm_config_factory):
         # Two runs that would compile different prefill chunk sizes must not
         # collide on the same cache key.
         name_512 = compile_cache_name(
@@ -206,20 +216,11 @@ class TestCompileCacheName:
         )
         assert name_512 != name_256
 
-    def test_unset_differs_from_explicit(self, vllm_config_factory):
-        name_unset = compile_cache_name(
-            vllm_config_factory(None).additional_config.compile_config
-        )
-        name_512 = compile_cache_name(
-            vllm_config_factory(512).additional_config.compile_config
-        )
-        assert name_unset != name_512
-
-    def test_same_value_same_hash(self, vllm_config_factory):
-        assert compile_cache_name(
-            vllm_config_factory(512).additional_config.compile_config
-        ) == compile_cache_name(
-            vllm_config_factory(512).additional_config.compile_config
+    def test_scheduling_budget_does_not_change_hash(self, vllm_config_factory):
+        first = vllm_config_factory(256, max_num_batched_tokens=8192)
+        second = vllm_config_factory(256, max_num_batched_tokens=16384)
+        assert compile_cache_name(first.additional_config.compile_config) == (
+            compile_cache_name(second.additional_config.compile_config)
         )
 
     def test_dtype_changes_hash(self, vllm_config_factory):
@@ -313,7 +314,7 @@ class TestCompileCacheName:
 
 
 @pytest.mark.parametrize(
-    "architecture, overrides, user_chunk, expected_chunk, default_calls",
+    "architecture, overrides, prefill_chunk_size, expected_chunk, default_calls",
     [
         ("LlamaForCausalLM", {}, None, 256, 1),
         ("LlamaForCausalLM", {"prefill_chunk_size": 384}, None, 384, 0),
@@ -328,8 +329,13 @@ class TestCompileCacheName:
         ("PaliGemmaForConditionalGeneration", {}, None, 8192, 0),
     ],
 )
-def test_compile_config_resolves_chunk_before_considering_the_npu_default(
-    monkeypatch, architecture, overrides, user_chunk, expected_chunk, default_calls
+def test_compile_config_resolve_chunk_before_considering_the_npu_default(
+    monkeypatch,
+    architecture,
+    overrides,
+    prefill_chunk_size,
+    expected_chunk,
+    default_calls,
 ):
     from vllm_rbln.utils.optimum.configuration import compile_config as compile_module
 
@@ -343,7 +349,7 @@ def test_compile_config_resolves_chunk_before_considering_the_npu_default(
     cfg = _vllm_config(
         PretrainedConfig(architectures=[architecture]),
         optimum_overrides=overrides,
-        user_chunk=user_chunk,
+        prefill_chunk_size=prefill_chunk_size,
     )
     inputs = prepare_compile_config(cfg)
     decoder_config = inputs.rbln_config.get("language_model", inputs.rbln_config)
