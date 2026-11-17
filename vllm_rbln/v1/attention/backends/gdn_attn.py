@@ -17,8 +17,12 @@
 A layer's state is a `MambaSpec` block declared as a full-attention KV page, so
 the layers sharing a buffer are one graph input with one chiplet cut. The
 kernels read a state prefix of each local page and preserve the trailing
-padding. A request holds one state block (`mamba_block_size` is the model
-length); a padding row uses null block 0.
+padding. A padding row uses null block 0.
+
+The builder addresses the block a row loads (its last computed token's) and
+the block it stores to (its last scheduled token's) by the group's block table.
+They differ only under prefix caching ("align", a state a KV block), when a
+step enters a new block.
 
 The short-conv ring is a block-aux cache on the same block ids, its channels
 in the delta-rule kernels' key-head order (`grouped_qkv_rows`).
@@ -60,20 +64,23 @@ class RBLNGDNAttentionMetadata(GDNAttentionMetadata):
 
     A step is one prefill request or a decode batch, never both and never
     speculative, so the `spec_*` fields and the ones for upstream's own kernels
-    stay unset. The state indices are padded to the step's batch and stay int16
-    on the host: the kernels read them through the const buffer, and a device
-    copy crashes the runtime.
+    stay unset. `has_initial_state` is [batch] int32 on the device, on a decode
+    step too: kda_conv takes it on every step, the chunk kernel on prefill. The
+    state blocks are padded to the step's batch and stay int16 on the host: the
+    kernels read them through the const buffer, and a device copy crashes the
+    runtime.
     """
 
     # The compiled step's batch: 1 on prefill, the padded batch on decode.
     batch_size: int
-    # [batch] int16 on the host: the state block each row stores.
-    store_state_indices: torch.Tensor
+    # [batch] int16 on the host: the block each row loads its state from and
+    # the block it stores it to.
+    load_blocks: torch.Tensor
+    store_blocks: torch.Tensor
     # [batch] int32 on the device: kda_conv's per-row operands.
     conv_load_blocks: torch.Tensor
     conv_start_positions: torch.Tensor
     conv_query_lens: torch.Tensor
-    conv_has_initial_state: torch.Tensor
     conv_store_blocks: torch.Tensor
     # [1, 1, largest prefill chunk] float32 on prefill: 1 for valid tokens, 0
     # for padding. The layer takes the step's chunk of it.
@@ -110,6 +117,18 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
     def _padded(self, values: torch.Tensor, batch: int) -> torch.Tensor:
         """`values` as int32, padded with 0 to the step's `batch` rows."""
         return rbln_utils.pad(values.to(torch.int32), 0, batch)
+
+    def _get_state_blocks(
+        self, block_table: torch.Tensor, num_tokens: torch.Tensor, batch: int
+    ) -> torch.Tensor:
+        """Each request's block holding its state after `num_tokens` tokens."""
+        blocks = mamba_get_block_table_tensor(
+            block_table,
+            num_tokens,
+            self.kv_cache_spec,
+            self.vllm_config.cache_config.mamba_cache_mode,
+        )
+        return self._padded(blocks[:, 0], batch)
 
     def build(  # type: ignore[override]
         self,
@@ -151,26 +170,19 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
             num_prefill_tokens = 0
             num_decodes = num_reqs
 
-        # TODO(prefix caching): a row stores to the block it loads, which holds
-        # while mamba_block_size is the model length (one block-table column).
-        block_table_tensor = mamba_get_block_table_tensor(
-            m.block_table_tensor,
-            m.seq_lens,
-            self.kv_cache_spec,
-            self.vllm_config.cache_config.mamba_cache_mode,
+        block_table = m.block_table_tensor[:num_reqs]
+        load_blocks = self._get_state_blocks(
+            block_table, context_lens_tensor, batch_size
         )
-        blocks = self._padded(block_table_tensor[:num_reqs, 0], batch_size)
-        non_spec_state_indices_tensor = blocks.to(torch.int16)
+        store_blocks = self._get_state_blocks(
+            block_table, m.seq_lens[:num_reqs], batch_size
+        )
 
         valid_mask = None
         if is_prefill:
             max_chunk = self.chunked_prefill_size
             valid_mask = (torch.arange(max_chunk) < query_lens[0]).to(torch.float32)
             valid_mask = valid_mask.view(1, 1, max_chunk)
-        has_initial_state = self._padded(context_lens_tensor > 0, batch_size)
-        prefill_has_initial_state = (
-            has_initial_state.to(torch.int16) if is_prefill else None
-        )
         return RBLNGDNAttentionMetadata(
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
@@ -179,23 +191,20 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
             num_spec_decodes=0,
             num_spec_decode_tokens=0,
             num_actual_tokens=m.num_actual_tokens,
-            has_initial_state=prefill_has_initial_state,
-            non_spec_state_indices_tensor=non_spec_state_indices_tensor,
-            prefill_state_indices=non_spec_state_indices_tensor if is_prefill else None,
-            prefill_has_initial_state=prefill_has_initial_state,
+            has_initial_state=self._stage(
+                self._padded(context_lens_tensor > 0, batch_size), "has_initial_state"
+            ),
             batch_size=batch_size,
-            store_state_indices=blocks.to(torch.int16),
-            conv_load_blocks=self._stage(blocks, "conv_load_blocks"),
+            load_blocks=load_blocks.to(torch.int16),
+            store_blocks=store_blocks.to(torch.int16),
+            conv_load_blocks=self._stage(load_blocks, "conv_load_blocks"),
             conv_start_positions=self._stage(
                 self._padded(first_positions, batch_size), "conv_start_positions"
             ),
             conv_query_lens=self._stage(
                 self._padded(query_lens, batch_size), "conv_query_lens"
             ),
-            conv_has_initial_state=self._stage(
-                has_initial_state, "conv_has_initial_state"
-            ),
-            conv_store_blocks=self._stage(blocks, "conv_store_blocks"),
+            conv_store_blocks=self._stage(store_blocks, "conv_store_blocks"),
             valid_mask=None
             if valid_mask is None
             else self._stage(valid_mask, "valid_mask"),
