@@ -195,6 +195,11 @@ class RBLNFlashAttentionMetadata:
         )
 
 
+# Slots built from the step alone, never from the KV cache group's spec or
+# block table, so every group of one runner stages the same values.
+_STEP_ONLY_SLOTS = frozenset({"seq_idx", "mm_prefix_row_ends", "num_accepted"})
+
+
 class RBLNFlashAttentionMetadataBuilder(
     AttentionMetadataBuilder[RBLNFlashAttentionMetadata]
 ):
@@ -243,6 +248,9 @@ class RBLNFlashAttentionMetadataBuilder(
             )
 
         self._staged: dict[tuple, torch.Tensor] = {}
+        # The runner points this at one dict for all of its builders, so a
+        # step-only slot reaches the graph as one input across KV cache groups.
+        self.step_staged: dict[tuple, torch.Tensor] = {}
 
     def _stage(self, t: torch.Tensor | None, slot: str) -> torch.Tensor | None:
         """Copy a host tensor into this builder's persistent device buffer.
@@ -252,16 +260,17 @@ class RBLNFlashAttentionMetadataBuilder(
         would silently make them share one buffer.
 
         The returned tensor is overwritten by the next build() call, so the
-        caller must run the forward pass before building again. That holds
-        because each AttentionGroup owns its own builder instance and every
-        build() is immediately followed by a forward.
+        caller must run the forward pass before building again. A step-only
+        slot is shared by the runner's builders, which all stage the same value
+        for one step before that step's forward.
         """
         if t is None:
             return None
+        staged = self.step_staged if slot in _STEP_ONLY_SLOTS else self._staged
         key = (slot, t.shape, t.dtype)
-        if (buf := self._staged.get(key)) is None:
+        if (buf := staged.get(key)) is None:
             buf = torch.empty(t.shape, dtype=t.dtype, device=self.device)
-            self._staged[key] = buf
+            staged[key] = buf
         buf.copy_(t)
         return buf
 

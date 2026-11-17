@@ -233,6 +233,31 @@ class TestBuildCommonIndices:
         # positions[[0, 3]] = [0, 30]
         assert md.seq_lens.reshape(-1).tolist() == [0, 30]
 
+    def test_builders_sharing_step_staged_share_seq_idx_only(self, cfg):
+        # One tensor object is one graph input: KV cache groups must hand the
+        # graph the same seq_idx, but each keeps its own block table.
+        step_staged: dict = {}
+        builders = [make_builder(cfg), make_builder(cfg)]
+        for builder in builders:
+            builder.step_staged = step_staged
+        mds = [
+            builder.build(
+                _cam(
+                    num_reqs=2,
+                    query_start_loc=[0, 1, 2],
+                    seq_lens=[5, 8],
+                    block_table=table,
+                ),
+                torch.tensor([4, 7]),
+                batch_pad=2,
+                is_prefill=False,
+            )
+            for builder, table in zip(builders, [[[1], [2]], [[3], [4]]])
+        ]
+        assert mds[0].seq_lens is mds[1].seq_lens
+        assert mds[0].block_tables is not mds[1].block_tables
+        assert mds[1].block_tables.reshape(-1).tolist() == [3, 4]
+
 
 class TestBuildPrefillCausal:
     def test_no_mask_and_block_tables_flattened(self, cfg):

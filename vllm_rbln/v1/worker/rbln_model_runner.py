@@ -3325,6 +3325,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     else None,
                     num_metadata_builders=1,  # not use ubatching
                 )
+        step_staged: dict[tuple, torch.Tensor] = {}
+        for attn_groups in self.attn_groups:
+            for attn_group in attn_groups:
+                builder = attn_group.get_metadata_builder(0)
+                if isinstance(builder, RBLNFlashAttentionMetadataBuilder):
+                    builder.step_staged = step_staged
 
         # Initialize drafter attention backend.
         if isinstance(self.drafter, DRAFT_MODEL_PROPOSERS):
