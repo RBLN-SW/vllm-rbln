@@ -78,10 +78,10 @@ pip install -e . --extra-index-url https://wheels.vllm.ai/0.31.0/cpu --extra-ind
 If installation fails with an error like the following, add the option below to your installation command:
 
 ```text
-vllm==0.30.0+cpu has no wheels with a matching platform tag
+vllm==0.31.0+cpu has no wheels with a matching platform tag
 (e.g., `manylinux_2_35_x86_64`)
 
-hint: Wheels are available for `vllm` (v0.30.0+cpu) on the following platforms:
+hint: Wheels are available for `vllm` (v0.31.0+cpu) on the following platforms:
 `manylinux_2_39_aarch64`, `manylinux_2_39_x86_64`
 ```
 
