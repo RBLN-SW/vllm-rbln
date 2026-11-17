@@ -14,9 +14,19 @@
 
 import functools
 
+from vllm.transformers_utils.model_arch_config_convertor import (
+    ModelArchConfigConvertorBase,
+)
+
+from vllm_rbln.patches.model_arch_config import register_convertor
 from vllm_rbln.patches.registry import add_registration, register_patch
 
 _MODULE = "vllm_rbln.model_executor.models.glm5_next"
+
+
+class Glm5NextMTPConvertor(ModelArchConfigConvertorBase):
+    def get_num_hidden_layers(self) -> int:
+        return self.hf_text_config.num_nextn_predict_layers
 
 
 @add_registration(
@@ -37,6 +47,21 @@ def register_glm5_next() -> None:
     )
     # The MTP drafter vLLM's speculative config selects for a glm5_next target.
     ModelRegistry.register_model("Glm5NextMTPModel", f"{_MODULE}:RBLNGlm5NextMTP")
+
+
+@add_registration(
+    reason=(
+        "Upstream has no model arch config convertor for glm5_next_mtp, the type "
+        "SpeculativeConfig gives a GLM-5.3 MTP draft, so the base convertor reports "
+        "the target's num_hidden_layers as the draft's layer count. Report "
+        "num_nextn_predict_layers, as upstream's DeepSeek and GLM-4 MoE MTP "
+        "convertors do."
+    )
+)
+def register_glm5_next_mtp_convertor() -> None:
+    # TODO(vllm): delete once upstream registers a glm5_next_mtp convertor;
+    # register_convertor raises from then on.
+    register_convertor("glm5_next_mtp", Glm5NextMTPConvertor)
 
 
 @add_registration(
