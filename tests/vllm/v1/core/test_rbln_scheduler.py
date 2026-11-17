@@ -2313,3 +2313,70 @@ def test_eagle_steps_through_adjacent_images_with_a_one_image_encoder_cache():
         out = sched.schedule()
         assert out.num_scheduled_tokens == {"0": 8}
         sched.update_from_output(out, make_model_runner_output(out))
+
+
+class TestStateBoundaryAdmission:
+    """An align-mode hybrid admits a pulled request whose producer names the
+    prompt's last block boundary: block 16, a 40-token prompt, 39 received."""
+
+    @staticmethod
+    def _scheduler(monkeypatch, *, sends_state_boundary):
+        from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec
+
+        from tests.vllm.v1.core.utils import MockKVConnector
+        from vllm_rbln.platform import RblnPlatform
+        from vllm_rbln.v1.kv_cache import RBLNMambaSpec
+
+        RblnPlatform.register_custom_kv_cache_specs(None)
+        monkeypatch.setattr(
+            MockKVConnector,
+            "connector_scheduler",
+            SimpleNamespace(sends_state_boundary=sends_state_boundary),
+            raising=False,
+        )
+        full = full_attention_spec(16)
+        state = RBLNMambaSpec(
+            block_size=16,
+            shapes=((full.page_size_bytes,),),
+            dtypes=(torch.uint8,),
+            mamba_cache_mode="align",
+        )
+        config = KVCacheConfig(
+            num_blocks=64,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(["attn"], full),
+                KVCacheGroupSpec(["state"], state),
+            ],
+            prefix_cache_retention_interval=0,
+        )
+        return create_rbln_scheduler(
+            enable_prefix_caching=True,
+            block_size=16,
+            max_num_batched_tokens=16,
+            max_model_len=128,
+            num_blocks=64,
+            use_kv_connector=MockKVConfig(matched_tokens=39),
+            kv_cache_config=config,
+        )
+
+    @pytest.mark.parametrize("sends_state_boundary", [True, False])
+    def test_the_boundary_block_is_allocated_where_the_connector_sends_it(
+        self, monkeypatch, sends_state_boundary
+    ):
+        from vllm_rbln.v1.kv_cache import REMOTE_STATE_BOUNDARY
+
+        sched = self._scheduler(monkeypatch, sends_state_boundary=sends_state_boundary)
+        request = make_request("d", list(range(40)), 16)
+        request.kv_transfer_params = {
+            "do_remote_prefill": True,
+            REMOTE_STATE_BOUNDARY: 32,
+        }
+        sched.add_request(request)
+
+        out = sched.schedule()
+
+        assert out.num_scheduled_tokens["d"] == 1
+        state = sched.kv_cache_manager.coordinator.single_type_managers[1]
+        blocks = state.req_to_blocks["d"]
+        assert [b.is_null for b in blocks] == [True, not sends_state_boundary, False]

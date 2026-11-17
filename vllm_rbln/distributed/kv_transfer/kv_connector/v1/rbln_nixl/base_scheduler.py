@@ -77,6 +77,10 @@ class RblnNixlSchedulerBase(NixlBaseConnectorScheduler):
     #: the worker's, so one reduction answers for both.
     _writes_into_peer: ClassVar[bool] = False
 
+    #: Whether this side exchanges a single-state SSM group's block-boundary
+    #: state, so `RBLNMambaManager` keeps or allocates a block for it.
+    sends_state_boundary: ClassVar[bool] = False
+
     @property
     def _sends_token_count(self) -> bool:
         """Whether the worker needs a request's token count in the metadata."""

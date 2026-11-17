@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections.abc import Iterator, Sequence
-from contextlib import contextmanager
+from collections.abc import Sequence
 from dataclasses import dataclass
 from math import prod
 
@@ -187,6 +186,16 @@ class RBLNSlidingWindowManager(SingleTypeKVCacheManager):
 REMOTE_STATE_BOUNDARY = "remote_state_boundary"
 
 
+def state_boundary_is_reachable(vllm_config: VllmConfig) -> bool:
+    """Whether a prefix lookup can land on a prompt's last block boundary.
+
+    An EAGLE/MTP block drop backs every hit off one block below it, so the state
+    there is never read.
+    """
+    spec = vllm_config.speculative_config
+    return spec is None or not spec.use_eagle_block_drop()
+
+
 def prompt_boundary_block(num_prompt_tokens: int, block_size: int) -> int | None:
     """The block holding the state at the prompt's last block boundary, when that
     is not the block holding the prompt's last state."""
@@ -258,32 +267,27 @@ class RBLNMambaManager(MambaManager):
             return
         self._received_boundary[request_id] = block_idx
 
-    @contextmanager
-    def _boundary_shielded(self, request_id: str) -> Iterator[None]:
-        # Upstream frees every state block behind the running one; hiding the
-        # kept block as null for the call is what both its paths skip.
-        block_idx = self._kept_boundary.get(request_id)
-        blocks = self.req_to_blocks.get(request_id, [])
-        if block_idx is None or block_idx >= len(blocks) or blocks[block_idx].is_null:
-            yield
-            return
-        block = blocks[block_idx]
-        blocks[block_idx] = self._null_block
-        try:
-            yield
-        finally:
-            blocks[block_idx] = block
-
     def remove_skipped_blocks(
         self,
         request_id: str,
         processed_computed_tokens: int,
         num_prompt_tokens: int | None = None,
     ) -> None:
-        with self._boundary_shielded(request_id):
+        # Upstream frees every state block behind the running one; hiding the
+        # kept block as null for the call is what both its paths skip.
+        block_idx = self._kept_boundary.get(request_id)
+        blocks = self.req_to_blocks.get(request_id, [])
+        kept = None
+        if block_idx is not None and block_idx < len(blocks):
+            kept = blocks[block_idx]
+            blocks[block_idx] = self._null_block
+        try:
             super().remove_skipped_blocks(
                 request_id, processed_computed_tokens, num_prompt_tokens
             )
+        finally:
+            if kept is not None:
+                blocks[block_idx] = kept
 
     def get_num_blocks_to_allocate(
         self,
@@ -306,9 +310,7 @@ class RBLNMambaManager(MambaManager):
             apply_admission_cap=apply_admission_cap,
             prefill_end=prefill_end,
         )
-        if request_id in self._received_boundary and not self.req_to_blocks.get(
-            request_id
-        ):
+        if request_id in self._received_boundary:
             num_blocks += 1
         return num_blocks
 

@@ -413,6 +413,46 @@ class TestStateBoundaryExchange:
     def test_clip_keeps_a_live_boundary_block(self, block_ids, expected):
         assert self._scheduler().get_exchange_clipped_blocks(block_ids) == expected
 
+    def test_a_consumer_pulls_into_its_boundary_block(self):
+        # The consumer reaches the clip through upstream's entry point.
+        sched = self._scheduler()
+        req = _Request("d", num_prompt_tokens=40)
+        req.kv_transfer_params = {
+            "do_remote_prefill": True,
+            "remote_block_ids": ([1, 2, 3], [7, 8]),
+            "remote_engine_id": "remote",
+            "remote_request_id": "d",
+            "remote_host": "localhost",
+            "remote_port": 5000,
+            REMOTE_STATE_BOUNDARY: 32,
+        }
+        blocks = MagicMock()
+        blocks.get_unhashed_block_ids_all_groups.return_value = ([4, 5, 6], [3, 9])
+        blocks.blocks = ([], [])
+
+        sched.update_state_after_alloc(req, blocks, 39)
+
+        assert sched._reqs_need_recv["d"][1] == ([4, 5, 6], [3, 9])
+
+    def test_a_block_drop_exchanges_the_running_state_alone(self):
+        # Under an EAGLE / MTP block drop no lookup lands on the boundary.
+        sched = self._scheduler()
+        sched.vllm_config.speculative_config = SimpleNamespace(
+            use_eagle_block_drop=lambda: True
+        )
+        clipped = sched.get_exchange_clipped_blocks(([1, 2, 3], [0, 7, 8]))
+        assert clipped == ([1, 2, 3], [8])
+
+    @pytest.mark.parametrize(
+        ("cls", "sends"),
+        [
+            (RblnNixlPullConnectorScheduler, True),
+            (RblnNixlPushConnectorScheduler, False),
+        ],
+    )
+    def test_only_the_pull_scheduler_exchanges_the_boundary(self, cls, sends):
+        assert cls.sends_state_boundary is sends
+
     @pytest.mark.parametrize(
         ("num_tokens", "ssm_blocks", "sent", "boundary"),
         [

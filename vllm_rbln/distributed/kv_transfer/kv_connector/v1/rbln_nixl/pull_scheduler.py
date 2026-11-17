@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
@@ -23,7 +23,11 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_scheduler import (
     RblnNixlSchedulerBase,
 )
-from vllm_rbln.v1.kv_cache import REMOTE_STATE_BOUNDARY, prompt_boundary_block
+from vllm_rbln.v1.kv_cache import (
+    REMOTE_STATE_BOUNDARY,
+    prompt_boundary_block,
+    state_boundary_is_reachable,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.request import Request
@@ -31,6 +35,8 @@ if TYPE_CHECKING:
 
 class RblnNixlPullConnectorScheduler(RblnNixlSchedulerBase, NixlPullConnectorScheduler):
     """Scheduler side of the read path."""
+
+    sends_state_boundary: ClassVar[bool] = True
 
     def get_exchange_clipped_blocks(
         self, block_ids: BlockIds, clip_ssm: bool = True
@@ -50,6 +56,7 @@ class RblnNixlPullConnectorScheduler(RblnNixlSchedulerBase, NixlPullConnectorSch
             or not clipped
             or not self._is_hma_required
             or self._ssm_state_slots_are_positional
+            or not state_boundary_is_reachable(self.vllm_config)
         ):
             return clipped
         selected = self.kv_cache_config.select_transfer_block_ids(block_ids)

@@ -59,7 +59,7 @@ from vllm_rbln.v1.core.utils import (
     should_defer_spec_step,
     sub_block_size_in_use,
 )
-from vllm_rbln.v1.kv_cache import RBLNMambaManager
+from vllm_rbln.v1.kv_cache import RBLNMambaManager, state_boundary_is_reachable
 
 logger = init_logger(__name__)
 
@@ -195,11 +195,20 @@ class RBLNScheduler(Scheduler):
         self._prefill_chunk_size = rbln_config.max_prefill_chunk_size
         self._is_mm_prefix_lm = self.vllm_config.model_config.is_mm_prefix_lm
 
-        self._state_transfer_managers = [
-            manager
-            for manager in self.kv_cache_manager.coordinator.single_type_managers
-            if isinstance(manager, RBLNMambaManager)
-        ]
+        # NOTE(RBLN): a prompt's block-boundary state is kept by a producer and
+        # allocated by a consumer only where the connector exchanges it and a
+        # prefix lookup can land on it.
+        connector_scheduler = getattr(self.connector, "connector_scheduler", None)
+        self._state_transfer_managers = (
+            [
+                manager
+                for manager in self.kv_cache_manager.coordinator.single_type_managers
+                if isinstance(manager, RBLNMambaManager)
+            ]
+            if getattr(connector_scheduler, "sends_state_boundary", False)
+            and state_boundary_is_reachable(self.vllm_config)
+            else []
+        )
 
         # NOTE(RBLN): the sparse-attention ops (DSA MLA / indexer, MiniMax-M3
         # MSA / indexer, GLM5 MLA / indexer) get NULL_BLOCK_ID as null_block_id
@@ -898,13 +907,14 @@ class RBLNScheduler(Scheduler):
                         for i in encoder_inputs_to_schedule
                     )
 
-                if self.connector is not None:
-                    for manager in self._state_transfer_managers:
-                        manager.track_transfer(
-                            request,
-                            num_new_local_computed_tokens,
-                            num_external_computed_tokens,
-                        )
+                # NOTE(RBLN): before allocate_slots, whose
+                # get_num_blocks_to_allocate counts the boundary block noted here.
+                for manager in self._state_transfer_managers:
+                    manager.track_transfer(
+                        request,
+                        num_new_local_computed_tokens,
+                        num_external_computed_tokens,
+                    )
 
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
