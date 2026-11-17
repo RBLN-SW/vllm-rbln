@@ -73,7 +73,7 @@ def main(
         chat_template = f.read()
 
     print("Query: string & Document: string")
-    outputs = llm.score(query, document)
+    outputs = llm.score(query, document, chat_template=chat_template)
     print("Relevance scores:", [output.outputs.score for output in outputs])
 
     print("Query: string & Document: text")
