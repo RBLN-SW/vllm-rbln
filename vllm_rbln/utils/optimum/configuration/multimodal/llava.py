@@ -23,6 +23,7 @@ def build_llava_config(
     num_devices: int,
     memory_budget: float,
     prefill_chunk_size: int | None = None,
+    num_blocks: int | None = None,
 ) -> dict:
     rbln_config = {
         "vision_tower": {"output_hidden_states": True},
@@ -33,6 +34,7 @@ def build_llava_config(
             num_devices,
             memory_budget,
             prefill_chunk_size,
+            num_blocks,
         ),
     }
     return rbln_config

@@ -263,7 +263,14 @@ def prepare_compile_config(vllm_config: VllmConfig) -> OptimumRBLNCompileConfig:
             "not support chunked prefill. Leave --rbln-prefill-chunk-size unset."
         )
 
+    hf_config = model_config.hf_config
     optimum_overrides = deepcopy(additional_config.optimum_overrides)
+    if num_blocks is not None and (
+        is_generation_arch(hf_config) or is_multi_modal(hf_config)
+    ):
+        # resolve_explicit_num_blocks already accounted for these overrides.
+        for config in language_model_configs(optimum_overrides):
+            config.pop("kvcache_num_blocks", None)
     if optimum_overrides.get("dtype") is not None:
         raise ValueError(
             "`dtype` cannot be set in `additional_config`'s `optimum_overrides`. "
@@ -273,13 +280,16 @@ def prepare_compile_config(vllm_config: VllmConfig) -> OptimumRBLNCompileConfig:
         )
     set_submodule_num_devices(optimum_overrides)
 
-    hf_config = model_config.hf_config
     if is_generation_arch(hf_config):
-        model_cls, rbln_config = _for_decoder(vllm_config, optimum_overrides)
+        model_cls, rbln_config = _for_decoder(
+            vllm_config, optimum_overrides, num_blocks
+        )
     elif is_pooling_arch(hf_config):
         model_cls, rbln_config = _for_pooling(vllm_config, optimum_overrides)
     elif is_multi_modal(hf_config):
-        model_cls, rbln_config = _for_multimodal(vllm_config, optimum_overrides)
+        model_cls, rbln_config = _for_multimodal(
+            vllm_config, optimum_overrides, num_blocks
+        )
     elif is_enc_dec_arch(hf_config):
         model_cls, rbln_config = _for_enc_dec(vllm_config, optimum_overrides)
     else:
@@ -287,13 +297,6 @@ def prepare_compile_config(vllm_config: VllmConfig) -> OptimumRBLNCompileConfig:
         raise NotImplementedError(
             f"Compilation is not implemented for architecture {architectures[0]}"
         )
-
-    explicit_decoder_blocks = num_blocks is not None and (
-        is_generation_arch(hf_config) or is_multi_modal(hf_config)
-    )
-    if explicit_decoder_blocks:
-        decoder_config = language_model_configs(rbln_config)[0]
-        del decoder_config["memory_budget"]
 
     # optimum_overrides must not overwrite fields vllm derives from its own
     # config (batch_size, max_seq_len, memory_budget, ...); a silent
@@ -308,9 +311,6 @@ def prepare_compile_config(vllm_config: VllmConfig) -> OptimumRBLNCompileConfig:
             )
         merge_overrides(rbln_config, optimum_overrides)
 
-    if explicit_decoder_blocks:
-        decoder_config["kvcache_num_blocks"] = num_blocks
-
     return OptimumRBLNCompileConfig(
         model=str(model_config.model),
         dtype=model_config.dtype,
@@ -324,6 +324,7 @@ def prepare_compile_config(vllm_config: VllmConfig) -> OptimumRBLNCompileConfig:
 def _for_decoder(
     vllm_config: VllmConfig,
     optimum_overrides: dict[str, Any],
+    num_blocks: int | None,
 ) -> tuple[Any, dict[str, Any]]:
     from optimum.rbln import RBLNAutoModelForCausalLM
 
@@ -358,9 +359,12 @@ def _for_decoder(
         "batch_size": batch_size,
         "max_seq_len": max_model_len,
         "kvcache_block_size": block_size,
-        "memory_budget": cache_config.gpu_memory_utilization,
         "prefill_chunk_size": prefill_chunk_size,
     }
+    if num_blocks is None:
+        rbln_config["memory_budget"] = cache_config.gpu_memory_utilization
+    else:
+        rbln_config["kvcache_num_blocks"] = num_blocks
     if block_size != max_model_len:
         rbln_config["kvcache_partition_len"] = block_size
         rbln_config["attn_impl"] = "flash_attn"
@@ -420,6 +424,7 @@ def _for_pooling(
 def _for_multimodal(
     vllm_config: VllmConfig,
     optimum_overrides: dict[str, Any],
+    num_blocks: int | None,
 ) -> tuple[Any, dict[str, Any]]:
     import optimum.rbln
 
@@ -483,6 +488,7 @@ def _for_multimodal(
         num_devices,
         cache_config.gpu_memory_utilization,
         prefill_chunk_size,
+        num_blocks,
     )
     decoder_config = language_model_configs(rbln_config)[0]
     decoder_config["kvcache_block_size"] = block_size

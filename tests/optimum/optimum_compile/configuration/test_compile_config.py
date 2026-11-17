@@ -25,6 +25,7 @@ from vllm_rbln.utils.optimum.configuration.compile_config import (
     compile_cache_name,
     prepare_compile_config,
 )
+from vllm_rbln.utils.optimum.configuration.multimodal import MULTIMODAL_CONFIG_BUILDERS
 from vllm_rbln.utils.optimum.configuration.multimodal.qwen import (
     build_qwen3_5_config,
 )
@@ -225,6 +226,21 @@ def test_prefill_chunk_size_conflicting_with_override_is_rejected(arch, override
     )
     with pytest.raises(ValueError, match="Conflicting prefill chunk size"):
         prepare_compile_config(cfg)
+
+
+@pytest.mark.parametrize("model_name", MULTIMODAL_CONFIG_BUILDERS)
+@pytest.mark.parametrize("num_blocks", [None, 16])
+def test_multimodal_builders_select_memory_sizing(model_name, num_blocks):
+    config = MULTIMODAL_CONFIG_BUILDERS[model_name](
+        4, 8192, 1024, 1, 0.9, 256, num_blocks
+    )
+    decoder = config.get("language_model", config.get("text_model", config))
+    if num_blocks is None:
+        assert decoder["memory_budget"] == 0.9
+        assert "kvcache_num_blocks" not in decoder
+    else:
+        assert decoder["kvcache_num_blocks"] == num_blocks
+        assert "memory_budget" not in decoder
 
 
 class TestQwen35ConfigBuilder:

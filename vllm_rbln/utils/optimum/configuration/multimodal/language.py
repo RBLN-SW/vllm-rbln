@@ -21,14 +21,18 @@ def build_language_model_config(
     num_devices: int,
     memory_budget: float,
     prefill_chunk_size: int | None = None,
+    num_blocks: int | None = None,
 ) -> dict:
     rbln_config: dict = {
         "use_inputs_embeds": True,
         "batch_size": batch_size,
         "max_seq_len": max_model_len,
         "num_devices": num_devices,
-        "memory_budget": memory_budget,
     }
+    if num_blocks is None:
+        rbln_config["memory_budget"] = memory_budget
+    else:
+        rbln_config["kvcache_num_blocks"] = num_blocks
     if block_size != max_model_len:
         attn_impl = "flash_attn" if block_size != max_model_len else "eager"
         rbln_config["attn_impl"] = attn_impl
@@ -47,6 +51,7 @@ def build_language_model_wrapper_config(
     num_devices: int,
     memory_budget: float,
     prefill_chunk_size: int | None = None,
+    num_blocks: int | None = None,
 ) -> dict:
     return {
         "language_model": build_language_model_config(
@@ -56,5 +61,6 @@ def build_language_model_wrapper_config(
             num_devices,
             memory_budget,
             prefill_chunk_size,
+            num_blocks,
         ),
     }

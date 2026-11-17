@@ -21,14 +21,18 @@ def build_qwen2_vl_config(
     num_devices: int,
     memory_budget: float,
     prefill_chunk_size: int | None = None,
+    num_blocks: int | None = None,
 ) -> dict:
     rbln_config: dict = {
         "num_devices": num_devices,
         "max_seq_len": max_model_len,
         "batch_size": batch_size,
         "use_inputs_embeds": True,
-        "memory_budget": memory_budget,
     }
+    if num_blocks is None:
+        rbln_config["memory_budget"] = memory_budget
+    else:
+        rbln_config["kvcache_num_blocks"] = num_blocks
     if block_size != max_model_len:
         attn_impl = "flash_attn" if block_size != max_model_len else "eager"
         rbln_config["kvcache_partition_len"] = block_size

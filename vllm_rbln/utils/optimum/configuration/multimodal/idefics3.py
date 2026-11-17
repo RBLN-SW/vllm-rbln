@@ -23,6 +23,7 @@ def build_idefics3_config(
     num_devices: int,
     memory_budget: float,
     prefill_chunk_size: int | None = None,
+    num_blocks: int | None = None,
 ) -> dict:
     language_model_config = build_language_model_config(
         batch_size,
@@ -31,5 +32,6 @@ def build_idefics3_config(
         num_devices,
         memory_budget,
         prefill_chunk_size,
+        num_blocks,
     )
     return {"text_model": language_model_config}
