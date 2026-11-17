@@ -818,6 +818,32 @@ class TestStage:
         assert first is second
         assert first.reshape(-1).tolist() == [10]
 
+    def test_distinct_staging_slots_keep_their_own_buffers(self, cfg):
+        # Several builds feed one unrolled forward, so each slot keeps its
+        # buffers instead of overwriting the previous build's.
+        builder = make_builder(cfg)
+
+        def run(offset, slot):
+            return builder.build(
+                _cam(
+                    num_reqs=1,
+                    query_start_loc=[0, 4],
+                    seq_lens=[4],
+                    block_table=[[1, 2, 3]],
+                ),
+                torch.arange(4) + offset,
+                batch_pad=1,
+                is_prefill=True,
+                staging_slot=slot,
+            ).seq_lens
+
+        first = run(0, 1)
+        second = run(10, 2)
+        assert first is not second
+        assert first.reshape(-1).tolist() == [0]
+        assert second.reshape(-1).tolist() == [10]
+        assert run(20, 0) is not first
+
 
 @pytest.mark.maybe_use_device
 class TestFlashImplInit:

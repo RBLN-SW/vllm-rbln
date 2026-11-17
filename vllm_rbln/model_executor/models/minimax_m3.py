@@ -111,6 +111,7 @@ from vllm_rbln.v1.attention.backends.minimax_m3 import (
     RBLNMiniMaxM3IndexerBackend,
     RBLNMiniMaxM3SparseBackend,
 )
+from vllm_rbln.v1.spec_decode import pass_state
 from vllm_rbln.v1.spec_decode.eagle3_pp import (
     AUX_COMBINED,
     aux_slots_captured,
@@ -583,7 +584,7 @@ class RBLNMiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         index_q, index_k = self.index_rotary_emb(positions, index_q, index_k)
 
         forward_context = get_forward_context()
-        attn_metadata = forward_context.attn_metadata
+        attn_metadata = pass_state.select(forward_context.attn_metadata)
         if isinstance(attn_metadata, dict):
             main_metadata = attn_metadata[self.layer_name]
             index_metadata = attn_metadata[self.indexer_cache.prefix]

@@ -181,3 +181,20 @@ class TestKvTransferWrap:
         assert connector["kv_cache"] is None
         # The attention op still resolves its own, from the metadata.
         assert forward_context["kv_cache"] is not None
+
+
+def test_a_metadata_list_is_read_at_the_current_pass(monkeypatch):
+    # An unrolled drafter region hands one metadata dict per pass; each pass
+    # resolves its own entry, not the first.
+    from vllm_rbln.v1.spec_decode import pass_state
+
+    per_pass = [{"layer.0": f"pass{i}"} for i in range(3)]
+    context = SimpleNamespace(
+        attn_metadata=per_pass,
+        no_compile_layers={"layer.0": object()},
+        slot_mapping={},
+    )
+    monkeypatch.setattr(attention, "get_forward_context", lambda: context)
+    for idx in range(3):
+        monkeypatch.setattr(pass_state, "PASS_IDX", idx)
+        assert attention.patched_get_attention_context("layer.0")[0] == f"pass{idx}"

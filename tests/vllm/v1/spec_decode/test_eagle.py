@@ -119,6 +119,21 @@ def _echo_model_exec(hidden_size):
     return executable
 
 
+def _echo_tail_exec(proposer, passes=None):
+    # The tail region's contract: the first pass's ids and hidden states in,
+    # [rows, num_speculative_tokens] target-space ids out. Echo semantics again:
+    # each column is the previous + 1. `passes` counts one entry per pass.
+    def executable(*, draft_ids, hidden_states, positions):
+        cols = [draft_ids.reshape(-1).to(torch.int32)]
+        for _ in range(proposer.num_speculative_tokens - 1):
+            if passes is not None:
+                passes.append(1)
+            cols.append((cols[-1] + 1) % 128)
+        return torch.stack(cols, dim=1)
+
+    return executable
+
+
 # The last slot of each request in _call_propose's [0, 2, 4] query layout.
 _LAST_SLOTS = torch.tensor([1, 3], dtype=torch.int32)
 
@@ -383,6 +398,7 @@ class TestPropose:
         builder = mock.Mock()
         proposer.draft_attn_groups[0].get_metadata_builder = lambda: builder
         proposer.model_executable = _echo_model_exec(proposer.hidden_size)
+        proposer.tail_executable = _echo_tail_exec(proposer)
 
         _call_propose(proposer)
 
@@ -423,6 +439,7 @@ class TestPropose:
         proposer = make_eagle_proposer(method="eagle", num_speculative_tokens=3)
         _wire_runner(proposer, num_reqs=2)
         proposer.model_executable = _echo_model_exec(proposer.hidden_size)
+        proposer.tail_executable = _echo_tail_exec(proposer)
 
         out = proposer.propose(
             target_token_ids=torch.tensor([10, 11, 20, 21], dtype=torch.int32),
@@ -452,6 +469,7 @@ class TestPropose:
             return echo(**kwargs)
 
         proposer.model_executable = counting
+        proposer.tail_executable = _echo_tail_exec(proposer, passes)
 
         out = _call_propose(proposer)
 
@@ -492,6 +510,7 @@ class TestPropose:
             return echo(**kwargs)
 
         proposer.model_executable = counting
+        proposer.tail_executable = _echo_tail_exec(proposer, passes)
 
         out = _call_propose(proposer)
 
@@ -530,6 +549,7 @@ class TestPropose:
             return echo(**kwargs)
 
         proposer.model_executable = counting
+        proposer.tail_executable = _echo_tail_exec(proposer, passes)
 
         _call_propose(proposer)
 
@@ -544,6 +564,7 @@ class TestPropose:
         _wire_runner(proposer, num_reqs=1)
         proposer.max_model_len = 3  # positions hit the cap on the second step
         proposer.model_executable = _echo_model_exec(proposer.hidden_size)
+        proposer.tail_executable = _echo_tail_exec(proposer)
 
         out = proposer.propose(
             target_token_ids=torch.tensor([7], dtype=torch.int32),
@@ -581,51 +602,91 @@ class TestPropose:
 
         assert out.cpu().tolist() == [[47], [67]]
 
-    def test_multi_step_feeds_the_mapped_id_forward(self, monkeypatch):
-        # Each draft is mapped before it becomes the next step's input: the draft
-        # head's input embedding is in target space even when its output head is
-        # not.
+    def test_the_tail_is_staged_before_the_first_pass_launches(self, monkeypatch):
+        # The tail's host inputs -- per-pass metadata and its first position --
+        # are built before the first pass, so nothing between the two launches
+        # waits on the device.
+        _neutralize(monkeypatch)
+        proposer = make_eagle_proposer(method="eagle", num_speculative_tokens=3)
+        _wire_runner(proposer, num_reqs=2)
+        order: list[str] = []
+        builds: list[dict] = []
+
+        def build(**kwargs):
+            order.append("build")
+            builds.append(
+                dict(kwargs, seq_lens=kwargs["common_attn_metadata"].seq_lens.clone())
+            )
+            return object()
+
+        proposer.draft_attn_groups[0].get_metadata_builder = lambda: SimpleNamespace(
+            build=build
+        )
+        echo = _echo_model_exec(proposer.hidden_size)
+
+        def first_pass(**kwargs):
+            order.append("first")
+            return echo(**kwargs)
+
+        tail = _echo_tail_exec(proposer)
+        tail_positions: list[torch.Tensor] = []
+
+        def tail_pass(**kwargs):
+            order.append("tail")
+            tail_positions.append(kwargs["positions"].cpu().clone())
+            return tail(**kwargs)
+
+        proposer.model_executable = first_pass
+        proposer.tail_executable = tail_pass
+
+        out = _call_propose(proposer)
+
+        assert order == ["build", "build", "build", "first", "tail"]
+        # One staging slot per pass, so the tail's two builds do not share
+        # buffers with each other or with the first pass.
+        assert [b["staging_slot"] for b in builds[1:]] == [1, 2]
+        assert [b["seq_lens"].tolist() for b in builds[1:]] == [[11, 12], [12, 13]]
+        # Positions of the last verified slots [1, 3], one step ahead.
+        assert tail_positions[0][:, 0].tolist() == [2, 4]
+        assert out.shape == (2, 3)
+        assert out.dtype == torch.int64
+
+    def test_a_first_pass_on_another_batch_is_repadded_for_the_tail(self, monkeypatch):
+        # A prefill's first pass runs unpadded while the tail runs the decode
+        # bucket, so its outputs are copied into the tail's padded batch.
         _neutralize(monkeypatch)
         proposer = make_eagle_proposer(method="eagle", num_speculative_tokens=2)
         _wire_runner(proposer, num_reqs=2)
-        d2t = torch.zeros(128, dtype=torch.long)
-        d2t[1], d2t[2], d2t[3], d2t[4] = 2, 3, 5, 8
-        proposer.draft_id_to_target_id = d2t
-        argmax_per_call = [[1, 3], [2, 4]]
-        seen: list[torch.Tensor] = []
-
-        def executable(
-            *,
-            input_ids,
-            positions,
-            hidden_states,
-            inputs_embeds,
-            token_indices_to_sample,
-        ):
-            ids = torch.zeros(8, dtype=torch.int64)
-            for row, tok in enumerate(argmax_per_call[len(seen)]):
-                ids[row] = tok
-            seen.append(input_ids.clone())
-            return (
-                hidden_states.reshape(-1, proposer.hidden_size),
-                ids.to(hidden_states.device),
-            )
-
-        proposer.model_executable = executable
-
-        out = proposer.propose(
-            target_token_ids=torch.tensor([10, 11, 20, 21], dtype=torch.int32),
-            target_positions=torch.tensor([4, 5, 6, 7], dtype=torch.int64),
-            target_hidden_states=torch.zeros(4, proposer.hidden_size),
-            next_token_ids=torch.tensor([30, 31], dtype=torch.int32),
-            token_indices_to_sample=torch.tensor([1, 3], dtype=torch.int32),
-            common_attn_metadata=make_cad([0, 2, 4], [10, 11]),
+        proposer.runner.shape_config = ShapeConfig(
+            decode_batch_buckets=[4],
+            find_bucket=lambda n: 4,
+            max_num_tokens=64,
+            specialized_moe_decode=False,
         )
+        h = proposer.hidden_size
 
-        # step 1 argmax [1, 3] -> [3, 8], which is what step 2 must be fed.
-        assert seen[1][:, 0].cpu().tolist() == [3, 8]
-        # step 2 argmax [2, 4] -> [5, 12].
-        assert out.cpu().tolist() == [[3, 5], [8, 12]]
+        def first_pass(**kwargs):
+            return torch.ones(2, h), torch.tensor([5, 6], device=proposer.device)
+
+        seen: list[tuple[torch.Tensor, torch.Tensor]] = []
+        tail = _echo_tail_exec(proposer)
+
+        def tail_pass(**kwargs):
+            seen.append(
+                (kwargs["draft_ids"].cpu().clone(), kwargs["hidden_states"].cpu())
+            )
+            return tail(**kwargs)
+
+        proposer.model_executable = first_pass
+        proposer.tail_executable = tail_pass
+
+        out = _call_propose(proposer)
+
+        ids, hidden = seen[0]
+        assert ids.tolist() == [5, 6, 0, 0]
+        assert hidden.shape == (4, h)
+        assert hidden[:2].eq(1).all() and hidden[2:].eq(0).all()
+        assert out.tolist() == [[5, 6], [6, 7]]
 
 
 class TestLoadModel:
@@ -855,6 +916,83 @@ class TestLoadModel:
         expected_ids = (expected_sample + 1).argmax(dim=-1)
         assert draft_ids.cpu().tolist() == expected_ids.tolist()
 
+    def test_eager_tail_feeds_the_mapped_id_forward(self, monkeypatch):
+        # Each pass's draft is mapped into target space before it becomes the
+        # next pass's input, positions advance one per pass, and every pass reads
+        # its own entry of the per-pass metadata list.
+        from vllm_rbln.v1.spec_decode import pass_state
+
+        proposer = make_eagle_proposer(num_speculative_tokens=3)
+        h = proposer.hidden_size
+        d2t = torch.zeros(h, dtype=torch.long)
+        d2t[1], d2t[2], d2t[3], d2t[4], d2t[7] = 2, 3, 5, 8, 1
+        argmax_per_call = [[2, 4], [7, 1]]
+        seen: list[tuple[list[int], list[int], int]] = []
+
+        class _Draft(TestLoadModel._FakeMappedDraft):
+            def __call__(self, *, input_ids, positions, hidden_states, inputs_embeds):
+                picks = argmax_per_call[len(seen)]
+                seen.append(
+                    (
+                        input_ids.view(-1).tolist(),
+                        positions.view(-1).tolist(),
+                        pass_state.PASS_IDX,
+                    )
+                )
+                last = torch.zeros(len(picks), 1, h)
+                last[torch.arange(len(picks)), 0, torch.tensor(picks)] = 1.0
+                return last, hidden_states + 1
+
+            def logits_processor(self, lm_head, hidden_states):
+                return hidden_states
+
+        model = _Draft(d2t)
+        self._stub_super_load_model(monkeypatch, model)
+        monkeypatch.setattr(
+            proposer.vllm_config.speculative_config, "enforce_eager", True
+        )
+        proposer.load_model(target_model=object())
+
+        out = proposer.tail_executable(
+            draft_ids=torch.tensor([1, 3]),
+            hidden_states=torch.zeros(2, h),
+            positions=torch.tensor([[10], [20]]),
+        )
+
+        # first pass [1, 3] -> [3, 8]; pass 2 [2, 4] -> [5, 12]; pass 3 [7, 1] -> [8, 3]
+        assert [s[0] for s in seen] == [[3, 8], [5, 12]]
+        assert [s[1] for s in seen] == [[10, 20], [11, 21]]
+        assert [s[2] for s in seen] == [0, 1]
+        assert pass_state.PASS_IDX == 0
+        assert out.tolist() == [[3, 5, 8], [8, 12, 3]]
+        assert out.dtype == torch.int32
+        assert model.compute_logits_calls == 0
+
+    def test_a_single_token_draft_compiles_no_tail(self, monkeypatch):
+        self._stub_super_load_model(monkeypatch)
+        compiled: list[str] = []
+
+        def _fake_compile(fn, **kw):
+            compiled.append(fn.__name__)
+            return object()
+
+        monkeypatch.setattr(eagle_module, "compile", _fake_compile)
+        monkeypatch.setattr(eagle_module, "build_process_group_dict", lambda: {})
+        for num_spec, expected in (
+            (1, ["model_wrapper"]),
+            (3, ["model_wrapper", "tail_wrapper"]),
+        ):
+            compiled.clear()
+            proposer = make_eagle_proposer(num_speculative_tokens=num_spec)
+            monkeypatch.setattr(
+                proposer.vllm_config.speculative_config, "enforce_eager", False
+            )
+            proposer.runner = SimpleNamespace(
+                compile_context=object(), runtime_holder=[None]
+            )
+            proposer.load_model(target_model=object())
+            assert compiled == expected
+
 
 class TestDummyRun:
     @staticmethod
@@ -919,6 +1057,7 @@ class TestDummyRun:
             ), torch.zeros(8, dtype=torch.int64)
 
         proposer.model_executable = executable
+        proposer.tail_executable = _echo_tail_exec(proposer, calls)
         proposer.builds = builds
         return proposer, calls
 
