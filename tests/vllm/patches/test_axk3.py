@@ -143,13 +143,7 @@ def test_forward_runs_only_the_layers_this_rank_built(monkeypatch):
     monkeypatch.setattr(dist_utils, "get_pp_indices", patched_get_pp_indices)
     group = SimpleNamespace(rank_in_group=0, world_size=1)
     monkeypatch.setattr(parallel_state, "get_pp_group", lambda: group)
-    monkeypatch.setattr(
-        axk3_model,
-        "get_forward_context",
-        lambda: SimpleNamespace(
-            attn_metadata={"attn": SimpleNamespace(is_prefill=False)}
-        ),
-    )
+    monkeypatch.setattr(axk3_model, "is_prefill_step", lambda: False)
 
     model = axk3_model.AXK3Model.__new__(axk3_model.AXK3Model)
     torch.nn.Module.__init__(model)
@@ -217,7 +211,7 @@ def test_decoder_layer_returns_topk_without_writing_the_shared_dict(
 def gated_residual_model(monkeypatch):
     """A two-layer AXK3Model with real Gated Residuals and token-local blocks.
 
-    `step.is_prefill` is the flag the model reads from the forward context, and
+    `step.is_prefill` is what the model's is_prefill_step() returns, and
     `read_dims` collects the rank of the residual each read was given.
     """
     import vllm.distributed.parallel_state as parallel_state
@@ -265,11 +259,7 @@ def gated_residual_model(monkeypatch):
     model.start_layer, model.end_layer = 0, 2
 
     step = SimpleNamespace(is_prefill=True)
-    monkeypatch.setattr(
-        axk3_model,
-        "get_forward_context",
-        lambda: SimpleNamespace(attn_metadata={"attn": step}),
-    )
+    monkeypatch.setattr(axk3_model, "is_prefill_step", lambda: step.is_prefill)
     read_dims = []
     plain_read = axk3_model.AXK3GatedResidual.read
 

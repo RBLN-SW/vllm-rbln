@@ -25,11 +25,6 @@ from rebel.ops.torch_custom_ops.sparse_attn_glm5 import hadamard_128
 from torch import nn
 from transformers import PretrainedConfig
 from transformers.feature_extraction_utils import BatchFeature
-
-try:  # the token-cut mHC kernels (rebellions-sw/rebel_compiler#15759)
-    from rebel.ops.torch_custom_ops.mhc import mhc_post, mhc_pre
-except ImportError:  # an older compiler: the plain mHC ops only
-    mhc_pre = mhc_post = None
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_pp_group,
@@ -101,6 +96,7 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec, MLAAttentionSpec
 import vllm_rbln.utils as rbln_utils
 from vllm_rbln.model_executor.models.interfaces import SupportsRBLNMultiModal
 from vllm_rbln.patches.attention import _resolve_kv_cache
+from vllm_rbln.utils import is_prefill_step
 from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadata,
 )
@@ -898,48 +894,37 @@ class RBLNGlm5NextDecoderLayer(nn.Module):
                 scale.repeat_interleave(lanes)
             )
 
-    def _plain_sublayer(self, streams, fn, scale, base, norm, sublayer):
+    def _sublayer(self, streams, fn, scale, base, norm, sublayer) -> torch.Tensor:
+        ops = torch.ops.rbln_custom_ops
+        streams_f32 = streams.float()
+        if is_prefill_step():
+            # The compiler cuts the mhc_* kernels by tokens over the chiplets, so
+            # the streams stay split between sublayers (fp32 holding bf16 values)
+            # and only the sublayer input is gathered.
+            logits = ops.mhc_mix(streams_f32, fn, scale, base, eps=self.rms_eps)
+            x = ops.mhc_read(streams_f32, logits, eps=self.hc_eps).to(norm.weight.dtype)
+            y = sublayer(norm(x))
+            return ops.mhc_write(
+                y.float(),
+                streams_f32,
+                logits,
+                post_mult=self.post_mult,
+                iters=self.sinkhorn_iters,
+                eps=self.hc_eps,
+            )
         batch, n, tokens, hidden = streams.shape
         flat = streams.transpose(1, 2).reshape(batch, tokens, n * hidden).float()
         flat = flat * torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.rms_eps)
         z = F.linear(flat, fn) * scale + base
         z_pre, z_post = z[..., :n], z[..., n : 2 * n]
-        comb = torch.ops.rbln_custom_ops.sinkhorn_normalize(
-            z[..., 2 * n :],
-            iters=self.sinkhorn_iters,
-            eps=self.hc_eps,
+        comb = ops.sinkhorn_normalize(
+            z[..., 2 * n :], iters=self.sinkhorn_iters, eps=self.hc_eps
         )
-        streams_f32 = streams.float()
-        x = torch.ops.rbln_custom_ops.hc_stream_reduce(
-            streams_f32, z_pre, eps=self.hc_eps
-        ).to(streams.dtype)
+        x = ops.hc_stream_reduce(streams_f32, z_pre, eps=self.hc_eps).to(streams.dtype)
         x = sublayer(norm(x))
-        return torch.ops.rbln_custom_ops.hc_residual_add(
+        return ops.hc_residual_add(
             x.float(), streams_f32, z_post, comb, post_mult=self.post_mult
         ).to(streams.dtype)
-
-    def _sublayer(self, streams, fn, scale, base, norm, sublayer) -> torch.Tensor:
-        if mhc_pre is None:
-            return self._plain_sublayer(streams, fn, scale, base, norm, sublayer)
-        # The compiler picks the path by the token count: a prefill chunk runs the
-        # mhc_* kernels, which keep the streams cut by tokens over the chiplets; a
-        # short step runs the plain mHC ops. A cut path keeps the streams fp32.
-        x, state = mhc_pre(
-            streams,
-            fn,
-            scale,
-            base,
-            rms_eps=self.rms_eps,
-            hc_eps=self.hc_eps,
-            iters=self.sinkhorn_iters,
-        )
-        return mhc_post(
-            sublayer(norm(x)),
-            state,
-            post_mult=self.post_mult,
-            iters=self.sinkhorn_iters,
-            hc_eps=self.hc_eps,
-        )
 
     def forward(self, streams: torch.Tensor) -> torch.Tensor:
         """streams [B, n, T, H] -> [B, n, T, H]."""

@@ -184,7 +184,7 @@ def _run(layer, hidden_states, prefill, monkeypatch, **kwargs):
 
     from vllm_rbln.patches import gemma4
 
-    monkeypatch.setattr(gemma4, "_is_prefill", lambda: prefill)
+    monkeypatch.setattr(gemma4, "is_prefill_step", lambda: prefill)
     positions = torch.arange(hidden_states.shape[-2])
     out, _ = gemma4.patched_gemma4_decoder_layer_forward(
         layer, positions, hidden_states, None, **kwargs

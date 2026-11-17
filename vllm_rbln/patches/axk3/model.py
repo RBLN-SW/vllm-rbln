@@ -38,7 +38,6 @@ from torch import nn
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
-from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -52,6 +51,7 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
 from vllm_rbln.patches.axk2 import model as _axk2_model
+from vllm_rbln.utils import is_prefill_step
 
 # Loaded at import time from the frozen copy, so mypy cannot see its classes
 # (nor `Indexer`, which `_without_indexer` swaps on the module).
@@ -362,10 +362,7 @@ class AXK3Model(nn.Module):
     ) -> torch.Tensor:
         if inputs_embeds is None:
             inputs_embeds = self.embed_input_ids(input_ids)
-        attn_metadata = get_forward_context().attn_metadata
-        if isinstance(attn_metadata, dict):
-            attn_metadata = next(iter(attn_metadata.values()))
-        is_prefill = attn_metadata.is_prefill
+        is_prefill = is_prefill_step()
 
         # Every stream starts as the embedding.
         if is_prefill:
