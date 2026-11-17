@@ -2416,7 +2416,7 @@ class TestStateBoundaryAdmission:
     prompt's last block boundary: block 16, a 40-token prompt, 39 received."""
 
     @staticmethod
-    def _scheduler(monkeypatch, *, sends_state_boundary):
+    def _scheduler(monkeypatch, *, sends_state_boundary, is_async=False):
         from vllm.v1.core.single_type_kv_cache_manager import (
             register_all_kvcache_specs,
         )
@@ -2456,7 +2456,7 @@ class TestStateBoundaryAdmission:
             max_num_batched_tokens=16,
             max_model_len=128,
             num_blocks=64,
-            use_kv_connector=MockKVConfig(matched_tokens=39),
+            use_kv_connector=MockKVConfig(matched_tokens=39, is_async=is_async),
             kv_cache_config=config,
         )
 
@@ -2480,3 +2480,46 @@ class TestStateBoundaryAdmission:
         state = sched.kv_cache_manager.coordinator.single_type_managers[1]
         blocks = state.req_to_blocks["d"]
         assert [b.is_null for b in blocks] == [True, not sends_state_boundary, False]
+
+    @pytest.mark.parametrize("failure", [None, "fail", "recompute"])
+    def test_a_failed_receive_leaves_no_cache_hit(self, monkeypatch, failure):
+        from vllm.v1.core.sched import scheduler as upstream_scheduler
+        from vllm.v1.outputs import KVConnectorOutput
+
+        from tests.vllm.v1.core.utils import MockKVConnector
+        from vllm_rbln.v1.kv_cache import REMOTE_STATE_BOUNDARY
+
+        # Upstream reports failed receives only for HMA connectors.
+        monkeypatch.setattr(upstream_scheduler, "SupportsHMA", MockKVConnector)
+        monkeypatch.setattr(
+            MockKVConnector,
+            "request_finished_all_groups",
+            lambda self, request, block_ids: (False, None),
+            raising=False,
+        )
+        sched = self._scheduler(monkeypatch, sends_state_boundary=True, is_async=True)
+        if failure is not None:
+            sched.recompute_kv_load_failures = failure == "recompute"
+        request = make_request("d", list(range(40)), 16)
+        request.kv_transfer_params = {
+            "do_remote_prefill": True,
+            REMOTE_STATE_BOUNDARY: 32,
+        }
+        sched.add_request(request)
+        out = sched.schedule()
+        state = sched.kv_cache_manager.coordinator.single_type_managers[1]
+        assert not state.req_to_blocks["d"][1].is_null
+
+        output = make_model_runner_output(out)
+        output.kv_connector_output = KVConnectorOutput(
+            finished_recving={"d"},
+            failed_recving={"d"} if failure else set(),
+        )
+        sched.update_from_output(out, output)
+        sched.schedule()
+
+        probe = make_request("probe", list(range(40)), 16)
+        _, hit, _ = sched.kv_cache_manager.coordinator.find_longest_cache_hit(
+            probe.block_hashes, 39
+        )
+        assert hit == (32 if failure is None else 0)
