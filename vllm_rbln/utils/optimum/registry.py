@@ -44,7 +44,7 @@ _RBLN_GENERATION_MODELS: dict[str, tuple[str, str]] = {
     # logits, so it runs the generation graph -- as upstream vLLM does, resolving
     # it to Qwen3ForCausalLM. Classing it as pooling would compile
     # prefill_chunk_size == max_model_len, which the decoder graph cannot use.
-    "Qwen3ForSequenceClassification": ("qwen3", "RBLNQwen3ForCausalLM"),
+    "Qwen3ForSequenceClassification": ("qwen3_reranker", "RBLNQwen3ForCausalLM"),
 }
 
 _RBLN_ENCODER_DECODER_MODELS: dict[str, tuple[str, str]] = {
@@ -75,6 +75,11 @@ _RBLN_MULTIMODAL_MODELS = {
         "qwen3_vl",
         "RBLNQwen3VLForConditionalGeneration",
     ),
+    "Qwen3VLForSequenceClassification": (
+        "qwen3_vl_reranker",
+        "RBLNQwen3VLForConditionalGeneration",
+    ),
+    "Qwen3VLModel": ("qwen3_vl_embedding", "RBLNQwen3VLModel"),
     "Qwen3VLMoeForConditionalGeneration": (
         "qwen3_vl_moe",
         "RBLNQwen3VLMoeForConditionalGeneration",
@@ -116,7 +121,7 @@ _RBLN_EMBEDDING_MODELS = {
         "RBLNXLMRobertaForSequenceClassification",
     ),
     "XLMRobertaModel": ("xlm_roberta", "RBLNXLMRobertaModel"),
-    "Qwen3Model": ("qwen3", "RBLNQwen3Model"),
+    "Qwen3Model": ("qwen3_embedding", "RBLNQwen3Model"),
 }
 
 _RBLN_SUPPORTED_MODELS = {

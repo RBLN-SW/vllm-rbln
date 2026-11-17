@@ -16,6 +16,7 @@
 # and the per-group attention metadata over it. test_kv_cache_bindings.py covers
 # the consumer of those recipes; this is the producer.
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -23,7 +24,7 @@ import torch
 from transformers import LlamaConfig
 from vllm.config import set_current_vllm_config
 from vllm.engine.arg_utils import EngineArgs
-from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.kv_cache_interface import MambaSpec, MLAAttentionSpec
 
 import vllm_rbln.v1.worker.rbln_model_runner as mr
 from tests.vllm.v1.worker.utils import make_kv_cache_config, schedule_new
@@ -32,6 +33,8 @@ from vllm_rbln.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     RBLNQwenGatedDeltaNetAttention,
 )
 from vllm_rbln.v1.attention.backends.gdn_attn import RBLNGDNAttentionMetadata
+from vllm_rbln.v1.attention.backends.glm5_next import RBLNGlm5NextIndexerBackend
+from vllm_rbln.v1.attention.backends.mla.indexer import RBLNDeepseekV32IndexerBackend
 from vllm_rbln.v1.attention.kv_cache_bindings import (
     kv_cache_tensor_key,
     materialize_kv_cache_view,
@@ -39,6 +42,67 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
 from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
 
 pytestmark = pytest.mark.maybe_use_device
+
+
+@pytest.mark.usefixtures("cr13")
+@pytest.mark.parametrize("prefix_caching", [False, True])
+@pytest.mark.parametrize("sub_block_cache", [False, True])
+@pytest.mark.parametrize(
+    "backend, cache_dtype, chunks, rejected",
+    [
+        (RBLNDeepseekV32IndexerBackend, "fp8", [96], True),
+        (RBLNDeepseekV32IndexerBackend, "fp8", [64, 96], True),
+        (RBLNDeepseekV32IndexerBackend, "fp8", [96, 128], True),
+        (RBLNDeepseekV32IndexerBackend, "fp8", [64, 96, 128], True),
+        (RBLNDeepseekV32IndexerBackend, "fp8_e4m3", [96], True),
+        (RBLNDeepseekV32IndexerBackend, "fp8", [128], False),
+        (RBLNDeepseekV32IndexerBackend, "fp8", [64, 128], False),
+        (RBLNDeepseekV32IndexerBackend, "auto", [96], False),
+        (RBLNGlm5NextIndexerBackend, "fp8", [64, 96], False),
+        (RBLNGlm5NextIndexerBackend, "fp8", [96, 128], False),
+    ],
+)
+def test_indexer_prefill_block_alignment(
+    make_model_runner,
+    monkeypatch,
+    backend,
+    cache_dtype,
+    chunks,
+    rejected,
+    prefix_caching,
+    sub_block_cache,
+):
+    runner = make_model_runner(
+        init_kv_cache=False,
+        kv_cache_dtype=cache_dtype,
+        enable_prefix_caching=prefix_caching,
+        additional_config={
+            "prefill_chunk_size": chunks,
+            "enable_sub_block_cache": sub_block_cache,
+        },
+    )
+    layer = runner.compilation_config.static_forward_context["layer.0"]
+    monkeypatch.setattr(layer, "get_attn_backend", lambda: backend)
+    glm = backend is RBLNGlm5NextIndexerBackend
+    spec = MLAAttentionSpec(
+        block_size=1024,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=(
+            torch.float8_e4m3fn
+            if cache_dtype.startswith("fp8") and not glm
+            else torch.bfloat16
+        ),
+        tokens_per_state=4 if glm else 1,
+    )
+    config = make_kv_cache_config(runner, spec=spec)
+    with (
+        pytest.raises(ValueError, match="FP8 DSA indexer scale cache")
+        if rejected
+        else nullcontext()
+    ):
+        runner.initialize_kv_cache(config)
+        assert runner._kernel_block_sizes == [1024]
 
 
 def _one_group_two_layers(make_model_runner):

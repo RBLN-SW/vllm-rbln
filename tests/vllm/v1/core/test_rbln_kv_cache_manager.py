@@ -34,6 +34,7 @@ from vllm.v1.core.kv_cache_utils import (
     init_none_hash,
     maybe_convert_block_hash,
 )
+from vllm.v1.kv_cache_interface import SlidingWindowSpec, UniformTypeKVCacheSpecs
 from vllm.v1.request import Request
 
 from tests.vllm.v1.core.utils import (
@@ -51,6 +52,7 @@ from vllm_rbln.v1.core.rbln_kv_cache_manager import (
     SubBlockHasher,
     SubBlockIndex,
 )
+from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 
 BLOCK_SIZE = 8
 SUB_BLOCK_SIZE = 4
@@ -314,6 +316,31 @@ class TestCanUseSubBlockCaching:
         # All groups eligible and size constraints satisfied -> True.
         cfg = make_kv_cache_config([full_attention_spec(8)])
         assert RBLNKVCacheManager.can_use_sub_block_caching(cfg, 4)
+
+    @pytest.mark.parametrize("recycling_layer", ["first", "second"])
+    def test_grouped_sliding_windows_check_every_layer(self, recycling_layer):
+        specs = {
+            name: SlidingWindowSpec(
+                block_size=16,
+                num_kv_heads=1,
+                head_size=head_size,
+                dtype=torch.bfloat16,
+                sliding_window=8,
+            )
+            for name, head_size in (("first", 1), ("second", 2))
+        }
+        cfg = make_kv_cache_config(
+            [UniformTypeKVCacheSpecs(block_size=16, kv_cache_specs=specs)]
+        )
+        assert RBLNKVCacheManager.can_use_sub_block_caching(cfg, 4)
+        specs[recycling_layer] = RBLNSlidingWindowSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.bfloat16,
+            sliding_window=8,
+        )
+        assert not RBLNKVCacheManager.can_use_sub_block_caching(cfg, 4)
 
     def test_multi_group_all_must_be_eligible(self):
         # Every group must be eligible; one ineligible group flips it to False.
