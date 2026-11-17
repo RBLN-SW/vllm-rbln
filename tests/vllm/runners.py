@@ -31,6 +31,7 @@ from vllm import LLM, SamplingParams
 from vllm.distributed import cleanup_dist_env_and_memory
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.v1.engine.async_llm import AsyncLLM
+from vllm.v1.engine.output_processor import RequestOutputCollector
 
 from tests.vllm.vllm_config import local_weights_path
 
@@ -258,34 +259,47 @@ class AsyncVllmRunner:
     async def _generate_all(
         self, requests: list[DPRequest], num_logprobs: int | None = None
     ) -> list[Any]:
+        # Queue the whole group before scheduling so arrival timing cannot put
+        # one request on a smaller decode bucket before its peers join.
+        await self.engine.pause_generation(mode="keep", clear_cache=False)
+        try:
+            queues = [
+                await self.engine.add_request(
+                    request_id=f"dp-req-{i}",
+                    prompt=req.prompt,
+                    params=SamplingParams(
+                        temperature=0.0,
+                        max_tokens=req.max_tokens,
+                        logprobs=num_logprobs,
+                    ),
+                    data_parallel_rank=req.dp_rank,
+                )
+                for i, req in enumerate(requests)
+            ]
+        finally:
+            await self.engine.resume_generation()
         # gather() must be built inside the loop, or its futures attach to
         # whatever loop asyncio considers current.
         return list(
             await asyncio.gather(
                 *(
-                    self._generate_one(i, req, num_logprobs)
-                    for i, req in enumerate(requests)
+                    self._generate_one(i, req, queue, num_logprobs)
+                    for i, (req, queue) in enumerate(zip(requests, queues))
                 )
             )
         )
 
     async def _generate_one(
-        self, index: int, request: DPRequest, num_logprobs: int | None = None
+        self,
+        index: int,
+        request: DPRequest,
+        queue: RequestOutputCollector,
+        num_logprobs: int | None = None,
     ) -> tuple[list[int], str] | tuple[list[int], str, list[dict[int, float]]]:
-        params = SamplingParams(
-            temperature=0.0, max_tokens=request.max_tokens, logprobs=num_logprobs
-        )
-        stream = self.engine.generate(
-            request.prompt,
-            params,
-            request_id=f"dp-req-{index}",
-            data_parallel_rank=request.dp_rank,
-        )
-
         async def drain() -> Any:
             final = None
-            async for output in stream:
-                final = output
+            while final is None or not final.finished:
+                final = await queue.get()
             return final
 
         # A bound, not a budget: a rank stalled in a collective would otherwise
@@ -293,15 +307,12 @@ class AsyncVllmRunner:
         try:
             final = await asyncio.wait_for(drain(), timeout=self.request_timeout_s)
         except TimeoutError as exc:
+            await self.engine.abort(queue.request_id, internal=True)
             raise TimeoutError(
                 f"request {index} (dp_rank={request.dp_rank}) did not finish "
                 f"within {self.request_timeout_s}s"
             ) from exc
 
-        assert final is not None, (
-            f"request {index} (dp_rank={request.dp_rank}): the engine closed the "
-            f"stream without producing any output"
-        )
         completion = final.outputs[0]
         if num_logprobs is None:
             return list(completion.token_ids), completion.text

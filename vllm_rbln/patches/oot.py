@@ -70,6 +70,10 @@ def register_rbln_oot_implementations() -> None:
         RBLNUnquantizedFusedMoEMethod,
         UnquantizedFusedMoEMethod,
     )
+    from vllm_rbln.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+        QwenGatedDeltaNetAttention,
+        RBLNQwenGatedDeltaNetAttention,
+    )
     from vllm_rbln.model_executor.layers.mla import (
         MultiHeadLatentAttentionWrapper,
         RBLNMultiHeadLatentAttentionWrapper,
@@ -77,6 +81,10 @@ def register_rbln_oot_implementations() -> None:
     from vllm_rbln.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
         DeepseekScalingRotaryEmbedding,
         RBLNDeepseekScalingRotaryEmbedding,
+    )
+    from vllm_rbln.model_executor.layers.rotary_embedding.mrope import (
+        MRotaryEmbedding,
+        RBLNMRotaryEmbedding,
     )
     from vllm_rbln.model_executor.layers.vocab_parallel_embedding import (
         ParallelLMHead,
@@ -91,5 +99,7 @@ def register_rbln_oot_implementations() -> None:
     _register_oot(ParallelLMHead, RBLNParallelLMHead)
     _register_oot(MultiHeadLatentAttentionWrapper, RBLNMultiHeadLatentAttentionWrapper)
     _register_oot(DeepseekScalingRotaryEmbedding, RBLNDeepseekScalingRotaryEmbedding)
+    _register_oot(MRotaryEmbedding, RBLNMRotaryEmbedding)
+    _register_oot(QwenGatedDeltaNetAttention, RBLNQwenGatedDeltaNetAttention)
     _register_fp8_block_kernel()
     _register_unpacked_wna16_linear_kernel()

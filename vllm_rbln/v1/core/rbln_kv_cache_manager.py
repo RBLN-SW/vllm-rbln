@@ -45,6 +45,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
     SlidingWindowSpec,
+    iter_layer_specs,
 )
 
 from vllm_rbln.logger import init_logger
@@ -301,7 +302,7 @@ class RBLNKVCacheManager(KVCacheManager):
         """Return True if sub-block caching is applicable to this config.
 
         Sub-block caching requires:
-        1. Every group's spec type must store per-token KV data (allow-listed
+        1. Every layer's spec type must store per-token KV data (allow-listed
            in ``_SUB_BLOCK_ELIGIBLE_SPECS``).
         2. Every group must have block_size > sub_block_size and
            block_size % sub_block_size == 0.
@@ -309,15 +310,15 @@ class RBLNKVCacheManager(KVCacheManager):
         if sub_block_size <= 0:
             return False
         for group in kv_cache_config.kv_cache_groups:
-            spec = group.kv_cache_spec
-            # The shift kernel overwrites the prefix with the latest window.
-            if isinstance(spec, RBLNSlidingWindowSpec):
-                return False
-            if not isinstance(spec, _SUB_BLOCK_ELIGIBLE_SPECS):
-                return False
-            bs = spec.block_size
-            if bs <= sub_block_size or bs % sub_block_size != 0:
-                return False
+            for spec in iter_layer_specs(group.kv_cache_spec):
+                # The shift kernel overwrites the prefix with the latest window.
+                if isinstance(spec, RBLNSlidingWindowSpec):
+                    return False
+                if not isinstance(spec, _SUB_BLOCK_ELIGIBLE_SPECS):
+                    return False
+                bs = spec.block_size
+                if bs <= sub_block_size or bs % sub_block_size != 0:
+                    return False
         return True
 
     def __init__(
