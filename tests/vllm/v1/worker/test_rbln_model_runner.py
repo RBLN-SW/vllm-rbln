@@ -111,6 +111,7 @@ def _make_runner_stub(**attrs):
     runner.is_strict_kv_producer = False
     runner.supports_mm_inputs = False
     runner.model_config = SimpleNamespace(is_mm_prefix_lm=False)
+    runner.mrope_positions = None
     for key, value in attrs.items():
         setattr(runner, key, value)
     return runner
@@ -776,7 +777,9 @@ class TestEcConsumer:
         runner = _make_runner_stub(
             load_config=None,
             vllm_config=SimpleNamespace(ec_transfer_config=ec_config),
-            model_config=SimpleNamespace(model="m", enforce_eager=False),
+            model_config=SimpleNamespace(
+                model="m", enforce_eager=False, uses_mrope=False
+            ),
             offload_context=nullcontext,
             _resolve_mm_support=lambda: True,
             drafter=None,
@@ -1386,6 +1389,7 @@ class TestDummyRunPadding:
 
         def stage(**kwargs):
             captured["layout"] = kwargs["layout"]
+            captured["positions"] = kwargs["positions"]
             return SimpleNamespace(as_kwargs=lambda: {})
 
         # Two buckets, so a padded count can differ from a raw one at all.
@@ -1489,6 +1493,16 @@ class TestDummyRunPadding:
         runner, captured = self._runner(monkeypatch, reqs_across_dp=[1, 1, 1, 1])
         runner._dummy_run(1, 1, is_prefill=False, warmup=False)
         assert captured["layout"].shape != warmed
+
+    def test_an_mrope_model_gets_positions_on_three_axes(self, monkeypatch):
+        # The graph an M-RoPE model warms up takes [3, batch, seq] positions.
+        runner, captured = self._runner(monkeypatch, reqs_across_dp=[1, 1, 1, 1])
+        runner._dummy_run(1, 4, is_prefill=True)
+        assert captured["positions"].shape == (1, 4)
+
+        runner.mrope_positions = torch.zeros(3, 128, dtype=torch.int64)
+        runner._dummy_run(1, 4, is_prefill=True)
+        assert captured["positions"].shape == (3, 1, 4)
 
     def test_warmup_pin_is_the_token_dimension(self, monkeypatch):
         # Warm-up dictates the dimension it wants compiled -- the group agreement
@@ -1687,26 +1701,26 @@ class TestProcessKvCacheCopyOps:
 
     def test_eager_copy_mla_indexer_scale(self, monkeypatch):
         monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", True)
-        # DeepSeek-V3.2 carries three MLA-family caches and the indexer scale
-        # one is (num_blocks, block_tokens) -- no trailing head axis.
-        latent = torch.zeros(4, 8, 2)
-        scale = torch.zeros(4, 8)
-        latent[1] = 7.0
-        scale[1] = 9.0
+        latent = torch.zeros(4, 8, 768, dtype=torch.uint8)
+        indexer = torch.zeros(4, 8, 128, dtype=torch.float8_e4m3fn)
+        scale = torch.zeros(4, 8, dtype=torch.bfloat16)
+        caches = [latent, indexer, scale]
+        for i, cache in enumerate(caches):
+            shape = (8,) + (1,) * (cache.ndim - 2)
+            cache[1].copy_(torch.arange(8).view(shape) + i + 1)
         r = _make_runner_stub(
-            kv_caches=[latent, scale],
-            kv_cache_names=["latent", "scale"],
-            kv_cache_block_axes={"latent": 0, "scale": 0},
-            kv_cache_config=_copy_groups(["latent", "scale"]),
+            kv_caches=caches,
+            kv_cache_names=["latent", "indexer", "scale"],
+            kv_cache_block_axes={"latent": 0, "indexer": 0, "scale": 0},
+            kv_cache_config=_copy_groups(["latent", "indexer", "scale"]),
             _kernel_block_sizes=[8],
             model_config=SimpleNamespace(use_mla=True, enforce_eager=True),
             runtime_holder=[None],
         )
         r._process_kv_cache_copy_ops([KVCacheCopyOp(0, 1, 2, 3)])
-        assert (latent[2, :3, :] == 7.0).all()
-        assert (latent[2, 3:, :] == 0.0).all()
-        assert (scale[2, :3] == 9.0).all()
-        assert (scale[2, 3:] == 0.0).all()
+        for cache in caches:
+            assert torch.equal(cache[2, :3].float(), cache[1, :3].float())
+            assert torch.count_nonzero(cache[2, 3:].float()) == 0
 
     def test_only_the_op_group_is_copied(self, monkeypatch):
         monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", True)

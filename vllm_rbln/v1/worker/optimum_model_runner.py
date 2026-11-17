@@ -149,7 +149,6 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         self.is_pooling_model = model_config.runner_type == "pooling"
         self.vocab_size = self.model_config.get_vocab_size()
         self.max_model_len = self.model_config.max_model_len
-        self.max_num_tokens = self.scheduler_config.max_num_batched_tokens
         self.max_num_reqs = self.scheduler_config.max_num_seqs
         self.inputs_embeds_size = self.model_config.get_inputs_embeds_size()
 
@@ -210,7 +209,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         self.input_batch = RBLNInputBatch(
             max_num_reqs=self.max_num_reqs,
             max_model_len=self.max_model_len,
-            max_num_batched_tokens=self.max_num_tokens,
+            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
             device=self.device,
             vocab_size=self.model_config.get_vocab_size(),
             block_sizes=[cache_config.block_size],
