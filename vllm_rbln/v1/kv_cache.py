@@ -194,9 +194,11 @@ class RBLNRingSlidingWindowManager(SlidingWindowManager):
 
     def __init__(self, kv_cache_spec: SlidingWindowSpec, **kwargs) -> None:
         super().__init__(kv_cache_spec, **kwargs)
-        if self.sliding_window > self.block_size:
+        # A narrower window splits the block into kernel blocks, which a row
+        # copy cannot address.
+        if self.sliding_window != self.block_size:
             raise NotImplementedError(
-                "use_swa_ring needs a sliding window no wider than the block."
+                "use_swa_ring needs a sliding window as wide as the block."
             )
         self._step_start: dict[str, int] = {}
         self._window_column: dict[str, int] = {}
