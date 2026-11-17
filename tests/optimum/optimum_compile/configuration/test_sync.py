@@ -283,7 +283,10 @@ class TestSync:
                 worker_cls="auto", tensor_parallel_size=1, pipeline_parallel_size=1
             ),
             scheduler_config=SimpleNamespace(
-                max_num_seqs=1, max_num_batched_tokens=2048, async_scheduling=False
+                max_num_seqs=1,
+                max_num_batched_tokens=2048,
+                max_num_scheduled_tokens=None,
+                async_scheduling=False,
             ),
             cache_config=SimpleNamespace(
                 block_size=1024,
