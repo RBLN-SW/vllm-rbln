@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import struct
 import time
 from contextlib import AbstractContextManager, nullcontext
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlPullConnectorWorker,
@@ -22,6 +23,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
 
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_worker import (
     RblnNixlWorkerBase,
+)
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
+    RblnReqMeta,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.transfer import (
     trim_producer_to_consumer,
@@ -42,6 +46,12 @@ class RblnNixlPullConnectorWorker(RblnNixlWorkerBase, NixlPullConnectorWorker):
     The pairing itself lives in `RblnNixlWorkerBase`; what belongs here is the
     read -- which peers to issue it against.
     """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        # Remote agent -> the (mode, rail) its connection had before a request
+        # changed it; present only while the connection is off that default.
+        self._xfer_defaults: dict[bytes, tuple[int, int]] = {}
 
     def _read_blocks_for_req(self, req_id: str, meta: "ReqMeta") -> None:
         assert meta.remote is not None and self.transfer_topo is not None
@@ -64,6 +74,69 @@ class RblnNixlPullConnectorWorker(RblnNixlWorkerBase, NixlPullConnectorWorker):
         # read path this one replaces, and a swept producer loses the state
         # mid-transfer.
         self._engine_last_active[engine_id] = time.perf_counter()
+
+        # nixl-rbln keeps mode and rail per connection, not per transfer, and
+        # applies them from the next one posted. So a read that names a lane
+        # sets it on every agent of the engine first, and one that names none
+        # puts back the default a previous request replaced.
+        asked = isinstance(meta, RblnReqMeta)
+        # A notify-only read (full local hit, aborted cleanup) moves no KV, and
+        # failing it here would drop the notice that frees the producer's blocks.
+        moves_kv = meta.awaiting_kvs or any(meta.local_block_ids)
+        agents = [
+            agent
+            for agent in self._remote_agents[engine_id].values()
+            if moves_kv and (asked or agent in self._xfer_defaults)
+        ]
+        if agents:
+            try:
+                if not self._use_rbln_nixl_backend:
+                    raise RuntimeError("xfer_mode / xfer_rail need nixl-rbln")
+                if asked and meta.xfer_mode not in (None, "single_lane", "multi_lane"):
+                    raise ValueError(
+                        f"xfer_mode {meta.xfer_mode!r} is neither 'single_lane' "
+                        "nor 'multi_lane'"
+                    )
+                if asked and isinstance(meta.xfer_rail, bool):
+                    raise ValueError(f"xfer_rail {meta.xfer_rail!r} is not a rail")
+                import nixl_rbln
+
+                for agent in agents:
+                    # NIXL's binding hands agent names back as bytes despite the
+                    # str in `add_remote_agent`'s annotation, and nixl-rbln
+                    # encodes what it is given.
+                    peer = agent.decode()
+                    if agent not in self._xfer_defaults:
+                        self._xfer_defaults[agent] = (
+                            nixl_rbln.get_xfer_mode(self.nixl_wrapper, peer),
+                            nixl_rbln.get_xfer_rail(self.nixl_wrapper, peer),
+                        )
+                    mode, rail = self._xfer_defaults[agent]
+                    if asked and meta.xfer_mode is not None:
+                        mode = (
+                            nixl_rbln.XFER_MULTI_LANE
+                            if meta.xfer_mode == "multi_lane"
+                            else nixl_rbln.XFER_SINGLE_LANE
+                        )
+                    if asked and meta.xfer_rail is not None:
+                        rail = meta.xfer_rail
+                    nixl_rbln.set_xfer_mode(self.nixl_wrapper, peer, mode)
+                    nixl_rbln.set_xfer_rail(self.nixl_wrapper, peer, rail)
+                    if not asked:
+                        del self._xfer_defaults[agent]
+            except (ValueError, RuntimeError, struct.error) as e:
+                # What the request asked for decides it, so it fails the
+                # request rather than the engine.
+                self._log_failure(
+                    failure_type="transfer_setup_failed",
+                    req_id=req_id,
+                    msg="Marking blocks as invalid",
+                    error=e,
+                    dst_engine_id=engine_id,
+                )
+                self._handle_failed_transfer(req_id, None, self._recv_failures)
+                return
+
         pp_size = self._remote_pp_size.get(engine_id, 1)
         # `or None`: a producer that kept no blocks reports zero, and zero is
         # not a last block anyone can size -- the whole block goes.

@@ -366,6 +366,8 @@ class TestShardReadPath:
         w.dcp_rank = 0
         w.pcp_rank = 0
         w._recving_transfers = defaultdict(list)
+        # No connection is off its default lane until a request names one.
+        w._xfer_defaults = {}
         w._engine_last_active = {}
         w._engines_to_rehandshake = set()
         w._link_down_since = None

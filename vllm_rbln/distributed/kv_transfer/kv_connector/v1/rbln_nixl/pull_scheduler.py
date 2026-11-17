@@ -12,14 +12,50 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import fields
+from typing import TYPE_CHECKING
+
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
+    NixlConnectorMetadata,
     NixlPullConnectorScheduler,
 )
 
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_scheduler import (
     RblnNixlSchedulerBase,
 )
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
+    RblnReqMeta,
+)
+
+if TYPE_CHECKING:
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+        KVConnectorMetadata,
+    )
+    from vllm.v1.core.sched.output import SchedulerOutput
 
 
 class RblnNixlPullConnectorScheduler(RblnNixlSchedulerBase, NixlPullConnectorScheduler):
     """Scheduler side of the read path."""
+
+    def build_connector_meta(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> "KVConnectorMetadata":
+        # Read before upstream clears `_reqs_need_recv`; its ReqMeta has no
+        # field for these, so a request naming either gets an RblnReqMeta.
+        lanes = {
+            req_id: (params.get("xfer_mode"), params.get("xfer_rail"))
+            for req_id, (req, *_) in self._reqs_need_recv.items()
+            if (params := req.kv_transfer_params) is not None
+        }
+        meta = super().build_connector_meta(scheduler_output)
+        assert isinstance(meta, NixlConnectorMetadata)
+        for req_id, (mode, rail) in lanes.items():
+            if mode is None and rail is None:
+                continue
+            base = meta.reqs_to_recv[req_id]
+            meta.reqs_to_recv[req_id] = RblnReqMeta(
+                **{f.name: getattr(base, f.name) for f in fields(base)},
+                xfer_mode=mode,
+                xfer_rail=rail,
+            )
+        return meta

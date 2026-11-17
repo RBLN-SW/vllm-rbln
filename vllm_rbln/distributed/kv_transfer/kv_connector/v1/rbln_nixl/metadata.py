@@ -39,7 +39,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlAgentMetadata,
     NixlConnectorMetadata,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import ReqId
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import ReqId, ReqMeta
 from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     SlidingWindowSpec,
@@ -163,6 +163,19 @@ class RblnNixlConnectorMetadata(NixlConnectorMetadata):
         meta = cls()
         meta.__dict__.update(base.__dict__)
         return meta
+
+
+@dataclass
+class RblnReqMeta(ReqMeta):
+    """``ReqMeta`` + the lane a read asks for in its ``kv_transfer_params``.
+
+    Swapped in by the pull scheduler only for a request that names one, so it
+    rides the read however long the handshake keeps it queued. None leaves the
+    connection's default for that field.
+    """
+
+    xfer_mode: str | None = None
+    xfer_rail: int | None = None
 
 
 _T = TypeVar("_T")
