@@ -77,8 +77,8 @@ def test_compressor_preserves_state_across_prefill_chunks(monkeypatch, chunked):
     from tests.vllm.vllm_config import make_vllm_config
 
     class NoRope(torch.nn.Module):
-        def forward(self, x, positions):
-            return x
+        def forward(self, positions, x):
+            return x, None
 
     monkeypatch.setattr(
         parallel_state, "_TP", SimpleNamespace(world_size=1, rank_in_group=0)
@@ -107,7 +107,11 @@ def test_compressor_preserves_state_across_prefill_chunks(monkeypatch, chunked):
     state = torch.empty(1, 8, 256, dtype=compressor.state_cache.dtype)
     slot = torch.zeros(1, 1, dtype=torch.int32)
     query_len = torch.tensor([[3 if chunked else 4]], dtype=torch.int32)
-    monkeypatch.setattr(dsv4, "_ring_inputs", lambda cache: (state, slot, query_len))
+    monkeypatch.setattr(
+        dsv4.RBLNDeepseekV4RingCache,
+        "inputs",
+        lambda self: (state, slot, query_len, None),
+    )
     if chunked:
         compressor(x[:, :3], torch.tensor([[0]], dtype=torch.int32))
         query_len.fill_(1)
@@ -147,6 +151,7 @@ def test_mtp_masks_only_position_zero_embeddings():
 def test_compressor_padding_does_not_index_past_the_rope_table(monkeypatch, query_len):
     import vllm.distributed.parallel_state as parallel_state
     from vllm.config import set_current_vllm_config
+    from vllm.models.deepseek_v4.common.rope import build_deepseek_v4_rope
     from vllm.transformers_utils.configs.deepseek_v4 import DeepseekV4Config
 
     import vllm_rbln.model_executor.models.deepseek_v4 as dsv4
@@ -164,25 +169,28 @@ def test_compressor_padding_does_not_index_past_the_rope_table(monkeypatch, quer
         rope_parameters={"rope_type": "default"},
     )
     with set_current_vllm_config(make_vllm_config()):
-        compressor = dsv4.RBLNDeepseekV4Compressor(
+        rope = build_deepseek_v4_rope(
             config,
-            4,
-            64,
-            dsv4.SLOT_STATE,
-            dsv4.RBLNDeepseekV4Rope(config, 4, 64),
-            "model.layers.0.attn.compressor",
+            head_dim=64,
+            rope_head_dim=64,
+            max_position_embeddings=64,
+            compress_ratio=4,
+        )
+        compressor = dsv4.RBLNDeepseekV4Compressor(
+            config, 4, 64, dsv4.SLOT_STATE, rope, "model.layers.0.attn.compressor"
         )
     rng = torch.Generator().manual_seed(18)
     with torch.no_grad():
         compressor.fused_wkv_wgate.weight.copy_(torch.randn(256, 4, generator=rng))
         compressor.ape.copy_(torch.randn(4, 128, generator=rng))
     monkeypatch.setattr(
-        dsv4,
-        "_ring_inputs",
-        lambda cache: (
+        dsv4.RBLNDeepseekV4RingCache,
+        "inputs",
+        lambda self: (
             torch.zeros(1, 8, 256),
             torch.zeros(1, 1, dtype=torch.int32),
             torch.tensor([[query_len]], dtype=torch.int32),
+            None,
         ),
     )
     x = torch.randn(1, 16, 4, generator=rng).bfloat16()
@@ -192,73 +200,21 @@ def test_compressor_padding_does_not_index_past_the_rope_table(monkeypatch, quer
     torch.testing.assert_close(actual[:, :1], expected, atol=0, rtol=0)
 
 
-def test_rope_sharing_is_local_to_each_model(monkeypatch):
-    import vllm.distributed.parallel_state as parallel_state
-    from vllm.config import set_current_vllm_config
-    from vllm.transformers_utils.configs.deepseek_v4 import DeepseekV4Config
-
-    import vllm_rbln.model_executor.models.deepseek_v4 as dsv4
-    from tests.vllm.vllm_config import make_vllm_config
-
-    monkeypatch.setattr(
-        parallel_state, "_TP", SimpleNamespace(world_size=1, rank_in_group=0)
-    )
-    monkeypatch.setattr(
-        dsv4, "get_pp_group", lambda: SimpleNamespace(is_first_rank=False)
-    )
-    monkeypatch.setattr(dsv4, "RBLNDeepseekV4MoE", lambda *args: torch.nn.Identity())
-    monkeypatch.setattr(
-        dsv4,
-        "make_layers",
-        lambda count, factory, prefix: (
-            0,
-            count,
-            torch.nn.ModuleList(factory(f"{prefix}.{i}") for i in range(count)),
-        ),
-    )
-    hf_config = DeepseekV4Config(
-        num_hidden_layers=2,
-        num_attention_heads=1,
-        hidden_size=4,
-        head_dim=64,
-        qk_rope_head_dim=64,
-        q_lora_rank=4,
-        o_lora_rank=4,
-        o_groups=1,
-        sliding_window=128,
-        rms_norm_eps=1e-6,
-        compress_ratios=[0, 0],
-        hc_mult=4,
-        hc_eps=1e-6,
-        hc_sinkhorn_iters=20,
-    )
-    config = SimpleNamespace(
-        model_config=SimpleNamespace(hf_text_config=hf_config, max_model_len=64),
-        cache_config=SimpleNamespace(cache_dtype="fp8"),
-        quant_config=None,
-    )
-    with set_current_vllm_config(make_vllm_config()):
-        cpu_model = dsv4.RBLNDeepseekV4Model(vllm_config=config, prefix="cpu")
-        with torch.device("meta"):
-            meta_model = dsv4.RBLNDeepseekV4Model(vllm_config=config, prefix="meta")
-    cpu_rope = cpu_model.layers[0].attn.rope
-    meta_rope = meta_model.layers[0].attn.rope
-    assert cpu_rope is cpu_model.layers[1].attn.rope
-    assert meta_rope is meta_model.layers[1].attn.rope
-    assert cpu_rope.cos_cache.device.type == "cpu"
-    assert meta_rope.cos_cache.device.type == "meta"
-
-
 @pytest.mark.parametrize("nested", [False, True])
 @pytest.mark.parametrize("ratio", [0, 4, 128])
 @pytest.mark.parametrize("inverse", [False, True])
-def test_rope_matches_upstream(nested, ratio, inverse):
+@pytest.mark.parametrize("headless", [False, True])
+def test_rope_resolves_to_the_rbln_op_and_matches_upstream(
+    nested, ratio, inverse, headless
+):
     from vllm.config import set_current_vllm_config
     from vllm.models.deepseek_v4.common.rope import build_deepseek_v4_rope
     from vllm.transformers_utils.configs.deepseek_v4 import DeepseekV4Config
 
     from tests.vllm.vllm_config import make_vllm_config
-    from vllm_rbln.model_executor.models.deepseek_v4 import RBLNDeepseekV4Rope
+    from vllm_rbln.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
+        RBLNDeepseekV4ScalingRotaryEmbedding,
+    )
 
     scaling = dict(
         rope_type="yarn",
@@ -278,24 +234,23 @@ def test_rope_matches_upstream(nested, ratio, inverse):
         rope_parameters=parameters,
     )
     with set_current_vllm_config(make_vllm_config()):
-        upstream = build_deepseek_v4_rope(
+        rope = build_deepseek_v4_rope(
             config,
             head_dim=128,
             rope_head_dim=64,
             max_position_embeddings=256,
             compress_ratio=ratio,
         )
-        rope = RBLNDeepseekV4Rope(config, ratio, 256)
+    assert isinstance(rope, RBLNDeepseekV4ScalingRotaryEmbedding)
     positions = torch.tensor([[0, 13, 65], [127, 129, 255]])
-    x = torch.randn(2, 3, 2, 128, generator=torch.Generator().manual_seed(9)).bfloat16()
-    expected, _ = upstream.forward_native(
-        positions.flatten(),
-        x.reshape(6, 2, 128),
-        inverse=inverse,
+    shape = (2, 3, 128) if headless else (2, 3, 2, 128)
+    x = torch.randn(*shape, generator=torch.Generator().manual_seed(9)).bfloat16()
+    # Upstream's forward takes flat positions over [N, H, D] rows.
+    expected, _ = rope.forward_native(
+        positions.flatten(), x.reshape(6, -1, 128), inverse=inverse
     )
-    torch.testing.assert_close(
-        rope(x, positions, inverse), expected.reshape_as(x), atol=0, rtol=0
-    )
+    actual, _ = rope.forward_oot(positions, x, inverse=inverse)
+    torch.testing.assert_close(actual, expected.reshape_as(x), atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("dtype", [torch.uint8, torch.float8_e8m0fnu])
@@ -476,56 +431,160 @@ def test_head_relocation_preserves_reduction(sampled_only):
     torch.testing.assert_close(actual, expected)
 
 
-@pytest.mark.parametrize(
-    "tokens,cut", [(1, False), (4, False), (256, True), (512, True), (260, False)]
-)
-def test_mhc_sublayer_token_cut(tokens, cut):
-    from vllm_rbln.model_executor.models.deepseek_v4 import RBLNDeepseekV4DecoderLayer
+class _Norm:
+    def __init__(self, hidden):
+        self.weight = 1.0 + 0.1 * torch.randn(hidden, dtype=torch.bfloat16)
 
-    class Sublayer(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.register_buffer("fn", torch.randn(24, 4 * 128) * 0.02)
-            self.register_buffer("scale", torch.linspace(0.5, 1.5, 24))
-            self.register_buffer("base", torch.randn(24) * 0.1)
-            self.norm = torch.nn.RMSNorm(128, eps=1e-5, dtype=torch.bfloat16)
-            self.config = SimpleNamespace(norm_eps=1e-5, hc_eps=1e-6, hc_iters=20)
+    def __call__(self, x):
+        rows = x.float()
+        normed = rows * torch.rsqrt(rows.pow(2).mean(-1, keepdim=True) + 1e-5)
+        return (normed.to(self.weight.dtype) * self.weight).to(x.dtype)
 
-        def forward(self, streams):
-            return RBLNDeepseekV4DecoderLayer._sublayer(
-                self.config,
-                streams,
-                self.fn,
-                self.scale,
-                self.base,
-                self.norm,
-                lambda x, factor: x * factor,
-                0.5,
-            )
 
-    torch.manual_seed(7)
-    module = Sublayer().eval()
-    streams = torch.randn(1, 4, tokens, 128, dtype=torch.bfloat16)
-    graph = torch.export.export(module, (streams,)).graph
-    targets = {str(node.target) for node in graph.nodes if node.op == "call_function"}
-    for name in ("mhc_mix", "mhc_read", "mhc_write"):
-        assert (f"rbln_custom_ops.{name}.default" in targets) == cut
+def _mhc_layer(cls, hidden=64):
+    class Attention(torch.nn.Module):
+        swa_cache = SimpleNamespace(prefix="attn.swa_cache")
 
-    flat = streams.transpose(1, 2).reshape(1, tokens, -1).float()
-    flat = flat * torch.rsqrt(flat.square().mean(-1, keepdim=True) + 1e-5)
-    logits = torch.nn.functional.linear(flat, module.fn) * module.scale + module.base
-    pre = torch.sigmoid(logits[..., :4]) + 1e-6
-    x = (streams.float() * pre.transpose(1, 2).unsqueeze(-1)).sum(1)
-    y = (module.norm(x.to(streams.dtype)) * 0.5).float()
-    comb = torch.softmax(logits[..., 8:].reshape(1, tokens, 4, 4), dim=-1) + 1e-6
-    comb = comb / (comb.sum(-2, keepdim=True) + 1e-6)
-    for _ in range(19):
-        comb = comb / (comb.sum(-1, keepdim=True) + 1e-6)
-        comb = comb / (comb.sum(-2, keepdim=True) + 1e-6)
-    expected = torch.matmul(comb.transpose(-1, -2), streams.float().transpose(1, 2))
-    expected += (2 * torch.sigmoid(logits[..., 4:8])).unsqueeze(-1) * y.unsqueeze(-2)
-    got = module(streams)
-    assert got.dtype == streams.dtype
-    torch.testing.assert_close(
-        got, expected.transpose(1, 2).to(streams.dtype), atol=2e-2, rtol=2e-2
+        def forward(self, positions, h):
+            return torch.sin(h)
+
+    torch.manual_seed(0)
+    layer = cls.__new__(cls)
+    torch.nn.Module.__init__(layer)
+    layer.hc_mult, layer.norm_eps, layer.hc_eps = 4, 1e-5, 1e-6
+    layer.hc_iters, layer.hc_post_mult = 20, 2.0
+    mix = (2 + layer.hc_mult) * layer.hc_mult
+    for kind in ("attn", "ffn"):
+        setattr(layer, f"hc_{kind}_fn", 0.05 * torch.randn(mix, layer.hc_mult * hidden))
+        setattr(layer, f"hc_{kind}_base", 0.1 * torch.randn(mix))
+        setattr(layer, f"hc_{kind}_scale_vec", 0.5 + torch.rand(mix))
+    layer.attn_norm = _Norm(hidden)
+    layer.ffn_norm = _Norm(hidden)
+    layer.attn = Attention()
+    layer.ffn = lambda h, input_ids: torch.tanh(h)
+    return layer
+
+
+def _mhc_kernels(monkeypatch):
+    ops = torch.ops.rbln_custom_ops
+    calls = []
+    n = 4
+
+    def mix(streams, mix_weight, scale, base, eps):
+        calls.append("mix")
+        batch, _, tokens, hidden = streams.shape
+        flat = streams.transpose(1, 2).reshape(batch, tokens, n * hidden).float()
+        flat = flat * torch.rsqrt(flat.square().mean(-1, keepdim=True) + eps)
+        logits = torch.nn.functional.linear(flat, mix_weight) * scale + base
+        return logits.to(streams.dtype)
+
+    def read(streams, logits, eps):
+        calls.append("read")
+        return ops.hc_stream_reduce(streams, logits[..., :n].contiguous(), eps)
+
+    def write(x, streams, logits, post_mult, iters, eps):
+        calls.append("write")
+        comb = ops.sinkhorn_normalize(
+            logits[..., 2 * n :].contiguous(), iters=iters, eps=eps
+        )
+        out = ops.hc_residual_add(
+            x, streams, logits[..., n : 2 * n].contiguous(), comb, post_mult=post_mult
+        )
+        return out.to(torch.bfloat16).to(streams.dtype)
+
+    for name, kernel in (("mhc_mix", mix), ("mhc_read", read), ("mhc_write", write)):
+        monkeypatch.setattr(ops, name, kernel, raising=False)
+    return calls
+
+
+@pytest.fixture
+def mhc_metadata():
+    from vllm.forward_context import ForwardContext, override_forward_context
+
+    metadata = SimpleNamespace(is_prefill=True)
+    context = ForwardContext(
+        no_compile_layers={},
+        attn_metadata={"attn.swa_cache": metadata},
+        slot_mapping={},
     )
+    with override_forward_context(context):
+        yield metadata
+
+
+def test_a_prefill_step_runs_the_mhc_on_the_token_cut_kernels(
+    monkeypatch, mhc_metadata
+):
+    import vllm_rbln.model_executor.models.deepseek_v4 as dsv4
+
+    calls = _mhc_kernels(monkeypatch)
+    layer = _mhc_layer(dsv4.RBLNDeepseekV4DecoderLayer)
+    streams = torch.randn(1, 4, 8, 64).to(torch.bfloat16)
+    positions = torch.arange(8).unsqueeze(0)
+    input_ids = torch.zeros(1, 8, dtype=torch.long)
+
+    cut = layer(positions, streams, input_ids)
+    assert calls == ["mix", "read", "write"] * 2
+    mhc_metadata.is_prefill = False
+    plain = layer(positions, streams, input_ids)
+
+    assert calls == ["mix", "read", "write"] * 2
+    torch.testing.assert_close(cut.to(streams.dtype), plain)
+
+
+@pytest.mark.parametrize(
+    "first_rank,last_rank", [(True, True), (True, False), (False, False), (False, True)]
+)
+def test_the_model_returns_the_streams_in_the_input_dtype_after_a_cut_prefill(
+    monkeypatch,
+    mhc_metadata,
+    first_rank,
+    last_rank,
+):
+    from vllm.sequence import IntermediateTensors
+
+    import vllm_rbln.model_executor.models.deepseek_v4 as dsv4
+
+    monkeypatch.setattr(
+        dsv4,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=first_rank, is_last_rank=last_rank),
+    )
+    model = dsv4.RBLNDeepseekV4Model.__new__(dsv4.RBLNDeepseekV4Model)
+    torch.nn.Module.__init__(model)
+    model.hc_mult = 4
+    model.layers = torch.nn.ModuleList([_mhc_layer(dsv4.RBLNDeepseekV4DecoderLayer)])
+    model.start_layer, model.end_layer = 0, 1
+    input_ids = torch.zeros(1, 8, dtype=torch.long)
+    embeds = torch.randn(1, 8, 64).to(torch.bfloat16)
+    intermediate = None
+    if not first_rank:
+        intermediate = IntermediateTensors({"streams": embeds.repeat(1, 1, 4)})
+
+    out = model(input_ids, torch.arange(8).unsqueeze(0), intermediate, embeds)
+    if not last_rank:
+        out = out["streams"]
+
+    assert out.dtype == torch.bfloat16
+
+
+def test_the_drafter_returns_the_streams_in_the_input_dtype_after_a_cut_prefill(
+    monkeypatch,
+    mhc_metadata,
+):
+    import vllm_rbln.model_executor.models.deepseek_v4 as dsv4
+
+    class Projection(torch.nn.Module):
+        def forward(self, x):
+            return x, None
+
+    _mhc_kernels(monkeypatch)
+    layer = _mhc_layer(dsv4.RBLNDeepseekV4MTPLayer)
+    layer.enorm = layer.hnorm = torch.nn.Identity()
+    layer.e_proj = layer.h_proj = Projection()
+    positions = torch.arange(1, 9).unsqueeze(0)
+    embeds = torch.randn(1, 8, 64).to(torch.bfloat16)
+    previous = torch.randn(1, 8, 256).to(torch.bfloat16)
+
+    out = layer.forward_mtp(positions, embeds, previous, torch.zeros_like(positions))
+
+    assert out.dtype == torch.bfloat16

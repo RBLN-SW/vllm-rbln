@@ -18,7 +18,9 @@
 # within them. Pure torch, hand-verifiable inputs.
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
+import pytest
 import torch
 from vllm.model_executor.custom_op import maybe_get_oot_by_class
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
@@ -355,7 +357,7 @@ class TestSqrtSoftplusRouting:
         chosen = scores.gather(1, ids.long())
         chosen /= chosen.sum(1, keepdim=True)
         expected.scatter_(1, ids.long(), chosen)
-        actual = _apply_sqrtsoftplus_topk(logits, 2, True, forced_ids=ids)
+        actual = _apply_sqrtsoftplus_topk(logits, 2, True, expert_ids=ids)
         torch.testing.assert_close(actual, expected.transpose(0, 1))
 
     def test_bias_changes_selection_without_changing_weights(self):
@@ -369,3 +371,144 @@ class TestSqrtSoftplusRouting:
         expected = torch.zeros(4, 1)
         expected[0, 0] = torch.nn.functional.softplus(logits[0, 0]).sqrt()
         torch.testing.assert_close(actual, expected)
+
+
+class TestHashRoutedForward:
+    @pytest.mark.parametrize("rank", [0, 1])
+    @pytest.mark.parametrize("dispatch", [False, True])
+    @pytest.mark.parametrize("hash_routing", [False, True])
+    def test_dp_gathers_ids_with_hidden_states_and_preserves_rank_padding(
+        self, monkeypatch, rank, dispatch, hash_routing
+    ):
+        import vllm_rbln.model_executor.layers.fused_moe.runner.moe_runner as mr
+
+        counts = [1, 3]
+        hidden = torch.arange(2 * 3 * 64).reshape(2, 3, 64).to(torch.bfloat16)
+        hidden[0, 1:] = 0
+        ids = torch.zeros(2, 3, 64, dtype=torch.bfloat16)
+        ids[0, 0, :2] = torch.tensor([0, 3])
+        ids[1, :, :2] = torch.tensor([[1, 2], [0, 2], [1, 3]])
+        context = SimpleNamespace(
+            dp_metadata=SimpleNamespace(
+                num_tokens_across_dp_cpu=torch.tensor(counts),
+                max_pads_across_dp=torch.empty(3),
+            )
+        )
+        monkeypatch.setattr(mr, "get_forward_context", lambda: context)
+        monkeypatch.setattr(fused_moe_utils, "get_forward_context", lambda: context)
+
+        def router(x):
+            return x[..., :4].float() / 128
+
+        logits = router(hidden)
+        if dispatch:
+            payloads = [ids[..., :2]] if hash_routing else []
+            payloads.append(logits.reshape(2, -1))
+        else:
+            payloads = [torch.cat((hidden, ids), -1) if hash_routing else hidden]
+        sends: list[torch.Tensor] = []
+
+        def all_gather(x, dim):
+            assert len(sends) < len(payloads), "Unexpected extra all-gather"
+            payload = payloads[len(sends)]
+            torch.testing.assert_close(x, payload[rank : rank + 1])
+            sends.append(x)
+            return payload.clone()
+
+        group = SimpleNamespace(
+            all_gather=all_gather,
+            reduce_scatter=lambda x, dim: x[rank * 3 : (rank + 1) * 3],
+            unique_name="test-hash-routing",
+        )
+        monkeypatch.setattr(mr, "get_dp_group", lambda: group)
+        if dispatch:
+            ops = torch.ops.rbln_custom_ops
+            monkeypatch.setattr(ops, "ccl_dispatch_send", lambda *args: (hidden, ids))
+            monkeypatch.setattr(ops, "ccl_all2all_x_kernel", lambda *args: hidden)
+            monkeypatch.setattr(ops, "ccl_dispatch_receive", lambda *args: hidden)
+
+        apply = Mock(side_effect=lambda layer, x, router_logits: x)
+        runner = object.__new__(RBLNMoERunner)
+        torch.nn.Module.__init__(runner)
+        runner.routed_experts = SimpleNamespace(
+            quant_method=SimpleNamespace(apply=apply)
+        )
+        runner.top_k = 2
+        runner.moe_parallel_config = SimpleNamespace(dp_size=2, dp_rank=rank)
+        runner.use_dispatch_all2all = dispatch
+        runner.use_combine_all2all = False
+        runner.use_moe_tokens_mask = True
+        runner.send_mask = torch.eye(4)
+        runner.router = SimpleNamespace(
+            scoring_func="sqrtsoftplus",
+            renormalize=True,
+            e_score_correction_bias=None,
+            num_expert_group=None,
+            topk_group=None,
+        )
+        local_hidden = hidden[rank : rank + 1, : counts[rank]]
+        result = runner(
+            local_hidden,
+            router,
+            expert_ids=ids[rank, : counts[rank]] if hash_routing else None,
+        )
+
+        assert len(sends) == len(payloads)
+        torch.testing.assert_close(result, local_hidden)
+        torch.testing.assert_close(apply.call_args.kwargs["x"], hidden.reshape(6, 64))
+        weights = apply.call_args.kwargs["router_logits"].t().reshape(2, 3, 4)
+        assert weights[0, 1:].count_nonzero() == 0
+        for r, count in enumerate(counts):
+            for t in range(count):
+                chosen = (
+                    ids[r, t, :2].long()
+                    if hash_routing
+                    else logits[r, t].topk(2).indices
+                )
+                scores = torch.nn.functional.softplus(logits[r, t, chosen]).sqrt()
+                expected = torch.zeros(4)
+                expected[chosen] = scores / scores.sum()
+                torch.testing.assert_close(weights[r, t], expected)
+
+    def test_expert_ids_pick_the_experts_the_quant_method_sees(self, monkeypatch):
+        monkeypatch.setattr(
+            fused_moe_utils,
+            "get_forward_context",
+            lambda: SimpleNamespace(
+                dp_metadata=SimpleNamespace(
+                    num_tokens_across_dp_cpu=torch.tensor([3]),
+                    max_pads_across_dp=None,  # DP=1
+                )
+            ),
+        )
+        routed: dict[str, torch.Tensor] = {}
+
+        class _CaptureQuantMethod:
+            def apply(self, layer, x, router_logits):
+                routed["weights"] = router_logits
+                return x
+
+        runner = object.__new__(RBLNMoERunner)
+        torch.nn.Module.__init__(runner)
+        runner.use_moe_tokens_mask = False
+        runner.routed_experts = SimpleNamespace(quant_method=_CaptureQuantMethod())
+        runner.top_k = 2
+        runner.moe_parallel_config = SimpleNamespace(dp_size=1, dp_rank=0)
+        runner.router = SimpleNamespace(
+            scoring_func="sqrtsoftplus",
+            renormalize=True,
+            e_score_correction_bias=None,
+            num_expert_group=None,
+            topk_group=None,
+        )
+        logits = torch.randn(1, 3, 4)
+        ids = torch.tensor([[0, 3], [1, 2], [3, 1]], dtype=torch.bfloat16)
+
+        RBLNMoERunner.forward(
+            runner, torch.zeros(1, 3, 8), lambda _: logits, expert_ids=ids
+        )
+
+        weights = routed["weights"].transpose(0, 1)  # [t, E]
+        chosen = sorted(map(tuple, weights.nonzero().tolist()))
+        assert chosen == sorted((t, int(e)) for t in range(3) for e in ids[t])
+        torch.testing.assert_close(weights.sum(1), torch.ones(3))

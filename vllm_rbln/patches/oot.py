@@ -76,7 +76,9 @@ def register_rbln_oot_implementations() -> None:
     )
     from vllm_rbln.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
         DeepseekScalingRotaryEmbedding,
+        DeepseekV4ScalingRotaryEmbedding,
         RBLNDeepseekScalingRotaryEmbedding,
+        RBLNDeepseekV4ScalingRotaryEmbedding,
     )
     from vllm_rbln.model_executor.layers.vocab_parallel_embedding import (
         ParallelLMHead,
@@ -91,5 +93,8 @@ def register_rbln_oot_implementations() -> None:
     _register_oot(ParallelLMHead, RBLNParallelLMHead)
     _register_oot(MultiHeadLatentAttentionWrapper, RBLNMultiHeadLatentAttentionWrapper)
     _register_oot(DeepseekScalingRotaryEmbedding, RBLNDeepseekScalingRotaryEmbedding)
+    _register_oot(
+        DeepseekV4ScalingRotaryEmbedding, RBLNDeepseekV4ScalingRotaryEmbedding
+    )
     _register_fp8_block_kernel()
     _register_unpacked_wna16_linear_kernel()

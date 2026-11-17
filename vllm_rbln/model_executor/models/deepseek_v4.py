@@ -17,7 +17,6 @@ from itertools import islice
 
 import torch
 import torch.nn.functional as F
-from rebel.ops.torch_custom_ops.mhc import mhc_post, mhc_pre
 from torch import nn
 from transformers import PretrainedConfig
 from vllm.config import VllmConfig, get_current_vllm_config
@@ -34,6 +33,7 @@ from vllm.model_executor.layers.fused_moe import (
     GateLinear,
     fused_moe_make_expert_params_mapping,
 )
+from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -42,7 +42,9 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.layers.rotary_embedding.common import rotate_gptj
+from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
+    DeepseekV4ScalingRotaryEmbedding,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -62,6 +64,10 @@ from vllm.models.deepseek_v4.nvidia.model import _make_deepseek_v4_weights_mappe
 from vllm.sequence import IntermediateTensors
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
+from vllm_rbln.model_executor.layers.quantization.deepseek_v4 import (
+    RBLNDeepseekV4BlockFp8LinearMethod,
+    e8m0_to_bf16,
+)
 from vllm_rbln.patches.attention import _resolve_kv_cache
 from vllm_rbln.v1.attention.backends.deepseek_v4 import (
     DSV4_INDEX_HEAD_DIM,
@@ -69,6 +75,9 @@ from vllm_rbln.v1.attention.backends.deepseek_v4 import (
     RBLNDeepseekV4RingBackend,
     RBLNDeepseekV4StateSpec,
     dsv4_paged_backend,
+)
+from vllm_rbln.v1.attention.backends.flash_attention import (
+    RBLNFlashAttentionMetadata,
 )
 from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
 from vllm_rbln.v1.worker.utils import pipeline_adjusted_layer_index
@@ -81,52 +90,45 @@ DSV4_NUM_CACHE_SLOTS = 6
 
 def _compress_ratio(config: PretrainedConfig, layer_id: int) -> int:
     ratios = config.compress_ratios
-    num_mtp = getattr(config, "num_nextn_predict_layers", 0) or 0
-    if num_mtp and layer_id >= config.num_hidden_layers:
+    if layer_id >= config.num_hidden_layers:
         # Truncating target layers must not move MTP ratios away from the tail.
-        layer_id = len(ratios) - num_mtp + (layer_id - config.num_hidden_layers)
-    return int(ratios[layer_id]) if 0 <= layer_id < len(ratios) else 0
+        layer_id += (
+            len(ratios) - config.num_nextn_predict_layers - config.num_hidden_layers
+        )
+    return int(ratios[layer_id])
 
 
-def _register_layer(module: nn.Module, prefix: str) -> None:
-    vllm_config = get_current_vllm_config()
-    compilation_config = vllm_config.compilation_config
-    if prefix in compilation_config.static_forward_context:
-        raise ValueError(f"Duplicate layer name: {prefix}")
-    compilation_config.static_forward_context[prefix] = module
-    module.layer_index = pipeline_adjusted_layer_index(
-        prefix,
-        vllm_config.model_config,
-        vllm_config.parallel_config,
-        DSV4_NUM_CACHE_SLOTS,
-    )
+class _RBLNDeepseekV4Cache(nn.Module, AttentionLayerBase):
+    def __init__(self, prefix: str) -> None:
+        super().__init__()
+        self.prefix = prefix
+        self.kv_cache = torch.tensor([])
+        vllm_config = get_current_vllm_config()
+        compilation_config = vllm_config.compilation_config
+        if prefix in compilation_config.static_forward_context:
+            raise ValueError(f"Duplicate layer name: {prefix}")
+        compilation_config.static_forward_context[prefix] = self
+        self.layer_index = pipeline_adjusted_layer_index(
+            prefix,
+            vllm_config.model_config,
+            vllm_config.parallel_config,
+            DSV4_NUM_CACHE_SLOTS,
+        )
+
+    def forward(self) -> None: ...
 
 
-def _metadata(prefix: str):
-    attn_metadata = get_forward_context().attn_metadata
-    if isinstance(attn_metadata, dict):
-        return attn_metadata[prefix]
-    return attn_metadata
-
-
-class RBLNDeepseekV4RingCache(nn.Module, AttentionLayerBase):
+class RBLNDeepseekV4RingCache(_RBLNDeepseekV4Cache):
     """A per-request ring: ``[slot, window, width]`` (the SWA ring or a compressor
     state)."""
 
     def __init__(
-        self,
-        prefix: str,
-        window: int,
-        width: int,
-        dtype: torch.dtype,
+        self, prefix: str, window: int, width: int, dtype: torch.dtype
     ) -> None:
-        super().__init__()
-        self.prefix = prefix
+        super().__init__(prefix)
         self.window = window
         self.width = width
         self.dtype = dtype
-        self.kv_cache = torch.tensor([])
-        _register_layer(self, prefix)
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         speculative = vllm_config.speculative_config
@@ -140,10 +142,17 @@ class RBLNDeepseekV4RingCache(nn.Module, AttentionLayerBase):
             dtype=self.dtype,
         )
 
-    def forward(self) -> None: ...
-
     def get_attn_backend(self) -> type[RBLNDeepseekV4RingBackend]:
         return RBLNDeepseekV4RingBackend
+
+    def inputs(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, RBLNFlashAttentionMetadata]:
+        metadata = get_forward_context().attn_metadata[self.prefix]
+        ring = _resolve_kv_cache(metadata, self.layer_index)
+        slots = metadata.block_tables.reshape(-1, 1).to(torch.int32)
+        query_len = metadata.cache_offsets - metadata.cache_seq_lens
+        return ring, slots, query_len.to(torch.int32), metadata
 
 
 def _paged_block_size(vllm_config: VllmConfig, compress_ratio: int) -> int:
@@ -161,23 +170,16 @@ def _paged_block_size(vllm_config: VllmConfig, compress_ratio: int) -> int:
     )
 
 
-class RBLNDeepseekV4PagedCache(nn.Module, AttentionLayerBase):
+class RBLNDeepseekV4PagedCache(_RBLNDeepseekV4Cache):
     """Compressed KV8 entries or fp8 indexer keys, grouped by token block size."""
 
     def __init__(
-        self,
-        prefix: str,
-        compress_ratio: int,
-        width: int,
-        dtype: torch.dtype,
+        self, prefix: str, compress_ratio: int, width: int, dtype: torch.dtype
     ) -> None:
-        super().__init__()
-        self.prefix = prefix
+        super().__init__(prefix)
         self.compress_ratio = compress_ratio
         self.width = width
         self.dtype = dtype
-        self.kv_cache = torch.tensor([])
-        _register_layer(self, prefix)
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         block_size = _paged_block_size(vllm_config, self.compress_ratio)
@@ -189,26 +191,23 @@ class RBLNDeepseekV4PagedCache(nn.Module, AttentionLayerBase):
             tokens_per_state=self.compress_ratio,
         )
 
-    def forward(self) -> None: ...
-
     def get_attn_backend(self):
         return dsv4_paged_backend(self.compress_ratio)
 
+    def inputs(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """(cache, block_table)."""
+        metadata = get_forward_context().attn_metadata[self.prefix]
+        return _resolve_kv_cache(metadata, self.layer_index), metadata.block_tables
 
-class RBLNDeepseekV4AuxCache(nn.Module, AttentionLayerBase):
+
+class RBLNDeepseekV4AuxCache(_RBLNDeepseekV4Cache):
     def __init__(
-        self,
-        prefix: str,
-        owner: RBLNDeepseekV4PagedCache,
-        dtype: torch.dtype,
+        self, prefix: str, owner: RBLNDeepseekV4PagedCache, dtype: torch.dtype
     ) -> None:
-        super().__init__()
-        self.prefix = prefix
+        super().__init__(prefix)
         self.owner_prefix = owner.prefix
         self.owner_ratio = owner.compress_ratio
         self.dtype = dtype
-        self.kv_cache = torch.tensor([])
-        _register_layer(self, prefix)
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> None:
         return None
@@ -217,110 +216,20 @@ class RBLNDeepseekV4AuxCache(nn.Module, AttentionLayerBase):
         rows = _paged_block_size(vllm_config, self.owner_ratio) // self.owner_ratio
         return RBLNBlockAuxSpec(self.owner_prefix, (rows,), self.dtype)
 
-    def forward(self) -> None: ...
-
     def get_attn_backend(self):
         return dsv4_paged_backend(self.owner_ratio)
 
     def inputs(self) -> torch.Tensor:
-        return _resolve_kv_cache(_metadata(self.owner_prefix), self.layer_index)
-
-
-def _ring_inputs(cache: RBLNDeepseekV4RingCache) -> tuple[torch.Tensor, ...]:
-    """(ring tensor [N, window, width], slot [B, 1], query_len [B, 1]) of a ring
-    cache.
-    """
-    metadata = _metadata(cache.prefix)
-    ring = _resolve_kv_cache(metadata, cache.layer_index)
-    slots = metadata.block_tables.reshape(-1, 1).to(torch.int32)
-    query_len = metadata.cache_offsets - metadata.cache_seq_lens
-    return ring, slots, query_len.to(torch.int32)
-
-
-def _paged_inputs(cache: RBLNDeepseekV4PagedCache) -> tuple[torch.Tensor, ...]:
-    metadata = _metadata(cache.prefix)
-    return _resolve_kv_cache(metadata, cache.layer_index), metadata.block_tables
-
-
-class RBLNRMSNorm(nn.Module):
-    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=torch.float32))
-        self.variance_epsilon = eps
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        xf = x.float()
-        xf = xf * torch.rsqrt(
-            xf.square().mean(dim=-1, keepdim=True) + self.variance_epsilon
-        )
-        return (self.weight * xf).to(x.dtype)
-
-
-class RBLNDeepseekV4Rope(nn.Module):
-    """Upstream RoPE tables with rank-4 forward/inverse rotations for RBLN."""
-
-    def __init__(
-        self, config: PretrainedConfig, compress_ratio: int, max_pos: int
-    ) -> None:
-        super().__init__()
-        self.rope_dim = config.qk_rope_head_dim
-        device = torch.get_default_device()
-        # Use upstream's YaRN parameters and frequency calculation for both legacy
-        # flat and per-layer-type RoPE configurations.
-        with torch.device("cpu"):
-            rope = build_deepseek_v4_rope(
-                config,
-                head_dim=config.head_dim,
-                rope_head_dim=self.rope_dim,
-                max_position_embeddings=max_pos,
-                compress_ratio=compress_ratio,
-            )
-            cos, sin = rope.cos_sin_cache[:max_pos].chunk(2, dim=-1)
-            cos = cos.repeat_interleave(2, dim=-1)
-            sin = sin.repeat_interleave(2, dim=-1)
-        self.register_buffer("cos_cache", cos.to(device), persistent=False)
-        self.register_buffer("sin_cache", sin.to(device), persistent=False)
-
-    def forward(
-        self, x: torch.Tensor, positions: torch.Tensor, inverse: bool = False
-    ) -> torch.Tensor:
-        """x [B, L, ..., D]; positions [B, L]. Rotates x[..., -rope_dim:]."""
-        if x.dim() == 3:
-            # The compiler fuses a rotation over a 4- or 5-D tensor only; a head-less
-            # [B, L, D] one (kv, compressed entries) would leave its channel shuffle
-            # on the host.
-            return self.forward(x.unsqueeze(2), positions, inverse).squeeze(2)
-        batch, seq_len = positions.shape[0], positions.shape[1]
-        flat = positions.flatten()
-        cos = self.cos_cache.index_select(0, flat).view(batch, seq_len, -1)
-        sin = self.sin_cache.index_select(0, flat).view(batch, seq_len, -1)
-        for _ in range(x.dim() - 3):
-            cos, sin = cos.unsqueeze(-2), sin.unsqueeze(-2)
-        nope, rope = x[..., : -self.rope_dim], x[..., -self.rope_dim :].float()
-        if inverse:
-            rot = rope * cos - rotate_gptj(rope) * sin
-        else:
-            rot = rope * cos + rotate_gptj(rope) * sin
-        return torch.cat([nope, rot.to(x.dtype)], dim=-1)
+        metadata = get_forward_context().attn_metadata[self.owner_prefix]
+        return _resolve_kv_cache(metadata, self.layer_index)
 
 
 _TID2EID_LANES = 64
 
 
-def _hc_scale_vec(scale: torch.Tensor, hc: int) -> torch.Tensor:
-    """[3] (pre, post, comb) scales -> [(2 + hc) * hc], one per mix; built on the
-    host.
-    """
-    s = scale.detach().to("cpu", torch.float32)
-    vec = torch.cat([s[0].expand(hc), s[1].expand(hc), s[2].expand(hc * hc)])
-    return vec.to(scale.device)
-
-
 class RBLNDeepseekV4Compressor(nn.Module):
     """Gated pooling of ``compress_ratio`` tokens into one entry, then RMSNorm + RoPE
-    at the block's first position. The pooling and its per-request ring live in
-    ``rbln_custom_ops.deepseek_v4_compressor``.
-    """
+    at the block's first position."""
 
     def __init__(
         self,
@@ -328,7 +237,7 @@ class RBLNDeepseekV4Compressor(nn.Module):
         compress_ratio: int,
         head_dim: int,
         state_slot: int,
-        rope: RBLNDeepseekV4Rope,
+        rope: DeepseekV4ScalingRotaryEmbedding,
         prefix: str,
     ) -> None:
         super().__init__()
@@ -349,7 +258,7 @@ class RBLNDeepseekV4Compressor(nn.Module):
             prefix=f"{prefix}.fused_wkv_wgate",
             disable_tp=True,
         )
-        self.norm = RBLNRMSNorm(head_dim, config.rms_norm_eps)
+        self.norm = RMSNorm(head_dim, config.rms_norm_eps)
         self.rope = rope
         self.state_cache = RBLNDeepseekV4RingCache(
             prefix=f"{prefix}.state.{state_slot}",
@@ -363,7 +272,7 @@ class RBLNDeepseekV4Compressor(nn.Module):
         """x [B, L, H] -> [B, ceil(L / r), head_dim] candidates (normed, RoPE'd)."""
         kv_score, _ = self.fused_wkv_wgate(x.float())
         kv, score = kv_score.chunk(2, dim=-1)
-        state, slot, query_len = _ring_inputs(self.state_cache)
+        state, slot, query_len, _ = self.state_cache.inputs()
         pooled = torch.ops.rbln_custom_ops.deepseek_v4_compressor(
             kv.float().contiguous(),
             score.float().contiguous(),
@@ -381,7 +290,7 @@ class RBLNDeepseekV4Compressor(nn.Module):
         positions = (seq_idx // r + j[None, :]) * r
         # Padded candidates can extend beyond max_model_len; their rotation is unused.
         positions = positions.minimum((seq_idx + query_len - 1).clamp_min(0))
-        return self.rope(entries, positions.long())
+        return self.rope(positions.long(), entries)[0]
 
 
 class RBLNDeepseekV4Indexer(nn.Module):
@@ -392,7 +301,7 @@ class RBLNDeepseekV4Indexer(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
-        rope: RBLNDeepseekV4Rope,
+        rope: DeepseekV4ScalingRotaryEmbedding,
         quant_config: QuantizationConfig | None,
         prefix: str,
     ) -> None:
@@ -447,14 +356,12 @@ class RBLNDeepseekV4Indexer(nn.Module):
     ) -> torch.Tensor:
         batch, seq_len, _ = x.shape
         q, _ = self.wq_b(qr)
-        q = self.rope(q.view(batch, seq_len, self.n_heads, self.head_dim), positions)
+        q, _ = self.rope(positions, q.view(batch, seq_len, self.n_heads, self.head_dim))
         k_cur = self.compressor(x, seq_idx)
         weights, _ = self.weights_proj(x)
         weights = weights.float() * self.weight_scale
-        k_cache, block_table = _paged_inputs(self.k_cache)
-        k_scale = self.k_scale.inputs()  # [NB, E] f16: one scale a compressed key
-        # GLM-5.3's kpool indexer has the V4 compressed-key indexer's contract (store
-        # the step's candidates, pick among e < (p + 1) // 4, ascending, -1 tail).
+        k_cache, block_table = self.k_cache.inputs()
+        k_scale = self.k_scale.inputs()
         return torch.ops.rbln_custom_ops.sparse_attn_glm5_indexer(
             q.transpose(1, 2).contiguous(),
             k_cur.contiguous(),
@@ -478,7 +385,6 @@ class RBLNDeepseekV4Attention(nn.Module):
         vllm_config: VllmConfig,
         layer_id: int,
         prefix: str,
-        ropes: dict[bool, RBLNDeepseekV4Rope],
     ) -> None:
         super().__init__()
         config = vllm_config.model_config.hf_text_config
@@ -516,7 +422,7 @@ class RBLNDeepseekV4Attention(nn.Module):
             prefix=f"{prefix}.fused_wqa_wkv",
             disable_tp=True,
         )
-        self.q_norm = RBLNRMSNorm(self.q_lora_rank, self.eps)
+        self.q_norm = RMSNorm(self.q_lora_rank, self.eps)
         self.wq_b = ColumnParallelLinear(
             self.q_lora_rank,
             self.n_heads * self.head_dim,
@@ -524,9 +430,7 @@ class RBLNDeepseekV4Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.wq_b",
         )
-        self.kv_norm = RBLNRMSNorm(self.head_dim, self.eps)
-        # Grouped: o [.., g, H * D / g] x wo_a[g] -> [.., g, o_lora]; the weight is
-        # read dequantized and multiplied per group (a bmm).
+        self.kv_norm = RMSNorm(self.head_dim, self.eps)
         self.wo_a = ColumnParallelLinear(
             self.n_heads * self.head_dim // self.n_groups,
             self.n_groups * self.o_lora_rank,
@@ -553,12 +457,13 @@ class RBLNDeepseekV4Attention(nn.Module):
             prefix=f"{prefix}.wo_b",
         )
 
-        max_pos = vllm_config.model_config.max_model_len
-        # Share tables within this model, without retaining another model's device.
-        compressed = bool(self.compress_ratio)
-        if compressed not in ropes:
-            ropes[compressed] = RBLNDeepseekV4Rope(config, self.compress_ratio, max_pos)
-        self.rope = ropes[compressed]
+        self.rope = build_deepseek_v4_rope(
+            config,
+            head_dim=self.head_dim,
+            rope_head_dim=self.rope_dim,
+            max_position_embeddings=vllm_config.model_config.max_model_len,
+            compress_ratio=self.compress_ratio,
+        )
         self.swa_cache = RBLNDeepseekV4RingCache(
             prefix=f"{prefix}.swa_cache.{SLOT_SWA}",
             window=self.window,
@@ -591,28 +496,15 @@ class RBLNDeepseekV4Attention(nn.Module):
         self.scale = self.head_dim**-0.5
 
     def finalize_wo_a(self) -> None:
-        """wo_a as the [1, g, d, r] bf16 batched-matmul weight, dequantized once on
-        the host after loading (as MLA's W_UV): an einsum lowers to a host op, and
-        an in-graph fp8 dequant + transpose in front of the matmul fails the fp8
-        weight-format annotation.
-        """
         weight = self.wo_a.weight.detach().to("cpu")
         method = self.wo_a.quant_method
-        if hasattr(method, "dequantized_weight"):
+        if isinstance(method, RBLNDeepseekV4BlockFp8LinearMethod):
             block_n, block_k = (int(v) for v in method.weight_block_size)
             n, k = weight.shape
-            if hasattr(self.wo_a, "weight_scale_t"):  # folded already: [K / 128, N]
-                scale = self.wo_a.weight_scale_t.detach().to("cpu", torch.float32).t()
-            else:
-                # Before folding: the checkpoint's [N / 128, K / 128].
-                from vllm_rbln.model_executor.layers.quantization.deepseek_v4 import (
-                    e8m0_to_bf16,
-                )
-
-                inv = self.wo_a.weight_scale_inv.detach().to("cpu")
-                if inv.dtype in (torch.float8_e8m0fnu, torch.uint8):
-                    inv = e8m0_to_bf16(inv)
-                scale = inv.to(torch.float32).repeat_interleave(block_n, dim=0)[:n]
+            inv = self.wo_a.weight_scale_inv.detach().to("cpu")
+            if inv.dtype in (torch.float8_e8m0fnu, torch.uint8):
+                inv = e8m0_to_bf16(inv)
+            scale = inv.to(torch.float32).repeat_interleave(block_n, dim=0)[:n]
             # bf16 product, the same rounding as the in-graph dequantized_weight it
             # replaces
             bf = torch.bfloat16
@@ -637,11 +529,11 @@ class RBLNDeepseekV4Attention(nn.Module):
         q = (qf * torch.rsqrt(qf.square().mean(dim=-1, keepdim=True) + self.eps)).to(
             x.dtype
         )
-        q = self.rope(q, positions)
-        kv = self.rope(self.kv_norm(kv), positions)  # [B, L, 512]
+        q, _ = self.rope(positions, q)
+        kv, _ = self.rope(positions, self.kv_norm(kv))  # [B, L, 512]
 
-        swa, swa_slot, query_len = _ring_inputs(self.swa_cache)
-        seq_idx = _metadata(self.swa_cache.prefix).cache_seq_lens.to(torch.int32)
+        swa, swa_slot, query_len, metadata = self.swa_cache.inputs()
+        seq_idx = metadata.cache_seq_lens.to(torch.int32)
         common = (
             q.transpose(1, 2).contiguous(),
             kv.contiguous(),
@@ -655,7 +547,7 @@ class RBLNDeepseekV4Attention(nn.Module):
         if self.compress_ratio:
             assert self.compressor is not None and self.cmp_cache is not None
             kv_cmp = self.compressor(x, seq_idx).contiguous()
-            cmp_cache, cmp_block_table = _paged_inputs(self.cmp_cache)
+            cmp_cache, cmp_block_table = self.cmp_cache.inputs()
             compressed = (self.compress_ratio, kv_cmp, cmp_cache, cmp_block_table)
             if self.indexer is not None:  # CSA: the indexer's top-k entries
                 topk_index = self.indexer(x, qr, positions, seq_idx, query_len)
@@ -669,16 +561,11 @@ class RBLNDeepseekV4Attention(nn.Module):
         else:
             o = torch.ops.rbln_custom_ops.sparse_attn_deepseek_v4_swa(*common)
         # o [B, H, L, D]
-        o = self.rope(o.transpose(1, 2), positions, inverse=True)  # [B, L, H, D]
+        o, _ = self.rope(positions, o.transpose(1, 2), inverse=True)  # [B, L, H, D]
         o = o.reshape(batch, seq_len, self.n_local_groups, -1)
         o = torch.matmul(o.transpose(1, 2), self.wo_a_t.to(o.dtype))
         out, _ = self.wo_b(o.transpose(1, 2).flatten(2))
         return out
-
-
-# ------------------------------------------------------------------------------
-# MoE
-# ------------------------------------------------------------------------------
 
 
 class RBLNDeepseekV4MLP(nn.Module):
@@ -739,9 +626,6 @@ class RBLNDeepseekV4MoE(nn.Module):
         )
         if self.is_hash:
             self.gate.e_score_correction_bias = None
-            # bf16 rows padded to 64 lanes: looked up as a device embedding (an int32
-            # table gather lowers to one host index per token). Expert ids < 256 are
-            # exact in bf16.
             self.gate.tid2eid = nn.Parameter(
                 torch.zeros(config.vocab_size, _TID2EID_LANES, dtype=torch.bfloat16),
                 requires_grad=False,
@@ -773,43 +657,21 @@ class RBLNDeepseekV4MoE(nn.Module):
             router_logits_dtype=torch.float32,
         )
 
-    def _router(self, hidden_states: torch.Tensor, input_ids: torch.Tensor):
-        # Hash layers: the expert ids are a bf16 table lookup of the local tokens;
-        # under DP the runner carries them through its hidden-state gather
-        # (`gather_extra`) and hands the gathered rows back as `extra`.
-        eids_local = (
-            F.embedding(input_ids.reshape(-1), self.gate.tid2eid)
-            if self.is_hash
-            else None
-        )
-
-        def route(x: torch.Tensor, extra: torch.Tensor | None = None):
-            logits, _ = self.gate(x.float())
-            if not self.is_hash:
-                return logits
-            eids = eids_local if extra is None else extra
-            # bf16 ids as they are: the router masks with a compare, no int cast
-            return logits, eids[:, : self.top_k]
-
-        if self.is_hash:
-            route.gather_extra = eids_local  # type: ignore[attr-defined]
-        return route
-
     def forward(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor
     ) -> torch.Tensor:
+        expert_ids = None
+        if self.is_hash:
+            expert_ids = F.embedding(input_ids.reshape(-1), self.gate.tid2eid)
         out = self.experts(
-            hidden_states=hidden_states, router=self._router(hidden_states, input_ids)
+            hidden_states=hidden_states,
+            router=lambda x: self.gate(x.float())[0],
+            expert_ids=expert_ids,
         )
         out = out * self.routed_scaling_factor + self.shared_experts(hidden_states)
         if self.tp_size > 1:
             out = tensor_model_parallel_all_reduce(out)
         return out.to(hidden_states.dtype)
-
-
-# ------------------------------------------------------------------------------
-# decoder
-# ------------------------------------------------------------------------------
 
 
 class RBLNDeepseekV4DecoderLayer(nn.Module):
@@ -818,7 +680,6 @@ class RBLNDeepseekV4DecoderLayer(nn.Module):
         *,
         vllm_config: VllmConfig,
         prefix: str,
-        ropes: dict[bool, RBLNDeepseekV4Rope],
     ) -> None:
         super().__init__()
         config = vllm_config.model_config.hf_text_config
@@ -828,12 +689,11 @@ class RBLNDeepseekV4DecoderLayer(nn.Module):
         self.hc_mult = config.hc_mult
         self.hc_iters = config.hc_sinkhorn_iters
         self.hc_eps = config.hc_eps
-        self.attn = RBLNDeepseekV4Attention(
-            vllm_config, layer_id, f"{prefix}.attn", ropes
-        )
+        self.hc_post_mult = 2.0
+        self.attn = RBLNDeepseekV4Attention(vllm_config, layer_id, f"{prefix}.attn")
         self.ffn = RBLNDeepseekV4MoE(vllm_config, layer_id, f"{prefix}.ffn")
-        self.attn_norm = RBLNRMSNorm(config.hidden_size, self.norm_eps)
-        self.ffn_norm = RBLNRMSNorm(config.hidden_size, self.norm_eps)
+        self.attn_norm = RMSNorm(config.hidden_size, self.norm_eps)
+        self.ffn_norm = RMSNorm(config.hidden_size, self.norm_eps)
         mix_hc = (2 + self.hc_mult) * self.hc_mult
         hc_dim = self.hc_mult * config.hidden_size
         for name, shape in (
@@ -858,25 +718,45 @@ class RBLNDeepseekV4DecoderLayer(nn.Module):
             )
 
     def finalize_hc_scales(self) -> None:
-        self.hc_attn_scale_vec = _hc_scale_vec(self.hc_attn_scale, self.hc_mult)
-        self.hc_ffn_scale_vec = _hc_scale_vec(self.hc_ffn_scale, self.hc_mult)
+        n = self.hc_mult
+        lanes = torch.tensor([n, n, n * n])
+        for kind in ("attn", "ffn"):
+            scale = getattr(self, f"hc_{kind}_scale").cpu()
+            getattr(self, f"hc_{kind}_scale_vec").copy_(scale.repeat_interleave(lanes))
 
-    def _sublayer(
-        self, streams, fn, scale, base, norm, sublayer, *args
-    ) -> torch.Tensor:
-        """Run a sublayer with token-cut mHC for prefill chunks."""
-        x, state = mhc_pre(
-            streams,
-            fn,
-            scale,
-            base,
-            rms_eps=self.norm_eps,
-            hc_eps=self.hc_eps,
-            iters=self.hc_iters,
+    def _sublayer(self, streams, fn, scale, base, norm, sublayer) -> torch.Tensor:
+        streams_f32 = streams.float()
+        metadata = get_forward_context().attn_metadata[self.attn.swa_cache.prefix]
+        if metadata.is_prefill:
+            logits = torch.ops.rbln_custom_ops.mhc_mix(
+                streams_f32, fn, scale, base, eps=self.norm_eps
+            )
+            x = torch.ops.rbln_custom_ops.mhc_read(
+                streams_f32, logits, eps=self.hc_eps
+            ).to(norm.weight.dtype)
+            y = sublayer(norm(x))
+            return torch.ops.rbln_custom_ops.mhc_write(
+                y.float(),
+                streams_f32,
+                logits,
+                post_mult=self.hc_post_mult,
+                iters=self.hc_iters,
+                eps=self.hc_eps,
+            )
+        batch, n, tokens, hidden = streams.shape
+        flat = streams.transpose(1, 2).reshape(batch, tokens, n * hidden).float()
+        flat = flat * torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.norm_eps)
+        z = F.linear(flat, fn) * scale + base
+        z_pre, z_post = z[..., :n], z[..., n : 2 * n]
+        comb = torch.ops.rbln_custom_ops.sinkhorn_normalize(
+            z[..., 2 * n :], iters=self.hc_iters, eps=self.hc_eps
         )
-        x = sublayer(norm(x.to(streams.dtype)), *args)
-        return mhc_post(
-            x, state, post_mult=2.0, iters=self.hc_iters, hc_eps=self.hc_eps
+        x = torch.ops.rbln_custom_ops.hc_stream_reduce(
+            streams_f32, z_pre, eps=self.hc_eps
+        ).to(streams.dtype)
+        x = sublayer(norm(x))
+        return torch.ops.rbln_custom_ops.hc_residual_add(
+            x.float(), streams_f32, z_post, comb, post_mult=self.hc_post_mult
         ).to(streams.dtype)
 
     def forward(
@@ -975,10 +855,10 @@ def _load_deepseek_v4_weights(
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
     for layer in layers:
-        if hasattr(layer, "finalize_hc_scales"):
-            layer.finalize_hc_scales()
-        if hasattr(layer, "attn"):
-            layer.attn.finalize_wo_a()
+        if isinstance(layer, PPMissingLayer):
+            continue
+        layer.finalize_hc_scales()
+        layer.attn.finalize_wo_a()
     return loaded_params
 
 
@@ -1021,15 +901,14 @@ class RBLNDeepseekV4Model(nn.Module):
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["streams"], config.hc_mult * config.hidden_size
         )
-        ropes: dict[bool, RBLNDeepseekV4Rope] = {}
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: RBLNDeepseekV4DecoderLayer(
-                vllm_config=vllm_config, prefix=prefix, ropes=ropes
+                vllm_config=vllm_config, prefix=prefix
             ),
             prefix=f"{prefix}.layers",
         )
-        self.norm = RBLNRMSNorm(config.hidden_size, self.norm_eps)
+        self.norm = RMSNorm(config.hidden_size, self.norm_eps)
         hc_dim = self.hc_mult * config.hidden_size
         self.hc_head_fn = nn.Parameter(
             torch.empty(self.hc_mult, hc_dim, dtype=torch.float32), requires_grad=False
@@ -1071,10 +950,12 @@ class RBLNDeepseekV4Model(nn.Module):
                 .transpose(1, 2)
                 .contiguous()
             )
-        # Slicing ModuleList during tracing lifts weights into graph inputs.
+
+        input_dtype = streams.dtype
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             streams = layer(positions, streams, input_ids)
-        # PP and MTP consume pre-hc-head streams; compute_logits applies the head.
+
+        streams = streams.to(input_dtype)
         flat = streams.transpose(1, 2).reshape(batch, tokens, self.hc_mult * hidden)
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"streams": flat})
@@ -1192,17 +1073,11 @@ class RBLNDeepseekV4ForCausalLM(nn.Module, SupportsPP):
         return self.model.get_expert_mapping()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # the MTP head's weights are RBLNDeepseekV4MTP's
         weights = (
             (n, w) for n, w in weights if not n.startswith(("model.mtp.", "mtp."))
         )
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
-
-# ------------------------------------------------------------------------------
-# MTP (multi-token prediction) draft head
-# ------------------------------------------------------------------------------
 
 
 class RBLNDeepseekV4MTPLayer(RBLNDeepseekV4DecoderLayer):
@@ -1213,14 +1088,13 @@ class RBLNDeepseekV4MTPLayer(RBLNDeepseekV4DecoderLayer):
         *,
         vllm_config: VllmConfig,
         prefix: str,
-        ropes: dict[bool, RBLNDeepseekV4Rope],
     ) -> None:
-        super().__init__(vllm_config=vllm_config, prefix=prefix, ropes=ropes)
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
         config = vllm_config.model_config.hf_text_config
         quant_config = vllm_config.quant_config
         hidden = config.hidden_size
-        self.enorm = RBLNRMSNorm(hidden, self.norm_eps)
-        self.hnorm = RBLNRMSNorm(hidden, self.norm_eps)
+        self.enorm = RMSNorm(hidden, self.norm_eps)
+        self.hnorm = RMSNorm(hidden, self.norm_eps)
         self.e_proj = ReplicatedLinear(
             hidden,
             hidden,
@@ -1248,7 +1122,7 @@ class RBLNDeepseekV4MTPLayer(RBLNDeepseekV4DecoderLayer):
                 ),
             )
         self.shared_head = nn.Module()
-        self.shared_head.norm = RBLNRMSNorm(hidden, self.norm_eps)
+        self.shared_head.norm = RMSNorm(hidden, self.norm_eps)
 
     def forward_mtp(
         self,
@@ -1266,7 +1140,7 @@ class RBLNDeepseekV4MTPLayer(RBLNDeepseekV4DecoderLayer):
         e = self.e_proj(self.enorm(inputs_embeds))[0]  # [B, T, H]
         h = self.h_proj(self.hnorm(previous.reshape(batch, tokens, n, hidden)))[0]
         streams = (h + e.unsqueeze(2)).transpose(1, 2).contiguous()  # [B, n, T, H]
-        streams = self.forward(positions, streams, input_ids)
+        streams = self.forward(positions, streams, input_ids).to(inputs_embeds.dtype)
         return streams.transpose(1, 2).reshape(batch, tokens, n * hidden)
 
     def head_hidden(self, flat_streams: torch.Tensor) -> torch.Tensor:
@@ -1289,13 +1163,10 @@ class RBLNDeepseekV4MTPModel(nn.Module):
         self.config = config
         self.mtp_start_layer_idx = config.num_hidden_layers
         self.num_mtp_layers = config.num_nextn_predict_layers
-        ropes: dict[bool, RBLNDeepseekV4Rope] = {}
         self.layers = nn.ModuleDict(
             {
                 str(idx): RBLNDeepseekV4MTPLayer(
-                    vllm_config=vllm_config,
-                    prefix=f"{prefix}.layers.{idx}",
-                    ropes=ropes,
+                    vllm_config=vllm_config, prefix=f"{prefix}.layers.{idx}"
                 )
                 for idx in range(
                     self.mtp_start_layer_idx,
@@ -1308,17 +1179,13 @@ class RBLNDeepseekV4MTPModel(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # The draft wrapper maps MTP names to layers.{num_hidden_layers + i}.*.
         return _load_deepseek_v4_weights(
             self, self.config, weights, list(self.layers.values())
         )
 
 
 class RBLNDeepseekV4MTP(nn.Module):
-    """MTP draft model sharing the target lm_head and non-PP embeddings.
-
-    Previous hidden states are the target's flat pre-hc-head streams.
-    """
+    """MTP draft model sharing the target lm_head and non-PP embeddings."""
 
     has_own_lm_head = False
     hf_to_vllm_mapper = RBLNDeepseekV4ForCausalLM.hf_to_vllm_mapper
@@ -1349,8 +1216,6 @@ class RBLNDeepseekV4MTP(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         spec_step_index: int = 0,
     ) -> torch.Tensor:
-        # Upstream expects one tensor: flat streams serve both the logits and the next
-        # drafting step's previous hidden states.
         if inputs_embeds is None:
             inputs_embeds = self.embed_input_ids(input_ids)
         layer = self._mtp_layers[spec_step_index % len(self._mtp_layers)]
@@ -1368,8 +1233,6 @@ class RBLNDeepseekV4MTP(nn.Module):
         own_embed = get_pp_group().world_size > 1
 
         def mtp_only():
-            # The target's embedding lives on the first PP stage, so the drafter on
-            # the last stage loads its own copy. The lm_head remains shared.
             for name, weight in weights:
                 if own_embed and name == "embed.weight":
                     yield name, weight
