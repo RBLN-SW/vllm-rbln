@@ -101,7 +101,7 @@ def _assert_conv_rows(
         "conv_load_blocks": blocks,
         "conv_start_positions": start_positions,
         "conv_query_lens": query_lens,
-        "conv_has_initial_state": has_initial_state,
+        "has_initial_state": has_initial_state,
         "conv_store_blocks": blocks if store_blocks is None else store_blocks,
     }
     for name, values in want.items():
@@ -120,9 +120,6 @@ class TestBuilder:
         # A fresh request names its block for both, and the kernel reads none.
         assert md.load_blocks.dtype == md.store_blocks.dtype == torch.int16
         assert md.load_blocks.tolist() == md.store_blocks.tolist() == [7]
-        # The chunk kernel's initial-state flag is the step's, as upstream names it.
-        assert md.prefill_has_initial_state is md.has_initial_state
-        assert md.prefill_has_initial_state.tolist() == [0]
         _assert_conv_rows(md, [7], [0], [70], [0])
         assert md.valid_mask.shape == (1, 1, 128)
         assert md.valid_mask.sum() == 70 and md.valid_mask[..., :70].all()
@@ -139,7 +136,6 @@ class TestBuilder:
         md = builder.build(_common([58], [128], [[7]]), positions, 1, True)
         assert md.num_prefill_tokens == 58
         assert md.load_blocks.tolist() == [7]
-        assert md.prefill_has_initial_state.tolist() == [1]
         _assert_conv_rows(md, [7], [70], [58], [1])
 
     def test_decode_pads_the_batch_onto_the_null_block(self, builder):
@@ -150,8 +146,6 @@ class TestBuilder:
         assert md.batch_size == 4
         assert md.load_blocks.tolist() == [7, 3, 0, 0]
         assert md.store_blocks.tolist() == [7, 3, 0, 0]
-        # The chunk kernel's initial-state flag belongs to a prefill step.
-        assert md.has_initial_state is None and md.prefill_has_initial_state is None
         _assert_conv_rows(md, [7, 3, 0, 0], [128, 5, 0, 0], [1, 1, 0, 0], [1, 1, 0, 0])
         assert md.valid_mask is None
 

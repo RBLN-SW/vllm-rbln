@@ -64,9 +64,11 @@ class RBLNGDNAttentionMetadata(GDNAttentionMetadata):
 
     A step is one prefill request or a decode batch, never both and never
     speculative, so the `spec_*` fields and the ones for upstream's own kernels
-    stay unset. The state blocks are padded to the step's batch and stay int16
-    on the host: the kernels read them through the const buffer, and a device
-    copy crashes the runtime.
+    stay unset. `has_initial_state` is [batch] int32 on the device, on a decode
+    step too: kda_conv takes it on every step, the chunk kernel on prefill. The
+    state blocks are padded to the step's batch and stay int16 on the host: the
+    kernels read them through the const buffer, and a device copy crashes the
+    runtime.
     """
 
     # The compiled step's batch: 1 on prefill, the padded batch on decode.
@@ -79,7 +81,6 @@ class RBLNGDNAttentionMetadata(GDNAttentionMetadata):
     conv_load_blocks: torch.Tensor
     conv_start_positions: torch.Tensor
     conv_query_lens: torch.Tensor
-    conv_has_initial_state: torch.Tensor
     conv_store_blocks: torch.Tensor
     # [1, 1, largest prefill chunk] float32 on prefill: 1 for valid tokens, 0
     # for padding. The layer takes the step's chunk of it.
@@ -182,10 +183,6 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
             max_chunk = self.chunked_prefill_size
             valid_mask = (torch.arange(max_chunk) < query_lens[0]).to(torch.float32)
             valid_mask = valid_mask.view(1, 1, max_chunk)
-        has_initial_state = self._padded(context_lens_tensor > 0, batch_size)
-        prefill_has_initial_state = (
-            has_initial_state.to(torch.int16) if is_prefill else None
-        )
         return RBLNGDNAttentionMetadata(
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
@@ -194,8 +191,9 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
             num_spec_decodes=0,
             num_spec_decode_tokens=0,
             num_actual_tokens=m.num_actual_tokens,
-            has_initial_state=prefill_has_initial_state,
-            prefill_has_initial_state=prefill_has_initial_state,
+            has_initial_state=self._stage(
+                self._padded(context_lens_tensor > 0, batch_size), "has_initial_state"
+            ),
             batch_size=batch_size,
             load_blocks=load_blocks.to(torch.int16),
             store_blocks=store_blocks.to(torch.int16),
@@ -205,9 +203,6 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
             ),
             conv_query_lens=self._stage(
                 self._padded(query_lens, batch_size), "conv_query_lens"
-            ),
-            conv_has_initial_state=self._stage(
-                has_initial_state, "conv_has_initial_state"
             ),
             conv_store_blocks=self._stage(store_blocks, "conv_store_blocks"),
             valid_mask=None

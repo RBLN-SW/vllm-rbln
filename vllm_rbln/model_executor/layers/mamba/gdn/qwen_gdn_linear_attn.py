@@ -168,7 +168,7 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             metadata.conv_load_blocks,
             metadata.conv_start_positions,
             metadata.conv_query_lens,
-            metadata.conv_has_initial_state,
+            metadata.has_initial_state,
             kernel - 1,
             store_index=metadata.conv_store_blocks,
         )
@@ -199,7 +199,7 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 beta.contiguous(),
                 state,
                 metadata.load_blocks,
-                metadata.prefill_has_initial_state,
+                metadata.has_initial_state,
                 store_index=metadata.store_blocks,
             )
         else:
