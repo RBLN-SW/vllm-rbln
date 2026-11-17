@@ -37,9 +37,8 @@ MODELS: list[CompileModelSpec] = [
         # page. Under prefix caching a request holds two state blocks a GDN group:
         # 32 + 3 * 2 + the null block.
         {
-            "max_num_seqs": 2,
-            "language_model_only": True,
-            "block_size": 256,
+            "max_num_seqs": 1,
+            "block_size": 1024,
             "num_gpu_blocks_override": 39,
         },
         chips=REBEL,
