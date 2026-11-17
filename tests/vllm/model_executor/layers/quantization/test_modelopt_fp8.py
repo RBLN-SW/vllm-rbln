@@ -14,7 +14,7 @@
 
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -23,6 +23,7 @@ from vllm_rbln.model_executor.layers.quantization.modelopt_fp8 import (
     RBLNModelOptFp8LinearMethod,
 )
 from vllm_rbln.model_executor.layers.quantization.modelopt_mxfp8 import (
+    RBLNModelOptMxFp8FusedMoE,
     RBLNModelOptMxFp8LinearMethod,
 )
 
@@ -230,3 +231,70 @@ class TestModelOptMxFp8:
                 output_size=2,
                 params_dtype=torch.bfloat16,
             )
+
+
+class TestModelOptMxFp8MoE:
+    # MiniMax-M3's quantization_config, trimmed to one excluded router gate.
+    HF_QUANT_CONFIG = {
+        "quant_method": "mxfp8",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [1, 32],
+        "ignored_layers": ["language_model.model.layers.3.block_sparse_moe.gate"],
+    }
+    EXPERTS, HIDDEN, INTERMEDIATE = 2, 64, 64
+
+    def _method(self) -> Any:
+        from vllm.model_executor.layers.fused_moe import RoutedExperts
+        from vllm.model_executor.layers.quantization import get_quantization_config
+
+        config = get_quantization_config("mxfp8").from_config(self.HF_QUANT_CONFIG)
+        experts = MagicMock(spec=RoutedExperts)
+        experts.moe_config = SimpleNamespace(is_act_and_mul=True)
+        return config.get_quant_method(
+            experts, "language_model.model.layers.3.block_sparse_moe.experts"
+        )
+
+    def test_mxfp8_checkpoint_experts_take_the_rbln_method(self):
+        assert isinstance(self._method(), RBLNModelOptMxFp8FusedMoE)
+
+    def test_apply_hands_the_op_raw_e8m0_scales_split_gate_then_up(self):
+        method = self._method()
+        layer = torch.nn.Module()
+        layer.hidden_size, layer.intermediate_size_per_partition = (
+            self.HIDDEN,
+            self.INTERMEDIATE,
+        )
+        method.create_weights(
+            layer,
+            num_experts=self.EXPERTS,
+            hidden_size=self.HIDDEN,
+            intermediate_size_per_partition=self.INTERMEDIATE,
+            params_dtype=torch.bfloat16,
+            weight_loader=lambda *a, **k: None,
+        )
+        # Scale byte = 100 + (0 for gate rows, 1 for up rows) marks each half.
+        layer.w13_weight_scale.data[:, : self.INTERMEDIATE] = 100
+        layer.w13_weight_scale.data[:, self.INTERMEDIATE :] = 101
+        method.process_weights_after_loading(layer)
+        layer.activation = SimpleNamespace(value="swigluoai_uninterleave")
+        layer.expert_map = None
+        layer.swiglu_alpha, layer.swiglu_limit, layer.swiglu_beta = 1.702, 7.0, 1.0
+
+        x = torch.zeros(1, 3, self.HIDDEN, dtype=torch.bfloat16)
+        op = MagicMock(return_value=torch.zeros(3, self.HIDDEN, dtype=torch.bfloat16))
+        with patch.object(
+            torch.ops.rbln_custom_ops, "custom_moe_glu_group_dequantize", op
+        ):
+            out = method.apply(layer, x, torch.zeros(self.EXPERTS, 3))
+
+        assert out.shape == x.shape
+        args, kwargs = op.call_args
+        gate_scale, up_scale, down_scale = args[2], args[4], args[6]
+        scales = (gate_scale, up_scale, down_scale)
+        assert {s.dtype for s in scales} == {torch.uint8}
+        assert bool((gate_scale == 100).all()) and bool((up_scale == 101).all())
+        assert args[1].dtype == torch.float8_e4m3fn
+        assert int(args[8]) == 32
+        assert "weight_dtype" not in kwargs
+        swiglu = tuple(kwargs[f"swiglu_{k}"] for k in ("alpha", "limit", "beta"))
+        assert swiglu == (1.702, 7.0, 1.0)
