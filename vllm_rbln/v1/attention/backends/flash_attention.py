@@ -623,19 +623,20 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                 is_prompt_sorted=attn_metadata.is_prompt_sorted,
             )
         elif reads_shared_kv:
-            # A key mask on top of the causal rule lowers to the flash causal
-            # function the target's full layer runs.
+            # GQA selects the old masked kernel for a one-column table. The
+            # explicit flash op retains the target's in-memory cache layout.
             assert not attn_metadata.is_prefill
-            attn_output = torch.ops.rbln_custom_ops.gqa(
+            attn_output = flash_attention_naive_decode(
                 query,
                 key,
                 value,
                 kv_cache,
-                attn_metadata.seq_lens,
+                attn_metadata.attn_masks,
                 self.scale,
+                attn_metadata.seq_lens,
                 attn_metadata.block_tables,
-                attn_mask=attn_metadata.attn_masks,
-                is_causal=True,
+                self.sinks,
+                use_custom_kernel=self.use_custom_kernel,
                 is_prompt_sorted=attn_metadata.is_prompt_sorted,
             )
         elif self.sliding_window is not None:
