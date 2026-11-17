@@ -23,11 +23,7 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_scheduler import (
     RblnNixlSchedulerBase,
 )
-from vllm_rbln.v1.kv_cache import (
-    REMOTE_STATE_BOUNDARY,
-    prompt_boundary_block,
-    state_boundary_is_reachable,
-)
+from vllm_rbln.v1.kv_cache import REMOTE_STATE_BOUNDARY, prompt_boundary_block
 
 if TYPE_CHECKING:
     from vllm.v1.request import Request
@@ -38,17 +34,25 @@ class RblnNixlPullConnectorScheduler(RblnNixlSchedulerBase, NixlPullConnectorSch
 
     sends_state_boundary: ClassVar[bool] = True
 
+    @property
+    def _drops_eagle_block(self) -> bool:
+        spec = self.vllm_config.speculative_config
+        return spec is not None and spec.use_eagle_block_drop()
+
     def get_exchange_clipped_blocks(
         self, block_ids: BlockIds, clip_ssm: bool = True
     ) -> BlockIds:
         """Also keep a single-state SSM group's block-boundary state.
 
         NOTE(RBLN): upstream keeps only the running state, so the consumer can
-        decode but never caches the prompt. `RBLNMambaManager` holds the state at
-        the prompt's last block boundary in the slot right before the running
-        one -- kept by a producer, allocated by a consumer expecting it -- so a
-        live block there goes along. Both ends clip the same way, and a consumer
-        holding only the running state pairs with the tail of a producer's two.
+        decode but never caches the prompt. `RBLNMambaManager` holds the state a
+        repeat of the prompt can hit (`prompt_boundary_block`) one slot before the
+        running one, or two under an EAGLE/MTP block drop -- kept by a producer,
+        allocated by a consumer expecting it -- so a live block there goes along.
+        A producer's list is positional, while a consumer's holds only its
+        unhashed blocks, so the boundary is the first live block in that window
+        rather than a fixed slot. A consumer holding only the running state pairs
+        with the tail of a producer's two.
         """
         clipped = super().get_exchange_clipped_blocks(block_ids, clip_ssm)
         if (
@@ -56,10 +60,10 @@ class RblnNixlPullConnectorScheduler(RblnNixlSchedulerBase, NixlPullConnectorSch
             or not clipped
             or not self._is_hma_required
             or self._ssm_state_slots_are_positional
-            or not state_boundary_is_reachable(self.vllm_config)
         ):
             return clipped
         selected = self.kv_cache_config.select_transfer_block_ids(block_ids)
+        boundary_slot = -3 if self._drops_eagle_block else -2
         out = list(clipped)
         for i, blocks in enumerate(selected):
             n_spec = self._ssm_spec_blocks[i]
@@ -67,8 +71,9 @@ class RblnNixlPullConnectorScheduler(RblnNixlSchedulerBase, NixlPullConnectorSch
                 continue
             if n_spec := min(n_spec, len(blocks) - 1):
                 blocks = blocks[:-n_spec]
-            if len(blocks) >= 2 and blocks[-2] != NULL_BLOCK_ID:
-                out[i] = list(blocks[-2:])
+            live = [b for b in blocks[boundary_slot:-1] if b != NULL_BLOCK_ID]
+            if live:
+                out[i] = [live[0], blocks[-1]]
         return tuple(out)
 
     def request_finished(
@@ -85,18 +90,24 @@ class RblnNixlPullConnectorScheduler(RblnNixlSchedulerBase, NixlPullConnectorSch
         ):
             return delay_free_blocks, params
         groups = self.kv_cache_config.transfer_groups
+        selected = self.kv_cache_config.select_transfer_block_ids(block_ids)
         remote_block_ids = list(params["remote_block_ids"])
         for i, blocks in enumerate(remote_block_ids):
             if self._ssm_spec_blocks[i] is None or len(blocks) != 2:
                 continue
             block_size = groups[i].kv_cache_spec.block_size
-            if prompt_boundary_block(request.num_computed_tokens, block_size) is None:
+            block_idx = prompt_boundary_block(
+                request.num_computed_tokens, block_size, self._drops_eagle_block
+            )
+            if block_idx is None:
                 # A block-aligned prompt's running state is its boundary state;
                 # the slot before it is a superseded one not yet freed.
                 remote_block_ids[i] = blocks[-1:]
             else:
-                params[REMOTE_STATE_BOUNDARY] = (
-                    request.num_computed_tokens // block_size * block_size
+                assert selected[i][block_idx] == blocks[0], (
+                    f"{request.request_id}: group {i} sends block {blocks[0]} for "
+                    f"slot {block_idx}, which holds {selected[i][block_idx]}"
                 )
+                params[REMOTE_STATE_BOUNDARY] = (block_idx + 1) * block_size
         params["remote_block_ids"] = tuple(remote_block_ids)
         return delay_free_blocks, params

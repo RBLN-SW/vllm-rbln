@@ -25,7 +25,11 @@ from vllm.v1.core.single_type_kv_cache_manager import (
     MambaManager,
     SingleTypeKVCacheManager,
 )
-from vllm.v1.kv_cache_interface import MambaSpec, SlidingWindowSpec
+from vllm.v1.kv_cache_interface import (
+    MambaSpec,
+    SlidingWindowSpec,
+    get_mamba_prefill_checkpoint_position,
+)
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -186,19 +190,18 @@ class RBLNSlidingWindowManager(SingleTypeKVCacheManager):
 REMOTE_STATE_BOUNDARY = "remote_state_boundary"
 
 
-def state_boundary_is_reachable(vllm_config: VllmConfig) -> bool:
-    """Whether a prefix lookup can land on a prompt's last block boundary.
-
-    An EAGLE/MTP block drop backs every hit off one block below it, so the state
-    there is never read.
-    """
-    spec = vllm_config.speculative_config
-    return spec is None or not spec.use_eagle_block_drop()
-
-
-def prompt_boundary_block(num_prompt_tokens: int, block_size: int) -> int | None:
-    """The block holding the state at the prompt's last block boundary, when that
-    is not the block holding the prompt's last state."""
+def prompt_boundary_block(
+    num_prompt_tokens: int, block_size: int, drop_eagle_block: bool
+) -> int | None:
+    """The block holding the state a repeat of the prompt can hit, when that is not
+    the block holding the prompt's last state."""
+    if drop_eagle_block:
+        # An EAGLE/MTP lookup drops its last matched block, so it stops one block
+        # short of the prompt's last boundary.
+        position = get_mamba_prefill_checkpoint_position(
+            num_prompt_tokens, block_size, drop_eagle_block
+        )
+        return position // block_size - 1 if position else None
     if num_prompt_tokens < block_size or num_prompt_tokens % block_size == 0:
         return None
     return num_prompt_tokens // block_size - 1
@@ -237,7 +240,9 @@ class RBLNMambaManager(MambaManager):
         request_id = request.request_id
         if params.get("do_remote_decode"):
             block_idx = prompt_boundary_block(
-                request.num_prompt_tokens, self.block_size
+                request.num_prompt_tokens,
+                self.block_size,
+                self.drop_eagle_checkpoint_block,
             )
             if block_idx is not None:
                 self._kept_boundary[request_id] = block_idx
@@ -251,14 +256,16 @@ class RBLNMambaManager(MambaManager):
         ):
             return
         block_idx = prompt_boundary_block(
-            num_local_computed_tokens + num_external_computed_tokens, self.block_size
+            num_local_computed_tokens + num_external_computed_tokens,
+            self.block_size,
+            self.drop_eagle_checkpoint_block,
         )
         if block_idx != boundary // self.block_size - 1:
             # The value comes from the peer; the running state alone still
             # serves the request, so a mismatch only costs the cache entry.
             logger.warning(
-                "%s: ignoring %s=%d, not the last block boundary of the %d "
-                "token(s) received",
+                "%s: ignoring %s=%d, not the boundary a repeat of the %d "
+                "token(s) received can hit",
                 request_id,
                 REMOTE_STATE_BOUNDARY,
                 boundary,

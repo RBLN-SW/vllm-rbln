@@ -345,7 +345,7 @@ class TestRBLNMambaManager:
 
     BLOCK = 16
 
-    def _coordinator(self, num_blocks=32):
+    def _coordinator(self, num_blocks=32, use_eagle=False):
         from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
         from vllm.v1.core.single_type_kv_cache_manager import (
             register_all_kvcache_specs,
@@ -394,7 +394,7 @@ class TestRBLNMambaManager:
             kv_cache_config=config,
             max_model_len=self.BLOCK * 32,
             max_in_flight_tokens=512,
-            use_eagle=False,
+            use_eagle=use_eagle,
             enable_caching=True,
             enable_kv_cache_events=False,
             dcp_world_size=1,
@@ -494,16 +494,32 @@ class TestRBLNMambaManager:
 
         assert state._kept_boundary == {}
 
+    def test_an_eagle_producer_keeps_the_state_before_the_drop(self):
+        coord = self._coordinator(use_eagle=True)
+        state = coord.single_type_managers[1]
+        request = self._request("p", {"do_remote_decode": True})
+        state.track_transfer(request, 0, 0)
+        for computed, end in ((0, 16), (16, 32), (32, 36), (36, 40)):
+            coord.remove_skipped_blocks("p", computed, 40)
+            coord.allocate_new_blocks("p", end, end)
 
-@pytest.mark.parametrize(
-    ("speculative_config", "reachable"),
-    [
-        (None, True),
-        (SimpleNamespace(use_eagle_block_drop=lambda: False), True),
-        # EAGLE / MTP by default: a hit lands one block below the boundary.
-        (SimpleNamespace(use_eagle_block_drop=lambda: True), False),
-    ],
-)
-def test_state_boundary_is_reachable(speculative_config, reachable):
-    config = SimpleNamespace(speculative_config=speculative_config)
-    assert kv_cache.state_boundary_is_reachable(config) is reachable
+        blocks = state.req_to_blocks["p"]
+        assert [b.is_null for b in blocks] == [False, True, False]
+
+    @pytest.mark.parametrize(("boundary", "cached"), [(16, True), (32, False)])
+    def test_an_eagle_consumer_caches_the_state_before_the_drop(self, boundary, cached):
+        coord = self._coordinator(use_eagle=True)
+        state = coord.single_type_managers[1]
+        request = self._request(
+            "d", {"do_remote_prefill": True, REMOTE_STATE_BOUNDARY: boundary}
+        )
+        num_external = 39
+        state.track_transfer(request, 0, num_external)
+        coord.allocate_new_computed_blocks("d", ([], []), 0, num_external)
+        coord.allocate_new_blocks("d", num_external, num_external)
+
+        blocks = state.req_to_blocks["d"]
+        assert [b.is_null for b in blocks] == [not cached, True, False]
+        coord.cache_blocks(request, num_external)
+        _, hit_length, _ = coord.find_longest_cache_hit(request.block_hashes, 39)
+        assert hit_length == (16 if cached else 0)

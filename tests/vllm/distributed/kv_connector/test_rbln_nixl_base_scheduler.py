@@ -387,8 +387,12 @@ class TestStateBoundaryExchange:
     the slot before the running one: an attention group, then an SSM group."""
 
     @staticmethod
-    def _scheduler():
+    def _scheduler(drops_eagle_block=False):
         sched = _scheduler()
+        if drops_eagle_block:
+            sched.vllm_config.speculative_config = SimpleNamespace(
+                use_eagle_block_drop=lambda: True
+            )
         sched._is_hma_required = True
         sched._has_mamba = True
         sched._ssm_state_slots_are_positional = False
@@ -434,14 +438,44 @@ class TestStateBoundaryExchange:
 
         assert sched._reqs_need_recv["d"][1] == ([4, 5, 6], [3, 9])
 
-    def test_a_block_drop_exchanges_the_running_state_alone(self):
-        # Under an EAGLE / MTP block drop no lookup lands on the boundary.
-        sched = self._scheduler()
-        sched.vllm_config.speculative_config = SimpleNamespace(
-            use_eagle_block_drop=lambda: True
+    # Under an EAGLE/MTP block drop the state a repeat can hit is two slots
+    # before the running one, and a block-aligned prompt is no exception.
+    @pytest.mark.parametrize(
+        ("block_ids", "expected"),
+        [
+            # Producer, whole lists: the superseded block may not be freed yet.
+            (([1, 2, 3], [6, 0, 8]), ([1, 2, 3], [6, 8])),
+            (([1, 2, 3], [6, 7, 8]), ([1, 2, 3], [6, 8])),
+            # Consumer, unhashed lists: no null slot between the two.
+            (([4, 5, 6], [3, 9]), ([4, 5, 6], [3, 9])),
+            (([4, 5, 6], [9]), ([4, 5, 6], [9])),
+        ],
+    )
+    def test_an_eagle_clip_keeps_the_block_before_the_drop(self, block_ids, expected):
+        sched = self._scheduler(drops_eagle_block=True)
+        assert sched.get_exchange_clipped_blocks(block_ids) == expected
+
+    @pytest.mark.parametrize(
+        ("num_tokens", "ssm_blocks", "sent", "boundary"),
+        [
+            (39, [6, 0, 8], [6, 8], 16),
+            (48, [6, 7, 8], [6, 8], 16),
+            (32, [7, 8], [8], None),
+        ],
+    )
+    def test_an_eagle_producer_names_the_boundary_before_the_drop(
+        self, num_tokens, ssm_blocks, sent, boundary
+    ):
+        sched = self._scheduler(drops_eagle_block=True)
+        req = _Request(
+            "p", num_prompt_tokens=num_tokens, num_computed_tokens=num_tokens
         )
-        clipped = sched.get_exchange_clipped_blocks(([1, 2, 3], [0, 7, 8]))
-        assert clipped == ([1, 2, 3], [8])
+        req.status = RequestStatus.FINISHED_LENGTH_CAPPED
+
+        delay, params = sched.request_finished(req, ([1, 2, 3], ssm_blocks))
+        assert delay is True
+        assert params["remote_block_ids"][1] == sent
+        assert params.get(REMOTE_STATE_BOUNDARY) == boundary
 
     @pytest.mark.parametrize(
         ("cls", "sends"),
