@@ -43,9 +43,6 @@ MODELS: list[CompileModelSpec] = [
             "num_gpu_blocks_override": 39,
         },
         chips=REBEL,
-        # The fourth layer is the first full-attention one: with it the state
-        # and the attention cache share a buffer.
-        num_hidden_layers=4,
     ),
     CompileModelSpec(
         "Qwen/Qwen3-30B-A3B",
