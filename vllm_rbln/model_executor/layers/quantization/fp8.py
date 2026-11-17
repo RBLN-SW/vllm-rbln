@@ -385,7 +385,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 down_proj_scale=down_proj_weight_scale,
                 group_size=int(self.weight_block_size[1]),
                 hidden_states_scale=hs_scale,
-                compute_dtype=compute_dtype,
+                out_dtype=compute_dtype,
                 expert_map=layer.expert_map,
             )
         else:
