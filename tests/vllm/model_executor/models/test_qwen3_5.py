@@ -133,7 +133,9 @@ def test_a_request_image_above_the_start_up_limit_is_refused(monkeypatch):
     processor = RBLNQwen3_5MultiModalProcessor.__new__(RBLNQwen3_5MultiModalProcessor)
     processor.info = SimpleNamespace(
         get_max_image_tokens=lambda: 256,
-        get_image_processor=lambda: SimpleNamespace(merge_size=MERGE),
+        get_hf_config=lambda: SimpleNamespace(
+            vision_config=SimpleNamespace(spatial_merge_size=MERGE)
+        ),
     )
     grids = torch.tensor([[1, 32, 32]])
     monkeypatch.setattr(
