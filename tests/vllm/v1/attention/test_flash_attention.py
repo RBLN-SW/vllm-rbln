@@ -233,13 +233,11 @@ class TestBuildCommonIndices:
         # positions[[0, 3]] = [0, 30]
         assert md.seq_lens.reshape(-1).tolist() == [0, 30]
 
-    def test_builders_sharing_step_staged_share_seq_idx_only(self, cfg):
+    def test_group_shared_staging_shares_seq_idx_only(self, cfg):
         # One tensor object is one graph input: KV cache groups must hand the
         # graph the same seq_idx, but each keeps its own block table.
-        step_staged: dict = {}
+        group_shared: dict = {}
         builders = [make_builder(cfg), make_builder(cfg)]
-        for builder in builders:
-            builder.step_staged = step_staged
         mds = [
             builder.build(
                 _cam(
@@ -251,6 +249,7 @@ class TestBuildCommonIndices:
                 torch.tensor([4, 7]),
                 batch_pad=2,
                 is_prefill=False,
+                group_shared=group_shared,
             )
             for builder, table in zip(builders, [[[1], [2]], [[3], [4]]])
         ]

@@ -123,6 +123,7 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
         num_accepted: torch.Tensor | None = None,
         state_load_pos: torch.Tensor | None = None,
         mm_prefix_row_ends: torch.Tensor | None = None,
+        group_shared: dict[tuple, torch.Tensor] | None = None,
     ) -> RBLNGDNAttentionMetadata:
         assert num_accepted is None and state_load_pos is None, (
             "speculative decoding is refused for GatedDeltaNet models"
@@ -187,13 +188,15 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
             store_state_indices=blocks.to(torch.int16),
             conv_load_blocks=self._stage(blocks, "conv_load_blocks"),
             conv_start_positions=self._stage(
-                self._padded(first_positions, batch_size), "conv_start_positions"
+                self._padded(first_positions, batch_size),
+                "conv_start_positions",
+                group_shared,
             ),
             conv_query_lens=self._stage(
-                self._padded(query_lens, batch_size), "conv_query_lens"
+                self._padded(query_lens, batch_size), "conv_query_lens", group_shared
             ),
             conv_has_initial_state=self._stage(
-                has_initial_state, "conv_has_initial_state"
+                has_initial_state, "conv_has_initial_state", group_shared
             ),
             conv_store_blocks=self._stage(blocks, "conv_store_blocks"),
             valid_mask=None

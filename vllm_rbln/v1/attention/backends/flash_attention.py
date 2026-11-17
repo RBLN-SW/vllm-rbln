@@ -195,11 +195,6 @@ class RBLNFlashAttentionMetadata:
         )
 
 
-# Slots built from the step alone, never from the KV cache group's spec or
-# block table, so every group of one runner stages the same values.
-_STEP_ONLY_SLOTS = frozenset({"seq_idx", "mm_prefix_row_ends", "num_accepted"})
-
-
 class RBLNFlashAttentionMetadataBuilder(
     AttentionMetadataBuilder[RBLNFlashAttentionMetadata]
 ):
@@ -248,11 +243,13 @@ class RBLNFlashAttentionMetadataBuilder(
             )
 
         self._staged: dict[tuple, torch.Tensor] = {}
-        # The runner points this at one dict for all of its builders, so a
-        # step-only slot reaches the graph as one input across KV cache groups.
-        self.step_staged: dict[tuple, torch.Tensor] = {}
 
-    def _stage(self, t: torch.Tensor | None, slot: str) -> torch.Tensor | None:
+    def _stage(
+        self,
+        t: torch.Tensor | None,
+        slot: str,
+        shared: dict[tuple, torch.Tensor] | None = None,
+    ) -> torch.Tensor | None:
         """Copy a host tensor into this builder's persistent device buffer.
 
         `slot` must be unique per logical tensor: cache_seq_lens and
@@ -260,14 +257,16 @@ class RBLNFlashAttentionMetadataBuilder(
         would silently make them share one buffer.
 
         The returned tensor is overwritten by the next build() call, so the
-        caller must run the forward pass before building again. A step-only
-        slot is shared by the runner's builders, which all stage the same value
-        for one step before that step's forward.
+        caller must run the forward pass before building again. That holds
+        because each AttentionGroup owns its own builder instance and every
+        build() is immediately followed by a forward. `shared` takes the buffer
+        instead of this builder, for a slot whose value does not depend on the
+        KV cache group: every group stages the same value into it.
         """
         if t is None:
             return None
-        staged = self.step_staged if slot in _STEP_ONLY_SLOTS else self._staged
         key = (slot, t.shape, t.dtype)
+        staged = self._staged if shared is None else shared
         if (buf := staged.get(key)) is None:
             buf = torch.empty(t.shape, dtype=t.dtype, device=self.device)
             staged[key] = buf
@@ -291,10 +290,15 @@ class RBLNFlashAttentionMetadataBuilder(
         num_accepted: torch.Tensor | None = None,
         state_load_pos: torch.Tensor | None = None,
         mm_prefix_row_ends: torch.Tensor | None = None,
+        group_shared: dict[tuple, torch.Tensor] | None = None,
     ) -> RBLNFlashAttentionMetadata:
         """`mm_prefix_row_ends`, on a prefill of an mm prefix LM, holds for each
         padded row of the step the last step-local row it may read: itself, or
-        its range's last position for an mm row. None on any other step."""
+        its range's last position for an mm row. None on any other step.
+
+        `group_shared` is one staging dict the caller hands every KV cache group
+        of a step, so the slots that do not depend on the group reach the graph
+        as one input each."""
         num_reqs = common_attn_metadata.num_reqs
         # NOTE(RBLN): vllm-rbln keeps attention metadata on the host and copies
         # to the device only when constructing RBLNFlashAttentionMetadata below.
@@ -387,11 +391,13 @@ class RBLNFlashAttentionMetadataBuilder(
             local_block_tables = block_tables_tensor[..., :1]
 
         attn_metadata = RBLNFlashAttentionMetadata(
-            seq_lens=self._stage(seq_idx, "seq_idx"),
+            seq_lens=self._stage(seq_idx, "seq_idx", group_shared),
             block_tables=self._stage(block_tables_tensor, "block_tables"),
             is_prefill=is_prefill,
             attn_masks=self._stage(attn_masks, "attn_masks"),
-            mm_prefix_row_ends=self._stage(mm_prefix_row_ends, "mm_prefix_row_ends"),
+            mm_prefix_row_ends=self._stage(
+                mm_prefix_row_ends, "mm_prefix_row_ends", group_shared
+            ),
             swa_appends=self.swa_appends,
             cache_seq_lens=self._stage(cache_seq_lens, "cache_seq_lens"),
             cache_offsets=self._stage(cache_offsets, "cache_offsets"),
@@ -404,6 +410,7 @@ class RBLNFlashAttentionMetadataBuilder(
                 if num_accepted is None
                 else rbln_utils.pad(num_accepted.view(-1, 1), 0, batch_pad),
                 "num_accepted",
+                group_shared,
             ),
         )
 

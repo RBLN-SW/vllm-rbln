@@ -485,6 +485,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         self.discard_request_mask = torch.zeros(self.max_num_reqs, dtype=torch.bool)
         self.intermediate_tensors_dict: dict[tuple[int, int], IntermediateTensors] = {}
         self.input_stager = InputStager(self.device)
+        self._group_shared_staging: dict[tuple, torch.Tensor] = {}
 
         # OPTIMIZATION: Cache the tensors rather than creating them every step.
         # Keep in int64 to avoid overflow with long context
@@ -1240,6 +1241,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     num_accepted=num_accepted,
                     state_load_pos=state_load_pos,
                     mm_prefix_row_ends=mm_prefix_row_ends,
+                    group_shared=self._group_shared_staging,
                 )
 
                 for layer_name in attn_group.layer_names:
@@ -3325,12 +3327,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     else None,
                     num_metadata_builders=1,  # not use ubatching
                 )
-        step_staged: dict[tuple, torch.Tensor] = {}
-        for attn_groups in self.attn_groups:
-            for attn_group in attn_groups:
-                builder = attn_group.get_metadata_builder(0)
-                if isinstance(builder, RBLNFlashAttentionMetadataBuilder):
-                    builder.step_staged = step_staged
 
         # Initialize drafter attention backend.
         if isinstance(self.drafter, DRAFT_MODEL_PROPOSERS):
