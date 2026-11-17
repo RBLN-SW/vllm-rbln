@@ -825,6 +825,16 @@ class TestRejectedConfigs:
         with pytest.raises(ValueError, match="divisible"):
             reconfigure(_ranks(data_parallel_size=2, max_num_seqs=5))
 
+    def test_glm5_next_prefill_buckets_without_sub_blocks(self, reconfigure):
+        def mutate(config):
+            _as_glm5_next(config)
+            config.model_config.hf_text_config.index_topk = 2048
+            config.cache_config.enable_prefix_caching = True
+            config.cache_config.block_size = 1024
+            config.additional_config.prefill_chunk_size = [64, 96]
+
+        reconfigure(mutate)
+
     def test_a_prefill_chunk_above_the_token_budget_is_refused(self, reconfigure):
         with pytest.raises(ValueError, match="exceeds"):
             reconfigure(_prefill_chunk(256))
