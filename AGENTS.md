@@ -26,13 +26,12 @@ Run `pre-commit` through `uvx`, since it is not a project dependency. Pass `--fi
 
 A new `.py` file needs the Apache header that every other file carries; `check-license-header` rejects it otherwise. Copy the header from a neighbouring file.
 
-`tests/vllm/` defines three session options (see its `conftest.py`):
+`tests/vllm/` defines two session options (see its `conftest.py`):
 
 - `--model-compile` — opt into whole-model compiles, minutes per test
-- `--device-tensor {0,1}` — session-wide, cannot be parametrized per test
 - `--num-hidden-layers N` — build only the first N decoder layers
 
-They do not exist in `tests/optimum/`.
+They do not exist in `tests/optimum/`. The vllm suite always uses device tensors.
 
 ## Terms
 
@@ -140,7 +139,7 @@ Code either succeeds or fails with a clear error.
 - Extend an existing file, `conftest.py` fixture, or `utils.py` helper before adding a new file.
 - Do not add a test that is skipped as a placeholder. A test that never runs covers nothing while reading as coverage that exists.
 - `--strict-markers` turns a misspelled mark into a collection error, but a mark you leave off is silent. Forgetting `model_compile` is how a whole-model compile ends up in the lane that runs on every PR.
-- The `model_compile`, `use_device`, and `maybe_use_device` marks exist in `tests/vllm/` only.
+- The `model_compile` and `use_device` marks exist in `tests/vllm/` only.
 - `tests/optimum/optimum_correctness/` holds `fire` CLI scripts, not pytest tests. Do not add `test_*.py` there.
 
 ## Reporting

@@ -1230,7 +1230,7 @@ class TestResolveBatchDescriptor:
         assert across is None
 
 
-@pytest.mark.maybe_use_device
+@pytest.mark.use_device
 @pytest.mark.parametrize(("backend", "should_exit"), [("mp", True), ("uni", False)])
 def test_async_output_inherits_runner_fail_fast_policy(
     make_model_runner, monkeypatch, capfd, backend, should_exit
@@ -1295,7 +1295,7 @@ class TestShapeConfigWiring:
     # around here hand-build one, which leaves the construction unpinned: a field
     # wired to the wrong source would keep every one of them green.
 
-    @pytest.mark.maybe_use_device
+    @pytest.mark.use_device
     def test_a_real_runners_shapes_reach_the_decision(self, make_model_runner):
         # Drive the rule with this runner's own config and a two-rank status, so
         # every field shows up in the answer: the bucket rule (3 sits between two
@@ -1322,7 +1322,7 @@ class TestShapeConfigWiring:
         )
         assert desc.num_tokens_padded == runner.max_num_tokens
 
-    @pytest.mark.maybe_use_device
+    @pytest.mark.use_device
     def test_the_bucket_list_reaches_the_routes_that_read_it(self, make_model_runner):
         # decode_batch_buckets is read by the two routes that pick an end of it, and
         # both need data parallelism to specialize at all -- so this runner is built
@@ -2041,7 +2041,7 @@ class TestMayReorderBatch:
 
 
 class TestDummyRunDecodeWindowPadding:
-    pytestmark = pytest.mark.maybe_use_device
+    pytestmark = pytest.mark.use_device
 
     NUM_REQS = 2
     NUM_SPEC = 3
@@ -2920,7 +2920,7 @@ class TestExecuteModelMmPrefixRowEnds:
         assert seen is None
 
 
-@pytest.mark.maybe_use_device
+@pytest.mark.use_device
 @pytest.mark.parametrize(
     ("kv_role", "decodes"), [("kv_producer", False), ("kv_both", True)]
 )

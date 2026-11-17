@@ -25,7 +25,7 @@ import vllm_rbln.platform as platform
 import vllm_rbln.v1.spec_decode.medusa as medusa_module
 from tests.vllm.v1.spec_decode.utils import make_medusa_proposer
 
-pytestmark = pytest.mark.maybe_use_device
+pytestmark = pytest.mark.use_device
 
 
 class TestInit:
