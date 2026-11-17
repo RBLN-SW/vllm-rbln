@@ -249,7 +249,8 @@ def test_vision_encoder_builds_its_inputs_from_upstream_rope(monkeypatch):
     assert not key_bias[..., :8].any() and (key_bias[..., 8:] < -1e4).all()
 
 
-def test_aux_cache_flags_and_an_unallocated_draft(monkeypatch):
+def _glm5_layers(monkeypatch):
+    """A KDA layer and a DSA indexer built on a small config; returns it."""
     import vllm.distributed.parallel_state as parallel_state
     from vllm.config import set_current_vllm_config
 
@@ -277,7 +278,24 @@ def test_aux_cache_flags_and_an_unallocated_draft(monkeypatch):
     with set_current_vllm_config(config):
         glm.RBLNGlm5NextKDA(text, "model.layers.0.self_attn")
         glm.RBLNGlm5NextIndexer(text, "model.layers.1.self_attn.indexer")
+    return config
 
+
+def test_kda_states_carry_their_boundary_over_a_transfer(monkeypatch):
+    from vllm_rbln.v1.kv_cache import RBLNMambaSpec
+
+    config = _glm5_layers(monkeypatch)
+    config.cache_config.mamba_block_size = config.cache_config.block_size
+    context = config.compilation_config.static_forward_context
+    specs = [
+        context[f"model.layers.0.self_attn.attn.{j}"].get_kv_cache_spec(config)
+        for j in (0, 1)
+    ]
+    assert all(type(spec) is RBLNMambaSpec for spec in specs)
+
+
+def test_aux_cache_flags_and_an_unallocated_draft(monkeypatch):
+    config = _glm5_layers(monkeypatch)
     context = config.compilation_config.static_forward_context
     flags = {
         name: (spec.prefix_cacheable, spec.verify_only)

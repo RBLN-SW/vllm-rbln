@@ -23,6 +23,7 @@ from typing import Any
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.utils.hashing import get_hash_fn_by_name
+from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -195,11 +196,19 @@ class RBLNScheduler(Scheduler):
         self._prefill_chunk_size = rbln_config.max_prefill_chunk_size
         self._is_mm_prefix_lm = self.vllm_config.model_config.is_mm_prefix_lm
 
-        self._state_transfer_managers = [
-            manager
-            for manager in self.kv_cache_manager.coordinator.single_type_managers
-            if isinstance(manager, RBLNMambaManager)
-        ]
+        # NOTE(RBLN): a prompt's block-boundary state is kept by a producer and
+        # allocated by a consumer only where the connector scheduler exchanges
+        # it (`sends_state_boundary`).
+        connector_scheduler = getattr(self.connector, "connector_scheduler", None)
+        self._state_transfer_managers = (
+            [
+                manager
+                for manager in self.kv_cache_manager.coordinator.single_type_managers
+                if isinstance(manager, RBLNMambaManager)
+            ]
+            if getattr(connector_scheduler, "sends_state_boundary", False)
+            else []
+        )
 
         # NOTE(RBLN): the sparse-attention ops (DSA MLA / indexer, MiniMax-M3
         # MSA / indexer, GLM5 MLA / indexer) get NULL_BLOCK_ID as null_block_id
@@ -898,35 +907,49 @@ class RBLNScheduler(Scheduler):
                         for i in encoder_inputs_to_schedule
                     )
 
-                if self.connector is not None:
-                    for manager in self._state_transfer_managers:
-                        manager.track_transfer(
-                            request,
-                            num_new_local_computed_tokens,
-                            num_external_computed_tokens,
-                        )
+                # NOTE(RBLN): before the admission check and allocate_slots,
+                # whose get_num_blocks_to_allocate counts the boundary block
+                # noted here.
+                for manager in self._state_transfer_managers:
+                    manager.track_transfer(
+                        request,
+                        num_new_local_computed_tokens,
+                        num_external_computed_tokens,
+                    )
 
-                new_blocks = self.kv_cache_manager.allocate_slots(
+                new_blocks = None
+                if self._fits_first_decode_step(
                     request,
-                    # Sub-block tokens count as tokens to compute, never as
-                    # computed: upstream contracts the computed count to
-                    # len(new_computed_blocks) * block_size, and a count that is
-                    # not block-aligned tells it the tail block is shared, so it
-                    # CoWs a block we never handed it. Only the sum is used.
-                    num_new_tokens + num_sub_block_tokens,
-                    num_new_computed_tokens=num_new_local_computed_tokens,
-                    new_computed_blocks=new_computed_blocks,
-                    num_lookahead_tokens=effective_lookahead_tokens,
+                    new_computed_blocks,
+                    num_new_local_computed_tokens=num_new_local_computed_tokens,
                     num_external_computed_tokens=num_external_computed_tokens,
                     num_encoder_tokens=num_encoder_tokens,
-                    # NOTE(RBLN): Cache blocks only after scheduling is finalized.
-                    delay_cache_blocks=True,
-                    has_scheduled_reqs=bool(self.running),
-                    # NOTE(RBLN): Even when chunked prefill is enabled, we should
-                    # schedule a new prefill request only if there is enough
-                    # KV cache space to accommodate the full token count.
-                    full_sequence_must_fit=True,
-                )
+                    num_lookahead_tokens=effective_lookahead_tokens,
+                ):
+                    new_blocks = self.kv_cache_manager.allocate_slots(
+                        request,
+                        # Sub-block tokens count as tokens to compute, never as
+                        # computed: upstream contracts the computed count to
+                        # len(new_computed_blocks) * block_size, and a count that
+                        # is not block-aligned tells it the tail block is shared,
+                        # so it CoWs a block we never handed it. Only the sum is
+                        # used.
+                        num_new_tokens + num_sub_block_tokens,
+                        num_new_computed_tokens=num_new_local_computed_tokens,
+                        new_computed_blocks=new_computed_blocks,
+                        num_lookahead_tokens=effective_lookahead_tokens,
+                        num_external_computed_tokens=num_external_computed_tokens,
+                        num_encoder_tokens=num_encoder_tokens,
+                        # NOTE(RBLN): Cache blocks only after scheduling is
+                        # finalized.
+                        delay_cache_blocks=True,
+                        has_scheduled_reqs=bool(self.running),
+                        # NOTE(RBLN): Even when chunked prefill is enabled, we
+                        # should schedule a new prefill request only if there is
+                        # enough KV cache space to accommodate the full token
+                        # count.
+                        full_sequence_must_fit=True,
+                    )
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
@@ -1420,6 +1443,62 @@ class RBLNScheduler(Scheduler):
         )
         self.encoder_cache_mismatch_reqs.add(request.request_id)
         return [], 0, encoder_compute_budget, []
+
+    def _fits_first_decode_step(
+        self,
+        request: Request,
+        new_computed_blocks: KVCacheBlocks,
+        *,
+        num_new_local_computed_tokens: int,
+        num_external_computed_tokens: int,
+        num_encoder_tokens: int,
+        num_lookahead_tokens: int,
+    ) -> bool:
+        """Whether the free blocks hold ``request`` through its first spec
+        decode step: the sampled and draft tokens after the prompt, plus the
+        lookahead.
+
+        An admitted prefill runs alone to completion (no mixed batching), so it
+        must not be admitted short of that step: it would preempt itself there
+        and its re-admission would evict the decodes again. The full-sequence
+        gate in ``allocate_slots`` counts the prompt alone; this is the same
+        count carried through that step.
+        """
+        if not self.num_spec_tokens:
+            return True
+        manager = self.kv_cache_manager
+        hit_blocks = list(new_computed_blocks.blocks)
+        for group_id in manager.retained_hit_group_ids:
+            hit_blocks[group_id] = hit_blocks[group_id][
+                : cdiv(
+                    num_new_local_computed_tokens + num_external_computed_tokens,
+                    manager.coordinator.single_type_managers[group_id].block_size,
+                )
+            ]
+        num_local_computed_tokens = (
+            request.num_computed_tokens + num_new_local_computed_tokens
+        )
+        num_tokens_main_model = min(
+            request.num_tokens + 1 + self.num_spec_tokens, self.max_model_len
+        )
+        num_blocks = manager.coordinator.get_num_blocks_to_allocate(
+            request_id=request.request_id,
+            num_tokens=min(
+                num_tokens_main_model + num_lookahead_tokens, self.max_model_len
+            ),
+            new_computed_blocks=tuple(hit_blocks),
+            num_encoder_tokens=num_encoder_tokens,
+            total_computed_tokens=min(
+                num_local_computed_tokens + num_external_computed_tokens,
+                self.max_model_len,
+            ),
+            num_local_computed_tokens=num_local_computed_tokens,
+            num_tokens_main_model=num_tokens_main_model,
+            apply_admission_cap=True,
+            prefill_end=max(request.num_prompt_tokens, request.num_tokens - 1),
+        )
+        watermark_blocks = manager.watermark_blocks if self.running else 0
+        return num_blocks + watermark_blocks <= manager.block_pool.get_num_free_blocks()
 
     def _try_sub_block_match(
         self,

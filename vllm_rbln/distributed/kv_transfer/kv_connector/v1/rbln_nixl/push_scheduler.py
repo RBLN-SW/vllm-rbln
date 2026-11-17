@@ -100,7 +100,7 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
             not load_async
             or not params
             or not params.get("do_remote_prefill")
-            or not self._carries_boundary_state
+            or not self.sends_state_boundary
             or not self._has_mamba
         ):
             return count, load_async

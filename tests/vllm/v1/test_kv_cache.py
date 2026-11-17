@@ -24,6 +24,7 @@ import torch
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
+import vllm_rbln.v1.kv_cache as kv_cache
 from tests.vllm.v1.core.utils import make_request
 from vllm_rbln.v1.kv_cache import (
     REMOTE_STATE_BOUNDARY,
@@ -386,6 +387,8 @@ class TestRBLNMambaManager:
                 KVCacheGroupSpec(["attn"], full),
                 KVCacheGroupSpec(["state"], state),
             ],
+            # CacheConfig's default, which keeps only the reachable boundaries.
+            prefix_cache_retention_interval=0,
         )
         coord = get_kv_cache_coordinator(
             kv_cache_config=config,
@@ -453,3 +456,54 @@ class TestRBLNMambaManager:
         coord.cache_blocks(request, num_external)
         _, hit_length, _ = coord.find_longest_cache_hit(request.block_hashes, 39)
         assert hit_length == (32 if cached else 0)
+
+    @pytest.mark.parametrize(
+        ("num_local", "num_external"),
+        [
+            # Re-admitted once its KV has arrived: nothing more is received.
+            (0, 0),
+            # A local prefix hit already reaches the boundary.
+            (32, 7),
+        ],
+    )
+    def test_consumer_notes_no_block_it_will_not_receive(
+        self, monkeypatch, num_local, num_external
+    ):
+        state = self._coordinator().single_type_managers[1]
+        warnings = []
+        monkeypatch.setattr(kv_cache.logger, "warning", lambda *a: warnings.append(a))
+        request = self._request(
+            "d", {"do_remote_prefill": True, REMOTE_STATE_BOUNDARY: 32}
+        )
+        # Left by an earlier admission attempt whose allocation failed.
+        state._received_boundary["d"] = 1
+
+        state.track_transfer(request, num_local, num_external)
+
+        assert "d" not in state._received_boundary
+        assert not warnings
+
+    def test_freeing_a_producer_request_drops_its_kept_boundary(self):
+        coord = self._coordinator()
+        state = coord.single_type_managers[1]
+        state.track_transfer(self._request("p", {"do_remote_decode": True}), 0, 0)
+        coord.allocate_new_blocks("p", 16, 16)
+        assert state._kept_boundary == {"p": 1}
+
+        coord.free("p")
+
+        assert state._kept_boundary == {}
+
+
+@pytest.mark.parametrize(
+    ("speculative_config", "reachable"),
+    [
+        (None, True),
+        (SimpleNamespace(use_eagle_block_drop=lambda: False), True),
+        # EAGLE / MTP by default: a hit lands one block below the boundary.
+        (SimpleNamespace(use_eagle_block_drop=lambda: True), False),
+    ],
+)
+def test_state_boundary_is_reachable(speculative_config, reachable):
+    config = SimpleNamespace(speculative_config=speculative_config)
+    assert kv_cache.state_boundary_is_reachable(config) is reachable

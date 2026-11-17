@@ -37,7 +37,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
     every_local_link_down,
 )
 from vllm_rbln.logger import init_logger
-from vllm_rbln.v1.kv_cache import prompt_boundary_block
+from vllm_rbln.v1.kv_cache import prompt_boundary_block, state_boundary_is_reachable
 
 if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -85,11 +85,17 @@ class RblnNixlSchedulerBase(NixlBaseConnectorScheduler):
         return self._shape.sends_token_count
 
     @property
-    def _carries_boundary_state(self) -> bool:
+    def sends_state_boundary(self) -> bool:
         """Whether a single-state SSM group also exchanges its block-boundary
-        state. A reader learns it from the producer's `remote_state_boundary`;
-        a writer's consumer allocates before that, so it is the opt-in."""
-        return not self._writes_into_peer or self._shape.push_boundary_state
+        state, so `RBLNMambaManager` keeps or allocates a block for it.
+
+        A reader learns it from the producer's `remote_state_boundary`; a
+        writer's consumer allocates before that, so it is the opt-in. Under an
+        EAGLE/MTP block drop no lookup lands on it.
+        """
+        return (
+            not self._writes_into_peer or self._shape.push_boundary_state
+        ) and state_boundary_is_reachable(self.vllm_config)
 
     def get_exchange_clipped_blocks(
         self, block_ids: BlockIds, clip_ssm: bool = True
@@ -109,7 +115,7 @@ class RblnNixlSchedulerBase(NixlBaseConnectorScheduler):
             or not clipped
             or not self._is_hma_required
             or self._ssm_state_slots_are_positional
-            or not self._carries_boundary_state
+            or not self.sends_state_boundary
         ):
             return clipped
         selected = self.kv_cache_config.select_transfer_block_ids(block_ids)
