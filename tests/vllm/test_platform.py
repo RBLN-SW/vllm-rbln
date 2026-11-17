@@ -506,24 +506,25 @@ class TestRejectedConfigs:
     ):
         from vllm.platforms import current_platform
 
+        from vllm_rbln.platform import vllm_impl
+
         monkeypatch.setattr(current_platform, "is_cr13", lambda: True)
 
         def single_block(config):
             config.additional_config.use_swa_single_block = True
 
-        def retention_without_caching(config):
-            single_block(config)
-            config.cache_config.enable_prefix_caching = False
-            config.cache_config.prefix_cache_retention_interval = None
-
         def speculative(config):
             single_block(config)
             config.speculative_config = SimpleNamespace(method="mtp")
 
+        monkeypatch.setattr(vllm_impl, "use_device_tensor", lambda: True)
         reconfigure(single_block)
-        for mutate in (retention_without_caching, speculative):
-            with pytest.raises(NotImplementedError, match="use_swa_single_block"):
-                reconfigure(mutate)
+        with pytest.raises(NotImplementedError, match="use_swa_single_block"):
+            reconfigure(speculative)
+        monkeypatch.setattr(vllm_impl, "use_device_tensor", lambda: False)
+        with pytest.raises(NotImplementedError, match="use_swa_single_block"):
+            reconfigure(single_block)
+        monkeypatch.setattr(vllm_impl, "use_device_tensor", lambda: True)
         monkeypatch.setattr(current_platform, "is_cr13", lambda: False)
         with pytest.raises(NotImplementedError, match="use_swa_single_block"):
             reconfigure(single_block)

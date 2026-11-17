@@ -432,8 +432,6 @@ class RBLNSingleBlockSlidingWindowManager(SlidingWindowManager):
 
     def __init__(self, kv_cache_spec: SlidingWindowSpec, **kwargs) -> None:
         super().__init__(kv_cache_spec, **kwargs)
-        # A narrower window splits the block into kernel blocks, which a row
-        # copy cannot address.
         if self.sliding_window != self.block_size:
             raise NotImplementedError(
                 "use_swa_single_block needs a sliding window as wide as the block."
@@ -450,22 +448,17 @@ class RBLNSingleBlockSlidingWindowManager(SlidingWindowManager):
         num_tokens: int,
         new_computed_blocks: Sequence[KVCacheBlock],
         total_computed_tokens: int,
-        num_local_computed_tokens: int,
-        num_tokens_main_model: int,
-        apply_admission_cap: bool = False,
-        prefill_end: int = 0,
+        *args,
+        **kwargs,
     ) -> int:
-        if not apply_admission_cap:  # a plan for the allocation that follows
-            self._step_start[request_id] = total_computed_tokens
+        self._step_start[request_id] = total_computed_tokens
         return super().get_num_blocks_to_allocate(
             request_id,
             num_tokens,
             new_computed_blocks,
             total_computed_tokens,
-            num_local_computed_tokens,
-            num_tokens_main_model,
-            apply_admission_cap,
-            prefill_end,
+            *args,
+            **kwargs,
         )
 
     def allocate_new_blocks(
@@ -503,31 +496,20 @@ class RBLNSingleBlockSlidingWindowManager(SlidingWindowManager):
         # flight may; a request that has not cached yet may be either.
         column = self._window_column.get(request_id, 0)
         if (
-            processed_computed_tokens > column * self.block_size
-            and processed_computed_tokens >= self._decode_from.get(request_id, 1 << 62)
+            request_id in self._decode_from
+            and processed_computed_tokens > column * self.block_size
+            and processed_computed_tokens >= self._decode_from[request_id]
         ):
             self._remove_blocks_in_range(request_id, 0, column)
 
-    def cache_blocks(
-        self,
-        request: Request,
-        num_tokens: int,
-        retention_interval: int | None = None,
-        *,
-        replay_boundaries: Sequence[int],
-    ) -> None:
+    def cache_blocks(self, request: Request, *args, **kwargs) -> None:
         # A streaming session prefills again after it decodes.
         if not request.resumable:
             self._decode_from.setdefault(
                 request.request_id,
                 max(request.num_prompt_tokens, request.num_tokens - 1),
             )
-        super().cache_blocks(
-            request,
-            num_tokens,
-            retention_interval,
-            replay_boundaries=replay_boundaries,
-        )
+        super().cache_blocks(request, *args, **kwargs)
 
     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
         self._step_start.pop(request_id, None)

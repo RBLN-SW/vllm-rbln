@@ -383,9 +383,8 @@ class RBLNFlashAttentionMetadataBuilder(
             isinstance(self.kv_cache_spec, RBLNSingleBlockSlidingWindowSpec)
             and not is_prefill
         ):
-            # The append kernel reads the column before the last key's too,
-            # where the table still names a block the manager has freed.
-            column = (seq_idx[:, 0] - 1).clamp(min=0) // self.block_size
+            # The kernel also reads the column before, whose block is freed.
+            column = seq_idx[:, 0] // self.block_size
             rows = torch.nonzero(column).view(-1)
             block_tables_tensor = block_tables_tensor.clone()
             block_tables_tensor[rows, column[rows] - 1] = block_tables_tensor[

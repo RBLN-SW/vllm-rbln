@@ -1434,7 +1434,7 @@ class TestDrainReleaseCopyOps:
         assert manager.pending_copy_ops == []
         manager.release_copy_ops(ops)
 
-    def test_a_ring_groups_window_copies_drain_with_their_group(self):
+    def test_a_single_block_groups_window_copies_drain_before_sub_block_copies(self):
         from vllm_rbln.platform import RblnPlatform
         from vllm_rbln.v1.kv_cache import RBLNSingleBlockSlidingWindowSpec
 
@@ -1457,10 +1457,11 @@ class TestDrainReleaseCopyOps:
             hash_fn=sha256,
         )
         window = manager.coordinator.single_type_managers[1]
-        manager.block_pool.touch([manager.block_pool.blocks[3]])
+        manager.block_pool.touch(manager.block_pool.blocks[2:4])
         window.pending_copies = [(3, 4, 5)]
+        manager.pending_copy_ops = [KVCacheCopyOp(1, 2, 4, 4)]
         ops = manager.drain_pending_copy_ops()
-        assert ops == [KVCacheCopyOp(1, 3, 4, 3, 5)]
+        assert ops == [KVCacheCopyOp(1, 3, 4, 3, 5), KVCacheCopyOp(1, 2, 4, 4)]
         assert window.pending_copies == []
         manager.release_copy_ops(ops)
         assert manager.block_pool.blocks[3].ref_cnt == 0
