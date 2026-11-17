@@ -119,11 +119,31 @@ def test_minimax_m3_small_config_compiles_and_generates(
         block_size=1024,
         num_gpu_blocks_override=5,
         kv_cache_dtype=kv_cache_dtype,
+        enable_prefix_caching=True,
+        additional_config={"prefill_chunk_size": [64, 128], "sub_block_size": 64},
     ) as model:
-        outputs = model.llm.generate(
-            [{"prompt_token_ids": [1] * 140}, {"prompt_token_ids": [2] * 270}],
-            SamplingParams(temperature=0, max_tokens=MAX_TOKENS, ignore_eos=True),
-        )
+        prompts = [{"prompt_token_ids": [1] * 100}, {"prompt_token_ids": [2] * 270}]
+        params = SamplingParams(temperature=0, max_tokens=MAX_TOKENS, ignore_eos=True)
+        outputs = model.llm.generate(prompts, params)
+        cached = model.llm.generate(prompts, params)
+        assert [output.num_cached_tokens for output in cached] == [64, 256]
+        assert [o.outputs[0].token_ids for o in cached] == [
+            o.outputs[0].token_ids for o in outputs
+        ]
+
+        prefix = [3] * (2 * 1024 - 64)
+        donor = {"prompt_token_ids": prefix + [4] * 32}
+        query = {"prompt_token_ids": prefix + [5] * 192}
+        assert model.llm.reset_prefix_cache()
+        baseline = model.llm.generate([query], params)[0]
+        assert baseline.num_cached_tokens == 0
+        assert model.llm.reset_prefix_cache()
+        donor_output = model.llm.generate([donor], params)[0]
+        assert donor_output.num_cached_tokens == 0
+        reused = model.llm.generate([query], params)[0]
+        # A 128-token prefill resumes 64 tokens before the second block ends.
+        assert reused.num_cached_tokens == 1984
+        assert reused.outputs[0].token_ids == baseline.outputs[0].token_ids
 
     assert len(outputs) == 2
     assert all(len(output.outputs[0].token_ids) == MAX_TOKENS for output in outputs)
