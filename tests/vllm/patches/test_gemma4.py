@@ -185,7 +185,7 @@ def _run(layer, hidden_states, prefill, monkeypatch, **kwargs):
 
     from vllm_rbln.patches import gemma4
 
-    monkeypatch.setattr(gemma4, "_is_prefill", lambda: prefill)
+    monkeypatch.setattr(gemma4, "is_prefill_step", lambda: prefill)
     positions = torch.arange(hidden_states.shape[-2])
     out, _ = gemma4.patched_gemma4_decoder_layer_forward(
         layer, positions, hidden_states, None, **kwargs
@@ -251,7 +251,7 @@ def test_the_final_norm_reads_only_the_decode_residual(monkeypatch, prefill):
     torch.manual_seed(0)
     calls = _token_cut_ops(monkeypatch)
     monkeypatch.setattr(gemma4, "_CUTS_THE_DECODE_RESIDUAL", True)
-    monkeypatch.setattr(gemma4, "_is_prefill", lambda: prefill)
+    monkeypatch.setattr(gemma4, "is_prefill_step", lambda: prefill)
     with set_current_vllm_config(make_vllm_config()):
         norm = gemma4.ResidualReadNorm(64, eps=1e-6)
     norm.weight.data = 1.0 + 0.1 * torch.randn(64)
