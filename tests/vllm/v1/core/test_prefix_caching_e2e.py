@@ -41,9 +41,6 @@ MODELS = [
             "num_gpu_blocks_override": 64,
             "seed": 0,
         },
-        # The fourth layer is the first full-attention one: with it the state
-        # and the attention cache share a buffer.
-        num_hidden_layers=4,
     ),
 ]
 
