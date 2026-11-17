@@ -18,24 +18,21 @@ highest one. In logits that is `logit >= max_logit + log(min_p)`, which needs no
 softmax. A row without min_p carries `log(0) = -inf` and keeps every token.
 """
 
+from collections.abc import Sequence
+from typing import Any
+
 import numpy as np
 import torch
 from vllm.v1.sample.logits_processor.builtin import MinPLogitsProcessor
-from vllm.v1.sample.metadata import SamplingMetadata
 
 _DROP = -1e4
 
 
 def graph_log_min_p(
-    sampling_metadata: SamplingMetadata, num_rows: int, device: torch.device
+    active: Sequence[Any], num_rows: int, device: torch.device
 ) -> torch.Tensor | None:
     """log(min_p) per row for the sampling graph, or None when the step keeps the
-    eager argmax-invariant processors."""
-    active = [
-        p
-        for p in sampling_metadata.logitsprocs.argmax_invariant
-        if getattr(p, "min_p_count", 1)
-    ]
+    eager argmax-invariant processors. `active` is `active_argmax_invariant()`."""
     if len(active) != 1 or not isinstance(active[0], MinPLogitsProcessor):
         return None
     proc = active[0]

@@ -14,13 +14,18 @@
 import math
 import weakref
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import numpy as np
 import torch
+from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.logits_processor.builtin import MinPLogitsProcessor
 
+from vllm_rbln.v1.sample.ops.fused_penalty import active_argmax_invariant
 from vllm_rbln.v1.sample.ops.min_p import apply_min_p, graph_log_min_p
 from vllm_rbln.v1.sample.rbln_sampler import RBLNSampler
+
+from .utils import build_input_batch
 
 
 def test_apply_min_p_matches_the_probability_rule():
@@ -51,15 +56,15 @@ def _metadata(*procs):
 
 def test_log_min_p_pads_rows_without_min_p():
     md = _metadata(_min_p_proc([0.1, 0.0, 0.5]))
-    got = graph_log_min_p(md, 4, torch.device("cpu"))
+    got = graph_log_min_p(active_argmax_invariant(md), 4, torch.device("cpu"))
     want = torch.tensor([math.log(0.1), -math.inf, math.log(0.5), -math.inf])
     torch.testing.assert_close(got, want)
 
 
 def test_other_argmax_invariant_processors_keep_the_eager_path():
     other = SimpleNamespace()  # no min_p_count: counted as active
-    assert graph_log_min_p(_metadata(_min_p_proc([0.1]), other), 1, "cpu") is None
-    assert graph_log_min_p(_metadata(_min_p_proc([0.0])), 1, "cpu") is None
+    for md in (_metadata(_min_p_proc([0.1]), other), _metadata(_min_p_proc([0.0]))):
+        assert graph_log_min_p(active_argmax_invariant(md), 1, "cpu") is None
 
 
 def test_keep_all_buffers_live_with_the_sampler(monkeypatch):
@@ -84,3 +89,19 @@ def test_keep_all_buffers_live_with_the_sampler(monkeypatch):
     refs = weakref.ref(k), weakref.ref(p)
     del sampler, k, p, again_k, again_p
     assert all(ref() is None for ref in refs)
+
+
+def test_unaligned_vocab_keeps_the_eager_min_p(monkeypatch):
+    monkeypatch.setattr(
+        "vllm_rbln.v1.sample.rbln_sampler.compile_sampler", lambda fn, ctx: fn
+    )
+    sampler = RBLNSampler()
+    sampler._compiled_min_p_sample = MagicMock()
+    top_k_top_p = MagicMock(return_value=(torch.zeros(2), None))
+    monkeypatch.setattr(sampler.topk_topp_sampler, "forward", top_k_top_p)
+    vocab = 50272  # opt-125m, not a multiple of 128
+    params = SamplingParams(temperature=1.0, min_p=0.3)
+    batch = build_input_batch([("0", params), ("1", params)], vocab_size=vocab)
+    sampler.sample(torch.randn(2, vocab), batch.sampling_metadata)
+    sampler._compiled_min_p_sample.assert_not_called()
+    top_k_top_p.assert_called_once()

@@ -28,7 +28,7 @@ See docs/fused_sampling.md.
 
 import dataclasses
 from collections.abc import Callable, Iterable, Sequence
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import numpy as np
 import torch
@@ -86,13 +86,14 @@ def supports_vocab(vocab_size: int) -> bool:
     return vocab_size % (2 * CHUNK) == 0 and k_cap(vocab_size // 2) > 0
 
 
-def uses_argmax_invariant_processors(sampling_metadata: SamplingMetadata) -> bool:
-    """Whether a random-sampling step must run min_p and other argmax-invariant
-    processors on the logits before sampling."""
-    return any(
-        getattr(p, "min_p_count", 1)
+def active_argmax_invariant(sampling_metadata: SamplingMetadata) -> list[Any]:
+    """The min_p and other argmax-invariant processors a random-sampling step
+    must run on the logits before sampling."""
+    return [
+        p
         for p in sampling_metadata.logitsprocs.argmax_invariant
-    )
+        if getattr(p, "min_p_count", 1)
+    ]
 
 
 def without_penalties_and_logit_bias(

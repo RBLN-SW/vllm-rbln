@@ -33,9 +33,9 @@ from vllm_rbln.platform import use_device_tensor
 from vllm_rbln.v1.sample.ops.fused_penalty import (
     FusedPenaltyPlan,
     FusedPenaltyState,
+    active_argmax_invariant,
     apply_fused_penalty,
     supports_vocab,
-    uses_argmax_invariant_processors,
     without_penalties_and_logit_bias,
 )
 from vllm_rbln.v1.sample.ops.min_p import apply_min_p, graph_log_min_p
@@ -206,7 +206,6 @@ class RBLNTopKTopPSampler(nn.Module):
         temperature: torch.Tensor,
         k: torch.Tensor | None,
         p: torch.Tensor | None,
-        staging_owner: Any = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """More optimized implementation for top-k and top-p sampling.
 
@@ -219,8 +218,6 @@ class RBLNTopKTopPSampler(nn.Module):
             )
 
         out = self._compiled_rbln_topk_topp_sampler(logits, temperature, k, p)
-        if staging_owner is not None:
-            out = _stage_into(staging_owner, out)
         return out, None
 
 
@@ -324,6 +321,7 @@ class RBLNSampler(VLLMSampler):
             min_p_sample is not None
             and temperature is not None
             and not sampling_metadata.all_greedy
+            and supports_vocab(logits.shape[-1])
         ):
             rows, vocab = logits.shape
             top_k, top_p = self._filled_top_k_top_p(
@@ -400,13 +398,16 @@ class RBLNSampler(VLLMSampler):
             temperature = torch.where(temperature < _SAMPLING_EPS, 1.0, temperature)
 
         min_p_sample = self._compiled_min_p_sample
+        active = active_argmax_invariant(sampling_metadata)
+        # TODO(rbln): drop the vocab check once x - amax(x) is correct for a last
+        # dim that is not a multiple of 64 (the reduction reads the padding).
         log_min_p = (
-            graph_log_min_p(sampling_metadata, logits.shape[0], logits.device)
-            if min_p_sample is not None
+            graph_log_min_p(active, logits.shape[0], logits.device)
+            if min_p_sample is not None and supports_vocab(logits.shape[-1])
             else None
         )
         argmax_invariant = sampling_metadata.logitsprocs.argmax_invariant
-        if uses_argmax_invariant_processors(sampling_metadata):
+        if active:
             if penalty is not None:
                 # min_p and friends read the penalized logits.
                 logits = self._fused_graph("penalize", penalty)(
@@ -414,8 +415,9 @@ class RBLNSampler(VLLMSampler):
                 )
                 penalty = None
             if log_min_p is None:
-                # Padded rows carry temperature 1.0, so the in-place division
-                # also preserves the padding seen by eager processors.
+                # In place: a second logits-sized tensor costs more than the
+                # division. Padded rows carry temperature 1.0, see
+                # RBLNInputBatch._make_sampling_metadata_rbln.
                 logits = logits.div_(temperature.to(logits.dtype).unsqueeze(dim=1))
                 temperature = torch.ones_like(temperature)
 

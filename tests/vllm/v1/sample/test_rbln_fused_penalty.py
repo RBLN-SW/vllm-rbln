@@ -231,11 +231,13 @@ def test_warm_up_skips_fused_graphs_for_an_unsupported_vocab(monkeypatch):
     monkeypatch.setattr(RBLNSampler, "__call__", lambda self, **kw: None)
     sampler = object.__new__(RBLNSampler)
     sampler._penalty_state = FusedPenaltyState()
-    sampler._compiled_min_p_sample = None
+    sampler._compiled_min_p_sample = MagicMock()
+    sampler._filled_top_k_top_p = MagicMock(return_value=(None, None))
     sampler.sample = MagicMock()
     sampler._fused_graph = MagicMock()
-    md = SimpleNamespace(all_greedy=False, temperature=None)
+    md = SimpleNamespace(all_greedy=False, temperature=torch.ones(2))
     sampler.warm_up(torch.zeros(2, 50257), md)
+    sampler._compiled_min_p_sample.assert_not_called()
     sampler.sample.assert_not_called()
     sampler._fused_graph.assert_not_called()
 

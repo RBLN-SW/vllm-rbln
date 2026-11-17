@@ -37,9 +37,10 @@ Fused sampling is enabled by default on the vllm model path. Disable it with
 `--no-rbln-use-fused-sampling`, or pass
 `additional_config={"use_fused_sampling": False}` to `LLM(...)`.
 
-A step keeps the existing path when it runs speculative decoding or a thinking
-budget, when the sampler returns processed logprobs, or when the vocab size is
-not a multiple of 128.
+Penalties and logit bias keep the existing path when a step runs speculative
+decoding or a thinking budget. Upstream vLLM rejects min_p with speculative
+decoding. A step also keeps the existing path when the sampler returns processed
+logprobs, or when the vocab size is not a multiple of 128.
 
 min_p also runs in a graph with this option on. A step with min_p applies the
 penalties in a graph of their own first, since min_p reads the penalized
