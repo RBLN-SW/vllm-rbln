@@ -19,6 +19,7 @@ from vllm.model_executor.models.gemma4 import Gemma4DecoderLayer, Gemma4MLP
 
 from vllm_rbln.patches import register_patch
 from vllm_rbln.patches.registry import add_registration
+from vllm_rbln.utils import is_prefill_step
 
 
 @register_patch(
@@ -35,13 +36,35 @@ def keep_the_rbln_attention_backend(vllm_config: VllmConfig) -> None:
     """Leave the attention backend to the RBLN platform."""
 
 
+def _read(norm, residual: torch.Tensor, cut: bool) -> torch.Tensor:
+    """The next block's input: RMSNorm(residual), token-cut when `cut`."""
+    if cut:
+        return torch.ops.rbln_custom_ops.residual_read(
+            residual, norm.weight, norm.variance_epsilon
+        )
+    return norm(residual)
+
+
+def _write(norm, residual: torch.Tensor, y: torch.Tensor, cut: bool) -> torch.Tensor:
+    """residual + RMSNorm(y), token-cut when `cut`; each norm passes its own eps."""
+    if cut:
+        return torch.ops.rbln_custom_ops.gemma4_dense_residual_write(
+            residual, y, norm.weight, norm.variance_epsilon
+        )
+    return norm(y) + residual
+
+
 @register_patch(
     target="vllm.model_executor.models.gemma4.Gemma4DecoderLayer.forward",
     reason=(
         "Gemma4 routes on the residual, not on the experts' input, and hands "
         "upstream's MoE runner precomputed logits. RBLNMoERunner takes a router "
         "callable instead, as the patched qwen/deepseek/minimax/gpt-oss MoE "
-        "blocks pass it; this forward is upstream's with that one call changed."
+        "blocks pass it; this forward is upstream's with that one call changed. "
+        "A dense layer in prefill runs its residual adds and norms as "
+        "rbln_custom_ops::{residual_read,gemma4_dense_residual_write} instead, "
+        "which the compiler cuts by tokens so the residual stays split across "
+        "chiplets."
     ),
 )
 def patched_gemma4_decoder_layer_forward(
@@ -52,16 +75,20 @@ def patched_gemma4_decoder_layer_forward(
     per_layer_input: torch.Tensor | None = None,
     **kwargs,
 ) -> tuple[torch.Tensor, None]:
+    # The two dense ops cover one read and one write per block; a MoE layer reads
+    # the residual again for the router and a per-layer input adds to it before
+    # the scalar. The layer scalar stays upstream's multiply, so it runs on each
+    # chiplet's token slice and remains a constant the decode graph shares.
+    cut = not self.enable_moe_block and per_layer_input is None and is_prefill_step()
     residual = hidden_states
-    hidden_states = self.input_layernorm(residual)
+    hidden_states = _read(self.input_layernorm, residual, cut)
     hidden_states = self.self_attn(
         positions=positions, hidden_states=hidden_states, **kwargs
     )
-    hidden_states = self.post_attention_layernorm(hidden_states)
-    hidden_states = hidden_states + residual
+    hidden_states = _write(self.post_attention_layernorm, residual, hidden_states, cut)
     residual = hidden_states
 
-    hidden_states = self.pre_feedforward_layernorm(hidden_states)
+    hidden_states = _read(self.pre_feedforward_layernorm, hidden_states, cut)
     hidden_states = self.mlp(hidden_states)
 
     if self.enable_moe_block:
@@ -76,8 +103,9 @@ def patched_gemma4_decoder_layer_forward(
         hidden_states_2 = self.post_feedforward_layernorm_2(hidden_states_2)
         hidden_states = hidden_states_1 + hidden_states_2
 
-    hidden_states = self.post_feedforward_layernorm(hidden_states)
-    hidden_states = hidden_states + residual
+    hidden_states = _write(
+        self.post_feedforward_layernorm, residual, hidden_states, cut
+    )
 
     if per_layer_input is not None and self.per_layer_input_gate is not None:
         gate = self.per_layer_input_gate(hidden_states)
