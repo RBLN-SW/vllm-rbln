@@ -21,15 +21,17 @@ with one state per request; prefix checkpoint copies are not supported yet.
 GLM-5.3 metadata supplies block tables, positions and state slots.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import ClassVar
 
 import torch
 from vllm.v1.attention.backend import AttentionBackend, MultipleOf
 from vllm.v1.kv_cache_interface import MambaSpec
 
+import vllm_rbln.utils as rbln_utils
+
 from .flash_attention import RBLNFlashAttentionMetadataBuilder
-from .glm5_next import RBLNGlm5NextMetadataBuilder
+from .glm5_next import RBLNGlm5NextMetadataBuilder, RBLNGlm5NextStateMetadata
 
 # The packed KV8 row: 448 fp8 nope | 64 pad | 64 f16 scale lanes | 64 bf16 rope.
 DSV4_KV8_ROW_BYTES = 768
@@ -123,6 +125,34 @@ class RBLNDeepseekV4CSABackend(_RBLNDeepseekV4CacheBackend):
         return "RBLN_DEEPSEEK_V4_CSA"
 
 
+@dataclass
+class RBLNDeepseekV4HCAMetadata(RBLNGlm5NextStateMetadata):
+    # block_tables' values as int16, a tensor of its own: the HCA history walk
+    # reads it as a const buffer, which must not be the graph input the cache
+    # store reads on the device (one input holds one physical layout).
+    hist_block_tables: torch.Tensor | None = None
+
+
+class RBLNDeepseekV4HCAMetadataBuilder(RBLNGlm5NextMetadataBuilder):
+    def build(self, common_attn_metadata, positions, batch_pad, is_prefill, **kwargs):
+        metadata = super().build(
+            common_attn_metadata, positions, batch_pad, is_prefill, **kwargs
+        )
+        # block_tables as the parent builds it: a 1-D table for a prefill, the batch
+        # padded for a decode.
+        block_table = common_attn_metadata.block_table_tensor
+        if is_prefill:
+            block_table = block_table[0]
+        else:
+            block_table = rbln_utils.pad(block_table, 0, batch_pad)
+        return RBLNDeepseekV4HCAMetadata(
+            **{f.name: getattr(metadata, f.name) for f in fields(metadata)},
+            hist_block_tables=self._stage(
+                block_table.to(torch.int16), "hist_block_tables"
+            ),
+        )
+
+
 class RBLNDeepseekV4HCABackend(_RBLNDeepseekV4CacheBackend):
     """HCA compressed KV cache (ratio 128)."""
 
@@ -131,6 +161,10 @@ class RBLNDeepseekV4HCABackend(_RBLNDeepseekV4CacheBackend):
     @staticmethod
     def get_name() -> str:
         return "RBLN_DEEPSEEK_V4_HCA"
+
+    @staticmethod
+    def get_builder_cls() -> type["RBLNFlashAttentionMetadataBuilder"]:
+        return RBLNDeepseekV4HCAMetadataBuilder
 
 
 def dsv4_paged_backend(compress_ratio: int) -> type[_RBLNDeepseekV4CacheBackend]:

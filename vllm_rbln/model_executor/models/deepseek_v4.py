@@ -855,8 +855,9 @@ class RBLNDeepseekV4Attention(nn.Module):
                     *common, *compressed, topk_index
                 )
             else:  # HCA: every completed entry
+                hist_block_table = _metadata(self.cmp_cache.prefix).hist_block_tables
                 o = torch.ops.rbln_custom_ops.sparse_attn_deepseek_v4_hca(
-                    *common, *compressed
+                    *common, *compressed, hist_block_table
                 )
         else:
             o = torch.ops.rbln_custom_ops.sparse_attn_deepseek_v4_swa(*common)
