@@ -58,7 +58,7 @@ _pytest: &pytest
     queue: udc
   resources:
     npu:
-      count: 4
+      count: 1
       product: "RBLN-CR13"
   image: "${DEVTOOLS_DOCKER_IMAGE}"
   secrets: *secrets
@@ -88,10 +88,6 @@ steps:
       - <<: *e2e
         label: "basic_correctness"
         key: "vllm-rbln-e2e-basic-correctness-cr13"
-        resources:
-          npu:
-            count: 1
-            product: "RBLN-CR13"
         command:
           - *sync
           - "bash .buildkite/pipelines/vllm-rbln/scripts/run-e2e.sh --group basic_correctness ${PYTEST_E2E_ARGS:-}"
@@ -99,6 +95,10 @@ steps:
       - <<: *e2e
         label: "compile"
         key: "vllm-rbln-e2e-compile-cr13"
+        resources:
+          npu:
+            count: 4
+            product: "RBLN-CR13"
         command:
           - *sync
           - "bash .buildkite/pipelines/vllm-rbln/scripts/run-e2e.sh --group compile ${PYTEST_E2E_ARGS:-}"
@@ -106,6 +106,10 @@ steps:
       - <<: *e2e
         label: "dp"
         key: "vllm-rbln-e2e-dp-cr13"
+        resources:
+          npu:
+            count: 4
+            product: "RBLN-CR13"
         command:
           - *sync
           - "bash .buildkite/pipelines/vllm-rbln/scripts/run-e2e.sh --group dp ${PYTEST_E2E_ARGS:-}"
@@ -124,10 +128,6 @@ steps:
       - <<: *e2e
         label: "core"
         key: "vllm-rbln-e2e-core-cr13"
-        resources:
-          npu:
-            count: 1
-            product: "RBLN-CR13"
         command:
           - *sync
           - "bash .buildkite/pipelines/vllm-rbln/scripts/run-e2e.sh --group core ${PYTEST_E2E_ARGS:-}"
@@ -135,10 +135,6 @@ steps:
       - <<: *e2e
         label: "sample"
         key: "vllm-rbln-e2e-sample-cr13"
-        resources:
-          npu:
-            count: 1
-            product: "RBLN-CR13"
         command:
           - *sync
           - "bash .buildkite/pipelines/vllm-rbln/scripts/run-e2e.sh --group sample ${PYTEST_E2E_ARGS:-}"
