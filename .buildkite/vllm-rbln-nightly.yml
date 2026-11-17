@@ -35,7 +35,7 @@ _dshm: &dshm
               medium: Memory
               sizeLimit: 4Gi
 
-_sync: &sync "echo '--- :package: uv sync' && uv sync --locked --python 3.12 --extra test --extra dev --extra runtime"
+_sync: &sync "echo '--- :package: uv sync' && uv sync --locked --python 3.12 --extra test --extra dev --extra runtime --extra kv_connectors"
 
 _measured: &measured
   soft_fail: true

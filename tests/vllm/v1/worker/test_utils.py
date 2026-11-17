@@ -402,8 +402,9 @@ class TestEstimateModelKernelSize:
     def test_bytes_path_exact(self):
         # n_model_bytes path, default bits passed explicitly (no platform mock).
         result = estimate_model_kernel_size(
-            _make_model_config(num_layers=2, vocab_size=64, hidden_size=32),
+            _make_model_config(vocab_size=64, hidden_size=32),
             _make_parallel_config(tp_size=1),
+            num_layers=2,
             n_model_bytes=12_288,
             default_bits_per_param=16,
         )
@@ -412,8 +413,9 @@ class TestEstimateModelKernelSize:
     def test_params_path_exact(self):
         # n_model_params + nbits_per_param path.
         result = estimate_model_kernel_size(
-            _make_model_config(num_layers=4, vocab_size=128, hidden_size=64),
+            _make_model_config(vocab_size=128, hidden_size=64),
             _make_parallel_config(tp_size=1),
+            num_layers=4,
             n_model_params=1_000_000,
             nbits_per_param=16,
             default_bits_per_param=16,
@@ -422,8 +424,8 @@ class TestEstimateModelKernelSize:
 
     def test_tp_scaling(self):
         # tp_size changes lm_heads_nbytes (align per-tp, then multiply by tp).
-        mc = _make_model_config(num_layers=2, vocab_size=64, hidden_size=32)
-        common = dict(n_model_bytes=12_288, default_bits_per_param=16)
+        mc = _make_model_config(vocab_size=64, hidden_size=32)
+        common = dict(num_layers=2, n_model_bytes=12_288, default_bits_per_param=16)
         r1 = estimate_model_kernel_size(mc, _make_parallel_config(tp_size=1), **common)
         r2 = estimate_model_kernel_size(mc, _make_parallel_config(tp_size=2), **common)
         assert r1 == 6_291_456
@@ -447,6 +449,7 @@ class TestEstimateModelKernelSize:
             estimate_model_kernel_size(
                 _make_model_config(),
                 _make_parallel_config(),
+                num_layers=32,
                 default_bits_per_param=16,
                 **kwargs,
             )
@@ -454,22 +457,23 @@ class TestEstimateModelKernelSize:
     def test_default_bits_from_platform(self, monkeypatch):
         # With default_bits_per_param=None the bits come from the device name:
         # ATOM/REBEL -> 16, unknown RBLN -> ValueError, non-rbln -> assert.
-        mc = _make_model_config(num_layers=2, vocab_size=64, hidden_size=32)
+        mc = _make_model_config(vocab_size=64, hidden_size=32)
         pc = _make_parallel_config(tp_size=1)
+        kw = dict(num_layers=2, n_model_bytes=12_288)
 
         def _name(name):
             monkeypatch.setattr(current_platform, "get_device_name", lambda: name)
 
         _name("RBLN-CA25")
-        assert estimate_model_kernel_size(mc, pc, n_model_bytes=12_288) == 6_291_456
+        assert estimate_model_kernel_size(mc, pc, **kw) == 6_291_456
         _name("RBLN-CR13")
-        assert estimate_model_kernel_size(mc, pc, n_model_bytes=12_288) == 6_291_456
+        assert estimate_model_kernel_size(mc, pc, **kw) == 6_291_456
         _name("RBLN-XX99")
         with pytest.raises(ValueError, match="invalid RBLN architecture"):
-            estimate_model_kernel_size(mc, pc, n_model_bytes=12_288)
+            estimate_model_kernel_size(mc, pc, **kw)
         _name("cpu")
         with pytest.raises(AssertionError):
-            estimate_model_kernel_size(mc, pc, n_model_bytes=12_288)
+            estimate_model_kernel_size(mc, pc, **kw)
 
 
 class TestGetKvCacheNames:
@@ -1918,3 +1922,17 @@ class TestRescaleKvCacheConfig:
     def test_a_zero_block_config_is_refused(self):
         with pytest.raises(ValueError, match="cannot rescale"):
             rescale_kv_cache_config(self._cfg(0), 5)
+
+
+class TestGatedDeltaNetCacheIndices:
+    def test_a_layer_owns_a_state_and_a_conv_ring_slot(self):
+        # Two cache slots a layer: the recurrent state at the layer's own slot,
+        # its conv ring at the next, and an attention layer's cache at the first.
+        config = SimpleNamespace(hf_config=SimpleNamespace(model_type="qwen3_5_text"))
+        assert worker_utils.num_attn_module(config, "auto") == 2
+        assert worker_utils.extract_layer_index("model.layers.3.linear_attn", 2) == 6
+        assert (
+            worker_utils.extract_layer_index("model.layers.3.linear_attn.conv_ring", 2)
+            == 7
+        )
+        assert worker_utils.extract_layer_index("model.layers.3.self_attn.attn", 2) == 6
