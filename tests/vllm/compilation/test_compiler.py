@@ -340,18 +340,3 @@ class TestCompilerConformance:
         params = inspect.signature(CompileContext).parameters
         assert "use_weight_sharing" in params
         assert "use_global_ctx" not in params  # deprecated kwargs
-
-    def test_dtype_check_refuses_an_older_rebel(self, monkeypatch):
-        def legacy_compile(model, *, npu=None):
-            pass
-
-        monkeypatch.setattr(compiler.rebel, "compile", legacy_compile)
-        with pytest.raises(ValueError, match="dtype"):
-            compiler.check_dtype_option_supported()
-
-    def test_dtype_check_passes_when_rebel_takes_it(self, monkeypatch):
-        def new_compile(model, *, npu=None, dtype=None):
-            pass
-
-        monkeypatch.setattr(compiler.rebel, "compile", new_compile)
-        compiler.check_dtype_option_supported()

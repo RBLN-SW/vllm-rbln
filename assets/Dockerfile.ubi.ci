@@ -88,9 +88,7 @@ RUN ln -sf "/usr/bin/python${PYTHON_VERSION%.*}" /usr/bin/python3 && \
     ln -sf "/usr/bin/pip${PYTHON_VERSION%.*}" /usr/bin/pip
 
 # vLLM-RBLN ENV
-ENV RBLN_KERNEL_MODE="triton" \
-    VLLM_USE_V1="0" \
-    USE_VLLM_MODEL="1" \
+ENV VLLM_RBLN_USE_VLLM_MODEL="1" \
     VLLM_DISABLE_COMPILE_CACHE="1" 
 
 # Fix permissions for OpenShift

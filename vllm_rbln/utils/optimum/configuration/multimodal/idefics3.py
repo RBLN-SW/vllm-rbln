@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2025 Rebellions Inc. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at:
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from .language import build_language_model_config
+
+
+def build_idefics3_config(
+    batch_size: int,
+    max_model_len: int,
+    block_size: int,
+    num_devices: int,
+    memory_budget: float,
+    prefill_chunk_size: int | None = None,
+) -> dict:
+    language_model_config = build_language_model_config(
+        batch_size,
+        max_model_len,
+        block_size,
+        num_devices,
+        memory_budget,
+        prefill_chunk_size,
+    )
+    return {"text_model": language_model_config}

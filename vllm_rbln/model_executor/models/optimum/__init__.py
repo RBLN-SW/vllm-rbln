@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -35,6 +35,7 @@ from .exaone4_5 import RBLNOptimumExaone4_5_ForConditionalGeneration  # noqa: F4
 from .gemma3 import RBLNOptimumGemma3ForConditionalGeneration  # noqa: F401
 from .gemma4 import RBLNOptimumGemma4ForConditionalGeneration  # noqa: F401
 from .idefics3 import RBLNOptimumIdefics3ForConditionalGeneration  # noqa: F401
+from .llama4 import RBLNOptimumLlama4ForConditionalGeneration  # noqa: F401
 from .llava import RBLNOptimumLlavaForConditionalGeneration  # noqa: F401
 from .llava_next import RBLNOptimumLlavaNextForConditionalGeneration  # noqa: F401
 from .paligemma import RBLNOptimumPaliGemmaForConditionalGeneration  # noqa: F401
@@ -47,6 +48,8 @@ from .qwen3_reranker import RBLNOptimumQwen3RerankerModel
 from .qwen3_vl import (  # noqa: F401
     RBLNOptimumQwen3_5ForConditionalGeneration,
     RBLNOptimumQwen3VLForConditionalGeneration,
+    RBLNOptimumQwen3VLForSequenceClassification,
+    RBLNOptimumQwen3VLModel,
     RBLNOptimumQwen3VLMoeForConditionalGeneration,
 )
 from .sliding_window import RBLNOptimumSlidingWindowAttentionForCausalLM  # noqa: F401
@@ -88,8 +91,8 @@ def load_model(vllm_config: VllmConfig) -> nn.Module:
                 "Encoder-decoder models are not supportedsince vLLM RBLN v0.10.1"
             )
     elif is_qwen3_reranker(model_config):
-        # Scored through the generation graph, so the HF arch was remapped to
-        # Qwen3ForCausalLM and the pooling dispatch below would miss it.
+        # Scored through the generation graph, so Qwen3ForSequenceClassification
+        # is a generation arch and the pooling dispatch below would miss it.
         assert vllm_config.cache_config.enable_prefix_caching in (False, None), (
             "Prefix caching is not supported with pooling models. Please set "
             "`enable_prefix_caching` to False."

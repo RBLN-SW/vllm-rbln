@@ -89,8 +89,9 @@ class InputStager:
             non_blocking=True,
         )
 
+        # positions is [B, S], or [3, B, S] for an M-RoPE model with images.
         buf.positions.fill_(layout.position_pad_value)
-        buf.positions[: layout.num_reqs, : layout.query_len].copy_(
+        buf.positions[..., : layout.num_reqs, : layout.query_len].copy_(
             positions,
             non_blocking=True,
         )
@@ -110,9 +111,11 @@ class InputStager:
         input_ids: torch.Tensor,
         positions: torch.Tensor,
     ) -> InputBuffer:
+        positions_shape = (*positions.shape[:-2], *layout.shape)
         key = (
             layout.shape,
             input_ids.dtype,
+            positions_shape,
             positions.dtype,
         )
         if key in self._buffers:
@@ -125,7 +128,7 @@ class InputStager:
                 device=self.device,
             ),
             positions=torch.empty(
-                layout.shape,
+                positions_shape,
                 dtype=positions.dtype,
                 device=self.device,
             ),
@@ -160,18 +163,20 @@ class InputStager:
 
     def stage_mm_embeds(
         self,
-        mm_embeds: torch.Tensor,
+        mm_rows: list[tuple[int, int, torch.Tensor]],
         mm_mask: torch.Tensor,
+        hidden_size: int,
         layout: InputLayout,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Pad a multimodal model's per-token vision embeddings [R, L, H] and
-        their 0 / 1 mask [R, L, 1] to the layout; padding is text (mask 0)."""
-        key = (layout.shape, mm_embeds.dtype, mm_embeds.shape[-1])
+        """Pad a multimodal model's 0 / 1 mask [R, L, 1] to the layout as text
+        (mask 0), and copy each ``(request, first token, [N, H] rows)`` run of
+        vision embeddings into a [R, L, H] buffer in the mask's dtype."""
+        key = (layout.shape, mm_mask.dtype, hidden_size)
         if (bufs := self._mm_embeds_buffers.get(key)) is None:
             bufs = (
-                torch.empty(
-                    (*layout.shape, mm_embeds.shape[-1]),
-                    dtype=mm_embeds.dtype,
+                torch.zeros(
+                    (*layout.shape, hidden_size),
+                    dtype=mm_mask.dtype,
                     device=self.device,
                 ),
                 torch.empty(
@@ -180,9 +185,15 @@ class InputStager:
             )
             self._mm_embeds_buffers[key] = bufs
 
-        for buf, src in zip(bufs, (mm_embeds, mm_mask)):
-            buf.zero_()
-            buf[: layout.num_reqs, : layout.query_len].copy_(src, non_blocking=True)
+        embeds, mask = bufs
+        mask.zero_()
+        mask[: layout.num_reqs, : layout.query_len].copy_(mm_mask, non_blocking=True)
+        for req_index, start, rows in mm_rows:
+            assert req_index < layout.num_reqs
+            assert start + rows.shape[0] <= layout.query_len
+            embeds[req_index, start : start + rows.shape[0]].copy_(
+                rows, non_blocking=True
+            )
         return bufs
 
     def _stage_token_indices(

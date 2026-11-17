@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -56,6 +56,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import (
     SupportsKVCacheRegistrationFinalize,
 )
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
@@ -118,6 +119,10 @@ class RblnNixlConnectorBase(NixlBaseConnector, SupportsKVCacheRegistrationFinali
         materializes the KV cache backing memory. No-op on host-bounce."""
         if self.connector_worker is not None:
             self.connector_worker.finalize_kv_cache_registration()
+
+    def register_block_aux_kv_caches(self, specs: dict[str, RBLNBlockAuxSpec]) -> None:
+        assert self.connector_worker is not None
+        self.connector_worker.register_block_aux_kv_caches(specs)
 
 
 class RblnNixlPullConnector(

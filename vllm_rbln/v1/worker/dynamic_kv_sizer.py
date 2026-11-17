@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -443,8 +443,10 @@ class DynamicKvSizer:
             enable_prefix_caching=self.cache_config.enable_prefix_caching,
             sub_block_cache=rbln_config.enable_sub_block_cache,
             block_size=self.cache_config.block_size,
-            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+            prefill_chunk_sizes=rbln_config.prefill_chunk_size,
             kv_cache_config=self.model_runner.kv_cache_config,
+            model_config=self.vllm_config.model_config,
+            cache_dtype=self.cache_config.cache_dtype,
             sub_block_size=rbln_config.sub_block_size,
         )
         return DYNAMIC_KV_COPY_STREAM_RESERVE_BYTES if in_use is not None else 0
@@ -742,7 +744,7 @@ class DynamicKvSizer:
         unbound = 0
         for layer_name in dict.fromkeys(
             [name for t in old_cfg.kv_cache_tensors for name in t.layers]
-            + mr.aux_kv_cache_layers
+            + list(mr.aux_kv_cache_specs)
         ):
             layer = forward_context.get(layer_name)
             if layer is None:

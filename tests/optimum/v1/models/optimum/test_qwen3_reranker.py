@@ -1,11 +1,11 @@
 # Copyright 2026 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -16,12 +16,14 @@
 The reranker reuses the *generation* graph so it can read the score off two
 vocabulary logits. These tests cover the parts that do not need an NPU:
 
-  * the HF arch is remapped to ``Qwen3ForCausalLM``, so the compile spec and
-    optimum-rbln class match the generative path and share its artifact,
+  * the HF arch stays ``Qwen3ForSequenceClassification``, which selects
+    ``RBLNQwen3ForCausalLM`` compiled prefill-only,
   * ``classifier_from_token`` resolves to the right vocabulary ids,
   * inputs are **left** padded, which the generation graph requires,
   * ``forward`` reduces the vocabulary to ``logit_yes - logit_no``, and the
     pooler's sigmoid on that equals the 2-way softmax.
+
+Qwen3-VL-Reranker is scored the same way, through the multimodal wrapper.
 """
 
 from types import SimpleNamespace
@@ -37,13 +39,19 @@ from vllm.config import (
     set_current_vllm_config,
 )
 
+from vllm_rbln.model_executor.models.optimum.base import ModelInputForRBLN
 from vllm_rbln.model_executor.models.optimum.model_base import RBLNOptimumModelBase
 from vllm_rbln.model_executor.models.optimum.qwen3_reranker import (
     RBLNOptimumQwen3RerankerModel,
     RBLNQwen3RerankerPooler,
     resolve_label_token_ids,
 )
-from vllm_rbln.utils.optimum.converter.common import is_chunked_prefill_arch
+from vllm_rbln.model_executor.models.optimum.qwen3_vl import (
+    RBLNOptimumQwen3VLForSequenceClassification,
+)
+from vllm_rbln.utils.optimum.configuration.runtime_config import (
+    is_chunked_prefill_arch,
+)
 from vllm_rbln.utils.optimum.predicates import is_qwen3_embedding, is_qwen3_reranker
 from vllm_rbln.utils.optimum.registry import (
     get_rbln_model_info,
@@ -73,9 +81,6 @@ def _model_config(**overrides):
 
 def _build_reranker(max_seq_len=16, batch_size=2):
     model_config = _model_config()
-    # Mirror RBLNOptimumModelRunner's remap.
-    assert is_qwen3_reranker(model_config)
-    model_config.hf_config.__dict__["architectures"] = ["Qwen3ForCausalLM"]
     vllm_config = VllmConfig(
         model_config=model_config,
         cache_config=CacheConfig(block_size=16, cache_dtype="auto"),
@@ -98,14 +103,6 @@ def _build_reranker(max_seq_len=16, batch_size=2):
         patch.object(RBLNOptimumModelBase, "init_model", fake_init_model),
     ):
         return RBLNOptimumQwen3RerankerModel(vllm_config=vllm_config)
-
-
-def test_predicate_survives_arch_remap():
-    """The predicate keys on classifier_from_token, not the arch name."""
-    model_config = _model_config()
-    assert is_qwen3_reranker(model_config)
-    model_config.hf_config.__dict__["architectures"] = ["Qwen3ForCausalLM"]
-    assert is_qwen3_reranker(model_config), "must still hold after the remap"
 
 
 def test_label_token_ids():
@@ -149,7 +146,10 @@ def test_registered_as_a_generation_arch():
     assert is_generation_arch(hf_config)
     assert not is_pooling_arch(hf_config)
     assert is_chunked_prefill_arch(hf_config)
-    assert get_rbln_model_info(hf_config) == ("qwen3", "RBLNQwen3ForCausalLM")
+    assert get_rbln_model_info(hf_config) == (
+        "qwen3_reranker",
+        "RBLNQwen3ForCausalLM",
+    )
 
 
 def _bare_config(tokens):
@@ -258,5 +258,102 @@ def test_forward_reduces_to_2_way_softmax():
     out = model.forward(model_input)
 
     assert out.shape == (num_requests, 1)
+    expected = torch.softmax(logits[:, 0, [NO_ID, YES_ID]], dim=-1)[:, 1]
+    torch.testing.assert_close(torch.sigmoid(out.squeeze(-1)), expected)
+
+
+VL_MODEL_ID = "Qwen/Qwen3-VL-Reranker-2B"
+VL_RERANKER_OVERRIDES = {
+    **RERANKER_OVERRIDES,
+    "architectures": ["Qwen3VLForSequenceClassification"],
+}
+
+
+def _vl_model_config(**overrides):
+    return ModelConfig(
+        model=VL_MODEL_ID,
+        dtype=torch.float32,
+        seed=42,
+        runner="pooling",
+        max_model_len=128,
+        hf_overrides={**VL_RERANKER_OVERRIDES, **overrides},
+    )
+
+
+def _build_vl_reranker(enable_prefix_caching=False):
+    vllm_config = VllmConfig(
+        model_config=_vl_model_config(),
+        cache_config=CacheConfig(
+            block_size=16,
+            cache_dtype="auto",
+            enable_prefix_caching=enable_prefix_caching,
+        ),
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=1,
+            max_num_batched_tokens=128,
+            max_model_len=128,
+            is_encoder_decoder=False,
+        ),
+    )
+
+    # Fake ONLY the optimum-rbln compile/load step; the rest is the real path.
+    def fake_init_model(self):
+        self.model = MagicMock()
+        self.model.get_kvcache_num_blocks.return_value = 1
+        self.model.rbln_config = SimpleNamespace(
+            dtype=torch.float32, use_multiple_decoder=False, decoder_batch_sizes=None
+        )
+        self.rbln_model_config = self.model.rbln_config
+        self.attn_impl = None
+
+    with (
+        set_current_vllm_config(vllm_config),
+        patch.object(RBLNOptimumModelBase, "init_model", fake_init_model),
+    ):
+        return RBLNOptimumQwen3VLForSequenceClassification(vllm_config=vllm_config)
+
+
+def test_rejects_vl_seq_cls_arch_without_reranker_flags():
+    model_config = _vl_model_config(is_original_qwen3_reranker=False)
+    with pytest.raises(ValueError, match="Qwen3VLForSequenceClassification"):
+        is_qwen3_reranker(model_config)
+
+
+def test_vl_reranker_prefix_caching_is_disabled():
+    """Being multimodal, it is not a pooling arch, so only the Qwen3 predicates
+    turn the requested prefix caching off."""
+    model = _build_vl_reranker(enable_prefix_caching=True)
+    assert not model.vllm_config.cache_config.enable_prefix_caching
+
+
+def test_builds_vl_reranker_pooler():
+    model = _build_vl_reranker()
+
+    assert isinstance(model.pooler, RBLNQwen3RerankerPooler)
+    assert model.pooler.get_supported_tasks() == {"classify"}
+    assert (model.false_id, model.true_id) == (NO_ID, YES_ID)
+
+
+def test_vl_forward_reduces_to_2_way_softmax():
+    """sigmoid(forward()) must equal softmax over the yes/no logits."""
+    model = _build_vl_reranker()
+    vocab_size = model.model_config.hf_text_config.vocab_size
+
+    torch.manual_seed(0)
+    # The prefill graph returns the final position only: [1, 1, vocab_size].
+    logits = torch.randn(1, 1, vocab_size)
+    model.model.prefill_decoder = MagicMock(return_value=SimpleNamespace(logits=logits))
+    model_input = ModelInputForRBLN(
+        input_tokens=torch.zeros(1, 5, dtype=torch.long),
+        input_positions=torch.arange(5, dtype=torch.int32).unsqueeze(0),
+        block_tables=torch.zeros(8, dtype=torch.int16),
+        running_requests_ids=["r0"],
+        padded_batch_size=1,
+        batch_rows=slice(0, 1),
+        is_prompt=True,
+    )
+    out = model.forward(model_input)
+
+    assert out.shape == (1, 1)
     expected = torch.softmax(logits[:, 0, [NO_ID, YES_ID]], dim=-1)[:, 1]
     torch.testing.assert_close(torch.sigmoid(out.squeeze(-1)), expected)
