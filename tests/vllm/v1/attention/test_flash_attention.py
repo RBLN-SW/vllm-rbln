@@ -238,24 +238,38 @@ class TestBuildCommonIndices:
         # graph the same seq_idx, but each keeps its own block table.
         group_shared: dict = {}
         builders = [make_builder(cfg), make_builder(cfg)]
-        mds = [
-            builder.build(
-                _cam(
-                    num_reqs=2,
-                    query_start_loc=[0, 1, 2],
-                    seq_lens=[5, 8],
-                    block_table=table,
-                ),
-                torch.tensor([4, 7]),
-                batch_pad=2,
-                is_prefill=False,
-                group_shared=group_shared,
-            )
-            for builder, table in zip(builders, [[[1], [2]], [[3], [4]]])
-        ]
+
+        def step(positions, shared):
+            return [
+                builder.build(
+                    _cam(
+                        num_reqs=2,
+                        query_start_loc=[0, 1, 2],
+                        seq_lens=[5, 8],
+                        block_table=table,
+                    ),
+                    torch.tensor(positions),
+                    batch_pad=2,
+                    is_prefill=False,
+                    group_shared=shared,
+                )
+                for builder, table in zip(builders, [[[1], [2]], [[3], [4]]])
+            ]
+
+        mds = step([4, 7], group_shared)
         assert mds[0].seq_lens is mds[1].seq_lens
         assert mds[0].block_tables is not mds[1].block_tables
         assert mds[1].block_tables.reshape(-1).tolist() == [3, 4]
+
+        # The next step overwrites the same buffer rather than allocating one.
+        next_mds = step([5, 8], group_shared)
+        assert next_mds[0].seq_lens is mds[0].seq_lens
+        assert mds[0].seq_lens.reshape(-1).tolist() == [5, 8]
+
+        # A caller without the dict, like a drafter, keeps its own buffer.
+        unshared = step([9, 9], None)
+        assert unshared[0].seq_lens is not mds[0].seq_lens
+        assert mds[0].seq_lens.reshape(-1).tolist() == [5, 8]
 
 
 class TestBuildPrefillCausal:

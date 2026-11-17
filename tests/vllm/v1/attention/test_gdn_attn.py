@@ -129,6 +129,30 @@ class TestBuilder:
         assert md.prefill_has_initial_state.tolist() == [1]
         _assert_conv_rows(md, [7], [70], [58], [1])
 
+    def test_group_shared_staging_shares_only_the_group_independent_rows(self):
+        group_shared: dict = {}
+        positions = torch.tensor([128, 5])
+        mds = [
+            _builder().build(
+                _common([1, 1], [129, 6], table),
+                positions,
+                4,
+                False,
+                group_shared=group_shared,
+            )
+            for table in ([[7], [3]], [[8], [2]])
+        ]
+        for name in (
+            "conv_start_positions",
+            "conv_query_lens",
+            "conv_has_initial_state",
+        ):
+            assert getattr(mds[0], name) is getattr(mds[1], name), name
+        assert mds[0].conv_load_blocks is not mds[1].conv_load_blocks
+        _assert_conv_rows(
+            mds[1], [8, 2, 0, 0], [128, 5, 0, 0], [1, 1, 0, 0], [1, 1, 0, 0]
+        )
+
     def test_decode_pads_the_batch_onto_the_null_block(self, builder):
         positions = torch.tensor([128, 5])
         md = builder.build(_common([1, 1], [129, 6], [[7], [3]]), positions, 4, False)
