@@ -11,7 +11,13 @@ if [ "${1:-}" = "--group" ]; then
   fi
   group="$2"
   case "$group" in
-    sample) paths=(tests/vllm/v1/sample) ;;
+    sample)
+      paths=(
+        tests/vllm/v1/sample
+        --shard-count "${BUILDKITE_PARALLEL_JOB_COUNT:-1}"
+        --shard-index "${BUILDKITE_PARALLEL_JOB:-0}"
+      )
+      ;;
     others) paths+=(--ignore tests/vllm/v1/sample) ;;
     *) echo "unknown unit group: $group" >&2; exit 2 ;;
   esac

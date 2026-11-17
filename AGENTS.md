@@ -26,10 +26,12 @@ Run `pre-commit` through `uvx`, since it is not a project dependency. Pass `--fi
 
 A new `.py` file needs the Apache header that every other file carries; `check-license-header` rejects it otherwise. Copy the header from a neighbouring file.
 
-`tests/vllm/` defines two session options (see its `conftest.py`):
+`tests/vllm/` defines four session options (see its `conftest.py`):
 
 - `--model-compile` — opt into whole-model compiles, minutes per test
 - `--num-hidden-layers N` — build only the first N decoder layers
+- `--shard-count N` — split selected tests into N deterministic shards
+- `--shard-index I` — run zero-based shard I; spawned children do not split again
 
 They do not exist in `tests/optimum/`. The vllm suite always uses device tensors.
 

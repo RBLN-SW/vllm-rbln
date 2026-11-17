@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import contextlib
+import hashlib
 import json
 import os
 import warnings
@@ -104,6 +105,18 @@ def _replay_warnings(spawn) -> None:
 
 def pytest_addoption(parser):
     parser.addoption(
+        "--shard-count",
+        type=int,
+        default=1,
+        help="number of deterministic test shards (default: 1)",
+    )
+    parser.addoption(
+        "--shard-index",
+        type=int,
+        default=0,
+        help="zero-based index of the test shard to run (default: 0)",
+    )
+    parser.addoption(
         "--model-compile",
         action="store_true",
         default=False,
@@ -165,16 +178,33 @@ def _session_layers(config) -> int:
     return _DEFAULT_NUM_HIDDEN_LAYERS if layers is None else layers
 
 
+@pytest.hookimpl(trylast=True)
 def pytest_collection_modifyitems(config, items):
-    """Keep whole-model compiles out of the default lane (opt-in via
-    --model-compile; forgetting the flag costs nothing)."""
+    """Gate whole-model compiles and shard after pytest's -m/-k selection.
+
+    Batch children already receive selected nodeids and must not shard again.
+    """
     if config.getoption("--model-compile"):
         _skip_other_chips(items)
+    else:
+        skip = pytest.mark.skip(reason="needs --model-compile")
+        for item in items:
+            if "model_compile" in item.keywords:
+                item.add_marker(skip)
+
+    shard_count = config.getoption("--shard-count")
+    if shard_count == 1 or os.environ.get(_SPAWN_CHILD_ENV) == "1":
         return
-    skip = pytest.mark.skip(reason="needs --model-compile")
+    shard_index = config.getoption("--shard-index")
+    selected, deselected = [], []
     for item in items:
-        if "model_compile" in item.keywords:
-            item.add_marker(skip)
+        shard = int(hashlib.sha256(item.nodeid.encode()).hexdigest(), 16) % shard_count
+        if shard == shard_index:
+            selected.append(item)
+        else:
+            deselected.append(item)
+    items[:] = selected
+    config.hook.pytest_deselected(items=deselected)
 
 
 def _record(payload: dict) -> None:
@@ -352,6 +382,12 @@ def pytest_configure(config):
     # Must run before collection: test modules capture upstream symbols at
     # import time, so the patches have to be in place before any of them
     # execute `from vllm.xxx import yyy`.
+    shard_count = config.getoption("--shard-count")
+    shard_index = config.getoption("--shard-index")
+    if shard_count < 1:
+        raise pytest.UsageError("--shard-count must be positive")
+    if not 0 <= shard_index < shard_count:
+        raise pytest.UsageError("--shard-index must be in [0, --shard-count)")
     global _scrubbed, _config
     _config = config
     _scrubbed = scrub_env()

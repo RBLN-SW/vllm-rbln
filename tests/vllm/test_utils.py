@@ -18,11 +18,15 @@ env scrub silently makes every other test depend on the developer's shell."""
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
+from . import conftest
 from .test_envs import ENV_SOURCE_ALIASES, RBLN_KEYS
 from .utils import (
+    _SPAWN_CHILD_ENV,
     SCRUBBED_EXTRA,
     VLLM_RBLN_ENV,
     devices_needed,
@@ -30,6 +34,73 @@ from .utils import (
     rbln_device_count,
     scrub_env,
 )
+
+
+@pytest.fixture
+def shard_config(monkeypatch):
+    monkeypatch.delenv(_SPAWN_CHILD_ENV, raising=False)
+
+    def make(index, count=2):
+        options = {
+            "--model-compile": False,
+            "--shard-index": index,
+            "--shard-count": count,
+        }
+        return SimpleNamespace(
+            getoption=options.__getitem__,
+            hook=SimpleNamespace(pytest_deselected=Mock()),
+        )
+
+    return make
+
+
+@pytest.mark.parametrize("count", [2, 3])
+def test_shards_cover_cases_once_and_preserve_assignments(shard_config, count):
+    items = [
+        SimpleNamespace(nodeid=f"sample.py::test_sample[{index}]", keywords={})
+        for index in range(24)
+    ]
+    shards = []
+    new_case_shards = 0
+    for index in range(count):
+        config = shard_config(index, count)
+        selected = items.copy()
+        conftest.pytest_collection_modifyitems(config, selected)
+        assert 0 < len(selected) < len(items)
+        deselected = config.hook.pytest_deselected.call_args.kwargs["items"]
+        assert {id(item) for item in selected}.isdisjoint(map(id, deselected))
+        assert {id(item) for item in selected + deselected} == set(map(id, items))
+        shards.append([item.nodeid for item in selected])
+
+        added = SimpleNamespace(nodeid="sample.py::test_new_case", keywords={})
+        expanded = [added, *reversed(items)]
+        conftest.pytest_collection_modifyitems(config, expanded)
+        new_case_shards += added in expanded
+        assert [item.nodeid for item in expanded if item is not added] == list(
+            reversed(shards[-1])
+        )
+    flattened = [nodeid for shard in shards for nodeid in shard]
+    assert len(flattened) == len(set(flattened)) == len(items)
+    assert set(flattened) == {item.nodeid for item in items}
+    assert new_case_shards == 1
+
+
+def test_spawn_child_does_not_repeat_sharding(shard_config, monkeypatch):
+    items = [
+        SimpleNamespace(nodeid=f"sample.py::test_sample[{index}]", keywords={})
+        for index in range(24)
+    ]
+    selected = items.copy()
+    config = shard_config(0)
+    conftest.pytest_collection_modifyitems(config, selected)
+    assert 0 < len(selected) < len(items)
+
+    monkeypatch.setenv(_SPAWN_CHILD_ENV, "1")
+    child = items.copy()
+    child_config = shard_config(0)
+    conftest.pytest_collection_modifyitems(child_config, child)
+    assert child == items
+    child_config.hook.pytest_deselected.assert_not_called()
 
 
 @pytest.mark.parametrize(

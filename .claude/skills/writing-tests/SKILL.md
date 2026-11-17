@@ -65,6 +65,7 @@ Read `tests/vllm/conftest.py` for the full text; the constraints that bite:
 
 - The suite always uses device tensors. Mark tests that open the NPU with `use_device`.
 - `--num-hidden-layers N` builds only the first N decoder layers to cut compile time, and `hf_runner` truncates to the same N so comparisons stay like-for-like. Default is 3; `0` means the whole model.
+- `--shard-count N --shard-index I` partitions selected tests by full nodeid. The index is zero-based. Spawned children run their supplied nodeids without partitioning again.
 - The suite scrubs exported `VLLM_RBLN_*` variables. These options are the way in — do not read the environment directly to get around them.
 
 ## 6. Reuse what is there

@@ -79,8 +79,9 @@ steps:
     key: "vllm-rbln-pytest-cr13"
     steps:
       - <<: *pytest
-        label: "unit-sample"
+        label: "unit-sample %N/%t"
         key: "vllm-rbln-pytest-unit-sample-cr13"
+        parallelism: 2
         command:
           - *sync
           - "bash .buildkite/pipelines/vllm-rbln/scripts/run-unit.sh --group sample"
