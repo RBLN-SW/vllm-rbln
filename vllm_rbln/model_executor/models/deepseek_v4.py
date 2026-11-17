@@ -441,9 +441,21 @@ class RBLNDeepseekV4Rope(nn.Module):
         self.register_buffer("sin_cache", sin, persistent=False)
 
     def forward(
-        self, x: torch.Tensor, positions: torch.Tensor, inverse: bool = False
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        inverse: bool = False,
+        head_major: bool = False,
     ) -> torch.Tensor:
-        """x [B, L, ..., D]; positions [B, L]. Rotates x[..., -rope_dim:]."""
+        """x [B, L, ..., D], or [B, H, L, D] with ``head_major``; positions [B, L].
+        Rotates x[..., -rope_dim:].
+
+        The nope / rope parts are a ``split`` of the channels, which the compiler cuts
+        on the 64-channel group axis of the device layout [B, H, D/64, L, 64]: the
+        rotary primitive then takes the last group as it is. Head-major is the
+        attention kernels' output: rotating it before the transpose to [B, L, H, D]
+        keeps the rotation on that layout too.
+        """
         if x.dim() == 3:
             # The compiler fuses a rotation over a 4- or 5-D tensor only; a head-less
             # [B, L, D]
@@ -453,9 +465,12 @@ class RBLNDeepseekV4Rope(nn.Module):
         flat = positions.flatten()
         cos = self.cos_cache.index_select(0, flat).view(batch, seq_len, -1).to(x.dtype)
         sin = self.sin_cache.index_select(0, flat).view(batch, seq_len, -1).to(x.dtype)
-        for _ in range(x.dim() - 3):
-            cos, sin = cos.unsqueeze(-2), sin.unsqueeze(-2)
-        nope, rope = x[..., : -self.rope_dim], x[..., -self.rope_dim :]
+        if head_major:
+            cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)  # [B, 1, L, rope_dim]
+        else:
+            for _ in range(x.dim() - 3):
+                cos, sin = cos.unsqueeze(-2), sin.unsqueeze(-2)
+        nope, rope = x.split([x.shape[-1] - self.rope_dim, self.rope_dim], dim=-1)
         if inverse:
             rot = rope * cos - rotate_gptj(rope) * sin
         else:
@@ -846,7 +861,15 @@ class RBLNDeepseekV4Attention(nn.Module):
         else:
             o = torch.ops.rbln_custom_ops.sparse_attn_deepseek_v4_swa(*common)
         # o [B, H, L, D]
-        o = self.rope(o.transpose(1, 2), positions, inverse=True)  # [B, L, H, D]
+        if seq_len > 1:
+            # Rotate on the kernel's head-major output: the rope channels are its
+            # last 64-channel group (no L <-> H transpose around the rotation).
+            o = self.rope(o, positions, inverse=True, head_major=True).transpose(1, 2)
+        else:
+            # Decode: L is 1, so [B, L, H, D] is a view of the output, and a
+            # per-batch position on the head-major [B, H, 1, D] has no device rotary.
+            o = self.rope(o.transpose(1, 2), positions, inverse=True)
+        # o [B, L, H, D]
         o = o.reshape(batch, seq_len, self.n_local_groups, -1)
         out, _ = self.wo_b(self._wo_a(o))
         return out
@@ -967,6 +990,7 @@ class RBLNDeepseekV4MoE(nn.Module):
             if not self.is_hash:
                 return logits
             eids = eids_local if extra is None else extra
+            assert eids is not None  # a hash layer always has its expert ids
             # bf16 ids as they are: the router masks with a compare, no int cast
             return logits, eids[:, : self.top_k]
 

@@ -204,3 +204,31 @@ def test_mhc_sublayer_token_cut(tokens, cut):
     torch.testing.assert_close(
         got, expected.transpose(1, 2).to(streams.dtype), atol=2e-2, rtol=2e-2
     )
+
+
+@pytest.mark.parametrize("inverse", [False, True])
+def test_head_major_rope_matches_token_major(inverse):
+    """The attention output is turned back in the kernels' head-major [B, H, L, D]
+    layout (prefill); it must be the same rotation as over [B, L, H, D]."""
+    from vllm_rbln.model_executor.models.deepseek_v4 import RBLNDeepseekV4Rope
+
+    config = SimpleNamespace(
+        qk_rope_head_dim=64,
+        rope_theta=10000.0,
+        compress_rope_theta=160000.0,
+        rope_scaling={
+            "factor": 16,
+            "original_max_position_embeddings": 65536,
+            "beta_fast": 32,
+            "beta_slow": 1,
+        },
+    )
+    rope = RBLNDeepseekV4Rope(config, compress_ratio=4, max_pos=4096)
+    torch.manual_seed(0)
+    x = torch.randn(2, 5, 3, 512)  # [B, L, H, D]
+    positions = torch.tensor([[0, 1, 2, 3, 4], [100, 101, 102, 103, 104]])
+    token_major = rope(x, positions, inverse=inverse)
+    head_major = rope(x.transpose(1, 2), positions, inverse=inverse, head_major=True)
+    torch.testing.assert_close(head_major.transpose(1, 2), token_major)
+    # The rope channels are the last 64; the nope part passes through untouched.
+    torch.testing.assert_close(token_major[..., :448], x[..., :448])
