@@ -150,11 +150,21 @@ class RBLNQwen3_5ForConditionalGeneration(
             info = MULTIMODAL_REGISTRY.get_processing_info(vllm_config.model_config)
             merge = self.visual.spatial_merge_size
             max_tokens = info.get_max_image_tokens()
+            rbln_config = vllm_config.additional_config
             # One compiled encoder shape per budget; an image is padded to the
             # smallest that holds its patches.
-            budgets = sorted(vllm_config.additional_config.encoder_token_budgets) or [
-                max_tokens
-            ]
+            budgets = sorted(rbln_config.encoder_token_budgets)
+            if not budgets:
+                # Unset: powers of two from 128 output tokens up to the longest
+                # prefill chunk (512 at least), as upstream's encoder CUDA graphs
+                # go up to max_num_batched_tokens, then the processor's bound.
+                top = max(512, rbln_config.max_prefill_chunk_size)
+                budgets = [128]
+                while budgets[-1] * 2 < top:
+                    budgets.append(budgets[-1] * 2)
+                budgets.append(top)
+                # No budget above the largest image, which is the last one.
+                budgets = [b for b in budgets if b < max_tokens] + [max_tokens]
             if budgets[-1] < max_tokens:
                 raise ValueError(
                     f"encoder_token_budgets {budgets} must reach {max_tokens} output "

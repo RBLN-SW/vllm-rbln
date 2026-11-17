@@ -85,16 +85,18 @@ def test_a_video_limit_above_zero_is_refused(limits):
         RBLNQwen3_5ForConditionalGeneration(vllm_config=vllm_config)
 
 
-def _build_with_token_budgets(monkeypatch, budgets):
+def _build_with_token_budgets(
+    monkeypatch, budgets, *, max_tokens=256, prefill_chunk_size=512
+):
     """The model with upstream's construction stubbed out: a largest image of
-    256 output tokens (1024 patches) and the given budgets."""
+    `max_tokens` output tokens (1024 patches unless given) and the given budgets."""
 
     def init(self, *, vllm_config, prefix="model"):
         torch.nn.Module.__init__(self)
         self.visual = SimpleNamespace(spatial_merge_size=MERGE)
 
     monkeypatch.setattr(qwen3_5.Qwen3_5ForConditionalGeneration, "__init__", init)
-    info = SimpleNamespace(get_max_image_tokens=lambda: 256)
+    info = SimpleNamespace(get_max_image_tokens=lambda: max_tokens)
     monkeypatch.setattr(
         qwen3_5.MULTIMODAL_REGISTRY, "get_processing_info", lambda model_config: info
     )
@@ -102,7 +104,9 @@ def _build_with_token_budgets(monkeypatch, budgets):
     mm_config = SimpleNamespace(get_limit_per_prompt=limits.get)
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(get_multimodal_config=lambda: mm_config),
-        additional_config=RBLNConfig(encoder_token_budgets=budgets),
+        additional_config=RBLNConfig(
+            encoder_token_budgets=budgets, prefill_chunk_size=prefill_chunk_size
+        ),
     )
     return RBLNQwen3_5ForConditionalGeneration(vllm_config=vllm_config)
 
@@ -110,14 +114,35 @@ def _build_with_token_budgets(monkeypatch, budgets):
 @pytest.mark.parametrize(
     ("budgets", "buckets"),
     [
-        # Unset: one bucket, the processor's largest image.
-        ([], [1024]),
         ([256, 64], [256, 1024]),
         ([64, 300], [256, 1200]),
     ],
 )
 def test_token_budgets_resolve_to_patch_buckets(monkeypatch, budgets, buckets):
     model = _build_with_token_budgets(monkeypatch, budgets)
+
+    assert model.mm_encoder_patch_buckets == buckets
+
+
+@pytest.mark.parametrize(
+    ("prefill_chunk_size", "max_tokens", "buckets"),
+    [
+        # 128, 256 and 512 output tokens, then the processor's largest image.
+        (128, 16384, [512, 1024, 2048, 65536]),
+        # A longer prefill chunk extends the budgets to its own length.
+        (1024, 16384, [512, 1024, 2048, 4096, 65536]),
+        ([512, 1536], 16384, [512, 1024, 2048, 4096, 6144, 65536]),
+        # Only the budgets below the largest image are kept.
+        (512, 256, [512, 1024]),
+        (512, 64, [256]),
+    ],
+)
+def test_unset_token_budgets_reach_the_prefill_chunk_and_the_largest_image(
+    monkeypatch, prefill_chunk_size, max_tokens, buckets
+):
+    model = _build_with_token_budgets(
+        monkeypatch, [], max_tokens=max_tokens, prefill_chunk_size=prefill_chunk_size
+    )
 
     assert model.mm_encoder_patch_buckets == buckets
 
