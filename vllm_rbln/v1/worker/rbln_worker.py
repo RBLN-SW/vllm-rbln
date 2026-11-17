@@ -258,6 +258,7 @@ class RBLNWorker(WorkerBase):
                 "fp8",
                 "compressed-tensors",
                 "modelopt_mixed",
+                "deepseek_v4_fp8",
             )
 
             if quantization == "compressed-tensors":
@@ -301,6 +302,9 @@ class RBLNWorker(WorkerBase):
             elif quantization == "modelopt_mixed":
                 # The fp8 weights and both NVFP4 scales are float dtypes and are
                 # counted by element_size() below
+                nbits_per_param = 4
+                packed_num_elems = 8 // 4
+            elif quantization == "deepseek_v4_fp8":
                 nbits_per_param = 4
                 packed_num_elems = 8 // 4
             elif quantization == "int4":

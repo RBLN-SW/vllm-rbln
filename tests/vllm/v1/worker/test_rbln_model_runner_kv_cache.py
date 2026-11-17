@@ -97,6 +97,46 @@ class TestKVCacheBaseBindings:
         assert runner.kv_cache_view_infos == []
 
 
+@pytest.mark.parametrize("window", [8, 128])
+def test_fixed_state_survives_attention_pool_resize(make_model_runner, window):
+    from vllm.v1.kv_cache_interface import KVCacheGroupSpec
+
+    from vllm_rbln.model_executor.models.deepseek_v4 import RBLNDeepseekV4RingCache
+    from vllm_rbln.v1.kv_cache import RBLNFixedKVCacheTensor
+    from vllm_rbln.v1.worker.dynamic_kv_sizer import kv_cache_config_at
+
+    runner = make_model_runner(init_kv_cache=False)
+    ring = RBLNDeepseekV4RingCache("layer.1", window, 768, torch.uint8)
+    spec = ring.get_kv_cache_spec(runner.vllm_config)
+    config = make_kv_cache_config(runner)
+    extent = spec.num_state_slots * spec.page_size_bytes
+    total = config.kv_cache_tensors[0].size + extent
+    config.kv_cache_tensors.append(
+        RBLNFixedKVCacheTensor(
+            size=total,
+            layers=["layer.1"],
+            layer_stride=extent,
+            block_stride=spec.page_size_bytes,
+            offset=config.kv_cache_tensors[0].size,
+        )
+    )
+    config.kv_cache_tensors[0].size = total
+    config.kv_cache_groups.append(KVCacheGroupSpec(["layer.1"], spec))
+    runner.initialize_kv_cache(config)
+    before = runner.fixed_kv_cache_tensors["layer.1"]
+    assert ring.kv_cache.shape == (spec.num_state_slots, window, 768)
+    assert runner.input_batch.block_table[1].get_cpu_tensor().shape[1] == 1
+    assert set(runner.kv_cache_allocations.values()) == {"layer.0"}
+    assert not getattr(ring.kv_cache, "_dynamo_dynamic_indices", set())
+
+    resized = kv_cache_config_at(config, 2 * config.num_blocks)
+    runner.initialize_kv_cache_tensors(resized, runner._kernel_block_sizes)
+    assert runner.fixed_kv_cache_tensors["layer.1"] is before
+    assert ring.kv_cache.shape == (spec.num_state_slots, window, 768)
+    assert set(runner.kv_cache_allocations.values()) == {"layer.0"}
+    assert runner.kv_caches[0].shape[0] == resized.num_blocks
+
+
 class TestLayerIndexFollowsCacheOrder:
     """`initialize_kv_cache_tensors` gives every layer the position of its cache
     in `kv_cache_names`. The construction-time index assumes `num_attn_module`

@@ -97,6 +97,7 @@ from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import record_function_or_nullcontext
+from vllm.v1.worker.block_table import SlotMappingMode
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.kv_connector_model_runner_mixin import (
@@ -364,6 +365,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         # ordering the KV connector relies on for region<->layer agreement.
         self.kv_cache_names: list[str] = []
         self.kv_cache_allocations: dict[tuple, str] = {}
+        self.fixed_kv_cache_tensors: dict[str, torch.Tensor] = {}
         # Initialize in initialize_kv_cache_tensors
         self.cross_layers_kv_cache: torch.Tensor | None = None
         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
@@ -3290,11 +3292,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             assert not isinstance(
                 kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec
             )
-            # A MambaSpec group without prefix caching (one state block a request)
-            # has block_size = max_model_len, so its table is one block wide.
-            block_size = kv_cache_group.kv_cache_spec.block_size
+            spec = kv_cache_group.kv_cache_spec
+            block_size = spec.block_size
             block_sizes.append(block_size)
-            max_num_blocks_per_req = cdiv(max_model_len, block_size)
+            max_num_blocks_per_req = spec.max_num_blocks_per_req(
+                self.vllm_config, max_model_len
+            )
             max_num_blocks.append(max_num_blocks_per_req)
 
         if (
@@ -3312,6 +3315,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 block_sizes=block_sizes,
                 kernel_block_sizes=kernel_block_sizes,
                 max_num_blocks_per_req=max_num_blocks,
+                slot_mapping_modes=[
+                    SlotMappingMode.TOKEN_TO_KV_SLOT
+                    if group.kv_cache_spec.uses_slot_mapping
+                    else SlotMappingMode.NONE
+                    for group in kv_cache_config.kv_cache_groups
+                ],
                 num_spec_tokens=self.num_spec_tokens,
                 logitsprocs=self.input_batch.logitsprocs,
                 logitsprocs_need_output_token_ids=self.input_batch.logitsprocs_need_output_token_ids,
@@ -3345,13 +3354,31 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         # graph input is a whole tensor, and dynamo refuses a slice's offset.
         device = self.device if use_device_tensor() else "meta"
         extent_of = kv_cache_extents(kv_cache_config)
+        from vllm_rbln.v1.kv_cache import RBLNFixedKVCacheTensor
+
+        fixed = {
+            name
+            for tensor in kv_cache_config.kv_cache_tensors
+            if isinstance(tensor, RBLNFixedKVCacheTensor)
+            for name in tensor.layers
+        }
         buffers = {
             extent: torch.empty(extent[1], dtype=torch.int8, device=device)
-            for extent in set(extent_of.values())
+            for extent in {v for name, v in extent_of.items() if name not in fixed}
         }
         kv_cache_raw_tensors = {
-            layer_name: buffers[extent] for layer_name, extent in extent_of.items()
+            layer_name: buffers[extent]
+            for layer_name, extent in extent_of.items()
+            if layer_name not in fixed
         }
+        # Retain fixed buffers while dynamic KV releases the attention pool;
+        # the driver's baseline snapshot must include their physical storage.
+        for name in fixed:
+            if name not in self.fixed_kv_cache_tensors:
+                self.fixed_kv_cache_tensors[name] = torch.empty(
+                    extent_of[name][1], dtype=torch.int8, device=device
+                )
+            kv_cache_raw_tensors[name] = self.fixed_kv_cache_tensors[name]
 
         layer_names = set()
         for group in kv_cache_config.kv_cache_groups:
@@ -3473,7 +3500,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     )
                     view_block_axis = inv_order.index(base_block_axis)
                     kv_cache_block_axes[layer_name] = view_block_axis
-                    if dynamic_kv_enabled(self.vllm_config):
+                    if dynamic_kv_enabled(self.vllm_config) and (
+                        layer_name not in self.fixed_kv_cache_tensors
+                    ):
                         base_dynamic_axis = base_block_axis
                         view_dynamic_axis = view_block_axis
                     else:
@@ -3617,8 +3646,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 for info in self.kv_cache_view_infos
                 if info.dynamic_axis is not None
             }
-            for index, base in enumerate(self.kv_cache_bases):
-                torch._dynamo.mark_dynamic(base, base_axes[index])
+            for index, axis in base_axes.items():
+                torch._dynamo.mark_dynamic(self.kv_cache_bases[index], axis)
             logger.info(
                 "[Dynamic KV] mark_dynamic(kv_cache_base, dim=%s) applied to %d "
                 "deduped base(s); shape=%s",
@@ -3632,6 +3661,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         # on allocation so addresses are never matched across cache generations.
         self.kv_cache_allocations = {}
         for name, cache in zip(self.kv_cache_names, self.kv_caches):
+            if name in self.fixed_kv_cache_tensors:
+                continue
             key = kv_cache_tensor_key(cache)
             self.kv_cache_allocations.setdefault(key, name)
         self.kv_cache_block_axes = block_axes
