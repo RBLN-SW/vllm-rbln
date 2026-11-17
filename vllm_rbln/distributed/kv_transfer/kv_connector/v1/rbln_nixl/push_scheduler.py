@@ -73,14 +73,16 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
 
         if self._shape.push_boundary_state and self._has_mamba:
             cache_config = vllm_config.cache_config
-            assert (
+            if not (
                 cache_config.enable_prefix_caching
                 and cache_config.mamba_cache_mode == "align"
-            ), (
-                "push_boundary_state needs prefix caching in mamba_cache_mode "
-                f"'align' on both ends; got mamba_cache_mode="
-                f"{cache_config.mamba_cache_mode!r}"
-            )
+            ):
+                raise RuntimeError(
+                    "RBLN NIXL: push_boundary_state needs prefix caching in "
+                    "mamba_cache_mode 'align' on both ends; got "
+                    f"enable_prefix_caching={cache_config.enable_prefix_caching}, "
+                    f"mamba_cache_mode={cache_config.mamba_cache_mode!r}"
+                )
 
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
@@ -95,14 +97,7 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
         count, load_async = super().get_num_new_matched_tokens(
             request, num_computed_tokens
         )
-        params = request.kv_transfer_params
-        if (
-            not load_async
-            or not params
-            or not params.get("do_remote_prefill")
-            or not self.sends_state_boundary
-            or not self._has_mamba
-        ):
+        if not load_async or not self.sends_state_boundary or not self._has_mamba:
             return count, load_async
         (block_size,) = {
             group.kv_cache_spec.block_size
@@ -110,10 +105,12 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
             if self._ssm_spec_blocks[i] is not None
         }
         num_tokens = num_computed_tokens + count
-        if prompt_boundary_block(num_tokens, block_size) is None:
-            params.pop(REMOTE_STATE_BOUNDARY, None)
-        else:
-            params[REMOTE_STATE_BOUNDARY] = num_tokens // block_size * block_size
+        if prompt_boundary_block(num_tokens, block_size) is not None:
+            # Upstream loads asynchronously only for a `do_remote_prefill` one.
+            assert request.kv_transfer_params is not None
+            request.kv_transfer_params[REMOTE_STATE_BOUNDARY] = (
+                num_tokens // block_size * block_size
+            )
         return count, load_async
 
     def update_state_after_alloc(
@@ -275,9 +272,10 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
             # here because it is the one that matches the handed-over blocks.
             if self._sends_token_count:
                 self._valid_tokens[request.request_id] = request.num_computed_tokens
-            if out_params is not None and self._has_mamba:
+            if self._has_mamba:
                 # Upstream files one clipped list in three places; a consumer
                 # registering a boundary state pairs only with the true one.
+                assert out_params is not None
                 block_ids, _ = self._drop_superseded_states(
                     request.num_computed_tokens, out_params["remote_block_ids"]
                 )

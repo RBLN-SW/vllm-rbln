@@ -1802,6 +1802,7 @@ class TestPublishHandshakeMetadata:
         base_meta=None,
         swa_kernel_blocks=frozenset(),
         slice_ids=None,
+        push_boundary_state=False,
     ):
         w = object.__new__(cls or RblnNixlPullConnectorWorker)
         w._kv_per_block = 1
@@ -1815,7 +1816,7 @@ class TestPublishHandshakeMetadata:
         w.transfer_topo = MagicMock()
         w.transfer_topo.cross_layers_blocks = cross_layers
         w._has_mamba = has_mamba
-        window_mode(w, None, has_swa=False)
+        window_mode(w, None, has_swa=False, push_boundary_state=push_boundary_state)
         w._swa_kernel_blocks = set(swa_kernel_blocks)
         w.use_mla = False
         # Chiplet geometry travels with the metadata so a consumer with a
@@ -1862,7 +1863,26 @@ class TestPublishHandshakeMetadata:
             cls=RblnNixlPushConnectorWorker,
         )
         assert w.compat_hash == rbln_compat_hash(
-            "BASE", writes_into_peer=True, cross_layers_blocks=False
+            "BASE",
+            writes_into_peer=True,
+            cross_layers_blocks=False,
+            push_boundary_state=False,
+        )
+
+    def test_a_writer_publishes_its_boundary_opt_in(self):
+        # The hash is what refuses a peer with the other setting at handshake.
+        w = self._publish(
+            pp_rank=0,
+            pp_size=1,
+            layer_names=["l0"],
+            cls=RblnNixlPushConnectorWorker,
+            push_boundary_state=True,
+        )
+        assert w.compat_hash == rbln_compat_hash(
+            "BASE",
+            writes_into_peer=True,
+            cross_layers_blocks=False,
+            push_boundary_state=True,
         )
 
     def test_the_region_ledger_survives_the_re_wrap(self):
@@ -1979,7 +1999,10 @@ class TestPublishHandshakeMetadata:
         # compat hash folded with our version and direction, mirrored into the
         # payload. A read-path worker must publish the read-path hash.
         assert w.compat_hash == rbln_compat_hash(
-            "BASE", writes_into_peer=False, cross_layers_blocks=False
+            "BASE",
+            writes_into_peer=False,
+            cross_layers_blocks=False,
+            push_boundary_state=False,
         )
         assert w.xfer_handshake_metadata.compatibility_hash == w.compat_hash
         decoded = msgspec.msgpack.Decoder(RblnNixlAgentMetadata).decode(

@@ -425,17 +425,19 @@ class TestStateBoundaryExchange:
         assert clipped == ([1, 2, 3], [8])
 
     @pytest.mark.parametrize(
-        ("num_prompt_tokens", "opt_in", "boundary"),
+        ("num_prompt_tokens", "num_local", "opt_in", "boundary"),
         [
             # One token backs off, leaving 39 to transfer: block 1 holds 32.
-            (40, True, 32),
+            (40, 0, True, 32),
+            # A local prefix hit: the boundary still counts from the prompt.
+            (40, 16, True, 32),
             # 32 transfer, block-aligned: the running state is the boundary one.
-            (33, True, None),
-            (40, False, None),
+            (33, 0, True, None),
+            (40, 0, False, None),
         ],
     )
     def test_a_writers_consumer_names_the_boundary_it_receives(
-        self, num_prompt_tokens, opt_in, boundary
+        self, num_prompt_tokens, num_local, opt_in, boundary
     ):
         sched = self._scheduler(RblnNixlPushConnectorScheduler, opt_in)
         req = _Request(
@@ -445,11 +447,82 @@ class TestStateBoundaryExchange:
             kv_transfer_params={"do_remote_prefill": True},
         )
 
-        assert sched.get_num_new_matched_tokens(req, 0) == (
-            num_prompt_tokens - 1,
+        assert sched.get_num_new_matched_tokens(req, num_local) == (
+            num_prompt_tokens - 1 - num_local,
             True,
         )
+        assert req.kv_transfer_params is not None
         assert req.kv_transfer_params.get(REMOTE_STATE_BOUNDARY) == boundary
+
+    def test_a_writers_consumer_names_the_ssm_groups_boundary(self):
+        # 55 tokens transfer: 48 on the attention group's grid, 32 on the SSM's.
+        sched = self._scheduler(RblnNixlPushConnectorScheduler, True)
+        sched.kv_cache_config.transfer_groups = (
+            SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16)),
+            SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=32)),
+        )
+        req = _Request(
+            "d",
+            num_prompt_tokens=56,
+            prompt_token_ids=list(range(56)),
+            kv_transfer_params={"do_remote_prefill": True},
+        )
+
+        sched.get_num_new_matched_tokens(req, 0)
+
+        assert req.kv_transfer_params is not None
+        assert req.kv_transfer_params[REMOTE_STATE_BOUNDARY] == 32
+
+    def test_a_writers_consumer_without_ssm_groups_names_no_boundary(self):
+        sched = self._scheduler(RblnNixlPushConnectorScheduler, True)
+        sched._has_mamba = False
+        sched._ssm_spec_blocks = [None, None]
+        req = _Request(
+            "d",
+            num_prompt_tokens=40,
+            prompt_token_ids=list(range(40)),
+            kv_transfer_params={"do_remote_prefill": True},
+        )
+
+        # Without an SSM group upstream backs off no token.
+        assert sched.get_num_new_matched_tokens(req, 0) == (40, True)
+        assert req.kv_transfer_params is not None
+        assert REMOTE_STATE_BOUNDARY not in req.kv_transfer_params
+
+    @pytest.mark.parametrize("opt_in", [True, False])
+    def test_a_writer_hands_over_what_its_producer_kept(self, opt_in):
+        # The producer's keep and the writer's clip, against the consumer's
+        # count: one block for the running state, one more for a named boundary.
+        from tests.vllm.v1 import test_kv_cache
+
+        writer = self._scheduler(RblnNixlPushConnectorScheduler, opt_in)
+        mamba = test_kv_cache.TestRBLNMambaManager()
+        coord = mamba._coordinator()
+        if writer.sends_state_boundary:  # `RBLNScheduler`'s gate
+            coord.single_type_managers[1].track_transfer(
+                mamba._request("p", {"do_remote_decode": True}), 0, 0
+            )
+        for computed, end in ((0, 16), (16, 32), (32, 36), (36, 40)):
+            coord.remove_skipped_blocks("p", computed, 40)
+            coord.allocate_new_blocks("p", end, end)
+        consumer = _Request(
+            "d",
+            num_prompt_tokens=40,
+            prompt_token_ids=list(range(40)),
+            kv_transfer_params={"do_remote_prefill": True},
+        )
+        writer.get_num_new_matched_tokens(consumer, 0)
+        assert consumer.kv_transfer_params is not None
+
+        _, sent = writer.get_exchange_clipped_blocks(
+            tuple(
+                [block.block_id for block in manager.req_to_blocks["p"]]
+                for manager in coord.single_type_managers
+            )
+        )
+
+        assert len(sent) == 1 + (REMOTE_STATE_BOUNDARY in consumer.kv_transfer_params)
+        assert 0 not in sent
 
     @pytest.mark.parametrize(
         ("num_tokens", "ssm_blocks", "sent"),
@@ -476,7 +549,12 @@ class TestStateBoundaryExchange:
 
     @pytest.mark.parametrize(
         ("caching", "mode", "ok"),
-        [(True, "align", True), (False, "none", False), (True, "all", False)],
+        [
+            (True, "align", True),
+            (False, "none", False),
+            (False, "align", False),
+            (True, "all", False),
+        ],
     )
     def test_the_opt_in_needs_align_mode_prefix_caching(
         self, monkeypatch, caching, mode, ok
@@ -492,8 +570,19 @@ class TestStateBoundaryExchange:
         if ok:
             RblnNixlPushConnectorScheduler(config, "eng", _kv_config([MagicMock()]))
         else:
-            with pytest.raises(AssertionError, match="push_boundary_state"):
+            with pytest.raises(RuntimeError, match="enable_prefix_caching"):
                 RblnNixlPushConnectorScheduler(config, "eng", _kv_config([MagicMock()]))
+
+    def test_the_opt_in_does_not_bind_an_engine_without_ssm_groups(self, monkeypatch):
+        def stub_init(self, cfg, _engine_id, kv_cache_config):
+            self._has_mamba = False
+
+        monkeypatch.setattr(NixlPushConnectorScheduler, "__init__", stub_init)
+        config = mock_vllm_config(push_boundary_state=True)
+        config.cache_config.enable_prefix_caching = False
+        config.cache_config.mamba_cache_mode = "none"
+
+        RblnNixlPushConnectorScheduler(config, "eng", _kv_config([MagicMock()]))
 
     def test_a_consumer_pulls_into_its_boundary_block(self):
         # The consumer reaches the clip through upstream's entry point.
@@ -1301,7 +1390,10 @@ class TestTailTokenCountOnTheWritePath:
             # `request_finished` drops from: the point of the stub is that only
             # our own lines run, not that upstream's fields are missing.
             lambda self, *a, **k: self.__dict__.update(
-                _is_hma_required=False, use_host_buffer=False, _reqs_need_save={}
+                _is_hma_required=False,
+                _has_mamba=False,
+                use_host_buffer=False,
+                _reqs_need_save={},
             ),
         )
         monkeypatch.setattr(

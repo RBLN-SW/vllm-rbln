@@ -411,7 +411,7 @@ def rbln_compat_hash(
     *,
     writes_into_peer: bool,
     cross_layers_blocks: bool,
-    push_boundary_state: bool = False,
+    push_boundary_state: bool,
     speculative_config: "SpeculativeConfig | None" = None,
 ) -> str:
     """Fold the RBLN schema version and the factors upstream's hash drops into
@@ -422,8 +422,10 @@ def rbln_compat_hash(
     a producer that writes into a consumer expecting to read passes every
     length check; the draft model, because its attention layers are members of
     the KV cache this connector registers while upstream's factors describe the
-    target alone; and ``cross_layers_blocks``, which scales the page by the
-    KV-cache tensor count and which 0.30 dropped from upstream's own factors.
+    target alone; ``cross_layers_blocks``, which scales the page by the
+    KV-cache tensor count and which 0.30 dropped from upstream's own factors;
+    and ``push_boundary_state``, because a writer's consumer allocates for the
+    boundary state before the producer says whether it sends one.
 
     Model-level values only -- the hash is compared across every shard, so a
     per-rank quantity would differ between PP stages.
