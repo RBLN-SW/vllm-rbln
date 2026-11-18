@@ -240,6 +240,7 @@ class OptimumRBLNCompileConfig:
     # Keep third-party config dataclasses opaque to pydantic validation.
     hf_config: Any
     npu_name: str
+    local_weights_fingerprint: str | None = None
 
 
 @vllm_config_dataclass

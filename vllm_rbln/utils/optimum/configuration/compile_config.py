@@ -20,6 +20,8 @@ import hashlib
 import json
 from copy import deepcopy
 from dataclasses import fields
+from pathlib import Path
+from stat import S_ISREG
 from typing import TYPE_CHECKING, Any
 
 from vllm_rbln import envs
@@ -79,6 +81,8 @@ def compile_cache_name(compile_config: OptimumRBLNCompileConfig) -> str:
     }
     config_dict["rbln_config"] = _strip_load_only_keys(config_dict["rbln_config"])
     config_dict["hf_config"] = compile_config.hf_config.to_dict()
+    if compile_config.local_weights_fingerprint is None:
+        del config_dict["local_weights_fingerprint"]
     model_name = str(config_dict["model"])
 
     config_json = json.dumps(config_dict, sort_keys=True, default=str)
@@ -86,6 +90,33 @@ def compile_cache_name(compile_config: OptimumRBLNCompileConfig) -> str:
 
     sanitized_name = model_name.replace("/", "_").replace(":", "_")
     return f"{sanitized_name}_{config_hash}"
+
+
+def _local_weights_fingerprint(model_path: Path) -> str | None:
+    if not model_path.is_dir():
+        return None
+
+    weight_paths = set()
+    indexes = {}
+    # Some Optimum loaders glob safetensors directly instead of using an index.
+    for path in model_path.iterdir():
+        if path.name.endswith((".safetensors.index.json", ".bin.index.json")):
+            index_bytes = path.read_bytes()
+            indexes[path.name] = hashlib.sha256(index_bytes).hexdigest()
+            weight_paths.update(json.loads(index_bytes)["weight_map"].values())
+        elif path.suffix == ".safetensors" or (
+            path.suffix == ".bin"
+            and path.name.startswith(("pytorch_model", "adapter_model"))
+        ):
+            weight_paths.add(path.name)
+
+    weights = []
+    for name in sorted(weight_paths):
+        info = (model_path / name).stat()
+        if S_ISREG(info.st_mode):
+            weights.append((name, info.st_size, info.st_mtime_ns, info.st_ctime_ns))
+    fingerprint = json.dumps((weights, indexes), sort_keys=True).encode()
+    return hashlib.sha256(fingerprint).hexdigest()
 
 
 def merge_overrides(base: dict, overrides: dict) -> None:
@@ -261,13 +292,15 @@ def prepare_compile_config(vllm_config: VllmConfig) -> OptimumRBLNCompileConfig:
             )
         merge_overrides(rbln_config, optimum_overrides)
 
+    model = str(model_config.model)
     return OptimumRBLNCompileConfig(
-        model=str(model_config.model),
+        model=model,
         dtype=model_config.dtype,
         model_cls=model_cls.__name__,
         rbln_config=rbln_config,
         hf_config=deepcopy(hf_config),
         npu_name=RblnPlatform.get_device_name().strip().upper(),
+        local_weights_fingerprint=_local_weights_fingerprint(Path(model)),
     )
 
 
