@@ -46,6 +46,7 @@ from vllm_rbln.config import RBLNConfig
 from vllm_rbln.distributed.ec_transfer.ec_connector.rbln_ec_cpu_connector import (
     RblnECCPUConnector,
 )
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import iter_kv_connectors
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.core.rbln_kv_cache_manager import (
     KVCacheCopyOp,
@@ -197,15 +198,23 @@ class RBLNScheduler(Scheduler):
         self._is_mm_prefix_lm = self.vllm_config.model_config.is_mm_prefix_lm
 
         # NOTE(RBLN): a prompt's block-boundary state is kept by a producer and
-        # allocated by a consumer only where the connector exchanges it.
-        connector_scheduler = getattr(self.connector, "connector_scheduler", None)
+        # allocated by a consumer only where the connector exchanges it. The
+        # connector may sit in a MultiConnector.
+        sends_state_boundary = self.connector is not None and any(
+            getattr(
+                getattr(leaf, "connector_scheduler", None),
+                "sends_state_boundary",
+                False,
+            )
+            for leaf in iter_kv_connectors(self.connector)
+        )
         self._state_transfer_managers = (
             [
                 manager
                 for manager in self.kv_cache_manager.coordinator.single_type_managers
                 if isinstance(manager, RBLNMambaManager)
             ]
-            if getattr(connector_scheduler, "sends_state_boundary", False)
+            if sends_state_boundary
             else []
         )
 
