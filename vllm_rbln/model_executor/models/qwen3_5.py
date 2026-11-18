@@ -44,9 +44,12 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.parse import MultiModalDataItems
 from vllm.sequence import IntermediateTensors
 
+from vllm_rbln.logger import init_logger
 from vllm_rbln.model_executor.models.interfaces import SupportsRBLNMultiModal
 from vllm_rbln.platform import RBLN_DEFAULT_MAX_NUM_BATCHED_TOKENS
 from vllm_rbln.v1.attention.backends.gdn_attn import grouped_qkv_rows
+
+logger = init_logger(__name__)
 
 
 class _RBLNQwen3VisionEncoder(nn.Module):
@@ -197,6 +200,11 @@ class RBLNQwen3_5ForConditionalGeneration(
                     "--mm-processor-kwargs."
                 )
             self.mm_encoder_patch_buckets = [b * merge**2 for b in budgets]
+            logger.info(
+                "Qwen3.5 vision encoder buckets: output tokens=%s, patches=%s",
+                budgets,
+                self.mm_encoder_patch_buckets,
+            )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loaded = super().load_weights(weights)
