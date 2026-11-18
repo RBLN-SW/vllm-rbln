@@ -757,7 +757,7 @@ class TestBuildOutputAssembly:
 
 
 class TestStage:
-    @pytest.mark.maybe_use_device
+    @pytest.mark.use_device
     @pytest.mark.parametrize("kind", ["full", "shift", "glm"])
     @pytest.mark.parametrize("is_prefill", [False, True])
     @pytest.mark.parametrize("use_custom_kernel", [False, True])
