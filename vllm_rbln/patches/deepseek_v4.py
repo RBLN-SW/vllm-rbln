@@ -321,7 +321,7 @@ def _build_deepseek_v4_memory_usage():
 
 
 @register_patch(
-    target="vllm.v1.core.kv_cache_utils.get_kv_cache_configs",
+    target="vllm.v1.engine.core.get_kv_cache_configs",
     reason=(
         "Upstream reconciles PP ranks by replanning with N * page_bytes. RBLN V4 "
         "requires fixed_ring_bytes + N * page_bytes; auto-fit, overrides and PP "
@@ -331,11 +331,12 @@ def _build_deepseek_v4_memory_usage():
 )
 def _build_deepseek_v4_kv_cache_configs():
     from vllm.v1.core import kv_cache_utils
+    from vllm.v1.engine import core as engine_core
     from vllm.v1.kv_cache_interface import KVCacheSpec, KVCacheSpecRegistry
 
     from vllm_rbln.v1.worker.utils import rescale_kv_cache_config
 
-    original = kv_cache_utils.get_kv_cache_configs
+    original = engine_core.get_kv_cache_configs
 
     @functools.wraps(original)
     def get_kv_cache_configs(vllm_config, kv_cache_specs, available_memory):

@@ -620,7 +620,11 @@ def estimate_model_kernel_size(
     def align_2MB(x: int | float) -> int:
         return align(x, 2**21)
 
-    num_layers = model_config.get_num_layers(parallel_config)
+    num_layers = (
+        model_config.get_total_num_hidden_layers()
+        if parallel_config.pipeline_parallel_size == 1
+        else model_config.get_num_layers(parallel_config)
+    )
     vocab_size = model_config.get_vocab_size()
     hidden_size = model_config.get_hidden_size()
     tp_size = parallel_config.tensor_parallel_size

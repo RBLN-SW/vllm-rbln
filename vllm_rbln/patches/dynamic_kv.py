@@ -28,6 +28,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from vllm_rbln.logger import init_logger
 from vllm_rbln.patches.registry import register_patch
+from vllm_rbln.v1.attention.backends.deepseek_v4 import RBLNDeepseekV4StateSpec
 from vllm_rbln.v1.worker.utils import (
     dynamic_kv_unsupported_reason,
     rescale_kv_cache_config,
@@ -42,8 +43,8 @@ engine_core_original_initialize_kv_caches = EngineCore._initialize_kv_caches
 def resolve_rank_num_blocks(num_blocks_per_rank: list[Any]) -> int | None:
     """Reduce the per-rank answers to the single block count to apply.
 
-    All ranks run the same gates, so a mixed result means one rank's query
-    failed. The reduction is a min, as upstream's own is.
+    All ranks run the same gates, so a mixed inactive result means one rank's
+    query failed. Fixed-only ranks return infinity and do not limit the pool.
     """
     if all(n is None for n in num_blocks_per_rank):
         return None
@@ -52,7 +53,8 @@ def resolve_rank_num_blocks(num_blocks_per_rank: list[Any]) -> int | None:
             "dynamic KV cache: some ranks computed a block count and some did not "
             f"({num_blocks_per_rank}); one rank's profile query failed."
         )
-    return min(num_blocks_per_rank)
+    num_blocks = min(num_blocks_per_rank)
+    return None if num_blocks == float("inf") else num_blocks
 
 
 @register_patch(
@@ -145,6 +147,7 @@ def check_enough_kv_cache_blocks_after_resize(
             group.kv_cache_spec.page_size_bytes,
         )
         for group in kv_cache_config.kv_cache_groups
+        if not isinstance(group.kv_cache_spec, RBLNDeepseekV4StateSpec)
     )
     # +1: the block pool keeps block 0 as the null block.
     if kv_cache_config.num_blocks > one_request:

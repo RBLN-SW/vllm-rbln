@@ -42,6 +42,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm_rbln.compilation.backends import program_input_bindings, set_compile_stage
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.core.utils import sub_block_size_in_use
+from vllm_rbln.v1.kv_cache import RBLNFixedKVCacheTensor
 from vllm_rbln.v1.worker.kv_placement import (
     ChipletMemory,
     KvGrowth,
@@ -128,6 +129,12 @@ def kv_cache_config_at(cfg: KVCacheConfig, num_blocks: int) -> KVCacheConfig:
     scaled.kv_cache_tensors = copy.deepcopy(cfg.kv_cache_tensors)
     rescale_kv_cache_config(scaled, num_blocks)
     return scaled
+
+
+def has_only_fixed_kv_caches(cfg: KVCacheConfig) -> bool:
+    return bool(cfg.kv_cache_tensors) and all(
+        isinstance(tensor, RBLNFixedKVCacheTensor) for tensor in cfg.kv_cache_tensors
+    )
 
 
 def max_num_blocks_for_int16_block_ids(
@@ -334,6 +341,8 @@ class DynamicKvSizer:
                 kv_cache_config.num_blocks,
             )
             return kv_cache_config
+        if has_only_fixed_kv_caches(kv_cache_config):
+            return kv_cache_config
         compile_num_blocks = COMPILE_KV_CACHE_NUM_BLOCKS
         if compile_num_blocks >= kv_cache_config.num_blocks:
             # No shrink means no resize: the run would silently serve the
@@ -451,15 +460,30 @@ class DynamicKvSizer:
         )
         return DYNAMIC_KV_COPY_STREAM_RESERVE_BYTES if in_use is not None else 0
 
-    def compute_num_blocks(self) -> int | None:
+    def compute_num_blocks(self) -> int | float | None:
         """How many KV blocks fit this device, from the placement and a memory
-        snapshot. Reallocates nothing; None means the path is not in play."""
+        snapshot. None means inactive; infinity means only fixed caches.
+        Reallocates nothing."""
         if self.mode is DynamicKvMode.PINNED:
             logger.info(
                 "[Dynamic KV] %s is set; leaving the KV cache alone.",
                 self.mode_reason,
             )
             return None
+        if self.mode is DynamicKvMode.ACTIVE and has_only_fixed_kv_caches(
+            self.model_runner.kv_cache_config
+        ):
+            if torch.rbln.is_dummy_device():
+                return None
+            snapshot, _ = self.memory_snapshot(self.device)
+            for unit, memory in snapshot.items():
+                budget = int(memory.total * self.cache_config.gpu_memory_utilization)
+                if memory.used > budget:
+                    raise RuntimeError(
+                        f"[Dynamic KV] fixed caches and model exceed the memory "
+                        f"budget on {unit}: used={memory.used}, budget={budget}."
+                    )
+            return float("inf")
         if self.kv_blocks_before_shrink is None:
             # The branch that cancelled the shrink already logged why.
             logger.warning(
@@ -686,6 +710,12 @@ class DynamicKvSizer:
         if target is None:
             return None
         self.kv_blocks_before_shrink = None
+
+        if has_only_fixed_kv_caches(self.model_runner.kv_cache_config):
+            rescale_kv_cache_config(self.model_runner.kv_cache_config, target)
+            self.cache_config.num_gpu_blocks = target
+            self.cache_config.num_cpu_blocks = target
+            return target
 
         current = self.model_runner.kv_cache_config.num_blocks
         if target == current and self.model_runner.kv_caches:

@@ -742,7 +742,7 @@ class RBLNDeepseekV4DecoderLayer(nn.Module):
                 post_mult=self.hc_post_mult,
                 iters=self.hc_iters,
                 eps=self.hc_eps,
-            )
+            ).to(streams.dtype)
         batch, n, tokens, hidden = streams.shape
         flat = streams.transpose(1, 2).reshape(batch, tokens, n * hidden).float()
         flat = flat * torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.norm_eps)
@@ -753,7 +753,7 @@ class RBLNDeepseekV4DecoderLayer(nn.Module):
         )
         x = torch.ops.rbln_custom_ops.hc_stream_reduce(
             streams_f32, z_pre, eps=self.hc_eps
-        ).to(streams.dtype)
+        ).to(norm.weight.dtype)
         x = sublayer(norm(x))
         return torch.ops.rbln_custom_ops.hc_residual_add(
             x.float(), streams_f32, z_post, comb, post_mult=self.hc_post_mult

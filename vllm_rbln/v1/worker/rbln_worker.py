@@ -483,7 +483,7 @@ class RBLNWorker(WorkerBase):
         if not self.dynamic_kv.defers_kv_registration:
             self.model_runner.register_kv_caches_with_connector()
 
-    def compute_dynamic_kv_num_blocks(self) -> int | None:
+    def compute_dynamic_kv_num_blocks(self) -> int | float | None:
         """RPC target of the engine's dynamic-KV patch; see
         `DynamicKvSizer.compute_num_blocks`."""
         with set_current_vllm_config(self.vllm_config, check_compile=False):
