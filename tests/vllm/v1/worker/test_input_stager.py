@@ -79,6 +79,30 @@ class TestStagedModelInputs:
 
 @pytest.mark.maybe_use_device
 class TestStage:
+    def test_copies_complete_pinned_host_buffers(self, monkeypatch):
+        stager = _stager()
+        layout = _layout()
+        copies = []
+        original = torch.Tensor.copy_
+
+        def copy(dst, src, *args, **kwargs):
+            if src.is_pinned():
+                copies.append((src, dst, kwargs.get("non_blocking", False)))
+            return original(dst, src, *args, **kwargs)
+
+        monkeypatch.setattr(torch.Tensor, "copy_", copy)
+        stager.stage(input_ids=_ids(2, 3), positions=_ids(2, 3), layout=layout)
+
+        assert len(copies) == 2
+        for src, dst, non_blocking in copies:
+            assert src.shape == dst.shape == layout.shape
+            assert src.is_contiguous() and dst.is_contiguous()
+            assert non_blocking
+        sources = [src for src, _, _ in copies]
+        copies.clear()
+        stager.stage(input_ids=_ids(2, 3, base=9), positions=_ids(2, 3), layout=layout)
+        assert all(src is previous for (src, _, _), previous in zip(copies, sources))
+
     def test_copies_into_top_left_and_pads_rest(self):
         stager = _stager()
         layout = _layout(num_reqs=2, num_reqs_padded=4, query_len=3, query_len_padded=8)

@@ -32,6 +32,19 @@ _MINIMAX_BASE = CompileModelSpec(
 
 MODELS: list[CompileModelSpec] = [
     CompileModelSpec(
+        "Qwen/Qwen3.5-9B",
+        # text-only: Qwen3.5 does not start with video on. The runner's block
+        # count does not model a GatedDeltaNet group: under prefix caching a
+        # request holds two state blocks, plus the null block.
+        {
+            "max_num_seqs": 1,
+            "language_model_only": True,
+            "block_size": 1024,
+            "num_gpu_blocks_override": 3,
+        },
+        chips=REBEL,
+    ),
+    CompileModelSpec(
         "Qwen/Qwen3-30B-A3B",
         {
             "max_num_seqs": 1,
