@@ -170,9 +170,8 @@ uv pip install -e ".[test]"
 
 `rebel-compiler` is an optional `runtime` extra and is not pulled in by the
 base `test` install, so the resolver never conflicts with your separately
-installed copy. Everything else resolves from public indexes (PyPI,
-`wheels.vllm.ai`, `download.pytorch.org`); internal indexes are skipped
-automatically.
+installed copy. The vLLM empty wheel resolves from the Rebellions public package
+index, and the other dependencies resolve from PyPI and `download.pytorch.org`.
 
 > Note: this environment is **not** what CI reproduces. CI always builds from
 > the committed `uv.lock` (internal nightly `rebel-compiler` included), so unless
