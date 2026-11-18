@@ -17,7 +17,9 @@ read it: the state blocks a request loads and stores come from the group's
 block table, and the conv ring is read and stored by the same blocks as the
 state."""
 
+from dataclasses import fields
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -46,6 +48,8 @@ def _builder(
     prefill_chunk_size=(128,),
     block_size: int = MAX_LEN,
     mamba_cache_mode: str = "none",
+    *,
+    device="cpu",
 ):
     vllm_config = make_vllm_config(
         max_model_len=MAX_LEN,
@@ -63,7 +67,7 @@ def _builder(
     # The flash builder it extends reads the config it is built under.
     with set_current_vllm_config(vllm_config):
         return RBLNGDNAttentionMetadataBuilder(
-            spec, [LAYER], vllm_config, torch.device("cpu")
+            spec, [LAYER], vllm_config, torch.device(device)
         )
 
 
@@ -110,6 +114,56 @@ def _assert_conv_rows(
 
 
 class TestBuilder:
+    @pytest.mark.maybe_use_device
+    @pytest.mark.parametrize("is_prefill", [False, True])
+    @pytest.mark.parametrize("defer_staging", [False, True])
+    @pytest.mark.parametrize("mamba_cache_mode", ["none", "align"])
+    def test_staging_preserves_values_and_host_state_indices(
+        self, monkeypatch, is_prefill, defer_staging, mamba_cache_mode
+    ):
+        from vllm.platforms import current_platform
+
+        builder = _builder(
+            block_size=256 if mamba_cache_mode == "align" else MAX_LEN,
+            mamba_cache_mode=mamba_cache_mode,
+            device=current_platform.device_type,
+        )
+        copy_tensor = Mock(wraps=builder._stage)
+        monkeypatch.setattr(builder, "_stage", copy_tensor)
+        query_len = 2 if is_prefill else 1
+        metadata = builder.build(
+            _common([query_len], [256 + query_len], [[7, 8]]),
+            torch.arange(256, 256 + query_len),
+            batch_pad=1 if is_prefill else 4,
+            is_prefill=is_prefill,
+            **({"defer_staging": True} if defer_staging else {}),
+        )
+        if defer_staging:
+            copy_tensor.assert_not_called()
+        padding = [] if is_prefill else [0, 0, 0]
+        assert metadata.load_blocks.tolist() == [7, *padding]
+        store = 8 if mamba_cache_mode == "align" else 7
+        assert metadata.store_blocks.tolist() == [store, *padding]
+        originals = {
+            field.name: value
+            for field in fields(metadata)
+            if isinstance(value := getattr(metadata, field.name), torch.Tensor)
+        }
+        expected = {name: tensor.cpu().clone() for name, tensor in originals.items()}
+
+        builder.stage(metadata)
+        for name, tensor in originals.items():
+            staged = getattr(metadata, name)
+            if tensor.dtype == torch.int16:
+                assert staged is tensor, name
+                assert staged.device.type == "cpu", name
+            else:
+                assert staged.device.type == current_platform.device_type, name
+                if defer_staging:
+                    assert staged is not tensor, name
+                    tensor.zero_()
+            assert torch.equal(staged.cpu(), expected[name]), name
+
     def test_first_prefill_chunk(self, builder):
         positions = torch.arange(128)
         md = builder.build(_common([70], [70], [[7]]), positions, 1, True)
