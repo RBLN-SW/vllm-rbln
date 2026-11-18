@@ -948,6 +948,7 @@ class TestRegisterKvCachesImpl:
         spec_cfg.draft_model_config.revision = None
         spec_cfg.draft_model_config.code_revision = None
         spec_cfg.draft_model_config.get_total_num_kv_heads.return_value = 32
+        spec_cfg.use_eagle_block_drop.return_value = True
         worker.vllm_config.speculative_config = spec_cfg
         # The draft layer is named past the target's depth, so it comes last.
         kv_caches = _impl_kv_caches(

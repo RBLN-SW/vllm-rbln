@@ -189,22 +189,29 @@ class RBLNSlidingWindowManager(SingleTypeKVCacheManager):
 #: state block ends at, so a consumer knows to allocate and cache a block for it.
 REMOTE_STATE_BOUNDARY = "remote_state_boundary"
 
+#: kv_transfer_params key a producer sets to its prompt length before upstream
+#: truncates the prompt to what the consumer receives.
+UNTRUNCATED_PROMPT_LENGTH = "rbln_untruncated_prompt_length"
+
 
 def prompt_boundary_block(
-    num_prompt_tokens: int, block_size: int, drop_eagle_block: bool
+    num_prompt_tokens: int,
+    num_transferred_tokens: int,
+    block_size: int,
+    drop_eagle_block: bool,
 ) -> int | None:
-    """The block holding the state a repeat of the prompt can hit, when that is not
-    the block holding the prompt's last state."""
-    if drop_eagle_block:
-        # An EAGLE/MTP lookup drops its last matched block, so it stops one block
-        # short of the prompt's last boundary.
-        position = get_mamba_prefill_checkpoint_position(
-            num_prompt_tokens, block_size, drop_eagle_block
-        )
-        return position // block_size - 1 if position else None
-    if num_prompt_tokens < block_size or num_prompt_tokens % block_size == 0:
+    """The block holding the state a repeat of the prompt can hit, when the
+    transfer covers it and it is not the transferred tokens' last state.
+
+    A repeat looks up from the whole prompt, while the transfer stops short of
+    the tokens the consumer recomputes, so the two lengths differ.
+    """
+    position = get_mamba_prefill_checkpoint_position(
+        num_prompt_tokens, block_size, drop_eagle_block
+    )
+    if position == 0 or position >= num_transferred_tokens:
         return None
-    return num_prompt_tokens // block_size - 1
+    return position // block_size - 1
 
 
 @dataclass(frozen=True)
@@ -213,13 +220,14 @@ class RBLNMambaSpec(MambaSpec):
 
 
 class RBLNMambaManager(MambaManager):
-    """Carries a prompt's last block-boundary state across a P/D transfer.
+    """Carries the block-boundary state a repeat of a prompt can hit across a
+    P/D transfer (`prompt_boundary_block`).
 
     In align mode a transfer moves only the running state. That serves the
     request, but the consumer holds no state at a block boundary, so a repeat of
-    the prompt there misses the prefix cache. The producer keeps its boundary
-    block until the transfer releases it; the consumer allocates a block for it
-    and caches it once received, as if it had computed it.
+    the prompt misses the prefix cache. The producer keeps the boundary block
+    until the transfer releases it; the consumer allocates a block for it and
+    caches it once received, as if it had computed it.
     """
 
     def __init__(self, kv_cache_spec: MambaSpec, block_pool, **kwargs) -> None:
@@ -240,6 +248,7 @@ class RBLNMambaManager(MambaManager):
         request_id = request.request_id
         if params.get("do_remote_decode"):
             block_idx = prompt_boundary_block(
+                params[UNTRUNCATED_PROMPT_LENGTH],
                 request.num_prompt_tokens,
                 self.block_size,
                 self.drop_eagle_checkpoint_block,
@@ -255,8 +264,10 @@ class RBLNMambaManager(MambaManager):
             or num_local_computed_tokens >= boundary
         ):
             return
+        num_received_tokens = num_local_computed_tokens + num_external_computed_tokens
         block_idx = prompt_boundary_block(
-            num_local_computed_tokens + num_external_computed_tokens,
+            request.num_prompt_tokens,
+            num_received_tokens,
             self.block_size,
             self.drop_eagle_checkpoint_block,
         )
@@ -264,12 +275,13 @@ class RBLNMambaManager(MambaManager):
             # The value comes from the peer; the running state alone still
             # serves the request, so a mismatch only costs the cache entry.
             logger.warning(
-                "%s: ignoring %s=%d, not the boundary a repeat of the %d "
-                "token(s) received can hit",
+                "%s: ignoring %s=%d, not a boundary that %d received token(s) "
+                "cover and a repeat of the %d-token prompt can hit",
                 request_id,
                 REMOTE_STATE_BOUNDARY,
                 boundary,
-                num_local_computed_tokens + num_external_computed_tokens,
+                num_received_tokens,
+                request.num_prompt_tokens,
             )
             return
         self._received_boundary[request_id] = block_idx

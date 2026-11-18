@@ -413,8 +413,10 @@ def rbln_compat_hash(
     a producer that writes into a consumer expecting to read passes every
     length check; the draft model, because its attention layers are members of
     the KV cache this connector registers while upstream's factors describe the
-    target alone; and ``cross_layers_blocks``, which scales the page by the
-    KV-cache tensor count and which 0.30 dropped from upstream's own factors.
+    target alone; the EAGLE block drop, because it moves the block-boundary
+    state the pull path exchanges; and ``cross_layers_blocks``, which scales the
+    page by the KV-cache tensor count and which 0.30 dropped from upstream's own
+    factors.
 
     Model-level values only -- the hash is compared across every shard, so a
     per-rank quantity would differ between PP stages.
@@ -435,5 +437,6 @@ def rbln_compat_hash(
             "rbln_draft_model": draft_model_config.model,
             "rbln_draft_revision": draft_model_config.revision,
             "rbln_draft_code_revision": draft_model_config.code_revision,
+            "rbln_eagle_block_drop": speculative_config.use_eagle_block_drop(),
         }
     return hash_factors(factors)

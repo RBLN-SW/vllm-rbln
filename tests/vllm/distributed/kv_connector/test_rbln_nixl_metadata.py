@@ -235,16 +235,23 @@ class TestRblnCompatHash:
         ) != rbln_compat_hash("BASE", writes_into_peer=False, cross_layers_blocks=False)
 
     @staticmethod
-    def _spec_config(*, method="eagle3", model="draft-a", revision=None):
+    def _spec_config(
+        *, method="eagle3", model="draft-a", revision=None, disable_block_drop=False
+    ):
         draft_model_config = MagicMock()
         draft_model_config.model = model
         draft_model_config.revision = revision
         draft_model_config.code_revision = None
-        spec = MagicMock(method=method, draft_model_config=draft_model_config)
+        spec = MagicMock(
+            method=method,
+            draft_model_config=draft_model_config,
+            disable_eagle_block_drop=disable_block_drop,
+        )
         # Upstream's own predicates, not a copy of the method names they read:
         # a method moving between them has to show up here.
         spec.use_eagle = lambda: SpeculativeConfig.use_eagle(spec)
         spec.uses_draft_model = lambda: SpeculativeConfig.uses_draft_model(spec)
+        spec.use_eagle_block_drop = lambda: SpeculativeConfig.use_eagle_block_drop(spec)
         return spec
 
     def test_no_speculation_leaves_the_factors_alone(self):
@@ -277,6 +284,20 @@ class TestRblnCompatHash:
             writes_into_peer=False,
             cross_layers_blocks=False,
             speculative_config=self._spec_config(model="draft-b"),
+        )
+
+    def test_the_block_drop_separates_one_draft(self):
+        # It moves the block-boundary state the pull path exchanges.
+        assert rbln_compat_hash(
+            "BASE",
+            writes_into_peer=False,
+            cross_layers_blocks=False,
+            speculative_config=self._spec_config(),
+        ) != rbln_compat_hash(
+            "BASE",
+            writes_into_peer=False,
+            cross_layers_blocks=False,
+            speculative_config=self._spec_config(disable_block_drop=True),
         )
 
     def test_a_revision_separates_one_name(self):

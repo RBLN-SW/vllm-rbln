@@ -28,6 +28,7 @@ import vllm_rbln.v1.kv_cache as kv_cache
 from tests.vllm.v1.core.utils import make_request
 from vllm_rbln.v1.kv_cache import (
     REMOTE_STATE_BOUNDARY,
+    UNTRUNCATED_PROMPT_LENGTH,
     RBLNMambaManager,
     RBLNMambaSpec,
     RBLNSlidingWindowManager,
@@ -405,16 +406,19 @@ class TestRBLNMambaManager:
         assert isinstance(coord.single_type_managers[1], RBLNMambaManager)
         return coord
 
-    def _request(self, request_id, params):
-        request = make_request(request_id, list(range(40)), self.BLOCK)
+    def _request(self, request_id, params, num_tokens=40):
+        request = make_request(request_id, list(range(num_tokens)), self.BLOCK)
         request.kv_transfer_params = params
         return request
+
+    def _producer_params(self, num_prompt_tokens=40):
+        return {"do_remote_decode": True, UNTRUNCATED_PROMPT_LENGTH: num_prompt_tokens}
 
     @pytest.mark.parametrize("producer", [True, False])
     def test_producer_keeps_the_last_boundary_state(self, producer):
         coord = self._coordinator()
         state = coord.single_type_managers[1]
-        request = self._request("p", {"do_remote_decode": True} if producer else None)
+        request = self._request("p", self._producer_params() if producer else None)
         state.track_transfer(request, 0, 0)
         for computed, end in ((0, 16), (16, 32), (32, 36), (36, 40)):
             coord.remove_skipped_blocks("p", computed, 40)
@@ -486,7 +490,7 @@ class TestRBLNMambaManager:
     def test_freeing_a_producer_request_drops_its_kept_boundary(self):
         coord = self._coordinator()
         state = coord.single_type_managers[1]
-        state.track_transfer(self._request("p", {"do_remote_decode": True}), 0, 0)
+        state.track_transfer(self._request("p", self._producer_params()), 0, 0)
         coord.allocate_new_blocks("p", 16, 16)
         assert state._kept_boundary == {"p": 1}
 
@@ -494,32 +498,51 @@ class TestRBLNMambaManager:
 
         assert state._kept_boundary == {}
 
-    def test_an_eagle_producer_keeps_the_state_before_the_drop(self):
+    # The producer holds the prompt less its last token, while a repeat looks
+    # up from the whole prompt: a 49-token one hits 32, not 16.
+    @pytest.mark.parametrize(("num_prompt_tokens", "kept"), [(40, 0), (49, 1)])
+    def test_an_eagle_producer_keeps_the_state_before_the_drop(
+        self, num_prompt_tokens, kept
+    ):
         coord = self._coordinator(use_eagle=True)
         state = coord.single_type_managers[1]
-        request = self._request("p", {"do_remote_decode": True})
+        num_tokens = num_prompt_tokens - 1
+        request = self._request(
+            "p", self._producer_params(num_prompt_tokens), num_tokens
+        )
         state.track_transfer(request, 0, 0)
-        for computed, end in ((0, 16), (16, 32), (32, 36), (36, 40)):
-            coord.remove_skipped_blocks("p", computed, 40)
+        for computed in range(0, num_tokens, self.BLOCK):
+            end = min(computed + self.BLOCK, num_tokens)
+            coord.remove_skipped_blocks("p", computed, num_tokens)
             coord.allocate_new_blocks("p", end, end)
 
-        blocks = state.req_to_blocks["p"]
-        assert [b.is_null for b in blocks] == [False, True, False]
+        assert state._kept_boundary == {"p": kept}
+        assert not state.req_to_blocks["p"][kept].is_null
 
-    @pytest.mark.parametrize(("boundary", "cached"), [(16, True), (32, False)])
-    def test_an_eagle_consumer_caches_the_state_before_the_drop(self, boundary, cached):
+    @pytest.mark.parametrize(
+        ("num_prompt_tokens", "boundary", "cached"),
+        [(40, 16, True), (40, 32, False), (49, 32, True), (49, 16, False)],
+    )
+    def test_an_eagle_consumer_caches_the_state_before_the_drop(
+        self, num_prompt_tokens, boundary, cached
+    ):
         coord = self._coordinator(use_eagle=True)
         state = coord.single_type_managers[1]
         request = self._request(
-            "d", {"do_remote_prefill": True, REMOTE_STATE_BOUNDARY: boundary}
+            "d",
+            {"do_remote_prefill": True, REMOTE_STATE_BOUNDARY: boundary},
+            num_prompt_tokens,
         )
-        num_external = 39
+        num_external = num_prompt_tokens - 1
         state.track_transfer(request, 0, num_external)
         coord.allocate_new_computed_blocks("d", ([], []), 0, num_external)
         coord.allocate_new_blocks("d", num_external, num_external)
 
         blocks = state.req_to_blocks["d"]
-        assert [b.is_null for b in blocks] == [not cached, True, False]
+        boundary_slot = boundary // self.BLOCK - 1
+        assert blocks[boundary_slot].is_null is not cached
         coord.cache_blocks(request, num_external)
-        _, hit_length, _ = coord.find_longest_cache_hit(request.block_hashes, 39)
-        assert hit_length == (16 if cached else 0)
+        _, hit_length, _ = coord.find_longest_cache_hit(
+            request.block_hashes, num_external
+        )
+        assert hit_length == (boundary if cached else 0)
