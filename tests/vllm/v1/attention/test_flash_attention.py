@@ -15,13 +15,13 @@
 
 from dataclasses import fields
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 from vllm.config import set_current_vllm_config
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-import vllm_rbln.envs as envs
 import vllm_rbln.v1.attention.backends.flash_attention as flash_attention
 from tests.vllm.v1.attention.utils import (
     make_attention_spec,
@@ -305,10 +305,6 @@ class TestBuildPrefillNonCausal:
     def test_mask_dtype_follows_enforce_eager(
         self, cfg_noncausal, eager, expected_dtype
     ):
-        # float16 under enforce_eager, float32 otherwise. enforce_eager needs
-        # device tensors, so that case is skipped on the cpu lane.
-        if eager and not envs.VLLM_RBLN_USE_DEVICE_TENSOR:
-            pytest.skip("enforce_eager=True requires VLLM_RBLN_USE_DEVICE_TENSOR=1")
         config = (
             make_vllm_config(
                 max_model_len=MAX_LEN,
@@ -761,6 +757,70 @@ class TestBuildOutputAssembly:
 
 
 class TestStage:
+    @pytest.mark.use_device
+    @pytest.mark.parametrize("kind", ["full", "shift", "glm"])
+    @pytest.mark.parametrize("is_prefill", [False, True])
+    @pytest.mark.parametrize("use_custom_kernel", [False, True])
+    def test_deferred_build_preserves_tensor_values_after_staging(
+        self, monkeypatch, kind, is_prefill, use_custom_kernel
+    ):
+        from vllm.platforms import current_platform
+        from vllm.v1.kv_cache_interface import MambaSpec
+
+        from vllm_rbln.v1.attention.backends.glm5_next import (
+            RBLNGlm5NextMetadataBuilder,
+        )
+
+        config = make_vllm_config(
+            max_model_len=MAX_LEN,
+            max_num_batched_tokens=CHUNK,
+            additional_config={"use_custom_kernel": use_custom_kernel},
+            attention_config={"use_non_causal": True},
+        )
+        builder = make_builder(
+            config,
+            device=current_platform.device_type,
+            sliding_window=4 if kind == "shift" else None,
+            appends_kv=False,
+            spec=MambaSpec(block_size=4, shapes=((4, 512),), dtypes=(torch.uint8,))
+            if kind == "glm"
+            else None,
+            builder_cls=RBLNGlm5NextMetadataBuilder if kind == "glm" else None,
+        )
+        copy_tensor = Mock(wraps=builder._stage)
+        monkeypatch.setattr(builder, "_stage", copy_tensor)
+        query_len = 2 if is_prefill else 1
+        metadata = builder.build(
+            _cam(
+                num_reqs=1,
+                query_start_loc=[0, query_len],
+                seq_lens=[6],
+                block_table=[[4, 5, 6, 7]],
+            ),
+            torch.arange(query_len) + 6 - query_len,
+            batch_pad=1 if is_prefill else 2,
+            is_prefill=is_prefill,
+            num_accepted=torch.tensor([1], dtype=torch.int32),
+            mm_prefix_row_ends=torch.arange(CHUNK) if is_prefill else None,
+            defer_staging=True,
+        )
+        copy_tensor.assert_not_called()
+        originals = {
+            field.name: value
+            for field in fields(metadata)
+            if isinstance(value := getattr(metadata, field.name), torch.Tensor)
+        }
+        expected = {name: tensor.clone() for name, tensor in originals.items()}
+
+        builder.stage(metadata)
+        for tensor in originals.values():
+            tensor.zero_()
+
+        for name, tensor in expected.items():
+            staged = getattr(metadata, name)
+            assert staged.device.type == current_platform.device_type, name
+            assert torch.equal(staged.cpu(), tensor), name
+
     def test_none_passthrough(self, cfg):
         # None in -> None out; there is nothing to stage.
         assert make_builder(cfg)._stage(None, "x") is None
@@ -819,7 +879,7 @@ class TestStage:
         assert first.reshape(-1).tolist() == [10]
 
 
-@pytest.mark.maybe_use_device
+@pytest.mark.use_device
 class TestFlashImplInit:
     # __init__ validation guards and derived attributes. Each guard test sets the
     # other args valid so the intended check fires (the guards are ordered).
@@ -929,7 +989,7 @@ class TestFlashImplInit:
         assert make_impl(cfg_square, sinks=torch.zeros(8)).is_normal is False
 
 
-@pytest.mark.maybe_use_device
+@pytest.mark.use_device
 class TestForwardSlidingWindow:
     """Which kernel a sliding-window layer reaches is carried on the metadata
     by the builder, and the two take different inputs."""

@@ -31,15 +31,15 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import ParamSpec
 
-# What the suite pins: the knobs whose source default it must not take. Nothing
-# that merely repeats a default -- pinning those would hide the day one is
-# flipped. The model path is not here; `pytest_configure` adopts it.
+# The suite always uses device tensors; other pins override source defaults
+# only where needed. `pytest_configure` adopts the model path separately.
 VLLM_RBLN_ENV = {
     "RBLN_ROOT_IP": "127.0.0.1",
     "RBLN_LOCAL_IP": "127.0.0.1",
     "VLLM_DISABLE_COMPILE_CACHE": "1",
     "VLLM_LOGGING_LEVEL": "DEBUG",
     "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+    "VLLM_RBLN_USE_DEVICE_TENSOR": "1",
 }
 
 SCRUBBED_PREFIXES = ("VLLM_RBLN_",)
@@ -527,7 +527,6 @@ def start_module_in_spawned_process(
     nodeids: list[str],
     *,
     nodeid_prefix: str = "",
-    device_tensor: str | None,
     model_compile: bool,
     num_hidden_layers: int,
     tb_style: str | None = None,
@@ -537,28 +536,18 @@ def start_module_in_spawned_process(
     """Start one fresh spawned pytest over exactly ``nodeids`` (all from the
     same file) and return the handle the parent reads results from as they land.
 
-    Lets a whole device-touching file share ONE spawn instead of spawning per
-    test: the child is a real pytest run (so it resolves fixtures,
-    parametrization and skips itself) with the spawn-child guard set, and the
-    suite conftest's logreport hook serializes each phase report to a file.
+    The child resolves fixtures, parametrization and skips, then serializes each
+    phase report for the parent. Passing selected nodeids preserves -m/-k and
+    --deselect without rerunning unmarked tests from mixed files.
 
-    The parent passes the tests it actually selected rather than the file, so
-    -m/-k/--deselect mean what they say: handing over the file would run the
-    deselected tests too (on the NPU, invisibly), and would re-run any unmarked
-    test of a mixed file that the parent is already running in-process.
-    --device-tensor / --model-compile / --num-hidden-layers are forwarded so the
-    child's skip/run decisions and engine config match the parent's, and --tb /
-    --maxfail so the reports it builds are rendered and cut off the way the
-    parent was asked to.
+    Forward --model-compile and --num-hidden-layers to match the parent's engine
+    config, plus --tb and --maxfail to preserve reporting and early termination.
+    Both processes pin device tensors through the suite's common environment.
 
-    The child's raw stream is redirected to a log file rather than inherited.
-    Inheriting it would put the WHOLE file's output -- every EngineCore
-    traceback included -- into the parent's capture buffer for the *first* test
-    of the module (the one whose pyfunc_call triggered this spawn), which pytest
-    then discards when that test passes. Per-test output reaches the parent via
-    each record's sections instead; the log file is the fallback for a child
-    that dies without recording anything. ``stream_output`` (parent run with
-    -s) inherits the stream instead, since nothing is capturing it then."""
+    Redirect raw output to a log so the first test's capture does not absorb
+    the whole file's output. Per-test capture travels with its phase reports;
+    the log diagnoses hard crashes. ``stream_output`` forwards -s for live
+    output instead, since the parent is not capturing it then."""
     with tempfile.NamedTemporaryFile(delete=False, suffix=".jsonl", mode="w") as tmp:
         results_file = tmp.name
     log_path: str | None = None
@@ -583,8 +572,6 @@ def start_module_in_spawned_process(
         "no:cacheprovider",
         "-q",
     ]
-    if device_tensor is not None:
-        args += ["--device-tensor", device_tensor]
     if model_compile:
         args.append("--model-compile")
     # A flag, not env: the child scrubs every VLLM_RBLN_* it inherits.

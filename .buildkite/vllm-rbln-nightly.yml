@@ -1,5 +1,5 @@
 env:
-  UV_CACHE_DIR: "/root/.cache/uv"
+  UV_CACHE_DIR: "/mnt/uv_cache"
   UV_LINK_MODE: "symlink"
   UV_INDEX_STRATEGY: "unsafe-best-match"
   # Only the cron schedule sets this, so a manual or re-run build exercises the
@@ -209,6 +209,7 @@ steps:
         uv run --no-sync python \
           .buildkite/pipelines/vllm-rbln/scripts/sampler-perf/run_benchmarks.py \
           --config "ci-targets/$${BUILDKITE_BUILD_ID}/sampler-perf/benchmark-configs.yaml" \
+          --use-fused-sampling 0 1 \
           --output-dir "$${sampler_output}" || sampler_status=$$?
         if [[ -f "$${sampler_output}/summary.md" ]]; then
           sampler_style=info
