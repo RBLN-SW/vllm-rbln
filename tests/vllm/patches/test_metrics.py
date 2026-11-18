@@ -629,6 +629,52 @@ class TestMmEncoder:
         }
 
     @pytest.mark.parametrize("recording", [False, True])
+    @pytest.mark.parametrize("preserve_device", [False, True])
+    def test_rbln_latency_waits_for_encoder_completion(
+        self, ctx, clock, monkeypatch, recording, preserve_device
+    ):
+        monkeypatch.setattr(pm, "_ACTIVE_CTX", ctx)
+        rbln_device = torch.device("rbln:1")
+        pixels = types.SimpleNamespace(device=rbln_device, shape=(4, 3))
+        output = types.SimpleNamespace(device=rbln_device)
+        waits = []
+
+        def wait_for_previous_work():
+            waits.append("before")
+            clock.advance(11 * MS)
+
+        def wait_for_encoder():
+            waits.append("after")
+            clock.advance(7 * MS)
+
+        stream = types.SimpleNamespace(
+            synchronize=wait_for_previous_work,
+            record_event=lambda: types.SimpleNamespace(synchronize=wait_for_encoder),
+        )
+
+        def current_stream(device):
+            assert device == rbln_device
+            return stream
+
+        def run_encoder(*args, **kwargs):
+            clock.advance(1 * MS)
+            return output
+
+        monkeypatch.setattr(torch.rbln, "current_stream", current_stream)
+        monkeypatch.setattr(pm, "_run_mm_encoder", run_encoder)
+        if recording:
+            ctx.start_pass()
+        device = None if preserve_device else rbln_device
+        assert pm.run_mm_encoder(None, [pixels], 2, device=device) is output
+
+        if recording:
+            assert waits == ["before", "after"]
+            assert ctx._encoder["4x3"].latencies == pytest.approx([8 * MS])
+        else:
+            assert waits == []
+            assert not ctx._encoder
+
+    @pytest.mark.parametrize("recording", [False, True])
     @pytest.mark.parametrize("device", [None, "meta"])
     @pytest.mark.parametrize("dtype", [None, torch.bfloat16])
     def test_encoder_device_and_dtype_are_forwarded(

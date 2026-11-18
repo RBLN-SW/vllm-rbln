@@ -18,14 +18,16 @@ sums the model call, sampler, and blocking bookkeeping as MODEL + SAMPLE.
 Spec decode's postprocess gather also holds a blocking read, so its profiler
 region is included in that sum. Drafter time stays in the E2E residual.
 Non-last PP ranks close their pass after the hand-off waits on compute.
-Multimodal encoder calls through their existing CPU output copy are reported
-per input shape as ENCODER. Input preparation is outside that interval.
+Multimodal encoder calls are reported per input shape as ENCODER, through
+the CPU output copy or RBLN stream completion. Input preparation is outside
+that interval.
 """
 
 import contextlib
 import functools
 import time
 
+import torch
 from vllm.sequence import IntermediateTensors
 from vllm.v1.utils import record_function_or_nullcontext
 
@@ -119,12 +121,17 @@ def run_mm_encoder(encoder, inputs, num_embeddings, *, dtype=None, device="cpu")
         return _run_mm_encoder(
             encoder, inputs, num_embeddings, dtype=dtype, device=device
         )
+    output_device = inputs[0].device if device is None else torch.device(device)
+    if output_device.type == "rbln":
+        # Exclude pending input preparation and work from earlier calls.
+        torch.rbln.current_stream(output_device).synchronize()
     start = time.perf_counter()
     output = _run_mm_encoder(
         encoder, inputs, num_embeddings, dtype=dtype, device=device
     )
+    if output.device.type == "rbln":
+        torch.rbln.current_stream(output.device).record_event().synchronize()
     latency = time.perf_counter() - start
-    # Device outputs may complete asynchronously; this measures the helper call.
     shape = "x".join(map(str, inputs[0].shape))
     ctx.record_encoder(shape, latency)
     return output
@@ -241,8 +248,8 @@ def _register_patches() -> None:
         (
             "vllm_rbln.utils.run_mm_encoder",
             run_mm_encoder,
-            "The per-image CPU handoff is the existing blocking boundary for "
-            "encoder execution; the runner only sees a batch of completed outputs.",
+            "The helper is the per-image or per-segment boundary for encoder "
+            "execution; the runner only sees the assembled outputs.",
         ),
         (
             f"{_RUNNER}._determine_batch_execution_and_padding",
