@@ -27,6 +27,7 @@ from vllm_rbln import envs
 from vllm_rbln.compilation import compile, create_compile_context
 from vllm_rbln.logger import init_logger
 from vllm_rbln.platform import USE_DEVICE_TENSOR
+from vllm_rbln.v1.sample.ops.fused_penalty import active_argmax_invariant
 from vllm_rbln.v1.sample.ops.top_k_top_p import (
     GREEDY_TEMPERATURE,
     GREEDY_TOP_K,
@@ -134,10 +135,7 @@ class RBLNRejectionSampler(RejectionSampler):
             and not sampling_metadata.logprob_token_ids
             and (
                 sampling_metadata.all_greedy
-                or not any(
-                    getattr(p, "min_p_count", 1)
-                    for p in sampling_metadata.logitsprocs.argmax_invariant
-                )
+                or not active_argmax_invariant(sampling_metadata)
             )
         )
         if bonus_in_graph:
