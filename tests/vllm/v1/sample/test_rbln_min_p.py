@@ -83,7 +83,6 @@ def test_keep_all_buffers_live_with_the_sampler(monkeypatch):
         )
     assert k is again_k and p is again_p
     assert k is not other_k and p is not other_p
-    assert not k.is_inference() and not p.is_inference()
     torch.testing.assert_close(k, torch.full((4,), 128, dtype=torch.int32))
     torch.testing.assert_close(p, torch.ones(4))
     refs = weakref.ref(k), weakref.ref(p)

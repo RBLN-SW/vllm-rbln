@@ -89,15 +89,6 @@ def rbln_greedy_sample(logits: torch.Tensor) -> torch.Tensor:
     return torch.ops.rbln.argmax(logits)
 
 
-def _as_batch_tensor(t: torch.Tensor | None) -> torch.Tensor | None:
-    # Dynamo guards on the dispatch key set. Batch-owned tensors carry
-    # ADInplaceOrView and step-made inference tensors do not, so copy the latter.
-    if t is None or not t.is_inference():
-        return t
-    with torch.inference_mode(False):
-        return t.clone()
-
-
 FusedGraphKind = Literal["penalize", "greedy", "top_k_top_p"]
 
 
@@ -150,6 +141,9 @@ def compile_sampler(
         # FIXME: Currently, sampler ops do not support caching.
         # Reusing seed buffer is not supported when the compiled sampler is loaded.
         use_cache=False,
+        # Batch-owned and step-made inference tensors differ in dispatch keys,
+        # which Dynamo's guards would recompile on.
+        use_direct_dispatch=True,
     )
 
 
@@ -254,15 +248,14 @@ class RBLNSampler(VLLMSampler):
         if k is None or p is None:
             key = (rows, vocab, device)
             if key not in self._keep_all:
-                with torch.inference_mode(False):
-                    self._keep_all[key] = (
-                        torch.full((rows,), vocab, dtype=torch.int32, device=device),
-                        torch.ones((rows,), dtype=torch.float32, device=device),
-                    )
+                self._keep_all[key] = (
+                    torch.full((rows,), vocab, dtype=torch.int32, device=device),
+                    torch.ones((rows,), dtype=torch.float32, device=device),
+                )
             keep_k, keep_p = self._keep_all[key]
             k = keep_k if k is None else k
             p = keep_p if p is None else p
-        return _as_batch_tensor(k), _as_batch_tensor(p)
+        return k, p
 
     def _fused_graph(
         self, kind: FusedGraphKind, plan: FusedPenaltyPlan
@@ -302,7 +295,7 @@ class RBLNSampler(VLLMSampler):
             )
             min_p_sample(
                 logits.clone(),
-                _as_batch_tensor(temperature),
+                temperature,
                 top_k,
                 top_p,
                 torch.full((rows,), float("-inf"), device=logits.device),
@@ -398,15 +391,15 @@ class RBLNSampler(VLLMSampler):
         if log_min_p is not None:
             assert min_p_sample is not None
             k, p = self._filled_top_k_top_p(k, p, rows, vocab, logits.device)
-            out = min_p_sample(logits, _as_batch_tensor(temperature), k, p, log_min_p)
+            out = min_p_sample(logits, temperature, k, p, log_min_p)
         elif penalty is not None:
             out = self._fused_graph("top_k_top_p", penalty)(
                 logits,
                 penalty.cidx,
                 penalty.lanes,
-                _as_batch_tensor(temperature),
-                _as_batch_tensor(k),
-                _as_batch_tensor(p),
+                temperature,
+                k,
+                p,
             )
         else:
             out, processed_logprobs = self.topk_topp_sampler(
