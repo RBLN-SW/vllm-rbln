@@ -168,7 +168,7 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             metadata.conv_load_blocks,
             metadata.conv_start_positions,
             metadata.conv_query_lens,
-            metadata.conv_has_initial_state,
+            metadata.has_initial_state,
             kernel - 1,
             store_index=metadata.conv_store_blocks,
         )
@@ -198,9 +198,9 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 g.contiguous(),
                 beta.contiguous(),
                 state,
-                metadata.prefill_state_indices,
-                metadata.prefill_has_initial_state,
-                store_index=metadata.store_state_indices,
+                metadata.load_blocks,
+                metadata.has_initial_state,
+                store_index=metadata.store_blocks,
             )
         else:
             core = torch.ops.rbln_custom_ops.recurrent_gated_delta_rule(
@@ -210,8 +210,8 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 g.contiguous(),
                 beta.contiguous(),
                 state,
-                metadata.non_spec_state_indices_tensor,
-                store_index=metadata.store_state_indices,
+                metadata.load_blocks,
+                store_index=metadata.store_blocks,
             )
         # [batch, num_k_heads, ratio, seq, 128] -> [batch, seq, num_v_heads, 128]
         core = core.permute(0, 3, 1, 2, 4).reshape(
