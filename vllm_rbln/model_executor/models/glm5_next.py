@@ -96,7 +96,7 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec, MLAAttentionSpec
 import vllm_rbln.utils as rbln_utils
 from vllm_rbln.model_executor.models.interfaces import SupportsRBLNMultiModal
 from vllm_rbln.patches.attention import _resolve_kv_cache
-from vllm_rbln.utils import is_prefill_step
+from vllm_rbln.utils import is_prefill_step, reads_a_batch_cut
 from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadata,
 )
@@ -115,17 +115,12 @@ from vllm_rbln.v1.worker.utils import (
 )
 from vllm_rbln.v1.worker.utils import pipeline_adjusted_layer_index
 
-try:
-    # A compiler with this kernel also cuts the mhc_* kernels of a decode batch
-    # by rows (or runs a small batch whole) and lays out decode's weights around
-    # them as prefill's; an older one keeps decode on the plain mHC ops.
-    from rebel.core.custom_converter.kernel_table.mhc import (  # noqa: F401
-        KERNEL_MHC_READ_ROWS,
-    )
-except ImportError:
-    _CUTS_THE_DECODE_MHC = False
-else:
-    _CUTS_THE_DECODE_MHC = True
+# A compiler whose read takes a batch cut also cuts the mhc_* kernels of a decode
+# batch by rows (or runs a small batch whole) and lays out decode's weights around
+# them as prefill's; an older one keeps decode on the plain mHC ops.
+_CUTS_THE_DECODE_MHC = reads_a_batch_cut(
+    "mhc", "KERNEL_MHC_READ_ROWS", "KERNEL_MHC_READ"
+)
 
 SLOT_DSA_LATENT, SLOT_DSA_INDEX_KEY, SLOT_DSA_INDEX_SCALE, SLOT_DSA_INDEX_TAIL = range(
     4

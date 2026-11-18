@@ -20,7 +20,7 @@ from vllm.model_executor.models.gemma4 import Gemma4DecoderLayer, Gemma4MLP
 
 from vllm_rbln.patches import register_patch
 from vllm_rbln.patches.registry import add_registration
-from vllm_rbln.utils import is_prefill_step
+from vllm_rbln.utils import is_prefill_step, reads_a_batch_cut
 
 
 @register_patch(
@@ -37,17 +37,13 @@ def keep_the_rbln_attention_backend(vllm_config: VllmConfig) -> None:
     """Leave the attention backend to the RBLN platform."""
 
 
-try:
-    # A compiler with this kernel cuts the decode residual by batch rows and lays
-    # out decode's weights around the ops as prefill's; an older one fails to
-    # share them, so decode keeps the plain path there.
-    from rebel.core.custom_converter.kernel_table.residual import (  # noqa: F401
-        KERNEL_RESIDUAL_READ_ROWS,
-    )
-except ImportError:
-    _CUTS_THE_DECODE_RESIDUAL = False
-else:
-    _CUTS_THE_DECODE_RESIDUAL = True
+# A compiler whose read takes a batch cut (residual_read_rows, or residual_read's
+# B shard) cuts the decode residual by batch rows and lays out decode's weights
+# around the ops as prefill's; an older one fails to share them, so decode keeps
+# the plain path there.
+_CUTS_THE_DECODE_RESIDUAL = reads_a_batch_cut(
+    "residual", "KERNEL_RESIDUAL_READ_ROWS", "KERNEL_RESIDUAL_READ"
+)
 
 
 def _read(norm, residual: torch.Tensor, cut: bool) -> torch.Tensor:

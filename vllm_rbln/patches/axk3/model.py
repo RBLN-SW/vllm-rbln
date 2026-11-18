@@ -51,7 +51,7 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
 from vllm_rbln.patches.axk2 import model as _axk2_model
-from vllm_rbln.utils import is_prefill_step
+from vllm_rbln.utils import is_prefill_step, reads_a_batch_cut
 
 # Loaded at import time from the frozen copy, so mypy cannot see its classes
 # (nor `Indexer`, which `_without_indexer` swaps on the module).
@@ -59,17 +59,12 @@ _k2: Any = _axk2_model._module
 _AXK2DecoderLayer: Any = _k2.AXK2DecoderLayer
 _AXK2ForCausalLM: Any = _k2.AXK2ForCausalLM
 
-try:
-    # A compiler with this kernel cuts the decode Gated Residual by batch rows and
-    # lays out decode's weights around the axk3_gr_* ops as prefill's; an older one
-    # fails to share them, so decode keeps the plain Gated Residual there.
-    from rebel.core.custom_converter.kernel_table.gated_residual import (  # noqa: F401
-        KERNEL_AXK3_GR_READ_ROWS,
-    )
-except ImportError:
-    _CUTS_THE_DECODE_GR = False
-else:
-    _CUTS_THE_DECODE_GR = True
+# A compiler whose read takes a batch cut cuts the decode Gated Residual by batch
+# rows and lays out decode's weights around the axk3_gr_* ops as prefill's; an
+# older one fails to share them, so decode keeps the plain Gated Residual there.
+_CUTS_THE_DECODE_GR = reads_a_batch_cut(
+    "gated_residual", "KERNEL_AXK3_GR_READ_ROWS", "KERNEL_AXK3_GR_READ"
+)
 
 
 class AXK3GatedResidual(nn.Module):
