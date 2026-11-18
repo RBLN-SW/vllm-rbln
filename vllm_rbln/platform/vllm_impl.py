@@ -98,12 +98,21 @@ def _uses_gated_delta_net(model_config) -> bool:
     return getattr(text_config, "model_type", None) == "qwen3_5_text"
 
 
+def _runs_gated_delta_net(vllm_config: "VllmConfig") -> bool:
+    """Whether this instance builds GatedDeltaNet layers: an encoder-only one
+    builds no language model."""
+    return (
+        _uses_gated_delta_net(vllm_config.model_config)
+        and not vllm_config.is_mm_encoder_only
+    )
+
+
 def _keeps_recurrent_state(vllm_config: "VllmConfig") -> bool:
     """A language model with a recurrent state a request beside its KV cache:
     GLM-5.3's KDA layers or GatedDeltaNet ones."""
-    model_config = vllm_config.model_config
-    return model_config.hf_text_config.model_type == "glm5_next_text" or (
-        _uses_gated_delta_net(model_config) and not vllm_config.is_mm_encoder_only
+    text_config = vllm_config.model_config.hf_text_config
+    return text_config.model_type == "glm5_next_text" or _runs_gated_delta_net(
+        vllm_config
     )
 
 
@@ -125,10 +134,7 @@ def _validate(vllm_config: "VllmConfig") -> None:
     if vllm_config.lora_config is not None:
         raise ValueError("LoRA is not supported on RBLN.")
 
-    # An encoder-only instance builds no language model, so no GDN layer.
-    uses_gdn = (
-        _uses_gated_delta_net(model_config) and not vllm_config.is_mm_encoder_only
-    )
+    uses_gdn = _runs_gated_delta_net(vllm_config)
     if uses_gdn:
         if rbln_config.use_custom_kernel:
             raise ValueError(
