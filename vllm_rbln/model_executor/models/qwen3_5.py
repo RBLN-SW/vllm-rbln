@@ -43,6 +43,7 @@ from vllm.multimodal.parse import MultiModalDataItems
 from vllm.sequence import IntermediateTensors
 
 from vllm_rbln.model_executor.models.interfaces import SupportsRBLNMultiModal
+from vllm_rbln.platform import RBLN_DEFAULT_MAX_NUM_BATCHED_TOKENS
 from vllm_rbln.v1.attention.backends.gdn_attn import grouped_qkv_rows
 
 
@@ -157,11 +158,12 @@ class RBLNQwen3_5ForConditionalGeneration(
             # smallest that holds its patches.
             budgets = sorted(rbln_config.encoder_token_budgets)
             if not budgets:
-                # Unset: powers of two from 128 output tokens up to the longest
-                # prefill chunk (512 at least), as upstream's encoder CUDA graphs
-                # go up to max_num_batched_tokens, then the processor's bound.
-                top = max(512, rbln_config.max_prefill_chunk_size)
-                budgets = [128]
+                # Unset: powers of two from the default prefill chunk counted in
+                # patches up to the longest prefill chunk in output tokens (the
+                # default one at least).
+                default_chunk = RBLN_DEFAULT_MAX_NUM_BATCHED_TOKENS
+                top = max(default_chunk, rbln_config.max_prefill_chunk_size)
+                budgets = [default_chunk // merge**2]
                 while budgets[-1] * 2 < top:
                     budgets.append(budgets[-1] * 2)
                 budgets.append(top)
