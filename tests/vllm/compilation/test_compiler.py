@@ -142,7 +142,7 @@ class TestCompileOptions:
         compile(object(), mode=["foo"])
         assert captured_compile["options"]["mode"] == ["foo", "compile_only"]
 
-    def test_declare_held_pv_off_by_default(self, captured_compile, monkeypatch):
+    def test_declare_held_pv_absent_when_env_off(self, captured_compile, monkeypatch):
         monkeypatch.setattr(compiler.envs, "VLLM_RBLN_DECLARE_HELD_PV", False)
         compile(object())
         assert "declare_held_pv" not in captured_compile["options"]

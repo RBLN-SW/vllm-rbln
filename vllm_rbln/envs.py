@@ -50,7 +50,7 @@ if TYPE_CHECKING:
     # --- COMPILE / RUNTIME ---
     VLLM_RBLN_COMPILE_STRICT_MODE: bool = True
     VLLM_RBLN_COMPILE_ONLY: bool = False
-    VLLM_RBLN_DECLARE_HELD_PV: bool = False
+    VLLM_RBLN_DECLARE_HELD_PV: bool = True
     VLLM_RBLN_NUM_HIDDEN_LAYERS: int = 0
     VLLM_RBLN_USE_DEVICE_TENSOR: bool = True
     VLLM_RBLN_DISABLE_OFFLOAD: bool = True
@@ -257,7 +257,7 @@ environment_variables = {
     # graph's output takes that output's on-device layout, skipping relocation.
     "VLLM_RBLN_DECLARE_HELD_PV": (
         lambda: (
-            os.environ.get("VLLM_RBLN_DECLARE_HELD_PV", "False").lower()
+            os.environ.get("VLLM_RBLN_DECLARE_HELD_PV", "True").lower()
             in ("true", "1")
         )
     ),
