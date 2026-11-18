@@ -43,33 +43,6 @@ from vllm_rbln.v1.sample.ops.top_k_top_p import build_op_top_k_top_p
 logger = init_logger(__name__)
 
 
-# TODO(yunseong): move this to the runner
-def _stage_into(owner: Any, out: torch.Tensor) -> torch.Tensor:
-    """Snapshot `out` into a buffer belonging to `owner`, alternating two slots.
-
-    `out` is the sampling graph's own output, which the runtime recycles on the
-    next launch. Async holds the sampled tokens past the step boundary, so it
-    gets this copy instead. Enqueued here, next to the launch, and not by the
-    caller: a non_blocking copy is only safe while the source cannot have been
-    recycled yet, and every device op between the two widens that window.
-    """
-    ring = owner._sampled_token_ring
-    if (
-        not ring
-        or ring[0].shape != out.shape
-        or ring[0].dtype != out.dtype
-        or ring[0].device != out.device
-    ):
-        ring = [torch.empty_like(out) for _ in range(2)]
-        owner._sampled_token_ring = ring
-        owner._ring_slot = 0
-    buf = ring[owner._ring_slot]
-    owner._ring_slot ^= 1
-    # non_blocking, or the copy waits on the sampling graph.
-    buf.copy_(out, non_blocking=True)
-    return buf
-
-
 def rbln_top_k_top_p_sample(
     logits: torch.Tensor,
     temperature: torch.Tensor,
@@ -191,7 +164,6 @@ class RBLNTopKTopPSampler(nn.Module):
         temperature: torch.Tensor,
         k: torch.Tensor | None,
         p: torch.Tensor | None,
-        staging_owner: Any = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """More optimized implementation for top-k and top-p sampling.
 
@@ -204,8 +176,6 @@ class RBLNTopKTopPSampler(nn.Module):
             )
 
         out = self._compiled_rbln_topk_topp_sampler(logits, temperature, k, p)
-        if staging_owner is not None:
-            out = _stage_into(staging_owner, out)
         return out, None
 
 
@@ -282,18 +252,14 @@ class RBLNSampler(VLLMSampler):
                     logits.clone(), plan.cidx, plan.lanes
                 )
 
-    def greedy_sample(
-        self, logits: torch.Tensor, staging_owner: Any = None
-    ) -> torch.Tensor:
-        out = self._compiled_greedy_sample(logits)
-        return out if staging_owner is None else _stage_into(staging_owner, out)
+    def greedy_sample(self, logits: torch.Tensor) -> torch.Tensor:
+        return self._compiled_greedy_sample(logits)
 
     def sample(
         self,
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
         logprobs_mode_override: LogprobsMode | None = None,
-        staging_owner: Any = None,
         penalty: FusedPenaltyPlan | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Sample logits based on sampling metadata.
@@ -322,10 +288,8 @@ class RBLNSampler(VLLMSampler):
                 out = self._fused_graph("greedy", penalty)(
                     logits, penalty.cidx, penalty.lanes
                 )
-                if staging_owner is not None:
-                    out = _stage_into(staging_owner, out)
                 return out, processed_logprobs
-            return self.greedy_sample(logits, staging_owner), processed_logprobs
+            return self.greedy_sample(logits), processed_logprobs
 
         assert sampling_metadata.temperature is not None
 
@@ -370,8 +334,6 @@ class RBLNSampler(VLLMSampler):
                 _as_batch_tensor(k),
                 _as_batch_tensor(p),
             )
-            if staging_owner is not None:
-                out = _stage_into(staging_owner, out)
             return out, None
 
         # Apply temperature and top_k and/or top_p.
@@ -381,7 +343,6 @@ class RBLNSampler(VLLMSampler):
             temperature,
             k,
             p,
-            staging_owner,
         )
 
         return random_sampled, processed_logprobs
@@ -392,7 +353,6 @@ class RBLNSampler(VLLMSampler):
         sampling_metadata: SamplingMetadata,
         predict_bonus_token: bool = False,
         logprobs_mode_override: LogprobsMode | None = None,
-        staging_owner: Any = None,
         input_batch: InputBatch | None = None,
     ) -> SamplerOutput:
         logprobs_mode = logprobs_mode_override or self.logprobs_mode
@@ -433,7 +393,7 @@ class RBLNSampler(VLLMSampler):
         )
         # Sample the next token.
         sampled, processed_logprobs = self.sample(
-            logits, sampling_metadata, staging_owner=staging_owner, penalty=penalty
+            logits, sampling_metadata, penalty=penalty
         )
         if processed_logprobs is not None:
             raw_logprobs = processed_logprobs
