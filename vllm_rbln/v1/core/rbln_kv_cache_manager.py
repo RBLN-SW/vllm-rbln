@@ -31,6 +31,7 @@ from vllm.distributed.kv_events import (
     BlockStored,
     KVCacheEvent,
 )
+from vllm.v1.core.kv_cache_coordinator import KVCacheCoordinator
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -45,6 +46,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
     SlidingWindowSpec,
+    iter_layer_specs,
 )
 
 from vllm_rbln.logger import init_logger
@@ -301,7 +303,7 @@ class RBLNKVCacheManager(KVCacheManager):
         """Return True if sub-block caching is applicable to this config.
 
         Sub-block caching requires:
-        1. Every group's spec type must store per-token KV data (allow-listed
+        1. Every layer's spec type must store per-token KV data (allow-listed
            in ``_SUB_BLOCK_ELIGIBLE_SPECS``).
         2. Every group must have block_size > sub_block_size and
            block_size % sub_block_size == 0.
@@ -309,15 +311,15 @@ class RBLNKVCacheManager(KVCacheManager):
         if sub_block_size <= 0:
             return False
         for group in kv_cache_config.kv_cache_groups:
-            spec = group.kv_cache_spec
-            # The shift kernel overwrites the prefix with the latest window.
-            if isinstance(spec, RBLNSlidingWindowSpec):
-                return False
-            if not isinstance(spec, _SUB_BLOCK_ELIGIBLE_SPECS):
-                return False
-            bs = spec.block_size
-            if bs <= sub_block_size or bs % sub_block_size != 0:
-                return False
+            for spec in iter_layer_specs(group.kv_cache_spec):
+                # The shift kernel overwrites the prefix with the latest window.
+                if isinstance(spec, RBLNSlidingWindowSpec):
+                    return False
+                if not isinstance(spec, _SUB_BLOCK_ELIGIBLE_SPECS):
+                    return False
+                bs = spec.block_size
+                if bs <= sub_block_size or bs % sub_block_size != 0:
+                    return False
         return True
 
     def __init__(
@@ -338,6 +340,10 @@ class RBLNKVCacheManager(KVCacheManager):
             enable_caching=True,
             **kwargs,
         )
+        # Sliding-window retention keeps only the blocks a hit at this alignment
+        # can reach, and a sub-block hit ends at any sub-block boundary.
+        for manager in self.coordinator.single_type_managers:
+            manager.cache_hit_alignment_tokens = sub_block_size
 
         self.sub_block_size = sub_block_size
 
@@ -530,6 +536,15 @@ class RBLNKVCacheManager(KVCacheManager):
             self.schedule_sub_block_indexing(request)
 
         return result
+
+    def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
+        # The hybrid coordinator rounds down to its block-aligned hit length,
+        # which leaves a group with smaller blocks nothing to index for a
+        # sub-block hit; the base coordinator caches every full block.
+        if self.enable_caching:
+            KVCacheCoordinator.cache_blocks(
+                self.coordinator, request, num_computed_tokens
+            )
 
     def schedule_sub_block_indexing(self, request: Request) -> None:
         """Record that *request* needs sub-block indexing in the next
@@ -733,7 +748,9 @@ class RBLNKVCacheManager(KVCacheManager):
                 request, state, sub_start, sub_end, first_fresh_idx, gi
             )
 
-            if mark_cached:
+            # A block upstream already keyed (its partial-tail entry, when
+            # hash_block_size < block_size) stays in the LRU cache on its own.
+            if mark_cached and blk.block_hash is None:
                 # Give the block a synthetic block_hash so the upstream block pool
                 # keeps it in the LRU cache instead of immediately reusing it.
                 # The actual value doesn't matter as long as it' unique so that it

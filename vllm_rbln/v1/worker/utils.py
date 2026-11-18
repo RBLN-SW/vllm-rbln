@@ -520,6 +520,7 @@ def estimate_model_kernel_size(
     model_config: ModelConfig,
     parallel_config: ParallelConfig,
     *,
+    num_layers: int,
     nbits_per_param: int | None = None,
     n_model_params: int | float | None = None,
     n_model_bytes: int | float | None = None,
@@ -531,7 +532,6 @@ def estimate_model_kernel_size(
     def align_2MB(x: int | float) -> int:
         return align(x, 2**21)
 
-    num_layers = model_config.get_num_layers(parallel_config)
     vocab_size = model_config.get_vocab_size()
     hidden_size = model_config.get_hidden_size()
     tp_size = parallel_config.tensor_parallel_size
@@ -722,6 +722,7 @@ def estimate_available_memory(
         kernel_size = estimate_model_kernel_size(
             model_config=model_config,
             parallel_config=parallel_config,
+            num_layers=model_config.get_num_layers(parallel_config),
             nbits_per_param=nbits_per_param,
             n_model_params=n_model_params,
             n_model_bytes=n_model_bytes,

@@ -95,6 +95,18 @@ def test_defaults_when_nothing_is_passed(parser):
     assert resolve(parser, []) == RBLNConfig()
 
 
+@pytest.mark.parametrize(
+    "argv, enabled",
+    [
+        ([], True),
+        (["--no-rbln-use-fused-sampling"], False),
+        (["--additional-config", '{"use_fused_sampling": false}'], False),
+    ],
+)
+def test_fused_sampling_can_be_disabled(parser, argv, enabled):
+    assert resolve(parser, argv).use_fused_sampling is enabled
+
+
 def test_flags_reach_the_config(parser):
     config = resolve(
         parser,
@@ -363,6 +375,7 @@ def test_only_compile_fields_change_the_hash():
     """
     base = RBLNConfig().compute_hash()
     assert RBLNConfig(use_custom_sampler=False).compute_hash() == base
+    assert RBLNConfig(use_fused_sampling=False).compute_hash() == base
     assert RBLNConfig(enable_sub_block_cache=False).compute_hash() == base
     assert RBLNConfig(sub_block_size=64).compute_hash() == base
     # mega_cache keys on the buckets the model resolves from this one.

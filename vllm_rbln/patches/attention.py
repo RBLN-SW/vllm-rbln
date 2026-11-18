@@ -34,6 +34,7 @@ from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionBackend,
     RBLNFlashAttentionMetadata,
 )
+from vllm_rbln.v1.attention.backends.gdn_attn import RBLNGDNAttentionMetadata
 from vllm_rbln.v1.attention.kv_cache_bindings import materialize_kv_cache_view
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 
@@ -50,7 +51,8 @@ attention_original_forward = Attention.forward
 # attention metadata's kv cache must equal the attention layer's
 # embedded kv cache.
 def _resolve_kv_cache(
-    attn_metadata: RBLNFlashAttentionMetadata, layer_index: int | None
+    attn_metadata: RBLNFlashAttentionMetadata | RBLNGDNAttentionMetadata,
+    layer_index: int | None,
 ) -> torch.Tensor:
     """Resolve the KV cache for a given layer, either from deduplicated
     base tensors (for torch.export compatibility) or from the direct list."""

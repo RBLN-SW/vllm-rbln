@@ -1,5 +1,5 @@
 env:
-  UV_CACHE_DIR: "/root/.cache/uv"
+  UV_CACHE_DIR: "/mnt/uv_cache"
   UV_LINK_MODE: "symlink"
   UV_INDEX_STRATEGY: "unsafe-best-match"
   # Only the cron schedule sets this, so a manual or re-run build exercises the
@@ -35,7 +35,7 @@ _dshm: &dshm
               medium: Memory
               sizeLimit: 4Gi
 
-_sync: &sync "echo '--- :package: uv sync' && uv sync --locked --python 3.12 --extra test --extra dev --extra runtime"
+_sync: &sync "echo '--- :package: uv sync' && uv sync --locked --python 3.12 --extra test --extra dev --extra runtime --extra kv_connectors"
 
 _measured: &measured
   soft_fail: true
@@ -209,6 +209,7 @@ steps:
         uv run --no-sync python \
           .buildkite/pipelines/vllm-rbln/scripts/sampler-perf/run_benchmarks.py \
           --config "ci-targets/$${BUILDKITE_BUILD_ID}/sampler-perf/benchmark-configs.yaml" \
+          --use-fused-sampling 0 1 \
           --output-dir "$${sampler_output}" || sampler_status=$$?
         if [[ -f "$${sampler_output}/summary.md" ]]; then
           sampler_style=info
