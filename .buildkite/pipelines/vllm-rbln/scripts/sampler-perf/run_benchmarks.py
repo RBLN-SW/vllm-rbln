@@ -369,7 +369,9 @@ def main() -> None:
                 ):
                     parser.error(f"invalid benchmark option name: {key!r}")
                 flag = "--" + key.replace("_", "-")
-                if key == "use_fused_sampling" and type(value) is bool:
+                if key == "logit_bias" and isinstance(value, dict):
+                    arguments.extend([flag, json.dumps(value)])
+                elif key == "use_fused_sampling" and type(value) is bool:
                     arguments.extend([flag, str(int(value))])
                 elif key == "greedy":
                     if type(value) is not bool:
