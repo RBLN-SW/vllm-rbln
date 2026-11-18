@@ -48,12 +48,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         from vllm_rbln.config import get_rbln_config
 
         self.use_w8a8 = get_rbln_config().use_w8a8
-        swiglu_limit = layer.swiglu_limit
-        if self.use_w8a8 and swiglu_limit is not None and swiglu_limit > 0:
-            raise NotImplementedError(
-                f"swiglu_limit {swiglu_limit}: the RBLN W8A8 MoE kernel has no "
-                "SwiGLU clamp; use the fp8 weight-only (W8A16) MoE path"
-            )
 
     def create_weights(
         self,
@@ -337,22 +331,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             :, scale_intermediate_size:, :
         ]
 
-        # SwiGLU clamp: silu(min(gate, L)) * clamp(up, -L, L).
-        swiglu_limit = layer.swiglu_limit
-        hidden_act = layer.activation.value
-        swiglu_kwargs = {}
-        if swiglu_limit is not None and swiglu_limit > 0:
-            if hidden_act not in ("silu", "swish"):
-                raise NotImplementedError(
-                    f"swiglu_limit {swiglu_limit} with activation {hidden_act!r}: "
-                    "the RBLN MoE kernels clamp the SwiGLU (silu) gate only"
-                )
-            hidden_act = "swigluoai"
-            swiglu_kwargs = {
-                "swiglu_alpha": 1.0,
-                "swiglu_limit": float(swiglu_limit),
-                "swiglu_beta": 0.0,
-            }
+        # 0 is upstream's "no clamp"; custom_moe clamps whenever a limit is given.
+        swiglu_limit = layer.swiglu_limit or None
 
         if self.use_w8a8:
             # W8A8: dynamically quantize hidden_states to fp8 per (1, block_k)
@@ -387,6 +367,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 hidden_states_scale=hs_scale,
                 out_dtype=compute_dtype,
                 expert_map=layer.expert_map,
+                swiglu_limit=swiglu_limit,
             )
         else:
             final_hidden_states = torch.ops.rbln_custom_ops.custom_moe(
@@ -395,13 +376,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 up_proj_weight,
                 down_proj_weight,
                 masked_routing_weights,
-                hidden_act,
+                layer.activation.value,
                 gate_proj_scale=gate_proj_weight_scale,
                 up_proj_scale=up_proj_weight_scale,
                 down_proj_scale=down_proj_weight_scale,
                 group_size=int(self.weight_block_size[1]),
                 expert_map=layer.expert_map,
-                **swiglu_kwargs,
+                swiglu_limit=swiglu_limit,
             )
 
         return final_hidden_states.reshape(orig_shape)
