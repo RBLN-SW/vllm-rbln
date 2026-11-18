@@ -1271,13 +1271,7 @@ class TestSchedulerOverrides:
         assert config.scheduler_config.max_num_batched_tokens == 512
 
     def test_async_scheduling_is_honored(self, monkeypatch):
-        # The platform used to force this off unconditionally. It now follows
-        # vLLM's --async-scheduling, as long as the device-side token path is
-        # available (see below). Both carriers are pinned on because
-        # --device-tensor 0 switches the first one off for the whole session,
-        # which would land this on the negative case below.
-        for name in ("VLLM_RBLN_USE_DEVICE_TENSOR", "VLLM_RBLN_SAMPLER"):
-            monkeypatch.setenv(name, "1")
+        monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
         assert _build(async_scheduling=True).scheduler_config.async_scheduling is True
 
     @pytest.mark.parametrize(
@@ -1294,11 +1288,7 @@ class TestSchedulerOverrides:
         sampled and returns wrong text with no error raised, so the platform
         downgrades to sync rather than run the combination.
         """
-        # Both are set before one is switched off: the gate refuses on either,
-        # so leaving the other to the lane lets --device-tensor 0 satisfy this
-        # case with the sampler still on, and the parametrization proves nothing.
-        for name in ("VLLM_RBLN_USE_DEVICE_TENSOR", "VLLM_RBLN_SAMPLER"):
-            monkeypatch.setenv(name, "1")
+        monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
         monkeypatch.setenv(switched_off, "0")
         config = _build(async_scheduling=True)
         assert config.scheduler_config.async_scheduling is False

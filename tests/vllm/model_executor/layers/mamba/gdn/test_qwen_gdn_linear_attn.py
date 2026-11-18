@@ -307,7 +307,7 @@ def test_padded_prefill_then_decode_tracks_hf(
     assert not ring[BLOCK - 1].any() and not ring[BLOCK + 1].any()
 
 
-@pytest.mark.maybe_use_device
+@pytest.mark.use_device
 def test_mtp_adds_a_verify_only_draft_buffer(monkeypatch):
     # The layer as the model builds it; upstream's constructor puts parameters
     # on the device.
