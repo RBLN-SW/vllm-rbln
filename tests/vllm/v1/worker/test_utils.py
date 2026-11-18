@@ -322,6 +322,7 @@ def _make_model_config(
     # Duck-typed stub exposing the config getters the functions read.
     cfg = SimpleNamespace()
     cfg.get_num_layers = lambda pc: num_layers
+    cfg.get_total_num_hidden_layers = lambda: num_layers
     cfg.get_vocab_size = lambda: vocab_size
     cfg.get_hidden_size = lambda: hidden_size
     cfg.get_num_kv_heads = lambda pc: num_kv_heads
@@ -339,6 +340,7 @@ def _make_parallel_config(
     ws = tp_size if world_size is None else world_size
     return SimpleNamespace(
         tensor_parallel_size=tp_size,
+        pipeline_parallel_size=1,
         data_parallel_size=dp_size,
         world_size=ws,
         world_size_across_dp=ws
@@ -399,6 +401,27 @@ def _full_attn(block_size):
 
 
 class TestEstimateModelKernelSize:
+    @pytest.mark.parametrize(
+        "pp_size, rank, expected", [(1, 0, 6_291_456), (2, 1, 4_194_304)]
+    )
+    def test_explicit_pp_partition_only_applies_to_partitioned_models(
+        self, monkeypatch, pp_size, rank, expected
+    ):
+        from vllm.config import ModelConfig, ParallelConfig
+
+        model = object.__new__(ModelConfig)
+        model.model_arch_config = SimpleNamespace(
+            total_num_hidden_layers=2, vocab_size=64, hidden_size=32
+        )
+        parallel = ParallelConfig(pipeline_parallel_size=pp_size, rank=rank)
+        monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "1,1")
+        assert (
+            estimate_model_kernel_size(
+                model, parallel, n_model_bytes=12_288, default_bits_per_param=16
+            )
+            == expected
+        )
+
     def test_bytes_path_exact(self):
         # n_model_bytes path, default bits passed explicitly (no platform mock).
         result = estimate_model_kernel_size(

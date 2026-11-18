@@ -783,6 +783,43 @@ class TestMaybeShrinkKvCacheForCompile:
             for t in config.kv_cache_tensors
         )
 
+    @pytest.mark.parametrize("num_blocks", [1, 211])
+    def test_fixed_only_rank_keeps_its_allocations(self, num_blocks, monkeypatch):
+        from vllm_rbln.v1.kv_cache import RBLNFixedKVCacheTensor
+
+        config = self._config(num_blocks)
+        tensor = RBLNFixedKVCacheTensor(
+            size=4096,
+            layers=["ring"],
+            layer_stride=4096,
+            block_stride=1024,
+            offset=0,
+        )
+        config.kv_cache_tensors = [tensor]
+        sizer, out = self._shrink(config)
+        assert out is config
+        sizer.model_runner = SimpleNamespace(kv_cache_config=out)
+        sizer.device = torch.device("cpu")
+        sizer.cache_config.gpu_memory_utilization = 0.9
+        sizer.memory_snapshot = lambda device: (
+            {(0, 0): dks.ChipletMemory(total=10000, used=8000)},
+            "stub",
+        )
+        monkeypatch.setattr(torch.rbln, "is_dummy_device", lambda: False)
+        assert DynamicKvSizer.compute_num_blocks(sizer) == float("inf")
+        assert DynamicKvSizer.apply_num_blocks(sizer, 1200) == 1200
+        assert config.num_blocks == 1200
+        assert sizer.cache_config.num_gpu_blocks == 1200
+        assert sizer.cache_config.num_cpu_blocks == 1200
+        assert config.kv_cache_tensors == [tensor]
+        assert tensor.layer_stride == tensor.size == 4096
+        sizer.memory_snapshot = lambda device: (
+            {(0, 0): dks.ChipletMemory(total=10000, used=9500)},
+            "stub",
+        )
+        with pytest.raises(RuntimeError, match="exceed the memory budget"):
+            DynamicKvSizer.compute_num_blocks(sizer)
+
     def test_the_flag_off_returns_the_config_untouched(self):
         config = self._config()
         sizer, out = self._shrink(config, dynamic=False)
@@ -1075,7 +1112,9 @@ class TestApplyResizesThenMaterializes:
         sizer = SimpleNamespace(
             kv_blocks_before_shrink=before_shrink,
             model_runner=SimpleNamespace(
-                kv_cache_config=SimpleNamespace(num_blocks=current),
+                kv_cache_config=SimpleNamespace(
+                    num_blocks=current, kv_cache_tensors=[]
+                ),
                 kv_caches=[object()],
             ),
             reallocate=lambda target: calls.append(("realloc", target)),

@@ -561,7 +561,12 @@ class RBLNDeepseekV4Attention(nn.Module):
         else:
             o = torch.ops.rbln_custom_ops.sparse_attn_deepseek_v4_swa(*common)
         # o [B, H, L, D]
-        o, _ = self.rope(positions, o.transpose(1, 2), inverse=True)  # [B, L, H, D]
+        if seq_len > 1:
+            o, _ = self.rope(positions, o, inverse=True, head_major=True)
+            o = o.transpose(1, 2)
+        else:
+            # Per-batch decode positions need token-major rotary lowering at L=1.
+            o, _ = self.rope(positions, o.transpose(1, 2), inverse=True)
         o = o.reshape(batch, seq_len, self.n_local_groups, -1)
         o = torch.matmul(o.transpose(1, 2), self.wo_a_t.to(o.dtype))
         out, _ = self.wo_b(o.transpose(1, 2).flatten(2))

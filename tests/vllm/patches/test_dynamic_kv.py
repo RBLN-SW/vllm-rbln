@@ -106,6 +106,10 @@ class TestResolveRankNumBlocks:
     def test_the_minimum_across_ranks_wins(self):
         assert resolve_rank_num_blocks([304, 274, 280, 274]) == 274
 
+    def test_fixed_only_ranks_do_not_limit_the_paged_pool(self):
+        assert resolve_rank_num_blocks([float("inf"), 274, 280]) == 274
+        assert resolve_rank_num_blocks([float("inf"), float("inf")]) is None
+
     def test_a_mixed_answer_is_one_ranks_failure(self):
         with pytest.raises(RuntimeError, match="some ranks"):
             resolve_rank_num_blocks([274, None])

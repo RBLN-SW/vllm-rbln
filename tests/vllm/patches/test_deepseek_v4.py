@@ -17,6 +17,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from vllm.v1.core import kv_cache_utils
+from vllm.v1.engine import core as engine_core
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     KVCacheGroupSpec,
@@ -152,7 +153,8 @@ def cache_specs():
 def test_fixed_rings_are_reserved_before_paged_sizing(
     cache_config, cache_specs, num_blocks
 ):
-    from vllm.v1.engine.core import get_kv_cache_configs
+    from vllm_rbln.patches.dynamic_kv import check_enough_kv_cache_blocks_after_resize
+    from vllm_rbln.v1.worker.dynamic_kv_sizer import kv_cache_config_at
 
     groups = deepseek_v4_kv_cache_groups(cache_config, cache_specs)
     page = cache_specs["csa"].page_size_bytes + cache_specs["hca"].page_size_bytes
@@ -160,9 +162,14 @@ def test_fixed_rings_are_reserved_before_paged_sizing(
         cache_specs["swa"].page_size_bytes + cache_specs["compressor"].page_size_bytes
     )
     memory = fixed + num_blocks * page
-    cfg = get_kv_cache_configs(cache_config, [cache_specs], [memory])[0]
+    cfg = engine_core.get_kv_cache_configs(cache_config, [cache_specs], [memory])[0]
     assert kv_cache_utils._get_kv_cache_bytes_per_block(groups) == page
     assert cfg.num_blocks == num_blocks
+    check_enough_kv_cache_blocks_after_resize(cache_config, cfg)
+    with pytest.raises(ValueError, match="needs 6"):
+        check_enough_kv_cache_blocks_after_resize(
+            cache_config, kv_cache_config_at(cfg, 5)
+        )
     assert sum(t.layer_stride for t in cfg.kv_cache_tensors) == memory
     assert kv_cache_utils.get_max_concurrency_for_kv_cache_config(
         cache_config, cfg
@@ -183,7 +190,7 @@ def test_pp_reconciliation_keeps_fixed_rings(cache_config, cache_specs, override
         6 * cache_specs["hca"].page_size_bytes,
         3 * cache_specs["compressor"].page_size_bytes,
     ]
-    configs = kv_cache_utils.get_kv_cache_configs(cache_config, workers, memories)
+    configs = engine_core.get_kv_cache_configs(cache_config, workers, memories)
     for cfg, memory in zip(configs, memories, strict=True):
         assert cfg.num_blocks == 6
         assert sum(t.layer_stride for t in cfg.kv_cache_tensors) <= memory
@@ -201,7 +208,7 @@ def test_auto_fit_accounts_for_fixed_rings_and_null_block(cache_config, cache_sp
     fixed = 3 * (
         cache_specs["swa"].page_size_bytes + cache_specs["compressor"].page_size_bytes
     )
-    cfg = kv_cache_utils.get_kv_cache_configs(
+    cfg = engine_core.get_kv_cache_configs(
         cache_config, [cache_specs], [fixed + 5 * page]
     )[0]
     assert cache_config.model_config.max_model_len == 48
@@ -217,7 +224,7 @@ def test_scheduler_admission_and_free_use_independent_ring_pools(
     from tests.vllm.v1.core.utils import make_request
 
     cache_config.cache_config.num_gpu_blocks_override = 64
-    cfg = kv_cache_utils.get_kv_cache_configs(cache_config, [cache_specs], [1 << 20])[0]
+    cfg = engine_core.get_kv_cache_configs(cache_config, [cache_specs], [1 << 20])[0]
     cfg = kv_cache_utils.generate_scheduler_kv_cache_config([cfg])
     manager = KVCacheManager(cfg, 256, 64, 16, enable_caching=False)
     requests = [make_request(str(i), list(range(32)), 16) for i in range(3)]

@@ -203,9 +203,9 @@ def test_compressor_padding_does_not_index_past_the_rope_table(monkeypatch, quer
 @pytest.mark.parametrize("nested", [False, True])
 @pytest.mark.parametrize("ratio", [0, 4, 128])
 @pytest.mark.parametrize("inverse", [False, True])
-@pytest.mark.parametrize("headless", [False, True])
+@pytest.mark.parametrize("layout", ["headless", "token_major", "head_major"])
 def test_rope_resolves_to_the_rbln_op_and_matches_upstream(
-    nested, ratio, inverse, headless
+    nested, ratio, inverse, layout
 ):
     from vllm.config import set_current_vllm_config
     from vllm.models.deepseek_v4.common.rope import build_deepseek_v4_rope
@@ -243,14 +243,54 @@ def test_rope_resolves_to_the_rbln_op_and_matches_upstream(
         )
     assert isinstance(rope, RBLNDeepseekV4ScalingRotaryEmbedding)
     positions = torch.tensor([[0, 13, 65], [127, 129, 255]])
-    shape = (2, 3, 128) if headless else (2, 3, 2, 128)
+    shape = (2, 3, 128) if layout == "headless" else (2, 3, 2, 128)
     x = torch.randn(*shape, generator=torch.Generator().manual_seed(9)).bfloat16()
     # Upstream's forward takes flat positions over [N, H, D] rows.
     expected, _ = rope.forward_native(
         positions.flatten(), x.reshape(6, -1, 128), inverse=inverse
     )
-    actual, _ = rope.forward_oot(positions, x, inverse=inverse)
+    if layout == "head_major":
+        actual, _ = rope.forward_oot(
+            positions, x.transpose(1, 2), inverse=inverse, head_major=True
+        )
+        actual = actual.transpose(1, 2)
+    else:
+        actual, _ = rope.forward_oot(positions, x, inverse=inverse)
     torch.testing.assert_close(actual, expected.reshape_as(x), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_mxfp4_experts_preserve_scales_clamp_and_routing(dtype):
+    from vllm_rbln.model_executor.layers.quantization.deepseek_v4 import (
+        RBLNDeepseekV4Mxfp4MoEMethod,
+    )
+
+    method = object.__new__(RBLNDeepseekV4Mxfp4MoEMethod)
+    method.swiglu_limit = 0.75
+    # Two equal FP4 nibbles per byte: 0x22 = (1, 1), 0x44 = (2, 2),
+    # 0x11 = (0.5, 0.5). Scales produce dense weights 0.5, 0.25 and 0.125.
+    layer = SimpleNamespace(
+        w1_weight=torch.full((1, 32, 16), 0x22, dtype=torch.uint8),
+        w3_weight=torch.full((1, 32, 16), 0x44, dtype=torch.uint8),
+        w2_weight=torch.full((1, 32, 16), 0x11, dtype=torch.uint8),
+        w1_weight_scale=torch.full((1, 32, 1), 0.5, dtype=torch.bfloat16),
+        w3_weight_scale=torch.full((1, 32, 1), 0.125, dtype=torch.bfloat16),
+        w2_weight_scale=torch.full((1, 32, 1), 0.25, dtype=torch.bfloat16),
+        expert_map=None,
+    )
+    x = torch.tensor([-0.25, -0.03125, 0.0625, 0.25], dtype=dtype)
+    x = x.view(2, 2, 1).expand(2, 2, 32).contiguous()
+    routing = torch.tensor([[0.25, 0.5, 1.0, 0.0]], dtype=dtype)
+    gate = torch.nn.functional.linear(x, torch.full((32, 32), 0.5, dtype=dtype))
+    up = torch.nn.functional.linear(x, torch.full((32, 32), 0.25, dtype=dtype))
+    gate, up = gate.clamp(max=0.75), up.clamp(-0.75, 0.75)
+    expected = torch.nn.functional.linear(
+        gate * gate.sigmoid() * up, torch.full((32, 32), 0.125, dtype=dtype)
+    ) * routing.view(2, 2, 1)
+
+    actual = method.apply(layer, x, routing)
+
+    torch.testing.assert_close(actual, expected)
 
 
 @pytest.mark.parametrize("dtype", [torch.uint8, torch.float8_e8m0fnu])
@@ -528,7 +568,7 @@ def test_a_prefill_step_runs_the_mhc_on_the_token_cut_kernels(
     plain = layer(positions, streams, input_ids)
 
     assert calls == ["mix", "read", "write"] * 2
-    torch.testing.assert_close(cut.to(streams.dtype), plain)
+    torch.testing.assert_close(cut, plain)
 
 
 @pytest.mark.parametrize(

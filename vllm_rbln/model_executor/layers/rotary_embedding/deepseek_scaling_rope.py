@@ -85,8 +85,10 @@ class RBLNDeepseekV4ScalingRotaryEmbedding(DeepseekV4ScalingRotaryEmbedding):
         key: torch.Tensor | None = None,
         offsets: torch.Tensor | None = None,
         inverse: bool = False,
+        head_major: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """positions [B, L]; query / key [B, L, ..., D] or head-less [B, L, D]."""
+        """positions [B, L]; query / key [B, L, ..., D], or [B, H, L, D]
+        with head_major=True."""
         if offsets is not None:
             positions = positions + offsets
         batch, seq_len = positions.shape[0], positions.shape[1]
@@ -109,8 +111,11 @@ class RBLNDeepseekV4ScalingRotaryEmbedding(DeepseekV4ScalingRotaryEmbedding):
             if headless:
                 x = x.unsqueeze(2)
             c, s = cos, sin
-            for _ in range(x.dim() - 3):
-                c, s = c.unsqueeze(-2), s.unsqueeze(-2)
+            if head_major:
+                c, s = c.unsqueeze(1), s.unsqueeze(1)
+            else:
+                for _ in range(x.dim() - 3):
+                    c, s = c.unsqueeze(-2), s.unsqueeze(-2)
             nope, rope = x.split([x.shape[-1] - self.rotary_dim, self.rotary_dim], -1)
             rope = rope.float()
             rot = (rope * c + rotate_fn(rope) * s).to(x.dtype)
