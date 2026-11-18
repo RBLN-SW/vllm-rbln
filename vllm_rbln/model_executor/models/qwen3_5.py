@@ -101,32 +101,6 @@ class _RBLNQwen3VisionEncoder(nn.Module):
         return self.visual.merger(x)
 
 
-class RBLNQwen3_5ProcessingInfo(Qwen3_5ProcessingInfo):
-    def get_max_frame_tokens(self, modality: str) -> int:
-        """The processor's upper bound for one encoder run: an image, or one
-        temporal patch of a video, which can take the clip's whole pixel budget."""
-        if modality == "image":
-            return self.get_max_image_tokens()
-        processor = self.get_video_processor()
-        # The clip size upstream's processor resizes to; its
-        # get_max_video_tokens leaves max_pixels out.
-        kwargs = self.ctx.get_merged_mm_kwargs({}, modality="video")
-        size = dict(processor.size) | (kwargs.get("size") or {})
-        if (max_pixels := kwargs.get("max_pixels")) is not None:
-            size["longest_edge"] = max_pixels
-        temporal = self.get_hf_config().vision_config.temporal_patch_size
-        frame = self.get_image_size_with_most_features(
-            max_pixels=size["longest_edge"] // temporal
-        )
-        return self.get_num_video_tokens(
-            image_width=frame.width,
-            image_height=frame.height,
-            num_frames=temporal,
-            image_processor=processor,
-            mm_kwargs={},
-        )
-
-
 class RBLNQwen3_5MultiModalProcessor(Qwen3VLMultiModalProcessor):
     """Upstream's processor, refusing per request an image or a video frame
     above the engine's start-up limit, which the vision encoder buckets are
@@ -146,7 +120,13 @@ class RBLNQwen3_5MultiModalProcessor(Qwen3VLMultiModalProcessor):
             # An input sent as embeddings has a grid too, but skips the encoder.
             if pixels not in outputs:
                 continue
-            limit = self.info.get_max_frame_tokens(modality) * merge**2
+            limit = (
+                self.info.get_mm_max_tokens_per_item(
+                    seq_len=self.info.ctx.model_config.max_model_len,
+                    mm_counts={modality: 1},
+                )[modality]
+                * merge**2
+            )
             for grid in outputs[f"{modality}_grid_thw"].tolist():
                 if grid[1] * grid[2] > limit:
                     raise ValueError(
@@ -161,7 +141,7 @@ class RBLNQwen3_5MultiModalProcessor(Qwen3VLMultiModalProcessor):
 
 @MULTIMODAL_REGISTRY.register_processor(
     RBLNQwen3_5MultiModalProcessor,
-    info=RBLNQwen3_5ProcessingInfo,
+    info=Qwen3_5ProcessingInfo,
     dummy_inputs=Qwen3VLDummyInputsBuilder,
 )
 class RBLNQwen3_5ForConditionalGeneration(
@@ -188,7 +168,11 @@ class RBLNQwen3_5ForConditionalGeneration(
         if self.has_vision:
             info = MULTIMODAL_REGISTRY.get_processing_info(vllm_config.model_config)
             merge = self.visual.spatial_merge_size
-            max_tokens = max(info.get_max_frame_tokens(m) for m in modalities)
+            max_tokens_per_item = info.get_mm_max_tokens_per_item(
+                seq_len=vllm_config.model_config.max_model_len,
+                mm_counts=dict.fromkeys(modalities, 1),
+            )
+            max_tokens = max(max_tokens_per_item[m] for m in modalities)
             rbln_config = vllm_config.additional_config
             # One compiled encoder shape per budget; an image is padded to the
             # smallest that holds its patches.

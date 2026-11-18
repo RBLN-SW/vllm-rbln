@@ -31,6 +31,7 @@ from vllm.distributed import (
 )
 from vllm.model_executor.models.qwen3_vl import Qwen3_VisionTransformer
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.encoder_budget import MultiModalBudget
 
 from tests.vllm.vllm_config import make_vllm_config
 from vllm_rbln.config import RBLNConfig
@@ -84,22 +85,32 @@ def test_video_pruning_is_refused():
 
 
 @pytest.mark.parametrize(
-    ("mm_processor_kwargs", "tokens"),
+    "mm_processor_kwargs",
     [
-        # Two frames of 512 x 512 pixels, 32 pixels a token side.
-        ({"max_pixels": 2 * 512 * 512}, 256),
-        ({"size": {"longest_edge": 2 * 256 * 256}}, 64),
+        None,
+        {"max_pixels": 4194304},
+        {"size": {"longest_edge": 2 * 256 * 256}},
     ],
 )
-def test_a_video_frame_is_bounded_by_the_clip_pixel_budget(mm_processor_kwargs, tokens):
+def test_video_buckets_follow_upstream_encoder_budget(monkeypatch, mm_processor_kwargs):
     vllm_config = make_vllm_config(
         model="Qwen/Qwen3.5-4B",
+        max_num_batched_tokens=512,
         limit_mm_per_prompt={"image": 0, "video": 1},
         mm_processor_kwargs=mm_processor_kwargs,
     )
-    info = MULTIMODAL_REGISTRY.get_processing_info(vllm_config.model_config)
+    budget = MultiModalBudget(vllm_config, MULTIMODAL_REGISTRY, enable_cache=False)
 
-    assert info.get_max_frame_tokens("video") == tokens
+    def init(self, *, vllm_config, prefix="model"):
+        torch.nn.Module.__init__(self)
+        self.visual = SimpleNamespace(spatial_merge_size=MERGE)
+
+    monkeypatch.setattr(qwen3_5.Qwen3_5ForConditionalGeneration, "__init__", init)
+    model = RBLNQwen3_5ForConditionalGeneration(vllm_config=vllm_config)
+
+    assert model.mm_encoder_patch_buckets[-1] == (
+        budget.mm_max_toks_per_item["video"] * MERGE**2
+    )
 
 
 def _build_with_token_budgets(
@@ -115,7 +126,7 @@ def _build_with_token_budgets(
         self.visual = SimpleNamespace(spatial_merge_size=MERGE)
 
     monkeypatch.setattr(qwen3_5.Qwen3_5ForConditionalGeneration, "__init__", init)
-    info = SimpleNamespace(get_max_frame_tokens=bounds.__getitem__)
+    info = SimpleNamespace(get_mm_max_tokens_per_item=lambda **kwargs: bounds)
     monkeypatch.setattr(
         qwen3_5.MULTIMODAL_REGISTRY, "get_processing_info", lambda model_config: info
     )
@@ -124,7 +135,9 @@ def _build_with_token_budgets(
         is_multimodal_pruning_enabled=lambda: False,
     )
     vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(get_multimodal_config=lambda: mm_config),
+        model_config=SimpleNamespace(
+            get_multimodal_config=lambda: mm_config, max_model_len=8192
+        ),
         additional_config=RBLNConfig(
             encoder_token_budgets=budgets, prefill_chunk_size=prefill_chunk_size
         ),
@@ -196,7 +209,8 @@ def test_a_request_frame_above_the_start_up_limit_is_refused(monkeypatch):
     # patches, and of 64 for a video frame, 256 patches.
     processor = RBLNQwen3_5MultiModalProcessor.__new__(RBLNQwen3_5MultiModalProcessor)
     processor.info = SimpleNamespace(
-        get_max_frame_tokens={"image": 256, "video": 64}.__getitem__,
+        ctx=SimpleNamespace(model_config=SimpleNamespace(max_model_len=8192)),
+        get_mm_max_tokens_per_item=lambda **kwargs: {"image": 256, "video": 64},
         get_hf_config=lambda: SimpleNamespace(
             vision_config=SimpleNamespace(spatial_merge_size=MERGE)
         ),
