@@ -123,7 +123,6 @@ def run_mm_encoder(encoder, inputs, num_embeddings, *, dtype=None, device="cpu")
         )
     output_device = inputs[0].device if device is None else torch.device(device)
     if output_device.type == "rbln":
-        # Exclude pending input preparation and work from earlier calls.
         torch.rbln.current_stream(output_device).synchronize()
     start = time.perf_counter()
     output = _run_mm_encoder(
