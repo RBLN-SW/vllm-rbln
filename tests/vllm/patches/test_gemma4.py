@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Gemma4's attention backend choice on RBLN.
+"""Gemma4 on RBLN: the attention backend choice, the decoder layer forward
+(MoE routing, the dense prefill residual on the token-cut ops) and the split MLP.
 
-Config objects only -- no checkpoint, no device.
+Config objects and stand-in layers only -- no checkpoint, no device.
 """
 
 from types import SimpleNamespace
@@ -115,3 +116,121 @@ def test_the_split_mlp_matches_the_merged_one():
 
     torch.testing.assert_close(split_gate_up_mlp_forward(mlp, x), merged)
     assert not hasattr(mlp.gate_up_proj, "weight")
+
+
+def _rms_norm(x, weight, eps):
+    """vLLM's RMSNorm math: fp32 statistics, cast back before the weight."""
+    rows = x.float()
+    normed = rows * (rows.pow(2).mean(dim=-1, keepdim=True) + eps).rsqrt()
+    return (normed.to(weight.dtype) * weight).to(x.dtype)
+
+
+def _dense_layer(hidden=64):
+    """A dense Gemma4DecoderLayer's residual path around stand-in blocks, each
+    norm with its own eps."""
+    import torch
+
+    layer = SimpleNamespace(enable_moe_block=False, per_layer_input_gate=None)
+    for i, name in enumerate(
+        (
+            "input_layernorm",
+            "post_attention_layernorm",
+            "pre_feedforward_layernorm",
+            "post_feedforward_layernorm",
+        )
+    ):
+        eps = (i + 1) * 1e-6
+        weight = 1.0 + 0.1 * torch.randn(hidden)
+        setattr(layer, name, _Norm(weight, eps))
+    attn = torch.randn(hidden, hidden) / hidden**0.5
+    mlp = torch.randn(hidden, hidden) / hidden**0.5
+    layer.self_attn = lambda positions, hidden_states: hidden_states @ attn
+    layer.mlp = lambda x: x @ mlp
+    layer.layer_scalar = torch.tensor([0.75])
+    return layer
+
+
+class _Norm:
+    def __init__(self, weight, eps):
+        self.weight = weight
+        self.variance_epsilon = eps
+
+    def __call__(self, x):
+        return _rms_norm(x, self.weight, self.variance_epsilon)
+
+
+def _token_cut_ops(monkeypatch):
+    """The two ops as their CPU math, recording each call."""
+    import torch
+
+    calls = []
+
+    def read(residual, weight, eps):
+        calls.append("read")
+        return _rms_norm(residual, weight, eps)
+
+    def write(residual, y, weight, eps):
+        calls.append("write")
+        return _rms_norm(y, weight, eps) + residual
+
+    ops = torch.ops.rbln_custom_ops
+    monkeypatch.setattr(ops, "residual_read", read, raising=False)
+    monkeypatch.setattr(ops, "gemma4_dense_residual_write", write, raising=False)
+    return calls
+
+
+def _run(layer, hidden_states, prefill, monkeypatch, **kwargs):
+    import torch
+
+    from vllm_rbln.patches import gemma4
+
+    monkeypatch.setattr(gemma4, "is_prefill_step", lambda: prefill)
+    positions = torch.arange(hidden_states.shape[-2])
+    out, _ = gemma4.patched_gemma4_decoder_layer_forward(
+        layer, positions, hidden_states, None, **kwargs
+    )
+    return out
+
+
+def test_the_dense_prefill_residual_runs_on_the_token_cut_ops(monkeypatch):
+    import torch
+
+    torch.manual_seed(0)
+    calls = _token_cut_ops(monkeypatch)
+    layer = _dense_layer()
+    hidden_states = torch.randn(1, 8, 64)
+
+    cut = _run(layer, hidden_states, True, monkeypatch)
+    assert calls == ["read", "write", "read", "write"]
+    plain = _run(layer, hidden_states, False, monkeypatch)
+    torch.testing.assert_close(cut, plain)
+
+
+def test_decode_keeps_the_plain_layer(monkeypatch):
+    import torch
+
+    calls = _token_cut_ops(monkeypatch)
+
+    _run(_dense_layer(), torch.randn(4, 1, 64), False, monkeypatch)
+
+    assert calls == []
+
+
+def test_a_per_layer_input_keeps_the_plain_layer(monkeypatch):
+    import torch
+
+    calls = _token_cut_ops(monkeypatch)
+    layer = _dense_layer()
+    layer.per_layer_input_gate = lambda x: x[..., :8]
+    layer.per_layer_projection = lambda x: x.repeat(1, 1, 8)
+    layer.post_per_layer_input_norm = lambda x: x
+
+    _run(
+        layer,
+        torch.randn(1, 8, 64),
+        True,
+        monkeypatch,
+        per_layer_input=torch.randn(1, 8, 8),
+    )
+
+    assert calls == []

@@ -20,7 +20,7 @@ register_patch(
     reason=(
         "Replace upstream Fp8MoEMethod with the RBLN block-fp8 MoE method. "
         "It dequantizes fp8 weights to bf16 and runs the "
-        "custom_moe_glu_group_dequantize op with pre-computed routing weights "
+        "custom_moe op with pre-computed routing weights "
         "supplied by RBLNMoERunner (topk/softmax done outside the op)."
     ),
 )(Fp8MoEMethod)

@@ -219,15 +219,17 @@ class RBLNScheduler(Scheduler):
         )
 
         # NOTE(RBLN): the sparse-attention ops (DSA MLA / indexer, MiniMax-M3
-        # MSA / indexer, GLM5 MLA / indexer) get NULL_BLOCK_ID as null_block_id
-        # and write their context-parallel cache store's unowned rows there, so
-        # the block the pool reserves has to be that one. Checked once the KV
-        # cache manager is final (it may be swapped above).
+        # MSA / indexer, GLM5 MLA / indexer) and the dense in-memory ones
+        # (flash_causal_attention_naive, flash_attention_naive,
+        # paged_flash_causal_mla_naive) get NULL_BLOCK_ID as null_block_id and
+        # write their context-parallel cache store's unowned rows there, so the
+        # block the pool reserves has to be that one. Checked once the KV cache
+        # manager is final (it may be swapped above).
         null_block_id = self.kv_cache_manager.block_pool.null_block.block_id
         if null_block_id != NULL_BLOCK_ID:
             raise RuntimeError(
                 f"vLLM's null block is {null_block_id}, not NULL_BLOCK_ID "
-                f"({NULL_BLOCK_ID}); the RBLN sparse-attention cache store writes "
+                f"({NULL_BLOCK_ID}); the RBLN attention cache store writes "
                 "to NULL_BLOCK_ID and would corrupt a live block."
             )
 
