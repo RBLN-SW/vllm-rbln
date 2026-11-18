@@ -114,7 +114,7 @@ def _assert_conv_rows(
 
 
 class TestBuilder:
-    @pytest.mark.maybe_use_device
+    @pytest.mark.use_device
     @pytest.mark.parametrize("is_prefill", [False, True])
     @pytest.mark.parametrize("defer_staging", [False, True])
     @pytest.mark.parametrize("mamba_cache_mode", ["none", "align"])

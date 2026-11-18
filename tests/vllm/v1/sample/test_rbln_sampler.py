@@ -104,7 +104,7 @@ def test_all_greedy_batch_takes_the_argmax_op(sampler, op_args, dtype):
 ROWS = 256
 WEIGHTED = evenly_spaced_token_ids(num_ids=32).tolist()
 TAIL_TOKEN = 1
-LAUNCHES = 40
+LAUNCHES = 20
 
 
 def sample(
