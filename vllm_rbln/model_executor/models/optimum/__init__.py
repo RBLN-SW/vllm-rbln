@@ -23,9 +23,10 @@ from vllm_rbln.model_executor.models.optimum.base import (
 from vllm_rbln.utils.optimum.predicates import is_qwen3_reranker
 from vllm_rbln.utils.optimum.registry import (
     _RBLN_MULTIMODAL_MODELS,
+    is_decoder_pooling_arch,
     is_enc_dec_arch,
+    is_encoder_pooling_arch,
     is_multi_modal,
-    is_pooling_arch,
 )
 
 from .blip2 import RBLNOptimumBlip2ForConditionalGeneration  # noqa: F401
@@ -43,8 +44,8 @@ from .qwen2_vl import (  # noqa: F401
     RBLNOptimumQwen2_5_VLForConditionalGeneration,
     RBLNOptimumQwen2VLForConditionalGeneration,
 )
+from .qwen3 import RBLNOptimumQwen3ForSequenceClassification, RBLNOptimumQwen3Model
 from .qwen3_asr import RBLNOptimumQwen3ASRForConditionalGeneration  # noqa: F401
-from .qwen3_reranker import RBLNOptimumQwen3RerankerModel
 from .qwen3_vl import (  # noqa: F401
     RBLNOptimumQwen3_5ForConditionalGeneration,
     RBLNOptimumQwen3VLForConditionalGeneration,
@@ -97,10 +98,12 @@ def load_model(vllm_config: VllmConfig) -> nn.Module:
             "Prefix caching is not supported with pooling models. Please set "
             "`enable_prefix_caching` to False."
         )
-        rbln_model = RBLNOptimumQwen3RerankerModel(vllm_config)
-    elif is_pooling_arch(model_config.hf_config):
+        rbln_model = RBLNOptimumQwen3ForSequenceClassification(vllm_config)
+    elif is_decoder_pooling_arch(model_config.hf_config):
+        rbln_model = RBLNOptimumQwen3Model(vllm_config)
+    elif is_encoder_pooling_arch(model_config.hf_config):
         assert vllm_config.cache_config.enable_prefix_caching in (False, None), (
-            "Prefix caching is not supported with pooling models. Please set "
+            "Prefix caching is not supported with encoder pooling models. Please set "
             "`enable_prefix_caching` to False."
         )
         rbln_model = RBLNOptimumForEncoderModel(vllm_config)

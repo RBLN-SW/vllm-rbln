@@ -411,6 +411,11 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
 
         with record_function_or_nullcontext("rbln_model_runner: postprocess"):
             if self.is_pooling_model:
+                # The scheduler counts the whole prompt even on a cache hit.
+                # The pooling cursor indexes only the hidden states we computed.
+                if model_input.is_prompt:
+                    num_scheduled_tokens = model_input.input_tokens.shape[1]
+                    num_scheduled_tokens_np[0] = num_scheduled_tokens
                 output = self._pool(
                     hidden_states, num_scheduled_tokens, num_scheduled_tokens_np
                 )
