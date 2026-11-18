@@ -47,6 +47,7 @@ class RBLNGDNBlockAuxCache(nn.Module, AttentionLayerBase):
         block_shape: tuple[int, ...],
         dtype: torch.dtype,
         prefix_cacheable: bool = True,
+        verify_only: bool = False,
     ) -> None:
         super().__init__()
         self.prefix = prefix
@@ -54,6 +55,7 @@ class RBLNGDNBlockAuxCache(nn.Module, AttentionLayerBase):
         self.block_shape = block_shape
         self.dtype = dtype
         self.prefix_cacheable = prefix_cacheable
+        self.verify_only = verify_only
         self.kv_cache = torch.tensor([])
         # Index among the graph's KV cache inputs, assigned by the runner.
         self.layer_index: int | None = None
@@ -69,7 +71,11 @@ class RBLNGDNBlockAuxCache(nn.Module, AttentionLayerBase):
 
     def get_aux_cache_spec(self, vllm_config: VllmConfig) -> RBLNBlockAuxSpec:
         return RBLNBlockAuxSpec(
-            self.owner, self.block_shape, self.dtype, self.prefix_cacheable
+            self.owner,
+            self.block_shape,
+            self.dtype,
+            prefix_cacheable=self.prefix_cacheable,
+            verify_only=self.verify_only,
         )
 
     def get_attn_backend(self) -> type[RBLNGDNAttentionBackend]:
@@ -140,6 +146,7 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 block_shape=(heads_k, 2 * ratio + 1, self.num_drafts, self.head_k_dim),
                 dtype=model_config.dtype,
                 prefix_cacheable=False,
+                verify_only=True,
             )
 
     def get_state_shape(self) -> tuple[tuple[int, ...]]:

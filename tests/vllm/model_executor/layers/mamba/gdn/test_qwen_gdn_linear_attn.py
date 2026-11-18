@@ -306,6 +306,42 @@ def test_padded_prefill_then_decode_tracks_hf(
     assert not ring[BLOCK - 1].any() and not ring[BLOCK + 1].any()
 
 
+@pytest.mark.maybe_use_device
+def test_mtp_adds_a_verify_only_draft_buffer(monkeypatch):
+    # The layer as the model builds it; upstream's constructor puts parameters
+    # on the device.
+    import vllm.distributed.parallel_state as parallel_state
+
+    config = make_vllm_config(block_size=256, dtype="bfloat16")
+    text = config.model_config.hf_text_config
+    text.linear_num_key_heads = HEADS_K
+    text.linear_num_value_heads = HEADS_V
+    text.linear_key_head_dim = text.linear_value_head_dim = HEAD_DIM
+    text.linear_conv_kernel_dim = KERNEL
+    config.speculative_config = SimpleNamespace(num_speculative_tokens=2)
+    monkeypatch.setattr(
+        config.model_config, "_architecture", "Qwen3_5ForConditionalGeneration"
+    )
+    monkeypatch.setattr(
+        parallel_state, "_TP", SimpleNamespace(world_size=1, rank_in_group=0)
+    )
+    with set_current_vllm_config(config):
+        RBLNQwenGatedDeltaNetAttention(text, config, PREFIX)
+    specs = {
+        name.removeprefix(PREFIX): module.get_aux_cache_spec(config)
+        for name, module in config.compilation_config.static_forward_context.items()
+        if hasattr(module, "get_aux_cache_spec")
+    }
+    ring, drafts = specs[".conv_ring"], specs[".drafts"]
+    # The ring holds the two drafts beside the taps.
+    assert ring.block_shape == (KERNEL - 1 + 2, 1, CONV_DIM // 64, 64)
+    assert (ring.prefix_cacheable, ring.verify_only) == (True, False)
+    # Only a verify step reads the drafts, and a prefix resuming at a block
+    # boundary replays none.
+    assert drafts.block_shape == (HEADS_K, 2 * (HEADS_V // HEADS_K) + 1, 2, HEAD_DIM)
+    assert (drafts.prefix_cacheable, drafts.verify_only) == (False, True)
+
+
 def _decoded(vllm_config, num_drafts: int, windows, monkeypatch, shared_binding):
     """A 70-token prefill, then `windows` of (tokens, position, valid tokens,
     drafts of the window before that were accepted) on a bfloat16 layer, the
