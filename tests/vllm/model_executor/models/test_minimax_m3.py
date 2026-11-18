@@ -1009,6 +1009,7 @@ def test_minimax_m3_indexer_cache_declares_kv_cache_subindex():
             head_dim=128, prefix="model.layers.0.self_attn.attn.indexer"
         )
 
+    assert config.compilation_config.static_forward_context[cache.prefix] is cache
     assert cache.kv_cache_subindex == 1
 
 

@@ -15,6 +15,7 @@
 from collections.abc import Sequence
 from dataclasses import dataclass
 from math import prod
+from typing import Any
 
 import torch
 from vllm.config import VllmConfig
@@ -23,6 +24,27 @@ from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
 from vllm.v1.kv_cache_interface import SlidingWindowSpec
 from vllm.v1.request import Request
+
+
+def register_aux_kv_cache(
+    context: dict[str, Any],
+    name: str,
+    cache: torch.nn.Module,
+    *,
+    subindex: int,
+    already_registered: bool = False,
+) -> None:
+    """Register a cache whose module path has no numeric slot of its own."""
+    if subindex < 1:
+        raise ValueError(f"Auxiliary cache {name} requires a positive subindex")
+    if already_registered:
+        if context.get(name) is not cache:
+            raise ValueError(f"Expected upstream to register auxiliary cache {name}")
+    elif name in context:
+        raise ValueError(f"Duplicate layer name: {name}")
+
+    cache.kv_cache_subindex = subindex
+    context[name] = cache
 
 
 @dataclass(frozen=True)
