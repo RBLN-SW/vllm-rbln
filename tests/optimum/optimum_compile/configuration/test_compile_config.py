@@ -19,10 +19,11 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from huggingface_hub import ResolvedRevision
 from optimum.rbln import RBLNAutoModelForCausalLM
 from transformers import GptOssConfig, LlamaConfig, PretrainedConfig, Qwen3Config
 
-from vllm_rbln.config import build_optimum_rbln_config
+from vllm_rbln.config import OptimumWeightsIdentity, build_optimum_rbln_config
 from vllm_rbln.utils.optimum.configuration import sync
 from vllm_rbln.utils.optimum.configuration.compile_config import (
     compile_cache_name,
@@ -175,6 +176,42 @@ class TestQwen35ConfigBuilder:
 
 @pytest.mark.usefixtures("compile_environment")
 class TestCompileCacheName:
+    def test_hub_commit_changes_hash(self, vllm_config_factory):
+        cfg = vllm_config_factory(sync_config=False)
+        model_config = cfg.model_config
+        first_sha = "a" * 40
+        model_config.revision = ResolvedRevision(first_sha, "main", model_config.model)
+        first = prepare_compile_config(cfg)
+        assert first.weights_identity == OptimumWeightsIdentity("hub", first_sha)
+
+        model_config.revision = first_sha
+        assert compile_cache_name(prepare_compile_config(cfg)) == compile_cache_name(
+            first
+        )
+
+        model_config.revision = ResolvedRevision("b" * 40, "main", model_config.model)
+        assert compile_cache_name(prepare_compile_config(cfg)) != compile_cache_name(
+            first
+        )
+
+    def test_hub_config_commit_fallback_requires_same_repository(
+        self, vllm_config_factory
+    ):
+        cfg = vllm_config_factory(sync_config=False)
+        cfg.model_config.revision = "main"
+        cfg.model_config.hf_config._commit_hash = "a" * 40
+        assert prepare_compile_config(cfg).weights_identity == OptimumWeightsIdentity(
+            "hub", "a" * 40
+        )
+
+        cfg.model_config.hf_config_path = "other/config"
+        assert prepare_compile_config(cfg).weights_identity is None
+
+        cfg.model_config.revision = "b" * 40
+        assert prepare_compile_config(cfg).weights_identity == OptimumWeightsIdentity(
+            "hub", "b" * 40
+        )
+
     def test_local_weight_metadata_changes_hash(
         self, monkeypatch, tmp_path, vllm_config_factory
     ):
@@ -195,7 +232,11 @@ class TestCompileCacheName:
         def cache_name():
             cfg = vllm_config_factory(sync_config=False)
             cfg.model_config.model = str(tmp_path)
-            return compile_cache_name(prepare_compile_config(cfg))
+            cfg.model_config.hf_config._commit_hash = "a" * 40
+            inputs = prepare_compile_config(cfg)
+            assert inputs.weights_identity is not None
+            assert inputs.weights_identity.source == "local"
+            return compile_cache_name(inputs)
 
         initial = cache_name()
         assert cache_name() == initial

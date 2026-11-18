@@ -24,9 +24,13 @@ from copy import deepcopy
 
 import pytest
 import torch
-from transformers import Gemma4Config, LlamaConfig, PretrainedConfig
+from transformers import Gemma4Config, GptOssConfig, LlamaConfig, PretrainedConfig
 
-from vllm_rbln.config import OptimumRBLNCompileConfig, OptimumRBLNConfig
+from vllm_rbln.config import (
+    OptimumRBLNCompileConfig,
+    OptimumRBLNConfig,
+    OptimumWeightsIdentity,
+)
 from vllm_rbln.model_executor.models.optimum import model_base
 from vllm_rbln.model_executor.models.optimum.model_base import RBLNOptimumModelBase
 from vllm_rbln.utils.optimum.configuration.rbln_config import get_field
@@ -37,7 +41,14 @@ class ExternalConfig(PretrainedConfig):
 
 
 def _init_model_with(
-    monkeypatch, tmp_path, hf_config, *, precompiled=False, hf_snapshot=None
+    monkeypatch,
+    tmp_path,
+    hf_config,
+    *,
+    precompiled=False,
+    hf_snapshot=None,
+    weights_identity=None,
+    model_cls_name="FakeRBLNModel",
 ) -> dict:
     passed = {}
 
@@ -55,7 +66,7 @@ def _init_model_with(
         model_base.optimum.rbln, "FakeRBLNModel", FakeRBLNModel, raising=False
     )
     monkeypatch.setattr(
-        model_base, "get_rbln_model_info", lambda cfg: ("fake", "FakeRBLNModel")
+        model_base, "get_rbln_model_info", lambda cfg: ("fake", model_cls_name)
     )
     obj = RBLNOptimumModelBase.__new__(RBLNOptimumModelBase)
     obj.model_config = types.SimpleNamespace(
@@ -63,6 +74,7 @@ def _init_model_with(
         model="repo",
         max_model_len=4096,
         dtype=torch.float16,
+        hf_token=True,
     )
     obj.scheduler_config = types.SimpleNamespace(
         max_num_seqs=1, max_num_batched_tokens=128
@@ -80,6 +92,7 @@ def _init_model_with(
                 hf_config=deepcopy(hf_config if hf_snapshot is None else hf_snapshot),
                 npu_name="RBLN-CA25",
                 rbln_config={"prefill_chunk_size": 256},
+                weights_identity=weights_identity,
             ),
         ),
         model_config=obj.model_config,
@@ -181,13 +194,46 @@ def test_compilation_uses_hf_snapshot_after_original_changes(
 
 def test_compilation_uses_the_inputs_that_were_hashed(monkeypatch, tmp_path):
     hf_config = ExternalConfig(architectures=["Qwen3ForCausalLM"], num_hidden_layers=2)
-    passed = _init_model_with(monkeypatch, tmp_path, hf_config)
+    passed = _init_model_with(
+        monkeypatch,
+        tmp_path,
+        hf_config,
+        weights_identity=OptimumWeightsIdentity("local", "a" * 64),
+    )
     assert passed["model"] == "compile-source"
     assert passed["dtype"] == torch.bfloat16
     assert passed["rbln_config"] == {"prefill_chunk_size": 256}
+    assert "revision" not in passed
 
     passed["rbln_config"]["prefill_chunk_size"] = 512
     assert passed["compile_config"].rbln_config["prefill_chunk_size"] == 256
+
+
+@pytest.mark.parametrize(
+    ("config_cls", "model_cls_name"),
+    [
+        (LlamaConfig, "RBLNLlamaForCausalLM"),
+        (GptOssConfig, "RBLNGptOssForCausalLM"),
+    ],
+)
+def test_hub_compilation_pins_weight_loading_to_the_hashed_commit(
+    monkeypatch, tmp_path, config_cls, model_cls_name
+):
+    config = config_cls(_commit_hash="b" * 40)
+    commit = "a" * 40
+    passed = _init_model_with(
+        monkeypatch,
+        tmp_path,
+        config,
+        weights_identity=OptimumWeightsIdentity("hub", commit),
+        model_cls_name=model_cls_name,
+    )
+
+    assert passed["model"] == "compile-source"
+    assert passed["revision"] == commit
+    assert passed["token"] is True
+    assert passed["config"]._commit_hash == commit
+    assert passed["compile_config"].hf_config._commit_hash == "b" * 40
 
 
 @pytest.mark.parametrize("precompiled", [False, True])

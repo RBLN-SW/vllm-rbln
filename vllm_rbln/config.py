@@ -226,6 +226,12 @@ class RBLNConfig(RBLNConfigBase):
             self.prefill_chunk_size = sorted(sizes)
 
 
+@dataclass(frozen=True)
+class OptimumWeightsIdentity:
+    source: Literal["local", "hub"]
+    value: str
+
+
 @dataclass
 class OptimumRBLNCompileConfig:
     """Resolved model compilation settings shared by cache hashing and compilation.
@@ -240,7 +246,7 @@ class OptimumRBLNCompileConfig:
     # Keep third-party config dataclasses opaque to pydantic validation.
     hf_config: Any
     npu_name: str
-    local_weights_fingerprint: str | None = None
+    weights_identity: OptimumWeightsIdentity | None = None
 
 
 @vllm_config_dataclass

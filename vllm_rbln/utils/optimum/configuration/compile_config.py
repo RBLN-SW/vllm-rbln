@@ -18,14 +18,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from copy import deepcopy
 from dataclasses import fields
 from pathlib import Path
 from stat import S_ISREG
 from typing import TYPE_CHECKING, Any
 
+from vllm import envs as vllm_envs
+
 from vllm_rbln import envs
-from vllm_rbln.config import OptimumRBLNCompileConfig
+from vllm_rbln.config import OptimumRBLNCompileConfig, OptimumWeightsIdentity
 from vllm_rbln.logger import init_logger
 from vllm_rbln.utils.optimum.registry import (
     get_rbln_model_info,
@@ -45,11 +48,13 @@ from .rbln_config import (
 )
 
 if TYPE_CHECKING:
-    from vllm.config import VllmConfig
+    from vllm.config import ModelConfig, VllmConfig
 else:
     VllmConfig = None
 
 logger = init_logger(__name__)
+
+_HUB_COMMIT_SHA = re.compile(r"[0-9a-f]{40}")
 
 
 # Keys that affect only loading the compiled model, not the compiled binary,
@@ -81,8 +86,14 @@ def compile_cache_name(compile_config: OptimumRBLNCompileConfig) -> str:
     }
     config_dict["rbln_config"] = _strip_load_only_keys(config_dict["rbln_config"])
     config_dict["hf_config"] = compile_config.hf_config.to_dict()
-    if compile_config.local_weights_fingerprint is None:
-        del config_dict["local_weights_fingerprint"]
+    weights_identity = compile_config.weights_identity
+    if weights_identity is None:
+        del config_dict["weights_identity"]
+    else:
+        config_dict["weights_identity"] = (
+            weights_identity.source,
+            weights_identity.value,
+        )
     model_name = str(config_dict["model"])
 
     config_json = json.dumps(config_dict, sort_keys=True, default=str)
@@ -117,6 +128,30 @@ def _local_weights_fingerprint(model_path: Path) -> str | None:
             weights.append((name, info.st_size, info.st_mtime_ns, info.st_ctime_ns))
     fingerprint = json.dumps((weights, indexes), sort_keys=True).encode()
     return hashlib.sha256(fingerprint).hexdigest()
+
+
+def _resolve_weights_identity(
+    model_config: ModelConfig,
+) -> OptimumWeightsIdentity | None:
+    model = str(model_config.model)
+    fingerprint = _local_weights_fingerprint(Path(model))
+    if fingerprint is not None:
+        return OptimumWeightsIdentity(source="local", value=fingerprint)
+    if vllm_envs.VLLM_USE_MODELSCOPE:
+        return None
+
+    # vLLM resolves Hub refs before loading the Transformers config.
+    revision = getattr(model_config, "revision", None)
+    commit = getattr(revision, "resolved", revision)
+    if commit and _HUB_COMMIT_SHA.fullmatch(commit):
+        return OptimumWeightsIdentity(source="hub", value=commit)
+
+    config_source = getattr(model_config, "hf_config_path", None) or model
+    if config_source == model:
+        commit = getattr(model_config.hf_config, "_commit_hash", None)
+        if commit and _HUB_COMMIT_SHA.fullmatch(commit):
+            return OptimumWeightsIdentity(source="hub", value=commit)
+    return None
 
 
 def merge_overrides(base: dict, overrides: dict) -> None:
@@ -292,15 +327,14 @@ def prepare_compile_config(vllm_config: VllmConfig) -> OptimumRBLNCompileConfig:
             )
         merge_overrides(rbln_config, optimum_overrides)
 
-    model = str(model_config.model)
     return OptimumRBLNCompileConfig(
-        model=model,
+        model=str(model_config.model),
         dtype=model_config.dtype,
         model_cls=model_cls.__name__,
         rbln_config=rbln_config,
         hf_config=deepcopy(hf_config),
         npu_name=RblnPlatform.get_device_name().strip().upper(),
-        local_weights_fingerprint=_local_weights_fingerprint(Path(model)),
+        weights_identity=_resolve_weights_identity(model_config),
     )
 
 
