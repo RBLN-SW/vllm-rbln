@@ -2416,7 +2416,9 @@ class TestStateBoundaryAdmission:
     prompt's last block boundary: block 16, a 40-token prompt, 39 received."""
 
     @staticmethod
-    def _scheduler(monkeypatch, *, sends_state_boundary, is_async=False):
+    def _scheduler(
+        monkeypatch, *, sends_state_boundary, is_async=False, in_multi=False
+    ):
         from vllm.v1.core.single_type_kv_cache_manager import (
             register_all_kvcache_specs,
         )
@@ -2456,17 +2458,33 @@ class TestStateBoundaryAdmission:
             max_num_batched_tokens=16,
             max_model_len=128,
             num_blocks=64,
-            use_kv_connector=MockKVConfig(matched_tokens=39, is_async=is_async),
+            use_kv_connector=MockKVConfig(
+                matched_tokens=39, is_async=is_async, in_multi_connector=in_multi
+            ),
             kv_cache_config=config,
         )
 
+    @pytest.mark.parametrize("in_multi", [False, True])
     @pytest.mark.parametrize("sends_state_boundary", [True, False])
     def test_the_boundary_block_is_allocated_where_the_connector_sends_it(
-        self, monkeypatch, sends_state_boundary
+        self, monkeypatch, sends_state_boundary, in_multi
     ):
+        from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
+            MultiConnector,
+        )
+
         from vllm_rbln.v1.kv_cache import REMOTE_STATE_BOUNDARY
 
-        sched = self._scheduler(monkeypatch, sends_state_boundary=sends_state_boundary)
+        # The mock child is not `SupportsHMA`, which a hybrid engine requires.
+        monkeypatch.setattr(
+            MultiConnector, "all_children_support_hma", classmethod(lambda *_: True)
+        )
+        sched = self._scheduler(
+            monkeypatch,
+            sends_state_boundary=sends_state_boundary,
+            in_multi=in_multi,
+        )
+        assert isinstance(sched.connector, MultiConnector) is in_multi
         request = make_request("d", list(range(40)), 16)
         request.kv_transfer_params = {
             "do_remote_prefill": True,
@@ -2489,7 +2507,9 @@ class TestStateBoundaryAdmission:
         from tests.vllm.v1.core.utils import MockKVConnector
         from vllm_rbln.v1.kv_cache import REMOTE_STATE_BOUNDARY
 
-        # Upstream reports failed receives only for HMA connectors.
+        # The `fail` row finishes the request, and upstream's
+        # `_connector_finished` asserts one KV cache group unless the
+        # connector is `SupportsHMA`.
         monkeypatch.setattr(upstream_scheduler, "SupportsHMA", MockKVConnector)
         monkeypatch.setattr(
             MockKVConnector,
