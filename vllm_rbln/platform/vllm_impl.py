@@ -98,6 +98,15 @@ def _uses_gated_delta_net(model_config) -> bool:
     return getattr(text_config, "model_type", None) == "qwen3_5_text"
 
 
+def _keeps_recurrent_state(vllm_config: "VllmConfig") -> bool:
+    """A language model with a recurrent state a request beside its KV cache:
+    GLM-5.3's KDA layers or GatedDeltaNet ones."""
+    model_config = vllm_config.model_config
+    return model_config.hf_text_config.model_type == "glm5_next_text" or (
+        _uses_gated_delta_net(model_config) and not vllm_config.is_mm_encoder_only
+    )
+
+
 def _uses_model_parallel(parallel_config) -> bool:
     return (
         parallel_config.tensor_parallel_size > 1
@@ -249,9 +258,7 @@ def _validate(vllm_config: "VllmConfig") -> None:
             )
 
     cache_config = vllm_config.cache_config
-    if cache_config.enable_prefix_caching and (
-        text_config.model_type == "glm5_next_text" or uses_gdn
-    ):
+    if cache_config.enable_prefix_caching and _keeps_recurrent_state(vllm_config):
         if (
             cache_config.user_specified_mamba_block_size
             and cache_config.mamba_block_size != cache_config.block_size
@@ -589,17 +596,17 @@ def _override(vllm_config: "VllmConfig") -> None:
 
     cache_config = vllm_config.cache_config
     if (
-        model_config.hf_text_config.model_type == "glm5_next_text"
+        _keeps_recurrent_state(vllm_config)
         and cache_config.enable_prefix_caching
         and vllm_config.speculative_config is not None
         and cache_config.prefix_cache_retention_interval != 0
     ):
-        # A KDA verify step stores its first token's state and replays the accepted
+        # A verify step stores its first token's state and replays the accepted
         # drafts next step, so a block it crossed holds no state at its end. Retention
         # 0 caches only states a prefill stored (prompt end, shared-prefix junction).
         logger.warning(
-            "Disabling prefix caching: GLM-5.3 on RBLN runs it with speculative "
-            "decoding only at prefix_cache_retention_interval 0, got %s.",
+            "Disabling prefix caching: a recurrent state on RBLN runs it with "
+            "speculative decoding only at prefix_cache_retention_interval 0, got %s.",
             cache_config.prefix_cache_retention_interval,
         )
         cache_config.enable_prefix_caching = False

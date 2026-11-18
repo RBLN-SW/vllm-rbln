@@ -763,6 +763,26 @@ class TestRejectedConfigs:
         with pytest.raises(ValueError, match="whole KV blocks"):
             reconfigure(cached(prefix_match_unit=128))
 
+    def test_gdn_prefix_caching_with_mtp_needs_retention_0(self, reconfigure, gdn):
+        # As for GLM-5.3: a verify step leaves no state at the end of a block it
+        # crossed.
+        def gdn_mtp(retention):
+            def mutate(config):
+                gdn(config)
+                config.cache_config.enable_prefix_caching = True
+                config.cache_config.mamba_cache_mode = "align"
+                config.cache_config.prefix_cache_retention_interval = retention
+                config.speculative_config = SimpleNamespace(
+                    method="mtp", num_speculative_tokens=1
+                )
+
+            return mutate
+
+        assert reconfigure(gdn_mtp(0)).cache_config.enable_prefix_caching
+        config = reconfigure(gdn_mtp(1))
+        assert not config.cache_config.enable_prefix_caching
+        assert config.cache_config.mamba_cache_mode == "none"
+
     def test_gdn_value_heads_split_over_the_chiplets(self, reconfigure, gdn):
         def six_heads(config):
             gdn(config)
