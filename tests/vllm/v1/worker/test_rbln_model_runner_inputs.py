@@ -157,11 +157,11 @@ class TestPreprocessBeforeStaging:
             order.append("metadata")
             return original_metadata(**values)
 
-        def metadata_stage(builder, values):
+        def metadata_stage(builder, values, buffer_index=0):
             order.append("metadata_stage")
             if isinstance(builder, mr.RBLNGDNAttentionMetadataBuilder):
-                return original_gdn_stage(builder, values)
-            return original_metadata_stage(builder, values)
+                return original_gdn_stage(builder, values, buffer_index)
+            return original_metadata_stage(builder, values, buffer_index)
 
         def forward(**values):
             order.append("forward")

@@ -130,23 +130,27 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
         )
         return self._padded(blocks[:, 0], batch)
 
-    def stage(self, metadata: RBLNGDNAttentionMetadata) -> None:  # type: ignore[override]
+    def stage(  # type: ignore[override]
+        self, metadata: RBLNGDNAttentionMetadata, buffer_index: int = 0
+    ) -> None:
         metadata.has_initial_state = self._stage(
-            metadata.has_initial_state, "has_initial_state"
+            metadata.has_initial_state, "has_initial_state", buffer_index
         )
         metadata.conv_load_blocks = self._stage(
-            metadata.conv_load_blocks, "conv_load_blocks"
+            metadata.conv_load_blocks, "conv_load_blocks", buffer_index
         )
         metadata.conv_start_positions = self._stage(
-            metadata.conv_start_positions, "conv_start_positions"
+            metadata.conv_start_positions, "conv_start_positions", buffer_index
         )
         metadata.conv_query_lens = self._stage(
-            metadata.conv_query_lens, "conv_query_lens"
+            metadata.conv_query_lens, "conv_query_lens", buffer_index
         )
         metadata.conv_store_blocks = self._stage(
-            metadata.conv_store_blocks, "conv_store_blocks"
+            metadata.conv_store_blocks, "conv_store_blocks", buffer_index
         )
-        metadata.valid_mask = self._stage(metadata.valid_mask, "valid_mask")
+        metadata.valid_mask = self._stage(
+            metadata.valid_mask, "valid_mask", buffer_index
+        )
 
     def build(  # type: ignore[override]
         self,

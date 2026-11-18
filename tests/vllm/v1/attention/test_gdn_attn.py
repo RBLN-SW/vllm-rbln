@@ -114,6 +114,40 @@ def _assert_conv_rows(
 
 
 class TestBuilder:
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "has_initial_state",
+            "conv_load_blocks",
+            "conv_start_positions",
+            "conv_query_lens",
+            "conv_store_blocks",
+            "valid_mask",
+        ],
+    )
+    def test_alternating_slots_preserve_inflight_metadata(self, builder, field):
+        first, second, third = (
+            builder.build(
+                _common([2], [258], [[7, 8]]),
+                torch.arange(256, 258),
+                batch_pad=1,
+                is_prefill=True,
+                defer_staging=True,
+            )
+            for _ in range(3)
+        )
+        for metadata, value in zip((first, second, third), (3, 4, 5)):
+            getattr(metadata, field).fill_(value)
+
+        builder.stage(first, buffer_index=0)
+        builder.stage(second, buffer_index=1)
+        assert torch.all(getattr(first, field) == 3)
+        assert torch.all(getattr(second, field) == 4)
+        builder.stage(third, buffer_index=0)
+        assert getattr(third, field) is getattr(first, field)
+        assert torch.all(getattr(first, field) == 5)
+        assert torch.all(getattr(second, field) == 4)
+
     @pytest.mark.maybe_use_device
     @pytest.mark.parametrize("is_prefill", [False, True])
     @pytest.mark.parametrize("defer_staging", [False, True])
