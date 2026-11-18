@@ -117,13 +117,17 @@ def _pin_layers(request, monkeypatch):
     from vllm_rbln import envs
 
     method = request.node.callspec.params["method"]
-    if method == "mtp":
-        # TODO(rebel-compiler): truncated, the target is GatedDeltaNet layers
-        # only beside the drafter's full-attention one, a graph the compiler's
-        # layer rolling rejects (RblnTensorUnrollLayerLoop). The whole model rolls.
-        monkeypatch.setenv("VLLM_RBLN_NUM_HIDDEN_LAYERS", "0")
-        return
     num_layers = envs.VLLM_RBLN_NUM_HIDDEN_LAYERS
+    if method == "mtp" and 0 < num_layers < 8:
+        # TODO(rebel-compiler): the compiler's layer rolling
+        # (RblnTensorUnrollLayerLoop) rejects Qwen3.5 truncated to its first
+        # three layers, all GatedDeltaNet, or to one period of four. Two roll.
+        warnings.warn(
+            f"mtp needs two periods of Qwen3.5's layers: raising "
+            f"VLLM_RBLN_NUM_HIDDEN_LAYERS from {num_layers} to 8",
+            stacklevel=2,
+        )
+        monkeypatch.setenv("VLLM_RBLN_NUM_HIDDEN_LAYERS", "8")
     if method != "eagle3" or num_layers == 0:
         return
 
@@ -146,9 +150,9 @@ def _pin_layers(request, monkeypatch):
 
 @pytest.mark.model_compile
 @pytest.mark.parametrize("method", SPEC_METHODS)
-def test_speculative_decoding_matches_reference(vllm_runner, method: str) -> None:
-    from vllm_rbln import envs
-
+def test_speculative_decoding_matches_reference(
+    vllm_runner, method: str, whole_model: bool
+) -> None:
     target, extra_kwargs, spec_config = SPEC_METHODS[method]
     if draft := spec_config.get("model"):
         spec_config = {**spec_config, "model": local_weights_path(draft)}
@@ -193,7 +197,7 @@ def test_speculative_decoding_matches_reference(vllm_runner, method: str) -> Non
     # Equivalence alone passes even if every draft is rejected, so where drafts
     # can realistically hit, require at least one acceptance. Truncated layers
     # leave the draft's predictions unrelated to the target's, so nothing hits.
-    if method in _EXPECT_ACCEPTANCE and envs.VLLM_RBLN_NUM_HIDDEN_LAYERS == 0:
+    if method in _EXPECT_ACCEPTANCE and whole_model:
         assert accepted > 0, f"spec:{method} accepted no draft tokens"
 
 
