@@ -20,7 +20,10 @@ import pytest
 import torch
 from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
-from vllm.v1.sample.logits_processor.builtin import LogitBiasLogitsProcessor
+from vllm.v1.sample.logits_processor.builtin import (
+    LogitBiasLogitsProcessor,
+    MinPLogitsProcessor,
+)
 
 from vllm_rbln.v1.sample.ops.fused_penalty import (
     K_BUCKETS,
@@ -228,9 +231,13 @@ def test_warm_up_skips_fused_graphs_for_an_unsupported_vocab(monkeypatch):
     monkeypatch.setattr(RBLNSampler, "__call__", lambda self, **kw: None)
     sampler = object.__new__(RBLNSampler)
     sampler._penalty_state = FusedPenaltyState()
+    sampler._compiled_min_p_sample = MagicMock()
+    sampler._filled_top_k_top_p = MagicMock(return_value=(None, None))
     sampler.sample = MagicMock()
     sampler._fused_graph = MagicMock()
-    sampler.warm_up(torch.zeros(2, 50257), SimpleNamespace(all_greedy=False))
+    md = SimpleNamespace(all_greedy=False, temperature=torch.ones(2))
+    sampler.warm_up(torch.zeros(2, 50257), md)
+    sampler._compiled_min_p_sample.assert_not_called()
     sampler.sample.assert_not_called()
     sampler._fused_graph.assert_not_called()
 
@@ -298,12 +305,13 @@ def test_min_p_reads_penalized_logits():
 
 
 @pytest.mark.use_device
-def test_mixed_batch_reuses_the_warmed_fused_graph():
+@pytest.mark.parametrize("min_p", [0.0, 0.05])
+def test_mixed_batch_reuses_the_warmed_fused_graph(min_p):
     """A mixed batch builds temperature, top_k and top_p as step tensors. The
     fused graph warmed on batch buffers must take them without recompiling."""
     device = current_platform.device_type
     rand = SamplingParams(
-        temperature=0.8, top_k=30, top_p=0.99, repetition_penalty=1.05
+        temperature=0.8, top_k=30, top_p=0.99, repetition_penalty=1.05, min_p=min_p
     )
     greedy = SamplingParams(temperature=0.0, repetition_penalty=1.05)
     kw = dict(device=device, prompt_token_ids=[11, 4000], output_token_ids=[77])
@@ -311,14 +319,16 @@ def test_mixed_batch_reuses_the_warmed_fused_graph():
     mixed = build_input_batch(
         [(str(i), p) for i, p in enumerate([rand, greedy, rand, greedy])], **kw
     )
-    sampler = RBLNSampler(fused_sampling=True)
+    sampler = RBLNSampler()
     logits = _logits(4).to(device)
     graphs = torch._dynamo.utils.counters["stats"]
     with torch.inference_mode():
         sampler(logits.clone(), warm.sampling_metadata, input_batch=warm)
         before = graphs["unique_graphs"]
         sampler(logits.clone(), mixed.sampling_metadata, input_batch=mixed)
-    assert {key[0] for key in sampler._fused_graphs} == {"top_k_top_p"}
+    assert {key[0] for key in sampler._fused_graphs} == {
+        "penalize" if min_p else "top_k_top_p"
+    }
     assert graphs["unique_graphs"] == before
 
 
@@ -349,12 +359,20 @@ ROWS, LAUNCHES = 256, 40
         ),
         SamplingParams(temperature=1.0, top_k=8, logit_bias=BIAS),
         SamplingParams(temperature=1.0, min_p=0.05, repetition_penalty=1.3),
+        SamplingParams(temperature=1.2, min_p=0.05, top_k=16, top_p=0.9),
     ],
-    ids=["temp_topp_topk_rep_bias", "rep_freq_pres", "topk_bias", "min_p_rep"],
+    ids=[
+        "temp_topp_topk_rep_bias",
+        "rep_freq_pres",
+        "topk_bias",
+        "min_p_rep",
+        "min_p_topk_topp",
+    ],
 )
 @pytest.mark.use_device
-def test_sampled_distribution_matches_upstream(params):
-    """Samples follow upstream's distribution under penalties and logit bias."""
+def test_sampled_distribution_matches_upstream(params, monkeypatch):
+    """Samples follow upstream's distribution under penalties, logit bias and
+    min_p, with min_p in the graph rather than the eager processor."""
     device = current_platform.device_type
     row = logits_from_weights(weights=range(1, 33))
     expected = expected_probs(
@@ -372,6 +390,12 @@ def test_sampled_distribution_matches_upstream(params):
     )
     sampler = RBLNSampler(fused_sampling=True)
     logits = row.expand(ROWS, -1).contiguous().to(device)
+    if params.min_p:
+        # Only now: the reference above runs upstream's eager min_p.
+        def eager_min_p(self, logits):
+            raise AssertionError("min_p ran outside the sampling graph")
+
+        monkeypatch.setattr(MinPLogitsProcessor, "apply", eager_min_p)
     samples = torch.stack(
         [
             sampler(logits.clone(), batch.sampling_metadata, input_batch=batch)
@@ -380,5 +404,6 @@ def test_sampled_distribution_matches_upstream(params):
             for _ in range(LAUNCHES)
         ]
     )
-    assert sampler._fused_graphs, "the fused graphs were not taken"
+    penalized = params.repetition_penalty != 1.0 or bool(params.logit_bias)
+    assert bool(sampler._fused_graphs) == penalized
     assert_samples_match(samples=samples, probs=expected)

@@ -96,6 +96,7 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec, MLAAttentionSpec
 import vllm_rbln.utils as rbln_utils
 from vllm_rbln.model_executor.models.interfaces import SupportsRBLNMultiModal
 from vllm_rbln.patches.attention import _resolve_kv_cache
+from vllm_rbln.utils import is_prefill_step
 from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadata,
 )
@@ -894,22 +895,34 @@ class RBLNGlm5NextDecoderLayer(nn.Module):
             )
 
     def _sublayer(self, streams, fn, scale, base, norm, sublayer) -> torch.Tensor:
+        ops = torch.ops.rbln_custom_ops
+        streams_f32 = streams.float()
+        if is_prefill_step():
+            # The compiler cuts the mhc_* kernels by tokens over the chiplets, so
+            # the streams stay split between sublayers (fp32 holding bf16 values)
+            # and only the sublayer input is gathered.
+            logits = ops.mhc_mix(streams_f32, fn, scale, base, eps=self.rms_eps)
+            x = ops.mhc_read(streams_f32, logits, eps=self.hc_eps).to(norm.weight.dtype)
+            y = sublayer(norm(x))
+            return ops.mhc_write(
+                y.float(),
+                streams_f32,
+                logits,
+                post_mult=self.post_mult,
+                iters=self.sinkhorn_iters,
+                eps=self.hc_eps,
+            )
         batch, n, tokens, hidden = streams.shape
         flat = streams.transpose(1, 2).reshape(batch, tokens, n * hidden).float()
         flat = flat * torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.rms_eps)
         z = F.linear(flat, fn) * scale + base
         z_pre, z_post = z[..., :n], z[..., n : 2 * n]
-        comb = torch.ops.rbln_custom_ops.sinkhorn_normalize(
-            z[..., 2 * n :],
-            iters=self.sinkhorn_iters,
-            eps=self.hc_eps,
+        comb = ops.sinkhorn_normalize(
+            z[..., 2 * n :], iters=self.sinkhorn_iters, eps=self.hc_eps
         )
-        streams_f32 = streams.float()
-        x = torch.ops.rbln_custom_ops.hc_stream_reduce(
-            streams_f32, z_pre, eps=self.hc_eps
-        ).to(streams.dtype)
+        x = ops.hc_stream_reduce(streams_f32, z_pre, eps=self.hc_eps).to(streams.dtype)
         x = sublayer(norm(x))
-        return torch.ops.rbln_custom_ops.hc_residual_add(
+        return ops.hc_residual_add(
             x.float(), streams_f32, z_post, comb, post_mult=self.post_mult
         ).to(streams.dtype)
 
@@ -1050,8 +1063,13 @@ class RBLNGlm5NextModel(nn.Module):
             flat = intermediate_tensors["streams"]
             batch, tokens, _ = flat.shape
             streams = flat.view(batch, tokens, self.n, -1).transpose(1, 2).contiguous()
+        dtype = streams.dtype
+        if is_prefill_step():
+            streams = streams.float()
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             streams = layer(streams)
+        # A prefill chunk keeps the streams fp32 between sublayers (bf16 values).
+        streams = streams.to(dtype)
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
                 {"streams": streams.transpose(1, 2).reshape(batch, tokens, -1)}
