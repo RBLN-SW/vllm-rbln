@@ -154,17 +154,6 @@ def _validate(vllm_config: "VllmConfig") -> None:
                 f"{parallel_config.pipeline_parallel_size}, data_parallel_size="
                 f"{parallel_config.data_parallel_size}."
             )
-        spec = vllm_config.speculative_config
-        # The verify kernel takes up to 7 drafts; 1 to 5 ran on a device.
-        if spec is not None and (
-            spec.method != "mtp" or not 1 <= spec.num_speculative_tokens <= 5
-        ):
-            raise ValueError(
-                "GatedDeltaNet speculative decoding on RBLN runs the model's MTP "
-                "head with num_speculative_tokens 1 to 5 only; got "
-                f"method={spec.method!r}, "
-                f"num_speculative_tokens={spec.num_speculative_tokens}."
-            )
         text_config = model_config.hf_text_config
         num_v_heads = text_config.linear_num_value_heads
         # Per rank, so the rule holds as it is once TP is supported.
@@ -248,21 +237,29 @@ def _validate(vllm_config: "VllmConfig") -> None:
             f"RBLN; got dtype={model_config.dtype}. Pass --dtype bfloat16."
         )
 
-    if text_config.model_type == "glm5_next_text":
-        if not vllm_config.cache_config.cache_dtype.startswith("fp8"):
-            raise ValueError(
-                "GLM-5.3 needs an fp8 KV cache on RBLN; pass --kv-cache-dtype fp8."
-            )
-        # The kpool indexer's tail ring holds 3 + K positions in at most 8 slots.
-        spec = vllm_config.speculative_config
-        if spec is not None and (
-            spec.method != "mtp" or not 1 <= spec.num_speculative_tokens <= 5
-        ):
-            raise ValueError(
-                "GLM-5.3 speculative decoding on RBLN runs its MTP head with "
-                f"num_speculative_tokens 1 to 5 only; got method={spec.method!r}, "
-                f"num_speculative_tokens={spec.num_speculative_tokens}."
-            )
+    if (
+        text_config.model_type == "glm5_next_text"
+        and not vllm_config.cache_config.cache_dtype.startswith("fp8")
+    ):
+        raise ValueError(
+            "GLM-5.3 needs an fp8 KV cache on RBLN; pass --kv-cache-dtype fp8."
+        )
+
+    # GLM-5.3's kpool indexer tail ring holds 3 + K positions in at most 8
+    # slots. The GatedDeltaNet verify kernel takes up to 7 drafts; 1 to 5 ran
+    # on a device.
+    spec = vllm_config.speculative_config
+    if (
+        spec is not None
+        and _keeps_recurrent_state(vllm_config)
+        and (spec.method != "mtp" or not 1 <= spec.num_speculative_tokens <= 5)
+    ):
+        raise ValueError(
+            "Speculative decoding over a recurrent state on RBLN runs the model's "
+            "MTP head with num_speculative_tokens 1 to 5 only; got "
+            f"method={spec.method!r}, "
+            f"num_speculative_tokens={spec.num_speculative_tokens}."
+        )
 
     cache_config = vllm_config.cache_config
     if cache_config.enable_prefix_caching and _keeps_recurrent_state(vllm_config):
