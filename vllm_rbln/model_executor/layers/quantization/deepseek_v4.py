@@ -166,21 +166,18 @@ class RBLNDeepseekV4Mxfp4MoEMethod(Mxfp4MoEMethod):
         orig_shape = x.shape
         hidden_states = x.reshape(orig_shape[:-1].numel(), -1)
         # router_logits is the runner's [E, T] masked routing weights.
-        out = torch.ops.rbln_custom_ops.custom_moe_glu_group_dequantize(
+        out = torch.ops.rbln_custom_ops.custom_moe(
             hidden_states,
             layer.w1_weight,
-            layer.w1_weight_scale,
             layer.w3_weight,
-            layer.w3_weight_scale,
             layer.w2_weight,
-            layer.w2_weight_scale,
             router_logits,
-            torch.tensor(MXFP4_GROUP_SIZE, dtype=torch.int32),
             "swigluoai",
-            None,  # gate_proj_bias
-            None,  # up_proj_bias
-            None,  # down_proj_bias
-            layer.expert_map,
+            gate_proj_scale=layer.w1_weight_scale,
+            up_proj_scale=layer.w3_weight_scale,
+            down_proj_scale=layer.w2_weight_scale,
+            group_size=MXFP4_GROUP_SIZE,
+            expert_map=layer.expert_map,
             weight_dtype=_PACKED_FP4_WEIGHT_DTYPE,
             swiglu_alpha=1.0,
             swiglu_limit=self.swiglu_limit,
