@@ -89,10 +89,12 @@ SPEC_METHODS: dict[str, tuple[str, dict[str, Any], dict[str, Any]]] = {
         {"method": "medusa", "model": MEDUSA_DRAFT, "num_speculative_tokens": 3},
     ),
     # The target's own MTP head; text-only, at the block size a GatedDeltaNet
-    # state fills a full-attention page (as basic_correctness runs the model).
+    # state fills a full-attention page. The runner's block count does not
+    # model a GatedDeltaNet group: 32 blocks of context, two state blocks for
+    # each of three groups under prefix caching, and the null block.
     "mtp": (
         "Qwen/Qwen3.5-4B",
-        {"language_model_only": True, "block_size": 256},
+        {"language_model_only": True, "block_size": 256, "num_gpu_blocks_override": 39},
         {"method": "mtp", "num_speculative_tokens": 3},
     ),
 }
@@ -104,11 +106,18 @@ _EXPECT_ACCEPTANCE = {"ngram", "suffix", "eagle", "eagle3", "mtp"}
 
 
 @pytest.fixture(autouse=True)
-def _pin_aux_layers(request, monkeypatch):
+def _pin_layers(request, monkeypatch):
     from vllm_rbln import envs
 
+    method = request.node.callspec.params["method"]
+    if method == "mtp":
+        # TODO(rebel-compiler): truncated, the target is GatedDeltaNet layers
+        # only beside the drafter's full-attention one, a graph the compiler's
+        # layer rolling rejects (RblnTensorUnrollLayerLoop). The whole model rolls.
+        monkeypatch.setenv("VLLM_RBLN_NUM_HIDDEN_LAYERS", "0")
+        return
     num_layers = envs.VLLM_RBLN_NUM_HIDDEN_LAYERS
-    if request.node.callspec.params["method"] != "eagle3" or num_layers == 0:
+    if method != "eagle3" or num_layers == 0:
         return
 
     if num_layers < 3:
@@ -130,14 +139,10 @@ def _pin_aux_layers(request, monkeypatch):
 
 @pytest.mark.model_compile
 @pytest.mark.parametrize("method", SPEC_METHODS)
-def test_speculative_decoding_matches_reference(
-    vllm_runner, method: str, whole_model: bool, monkeypatch
-) -> None:
+def test_speculative_decoding_matches_reference(vllm_runner, method: str) -> None:
+    from vllm_rbln import envs
+
     target, extra_kwargs, spec_config = SPEC_METHODS[method]
-    if method == "mtp":
-        # TODO(rebel-compiler): drop with basic_correctness's Qwen3.5 entry, once
-        # rolling its GDN layers passes RblnTensorUnrollLayerLoop.
-        monkeypatch.setenv("VLLM_RBLN_USE_NESTED_COMPILE_REGION", "0")
     if draft := spec_config.get("model"):
         spec_config = {**spec_config, "model": local_weights_path(draft)}
 
@@ -180,7 +185,7 @@ def test_speculative_decoding_matches_reference(
     # Equivalence alone passes even if every draft is rejected, so where drafts
     # can realistically hit, require at least one acceptance. Truncated layers
     # leave the draft's predictions unrelated to the target's, so nothing hits.
-    if method in _EXPECT_ACCEPTANCE and whole_model:
+    if method in _EXPECT_ACCEPTANCE and envs.VLLM_RBLN_NUM_HIDDEN_LAYERS == 0:
         assert accepted > 0, f"spec:{method} accepted no draft tokens"
 
 
