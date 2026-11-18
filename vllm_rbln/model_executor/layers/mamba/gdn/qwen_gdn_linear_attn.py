@@ -47,6 +47,7 @@ class RBLNGDNConvRingCache(nn.Module, AttentionLayerBase):
         self.kv_cache = torch.tensor([])
         # Index among the graph's KV cache inputs, assigned by the runner.
         self.layer_index: int | None = None
+        self.kv_cache_subindex = 1
         context = get_current_vllm_config().compilation_config.static_forward_context
         if prefix in context:
             raise ValueError(f"Duplicate layer name: {prefix}")
