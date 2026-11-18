@@ -27,23 +27,45 @@ Built on top of [vLLM’s Plugin System](https://docs.vllm.ai/en/latest/design/p
 
 #### Install via PyPI
 
-Install the vLLM empty wheel from the Rebellions package index.
+##### Using uv
 
 ```bash
-pip3 install --index-url https://repo.rebellions.ai/repository/pypi-public/simple vllm==0.31.0+empty
+uv pip install vllm-rbln \
+  --index https://repo.rebellions.ai/repository/pypi-public/simple \
+  --torch-backend cpu
 ```
 
-Install `vllm-rbln` with that vLLM version.
+##### Using pip
 
 ```bash
-pip3 install vllm-rbln vllm==0.31.0+empty \
+pip install vllm-rbln \
+  --extra-index-url https://repo.rebellions.ai/repository/pypi-public/simple \
+  --extra-index-url https://download.pytorch.org/whl/cpu
+```
+
+#### Or from source
+
+##### Using uv
+
+```bash
+git clone https://github.com/rbln-sw/vllm-rbln.git
+cd vllm-rbln
+uv pip install -e .
+```
+
+##### Using pip
+
+```bash
+git clone https://github.com/rbln-sw/vllm-rbln.git
+cd vllm-rbln
+pip install -e . \
   --extra-index-url https://repo.rebellions.ai/repository/pypi-public/simple \
   --extra-index-url https://download.pytorch.org/whl/cpu
 ```
 
 ### 🛠️ Development setup
 
-For source installation and the `uv` development workflow, see **[DEVELOPMENT.md](./DEVELOPMENT.md)**.
+For the `uv` development workflow, see **[DEVELOPMENT.md](./DEVELOPMENT.md)**.
 
 ### 📚 Documentation
 
