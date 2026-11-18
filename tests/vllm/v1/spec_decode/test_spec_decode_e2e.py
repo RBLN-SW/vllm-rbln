@@ -36,7 +36,11 @@ from tests.vllm.vllm_config import local_weights_path
 # A small, compilable target for the draft-free methods; ngram/suffix speculate
 # by matching repeats, so the prompt is deliberately repetitive.
 _NGRAM_TARGET = "meta-llama/Llama-3.2-1B-Instruct"
-PROMPT = "The quick brown fox jumps over the lazy dog. " * 20
+_SENTENCE = "The quick brown fox jumps over the lazy dog. "
+PROMPT = _SENTENCE * 20
+# 251 tokens for Qwen3.5: the generated ones cross from the first 256-token
+# block, where a GatedDeltaNet state lives, into the second.
+_MTP_PROMPT = _SENTENCE * 25
 MAX_TOKENS = 16
 NUM_LOGPROBS = 5
 
@@ -90,11 +94,14 @@ SPEC_METHODS: dict[str, tuple[str, dict[str, Any], dict[str, Any]]] = {
     ),
     # The target's own MTP head; text-only, at the block size a GatedDeltaNet
     # state fills a full-attention page. The runner's block count does not
-    # model a GatedDeltaNet group: 32 blocks of context, two state blocks for
-    # each of three groups under prefix caching, and the null block.
+    # model a GatedDeltaNet group, so the engine sizes the pool itself.
     "mtp": (
         "Qwen/Qwen3.5-4B",
-        {"language_model_only": True, "block_size": 256, "num_gpu_blocks_override": 39},
+        {
+            "language_model_only": True,
+            "block_size": 256,
+            "num_gpu_blocks_override": None,
+        },
         {"method": "mtp", "num_speculative_tokens": 3},
     ),
 }
@@ -145,6 +152,7 @@ def test_speculative_decoding_matches_reference(vllm_runner, method: str) -> Non
     target, extra_kwargs, spec_config = SPEC_METHODS[method]
     if draft := spec_config.get("model"):
         spec_config = {**spec_config, "model": local_weights_path(draft)}
+    prompt = _MTP_PROMPT if method == "mtp" else PROMPT
 
     # The reference sampler, on both runs: the RBLN one compiles a graph of its
     # own, and acceptance is being compared, not sampler implementations.
@@ -158,7 +166,7 @@ def test_speculative_decoding_matches_reference(vllm_runner, method: str) -> Non
         target, **extra_kwargs, additional_config=reference_sampler
     ) as ref_model:
         ref_outputs = ref_model.generate_greedy_logprobs(
-            [PROMPT], MAX_TOKENS, NUM_LOGPROBS
+            [prompt], MAX_TOKENS, NUM_LOGPROBS
         )
 
     with vllm_runner(
@@ -168,7 +176,7 @@ def test_speculative_decoding_matches_reference(vllm_runner, method: str) -> Non
         additional_config=reference_sampler,
     ) as spec_model:
         spec_outputs = spec_model.generate_greedy_logprobs(
-            [PROMPT], MAX_TOKENS, NUM_LOGPROBS
+            [prompt], MAX_TOKENS, NUM_LOGPROBS
         )
         # Read while the engine is alive (__exit__ shuts down the EngineCore).
         accepted = spec_model.spec_decode_accepted_tokens()
