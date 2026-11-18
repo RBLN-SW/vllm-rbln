@@ -152,7 +152,7 @@ class TestBuilder:
     def test_verify_window_is_padded_at_the_back(self, builder):
         # Two drafts a step. Row 0 carries its token and both drafts (positions
         # 128 .. 130); row 1 only its token (5), padded to the window at the back.
-        positions = torch.tensor([128, 129, 130, 5, 5, 5])
+        positions = torch.tensor([128, 129, 130, 5, 6, 7])
         md = builder.build(
             _common([3, 3], [131, 6], [[7], [3]]),
             positions,

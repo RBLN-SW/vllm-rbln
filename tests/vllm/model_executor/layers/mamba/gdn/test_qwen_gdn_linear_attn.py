@@ -14,8 +14,9 @@
 
 """The RBLN GatedDeltaNet layer's physical state spec and KV cache.
 Its forward tracks the HF reference across
-a padded prefill chunk, a continued chunk and a decode step on that block. The
-custom ops run their CPU bodies here, so no NPU is needed."""
+a padded prefill chunk, a continued chunk and a decode step on that block, and
+its MTP verify steps track one-token decode steps. The custom ops run their CPU
+bodies here, so no NPU is needed."""
 
 from types import SimpleNamespace
 
@@ -79,7 +80,7 @@ def _layer():
         head_v_dim=HEAD_DIM,
         conv_kernel_size=KERNEL,
         conv_dim=CONV_DIM,
-        num_drafts=0,
+        num_spec=0,
         drafts=None,
     )
     layer.in_proj_qkvz = _Proj(HIDDEN, CONV_DIM + VALUE_DIM, bias=False)
@@ -361,7 +362,7 @@ def _decoded(vllm_config, num_drafts: int, windows, monkeypatch, shared_binding)
     for name in ("in_proj_qkvz", "in_proj_ba", "norm", "out_proj"):
         getattr(device_layer, name).to(dtype)
     device_layer.conv1d.weight = device_layer.conv1d.weight.to(dtype)
-    device_layer.num_drafts = num_drafts
+    device_layer.num_spec = num_drafts
     if num_drafts:
         ratio = HEADS_V // HEADS_K
         drafts = torch.zeros(

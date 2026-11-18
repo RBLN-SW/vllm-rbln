@@ -115,18 +115,15 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         model_config = vllm_config.model_config
         self.num_kv_heads = model_config.get_num_kv_heads(vllm_config.parallel_config)
         self.kv_head_size = model_config.get_head_size()
-        spec = vllm_config.speculative_config
-        self.num_drafts = spec.num_speculative_tokens if spec is not None else 0
-        # One ring a block, in kda_conv's stacked form ([W, P=1, C / 64, 64]): the
-        # kernel takes it as allocated, and the converter's reshape of the
-        # unstacked form cannot carry the cache's dynamic block count. W holds
-        # the taps before a step's first token and the step's MTP drafts.
+        # One ring a block, in kda_conv's stacked form [W, 1, C / 64, 64]: a
+        # reshape of the unstacked form cannot carry the dynamic block count.
+        # W holds the taps before a step's first token and its MTP drafts.
         channels = self.conv_dim // self.tp_size
         self.conv_ring = RBLNGDNBlockAuxCache(
             f"{prefix}.conv_ring",
             owner=prefix,
             block_shape=(
-                self.conv_kernel_size - 1 + self.num_drafts,
+                self.conv_kernel_size - 1 + self.num_spec,
                 1,
                 channels // CONV_LANES,
                 CONV_LANES,
@@ -137,13 +134,13 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # drafts as (k, v, g, beta) records, which the next step replays. A
         # prefix resuming at a block boundary has none to replay.
         self.drafts = None
-        if self.num_drafts:
+        if self.num_spec:
             heads_k = self.num_k_heads // self.tp_size
             ratio = self.num_v_heads // self.num_k_heads
             self.drafts = RBLNGDNBlockAuxCache(
                 f"{prefix}.drafts",
                 owner=prefix,
-                block_shape=(heads_k, 2 * ratio + 1, self.num_drafts, self.head_k_dim),
+                block_shape=(heads_k, 2 * ratio + 1, self.num_spec, self.head_k_dim),
                 dtype=model_config.dtype,
                 prefix_cacheable=False,
                 verify_only=True,
@@ -212,7 +209,7 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             metadata.conv_start_positions,
             metadata.conv_query_lens,
             metadata.has_initial_state,
-            kernel - 1 + self.num_drafts,
+            kernel - 1 + self.num_spec,
             store_index=metadata.conv_store_blocks,
         )
         # The delta-rule kernels take q / k per key head (L2-normalized inside) and
@@ -260,7 +257,7 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             # The state cannot roll back: the verify stores it after token 0 and
             # buffers the drafts, which the next step replays as far as they
             # were accepted.
-            assert seq_len == self.num_drafts + 1, seq_len
+            assert seq_len == self.num_spec + 1, seq_len
             core = torch.ops.rbln_custom_ops.gdn_verify(
                 query,
                 key,
@@ -271,9 +268,9 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 self.drafts.inputs(),
                 metadata.load_blocks,
                 metadata.num_accepted,
-                metadata.load_blocks,
-                metadata.store_blocks,
-                metadata.store_blocks,
+                draft_index=metadata.load_blocks,
+                store_index=metadata.store_blocks,
+                draft_store_index=metadata.store_blocks,
             )
         # [batch, num_k_heads, ratio, seq, 128] -> [batch, seq, num_v_heads, 128]
         core = core.permute(0, 3, 1, 2, 4).reshape(

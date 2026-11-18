@@ -23,7 +23,10 @@ from vllm_rbln.patches.registry import add_registration
     reason=(
         "Upstream's Qwen3.5 merges image embeddings outside forward() and runs its "
         "vision tower with cu_seqlens attention; the RBLN class merges them inside "
-        "the compiled graph and compiles the tower at one fixed patch bucket."
+        "the compiled graph and compiles the tower at one fixed patch bucket. "
+        "Upstream's MTP drafter numbers its layer 0, as the target's first: the "
+        "RBLN class numbers it past the target's, as the runner's KV cache order "
+        "needs one number a layer."
     )
 )
 def register_qwen3_5() -> None:
@@ -33,7 +36,6 @@ def register_qwen3_5() -> None:
         "Qwen3_5ForConditionalGeneration",
         "vllm_rbln.model_executor.models.qwen3_5:RBLNQwen3_5ForConditionalGeneration",
     )
-    # The MTP drafter vLLM's speculative config selects for a qwen3_5 target.
     ModelRegistry.register_model(
         "Qwen3_5MTP", "vllm_rbln.model_executor.models.qwen3_5:RBLNQwen3_5MTP"
     )

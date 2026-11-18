@@ -666,7 +666,8 @@ class TestGatedDeltaNetOnTheAttentionPool:
         runner, cache_config = _attention_and_gdn(
             make_model_runner, tmp_path, 256, self.ATTN, self.GDN
         )
-        # The MTP slot is reserved even when only the state and conv ring are bound.
+        # Three cache slots a decoder layer, as num_attn_module counts Qwen3.5's;
+        # the draft one stays unbound here.
         monkeypatch.setattr(
             runner.model_config.hf_text_config,
             "model_type",
