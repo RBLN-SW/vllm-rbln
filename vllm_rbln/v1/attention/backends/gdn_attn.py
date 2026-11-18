@@ -22,10 +22,12 @@ padding. A padding row uses null block 0.
 The builder addresses the block a row loads (its last computed token's) and
 the block it stores to (its last scheduled token's) by the group's block table.
 They differ only under prefix caching ("align", a state a KV block), when a
-step enters a new block.
+step enters a new block. An MTP step stores at its last draft's block, which
+the next step loads from, however many drafts were accepted.
 
-The short-conv ring is a block-aux cache on the same block ids, its channels
-in the delta-rule kernels' key-head order (`grouped_qkv_rows`).
+The short-conv ring and the MTP draft buffer are block-aux caches on the same
+block ids, the ring's channels in the delta-rule kernels' key-head order
+(`grouped_qkv_rows`).
 """
 
 from dataclasses import dataclass
@@ -146,8 +148,9 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
         state_load_pos: torch.Tensor | None = None,
         mm_prefix_row_ends: torch.Tensor | None = None,
     ) -> RBLNGDNAttentionMetadata:
-        """A request's state stays in its one block, so `state_load_pos`, the
-        position its previous step stored at, picks no other."""
+        """Under MTP `state_load_pos` is the last position of a row's previous
+        step, whose block that step stored the state in: with rejected drafts
+        it is past the row's last computed token, and can be in the next block."""
         m = common_attn_metadata
         num_reqs = m.num_reqs
         query_start_loc = m.query_start_loc[: num_reqs + 1]
@@ -178,9 +181,10 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
             num_decodes = num_reqs
 
         block_table = m.block_table_tensor[:num_reqs]
-        load_blocks = self._get_state_blocks(
-            block_table, context_lens_tensor, batch_size
-        )
+        load_tokens = context_lens_tensor
+        if state_load_pos is not None:
+            load_tokens = state_load_pos[:num_reqs] + 1
+        load_blocks = self._get_state_blocks(block_table, load_tokens, batch_size)
         store_blocks = self._get_state_blocks(
             block_table, m.seq_lens[:num_reqs], batch_size
         )

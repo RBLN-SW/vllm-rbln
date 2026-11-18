@@ -206,3 +206,20 @@ class TestBuilder:
             [1, 1, 0, 0],
             [10, 21, 0, 0],
         )
+
+    def test_aligned_verify_loads_the_block_the_step_before_stored_to(self, aligned):
+        # Two drafts a step. The step before took tokens 254 .. 256 and stored
+        # the state in block 1, which token 256 entered. Both drafts were
+        # rejected, so this step starts at 255, back in block 0.
+        md = aligned.build(
+            _common([3], [258], [[10, 11]]),
+            torch.tensor([255, 256, 257]),
+            4,
+            False,
+            back_pad=torch.tensor([0]),
+            num_accepted=torch.tensor([0], dtype=torch.int32),
+            state_load_pos=torch.tensor([256], dtype=torch.int32),
+        )
+        assert md.load_blocks.tolist() == [11, 0, 0, 0]
+        assert md.store_blocks.tolist() == [11, 0, 0, 0]
+        _assert_conv_rows(md, [11, 0, 0, 0], [255, 0, 0, 0], [3, 0, 0, 0], [1, 0, 0, 0])
