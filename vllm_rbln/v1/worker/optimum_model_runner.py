@@ -168,6 +168,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             sampler = RBLNSampler(
                 logprobs_mode=self.model_config.logprobs_mode,
                 use_fp64_gumbel=False,
+                fused_sampling=False,
             )
         else:
             logger.info("Using default vLLM sampler.")
