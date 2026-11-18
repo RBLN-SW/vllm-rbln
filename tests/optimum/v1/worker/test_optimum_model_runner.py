@@ -111,6 +111,17 @@ def model_runner(request):
     return runner
 
 
+def test_custom_sampler_keeps_fused_sampling_disabled(monkeypatch):
+    monkeypatch.setattr(
+        "vllm_rbln.v1.sample.rbln_sampler.compile_sampler", lambda fn, ctx: fn
+    )
+    runner = RBLNOptimumModelRunner(get_vllm_config(), DEVICE)
+
+    assert isinstance(runner.sampler, runner_module.RBLNSampler)
+    assert runner.sampler._penalty_state is None
+    assert runner.sampler._compiled_min_p_sample is None
+
+
 def _is_req_scheduled(model_runner, req_id: str) -> bool:
     return req_id in model_runner.input_batch.req_id_to_index
 
