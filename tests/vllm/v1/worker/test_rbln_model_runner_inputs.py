@@ -17,7 +17,7 @@
 # sampler's output back.
 
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, create_autospec
 
 import numpy as np
 import pytest
@@ -311,10 +311,12 @@ class TestResolveMmPrefixSupport:
 
 
 class TestGatherMultimodalEmbeddings:
+    @pytest.mark.parametrize("draft_type", ["mtp", "dflash"])
     def test_proposer_receives_shifted_embeddings_and_both_position_views(
-        self, make_model_runner, monkeypatch
+        self, make_model_runner, monkeypatch, draft_type
     ):
         from tests.vllm.v1.spec_decode.utils import make_cad
+        from vllm_rbln.v1.spec_decode.dflash import RBLNDFlashProposer
         from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 
         monkeypatch.setattr(
@@ -342,15 +344,20 @@ class TestGatherMultimodalEmbeddings:
         runner.is_prefill = True
         runner.supports_mm_inputs = True
         runner.speculative_config = SimpleNamespace(
-            method="mtp", use_eagle=lambda: True
+            method=draft_type, use_eagle=lambda: True
         )
         runner.input_ids[:3] = torch.tensor([10, 11, 12], dtype=runner.input_ids.dtype)
         runner.positions[:3] = torch.arange(3)
         runner.decode_back_pad[:1] = 0
         runner.mrope_positions = torch.tensor([[0, 0, 0], [0, 1, 2], [0, 0, 1]])
-        drafter = Mock(spec=RBLNEagleProposer)
-        drafter.supports_mm_inputs = True
+        draft_cls = RBLNEagleProposer if draft_type == "mtp" else RBLNDFlashProposer
+        drafter = Mock(spec=draft_cls)
+        drafter.supports_mm_inputs = draft_type == "mtp"
         drafter.uses_mrope = True
+        if draft_type == "dflash":
+            drafter.propose = create_autospec(
+                RBLNDFlashProposer.propose.__get__(drafter)
+            )
         drafter.prepare_next_token_ids_padded.return_value = (
             torch.tensor([13]),
             torch.tensor([1]),
@@ -370,6 +377,9 @@ class TestGatherMultimodalEmbeddings:
 
         inputs = drafter.propose.call_args.kwargs
         torch.testing.assert_close(inputs["target_positions"], torch.arange(3))
+        if draft_type == "dflash":
+            assert "target_mrope_positions" not in inputs
+            return
         torch.testing.assert_close(
             inputs["target_mrope_positions"], runner.mrope_positions
         )
