@@ -279,25 +279,102 @@ class TestAcceptedTokensReAdd:
         assert "a" not in runner.state_pos_by_req
 
 
-class TestWritebackBeforeReAdd:
-    def test_evicted_decode_comes_back_with_its_sampled_token(
+class TestTokenFeedbackBeforeReAdd:
+    def test_custom_processor_receives_completed_token_history(
         self, make_model_runner, monkeypatch
     ):
-        # Async scheduling leaves a -1 for the token still being sampled. If a
-        # prefill-only step evicts the request first, only the writeback repairs
-        # its cached state, as all_token_ids no longer arrives; the re-add then
-        # rebuilds the row from that state.
+        from vllm.v1.sample.logits_processor import LogitsProcessor
+        from vllm.v1.sample.logits_processor.builtin import process_dict_updates
+
+        from tests.vllm.v1.worker.test_async_output import _async_output
+
+        class CachesLastToken(LogitsProcessor):
+            def __init__(self, vllm_config, device, is_pin_memory):
+                self.histories = {}
+                self.last_tokens = {}
+
+            def is_argmax_invariant(self):
+                return False
+
+            def update_state(self, batch_update):
+                process_dict_updates(
+                    self.histories,
+                    batch_update,
+                    lambda params, prompt, output: output,
+                )
+                self.last_tokens = {
+                    row: history[-1]
+                    for row, history in self.histories.items()
+                    if history
+                }
+
+            def apply(self, logits):
+                for row, token in self.last_tokens.items():
+                    logits[row, token] = float("-inf")
+                return logits
+
         _last_rank(monkeypatch)
-        runner = make_model_runner()
+        runner = make_model_runner(logits_processors=[CachesLastToken])
+        runner.use_async_scheduling = True
         runner._update_states(schedule_new("a"))
         state = runner.requests["a"]
         n = state.num_prompt_tokens
         state.output_token_ids.append(-1)
-        runner._pending_token_writeback.append((["a"], [[42]], {"a": n}))
+        runner.input_batch.token_ids_cpu[0, n] = -1
+        runner.input_batch.num_tokens_no_spec[0] = n + 1
+        previous = _async_output(
+            torch.tensor([[42]], dtype=torch.int32),
+            req_ids=["a"],
+            placeholder_pos={"a": n},
+        )
+        assert previous.get_output().sampled_token_ids == [[42]]
+        runner._prev_async_output = previous
+
+        runner._update_states(
+            schedule_cached(
+                req_ids=["a"], num_computed_tokens=[n], num_output_tokens=[1]
+            )
+        )
+        runner._repair_staged_input_ids()
+        processor = next(
+            proc
+            for proc in runner.input_batch.logitsprocs.all
+            if isinstance(proc, CachesLastToken)
+        )
+        logits = torch.full((1, 128), float("-inf"))
+        logits[0, 42] = 10
+        logits[0, 43] = 9
+
+        assert processor.apply(logits).argmax(-1).item() == 43
+        assert processor.last_tokens == {0: 42}
+        assert state.output_token_ids == [42]
+
+    @pytest.mark.parametrize("repair_during_prefill", [False, True])
+    def test_evicted_decode_comes_back_with_its_sampled_token(
+        self, make_model_runner, monkeypatch, repair_during_prefill
+    ):
+        from tests.vllm.v1.worker.test_async_output import _async_output
+
+        _last_rank(monkeypatch)
+        runner = make_model_runner()
+        runner.use_async_scheduling = True
+        runner._update_states(schedule_new("a"))
+        state = runner.requests["a"]
+        n = state.num_prompt_tokens
+        state.output_token_ids.append(-1)
+        runner._prev_async_output = _async_output(
+            torch.tensor([[42]], dtype=torch.int32),
+            req_ids=["a"],
+            placeholder_pos={"a": n},
+        )
         runner._update_states(make_scheduler_output(num_scheduled_tokens={}))
         assert not is_in_batch(runner, "a")
 
-        runner._apply_pending_token_writeback()
+        if repair_during_prefill:
+            runner.is_prefill = True
+            runner._repair_staged_input_ids(
+                SimpleNamespace(input_ids=torch.empty((0, 1), dtype=torch.int32)), []
+            )
         runner._update_states(
             schedule_cached(
                 req_ids=["a"], num_computed_tokens=[n], num_output_tokens=[1]
@@ -306,6 +383,69 @@ class TestWritebackBeforeReAdd:
 
         req_index = runner.input_batch.req_id_to_index["a"]
         assert runner.input_batch.token_ids_cpu[req_index, n] == 42
+        assert runner.requests["a"].output_token_ids == [42]
+        assert runner._prev_async_output is None
+
+    def test_continuing_decode_defers_feedback_until_input_repair(
+        self, make_model_runner, monkeypatch
+    ):
+        from tests.vllm.v1.worker.test_async_output import _async_output
+
+        _last_rank(monkeypatch)
+        runner = make_model_runner()
+        runner.use_async_scheduling = True
+        runner._update_states(schedule_new("a"))
+        state = runner.requests["a"]
+        n = state.num_prompt_tokens
+        state.output_token_ids.append(-1)
+        previous = _async_output(
+            torch.tensor([[42]], dtype=torch.int32),
+            req_ids=["a"],
+            placeholder_pos={"a": n},
+        )
+        runner._prev_async_output = previous
+        runner._update_states(
+            schedule_cached(
+                req_ids=["a"], num_computed_tokens=[n], num_output_tokens=[1]
+            )
+        )
+        assert state.output_token_ids == [-1]
+        assert runner._prev_async_output is previous
+
+        runner.is_prefill = False
+        staged = SimpleNamespace(input_ids=torch.full((1, 1), -1, dtype=torch.int32))
+        runner._repair_staged_input_ids(staged, ["a"])
+        assert staged.input_ids.tolist() == [[42]]
+        assert state.output_token_ids == [42]
+
+    def test_readding_an_unrelated_request_does_not_wait_for_feedback(
+        self, make_model_runner, monkeypatch
+    ):
+        from tests.vllm.v1.worker.test_async_output import _async_output
+
+        _last_rank(monkeypatch)
+        runner = make_model_runner()
+        runner.use_async_scheduling = True
+        runner._update_states(schedule_new("b"))
+        b_prompt_len = runner.requests["b"].num_prompt_tokens
+        runner._update_states(schedule_new("a"))
+        state = runner.requests["a"]
+        state.output_token_ids.append(-1)
+        previous = _async_output(
+            torch.tensor([[42]], dtype=torch.int32),
+            req_ids=["a"],
+            placeholder_pos={"a": state.num_prompt_tokens},
+        )
+        runner._prev_async_output = previous
+
+        runner._update_states(
+            schedule_cached(
+                req_ids=["b"], num_computed_tokens=[b_prompt_len], num_output_tokens=[0]
+            )
+        )
+
+        assert runner._prev_async_output is previous
+        assert state.output_token_ids == [-1]
 
 
 class TestSeededRequest:
