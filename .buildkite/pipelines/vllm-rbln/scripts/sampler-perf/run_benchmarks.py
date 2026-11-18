@@ -29,10 +29,15 @@ import yaml
 from benchmark_sampler import parse_args, write_result
 
 
-def sampler_summary(manifest: dict) -> dict:
+def sampler_summary(manifest: dict, *, use_fused_sampling: bool) -> dict:
     """Build a batch matrix for both the job annotation and nightly report."""
+    cases = [
+        case
+        for case in manifest["cases"]
+        if case["use_fused_sampling"] is use_fused_sampling
+    ]
     batches = sorted(
-        {case["batch_size"] for case in manifest["cases"]},
+        {case["batch_size"] for case in cases},
         key=lambda value: (value is None, value or 0),
     )
     titles = [
@@ -44,12 +49,12 @@ def sampler_summary(manifest: dict) -> dict:
     ]
     grouped = {}
     row_metadata = {}
-    passed = failed = incomplete = 0
-    for case in manifest["cases"]:
+    passed = failed = incomplete = active = 0
+    for case in cases:
         extra = ", ".join(
             f"{key}={value}"
             for key, value in case["sweep_values"].items()
-            if key not in ("base", "batch_size")
+            if key not in ("base", "batch_size", "use_fused_sampling")
         )
         sampling = case["base"] or "custom"
         if extra:
@@ -78,6 +83,7 @@ def sampler_summary(manifest: dict) -> dict:
                 )
             row_metadata[key] = metadata
             passed += 1
+            active += bool(metrics["fused_sampling_active"])
             value = f"{metrics['median_ns'] / 1_000_000:.6f}"
         elif case["status"] in ("not_started", "running"):
             incomplete += 1
@@ -97,19 +103,22 @@ def sampler_summary(manifest: dict) -> dict:
         ]
         for key, cells in grouped.items()
     ]
+    status = f"{passed}/{len(cases)} passed · {failed} failed · {incomplete} incomplete"
     text = (
-        f"{passed}/{len(manifest['cases'])} passed · {failed} failed · "
-        f"{incomplete} incomplete · {manifest['chip'] or 'chip not measured'}\n"
+        f"{status} · {manifest['chip'] or 'chip not measured'}\n"
         "Median latency (ms), including token transfer to CPU and completion wait."
     )
+    if use_fused_sampling:
+        text += f"\n{active}/{len(cases)} cases used fused graphs."
     markdown = ["| " + " | ".join(titles) + " |", "|" + "---|" * len(titles)]
     markdown.extend("| " + " | ".join(row) + " |" for row in rows)
     return {
         "text": text,
+        "status": status,
         "titles": titles,
         "rows": rows,
         "markdown": "\n".join(markdown),
-        "degraded": bool(not manifest["cases"] or failed or incomplete),
+        "degraded": bool(not cases or failed or incomplete),
     }
 
 
@@ -140,6 +149,9 @@ def summarize_results(manifest: dict, *, title: str = "Summary") -> None:
             if entry["status"] == "passed":
                 measurement = result["measurement"]
                 summary = {
+                    "fused_sampling_active": result["sampling"][
+                        "fused_sampling_active"
+                    ],
                     "shape": result["input"]["shape"],
                     "dtype": result["input"]["dtype"],
                     "sample_count": measurement["sample_count"],
@@ -209,6 +221,13 @@ def main() -> None:
         "paths use the YAML directory.",
     )
     parser.add_argument(
+        "--use-fused-sampling",
+        type=int,
+        nargs="+",
+        choices=(0, 1),
+        help="Expand every configured case over these fused sampling settings.",
+    )
+    parser.add_argument(
         "--summary-only",
         action="store_true",
         help="Print existing results from --output-dir without launching processes; "
@@ -237,7 +256,12 @@ def main() -> None:
     on_ci = bool(os.environ.get("BUILDKITE"))
     output_dir = args.output_dir.resolve()
     if args.summary_only:
-        if args.config is not None or args.iterations is not None or args.dry_run:
+        if (
+            args.config is not None
+            or args.iterations is not None
+            or args.dry_run
+            or args.use_fused_sampling is not None
+        ):
             parser.error("--summary-only accepts only --output-dir")
         manifest = json.loads(
             (output_dir / "manifest.json").read_text(encoding="utf-8")
@@ -303,6 +327,13 @@ def main() -> None:
             )
         if {"case_id", "output", "id", "sweep"} & sweep.keys():
             parser.error("sweep can contain only benchmark options")
+        if args.use_fused_sampling is not None:
+            if "use_fused_sampling" in case_options or "use_fused_sampling" in sweep:
+                parser.error(
+                    "--use-fused-sampling cannot override a configured "
+                    "fused sampling setting"
+                )
+            sweep = {**sweep, "use_fused_sampling": args.use_fused_sampling}
         if bases and "base" not in case_options and "base" not in sweep:
             sweep = {"base": list(bases), **sweep}
         for index, combination in enumerate(itertools.product(*sweep.values())):
@@ -338,7 +369,9 @@ def main() -> None:
                 ):
                     parser.error(f"invalid benchmark option name: {key!r}")
                 flag = "--" + key.replace("_", "-")
-                if key == "greedy":
+                if key == "use_fused_sampling" and type(value) is bool:
+                    arguments.extend([flag, str(int(value))])
+                elif key == "greedy":
                     if type(value) is not bool:
                         parser.error(f"{case_id}: greedy must be a boolean")
                     if value:
@@ -366,6 +399,7 @@ def main() -> None:
                     "case_id": case_id,
                     "input_id": name,
                     "batch_size": parsed.batch_size,
+                    "use_fused_sampling": bool(parsed.use_fused_sampling),
                     "base": base_name,
                     "sweep_values": dict(zip(sweep, combination)),
                     "result": str(parsed.output),
@@ -453,14 +487,24 @@ def main() -> None:
     print(f"{'+++' if on_ci else '==='} Sampler benchmark summary", flush=True)
     summarize_results(manifest)
     write_result(output_dir / "manifest.json", manifest)
-    matrix = sampler_summary(manifest)
-    body = matrix["text"] + "\n\n" + matrix["markdown"]
+    matrices = [
+        (enabled, sampler_summary(manifest, use_fused_sampling=enabled))
+        for enabled in (False, True)
+        if any(case["use_fused_sampling"] is enabled for case in manifest["cases"])
+    ]
+    body = "\n\n".join(
+        f"## Sampler Perf (Fused {'On' if enabled else 'Off'})\n\n"
+        + matrix["text"]
+        + "\n\n"
+        + matrix["markdown"]
+        for enabled, matrix in matrices
+    )
     summary_path = output_dir / "summary.md"
     summary_path.touch(mode=0o600, exist_ok=True)
     summary_path.chmod(0o600)
     summary_path.write_text(body + "\n", encoding="utf-8")
     print(f"Results: {output_dir / 'manifest.json'}", flush=True)
-    raise SystemExit(1 if matrix["degraded"] else 0)
+    raise SystemExit(1 if any(matrix["degraded"] for _, matrix in matrices) else 0)
 
 
 if __name__ == "__main__":
