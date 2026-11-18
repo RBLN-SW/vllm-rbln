@@ -257,8 +257,7 @@ environment_variables = {
     # graph's output takes that output's on-device layout, skipping relocation.
     "VLLM_RBLN_DECLARE_HELD_PV": (
         lambda: (
-            os.environ.get("VLLM_RBLN_DECLARE_HELD_PV", "True").lower()
-            in ("true", "1")
+            os.environ.get("VLLM_RBLN_DECLARE_HELD_PV", "True").lower() in ("true", "1")
         )
     ),
     # Build only the first N decoder layers and leave the rest as
