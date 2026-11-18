@@ -37,13 +37,10 @@ def keep_the_rbln_attention_backend(vllm_config: VllmConfig) -> None:
     """Leave the attention backend to the RBLN platform."""
 
 
-# A compiler whose read takes a batch cut (residual_read_rows, or residual_read's
-# B shard) cuts the decode residual by batch rows and lays out decode's weights
-# around the ops as prefill's; an older one fails to share them, so decode keeps
-# the plain path there.
-_CUTS_THE_DECODE_RESIDUAL = reads_a_batch_cut(
-    "residual", "KERNEL_RESIDUAL_READ_ROWS", "KERNEL_RESIDUAL_READ"
-)
+# A compiler whose residual_read takes a batch cut cuts the decode residual by
+# batch rows and lays out decode's weights around the ops as prefill's; an older
+# one fails to share them, so decode keeps the plain path there.
+_CUTS_THE_DECODE_RESIDUAL = reads_a_batch_cut("residual", "KERNEL_RESIDUAL_READ")
 
 
 def _read(norm, residual: torch.Tensor, cut: bool) -> torch.Tensor:

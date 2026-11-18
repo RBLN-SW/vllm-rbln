@@ -118,9 +118,7 @@ from vllm_rbln.v1.worker.utils import pipeline_adjusted_layer_index
 # A compiler whose read takes a batch cut also cuts the mhc_* kernels of a decode
 # batch by rows (or runs a small batch whole) and lays out decode's weights around
 # them as prefill's; an older one keeps decode on the plain mHC ops.
-_CUTS_THE_DECODE_MHC = reads_a_batch_cut(
-    "mhc", "KERNEL_MHC_READ_ROWS", "KERNEL_MHC_READ"
-)
+_CUTS_THE_DECODE_MHC = reads_a_batch_cut("mhc", "KERNEL_MHC_READ")
 
 SLOT_DSA_LATENT, SLOT_DSA_INDEX_KEY, SLOT_DSA_INDEX_SCALE, SLOT_DSA_INDEX_TAIL = range(
     4

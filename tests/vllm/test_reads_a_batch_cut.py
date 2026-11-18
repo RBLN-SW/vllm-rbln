@@ -39,8 +39,6 @@ def _read(*axes):
 @pytest.mark.parametrize(
     "kernels,expected",
     [
-        # read_rows: the batch-row read of rebel_compiler#15810
-        ({"READ_ROWS": object(), "READ": _read("T")}, True),
         # the read takes the batch cut itself
         ({"READ": _read("T", "B")}, True),
         # a compiler that cuts only prefill
@@ -49,8 +47,8 @@ def _read(*axes):
 )
 def test_reads_a_batch_cut(monkeypatch, kernels, expected):
     _table(monkeypatch, **kernels)
-    assert reads_a_batch_cut("fake_residual", "READ_ROWS", "READ") is expected
+    assert reads_a_batch_cut("fake_residual", "READ") is expected
 
 
 def test_a_compiler_without_the_table_reads_no_batch_cut():
-    assert not reads_a_batch_cut("no_such_table", "READ_ROWS", "READ")
+    assert not reads_a_batch_cut("no_such_table", "READ")

@@ -62,9 +62,7 @@ _AXK2ForCausalLM: Any = _k2.AXK2ForCausalLM
 # A compiler whose read takes a batch cut cuts the decode Gated Residual by batch
 # rows and lays out decode's weights around the axk3_gr_* ops as prefill's; an
 # older one fails to share them, so decode keeps the plain Gated Residual there.
-_CUTS_THE_DECODE_GR = reads_a_batch_cut(
-    "gated_residual", "KERNEL_AXK3_GR_READ_ROWS", "KERNEL_AXK3_GR_READ"
-)
+_CUTS_THE_DECODE_GR = reads_a_batch_cut("gated_residual", "KERNEL_AXK3_GR_READ")
 
 
 class AXK3GatedResidual(nn.Module):
