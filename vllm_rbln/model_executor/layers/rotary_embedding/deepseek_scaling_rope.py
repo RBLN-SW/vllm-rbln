@@ -92,7 +92,9 @@ class RBLNDeepseekV4ScalingRotaryEmbedding(DeepseekV4ScalingRotaryEmbedding):
         if offsets is not None:
             positions = positions + offsets
         batch, seq_len = positions.shape[0], positions.shape[1]
-        cos_sin = self.cos_sin_cache.index_select(0, positions.flatten())
+        cos_sin = self.cos_sin_cache.index_select(0, positions.flatten()).to(
+            query.dtype
+        )
         cos, sin = cos_sin.view(batch, seq_len, -1).chunk(2, dim=-1)
         if self.is_neox_style:
             cos, sin = torch.cat((cos, cos), dim=-1), torch.cat((sin, sin), dim=-1)
@@ -117,7 +119,6 @@ class RBLNDeepseekV4ScalingRotaryEmbedding(DeepseekV4ScalingRotaryEmbedding):
                 for _ in range(x.dim() - 3):
                     c, s = c.unsqueeze(-2), s.unsqueeze(-2)
             nope, rope = x.split([x.shape[-1] - self.rotary_dim, self.rotary_dim], -1)
-            rope = rope.float()
             rot = (rope * c + rotate_fn(rope) * s).to(x.dtype)
             x = torch.cat((nope, rot), dim=-1)
             out.append(x.squeeze(2) if headless else x)

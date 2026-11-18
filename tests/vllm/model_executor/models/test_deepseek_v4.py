@@ -204,8 +204,9 @@ def test_compressor_padding_does_not_index_past_the_rope_table(monkeypatch, quer
 @pytest.mark.parametrize("ratio", [0, 4, 128])
 @pytest.mark.parametrize("inverse", [False, True])
 @pytest.mark.parametrize("layout", ["headless", "token_major", "head_major"])
-def test_rope_resolves_to_the_rbln_op_and_matches_upstream(
-    nested, ratio, inverse, layout
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_rope_matches_upstream_with_activation_dtype_coefficients(
+    monkeypatch, nested, ratio, inverse, layout, dtype
 ):
     from vllm.config import set_current_vllm_config
     from vllm.models.deepseek_v4.common.rope import build_deepseek_v4_rope
@@ -244,11 +245,7 @@ def test_rope_resolves_to_the_rbln_op_and_matches_upstream(
     assert isinstance(rope, RBLNDeepseekV4ScalingRotaryEmbedding)
     positions = torch.tensor([[0, 13, 65], [127, 129, 255]])
     shape = (2, 3, 128) if layout == "headless" else (2, 3, 2, 128)
-    x = torch.randn(*shape, generator=torch.Generator().manual_seed(9)).bfloat16()
-    # Upstream's forward takes flat positions over [N, H, D] rows.
-    expected, _ = rope.forward_native(
-        positions.flatten(), x.reshape(6, -1, 128), inverse=inverse
-    )
+    x = torch.randn(*shape, generator=torch.Generator().manual_seed(9)).to(dtype)
     if layout == "head_major":
         actual, _ = rope.forward_oot(
             positions, x.transpose(1, 2), inverse=inverse, head_major=True
@@ -256,6 +253,11 @@ def test_rope_resolves_to_the_rbln_op_and_matches_upstream(
         actual = actual.transpose(1, 2)
     else:
         actual, _ = rope.forward_oot(positions, x, inverse=inverse)
+    assert rope.cos_sin_cache.dtype == torch.float32
+    monkeypatch.setattr(rope, "cos_sin_cache", rope.cos_sin_cache.to(dtype))
+    expected, _ = rope.forward_native(
+        positions.flatten(), x.reshape(6, -1, 128), inverse=inverse
+    )
     torch.testing.assert_close(actual, expected.reshape_as(x), atol=0, rtol=0)
 
 
