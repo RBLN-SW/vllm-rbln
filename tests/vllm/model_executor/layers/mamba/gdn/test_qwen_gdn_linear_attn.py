@@ -370,6 +370,10 @@ def _decoded(vllm_config, num_drafts: int, windows, monkeypatch, shared_binding)
         )
         device_layer.drafts = SimpleNamespace(inputs=lambda: drafts)
     vllm_config.compilation_config.static_forward_context[PREFIX] = device_layer
+    # The builder holds a decode step to one token and the drafts.
+    vllm_config.speculative_config = (
+        SimpleNamespace(num_speculative_tokens=num_drafts) if num_drafts else None
+    )
     spec = MambaSpec(
         block_size=vllm_config.model_config.max_model_len,
         shapes=(kv_block,),
@@ -438,13 +442,13 @@ def test_verify_steps_stand_for_the_decode_steps_of_their_accepted_tokens(
         dtype="bfloat16",
     )
     torch.manual_seed(2)
-    x = torch.randn(5, HIDDEN)
+    x = torch.randn(8, HIDDEN)
     wrong = torch.randn(2, HIDDEN)
     pad = torch.zeros(HIDDEN)
     plain, plain_states = _decoded(
         vllm_config,
         0,
-        [(x[i : i + 1], 70 + i, 1, 0) for i in range(5)],
+        [(x[i : i + 1], 70 + i, 1, 0) for i in range(8)],
         monkeypatch,
         shared_binding,
     )
@@ -456,7 +460,10 @@ def test_verify_steps_stand_for_the_decode_steps_of_their_accepted_tokens(
             (torch.stack([x[0], pad, pad]), 70, 1, 0),
             # x[2] is accepted, the draft after it rejected.
             (torch.stack([x[1], x[2], wrong[0]]), 71, 3, 0),
-            (torch.stack([x[3], x[4], wrong[1]]), 73, 3, 1),
+            # Both of this window's drafts are accepted: the next one replays
+            # the whole draft buffer.
+            (torch.stack([x[3], x[4], x[5]]), 73, 3, 1),
+            (torch.stack([x[6], x[7], wrong[1]]), 76, 3, 2),
         ],
         monkeypatch,
         shared_binding,
@@ -464,9 +471,10 @@ def test_verify_steps_stand_for_the_decode_steps_of_their_accepted_tokens(
     close = {"atol": 1e-2, "rtol": 0}
     torch.testing.assert_close(verified[0][:1], plain[0], **close)
     torch.testing.assert_close(verified[1][:2], torch.cat(plain[1:3]), **close)
-    torch.testing.assert_close(verified[2][:2], torch.cat(plain[3:5]), **close)
-    # The state after x[0], x[1] and x[3]: each window's confirmed token.
-    for window, step in enumerate((0, 1, 3)):
+    torch.testing.assert_close(verified[2], torch.cat(plain[3:6]), **close)
+    torch.testing.assert_close(verified[3][:2], torch.cat(plain[6:8]), **close)
+    # The state after x[0], x[1], x[3] and x[6]: each window's confirmed token.
+    for window, step in enumerate((0, 1, 3, 6)):
         torch.testing.assert_close(verified_states[window], plain_states[step], **close)
 
 

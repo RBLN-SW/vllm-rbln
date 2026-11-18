@@ -258,6 +258,7 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             # buffers the drafts, which the next step replays as far as they
             # were accepted.
             assert seq_len == self.num_spec + 1, seq_len
+            assert metadata.num_accepted is not None, self.prefix
             core = torch.ops.rbln_custom_ops.gdn_verify(
                 query,
                 key,

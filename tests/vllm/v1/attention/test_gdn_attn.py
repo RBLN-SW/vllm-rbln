@@ -50,6 +50,7 @@ def _builder(
     mamba_cache_mode: str = "none",
     *,
     device="cpu",
+    num_drafts: int = 0,
 ):
     vllm_config = make_vllm_config(
         max_model_len=MAX_LEN,
@@ -58,6 +59,10 @@ def _builder(
         additional_config={"prefill_chunk_size": list(prefill_chunk_size)},
     )
     vllm_config.cache_config.mamba_cache_mode = mamba_cache_mode
+    if num_drafts:
+        vllm_config.speculative_config = SimpleNamespace(
+            num_speculative_tokens=num_drafts
+        )
     spec = MambaSpec(
         block_size=block_size,
         shapes=((4, 128, 128),),
@@ -204,11 +209,20 @@ class TestBuilder:
         _assert_conv_rows(md, [7, 3, 0, 0], [128, 5, 0, 0], [1, 1, 0, 0], [1, 1, 0, 0])
         assert md.valid_mask is None
 
-    def test_verify_window_is_padded_at_the_back(self, builder):
+    @pytest.mark.parametrize(("num_drafts", "query_len"), [(0, 2), (2, 1)])
+    def test_a_decode_step_of_another_length_is_refused(self, num_drafts, query_len):
+        # One token a request, plus the drafts under MTP: the decode kernel
+        # takes the first and the verify kernel the second, nothing else.
+        positions = torch.arange(128, 128 + query_len)
+        common = _common([query_len], [128 + query_len], [[7]])
+        with pytest.raises(AssertionError, match=f"takes {1 + num_drafts} tokens"):
+            _builder(num_drafts=num_drafts).build(common, positions, 4, False)
+
+    def test_verify_window_is_padded_at_the_back(self):
         # Two drafts a step. Row 0 carries its token and both drafts (positions
         # 128 .. 130); row 1 only its token (5), padded to the window at the back.
         positions = torch.tensor([128, 129, 130, 5, 6, 7])
-        md = builder.build(
+        md = _builder(num_drafts=2).build(
             _common([3, 3], [131, 6], [[7], [3]]),
             positions,
             4,
@@ -262,19 +276,27 @@ class TestBuilder:
             [10, 21, 0, 0],
         )
 
-    def test_aligned_verify_loads_the_block_the_step_before_stored_to(self, aligned):
+    @pytest.mark.parametrize(("accepted", "first"), [(0, 255), (2, 257)])
+    def test_aligned_verify_loads_the_block_the_step_before_stored_to(
+        self, accepted, first
+    ):
         # Two drafts a step. The step before took tokens 254 .. 256 and stored
-        # the state in block 1, which token 256 entered. Both drafts were
-        # rejected, so this step starts at 255, back in block 0.
+        # the state in block 1, which token 256 entered. With both drafts
+        # rejected this step starts at 255, back in block 0; with both accepted
+        # it starts at 257, in block 1 too.
+        aligned = _builder(block_size=256, mamba_cache_mode="align", num_drafts=2)
         md = aligned.build(
-            _common([3], [258], [[10, 11]]),
-            torch.tensor([255, 256, 257]),
+            _common([3], [first + 3], [[10, 11]]),
+            torch.arange(first, first + 3),
             4,
             False,
             back_pad=torch.tensor([0]),
-            num_accepted=torch.tensor([0], dtype=torch.int32),
+            num_accepted=torch.tensor([accepted], dtype=torch.int32),
             state_load_pos=torch.tensor([256], dtype=torch.int32),
         )
         assert md.load_blocks.tolist() == [11, 0, 0, 0]
         assert md.store_blocks.tolist() == [11, 0, 0, 0]
-        _assert_conv_rows(md, [11, 0, 0, 0], [255, 0, 0, 0], [3, 0, 0, 0], [1, 0, 0, 0])
+        _assert_conv_rows(
+            md, [11, 0, 0, 0], [first, 0, 0, 0], [3, 0, 0, 0], [1, 0, 0, 0]
+        )
+        assert md.num_accepted.tolist() == [accepted, 0, 0, 0]

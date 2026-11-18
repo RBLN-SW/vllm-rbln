@@ -191,8 +191,10 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
             num_decodes = 0
         else:
             batch_size = batch_pad
-            assert bool((query_lens == query_lens[0]).all()), (
-                "every request of a decode step takes the same number of tokens"
+            spec = self.vllm_config.speculative_config
+            query_len = 1 + (spec.num_speculative_tokens if spec is not None else 0)
+            assert bool((query_lens == query_len).all()), (
+                f"a decode step takes {query_len} tokens a request, got {query_lens}"
             )
 
             num_prefills = 0
