@@ -54,8 +54,7 @@ def _intra_nodeid(nodeid: str) -> str:
 
 def _needs_spawn(item) -> bool:
     """Whether ``item`` must run in a fresh process rather than in this one."""
-    kw = item.keywords
-    return "model_compile" in kw or "use_device" in kw
+    return "model_compile" in item.keywords
 
 
 def _will_be_skipped(item) -> bool:
@@ -326,10 +325,7 @@ def _crash_reports(item, spawn) -> list:
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_runtest_protocol(item, nextitem):
-    """Run device-touching tests in a fresh spawned process, batched per file:
-    the RBLN device must not be opened in the parent (it would pin the device for
-    the whole session), and one spawn per file amortizes the interpreter + plugin
-    + device init over all its tests.
+    """Isolate whole-model compiles in a fresh process, batched per file.
 
     Taking over the whole protocol (rather than just the call phase) is what
     makes a batched test indistinguishable from a plain one: the child's own

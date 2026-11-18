@@ -36,6 +36,40 @@ from .utils import (
 )
 
 
+@pytest.mark.parametrize(
+    ("keywords", "spawned"),
+    [
+        ({"use_device": True}, False),
+        ({"model_compile": True}, True),
+        ({"use_device": True, "model_compile": True}, True),
+    ],
+    ids=["device-unit", "model-compile", "model-compile-with-device"],
+)
+def test_protocol_only_spawns_model_compiles(monkeypatch, keywords, spawned):
+    monkeypatch.delenv(_SPAWN_CHILD_ENV, raising=False)
+    item = SimpleNamespace(
+        keywords=keywords,
+        nodeid="test_model.py::test_model",
+        location=("test_model.py", 0, "test_model"),
+        ihook=Mock(),
+        session=SimpleNamespace(_setupstate=Mock()),
+    )
+    child = Mock()
+    child.records_for.return_value = []
+    child.take_warnings.return_value = []
+    start = Mock(return_value=child)
+    monkeypatch.setattr(conftest, "_spawn_for", start)
+    monkeypatch.setattr(conftest, "_will_be_skipped", lambda item: False)
+
+    result = conftest.pytest_runtest_protocol(item, nextitem=None)
+
+    assert result is (True if spawned else None)
+    if spawned:
+        start.assert_called_once_with(item)
+    else:
+        start.assert_not_called()
+
+
 @pytest.fixture
 def shard_config(monkeypatch):
     monkeypatch.delenv(_SPAWN_CHILD_ENV, raising=False)

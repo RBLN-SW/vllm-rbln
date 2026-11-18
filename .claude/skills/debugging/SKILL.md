@@ -17,7 +17,7 @@ Check these before concluding anything, because each one makes a reproduction si
 
 - **`tests/vllm/` scrubs `VLLM_RBLN_*`.** Exported values do not reach it; the session options are the only way in. A knob you "set" may never have applied.
 - **The vllm suite always uses device tensors.** Its common environment pins `VLLM_RBLN_USE_DEVICE_TENSOR=1` before the platform is imported.
-- **Marks decide the process.** `use_device` and `model_compile` items run in a spawned child. A failure that only appears in one of the two contexts is about the process, not the logic.
+- **Marks decide the process.** `model_compile` items run in a spawned child. `use_device` alone runs in this process, so check for global state left by earlier tests when a unit test fails only in a combined run.
 
 ## 2. Make the evidence discriminate
 

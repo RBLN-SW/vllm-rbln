@@ -44,10 +44,11 @@ Marks decide whether an item runs at all and whether it runs in this process or 
 | Mark               | Effect                                                                          |
 | ------------------ | ------------------------------------------------------------------------------- |
 | `model_compile`    | Whole-model compile, minutes. Skipped unless `--model-compile`. Always spawned.  |
-| `use_device`       | Always opens the NPU. Always spawned.                                            |
+| `use_device`       | Requires an NPU. Runs in this process unless also marked `model_compile`.         |
 | none               | Runs in this process.                                                            |
 
-Spawning is not an optimization. A test that opens the device in the parent process pins it for the rest of the session, so `use_device` exists to force a fresh process.
+Only whole-model compiles are isolated. Unit tests, including `use_device` tests,
+share a process and must restore any global state they change.
 
 Compiling an individual op is deliberately left unmarked so it stays in the default lane. Only a whole-model compile takes `model_compile`.
 
