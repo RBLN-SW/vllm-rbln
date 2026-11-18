@@ -201,8 +201,7 @@ class RBLNQwen3_5ForConditionalGeneration(
                 )
             self.mm_encoder_patch_buckets = [b * merge**2 for b in budgets]
             logger.info(
-                "Qwen3.5 vision encoder buckets: output tokens=%s, patches=%s",
-                budgets,
+                "Vision encoder buckets: patches=%s",
                 self.mm_encoder_patch_buckets,
             )
 
