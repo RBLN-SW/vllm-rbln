@@ -43,8 +43,9 @@ dependencies = [
     "torchvision",
     "torchaudio",
     "torchcodec",
-    "torch-rbln>=0.12.0,<0.12.1 ; platform_machine == 'x86_64'",
-    "optimum-rbln>=0.12.1a7,<0.12.2",
+    "torch-rbln>=0.12.1a1,<0.12.2 ; platform_machine == 'x86_64'",
+    "optimum-rbln>=0.12.1a11,<0.12.2",
+    "numba==0.65.0",
 ]
 
 [project.optional-dependencies]
@@ -75,10 +76,10 @@ dev = [
 ]
 
 runtime = [
-    "rebel-compiler>=0.12.1.dev483,<0.12.2",
+    "rebel-compiler>=0.12.1.dev739,<0.12.2",
 ]
 kv_connectors = [
-    "nixl-rbln>=0.12.0rc1,<0.12.1",
+    "nixl-rbln>=0.12.1.dev0,<0.12.2",
     "lmcache-rbln>=0.12.1.dev19,<0.12.2",
 ]
 
@@ -236,6 +237,6 @@ identifier-leading-digits = false
 locale = "en"
 extend-ignore-identifiers-re = ["NVML_*", ".*Unc.*", ".*_thw",
     ".*UE8M0.*", ".*[UE4M3|ue4m3].*", ".*eles.*",
-     ".*[Tt]h[rR].*"]
+     ".*[Tt]h[rR].*", "in_proj_ba"]
 extend-ignore-words-re = []
 extend-ignore-re = []

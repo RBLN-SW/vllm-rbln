@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -86,8 +86,6 @@ from vllm_rbln.model_executor.models.optimum.model_base import (
 )
 from vllm_rbln.platform.optimum_impl import patch_upstream
 from vllm_rbln.utils.optimum.bucket import select_bucket_size
-from vllm_rbln.utils.optimum.predicates import is_qwen3_embedding, is_qwen3_reranker
-from vllm_rbln.utils.optimum.registry import get_rbln_model_info
 from vllm_rbln.v1.core.optimum_scheduler import RBLNSchedulerOutput
 from vllm_rbln.v1.metrics.performance import (
     PerformanceContext,
@@ -124,28 +122,6 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         patch_upstream()
 
-        # Raises if the architecture has no optimum-rbln counterpart. Must run
-        # before the remap below, which rewrites it to an optimum-rbln-internal
-        # name. vLLM has already rejected anything it cannot resolve itself, so
-        # this only has to cover the RBLN side.
-        get_rbln_model_info(vllm_config.model_config)
-
-        if is_qwen3_reranker(vllm_config.model_config):
-            # Callers pass `Qwen3ForSequenceClassification`, which is how vLLM
-            # selects convert=classify; optimum-rbln has no such class. Map it
-            # back to `Qwen3ForCausalLM`: the score comes from two vocabulary
-            # logits, so the graph needs lm_head, which `Qwen3Model` would drop.
-            vllm_config.model_config.hf_config.__dict__["architectures"] = [
-                "Qwen3ForCausalLM"
-            ]
-        elif is_qwen3_embedding(vllm_config.model_config):
-            # The architecture of Qwen3-Embedding model in huggingface
-            # is `Qwen3ForCausalLM`. But it have to be mapped to `Qwen3Model`
-            # for optimum-rbln.
-            vllm_config.model_config.hf_config.__dict__["architectures"] = [
-                "Qwen3Model"
-            ]
-
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
@@ -173,7 +149,6 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         self.is_pooling_model = model_config.runner_type == "pooling"
         self.vocab_size = self.model_config.get_vocab_size()
         self.max_model_len = self.model_config.max_model_len
-        self.max_num_tokens = self.scheduler_config.max_num_batched_tokens
         self.max_num_reqs = self.scheduler_config.max_num_seqs
         self.inputs_embeds_size = self.model_config.get_inputs_embeds_size()
 
@@ -234,7 +209,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         self.input_batch = RBLNInputBatch(
             max_num_reqs=self.max_num_reqs,
             max_model_len=self.max_model_len,
-            max_num_batched_tokens=self.max_num_tokens,
+            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
             device=self.device,
             vocab_size=self.model_config.get_vocab_size(),
             block_sizes=[cache_config.block_size],

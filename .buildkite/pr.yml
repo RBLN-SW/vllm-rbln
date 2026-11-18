@@ -47,6 +47,17 @@ steps:
             tests/test_python_support.py \
             -q
 
+  - label: ":shield: security-tooling (diff)"
+    trigger: "standalone-security-tooling"
+    build:
+      message: "[sast-diff] ${BUILDKITE_PIPELINE_SLUG}@${BUILDKITE_COMMIT}"
+      env:
+        TARGET_REPO: "${BUILDKITE_REPO}"
+        TARGET_COMMIT: "${BUILDKITE_COMMIT}"
+        SCANNERS: sast
+        SAST_MODE: diff
+        SAST_BASELINE: dev
+
   # All gates must pass before the heavy test pipelines are even uploaded.
   - wait: ~
 

@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -65,8 +65,9 @@ class SupportsBlockAuxKVCaches(Protocol):
 
     A block-aux cache (`RBLNBlockAuxSpec`) is outside the KV cache config: its block
     `b` belongs to block `b` of the owner layer's cache, so it moves with the owner
-    group's blocks. The runner calls this before the warm-up, and
-    `register_kv_caches` later hands the caches over under the same names.
+    group's blocks. The runner calls this before the warm-up with the specs to
+    transfer. `register_kv_caches` later hands every cache over, `verify_only` ones
+    included, so the connector registers only the aux names it was given here.
     """
 
     def register_block_aux_kv_caches(

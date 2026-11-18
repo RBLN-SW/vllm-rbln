@@ -1,11 +1,11 @@
 # Copyright 2026 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -41,7 +41,11 @@ def image_url(image: str) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://127.0.0.1:8000/v1")
-    parser.add_argument("--image", required=True, help="Local path or URL.")
+    parser.add_argument(
+        "--image",
+        default="https://vllm-public-assets.s3.us-west-2.amazonaws.com/vision_model_images/stop_sign.jpg",
+        help="Local path or URL.",
+    )
     parser.add_argument("--prompt", default="What is in this image?")
     parser.add_argument("--max-tokens", type=int, default=64)
     args = parser.parse_args()

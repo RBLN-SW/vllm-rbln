@@ -1,18 +1,19 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from collections.abc import Callable
-from typing import Any
+from collections.abc import Callable, Iterable
+from types import FunctionType
+from typing import Any, Literal
 
 import rebel
 import torch
@@ -23,41 +24,23 @@ from vllm.v1.outputs import LogprobsTensors, SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.logprobs import batched_count_greater_than
 from vllm.v1.sample.sampler import Sampler as VLLMSampler
+from vllm.v1.worker.gpu_input_batch import InputBatch
 
 import vllm_rbln.envs as envs
 from vllm_rbln.compilation import compile, create_compile_context
 from vllm_rbln.logger import init_logger
 from vllm_rbln.platform import use_device_tensor
+from vllm_rbln.v1.sample.ops.fused_penalty import (
+    FusedPenaltyPlan,
+    FusedPenaltyState,
+    apply_fused_penalty,
+    supports_vocab,
+    uses_argmax_invariant_processors,
+    without_penalties_and_logit_bias,
+)
 from vllm_rbln.v1.sample.ops.top_k_top_p import build_op_top_k_top_p
 
 logger = init_logger(__name__)
-
-
-# TODO(yunseong): move this to the runner
-def _stage_into(owner: Any, out: torch.Tensor) -> torch.Tensor:
-    """Snapshot `out` into a buffer belonging to `owner`, alternating two slots.
-
-    `out` is the sampling graph's own output, which the runtime recycles on the
-    next launch. Async holds the sampled tokens past the step boundary, so it
-    gets this copy instead. Enqueued here, next to the launch, and not by the
-    caller: a non_blocking copy is only safe while the source cannot have been
-    recycled yet, and every device op between the two widens that window.
-    """
-    ring = owner._sampled_token_ring
-    if (
-        not ring
-        or ring[0].shape != out.shape
-        or ring[0].dtype != out.dtype
-        or ring[0].device != out.device
-    ):
-        ring = [torch.empty_like(out) for _ in range(2)]
-        owner._sampled_token_ring = ring
-        owner._ring_slot = 0
-    buf = ring[owner._ring_slot]
-    owner._ring_slot ^= 1
-    # non_blocking, or the copy waits on the sampling graph.
-    buf.copy_(out, non_blocking=True)
-    return buf
 
 
 def rbln_top_k_top_p_sample(
@@ -89,6 +72,42 @@ def rbln_greedy_sample(logits: torch.Tensor) -> torch.Tensor:
     """
     # NOTE(RBLN): argmax op is registered in the compiler
     return torch.ops.rbln.argmax(logits)
+
+
+def _as_batch_tensor(t: torch.Tensor | None) -> torch.Tensor | None:
+    # Dynamo guards on the dispatch key set. Batch-owned tensors carry
+    # ADInplaceOrView and step-made inference tensors do not, so copy the latter.
+    if t is None or not t.is_inference():
+        return t
+    with torch.inference_mode(False):
+        return t.clone()
+
+
+FusedGraphKind = Literal["penalize", "greedy", "top_k_top_p"]
+
+
+def _fused_graph_fn(
+    kind: FusedGraphKind, rows: int, row_vocab: int, k: int
+) -> Callable[..., torch.Tensor]:
+    def penalize(logits, cidx, lanes):
+        return apply_fused_penalty(logits, cidx, lanes, rows, row_vocab, k)
+
+    def greedy(logits, cidx, lanes):
+        return rbln_greedy_sample(penalize(logits, cidx, lanes))
+
+    def top_k_top_p(logits, cidx, lanes, temperature, top_k, top_p):
+        logits = penalize(logits, cidx, lanes)
+        return rbln_top_k_top_p_sample(logits, temperature, top_k, top_p)
+
+    graphs: dict[str, Callable[..., torch.Tensor]] = {
+        "penalize": penalize,
+        "greedy": greedy,
+        "top_k_top_p": top_k_top_p,
+    }
+    fn = graphs[kind]
+    # Dynamo caps compiled entries per code object, so each key gets its own.
+    code = fn.__code__.replace(co_name=f"fused_{kind}_{rows}x{row_vocab}_k{k}")
+    return FunctionType(code, fn.__globals__, code.co_name, None, fn.__closure__)
 
 
 def compile_sampler(
@@ -145,7 +164,6 @@ class RBLNTopKTopPSampler(nn.Module):
         temperature: torch.Tensor,
         k: torch.Tensor | None,
         p: torch.Tensor | None,
-        staging_owner: Any = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """More optimized implementation for top-k and top-p sampling.
 
@@ -158,8 +176,6 @@ class RBLNTopKTopPSampler(nn.Module):
             )
 
         out = self._compiled_rbln_topk_topp_sampler(logits, temperature, k, p)
-        if staging_owner is not None:
-            out = _stage_into(staging_owner, out)
         return out, None
 
 
@@ -169,6 +185,7 @@ class RBLNSampler(VLLMSampler):
         logprobs_mode: LogprobsMode = "raw_logprobs",
         use_fp64_gumbel: bool = False,
         compile_context: rebel.CompileContext | None = None,
+        fused_sampling: bool = False,
     ):
         super().__init__(logprobs_mode=logprobs_mode, use_fp64_gumbel=use_fp64_gumbel)
 
@@ -194,18 +211,56 @@ class RBLNSampler(VLLMSampler):
             rbln_greedy_sample, compile_context
         )
 
-    def greedy_sample(
-        self, logits: torch.Tensor, staging_owner: Any = None
-    ) -> torch.Tensor:
-        out = self._compiled_greedy_sample(logits)
-        return out if staging_owner is None else _stage_into(staging_owner, out)
+        self._compile_context = compile_context
+        self._penalty_state = (
+            FusedPenaltyState()
+            if fused_sampling and logprobs_mode in ("raw_logprobs", "raw_logits")
+            else None
+        )
+        self._fused_graphs: dict[tuple, Callable[..., torch.Tensor]] = {}
+
+    def _fused_graph(
+        self, kind: FusedGraphKind, plan: FusedPenaltyPlan
+    ) -> Callable[..., torch.Tensor]:
+        key = (kind, plan.rows, plan.row_vocab, plan.k)
+        fn = self._fused_graphs.get(key)
+        if fn is None:
+            fn = self._fused_graphs[key] = compile_sampler(
+                _fused_graph_fn(*key), self._compile_context
+            )
+        return fn
+
+    def forget_requests(self, req_ids: Iterable[str]) -> None:
+        """Drop the fused-penalty state of finished requests."""
+        if self._penalty_state is not None:
+            self._penalty_state.forget(req_ids)
+
+    def warm_up(
+        self, logits: torch.Tensor, sampling_metadata: SamplingMetadata
+    ) -> None:
+        """Compile the graphs `sampling_metadata` reaches, fused ones at every k."""
+        _ = self(logits=logits, sampling_metadata=sampling_metadata)
+        state = self._penalty_state
+        if state is None or not supports_vocab(logits.shape[-1]):
+            return
+        for k in state.k_buckets(logits.shape):
+            plan = state.identity_plan(logits.shape, logits.device, k)
+            self.sample(logits.clone(), sampling_metadata, penalty=plan)
+            if not sampling_metadata.all_greedy:
+                # Steps with min_p penalize before the eager processors.
+                self._fused_graph("penalize", plan)(
+                    logits.clone(), plan.cidx, plan.lanes
+                )
+
+    def greedy_sample(self, logits: torch.Tensor) -> torch.Tensor:
+        return self._compiled_greedy_sample(logits)
 
     def sample(
         self,
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
         logprobs_mode_override: LogprobsMode | None = None,
-        staging_owner: Any = None,
+        penalty: FusedPenaltyPlan | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Sample logits based on sampling metadata.
 
@@ -229,7 +284,12 @@ class RBLNSampler(VLLMSampler):
                     processed_logprobs = logits
                 elif logprobs_mode == "processed_logprobs":
                     processed_logprobs = self.compute_logprobs(logits)
-            return self.greedy_sample(logits, staging_owner), processed_logprobs
+            if penalty is not None:
+                out = self._fused_graph("greedy", penalty)(
+                    logits, penalty.cidx, penalty.lanes
+                )
+                return out, processed_logprobs
+            return self.greedy_sample(logits), processed_logprobs
 
         assert sampling_metadata.temperature is not None
 
@@ -240,7 +300,13 @@ class RBLNSampler(VLLMSampler):
         argmax_invariant = sampling_metadata.logitsprocs.argmax_invariant
         # if argmax_invariant processors are active, apply temperature scaling
         # before applying them.
-        if any(getattr(p, "min_p_count", 1) for p in argmax_invariant):
+        if uses_argmax_invariant_processors(sampling_metadata):
+            if penalty is not None:
+                # min_p and friends read the penalized logits.
+                logits = self._fused_graph("penalize", penalty)(
+                    logits, penalty.cidx, penalty.lanes
+                )
+                penalty = None
             # Divide in place, as upstream does: allocating a second logits-sized
             # tensor here costs more than the division itself. Rows past num_reqs of
             # the padded buffer must therefore carry temperature 1.0 -- see
@@ -259,6 +325,17 @@ class RBLNSampler(VLLMSampler):
             logits.shape[-1],
             logits.device,
         )
+        if penalty is not None:
+            out = self._fused_graph("top_k_top_p", penalty)(
+                logits,
+                penalty.cidx,
+                penalty.lanes,
+                _as_batch_tensor(temperature),
+                _as_batch_tensor(k),
+                _as_batch_tensor(p),
+            )
+            return out, None
+
         # Apply temperature and top_k and/or top_p.
         random_sampled, processed_logprobs = self.topk_topp_sampler(
             logits,
@@ -266,7 +343,6 @@ class RBLNSampler(VLLMSampler):
             temperature,
             k,
             p,
-            staging_owner,
         )
 
         return random_sampled, processed_logprobs
@@ -277,7 +353,7 @@ class RBLNSampler(VLLMSampler):
         sampling_metadata: SamplingMetadata,
         predict_bonus_token: bool = False,
         logprobs_mode_override: LogprobsMode | None = None,
-        staging_owner: Any = None,
+        input_batch: InputBatch | None = None,
     ) -> SamplerOutput:
         logprobs_mode = logprobs_mode_override or self.logprobs_mode
         # NOTE(woosuk): Use the original logits (before any penalties or
@@ -299,12 +375,25 @@ class RBLNSampler(VLLMSampler):
         # Use float32 for the logits.
         # logits = logits.to(torch.float32)
 
+        penalty = None
+        if (
+            self._penalty_state is not None
+            and input_batch is not None
+            and not predict_bonus_token
+        ):
+            penalty = self._penalty_state.plan(
+                sampling_metadata, input_batch, logits.shape, logits.device
+            )
         logits = self.apply_logits_processors(
-            logits, sampling_metadata, predict_bonus_token
+            logits,
+            sampling_metadata
+            if penalty is None
+            else without_penalties_and_logit_bias(sampling_metadata),
+            predict_bonus_token,
         )
         # Sample the next token.
         sampled, processed_logprobs = self.sample(
-            logits, sampling_metadata, staging_owner=staging_owner
+            logits, sampling_metadata, penalty=penalty
         )
         if processed_logprobs is not None:
             raw_logprobs = processed_logprobs

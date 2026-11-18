@@ -1,20 +1,44 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Callable
 from typing import Union
 
 import torch
+from vllm.forward_context import get_forward_context
+
+
+def is_prefill_step() -> bool:
+    """The step's prefill/decode classification, read off the attention metadata
+    the runner put in the forward context (one per layer; every layer agrees)."""
+    attn_metadata = get_forward_context().attn_metadata
+    if isinstance(attn_metadata, dict):
+        attn_metadata = next(iter(attn_metadata.values()))
+    return attn_metadata.is_prefill
+
+
+def run_mm_encoder(
+    encoder: Callable[..., torch.Tensor],
+    inputs: list[torch.Tensor],
+    num_embeddings: int,
+    *,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    embeds = encoder(*inputs)[:num_embeddings]
+    if dtype is None:
+        return embeds.cpu()
+    return embeds.to(device="cpu", dtype=dtype)
 
 
 def pad(

@@ -279,25 +279,102 @@ class TestAcceptedTokensReAdd:
         assert "a" not in runner.state_pos_by_req
 
 
-class TestWritebackBeforeReAdd:
-    def test_evicted_decode_comes_back_with_its_sampled_token(
+class TestTokenFeedbackBeforeReAdd:
+    def test_custom_processor_receives_completed_token_history(
         self, make_model_runner, monkeypatch
     ):
-        # Async scheduling leaves a -1 for the token still being sampled. If a
-        # prefill-only step evicts the request first, only the writeback repairs
-        # its cached state, as all_token_ids no longer arrives; the re-add then
-        # rebuilds the row from that state.
+        from vllm.v1.sample.logits_processor import LogitsProcessor
+        from vllm.v1.sample.logits_processor.builtin import process_dict_updates
+
+        from tests.vllm.v1.worker.test_async_output import _async_output
+
+        class CachesLastToken(LogitsProcessor):
+            def __init__(self, vllm_config, device, is_pin_memory):
+                self.histories = {}
+                self.last_tokens = {}
+
+            def is_argmax_invariant(self):
+                return False
+
+            def update_state(self, batch_update):
+                process_dict_updates(
+                    self.histories,
+                    batch_update,
+                    lambda params, prompt, output: output,
+                )
+                self.last_tokens = {
+                    row: history[-1]
+                    for row, history in self.histories.items()
+                    if history
+                }
+
+            def apply(self, logits):
+                for row, token in self.last_tokens.items():
+                    logits[row, token] = float("-inf")
+                return logits
+
         _last_rank(monkeypatch)
-        runner = make_model_runner()
+        runner = make_model_runner(logits_processors=[CachesLastToken])
+        runner.use_async_scheduling = True
         runner._update_states(schedule_new("a"))
         state = runner.requests["a"]
         n = state.num_prompt_tokens
         state.output_token_ids.append(-1)
-        runner._pending_token_writeback.append((["a"], [[42]], {"a": n}))
+        runner.input_batch.token_ids_cpu[0, n] = -1
+        runner.input_batch.num_tokens_no_spec[0] = n + 1
+        previous = _async_output(
+            torch.tensor([[42]], dtype=torch.int32),
+            req_ids=["a"],
+            placeholder_pos={"a": n},
+        )
+        assert previous.get_output().sampled_token_ids == [[42]]
+        runner._prev_async_output = previous
+
+        runner._update_states(
+            schedule_cached(
+                req_ids=["a"], num_computed_tokens=[n], num_output_tokens=[1]
+            )
+        )
+        runner._repair_staged_input_ids()
+        processor = next(
+            proc
+            for proc in runner.input_batch.logitsprocs.all
+            if isinstance(proc, CachesLastToken)
+        )
+        logits = torch.full((1, 128), float("-inf"))
+        logits[0, 42] = 10
+        logits[0, 43] = 9
+
+        assert processor.apply(logits).argmax(-1).item() == 43
+        assert processor.last_tokens == {0: 42}
+        assert state.output_token_ids == [42]
+
+    @pytest.mark.parametrize("repair_during_prefill", [False, True])
+    def test_evicted_decode_comes_back_with_its_sampled_token(
+        self, make_model_runner, monkeypatch, repair_during_prefill
+    ):
+        from tests.vllm.v1.worker.test_async_output import _async_output
+
+        _last_rank(monkeypatch)
+        runner = make_model_runner()
+        runner.use_async_scheduling = True
+        runner._update_states(schedule_new("a"))
+        state = runner.requests["a"]
+        n = state.num_prompt_tokens
+        state.output_token_ids.append(-1)
+        runner._prev_async_output = _async_output(
+            torch.tensor([[42]], dtype=torch.int32),
+            req_ids=["a"],
+            placeholder_pos={"a": n},
+        )
         runner._update_states(make_scheduler_output(num_scheduled_tokens={}))
         assert not is_in_batch(runner, "a")
 
-        runner._apply_pending_token_writeback()
+        if repair_during_prefill:
+            runner.is_prefill = True
+            runner._repair_staged_input_ids(
+                SimpleNamespace(input_ids=torch.empty((0, 1), dtype=torch.int32)), []
+            )
         runner._update_states(
             schedule_cached(
                 req_ids=["a"], num_computed_tokens=[n], num_output_tokens=[1]
@@ -306,6 +383,69 @@ class TestWritebackBeforeReAdd:
 
         req_index = runner.input_batch.req_id_to_index["a"]
         assert runner.input_batch.token_ids_cpu[req_index, n] == 42
+        assert runner.requests["a"].output_token_ids == [42]
+        assert runner._prev_async_output is None
+
+    def test_continuing_decode_defers_feedback_until_input_repair(
+        self, make_model_runner, monkeypatch
+    ):
+        from tests.vllm.v1.worker.test_async_output import _async_output
+
+        _last_rank(monkeypatch)
+        runner = make_model_runner()
+        runner.use_async_scheduling = True
+        runner._update_states(schedule_new("a"))
+        state = runner.requests["a"]
+        n = state.num_prompt_tokens
+        state.output_token_ids.append(-1)
+        previous = _async_output(
+            torch.tensor([[42]], dtype=torch.int32),
+            req_ids=["a"],
+            placeholder_pos={"a": n},
+        )
+        runner._prev_async_output = previous
+        runner._update_states(
+            schedule_cached(
+                req_ids=["a"], num_computed_tokens=[n], num_output_tokens=[1]
+            )
+        )
+        assert state.output_token_ids == [-1]
+        assert runner._prev_async_output is previous
+
+        runner.is_prefill = False
+        staged = SimpleNamespace(input_ids=torch.full((1, 1), -1, dtype=torch.int32))
+        runner._repair_staged_input_ids(staged, ["a"])
+        assert staged.input_ids.tolist() == [[42]]
+        assert state.output_token_ids == [42]
+
+    def test_readding_an_unrelated_request_does_not_wait_for_feedback(
+        self, make_model_runner, monkeypatch
+    ):
+        from tests.vllm.v1.worker.test_async_output import _async_output
+
+        _last_rank(monkeypatch)
+        runner = make_model_runner()
+        runner.use_async_scheduling = True
+        runner._update_states(schedule_new("b"))
+        b_prompt_len = runner.requests["b"].num_prompt_tokens
+        runner._update_states(schedule_new("a"))
+        state = runner.requests["a"]
+        state.output_token_ids.append(-1)
+        previous = _async_output(
+            torch.tensor([[42]], dtype=torch.int32),
+            req_ids=["a"],
+            placeholder_pos={"a": state.num_prompt_tokens},
+        )
+        runner._prev_async_output = previous
+
+        runner._update_states(
+            schedule_cached(
+                req_ids=["b"], num_computed_tokens=[b_prompt_len], num_output_tokens=[0]
+            )
+        )
+
+        assert runner._prev_async_output is previous
+        assert state.output_token_ids == [-1]
 
 
 class TestSeededRequest:
@@ -524,3 +664,71 @@ class TestSampleTokensOnDrafterOverflow:
         # What the scheduler actually receives. .tolist() is also the only read of
         # the expanded (non-contiguous) view the runner builds.
         assert runner.take_draft_token_ids().draft_token_ids == [[0, 0, 0]]
+
+    @pytest.mark.parametrize("strict_kv_producer", [False, True])
+    def test_a_producer_does_not_ask_a_proposer_that_holds_no_kv(
+        self, make_model_runner, monkeypatch, strict_kv_producer
+    ):
+        # ngram writes no KV, so on a producer its drafts would be built and then
+        # dropped by take_draft_token_ids. A decoding role still asks for them.
+        _last_rank(monkeypatch)
+        runner = make_model_runner(
+            speculative_config={
+                "method": "ngram",
+                "num_speculative_tokens": 3,
+                "prompt_lookup_max": 4,
+            }
+        )
+        scheduler_output = schedule_new("a")
+        runner._update_states(scheduler_output)
+        runner.is_strict_kv_producer = strict_kv_producer
+        # 10 + 3 <= 64, so the input fits and the role decides the outcome.
+        monkeypatch.setattr(runner, "effective_drafter_max_model_len", 64)
+        runner.execute_model_state = mr.ExecuteModelState(
+            scheduler_output=scheduler_output,
+            logits=torch.zeros((1, 8)),
+            spec_decode_metadata=None,
+            spec_decode_common_attn_metadata=SimpleNamespace(max_seq_len=10),
+            hidden_states=torch.zeros((1, 4)),
+            sample_hidden_states=torch.zeros((1, 4)),
+            combined_hidden_states=None,
+        )
+        asked: list[str] = []
+        monkeypatch.setattr(
+            runner, "propose_draft_token_ids", lambda *a, **kw: asked.append("draft")
+        )
+        monkeypatch.setattr(
+            runner,
+            "_sample",
+            lambda logits, spec_decode_metadata: SimpleNamespace(
+                sampled_token_ids=torch.tensor([[101]], dtype=torch.int32)
+            ),
+        )
+        monkeypatch.setattr(
+            runner,
+            "_bookkeeping_sync",
+            lambda *args: ({}, None, [[101]], {}, ["a"], {"a": 0}, []),
+        )
+
+        runner.sample_tokens(grammar_output=None)
+
+        assert bool(asked) is not strict_kv_producer
+
+    def test_a_strict_producer_publishes_no_drafts(
+        self, make_model_runner, monkeypatch
+    ):
+        # A producer verifies nothing, so the placeholder above must not reach
+        # the scheduler: it drops drafts only for a request still chunking, and
+        # the last chunk is not one. Accepted, the next step would schedule
+        # 1 + num_spec tokens and look for a graph a producer does not compile.
+        _last_rank(monkeypatch)
+        runner = make_model_runner(
+            speculative_config={
+                "method": "ngram",
+                "num_speculative_tokens": 3,
+                "prompt_lookup_max": 4,
+            }
+        )
+        runner._update_states(schedule_new("a"))
+        runner.is_strict_kv_producer = True
+        assert runner.take_draft_token_ids() is None
