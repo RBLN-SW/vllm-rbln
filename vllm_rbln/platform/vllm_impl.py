@@ -149,6 +149,7 @@ def _validate(vllm_config: "VllmConfig") -> None:
                 f"{parallel_config.data_parallel_size}."
             )
         spec = vllm_config.speculative_config
+        # The verify kernel takes up to 7 drafts; 1 to 5 ran on a device.
         if spec is not None and (
             spec.method != "mtp" or not 1 <= spec.num_speculative_tokens <= 5
         ):
@@ -551,6 +552,16 @@ def _override(vllm_config: "VllmConfig") -> None:
     if model_config.enforce_eager:
         # RBLN(NOTE): force dtype into fp16 for eager mode
         model_config.dtype = torch.float16
+
+    if (
+        _keeps_recurrent_state(vllm_config)
+        and vllm_config.speculative_config is not None
+        and model_config.dtype.itemsize != 2
+    ):
+        raise ValueError(
+            "The MTP verify kernel of a recurrent state takes 16-bit activations on "
+            f"RBLN; got dtype {model_config.dtype}."
+        )
 
     text_config = model_config.hf_text_config
     if text_config.model_type == "glm5_next_text":

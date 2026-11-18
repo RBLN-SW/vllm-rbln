@@ -598,6 +598,19 @@ class TestRejectedConfigs:
         assert config.cache_config.mamba_cache_mode == "none"
         assert config.cache_config.mamba_block_size == config.model_config.max_model_len
 
+    def test_glm5_next_mtp_takes_16_bit_activations(self, reconfigure):
+        def forced_to_fp32(config):
+            _as_glm5_next(config)
+            config.speculative_config = SimpleNamespace(
+                method="mtp", num_speculative_tokens=1
+            )
+            config.additional_config = replace(
+                config.additional_config, enforce_model_fp32=True
+            )
+
+        with pytest.raises(ValueError, match="16-bit activations"):
+            reconfigure(forced_to_fp32)
+
     @pytest.fixture
     def gdn(self, monkeypatch):
         """The hook sees a GatedDeltaNet model with Qwen3.5-4B's 32 value heads."""
@@ -676,6 +689,19 @@ class TestRejectedConfigs:
                 reconfigure(speculative(method, drafts))
         for drafts in (1, 5):
             reconfigure(speculative("mtp", drafts))
+
+    def test_gdn_mtp_takes_16_bit_activations(self, reconfigure, gdn):
+        def forced_to_fp32(config):
+            gdn(config)
+            config.speculative_config = SimpleNamespace(
+                method="mtp", num_speculative_tokens=1
+            )
+            config.additional_config = replace(
+                config.additional_config, enforce_model_fp32=True
+            )
+
+        with pytest.raises(ValueError, match="16-bit activations"):
+            reconfigure(forced_to_fp32)
 
     def test_gdn_models_reject_the_custom_kernel_option(self, reconfigure, gdn):
         def custom_kernel(config):
