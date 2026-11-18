@@ -118,9 +118,11 @@ class AXK3GatedResidual(nn.Module):
         if residual.dim() == 4:
             write_gate = None
             if self.write_proj is None:
-                u = torch.ops.rbln_custom_ops.axk3_gr_norm_last(
-                    residual, self.gamma, self.norm.variance_epsilon
-                )
+                # The final read runs once per model: its norm stays a plain op,
+                # and the read op gathers the rows before lm_head.
+                gamma = self.gamma.view(self.num_streams, 1, self.hidden_size)
+                u = self.norm(residual.float()) * gamma.float()
+                u = u.to(residual.dtype)
             else:
                 u, write_gate = torch.ops.rbln_custom_ops.axk3_gr_norm(
                     residual,

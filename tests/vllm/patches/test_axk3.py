@@ -317,19 +317,9 @@ def test_a_decode_batch_runs_the_gated_residual_ops(gated_residual_model, monkey
     def forward():
         return built.model.forward(None, torch.zeros(8, 1), None, embeds)
 
-    def norm_last(residual, gamma, eps):
-        """axk3_gr_norm_last, which a compiler before the decode cut lacks."""
-        rows = residual.float()
-        normed = rows * torch.rsqrt(rows.pow(2).mean(dim=-1, keepdim=True) + eps)
-        gain = gamma.view(residual.shape[1], 1, -1).float()
-        return (normed * gain).to(residual.dtype)
-
     plain = forward()
     built.read_dims.clear()
     monkeypatch.setattr(axk3_model, "_CUTS_THE_DECODE_GR", True)
-    monkeypatch.setattr(
-        torch.ops.rbln_custom_ops, "axk3_gr_norm_last", norm_last, raising=False
-    )
     cut = forward()
 
     # Every read, the final one too, takes [B, n, T, h].
