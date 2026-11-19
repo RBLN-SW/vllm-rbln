@@ -142,12 +142,24 @@ class RBLNScheduler(Scheduler):
                     f"got {self.mm_prefill_lookahead}. Multi-module multimodal "
                     "MTP is not supported."
                 )
-            # At an item boundary, the target still needs the previous item's
-            # tail while the drafter needs the next item's whole encoder output.
+            # One-token lookahead can add a whole encoder item to the baseline
+            # demand. Each allowance already fits the largest item, so doubling
+            # provides a conservative bound.
+            encoder_compute_budget = self.max_num_encoder_input_tokens
             self.max_num_encoder_input_tokens *= 2
             manager = self.encoder_cache_manager
             self.encoder_cache_manager = manager.create_manager(
                 cache_size=2 * manager.cache_size, vllm_config=self.vllm_config
+            )
+            logger.info(
+                "Multimodal draft prefill lookahead=%d: "
+                "max_num_encoder_input_tokens=%d -> %d, "
+                "encoder_cache_size=%d -> %d (embedding rows).",
+                self.mm_prefill_lookahead,
+                encoder_compute_budget,
+                self.max_num_encoder_input_tokens,
+                manager.cache_size,
+                self.encoder_cache_manager.cache_size,
             )
 
         rbln_config: RBLNConfig = self.vllm_config.additional_config
