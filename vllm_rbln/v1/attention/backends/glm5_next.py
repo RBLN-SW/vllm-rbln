@@ -96,6 +96,7 @@ class RBLNGlm5NextMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
         num_accepted: torch.Tensor | None = None,
         state_load_pos: torch.Tensor | None = None,
         mm_prefix_row_ends: torch.Tensor | None = None,
+        group_shared: dict[tuple, torch.Tensor] | None = None,
         defer_staging: bool = False,
     ) -> RBLNFlashAttentionMetadata:
         metadata = super().build(
@@ -126,7 +127,7 @@ class RBLNGlm5NextMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
         metadata.cache_offsets = seq_lens
         if not isinstance(self.kv_cache_spec, MambaSpec):
             if not defer_staging:
-                self.stage(metadata)
+                self.stage(metadata, group_shared)
             return metadata
         num_computed_tokens = num_computed_tokens[:num_reqs]
         seq_lens = seq_lens[:num_reqs]
@@ -151,11 +152,15 @@ class RBLNGlm5NextMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
             store_blocks=store_blocks,
         )
         if not defer_staging:
-            self.stage(metadata)
+            self.stage(metadata, group_shared)
         return metadata
 
-    def stage(self, metadata: RBLNFlashAttentionMetadata) -> None:
-        super().stage(metadata)
+    def stage(
+        self,
+        metadata: RBLNFlashAttentionMetadata,
+        group_shared: dict[tuple, torch.Tensor] | None = None,
+    ) -> None:
+        super().stage(metadata, group_shared)
         if isinstance(metadata, RBLNGlm5NextStateMetadata):
             metadata.load_blocks = self._stage(metadata.load_blocks, "load_blocks")
             metadata.store_blocks = self._stage(metadata.store_blocks, "store_blocks")
