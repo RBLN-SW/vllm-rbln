@@ -491,8 +491,8 @@ class TestGetKvCacheNames:
         ids=["decoder-layers", "glm-slots"],
     )
     def test_orders_by_numeric_path(self, names):
-        layers = {name: SimpleNamespace() for name in reversed(names)}
-        assert get_kv_cache_names(layers, layers) == list(names)
+        layers = {name: SimpleNamespace() for name in names}
+        assert get_kv_cache_names(reversed(names), layers) == list(names)
 
     @pytest.mark.parametrize("aux_name", ["indexer", "renamed", "conv_ring"])
     def test_aux_caches_sort_by_subindex(self, aux_name):
@@ -508,9 +508,10 @@ class TestGetKvCacheNames:
         assert get_kv_cache_names((scale, aux, main), layers) == [main, aux, scale]
 
     def test_duplicate_order_is_an_error(self):
-        layers = {name: SimpleNamespace() for name in ("layer.3.main", "layer.3.other")}
+        names = ("layer.3.main", "layer.3.other")
+        layers = {name: SimpleNamespace() for name in names}
         with pytest.raises(ValueError, match="main.*other|other.*main"):
-            get_kv_cache_names(layers, layers)
+            get_kv_cache_names(names, layers)
 
 
 class TestPrepareKernelBlockSizes:
