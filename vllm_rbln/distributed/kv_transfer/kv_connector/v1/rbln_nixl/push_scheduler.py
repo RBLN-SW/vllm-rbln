@@ -78,8 +78,8 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
 
         NOTE(RBLN): on the read path the producer names it once it has finished;
         a writer's consumer allocates first, so it derives the same boundary
-        from the token count both ends transfer, which the opt-in -- matched by
-        the compatibility hash -- guarantees the producer carries.
+        from the prompt and the token count both ends transfer. The compatibility
+        hash guarantees the producer decided the same way and carries it.
         """
         count, load_async = super().get_num_new_matched_tokens(
             request, num_computed_tokens
