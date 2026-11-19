@@ -23,7 +23,6 @@ from typing import Any
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.model_executor.model_loader.utils import get_model_architecture
-from vllm.model_executor.models.interfaces import supports_multimodal_embeddings
 from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
@@ -50,6 +49,9 @@ from vllm_rbln.distributed.ec_transfer.ec_connector.rbln_ec_cpu_connector import
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import iter_kv_connectors
 from vllm_rbln.logger import init_logger
+from vllm_rbln.model_executor.models.interfaces import (
+    supports_rbln_multimodal_embeddings,
+)
 from vllm_rbln.v1.core.rbln_kv_cache_manager import (
     KVCacheCopyOp,
     RBLNKVCacheManager,
@@ -130,7 +132,7 @@ class RBLNScheduler(Scheduler):
             spec = self.vllm_config.speculative_config
             assert spec is not None
             draft_cls, _ = get_model_architecture(spec.draft_model_config)
-            if supports_multimodal_embeddings(draft_cls):
+            if supports_rbln_multimodal_embeddings(draft_cls):
                 self.mm_prefill_lookahead = self.num_prefill_lookahead
 
         if self.mm_prefill_lookahead:

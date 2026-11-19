@@ -33,7 +33,9 @@ from vllm_rbln.compilation import (
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.logger import init_logger
-from vllm_rbln.model_executor.models.qwen3_5 import RBLNQwen3_5MTP
+from vllm_rbln.model_executor.models.interfaces import (
+    supports_rbln_multimodal_embeddings,
+)
 from vllm_rbln.platform import use_device_tensor
 from vllm_rbln.v1.attention.kv_cache_bindings import (
     attach_kv_cache_bindings,
@@ -415,17 +417,19 @@ class RBLNEagleProposer(EagleProposer):
 
     def load_model(self, target_model: nn.Module) -> None:
         super().load_model(target_model)
-        if self.supports_mm_inputs and not isinstance(self.model, RBLNQwen3_5MTP):
+        if self.supports_mm_inputs and not supports_rbln_multimodal_embeddings(
+            self.model
+        ):
             raise NotImplementedError(
-                "vllm-rbln supports multimodal embeddings only for the "
-                "Qwen3.5 MTP drafter."
+                "The draft model must declare supports_rbln_multimodal_embeddings=True "
+                "to use external multimodal embeddings on RBLN."
             )
         if (
             self.supports_mm_inputs
             and self.vllm_config.parallel_config.pipeline_parallel_size != 1
         ):
             raise NotImplementedError(
-                "Multimodal Qwen3.5 MTP requires pipeline_parallel_size=1."
+                "Multimodal drafting requires pipeline_parallel_size=1."
             )
 
         self.draft_id_to_target_id = getattr(self.model, "draft_id_to_target_id", None)

@@ -726,10 +726,11 @@ class TestPropose:
 
 class TestLoadModel:
     @pytest.mark.parametrize("pp_size", [1, 2])
-    def test_qwen_mtp_multimodal_wrapper(self, monkeypatch, pp_size):
-        from vllm_rbln.model_executor.models.qwen3_5 import RBLNQwen3_5MTP
+    def test_multimodal_wrapper_accepts_an_opted_in_draft(self, monkeypatch, pp_size):
+        class Draft(torch.nn.Module):
+            supports_multimodal_embeddings = True
+            supports_rbln_multimodal_embeddings = True
 
-        class Draft(RBLNQwen3_5MTP):
             def __init__(self):
                 torch.nn.Module.__init__(self)
                 self.seen = None

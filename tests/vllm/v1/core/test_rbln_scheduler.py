@@ -2445,19 +2445,30 @@ class TestMultimodalDraftEncoderLookahead:
             assert sched.mm_prefill_lookahead == 0
 
     @pytest.mark.parametrize("running", [False, True])
-    @pytest.mark.parametrize("draft_accepts_mm", [False, True])
+    @pytest.mark.parametrize(
+        "draft_accepts_mm,draft_accepts_rbln_mm",
+        [(False, False), (False, True), (True, False), (True, True)],
+    )
     @pytest.mark.parametrize("with_text_prefix", [False, True])
     def test_encodes_an_image_starting_just_after_the_target_chunk(
-        self, monkeypatch, running, draft_accepts_mm, with_text_prefix
+        self,
+        monkeypatch,
+        running,
+        draft_accepts_mm,
+        draft_accepts_rbln_mm,
+        with_text_prefix,
     ):
-        if not draft_accepts_mm:
-            from vllm_rbln.model_executor.models.glm5_next import RBLNGlm5NextMTP
+        from vllm_rbln.model_executor.models.qwen3_5 import RBLNQwen3_5MTP
 
-            monkeypatch.setattr(
-                rbln_scheduler,
-                "get_model_architecture",
-                lambda config: (RBLNGlm5NextMTP, "Glm5NextMTP"),
-            )
+        monkeypatch.setattr(
+            RBLNQwen3_5MTP, "supports_multimodal_embeddings", draft_accepts_mm
+        )
+        monkeypatch.setattr(
+            RBLNQwen3_5MTP,
+            "supports_rbln_multimodal_embeddings",
+            draft_accepts_rbln_mm,
+            raising=False,
+        )
         sched = self._scheduler()
         offset = 256 if running else 128
         feature = image_at(offset, 64)
@@ -2477,7 +2488,7 @@ class TestMultimodalDraftEncoderLookahead:
 
         assert out.num_scheduled_tokens == {"image": 128}
         assert out.scheduled_encoder_inputs == (
-            {"image": [0]} if draft_accepts_mm else {}
+            {"image": [0]} if draft_accepts_mm and draft_accepts_rbln_mm else {}
         )
 
     def test_encoder_budget_backpressure_keeps_the_lookahead_available(self):

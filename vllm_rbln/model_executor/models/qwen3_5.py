@@ -25,6 +25,7 @@ compiled graph.
 
 import math
 from collections.abc import Callable, Iterable, Mapping
+from typing import ClassVar
 
 import torch
 import torch.nn.functional as F
@@ -394,6 +395,8 @@ class RBLNQwen3_5ForConditionalGeneration(
 class RBLNQwen3_5MTP(Qwen3_5MTP):
     """Upstream's drafter with its layers numbered past the target's: the runner
     orders the KV caches by the number in a layer's name, one layer a number."""
+
+    supports_rbln_multimodal_embeddings: ClassVar[bool] = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
