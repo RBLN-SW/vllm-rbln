@@ -71,6 +71,7 @@ def visual(tmp_path):
                 param.data.normal_(0, 0.05)
             yield tower
         finally:
+            torch._dynamo.reset()
             destroy_model_parallel()
             destroy_distributed_environment()
 
@@ -93,6 +94,7 @@ def _build_with_token_budgets(
 
     def init(self, *, vllm_config, prefix="model"):
         torch.nn.Module.__init__(self)
+        self.config = SimpleNamespace(image_token_id=0)
         self.visual = SimpleNamespace(spatial_merge_size=MERGE)
 
     monkeypatch.setattr(qwen3_5.Qwen3_5ForConditionalGeneration, "__init__", init)
@@ -264,3 +266,44 @@ def test_image_embeddings_match_upstream(visual):
     assert len(embeds) == len(expected)
     for got, want in zip(embeds, expected):
         torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-5)
+
+
+def test_vision_blocks_trace_as_regions_with_shared_weights(visual):
+    from vllm_rbln.compilation.compiler import compile
+
+    original_keys = list(visual.state_dict())
+    encoder = qwen3_5._RBLNQwen3VisionEncoder(visual).eval()
+    graphs = []
+
+    def capture(graph, inputs, **kwargs):
+        graphs.append(graph)
+        return graph.forward
+
+    compiled = compile(encoder, backend=capture, fullgraph=True, use_cache=False)
+    rotary_dim = visual.blocks[0].attn.hidden_size_per_attention_head // 2
+    with torch.inference_mode():
+        for patches in (8, 12):
+            angles = torch.randn(patches, rotary_dim)
+            key_bias = torch.zeros(1, 1, patches)
+            key_bias[..., -4:] = -30000.0
+            inputs = (
+                torch.randn(patches, 3 * TEMPORAL * PATCH * PATCH),
+                torch.randn(patches, visual.hidden_size),
+                angles.cos(),
+                angles.sin(),
+                key_bias,
+            )
+            torch.testing.assert_close(
+                compiled(*inputs), encoder(*inputs), rtol=0, atol=0
+            )
+    # One graph per bucket shape, each calling one region per vision block.
+    assert len(graphs) == 2
+    for graph in graphs:
+        calls = [
+            node
+            for node in graph.graph.nodes
+            if node.target is torch.ops.higher_order.invoke_subgraph
+        ]
+        assert len(calls) == len(visual.blocks)
+    assert list(visual.state_dict()) == original_keys
+    assert {id(p) for p in encoder.parameters()} == {id(p) for p in visual.parameters()}

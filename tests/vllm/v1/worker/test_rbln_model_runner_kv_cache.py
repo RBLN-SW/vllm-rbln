@@ -29,7 +29,7 @@ from vllm.v1.kv_cache_interface import MambaSpec, MLAAttentionSpec
 import vllm_rbln.v1.worker.rbln_model_runner as mr
 from tests.vllm.v1.worker.utils import make_kv_cache_config, schedule_new
 from vllm_rbln.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
-    RBLNGDNConvRingCache,
+    RBLNGDNBlockAuxCache,
     RBLNQwenGatedDeltaNetAttention,
 )
 from vllm_rbln.v1.attention.backends.gdn_attn import RBLNGDNAttentionMetadata
@@ -660,11 +660,12 @@ class TestGatedDeltaNetOnTheAttentionPool:
             make_model_runner, tmp_path, 256, self.ATTN, self.GDN
         )
         with set_current_vllm_config(runner.vllm_config):
-            RBLNGDNConvRingCache(
+            RBLNGDNBlockAuxCache(
                 self.RING,
                 owner=self.GDN,
                 block_shape=(3, 1, 2, 64),
                 dtype=torch.bfloat16,
+                subindex=1,
             )
         runner.initialize_kv_cache(cache_config)
         return runner

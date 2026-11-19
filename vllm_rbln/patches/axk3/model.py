@@ -64,9 +64,8 @@ class AXK3GatedResidual(nn.Module):
     """Gated Residual read/write over ``num_streams`` residual branches.
 
     Numerics follow ``AXK3GatedResidual`` in ``modeling_axk3.py`` with fp32
-    RMSNorm statistics. The read and write gates and the write product run in
-    the activation dtype instead of fp32 (the projections feeding them are
-    bf16 already).
+    RMSNorm statistics. The plain read gate runs in the activation dtype instead
+    of fp32 (the projections feeding it are bf16 already).
     """
 
     def __init__(
@@ -111,24 +110,33 @@ class AXK3GatedResidual(nn.Module):
     def read(self, residual: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         """[..., n*h] -> (block input [..., h], write gate [..., n] or None)."""
         if residual.dim() == 4:
-            u, write_gate = torch.ops.rbln_custom_ops.axk3_gr_norm(
-                residual,
-                self.gamma,
-                self.write_proj.weight,
-                self.write_bias,
-                self.norm.variance_epsilon,
-            )
+            write_gate = None
+            if self.write_proj is None:
+                # The final read runs once per model: its norm stays a plain op,
+                # and the read op gathers the rows before lm_head.
+                gamma = self.gamma.view(self.num_streams, 1, self.hidden_size)
+                u = self.norm(residual.float()) * gamma.float()
+                u = u.to(residual.dtype)
+            else:
+                u, write_gate = torch.ops.rbln_custom_ops.axk3_gr_norm(
+                    residual,
+                    self.gamma,
+                    self.write_proj.weight,
+                    self.write_bias,
+                    self.norm.variance_epsilon,
+                )
             block_input = torch.ops.rbln_custom_ops.axk3_gr_read(
                 u, self.read_down.weight, self.read_up.weight
             )
             return block_input, write_gate
 
+        # Only the final read, in prefill, takes the plain [..., n*h] layout.
+        assert self.write_proj is None
         n = self.num_streams
         # vLLM's RMSNorm over the h axis of [..., n, h], so the norm lowers like
-        # every other RMSNorm; a hand-written [..., n, 1] statistic left a host
-        # rsqrt between the device functions of every decode layer. It is fed
-        # fp32 so it returns fp32, which keeps the per-stream gain on the
-        # unrounded normalize and leaves the one cast the reference has.
+        # every other RMSNorm. It is fed fp32 so it returns fp32, which keeps the
+        # per-stream gain on the unrounded normalize and leaves the one cast the
+        # reference has.
         normed = self.norm(self._streams(residual).float())
         u = normed * self.gamma.view(n, self.hidden_size).float()
         u = u.to(residual.dtype).view_as(residual)
@@ -140,26 +148,13 @@ class AXK3GatedResidual(nn.Module):
         # The stream mean still accumulates in fp32 on device.
         z = F.silu(self.read_down(u)[0] / n)
         gate = torch.sigmoid(self.read_up(z)[0])
-        block_input = self._streams(gate * u).mean(dim=-2)
-
-        write_gate = None
-        if self.write_proj is not None:
-            write_gate = 2.0 * torch.sigmoid(
-                self.write_proj(u)[0] / n + self.write_bias.to(u.dtype)
-            )
-        return block_input, write_gate
+        return self._streams(gate * u).mean(dim=-2), None
 
     def write(
         self, residual: torch.Tensor, y: torch.Tensor, write_gate: torch.Tensor
     ) -> torch.Tensor:
         """R'_i = R_i + s_i * y."""
-        if residual.dim() == 4:
-            return torch.ops.rbln_custom_ops.axk3_gr_write(residual, y, write_gate)
-
-        # y and the gate are bf16 and the product goes straight back to bf16,
-        # so an fp32 multiply only added a cast on each side of it.
-        scaled = (write_gate.unsqueeze(-1) * y.unsqueeze(-2)).to(residual.dtype)
-        return (self._streams(residual) + scaled).view_as(residual)
+        return torch.ops.rbln_custom_ops.axk3_gr_write(residual, y, write_gate)
 
 
 @contextlib.contextmanager
@@ -361,18 +356,14 @@ class AXK3Model(nn.Module):
     ) -> torch.Tensor:
         if inputs_embeds is None:
             inputs_embeds = self.embed_input_ids(input_ids)
-        is_prefill = is_prefill_step()
-
-        # Every stream starts as the embedding.
-        if is_prefill:
-            streams = (
-                *inputs_embeds.shape[:-2],
-                self.num_streams,
-                *inputs_embeds.shape[-2:],
-            )
-            hidden_states = inputs_embeds.unsqueeze(-3).expand(streams).contiguous()
-        else:
-            hidden_states = torch.cat([inputs_embeds] * self.num_streams, dim=-1)
+        # Every stream starts as the embedding; the layers run the axk3_gr_* ops
+        # on [B, n, T, h] streams.
+        streams = (
+            *inputs_embeds.shape[:-2],
+            self.num_streams,
+            *inputs_embeds.shape[-2:],
+        )
+        hidden_states = inputs_embeds.unsqueeze(-3).expand(streams).contiguous()
 
         topk_by_layer: dict[int, torch.Tensor] = {}
         # `make_layers` pads the list to the full depth with `PPMissingLayer`,
@@ -382,7 +373,9 @@ class AXK3Model(nn.Module):
             if topk_indices is not None:
                 topk_by_layer[layer.layer_idx] = topk_indices
 
-        if is_prefill:
+        # Prefill runs the final read plain; decode, cut by batch rows, reads on
+        # the ops, so the rows are gathered before lm_head.
+        if is_prefill_step():
             hidden_states = hidden_states.transpose(-3, -2).reshape(
                 *inputs_embeds.shape[:-1], -1
             )
