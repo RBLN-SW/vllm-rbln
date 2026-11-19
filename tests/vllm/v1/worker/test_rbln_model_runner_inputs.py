@@ -506,7 +506,7 @@ class TestGatherMultimodalEmbeddings:
         torch.testing.assert_close(mask[:, 0], (expected != 0).to(runner.dtype))
 
     @pytest.mark.parametrize("offset", [2, 3])
-    def test_shifted_gather_skips_only_an_unencoded_future_feature(
+    def test_shifted_gather_requires_cached_embeddings_for_its_whole_window(
         self, make_model_runner, monkeypatch, offset
     ):
         monkeypatch.setattr(
@@ -528,13 +528,8 @@ class TestGatherMultimodalEmbeddings:
         ]
         runner._update_states(step)
 
-        if offset == 2:
-            with pytest.raises(AssertionError, match="Encoder cache miss"):
-                runner._gather_mm_embeddings(step, 3, shift_computed_tokens=1)
-        else:
-            rows, mask = runner._gather_mm_embeddings(step, 3, shift_computed_tokens=1)
-            assert rows == []
-            assert not mask.any()
+        with pytest.raises(AssertionError, match="Encoder cache miss"):
+            runner._gather_mm_embeddings(step, 3, shift_computed_tokens=1)
 
 
 class TestWarmupMultimodalEncoder:

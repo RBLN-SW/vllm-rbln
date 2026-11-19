@@ -2389,7 +2389,7 @@ class TestEcConsumerEncodesNothing:
 
 class TestMultimodalDraftEncoderLookahead:
     @staticmethod
-    def _scheduler(*, encoder_budget=256, cache_size=256):
+    def _scheduler(*, encoder_budget=None, cache_size=None):
         from vllm.v1.structured_output import StructuredOutputManager
 
         from tests.vllm.vllm_config import make_vllm_config
@@ -2401,7 +2401,7 @@ class TestMultimodalDraftEncoderLookahead:
             max_num_batched_tokens=128,
             enable_prefix_caching=False,
             limit_mm_per_prompt={"image": 2, "video": 0},
-            mm_processor_kwargs={"max_pixels": 262144},
+            mm_processor_kwargs={"min_pixels": 1024, "max_pixels": 262144},
             speculative_config={"method": "mtp", "num_speculative_tokens": 3},
         )
         config.cache_config.num_gpu_blocks = 64
@@ -2412,8 +2412,10 @@ class TestMultimodalDraftEncoderLookahead:
             log_stats=True,
             structured_output_manager=StructuredOutputManager(config),
         )
-        sched.max_num_encoder_input_tokens = encoder_budget
-        sched.encoder_cache_manager = EncoderCacheManager(cache_size=cache_size)
+        if encoder_budget is not None:
+            sched.max_num_encoder_input_tokens = encoder_budget
+        if cache_size is not None:
+            sched.encoder_cache_manager = EncoderCacheManager(cache_size=cache_size)
         return sched
 
     @pytest.mark.parametrize("running", [False, True])
@@ -2469,6 +2471,26 @@ class TestMultimodalDraftEncoderLookahead:
         out = sched.schedule()
         assert out.num_scheduled_tokens == {"images": 128}
         assert out.scheduled_encoder_inputs == {"images": [1]}
+
+    @pytest.mark.parametrize("offset, first_length", [(0, 1), (64, 256)])
+    def test_adjacent_images_make_progress(self, offset, first_length):
+        sched = self._scheduler()
+        request = make_request(
+            "images",
+            list(range(640)),
+            1024,
+            mm_features=[
+                image_at(offset, first_length),
+                image_at(offset + first_length, 256),
+            ],
+        )
+        sched.add_request(request)
+
+        while request.num_computed_tokens < len(request.prompt_token_ids):
+            before = request.num_computed_tokens
+            out = sched.schedule()
+            assert out.num_scheduled_tokens.get("images", 0) > 0, before
+            sched.update_from_output(out, make_model_runner_output(out))
 
 
 def test_eagle_steps_through_adjacent_images_with_a_one_image_encoder_cache():

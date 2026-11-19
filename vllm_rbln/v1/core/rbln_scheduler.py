@@ -131,6 +131,15 @@ class RBLNScheduler(Scheduler):
             if supports_multimodal_embeddings(draft_cls):
                 self.mm_prefill_lookahead = self.num_prefill_lookahead
 
+        if self.mm_prefill_lookahead:
+            # At an item boundary, the target still needs the previous item's
+            # tail while the drafter needs the next item's whole encoder output.
+            self.max_num_encoder_input_tokens *= 2
+            manager = self.encoder_cache_manager
+            self.encoder_cache_manager = manager.create_manager(
+                cache_size=2 * manager.cache_size, vllm_config=self.vllm_config
+            )
+
         rbln_config: RBLNConfig = self.vllm_config.additional_config
 
         prefill_chunk_sizes = rbln_config.prefill_chunk_size

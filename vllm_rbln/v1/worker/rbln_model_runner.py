@@ -1670,11 +1670,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     continue
 
                 encoder_output = self.encoder_cache.get(mm_feature.identifier)
-                if encoder_output is None and (
-                    start_pos >= req_state.num_computed_tokens + num_scheduled_tokens
-                ):
-                    # The drafter can look into the next, not-yet-encoded feature.
-                    continue
                 assert encoder_output is not None, (
                     f"Encoder cache miss for {mm_feature.identifier}."
                 )
