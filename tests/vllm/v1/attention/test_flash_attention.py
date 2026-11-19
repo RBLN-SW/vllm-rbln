@@ -22,7 +22,6 @@ import torch
 from vllm.config import set_current_vllm_config
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-import vllm_rbln.envs as envs
 import vllm_rbln.v1.attention.backends.flash_attention as flash_attention
 from tests.vllm.v1.attention.utils import (
     make_attention_spec,
@@ -234,6 +233,44 @@ class TestBuildCommonIndices:
         # positions[[0, 3]] = [0, 30]
         assert md.seq_lens.reshape(-1).tolist() == [0, 30]
 
+    def test_group_shared_staging_shares_seq_idx_only(self, cfg):
+        # One tensor object is one graph input: KV cache groups must hand the
+        # graph the same seq_idx, but each keeps its own block table.
+        group_shared: dict = {}
+        builders = [make_builder(cfg), make_builder(cfg)]
+
+        def step(positions, shared):
+            return [
+                builder.build(
+                    _cam(
+                        num_reqs=2,
+                        query_start_loc=[0, 1, 2],
+                        seq_lens=[5, 8],
+                        block_table=table,
+                    ),
+                    torch.tensor(positions),
+                    batch_pad=2,
+                    is_prefill=False,
+                    group_shared=shared,
+                )
+                for builder, table in zip(builders, [[[1], [2]], [[3], [4]]])
+            ]
+
+        mds = step([4, 7], group_shared)
+        assert mds[0].seq_lens is mds[1].seq_lens
+        assert mds[0].block_tables is not mds[1].block_tables
+        assert mds[1].block_tables.reshape(-1).tolist() == [3, 4]
+
+        # The next step overwrites the same buffer rather than allocating one.
+        next_mds = step([5, 8], group_shared)
+        assert next_mds[0].seq_lens is mds[0].seq_lens
+        assert mds[0].seq_lens.reshape(-1).tolist() == [5, 8]
+
+        # A caller without the dict, like a drafter, keeps its own buffer.
+        unshared = step([9, 9], None)
+        assert unshared[0].seq_lens is not mds[0].seq_lens
+        assert mds[0].seq_lens.reshape(-1).tolist() == [5, 8]
+
 
 class TestBuildPrefillCausal:
     def test_no_mask_and_block_tables_flattened(self, cfg):
@@ -306,10 +343,6 @@ class TestBuildPrefillNonCausal:
     def test_mask_dtype_follows_enforce_eager(
         self, cfg_noncausal, eager, expected_dtype
     ):
-        # float16 under enforce_eager, float32 otherwise. enforce_eager needs
-        # device tensors, so that case is skipped on the cpu lane.
-        if eager and not envs.VLLM_RBLN_USE_DEVICE_TENSOR:
-            pytest.skip("enforce_eager=True requires VLLM_RBLN_USE_DEVICE_TENSOR=1")
         config = (
             make_vllm_config(
                 max_model_len=MAX_LEN,
@@ -762,7 +795,7 @@ class TestBuildOutputAssembly:
 
 
 class TestStage:
-    @pytest.mark.maybe_use_device
+    @pytest.mark.use_device
     @pytest.mark.parametrize("kind", ["full", "shift", "glm"])
     @pytest.mark.parametrize("is_prefill", [False, True])
     @pytest.mark.parametrize("use_custom_kernel", [False, True])
@@ -884,7 +917,7 @@ class TestStage:
         assert first.reshape(-1).tolist() == [10]
 
 
-@pytest.mark.maybe_use_device
+@pytest.mark.use_device
 class TestFlashImplInit:
     # __init__ validation guards and derived attributes. Each guard test sets the
     # other args valid so the intended check fires (the guards are ordered).
@@ -994,7 +1027,7 @@ class TestFlashImplInit:
         assert make_impl(cfg_square, sinks=torch.zeros(8)).is_normal is False
 
 
-@pytest.mark.maybe_use_device
+@pytest.mark.use_device
 class TestForwardSlidingWindow:
     """Which kernel a sliding-window layer reaches is carried on the metadata
     by the builder, and the two take different inputs."""
