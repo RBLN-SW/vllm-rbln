@@ -616,23 +616,18 @@ def _mhc_kernels(monkeypatch):
     return calls
 
 
-def test_a_prefill_step_runs_the_mhc_on_the_token_cut_kernels(monkeypatch):
+@pytest.mark.parametrize("prefill", [True, False])
+def test_every_step_runs_the_mhc_on_the_cut_kernels(monkeypatch, prefill):
     import vllm_rbln.model_executor.models.glm5_next as glm
 
     calls = _mhc_kernels(monkeypatch)
     layer = _mhc_layer()
-    streams = torch.randn(1, 4, 8, 64).to(torch.bfloat16)
+    shape = (1, 4, 8, 64) if prefill else (8, 4, 1, 64)
+    monkeypatch.setattr(glm, "is_prefill_step", lambda: prefill)
 
-    # The plain decode, whichever compiler is installed.
-    monkeypatch.setattr(glm, "_CUTS_THE_DECODE_MHC", False)
-    monkeypatch.setattr(glm, "is_prefill_step", lambda: True)
-    cut = layer(streams)
-    assert calls == ["mix", "read", "write"] * 2
-    monkeypatch.setattr(glm, "is_prefill_step", lambda: False)
-    plain = layer(streams)
+    layer(torch.randn(shape).to(torch.bfloat16))
 
     assert calls == ["mix", "read", "write"] * 2
-    torch.testing.assert_close(cut.to(streams.dtype), plain)
 
 
 def test_the_model_returns_the_streams_in_the_input_dtype_after_a_cut_prefill(
@@ -658,49 +653,8 @@ def test_the_model_returns_the_streams_in_the_input_dtype_after_a_cut_prefill(
     assert out.dtype == torch.bfloat16
 
 
-@pytest.mark.parametrize("cuts", [False, True])
-def test_a_decode_sublayer_runs_the_mhc_kernels_on_a_cut_compiler(monkeypatch, cuts):
-    import vllm_rbln.model_executor.models.glm5_next as glm
-
-    calls = []
-
-    def record(name, result):
-        def op(*args, **kwargs):
-            calls.append(name)
-            return result(*args)
-
-        return op
-
-    ops = torch.ops.rbln_custom_ops
-    for name, result in (
-        ("mhc_mix", lambda s, *_: torch.zeros(s.shape[0], s.shape[2], 24)),
-        ("mhc_read", lambda s, *_: s.mean(dim=1)),
-        ("mhc_write", lambda y, s, *_: s),
-        ("sinkhorn_normalize", lambda z, *_: z),
-        ("hc_stream_reduce", lambda s, *_: s.mean(dim=1)),
-        ("hc_residual_add", lambda y, s, *_: s),
-    ):
-        monkeypatch.setattr(ops, name, record(name, result), raising=False)
-    monkeypatch.setattr(glm, "_CUTS_THE_DECODE_MHC", cuts)
-    monkeypatch.setattr(glm, "is_prefill_step", lambda: False)
-    layer = _bare(glm.RBLNGlm5NextDecoderLayer)
-    layer.n, layer.rms_eps, layer.hc_eps = 4, 1e-6, 1e-6
-    layer.post_mult, layer.sinkhorn_iters = 2.0, 20
-    norm = torch.nn.Identity()
-    norm.weight = torch.ones(8)
-    streams = torch.randn(8, 4, 1, 8)
-
-    layer._sublayer(
-        streams, torch.zeros(24, 32), torch.ones(24), torch.zeros(24), norm, norm
-    )
-
-    kernels = ["mhc_mix", "mhc_read", "mhc_write"]
-    assert [c for c in calls if c in kernels] == (kernels if cuts else [])
-
-
 @pytest.mark.parametrize("prefill", [False, True])
-@pytest.mark.parametrize("cuts", [False, True])
-def test_only_a_cut_decode_reads_the_final_norm_on_the_op(monkeypatch, prefill, cuts):
+def test_only_decode_reads_the_final_norm_on_the_op(monkeypatch, prefill):
     from vllm.config import set_current_vllm_config
     from vllm.model_executor.layers.layernorm import RMSNorm
 
@@ -716,7 +670,6 @@ def test_only_a_cut_decode_reads_the_final_norm_on_the_op(monkeypatch, prefill, 
         normed = rows * torch.rsqrt(rows.pow(2).mean(dim=-1, keepdim=True) + eps)
         return (normed * weight.float()).to(x.dtype)
 
-    monkeypatch.setattr(glm, "_CUTS_THE_DECODE_MHC", cuts)
     monkeypatch.setattr(glm, "is_prefill_step", lambda: prefill)
     monkeypatch.setattr(
         glm,
@@ -735,5 +688,5 @@ def test_only_a_cut_decode_reads_the_final_norm_on_the_op(monkeypatch, prefill, 
 
     out = model.forward(None, torch.zeros(8, 1), inputs_embeds=embeds)
 
-    assert reads == ([(8, 1, 64)] if cuts and not prefill else [])
+    assert reads == ([] if prefill else [(8, 1, 64)])
     torch.testing.assert_close(out, model.norm(embeds))

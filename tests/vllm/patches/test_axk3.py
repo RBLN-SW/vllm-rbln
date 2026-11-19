@@ -140,8 +140,6 @@ def test_forward_runs_only_the_layers_this_rank_built(monkeypatch):
             return hidden_states + 1, None
 
     monkeypatch.setattr(envs, "VLLM_RBLN_NUM_HIDDEN_LAYERS", 2)
-    # The plain decode streams, whichever compiler is installed.
-    monkeypatch.setattr(axk3_model, "_CUTS_THE_DECODE_GR", False)
     monkeypatch.setattr(dist_utils, "get_pp_indices", patched_get_pp_indices)
     group = SimpleNamespace(rank_in_group=0, world_size=1)
     monkeypatch.setattr(parallel_state, "get_pp_group", lambda: group)
@@ -160,7 +158,9 @@ def test_forward_runs_only_the_layers_this_rank_built(monkeypatch):
         PPMissingLayer,
     ]
     model.embed_input_ids = lambda input_ids: torch.zeros(len(input_ids), 8)
-    model.final_gated_residual = SimpleNamespace(read=lambda hidden: (hidden, None))
+    model.final_gated_residual = SimpleNamespace(
+        read=lambda hidden: (hidden.squeeze(-3), None)
+    )
 
     out = model.forward(
         input_ids=torch.zeros(3, dtype=torch.long),
@@ -262,8 +262,6 @@ def gated_residual_model(monkeypatch):
 
     step = SimpleNamespace(is_prefill=True)
     monkeypatch.setattr(axk3_model, "is_prefill_step", lambda: step.is_prefill)
-    # A compiler without the decode cut unless a test says otherwise.
-    monkeypatch.setattr(axk3_model, "_CUTS_THE_DECODE_GR", False)
     read_dims = []
     plain_read = axk3_model.AXK3GatedResidual.read
 
@@ -293,38 +291,21 @@ def test_prefill_chunk_matches_decoding_its_tokens_one_at_a_time(gated_residual_
     torch.testing.assert_close(chunk, decoded)
 
 
-def test_decode_on_a_compiler_without_the_decode_cut_keeps_the_plain_gated_residual(
-    gated_residual_model,
-):
-    built = gated_residual_model
-    built.step.is_prefill = False
-    tokens = 3
-
-    built.model.forward(
-        None, torch.arange(tokens), None, torch.randn(1, tokens, built.hidden)
-    )
-
-    assert built.read_dims == [3] * 5
-
-
-def test_a_decode_batch_runs_the_gated_residual_ops(gated_residual_model, monkeypatch):
-    import vllm_rbln.patches.axk3.model as axk3_model
-
+def test_a_decode_batch_runs_the_gated_residual_ops(gated_residual_model):
     built = gated_residual_model
     built.step.is_prefill = False
     embeds = torch.randn(8, 1, built.hidden)
 
-    def forward():
-        return built.model.forward(None, torch.zeros(8, 1), None, embeds)
-
-    plain = forward()
-    built.read_dims.clear()
-    monkeypatch.setattr(axk3_model, "_CUTS_THE_DECODE_GR", True)
-    cut = forward()
+    batch = built.model.forward(None, torch.zeros(8, 1), None, embeds)
 
     # Every read, the final one too, takes [B, n, T, h].
     assert built.read_dims == [4, 4, 4, 4, 4]
-    torch.testing.assert_close(cut, plain)
+    built.step.is_prefill = True
+    rows = [
+        built.model.forward(None, torch.zeros(1), None, embeds[b : b + 1])
+        for b in range(8)
+    ]
+    torch.testing.assert_close(batch, torch.cat(rows))
 
 
 def test_eagle3_is_refused_on_both_aux_layer_setup_paths():

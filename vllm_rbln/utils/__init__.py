@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import importlib
 from collections.abc import Callable
 from typing import Union
 
@@ -27,21 +26,6 @@ def is_prefill_step() -> bool:
     if isinstance(attn_metadata, dict):
         attn_metadata = next(iter(attn_metadata.values()))
     return attn_metadata.is_prefill
-
-
-def reads_a_batch_cut(table: str, read: str) -> bool:
-    """Whether the compiler's read of a residual takes a decode batch cut.
-
-    `table` names a module of rebel.core.custom_converter.kernel_table: the cut
-    is a batch (B) shard on its `read` kernel.
-    """
-    try:
-        module = importlib.import_module(
-            f"rebel.core.custom_converter.kernel_table.{table}"
-        )
-    except ModuleNotFoundError:
-        return False
-    return any(s.axes == ("B",) for s in getattr(module, read).shard)
 
 
 def run_mm_encoder(

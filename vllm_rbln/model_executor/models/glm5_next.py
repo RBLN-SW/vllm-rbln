@@ -96,7 +96,7 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec, MLAAttentionSpec
 import vllm_rbln.utils as rbln_utils
 from vllm_rbln.model_executor.models.interfaces import SupportsRBLNMultiModal
 from vllm_rbln.patches.attention import _resolve_kv_cache
-from vllm_rbln.utils import is_prefill_step, reads_a_batch_cut
+from vllm_rbln.utils import is_prefill_step
 from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadata,
 )
@@ -114,11 +114,6 @@ from vllm_rbln.v1.worker.utils import (
     num_attn_module as rbln_num_attn_module,
 )
 from vllm_rbln.v1.worker.utils import pipeline_adjusted_layer_index
-
-# A compiler whose read takes a batch cut also cuts the mhc_* kernels of a decode
-# batch by rows (or runs a small batch whole) and lays out decode's weights around
-# them as prefill's; an older one keeps decode on the plain mHC ops.
-_CUTS_THE_DECODE_MHC = reads_a_batch_cut("mhc", "KERNEL_MHC_READ")
 
 SLOT_DSA_LATENT, SLOT_DSA_INDEX_KEY, SLOT_DSA_INDEX_SCALE, SLOT_DSA_INDEX_TAIL = range(
     4
@@ -900,37 +895,23 @@ class RBLNGlm5NextDecoderLayer(nn.Module):
             )
 
     def _sublayer(self, streams, fn, scale, base, norm, sublayer) -> torch.Tensor:
+        # The compiler cuts the mhc_* kernels over the chiplets, by tokens in
+        # prefill and by batch rows in decode, so the streams stay split between
+        # sublayers (fp32 holding bf16 values) and only the sublayer input is
+        # gathered.
         ops = torch.ops.rbln_custom_ops
         streams_f32 = streams.float()
-        if _CUTS_THE_DECODE_MHC or is_prefill_step():
-            # The compiler cuts the mhc_* kernels over the chiplets, by tokens in
-            # prefill and by batch rows in decode, so the streams stay split
-            # between sublayers (fp32 holding bf16 values) and only the sublayer
-            # input is gathered.
-            logits = ops.mhc_mix(streams_f32, fn, scale, base, eps=self.rms_eps)
-            x = ops.mhc_read(streams_f32, logits, eps=self.hc_eps).to(norm.weight.dtype)
-            y = sublayer(norm(x))
-            return ops.mhc_write(
-                y.float(),
-                streams_f32,
-                logits,
-                post_mult=self.post_mult,
-                iters=self.sinkhorn_iters,
-                eps=self.hc_eps,
-            )
-        batch, n, tokens, hidden = streams.shape
-        flat = streams.transpose(1, 2).reshape(batch, tokens, n * hidden).float()
-        flat = flat * torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.rms_eps)
-        z = F.linear(flat, fn) * scale + base
-        z_pre, z_post = z[..., :n], z[..., n : 2 * n]
-        comb = ops.sinkhorn_normalize(
-            z[..., 2 * n :], iters=self.sinkhorn_iters, eps=self.hc_eps
+        logits = ops.mhc_mix(streams_f32, fn, scale, base, eps=self.rms_eps)
+        x = ops.mhc_read(streams_f32, logits, eps=self.hc_eps).to(norm.weight.dtype)
+        y = sublayer(norm(x))
+        return ops.mhc_write(
+            y.float(),
+            streams_f32,
+            logits,
+            post_mult=self.post_mult,
+            iters=self.sinkhorn_iters,
+            eps=self.hc_eps,
         )
-        x = ops.hc_stream_reduce(streams_f32, z_pre, eps=self.hc_eps).to(streams.dtype)
-        x = sublayer(norm(x))
-        return ops.hc_residual_add(
-            x.float(), streams_f32, z_post, comb, post_mult=self.post_mult
-        ).to(streams.dtype)
 
     def forward(self, streams: torch.Tensor) -> torch.Tensor:
         """streams [B, n, T, H] -> [B, n, T, H]."""
@@ -1081,7 +1062,7 @@ class RBLNGlm5NextModel(nn.Module):
                 {"streams": streams.transpose(1, 2).reshape(batch, tokens, -1)}
             )
         hidden = streams.mean(dim=1)
-        if _CUTS_THE_DECODE_MHC and not is_prefill_step():
+        if not is_prefill_step():
             # A read gathers the rows; left cut, they would reach lm_head, whose
             # weight takes the layout prefill gives it.
             return torch.ops.rbln_custom_ops.residual_read(

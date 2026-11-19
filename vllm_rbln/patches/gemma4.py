@@ -20,7 +20,7 @@ from vllm.model_executor.models.gemma4 import Gemma4DecoderLayer, Gemma4MLP
 
 from vllm_rbln.patches import register_patch
 from vllm_rbln.patches.registry import add_registration
-from vllm_rbln.utils import is_prefill_step, reads_a_batch_cut
+from vllm_rbln.utils import is_prefill_step
 
 
 @register_patch(
@@ -37,14 +37,8 @@ def keep_the_rbln_attention_backend(vllm_config: VllmConfig) -> None:
     """Leave the attention backend to the RBLN platform."""
 
 
-# A compiler whose residual_read takes a batch cut cuts the decode residual by
-# batch rows and lays out decode's weights around the ops as prefill's; an older
-# one fails to share them, so decode keeps the plain path there.
-_CUTS_THE_DECODE_RESIDUAL = reads_a_batch_cut("residual", "KERNEL_RESIDUAL_READ")
-
-
 def _read(norm, residual: torch.Tensor, cut: bool) -> torch.Tensor:
-    """The next block's input: RMSNorm(residual), token-cut when `cut`."""
+    """The next block's input: RMSNorm(residual), on the cut op when `cut`."""
     if cut:
         return torch.ops.rbln_custom_ops.residual_read(
             residual, norm.weight, norm.variance_epsilon
@@ -53,7 +47,7 @@ def _read(norm, residual: torch.Tensor, cut: bool) -> torch.Tensor:
 
 
 def _write(norm, residual: torch.Tensor, y: torch.Tensor, cut: bool) -> torch.Tensor:
-    """residual + RMSNorm(y), token-cut when `cut`; each norm passes its own eps."""
+    """residual + RMSNorm(y), on the cut op when `cut`; each norm passes its own eps."""
     if cut:
         return torch.ops.rbln_custom_ops.gemma4_dense_residual_write(
             residual, y, norm.weight, norm.variance_epsilon
@@ -84,11 +78,7 @@ def patched_gemma4_decoder_layer_forward(
     # the residual again for the router and a per-layer input adds to it before
     # the scalar. The layer scalar stays upstream's multiply, so it runs on each
     # chiplet's token slice and remains a constant the decode graph shares.
-    cut = (
-        not self.enable_moe_block
-        and per_layer_input is None
-        and (_CUTS_THE_DECODE_RESIDUAL or is_prefill_step())
-    )
+    cut = not self.enable_moe_block and per_layer_input is None
     residual = hidden_states
     hidden_states = _read(self.input_layernorm, residual, cut)
     hidden_states = self.self_attn(
@@ -128,15 +118,15 @@ def patched_gemma4_decoder_layer_forward(
 
 
 class ResidualReadNorm(RMSNorm):
-    """Gemma4's final norm, as rbln_custom_ops::residual_read in decode on a
-    compiler that cuts the decode residual by batch rows. The read gathers the
-    rows; left cut, they would reach lm_head, whose weight is embed_tokens' and
-    takes the layout prefill gives it."""
+    """Gemma4's final norm, as rbln_custom_ops::residual_read in decode, where
+    the compiler cuts the residual by batch rows. The read gathers the rows;
+    left cut, they would reach lm_head, whose weight is embed_tokens' and takes
+    the layout prefill gives it."""
 
     def forward(
         self, x: torch.Tensor, residual: torch.Tensor | None = None
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if _CUTS_THE_DECODE_RESIDUAL and not is_prefill_step():
+        if not is_prefill_step():
             # The patched layers carry the residual in hidden_states.
             assert residual is None
             return torch.ops.rbln_custom_ops.residual_read(

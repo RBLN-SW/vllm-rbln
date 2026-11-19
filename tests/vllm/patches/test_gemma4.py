@@ -193,36 +193,8 @@ def _run(layer, hidden_states, prefill, monkeypatch, **kwargs):
     return out
 
 
-def test_the_dense_prefill_residual_runs_on_the_token_cut_ops(monkeypatch):
-    import torch
-
-    torch.manual_seed(0)
-    calls = _token_cut_ops(monkeypatch)
-    layer = _dense_layer()
-    hidden_states = torch.randn(1, 8, 64)
-
-    cut = _run(layer, hidden_states, True, monkeypatch)
-    assert calls == ["read", "write", "read", "write"]
-    plain = _run(layer, hidden_states, False, monkeypatch)
-    torch.testing.assert_close(cut, plain)
-
-
-def test_decode_on_a_compiler_without_the_decode_cut_keeps_the_plain_layer(
-    monkeypatch,
-):
-    import torch
-
-    from vllm_rbln.patches import gemma4
-
-    calls = _token_cut_ops(monkeypatch)
-    monkeypatch.setattr(gemma4, "_CUTS_THE_DECODE_RESIDUAL", False)
-
-    _run(_dense_layer(), torch.randn(4, 1, 64), False, monkeypatch)
-
-    assert calls == []
-
-
-def test_the_dense_decode_residual_runs_on_the_cut_ops(monkeypatch):
+@pytest.mark.parametrize("prefill", [True, False])
+def test_the_dense_residual_runs_on_the_cut_ops(monkeypatch, prefill):
     import torch
 
     from vllm_rbln.patches import gemma4
@@ -230,13 +202,17 @@ def test_the_dense_decode_residual_runs_on_the_cut_ops(monkeypatch):
     torch.manual_seed(0)
     calls = _token_cut_ops(monkeypatch)
     layer = _dense_layer()
-    hidden_states = torch.randn(8, 1, 64)
+    hidden_states = torch.randn(1, 8, 64) if prefill else torch.randn(8, 1, 64)
 
-    monkeypatch.setattr(gemma4, "_CUTS_THE_DECODE_RESIDUAL", True)
-    cut = _run(layer, hidden_states, False, monkeypatch)
+    cut = _run(layer, hidden_states, prefill, monkeypatch)
     assert calls == ["read", "write", "read", "write"]
-    monkeypatch.setattr(gemma4, "_CUTS_THE_DECODE_RESIDUAL", False)
-    plain = _run(layer, hidden_states, False, monkeypatch)
+    # The same layer on the plain path a MoE layer takes.
+    read, write = gemma4._read, gemma4._write
+    monkeypatch.setattr(gemma4, "_read", lambda norm, r, cut: read(norm, r, False))
+    monkeypatch.setattr(
+        gemma4, "_write", lambda norm, r, y, cut: write(norm, r, y, False)
+    )
+    plain = _run(layer, hidden_states, prefill, monkeypatch)
     torch.testing.assert_close(cut, plain)
 
 
@@ -250,7 +226,6 @@ def test_the_final_norm_reads_only_the_decode_residual(monkeypatch, prefill):
 
     torch.manual_seed(0)
     calls = _token_cut_ops(monkeypatch)
-    monkeypatch.setattr(gemma4, "_CUTS_THE_DECODE_RESIDUAL", True)
     monkeypatch.setattr(gemma4, "is_prefill_step", lambda: prefill)
     with set_current_vllm_config(make_vllm_config()):
         norm = gemma4.ResidualReadNorm(64, eps=1e-6)
