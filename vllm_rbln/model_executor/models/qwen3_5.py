@@ -145,6 +145,9 @@ class RBLNQwen3_5MultiModalProcessor(Qwen3VLMultiModalProcessor):
             # An input sent as embeddings has a grid too, but skips the encoder.
             if pixels not in outputs:
                 continue
+            # NOTE: upstream's video bound is the token count of one 3:4 frame,
+            # so with a start-up max_pixels other than the default a frame of
+            # another shape can exceed it and is refused here.
             limit = (
                 self.info.get_mm_max_tokens_per_item(
                     seq_len=self.info.ctx.model_config.max_model_len,
