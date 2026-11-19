@@ -1,0 +1,22 @@
+{{- bos_token -}}
+{%- for message in messages -%}
+    {%- set role = "model" if message.role == "assistant" else message.role -%}
+    {{- "<|turn>" ~ role ~ "\n" -}}
+    {%- if message.content is string -%}
+        {{- message.content -}}
+    {%- else -%}
+        {%- for part in message.content -%}
+            {%- if part.type == "text" -%}
+                {{- part.text -}}
+            {%- elif part.type == "image" -%}
+                {{- "<|image|>" -}}
+            {%- else -%}
+                {{- raise_exception("Unsupported chat content type: " ~ part.type) -}}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- endif -%}
+    {{- "<turn|>\n" -}}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{- "<|turn>model\n" -}}
+{%- endif -%}

@@ -6,7 +6,7 @@
 # encodes images and serves the outputs to consumers over NIXL.
 #
 # Usage (same host as the consumer's default devices):
-#   RBLN_DEVICES=4 bash serve_ec_producer.sh [MODEL] [PORT]
+#   RBLN_DEVICES=5 bash serve_ec_producer.sh [MODEL] [PORT]
 #
 # MODEL must be the same string on the producer and the consumer: it is part of
 # the compatibility hash the two compare. A consumer on another host needs
@@ -14,21 +14,31 @@
 # producers sharing a host need distinct VLLM_EC_SIDE_CHANNEL_PORT values.
 set -euo pipefail
 
-MODEL="${1:-nvidia/MiniMax-M3-NVFP4}"
+MODEL="${1:-google/gemma-4-26B-A4B}"
 PORT="${2:-8100}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
+TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-262144}"
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-2048}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"
 BLOCK_SIZE="${BLOCK_SIZE:-8192}"
 IMAGE_LIMIT="${IMAGE_LIMIT:-1}"
 EC_CPU_BYTES="${EC_CPU_BYTES:-1073741824}"
 
-export RBLN_DEVICES="${RBLN_DEVICES:-4}"
+export RBLN_DEVICES="${RBLN_DEVICES:-5}"
+
+chat_args=()
+if [[ "$MODEL" == "google/gemma-4-26B-A4B" ]]; then
+    chat_args=(--chat-template "$(dirname -- "${BASH_SOURCE[0]}")/gemma4_chat_template.jinja" --chat-template-content-format openai)
+fi
 
 exec vllm serve "$MODEL" \
     --port "$PORT" \
     --model-impl vllm \
+    --tensor-parallel-size "$TENSOR_PARALLEL_SIZE" \
     --block-size "$BLOCK_SIZE" \
     --max-model-len "$MAX_MODEL_LEN" \
-    --max-num-batched-tokens 8192 \
+    --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS" \
+    --max-num-seqs "$MAX_NUM_SEQS" \
     --no-enable-prefix-caching \
     --no-async-scheduling \
     --enable-request-id-headers \
@@ -37,4 +47,5 @@ exec vllm serve "$MODEL" \
         \"ec_connector\": \"RblnECCPUConnector\",
         \"ec_role\": \"ec_producer\",
         \"ec_connector_extra_config\": {\"ec_cpu_bytes\": $EC_CPU_BYTES}
-    }"
+    }" \
+    "${chat_args[@]}"

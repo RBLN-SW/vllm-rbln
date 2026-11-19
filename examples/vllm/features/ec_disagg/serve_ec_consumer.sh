@@ -7,24 +7,29 @@
 # encoding the image itself.
 #
 # Usage:
-#   RBLN_DEVICES=0,1,2,3 bash serve_ec_consumer.sh [MODEL] [PORT]
+#   RBLN_DEVICES=4 bash serve_ec_consumer.sh [MODEL] [PORT]
 #
 # MODEL must be the same string as on the producer. With TENSOR_PARALLEL_SIZE
 # above 1, list that many devices in RBLN_DEVICES.
-# When sharing a host, run the producer with RBLN_DEVICES=4.
+# When sharing a host, run the producer on a separate device.
 set -euo pipefail
 
-MODEL="${1:-nvidia/MiniMax-M3-NVFP4}"
+MODEL="${1:-google/gemma-4-26B-A4B}"
 PORT="${2:-8200}"
-TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-4}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
-MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-512}"
+TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-262144}"
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-2048}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"
 BLOCK_SIZE="${BLOCK_SIZE:-8192}"
 IMAGE_LIMIT="${IMAGE_LIMIT:-1}"
 EC_CPU_BYTES="${EC_CPU_BYTES:-1073741824}"
 
-export RBLN_DEVICES="${RBLN_DEVICES:-0,1,2,3}"
+export RBLN_DEVICES="${RBLN_DEVICES:-4}"
+
+chat_args=()
+if [[ "$MODEL" == "google/gemma-4-26B-A4B" ]]; then
+    chat_args=(--chat-template "$(dirname -- "${BASH_SOURCE[0]}")/gemma4_chat_template.jinja" --chat-template-content-format openai)
+fi
 
 exec vllm serve "$MODEL" \
     --port "$PORT" \
@@ -42,4 +47,5 @@ exec vllm serve "$MODEL" \
         \"ec_connector\": \"RblnECCPUConnector\",
         \"ec_role\": \"ec_consumer\",
         \"ec_connector_extra_config\": {\"ec_cpu_bytes\": $EC_CPU_BYTES}
-    }"
+    }" \
+    "${chat_args[@]}"
