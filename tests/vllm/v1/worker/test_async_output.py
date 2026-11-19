@@ -32,7 +32,7 @@ import vllm_rbln.v1.worker.utils as worker_utils
 from vllm_rbln.v1.sample.rbln_sampler import compile_sampler, rbln_greedy_sample
 from vllm_rbln.v1.worker.async_output import AsyncRBLNModelRunnerOutput
 
-pytestmark = pytest.mark.maybe_use_device
+pytestmark = pytest.mark.use_device
 
 
 def _output(req_ids):
