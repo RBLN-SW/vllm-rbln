@@ -40,7 +40,7 @@ MODELS: list[CompileModelSpec] = [
             "max_num_seqs": 1,
             "language_model_only": True,
             "block_size": 1024,
-            "num_gpu_blocks_override": 3,
+            "num_gpu_blocks_override": None,
         },
         chips=REBEL,
     ),
