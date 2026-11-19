@@ -145,9 +145,6 @@ class RBLNQwen3_5ForConditionalGeneration(
                 "text."
             )
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-        # Upstream's MTP proposer reads the image token by this name from a
-        # target whose class name it does not list.
-        self.config.image_token_index = self.config.image_token_id
         object.__setattr__(self, "_mm_encoder", None)
         # Upstream builds no vision tower when images are off (a placeholder
         # stands in for it).

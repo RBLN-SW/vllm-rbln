@@ -639,6 +639,26 @@ class TestPropose:
 
 
 class TestLoadModel:
+    def test_an_rbln_target_goes_by_its_upstream_class_name(self):
+        # Upstream's load_model picks the target's image-token field by class
+        # name and lists upstream classes only, so the RBLN subclass of a listed
+        # class has to answer with its parent's name.
+        from vllm.model_executor.models.qwen3_5 import (
+            Qwen3_5ForConditionalGeneration,
+        )
+
+        from vllm_rbln.model_executor.models.qwen3_5 import (
+            RBLNQwen3_5ForConditionalGeneration,
+        )
+
+        target = RBLNQwen3_5ForConditionalGeneration.__new__(
+            RBLNQwen3_5ForConditionalGeneration
+        )
+        proposer = make_eagle_proposer()
+        assert (
+            proposer.get_model_name(target) == Qwen3_5ForConditionalGeneration.__name__
+        )
+
     @pytest.mark.parametrize("draft_needs_mm_inputs", [False, True])
     def test_multimodal_guard_uses_loaded_draft_capability(
         self, monkeypatch, draft_needs_mm_inputs
