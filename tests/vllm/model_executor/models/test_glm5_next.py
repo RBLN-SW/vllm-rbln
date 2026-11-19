@@ -26,6 +26,89 @@ def _bare(cls):
     return module
 
 
+@pytest.fixture
+def vision_tower(tmp_path):
+    from vllm.config import set_current_vllm_config
+    from vllm.distributed import (
+        destroy_distributed_environment,
+        destroy_model_parallel,
+        ensure_model_parallel_initialized,
+        init_distributed_environment,
+    )
+
+    from tests.vllm.vllm_config import make_vllm_config
+    from vllm_rbln.model_executor.models.glm5_next import Glm5NextVisionTransformer
+
+    with set_current_vllm_config(make_vllm_config()):
+        init_distributed_environment(
+            world_size=1,
+            rank=0,
+            distributed_init_method=f"file://{tmp_path}/dist",
+            local_rank=0,
+            backend="gloo",
+        )
+        ensure_model_parallel_initialized(1, 1)
+        try:
+            config = SimpleNamespace(
+                depth=3,
+                hidden_size=128,
+                intermediate_size=256,
+                num_heads=2,
+                patch_size=2,
+                temporal_patch_size=2,
+                in_channels=3,
+                spatial_merge_size=2,
+                out_hidden_size=64,
+                projection_intermediate_size=128,
+                swiglu_limit=7.0,
+                rms_norm_eps=1e-6,
+            )
+            torch.manual_seed(0)
+            tower = Glm5NextVisionTransformer(config, config).float().eval()
+            for param in tower.parameters():
+                param.data.normal_(0, 0.05)
+            yield tower
+        finally:
+            torch._dynamo.reset()
+            destroy_model_parallel()
+            destroy_distributed_environment()
+
+
+def test_vision_blocks_trace_as_regions_with_shared_weights(vision_tower):
+    from vllm_rbln.compilation.compiler import compile
+    from vllm_rbln.model_executor.models.glm5_next import _RBLNGlm5NextVisionEncoder
+
+    tower = vision_tower
+    original_keys = list(tower.state_dict())
+    encoder = _RBLNGlm5NextVisionEncoder(tower, torch.bfloat16).eval()
+    graphs = []
+
+    def capture(graph, inputs, **kwargs):
+        graphs.append(graph)
+        return graph.forward
+
+    compiled = compile(encoder, backend=capture, fullgraph=True, use_cache=False)
+    with torch.inference_mode():
+        for tokens in (8, 12):
+            angles = torch.randn(tokens, 64)
+            bias = torch.zeros(1, 1, tokens)
+            bias[..., -4:] = -30000.0
+            inputs = (torch.randn(tokens, 24), angles.cos(), angles.sin(), bias)
+            torch.testing.assert_close(
+                compiled(*inputs), encoder(*inputs), rtol=0, atol=0
+            )
+    assert len(graphs) == 2
+    for graph in graphs:
+        calls = [
+            node
+            for node in graph.graph.nodes
+            if node.target is torch.ops.higher_order.invoke_subgraph
+        ]
+        assert len(calls) == len(tower.blocks)
+    assert list(tower.state_dict()) == original_keys
+    assert {id(p) for p in encoder.parameters()} == {id(p) for p in tower.parameters()}
+
+
 def test_load_time_transforms_run_once_after_every_weight(monkeypatch):
     import vllm_rbln.model_executor.models.glm5_next as glm
 
