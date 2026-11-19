@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import contextlib
+import hashlib
 import json
 import os
 import warnings
@@ -53,14 +54,7 @@ def _intra_nodeid(nodeid: str) -> str:
 
 def _needs_spawn(item) -> bool:
     """Whether ``item`` must run in a fresh process rather than in this one."""
-    kw = item.keywords
-    if "model_compile" in kw or "use_device" in kw:
-        return True
-    if "maybe_use_device" in kw:
-        from vllm.platforms import current_platform
-
-        return current_platform.device_type != "cpu"
-    return False
+    return "model_compile" in item.keywords
 
 
 def _will_be_skipped(item) -> bool:
@@ -110,23 +104,22 @@ def _replay_warnings(spawn) -> None:
 
 def pytest_addoption(parser):
     parser.addoption(
+        "--shard-count",
+        type=int,
+        default=1,
+        help="number of deterministic test shards (default: 1)",
+    )
+    parser.addoption(
+        "--shard-index",
+        type=int,
+        default=0,
+        help="zero-based index of the test shard to run (default: 0)",
+    )
+    parser.addoption(
         "--model-compile",
         action="store_true",
         default=False,
         help="run tests that compile a whole model on the NPU (minutes each)",
-    )
-    parser.addoption(
-        "--device-tensor",
-        choices=["0", "1"],
-        default=None,
-        help=(
-            "VLLM_RBLN_USE_DEVICE_TENSOR for the whole session. "
-            "platform/__init__.py resolves it at module scope into "
-            "RblnPlatform.device_type and friends, so it cannot be "
-            "parametrized per test -- run the suite once per value instead. "
-            "Left unset by default so the source's own default is what gets "
-            "exercised."
-        ),
     )
     parser.addoption(
         "--num-hidden-layers",
@@ -184,16 +177,33 @@ def _session_layers(config) -> int:
     return _DEFAULT_NUM_HIDDEN_LAYERS if layers is None else layers
 
 
+@pytest.hookimpl(trylast=True)
 def pytest_collection_modifyitems(config, items):
-    """Keep whole-model compiles out of the default lane (opt-in via
-    --model-compile; forgetting the flag costs nothing)."""
+    """Gate whole-model compiles and shard after pytest's -m/-k selection.
+
+    Batch children already receive selected nodeids and must not shard again.
+    """
     if config.getoption("--model-compile"):
         _skip_other_chips(items)
+    else:
+        skip = pytest.mark.skip(reason="needs --model-compile")
+        for item in items:
+            if "model_compile" in item.keywords:
+                item.add_marker(skip)
+
+    shard_count = config.getoption("--shard-count")
+    if shard_count == 1 or os.environ.get(_SPAWN_CHILD_ENV) == "1":
         return
-    skip = pytest.mark.skip(reason="needs --model-compile")
+    shard_index = config.getoption("--shard-index")
+    selected, deselected = [], []
     for item in items:
-        if "model_compile" in item.keywords:
-            item.add_marker(skip)
+        shard = int(hashlib.sha256(item.nodeid.encode()).hexdigest(), 16) % shard_count
+        if shard == shard_index:
+            selected.append(item)
+        else:
+            deselected.append(item)
+    items[:] = selected
+    config.hook.pytest_deselected(items=deselected)
 
 
 def _record(payload: dict) -> None:
@@ -280,7 +290,6 @@ def _spawn_for(item) -> ModuleSpawn:
     spawn = start_module_in_spawned_process(
         nodeids or [item.nodeid],
         nodeid_prefix=item.nodeid.split("::", 1)[0],
-        device_tensor=config.getoption("--device-tensor"),
         model_compile=config.getoption("--model-compile"),
         num_hidden_layers=_session_layers(config),
         tb_style=config.getoption("tbstyle", None),
@@ -316,14 +325,7 @@ def _crash_reports(item, spawn) -> list:
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_runtest_protocol(item, nextitem):
-    """Run device-touching tests in a fresh spawned process, batched per file:
-    the RBLN device must not be opened in the parent (it would pin the device for
-    the whole session), and one spawn per file amortizes the interpreter + plugin
-    + device init over all its tests.
-
-    @model_compile and @use_device always spawn -- they compile/run on the NPU
-    regardless of --device-tensor. @maybe_use_device spawns only when device
-    tensors are on (--device-tensor 1); under 0 its ops stay on CPU.
+    """Isolate whole-model compiles in a fresh process, batched per file.
 
     Taking over the whole protocol (rather than just the call phase) is what
     makes a batched test indistinguishable from a plain one: the child's own
@@ -376,18 +378,18 @@ def pytest_configure(config):
     # Must run before collection: test modules capture upstream symbols at
     # import time, so the patches have to be in place before any of them
     # execute `from vllm.xxx import yyy`.
+    shard_count = config.getoption("--shard-count")
+    shard_index = config.getoption("--shard-index")
+    if shard_count < 1:
+        raise pytest.UsageError("--shard-count must be positive")
+    if not 0 <= shard_index < shard_count:
+        raise pytest.UsageError("--shard-index must be in [0, --shard-count)")
     global _scrubbed, _config
     _config = config
     _scrubbed = scrub_env()
     os.environ.update(VLLM_RBLN_ENV)
 
-    # Must land before the import below: platform/__init__.py reads this at
-    # module scope.
-    device_tensor = config.getoption("--device-tensor")
-    if device_tensor is not None:
-        os.environ["VLLM_RBLN_USE_DEVICE_TENSOR"] = device_tensor
-
-    # Also before the import below: the get_pp_indices patch conditions on this.
+    # Before the import below: the get_pp_indices patch conditions on this.
     os.environ["VLLM_RBLN_NUM_HIDDEN_LAYERS"] = str(_session_layers(config))
 
     # Parent only -- the child is handed the resolved value, so its own view of
@@ -446,10 +448,9 @@ def pytest_report_header(config):
     # than the request, since that is the lane the whole session runs in.
     from vllm_rbln.platform import RblnPlatform
 
-    origin = "explicit" if config.getoption("--device-tensor") else "source default"
     header = [
         f"vllm-rbln: env {', '.join(f'{k}={v}' for k, v in VLLM_RBLN_ENV.items())}",
-        f"vllm-rbln: device_type={RblnPlatform.device_type} ({origin})",
+        f"vllm-rbln: device_type={RblnPlatform.device_type}",
     ]
     num_hidden_layers = _session_layers(config)
     pinnable = (

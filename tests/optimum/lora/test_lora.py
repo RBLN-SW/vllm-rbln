@@ -113,6 +113,8 @@ class MockModelWrapper(nn.Module, RBLNOptimumDecoderMixin):
             "max_seq_len": MAX_MODEL_LEN,
             "kvcache_num_blocks": NUM_BLOCKS + 1,
             "kvcache_block_size": BLOCK_SIZE,
+            "prefill_chunk_size": vllm_config.scheduler_config.max_num_batched_tokens,
+            "num_devices": vllm_config.additional_config.num_devices_per_local_rank,
         }
         self.vocab_size = vllm_config.model_config.get_vocab_size()
         self.logits_processor = LogitsProcessor(self.vocab_size, logits_as_input=True)
@@ -179,7 +181,7 @@ async def add_lora():
         max_loras=NUM_LORAS,
         max_lora_rank=MAX_LORA_RANK,
         max_model_len=MAX_MODEL_LEN,
-        max_num_batched_tokens=MAX_MODEL_LEN,
+        additional_config={"prefill_chunk_size": MAX_MODEL_LEN},
         max_num_seqs=BATCH_SIZE,
         block_size=BLOCK_SIZE,
     )
@@ -196,7 +198,7 @@ async def list_loras():
         max_loras=NUM_LORAS,
         max_lora_rank=MAX_LORA_RANK,
         max_model_len=MAX_MODEL_LEN,
-        max_num_batched_tokens=MAX_MODEL_LEN,
+        additional_config={"prefill_chunk_size": MAX_MODEL_LEN},
         max_num_seqs=BATCH_SIZE,
         block_size=BLOCK_SIZE,
     )

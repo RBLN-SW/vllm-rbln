@@ -221,7 +221,7 @@ class RBLNWorker(WorkerBase):
         """Estimate KV-cache DRAM, discounting the fixed command-stream buffers
         that warm-up's compiled runtimes reserve.
 
-        One per decode graph the runner will compile, plus the prefill. A draft
+        One per decode graph and prefill chunk size the runner will compile. A draft
         model, when present, adds one, and a bucket's worth more (plus the
         specialized-MoE fallback) wherever the runner compiles decode graphs --
         or one more on a producer whose drafter still warms its decode pass.
@@ -241,7 +241,9 @@ class RBLNWorker(WorkerBase):
         # Read off the runner that compiles them, so this count and
         # run_model_graphs cannot drift apart.
         decode_graph_shapes = self.model_runner.decode_graph_shapes()
-        num_runtimes = 1 + len(decode_graph_shapes)
+        num_runtimes = len(self.model_runner.prefill_chunk_sizes) + len(
+            decode_graph_shapes
+        )
 
         ratio: float = 1.0
         if self.model_config.quantization is not None:
@@ -381,6 +383,7 @@ class RBLNWorker(WorkerBase):
             model_kernel_size = estimate_model_kernel_size(
                 model_config=self.model_config,
                 parallel_config=self.parallel_config,
+                num_layers=self.model_config.get_num_layers(self.parallel_config),
                 n_model_bytes=n_model_bytes,
             )
 
@@ -406,6 +409,10 @@ class RBLNWorker(WorkerBase):
             draft_kernel_size = estimate_model_kernel_size(
                 model_config=draft_model_config,
                 parallel_config=draft_parallel_config,
+                # The drafter builds every layer on the last stage, outside
+                # make_layers, so neither VLLM_PP_LAYER_PARTITION nor the layer
+                # truncation shapes it.
+                num_layers=draft_model_config.get_total_num_hidden_layers(),
                 n_model_bytes=draft_n_model_bytes,
             )
             estimate_kwargs["num_runtimes"] = num_runtimes + num_draft_runtimes
@@ -723,6 +730,10 @@ class RBLNWorker(WorkerBase):
         return
 
     def shutdown(self) -> None:
+        runner = getattr(self, "model_runner", None)
+        if runner is not None and runner._prev_async_output is not None:
+            runner._prev_async_output.get_sampled_token_ids_cpu()
+            runner._prev_async_output = None
         self._release_offload_temp_storage()
 
         # has_kv_transfer_group can be None during interpreter shutdown.

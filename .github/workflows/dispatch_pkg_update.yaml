@@ -27,11 +27,21 @@ on:
         description: Version of optimum-rbln to add
         default: "latest"
         type: string
+    secrets:
+      UDC_NEXUS_USERNAME:
+        required: false
+      UDC_NEXUS_PASSWORD:
+        required: false
+      GIT_PAT:
+        required: false
 
 jobs:
   update-pkg:
     uses: ./.github/workflows/pkg_update.yaml
-    secrets: inherit
+    secrets:
+      UDC_NEXUS_USERNAME: ${{ secrets.UDC_NEXUS_USERNAME }}
+      UDC_NEXUS_PASSWORD: ${{ secrets.UDC_NEXUS_PASSWORD }}
+      GIT_PAT: ${{ secrets.GIT_PAT }}
     with:
       python-version: ${{ inputs.python-version }}
       optimum-version: ${{ inputs.optimum-version }}
