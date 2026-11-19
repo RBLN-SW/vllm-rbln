@@ -118,14 +118,14 @@ class AXK3GatedResidual(nn.Module):
                 u = self.norm(residual.float()) * gamma.float()
                 u = u.to(residual.dtype)
             else:
-                u, write_gate = torch.ops.rbln_custom_ops.axk3_gr_norm(
+                u, write_gate = torch.ops.rbln_custom_ops.gated_residual_norm(
                     residual,
                     self.gamma,
                     self.write_proj.weight,
                     self.write_bias,
                     self.norm.variance_epsilon,
                 )
-            block_input = torch.ops.rbln_custom_ops.axk3_gr_read(
+            block_input = torch.ops.rbln_custom_ops.gated_residual_read(
                 u, self.read_down.weight, self.read_up.weight
             )
             return block_input, write_gate
@@ -154,7 +154,7 @@ class AXK3GatedResidual(nn.Module):
         self, residual: torch.Tensor, y: torch.Tensor, write_gate: torch.Tensor
     ) -> torch.Tensor:
         """R'_i = R_i + s_i * y."""
-        return torch.ops.rbln_custom_ops.axk3_gr_write(residual, y, write_gate)
+        return torch.ops.rbln_custom_ops.gated_residual_write(residual, y, write_gate)
 
 
 @contextlib.contextmanager
@@ -356,7 +356,7 @@ class AXK3Model(nn.Module):
     ) -> torch.Tensor:
         if inputs_embeds is None:
             inputs_embeds = self.embed_input_ids(input_ids)
-        # Every stream starts as the embedding; the layers run the axk3_gr_* ops
+        # Every stream starts as the embedding; the layers run the gated_residual_* ops
         # on [B, n, T, h] streams.
         streams = (
             *inputs_embeds.shape[:-2],
