@@ -244,7 +244,12 @@ class RBLNFlashAttentionMetadataBuilder(
 
         self._staged: dict[tuple, torch.Tensor] = {}
 
-    def _stage(self, t: torch.Tensor | None, slot: str) -> torch.Tensor | None:
+    def _stage(
+        self,
+        t: torch.Tensor | None,
+        slot: str,
+        shared: dict[tuple, torch.Tensor] | None = None,
+    ) -> torch.Tensor | None:
         """Copy a host tensor into this builder's persistent device buffer.
 
         `slot` must be unique per logical tensor: cache_seq_lens and
@@ -252,23 +257,33 @@ class RBLNFlashAttentionMetadataBuilder(
         would silently make them share one buffer.
 
         The returned tensor is overwritten by the next stage() call, so the
-        caller must run the forward pass before staging again.
+        caller must run the forward pass before staging again. `shared` takes
+        the buffer instead of this builder, for a slot whose value does not
+        depend on the KV cache group: every group stages the same value into it.
         """
         if t is None:
             return None
         key = (slot, t.shape, t.dtype)
-        if (buf := self._staged.get(key)) is None:
+        staged = self._staged if shared is None else shared
+        if (buf := staged.get(key)) is None:
             buf = torch.empty(t.shape, dtype=t.dtype, device=self.device)
-            self._staged[key] = buf
+            staged[key] = buf
         buf.copy_(t)
         return buf
 
-    def stage(self, metadata: RBLNFlashAttentionMetadata) -> None:
-        metadata.seq_lens = self._stage(metadata.seq_lens, "seq_idx")
+    def stage(
+        self,
+        metadata: RBLNFlashAttentionMetadata,
+        group_shared: dict[tuple, torch.Tensor] | None = None,
+    ) -> None:
+        """`group_shared` is one staging dict the caller hands every KV cache
+        group of a step, so the slots that do not depend on the group reach the
+        graph as one input each."""
+        metadata.seq_lens = self._stage(metadata.seq_lens, "seq_idx", group_shared)
         metadata.block_tables = self._stage(metadata.block_tables, "block_tables")
         metadata.attn_masks = self._stage(metadata.attn_masks, "attn_masks")
         metadata.mm_prefix_row_ends = self._stage(
-            metadata.mm_prefix_row_ends, "mm_prefix_row_ends"
+            metadata.mm_prefix_row_ends, "mm_prefix_row_ends", group_shared
         )
         metadata.cache_seq_lens = self._stage(metadata.cache_seq_lens, "cache_seq_lens")
         metadata.cache_offsets = self._stage(metadata.cache_offsets, "cache_offsets")
@@ -276,7 +291,9 @@ class RBLNFlashAttentionMetadataBuilder(
             metadata.local_block_tables, "local_block_tables"
         )
         metadata.swa_attn_masks = self._stage(metadata.swa_attn_masks, "swa_attn_masks")
-        metadata.num_accepted = self._stage(metadata.num_accepted, "num_accepted")
+        metadata.num_accepted = self._stage(
+            metadata.num_accepted, "num_accepted", group_shared
+        )
 
     def reorder_batch(
         self, input_batch: "InputBatch", scheduler_output: "SchedulerOutput"
@@ -295,6 +312,7 @@ class RBLNFlashAttentionMetadataBuilder(
         num_accepted: torch.Tensor | None = None,
         state_load_pos: torch.Tensor | None = None,
         mm_prefix_row_ends: torch.Tensor | None = None,
+        group_shared: dict[tuple, torch.Tensor] | None = None,
         defer_staging: bool = False,
     ) -> RBLNFlashAttentionMetadata:
         """`mm_prefix_row_ends`, on a prefill of an mm prefix LM, holds for each
@@ -407,7 +425,7 @@ class RBLNFlashAttentionMetadataBuilder(
         )
 
         if not defer_staging:
-            self.stage(attn_metadata)
+            self.stage(attn_metadata, group_shared)
         return attn_metadata
 
     def use_cascade_attention(self, *args, **kwargs) -> bool:

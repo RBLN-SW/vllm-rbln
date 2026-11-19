@@ -472,6 +472,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         self.discard_request_mask = torch.zeros(self.max_num_reqs, dtype=torch.bool)
         self.intermediate_tensors_dict: dict[tuple[int, int], IntermediateTensors] = {}
         self.input_stager = InputStager(self.device)
+        self._group_shared_staging: dict[tuple, torch.Tensor] = {}
 
         # OPTIMIZATION: Cache the tensors rather than creating them every step.
         # Keep in int64 to avoid overflow with long context
@@ -1217,6 +1218,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
 
             if kv_cache_gid > 0:
                 cm.block_table_tensor = _get_block_table(kv_cache_gid)
+            # _group_shared_staging gives every group one buffer for the slots
+            # derived from positions, query_start_loc and seq_lens, so a
+            # per-group value would silently reach every group as the last
+            # group's: only the block table may differ.
+            assert cm.query_start_loc is cm_base.query_start_loc
+            assert cm.seq_lens is cm_base.seq_lens
+            assert cm.num_reqs == cm_base.num_reqs
 
             # NOTE(RBLN): gate on the drafter, not speculative_config (which every
             # rank has): only the last PP rank drafts, and no other rank consumes
@@ -1249,6 +1257,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     num_accepted=num_accepted,
                     state_load_pos=state_load_pos,
                     mm_prefix_row_ends=mm_prefix_row_ends,
+                    group_shared=self._group_shared_staging,
                     defer_staging=defer_staging,
                 )
 
@@ -2189,7 +2198,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             for groups in self.attn_groups:
                 for group in groups:
                     builder = group.get_metadata_builder(0)
-                    builder.stage(attn_metadata[group.layer_names[0]])
+                    builder.stage(
+                        attn_metadata[group.layer_names[0]], self._group_shared_staging
+                    )
         # Run the model.
         # With spec decode, defer connector finalization (wait_for_save + clear
         # metadata) until after the draft runs in sample_tokens() so the draft
