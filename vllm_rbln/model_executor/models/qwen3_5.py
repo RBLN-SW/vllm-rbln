@@ -53,23 +53,56 @@ from vllm_rbln.v1.attention.backends.gdn_attn import grouped_qkv_rows
 logger = init_logger(__name__)
 
 
+class _RBLNQwen3VisionBlock(nn.Module):
+    def __init__(self, block: nn.Module, num_heads: int, head_dim: int):
+        super().__init__()
+        self.block = block
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+
+    def _rotate(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+        x1, x2 = x.chunk(2, dim=-1)
+        return torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1)
+
+    @torch.compiler.nested_compile_region
+    def forward(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        key_bias: torch.Tensor,
+    ) -> torch.Tensor:
+        n = x.shape[0]
+        block = self.block
+        qkv, _ = block.attn.qkv(block.norm1(x))
+        qkv = qkv.view(n, 3, self.num_heads, self.head_dim)
+        q = self._rotate(qkv[:, 0], cos, sin).transpose(0, 1)
+        k = self._rotate(qkv[:, 1], cos, sin).transpose(0, 1)
+        v = qkv[:, 2].transpose(0, 1)
+        scores = torch.matmul(q, k.transpose(1, 2)) * self.head_dim**-0.5 + key_bias
+        out = torch.matmul(torch.softmax(scores, dim=-1), v)
+        out, _ = block.attn.proj(out.transpose(0, 1).reshape(n, -1))
+        x = x + out
+        return x + block.mlp(block.norm2(x))
+
+
 class _RBLNQwen3VisionEncoder(nn.Module):
     """Qwen3-VL's vision transformer on one padded image, without the cu_seqlens
-    attention: full attention over the bucket with padded keys masked."""
+    attention: full attention over the bucket with padded keys masked. Each block
+    is a nested compile region, so the compiler can roll the blocks into a loop."""
 
     def __init__(self, visual: nn.Module):
         super().__init__()
         self.visual = visual
         attn = visual.blocks[0].attn
-        self.num_heads = attn.num_attention_heads_per_partition
-        self.head_dim = attn.hidden_size_per_attention_head
+        num_heads = attn.num_attention_heads_per_partition
+        head_dim = attn.hidden_size_per_attention_head
+        self.blocks = nn.ModuleList(
+            _RBLNQwen3VisionBlock(block, num_heads, head_dim) for block in visual.blocks
+        )
         proj = visual.patch_embed.proj
         self.patch_weight = proj.weight.view(proj.weight.shape[0], -1)
         self.patch_bias = proj.bias
-
-    def _rotate(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
-        x1, x2 = x.chunk(2, dim=-1)
-        return torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1)
 
     def forward(
         self,
@@ -86,22 +119,11 @@ class _RBLNQwen3VisionEncoder(nn.Module):
             cos, sin: [N, head_dim / 2] the 2-D rotary embedding
             key_bias: [1, 1, N] 0 on the image's patches, -30000 on the padding
         """
-        n = patches.shape[0]
         x = F.linear(patches, self.patch_weight, self.patch_bias) + pos_embeds
         cos = cos.unsqueeze(1)
         sin = sin.unsqueeze(1)
-        scale = self.head_dim**-0.5
-        for block in self.visual.blocks:
-            qkv, _ = block.attn.qkv(block.norm1(x))
-            qkv = qkv.view(n, 3, self.num_heads, self.head_dim)
-            q = self._rotate(qkv[:, 0], cos, sin).transpose(0, 1)
-            k = self._rotate(qkv[:, 1], cos, sin).transpose(0, 1)
-            v = qkv[:, 2].transpose(0, 1)
-            scores = torch.matmul(q, k.transpose(1, 2)) * scale + key_bias
-            out = torch.matmul(torch.softmax(scores, dim=-1), v)
-            out, _ = block.attn.proj(out.transpose(0, 1).reshape(n, -1))
-            x = x + out
-            x = x + block.mlp(block.norm2(x))
+        for block in self.blocks:
+            x = block(x, cos, sin, key_bias)
         return self.visual.merger(x)
 
 
@@ -161,9 +183,6 @@ class RBLNQwen3_5ForConditionalGeneration(
                 "--video-pruning-rate unset."
             )
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-        # Upstream's MTP proposer reads the image token by this name from a
-        # target whose class name it does not list.
-        self.config.image_token_index = self.config.image_token_id
         object.__setattr__(self, "_mm_encoder", None)
         # Upstream builds no vision tower when images and video are off (a
         # placeholder stands in for it).

@@ -407,6 +407,12 @@ class RBLNEagleProposer(EagleProposer):
             num_rejected_tokens,
         )
 
+    def get_model_name(self, model: nn.Module) -> str:
+        # Upstream's load_model picks the target's image-token field by class
+        # name and lists upstream classes only; an RBLN subclass of one goes by
+        # its parent's name.
+        return super().get_model_name(model).removeprefix("RBLN")
+
     def load_model(self, target_model: nn.Module) -> None:
         super().load_model(target_model)
         if self.supports_mm_inputs and not isinstance(self.model, RBLNQwen3_5MTP):

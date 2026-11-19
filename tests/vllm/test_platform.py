@@ -674,10 +674,15 @@ class TestRejectedConfigs:
             with pytest.raises(ValueError, match="single rank"):
                 reconfigure(widened)
 
-    def test_gdn_models_speculate_with_their_mtp_head_only(self, reconfigure, gdn):
+    @pytest.mark.parametrize("model", ["gdn", "glm5_next"])
+    def test_recurrent_state_models_speculate_with_their_mtp_head_only(
+        self, reconfigure, request, model
+    ):
+        as_model = request.getfixturevalue("gdn") if model == "gdn" else _as_glm5_next
+
         def speculative(method, num_speculative_tokens):
             def mutate(config):
-                gdn(config)
+                as_model(config)
                 config.speculative_config = SimpleNamespace(
                     method=method, num_speculative_tokens=num_speculative_tokens
                 )

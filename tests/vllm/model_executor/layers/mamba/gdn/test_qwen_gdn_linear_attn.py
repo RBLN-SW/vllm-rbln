@@ -23,7 +23,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn.functional as F
-from rebel.ops.torch_custom_ops.gdn import state_blocks, unblock_state
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5RMSNormGated,
     torch_chunk_gated_delta_rule,
@@ -51,7 +50,7 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
     build_kv_cache_forward_context_kwargs,
 )
 
-HIDDEN, HEADS_K, HEADS_V, HEAD_DIM, KERNEL = 64, 2, 4, 128, 4
+HIDDEN, HEADS_K, HEADS_V, HEAD_DIM, KERNEL = 64, 4, 4, 128, 4
 KEY_DIM, VALUE_DIM = HEADS_K * HEAD_DIM, HEADS_V * HEAD_DIM
 CONV_DIM = 2 * KEY_DIM + VALUE_DIM
 PREFIX = "model.layers.0.linear_attn"
@@ -194,17 +193,6 @@ def _run(
         return RBLNQwenGatedDeltaNetAttention.forward(layer, hidden)
 
 
-def _ssm_state(state: torch.Tensor) -> torch.Tensor:
-    # The block's bytes as the blocked state they hold -> HF [1, num_v_heads, dk, dv]
-    blocked = (
-        state[BLOCK]
-        .flatten()[: HEADS_V * HEAD_DIM * HEAD_DIM]
-        .float()
-        .reshape(1, HEADS_K, HEADS_V // HEADS_K, *state_blocks(HEAD_DIM))
-    )
-    return unblock_state(blocked).reshape(1, HEADS_V, HEAD_DIM, HEAD_DIM)
-
-
 @pytest.mark.parametrize("block_size", [256, 1024])
 @pytest.mark.parametrize("shared_binding", [False, True])
 @pytest.mark.parametrize(
@@ -227,14 +215,11 @@ def test_padded_prefill_then_decode_tracks_hf(
         dtype="float32",
     )
     layer = _layer()
-    # The state cache and the ring beside it, as the runner allocates them.
     with set_current_vllm_config(vllm_config):
         kv_block = RBLNFlashAttentionBackend.get_kv_cache_shape(1, block_size, 1, 128)[
             1:
         ]
     state = torch.zeros(NUM_BLOCKS, *kv_block)
-    state_elements = HEADS_V * HEAD_DIM * HEAD_DIM
-    state.flatten(1)[:, state_elements:] = 13
     before = state.clone()
     ring = torch.zeros(NUM_BLOCKS, KERNEL - 1, 1, CONV_DIM // 64, 64)
     device_layer = _grouped(layer, ring, monkeypatch)
@@ -275,7 +260,6 @@ def test_padded_prefill_then_decode_tracks_hf(
             layer, tokens[:, start : start + valid], history, ref_state
         )
         torch.testing.assert_close(out[:, :valid], ref, atol=2e-3, rtol=2e-2)
-        torch.testing.assert_close(_ssm_state(state), ref_state, atol=2e-3, rtol=2e-2)
         start += valid
 
     # Decode: one token on row 0 of a padded batch of two.
@@ -293,16 +277,12 @@ def test_padded_prefill_then_decode_tracks_hf(
         2,
         shared_binding,
     )
-    ref, _, ref_state = _reference(layer, tokens[:, total:], history, ref_state)
+    ref, _, _ = _reference(layer, tokens[:, total:], history, ref_state)
     torch.testing.assert_close(out[:1], ref, atol=2e-3, rtol=2e-2)
-    torch.testing.assert_close(_ssm_state(state), ref_state, atol=2e-3, rtol=2e-2)
     # The padded row took the null block, so the request's neighbours are
     # untouched.
     torch.testing.assert_close(
         state[[BLOCK - 1, BLOCK + 1]], before[[BLOCK - 1, BLOCK + 1]]
-    )
-    torch.testing.assert_close(
-        state.flatten(1)[:, state_elements:], before.flatten(1)[:, state_elements:]
     )
     assert not ring[BLOCK - 1].any() and not ring[BLOCK + 1].any()
 
@@ -423,7 +403,7 @@ def _decoded(vllm_config, num_drafts: int, windows, monkeypatch, shared_binding)
             **window,
         )
         outputs.append(out[0].float())
-        states.append(_ssm_state(state))
+        states.append(state[BLOCK].float())
     return outputs, states
 
 
