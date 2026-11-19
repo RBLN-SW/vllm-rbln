@@ -158,9 +158,7 @@ def test_forward_runs_only_the_layers_this_rank_built(monkeypatch):
         PPMissingLayer,
     ]
     model.embed_input_ids = lambda input_ids: torch.zeros(len(input_ids), 8)
-    model.final_gated_residual = SimpleNamespace(
-        read=lambda hidden: (hidden.squeeze(-3), None)
-    )
+    model.final_gated_residual = SimpleNamespace(read=lambda hidden: (hidden, None))
 
     out = model.forward(
         input_ids=torch.zeros(3, dtype=torch.long),
@@ -291,21 +289,16 @@ def test_prefill_chunk_matches_decoding_its_tokens_one_at_a_time(gated_residual_
     torch.testing.assert_close(chunk, decoded)
 
 
-def test_a_decode_batch_runs_the_gated_residual_ops(gated_residual_model):
+def test_a_multi_token_decode_step_keeps_the_plain_gated_residual(gated_residual_model):
     built = gated_residual_model
     built.step.is_prefill = False
-    embeds = torch.randn(8, 1, built.hidden)
+    tokens = 3
 
-    batch = built.model.forward(None, torch.zeros(8, 1), None, embeds)
+    built.model.forward(
+        None, torch.arange(tokens), None, torch.randn(1, tokens, built.hidden)
+    )
 
-    # Every read, the final one too, takes [B, n, T, h].
-    assert built.read_dims == [4, 4, 4, 4, 4]
-    built.step.is_prefill = True
-    rows = [
-        built.model.forward(None, torch.zeros(1), None, embeds[b : b + 1])
-        for b in range(8)
-    ]
-    torch.testing.assert_close(batch, torch.cat(rows))
+    assert built.read_dims == [3] * 5
 
 
 def test_eagle3_is_refused_on_both_aux_layer_setup_paths():
