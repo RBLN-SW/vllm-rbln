@@ -83,7 +83,6 @@ class RBLNGDNBlockAuxCache(nn.Module, AttentionLayerBase):
 
     def inputs(self) -> torch.Tensor:
         metadata = get_forward_context().attn_metadata[self.owner]
-        assert self.layer_index is not None, self.prefix
         return _resolve_kv_cache(metadata, self.layer_index)
 
 
@@ -183,7 +182,6 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             f"the step's batch {batch}"
         )
         seq_len = num_tokens // batch
-        assert self.layer_index is not None, self.prefix
         state = _resolve_kv_cache(metadata, self.layer_index)
         ring = self.conv_ring.inputs()
         tp_size = self.tp_size

@@ -243,7 +243,6 @@ class RBLNGlm5NextAuxCache(_RBLNGlm5NextCache):
         return RBLNGlm5NextCacheBackend
 
     def inputs(self) -> torch.Tensor:
-        assert self.layer_index is not None, f"{self.prefix} was not allocated"
         metadata = get_forward_context().attn_metadata[self.owner]
         return _resolve_kv_cache(metadata, self.layer_index)
 
