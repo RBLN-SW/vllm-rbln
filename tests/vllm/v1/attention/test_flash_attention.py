@@ -22,7 +22,6 @@ import torch
 from vllm.config import set_current_vllm_config
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-import vllm_rbln.envs as envs
 import vllm_rbln.v1.attention.backends.flash_attention as flash_attention
 from tests.vllm.v1.attention.utils import (
     make_attention_spec,
@@ -306,10 +305,6 @@ class TestBuildPrefillNonCausal:
     def test_mask_dtype_follows_enforce_eager(
         self, cfg_noncausal, eager, expected_dtype
     ):
-        # float16 under enforce_eager, float32 otherwise. enforce_eager needs
-        # device tensors, so that case is skipped on the cpu lane.
-        if eager and not envs.VLLM_RBLN_USE_DEVICE_TENSOR:
-            pytest.skip("enforce_eager=True requires VLLM_RBLN_USE_DEVICE_TENSOR=1")
         config = (
             make_vllm_config(
                 max_model_len=MAX_LEN,
@@ -762,7 +757,7 @@ class TestBuildOutputAssembly:
 
 
 class TestStage:
-    @pytest.mark.maybe_use_device
+    @pytest.mark.use_device
     @pytest.mark.parametrize("kind", ["full", "shift", "glm"])
     @pytest.mark.parametrize("is_prefill", [False, True])
     @pytest.mark.parametrize("use_custom_kernel", [False, True])
@@ -884,7 +879,7 @@ class TestStage:
         assert first.reshape(-1).tolist() == [10]
 
 
-@pytest.mark.maybe_use_device
+@pytest.mark.use_device
 class TestFlashImplInit:
     # __init__ validation guards and derived attributes. Each guard test sets the
     # other args valid so the intended check fires (the guards are ordered).
@@ -994,7 +989,7 @@ class TestFlashImplInit:
         assert make_impl(cfg_square, sinks=torch.zeros(8)).is_normal is False
 
 
-@pytest.mark.maybe_use_device
+@pytest.mark.use_device
 class TestForwardSlidingWindow:
     """Which kernel a sliding-window layer reaches is carried on the metadata
     by the builder, and the two take different inputs."""
