@@ -280,7 +280,7 @@ class TestRblnCompatHash:
 
     def test_a_one_sided_push_boundary_state_does_not_pair(self):
         # The consumer allocates the boundary block before it knows the
-        # producer; a producer without the opt-in would leave it unwritten.
+        # producer; a producer that does not push it would leave it unwritten.
         def hashed(opt_in):
             return rbln_compat_hash(
                 "BASE",
@@ -293,10 +293,20 @@ class TestRblnCompatHash:
         assert hashed(True) != hashed(False)
 
     @pytest.mark.parametrize(
-        ("writes_into_peer", "expected"), [(True, True), (False, False)]
+        ("writes_into_peer", "caching", "mode", "expected"),
+        [
+            (True, True, "align", True),
+            (False, True, "align", False),
+            (True, False, "align", False),
+            (True, True, "all", False),
+        ],
     )
-    def test_push_boundary_state_is_a_writer_knob(self, writes_into_peer, expected):
-        config = mock_vllm_config(push_boundary_state=True)
+    def test_a_writer_with_align_mode_prefix_caching_pushes_the_boundary(
+        self, writes_into_peer, caching, mode, expected
+    ):
+        config = mock_vllm_config()
+        config.cache_config.enable_prefix_caching = caching
+        config.cache_config.mamba_cache_mode = mode
         result = transfer_shape(config, [], writes_into_peer=writes_into_peer)
         assert result.push_boundary_state is expected
 

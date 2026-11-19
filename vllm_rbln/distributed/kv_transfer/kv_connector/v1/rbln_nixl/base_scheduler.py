@@ -90,7 +90,8 @@ class RblnNixlSchedulerBase(NixlBaseConnectorScheduler):
         state, so `RBLNMambaManager` keeps or allocates a block for it.
 
         A reader learns it from the producer's `remote_state_boundary`; a
-        writer's consumer allocates before that, so it is the opt-in.
+        writer's consumer allocates before that, so each end decides it from
+        its own cache config (`TransferShape.push_boundary_state`).
         """
         return not self._writes_into_peer or self._shape.push_boundary_state
 

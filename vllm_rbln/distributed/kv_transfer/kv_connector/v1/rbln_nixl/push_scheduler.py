@@ -71,19 +71,6 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
         # Tokens each handed-over request holds, for the worker's `_tail_chunks`.
         self._valid_tokens: dict[ReqId, int] = {}
 
-        if self._shape.push_boundary_state and self._has_mamba:
-            cache_config = vllm_config.cache_config
-            if not (
-                cache_config.enable_prefix_caching
-                and cache_config.mamba_cache_mode == "align"
-            ):
-                raise RuntimeError(
-                    "RBLN NIXL: push_boundary_state needs prefix caching in "
-                    "mamba_cache_mode 'align' on both ends; got "
-                    f"enable_prefix_caching={cache_config.enable_prefix_caching}, "
-                    f"mamba_cache_mode={cache_config.mamba_cache_mode!r}"
-                )
-
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
     ) -> tuple[int, bool]:

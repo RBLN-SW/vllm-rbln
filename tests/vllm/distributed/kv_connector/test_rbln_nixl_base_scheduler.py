@@ -567,43 +567,6 @@ class TestStateBoundaryExchange:
         assert REMOTE_STATE_BOUNDARY not in params
 
     @pytest.mark.parametrize(
-        ("caching", "mode", "ok"),
-        [
-            (True, "align", True),
-            (False, "none", False),
-            (False, "align", False),
-            (True, "all", False),
-        ],
-    )
-    def test_the_opt_in_needs_align_mode_prefix_caching(
-        self, monkeypatch, caching, mode, ok
-    ):
-        def stub_init(self, cfg, _engine_id, kv_cache_config):
-            self._has_mamba = True
-
-        monkeypatch.setattr(NixlPushConnectorScheduler, "__init__", stub_init)
-        config = mock_vllm_config(push_boundary_state=True)
-        config.cache_config.enable_prefix_caching = caching
-        config.cache_config.mamba_cache_mode = mode
-
-        if ok:
-            RblnNixlPushConnectorScheduler(config, "eng", _kv_config([MagicMock()]))
-        else:
-            with pytest.raises(RuntimeError, match="enable_prefix_caching"):
-                RblnNixlPushConnectorScheduler(config, "eng", _kv_config([MagicMock()]))
-
-    def test_the_opt_in_does_not_bind_an_engine_without_ssm_groups(self, monkeypatch):
-        def stub_init(self, cfg, _engine_id, kv_cache_config):
-            self._has_mamba = False
-
-        monkeypatch.setattr(NixlPushConnectorScheduler, "__init__", stub_init)
-        config = mock_vllm_config(push_boundary_state=True)
-        config.cache_config.enable_prefix_caching = False
-        config.cache_config.mamba_cache_mode = "none"
-
-        RblnNixlPushConnectorScheduler(config, "eng", _kv_config([MagicMock()]))
-
-    @pytest.mark.parametrize(
         ("cls", "push_boundary_state"),
         [
             (RblnNixlPullConnectorScheduler, False),
