@@ -82,6 +82,21 @@ class RBLNConfigBase:
     If None, uses the longest prefill_chunk_size that divides block_size.
     """
 
+    prefill_chunk_size: list[int] | None = None
+    """Compiled prefill graph lengths, separate from the scheduling token budget.
+
+    The vllm model path accepts multiple lengths and chooses the shortest that
+    fits each chunk. If unset, it uses [max_num_batched_tokens].
+
+    The optimum model path accepts exactly one length. If unset, it uses
+    optimum-rbln's default for compilation or the pre-compiled model's chunk size.
+    """
+
+    @field_validator("prefill_chunk_size", mode="before")
+    @classmethod
+    def _normalize_prefill_chunk_size(cls, value: Any) -> Any:
+        return [value] if isinstance(value, int) else value
+
 
 @vllm_config_dataclass
 class RBLNConfig(RBLNConfigBase):
@@ -102,10 +117,10 @@ class RBLNConfig(RBLNConfigBase):
     enable_sub_block_cache: bool = True
     """Enable sub-block prefix caching, at `sub_block_size` granularity."""
 
-    use_fused_sampling: bool = False
+    use_fused_sampling: bool = True
     """Run the sampling step's logits processing inside the compiled sampling
     graph: repetition / frequency / presence penalties and logit bias, on the
-    vocab chunks they touch. Needs `use_custom_sampler`."""
+    vocab chunks they touch, and min_p. Needs `use_custom_sampler`."""
 
     prefill_chunk_size: list[int] | None = None
     """Lengths the prefill graphs are compiled at. A prefill step runs the
@@ -145,7 +160,8 @@ class RBLNConfig(RBLNConfigBase):
     """Output-token capacities of compiled encoder graphs, shared across modalities.
     Empty lets the model choose: MiniMax-M3 takes the processor upper bounds of
     the enabled modalities, Gemma4 every supported soft token budget up to
-    max_soft_tokens."""
+    max_soft_tokens, Qwen3.5 powers of two from 128 up to the longest prefill
+    chunk (512 at least) and the processor upper bound for an image."""
 
     use_w8a8: bool = False
     """Opt in to W8A8. W8A16 runs on every RBLN NPU, W8A8 only on the ones
@@ -177,11 +193,6 @@ class RBLNConfig(RBLNConfigBase):
         # Unset and True build the same graph; only False changes the artifact.
         factors["use_dynamic_kv_cache"] = self.use_dynamic_kv_cache is not False
         return hash_factors(factors)
-
-    @field_validator("prefill_chunk_size", mode="before")
-    @classmethod
-    def _one_prefill_chunk_size_is_a_list(cls, value: Any) -> Any:
-        return [value] if isinstance(value, int) else value
 
     @property
     def max_prefill_chunk_size(self) -> int:
@@ -236,6 +247,25 @@ class OptimumRBLNCompileConfig:
 class OptimumRBLNConfig(RBLNConfigBase):
     """RBLN NPU options for the optimum-rbln model path."""
 
+    @field_validator("prefill_chunk_size")
+    @classmethod
+    def _validate_prefill_chunk_size(cls, value: list[int] | None) -> list[int] | None:
+        if value is not None:
+            if len(value) != 1:
+                raise ValueError(
+                    "The optimum model path requires exactly one prefill_chunk_size."
+                )
+            if value[0] <= 0:
+                raise ValueError("prefill_chunk_size must be greater than 0")
+        return value
+
+    @property
+    def single_prefill_chunk_size(self) -> int | None:
+        """The single prefill length used by optimum-rbln."""
+        return (
+            self.prefill_chunk_size[0] if self.prefill_chunk_size is not None else None
+        )
+
     num_devices_per_local_rank: int = 1
     """Number of NPU devices assigned to each local rank."""
 
@@ -243,13 +273,6 @@ class OptimumRBLNConfig(RBLNConfigBase):
     """Entries for optimum-rbln's own model config, laid over what vllm-rbln
     derives from the vLLM settings when the model is compiled. With a
     pre-compiled model only the `device` entries apply."""
-
-    # Snapshots of a vLLM field taken before it is overwritten. vLLM already has
-    # the flag, so there is no `--rbln-*` one, but they stay settable: the
-    # platform hook writes the first into the dict before this class exists.
-    user_max_num_batched_tokens: int | None = field(default=None, metadata=_NO_FLAG)
-    """`--max-num-batched-tokens` as the user gave it, before vLLM fills in its
-    default. On this path it is the prefill chunk size to compile."""
 
     num_blocks_override: int | None = field(default=None, metadata=_NO_FLAG)
     """`--num-gpu-blocks-override` as given, before the prefix-cache block ratio

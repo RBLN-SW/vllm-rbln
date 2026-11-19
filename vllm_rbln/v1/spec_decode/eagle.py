@@ -71,6 +71,11 @@ class RBLNEagleProposer(EagleProposer):
         # still gets the NPU, where the draft model itself keeps running.
         super().__init__(vllm_config, torch.device("cpu"), runner)
         self.device = device
+        if self.uses_mrope:
+            # The parent keeps M-RoPE positions only. A draft here is text-only
+            # (`load_model` refuses multimodal embeddings), where the M-RoPE
+            # dimensions are identical, so it runs on one row as the runner does.
+            self.positions = torch.zeros(self.max_positions, dtype=torch.int64)
 
         if self.needs_extra_input_slots:
             raise NotImplementedError(
@@ -390,6 +395,12 @@ class RBLNEagleProposer(EagleProposer):
             token_indices_to_sample,
             num_rejected_tokens,
         )
+
+    def get_model_name(self, model: nn.Module) -> str:
+        # Upstream's load_model picks the target's image-token field by class
+        # name and lists upstream classes only; an RBLN subclass of one goes by
+        # its parent's name.
+        return super().get_model_name(model).removeprefix("RBLN")
 
     def load_model(self, target_model: nn.Module) -> None:
         super().load_model(target_model)

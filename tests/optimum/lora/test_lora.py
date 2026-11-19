@@ -181,7 +181,7 @@ async def add_lora():
         max_loras=NUM_LORAS,
         max_lora_rank=MAX_LORA_RANK,
         max_model_len=MAX_MODEL_LEN,
-        max_num_batched_tokens=MAX_MODEL_LEN,
+        additional_config={"prefill_chunk_size": MAX_MODEL_LEN},
         max_num_seqs=BATCH_SIZE,
         block_size=BLOCK_SIZE,
     )
@@ -198,7 +198,7 @@ async def list_loras():
         max_loras=NUM_LORAS,
         max_lora_rank=MAX_LORA_RANK,
         max_model_len=MAX_MODEL_LEN,
-        max_num_batched_tokens=MAX_MODEL_LEN,
+        additional_config={"prefill_chunk_size": MAX_MODEL_LEN},
         max_num_seqs=BATCH_SIZE,
         block_size=BLOCK_SIZE,
     )

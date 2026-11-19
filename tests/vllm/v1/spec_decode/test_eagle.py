@@ -35,7 +35,7 @@ import vllm_rbln.v1.spec_decode.eagle as eagle_module
 from tests.vllm.v1.spec_decode.utils import make_cad, make_eagle_proposer
 from vllm_rbln.v1.worker.dp_utils import DPStatus, ShapeConfig
 
-pytestmark = pytest.mark.maybe_use_device
+pytestmark = pytest.mark.use_device
 
 
 def _shape_config(*, specialized=False, max_num_tokens=64):
@@ -298,6 +298,16 @@ class TestInitGuards:
         )
         proposer = make_eagle_proposer()
         assert proposer.supports_mm_inputs
+
+    def test_an_mrope_draft_keeps_one_row_of_positions(self, monkeypatch):
+        from vllm.config import ModelConfig
+
+        # Upstream allocates the M-RoPE rows only for such a draft (Qwen3.5's
+        # MTP head); a text-only draft step reads one row.
+        monkeypatch.setattr(ModelConfig, "uses_mrope", property(lambda self: True))
+        monkeypatch.setattr(ModelConfig, "mrope_num_dims", property(lambda self: 3))
+        proposer = make_eagle_proposer()
+        assert proposer.positions.shape == (proposer.max_positions,)
 
     def test_rejects_extra_input_slots(self, monkeypatch):
         # Parallel drafting / draft-model spec decode needs input slots the
@@ -629,6 +639,26 @@ class TestPropose:
 
 
 class TestLoadModel:
+    def test_an_rbln_target_goes_by_its_upstream_class_name(self):
+        # Upstream's load_model picks the target's image-token field by class
+        # name and lists upstream classes only, so the RBLN subclass of a listed
+        # class has to answer with its parent's name.
+        from vllm.model_executor.models.qwen3_5 import (
+            Qwen3_5ForConditionalGeneration,
+        )
+
+        from vllm_rbln.model_executor.models.qwen3_5 import (
+            RBLNQwen3_5ForConditionalGeneration,
+        )
+
+        target = RBLNQwen3_5ForConditionalGeneration.__new__(
+            RBLNQwen3_5ForConditionalGeneration
+        )
+        proposer = make_eagle_proposer()
+        assert (
+            proposer.get_model_name(target) == Qwen3_5ForConditionalGeneration.__name__
+        )
+
     @pytest.mark.parametrize("draft_needs_mm_inputs", [False, True])
     def test_multimodal_guard_uses_loaded_draft_capability(
         self, monkeypatch, draft_needs_mm_inputs

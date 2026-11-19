@@ -77,8 +77,32 @@ class TestStagedModelInputs:
         }
 
 
-@pytest.mark.maybe_use_device
+@pytest.mark.use_device
 class TestStage:
+    def test_copies_complete_pinned_host_buffers(self, monkeypatch):
+        stager = _stager()
+        layout = _layout()
+        copies = []
+        original = torch.Tensor.copy_
+
+        def copy(dst, src, *args, **kwargs):
+            if src.is_pinned():
+                copies.append((src, dst, kwargs.get("non_blocking", False)))
+            return original(dst, src, *args, **kwargs)
+
+        monkeypatch.setattr(torch.Tensor, "copy_", copy)
+        stager.stage(input_ids=_ids(2, 3), positions=_ids(2, 3), layout=layout)
+
+        assert len(copies) == 2
+        for src, dst, non_blocking in copies:
+            assert src.shape == dst.shape == layout.shape
+            assert src.is_contiguous() and dst.is_contiguous()
+            assert non_blocking
+        sources = [src for src, _, _ in copies]
+        copies.clear()
+        stager.stage(input_ids=_ids(2, 3, base=9), positions=_ids(2, 3), layout=layout)
+        assert all(src is previous for (src, _, _), previous in zip(copies, sources))
+
     def test_copies_into_top_left_and_pads_rest(self):
         stager = _stager()
         layout = _layout(num_reqs=2, num_reqs_padded=4, query_len=3, query_len_padded=8)
@@ -118,6 +142,19 @@ class TestStage:
         assert torch.equal(staged.input_ids.cpu(), input_ids)
         assert torch.equal(staged.positions.cpu(), positions)
 
+    def test_mrope_positions_pad_each_axis(self):
+        stager = _stager()
+        layout = _layout(num_reqs=2, num_reqs_padded=4, query_len=3, query_len_padded=8)
+        positions = torch.arange(18, dtype=torch.int64).reshape(3, 2, 3) + 100
+        staged = stager.stage(input_ids=_ids(2, 3), positions=positions, layout=layout)
+
+        expected = torch.zeros(3, 4, 8, dtype=torch.int64)
+        expected[:, :2, :3] = positions
+        assert torch.equal(staged.positions.cpu(), expected)
+        # Text positions under the same layout get their own [batch, seq] buffer.
+        text = stager.stage(input_ids=_ids(2, 3), positions=_ids(2, 3), layout=layout)
+        assert text.positions.shape == (4, 8)
+
     def test_buffers_live_on_configured_device(self):
         stager = _stager()
         staged = stager.stage(
@@ -129,7 +166,7 @@ class TestStage:
         assert staged.positions.device.type == current_platform.device_type
 
 
-@pytest.mark.maybe_use_device
+@pytest.mark.use_device
 class TestBufferReuse:
     def test_same_layout_and_dtype_reuses_buffer(self):
         stager = _stager()
@@ -210,7 +247,7 @@ class TestBufferReuse:
         assert s2.positions.dtype == torch.int32
 
 
-@pytest.mark.maybe_use_device
+@pytest.mark.use_device
 class TestTokenIndices:
     @staticmethod
     def _base_kwargs():
@@ -280,7 +317,7 @@ class TestTokenIndices:
         assert s1.token_indices is not s2.token_indices
 
 
-@pytest.mark.maybe_use_device
+@pytest.mark.use_device
 class TestHiddenStates:
     # The eagle3 drafter's third input, staged into the same padded layout.
     @staticmethod
@@ -313,7 +350,7 @@ class TestHiddenStates:
         assert torch.equal(s2.hidden_states.cpu(), expected)
 
 
-@pytest.mark.maybe_use_device
+@pytest.mark.use_device
 class TestMultimodalEmbeddings:
     def test_writes_only_the_image_runs_and_pads_the_mask_as_text(self):
         stager = _stager()
@@ -348,7 +385,7 @@ class TestMultimodalEmbeddings:
         torch.testing.assert_close(next_mask.cpu(), expected_mask)
 
 
-@pytest.mark.maybe_use_device
+@pytest.mark.use_device
 class TestPassthrough:
     def test_intermediate_and_embeds_passed_through(self):
         stager = _stager()

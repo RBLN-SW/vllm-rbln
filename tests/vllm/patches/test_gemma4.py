@@ -12,13 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Gemma4's attention backend choice on RBLN.
+"""Gemma4 on RBLN: the attention backend choice, the decoder layer forward
+(MoE routing, the dense residual on the cut ops), the final norm and the split MLP.
 
-Config objects only -- no checkpoint, no device.
+Config objects and stand-in layers only -- no checkpoint, no device.
 """
 
 from types import SimpleNamespace
 
+import pytest
 from vllm.model_executor.models.config import Gemma4Config
 
 
@@ -115,3 +117,174 @@ def test_the_split_mlp_matches_the_merged_one():
 
     torch.testing.assert_close(split_gate_up_mlp_forward(mlp, x), merged)
     assert not hasattr(mlp.gate_up_proj, "weight")
+
+
+def _rms_norm(x, weight, eps):
+    """vLLM's RMSNorm math: fp32 statistics, cast back before the weight."""
+    rows = x.float()
+    normed = rows * (rows.pow(2).mean(dim=-1, keepdim=True) + eps).rsqrt()
+    return (normed.to(weight.dtype) * weight).to(x.dtype)
+
+
+def _dense_layer(hidden=64):
+    """A dense Gemma4DecoderLayer's residual path around stand-in blocks, each
+    norm with its own eps."""
+    import torch
+
+    layer = SimpleNamespace(enable_moe_block=False, per_layer_input_gate=None)
+    for i, name in enumerate(
+        (
+            "input_layernorm",
+            "post_attention_layernorm",
+            "pre_feedforward_layernorm",
+            "post_feedforward_layernorm",
+        )
+    ):
+        eps = (i + 1) * 1e-6
+        weight = 1.0 + 0.1 * torch.randn(hidden)
+        setattr(layer, name, _Norm(weight, eps))
+    attn = torch.randn(hidden, hidden) / hidden**0.5
+    mlp = torch.randn(hidden, hidden) / hidden**0.5
+    layer.self_attn = lambda positions, hidden_states: hidden_states @ attn
+    layer.mlp = lambda x: x @ mlp
+    layer.layer_scalar = torch.tensor([0.75])
+    return layer
+
+
+class _Norm:
+    def __init__(self, weight, eps):
+        self.weight = weight
+        self.variance_epsilon = eps
+
+    def __call__(self, x):
+        return _rms_norm(x, self.weight, self.variance_epsilon)
+
+
+def _token_cut_ops(monkeypatch):
+    """The two ops as their CPU math, recording each call."""
+    import torch
+
+    calls = []
+
+    def read(residual, weight, eps):
+        calls.append("read")
+        return _rms_norm(residual, weight, eps)
+
+    def write(residual, y, weight, eps):
+        calls.append("write")
+        return _rms_norm(y, weight, eps) + residual
+
+    ops = torch.ops.rbln_custom_ops
+    monkeypatch.setattr(ops, "residual_read", read, raising=False)
+    monkeypatch.setattr(ops, "gemma4_dense_residual_write", write, raising=False)
+    return calls
+
+
+def _run(layer, hidden_states, prefill, monkeypatch, **kwargs):
+    import torch
+
+    from vllm_rbln.patches import gemma4
+
+    monkeypatch.setattr(gemma4, "is_prefill_step", lambda: prefill)
+    positions = torch.arange(hidden_states.shape[-2])
+    out, _ = gemma4.patched_gemma4_decoder_layer_forward(
+        layer, positions, hidden_states, None, **kwargs
+    )
+    return out
+
+
+@pytest.mark.parametrize("prefill", [True, False])
+def test_the_dense_residual_runs_on_the_cut_ops(monkeypatch, prefill):
+    import torch
+
+    from vllm_rbln.patches import gemma4
+
+    torch.manual_seed(0)
+    calls = _token_cut_ops(monkeypatch)
+    layer = _dense_layer()
+    hidden_states = torch.randn(1, 8, 64) if prefill else torch.randn(8, 1, 64)
+
+    cut = _run(layer, hidden_states, prefill, monkeypatch)
+    assert calls == ["read", "write", "read", "write"]
+    # The same layer on the plain path a MoE layer takes.
+    read, write = gemma4._read, gemma4._write
+    monkeypatch.setattr(gemma4, "_read", lambda norm, r, cut: read(norm, r, False))
+    monkeypatch.setattr(
+        gemma4, "_write", lambda norm, r, y, cut: write(norm, r, y, False)
+    )
+    plain = _run(layer, hidden_states, prefill, monkeypatch)
+    torch.testing.assert_close(cut, plain)
+
+
+@pytest.mark.parametrize("prefill", [False, True])
+def test_the_final_norm_reads_only_the_decode_residual(monkeypatch, prefill):
+    import torch
+    from vllm.config import set_current_vllm_config
+
+    from tests.vllm.vllm_config import make_vllm_config
+    from vllm_rbln.patches import gemma4
+
+    torch.manual_seed(0)
+    calls = _token_cut_ops(monkeypatch)
+    monkeypatch.setattr(gemma4, "is_prefill_step", lambda: prefill)
+    with set_current_vllm_config(make_vllm_config()):
+        norm = gemma4.ResidualReadNorm(64, eps=1e-6)
+    norm.weight.data = 1.0 + 0.1 * torch.randn(64)
+    x = torch.randn(8, 1, 64)
+
+    out = norm(x)
+
+    assert calls == ([] if prefill else ["read"])
+    torch.testing.assert_close(out, _rms_norm(x, norm.weight.data, 1e-6))
+
+
+@pytest.mark.parametrize(
+    "moe,per_layer_dim,reads",
+    [(False, 0, True), (True, 0, False), (False, 256, False)],
+    ids=["dense", "moe", "per-layer-input"],
+)
+def test_only_a_model_with_a_cut_layer_reads_its_final_norm(
+    monkeypatch, moe, per_layer_dim, reads
+):
+    from vllm.config import set_current_vllm_config
+    from vllm.model_executor.layers.layernorm import RMSNorm
+
+    from tests.vllm.vllm_config import make_vllm_config
+    from vllm_rbln.patches import gemma4
+
+    def upstream_init(self, *, vllm_config, prefix=""):
+        layer = SimpleNamespace(
+            enable_moe_block=moe, hidden_size_per_layer_input=per_layer_dim
+        )
+        # The trailing layer belongs to another pipeline rank.
+        cut = SimpleNamespace(enable_moe_block=False, hidden_size_per_layer_input=0)
+        self.layers, self.start_layer, self.end_layer = [layer, cut], 0, 1
+        self.norm = RMSNorm(64, eps=1e-6)
+
+    monkeypatch.setattr(gemma4, "_original_gemma4_model_init", upstream_init)
+    model = SimpleNamespace()
+    with set_current_vllm_config(make_vllm_config()):
+        gemma4.patched_gemma4_model_init(model, vllm_config=None)
+
+    assert isinstance(model.norm, gemma4.ResidualReadNorm) is reads
+    assert (model.norm.hidden_size, model.norm.variance_epsilon) == (64, 1e-6)
+
+
+def test_a_per_layer_input_keeps_the_plain_layer(monkeypatch):
+    import torch
+
+    calls = _token_cut_ops(monkeypatch)
+    layer = _dense_layer()
+    layer.per_layer_input_gate = lambda x: x[..., :8]
+    layer.per_layer_projection = lambda x: x.repeat(1, 1, 8)
+    layer.post_per_layer_input_norm = lambda x: x
+
+    _run(
+        layer,
+        torch.randn(1, 8, 64),
+        True,
+        monkeypatch,
+        per_layer_input=torch.randn(1, 8, 8),
+    )
+
+    assert calls == []

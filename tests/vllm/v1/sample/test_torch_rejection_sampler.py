@@ -433,17 +433,18 @@ def test_rejection_sampling_approximates_target_distribution():
     much more than the distance improvement between the observed
     distribution and the random distribution.
     """
-    torch.set_default_device(DEVICE)
     vocab_size = 10
     k = 2
     num_reference_probs = 100
 
     # Prepare draft, target, and reference probability distributions
-    draft_probs = F.softmax(torch.rand(vocab_size, dtype=torch.float32), dim=-1)
-    target_logits = torch.rand(vocab_size, dtype=torch.float32)
+    draft_probs = F.softmax(
+        torch.rand(vocab_size, dtype=torch.float32, device=DEVICE), dim=-1
+    )
+    target_logits = torch.rand(vocab_size, dtype=torch.float32, device=DEVICE)
     target_probs = F.softmax(target_logits, dim=-1)
     reference_probs = F.softmax(
-        torch.rand(num_reference_probs, vocab_size, dtype=torch.float32),
+        torch.rand(num_reference_probs, vocab_size, dtype=torch.float32, device=DEVICE),
         dim=-1,
     )
 
