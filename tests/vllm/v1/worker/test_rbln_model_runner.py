@@ -806,9 +806,7 @@ class TestEcConsumer:
         runner = _make_runner_stub(
             load_config=None,
             vllm_config=SimpleNamespace(ec_transfer_config=ec_config),
-            model_config=SimpleNamespace(
-                model="m", enforce_eager=False, uses_mrope=False
-            ),
+            model_config=SimpleNamespace(model="m", uses_mrope=False),
             offload_context=nullcontext,
             _resolve_mm_support=lambda: True,
             drafter=None,
@@ -1670,7 +1668,7 @@ class TestDummyRunFlushesTheDeferredLoad:
 
 
 def _copy_groups(*groups):
-    # One KV cache group per entry of layer names; the eager copy path reads
+    # One KV cache group per entry of layer names; the device tensor copy path reads
     # only a group's block_size and layer_names.
     return SimpleNamespace(
         kv_cache_groups=[
@@ -1683,15 +1681,13 @@ def _copy_groups(*groups):
 
 
 class TestProcessKvCacheCopyOps:
-    # Path selection: use_runtime = not USE_DEVICE_TENSOR and not enforce_eager.
-    # Forced deterministically.
     @pytest.mark.parametrize(
         "block_axis, shape",
         [(0, (4, 2, 1, 1, 8, 2)), (1, (2, 4, 1, 1, 8, 2))],
         ids=["blocks_first", "kv_first"],
     )
-    def test_eager_copy_non_mla(self, monkeypatch, block_axis, shape):
-        monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", True)  # -> eager path
+    def test_device_tensor_copy_non_mla(self, monkeypatch, block_axis, shape):
+        monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", True)
         # The rbln_custom_ops and rbln_triton_ops layouts, in that order.
         kv = torch.zeros(shape)
         kv.select(block_axis, 1).fill_(5.0)  # source = block 1
@@ -1701,7 +1697,7 @@ class TestProcessKvCacheCopyOps:
             kv_cache_block_axes={"l0": block_axis},
             kv_cache_config=_copy_groups(["l0"]),
             _kernel_block_sizes=[8],
-            model_config=SimpleNamespace(use_mla=False, enforce_eager=True),
+            model_config=SimpleNamespace(use_mla=False),
             runtime_holder=[None],
         )
         r._process_kv_cache_copy_ops([KVCacheCopyOp(0, 1, 2, 3)])
@@ -1712,7 +1708,7 @@ class TestProcessKvCacheCopyOps:
         assert (dst[..., :3, :] == 5.0).all()
         assert (dst[..., 3:, :] == 0.0).all()
 
-    def test_eager_copy_mla(self, monkeypatch):
+    def test_device_tensor_copy_mla(self, monkeypatch):
         monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", True)
         kv = torch.zeros(4, 8, 2)  # (num_blocks, block_tokens, dim)
         kv[1] = 7.0
@@ -1722,14 +1718,14 @@ class TestProcessKvCacheCopyOps:
             kv_cache_block_axes={"l0": 0},
             kv_cache_config=_copy_groups(["l0"]),
             _kernel_block_sizes=[8],
-            model_config=SimpleNamespace(use_mla=True, enforce_eager=True),
+            model_config=SimpleNamespace(use_mla=True),
             runtime_holder=[None],
         )
         r._process_kv_cache_copy_ops([KVCacheCopyOp(0, 1, 2, 3)])
         assert (kv[2, :3, :] == 7.0).all()
         assert (kv[2, 3:, :] == 0.0).all()
 
-    def test_eager_copy_mla_indexer_scale(self, monkeypatch):
+    def test_device_tensor_copy_mla_indexer_scale(self, monkeypatch):
         monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", True)
         latent = torch.zeros(4, 8, 768, dtype=torch.uint8)
         indexer = torch.zeros(4, 8, 128, dtype=torch.float8_e4m3fn)
@@ -1744,7 +1740,7 @@ class TestProcessKvCacheCopyOps:
             kv_cache_block_axes={"latent": 0, "indexer": 0, "scale": 0},
             kv_cache_config=_copy_groups(["latent", "indexer", "scale"]),
             _kernel_block_sizes=[8],
-            model_config=SimpleNamespace(use_mla=True, enforce_eager=True),
+            model_config=SimpleNamespace(use_mla=True),
             runtime_holder=[None],
         )
         r._process_kv_cache_copy_ops([KVCacheCopyOp(0, 1, 2, 3)])
@@ -1765,7 +1761,7 @@ class TestProcessKvCacheCopyOps:
             kv_cache_block_axes={"a": 0, "b": 0},
             kv_cache_config=_copy_groups(["a"], ["b"]),
             _kernel_block_sizes=[8, 8],
-            model_config=SimpleNamespace(use_mla=False, enforce_eager=True),
+            model_config=SimpleNamespace(use_mla=False),
             runtime_holder=[None],
         )
         r._process_kv_cache_copy_ops([KVCacheCopyOp(1, 1, 2, 8)])
@@ -1782,7 +1778,7 @@ class TestProcessKvCacheCopyOps:
             kv_caches=[],
             kv_cache_names=[],
             kv_cache_block_axes={},
-            model_config=SimpleNamespace(use_mla=False, enforce_eager=False),
+            model_config=SimpleNamespace(use_mla=False),
             runtime_holder=[runtime],
             rbln_config=RBLNConfig(),
         )

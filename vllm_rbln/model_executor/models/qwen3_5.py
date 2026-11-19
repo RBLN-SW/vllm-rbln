@@ -225,10 +225,6 @@ class RBLNQwen3_5ForConditionalGeneration(
         if not self.has_vision:
             return
         encoder = self._mm_encoder
-        if encoder is None:
-            # enforce_eager: the runner never calls compile_mm_encoder.
-            self.compile_mm_encoder(lambda encoder: encoder)
-            encoder = self._mm_encoder
         assert encoder is not None
         visual = self.visual
         patch_dim = visual.patch_embed.proj.weight[0].numel()
@@ -286,10 +282,6 @@ class RBLNQwen3_5ForConditionalGeneration(
         if image_input["type"] == "image_embeds":
             return super()._process_image_input(image_input)
         encoder = self._mm_encoder
-        if encoder is None:
-            # enforce_eager: the runner never calls compile_mm_encoder.
-            self.compile_mm_encoder(lambda encoder: encoder)
-            encoder = self._mm_encoder
         assert encoder is not None
         grid_thw = image_input["image_grid_thw"].tolist()
         sizes = [math.prod(g) for g in grid_thw]

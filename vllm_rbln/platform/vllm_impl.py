@@ -22,7 +22,6 @@ from vllm.logger import init_logger
 from vllm.utils.torch_utils import get_dtype_size, kv_cache_dtype_str_to_dtype
 
 from vllm_rbln import envs
-from vllm_rbln.platform import use_device_tensor
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -112,6 +111,14 @@ def _validate(vllm_config: "VllmConfig") -> None:
     model_config = vllm_config.model_config
     parallel_config = vllm_config.parallel_config
     scheduler_config = vllm_config.scheduler_config
+
+    if model_config.enforce_eager:
+        raise ValueError("--enforce-eager is not supported with the 'vllm' model impl.")
+    if getattr(vllm_config.speculative_config, "enforce_eager", False):
+        raise ValueError(
+            "speculative_config.enforce_eager is not supported "
+            "with the 'vllm' model impl."
+        )
 
     if vllm_config.lora_config is not None:
         raise ValueError("LoRA is not supported on RBLN.")
@@ -445,21 +452,6 @@ def _validate(vllm_config: "VllmConfig") -> None:
 
         _validate_aux_hidden_states_pp_config(vllm_config)
 
-    # FIXME(jiwoo.park) This is a temporary workaround.
-    if model_config.enforce_eager:
-        if not use_device_tensor():
-            raise ValueError(
-                "enforce_eager=True requires VLLM_RBLN_USE_DEVICE_TENSOR=1. "
-                "Eager mode bypasses torch.compile, so ops must dispatch "
-                "to a real device='rbln' rather than the compile-backend "
-                "fake-CPU tensors used by the default vLLM model path."
-            )
-
-        hf_config = model_config.hf_config
-        assert not hasattr(hf_config, "sliding_window") or not getattr(
-            hf_config, "use_sliding_window", True
-        )
-
 
 def _validate_aux_hidden_states_pp_config(vllm_config: "VllmConfig") -> None:
     """Reject a target whose aux hidden states this plugin cannot carry.
@@ -535,10 +527,6 @@ def _override(vllm_config: "VllmConfig") -> None:
             model_config.dtype = torch.float32
 
     logger.info("Using model_config.dtype for RBLN: %s", model_config.dtype)
-
-    if model_config.enforce_eager:
-        # RBLN(NOTE): force dtype into fp16 for eager mode
-        model_config.dtype = torch.float16
 
     text_config = model_config.hf_text_config
     if text_config.model_type == "glm5_next_text":

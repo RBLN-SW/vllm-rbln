@@ -566,15 +566,6 @@ class TestRejectedConfigs:
             )
 
         reconfigure(bf16_forced_to_fp32)
-        if platform.USE_DEVICE_TENSOR:
-
-            def fp32_forced_to_fp16(config):
-                glm5_next(block_size=8192)(config)
-                config.model_config.dtype = torch.float32
-                config.model_config.enforce_eager = True
-
-            with pytest.raises(ValueError, match="whole KDA head states"):
-                reconfigure(fp32_forced_to_fp16)
 
     def test_glm5_next_prefix_caching_with_mtp_needs_retention_0(self, reconfigure):
         # A KDA verify step leaves no state at the end of a block it crossed, so
@@ -1306,16 +1297,28 @@ class TestCacheOverrides:
 
 
 class TestEnforceEager:
-    def test_outcome_follows_the_device_lane(self, reconfigure):
-        mutate = lambda config: setattr(  # noqa: E731
-            config.model_config, "enforce_eager", True
-        )
-        if platform.USE_DEVICE_TENSOR:
-            # Eager needs real device tensors; dtype is forced to fp16 there.
-            assert reconfigure(mutate).model_config.dtype == torch.float16
-        else:
-            with pytest.raises(ValueError, match="VLLM_RBLN_USE_DEVICE_TENSOR"):
-                reconfigure(mutate)
+    def test_rejects_target_eager(self, reconfigure):
+        def mutate(config):
+            config.model_config.enforce_eager = True
+
+        with pytest.raises(
+            ValueError,
+            match="--enforce-eager is not supported with the 'vllm' model impl",
+        ):
+            reconfigure(mutate)
+
+    def test_rejects_draft_eager(self, reconfigure):
+        def mutate(config):
+            config.speculative_config = SimpleNamespace(
+                method="eagle", enforce_eager=True
+            )
+
+        with pytest.raises(
+            ValueError,
+            match=r"speculative_config\.enforce_eager is not supported "
+            "with the 'vllm' model impl",
+        ):
+            reconfigure(mutate)
 
 
 def _selector(*, use_mla: bool = False, use_sparse: bool = False) -> SimpleNamespace:

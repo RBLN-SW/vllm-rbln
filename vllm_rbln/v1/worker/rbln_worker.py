@@ -518,7 +518,7 @@ class RBLNWorker(WorkerBase):
         self._ensure_rbln_host_threads_before_compile()
 
         try:
-            if (skip := compile_and_warmup_skip_reason(self.vllm_config)) is not None:
+            if (skip := compile_and_warmup_skip_reason()) is not None:
                 logger.info("Skipping compile_or_warm_up_model (%s).", skip)
             else:
                 with self.dynamic_kv.capture_programs() as programs:

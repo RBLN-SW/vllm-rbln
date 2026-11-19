@@ -41,6 +41,30 @@ pytestmark = pytest.mark.usefixtures("compile_environment")
 
 
 class TestSync:
+    @pytest.mark.parametrize(
+        ("target_eager", "message"),
+        [
+            (True, "--enforce-eager is not supported with the 'optimum' model impl"),
+            (
+                False,
+                r"speculative_config\.enforce_eager is not supported "
+                "with the 'optimum' model impl",
+            ),
+        ],
+        ids=["target", "draft"],
+    )
+    def test_platform_rejects_eager_before_compile_setup(self, target_eager, message):
+        from vllm_rbln.platform.optimum_impl import check_and_update
+
+        cfg = SimpleNamespace(
+            model_config=SimpleNamespace(enforce_eager=target_eager),
+            speculative_config=(
+                None if target_eager else SimpleNamespace(enforce_eager=True)
+            ),
+        )
+        with pytest.raises(ValueError, match=message):
+            check_and_update(cfg)
+
     @pytest.mark.parametrize("prefix_caching", [False, True])
     def test_paligemma_uses_final_chunk_before_cache_lookup(
         self, monkeypatch, prefix_caching, vllm_config_factory
@@ -198,6 +222,7 @@ class TestSync:
         cfg = SimpleNamespace(
             model_config=SimpleNamespace(
                 model="Qwen/Qwen3-0.6B",
+                enforce_eager=False,
                 architectures=hf_config.architectures,
                 runner_type=runner,
                 hf_config=hf_config,
@@ -277,6 +302,7 @@ class TestSync:
         cfg = SimpleNamespace(
             model_config=SimpleNamespace(
                 model="Qwen/Qwen3-VL-2B",
+                enforce_eager=False,
                 architectures=hf_config.architectures,
                 runner_type="pooling",
                 hf_config=hf_config,

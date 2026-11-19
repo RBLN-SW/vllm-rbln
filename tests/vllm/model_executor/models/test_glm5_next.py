@@ -73,8 +73,7 @@ def test_load_time_transforms_run_once_after_every_weight(monkeypatch):
     ]
 
 
-@pytest.mark.parametrize("compiled", [False, True])
-def test_image_encoding_reuses_eager_or_compiled_encoder(monkeypatch, compiled):
+def test_image_encoding_reuses_the_compiled_encoder(monkeypatch):
     import vllm_rbln.model_executor.models.glm5_next as glm
 
     cls = glm.RBLNGlm5NextForConditionalGeneration
@@ -86,8 +85,7 @@ def test_image_encoding_reuses_eager_or_compiled_encoder(monkeypatch, compiled):
     build_encoder = Mock(return_value=encoder)
     monkeypatch.setattr(glm, "_RBLNGlm5NextVisionEncoder", build_encoder)
     object.__setattr__(model, "_mm_encoder", None)
-    if compiled:
-        model.compile_mm_encoder(lambda module: module)
+    model.compile_mm_encoder(lambda module: module)
     model._encoder_inputs = Mock(side_effect=lambda pixels, grid: [pixels])
     pixels = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
     grids = torch.tensor([[1, 1, 1], [1, 1, 2]])
@@ -153,7 +151,6 @@ def _build_with_token_budgets(monkeypatch, budgets, limits, is_first_rank=True):
 
 
 @pytest.mark.parametrize("is_first_rank", [False, True])
-@pytest.mark.parametrize("compiled", [False, True])
 @pytest.mark.parametrize(
     "limits,budgets,buckets",
     [
@@ -165,7 +162,7 @@ def _build_with_token_budgets(monkeypatch, budgets, limits, is_first_rank=True):
     ],
 )
 def test_encoder_buckets_are_initialized_and_warmed(
-    monkeypatch, is_first_rank, compiled, limits, budgets, buckets
+    monkeypatch, is_first_rank, limits, budgets, buckets
 ):
     import vllm_rbln.model_executor.models.glm5_next as glm
 
@@ -175,8 +172,7 @@ def test_encoder_buckets_are_initialized_and_warmed(
     build_encoder = Mock(return_value=encoder)
     monkeypatch.setattr(glm, "_RBLNGlm5NextVisionEncoder", build_encoder)
     compile_fn = Mock(side_effect=lambda module: module)
-    if compiled:
-        model.compile_mm_encoder(compile_fn)
+    model.compile_mm_encoder(compile_fn)
 
     model.warmup_mm_encoder()
 
@@ -188,8 +184,7 @@ def test_encoder_buckets_are_initialized_and_warmed(
         return
     assert model.mm_encoder_patch_buckets == buckets
     build_encoder.assert_called_once_with(model.visual, torch.bfloat16)
-    if compiled:
-        compile_fn.assert_called_once_with(encoder)
+    compile_fn.assert_called_once_with(encoder)
     assert encoder.call_count == len(buckets)
     for call, bucket in zip(encoder.call_args_list, buckets, strict=True):
         for actual, expected in zip(
