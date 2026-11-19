@@ -245,7 +245,7 @@ class TestBuildKvCacheBaseBindings:
     def test_cache_order_must_cover_each_view_once(self, names):
         bases = {name: torch.zeros(1) for name in ("first", "second")}
         infos = {name: KVCacheViewInfo() for name in bases}
-        with pytest.raises(ValueError, match="every cache exactly once"):
+        with pytest.raises(AssertionError, match="every cache exactly once"):
             build_kv_cache_base_bindings(bases, infos, layer_names=names)
 
 

@@ -65,10 +65,11 @@ def build_kv_cache_base_bindings(
     layer_names: Sequence[str],
 ) -> tuple[list[torch.Tensor], list[KVCacheViewInfo]]:
     """Deduplicate KV cache inputs by storage and capture per-layer view info."""
-    if len(layer_names) != len(kv_cache_view_infos_by_layer) or set(layer_names) != set(
-        kv_cache_view_infos_by_layer
-    ):
-        raise ValueError("KV cache order must name every cache exactly once")
+    assert len(layer_names) == len(kv_cache_view_infos_by_layer) and set(
+        layer_names
+    ) == set(kv_cache_view_infos_by_layer), (
+        "KV cache order must name every cache exactly once"
+    )
     base_tensors: list[torch.Tensor] = []
     view_infos: list[KVCacheViewInfo] = []
     base_index_by_view: dict[tuple[torch.device, int, int, int, int], int] = {}
