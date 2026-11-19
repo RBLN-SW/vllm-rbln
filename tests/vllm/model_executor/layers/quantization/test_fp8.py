@@ -57,7 +57,7 @@ def _layer(swiglu_limit, activation="silu"):
     )
 
 
-def _reference(layer, x, routing, limit):
+def _reference(layer, x, routing, limit, act=torch.nn.functional.silu):
     def deq(w, s):
         s = s.repeat_interleave(BLOCK, 1).repeat_interleave(BLOCK, 2)
         return w.float() * s
@@ -71,7 +71,7 @@ def _reference(layer, x, routing, limit):
         if limit:
             gate = gate.clamp(max=limit)
             up = up.clamp(min=-limit, max=limit)
-        out += (torch.nn.functional.silu(gate) * up @ w2[e].T) * routing[e, :, None]
+        out += (act(gate) * up @ w2[e].T) * routing[e, :, None]
     return out
 
 
@@ -88,18 +88,25 @@ def test_apply_clamps_the_swiglu_when_the_layer_has_a_limit(limit):
         assert not torch.allclose(out.float(), _reference(layer, x, routing, None))
 
 
-@pytest.mark.parametrize("limit", [None, 0.0, 10.0])
-def test_w8a8_checks_clamp_support_at_initialization(limit):
-    if limit:
-        with pytest.raises(NotImplementedError, match="W8A8.*SwiGLU clamp"):
-            _method(_layer(limit), use_w8a8=True)
-    else:
-        assert _method(_layer(limit), use_w8a8=True).use_w8a8
+def test_apply_clamps_a_gelu_gate():
+    layer = _layer(0.25, activation="gelu")
+    g = torch.Generator().manual_seed(1)
+    x = torch.randn(TOKENS, HIDDEN, generator=g)
+    routing = torch.softmax(torch.randn(EXPERTS, TOKENS, generator=g), dim=0)
+    out = _method(layer).apply(layer, x, routing)
+    gelu = torch.nn.functional.gelu
+    expected = _reference(layer, x, routing, 0.25, act=gelu)
+    torch.testing.assert_close(out.float(), expected, atol=1e-3, rtol=1e-3)
+    assert not torch.allclose(out.float(), _reference(layer, x, routing, None, gelu))
 
 
-def test_a_limit_needs_silu():
-    layer = _layer(10.0, activation="gelu")
-    with pytest.raises(NotImplementedError, match="silu"):
-        _method(layer).apply(
-            layer, torch.randn(TOKENS, HIDDEN), torch.ones(EXPERTS, TOKENS)
-        )
+def test_w8a8_apply_clamps_the_swiglu():
+    layer = _layer(0.25)
+    g = torch.Generator().manual_seed(1)
+    x = torch.randn(TOKENS, HIDDEN, generator=g)
+    routing = torch.softmax(torch.randn(EXPERTS, TOKENS, generator=g), dim=0)
+    out = _method(layer, use_w8a8=True).apply(layer, x, routing).float()
+    clamped = _reference(layer, x, routing, 0.25)
+    unclamped = _reference(layer, x, routing, None)
+    # fp8 activations: closer to the clamped reference than to the unclamped one
+    assert (out - clamped).norm() < 0.2 * (out - unclamped).norm()
