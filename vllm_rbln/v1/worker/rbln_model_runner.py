@@ -1224,6 +1224,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             # group's: only the block table may differ.
             assert cm.query_start_loc is cm_base.query_start_loc
             assert cm.seq_lens is cm_base.seq_lens
+            assert cm.num_reqs == cm_base.num_reqs
 
             # NOTE(RBLN): gate on the drafter, not speculative_config (which every
             # rank has): only the last PP rank drafts, and no other rank consumes
