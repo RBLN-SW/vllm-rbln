@@ -553,24 +553,22 @@ def mhc_metadata():
         yield metadata
 
 
-def test_a_prefill_step_runs_the_mhc_on_the_token_cut_kernels(
-    monkeypatch, mhc_metadata
-):
+@pytest.mark.parametrize("prefill", [True, False])
+def test_every_step_runs_the_mhc_on_the_cut_kernels(monkeypatch, mhc_metadata, prefill):
     import vllm_rbln.model_executor.models.deepseek_v4 as dsv4
 
     calls = _mhc_kernels(monkeypatch)
     layer = _mhc_layer(dsv4.RBLNDeepseekV4DecoderLayer)
-    streams = torch.randn(1, 4, 8, 64).to(torch.bfloat16)
-    positions = torch.arange(8).unsqueeze(0)
-    input_ids = torch.zeros(1, 8, dtype=torch.long)
+    batch, tokens = (1, 8) if prefill else (8, 1)
+    mhc_metadata.is_prefill = prefill
+    streams = torch.randn(batch, 4, tokens, 64).to(torch.bfloat16)
+    positions = torch.arange(tokens).repeat(batch, 1)
+    input_ids = torch.zeros(batch, tokens, dtype=torch.long)
 
-    cut = layer(positions, streams, input_ids)
-    assert calls == ["mix", "read", "write"] * 2
-    mhc_metadata.is_prefill = False
-    plain = layer(positions, streams, input_ids)
+    out = layer(positions, streams, input_ids)
 
     assert calls == ["mix", "read", "write"] * 2
-    torch.testing.assert_close(cut, plain)
+    assert out.shape == streams.shape and out.dtype == streams.dtype
 
 
 @pytest.mark.parametrize(

@@ -730,38 +730,22 @@ class RBLNDeepseekV4DecoderLayer(nn.Module):
             getattr(self, f"hc_{kind}_scale_vec").copy_(scale.repeat_interleave(lanes))
 
     def _sublayer(self, streams, fn, scale, base, norm, sublayer) -> torch.Tensor:
+        # The compiler cuts the mhc_* kernels over the chiplets, by tokens in
+        # prefill and by batch rows in decode, so the streams stay split between
+        # sublayers (fp32 holding bf16 values) and only the sublayer input is
+        # gathered.
+        ops = torch.ops.rbln_custom_ops
         streams_f32 = streams.float()
-        metadata = get_forward_context().attn_metadata[self.attn.swa_cache.prefix]
-        if metadata.is_prefill:
-            logits = torch.ops.rbln_custom_ops.mhc_mix(
-                streams_f32, fn, scale, base, eps=self.norm_eps
-            )
-            x = torch.ops.rbln_custom_ops.mhc_read(
-                streams_f32, logits, eps=self.hc_eps
-            ).to(norm.weight.dtype)
-            y = sublayer(norm(x))
-            return torch.ops.rbln_custom_ops.mhc_write(
-                y.float(),
-                streams_f32,
-                logits,
-                post_mult=self.hc_post_mult,
-                iters=self.hc_iters,
-                eps=self.hc_eps,
-            ).to(streams.dtype)
-        batch, n, tokens, hidden = streams.shape
-        flat = streams.transpose(1, 2).reshape(batch, tokens, n * hidden).float()
-        flat = flat * torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.norm_eps)
-        z = F.linear(flat, fn) * scale + base
-        z_pre, z_post = z[..., :n], z[..., n : 2 * n]
-        comb = torch.ops.rbln_custom_ops.sinkhorn_normalize(
-            z[..., 2 * n :], iters=self.hc_iters, eps=self.hc_eps
-        )
-        x = torch.ops.rbln_custom_ops.hc_stream_reduce(
-            streams_f32, z_pre, eps=self.hc_eps
-        ).to(norm.weight.dtype)
-        x = sublayer(norm(x))
-        return torch.ops.rbln_custom_ops.hc_residual_add(
-            x.float(), streams_f32, z_post, comb, post_mult=self.hc_post_mult
+        logits = ops.mhc_mix(streams_f32, fn, scale, base, eps=self.norm_eps)
+        x = ops.mhc_read(streams_f32, logits, eps=self.hc_eps).to(norm.weight.dtype)
+        y = sublayer(norm(x))
+        return ops.mhc_write(
+            y.float(),
+            streams_f32,
+            logits,
+            post_mult=self.hc_post_mult,
+            iters=self.hc_iters,
+            eps=self.hc_eps,
         ).to(streams.dtype)
 
     def forward(
