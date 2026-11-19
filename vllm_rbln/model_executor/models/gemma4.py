@@ -43,6 +43,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.parse import MultiModalDataItems
 from vllm.sequence import IntermediateTensors
 
+import vllm_rbln.utils as rbln_utils
 from vllm_rbln.model_executor.models.interfaces import (
     SupportsRBLNMmPrefix,
     SupportsRBLNMultiModal,
@@ -408,16 +409,19 @@ class RBLNGemma4ForConditionalGeneration(
             :, None, None, :
         ]
         device = next(tower.parameters()).device
-        embeds = encoder(
-            patches.to(device),
-            positions.to(device),
-            padding.to(device),
-            key_bias.to(device=device, dtype=self.model_dtype),
-        )
         # The patches of a grid whose sides are multiples of the pooling kernel
         # pool into the leading cells, in order.
         num_soft_tokens = num_patches // tower.config.pooling_kernel_size**2
-        return embeds[0, :num_soft_tokens].cpu()
+        return rbln_utils.run_mm_encoder(
+            lambda *inputs: encoder(*inputs)[0],
+            [
+                patches.to(device),
+                positions.to(device),
+                padding.to(device),
+                key_bias.to(device=device, dtype=self.model_dtype),
+            ],
+            num_soft_tokens,
+        )
 
     def _process_image_input(
         self, image_input: Gemma4ImageInputs
