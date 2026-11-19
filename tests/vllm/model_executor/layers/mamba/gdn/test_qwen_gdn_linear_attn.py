@@ -551,7 +551,7 @@ def test_gdn_aux_caches_sort_after_their_state(monkeypatch):
     with set_current_vllm_config(config):
         RBLNQwenGatedDeltaNetAttention(None, config, PREFIX)
 
-    assert get_kv_cache_names(context) == [
+    assert get_kv_cache_names(context, context) == [
         PREFIX,
         f"{PREFIX}.conv_ring",
         f"{PREFIX}.drafts",

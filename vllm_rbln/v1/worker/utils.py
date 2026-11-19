@@ -21,7 +21,7 @@ import platform
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from datetime import datetime, timezone
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Literal, NoReturn, TypeVar
@@ -1259,7 +1259,9 @@ def reorder_input_batch(input_batch: "InputBatch", perm: np.ndarray) -> None:
         ]
 
 
-def get_kv_cache_names(cache_layers: Mapping[str, Any]) -> list[str]:
+def get_kv_cache_names(
+    cache_names: Iterable[str], forward_context: Mapping[str, Any]
+) -> list[str]:
     """Order caches by their numeric module path and optional subindex.
 
     Numbered attention modules and cache groups already encode their order.
@@ -1274,7 +1276,8 @@ def get_kv_cache_names(cache_layers: Mapping[str, Any]) -> list[str]:
         MiniMax indexer: layers.3.self_attn.attn.indexer -> (3, 1).
     """
     names_by_sort_key: dict[tuple[int, ...], str] = {}
-    for name, layer in cache_layers.items():
+    for name in cache_names:
+        layer = forward_context[name]
         numeric_path = tuple(int(part) for part in name.split(".") if part.isdecimal())
         if not numeric_path:
             raise ValueError(f"KV cache {name} has no numeric layer path")

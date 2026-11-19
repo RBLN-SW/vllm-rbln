@@ -3614,9 +3614,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         )
 
         forward_context = self.compilation_config.static_forward_context
-        self.kv_cache_names = get_kv_cache_names(
-            {name: forward_context[name] for name in kv_caches}
-        )
+        self.kv_cache_names = get_kv_cache_names(kv_caches, forward_context)
         self._update_kv_cache_base_bindings(
             kv_cache_bases_by_layer,
             kv_cache_view_infos,
