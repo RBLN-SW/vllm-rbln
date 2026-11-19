@@ -2389,7 +2389,7 @@ class TestEcConsumerEncodesNothing:
 
 class TestMultimodalDraftEncoderLookahead:
     @staticmethod
-    def _scheduler(*, encoder_budget=None, cache_size=None):
+    def _scheduler(*, encoder_budget=None, cache_size=None, num_mtp_layers=None):
         from vllm.v1.structured_output import StructuredOutputManager
 
         from tests.vllm.vllm_config import make_vllm_config
@@ -2404,6 +2404,9 @@ class TestMultimodalDraftEncoderLookahead:
             mm_processor_kwargs={"min_pixels": 1024, "max_pixels": 262144},
             speculative_config={"method": "mtp", "num_speculative_tokens": 3},
         )
+        if num_mtp_layers is not None:
+            hf_config = config.speculative_config.draft_model_config.hf_config
+            hf_config.num_nextn_predict_layers = num_mtp_layers
         config.cache_config.num_gpu_blocks = 64
         sched = RBLNScheduler(
             vllm_config=config,
@@ -2417,6 +2420,29 @@ class TestMultimodalDraftEncoderLookahead:
         if cache_size is not None:
             sched.encoder_cache_manager = EncoderCacheManager(cache_size=cache_size)
         return sched
+
+    @pytest.mark.parametrize("num_mtp_layers", [2, 3])
+    @pytest.mark.parametrize("draft_accepts_mm", [False, True])
+    def test_multi_module_limit_applies_only_to_multimodal_drafters(
+        self, monkeypatch, num_mtp_layers, draft_accepts_mm
+    ):
+        if not draft_accepts_mm:
+            from vllm_rbln.model_executor.models.glm5_next import RBLNGlm5NextMTP
+
+            monkeypatch.setattr(
+                rbln_scheduler,
+                "get_model_architecture",
+                lambda config: (RBLNGlm5NextMTP, "Glm5NextMTP"),
+            )
+        if draft_accepts_mm:
+            with pytest.raises(
+                NotImplementedError, match="num_prefill_lookahead_tokens=1"
+            ):
+                self._scheduler(num_mtp_layers=num_mtp_layers)
+        else:
+            sched = self._scheduler(num_mtp_layers=num_mtp_layers)
+            assert sched.num_prefill_lookahead == 3
+            assert sched.mm_prefill_lookahead == 0
 
     @pytest.mark.parametrize("running", [False, True])
     @pytest.mark.parametrize("draft_accepts_mm", [False, True])

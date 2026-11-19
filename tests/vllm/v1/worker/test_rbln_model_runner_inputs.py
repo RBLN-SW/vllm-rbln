@@ -344,9 +344,13 @@ class TestGatherMultimodalEmbeddings:
         )
         runner.is_prefill = True
         runner.supports_mm_inputs = True
-        runner.speculative_config = SimpleNamespace(
-            method=draft_type, use_eagle=lambda: True
+        speculative_config = SimpleNamespace(
+            method=draft_type,
+            use_eagle=lambda: True,
+            use_multi_module_mtp=lambda: False,
         )
+        runner.speculative_config = speculative_config
+        runner.vllm_config.speculative_config = speculative_config
         runner.input_ids[:3] = torch.tensor([10, 11, 12], dtype=runner.input_ids.dtype)
         runner.positions[:3] = torch.arange(3)
         runner.decode_back_pad[:1] = 0

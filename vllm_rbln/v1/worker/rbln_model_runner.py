@@ -2585,7 +2585,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     mm_kwargs["mm_embed_inputs"] = self._gather_mm_embeddings(
                         scheduler_output,
                         target_token_ids.shape[0],
-                        shift_computed_tokens=1,
+                        shift_computed_tokens=(
+                            self.vllm_config.num_prefill_lookahead_tokens
+                        ),
                     )
                 if self.drafter.uses_mrope:
                     assert self.mrope_positions is not None

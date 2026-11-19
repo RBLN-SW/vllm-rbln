@@ -134,6 +134,12 @@ class RBLNScheduler(Scheduler):
                 self.mm_prefill_lookahead = self.num_prefill_lookahead
 
         if self.mm_prefill_lookahead:
+            if self.mm_prefill_lookahead != 1:
+                raise NotImplementedError(
+                    "Multimodal drafting requires num_prefill_lookahead_tokens=1; "
+                    f"got {self.mm_prefill_lookahead}. Multi-module multimodal "
+                    "MTP is not supported."
+                )
             # At an item boundary, the target still needs the previous item's
             # tail while the drafter needs the next item's whole encoder output.
             self.max_num_encoder_input_tokens *= 2
