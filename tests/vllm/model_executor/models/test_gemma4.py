@@ -176,6 +176,28 @@ def test_an_image_takes_the_smallest_bucket_holding_it(width, height, bucket):
     assert calls == [(bucket, width * height)]
 
 
+def test_an_image_is_encoded_through_the_shared_metrics_hook(monkeypatch):
+    """ENCODER metrics wrap `run_mm_encoder`; an encoder call outside it is
+    missing from the per-bucket report."""
+    import vllm_rbln.utils as rbln_utils
+
+    model, _ = _recording_model([18, 45, 90])
+    pixels, positions = _image(9, 3, num_patches=90)
+    run_mm_encoder = rbln_utils.run_mm_encoder
+    shapes = []
+
+    def recording(encoder, inputs, num_embeddings, **kwargs):
+        shapes.append(tuple(inputs[0].shape))
+        return run_mm_encoder(encoder, inputs, num_embeddings, **kwargs)
+
+    monkeypatch.setattr(rbln_utils, "run_mm_encoder", recording)
+
+    embeds = model._encode_vision(pixels, positions)
+
+    assert shapes == [(1, 45, pixels.shape[-1])]
+    assert embeds.shape == (9 * 3 // POOL**2, 32)
+
+
 def test_warm_up_runs_every_bucket_once_full():
     model, calls = _recording_model([18, 45, 90])
 

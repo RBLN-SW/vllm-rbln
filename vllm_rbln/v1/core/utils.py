@@ -30,7 +30,7 @@ from typing import TYPE_CHECKING
 from vllm.platforms import current_platform
 
 if TYPE_CHECKING:
-    from vllm.config import VllmConfig
+    from vllm.config import ModelConfig, VllmConfig
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
@@ -259,6 +259,8 @@ def sub_block_size_in_use(
     block_size: int,
     prefill_chunk_sizes: list[int],
     kv_cache_config: KVCacheConfig,
+    model_config: ModelConfig,
+    cache_dtype: str,
     sub_block_size: int | None = None,
 ) -> int | None:
     """The sub-block size prefix caching runs at (None takes the longest prefill
@@ -325,5 +327,23 @@ def sub_block_size_in_use(
             f"{prefill_chunk_size} makes a prefill chunk span two blocks, "
             "which needs the multi-block store that only REBEL CR13 carries; "
             f"this is {current_platform.get_device_name()}."
+        )
+    # DSA constructors select the indexer by index_topk. Its FP8 scale store
+    # cannot span blocks; apply this limit only after sub-blocks are in use.
+    if (
+        cache_dtype.startswith("fp8")
+        and (
+            hasattr(model_config.hf_text_config, "index_topk")
+            or hasattr(model_config.hf_config, "index_topk")
+        )
+        and sub_block_size < prefill_chunk_size
+    ):
+        raise ValueError(
+            "The FP8 DSA indexer scale cache requires sub_block_size to "
+            "equal the largest prefill bucket "
+            f"({prefill_chunk_size}); got {sub_block_size} "
+            f"with prefill_chunk_size={prefill_chunk_sizes}. "
+            f"Set --rbln-sub-block-size to {prefill_chunk_size} "
+            "and use a --block-size that is a larger multiple of it."
         )
     return sub_block_size

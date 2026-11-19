@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any
 
 from vllm_rbln import envs
 from vllm_rbln.config import OptimumRBLNCompileConfig
+from vllm_rbln.logger import init_logger
 from vllm_rbln.utils.optimum.registry import (
     get_rbln_model_info,
     is_decoder_pooling_arch,
@@ -40,11 +41,14 @@ from .rbln_config import (
     read_language_model_fields,
     read_num_devices,
 )
+from .runtime_config import is_chunked_prefill_arch
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 else:
     VllmConfig = None
+
+logger = init_logger(__name__)
 
 
 # Keys that affect only loading the compiled model, not the compiled binary,
@@ -204,12 +208,32 @@ def default_prefill_chunk_size() -> int:
     )
 
 
+def _resolve_decoder_prefill_chunk_size(
+    user_chunk: int | None, override_chunk: int | None
+) -> int:
+    validate_prefill_chunk_override(user_chunk, override_chunk)
+    if user_chunk is not None:
+        return user_chunk
+    if override_chunk is not None:
+        return override_chunk
+    return default_prefill_chunk_size()
+
+
 def prepare_compile_config(vllm_config: VllmConfig) -> OptimumRBLNCompileConfig:
     """Resolve user settings into an owned config for cache lookup and compilation."""
     from vllm_rbln.platform import RblnPlatform
 
     model_config = vllm_config.model_config
     additional_config = vllm_config.additional_config
+    hf_config = model_config.hf_config
+
+    if additional_config.prefill_chunk_size is not None and not is_chunked_prefill_arch(
+        hf_config
+    ):
+        raise ValueError(
+            "prefill_chunk_size cannot be specified for a model that does "
+            "not support chunked prefill. Leave --rbln-prefill-chunk-size unset."
+        )
 
     optimum_overrides = deepcopy(additional_config.optimum_overrides)
     if optimum_overrides.get("dtype") is not None:
@@ -221,7 +245,6 @@ def prepare_compile_config(vllm_config: VllmConfig) -> OptimumRBLNCompileConfig:
         )
     set_submodule_num_devices(optimum_overrides)
 
-    hf_config = model_config.hf_config
     if is_generation_arch(hf_config):
         model_cls, rbln_config = _for_decoder(vllm_config, optimum_overrides)
     elif is_pooling_arch(hf_config):
@@ -283,27 +306,26 @@ def _for_decoder(
 
     num_devices = get_compile_num_devices(vllm_config, optimum_overrides)
 
-    prefill_chunk_size = optimum_overrides.get("prefill_chunk_size")
-    user_chunk = additional_config.user_max_num_batched_tokens
-    validate_prefill_chunk_override(user_chunk, prefill_chunk_size)
-    if user_chunk is not None:
-        prefill_chunk_size = user_chunk
-    if prefill_chunk_size is None:
-        prefill_chunk_size = default_prefill_chunk_size()
-
     rbln_config: dict[str, Any] = {
         "num_devices": num_devices,
         "batch_size": batch_size,
         "max_seq_len": max_model_len,
         "kvcache_block_size": block_size,
         "memory_budget": cache_config.gpu_memory_utilization,
-        "prefill_chunk_size": prefill_chunk_size,
+        "prefill_chunk_size": _resolve_decoder_prefill_chunk_size(
+            additional_config.single_prefill_chunk_size,
+            optimum_overrides.get("prefill_chunk_size"),
+        ),
     }
     if block_size != max_model_len:
         rbln_config["kvcache_partition_len"] = block_size
         rbln_config["attn_impl"] = "flash_attn"
     if envs.VLLM_RBLN_USE_NESTED_COMPILE_REGION:
         rbln_config["nested_compile_region"] = True
+
+    if get_rbln_model_info(model_config.hf_config)[0] == "qwen3_reranker":
+        # score() never decodes, so the decode graphs would only cost memory.
+        rbln_config["phases"] = ["prefill"]
     return RBLNAutoModelForCausalLM, rbln_config
 
 
@@ -348,6 +370,10 @@ def _for_pooling(
         if block_size != max_model_len:
             rbln_config["kvcache_partition_len"] = block_size
             rbln_config["attn_impl"] = "flash_attn"
+        rbln_config["prefill_chunk_size"] = _resolve_decoder_prefill_chunk_size(
+            vllm_config.additional_config.single_prefill_chunk_size,
+            optimum_overrides.pop("prefill_chunk_size", None),
+        )
     return model_cls, rbln_config
 
 
@@ -381,15 +407,22 @@ def _for_multimodal(
 
     num_devices = get_compile_num_devices(vllm_config, optimum_overrides)
 
-    prefill_chunk_size = override_values.get("prefill_chunk_size")
-    user_chunk = additional_config.user_max_num_batched_tokens
-    override_chunk = optimum_overrides.get("prefill_chunk_size")
-    validate_prefill_chunk_override(user_chunk, override_chunk)
-    if user_chunk is not None:
-        prefill_chunk_size = user_chunk
+    prefill_chunk_size = additional_config.single_prefill_chunk_size
+    override_prefill_chunk_size = override_values.get("prefill_chunk_size")
+    validate_prefill_chunk_override(prefill_chunk_size, override_prefill_chunk_size)
+    if prefill_chunk_size is None:
+        prefill_chunk_size = override_prefill_chunk_size
     model_name, model_cls_name = get_rbln_model_info(model_config.hf_config)
     if model_name == "paligemma":
+        if prefill_chunk_size is not None and prefill_chunk_size != max_model_len:
+            logger.warning(
+                "PaliGemma requires full-prompt prefill. Adjusting "
+                "prefill_chunk_size from %s to max_model_len (%s).",
+                prefill_chunk_size,
+                max_model_len,
+            )
         prefill_chunk_size = max_model_len
+        additional_config.prefill_chunk_size = [prefill_chunk_size]
     if prefill_chunk_size is None:
         prefill_chunk_size = default_prefill_chunk_size()
 
@@ -415,6 +448,8 @@ def _for_multimodal(
     decoder_config["kvcache_block_size"] = block_size
     if envs.VLLM_RBLN_USE_NESTED_COMPILE_REGION:
         decoder_config["nested_compile_region"] = True
+    if model_name == "qwen3_vl_reranker":
+        decoder_config["phases"] = ["prefill"]
     return model_cls, rbln_config
 
 

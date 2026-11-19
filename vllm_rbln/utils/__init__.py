@@ -16,6 +16,16 @@ from collections.abc import Callable
 from typing import Union
 
 import torch
+from vllm.forward_context import get_forward_context
+
+
+def is_prefill_step() -> bool:
+    """The step's prefill/decode classification, read off the attention metadata
+    the runner put in the forward context (one per layer; every layer agrees)."""
+    attn_metadata = get_forward_context().attn_metadata
+    if isinstance(attn_metadata, dict):
+        attn_metadata = next(iter(attn_metadata.values()))
+    return attn_metadata.is_prefill
 
 
 def run_mm_encoder(

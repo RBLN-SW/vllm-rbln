@@ -449,6 +449,8 @@ class DynamicKvSizer:
             block_size=self.cache_config.block_size,
             prefill_chunk_sizes=rbln_config.prefill_chunk_size,
             kv_cache_config=self.model_runner.kv_cache_config,
+            model_config=self.vllm_config.model_config,
+            cache_dtype=self.cache_config.cache_dtype,
             sub_block_size=rbln_config.sub_block_size,
         )
         return DYNAMIC_KV_COPY_STREAM_RESERVE_BYTES if in_use is not None else 0

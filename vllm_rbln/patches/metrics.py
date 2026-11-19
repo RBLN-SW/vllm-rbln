@@ -18,9 +18,10 @@ sums the model call, sampler, and blocking bookkeeping as MODEL + SAMPLE.
 Spec decode's postprocess gather also holds a blocking read, so its profiler
 region is included in that sum. Drafter time stays in the E2E residual.
 Non-last PP ranks close their pass after the hand-off waits on compute.
-Multimodal encoder calls are reported per input shape as ENCODER, through
-the CPU output copy or RBLN stream completion. Input preparation is outside
-that interval.
+With RBLN_RUNTIME_TIMER on, HOST OP sums the host-op time of timed runs
+completed on the calling thread during the model call.
+Multimodal encoder calls through their existing CPU output copy are reported
+per input shape as ENCODER. Input preparation is outside that interval.
 """
 
 import contextlib
@@ -28,6 +29,7 @@ import functools
 import time
 
 import torch
+import rebel
 from vllm.sequence import IntermediateTensors
 from vllm.v1.utils import record_function_or_nullcontext
 
@@ -106,9 +108,13 @@ def load_model(self, *args, **kwargs):
         if not ctx.in_pass:
             # Warm-up and dummy runs: skip the clock reads as well as the record.
             return executable(*call_args, **call_kwargs)
+        host_op_before = rebel.get_accumulated_host_op_time_us()
         start = time.perf_counter()
         output = executable(*call_args, **call_kwargs)
         ctx.add_graph_time(time.perf_counter() - start)
+        host_op_after = rebel.get_accumulated_host_op_time_us()
+        if host_op_after is not None:
+            ctx.add_host_op_time((host_op_after - (host_op_before or 0)) / 1e6)
         return output
 
     self.model_executable = timed_executable

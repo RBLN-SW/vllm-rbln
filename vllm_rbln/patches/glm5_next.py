@@ -14,9 +14,19 @@
 
 import functools
 
+from vllm.transformers_utils.model_arch_config_convertor import (
+    ModelArchConfigConvertorBase,
+)
+
+from vllm_rbln.patches.model_arch_config import register_convertor
 from vllm_rbln.patches.registry import add_registration, register_patch
 
 _MODULE = "vllm_rbln.model_executor.models.glm5_next"
+
+
+class Glm5NextMTPConvertor(ModelArchConfigConvertorBase):
+    def get_num_hidden_layers(self) -> int:
+        return self.hf_text_config.num_nextn_predict_layers
 
 
 @add_registration(
@@ -37,6 +47,21 @@ def register_glm5_next() -> None:
     )
     # The MTP drafter vLLM's speculative config selects for a glm5_next target.
     ModelRegistry.register_model("Glm5NextMTPModel", f"{_MODULE}:RBLNGlm5NextMTP")
+
+
+@add_registration(
+    reason=(
+        "Upstream has no model arch config convertor for glm5_next_mtp, the type "
+        "SpeculativeConfig gives a GLM-5.3 MTP draft, so the base convertor reports "
+        "the target's num_hidden_layers as the draft's layer count. Report "
+        "num_nextn_predict_layers, as upstream's DeepSeek and GLM-4 MoE MTP "
+        "convertors do."
+    )
+)
+def register_glm5_next_mtp_convertor() -> None:
+    # TODO(vllm): delete once upstream registers a glm5_next_mtp convertor;
+    # register_convertor raises from then on.
+    register_convertor("glm5_next_mtp", Glm5NextMTPConvertor)
 
 
 @add_registration(
@@ -135,26 +160,14 @@ def _build_glm5_next_phase_groups():
             if type(spec) is MLAAttentionSpec and spec.tokens_per_state == 1
         ]
         phase_ids = {phase: i for i, phase in enumerate(phases)}
-        state_layers = {name: layer for layer, _, name in states}
         names: list[list[str]] = [[] for _ in state_groups]
         pp_size = vllm_config.parallel_config.pipeline_parallel_size
         total_layers = vllm_config.model_config.get_total_num_hidden_layers()
         for rank in range(pp_size):
             start, end = get_pp_indices(total_layers, rank, pp_size)
-            num_target_layers = min(end, total_layers) - start
             if rank == pp_size - 1:
                 # Draft attention belongs to the last stage and also owns slots.
                 end = max(end, max(mla_layers) + 1, states[-1][0] + 1)
-            # Carrying a stage's device input peels one period; rolling needs
-            # two more. Avoid enlarging aux pools on stages too short to roll.
-            if pp_size > 1 and num_target_layers < 3 * period:
-                for selected, group in zip(names, state_groups):
-                    selected.extend(
-                        name
-                        for name in group.layer_names
-                        if start <= state_layers[name] < end
-                    )
-                continue
             capacity = sum(start <= layer < end for layer in mla_layers)
             local: list[list[str]] = [[] for _ in state_groups]
             overflow = []
