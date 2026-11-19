@@ -28,11 +28,7 @@ from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
-from vllm.model_executor.models.gemma4 import (
-    Gemma4Attention,
-    Gemma4MLP,
-    Gemma4Model,
-)
+from vllm.model_executor.models.gemma4 import Gemma4Attention, Gemma4MLP
 from vllm.model_executor.models.gemma4_mm import (
     _SUPPORTED_SOFT_TOKENS,
     Gemma4DummyInputsBuilder,
@@ -52,7 +48,6 @@ from vllm_rbln.model_executor.models.interfaces import (
     SupportsRBLNMultiModal,
 )
 from vllm_rbln.patches.attention import _resolve_kv_cache
-from vllm_rbln.patches.gemma4 import ResidualReadNorm
 
 
 def _build_mm_prefix_sliding_mask(
@@ -284,10 +279,6 @@ class RBLNGemma4ForConditionalGeneration(
                 "supported on RBLN yet."
             )
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-        for model in [m for m in self.modules() if isinstance(m, Gemma4Model)]:
-            model.norm = ResidualReadNorm(
-                model.norm.hidden_size, eps=model.norm.variance_epsilon
-            )
         self.mm_prefix_attn_layers: list[nn.Module] = []
         for module in self.modules():
             if (

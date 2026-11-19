@@ -238,6 +238,38 @@ def test_the_final_norm_reads_only_the_decode_residual(monkeypatch, prefill):
     torch.testing.assert_close(out, _rms_norm(x, norm.weight.data, 1e-6))
 
 
+@pytest.mark.parametrize(
+    "moe,per_layer_dim,reads",
+    [(False, 0, True), (True, 0, False), (False, 256, False)],
+    ids=["dense", "moe", "per-layer-input"],
+)
+def test_only_a_model_with_a_cut_layer_reads_its_final_norm(
+    monkeypatch, moe, per_layer_dim, reads
+):
+    from vllm.config import set_current_vllm_config
+    from vllm.model_executor.layers.layernorm import RMSNorm
+
+    from tests.vllm.vllm_config import make_vllm_config
+    from vllm_rbln.patches import gemma4
+
+    def upstream_init(self, *, vllm_config, prefix=""):
+        layer = SimpleNamespace(
+            enable_moe_block=moe, hidden_size_per_layer_input=per_layer_dim
+        )
+        # The trailing layer belongs to another pipeline rank.
+        cut = SimpleNamespace(enable_moe_block=False, hidden_size_per_layer_input=0)
+        self.layers, self.start_layer, self.end_layer = [layer, cut], 0, 1
+        self.norm = RMSNorm(64, eps=1e-6)
+
+    monkeypatch.setattr(gemma4, "_original_gemma4_model_init", upstream_init)
+    model = SimpleNamespace()
+    with set_current_vllm_config(make_vllm_config()):
+        gemma4.patched_gemma4_model_init(model, vllm_config=None)
+
+    assert isinstance(model.norm, gemma4.ResidualReadNorm) is reads
+    assert (model.norm.hidden_size, model.norm.variance_epsilon) == (64, 1e-6)
+
+
 def test_a_per_layer_input_keeps_the_plain_layer(monkeypatch):
     import torch
 
