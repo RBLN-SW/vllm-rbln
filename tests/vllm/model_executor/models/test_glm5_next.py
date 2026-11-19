@@ -546,3 +546,147 @@ def test_video_placeholders_follow_processed_frames(
         assert output["prompt_token_ids"].count(3) == int(grid[0])
         assert item["timestamps"].data.tolist() == timestamps
     assert inputs.cache.make_stats().hits == 1
+
+
+class _Norm:
+    """vLLM's RMSNorm as the mHC sublayer norm: a `weight` for the op and the
+    plain math for the call."""
+
+    def __init__(self, hidden):
+        self.weight = 1.0 + 0.1 * torch.randn(hidden, dtype=torch.bfloat16)
+
+    def __call__(self, x):
+        rows = x.float()
+        normed = rows * torch.rsqrt(rows.pow(2).mean(-1, keepdim=True) + 1e-5)
+        return (normed.to(self.weight.dtype) * self.weight).to(x.dtype)
+
+
+def _mhc_layer(hidden=64):
+    """A decoder layer's mHC around token-local stand-in sublayers; the hc_* ops
+    fix n at 4."""
+    import vllm_rbln.model_executor.models.glm5_next as glm
+
+    torch.manual_seed(0)
+    layer = _bare(glm.RBLNGlm5NextDecoderLayer)
+    layer.n, layer.rms_eps, layer.hc_eps = 4, 1e-5, 1e-6
+    layer.sinkhorn_iters, layer.post_mult = 20, 2.0
+    mix = (2 + layer.n) * layer.n
+    for kind in ("attn", "ffn"):
+        setattr(layer, f"hc_{kind}_fn", 0.05 * torch.randn(mix, layer.n * hidden))
+        setattr(layer, f"hc_{kind}_base", 0.1 * torch.randn(mix))
+        setattr(layer, f"hc_{kind}_scale_lanes", 0.5 + torch.rand(mix))
+    layer.input_layernorm = _Norm(hidden)
+    layer.post_attention_layernorm = _Norm(hidden)
+    layer.self_attn = torch.sin
+    layer.mlp = torch.tanh
+    return layer
+
+
+def _mhc_kernels(monkeypatch):
+    """The three token-cut kernels as the plain mHC ops they lower from,
+    recording each call."""
+    ops = torch.ops.rbln_custom_ops
+    calls = []
+    n = 4
+
+    def mix(streams, mix_weight, scale, base, eps):
+        calls.append("mix")
+        batch, _, tokens, hidden = streams.shape
+        flat = streams.transpose(1, 2).reshape(batch, tokens, n * hidden).float()
+        flat = flat * torch.rsqrt(flat.square().mean(-1, keepdim=True) + eps)
+        logits = torch.nn.functional.linear(flat, mix_weight) * scale + base
+        return logits.to(streams.dtype)
+
+    def read(streams, logits, eps):
+        calls.append("read")
+        return ops.hc_stream_reduce(streams, logits[..., :n].contiguous(), eps)
+
+    def write(x, streams, logits, post_mult, iters, eps):
+        calls.append("write")
+        comb = ops.sinkhorn_normalize(
+            logits[..., 2 * n :].contiguous(), iters=iters, eps=eps
+        )
+        out = ops.hc_residual_add(
+            x, streams, logits[..., n : 2 * n].contiguous(), comb, post_mult=post_mult
+        )
+        return out.to(torch.bfloat16).to(streams.dtype)
+
+    for name, kernel in (("mhc_mix", mix), ("mhc_read", read), ("mhc_write", write)):
+        monkeypatch.setattr(ops, name, kernel, raising=False)
+    return calls
+
+
+@pytest.mark.parametrize("prefill", [True, False])
+def test_every_step_runs_the_mhc_on_the_cut_kernels(monkeypatch, prefill):
+    import vllm_rbln.model_executor.models.glm5_next as glm
+
+    calls = _mhc_kernels(monkeypatch)
+    layer = _mhc_layer()
+    shape = (1, 4, 8, 64) if prefill else (8, 4, 1, 64)
+    monkeypatch.setattr(glm, "is_prefill_step", lambda: prefill)
+
+    layer(torch.randn(shape).to(torch.bfloat16))
+
+    assert calls == ["mix", "read", "write"] * 2
+
+
+def test_the_model_returns_the_streams_in_the_input_dtype_after_a_cut_prefill(
+    monkeypatch,
+):
+    import vllm_rbln.model_executor.models.glm5_next as glm
+
+    _mhc_kernels(monkeypatch)
+    monkeypatch.setattr(glm, "is_prefill_step", lambda: True)
+    monkeypatch.setattr(
+        glm,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    model = _bare(glm.RBLNGlm5NextModel)
+    model.n = 4
+    model.layers = torch.nn.ModuleList([_mhc_layer()])
+    model.start_layer, model.end_layer = 0, 1
+    model.norm = lambda x: x
+
+    out = model(None, torch.arange(8), None, torch.randn(1, 8, 64).to(torch.bfloat16))
+
+    assert out.dtype == torch.bfloat16
+
+
+@pytest.mark.parametrize("prefill", [False, True])
+def test_only_decode_reads_the_final_norm_on_the_op(monkeypatch, prefill):
+    from vllm.config import set_current_vllm_config
+    from vllm.model_executor.layers.layernorm import RMSNorm
+
+    import vllm_rbln.model_executor.models.glm5_next as glm
+    from tests.vllm.vllm_config import make_vllm_config
+
+    torch.manual_seed(0)
+    reads = []
+
+    def residual_read(x, weight, eps):
+        reads.append(tuple(x.shape))
+        rows = x.float()
+        normed = rows * torch.rsqrt(rows.pow(2).mean(dim=-1, keepdim=True) + eps)
+        return (normed * weight.float()).to(x.dtype)
+
+    monkeypatch.setattr(glm, "is_prefill_step", lambda: prefill)
+    monkeypatch.setattr(
+        glm,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(
+        torch.ops.rbln_custom_ops, "residual_read", residual_read, raising=False
+    )
+    model = _bare(glm.RBLNGlm5NextModel)
+    model.n, model.layers, model.start_layer, model.end_layer = 4, [], 0, 0
+    with set_current_vllm_config(make_vllm_config()):
+        model.norm = RMSNorm(64, eps=1e-6)
+    model.norm.weight.data = 1.0 + 0.1 * torch.randn(64)
+    embeds = torch.randn(8, 1, 64)
+
+    out = model.forward(None, torch.zeros(8, 1), inputs_embeds=embeds)
+
+    assert reads == ([] if prefill else [(8, 1, 64)])
+    torch.testing.assert_close(out, model.norm(embeds))

@@ -29,7 +29,7 @@ from vllm.v1.kv_cache_interface import MambaSpec, MLAAttentionSpec
 import vllm_rbln.v1.worker.rbln_model_runner as mr
 from tests.vllm.v1.worker.utils import make_kv_cache_config, schedule_new
 from vllm_rbln.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
-    RBLNGDNConvRingCache,
+    RBLNGDNBlockAuxCache,
     RBLNQwenGatedDeltaNetAttention,
 )
 from vllm_rbln.v1.attention.backends.gdn_attn import RBLNGDNAttentionMetadata
@@ -41,7 +41,7 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
 )
 from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
 
-pytestmark = pytest.mark.maybe_use_device
+pytestmark = pytest.mark.use_device
 
 
 @pytest.mark.usefixtures("cr13")
@@ -666,7 +666,8 @@ class TestGatedDeltaNetOnTheAttentionPool:
         runner, cache_config = _attention_and_gdn(
             make_model_runner, tmp_path, 256, self.ATTN, self.GDN
         )
-        # Two caches a decoder layer, as num_attn_module counts Qwen3.5's.
+        # Three cache slots a decoder layer, as num_attn_module counts Qwen3.5's;
+        # the draft one stays unbound here.
         monkeypatch.setattr(
             runner.model_config.hf_text_config,
             "model_type",
@@ -674,7 +675,7 @@ class TestGatedDeltaNetOnTheAttentionPool:
             raising=False,
         )
         with set_current_vllm_config(runner.vllm_config):
-            RBLNGDNConvRingCache(
+            RBLNGDNBlockAuxCache(
                 self.RING,
                 owner=self.GDN,
                 block_shape=(3, 1, 2, 64),
@@ -709,7 +710,7 @@ class TestGatedDeltaNetOnTheAttentionPool:
         attention, state = attn_metadata[self.ATTN], attn_metadata[self.GDN]
         assert attention.block_tables[:2, 0].tolist() == [1, 3]
         assert isinstance(state, RBLNGDNAttentionMetadata)
-        assert state.non_spec_state_indices_tensor.tolist() == [2, 1, 0, 0]
+        assert state.load_blocks.tolist() == [2, 1, 0, 0]
         # The two views are recipes over one base, which reaches the graph once.
         infos = runner.kv_cache_view_infos
         assert state.kv_cache_view_infos is attention.kv_cache_view_infos is infos
