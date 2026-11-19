@@ -111,7 +111,7 @@ from vllm_rbln.v1.attention.backends.minimax_m3 import (
     RBLNMiniMaxM3IndexerBackend,
     RBLNMiniMaxM3SparseBackend,
 )
-from vllm_rbln.v1.kv_cache import register_kv_cache_with_subindex
+from vllm_rbln.v1.kv_cache import ensure_kv_cache_registration
 from vllm_rbln.v1.spec_decode.eagle3_pp import (
     AUX_COMBINED,
     aux_slots_captured,
@@ -371,7 +371,7 @@ class RBLNMiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
         self.cache_config = cache_config
         self.layer_index: int | None = None
         context = vllm_config.compilation_config.static_forward_context
-        register_kv_cache_with_subindex(context, prefix, self, subindex=1)
+        ensure_kv_cache_registration(context, prefix, self, subindex=1)
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         # Key-only: MLAAttentionSpec budgets one vector per token (not K + V).

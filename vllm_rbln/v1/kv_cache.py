@@ -36,25 +36,21 @@ from vllm.v1.request import Request
 logger = init_logger(__name__)
 
 
-def register_kv_cache_with_subindex(
+def ensure_kv_cache_registration(
     context: dict[str, Any],
     name: str,
     cache: torch.nn.Module,
     *,
     subindex: int,
-    already_registered: bool = False,
 ) -> None:
-    """Register a cache whose module path has no numeric slot of its own."""
+    """Set the cache subindex and register the cache if it is new."""
     if subindex < 1:
         raise ValueError(f"KV cache {name} requires a positive subindex")
-    if already_registered:
-        if context.get(name) is not cache:
-            raise ValueError(f"Expected upstream to register KV cache {name}")
-    elif name in context:
+    if name in context and context[name] is not cache:
         raise ValueError(f"Duplicate layer name: {name}")
 
     cache.kv_cache_subindex = subindex
-    context[name] = cache
+    context.setdefault(name, cache)
 
 
 @dataclass(frozen=True)
