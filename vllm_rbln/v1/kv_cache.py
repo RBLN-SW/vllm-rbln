@@ -19,10 +19,41 @@ from math import prod
 import torch
 from vllm.config import VllmConfig
 from vllm.utils.torch_utils import get_dtype_size
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
-from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
-from vllm.v1.kv_cache_interface import SlidingWindowSpec
+from vllm.v1.core.single_type_kv_cache_manager import (
+    CircularBufferManager,
+    SingleTypeKVCacheManager,
+)
+from vllm.v1.kv_cache_interface import KVCacheTensor, SlidingWindowSpec
 from vllm.v1.request import Request
+
+
+class RBLNFixedKVCacheTensor(KVCacheTensor):
+    """A cache allocation whose capacity does not grow with the attention pool."""
+
+
+class RBLNDeepseekV4StateManager(CircularBufferManager):
+    """Allocate ring IDs from a per-group pool bounded by concurrent requests."""
+
+    def __init__(self, kv_cache_spec, *, block_pool, **kwargs):
+        assert kv_cache_spec.mamba_cache_mode == "none"
+        assert not kwargs["enable_caching"]
+        self.attention_pool = block_pool
+        state_pool = BlockPool(
+            num_gpu_blocks=kv_cache_spec.num_state_slots,
+            enable_caching=False,
+            hash_block_size=block_pool.hash_block_size,
+        )
+        super().__init__(kv_cache_spec, block_pool=state_pool, **kwargs)
+
+    def get_num_blocks_to_allocate(self, *args, **kwargs) -> int:
+        needed = super().get_num_blocks_to_allocate(*args, **kwargs)
+        # Coordinator admission compares the sum against the attention pool.
+        # State slots consume none of it, but exhaustion must still deny admission.
+        if needed > self.block_pool.get_num_free_blocks():
+            return self.attention_pool.get_num_free_blocks() + 1
+        return 0
 
 
 @dataclass(frozen=True)

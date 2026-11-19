@@ -359,6 +359,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         # ordering the KV connector relies on for region<->layer agreement.
         self.kv_cache_names: list[str] = []
         self.kv_cache_allocations: dict[tuple, str] = {}
+        self.fixed_kv_cache_tensors: dict[str, torch.Tensor] = {}
         # Initialize in initialize_kv_cache_tensors
         self.cross_layers_kv_cache: torch.Tensor | None = None
         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
@@ -3332,13 +3333,31 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         # graph input is a whole tensor, and dynamo refuses a slice's offset.
         device = self.device if use_device_tensor() else "meta"
         extent_of = kv_cache_extents(kv_cache_config)
+        from vllm_rbln.v1.kv_cache import RBLNFixedKVCacheTensor
+
+        fixed = {
+            name
+            for tensor in kv_cache_config.kv_cache_tensors
+            if isinstance(tensor, RBLNFixedKVCacheTensor)
+            for name in tensor.layers
+        }
         buffers = {
             extent: torch.empty(extent[1], dtype=torch.int8, device=device)
-            for extent in set(extent_of.values())
+            for extent in {v for name, v in extent_of.items() if name not in fixed}
         }
         kv_cache_raw_tensors = {
-            layer_name: buffers[extent] for layer_name, extent in extent_of.items()
+            layer_name: buffers[extent]
+            for layer_name, extent in extent_of.items()
+            if layer_name not in fixed
         }
+        # Retain fixed buffers while dynamic KV releases the attention pool;
+        # the driver's baseline snapshot must include their physical storage.
+        for name in fixed:
+            if name not in self.fixed_kv_cache_tensors:
+                self.fixed_kv_cache_tensors[name] = torch.empty(
+                    extent_of[name][1], dtype=torch.int8, device=device
+                )
+            kv_cache_raw_tensors[name] = self.fixed_kv_cache_tensors[name]
 
         layer_names = set()
         for group in kv_cache_config.kv_cache_groups:
@@ -3503,7 +3522,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     kv_caches[layer_name] = typed_base
                     kv_cache_block_axes[layer_name] = 0
                     dynamic_axis = None
-                    if dynamic_kv_enabled(self.vllm_config):
+                    if dynamic_kv_enabled(self.vllm_config) and (
+                        layer_name not in self.fixed_kv_cache_tensors
+                    ):
                         dynamic_axis = 0
                         torch._dynamo.mark_dynamic(typed_base, 0)
                         marked_layers.append((layer_name, 0))
@@ -3604,8 +3625,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 for info in self.kv_cache_view_infos
                 if info.dynamic_axis is not None
             }
-            for index, base in enumerate(self.kv_cache_bases):
-                torch._dynamo.mark_dynamic(base, base_axes[index])
+            for index, axis in base_axes.items():
+                torch._dynamo.mark_dynamic(self.kv_cache_bases[index], axis)
             logger.info(
                 "[Dynamic KV] mark_dynamic(kv_cache_base, dim=%s) applied to %d "
                 "deduped base(s); shape=%s",
@@ -3619,6 +3640,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         # on allocation so addresses are never matched across cache generations.
         self.kv_cache_allocations = {}
         for name, cache in zip(self.kv_cache_names, self.kv_caches):
+            if name in self.fixed_kv_cache_tensors:
+                continue
             key = kv_cache_tensor_key(cache)
             self.kv_cache_allocations.setdefault(key, name)
         self.kv_cache_block_axes = block_axes

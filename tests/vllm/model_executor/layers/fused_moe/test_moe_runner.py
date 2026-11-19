@@ -340,3 +340,32 @@ class TestRegistration:
         # The factory path itself: PluggableLayer.__new__ allocates the RBLN class
         # when the base MoERunner is instantiated.
         assert type(MoERunner.__new__(MoERunner)) is RBLNMoERunner
+
+
+class TestSqrtSoftplusRouting:
+    def test_hash_ids_select_unbiased_weights(self):
+        from vllm_rbln.model_executor.layers.fused_moe.runner.moe_runner import (
+            _apply_sqrtsoftplus_topk,
+        )
+
+        logits = torch.tensor([[1.0, -2.0, 3.0, 0.5], [4.0, 1.0, -1.0, 2.0]])
+        ids = torch.tensor([[0, 3], [1, 2]], dtype=torch.bfloat16)
+        expected = torch.zeros_like(logits)
+        scores = torch.nn.functional.softplus(logits).sqrt()
+        chosen = scores.gather(1, ids.long())
+        chosen /= chosen.sum(1, keepdim=True)
+        expected.scatter_(1, ids.long(), chosen)
+        actual = _apply_sqrtsoftplus_topk(logits, 2, True, forced_ids=ids)
+        torch.testing.assert_close(actual, expected.transpose(0, 1))
+
+    def test_bias_changes_selection_without_changing_weights(self):
+        from vllm_rbln.model_executor.layers.fused_moe.runner.moe_runner import (
+            _apply_sqrtsoftplus_topk,
+        )
+
+        logits = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+        bias = torch.tensor([100.0, 0.0, 0.0, 0.0])
+        actual = _apply_sqrtsoftplus_topk(logits, 1, False, bias)
+        expected = torch.zeros(4, 1)
+        expected[0, 0] = torch.nn.functional.softplus(logits[0, 0]).sqrt()
+        torch.testing.assert_close(actual, expected)
