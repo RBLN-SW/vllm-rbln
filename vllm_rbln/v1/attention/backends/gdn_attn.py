@@ -135,18 +135,22 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
         )
         return self._padded(blocks[:, 0], batch)
 
-    def stage(self, metadata: RBLNGDNAttentionMetadata) -> None:  # type: ignore[override]
+    def stage(  # type: ignore[override]
+        self,
+        metadata: RBLNGDNAttentionMetadata,
+        group_shared: dict[tuple, torch.Tensor] | None = None,
+    ) -> None:
         metadata.has_initial_state = self._stage(
-            metadata.has_initial_state, "has_initial_state"
+            metadata.has_initial_state, "has_initial_state", group_shared
         )
         metadata.conv_load_blocks = self._stage(
             metadata.conv_load_blocks, "conv_load_blocks"
         )
         metadata.conv_start_positions = self._stage(
-            metadata.conv_start_positions, "conv_start_positions"
+            metadata.conv_start_positions, "conv_start_positions", group_shared
         )
         metadata.conv_query_lens = self._stage(
-            metadata.conv_query_lens, "conv_query_lens"
+            metadata.conv_query_lens, "conv_query_lens", group_shared
         )
         metadata.conv_store_blocks = self._stage(
             metadata.conv_store_blocks, "conv_store_blocks"
@@ -166,6 +170,7 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
         num_accepted: torch.Tensor | None = None,
         state_load_pos: torch.Tensor | None = None,
         mm_prefix_row_ends: torch.Tensor | None = None,
+        group_shared: dict[tuple, torch.Tensor] | None = None,
         defer_staging: bool = False,
     ) -> RBLNGDNAttentionMetadata:
         """Under MTP `state_load_pos` is the last position of a row's previous
@@ -237,5 +242,5 @@ class RBLNGDNAttentionMetadataBuilder(RBLNFlashAttentionMetadataBuilder):
             else self._padded(num_accepted, batch_size),
         )
         if not defer_staging:
-            self.stage(metadata)
+            self.stage(metadata, group_shared)
         return metadata

@@ -249,7 +249,8 @@ def test_vision_encoder_builds_its_inputs_from_upstream_rope(monkeypatch):
     assert not key_bias[..., :8].any() and (key_bias[..., 8:] < -1e4).all()
 
 
-def test_aux_cache_flags_and_an_unallocated_draft(monkeypatch):
+def _glm5_layers(monkeypatch):
+    """A KDA layer and a DSA indexer built on a small config; returns it."""
     import vllm.distributed.parallel_state as parallel_state
     from vllm.config import set_current_vllm_config
 
@@ -277,7 +278,24 @@ def test_aux_cache_flags_and_an_unallocated_draft(monkeypatch):
     with set_current_vllm_config(config):
         glm.RBLNGlm5NextKDA(text, "model.layers.0.self_attn")
         glm.RBLNGlm5NextIndexer(text, "model.layers.1.self_attn.indexer")
+    return config
 
+
+def test_kda_states_carry_their_boundary_over_a_transfer(monkeypatch):
+    from vllm_rbln.v1.kv_cache import RBLNMambaSpec
+
+    config = _glm5_layers(monkeypatch)
+    config.cache_config.mamba_block_size = config.cache_config.block_size
+    context = config.compilation_config.static_forward_context
+    specs = [
+        context[f"model.layers.0.self_attn.attn.{j}"].get_kv_cache_spec(config)
+        for j in (0, 1)
+    ]
+    assert all(type(spec) is RBLNMambaSpec for spec in specs)
+
+
+def test_aux_cache_flags_and_an_unallocated_draft(monkeypatch):
+    config = _glm5_layers(monkeypatch)
     context = config.compilation_config.static_forward_context
     flags = {
         name: (spec.prefix_cacheable, spec.verify_only)
@@ -616,21 +634,18 @@ def _mhc_kernels(monkeypatch):
     return calls
 
 
-def test_a_prefill_step_runs_the_mhc_on_the_token_cut_kernels(monkeypatch):
+@pytest.mark.parametrize("prefill", [True, False])
+def test_every_step_runs_the_mhc_on_the_cut_kernels(monkeypatch, prefill):
     import vllm_rbln.model_executor.models.glm5_next as glm
 
     calls = _mhc_kernels(monkeypatch)
     layer = _mhc_layer()
-    streams = torch.randn(1, 4, 8, 64).to(torch.bfloat16)
+    shape = (1, 4, 8, 64) if prefill else (8, 4, 1, 64)
+    monkeypatch.setattr(glm, "is_prefill_step", lambda: prefill)
 
-    monkeypatch.setattr(glm, "is_prefill_step", lambda: True)
-    cut = layer(streams)
-    assert calls == ["mix", "read", "write"] * 2
-    monkeypatch.setattr(glm, "is_prefill_step", lambda: False)
-    plain = layer(streams)
+    layer(torch.randn(shape).to(torch.bfloat16))
 
     assert calls == ["mix", "read", "write"] * 2
-    torch.testing.assert_close(cut.to(streams.dtype), plain)
 
 
 def test_the_model_returns_the_streams_in_the_input_dtype_after_a_cut_prefill(
@@ -654,3 +669,42 @@ def test_the_model_returns_the_streams_in_the_input_dtype_after_a_cut_prefill(
     out = model(None, torch.arange(8), None, torch.randn(1, 8, 64).to(torch.bfloat16))
 
     assert out.dtype == torch.bfloat16
+
+
+@pytest.mark.parametrize("prefill", [False, True])
+def test_only_decode_reads_the_final_norm_on_the_op(monkeypatch, prefill):
+    from vllm.config import set_current_vllm_config
+    from vllm.model_executor.layers.layernorm import RMSNorm
+
+    import vllm_rbln.model_executor.models.glm5_next as glm
+    from tests.vllm.vllm_config import make_vllm_config
+
+    torch.manual_seed(0)
+    reads = []
+
+    def residual_read(x, weight, eps):
+        reads.append(tuple(x.shape))
+        rows = x.float()
+        normed = rows * torch.rsqrt(rows.pow(2).mean(dim=-1, keepdim=True) + eps)
+        return (normed * weight.float()).to(x.dtype)
+
+    monkeypatch.setattr(glm, "is_prefill_step", lambda: prefill)
+    monkeypatch.setattr(
+        glm,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(
+        torch.ops.rbln_custom_ops, "residual_read", residual_read, raising=False
+    )
+    model = _bare(glm.RBLNGlm5NextModel)
+    model.n, model.layers, model.start_layer, model.end_layer = 4, [], 0, 0
+    with set_current_vllm_config(make_vllm_config()):
+        model.norm = RMSNorm(64, eps=1e-6)
+    model.norm.weight.data = 1.0 + 0.1 * torch.randn(64)
+    embeds = torch.randn(8, 1, 64)
+
+    out = model.forward(None, torch.zeros(8, 1), inputs_embeds=embeds)
+
+    assert reads == ([] if prefill else [(8, 1, 64)])
+    torch.testing.assert_close(out, model.norm(embeds))

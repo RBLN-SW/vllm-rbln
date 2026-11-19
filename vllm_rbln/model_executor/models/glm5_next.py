@@ -91,7 +91,7 @@ from vllm.multimodal.processing import (
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import set_default_torch_dtype
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
-from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec, MLAAttentionSpec
+from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
 import vllm_rbln.utils as rbln_utils
 from vllm_rbln.model_executor.models.interfaces import SupportsRBLNMultiModal
@@ -109,7 +109,7 @@ from vllm_rbln.v1.attention.backends.glm5_next import (
     RBLNGlm5NextStateMetadata,
     kda_cache_name,
 )
-from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
+from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec, RBLNMambaSpec
 from vllm_rbln.v1.worker.utils import (
     num_attn_module as rbln_num_attn_module,
 )
@@ -155,7 +155,7 @@ class RBLNGlm5NextStateCache(_RBLNGlm5NextCache):
             vllm_config.cache_config.block_size,
             vllm_config.model_config.hf_text_config.kv_lora_rank,
         )
-        return MambaSpec(
+        return RBLNMambaSpec(
             block_size=vllm_config.cache_config.mamba_block_size,
             shapes=(latent_block,),
             dtypes=(torch.uint8,),
@@ -895,36 +895,23 @@ class RBLNGlm5NextDecoderLayer(nn.Module):
             )
 
     def _sublayer(self, streams, fn, scale, base, norm, sublayer) -> torch.Tensor:
+        # The compiler cuts the mhc_* kernels over the chiplets, by tokens in
+        # prefill and by batch rows in decode, so the streams stay split between
+        # sublayers (fp32 holding bf16 values) and only the sublayer input is
+        # gathered.
         ops = torch.ops.rbln_custom_ops
         streams_f32 = streams.float()
-        if is_prefill_step():
-            # The compiler cuts the mhc_* kernels by tokens over the chiplets, so
-            # the streams stay split between sublayers (fp32 holding bf16 values)
-            # and only the sublayer input is gathered.
-            logits = ops.mhc_mix(streams_f32, fn, scale, base, eps=self.rms_eps)
-            x = ops.mhc_read(streams_f32, logits, eps=self.hc_eps).to(norm.weight.dtype)
-            y = sublayer(norm(x))
-            return ops.mhc_write(
-                y.float(),
-                streams_f32,
-                logits,
-                post_mult=self.post_mult,
-                iters=self.sinkhorn_iters,
-                eps=self.hc_eps,
-            )
-        batch, n, tokens, hidden = streams.shape
-        flat = streams.transpose(1, 2).reshape(batch, tokens, n * hidden).float()
-        flat = flat * torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.rms_eps)
-        z = F.linear(flat, fn) * scale + base
-        z_pre, z_post = z[..., :n], z[..., n : 2 * n]
-        comb = ops.sinkhorn_normalize(
-            z[..., 2 * n :], iters=self.sinkhorn_iters, eps=self.hc_eps
+        logits = ops.mhc_mix(streams_f32, fn, scale, base, eps=self.rms_eps)
+        x = ops.mhc_read(streams_f32, logits, eps=self.hc_eps).to(norm.weight.dtype)
+        y = sublayer(norm(x))
+        return ops.mhc_write(
+            y.float(),
+            streams_f32,
+            logits,
+            post_mult=self.post_mult,
+            iters=self.sinkhorn_iters,
+            eps=self.hc_eps,
         )
-        x = ops.hc_stream_reduce(streams_f32, z_pre, eps=self.hc_eps).to(streams.dtype)
-        x = sublayer(norm(x))
-        return ops.hc_residual_add(
-            x.float(), streams_f32, z_post, comb, post_mult=self.post_mult
-        ).to(streams.dtype)
 
     def forward(self, streams: torch.Tensor) -> torch.Tensor:
         """streams [B, n, T, H] -> [B, n, T, H]."""
@@ -1074,7 +1061,14 @@ class RBLNGlm5NextModel(nn.Module):
             return IntermediateTensors(
                 {"streams": streams.transpose(1, 2).reshape(batch, tokens, -1)}
             )
-        return self.norm(streams.mean(dim=1))
+        hidden = streams.mean(dim=1)
+        if not is_prefill_step():
+            # A read gathers the rows; left cut, they would reach lm_head, whose
+            # weight takes the layout prefill gives it.
+            return torch.ops.rbln_custom_ops.residual_read(
+                hidden, self.norm.weight, self.norm.variance_epsilon
+            )
+        return self.norm(hidden)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         return _load_glm5_next_weights(

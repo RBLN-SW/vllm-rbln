@@ -156,11 +156,12 @@ class TestPreprocessBeforeStaging:
             order.append("metadata")
             return original_metadata(**values)
 
-        def metadata_stage(builder, values):
+        def metadata_stage(builder, values, group_shared):
             order.append("metadata_stage")
+            assert group_shared is runner._group_shared_staging
             if isinstance(builder, mr.RBLNGDNAttentionMetadataBuilder):
-                return original_gdn_stage(builder, values)
-            return original_metadata_stage(builder, values)
+                return original_gdn_stage(builder, values, group_shared)
+            return original_metadata_stage(builder, values, group_shared)
 
         def forward(**values):
             order.append("forward")
