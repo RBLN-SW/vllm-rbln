@@ -141,7 +141,7 @@ def test_forward_runs_only_the_layers_this_rank_built(monkeypatch):
 
     monkeypatch.setattr(envs, "VLLM_RBLN_NUM_HIDDEN_LAYERS", 2)
     # The plain decode streams, whichever compiler is installed.
-    monkeypatch.setattr(axk3_model, "_CUTS_THE_DECODE_GR", False, raising=False)
+    monkeypatch.setattr(axk3_model, "_CUTS_THE_DECODE_GR", False)
     monkeypatch.setattr(dist_utils, "get_pp_indices", patched_get_pp_indices)
     group = SimpleNamespace(rank_in_group=0, world_size=1)
     monkeypatch.setattr(parallel_state, "get_pp_group", lambda: group)
@@ -263,7 +263,7 @@ def gated_residual_model(monkeypatch):
     step = SimpleNamespace(is_prefill=True)
     monkeypatch.setattr(axk3_model, "is_prefill_step", lambda: step.is_prefill)
     # A compiler without the decode cut unless a test says otherwise.
-    monkeypatch.setattr(axk3_model, "_CUTS_THE_DECODE_GR", False, raising=False)
+    monkeypatch.setattr(axk3_model, "_CUTS_THE_DECODE_GR", False)
     read_dims = []
     plain_read = axk3_model.AXK3GatedResidual.read
 

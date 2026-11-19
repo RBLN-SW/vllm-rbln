@@ -39,10 +39,9 @@ def reads_a_batch_cut(table: str, read: str) -> bool:
         module = importlib.import_module(
             f"rebel.core.custom_converter.kernel_table.{table}"
         )
-    except ImportError:
+    except ModuleNotFoundError:
         return False
-    kernel = getattr(module, read, None)
-    return kernel is not None and any(s.axes == ("B",) for s in kernel.shard)
+    return any(s.axes == ("B",) for s in getattr(module, read).shard)
 
 
 def run_mm_encoder(

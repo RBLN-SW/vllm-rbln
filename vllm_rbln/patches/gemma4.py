@@ -64,14 +64,12 @@ def _write(norm, residual: torch.Tensor, y: torch.Tensor, cut: bool) -> torch.Te
 @register_patch(
     target="vllm.model_executor.models.gemma4.Gemma4DecoderLayer.forward",
     reason=(
-        "Gemma4 routes on the residual, not on the experts' input, and hands "
-        "upstream's MoE runner precomputed logits. RBLNMoERunner takes a router "
-        "callable instead, as the patched qwen/deepseek/minimax/gpt-oss MoE "
-        "blocks pass it; this forward is upstream's with that one call changed. "
-        "A dense layer runs its residual adds and norms as "
-        "rbln_custom_ops::{residual_read,gemma4_dense_residual_write} instead, "
-        "which the compiler cuts by tokens in prefill and by batch rows in "
-        "decode so the residual stays split across chiplets."
+        "Gemma4 routes on the residual and hands upstream's MoE runner precomputed "
+        "logits; RBLNMoERunner takes a router callable, as the patched "
+        "qwen/deepseek/minimax/gpt-oss MoE blocks pass it. Upstream also cannot keep "
+        "a dense layer's residual split across chiplets: its adds and norms run as "
+        "rbln_custom_ops::{residual_read,gemma4_dense_residual_write}, which the "
+        "compiler cuts by tokens or by batch rows."
     ),
 )
 def patched_gemma4_decoder_layer_forward(
