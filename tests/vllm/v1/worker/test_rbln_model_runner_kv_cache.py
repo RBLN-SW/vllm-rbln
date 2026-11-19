@@ -654,17 +654,10 @@ class TestGatedDeltaNetOnTheAttentionPool:
     ATTN = "model.layers.1.self_attn.attn"
 
     @pytest.fixture
-    def runner(self, make_model_runner, monkeypatch, tmp_path):
+    def runner(self, make_model_runner, tmp_path):
         # The attention layer is created first; the decoder runs it second.
         runner, cache_config = _attention_and_gdn(
             make_model_runner, tmp_path, 256, self.ATTN, self.GDN
-        )
-        # Two caches a decoder layer, as num_attn_module counts Qwen3.5's.
-        monkeypatch.setattr(
-            runner.model_config.hf_text_config,
-            "model_type",
-            "qwen3_5_text",
-            raising=False,
         )
         with set_current_vllm_config(runner.vllm_config):
             RBLNGDNConvRingCache(
