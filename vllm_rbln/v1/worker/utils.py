@@ -1260,10 +1260,10 @@ def reorder_input_batch(input_batch: "InputBatch", perm: np.ndarray) -> None:
 
 
 def get_kv_cache_names(cache_layers: Mapping[str, Any]) -> list[str]:
-    """Order caches by their numeric module path and optional auxiliary subindex.
+    """Order caches by their numeric module path and optional subindex.
 
     Numbered attention modules and cache groups already encode their order.
-    Unnumbered auxiliary caches declare `kv_cache_subindex`; the default is 0.
+    Caches without a numeric slot declare `kv_cache_subindex`; the default is 0.
 
     Examples:
         Standard attention cache: layers.3.self_attn.attn -> (3, 0).

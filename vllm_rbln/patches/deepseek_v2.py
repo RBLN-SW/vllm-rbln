@@ -31,7 +31,7 @@ from vllm_rbln.v1.attention.backends.mla.indexer import (
     RBLNDeepseekV32IndexerBackend,
     RBLNDeepseekV32IndexerScaleBackend,
 )
-from vllm_rbln.v1.kv_cache import register_aux_kv_cache
+from vllm_rbln.v1.kv_cache import register_kv_cache_with_subindex
 
 logger = init_logger(__name__)
 _original_indexer_cache_init = DeepseekV32IndexerCache.__init__
@@ -172,7 +172,7 @@ def rbln_indexer_cache_init(self, *args, **kwargs) -> None:
     model_config = vllm_config.model_config
     self.layer_index = None
     context = vllm_config.compilation_config.static_forward_context
-    register_aux_kv_cache(
+    register_kv_cache_with_subindex(
         context, self.prefix, self, subindex=1, already_registered=True
     )
 
@@ -189,7 +189,7 @@ def rbln_indexer_cache_init(self, *args, **kwargs) -> None:
         )
         scale.get_attn_backend = lambda: RBLNDeepseekV32IndexerScaleBackend
         scale.layer_index = None
-        register_aux_kv_cache(
+        register_kv_cache_with_subindex(
             context, scale.prefix, scale, subindex=2, already_registered=True
         )
         self.scale_cache = scale

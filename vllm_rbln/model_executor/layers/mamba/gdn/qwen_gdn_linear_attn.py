@@ -32,7 +32,7 @@ from vllm_rbln.v1.attention.backends.gdn_attn import (
     RBLNGDNAttentionBackend,
     RBLNGDNAttentionMetadata,
 )
-from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec, register_aux_kv_cache
+from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec, register_kv_cache_with_subindex
 
 
 class RBLNGDNBlockAuxCache(nn.Module, AttentionLayerBase):
@@ -62,7 +62,7 @@ class RBLNGDNBlockAuxCache(nn.Module, AttentionLayerBase):
         # Index among the graph's KV cache inputs, assigned by the runner.
         self.layer_index: int | None = None
         context = get_current_vllm_config().compilation_config.static_forward_context
-        register_aux_kv_cache(context, prefix, self, subindex=subindex)
+        register_kv_cache_with_subindex(context, prefix, self, subindex=subindex)
 
     def forward(self) -> None: ...
 
