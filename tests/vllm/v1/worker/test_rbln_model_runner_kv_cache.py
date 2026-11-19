@@ -317,9 +317,7 @@ class TestBlockAuxKVCaches:
         runner = make_model_runner(layers=("layer.0", "layer.1"), init_kv_cache=False)
         context = runner.compilation_config.static_forward_context
         for i, owner in ((2, "layer.0"), (3, "layer.1")):
-            module = self._aux(owner)
-            module.layer_index = None
-            monkeypatch.setitem(context, f"layer.{i}", module)
+            monkeypatch.setitem(context, f"layer.{i}", self._aux(owner))
         config = make_kv_cache_config(runner, groups=[("layer.0",), ("layer.1",)])
         runner.initialize_kv_cache(config)
         assert runner.kv_cache_allocations == {
@@ -374,7 +372,6 @@ class TestBlockAuxKVCaches:
         if strict_producer:
             assert set(runner.aux_kv_cache_specs) == {"layer.1"}
             assert "layer.2" not in runner.kv_cache_names
-            # Unbound, its own index could name another layer's cache.
             assert draft.layer_index is None
         else:
             assert set(runner.aux_kv_cache_specs) == {"layer.1", "layer.2"}
@@ -388,7 +385,6 @@ class TestBlockAuxKVCaches:
         runner.is_strict_kv_producer = strict_producer
         context = runner.compilation_config.static_forward_context
         for i, module in enumerate(auxes, start=1):
-            module.layer_index = i
             monkeypatch.setitem(context, f"layer.{i}", module)
         runner.initialize_kv_cache(make_kv_cache_config(runner, groups=[("layer.0",)]))
         return runner
@@ -408,7 +404,9 @@ class TestBlockAuxKVCaches:
             prefix_cacheable=prefix_cacheable,
             verify_only=verify_only,
         )
-        return SimpleNamespace(get_aux_cache_spec=lambda _config: spec)
+        return SimpleNamespace(
+            layer_index=None, get_aux_cache_spec=lambda _config: spec
+        )
 
     def _allocate(self, runner, config, monkeypatch, auxes):
         # GLM-5.3, the one model with aux caches, runs a static KV cache.

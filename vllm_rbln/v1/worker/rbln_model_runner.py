@@ -3695,9 +3695,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             assert isinstance(spec, RBLNBlockAuxSpec), spec
             assert spec.owner in extent_of, f"{layer_name}: no owner {spec.owner}"
             if spec.verify_only and self.is_strict_kv_producer:
-                # No graph a strict producer compiles places it. Its module's
-                # construction-time layer_index could name another layer's cache.
-                module.layer_index = None
+                # Strict KV producers skip allocating verification-only caches.
                 continue
             shape = (num_blocks, *spec.block_shape)
             kind = (spec.owner, shape, spec.dtype)
