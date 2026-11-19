@@ -2560,7 +2560,12 @@ class TestStateBoundaryAdmission:
 
     @staticmethod
     def _scheduler(
-        monkeypatch, *, sends_state_boundary, is_async=False, in_multi=False
+        monkeypatch,
+        *,
+        sends_state_boundary,
+        is_async=False,
+        in_multi=False,
+        num_speculative_tokens=None,
     ):
         from vllm.v1.core.single_type_kv_cache_manager import (
             register_all_kvcache_specs,
@@ -2605,6 +2610,7 @@ class TestStateBoundaryAdmission:
                 matched_tokens=39, is_async=is_async, in_multi_connector=in_multi
             ),
             kv_cache_config=config,
+            num_speculative_tokens=num_speculative_tokens,
         )
 
     @pytest.mark.parametrize("in_multi", [False, True])
@@ -2641,6 +2647,36 @@ class TestStateBoundaryAdmission:
         state = sched.kv_cache_manager.coordinator.single_type_managers[1]
         blocks = state.req_to_blocks["d"]
         assert [b.is_null for b in blocks] == [True, not sends_state_boundary, False]
+
+    # n-gram drops no block; the `True` row has the scheduler treat it as an
+    # EAGLE/MTP drafter, whose block drop moves the boundary one block back.
+    @pytest.mark.parametrize(
+        ("drops_eagle_block", "boundary"), [(False, 32), (True, 16)]
+    )
+    def test_a_speculating_consumer_allocates_the_boundary_block(
+        self, monkeypatch, drops_eagle_block, boundary
+    ):
+        from vllm.config import SpeculativeConfig
+
+        from vllm_rbln.v1.kv_cache import REMOTE_STATE_BOUNDARY
+
+        monkeypatch.setattr(
+            SpeculativeConfig, "use_eagle", lambda self: drops_eagle_block
+        )
+        sched = self._scheduler(
+            monkeypatch, sends_state_boundary=True, num_speculative_tokens=1
+        )
+        request = make_request("d", list(range(40)), 16)
+        request.kv_transfer_params = {
+            "do_remote_prefill": True,
+            REMOTE_STATE_BOUNDARY: boundary,
+        }
+        sched.add_request(request)
+
+        sched.schedule()
+
+        state = sched.kv_cache_manager.coordinator.single_type_managers[1]
+        assert not state.req_to_blocks["d"][boundary // 16 - 1].is_null
 
     @pytest.mark.parametrize("failure", [None, "fail", "recompute"])
     def test_a_failed_receive_leaves_no_cache_hit(self, monkeypatch, failure):
