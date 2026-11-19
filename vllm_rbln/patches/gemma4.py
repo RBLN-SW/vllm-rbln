@@ -55,7 +55,7 @@ def _read(norm, residual: torch.Tensor, cut: bool) -> torch.Tensor:
 def _write(norm, residual: torch.Tensor, y: torch.Tensor, cut: bool) -> torch.Tensor:
     """residual + RMSNorm(y), on the cut op when `cut`; each norm passes its own eps."""
     if cut:
-        return torch.ops.rbln_custom_ops.gemma4_dense_residual_write(
+        return torch.ops.rbln_custom_ops.residual_write(
             residual, y, norm.weight, norm.variance_epsilon
         )
     return norm(y) + residual
@@ -68,7 +68,7 @@ def _write(norm, residual: torch.Tensor, y: torch.Tensor, cut: bool) -> torch.Te
         "logits; RBLNMoERunner takes a router callable, as the patched "
         "qwen/deepseek/minimax/gpt-oss MoE blocks pass it. Upstream also cannot keep "
         "a dense layer's residual split across chiplets: its adds and norms run as "
-        "rbln_custom_ops::{residual_read,gemma4_dense_residual_write}, which the "
+        "rbln_custom_ops::{residual_read,residual_write}, which the "
         "compiler cuts by tokens or by batch rows."
     ),
 )
