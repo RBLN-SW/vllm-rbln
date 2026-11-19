@@ -180,7 +180,7 @@ Three more cases warn and continue on the pre-compile estimate, because each is
 an explicit request from the caller. The first two still go through the int16
 check above, so a count over the cap fails at start-up rather than being served:
 
-- Compile and warm-up are skipped (`--enforce-eager`, `VLLM_RBLN_ENABLE_WARM_UP=0`).
+- Compile and warm-up are skipped (`VLLM_RBLN_ENABLE_WARM_UP=0`).
   Nothing compiles, so no program carries a placement.
 - `--num-gpu-blocks-override` is set. The override pins the count and wins.
 - `RBLN_DUMMY_DEVICE` is set (a compile-only run). There is no device to

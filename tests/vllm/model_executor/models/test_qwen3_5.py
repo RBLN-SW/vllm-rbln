@@ -247,7 +247,7 @@ def test_image_embeddings_match_upstream(visual):
     model.visual = visual
     model.has_vision = True
     model.mm_encoder_patch_buckets = [64, 128]
-    model._mm_encoder = None
+    model.compile_mm_encoder(lambda encoder: encoder)
 
     with torch.inference_mode():
         expected = visual(pixels, grid_thw=grids).split(

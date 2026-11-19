@@ -201,7 +201,7 @@ class DynamicKvSizer:
             is not False,
             unsupported_reason=dynamic_kv_unsupported_reason(vllm_config),
             num_gpu_blocks_override=self.cache_config.num_gpu_blocks_override,
-            compile_skip_reason=compile_and_warmup_skip_reason(vllm_config),
+            compile_skip_reason=compile_and_warmup_skip_reason(),
         )
         # The count vLLM sized, held while the cache is shrunk for the compile.
         self.kv_blocks_before_shrink: int | None = None

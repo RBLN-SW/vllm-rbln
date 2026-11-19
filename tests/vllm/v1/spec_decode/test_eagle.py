@@ -645,9 +645,9 @@ class TestLoadModel:
             ModelConfig, "supports_multimodal_inputs", property(lambda self: True)
         )
         proposer = make_eagle_proposer()
-        monkeypatch.setattr(
-            proposer.vllm_config.speculative_config, "enforce_eager", True
-        )
+        monkeypatch.setattr(eagle_module, "compile", lambda fn, **kwargs: fn)
+        monkeypatch.setattr(eagle_module, "build_process_group_dict", lambda: {})
+        proposer.runner = SimpleNamespace(compile_context=None, runtime_holder=None)
 
         def load_draft(self, target_model):
             assert self.supports_mm_inputs
@@ -720,9 +720,9 @@ class TestLoadModel:
         # is what lets an idle rank skip drafting altogether.
         self._stub_super_load_model(monkeypatch)
         proposer = make_eagle_proposer(num_speculative_tokens=1)
-        monkeypatch.setattr(
-            proposer.vllm_config.speculative_config, "enforce_eager", True
-        )
+        monkeypatch.setattr(eagle_module, "compile", lambda fn, **kwargs: fn)
+        monkeypatch.setattr(eagle_module, "build_process_group_dict", lambda: {})
+        proposer.runner = SimpleNamespace(compile_context=None, runtime_holder=None)
         proposer.load_model(target_model=object())
         assert proposer.draft_has_moe is False
 
@@ -733,23 +733,13 @@ class TestLoadModel:
         moe = mock.Mock(spec=eagle_module.MoERunner)
         self._stub_super_load_model(monkeypatch, modules=(object(), moe))
         proposer = make_eagle_proposer(num_speculative_tokens=1)
-        monkeypatch.setattr(
-            proposer.vllm_config.speculative_config, "enforce_eager", True
-        )
+        monkeypatch.setattr(eagle_module, "compile", lambda fn, **kwargs: fn)
+        monkeypatch.setattr(eagle_module, "build_process_group_dict", lambda: {})
+        proposer.runner = SimpleNamespace(compile_context=None, runtime_holder=None)
         proposer.load_model(target_model=object())
         assert proposer.draft_has_moe is True
 
-    def test_eager_wrapper_when_enforce_eager(self, monkeypatch):
-        self._stub_super_load_model(monkeypatch)
-        proposer = make_eagle_proposer(num_speculative_tokens=1)
-        monkeypatch.setattr(
-            proposer.vllm_config.speculative_config, "enforce_eager", True
-        )
-        proposer.load_model(target_model=object())
-        # eager path leaves the executable as the uncompiled wrapper closure.
-        assert proposer.model_executable.__name__ == "model_wrapper"
-
-    def test_compiles_wrapper_when_not_eager(self, monkeypatch):
+    def test_compiles_wrapper(self, monkeypatch):
         self._stub_super_load_model(monkeypatch)
         sentinel = object()
         captured: dict = {}
@@ -758,9 +748,6 @@ class TestLoadModel:
         )
         monkeypatch.setattr(eagle_module, "build_process_group_dict", lambda: {})
         proposer = make_eagle_proposer(num_speculative_tokens=1)
-        monkeypatch.setattr(
-            proposer.vllm_config.speculative_config, "enforce_eager", False
-        )
         proposer.runner = SimpleNamespace(
             compile_context=object(), runtime_holder=[None]
         )
@@ -770,8 +757,8 @@ class TestLoadModel:
         assert captured["fullgraph"] is True
         assert "compile_context" in captured
 
-    def test_eager_wrapper_composes_model_forward(self, monkeypatch):
-        # The eager wrapper runs the draft model, reshapes the hidden states,
+    def test_wrapper_composes_model_forward(self, monkeypatch):
+        # The wrapper runs the draft model, reshapes the hidden states,
         # keeps the sampled positions, and returns (hidden, in-graph argmax).
         from vllm.v1.spec_decode.eagle import EagleProposer
 
@@ -792,9 +779,9 @@ class TestLoadModel:
         )
         proposer = make_eagle_proposer(num_speculative_tokens=1)
         monkeypatch.setattr(proposer, "model_returns_tuple", lambda: False)
-        monkeypatch.setattr(
-            proposer.vllm_config.speculative_config, "enforce_eager", True
-        )
+        monkeypatch.setattr(eagle_module, "compile", lambda fn, **kwargs: fn)
+        monkeypatch.setattr(eagle_module, "build_process_group_dict", lambda: {})
+        proposer.runner = SimpleNamespace(compile_context=None, runtime_holder=None)
         proposer.load_model(target_model=object())
 
         h = proposer.hidden_size
@@ -823,9 +810,9 @@ class TestLoadModel:
         d2t = torch.tensor([0, 2, 3], dtype=torch.long, device=proposer.device)
         model = self._FakeMappedDraft(d2t)
         self._stub_super_load_model(monkeypatch, model)
-        monkeypatch.setattr(
-            proposer.vllm_config.speculative_config, "enforce_eager", True
-        )
+        monkeypatch.setattr(eagle_module, "compile", lambda fn, **kwargs: fn)
+        monkeypatch.setattr(eagle_module, "build_process_group_dict", lambda: {})
+        proposer.runner = SimpleNamespace(compile_context=None, runtime_holder=None)
         proposer.load_model(target_model=object())
 
         # Taking that branch at all depends on load_model lifting d2t off the

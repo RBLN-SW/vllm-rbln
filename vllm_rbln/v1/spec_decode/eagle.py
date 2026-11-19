@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -55,6 +56,8 @@ logger = init_logger(__name__)
 
 
 class RBLNEagleProposer(EagleProposer):
+    model_executable: Callable[..., tuple[torch.Tensor, torch.Tensor]]
+
     # A producer's warm-up stops after the first pass, which is prefill-shaped.
     warms_up_decode_graphs_on_a_producer = False
 
@@ -459,24 +462,21 @@ class RBLNEagleProposer(EagleProposer):
             return hidden_states, torch.ops.rbln.argmax(logits)
 
         rbln_config: RBLNConfig = self.vllm_config.additional_config
-        if self.vllm_config.speculative_config.enforce_eager:
-            self.model_executable = model_wrapper
-        else:
-            self.model_executable = compile(
-                model_wrapper,
-                dynamic=False,
-                fullgraph=True,
-                compile_context=self.runner.compile_context,
-                num_devices=1,
-                model_trace_method="export" if use_device_tensor() else "",
-                process_group_dict=build_process_group_dict(),
-                guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
-                runtime_holder=self.runner.runtime_holder,
-                mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
-                use_static_output=True,
-                use_direct_dispatch=True,
-                dtype=rbln_config.compile_dtype,
-            )
+        self.model_executable = compile(
+            model_wrapper,
+            dynamic=False,
+            fullgraph=True,
+            compile_context=self.runner.compile_context,
+            num_devices=1,
+            model_trace_method="export" if use_device_tensor() else "",
+            process_group_dict=build_process_group_dict(),
+            guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
+            runtime_holder=self.runner.runtime_holder,
+            mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
+            use_static_output=True,
+            use_direct_dispatch=True,
+            dtype=rbln_config.compile_dtype,
+        )
 
     def _build_dummy_attn_metadata(
         self,

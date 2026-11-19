@@ -384,12 +384,7 @@ class RBLNGemma4ForConditionalGeneration(
         """One image or video frame, `[num_patches, patch_pixels]` with `(-1, -1)`
         positions on its padding, to its soft token embeddings."""
         encoder = self._mm_encoder
-        if encoder is None:
-            # enforce_eager: the runner never calls compile_mm_encoder.
-            encoder = _RBLNGemma4VisionEncoder(
-                self.vision_tower, self.embed_vision
-            ).eval()
-            object.__setattr__(self, "_mm_encoder", encoder)
+        assert encoder is not None
         tower = self.vision_tower
         valid = (pixel_position_ids >= 0).all(dim=-1)
         num_patches = int(valid.sum())
