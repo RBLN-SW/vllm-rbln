@@ -1803,6 +1803,8 @@ class TestPublishHandshakeMetadata:
         base_meta=None,
         swa_kernel_blocks=frozenset(),
         slice_ids=None,
+        block_state_layers=(),
+        speculative_config=None,
     ):
         w = object.__new__(cls or RblnNixlPullConnectorWorker)
         w._kv_per_block = 1
@@ -1812,10 +1814,11 @@ class TestPublishHandshakeMetadata:
         # _check_pp_constraints reads these; a plain PP producer passes.
         w.vllm_config = mock_vllm_config()
         w.vllm_config.parallel_config.pipeline_parallel_size = pp_size
-        w.vllm_config.speculative_config = None
+        w.vllm_config.speculative_config = speculative_config
         w.transfer_topo = MagicMock()
         w.transfer_topo.cross_layers_blocks = cross_layers
         w._has_mamba = has_mamba
+        w._block_state_layers = set(block_state_layers)
         window_mode(w, None, has_swa=False)
         w._swa_kernel_blocks = set(swa_kernel_blocks)
         w.use_mla = False
@@ -1852,6 +1855,29 @@ class TestPublishHandshakeMetadata:
         with pytest.raises(RuntimeError, match="cross-layer-blocks"):
             self._publish(pp_rank=0, pp_size=2, layer_names=["l0"], cross_layers=True)
 
+    @pytest.mark.parametrize("block_state_layers", [("l0",), ()])
+    def test_the_block_drop_reaches_the_hash_with_block_state(self, block_state_layers):
+        def spec(drop):
+            cfg = MagicMock(method="eagle3")
+            cfg.draft_model_config.model = "draft"
+            cfg.draft_model_config.revision = None
+            cfg.draft_model_config.code_revision = None
+            cfg.use_eagle.return_value = True
+            cfg.use_eagle_block_drop.return_value = drop
+            return cfg
+
+        hashes = {
+            self._publish(
+                pp_rank=0,
+                pp_size=1,
+                layer_names=["l0"],
+                block_state_layers=block_state_layers,
+                speculative_config=spec(drop),
+            ).compat_hash
+            for drop in (True, False)
+        }
+        assert len(hashes) == (2 if block_state_layers else 1)
+
     def test_a_writer_publishes_the_write_path_hash(self):
         # The direction is a class fact, and the hash has to come from the class
         # that is running: a producer that writes must not present the hash a
@@ -1863,7 +1889,10 @@ class TestPublishHandshakeMetadata:
             cls=RblnNixlPushConnectorWorker,
         )
         assert w.compat_hash == rbln_compat_hash(
-            "BASE", writes_into_peer=True, cross_layers_blocks=False
+            "BASE",
+            writes_into_peer=True,
+            cross_layers_blocks=False,
+            exchanges_block_state=False,
         )
 
     def test_the_region_ledger_survives_the_re_wrap(self):
@@ -1980,7 +2009,10 @@ class TestPublishHandshakeMetadata:
         # compat hash folded with our version and direction, mirrored into the
         # payload. A read-path worker must publish the read-path hash.
         assert w.compat_hash == rbln_compat_hash(
-            "BASE", writes_into_peer=False, cross_layers_blocks=False
+            "BASE",
+            writes_into_peer=False,
+            cross_layers_blocks=False,
+            exchanges_block_state=False,
         )
         assert w.xfer_handshake_metadata.compatibility_hash == w.compat_hash
         decoded = msgspec.msgpack.Decoder(RblnNixlAgentMetadata).decode(
