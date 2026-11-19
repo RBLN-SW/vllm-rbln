@@ -33,6 +33,7 @@ from vllm.model_executor.models.qwen3_5 import (
     Qwen3_5ForConditionalGeneration,
     Qwen3_5ProcessingInfo,
 )
+from vllm.model_executor.models.qwen3_5_mtp import Qwen3_5MTP
 from vllm.model_executor.models.qwen3_vl import (
     Qwen3VLDummyInputsBuilder,
     Qwen3VLMultiModalProcessor,
@@ -341,3 +342,20 @@ class RBLNQwen3_5ForConditionalGeneration(
         return super().forward(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
+
+
+class RBLNQwen3_5MTP(Qwen3_5MTP):
+    """Upstream's drafter with its layers numbered past the target's: the runner
+    orders the KV caches by the number in a layer's name, one layer a number."""
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        layers = vllm_config.compilation_config.static_forward_context
+        start = self.model.mtp_start_layer_idx
+        for idx, layer in enumerate(self.model.layers):
+            attn = layer.self_attn.attn
+            del layers[attn.layer_name]
+            attn.layer_name = attn.layer_name.replace(
+                f".layers.{idx}.", f".layers.{start + idx}."
+            )
+            layers[attn.layer_name] = attn

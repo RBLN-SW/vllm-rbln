@@ -29,7 +29,7 @@ from vllm.v1.kv_cache_interface import MambaSpec, MLAAttentionSpec
 import vllm_rbln.v1.worker.rbln_model_runner as mr
 from tests.vllm.v1.worker.utils import make_kv_cache_config, schedule_new
 from vllm_rbln.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
-    RBLNGDNConvRingCache,
+    RBLNGDNBlockAuxCache,
     RBLNQwenGatedDeltaNetAttention,
 )
 from vllm_rbln.v1.attention.backends.gdn_attn import RBLNGDNAttentionMetadata
@@ -666,7 +666,8 @@ class TestGatedDeltaNetOnTheAttentionPool:
         runner, cache_config = _attention_and_gdn(
             make_model_runner, tmp_path, 256, self.ATTN, self.GDN
         )
-        # Two caches a decoder layer, as num_attn_module counts Qwen3.5's.
+        # Three cache slots a decoder layer, as num_attn_module counts Qwen3.5's;
+        # the draft one stays unbound here.
         monkeypatch.setattr(
             runner.model_config.hf_text_config,
             "model_type",
@@ -674,7 +675,7 @@ class TestGatedDeltaNetOnTheAttentionPool:
             raising=False,
         )
         with set_current_vllm_config(runner.vllm_config):
-            RBLNGDNConvRingCache(
+            RBLNGDNBlockAuxCache(
                 self.RING,
                 owner=self.GDN,
                 block_shape=(3, 1, 2, 64),
