@@ -25,6 +25,7 @@ from vllm.v1.sample.logits_processor.builtin import (
     MinPLogitsProcessor,
 )
 
+import vllm_rbln.compilation.backends as backends
 from vllm_rbln.v1.sample.ops.fused_penalty import (
     K_BUCKETS,
     FusedPenaltyState,
@@ -306,7 +307,7 @@ def test_min_p_reads_penalized_logits():
 
 @pytest.mark.use_device
 @pytest.mark.parametrize("min_p", [0.0, 0.05])
-def test_mixed_batch_reuses_the_warmed_fused_graph(min_p):
+def test_mixed_batch_reuses_the_warmed_fused_graph(min_p, monkeypatch):
     """A mixed batch builds temperature, top_k and top_p as step tensors. The
     fused graph warmed on batch buffers must take them without recompiling."""
     device = current_platform.device_type
@@ -319,17 +320,27 @@ def test_mixed_batch_reuses_the_warmed_fused_graph(min_p):
     mixed = build_input_batch(
         [(str(i), p) for i, p in enumerate([rand, greedy, rand, greedy])], **kw
     )
+    # torch-rbln compiles eager device ops with Dynamo as well, so a process-wide
+    # graph count also sees ops the step runs outside the sampler's graphs. Count
+    # only what the vllm-rbln backend compiles.
+    compiled = []
+    compile_graph = backends.rbln_torch_compile_backend
+
+    def record(graph, example_inputs, **kwargs):
+        compiled.append(graph)
+        return compile_graph(graph, example_inputs, **kwargs)
+
+    monkeypatch.setattr(backends, "rbln_torch_compile_backend", record)
     sampler = RBLNSampler()
     logits = _logits(4).to(device)
-    graphs = torch._dynamo.utils.counters["stats"]
     with torch.inference_mode():
         sampler(logits.clone(), warm.sampling_metadata, input_batch=warm)
-        before = graphs["unique_graphs"]
+        before = len(compiled)
         sampler(logits.clone(), mixed.sampling_metadata, input_batch=mixed)
     assert {key[0] for key in sampler._fused_graphs} == {
         "penalize" if min_p else "top_k_top_p"
     }
-    assert graphs["unique_graphs"] == before
+    assert 0 < before == len(compiled)
 
 
 # The weighted row: WEIGHTED[i] weighs i + 1. The heaviest tokens are the ones the
