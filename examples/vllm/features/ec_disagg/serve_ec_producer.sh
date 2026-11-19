@@ -24,7 +24,7 @@ BLOCK_SIZE="${BLOCK_SIZE:-8192}"
 IMAGE_LIMIT="${IMAGE_LIMIT:-1}"
 EC_CPU_BYTES="${EC_CPU_BYTES:-1073741824}"
 
-export RBLN_DEVICES="${RBLN_DEVICES:-5}"
+export RBLN_DEVICES="${RBLN_DEVICES:-0}"
 
 chat_args=()
 if [[ "$MODEL" == "google/gemma-4-26B-A4B" ]]; then

@@ -186,7 +186,13 @@ async def run(args) -> None:
                     prompt=trace["prompt"],
                     prompt_len=0,
                     expected_output_len=length,
-                    multi_modal_data=[{"type": "image_url", "image_url": {"url": url}}],
+                    multi_modal_data=[
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": url},
+                            "uuid": row["image_sha256"],
+                        }
+                    ],
                     request_id=row["id"],
                     timestamp=row["timestamp"],
                 )
