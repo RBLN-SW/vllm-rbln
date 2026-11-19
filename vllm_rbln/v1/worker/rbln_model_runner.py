@@ -1645,6 +1645,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         self,
         scheduler_output: RBLNSchedulerOutput,
         num_tokens: int,
+        shift_computed_tokens: int = 0,
     ) -> tuple[list[tuple[int, int, torch.Tensor]], torch.Tensor]:
         mm_rows: list[tuple[int, int, torch.Tensor]] = []
         is_mm = torch.zeros(num_tokens, dtype=torch.bool)
@@ -1653,7 +1654,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         for req_index, req_id in enumerate(self.input_batch.req_ids):
             num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
             req_state = self.requests[req_id]
-            num_computed_tokens = req_state.num_computed_tokens
+            num_computed_tokens = req_state.num_computed_tokens + shift_computed_tokens
 
             for mm_feature in req_state.mm_features:
                 pos_info = mm_feature.mm_position
@@ -2578,6 +2579,22 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 target_token_ids = self.input_ids[:total_num_tokens]
                 target_positions = self.positions[:total_num_tokens]
 
+            mm_kwargs: dict[str, Any] = {}
+            if self.supports_mm_inputs and self.drafter.supports_mm_inputs:
+                if self.is_prefill:
+                    mm_kwargs["mm_embed_inputs"] = self._gather_mm_embeddings(
+                        scheduler_output,
+                        target_token_ids.shape[0],
+                        shift_computed_tokens=(
+                            self.vllm_config.num_prefill_lookahead_tokens
+                        ),
+                    )
+                if self.drafter.uses_mrope:
+                    assert self.mrope_positions is not None
+                    mm_kwargs["target_mrope_positions"] = self.mrope_positions[
+                        :, : target_token_ids.shape[0]
+                    ]
+
             draft_token_ids = self.drafter.propose(
                 target_token_ids=target_token_ids,
                 target_positions=target_positions,
@@ -2585,8 +2602,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 next_token_ids=next_token_ids,
                 token_indices_to_sample=token_indices_to_sample,
                 common_attn_metadata=common_attn_metadata,
-                mm_embed_inputs=None,
                 num_rejected_tokens=num_rejected_tokens,
+                **mm_kwargs,
             )
 
         return draft_token_ids

@@ -88,6 +88,14 @@ def _image(width: int, height: int, num_patches: int):
     return pixels, positions
 
 
+def test_logits_processor_delegates_to_language_model():
+    processor = nn.Identity()
+    model = _bare_model(language_model=nn.Module())
+    model.language_model.logits_processor = processor
+
+    assert model.logits_processor is processor
+
+
 def test_the_vision_encoder_matches_hfs():
     # The encoder pads every image to its bucket and runs attention spelled out;
     # what comes back must be HF's soft tokens for the image alone.
