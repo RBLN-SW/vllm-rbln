@@ -19,6 +19,7 @@ from typing import ClassVar, Literal, Protocol, runtime_checkable
 
 from torch import nn
 from typing_extensions import TypeIs
+from vllm.model_executor.models.interfaces import supports_multimodal_embeddings
 
 
 @runtime_checkable
@@ -56,6 +57,13 @@ def supports_rbln_multimodal(model: object) -> TypeIs[SupportsRBLNMultiModal]:
     return getattr(model, "merges_mm_embeds_in_graph", False) is True
 
 
+def supports_rbln_multimodal_embeddings(model: object) -> bool:
+    # Scheduling needs the same opt-in before the draft is instantiated.
+    model_cls = model if isinstance(model, type) else type(model)
+    opted_in = getattr(model_cls, "supports_rbln_multimodal_embeddings", False) is True
+    return opted_in and supports_multimodal_embeddings(model_cls)
+
+
 @runtime_checkable
 class SupportsRBLNMmPrefix(Protocol):
     """An mm prefix LM (upstream's ``is_mm_prefix_lm``) the RBLN vLLM path serves.
@@ -79,4 +87,5 @@ __all__ = [
     "SupportsRBLNMultiModal",
     "supports_rbln_mm_prefix",
     "supports_rbln_multimodal",
+    "supports_rbln_multimodal_embeddings",
 ]

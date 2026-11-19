@@ -2387,6 +2387,149 @@ class TestEcConsumerEncodesNothing:
         assert request.status == RequestStatus.RUNNING
 
 
+class TestMultimodalDraftEncoderLookahead:
+    @staticmethod
+    def _scheduler(*, encoder_budget=None, cache_size=None, num_mtp_layers=None):
+        from vllm.v1.structured_output import StructuredOutputManager
+
+        from tests.vllm.vllm_config import make_vllm_config
+
+        config = make_vllm_config(
+            model="Qwen/Qwen3.5-4B",
+            max_model_len=8192,
+            max_num_seqs=1,
+            max_num_batched_tokens=128,
+            enable_prefix_caching=False,
+            limit_mm_per_prompt={"image": 2, "video": 0},
+            mm_processor_kwargs={"min_pixels": 1024, "max_pixels": 262144},
+            speculative_config={"method": "mtp", "num_speculative_tokens": 3},
+        )
+        if num_mtp_layers is not None:
+            hf_config = config.speculative_config.draft_model_config.hf_config
+            hf_config.num_nextn_predict_layers = num_mtp_layers
+        config.cache_config.num_gpu_blocks = 64
+        sched = RBLNScheduler(
+            vllm_config=config,
+            kv_cache_config=make_kv_cache_config([full_attention_spec(1024)], 64),
+            block_size=1024,
+            log_stats=True,
+            structured_output_manager=StructuredOutputManager(config),
+        )
+        if encoder_budget is not None:
+            sched.max_num_encoder_input_tokens = encoder_budget
+        if cache_size is not None:
+            sched.encoder_cache_manager = EncoderCacheManager(cache_size=cache_size)
+        return sched
+
+    @pytest.mark.parametrize("num_mtp_layers", [2, 3])
+    @pytest.mark.parametrize("draft_accepts_mm", [False, True])
+    def test_multi_module_limit_applies_only_to_multimodal_drafters(
+        self, monkeypatch, num_mtp_layers, draft_accepts_mm
+    ):
+        if not draft_accepts_mm:
+            from vllm_rbln.model_executor.models.glm5_next import RBLNGlm5NextMTP
+
+            monkeypatch.setattr(
+                rbln_scheduler,
+                "get_model_architecture",
+                lambda config: (RBLNGlm5NextMTP, "Glm5NextMTP"),
+            )
+        if draft_accepts_mm:
+            with pytest.raises(
+                NotImplementedError, match="num_prefill_lookahead_tokens=1"
+            ):
+                self._scheduler(num_mtp_layers=num_mtp_layers)
+        else:
+            sched = self._scheduler(num_mtp_layers=num_mtp_layers)
+            assert sched.num_prefill_lookahead == 3
+            assert sched.mm_prefill_lookahead == 0
+
+    @pytest.mark.parametrize("running", [False, True])
+    @pytest.mark.parametrize(
+        "draft_accepts_mm,draft_accepts_rbln_mm",
+        [(False, False), (False, True), (True, False), (True, True)],
+    )
+    @pytest.mark.parametrize("with_text_prefix", [False, True])
+    def test_encodes_an_image_starting_just_after_the_target_chunk(
+        self,
+        monkeypatch,
+        running,
+        draft_accepts_mm,
+        draft_accepts_rbln_mm,
+        with_text_prefix,
+    ):
+        from vllm_rbln.model_executor.models.qwen3_5 import RBLNQwen3_5MTP
+
+        monkeypatch.setattr(
+            RBLNQwen3_5MTP, "supports_multimodal_embeddings", draft_accepts_mm
+        )
+        monkeypatch.setattr(
+            RBLNQwen3_5MTP,
+            "supports_rbln_multimodal_embeddings",
+            draft_accepts_rbln_mm,
+            raising=False,
+        )
+        sched = self._scheduler()
+        offset = 256 if running else 128
+        feature = image_at(offset, 64)
+        if with_text_prefix:
+            feature.mm_position = PlaceholderRange(
+                offset=offset - 8,
+                length=72,
+                is_embed=torch.tensor([False] * 8 + [True] * 64),
+            )
+        request = make_request("image", list(range(384)), 1024, mm_features=[feature])
+        sched.add_request(request)
+        if running:
+            out = sched.schedule()
+            sched.update_from_output(out, make_model_runner_output(out))
+
+        out = sched.schedule()
+
+        assert out.num_scheduled_tokens == {"image": 128}
+        assert out.scheduled_encoder_inputs == (
+            {"image": [0]} if draft_accepts_mm and draft_accepts_rbln_mm else {}
+        )
+
+    def test_encoder_budget_backpressure_keeps_the_lookahead_available(self):
+        sched = self._scheduler(encoder_budget=64, cache_size=128)
+        request = make_request(
+            "images",
+            list(range(256)),
+            1024,
+            mm_features=[image_at(64, 64), image_at(128, 64)],
+        )
+        sched.add_request(request)
+
+        out = sched.schedule()
+        assert out.num_scheduled_tokens == {"images": 127}
+        assert out.scheduled_encoder_inputs == {"images": [0]}
+        sched.update_from_output(out, make_model_runner_output(out))
+        out = sched.schedule()
+        assert out.num_scheduled_tokens == {"images": 128}
+        assert out.scheduled_encoder_inputs == {"images": [1]}
+
+    @pytest.mark.parametrize("offset, first_length", [(0, 1), (64, 256)])
+    def test_adjacent_images_make_progress(self, offset, first_length):
+        sched = self._scheduler()
+        request = make_request(
+            "images",
+            list(range(640)),
+            1024,
+            mm_features=[
+                image_at(offset, first_length),
+                image_at(offset + first_length, 256),
+            ],
+        )
+        sched.add_request(request)
+
+        while request.num_computed_tokens < len(request.prompt_token_ids):
+            before = request.num_computed_tokens
+            out = sched.schedule()
+            assert out.num_scheduled_tokens.get("images", 0) > 0, before
+            sched.update_from_output(out, make_model_runner_output(out))
+
+
 def test_eagle_steps_through_adjacent_images_with_a_one_image_encoder_cache():
     """The drafter's look-ahead shifted the encoder window into the second image
     and deferred freeing the first, so with a cache that holds one image the

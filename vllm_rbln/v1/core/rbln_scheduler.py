@@ -22,6 +22,7 @@ from typing import Any
 
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
+from vllm.model_executor.model_loader.utils import get_model_architecture
 from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
@@ -48,6 +49,9 @@ from vllm_rbln.distributed.ec_transfer.ec_connector.rbln_ec_cpu_connector import
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import iter_kv_connectors
 from vllm_rbln.logger import init_logger
+from vllm_rbln.model_executor.models.interfaces import (
+    supports_rbln_multimodal_embeddings,
+)
 from vllm_rbln.v1.core.rbln_kv_cache_manager import (
     KVCacheCopyOp,
     RBLNKVCacheManager,
@@ -119,6 +123,44 @@ class RBLNScheduler(Scheduler):
         self.num_lookahead_tokens: int = max(
             self.num_lookahead_tokens, self.num_spec_tokens
         )
+
+        self.mm_prefill_lookahead = 0
+        if (
+            self.num_prefill_lookahead
+            and self.vllm_config.model_config.supports_multimodal_inputs
+        ):
+            spec = self.vllm_config.speculative_config
+            assert spec is not None
+            draft_cls, _ = get_model_architecture(spec.draft_model_config)
+            if supports_rbln_multimodal_embeddings(draft_cls):
+                self.mm_prefill_lookahead = self.num_prefill_lookahead
+
+        if self.mm_prefill_lookahead:
+            if self.mm_prefill_lookahead != 1:
+                raise NotImplementedError(
+                    "Multimodal drafting requires num_prefill_lookahead_tokens=1; "
+                    f"got {self.mm_prefill_lookahead}. Multi-module multimodal "
+                    "MTP is not supported."
+                )
+            # One-token lookahead can add a whole encoder item to the baseline
+            # demand. Each allowance already fits the largest item, so doubling
+            # provides a conservative bound.
+            encoder_compute_budget = self.max_num_encoder_input_tokens
+            self.max_num_encoder_input_tokens *= 2
+            manager = self.encoder_cache_manager
+            self.encoder_cache_manager = manager.create_manager(
+                cache_size=2 * manager.cache_size, vllm_config=self.vllm_config
+            )
+            logger.info(
+                "Multimodal draft prefill lookahead=%d: "
+                "max_num_encoder_input_tokens=%d -> %d, "
+                "encoder_cache_size=%d -> %d (embedding rows).",
+                self.mm_prefill_lookahead,
+                encoder_compute_budget,
+                self.max_num_encoder_input_tokens,
+                manager.cache_size,
+                self.encoder_cache_manager.cache_size,
+            )
 
         rbln_config: RBLNConfig = self.vllm_config.additional_config
 
@@ -466,9 +508,7 @@ class RBLNScheduler(Scheduler):
                     request.num_computed_tokens,
                     num_new_tokens,
                     encoder_compute_budget,
-                    # NOTE(RBLN): the drafter takes no mm embeddings, so EAGLE needs
-                    # no shifted encoder window.
-                    shift_computed_tokens=0,
+                    shift_computed_tokens=self.mm_prefill_lookahead,
                 )
 
             if self.need_mamba_block_aligned_split:
@@ -874,9 +914,7 @@ class RBLNScheduler(Scheduler):
                             num_computed_tokens,
                             num_new_tokens,
                             encoder_compute_budget,
-                            # NOTE(RBLN): the drafter takes no mm
-                            # embeddings, so EAGLE needs no shifted encoder window.
-                            shift_computed_tokens=0,
+                            shift_computed_tokens=self.mm_prefill_lookahead,
                         )
                         if num_new_tokens == 0:
                             # The request cannot be scheduled.
@@ -1367,8 +1405,8 @@ class RBLNScheduler(Scheduler):
         )
 
     def _free_encoder_inputs(self, request: Request) -> None:
-        # NOTE(RBLN): upstream defers the free by the drafter's look-ahead, but
-        # the RBLN drafter reads no mm embeddings.
+        # Drafting finishes before the scheduler processes the step's output;
+        # retain each item until the target has also consumed it.
         if self.is_encoder_decoder:
             super()._free_encoder_inputs(request)
             return

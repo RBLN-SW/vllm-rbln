@@ -125,6 +125,7 @@ def _build_with_token_budgets(
 
     def init(self, *, vllm_config, prefix="model"):
         torch.nn.Module.__init__(self)
+        self.config = SimpleNamespace(image_token_id=0)
         self.visual = SimpleNamespace(spatial_merge_size=MERGE)
 
     monkeypatch.setattr(qwen3_5.Qwen3_5ForConditionalGeneration, "__init__", init)
