@@ -61,7 +61,7 @@ from vllm_rbln.v1.core.utils import (
     should_defer_spec_step,
     sub_block_size_in_use,
 )
-from vllm_rbln.v1.kv_cache import RBLNMambaManager, state_boundary_is_reachable
+from vllm_rbln.v1.kv_cache import RBLNMambaManager
 
 logger = init_logger(__name__)
 
@@ -198,8 +198,8 @@ class RBLNScheduler(Scheduler):
         self._is_mm_prefix_lm = self.vllm_config.model_config.is_mm_prefix_lm
 
         # NOTE(RBLN): a prompt's block-boundary state is kept by a producer and
-        # allocated by a consumer only where the connector exchanges it and a
-        # prefix lookup can land on it. The connector may sit in a MultiConnector.
+        # allocated by a consumer only where the connector exchanges it. The
+        # connector may sit in a MultiConnector.
         sends_state_boundary = self.connector is not None and any(
             getattr(
                 getattr(leaf, "connector_scheduler", None),
@@ -214,7 +214,7 @@ class RBLNScheduler(Scheduler):
                 for manager in self.kv_cache_manager.coordinator.single_type_managers
                 if isinstance(manager, RBLNMambaManager)
             ]
-            if sends_state_boundary and state_boundary_is_reachable(self.vllm_config)
+            if sends_state_boundary
             else []
         )
 
