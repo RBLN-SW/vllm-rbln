@@ -57,7 +57,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.push_scheduler 
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.push_worker import (
     RblnNixlPushConnectorWorker,
 )
-from vllm_rbln.v1.kv_cache import REMOTE_STATE_BOUNDARY
+from vllm_rbln.v1.kv_cache import REMOTE_STATE_BOUNDARY, UNTRUNCATED_PROMPT_LENGTH
 
 
 @dataclass
@@ -91,6 +91,20 @@ class _Request:
         default_factory=lambda: {"do_remote_decode": True}
     )
     prompt_token_ids: list = field(default_factory=list)
+
+
+def _producer_request(num_prompt_tokens):
+    """A finished producer request, its prompt truncated by the last token."""
+    return _Request(
+        "p",
+        num_prompt_tokens=num_prompt_tokens - 1,
+        num_computed_tokens=num_prompt_tokens - 1,
+        status=RequestStatus.FINISHED_LENGTH_CAPPED,
+        kv_transfer_params={
+            "do_remote_decode": True,
+            UNTRUNCATED_PROMPT_LENGTH: num_prompt_tokens,
+        },
+    )
 
 
 def _sched_output(
@@ -383,16 +397,24 @@ class TestRequestFinished:
 
 
 class TestStateBoundaryExchange:
-    """A single-state SSM group also exchanges the block-boundary state held in
-    the slot before the running one: an attention group, then an SSM group."""
+    """A single-state SSM group also exchanges the block-boundary state a repeat
+    of the prompt can hit: an attention group, then an SSM group."""
 
     @staticmethod
-    def _scheduler(cls=RblnNixlPullConnectorScheduler, push_boundary_state=False):
+    def _scheduler(
+        cls=RblnNixlPullConnectorScheduler,
+        push_boundary_state=False,
+        drops_eagle_block=None,
+    ):
         sched = _scheduler(cls=cls)
         sched._shape = shape(
             writes_into_peer=cls._writes_into_peer,
             push_boundary_state=push_boundary_state,
         )
+        if drops_eagle_block is not None:
+            sched.vllm_config.speculative_config = SimpleNamespace(
+                use_eagle_block_drop=lambda: drops_eagle_block
+            )
         sched._is_hma_required = True
         sched._has_mamba = True
         sched._ssm_state_slots_are_positional = False
@@ -500,7 +522,7 @@ class TestStateBoundaryExchange:
         coord = mamba._coordinator()
         if writer.sends_state_boundary:  # `RBLNScheduler`'s gate
             coord.single_type_managers[1].track_transfer(
-                mamba._request("p", {"do_remote_decode": True}), 0, 0
+                mamba._request("p", mamba._producer_params()), 0, 0
             )
         for computed, end in ((0, 16), (16, 32), (32, 36), (36, 40)):
             coord.remove_skipped_blocks("p", computed, 40)
@@ -533,10 +555,7 @@ class TestStateBoundaryExchange:
     ):
         sched = self._scheduler(RblnNixlPushConnectorScheduler, True)
         sched._stop_heartbeat = lambda _req_id: None
-        req = _Request(
-            "p", num_prompt_tokens=num_tokens, num_computed_tokens=num_tokens
-        )
-        req.status = RequestStatus.FINISHED_LENGTH_CAPPED
+        req = _producer_request(num_tokens + 1)
 
         delay, params = sched.request_finished(req, ([1, 2, 3], ssm_blocks))
 
@@ -584,6 +603,35 @@ class TestStateBoundaryExchange:
 
         RblnNixlPushConnectorScheduler(config, "eng", _kv_config([MagicMock()]))
 
+    @pytest.mark.parametrize(
+        ("cls", "push_boundary_state"),
+        [
+            (RblnNixlPullConnectorScheduler, False),
+            (RblnNixlPushConnectorScheduler, True),
+        ],
+    )
+    def test_a_producer_records_its_prompt_length_before_the_truncation(
+        self, cls, push_boundary_state
+    ):
+        # `RBLNMambaManager.track_transfer` reads it on either transfer path.
+        sched = self._scheduler(cls, push_boundary_state=push_boundary_state)
+        params: dict = {"do_remote_decode": True}
+        req = SimpleNamespace(
+            request_id="p",
+            kv_transfer_params=params,
+            num_prompt_tokens=40,
+            prompt_token_ids=list(range(40)),
+            _all_token_ids=list(range(40)),
+            max_tokens=16,
+        )
+
+        # Called again after a preemption, which must not overwrite it.
+        sched.on_new_request(req)
+        sched.on_new_request(req)
+
+        assert req.num_prompt_tokens == 39
+        assert params[UNTRUNCATED_PROMPT_LENGTH] == 40
+
     def test_a_consumer_pulls_into_its_boundary_block(self):
         # The consumer reaches the clip through upstream's entry point.
         sched = self._scheduler()
@@ -605,14 +653,30 @@ class TestStateBoundaryExchange:
 
         assert sched._reqs_need_recv["d"][1] == ([4, 5, 6], [3, 9])
 
-    def test_a_block_drop_exchanges_the_running_state_alone(self):
-        # Under an EAGLE / MTP block drop no lookup lands on the boundary.
-        sched = self._scheduler()
-        sched.vllm_config.speculative_config = SimpleNamespace(
-            use_eagle_block_drop=lambda: True
-        )
-        clipped = sched.get_exchange_clipped_blocks(([1, 2, 3], [0, 7, 8]))
-        assert clipped == ([1, 2, 3], [8])
+    # The producer holds the prompt less its last token, while a repeat looks
+    # up from the whole prompt; the block is picked by slot, so a superseded or
+    # freed one in between never stands in for it.
+    @pytest.mark.parametrize(
+        ("num_prompt_tokens", "ssm_blocks", "sent", "boundary"),
+        [
+            (40, [6, 0, 8], [6, 8], 16),
+            (40, [6, 7, 8], [6, 8], 16),
+            (40, [0, 7, 8], [8], None),
+            (49, [6, 7, 8], [7, 8], 32),
+            (33, [7, 8], [7, 8], 16),
+            (32, [7, 8], [8], None),
+        ],
+    )
+    def test_an_eagle_producer_names_the_boundary_before_the_drop(
+        self, num_prompt_tokens, ssm_blocks, sent, boundary
+    ):
+        sched = self._scheduler(drops_eagle_block=True)
+        req = _producer_request(num_prompt_tokens)
+
+        delay, params = sched.request_finished(req, ([1, 2, 3], ssm_blocks))
+        assert delay is True
+        assert params["remote_block_ids"][1] == sent
+        assert params.get(REMOTE_STATE_BOUNDARY) == boundary
 
     @pytest.mark.parametrize(
         ("cls", "push_boundary_state", "sends"),
@@ -628,23 +692,22 @@ class TestStateBoundaryExchange:
         sched = self._scheduler(cls, push_boundary_state=push_boundary_state)
         assert sched.sends_state_boundary is sends
 
+    # No speculation, or MTP with the block drop disabled.
+    @pytest.mark.parametrize("drops_eagle_block", [None, False])
     @pytest.mark.parametrize(
-        ("num_tokens", "ssm_blocks", "sent", "boundary"),
+        ("num_prompt_tokens", "ssm_blocks", "sent", "boundary"),
         [
-            (39, [0, 7, 8], [7, 8], 32),
-            (39, [0, 0, 8], [8], None),
+            (40, [0, 7, 8], [7, 8], 32),
+            (40, [0, 0, 8], [8], None),
             # Block-aligned: block 1 is the boundary state, block 0 superseded.
-            (32, [7, 8], [8], None),
+            (33, [7, 8], [8], None),
         ],
     )
     def test_producer_names_the_boundary_it_sends(
-        self, num_tokens, ssm_blocks, sent, boundary
+        self, drops_eagle_block, num_prompt_tokens, ssm_blocks, sent, boundary
     ):
-        sched = self._scheduler()
-        req = _Request(
-            "p", num_prompt_tokens=num_tokens, num_computed_tokens=num_tokens
-        )
-        req.status = RequestStatus.FINISHED_LENGTH_CAPPED
+        sched = self._scheduler(drops_eagle_block=drops_eagle_block)
+        req = _producer_request(num_prompt_tokens)
 
         delay, params = sched.request_finished(req, ([1, 2, 3], ssm_blocks))
         assert delay is True

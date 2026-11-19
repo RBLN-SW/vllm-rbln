@@ -14,8 +14,9 @@
 
 """The RBLN GatedDeltaNet layer's physical state spec and KV cache.
 Its forward tracks the HF reference across
-a padded prefill chunk, a continued chunk and a decode step on that block. The
-custom ops run their CPU bodies here, so no NPU is needed."""
+a padded prefill chunk, a continued chunk and a decode step on that block, and
+its MTP verify steps track one-token decode steps. The custom ops run their CPU
+bodies here, so no NPU is needed."""
 
 from types import SimpleNamespace
 
@@ -78,6 +79,8 @@ def _layer():
         head_v_dim=HEAD_DIM,
         conv_kernel_size=KERNEL,
         conv_dim=CONV_DIM,
+        num_spec=0,
+        drafts=None,
     )
     layer.in_proj_qkvz = _Proj(HIDDEN, CONV_DIM + VALUE_DIM, bias=False)
     layer.in_proj_ba = _Proj(HIDDEN, 2 * HEADS_V, bias=False)
@@ -174,8 +177,9 @@ def _run(
     is_prefill,
     pad,
     shared_binding,
+    **window,
 ):
-    metadata = builder.build(common, positions, pad, is_prefill)
+    metadata = builder.build(common, positions, pad, is_prefill, **window)
     bases = [state] if shared_binding else []
     infos = (
         [KVCacheViewInfo(base_index=0, view_shape=tuple(state.shape))]
@@ -283,6 +287,177 @@ def test_padded_prefill_then_decode_tracks_hf(
     assert not ring[BLOCK - 1].any() and not ring[BLOCK + 1].any()
 
 
+@pytest.mark.use_device
+def test_mtp_adds_a_verify_only_draft_buffer(monkeypatch):
+    # The layer as the model builds it; upstream's constructor puts parameters
+    # on the device.
+    import vllm.distributed.parallel_state as parallel_state
+
+    config = make_vllm_config(block_size=256, dtype="bfloat16")
+    text = config.model_config.hf_text_config
+    text.linear_num_key_heads = HEADS_K
+    text.linear_num_value_heads = HEADS_V
+    text.linear_key_head_dim = text.linear_value_head_dim = HEAD_DIM
+    text.linear_conv_kernel_dim = KERNEL
+    config.speculative_config = SimpleNamespace(num_speculative_tokens=2)
+    monkeypatch.setattr(
+        config.model_config, "_architecture", "Qwen3_5ForConditionalGeneration"
+    )
+    monkeypatch.setattr(
+        parallel_state, "_TP", SimpleNamespace(world_size=1, rank_in_group=0)
+    )
+    with set_current_vllm_config(config):
+        RBLNQwenGatedDeltaNetAttention(text, config, PREFIX)
+    specs = {
+        name.removeprefix(PREFIX): module.get_aux_cache_spec(config)
+        for name, module in config.compilation_config.static_forward_context.items()
+        if hasattr(module, "get_aux_cache_spec")
+    }
+    ring, drafts = specs[".conv_ring"], specs[".drafts"]
+    # The ring holds the two drafts beside the taps.
+    assert ring.block_shape == (KERNEL - 1 + 2, 1, CONV_DIM // 64, 64)
+    assert (ring.prefix_cacheable, ring.verify_only) == (True, False)
+    # Only a verify step reads the drafts, and a prefix resuming at a block
+    # boundary replays none.
+    assert drafts.block_shape == (HEADS_K, 2 * (HEADS_V // HEADS_K) + 1, 2, HEAD_DIM)
+    assert (drafts.prefix_cacheable, drafts.verify_only) == (False, True)
+
+
+def _decoded(vllm_config, num_drafts: int, windows, monkeypatch, shared_binding):
+    """A 70-token prefill, then `windows` of (tokens, position, valid tokens,
+    drafts of the window before that were accepted) on a bfloat16 layer, the
+    16-bit activations the verify kernel takes. Returns each window's outputs
+    and the state it left."""
+    layer = _layer()
+    # A slow decay, so a token missing from the state shows.
+    layer.A_log = torch.full((HEADS_V,), -3.0)
+    dtype = torch.bfloat16
+    with set_current_vllm_config(vllm_config):
+        kv_block = RBLNFlashAttentionBackend.get_kv_cache_shape(1, 256, 1, 128)[1:]
+    state = torch.zeros(NUM_BLOCKS, *kv_block, dtype=dtype)
+    ring = torch.zeros(
+        NUM_BLOCKS, KERNEL - 1 + num_drafts, 1, CONV_DIM // 64, 64, dtype=dtype
+    )
+    device_layer = _grouped(layer, ring, monkeypatch)
+    for name in ("in_proj_qkvz", "in_proj_ba", "norm", "out_proj"):
+        getattr(device_layer, name).to(dtype)
+    device_layer.conv1d.weight = device_layer.conv1d.weight.to(dtype)
+    device_layer.num_spec = num_drafts
+    if num_drafts:
+        ratio = HEADS_V // HEADS_K
+        drafts = torch.zeros(
+            NUM_BLOCKS, HEADS_K, 2 * ratio + 1, num_drafts, HEAD_DIM, dtype=dtype
+        )
+        device_layer.drafts = SimpleNamespace(inputs=lambda: drafts)
+    vllm_config.compilation_config.static_forward_context[PREFIX] = device_layer
+    # The builder holds a decode step to one token and the drafts.
+    vllm_config.speculative_config = (
+        SimpleNamespace(num_speculative_tokens=num_drafts) if num_drafts else None
+    )
+    spec = MambaSpec(
+        block_size=vllm_config.model_config.max_model_len,
+        shapes=(kv_block,),
+        dtypes=(dtype,),
+    )
+    with set_current_vllm_config(vllm_config):
+        builder = RBLNGDNAttentionMetadataBuilder(
+            spec, [PREFIX], vllm_config, torch.device("cpu")
+        )
+    torch.manual_seed(1)
+    hidden = torch.zeros(1, 128, HIDDEN, dtype=dtype)
+    hidden[:, :70] = torch.randn(1, 70, HIDDEN)
+    _run(
+        device_layer,
+        vllm_config,
+        builder,
+        state,
+        hidden,
+        _common(70, 70),
+        torch.arange(128),
+        True,
+        1,
+        shared_binding,
+    )
+    outputs, states = [], []
+    for tokens, position, valid, accepted in windows:
+        width = tokens.shape[0]
+        hidden = torch.zeros(2, width, HIDDEN, dtype=dtype)
+        hidden[0] = tokens
+        window = {}
+        if num_drafts:
+            window = {
+                "back_pad": torch.tensor([width - valid]),
+                "num_accepted": torch.tensor([accepted]),
+            }
+        out = _run(
+            device_layer,
+            vllm_config,
+            builder,
+            state,
+            hidden,
+            _common(width, position + valid),
+            torch.arange(position, position + width),
+            False,
+            2,
+            shared_binding,
+            **window,
+        )
+        outputs.append(out[0].float())
+        states.append(state[BLOCK].float())
+    return outputs, states
+
+
+@pytest.mark.parametrize("shared_binding", [False, True])
+def test_verify_steps_stand_for_the_decode_steps_of_their_accepted_tokens(
+    monkeypatch, shared_binding
+):
+    """An MTP step takes a confirmed token and two drafts, keeps the state
+    after the confirmed token only and replays the accepted drafts on the next
+    step, so a rejected draft leaves no trace in the state or the conv ring."""
+    vllm_config = make_vllm_config(
+        model="JackFram/llama-68m",
+        max_model_len=2048,
+        max_num_batched_tokens=128,
+        max_num_seqs=2,
+        dtype="bfloat16",
+    )
+    torch.manual_seed(2)
+    x = torch.randn(8, HIDDEN)
+    wrong = torch.randn(2, HIDDEN)
+    pad = torch.zeros(HIDDEN)
+    plain, plain_states = _decoded(
+        vllm_config,
+        0,
+        [(x[i : i + 1], 70 + i, 1, 0) for i in range(8)],
+        monkeypatch,
+        shared_binding,
+    )
+    verified, verified_states = _decoded(
+        vllm_config,
+        2,
+        [
+            # The first decode step carries no draft.
+            (torch.stack([x[0], pad, pad]), 70, 1, 0),
+            # x[2] is accepted, the draft after it rejected.
+            (torch.stack([x[1], x[2], wrong[0]]), 71, 3, 0),
+            # Both of this window's drafts are accepted: the next one replays
+            # the whole draft buffer.
+            (torch.stack([x[3], x[4], x[5]]), 73, 3, 1),
+            (torch.stack([x[6], x[7], wrong[1]]), 76, 3, 2),
+        ],
+        monkeypatch,
+        shared_binding,
+    )
+    close = {"atol": 1e-2, "rtol": 0}
+    torch.testing.assert_close(verified[0][:1], plain[0], **close)
+    torch.testing.assert_close(verified[1][:2], torch.cat(plain[1:3]), **close)
+    torch.testing.assert_close(verified[2], torch.cat(plain[3:6]), **close)
+    torch.testing.assert_close(verified[3][:2], torch.cat(plain[6:8]), **close)
+    # The state after x[0], x[1], x[3] and x[6]: each window's confirmed token.
+    for window, step in enumerate((0, 1, 3, 6)):
+        torch.testing.assert_close(verified_states[window], plain_states[step], **close)
+
+
 class TestStateSpec:
     """State specs describe the physical KV page used by the runner."""
 
@@ -311,6 +486,22 @@ class TestStateSpec:
         spec = layer.get_kv_cache_spec(config)
         assert spec.shapes == ((2, 4, 1, 1024, 256),)
         assert spec.real_page_size_bytes == spec.page_size_bytes
+
+    def test_the_state_takes_no_block_a_draft(self):
+        layer = self._layer()
+        vllm_config = SimpleNamespace(
+            cache_config=SimpleNamespace(
+                mamba_block_size=8192,
+                mamba_page_size_padded=None,
+                mamba_cache_mode="none",
+                use_kda_recoverssm=False,
+            ),
+            num_speculative_tokens=3,
+            additional_config=RBLNConfig(),
+        )
+        # Upstream keeps a state block a draft; the RBLN verify kernel keeps the
+        # drafts in the layer's draft buffer instead.
+        assert layer.get_kv_cache_spec(vllm_config).num_speculative_blocks == 0
 
     def test_model_state_sizing_uses_valid_shape(self):
         layer = self._layer()

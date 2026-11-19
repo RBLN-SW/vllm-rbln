@@ -44,8 +44,8 @@ class RblnNixlPullConnectorScheduler(RblnNixlSchedulerBase, NixlPullConnectorSch
             or not self._has_mamba
         ):
             return delay_free_blocks, params
-        remote_block_ids, boundary = self._drop_superseded_states(
-            request.num_computed_tokens, params["remote_block_ids"]
+        remote_block_ids, boundary = self._select_boundary_states(
+            request, block_ids, params["remote_block_ids"]
         )
         params["remote_block_ids"] = remote_block_ids
         if boundary is not None:

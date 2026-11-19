@@ -14,7 +14,7 @@
 
 # Speculative decoding is a pure optimization: drafts are verified against the
 # target, so greedy output with a method ON must equal spec OFF. Covers ngram,
-# suffix, eagle, eagle3 and medusa.
+# suffix, eagle, eagle3, medusa and mtp.
 
 import warnings
 from typing import Any
@@ -36,7 +36,11 @@ from tests.vllm.vllm_config import local_weights_path
 # A small, compilable target for the draft-free methods; ngram/suffix speculate
 # by matching repeats, so the prompt is deliberately repetitive.
 _NGRAM_TARGET = "meta-llama/Llama-3.2-1B-Instruct"
-PROMPT = "The quick brown fox jumps over the lazy dog. " * 20
+_SENTENCE = "The quick brown fox jumps over the lazy dog. "
+PROMPT = _SENTENCE * 20
+# 251 tokens for Qwen3.5: the generated ones cross from the first 256-token
+# block, where a GatedDeltaNet state lives, into the second.
+_MTP_PROMPT = _SENTENCE * 25
 MAX_TOKENS = 16
 NUM_LOGPROBS = 5
 
@@ -88,20 +92,43 @@ SPEC_METHODS: dict[str, tuple[str, dict[str, Any], dict[str, Any]]] = {
         {"max_model_len": 2048},
         {"method": "medusa", "model": MEDUSA_DRAFT, "num_speculative_tokens": 3},
     ),
+    # The target's own MTP head; text-only, at the block size a GatedDeltaNet
+    # state fills a full-attention page. The runner's block count does not
+    # model a GatedDeltaNet group, so the engine sizes the pool itself.
+    "mtp": (
+        "Qwen/Qwen3.5-4B",
+        {
+            "language_model_only": True,
+            "block_size": 256,
+            "num_gpu_blocks_override": None,
+        },
+        {"method": "mtp", "num_speculative_tokens": 3},
+    ),
 }
 
 # Methods whose draft path should land accepted tokens on the repetitive prompt.
 # medusa is excluded: its only small ungated checkpoint is random-init, so
 # acceptance there would measure model quality, not the code path.
-_EXPECT_ACCEPTANCE = {"ngram", "suffix", "eagle", "eagle3"}
+_EXPECT_ACCEPTANCE = {"ngram", "suffix", "eagle", "eagle3", "mtp"}
 
 
 @pytest.fixture(autouse=True)
-def _pin_aux_layers(request, monkeypatch):
+def _pin_layers(request, monkeypatch):
     from vllm_rbln import envs
 
+    method = request.node.callspec.params["method"]
     num_layers = envs.VLLM_RBLN_NUM_HIDDEN_LAYERS
-    if request.node.callspec.params["method"] != "eagle3" or num_layers == 0:
+    if method == "mtp" and 0 < num_layers < 8:
+        # TODO(rebel-compiler): the compiler's layer rolling
+        # (RblnTensorUnrollLayerLoop) rejects Qwen3.5 truncated to its first
+        # three layers, all GatedDeltaNet, or to one period of four. Two roll.
+        warnings.warn(
+            f"mtp needs two periods of Qwen3.5's layers: raising "
+            f"VLLM_RBLN_NUM_HIDDEN_LAYERS from {num_layers} to 8",
+            stacklevel=2,
+        )
+        monkeypatch.setenv("VLLM_RBLN_NUM_HIDDEN_LAYERS", "8")
+    if method != "eagle3" or num_layers == 0:
         return
 
     if num_layers < 3:
@@ -129,6 +156,7 @@ def test_speculative_decoding_matches_reference(
     target, extra_kwargs, spec_config = SPEC_METHODS[method]
     if draft := spec_config.get("model"):
         spec_config = {**spec_config, "model": local_weights_path(draft)}
+    prompt = _MTP_PROMPT if method == "mtp" else PROMPT
 
     # The reference sampler, on both runs: the RBLN one compiles a graph of its
     # own, and acceptance is being compared, not sampler implementations.
@@ -142,7 +170,7 @@ def test_speculative_decoding_matches_reference(
         target, **extra_kwargs, additional_config=reference_sampler
     ) as ref_model:
         ref_outputs = ref_model.generate_greedy_logprobs(
-            [PROMPT], MAX_TOKENS, NUM_LOGPROBS
+            [prompt], MAX_TOKENS, NUM_LOGPROBS
         )
 
     with vllm_runner(
@@ -152,7 +180,7 @@ def test_speculative_decoding_matches_reference(
         additional_config=reference_sampler,
     ) as spec_model:
         spec_outputs = spec_model.generate_greedy_logprobs(
-            [PROMPT], MAX_TOKENS, NUM_LOGPROBS
+            [prompt], MAX_TOKENS, NUM_LOGPROBS
         )
         # Read while the engine is alive (__exit__ shuts down the EngineCore).
         accepted = spec_model.spec_decode_accepted_tokens()

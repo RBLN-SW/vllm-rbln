@@ -104,13 +104,18 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
             for i, group in enumerate(self.kv_cache_config.transfer_groups)
             if self._ssm_spec_blocks[i] is not None
         }
-        num_tokens = num_computed_tokens + count
-        if prompt_boundary_block(num_tokens, block_size) is not None:
+        block_idx = prompt_boundary_block(
+            request.num_prompt_tokens,
+            num_computed_tokens + count,
+            block_size,
+            self._drops_eagle_block,
+        )
+        if block_idx is not None:
             # Upstream loads asynchronously only for a `do_remote_prefill` one.
             assert request.kv_transfer_params is not None
             request.kv_transfer_params[REMOTE_STATE_BOUNDARY] = (
-                num_tokens // block_size * block_size
-            )
+                block_idx + 1
+            ) * block_size
         return count, load_async
 
     def update_state_after_alloc(
@@ -276,10 +281,10 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
                 # Upstream files one clipped list in three places; a consumer
                 # registering a boundary state pairs only with the true one.
                 assert out_params is not None
-                block_ids, _ = self._drop_superseded_states(
-                    request.num_computed_tokens, out_params["remote_block_ids"]
+                sent, _ = self._select_boundary_states(
+                    request, block_ids, out_params["remote_block_ids"]
                 )
-                out_params["remote_block_ids"] = block_ids
-                self._finished_request_blocks[request.request_id] = block_ids
-                self._newly_finished_push_blocks[request.request_id] = block_ids
+                out_params["remote_block_ids"] = sent
+                self._finished_request_blocks[request.request_id] = sent
+                self._newly_finished_push_blocks[request.request_id] = sent
         return delay_free_blocks, out_params

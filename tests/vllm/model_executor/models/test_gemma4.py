@@ -31,6 +31,7 @@ from vllm.model_executor.models.gemma4_mm import Gemma4ForConditionalGeneration
 
 import vllm_rbln.model_executor.models.gemma4 as gemma4
 from vllm_rbln.compilation.compiler import compile, mark_decoder_regions
+from vllm_rbln.config import RBLNConfig
 from vllm_rbln.model_executor.models.gemma4 import RBLNGemma4ForConditionalGeneration
 from vllm_rbln.v1.attention.backends.flash_attention import RBLNFlashAttentionMetadata
 
@@ -206,7 +207,9 @@ def test_warm_up_runs_every_bucket_once_full():
     assert calls == [(18, 18), (45, 45), (90, 90)]
 
 
-def _built_model(monkeypatch, *, cap, budgets, per_layer_input=0, attention_layers=()):
+def _built_model(
+    monkeypatch, *, cap, budgets, chunk=512, per_layer_input=0, attention_layers=()
+):
     """The model as construction resolves it, upstream's model left out."""
 
     def upstream_init(self, **kwargs):
@@ -242,7 +245,9 @@ def _built_model(monkeypatch, *, cap, budgets, per_layer_input=0, attention_laye
                     )
                 ),
             ),
-            additional_config=SimpleNamespace(encoder_token_budgets=budgets),
+            additional_config=RBLNConfig(
+                encoder_token_budgets=budgets, prefill_chunk_size=[chunk]
+            ),
         )
     )
     return model
@@ -274,6 +279,18 @@ def test_the_encoder_buckets_follow_encoder_token_budgets(
 ):
     model = _built_model(monkeypatch, cap=280, budgets=budgets)
     assert model.mm_encoder_patch_buckets == buckets
+
+
+def test_unset_budgets_follow_the_prefill_chunk_not_the_cap(monkeypatch):
+    model = _built_model(monkeypatch, cap=280, budgets=[], chunk=2048)
+    assert model.mm_encoder_patch_buckets == [
+        budget * 9 for budget in (70, 140, 280, 560, 1120)
+    ]
+
+
+def test_a_cap_above_the_prefill_chunk_is_refused_with_unset_budgets(monkeypatch):
+    with pytest.raises(ValueError, match="must reach max_soft_tokens=560"):
+        _built_model(monkeypatch, cap=560, budgets=[], chunk=512)
 
 
 def test_the_longest_range_is_the_cap_not_the_largest_budget(monkeypatch):
