@@ -31,6 +31,7 @@ from vllm.model_executor.models.gemma4_mm import Gemma4ForConditionalGeneration
 
 import vllm_rbln.model_executor.models.gemma4 as gemma4
 from vllm_rbln.compilation.compiler import compile, mark_decoder_regions
+from vllm_rbln.config import RBLNConfig
 from vllm_rbln.model_executor.models.gemma4 import RBLNGemma4ForConditionalGeneration
 from vllm_rbln.v1.attention.backends.flash_attention import RBLNFlashAttentionMetadata
 
@@ -244,8 +245,8 @@ def _built_model(
                     )
                 ),
             ),
-            additional_config=SimpleNamespace(
-                encoder_token_budgets=budgets, max_prefill_chunk_size=chunk
+            additional_config=RBLNConfig(
+                encoder_token_budgets=budgets, prefill_chunk_size=[chunk]
             ),
         )
     )
