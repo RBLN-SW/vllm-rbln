@@ -1064,6 +1064,8 @@ class RBLNGlm5NextModel(nn.Module):
             batch, tokens, _ = flat.shape
             streams = flat.view(batch, tokens, self.n, -1).transpose(1, 2).contiguous()
         dtype = streams.dtype
+        if is_prefill_step():
+            streams = streams.float()
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             streams = layer(streams)
         # A prefill chunk keeps the streams fp32 between sublayers (bf16 values).

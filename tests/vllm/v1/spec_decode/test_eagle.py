@@ -35,7 +35,7 @@ import vllm_rbln.v1.spec_decode.eagle as eagle_module
 from tests.vllm.v1.spec_decode.utils import make_cad, make_eagle_proposer
 from vllm_rbln.v1.worker.dp_utils import DPStatus, ShapeConfig
 
-pytestmark = pytest.mark.maybe_use_device
+pytestmark = pytest.mark.use_device
 
 
 def _shape_config(*, specialized=False, max_num_tokens=64):
