@@ -1132,6 +1132,34 @@ class RBLNGlm5NextForCausalLM(nn.Module, SupportsPP):
         return loaded_params
 
 
+class _RBLNGlm5NextVisionBlock(nn.Module):
+    def __init__(self, block, num_heads, head_dim, swiglu_limit) -> None:
+        super().__init__()
+        self.block = block
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.swiglu_limit = swiglu_limit
+
+    @torch.compiler.nested_compile_region
+    def forward(self, x, cos, sin, key_bias, rot):
+        n = x.shape[0]
+        block, attn = self.block, self.block.attn
+        qkv = attn.qkv(block.norm1(x))[0]
+        qkv = qkv.view(n, 3, self.num_heads, self.head_dim)
+        q = attn.q_norm(qkv[:, 0])
+        k = attn.k_norm(qkv[:, 1])
+        v = qkv[:, 2]
+        q = q * cos + torch.matmul(q, rot) * sin
+        k = k * cos + torch.matmul(k, rot) * sin
+        q, k, v = q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1)
+        scores = torch.matmul(q, k.transpose(1, 2)) * self.head_dim**-0.5 + key_bias
+        out = torch.matmul(torch.softmax(scores, dim=-1), v)
+        x = x + attn.proj(out.transpose(0, 1).reshape(n, -1))[0]
+        mlp = block.mlp
+        gate, up = mlp.gate_up_proj(block.norm2(x))[0].chunk(2, dim=-1)
+        return x + mlp.down_proj(_swiglu_clamped(gate, up, self.swiglu_limit))[0]
+
+
 class _RBLNGlm5NextVisionEncoder(nn.Module):
     def __init__(self, tower: nn.Module, out_dtype: torch.dtype) -> None:
         super().__init__()
@@ -1141,6 +1169,12 @@ class _RBLNGlm5NextVisionEncoder(nn.Module):
         self.num_heads = attn.num_attention_heads_per_partition
         self.head_dim = attn.head_dim
         self.swiglu_limit = tower.blocks[0].mlp.act_fn.swiglu_limit
+        self.blocks = nn.ModuleList(
+            _RBLNGlm5NextVisionBlock(
+                block, self.num_heads, self.head_dim, self.swiglu_limit
+            )
+            for block in tower.blocks
+        )
         half = self.head_dim // 2
         rot = torch.zeros(self.head_dim, self.head_dim)
         for j in range(half):
@@ -1163,23 +1197,8 @@ class _RBLNGlm5NextVisionEncoder(nn.Module):
         )
         cos = cos.unsqueeze(1)
         sin = sin.unsqueeze(1)
-        scale = self.head_dim**-0.5
-        for block in tower.blocks:
-            attn = block.attn
-            qkv = attn.qkv(block.norm1(x))[0]
-            qkv = qkv.view(n, 3, self.num_heads, self.head_dim)
-            q = attn.q_norm(qkv[:, 0])
-            k = attn.k_norm(qkv[:, 1])
-            v = qkv[:, 2]  # [N, heads, D]
-            q = q * cos + torch.matmul(q, self.rot) * sin
-            k = k * cos + torch.matmul(k, self.rot) * sin
-            q, k, v = q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1)
-            scores = torch.matmul(q, k.transpose(1, 2)) * scale + key_bias
-            out = torch.matmul(torch.softmax(scores, dim=-1), v)
-            x = x + attn.proj(out.transpose(0, 1).reshape(n, -1))[0]
-            mlp = block.mlp
-            gate, up = mlp.gate_up_proj(block.norm2(x))[0].chunk(2, dim=-1)
-            x = x + mlp.down_proj(_swiglu_clamped(gate, up, self.swiglu_limit))[0]
+        for block in self.blocks:
+            x = block(x, cos, sin, key_bias, self.rot)
         x = tower.post_layernorm(x)
         merge2 = tower.spatial_merge_size**2
         d = tower.downsample.weight

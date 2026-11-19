@@ -320,6 +320,10 @@ class RBLNGemma4ForConditionalGeneration(
         self._mm_encoder: Callable[..., torch.Tensor] | None
         object.__setattr__(self, "_mm_encoder", None)
 
+    @property
+    def logits_processor(self) -> nn.Module:
+        return self.language_model.logits_processor
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # Scale each expert's down projection instead of its routing weight:
         # the decode graph lowers the [E, 1] routing-weight scale incorrectly.
