@@ -147,6 +147,7 @@ def mock_vllm_config(**options) -> Any:
     # same way.
     config.scheduler_config.max_num_batched_tokens = 128
     config.num_prefill_lookahead_tokens = 0
+    config.speculative_config = None
     set_mock_connector_options(config, **options)
     return config
 
