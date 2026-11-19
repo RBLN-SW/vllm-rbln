@@ -22,6 +22,8 @@ from typing import Any
 
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
+from vllm.model_executor.model_loader.utils import get_model_architecture
+from vllm.model_executor.models.interfaces import supports_multimodal_embeddings
 from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
@@ -117,6 +119,17 @@ class RBLNScheduler(Scheduler):
         self.num_lookahead_tokens: int = max(
             self.num_lookahead_tokens, self.num_spec_tokens
         )
+
+        self.mm_prefill_lookahead = 0
+        if (
+            self.num_prefill_lookahead
+            and self.vllm_config.model_config.supports_multimodal_inputs
+        ):
+            spec = self.vllm_config.speculative_config
+            assert spec is not None
+            draft_cls, _ = get_model_architecture(spec.draft_model_config)
+            if supports_multimodal_embeddings(draft_cls):
+                self.mm_prefill_lookahead = self.num_prefill_lookahead
 
         rbln_config: RBLNConfig = self.vllm_config.additional_config
 
@@ -443,9 +456,7 @@ class RBLNScheduler(Scheduler):
                     request.num_computed_tokens,
                     num_new_tokens,
                     encoder_compute_budget,
-                    # NOTE(RBLN): the drafter takes no mm embeddings, so EAGLE needs
-                    # no shifted encoder window.
-                    shift_computed_tokens=0,
+                    shift_computed_tokens=self.mm_prefill_lookahead,
                 )
 
             if self.need_mamba_block_aligned_split:
@@ -851,9 +862,7 @@ class RBLNScheduler(Scheduler):
                             num_computed_tokens,
                             num_new_tokens,
                             encoder_compute_budget,
-                            # NOTE(RBLN): the drafter takes no mm
-                            # embeddings, so EAGLE needs no shifted encoder window.
-                            shift_computed_tokens=0,
+                            shift_computed_tokens=self.mm_prefill_lookahead,
                         )
                         if num_new_tokens == 0:
                             # The request cannot be scheduled.
@@ -1334,8 +1343,8 @@ class RBLNScheduler(Scheduler):
         )
 
     def _free_encoder_inputs(self, request: Request) -> None:
-        # NOTE(RBLN): upstream defers the free by the drafter's look-ahead, but
-        # the RBLN drafter reads no mm embeddings.
+        # Drafting finishes before the scheduler processes the step's output;
+        # retain each item until the target has also consumed it.
         if self.is_encoder_decoder:
             super()._free_encoder_inputs(request)
             return
