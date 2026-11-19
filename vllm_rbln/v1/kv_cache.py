@@ -206,7 +206,12 @@ def prompt_boundary_block(num_prompt_tokens: int, block_size: int) -> int | None
 
 @dataclass(frozen=True)
 class RBLNMambaSpec(MambaSpec):
-    """A recurrent state the RBLN KV connector moves with its block-boundary state."""
+    """A recurrent state the RBLN KV connector moves with its block-boundary state.
+
+    A subclass because KVCacheSpecRegistry picks a manager by spec class and upstream
+    already registers MambaSpec to MambaManager; it also keeps other Mamba models on
+    upstream's manager.
+    """
 
 
 class RBLNMambaManager(MambaManager):
