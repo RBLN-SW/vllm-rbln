@@ -16,6 +16,7 @@
 # compile/warmup control flow, reachable on CPU once WorkerBase.__init__ is
 # patched out. Device execution stays in the e2e tier.
 
+import functools
 import inspect
 import json
 import os
@@ -32,7 +33,12 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from torch._dynamo.exc import BackendCompilerFailed
-from vllm.config import ECTransferConfig, ProfilerConfig, get_current_vllm_config
+from vllm.config import (
+    ECTransferConfig,
+    ModelConfig,
+    ProfilerConfig,
+    get_current_vllm_config,
+)
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorRole
 from vllm.distributed.ec_transfer.ec_connector.factory import ECConnectorFactory
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
@@ -375,6 +381,29 @@ class TestWorkerFailFast:
             assert excinfo.value is error
 
 
+def test_shutdown_waits_for_the_last_async_token_copy(monkeypatch):
+    from tests.vllm.v1.worker.test_async_output import _async_output
+
+    previous = _async_output(torch.tensor([[42]], dtype=torch.int32))
+    phases = []
+    wait = Mock(
+        side_effect=lambda: phases.append("copy_complete"),
+    )
+    monkeypatch.setattr(previous, "get_sampled_token_ids_cpu", wait)
+    worker = object.__new__(RBLNWorker)
+    worker.model_runner = SimpleNamespace(_prev_async_output=previous)
+    worker.profiler = None
+    worker._release_offload_temp_storage = Mock(
+        side_effect=lambda: phases.append("release_storage")
+    )
+    monkeypatch.setattr(wm, "ensure_kv_transfer_shutdown", None)
+
+    worker.shutdown()
+
+    assert phases == ["copy_complete", "release_storage"]
+    assert worker.model_runner._prev_async_output is None
+
+
 class TestConformance:
     def test_extends_worker_base(self):
         assert issubclass(RBLNWorker, WorkerBase)
@@ -633,10 +662,17 @@ class TestDetermineAvailableMemory:
         drafter=None,
         speculative_config=None,
         dynamic=False,
+        kernel_size=lambda **kw: 111,
     ):
         vcfg = _make_vllm_config(quantization=quantization)
         vcfg.additional_config.use_dynamic_kv_cache = None if dynamic else False
         vcfg.model_config.hf_config = hf_config
+
+        def get_num_layers(parallel_config):
+            assert parallel_config is vcfg.parallel_config
+            return 2
+
+        vcfg.model_config.get_num_layers = get_num_layers
         worker = make_worker(vllm_config=vcfg, device_name=device_name)
         worker.device = torch.device("cpu")
         captured: dict = {}
@@ -649,7 +685,7 @@ class TestDetermineAvailableMemory:
         # The worker hands the kwargs to the sizer, which is where the formula
         # is called from on both the dynamic and the default path.
         monkeypatch.setattr(dks, "estimate_available_memory", record)
-        monkeypatch.setattr(wm, "estimate_model_kernel_size", lambda **kw: 111)
+        monkeypatch.setattr(wm, "estimate_model_kernel_size", kernel_size)
         monkeypatch.setattr(dks, "get_kv_cache_groups", lambda cfg, spec: [])
         # WorkerBase always carries the field; None is what no spec decode means.
         worker.speculative_config = speculative_config
@@ -833,7 +869,9 @@ class TestDetermineAvailableMemory:
             warms_up_decode_graphs_on_a_producer=False,
         )
         spec = SimpleNamespace(
-            draft_model_config=SimpleNamespace(quantization=None),
+            draft_model_config=SimpleNamespace(
+                quantization=None, get_total_num_hidden_layers=lambda: 1
+            ),
             draft_parallel_config=None,
             method="eagle",
         )
@@ -850,6 +888,62 @@ class TestDetermineAvailableMemory:
         # 1 + buckets(3)*1 = 4 (no MoE); draft = 1 + buckets(3) = 4. Total 8.
         assert cap["num_runtimes"] == 8
 
+    def test_drafter_counts_its_own_layers_under_a_pp_layer_partition(
+        self, make_worker, monkeypatch
+    ):
+        # A target partition and a layer truncation are both set; the drafter is
+        # built whole on one stage, so it counts the draft config's five layers.
+        # The target's own count comes from _capture's stub.
+        monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "1,1")
+        monkeypatch.setenv("VLLM_RBLN_NUM_HIDDEN_LAYERS", "2")
+        draft_config = SimpleNamespace(
+            quantization=None,
+            get_total_num_hidden_layers=lambda: 5,
+            get_vocab_size=lambda: 64,
+            get_hidden_size=lambda: 32,
+        )
+        # Upstream's own layer getters, so a count taken through the drafter's
+        # single-stage parallel config reads the partition as upstream does.
+        for name in ("get_layers_start_end_indices", "get_num_layers"):
+            setattr(
+                draft_config,
+                name,
+                functools.partial(getattr(ModelConfig, name), draft_config),
+            )
+        drafter = SimpleNamespace(
+            model=SimpleNamespace(
+                parameters=lambda: iter([torch.zeros(6144, dtype=torch.float16)])
+            ),
+            warms_up_decode_graphs_on_a_producer=False,
+        )
+        spec = SimpleNamespace(
+            draft_model_config=draft_config,
+            draft_parallel_config=SimpleNamespace(
+                tensor_parallel_size=1, pipeline_parallel_size=1, rank=0
+            ),
+            method="mtp",
+        )
+        target_layers = []
+
+        def kernel_size(**kw):
+            if kw["model_config"] is not draft_config:
+                target_layers.append(kw.get("num_layers"))
+                return 111
+            return worker_utils.estimate_model_kernel_size(
+                **kw, default_bits_per_param=16
+            )
+
+        cap = self._capture(
+            make_worker,
+            monkeypatch,
+            drafter=drafter,
+            speculative_config=spec,
+            kernel_size=kernel_size,
+        )
+        # Five layers of 2 MiB-aligned weights plus the lm_head's 2 MiB.
+        assert cap["kernel_size"] == 111 + 6 * 2**21
+        assert target_layers == [2]
+
     def test_medusa_on_a_producer_reserves_one_draft_runtime(
         self, make_worker, monkeypatch
     ):
@@ -861,7 +955,9 @@ class TestDetermineAvailableMemory:
             parameters=lambda: iter([torch.zeros(20, dtype=torch.float16)])
         )
         spec = SimpleNamespace(
-            draft_model_config=SimpleNamespace(quantization=None),
+            draft_model_config=SimpleNamespace(
+                quantization=None, get_total_num_hidden_layers=lambda: 1
+            ),
             draft_parallel_config=None,
             method="medusa",
         )
@@ -889,7 +985,9 @@ class TestDetermineAvailableMemory:
             warms_up_decode_graphs_on_a_producer=warms_up_decode,
         )
         spec = SimpleNamespace(
-            draft_model_config=SimpleNamespace(quantization=None),
+            draft_model_config=SimpleNamespace(
+                quantization=None, get_total_num_hidden_layers=lambda: 1
+            ),
             draft_parallel_config=None,
             method="dflash" if warms_up_decode else "eagle",
         )
@@ -917,7 +1015,9 @@ class TestDetermineAvailableMemory:
             warms_up_decode_graphs_on_a_producer=False,
         )
         spec = SimpleNamespace(
-            draft_model_config=SimpleNamespace(quantization=None),
+            draft_model_config=SimpleNamespace(
+                quantization=None, get_total_num_hidden_layers=lambda: 1
+            ),
             draft_parallel_config=None,
             method="eagle",
         )
@@ -1317,7 +1417,8 @@ class TestEcConnectorLifecycle:
         monkeypatch.setattr(ec_state, "_EC_CONNECTOR_AGENT", connector)
         worker = make_worker()
         worker.model_runner = SimpleNamespace(
-            load_model=lambda: connector.calls.append("load_model")
+            load_model=lambda: connector.calls.append("load_model"),
+            _prev_async_output=None,
         )
         monkeypatch.setattr(wm, "set_current_vllm_config", lambda _: nullcontext())
         monkeypatch.setattr(worker, "_release_offload_temp_storage", lambda: None)
