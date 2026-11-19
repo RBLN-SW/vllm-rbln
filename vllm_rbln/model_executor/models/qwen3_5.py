@@ -156,10 +156,10 @@ class RBLNQwen3_5MultiModalProcessor(Qwen3VLMultiModalProcessor):
                 if grid[1] * grid[2] > limit:
                     raise ValueError(
                         f"The {modality} grid {grid} has {grid[1] * grid[2]} patches "
-                        f"a frame, more than the {limit} the RBLN vision encoder is "
-                        "compiled for. Lower the request's max_pixels, or raise it at "
-                        "start-up in --mm-processor-kwargs (and add a budget that "
-                        "reaches it if encoder_token_budgets is set)."
+                        f"per frame, more than the {limit} the RBLN vision encoder "
+                        "is compiled for. Lower the request's max_pixels, or raise "
+                        "it at start-up in --mm-processor-kwargs (and add a budget "
+                        "that reaches it if encoder_token_budgets is set)."
                     )
         return outputs
 
@@ -336,7 +336,7 @@ class RBLNQwen3_5ForConditionalGeneration(
     def _encode(
         self, pixel_values: torch.Tensor, grid_thw: torch.Tensor
     ) -> tuple[torch.Tensor, ...]:
-        """The embeddings of each image or video, one encoder run a temporal
+        """The embeddings of each image or video, one encoder run per temporal
         patch: upstream's cu_seqlens keeps attention inside each, so a video's
         frames are images of its grid."""
         encoder = self._mm_encoder
@@ -350,6 +350,8 @@ class RBLNQwen3_5ForConditionalGeneration(
         tokens = [h * w // self.visual.spatial_merge_size**2 for _, h, w in grids]
         embeds = []
         with torch.inference_mode():
+            # TODO: a video's temporal patches share h and w, so their position
+            # embeddings and key mask could be built once per video.
             for pixels, (_, h, w), n in zip(pixel_values.split(sizes), grids, tokens):
                 frames = [
                     encoder(*self._encoder_inputs(frame, [1, h, w]))[:n].cpu()

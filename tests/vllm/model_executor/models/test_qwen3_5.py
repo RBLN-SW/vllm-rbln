@@ -231,7 +231,7 @@ def test_a_request_frame_above_the_start_up_limit_is_refused(monkeypatch):
     # A request that raised max_pixels: 34 x 32 = 1088 patches.
     grids = torch.tensor([[1, 32, 32], [1, 34, 32]])
     outputs = {"pixel_values": torch.zeros(1), "image_grid_thw": grids}
-    with pytest.raises(ValueError, match="1088 patches a frame, more than the 1024"):
+    with pytest.raises(ValueError, match="1088 patches per frame, more than the 1024"):
         processor._apply_hf_processor_main(None, {})
 
     # Sent as embeddings, the same grids skip the encoder and are let through.
@@ -246,7 +246,7 @@ def test_a_request_frame_above_the_start_up_limit_is_refused(monkeypatch):
 
     grids = torch.tensor([[2, 18, 16]])
     outputs = {"pixel_values_videos": torch.zeros(1), "video_grid_thw": grids}
-    with pytest.raises(ValueError, match="288 patches a frame, more than the 256"):
+    with pytest.raises(ValueError, match="288 patches per frame, more than the 256"):
         processor._apply_hf_processor_main(None, {})
 
 
