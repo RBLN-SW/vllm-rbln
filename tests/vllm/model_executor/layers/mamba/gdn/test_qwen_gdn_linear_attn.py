@@ -403,7 +403,7 @@ def _decoded(vllm_config, num_drafts: int, windows, monkeypatch, shared_binding)
             **window,
         )
         outputs.append(out[0].float())
-        states.append(_ssm_state(state))
+        states.append(state[BLOCK].float())
     return outputs, states
 
 
