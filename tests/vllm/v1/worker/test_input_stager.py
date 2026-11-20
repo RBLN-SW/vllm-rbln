@@ -15,6 +15,8 @@
 """Tests for the input staging buffers (input_stager.py): pad-and-copy into
 reused, key-cached buffers, compared on .cpu() (device from current_platform)."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from vllm.platforms import current_platform
@@ -460,6 +462,102 @@ def test_stage_mm_embeds_has_no_d2h(dtype):
         expected_mask = torch.zeros(4, 8, 1, dtype=dtype)
         expected_mask[:2, :6] = mm_mask
         torch.testing.assert_close(mask.cpu(), expected_mask, atol=0, rtol=0)
+
+
+@pytest.mark.use_device
+@pytest.mark.parametrize("model_name", ["gemma4", "glm5_next", "qwen3_5", "minimax_m3"])
+def test_multimodal_encoder_to_stager_has_no_d2h(model_name):
+    from rebel.core.torch_compile import rbln_backend
+
+    from vllm_rbln.model_executor.models.gemma4 import (
+        RBLNGemma4ForConditionalGeneration,
+    )
+    from vllm_rbln.model_executor.models.glm5_next import (
+        RBLNGlm5NextForConditionalGeneration,
+    )
+    from vllm_rbln.model_executor.models.minimax_m3 import (
+        RBLNMiniMaxM3SparseForConditionalGeneration,
+    )
+    from vllm_rbln.model_executor.models.qwen3_5 import (
+        RBLNQwen3_5ForConditionalGeneration,
+    )
+
+    # Exercise each model's tensor handoff using a real compiled static output.
+    model_class = {
+        "gemma4": RBLNGemma4ForConditionalGeneration,
+        "glm5_next": RBLNGlm5NextForConditionalGeneration,
+        "qwen3_5": RBLNQwen3_5ForConditionalGeneration,
+        "minimax_m3": RBLNMiniMaxM3SparseForConditionalGeneration,
+    }[model_name]
+    model = model_class.__new__(model_class)
+    torch.nn.Module.__init__(model)
+    device = torch.device("rbln:0")
+    dtype = torch.bfloat16
+    pixels = torch.arange(8 * 64, dtype=torch.float32).view(2, 4, 64)
+    weights = torch.eye(64, dtype=dtype, device=device)
+
+    def project(frame, weights):
+        return frame.to(weights.dtype) @ weights
+
+    compiled = torch.compile(
+        project,
+        backend=rbln_backend,
+        fullgraph=True,
+        dynamic=False,
+        options={"dtype": "bfloat16", "use_static_output": True},
+    )
+
+    def encoder(frame, *args):
+        return compiled(frame.view(4, 64), weights).view_as(frame)
+
+    object.__setattr__(model, "_mm_encoder", encoder)
+    model.mm_encoder_patch_buckets = [4]
+    model.mm_embeds_dtype = dtype
+    model.model_dtype = dtype
+    model.is_multimodal_pruning_enabled = False
+    model.visual = SimpleNamespace(device=device, spatial_merge_size=1)
+    model.vision_tower = torch.nn.Linear(1, 1, device=device)
+    model.vision_tower.config = SimpleNamespace(pooling_kernel_size=1)
+    model.vision_tower.spatial_merge_size = 1
+    model.vision_tower.vision_model = SimpleNamespace(vision_segment_max_frames=1)
+    model._encoder_inputs = lambda frame, *args: [frame.to(device)]
+
+    video = dict(
+        pixel_values_videos=pixels.flatten(0, 1),
+        video_grid_thw=torch.tensor([[2, 2, 2]]),
+    )
+    if model_name == "gemma4":
+        positions = torch.cartesian_prod(torch.arange(2), torch.arange(2))
+        video = dict(
+            pixel_values_videos=pixels,
+            pixel_position_ids_videos=positions.expand(2, -1, -1),
+            video_frame_counts=torch.tensor([2]),
+        )
+
+    stager = InputStager(device)
+    layout = InputLayout(1, 1, 8, 8)
+    mask = torch.ones(1, 8, 1, dtype=dtype)
+    with torch.inference_mode():
+        model.embed_multimodal(**video)
+        torch.rbln.synchronize(device)
+        with torch.rbln.explain(with_stack=True) as trace:
+            embeds = model.embed_multimodal(**video)
+            staged, _ = stager.stage_mm_embeds(embeds, mask, 64, layout)
+            torch.rbln.synchronize(device)
+
+        residency = trace.dump()["runtime_residency"]
+        assert residency["available"], trace.report()
+        d2h = residency["real_host_sync_d2h"]
+        print(f"{model_name}: D2H {d2h['count']} transfers, {d2h['bytes']} bytes")
+        assert d2h == {"count": 0, "bytes": 0}, trace.report()
+        assert len(embeds) == 1 and embeds[0].device == device
+        torch.testing.assert_close(staged.cpu(), pixels.view(1, 8, 64).to(dtype))
+
+        # Confirm that a host read of a fresh compiled output is observable.
+        source = encoder(pixels[0].to(device))
+        with torch.rbln.explain(with_stack=True) as cpu_trace:
+            source.cpu()
+        assert cpu_trace.dump()["runtime_residency"]["real_host_sync_d2h"]["count"] > 0
 
 
 @pytest.mark.use_device
