@@ -18,6 +18,7 @@ padded decode bucket. None depends on output quality, so the truncated model
 of the default --num-hidden-layers is enough.
 """
 
+import math
 import re
 
 import pytest
@@ -198,9 +199,14 @@ def test_first_token_distribution_matches_upstream(runner, params):
 
     completions = generate(runner, [PROMPT] * NUM_SAMPLES, params)
 
-    assert_samples_match(
-        samples=torch.tensor([c.token_ids[0] for c in completions]), probs=expected
-    )
+    samples = torch.tensor([c.token_ids[0] for c in completions])
+    if params.min_p:
+        gap = (raw - raw.max()) / params.temperature - math.log(params.min_p)
+        edge = gap.abs() < 0.1
+        samples = samples[~edge[samples]]
+        expected = torch.where(edge, 0.0, expected)
+        expected = expected / expected.sum()
+    assert_samples_match(samples=samples, probs=expected)
 
 
 @pytest.mark.parametrize(
