@@ -25,6 +25,7 @@ from vllm_rbln.utils.optimum.configuration.compile_config import (
     compile_cache_name,
     prepare_compile_config,
 )
+from vllm_rbln.utils.optimum.configuration.multimodal import MULTIMODAL_CONFIG_BUILDERS
 from vllm_rbln.utils.optimum.configuration.multimodal.qwen import (
     build_qwen3_5_config,
 )
@@ -51,6 +52,7 @@ def _vllm_config(hf_config, *, optimum_overrides=None, prefill_chunk_size=None):
             user_specified_block_size=True,
             enable_prefix_caching=False,
             gpu_memory_utilization=0.9,
+            num_gpu_blocks_override=None,
         ),
         additional_config=build_optimum_rbln_config(
             {
@@ -91,6 +93,93 @@ def test_multimodal_decoder_option(monkeypatch, architecture, key):
     assert decoder["nested_compile_region"] is True
     if key:
         assert "nested_compile_region" not in inputs.rbln_config
+
+
+@pytest.mark.parametrize(
+    "num_blocks, override_blocks, expected_blocks",
+    [
+        (None, None, None),
+        (None, 0, None),
+        (None, 16, 16),
+        (16, None, 16),
+        (16, 0, 16),
+        (16, 16, 16),
+    ],
+)
+@pytest.mark.parametrize(
+    "architecture, key, override_key",
+    [
+        ("LlamaForCausalLM", None, None),
+        ("Qwen3VLForConditionalGeneration", None, None),
+        ("Gemma3ForConditionalGeneration", "language_model", "language_model"),
+        ("Gemma3ForConditionalGeneration", "language_model", None),
+        ("Idefics3ForConditionalGeneration", "text_model", "text_model"),
+    ],
+)
+def test_explicit_blocks_replace_automatic_memory_budget(
+    architecture, key, override_key, num_blocks, override_blocks, expected_blocks
+):
+    overrides = (
+        {} if override_blocks is None else {"kvcache_num_blocks": override_blocks}
+    )
+    overrides = {override_key: overrides} if override_key else overrides
+    cfg = _vllm_config(
+        PretrainedConfig(architectures=[architecture]), optimum_overrides=overrides
+    )
+    cfg.cache_config.num_gpu_blocks_override = num_blocks
+    inputs = prepare_compile_config(cfg)
+    decoder = inputs.rbln_config[key] if key else inputs.rbln_config
+    if expected_blocks is None:
+        assert decoder["memory_budget"] == 0.9
+    else:
+        assert "memory_budget" not in decoder
+        assert decoder["kvcache_num_blocks"] == expected_blocks
+        if key:
+            assert "kvcache_num_blocks" not in inputs.rbln_config
+    assert cfg.additional_config.optimum_overrides == overrides
+    assert cfg.cache_config.num_gpu_blocks_override == num_blocks
+    assert cfg.cache_config.gpu_memory_utilization == 0.9
+
+
+@pytest.mark.parametrize("memory_budget", [0.8, None])
+@pytest.mark.parametrize("block_source", ["vllm", "optimum"])
+@pytest.mark.parametrize(
+    "architecture, decoder_key, budget_key",
+    [
+        ("LlamaForCausalLM", None, None),
+        ("Qwen3VLForConditionalGeneration", None, None),
+        ("Gemma3ForConditionalGeneration", "language_model", "language_model"),
+        ("Gemma3ForConditionalGeneration", "language_model", None),
+        ("Idefics3ForConditionalGeneration", "text_model", "text_model"),
+        ("Idefics3ForConditionalGeneration", "text_model", None),
+    ],
+)
+def test_explicit_blocks_validate_memory_budget_override(
+    architecture, decoder_key, budget_key, block_source, memory_budget
+):
+    overrides: dict = {}
+    decoder_overrides = (
+        overrides.setdefault(decoder_key, {}) if decoder_key else overrides
+    )
+    if block_source == "optimum":
+        decoder_overrides["kvcache_num_blocks"] = 16
+    budget_overrides = overrides.setdefault(budget_key, {}) if budget_key else overrides
+    budget_overrides["memory_budget"] = memory_budget
+    cfg = _vllm_config(
+        PretrainedConfig(architectures=[architecture]), optimum_overrides=overrides
+    )
+    if block_source == "vllm":
+        cfg.cache_config.num_gpu_blocks_override = 16
+
+    if memory_budget is not None:
+        with pytest.raises(ValueError, match="memory_budget.*explicit.*block count"):
+            prepare_compile_config(cfg)
+    else:
+        inputs = prepare_compile_config(cfg)
+        decoder = inputs.rbln_config[decoder_key] if decoder_key else inputs.rbln_config
+        assert decoder.get("memory_budget") is None
+        assert decoder["kvcache_num_blocks"] == 16
+    assert cfg.additional_config.optimum_overrides == overrides
 
 
 def test_flag_conflicts_with_decoder_override(monkeypatch):
@@ -142,6 +231,25 @@ def test_prefill_chunk_size_conflicting_with_override_is_rejected(arch, override
         prepare_compile_config(cfg)
 
 
+@pytest.mark.parametrize("model_name", MULTIMODAL_CONFIG_BUILDERS)
+@pytest.mark.parametrize(
+    "kv_cache_capacity_fields", [{"memory_budget": 0.9}, {"kvcache_num_blocks": 16}]
+)
+def test_multimodal_builders_apply_kv_cache_capacity(
+    model_name, kv_cache_capacity_fields
+):
+    config = MULTIMODAL_CONFIG_BUILDERS[model_name](
+        4, 8192, 1024, 1, kv_cache_capacity_fields, 256
+    )
+    decoder = config.get("language_model", config.get("text_model", config))
+    actual = {
+        key: decoder[key]
+        for key in ("memory_budget", "kvcache_num_blocks")
+        if key in decoder
+    }
+    assert actual == kv_cache_capacity_fields
+
+
 class TestQwen35ConfigBuilder:
     """Qwen3.5 takes the same parameters as the other Qwen VLMs: a block_size below
     max_model_len partitions the cache and selects flash attention, and a block_size
@@ -150,7 +258,7 @@ class TestQwen35ConfigBuilder:
     cfg = {
         "batch_size": 1,
         "num_devices": 1,
-        "memory_budget": 0.9,
+        "kv_cache_capacity_fields": {"memory_budget": 0.9},
         "prefill_chunk_size": 128,
     }
 
@@ -295,7 +403,7 @@ class TestCompileCacheName:
         cfg.model_config.hf_config.num_hidden_layers = 1
         assert compile_cache_name(cfg.additional_config.compile_config) == original
 
-    @pytest.mark.parametrize("key", ["device", "create_runtimes", "kvcache_num_blocks"])
+    @pytest.mark.parametrize("key", ["device", "create_runtimes"])
     def test_load_only_options_do_not_change_the_key(self, key, vllm_config_factory):
         cfg = vllm_config_factory()
         original = compile_cache_name(cfg.additional_config.compile_config)

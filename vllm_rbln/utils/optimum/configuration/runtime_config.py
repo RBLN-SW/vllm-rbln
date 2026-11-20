@@ -27,11 +27,13 @@ from vllm_rbln.utils.optimum.block_size import (
     is_full_block_available,
 )
 from vllm_rbln.utils.optimum.registry import (
+    is_chunked_prefill_arch,
     is_enc_dec_arch,
     is_encoder_pooling_arch,
     is_multi_modal,
 )
 
+from .compile_config import resolve_explicit_num_blocks
 from .rbln_config import (
     RblnConfigLike,
     get_field,
@@ -69,6 +71,8 @@ class OptimumRBLNRuntimeConfig:
     model_num_blocks: int | None
     num_devices_per_local_rank: int
     compiled_dtype: torch.dtype | None
+    gpu_memory_utilization: float
+    explicit_num_blocks: int | None
     precompiled: bool
 
 
@@ -188,6 +192,7 @@ def prepare_runtime_config(
             "RBLN does not support prefix caching for mamba/hybrid models."
         )
         mamba_block_size = max_seq_len
+    explicit_num_blocks = resolve_explicit_num_blocks(vllm_config)
     return OptimumRBLNRuntimeConfig(
         max_num_seqs=batch_size,
         max_model_len=max_seq_len,
@@ -199,6 +204,12 @@ def prepare_runtime_config(
         model_num_blocks=resolve_runtime_num_blocks(vllm_config, rbln_config),
         num_devices_per_local_rank=num_devices,
         compiled_dtype=compiled_dtype,
+        gpu_memory_utilization=(
+            1.0
+            if explicit_num_blocks is not None
+            else cache_config.gpu_memory_utilization
+        ),
+        explicit_num_blocks=explicit_num_blocks,
         precompiled=precompiled,
     )
 
@@ -213,6 +224,17 @@ def apply_runtime_config(
     prefill_chunk_size = runtime_config.prefill_chunk_size
     compiled_dtype = runtime_config.compiled_dtype
     additional_config: OptimumRBLNConfig = vllm_config.additional_config
+    cache_config = vllm_config.cache_config
+    utilization = runtime_config.gpu_memory_utilization
+    if cache_config.gpu_memory_utilization != utilization:
+        logger.info(
+            "Setting gpu_memory_utilization from %s to %s because "
+            "an explicit KV cache block count=%d is set.",
+            cache_config.gpu_memory_utilization,
+            utilization,
+            runtime_config.explicit_num_blocks,
+        )
+        cache_config.gpu_memory_utilization = utilization
     if runtime_config.precompiled:
         additional_config.optimum_overrides = keep_device_overrides(
             additional_config.optimum_overrides
@@ -324,11 +346,6 @@ def update_block_size(
             block_size,
         )
         vllm_config.cache_config.block_size = block_size
-
-
-def is_chunked_prefill_arch(hf_config) -> bool:
-    """Whether the compiled model supports chunked prefill."""
-    return not (is_enc_dec_arch(hf_config) or is_encoder_pooling_arch(hf_config))
 
 
 def update_max_num_batched_tokens(vllm_config: VllmConfig) -> None:
