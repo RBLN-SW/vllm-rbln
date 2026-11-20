@@ -289,15 +289,20 @@ def prepare_compile_config(vllm_config: VllmConfig) -> OptimumRBLNCompileConfig:
         )
     set_submodule_num_devices(optimum_overrides)
 
+    kv_cache_capacity_fields: dict[str, int | float] = (
+        {"memory_budget": vllm_config.cache_config.gpu_memory_utilization}
+        if num_blocks is None
+        else {"kvcache_num_blocks": num_blocks}
+    )
     if is_generation_arch(hf_config):
         model_cls, rbln_config = _for_decoder(
-            vllm_config, optimum_overrides, num_blocks
+            vllm_config, optimum_overrides, kv_cache_capacity_fields
         )
     elif is_pooling_arch(hf_config):
         model_cls, rbln_config = _for_pooling(vllm_config, optimum_overrides)
     elif is_multi_modal(hf_config):
         model_cls, rbln_config = _for_multimodal(
-            vllm_config, optimum_overrides, num_blocks
+            vllm_config, optimum_overrides, kv_cache_capacity_fields
         )
     elif is_enc_dec_arch(hf_config):
         model_cls, rbln_config = _for_enc_dec(vllm_config, optimum_overrides)
@@ -333,12 +338,11 @@ def prepare_compile_config(vllm_config: VllmConfig) -> OptimumRBLNCompileConfig:
 def _for_decoder(
     vllm_config: VllmConfig,
     optimum_overrides: dict[str, Any],
-    num_blocks: int | None,
+    kv_cache_capacity_fields: dict[str, int | float],
 ) -> tuple[Any, dict[str, Any]]:
     from optimum.rbln import RBLNAutoModelForCausalLM
 
     model_config = vllm_config.model_config
-    cache_config = vllm_config.cache_config
     additional_config = vllm_config.additional_config
 
     batch_size = optimum_overrides.get("batch_size")
@@ -364,11 +368,8 @@ def _for_decoder(
             additional_config.single_prefill_chunk_size,
             optimum_overrides.get("prefill_chunk_size"),
         ),
+        **kv_cache_capacity_fields,
     }
-    if num_blocks is None:
-        rbln_config["memory_budget"] = cache_config.gpu_memory_utilization
-    else:
-        rbln_config["kvcache_num_blocks"] = num_blocks
     if block_size != max_model_len:
         rbln_config["kvcache_partition_len"] = block_size
         rbln_config["attn_impl"] = "flash_attn"
@@ -432,12 +433,11 @@ def _for_pooling(
 def _for_multimodal(
     vllm_config: VllmConfig,
     optimum_overrides: dict[str, Any],
-    num_blocks: int | None,
+    kv_cache_capacity_fields: dict[str, int | float],
 ) -> tuple[Any, dict[str, Any]]:
     import optimum.rbln
 
     model_config = vllm_config.model_config
-    cache_config = vllm_config.cache_config
     additional_config = vllm_config.additional_config
 
     override_values = read_language_model_fields(
@@ -494,9 +494,8 @@ def _for_multimodal(
         max_model_len,
         block_size,
         num_devices,
-        cache_config.gpu_memory_utilization,
+        kv_cache_capacity_fields,
         prefill_chunk_size,
-        num_blocks,
     )
     decoder_config = language_model_configs(rbln_config)[0]
     decoder_config["kvcache_block_size"] = block_size

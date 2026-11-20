@@ -107,21 +107,22 @@ def test_multimodal_decoder_option(monkeypatch, architecture, key):
     ],
 )
 @pytest.mark.parametrize(
-    "architecture, key",
+    "architecture, key, override_key",
     [
-        ("LlamaForCausalLM", None),
-        ("Qwen3VLForConditionalGeneration", None),
-        ("Gemma3ForConditionalGeneration", "language_model"),
-        ("Idefics3ForConditionalGeneration", "text_model"),
+        ("LlamaForCausalLM", None, None),
+        ("Qwen3VLForConditionalGeneration", None, None),
+        ("Gemma3ForConditionalGeneration", "language_model", "language_model"),
+        ("Gemma3ForConditionalGeneration", "language_model", None),
+        ("Idefics3ForConditionalGeneration", "text_model", "text_model"),
     ],
 )
 def test_explicit_blocks_replace_automatic_memory_budget(
-    architecture, key, num_blocks, override_blocks, expected_blocks
+    architecture, key, override_key, num_blocks, override_blocks, expected_blocks
 ):
     overrides = (
         {} if override_blocks is None else {"kvcache_num_blocks": override_blocks}
     )
-    overrides = {key: overrides} if key else overrides
+    overrides = {override_key: overrides} if override_key else overrides
     cfg = _vllm_config(
         PretrainedConfig(architectures=[architecture]), optimum_overrides=overrides
     )
@@ -133,6 +134,8 @@ def test_explicit_blocks_replace_automatic_memory_budget(
     else:
         assert "memory_budget" not in decoder
         assert decoder["kvcache_num_blocks"] == expected_blocks
+        if key:
+            assert "kvcache_num_blocks" not in inputs.rbln_config
     assert cfg.additional_config.optimum_overrides == overrides
     assert cfg.cache_config.num_gpu_blocks_override == num_blocks
     assert cfg.cache_config.gpu_memory_utilization == 0.9
@@ -229,18 +232,22 @@ def test_prefill_chunk_size_conflicting_with_override_is_rejected(arch, override
 
 
 @pytest.mark.parametrize("model_name", MULTIMODAL_CONFIG_BUILDERS)
-@pytest.mark.parametrize("num_blocks", [None, 16])
-def test_multimodal_builders_select_memory_sizing(model_name, num_blocks):
+@pytest.mark.parametrize(
+    "kv_cache_capacity_fields", [{"memory_budget": 0.9}, {"kvcache_num_blocks": 16}]
+)
+def test_multimodal_builders_apply_kv_cache_capacity(
+    model_name, kv_cache_capacity_fields
+):
     config = MULTIMODAL_CONFIG_BUILDERS[model_name](
-        4, 8192, 1024, 1, 0.9, 256, num_blocks
+        4, 8192, 1024, 1, kv_cache_capacity_fields, 256
     )
     decoder = config.get("language_model", config.get("text_model", config))
-    if num_blocks is None:
-        assert decoder["memory_budget"] == 0.9
-        assert "kvcache_num_blocks" not in decoder
-    else:
-        assert decoder["kvcache_num_blocks"] == num_blocks
-        assert "memory_budget" not in decoder
+    actual = {
+        key: decoder[key]
+        for key in ("memory_budget", "kvcache_num_blocks")
+        if key in decoder
+    }
+    assert actual == kv_cache_capacity_fields
 
 
 class TestQwen35ConfigBuilder:
@@ -251,7 +258,7 @@ class TestQwen35ConfigBuilder:
     cfg = {
         "batch_size": 1,
         "num_devices": 1,
-        "memory_budget": 0.9,
+        "kv_cache_capacity_fields": {"memory_budget": 0.9},
         "prefill_chunk_size": 128,
     }
 
