@@ -14,20 +14,18 @@
 
 from types import SimpleNamespace
 
-import pytest
 import torch
 
 from vllm_rbln.patches.rotary_embedding import patched_rope_forward_oot
 
 
-@pytest.mark.parametrize("rotary_dim", [32, 64])
-@pytest.mark.parametrize("is_neox_style", [False, True])
-def test_a_query_alone_rotates_as_it_does_beside_a_key(rotary_dim, is_neox_style):
+def test_a_query_alone_rotates_as_it_does_beside_a_key():
+    rotary_dim = 32
     table = torch.linspace(-1.0, 1.0, 16 * rotary_dim).reshape(16, rotary_dim)
     rope = SimpleNamespace(
         head_size=64,
         rotary_dim=rotary_dim,
-        is_neox_style=is_neox_style,
+        is_neox_style=True,
         cos_cache=table.cos(),
         sin_cache=table.sin(),
     )

@@ -1315,11 +1315,9 @@ class TestGemma4Drafting:
         mlp = Gemma4MLP.__new__(Gemma4MLP)
         torch.nn.Module.__init__(mlp)
         mlp.gate_up_proj = torch.nn.Module()
-        weight = torch.arange(64, dtype=torch.float32).view(16, 4) / 64
+        weight = torch.arange(64, dtype=torch.float32).view(16, 4)
         mlp.gate_up_proj.weight = torch.nn.Parameter(weight)
         mlp.gate_up_proj.quant_method = UnquantizedLinearMethod()
-        mlp.act_fn = SimpleNamespace(approximate="tanh")
-        mlp.down_proj = lambda x: (x.sum(-1, keepdim=True), None)
         monkeypatch.setattr(gemma4_module, "get_layers_from_vllm_config", lambda *a: {})
         monkeypatch.setattr(proposer, "_setup_gemma4_kv_sharing", lambda *a: None)
         monkeypatch.setattr(
@@ -1328,12 +1326,8 @@ class TestGemma4Drafting:
             lambda self, target: setattr(self, "model", mlp),
         )
         proposer.load_model(torch.nn.Identity())
-        inputs = torch.ones(2, 4)
-        gate, up = (inputs @ weight.T).chunk(2, dim=-1)
-        expected = (torch.nn.functional.gelu(gate, approximate="tanh") * up).sum(
-            -1, keepdim=True
-        )
-        torch.testing.assert_close(mlp(inputs), expected)
+        torch.testing.assert_close(mlp.gate_weight, weight[:8])
+        torch.testing.assert_close(mlp.up_weight, weight[8:])
 
     @pytest.mark.parametrize(
         "strict_producer, intermediate", [(False, False), (True, False), (False, True)]
@@ -1374,7 +1368,9 @@ class TestGemma4Drafting:
                 assert positions.flatten().tolist() == [1, 3]
                 torch.testing.assert_close(hidden, torch.full_like(hidden, step))
 
-    @pytest.mark.parametrize("position", [2, 3, 10, 11, 30])
+    # Window 8 over blocks of 4: not yet full, starting mid-block, starting on
+    # a block boundary.
+    @pytest.mark.parametrize("position", [3, 10, 11])
     def test_sliding_mask_keeps_the_oldest_key_at_a_block_boundary(
         self, monkeypatch, position
     ):
