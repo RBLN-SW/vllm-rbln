@@ -1509,6 +1509,65 @@ class TestMultiGroup:
         assert match.num_tokens == SUB_BLOCK_SIZE
         manager.release_sub_block_match(match)
 
+    @staticmethod
+    def _mixed_block_manager(**kwargs):
+        return RBLNKVCacheManager(
+            kv_cache_config=make_kv_cache_config(
+                [full_attention_spec(16), sliding_window_spec(8, 64)], num_blocks=48
+            ),
+            max_model_len=128,
+            scheduler_block_size=16,
+            hash_block_size=8,
+            sub_block_size=4,
+            hash_fn=sha256,
+            **kwargs,
+        )
+
+    @pytest.mark.parametrize("evict_second_block", [False, True])
+    def test_multi_block_tail_after_full_hit(self, evict_second_block):
+        manager = self._mixed_block_manager()
+        donor = make_request("donor", list(range(32)), 8)
+        prefill_request(manager, donor)
+        sources = [
+            list(blocks) for blocks in manager.coordinator.get_blocks(donor.request_id)
+        ]
+        manager.free(donor)
+        if evict_second_block:
+            manager.block_pool.evict_blocks({sources[1][3].block_id})
+
+        reader = make_request("reader", list(range(32)), 8)
+        _, full_hit, _ = manager.get_computed_blocks(reader)
+        assert full_hit == 16
+        _, total_hit, _ = prefill_request(manager, reader)
+        assert total_hit == (24 if evict_second_block else 28)
+        dests = manager.coordinator.get_blocks(reader.request_id)
+        expected = [(0, 1, total_hit - full_hit), (1, 2, 8)]
+        if not evict_second_block:
+            expected.append((1, 3, 4))
+        ops = manager.drain_pending_copy_ops()
+        assert [
+            (op.group_id, op.src_block_id, op.dst_block_id, op.num_tokens) for op in ops
+        ] == [
+            (group, sources[group][index].block_id, dests[group][index].block_id, size)
+            for group, index, size in expected
+        ]
+        manager.release_copy_ops(ops)
+        assert all(sources[group][index].ref_cnt == 0 for group, index, _ in expected)
+
+    @pytest.mark.parametrize("prefix_tokens", [28, 32])
+    @pytest.mark.parametrize("block_drop", [False, True])
+    def test_tail_after_speculative_block_drop(self, prefix_tokens, block_drop):
+        manager = self._mixed_block_manager(use_eagle=block_drop)
+        prefix = list(range(prefix_tokens))
+        donor = make_request("donor", prefix + [90] * 4, 8)
+        prefill_request(manager, donor)
+        manager.free(donor)
+        reader = make_request("reader", prefix + [91] * 4, 8)
+        _, full_hit, _ = manager.get_computed_blocks(reader)
+        _, total_hit, _ = prefill_request(manager, reader)
+        assert total_hit == (full_hit + 4 if block_drop else prefix_tokens)
+        manager.release_copy_ops(manager.drain_pending_copy_ops())
+
     def test_partial_block_indexed_on_free_per_group(self):
         # free indexes the partial block of each group.
         manager = make_hybrid_manager(8, 4, 20, self.SLIDING_WINDOW)
