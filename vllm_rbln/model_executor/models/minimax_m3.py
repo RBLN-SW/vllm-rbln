@@ -370,7 +370,7 @@ class RBLNMiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
         self.prefix = prefix
         self.cache_config = cache_config
         context = vllm_config.compilation_config.static_forward_context
-        ensure_kv_cache_registration(context, prefix, self, subindex=1)
+        ensure_kv_cache_registration(context, prefix, self)
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         # Key-only: MLAAttentionSpec budgets one vector per token (not K + V).

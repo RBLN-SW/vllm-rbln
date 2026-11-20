@@ -48,8 +48,6 @@ class RBLNGDNBlockAuxCache(nn.Module, AttentionLayerBase):
         dtype: torch.dtype,
         prefix_cacheable: bool = True,
         verify_only: bool = False,
-        *,
-        subindex: int,
     ) -> None:
         super().__init__()
         self.prefix = prefix
@@ -60,7 +58,7 @@ class RBLNGDNBlockAuxCache(nn.Module, AttentionLayerBase):
         self.verify_only = verify_only
         self.kv_cache = torch.tensor([])
         context = get_current_vllm_config().compilation_config.static_forward_context
-        ensure_kv_cache_registration(context, prefix, self, subindex=subindex)
+        ensure_kv_cache_registration(context, prefix, self)
 
     def forward(self) -> None: ...
 
@@ -124,7 +122,6 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 CONV_LANES,
             ),
             dtype=model_config.dtype,
-            subindex=1,
         )
         # gdn_verify's draft buffer, [Hk, 2R + 1, K, D] a state block: a step's
         # drafts as (k, v, g, beta) records, which the next step replays. A
@@ -140,7 +137,6 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 dtype=model_config.dtype,
                 prefix_cacheable=False,
                 verify_only=True,
-                subindex=2,
             )
 
     def get_state_shape(self) -> tuple[tuple[int, ...]]:

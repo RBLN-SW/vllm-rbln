@@ -1259,36 +1259,18 @@ def reorder_input_batch(input_batch: "InputBatch", perm: np.ndarray) -> None:
         ]
 
 
-def get_kv_cache_names(
-    cache_names: Iterable[str], forward_context: Mapping[str, Any]
-) -> list[str]:
-    """Order caches by their numeric module path and optional subindex.
-
-    Numbered attention modules and cache groups already encode their order.
-    Caches without a numeric slot declare `kv_cache_subindex`; the default is 0.
-
-    Examples:
-        Standard attention cache: layers.3.self_attn.attn -> (3, 0).
-        GLM-5.3 (2 state groups, speculative decoding on): .attn.0/1=state,
-        .2=conv, .3/4=draft buffers with num_speculative_tokens records each.
-        DeepSeek indexer: layers.3.self_attn.indexer.k_cache -> (3, 1).
-        DeepSeek scale: layers.3.self_attn.indexer.k_cache.scale_cache -> (3, 2).
-        MiniMax indexer: layers.3.self_attn.attn.indexer -> (3, 1).
-    """
-    names_by_sort_key: dict[tuple[int, ...], str] = {}
+def get_kv_cache_names(cache_names: Iterable[str]) -> list[str]:
+    """Order caches by numeric module path, breaking ties by full name."""
+    sort_keys: set[tuple[tuple[int, ...], str]] = set()
     for name in cache_names:
-        layer = forward_context[name]
         numeric_path = tuple(int(part) for part in name.split(".") if part.isdecimal())
         if not numeric_path:
             raise ValueError(f"KV cache {name} has no numeric layer path")
-        sort_key = (*numeric_path, getattr(layer, "kv_cache_subindex", 0))
-        if sort_key in names_by_sort_key:
-            raise ValueError(
-                f"Duplicate KV cache sort key {sort_key}: "
-                f"{names_by_sort_key[sort_key]} and {name}"
-            )
-        names_by_sort_key[sort_key] = name
-    return [names_by_sort_key[sort_key] for sort_key in sorted(names_by_sort_key)]
+        sort_key = (numeric_path, name)
+        if sort_key in sort_keys:
+            raise ValueError(f"Duplicate KV cache name: {name}")
+        sort_keys.add(sort_key)
+    return [name for _, name in sorted(sort_keys)]
 
 
 def copy_host_device_kv_blocks(

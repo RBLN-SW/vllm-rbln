@@ -31,7 +31,6 @@ from vllm_rbln.v1.attention.backends.mla.indexer import (
     RBLNDeepseekV32IndexerBackend,
     RBLNDeepseekV32IndexerScaleBackend,
 )
-from vllm_rbln.v1.kv_cache import ensure_kv_cache_registration
 
 logger = init_logger(__name__)
 _original_indexer_cache_init = DeepseekV32IndexerCache.__init__
@@ -169,8 +168,6 @@ def rbln_indexer_cache_init(self, *args, **kwargs) -> None:
     self.dtype = torch.float8_e4m3fn if self.is_fp8_cache else torch.bfloat16
 
     model_config = vllm_config.model_config
-    context = vllm_config.compilation_config.static_forward_context
-    ensure_kv_cache_registration(context, self.prefix, self, subindex=1)
 
     # register the per-token scale cache (2-cache spec).
     self.scale_cache = None
@@ -184,7 +181,6 @@ def rbln_indexer_cache_init(self, *args, **kwargs) -> None:
             cache_config=self.cache_config,
         )
         scale.get_attn_backend = lambda: RBLNDeepseekV32IndexerScaleBackend
-        ensure_kv_cache_registration(context, scale.prefix, scale, subindex=2)
         self.scale_cache = scale
 
 

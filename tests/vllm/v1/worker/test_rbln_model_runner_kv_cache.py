@@ -239,10 +239,8 @@ class TestCachePositionsFollowCacheOrder:
     """Lookup uses the rank-local order even with variable cache counts."""
 
     @staticmethod
-    def _bind(make_model_runner, names, cache_subindices):
-        runner = make_model_runner(
-            layers=names, cache_subindices=cache_subindices, init_kv_cache=False
-        )
+    def _bind(make_model_runner, names):
+        runner = make_model_runner(layers=names, init_kv_cache=False)
         ctx = runner.compilation_config.static_forward_context
 
         runner.initialize_kv_cache(make_kv_cache_config(runner, groups=[names]))
@@ -260,11 +258,7 @@ class TestCachePositionsFollowCacheOrder:
             "model.layers.1.self_attn.attn.indexer",  # ... and the indexer keys
             "model.layers.2.self_attn.attn",  # dense again
         )
-        runner = self._bind(
-            make_model_runner,
-            names,
-            cache_subindices={names[2]: 1},
-        )
+        runner = self._bind(make_model_runner, names)
         assert runner.kv_cache_names == list(names)
         assert runner.kv_cache_positions == {name: i for i, name in enumerate(names)}
 
@@ -276,11 +270,7 @@ class TestCachePositionsFollowCacheOrder:
             for layer in (0, 1)
             for module in ("attn", "indexer.k_cache", "indexer.k_cache.scale_cache")
         )
-        runner = self._bind(
-            make_model_runner,
-            names,
-            cache_subindices={name: i % 3 for i, name in enumerate(names) if i % 3},
-        )
+        runner = self._bind(make_model_runner, names)
         assert runner.kv_cache_names == list(names)
         assert runner.kv_cache_positions == {name: i for i, name in enumerate(names)}
 
@@ -660,7 +650,6 @@ class TestGatedDeltaNetOnTheAttentionPool:
                 owner=self.GDN,
                 block_shape=(3, 1, 2, 64),
                 dtype=torch.bfloat16,
-                subindex=1,
             )
         runner.initialize_kv_cache(cache_config)
         return runner
@@ -738,14 +727,7 @@ class TestCacheNameResolution:
 
     @pytest.mark.parametrize("shared", [False, True])
     def test_after_initialization_and_after_a_rebind(self, make_model_runner, shared):
-        runner = make_model_runner(
-            layers=self.LAYERS,
-            init_kv_cache=False,
-            cache_subindices={
-                self.LAYERS[i]: subindex
-                for i, subindex in ((1, 1), (2, 2), (5, 1), (6, 2))
-            },
-        )
+        runner = make_model_runner(layers=self.LAYERS, init_kv_cache=False)
 
         groups = [self.LAYERS[::2], self.LAYERS[1::2]] if shared else [self.LAYERS]
         runner.initialize_kv_cache(make_kv_cache_config(runner, groups=groups))

@@ -40,16 +40,11 @@ def ensure_kv_cache_registration(
     context: dict[str, Any],
     name: str,
     cache: torch.nn.Module,
-    *,
-    subindex: int,
 ) -> None:
-    """Set the cache subindex and register the cache if it is new."""
-    if subindex < 1:
-        raise ValueError(f"KV cache {name} requires a positive subindex")
+    """Register the cache and reject a different cache with the same name."""
     if name in context and context[name] is not cache:
         raise ValueError(f"Duplicate layer name: {name}")
 
-    cache.kv_cache_subindex = subindex
     context.setdefault(name, cache)
 
 
