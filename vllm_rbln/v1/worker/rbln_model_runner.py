@@ -1600,8 +1600,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     "--mm-processor-kwargs."
                 )
             # TODO(RBLN): the drafter's builders get no row ends, so its sliding
-            # layers would run the ranges causally.
-            if self.speculative_config is not None:
+            # layers would run the ranges causally. A Gemma4 MTP assistant only
+            # queries the target's last position, which no range runs past.
+            spec = self.speculative_config
+            if spec is not None and not spec.use_gemma4_mtp():
                 raise ValueError(
                     "Speculative decoding is not supported with multimodal inputs of "
                     "an mm prefix LM on RBLN yet."
