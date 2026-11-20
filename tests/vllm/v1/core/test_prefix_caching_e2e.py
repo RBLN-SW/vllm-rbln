@@ -101,3 +101,61 @@ def test_prefix_cache_matches_baseline(
     # one's arithmetic, so the logprobs are equal, not merely close. The tokens
     # alone say little: a truncated model repeats one.
     assert cached_outputs == baseline_outputs
+
+
+# A hit inside a block: --prefix-match-unit at the prefill chunk keeps one
+# partial entry at the prompt's last unit boundary, and a hit copies that block
+# (KV, state and conv ring) before the request writes past it.
+CHUNK = 128
+_LONG_PREFIX = random.Random(0).sample(range(2000, 100000), 828)
+LONG_PROMPTS = [
+    TokensPrompt(
+        prompt_token_ids=_LONG_PREFIX
+        + random.Random(i + 1).sample(range(2000, 100000), 10)
+    )
+    for i in range(4)
+]
+
+
+@pytest.mark.model_compile
+@pytest.mark.parametrize(
+    "speculative_config, hit",
+    [
+        # The first prompt's last unit boundary: 838 // 128 * 128.
+        (None, 768),
+        # An MTP lookup drops one unit, as the block drop does at block size.
+        ({"method": "mtp", "num_speculative_tokens": 1}, 640),
+    ],
+    ids=["mtp-off", "mtp-on"],
+)
+@pytest.mark.parametrize("spec", spec_params(MODELS))
+def test_fine_grained_prefix_hit_matches_baseline(
+    vllm_runner, spec: CompileModelSpec, monkeypatch, speculative_config, hit
+) -> None:
+    apply_spec_envs(spec, monkeypatch)
+    engine_kwargs = {
+        **spec.engine_kwargs,
+        "max_num_batched_tokens": CHUNK,
+        "speculative_config": speculative_config,
+    }
+    with vllm_runner(
+        spec.model, enable_prefix_caching=False, **engine_kwargs
+    ) as baseline:
+        baseline_outputs = _tokens_and_logprobs(
+            baseline.llm.generate(LONG_PROMPTS, SAMPLING_PARAMS)
+        )
+
+    with vllm_runner(
+        spec.model,
+        enable_prefix_caching=True,
+        prefix_match_unit=CHUNK,
+        **engine_kwargs,
+    ) as cached:
+        cached.llm.generate(LONG_PROMPTS[0], SAMPLING_PARAMS)
+        outputs = cached.llm.generate(LONG_PROMPTS, SAMPLING_PARAMS)
+        cached_outputs = _tokens_and_logprobs(outputs)
+        num_cached = [o.num_cached_tokens for o in outputs]
+
+    # Past the last block boundary (512), which is all a whole-block hit reaches.
+    assert num_cached == [hit] * len(LONG_PROMPTS)
+    assert cached_outputs == baseline_outputs
