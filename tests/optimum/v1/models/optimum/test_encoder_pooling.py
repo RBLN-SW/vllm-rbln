@@ -11,13 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""E2E check that encoder models end up with the right sequence pooling.
+"""Check how the Optimum model wrappers configure pooling.
 
-For each real encoder architecture supported by the RBLN optimum path a real
-``VllmConfig`` is built, so vLLM's own ``ModelConfig`` resolves ``pooler_config``
-exactly as it would in production. The model is then built through the real
-``RBLNOptimumForEncoderModel.__init__`` code path; only the optimum-rbln model
-compilation/loading (``init_model``) is faked, since that requires an NPU.
+These tests build ``VllmConfig`` with real checkpoints so ``ModelConfig``
+resolves ``pooler_config`` as it would in production. Only optimum-rbln model
+compilation and loading (``init_model``) are faked, since they require an NPU.
 
 Encoder-only models (BertModel / RobertaModel / XLMRobertaModel and their
 ``*ForSequenceClassification`` variants) are forced to CLS pooling. Decoder-based
@@ -45,6 +43,7 @@ from vllm.config import (
 from vllm.model_executor.layers.pooler import DispatchPooler
 from vllm.model_executor.layers.pooler.seqwise import SequencePooler
 
+from vllm_rbln.model_executor.models.optimum import load_model
 from vllm_rbln.model_executor.models.optimum.base import ModelInputForRBLN
 from vllm_rbln.model_executor.models.optimum.encoder import (
     RBLNClassifierPooler,
@@ -72,15 +71,16 @@ ENCODER_MODELS = [
 ]
 
 
-def _build_encoder(model_id: str):
+def _build_pooling_model(model_id: str):
     model_config = ModelConfig(model=model_id, dtype=torch.float32, seed=42)
-    # Mirror RBLNOptimumModelRunner: Qwen3 pooling models have their HF arch
-    # (Qwen3ForCausalLM) remapped to Qwen3Model before the encoder is built.
+    # Mirror the platform's architecture remap before model loading.
     if is_qwen3_embedding(model_config):
         model_config.hf_config.__dict__["architectures"] = ["Qwen3Model"]
     vllm_config = VllmConfig(
         model_config=model_config,
-        cache_config=CacheConfig(block_size=16, cache_dtype="auto"),
+        cache_config=CacheConfig(
+            block_size=16, cache_dtype="auto", enable_prefix_caching=False
+        ),
         scheduler_config=SchedulerConfig(
             max_num_seqs=2,
             max_num_batched_tokens=128,
@@ -89,22 +89,21 @@ def _build_encoder(model_id: str):
         ),
     )
 
-    # Fake ONLY the optimum-rbln compile/load step (the only part that needs an
-    # NPU); everything else runs the real encoder __init__ / pooler setup.
     def fake_init_model(self):
         self.model = MagicMock()
         self.model.get_kvcache_num_blocks.return_value = 1
+        self.rbln_model_config = SimpleNamespace()
 
     with (
         set_current_vllm_config(vllm_config),
         patch.object(RBLNOptimumModelBase, "init_model", fake_init_model),
     ):
-        return RBLNOptimumForEncoderModel(vllm_config=vllm_config)
+        return load_model(vllm_config)
 
 
 @pytest.mark.parametrize("model_id, expected_seq_pool, expected_pooler", ENCODER_MODELS)
-def test_encoder_pooling(model_id, expected_seq_pool, expected_pooler):
-    model = _build_encoder(model_id)
+def test_sequence_pooling(model_id, expected_seq_pool, expected_pooler):
+    model = _build_pooling_model(model_id)
 
     pooler_config = model.vllm_config.model_config.pooler_config
     assert pooler_config.seq_pooling_type == expected_seq_pool
@@ -155,7 +154,9 @@ def _build_qwen3_vl_embedding():
     model_config.hf_config.__dict__["architectures"] = ["Qwen3VLModel"]
     vllm_config = VllmConfig(
         model_config=model_config,
-        cache_config=CacheConfig(block_size=16, cache_dtype="auto"),
+        cache_config=CacheConfig(
+            block_size=16, cache_dtype="auto", enable_prefix_caching=False
+        ),
         scheduler_config=SchedulerConfig(
             max_num_seqs=1,
             max_num_batched_tokens=128,

@@ -37,7 +37,14 @@ def patch_upstream() -> None:
 
 
 def validate_request(params: "SamplingParams | PoolingParams") -> None:
-    pass
+    from vllm.pooling_params import PoolingParams
+
+    # KV-cache hits do not provide the hidden states for skipped tokens.
+    if isinstance(params, PoolingParams) and params.task in (
+        "token_embed",
+        "token_classify",
+    ):
+        params.skip_reading_prefix_cache = True
 
 
 def check_and_update(vllm_config: "VllmConfig") -> None:
@@ -49,8 +56,8 @@ def check_and_update(vllm_config: "VllmConfig") -> None:
     )
     from vllm_rbln.utils.optimum.registry import (
         get_rbln_model_info,
+        is_encoder_pooling_arch,
         is_multi_modal,
-        is_pooling_arch,
     )
 
     # Everything below, and the sync at the end, reads additional_config as an
@@ -120,7 +127,9 @@ def check_and_update(vllm_config: "VllmConfig") -> None:
     # ModelConfig.is_encoder_decoder is a @cached_property that's
     # already evaluated by this point, so invalidate the cache too.
     hf_config = model_config.hf_config
-    if is_pooling_arch(hf_config) and getattr(hf_config, "is_encoder_decoder", False):
+    if is_encoder_pooling_arch(hf_config) and getattr(
+        hf_config, "is_encoder_decoder", False
+    ):
         hf_config.is_encoder_decoder = False
         with contextlib.suppress(KeyError):
             del model_config.__dict__["is_encoder_decoder"]
@@ -178,8 +187,9 @@ def disable_unsupported_prefix_caching(vllm_config: "VllmConfig") -> None:
         is_qwen3_reranker,
     )
     from vllm_rbln.utils.optimum.registry import (
+        is_decoder_pooling_arch,
         is_enc_dec_arch,
-        is_pooling_arch,
+        is_encoder_pooling_arch,
     )
 
     if not vllm_config.cache_config.enable_prefix_caching:
@@ -195,13 +205,16 @@ def disable_unsupported_prefix_caching(vllm_config: "VllmConfig") -> None:
     model_config = vllm_config.model_config
     hf_config = model_config.hf_config
 
-    # Prefix caching is supported only for decoder-only models for now.
-    if is_qwen3_embedding(model_config) or is_qwen3_reranker(model_config):
-        _disable_prefix_caching(vllm_config, "Qwen3 pooling models")
+    if is_qwen3_reranker(model_config):
+        _disable_prefix_caching(vllm_config, "Qwen3 reranker models")
     elif is_enc_dec_arch(hf_config):
         _disable_prefix_caching(vllm_config, "encoder-decoder models")
-    elif is_pooling_arch(hf_config):
-        _disable_prefix_caching(vllm_config, "pooling models")
+    elif is_encoder_pooling_arch(hf_config):
+        _disable_prefix_caching(vllm_config, "encoder pooling models")
+    elif (
+        is_decoder_pooling_arch(hf_config) or is_qwen3_embedding(model_config)
+    ) and model_config.pooler_config.seq_pooling_type != "LAST":
+        _disable_prefix_caching(vllm_config, "decoder pooling without LAST pooling")
     elif _uses_sliding_window(hf_config):
         _disable_prefix_caching(vllm_config, "sliding window models")
     elif model_config.is_hybrid:

@@ -16,6 +16,7 @@ import contextlib
 import json
 import tempfile
 from types import MethodType, SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -31,6 +32,7 @@ from vllm.distributed import (
     ensure_model_parallel_initialized,
     init_distributed_environment,
 )
+from vllm.engine.arg_utils import EngineArgs
 from vllm.model_executor.layers.pooler.special import IdentityPooler
 from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.multimodal.inputs import PlaceholderRange
@@ -41,7 +43,9 @@ from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 from vllm.v1.sample.metadata import SamplingMetadata
 
 import vllm_rbln.v1.worker.optimum_model_runner as runner_module
+from vllm_rbln.model_executor.models.optimum import load_model
 from vllm_rbln.model_executor.models.optimum.model_base import (
+    RBLNOptimumModelBase,
     RBLNOptimumMultimodalMixin,
 )
 from vllm_rbln.model_executor.models.optimum.qwen3_vl import (
@@ -986,6 +990,59 @@ def test_metrics_finish_with_pooling_output(model_runner, monkeypatch, tmp_path)
     sections = json.loads((tmp_path / "metrics.json").read_text())["sections"]
     assert set(sections) == {"MODEL + SAMPLE (PREFILL)", "E2E (PREFILL)"}
     assert all(section["call_count"] == 1 for section in sections.values())
+
+
+@pytest.mark.parametrize("copy_fails", [False, True])
+def test_decoder_pooling_with_a_cached_prefix(monkeypatch, copy_fails):
+    monkeypatch.setenv("RBLN_FORCE_NPU_NAME", "RBLN-CA25")
+    monkeypatch.setattr(
+        runner_module, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+    )
+    config = EngineArgs(
+        model="Qwen/Qwen3-Embedding-0.6B",
+        model_impl="optimum",
+        max_model_len=1024,
+        max_num_seqs=1,
+        block_size=512,
+        enable_prefix_caching=True,
+    ).create_engine_config()
+    model_runner = RBLNOptimumModelRunner(config, torch.device("cpu"))
+
+    def prefill(**kwargs):
+        return SimpleNamespace(logits=kwargs["cache_position"].float().unsqueeze(-1))
+
+    prefill_decoder = Mock(side_effect=prefill)
+    copy_kv_cache = prefill_decoder.runtime._copy_kv_cache
+    if copy_fails:
+        copy_kv_cache.side_effect = RuntimeError("KV copy failed")
+
+    def init_model(model):
+        model.rbln_model_config = SimpleNamespace()
+        model.model = SimpleNamespace(
+            prefill_decoder=prefill_decoder, get_kvcache_num_blocks=lambda: 8
+        )
+
+    monkeypatch.setattr(RBLNOptimumModelBase, "init_model", init_model)
+    with set_current_vllm_config(config):
+        model_runner.model = load_model(config)
+    scheduler_output = _schedule_new_request(
+        "r0",
+        block_ids=([1, 2],),
+        outer_block_ids=[1],
+        token_ids=list(range(129)),
+        cached_block_table=[0],
+        cached_length=[128],
+        pooling_params=PoolingParams(task="embed", use_activation=False),
+    )
+
+    output = model_runner.execute_model(scheduler_output)
+
+    copy_kv_cache.assert_called_once_with(0, 1, 128)
+    prefill_args = prefill_decoder.call_args.kwargs
+    assert prefill_args["block_tables"].tolist() == [1]
+    expected_positions = list(range(129)) if copy_fails else [128]
+    assert prefill_args["cache_position"].tolist() == [expected_positions]
+    torch.testing.assert_close(output.pooler_output[0], torch.tensor([128.0]))
 
 
 def test_metrics_do_not_record_an_idle_step(model_runner, monkeypatch, tmp_path):

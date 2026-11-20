@@ -41,8 +41,8 @@ from vllm.config import (
 
 from vllm_rbln.model_executor.models.optimum.base import ModelInputForRBLN
 from vllm_rbln.model_executor.models.optimum.model_base import RBLNOptimumModelBase
-from vllm_rbln.model_executor.models.optimum.qwen3_reranker import (
-    RBLNOptimumQwen3RerankerModel,
+from vllm_rbln.model_executor.models.optimum.qwen3 import (
+    RBLNOptimumQwen3ForSequenceClassification,
     RBLNQwen3RerankerPooler,
     resolve_label_token_ids,
 )
@@ -56,7 +56,7 @@ from vllm_rbln.utils.optimum.predicates import is_qwen3_embedding, is_qwen3_rera
 from vllm_rbln.utils.optimum.registry import (
     get_rbln_model_info,
     is_generation_arch,
-    is_pooling_arch,
+    is_text_pooling_arch,
 )
 
 MODEL_ID = "Qwen/Qwen3-Reranker-0.6B"
@@ -102,7 +102,7 @@ def _build_reranker(max_seq_len=16, batch_size=2):
         set_current_vllm_config(vllm_config),
         patch.object(RBLNOptimumModelBase, "init_model", fake_init_model),
     ):
-        return RBLNOptimumQwen3RerankerModel(vllm_config=vllm_config)
+        return RBLNOptimumQwen3ForSequenceClassification(vllm_config=vllm_config)
 
 
 def test_label_token_ids():
@@ -144,7 +144,7 @@ def test_registered_as_a_generation_arch():
     hf_config = _model_config().hf_config
 
     assert is_generation_arch(hf_config)
-    assert not is_pooling_arch(hf_config)
+    assert not is_text_pooling_arch(hf_config)
     assert is_chunked_prefill_arch(hf_config)
     assert get_rbln_model_info(hf_config) == (
         "qwen3_reranker",
