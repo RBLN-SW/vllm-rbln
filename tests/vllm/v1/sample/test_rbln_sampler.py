@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from collections.abc import Callable
+from itertools import product
 from typing import Any
 
 import pytest
@@ -39,7 +40,7 @@ from .utils import (
 # Logits arrive in the model's dtype, and RBLN serves all three.
 DTYPES = [torch.bfloat16, torch.float16, torch.float32]
 # The default and the opt-out must draw from the same distribution.
-FUSED = pytest.mark.parametrize("fused", [True, False], ids=["fused", "unfused"])
+FUSED_MODES = {"fused": True, "unfused": False}
 
 
 @pytest.fixture
@@ -201,7 +202,6 @@ DISTRIBUTION_CASES = [
         SamplingParams(logit_bias={WEIGHTED[31]: -100.0, WEIGHTED[30]: -100.0}),
         "logit_bias_ban",
     ),
-    # Every fused stage at once.
     case(
         SamplingParams(
             temperature=0.8,
@@ -241,9 +241,17 @@ DISTRIBUTION_CASES = [
 ]
 
 
-@pytest.mark.parametrize(("params", "request_kwargs"), DISTRIBUTION_CASES)
-@pytest.mark.parametrize("dtype", DTYPES, ids=str)
-@FUSED
+# Without input_batch, only active min_p changes paths under fused sampling.
+@pytest.mark.parametrize(
+    ("params", "request_kwargs", "dtype", "fused"),
+    [
+        pytest.param(*case.values, dtype, fused, id=f"{mode}-{dtype}-{case.id}")
+        for (mode, fused), dtype, case in product(
+            FUSED_MODES.items(), DTYPES, DISTRIBUTION_CASES
+        )
+        if fused or case.values[0].min_p > 0
+    ],
+)
 @pytest.mark.use_device
 def test_sampled_distribution(params, request_kwargs, dtype, fused):
     row = logits_from_weights(weights=range(1, 33), dtype=dtype)
@@ -315,7 +323,7 @@ def test_structured_output_mask_with_top_p_min_p():
 
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=str)
-@FUSED
+@pytest.mark.parametrize("fused", FUSED_MODES.values(), ids=FUSED_MODES)
 @pytest.mark.use_device
 def test_mixed_batch_keeps_each_row_to_its_own_params(dtype, fused):
     """One op call serves the mixed batch, greedy rows as top_k=1. Each row must
