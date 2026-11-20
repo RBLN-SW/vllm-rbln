@@ -164,6 +164,7 @@ def test_image_encoding_reuses_eager_or_compiled_encoder(monkeypatch, compiled):
     model = _bare(cls)
     model.visual = torch.nn.Linear(2, 2, bias=False)
     model.visual.spatial_merge_size = 1
+    model.visual.device = model.visual.weight.device
     model.mm_embeds_dtype = torch.float32
     encoder = torch.nn.Sequential(model.visual)
     build_encoder = Mock(return_value=encoder)
@@ -185,6 +186,35 @@ def test_image_encoding_reuses_eager_or_compiled_encoder(monkeypatch, compiled):
     assert not encoder.training
     assert model._mm_encoder is encoder
     assert "_mm_encoder" not in model._modules
+
+
+@pytest.mark.use_device
+def test_video_embeddings_survive_encoder_output_reuse():
+    from vllm.platforms import current_platform
+
+    import vllm_rbln.model_executor.models.glm5_next as glm
+
+    device = torch.device(current_platform.device_type)
+    model = _bare(glm.RBLNGlm5NextForConditionalGeneration)
+    model.visual = SimpleNamespace(device=device, spatial_merge_size=1)
+    model.mm_embeds_dtype = torch.float32
+    model._encoder_inputs = lambda frame, grid: [frame.to(device)]
+    buffer = torch.empty(2, 1, device=device)
+
+    def encoder(pixels):
+        buffer[:1].copy_(pixels)
+        return buffer
+
+    object.__setattr__(model, "_mm_encoder", encoder)
+    pixels = torch.arange(3.0).unsqueeze(1)
+    videos = model.embed_multimodal(
+        pixel_values_videos=pixels, video_grid_thw=torch.tensor([[2, 1, 1], [1, 1, 1]])
+    )
+    buffer.fill_(-1)
+
+    for actual, expected in zip(videos, pixels.split([2, 1]), strict=True):
+        assert actual.device == buffer.device
+        torch.testing.assert_close(actual.cpu(), expected)
 
 
 def _build_with_token_budgets(monkeypatch, budgets, limits, is_first_rank=True):

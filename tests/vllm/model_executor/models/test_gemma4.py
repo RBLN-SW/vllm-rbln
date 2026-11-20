@@ -215,6 +215,45 @@ def test_warm_up_runs_every_bucket_once_full():
     assert calls == [(18, 18), (45, 45), (90, 90)]
 
 
+@pytest.mark.use_device
+def test_image_and_video_embeddings_survive_encoder_output_reuse():
+    from vllm.platforms import current_platform
+
+    device = torch.device(current_platform.device_type)
+    tower = nn.Linear(1, 1, device=device)
+    tower.config = SimpleNamespace(pooling_kernel_size=POOL)
+    buffer = torch.empty(1, 1, 1, device=device)
+    model = _bare_model(
+        vision_tower=tower, model_dtype=torch.float32, mm_encoder_patch_buckets=[9]
+    )
+
+    def encoder(patches, *args):
+        buffer.copy_(patches[:, :1, :1])
+        return buffer
+
+    object.__setattr__(model, "_mm_encoder", encoder)
+    _, positions = _image(3, 3, num_patches=9)
+    positions = positions.expand(2, -1, -1)
+    pixels = torch.tensor([1.0, 2.0]).view(2, 1, 1).expand(-1, 9, 12)
+    images = model._process_image_input(
+        {"pixel_values": pixels, "pixel_position_ids": positions}
+    )
+    (video,) = model._process_video_input(
+        {
+            "pixel_values_videos": pixels.flip(0),
+            "pixel_position_ids_videos": positions,
+            "video_frame_counts": [2],
+        }
+    )
+    buffer.fill_(-1)
+
+    for actual, expected in zip(
+        (*images, video), ([[1.0]], [[2.0]], [[2.0], [1.0]]), strict=True
+    ):
+        assert actual.device == buffer.device
+        torch.testing.assert_close(actual.cpu(), torch.tensor(expected))
+
+
 def _built_model(
     monkeypatch, *, cap, budgets, chunk=512, per_layer_input=0, attention_layers=()
 ):

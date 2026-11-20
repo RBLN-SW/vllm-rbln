@@ -692,9 +692,8 @@ class TestMmEncoder:
         }
 
     @pytest.mark.parametrize("recording", [False, True])
-    @pytest.mark.parametrize("preserve_device", [False, True])
     def test_rbln_latency_waits_for_encoder_completion(
-        self, ctx, clock, monkeypatch, recording, preserve_device
+        self, ctx, clock, monkeypatch, recording
     ):
         monkeypatch.setattr(pm, "_ACTIVE_CTX", ctx)
         rbln_device = torch.device("rbln:1")
@@ -727,8 +726,7 @@ class TestMmEncoder:
         monkeypatch.setattr(pm, "_run_mm_encoder", run_encoder)
         if recording:
             ctx.start_pass()
-        device = None if preserve_device else rbln_device
-        assert pm.run_mm_encoder(None, [pixels], 2, device=device) is output
+        assert pm.run_mm_encoder(None, [pixels], 2, device=rbln_device) is output
 
         if recording:
             assert waits == ["before", "after"]
@@ -738,7 +736,7 @@ class TestMmEncoder:
             assert not ctx._encoder
 
     @pytest.mark.parametrize("recording", [False, True])
-    @pytest.mark.parametrize("device", [None, "meta"])
+    @pytest.mark.parametrize("device", ["meta", torch.device("meta")])
     @pytest.mark.parametrize("dtype", [None, torch.bfloat16])
     def test_encoder_device_and_dtype_are_forwarded(
         self, ctx, monkeypatch, recording, device, dtype
@@ -746,7 +744,7 @@ class TestMmEncoder:
         monkeypatch.setattr(pm, "_ACTIVE_CTX", ctx)
         if recording:
             ctx.start_pass()
-        pixels = torch.ones(4, 3, device="meta" if device is None else "cpu")
+        pixels = torch.ones(4, 3)
 
         output = pm.run_mm_encoder(
             lambda pixels: pixels, [pixels], 2, device=device, dtype=dtype
@@ -780,6 +778,7 @@ class TestMmEncoder:
         vision_model = types.SimpleNamespace(vision_segment_max_frames=None)
         vision_tower = torch.nn.Module()
         vision_tower.register_parameter("anchor", torch.nn.Parameter(torch.zeros(1)))
+        vision_tower.device = next(vision_tower.parameters()).device
         vision_tower.spatial_merge_size = 1
         vision_tower.vision_model = vision_model
         setattr(model, tower, vision_tower)
@@ -796,11 +795,7 @@ class TestMmEncoder:
                 return PendingOutput(self.pixels[index])
 
             def to(self, *, device, dtype):
-                assert device == (
-                    next(vision_tower.parameters()).device
-                    if model_name == "minimax"
-                    else "cpu"
-                )
+                assert device == vision_tower.device
                 events.append("to")
                 clock.advance(35 * MS)
                 return self.pixels.to(device=device, dtype=dtype)
@@ -821,9 +816,8 @@ class TestMmEncoder:
         ctx.end_pass()
 
         assert events == ["encoder", "slice", "to"] * 2
-        dtype = torch.bfloat16 if model_name == "minimax" else pixels.dtype
-        torch.testing.assert_close(outputs[0], pixels[:1].to(dtype))
-        torch.testing.assert_close(outputs[1], pixels[1:].to(dtype))
+        torch.testing.assert_close(outputs[0], pixels[:1].to(torch.bfloat16))
+        torch.testing.assert_close(outputs[1], pixels[1:].to(torch.bfloat16))
         assert {shape: m.latencies for shape, m in ctx._encoder.items()} == {
             "1x3": [pytest.approx(36 * MS)],
             "2x3": [pytest.approx(36 * MS)],

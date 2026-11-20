@@ -1499,19 +1499,25 @@ class RBLNGlm5NextForConditionalGeneration(
                 grids = grid_thw.tolist()
                 sizes = [math.prod(g) for g in grids]
                 merge2 = self.visual.spatial_merge_size**2
-                for pixels, (_, h, w) in zip(pixel_values.split(sizes), grids):
+                encoder = self._mm_encoder
+                device = self.visual.device
+                for pixels, (t, h, w) in zip(pixel_values.split(sizes), grids):
                     # Upstream cu_seqlens splits attention at every temporal
                     # patch. Encoding these independently preserves that mask.
-                    frames = [
+                    num_tokens = h * w // merge2
+                    frames = (
                         rbln_utils.run_mm_encoder(
-                            self._mm_encoder,
+                            encoder,
                             self._encoder_inputs(frame, [1, h, w]),
-                            h * w // merge2,
+                            num_tokens,
                             dtype=self.mm_embeds_dtype,
+                            device=device,
                         )
                         for frame in pixels.split(h * w)
-                    ]
-                    outputs.append(frames[0] if len(frames) == 1 else torch.cat(frames))
+                    )
+                    outputs.append(
+                        rbln_utils.collect_mm_encoder_outputs(frames, t * num_tokens)
+                    )
         return tuple(outputs)
 
     def forward(

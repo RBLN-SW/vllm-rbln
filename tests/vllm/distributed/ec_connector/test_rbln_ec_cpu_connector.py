@@ -168,9 +168,15 @@ def test_nixl_without_ec_enable_nixl(connect, monkeypatch, ec_role, nixl):
     assert len(setups) == int(nixl)
 
 
-def test_a_saved_output_loads_back_as_is(connect):
+@pytest.mark.parametrize(
+    "use_device", [False, pytest.param(True, marks=pytest.mark.use_device)]
+)
+def test_a_saved_output_loads_back_as_is(connect, use_device):
+    from vllm.platforms import current_platform
+
     producer, consumer = connect(ec_role="ec_producer"), connect(ec_role="ec_consumer")
     embeds = torch.arange(3 * HIDDEN, dtype=torch.bfloat16).reshape(3, HIDDEN)
+    output = embeds.to(current_platform.device_type) if use_device else embeds
     # One block per placeholder, which can outnumber the embeddings.
     block_ids = [5, 2, 3, 7]
     encoder_cache: dict[str, torch.Tensor] = {}
@@ -178,7 +184,7 @@ def test_a_saved_output_loads_back_as_is(connect):
     saved = _step(
         producer,
         ECCPUConnectorMetadata(saves={"img": block_ids}),
-        lambda: producer.save_caches({"img": embeds}, "img"),
+        lambda: producer.save_caches({"img": output}, "img"),
     )
     loaded = _step(
         consumer,

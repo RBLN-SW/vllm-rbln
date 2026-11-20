@@ -46,6 +46,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.parse import MultiModalDataItems
 from vllm.sequence import IntermediateTensors
 
+from vllm_rbln import utils as rbln_utils
 from vllm_rbln.logger import init_logger
 from vllm_rbln.model_executor.models.interfaces import SupportsRBLNMultiModal
 from vllm_rbln.platform import RBLN_DEFAULT_MAX_NUM_BATCHED_TOKENS
@@ -353,16 +354,22 @@ class RBLNQwen3_5ForConditionalGeneration(
         grids = grid_thw.tolist()
         sizes = [math.prod(g) for g in grids]
         tokens = [h * w // self.visual.spatial_merge_size**2 for _, h, w in grids]
+        device = self.visual.device
         embeds = []
         with torch.inference_mode():
             # TODO: a video's temporal patches share h and w, so their position
             # embeddings and key mask could be built once per video.
-            for pixels, (_, h, w), n in zip(pixel_values.split(sizes), grids, tokens):
-                frames = [
-                    encoder(*self._encoder_inputs(frame, [1, h, w]))[:n].cpu()
+            for pixels, (t, h, w), n in zip(pixel_values.split(sizes), grids, tokens):
+                frames = (
+                    rbln_utils.run_mm_encoder(
+                        encoder,
+                        self._encoder_inputs(frame, [1, h, w]),
+                        n,
+                        device=device,
+                    )
                     for frame in pixels.split(h * w)
-                ]
-                embeds.append(torch.cat(frames))
+                )
+                embeds.append(rbln_utils.collect_mm_encoder_outputs(frames, t * n))
         return tuple(embeds)
 
     def _process_image_input(self, image_input) -> tuple[torch.Tensor, ...]:

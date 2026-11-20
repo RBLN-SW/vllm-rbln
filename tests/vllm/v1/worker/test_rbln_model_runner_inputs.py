@@ -475,8 +475,10 @@ class TestGatherMultimodalEmbeddings:
 
         assert len(calls) == 1
         torch.testing.assert_close(calls[0], pixels.flip(0))
-        torch.testing.assert_close(runner.encoder_cache["image-0"], pixels[0] + 10)
-        torch.testing.assert_close(runner.encoder_cache["image-1"], pixels[1] + 10)
+        for i, pixel_values in enumerate(pixels):
+            cached = runner.encoder_cache[f"image-{i}"]
+            assert cached.device.type == runner.device.type
+            torch.testing.assert_close(cached.cpu(), pixel_values + 10)
 
     @pytest.mark.parametrize(
         "computed, with_text_holes, shift, values",

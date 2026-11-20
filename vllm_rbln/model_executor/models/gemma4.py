@@ -419,7 +419,7 @@ class RBLNGemma4ForConditionalGeneration(
         # The patches of a grid whose sides are multiples of the pooling kernel
         # pool into the leading cells, in order.
         num_soft_tokens = num_patches // tower.config.pooling_kernel_size**2
-        return rbln_utils.run_mm_encoder(
+        embeds = rbln_utils.run_mm_encoder(
             lambda *inputs: encoder(*inputs)[0],
             [
                 patches.to(device),
@@ -428,7 +428,10 @@ class RBLNGemma4ForConditionalGeneration(
                 key_bias.to(device=device, dtype=self.model_dtype),
             ],
             num_soft_tokens,
+            device=device,
         )
+        # Subsequent images and frames can reuse this encoder output buffer.
+        return embeds.clone()
 
     def _process_image_input(
         self, image_input: Gemma4ImageInputs
@@ -446,18 +449,19 @@ class RBLNGemma4ForConditionalGeneration(
     ) -> list[torch.Tensor]:
         pixel_values = video_input["pixel_values_videos"]
         pixel_position_ids = video_input["pixel_position_ids_videos"]
-        with torch.inference_mode():
-            frames = [
-                self._encode_vision(pixel_values[i], pixel_position_ids[i])
-                for i in range(pixel_values.shape[0])
-            ]
         frame_counts = video_input["video_frame_counts"]
         if isinstance(frame_counts, torch.Tensor):
             frame_counts = frame_counts.tolist()
         videos = []
-        for count in frame_counts:
-            videos.append(torch.cat(frames[:count]))
-            frames = frames[count:]
+        with torch.inference_mode():
+            for pixels, positions in zip(
+                pixel_values.split(frame_counts), pixel_position_ids.split(frame_counts)
+            ):
+                frames = [
+                    self._encode_vision(frame, pos)
+                    for frame, pos in zip(pixels, positions)
+                ]
+                videos.append(frames[0] if len(frames) == 1 else torch.cat(frames))
         return videos
 
     def forward(

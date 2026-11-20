@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Union
 
 import torch
@@ -34,11 +34,28 @@ def run_mm_encoder(
     num_embeddings: int,
     *,
     dtype: torch.dtype | None = None,
-    device: torch.device | str | None = "cpu",
+    device: torch.device | str = "cpu",
 ) -> torch.Tensor:
-    """Return valid embeddings; device=None preserves the encoder output device."""
+    """Return valid embeddings on the requested device."""
+    output_device = torch.device(device)
     embeds = encoder(*inputs)[:num_embeddings]
-    return embeds.to(device=device, dtype=dtype)
+    return embeds.to(device=output_device, dtype=dtype)
+
+
+def collect_mm_encoder_outputs(
+    outputs: Iterable[torch.Tensor], num_embeddings: int
+) -> torch.Tensor:
+    """Copy each frame before the encoder can reuse its output buffer."""
+    result = None
+    offset = 0
+    for embeds in outputs:
+        if result is None:
+            result = embeds.new_empty((num_embeddings, embeds.shape[-1]))
+        end = offset + embeds.shape[0]
+        result[offset:end].copy_(embeds)
+        offset = end
+    assert result is not None and offset == num_embeddings
+    return result
 
 
 def pad(

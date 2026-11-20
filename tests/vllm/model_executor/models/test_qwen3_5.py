@@ -333,6 +333,39 @@ def test_image_embeddings_match_upstream(visual):
         torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-5)
 
 
+@pytest.mark.use_device
+def test_video_embeddings_survive_encoder_output_reuse():
+    from vllm.platforms import current_platform
+
+    device = torch.device(current_platform.device_type)
+    model = RBLNQwen3_5ForConditionalGeneration.__new__(
+        RBLNQwen3_5ForConditionalGeneration
+    )
+    torch.nn.Module.__init__(model)
+    model.visual = SimpleNamespace(device=device, spatial_merge_size=1)
+    model._encoder_inputs = lambda frame, grid: [frame.to(device)]
+    buffer = torch.empty(2, 1, device=device)
+
+    def encoder(pixels):
+        buffer[:1].copy_(pixels)
+        return buffer
+
+    object.__setattr__(model, "_mm_encoder", encoder)
+    pixels = torch.arange(3.0).unsqueeze(1)
+    videos = model._process_video_input(
+        {
+            "type": "pixel_values_videos",
+            "pixel_values_videos": pixels,
+            "video_grid_thw": torch.tensor([[2, 1, 1], [1, 1, 1]]),
+        }
+    )
+    buffer.fill_(-1)
+
+    for actual, expected in zip(videos, pixels.split([2, 1]), strict=True):
+        assert actual.device == buffer.device
+        torch.testing.assert_close(actual.cpu(), expected)
+
+
 def test_video_frames_run_one_at_a_time_and_match_upstream(visual):
     # Two clips, of three and of two temporal patches. Upstream's cu_seqlens
     # keeps attention inside a temporal patch; here each is an encoder run at

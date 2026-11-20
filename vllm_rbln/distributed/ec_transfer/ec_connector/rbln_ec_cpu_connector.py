@@ -96,7 +96,7 @@ class RblnECCPUWorker(ECCPUWorker):
             return
         src = encoder_cache[mm_hash]
         # One byte row per region block; a load views them back in the model dtype.
-        rows = src.view(torch.int8)
+        rows = src.cpu().view(torch.int8)
         assert (
             src.dtype == self._dtype
             and rows.dim() == 2
