@@ -14,7 +14,7 @@
 
 # RBLN overrides for Multi-head Latent Attention (MLA). These mirror the
 # non-MLA Attention overrides in ``patches/attention.py`` (KV cache resolved
-# from attention metadata as a graph input, pipeline-adjusted layer index) and
+# from attention metadata as a graph input, runner-assigned layer index) and
 # reuse its shared helpers.
 
 import torch
@@ -27,10 +27,7 @@ from vllm_rbln.model_executor.layers.quantization.modelopt_fp8 import (
     RBLNModelOptFp8LinearMethod,
 )
 from vllm_rbln.patches import register_patch
-from vllm_rbln.patches.attention import (
-    _record_pipeline_layer_index,
-    _resolve_kv_cache,
-)
+from vllm_rbln.patches.attention import _resolve_kv_cache
 
 mla_attention_original_init = MLAAttention.__init__
 mla_attention_original_process_weights = MLAAttention.process_weights_after_loading
@@ -130,16 +127,14 @@ def patched_mla_get_kv_cache_spec(self: MLAAttention, vllm_config):
 @register_patch(
     target="vllm.model_executor.layers.attention.mla_attention.MLAAttention.__init__",
     reason=(
-        "RBLN needs MLAAttention initialization to record a pipeline-adjusted "
-        "layer index so external KV-cache bindings can resolve the matching "
-        "per-layer latent cache tensor (same requirement as `Attention.__init__`)."
+        "RBLN resolves latent KV caches through indices assigned by the runner "
+        "after allocation; upstream MLAAttention does not declare this binding field."
     ),
 )
 def patched_mla_attention_init(self: MLAAttention, *args, **kwargs) -> None:
     mla_attention_original_init(self, *args, **kwargs)
 
-    # NOTE(RBLN): Layer index is required to use external binding KV cache.
-    _record_pipeline_layer_index(self)
+    self.layer_index = None
 
 
 @register_patch(

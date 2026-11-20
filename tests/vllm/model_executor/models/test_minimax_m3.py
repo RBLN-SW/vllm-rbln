@@ -22,6 +22,98 @@ import pytest
 import torch
 
 
+@pytest.fixture
+def vision_tower(tmp_path):
+    from transformers import PretrainedConfig
+    from vllm.config import set_current_vllm_config
+    from vllm.distributed import (
+        destroy_distributed_environment,
+        destroy_model_parallel,
+        ensure_model_parallel_initialized,
+        init_distributed_environment,
+    )
+
+    import vllm_rbln.model_executor.models.minimax_m3 as m3
+    from tests.vllm.vllm_config import make_vllm_config
+
+    with set_current_vllm_config(make_vllm_config()):
+        init_distributed_environment(
+            world_size=1,
+            rank=0,
+            distributed_init_method=f"file://{tmp_path}/dist",
+            local_rank=0,
+            backend="gloo",
+        )
+        ensure_model_parallel_initialized(1, 1)
+        try:
+            config = PretrainedConfig(
+                num_hidden_layers=3,
+                hidden_size=128,
+                intermediate_size=256,
+                num_attention_heads=2,
+                layer_norm_eps=1e-6,
+                hidden_act="gelu",
+                patch_size=2,
+                num_channels=3,
+                img_token_compression_config={
+                    "spatial_merge_size": 2,
+                    "temporal_patch_size": 2,
+                },
+                vision_segment_max_frames=2,
+            )
+            torch.manual_seed(0)
+            tower = (
+                m3._vision_tower.MiniMaxVLVisionModel(
+                    config, text_hidden_size=64, projector_hidden_size=128
+                )
+                .float()
+                .eval()
+            )
+            for param in tower.parameters():
+                param.data.normal_(0, 0.05)
+            yield tower
+        finally:
+            torch._dynamo.reset()
+            destroy_model_parallel()
+            destroy_distributed_environment()
+
+
+def test_vision_blocks_trace_as_regions_with_shared_weights(vision_tower):
+    import vllm_rbln.model_executor.models.minimax_m3 as m3
+    from vllm_rbln.compilation.compiler import compile
+
+    tower = vision_tower
+    original_keys = list(tower.state_dict())
+    encoder = m3._RBLNVisionEncoder(tower, torch.bfloat16).eval()
+    graphs = []
+
+    def capture(graph, inputs, **kwargs):
+        graphs.append(graph)
+        return graph.forward
+
+    compiled = compile(encoder, backend=capture, fullgraph=True, use_cache=False)
+    with torch.inference_mode():
+        for tokens in (8, 12):
+            angles = torch.randn(tokens, 64)
+            angles[:, 60:] = 0
+            bias = torch.zeros(1, 1, 1, tokens)
+            bias[..., -4:] = -30000.0
+            inputs = (torch.randn(tokens, 24), angles.cos(), angles.sin(), bias)
+            torch.testing.assert_close(
+                compiled(*inputs), encoder(*inputs), rtol=0, atol=0
+            )
+    assert len(graphs) == 2
+    for graph in graphs:
+        calls = [
+            node
+            for node in graph.graph.nodes
+            if node.target is torch.ops.higher_order.invoke_subgraph
+        ]
+        assert len(calls) == len(tower.vision_model.encoder.layers)
+    assert list(tower.state_dict()) == original_keys
+    assert {id(p) for p in encoder.parameters()} == {id(p) for p in tower.parameters()}
+
+
 @pytest.mark.parametrize("has_tower", [False, True])
 def test_minimax_m3_encoder_compile_requires_local_tower(monkeypatch, has_tower):
     import vllm_rbln.model_executor.models.minimax_m3 as m3
@@ -321,7 +413,7 @@ def test_fp32_vision_encoder_hands_out_model_dtype_embeddings():
     tower.patch_merge_mlp = torch.nn.Linear(4, 4)
     encoder = m3._RBLNVisionEncoder(tower, torch.bfloat16)
     # No encoder layers: only the dtype the embeddings leave in is under test.
-    vision_model.encoder.layers = []
+    encoder.blocks = torch.nn.ModuleList()
     pixels = torch.randn(3, 6)
 
     out = encoder(pixels, torch.ones(3, 4), torch.zeros(3, 4), torch.zeros(1, 1, 1, 3))
@@ -1004,6 +1096,21 @@ def test_text_config_loads_from_local_checkpoint(tmp_path):
     assert loaded.num_hidden_layers == 2
     assert loaded.vocab_size == 256
     assert loaded.architectures == ["MiniMaxM3SparseForCausalLM"]
+
+
+def test_minimax_m3_indexer_cache_declares_kv_cache_subindex():
+    from vllm.config import CompilationConfig, set_current_vllm_config
+
+    from vllm_rbln.model_executor.models.minimax_m3 import RBLNMiniMaxM3IndexerCache
+
+    config = SimpleNamespace(compilation_config=CompilationConfig())
+    with set_current_vllm_config(config):
+        cache = RBLNMiniMaxM3IndexerCache(
+            head_dim=128, prefix="model.layers.0.self_attn.attn.indexer"
+        )
+
+    assert config.compilation_config.static_forward_context[cache.prefix] is cache
+    assert cache.kv_cache_subindex == 1
 
 
 def test_pp_ranks_report_the_same_kv_cache_layouts():

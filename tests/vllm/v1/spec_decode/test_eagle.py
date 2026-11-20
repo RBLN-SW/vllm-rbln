@@ -299,6 +299,16 @@ class TestInitGuards:
         proposer = make_eagle_proposer()
         assert proposer.supports_mm_inputs
 
+    def test_an_mrope_draft_keeps_one_row_of_positions(self, monkeypatch):
+        from vllm.config import ModelConfig
+
+        # Upstream allocates the M-RoPE rows only for such a draft (Qwen3.5's
+        # MTP head); a text-only draft step reads one row.
+        monkeypatch.setattr(ModelConfig, "uses_mrope", property(lambda self: True))
+        monkeypatch.setattr(ModelConfig, "mrope_num_dims", property(lambda self: 3))
+        proposer = make_eagle_proposer()
+        assert proposer.positions.shape == (proposer.max_positions,)
+
     def test_rejects_extra_input_slots(self, monkeypatch):
         # Parallel drafting / draft-model spec decode needs input slots the
         # staged drafter inputs have no room for; construction, not the first
@@ -372,6 +382,92 @@ class TestToTargetTokenIds:
 
 
 class TestPropose:
+    def test_prefill_passes_multimodal_rows_and_zeroes_the_padded_mask(
+        self, monkeypatch
+    ):
+        _neutralize(monkeypatch)
+        proposer = make_eagle_proposer(num_speculative_tokens=1)
+        _wire_runner(proposer, num_reqs=1)
+        proposer.runner.is_prefill = True
+        proposer.supports_mm_inputs = True
+        calls = []
+
+        def execute(**kwargs):
+            calls.append(kwargs)
+            return kwargs["hidden_states"], torch.zeros(1, dtype=torch.long)
+
+        proposer.model_executable = execute
+        rows = torch.full((1, proposer.inputs_embeds_size), 42.0, dtype=proposer.dtype)
+        proposer.propose(
+            target_token_ids=torch.tensor([10, 11, 12], dtype=torch.int32),
+            target_positions=torch.arange(3),
+            target_hidden_states=torch.zeros(3, proposer.hidden_size),
+            next_token_ids=torch.tensor([13], dtype=torch.int32),
+            token_indices_to_sample=torch.tensor([2], dtype=torch.int32),
+            common_attn_metadata=make_cad([0, 3], [3]),
+            mm_embed_inputs=(
+                [rows],
+                torch.tensor([[0], [1], [0]], dtype=proposer.dtype),
+            ),
+        )
+
+        mask = calls[0]["mm_mask"].cpu()
+        embeds = calls[0]["mm_embeds"].cpu()
+        assert mask[0, :3, 0].tolist() == [0, 1, 0]
+        assert not mask[0, 3:].any()
+        torch.testing.assert_close(embeds[0, 1], rows[0])
+
+    def test_mrope_and_cache_positions_advance_independently(self, monkeypatch):
+        _neutralize(monkeypatch)
+        proposer = make_eagle_proposer(num_speculative_tokens=3)
+        _wire_runner(proposer, num_reqs=2)
+        proposer.supports_mm_inputs = True
+        proposer.uses_mrope = True
+        proposer.max_model_len = 200
+        model_positions = []
+        cache_positions = []
+        echo = _echo_model_exec(proposer.hidden_size)
+
+        def execute(**kwargs):
+            model_positions.append(kwargs["positions"].cpu().clone())
+            return echo(**kwargs)
+
+        def build(**kwargs):
+            cache_positions.append(kwargs["positions"].clone())
+            return object()
+
+        proposer.model_executable = execute
+        proposer.draft_attn_groups[0].get_metadata_builder = lambda: SimpleNamespace(
+            build=build
+        )
+        cad = make_cad([0, 2, 4], [100, 200])
+        mrope = torch.tensor(
+            [[10, 11, 30, 31], [110, 111, 130, 131], [210, 211, 230, 231]]
+        )
+        proposer.propose(
+            target_token_ids=torch.tensor([10, 11, 20, 21], dtype=torch.int32),
+            target_positions=torch.tensor([98, 99, 198, 199]),
+            target_mrope_positions=mrope,
+            target_hidden_states=torch.zeros(4, proposer.hidden_size),
+            next_token_ids=torch.tensor([50, 60], dtype=torch.int32),
+            token_indices_to_sample=torch.tensor([1, 3], dtype=torch.int32),
+            common_attn_metadata=cad,
+        )
+
+        torch.testing.assert_close(model_positions[0], mrope.view(3, 2, 2))
+        torch.testing.assert_close(
+            model_positions[1], torch.tensor([12, 32]).view(1, 2, 1).expand(3, -1, -1)
+        )
+        torch.testing.assert_close(
+            model_positions[2], torch.tensor([13, 33]).view(1, 2, 1).expand(3, -1, -1)
+        )
+        assert [p.tolist() for p in cache_positions] == [
+            [98, 99, 198, 199],
+            [100, 200],
+            [101, 201],
+        ]
+        assert cad.seq_lens.tolist() == [102, 1]
+
     @pytest.mark.parametrize("is_prompt_sorted", [False, True])
     def test_prompt_sorting_reaches_every_draft_step(
         self, monkeypatch, is_prompt_sorted
@@ -629,6 +725,76 @@ class TestPropose:
 
 
 class TestLoadModel:
+    @pytest.mark.parametrize("pp_size", [1, 2])
+    def test_multimodal_wrapper_accepts_an_opted_in_draft(self, monkeypatch, pp_size):
+        class Draft(torch.nn.Module):
+            supports_multimodal_embeddings = True
+            supports_rbln_multimodal_embeddings = True
+
+            def __init__(self):
+                torch.nn.Module.__init__(self)
+                self.seen = None
+
+            def embed_input_ids(self, input_ids):
+                return input_ids[..., None].float().expand(-1, -1, 4)
+
+            def __call__(self, *, input_ids, positions, hidden_states, inputs_embeds):
+                assert input_ids is None
+                self.seen = inputs_embeds.clone()
+                return inputs_embeds
+
+            def compute_logits(self, hidden_states):
+                return hidden_states
+
+        draft = Draft()
+        self._stub_super_load_model(monkeypatch, draft)
+        proposer = make_eagle_proposer(num_speculative_tokens=1)
+        proposer.supports_mm_inputs = True
+        proposer.hidden_size = 4
+        monkeypatch.setattr(proposer, "model_returns_tuple", lambda: False)
+        monkeypatch.setattr(
+            proposer.vllm_config.speculative_config, "enforce_eager", True
+        )
+        monkeypatch.setattr(
+            proposer.vllm_config.parallel_config, "pipeline_parallel_size", pp_size
+        )
+        if pp_size != 1:
+            with pytest.raises(NotImplementedError, match="pipeline_parallel_size=1"):
+                proposer.load_model(target_model=object())
+            return
+        proposer.load_model(target_model=object())
+        embeds = torch.full((1, 3, 4), 99.0)
+        proposer.model_executable(
+            input_ids=torch.tensor([[1, 2, 3]], dtype=torch.int32),
+            positions=torch.zeros(3, 1, 3, dtype=torch.long),
+            hidden_states=torch.zeros(1, 3, 4),
+            mm_embeds=embeds,
+            mm_mask=torch.tensor([[[0.0], [1.0], [0.0]]]),
+        )
+        torch.testing.assert_close(
+            draft.seen, torch.tensor([[[1.0] * 4, [99.0] * 4, [3.0] * 4]])
+        )
+
+    def test_an_rbln_target_goes_by_its_upstream_class_name(self):
+        # Upstream's load_model picks the target's image-token field by class
+        # name and lists upstream classes only, so the RBLN subclass of a listed
+        # class has to answer with its parent's name.
+        from vllm.model_executor.models.qwen3_5 import (
+            Qwen3_5ForConditionalGeneration,
+        )
+
+        from vllm_rbln.model_executor.models.qwen3_5 import (
+            RBLNQwen3_5ForConditionalGeneration,
+        )
+
+        target = RBLNQwen3_5ForConditionalGeneration.__new__(
+            RBLNQwen3_5ForConditionalGeneration
+        )
+        proposer = make_eagle_proposer()
+        assert (
+            proposer.get_model_name(target) == Qwen3_5ForConditionalGeneration.__name__
+        )
+
     @pytest.mark.parametrize("draft_needs_mm_inputs", [False, True])
     def test_multimodal_guard_uses_loaded_draft_capability(
         self, monkeypatch, draft_needs_mm_inputs
@@ -857,6 +1023,30 @@ class TestLoadModel:
 
 
 class TestDummyRun:
+    def test_multimodal_prefill_warms_the_mask_and_three_position_rows(
+        self, monkeypatch
+    ):
+        proposer, _ = self._proposer(monkeypatch, num_spec=1)
+        proposer.supports_mm_inputs = True
+        proposer.uses_mrope = True
+        proposer.mrope_positions = torch.zeros(
+            3, proposer.max_positions + 1, dtype=torch.long
+        )
+        calls = []
+
+        def execute(**kwargs):
+            calls.append(kwargs)
+            return kwargs["hidden_states"], torch.zeros(1, dtype=torch.long)
+
+        proposer.model_executable = execute
+        proposer.dummy_run(1, 4, True)
+        assert calls[0]["positions"].shape == (3, *calls[0]["input_ids"].shape)
+        assert calls[0]["mm_embeds"].shape == (
+            *calls[0]["input_ids"].shape,
+            proposer.inputs_embeds_size,
+        )
+        assert not calls[0]["mm_mask"].any()
+
     @staticmethod
     def _proposer(
         monkeypatch,

@@ -295,10 +295,13 @@ class RBLNGemma4ForConditionalGeneration(
         # longest range.
         self.max_mm_prefix_range_len = cap
         # One compiled encoder shape per budget; an image or frame is padded to
-        # the smallest that holds its patches.
+        # the smallest that holds its patches. Unset, every budget a prefill
+        # chunk holds, so raising max_soft_tokens keeps the compiled graphs.
         rbln_config = vllm_config.additional_config
         budgets = sorted(rbln_config.encoder_token_budgets) or [
-            budget for budget in _SUPPORTED_SOFT_TOKENS if budget <= cap
+            budget
+            for budget in _SUPPORTED_SOFT_TOKENS
+            if budget <= rbln_config.max_prefill_chunk_size
         ]
         if unsupported := sorted(set(budgets) - set(_SUPPORTED_SOFT_TOKENS)):
             raise ValueError(
@@ -316,6 +319,10 @@ class RBLNGemma4ForConditionalGeneration(
         self.mm_encoder_patch_buckets = [budget * pool**2 for budget in budgets]
         self._mm_encoder: Callable[..., torch.Tensor] | None
         object.__setattr__(self, "_mm_encoder", None)
+
+    @property
+    def logits_processor(self) -> nn.Module:
+        return self.language_model.logits_processor
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # Scale each expert's down projection instead of its routing weight:

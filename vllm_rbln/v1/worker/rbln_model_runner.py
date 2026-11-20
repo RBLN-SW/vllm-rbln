@@ -200,9 +200,6 @@ from vllm_rbln.v1.worker.utils import (
     prepare_kernel_block_sizes,
     reorder_input_batch,
 )
-from vllm_rbln.v1.worker.utils import (
-    num_attn_module as rbln_num_attn_module,
-)
 
 logger = init_logger(__name__)
 
@@ -480,6 +477,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         self.discard_request_mask = torch.zeros(self.max_num_reqs, dtype=torch.bool)
         self.intermediate_tensors_dict: dict[tuple[int, int], IntermediateTensors] = {}
         self.input_stager = InputStager(self.device)
+        self._group_shared_staging: dict[tuple, torch.Tensor] = {}
 
         # OPTIMIZATION: Cache the tensors rather than creating them every step.
         # Keep in int64 to avoid overflow with long context
@@ -1225,6 +1223,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
 
             if kv_cache_gid > 0:
                 cm.block_table_tensor = _get_block_table(kv_cache_gid)
+            # _group_shared_staging gives every group one buffer for the slots
+            # derived from positions, query_start_loc and seq_lens, so a
+            # per-group value would silently reach every group as the last
+            # group's: only the block table may differ.
+            assert cm.query_start_loc is cm_base.query_start_loc
+            assert cm.seq_lens is cm_base.seq_lens
+            assert cm.num_reqs == cm_base.num_reqs
 
             # NOTE(RBLN): gate on the drafter, not speculative_config (which every
             # rank has): only the last PP rank drafts, and no other rank consumes
@@ -1257,6 +1262,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     num_accepted=num_accepted,
                     state_load_pos=state_load_pos,
                     mm_prefix_row_ends=mm_prefix_row_ends,
+                    group_shared=self._group_shared_staging,
                     defer_staging=defer_staging,
                 )
 
@@ -1663,6 +1669,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         self,
         scheduler_output: RBLNSchedulerOutput,
         num_tokens: int,
+        shift_computed_tokens: int = 0,
     ) -> tuple[list[torch.Tensor], torch.Tensor]:
         mm_embeds: list[torch.Tensor] = []
         is_mm = torch.zeros(num_tokens, dtype=torch.bool)
@@ -1671,7 +1678,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         for req_id in self.input_batch.req_ids:
             num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
             req_state = self.requests[req_id]
-            num_computed_tokens = req_state.num_computed_tokens
+            num_computed_tokens = req_state.num_computed_tokens + shift_computed_tokens
 
             for mm_feature in req_state.mm_features:
                 pos_info = mm_feature.mm_position
@@ -2205,7 +2212,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             for groups in self.attn_groups:
                 for group in groups:
                     builder = group.get_metadata_builder(0)
-                    builder.stage(attn_metadata[group.layer_names[0]])
+                    builder.stage(
+                        attn_metadata[group.layer_names[0]], self._group_shared_staging
+                    )
         # Run the model.
         # With spec decode, defer connector finalization (wait_for_save + clear
         # metadata) until after the draft runs in sample_tokens() so the draft
@@ -2583,6 +2592,22 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 target_token_ids = self.input_ids[:total_num_tokens]
                 target_positions = self.positions[:total_num_tokens]
 
+            mm_kwargs: dict[str, Any] = {}
+            if self.supports_mm_inputs and self.drafter.supports_mm_inputs:
+                if self.is_prefill:
+                    mm_kwargs["mm_embed_inputs"] = self._gather_mm_embeddings(
+                        scheduler_output,
+                        target_token_ids.shape[0],
+                        shift_computed_tokens=(
+                            self.vllm_config.num_prefill_lookahead_tokens
+                        ),
+                    )
+                if self.drafter.uses_mrope:
+                    assert self.mrope_positions is not None
+                    mm_kwargs["target_mrope_positions"] = self.mrope_positions[
+                        :, : target_token_ids.shape[0]
+                    ]
+
             draft_token_ids = self.drafter.propose(
                 target_token_ids=target_token_ids,
                 target_positions=target_positions,
@@ -2590,8 +2615,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 next_token_ids=next_token_ids,
                 token_indices_to_sample=token_indices_to_sample,
                 common_attn_metadata=common_attn_metadata,
-                mm_embed_inputs=None,
                 num_rejected_tokens=num_rejected_tokens,
+                **mm_kwargs,
             )
 
         return draft_token_ids
@@ -3604,13 +3629,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             kv_cache_view_infos,
         )
 
-        num_attn_module = rbln_num_attn_module(
-            self.model_config, self.cache_config.cache_dtype
-        )
+        forward_context = self.compilation_config.static_forward_context
+        self.kv_cache_names = get_kv_cache_names(kv_caches, forward_context)
         self._update_kv_cache_base_bindings(
             kv_cache_bases_by_layer,
             kv_cache_view_infos,
-            num_attn_module,
         )
         if dynamic_kv_enabled(self.vllm_config) and self.kv_cache_bases:
             # With shared bases these are the graph inputs and the per-layer
@@ -3629,7 +3652,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 len(self.kv_cache_bases),
                 tuple(self.kv_cache_bases[0].shape),
             )
-        self.kv_cache_names = get_kv_cache_names(kv_caches, num_attn_module)
         self.kv_caches = [kv_caches[name] for name in self.kv_cache_names]
         # The runner owns the cache storage until sizing finishes. Rebuild keys
         # on allocation so addresses are never matched across cache generations.
@@ -3638,12 +3660,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             key = kv_cache_tensor_key(cache)
             self.kv_cache_allocations.setdefault(key, name)
         self.kv_cache_block_axes = block_axes
-        forward_context = self.compilation_config.static_forward_context
         for layer_name, kv_cache in kv_caches.items():
             forward_context[layer_name].kv_cache = kv_cache
-        # A layer reads the cache at its position in this list. The index set at
-        # construction assumes `num_attn_module` caches per layer, which a layer
-        # owning fewer (a MiniMax-M3 dense layer has no indexer cache) breaks.
+        # Cache indices are positions in this rank's actual cache list, including
+        # auxiliary caches and MTP layers, and are assigned only after allocation.
         for position, layer_name in enumerate(self.kv_cache_names):
             layer = forward_context[layer_name]
             assert hasattr(layer, "layer_index"), layer_name
@@ -3689,9 +3709,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             assert isinstance(spec, RBLNBlockAuxSpec), spec
             assert spec.owner in extent_of, f"{layer_name}: no owner {spec.owner}"
             if spec.verify_only and self.is_strict_kv_producer:
-                # No graph a strict producer compiles places it. Its module's
-                # construction-time layer_index could name another layer's cache.
-                module.layer_index = None
+                # Strict KV producers skip allocating verification-only caches.
                 continue
             shape = (num_blocks, *spec.block_shape)
             kind = (spec.owner, shape, spec.dtype)
@@ -4047,7 +4065,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         self,
         kv_cache_bases_by_layer: dict[str, torch.Tensor],
         kv_cache_view_infos_by_layer: dict[str, KVCacheViewInfo],
-        num_attn_module: int,
     ) -> None:
         if not kv_cache_view_infos_by_layer:
             self.kv_cache_bases = []
@@ -4057,7 +4074,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         kv_cache_bases, kv_cache_view_infos = build_kv_cache_base_bindings(
             kv_cache_bases_by_layer,
             kv_cache_view_infos_by_layer,
-            num_attn_module=num_attn_module,
+            layer_names=self.kv_cache_names,
         )
         # If no deduplication occurred (each layer has its own unique base),
         # the new system adds overhead without benefit — disable it.
