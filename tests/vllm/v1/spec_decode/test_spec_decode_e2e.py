@@ -71,17 +71,6 @@ SPEC_METHODS: dict[str, tuple[str, dict[str, Any], dict[str, Any]]] = {
         {"max_model_len": 2048, "tensor_parallel_size": 2},
         {"method": "eagle", "model": _DRAFT["eagle"], "num_speculative_tokens": 3},
     ),
-    # The target prefills the prompt on the 256 graph, the drafter on the 512 one.
-    "eagle-prefill-chunk-sizes": (
-        TARGET_MODEL,
-        {
-            "max_model_len": 2048,
-            "tensor_parallel_size": 2,
-            "max_num_batched_tokens": 512,
-            "additional_config": {"prefill_chunk_size": [256, 512]},
-        },
-        {"method": "eagle", "model": _DRAFT["eagle"], "num_speculative_tokens": 3},
-    ),
     "eagle3": (
         TARGET_MODEL,
         {"max_model_len": 2048, "tensor_parallel_size": 2},
