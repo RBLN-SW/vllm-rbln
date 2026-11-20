@@ -26,6 +26,15 @@ if the KV cache tensor has a token dimension that can be sliced for partial copy
       This is not per-token data.
     * `CrossAttentionSpec`: Prefix caching is entirely disabled for this.
 
+GLM-5.3 holds a `MambaSpec` group for its KDA layers, so this manager does not run for it.
+With sub-block caching on, it takes upstream's fine-grained prefix hits instead:
+the platform sets `--prefix-match-unit` to the prefill chunk size.
+Every group then registers one partial entry at the prompt's last unit boundary,
+and a hit copies that block into a new one before the request writes past it.
+A recurrent state is kept at that one boundary per prompt, not at every sub-block.
+A sibling prompt that diverges before that boundary resumes at the latest state kept
+before the divergence, which is a block boundary.
+
 
 ## Configuration
 
