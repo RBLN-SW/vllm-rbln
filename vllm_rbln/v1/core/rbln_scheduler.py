@@ -1012,7 +1012,12 @@ class RBLNScheduler(Scheduler):
                     )
 
                 if new_blocks is None:
-                    # The request cannot be scheduled.
+                    # An idle pool cannot make room for extra pinned sources.
+                    if sub_block_match is not None and not self.running:
+                        self.kv_cache_manager.release_sub_block_match(
+                            sub_block_match, retry_without_copy=True
+                        )
+                        sub_block_match = None
 
                     # NOTE: we need to untouch the request from the encode cache
                     # manager

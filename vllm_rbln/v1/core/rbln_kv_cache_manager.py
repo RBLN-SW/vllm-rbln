@@ -250,6 +250,7 @@ class _SubHashState:
     extra_keys: list[tuple[Any, ...] | None] = field(default_factory=list)
     mm_idx: int = 0
     num_indexed_full_blocks: list[int] = field(default_factory=list)
+    retry_without_copy: bool = False
 
 
 @dataclass(slots=True)
@@ -413,13 +414,18 @@ class RBLNKVCacheManager(KVCacheManager):
         )
         if common_end <= first:
             return None
-        hashes = self._get_or_compute_sub_hashes(request).hashes
+        state = self._get_or_compute_sub_hashes(request)
+        if state.retry_without_copy:
+            state.retry_without_copy = False
+            return None
         candidates: list[_GroupPartialMatch] = []
         for group in self._group_infos:
             pos = first
             while pos < common_end:
                 end = min(pos + group.sub_blocks_per_block, common_end)
-                block_id, depth = group.sub_block_index.longest_match(hashes[pos:end])
+                block_id, depth = group.sub_block_index.longest_match(
+                    state.hashes[pos:end]
+                )
                 if block_id is None:
                     break
                 candidates.append(
@@ -495,13 +501,17 @@ class RBLNKVCacheManager(KVCacheManager):
                 )
             )
 
-    def release_sub_block_match(self, match: SubBlockMatch) -> None:
+    def release_sub_block_match(
+        self, match: SubBlockMatch, *, retry_without_copy: bool = False
+    ) -> None:
         """Release source-block references held by a sub-block match.
 
         Call this when discarding a match (e.g. connector provides better
         coverage, or allocation failed).
         """
         self.block_pool.free_blocks([gm.src_block for gm in match.group_matches])
+        if retry_without_copy and len(match.group_matches) > len(self._group_infos):
+            self._req_sub_hashes[match.request.request_id].retry_without_copy = True
 
     def allocate_slots(
         self,

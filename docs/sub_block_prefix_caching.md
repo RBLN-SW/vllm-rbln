@@ -194,7 +194,8 @@ If the upstream hit ends inside a physical block, the manager skips the extensio
 because a copy would overwrite shared KV.
 
 The manager trims the copies to the prefix covered by every group, then pins
-their source blocks until the match is applied or released.
+their source blocks until the match is applied or released. If those pins prevent
+admission on an idle scheduler, the next attempt can use the space for prefill.
 
 ### Step 4: Copy op scheduling
 

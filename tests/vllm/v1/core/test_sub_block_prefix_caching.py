@@ -320,12 +320,8 @@ class TestSubBlockIndexingUnderAsyncScheduling:
 
 
 class TestSubBlockHitUnderTheSchedulerBlock:
-    # Gemma4's KV cache groups at a smaller scale: full attention in 16-token
-    # blocks, a sliding window as wide as its 8-token blocks, hashed at the gcd
-    # and scheduled at the lcm. Upstream's hybrid coordinator only caches and
-    # retains blocks a 16-aligned hit can reach, so a request that ends inside
-    # its first scheduler block leaves the sub-block index nothing to serve.
-    def test_donor_shorter_than_a_scheduler_block_serves_a_hit(self):
+    @staticmethod
+    def _schedule_sharer(num_blocks):
         sched = create_rbln_scheduler(
             enable_prefix_caching=True,
             block_size=16,
@@ -334,7 +330,8 @@ class TestSubBlockHitUnderTheSchedulerBlock:
             max_num_batched_tokens=16,
             max_model_len=128,
             kv_cache_config=make_kv_cache_config(
-                [full_attention_spec(16), sliding_window_spec(8, 8)], num_blocks=64
+                [full_attention_spec(16), sliding_window_spec(8, 8)],
+                num_blocks=num_blocks,
             ),
         )
         donor = make_request("0", list(range(12)), 8, max_tokens=2)
@@ -342,8 +339,14 @@ class TestSubBlockHitUnderTheSchedulerBlock:
         _drain(sched)
         assert donor.is_finished()
 
-        sharer = make_request("1", list(range(12)) + [100 + i for i in range(9)], 8)
+        sharer = make_request(
+            "1", list(range(12)) + [100 + i for i in range(9)], 8, max_tokens=1
+        )
         sched.add_request(sharer)
+        return sched, sharer
+
+    def test_donor_shorter_than_a_scheduler_block_serves_a_hit(self):
+        sched, sharer = self._schedule_sharer(64)
         out = sched.schedule()
         assert sharer.num_computed_tokens - out.num_scheduled_tokens["1"] == 12
         assert [(op.group_id, op.num_tokens) for op in out.kv_cache_copy_ops] == [
@@ -351,3 +354,14 @@ class TestSubBlockHitUnderTheSchedulerBlock:
             (1, 8),
             (1, 4),
         ]
+
+    def test_pinned_sources_cannot_stall_idle_scheduler(self):
+        sched, sharer = self._schedule_sharer(8)
+        first = sched.schedule()
+        assert not first.num_scheduled_tokens
+        retry = sched.schedule()
+        assert retry.num_scheduled_tokens == {sharer.request_id: 16}
+        assert not retry.kv_cache_copy_ops
+        sched.update_from_output(retry, make_model_runner_output(retry))
+        _drain(sched)
+        assert sharer.is_finished()
