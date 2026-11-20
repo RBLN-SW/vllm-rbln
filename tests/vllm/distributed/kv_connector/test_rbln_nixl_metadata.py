@@ -281,12 +281,12 @@ class TestRblnCompatHash:
     def test_a_one_sided_push_boundary_state_does_not_pair(self):
         # The consumer allocates the boundary block before it knows the
         # producer; a producer that does not push it would leave it unwritten.
-        def hashed(opt_in):
+        def hashed(push_boundary_state):
             return rbln_compat_hash(
                 "BASE",
                 writes_into_peer=True,
                 cross_layers_blocks=False,
-                push_boundary_state=opt_in,
+                push_boundary_state=push_boundary_state,
                 exchanges_block_state=False,
             )
 

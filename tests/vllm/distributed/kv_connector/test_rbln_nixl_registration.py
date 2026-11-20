@@ -1897,7 +1897,7 @@ class TestPublishHandshakeMetadata:
             exchanges_block_state=False,
         )
 
-    def test_a_writer_publishes_its_boundary_opt_in(self):
+    def test_a_writer_publishes_push_boundary_state(self):
         # The hash is what refuses a peer with the other setting at handshake.
         w = self._publish(
             pp_rank=0,

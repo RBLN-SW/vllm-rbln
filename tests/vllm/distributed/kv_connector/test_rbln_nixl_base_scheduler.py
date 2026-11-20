@@ -441,13 +441,13 @@ class TestStateBoundaryExchange:
         writer = self._scheduler(RblnNixlPushConnectorScheduler, True)
         assert writer.get_exchange_clipped_blocks(block_ids) == expected
 
-    def test_a_writer_without_the_opt_in_clips_as_upstream(self):
+    def test_a_writer_without_push_boundary_state_clips_as_upstream(self):
         writer = self._scheduler(RblnNixlPushConnectorScheduler)
         clipped = writer.get_exchange_clipped_blocks(([1, 2, 3], [0, 7, 8]))
         assert clipped == ([1, 2, 3], [8])
 
     @pytest.mark.parametrize(
-        ("num_prompt_tokens", "num_local", "opt_in", "boundary"),
+        ("num_prompt_tokens", "num_local", "push_boundary_state", "boundary"),
         [
             # One token backs off, leaving 39 to transfer: block 1 holds 32.
             (40, 0, True, 32),
@@ -459,9 +459,9 @@ class TestStateBoundaryExchange:
         ],
     )
     def test_a_writers_consumer_names_the_boundary_it_receives(
-        self, num_prompt_tokens, num_local, opt_in, boundary
+        self, num_prompt_tokens, num_local, push_boundary_state, boundary
     ):
-        sched = self._scheduler(RblnNixlPushConnectorScheduler, opt_in)
+        sched = self._scheduler(RblnNixlPushConnectorScheduler, push_boundary_state)
         req = _Request(
             "d",
             num_prompt_tokens=num_prompt_tokens,
@@ -511,13 +511,13 @@ class TestStateBoundaryExchange:
         assert req.kv_transfer_params is not None
         assert REMOTE_STATE_BOUNDARY not in req.kv_transfer_params
 
-    @pytest.mark.parametrize("opt_in", [True, False])
-    def test_a_writer_hands_over_what_its_producer_kept(self, opt_in):
+    @pytest.mark.parametrize("push_boundary_state", [True, False])
+    def test_a_writer_hands_over_what_its_producer_kept(self, push_boundary_state):
         # The producer's keep and the writer's clip, against the consumer's
         # count: one block for the running state, one more for a named boundary.
         from tests.vllm.v1 import test_kv_cache
 
-        writer = self._scheduler(RblnNixlPushConnectorScheduler, opt_in)
+        writer = self._scheduler(RblnNixlPushConnectorScheduler, push_boundary_state)
         mamba = test_kv_cache.TestRBLNMambaManager()
         coord = mamba._coordinator()
         if writer.sends_state_boundary:  # `RBLNScheduler`'s gate
@@ -649,7 +649,7 @@ class TestStateBoundaryExchange:
             (RblnNixlPushConnectorScheduler, True, True),
         ],
     )
-    def test_the_scheduler_exchanges_the_boundary_on_pull_or_opt_in(
+    def test_the_scheduler_exchanges_the_boundary_on_pull_or_with_push_boundary_state(
         self, cls, push_boundary_state, sends
     ):
         sched = self._scheduler(cls, push_boundary_state=push_boundary_state)
