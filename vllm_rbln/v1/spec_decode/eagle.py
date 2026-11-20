@@ -467,6 +467,8 @@ class RBLNEagleProposer(EagleProposer):
             if not self.model_returns_tuple():
                 last_hidden_states = ret_hidden_states
                 hidden_states = last_hidden_states
+                # Only a tuple-returning drafter (Gemma4 MTP) samples narrower.
+                assert last_hidden_states.shape[-1] == self.hidden_size
             else:
                 last_hidden_states, hidden_states = ret_hidden_states
 
