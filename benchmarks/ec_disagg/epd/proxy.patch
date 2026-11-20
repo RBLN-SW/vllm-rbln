@@ -1,0 +1,82 @@
+--- upstream/disagg_epd_proxy.py
++++ benchmark/disagg_epd_proxy.py
+@@ -484,6 +484,15 @@
+     # Audio processors may consume placeholders from other modalities too.
+     # Keep the whole request raw if any item cannot be rewritten safely.
+     control_fields = {"mm_hash", "ec_mm_hash", "transfer_id"}
++    # vLLM's chat parser requires all images in a prompt to use the same form.
++    raw_image_request = any(
++        item["type"] == "image_url"
++        and (
++            not item_meta.get(i, {}).get("mm_hash")
++            or not (item_meta.get(i, {}).keys() - control_fields)
++        )
++        for i, item in enumerate(mm_items)
++    )
+     raw_audio_request = any(
+         item["type"] in {"audio_url", "input_audio"} for item in mm_items
+     ) and any(
+@@ -492,6 +501,7 @@
+         for i in range(len(mm_items))
+     )
+     rewritten = 0
++    assigned_image_uuid = False
+     transfer_items = []
+     idx = 0
+     new_messages = []
+@@ -522,6 +532,16 @@
+                         {"mm_hash": ec_mm_hash, "transfer_id": transfer_id}
+                     )
+                 continue
++            if raw_image_request and item["type"] == "image_url":
++                if not item.get("uuid"):
++                    item = {**item, "uuid": item_uuid or content_uuid(item)}
++                    assigned_image_uuid = True
++                new_content.append(item)
++                if transfer_id is not None and ec_mm_hash is not None:
++                    transfer_items.append(
++                        {"mm_hash": ec_mm_hash, "transfer_id": transfer_id}
++                    )
++                continue
+             # Whatever keys the encoder reported are the metadata its model
+             # declared as needed to size the placeholder range; the proxy does
+             # not need to know their names.
+@@ -555,7 +575,7 @@
+             rewritten += 1
+         new_messages.append({**msg, "content": new_content})
+
+-    if not rewritten and not raw_audio_request:
++    if not (rewritten or raw_audio_request or assigned_image_uuid or transfer_items):
+         return req_data
+     if rewritten:
+         logger.info("Rewrote %d media item(s) as metadata references", rewritten)
+@@ -1178,14 +1198,14 @@
+
+         e_urls = app.state.e_urls  # we want the full list for fan-out
+         p_url = random.choice(app.state.p_urls) if app.state.p_urls else None
+-        decode_index = random.randrange(len(app.state.d_urls))
++        dp_round, decode_index = divmod(
++            next(app.state.decode_counter), len(app.state.d_urls)
++        )
+         d_url = app.state.d_urls[decode_index]
+         dp_size = app.state.ec_consumer_dp_size
+-        # Round-robin the replica, then name it to both halves: the decoder
+-        # honours the rank header instead of its own balancer, and the encoder
+-        # pushes to that replica's control channel. Choosing once here means a
+-        # decode retry re-encodes to the same replica.
+-        dp_rank = next(app.state.replica_counter) % dp_size if dp_size > 1 else None
++        # Advance the DP rank after a full round of consumer URLs so every
++        # consumer uses every rank. Retries keep the original URL and rank.
++        dp_rank = dp_round % dp_size if dp_size > 1 else None
+         ec_index = decode_index * dp_size + (dp_rank or 0)
+         consumer_zmq = app.state.d_ec_urls[ec_index] if app.state.d_ec_urls else None
+
+@@ -1595,7 +1615,7 @@
+         if args.ec_consumer_dp_size < 1:
+             parser.error("--ec-consumer-dp-size must be at least 1")
+         app.state.ec_consumer_dp_size = args.ec_consumer_dp_size
+-        app.state.replica_counter = itertools.count()
++        app.state.decode_counter = itertools.count()
+         expected = len(app.state.d_urls) * args.ec_consumer_dp_size
+         if app.state.d_ec_urls and len(app.state.d_ec_urls) != expected:
+             parser.error(
