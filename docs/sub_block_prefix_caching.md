@@ -9,8 +9,7 @@ sub-block prefix caching adds a finer-grained (e.g., 128-token) caching layer
 on top of the upstream `KVCacheManager`.
 It first applies the upstream full-block prefix caching,
 then attempts to *extend* the cache hit at sub-block granularity.
-The matched sub-blocks are copied into a new block,
-since the block containing the partial matches cannot be reused directly.
+Matched sub-blocks are copied into the request's newly allocated blocks.
 
 Sub-block prefix caching is automatically enabled when
 `enable_prefix_caching=True` and `--rbln-enable-sub-block-cache` (default)
@@ -176,32 +175,22 @@ so upstream's LRU preserves it for potential reuse.
 
 ### Step 3: Partial-match lookup
 
-`get_computed_blocks_sub_block(request, num_computed_tokens)`
-1.  Compute sub-block hashes for the request
-2.  For each group:
-    1. Starting after the last full-block boundary,
-       query the group's index with up to `sub_blocks_per_block − 1` hashes
-    2. Record the match length
-3.  Extension = min match length across all groups
-4.  If match found → return a `SubBlockMatch` handle
-    (with per-group `_GroupPartialMatch`),
-    bump `src_block`s' ref counts to prevent eviction
-5.  Return the sub-block extension in tokens (0 if no match),
-    capped at `request.num_tokens − 1` to preserve the upstream
-    "must recompute last token" invariant.
+Starting at the upstream hit, each group looks up consecutive sub-block hashes,
+one physical block at a time. A miss ends that group's prefix. The final token
+is reserved for logits. Equal-sized groups and speculative drafters that write
+lookahead KV retain the single-block extension limit. Gemma4's MTP assistant
+reads the target KV, so its groups can reuse a multi-block prefix.
+If the upstream hit ends inside a physical block, the manager skips the extension
+because a copy would overwrite shared KV.
 
-The query is limited to `sub_blocks_per_block - 1` because a match of all
-sub-blocks would be a full-block match, which upstream handles already. The
-cap at `num_tokens - 1` ensures the scheduler always schedules at least one
-token for computation (upstream requires the last token to be recomputed to
-produce logits).
+The manager trims the copies to the prefix covered by every group, then pins
+their source blocks until the match is applied or released.
 
 ### Step 4: Copy op scheduling
 
-After `allocate_slots` succeeds, the scheduler calls
-`apply_sub_block_match(match)` which, for each group:
-1.  Looks up the destination block (newly allocated at the match boundary)
-2.  Appends `KVCacheCopyOp(group_id, src_block_id, dst_block_id, num_tokens)`
+After allocation, `apply_sub_block_match` queues a `KVCacheCopyOp` for each
+matched physical block. Each op carries its group's source, destination and
+copy length. Sliding-window slots outside the retained window need no copy.
 
 ### Step 5: Copy execution (model runner)
 
