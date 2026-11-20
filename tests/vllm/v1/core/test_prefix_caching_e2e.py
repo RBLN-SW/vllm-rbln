@@ -25,6 +25,7 @@ from vllm import SamplingParams
 from vllm.inputs import TokensPrompt
 
 from tests.vllm.model_specs import CompileModelSpec, apply_spec_envs, spec_params
+from vllm_rbln import envs
 
 BLOCK_SIZE = 256
 
@@ -133,6 +134,11 @@ def test_fine_grained_prefix_hit_matches_baseline(
     vllm_runner, spec: CompileModelSpec, monkeypatch, speculative_config, hit
 ) -> None:
     apply_spec_envs(spec, monkeypatch)
+    num_layers = envs.VLLM_RBLN_NUM_HIDDEN_LAYERS
+    if speculative_config is not None and 0 < num_layers < 8:
+        # As in test_spec_decode_e2e: the compiler's layer rolling rejects
+        # Qwen3.5 with MTP below two periods of its layers.
+        monkeypatch.setenv("VLLM_RBLN_NUM_HIDDEN_LAYERS", "8")
     engine_kwargs = {
         **spec.engine_kwargs,
         "max_num_batched_tokens": CHUNK,
