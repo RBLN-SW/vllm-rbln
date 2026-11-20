@@ -36,16 +36,16 @@ from vllm.v1.request import Request
 logger = init_logger(__name__)
 
 
-def ensure_kv_cache_registration(
+def register_kv_cache(
     context: dict[str, Any],
     name: str,
     cache: torch.nn.Module,
 ) -> None:
-    """Register the cache and reject a different cache with the same name."""
-    if name in context and context[name] is not cache:
+    """Register a cache in the static forward context."""
+    if name in context:
         raise ValueError(f"Duplicate layer name: {name}")
 
-    context.setdefault(name, cache)
+    context[name] = cache
 
 
 @dataclass(frozen=True)

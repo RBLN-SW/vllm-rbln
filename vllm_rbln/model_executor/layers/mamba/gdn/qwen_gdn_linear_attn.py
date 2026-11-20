@@ -32,7 +32,7 @@ from vllm_rbln.v1.attention.backends.gdn_attn import (
     RBLNGDNAttentionBackend,
     RBLNGDNAttentionMetadata,
 )
-from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec, ensure_kv_cache_registration
+from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec, register_kv_cache
 
 
 class RBLNGDNBlockAuxCache(nn.Module, AttentionLayerBase):
@@ -58,7 +58,7 @@ class RBLNGDNBlockAuxCache(nn.Module, AttentionLayerBase):
         self.verify_only = verify_only
         self.kv_cache = torch.tensor([])
         context = get_current_vllm_config().compilation_config.static_forward_context
-        ensure_kv_cache_registration(context, prefix, self)
+        register_kv_cache(context, prefix, self)
 
     def forward(self) -> None: ...
 
