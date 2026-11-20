@@ -2029,3 +2029,22 @@ class TestModelImpl:
         )
         assert out.returncode == 0, out.stderr[-2000:]
         assert out.stdout.strip().endswith("True []"), out.stdout
+
+
+@pytest.mark.parametrize(
+    "architecture, fused_add_rms_norm",
+    [("DeepseekV3ForCausalLM", ["rbln", "native"]), ("LlamaForCausalLM", ["native"])],
+)
+def test_residual_cut_models_put_the_rbln_fused_add_rms_norm_first(
+    configured, architecture, fused_add_rms_norm
+):
+    from vllm import ir
+
+    config = copy.deepcopy(configured)
+    config.model_config.model_arch_config.architectures = [architecture]
+    priority = RblnPlatform.get_default_ir_op_priority(config)
+
+    assert priority.fused_add_rms_norm == fused_add_rms_norm
+    assert priority.rms_norm == ["native"]
+    RblnPlatform.import_ir_kernels()
+    assert "rbln" in ir.ops.fused_add_rms_norm.impls
