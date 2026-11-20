@@ -384,13 +384,38 @@ class RBLNGemma4ForConditionalGeneration(
                     indexing="ij",
                 )
                 positions = torch.stack([xs, ys], dim=-1).reshape(-1, 2)
-                self._encode_vision(torch.zeros(bucket, patch_pixels), positions)
+                self._encode_vision_frame(
+                    torch.zeros(bucket, patch_pixels),
+                    positions,
+                    torch.ones(bucket, dtype=torch.bool),
+                    bucket,
+                )
 
     def _encode_vision(
         self, pixel_values: torch.Tensor, pixel_position_ids: torch.Tensor
     ) -> torch.Tensor:
-        """One image or video frame, `[num_patches, patch_pixels]` with `(-1, -1)`
-        positions on its padding, to its soft token embeddings."""
+        """Collect the soft token embeddings of one image or video."""
+        valid = (pixel_position_ids >= 0).all(dim=-1)
+        patch_counts = valid.sum(dim=-1).tolist()
+        pool_area = self.vision_tower.config.pooling_kernel_size**2
+        frames = (
+            self._encode_vision_frame(pixels, positions, mask, num_patches)
+            for pixels, positions, mask, num_patches in zip(
+                pixel_values, pixel_position_ids, valid, patch_counts, strict=True
+            )
+        )
+        return rbln_utils.collect_mm_encoder_outputs(
+            frames, sum(n // pool_area for n in patch_counts)
+        )
+
+    def _encode_vision_frame(
+        self,
+        pixel_values: torch.Tensor,
+        pixel_position_ids: torch.Tensor,
+        valid: torch.Tensor,
+        num_patches: int,
+    ) -> torch.Tensor:
+        """Return frame embeddings that may alias the compiled output buffer."""
         encoder = self._mm_encoder
         if encoder is None:
             # enforce_eager: the runner never calls compile_mm_encoder.
@@ -399,8 +424,6 @@ class RBLNGemma4ForConditionalGeneration(
             ).eval()
             object.__setattr__(self, "_mm_encoder", encoder)
         tower = self.vision_tower
-        valid = (pixel_position_ids >= 0).all(dim=-1)
-        num_patches = int(valid.sum())
         assert num_patches <= self.mm_encoder_patch_buckets[-1], (
             f"an image of {num_patches} patches exceeds the vision encoder's "
             f"{self.mm_encoder_patch_buckets[-1]}-patch bucket"
@@ -419,7 +442,7 @@ class RBLNGemma4ForConditionalGeneration(
         # The patches of a grid whose sides are multiples of the pooling kernel
         # pool into the leading cells, in order.
         num_soft_tokens = num_patches // tower.config.pooling_kernel_size**2
-        embeds = rbln_utils.run_mm_encoder(
+        return rbln_utils.run_mm_encoder(
             lambda *inputs: encoder(*inputs)[0],
             [
                 patches.to(device),
@@ -430,8 +453,6 @@ class RBLNGemma4ForConditionalGeneration(
             num_soft_tokens,
             device=device,
         )
-        # Subsequent images and frames can reuse this encoder output buffer.
-        return embeds.clone()
 
     def _process_image_input(
         self, image_input: Gemma4ImageInputs
@@ -440,8 +461,10 @@ class RBLNGemma4ForConditionalGeneration(
         pixel_position_ids = image_input["pixel_position_ids"]
         with torch.inference_mode():
             return [
-                self._encode_vision(pixel_values[i], pixel_position_ids[i])
-                for i in range(len(pixel_values))
+                self._encode_vision(pixels[None], positions[None])
+                for pixels, positions in zip(
+                    pixel_values, pixel_position_ids, strict=True
+                )
             ]
 
     def _process_video_input(
@@ -452,17 +475,15 @@ class RBLNGemma4ForConditionalGeneration(
         frame_counts = video_input["video_frame_counts"]
         if isinstance(frame_counts, torch.Tensor):
             frame_counts = frame_counts.tolist()
-        videos = []
         with torch.inference_mode():
-            for pixels, positions in zip(
-                pixel_values.split(frame_counts), pixel_position_ids.split(frame_counts)
-            ):
-                frames = [
-                    self._encode_vision(frame, pos)
-                    for frame, pos in zip(pixels, positions)
-                ]
-                videos.append(frames[0] if len(frames) == 1 else torch.cat(frames))
-        return videos
+            return [
+                self._encode_vision(pixels, positions)
+                for pixels, positions in zip(
+                    pixel_values.split(frame_counts),
+                    pixel_position_ids.split(frame_counts),
+                    strict=True,
+                )
+            ]
 
     def forward(
         self,

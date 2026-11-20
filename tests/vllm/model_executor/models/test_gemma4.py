@@ -109,7 +109,7 @@ def test_the_vision_encoder_matches_hfs():
     pixels, positions = _image(9, 9, num_patches=81)
 
     with torch.no_grad():
-        got = model._encode_vision(pixels, positions)
+        got = model._encode_vision(pixels[None], positions[None])
         expected = tower(
             pixel_values=pixels[None], pixel_position_ids=positions[None]
         ).last_hidden_state
@@ -128,11 +128,12 @@ def test_the_rotary_tables_are_built_once_not_per_image(monkeypatch):
         model_dtype=torch.float32,
         mm_encoder_patch_buckets=[90],
     )
-    first, second = _image(6, 3, num_patches=81), _image(3, 9, num_patches=81)
+    first_pixels, first_positions = _image(6, 3, num_patches=81)
+    pixels, positions = _image(3, 9, num_patches=81)
     with torch.no_grad():
-        model._encode_vision(*first)
+        model._encode_vision(first_pixels[None], first_positions[None])
         expected = tower(
-            pixel_values=second[0][None], pixel_position_ids=second[1][None]
+            pixel_values=pixels[None], pixel_position_ids=positions[None]
         ).last_hidden_state
         monkeypatch.setattr(
             tower.encoder.rotary_emb,
@@ -140,7 +141,7 @@ def test_the_rotary_tables_are_built_once_not_per_image(monkeypatch):
             Mock(side_effect=AssertionError("rotary computed per image")),
         )
 
-        got = model._encode_vision(*second)
+        got = model._encode_vision(pixels[None], positions[None])
 
     torch.testing.assert_close(got, expected, rtol=1e-4, atol=1e-4)
 
@@ -180,7 +181,7 @@ def test_an_image_takes_the_smallest_bucket_holding_it(width, height, bucket):
     model, calls = _recording_model([18, 45, 90])
     pixels, positions = _image(width, height, num_patches=90)
 
-    model._encode_vision(pixels, positions)
+    model._encode_vision(pixels[None], positions[None])
 
     assert calls == [(bucket, width * height)]
 
@@ -201,7 +202,7 @@ def test_an_image_is_encoded_through_the_shared_metrics_hook(monkeypatch):
 
     monkeypatch.setattr(rbln_utils, "run_mm_encoder", recording)
 
-    embeds = model._encode_vision(pixels, positions)
+    embeds = model._encode_vision(pixels[None], positions[None])
 
     assert shapes == [(1, 45, pixels.shape[-1])]
     assert embeds.shape == (9 * 3 // POOL**2, 32)
@@ -222,33 +223,40 @@ def test_image_and_video_embeddings_survive_encoder_output_reuse():
     device = torch.device(current_platform.device_type)
     tower = nn.Linear(1, 1, device=device)
     tower.config = SimpleNamespace(pooling_kernel_size=POOL)
-    buffer = torch.empty(1, 1, 1, device=device)
+    buffer = torch.empty(1, 2, 1, device=device)
     model = _bare_model(
-        vision_tower=tower, model_dtype=torch.float32, mm_encoder_patch_buckets=[9]
+        vision_tower=tower, model_dtype=torch.float32, mm_encoder_patch_buckets=[18]
     )
 
     def encoder(patches, *args):
-        buffer.copy_(patches[:, :1, :1])
+        buffer.copy_(patches[:, ::9, :1])
         return buffer
 
     object.__setattr__(model, "_mm_encoder", encoder)
-    _, positions = _image(3, 3, num_patches=9)
-    positions = positions.expand(2, -1, -1)
-    pixels = torch.tensor([1.0, 2.0]).view(2, 1, 1).expand(-1, 9, 12)
+    positions = torch.stack([_image(width, 3, num_patches=18)[1] for width in (3, 6)])
+    pixels = (
+        torch.tensor([[1.0, 0.0], [2.0, 3.0]])
+        .repeat_interleave(9, dim=1)
+        .unsqueeze(-1)
+        .expand(-1, -1, 12)
+    )
     images = model._process_image_input(
         {"pixel_values": pixels, "pixel_position_ids": positions}
     )
-    (video,) = model._process_video_input(
+    frame_order = [1, 0, 0]
+    videos = model._process_video_input(
         {
-            "pixel_values_videos": pixels.flip(0),
-            "pixel_position_ids_videos": positions,
-            "video_frame_counts": [2],
+            "pixel_values_videos": pixels[frame_order],
+            "pixel_position_ids_videos": positions[frame_order],
+            "video_frame_counts": torch.tensor([2, 1]),
         }
     )
     buffer.fill_(-1)
 
     for actual, expected in zip(
-        (*images, video), ([[1.0]], [[2.0]], [[2.0], [1.0]]), strict=True
+        (*images, *videos),
+        ([[1.0]], [[2.0], [3.0]], [[2.0], [3.0], [1.0]], [[1.0]]),
+        strict=True,
     ):
         assert actual.device == buffer.device
         torch.testing.assert_close(actual.cpu(), torch.tensor(expected))
@@ -472,16 +480,20 @@ def test_construction_builds_the_hf_processor_of_every_allowed_budget(monkeypatc
 
 
 def test_video_frames_are_regrouped_per_video(monkeypatch):
-    model = _bare_model()
-    monkeypatch.setattr(
-        model, "_encode_vision", lambda pixels, positions: pixels[:1].clone()
+    model = _bare_model(
+        vision_tower=SimpleNamespace(config=SimpleNamespace(pooling_kernel_size=POOL))
     )
-    frames = torch.arange(5.0).view(5, 1, 1).expand(5, 2, 1)
+    monkeypatch.setattr(
+        model,
+        "_encode_vision_frame",
+        lambda pixels, positions, valid, count: pixels[:1],
+    )
+    frames = torch.arange(5.0).view(5, 1, 1).expand(5, POOL**2, 1)
 
     videos = model._process_video_input(
         {
             "pixel_values_videos": frames,
-            "pixel_position_ids_videos": torch.zeros(5, 2, 2),
+            "pixel_position_ids_videos": torch.zeros(5, POOL**2, 2),
             "video_frame_counts": torch.tensor([2, 3]),
         }
     )
