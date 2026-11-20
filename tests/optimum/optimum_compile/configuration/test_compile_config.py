@@ -12,14 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+from pathlib import Path
+from stat import S_IFREG
 from types import SimpleNamespace
 
 import pytest
 import torch
+from huggingface_hub import ResolvedRevision
 from optimum.rbln import RBLNAutoModelForCausalLM
 from transformers import GptOssConfig, LlamaConfig, PretrainedConfig, Qwen3Config
 
-from vllm_rbln.config import build_optimum_rbln_config
+from vllm_rbln.config import OptimumWeightsIdentity, build_optimum_rbln_config
 from vllm_rbln.utils.optimum.configuration import sync
 from vllm_rbln.utils.optimum.configuration.compile_config import (
     compile_cache_name,
@@ -280,6 +284,103 @@ class TestQwen35ConfigBuilder:
 
 @pytest.mark.usefixtures("compile_environment")
 class TestCompileCacheName:
+    def test_hub_commit_changes_hash(self, vllm_config_factory):
+        cfg = vllm_config_factory(sync_config=False)
+        model_config = cfg.model_config
+        first_sha = "a" * 40
+        model_config.revision = ResolvedRevision(first_sha, "main", model_config.model)
+        first = prepare_compile_config(cfg)
+        assert first.weights_identity == OptimumWeightsIdentity("hub", first_sha)
+
+        model_config.revision = first_sha
+        assert compile_cache_name(prepare_compile_config(cfg)) == compile_cache_name(
+            first
+        )
+
+        model_config.revision = ResolvedRevision("b" * 40, "main", model_config.model)
+        assert compile_cache_name(prepare_compile_config(cfg)) != compile_cache_name(
+            first
+        )
+
+    def test_hub_config_commit_fallback_requires_same_repository(
+        self, vllm_config_factory
+    ):
+        cfg = vllm_config_factory(sync_config=False)
+        cfg.model_config.revision = "main"
+        cfg.model_config.hf_config._commit_hash = "a" * 40
+        assert prepare_compile_config(cfg).weights_identity == OptimumWeightsIdentity(
+            "hub", "a" * 40
+        )
+
+        cfg.model_config.hf_config_path = "other/config"
+        assert prepare_compile_config(cfg).weights_identity is None
+
+        cfg.model_config.revision = "b" * 40
+        assert prepare_compile_config(cfg).weights_identity == OptimumWeightsIdentity(
+            "hub", "b" * 40
+        )
+
+    def test_local_weight_metadata_changes_hash(
+        self, monkeypatch, tmp_path, vllm_config_factory
+    ):
+        weight = tmp_path / "model.safetensors"
+        weight.touch()
+        stat = Path.stat
+        metadata = SimpleNamespace(
+            st_mode=S_IFREG, st_size=1, st_mtime_ns=2, st_ctime_ns=3
+        )
+
+        def stat_weight(path, **kwargs):
+            if path.parent == tmp_path and path.suffix == ".safetensors":
+                return metadata
+            return stat(path, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", stat_weight)
+
+        def cache_name():
+            cfg = vllm_config_factory(sync_config=False)
+            cfg.model_config.model = str(tmp_path)
+            cfg.model_config.hf_config._commit_hash = "a" * 40
+            inputs = prepare_compile_config(cfg)
+            assert inputs.weights_identity is not None
+            assert inputs.weights_identity.source == "local"
+            return compile_cache_name(inputs)
+
+        initial = cache_name()
+        assert cache_name() == initial
+
+        for field in ("st_size", "st_mtime_ns", "st_ctime_ns"):
+            before = getattr(metadata, field)
+            setattr(metadata, field, before + 1)
+            assert cache_name() != initial, field
+            setattr(metadata, field, before)
+
+        weight.rename(tmp_path / "model-00001-of-00001.safetensors")
+        assert cache_name() != initial
+
+    def test_local_weight_index_changes_hash(self, tmp_path, vllm_config_factory):
+        shards = tmp_path / "shards"
+        shards.mkdir()
+        first = shards / "first.bin"
+        first.write_bytes(b"first")
+        second = shards / "other.bin"
+        second.write_bytes(b"other")
+        index = tmp_path / "pytorch_model.bin.index.json"
+
+        cfg = vllm_config_factory(sync_config=False)
+        cfg.model_config.model = str(tmp_path)
+        weight_map = {"a": "shards/first.bin", "b": "shards/other.bin"}
+        index.write_text(json.dumps({"weight_map": weight_map}))
+        initial = compile_cache_name(prepare_compile_config(cfg))
+
+        first.write_bytes(b"larger shard")
+        resized = compile_cache_name(prepare_compile_config(cfg))
+        assert resized != initial
+
+        weight_map["a"], weight_map["b"] = weight_map["b"], weight_map["a"]
+        index.write_text(json.dumps({"weight_map": weight_map}))
+        assert compile_cache_name(prepare_compile_config(cfg)) != resized
+
     def test_npu_type_changes_hash(self, monkeypatch, vllm_config_factory):
         ca25 = compile_cache_name(
             vllm_config_factory().additional_config.compile_config
