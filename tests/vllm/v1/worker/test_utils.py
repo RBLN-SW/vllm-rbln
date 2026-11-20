@@ -507,6 +507,13 @@ class TestGetKvCacheNames:
         }
         assert get_kv_cache_names((scale, aux, main), layers) == [main, aux, scale]
 
+    def test_a_layer_reusing_a_cache_may_repeat_an_owner_path(self):
+        names = ("model.layers.0.attn", "draft.layers.0.attn", "model.layers.1.attn")
+        layers = {name: SimpleNamespace() for name in names}
+        assert get_kv_cache_names(
+            names, layers, shared_kv_cache_layers={"draft.layers.0.attn"}
+        ) == ["model.layers.0.attn", "model.layers.1.attn", "draft.layers.0.attn"]
+
     def test_duplicate_order_is_an_error(self):
         names = ("layer.3.main", "layer.3.other")
         layers = {name: SimpleNamespace() for name in names}

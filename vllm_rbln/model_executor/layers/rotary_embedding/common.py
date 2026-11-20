@@ -37,8 +37,8 @@ def apply_rotate_half(
     cos: torch.Tensor,
     sin: torch.Tensor,
     query: torch.Tensor,
-    key: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    key: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     # NOTE(RBLN): For best compatibility with rbln,
     # tensors are reshaped/transposed as follows:
     # - cos, sin: (batch_size, 1, seq_len, rotary_dim * 2)
@@ -59,6 +59,10 @@ def apply_rotate_half(
     else:
         query_pass = query[..., self.rotary_dim :]
         query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
+
+    # A KV-shared layer (Gemma4 MTP) rotates its query alone.
+    if key is None:
+        return query, None
 
     key_shape = key.shape
     key = key.view(batch_size, seq_len, -1, self.head_size)
