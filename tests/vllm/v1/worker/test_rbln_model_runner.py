@@ -531,6 +531,7 @@ class TestEncoderOnly:
             requests={"r0": SimpleNamespace(mm_features=features)},
             model=SimpleNamespace(embed_multimodal=lambda **kw: embeds),
             encoder_cache={},
+            device=torch.device("cpu"),
         )
 
         runner._execute_mm_encoder(
