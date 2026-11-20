@@ -309,6 +309,30 @@ class RBLNMambaManager(MambaManager):
             return
         self._received_boundary[request_id] = block_idx
 
+    def cache_blocks(
+        self,
+        request: Request,
+        num_tokens: int,
+        retention_interval: int | None = None,
+        *,
+        replay_boundaries: Sequence[int],
+    ) -> None:
+        # At a prefix_match_unit below the block, an EAGLE sibling resumes one
+        # unit below the prompt's last unit boundary. Upstream's partial tail
+        # skips that position on a block boundary and its EAGLE replay boundary
+        # is a whole block lower, so name it here or neither keeps the state.
+        unit = self.block_pool.hash_block_size
+        if self.drop_eagle_checkpoint_block and unit < self.block_size:
+            tail = request.num_prompt_tokens // unit * unit - unit
+            if tail > 0 and tail % self.block_size == 0:
+                replay_boundaries = (*replay_boundaries, tail)
+        super().cache_blocks(
+            request,
+            num_tokens,
+            retention_interval,
+            replay_boundaries=replay_boundaries,
+        )
+
     def remove_skipped_blocks(
         self,
         request_id: str,

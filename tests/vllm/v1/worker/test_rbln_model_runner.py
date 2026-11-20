@@ -738,6 +738,7 @@ class TestEcConsumer:
         scheduler_output = SimpleNamespace(
             total_num_scheduled_tokens=0,
             kv_cache_copy_ops=None,
+            kv_cache_block_copies=None,
             ec_connector_metadata=ECConnectorMetadata(),
             finished_req_ids=set(),
         )
@@ -2671,6 +2672,7 @@ class TestExecuteModelRecoversADeferredLoad:
             total_num_scheduled_tokens=0,
             kv_connector_metadata="META",
             kv_cache_copy_ops=None,
+            kv_cache_block_copies=None,
         )
 
     def test_the_held_read_is_issued_before_the_connector_step(self, monkeypatch):
@@ -2779,6 +2781,7 @@ class TestExecuteModelFlushesAfterTheSubmission:
             num_scheduled_tokens={"r0": 1},
             kv_connector_metadata="META",
             kv_cache_copy_ops=None,
+            kv_cache_block_copies=None,
         )
 
         runner.execute_model(scheduler_output)
@@ -2874,6 +2877,7 @@ class TestExecuteModelMmPrefixRowEnds:
                     req_ids=["r0"], num_computed_tokens=[computed]
                 ),
                 kv_cache_copy_ops=None,
+                kv_cache_block_copies=None,
             )
         )
         return seen[0]
