@@ -157,6 +157,16 @@ def test_a_drafter_other_than_the_mtp_assistant_is_refused():
         RBLNGemma4ForConditionalGeneration(vllm_config=vllm_config)
 
 
+def test_the_mtp_assistant_is_refused_under_pipeline_parallel():
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(data_parallel_size=1, pipeline_parallel_size=2),
+        speculative_config=SimpleNamespace(method="mtp", use_gemma4_mtp=lambda: True),
+    )
+
+    with pytest.raises(ValueError, match="pipeline_parallel_size=1 only"):
+        RBLNGemma4ForConditionalGeneration(vllm_config=vllm_config)
+
+
 def _recording_model(buckets):
     """A model whose compiled encoder records the patch count it is called at."""
     tower = _vision_tower()
