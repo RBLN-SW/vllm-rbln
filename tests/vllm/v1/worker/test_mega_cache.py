@@ -759,7 +759,7 @@ class TestSaveLoad:
         assert bundle.set_dirs == []
 
 
-@pytest.mark.maybe_use_device
+@pytest.mark.use_device
 class TestWarmupWiring:
     """What binds this module into production: the bundle is loaded before
     warm-up compiles anything and written only once warm-up has succeeded."""

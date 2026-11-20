@@ -46,6 +46,7 @@ from .rbln_config import (
     read_language_model_fields,
     read_num_devices,
 )
+from .runtime_config import is_chunked_prefill_arch
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
@@ -273,16 +274,27 @@ def default_prefill_chunk_size() -> int:
     )
 
 
+def _resolve_decoder_prefill_chunk_size(
+    user_chunk: int | None, override_chunk: int | None
+) -> int:
+    validate_prefill_chunk_override(user_chunk, override_chunk)
+    if user_chunk is not None:
+        return user_chunk
+    if override_chunk is not None:
+        return override_chunk
+    return default_prefill_chunk_size()
+
+
 def prepare_compile_config(vllm_config: VllmConfig) -> OptimumRBLNCompileConfig:
     """Resolve user settings into an owned config for cache lookup and compilation."""
     from vllm_rbln.platform import RblnPlatform
 
     model_config = vllm_config.model_config
     additional_config = vllm_config.additional_config
+    hf_config = model_config.hf_config
 
-    if additional_config.prefill_chunk_size is not None and (
-        is_enc_dec_arch(model_config.hf_config)
-        or is_pooling_arch(model_config.hf_config)
+    if additional_config.prefill_chunk_size is not None and not is_chunked_prefill_arch(
+        hf_config
     ):
         raise ValueError(
             "prefill_chunk_size cannot be specified for a model that does "
@@ -299,7 +311,6 @@ def prepare_compile_config(vllm_config: VllmConfig) -> OptimumRBLNCompileConfig:
         )
     set_submodule_num_devices(optimum_overrides)
 
-    hf_config = model_config.hf_config
     if is_generation_arch(hf_config):
         model_cls, rbln_config = _for_decoder(vllm_config, optimum_overrides)
     elif is_pooling_arch(hf_config):
@@ -362,21 +373,16 @@ def _for_decoder(
 
     num_devices = get_compile_num_devices(vllm_config, optimum_overrides)
 
-    prefill_chunk_size = additional_config.single_prefill_chunk_size
-    override_prefill_chunk_size = optimum_overrides.get("prefill_chunk_size")
-    validate_prefill_chunk_override(prefill_chunk_size, override_prefill_chunk_size)
-    if prefill_chunk_size is None:
-        prefill_chunk_size = override_prefill_chunk_size
-    if prefill_chunk_size is None:
-        prefill_chunk_size = default_prefill_chunk_size()
-
     rbln_config: dict[str, Any] = {
         "num_devices": num_devices,
         "batch_size": batch_size,
         "max_seq_len": max_model_len,
         "kvcache_block_size": block_size,
         "memory_budget": cache_config.gpu_memory_utilization,
-        "prefill_chunk_size": prefill_chunk_size,
+        "prefill_chunk_size": _resolve_decoder_prefill_chunk_size(
+            additional_config.single_prefill_chunk_size,
+            optimum_overrides.get("prefill_chunk_size"),
+        ),
     }
     if block_size != max_model_len:
         rbln_config["kvcache_partition_len"] = block_size
@@ -431,6 +437,10 @@ def _for_pooling(
         if block_size != max_model_len:
             rbln_config["kvcache_partition_len"] = block_size
             rbln_config["attn_impl"] = "flash_attn"
+        rbln_config["prefill_chunk_size"] = _resolve_decoder_prefill_chunk_size(
+            vllm_config.additional_config.single_prefill_chunk_size,
+            optimum_overrides.pop("prefill_chunk_size", None),
+        )
     return model_cls, rbln_config
 
 

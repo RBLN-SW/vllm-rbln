@@ -26,6 +26,89 @@ def _bare(cls):
     return module
 
 
+@pytest.fixture
+def vision_tower(tmp_path):
+    from vllm.config import set_current_vllm_config
+    from vllm.distributed import (
+        destroy_distributed_environment,
+        destroy_model_parallel,
+        ensure_model_parallel_initialized,
+        init_distributed_environment,
+    )
+
+    from tests.vllm.vllm_config import make_vllm_config
+    from vllm_rbln.model_executor.models.glm5_next import Glm5NextVisionTransformer
+
+    with set_current_vllm_config(make_vllm_config()):
+        init_distributed_environment(
+            world_size=1,
+            rank=0,
+            distributed_init_method=f"file://{tmp_path}/dist",
+            local_rank=0,
+            backend="gloo",
+        )
+        ensure_model_parallel_initialized(1, 1)
+        try:
+            config = SimpleNamespace(
+                depth=3,
+                hidden_size=128,
+                intermediate_size=256,
+                num_heads=2,
+                patch_size=2,
+                temporal_patch_size=2,
+                in_channels=3,
+                spatial_merge_size=2,
+                out_hidden_size=64,
+                projection_intermediate_size=128,
+                swiglu_limit=7.0,
+                rms_norm_eps=1e-6,
+            )
+            torch.manual_seed(0)
+            tower = Glm5NextVisionTransformer(config, config).float().eval()
+            for param in tower.parameters():
+                param.data.normal_(0, 0.05)
+            yield tower
+        finally:
+            torch._dynamo.reset()
+            destroy_model_parallel()
+            destroy_distributed_environment()
+
+
+def test_vision_blocks_trace_as_regions_with_shared_weights(vision_tower):
+    from vllm_rbln.compilation.compiler import compile
+    from vllm_rbln.model_executor.models.glm5_next import _RBLNGlm5NextVisionEncoder
+
+    tower = vision_tower
+    original_keys = list(tower.state_dict())
+    encoder = _RBLNGlm5NextVisionEncoder(tower, torch.bfloat16).eval()
+    graphs = []
+
+    def capture(graph, inputs, **kwargs):
+        graphs.append(graph)
+        return graph.forward
+
+    compiled = compile(encoder, backend=capture, fullgraph=True, use_cache=False)
+    with torch.inference_mode():
+        for tokens in (8, 12):
+            angles = torch.randn(tokens, 64)
+            bias = torch.zeros(1, 1, tokens)
+            bias[..., -4:] = -30000.0
+            inputs = (torch.randn(tokens, 24), angles.cos(), angles.sin(), bias)
+            torch.testing.assert_close(
+                compiled(*inputs), encoder(*inputs), rtol=0, atol=0
+            )
+    assert len(graphs) == 2
+    for graph in graphs:
+        calls = [
+            node
+            for node in graph.graph.nodes
+            if node.target is torch.ops.higher_order.invoke_subgraph
+        ]
+        assert len(calls) == len(tower.blocks)
+    assert list(tower.state_dict()) == original_keys
+    assert {id(p) for p in encoder.parameters()} == {id(p) for p in tower.parameters()}
+
+
 def test_load_time_transforms_run_once_after_every_weight(monkeypatch):
     import vllm_rbln.model_executor.models.glm5_next as glm
 
@@ -249,7 +332,8 @@ def test_vision_encoder_builds_its_inputs_from_upstream_rope(monkeypatch):
     assert not key_bias[..., :8].any() and (key_bias[..., 8:] < -1e4).all()
 
 
-def test_aux_cache_flags_and_an_unallocated_draft(monkeypatch):
+def _glm5_layers(monkeypatch):
+    """A KDA layer and a DSA indexer built on a small config; returns it."""
     import vllm.distributed.parallel_state as parallel_state
     from vllm.config import set_current_vllm_config
 
@@ -277,7 +361,26 @@ def test_aux_cache_flags_and_an_unallocated_draft(monkeypatch):
     with set_current_vllm_config(config):
         glm.RBLNGlm5NextKDA(text, "model.layers.0.self_attn")
         glm.RBLNGlm5NextIndexer(text, "model.layers.1.self_attn.indexer")
+    return config
 
+
+def test_kda_states_carry_their_boundary_over_a_transfer(monkeypatch):
+    from vllm_rbln.v1.kv_cache import RBLNMambaSpec
+
+    config = _glm5_layers(monkeypatch)
+    config.cache_config.mamba_block_size = config.cache_config.block_size
+    context = config.compilation_config.static_forward_context
+    specs = [
+        context[f"model.layers.0.self_attn.attn.{j}"].get_kv_cache_spec(config)
+        for j in (0, 1)
+    ]
+    assert all(type(spec) is RBLNMambaSpec for spec in specs)
+
+
+def test_aux_cache_flags_and_an_unallocated_draft(monkeypatch):
+    from vllm_rbln.forward_context import set_forward_context
+
+    config = _glm5_layers(monkeypatch)
     context = config.compilation_config.static_forward_context
     flags = {
         name: (spec.prefix_cacheable, spec.verify_only)
@@ -297,7 +400,12 @@ def test_aux_cache_flags_and_an_unallocated_draft(monkeypatch):
     # A strict producer leaves the drafts unallocated, with no layer index.
     draft = context["model.layers.0.self_attn.attn.3"]
     draft.layer_index = None
-    with pytest.raises(AssertionError, match="was not allocated"):
+    with (
+        set_forward_context({draft.owner: None}, config),
+        pytest.raises(
+            AssertionError, match="KV cache has not been bound by the runner"
+        ),
+    ):
         draft.inputs()
 
 
@@ -616,21 +724,18 @@ def _mhc_kernels(monkeypatch):
     return calls
 
 
-def test_a_prefill_step_runs_the_mhc_on_the_token_cut_kernels(monkeypatch):
+@pytest.mark.parametrize("prefill", [True, False])
+def test_every_step_runs_the_mhc_on_the_cut_kernels(monkeypatch, prefill):
     import vllm_rbln.model_executor.models.glm5_next as glm
 
     calls = _mhc_kernels(monkeypatch)
     layer = _mhc_layer()
-    streams = torch.randn(1, 4, 8, 64).to(torch.bfloat16)
+    shape = (1, 4, 8, 64) if prefill else (8, 4, 1, 64)
+    monkeypatch.setattr(glm, "is_prefill_step", lambda: prefill)
 
-    monkeypatch.setattr(glm, "is_prefill_step", lambda: True)
-    cut = layer(streams)
-    assert calls == ["mix", "read", "write"] * 2
-    monkeypatch.setattr(glm, "is_prefill_step", lambda: False)
-    plain = layer(streams)
+    layer(torch.randn(shape).to(torch.bfloat16))
 
     assert calls == ["mix", "read", "write"] * 2
-    torch.testing.assert_close(cut.to(streams.dtype), plain)
 
 
 def test_the_model_returns_the_streams_in_the_input_dtype_after_a_cut_prefill(
@@ -654,3 +759,42 @@ def test_the_model_returns_the_streams_in_the_input_dtype_after_a_cut_prefill(
     out = model(None, torch.arange(8), None, torch.randn(1, 8, 64).to(torch.bfloat16))
 
     assert out.dtype == torch.bfloat16
+
+
+@pytest.mark.parametrize("prefill", [False, True])
+def test_only_decode_reads_the_final_norm_on_the_op(monkeypatch, prefill):
+    from vllm.config import set_current_vllm_config
+    from vllm.model_executor.layers.layernorm import RMSNorm
+
+    import vllm_rbln.model_executor.models.glm5_next as glm
+    from tests.vllm.vllm_config import make_vllm_config
+
+    torch.manual_seed(0)
+    reads = []
+
+    def residual_read(x, weight, eps):
+        reads.append(tuple(x.shape))
+        rows = x.float()
+        normed = rows * torch.rsqrt(rows.pow(2).mean(dim=-1, keepdim=True) + eps)
+        return (normed * weight.float()).to(x.dtype)
+
+    monkeypatch.setattr(glm, "is_prefill_step", lambda: prefill)
+    monkeypatch.setattr(
+        glm,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(
+        torch.ops.rbln_custom_ops, "residual_read", residual_read, raising=False
+    )
+    model = _bare(glm.RBLNGlm5NextModel)
+    model.n, model.layers, model.start_layer, model.end_layer = 4, [], 0, 0
+    with set_current_vllm_config(make_vllm_config()):
+        model.norm = RMSNorm(64, eps=1e-6)
+    model.norm.weight.data = 1.0 + 0.1 * torch.randn(64)
+    embeds = torch.randn(8, 1, 64)
+
+    out = model.forward(None, torch.zeros(8, 1), inputs_embeds=embeds)
+
+    assert reads == ([] if prefill else [(8, 1, 64)])
+    torch.testing.assert_close(out, model.norm(embeds))

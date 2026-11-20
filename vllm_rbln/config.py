@@ -117,10 +117,10 @@ class RBLNConfig(RBLNConfigBase):
     enable_sub_block_cache: bool = True
     """Enable sub-block prefix caching, at `sub_block_size` granularity."""
 
-    use_fused_sampling: bool = False
+    use_fused_sampling: bool = True
     """Run the sampling step's logits processing inside the compiled sampling
     graph: repetition / frequency / presence penalties and logit bias, on the
-    vocab chunks they touch. Needs `use_custom_sampler`."""
+    vocab chunks they touch, and min_p. Needs `use_custom_sampler`."""
 
     prefill_chunk_size: list[int] | None = None
     """Lengths the prefill graphs are compiled at. A prefill step runs the
@@ -160,7 +160,9 @@ class RBLNConfig(RBLNConfigBase):
     """Output-token capacities of compiled encoder graphs, shared across modalities.
     Empty lets the model choose: MiniMax-M3 takes the processor upper bounds of
     the enabled modalities, Gemma4 every supported soft token budget up to
-    max_soft_tokens."""
+    max_soft_tokens, Qwen3.5 powers of two from 128 up to the longest prefill
+    chunk (512 at least) and the processor upper bound for an image or a
+    video frame."""
 
     use_w8a8: bool = False
     """Opt in to W8A8. W8A16 runs on every RBLN NPU, W8A8 only on the ones

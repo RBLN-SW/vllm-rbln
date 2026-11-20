@@ -17,7 +17,7 @@
 # sampler's output back.
 
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, create_autospec
 
 import numpy as np
 import pytest
@@ -43,7 +43,7 @@ from tests.vllm.v1.worker.utils import (
     schedule_new,
 )
 
-pytestmark = pytest.mark.maybe_use_device
+pytestmark = pytest.mark.use_device
 
 
 class _InGraphMergeModel(torch.nn.Module):
@@ -156,11 +156,12 @@ class TestPreprocessBeforeStaging:
             order.append("metadata")
             return original_metadata(**values)
 
-        def metadata_stage(builder, values):
+        def metadata_stage(builder, values, group_shared):
             order.append("metadata_stage")
+            assert group_shared is runner._group_shared_staging
             if isinstance(builder, mr.RBLNGDNAttentionMetadataBuilder):
-                return original_gdn_stage(builder, values)
-            return original_metadata_stage(builder, values)
+                return original_gdn_stage(builder, values, group_shared)
+            return original_metadata_stage(builder, values, group_shared)
 
         def forward(**values):
             order.append("forward")
@@ -311,6 +312,89 @@ class TestResolveMmPrefixSupport:
 
 
 class TestGatherMultimodalEmbeddings:
+    @pytest.mark.parametrize("draft_type", ["mtp", "dflash"])
+    def test_proposer_receives_shifted_embeddings_and_both_position_views(
+        self, make_model_runner, monkeypatch, draft_type
+    ):
+        from tests.vllm.v1.spec_decode.utils import make_cad
+        from vllm_rbln.v1.spec_decode.dflash import RBLNDFlashProposer
+        from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
+
+        monkeypatch.setattr(
+            mr,
+            "get_pp_group",
+            lambda: SimpleNamespace(is_last_rank=True, is_first_rank=True),
+        )
+        runner = make_model_runner()
+        step = schedule_new(
+            "image", prompt_token_ids=[[1] * 8], num_scheduled_tokens=[3]
+        )
+        step.scheduled_new_reqs[0].mm_features = [
+            MultiModalFeatureSpec(
+                data=None,
+                modality="image",
+                identifier="image",
+                mm_position=PlaceholderRange(offset=0, length=3),
+            )
+        ]
+        runner._update_states(step)
+        hidden_size = runner.model_config.get_hidden_size()
+        runner.encoder_cache["image"] = (
+            torch.tensor([11.0, 22.0, 33.0]).view(3, 1).expand(-1, hidden_size)
+        )
+        runner.is_prefill = True
+        runner.supports_mm_inputs = True
+        speculative_config = SimpleNamespace(
+            method=draft_type,
+            use_eagle=lambda: True,
+            use_multi_module_mtp=lambda: False,
+        )
+        runner.speculative_config = speculative_config
+        runner.vllm_config.speculative_config = speculative_config
+        runner.input_ids[:3] = torch.tensor([10, 11, 12], dtype=runner.input_ids.dtype)
+        runner.positions[:3] = torch.arange(3)
+        runner.decode_back_pad[:1] = 0
+        runner.mrope_positions = torch.tensor([[0, 0, 0], [0, 1, 2], [0, 0, 1]])
+        draft_cls = RBLNEagleProposer if draft_type == "mtp" else RBLNDFlashProposer
+        drafter = Mock(spec=draft_cls)
+        drafter.supports_mm_inputs = draft_type == "mtp"
+        drafter.uses_mrope = True
+        if draft_type == "dflash":
+            drafter.propose = create_autospec(
+                RBLNDFlashProposer.propose.__get__(drafter)
+            )
+        drafter.prepare_next_token_ids_padded.return_value = (
+            torch.tensor([13]),
+            torch.tensor([1]),
+        )
+        runner.drafter = drafter
+        hidden = torch.zeros(3, hidden_size)
+        runner.propose_draft_token_ids(
+            step,
+            torch.tensor([[13]]),
+            runner.input_batch.sampling_metadata,
+            hidden,
+            hidden,
+            None,
+            make_cad([0, 3], [3]),
+            None,
+        )
+
+        inputs = drafter.propose.call_args.kwargs
+        torch.testing.assert_close(inputs["target_positions"], torch.arange(3))
+        if draft_type == "dflash":
+            assert "target_mrope_positions" not in inputs
+            return
+        torch.testing.assert_close(
+            inputs["target_mrope_positions"], runner.mrope_positions
+        )
+        rows, mask = inputs["mm_embed_inputs"]
+        assert mask[:, 0].tolist() == [1, 1, 0]
+        assert rows[0][:2] == (0, 0)
+        torch.testing.assert_close(
+            rows[0][2][:, 0], torch.tensor([22, 33], dtype=runner.dtype)
+        )
+
     def test_scheduled_images_are_encoded_and_cached_by_hash(
         self, make_model_runner, monkeypatch
     ):
@@ -349,18 +433,23 @@ class TestGatherMultimodalEmbeddings:
         torch.testing.assert_close(runner.encoder_cache["image-1"], pixels[1] + 10)
 
     @pytest.mark.parametrize(
-        "computed, with_text_holes, values",
+        "computed, with_text_holes, shift, values",
         [
-            (0, True, [0, 0, 11]),
-            (2, True, [11, 0, 22]),
-            (3, True, [0, 22, 33]),
-            (6, True, [0, 0, 0]),
-            (0, False, [0, 0, 11]),
-            (3, False, [22, 33, 0]),
+            (0, True, 0, [0, 0, 11]),
+            (2, True, 0, [11, 0, 22]),
+            (3, True, 0, [0, 22, 33]),
+            (6, True, 0, [0, 0, 0]),
+            (0, False, 0, [0, 0, 11]),
+            (3, False, 0, [22, 33, 0]),
+            (0, True, 1, [0, 11, 0]),
+            (2, True, 1, [0, 22, 33]),
+            (3, True, 1, [22, 33, 0]),
+            (0, False, 1, [0, 11, 22]),
+            (3, False, 1, [33, 0, 0]),
         ],
     )
     def test_chunk_boundaries_preserve_text_holes_and_request_order(
-        self, make_model_runner, monkeypatch, computed, with_text_holes, values
+        self, make_model_runner, monkeypatch, computed, with_text_holes, shift, values
     ):
         monkeypatch.setattr(
             mr,
@@ -402,6 +491,11 @@ class TestGatherMultimodalEmbeddings:
         _, model_kwargs, layout, _ = runner._preprocess(
             step, 2, 2, 6, torch.tensor([2, 5], dtype=torch.int32)
         )
+        if shift:
+            rows, mask = runner._gather_mm_embeddings(
+                step, 6, shift_computed_tokens=shift
+            )
+            model_kwargs = {"mm_embeds": rows, "mm_mask": mask.view(2, 3, 1)}
         mask = model_kwargs["mm_mask"].reshape(6, 1)
         embeds, _ = runner.input_stager.stage_mm_embeds(
             model_kwargs["mm_embeds"],
@@ -415,6 +509,32 @@ class TestGatherMultimodalEmbeddings:
             embeds.cpu()[:, :3].reshape(6, hidden), expected[:, None].expand(-1, hidden)
         )
         torch.testing.assert_close(mask[:, 0], (expected != 0).to(runner.dtype))
+
+    @pytest.mark.parametrize("offset", [2, 3])
+    def test_shifted_gather_requires_cached_embeddings_for_its_whole_window(
+        self, make_model_runner, monkeypatch, offset
+    ):
+        monkeypatch.setattr(
+            mr,
+            "get_pp_group",
+            lambda: SimpleNamespace(is_last_rank=True, is_first_rank=True),
+        )
+        runner = make_model_runner()
+        step = schedule_new(
+            "image", prompt_token_ids=[[1] * 8], num_scheduled_tokens=[3]
+        )
+        step.scheduled_new_reqs[0].mm_features = [
+            MultiModalFeatureSpec(
+                data=None,
+                modality="image",
+                identifier="missing",
+                mm_position=PlaceholderRange(offset=offset, length=1),
+            )
+        ]
+        runner._update_states(step)
+
+        with pytest.raises(AssertionError, match="Encoder cache miss"):
+            runner._gather_mm_embeddings(step, 3, shift_computed_tokens=1)
 
 
 class TestWarmupMultimodalEncoder:
