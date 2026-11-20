@@ -378,6 +378,8 @@ def test_kda_states_carry_their_boundary_over_a_transfer(monkeypatch):
 
 
 def test_aux_cache_flags_and_an_unallocated_draft(monkeypatch):
+    from vllm_rbln.forward_context import set_forward_context
+
     config = _glm5_layers(monkeypatch)
     context = config.compilation_config.static_forward_context
     flags = {
@@ -398,7 +400,12 @@ def test_aux_cache_flags_and_an_unallocated_draft(monkeypatch):
     # A strict producer leaves the drafts unallocated, with no layer index.
     draft = context["model.layers.0.self_attn.attn.3"]
     draft.layer_index = None
-    with pytest.raises(AssertionError, match="was not allocated"):
+    with (
+        set_forward_context({draft.owner: None}, config),
+        pytest.raises(
+            AssertionError, match="KV cache has not been bound by the runner"
+        ),
+    ):
         draft.inputs()
 
 

@@ -15,6 +15,7 @@
 from collections.abc import Sequence
 from dataclasses import dataclass
 from math import prod
+from typing import Any
 
 import torch
 from vllm.config import VllmConfig
@@ -33,6 +34,23 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+def ensure_kv_cache_registration(
+    context: dict[str, Any],
+    name: str,
+    cache: torch.nn.Module,
+    *,
+    subindex: int,
+) -> None:
+    """Set the cache subindex and register the cache if it is new."""
+    if subindex < 1:
+        raise ValueError(f"KV cache {name} requires a positive subindex")
+    if name in context and context[name] is not cache:
+        raise ValueError(f"Duplicate layer name: {name}")
+
+    cache.kv_cache_subindex = subindex
+    context.setdefault(name, cache)
 
 
 @dataclass(frozen=True)

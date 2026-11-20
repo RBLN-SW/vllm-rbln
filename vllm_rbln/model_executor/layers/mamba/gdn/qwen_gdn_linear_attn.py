@@ -32,7 +32,7 @@ from vllm_rbln.v1.attention.backends.gdn_attn import (
     RBLNGDNAttentionBackend,
     RBLNGDNAttentionMetadata,
 )
-from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
+from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec, ensure_kv_cache_registration
 
 
 class RBLNGDNBlockAuxCache(nn.Module, AttentionLayerBase):
@@ -48,6 +48,8 @@ class RBLNGDNBlockAuxCache(nn.Module, AttentionLayerBase):
         dtype: torch.dtype,
         prefix_cacheable: bool = True,
         verify_only: bool = False,
+        *,
+        subindex: int,
     ) -> None:
         super().__init__()
         self.prefix = prefix
@@ -60,9 +62,7 @@ class RBLNGDNBlockAuxCache(nn.Module, AttentionLayerBase):
         # Index among the graph's KV cache inputs, assigned by the runner.
         self.layer_index: int | None = None
         context = get_current_vllm_config().compilation_config.static_forward_context
-        if prefix in context:
-            raise ValueError(f"Duplicate layer name: {prefix}")
-        context[prefix] = self
+        ensure_kv_cache_registration(context, prefix, self, subindex=subindex)
 
     def forward(self) -> None: ...
 
@@ -83,7 +83,6 @@ class RBLNGDNBlockAuxCache(nn.Module, AttentionLayerBase):
 
     def inputs(self) -> torch.Tensor:
         metadata = get_forward_context().attn_metadata[self.owner]
-        assert self.layer_index is not None, self.prefix
         return _resolve_kv_cache(metadata, self.layer_index)
 
 
@@ -129,6 +128,7 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 CONV_LANES,
             ),
             dtype=model_config.dtype,
+            subindex=1,
         )
         # gdn_verify's draft buffer, [Hk, 2R + 1, K, D] a state block: a step's
         # drafts as (k, v, g, beta) records, which the next step replays. A
@@ -144,6 +144,7 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 dtype=model_config.dtype,
                 prefix_cacheable=False,
                 verify_only=True,
+                subindex=2,
             )
 
     def get_state_shape(self) -> tuple[tuple[int, ...]]:
@@ -181,7 +182,6 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             f"the step's batch {batch}"
         )
         seq_len = num_tokens // batch
-        assert self.layer_index is not None, self.prefix
         state = _resolve_kv_cache(metadata, self.layer_index)
         ring = self.conv_ring.inputs()
         tp_size = self.tp_size
