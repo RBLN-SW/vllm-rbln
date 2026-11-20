@@ -78,8 +78,8 @@ def make_eagle_proposer(
     runner: Any = None,
 ) -> Any:
     """A real RBLNEagleProposer built through its actual constructor on the
-    current platform's device (cpu under --device-tensor 0, rbln under 1). The
-    compiled model is left unset; attach a mock for the propose/load paths."""
+    RBLN device. The compiled model is left unset; attach a mock for the
+    propose/load paths."""
     from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 
     vllm_config = _spec_vllm_config(method, num_speculative_tokens)

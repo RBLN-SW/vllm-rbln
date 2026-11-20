@@ -219,6 +219,8 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
             base_hash,
             writes_into_peer=self._writes_into_peer,
             cross_layers_blocks=self.topo.cross_layers_blocks,
+            push_boundary_state=self._shape.push_boundary_state,
+            exchanges_block_state=bool(self._block_state_layers),
             speculative_config=self.vllm_config.speculative_config,
         )
         self.xfer_handshake_metadata = NixlHandshakePayload(

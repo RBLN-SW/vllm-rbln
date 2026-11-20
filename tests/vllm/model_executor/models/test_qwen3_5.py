@@ -1,0 +1,415 @@
+# Copyright 2026 Rebellions Inc. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at:
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""The RBLN Qwen3.5 image and video paths (one padded image or video frame at a
+time, full attention with the padding masked) track upstream's vision tower on
+the same weights."""
+
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+import torch
+from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5VisionConfig
+from vllm.config import set_current_vllm_config
+from vllm.distributed import (
+    destroy_distributed_environment,
+    destroy_model_parallel,
+    ensure_model_parallel_initialized,
+    init_distributed_environment,
+)
+from vllm.model_executor.models.qwen3_vl import Qwen3_VisionTransformer
+from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.encoder_budget import MultiModalBudget
+
+from tests.vllm.vllm_config import make_vllm_config
+from vllm_rbln.config import RBLNConfig
+from vllm_rbln.model_executor.models import qwen3_5
+from vllm_rbln.model_executor.models.qwen3_5 import (
+    RBLNQwen3_5ForConditionalGeneration,
+    RBLNQwen3_5MultiModalProcessor,
+)
+
+PATCH, MERGE, TEMPORAL = 16, 2, 2
+
+
+@pytest.fixture
+def visual(tmp_path):
+    with set_current_vllm_config(make_vllm_config()):
+        init_distributed_environment(
+            world_size=1,
+            rank=0,
+            distributed_init_method=f"file://{tmp_path}/dist",
+            local_rank=0,
+            backend="gloo",
+        )
+        ensure_model_parallel_initialized(1, 1)
+        try:
+            config = Qwen3_5VisionConfig(
+                depth=2,
+                hidden_size=64,
+                intermediate_size=128,
+                num_heads=4,
+                patch_size=PATCH,
+                spatial_merge_size=MERGE,
+                temporal_patch_size=TEMPORAL,
+                num_position_embeddings=64,
+                out_hidden_size=32,
+                hidden_act="gelu_pytorch_tanh",
+            )
+            torch.manual_seed(0)
+            tower = Qwen3_VisionTransformer(config, norm_eps=1e-6).float()
+            for param in tower.parameters():
+                param.data.normal_(0, 0.05)
+            yield tower
+        finally:
+            torch._dynamo.reset()
+            destroy_model_parallel()
+            destroy_distributed_environment()
+
+
+def test_video_pruning_is_refused():
+    vllm_config = make_vllm_config(model="Qwen/Qwen3.5-4B", video_pruning_rate=0.5)
+    with pytest.raises(NotImplementedError, match="--video-pruning-rate"):
+        RBLNQwen3_5ForConditionalGeneration(vllm_config=vllm_config)
+
+
+@pytest.mark.parametrize(
+    "mm_processor_kwargs",
+    [
+        None,
+        {"max_pixels": 4194304},
+        {"size": {"longest_edge": 2 * 256 * 256}},
+    ],
+)
+def test_video_buckets_follow_upstream_encoder_budget(monkeypatch, mm_processor_kwargs):
+    vllm_config = make_vllm_config(
+        model="Qwen/Qwen3.5-4B",
+        max_num_batched_tokens=512,
+        limit_mm_per_prompt={"image": 0, "video": 1},
+        mm_processor_kwargs=mm_processor_kwargs,
+    )
+    budget = MultiModalBudget(vllm_config, MULTIMODAL_REGISTRY, enable_cache=False)
+
+    def init(self, *, vllm_config, prefix="model"):
+        torch.nn.Module.__init__(self)
+        self.config = SimpleNamespace(image_token_id=0)
+        self.visual = SimpleNamespace(spatial_merge_size=MERGE)
+
+    monkeypatch.setattr(qwen3_5.Qwen3_5ForConditionalGeneration, "__init__", init)
+    model = RBLNQwen3_5ForConditionalGeneration(vllm_config=vllm_config)
+
+    assert model.mm_encoder_patch_buckets[-1] == (
+        budget.mm_max_toks_per_item["video"] * MERGE**2
+    )
+
+
+def _build_with_token_budgets(
+    monkeypatch, budgets, *, max_tokens=256, prefill_chunk_size=512
+):
+    """The model with upstream's construction stubbed out: a largest image of
+    `max_tokens` output tokens (1024 patches unless given) and the given budgets.
+    As a dict, `max_tokens` is the largest frame of each modality that is on."""
+    bounds = max_tokens if isinstance(max_tokens, dict) else {"image": max_tokens}
+
+    def init(self, *, vllm_config, prefix="model"):
+        torch.nn.Module.__init__(self)
+        self.config = SimpleNamespace(image_token_id=0)
+        self.visual = SimpleNamespace(spatial_merge_size=MERGE)
+
+    monkeypatch.setattr(qwen3_5.Qwen3_5ForConditionalGeneration, "__init__", init)
+    info = SimpleNamespace(get_mm_max_tokens_per_item=lambda **kwargs: bounds)
+    monkeypatch.setattr(
+        qwen3_5.MULTIMODAL_REGISTRY, "get_processing_info", lambda model_config: info
+    )
+    mm_config = SimpleNamespace(
+        get_limit_per_prompt=lambda modality: int(modality in bounds),
+        is_multimodal_pruning_enabled=lambda: False,
+    )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            get_multimodal_config=lambda: mm_config, max_model_len=8192
+        ),
+        additional_config=RBLNConfig(
+            encoder_token_budgets=budgets, prefill_chunk_size=prefill_chunk_size
+        ),
+    )
+    return RBLNQwen3_5ForConditionalGeneration(vllm_config=vllm_config)
+
+
+@pytest.mark.parametrize(
+    ("budgets", "buckets"),
+    [
+        ([256, 64], [256, 1024]),
+        ([64, 300], [256, 1200]),
+    ],
+)
+def test_token_budgets_resolve_to_patch_buckets(monkeypatch, budgets, buckets):
+    model = _build_with_token_budgets(monkeypatch, budgets)
+
+    assert model.mm_encoder_patch_buckets == buckets
+
+
+@pytest.mark.parametrize(
+    ("prefill_chunk_size", "max_tokens", "buckets"),
+    [
+        # 128, 256 and 512 output tokens, then the processor's largest image.
+        (128, 16384, [512, 1024, 2048, 65536]),
+        # A longer prefill chunk extends the budgets to its own length.
+        (1024, 16384, [512, 1024, 2048, 4096, 65536]),
+        ([512, 1536], 16384, [512, 1024, 2048, 4096, 6144, 65536]),
+        # Only the budgets below the largest image are kept.
+        (512, 256, [512, 1024]),
+        (512, 64, [256]),
+    ],
+)
+def test_unset_token_budgets_reach_the_prefill_chunk_and_the_largest_image(
+    monkeypatch, prefill_chunk_size, max_tokens, buckets
+):
+    model = _build_with_token_budgets(
+        monkeypatch, [], max_tokens=max_tokens, prefill_chunk_size=prefill_chunk_size
+    )
+
+    assert model.mm_encoder_patch_buckets == buckets
+
+
+@pytest.mark.parametrize(
+    ("bounds", "largest"),
+    [
+        ({"video": 192}, 768),
+        ({"image": 256, "video": 192}, 1024),
+        ({"image": 64, "video": 192}, 768),
+    ],
+)
+def test_the_largest_bucket_holds_a_frame_of_each_modality_that_is_on(
+    monkeypatch, bounds, largest
+):
+    model = _build_with_token_budgets(monkeypatch, [], max_tokens=bounds)
+
+    assert model.has_vision
+    assert model.mm_encoder_patch_buckets[-1] == largest
+
+
+def test_token_budgets_below_the_largest_image_are_refused(monkeypatch):
+    # No bucket would hold the processor's largest image.
+    with pytest.raises(ValueError, match="must reach 256 output tokens"):
+        _build_with_token_budgets(monkeypatch, [64])
+
+
+def test_a_request_frame_above_the_start_up_limit_is_refused(monkeypatch):
+    # The engine starts with a limit of 256 output tokens for an image, 1024
+    # patches, and of 64 for a video frame, 256 patches.
+    processor = RBLNQwen3_5MultiModalProcessor.__new__(RBLNQwen3_5MultiModalProcessor)
+    processor.info = SimpleNamespace(
+        ctx=SimpleNamespace(model_config=SimpleNamespace(max_model_len=8192)),
+        get_mm_max_tokens_per_item=lambda **kwargs: {"image": 256, "video": 64},
+        get_hf_config=lambda: SimpleNamespace(
+            vision_config=SimpleNamespace(spatial_merge_size=MERGE)
+        ),
+    )
+    outputs = {
+        "pixel_values": torch.zeros(1),
+        "image_grid_thw": torch.tensor([[1, 32, 32]]),
+    }
+    monkeypatch.setattr(
+        qwen3_5.Qwen3VLMultiModalProcessor,
+        "_apply_hf_processor_main",
+        lambda self, mm_items, hf_kwargs: outputs,
+    )
+
+    assert processor._apply_hf_processor_main(None, {}) is outputs
+
+    # A request that raised max_pixels: 34 x 32 = 1088 patches.
+    grids = torch.tensor([[1, 32, 32], [1, 34, 32]])
+    outputs = {"pixel_values": torch.zeros(1), "image_grid_thw": grids}
+    with pytest.raises(ValueError, match="1088 patches per frame, more than the 1024"):
+        processor._apply_hf_processor_main(None, {})
+
+    # Sent as embeddings, the same grids skip the encoder and are let through.
+    outputs = {"image_embeds": torch.zeros(1), "image_grid_thw": grids}
+    assert processor._apply_hf_processor_main(None, {}) is outputs
+
+    # A video is held to one frame: four of 16 x 16 pass with 1024 patches in
+    # all, and one of 18 x 16 = 288 patches is refused.
+    grids = torch.tensor([[4, 16, 16]])
+    outputs = {"pixel_values_videos": torch.zeros(1), "video_grid_thw": grids}
+    assert processor._apply_hf_processor_main(None, {}) is outputs
+
+    grids = torch.tensor([[2, 18, 16]])
+    outputs = {"pixel_values_videos": torch.zeros(1), "video_grid_thw": grids}
+    with pytest.raises(ValueError, match="288 patches per frame, more than the 256"):
+        processor._apply_hf_processor_main(None, {})
+
+
+def test_warmup_runs_the_encoder_once_over_each_bucket(visual):
+    model = RBLNQwen3_5ForConditionalGeneration.__new__(
+        RBLNQwen3_5ForConditionalGeneration
+    )
+    torch.nn.Module.__init__(model)
+    model.visual = visual
+    model.has_vision = True
+    model.mm_encoder_patch_buckets = [64, 128]
+    encoder = Mock(return_value=torch.zeros(1, 32))
+    model._mm_encoder = encoder
+
+    model.warmup_mm_encoder()
+
+    assert encoder.call_count == 2
+    # Warm-up compiles the shapes a request's image arrives in: the inputs it
+    # builds match what _encoder_inputs returns for an image of that bucket.
+    for call, grid in zip(encoder.call_args_list, [[1, 8, 8], [1, 8, 16]]):
+        pixels = torch.zeros(grid[1] * grid[2], 3 * TEMPORAL * PATCH * PATCH)
+        request = model._encoder_inputs(pixels, grid)
+        assert [(x.shape, x.dtype, x.device) for x in call.args] == [
+            (x.shape, x.dtype, x.device) for x in request
+        ]
+        assert not call.args[4].any()
+
+    model.has_vision = False
+    model.warmup_mm_encoder()
+    assert encoder.call_count == 2
+
+
+@pytest.mark.parametrize(
+    ("grid", "bucket"), [([1, 6, 4], 64), ([1, 8, 8], 64), ([1, 8, 12], 128)]
+)
+def test_an_image_takes_the_smallest_bucket_that_holds_it(visual, grid, bucket):
+    model = RBLNQwen3_5ForConditionalGeneration.__new__(
+        RBLNQwen3_5ForConditionalGeneration
+    )
+    torch.nn.Module.__init__(model)
+    model.visual = visual
+    model.mm_encoder_patch_buckets = [64, 128]
+    num_patches = grid[0] * grid[1] * grid[2]
+    pixels = torch.zeros(num_patches, 3 * TEMPORAL * PATCH * PATCH)
+
+    patches, _, _, _, key_bias = model._encoder_inputs(pixels, grid)
+
+    assert patches.shape[0] == bucket
+    assert int((key_bias == 0).sum()) == num_patches
+
+
+def test_image_embeddings_match_upstream(visual):
+    # Two images of different grids, each smaller than its bucket (128 and 64
+    # patches), so the per-image split, the bucket choice, the padding and the
+    # key mask all take part.
+    grids = [[1, 8, 12], [1, 6, 4]]
+    sizes = [t * h * w for t, h, w in grids]
+    pixels = torch.randn(sum(sizes), 3 * TEMPORAL * PATCH * PATCH)
+    model = RBLNQwen3_5ForConditionalGeneration.__new__(
+        RBLNQwen3_5ForConditionalGeneration
+    )
+    torch.nn.Module.__init__(model)
+    model.visual = visual
+    model.has_vision = True
+    model.mm_encoder_patch_buckets = [64, 128]
+    model._mm_encoder = None
+
+    with torch.inference_mode():
+        expected = visual(pixels, grid_thw=grids).split(
+            [n // (MERGE * MERGE) for n in sizes]
+        )
+        embeds = model._process_image_input(
+            {
+                "type": "pixel_values",
+                "pixel_values": pixels,
+                "image_grid_thw": torch.tensor(grids),
+            }
+        )
+
+    assert len(embeds) == len(expected)
+    for got, want in zip(embeds, expected):
+        torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-5)
+
+
+def test_video_frames_run_one_at_a_time_and_match_upstream(visual):
+    # Two clips, of three and of two temporal patches. Upstream's cu_seqlens
+    # keeps attention inside a temporal patch; here each is an encoder run at
+    # the bucket its grid takes (64 and 128 patches).
+    grids = [[3, 6, 4], [2, 8, 12]]
+    sizes = [t * h * w for t, h, w in grids]
+    pixels = torch.randn(sum(sizes), 3 * TEMPORAL * PATCH * PATCH)
+    model = RBLNQwen3_5ForConditionalGeneration.__new__(
+        RBLNQwen3_5ForConditionalGeneration
+    )
+    torch.nn.Module.__init__(model)
+    model.visual = visual
+    model.has_vision = True
+    model.mm_encoder_patch_buckets = [64, 128]
+    encoder = Mock(wraps=qwen3_5._RBLNQwen3VisionEncoder(visual).eval())
+    model._mm_encoder = encoder
+
+    with torch.inference_mode():
+        expected = visual(pixels, grid_thw=grids).split(
+            [n // (MERGE * MERGE) for n in sizes]
+        )
+        embeds = model._process_video_input(
+            {
+                "type": "pixel_values_videos",
+                "pixel_values_videos": pixels,
+                "video_grid_thw": torch.tensor(grids),
+            }
+        )
+
+    assert [call.args[0].shape[0] for call in encoder.call_args_list] == [
+        64,
+        64,
+        64,
+        128,
+        128,
+    ]
+    assert len(embeds) == len(expected)
+    for got, want in zip(embeds, expected):
+        torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-5)
+
+
+def test_vision_blocks_trace_as_regions_with_shared_weights(visual):
+    from vllm_rbln.compilation.compiler import compile
+
+    original_keys = list(visual.state_dict())
+    encoder = qwen3_5._RBLNQwen3VisionEncoder(visual).eval()
+    graphs = []
+
+    def capture(graph, inputs, **kwargs):
+        graphs.append(graph)
+        return graph.forward
+
+    compiled = compile(encoder, backend=capture, fullgraph=True, use_cache=False)
+    rotary_dim = visual.blocks[0].attn.hidden_size_per_attention_head // 2
+    with torch.inference_mode():
+        for patches in (8, 12):
+            angles = torch.randn(patches, rotary_dim)
+            key_bias = torch.zeros(1, 1, patches)
+            key_bias[..., -4:] = -30000.0
+            inputs = (
+                torch.randn(patches, 3 * TEMPORAL * PATCH * PATCH),
+                torch.randn(patches, visual.hidden_size),
+                angles.cos(),
+                angles.sin(),
+                key_bias,
+            )
+            torch.testing.assert_close(
+                compiled(*inputs), encoder(*inputs), rtol=0, atol=0
+            )
+    # One graph per bucket shape, each calling one region per vision block.
+    assert len(graphs) == 2
+    for graph in graphs:
+        calls = [
+            node
+            for node in graph.graph.nodes
+            if node.target is torch.ops.higher_order.invoke_subgraph
+        ]
+        assert len(calls) == len(visual.blocks)
+    assert list(visual.state_dict()) == original_keys
+    assert {id(p) for p in encoder.parameters()} == {id(p) for p in visual.parameters()}

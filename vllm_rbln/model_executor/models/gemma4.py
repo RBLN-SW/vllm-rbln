@@ -43,6 +43,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.parse import MultiModalDataItems
 from vllm.sequence import IntermediateTensors
 
+import vllm_rbln.utils as rbln_utils
 from vllm_rbln.model_executor.models.interfaces import (
     SupportsRBLNMmPrefix,
     SupportsRBLNMultiModal,
@@ -295,10 +296,13 @@ class RBLNGemma4ForConditionalGeneration(
         # longest range.
         self.max_mm_prefix_range_len = cap
         # One compiled encoder shape per budget; an image or frame is padded to
-        # the smallest that holds its patches.
+        # the smallest that holds its patches. Unset, every budget a prefill
+        # chunk holds, so raising max_soft_tokens keeps the compiled graphs.
         rbln_config = vllm_config.additional_config
         budgets = sorted(rbln_config.encoder_token_budgets) or [
-            budget for budget in _SUPPORTED_SOFT_TOKENS if budget <= cap
+            budget
+            for budget in _SUPPORTED_SOFT_TOKENS
+            if budget <= rbln_config.max_prefill_chunk_size
         ]
         if unsupported := sorted(set(budgets) - set(_SUPPORTED_SOFT_TOKENS)):
             raise ValueError(
@@ -316,6 +320,10 @@ class RBLNGemma4ForConditionalGeneration(
         self.mm_encoder_patch_buckets = [budget * pool**2 for budget in budgets]
         self._mm_encoder: Callable[..., torch.Tensor] | None
         object.__setattr__(self, "_mm_encoder", None)
+
+    @property
+    def logits_processor(self) -> nn.Module:
+        return self.language_model.logits_processor
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # Scale each expert's down projection instead of its routing weight:
@@ -409,16 +417,19 @@ class RBLNGemma4ForConditionalGeneration(
             :, None, None, :
         ]
         device = next(tower.parameters()).device
-        embeds = encoder(
-            patches.to(device),
-            positions.to(device),
-            padding.to(device),
-            key_bias.to(device=device, dtype=self.model_dtype),
-        )
         # The patches of a grid whose sides are multiples of the pooling kernel
         # pool into the leading cells, in order.
         num_soft_tokens = num_patches // tower.config.pooling_kernel_size**2
-        return embeds[0, :num_soft_tokens].cpu()
+        return rbln_utils.run_mm_encoder(
+            lambda *inputs: encoder(*inputs)[0],
+            [
+                patches.to(device),
+                positions.to(device),
+                padding.to(device),
+                key_bias.to(device=device, dtype=self.model_dtype),
+            ],
+            num_soft_tokens,
+        )
 
     def _process_image_input(
         self, image_input: Gemma4ImageInputs

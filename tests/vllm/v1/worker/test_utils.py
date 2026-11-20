@@ -402,8 +402,9 @@ class TestEstimateModelKernelSize:
     def test_bytes_path_exact(self):
         # n_model_bytes path, default bits passed explicitly (no platform mock).
         result = estimate_model_kernel_size(
-            _make_model_config(num_layers=2, vocab_size=64, hidden_size=32),
+            _make_model_config(vocab_size=64, hidden_size=32),
             _make_parallel_config(tp_size=1),
+            num_layers=2,
             n_model_bytes=12_288,
             default_bits_per_param=16,
         )
@@ -412,8 +413,9 @@ class TestEstimateModelKernelSize:
     def test_params_path_exact(self):
         # n_model_params + nbits_per_param path.
         result = estimate_model_kernel_size(
-            _make_model_config(num_layers=4, vocab_size=128, hidden_size=64),
+            _make_model_config(vocab_size=128, hidden_size=64),
             _make_parallel_config(tp_size=1),
+            num_layers=4,
             n_model_params=1_000_000,
             nbits_per_param=16,
             default_bits_per_param=16,
@@ -422,8 +424,8 @@ class TestEstimateModelKernelSize:
 
     def test_tp_scaling(self):
         # tp_size changes lm_heads_nbytes (align per-tp, then multiply by tp).
-        mc = _make_model_config(num_layers=2, vocab_size=64, hidden_size=32)
-        common = dict(n_model_bytes=12_288, default_bits_per_param=16)
+        mc = _make_model_config(vocab_size=64, hidden_size=32)
+        common = dict(num_layers=2, n_model_bytes=12_288, default_bits_per_param=16)
         r1 = estimate_model_kernel_size(mc, _make_parallel_config(tp_size=1), **common)
         r2 = estimate_model_kernel_size(mc, _make_parallel_config(tp_size=2), **common)
         assert r1 == 6_291_456
@@ -447,6 +449,7 @@ class TestEstimateModelKernelSize:
             estimate_model_kernel_size(
                 _make_model_config(),
                 _make_parallel_config(),
+                num_layers=32,
                 default_bits_per_param=16,
                 **kwargs,
             )
@@ -454,69 +457,68 @@ class TestEstimateModelKernelSize:
     def test_default_bits_from_platform(self, monkeypatch):
         # With default_bits_per_param=None the bits come from the device name:
         # ATOM/REBEL -> 16, unknown RBLN -> ValueError, non-rbln -> assert.
-        mc = _make_model_config(num_layers=2, vocab_size=64, hidden_size=32)
+        mc = _make_model_config(vocab_size=64, hidden_size=32)
         pc = _make_parallel_config(tp_size=1)
+        kw = dict(num_layers=2, n_model_bytes=12_288)
 
         def _name(name):
             monkeypatch.setattr(current_platform, "get_device_name", lambda: name)
 
         _name("RBLN-CA25")
-        assert estimate_model_kernel_size(mc, pc, n_model_bytes=12_288) == 6_291_456
+        assert estimate_model_kernel_size(mc, pc, **kw) == 6_291_456
         _name("RBLN-CR13")
-        assert estimate_model_kernel_size(mc, pc, n_model_bytes=12_288) == 6_291_456
+        assert estimate_model_kernel_size(mc, pc, **kw) == 6_291_456
         _name("RBLN-XX99")
         with pytest.raises(ValueError, match="invalid RBLN architecture"):
-            estimate_model_kernel_size(mc, pc, n_model_bytes=12_288)
+            estimate_model_kernel_size(mc, pc, **kw)
         _name("cpu")
         with pytest.raises(AssertionError):
-            estimate_model_kernel_size(mc, pc, n_model_bytes=12_288)
+            estimate_model_kernel_size(mc, pc, **kw)
 
 
 class TestGetKvCacheNames:
-    @staticmethod
-    def _caches(*names):
-        return {n: torch.empty(0) for n in names}
+    @pytest.mark.parametrize(
+        "names",
+        [
+            ("model.layers.2.attn", "model.layers.10.attn"),
+            (
+                "model.layers.2.attn.0",
+                "model.layers.2.attn.9",
+                "model.layers.2.attn.10",
+                "model.layers.3.attn.0",
+            ),
+        ],
+        ids=["decoder-layers", "glm-slots"],
+    )
+    def test_orders_by_numeric_path(self, names):
+        layers = {name: SimpleNamespace() for name in names}
+        assert get_kv_cache_names(reversed(names), layers) == list(names)
 
-    def test_orders_by_layer_index(self):
-        # Returned ordered by extracted layer index, not dict insertion order.
-        caches = self._caches(
-            "model.layers.2.self_attn",
-            "model.layers.0.self_attn",
-            "model.layers.1.self_attn",
-        )
-        assert get_kv_cache_names(caches) == [
-            "model.layers.0.self_attn",
-            "model.layers.1.self_attn",
-            "model.layers.2.self_attn",
-        ]
+    @pytest.mark.parametrize("aux_name", ["indexer", "renamed", "conv_ring"])
+    def test_aux_caches_sort_by_subindex(self, aux_name):
+        main = "model.layers.3.attn"
+        aux = f"{main}.{aux_name}"
+        scale = f"{aux}.scales"
+        layers = {
+            scale: SimpleNamespace(kv_cache_subindex=2),
+            aux: SimpleNamespace(kv_cache_subindex=1),
+            main: SimpleNamespace(),
+            "model.layers.4.attn": SimpleNamespace(),
+        }
+        assert get_kv_cache_names((scale, aux, main), layers) == [main, aux, scale]
 
-    def test_multi_layer_same_index_raises(self, monkeypatch):
-        # Two layers at one index on a non-cpu/cuda/xpu platform -> not supported.
-        monkeypatch.setattr(current_platform, "is_cpu", lambda: False)
-        monkeypatch.setattr(current_platform, "is_cuda_alike", lambda: False)
-        monkeypatch.setattr(current_platform, "is_xpu", lambda: False)
-        caches = self._caches("model.layers.0.self_attn", "model.layers.0.cross_attn")
-        with pytest.raises(NotImplementedError):
-            get_kv_cache_names(caches)
+    def test_a_layer_reusing_a_cache_may_repeat_an_owner_path(self):
+        names = ("model.layers.0.attn", "draft.layers.0.attn", "model.layers.1.attn")
+        layers = {name: SimpleNamespace() for name in names}
+        assert get_kv_cache_names(
+            names, layers, shared_kv_cache_layers={"draft.layers.0.attn"}
+        ) == ["model.layers.0.attn", "model.layers.1.attn", "draft.layers.0.attn"]
 
-    def test_a_layer_reusing_a_cache_may_share_an_index(self, monkeypatch):
-        monkeypatch.setattr(current_platform, "is_cpu", lambda: False)
-        monkeypatch.setattr(current_platform, "is_cuda_alike", lambda: False)
-        monkeypatch.setattr(current_platform, "is_xpu", lambda: False)
-        caches = self._caches("model.layers.0.self_attn", "draft.layers.0.self_attn")
-        shared = {"draft.layers.0.self_attn"}
-        names = get_kv_cache_names(caches, shared_kv_cache_layers=shared)
-        assert set(names) == set(caches)
-
-    def test_multi_layer_same_index_allowed_on_cpu(self, monkeypatch):
-        # The other side of the branch: on cpu/cuda/xpu both names are returned.
-        monkeypatch.setattr(current_platform, "is_cpu", lambda: True)
-        monkeypatch.setattr(current_platform, "is_cuda_alike", lambda: False)
-        monkeypatch.setattr(current_platform, "is_xpu", lambda: False)
-        caches = self._caches("model.layers.0.self_attn", "model.layers.0.cross_attn")
-        names = get_kv_cache_names(caches)
-        assert set(names) == set(caches)
-        assert len(names) == 2
+    def test_duplicate_order_is_an_error(self):
+        names = ("layer.3.main", "layer.3.other")
+        layers = {name: SimpleNamespace() for name in names}
+        with pytest.raises(ValueError, match="main.*other|other.*main"):
+            get_kv_cache_names(names, layers)
 
 
 class TestPrepareKernelBlockSizes:
