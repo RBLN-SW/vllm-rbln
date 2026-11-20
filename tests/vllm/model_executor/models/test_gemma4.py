@@ -24,10 +24,17 @@ from unittest.mock import Mock
 import pytest
 import torch
 from torch import nn
-from transformers import Gemma4VisionConfig, Gemma4VisionModel
+from transformers import BatchFeature, Gemma4VisionConfig, Gemma4VisionModel
+from vllm.distributed.ec_transfer.ec_connector.utils import collect_ec_item_metadata
+from vllm.entrypoints.chat_utils import _get_embeds_data
 from vllm.forward_context import get_forward_context, override_forward_context
 from vllm.model_executor.models.gemma4 import Gemma4Attention
 from vllm.model_executor.models.gemma4_mm import Gemma4ForConditionalGeneration
+from vllm.multimodal.inputs import (
+    MultiModalFeatureSpec,
+    MultiModalKwargsItems,
+    PlaceholderRange,
+)
 
 import vllm_rbln.model_executor.models.gemma4 as gemma4
 from vllm_rbln.compilation.compiler import compile, mark_decoder_regions
@@ -430,6 +437,64 @@ def test_construction_builds_the_hf_processor_of_every_allowed_budget(monkeypatc
     gemma4.RBLNGemma4MultiModalProcessor()
 
     assert [kwargs["max_soft_tokens"] for kwargs in built if kwargs] == [70, 140, 280]
+
+
+def test_ec_image_metadata_preserves_the_placeholder_without_pixels():
+    image_token, boi_token, eoi_token = 3, 4, 5
+    parser = gemma4._RBLNGemma4DataParser(allow_missing_mm_embeddings=True)
+    processor = gemma4.RBLNGemma4MultiModalProcessor.__new__(
+        gemma4.RBLNGemma4MultiModalProcessor
+    )
+    processor._mm_soft_token_cap = 280
+    processor.info = SimpleNamespace(
+        ctx=SimpleNamespace(
+            get_merged_mm_kwargs=lambda kwargs: kwargs,
+            model_config=SimpleNamespace(get_inputs_embeds_size=lambda: 2816),
+        ),
+        data_parser=parser,
+        get_hf_processor=lambda: SimpleNamespace(image_token_id=image_token),
+        get_hf_config=lambda: SimpleNamespace(
+            vision_config=SimpleNamespace(pooling_kernel_size=POOL),
+            boi_token_id=boi_token,
+            eoi_token_id=eoi_token,
+        ),
+    )
+    positions = torch.zeros((2, 18, 2), dtype=torch.long)
+    positions[0, 9:] = -1
+    inputs = processor._postprocess_hf_mm_data(
+        {}, {}, BatchFeature({"pixel_position_ids": positions})
+    )
+    fields = processor._get_mm_fields_config(inputs, {})
+    outputs = MultiModalKwargsItems.from_hf_inputs(inputs, fields)
+    features = [
+        MultiModalFeatureSpec(
+            data=item,
+            modality="image",
+            identifier=str(index),
+            mm_position=PlaceholderRange(offset=0, length=4),
+        )
+        for index, item in enumerate(outputs["image"])
+    ]
+    metadata = collect_ec_item_metadata(
+        features, SimpleNamespace(fields_for=parser.placeholder_metadata_fields)
+    )
+    payload = [entry["metadata"] for entry in metadata.values()]
+    assert payload == [{"image_num_tokens": [1]}, {"image_num_tokens": [2]}]
+
+    values = _get_embeds_data("image", payload, processor)
+    items = parser.parse_mm_data({"image": values})
+    inputs = processor._apply_hf_processor_main(items, {})
+    assert set(inputs) == {"image_num_tokens"}
+    (update,) = processor._get_prompt_updates(items, {}, outputs)
+    for index, count in enumerate((1, 2)):
+        content = update.resolve(index).content
+        assert content.full == [boi_token, *([image_token] * count), eoi_token]
+        assert content.is_embed is not None
+        assert content.is_embed(content.full).tolist() == [
+            False,
+            *([True] * count),
+            False,
+        ]
 
 
 def test_video_frames_are_regrouped_per_video(monkeypatch):

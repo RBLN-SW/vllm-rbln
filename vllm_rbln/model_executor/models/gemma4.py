@@ -16,8 +16,9 @@
 compiled and its image embeddings merged inside the compiled graph."""
 
 import math
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from functools import cached_property
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -27,6 +28,7 @@ from transformers.models.gemma4.modeling_gemma4 import apply_multidimensional_ro
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
 from vllm.forward_context import get_forward_context
+from vllm.inputs import ModalityData
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.models.gemma4 import Gemma4Attention, Gemma4MLP
 from vllm.model_executor.models.gemma4_mm import (
@@ -40,7 +42,22 @@ from vllm.model_executor.models.gemma4_mm import (
     _get_max_soft_tokens,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.multimodal.parse import MultiModalDataItems
+from vllm.multimodal.inputs import (
+    ImageItem,
+    MultiModalFieldConfig,
+    MultiModalKwargsItems,
+)
+from vllm.multimodal.parse import (
+    DictEmbeddingItems,
+    ModalityDataItems,
+    MultiModalDataItems,
+    MultiModalDataParser,
+)
+from vllm.multimodal.processing import (
+    PromptReplacement,
+    PromptUpdate,
+    PromptUpdateDetails,
+)
 from vllm.sequence import IntermediateTensors
 
 import vllm_rbln.utils as rbln_utils
@@ -221,6 +238,50 @@ def mm_soft_token_cap(info: Gemma4ProcessingInfo) -> int:
     return cap
 
 
+class _RBLNGemma4DataParser(MultiModalDataParser):
+    embedding_fields = {"image": {"image_num_tokens": "metadata"}}
+
+    def _parse_image_data(
+        self, data: dict[str, torch.Tensor] | ModalityData[ImageItem]
+    ) -> ModalityDataItems[Any, Any] | None:
+        if not isinstance(data, dict):
+            return super()._parse_image_data(data)
+
+        if not self.allow_missing_mm_embeddings or data.keys() != {"image_num_tokens"}:
+            raise ValueError("Gemma4 image metadata requires an EC consumer")
+        counts = data["image_num_tokens"]
+        if (
+            not isinstance(counts, torch.Tensor)
+            or counts.dtype not in (torch.int32, torch.int64)
+            or counts.ndim not in (1, 2)
+            or (counts.ndim == 2 and counts.shape[1] != 1)
+            or not torch.all((counts > 0) & (counts <= max(_SUPPORTED_SOFT_TOKENS)))
+        ):
+            raise ValueError(
+                "image_num_tokens must contain one valid integer per image"
+            )
+        return DictEmbeddingItems(
+            {"image_num_tokens": counts.flatten()},
+            modality="image",
+            required_fields=self.placeholder_metadata_fields("image"),
+            fields_factory=lambda _: {
+                "image_num_tokens": MultiModalFieldConfig.batched(
+                    "image", keep_on_cpu=True
+                ),
+            },
+        )
+
+
+class _RBLNGemma4ProcessingInfo(Gemma4ProcessingInfo):
+    def get_data_parser(self) -> MultiModalDataParser:
+        parser = super().get_data_parser()
+        return _RBLNGemma4DataParser(
+            video_needs_metadata=parser.video_needs_metadata,
+            target_sr=parser.audio_resampler.target_sr,
+            allow_missing_mm_embeddings=self.allow_missing_mm_embeddings,
+        )
+
+
 class RBLNGemma4MultiModalProcessor(Gemma4MultiModalProcessor):
     """Upstream's processor, refusing per request an image budget above the
     engine's."""
@@ -255,15 +316,85 @@ class RBLNGemma4MultiModalProcessor(Gemma4MultiModalProcessor):
                 )
         return super()._apply_hf_processor_main(mm_items, hf_kwargs)
 
+    def _postprocess_hf_mm_data(
+        self,
+        mm_inputs: Mapping[str, object],
+        hf_processor_mm_kwargs: Mapping[str, object],
+        processed_data: BatchFeature,
+    ) -> BatchFeature:
+        processed_data = super()._postprocess_hf_mm_data(
+            mm_inputs, hf_processor_mm_kwargs, processed_data
+        )
+        if (positions := processed_data.get("pixel_position_ids")) is not None:
+            patches_per_token = (
+                self.info.get_hf_config().vision_config.pooling_kernel_size ** 2
+            )
+            processed_data["image_num_tokens"] = (positions >= 0).all(dim=-1).sum(
+                dim=-1
+            ) // patches_per_token
+        return processed_data
+
+    def _get_mm_fields_config(
+        self,
+        hf_inputs: BatchFeature,
+        hf_processor_mm_kwargs: Mapping[str, object],
+    ) -> Mapping[str, MultiModalFieldConfig]:
+        fields = super()._get_mm_fields_config(hf_inputs, hf_processor_mm_kwargs)
+        if "image_num_tokens" in hf_inputs:
+            return {
+                **fields,
+                "image_num_tokens": MultiModalFieldConfig.batched(
+                    "image", keep_on_cpu=True
+                ),
+            }
+        return fields
+
+    def _get_prompt_updates(
+        self,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, Any],
+        out_mm_kwargs: MultiModalKwargsItems,
+    ) -> Sequence[PromptUpdate]:
+        images = mm_items.get("image")
+        if not isinstance(images, DictEmbeddingItems):
+            return super()._get_prompt_updates(
+                mm_items, hf_processor_mm_kwargs, out_mm_kwargs
+            )
+
+        processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
+        image_token_id = processor.image_token_id
+        config = self.info.get_hf_config()
+
+        def replacement(item_idx: int) -> PromptUpdateDetails:
+            num_tokens = int(images.get(item_idx)["image_num_tokens"].item())
+            tokens = [config.boi_token_id] + [image_token_id] * num_tokens
+            tokens.append(config.eoi_token_id)
+            return PromptUpdateDetails.select_token_id(tokens, image_token_id)
+
+        return [
+            PromptReplacement("image", [image_token_id], replacement),
+            *super()._get_prompt_updates(
+                mm_items.select(set(mm_items) - {"image"}),
+                hf_processor_mm_kwargs,
+                out_mm_kwargs,
+            ),
+        ]
+
 
 @MULTIMODAL_REGISTRY.register_processor(
     RBLNGemma4MultiModalProcessor,
-    info=Gemma4ProcessingInfo,
+    info=_RBLNGemma4ProcessingInfo,
     dummy_inputs=Gemma4DummyInputsBuilder,
 )
 class RBLNGemma4ForConditionalGeneration(
     Gemma4ForConditionalGeneration, SupportsRBLNMultiModal, SupportsRBLNMmPrefix
 ):
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
+        return super().get_placeholder_str(
+            "image" if modality == "image_embeds" else modality, i
+        )
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         if vllm_config.parallel_config.data_parallel_size > 1:
             raise ValueError("Gemma4 does not support data parallel on RBLN.")
