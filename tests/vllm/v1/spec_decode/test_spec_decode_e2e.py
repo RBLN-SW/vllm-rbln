@@ -18,13 +18,13 @@
 
 import json
 import warnings
-from typing import Any
 
 import pytest
 from vllm import SamplingParams
 from vllm.config import SpeculativeConfig
 from vllm.inputs import TokensPrompt
 
+from tests.vllm.model_specs import CompileModelSpec, apply_spec_envs, spec_params
 from tests.vllm.utils import TokensTextLogprobs, check_outputs_almost_equal
 from tests.vllm.v1.spec_decode.utils import (
     _DRAFT,
@@ -35,9 +35,7 @@ from tests.vllm.v1.spec_decode.utils import (
 from tests.vllm.vllm_config import local_weights_path
 from vllm_rbln import envs
 
-# A small, compilable target for the draft-free methods; ngram/suffix speculate
-# by matching repeats, so the prompt is deliberately repetitive.
-_NGRAM_TARGET = "meta-llama/Llama-3.2-1B-Instruct"
+# Ngram and suffix find drafts by matching repeated text.
 _SENTENCE = "The quick brown fox jumps over the lazy dog. "
 PROMPT = _SENTENCE * 20
 # 251 tokens for Qwen3.5: the generated ones cross from the first 256-token
@@ -46,56 +44,73 @@ _MTP_PROMPT = _SENTENCE * 25
 MAX_TOKENS = 16
 NUM_LOGPROBS = 5
 
-# method -> (target model, extra LLM kwargs, speculative_config). The eagle/medusa
-# drafts cap at 2048 positions, so max_model_len is lowered for them.
-SPEC_METHODS: dict[str, tuple[str, dict[str, Any], dict[str, Any]]] = {
-    "ngram": (
+_NGRAM_TARGET = "meta-llama/Llama-3.2-1B-Instruct"
+_NGRAM_CONFIG = {
+    "method": "ngram",
+    "prompt_lookup_max": 5,
+    "prompt_lookup_min": 3,
+    "num_speculative_tokens": 3,
+}
+SPEC_MODELS = [
+    CompileModelSpec(_NGRAM_TARGET, {"speculative_config": _NGRAM_CONFIG}, id="ngram"),
+    CompileModelSpec(
         _NGRAM_TARGET,
-        {},
         {
-            "method": "ngram",
-            "prompt_lookup_max": 5,
-            "prompt_lookup_min": 3,
-            "num_speculative_tokens": 3,
+            "speculative_config": {
+                "method": "suffix",
+                "suffix_decoding_max_spec_factor": 2.0,
+                "num_speculative_tokens": 3,
+            },
         },
+        id="suffix",
     ),
-    "suffix": (
-        _NGRAM_TARGET,
-        {},
-        {
-            "method": "suffix",
-            "suffix_decoding_max_spec_factor": 2.0,
-            "num_speculative_tokens": 3,
-        },
-    ),
-    "eagle": (
-        TARGET_MODEL,
-        {"max_model_len": 2048, "tensor_parallel_size": 2},
-        {"method": "eagle", "model": _DRAFT["eagle"], "num_speculative_tokens": 3},
-    ),
-    "eagle3": (
-        TARGET_MODEL,
-        {"max_model_len": 2048, "tensor_parallel_size": 2},
-        {"method": "eagle3", "model": _DRAFT["eagle3"], "num_speculative_tokens": 3},
-    ),
-    "medusa": (
+    # The EAGLE and Medusa draft models cap at 2048 positions.
+    *[
+        CompileModelSpec(
+            TARGET_MODEL,
+            {
+                "max_model_len": 2048,
+                "tensor_parallel_size": 2,
+                "speculative_config": {
+                    "method": method,
+                    "model": draft,
+                    "num_speculative_tokens": 3,
+                },
+            },
+            id=method,
+        )
+        for method, draft in _DRAFT.items()
+    ],
+    CompileModelSpec(
         MEDUSA_TARGET,
-        {"max_model_len": 2048},
-        {"method": "medusa", "model": MEDUSA_DRAFT, "num_speculative_tokens": 3},
+        {
+            "max_model_len": 2048,
+            "speculative_config": {
+                "method": "medusa",
+                "model": MEDUSA_DRAFT,
+                "num_speculative_tokens": 3,
+            },
+        },
+        id="medusa",
     ),
-    # The target's own MTP head; text-only, at the block size a GatedDeltaNet
-    # state fills a full-attention page. The runner's block count does not
-    # model a GatedDeltaNet group, so the engine sizes the pool itself.
-    "mtp": (
+    # A GatedDeltaNet state fills one full-attention page at this block size.
+    # The runner cannot size a GatedDeltaNet pool, so the engine sizes it.
+    CompileModelSpec(
         "Qwen/Qwen3.5-4B",
         {
             "language_model_only": True,
             "block_size": 256,
             "num_gpu_blocks_override": None,
+            "speculative_config": {"method": "mtp", "num_speculative_tokens": 3},
         },
-        {"method": "mtp", "num_speculative_tokens": 3},
+        id="mtp",
     ),
-}
+]
+SAMPLED_NGRAM = CompileModelSpec(
+    "Qwen/Qwen3-0.6B",
+    {"max_num_seqs": 4, "speculative_config": _NGRAM_CONFIG},
+    id="ngram",
+)
 
 # Methods whose draft path should land accepted tokens on the repetitive prompt.
 # medusa is excluded: its only small ungated checkpoint is random-init, so
@@ -104,8 +119,9 @@ _EXPECT_ACCEPTANCE = {"ngram", "suffix", "eagle", "eagle3", "mtp"}
 
 
 @pytest.fixture(autouse=True)
-def _pin_layers(request, monkeypatch):
-    method = request.node.callspec.params["method"]
+def _pin_layers(spec: CompileModelSpec, monkeypatch):
+    apply_spec_envs(spec, monkeypatch)
+    method = spec.engine_kwargs["speculative_config"]["method"]
     num_layers = envs.VLLM_RBLN_NUM_HIDDEN_LAYERS
     if method == "mtp" and 0 < num_layers < 8:
         # TODO(rebel-compiler): the compiler's layer rolling
@@ -143,39 +159,38 @@ def reference_outputs() -> dict[tuple[str, str, int, str], list[TokensTextLogpro
 
 
 @pytest.mark.model_compile
-@pytest.mark.parametrize("method", SPEC_METHODS)
+@pytest.mark.parametrize("spec", spec_params(SPEC_MODELS))
 def test_speculative_decoding_matches_reference(
-    vllm_runner, method: str, whole_model: bool, reference_outputs
+    vllm_runner, spec: CompileModelSpec, whole_model: bool, reference_outputs
 ) -> None:
-    target, extra_kwargs, spec_config = SPEC_METHODS[method]
+    engine_kwargs = dict(spec.engine_kwargs)
+    spec_config = dict(engine_kwargs.pop("speculative_config"))
+    method = spec_config["method"]
     if draft := spec_config.get("model"):
-        spec_config = {**spec_config, "model": local_weights_path(draft)}
+        spec_config["model"] = local_weights_path(draft)
     prompt = _MTP_PROMPT if method == "mtp" else PROMPT
 
     # The reference sampler, on both runs: the RBLN one compiles a graph of its
     # own, and acceptance is being compared, not sampler implementations.
-    engine_kwargs = {
-        **extra_kwargs,
-        "additional_config": {
-            "use_custom_sampler": False,
-            **extra_kwargs.get("additional_config", {}),
-        },
+    engine_kwargs["additional_config"] = {
+        "use_custom_sampler": False,
+        **engine_kwargs.get("additional_config", {}),
     }
     reference_key = (
-        target,
+        spec.model,
         prompt,
         envs.VLLM_RBLN_NUM_HIDDEN_LAYERS,
-        json.dumps(engine_kwargs, sort_keys=True),
+        json.dumps((engine_kwargs, spec.envs), sort_keys=True),
     )
     if reference_key not in reference_outputs:
-        with vllm_runner(target, **engine_kwargs) as ref_model:
+        with vllm_runner(spec.model, **engine_kwargs) as ref_model:
             outputs = ref_model.generate_greedy_logprobs(
                 [prompt], MAX_TOKENS, NUM_LOGPROBS
             )
         reference_outputs[reference_key] = outputs
 
     with vllm_runner(
-        target,
+        spec.model,
         **engine_kwargs,
         speculative_config=spec_config,
     ) as spec_model:
@@ -203,23 +218,24 @@ def test_speculative_decoding_matches_reference(
 
 # Qwen3's generation_config.json samples with top_k=20, so a request that sets
 # nothing still carries a top-k the output can be held to.
-SAMPLED_TARGET = "Qwen/Qwen3-0.6B"
 DEFAULT_TOP_K = 20
 
 
 @pytest.mark.model_compile
-@pytest.mark.parametrize("method", ["ngram"])
+@pytest.mark.parametrize("spec", spec_params([SAMPLED_NGRAM]))
 def test_sampled_speculative_decoding_stays_in_the_top_k(
-    vllm_runner, method: str, whole_model: bool
+    vllm_runner, spec: CompileModelSpec, whole_model: bool
 ) -> None:
     """Random rows through the RBLN rejection graph, one with its own top_k and
     one with the model's defaults, must sample only within that top_k."""
-    spec_config = SPEC_METHODS[method][2]
+    engine_kwargs = dict(spec.engine_kwargs)
+    spec_config = dict(engine_kwargs.pop("speculative_config"))
+    method = spec_config["method"]
     explicit = SamplingParams(
         temperature=1.0, top_k=5, max_tokens=MAX_TOKENS, ignore_eos=True
     )
     with vllm_runner(
-        SAMPLED_TARGET, max_num_seqs=4, speculative_config=spec_config
+        spec.model, **engine_kwargs, speculative_config=spec_config
     ) as spec_model:
         defaults = spec_model.llm.get_default_sampling_params()
         assert defaults.top_k == DEFAULT_TOP_K
@@ -236,12 +252,12 @@ def test_sampled_speculative_decoding_stays_in_the_top_k(
         for p, o in zip(params, outputs)
         for i, token in enumerate(o.outputs[0].token_ids)
     ]
-    with vllm_runner(
-        SAMPLED_TARGET,
-        max_num_seqs=4,
-        max_logprobs=2 * DEFAULT_TOP_K,
-        additional_config={"use_custom_sampler": False},
-    ) as ref_model:
+    engine_kwargs["max_logprobs"] = 2 * DEFAULT_TOP_K
+    engine_kwargs["additional_config"] = {
+        **engine_kwargs.get("additional_config", {}),
+        "use_custom_sampler": False,
+    }
+    with vllm_runner(spec.model, **engine_kwargs) as ref_model:
         ranked = ref_model.llm.generate(
             [TokensPrompt(prompt_token_ids=prefix) for prefix, _, _ in checks],
             [
