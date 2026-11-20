@@ -659,7 +659,7 @@ def test_a_video_is_encoded_in_segments_of_temporal_patches(vision_encoder_model
         torch.testing.assert_close(cos[:n, 0], t_pos.float().cos())
 
 
-@pytest.mark.maybe_use_device
+@pytest.mark.use_device
 @pytest.mark.parametrize("num_frames, frame_limit", [(1, None), (5, 2)])
 def test_encoder_cache_survives_static_output_reuse(
     vision_encoder_model, num_frames, frame_limit
