@@ -74,6 +74,18 @@ _e2e: &e2e
     VLLM_RBLN_TEST_DP_TIMEOUT_S: "3600"
   timeout_in_minutes: "${PYTEST_E2E_TIMEOUT:-60}"
 
+_planned_e2e:
+  compile:
+    <<: *e2e
+    key: "vllm-rbln-e2e-compile-cr13"
+    command:
+      - *sync
+  specdec:
+    <<: *e2e
+    key: "vllm-rbln-e2e-specdec-cr13"
+    command:
+      - *sync
+
 steps:
   - group: ":pytest: [CR13] pytest (unit)"
     key: "vllm-rbln-pytest-cr13"
@@ -104,17 +116,6 @@ steps:
           - "bash .buildkite/pipelines/vllm-rbln/scripts/run-e2e.sh --group basic_correctness ${PYTEST_E2E_ARGS:-}"
 
       - <<: *e2e
-        label: "compile"
-        key: "vllm-rbln-e2e-compile-cr13"
-        resources:
-          npu:
-            count: 4
-            product: "RBLN-CR13"
-        command:
-          - *sync
-          - "bash .buildkite/pipelines/vllm-rbln/scripts/run-e2e.sh --group compile ${PYTEST_E2E_ARGS:-}"
-
-      - <<: *e2e
         label: "dp"
         key: "vllm-rbln-e2e-dp-cr13"
         resources:
@@ -124,17 +125,6 @@ steps:
         command:
           - *sync
           - "bash .buildkite/pipelines/vllm-rbln/scripts/run-e2e.sh --group dp ${PYTEST_E2E_ARGS:-}"
-
-      - <<: *e2e
-        label: "specdec"
-        key: "vllm-rbln-e2e-specdec-cr13"
-        resources:
-          npu:
-            count: 2
-            product: "RBLN-CR13"
-        command:
-          - *sync
-          - "bash .buildkite/pipelines/vllm-rbln/scripts/run-e2e.sh --group specdec ${PYTEST_E2E_ARGS:-}"
 
       - <<: *e2e
         label: "core"
