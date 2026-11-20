@@ -211,6 +211,13 @@ class RBLNScheduler(Scheduler):
                     "sub_block_size=%d.",
                     sub_block_size,
                 )
+        elif self.hash_block_size < self.block_size:
+            logger.info(
+                "Fine-grained prefix caching enabled: block_size=%d, "
+                "prefix_match_unit=%d",
+                self.block_size,
+                self.hash_block_size,
+            )
         elif (
             self.cache_config.enable_prefix_caching
             and rbln_config.enable_sub_block_cache
@@ -1244,6 +1251,14 @@ class RBLNScheduler(Scheduler):
             else None
         )
 
+        kv_cache_block_copies, cow_retained_blocks = (
+            self.kv_cache_manager.take_kv_cache_block_copies()
+        )
+        if kv_cache_block_copies:
+            # The copies run with this step, the first non-empty one at or after
+            # it (seq sched_step_seq + 1).
+            self._free_cow_retained_blocks(cow_retained_blocks, self.sched_step_seq + 1)
+
         scheduler_output = RBLNSchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -1261,6 +1276,7 @@ class RBLNScheduler(Scheduler):
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
             has_sync_kv_loads=has_sync_kv_loads,
+            kv_cache_block_copies=kv_cache_block_copies or None,
         )
 
         # Drain pending copy ops from the KV cache manager.

@@ -293,9 +293,7 @@ class RblnPlatform(Platform):
             # TODO(vllm-rbln>=0.14.0): delete the legacy chunk-size alias.
             if model_impl == "optimum" and self.max_num_batched_tokens is not None:
                 from vllm_rbln.config import build_optimum_rbln_config
-                from vllm_rbln.utils.optimum.configuration.runtime_config import (
-                    is_chunked_prefill_arch,
-                )
+                from vllm_rbln.utils.optimum.registry import is_chunked_prefill_arch
 
                 logger.warning_once(
                     "--max-num-batched-tokens (max_num_batched_tokens) on the "
