@@ -21,9 +21,14 @@ NPU-dependent operations are replaced with test doubles.
 
 import types
 from copy import deepcopy
+from unittest.mock import Mock
 
 import pytest
 import torch
+from optimum.rbln import modeling_base as optimum_modeling_base
+from optimum.rbln.transformers.models.gpt_oss import modeling_gpt_oss
+from optimum.rbln.transformers.utils import rbln_quantization
+from safetensors.torch import save_file
 from transformers import Gemma4Config, GptOssConfig, LlamaConfig, PretrainedConfig
 
 from vllm_rbln.config import (
@@ -40,34 +45,15 @@ class ExternalConfig(PretrainedConfig):
     pass
 
 
-def _init_model_with(
-    monkeypatch,
+def _build_model(
     tmp_path,
     hf_config,
     *,
+    model_cls,
     precompiled=False,
     hf_snapshot=None,
     weights_identity=None,
-    model_cls_name="FakeRBLNModel",
-) -> dict:
-    passed = {}
-
-    class FakeRBLNModel:
-        @classmethod
-        def from_pretrained(cls, path, **kwargs):
-            passed["model"] = path
-            passed.update(kwargs)
-            return types.SimpleNamespace(
-                rbln_config=types.SimpleNamespace(),
-                save_pretrained=lambda path: passed.update(saved_to=path),
-            )
-
-    monkeypatch.setattr(
-        model_base.optimum.rbln, "FakeRBLNModel", FakeRBLNModel, raising=False
-    )
-    monkeypatch.setattr(
-        model_base, "get_rbln_model_info", lambda cfg: ("fake", model_cls_name)
-    )
+):
     obj = RBLNOptimumModelBase.__new__(RBLNOptimumModelBase)
     obj.model_config = types.SimpleNamespace(
         hf_config=hf_config,
@@ -88,7 +74,7 @@ def _init_model_with(
             compile_config=OptimumRBLNCompileConfig(
                 model="compile-source",
                 dtype=torch.bfloat16,
-                model_cls="FakeRBLNModel",
+                model_cls=model_cls,
                 hf_config=deepcopy(hf_config if hf_snapshot is None else hf_snapshot),
                 npu_name="RBLN-CA25",
                 rbln_config={"prefill_chunk_size": 256},
@@ -100,6 +86,29 @@ def _init_model_with(
         cache_config=types.SimpleNamespace(gpu_memory_utilization=0.9),
         ec_transfer_config=None,
     )
+    return obj
+
+
+def _init_model_with(monkeypatch, tmp_path, hf_config, **kwargs) -> dict:
+    passed = {}
+
+    class FakeRBLNModel:
+        @classmethod
+        def from_pretrained(cls, path, **kwargs):
+            passed["model"] = path
+            passed.update(kwargs)
+            return types.SimpleNamespace(
+                rbln_config=types.SimpleNamespace(),
+                save_pretrained=lambda path: passed.update(saved_to=path),
+            )
+
+    monkeypatch.setattr(
+        model_base.optimum.rbln, "FakeRBLNModel", FakeRBLNModel, raising=False
+    )
+    monkeypatch.setattr(
+        model_base, "get_rbln_model_info", lambda cfg: ("fake", "FakeRBLNModel")
+    )
+    obj = _build_model(tmp_path, hf_config, model_cls="FakeRBLNModel", **kwargs)
     obj.init_model()
     passed["compile_config"] = obj.vllm_config.additional_config.compile_config
     passed["source_model"] = obj.model_config.model
@@ -204,29 +213,22 @@ def test_compilation_uses_the_inputs_that_were_hashed(monkeypatch, tmp_path):
     assert passed["dtype"] == torch.bfloat16
     assert passed["rbln_config"] == {"prefill_chunk_size": 256}
     assert "revision" not in passed
+    assert "token" not in passed
 
     passed["rbln_config"]["prefill_chunk_size"] = 512
     assert passed["compile_config"].rbln_config["prefill_chunk_size"] == 256
 
 
-@pytest.mark.parametrize(
-    ("config_cls", "model_cls_name"),
-    [
-        (LlamaConfig, "RBLNLlamaForCausalLM"),
-        (GptOssConfig, "RBLNGptOssForCausalLM"),
-    ],
-)
 def test_hub_compilation_pins_weight_loading_to_the_hashed_commit(
-    monkeypatch, tmp_path, config_cls, model_cls_name
+    monkeypatch, tmp_path
 ):
-    config = config_cls(_commit_hash="b" * 40)
+    config = LlamaConfig(_commit_hash="b" * 40)
     commit = "a" * 40
     passed = _init_model_with(
         monkeypatch,
         tmp_path,
         config,
         weights_identity=OptimumWeightsIdentity("hub", commit),
-        model_cls_name=model_cls_name,
     )
 
     assert passed["model"] == "compile-source"
@@ -234,6 +236,62 @@ def test_hub_compilation_pins_weight_loading_to_the_hashed_commit(
     assert passed["token"] is True
     assert passed["config"]._commit_hash == commit
     assert passed["compile_config"].hf_config._commit_hash == "b" * 40
+
+
+def test_gpt_oss_loads_weights_from_the_hashed_hub_commit(monkeypatch, tmp_path):
+    commit = "a" * 40
+    config_commit = "b" * 40
+    filename = "model.safetensors"
+    pinned_weights = torch.ones(1, 1)
+    for revision, weights in (
+        (commit, pinned_weights),
+        (config_commit, torch.zeros_like(pinned_weights)),
+    ):
+        snapshot = tmp_path / revision
+        snapshot.mkdir()
+        save_file({"weight": weights}, snapshot / filename)
+
+    list_files = Mock(return_value=[filename])
+    download = Mock(
+        side_effect=lambda filename, revision, **kwargs: str(
+            tmp_path / (revision or config_commit) / filename
+        )
+    )
+    monkeypatch.setattr(rbln_quantization, "list_repo_files", list_files)
+    monkeypatch.setattr(rbln_quantization, "hf_hub_download", download)
+    monkeypatch.setattr(
+        optimum_modeling_base,
+        "pull_compiled_model_from_hub",
+        Mock(side_effect=FileNotFoundError),
+    )
+    monkeypatch.setattr(
+        optimum_modeling_base, "maybe_load_preprocessors", Mock(return_value=[])
+    )
+
+    pytorch_model = torch.nn.Linear(1, 1, bias=False)
+    construct = Mock(return_value=pytorch_model)
+    monkeypatch.setattr(modeling_gpt_oss.AutoModelForCausalLM, "from_config", construct)
+    monkeypatch.setattr(
+        modeling_gpt_oss.RBLNGptOssForCausalLM,
+        "from_model",
+        Mock(
+            return_value=types.SimpleNamespace(rbln_config=None, save_pretrained=Mock())
+        ),
+    )
+    obj = _build_model(
+        tmp_path,
+        GptOssConfig(architectures=["GptOssForCausalLM"], _commit_hash=config_commit),
+        model_cls="RBLNGptOssForCausalLM",
+        weights_identity=OptimumWeightsIdentity("hub", commit),
+    )
+
+    obj.init_model()
+
+    torch.testing.assert_close(pytorch_model.weight, pinned_weights)
+    list_files.assert_called_once_with("compile-source", revision=commit, token=True)
+    assert download.call_args.kwargs["revision"] == commit
+    assert download.call_args.kwargs["token"] is True
+    assert construct.call_args.kwargs == {"dtype": torch.bfloat16}
 
 
 @pytest.mark.parametrize("precompiled", [False, True])
