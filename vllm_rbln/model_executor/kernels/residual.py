@@ -27,7 +27,9 @@ from torch import Tensor
 from vllm import ir
 
 # The architectures whose fused_add_rms_norm puts "rbln" first.
-RESIDUAL_CUT_ARCHITECTURES = frozenset({"DeepseekV3ForCausalLM"})
+RESIDUAL_CUT_ARCHITECTURES = frozenset(
+    {"DeepseekV3ForCausalLM", "DeepseekV32ForCausalLM"}
+)
 
 
 def _supports_args(
