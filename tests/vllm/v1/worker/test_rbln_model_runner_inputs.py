@@ -284,6 +284,19 @@ class TestResolveMmPrefixSupport:
 
         assert runner._resolve_mm_support() is True
 
+    @pytest.mark.parametrize("gemma4_mtp", [False, True])
+    def test_only_the_gemma4_mtp_assistant_drafts_over_ranges(
+        self, make_model_runner, monkeypatch, gemma4_mtp
+    ):
+        runner = self._runner(make_model_runner, monkeypatch, _MmPrefixModel(128))
+        runner.speculative_config = SimpleNamespace(use_gemma4_mtp=lambda: gemma4_mtp)
+
+        if gemma4_mtp:
+            assert runner._resolve_mm_support() is True
+        else:
+            with pytest.raises(ValueError, match="Speculative decoding"):
+                runner._resolve_mm_support()
+
     def test_a_range_longer_than_the_longest_chunk_is_refused_with_a_fix(
         self, make_model_runner, monkeypatch
     ):

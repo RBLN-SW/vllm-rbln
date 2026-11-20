@@ -170,6 +170,7 @@ from vllm_rbln.v1.spec_decode.eagle3_pp import (
     aux_hidden_states_enabled,
     install_aux_handoff_slots,
 )
+from vllm_rbln.v1.spec_decode.gemma4 import RBLNGemma4Proposer
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
 from vllm_rbln.v1.worker import mega_cache
 from vllm_rbln.v1.worker.async_output import AsyncRBLNModelRunnerOutput
@@ -386,6 +387,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 self.drafter = RBLNMedusaProposer(self.vllm_config, self.device)
             elif self.speculative_config.method == "dflash":
                 self.drafter = RBLNDFlashProposer(self.vllm_config, self.device, self)
+            elif self.speculative_config.use_gemma4_mtp():
+                self.drafter = RBLNGemma4Proposer(self.vllm_config, self.device, self)
             elif self.speculative_config.use_eagle():
                 self.drafter = RBLNEagleProposer(self.vllm_config, self.device, self)
             else:
@@ -1597,8 +1600,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     "--mm-processor-kwargs."
                 )
             # TODO(RBLN): the drafter's builders get no row ends, so its sliding
-            # layers would run the ranges causally.
-            if self.speculative_config is not None:
+            # layers would run the ranges causally. A Gemma4 MTP assistant only
+            # queries the target's last position, which no range runs past.
+            spec = self.speculative_config
+            if spec is not None and not spec.use_gemma4_mtp():
                 raise ValueError(
                     "Speculative decoding is not supported with multimodal inputs of "
                     "an mm prefix LM on RBLN yet."
@@ -3614,7 +3619,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         )
 
         forward_context = self.compilation_config.static_forward_context
-        self.kv_cache_names = get_kv_cache_names(kv_caches, forward_context)
+        self.kv_cache_names = get_kv_cache_names(
+            kv_caches, forward_context, self.shared_kv_cache_layers
+        )
         self._update_kv_cache_base_bindings(
             kv_cache_bases_by_layer,
             kv_cache_view_infos,
