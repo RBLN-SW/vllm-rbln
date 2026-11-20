@@ -1483,6 +1483,37 @@ class TestMultiGroup:
             **kwargs,
         )
 
+    @pytest.mark.parametrize("finish_prefill", [False, True])
+    def test_partially_computed_donor_after_full_group_eviction(self, finish_prefill):
+        manager = self._mixed_block_manager()
+        tokens = list(range(13))
+        first = make_request("first", tokens, 8)
+        assert manager.allocate_slots(first, 13, delay_cache_blocks=True) is not None
+        manager.cache_blocks(first, 13)
+        first.num_computed_tokens = 13
+        full_block = manager.coordinator.get_blocks(first.request_id)[0][0]
+        manager.schedule_sub_block_indexing(first)
+        manager.free(first)
+        manager.block_pool.evict_blocks({full_block.block_id})
+
+        donor = make_request("donor", tokens, 8)
+        for end in [8, 13] if finish_prefill else [8]:
+            chunk = end - donor.num_computed_tokens
+            assert manager.allocate_slots(donor, chunk, delay_cache_blocks=True)
+            manager.cache_blocks(donor, end)
+            donor.num_computed_tokens = end
+            manager.schedule_sub_block_indexing(donor)
+            manager.do_pending_indexing()
+        manager.free(donor)
+
+        reader = make_request("reader", tokens + [99], 8)
+        _, full_hit, _ = manager.get_computed_blocks(reader)
+        assert full_hit == 0
+        match = manager.get_computed_blocks_sub_block(reader, full_hit)
+        assert match is not None
+        assert match.num_tokens == (12 if finish_prefill else 8)
+        manager.release_sub_block_match(match)
+
     @pytest.mark.parametrize("evict_second_block", [False, True])
     def test_multi_block_tail_after_full_hit(self, evict_second_block):
         manager = self._mixed_block_manager()

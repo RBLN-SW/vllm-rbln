@@ -692,7 +692,10 @@ class RBLNKVCacheManager(KVCacheManager):
         blocks = self.coordinator.get_blocks(request.request_id)
         for gid, (gi, block_list) in enumerate(zip(self._group_infos, blocks)):
             num_indexed = state.num_indexed_full_blocks[gid]
-            for blk_idx in range(num_indexed, len(block_list)):
+            num_full_blocks = min(
+                len(block_list), request.num_computed_tokens // gi.block_size
+            )
+            for blk_idx in range(num_indexed, num_full_blocks):
                 blk = block_list[blk_idx]
                 if blk.is_null or blk.block_hash is None:
                     continue
