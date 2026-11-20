@@ -203,11 +203,13 @@ class TestRblnCompatHash:
             "BASE",
             writes_into_peer=False,
             cross_layers_blocks=False,
+            push_boundary_state=False,
             exchanges_block_state=False,
         ) == rbln_compat_hash(
             "BASE",
             writes_into_peer=False,
             cross_layers_blocks=False,
+            push_boundary_state=False,
             exchanges_block_state=False,
         )
 
@@ -219,6 +221,7 @@ class TestRblnCompatHash:
                 "BASE",
                 writes_into_peer=False,
                 cross_layers_blocks=False,
+                push_boundary_state=False,
                 exchanges_block_state=False,
             )
             != "BASE"
@@ -232,11 +235,13 @@ class TestRblnCompatHash:
             "BASE",
             writes_into_peer=True,
             cross_layers_blocks=False,
+            push_boundary_state=False,
             exchanges_block_state=False,
         ) != rbln_compat_hash(
             "BASE",
             writes_into_peer=False,
             cross_layers_blocks=False,
+            push_boundary_state=False,
             exchanges_block_state=False,
         )
 
@@ -245,11 +250,13 @@ class TestRblnCompatHash:
             "hash-a",
             writes_into_peer=False,
             cross_layers_blocks=False,
+            push_boundary_state=False,
             exchanges_block_state=False,
         ) != rbln_compat_hash(
             "hash-b",
             writes_into_peer=False,
             cross_layers_blocks=False,
+            push_boundary_state=False,
             exchanges_block_state=False,
         )
 
@@ -261,13 +268,47 @@ class TestRblnCompatHash:
             "BASE",
             writes_into_peer=False,
             cross_layers_blocks=True,
+            push_boundary_state=False,
             exchanges_block_state=False,
         ) != rbln_compat_hash(
             "BASE",
             writes_into_peer=False,
             cross_layers_blocks=False,
+            push_boundary_state=False,
             exchanges_block_state=False,
         )
+
+    def test_a_one_sided_push_boundary_state_does_not_pair(self):
+        # The consumer allocates the boundary block before it knows the
+        # producer; a producer that does not push it would leave it unwritten.
+        def hashed(push_boundary_state):
+            return rbln_compat_hash(
+                "BASE",
+                writes_into_peer=True,
+                cross_layers_blocks=False,
+                push_boundary_state=push_boundary_state,
+                exchanges_block_state=False,
+            )
+
+        assert hashed(True) != hashed(False)
+
+    @pytest.mark.parametrize(
+        ("writes_into_peer", "caching", "mode", "expected"),
+        [
+            (True, True, "align", True),
+            (False, True, "align", False),
+            (True, False, "align", False),
+            (True, True, "all", False),
+        ],
+    )
+    def test_a_writer_with_align_mode_prefix_caching_pushes_the_boundary(
+        self, writes_into_peer, caching, mode, expected
+    ):
+        config = mock_vllm_config()
+        config.cache_config.enable_prefix_caching = caching
+        config.cache_config.mamba_cache_mode = mode
+        result = transfer_shape(config, [], writes_into_peer=writes_into_peer)
+        assert result.push_boundary_state is expected
 
     @staticmethod
     def _spec_config(
@@ -297,10 +338,12 @@ class TestRblnCompatHash:
             cross_layers_blocks=False,
             exchanges_block_state=False,
             speculative_config=None,
+            push_boundary_state=False,
         ) == rbln_compat_hash(
             "BASE",
             writes_into_peer=False,
             cross_layers_blocks=False,
+            push_boundary_state=False,
             exchanges_block_state=False,
         )
 
@@ -312,10 +355,12 @@ class TestRblnCompatHash:
             cross_layers_blocks=False,
             exchanges_block_state=False,
             speculative_config=self._spec_config(),
+            push_boundary_state=False,
         ) != rbln_compat_hash(
             "BASE",
             writes_into_peer=False,
             cross_layers_blocks=False,
+            push_boundary_state=False,
             exchanges_block_state=False,
         )
 
@@ -327,12 +372,14 @@ class TestRblnCompatHash:
             cross_layers_blocks=False,
             exchanges_block_state=False,
             speculative_config=self._spec_config(model="draft-a"),
+            push_boundary_state=False,
         ) != rbln_compat_hash(
             "BASE",
             writes_into_peer=False,
             cross_layers_blocks=False,
             exchanges_block_state=False,
             speculative_config=self._spec_config(model="draft-b"),
+            push_boundary_state=False,
         )
 
     @pytest.mark.parametrize("exchanges_block_state", [True, False])
@@ -346,6 +393,7 @@ class TestRblnCompatHash:
                 "BASE",
                 writes_into_peer=False,
                 cross_layers_blocks=False,
+                push_boundary_state=False,
                 exchanges_block_state=exchanges_block_state,
                 speculative_config=self._spec_config(disable_block_drop=disable),
             )
@@ -362,12 +410,14 @@ class TestRblnCompatHash:
             cross_layers_blocks=False,
             exchanges_block_state=False,
             speculative_config=self._spec_config(revision="r1"),
+            push_boundary_state=False,
         ) != rbln_compat_hash(
             "BASE",
             writes_into_peer=False,
             cross_layers_blocks=False,
             exchanges_block_state=False,
             speculative_config=self._spec_config(revision="r2"),
+            push_boundary_state=False,
         )
 
     def test_a_method_without_a_draft_model_leaves_the_factors_alone(self):
@@ -377,6 +427,7 @@ class TestRblnCompatHash:
             "BASE",
             writes_into_peer=False,
             cross_layers_blocks=False,
+            push_boundary_state=False,
             exchanges_block_state=False,
         )
         for method in ("ngram", "suffix"):
@@ -387,6 +438,7 @@ class TestRblnCompatHash:
                     cross_layers_blocks=False,
                     exchanges_block_state=False,
                     speculative_config=self._spec_config(method=method),
+                    push_boundary_state=False,
                 )
                 == plain
             )
@@ -399,10 +451,12 @@ class TestRblnCompatHash:
             cross_layers_blocks=False,
             exchanges_block_state=False,
             speculative_config=self._spec_config(method="draft_model"),
+            push_boundary_state=False,
         ) != rbln_compat_hash(
             "BASE",
             writes_into_peer=False,
             cross_layers_blocks=False,
+            push_boundary_state=False,
             exchanges_block_state=False,
         )
 
@@ -412,6 +466,7 @@ class TestRblnCompatHash:
             "BASE",
             writes_into_peer=False,
             cross_layers_blocks=False,
+            push_boundary_state=False,
             exchanges_block_state=False,
         )
         setattr_in_package(
@@ -422,6 +477,7 @@ class TestRblnCompatHash:
                 "BASE",
                 writes_into_peer=False,
                 cross_layers_blocks=False,
+                push_boundary_state=False,
                 exchanges_block_state=False,
             )
             != h1

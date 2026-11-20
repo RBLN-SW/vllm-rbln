@@ -26,6 +26,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     ReqId,
 )
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.core.sched.output import SchedulerOutput
 
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
@@ -36,6 +37,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
     every_local_link_down,
 )
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.kv_cache import UNTRUNCATED_PROMPT_LENGTH, prompt_boundary_block
 
 if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -77,14 +79,98 @@ class RblnNixlSchedulerBase(NixlBaseConnectorScheduler):
     #: the worker's, so one reduction answers for both.
     _writes_into_peer: ClassVar[bool] = False
 
-    #: Whether this side exchanges a single-state SSM group's block-boundary
-    #: state, so `RBLNMambaManager` keeps or allocates a block for it.
-    sends_state_boundary: ClassVar[bool] = False
-
     @property
     def _sends_token_count(self) -> bool:
         """Whether the worker needs a request's token count in the metadata."""
         return self._shape.sends_token_count
+
+    @property
+    def sends_state_boundary(self) -> bool:
+        """Whether a single-state SSM group also exchanges its block-boundary
+        state, so `RBLNMambaManager` keeps or allocates a block for it.
+
+        A reader learns it from the producer's `remote_state_boundary`; a
+        writer's consumer allocates before that, so each end decides it from
+        its own cache config (`TransferShape.push_boundary_state`).
+        """
+        return not self._writes_into_peer or self._shape.push_boundary_state
+
+    @property
+    def _drops_eagle_block(self) -> bool:
+        spec = self.vllm_config.speculative_config
+        return spec is not None and spec.use_eagle_block_drop()
+
+    def get_exchange_clipped_blocks(
+        self, block_ids: BlockIds, clip_ssm: bool = True
+    ) -> BlockIds:
+        """Also keep a single-state SSM group's block-boundary state.
+
+        NOTE(RBLN): upstream keeps only the running state, so the consumer can
+        decode but never caches the prompt. A consumer expecting the state a
+        repeat of the prompt can hit (`prompt_boundary_block`) allocates a block
+        for it, the only unhashed block before the running one, so a live block
+        there goes along. A producer's list is positional;
+        `_select_boundary_states` picks its block by slot. A consumer holding
+        only the running state pairs with the tail of a producer's two.
+        """
+        clipped = super().get_exchange_clipped_blocks(block_ids, clip_ssm)
+        if (
+            not clip_ssm
+            or not clipped
+            or not self._is_hma_required
+            or self._ssm_state_slots_are_positional
+            or not self.sends_state_boundary
+        ):
+            return clipped
+        selected = self.kv_cache_config.select_transfer_block_ids(block_ids)
+        out = list(clipped)
+        for i, blocks in enumerate(selected):
+            n_spec = self._ssm_spec_blocks[i]
+            if n_spec is None or len(blocks) < 2:
+                continue
+            if n_spec := min(n_spec, len(blocks) - 1):
+                blocks = blocks[:-n_spec]
+            if len(blocks) >= 2 and blocks[-2] != NULL_BLOCK_ID:
+                out[i] = list(blocks[-2:])
+        return tuple(out)
+
+    def _truncate_request_for_prefill(self, request: "Request") -> None:
+        params = request.kv_transfer_params
+        assert params is not None
+        params.setdefault(UNTRUNCATED_PROMPT_LENGTH, request.num_prompt_tokens)
+        super()._truncate_request_for_prefill(request)
+
+    def _select_boundary_states(
+        self, request: "Request", block_ids: BlockIds, remote_block_ids: BlockIds
+    ) -> tuple[BlockIds, int | None]:
+        """A producer's clipped lists with each SSM group's boundary block
+        picked by slot, and the token count that block ends at, if any.
+
+        A live block in the slot holds that boundary's state whether or not this
+        request's manager kept it.
+        """
+        assert request.kv_transfer_params is not None
+        num_prompt_tokens = request.kv_transfer_params[UNTRUNCATED_PROMPT_LENGTH]
+        groups = self.kv_cache_config.transfer_groups
+        selected = self.kv_cache_config.select_transfer_block_ids(block_ids)
+        out = list(remote_block_ids)
+        boundary = None
+        for i, blocks in enumerate(out):
+            if self._ssm_spec_blocks[i] is None or not blocks:
+                continue
+            block_size = groups[i].kv_cache_spec.block_size
+            block_idx = prompt_boundary_block(
+                num_prompt_tokens,
+                request.num_prompt_tokens,
+                block_size,
+                self._drops_eagle_block,
+            )
+            if block_idx is None or selected[i][block_idx] == NULL_BLOCK_ID:
+                out[i] = blocks[-1:]
+            else:
+                out[i] = [selected[i][block_idx], blocks[-1]]
+                boundary = (block_idx + 1) * block_size
+        return tuple(out), boundary
 
     def has_pending_push_work(self) -> bool:
         # The worker's exit runs on a step, and an idle engine does not step.
