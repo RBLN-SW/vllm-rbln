@@ -62,9 +62,12 @@ class RBLNGemma4Proposer(RBLNEagleProposer):
         next_token_ids: torch.Tensor,
         token_indices_to_sample: torch.Tensor | None,
         common_attn_metadata: CommonAttentionMetadata,
-        mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+        mm_embed_inputs: tuple[list[tuple[int, int, torch.Tensor]], torch.Tensor]
+        | None = None,
         num_rejected_tokens: torch.Tensor | None = None,
+        target_mrope_positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        assert target_mrope_positions is None, "Gemma4 does not use M-RoPE"
         num_reqs = self.runner.input_batch.num_reqs
         if (
             self.runner.is_intermediate_chunked_prefill
