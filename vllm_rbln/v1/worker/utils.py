@@ -21,7 +21,7 @@ import platform
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping
 from datetime import datetime, timezone
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Literal, NoReturn, TypeVar
@@ -1260,12 +1260,16 @@ def reorder_input_batch(input_batch: "InputBatch", perm: np.ndarray) -> None:
 
 
 def get_kv_cache_names(
-    cache_names: Iterable[str], forward_context: Mapping[str, Any]
+    cache_names: Iterable[str],
+    forward_context: Mapping[str, Any],
+    shared_kv_cache_layers: Collection[str] = (),
 ) -> list[str]:
     """Order caches by their numeric module path and optional subindex.
 
     Numbered attention modules and cache groups already encode their order.
     Caches without a numeric slot declare `kv_cache_subindex`; the default is 0.
+    A layer in `shared_kv_cache_layers` reuses another's cache (a Gemma4 MTP
+    draft layer) and may repeat an owner's path, so those sort after the owners.
 
     Examples:
         Standard attention cache: layers.3.self_attn.attn -> (3, 0).
@@ -1281,7 +1285,11 @@ def get_kv_cache_names(
         numeric_path = tuple(int(part) for part in name.split(".") if part.isdecimal())
         if not numeric_path:
             raise ValueError(f"KV cache {name} has no numeric layer path")
-        sort_key = (*numeric_path, getattr(layer, "kv_cache_subindex", 0))
+        sort_key = (
+            name in shared_kv_cache_layers,
+            *numeric_path,
+            getattr(layer, "kv_cache_subindex", 0),
+        )
         if sort_key in names_by_sort_key:
             raise ValueError(
                 f"Duplicate KV cache sort key {sort_key}: "

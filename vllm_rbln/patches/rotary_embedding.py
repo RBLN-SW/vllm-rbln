@@ -71,9 +71,9 @@ def patched_rope_forward_oot(
     self: RotaryEmbedding,
     positions: torch.Tensor,
     query: torch.Tensor,
-    key: torch.Tensor,
+    key: torch.Tensor | None,
     offsets: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     """
     Args:
         positions: [batch_size, seq_len]
