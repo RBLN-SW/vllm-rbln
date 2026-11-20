@@ -94,8 +94,8 @@ def test_defaults_when_nothing_is_passed(parser):
 @pytest.mark.parametrize(
     "argv, enabled",
     [
-        ([], True),
-        (["--no-rbln-use-fused-sampling"], False),
+        ([], False),
+        (["--rbln-use-fused-sampling"], True),
         (["--additional-config", '{"use_fused_sampling": false}'], False),
     ],
 )
