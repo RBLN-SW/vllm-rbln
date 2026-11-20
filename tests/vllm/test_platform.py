@@ -549,10 +549,27 @@ class TestRejectedConfigs:
                     mamba_block_size=2 * block_size,
                 )
             )
+        chunk = _build().additional_config.max_prefill_chunk_size
+        cached = reconfigure(glm5_next(enable_prefix_caching=True))
+        assert cached.cache_config.prefix_match_unit == chunk
+        assert (
+            reconfigure(
+                glm5_next(enable_prefix_caching=True, prefix_match_unit=2 * chunk)
+            ).cache_config.prefix_match_unit
+            == 2 * chunk
+        )
         with pytest.raises(ValueError, match="whole KV blocks"):
             reconfigure(
-                glm5_next(enable_prefix_caching=True, prefix_match_unit=block_size // 2)
+                glm5_next(enable_prefix_caching=True, prefix_match_unit=chunk // 2)
             )
+
+        def sub_block_off(config):
+            glm5_next(enable_prefix_caching=True)(config)
+            config.additional_config = replace(
+                config.additional_config, enable_sub_block_cache=False
+            )
+
+        assert reconfigure(sub_block_off).cache_config.prefix_match_unit is None
 
         reconfigure(glm5_next(tp=4, block_size=1024))
         for tp, block_size in ((4, 2048), (1, 8192), (1, 192), (1, 160)):

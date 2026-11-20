@@ -2722,3 +2722,84 @@ class TestStateBoundaryAdmission:
             probe.block_hashes, 39
         )
         assert hit == (32 if failure is None else 0)
+
+
+class TestFineGrainedPrefixHit:
+    """An align-mode hybrid with prefix_match_unit (16) below block_size (64)
+    resumes a repeat of a 40-token prompt at its last 16-token boundary."""
+
+    @staticmethod
+    def _step(sched):
+        out = sched.schedule()
+        req_ids = list(out.num_scheduled_tokens)
+        # A chunk that ends inside the prompt samples nothing; schedule() has
+        # already advanced num_computed_tokens.
+        done = {
+            r
+            for r in req_ids
+            if sched.requests[r].num_computed_tokens
+            >= sched.requests[r].num_prompt_tokens
+        }
+        sched.update_from_output(
+            out,
+            ModelRunnerOutput(
+                req_ids=req_ids,
+                req_id_to_index={r: i for i, r in enumerate(req_ids)},
+                sampled_token_ids=[[7] if r in done else [] for r in req_ids],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+        return out
+
+    def test_the_copies_a_mid_block_hit_needs_reach_the_runner(self):
+        from vllm.v1.core.single_type_kv_cache_manager import (
+            register_all_kvcache_specs,
+        )
+        from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec
+
+        from vllm_rbln.platform import RblnPlatform
+        from vllm_rbln.v1.kv_cache import RBLNMambaSpec
+
+        register_all_kvcache_specs(None)
+        RblnPlatform.register_custom_kv_cache_specs(None)
+        full = full_attention_spec(64)
+        state = RBLNMambaSpec(
+            block_size=64,
+            shapes=((full.page_size_bytes,),),
+            dtypes=(torch.uint8,),
+            mamba_cache_mode="align",
+        )
+        config = KVCacheConfig(
+            num_blocks=64,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(["attn"], full),
+                KVCacheGroupSpec(["state"], state),
+            ],
+            prefix_cache_retention_interval=0,
+        )
+        sched = create_rbln_scheduler(
+            enable_prefix_caching=True,
+            block_size=64,
+            max_num_batched_tokens=16,
+            max_model_len=256,
+            num_blocks=64,
+            kv_cache_config=config,
+            hash_block_size=16,
+        )
+        prompt = list(range(100, 140))
+        sched.add_request(make_request("first", prompt, 16, max_tokens=1))
+        copies: list = []
+        while "first" in sched.requests:
+            out = self._step(sched)
+            copies += out.kv_cache_block_copies or []
+        # The prompt's state at token 32 is copied out of the block the next
+        # chunk keeps running in.
+        assert copies
+
+        sched.add_request(make_request("repeat", prompt + [1] * 20, 16, max_tokens=1))
+        out = self._step(sched)
+        assert sched.requests["repeat"].num_computed_tokens == 32 + 16
+        assert out.kv_cache_block_copies
