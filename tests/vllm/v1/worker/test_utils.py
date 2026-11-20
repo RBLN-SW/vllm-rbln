@@ -16,7 +16,6 @@
 # (device DRAM, NUMA, CPU affinity) only the inputs are mocked and the real
 # computed values asserted.
 
-import ctypes
 import json
 import math
 import os
@@ -26,7 +25,7 @@ import textwrap
 import threading
 import time
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -68,13 +67,11 @@ from vllm_rbln.v1.worker.utils import (
     get_rbln_visible_card_indices,
     prepare_kernel_block_sizes,
     rbln_device_dram_total_bytes,
-    rbln_device_numa_node,
     read_rbln_card_dram_used_bytes,
     reorder_input_batch,
     rescale_kv_cache_config,
     set_cpu_affinity,
     set_omp_num_threads,
-    set_preferred_memory_node,
     worker_fail_fast,
 )
 
@@ -405,8 +402,9 @@ class TestEstimateModelKernelSize:
     def test_bytes_path_exact(self):
         # n_model_bytes path, default bits passed explicitly (no platform mock).
         result = estimate_model_kernel_size(
-            _make_model_config(num_layers=2, vocab_size=64, hidden_size=32),
+            _make_model_config(vocab_size=64, hidden_size=32),
             _make_parallel_config(tp_size=1),
+            num_layers=2,
             n_model_bytes=12_288,
             default_bits_per_param=16,
         )
@@ -415,8 +413,9 @@ class TestEstimateModelKernelSize:
     def test_params_path_exact(self):
         # n_model_params + nbits_per_param path.
         result = estimate_model_kernel_size(
-            _make_model_config(num_layers=4, vocab_size=128, hidden_size=64),
+            _make_model_config(vocab_size=128, hidden_size=64),
             _make_parallel_config(tp_size=1),
+            num_layers=4,
             n_model_params=1_000_000,
             nbits_per_param=16,
             default_bits_per_param=16,
@@ -425,8 +424,8 @@ class TestEstimateModelKernelSize:
 
     def test_tp_scaling(self):
         # tp_size changes lm_heads_nbytes (align per-tp, then multiply by tp).
-        mc = _make_model_config(num_layers=2, vocab_size=64, hidden_size=32)
-        common = dict(n_model_bytes=12_288, default_bits_per_param=16)
+        mc = _make_model_config(vocab_size=64, hidden_size=32)
+        common = dict(num_layers=2, n_model_bytes=12_288, default_bits_per_param=16)
         r1 = estimate_model_kernel_size(mc, _make_parallel_config(tp_size=1), **common)
         r2 = estimate_model_kernel_size(mc, _make_parallel_config(tp_size=2), **common)
         assert r1 == 6_291_456
@@ -450,6 +449,7 @@ class TestEstimateModelKernelSize:
             estimate_model_kernel_size(
                 _make_model_config(),
                 _make_parallel_config(),
+                num_layers=32,
                 default_bits_per_param=16,
                 **kwargs,
             )
@@ -457,60 +457,61 @@ class TestEstimateModelKernelSize:
     def test_default_bits_from_platform(self, monkeypatch):
         # With default_bits_per_param=None the bits come from the device name:
         # ATOM/REBEL -> 16, unknown RBLN -> ValueError, non-rbln -> assert.
-        mc = _make_model_config(num_layers=2, vocab_size=64, hidden_size=32)
+        mc = _make_model_config(vocab_size=64, hidden_size=32)
         pc = _make_parallel_config(tp_size=1)
+        kw = dict(num_layers=2, n_model_bytes=12_288)
 
         def _name(name):
             monkeypatch.setattr(current_platform, "get_device_name", lambda: name)
 
         _name("RBLN-CA25")
-        assert estimate_model_kernel_size(mc, pc, n_model_bytes=12_288) == 6_291_456
+        assert estimate_model_kernel_size(mc, pc, **kw) == 6_291_456
         _name("RBLN-CR13")
-        assert estimate_model_kernel_size(mc, pc, n_model_bytes=12_288) == 6_291_456
+        assert estimate_model_kernel_size(mc, pc, **kw) == 6_291_456
         _name("RBLN-XX99")
         with pytest.raises(ValueError, match="invalid RBLN architecture"):
-            estimate_model_kernel_size(mc, pc, n_model_bytes=12_288)
+            estimate_model_kernel_size(mc, pc, **kw)
         _name("cpu")
         with pytest.raises(AssertionError):
-            estimate_model_kernel_size(mc, pc, n_model_bytes=12_288)
+            estimate_model_kernel_size(mc, pc, **kw)
 
 
 class TestGetKvCacheNames:
-    @staticmethod
-    def _caches(*names):
-        return {n: torch.empty(0) for n in names}
+    @pytest.mark.parametrize(
+        "names",
+        [
+            ("model.layers.2.attn", "model.layers.10.attn"),
+            (
+                "model.layers.2.attn.0",
+                "model.layers.2.attn.9",
+                "model.layers.2.attn.10",
+                "model.layers.3.attn.0",
+            ),
+        ],
+        ids=["decoder-layers", "glm-slots"],
+    )
+    def test_orders_by_numeric_path(self, names):
+        layers = {name: SimpleNamespace() for name in names}
+        assert get_kv_cache_names(reversed(names), layers) == list(names)
 
-    def test_orders_by_layer_index(self):
-        # Returned ordered by extracted layer index, not dict insertion order.
-        caches = self._caches(
-            "model.layers.2.self_attn",
-            "model.layers.0.self_attn",
-            "model.layers.1.self_attn",
-        )
-        assert get_kv_cache_names(caches) == [
-            "model.layers.0.self_attn",
-            "model.layers.1.self_attn",
-            "model.layers.2.self_attn",
-        ]
+    @pytest.mark.parametrize("aux_name", ["indexer", "renamed", "conv_ring"])
+    def test_aux_caches_sort_by_subindex(self, aux_name):
+        main = "model.layers.3.attn"
+        aux = f"{main}.{aux_name}"
+        scale = f"{aux}.scales"
+        layers = {
+            scale: SimpleNamespace(kv_cache_subindex=2),
+            aux: SimpleNamespace(kv_cache_subindex=1),
+            main: SimpleNamespace(),
+            "model.layers.4.attn": SimpleNamespace(),
+        }
+        assert get_kv_cache_names((scale, aux, main), layers) == [main, aux, scale]
 
-    def test_multi_layer_same_index_raises(self, monkeypatch):
-        # Two layers at one index on a non-cpu/cuda/xpu platform -> not supported.
-        monkeypatch.setattr(current_platform, "is_cpu", lambda: False)
-        monkeypatch.setattr(current_platform, "is_cuda_alike", lambda: False)
-        monkeypatch.setattr(current_platform, "is_xpu", lambda: False)
-        caches = self._caches("model.layers.0.self_attn", "model.layers.0.cross_attn")
-        with pytest.raises(NotImplementedError):
-            get_kv_cache_names(caches)
-
-    def test_multi_layer_same_index_allowed_on_cpu(self, monkeypatch):
-        # The other side of the branch: on cpu/cuda/xpu both names are returned.
-        monkeypatch.setattr(current_platform, "is_cpu", lambda: True)
-        monkeypatch.setattr(current_platform, "is_cuda_alike", lambda: False)
-        monkeypatch.setattr(current_platform, "is_xpu", lambda: False)
-        caches = self._caches("model.layers.0.self_attn", "model.layers.0.cross_attn")
-        names = get_kv_cache_names(caches)
-        assert set(names) == set(caches)
-        assert len(names) == 2
+    def test_duplicate_order_is_an_error(self):
+        names = ("layer.3.main", "layer.3.other")
+        layers = {name: SimpleNamespace() for name in names}
+        with pytest.raises(ValueError, match="main.*other|other.*main"):
+            get_kv_cache_names(names, layers)
 
 
 class TestPrepareKernelBlockSizes:
@@ -845,27 +846,7 @@ class TestEstimateAvailableMemory:
             self._measured(self._snapshot([40 * _GB, _GB, _GB, _GB]))
 
 
-class TestRblnDeviceNumaNode:
-    # card -> sysfs numa_node; cards split across nodes or unreported are unknown.
-    @pytest.mark.parametrize(
-        "nodes, expected",
-        [({4: 1, 5: 1}, 1), ({3: 0, 4: 1}, None), ({0: None}, None), ({0: -1}, None)],
-    )
-    def test_node_of_owned_cards(self, monkeypatch, nodes, expected):
-        monkeypatch.setattr(
-            worker_utils, "get_rbln_owned_card_indices", lambda: list(nodes)
-        )
-        monkeypatch.setattr(
-            worker_utils, "_read_card_attr_int", lambda card, attr: nodes[card]
-        )
-        assert rbln_device_numa_node() == expected
-
-
 class TestGetAutobindCpuIds:
-    @pytest.fixture(autouse=True)
-    def _unknown_device_node(self, monkeypatch):
-        monkeypatch.setattr(worker_utils, "rbln_device_numa_node", lambda: None)
-
     @pytest.fixture
     def cpus(self, monkeypatch):
         cpu_list = _cpus_8()
@@ -879,24 +860,6 @@ class TestGetAutobindCpuIds:
 
     def test_basic_single_rank(self, cpus):
         # rank 0 -> NUMA 0 -> all of NUMA-0's CPUs (sorted by id).
-        result = get_autobind_cpu_ids(0, 0, _make_parallel_config(tp_size=1), self._all)
-        assert result == "0,1,4,5"
-
-    def test_single_rank_follows_device_numa_node(self, cpus, monkeypatch):
-        # The round robin would give rank 0 NUMA 0; its card is on NUMA 1.
-        monkeypatch.setattr(worker_utils, "rbln_device_numa_node", lambda: 1)
-        result = get_autobind_cpu_ids(0, 0, _make_parallel_config(tp_size=1), self._all)
-        assert result == "2,3,6,7"
-
-    def test_several_ranks_keep_round_robin(self, cpus, monkeypatch):
-        # The card is on NUMA 1, but with two ranks rank 0 still gets NUMA 0.
-        monkeypatch.setattr(worker_utils, "rbln_device_numa_node", lambda: 1)
-        result = get_autobind_cpu_ids(0, 0, _make_parallel_config(tp_size=2), self._all)
-        assert result == "0,1,4,5"
-
-    def test_card_node_not_allowed_keeps_round_robin(self, cpus, monkeypatch):
-        # NUMA 2 has no allowed CPUs, so the lone rank falls back to NUMA 0.
-        monkeypatch.setattr(worker_utils, "rbln_device_numa_node", lambda: 2)
         result = get_autobind_cpu_ids(0, 0, _make_parallel_config(tp_size=1), self._all)
         assert result == "0,1,4,5"
 
@@ -973,10 +936,6 @@ class TestGetAutobindCpuIds:
 
 
 class TestComputeRblnLocalOmpCpuid:
-    @pytest.fixture(autouse=True)
-    def _unknown_device_node(self, monkeypatch):
-        monkeypatch.setattr(worker_utils, "rbln_device_numa_node", lambda: None)
-
     @pytest.fixture
     def cpus(self, monkeypatch):
         monkeypatch.setattr(worker_utils, "get_visible_memory_node", lambda: [0, 1])
@@ -1022,12 +981,18 @@ class TestComputeRblnLocalOmpCpuid:
 
 
 class TestGetRblnPlannedAffinityCpuCount:
-    def test_bound_list_counts_ids(self):
-        assert get_rbln_planned_affinity_cpu_count("0,1,2,3") == 4
+    def test_bound_list_counts_ids(self, monkeypatch):
+        monkeypatch.setattr(
+            worker_utils, "compute_rbln_local_omp_cpuid", lambda r, lr, pc: "0,1,2,3"
+        )
+        assert get_rbln_planned_affinity_cpu_count(0, 0, _make_parallel_config()) == 4
 
     def test_nobind_or_all_uses_current_affinity(self, monkeypatch):
+        monkeypatch.setattr(
+            worker_utils, "compute_rbln_local_omp_cpuid", lambda r, lr, pc: "nobind"
+        )
         monkeypatch.setattr(worker_utils.os, "sched_getaffinity", lambda pid: {0, 1, 2})
-        assert get_rbln_planned_affinity_cpu_count("nobind") == 3
+        assert get_rbln_planned_affinity_cpu_count(0, 0, _make_parallel_config()) == 3
 
 
 class TestGetCgroupCpuQuota:
@@ -1132,25 +1097,34 @@ class TestGetNumLocalRanks:
 
 
 class TestSetCpuAffinity:
+    @staticmethod
+    def _cpuid(monkeypatch, value):
+        monkeypatch.setattr(
+            worker_utils, "compute_rbln_local_omp_cpuid", lambda r, lr, pc: value
+        )
+
     def test_nobind_makes_no_sched_call(self, monkeypatch):
         # cpuid "nobind" -> no syscall. (Its causes -- NUMA off / non-Linux /
         # unhandled arch -- are covered in TestComputeRblnLocalOmpCpuid.)
+        self._cpuid(monkeypatch, "nobind")
         calls = []
         monkeypatch.setattr(
             worker_utils.os, "sched_setaffinity", lambda *a: calls.append(a)
         )
-        set_cpu_affinity(0, 0, "nobind")
+        set_cpu_affinity(0, 0, _make_parallel_config())
         assert calls == []
 
     def test_all_result_makes_no_sched_call(self, monkeypatch):
+        self._cpuid(monkeypatch, "all")
         calls = []
         monkeypatch.setattr(
             worker_utils.os, "sched_setaffinity", lambda *a: calls.append(a)
         )
-        set_cpu_affinity(0, 0, "all")
+        set_cpu_affinity(0, 0, _make_parallel_config())
         assert calls == []
 
     def test_sets_affinity_with_computed_ids(self, monkeypatch):
+        self._cpuid(monkeypatch, "0,1,2,3")
         calls = []
         monkeypatch.setattr(
             worker_utils.os,
@@ -1160,100 +1134,25 @@ class TestSetCpuAffinity:
         monkeypatch.setattr(
             worker_utils.os, "sched_getaffinity", lambda pid: {0, 1, 2, 3}
         )
-        set_cpu_affinity(0, 0, "0,1,2,3")
-        assert calls[0] == (0, [0, 1, 2, 3])
-        assert all(ids == [0, 1, 2, 3] for _, ids in calls)
-
-    def test_binds_threads_started_before(self, monkeypatch):
-        # Threads from warm-up already exist when the binding is applied.
-        bound = []
-        monkeypatch.setattr(
-            worker_utils.os, "sched_setaffinity", lambda pid, ids: bound.append(pid)
-        )
-        monkeypatch.setattr(
-            worker_utils.os, "sched_getaffinity", lambda pid: {0, 1, 2, 3}
-        )
-        release = threading.Event()
-        started = threading.Thread(target=release.wait)
-        started.start()
-        try:
-            set_cpu_affinity(0, 0, "0,1,2,3")
-        finally:
-            release.set()
-            started.join()
-        assert started.native_id in bound
-
-    def test_thread_exiting_while_binding_is_skipped(self, monkeypatch):
-        def _exited(pid, ids):
-            if pid != 0:
-                raise ProcessLookupError(pid)
-
-        monkeypatch.setattr(worker_utils.os, "sched_setaffinity", _exited)
-        monkeypatch.setattr(
-            worker_utils.os, "sched_getaffinity", lambda pid: {0, 1, 2, 3}
-        )
-        set_cpu_affinity(0, 0, "0,1,2,3")
+        set_cpu_affinity(0, 0, _make_parallel_config())
+        assert calls == [(0, [0, 1, 2, 3])]
 
     def test_affinity_mismatch_warns(self, monkeypatch):
+        self._cpuid(monkeypatch, "0,1,2,3")
         monkeypatch.setattr(worker_utils.os, "sched_setaffinity", lambda pid, ids: None)
         # Applied mask differs from requested -> warns, does not raise.
         monkeypatch.setattr(worker_utils.os, "sched_getaffinity", lambda pid: {0, 1})
-        set_cpu_affinity(0, 0, "0,1,2,3")
+        set_cpu_affinity(0, 0, _make_parallel_config())
 
     def test_os_error_propagates(self, monkeypatch):
+        self._cpuid(monkeypatch, "0,1,2,3")
+
         def _boom(pid, ids):
             raise OSError("denied")
 
         monkeypatch.setattr(worker_utils.os, "sched_setaffinity", _boom)
         with pytest.raises(OSError):
-            set_cpu_affinity(0, 0, "0,1,2,3")
-
-
-class TestSetPreferredMemoryNode:
-    @pytest.mark.skipif(
-        worker_utils.get_libnuma() is None, reason="libnuma is not installed"
-    )
-    def test_prefers_node_of_bound_cpus(self, monkeypatch):
-        monkeypatch.setattr(worker_utils, "get_allowed_cpu_list", lambda: _cpus_8())
-        mode, mask = ctypes.c_int(), (ctypes.c_ulong * 1)()
-
-        # The policy is per thread: set and read it in a thread of its own so the
-        # test process keeps its policy.
-        def run():
-            set_preferred_memory_node(0, 0, "0,1")
-            worker_utils.get_libnuma().get_mempolicy(
-                ctypes.byref(mode), mask, ctypes.c_ulong(65), None, ctypes.c_ulong(0)
-            )
-
-        thread = threading.Thread(target=run)
-        thread.start()
-        thread.join()
-        # MPOL_PREFERRED on NUMA 0, the node of CPUs 0 and 1.
-        assert (mode.value, mask[0]) == (1, 0b1)
-
-    def test_nobind_sets_no_policy(self, monkeypatch):
-        monkeypatch.setattr(worker_utils, "get_libnuma", None)
-        set_preferred_memory_node(0, 0, "nobind")
-
-    def test_missing_libnuma_is_skipped(self, monkeypatch):
-        monkeypatch.setattr(worker_utils, "_can_set_mempolicy", lambda: False)
-        monkeypatch.setattr(worker_utils, "get_libnuma", lambda: None)
-        set_preferred_memory_node(0, 0, "0,1")
-
-    def test_keeps_policy_set_at_launch(self, monkeypatch):
-        # MPOL_BIND, as `numactl --membind` leaves it, is not replaced.
-        def get_mempolicy(mode, *args):
-            ctypes.cast(mode, ctypes.POINTER(ctypes.c_int)).contents.value = 2
-            return 0
-
-        numa_set_preferred = Mock()
-        libnuma = SimpleNamespace(
-            get_mempolicy=get_mempolicy, numa_set_preferred=numa_set_preferred
-        )
-        monkeypatch.setattr(worker_utils, "_can_set_mempolicy", lambda: True)
-        monkeypatch.setattr(worker_utils, "get_libnuma", lambda: libnuma)
-        set_preferred_memory_node(0, 0, "0,1")
-        numa_set_preferred.assert_not_called()
+            set_cpu_affinity(0, 0, _make_parallel_config())
 
 
 class TestSetOmpNumThreads:

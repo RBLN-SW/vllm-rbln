@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from copy import deepcopy
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
@@ -21,14 +22,10 @@ import torch
 from vllm.config import CacheConfig, ModelConfig, SchedulerConfig, VllmConfig
 
 from vllm_rbln.config import build_optimum_rbln_config
-from vllm_rbln.utils.optimum.configuration.apply import apply_to_vllm_config
-from vllm_rbln.utils.optimum.configuration.runtime import (
+from vllm_rbln.utils.optimum.configuration.runtime_config import (
+    apply_runtime_config,
     get_runtime_num_blocks,
-    get_user_max_num_batched_tokens,
-    is_chunked_prefill_arch,
-    store_image_prefill_chunk_size,
-    update_max_num_batched_tokens,
-    validate_user_prefill_chunk_size,
+    prepare_runtime_config,
 )
 
 pytestmark = pytest.mark.usefixtures("set_npu_env_var")
@@ -40,22 +37,14 @@ POOLING_ARCH = "BertModel"
 
 
 def _vllm_config(
-    *,
-    arch: str,
-    max_model_len: int = 8192,
-    max_num_seqs: int = 4,
-    max_num_batched_tokens: int = 0,
-    max_source_positions: int | None = None,
-    additional_config: dict | None = None,
+    *, arch: str, additional_config: dict | None = None
 ) -> SimpleNamespace:
-    hf_config = SimpleNamespace(architectures=[arch])
-    if max_source_positions is not None:
-        hf_config.max_source_positions = max_source_positions
     return SimpleNamespace(
-        model_config=SimpleNamespace(hf_config=hf_config, max_model_len=max_model_len),
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=[arch]), max_model_len=8192
+        ),
         scheduler_config=SimpleNamespace(
-            max_num_seqs=max_num_seqs,
-            max_num_batched_tokens=max_num_batched_tokens,
+            max_num_seqs=4, max_num_batched_tokens=0, max_num_scheduled_tokens=None
         ),
         additional_config=build_optimum_rbln_config(additional_config),
     )
@@ -74,8 +63,10 @@ def apply_config():
             num_gpu_blocks_override=None,
             user_specified_mamba_block_size=False,
             mamba_block_size=None,
+            gpu_memory_utilization=0.9,
         )
-        apply_to_vllm_config(cfg, rbln_config, precompiled=precompiled)
+        prepared = prepare_runtime_config(cfg, rbln_config, precompiled=precompiled)
+        apply_runtime_config(cfg, prepared)
         return cfg
 
     return run
@@ -96,7 +87,8 @@ class TestApplyDecoder:
         assert synced.scheduler_config.max_num_seqs == 4
         assert synced.model_config.max_model_len == 8192
         assert synced.cache_config.block_size == 4096
-        assert synced.scheduler_config.max_num_batched_tokens == 256
+        assert synced.scheduler_config.max_num_batched_tokens == 8192
+        assert synced.additional_config.prefill_chunk_size == [256]
 
     def test_missing_required_fields_are_rejected(self, apply_config):
         with pytest.raises(AssertionError):
@@ -145,13 +137,14 @@ class TestApplyEncDec:
 
 
 class TestApplyPooling:
-    def test_reads_partition_size_from_compile_inputs(self, apply_config):
+    def test_reads_partition_size_from_compile_config(self, apply_config):
         synced = apply_config(
             {
                 "num_devices": 1,
                 "max_seq_len": 8192,
                 "batch_size": 4,
                 "kvcache_partition_len": 1024,
+                "prefill_chunk_size": 128,
             },
             arch="Qwen3Model",
         )
@@ -164,6 +157,7 @@ class TestApplyPooling:
             "batch_size": 8,
             "kvcache_num_blocks": 16,
             "kvcache_block_size": 512,
+            "prefill_chunk_size": 128,
         }
         synced = apply_config(cfg, arch="Qwen3Model")
         assert get_runtime_num_blocks(synced.model_config.hf_config, cfg) == 16
@@ -243,7 +237,8 @@ class TestApplyMultimodal:
         assert synced.model_config.max_model_len == 4096
         assert synced.cache_config.block_size == 4096
         assert get_runtime_num_blocks(synced.model_config.hf_config, cfg) == 8
-        assert synced.scheduler_config.max_num_batched_tokens == 256
+        assert synced.scheduler_config.max_num_batched_tokens == 4096
+        assert synced.additional_config.prefill_chunk_size == [256]
         assert synced.additional_config.image_prefill_chunk_size == [512, 256]
 
     def test_top_level_fields_present(self, apply_config):
@@ -389,122 +384,9 @@ class TestCompiledDtype:
         assert cfg.model_config.dtype == (torch.bfloat16 if dtype else torch.float32)
 
 
-class TestIsChunkedPrefillArch:
-    def test_decoder_is_chunked(self):
-        assert is_chunked_prefill_arch(SimpleNamespace(architectures=[DECODER_ARCH]))
-
-    def test_enc_dec_is_not_chunked(self):
-        assert not is_chunked_prefill_arch(
-            SimpleNamespace(architectures=[ENC_DEC_ARCH])
-        )
-
-    def test_pooling_is_not_chunked(self):
-        assert not is_chunked_prefill_arch(
-            SimpleNamespace(architectures=[POOLING_ARCH])
-        )
-
-
-class TestGetUserMaxNumBatchedTokens:
-    def test_none_when_no_additional_config(self):
-        cfg = _vllm_config(arch=DECODER_ARCH, additional_config=None)
-        assert get_user_max_num_batched_tokens(cfg) is None
-
-    def test_none_when_unset(self):
-        cfg = _vllm_config(arch=DECODER_ARCH, additional_config={})
-        assert get_user_max_num_batched_tokens(cfg) is None
-
-    def test_returns_stashed_value(self):
-        cfg = _vllm_config(
-            arch=DECODER_ARCH,
-            additional_config={"user_max_num_batched_tokens": 512},
-        )
-        assert get_user_max_num_batched_tokens(cfg) == 512
-
-
-class TestUpdateMaxNumBatchedTokens:
-    def test_decoder_uses_prefill_chunk_size(self):
-        cfg = _vllm_config(arch=DECODER_ARCH, max_num_seqs=4)
-        prefill_chunk_size = 256
-        update_max_num_batched_tokens(cfg, prefill_chunk_size)
-        assert cfg.scheduler_config.max_num_batched_tokens == 256
-
-    def test_decoder_chunk_smaller_than_batch_ok(self):
-        # The scheduler's per-step budget is decoupled from max_num_batched_tokens,
-        # so a prefill chunk smaller than max_num_seqs no longer throttles decode.
-        cfg = _vllm_config(arch=DECODER_ARCH, max_num_seqs=512)
-        prefill_chunk_size = 128
-        update_max_num_batched_tokens(cfg, prefill_chunk_size)
-        assert cfg.scheduler_config.max_num_batched_tokens == 128
-
-    def test_pooling_uses_full_prefill_budget(self):
-        cfg = _vllm_config(arch=POOLING_ARCH, max_model_len=8192, max_num_seqs=4)
-        prefill_chunk_size = 128
-        update_max_num_batched_tokens(cfg, prefill_chunk_size)
-        # prefill_chunk_size is ignored; budget fits a full prefill.
-        assert cfg.scheduler_config.max_num_batched_tokens == 8192
-
-    def test_enc_dec_layers_source_positions(self):
-        cfg = _vllm_config(
-            arch=ENC_DEC_ARCH,
-            max_model_len=448,
-            max_num_seqs=4,
-            max_source_positions=1500,
-        )
-        prefill_chunk_size = 128
-        update_max_num_batched_tokens(cfg, prefill_chunk_size)
-        assert cfg.scheduler_config.max_num_batched_tokens == 1500
-
-
-class TestValidateUserPrefillChunkSize:
-    def test_noop_for_pooling(self):
-        cfg = _vllm_config(
-            arch=POOLING_ARCH,
-            additional_config={"user_max_num_batched_tokens": 512},
-        )
-        prefill_chunk_size = 128
-        validate_user_prefill_chunk_size(cfg, prefill_chunk_size)
-        assert prefill_chunk_size == 128
-
-    def test_noop_when_user_unset(self):
-        cfg = _vllm_config(arch=DECODER_ARCH, additional_config={})
-        prefill_chunk_size = 128
-        validate_user_prefill_chunk_size(cfg, prefill_chunk_size)
-        assert prefill_chunk_size == 128
-
-    def test_precompiled_conflict_raises(self):
-        cfg = _vllm_config(
-            arch=DECODER_ARCH,
-            additional_config={"user_max_num_batched_tokens": 512},
-        )
-        prefill_chunk_size = 128
-        with pytest.raises(ValueError, match="conflicts with the compiled"):
-            validate_user_prefill_chunk_size(cfg, prefill_chunk_size)
-
-    def test_precompiled_match_ok(self):
-        cfg = _vllm_config(
-            arch=DECODER_ARCH,
-            additional_config={"user_max_num_batched_tokens": 128},
-        )
-        prefill_chunk_size = 128
-        validate_user_prefill_chunk_size(cfg, prefill_chunk_size)
-        assert prefill_chunk_size == 128
-
-
-class TestStoreImagePrefillChunkSize:
-    def test_stores_buckets(self):
-        cfg = _vllm_config(arch=DECODER_ARCH, additional_config={})
-        store_image_prefill_chunk_size(cfg, [1152, 640, 384])
-        assert cfg.additional_config.image_prefill_chunk_size == [1152, 640, 384]
-
-    def test_noop_when_none(self):
-        cfg = _vllm_config(arch=DECODER_ARCH, additional_config={})
-        store_image_prefill_chunk_size(cfg, None)
-        assert cfg.additional_config.image_prefill_chunk_size is None
-
-
 def _engine_config() -> VllmConfig:
     # Force the cache-miss branch so building the config does not look for a
-    # compiled artifact. The test calls apply_to_vllm_config itself.
+    # compiled artifact. The test calls apply_runtime_config itself.
     with patch(
         "vllm_rbln.utils.optimum.configuration.sync.load_compiled_rbln_config",
         return_value=None,
@@ -534,15 +416,18 @@ def test_compiled_num_devices_lands_in_the_config(monkeypatch):
         "batch_size": 4,
         "max_seq_len": 128,
         "kvcache_block_size": 128,
-        "prefill_chunk_size": 128,
+        "prefill_chunk_size": 4,
         "num_devices": 2,
     }
-    apply_to_vllm_config(vllm_config, compiled, precompiled=True)
+    prepared = prepare_runtime_config(vllm_config, compiled, precompiled=True)
+    apply_runtime_config(vllm_config, prepared)
 
     assert vllm_config.additional_config.num_devices_per_local_rank == 2
 
 
-@pytest.mark.parametrize("arch", [DECODER_ARCH, "PaliGemmaForConditionalGeneration"])
+@pytest.mark.parametrize(
+    "arch", [DECODER_ARCH, "PaliGemmaForConditionalGeneration", "Qwen3Model"]
+)
 @pytest.mark.parametrize("precompiled", [False, True])
 @pytest.mark.parametrize("explicit_none", [False, True])
 def test_missing_prefill_chunk_size_is_rejected(
@@ -578,7 +463,8 @@ def test_apply_uses_selected_chunk_without_querying_the_npu(
         "prefill_chunk_size": 256,
     }
     cfg = apply_config(selected, arch=arch, precompiled=True)
-    assert cfg.scheduler_config.max_num_batched_tokens == 256
+    assert cfg.scheduler_config.max_num_batched_tokens == 8192
+    assert cfg.additional_config.prefill_chunk_size == [256]
 
 
 @pytest.mark.parametrize(
@@ -613,14 +499,185 @@ def test_whisper_block_count_is_read_without_a_batch_size_default():
     )
 
 
-@pytest.mark.parametrize("invalid", ["missing_devices", "prefill_conflict"])
+@pytest.mark.parametrize("precompiled", [False, True])
+def test_prepared_settings_are_owned_and_applied_without_reading_metadata(
+    apply_config, precompiled
+):
+    selected = {
+        "batch_size": 2,
+        "max_seq_len": 4096,
+        "kvcache_block_size": 4096,
+        "kvcache_num_blocks": 16,
+        "prefill_chunk_size": 256,
+        "num_devices": 2,
+        "dtype": "bfloat16",
+    }
+    cfg = apply_config(selected)
+    cfg.scheduler_config.max_num_seqs = 4
+    cfg.model_config.max_model_len = 8192
+    cfg.cache_config.num_gpu_blocks_override = 16
+    prepared = prepare_runtime_config(cfg, selected, precompiled=precompiled)
+    assert cfg.scheduler_config.max_num_seqs == 4
+    assert cfg.model_config.max_model_len == 8192
+    assert cfg.cache_config.gpu_memory_utilization == 0.9
+    selected.clear()
+
+    apply_runtime_config(cfg, prepared)
+
+    assert cfg.scheduler_config.max_num_seqs == 2
+    assert cfg.model_config.max_model_len == 4096
+    assert cfg.scheduler_config.max_num_batched_tokens == 4096
+    assert cfg.additional_config.prefill_chunk_size == [256]
+    assert cfg.additional_config.num_devices_per_local_rank == 2
+    assert cfg.cache_config.gpu_memory_utilization == 0.9
+    assert cfg.model_config.dtype == (torch.bfloat16 if precompiled else torch.float32)
+
+
+@pytest.mark.parametrize(
+    "prefix_caching, override, expected_blocks",
+    [(False, None, 8), (False, 4, 4), (True, None, 29), (True, 4, 13)],
+)
+def test_runtime_block_count_is_resolved_before_apply(
+    apply_config, prefix_caching, override, expected_blocks
+):
+    selected = {
+        "batch_size": 2,
+        "max_seq_len": 8192,
+        "kvcache_block_size": 1024,
+        "kvcache_num_blocks": 8,
+        "prefill_chunk_size": 256,
+        "num_devices": 1,
+    }
+    cfg = apply_config(selected)
+    cfg.cache_config.enable_prefix_caching = prefix_caching
+    cfg.cache_config.num_gpu_blocks_override = override
+    if override is not None:
+        cfg.additional_config.optimum_overrides = {"kvcache_num_blocks": override}
+    prepared = prepare_runtime_config(cfg, selected, precompiled=True)
+    assert prepared.model_num_blocks == (8 if override is None else override)
+    assert cfg.cache_config.num_gpu_blocks is None
+    if override is not None:
+        cfg.cache_config.num_gpu_blocks_override = override + 1
+
+    apply_runtime_config(cfg, prepared)
+
+    assert cfg.cache_config.num_gpu_blocks == expected_blocks
+    assert cfg.additional_config.num_blocks_override == override
+    repeated = prepare_runtime_config(cfg, selected, precompiled=True)
+    assert repeated.model_num_blocks == prepared.model_num_blocks
+    apply_runtime_config(cfg, repeated)
+    assert cfg.cache_config.num_gpu_blocks == expected_blocks
+
+
+@pytest.mark.parametrize(
+    "sub_block_size, prefill_chunk_size, mamba_block_size, error, message",
+    [
+        (384, 256, None, ValueError, "not divisible.*prefill_chunk_size"),
+        (2048, 256, None, ValueError, "greater than.*kvcache_block_size"),
+        (768, 256, None, ValueError, "not divisible.*sub_block_size"),
+        (None, 384, None, ValueError, "not divisible.*sub_block_size"),
+        (256, 256, 4096, AssertionError, "mamba_block_size can only be synced"),
+    ],
+)
+def test_block_constraints_are_validated_without_changing_config(
+    apply_config, sub_block_size, prefill_chunk_size, mamba_block_size, error, message
+):
+    selected = {
+        "batch_size": 2,
+        "max_seq_len": 8192,
+        "kvcache_block_size": 1024,
+        "kvcache_num_blocks": 16,
+        "prefill_chunk_size": prefill_chunk_size,
+        "num_devices": 1,
+    }
+    cfg = apply_config(selected)
+    cfg.cache_config.enable_prefix_caching = True
+    cfg.cache_config.mamba_block_size = mamba_block_size
+    cfg.additional_config.sub_block_size = sub_block_size
+    cfg.additional_config.optimum_overrides = {"device": [0], "create_runtimes": False}
+    cfg.scheduler_config.max_num_seqs = 4
+    cfg.model_config.max_model_len = 16384
+    before = deepcopy(cfg)
+
+    with pytest.raises(error, match=message):
+        prepare_runtime_config(cfg, selected, precompiled=True)
+
+    assert cfg == before
+
+
+@pytest.mark.parametrize("sub_block_size, expected_size", [(None, 256), (512, 512)])
+def test_prefix_block_sizes_are_resolved_before_apply(
+    apply_config, sub_block_size, expected_size
+):
+    selected = {
+        "batch_size": 2,
+        "max_seq_len": 8192,
+        "kvcache_block_size": 1024,
+        "kvcache_num_blocks": 16,
+        "prefill_chunk_size": 256,
+        "num_devices": 1,
+    }
+    cfg = apply_config(selected)
+    cfg.cache_config.enable_prefix_caching = True
+    cfg.additional_config.sub_block_size = sub_block_size
+    before = deepcopy(cfg)
+
+    prepared = prepare_runtime_config(cfg, selected, precompiled=True)
+
+    assert cfg == before
+    assert prepared.block_size == expected_size
+    assert prepared.attn_block_size == 1024
+    apply_runtime_config(cfg, prepared)
+    assert cfg.cache_config.block_size == expected_size
+    assert cfg.additional_config.attn_block_size == 1024
+
+
+@pytest.mark.parametrize(
+    "user_specified, precompiled, expected_size",
+    [(False, True, 8192), (True, True, 4096), (False, False, 4096)],
+)
+def test_mamba_block_size_is_resolved_before_apply(
+    apply_config, user_specified, precompiled, expected_size
+):
+    selected = {
+        "batch_size": 2,
+        "max_seq_len": 8192,
+        "kvcache_block_size": 1024,
+        "kvcache_num_blocks": 16,
+        "prefill_chunk_size": 256,
+        "num_devices": 1,
+    }
+    cfg = apply_config(selected)
+    cfg.cache_config.mamba_block_size = 4096
+    cfg.cache_config.user_specified_mamba_block_size = user_specified
+    cfg.cache_config.enable_prefix_caching = user_specified
+    cfg.model_config.max_model_len = 16384
+    before = deepcopy(cfg)
+
+    prepared = prepare_runtime_config(cfg, selected, precompiled=precompiled)
+
+    assert cfg == before
+    assert prepared.mamba_block_size == expected_size
+    apply_runtime_config(cfg, prepared)
+    assert cfg.cache_config.mamba_block_size == expected_size
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "missing_devices",
+        "prefill_conflict",
+        "zero_scheduling_budget",
+        "scheduling_budget",
+    ],
+)
 def test_selected_settings_are_validated_before_config_is_changed(invalid):
     overrides = {"device": [0], "memory_budget": 0.5}
     cfg = _vllm_config(
         arch=DECODER_ARCH,
         additional_config={
             "optimum_overrides": overrides,
-            "user_max_num_batched_tokens": 512,
+            "prefill_chunk_size": 512,
         },
     )
     selected = {
@@ -634,11 +691,15 @@ def test_selected_settings_are_validated_before_config_is_changed(invalid):
     if invalid == "missing_devices":
         del selected["num_devices"]
         expected_error = "num_devices"
-    else:
+    elif invalid == "prefill_conflict":
         selected["prefill_chunk_size"] = 256
-        expected_error = "conflicts with the compiled"
+        expected_error = "does not match the resolved model configuration"
+    else:
+        cfg.scheduler_config.max_num_scheduled_tokens = (
+            0 if invalid == "zero_scheduling_budget" else 256
+        )
+        expected_error = "max_num_scheduled_tokens cannot be set"
+    before = deepcopy(cfg)
     with pytest.raises(ValueError, match=expected_error):
-        apply_to_vllm_config(cfg, selected, precompiled=True)
-    assert cfg.scheduler_config.max_num_seqs == 4
-    assert cfg.model_config.max_model_len == 8192
-    assert cfg.additional_config.optimum_overrides == overrides
+        prepare_runtime_config(cfg, selected, precompiled=True)
+    assert cfg == before

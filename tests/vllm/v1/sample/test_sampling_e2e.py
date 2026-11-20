@@ -44,9 +44,15 @@ def generate(
     return [out.outputs[0] for out in runner.llm.generate(prompts, params)]
 
 
-@pytest.fixture(scope="module")
-def runner(vllm_runner):
-    engine_kwargs = {**SPEC.engine_kwargs, "max_num_seqs": 32, "max_logprobs": -1}
+# The default and the opt-out must sample alike.
+@pytest.fixture(scope="module", params=[True, False], ids=["fused", "unfused"])
+def runner(request, vllm_runner):
+    engine_kwargs = {
+        **SPEC.engine_kwargs,
+        "max_num_seqs": 32,
+        "max_logprobs": -1,
+        "additional_config": {"use_fused_sampling": request.param},
+    }
     with pytest.MonkeyPatch.context() as monkeypatch:
         apply_spec_envs(SPEC, monkeypatch)
         with vllm_runner(SPEC.model, **engine_kwargs) as runner:
@@ -195,6 +201,52 @@ def test_first_token_distribution_matches_upstream(runner, params):
     assert_samples_match(
         samples=torch.tensor([c.token_ids[0] for c in completions]), probs=expected
     )
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        pytest.param({"repetition_penalty": 1.5}, id="repetition_penalty"),
+        pytest.param({"ban_top": 6}, id="logit_bias"),
+        # No top-k or top-p: the NPU keeps a whole tie at the cut where upstream
+        # keeps one, and a real model's tail has ties. test_rbln_sampler covers them.
+        pytest.param(
+            {
+                "temperature": 0.8,
+                "min_p": 0.05,
+                "repetition_penalty": 1.05,
+                "ban_top": 6,
+            },
+            id="min_p_penalty_logit_bias",
+        ),
+    ],
+)
+def test_first_token_distribution_with_processors_matches_upstream(runner, kwargs):
+    """The same check with the repetition penalty, which reads the prompt, and
+    a logit bias that bans the `ban_top` likeliest tokens."""
+    kwargs = dict(kwargs)
+    ban_top = kwargs.pop("ban_top", 0)
+    probe = SamplingParams(temperature=1.0, max_tokens=1, logprobs=-1)
+    (request,) = runner.llm.generate([PROMPT], probe)
+    vocab_size = runner.llm.llm_engine.model_config.get_vocab_size()
+    raw = torch.full((vocab_size,), float("-inf"))
+    for token_id, logprob in request.outputs[0].logprobs[0].items():
+        raw[token_id] = logprob.logprob
+    banned = raw.topk(ban_top).indices.tolist()
+    params = SamplingParams(
+        max_tokens=1, logit_bias={t: -100.0 for t in banned} or None, **kwargs
+    )
+    expected = expected_probs(
+        logits=raw.unsqueeze(0),
+        params=[params],
+        prompt_token_ids=request.prompt_token_ids,
+    )[0]
+
+    completions = generate(runner, [PROMPT] * NUM_SAMPLES, params)
+
+    samples = torch.tensor([c.token_ids[0] for c in completions])
+    assert not set(samples.tolist()) & set(banned)
+    assert_samples_match(samples=samples, probs=expected)
 
 
 # The grammar fixes the first token to "x", so the digit after it comes from a

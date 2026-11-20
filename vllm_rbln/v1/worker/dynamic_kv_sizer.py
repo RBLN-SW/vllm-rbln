@@ -385,13 +385,14 @@ class DynamicKvSizer:
         """Per-chiplet bytes to keep out of the KV budget when the scheduler
         will run sub-block prefix caching."""
         rbln_config = self.vllm_config.additional_config
-        assert rbln_config.prefill_chunk_size is not None  # resolved at start-up
         in_use = sub_block_size_in_use(
             enable_prefix_caching=self.cache_config.enable_prefix_caching,
             sub_block_cache=rbln_config.enable_sub_block_cache,
             block_size=self.cache_config.block_size,
-            prefill_chunk_size=rbln_config.prefill_chunk_size,
+            prefill_chunk_sizes=rbln_config.prefill_chunk_size,
             kv_cache_config=self.model_runner.kv_cache_config,
+            model_config=self.vllm_config.model_config,
+            cache_dtype=self.cache_config.cache_dtype,
             sub_block_size=rbln_config.sub_block_size,
         )
         return DYNAMIC_KV_COPY_STREAM_RESERVE_BYTES if in_use is not None else 0

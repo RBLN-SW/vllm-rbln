@@ -17,7 +17,7 @@ import queue
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Container
+from collections.abc import Container, Iterable
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -45,6 +45,9 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_worker imp
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
     RBLN_COVERAGE_NOTIF_PREFIX,
     RblnNixlConnectorMetadata,
+)
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.transfer import (
+    trim_producer_to_consumer,
 )
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.worker.utils import abort_worker
@@ -987,7 +990,11 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         pieces = window[3] if window is not None else ()
         if window is None:
             local_block_ids = self._trim_to_consumer_blocks(
-                local_block_ids, remote_block_ids, engine_id, meta.remote.request_id
+                local_block_ids,
+                remote_block_ids,
+                engine_id,
+                meta.remote.request_id,
+                self._region_group_pairs(engine_id, peer_ranks, producer_is_peer=False),
             )
             span = (0, registered * cpb)
         else:
@@ -1024,6 +1031,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                 remote_block_ids,
                 num_valid_tokens=tail_tokens,
                 num_prompt_blocks=n_prompt_blocks,
+                remote=True,
             )
             local_descs = self._shard_descs_for_tokens(
                 engine_id,
@@ -1499,6 +1507,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         remote_block_ids: BlockIds,
         engine_id: str,
         req_id: str,
+        pairs: Iterable[tuple[int, int]],
     ) -> BlockIds:
         """Drop from our side the blocks the consumer already had.
 
@@ -1509,17 +1518,10 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         prompt, so dropping our tail would hand it the wrong blocks under a
         partial prefix hit.
         """
-        local = list(local_block_ids)
-        for i, remote_group in enumerate(remote_block_ids):
-            num_remote = len(remote_group)
-            if num_remote > len(local[i]):
-                raise RuntimeError(
-                    f"RBLN NIXL: consumer {engine_id} registered {num_remote} "
-                    f"block(s) for request {req_id} in group {i}, more than the "
-                    f"{len(local[i])} this producer holds; the peer's advertised "
-                    "length crosses the handshake, so the pair is refused rather "
-                    "than trimmed to it."
-                )
-            if num_remote < len(local[i]):
-                local[i] = local[i][-num_remote:]
-        return tuple(local)
+        return trim_producer_to_consumer(
+            local_block_ids,
+            remote_block_ids,
+            pairs,
+            consumer_name=engine_id,
+            req_id=req_id,
+        )

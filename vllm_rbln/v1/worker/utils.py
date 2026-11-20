@@ -14,7 +14,6 @@
 """Utilities for RBLN worker. (CPU affinity, batch reorder, ...)"""
 
 import contextlib
-import ctypes
 import json
 import math
 import os
@@ -22,13 +21,12 @@ import platform
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from datetime import datetime, timezone
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Literal, NoReturn, TypeVar
 
 import numpy as np
-import psutil
 import torch
 from rebel import profiler as rbln_profiler
 from vllm.config import ModelConfig, ParallelConfig, VllmConfig
@@ -39,7 +37,6 @@ from vllm.utils.cpu_resource_utils import (
     get_allowed_cpu_list,
     get_visible_memory_node,
 )
-from vllm.utils.numa_utils import _can_set_mempolicy, get_libnuma
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
@@ -207,78 +204,6 @@ RBLN_DEV_DIR = "/dev"
 REBEL_DRAM_NBYTES = 144 * 2**30 - 4 * 2**30
 
 
-def extract_layer_index(layer_name: str, num_attn_module: int = 1) -> int:
-    int_vals: list[int] = []
-    for subname in layer_name.split("."):
-        try:
-            int_vals.append(int(subname))
-        except ValueError:
-            continue
-    if num_attn_module <= 1 or "attn" not in layer_name:
-        assert len(int_vals) == 1, (
-            f"layer name {layer_name} should only contain one integer"
-        )
-        return int_vals[0]
-    assert int_vals, f"layer name {layer_name} has no integer layer index"
-    base = int_vals[0]
-    if len(int_vals) >= 2:
-        sub = int_vals[1]
-    elif "scale" in layer_name:
-        sub = 2
-    elif "indexer" in layer_name:
-        sub = 1
-    else:
-        sub = 0
-    return base * num_attn_module + sub
-
-
-def pipeline_adjusted_layer_index(
-    layer_name: str,
-    model_config,
-    parallel_config,
-    num_attn_module: int,
-) -> int:
-    raw_layer_index = extract_layer_index(layer_name, num_attn_module)
-    if model_config is None:
-        return raw_layer_index
-
-    start, end = model_config.get_layers_start_end_indices(parallel_config)
-    total_num_hidden_layers = model_config.get_total_num_hidden_layers()
-    if raw_layer_index >= total_num_hidden_layers * num_attn_module:
-        # MTP/nextn layers are named past the target's layer count
-        # (mtp_start_layer_idx == num_hidden_layers), so their KV cache sits
-        # right after the target layers in the compacted per-rank cache list.
-        return (end - start) * num_attn_module + (
-            raw_layer_index - total_num_hidden_layers * num_attn_module
-        )
-    return raw_layer_index - start * num_attn_module
-
-
-def num_attn_module(model_config, cache_dtype) -> int:
-    hf_config = model_config.hf_config
-    if getattr(hf_config, "model_type", None) == "longcat_flash":
-        return 2
-    text_config = getattr(model_config, "hf_text_config", hf_config)
-    # GLM uses an upper bound for per-layer index spacing, not a cache count.
-    # KDA needs up to 2 * num_groups + 1 slots; num_groups <= linear_num_heads.
-    # MTP uses the same bound although its DSA layers have only four slots.
-    # Cache binding compacts the actual entries into consecutive indices.
-    if getattr(text_config, "model_type", None) in ("glm5_next_text", "glm5_next_mtp"):
-        return 2 * text_config.linear_num_heads + 1
-    # A DSA model puts the lightning-indexer key cache next to MLA: 2 modules,
-    # or 3 when the indexer cache is fp8 (a companion scale cache).
-    if hasattr(text_config, "index_topk") or hasattr(hf_config, "index_topk"):
-        is_fp8 = bool(cache_dtype) and cache_dtype.startswith("fp8")
-        return 3 if is_fp8 else 2
-    # MiniMax-M3 MSA: the indexer key cache next to the GQA K/V cache. Dense
-    # layers own only K/V; the runner re-indexes layers by bound position.
-    if getattr(text_config, "sparse_attention_config", None) or getattr(
-        hf_config, "sparse_attention_config", None
-    ):
-        return 2
-    return 1
-
-
 def get_rbln_visible_card_indices() -> list[int]:
     """Card indices this process may use, from `RBLN_VISIBLE_DEVICES`.
 
@@ -340,17 +265,6 @@ def get_rbln_owned_card_indices() -> list[int]:
         elif index in present:
             owned.append(index)
     return sorted(set(owned)) or present
-
-
-def rbln_device_numa_node() -> int | None:
-    """NUMA node of the cards this process owns; None when unknown or split."""
-    nodes = {
-        _read_card_attr_int(card, "device/numa_node")
-        for card in get_rbln_owned_card_indices()
-    }
-    if len(nodes) == 1 and (node := nodes.pop()) is not None and node >= 0:
-        return node
-    return None
 
 
 def _read_card_attr_int(card_index: int, attr: str) -> int | None:
@@ -606,6 +520,7 @@ def estimate_model_kernel_size(
     model_config: ModelConfig,
     parallel_config: ParallelConfig,
     *,
+    num_layers: int,
     nbits_per_param: int | None = None,
     n_model_params: int | float | None = None,
     n_model_bytes: int | float | None = None,
@@ -617,7 +532,6 @@ def estimate_model_kernel_size(
     def align_2MB(x: int | float) -> int:
         return align(x, 2**21)
 
-    num_layers = model_config.get_num_layers(parallel_config)
     vocab_size = model_config.get_vocab_size()
     hidden_size = model_config.get_hidden_size()
     tp_size = parallel_config.tensor_parallel_size
@@ -808,6 +722,7 @@ def estimate_available_memory(
         kernel_size = estimate_model_kernel_size(
             model_config=model_config,
             parallel_config=parallel_config,
+            num_layers=model_config.get_num_layers(parallel_config),
             nbits_per_param=nbits_per_param,
             n_model_params=n_model_params,
             n_model_bytes=n_model_bytes,
@@ -916,38 +831,14 @@ def get_autobind_cpu_ids(
         )
         return "all"
 
-    device_numa_node = rbln_device_numa_node()
-    if (
-        world_size_across_dp == 1
-        and device_numa_node is not None
-        and device_numa_node in available_numa_nodes
-    ):
-        # A lone rank binds to its card's node. Several ranks keep the round robin:
-        # RBLN_VISIBLE_DEVICES lists only this rank's cards by now, so the cards of
-        # the ranks it shares a node with are unknown.
-        selected_numa_node = device_numa_node
-        ranks_in_same_numa = [rank_across_dp]
-        logger.debug(
-            "auto thread-binding: rank %d follows its card to NUMA node %d",
-            rank,
-            device_numa_node,
-        )
-    else:
-        if world_size_across_dp == 1:
-            logger.debug(
-                "auto thread-binding: card NUMA node %s is unknown or not in "
-                "allowed nodes %s; using round robin",
-                device_numa_node,
-                available_numa_nodes,
-            )
-        numa_node_idx = rank_across_dp % len(available_numa_nodes)
-        selected_numa_node = available_numa_nodes[numa_node_idx]
-        ranks_in_same_numa = [
-            r
-            for r in range(world_size_across_dp)
-            if r % len(available_numa_nodes) == numa_node_idx
-        ]
+    numa_node_idx = rank_across_dp % len(available_numa_nodes)
+    selected_numa_node = available_numa_nodes[numa_node_idx]
     numa_node_cpu_list = numa_node_to_cpus[selected_numa_node]
+    ranks_in_same_numa = [
+        r
+        for r in range(world_size_across_dp)
+        if r % len(available_numa_nodes) == numa_node_idx
+    ]
 
     # Select CPUs from each physical core via cpu_selector
     core_to_cpus: dict[int, list[LogicalCPUInfo]] = {}
@@ -1037,7 +928,11 @@ def compute_rbln_local_omp_cpuid(
     return "nobind"
 
 
-def get_rbln_planned_affinity_cpu_count(local_omp_cpuid: str) -> int:
+def get_rbln_planned_affinity_cpu_count(
+    rank: int,
+    local_rank: int,
+    parallel_config: ParallelConfig,
+) -> int:
     """Logical CPU count this rank will pin to after NUMA split (before
     ``sched_setaffinity``).
 
@@ -1045,6 +940,7 @@ def get_rbln_planned_affinity_cpu_count(local_omp_cpuid: str) -> int:
     counts match the post-bind CPU mask. If binding is ``nobind``/``all``, uses the
     current ``sched_getaffinity`` mask.
     """
+    local_omp_cpuid = compute_rbln_local_omp_cpuid(rank, local_rank, parallel_config)
     if local_omp_cpuid not in ("all", "nobind"):
         cpu_ids = [int(x.strip()) for x in local_omp_cpuid.split(",") if x.strip()]
         return max(1, len(cpu_ids))
@@ -1122,29 +1018,26 @@ def get_default_num_threads(allocated_cpus: int, num_local_ranks: int = 1) -> in
     return max(2, allocated_cpus // 2)
 
 
-def set_cpu_affinity(rank: int, local_rank: int, local_omp_cpuid: str) -> None:
+def set_cpu_affinity(
+    rank: int,
+    local_rank: int,
+    parallel_config: ParallelConfig,
+) -> None:
     """Setup thread affinity based on NUMA nodes.
 
     Args:
         rank: Global rank of the worker.
         local_rank: Local rank of the worker.
-        local_omp_cpuid: CPU set from ``compute_rbln_local_omp_cpuid``.
+        parallel_config: Parallel configuration.
     """
+    local_omp_cpuid = compute_rbln_local_omp_cpuid(rank, local_rank, parallel_config)
+
     if local_omp_cpuid not in ("all", "nobind"):
         # Parse CPU IDs from string (e.g., "0,1,2,3" -> [0, 1, 2, 3])
         cpu_ids = [int(cpu_id.strip()) for cpu_id in local_omp_cpuid.split(",")]
         # Set CPU affinity for current process
         try:
             os.sched_setaffinity(0, cpu_ids)
-            # sched_setaffinity(0) binds only this thread: bind the ones already
-            # running too (compiler, runtime, torch). List them again until none
-            # is new, as an unbound one may start a child mid-walk; one may exit.
-            bound: set[int] = set()
-            while new := {thread.id for thread in psutil.Process().threads()} - bound:
-                for tid in new:
-                    with contextlib.suppress(ProcessLookupError):
-                        os.sched_setaffinity(tid, cpu_ids)
-                bound.update(new)
             # Verify CPU affinity was set correctly
             actual_cpu_ids = sorted(os.sched_getaffinity(0))
             expected_cpu_ids = sorted(cpu_ids)
@@ -1159,11 +1052,10 @@ def set_cpu_affinity(rank: int, local_rank: int, local_omp_cpuid: str) -> None:
                 )
             else:
                 logger.debug(
-                    "Set CPU affinity for rank %d (local_rank %d): CPUs %s, %d threads",
+                    "Set CPU affinity for rank %d (local_rank %d): CPUs %s",
                     rank,
                     local_rank,
                     local_omp_cpuid,
-                    len(bound),
                 )
         except OSError as e:
             logger.error(
@@ -1179,43 +1071,6 @@ def set_cpu_affinity(rank: int, local_rank: int, local_omp_cpuid: str) -> None:
             rank,
             local_rank,
         )
-
-
-def set_preferred_memory_node(rank: int, local_rank: int, local_omp_cpuid: str) -> None:
-    """Prefer the CPU binding's NUMA node for new pages before the CPUs are pinned.
-
-    The policy applies to this thread and to the threads it starts later.
-    A policy set at launch, such as by ``numactl --membind``, is kept.
-    """
-    if local_omp_cpuid in ("all", "nobind"):
-        return
-    if not _can_set_mempolicy():
-        logger.warning(
-            "Cannot set a NUMA memory policy for rank %d; host memory may land "
-            "on another node than its CPUs. In Docker, add --cap-add SYS_NICE.",
-            rank,
-        )
-        return
-    libnuma = get_libnuma()
-    mode = ctypes.c_int()
-    libnuma.get_mempolicy(
-        ctypes.byref(mode), None, ctypes.c_ulong(0), None, ctypes.c_ulong(0)
-    )
-    if mode.value != 0:  # not MPOL_DEFAULT: keep the policy set at launch
-        logger.debug(
-            "Keeping the NUMA memory policy set at launch (mode %d) for rank %d",
-            mode.value,
-            rank,
-        )
-        return
-    cpu_ids = {int(cpu_id) for cpu_id in local_omp_cpuid.split(",")}
-    nodes = {cpu.numa_node for cpu in get_allowed_cpu_list() if cpu.id in cpu_ids}
-    assert len(nodes) == 1, f"auto-binding spans NUMA nodes {sorted(nodes)}"
-    (node,) = nodes
-    libnuma.numa_set_preferred(node)
-    logger.debug(
-        "Preferred NUMA node %d for rank %d (local_rank %d)", node, rank, local_rank
-    )
 
 
 def set_omp_num_threads(
@@ -1405,33 +1260,35 @@ def reorder_input_batch(input_batch: "InputBatch", perm: np.ndarray) -> None:
 
 
 def get_kv_cache_names(
-    kv_caches: dict[str, torch.Tensor],
-    num_attn_module: int = 1,
+    cache_names: Iterable[str], forward_context: Mapping[str, Any]
 ) -> list[str]:
-    """Return KV cache layer names ordered by layer index.
+    """Order caches by their numeric module path and optional subindex.
 
-    A deterministic, hash-seed-independent ordering is required by the KV
-    connector: NIXL assigns transfer region indices in iteration order, so the
-    P/D region <-> layer agreement breaks if the order varies between runs.
-    Adapted from ``vllm.v1.worker.utils.bind_kv_cache``.
+    Numbered attention modules and cache groups already encode their order.
+    Caches without a numeric slot declare `kv_cache_subindex`; the default is 0.
+
+    Examples:
+        Standard attention cache: layers.3.self_attn.attn -> (3, 0).
+        GLM-5.3 (2 state groups, speculative decoding on): .attn.0/1=state,
+        .2=conv, .3/4=draft buffers with num_speculative_tokens records each.
+        DeepSeek indexer: layers.3.self_attn.indexer.k_cache -> (3, 1).
+        DeepSeek scale: layers.3.self_attn.indexer.k_cache.scale_cache -> (3, 2).
+        MiniMax indexer: layers.3.self_attn.attn.indexer -> (3, 1).
     """
-    index2name: dict[int, list[str]] = defaultdict(list)
-    for layer_name in kv_caches:
-        index2name[extract_layer_index(layer_name, num_attn_module)].append(layer_name)
-
-    kv_cache_names: list[str] = []
-    for layer_index in sorted(index2name.keys()):
-        layer_names = index2name[layer_index]
-        if len(layer_names) > 1 and not (
-            current_platform.is_cuda_alike()
-            or current_platform.is_xpu()
-            or current_platform.is_cpu()
-        ):
-            # Multiple layers sharing one index (e.g. encoder-decoder cross +
-            # self attention) is only known-safe on GPU/CPU runners.
-            raise NotImplementedError
-        kv_cache_names.extend(layer_names)
-    return kv_cache_names
+    names_by_sort_key: dict[tuple[int, ...], str] = {}
+    for name in cache_names:
+        layer = forward_context[name]
+        numeric_path = tuple(int(part) for part in name.split(".") if part.isdecimal())
+        if not numeric_path:
+            raise ValueError(f"KV cache {name} has no numeric layer path")
+        sort_key = (*numeric_path, getattr(layer, "kv_cache_subindex", 0))
+        if sort_key in names_by_sort_key:
+            raise ValueError(
+                f"Duplicate KV cache sort key {sort_key}: "
+                f"{names_by_sort_key[sort_key]} and {name}"
+            )
+        names_by_sort_key[sort_key] = name
+    return [names_by_sort_key[sort_key] for sort_key in sorted(names_by_sort_key)]
 
 
 def copy_host_device_kv_blocks(

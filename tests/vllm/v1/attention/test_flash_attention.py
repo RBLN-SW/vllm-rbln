@@ -14,15 +14,17 @@
 
 
 from dataclasses import fields
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 from vllm.config import set_current_vllm_config
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-import vllm_rbln.envs as envs
 import vllm_rbln.v1.attention.backends.flash_attention as flash_attention
 from tests.vllm.v1.attention.utils import (
+    make_attention_spec,
     make_builder,
     make_common_attn_metadata,
     make_impl,
@@ -135,6 +137,7 @@ class TestFlashAttentionBackendStatic:
             192,
             224,
             256,
+            512,
         ]
 
     def test_get_name(self):
@@ -230,6 +233,44 @@ class TestBuildCommonIndices:
         # positions[[0, 3]] = [0, 30]
         assert md.seq_lens.reshape(-1).tolist() == [0, 30]
 
+    def test_group_shared_staging_shares_seq_idx_only(self, cfg):
+        # One tensor object is one graph input: KV cache groups must hand the
+        # graph the same seq_idx, but each keeps its own block table.
+        group_shared: dict = {}
+        builders = [make_builder(cfg), make_builder(cfg)]
+
+        def step(positions, shared):
+            return [
+                builder.build(
+                    _cam(
+                        num_reqs=2,
+                        query_start_loc=[0, 1, 2],
+                        seq_lens=[5, 8],
+                        block_table=table,
+                    ),
+                    torch.tensor(positions),
+                    batch_pad=2,
+                    is_prefill=False,
+                    group_shared=shared,
+                )
+                for builder, table in zip(builders, [[[1], [2]], [[3], [4]]])
+            ]
+
+        mds = step([4, 7], group_shared)
+        assert mds[0].seq_lens is mds[1].seq_lens
+        assert mds[0].block_tables is not mds[1].block_tables
+        assert mds[1].block_tables.reshape(-1).tolist() == [3, 4]
+
+        # The next step overwrites the same buffer rather than allocating one.
+        next_mds = step([5, 8], group_shared)
+        assert next_mds[0].seq_lens is mds[0].seq_lens
+        assert mds[0].seq_lens.reshape(-1).tolist() == [5, 8]
+
+        # A caller without the dict, like a drafter, keeps its own buffer.
+        unshared = step([9, 9], None)
+        assert unshared[0].seq_lens is not mds[0].seq_lens
+        assert mds[0].seq_lens.reshape(-1).tolist() == [5, 8]
+
 
 class TestBuildPrefillCausal:
     def test_no_mask_and_block_tables_flattened(self, cfg):
@@ -302,10 +343,6 @@ class TestBuildPrefillNonCausal:
     def test_mask_dtype_follows_enforce_eager(
         self, cfg_noncausal, eager, expected_dtype
     ):
-        # float16 under enforce_eager, float32 otherwise. enforce_eager needs
-        # device tensors, so that case is skipped on the cpu lane.
-        if eager and not envs.VLLM_RBLN_USE_DEVICE_TENSOR:
-            pytest.skip("enforce_eager=True requires VLLM_RBLN_USE_DEVICE_TENSOR=1")
         config = (
             make_vllm_config(
                 max_model_len=MAX_LEN,
@@ -514,6 +551,230 @@ class TestBuildSlidingWindowAppend:
             make_builder(cfg_custom_kernel, sliding_window=4)
 
 
+class TestMmPrefixOnTheShiftKernel:
+    """The shift kernel takes no mask, so an mm prefix LM that may receive
+    multimodal ranges cannot run its sliding layers there."""
+
+    @staticmethod
+    def _cfg(**engine_args):
+        # Upstream clears is_mm_prefix_lm only when every modality is 0 and
+        # --enable-mm-embeds is off.
+        return make_vllm_config(
+            model="google/gemma-4-26B-A4B-it",
+            max_model_len=64,
+            block_size=64,
+            max_num_batched_tokens=64,
+            **engine_args,
+        )
+
+    @pytest.mark.parametrize(
+        "engine_args",
+        [
+            {"limit_mm_per_prompt": {"image": 1, "video": 0}},
+            {"limit_mm_per_prompt": {"image": 0, "video": 0}, "enable_mm_embeds": True},
+        ],
+        ids=["image", "mm_embeds"],
+    )
+    def test_is_refused(self, engine_args):
+        with pytest.raises(NotImplementedError, match="--limit-mm-per-prompt"):
+            make_builder(self._cfg(**engine_args), sliding_window=4, appends_kv=False)
+
+    def test_text_only_is_served(self):
+        cfg = self._cfg(limit_mm_per_prompt={"image": 0, "video": 0})
+        make_builder(cfg, sliding_window=4, appends_kv=False)
+
+    def test_the_append_kernel_is_served(self):
+        cfg = self._cfg(limit_mm_per_prompt={"image": 1, "video": 0})
+        assert make_builder(cfg, sliding_window=4).swa_appends
+
+
+class TestBuildMmPrefixSlidingWindow:
+    """The sliding-window mask of an mm prefix LM's prefill, checked by running
+    sliding_window_attention_v1's eager reference over a whole prompt chunk by
+    chunk and comparing it with dense attention under HF Gemma4's sliding rule:
+    AND(window, OR(causal, same mm prefix range))."""
+
+    WINDOW, BLOCK, HEADS, GROUPS, DIM = 8, 4, 2, 2, 32
+
+    def test_only_row_ends_are_staged(self, cfg):
+        row_ends = torch.tensor([0, 3, 3, 3, 4, 5, 6, 7])
+        md = self._builder(cfg).build(
+            _cam(num_reqs=1, query_start_loc=[0, 6], seq_lens=[6], block_table=[[1]]),
+            torch.arange(6),
+            batch_pad=1,
+            is_prefill=True,
+            mm_prefix_row_ends=row_ends,
+        )
+        assert md.swa_attn_masks is None
+        assert torch.equal(md.mm_prefix_row_ends, row_ends)
+
+    def _builder(self, cfg):
+        spec = make_attention_spec(
+            block_size=self.BLOCK,
+            num_kv_heads=self.HEADS,
+            head_size=self.DIM,
+            dtype=torch.float32,
+            sliding_window=self.WINDOW,
+        )
+        return make_builder(cfg, spec=spec)
+
+    def _dense(self, q, k, v, scale, mm_ranges):
+        n = q.size(-2)
+        query = torch.arange(n).view(-1, 1)
+        key = torch.arange(n).view(1, -1)
+        same_range = torch.zeros(n, n, dtype=torch.bool)
+        for s, e in mm_ranges:
+            same_range |= (query >= s) & (query < e) & (key >= s) & (key < e)
+        keep = (query - key < self.WINDOW) & ((query >= key) | same_range)
+        logits = (q @ k.transpose(-1, -2) * scale).masked_fill(~keep, float("-inf"))
+        return logits.softmax(-1) @ v
+
+    def _outputs(self, cfg, chunks, mm_ranges, *, padding=3, masked=True, backend=None):
+        """q, k, v, scale and each chunk's output over its padded rows."""
+        torch.manual_seed(0)
+        n = chunks[-1][1]
+        shape = (1, self.HEADS, 1, n, self.DIM)
+        q = torch.randn(1, self.HEADS, self.GROUPS, n, self.DIM)
+        k, v = torch.randn(shape), torch.randn(shape)
+        scale = torch.tensor(self.DIM**-0.5)
+        num_blocks = n // self.BLOCK + 4
+        kv_cache = torch.zeros(num_blocks, 2, self.HEADS, 1, self.BLOCK, self.DIM)
+        block_table = torch.randperm(num_blocks - 1)[: n // self.BLOCK + 2] + 1
+        builder = self._builder(cfg)
+        impl = make_impl(
+            cfg,
+            num_heads=self.HEADS * self.GROUPS,
+            num_kv_heads=self.HEADS,
+            head_size=self.DIM,
+            scale=self.DIM**-0.5,
+            sliding_window=self.WINDOW,
+        )
+        # The impl puts its scale on the configured device (the NPU in the
+        # device-tensor lane); this test runs the op's CPU reference.
+        impl.scale = impl.scale.cpu()
+        from vllm_rbln.model_executor.models.gemma4 import _build_mm_prefix_sliding_mask
+
+        layer = torch.nn.Module()
+
+        def forward(layer, query, key, value, cache, metadata, output):
+            if masked:
+                metadata.swa_attn_masks = _build_mm_prefix_sliding_mask(
+                    metadata.mm_prefix_row_ends,
+                    metadata.seq_lens,
+                    self.WINDOW,
+                    self.BLOCK,
+                    query.dtype,
+                )
+            impl.forward(layer, query, key, value, cache, metadata, output)
+            metadata.swa_attn_masks = None
+
+        if backend is not None:
+            forward = torch.compile(forward, backend=backend, fullgraph=True)
+        outputs = []
+        for s, e in chunks:
+            query_len = e - s + padding
+            # Step-local: a text or padding row ends at itself, an mm row at
+            # its range's last position.
+            row_ends = torch.arange(query_len)
+            for rs, re in mm_ranges:
+                if rs < e and re > s:
+                    assert re <= e, "a range straddles two steps"
+                    row_ends[max(rs - s, 0) : re - s] = re - 1 - s
+
+            def chunk(t, s=s, e=e, query_len=query_len):
+                pad = t.new_zeros(*t.shape[:-2], query_len - (e - s), self.DIM)
+                return torch.cat([t[..., s:e, :], pad], dim=-2)
+
+            md = builder.build(
+                _cam(
+                    num_reqs=1,
+                    query_start_loc=[0, e - s],
+                    seq_lens=[e],
+                    block_table=[block_table.tolist()],
+                ),
+                torch.arange(s, e),
+                batch_pad=1,
+                is_prefill=True,
+                mm_prefix_row_ends=row_ends,
+            )
+            assert md.swa_attn_masks is None
+            qs, ks, vs = (
+                chunk(t).reshape(-1, query_len, self.DIM).transpose(0, 1)
+                for t in (q, k, v)
+            )
+            output = torch.empty_like(qs)
+            forward(
+                layer,
+                qs,
+                ks,
+                vs,
+                kv_cache,
+                md,
+                output,
+            )
+            outputs.append(
+                output.transpose(0, 1).reshape(
+                    1, self.HEADS, self.GROUPS, query_len, self.DIM
+                )
+            )
+        return q, k, v, scale, outputs
+
+    def test_row_ends_and_start_stay_dynamic_in_one_graph(self, cfg):
+        graphs = []
+
+        def backend(graph, inputs):
+            graphs.append(graph)
+            return graph.forward
+
+        chunks = [(0, 8), (8, 16), (16, 24)]
+        ranges = [(1, 6), (10, 16)]
+        q, k, v, scale, outputs = self._outputs(cfg, chunks, ranges, backend=backend)
+        expected = self._dense(q, k, v, scale, ranges)
+        actual = torch.cat([out[..., :8, :] for out in outputs], dim=-2)
+        torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+        assert len(graphs) == 1
+
+    def _run(self, cfg, chunks, mm_ranges, *, checked=None):
+        q, k, v, scale, outputs = self._outputs(cfg, chunks, mm_ranges)
+        outputs = [out[..., : e - s, :] for out, (s, e) in zip(outputs, chunks)]
+        expected = self._dense(q, k, v, scale, mm_ranges)
+        if checked is not None:
+            # Only the chunk at that index; a single layer's cached K/V do not
+            # depend on the mask, so earlier chunks just fill the cache.
+            s, e = chunks[checked]
+            return (outputs[checked] - expected[..., s:e, :]).abs().max().item()
+        return (torch.cat(outputs, dim=-2) - expected).abs().max().item()
+
+    def test_two_ranges_in_one_chunk(self, cfg):
+        assert self._run(cfg, [(0, 4), (4, 22)], [(5, 10), (12, 20)]) < 1e-5
+
+    def test_a_range_longer_than_the_window_is_clipped_by_it(self, cfg):
+        # The grant reaches back no further than the window, as HF clips it.
+        assert self._run(cfg, [(0, 5), (5, 20), (20, 24)], [(5, 20)]) < 1e-5
+
+    def test_a_long_range_resumed_mid_way_is_still_clipped_by_the_window(self, cfg):
+        chunks = [(0, 5), (5, 20), (15, 24)]
+        assert self._run(cfg, chunks, [(5, 20)], checked=2) < 1e-5
+
+    def test_a_text_chunk_matches_the_unmasked_causal_op(self, cfg):
+        # Padded rows included: each ends at itself, as the causal op reads it.
+        chunks = [(0, 6), (6, 17)]
+        *_, masked = self._outputs(cfg, chunks, [])
+        *_, causal = self._outputs(cfg, chunks, [], masked=False)
+        for a, b in zip(masked, causal):
+            assert torch.allclose(a, b, atol=1e-6)
+
+    def test_a_full_attention_group_builds_no_mask(self, cfg):
+        md = make_builder(cfg).build(
+            _cam(num_reqs=1, query_start_loc=[0, 4], seq_lens=[4], block_table=[[1]]),
+            torch.arange(4),
+            batch_pad=1,
+            is_prefill=True,
+            mm_prefix_row_ends=torch.arange(8),
+        )
+        assert md.swa_attn_masks is None
+
+
 class TestBuildOutputAssembly:
     @pytest.mark.parametrize("is_prefill", [True, False])
     def test_is_prefill_reflected(self, cfg, is_prefill):
@@ -534,6 +795,70 @@ class TestBuildOutputAssembly:
 
 
 class TestStage:
+    @pytest.mark.use_device
+    @pytest.mark.parametrize("kind", ["full", "shift", "glm"])
+    @pytest.mark.parametrize("is_prefill", [False, True])
+    @pytest.mark.parametrize("use_custom_kernel", [False, True])
+    def test_deferred_build_preserves_tensor_values_after_staging(
+        self, monkeypatch, kind, is_prefill, use_custom_kernel
+    ):
+        from vllm.platforms import current_platform
+        from vllm.v1.kv_cache_interface import MambaSpec
+
+        from vllm_rbln.v1.attention.backends.glm5_next import (
+            RBLNGlm5NextMetadataBuilder,
+        )
+
+        config = make_vllm_config(
+            max_model_len=MAX_LEN,
+            max_num_batched_tokens=CHUNK,
+            additional_config={"use_custom_kernel": use_custom_kernel},
+            attention_config={"use_non_causal": True},
+        )
+        builder = make_builder(
+            config,
+            device=current_platform.device_type,
+            sliding_window=4 if kind == "shift" else None,
+            appends_kv=False,
+            spec=MambaSpec(block_size=4, shapes=((4, 512),), dtypes=(torch.uint8,))
+            if kind == "glm"
+            else None,
+            builder_cls=RBLNGlm5NextMetadataBuilder if kind == "glm" else None,
+        )
+        copy_tensor = Mock(wraps=builder._stage)
+        monkeypatch.setattr(builder, "_stage", copy_tensor)
+        query_len = 2 if is_prefill else 1
+        metadata = builder.build(
+            _cam(
+                num_reqs=1,
+                query_start_loc=[0, query_len],
+                seq_lens=[6],
+                block_table=[[4, 5, 6, 7]],
+            ),
+            torch.arange(query_len) + 6 - query_len,
+            batch_pad=1 if is_prefill else 2,
+            is_prefill=is_prefill,
+            num_accepted=torch.tensor([1], dtype=torch.int32),
+            mm_prefix_row_ends=torch.arange(CHUNK) if is_prefill else None,
+            defer_staging=True,
+        )
+        copy_tensor.assert_not_called()
+        originals = {
+            field.name: value
+            for field in fields(metadata)
+            if isinstance(value := getattr(metadata, field.name), torch.Tensor)
+        }
+        expected = {name: tensor.clone() for name, tensor in originals.items()}
+
+        builder.stage(metadata)
+        for tensor in originals.values():
+            tensor.zero_()
+
+        for name, tensor in expected.items():
+            staged = getattr(metadata, name)
+            assert staged.device.type == current_platform.device_type, name
+            assert torch.equal(staged.cpu(), tensor), name
+
     def test_none_passthrough(self, cfg):
         # None in -> None out; there is nothing to stage.
         assert make_builder(cfg)._stage(None, "x") is None
@@ -592,7 +917,7 @@ class TestStage:
         assert first.reshape(-1).tolist() == [10]
 
 
-@pytest.mark.maybe_use_device
+@pytest.mark.use_device
 class TestFlashImplInit:
     # __init__ validation guards and derived attributes. Each guard test sets the
     # other args valid so the intended check fires (the guards are ordered).
@@ -702,7 +1027,7 @@ class TestFlashImplInit:
         assert make_impl(cfg_square, sinks=torch.zeros(8)).is_normal is False
 
 
-@pytest.mark.maybe_use_device
+@pytest.mark.use_device
 class TestForwardSlidingWindow:
     """Which kernel a sliding-window layer reaches is carried on the metadata
     by the builder, and the two take different inputs."""
@@ -710,13 +1035,25 @@ class TestForwardSlidingWindow:
     WINDOW = 4
     HEADS, DIM = 8, 128  # make_impl defaults; num_queries_per_kv is 1
 
-    def _forward(self, cfg, monkeypatch, target, metadata):
+    def _forward(
+        self,
+        cfg,
+        monkeypatch,
+        target,
+        metadata,
+        kwargs_out=None,
+        *,
+        mm_prefix_mask=None,
+        dtype=torch.float32,
+    ):
         impl = make_impl(cfg, sliding_window=self.WINDOW)
         b_size = metadata.seq_lens.shape[0]
         recorded = []
 
         def record(*args, **kwargs):
             recorded.append(args)
+            if kwargs_out is not None:
+                kwargs_out.update(kwargs)
             return torch.zeros(b_size, self.HEADS, 1, 1, self.DIM)
 
         for name in (
@@ -727,9 +1064,10 @@ class TestForwardSlidingWindow:
             monkeypatch.setattr(
                 flash_attention, name, record if name == target else _unexpected(name)
             )
-        qkv = torch.zeros(b_size, self.HEADS, self.DIM)
+        metadata.swa_attn_masks = mm_prefix_mask
+        qkv = torch.zeros(b_size, self.HEADS, self.DIM, dtype=dtype)
         impl.forward(
-            None,  # layer: only the flash causal branch reads it
+            SimpleNamespace(),
             qkv,
             qkv,
             qkv,
@@ -788,6 +1126,50 @@ class TestForwardSlidingWindow:
         )
         assert tables.tolist() == [7, 8, 9]
         assert window == self.WINDOW
+
+    @pytest.mark.parametrize("use_mm_prefix", [False, True])
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+    def test_model_mask_is_forwarded(self, cfg, monkeypatch, use_mm_prefix, dtype):
+        md = RBLNFlashAttentionMetadata(
+            seq_lens=torch.tensor([[6]]),
+            block_tables=torch.tensor([7, 8, 9]),
+            is_prefill=True,
+            swa_appends=True,
+            mm_prefix_row_ends=torch.tensor([0]),
+        )
+        from vllm_rbln.model_executor.models.gemma4 import _build_mm_prefix_sliding_mask
+
+        model_mask = (
+            _build_mm_prefix_sliding_mask(
+                md.mm_prefix_row_ends,
+                md.seq_lens,
+                self.WINDOW,
+                self.WINDOW,
+                dtype,
+            )
+            if use_mm_prefix
+            else None
+        )
+        kwargs: dict[str, object] = {}
+        self._forward(
+            cfg,
+            monkeypatch,
+            "sliding_window_attention_v1",
+            md,
+            kwargs,
+            mm_prefix_mask=model_mask,
+            dtype=dtype,
+        )
+        assert kwargs["attn_mask"] is model_mask
+        if use_mm_prefix:
+            mask = kwargs["attn_mask"]
+            assert isinstance(mask, torch.Tensor)
+            assert mask.dtype == dtype
+            torch.testing.assert_close(
+                mask.flatten(), torch.tensor([0, 0, 0, 1, 1, 1, 1, 0], dtype=dtype)
+            )
+        else:
+            assert kwargs["attn_mask"] is None
 
     @pytest.mark.parametrize("is_prompt_sorted", [True, False])
     def test_shift_decode_mask_follows_prompt_sorting(

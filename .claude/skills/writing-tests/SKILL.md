@@ -1,6 +1,6 @@
 ---
 name: writing-tests
-description: Use when adding or modifying tests under tests/vllm/ — covers placement, the model_compile/use_device/maybe_use_device marks, the session options, and proving a new test fails before the change it covers.
+description: Use when adding or modifying tests under tests/vllm/ — covers placement, the model_compile/use_device marks, the session options, and proving a new test fails before the change it covers.
 ---
 
 # Writing tests in the vllm suite
@@ -44,11 +44,11 @@ Marks decide whether an item runs at all and whether it runs in this process or 
 | Mark               | Effect                                                                          |
 | ------------------ | ------------------------------------------------------------------------------- |
 | `model_compile`    | Whole-model compile, minutes. Skipped unless `--model-compile`. Always spawned.  |
-| `use_device`       | Always opens the NPU. Always spawned.                                            |
-| `maybe_use_device` | Opens the NPU only under device tensors. Spawned when `device_type != "cpu"`.    |
+| `use_device`       | Requires an NPU. Runs in this process unless also marked `model_compile`.         |
 | none               | Runs in this process.                                                            |
 
-Spawning is not an optimization. A test that opens the device in the parent process pins it for the rest of the session, so `use_device` and `maybe_use_device` exist to force a fresh process.
+Only whole-model compiles are isolated. Unit tests, including `use_device` tests,
+share a process and must restore any global state they change.
 
 Compiling an individual op is deliberately left unmarked so it stays in the default lane. Only a whole-model compile takes `model_compile`.
 
@@ -64,8 +64,9 @@ There is no `e2e/` directory today; four such files sit in four different subsys
 
 Read `tests/vllm/conftest.py` for the full text; the constraints that bite:
 
-- `--device-tensor {0,1}` is session-wide. `platform/__init__.py` resolves it at module scope into `RblnPlatform.device_type` and friends, so it **cannot** be parametrized per test. Run the suite once per value.
+- The suite always uses device tensors. Mark tests that open the NPU with `use_device`.
 - `--num-hidden-layers N` builds only the first N decoder layers to cut compile time, and `hf_runner` truncates to the same N so comparisons stay like-for-like. Default is 3; `0` means the whole model.
+- `--shard-count N --shard-index I` partitions selected tests by full nodeid. The index is zero-based. Spawned children run their supplied nodeids without partitioning again.
 - The suite scrubs exported `VLLM_RBLN_*` variables. These options are the way in — do not read the environment directly to get around them.
 
 ## 6. Reuse what is there

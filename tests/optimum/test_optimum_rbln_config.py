@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 from vllm.engine.arg_utils import AsyncEngineArgs
@@ -98,51 +99,124 @@ def test_a_shared_field_is_taken(parser):
 def test_a_no_flag_field_has_no_flag(parser):
     group = next(g for g in parser._action_groups if g.title == _GROUP_TITLE)
     flags = {a.dest for a in group._group_actions}
-    # vLLM already owns --max-num-batched-tokens, and the sync writes the other.
-    assert "rbln_user_max_num_batched_tokens" not in flags
     assert "rbln_attn_block_size" not in flags
 
 
-def test_a_no_flag_field_is_still_accepted():
-    """`_capture_user_max_num_batched_tokens` writes this into the dict before
-    the class exists, so resolution has to take it."""
-    config = _resolve(OptimumRBLNConfig, {"user_max_num_batched_tokens": 512})
-    assert config.user_max_num_batched_tokens == 512
-
-
-def test_the_capture_writes_only_where_this_path_reads(monkeypatch):
-    """`--max-num-batched-tokens` is captured where the path is already known.
-
-    It lands in whichever shape `additional_config` arrived as, since neither a
-    built config nor upstream's bare string takes item assignment. What the
-    other path gets is not this suite's to say; building a native config is
-    what shows that, and the whole of tests/vllm does it.
-    """
+@pytest.fixture
+def capture_engine_config(monkeypatch):
     from vllm.engine.arg_utils import EngineArgs
 
-    from vllm_rbln.platform import RblnPlatform
+    from vllm_rbln import platform
 
-    # Wrapped around a stub: building a real engine config needs a compiled
-    # model, and what is under test is what the wrapper writes before that.
-    monkeypatch.setattr(EngineArgs, "create_engine_config", lambda self: None)
+    monkeypatch.setattr(EngineArgs, "create_engine_config", lambda self: "created")
     monkeypatch.setattr(EngineArgs, "_rbln_model_impl_patched", False, raising=False)
-    RblnPlatform._capture_model_impl()
+    monkeypatch.setattr(platform.logger, "warning_once", Mock())
+    platform.RblnPlatform._capture_model_impl()
+    return EngineArgs.create_engine_config, platform.logger.warning_once
 
-    def captured(additional_config):
-        # Named rather than left at `auto`, which reads the model to pick a
-        # path and there is no model on this stub.
-        args = SimpleNamespace(
-            max_num_batched_tokens=512,
-            additional_config=additional_config,
-            model_impl="optimum",
-        )
-        EngineArgs.create_engine_config(args)
-        return args.additional_config
 
-    assert captured(None)["user_max_num_batched_tokens"] == 512
-    assert captured({"sub_block_size": 64})["user_max_num_batched_tokens"] == 512
-    assert captured(OptimumRBLNConfig()).user_max_num_batched_tokens == 512
-    assert captured("something") == "something"
+@pytest.mark.parametrize("built", [False, True])
+@pytest.mark.parametrize(
+    ("budget", "chunk", "error"),
+    [
+        (128, 256, "Conflicting prefill chunk size"),
+        (0, None, "greater than 0"),
+        (-1, None, "greater than 0"),
+        (128.5, None, "int_from_float"),
+        (float("nan"), None, "finite_number"),
+        (float("inf"), None, "finite_number"),
+    ],
+)
+def test_invalid_legacy_budget_is_rejected(
+    capture_engine_config, built, budget, chunk, error
+):
+    create_config, _ = capture_engine_config
+    config = {"prefill_chunk_size": chunk}
+    if built:
+        config = OptimumRBLNConfig(**config)
+    args = SimpleNamespace(
+        model_impl="optimum",
+        additional_config=config,
+        max_num_batched_tokens=budget,
+        create_model_config=lambda: SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"])
+        ),
+    )
+    with pytest.raises(ValueError, match=error):
+        create_config(args)
+
+
+@pytest.mark.parametrize("arch", ["WhisperForConditionalGeneration", "BertModel"])
+def test_legacy_budget_is_ignored_without_chunked_prefill(capture_engine_config, arch):
+    create_config, warning = capture_engine_config
+    args = SimpleNamespace(
+        model_impl="optimum",
+        additional_config=None,
+        max_num_batched_tokens=128,
+        create_model_config=lambda: SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=[arch])
+        ),
+    )
+    assert create_config(args) == "created"
+    assert args.additional_config is None
+    assert args.max_num_batched_tokens is None
+    warning.assert_called_once()
+
+
+@pytest.mark.parametrize("config", [None, {}, OptimumRBLNConfig()])
+def test_unset_budget_is_left_to_vllm_defaults(capture_engine_config, config):
+    create_config, warning = capture_engine_config
+    args = SimpleNamespace(
+        model_impl="optimum", additional_config=config, max_num_batched_tokens=None
+    )
+    assert create_config(args) == "created"
+    warning.assert_not_called()
+    assert args.max_num_batched_tokens is None
+    assert args.additional_config is config
+    if isinstance(config, dict):
+        assert config == {}
+
+
+def test_prefill_chunk_size_flag(parser):
+    args = parser.parse_args(["--rbln-prefill-chunk-size", "256"])
+    assert args.additional_config["prefill_chunk_size"] == [256]
+    assert _resolve(OptimumRBLNConfig, args.additional_config).prefill_chunk_size == [
+        256
+    ]
+
+
+@pytest.mark.parametrize("reverse_classes", [False, True])
+def test_prefill_chunk_cli_type_is_independent_of_class_order(
+    monkeypatch, reverse_classes
+):
+    from vllm_rbln import config
+
+    if reverse_classes:
+        monkeypatch.setattr(config, "_CONFIG_CLASSES", config._CONFIG_CLASSES[::-1])
+    parser = AsyncEngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(["--rbln-prefill-chunk-size", "256", "512"])
+    assert args.additional_config["prefill_chunk_size"] == [256, 512]
+    with pytest.raises(ValueError, match="exactly one prefill_chunk_size"):
+        _resolve(OptimumRBLNConfig, args.additional_config)
+
+
+@pytest.mark.parametrize("size", [256, [256]])
+def test_prefill_chunk_size_accepts_one_length(size):
+    config = _resolve(OptimumRBLNConfig, {"prefill_chunk_size": size})
+    assert config.prefill_chunk_size == [256]
+    assert config.single_prefill_chunk_size == 256
+
+
+@pytest.mark.parametrize("sizes", [[], [256, 512]])
+def test_prefill_chunk_size_rejects_multiple_or_missing_lengths(sizes):
+    with pytest.raises(ValueError, match="exactly one prefill_chunk_size"):
+        _resolve(OptimumRBLNConfig, {"prefill_chunk_size": sizes})
+
+
+@pytest.mark.parametrize("size", [0, -1, [0], [-1]])
+def test_invalid_prefill_chunk_size_is_rejected(size):
+    with pytest.raises(ValueError, match="greater than 0"):
+        _resolve(OptimumRBLNConfig, {"prefill_chunk_size": size})
 
 
 def test_the_former_overrides_key_is_accepted():
@@ -174,7 +248,10 @@ def test_only_compile_fields_change_the_hash():
     assert OptimumRBLNConfig(precompiled=True).compute_hash() == base
     assert OptimumRBLNConfig(num_blocks_synced=True).compute_hash() == base
     assert OptimumRBLNConfig(use_custom_sampler=False).compute_hash() == base
-    assert OptimumRBLNConfig(user_max_num_batched_tokens=512).compute_hash() != base
+    assert OptimumRBLNConfig(prefill_chunk_size=512).compute_hash() != base
+    assert OptimumRBLNConfig(prefill_chunk_size=512).compute_hash() == (
+        OptimumRBLNConfig(prefill_chunk_size=[512]).compute_hash()
+    )
     assert OptimumRBLNConfig(sub_block_size=256).compute_hash() != base
 
 

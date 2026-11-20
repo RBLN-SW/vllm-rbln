@@ -57,6 +57,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.push_scheduler 
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.push_worker import (
     RblnNixlPushConnectorWorker,
 )
+from vllm_rbln.v1.kv_cache import REMOTE_STATE_BOUNDARY, UNTRUNCATED_PROMPT_LENGTH
 
 
 @dataclass
@@ -90,6 +91,20 @@ class _Request:
         default_factory=lambda: {"do_remote_decode": True}
     )
     prompt_token_ids: list = field(default_factory=list)
+
+
+def _producer_request(num_prompt_tokens):
+    """A finished producer request, its prompt truncated by the last token."""
+    return _Request(
+        "p",
+        num_prompt_tokens=num_prompt_tokens - 1,
+        num_computed_tokens=num_prompt_tokens - 1,
+        status=RequestStatus.FINISHED_LENGTH_CAPPED,
+        kv_transfer_params={
+            "do_remote_decode": True,
+            UNTRUNCATED_PROMPT_LENGTH: num_prompt_tokens,
+        },
+    )
 
 
 def _sched_output(
@@ -379,6 +394,139 @@ class TestRequestFinished:
         assert params is not None
         assert params["do_remote_prefill"] is True
         assert "empty" not in sched._reqs_need_send
+
+
+class TestStateBoundaryExchange:
+    """A single-state SSM group also exchanges the block-boundary state a repeat
+    of the prompt can hit: an attention group, then an SSM group."""
+
+    @staticmethod
+    def _scheduler(drops_eagle_block=None):
+        sched = _scheduler()
+        if drops_eagle_block is not None:
+            sched.vllm_config.speculative_config = SimpleNamespace(
+                use_eagle_block_drop=lambda: drops_eagle_block
+            )
+        sched._is_hma_required = True
+        sched._has_mamba = True
+        sched._ssm_state_slots_are_positional = False
+        sched.blocks_per_sw = [0, 0]
+        sched._ssm_spec_blocks = [None, 0]
+        sched.kv_cache_config.transfer_groups = (
+            SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16)),
+        ) * 2
+        return sched
+
+    @pytest.mark.parametrize(
+        ("block_ids", "expected"),
+        [
+            # Producer, whole lists: the boundary block is kept, or already freed.
+            (([1, 2, 3], [0, 7, 8]), ([1, 2, 3], [7, 8])),
+            (([1, 2, 3], [0, 0, 8]), ([1, 2, 3], [8])),
+            # Consumer, unhashed lists: a boundary block allocated, or not.
+            (([4, 5, 6], [3, 9]), ([4, 5, 6], [3, 9])),
+            (([4, 5, 6], [9]), ([4, 5, 6], [9])),
+        ],
+    )
+    def test_clip_keeps_a_live_boundary_block(self, block_ids, expected):
+        assert self._scheduler().get_exchange_clipped_blocks(block_ids) == expected
+
+    def test_a_producer_records_its_prompt_length_before_the_truncation(self):
+        sched = self._scheduler()
+        params: dict = {"do_remote_decode": True}
+        req = SimpleNamespace(
+            request_id="p",
+            kv_transfer_params=params,
+            num_prompt_tokens=40,
+            prompt_token_ids=list(range(40)),
+            _all_token_ids=list(range(40)),
+            max_tokens=16,
+        )
+
+        # Called again after a preemption, which must not overwrite it.
+        sched.on_new_request(req)
+        sched.on_new_request(req)
+
+        assert req.num_prompt_tokens == 39
+        assert params[UNTRUNCATED_PROMPT_LENGTH] == 40
+
+    def test_a_consumer_pulls_into_its_boundary_block(self):
+        # The consumer reaches the clip through upstream's entry point.
+        sched = self._scheduler()
+        req = _Request("d", num_prompt_tokens=40)
+        req.kv_transfer_params = {
+            "do_remote_prefill": True,
+            "remote_block_ids": ([1, 2, 3], [7, 8]),
+            "remote_engine_id": "remote",
+            "remote_request_id": "d",
+            "remote_host": "localhost",
+            "remote_port": 5000,
+            REMOTE_STATE_BOUNDARY: 32,
+        }
+        blocks = MagicMock()
+        blocks.get_unhashed_block_ids_all_groups.return_value = ([4, 5, 6], [3, 9])
+        blocks.blocks = ([], [])
+
+        sched.update_state_after_alloc(req, blocks, 39)
+
+        assert sched._reqs_need_recv["d"][1] == ([4, 5, 6], [3, 9])
+
+    # The producer holds the prompt less its last token, while a repeat looks
+    # up from the whole prompt; the block is picked by slot, so a superseded or
+    # freed one in between never stands in for it.
+    @pytest.mark.parametrize(
+        ("num_prompt_tokens", "ssm_blocks", "sent", "boundary"),
+        [
+            (40, [6, 0, 8], [6, 8], 16),
+            (40, [6, 7, 8], [6, 8], 16),
+            (40, [0, 7, 8], [8], None),
+            (49, [6, 7, 8], [7, 8], 32),
+            (33, [7, 8], [7, 8], 16),
+            (32, [7, 8], [8], None),
+        ],
+    )
+    def test_an_eagle_producer_names_the_boundary_before_the_drop(
+        self, num_prompt_tokens, ssm_blocks, sent, boundary
+    ):
+        sched = self._scheduler(drops_eagle_block=True)
+        req = _producer_request(num_prompt_tokens)
+
+        delay, params = sched.request_finished(req, ([1, 2, 3], ssm_blocks))
+        assert delay is True
+        assert params["remote_block_ids"][1] == sent
+        assert params.get(REMOTE_STATE_BOUNDARY) == boundary
+
+    @pytest.mark.parametrize(
+        ("cls", "sends"),
+        [
+            (RblnNixlPullConnectorScheduler, True),
+            (RblnNixlPushConnectorScheduler, False),
+        ],
+    )
+    def test_only_the_pull_scheduler_exchanges_the_boundary(self, cls, sends):
+        assert cls.sends_state_boundary is sends
+
+    # No speculation, or MTP with the block drop disabled.
+    @pytest.mark.parametrize("drops_eagle_block", [None, False])
+    @pytest.mark.parametrize(
+        ("num_prompt_tokens", "ssm_blocks", "sent", "boundary"),
+        [
+            (40, [0, 7, 8], [7, 8], 32),
+            (40, [0, 0, 8], [8], None),
+            # Block-aligned: block 1 is the boundary state, block 0 superseded.
+            (33, [7, 8], [8], None),
+        ],
+    )
+    def test_producer_names_the_boundary_it_sends(
+        self, drops_eagle_block, num_prompt_tokens, ssm_blocks, sent, boundary
+    ):
+        sched = self._scheduler(drops_eagle_block)
+        req = _producer_request(num_prompt_tokens)
+
+        delay, params = sched.request_finished(req, ([1, 2, 3], ssm_blocks))
+        assert delay is True
+        assert params["remote_block_ids"][1] == sent
+        assert params.get(REMOTE_STATE_BOUNDARY) == boundary
 
 
 class TestChunkAlignedFetch:

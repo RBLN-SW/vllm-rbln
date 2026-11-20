@@ -30,15 +30,18 @@ if TYPE_CHECKING:
 
 
 def is_qwen3_embedding(model_config: "ModelConfig") -> bool:
-    """Return True if the model is the Qwen3 backbone used as an embedder.
+    """Return True if the model is the Qwen3 or Qwen3-VL backbone used as an
+    embedder.
 
-    Qwen3-Reranker also loads ``RBLNQwen3ForCausalLM`` under a pooling runner,
-    but it is scored from the generation graph rather than pooled hidden states,
-    so it is excluded here — see :func:`is_qwen3_reranker`.
+    Qwen3-Reranker and Qwen3-VL-Reranker also load the generation class under a
+    pooling runner, but they are scored from the generation graph rather than
+    pooled hidden states, so they are excluded here — see
+    :func:`is_qwen3_reranker`.
     """
     _, model_cls_name = get_rbln_model_info(model_config)
     return (
-        model_cls_name == "RBLNQwen3ForCausalLM"
+        model_cls_name
+        in ("RBLNQwen3ForCausalLM", "RBLNQwen3VLForConditionalGeneration")
         and model_config.runner_type == "pooling"
         and not is_qwen3_reranker(model_config)
     )
@@ -54,7 +57,8 @@ def forces_fp32_dtype(model_config: "ModelConfig") -> bool:
 
 def is_qwen3_reranker(model_config: "ModelConfig") -> bool:
     """
-    Return True for the original Qwen3-Reranker loaded for ``score()``.
+    Return True for the original Qwen3-Reranker or Qwen3-VL-Reranker loaded for
+    ``score()``.
     """
     if model_config.runner_type != "pooling":
         return False
@@ -73,12 +77,13 @@ def is_qwen3_reranker(model_config: "ModelConfig") -> bool:
     )
 
     architectures = getattr(hf_config, "architectures", None) or []
-    if "Qwen3ForSequenceClassification" in architectures and not has_reranker_flags:
-        raise ValueError(
-            "Serving Qwen3-Reranker through score() requires "
-            "classifier_from_token=['no', 'yes'] and "
-            "is_original_qwen3_reranker=True in hf_overrides, next to the "
-            "Qwen3ForSequenceClassification architecture. See "
-            "examples/optimum/pooling_models/qwen3_reranker_score_offline.py."
-        )
+    for arch in ("Qwen3ForSequenceClassification", "Qwen3VLForSequenceClassification"):
+        if arch in architectures and not has_reranker_flags:
+            raise ValueError(
+                "Serving Qwen3-Reranker through score() requires "
+                "classifier_from_token=['no', 'yes'] and "
+                "is_original_qwen3_reranker=True in hf_overrides, next to the "
+                f"{arch} architecture. See "
+                "examples/optimum/pooling_models/qwen3_reranker_score_offline.py."
+            )
     return has_reranker_flags
