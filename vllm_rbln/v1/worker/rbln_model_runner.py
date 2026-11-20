@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import dataclasses
+import importlib
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from contextlib import nullcontext
@@ -3866,21 +3867,55 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 self.cross_layers_kv_cache, self.cross_layers_attn_backend
             )
         else:
-            # Every layer, in layer-index order: a token-level connector (LMCache)
-            # addresses each layer through its own view, and RBLN NIXL registers
-            # storage and picks one layer per buffer. The DSA indexer scale cache
-            # stays flat for the kernels (no squeeze on a dynamic input); connectors
-            # get it as [num_blocks, block_size, 1], like the other RBLN MLA caches.
-            kv_transfer_group.register_kv_caches(
-                {
-                    name: cache.unsqueeze(-1) if cache.dim() == 2 else cache
-                    for name, cache in zip(
-                        self.kv_cache_names, self.kv_caches, strict=True
-                    )
-                }
-            )
+            kv_transfer_group.register_kv_caches(self._connector_kv_caches())
 
         kv_transfer_group.set_host_xfer_buffer_ops(self._copy_host_device_kv_blocks)
+
+    def warm_up_kv_connector_transfers(self) -> None:
+        """Build the transfer programs of `LMCacheMPConnector` on this thread.
+
+        LMCache moves RBLN KV with compiled device programs, which torch-rbln
+        builds the first time each one runs. LMCache stores on its own commit
+        worker threads, so without this the build happens there while this
+        thread runs the model. Building flips torch's process-wide export and
+        compile state, which a `torch._dynamo.disable` frame on this thread
+        then trips over, and it holds the GIL long enough to stall the forward.
+
+        The worker calls this on the thread that drives the model, after the
+        connector registration is final. An LMCache without the hook leaves the
+        build to its first transfer, as before.
+        """
+        if not has_kv_transfer_group() or self.cross_layers_kv_cache is not None:
+            return
+        connectors = iter_kv_connectors(get_kv_transfer_group())
+        if not any(type(c).__name__ == "LMCacheMPConnector" for c in connectors):
+            return
+        try:
+            platform = importlib.import_module("lmcache.v1.platform.devices.rbln")
+        except ModuleNotFoundError:
+            platform = None
+        warm_up = getattr(platform, "warm_up_kv_transfer", None)
+        if warm_up is None:
+            logger.info(
+                "The installed LMCache has no RBLN transfer warm-up; its first "
+                "transfer builds the transfer programs."
+            )
+            return
+        warm_up(self._connector_kv_caches())
+
+    def _connector_kv_caches(self) -> dict[str, torch.Tensor]:
+        """The per-layer KV caches as connectors get them.
+
+        Every layer, in layer-index order: a token-level connector (LMCache)
+        addresses each layer through its own view, and RBLN NIXL registers
+        storage and picks one layer per buffer. The DSA indexer scale cache
+        stays flat for the kernels (no squeeze on a dynamic input); connectors
+        get it as [num_blocks, block_size, 1], like the other RBLN MLA caches.
+        """
+        return {
+            name: cache.unsqueeze(-1) if cache.dim() == 2 else cache
+            for name, cache in zip(self.kv_cache_names, self.kv_caches, strict=True)
+        }
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """

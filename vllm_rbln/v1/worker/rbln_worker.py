@@ -505,6 +505,7 @@ class RBLNWorker(WorkerBase):
             if self.dynamic_kv.defers_kv_registration and has_kv_transfer_group():
                 self.model_runner.register_kv_caches_with_connector()
                 finalize_kv_cache_registrations(get_kv_transfer_group())
+                self.model_runner.warm_up_kv_connector_transfers()
             return applied
 
     @worker_fail_fast
@@ -541,6 +542,7 @@ class RBLNWorker(WorkerBase):
                     # already past the scope the executor opened.
                     with set_current_vllm_config(self.vllm_config, check_compile=False):
                         finalize_kv_cache_registrations(get_kv_transfer_group())
+                        self.model_runner.warm_up_kv_connector_transfers()
 
                 # NOTE(RBLN): the sampler warm-up and the deferred KV-cache
                 # registration above are per-rank, so ranks reach this point

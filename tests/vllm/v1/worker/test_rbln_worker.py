@@ -1146,6 +1146,7 @@ class TestCompileOrWarmUpModel:
 
         worker.model_runner = SimpleNamespace(
             warmup_model=warmup,
+            warm_up_kv_connector_transfers=lambda: calls.append("transfer warm-up"),
             kv_cache_config=SimpleNamespace(num_blocks=10),
         )
         _attach_sizer(worker)
@@ -1175,6 +1176,21 @@ class TestCompileOrWarmUpModel:
         # Identity, not just "something was set": an outer scope holding a
         # different config would satisfy a bare call.
         assert seen == [worker.vllm_config]
+
+    def test_transfer_warm_up_follows_the_finalize(self, make_worker, monkeypatch):
+        # LMCache builds its transfer programs for the caches registration
+        # settled on, on this thread, before the first request.
+        worker, calls = self._worker(make_worker, monkeypatch)
+        monkeypatch.setattr(wm, "has_kv_transfer_group", lambda: True)
+        monkeypatch.setattr(wm, "get_kv_transfer_group", lambda: "group")
+        monkeypatch.setattr(dks.DynamicKvSizer, "defers_kv_registration", False)
+        monkeypatch.setattr(
+            wm, "finalize_kv_cache_registrations", lambda g: calls.append("finalize")
+        )
+
+        worker.compile_or_warm_up_model()
+
+        assert calls == ["warmup", "finalize", "transfer warm-up"]
 
     def test_a_pending_resize_holds_the_finalize(self, make_worker, monkeypatch):
         # The dynamic-KV resize frees this cache and allocates again right
