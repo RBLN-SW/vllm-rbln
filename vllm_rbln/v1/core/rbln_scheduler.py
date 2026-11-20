@@ -183,6 +183,7 @@ class RBLNScheduler(Scheduler):
             hash_fn = get_hash_fn_by_name(self.cache_config.prefix_caching_hash_algo)
             init_none_hash(hash_fn)
 
+            spec_config = self.vllm_config.speculative_config
             self.kv_cache_manager = RBLNKVCacheManager(
                 kv_cache_config=self.kv_cache_config,
                 max_model_len=self.max_model_len,
@@ -192,6 +193,9 @@ class RBLNScheduler(Scheduler):
                 sub_block_size=sub_block_size,
                 hash_fn=hash_fn,
                 use_eagle=self.use_eagle,
+                draft_shares_target_kv=(
+                    spec_config is not None and spec_config.use_gemma4_mtp()
+                ),
                 log_stats=self.log_stats,
                 enable_kv_cache_events=self.enable_kv_cache_events,
                 dcp_world_size=self.dcp_world_size,
