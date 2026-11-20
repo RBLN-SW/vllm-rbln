@@ -28,8 +28,8 @@ import contextlib
 import functools
 import time
 
-import torch
 import rebel
+import torch
 from vllm.sequence import IntermediateTensors
 from vllm.v1.utils import record_function_or_nullcontext
 
