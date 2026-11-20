@@ -363,25 +363,13 @@ def _validate(vllm_config: "VllmConfig") -> None:
                 f"got --mamba-block-size {cache_config.mamba_block_size} and "
                 f"--block-size {block_size}."
             )
-        # GLM-5.3 takes sub-block prefix caching as upstream's fine-grained hit:
-        # a partial-tail entry at the prompt's last chunk boundary, copied on a
-        # hit. Every step ends on a chunk boundary, so the entry's step exists.
-        is_glm = model_config.hf_text_config.model_type == "glm5_next_text"
-        chunk = max(chunks)
+        # A hit below the block reads the state a step stored at the prompt's
+        # last unit boundary, and a step stores one only where it ends.
         unit = cache_config.prefix_match_unit
-        if (
-            unit is None
-            and is_glm
-            and rbln_config.enable_sub_block_cache
-            and rbln_config.sub_block_size is None
-            and chunk < block_size
-            and block_size % chunk == 0
-        ):
-            cache_config.prefix_match_unit = unit = chunk
-        if unit is not None and unit < block_size and (not is_glm or unit % chunk):
+        if unit is not None and unit < block_size and unit % max(chunks):
             raise ValueError(
-                "Prefix caching with a recurrent state hits whole KV blocks on RBLN, "
-                "or on GLM-5.3 a multiple of the prefill chunk; got "
+                "Prefix caching with a recurrent state hits a whole KV block or a "
+                "multiple of the prefill chunk on RBLN; got "
                 f"--prefix-match-unit {unit}, --block-size {block_size}, "
                 f"prefill_chunk_size={chunks}."
             )

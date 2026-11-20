@@ -549,27 +549,25 @@ class TestRejectedConfigs:
                     mamba_block_size=2 * block_size,
                 )
             )
-        chunk = _build().additional_config.max_prefill_chunk_size
-        cached = reconfigure(glm5_next(enable_prefix_caching=True))
-        assert cached.cache_config.prefix_match_unit == chunk
+        chunk = max(_build().additional_config.prefill_chunk_size)
+        # Set by the user, never derived from sub-block caching.
         assert (
             reconfigure(
-                glm5_next(enable_prefix_caching=True, prefix_match_unit=2 * chunk)
+                glm5_next(enable_prefix_caching=True)
             ).cache_config.prefix_match_unit
-            == 2 * chunk
+            is None
         )
-        with pytest.raises(ValueError, match="whole KV blocks"):
+        for unit in (chunk, 2 * chunk):
+            assert (
+                reconfigure(
+                    glm5_next(enable_prefix_caching=True, prefix_match_unit=unit)
+                ).cache_config.prefix_match_unit
+                == unit
+            )
+        with pytest.raises(ValueError, match="multiple of the prefill chunk"):
             reconfigure(
                 glm5_next(enable_prefix_caching=True, prefix_match_unit=chunk // 2)
             )
-
-        def sub_block_off(config):
-            glm5_next(enable_prefix_caching=True)(config)
-            config.additional_config = replace(
-                config.additional_config, enable_sub_block_cache=False
-            )
-
-        assert reconfigure(sub_block_off).cache_config.prefix_match_unit is None
 
         reconfigure(glm5_next(tp=4, block_size=1024))
         for tp, block_size in ((4, 2048), (1, 8192), (1, 192), (1, 160)):
@@ -808,8 +806,13 @@ class TestRejectedConfigs:
             reconfigure(
                 cached(user_specified_mamba_block_size=True, mamba_block_size=512)
             )
-        with pytest.raises(ValueError, match="whole KV blocks"):
-            reconfigure(cached(prefix_match_unit=128))
+        chunk = max(reconfigure(cached()).additional_config.prefill_chunk_size)
+        assert (
+            reconfigure(cached(prefix_match_unit=chunk)).cache_config.prefix_match_unit
+            == chunk
+        )
+        with pytest.raises(ValueError, match="multiple of the prefill chunk"):
+            reconfigure(cached(prefix_match_unit=chunk // 2))
 
     def test_gdn_prefix_caching_with_mtp_needs_retention_0(self, reconfigure, gdn):
         # As for GLM-5.3: a verify step leaves no state at the end of a block it
