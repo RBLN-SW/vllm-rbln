@@ -42,6 +42,36 @@ pytestmark = pytest.mark.usefixtures("compile_environment")
 
 
 class TestSync:
+    @pytest.mark.parametrize("block_source", ["vllm", "optimum"])
+    @pytest.mark.parametrize(
+        "architecture", ["LlamaForCausalLM", "Gemma3ForConditionalGeneration"]
+    )
+    def test_explicit_block_count_changes_cache_lookup(
+        self, monkeypatch, vllm_config_factory, block_source, architecture
+    ):
+        hf_config = PretrainedConfig(architectures=[architecture])
+        original = vllm_config_factory(hf_config=hf_config, num_gpu_blocks_override=16)
+        cache_path = Path(original.additional_config.artifact_path)
+        cache_path.mkdir(parents=True)
+        metadata = original.additional_config.compile_config.rbln_config
+        (cache_path / "rbln_config.json").write_text(json.dumps(metadata))
+        monkeypatch.setattr(
+            sync, "load_compiled_rbln_config", load_compiled_rbln_config
+        )
+
+        matching = vllm_config_factory(hf_config=hf_config, num_gpu_blocks_override=16)
+        assert matching.additional_config.precompiled
+
+        requested = vllm_config_factory(
+            hf_config=hf_config,
+            num_gpu_blocks_override=32 if block_source == "vllm" else None,
+            optimum_overrides=(
+                {"kvcache_num_blocks": 32} if block_source == "optimum" else {}
+            ),
+        )
+        assert not requested.additional_config.precompiled
+        assert requested.additional_config.artifact_path != str(cache_path)
+
     @pytest.mark.parametrize(
         "num_blocks, override_blocks",
         [(None, 16), (16, None), (16, 16), (None, 0), (None, None)],

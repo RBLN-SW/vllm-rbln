@@ -54,9 +54,7 @@ logger = init_logger(__name__)
 # Keys that affect only loading the compiled model, not the compiled binary,
 # and therefore must be stripped before hashing so the same compiled artifact
 # is shared between compile-only and inference invocations.
-_LOAD_ONLY_KEYS: frozenset[str] = frozenset(
-    {"create_runtimes", "device", "kvcache_num_blocks"}
-)
+_LOAD_ONLY_KEYS: frozenset[str] = frozenset({"create_runtimes", "device"})
 
 
 def _strip_load_only_keys(obj: dict) -> dict:

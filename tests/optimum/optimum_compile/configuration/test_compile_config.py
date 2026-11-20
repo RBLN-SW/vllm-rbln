@@ -396,7 +396,7 @@ class TestCompileCacheName:
         cfg.model_config.hf_config.num_hidden_layers = 1
         assert compile_cache_name(cfg.additional_config.compile_config) == original
 
-    @pytest.mark.parametrize("key", ["device", "create_runtimes", "kvcache_num_blocks"])
+    @pytest.mark.parametrize("key", ["device", "create_runtimes"])
     def test_load_only_options_do_not_change_the_key(self, key, vllm_config_factory):
         cfg = vllm_config_factory()
         original = compile_cache_name(cfg.additional_config.compile_config)
