@@ -59,37 +59,43 @@ def counts_text(counts):
 
 
 def build_report(results, *, run_id, chip, build_url, branch, commit):
-    pipelines = ROOT / ".buildkite/pipelines/vllm-rbln"
-    pytest = yaml.safe_load((pipelines / "pipeline-pytest.yml").read_text())
+    plan_path = results / "pytest-plan.json"
     nightly = yaml.safe_load((ROOT / ".buildkite/vllm-rbln-nightly.yml").read_text())
-    test_steps = list(command_steps(pytest["steps"]))
-    degraded = False
+    degraded = not plan_path.is_file()
     tests = []
-    for label, prefix in (("unit", "vllm-rbln-pytest-"), ("e2e", "vllm-rbln-e2e-")):
-        counts = Counter()
-        missing = incomplete = unsuccessful = 0
-        for step in (step for step in test_steps if step["key"].startswith(prefix)):
-            key = step["key"]
-            # Downloads omit retried jobs; job directories contain current shards.
-            paths = list((results / "pytest-results" / key).glob("*/result.json"))
-            missing += max(int(step.get("parallelism", 1)) - len(paths), 0)
-            for path in paths:
-                result = json.loads(path.read_text())
-                if result["exit_code"] is None:
-                    incomplete += 1
-                    continue
-                counts.update(result["counts"])
-                unsuccessful += result["exit_code"] != 0
-        text = counts_text(counts)
-        for count, status in (
-            (missing, "missing"),
-            (incomplete, "incomplete"),
-            (unsuccessful, "unsuccessful"),
+    if plan_path.is_file():
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        test_steps = list(command_steps(plan["steps"]))
+        for label, prefix in (
+            ("unit", "vllm-rbln-pytest-"),
+            ("e2e", "vllm-rbln-e2e-"),
         ):
-            if count:
-                text += f" / {count} jobs {status}"
-        degraded |= bool(missing or incomplete or unsuccessful)
-        tests.append(f"- {label}: {text}")
+            counts = Counter()
+            missing = incomplete = unsuccessful = 0
+            for step in (step for step in test_steps if step["key"].startswith(prefix)):
+                key = step["key"]
+                # Downloads omit retried jobs; job directories contain current shards.
+                paths = list((results / "pytest-results" / key).glob("*/result.json"))
+                missing += max(int(step.get("parallelism", 1)) - len(paths), 0)
+                for path in paths:
+                    result = json.loads(path.read_text())
+                    if result["exit_code"] is None:
+                        incomplete += 1
+                        continue
+                    counts.update(result["counts"])
+                    unsuccessful += result["exit_code"] != 0
+            text = counts_text(counts)
+            for count, status in (
+                (missing, "missing"),
+                (incomplete, "incomplete"),
+                (unsuccessful, "unsuccessful"),
+            ):
+                if count:
+                    text += f" / {count} jobs {status}"
+            degraded |= bool(missing or incomplete or unsuccessful)
+            tests.append(f"- {label}: {text}")
+    else:
+        tests.append("- pytest: missing job plan")
 
     counts = Counter()
     missing = 0
@@ -388,17 +394,18 @@ def main():
                 parser.error("buildkite-agent is required to download artifacts")
             results = Path(temporary)
             for pattern in (
+                "pytest-plan.json",
                 "pytest-results/**/result.json",
                 "example-results/**/results.json",
                 f"perf-results/{args.run_id}/{args.chip}/**/result.json",
                 f"sampler-perf-results/{args.run_id}/{args.chip}/manifest.json",
                 f"ci-targets/{args.run_id}/snapshot.tar.gz",
             ):
-                scope = (
-                    ["--step", "nightly-targets-prepare"]
-                    if pattern.startswith("ci-targets/")
-                    else []
-                )
+                scope = []
+                if pattern == "pytest-plan.json":
+                    scope = ["--step", "nightly-pytest"]
+                if pattern.startswith("ci-targets/"):
+                    scope = ["--step", "nightly-targets-prepare"]
                 found = subprocess.run(
                     [
                         agent,

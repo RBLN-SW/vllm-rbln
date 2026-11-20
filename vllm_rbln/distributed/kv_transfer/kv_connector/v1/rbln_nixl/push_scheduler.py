@@ -32,6 +32,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_scheduler 
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
     RblnNixlConnectorMetadata,
 )
+from vllm_rbln.v1.kv_cache import REMOTE_STATE_BOUNDARY, prompt_boundary_block
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
@@ -69,6 +70,40 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
         self._early_sent: set[ReqId] = set()
         # Tokens each handed-over request holds, for the worker's `_tail_chunks`.
         self._valid_tokens: dict[ReqId, int] = {}
+
+    def get_num_new_matched_tokens(
+        self, request: "Request", num_computed_tokens: int
+    ) -> tuple[int, bool]:
+        """Name the boundary state a consumer is about to receive.
+
+        NOTE(RBLN): on the read path the producer names it once it has finished;
+        a writer's consumer allocates first, so it derives the same boundary
+        from the prompt and the token count both ends transfer. The compatibility
+        hash guarantees the producer decided the same way and carries it.
+        """
+        count, load_async = super().get_num_new_matched_tokens(
+            request, num_computed_tokens
+        )
+        if not load_async or not self.sends_state_boundary or not self._has_mamba:
+            return count, load_async
+        (block_size,) = {
+            group.kv_cache_spec.block_size
+            for i, group in enumerate(self.kv_cache_config.transfer_groups)
+            if self._ssm_spec_blocks[i] is not None
+        }
+        block_idx = prompt_boundary_block(
+            request.num_prompt_tokens,
+            num_computed_tokens + count,
+            block_size,
+            self._drops_eagle_block,
+        )
+        if block_idx is not None:
+            # Upstream loads asynchronously only for a `do_remote_prefill` one.
+            assert request.kv_transfer_params is not None
+            request.kv_transfer_params[REMOTE_STATE_BOUNDARY] = (
+                block_idx + 1
+            ) * block_size
+        return count, load_async
 
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
@@ -229,4 +264,14 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
             # here because it is the one that matches the handed-over blocks.
             if self._sends_token_count:
                 self._valid_tokens[request.request_id] = request.num_computed_tokens
+            if self._has_mamba:
+                # Upstream files one clipped list in three places; a consumer
+                # registering a boundary state pairs only with the true one.
+                assert out_params is not None
+                sent, _ = self._select_boundary_states(
+                    request, block_ids, out_params["remote_block_ids"]
+                )
+                out_params["remote_block_ids"] = sent
+                self._finished_request_blocks[request.request_id] = sent
+                self._newly_finished_push_blocks[request.request_id] = sent
         return delay_free_blocks, out_params

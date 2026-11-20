@@ -1803,6 +1803,7 @@ class TestPublishHandshakeMetadata:
         base_meta=None,
         swa_kernel_blocks=frozenset(),
         slice_ids=None,
+        push_boundary_state=False,
         block_state_layers=(),
         speculative_config=None,
     ):
@@ -1819,7 +1820,7 @@ class TestPublishHandshakeMetadata:
         w.transfer_topo.cross_layers_blocks = cross_layers
         w._has_mamba = has_mamba
         w._block_state_layers = set(block_state_layers)
-        window_mode(w, None, has_swa=False)
+        window_mode(w, None, has_swa=False, push_boundary_state=push_boundary_state)
         w._swa_kernel_blocks = set(swa_kernel_blocks)
         w.use_mla = False
         # Chiplet geometry travels with the metadata so a consumer with a
@@ -1892,6 +1893,24 @@ class TestPublishHandshakeMetadata:
             "BASE",
             writes_into_peer=True,
             cross_layers_blocks=False,
+            push_boundary_state=False,
+            exchanges_block_state=False,
+        )
+
+    def test_a_writer_publishes_push_boundary_state(self):
+        # The hash is what refuses a peer with the other setting at handshake.
+        w = self._publish(
+            pp_rank=0,
+            pp_size=1,
+            layer_names=["l0"],
+            cls=RblnNixlPushConnectorWorker,
+            push_boundary_state=True,
+        )
+        assert w.compat_hash == rbln_compat_hash(
+            "BASE",
+            writes_into_peer=True,
+            cross_layers_blocks=False,
+            push_boundary_state=True,
             exchanges_block_state=False,
         )
 
@@ -2012,6 +2031,7 @@ class TestPublishHandshakeMetadata:
             "BASE",
             writes_into_peer=False,
             cross_layers_blocks=False,
+            push_boundary_state=False,
             exchanges_block_state=False,
         )
         assert w.xfer_handshake_metadata.compatibility_hash == w.compat_hash

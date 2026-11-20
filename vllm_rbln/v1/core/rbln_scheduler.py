@@ -247,8 +247,8 @@ class RBLNScheduler(Scheduler):
         self._is_mm_prefix_lm = self.vllm_config.model_config.is_mm_prefix_lm
 
         # NOTE(RBLN): a prompt's block-boundary state is kept by a producer and
-        # allocated by a consumer only where the connector exchanges it. The
-        # connector may sit in a MultiConnector.
+        # allocated by a consumer only where the connector scheduler exchanges
+        # it (`sends_state_boundary`). The connector may sit in a MultiConnector.
         sends_state_boundary = self.connector is not None and any(
             getattr(
                 getattr(leaf, "connector_scheduler", None),

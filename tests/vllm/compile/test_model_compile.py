@@ -64,7 +64,7 @@ def test_compile_and_generate(
         assert token_ids, f"{spec.test_id} rank{rank} compiled but generated no tokens"
 
 
-@pytest.mark.model_compile
+@pytest.mark.model_compile(npu_count=1)
 @pytest.mark.timeout(_TIMEOUT_S, method="thread")
 @pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
 def test_minimax_m3_small_config_compiles_and_generates(
