@@ -16,6 +16,7 @@
 # target, so greedy output with a method ON must equal spec OFF. Covers ngram,
 # suffix, eagle, eagle3, medusa and mtp.
 
+import json
 import warnings
 from typing import Any
 
@@ -24,7 +25,7 @@ from vllm import SamplingParams
 from vllm.config import SpeculativeConfig
 from vllm.inputs import TokensPrompt
 
-from tests.vllm.utils import check_outputs_almost_equal
+from tests.vllm.utils import TokensTextLogprobs, check_outputs_almost_equal
 from tests.vllm.v1.spec_decode.utils import (
     _DRAFT,
     MEDUSA_DRAFT,
@@ -32,6 +33,7 @@ from tests.vllm.v1.spec_decode.utils import (
     TARGET_MODEL,
 )
 from tests.vllm.vllm_config import local_weights_path
+from vllm_rbln import envs
 
 # A small, compilable target for the draft-free methods; ngram/suffix speculate
 # by matching repeats, so the prompt is deliberately repetitive.
@@ -103,8 +105,6 @@ _EXPECT_ACCEPTANCE = {"ngram", "suffix", "eagle", "eagle3", "mtp"}
 
 @pytest.fixture(autouse=True)
 def _pin_layers(request, monkeypatch):
-    from vllm_rbln import envs
-
     method = request.node.callspec.params["method"]
     num_layers = envs.VLLM_RBLN_NUM_HIDDEN_LAYERS
     if method == "mtp" and 0 < num_layers < 8:
@@ -137,10 +137,15 @@ def _pin_layers(request, monkeypatch):
     monkeypatch.setattr(SpeculativeConfig, "__post_init__", post_init)
 
 
+@pytest.fixture(scope="module")
+def reference_outputs() -> dict[tuple[str, str, int, str], list[TokensTextLogprobs]]:
+    return {}
+
+
 @pytest.mark.model_compile
 @pytest.mark.parametrize("method", SPEC_METHODS)
 def test_speculative_decoding_matches_reference(
-    vllm_runner, method: str, whole_model: bool
+    vllm_runner, method: str, whole_model: bool, reference_outputs
 ) -> None:
     target, extra_kwargs, spec_config = SPEC_METHODS[method]
     if draft := spec_config.get("model"):
@@ -149,24 +154,30 @@ def test_speculative_decoding_matches_reference(
 
     # The reference sampler, on both runs: the RBLN one compiles a graph of its
     # own, and acceptance is being compared, not sampler implementations.
-    extra_kwargs = dict(extra_kwargs)
-    reference_sampler = {
-        "use_custom_sampler": False,
-        **extra_kwargs.pop("additional_config", {}),
+    engine_kwargs = {
+        **extra_kwargs,
+        "additional_config": {
+            "use_custom_sampler": False,
+            **extra_kwargs.get("additional_config", {}),
+        },
     }
-
-    with vllm_runner(
-        target, **extra_kwargs, additional_config=reference_sampler
-    ) as ref_model:
-        ref_outputs = ref_model.generate_greedy_logprobs(
-            [prompt], MAX_TOKENS, NUM_LOGPROBS
-        )
+    reference_key = (
+        target,
+        prompt,
+        envs.VLLM_RBLN_NUM_HIDDEN_LAYERS,
+        json.dumps(engine_kwargs, sort_keys=True),
+    )
+    if reference_key not in reference_outputs:
+        with vllm_runner(target, **engine_kwargs) as ref_model:
+            outputs = ref_model.generate_greedy_logprobs(
+                [prompt], MAX_TOKENS, NUM_LOGPROBS
+            )
+        reference_outputs[reference_key] = outputs
 
     with vllm_runner(
         target,
-        **extra_kwargs,
+        **engine_kwargs,
         speculative_config=spec_config,
-        additional_config=reference_sampler,
     ) as spec_model:
         spec_outputs = spec_model.generate_greedy_logprobs(
             [prompt], MAX_TOKENS, NUM_LOGPROBS
@@ -178,7 +189,7 @@ def test_speculative_decoding_matches_reference(
     # verifies K+1 tokens in one target pass where the reference decodes one at
     # a time, so the two differ by rounding. Only near-tie flips are tolerated.
     check_outputs_almost_equal(
-        outputs_0_lst=ref_outputs,
+        outputs_0_lst=reference_outputs[reference_key],
         outputs_1_lst=spec_outputs,
         name_0="reference",
         name_1=f"spec:{method}",
@@ -226,7 +237,10 @@ def test_sampled_speculative_decoding_stays_in_the_top_k(
         for i, token in enumerate(o.outputs[0].token_ids)
     ]
     with vllm_runner(
-        SAMPLED_TARGET, max_num_seqs=4, max_logprobs=2 * DEFAULT_TOP_K
+        SAMPLED_TARGET,
+        max_num_seqs=4,
+        max_logprobs=2 * DEFAULT_TOP_K,
+        additional_config={"use_custom_sampler": False},
     ) as ref_model:
         ranked = ref_model.llm.generate(
             [TokensPrompt(prompt_token_ids=prefix) for prefix, _, _ in checks],
