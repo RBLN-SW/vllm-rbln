@@ -2722,3 +2722,109 @@ class TestStateBoundaryAdmission:
             probe.block_hashes, 39
         )
         assert hit == (32 if failure is None else 0)
+
+
+class TestFineGrainedPrefixHit:
+    """An align-mode hybrid with prefix_match_unit (16) below block_size (64)
+    resumes a longer sibling of a prompt at the prompt's last 16-token boundary."""
+
+    @staticmethod
+    def _scheduler(num_speculative_tokens=None):
+        from vllm.v1.core.single_type_kv_cache_manager import (
+            register_all_kvcache_specs,
+        )
+        from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec
+
+        from vllm_rbln.platform import RblnPlatform
+        from vllm_rbln.v1.kv_cache import RBLNMambaSpec
+
+        register_all_kvcache_specs(None)
+        RblnPlatform.register_custom_kv_cache_specs(None)
+        full = full_attention_spec(64)
+        state = RBLNMambaSpec(
+            block_size=64,
+            shapes=((full.page_size_bytes,),),
+            dtypes=(torch.uint8,),
+            mamba_cache_mode="align",
+        )
+        config = KVCacheConfig(
+            num_blocks=64,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(["attn"], full),
+                KVCacheGroupSpec(["state"], state),
+            ],
+            prefix_cache_retention_interval=0,
+        )
+        return create_rbln_scheduler(
+            enable_prefix_caching=True,
+            block_size=64,
+            max_num_batched_tokens=16,
+            max_model_len=256,
+            num_blocks=64,
+            kv_cache_config=config,
+            hash_block_size=16,
+            num_speculative_tokens=num_speculative_tokens,
+        )
+
+    @staticmethod
+    def _step(sched):
+        out = sched.schedule()
+        req_ids = list(out.num_scheduled_tokens)
+        # A chunk that ends inside the prompt samples nothing; schedule() has
+        # already advanced num_computed_tokens.
+        done = {
+            r
+            for r in req_ids
+            if sched.requests[r].num_computed_tokens
+            >= sched.requests[r].num_prompt_tokens
+        }
+        sched.update_from_output(
+            out,
+            ModelRunnerOutput(
+                req_ids=req_ids,
+                req_id_to_index={r: i for i, r in enumerate(req_ids)},
+                sampled_token_ids=[[7] if r in done else [] for r in req_ids],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+        return out
+
+    def _run(self, sched, req_id, prompt):
+        sched.add_request(make_request(req_id, prompt, 16, max_tokens=1))
+        copies: list = []
+        while req_id in sched.requests:
+            out = self._step(sched)
+            copies += out.kv_cache_block_copies or []
+        return copies
+
+    def test_the_copies_a_mid_block_hit_needs_reach_the_runner(self):
+        sched = self._scheduler()
+        prompt = list(range(100, 140))
+        # The prompt's state at token 32 is copied out of the block the next
+        # chunk keeps running in.
+        assert self._run(sched, "first", prompt)
+
+        sched.add_request(make_request("sibling", prompt + [1] * 20, 16, max_tokens=1))
+        out = self._step(sched)
+        assert sched.requests["sibling"].num_computed_tokens == 32 + 16
+        assert out.kv_cache_block_copies
+
+    # An EAGLE/MTP drafter resumes one unit below the prompt's last boundary:
+    # 84 tokens resume at 64, a block boundary, and 100 at 80, inside block 1.
+    @pytest.mark.parametrize(("prompt_len", "hit"), [(84, 64), (100, 80)])
+    def test_an_eagle_sibling_resumes_one_unit_below_the_prompt_tail(
+        self, monkeypatch, prompt_len, hit
+    ):
+        from vllm.config import SpeculativeConfig
+
+        monkeypatch.setattr(SpeculativeConfig, "use_eagle", lambda self: True)
+        sched = self._scheduler(num_speculative_tokens=1)
+        prompt = list(range(100, 100 + prompt_len))
+        self._run(sched, "first", prompt)
+
+        sched.add_request(make_request("sibling", prompt + [1] * 20, 16, max_tokens=1))
+        self._step(sched)
+        assert sched.requests["sibling"].num_computed_tokens == hit + 16

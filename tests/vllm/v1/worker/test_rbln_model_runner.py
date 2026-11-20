@@ -37,6 +37,7 @@ from vllm.distributed.ec_transfer.ec_connector.base import (
 from vllm.multimodal.inputs import PlaceholderRange
 from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheTensor
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
@@ -737,6 +738,7 @@ class TestEcConsumer:
         scheduler_output = SimpleNamespace(
             total_num_scheduled_tokens=0,
             kv_cache_copy_ops=None,
+            kv_cache_block_copies=None,
             ec_connector_metadata=ECConnectorMetadata(),
             finished_req_ids=set(),
         )
@@ -1789,6 +1791,24 @@ class TestProcessKvCacheCopyOps:
         r._process_kv_cache_copy_ops([KVCacheCopyOp(0, 5, 6, 4)])
         assert calls == [(5, 6, 4)]
 
+    def test_a_block_copy_moves_the_whole_page_of_every_cache(self, monkeypatch):
+        monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", True)
+        latent = torch.zeros(4, 8, 2)
+        state = torch.zeros(3, 4, 5)  # blocks on axis 1
+        latent[1] = 7.0
+        state[:, 1] = 3.0
+        r = _make_runner_stub(
+            kv_caches=[latent, state],
+            kv_cache_names=["latent", "state"],
+            kv_cache_block_axes={"latent": 0, "state": 1},
+            model_config=SimpleNamespace(use_mla=True, enforce_eager=True),
+        )
+        r._copy_kv_cache_blocks([KVCacheBlockCopy(src_block_id=1, dst_block_id=2)])
+        assert (latent[2] == 7.0).all()
+        assert (state[:, 2] == 3.0).all()
+        assert torch.count_nonzero(latent[[0, 3]]) == 0
+        assert torch.count_nonzero(state[:, [0, 3]]) == 0
+
 
 def _empty_cached():
     return SimpleNamespace(
@@ -2652,6 +2672,7 @@ class TestExecuteModelRecoversADeferredLoad:
             total_num_scheduled_tokens=0,
             kv_connector_metadata="META",
             kv_cache_copy_ops=None,
+            kv_cache_block_copies=None,
         )
 
     def test_the_held_read_is_issued_before_the_connector_step(self, monkeypatch):
@@ -2760,6 +2781,7 @@ class TestExecuteModelFlushesAfterTheSubmission:
             num_scheduled_tokens={"r0": 1},
             kv_connector_metadata="META",
             kv_cache_copy_ops=None,
+            kv_cache_block_copies=None,
         )
 
         runner.execute_model(scheduler_output)
@@ -2855,6 +2877,7 @@ class TestExecuteModelMmPrefixRowEnds:
                     req_ids=["r0"], num_computed_tokens=[computed]
                 ),
                 kv_cache_copy_ops=None,
+                kv_cache_block_copies=None,
             )
         )
         return seen[0]

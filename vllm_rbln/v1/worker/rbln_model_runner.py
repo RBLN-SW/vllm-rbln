@@ -59,6 +59,7 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
 )
 from vllm.v1.attention.backends.utils import create_fast_prefill_custom_backend
+from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.core.sched.output import (
     GrammarOutput,
     NewRequestData,
@@ -2083,6 +2084,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             # pass so that partially cached blocks are populated.
             if scheduler_output.kv_cache_copy_ops:
                 self._process_kv_cache_copy_ops(scheduler_output.kv_cache_copy_ops)
+            if scheduler_output.kv_cache_block_copies:
+                self._copy_kv_cache_blocks(scheduler_output.kv_cache_block_copies)
 
             if not num_scheduled_tokens:
                 if not has_kv_transfer_group():
@@ -4333,6 +4336,29 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             direction,
             block_axes=self.kv_cache_block_axes,
         )
+
+    def _copy_kv_cache_blocks(self, copies: list[KVCacheBlockCopy]) -> None:
+        """Upstream's copy-on-write of a block a partial prefix hit privatizes.
+
+        A copy names a block, not its group, and every group indexes the one
+        block pool, so each cache copies the page; a page another group owns is
+        unused by its own group there.
+        """
+        assert use_device_tensor() or self.model_config.enforce_eager
+        dsts: list[torch.Tensor] = []
+        srcs: list[torch.Tensor] = []
+        seen: set[int] = set()
+        for layer_name, kv_cache in zip(
+            self.kv_cache_names, self.kv_caches, strict=True
+        ):
+            if kv_cache.data_ptr() in seen:
+                continue
+            seen.add(kv_cache.data_ptr())
+            axis = self.kv_cache_block_axes[layer_name]
+            for block_copy in copies:
+                dsts.append(kv_cache.select(axis, block_copy.dst_block_id))
+                srcs.append(kv_cache.select(axis, block_copy.src_block_id))
+        torch._foreach_copy_(dsts, srcs)
 
     def _process_kv_cache_copy_ops(
         self,
