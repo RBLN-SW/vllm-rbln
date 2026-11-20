@@ -397,14 +397,11 @@ def test_aux_cache_flags_and_an_unallocated_draft(monkeypatch):
         "model.layers.1.self_attn.attn.2": (True, False),
         "model.layers.1.self_attn.attn.3": (False, False),
     }
-    # A strict producer leaves the drafts unallocated, with no layer index.
     draft = context["model.layers.0.self_attn.attn.3"]
-    draft.layer_index = None
+    metadata = SimpleNamespace(kv_cache_positions={draft.owner: 0})
     with (
-        set_forward_context({draft.owner: None}, config),
-        pytest.raises(
-            AssertionError, match="KV cache has not been bound by the runner"
-        ),
+        set_forward_context({draft.owner: metadata}, config),
+        pytest.raises(KeyError, match=draft.prefix),
     ):
         draft.inputs()
 

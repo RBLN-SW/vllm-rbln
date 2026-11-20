@@ -481,7 +481,7 @@ class RBLNGemma4ForConditionalGeneration(
                     metadata.mm_prefix_row_ends,
                     metadata.seq_lens,
                     layer.sliding_window,
-                    _resolve_kv_cache(metadata, layer.layer_index).size(-2),
+                    _resolve_kv_cache(metadata, layer.layer_name).size(-2),
                     self.model_dtype,
                 )
                 # Workaround: borrow metadata without mutating Attention modules.

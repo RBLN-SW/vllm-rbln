@@ -188,8 +188,10 @@ def attach_kv_cache_bindings(
     kv_caches: list[torch.Tensor] | None,
     kv_cache_bases: list[torch.Tensor] | None,
     kv_cache_view_infos: list[KVCacheViewInfo] | None,
+    kv_cache_positions: dict[str, int],
 ) -> None:
     """Attach either per-layer KV views or deduplicated bases to metadata."""
+    attn_metadata.kv_cache_positions = kv_cache_positions
     if kv_cache_bases and kv_cache_view_infos:
         attn_metadata.kv_caches = None
         attn_metadata.kv_cache_view_infos = kv_cache_view_infos

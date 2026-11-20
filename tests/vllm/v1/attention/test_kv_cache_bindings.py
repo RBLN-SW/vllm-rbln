@@ -397,6 +397,7 @@ class TestAttachKvCacheBindings:
             kv_caches=[torch.zeros(1)],
             kv_cache_bases=[torch.zeros(1)],
             kv_cache_view_infos=infos,
+            kv_cache_positions={_layer(0): 0},
         )
         assert md.kv_caches is None
         assert md.kv_cache_view_infos is infos
@@ -406,7 +407,11 @@ class TestAttachKvCacheBindings:
         md = types.SimpleNamespace()
         caches = [torch.zeros(1)]
         attach_kv_cache_bindings(
-            md, kv_caches=caches, kv_cache_bases=None, kv_cache_view_infos=None
+            md,
+            kv_caches=caches,
+            kv_cache_bases=None,
+            kv_cache_view_infos=None,
+            kv_cache_positions={_layer(0): 0},
         )
         assert md.kv_caches is caches
         assert md.kv_cache_view_infos is None
@@ -421,6 +426,7 @@ class TestAttachKvCacheBindings:
             kv_caches=caches,
             kv_cache_bases=[torch.zeros(1)],
             kv_cache_view_infos=None,
+            kv_cache_positions={_layer(0): 0},
         )
         assert md.kv_caches is caches
         assert md.kv_cache_view_infos is None

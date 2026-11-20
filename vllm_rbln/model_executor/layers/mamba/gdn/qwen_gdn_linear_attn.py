@@ -59,8 +59,6 @@ class RBLNGDNBlockAuxCache(nn.Module, AttentionLayerBase):
         self.prefix_cacheable = prefix_cacheable
         self.verify_only = verify_only
         self.kv_cache = torch.tensor([])
-        # Index among the graph's KV cache inputs, assigned by the runner.
-        self.layer_index: int | None = None
         context = get_current_vllm_config().compilation_config.static_forward_context
         ensure_kv_cache_registration(context, prefix, self, subindex=subindex)
 
@@ -83,7 +81,7 @@ class RBLNGDNBlockAuxCache(nn.Module, AttentionLayerBase):
 
     def inputs(self) -> torch.Tensor:
         metadata = get_forward_context().attn_metadata[self.owner]
-        return _resolve_kv_cache(metadata, self.layer_index)
+        return _resolve_kv_cache(metadata, self.prefix)
 
 
 class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
@@ -109,8 +107,6 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 f"values, a multiple of {STATE_LANES}, got {self.head_k_dim} / "
                 f"{self.head_v_dim}"
             )
-        # Index among the graph's KV cache inputs, assigned by the runner.
-        self.layer_index: int | None = None
         model_config = vllm_config.model_config
         self.num_kv_heads = model_config.get_num_kv_heads(vllm_config.parallel_config)
         self.kv_head_size = model_config.get_head_size()
@@ -182,7 +178,7 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             f"the step's batch {batch}"
         )
         seq_len = num_tokens // batch
-        state = _resolve_kv_cache(metadata, self.layer_index)
+        state = _resolve_kv_cache(metadata, self.prefix)
         ring = self.conv_ring.inputs()
         tp_size = self.tp_size
         num_k_heads = self.num_k_heads // tp_size

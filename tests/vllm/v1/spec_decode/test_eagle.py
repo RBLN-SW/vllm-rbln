@@ -55,10 +55,6 @@ def _neutralize(monkeypatch):
     monkeypatch.setattr(
         eagle_module, "set_forward_context", lambda *a, **k: nullcontext()
     )
-    monkeypatch.setattr(eagle_module, "attach_kv_cache_bindings", lambda *a, **k: None)
-    monkeypatch.setattr(
-        eagle_module, "build_kv_cache_forward_context_kwargs", lambda *a, **k: {}
-    )
 
 
 def _wire_runner(
@@ -70,9 +66,8 @@ def _wire_runner(
         is_intermediate_chunked_prefill=intermediate_chunk,
         is_strict_kv_producer=strict_kv_producer,
         input_batch=SimpleNamespace(num_reqs=num_reqs),
-        kv_caches=[],
-        kv_cache_bases=[],
-        kv_cache_view_infos=[],
+        bind_kv_cache_to_metadata=lambda metadata: None,
+        kv_cache_forward_context_kwargs=dict,
         shape_config=_shape_config(),
         dp_status=None,
         decode_back_pad=torch.zeros(num_reqs, dtype=torch.int32),
@@ -1076,9 +1071,8 @@ class TestDummyRun:
                     )
                 ],
             ),
-            kv_caches=[],
-            kv_cache_bases=[],
-            kv_cache_view_infos=[],
+            bind_kv_cache_to_metadata=lambda metadata: None,
+            kv_cache_forward_context_kwargs=dict,
             shape_config=_shape_config(specialized=specialized),
             dp_status=dp_status,
             sort_batch_by_length=False,

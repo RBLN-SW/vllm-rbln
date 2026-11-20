@@ -30,7 +30,7 @@ block ids, the ring's channels in the delta-rule kernels' key-head order
 (`grouped_qkv_rows`).
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 from vllm.v1.attention.backend import AttentionBackend, CommonAttentionMetadata
@@ -90,9 +90,10 @@ class RBLNGDNAttentionMetadata(GDNAttentionMetadata):
     # [batch] int32 on the device under MTP: how many drafts of each row's
     # previous step were accepted, which the verify kernel replays.
     num_accepted: torch.Tensor | None = None
-    # Attached by the runner (attach_kv_cache_bindings), as on the flash metadata.
+    # Attached by the runner, as on the flash metadata.
     kv_caches: list[torch.Tensor] | None = None
     kv_cache_view_infos: list[KVCacheViewInfo] | None = None
+    kv_cache_positions: dict[str, int] = field(default_factory=dict, kw_only=True)
 
     @property
     def is_prefill(self) -> bool:

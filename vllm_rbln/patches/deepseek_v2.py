@@ -155,8 +155,7 @@ def patched_deepseek_v2_attention_forward(
     target="vllm.model_executor.models.deepseek_v2.DeepseekV32IndexerCache.__init__",
     reason=(
         "Upstream uses a CUDA indexer cache layout and has no companion scale "
-        "cache for RBLN fp8 keys; RBLN also needs a cache index assigned by the "
-        "runner after allocation."
+        "cache for RBLN fp8 keys."
     ),
 )
 def rbln_indexer_cache_init(self, *args, **kwargs) -> None:
@@ -170,7 +169,6 @@ def rbln_indexer_cache_init(self, *args, **kwargs) -> None:
     self.dtype = torch.float8_e4m3fn if self.is_fp8_cache else torch.bfloat16
 
     model_config = vllm_config.model_config
-    self.layer_index = None
     context = vllm_config.compilation_config.static_forward_context
     ensure_kv_cache_registration(context, self.prefix, self, subindex=1)
 
@@ -186,7 +184,6 @@ def rbln_indexer_cache_init(self, *args, **kwargs) -> None:
             cache_config=self.cache_config,
         )
         scale.get_attn_backend = lambda: RBLNDeepseekV32IndexerScaleBackend
-        scale.layer_index = None
         ensure_kv_cache_registration(context, scale.prefix, scale, subindex=2)
         self.scale_cache = scale
 
@@ -243,13 +240,11 @@ def rbln_indexer_forward(
     attn_metadata = forward_context.attn_metadata
     if isinstance(attn_metadata, dict):
         attn_metadata = attn_metadata[self.k_cache.prefix]
-    k_cache = _resolve_kv_cache(attn_metadata, self.k_cache.layer_index)
+    k_cache = _resolve_kv_cache(attn_metadata, self.k_cache.prefix)
 
     scale_cache = None
     if getattr(self.k_cache, "scale_cache", None) is not None:
-        scale_cache = _resolve_kv_cache(
-            attn_metadata, self.k_cache.scale_cache.layer_index
-        )
+        scale_cache = _resolve_kv_cache(attn_metadata, self.k_cache.scale_cache.prefix)
 
     weights = weights.contiguous()  # [B, T, n_head]
     softmax_scale = torch.tensor(

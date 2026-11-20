@@ -734,6 +734,7 @@ class DynamicKvSizer:
         mr.kv_caches = []
         mr.kv_cache_bases = []
         mr.kv_cache_names = []
+        mr.kv_cache_positions = {}
         mr.kv_cache_block_axes = {}
         mr.kv_cache_allocations = {}
         self.program_inputs = {}

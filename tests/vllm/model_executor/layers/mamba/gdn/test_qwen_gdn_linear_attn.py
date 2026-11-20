@@ -70,7 +70,6 @@ def _layer():
     torch.manual_seed(0)
     layer = SimpleNamespace(
         prefix=PREFIX,
-        layer_index=0,
         tp_size=1,
         num_k_heads=HEADS_K,
         num_v_heads=HEADS_V,
@@ -187,7 +186,9 @@ def _run(
         if shared_binding
         else []
     )
-    attach_kv_cache_bindings(metadata, [state], bases, infos)
+    attach_kv_cache_bindings(
+        metadata, [state], bases, infos, kv_cache_positions={PREFIX: 0}
+    )
     with set_forward_context(
         {PREFIX: metadata}, vllm_config, **build_kv_cache_forward_context_kwargs(bases)
     ):
