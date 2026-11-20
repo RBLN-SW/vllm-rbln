@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -197,36 +197,29 @@ class CompressedTensorsW8A16Fp8MoEMethod(CompressedTensorsMoEMethod):
         down_proj_weight = layer.w2_weight
 
         w13_scale = layer.w13_weight_scale
-        w2_scale = layer.w2_weight_scale
+        scale_intermediate_size = w13_scale.shape[1] // 2
+        gate_proj_weight_scale = w13_scale[:, :scale_intermediate_size, :]
+        up_proj_weight_scale = w13_scale[:, scale_intermediate_size:, :]
+        # CHANNEL: custom_moe reads one input group (hidden_size) off
+        # gate_proj_scale; it also covers down's smaller intermediate input.
+        group_size = (
+            self.weight_block_size[1]
+            if self.strategy == QuantizationStrategy.BLOCK
+            else None
+        )
 
-        if self.strategy == QuantizationStrategy.CHANNEL:
-            scale_intermediate_size = w13_scale.shape[1] // 2
-            gate_proj_weight_scale = w13_scale[:, :scale_intermediate_size, :]
-            up_proj_weight_scale = w13_scale[:, scale_intermediate_size:, :]
-            down_proj_weight_scale = w2_scale
-            group_size = 0
-        else:  # BLOCK
-            scale_intermediate_size = w13_scale.shape[1] // 2
-            gate_proj_weight_scale = w13_scale[:, :scale_intermediate_size, :]
-            up_proj_weight_scale = w13_scale[:, scale_intermediate_size:, :]
-            down_proj_weight_scale = w2_scale
-            group_size = self.weight_block_size[1]
-
-        final_hidden_states = torch.ops.rbln_custom_ops.custom_moe_glu_group_dequantize(
+        final_hidden_states = torch.ops.rbln_custom_ops.custom_moe(
             hidden_states,
             gate_proj_weight,
-            gate_proj_weight_scale,
             up_proj_weight,
-            up_proj_weight_scale,
             down_proj_weight,
-            down_proj_weight_scale,
             masked_routing_weights,
-            torch.tensor(group_size, dtype=torch.int32),
             layer.activation.value,
-            None,  # gate_proj_bias
-            None,  # up_proj_bias
-            None,  # down_proj_bias
-            layer.expert_map,
+            gate_proj_scale=gate_proj_weight_scale,
+            up_proj_scale=up_proj_weight_scale,
+            down_proj_scale=layer.w2_weight_scale,
+            group_size=group_size,
+            expert_map=layer.expert_map,
         )
 
         return final_hidden_states.reshape(orig_shape)
