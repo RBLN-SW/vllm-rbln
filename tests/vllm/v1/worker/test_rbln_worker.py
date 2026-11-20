@@ -21,7 +21,7 @@ import inspect
 import json
 import os
 import sys
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -1146,7 +1146,7 @@ class TestCompileOrWarmUpModel:
 
         worker.model_runner = SimpleNamespace(
             warmup_model=warmup,
-            warm_up_kv_connector_transfers=lambda: calls.append("transfer warm-up"),
+            warm_up_kv_connector_transfers=lambda: None,
             kv_cache_config=SimpleNamespace(num_blocks=10),
         )
         _attach_sizer(worker)
@@ -1177,20 +1177,60 @@ class TestCompileOrWarmUpModel:
         # different config would satisfy a bare call.
         assert seen == [worker.vllm_config]
 
-    def test_transfer_warm_up_follows_the_finalize(self, make_worker, monkeypatch):
-        # LMCache builds its transfer programs for the caches registration
-        # settled on, on this thread, before the first request.
+    @pytest.mark.parametrize("defers", [False, True])
+    def test_transfer_warm_up_runs_right_after_the_model_warm_up(
+        self, make_worker, monkeypatch, defers
+    ):
+        # LMCache builds its transfer programs on this thread before the first
+        # request. Outside the dynamic-KV program capture, so they are not
+        # taken for the model's; before the resize measures free memory, so
+        # its staging is counted. The resize changes only the block count,
+        # which the programs do not depend on.
         worker, calls = self._worker(make_worker, monkeypatch)
+        worker.model_runner.warm_up_kv_connector_transfers = lambda: calls.append(
+            "transfer warm-up"
+        )
         monkeypatch.setattr(wm, "has_kv_transfer_group", lambda: True)
         monkeypatch.setattr(wm, "get_kv_transfer_group", lambda: "group")
-        monkeypatch.setattr(dks.DynamicKvSizer, "defers_kv_registration", False)
+        monkeypatch.setattr(dks.DynamicKvSizer, "defers_kv_registration", defers)
         monkeypatch.setattr(
             wm, "finalize_kv_cache_registrations", lambda g: calls.append("finalize")
         )
 
+        @contextmanager
+        def capture_programs():
+            calls.append("capture")
+            yield None
+            calls.append("capture closed")
+
+        monkeypatch.setattr(worker.dynamic_kv, "capture_programs", capture_programs)
+
         worker.compile_or_warm_up_model()
 
-        assert calls == ["warmup", "finalize", "transfer warm-up"]
+        assert calls == [
+            "capture",
+            "warmup",
+            "capture closed",
+            "transfer warm-up",
+            *([] if defers else ["finalize"]),
+        ]
+
+    @pytest.mark.parametrize(
+        "skip", [{"enforce_eager": True}, {"warm_up": False}], ids=["eager", "off"]
+    )
+    def test_transfer_warm_up_runs_when_the_model_warm_up_is_skipped(
+        self, make_worker, monkeypatch, skip
+    ):
+        # The transfers still run during serving, so their programs must still
+        # be built here rather than on LMCache's first store.
+        worker, calls = self._worker(make_worker, monkeypatch, **skip)
+        worker.model_runner.warm_up_kv_connector_transfers = lambda: calls.append(
+            "transfer warm-up"
+        )
+
+        worker.compile_or_warm_up_model()
+
+        assert calls == ["transfer warm-up"]
 
     def test_a_pending_resize_holds_the_finalize(self, make_worker, monkeypatch):
         # The dynamic-KV resize frees this cache and allocates again right

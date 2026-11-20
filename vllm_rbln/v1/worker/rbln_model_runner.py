@@ -3881,8 +3881,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         compile state, which a `torch._dynamo.disable` frame on this thread
         then trips over, and it holds the GIL long enough to stall the forward.
 
-        The worker calls this on the thread that drives the model, after the
-        connector registration is final. An LMCache without the hook leaves the
+        The worker calls this on the thread that drives the model, right after
+        the model warm-up (or where it would run) and before the dynamic-KV
+        memory snapshot, so the transfer staging is counted when the KV cache
+        is sized. The programs depend on the KV layout, not the block count,
+        so the resize leaves them valid. An LMCache without the hook leaves the
         build to its first transfer, as before.
         """
         if not has_kv_transfer_group() or self.cross_layers_kv_cache is not None:
