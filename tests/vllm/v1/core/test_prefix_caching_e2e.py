@@ -108,37 +108,49 @@ def test_prefix_cache_matches_baseline(
 # partial entry at the prompt's last unit boundary, and a hit copies that block
 # (KV, state and conv ring) before the request writes past it.
 CHUNK = 128
-_LONG_PREFIX = random.Random(0).sample(range(2000, 100000), 828)
-LONG_PROMPTS = [
-    TokensPrompt(
-        prompt_token_ids=_LONG_PREFIX
-        + random.Random(i + 1).sample(range(2000, 100000), 10)
-    )
-    for i in range(4)
-]
+MTP = {"method": "mtp", "num_speculative_tokens": 1}
+
+
+def _prompts_sharing(prefix_len: int) -> list[TokensPrompt]:
+    prefix = random.Random(0).sample(range(2000, 100000), prefix_len)
+    return [
+        TokensPrompt(
+            prompt_token_ids=prefix
+            + random.Random(i + 1).sample(range(2000, 100000), 10)
+        )
+        for i in range(4)
+    ]
 
 
 @pytest.mark.model_compile
 @pytest.mark.parametrize(
-    "speculative_config, hit",
+    "speculative_config, prefix_len, hit",
     [
-        # The first prompt's last unit boundary: 838 // 128 * 128.
-        (None, 768),
-        # An MTP lookup drops one unit, as the block drop does at block size.
-        ({"method": "mtp", "num_speculative_tokens": 1}, 640),
+        # The first prompt's last unit boundary, 710 // 128 * 128. A whole-block
+        # hit stops at 512.
+        (None, 700, 640),
+        # An MTP lookup drops one unit, as the block drop does a block: one
+        # unit below 838 // 128 * 128. A whole-block hit stops at 512.
+        (MTP, 828, 640),
     ],
     ids=["mtp-off", "mtp-on"],
 )
 @pytest.mark.parametrize("spec", spec_params(MODELS))
 def test_fine_grained_prefix_hit_matches_baseline(
-    vllm_runner, spec: CompileModelSpec, monkeypatch, speculative_config, hit
+    vllm_runner,
+    spec: CompileModelSpec,
+    monkeypatch,
+    speculative_config,
+    prefix_len,
+    hit,
 ) -> None:
     apply_spec_envs(spec, monkeypatch)
-    num_layers = envs.VLLM_RBLN_NUM_HIDDEN_LAYERS
-    if speculative_config is not None and 0 < num_layers < 8:
-        # As in test_spec_decode_e2e: the compiler's layer rolling rejects
-        # Qwen3.5 with MTP below two periods of its layers.
+    if 0 < envs.VLLM_RBLN_NUM_HIDDEN_LAYERS < 8:
+        # Below four layers Qwen3.5 has no attention group, and a single group
+        # hashes whole blocks; the compiler's layer rolling rejects one period
+        # of four (see test_spec_decode_e2e). Two periods roll.
         monkeypatch.setenv("VLLM_RBLN_NUM_HIDDEN_LAYERS", "8")
+    prompts = _prompts_sharing(prefix_len)
     engine_kwargs = {
         **spec.engine_kwargs,
         "max_num_batched_tokens": CHUNK,
@@ -148,7 +160,7 @@ def test_fine_grained_prefix_hit_matches_baseline(
         spec.model, enable_prefix_caching=False, **engine_kwargs
     ) as baseline:
         baseline_outputs = _tokens_and_logprobs(
-            baseline.llm.generate(LONG_PROMPTS, SAMPLING_PARAMS)
+            baseline.llm.generate(prompts, SAMPLING_PARAMS)
         )
 
     with vllm_runner(
@@ -157,11 +169,10 @@ def test_fine_grained_prefix_hit_matches_baseline(
         prefix_match_unit=CHUNK,
         **engine_kwargs,
     ) as cached:
-        cached.llm.generate(LONG_PROMPTS[0], SAMPLING_PARAMS)
-        outputs = cached.llm.generate(LONG_PROMPTS, SAMPLING_PARAMS)
+        cached.llm.generate(prompts[0], SAMPLING_PARAMS)
+        outputs = cached.llm.generate(prompts, SAMPLING_PARAMS)
         cached_outputs = _tokens_and_logprobs(outputs)
         num_cached = [o.num_cached_tokens for o in outputs]
 
-    # Past the last block boundary (512), which is all a whole-block hit reaches.
-    assert num_cached == [hit] * len(LONG_PROMPTS)
+    assert num_cached == [hit] * len(prompts)
     assert cached_outputs == baseline_outputs
