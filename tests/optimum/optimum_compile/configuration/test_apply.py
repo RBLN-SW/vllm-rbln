@@ -144,6 +144,7 @@ class TestApplyPooling:
                 "max_seq_len": 8192,
                 "batch_size": 4,
                 "kvcache_partition_len": 1024,
+                "prefill_chunk_size": 128,
             },
             arch="Qwen3Model",
         )
@@ -156,6 +157,7 @@ class TestApplyPooling:
             "batch_size": 8,
             "kvcache_num_blocks": 16,
             "kvcache_block_size": 512,
+            "prefill_chunk_size": 128,
         }
         synced = apply_config(cfg, arch="Qwen3Model")
         assert get_runtime_num_blocks(synced.model_config.hf_config, cfg) == 16
@@ -423,7 +425,9 @@ def test_compiled_num_devices_lands_in_the_config(monkeypatch):
     assert vllm_config.additional_config.num_devices_per_local_rank == 2
 
 
-@pytest.mark.parametrize("arch", [DECODER_ARCH, "PaliGemmaForConditionalGeneration"])
+@pytest.mark.parametrize(
+    "arch", [DECODER_ARCH, "PaliGemmaForConditionalGeneration", "Qwen3Model"]
+)
 @pytest.mark.parametrize("precompiled", [False, True])
 @pytest.mark.parametrize("explicit_none", [False, True])
 def test_missing_prefill_chunk_size_is_rejected(

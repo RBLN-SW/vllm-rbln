@@ -27,10 +27,10 @@ from vllm_rbln.utils.optimum.block_size import (
     is_full_block_available,
 )
 from vllm_rbln.utils.optimum.registry import (
+    is_chunked_prefill_arch,
     is_enc_dec_arch,
     is_encoder_pooling_arch,
     is_multi_modal,
-    is_pooling_arch,
 )
 
 from .compile_config import resolve_explicit_num_blocks
@@ -130,7 +130,7 @@ def prepare_runtime_config(
 
     assert batch_size is not None
     assert max_seq_len is not None
-    if is_chunked_prefill_arch(hf_config) and prefill_chunk_size is None:
+    if prefill_chunk_size is None and is_chunked_prefill_arch(hf_config):
         raise ValueError(
             "prefill_chunk_size must be specified in the selected rbln_config."
         )
@@ -346,11 +346,6 @@ def update_block_size(
             block_size,
         )
         vllm_config.cache_config.block_size = block_size
-
-
-def is_chunked_prefill_arch(hf_config) -> bool:
-    """Whether the compiled model supports chunked prefill."""
-    return not (is_enc_dec_arch(hf_config) or is_pooling_arch(hf_config))
 
 
 def update_max_num_batched_tokens(vllm_config: VllmConfig) -> None:

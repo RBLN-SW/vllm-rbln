@@ -229,16 +229,19 @@ class TestSync:
             "reranker",
             "expected_arch",
             "expected_cls",
-            "expected_tokens",
+            "prefill_chunk_size",
+            "expected_chunk_size",
             "expected_phases",
         ),
         [
-            ("pooling", False, "Qwen3Model", "RBLNQwen3Model", 1024, None),
+            ("pooling", False, "Qwen3Model", "RBLNQwen3Model", None, 128, None),
+            ("pooling", False, "Qwen3Model", "RBLNQwen3Model", 256, 256, None),
             (
                 "pooling",
                 True,
                 "Qwen3ForSequenceClassification",
                 "RBLNAutoModelForCausalLM",
+                None,
                 128,
                 ["prefill"],
             ),
@@ -247,6 +250,7 @@ class TestSync:
                 False,
                 "Qwen3ForCausalLM",
                 "RBLNAutoModelForCausalLM",
+                None,
                 128,
                 None,
             ),
@@ -259,7 +263,8 @@ class TestSync:
         reranker,
         expected_arch,
         expected_cls,
-        expected_tokens,
+        prefill_chunk_size,
+        expected_chunk_size,
         expected_phases,
     ):
         from vllm_rbln.platform.optimum_impl import check_and_update
@@ -300,7 +305,7 @@ class TestSync:
                 user_specified_mamba_block_size=False,
                 mamba_block_size=None,
             ),
-            additional_config={},
+            additional_config={"prefill_chunk_size": prefill_chunk_size},
             speculative_config=None,
         )
         observed = []
@@ -310,7 +315,7 @@ class TestSync:
                 (
                     list(inputs.hf_config.architectures),
                     inputs.model_cls,
-                    inputs.rbln_config.get("prefill_chunk_size", 1024),
+                    inputs.rbln_config.get("prefill_chunk_size"),
                     inputs.rbln_config.get("phases"),
                 )
             )
@@ -319,8 +324,9 @@ class TestSync:
         monkeypatch.setattr(sync, "compile_cache_name", generate_name)
         check_and_update(cfg)
         assert observed == [
-            ([expected_arch], expected_cls, expected_tokens, expected_phases)
+            ([expected_arch], expected_cls, expected_chunk_size, expected_phases)
         ]
+        assert cfg.additional_config.single_prefill_chunk_size == expected_chunk_size
 
     @pytest.mark.parametrize(
         ("reranker", "expected_arch", "expected_cls", "expected_phases"),
@@ -845,7 +851,7 @@ def test_sync_rejects_an_explicit_scheduling_budget(vllm_config_factory, budget)
 
 
 @pytest.mark.parametrize(
-    "arch", ["LlamaForCausalLM", "PaliGemmaForConditionalGeneration"]
+    "arch", ["LlamaForCausalLM", "PaliGemmaForConditionalGeneration", "Qwen3Model"]
 )
 @pytest.mark.parametrize("chunk", [None, 256, 512])
 def test_precompiled_model_resolves_or_rejects_prefill_chunk_size(

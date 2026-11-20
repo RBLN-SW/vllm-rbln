@@ -17,7 +17,9 @@ read it: the state blocks a request loads and stores come from the group's
 block table, and the conv ring is read and stored by the same blocks as the
 state."""
 
+from dataclasses import fields
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -46,6 +48,9 @@ def _builder(
     prefill_chunk_size=(128,),
     block_size: int = MAX_LEN,
     mamba_cache_mode: str = "none",
+    *,
+    device="cpu",
+    num_drafts: int = 0,
 ):
     vllm_config = make_vllm_config(
         max_model_len=MAX_LEN,
@@ -54,6 +59,10 @@ def _builder(
         additional_config={"prefill_chunk_size": list(prefill_chunk_size)},
     )
     vllm_config.cache_config.mamba_cache_mode = mamba_cache_mode
+    if num_drafts:
+        vllm_config.speculative_config = SimpleNamespace(
+            num_speculative_tokens=num_drafts
+        )
     spec = MambaSpec(
         block_size=block_size,
         shapes=((4, 128, 128),),
@@ -63,7 +72,7 @@ def _builder(
     # The flash builder it extends reads the config it is built under.
     with set_current_vllm_config(vllm_config):
         return RBLNGDNAttentionMetadataBuilder(
-            spec, [LAYER], vllm_config, torch.device("cpu")
+            spec, [LAYER], vllm_config, torch.device(device)
         )
 
 
@@ -110,6 +119,57 @@ def _assert_conv_rows(
 
 
 class TestBuilder:
+    @pytest.mark.use_device
+    @pytest.mark.parametrize("is_prefill", [False, True])
+    @pytest.mark.parametrize("defer_staging", [False, True])
+    @pytest.mark.parametrize("mamba_cache_mode", ["none", "align"])
+    def test_staging_preserves_values_and_host_state_indices(
+        self, monkeypatch, is_prefill, defer_staging, mamba_cache_mode
+    ):
+        from vllm.platforms import current_platform
+
+        builder = _builder(
+            block_size=256 if mamba_cache_mode == "align" else MAX_LEN,
+            mamba_cache_mode=mamba_cache_mode,
+            device=current_platform.device_type,
+        )
+        copy_tensor = Mock(wraps=builder._stage)
+        monkeypatch.setattr(builder, "_stage", copy_tensor)
+        query_len = 2 if is_prefill else 1
+        metadata = builder.build(
+            _common([query_len], [256 + query_len], [[7, 8]]),
+            torch.arange(256, 256 + query_len),
+            batch_pad=1 if is_prefill else 4,
+            is_prefill=is_prefill,
+            num_accepted=None if is_prefill else torch.tensor([1], dtype=torch.int32),
+            **({"defer_staging": True} if defer_staging else {}),
+        )
+        if defer_staging:
+            copy_tensor.assert_not_called()
+        padding = [] if is_prefill else [0, 0, 0]
+        assert metadata.load_blocks.tolist() == [7, *padding]
+        store = 8 if mamba_cache_mode == "align" else 7
+        assert metadata.store_blocks.tolist() == [store, *padding]
+        originals = {
+            field.name: value
+            for field in fields(metadata)
+            if isinstance(value := getattr(metadata, field.name), torch.Tensor)
+        }
+        expected = {name: tensor.cpu().clone() for name, tensor in originals.items()}
+
+        builder.stage(metadata)
+        for name, tensor in originals.items():
+            staged = getattr(metadata, name)
+            if tensor.dtype == torch.int16:
+                assert staged is tensor, name
+                assert staged.device.type == "cpu", name
+            else:
+                assert staged.device.type == current_platform.device_type, name
+                if defer_staging:
+                    assert staged is not tensor, name
+                    tensor.zero_()
+            assert torch.equal(staged.cpu(), expected[name]), name
+
     def test_first_prefill_chunk(self, builder):
         positions = torch.arange(128)
         md = builder.build(_common([70], [70], [[7]]), positions, 1, True)
@@ -138,6 +198,30 @@ class TestBuilder:
         assert md.load_blocks.tolist() == [7]
         _assert_conv_rows(md, [7], [70], [58], [1])
 
+    def test_group_shared_staging_shares_only_the_group_independent_rows(self):
+        group_shared: dict = {}
+        positions = torch.tensor([128, 5])
+        mds = [
+            _builder().build(
+                _common([1, 1], [129, 6], table),
+                positions,
+                4,
+                False,
+                group_shared=group_shared,
+            )
+            for table in ([[7], [3]], [[8], [2]])
+        ]
+        for name in (
+            "conv_start_positions",
+            "conv_query_lens",
+            "has_initial_state",
+        ):
+            assert getattr(mds[0], name) is getattr(mds[1], name), name
+        assert mds[0].conv_load_blocks is not mds[1].conv_load_blocks
+        _assert_conv_rows(
+            mds[1], [8, 2, 0, 0], [128, 5, 0, 0], [1, 1, 0, 0], [1, 1, 0, 0]
+        )
+
     def test_decode_pads_the_batch_onto_the_null_block(self, builder):
         positions = torch.tensor([128, 5])
         md = builder.build(_common([1, 1], [129, 6], [[7], [3]]), positions, 4, False)
@@ -148,6 +232,36 @@ class TestBuilder:
         assert md.store_blocks.tolist() == [7, 3, 0, 0]
         _assert_conv_rows(md, [7, 3, 0, 0], [128, 5, 0, 0], [1, 1, 0, 0], [1, 1, 0, 0])
         assert md.valid_mask is None
+
+    @pytest.mark.parametrize(("num_drafts", "query_len"), [(0, 2), (2, 1)])
+    def test_a_decode_step_of_another_length_is_refused(self, num_drafts, query_len):
+        # One token a request, plus the drafts under MTP: the decode kernel
+        # takes the first and the verify kernel the second, nothing else.
+        positions = torch.arange(128, 128 + query_len)
+        common = _common([query_len], [128 + query_len], [[7]])
+        with pytest.raises(AssertionError, match=f"takes {1 + num_drafts} tokens"):
+            _builder(num_drafts=num_drafts).build(common, positions, 4, False)
+
+    def test_verify_window_is_padded_at_the_back(self):
+        # Two drafts a step. Row 0 carries its token and both drafts (positions
+        # 128 .. 130); row 1 only its token (5), padded to the window at the back.
+        positions = torch.tensor([128, 129, 130, 5, 6, 7])
+        md = _builder(num_drafts=2).build(
+            _common([3, 3], [131, 6], [[7], [3]]),
+            positions,
+            4,
+            False,
+            back_pad=torch.tensor([0, 2]),
+            num_accepted=torch.tensor([2, 0], dtype=torch.int32),
+            state_load_pos=torch.tensor([127, 4], dtype=torch.int32),
+        )
+        assert md.batch_size == 4
+        assert md.load_blocks.tolist() == [7, 3, 0, 0]
+        assert md.store_blocks.tolist() == [7, 3, 0, 0]
+        # The ring takes a row's valid tokens only.
+        _assert_conv_rows(md, [7, 3, 0, 0], [128, 5, 0, 0], [3, 1, 0, 0], [1, 1, 0, 0])
+        assert md.num_accepted.dtype == torch.int32
+        assert md.num_accepted.tolist() == [2, 0, 0, 0]
 
     @pytest.mark.parametrize(
         ("computed", "query_len", "load", "store"),
@@ -185,3 +299,28 @@ class TestBuilder:
             [1, 1, 0, 0],
             [10, 21, 0, 0],
         )
+
+    @pytest.mark.parametrize(("accepted", "first"), [(0, 255), (2, 257)])
+    def test_aligned_verify_loads_the_block_the_step_before_stored_to(
+        self, accepted, first
+    ):
+        # Two drafts a step. The step before took tokens 254 .. 256 and stored
+        # the state in block 1, which token 256 entered. With both drafts
+        # rejected this step starts at 255, back in block 0; with both accepted
+        # it starts at 257, in block 1 too.
+        aligned = _builder(block_size=256, mamba_cache_mode="align", num_drafts=2)
+        md = aligned.build(
+            _common([3], [first + 3], [[10, 11]]),
+            torch.arange(first, first + 3),
+            4,
+            False,
+            back_pad=torch.tensor([0]),
+            num_accepted=torch.tensor([accepted], dtype=torch.int32),
+            state_load_pos=torch.tensor([256], dtype=torch.int32),
+        )
+        assert md.load_blocks.tolist() == [11, 0, 0, 0]
+        assert md.store_blocks.tolist() == [11, 0, 0, 0]
+        _assert_conv_rows(
+            md, [11, 0, 0, 0], [first, 0, 0, 0], [3, 0, 0, 0], [1, 0, 0, 0]
+        )
+        assert md.num_accepted.tolist() == [accepted, 0, 0, 0]

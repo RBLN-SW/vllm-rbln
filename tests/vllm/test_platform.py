@@ -598,6 +598,19 @@ class TestRejectedConfigs:
         assert config.cache_config.mamba_cache_mode == "none"
         assert config.cache_config.mamba_block_size == config.model_config.max_model_len
 
+    def test_glm5_next_mtp_takes_16_bit_activations(self, reconfigure):
+        def forced_to_fp32(config):
+            _as_glm5_next(config)
+            config.speculative_config = SimpleNamespace(
+                method="mtp", num_speculative_tokens=1
+            )
+            config.additional_config = replace(
+                config.additional_config, enforce_model_fp32=True
+            )
+
+        with pytest.raises(ValueError, match="16-bit activations"):
+            reconfigure(forced_to_fp32)
+
     @pytest.fixture
     def gdn(self, monkeypatch):
         """The hook sees a GatedDeltaNet model with Qwen3.5-4B's 32 value heads."""
@@ -661,13 +674,39 @@ class TestRejectedConfigs:
             with pytest.raises(ValueError, match="single rank"):
                 reconfigure(widened)
 
-    def test_gdn_models_reject_speculative_decoding(self, reconfigure, gdn):
-        def speculative(config):
-            gdn(config)
-            config.speculative_config = object()
+    @pytest.mark.parametrize("model", ["gdn", "glm5_next"])
+    def test_recurrent_state_models_speculate_with_their_mtp_head_only(
+        self, reconfigure, request, model
+    ):
+        as_model = request.getfixturevalue("gdn") if model == "gdn" else _as_glm5_next
 
-        with pytest.raises(ValueError, match="Speculative decoding"):
-            reconfigure(speculative)
+        def speculative(method, num_speculative_tokens):
+            def mutate(config):
+                as_model(config)
+                config.speculative_config = SimpleNamespace(
+                    method=method, num_speculative_tokens=num_speculative_tokens
+                )
+
+            return mutate
+
+        for method, drafts in (("eagle", 1), ("mtp", 0), ("mtp", 6)):
+            with pytest.raises(ValueError, match="num_speculative_tokens 1 to 5"):
+                reconfigure(speculative(method, drafts))
+        for drafts in (1, 5):
+            reconfigure(speculative("mtp", drafts))
+
+    def test_gdn_mtp_takes_16_bit_activations(self, reconfigure, gdn):
+        def forced_to_fp32(config):
+            gdn(config)
+            config.speculative_config = SimpleNamespace(
+                method="mtp", num_speculative_tokens=1
+            )
+            config.additional_config = replace(
+                config.additional_config, enforce_model_fp32=True
+            )
+
+        with pytest.raises(ValueError, match="16-bit activations"):
+            reconfigure(forced_to_fp32)
 
     def test_gdn_models_reject_the_custom_kernel_option(self, reconfigure, gdn):
         def custom_kernel(config):
@@ -754,6 +793,26 @@ class TestRejectedConfigs:
             )
         with pytest.raises(ValueError, match="whole KV blocks"):
             reconfigure(cached(prefix_match_unit=128))
+
+    def test_gdn_prefix_caching_with_mtp_needs_retention_0(self, reconfigure, gdn):
+        # As for GLM-5.3: a verify step leaves no state at the end of a block it
+        # crossed.
+        def gdn_mtp(retention):
+            def mutate(config):
+                gdn(config)
+                config.cache_config.enable_prefix_caching = True
+                config.cache_config.mamba_cache_mode = "align"
+                config.cache_config.prefix_cache_retention_interval = retention
+                config.speculative_config = SimpleNamespace(
+                    method="mtp", num_speculative_tokens=1
+                )
+
+            return mutate
+
+        assert reconfigure(gdn_mtp(0)).cache_config.enable_prefix_caching
+        config = reconfigure(gdn_mtp(1))
+        assert not config.cache_config.enable_prefix_caching
+        assert config.cache_config.mamba_cache_mode == "none"
 
     def test_gdn_value_heads_split_over_the_chiplets(self, reconfigure, gdn):
         def six_heads(config):
@@ -1217,13 +1276,7 @@ class TestSchedulerOverrides:
         assert config.scheduler_config.max_num_batched_tokens == 512
 
     def test_async_scheduling_is_honored(self, monkeypatch):
-        # The platform used to force this off unconditionally. It now follows
-        # vLLM's --async-scheduling, as long as the device-side token path is
-        # available (see below). Both carriers are pinned on because
-        # --device-tensor 0 switches the first one off for the whole session,
-        # which would land this on the negative case below.
-        for name in ("VLLM_RBLN_USE_DEVICE_TENSOR", "VLLM_RBLN_SAMPLER"):
-            monkeypatch.setenv(name, "1")
+        monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
         assert _build(async_scheduling=True).scheduler_config.async_scheduling is True
 
     @pytest.mark.parametrize(
@@ -1240,11 +1293,7 @@ class TestSchedulerOverrides:
         sampled and returns wrong text with no error raised, so the platform
         downgrades to sync rather than run the combination.
         """
-        # Both are set before one is switched off: the gate refuses on either,
-        # so leaving the other to the lane lets --device-tensor 0 satisfy this
-        # case with the sampler still on, and the parametrization proves nothing.
-        for name in ("VLLM_RBLN_USE_DEVICE_TENSOR", "VLLM_RBLN_SAMPLER"):
-            monkeypatch.setenv(name, "1")
+        monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
         monkeypatch.setenv(switched_off, "0")
         config = _build(async_scheduling=True)
         assert config.scheduler_config.async_scheduling is False

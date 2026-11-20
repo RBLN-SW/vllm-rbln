@@ -23,8 +23,10 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from collections import Counter
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
@@ -204,45 +206,17 @@ def build_report(results, *, run_id, chip, build_url, branch, commit):
     sys.path.insert(0, str(Path(__file__).with_name("sampler-perf")))
     from run_benchmarks import sampler_summary
 
-    sampler_path = results / "sampler-perf-results" / run_id / chip / "manifest.json"
-    sampler = None
-    sampler_url = build_url
-    if sampler_path.is_file():
-        try:
-            manifest = json.loads(sampler_path.read_text())
-            if manifest["chip"] not in (None, chip):
-                raise ValueError("sampler result chip does not match nightly report")
-            if source is None:
-                raise ValueError("CI targets snapshot is missing")
-            sampler_targets = f"Targets: {source['repo']} @ {source['commit']}"
-            sampler = sampler_summary(manifest)
-        except (ValueError, KeyError, TypeError, OSError) as error:
-            sampler_text = f"INVALID: Sampler Perf results ({error})."
-            degraded = True
-        else:
-            sampler_url = manifest.get("job_url") or build_url
-            sampler_text = sampler["text"] + "\n" + sampler_targets
-            degraded |= sampler["degraded"]
-    else:
-        sampler_text = "MISSING: Sampler Perf manifest was not uploaded."
-        degraded = True
-
-    title = f"vllm-rbln {branch} nightly build"
-    build_number = urlsplit(build_url).path.rstrip("/").rsplit("/", 1)[-1]
-    sections = [
-        "*Tests*\n" + "\n".join(tests),
-        "*Examples*\n" + examples,
-        "*Perf*\n" + perf,
-    ]
-    text = (
-        f"{'⚠️' if degraded else '✅'} *{title} <{build_url}|#{build_number}> "
-        f"({commit[:8]})*\n\n" + "\n\n".join(sections)
-    )
-    blocks = [
-        {"type": "section", "text": {"type": "mrkdwn", "text": text}},
-    ]
+    perf_text = "*Perf*\n" + perf
+    details = {
+        "perf": {
+            "text": perf_text,
+            "blocks": [
+                {"type": "section", "text": {"type": "mrkdwn", "text": perf_text}}
+            ],
+        }
+    }
     if planned:
-        blocks.append(
+        details["perf"]["blocks"].append(
             {
                 "type": "table",
                 "column_settings": [
@@ -254,43 +228,109 @@ def build_report(results, *, run_id, chip, build_url, branch, commit):
                 "rows": rows,
             }
         )
-    sampler_section = f"*Sampler Perf*\n{sampler_text}\n<{sampler_url}|Job and details>"
-    blocks.append(
-        {"type": "section", "text": {"type": "mrkdwn", "text": sampler_section}}
-    )
-    if sampler is not None:
-        blocks.append(
-            {
-                "type": "table",
-                "column_settings": [
-                    {"is_wrapped": True},
-                    {"is_wrapped": True},
-                    {"align": "right"},
-                    {"is_wrapped": True},
-                    *({"align": "right"} for _ in sampler["titles"][4:]),
-                ],
-                "rows": [
-                    [{"type": "raw_text", "text": cell} for cell in row]
-                    for row in [sampler["titles"], *sampler["rows"]]
-                ],
-            }
+    sampler_path = results / "sampler-perf-results" / run_id / chip / "manifest.json"
+    sampler_summaries = []
+    sampler_annotations = []
+    for enabled, name in ((False, "Off"), (True, "On")):
+        sampler = None
+        sampler_url = build_url
+        sampler_status = "MISSING: Sampler Perf manifest was not uploaded."
+        sampler_text = sampler_status
+        if sampler_path.is_file():
+            try:
+                manifest = json.loads(sampler_path.read_text())
+                if manifest["chip"] not in (None, chip):
+                    raise ValueError(
+                        "sampler result chip does not match nightly report"
+                    )
+                if source is None:
+                    raise ValueError("CI targets snapshot is missing")
+                matrix = sampler_summary(manifest, use_fused_sampling=enabled)
+                if not matrix["rows"]:
+                    raise ValueError(f"no Fused {name} cases in manifest")
+            except (ValueError, KeyError, TypeError, OSError) as error:
+                sampler_status = f"INVALID: Sampler Perf results ({error})."
+                sampler_text = sampler_status
+            else:
+                sampler = matrix
+                sampler_url = manifest.get("job_url") or build_url
+                sampler_status = sampler["status"]
+                sampler_text = (
+                    sampler["text"]
+                    + f"\nTargets: {source['repo']} @ {source['commit']}"
+                )
+        degraded |= sampler is None or sampler["degraded"]
+        sampler_summaries.append(f"- Fused {name}: {sampler_status}")
+        section = (
+            f"*Sampler Perf (Fused {name})*\n{sampler_text}"
+            f"\n<{sampler_url}|Job and details>"
         )
-    text += "\n\n" + sampler_section
+        payload = {
+            "text": section,
+            "blocks": [
+                {"type": "section", "text": {"type": "mrkdwn", "text": section}}
+            ],
+        }
+        if sampler is not None:
+            payload["blocks"].append(
+                {
+                    "type": "table",
+                    "column_settings": [
+                        {"is_wrapped": True},
+                        {"is_wrapped": True},
+                        {"align": "right"},
+                        {"is_wrapped": True},
+                        *({"align": "right"} for _ in sampler["titles"][4:]),
+                    ],
+                    "rows": [
+                        [{"type": "raw_text", "text": cell} for cell in row]
+                        for row in [sampler["titles"], *sampler["rows"]]
+                    ],
+                }
+            )
+        details[f"sampler-{name.lower()}"] = payload
+        sampler_annotations.append(
+            f"**Sampler Perf (Fused {name})**\n{sampler_text}"
+            f"\n\n[Job and details]({sampler_url})"
+            + ("\n\n" + sampler["markdown"] if sampler is not None else "")
+        )
+
+    title = f"vllm-rbln {branch} nightly build"
+    build_number = urlsplit(build_url).path.rstrip("/").rsplit("/", 1)[-1]
+    sections = [
+        "*Tests*\n" + "\n".join(tests),
+        "*Examples*\n" + examples,
+        "*Perf*\n" + (f"{completed}/{planned} cases completed" if planned else perf),
+        "*Sampler Perf*\n" + "\n".join(sampler_summaries),
+    ]
+    text = (
+        f"{'⚠️' if degraded else '✅'} *{title} <{build_url}|#{build_number}> "
+        f"({commit[:8]})*\n\n" + "\n\n".join(sections)
+    )
+    payloads = {
+        "summary": {
+            "text": text,
+            "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": text}}],
+        },
+        **details,
+    }
+    for payload in payloads.values():
+        payload.update(unfurl_links=False, unfurl_media=False)
     annotation = (
         f"**{title} [#{build_number}]({build_url}) ({commit[:8]})**\n\n"
         + "\n\n".join(
             section.replace("*Tests*", "**Tests**")
             .replace("*Examples*", "**Examples**")
             .replace("*Perf*", "**Perf**")
-            for section in sections
+            for section in (sections[0], sections[1], perf_text, sections[3])
         )
         + "\n\n"
         + "\n".join(markdown)
-        + f"\n\n**Sampler Perf**\n{sampler_text}\n\n[Job and details]({sampler_url})"
-        + ("\n\n" + sampler["markdown"] if sampler is not None else "")
+        + "\n\n"
+        + "\n\n".join(sampler_annotations)
     )
     return (
-        {"text": text, "blocks": blocks, "unfurl_links": False, "unfurl_media": False},
+        payloads,
         annotation,
         degraded,
     )
@@ -305,8 +345,15 @@ def slack_api(method, payload):
             "Content-Type": "application/json; charset=utf-8",
         },
     )
-    with urlopen(request, timeout=30) as response:
-        result = json.load(response)
+    while True:
+        try:
+            with urlopen(request, timeout=30) as response:
+                result = json.load(response)
+            break
+        except HTTPError as error:
+            if error.code != 429:
+                raise
+            time.sleep(float(error.headers["Retry-After"]))
     if not result["ok"]:
         raise RuntimeError(f"Slack {method} failed: {result['error']}")
     return result
@@ -370,7 +417,7 @@ def main():
                         [agent, "artifact", "download", pattern, str(results), *scope],
                         check=True,
                     )
-        payload, annotation, degraded = build_report(
+        payloads, annotation, degraded = build_report(
             results,
             run_id=args.run_id,
             chip=args.chip,
@@ -380,7 +427,7 @@ def main():
         )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     (args.output_dir / "slack.json").write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+        json.dumps(payloads, ensure_ascii=False, indent=2) + "\n"
     )
     (args.output_dir / "summary.md").write_text(annotation + "\n")
     print(annotation)
@@ -401,20 +448,27 @@ def main():
     channel = os.environ["SLACK_REPORT_CHANNEL"]
     if not channel:
         raise ValueError("SLACK_REPORT_CHANNEL must name a Slack channel")
-    payload["channel"] = channel
-    key = f"nightly-slack-ts-{channel}"
-    timestamp = subprocess.run(
-        [agent, "meta-data", "get", key, "--default", ""],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    if timestamp:
-        posted = slack_api("chat.update", payload | {"ts": timestamp})
-    else:
-        posted = slack_api("chat.postMessage", payload)
-    subprocess.run([agent, "meta-data", "set", key, posted["ts"]], check=True)
-    print(f"Slack report published to {posted['channel']} at {posted['ts']}")
+    parent_ts = None
+    for name, payload in payloads.items():
+        payload = payload | {"channel": channel}
+        key = f"nightly-slack-ts-{channel}" + ("" if name == "summary" else f"-{name}")
+        timestamp = subprocess.run(
+            [agent, "meta-data", "get", key, "--default", ""],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if timestamp:
+            posted = slack_api("chat.update", payload | {"ts": timestamp})
+        else:
+            if name != "summary":
+                assert parent_ts is not None
+                payload["thread_ts"] = parent_ts
+            posted = slack_api("chat.postMessage", payload)
+        subprocess.run([agent, "meta-data", "set", key, posted["ts"]], check=True)
+        if name == "summary":
+            parent_ts = posted["ts"]
+        print(f"Slack {name} report published to {posted['channel']} at {posted['ts']}")
     return annotation_result.returncode
 
 

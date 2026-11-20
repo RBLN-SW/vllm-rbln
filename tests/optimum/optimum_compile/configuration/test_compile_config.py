@@ -420,6 +420,9 @@ class TestCompileCacheName:
         ("LlamaForCausalLM", {}, None, 256, 1),
         ("LlamaForCausalLM", {"prefill_chunk_size": 384}, None, 384, 0),
         ("LlamaForCausalLM", {}, 512, 512, 0),
+        ("Qwen3Model", {}, None, 256, 1),
+        ("Qwen3Model", {"prefill_chunk_size": None}, None, 256, 1),
+        ("Qwen3Model", {"prefill_chunk_size": 384}, None, 384, 0),
         (
             "Gemma3ForConditionalGeneration",
             {"language_model": {"prefill_chunk_size": 384}},
