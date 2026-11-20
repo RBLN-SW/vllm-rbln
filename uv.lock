@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.10, <3.15"
 resolution-markers = [
     "python_full_version >= '3.14' and platform_machine == 'x86_64' and sys_platform == 'linux'",
@@ -1968,7 +1968,7 @@ wheels = [
 
 [[package]]
 name = "optimum-rbln"
-version = "0.12.1a11"
+version = "0.12.1a12"
 source = { registry = "https://pypi.org/simple/" }
 dependencies = [
     { name = "accelerate" },
@@ -1982,9 +1982,9 @@ dependencies = [
     { name = "transformers" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/7e/33/7e8b2fff31eb4c4b2d2e24126789967143d3ba5e14c50102829915687094/optimum_rbln-0.12.1a11.tar.gz", hash = "sha256:8287d58017a5b7b19f3743e6b590f6fce495348589f702e2a3f4e431468c766f", size = 725226, upload-time = "2026-11-17T11:30:11.566Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/59/35/fce485cd9f6c12e42a1a8838668f9766f8bc53d7ddd0f69fc9dbe4d36805/optimum_rbln-0.12.1a12.tar.gz", hash = "sha256:71f799aa8678b136dc565df27a690a617832b54f5034851660a7eafc66f6258a", size = 730002, upload-time = "2026-11-20T05:30:46.499Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/5a/f1/d7a3fb6c4d62efd5007de4b53beb246362380663cb244b53011630b6d0c7/optimum_rbln-0.12.1a11-py3-none-any.whl", hash = "sha256:180886a8f5e4cfea2e5488f3dba7f9e38bfd230eb2688563682f6bd3bc4c0eba", size = 795593, upload-time = "2026-11-17T11:30:09.38Z" },
+    { url = "https://files.pythonhosted.org/packages/9b/9e/4616a5970e1b43eb86a110ca35fec603ee86e1432335681f3a6c128aa43d/optimum_rbln-0.12.1a12-py3-none-any.whl", hash = "sha256:62e9568f51b716f445d29a6df13c21fcd5fa8a39e0e898ff2e95a96f1765746e", size = 801828, upload-time = "2026-11-20T05:30:44.383Z" },
 ]
 
 [[package]]
@@ -3556,7 +3556,7 @@ requires-dist = [
     { name = "lmcache-rbln", marker = "extra == 'kv-connectors'", specifier = ">=0.12.1.dev44,<0.12.2" },
     { name = "nixl-rbln", marker = "extra == 'kv-connectors'", specifier = ">=0.12.1.dev0,<0.12.2" },
     { name = "numba", specifier = "==0.65.0" },
-    { name = "optimum-rbln", specifier = ">=0.12.1a11,<0.12.2", index = "https://pypi.org/simple/" },
+    { name = "optimum-rbln", specifier = ">=0.12.1a12,<0.12.2", index = "https://pypi.org/simple/" },
     { name = "packaging", marker = "extra == 'dev'" },
     { name = "pynvml", marker = "extra == 'dev'" },
     { name = "pytest", marker = "extra == 'test'" },
