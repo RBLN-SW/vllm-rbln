@@ -519,11 +519,16 @@ class RBLNWorker(WorkerBase):
         try:
             if (skip := compile_and_warmup_skip_reason(self.vllm_config)) is not None:
                 logger.info("Skipping compile_or_warm_up_model (%s).", skip)
+                self.model_runner.warm_up_kv_connector_transfers()
             else:
                 with self.dynamic_kv.capture_programs() as programs:
                     self.model_runner.warmup_model()
                 if programs is not None:
                     self.dynamic_kv.record_programs(programs)
+                # Outside the capture above, so the transfer programs are not
+                # taken for the model's. Before the dynamic-KV memory snapshot,
+                # so the transfer staging is counted when sizing the KV cache.
+                self.model_runner.warm_up_kv_connector_transfers()
 
                 # Connectors that defer KV-cache registration (RBLN NIXL D2D
                 # and LMCache) finalize it here: the KV cache physical views

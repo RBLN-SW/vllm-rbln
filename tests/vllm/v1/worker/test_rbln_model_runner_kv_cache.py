@@ -16,6 +16,7 @@
 # and the per-group attention metadata over it. test_kv_cache_bindings.py covers
 # the consumer of those recipes; this is the producer.
 
+import sys
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -610,6 +611,85 @@ class TestRegisterKvCachesWithConnector:
             for before, after in zip(first.values(), second.values(), strict=True)
         )
         assert [id(t) for t in second.values()] == [id(t) for t in runner.kv_caches]
+
+
+class LMCacheMPConnector:
+    """Stands in for LMCache's connector, which the runner recognizes by name."""
+
+    def __init__(self) -> None:
+        self.registered: list[dict] = []
+
+    def register_kv_caches(self, caches: dict) -> None:
+        self.registered.append(caches)
+
+    def set_host_xfer_buffer_ops(self, _op) -> None:
+        pass
+
+
+class RblnNixlConnector(LMCacheMPConnector):
+    """Any connector other than LMCache's."""
+
+
+class TestWarmUpKvConnectorTransfers:
+    """LMCache builds its RBLN transfer programs on the thread the worker calls
+    from, for the caches the connector was handed."""
+
+    @staticmethod
+    def _connect(monkeypatch, connector, platform) -> None:
+        monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: True)
+        monkeypatch.setattr(mr, "get_kv_transfer_group", lambda: connector)
+        monkeypatch.setitem(sys.modules, "lmcache.v1.platform.devices.rbln", platform)
+
+    @staticmethod
+    def _runner(make_model_runner):
+        runner = make_model_runner(
+            layers=("layer.0", "layer.1"),
+            init_kv_cache=False,
+            additional_config={"enable_sub_block_cache": False},
+        )
+        runner.initialize_kv_cache(
+            make_kv_cache_config(runner, groups=[("layer.0", "layer.1")])
+        )
+        return runner
+
+    def test_lmcache_warms_up_the_caches_it_registered(
+        self, make_model_runner, monkeypatch
+    ):
+        connector, warmed = LMCacheMPConnector(), list[dict]()
+        self._connect(
+            monkeypatch, connector, SimpleNamespace(warm_up_kv_transfer=warmed.append)
+        )
+        runner = self._runner(make_model_runner)
+        runner.register_kv_caches_with_connector()
+
+        runner.warm_up_kv_connector_transfers()
+
+        (registered,) = connector.registered
+        (caches,) = warmed
+        assert list(caches) == list(registered)
+        assert [id(t) for t in caches.values()] == [id(t) for t in registered.values()]
+
+    def test_other_connectors_build_nothing(self, make_model_runner, monkeypatch):
+        warmed: list = []
+        self._connect(
+            monkeypatch,
+            RblnNixlConnector(),
+            SimpleNamespace(warm_up_kv_transfer=warmed.append),
+        )
+        runner = self._runner(make_model_runner)
+
+        runner.warm_up_kv_connector_transfers()
+
+        assert warmed == []
+
+    def test_an_lmcache_without_the_hook_leaves_it_to_the_first_transfer(
+        self, make_model_runner, monkeypatch
+    ):
+        # An older LMCache still serves; its first transfer builds the programs.
+        self._connect(monkeypatch, LMCacheMPConnector(), SimpleNamespace())
+        runner = self._runner(make_model_runner)
+
+        runner.warm_up_kv_connector_transfers()
 
 
 class TestBuildAttentionMetadata:
