@@ -231,11 +231,12 @@ class TestResolveMultiModalSupport:
 
 
 class TestEncoderCacheReserve:
+    @pytest.mark.parametrize("lookahead, doubled", [(0, 1), (1, 2)])
     @pytest.mark.parametrize(
-        "dtype, expected", [(torch.bfloat16, 2**24), (torch.float32, 2**25)]
+        "dtype, base", [(torch.bfloat16, 2**24), (torch.float32, 2**25)]
     )
     def test_reserves_the_scheduler_capacity_without_tp_division(
-        self, monkeypatch, dtype, expected
+        self, monkeypatch, dtype, base, lookahead, doubled
     ):
         runner = mr.RBLNModelRunner.__new__(mr.RBLNModelRunner)
         runner.supports_mm_inputs = True
@@ -247,13 +248,78 @@ class TestEncoderCacheReserve:
         monkeypatch.setattr(
             mr, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True)
         )
+        monkeypatch.setattr(mr, "mm_prefill_lookahead", lambda config: lookahead)
         budget = Mock(return_value=SimpleNamespace(encoder_cache_size=4096))
         monkeypatch.setattr(mr, "MultiModalBudget", budget)
 
-        assert runner.encoder_cache_reserve_bytes == expected
-        assert runner.encoder_cache_reserve_bytes == expected
+        assert runner.encoder_cache_reserve_bytes == base * doubled
+        assert runner.encoder_cache_reserve_bytes == base * doubled
         budget.assert_called_once_with(
             runner.vllm_config, mr.MULTIMODAL_REGISTRY, enable_cache=False
+        )
+
+    @pytest.mark.parametrize("draft_accepts_rbln_mm", [False, True])
+    def test_matches_the_scheduler_under_multimodal_draft_lookahead(
+        self, monkeypatch, draft_accepts_rbln_mm
+    ):
+        """Qwen3.5 + MTP: RBLNScheduler doubles its manager's capacity for the
+        drafter's one-token lookahead, and the reserve must cover those rows,
+        not the base `MultiModalBudget.encoder_cache_size` it was rebuilt from."""
+        from vllm.multimodal import MULTIMODAL_REGISTRY
+        from vllm.multimodal.encoder_budget import MultiModalBudget
+        from vllm.utils.torch_utils import get_dtype_size
+        from vllm.v1.structured_output import StructuredOutputManager
+
+        from tests.vllm.v1.core.utils import full_attention_spec, make_kv_cache_config
+        from tests.vllm.vllm_config import make_vllm_config
+        from vllm_rbln.model_executor.models.qwen3_5 import RBLNQwen3_5MTP
+        from vllm_rbln.v1.core.rbln_scheduler import RBLNScheduler
+        from vllm_rbln.v1.worker.kv_placement import allocation_size
+
+        monkeypatch.setattr(
+            RBLNQwen3_5MTP,
+            "supports_rbln_multimodal_embeddings",
+            draft_accepts_rbln_mm,
+            raising=False,
+        )
+        config = make_vllm_config(
+            model="Qwen/Qwen3.5-4B",
+            max_model_len=8192,
+            max_num_seqs=1,
+            max_num_batched_tokens=512,
+            enable_prefix_caching=False,
+            limit_mm_per_prompt={"image": 2, "video": 0},
+            mm_processor_kwargs={"max_pixels": 4194304},
+            speculative_config={"method": "mtp", "num_speculative_tokens": 3},
+        )
+        config.cache_config.num_gpu_blocks = 64
+        sched = RBLNScheduler(
+            vllm_config=config,
+            kv_cache_config=make_kv_cache_config([full_attention_spec(1024)], 64),
+            block_size=1024,
+            log_stats=True,
+            structured_output_manager=StructuredOutputManager(config),
+        )
+        base = MultiModalBudget(
+            config, MULTIMODAL_REGISTRY, enable_cache=False
+        ).encoder_cache_size
+        rows = sched.encoder_cache_manager.cache_size
+        assert rows == (2 * base if draft_accepts_rbln_mm else base)
+
+        runner = mr.RBLNModelRunner.__new__(mr.RBLNModelRunner)
+        runner.supports_mm_inputs = True
+        runner.device = SimpleNamespace(type="rbln")
+        runner.vllm_config = config
+        runner.model_config = config.model_config
+        runner.dtype = config.model_config.dtype
+        monkeypatch.setattr(
+            mr, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True)
+        )
+
+        assert runner.encoder_cache_reserve_bytes == allocation_size(
+            rows
+            * config.model_config.get_hidden_size()
+            * get_dtype_size(config.model_config.dtype)
         )
 
     @pytest.mark.parametrize(

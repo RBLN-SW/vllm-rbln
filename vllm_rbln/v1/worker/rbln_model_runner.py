@@ -160,7 +160,9 @@ from vllm_rbln.v1.core.rbln_kv_cache_manager import KVCacheCopyOp
 from vllm_rbln.v1.core.rbln_scheduler import RBLNSchedulerOutput
 from vllm_rbln.v1.core.utils import (
     decode_batch_size,
+    encoder_cache_capacity,
     is_strict_kv_producer,
+    mm_prefill_lookahead,
     num_base_tokens,
     resolve_propagated_token_write,
     step_is_prefill,
@@ -1625,12 +1627,16 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         budget = MultiModalBudget(
             self.vllm_config, MULTIMODAL_REGISTRY, enable_cache=False
         )
-        # Conservatively reserve the scheduler's full encoder-cache capacity on each
-        # chiplet rather than assuming the KV cache's sharding also applies here.
+        # The rows the scheduler can admit: its base capacity, doubled for a
+        # multimodal drafter's lookahead, as RBLNScheduler sizes its manager.
+        num_rows = encoder_cache_capacity(
+            budget.encoder_cache_size,
+            mm_prefill_lookahead=mm_prefill_lookahead(self.vllm_config),
+        )
+        # Conservatively reserve that full capacity on each chiplet rather than
+        # assuming the KV cache's sharding also applies here.
         return allocation_size(
-            budget.encoder_cache_size
-            * self.model_config.get_hidden_size()
-            * get_dtype_size(self.dtype)
+            num_rows * self.model_config.get_hidden_size() * get_dtype_size(self.dtype)
         )
 
     def _execute_mm_encoder(self, scheduler_output: RBLNSchedulerOutput) -> None:
