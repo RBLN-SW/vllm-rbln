@@ -16,7 +16,7 @@ import importlib.util
 import inspect
 import math
 import sys
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from itertools import islice
 from pathlib import Path
 from types import ModuleType
@@ -1396,29 +1396,24 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         frames = tower.vision_model.vision_segment_max_frames
         if frames is None:
             frames = t
-        merge = tower.spatial_merge_size
+        tokens_per_frame = h * w // tower.spatial_merge_size**2
         device = next(tower.parameters()).device
-        output = None
-        for start in range(0, t, frames):
-            seg_t = min(frames, t - start)
-            seg_pixels = pixel_values[start * h * w : (start + seg_t) * h * w]
-            embeds = rbln_utils.run_mm_encoder(
-                self._mm_encoder,
-                self._encoder_inputs(seg_pixels, [seg_t, h, w], modality),
-                seg_t * h * w // (merge * merge),
-                device=device,
-                dtype=self.mm_embeds_dtype,
-            )
-            if output is None:
-                output = embeds.new_empty(
-                    (t * h * w // (merge * merge), embeds.shape[-1])
+
+        def segments() -> Iterator[torch.Tensor]:
+            for start in range(0, t, frames):
+                seg_t = min(frames, t - start)
+                seg_pixels = pixel_values[start * h * w : (start + seg_t) * h * w]
+                yield rbln_utils.run_mm_encoder(
+                    self._mm_encoder,
+                    self._encoder_inputs(seg_pixels, [seg_t, h, w], modality),
+                    seg_t * tokens_per_frame,
+                    device=device,
+                    dtype=self.mm_embeds_dtype,
                 )
-            # Copy before the next segment reuses the compiled encoder output.
-            begin = start * h * w // (merge * merge)
-            count = seg_t * h * w // (merge * merge)
-            output[begin : begin + count].copy_(embeds[:count])
-        assert output is not None
-        return output
+
+        # The collector copies each segment out before the next one reuses the
+        # compiled encoder's output buffer.
+        return rbln_utils.collect_mm_encoder_outputs(segments(), t * tokens_per_frame)
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
         outputs: list[torch.Tensor] = []
