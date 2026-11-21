@@ -1,3 +1,16 @@
+# Copyright 2026 Rebellions Inc. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at:
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Measure single-request image TTFT on the RBLN vllm model path."""
 
 import argparse
@@ -10,24 +23,24 @@ IMAGE_BUCKETS = [128, 256, 512, 1024, 2048, 4096]
 PRESETS = {
     "qwen3_5": {
         "model": "Qwen/Qwen3.5-2B",
-        "cases": [(704, 484), (2048, 4096)],
+        "cases": [(352, 121), (704, 484), (2048, 4096)],
         "processor": {"max_pixels": 2048**2},
     },
     "glm5_next": {
         "model": "zai-org/GLM-5.3-Flash",
-        "cases": [(616, 484), (1792, 4096)],
+        "cases": [(308, 121), (616, 484), (1792, 4096)],
         "processor": {"max_image_tokens": 4096},
         "engine": {"kv_cache_dtype": "fp8", "block_size": 1024, "max_model_len": 16384},
     },
     "minimax_m3": {
         "model": "nvidia/MiniMax-M3-NVFP4",
-        "cases": [(616, 484), (1792, 4096)],
+        "cases": [(308, 121), (616, 484), (1792, 4096)],
         "processor": {"max_pixels": 1792**2},
         "engine": {"block_size": 512},
     },
     "gemma4": {
         "model": "google/gemma-4-26B-A4B-it",
-        "cases": [(1024, 280), (1024, 1120)],
+        "cases": [(1024, 70), (1024, 280), (1024, 1120)],
         "processor": {"max_soft_tokens": 1120},
         "engine": {"block_size": 2048, "max_num_batched_tokens": 1152},
         "rbln": {
@@ -58,6 +71,7 @@ def main() -> None:
     import numpy as np
     from PIL import Image
     from vllm import LLM, SamplingParams
+
     from vllm_rbln.config import RBLNConfig
 
     preset = PRESETS[args.preset]
