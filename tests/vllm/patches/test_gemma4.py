@@ -176,7 +176,7 @@ def _token_cut_ops(monkeypatch):
 
     ops = torch.ops.rbln_custom_ops
     monkeypatch.setattr(ops, "residual_read", read, raising=False)
-    monkeypatch.setattr(ops, "gemma4_dense_residual_write", write, raising=False)
+    monkeypatch.setattr(ops, "residual_write", write, raising=False)
     return calls
 
 

@@ -223,7 +223,7 @@ def gated_residual_model(monkeypatch):
     from tests.vllm.vllm_config import make_vllm_config
 
     torch.manual_seed(0)
-    # The axk3_gr_* ops fix n at 4.
+    # The gated_residual_* ops fix n at 4.
     num_streams, hidden = 4, 64
 
     def gated_residual(has_write=True):
@@ -283,7 +283,7 @@ def test_prefill_chunk_matches_decoding_its_tokens_one_at_a_time(gated_residual_
 
     chunk = forward(slice(None))
     # Both layers read a token-cut residual; only the final read, which has no
-    # write gate for axk3_gr_norm to fuse, gets the plain layout.
+    # write gate for gated_residual_norm to fuse, gets the plain layout.
     assert built.read_dims == [4, 4, 4, 4, 3]
 
     built.step.is_prefill = False
