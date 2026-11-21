@@ -20,8 +20,10 @@ region is included in that sum. Drafter time stays in the E2E residual.
 Non-last PP ranks close their pass after the hand-off waits on compute.
 With RBLN_RUNTIME_TIMER on, HOST OP sums the host-op time of timed runs
 completed on the calling thread during the model call.
-Multimodal encoder calls through their existing CPU output copy are reported
-per input shape as ENCODER. Input preparation is outside that interval.
+Multimodal encoder calls are reported per input shape as ENCODER. On RBLN
+the timer starts after the output stream's pending work is synchronized and
+ends after the encoder's completion event; the later copy into the cache
+buffer falls outside that interval, as does input preparation.
 """
 
 import contextlib
