@@ -1671,6 +1671,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         num_tokens: int,
         shift_computed_tokens: int = 0,
     ) -> tuple[list[torch.Tensor], torch.Tensor]:
+        """Return this step's cached vision embeddings and their token mask.
+
+        Ordering contract with ``InputStager.stage_mm_embeds``:
+        1. Concatenating ``mm_embeds`` gives one row per nonzero mask position.
+        2. Rows come in request order, then token order within a request.
+        3. The order survives chunk slicing and the drafter's lookahead shift,
+           since the window and the mask move together.
+        """
         mm_embeds: list[torch.Tensor] = []
         is_mm = torch.zeros(num_tokens, dtype=torch.bool)
 

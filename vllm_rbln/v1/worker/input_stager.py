@@ -173,7 +173,13 @@ class InputStager:
         hidden_size: int,
         layout: InputLayout,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Stage ordered vision embeddings at the mask's nonzero positions.
+        """Stage vision embeddings at the mask's nonzero positions.
+
+        Ordering contract with ``_gather_mm_embeddings``:
+        1. Concatenating ``mm_embeds`` gives one row per nonzero mask position.
+        2. Rows come in request order, then token order within a request.
+        3. Rows are placed by that order alone; the row-count assertion cannot
+           catch two equally sized items that were swapped.
 
         The host mask [R, L, 1] excludes text and padding; the embedding
         buffer [R, L, H] is reused across steps in the mask's dtype.
