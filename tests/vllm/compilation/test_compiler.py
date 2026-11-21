@@ -142,6 +142,12 @@ class TestCompileOptions:
         compile(object(), mode=["foo"])
         assert captured_compile["options"]["mode"] == ["foo", "compile_only"]
 
+    @pytest.mark.parametrize("on", [True, False])
+    def test_declare_held_pv_follows_env(self, captured_compile, monkeypatch, on):
+        monkeypatch.setattr(compiler.envs, "VLLM_RBLN_DECLARE_HELD_PV", on)
+        compile(object())
+        assert captured_compile["options"]["declare_held_pv"] is on
+
     def test_cache_dir_defaults_under_cache_root(self, captured_compile, monkeypatch):
         # Default cache_dir is VLLM_CACHE_ROOT/rbln.
         monkeypatch.setattr(compiler.envs, "VLLM_DISABLE_COMPILE_CACHE", False)
