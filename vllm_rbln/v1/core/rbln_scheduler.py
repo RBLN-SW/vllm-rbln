@@ -22,7 +22,6 @@ from typing import Any
 
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
-from vllm.model_executor.model_loader.utils import get_model_architecture
 from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
@@ -49,9 +48,6 @@ from vllm_rbln.distributed.ec_transfer.ec_connector.rbln_ec_cpu_connector import
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import iter_kv_connectors
 from vllm_rbln.logger import init_logger
-from vllm_rbln.model_executor.models.interfaces import (
-    supports_rbln_multimodal_embeddings,
-)
 from vllm_rbln.v1.core.rbln_kv_cache_manager import (
     KVCacheCopyOp,
     RBLNKVCacheManager,
@@ -59,8 +55,10 @@ from vllm_rbln.v1.core.rbln_kv_cache_manager import (
 )
 from vllm_rbln.v1.core.utils import (
     DecodeBatchBudget,
+    encoder_cache_capacity,
     is_prefill,
     is_strict_kv_producer,
+    mm_prefill_lookahead,
     num_base_tokens,
     should_defer_spec_step,
     sub_block_size_in_use,
@@ -124,32 +122,18 @@ class RBLNScheduler(Scheduler):
             self.num_lookahead_tokens, self.num_spec_tokens
         )
 
-        self.mm_prefill_lookahead = 0
-        if (
-            self.num_prefill_lookahead
-            and self.vllm_config.model_config.supports_multimodal_inputs
-        ):
-            spec = self.vllm_config.speculative_config
-            assert spec is not None
-            draft_cls, _ = get_model_architecture(spec.draft_model_config)
-            if supports_rbln_multimodal_embeddings(draft_cls):
-                self.mm_prefill_lookahead = self.num_prefill_lookahead
-
+        self.mm_prefill_lookahead = mm_prefill_lookahead(self.vllm_config)
         if self.mm_prefill_lookahead:
-            if self.mm_prefill_lookahead != 1:
-                raise NotImplementedError(
-                    "Multimodal drafting requires num_prefill_lookahead_tokens=1; "
-                    f"got {self.mm_prefill_lookahead}. Multi-module multimodal "
-                    "MTP is not supported."
-                )
-            # One-token lookahead can add a whole encoder item to the baseline
-            # demand. Each allowance already fits the largest item, so doubling
-            # provides a conservative bound.
             encoder_compute_budget = self.max_num_encoder_input_tokens
-            self.max_num_encoder_input_tokens *= 2
+            self.max_num_encoder_input_tokens = encoder_cache_capacity(
+                encoder_compute_budget, mm_prefill_lookahead=self.mm_prefill_lookahead
+            )
             manager = self.encoder_cache_manager
             self.encoder_cache_manager = manager.create_manager(
-                cache_size=2 * manager.cache_size, vllm_config=self.vllm_config
+                cache_size=encoder_cache_capacity(
+                    manager.cache_size, mm_prefill_lookahead=self.mm_prefill_lookahead
+                ),
+                vllm_config=self.vllm_config,
             )
             logger.info(
                 "Multimodal draft prefill lookahead=%d: "

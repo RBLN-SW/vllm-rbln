@@ -21,13 +21,21 @@
   microbatch to ``max_num_seqs // pipeline_parallel_size``.
 - Token bookkeeping under spec-decode and PP -- ``should_defer_spec_step``,
   ``num_base_tokens``, ``resolve_propagated_token_write``.
+- Encoder cache capacity -- ``mm_prefill_lookahead``,
+  ``encoder_cache_capacity``: shared with the model runner, which reserves
+  device memory for the rows the scheduler can admit.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from vllm.model_executor.model_loader.utils import get_model_architecture
 from vllm.platforms import current_platform
+
+from vllm_rbln.model_executor.models.interfaces import (
+    supports_rbln_multimodal_embeddings,
+)
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
@@ -52,6 +60,39 @@ def is_strict_kv_producer(vllm_config: VllmConfig) -> bool:
     return (
         kv is not None and kv.kv_connector is not None and kv.kv_role == "kv_producer"
     )
+
+
+def mm_prefill_lookahead(vllm_config: VllmConfig) -> int:
+    """Prefill lookahead tokens that reach a multimodal drafter, else 0.
+
+    The scheduler sizes its encoder cache from this, and the model runner
+    reserves device memory for the same capacity, so both read it here.
+    """
+    lookahead = vllm_config.num_prefill_lookahead_tokens
+    if not lookahead or not vllm_config.model_config.supports_multimodal_inputs:
+        return 0
+    spec = vllm_config.speculative_config
+    assert spec is not None
+    draft_cls, _ = get_model_architecture(spec.draft_model_config)
+    if not supports_rbln_multimodal_embeddings(draft_cls):
+        return 0
+    if lookahead != 1:
+        raise NotImplementedError(
+            "Multimodal drafting requires num_prefill_lookahead_tokens=1; "
+            f"got {lookahead}. Multi-module multimodal MTP is not supported."
+        )
+    return lookahead
+
+
+def encoder_cache_capacity(cache_size: int, *, mm_prefill_lookahead: int) -> int:
+    """Embedding rows the encoder cache holds once the drafter's lookahead
+    is accounted for.
+
+    One-token lookahead can add a whole encoder item to the baseline demand.
+    Each allowance already fits the largest item, so doubling is a
+    conservative bound.
+    """
+    return 2 * cache_size if mm_prefill_lookahead else cache_size
 
 
 def is_prefill(request: Request, *, strict_kv_producer: bool) -> bool:

@@ -49,6 +49,7 @@ from tests.vllm.v1.core.utils import (
     sliding_window_spec,
 )
 from vllm_rbln.v1.core import rbln_scheduler
+from vllm_rbln.v1.core import utils as core_utils
 from vllm_rbln.v1.core.rbln_kv_cache_manager import RBLNKVCacheManager
 from vllm_rbln.v1.core.rbln_scheduler import (
     RBLNEncoderCacheManager,
@@ -2430,7 +2431,7 @@ class TestMultimodalDraftEncoderLookahead:
             from vllm_rbln.model_executor.models.glm5_next import RBLNGlm5NextMTP
 
             monkeypatch.setattr(
-                rbln_scheduler,
+                core_utils,
                 "get_model_architecture",
                 lambda config: (RBLNGlm5NextMTP, "Glm5NextMTP"),
             )

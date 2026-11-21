@@ -24,9 +24,12 @@ import torch
 from vllm.v1.kv_cache_interface import MambaSpec
 
 from tests.vllm.v1.core.utils import full_attention_spec, make_kv_cache_config
+from vllm_rbln.v1.core import utils as core_utils
 from vllm_rbln.v1.core.utils import (
     decode_batch_size,
+    encoder_cache_capacity,
     is_strict_kv_producer,
+    mm_prefill_lookahead,
     num_base_tokens,
     resolve_propagated_token_write,
     should_defer_spec_step,
@@ -447,3 +450,46 @@ class TestSubBlockSizeInUse:
                 kv_cache_config=make_kv_cache_config([full_attention_spec(1024)]),
                 sub_block_size=256,
             )
+
+
+class TestMmPrefillLookahead:
+    """The scheduler and the runner size the encoder cache from one answer."""
+
+    @staticmethod
+    def _config(lookahead, *, multimodal=True):
+        return SimpleNamespace(
+            num_prefill_lookahead_tokens=lookahead,
+            model_config=SimpleNamespace(supports_multimodal_inputs=multimodal),
+            speculative_config=SimpleNamespace(draft_model_config=object()),
+        )
+
+    @staticmethod
+    def _draft(monkeypatch, opted_in):
+        class Draft:
+            supports_multimodal_embeddings = True
+            supports_rbln_multimodal_embeddings = opted_in
+
+        monkeypatch.setattr(core_utils, "get_model_architecture", lambda c: (Draft, ""))
+
+    def test_no_lookahead_or_no_multimodal_input_is_zero(self, monkeypatch):
+        self._draft(monkeypatch, True)
+        assert mm_prefill_lookahead(self._config(0)) == 0
+        assert mm_prefill_lookahead(self._config(1, multimodal=False)) == 0
+
+    def test_a_drafter_that_takes_no_rbln_embeddings_is_zero(self, monkeypatch):
+        self._draft(monkeypatch, False)
+        assert mm_prefill_lookahead(self._config(1)) == 0
+
+    def test_one_token_reaches_a_multimodal_drafter(self, monkeypatch):
+        self._draft(monkeypatch, True)
+        assert mm_prefill_lookahead(self._config(1)) == 1
+
+    def test_more_than_one_token_is_refused(self, monkeypatch):
+        self._draft(monkeypatch, True)
+        with pytest.raises(NotImplementedError, match="num_prefill_lookahead_tokens=1"):
+            mm_prefill_lookahead(self._config(3))
+
+
+@pytest.mark.parametrize("lookahead, expected", [(0, 4096), (1, 8192)])
+def test_encoder_cache_capacity_doubles_for_the_lookahead(lookahead, expected):
+    assert encoder_cache_capacity(4096, mm_prefill_lookahead=lookahead) == expected
