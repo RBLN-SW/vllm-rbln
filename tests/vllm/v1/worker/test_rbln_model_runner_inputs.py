@@ -241,7 +241,7 @@ class TestEncoderCacheReserve:
         runner = mr.RBLNModelRunner.__new__(mr.RBLNModelRunner)
         runner.supports_mm_inputs = True
         runner.device = SimpleNamespace(type="rbln")
-        runner.vllm_config = object()
+        runner.vllm_config = SimpleNamespace(ec_transfer_config=None)
         runner.model_config = SimpleNamespace(get_hidden_size=lambda: 2048)
         runner.dtype = dtype
         runner.parallel_config = SimpleNamespace(tensor_parallel_size=4)
@@ -257,6 +257,35 @@ class TestEncoderCacheReserve:
         budget.assert_called_once_with(
             runner.vllm_config, mr.MULTIMODAL_REGISTRY, enable_cache=False
         )
+
+    @pytest.mark.parametrize(
+        "ec_role, reserved",
+        [("ec_producer", True), ("ec_both", True), ("ec_consumer", False)],
+    )
+    def test_a_consumer_only_engine_keeps_its_cache_on_the_host(
+        self, monkeypatch, ec_role, reserved
+    ):
+        """The EC connectors load into host memory, so a consumer that never
+        encodes holds no cache on the device; a producer or ec_both does."""
+        runner = mr.RBLNModelRunner.__new__(mr.RBLNModelRunner)
+        runner.supports_mm_inputs = True
+        runner.device = SimpleNamespace(type="rbln")
+        runner.vllm_config = SimpleNamespace(
+            ec_transfer_config=ECTransferConfig(
+                ec_connector="RBLNECCPUConnector", ec_role=ec_role
+            )
+        )
+        runner.model_config = SimpleNamespace(get_hidden_size=lambda: 2048)
+        runner.dtype = torch.bfloat16
+        monkeypatch.setattr(
+            mr, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True)
+        )
+        monkeypatch.setattr(mr, "mm_prefill_lookahead", lambda config: 0)
+        budget = Mock(return_value=SimpleNamespace(encoder_cache_size=4096))
+        monkeypatch.setattr(mr, "MultiModalBudget", budget)
+
+        assert runner.encoder_cache_reserve_bytes == (2**24 if reserved else 0)
+        assert budget.called is reserved
 
     @pytest.mark.parametrize("draft_accepts_rbln_mm", [False, True])
     def test_matches_the_scheduler_under_multimodal_draft_lookahead(

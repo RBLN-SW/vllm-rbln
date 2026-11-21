@@ -1624,6 +1624,18 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             or not get_pp_group().is_first_rank
         ):
             return 0
+        ec_config = self.vllm_config.ec_transfer_config
+        # FIXME(disaggregated encoder): a consumer-only engine never encodes.
+        # Its cache arrives from the EC connector in host memory, and a step
+        # stages only the rows it needs on the device, so nothing is reserved
+        # for it yet. Reserve here once the connectors load the cache onto the
+        # device.
+        if (
+            ec_config is not None
+            and ec_config.is_ec_consumer
+            and not ec_config.is_ec_producer
+        ):
+            return 0
         budget = MultiModalBudget(
             self.vllm_config, MULTIMODAL_REGISTRY, enable_cache=False
         )
