@@ -203,6 +203,7 @@ def test_image_encoding_reuses_eager_or_compiled_encoder(monkeypatch, compiled):
     model.visual = torch.nn.Linear(2, 2, bias=False)
     model.visual.spatial_merge_size = 1
     model.visual.device, model.visual.dtype = torch.device("cpu"), torch.float32
+    model.visual.rotary_pos_emb = SimpleNamespace(rotary_dim=2, base=100.0)
     model.mm_embeds_dtype = torch.float32
     encoder = torch.nn.Sequential(model.visual)
     build_encoder = Mock(return_value=encoder)
@@ -248,6 +249,7 @@ def _build_with_token_budgets(monkeypatch, budgets, limits, is_first_rank=True):
         spatial_merge_size=2,
         patch_embed=SimpleNamespace(proj=SimpleNamespace(weight=torch.zeros(3, 5))),
         blocks=[SimpleNamespace(attn=SimpleNamespace(head_dim=4))],
+        rotary_pos_emb=SimpleNamespace(rotary_dim=4, base=100.0),
     )
     monkeypatch.setattr(glm, "Glm5NextVisionTransformer", lambda *args, **kw: visual)
     monkeypatch.setattr(
@@ -350,6 +352,7 @@ def test_vision_encoder_builds_its_inputs_from_upstream_rope(monkeypatch):
     model = _bare(glm.RBLNGlm5NextForConditionalGeneration)
     model.visual = visual
     model._mm_input_buffers = EncoderInputBuffers(visual.device, visual.dtype)
+    model._rotary_table = glm._rotary_table(visual)
     model.mm_encoder_patch_buckets = [16]
     padded, cos, sin, key_bias = model._encoder_inputs(pixels, [1, 2, 4])
 
@@ -474,6 +477,7 @@ def test_video_frames_reuse_image_buckets_without_cross_frame_attention(video_fi
     model._mm_input_buffers = EncoderInputBuffers(
         model.visual.device, model.visual.dtype
     )
+    model._rotary_table = glm._rotary_table(model.visual)
     image = torch.arange(8, dtype=torch.float32).reshape(2, 4) / 10
     video = torch.arange(40, dtype=torch.float32).reshape(10, 4) / 10
     image_inputs = dict(pixel_values=image, image_grid_thw=torch.tensor([[1, 1, 2]]))
