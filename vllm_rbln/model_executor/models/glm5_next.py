@@ -1428,17 +1428,16 @@ class RBLNGlm5NextForConditionalGeneration(
         with torch.inference_mode():
             for bucket in self.mm_encoder_patch_buckets:
                 # Every entry valid: the warm-up never masks a key.
-                head_dim = visual.blocks[0].attn.head_dim
                 self._mm_encoder(
-                    *self._stage_encoder_inputs(bucket, head_dim, bucket, [None] * 4)
+                    *self._stage_encoder_inputs(bucket, bucket, [None] * 4)
                 )
 
-    def _mm_input_specs(
-        self, bucket: int, head_dim: int
-    ) -> list[rbln_utils.EncoderInput]:
+    def _mm_input_specs(self, bucket: int) -> list[rbln_utils.EncoderInput]:
         """The encoder's inputs at `bucket`: patches, the rotary cos and sin
         over `head_dim`, and the key bias that masks the padding."""
-        patch_dim = self.visual.patch_embed.proj.weight[0].numel()
+        visual = self.visual
+        patch_dim = math.prod(visual.patch_embed.proj.weight.shape[1:])
+        head_dim = visual.blocks[0].attn.head_dim
         return [
             rbln_utils.EncoderInput((bucket, patch_dim), 0, 0.0, 0.0),
             rbln_utils.EncoderInput((bucket, head_dim), 0, 1.0, 1.0),
@@ -1449,15 +1448,12 @@ class RBLNGlm5NextForConditionalGeneration(
     def _stage_encoder_inputs(
         self,
         bucket: int,
-        head_dim: int,
         num_patches: int,
         prefixes: list[torch.Tensor | None],
     ) -> list[torch.Tensor]:
         buffers = self._mm_input_buffers
         assert buffers is not None, "compile_mm_encoder runs before encoding"
-        return buffers.stage(
-            bucket, self._mm_input_specs(bucket, head_dim), prefixes, num_patches
-        )
+        return buffers.stage(bucket, self._mm_input_specs, prefixes, num_patches)
 
     def _encoder_inputs(
         self, pixel_values: torch.Tensor, grid_thw: list[int]
@@ -1491,7 +1487,6 @@ class RBLNGlm5NextForConditionalGeneration(
         key_bias[..., num_patches:] = -30000.0
         return self._stage_encoder_inputs(
             bucket,
-            angles.shape[-1],
             num_patches,
             [pixel_values, angles.cos(), angles.sin(), key_bias],
         )

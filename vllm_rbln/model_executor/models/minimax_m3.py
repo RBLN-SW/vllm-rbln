@@ -1330,7 +1330,7 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         tower = self.vision_tower
         assert tower is not None
         vm = tower.vision_model
-        patch_dim = vm.embeddings.patch_embedding.weight[0].numel()
+        patch_dim = math.prod(vm.embeddings.patch_embedding.weight.shape[1:])
         head_dim = vm.encoder.layers[0].self_attn.head_dim
         return [
             rbln_utils.EncoderInput((bucket, patch_dim), 0, 0.0, 0.0),
@@ -1344,9 +1344,7 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
     ) -> list[torch.Tensor]:
         buffers = self._mm_input_buffers
         assert buffers is not None, "compile_mm_encoder runs before encoding"
-        return buffers.stage(
-            bucket, self._mm_input_specs(bucket), prefixes, num_patches
-        )
+        return buffers.stage(bucket, self._mm_input_specs, prefixes, num_patches)
 
     def compile_mm_encoder(self, compile_fn) -> None:
         # Non-first PP ranks and zero image/video limits own no vision tower.

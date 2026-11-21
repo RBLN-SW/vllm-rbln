@@ -307,6 +307,7 @@ def test_vision_encoder_builds_its_inputs_from_upstream_rope(monkeypatch):
         spatial_merge_size=2,
         patch_embed=SimpleNamespace(proj=SimpleNamespace(weight=torch.zeros(3, 5))),
         rotary_pos_emb=SimpleNamespace(rotary_dim=4, base=100.0),
+        blocks=[SimpleNamespace(attn=SimpleNamespace(head_dim=8))],
     )
     pixels = torch.arange(40, dtype=torch.float32).view(8, 5)
 
@@ -422,6 +423,7 @@ def test_video_frames_reuse_image_buckets_without_cross_frame_attention(video_fi
         spatial_merge_size=1,
         patch_embed=SimpleNamespace(proj=SimpleNamespace(weight=torch.zeros(4, 4))),
         rotary_pos_emb=SimpleNamespace(rotary_dim=2, base=100.0),
+        blocks=[SimpleNamespace(attn=SimpleNamespace(head_dim=4))],
     )
     model.mm_encoder_patch_buckets = [4, 8]
     model.mm_embeds_dtype = torch.bfloat16

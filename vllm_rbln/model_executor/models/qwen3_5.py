@@ -300,7 +300,7 @@ class RBLNQwen3_5ForConditionalGeneration(
         """The encoder's inputs at `bucket`: patches, position embeddings, the
         rotary cos and sin, and the key bias that masks the padding."""
         visual = self.visual
-        patch_dim = visual.patch_embed.proj.weight[0].numel()
+        patch_dim = math.prod(visual.patch_embed.proj.weight.shape[1:])
         rotary_dim = visual.blocks[0].attn.hidden_size_per_attention_head // 2
         return [
             rbln_utils.EncoderInput((bucket, patch_dim), 0, 0.0, 0.0),
@@ -315,9 +315,7 @@ class RBLNQwen3_5ForConditionalGeneration(
     ) -> list[torch.Tensor]:
         buffers = self._mm_input_buffers
         assert buffers is not None, "compile_mm_encoder runs before encoding"
-        return buffers.stage(
-            bucket, self._mm_input_specs(bucket), prefixes, num_patches
-        )
+        return buffers.stage(bucket, self._mm_input_specs, prefixes, num_patches)
 
     def _encoder_inputs(
         self, pixel_values: torch.Tensor, grid_thw: list[int]

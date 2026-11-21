@@ -55,25 +55,33 @@ class EncoderInput(NamedTuple):
 
 
 class EncoderInputBuffers:
-    """Device buffers a vision encoder's inputs are staged into, one set a bucket.
+    """Reuse one set of device input buffers per vision encoder bucket.
 
-    Uploading into a freshly allocated device tensor runs several times slower
-    than into one written before, so each bucket keeps its input tensors across
-    calls, and a call copies only what the image needs: its own entries of each
-    input, and the key bias over the whole bucket. The padding entries of the
-    other inputs keep whatever an earlier image left there. That is finite,
-    and the key bias masks those entries, so they never reach a valid output.
+    Staging can leave values from previous calls in padding. Callers must
+    refresh the attention mask for the current input before encoding.
     """
 
     def __init__(self, device: torch.device | str, dtype: torch.dtype) -> None:
         self.device = torch.device(device)
         self.dtype = dtype
-        self._buffers: dict[int, list[torch.Tensor]] = {}
+        self._buckets: dict[int, tuple[Sequence[EncoderInput], list[torch.Tensor]]] = {}
 
-    def get(self, bucket: int, specs: Sequence[EncoderInput]) -> list[torch.Tensor]:
-        """The bucket's buffers, allocated and padded on first use."""
-        buffers = self._buffers.get(bucket)
-        if buffers is None:
+    def stage(
+        self,
+        bucket: int,
+        build_specs: Callable[[int], Sequence[EncoderInput]],
+        values: Sequence[torch.Tensor | None],
+        num_valid: int,
+    ) -> list[torch.Tensor]:
+        """Initialize the bucket on first use and write its input values.
+
+        Copy each value over the whole buffer or its valid prefix, depending on
+        its length along the bucket axis. None fills the buffer with the spec's
+        valid value.
+        """
+        entry = self._buckets.get(bucket)
+        if entry is None:
+            specs = build_specs(bucket)
             # Plain tensors, not inference tensors: staging writes them in place
             # inside and outside inference mode alike.
             with torch.inference_mode(False):
@@ -86,21 +94,8 @@ class EncoderInputBuffers:
                     )
                     for spec in specs
                 ]
-            self._buffers[bucket] = buffers
-        return buffers
-
-    def stage(
-        self,
-        bucket: int,
-        specs: Sequence[EncoderInput],
-        values: Sequence[torch.Tensor | None],
-        num_valid: int,
-    ) -> list[torch.Tensor]:
-        """Fill the bucket's buffers. A value spanning the bucket along its
-        input's axis is copied whole; one spanning `num_valid` entries is
-        copied over the leading entries; None fills every entry with the
-        input's valid value."""
-        buffers = self.get(bucket, specs)
+            entry = self._buckets[bucket] = (specs, buffers)
+        specs, buffers = entry
         for buffer, spec, value in zip(buffers, specs, values, strict=True):
             if value is None:
                 buffer.fill_(spec.valid)

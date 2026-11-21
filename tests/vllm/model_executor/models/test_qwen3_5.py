@@ -289,6 +289,8 @@ def test_a_bucket_reuses_its_input_buffers_and_masks_the_padding(visual):
     )
     torch.nn.Module.__init__(model)
     model.visual = visual
+    input_specs = Mock(wraps=model._mm_input_specs)
+    model._mm_input_specs = input_specs
     model._mm_input_buffers = EncoderInputBuffers(visual.device, visual.dtype)
     model.mm_encoder_patch_buckets = [64, 128]
     patch_dim = 3 * TEMPORAL * PATCH * PATCH
@@ -296,6 +298,7 @@ def test_a_bucket_reuses_its_input_buffers_and_masks_the_padding(visual):
     large = model._encoder_inputs(torch.full((64, patch_dim), 5.0), [1, 8, 8])
     small = model._encoder_inputs(torch.full((24, patch_dim), 3.0), [1, 6, 4])
 
+    input_specs.assert_called_once_with(64)
     # Same bucket, same device tensors: no allocation and no padded host copy.
     assert [x.data_ptr() for x in small] == [x.data_ptr() for x in large]
     patches, pos_embeds, cos, sin, key_bias = small

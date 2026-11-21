@@ -436,7 +436,7 @@ class RBLNGemma4ForConditionalGeneration(
         assert buffers is not None, "compile_mm_encoder runs before encoding"
         inputs = buffers.stage(
             bucket,
-            self._mm_input_specs(bucket, pixel_values.shape[-1]),
+            self._mm_input_specs,
             [pixel_values[valid].unsqueeze(0), positions, padding, key_bias],
             num_patches,
         )
@@ -447,12 +447,11 @@ class RBLNGemma4ForConditionalGeneration(
             lambda *inputs: encoder(*inputs)[0], inputs, num_soft_tokens
         )
 
-    def _mm_input_specs(
-        self, bucket: int, patch_pixels: int
-    ) -> list[rbln_utils.EncoderInput]:
+    def _mm_input_specs(self, bucket: int) -> list[rbln_utils.EncoderInput]:
         """The encoder's inputs at `bucket`: float32 patches, their (x, y)
         positions, the padding mask, and the key bias that masks the padding.
         Fixed dtypes, so warm-up and serving reach the same compiled graphs."""
+        patch_pixels = 3 * self.vision_tower.config.patch_size**2
         return [
             rbln_utils.EncoderInput(
                 (1, bucket, patch_pixels), 1, 0.0, 0.0, torch.float32
