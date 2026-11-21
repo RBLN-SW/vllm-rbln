@@ -262,6 +262,22 @@ class TestCachePositionsFollowCacheOrder:
         assert runner.kv_cache_names == list(names)
         assert runner.kv_cache_positions == {name: i for i, name in enumerate(names)}
 
+    def test_draft_alias_uses_the_target_allocation(self, make_model_runner):
+        target = "model.layers.12.self_attn.attn"
+        draft = "draft.layers.0.self_attn.attn"
+        runner = make_model_runner(layers=(target, draft), init_kv_cache=False)
+        context = runner.compilation_config.static_forward_context
+        context[draft].kv_sharing_target_layer_name = target
+        assert draft not in runner.get_kv_cache_spec()
+
+        runner.initialize_kv_cache(make_kv_cache_config(runner, groups=[(target,)]))
+
+        cache = context[target].kv_cache
+        assert context[draft].kv_cache is cache
+        assert runner.kv_cache_names == [draft, target]
+        assert runner.kv_caches[runner.kv_cache_positions[draft]] is cache
+        assert runner.kv_cache_allocations == {kv_cache_tensor_key(cache): target}
+
     def test_dsa_fp8_keeps_three_caches_per_layer_in_order(self, make_model_runner):
         # DeepSeek-V3.2 / A.X-K3 under KV8: MLA latent, indexer keys, and the
         # indexer's fp16 scale cache.

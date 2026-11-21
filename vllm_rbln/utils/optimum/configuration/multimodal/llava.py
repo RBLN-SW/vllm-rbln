@@ -21,7 +21,7 @@ def build_llava_config(
     max_model_len: int,
     block_size: int,
     num_devices: int,
-    memory_budget: float,
+    kv_cache_capacity_fields: dict[str, int | float],
     prefill_chunk_size: int | None = None,
 ) -> dict:
     rbln_config = {
@@ -31,7 +31,7 @@ def build_llava_config(
             max_model_len,
             block_size,
             num_devices,
-            memory_budget,
+            kv_cache_capacity_fields,
             prefill_chunk_size,
         ),
     }

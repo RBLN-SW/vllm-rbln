@@ -267,9 +267,16 @@ class RBLNGemma4ForConditionalGeneration(
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         if vllm_config.parallel_config.data_parallel_size > 1:
             raise ValueError("Gemma4 does not support data parallel on RBLN.")
-        if vllm_config.speculative_config is not None:
+        spec = vllm_config.speculative_config
+        if spec is not None and not spec.use_gemma4_mtp():
             raise ValueError(
-                "Gemma4 does not support speculative decoding on RBLN yet."
+                "Gemma4 supports speculative decoding only with its MTP assistant."
+            )
+        # Off the first stage the target shares no embedding, so the assistant
+        # keeps its narrower one and its first projection mismatches.
+        if spec is not None and vllm_config.parallel_config.pipeline_parallel_size > 1:
+            raise ValueError(
+                "Gemma4 MTP on RBLN supports pipeline_parallel_size=1 only."
             )
         # Upstream fills per-layer inputs in its own embed_input_ids, which the
         # in-graph merge of mm embeddings (forward) bypasses.

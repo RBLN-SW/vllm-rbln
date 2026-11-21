@@ -12,19 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+from pathlib import Path
+from stat import S_IFREG
 from types import SimpleNamespace
 
 import pytest
 import torch
+from huggingface_hub import ResolvedRevision
 from optimum.rbln import RBLNAutoModelForCausalLM
 from transformers import GptOssConfig, LlamaConfig, PretrainedConfig, Qwen3Config
 
-from vllm_rbln.config import build_optimum_rbln_config
+from vllm_rbln.config import OptimumWeightsIdentity, build_optimum_rbln_config
 from vllm_rbln.utils.optimum.configuration import sync
 from vllm_rbln.utils.optimum.configuration.compile_config import (
     compile_cache_name,
     prepare_compile_config,
 )
+from vllm_rbln.utils.optimum.configuration.multimodal import MULTIMODAL_CONFIG_BUILDERS
 from vllm_rbln.utils.optimum.configuration.multimodal.qwen import (
     build_qwen3_5_config,
 )
@@ -51,6 +56,7 @@ def _vllm_config(hf_config, *, optimum_overrides=None, prefill_chunk_size=None):
             user_specified_block_size=True,
             enable_prefix_caching=False,
             gpu_memory_utilization=0.9,
+            num_gpu_blocks_override=None,
         ),
         additional_config=build_optimum_rbln_config(
             {
@@ -91,6 +97,93 @@ def test_multimodal_decoder_option(monkeypatch, architecture, key):
     assert decoder["nested_compile_region"] is True
     if key:
         assert "nested_compile_region" not in inputs.rbln_config
+
+
+@pytest.mark.parametrize(
+    "num_blocks, override_blocks, expected_blocks",
+    [
+        (None, None, None),
+        (None, 0, None),
+        (None, 16, 16),
+        (16, None, 16),
+        (16, 0, 16),
+        (16, 16, 16),
+    ],
+)
+@pytest.mark.parametrize(
+    "architecture, key, override_key",
+    [
+        ("LlamaForCausalLM", None, None),
+        ("Qwen3VLForConditionalGeneration", None, None),
+        ("Gemma3ForConditionalGeneration", "language_model", "language_model"),
+        ("Gemma3ForConditionalGeneration", "language_model", None),
+        ("Idefics3ForConditionalGeneration", "text_model", "text_model"),
+    ],
+)
+def test_explicit_blocks_replace_automatic_memory_budget(
+    architecture, key, override_key, num_blocks, override_blocks, expected_blocks
+):
+    overrides = (
+        {} if override_blocks is None else {"kvcache_num_blocks": override_blocks}
+    )
+    overrides = {override_key: overrides} if override_key else overrides
+    cfg = _vllm_config(
+        PretrainedConfig(architectures=[architecture]), optimum_overrides=overrides
+    )
+    cfg.cache_config.num_gpu_blocks_override = num_blocks
+    inputs = prepare_compile_config(cfg)
+    decoder = inputs.rbln_config[key] if key else inputs.rbln_config
+    if expected_blocks is None:
+        assert decoder["memory_budget"] == 0.9
+    else:
+        assert "memory_budget" not in decoder
+        assert decoder["kvcache_num_blocks"] == expected_blocks
+        if key:
+            assert "kvcache_num_blocks" not in inputs.rbln_config
+    assert cfg.additional_config.optimum_overrides == overrides
+    assert cfg.cache_config.num_gpu_blocks_override == num_blocks
+    assert cfg.cache_config.gpu_memory_utilization == 0.9
+
+
+@pytest.mark.parametrize("memory_budget", [0.8, None])
+@pytest.mark.parametrize("block_source", ["vllm", "optimum"])
+@pytest.mark.parametrize(
+    "architecture, decoder_key, budget_key",
+    [
+        ("LlamaForCausalLM", None, None),
+        ("Qwen3VLForConditionalGeneration", None, None),
+        ("Gemma3ForConditionalGeneration", "language_model", "language_model"),
+        ("Gemma3ForConditionalGeneration", "language_model", None),
+        ("Idefics3ForConditionalGeneration", "text_model", "text_model"),
+        ("Idefics3ForConditionalGeneration", "text_model", None),
+    ],
+)
+def test_explicit_blocks_validate_memory_budget_override(
+    architecture, decoder_key, budget_key, block_source, memory_budget
+):
+    overrides: dict = {}
+    decoder_overrides = (
+        overrides.setdefault(decoder_key, {}) if decoder_key else overrides
+    )
+    if block_source == "optimum":
+        decoder_overrides["kvcache_num_blocks"] = 16
+    budget_overrides = overrides.setdefault(budget_key, {}) if budget_key else overrides
+    budget_overrides["memory_budget"] = memory_budget
+    cfg = _vllm_config(
+        PretrainedConfig(architectures=[architecture]), optimum_overrides=overrides
+    )
+    if block_source == "vllm":
+        cfg.cache_config.num_gpu_blocks_override = 16
+
+    if memory_budget is not None:
+        with pytest.raises(ValueError, match="memory_budget.*explicit.*block count"):
+            prepare_compile_config(cfg)
+    else:
+        inputs = prepare_compile_config(cfg)
+        decoder = inputs.rbln_config[decoder_key] if decoder_key else inputs.rbln_config
+        assert decoder.get("memory_budget") is None
+        assert decoder["kvcache_num_blocks"] == 16
+    assert cfg.additional_config.optimum_overrides == overrides
 
 
 def test_flag_conflicts_with_decoder_override(monkeypatch):
@@ -142,6 +235,25 @@ def test_prefill_chunk_size_conflicting_with_override_is_rejected(arch, override
         prepare_compile_config(cfg)
 
 
+@pytest.mark.parametrize("model_name", MULTIMODAL_CONFIG_BUILDERS)
+@pytest.mark.parametrize(
+    "kv_cache_capacity_fields", [{"memory_budget": 0.9}, {"kvcache_num_blocks": 16}]
+)
+def test_multimodal_builders_apply_kv_cache_capacity(
+    model_name, kv_cache_capacity_fields
+):
+    config = MULTIMODAL_CONFIG_BUILDERS[model_name](
+        4, 8192, 1024, 1, kv_cache_capacity_fields, 256
+    )
+    decoder = config.get("language_model", config.get("text_model", config))
+    actual = {
+        key: decoder[key]
+        for key in ("memory_budget", "kvcache_num_blocks")
+        if key in decoder
+    }
+    assert actual == kv_cache_capacity_fields
+
+
 class TestQwen35ConfigBuilder:
     """Qwen3.5 takes the same parameters as the other Qwen VLMs: a block_size below
     max_model_len partitions the cache and selects flash attention, and a block_size
@@ -150,7 +262,7 @@ class TestQwen35ConfigBuilder:
     cfg = {
         "batch_size": 1,
         "num_devices": 1,
-        "memory_budget": 0.9,
+        "kv_cache_capacity_fields": {"memory_budget": 0.9},
         "prefill_chunk_size": 128,
     }
 
@@ -172,6 +284,103 @@ class TestQwen35ConfigBuilder:
 
 @pytest.mark.usefixtures("compile_environment")
 class TestCompileCacheName:
+    def test_hub_commit_changes_hash(self, vllm_config_factory):
+        cfg = vllm_config_factory(sync_config=False)
+        model_config = cfg.model_config
+        first_sha = "a" * 40
+        model_config.revision = ResolvedRevision(first_sha, "main", model_config.model)
+        first = prepare_compile_config(cfg)
+        assert first.weights_identity == OptimumWeightsIdentity("hub", first_sha)
+
+        model_config.revision = first_sha
+        assert compile_cache_name(prepare_compile_config(cfg)) == compile_cache_name(
+            first
+        )
+
+        model_config.revision = ResolvedRevision("b" * 40, "main", model_config.model)
+        assert compile_cache_name(prepare_compile_config(cfg)) != compile_cache_name(
+            first
+        )
+
+    def test_hub_config_commit_fallback_requires_same_repository(
+        self, vllm_config_factory
+    ):
+        cfg = vllm_config_factory(sync_config=False)
+        cfg.model_config.revision = "main"
+        cfg.model_config.hf_config._commit_hash = "a" * 40
+        assert prepare_compile_config(cfg).weights_identity == OptimumWeightsIdentity(
+            "hub", "a" * 40
+        )
+
+        cfg.model_config.hf_config_path = "other/config"
+        assert prepare_compile_config(cfg).weights_identity is None
+
+        cfg.model_config.revision = "b" * 40
+        assert prepare_compile_config(cfg).weights_identity == OptimumWeightsIdentity(
+            "hub", "b" * 40
+        )
+
+    def test_local_weight_metadata_changes_hash(
+        self, monkeypatch, tmp_path, vllm_config_factory
+    ):
+        weight = tmp_path / "model.safetensors"
+        weight.touch()
+        stat = Path.stat
+        metadata = SimpleNamespace(
+            st_mode=S_IFREG, st_size=1, st_mtime_ns=2, st_ctime_ns=3
+        )
+
+        def stat_weight(path, **kwargs):
+            if path.parent == tmp_path and path.suffix == ".safetensors":
+                return metadata
+            return stat(path, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", stat_weight)
+
+        def cache_name():
+            cfg = vllm_config_factory(sync_config=False)
+            cfg.model_config.model = str(tmp_path)
+            cfg.model_config.hf_config._commit_hash = "a" * 40
+            inputs = prepare_compile_config(cfg)
+            assert inputs.weights_identity is not None
+            assert inputs.weights_identity.source == "local"
+            return compile_cache_name(inputs)
+
+        initial = cache_name()
+        assert cache_name() == initial
+
+        for field in ("st_size", "st_mtime_ns", "st_ctime_ns"):
+            before = getattr(metadata, field)
+            setattr(metadata, field, before + 1)
+            assert cache_name() != initial, field
+            setattr(metadata, field, before)
+
+        weight.rename(tmp_path / "model-00001-of-00001.safetensors")
+        assert cache_name() != initial
+
+    def test_local_weight_index_changes_hash(self, tmp_path, vllm_config_factory):
+        shards = tmp_path / "shards"
+        shards.mkdir()
+        first = shards / "first.bin"
+        first.write_bytes(b"first")
+        second = shards / "other.bin"
+        second.write_bytes(b"other")
+        index = tmp_path / "pytorch_model.bin.index.json"
+
+        cfg = vllm_config_factory(sync_config=False)
+        cfg.model_config.model = str(tmp_path)
+        weight_map = {"a": "shards/first.bin", "b": "shards/other.bin"}
+        index.write_text(json.dumps({"weight_map": weight_map}))
+        initial = compile_cache_name(prepare_compile_config(cfg))
+
+        first.write_bytes(b"larger shard")
+        resized = compile_cache_name(prepare_compile_config(cfg))
+        assert resized != initial
+
+        weight_map["a"], weight_map["b"] = weight_map["b"], weight_map["a"]
+        index.write_text(json.dumps({"weight_map": weight_map}))
+        assert compile_cache_name(prepare_compile_config(cfg)) != resized
+
     def test_npu_type_changes_hash(self, monkeypatch, vllm_config_factory):
         ca25 = compile_cache_name(
             vllm_config_factory().additional_config.compile_config
@@ -295,7 +504,7 @@ class TestCompileCacheName:
         cfg.model_config.hf_config.num_hidden_layers = 1
         assert compile_cache_name(cfg.additional_config.compile_config) == original
 
-    @pytest.mark.parametrize("key", ["device", "create_runtimes", "kvcache_num_blocks"])
+    @pytest.mark.parametrize("key", ["device", "create_runtimes"])
     def test_load_only_options_do_not_change_the_key(self, key, vllm_config_factory):
         cfg = vllm_config_factory()
         original = compile_cache_name(cfg.additional_config.compile_config)

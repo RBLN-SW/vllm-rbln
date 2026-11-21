@@ -59,6 +59,7 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
 )
 from vllm.v1.attention.backends.utils import create_fast_prefill_custom_backend
+from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.core.sched.output import (
     GrammarOutput,
     NewRequestData,
@@ -172,6 +173,7 @@ from vllm_rbln.v1.spec_decode.eagle3_pp import (
     aux_hidden_states_enabled,
     install_aux_handoff_slots,
 )
+from vllm_rbln.v1.spec_decode.gemma4 import RBLNGemma4Proposer
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
 from vllm_rbln.v1.worker import mega_cache
 from vllm_rbln.v1.worker.async_output import AsyncRBLNModelRunnerOutput
@@ -389,6 +391,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 self.drafter = RBLNMedusaProposer(self.vllm_config, self.device)
             elif self.speculative_config.method == "dflash":
                 self.drafter = RBLNDFlashProposer(self.vllm_config, self.device, self)
+            elif self.speculative_config.use_gemma4_mtp():
+                self.drafter = RBLNGemma4Proposer(self.vllm_config, self.device, self)
             elif self.speculative_config.use_eagle():
                 self.drafter = RBLNEagleProposer(self.vllm_config, self.device, self)
             else:
@@ -1599,8 +1603,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     "--mm-processor-kwargs."
                 )
             # TODO(RBLN): the drafter's builders get no row ends, so its sliding
-            # layers would run the ranges causally.
-            if self.speculative_config is not None:
+            # layers would run the ranges causally. A Gemma4 MTP assistant only
+            # queries the target's last position, which no range runs past.
+            spec = self.speculative_config
+            if spec is not None and not spec.use_gemma4_mtp():
                 raise ValueError(
                     "Speculative decoding is not supported with multimodal inputs of "
                     "an mm prefix LM on RBLN yet."
@@ -2080,6 +2086,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             # pass so that partially cached blocks are populated.
             if scheduler_output.kv_cache_copy_ops:
                 self._process_kv_cache_copy_ops(scheduler_output.kv_cache_copy_ops)
+            if scheduler_output.kv_cache_block_copies:
+                self._copy_kv_cache_blocks(scheduler_output.kv_cache_block_copies)
 
             if not num_scheduled_tokens:
                 if not has_kv_transfer_group():
@@ -3645,9 +3653,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         # The runner owns the cache storage until sizing finishes. Rebuild keys
         # on allocation so addresses are never matched across cache generations.
         self.kv_cache_allocations = {}
-        for name, cache in zip(self.kv_cache_names, self.kv_caches):
-            key = kv_cache_tensor_key(cache)
-            self.kv_cache_allocations.setdefault(key, name)
+        for name, cache in zip(self.kv_cache_names, self.kv_caches, strict=True):
+            if name not in self.shared_kv_cache_layers:
+                self.kv_cache_allocations.setdefault(kv_cache_tensor_key(cache), name)
         self.kv_cache_block_axes = block_axes
         for layer_name, kv_cache in kv_caches.items():
             forward_context[layer_name].kv_cache = kv_cache
@@ -4326,6 +4334,29 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             direction,
             block_axes=self.kv_cache_block_axes,
         )
+
+    def _copy_kv_cache_blocks(self, copies: list[KVCacheBlockCopy]) -> None:
+        """Upstream's copy-on-write of a block a partial prefix hit privatizes.
+
+        A copy names a block, not its group, and every group indexes the one
+        block pool, so each cache copies the page; a page another group owns is
+        unused by its own group there.
+        """
+        assert use_device_tensor() or self.model_config.enforce_eager
+        dsts: list[torch.Tensor] = []
+        srcs: list[torch.Tensor] = []
+        seen: set[int] = set()
+        for layer_name, kv_cache in zip(
+            self.kv_cache_names, self.kv_caches, strict=True
+        ):
+            if kv_cache.data_ptr() in seen:
+                continue
+            seen.add(kv_cache.data_ptr())
+            axis = self.kv_cache_block_axes[layer_name]
+            for block_copy in copies:
+                dsts.append(kv_cache.select(axis, block_copy.dst_block_id))
+                srcs.append(kv_cache.select(axis, block_copy.src_block_id))
+        torch._foreach_copy_(dsts, srcs)
 
     def _process_kv_cache_copy_ops(
         self,
