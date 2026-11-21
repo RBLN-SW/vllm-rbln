@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 import math
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -22,6 +21,17 @@ import pytest
 import torch
 
 from vllm_rbln.utils import EncoderInputBuffers
+
+
+def _rotary_stub(**attrs) -> SimpleNamespace:
+    """A vision_model stand-in with the 3D-RoPE inverse frequencies the
+    encoder's rotary tables are built from at compile time."""
+    return SimpleNamespace(
+        inv_freq_t=torch.ones(1),
+        inv_freq_h=torch.ones(1),
+        inv_freq_w=torch.ones(1),
+        **attrs,
+    )
 
 
 @pytest.fixture
@@ -167,6 +177,7 @@ def test_minimax_m3_encoder_compile_requires_local_tower(monkeypatch, has_tower)
     # tower carries a parameter and a dtype, which size the input buffers.
     tower = torch.nn.Linear(1, 1)
     tower.dtype = torch.bfloat16
+    tower.vision_model = _rotary_stub()
     model.vision_tower = tower if has_tower else None
     encoder = torch.nn.Identity()
     build_encoder = Mock(return_value=encoder)
@@ -363,7 +374,7 @@ def test_image_encoding_reuses_eager_or_compiled_encoder(
     model.vision_tower.spatial_merge_size = 1
     model.vision_tower.dtype = torch.float32
     model.mm_embeds_dtype = out_dtype
-    model.vision_tower.vision_model = SimpleNamespace(vision_segment_max_frames=4)
+    model.vision_tower.vision_model = _rotary_stub(vision_segment_max_frames=4)
     encoder = torch.nn.Sequential(model.vision_tower)
     build_encoder = Mock(return_value=encoder)
     monkeypatch.setattr(m3, "_RBLNVisionEncoder", build_encoder)
@@ -515,7 +526,7 @@ def _build_with_token_budgets(
 
     def tower(**kw):
         module = torch.nn.Module()
-        module.vision_model = SimpleNamespace(vision_segment_max_frames=segment_frames)
+        module.vision_model = _rotary_stub(vision_segment_max_frames=segment_frames)
         return module
 
     monkeypatch.setattr(m3._vision_tower, "MiniMaxVLVisionModel", tower)
@@ -596,6 +607,7 @@ def test_images_and_video_segments_share_buckets(
     )
     model.vision_tower = vision_encoder_model.vision_tower
     model._mm_input_buffers = vision_encoder_model._mm_input_buffers
+    model._rotary_tables = vision_encoder_model._rotary_tables
     pixels = torch.ones(math.prod(grid), 6)
 
     image, *_ = model._encoder_inputs(pixels, grid, "image")
@@ -768,6 +780,7 @@ def vision_encoder_model():
     )
     model.vision_tower = tower
     model._mm_input_buffers = EncoderInputBuffers("cpu", tower.dtype)
+    model._rotary_tables = m3._rotary_tables(tower)
     model.mm_embeds_dtype = torch.float32
     model.mm_encoder_patch_buckets = [16, 64]
     return model
@@ -911,6 +924,7 @@ def test_warmup_runs_every_patch_bucket(
     )
     model.vision_tower = vision_encoder_model.vision_tower
     model._mm_input_buffers = vision_encoder_model._mm_input_buffers
+    model._rotary_tables = vision_encoder_model._rotary_tables
     warmed = []
 
     def encode(pixels, cos, sin, bias):

@@ -1194,6 +1194,15 @@ class _RBLNMiniMaxM3VLDataParser(MultiModalDataParser):
         )
 
 
+def _rotary_tables(tower: nn.Module) -> tuple[rbln_utils.RotaryTable, ...]:
+    """One cos/sin table per 3D-RoPE axis of the vision tower."""
+    vm = tower.vision_model
+    return tuple(
+        rbln_utils.RotaryTable(inv_freq)
+        for inv_freq in (vm.inv_freq_t, vm.inv_freq_h, vm.inv_freq_w)
+    )
+
+
 @MULTIMODAL_REGISTRY.register_processor(
     _RBLNMiniMaxM3VLMultiModalProcessor,
     info=_RBLNMiniMaxM3VLProcessingInfo,
@@ -1286,6 +1295,7 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         object.__setattr__(self, "_mm_encoder", None)
         # Made with the encoder in compile_mm_encoder, once the tower's device is final.
         self._mm_input_buffers: rbln_utils.EncoderInputBuffers | None = None
+        self._rotary_tables: tuple[rbln_utils.RotaryTable, ...] | None = None
 
         with self._mark_language_model(vllm_config):
             self.language_model = init_vllm_registered_model(
@@ -1355,6 +1365,7 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         self._mm_input_buffers = rbln_utils.EncoderInputBuffers(
             next(self.vision_tower.parameters()).device, self.vision_tower.dtype
         )
+        self._rotary_tables = _rotary_tables(self.vision_tower)
 
     def _encoder_inputs(
         self, pixel_values: torch.Tensor, grid_thw: list[int], modality: str
@@ -1387,20 +1398,25 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         t_ids = torch.arange(t).unsqueeze(1).expand(-1, h * w).flatten()
         h_ids = spatial_ids(torch.arange(h).unsqueeze(1).expand(-1, w))
         w_ids = spatial_ids(torch.arange(w).unsqueeze(0).expand(h, -1))
-        freqs = torch.cat(
-            [
-                torch.outer(t_ids.float(), vm.inv_freq_t.cpu()),
-                torch.outer(h_ids.float(), vm.inv_freq_h.cpu()),
-                torch.outer(w_ids.float(), vm.inv_freq_w.cpu()),
-            ],
-            dim=-1,
+        # The angles of each axis, indexed out of the prebuilt tables.
+        tables = self._rotary_tables
+        assert tables is not None, "compile_mm_encoder runs before encoding"
+        time_table, height_table, width_table = tables
+        time_cos, time_sin = time_table.rows(t)
+        height_cos, height_sin = height_table.rows(h)
+        width_cos, width_sin = width_table.rows(w)
+        cos_half = torch.cat(
+            [time_cos[t_ids], height_cos[h_ids], width_cos[w_ids]], dim=-1
         )
-        half = freqs.shape[-1]
+        sin_half = torch.cat(
+            [time_sin[t_ids], height_sin[h_ids], width_sin[w_ids]], dim=-1
+        )
+        half = cos_half.shape[-1]
         head_dim = vm.encoder.layers[0].self_attn.head_dim
         cos = torch.ones(num_patches, head_dim)
         sin = torch.zeros(num_patches, head_dim)
-        cos[:, :half] = cos[:, half : 2 * half] = freqs.cos()
-        sin[:, :half] = sin[:, half : 2 * half] = freqs.sin()
+        cos[:, :half] = cos[:, half : 2 * half] = cos_half
+        sin[:, :half] = sin[:, half : 2 * half] = sin_half
         key_bias = torch.zeros(1, 1, 1, bucket)
         key_bias[..., num_patches:] = -30000.0
         return self._stage_encoder_inputs(

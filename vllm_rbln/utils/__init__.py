@@ -54,6 +54,31 @@ class EncoderInput(NamedTuple):
     dtype: torch.dtype | None = None
 
 
+class RotaryTable:
+    """Cache RoPE cosine and sine rows by position in CPU float32.
+
+    The table grows on demand when a caller requests more positions.
+    """
+
+    def __init__(self, inv_freq: torch.Tensor, num_positions: int = 256):
+        self.inv_freq = inv_freq.detach().to(device="cpu", dtype=torch.float32)
+        self._build(num_positions)
+
+    def _build(self, num_positions: int) -> None:
+        positions = torch.arange(
+            num_positions, device=self.inv_freq.device, dtype=torch.float32
+        )
+        freqs = torch.outer(positions, self.inv_freq)
+        self.cos, self.sin = freqs.cos(), freqs.sin()
+
+    def rows(self, num_positions: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """The `[num_positions, dim]` cos and sin rows of positions 0 to
+        `num_positions - 1`, to index with a frame's position ids."""
+        if num_positions > self.cos.shape[0]:
+            self._build(max(num_positions, 2 * self.cos.shape[0]))
+        return self.cos[:num_positions], self.sin[:num_positions]
+
+
 class EncoderInputBuffers:
     """Reuse one set of device input buffers per vision encoder bucket.
 

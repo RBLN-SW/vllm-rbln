@@ -1342,6 +1342,14 @@ class _RBLNGlm5NextMultiModalProcessor(Glm5NextMultiModalProcessor):
         ]
 
 
+def _rotary_table(visual: nn.Module) -> rbln_utils.RotaryTable:
+    """The cos/sin table of the vision tower's 2D-RoPE, one axis at a time:
+    upstream's inverse frequencies at even exponents over `rotary_dim`."""
+    rope = visual.rotary_pos_emb
+    exponents = torch.arange(0, rope.rotary_dim, 2, dtype=torch.float32)
+    return rbln_utils.RotaryTable(1.0 / rope.base ** (exponents / rope.rotary_dim))
+
+
 @MULTIMODAL_REGISTRY.register_processor(
     _RBLNGlm5NextMultiModalProcessor,
     info=RBLNGlm5NextProcessingInfo,
@@ -1405,6 +1413,7 @@ class RBLNGlm5NextForConditionalGeneration(
         object.__setattr__(self, "_mm_encoder", None)
         # Made with the encoder in compile_mm_encoder, once the tower's device is final.
         self._mm_input_buffers: rbln_utils.EncoderInputBuffers | None = None
+        self._rotary_table: rbln_utils.RotaryTable | None = None
 
     def get_language_model(self) -> nn.Module:
         return self
@@ -1417,6 +1426,7 @@ class RBLNGlm5NextForConditionalGeneration(
         self._mm_input_buffers = rbln_utils.EncoderInputBuffers(
             self.visual.device, self.visual.dtype
         )
+        self._rotary_table = _rotary_table(self.visual)
 
     def warmup_mm_encoder(self) -> None:
         visual = self.visual
@@ -1477,18 +1487,19 @@ class RBLNGlm5NextForConditionalGeneration(
             .flatten()
             .repeat(t)
         )
-        rope = visual.rotary_pos_emb
-        exponents = torch.arange(0, rope.rotary_dim, 2, dtype=torch.float32)
-        inv_freq = 1.0 / rope.base ** (exponents / rope.rotary_dim)
-        freqs_h = torch.outer((order // w).float(), inv_freq)
-        freqs_w = torch.outer((order % w).float(), inv_freq)
-        angles = torch.cat([freqs_h, freqs_w, freqs_h, freqs_w], dim=-1)
+        # The angles of the rows and columns, indexed out of the prebuilt table.
+        table = self._rotary_table
+        assert table is not None, "compile_mm_encoder runs before encoding"
+        cos_rows, sin_rows = table.rows(max(h, w))
+        h_ids, w_ids = order // w, order % w
+        cos_h, cos_w = cos_rows[h_ids], cos_rows[w_ids]
+        sin_h, sin_w = sin_rows[h_ids], sin_rows[w_ids]
+        cos = torch.cat([cos_h, cos_w, cos_h, cos_w], dim=-1)
+        sin = torch.cat([sin_h, sin_w, sin_h, sin_w], dim=-1)
         key_bias = torch.zeros(1, 1, bucket)
         key_bias[..., num_patches:] = -30000.0
         return self._stage_encoder_inputs(
-            bucket,
-            num_patches,
-            [pixel_values, angles.cos(), angles.sin(), key_bias],
+            bucket, num_patches, [pixel_values, cos, sin, key_bias]
         )
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
