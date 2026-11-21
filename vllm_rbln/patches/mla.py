@@ -27,7 +27,7 @@ from vllm_rbln.model_executor.layers.quantization.modelopt_fp8 import (
     RBLNModelOptFp8LinearMethod,
 )
 from vllm_rbln.patches import register_patch
-from vllm_rbln.patches.attention import _resolve_kv_cache
+from vllm_rbln.v1.attention.kv_cache_bindings import resolve_kv_cache
 
 mla_attention_original_init = MLAAttention.__init__
 mla_attention_original_process_weights = MLAAttention.process_weights_after_loading
@@ -162,7 +162,7 @@ def patched_mla_attention_forward(
 
         # NOTE(RBLN): Use attn_metadata's KV cache instead of self.kv_cache
         # so that KV caches appear as explicit model inputs for compilation.
-        self_kv_cache = _resolve_kv_cache(attn_metadata, self.layer_index)
+        self_kv_cache = resolve_kv_cache(attn_metadata, self.layer_index)
 
         if self.attn_backend.accept_output_buffer:
             output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
