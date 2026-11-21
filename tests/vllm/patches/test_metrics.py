@@ -669,22 +669,38 @@ class TestMmEncoder:
 
         return encoder
 
+    @pytest.mark.parametrize("recording", [False, True])
+    def test_the_output_device_is_required(self, ctx, clock, monkeypatch, recording):
+        """Omitting the device fails at the call site rather than silently
+        taking the host-output path, for the helper and the wrapper alike."""
+        import vllm_rbln.utils as utils
+
+        monkeypatch.setattr(pm, "_ACTIVE_CTX", ctx)
+        encoder = self._encoder(clock, latency=7 * MS)
+        if recording:
+            ctx.start_pass()
+        with pytest.raises(TypeError, match="device"):
+            pm.run_mm_encoder(encoder, [torch.zeros(4, 3)], 1)
+        with pytest.raises(TypeError, match="device"):
+            utils.run_mm_encoder(encoder, [torch.zeros(4, 3)], 1)
+        assert not ctx._encoder
+
     def test_a_call_is_a_sample_per_input_shape_only_while_recording(
         self, ctx, clock, monkeypatch
     ):
         monkeypatch.setattr(pm, "_ACTIVE_CTX", ctx)
         encoder = self._encoder(clock, latency=7 * MS)
 
-        pm.run_mm_encoder(encoder, [torch.zeros(4, 3)], 1)  # warm-up
+        pm.run_mm_encoder(encoder, [torch.zeros(4, 3)], 1, device="cpu")  # warm-up
         ctx.start_pass()
-        pm.run_mm_encoder(encoder, [torch.zeros(4, 3)], 1)
+        pm.run_mm_encoder(encoder, [torch.zeros(4, 3)], 1, device="cpu")
         ctx.end_pass()
         ctx.start_pass()
-        pm.run_mm_encoder(encoder, [torch.zeros(8, 3)], 1)
+        pm.run_mm_encoder(encoder, [torch.zeros(8, 3)], 1, device="cpu")
         ctx.end_pass()
-        pm.run_mm_encoder(encoder, [torch.zeros(16, 3)], 1)
+        pm.run_mm_encoder(encoder, [torch.zeros(16, 3)], 1, device="cpu")
         monkeypatch.setattr(pm, "_ACTIVE_CTX", None)
-        pm.run_mm_encoder(encoder, [torch.zeros(32, 3)], 1)
+        pm.run_mm_encoder(encoder, [torch.zeros(32, 3)], 1, device="cpu")
 
         assert {k: m.latencies for k, m in ctx._encoder.items()} == {
             "4x3": [pytest.approx(7 * MS)],
@@ -831,7 +847,7 @@ class TestMmEncoder:
         encoder = self._encoder(clock, latency=7 * MS)
         ctx.start_pass()
         ctx.mark_phase(wm.Phase.PREFILL)
-        pm.run_mm_encoder(encoder, [torch.zeros(4, 3)], 1)
+        pm.run_mm_encoder(encoder, [torch.zeros(4, 3)], 1, device="cpu")
         clock.advance(2 * MS)
         ctx.add_graph_time(2 * MS)
         ctx.end_pass()

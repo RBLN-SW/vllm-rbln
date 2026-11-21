@@ -1510,8 +1510,8 @@ class RBLNGlm5NextForConditionalGeneration(
                             encoder,
                             self._encoder_inputs(frame, [1, h, w]),
                             num_tokens,
-                            dtype=self.mm_embeds_dtype,
                             device=device,
+                            dtype=self.mm_embeds_dtype,
                         )
                         for frame in pixels.split(h * w)
                     )

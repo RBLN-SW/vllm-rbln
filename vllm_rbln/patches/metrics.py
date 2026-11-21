@@ -121,18 +121,18 @@ def load_model(self, *args, **kwargs):
 
 
 @functools.wraps(_run_mm_encoder)
-def run_mm_encoder(encoder, inputs, num_embeddings, *, dtype=None, device="cpu"):
+def run_mm_encoder(encoder, inputs, num_embeddings, *, device, dtype=None):
     ctx = _ACTIVE_CTX
     if ctx is None or not ctx.in_pass:
         return _run_mm_encoder(
-            encoder, inputs, num_embeddings, dtype=dtype, device=device
+            encoder, inputs, num_embeddings, device=device, dtype=dtype
         )
     output_device = torch.device(device)
     if output_device.type == "rbln":
         torch.rbln.current_stream(output_device).synchronize()
     start = time.perf_counter()
     output = _run_mm_encoder(
-        encoder, inputs, num_embeddings, dtype=dtype, device=device
+        encoder, inputs, num_embeddings, device=device, dtype=dtype
     )
     if output.device.type == "rbln":
         torch.rbln.current_stream(output.device).record_event().synchronize()

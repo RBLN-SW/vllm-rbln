@@ -1406,8 +1406,8 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
                 self._mm_encoder,
                 self._encoder_inputs(seg_pixels, [seg_t, h, w], modality),
                 seg_t * h * w // (merge * merge),
-                dtype=self.mm_embeds_dtype,
                 device=device,
+                dtype=self.mm_embeds_dtype,
             )
             if output is None:
                 output = embeds.new_empty(

@@ -33,10 +33,14 @@ def run_mm_encoder(
     inputs: list[torch.Tensor],
     num_embeddings: int,
     *,
+    device: torch.device | str,
     dtype: torch.dtype | None = None,
-    device: torch.device | str = "cpu",
 ) -> torch.Tensor:
-    """Return valid embeddings on the requested device."""
+    """Return valid embeddings on `device`.
+
+    The device is required so that a caller cannot fall back to a host copy by
+    omitting it; the compiled encoder's output lives on the model's device.
+    """
     output_device = torch.device(device)
     embeds = encoder(*inputs)[:num_embeddings]
     return embeds.to(device=output_device, dtype=dtype)
