@@ -46,6 +46,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.parse import MultiModalDataItems
 from vllm.sequence import IntermediateTensors
 
+import vllm_rbln.utils as rbln_utils
 from vllm_rbln.logger import init_logger
 from vllm_rbln.model_executor.models.interfaces import SupportsRBLNMultiModal
 from vllm_rbln.platform import RBLN_DEFAULT_MAX_NUM_BATCHED_TOKENS
@@ -188,6 +189,8 @@ class RBLNQwen3_5ForConditionalGeneration(
             )
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         object.__setattr__(self, "_mm_encoder", None)
+        # Made with the encoder in compile_mm_encoder, once the tower's device is final.
+        self._mm_input_buffers: rbln_utils.EncoderInputBuffers | None = None
         # Upstream builds no vision tower when images and video are off (a
         # placeholder stands in for it).
         modalities = [
@@ -275,6 +278,9 @@ class RBLNQwen3_5ForConditionalGeneration(
             return
         encoder = _RBLNQwen3VisionEncoder(self.visual).eval()
         object.__setattr__(self, "_mm_encoder", compile_fn(encoder))
+        self._mm_input_buffers = rbln_utils.EncoderInputBuffers(
+            self.visual.device, self.visual.dtype
+        )
 
     def warmup_mm_encoder(self) -> None:
         if not self.has_vision:
@@ -285,26 +291,41 @@ class RBLNQwen3_5ForConditionalGeneration(
             self.compile_mm_encoder(lambda encoder: encoder)
             encoder = self._mm_encoder
         assert encoder is not None
-        visual = self.visual
-        patch_dim = visual.patch_embed.proj.weight[0].numel()
-        rotary_dim = visual.blocks[0].attn.hidden_size_per_attention_head // 2
-        kwargs = {"dtype": visual.dtype, "device": visual.device}
         with torch.inference_mode():
             for bucket in self.mm_encoder_patch_buckets:
-                encoder(
-                    torch.zeros(bucket, patch_dim, **kwargs),
-                    torch.zeros(bucket, visual.hidden_size, **kwargs),
-                    torch.ones(bucket, rotary_dim, **kwargs),
-                    torch.zeros(bucket, rotary_dim, **kwargs),
-                    torch.zeros(1, 1, bucket, **kwargs),
-                )
+                # Every entry valid: the warm-up never masks a key.
+                encoder(*self._stage_encoder_inputs(bucket, bucket, [None] * 5))
+
+    def _mm_input_specs(self, bucket: int) -> list[rbln_utils.EncoderInput]:
+        """The encoder's inputs at `bucket`: patches, position embeddings, the
+        rotary cos and sin, and the key bias that masks the padding."""
+        visual = self.visual
+        patch_dim = math.prod(visual.patch_embed.proj.weight.shape[1:])
+        rotary_dim = visual.blocks[0].attn.hidden_size_per_attention_head // 2
+        return [
+            rbln_utils.EncoderInput((bucket, patch_dim), 0, 0.0, 0.0),
+            rbln_utils.EncoderInput((bucket, visual.hidden_size), 0, 0.0, 0.0),
+            rbln_utils.EncoderInput((bucket, rotary_dim), 0, 1.0, 1.0),
+            rbln_utils.EncoderInput((bucket, rotary_dim), 0, 0.0, 0.0),
+            rbln_utils.EncoderInput((1, 1, bucket), 2, 0.0, -30000.0),
+        ]
+
+    def _stage_encoder_inputs(
+        self, bucket: int, num_patches: int, input_tensors: list[torch.Tensor | None]
+    ) -> list[torch.Tensor]:
+        buffers = self._mm_input_buffers
+        assert buffers is not None, "compile_mm_encoder runs before encoding"
+        return buffers.stage(bucket, self._mm_input_specs, input_tensors, num_patches)
 
     def _encoder_inputs(
         self, pixel_values: torch.Tensor, grid_thw: list[int]
     ) -> list[torch.Tensor]:
-        """Pad one image or video frame to its bucket and build its position
-        embeddings and key mask on the host; upstream builds them on the tower's
-        device."""
+        """Stage one image or video frame into its bucket's device buffers:
+        its patches, and the position embeddings and key mask built on the
+        host for its valid patches; upstream builds them on the tower's
+        device. The tensors returned are the bucket's buffers, rewritten by
+        the next frame staged into it; their padding holds what earlier frames
+        left, masked by the key bias."""
         visual = self.visual
         num_patches = math.prod(grid_thw)
         fits = [b for b in self.mm_encoder_patch_buckets if b >= num_patches]
@@ -313,30 +334,25 @@ class RBLNQwen3_5ForConditionalGeneration(
             f"vision encoder's {self.mm_encoder_patch_buckets[-1]}-patch bucket"
         )
         bucket = fits[0]
-        dtype = visual.dtype
         t, h, w = grid_thw
-        patches = torch.zeros(bucket, pixel_values.shape[-1], dtype=dtype)
-        patches[:num_patches] = pixel_values.to(dtype)
-        pos_embeds = torch.zeros(bucket, visual.hidden_size, dtype=dtype)
-        pos_embeds[:num_patches] = pos_embed_interpolate_native(
+        pos_embeds = pos_embed_interpolate_native(
             visual.pos_embed.weight.cpu(),
             t,
             h,
             w,
             visual.num_grid_per_side,
             visual.spatial_merge_size,
-            dtype,
+            visual.dtype,
         )
         pos_ids = visual.rot_pos_ids(h, w, visual.spatial_merge_size).repeat(t, 1)
         cos_table, sin_table = visual.rotary_pos_emb.get_cos_sin(max(h, w))
-        image_cos = cos_table.cpu()[pos_ids].flatten(1)
-        cos = torch.ones(bucket, image_cos.shape[-1], dtype=dtype)
-        sin = torch.zeros(bucket, image_cos.shape[-1], dtype=dtype)
-        cos[:num_patches] = image_cos
-        sin[:num_patches] = sin_table.cpu()[pos_ids].flatten(1)
-        key_bias = torch.zeros(1, 1, bucket, dtype=dtype)
+        cos = cos_table.cpu()[pos_ids].flatten(1)
+        sin = sin_table.cpu()[pos_ids].flatten(1)
+        key_bias = torch.zeros(1, 1, bucket)
         key_bias[..., num_patches:] = -30000.0
-        return [x.to(visual.device) for x in (patches, pos_embeds, cos, sin, key_bias)]
+        return self._stage_encoder_inputs(
+            bucket, num_patches, [pixel_values, pos_embeds, cos, sin, key_bias]
+        )
 
     def _encode(
         self, pixel_values: torch.Tensor, grid_thw: torch.Tensor

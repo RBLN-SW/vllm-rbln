@@ -19,6 +19,8 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from vllm_rbln.utils import EncoderInputBuffers
+
 
 def _bare(cls):
     module = cls.__new__(cls)
@@ -109,6 +111,42 @@ def test_vision_blocks_trace_as_regions_with_shared_weights(vision_tower):
     assert {id(p) for p in encoder.parameters()} == {id(p) for p in tower.parameters()}
 
 
+def test_a_smaller_image_matches_fresh_padding_when_reusing_vision_buffers(
+    vision_tower,
+):
+    from vllm_rbln.model_executor.models.glm5_next import (
+        RBLNGlm5NextForConditionalGeneration,
+    )
+
+    model = _bare(RBLNGlm5NextForConditionalGeneration)
+    model.visual = vision_tower
+    model.mm_embeds_dtype = torch.float32
+    model.mm_encoder_patch_buckets = [16]
+    model.compile_mm_encoder(lambda encoder: Mock(wraps=encoder))
+    encoder = model._mm_encoder
+    large_pixels = torch.randn(16, 24)
+    small_image = {
+        "pixel_values": torch.randn(8, 24),
+        "image_grid_thw": torch.tensor([[1, 2, 4]]),
+    }
+
+    model.embed_multimodal(
+        pixel_values=large_pixels, image_grid_thw=torch.tensor([[1, 4, 4]])
+    )
+    (actual,) = model.embed_multimodal(**small_image)
+    model._mm_input_buffers = EncoderInputBuffers(
+        vision_tower.device, vision_tower.dtype
+    )
+    (expected,) = model.embed_multimodal(**small_image)
+
+    large, small, fresh = (call.args for call in encoder.call_args_list)
+    assert [x.data_ptr() for x in small] == [x.data_ptr() for x in large]
+    torch.testing.assert_close(small[0][8:], large_pixels[8:])
+    assert not fresh[0][8:].any()
+    assert actual.shape == (2, 64)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def test_load_time_transforms_run_once_after_every_weight(monkeypatch):
     import vllm_rbln.model_executor.models.glm5_next as glm
 
@@ -164,6 +202,7 @@ def test_image_encoding_reuses_eager_or_compiled_encoder(monkeypatch, compiled):
     model = _bare(cls)
     model.visual = torch.nn.Linear(2, 2, bias=False)
     model.visual.spatial_merge_size = 1
+    model.visual.device, model.visual.dtype = torch.device("cpu"), torch.float32
     model.mm_embeds_dtype = torch.float32
     encoder = torch.nn.Sequential(model.visual)
     build_encoder = Mock(return_value=encoder)
@@ -304,15 +343,15 @@ def test_vision_encoder_builds_its_inputs_from_upstream_rope(monkeypatch):
         spatial_merge_size=2,
         patch_embed=SimpleNamespace(proj=SimpleNamespace(weight=torch.zeros(3, 5))),
         rotary_pos_emb=SimpleNamespace(rotary_dim=4, base=100.0),
+        blocks=[SimpleNamespace(attn=SimpleNamespace(head_dim=8))],
     )
     pixels = torch.arange(40, dtype=torch.float32).view(8, 5)
 
-    encoder_inputs = glm.RBLNGlm5NextForConditionalGeneration._encoder_inputs
-    padded, cos, sin, key_bias = encoder_inputs(
-        SimpleNamespace(visual=visual, mm_encoder_patch_buckets=[16]),
-        pixels,
-        [1, 2, 4],
-    )
+    model = _bare(glm.RBLNGlm5NextForConditionalGeneration)
+    model.visual = visual
+    model._mm_input_buffers = EncoderInputBuffers(visual.device, visual.dtype)
+    model.mm_encoder_patch_buckets = [16]
+    padded, cos, sin, key_bias = model._encoder_inputs(pixels, [1, 2, 4])
 
     torch.testing.assert_close(padded[:8], pixels)
     assert not padded[8:].any()
@@ -420,6 +459,7 @@ def test_video_frames_reuse_image_buckets_without_cross_frame_attention(video_fi
         spatial_merge_size=1,
         patch_embed=SimpleNamespace(proj=SimpleNamespace(weight=torch.zeros(4, 4))),
         rotary_pos_emb=SimpleNamespace(rotary_dim=2, base=100.0),
+        blocks=[SimpleNamespace(attn=SimpleNamespace(head_dim=4))],
     )
     model.mm_encoder_patch_buckets = [4, 8]
     model.mm_embeds_dtype = torch.bfloat16
@@ -431,6 +471,9 @@ def test_video_frames_reuse_image_buckets_without_cross_frame_attention(video_fi
         return (weights @ pixels).squeeze(0)
 
     object.__setattr__(model, "_mm_encoder", encoder)
+    model._mm_input_buffers = EncoderInputBuffers(
+        model.visual.device, model.visual.dtype
+    )
     image = torch.arange(8, dtype=torch.float32).reshape(2, 4) / 10
     video = torch.arange(40, dtype=torch.float32).reshape(10, 4) / 10
     image_inputs = dict(pixel_values=image, image_grid_thw=torch.tensor([[1, 1, 2]]))

@@ -33,6 +33,7 @@ import vllm_rbln.model_executor.models.gemma4 as gemma4
 from vllm_rbln.compilation.compiler import compile, mark_decoder_regions
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.model_executor.models.gemma4 import RBLNGemma4ForConditionalGeneration
+from vllm_rbln.utils import EncoderInputBuffers
 from vllm_rbln.v1.attention.backends.flash_attention import RBLNFlashAttentionMetadata
 
 POOL = 3
@@ -52,6 +53,12 @@ def _bare_model(**attrs) -> RBLNGemma4ForConditionalGeneration:
     object.__setattr__(model, "_mm_encoder", None)
     for key, value in attrs.items():
         setattr(model, key, value)
+    # What compile_mm_encoder would make for a model built with a tower.
+    model._mm_input_buffers = (
+        EncoderInputBuffers("cpu", attrs["model_dtype"])
+        if "vision_tower" in attrs and "model_dtype" in attrs
+        else None
+    )
     return model
 
 
@@ -116,6 +123,33 @@ def test_the_vision_encoder_matches_hfs():
 
     assert got.shape == (9 * 9 // POOL**2, 32)
     torch.testing.assert_close(got, expected, rtol=1e-4, atol=1e-4)
+
+
+def test_a_smaller_image_matches_upstream_when_reusing_vision_buffers(monkeypatch):
+    tower = _vision_tower()
+    model = _bare_model(
+        vision_tower=tower,
+        embed_vision=_Identity(),
+        model_dtype=torch.float32,
+        mm_encoder_patch_buckets=[90],
+    )
+    encode = Mock(wraps=gemma4.rbln_utils.run_mm_encoder)
+    monkeypatch.setattr(gemma4.rbln_utils, "run_mm_encoder", encode)
+    large_pixels, large_positions = _image(9, 9, num_patches=90)
+    small_pixels, small_positions = _image(6, 3, num_patches=90)
+
+    with torch.inference_mode():
+        model._encode_vision(large_pixels, large_positions)
+        actual = model._encode_vision(small_pixels, small_positions)
+        expected = tower(
+            pixel_values=small_pixels[None], pixel_position_ids=small_positions[None]
+        ).last_hidden_state
+
+    large_inputs, small_inputs = (call.args[1] for call in encode.call_args_list)
+    assert [x.data_ptr() for x in small_inputs] == [x.data_ptr() for x in large_inputs]
+    torch.testing.assert_close(small_inputs[0][0, 18:81], large_pixels[18:81])
+    assert actual.shape == (2, 32)
+    torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
 
 
 def test_the_rotary_tables_are_built_once_not_per_image(monkeypatch):
@@ -482,8 +516,10 @@ def test_the_encoder_compiles_only_where_the_tower_lives(
         gemma4, "_RBLNGemma4VisionEncoder", lambda tower, embed_vision: built
     )
     model = _bare_model(
-        vision_tower=nn.Identity(),
+        # A tower with a parameter: the input buffers take its device.
+        vision_tower=nn.Linear(1, 1),
         embed_vision=nn.Identity(),
+        model_dtype=torch.float32,
         multimodal_config=SimpleNamespace(
             get_limit_per_prompt=lambda modality: limits.get(modality, 0)
         ),

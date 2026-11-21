@@ -1403,6 +1403,8 @@ class RBLNGlm5NextForConditionalGeneration(
             self.visual = PPMissingLayer()
         self.config.image_token_index = hf_config.image_token_id
         object.__setattr__(self, "_mm_encoder", None)
+        # Made with the encoder in compile_mm_encoder, once the tower's device is final.
+        self._mm_input_buffers: rbln_utils.EncoderInputBuffers | None = None
 
     def get_language_model(self) -> nn.Module:
         return self
@@ -1412,6 +1414,9 @@ class RBLNGlm5NextForConditionalGeneration(
             return
         encoder = _RBLNGlm5NextVisionEncoder(self.visual, self.mm_embeds_dtype).eval()
         object.__setattr__(self, "_mm_encoder", compile_fn(encoder))
+        self._mm_input_buffers = rbln_utils.EncoderInputBuffers(
+            self.visual.device, self.visual.dtype
+        )
 
     def warmup_mm_encoder(self) -> None:
         visual = self.visual
@@ -1420,35 +1425,48 @@ class RBLNGlm5NextForConditionalGeneration(
         if self._mm_encoder is None:
             self.compile_mm_encoder(lambda encoder: encoder)
         assert self._mm_encoder is not None
-        patch_dim = visual.patch_embed.proj.weight[0].numel()
-        head_dim = visual.blocks[0].attn.head_dim
         with torch.inference_mode():
             for bucket in self.mm_encoder_patch_buckets:
+                # Every entry valid: the warm-up never masks a key.
                 self._mm_encoder(
-                    torch.zeros(
-                        bucket, patch_dim, dtype=visual.dtype, device=visual.device
-                    ),
-                    torch.ones(
-                        bucket, head_dim, dtype=visual.dtype, device=visual.device
-                    ),
-                    torch.zeros(
-                        bucket, head_dim, dtype=visual.dtype, device=visual.device
-                    ),
-                    torch.zeros(1, 1, bucket, dtype=visual.dtype, device=visual.device),
+                    *self._stage_encoder_inputs(bucket, bucket, [None] * 4)
                 )
+
+    def _mm_input_specs(self, bucket: int) -> list[rbln_utils.EncoderInput]:
+        """The encoder's inputs at `bucket`: patches, the rotary cos and sin
+        over `head_dim`, and the key bias that masks the padding."""
+        visual = self.visual
+        patch_dim = math.prod(visual.patch_embed.proj.weight.shape[1:])
+        head_dim = visual.blocks[0].attn.head_dim
+        return [
+            rbln_utils.EncoderInput((bucket, patch_dim), 0, 0.0, 0.0),
+            rbln_utils.EncoderInput((bucket, head_dim), 0, 1.0, 1.0),
+            rbln_utils.EncoderInput((bucket, head_dim), 0, 0.0, 0.0),
+            rbln_utils.EncoderInput((1, 1, bucket), 2, 0.0, -30000.0),
+        ]
+
+    def _stage_encoder_inputs(
+        self,
+        bucket: int,
+        num_patches: int,
+        input_tensors: list[torch.Tensor | None],
+    ) -> list[torch.Tensor]:
+        buffers = self._mm_input_buffers
+        assert buffers is not None, "compile_mm_encoder runs before encoding"
+        return buffers.stage(bucket, self._mm_input_specs, input_tensors, num_patches)
 
     def _encoder_inputs(
         self, pixel_values: torch.Tensor, grid_thw: list[int]
     ) -> list[torch.Tensor]:
+        """Stage one frame into its bucket's device buffers, with the rotary
+        tables and key mask built on the host for its valid patches. The tensors
+        returned are the bucket's buffers, rewritten by the next frame; their
+        padding holds what earlier frames left, masked by the key bias."""
         visual = self.visual
         num_patches = math.prod(grid_thw)
         fits = [b for b in self.mm_encoder_patch_buckets if b >= num_patches]
         assert fits, f"a frame of {num_patches} patches (grid {grid_thw})"
         bucket = fits[0]
-        dtype = visual.dtype
-        patch_dim = visual.patch_embed.proj.weight[0].numel()
-        padded = torch.zeros(bucket, patch_dim, dtype=dtype)
-        padded[:num_patches] = pixel_values.to(dtype)
 
         t, h, w = grid_thw
         merge = visual.spatial_merge_size
@@ -1465,17 +1483,13 @@ class RBLNGlm5NextForConditionalGeneration(
         freqs_h = torch.outer((order // w).float(), inv_freq)
         freqs_w = torch.outer((order % w).float(), inv_freq)
         angles = torch.cat([freqs_h, freqs_w, freqs_h, freqs_w], dim=-1)
-        head_dim = angles.shape[-1]
-        cos = torch.ones(bucket, head_dim)
-        sin = torch.zeros(bucket, head_dim)
-        cos[:num_patches], sin[:num_patches] = angles.cos(), angles.sin()
-
         key_bias = torch.zeros(1, 1, bucket)
         key_bias[..., num_patches:] = -30000.0
-        return [
-            x.to(device=visual.device, dtype=dtype)
-            for x in (padded, cos, sin, key_bias)
-        ]
+        return self._stage_encoder_inputs(
+            bucket,
+            num_patches,
+            [pixel_values, angles.cos(), angles.sin(), key_bias],
+        )
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
         outputs: list[torch.Tensor] = []

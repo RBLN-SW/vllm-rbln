@@ -21,6 +21,8 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from vllm_rbln.utils import EncoderInputBuffers
+
 
 @pytest.fixture
 def vision_tower(tmp_path):
@@ -114,6 +116,45 @@ def test_vision_blocks_trace_as_regions_with_shared_weights(vision_tower):
     assert {id(p) for p in encoder.parameters()} == {id(p) for p in tower.parameters()}
 
 
+def test_a_smaller_image_matches_fresh_padding_when_reusing_vision_buffers(
+    vision_tower,
+):
+    from vllm_rbln.model_executor.models.minimax_m3 import (
+        RBLNMiniMaxM3SparseForConditionalGeneration,
+    )
+
+    model = RBLNMiniMaxM3SparseForConditionalGeneration.__new__(
+        RBLNMiniMaxM3SparseForConditionalGeneration
+    )
+    torch.nn.Module.__init__(model)
+    model.vision_tower = vision_tower
+    model.mm_embeds_dtype = torch.float32
+    model.mm_encoder_patch_buckets = [16]
+    model.compile_mm_encoder(lambda encoder: Mock(wraps=encoder))
+    encoder = model._mm_encoder
+    large_pixels = torch.randn(16, 24)
+    small_image = {
+        "pixel_values": torch.randn(8, 24),
+        "image_grid_thw": torch.tensor([[1, 2, 4]]),
+    }
+
+    model.embed_multimodal(
+        pixel_values=large_pixels, image_grid_thw=torch.tensor([[1, 4, 4]])
+    )
+    (actual,) = model.embed_multimodal(**small_image)
+    model._mm_input_buffers = EncoderInputBuffers(
+        large_pixels.device, vision_tower.dtype
+    )
+    (expected,) = model.embed_multimodal(**small_image)
+
+    large, small, fresh = (call.args for call in encoder.call_args_list)
+    assert [x.data_ptr() for x in small] == [x.data_ptr() for x in large]
+    torch.testing.assert_close(small[0][8:], large_pixels[8:])
+    assert not fresh[0][8:].any()
+    assert actual.shape == (2, 64)
+    torch.testing.assert_close(actual, expected)
+
+
 @pytest.mark.parametrize("has_tower", [False, True])
 def test_minimax_m3_encoder_compile_requires_local_tower(monkeypatch, has_tower):
     import vllm_rbln.model_executor.models.minimax_m3 as m3
@@ -122,8 +163,11 @@ def test_minimax_m3_encoder_compile_requires_local_tower(monkeypatch, has_tower)
         m3.RBLNMiniMaxM3SparseForConditionalGeneration
     )
     torch.nn.Module.__init__(model)
-    # Non-first PP ranks and text-only configurations own no vision tower.
-    model.vision_tower = torch.nn.Identity() if has_tower else None
+    # Non-first PP ranks and text-only configurations own no vision tower. A
+    # tower carries a parameter and a dtype, which size the input buffers.
+    tower = torch.nn.Linear(1, 1)
+    tower.dtype = torch.bfloat16
+    model.vision_tower = tower if has_tower else None
     encoder = torch.nn.Identity()
     build_encoder = Mock(return_value=encoder)
     monkeypatch.setattr(m3, "_RBLNVisionEncoder", build_encoder)
@@ -317,6 +361,7 @@ def test_image_encoding_reuses_eager_or_compiled_encoder(
     torch.nn.Module.__init__(model)
     model.vision_tower = torch.nn.Linear(2, 2, bias=False)
     model.vision_tower.spatial_merge_size = 1
+    model.vision_tower.dtype = torch.float32
     model.mm_embeds_dtype = out_dtype
     model.vision_tower.vision_model = SimpleNamespace(vision_segment_max_frames=4)
     encoder = torch.nn.Sequential(model.vision_tower)
@@ -550,6 +595,7 @@ def test_images_and_video_segments_share_buckets(
         limits={"image": 1, "video": 1},
     )
     model.vision_tower = vision_encoder_model.vision_tower
+    model._mm_input_buffers = vision_encoder_model._mm_input_buffers
     pixels = torch.ones(math.prod(grid), 6)
 
     image, *_ = model._encoder_inputs(pixels, grid, "image")
@@ -721,6 +767,7 @@ def vision_encoder_model():
         vision_segment_max_frames=2,
     )
     model.vision_tower = tower
+    model._mm_input_buffers = EncoderInputBuffers("cpu", tower.dtype)
     model.mm_embeds_dtype = torch.float32
     model.mm_encoder_patch_buckets = [16, 64]
     return model
@@ -731,9 +778,11 @@ def test_a_video_is_encoded_in_segments_of_temporal_patches(vision_encoder_model
     calls = []
 
     def encode(pixels, cos, sin, bias):
-        calls.append((pixels, cos))
+        # The inputs are the bucket's staging buffers, rewritten by the next
+        # segment, so keep copies as a compiled encoder's own output would be.
+        calls.append((pixels.clone(), cos.clone()))
         # One token per 2 x 2 merge: the patch index of its first patch.
-        return pixels[::4, :1]
+        return pixels[::4, :1].clone()
 
     object.__setattr__(model, "_mm_encoder", encode)
     pixels = torch.arange(20.0).unsqueeze(1).expand(-1, 6)
@@ -785,7 +834,10 @@ def test_shared_bucket_is_warmed_once(vision_encoder_model):
 @pytest.mark.parametrize("video_first", [False, True])
 def test_mixed_modalities_preserve_input_order(vision_encoder_model, video_first):
     model = vision_encoder_model
-    object.__setattr__(model, "_mm_encoder", lambda pixels, *args: pixels[::4, :1])
+    # A copy: the inputs are staging buffers the next item rewrites.
+    object.__setattr__(
+        model, "_mm_encoder", lambda pixels, *args: pixels[::4, :1].clone()
+    )
     image = {
         "pixel_values": torch.full((4, 6), 3.0),
         "image_grid_thw": torch.tensor([[1, 2, 2]]),
@@ -820,6 +872,23 @@ def test_an_image_runs_in_the_smallest_bucket_that_holds_it(vision_encoder_model
         assert (key_bias[..., math.prod(grid) :] < 0).all()
 
 
+def test_a_bucket_reuses_its_input_buffers_and_masks_the_padding(
+    vision_encoder_model,
+):
+    model = vision_encoder_model
+    large = model._encoder_inputs(torch.full((16, 6), 5.0), [1, 4, 4], "image")
+    small = model._encoder_inputs(torch.full((4, 6), 3.0), [1, 2, 2], "image")
+
+    # Same bucket, same device tensors: no allocation and no padded host copy.
+    assert [x.data_ptr() for x in small] == [x.data_ptr() for x in large]
+    padded, cos, sin, key_bias = small
+    assert (padded[:4] == 3.0).all()
+    # The larger image's entries stay in the padding, which the key bias masks.
+    assert (padded[4:] == 5.0).all()
+    assert torch.isfinite(cos).all() and torch.isfinite(sin).all()
+    assert (key_bias[..., :4] == 0).all() and (key_bias[..., 4:] < 0).all()
+
+
 @pytest.mark.parametrize(
     ("buckets", "max_side", "video_limit"),
     [
@@ -841,6 +910,7 @@ def test_warmup_runs_every_patch_bucket(
         limits={"image": 1, "video": video_limit},
     )
     model.vision_tower = vision_encoder_model.vision_tower
+    model._mm_input_buffers = vision_encoder_model._mm_input_buffers
     warmed = []
 
     def encode(pixels, cos, sin, bias):

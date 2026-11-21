@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections.abc import Callable
-from typing import Union
+from collections.abc import Callable, Sequence
+from typing import NamedTuple, Union
 
 import torch
 from vllm.forward_context import get_forward_context
@@ -39,6 +39,75 @@ def run_mm_encoder(
     if dtype is None:
         return embeds.cpu()
     return embeds.to(device="cpu", dtype=dtype)
+
+
+class EncoderInput(NamedTuple):
+    """One input of a compiled vision encoder at one bucket: its shape, the axis
+    the bucket runs along, the value every entry takes when nothing is copied
+    in, the value its padding is initialized to, and its dtype when that is not
+    the buffers' default."""
+
+    shape: tuple[int, ...]
+    axis: int
+    valid: float
+    pad: float
+    dtype: torch.dtype | None = None
+
+
+class EncoderInputBuffers:
+    """Reuse one set of device input buffers per vision encoder bucket.
+
+    Staging can leave values from previous calls in padding. Callers must
+    refresh the attention mask for the current input before encoding.
+    """
+
+    def __init__(self, device: torch.device | str, dtype: torch.dtype) -> None:
+        self.device = torch.device(device)
+        self.dtype = dtype
+        self._buckets: dict[int, tuple[Sequence[EncoderInput], list[torch.Tensor]]] = {}
+
+    def stage(
+        self,
+        bucket: int,
+        build_specs: Callable[[int], Sequence[EncoderInput]],
+        input_tensors: Sequence[torch.Tensor | None],
+        num_valid: int,
+    ) -> list[torch.Tensor]:
+        """Initialize the bucket on first use and stage its input tensors.
+
+        Copy each tensor over the whole buffer or its valid prefix, depending on
+        its length along the bucket axis. None fills the buffer with the spec's
+        valid value.
+        """
+        entry = self._buckets.get(bucket)
+        if entry is None:
+            specs = build_specs(bucket)
+            # Plain tensors, not inference tensors: staging writes them in place
+            # inside and outside inference mode alike.
+            with torch.inference_mode(False):
+                buffers = [
+                    torch.full(
+                        spec.shape,
+                        spec.pad,
+                        dtype=spec.dtype or self.dtype,
+                        device=self.device,
+                    )
+                    for spec in specs
+                ]
+            entry = self._buckets[bucket] = (specs, buffers)
+        specs, buffers = entry
+        for buffer, spec, tensor in zip(buffers, specs, input_tensors, strict=True):
+            if tensor is None:
+                buffer.fill_(spec.valid)
+            elif tensor.shape[spec.axis] == bucket:
+                buffer.copy_(tensor)
+            else:
+                assert tensor.shape[spec.axis] == num_valid, (
+                    f"a tensor with {tensor.shape[spec.axis]} entries for an input of "
+                    f"{num_valid} valid entries in a {bucket}-entry bucket"
+                )
+                buffer.narrow(spec.axis, 0, num_valid).copy_(tensor)
+        return buffers
 
 
 def pad(

@@ -40,6 +40,7 @@ from vllm_rbln.model_executor.models.qwen3_5 import (
     RBLNQwen3_5ForConditionalGeneration,
     RBLNQwen3_5MultiModalProcessor,
 )
+from vllm_rbln.utils import EncoderInputBuffers
 
 PATCH, MERGE, TEMPORAL = 16, 2, 2
 
@@ -258,6 +259,7 @@ def test_warmup_runs_the_encoder_once_over_each_bucket(visual):
     )
     torch.nn.Module.__init__(model)
     model.visual = visual
+    model._mm_input_buffers = EncoderInputBuffers(visual.device, visual.dtype)
     model.has_vision = True
     model.mm_encoder_patch_buckets = [64, 128]
     encoder = Mock(return_value=torch.zeros(1, 32))
@@ -281,6 +283,39 @@ def test_warmup_runs_the_encoder_once_over_each_bucket(visual):
     assert encoder.call_count == 2
 
 
+def test_a_bucket_reuses_its_input_buffers_and_masks_the_padding(visual):
+    model = RBLNQwen3_5ForConditionalGeneration.__new__(
+        RBLNQwen3_5ForConditionalGeneration
+    )
+    torch.nn.Module.__init__(model)
+    model.visual = visual
+    model.has_vision = True
+    input_specs = Mock(wraps=model._mm_input_specs)
+    model._mm_input_specs = input_specs
+    model.mm_encoder_patch_buckets = [64, 128]
+    model.compile_mm_encoder(lambda encoder: Mock(wraps=encoder))
+    encoder = model._mm_encoder
+    patch_dim = 3 * TEMPORAL * PATCH * PATCH
+    large_pixels = torch.randn(64, patch_dim)
+    small_pixels = torch.randn(24, patch_dim)
+    small_grid = [1, 6, 4]
+
+    with torch.inference_mode():
+        model._encode(large_pixels, torch.tensor([[1, 8, 8]]))
+        (actual,) = model._encode(small_pixels, torch.tensor([small_grid]))
+        expected = visual(small_pixels, grid_thw=[small_grid])
+
+    large, small = (call.args for call in encoder.call_args_list)
+    assert [x.data_ptr() for x in small] == [x.data_ptr() for x in large]
+    input_specs.assert_called_once_with(64)
+    patches, pos_embeds, cos, sin, key_bias = small
+    torch.testing.assert_close(patches[:24], small_pixels)
+    torch.testing.assert_close(patches[24:], large_pixels[24:])
+    assert all(torch.isfinite(x).all() for x in (pos_embeds, cos, sin))
+    torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-5)
+    assert (key_bias[..., :24] == 0).all() and (key_bias[..., 24:] < 0).all()
+
+
 @pytest.mark.parametrize(
     ("grid", "bucket"), [([1, 6, 4], 64), ([1, 8, 8], 64), ([1, 8, 12], 128)]
 )
@@ -290,6 +325,7 @@ def test_an_image_takes_the_smallest_bucket_that_holds_it(visual, grid, bucket):
     )
     torch.nn.Module.__init__(model)
     model.visual = visual
+    model._mm_input_buffers = EncoderInputBuffers(visual.device, visual.dtype)
     model.mm_encoder_patch_buckets = [64, 128]
     num_patches = grid[0] * grid[1] * grid[2]
     pixels = torch.zeros(num_patches, 3 * TEMPORAL * PATCH * PATCH)
@@ -312,6 +348,7 @@ def test_image_embeddings_match_upstream(visual):
     )
     torch.nn.Module.__init__(model)
     model.visual = visual
+    model._mm_input_buffers = EncoderInputBuffers(visual.device, visual.dtype)
     model.has_vision = True
     model.mm_encoder_patch_buckets = [64, 128]
     model._mm_encoder = None
@@ -345,6 +382,7 @@ def test_video_frames_run_one_at_a_time_and_match_upstream(visual):
     )
     torch.nn.Module.__init__(model)
     model.visual = visual
+    model._mm_input_buffers = EncoderInputBuffers(visual.device, visual.dtype)
     model.has_vision = True
     model.mm_encoder_patch_buckets = [64, 128]
     encoder = Mock(wraps=qwen3_5._RBLNQwen3VisionEncoder(visual).eval())
