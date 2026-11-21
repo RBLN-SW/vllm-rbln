@@ -48,7 +48,7 @@ from vllm_rbln.model_executor.models.interfaces import (
     SupportsRBLNMmPrefix,
     SupportsRBLNMultiModal,
 )
-from vllm_rbln.patches.attention import _resolve_kv_cache
+from vllm_rbln.v1.attention.kv_cache_bindings import resolve_kv_cache
 
 
 def _build_mm_prefix_sliding_mask(
@@ -488,7 +488,7 @@ class RBLNGemma4ForConditionalGeneration(
                     metadata.mm_prefix_row_ends,
                     metadata.seq_lens,
                     layer.sliding_window,
-                    _resolve_kv_cache(metadata, layer.layer_index).size(-2),
+                    resolve_kv_cache(metadata, layer.layer_index).size(-2),
                     self.model_dtype,
                 )
                 # Workaround: borrow metadata without mutating Attention modules.

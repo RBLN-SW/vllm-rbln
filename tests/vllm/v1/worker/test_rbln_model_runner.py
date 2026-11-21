@@ -20,6 +20,8 @@
 
 import contextlib
 import json
+import subprocess
+import sys
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
@@ -3054,3 +3056,20 @@ class TestDecodeGraphShapes:
         assert mr.RBLNModelRunner.decode_graph_shapes(runner) == []
         calls = self._dummies(runner)
         assert [args for args, _ in calls] == [(1, 128, True), (1, 256, True)]
+
+
+@pytest.mark.parametrize(
+    "module",
+    ["vllm_rbln.v1.worker.rbln_model_runner", "vllm_rbln.v1.worker.rbln_worker"],
+)
+def test_worker_module_imports_before_patches(module):
+    # The runner is imported outside the platform plugin too (out-of-tree
+    # workers subclass it), so it must not depend on `vllm_rbln.patches`,
+    # whose `metrics` module imports the runner back.
+    out = subprocess.run(
+        [sys.executable, "-c", f"import {module}"],
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert out.returncode == 0, out.stderr[-2000:]
