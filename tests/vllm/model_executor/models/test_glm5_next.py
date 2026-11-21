@@ -19,6 +19,8 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from vllm_rbln.utils import EncoderInputBuffers
+
 
 def _bare(cls):
     module = cls.__new__(cls)
@@ -164,6 +166,7 @@ def test_image_encoding_reuses_eager_or_compiled_encoder(monkeypatch, compiled):
     model = _bare(cls)
     model.visual = torch.nn.Linear(2, 2, bias=False)
     model.visual.spatial_merge_size = 1
+    model.visual.device, model.visual.dtype = torch.device("cpu"), torch.float32
     model.mm_embeds_dtype = torch.float32
     encoder = torch.nn.Sequential(model.visual)
     build_encoder = Mock(return_value=encoder)
@@ -309,6 +312,7 @@ def test_vision_encoder_builds_its_inputs_from_upstream_rope(monkeypatch):
 
     model = _bare(glm.RBLNGlm5NextForConditionalGeneration)
     model.visual = visual
+    model._mm_input_buffers = EncoderInputBuffers(visual.device, visual.dtype)
     model.mm_encoder_patch_buckets = [16]
     padded, cos, sin, key_bias = model._encoder_inputs(pixels, [1, 2, 4])
 
@@ -429,6 +433,9 @@ def test_video_frames_reuse_image_buckets_without_cross_frame_attention(video_fi
         return (weights @ pixels).squeeze(0)
 
     object.__setattr__(model, "_mm_encoder", encoder)
+    model._mm_input_buffers = EncoderInputBuffers(
+        model.visual.device, model.visual.dtype
+    )
     image = torch.arange(8, dtype=torch.float32).reshape(2, 4) / 10
     video = torch.arange(40, dtype=torch.float32).reshape(10, 4) / 10
     image_inputs = dict(pixel_values=image, image_grid_thw=torch.tensor([[1, 1, 2]]))

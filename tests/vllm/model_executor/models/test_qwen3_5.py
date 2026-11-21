@@ -40,6 +40,7 @@ from vllm_rbln.model_executor.models.qwen3_5 import (
     RBLNQwen3_5ForConditionalGeneration,
     RBLNQwen3_5MultiModalProcessor,
 )
+from vllm_rbln.utils import EncoderInputBuffers
 
 PATCH, MERGE, TEMPORAL = 16, 2, 2
 
@@ -258,6 +259,7 @@ def test_warmup_runs_the_encoder_once_over_each_bucket(visual):
     )
     torch.nn.Module.__init__(model)
     model.visual = visual
+    model._mm_input_buffers = EncoderInputBuffers(visual.device, visual.dtype)
     model.has_vision = True
     model.mm_encoder_patch_buckets = [64, 128]
     encoder = Mock(return_value=torch.zeros(1, 32))
@@ -287,6 +289,7 @@ def test_a_bucket_reuses_its_input_buffers_and_masks_the_padding(visual):
     )
     torch.nn.Module.__init__(model)
     model.visual = visual
+    model._mm_input_buffers = EncoderInputBuffers(visual.device, visual.dtype)
     model.mm_encoder_patch_buckets = [64, 128]
     patch_dim = 3 * TEMPORAL * PATCH * PATCH
 
@@ -312,6 +315,7 @@ def test_an_image_takes_the_smallest_bucket_that_holds_it(visual, grid, bucket):
     )
     torch.nn.Module.__init__(model)
     model.visual = visual
+    model._mm_input_buffers = EncoderInputBuffers(visual.device, visual.dtype)
     model.mm_encoder_patch_buckets = [64, 128]
     num_patches = grid[0] * grid[1] * grid[2]
     pixels = torch.zeros(num_patches, 3 * TEMPORAL * PATCH * PATCH)
@@ -334,6 +338,7 @@ def test_image_embeddings_match_upstream(visual):
     )
     torch.nn.Module.__init__(model)
     model.visual = visual
+    model._mm_input_buffers = EncoderInputBuffers(visual.device, visual.dtype)
     model.has_vision = True
     model.mm_encoder_patch_buckets = [64, 128]
     model._mm_encoder = None
@@ -367,6 +372,7 @@ def test_video_frames_run_one_at_a_time_and_match_upstream(visual):
     )
     torch.nn.Module.__init__(model)
     model.visual = visual
+    model._mm_input_buffers = EncoderInputBuffers(visual.device, visual.dtype)
     model.has_vision = True
     model.mm_encoder_patch_buckets = [64, 128]
     encoder = Mock(wraps=qwen3_5._RBLNQwen3VisionEncoder(visual).eval())

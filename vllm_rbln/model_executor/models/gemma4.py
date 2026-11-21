@@ -326,6 +326,8 @@ class RBLNGemma4ForConditionalGeneration(
         self.mm_encoder_patch_buckets = [budget * pool**2 for budget in budgets]
         self._mm_encoder: Callable[..., torch.Tensor] | None
         object.__setattr__(self, "_mm_encoder", None)
+        # Made with the encoder in compile_mm_encoder, once the tower's device is final.
+        self._mm_input_buffers: rbln_utils.EncoderInputBuffers | None = None
 
     @property
     def logits_processor(self) -> nn.Module:
@@ -372,7 +374,15 @@ class RBLNGemma4ForConditionalGeneration(
         ):
             return
         encoder = _RBLNGemma4VisionEncoder(self.vision_tower, self.embed_vision)
-        object.__setattr__(self, "_mm_encoder", compile_fn(encoder.eval()))
+        self._set_mm_encoder(compile_fn(encoder.eval()))
+
+    def _set_mm_encoder(self, encoder: Callable[..., torch.Tensor]) -> None:
+        """Adopt the encoder with the input buffers it is fed from, sized on the
+        tower's device."""
+        object.__setattr__(self, "_mm_encoder", encoder)
+        self._mm_input_buffers = rbln_utils.EncoderInputBuffers(
+            next(self.vision_tower.parameters()).device, self.model_dtype
+        )
 
     def warmup_mm_encoder(self) -> None:
         if self._mm_encoder is None:
@@ -405,7 +415,7 @@ class RBLNGemma4ForConditionalGeneration(
             encoder = _RBLNGemma4VisionEncoder(
                 self.vision_tower, self.embed_vision
             ).eval()
-            object.__setattr__(self, "_mm_encoder", encoder)
+            self._set_mm_encoder(encoder)
         tower = self.vision_tower
         valid = (pixel_position_ids >= 0).all(dim=-1)
         num_patches = int(valid.sum())
@@ -422,7 +432,9 @@ class RBLNGemma4ForConditionalGeneration(
         key_bias = torch.where(padding, torch.finfo(self.model_dtype).min, 0.0)[
             :, None, None, :
         ]
-        inputs = self._mm_input_buffers.stage(
+        buffers = self._mm_input_buffers
+        assert buffers is not None, "compile_mm_encoder runs before encoding"
+        inputs = buffers.stage(
             bucket,
             self._mm_input_specs(bucket, pixel_values.shape[-1]),
             [pixel_values[valid].unsqueeze(0), positions, padding, key_bias],
@@ -434,16 +446,6 @@ class RBLNGemma4ForConditionalGeneration(
         return rbln_utils.run_mm_encoder(
             lambda *inputs: encoder(*inputs)[0], inputs, num_soft_tokens
         )
-
-    @property
-    def _mm_input_buffers(self) -> rbln_utils.EncoderInputBuffers:
-        buffers = self.__dict__.get("_mm_input_buffers_")
-        if buffers is None:
-            buffers = rbln_utils.EncoderInputBuffers(
-                next(self.vision_tower.parameters()).device, self.model_dtype
-            )
-            self.__dict__["_mm_input_buffers_"] = buffers
-        return buffers
 
     def _mm_input_specs(
         self, bucket: int, patch_pixels: int

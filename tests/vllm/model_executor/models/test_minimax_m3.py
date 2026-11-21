@@ -21,6 +21,8 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from vllm_rbln.utils import EncoderInputBuffers
+
 
 @pytest.fixture
 def vision_tower(tmp_path):
@@ -122,8 +124,11 @@ def test_minimax_m3_encoder_compile_requires_local_tower(monkeypatch, has_tower)
         m3.RBLNMiniMaxM3SparseForConditionalGeneration
     )
     torch.nn.Module.__init__(model)
-    # Non-first PP ranks and text-only configurations own no vision tower.
-    model.vision_tower = torch.nn.Identity() if has_tower else None
+    # Non-first PP ranks and text-only configurations own no vision tower. A
+    # tower carries a parameter and a dtype, which size the input buffers.
+    tower = torch.nn.Linear(1, 1)
+    tower.dtype = torch.bfloat16
+    model.vision_tower = tower if has_tower else None
     encoder = torch.nn.Identity()
     build_encoder = Mock(return_value=encoder)
     monkeypatch.setattr(m3, "_RBLNVisionEncoder", build_encoder)
@@ -317,6 +322,7 @@ def test_image_encoding_reuses_eager_or_compiled_encoder(
     torch.nn.Module.__init__(model)
     model.vision_tower = torch.nn.Linear(2, 2, bias=False)
     model.vision_tower.spatial_merge_size = 1
+    model.vision_tower.dtype = torch.float32
     model.mm_embeds_dtype = out_dtype
     model.vision_tower.vision_model = SimpleNamespace(vision_segment_max_frames=4)
     encoder = torch.nn.Sequential(model.vision_tower)
@@ -550,6 +556,7 @@ def test_images_and_video_segments_share_buckets(
         limits={"image": 1, "video": 1},
     )
     model.vision_tower = vision_encoder_model.vision_tower
+    model._mm_input_buffers = vision_encoder_model._mm_input_buffers
     pixels = torch.ones(math.prod(grid), 6)
 
     image, *_ = model._encoder_inputs(pixels, grid, "image")
@@ -721,6 +728,7 @@ def vision_encoder_model():
         vision_segment_max_frames=2,
     )
     model.vision_tower = tower
+    model._mm_input_buffers = EncoderInputBuffers("cpu", tower.dtype)
     model.mm_embeds_dtype = torch.float32
     model.mm_encoder_patch_buckets = [16, 64]
     return model
@@ -863,6 +871,7 @@ def test_warmup_runs_every_patch_bucket(
         limits={"image": 1, "video": video_limit},
     )
     model.vision_tower = vision_encoder_model.vision_tower
+    model._mm_input_buffers = vision_encoder_model._mm_input_buffers
     warmed = []
 
     def encode(pixels, cos, sin, bias):

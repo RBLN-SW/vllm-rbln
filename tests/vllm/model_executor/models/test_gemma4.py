@@ -33,6 +33,7 @@ import vllm_rbln.model_executor.models.gemma4 as gemma4
 from vllm_rbln.compilation.compiler import compile, mark_decoder_regions
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.model_executor.models.gemma4 import RBLNGemma4ForConditionalGeneration
+from vllm_rbln.utils import EncoderInputBuffers
 from vllm_rbln.v1.attention.backends.flash_attention import RBLNFlashAttentionMetadata
 
 POOL = 3
@@ -52,6 +53,12 @@ def _bare_model(**attrs) -> RBLNGemma4ForConditionalGeneration:
     object.__setattr__(model, "_mm_encoder", None)
     for key, value in attrs.items():
         setattr(model, key, value)
+    # What compile_mm_encoder would make for a model built with a tower.
+    model._mm_input_buffers = (
+        EncoderInputBuffers("cpu", attrs["model_dtype"])
+        if "vision_tower" in attrs and "model_dtype" in attrs
+        else None
+    )
     return model
 
 
@@ -482,8 +489,10 @@ def test_the_encoder_compiles_only_where_the_tower_lives(
         gemma4, "_RBLNGemma4VisionEncoder", lambda tower, embed_vision: built
     )
     model = _bare_model(
-        vision_tower=nn.Identity(),
+        # A tower with a parameter: the input buffers take its device.
+        vision_tower=nn.Linear(1, 1),
         embed_vision=nn.Identity(),
+        model_dtype=torch.float32,
         multimodal_config=SimpleNamespace(
             get_limit_per_prompt=lambda modality: limits.get(modality, 0)
         ),

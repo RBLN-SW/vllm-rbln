@@ -1284,6 +1284,8 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
             self.mm_encoder_patch_buckets = [b * merge**2 for b in budgets]
 
         object.__setattr__(self, "_mm_encoder", None)
+        # Made with the encoder in compile_mm_encoder, once the tower's device is final.
+        self._mm_input_buffers: rbln_utils.EncoderInputBuffers | None = None
 
         with self._mark_language_model(vllm_config):
             self.language_model = init_vllm_registered_model(
@@ -1322,18 +1324,6 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
                     *self._stage_encoder_inputs(bucket, bucket, [None] * 4)
                 )
 
-    @property
-    def _mm_input_buffers(self) -> rbln_utils.EncoderInputBuffers:
-        buffers = self.__dict__.get("_mm_input_buffers_")
-        if buffers is None:
-            tower = self.vision_tower
-            assert tower is not None
-            buffers = rbln_utils.EncoderInputBuffers(
-                next(tower.parameters()).device, tower.dtype
-            )
-            self.__dict__["_mm_input_buffers_"] = buffers
-        return buffers
-
     def _mm_input_specs(self, bucket: int) -> list[rbln_utils.EncoderInput]:
         """The encoder's inputs at `bucket`: patches, the 3D-RoPE cos and sin,
         and the key bias that masks the padding."""
@@ -1352,7 +1342,9 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
     def _stage_encoder_inputs(
         self, bucket: int, num_patches: int, prefixes: list[torch.Tensor | None]
     ) -> list[torch.Tensor]:
-        return self._mm_input_buffers.stage(
+        buffers = self._mm_input_buffers
+        assert buffers is not None, "compile_mm_encoder runs before encoding"
+        return buffers.stage(
             bucket, self._mm_input_specs(bucket), prefixes, num_patches
         )
 
@@ -1362,6 +1354,9 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
             return
         encoder = _RBLNVisionEncoder(self.vision_tower, self.mm_embeds_dtype).eval()
         object.__setattr__(self, "_mm_encoder", compile_fn(encoder))
+        self._mm_input_buffers = rbln_utils.EncoderInputBuffers(
+            next(self.vision_tower.parameters()).device, self.vision_tower.dtype
+        )
 
     def _encoder_inputs(
         self, pixel_values: torch.Tensor, grid_thw: list[int], modality: str

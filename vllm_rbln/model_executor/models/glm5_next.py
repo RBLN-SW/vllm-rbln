@@ -1403,6 +1403,8 @@ class RBLNGlm5NextForConditionalGeneration(
             self.visual = PPMissingLayer()
         self.config.image_token_index = hf_config.image_token_id
         object.__setattr__(self, "_mm_encoder", None)
+        # Made with the encoder in compile_mm_encoder, once the tower's device is final.
+        self._mm_input_buffers: rbln_utils.EncoderInputBuffers | None = None
 
     def get_language_model(self) -> nn.Module:
         return self
@@ -1412,6 +1414,9 @@ class RBLNGlm5NextForConditionalGeneration(
             return
         encoder = _RBLNGlm5NextVisionEncoder(self.visual, self.mm_embeds_dtype).eval()
         object.__setattr__(self, "_mm_encoder", compile_fn(encoder))
+        self._mm_input_buffers = rbln_utils.EncoderInputBuffers(
+            self.visual.device, self.visual.dtype
+        )
 
     def warmup_mm_encoder(self) -> None:
         visual = self.visual
@@ -1427,16 +1432,6 @@ class RBLNGlm5NextForConditionalGeneration(
                 self._mm_encoder(
                     *self._stage_encoder_inputs(bucket, head_dim, bucket, [None] * 4)
                 )
-
-    @property
-    def _mm_input_buffers(self) -> rbln_utils.EncoderInputBuffers:
-        buffers = self.__dict__.get("_mm_input_buffers_")
-        if buffers is None:
-            buffers = rbln_utils.EncoderInputBuffers(
-                self.visual.device, self.visual.dtype
-            )
-            self.__dict__["_mm_input_buffers_"] = buffers
-        return buffers
 
     def _mm_input_specs(
         self, bucket: int, head_dim: int
@@ -1458,7 +1453,9 @@ class RBLNGlm5NextForConditionalGeneration(
         num_patches: int,
         prefixes: list[torch.Tensor | None],
     ) -> list[torch.Tensor]:
-        return self._mm_input_buffers.stage(
+        buffers = self._mm_input_buffers
+        assert buffers is not None, "compile_mm_encoder runs before encoding"
+        return buffers.stage(
             bucket, self._mm_input_specs(bucket, head_dim), prefixes, num_patches
         )
 

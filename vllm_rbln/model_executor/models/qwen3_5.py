@@ -189,6 +189,8 @@ class RBLNQwen3_5ForConditionalGeneration(
             )
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         object.__setattr__(self, "_mm_encoder", None)
+        # Made with the encoder in compile_mm_encoder, once the tower's device is final.
+        self._mm_input_buffers: rbln_utils.EncoderInputBuffers | None = None
         # Upstream builds no vision tower when images and video are off (a
         # placeholder stands in for it).
         modalities = [
@@ -276,6 +278,9 @@ class RBLNQwen3_5ForConditionalGeneration(
             return
         encoder = _RBLNQwen3VisionEncoder(self.visual).eval()
         object.__setattr__(self, "_mm_encoder", compile_fn(encoder))
+        self._mm_input_buffers = rbln_utils.EncoderInputBuffers(
+            self.visual.device, self.visual.dtype
+        )
 
     def warmup_mm_encoder(self) -> None:
         if not self.has_vision:
@@ -290,16 +295,6 @@ class RBLNQwen3_5ForConditionalGeneration(
             for bucket in self.mm_encoder_patch_buckets:
                 # Every entry valid: the warm-up never masks a key.
                 encoder(*self._stage_encoder_inputs(bucket, bucket, [None] * 5))
-
-    @property
-    def _mm_input_buffers(self) -> rbln_utils.EncoderInputBuffers:
-        buffers = self.__dict__.get("_mm_input_buffers_")
-        if buffers is None:
-            buffers = rbln_utils.EncoderInputBuffers(
-                self.visual.device, self.visual.dtype
-            )
-            self.__dict__["_mm_input_buffers_"] = buffers
-        return buffers
 
     def _mm_input_specs(self, bucket: int) -> list[rbln_utils.EncoderInput]:
         """The encoder's inputs at `bucket`: patches, position embeddings, the
@@ -318,7 +313,9 @@ class RBLNQwen3_5ForConditionalGeneration(
     def _stage_encoder_inputs(
         self, bucket: int, num_patches: int, prefixes: list[torch.Tensor | None]
     ) -> list[torch.Tensor]:
-        return self._mm_input_buffers.stage(
+        buffers = self._mm_input_buffers
+        assert buffers is not None, "compile_mm_encoder runs before encoding"
+        return buffers.stage(
             bucket, self._mm_input_specs(bucket), prefixes, num_patches
         )
 
