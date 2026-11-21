@@ -84,15 +84,17 @@ def mm_prefill_lookahead(vllm_config: VllmConfig) -> int:
     return lookahead
 
 
-def encoder_cache_capacity(cache_size: int, *, mm_prefill_lookahead: int) -> int:
+def encoder_cache_capacity(
+    num_embedding_rows: int, *, mm_prefill_lookahead: int
+) -> int:
     """Embedding rows the encoder cache holds once the drafter's lookahead
-    is accounted for.
+    is accounted for, from the rows it holds without one.
 
     One-token lookahead can add a whole encoder item to the baseline demand.
     Each allowance already fits the largest item, so doubling is a
     conservative bound.
     """
-    return 2 * cache_size if mm_prefill_lookahead else cache_size
+    return 2 * num_embedding_rows if mm_prefill_lookahead else num_embedding_rows
 
 
 def is_prefill(request: Request, *, strict_kv_producer: bool) -> bool:

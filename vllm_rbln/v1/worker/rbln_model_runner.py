@@ -1629,14 +1629,16 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         )
         # The rows the scheduler can admit: its base capacity, doubled for a
         # multimodal drafter's lookahead, as RBLNScheduler sizes its manager.
-        num_rows = encoder_cache_capacity(
+        num_embedding_rows = encoder_cache_capacity(
             budget.encoder_cache_size,
             mm_prefill_lookahead=mm_prefill_lookahead(self.vllm_config),
         )
         # Conservatively reserve that full capacity on each chiplet rather than
         # assuming the KV cache's sharding also applies here.
         return allocation_size(
-            num_rows * self.model_config.get_hidden_size() * get_dtype_size(self.dtype)
+            num_embedding_rows
+            * self.model_config.get_hidden_size()
+            * get_dtype_size(self.dtype)
         )
 
     def _execute_mm_encoder(self, scheduler_output: RBLNSchedulerOutput) -> None:
