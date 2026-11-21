@@ -329,7 +329,8 @@ class RBLNQwen3_5ForConditionalGeneration(
         its patches, and the position embeddings and key mask built on the
         host for its valid patches; upstream builds them on the tower's
         device. The tensors returned are the bucket's buffers, rewritten by
-        the next frame staged into it."""
+        the next frame staged into it; their padding holds what earlier frames
+        left, masked by the key bias."""
         visual = self.visual
         num_patches = math.prod(grid_thw)
         fits = [b for b in self.mm_encoder_patch_buckets if b >= num_patches]
@@ -352,8 +353,10 @@ class RBLNQwen3_5ForConditionalGeneration(
         cos_table, sin_table = visual.rotary_pos_emb.get_cos_sin(max(h, w))
         cos = cos_table.cpu()[pos_ids].flatten(1)
         sin = sin_table.cpu()[pos_ids].flatten(1)
+        key_bias = torch.zeros(1, 1, bucket)
+        key_bias[..., num_patches:] = -30000.0
         return self._stage_encoder_inputs(
-            bucket, num_patches, [pixel_values, pos_embeds, cos, sin, None]
+            bucket, num_patches, [pixel_values, pos_embeds, cos, sin, key_bias]
         )
 
     def _encode(

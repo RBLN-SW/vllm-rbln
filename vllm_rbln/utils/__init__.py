@@ -43,13 +43,15 @@ def run_mm_encoder(
 
 class EncoderInput(NamedTuple):
     """One input of a compiled vision encoder at one bucket: its shape, the axis
-    the bucket runs along, and the values its valid and padded entries take when
-    nothing is copied in."""
+    the bucket runs along, the value every entry takes when nothing is copied
+    in, the value its padding is initialized to, and its dtype when that is not
+    the buffers' default."""
 
     shape: tuple[int, ...]
     axis: int
     valid: float
     pad: float
+    dtype: torch.dtype | None = None
 
 
 class EncoderInputBuffers:
@@ -57,9 +59,10 @@ class EncoderInputBuffers:
 
     Uploading into a freshly allocated device tensor runs several times slower
     than into one written before, so each bucket keeps its input tensors across
-    calls. Staging copies the valid prefix of each input from the host and
-    refills the padding on the device, so only the image's own bytes cross the
-    link and the host builds no padded copies.
+    calls, and a call copies only what the image needs: its own entries of each
+    input, and the key bias over the whole bucket. The padding entries of the
+    other inputs keep whatever an earlier image left there. That is finite,
+    and the key bias masks those entries, so they never reach a valid output.
     """
 
     def __init__(self, device: torch.device | str, dtype: torch.dtype) -> None:
@@ -68,14 +71,19 @@ class EncoderInputBuffers:
         self._buffers: dict[int, list[torch.Tensor]] = {}
 
     def get(self, bucket: int, specs: Sequence[EncoderInput]) -> list[torch.Tensor]:
-        """The bucket's buffers, allocated on first use."""
+        """The bucket's buffers, allocated and padded on first use."""
         buffers = self._buffers.get(bucket)
         if buffers is None:
             # Plain tensors, not inference tensors: staging writes them in place
             # inside and outside inference mode alike.
             with torch.inference_mode(False):
                 buffers = [
-                    torch.empty(spec.shape, dtype=self.dtype, device=self.device)
+                    torch.full(
+                        spec.shape,
+                        spec.pad,
+                        dtype=spec.dtype or self.dtype,
+                        device=self.device,
+                    )
                     for spec in specs
                 ]
             self._buffers[bucket] = buffers
@@ -85,21 +93,25 @@ class EncoderInputBuffers:
         self,
         bucket: int,
         specs: Sequence[EncoderInput],
-        prefixes: Sequence[torch.Tensor | None],
+        values: Sequence[torch.Tensor | None],
         num_valid: int,
     ) -> list[torch.Tensor]:
-        """Fill the bucket's buffers: the first `num_valid` entries along each
-        input's axis from its host prefix (or its valid value when the prefix is
-        None), the rest with its pad value."""
+        """Fill the bucket's buffers. A value spanning the bucket along its
+        input's axis is copied whole; one spanning `num_valid` entries is
+        copied over the leading entries; None fills every entry with the
+        input's valid value."""
         buffers = self.get(bucket, specs)
-        for buffer, spec, prefix in zip(buffers, specs, prefixes, strict=True):
-            head = buffer.narrow(spec.axis, 0, num_valid)
-            if prefix is None:
-                head.fill_(spec.valid)
+        for buffer, spec, value in zip(buffers, specs, values, strict=True):
+            if value is None:
+                buffer.fill_(spec.valid)
+            elif value.shape[spec.axis] == bucket:
+                buffer.copy_(value)
             else:
-                head.copy_(prefix)
-            if num_valid < bucket:
-                buffer.narrow(spec.axis, num_valid, bucket - num_valid).fill_(spec.pad)
+                assert value.shape[spec.axis] == num_valid, (
+                    f"a value of {value.shape[spec.axis]} entries for an input of "
+                    f"{num_valid} valid entries in a {bucket}-entry bucket"
+                )
+                buffer.narrow(spec.axis, 0, num_valid).copy_(value)
         return buffers
 
 

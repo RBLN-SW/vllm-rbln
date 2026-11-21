@@ -397,7 +397,8 @@ class RBLNGemma4ForConditionalGeneration(
         self, pixel_values: torch.Tensor, pixel_position_ids: torch.Tensor
     ) -> torch.Tensor:
         """One image or video frame, `[num_patches, patch_pixels]` with `(-1, -1)`
-        positions on its padding, to its soft token embeddings."""
+        positions on its padding, to its soft token embeddings. The encoder's
+        inputs are the bucket's staging buffers, rewritten by the next frame."""
         encoder = self._mm_encoder
         if encoder is None:
             # enforce_eager: the runner never calls compile_mm_encoder.
@@ -413,29 +414,53 @@ class RBLNGemma4ForConditionalGeneration(
             f"{self.mm_encoder_patch_buckets[-1]}-patch bucket"
         )
         bucket = next(b for b in self.mm_encoder_patch_buckets if b >= num_patches)
-        # Fixed dtypes, so warm-up and serving reach the same compiled graphs.
+        # The positions, padding mask and key bias span the bucket, so the
+        # padding is masked whatever an earlier frame left in its patches.
         positions = torch.full((1, bucket, 2), -1, dtype=torch.long)
         positions[0, :num_patches] = pixel_position_ids[valid]
-        patches = torch.zeros(1, bucket, pixel_values.shape[-1])
-        patches[0, :num_patches] = pixel_values[valid]
         padding = ~(positions >= 0).all(dim=-1)
         key_bias = torch.where(padding, torch.finfo(self.model_dtype).min, 0.0)[
             :, None, None, :
         ]
-        device = next(tower.parameters()).device
+        inputs = self._mm_input_buffers.stage(
+            bucket,
+            self._mm_input_specs(bucket, pixel_values.shape[-1]),
+            [pixel_values[valid].unsqueeze(0), positions, padding, key_bias],
+            num_patches,
+        )
         # The patches of a grid whose sides are multiples of the pooling kernel
         # pool into the leading cells, in order.
         num_soft_tokens = num_patches // tower.config.pooling_kernel_size**2
         return rbln_utils.run_mm_encoder(
-            lambda *inputs: encoder(*inputs)[0],
-            [
-                patches.to(device),
-                positions.to(device),
-                padding.to(device),
-                key_bias.to(device=device, dtype=self.model_dtype),
-            ],
-            num_soft_tokens,
+            lambda *inputs: encoder(*inputs)[0], inputs, num_soft_tokens
         )
+
+    @property
+    def _mm_input_buffers(self) -> rbln_utils.EncoderInputBuffers:
+        buffers = self.__dict__.get("_mm_input_buffers_")
+        if buffers is None:
+            buffers = rbln_utils.EncoderInputBuffers(
+                next(self.vision_tower.parameters()).device, self.model_dtype
+            )
+            self.__dict__["_mm_input_buffers_"] = buffers
+        return buffers
+
+    def _mm_input_specs(
+        self, bucket: int, patch_pixels: int
+    ) -> list[rbln_utils.EncoderInput]:
+        """The encoder's inputs at `bucket`: float32 patches, their (x, y)
+        positions, the padding mask, and the key bias that masks the padding.
+        Fixed dtypes, so warm-up and serving reach the same compiled graphs."""
+        return [
+            rbln_utils.EncoderInput(
+                (1, bucket, patch_pixels), 1, 0.0, 0.0, torch.float32
+            ),
+            rbln_utils.EncoderInput((1, bucket, 2), 1, -1.0, -1.0, torch.long),
+            rbln_utils.EncoderInput((1, bucket), 1, 0.0, 1.0, torch.bool),
+            rbln_utils.EncoderInput(
+                (1, 1, 1, bucket), 3, 0.0, torch.finfo(self.model_dtype).min
+            ),
+        ]
 
     def _process_image_input(
         self, image_input: Gemma4ImageInputs

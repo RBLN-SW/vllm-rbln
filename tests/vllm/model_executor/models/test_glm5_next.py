@@ -307,12 +307,10 @@ def test_vision_encoder_builds_its_inputs_from_upstream_rope(monkeypatch):
     )
     pixels = torch.arange(40, dtype=torch.float32).view(8, 5)
 
-    encoder_inputs = glm.RBLNGlm5NextForConditionalGeneration._encoder_inputs
-    padded, cos, sin, key_bias = encoder_inputs(
-        SimpleNamespace(visual=visual, mm_encoder_patch_buckets=[16]),
-        pixels,
-        [1, 2, 4],
-    )
+    model = _bare(glm.RBLNGlm5NextForConditionalGeneration)
+    model.visual = visual
+    model.mm_encoder_patch_buckets = [16]
+    padded, cos, sin, key_bias = model._encoder_inputs(pixels, [1, 2, 4])
 
     torch.testing.assert_close(padded[:8], pixels)
     assert not padded[8:].any()

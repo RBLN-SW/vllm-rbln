@@ -825,7 +825,7 @@ def test_an_image_runs_in_the_smallest_bucket_that_holds_it(vision_encoder_model
         assert (key_bias[..., math.prod(grid) :] < 0).all()
 
 
-def test_a_bucket_reuses_its_input_buffers_and_resets_the_padding(
+def test_a_bucket_reuses_its_input_buffers_and_masks_the_padding(
     vision_encoder_model,
 ):
     model = vision_encoder_model
@@ -835,8 +835,10 @@ def test_a_bucket_reuses_its_input_buffers_and_resets_the_padding(
     # Same bucket, same device tensors: no allocation and no padded host copy.
     assert [x.data_ptr() for x in small] == [x.data_ptr() for x in large]
     padded, cos, sin, key_bias = small
-    assert (padded[:4] == 3.0).all() and (padded[4:] == 0.0).all()
-    assert (cos[4:] == 1.0).all() and (sin[4:] == 0.0).all()
+    assert (padded[:4] == 3.0).all()
+    # The larger image's entries stay in the padding, which the key bias masks.
+    assert (padded[4:] == 5.0).all()
+    assert torch.isfinite(cos).all() and torch.isfinite(sin).all()
     assert (key_bias[..., :4] == 0).all() and (key_bias[..., 4:] < 0).all()
 
 

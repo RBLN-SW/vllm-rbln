@@ -281,7 +281,7 @@ def test_warmup_runs_the_encoder_once_over_each_bucket(visual):
     assert encoder.call_count == 2
 
 
-def test_a_bucket_reuses_its_input_buffers_and_resets_the_padding(visual):
+def test_a_bucket_reuses_its_input_buffers_and_masks_the_padding(visual):
     model = RBLNQwen3_5ForConditionalGeneration.__new__(
         RBLNQwen3_5ForConditionalGeneration
     )
@@ -296,9 +296,10 @@ def test_a_bucket_reuses_its_input_buffers_and_resets_the_padding(visual):
     # Same bucket, same device tensors: no allocation and no padded host copy.
     assert [x.data_ptr() for x in small] == [x.data_ptr() for x in large]
     patches, pos_embeds, cos, sin, key_bias = small
-    assert (patches[:24] == 3.0).all() and (patches[24:] == 0.0).all()
-    assert (pos_embeds[24:] == 0.0).all()
-    assert (cos[24:] == 1.0).all() and (sin[24:] == 0.0).all()
+    assert (patches[:24] == 3.0).all()
+    # The larger image's entries stay in the padding, which the key bias masks.
+    assert (patches[24:] == 5.0).all()
+    assert all(torch.isfinite(x).all() for x in (pos_embeds, cos, sin))
     assert (key_bias[..., :24] == 0).all() and (key_bias[..., 24:] < 0).all()
 
 

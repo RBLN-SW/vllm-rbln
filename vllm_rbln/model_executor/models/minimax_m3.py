@@ -1369,7 +1369,8 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         """Stage an image or a video segment into its bucket's device buffers,
         with the 3D-RoPE and key mask built on the host for its valid patches.
         The tensors returned are the bucket's buffers, rewritten by the next
-        segment staged into it."""
+        segment staged into it; their padding holds what earlier segments
+        left, masked by the key bias."""
         tower = self.vision_tower
         assert tower is not None
         vm = tower.vision_model
@@ -1407,8 +1408,10 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         sin = torch.zeros(num_patches, head_dim)
         cos[:, :half] = cos[:, half : 2 * half] = freqs.cos()
         sin[:, :half] = sin[:, half : 2 * half] = freqs.sin()
+        key_bias = torch.zeros(1, 1, 1, bucket)
+        key_bias[..., num_patches:] = -30000.0
         return self._stage_encoder_inputs(
-            bucket, num_patches, [pixel_values, cos, sin, None]
+            bucket, num_patches, [pixel_values, cos, sin, key_bias]
         )
 
     def _encode_item(
