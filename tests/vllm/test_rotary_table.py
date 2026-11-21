@@ -62,8 +62,11 @@ def test_indexed_rows_rebuild_a_frame_in_any_order():
 
 def test_tables_are_float32_on_the_host_whatever_the_source():
     inv_freq = torch.tensor([1.0, 0.5], dtype=torch.bfloat16)
-    table = RotaryTable(inv_freq, num_positions=2)
+    with torch.device("meta"):
+        table = RotaryTable(inv_freq, num_positions=2)
+        cos, sin = table.rows(3)
 
     assert table.inv_freq.dtype == torch.float32
-    assert table.cos.dtype == torch.float32
-    assert table.cos.device.type == "cpu"
+    expected_cos, expected_sin = _direct(torch.arange(3), inv_freq.float())
+    torch.testing.assert_close(cos, expected_cos)
+    torch.testing.assert_close(sin, expected_sin)

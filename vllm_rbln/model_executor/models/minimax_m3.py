@@ -1401,12 +1401,15 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         # The angles of each axis, indexed out of the prebuilt tables.
         tables = self._rotary_tables
         assert tables is not None, "compile_mm_encoder runs before encoding"
-        rows = [table.rows(n) for table, n in zip(tables, (t, h, w), strict=True)]
+        time_table, height_table, width_table = tables
+        time_cos, time_sin = time_table.rows(t)
+        height_cos, height_sin = height_table.rows(h)
+        width_cos, width_sin = width_table.rows(w)
         cos_half = torch.cat(
-            [rows[0][0][t_ids], rows[1][0][h_ids], rows[2][0][w_ids]], dim=-1
+            [time_cos[t_ids], height_cos[h_ids], width_cos[w_ids]], dim=-1
         )
         sin_half = torch.cat(
-            [rows[0][1][t_ids], rows[1][1][h_ids], rows[2][1][w_ids]], dim=-1
+            [time_sin[t_ids], height_sin[h_ids], width_sin[w_ids]], dim=-1
         )
         half = cos_half.shape[-1]
         head_dim = vm.encoder.layers[0].self_attn.head_dim

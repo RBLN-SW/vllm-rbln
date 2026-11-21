@@ -65,7 +65,9 @@ class RotaryTable:
         self._build(num_positions)
 
     def _build(self, num_positions: int) -> None:
-        positions = torch.arange(num_positions, dtype=torch.float32)
+        positions = torch.arange(
+            num_positions, device=self.inv_freq.device, dtype=torch.float32
+        )
         freqs = torch.outer(positions, self.inv_freq)
         self.cos, self.sin = freqs.cos(), freqs.sin()
 
