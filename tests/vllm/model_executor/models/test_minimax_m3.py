@@ -116,6 +116,45 @@ def test_vision_blocks_trace_as_regions_with_shared_weights(vision_tower):
     assert {id(p) for p in encoder.parameters()} == {id(p) for p in tower.parameters()}
 
 
+def test_a_smaller_image_matches_fresh_padding_when_reusing_vision_buffers(
+    vision_tower,
+):
+    from vllm_rbln.model_executor.models.minimax_m3 import (
+        RBLNMiniMaxM3SparseForConditionalGeneration,
+    )
+
+    model = RBLNMiniMaxM3SparseForConditionalGeneration.__new__(
+        RBLNMiniMaxM3SparseForConditionalGeneration
+    )
+    torch.nn.Module.__init__(model)
+    model.vision_tower = vision_tower
+    model.mm_embeds_dtype = torch.float32
+    model.mm_encoder_patch_buckets = [16]
+    model.compile_mm_encoder(lambda encoder: Mock(wraps=encoder))
+    encoder = model._mm_encoder
+    large_pixels = torch.randn(16, 24)
+    small_image = {
+        "pixel_values": torch.randn(8, 24),
+        "image_grid_thw": torch.tensor([[1, 2, 4]]),
+    }
+
+    model.embed_multimodal(
+        pixel_values=large_pixels, image_grid_thw=torch.tensor([[1, 4, 4]])
+    )
+    (actual,) = model.embed_multimodal(**small_image)
+    model._mm_input_buffers = EncoderInputBuffers(
+        large_pixels.device, vision_tower.dtype
+    )
+    (expected,) = model.embed_multimodal(**small_image)
+
+    large, small, fresh = (call.args for call in encoder.call_args_list)
+    assert [x.data_ptr() for x in small] == [x.data_ptr() for x in large]
+    torch.testing.assert_close(small[0][8:], large_pixels[8:])
+    assert not fresh[0][8:].any()
+    assert actual.shape == (2, 64)
+    torch.testing.assert_close(actual, expected)
+
+
 @pytest.mark.parametrize("has_tower", [False, True])
 def test_minimax_m3_encoder_compile_requires_local_tower(monkeypatch, has_tower):
     import vllm_rbln.model_executor.models.minimax_m3 as m3

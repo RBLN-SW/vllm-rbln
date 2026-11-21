@@ -125,6 +125,33 @@ def test_the_vision_encoder_matches_hfs():
     torch.testing.assert_close(got, expected, rtol=1e-4, atol=1e-4)
 
 
+def test_a_smaller_image_matches_upstream_when_reusing_vision_buffers(monkeypatch):
+    tower = _vision_tower()
+    model = _bare_model(
+        vision_tower=tower,
+        embed_vision=_Identity(),
+        model_dtype=torch.float32,
+        mm_encoder_patch_buckets=[90],
+    )
+    encode = Mock(wraps=gemma4.rbln_utils.run_mm_encoder)
+    monkeypatch.setattr(gemma4.rbln_utils, "run_mm_encoder", encode)
+    large_pixels, large_positions = _image(9, 9, num_patches=90)
+    small_pixels, small_positions = _image(6, 3, num_patches=90)
+
+    with torch.inference_mode():
+        model._encode_vision(large_pixels, large_positions)
+        actual = model._encode_vision(small_pixels, small_positions)
+        expected = tower(
+            pixel_values=small_pixels[None], pixel_position_ids=small_positions[None]
+        ).last_hidden_state
+
+    large_inputs, small_inputs = (call.args[1] for call in encode.call_args_list)
+    assert [x.data_ptr() for x in small_inputs] == [x.data_ptr() for x in large_inputs]
+    torch.testing.assert_close(small_inputs[0][0, 18:81], large_pixels[18:81])
+    assert actual.shape == (2, 32)
+    torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
+
+
 def test_the_rotary_tables_are_built_once_not_per_image(monkeypatch):
     # The encoder looks up HF's cos and sin for each patch in the graph, so the
     # host computes none per image and the soft tokens stay HF's.

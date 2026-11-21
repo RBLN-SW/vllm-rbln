@@ -289,23 +289,30 @@ def test_a_bucket_reuses_its_input_buffers_and_masks_the_padding(visual):
     )
     torch.nn.Module.__init__(model)
     model.visual = visual
+    model.has_vision = True
     input_specs = Mock(wraps=model._mm_input_specs)
     model._mm_input_specs = input_specs
-    model._mm_input_buffers = EncoderInputBuffers(visual.device, visual.dtype)
     model.mm_encoder_patch_buckets = [64, 128]
+    model.compile_mm_encoder(lambda encoder: Mock(wraps=encoder))
+    encoder = model._mm_encoder
     patch_dim = 3 * TEMPORAL * PATCH * PATCH
+    large_pixels = torch.randn(64, patch_dim)
+    small_pixels = torch.randn(24, patch_dim)
+    small_grid = [1, 6, 4]
 
-    large = model._encoder_inputs(torch.full((64, patch_dim), 5.0), [1, 8, 8])
-    small = model._encoder_inputs(torch.full((24, patch_dim), 3.0), [1, 6, 4])
+    with torch.inference_mode():
+        model._encode(large_pixels, torch.tensor([[1, 8, 8]]))
+        (actual,) = model._encode(small_pixels, torch.tensor([small_grid]))
+        expected = visual(small_pixels, grid_thw=[small_grid])
 
-    input_specs.assert_called_once_with(64)
-    # Same bucket, same device tensors: no allocation and no padded host copy.
+    large, small = (call.args for call in encoder.call_args_list)
     assert [x.data_ptr() for x in small] == [x.data_ptr() for x in large]
+    input_specs.assert_called_once_with(64)
     patches, pos_embeds, cos, sin, key_bias = small
-    assert (patches[:24] == 3.0).all()
-    # The larger image's entries stay in the padding, which the key bias masks.
-    assert (patches[24:] == 5.0).all()
+    torch.testing.assert_close(patches[:24], small_pixels)
+    torch.testing.assert_close(patches[24:], large_pixels[24:])
     assert all(torch.isfinite(x).all() for x in (pos_embeds, cos, sin))
+    torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-5)
     assert (key_bias[..., :24] == 0).all() and (key_bias[..., 24:] < 0).all()
 
 
