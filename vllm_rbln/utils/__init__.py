@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections.abc import Callable
-from typing import Union
+from collections.abc import Callable, Sequence
+from typing import NamedTuple, Union
 
 import torch
 from vllm.forward_context import get_forward_context
@@ -39,6 +39,68 @@ def run_mm_encoder(
     if dtype is None:
         return embeds.cpu()
     return embeds.to(device="cpu", dtype=dtype)
+
+
+class EncoderInput(NamedTuple):
+    """One input of a compiled vision encoder at one bucket: its shape, the axis
+    the bucket runs along, and the values its valid and padded entries take when
+    nothing is copied in."""
+
+    shape: tuple[int, ...]
+    axis: int
+    valid: float
+    pad: float
+
+
+class EncoderInputBuffers:
+    """Device buffers a vision encoder's inputs are staged into, one set a bucket.
+
+    Uploading into a freshly allocated device tensor runs several times slower
+    than into one written before, so each bucket keeps its input tensors across
+    calls. Staging copies the valid prefix of each input from the host and
+    refills the padding on the device, so only the image's own bytes cross the
+    link and the host builds no padded copies.
+    """
+
+    def __init__(self, device: torch.device | str, dtype: torch.dtype) -> None:
+        self.device = torch.device(device)
+        self.dtype = dtype
+        self._buffers: dict[int, list[torch.Tensor]] = {}
+
+    def get(self, bucket: int, specs: Sequence[EncoderInput]) -> list[torch.Tensor]:
+        """The bucket's buffers, allocated on first use."""
+        buffers = self._buffers.get(bucket)
+        if buffers is None:
+            # Plain tensors, not inference tensors: staging writes them in place
+            # inside and outside inference mode alike.
+            with torch.inference_mode(False):
+                buffers = [
+                    torch.empty(spec.shape, dtype=self.dtype, device=self.device)
+                    for spec in specs
+                ]
+            self._buffers[bucket] = buffers
+        return buffers
+
+    def stage(
+        self,
+        bucket: int,
+        specs: Sequence[EncoderInput],
+        prefixes: Sequence[torch.Tensor | None],
+        num_valid: int,
+    ) -> list[torch.Tensor]:
+        """Fill the bucket's buffers: the first `num_valid` entries along each
+        input's axis from its host prefix (or its valid value when the prefix is
+        None), the rest with its pad value."""
+        buffers = self.get(bucket, specs)
+        for buffer, spec, prefix in zip(buffers, specs, prefixes, strict=True):
+            head = buffer.narrow(spec.axis, 0, num_valid)
+            if prefix is None:
+                head.fill_(spec.valid)
+            else:
+                head.copy_(prefix)
+            if num_valid < bucket:
+                buffer.narrow(spec.axis, num_valid, bucket - num_valid).fill_(spec.pad)
+        return buffers
 
 
 def pad(

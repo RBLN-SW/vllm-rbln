@@ -1315,18 +1315,46 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         if self._mm_encoder is None:
             self.compile_mm_encoder(lambda encoder: encoder)
         assert self._mm_encoder is not None
+        with torch.inference_mode():
+            for bucket in self.mm_encoder_patch_buckets:
+                # Every entry valid: the warm-up never masks a key.
+                self._mm_encoder(
+                    *self._stage_encoder_inputs(bucket, bucket, [None] * 4)
+                )
+
+    @property
+    def _mm_input_buffers(self) -> rbln_utils.EncoderInputBuffers:
+        buffers = self.__dict__.get("_mm_input_buffers_")
+        if buffers is None:
+            tower = self.vision_tower
+            assert tower is not None
+            buffers = rbln_utils.EncoderInputBuffers(
+                next(tower.parameters()).device, tower.dtype
+            )
+            self.__dict__["_mm_input_buffers_"] = buffers
+        return buffers
+
+    def _mm_input_specs(self, bucket: int) -> list[rbln_utils.EncoderInput]:
+        """The encoder's inputs at `bucket`: patches, the 3D-RoPE cos and sin,
+        and the key bias that masks the padding."""
+        tower = self.vision_tower
+        assert tower is not None
         vm = tower.vision_model
         patch_dim = vm.embeddings.patch_embedding.weight[0].numel()
         head_dim = vm.encoder.layers[0].self_attn.head_dim
-        device = next(tower.parameters()).device
-        with torch.inference_mode():
-            for bucket in self.mm_encoder_patch_buckets:
-                self._mm_encoder(
-                    torch.zeros(bucket, patch_dim, dtype=tower.dtype, device=device),
-                    torch.ones(bucket, head_dim, dtype=tower.dtype, device=device),
-                    torch.zeros(bucket, head_dim, dtype=tower.dtype, device=device),
-                    torch.zeros(1, 1, 1, bucket, dtype=tower.dtype, device=device),
-                )
+        return [
+            rbln_utils.EncoderInput((bucket, patch_dim), 0, 0.0, 0.0),
+            rbln_utils.EncoderInput((bucket, head_dim), 0, 1.0, 1.0),
+            rbln_utils.EncoderInput((bucket, head_dim), 0, 0.0, 0.0),
+            rbln_utils.EncoderInput((1, 1, 1, bucket), 3, 0.0, -30000.0),
+        ]
+
+    def _stage_encoder_inputs(
+        self, bucket: int, num_patches: int, prefixes: list[torch.Tensor | None]
+    ) -> list[torch.Tensor]:
+        return self._mm_input_buffers.stage(
+            bucket, self._mm_input_specs(bucket), prefixes, num_patches
+        )
 
     def compile_mm_encoder(self, compile_fn) -> None:
         # Non-first PP ranks and zero image/video limits own no vision tower.
@@ -1338,8 +1366,10 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
     def _encoder_inputs(
         self, pixel_values: torch.Tensor, grid_thw: list[int], modality: str
     ) -> list[torch.Tensor]:
-        """Pad an image or a video segment to the bucket, and build its host
-        3D-RoPE and key mask."""
+        """Stage an image or a video segment into its bucket's device buffers,
+        with the 3D-RoPE and key mask built on the host for its valid patches.
+        The tensors returned are the bucket's buffers, rewritten by the next
+        segment staged into it."""
         tower = self.vision_tower
         assert tower is not None
         vm = tower.vision_model
@@ -1347,11 +1377,6 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         fits = [b for b in self.mm_encoder_patch_buckets if b >= num_patches]
         assert fits, f"a {modality} of {num_patches} patches (grid {grid_thw})"
         bucket = fits[0]
-        dtype = tower.dtype
-        device = next(tower.parameters()).device
-        patch_dim = vm.embeddings.patch_embedding.weight[0].numel()
-        padded = torch.zeros(bucket, patch_dim, dtype=dtype)
-        padded[:num_patches] = pixel_values.to(dtype)
 
         t, h, w = grid_thw
         merge = tower.spatial_merge_size
@@ -1378,14 +1403,13 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         )
         half = freqs.shape[-1]
         head_dim = vm.encoder.layers[0].self_attn.head_dim
-        cos = torch.ones(bucket, head_dim)
-        sin = torch.zeros(bucket, head_dim)
-        cos[:num_patches, :half] = cos[:num_patches, half : 2 * half] = freqs.cos()
-        sin[:num_patches, :half] = sin[:num_patches, half : 2 * half] = freqs.sin()
-
-        key_bias = torch.zeros(1, 1, 1, bucket)
-        key_bias[..., num_patches:] = -30000.0
-        return [x.to(device=device, dtype=dtype) for x in (padded, cos, sin, key_bias)]
+        cos = torch.ones(num_patches, head_dim)
+        sin = torch.zeros(num_patches, head_dim)
+        cos[:, :half] = cos[:, half : 2 * half] = freqs.cos()
+        sin[:, :half] = sin[:, half : 2 * half] = freqs.sin()
+        return self._stage_encoder_inputs(
+            bucket, num_patches, [pixel_values, cos, sin, None]
+        )
 
     def _encode_item(
         self, pixel_values: torch.Tensor, grid_thw: list[int], modality: str

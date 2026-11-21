@@ -731,9 +731,11 @@ def test_a_video_is_encoded_in_segments_of_temporal_patches(vision_encoder_model
     calls = []
 
     def encode(pixels, cos, sin, bias):
-        calls.append((pixels, cos))
+        # The inputs are the bucket's staging buffers, rewritten by the next
+        # segment, so keep copies as a compiled encoder's own output would be.
+        calls.append((pixels.clone(), cos.clone()))
         # One token per 2 x 2 merge: the patch index of its first patch.
-        return pixels[::4, :1]
+        return pixels[::4, :1].clone()
 
     object.__setattr__(model, "_mm_encoder", encode)
     pixels = torch.arange(20.0).unsqueeze(1).expand(-1, 6)
@@ -785,7 +787,10 @@ def test_shared_bucket_is_warmed_once(vision_encoder_model):
 @pytest.mark.parametrize("video_first", [False, True])
 def test_mixed_modalities_preserve_input_order(vision_encoder_model, video_first):
     model = vision_encoder_model
-    object.__setattr__(model, "_mm_encoder", lambda pixels, *args: pixels[::4, :1])
+    # A copy: the inputs are staging buffers the next item rewrites.
+    object.__setattr__(
+        model, "_mm_encoder", lambda pixels, *args: pixels[::4, :1].clone()
+    )
     image = {
         "pixel_values": torch.full((4, 6), 3.0),
         "image_grid_thw": torch.tensor([[1, 2, 2]]),
@@ -818,6 +823,21 @@ def test_an_image_runs_in_the_smallest_bucket_that_holds_it(vision_encoder_model
         assert cos.shape == sin.shape == (bucket, 16)
         assert (key_bias[..., : math.prod(grid)] == 0).all()
         assert (key_bias[..., math.prod(grid) :] < 0).all()
+
+
+def test_a_bucket_reuses_its_input_buffers_and_resets_the_padding(
+    vision_encoder_model,
+):
+    model = vision_encoder_model
+    large = model._encoder_inputs(torch.full((16, 6), 5.0), [1, 4, 4], "image")
+    small = model._encoder_inputs(torch.full((4, 6), 3.0), [1, 2, 2], "image")
+
+    # Same bucket, same device tensors: no allocation and no padded host copy.
+    assert [x.data_ptr() for x in small] == [x.data_ptr() for x in large]
+    padded, cos, sin, key_bias = small
+    assert (padded[:4] == 3.0).all() and (padded[4:] == 0.0).all()
+    assert (cos[4:] == 1.0).all() and (sin[4:] == 0.0).all()
+    assert (key_bias[..., :4] == 0).all() and (key_bias[..., 4:] < 0).all()
 
 
 @pytest.mark.parametrize(

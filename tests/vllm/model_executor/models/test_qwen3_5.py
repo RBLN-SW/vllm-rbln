@@ -281,6 +281,27 @@ def test_warmup_runs_the_encoder_once_over_each_bucket(visual):
     assert encoder.call_count == 2
 
 
+def test_a_bucket_reuses_its_input_buffers_and_resets_the_padding(visual):
+    model = RBLNQwen3_5ForConditionalGeneration.__new__(
+        RBLNQwen3_5ForConditionalGeneration
+    )
+    torch.nn.Module.__init__(model)
+    model.visual = visual
+    model.mm_encoder_patch_buckets = [64, 128]
+    patch_dim = 3 * TEMPORAL * PATCH * PATCH
+
+    large = model._encoder_inputs(torch.full((64, patch_dim), 5.0), [1, 8, 8])
+    small = model._encoder_inputs(torch.full((24, patch_dim), 3.0), [1, 6, 4])
+
+    # Same bucket, same device tensors: no allocation and no padded host copy.
+    assert [x.data_ptr() for x in small] == [x.data_ptr() for x in large]
+    patches, pos_embeds, cos, sin, key_bias = small
+    assert (patches[:24] == 3.0).all() and (patches[24:] == 0.0).all()
+    assert (pos_embeds[24:] == 0.0).all()
+    assert (cos[24:] == 1.0).all() and (sin[24:] == 0.0).all()
+    assert (key_bias[..., :24] == 0).all() and (key_bias[..., 24:] < 0).all()
+
+
 @pytest.mark.parametrize(
     ("grid", "bucket"), [([1, 6, 4], 64), ([1, 8, 8], 64), ([1, 8, 12], 128)]
 )
