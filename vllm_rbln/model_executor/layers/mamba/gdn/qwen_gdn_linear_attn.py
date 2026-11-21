@@ -32,7 +32,7 @@ from vllm_rbln.v1.attention.backends.gdn_attn import (
     RBLNGDNAttentionBackend,
     RBLNGDNAttentionMetadata,
 )
-from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec, ensure_kv_cache_registration
+from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec, register_kv_cache
 
 
 class RBLNGDNBlockAuxCache(nn.Module, AttentionLayerBase):
@@ -48,8 +48,6 @@ class RBLNGDNBlockAuxCache(nn.Module, AttentionLayerBase):
         dtype: torch.dtype,
         prefix_cacheable: bool = True,
         verify_only: bool = False,
-        *,
-        subindex: int,
     ) -> None:
         super().__init__()
         self.prefix = prefix
@@ -59,10 +57,8 @@ class RBLNGDNBlockAuxCache(nn.Module, AttentionLayerBase):
         self.prefix_cacheable = prefix_cacheable
         self.verify_only = verify_only
         self.kv_cache = torch.tensor([])
-        # Index among the graph's KV cache inputs, assigned by the runner.
-        self.layer_index: int | None = None
         context = get_current_vllm_config().compilation_config.static_forward_context
-        ensure_kv_cache_registration(context, prefix, self, subindex=subindex)
+        register_kv_cache(context, prefix, self)
 
     def forward(self) -> None: ...
 
@@ -83,7 +79,7 @@ class RBLNGDNBlockAuxCache(nn.Module, AttentionLayerBase):
 
     def inputs(self) -> torch.Tensor:
         metadata = get_forward_context().attn_metadata[self.owner]
-        return _resolve_kv_cache(metadata, self.layer_index)
+        return _resolve_kv_cache(metadata, self.prefix)
 
 
 class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
@@ -109,8 +105,6 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 f"values, a multiple of {STATE_LANES}, got {self.head_k_dim} / "
                 f"{self.head_v_dim}"
             )
-        # Index among the graph's KV cache inputs, assigned by the runner.
-        self.layer_index: int | None = None
         model_config = vllm_config.model_config
         self.num_kv_heads = model_config.get_num_kv_heads(vllm_config.parallel_config)
         self.kv_head_size = model_config.get_head_size()
@@ -128,7 +122,6 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 CONV_LANES,
             ),
             dtype=model_config.dtype,
-            subindex=1,
         )
         # gdn_verify's draft buffer, [Hk, 2R + 1, K, D] a state block: a step's
         # drafts as (k, v, g, beta) records, which the next step replays. A
@@ -144,7 +137,6 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 dtype=model_config.dtype,
                 prefix_cacheable=False,
                 verify_only=True,
-                subindex=2,
             )
 
     def get_state_shape(self) -> tuple[tuple[int, ...]]:
@@ -182,7 +174,7 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             f"the step's batch {batch}"
         )
         seq_len = num_tokens // batch
-        state = _resolve_kv_cache(metadata, self.layer_index)
+        state = _resolve_kv_cache(metadata, self.prefix)
         ring = self.conv_ring.inputs()
         tp_size = self.tp_size
         num_k_heads = self.num_k_heads // tp_size

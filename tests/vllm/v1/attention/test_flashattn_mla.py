@@ -248,21 +248,21 @@ class TestIndexerCacheBackends:
                 prefix="model.layers.0.self_attn.indexer.k_cache",
                 cache_config=vllm_config.cache_config,
             )
-        return cache
+        return cache, vllm_config.compilation_config.static_forward_context
 
     @pytest.mark.parametrize("model_dtype", [torch.bfloat16, torch.float16])
     def test_fp8_scale_cache_is_registered_in_the_model_dtype(self, model_dtype):
-        cache = self._indexer_cache(model_dtype)
+        cache, context = self._indexer_cache(model_dtype)
         assert cache.dtype == torch.float8_e4m3fn
         assert cache.scale_cache.dtype == model_dtype
-        assert cache.kv_cache_subindex == 1
-        assert cache.scale_cache.kv_cache_subindex == 2
+        assert context[cache.prefix] is cache
+        assert context[cache.scale_cache.prefix] is cache.scale_cache
         assert (
             cache.scale_cache.get_attn_backend() is RBLNDeepseekV32IndexerScaleBackend
         )
 
     def test_a_bf16_key_cache_has_no_scale_cache(self):
-        cache = self._indexer_cache(torch.bfloat16, kv_cache_dtype="auto")
+        cache, _ = self._indexer_cache(torch.bfloat16, kv_cache_dtype="auto")
         assert cache.dtype == torch.bfloat16
         assert cache.scale_cache is None
 
