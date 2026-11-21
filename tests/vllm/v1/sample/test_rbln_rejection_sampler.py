@@ -624,3 +624,68 @@ def test_synthetic_acceptance_stops_at_an_out_of_range_draft_id(impl):
         synthetic_conditional_rates=torch.ones(NUM_SPEC_TOKENS),
     )
     assert output.tolist() == [[3, 6, PLACEHOLDER_TOKEN_ID]]
+
+
+# ---------------------------------------------------------------------------
+# Staged sampling inputs
+# ---------------------------------------------------------------------------
+
+
+def _recording(impl, monkeypatch):
+    """Count top_k/top_p builds and record the temperature the graph reads."""
+    builds: list[int] = []
+    seen: list[list[float]] = []
+    real_build = module.build_op_top_k_top_p
+
+    def build(*args, **kwargs):
+        builds.append(1)
+        return real_build(*args, **kwargs)
+
+    monkeypatch.setattr(module, "build_op_top_k_top_p", build)
+    graph = impl._compiled_rejection_sample
+
+    def record(*args):
+        seen.append(args[5].tolist())
+        return graph(*args)
+
+    impl._compiled_rejection_sample = record
+    return builds, seen
+
+
+def _random_metadata():
+    return make_sampling_metadata(
+        temperature=torch.tensor([0.5, 2.0]),
+        all_greedy=False,
+        all_random=True,
+        top_k=torch.tensor([4, 4], dtype=torch.int32),
+    )
+
+
+def test_sampling_inputs_are_staged_once_while_the_params_hold(impl, monkeypatch):
+    # The params change only with the batch, which writes them in place; until
+    # then the staged copies from the last step are reused.
+    builds, seen = _recording(impl, monkeypatch)
+    metadata = _random_metadata()
+    for _ in range(3):
+        run_rejection_sample(impl, [3, 5, 2, 4], [3, 5, 2, 4], [1, 1], metadata)
+    assert len(builds) == 1
+    assert seen[-1] == [0.5, 0.5, 2.0, 2.0]
+
+    metadata.temperature[1] = 3.0
+    run_rejection_sample(impl, [3, 5, 2, 4], [3, 5, 2, 4], [1, 1], metadata)
+    assert len(builds) == 2
+    assert seen[-1] == [0.5, 0.5, 3.0, 3.0]
+
+
+def test_a_partial_step_drops_the_staged_inputs(impl, monkeypatch):
+    # A step with fewer drafts writes per-token values into the same buffers,
+    # so the next full step stages again instead of reading them.
+    builds, seen = _recording(impl, monkeypatch)
+    metadata = _random_metadata()
+    run_rejection_sample(impl, [3, 5, 2, 4], [3, 5, 2, 4], [1, 1], metadata)
+    run_rejection_sample(
+        impl, [3, 5, 2], [3, 5, 2], [1, 1], metadata, num_draft_tokens=[2, 1]
+    )
+    run_rejection_sample(impl, [3, 5, 2, 4], [3, 5, 2, 4], [1, 1], metadata)
+    assert len(builds) == 3
+    assert seen[-1] == [0.5, 0.5, 2.0, 2.0]
