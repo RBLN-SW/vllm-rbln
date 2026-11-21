@@ -55,10 +55,10 @@ class EncoderInput(NamedTuple):
 
 
 class RotaryTable:
-    """cos and sin of position x inverse frequency, built once and indexed per
-    call. In the worker, an elementwise cos or sin over a frame's angles costs
-    tens of milliseconds whatever its size, while indexing a prebuilt table
-    costs a fraction of one. The table grows to the longest position asked."""
+    """Cache RoPE cosine and sine rows by position in CPU float32.
+
+    The table grows on demand when a caller requests more positions.
+    """
 
     def __init__(self, inv_freq: torch.Tensor, num_positions: int = 256):
         self.inv_freq = inv_freq.detach().to(device="cpu", dtype=torch.float32)
