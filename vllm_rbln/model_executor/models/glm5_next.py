@@ -1449,11 +1449,11 @@ class RBLNGlm5NextForConditionalGeneration(
         self,
         bucket: int,
         num_patches: int,
-        prefixes: list[torch.Tensor | None],
+        input_tensors: list[torch.Tensor | None],
     ) -> list[torch.Tensor]:
         buffers = self._mm_input_buffers
         assert buffers is not None, "compile_mm_encoder runs before encoding"
-        return buffers.stage(bucket, self._mm_input_specs, prefixes, num_patches)
+        return buffers.stage(bucket, self._mm_input_specs, input_tensors, num_patches)
 
     def _encoder_inputs(
         self, pixel_values: torch.Tensor, grid_thw: list[int]

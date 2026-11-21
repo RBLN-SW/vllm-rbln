@@ -326,7 +326,7 @@ class RBLNGemma4ForConditionalGeneration(
         self.mm_encoder_patch_buckets = [budget * pool**2 for budget in budgets]
         self._mm_encoder: Callable[..., torch.Tensor] | None
         object.__setattr__(self, "_mm_encoder", None)
-        # Made with the encoder in compile_mm_encoder, once the tower's device is final.
+        # Created after the vision tower is placed on its target device.
         self._mm_input_buffers: rbln_utils.EncoderInputBuffers | None = None
 
     @property
@@ -433,7 +433,9 @@ class RBLNGemma4ForConditionalGeneration(
             :, None, None, :
         ]
         buffers = self._mm_input_buffers
-        assert buffers is not None, "compile_mm_encoder runs before encoding"
+        assert buffers is not None, (
+            "Encoder input buffers must be initialized before staging"
+        )
         inputs = buffers.stage(
             bucket,
             self._mm_input_specs,

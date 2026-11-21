@@ -70,12 +70,12 @@ class EncoderInputBuffers:
         self,
         bucket: int,
         build_specs: Callable[[int], Sequence[EncoderInput]],
-        values: Sequence[torch.Tensor | None],
+        input_tensors: Sequence[torch.Tensor | None],
         num_valid: int,
     ) -> list[torch.Tensor]:
-        """Initialize the bucket on first use and write its input values.
+        """Initialize the bucket on first use and stage its input tensors.
 
-        Copy each value over the whole buffer or its valid prefix, depending on
+        Copy each tensor over the whole buffer or its valid prefix, depending on
         its length along the bucket axis. None fills the buffer with the spec's
         valid value.
         """
@@ -96,17 +96,17 @@ class EncoderInputBuffers:
                 ]
             entry = self._buckets[bucket] = (specs, buffers)
         specs, buffers = entry
-        for buffer, spec, value in zip(buffers, specs, values, strict=True):
-            if value is None:
+        for buffer, spec, tensor in zip(buffers, specs, input_tensors, strict=True):
+            if tensor is None:
                 buffer.fill_(spec.valid)
-            elif value.shape[spec.axis] == bucket:
-                buffer.copy_(value)
+            elif tensor.shape[spec.axis] == bucket:
+                buffer.copy_(tensor)
             else:
-                assert value.shape[spec.axis] == num_valid, (
-                    f"a value of {value.shape[spec.axis]} entries for an input of "
+                assert tensor.shape[spec.axis] == num_valid, (
+                    f"a tensor with {tensor.shape[spec.axis]} entries for an input of "
                     f"{num_valid} valid entries in a {bucket}-entry bucket"
                 )
-                buffer.narrow(spec.axis, 0, num_valid).copy_(value)
+                buffer.narrow(spec.axis, 0, num_valid).copy_(tensor)
         return buffers
 
 

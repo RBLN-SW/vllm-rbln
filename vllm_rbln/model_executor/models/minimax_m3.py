@@ -1340,11 +1340,11 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         ]
 
     def _stage_encoder_inputs(
-        self, bucket: int, num_patches: int, prefixes: list[torch.Tensor | None]
+        self, bucket: int, num_patches: int, input_tensors: list[torch.Tensor | None]
     ) -> list[torch.Tensor]:
         buffers = self._mm_input_buffers
         assert buffers is not None, "compile_mm_encoder runs before encoding"
-        return buffers.stage(bucket, self._mm_input_specs, prefixes, num_patches)
+        return buffers.stage(bucket, self._mm_input_specs, input_tensors, num_patches)
 
     def compile_mm_encoder(self, compile_fn) -> None:
         # Non-first PP ranks and zero image/video limits own no vision tower.
