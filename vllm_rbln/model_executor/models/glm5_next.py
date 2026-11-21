@@ -1492,14 +1492,10 @@ class RBLNGlm5NextForConditionalGeneration(
         assert table is not None, "compile_mm_encoder runs before encoding"
         cos_rows, sin_rows = table.rows(max(h, w))
         h_ids, w_ids = order // w, order % w
-        cos = torch.cat(
-            [cos_rows[h_ids], cos_rows[w_ids], cos_rows[h_ids], cos_rows[w_ids]],
-            dim=-1,
-        )
-        sin = torch.cat(
-            [sin_rows[h_ids], sin_rows[w_ids], sin_rows[h_ids], sin_rows[w_ids]],
-            dim=-1,
-        )
+        cos_h, cos_w = cos_rows[h_ids], cos_rows[w_ids]
+        sin_h, sin_w = sin_rows[h_ids], sin_rows[w_ids]
+        cos = torch.cat([cos_h, cos_w, cos_h, cos_w], dim=-1)
+        sin = torch.cat([sin_h, sin_w, sin_h, sin_w], dim=-1)
         key_bias = torch.zeros(1, 1, bucket)
         key_bias[..., num_patches:] = -30000.0
         return self._stage_encoder_inputs(
