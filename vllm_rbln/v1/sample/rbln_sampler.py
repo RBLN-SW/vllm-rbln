@@ -36,7 +36,7 @@ from vllm_rbln.v1.sample.ops.fused_penalty import (
     active_argmax_invariant,
     apply_fused_penalty,
     supports_vocab,
-    without_penalties_and_logit_bias,
+    without_fused_logits_processors,
 )
 from vllm_rbln.v1.sample.ops.min_p import apply_min_p, graph_log_min_p
 from vllm_rbln.v1.sample.ops.top_k_top_p import build_op_top_k_top_p
@@ -452,7 +452,7 @@ class RBLNSampler(VLLMSampler):
             logits,
             sampling_metadata
             if penalty is None
-            else without_penalties_and_logit_bias(sampling_metadata),
+            else without_fused_logits_processors(sampling_metadata),
             predict_bonus_token,
         )
         # Sample the next token.
