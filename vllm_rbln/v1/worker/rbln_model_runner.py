@@ -4193,8 +4193,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                         ),
                     )
                 )
-        # Random bonus sampling needs the largest workspace. Warm it first for reuse.
-        variants.sort(key=lambda variant: variant[1].all_greedy)
         # Synthetic mode feeds one more input, i.e. a distinct compiled variant.
         for bonus_kwargs, sampling_metadata in variants:
             self.rejection_sampler.impl.rejection_sample(

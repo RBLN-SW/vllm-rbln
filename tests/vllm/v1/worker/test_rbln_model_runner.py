@@ -1013,8 +1013,6 @@ def test_rejection_sampler_warmup_uses_per_stage_batch_bound():
 
     runner._warmup_sampler_decode_batches()
 
-    assert rejection_sample.call_args_list[0].args[7].all_random
-
     # One call per graph, all at the batch bound; a filtered random pattern
     # twice, once with buffer views and once with torch.cat metadata.
     buffers = {runner.input_batch.top_k.data_ptr(), runner.input_batch.top_p.data_ptr()}
