@@ -97,7 +97,7 @@ def test_logits_processor_delegates_to_language_model():
 
 
 def test_the_vision_encoder_matches_hfs():
-    # The encoder pads every image to its bucket and runs attention spelled out;
+    # The encoder pads every image to its bucket and masks the padding keys;
     # what comes back must be HF's soft tokens for the image alone.
     tower = _vision_tower()
     model = _bare_model(
@@ -116,6 +116,31 @@ def test_the_vision_encoder_matches_hfs():
 
     assert got.shape == (9 * 9 // POOL**2, 32)
     torch.testing.assert_close(got, expected, rtol=1e-4, atol=1e-4)
+
+
+def test_the_encoder_hands_the_compiler_one_sdpa_per_layer():
+    # A softmax with a float32 dtype argument makes the compiler cast every
+    # score matrix to and from the device's float type around it.
+    tower = _vision_tower()
+    encoder = gemma4._RBLNGemma4VisionEncoder(tower, _Identity()).eval()
+    _, positions = _image(9, 9, num_patches=90)
+    padding = ~(positions >= 0).all(dim=-1)
+    key_bias = torch.where(padding, torch.finfo(torch.float32).min, 0.0)
+
+    graph = torch.export.export(
+        encoder,
+        (
+            torch.rand(1, 90, 3 * 2 * 2),
+            positions[None],
+            padding[None],
+            key_bias[None, None, None, :],
+        ),
+    ).graph
+    ops = [node.target for node in graph.nodes if node.op == "call_function"]
+
+    sdpa = torch.ops.aten.scaled_dot_product_attention.default
+    assert ops.count(sdpa) == tower.config.num_hidden_layers
+    assert torch.ops.aten.softmax.int not in ops
 
 
 def test_the_rotary_tables_are_built_once_not_per_image(monkeypatch):
