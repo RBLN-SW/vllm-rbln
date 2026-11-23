@@ -31,6 +31,7 @@ from vllm_rbln.v1.attention.backends.mla.indexer import (
     RBLNDeepseekV32IndexerBackend,
     RBLNDeepseekV32IndexerScaleBackend,
 )
+from vllm_rbln.v1.attention.indexer_kv_dtype import is_fp8_rbln_indexer
 
 logger = init_logger(__name__)
 _original_indexer_cache_init = DeepseekV32IndexerCache.__init__
@@ -163,8 +164,10 @@ def rbln_indexer_cache_init(self, *args, **kwargs) -> None:
 
     vllm_config = get_current_vllm_config()
     self.head_dim = vllm_config.model_config.hf_text_config.index_head_dim
-    cache_dtype = vllm_config.cache_config.cache_dtype
-    self.is_fp8_cache = bool(cache_dtype) and cache_dtype.startswith("fp8")
+    # --attention-config indexer_kv_dtype, else --kv-cache-dtype ("auto").
+    self.is_fp8_cache = is_fp8_rbln_indexer(
+        vllm_config.cache_config.cache_dtype, vllm_config.attention_config
+    )
     self.dtype = torch.float8_e4m3fn if self.is_fp8_cache else torch.bfloat16
 
     model_config = vllm_config.model_config

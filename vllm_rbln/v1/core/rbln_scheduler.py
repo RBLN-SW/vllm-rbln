@@ -178,6 +178,7 @@ class RBLNScheduler(Scheduler):
             model_config=self.vllm_config.model_config,
             cache_dtype=self.cache_config.cache_dtype,
             sub_block_size=rbln_config.sub_block_size,
+            attention_config=self.vllm_config.attention_config,
         )
         if sub_block_size is not None:
             hash_fn = get_hash_fn_by_name(self.cache_config.prefix_caching_hash_algo)

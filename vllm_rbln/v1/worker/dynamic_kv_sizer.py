@@ -394,6 +394,7 @@ class DynamicKvSizer:
             model_config=self.vllm_config.model_config,
             cache_dtype=self.cache_config.cache_dtype,
             sub_block_size=rbln_config.sub_block_size,
+            attention_config=self.vllm_config.attention_config,
         )
         return DYNAMIC_KV_COPY_STREAM_RESERVE_BYTES if in_use is not None else 0
 

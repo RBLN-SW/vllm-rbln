@@ -23,6 +23,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from vllm.config import AttentionConfig
 from vllm.v1.core.kv_cache_utils import (
     generate_scheduler_kv_cache_config,
     get_kv_cache_groups,
@@ -975,6 +976,7 @@ class TestKvCopyStreamReserve:
             ),
             vllm_config=SimpleNamespace(
                 model_config=SimpleNamespace(),
+                attention_config=AttentionConfig(),
                 additional_config=SimpleNamespace(
                     enable_sub_block_cache=sub_block_cache,
                     sub_block_size=sub_block_size,

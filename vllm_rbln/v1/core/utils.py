@@ -25,9 +25,11 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vllm.platforms import current_platform
+
+from vllm_rbln.v1.attention.indexer_kv_dtype import is_fp8_rbln_indexer
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
@@ -262,6 +264,7 @@ def sub_block_size_in_use(
     model_config: ModelConfig,
     cache_dtype: str,
     sub_block_size: int | None = None,
+    attention_config: Any = None,
 ) -> int | None:
     """The sub-block size prefix caching runs at (None takes the longest prefill
     chunk the KV cache holds), or None when the scheduler stays on vLLM's manager.
@@ -331,7 +334,7 @@ def sub_block_size_in_use(
     # DSA constructors select the indexer by index_topk. Its FP8 scale store
     # cannot span blocks; apply this limit only after sub-blocks are in use.
     if (
-        cache_dtype.startswith("fp8")
+        is_fp8_rbln_indexer(cache_dtype, attention_config)
         and (
             hasattr(model_config.hf_text_config, "index_topk")
             or hasattr(model_config.hf_config, "index_topk")

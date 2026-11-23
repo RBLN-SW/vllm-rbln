@@ -436,6 +436,36 @@ class TestSubBlockSizeInUse:
             is None
         )
 
+    @pytest.mark.parametrize(
+        "cache_dtype, indexer_kv_dtype, rejected",
+        [
+            ("auto", "fp8", True),
+            ("fp8", "bf16", False),
+            ("fp8", "auto", True),
+            ("auto", "auto", False),
+        ],
+    )
+    def test_fp8_scale_limit_follows_the_indexer_kv_dtype(
+        self, cache_dtype, indexer_kv_dtype, rejected, cr13
+    ):
+        from vllm.config import AttentionConfig
+
+        args = dict(
+            model_config=SimpleNamespace(
+                hf_text_config=SimpleNamespace(model_type="axk3", index_topk=2048),
+                hf_config=SimpleNamespace(),
+            ),
+            cache_dtype=cache_dtype,
+            attention_config=AttentionConfig(indexer_kv_dtype=indexer_kv_dtype),
+            kv_cache_config=make_kv_cache_config([full_attention_spec(1024)]),
+            sub_block_size=256,
+        )
+        if rejected:
+            with pytest.raises(ValueError, match="FP8 DSA indexer scale cache"):
+                self._call(**args)
+        else:
+            assert self._call(**args) == 256
+
     def test_fp8_dsa_indexer_on_outer_config(self, cr13):
         with pytest.raises(ValueError, match="FP8 DSA indexer scale cache"):
             self._call(

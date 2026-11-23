@@ -501,6 +501,20 @@ class TestRejectedConfigs:
         with pytest.raises(ValueError, match="LoRA"):
             reconfigure(lambda config: setattr(config, "lora_config", object()))
 
+    def test_online_quantization_config(self):
+        with pytest.raises(ValueError, match="--quantization-config"):
+            _build(quantization_config={"linear": "fp8_per_channel"})
+
+    @pytest.mark.parametrize("indexer_kv_dtype", ["mxfp4", "nvfp4"])
+    def test_indexer_kv_dtype_without_an_rbln_kernel(self, indexer_kv_dtype):
+        with pytest.raises(ValueError, match="indexer_kv_dtype"):
+            _build(attention_config={"indexer_kv_dtype": indexer_kv_dtype})
+
+    @pytest.mark.parametrize("indexer_kv_dtype", ["auto", "bf16", "fp8"])
+    def test_indexer_kv_dtype_accepted(self, indexer_kv_dtype):
+        config = _build(attention_config={"indexer_kv_dtype": indexer_kv_dtype})
+        assert config.attention_config.indexer_kv_dtype == indexer_kv_dtype
+
     def test_msa_models_need_bfloat16(self, reconfigure):
         def msa(dtype):
             def mutate(config):
