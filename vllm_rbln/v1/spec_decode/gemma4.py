@@ -79,14 +79,20 @@ class RBLNGemma4Proposer(RBLNEagleProposer):
         hidden_states = target_hidden_states.view(-1, self.hidden_size)[
             token_indices_to_sample
         ]
-        draft_token_ids = next_token_ids[:num_reqs]
+        self.input_ids[:num_reqs] = next_token_ids[:num_reqs].int()
 
         per_layer_attn_metadata, num_reqs_padded, forward_kwargs = (
             self._build_draft_step(num_reqs, positions)
         )
-        draft_token_ids_list = []
-        for _ in range(self.num_speculative_tokens):
-            self.input_ids[:num_reqs] = draft_token_ids.int()
+        # The graph overwrites its static outputs on every run, so each step's
+        # ids are copied out on the device; the host reads all of them once.
+        draft_ids_per_step = torch.empty(
+            (self.num_speculative_tokens, num_reqs),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        draft_ids = None
+        for step in range(self.num_speculative_tokens):
             input_ids, staged_positions, staged_hidden_states, _ = self._preprocess(
                 num_reqs,
                 num_reqs_padded,
@@ -95,6 +101,8 @@ class RBLNGemma4Proposer(RBLNEagleProposer):
                 hidden_states,
                 is_prefill=False,
             )
+            if draft_ids is not None:
+                input_ids[:num_reqs, 0].copy_(draft_ids[:num_reqs])
             with set_forward_context(per_layer_attn_metadata, **forward_kwargs):
                 hidden_states, draft_ids = self.model_executable(
                     input_ids=input_ids,
@@ -104,9 +112,8 @@ class RBLNGemma4Proposer(RBLNEagleProposer):
                     token_indices_to_sample=None,
                 )
             hidden_states = hidden_states[:num_reqs]
-            draft_token_ids = self._to_target_token_ids(draft_ids[:num_reqs])
-            draft_token_ids_list.append(draft_token_ids)
-        return torch.stack(draft_token_ids_list, dim=1)
+            draft_ids_per_step[step].copy_(draft_ids[:num_reqs])
+        return self._to_target_token_ids(draft_ids_per_step).T.contiguous()
 
     @torch.inference_mode()
     def dummy_run(
