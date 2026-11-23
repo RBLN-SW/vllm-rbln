@@ -173,6 +173,7 @@ def test_minimax_m3_encoder_compile_requires_local_tower(monkeypatch, has_tower)
     compile_fn = Mock(return_value=runtime)
     model._mm_encoder = None
     model.mm_embeds_dtype = torch.bfloat16
+    model.mm_encoder_patch_buckets = []
 
     model.compile_mm_encoder(compile_fn)
 
@@ -362,6 +363,7 @@ def test_image_encoding_requires_and_reuses_compiled_encoder(
     model.vision_tower.spatial_merge_size = 1
     model.vision_tower.dtype = torch.float32
     model.mm_embeds_dtype = out_dtype
+    model.mm_encoder_patch_buckets = []
     model.vision_tower.vision_model = SimpleNamespace(vision_segment_max_frames=4)
     encoder = torch.nn.Sequential(model.vision_tower)
     build_encoder = Mock(return_value=encoder)
@@ -603,7 +605,12 @@ def test_images_and_video_segments_share_buckets(
     )
     model.vision_tower = vision_encoder_model.vision_tower
     buffered_encoder = BufferedVisionEncoder(
-        Mock(), device="cpu", dtype=model.vision_tower.dtype
+        Mock(),
+        specs_by_bucket={
+            size: model._mm_input_specs(size) for size in model.mm_encoder_patch_buckets
+        },
+        device="cpu",
+        dtype=model.vision_tower.dtype,
     )
     pixels = torch.ones(math.prod(grid), 6)
 
@@ -776,9 +783,16 @@ def vision_encoder_model():
         vision_segment_max_frames=2,
     )
     model.vision_tower = tower
-    model._mm_encoder = BufferedVisionEncoder(Mock(), device="cpu", dtype=tower.dtype)
-    model.mm_embeds_dtype = torch.float32
     model.mm_encoder_patch_buckets = [16, 64]
+    model._mm_encoder = BufferedVisionEncoder(
+        Mock(),
+        specs_by_bucket={
+            size: model._mm_input_specs(size) for size in model.mm_encoder_patch_buckets
+        },
+        device="cpu",
+        dtype=tower.dtype,
+    )
+    model.mm_embeds_dtype = torch.float32
     return model
 
 
@@ -794,7 +808,12 @@ def test_a_video_is_encoded_in_segments_of_temporal_patches(vision_encoder_model
         return pixels[::4, :1].clone()
 
     model._mm_encoder = BufferedVisionEncoder(
-        encode, device="cpu", dtype=model.vision_tower.dtype
+        encode,
+        specs_by_bucket={
+            size: model._mm_input_specs(size) for size in model.mm_encoder_patch_buckets
+        },
+        device="cpu",
+        dtype=model.vision_tower.dtype,
     )
     pixels = torch.arange(20.0).unsqueeze(1).expand(-1, 6)
 
@@ -821,7 +840,12 @@ def test_no_frame_limit_keeps_image_output_storage(vision_encoder_model):
         return outputs[-1]
 
     model._mm_encoder = BufferedVisionEncoder(
-        encode, device="cpu", dtype=model.vision_tower.dtype
+        encode,
+        specs_by_bucket={
+            size: model._mm_input_specs(size) for size in model.mm_encoder_patch_buckets
+        },
+        device="cpu",
+        dtype=model.vision_tower.dtype,
     )
     pixels = torch.arange(4.0).unsqueeze(1).expand(-1, 6)
     (embeds,) = model.embed_multimodal(
@@ -841,7 +865,12 @@ def test_shared_bucket_is_warmed_once(vision_encoder_model):
     with pytest.raises(RuntimeError, match="requires a compiled encoder"):
         model.warmup_mm_encoder()
     model._mm_encoder = BufferedVisionEncoder(
-        encoder, device="cpu", dtype=model.vision_tower.dtype
+        encoder,
+        specs_by_bucket={
+            size: model._mm_input_specs(size) for size in model.mm_encoder_patch_buckets
+        },
+        device="cpu",
+        dtype=model.vision_tower.dtype,
     )
 
     model.warmup_mm_encoder()
@@ -855,6 +884,9 @@ def test_mixed_modalities_preserve_input_order(vision_encoder_model, video_first
     # A copy: the inputs are staging buffers the next item rewrites.
     model._mm_encoder = BufferedVisionEncoder(
         lambda pixels, *args: pixels[::4, :1].clone(),
+        specs_by_bucket={
+            size: model._mm_input_specs(size) for size in model.mm_encoder_patch_buckets
+        },
         device="cpu",
         dtype=model.vision_tower.dtype,
     )
@@ -949,7 +981,12 @@ def test_warmup_runs_every_patch_bucket(
         return torch.zeros(n // 4, 8)
 
     model._mm_encoder = BufferedVisionEncoder(
-        encode, device="cpu", dtype=model.vision_tower.dtype
+        encode,
+        specs_by_bucket={
+            size: model._mm_input_specs(size) for size in model.mm_encoder_patch_buckets
+        },
+        device="cpu",
+        dtype=model.vision_tower.dtype,
     )
     model.warmup_mm_encoder()
 
@@ -968,7 +1005,7 @@ def test_warmup_without_a_local_vision_tower(vision_encoder_model):
     model.vision_tower = None
     encoder = Mock()
     model._mm_encoder = BufferedVisionEncoder(
-        encoder, device="cpu", dtype=torch.float32
+        encoder, specs_by_bucket={}, device="cpu", dtype=torch.float32
     )
 
     model.warmup_mm_encoder()

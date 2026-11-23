@@ -371,6 +371,10 @@ class RBLNGemma4ForConditionalGeneration(
         encoder = _RBLNGemma4VisionEncoder(self.vision_tower, self.embed_vision)
         self._mm_encoder = rbln_utils.BufferedVisionEncoder(
             compile_fn(encoder.eval()),
+            specs_by_bucket={
+                size: self._mm_input_specs(size)
+                for size in self.mm_encoder_patch_buckets
+            },
             device=next(self.vision_tower.parameters()).device,
             dtype=self.model_dtype,
         )
@@ -423,7 +427,6 @@ class RBLNGemma4ForConditionalGeneration(
         ]
         inputs = buffered_encoder.input_buffers.stage(
             bucket_size,
-            self._mm_input_specs,
             [pixel_values[valid].unsqueeze(0), positions, padding, key_bias],
             num_patches,
         )

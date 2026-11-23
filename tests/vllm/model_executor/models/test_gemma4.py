@@ -106,6 +106,9 @@ def _model_with_vision_encoder(tower):
     )
     model._mm_encoder = BufferedVisionEncoder(
         gemma4._RBLNGemma4VisionEncoder(tower, model.embed_vision).eval(),
+        specs_by_bucket={
+            size: model._mm_input_specs(size) for size in model.mm_encoder_patch_buckets
+        },
         device="cpu",
         dtype=model.model_dtype,
     )
@@ -212,7 +215,12 @@ def _recording_model(buckets):
         config=SimpleNamespace(vision_config=tower.config),
     )
     model._mm_encoder = BufferedVisionEncoder(
-        encoder, device="cpu", dtype=model.model_dtype
+        encoder,
+        specs_by_bucket={
+            size: model._mm_input_specs(size) for size in model.mm_encoder_patch_buckets
+        },
+        device="cpu",
+        dtype=model.model_dtype,
     )
     return model, calls
 
@@ -516,6 +524,7 @@ def test_the_encoder_compiles_only_where_the_tower_lives(
         vision_tower=nn.Linear(1, 1),
         embed_vision=nn.Identity(),
         model_dtype=torch.float32,
+        mm_encoder_patch_buckets=[],
         multimodal_config=SimpleNamespace(
             get_limit_per_prompt=lambda modality: limits.get(modality, 0)
         ),

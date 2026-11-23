@@ -202,6 +202,7 @@ def test_image_encoding_requires_and_reuses_compiled_encoder(monkeypatch, compil
     model.visual.spatial_merge_size = 1
     model.visual.device, model.visual.dtype = torch.device("cpu"), torch.float32
     model.mm_embeds_dtype = torch.float32
+    model.mm_encoder_patch_buckets = []
     encoder = torch.nn.Sequential(model.visual)
     build_encoder = Mock(return_value=encoder)
     monkeypatch.setattr(glm, "_RBLNGlm5NextVisionEncoder", build_encoder)
@@ -359,10 +360,15 @@ def test_vision_encoder_builds_its_inputs_from_upstream_rope(monkeypatch):
 
     model = _bare(glm.RBLNGlm5NextForConditionalGeneration)
     model.visual = visual
-    buffered_encoder = BufferedVisionEncoder(
-        Mock(), device=visual.device, dtype=visual.dtype
-    )
     model.mm_encoder_patch_buckets = [16]
+    buffered_encoder = BufferedVisionEncoder(
+        Mock(),
+        specs_by_bucket={
+            size: model._mm_input_specs(size) for size in model.mm_encoder_patch_buckets
+        },
+        device=visual.device,
+        dtype=visual.dtype,
+    )
     padded, cos, sin, key_bias = model._encoder_inputs(
         buffered_encoder, pixels, [1, 2, 4]
     )
@@ -485,7 +491,12 @@ def test_video_frames_reuse_image_buckets_without_cross_frame_attention(video_fi
         return (weights @ pixels).squeeze(0)
 
     model._mm_encoder = BufferedVisionEncoder(
-        encoder, device=model.visual.device, dtype=model.visual.dtype
+        encoder,
+        specs_by_bucket={
+            size: model._mm_input_specs(size) for size in model.mm_encoder_patch_buckets
+        },
+        device=model.visual.device,
+        dtype=model.visual.dtype,
     )
     image = torch.arange(8, dtype=torch.float32).reshape(2, 4) / 10
     video = torch.arange(40, dtype=torch.float32).reshape(10, 4) / 10

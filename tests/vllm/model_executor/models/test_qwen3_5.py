@@ -266,7 +266,12 @@ def test_warmup_runs_the_encoder_once_over_each_bucket(visual):
     with pytest.raises(RuntimeError, match="requires a compiled encoder"):
         model.warmup_mm_encoder()
     model._mm_encoder = BufferedVisionEncoder(
-        encoder, device=visual.device, dtype=visual.dtype
+        encoder,
+        specs_by_bucket={
+            size: model._mm_input_specs(size) for size in model.mm_encoder_patch_buckets
+        },
+        device=visual.device,
+        dtype=visual.dtype,
     )
 
     model.warmup_mm_encoder()
@@ -298,6 +303,10 @@ def test_a_bucket_reuses_its_input_buffers_and_masks_the_padding(visual):
     model._mm_input_specs = input_specs
     model.mm_encoder_patch_buckets = [64, 128]
     model.compile_mm_encoder(lambda encoder: Mock(wraps=encoder))
+    assert [spec_call.args for spec_call in input_specs.call_args_list] == [
+        (64,),
+        (128,),
+    ]
     encoder = model._mm_encoder.encoder
     patch_dim = 3 * TEMPORAL * PATCH * PATCH
     large_pixels = torch.randn(64, patch_dim)
@@ -311,7 +320,7 @@ def test_a_bucket_reuses_its_input_buffers_and_masks_the_padding(visual):
 
     large, small = (call.args for call in encoder.call_args_list)
     assert [x.data_ptr() for x in small] == [x.data_ptr() for x in large]
-    input_specs.assert_called_once_with(64)
+    assert input_specs.call_count == 2
     patches, pos_embeds, cos, sin, key_bias = small
     torch.testing.assert_close(patches[:24], small_pixels)
     torch.testing.assert_close(patches[24:], large_pixels[24:])
@@ -329,10 +338,15 @@ def test_an_image_takes_the_smallest_bucket_that_holds_it(visual, grid, bucket):
     )
     torch.nn.Module.__init__(model)
     model.visual = visual
-    buffered_encoder = BufferedVisionEncoder(
-        Mock(), device=visual.device, dtype=visual.dtype
-    )
     model.mm_encoder_patch_buckets = [64, 128]
+    buffered_encoder = BufferedVisionEncoder(
+        Mock(),
+        specs_by_bucket={
+            size: model._mm_input_specs(size) for size in model.mm_encoder_patch_buckets
+        },
+        device=visual.device,
+        dtype=visual.dtype,
+    )
     num_patches = grid[0] * grid[1] * grid[2]
     pixels = torch.zeros(num_patches, 3 * TEMPORAL * PATCH * PATCH)
 

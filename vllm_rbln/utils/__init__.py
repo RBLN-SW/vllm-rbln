@@ -62,19 +62,25 @@ class EncoderInputBuffers:
     refresh the attention mask for the current input before encoding.
     """
 
-    def __init__(self, device: torch.device | str, dtype: torch.dtype) -> None:
+    def __init__(
+        self,
+        device: torch.device | str,
+        dtype: torch.dtype,
+        *,
+        specs_by_bucket: Mapping[int, Sequence[EncoderInput]],
+    ) -> None:
         self.device = torch.device(device)
         self.dtype = dtype
-        self._buckets: dict[int, tuple[Sequence[EncoderInput], list[torch.Tensor]]] = {}
+        self._specs_by_bucket = dict(specs_by_bucket)
+        self._buffers_by_bucket: dict[int, list[torch.Tensor]] = {}
 
     def _get_or_create_bucket(
         self,
         bucket_size: int,
-        build_specs: Callable[[int], Sequence[EncoderInput]],
     ) -> tuple[Sequence[EncoderInput], list[torch.Tensor]]:
-        entry = self._buckets.get(bucket_size)
-        if entry is None:
-            specs = build_specs(bucket_size)
+        specs = self._specs_by_bucket[bucket_size]
+        buffers = self._buffers_by_bucket.get(bucket_size)
+        if buffers is None:
             # Plain tensors, not inference tensors: staging writes them in place
             # inside and outside inference mode alike.
             with torch.inference_mode(False):
@@ -87,18 +93,17 @@ class EncoderInputBuffers:
                     )
                     for spec in specs
                 ]
-            entry = self._buckets[bucket_size] = (specs, buffers)
-        return entry
+            self._buffers_by_bucket[bucket_size] = buffers
+        return specs, buffers
 
     def warmup_inputs(
         self,
         bucket_size: int,
-        build_specs: Callable[[int], Sequence[EncoderInput]],
         *,
         fill_overrides: Mapping[str, float],
     ) -> list[torch.Tensor]:
         """Fill the whole bucket with pad defaults and named warmup overrides."""
-        specs, buffers = self._get_or_create_bucket(bucket_size, build_specs)
+        specs, buffers = self._get_or_create_bucket(bucket_size)
         for spec, buffer in zip(specs, buffers, strict=True):
             buffer.fill_(fill_overrides.get(spec.name, spec.pad))
         return buffers
@@ -106,7 +111,6 @@ class EncoderInputBuffers:
     def stage(
         self,
         bucket_size: int,
-        build_specs: Callable[[int], Sequence[EncoderInput]],
         input_tensors: Sequence[torch.Tensor],
         num_valid: int,
     ) -> list[torch.Tensor]:
@@ -115,7 +119,7 @@ class EncoderInputBuffers:
         If allow_prefix_copy is False, the input length along the bucket axis
         must equal bucket_size.
         """
-        specs, buffers = self._get_or_create_bucket(bucket_size, build_specs)
+        specs, buffers = self._get_or_create_bucket(bucket_size)
         # Reject incomplete masks before writing any reused buffers.
         for spec, tensor in zip(specs, input_tensors, strict=True):
             if not spec.allow_prefix_copy:
@@ -145,11 +149,14 @@ class BufferedVisionEncoder:
         self,
         encoder: Callable[..., torch.Tensor],
         *,
+        specs_by_bucket: Mapping[int, Sequence[EncoderInput]],
         device: torch.device | str,
         dtype: torch.dtype,
     ) -> None:
         self.encoder = encoder
-        self.input_buffers = EncoderInputBuffers(device, dtype)
+        self.input_buffers = EncoderInputBuffers(
+            device, dtype, specs_by_bucket=specs_by_bucket
+        )
 
 
 def pad(

@@ -1319,7 +1319,7 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
             for bucket_size in self.mm_encoder_patch_buckets:
                 # Every entry valid: the warm-up never masks a key.
                 inputs = buffered_encoder.input_buffers.warmup_inputs(
-                    bucket_size, self._mm_input_specs, fill_overrides={"key_bias": 0.0}
+                    bucket_size, fill_overrides={"key_bias": 0.0}
                 )
                 buffered_encoder.encoder(*inputs)
 
@@ -1353,6 +1353,10 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         encoder = _RBLNVisionEncoder(self.vision_tower, self.mm_embeds_dtype).eval()
         self._mm_encoder = rbln_utils.BufferedVisionEncoder(
             compile_fn(encoder),
+            specs_by_bucket={
+                size: self._mm_input_specs(size)
+                for size in self.mm_encoder_patch_buckets
+            },
             device=next(self.vision_tower.parameters()).device,
             dtype=self.vision_tower.dtype,
         )
@@ -1410,7 +1414,6 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         key_bias[..., num_patches:] = -30000.0
         return buffered_encoder.input_buffers.stage(
             bucket_size,
-            self._mm_input_specs,
             [pixel_values, cos, sin, key_bias],
             num_patches,
         )

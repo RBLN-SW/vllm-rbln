@@ -746,7 +746,10 @@ class TestMmEncoder:
             return PendingOutput(pixels)
 
         model._mm_encoder = utils.BufferedVisionEncoder(
-            encoder, device="cpu", dtype=torch.bfloat16
+            encoder,
+            specs_by_bucket={},
+            device="cpu",
+            dtype=torch.bfloat16,
         )
         monkeypatch.setattr(utils, "run_mm_encoder", pm.run_mm_encoder)
         monkeypatch.setattr(pm, "_ACTIVE_CTX", ctx)
