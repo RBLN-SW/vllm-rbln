@@ -36,7 +36,6 @@ from vllm_rbln.v1.sample.ops.fused_penalty import (
 )
 from vllm_rbln.v1.sample.rbln_sampler import RBLNSampler
 
-from .test_rbln_sampler import npu_top_k_top_p
 from .utils import (
     VOCAB_SIZE,
     assert_samples_match,
@@ -45,6 +44,23 @@ from .utils import (
     expected_probs,
     logits_from_weights,
 )
+
+
+def npu_top_k_top_p(
+    logits: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor | None
+) -> torch.Tensor:
+    """How `rbln::top_k_top_p` cuts on the NPU: the intersection of top-k and
+    top-p, without upstream's renormalization over the top-k."""
+    probs, order = logits.softmax(dim=-1).sort(dim=-1, descending=True)
+    keep = torch.ones_like(probs, dtype=torch.bool)
+    if k is not None:
+        keep &= torch.arange(probs.shape[-1]) < k.unsqueeze(dim=1)
+    if p is not None:
+        above = probs.cumsum(dim=-1) - probs
+        keep &= above < p.unsqueeze(dim=1)
+        keep[:, 0] = True
+    mask = torch.empty_like(keep).scatter_(-1, order, keep)
+    return logits.masked_fill(~mask, float("-inf"))
 
 
 def dense_reference(logits, prompts, outputs, rep, freq, pres, biases):
