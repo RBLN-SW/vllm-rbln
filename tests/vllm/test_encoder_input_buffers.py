@@ -21,13 +21,12 @@ from vllm_rbln.utils import EncoderInput, EncoderInputBuffers
 
 def _specs(bucket_size):
     return [
-        EncoderInput("patches", (bucket_size, 4), axis=0, valid=0.0, pad=0.0),
-        EncoderInput("cos", (bucket_size, 2), axis=0, valid=1.0, pad=1.0),
+        EncoderInput("patches", (bucket_size, 4), axis=0, pad=0.0),
+        EncoderInput("cos", (bucket_size, 2), axis=0, pad=1.0),
         EncoderInput(
             "key_bias",
             (1, 1, bucket_size),
             axis=2,
-            valid=0.0,
             pad=-30000.0,
             allow_prefix_copy=False,
         ),
@@ -82,21 +81,29 @@ def test_staging_copies_a_prefix_and_leaves_the_padding_to_the_key_bias():
     assert (key_bias[..., :3] == 0.0).all() and (key_bias[..., 3:] == -30000.0).all()
 
 
-def test_a_none_value_fills_every_entry_with_the_valid_value():
+def test_warmup_restores_defaults_and_clears_the_mask_in_place():
     buffers = EncoderInputBuffers("cpu", torch.float32)
+    staged = buffers.stage(
+        8, _specs, [torch.ones(3, 4), torch.zeros(3, 2), _key_bias(3)], 3
+    )
 
-    patches, cos, key_bias = buffers.stage(8, _specs, [None, None, None], 8)
+    patches, cos, key_bias = buffers.warmup_inputs(
+        8, _specs, fill_overrides={"key_bias": 0.0}
+    )
 
+    assert all(
+        warmed is previous
+        for warmed, previous in zip((patches, cos, key_bias), staged, strict=True)
+    )
     assert (patches == 0.0).all() and (cos == 1.0).all() and (key_bias == 0.0).all()
 
 
-@pytest.mark.parametrize("omit_bias", [False, True])
-def test_staging_rejects_a_missing_or_short_key_bias_for_a_partial_bucket(omit_bias):
+def test_staging_rejects_a_short_key_bias_for_a_partial_bucket():
     buffers = EncoderInputBuffers("cpu", torch.float32)
     patches, _, key_bias = buffers.stage(
         8, _specs, [torch.ones(8, 4), torch.ones(8, 2), _key_bias(8)], 8
     )
-    bias = None if omit_bias else _key_bias(3)[..., :3]
+    bias = _key_bias(3)[..., :3]
 
     with pytest.raises(ValueError, match="'key_bias' requires a full 8-entry tensor"):
         buffers.stage(8, _specs, [torch.zeros(3, 4), torch.zeros(3, 2), bias], 3)
@@ -107,7 +114,7 @@ def test_staging_rejects_a_missing_or_short_key_bias_for_a_partial_bucket(omit_b
 def test_a_value_of_the_wrong_length_is_refused():
     buffers = EncoderInputBuffers("cpu", torch.float32)
     with pytest.raises(AssertionError, match="4 entries"):
-        buffers.stage(8, _specs, [torch.ones(4, 4), None, _key_bias(3)], 3)
+        buffers.stage(8, _specs, [torch.ones(4, 4), torch.ones(3, 2), _key_bias(3)], 3)
 
 
 def test_the_value_is_converted_to_the_buffer_dtype():
@@ -116,7 +123,11 @@ def test_the_value_is_converted_to_the_buffer_dtype():
     (patches, _, _) = buffers.stage(
         8,
         _specs,
-        [torch.arange(20, dtype=torch.float32).view(5, 4), None, _key_bias(5)],
+        [
+            torch.arange(20, dtype=torch.float32).view(5, 4),
+            torch.ones(5, 2),
+            _key_bias(5),
+        ],
         5,
     )
 
@@ -127,10 +138,12 @@ def test_the_value_is_converted_to_the_buffer_dtype():
 def test_buffers_are_written_in_place_inside_and_outside_inference_mode():
     buffers = EncoderInputBuffers("cpu", torch.float32)
     with torch.inference_mode():
-        inside = buffers.stage(8, _specs, [None, None, None], 8)
-    outside = buffers.stage(8, _specs, [torch.ones(2, 4), None, _key_bias(2)], 2)
+        inside = buffers.warmup_inputs(8, _specs, fill_overrides={"key_bias": 0.0})
+    outside = buffers.stage(
+        8, _specs, [torch.ones(2, 4), torch.ones(2, 2), _key_bias(2)], 2
+    )
     with torch.inference_mode():
-        again = buffers.stage(8, _specs, [None, None, _key_bias(4)], 4)
+        again = buffers.warmup_inputs(8, _specs, fill_overrides={"key_bias": 0.0})
 
     assert inside[0].data_ptr() == outside[0].data_ptr() == again[0].data_ptr()
     assert not inside[0].is_inference()
@@ -145,7 +158,6 @@ def test_an_input_may_carry_its_own_dtype():
                 "positions",
                 (1, bucket_size, 2),
                 axis=1,
-                valid=-1.0,
                 pad=-1.0,
                 dtype=torch.long,
             ),
@@ -153,15 +165,14 @@ def test_an_input_may_carry_its_own_dtype():
                 "padding",
                 (1, bucket_size),
                 axis=1,
-                valid=0.0,
                 pad=1.0,
                 dtype=torch.bool,
             ),
-            EncoderInput("patches", (bucket_size, 2), axis=0, valid=0.0, pad=0.0),
+            EncoderInput("patches", (bucket_size, 2), axis=0, pad=0.0),
         ]
 
     positions, padding, patches = buffers.stage(
-        8, specs, [torch.empty(1, 0, 2), torch.empty(1, 0), None], 0
+        8, specs, [torch.empty(1, 0, 2), torch.empty(1, 0), torch.empty(0, 2)], 0
     )
 
     assert positions.dtype == torch.long and (positions == -1).all()

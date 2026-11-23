@@ -1425,8 +1425,8 @@ class RBLNGlm5NextForConditionalGeneration(
         with torch.inference_mode():
             for bucket_size in self.mm_encoder_patch_buckets:
                 # Every entry valid: the warm-up never masks a key.
-                inputs = buffered_encoder.input_buffers.stage(
-                    bucket_size, self._mm_input_specs, [None] * 4, bucket_size
+                inputs = buffered_encoder.input_buffers.warmup_inputs(
+                    bucket_size, self._mm_input_specs, fill_overrides={"key_bias": 0.0}
                 )
                 buffered_encoder.encoder(*inputs)
 
@@ -1438,19 +1438,14 @@ class RBLNGlm5NextForConditionalGeneration(
         head_dim = visual.blocks[0].attn.head_dim
         return [
             rbln_utils.EncoderInput(
-                "pixel_values", (bucket_size, patch_dim), axis=0, valid=0.0, pad=0.0
+                "pixel_values", (bucket_size, patch_dim), axis=0, pad=0.0
             ),
-            rbln_utils.EncoderInput(
-                "cos", (bucket_size, head_dim), axis=0, valid=1.0, pad=1.0
-            ),
-            rbln_utils.EncoderInput(
-                "sin", (bucket_size, head_dim), axis=0, valid=0.0, pad=0.0
-            ),
+            rbln_utils.EncoderInput("cos", (bucket_size, head_dim), axis=0, pad=1.0),
+            rbln_utils.EncoderInput("sin", (bucket_size, head_dim), axis=0, pad=0.0),
             rbln_utils.EncoderInput(
                 "key_bias",
                 (1, 1, bucket_size),
                 axis=2,
-                valid=0.0,
                 pad=-30000.0,
                 allow_prefix_copy=False,
             ),

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import NamedTuple, Union
 
 import torch
@@ -44,13 +44,12 @@ def run_mm_encoder(
 class EncoderInput(NamedTuple):
     """One named input of a compiled vision encoder at one bucket.
 
-    The buffer starts filled with pad. Staging None fills it with valid.
+    The buffer starts filled with pad.
     """
 
     name: str
     shape: tuple[int, ...]
     axis: int
-    valid: float
     pad: float
     dtype: torch.dtype | None = None
     allow_prefix_copy: bool = True
@@ -68,21 +67,11 @@ class EncoderInputBuffers:
         self.dtype = dtype
         self._buckets: dict[int, tuple[Sequence[EncoderInput], list[torch.Tensor]]] = {}
 
-    def stage(
+    def _get_or_create_bucket(
         self,
         bucket_size: int,
         build_specs: Callable[[int], Sequence[EncoderInput]],
-        input_tensors: Sequence[torch.Tensor | None],
-        num_valid: int,
-    ) -> list[torch.Tensor]:
-        """Initialize the bucket on first use and stage its input tensors.
-
-        Copy each tensor over the whole buffer or its valid prefix, depending on
-        its length along the bucket axis. If allow_prefix_copy is False, that
-        length must equal the selected bucket_size. None fills the buffer with
-        the spec's valid value and is allowed for such inputs only when the
-        whole selected bucket is valid.
-        """
+    ) -> tuple[Sequence[EncoderInput], list[torch.Tensor]]:
         entry = self._buckets.get(bucket_size)
         if entry is None:
             specs = build_specs(bucket_size)
@@ -99,22 +88,46 @@ class EncoderInputBuffers:
                     for spec in specs
                 ]
             entry = self._buckets[bucket_size] = (specs, buffers)
-        specs, buffers = entry
+        return entry
+
+    def warmup_inputs(
+        self,
+        bucket_size: int,
+        build_specs: Callable[[int], Sequence[EncoderInput]],
+        *,
+        fill_overrides: Mapping[str, float],
+    ) -> list[torch.Tensor]:
+        """Fill the whole bucket with pad defaults and named warmup overrides."""
+        specs, buffers = self._get_or_create_bucket(bucket_size, build_specs)
+        for spec, buffer in zip(specs, buffers, strict=True):
+            buffer.fill_(fill_overrides.get(spec.name, spec.pad))
+        return buffers
+
+    def stage(
+        self,
+        bucket_size: int,
+        build_specs: Callable[[int], Sequence[EncoderInput]],
+        input_tensors: Sequence[torch.Tensor],
+        num_valid: int,
+    ) -> list[torch.Tensor]:
+        """Copy each tensor over the whole buffer or its valid prefix.
+
+        If allow_prefix_copy is False, the input length along the bucket axis
+        must equal bucket_size.
+        """
+        specs, buffers = self._get_or_create_bucket(bucket_size, build_specs)
         # Reject incomplete masks before writing any reused buffers.
         for spec, tensor in zip(specs, input_tensors, strict=True):
             if not spec.allow_prefix_copy:
-                length = num_valid if tensor is None else tensor.size(spec.axis)
+                length = tensor.size(spec.axis)
                 if length != bucket_size:
-                    provided = "None" if tensor is None else f"{length} entries"
                     raise ValueError(
                         f"Encoder input {spec.name!r} requires a full "
                         f"{bucket_size}-entry tensor "
-                        f"along axis {spec.axis}, got {provided}"
+                        f"along axis {spec.axis}, got {length} entries"
                     )
         for buffer, spec, tensor in zip(buffers, specs, input_tensors, strict=True):
-            if tensor is None:
-                buffer.fill_(spec.valid)
-            elif tensor.shape[spec.axis] == bucket_size:
+            if tensor.shape[spec.axis] == bucket_size:
                 buffer.copy_(tensor)
             else:
                 assert tensor.shape[spec.axis] == num_valid, (
