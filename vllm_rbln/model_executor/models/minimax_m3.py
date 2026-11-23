@@ -1318,33 +1318,51 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
             self.compile_mm_encoder(lambda encoder: encoder)
         assert self._mm_encoder is not None
         with torch.inference_mode():
-            for bucket in self.mm_encoder_patch_buckets:
+            for bucket_size in self.mm_encoder_patch_buckets:
                 # Every entry valid: the warm-up never masks a key.
                 self._mm_encoder(
-                    *self._stage_encoder_inputs(bucket, bucket, [None] * 4)
+                    *self._stage_encoder_inputs(bucket_size, bucket_size, [None] * 4)
                 )
 
-    def _mm_input_specs(self, bucket: int) -> list[rbln_utils.EncoderInput]:
-        """The encoder's inputs at `bucket`: patches, the 3D-RoPE cos and sin,
-        and the key bias that masks the padding."""
+    def _mm_input_specs(self, bucket_size: int) -> list[rbln_utils.EncoderInput]:
+        """The encoder's inputs at `bucket_size`: patches, the 3D-RoPE cos
+        and sin, and the key bias that masks the padding."""
         tower = self.vision_tower
         assert tower is not None
         vm = tower.vision_model
         patch_dim = math.prod(vm.embeddings.patch_embedding.weight.shape[1:])
         head_dim = vm.encoder.layers[0].self_attn.head_dim
         return [
-            rbln_utils.EncoderInput((bucket, patch_dim), 0, 0.0, 0.0),
-            rbln_utils.EncoderInput((bucket, head_dim), 0, 1.0, 1.0),
-            rbln_utils.EncoderInput((bucket, head_dim), 0, 0.0, 0.0),
-            rbln_utils.EncoderInput((1, 1, 1, bucket), 3, 0.0, -30000.0),
+            rbln_utils.EncoderInput(
+                "pixel_values", (bucket_size, patch_dim), axis=0, valid=0.0, pad=0.0
+            ),
+            rbln_utils.EncoderInput(
+                "cos", (bucket_size, head_dim), axis=0, valid=1.0, pad=1.0
+            ),
+            rbln_utils.EncoderInput(
+                "sin", (bucket_size, head_dim), axis=0, valid=0.0, pad=0.0
+            ),
+            rbln_utils.EncoderInput(
+                "key_bias",
+                (1, 1, 1, bucket_size),
+                axis=3,
+                valid=0.0,
+                pad=-30000.0,
+                allow_prefix_copy=False,
+            ),
         ]
 
     def _stage_encoder_inputs(
-        self, bucket: int, num_patches: int, input_tensors: list[torch.Tensor | None]
+        self,
+        bucket_size: int,
+        num_patches: int,
+        input_tensors: list[torch.Tensor | None],
     ) -> list[torch.Tensor]:
         buffers = self._mm_input_buffers
         assert buffers is not None, "compile_mm_encoder runs before encoding"
-        return buffers.stage(bucket, self._mm_input_specs, input_tensors, num_patches)
+        return buffers.stage(
+            bucket_size, self._mm_input_specs, input_tensors, num_patches
+        )
 
     def compile_mm_encoder(self, compile_fn) -> None:
         # Non-first PP ranks and zero image/video limits own no vision tower.
@@ -1370,7 +1388,7 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         num_patches = math.prod(grid_thw)
         fits = [b for b in self.mm_encoder_patch_buckets if b >= num_patches]
         assert fits, f"a {modality} of {num_patches} patches (grid {grid_thw})"
-        bucket = fits[0]
+        bucket_size = fits[0]
 
         t, h, w = grid_thw
         merge = tower.spatial_merge_size
@@ -1401,10 +1419,10 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         sin = torch.zeros(num_patches, head_dim)
         cos[:, :half] = cos[:, half : 2 * half] = freqs.cos()
         sin[:, :half] = sin[:, half : 2 * half] = freqs.sin()
-        key_bias = torch.zeros(1, 1, 1, bucket)
+        key_bias = torch.zeros(1, 1, 1, bucket_size)
         key_bias[..., num_patches:] = -30000.0
         return self._stage_encoder_inputs(
-            bucket, num_patches, [pixel_values, cos, sin, key_bias]
+            bucket_size, num_patches, [pixel_values, cos, sin, key_bias]
         )
 
     def _encode_item(

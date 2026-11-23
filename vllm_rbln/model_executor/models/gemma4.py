@@ -391,9 +391,9 @@ class RBLNGemma4ForConditionalGeneration(
         pool = vision_config.pooling_kernel_size
         patch_pixels = 3 * vision_config.patch_size**2
         with torch.inference_mode():
-            for bucket in self.mm_encoder_patch_buckets:
+            for bucket_size in self.mm_encoder_patch_buckets:
                 # A full grid whose sides are multiples of the pooling kernel.
-                cells = bucket // pool**2
+                cells = bucket_size // pool**2
                 rows = max(d for d in range(1, math.isqrt(cells) + 1) if cells % d == 0)
                 ys, xs = torch.meshgrid(
                     torch.arange(rows * pool),
@@ -401,7 +401,7 @@ class RBLNGemma4ForConditionalGeneration(
                     indexing="ij",
                 )
                 positions = torch.stack([xs, ys], dim=-1).reshape(-1, 2)
-                self._encode_vision(torch.zeros(bucket, patch_pixels), positions)
+                self._encode_vision(torch.zeros(bucket_size, patch_pixels), positions)
 
     def _encode_vision(
         self, pixel_values: torch.Tensor, pixel_position_ids: torch.Tensor
@@ -423,10 +423,10 @@ class RBLNGemma4ForConditionalGeneration(
             f"an image of {num_patches} patches exceeds the vision encoder's "
             f"{self.mm_encoder_patch_buckets[-1]}-patch bucket"
         )
-        bucket = next(b for b in self.mm_encoder_patch_buckets if b >= num_patches)
+        bucket_size = next(b for b in self.mm_encoder_patch_buckets if b >= num_patches)
         # The positions, padding mask and key bias span the bucket, so the
         # padding is masked whatever an earlier frame left in its patches.
-        positions = torch.full((1, bucket, 2), -1, dtype=torch.long)
+        positions = torch.full((1, bucket_size, 2), -1, dtype=torch.long)
         positions[0, :num_patches] = pixel_position_ids[valid]
         padding = ~(positions >= 0).all(dim=-1)
         key_bias = torch.where(padding, torch.finfo(self.model_dtype).min, 0.0)[
@@ -437,7 +437,7 @@ class RBLNGemma4ForConditionalGeneration(
             "Encoder input buffers must be initialized before staging"
         )
         inputs = buffers.stage(
-            bucket,
+            bucket_size,
             self._mm_input_specs,
             [pixel_values[valid].unsqueeze(0), positions, padding, key_bias],
             num_patches,
@@ -449,19 +449,45 @@ class RBLNGemma4ForConditionalGeneration(
             lambda *inputs: encoder(*inputs)[0], inputs, num_soft_tokens
         )
 
-    def _mm_input_specs(self, bucket: int) -> list[rbln_utils.EncoderInput]:
-        """The encoder's inputs at `bucket`: float32 patches, their (x, y)
-        positions, the padding mask, and the key bias that masks the padding.
+    def _mm_input_specs(self, bucket_size: int) -> list[rbln_utils.EncoderInput]:
+        """The encoder's inputs at `bucket_size`: float32 patches, their
+        (x, y) positions, the padding mask, and the key bias that masks padding.
         Fixed dtypes, so warm-up and serving reach the same compiled graphs."""
         patch_pixels = 3 * self.vision_tower.config.patch_size**2
         return [
             rbln_utils.EncoderInput(
-                (1, bucket, patch_pixels), 1, 0.0, 0.0, torch.float32
+                "pixel_values",
+                (1, bucket_size, patch_pixels),
+                axis=1,
+                valid=0.0,
+                pad=0.0,
+                dtype=torch.float32,
             ),
-            rbln_utils.EncoderInput((1, bucket, 2), 1, -1.0, -1.0, torch.long),
-            rbln_utils.EncoderInput((1, bucket), 1, 0.0, 1.0, torch.bool),
             rbln_utils.EncoderInput(
-                (1, 1, 1, bucket), 3, 0.0, torch.finfo(self.model_dtype).min
+                "pixel_position_ids",
+                (1, bucket_size, 2),
+                axis=1,
+                valid=-1.0,
+                pad=-1.0,
+                dtype=torch.long,
+                allow_prefix_copy=False,
+            ),
+            rbln_utils.EncoderInput(
+                "padding_positions",
+                (1, bucket_size),
+                axis=1,
+                valid=0.0,
+                pad=1.0,
+                dtype=torch.bool,
+                allow_prefix_copy=False,
+            ),
+            rbln_utils.EncoderInput(
+                "key_bias",
+                (1, 1, 1, bucket_size),
+                axis=3,
+                valid=0.0,
+                pad=torch.finfo(self.model_dtype).min,
+                allow_prefix_copy=False,
             ),
         ]
 

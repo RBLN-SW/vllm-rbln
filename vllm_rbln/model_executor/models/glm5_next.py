@@ -1426,34 +1426,49 @@ class RBLNGlm5NextForConditionalGeneration(
             self.compile_mm_encoder(lambda encoder: encoder)
         assert self._mm_encoder is not None
         with torch.inference_mode():
-            for bucket in self.mm_encoder_patch_buckets:
+            for bucket_size in self.mm_encoder_patch_buckets:
                 # Every entry valid: the warm-up never masks a key.
                 self._mm_encoder(
-                    *self._stage_encoder_inputs(bucket, bucket, [None] * 4)
+                    *self._stage_encoder_inputs(bucket_size, bucket_size, [None] * 4)
                 )
 
-    def _mm_input_specs(self, bucket: int) -> list[rbln_utils.EncoderInput]:
-        """The encoder's inputs at `bucket`: patches, the rotary cos and sin
-        over `head_dim`, and the key bias that masks the padding."""
+    def _mm_input_specs(self, bucket_size: int) -> list[rbln_utils.EncoderInput]:
+        """The encoder's inputs at `bucket_size`: patches, the rotary cos and
+        sin over `head_dim`, and the key bias that masks the padding."""
         visual = self.visual
         patch_dim = math.prod(visual.patch_embed.proj.weight.shape[1:])
         head_dim = visual.blocks[0].attn.head_dim
         return [
-            rbln_utils.EncoderInput((bucket, patch_dim), 0, 0.0, 0.0),
-            rbln_utils.EncoderInput((bucket, head_dim), 0, 1.0, 1.0),
-            rbln_utils.EncoderInput((bucket, head_dim), 0, 0.0, 0.0),
-            rbln_utils.EncoderInput((1, 1, bucket), 2, 0.0, -30000.0),
+            rbln_utils.EncoderInput(
+                "pixel_values", (bucket_size, patch_dim), axis=0, valid=0.0, pad=0.0
+            ),
+            rbln_utils.EncoderInput(
+                "cos", (bucket_size, head_dim), axis=0, valid=1.0, pad=1.0
+            ),
+            rbln_utils.EncoderInput(
+                "sin", (bucket_size, head_dim), axis=0, valid=0.0, pad=0.0
+            ),
+            rbln_utils.EncoderInput(
+                "key_bias",
+                (1, 1, bucket_size),
+                axis=2,
+                valid=0.0,
+                pad=-30000.0,
+                allow_prefix_copy=False,
+            ),
         ]
 
     def _stage_encoder_inputs(
         self,
-        bucket: int,
+        bucket_size: int,
         num_patches: int,
         input_tensors: list[torch.Tensor | None],
     ) -> list[torch.Tensor]:
         buffers = self._mm_input_buffers
         assert buffers is not None, "compile_mm_encoder runs before encoding"
-        return buffers.stage(bucket, self._mm_input_specs, input_tensors, num_patches)
+        return buffers.stage(
+            bucket_size, self._mm_input_specs, input_tensors, num_patches
+        )
 
     def _encoder_inputs(
         self, pixel_values: torch.Tensor, grid_thw: list[int]
@@ -1466,7 +1481,7 @@ class RBLNGlm5NextForConditionalGeneration(
         num_patches = math.prod(grid_thw)
         fits = [b for b in self.mm_encoder_patch_buckets if b >= num_patches]
         assert fits, f"a frame of {num_patches} patches (grid {grid_thw})"
-        bucket = fits[0]
+        bucket_size = fits[0]
 
         t, h, w = grid_thw
         merge = visual.spatial_merge_size
@@ -1483,10 +1498,10 @@ class RBLNGlm5NextForConditionalGeneration(
         freqs_h = torch.outer((order // w).float(), inv_freq)
         freqs_w = torch.outer((order % w).float(), inv_freq)
         angles = torch.cat([freqs_h, freqs_w, freqs_h, freqs_w], dim=-1)
-        key_bias = torch.zeros(1, 1, bucket)
+        key_bias = torch.zeros(1, 1, bucket_size)
         key_bias[..., num_patches:] = -30000.0
         return self._stage_encoder_inputs(
-            bucket,
+            bucket_size,
             num_patches,
             [pixel_values, angles.cos(), angles.sin(), key_bias],
         )

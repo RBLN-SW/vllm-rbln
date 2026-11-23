@@ -42,16 +42,18 @@ def run_mm_encoder(
 
 
 class EncoderInput(NamedTuple):
-    """One input of a compiled vision encoder at one bucket: its shape, the axis
-    the bucket runs along, the value every entry takes when nothing is copied
-    in, the value its padding is initialized to, and its dtype when that is not
-    the buffers' default."""
+    """One named input of a compiled vision encoder at one bucket.
 
+    The buffer starts filled with pad. Staging None fills it with valid.
+    """
+
+    name: str
     shape: tuple[int, ...]
     axis: int
     valid: float
     pad: float
     dtype: torch.dtype | None = None
+    allow_prefix_copy: bool = True
 
 
 class EncoderInputBuffers:
@@ -68,7 +70,7 @@ class EncoderInputBuffers:
 
     def stage(
         self,
-        bucket: int,
+        bucket_size: int,
         build_specs: Callable[[int], Sequence[EncoderInput]],
         input_tensors: Sequence[torch.Tensor | None],
         num_valid: int,
@@ -76,12 +78,14 @@ class EncoderInputBuffers:
         """Initialize the bucket on first use and stage its input tensors.
 
         Copy each tensor over the whole buffer or its valid prefix, depending on
-        its length along the bucket axis. None fills the buffer with the spec's
-        valid value.
+        its length along the bucket axis. If allow_prefix_copy is False, that
+        length must equal the selected bucket_size. None fills the buffer with
+        the spec's valid value and is allowed for such inputs only when the
+        whole selected bucket is valid.
         """
-        entry = self._buckets.get(bucket)
+        entry = self._buckets.get(bucket_size)
         if entry is None:
-            specs = build_specs(bucket)
+            specs = build_specs(bucket_size)
             # Plain tensors, not inference tensors: staging writes them in place
             # inside and outside inference mode alike.
             with torch.inference_mode(False):
@@ -94,17 +98,28 @@ class EncoderInputBuffers:
                     )
                     for spec in specs
                 ]
-            entry = self._buckets[bucket] = (specs, buffers)
+            entry = self._buckets[bucket_size] = (specs, buffers)
         specs, buffers = entry
+        # Reject incomplete masks before writing any reused buffers.
+        for spec, tensor in zip(specs, input_tensors, strict=True):
+            if not spec.allow_prefix_copy:
+                length = num_valid if tensor is None else tensor.size(spec.axis)
+                if length != bucket_size:
+                    provided = "None" if tensor is None else f"{length} entries"
+                    raise ValueError(
+                        f"Encoder input {spec.name!r} requires a full "
+                        f"{bucket_size}-entry tensor "
+                        f"along axis {spec.axis}, got {provided}"
+                    )
         for buffer, spec, tensor in zip(buffers, specs, input_tensors, strict=True):
             if tensor is None:
                 buffer.fill_(spec.valid)
-            elif tensor.shape[spec.axis] == bucket:
+            elif tensor.shape[spec.axis] == bucket_size:
                 buffer.copy_(tensor)
             else:
                 assert tensor.shape[spec.axis] == num_valid, (
-                    f"a tensor with {tensor.shape[spec.axis]} entries for an input of "
-                    f"{num_valid} valid entries in a {bucket}-entry bucket"
+                    f"{spec.name!r} received {tensor.shape[spec.axis]} entries for "
+                    f"{num_valid} valid entries in a {bucket_size}-entry bucket"
                 )
                 buffer.narrow(spec.axis, 0, num_valid).copy_(tensor)
         return buffers
