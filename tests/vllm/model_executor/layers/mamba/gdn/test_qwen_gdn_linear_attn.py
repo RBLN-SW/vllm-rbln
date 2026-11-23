@@ -28,7 +28,7 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
     torch_chunk_gated_delta_rule,
     torch_recurrent_gated_delta_rule,
 )
-from vllm.config import set_current_vllm_config
+from vllm.config import CompilationConfig, set_current_vllm_config
 from vllm.model_executor.models.qwen3_5 import Qwen3_5ForConditionalGeneration
 from vllm.v1.kv_cache_interface import MambaSpec
 
@@ -49,6 +49,7 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
     attach_kv_cache_bindings,
     build_kv_cache_forward_context_kwargs,
 )
+from vllm_rbln.v1.worker.utils import get_kv_cache_names
 
 HIDDEN, HEADS_K, HEADS_V, HEAD_DIM, KERNEL = 64, 4, 4, 128, 4
 KEY_DIM, VALUE_DIM = HEADS_K * HEAD_DIM, HEADS_V * HEAD_DIM
@@ -69,7 +70,6 @@ def _layer():
     torch.manual_seed(0)
     layer = SimpleNamespace(
         prefix=PREFIX,
-        layer_index=0,
         tp_size=1,
         num_k_heads=HEADS_K,
         num_v_heads=HEADS_V,
@@ -186,7 +186,9 @@ def _run(
         if shared_binding
         else []
     )
-    attach_kv_cache_bindings(metadata, [state], bases, infos)
+    attach_kv_cache_bindings(
+        metadata, [state], bases, infos, kv_cache_positions={PREFIX: 0}
+    )
     with set_forward_context(
         {PREFIX: metadata}, vllm_config, **build_kv_cache_forward_context_kwargs(bases)
     ):
@@ -524,6 +526,37 @@ class TestStateSpec:
         assert model.get_mamba_state_dtype_from_config(vllm_config) == (
             self._layer().get_state_dtype()
         )
+
+
+def test_gdn_aux_caches_sort_after_their_state(monkeypatch):
+    def init_upstream(layer, _text_config, config, prefix):
+        torch.nn.Module.__init__(layer)
+        layer.head_k_dim = layer.head_v_dim = HEAD_DIM
+        layer.num_k_heads, layer.num_v_heads = HEADS_K, HEADS_V
+        layer.conv_dim, layer.conv_kernel_size = CONV_DIM, KERNEL
+        layer.tp_size, layer.num_spec = 1, 2
+        config.compilation_config.static_forward_context[prefix] = layer
+
+    monkeypatch.setattr(QwenGatedDeltaNetAttention, "__init__", init_upstream)
+    config = SimpleNamespace(
+        compilation_config=CompilationConfig(),
+        model_config=SimpleNamespace(
+            architecture="Qwen3_5ForConditionalGeneration",
+            dtype=torch.bfloat16,
+            get_num_kv_heads=lambda _: HEADS_K,
+            get_head_size=lambda: HEAD_DIM,
+        ),
+        parallel_config=None,
+    )
+    context = config.compilation_config.static_forward_context
+    with set_current_vllm_config(config):
+        RBLNQwenGatedDeltaNetAttention(None, config, PREFIX)
+
+    assert get_kv_cache_names(context) == [
+        PREFIX,
+        f"{PREFIX}.conv_ring",
+        f"{PREFIX}.drafts",
+    ]
 
 
 def test_upstreams_layer_builds_the_rbln_one():

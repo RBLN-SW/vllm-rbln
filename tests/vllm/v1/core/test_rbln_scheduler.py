@@ -316,6 +316,24 @@ class TestSchedulerInit:
         )
         assert isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
 
+    def test_sub_block_manager_admits_what_the_sliding_window_recycles(self):
+        # The pool holds the prompt's full-attention blocks plus the few a
+        # sliding window keeps, not a second full-length copy of the prompt.
+        sched = create_rbln_scheduler(
+            enable_prefix_caching=True,
+            block_size=16,
+            sub_block_size=8,
+            max_num_batched_tokens=16,
+            max_model_len=2048,
+            kv_cache_config=make_kv_cache_config(
+                [full_attention_spec(16), sliding_window_spec(16, 16)],
+                num_blocks=32,
+            ),
+        )
+        assert isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
+        sched.add_request(make_request("0", list(range(320)), 16))
+        assert sched.schedule().num_scheduled_tokens == {"0": 16}
+
     def test_disabled_falls_back_to_base_manager(self):
         # prefix caching off -> plain KVCacheManager.
         sched = create_rbln_scheduler(enable_prefix_caching=False)
@@ -2525,6 +2543,149 @@ class TestEcConsumerEncodesNothing:
         assert request.status == RequestStatus.RUNNING
 
 
+class TestMultimodalDraftEncoderLookahead:
+    @staticmethod
+    def _scheduler(*, encoder_budget=None, cache_size=None, num_mtp_layers=None):
+        from vllm.v1.structured_output import StructuredOutputManager
+
+        from tests.vllm.vllm_config import make_vllm_config
+
+        config = make_vllm_config(
+            model="Qwen/Qwen3.5-4B",
+            max_model_len=8192,
+            max_num_seqs=1,
+            max_num_batched_tokens=128,
+            enable_prefix_caching=False,
+            limit_mm_per_prompt={"image": 2, "video": 0},
+            mm_processor_kwargs={"min_pixels": 1024, "max_pixels": 262144},
+            speculative_config={"method": "mtp", "num_speculative_tokens": 3},
+        )
+        if num_mtp_layers is not None:
+            hf_config = config.speculative_config.draft_model_config.hf_config
+            hf_config.num_nextn_predict_layers = num_mtp_layers
+        config.cache_config.num_gpu_blocks = 64
+        sched = RBLNScheduler(
+            vllm_config=config,
+            kv_cache_config=make_kv_cache_config([full_attention_spec(1024)], 64),
+            block_size=1024,
+            log_stats=True,
+            structured_output_manager=StructuredOutputManager(config),
+        )
+        if encoder_budget is not None:
+            sched.max_num_encoder_input_tokens = encoder_budget
+        if cache_size is not None:
+            sched.encoder_cache_manager = EncoderCacheManager(cache_size=cache_size)
+        return sched
+
+    @pytest.mark.parametrize("num_mtp_layers", [2, 3])
+    @pytest.mark.parametrize("draft_accepts_mm", [False, True])
+    def test_multi_module_limit_applies_only_to_multimodal_drafters(
+        self, monkeypatch, num_mtp_layers, draft_accepts_mm
+    ):
+        if not draft_accepts_mm:
+            from vllm_rbln.model_executor.models.glm5_next import RBLNGlm5NextMTP
+
+            monkeypatch.setattr(
+                rbln_scheduler,
+                "get_model_architecture",
+                lambda config: (RBLNGlm5NextMTP, "Glm5NextMTP"),
+            )
+        if draft_accepts_mm:
+            with pytest.raises(
+                NotImplementedError, match="num_prefill_lookahead_tokens=1"
+            ):
+                self._scheduler(num_mtp_layers=num_mtp_layers)
+        else:
+            sched = self._scheduler(num_mtp_layers=num_mtp_layers)
+            assert sched.num_prefill_lookahead == 3
+            assert sched.mm_prefill_lookahead == 0
+
+    @pytest.mark.parametrize("running", [False, True])
+    @pytest.mark.parametrize(
+        "draft_accepts_mm,draft_accepts_rbln_mm",
+        [(False, False), (False, True), (True, False), (True, True)],
+    )
+    @pytest.mark.parametrize("with_text_prefix", [False, True])
+    def test_encodes_an_image_starting_just_after_the_target_chunk(
+        self,
+        monkeypatch,
+        running,
+        draft_accepts_mm,
+        draft_accepts_rbln_mm,
+        with_text_prefix,
+    ):
+        from vllm_rbln.model_executor.models.qwen3_5 import RBLNQwen3_5MTP
+
+        monkeypatch.setattr(
+            RBLNQwen3_5MTP, "supports_multimodal_embeddings", draft_accepts_mm
+        )
+        monkeypatch.setattr(
+            RBLNQwen3_5MTP,
+            "supports_rbln_multimodal_embeddings",
+            draft_accepts_rbln_mm,
+            raising=False,
+        )
+        sched = self._scheduler()
+        offset = 256 if running else 128
+        feature = image_at(offset, 64)
+        if with_text_prefix:
+            feature.mm_position = PlaceholderRange(
+                offset=offset - 8,
+                length=72,
+                is_embed=torch.tensor([False] * 8 + [True] * 64),
+            )
+        request = make_request("image", list(range(384)), 1024, mm_features=[feature])
+        sched.add_request(request)
+        if running:
+            out = sched.schedule()
+            sched.update_from_output(out, make_model_runner_output(out))
+
+        out = sched.schedule()
+
+        assert out.num_scheduled_tokens == {"image": 128}
+        assert out.scheduled_encoder_inputs == (
+            {"image": [0]} if draft_accepts_mm and draft_accepts_rbln_mm else {}
+        )
+
+    def test_encoder_budget_backpressure_keeps_the_lookahead_available(self):
+        sched = self._scheduler(encoder_budget=64, cache_size=128)
+        request = make_request(
+            "images",
+            list(range(256)),
+            1024,
+            mm_features=[image_at(64, 64), image_at(128, 64)],
+        )
+        sched.add_request(request)
+
+        out = sched.schedule()
+        assert out.num_scheduled_tokens == {"images": 127}
+        assert out.scheduled_encoder_inputs == {"images": [0]}
+        sched.update_from_output(out, make_model_runner_output(out))
+        out = sched.schedule()
+        assert out.num_scheduled_tokens == {"images": 128}
+        assert out.scheduled_encoder_inputs == {"images": [1]}
+
+    @pytest.mark.parametrize("offset, first_length", [(0, 1), (64, 256)])
+    def test_adjacent_images_make_progress(self, offset, first_length):
+        sched = self._scheduler()
+        request = make_request(
+            "images",
+            list(range(640)),
+            1024,
+            mm_features=[
+                image_at(offset, first_length),
+                image_at(offset + first_length, 256),
+            ],
+        )
+        sched.add_request(request)
+
+        while request.num_computed_tokens < len(request.prompt_token_ids):
+            before = request.num_computed_tokens
+            out = sched.schedule()
+            assert out.num_scheduled_tokens.get("images", 0) > 0, before
+            sched.update_from_output(out, make_model_runner_output(out))
+
+
 def test_eagle_steps_through_adjacent_images_with_a_one_image_encoder_cache():
     """The drafter's look-ahead shifted the encoder window into the second image
     and deferred freeing the first, so with a cache that holds one image the
@@ -2547,3 +2708,279 @@ def test_eagle_steps_through_adjacent_images_with_a_one_image_encoder_cache():
         out = sched.schedule()
         assert out.num_scheduled_tokens == {"0": 8}
         sched.update_from_output(out, make_model_runner_output(out))
+
+
+class TestStateBoundaryAdmission:
+    """An align-mode hybrid admits a pulled request whose producer names the
+    prompt's last block boundary: block 16, a 40-token prompt, 39 received."""
+
+    @staticmethod
+    def _scheduler(
+        monkeypatch,
+        *,
+        sends_state_boundary,
+        is_async=False,
+        in_multi=False,
+        num_speculative_tokens=None,
+    ):
+        from vllm.v1.core.single_type_kv_cache_manager import (
+            register_all_kvcache_specs,
+        )
+        from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec
+
+        from tests.vllm.v1.core.utils import MockKVConnector
+        from vllm_rbln.platform import RblnPlatform
+        from vllm_rbln.v1.kv_cache import RBLNMambaSpec
+
+        register_all_kvcache_specs(None)
+        RblnPlatform.register_custom_kv_cache_specs(None)
+        monkeypatch.setattr(
+            MockKVConnector,
+            "connector_scheduler",
+            SimpleNamespace(sends_state_boundary=sends_state_boundary),
+            raising=False,
+        )
+        full = full_attention_spec(16)
+        state = RBLNMambaSpec(
+            block_size=16,
+            shapes=((full.page_size_bytes,),),
+            dtypes=(torch.uint8,),
+            mamba_cache_mode="align",
+        )
+        config = KVCacheConfig(
+            num_blocks=64,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(["attn"], full),
+                KVCacheGroupSpec(["state"], state),
+            ],
+            prefix_cache_retention_interval=0,
+        )
+        return create_rbln_scheduler(
+            enable_prefix_caching=True,
+            block_size=16,
+            max_num_batched_tokens=16,
+            max_model_len=128,
+            num_blocks=64,
+            use_kv_connector=MockKVConfig(
+                matched_tokens=39, is_async=is_async, in_multi_connector=in_multi
+            ),
+            kv_cache_config=config,
+            num_speculative_tokens=num_speculative_tokens,
+        )
+
+    @pytest.mark.parametrize("in_multi", [False, True])
+    @pytest.mark.parametrize("sends_state_boundary", [True, False])
+    def test_the_boundary_block_is_allocated_where_the_connector_sends_it(
+        self, monkeypatch, sends_state_boundary, in_multi
+    ):
+        from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
+            MultiConnector,
+        )
+
+        from vllm_rbln.v1.kv_cache import REMOTE_STATE_BOUNDARY
+
+        # The mock child is not `SupportsHMA`, which a hybrid engine requires.
+        monkeypatch.setattr(
+            MultiConnector, "all_children_support_hma", classmethod(lambda *_: True)
+        )
+        sched = self._scheduler(
+            monkeypatch,
+            sends_state_boundary=sends_state_boundary,
+            in_multi=in_multi,
+        )
+        assert isinstance(sched.connector, MultiConnector) is in_multi
+        request = make_request("d", list(range(40)), 16)
+        request.kv_transfer_params = {
+            "do_remote_prefill": True,
+            REMOTE_STATE_BOUNDARY: 32,
+        }
+        sched.add_request(request)
+
+        out = sched.schedule()
+
+        assert out.num_scheduled_tokens["d"] == 1
+        state = sched.kv_cache_manager.coordinator.single_type_managers[1]
+        blocks = state.req_to_blocks["d"]
+        assert [b.is_null for b in blocks] == [True, not sends_state_boundary, False]
+
+    # n-gram drops no block; the `True` row has the scheduler treat it as an
+    # EAGLE/MTP drafter, whose block drop moves the boundary one block back.
+    @pytest.mark.parametrize(
+        ("drops_eagle_block", "boundary"), [(False, 32), (True, 16)]
+    )
+    def test_a_speculating_consumer_allocates_the_boundary_block(
+        self, monkeypatch, drops_eagle_block, boundary
+    ):
+        from vllm.config import SpeculativeConfig
+
+        from vllm_rbln.v1.kv_cache import REMOTE_STATE_BOUNDARY
+
+        monkeypatch.setattr(
+            SpeculativeConfig, "use_eagle", lambda self: drops_eagle_block
+        )
+        sched = self._scheduler(
+            monkeypatch, sends_state_boundary=True, num_speculative_tokens=1
+        )
+        request = make_request("d", list(range(40)), 16)
+        request.kv_transfer_params = {
+            "do_remote_prefill": True,
+            REMOTE_STATE_BOUNDARY: boundary,
+        }
+        sched.add_request(request)
+
+        sched.schedule()
+
+        state = sched.kv_cache_manager.coordinator.single_type_managers[1]
+        assert not state.req_to_blocks["d"][boundary // 16 - 1].is_null
+
+    @pytest.mark.parametrize("failure", [None, "fail", "recompute"])
+    def test_a_failed_receive_leaves_no_cache_hit(self, monkeypatch, failure):
+        from vllm.v1.core.sched import scheduler as upstream_scheduler
+        from vllm.v1.outputs import KVConnectorOutput
+
+        from tests.vllm.v1.core.utils import MockKVConnector
+        from vllm_rbln.v1.kv_cache import REMOTE_STATE_BOUNDARY
+
+        # The `fail` row finishes the request, and upstream's
+        # `_connector_finished` asserts one KV cache group unless the
+        # connector is `SupportsHMA`.
+        monkeypatch.setattr(upstream_scheduler, "SupportsHMA", MockKVConnector)
+        monkeypatch.setattr(
+            MockKVConnector,
+            "request_finished_all_groups",
+            lambda self, request, block_ids: (False, None),
+            raising=False,
+        )
+        sched = self._scheduler(monkeypatch, sends_state_boundary=True, is_async=True)
+        if failure is not None:
+            sched.recompute_kv_load_failures = failure == "recompute"
+        request = make_request("d", list(range(40)), 16)
+        request.kv_transfer_params = {
+            "do_remote_prefill": True,
+            REMOTE_STATE_BOUNDARY: 32,
+        }
+        sched.add_request(request)
+        out = sched.schedule()
+        state = sched.kv_cache_manager.coordinator.single_type_managers[1]
+        assert not state.req_to_blocks["d"][1].is_null
+
+        output = make_model_runner_output(out)
+        output.kv_connector_output = KVConnectorOutput(
+            finished_recving={"d"},
+            failed_recving={"d"} if failure else set(),
+        )
+        sched.update_from_output(out, output)
+        sched.schedule()
+
+        probe = make_request("probe", list(range(40)), 16)
+        _, hit, _ = sched.kv_cache_manager.coordinator.find_longest_cache_hit(
+            probe.block_hashes, 39
+        )
+        assert hit == (32 if failure is None else 0)
+
+
+class TestFineGrainedPrefixHit:
+    """An align-mode hybrid with prefix_match_unit (16) below block_size (64)
+    resumes a longer sibling of a prompt at the prompt's last 16-token boundary."""
+
+    @staticmethod
+    def _scheduler(num_speculative_tokens=None):
+        from vllm.v1.core.single_type_kv_cache_manager import (
+            register_all_kvcache_specs,
+        )
+        from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec
+
+        from vllm_rbln.platform import RblnPlatform
+        from vllm_rbln.v1.kv_cache import RBLNMambaSpec
+
+        register_all_kvcache_specs(None)
+        RblnPlatform.register_custom_kv_cache_specs(None)
+        full = full_attention_spec(64)
+        state = RBLNMambaSpec(
+            block_size=64,
+            shapes=((full.page_size_bytes,),),
+            dtypes=(torch.uint8,),
+            mamba_cache_mode="align",
+        )
+        config = KVCacheConfig(
+            num_blocks=64,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(["attn"], full),
+                KVCacheGroupSpec(["state"], state),
+            ],
+            prefix_cache_retention_interval=0,
+        )
+        return create_rbln_scheduler(
+            enable_prefix_caching=True,
+            block_size=64,
+            max_num_batched_tokens=16,
+            max_model_len=256,
+            num_blocks=64,
+            kv_cache_config=config,
+            hash_block_size=16,
+            num_speculative_tokens=num_speculative_tokens,
+        )
+
+    @staticmethod
+    def _step(sched):
+        out = sched.schedule()
+        req_ids = list(out.num_scheduled_tokens)
+        # A chunk that ends inside the prompt samples nothing; schedule() has
+        # already advanced num_computed_tokens.
+        done = {
+            r
+            for r in req_ids
+            if sched.requests[r].num_computed_tokens
+            >= sched.requests[r].num_prompt_tokens
+        }
+        sched.update_from_output(
+            out,
+            ModelRunnerOutput(
+                req_ids=req_ids,
+                req_id_to_index={r: i for i, r in enumerate(req_ids)},
+                sampled_token_ids=[[7] if r in done else [] for r in req_ids],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+        return out
+
+    def _run(self, sched, req_id, prompt):
+        sched.add_request(make_request(req_id, prompt, 16, max_tokens=1))
+        copies: list = []
+        while req_id in sched.requests:
+            out = self._step(sched)
+            copies += out.kv_cache_block_copies or []
+        return copies
+
+    def test_the_copies_a_mid_block_hit_needs_reach_the_runner(self):
+        sched = self._scheduler()
+        prompt = list(range(100, 140))
+        # The prompt's state at token 32 is copied out of the block the next
+        # chunk keeps running in.
+        assert self._run(sched, "first", prompt)
+
+        sched.add_request(make_request("sibling", prompt + [1] * 20, 16, max_tokens=1))
+        out = self._step(sched)
+        assert sched.requests["sibling"].num_computed_tokens == 32 + 16
+        assert out.kv_cache_block_copies
+
+    # An EAGLE/MTP drafter resumes one unit below the prompt's last boundary:
+    # 84 tokens resume at 64, a block boundary, and 100 at 80, inside block 1.
+    @pytest.mark.parametrize(("prompt_len", "hit"), [(84, 64), (100, 80)])
+    def test_an_eagle_sibling_resumes_one_unit_below_the_prompt_tail(
+        self, monkeypatch, prompt_len, hit
+    ):
+        from vllm.config import SpeculativeConfig
+
+        monkeypatch.setattr(SpeculativeConfig, "use_eagle", lambda self: True)
+        sched = self._scheduler(num_speculative_tokens=1)
+        prompt = list(range(100, 100 + prompt_len))
+        self._run(sched, "first", prompt)
+
+        sched.add_request(make_request("sibling", prompt + [1] * 20, 16, max_tokens=1))
+        self._step(sched)
+        assert sched.requests["sibling"].num_computed_tokens == hit + 16

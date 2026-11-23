@@ -81,10 +81,8 @@ from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadata,
 )
 from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
-from vllm_rbln.v1.worker.utils import pipeline_adjusted_layer_index
 
-# Cache names reserve six slots per decoder layer. The runner assigns compact
-# layer_index values when binding the caches actually present on each PP stage.
+# Cache names distinguish the six possible buffers in each decoder layer.
 SLOT_SWA, SLOT_CMP, SLOT_IDX_K, SLOT_IDX_SCALE, SLOT_STATE, SLOT_IDX_STATE = range(6)
 DSV4_NUM_CACHE_SLOTS = 6
 
@@ -109,12 +107,6 @@ class _RBLNDeepseekV4Cache(nn.Module, AttentionLayerBase):
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
-        self.layer_index = pipeline_adjusted_layer_index(
-            prefix,
-            vllm_config.model_config,
-            vllm_config.parallel_config,
-            DSV4_NUM_CACHE_SLOTS,
-        )
 
     def forward(self) -> None: ...
 
@@ -159,7 +151,7 @@ class RBLNDeepseekV4RingCache(_RBLNDeepseekV4Cache):
         self,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, RBLNFlashAttentionMetadata]:
         metadata = get_forward_context().attn_metadata[self.prefix]
-        ring = _resolve_kv_cache(metadata, self.layer_index)
+        ring = _resolve_kv_cache(metadata, self.prefix)
         slots = metadata.block_tables.reshape(-1, 1).to(torch.int32)
         query_len = metadata.cache_offsets - metadata.cache_seq_lens
         return ring, slots, query_len.to(torch.int32), metadata
@@ -207,7 +199,7 @@ class RBLNDeepseekV4PagedCache(_RBLNDeepseekV4Cache):
     def inputs(self) -> tuple[torch.Tensor, torch.Tensor]:
         """(cache, block_table)."""
         metadata = get_forward_context().attn_metadata[self.prefix]
-        return _resolve_kv_cache(metadata, self.layer_index), metadata.block_tables
+        return _resolve_kv_cache(metadata, self.prefix), metadata.block_tables
 
 
 class RBLNDeepseekV4AuxCache(_RBLNDeepseekV4Cache):
@@ -231,7 +223,7 @@ class RBLNDeepseekV4AuxCache(_RBLNDeepseekV4Cache):
 
     def inputs(self) -> torch.Tensor:
         metadata = get_forward_context().attn_metadata[self.owner_prefix]
-        return _resolve_kv_cache(metadata, self.layer_index)
+        return _resolve_kv_cache(metadata, self.prefix)
 
 
 _TID2EID_LANES = 64

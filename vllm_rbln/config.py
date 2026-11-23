@@ -117,7 +117,7 @@ class RBLNConfig(RBLNConfigBase):
     enable_sub_block_cache: bool = True
     """Enable sub-block prefix caching, at `sub_block_size` granularity."""
 
-    use_fused_sampling: bool = True
+    use_fused_sampling: bool = False
     """Run the sampling step's logits processing inside the compiled sampling
     graph: repetition / frequency / presence penalties and logit bias, on the
     vocab chunks they touch, and min_p. Needs `use_custom_sampler`."""
@@ -161,7 +161,8 @@ class RBLNConfig(RBLNConfigBase):
     Empty lets the model choose: MiniMax-M3 takes the processor upper bounds of
     the enabled modalities, Gemma4 every supported soft token budget up to
     max_soft_tokens, Qwen3.5 powers of two from 128 up to the longest prefill
-    chunk (512 at least) and the processor upper bound for an image."""
+    chunk (512 at least) and the processor upper bound for an image or a
+    video frame."""
 
     use_w8a8: bool = False
     """Opt in to W8A8. W8A16 runs on every RBLN NPU, W8A8 only on the ones
@@ -227,6 +228,12 @@ class RBLNConfig(RBLNConfigBase):
             self.prefill_chunk_size = sorted(sizes)
 
 
+@dataclass(frozen=True)
+class OptimumWeightsIdentity:
+    source: Literal["local", "hub"]
+    value: str
+
+
 @dataclass
 class OptimumRBLNCompileConfig:
     """Resolved model compilation settings shared by cache hashing and compilation.
@@ -241,6 +248,7 @@ class OptimumRBLNCompileConfig:
     # Keep third-party config dataclasses opaque to pydantic validation.
     hf_config: Any
     npu_name: str
+    weights_identity: OptimumWeightsIdentity | None = None
 
 
 @vllm_config_dataclass

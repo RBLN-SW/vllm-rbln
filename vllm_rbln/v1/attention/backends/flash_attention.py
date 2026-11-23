@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, ClassVar
 
 import torch
@@ -156,6 +156,7 @@ class RBLNFlashAttentionMetadata:
     mm_prefix_row_ends: torch.Tensor | None = None
     kv_caches: list[torch.Tensor] | None = None
     kv_cache_view_infos: list[KVCacheViewInfo] | None = None
+    kv_cache_positions: dict[str, int] = field(default_factory=dict, kw_only=True)
 
     swa_appends: bool = False
     cache_seq_lens: torch.Tensor | None = None
@@ -455,8 +456,6 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         self.block_size = vllm_config.cache_config.block_size
         self.max_model_len = vllm_config.model_config.max_model_len
 
-        if kv_sharing_target_layer_name is not None:
-            raise NotImplementedError("KV sharing is not supported in RBLN.")
         if logits_soft_cap is not None:
             logger.warning_once(
                 "RBLN Attention Backend does not support logits soft cap. "
@@ -586,6 +585,14 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
 
         # 1. query reshape for custom operation
         num_tokens = query.shape[0]
+        # A KV-shared layer reads its target's cache through an op that also
+        # writes: its zero K/V land one slot past the query, which the target
+        # overwrites before it reads, and the mask keeps them out.
+        reads_shared_kv = key is None
+        if reads_shared_kv:
+            assert value is None and attn_metadata.attn_masks is not None
+            key = query.new_zeros(num_tokens, self.num_kv_heads, self.head_size)
+            value = query.new_zeros(num_tokens, self.num_kv_heads, self.head_size)
         b_size = attn_metadata.seq_lens.shape[0]
         q_len = num_tokens // b_size
         query = query.view(b_size, q_len, self.num_heads, self.head_size).transpose(
@@ -627,7 +634,41 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         # ex) tensor[block0 : 0, block1 : 100,
         #  block2: 10, block3: 5, ...]
         # attn_output = [batch,H,4,L,D]
-        if self.sliding_window is not None:
+        if reads_shared_kv and self.sliding_window is not None:
+            # The write sits one past the query. Include one extra position so
+            # the op's block strip retains the query's oldest visible key.
+            assert attn_metadata.swa_appends and not attn_metadata.is_prefill
+            attn_output = sliding_window_attention_v1(
+                query,
+                key,
+                value,
+                kv_cache,
+                attn_metadata.seq_lens,
+                self.scale,
+                attn_metadata.block_tables,
+                self.sliding_window + 1,
+                self.sinks,
+                attn_mask=attn_metadata.attn_masks,
+                is_prompt_sorted=attn_metadata.is_prompt_sorted,
+            )
+        elif reads_shared_kv:
+            # GQA selects the old masked kernel for a one-column table. The
+            # explicit flash op retains the target's in-memory cache layout.
+            assert not attn_metadata.is_prefill
+            attn_output = flash_attention_naive_decode(
+                query,
+                key,
+                value,
+                kv_cache,
+                attn_metadata.attn_masks,
+                self.scale,
+                attn_metadata.seq_lens,
+                attn_metadata.block_tables,
+                self.sinks,
+                use_custom_kernel=self.use_custom_kernel,
+                is_prompt_sorted=attn_metadata.is_prompt_sorted,
+            )
+        elif self.sliding_window is not None:
             if attn_metadata.swa_appends:
                 # `seq_lens` is the absolute position the chunk starts at, not
                 # a length: the op resolves the window's blocks from it and the

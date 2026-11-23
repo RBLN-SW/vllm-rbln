@@ -88,8 +88,16 @@ def _image(width: int, height: int, num_patches: int):
     return pixels, positions
 
 
+def test_logits_processor_delegates_to_language_model():
+    processor = nn.Identity()
+    model = _bare_model(language_model=nn.Module())
+    model.language_model.logits_processor = processor
+
+    assert model.logits_processor is processor
+
+
 def test_the_vision_encoder_matches_hfs():
-    # The encoder pads every image to its bucket and runs attention spelled out;
+    # The encoder pads every image to its bucket and masks the padding keys;
     # what comes back must be HF's soft tokens for the image alone.
     tower = _vision_tower()
     model = _bare_model(
@@ -137,13 +145,25 @@ def test_the_rotary_tables_are_built_once_not_per_image(monkeypatch):
     torch.testing.assert_close(got, expected, rtol=1e-4, atol=1e-4)
 
 
-def test_speculative_decoding_is_refused():
+def test_a_drafter_other_than_the_mtp_assistant_is_refused():
     vllm_config = SimpleNamespace(
         parallel_config=SimpleNamespace(data_parallel_size=1),
-        speculative_config=SimpleNamespace(method="mtp"),
+        speculative_config=SimpleNamespace(
+            method="eagle3", use_gemma4_mtp=lambda: False
+        ),
     )
 
-    with pytest.raises(ValueError, match="speculative decoding"):
+    with pytest.raises(ValueError, match="only with its MTP assistant"):
+        RBLNGemma4ForConditionalGeneration(vllm_config=vllm_config)
+
+
+def test_the_mtp_assistant_is_refused_under_pipeline_parallel():
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(data_parallel_size=1, pipeline_parallel_size=2),
+        speculative_config=SimpleNamespace(method="mtp", use_gemma4_mtp=lambda: True),
+    )
+
+    with pytest.raises(ValueError, match="pipeline_parallel_size=1 only"):
         RBLNGemma4ForConditionalGeneration(vllm_config=vllm_config)
 
 
@@ -515,7 +535,6 @@ def test_prefix_mask_is_shared_and_does_not_escape_forward(monkeypatch, compiled
             super().__init__()
             self.attn = nn.Module()
             self.attn.layer_name = f"layer.{index}"
-            self.attn.layer_index = index
             self.attn.sliding_window = 4
             self.attn.impl = SimpleNamespace(scale=torch.tensor(1.0))
 
@@ -549,6 +568,9 @@ def test_prefix_mask_is_shared_and_does_not_escape_forward(monkeypatch, compiled
         swa_appends=True,
         mm_prefix_row_ends=torch.tensor([0, 3, 3, 3]),
         kv_caches=[torch.zeros(4, 2, 1, 1, 4, 32) for _ in model.layers],
+        kv_cache_positions={
+            layer.layer_name: i for i, layer in enumerate(model.mm_prefix_attn_layers)
+        },
     )
     context = SimpleNamespace(
         attn_metadata={
@@ -595,7 +617,7 @@ def test_prefix_mask_is_restored_when_forward_raises(monkeypatch):
         raise RuntimeError("forward failed")
 
     monkeypatch.setattr(Gemma4ForConditionalGeneration, "forward", upstream_forward)
-    attn = SimpleNamespace(layer_name="layer.0", layer_index=0, sliding_window=4)
+    attn = SimpleNamespace(layer_name="layer.0", sliding_window=4)
     model = _bare_model(model_dtype=torch.float32)
     model.mm_prefix_attn_layers = [attn]
     metadata = RBLNFlashAttentionMetadata(
@@ -605,6 +627,7 @@ def test_prefix_mask_is_restored_when_forward_raises(monkeypatch):
         swa_appends=True,
         mm_prefix_row_ends=torch.tensor([0, 3, 3, 3]),
         kv_caches=[torch.zeros(4, 2, 1, 1, 4, 32)],
+        kv_cache_positions={"layer.0": 0},
     )
     context = SimpleNamespace(
         attn_metadata={"layer.0": metadata}, additional_kwargs={}, dp_metadata=None

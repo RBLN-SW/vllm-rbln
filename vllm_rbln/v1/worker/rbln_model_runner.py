@@ -59,6 +59,7 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
 )
 from vllm.v1.attention.backends.utils import create_fast_prefill_custom_backend
+from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.core.sched.output import (
     GrammarOutput,
     NewRequestData,
@@ -135,9 +136,11 @@ from vllm_rbln.model_executor.models.interfaces import (
 )
 from vllm_rbln.platform import use_device_tensor
 from vllm_rbln.v1.attention.backends.flash_attention import (
+    RBLNFlashAttentionMetadata,
     RBLNFlashAttentionMetadataBuilder,
 )
 from vllm_rbln.v1.attention.backends.gdn_attn import (
+    RBLNGDNAttentionMetadata,
     RBLNGDNAttentionMetadataBuilder,
 )
 from vllm_rbln.v1.attention.backends.mla.indexer import RBLNDeepseekV32IndexerBackend
@@ -171,6 +174,7 @@ from vllm_rbln.v1.spec_decode.eagle3_pp import (
     aux_hidden_states_enabled,
     install_aux_handoff_slots,
 )
+from vllm_rbln.v1.spec_decode.gemma4 import RBLNGemma4Proposer
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
 from vllm_rbln.v1.worker import mega_cache
 from vllm_rbln.v1.worker.async_output import AsyncRBLNModelRunnerOutput
@@ -192,9 +196,6 @@ from vllm_rbln.v1.worker.utils import (
     kv_cache_extents,
     prepare_kernel_block_sizes,
     reorder_input_batch,
-)
-from vllm_rbln.v1.worker.utils import (
-    num_attn_module as rbln_num_attn_module,
 )
 
 logger = init_logger(__name__)
@@ -356,9 +357,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         # Under replays_accepted_drafts, the last position of each request's previous
         # step: the recurrent state's block that step stored, which the next loads.
         self.state_pos_by_req: dict[str, int] = {}
-        # KV cache layer names in layer-index order; the deterministic
-        # ordering the KV connector relies on for region<->layer agreement.
+        # KV cache layer names in the deterministic order
+        # the KV connector relies on for region<->layer agreement.
         self.kv_cache_names: list[str] = []
+        self.kv_cache_positions: dict[str, int] = {}
         self.kv_cache_allocations: dict[tuple, str] = {}
         self.fixed_kv_cache_tensors: dict[str, torch.Tensor] = {}
         # Initialize in initialize_kv_cache_tensors
@@ -391,6 +393,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 self.drafter = RBLNMedusaProposer(self.vllm_config, self.device)
             elif self.speculative_config.method == "dflash":
                 self.drafter = RBLNDFlashProposer(self.vllm_config, self.device, self)
+            elif self.speculative_config.use_gemma4_mtp():
+                self.drafter = RBLNGemma4Proposer(self.vllm_config, self.device, self)
             elif self.speculative_config.use_eagle():
                 self.drafter = RBLNEagleProposer(self.vllm_config, self.device, self)
             else:
@@ -1270,10 +1274,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     defer_staging=defer_staging,
                 )
 
+                self.bind_kv_cache_to_metadata(attn_metadata_i)
                 for layer_name in attn_group.layer_names:
                     attn_metadata[layer_name] = attn_metadata_i
-
-        self._attach_kv_cache_bindings(attn_metadata)
 
         return attn_metadata, spec_decode_common_attn_metadata
 
@@ -1609,8 +1612,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     "--mm-processor-kwargs."
                 )
             # TODO(RBLN): the drafter's builders get no row ends, so its sliding
-            # layers would run the ranges causally.
-            if self.speculative_config is not None:
+            # layers would run the ranges causally. A Gemma4 MTP assistant only
+            # queries the target's last position, which no range runs past.
+            spec = self.speculative_config
+            if spec is not None and not spec.use_gemma4_mtp():
                 raise ValueError(
                     "Speculative decoding is not supported with multimodal inputs of "
                     "an mm prefix LM on RBLN yet."
@@ -1654,6 +1659,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         self,
         scheduler_output: RBLNSchedulerOutput,
         num_tokens: int,
+        shift_computed_tokens: int = 0,
     ) -> tuple[list[tuple[int, int, torch.Tensor]], torch.Tensor]:
         mm_rows: list[tuple[int, int, torch.Tensor]] = []
         is_mm = torch.zeros(num_tokens, dtype=torch.bool)
@@ -1662,7 +1668,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         for req_index, req_id in enumerate(self.input_batch.req_ids):
             num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
             req_state = self.requests[req_id]
-            num_computed_tokens = req_state.num_computed_tokens
+            num_computed_tokens = req_state.num_computed_tokens + shift_computed_tokens
 
             for mm_feature in req_state.mm_features:
                 pos_info = mm_feature.mm_position
@@ -2089,6 +2095,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             # pass so that partially cached blocks are populated.
             if scheduler_output.kv_cache_copy_ops:
                 self._process_kv_cache_copy_ops(scheduler_output.kv_cache_copy_ops)
+            if scheduler_output.kv_cache_block_copies:
+                self._copy_kv_cache_blocks(scheduler_output.kv_cache_block_copies)
 
             if not num_scheduled_tokens:
                 if not has_kv_transfer_group():
@@ -2226,7 +2234,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 num_tokens=num_query_tokens,
                 num_tokens_across_dp=num_tokens_across_dp,
                 num_padded_tokens=batch_desc.num_tokens_padded,
-                **build_kv_cache_forward_context_kwargs(self.kv_cache_bases),
+                **self.kv_cache_forward_context_kwargs(),
             ),
             record_function_or_nullcontext("rbln_model_runner: forward"),
             self.maybe_get_kv_connector_output(
@@ -2587,6 +2595,22 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 target_token_ids = self.input_ids[:total_num_tokens]
                 target_positions = self.positions[:total_num_tokens]
 
+            mm_kwargs: dict[str, Any] = {}
+            if self.supports_mm_inputs and self.drafter.supports_mm_inputs:
+                if self.is_prefill:
+                    mm_kwargs["mm_embed_inputs"] = self._gather_mm_embeddings(
+                        scheduler_output,
+                        target_token_ids.shape[0],
+                        shift_computed_tokens=(
+                            self.vllm_config.num_prefill_lookahead_tokens
+                        ),
+                    )
+                if self.drafter.uses_mrope:
+                    assert self.mrope_positions is not None
+                    mm_kwargs["target_mrope_positions"] = self.mrope_positions[
+                        :, : target_token_ids.shape[0]
+                    ]
+
             draft_token_ids = self.drafter.propose(
                 target_token_ids=target_token_ids,
                 target_positions=target_positions,
@@ -2594,8 +2618,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 next_token_ids=next_token_ids,
                 token_indices_to_sample=token_indices_to_sample,
                 common_attn_metadata=common_attn_metadata,
-                mm_embed_inputs=None,
                 num_rejected_tokens=num_rejected_tokens,
+                **mm_kwargs,
             )
 
         return draft_token_ids
@@ -3064,7 +3088,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             num_tokens=num_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
             num_padded_tokens=batch_desc.num_tokens_padded,
-            **build_kv_cache_forward_context_kwargs(self.kv_cache_bases),
+            **self.kv_cache_forward_context_kwargs(),
         ):
             _ = self.model_executable(
                 **staged_model_input.as_kwargs(), **self._dummy_mm_kwargs(layout)
@@ -3635,13 +3659,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             kv_cache_view_infos,
         )
 
-        num_attn_module = rbln_num_attn_module(
-            self.model_config, self.cache_config.cache_dtype
-        )
+        forward_context = self.compilation_config.static_forward_context
+        self.kv_cache_names = get_kv_cache_names(kv_caches)
+        self.kv_cache_positions = {
+            name: position for position, name in enumerate(self.kv_cache_names)
+        }
         self._update_kv_cache_base_bindings(
             kv_cache_bases_by_layer,
             kv_cache_view_infos,
-            num_attn_module,
         )
         if dynamic_kv_enabled(self.vllm_config) and self.kv_cache_bases:
             # With shared bases these are the graph inputs and the per-layer
@@ -3660,27 +3685,20 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 len(self.kv_cache_bases),
                 tuple(self.kv_cache_bases[0].shape),
             )
-        self.kv_cache_names = get_kv_cache_names(kv_caches, num_attn_module)
         self.kv_caches = [kv_caches[name] for name in self.kv_cache_names]
         # The runner owns the cache storage until sizing finishes. Rebuild keys
         # on allocation so addresses are never matched across cache generations.
         self.kv_cache_allocations = {}
-        for name, cache in zip(self.kv_cache_names, self.kv_caches):
-            if name in self.fixed_kv_cache_tensors:
+        for name, cache in zip(self.kv_cache_names, self.kv_caches, strict=True):
+            if (
+                name in self.fixed_kv_cache_tensors
+                or name in self.shared_kv_cache_layers
+            ):
                 continue
-            key = kv_cache_tensor_key(cache)
-            self.kv_cache_allocations.setdefault(key, name)
+            self.kv_cache_allocations.setdefault(kv_cache_tensor_key(cache), name)
         self.kv_cache_block_axes = block_axes
-        forward_context = self.compilation_config.static_forward_context
         for layer_name, kv_cache in kv_caches.items():
             forward_context[layer_name].kv_cache = kv_cache
-        # A layer reads the cache at its position in this list. The index set at
-        # construction assumes `num_attn_module` caches per layer, which a layer
-        # owning fewer (a MiniMax-M3 dense layer has no indexer cache) breaks.
-        for position, layer_name in enumerate(self.kv_cache_names):
-            layer = forward_context[layer_name]
-            assert hasattr(layer, "layer_index"), layer_name
-            layer.layer_index = position
 
         if not use_device_tensor() and not self.model_config.enforce_eager:
             # `mark_static_address` is last-write-wins on storage->name. Pin to
@@ -3722,9 +3740,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             assert isinstance(spec, RBLNBlockAuxSpec), spec
             assert spec.owner in extent_of, f"{layer_name}: no owner {spec.owner}"
             if spec.verify_only and self.is_strict_kv_producer:
-                # No graph a strict producer compiles places it. Its module's
-                # construction-time layer_index could name another layer's cache.
-                module.layer_index = None
+                # Strict KV producers skip allocating verification-only caches.
                 continue
             shape = (num_blocks, *spec.block_shape)
             kind = (spec.owner, shape, spec.dtype)
@@ -4001,18 +4017,19 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             and not ec_config.is_ec_producer
         )
 
-    def _attach_kv_cache_bindings(
-        self, attn_metadata: PerLayerAttnMetadata | None
+    def bind_kv_cache_to_metadata(
+        self, attn_metadata: RBLNFlashAttentionMetadata | RBLNGDNAttentionMetadata
     ) -> None:
-        if attn_metadata is None:
-            return
-        for attn_metadatum in attn_metadata.values():
-            attach_kv_cache_bindings(
-                attn_metadatum,
-                self.kv_caches,
-                self.kv_cache_bases,
-                self.kv_cache_view_infos,
-            )
+        attach_kv_cache_bindings(
+            attn_metadata,
+            self.kv_caches,
+            self.kv_cache_bases,
+            self.kv_cache_view_infos,
+            kv_cache_positions=self.kv_cache_positions,
+        )
+
+    def kv_cache_forward_context_kwargs(self) -> dict[str, tuple[torch.Tensor, ...]]:
+        return build_kv_cache_forward_context_kwargs(self.kv_cache_bases)
 
     def _determine_batch_execution_and_padding(
         self,
@@ -4080,7 +4097,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         self,
         kv_cache_bases_by_layer: dict[str, torch.Tensor],
         kv_cache_view_infos_by_layer: dict[str, KVCacheViewInfo],
-        num_attn_module: int,
     ) -> None:
         if not kv_cache_view_infos_by_layer:
             self.kv_cache_bases = []
@@ -4090,7 +4106,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         kv_cache_bases, kv_cache_view_infos = build_kv_cache_base_bindings(
             kv_cache_bases_by_layer,
             kv_cache_view_infos_by_layer,
-            num_attn_module=num_attn_module,
+            layer_names=self.kv_cache_names,
         )
         # If no deduplication occurred (each layer has its own unique base),
         # the new system adds overhead without benefit — disable it.
@@ -4365,6 +4381,29 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             direction,
             block_axes=self.kv_cache_block_axes,
         )
+
+    def _copy_kv_cache_blocks(self, copies: list[KVCacheBlockCopy]) -> None:
+        """Upstream's copy-on-write of a block a partial prefix hit privatizes.
+
+        A copy names a block, not its group, and every group indexes the one
+        block pool, so each cache copies the page; a page another group owns is
+        unused by its own group there.
+        """
+        assert use_device_tensor() or self.model_config.enforce_eager
+        dsts: list[torch.Tensor] = []
+        srcs: list[torch.Tensor] = []
+        seen: set[int] = set()
+        for layer_name, kv_cache in zip(
+            self.kv_cache_names, self.kv_caches, strict=True
+        ):
+            if kv_cache.data_ptr() in seen:
+                continue
+            seen.add(kv_cache.data_ptr())
+            axis = self.kv_cache_block_axes[layer_name]
+            for block_copy in copies:
+                dsts.append(kv_cache.select(axis, block_copy.dst_block_id))
+                srcs.append(kv_cache.select(axis, block_copy.src_block_id))
+        torch._foreach_copy_(dsts, srcs)
 
     def _process_kv_cache_copy_ops(
         self,

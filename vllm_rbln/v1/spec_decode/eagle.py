@@ -33,11 +33,10 @@ from vllm_rbln.compilation import (
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.logger import init_logger
-from vllm_rbln.platform import use_device_tensor
-from vllm_rbln.v1.attention.kv_cache_bindings import (
-    attach_kv_cache_bindings,
-    build_kv_cache_forward_context_kwargs,
+from vllm_rbln.model_executor.models.interfaces import (
+    supports_rbln_multimodal_embeddings,
 )
+from vllm_rbln.platform import use_device_tensor
 from vllm_rbln.v1.spec_decode.utils import (
     eagle_prepare_inputs_padded,
     eagle_prepare_next_token_padded,
@@ -72,9 +71,7 @@ class RBLNEagleProposer(EagleProposer):
         super().__init__(vllm_config, torch.device("cpu"), runner)
         self.device = device
         if self.uses_mrope:
-            # The parent keeps M-RoPE positions only. A draft here is text-only
-            # (`load_model` refuses multimodal embeddings), where the M-RoPE
-            # dimensions are identical, so it runs on one row as the runner does.
+            # Cache addresses follow token offsets independently of M-RoPE.
             self.positions = torch.zeros(self.max_positions, dtype=torch.int64)
 
         if self.needs_extra_input_slots:
@@ -104,8 +101,10 @@ class RBLNEagleProposer(EagleProposer):
         next_token_ids: torch.Tensor,
         token_indices_to_sample: torch.Tensor | None,
         common_attn_metadata: CommonAttentionMetadata,
-        mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+        mm_embed_inputs: tuple[list[tuple[int, int, torch.Tensor]], torch.Tensor]
+        | None = None,
         num_rejected_tokens: torch.Tensor | None = None,
+        target_mrope_positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # NOTE(RBLN): combine_hidden_states in eagle3 is fused
         # into the target model graph.
@@ -137,12 +136,7 @@ class RBLNEagleProposer(EagleProposer):
                 back_pad=self.runner.decode_back_pad,
                 is_prompt_sorted=self.runner.sort_batch_by_length,
             )
-            attach_kv_cache_bindings(
-                attn_metadata,
-                self.runner.kv_caches,
-                self.runner.kv_cache_bases,
-                self.runner.kv_cache_view_infos,
-            )
+            self.runner.bind_kv_cache_to_metadata(attn_metadata)
             for layer_name in attn_group.layer_names:
                 per_layer_attn_metadata[layer_name] = attn_metadata
 
@@ -157,6 +151,7 @@ class RBLNEagleProposer(EagleProposer):
                 token_indices_to_sample=token_indices_to_sample,
                 target_token_ids=target_token_ids,
                 next_token_ids=next_token_ids,
+                mrope_positions=target_mrope_positions,
             )
         )
         inputs_embeds = None
@@ -167,7 +162,7 @@ class RBLNEagleProposer(EagleProposer):
             num_tokens=num_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
             num_padded_tokens=num_padded_tokens,
-            **build_kv_cache_forward_context_kwargs(self.runner.kv_cache_bases),
+            **self.runner.kv_cache_forward_context_kwargs(),
         ):
             hidden_states, draft_ids = self.model_executable(
                 input_ids=input_ids,
@@ -175,6 +170,7 @@ class RBLNEagleProposer(EagleProposer):
                 hidden_states=hidden_states,
                 inputs_embeds=inputs_embeds,
                 token_indices_to_sample=token_indices_to_sample_padded,
+                **self._stage_mm_inputs(input_ids, is_prefill, mm_embed_inputs),
             )
 
         # A strict producer never verifies a draft, and has no decoding peer to
@@ -198,6 +194,11 @@ class RBLNEagleProposer(EagleProposer):
             return draft_ids.new_zeros((num_reqs, self.num_speculative_tokens))
 
         positions = target_positions[token_indices_to_sample]
+        mrope_positions = (
+            target_mrope_positions[:, token_indices_to_sample]
+            if target_mrope_positions is not None
+            else None
+        )
 
         # `hidden_states` is deliberately not gathered here -- #821 moved
         # that gather inside `model_wrapper`. Doing it again would index an
@@ -243,6 +244,8 @@ class RBLNEagleProposer(EagleProposer):
         for token_index in range(self.num_speculative_tokens - 1):
             self.input_ids[:num_reqs] = draft_token_ids_list[-1].int()
             positions = positions.view(-1) + 1
+            if mrope_positions is not None:
+                mrope_positions = (mrope_positions[:1] + 1).expand_as(mrope_positions)
 
             exceeds_max_model_len = positions[:num_reqs] >= self.max_model_len
             common_attn_metadata.seq_lens += 1
@@ -257,12 +260,7 @@ class RBLNEagleProposer(EagleProposer):
                     batch_pad=num_reqs_padded,
                     is_prompt_sorted=self.runner.sort_batch_by_length,
                 )
-                attach_kv_cache_bindings(
-                    attn_metadata,
-                    self.runner.kv_caches,
-                    self.runner.kv_cache_bases,
-                    self.runner.kv_cache_view_infos,
-                )
+                self.runner.bind_kv_cache_to_metadata(attn_metadata)
                 for layer_name in attn_group.layer_names:
                     per_layer_attn_metadata[layer_name] = attn_metadata
 
@@ -274,6 +272,7 @@ class RBLNEagleProposer(EagleProposer):
                     positions[:num_reqs],
                     hidden_states[:num_reqs],
                     is_prefill=False,
+                    mrope_positions=mrope_positions,
                 )
             )
 
@@ -284,7 +283,7 @@ class RBLNEagleProposer(EagleProposer):
                 num_tokens=num_reqs,
                 num_tokens_across_dp=num_tokens_across_dp,
                 num_padded_tokens=num_padded_tokens,
-                **build_kv_cache_forward_context_kwargs(self.runner.kv_cache_bases),
+                **self.runner.kv_cache_forward_context_kwargs(),
             ):
                 hidden_states, draft_ids = self.model_executable(
                     input_ids=staged_input_ids,
@@ -404,9 +403,19 @@ class RBLNEagleProposer(EagleProposer):
 
     def load_model(self, target_model: nn.Module) -> None:
         super().load_model(target_model)
-        if self.supports_mm_inputs:
+        if self.supports_mm_inputs and not supports_rbln_multimodal_embeddings(
+            self.model
+        ):
             raise NotImplementedError(
-                "vllm-rbln does not pass multimodal embeddings to the drafter yet."
+                "The draft model must declare supports_rbln_multimodal_embeddings=True "
+                "to use external multimodal embeddings on RBLN."
+            )
+        if (
+            self.supports_mm_inputs
+            and self.vllm_config.parallel_config.pipeline_parallel_size != 1
+        ):
+            raise NotImplementedError(
+                "Multimodal drafting requires pipeline_parallel_size=1."
             )
 
         self.draft_id_to_target_id = getattr(self.model, "draft_id_to_target_id", None)
@@ -426,7 +435,15 @@ class RBLNEagleProposer(EagleProposer):
             hidden_states: torch.Tensor,
             token_indices_to_sample: torch.Tensor | None = None,
             inputs_embeds: torch.Tensor | None = None,
+            mm_embeds: torch.Tensor | None = None,
+            mm_mask: torch.Tensor | None = None,
         ):
+            if mm_embeds is not None:
+                assert mm_mask is not None
+                inputs_embeds = torch.where(
+                    mm_mask > 0.5, mm_embeds, self.model.embed_input_ids(input_ids)
+                )
+                input_ids = None
             ret_hidden_states = self.model(
                 input_ids=input_ids,
                 positions=positions,
@@ -436,11 +453,16 @@ class RBLNEagleProposer(EagleProposer):
             if not self.model_returns_tuple():
                 last_hidden_states = ret_hidden_states
                 hidden_states = last_hidden_states
+                # Only a tuple-returning drafter (Gemma4 MTP) samples narrower.
+                assert last_hidden_states.shape[-1] == self.hidden_size
             else:
                 last_hidden_states, hidden_states = ret_hidden_states
 
             hidden_states = hidden_states.view(-1, self.hidden_size)
-            sample_hidden_states = last_hidden_states.view(-1, self.hidden_size)
+            # Gemma4 MTP samples from its own, narrower hidden states.
+            sample_hidden_states = last_hidden_states.view(
+                -1, last_hidden_states.shape[-1]
+            )
 
             if token_indices_to_sample is not None:
                 hidden_states = hidden_states[token_indices_to_sample]
@@ -469,25 +491,27 @@ class RBLNEagleProposer(EagleProposer):
             # the logits too.
             return hidden_states, torch.ops.rbln.argmax(logits)
 
-        rbln_config: RBLNConfig = self.vllm_config.additional_config
+        self.model_executable = self._compile_drafter(model_wrapper)
+
+    def _compile_drafter(self, fn):
         if self.vllm_config.speculative_config.enforce_eager:
-            self.model_executable = model_wrapper
-        else:
-            self.model_executable = compile(
-                model_wrapper,
-                dynamic=False,
-                fullgraph=True,
-                compile_context=self.runner.compile_context,
-                num_devices=1,
-                model_trace_method="export" if use_device_tensor() else "",
-                process_group_dict=build_process_group_dict(),
-                guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
-                runtime_holder=self.runner.runtime_holder,
-                mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
-                use_static_output=True,
-                use_direct_dispatch=True,
-                dtype=rbln_config.compile_dtype,
-            )
+            return fn
+        rbln_config: RBLNConfig = self.vllm_config.additional_config
+        return compile(
+            fn,
+            dynamic=False,
+            fullgraph=True,
+            compile_context=self.runner.compile_context,
+            num_devices=1,
+            model_trace_method="export" if use_device_tensor() else "",
+            process_group_dict=build_process_group_dict(),
+            guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
+            runtime_holder=self.runner.runtime_holder,
+            mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
+            use_static_output=True,
+            use_direct_dispatch=True,
+            dtype=rbln_config.compile_dtype,
+        )
 
     def _build_dummy_attn_metadata(
         self,
@@ -564,12 +588,7 @@ class RBLNEagleProposer(EagleProposer):
                 batch_pad=num_reqs_padded,
                 is_prompt_sorted=self.runner.sort_batch_by_length,
             )
-            attach_kv_cache_bindings(
-                attn_metadata,
-                self.runner.kv_caches,
-                self.runner.kv_cache_bases,
-                self.runner.kv_cache_view_infos,
-            )
+            self.runner.bind_kv_cache_to_metadata(attn_metadata)
             for layer_name in attn_group.layer_names:
                 per_layer_attn_metadata[layer_name] = attn_metadata
 
@@ -585,6 +604,11 @@ class RBLNEagleProposer(EagleProposer):
                 self.hidden_states[:num_tokens],
                 is_prefill=is_prefill,
                 token_indices_to_sample=token_indices_to_sample,
+                mrope_positions=(
+                    self.mrope_positions[:, :num_tokens]
+                    if self.supports_mm_inputs and self.uses_mrope
+                    else None
+                ),
             )
         )
         inputs_embeds = None
@@ -595,7 +619,7 @@ class RBLNEagleProposer(EagleProposer):
             num_tokens=num_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
             num_padded_tokens=num_padded_tokens,
-            **build_kv_cache_forward_context_kwargs(self.runner.kv_cache_bases),
+            **self.runner.kv_cache_forward_context_kwargs(),
         ):
             _, _ = self.model_executable(
                 input_ids=input_ids,
@@ -603,6 +627,7 @@ class RBLNEagleProposer(EagleProposer):
                 hidden_states=hidden_states,
                 inputs_embeds=inputs_embeds,
                 token_indices_to_sample=token_indices_to_sample_padded,
+                **self._stage_mm_inputs(input_ids, is_prefill),
             )
 
         if self.num_speculative_tokens == 1 or self.runner.is_strict_kv_producer:
@@ -632,12 +657,7 @@ class RBLNEagleProposer(EagleProposer):
                 batch_pad=num_reqs_padded,
                 is_prompt_sorted=self.runner.sort_batch_by_length,
             )
-            attach_kv_cache_bindings(
-                attn_metadata,
-                self.runner.kv_caches,
-                self.runner.kv_cache_bases,
-                self.runner.kv_cache_view_infos,
-            )
+            self.runner.bind_kv_cache_to_metadata(attn_metadata)
             for layer_name in attn_group.layer_names:
                 per_layer_attn_metadata[layer_name] = attn_metadata
 
@@ -648,6 +668,11 @@ class RBLNEagleProposer(EagleProposer):
             self.positions[:num_reqs],
             self.hidden_states[:num_reqs],
             is_prefill=False,
+            mrope_positions=(
+                self.mrope_positions[:, :num_reqs]
+                if self.supports_mm_inputs and self.uses_mrope
+                else None
+            ),
         )
 
         for _ in range(self.num_speculative_tokens - 1):
@@ -657,7 +682,7 @@ class RBLNEagleProposer(EagleProposer):
                 num_tokens=num_reqs,
                 num_tokens_across_dp=num_tokens_across_dp,
                 num_padded_tokens=num_padded_tokens,
-                **build_kv_cache_forward_context_kwargs(self.runner.kv_cache_bases),
+                **self.runner.kv_cache_forward_context_kwargs(),
             ):
                 _, _ = self.model_executable(
                     input_ids=input_ids,
@@ -713,6 +738,7 @@ class RBLNEagleProposer(EagleProposer):
         token_indices_to_sample: torch.Tensor | None = None,
         target_token_ids: torch.Tensor | None = None,
         next_token_ids: torch.Tensor | None = None,
+        mrope_positions: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         if target_token_ids is not None:
             assert next_token_ids is not None
@@ -723,7 +749,11 @@ class RBLNEagleProposer(EagleProposer):
             self.input_ids[token_indices_to_sample] = next_token_ids
 
         input_ids = self.input_ids[:num_input_tokens].view(num_reqs, -1)
-        positions = positions.view(-1)[:num_input_tokens].view(num_reqs, -1)
+        positions = (
+            positions.view(-1)[:num_input_tokens].view(num_reqs, -1)
+            if mrope_positions is None
+            else mrope_positions[:, :num_input_tokens].view(3, num_reqs, -1)
+        )
         hidden_states = hidden_states.view(-1, self.hidden_size)[
             :num_input_tokens
         ].view(num_reqs, -1, self.hidden_size)
@@ -753,3 +783,29 @@ class RBLNEagleProposer(EagleProposer):
             staged.hidden_states,
             staged.token_indices,
         )
+
+    def _stage_mm_inputs(
+        self,
+        input_ids: torch.Tensor,
+        is_prefill: bool,
+        mm_embed_inputs: tuple[list[tuple[int, int, torch.Tensor]], torch.Tensor]
+        | None = None,
+    ) -> dict[str, torch.Tensor]:
+        if not (self.supports_mm_inputs and is_prefill):
+            return {}
+        if mm_embed_inputs is None:
+            rows: list[tuple[int, int, torch.Tensor]] = []
+            mask = torch.zeros(*input_ids.shape, 1, dtype=self.dtype)
+        else:
+            rows, mask = mm_embed_inputs
+            mask = mask.view(input_ids.shape[0], -1, 1)
+        layout = InputLayout(
+            num_reqs=input_ids.shape[0],
+            num_reqs_padded=input_ids.shape[0],
+            query_len=mask.shape[1],
+            query_len_padded=input_ids.shape[1],
+        )
+        embeds, mask = self.input_stager.stage_mm_embeds(
+            rows, mask, self.inputs_embeds_size, layout
+        )
+        return {"mm_embeds": embeds, "mm_mask": mask}

@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for the RBLN sliding-window KV cache manager (v1/kv_cache.py): one
-physical block per request and prefix caching disabled, unlike the base."""
+"""Tests for the RBLN KV cache managers (v1/kv_cache.py): the sliding-window one
+holds one physical block per request with prefix caching disabled, and the Mamba
+one carries a prompt's block-boundary state across a P/D transfer."""
 
 from collections import defaultdict
 from types import SimpleNamespace
@@ -23,7 +24,16 @@ import torch
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
-from vllm_rbln.v1.kv_cache import RBLNSlidingWindowManager, RBLNSlidingWindowSpec
+import vllm_rbln.v1.kv_cache as kv_cache
+from tests.vllm.v1.core.utils import make_request
+from vllm_rbln.v1.kv_cache import (
+    REMOTE_STATE_BOUNDARY,
+    UNTRUNCATED_PROMPT_LENGTH,
+    RBLNMambaManager,
+    RBLNMambaSpec,
+    RBLNSlidingWindowManager,
+    RBLNSlidingWindowSpec,
+)
 
 
 class TestDeepseekV4PrefixState:
@@ -477,3 +487,211 @@ class TestCoordinatorCallsTheOverrides:
         coord.allocate_new_blocks("r", num_tokens=1024, num_tokens_main_model=1024)
         coord.remove_skipped_blocks("r", 512, 1024)
         assert len(coord.single_type_managers[0].req_to_blocks["r"]) == 1
+
+
+class TestRBLNMambaManager:
+    """An align-mode hybrid driven through the coordinator: block 16, a 40-token
+    prompt, so the last boundary state sits in block 1 and the running one in 2."""
+
+    BLOCK = 16
+
+    def _coordinator(self, num_blocks=32, use_eagle=False):
+        from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
+        from vllm.v1.core.single_type_kv_cache_manager import (
+            register_all_kvcache_specs,
+        )
+        from vllm.v1.kv_cache_interface import (
+            FullAttentionSpec,
+            KVCacheConfig,
+            KVCacheGroupSpec,
+            KVCacheTensor,
+        )
+
+        from vllm_rbln.platform import RblnPlatform
+
+        register_all_kvcache_specs(None)
+        RblnPlatform.register_custom_kv_cache_specs(None)
+        full = FullAttentionSpec(
+            block_size=self.BLOCK, num_kv_heads=1, head_size=4, dtype=torch.float16
+        )
+        state = RBLNMambaSpec(
+            block_size=self.BLOCK,
+            shapes=((16, 16),),
+            dtypes=(torch.uint8,),
+            mamba_cache_mode="align",
+        )
+        assert full.page_size_bytes == state.page_size_bytes
+        page = full.page_size_bytes
+        config = KVCacheConfig(
+            num_blocks=num_blocks,
+            kv_cache_tensors=[
+                KVCacheTensor(
+                    size=page * num_blocks,
+                    layers=[layer],
+                    layer_stride=page * num_blocks,
+                    block_stride=page,
+                )
+                for layer in ("attn", "state")
+            ],
+            kv_cache_groups=[
+                KVCacheGroupSpec(["attn"], full),
+                KVCacheGroupSpec(["state"], state),
+            ],
+            # CacheConfig's default, which keeps only the reachable boundaries.
+            prefix_cache_retention_interval=0,
+        )
+        coord = get_kv_cache_coordinator(
+            kv_cache_config=config,
+            max_model_len=self.BLOCK * 32,
+            max_in_flight_tokens=512,
+            use_eagle=use_eagle,
+            enable_caching=True,
+            enable_kv_cache_events=False,
+            dcp_world_size=1,
+            pcp_world_size=1,
+            scheduler_block_size=self.BLOCK,
+            hash_block_size=self.BLOCK,
+        )
+        assert isinstance(coord.single_type_managers[1], RBLNMambaManager)
+        return coord
+
+    def _request(self, request_id, params, num_tokens=40):
+        request = make_request(request_id, list(range(num_tokens)), self.BLOCK)
+        request.kv_transfer_params = params
+        return request
+
+    def _producer_params(self, num_prompt_tokens=40):
+        return {"do_remote_decode": True, UNTRUNCATED_PROMPT_LENGTH: num_prompt_tokens}
+
+    @pytest.mark.parametrize("producer", [True, False])
+    def test_producer_keeps_the_last_boundary_state(self, producer):
+        coord = self._coordinator()
+        state = coord.single_type_managers[1]
+        request = self._request("p", self._producer_params() if producer else None)
+        state.track_transfer(request, 0, 0)
+        for computed, end in ((0, 16), (16, 32), (32, 36), (36, 40)):
+            coord.remove_skipped_blocks("p", computed, 40)
+            coord.allocate_new_blocks("p", end, end)
+
+        blocks = state.req_to_blocks["p"]
+        assert blocks[0].is_null and not blocks[2].is_null
+        assert blocks[1].is_null is not producer
+
+    @pytest.mark.parametrize(
+        ("boundary", "cached"), [(32, True), (None, False), (16, False)]
+    )
+    def test_consumer_receives_and_caches_the_boundary_state(self, boundary, cached):
+        coord = self._coordinator()
+        state = coord.single_type_managers[1]
+        params = {"do_remote_prefill": True}
+        if boundary is not None:
+            params[REMOTE_STATE_BOUNDARY] = boundary
+        request = self._request("d", params)
+        num_external = 39
+        state.track_transfer(request, 0, num_external)
+
+        num_free = coord.block_pool.get_num_free_blocks()
+        num_to_allocate = coord.get_num_blocks_to_allocate(
+            request_id="d",
+            num_tokens=num_external,
+            new_computed_blocks=([], []),
+            num_encoder_tokens=0,
+            total_computed_tokens=num_external,
+            num_local_computed_tokens=0,
+            num_tokens_main_model=num_external,
+        )
+        coord.allocate_new_computed_blocks("d", ([], []), 0, num_external)
+        coord.allocate_new_blocks("d", num_external, num_external)
+        assert num_free - coord.block_pool.get_num_free_blocks() == num_to_allocate
+
+        blocks = state.req_to_blocks["d"]
+        assert [b.is_null for b in blocks] == [True, not cached, False]
+        coord.cache_blocks(request, num_external)
+        _, hit_length, _ = coord.find_longest_cache_hit(request.block_hashes, 39)
+        assert hit_length == (32 if cached else 0)
+
+    @pytest.mark.parametrize(
+        ("num_local", "num_external"),
+        [
+            # Re-admitted once its KV has arrived: nothing more is received.
+            (0, 0),
+            # A local prefix hit already reaches the boundary.
+            (32, 7),
+        ],
+    )
+    def test_consumer_notes_no_block_it_will_not_receive(
+        self, monkeypatch, num_local, num_external
+    ):
+        state = self._coordinator().single_type_managers[1]
+        warnings = []
+        monkeypatch.setattr(kv_cache.logger, "warning", lambda *a: warnings.append(a))
+        request = self._request(
+            "d", {"do_remote_prefill": True, REMOTE_STATE_BOUNDARY: 32}
+        )
+        # Left by an earlier admission attempt whose allocation failed.
+        state._received_boundary["d"] = 1
+
+        state.track_transfer(request, num_local, num_external)
+
+        assert "d" not in state._received_boundary
+        assert not warnings
+
+    def test_freeing_a_producer_request_drops_its_kept_boundary(self):
+        coord = self._coordinator()
+        state = coord.single_type_managers[1]
+        state.track_transfer(self._request("p", self._producer_params()), 0, 0)
+        coord.allocate_new_blocks("p", 16, 16)
+        assert state._kept_boundary == {"p": 1}
+
+        coord.free("p")
+
+        assert state._kept_boundary == {}
+
+    # The producer holds the prompt less its last token, while a repeat looks
+    # up from the whole prompt: a 49-token one hits 32, not 16.
+    @pytest.mark.parametrize(("num_prompt_tokens", "kept"), [(40, 0), (49, 1)])
+    def test_an_eagle_producer_keeps_the_state_before_the_drop(
+        self, num_prompt_tokens, kept
+    ):
+        coord = self._coordinator(use_eagle=True)
+        state = coord.single_type_managers[1]
+        num_tokens = num_prompt_tokens - 1
+        request = self._request(
+            "p", self._producer_params(num_prompt_tokens), num_tokens
+        )
+        state.track_transfer(request, 0, 0)
+        for computed in range(0, num_tokens, self.BLOCK):
+            end = min(computed + self.BLOCK, num_tokens)
+            coord.remove_skipped_blocks("p", computed, num_tokens)
+            coord.allocate_new_blocks("p", end, end)
+
+        assert state._kept_boundary == {"p": kept}
+        assert not state.req_to_blocks["p"][kept].is_null
+
+    @pytest.mark.parametrize(
+        ("num_prompt_tokens", "boundary", "cached"),
+        [(40, 16, True), (40, 32, False), (49, 32, True), (49, 16, False)],
+    )
+    def test_an_eagle_consumer_caches_the_state_before_the_drop(
+        self, num_prompt_tokens, boundary, cached
+    ):
+        coord = self._coordinator(use_eagle=True)
+        state = coord.single_type_managers[1]
+        request = self._request(
+            "d",
+            {"do_remote_prefill": True, REMOTE_STATE_BOUNDARY: boundary},
+            num_prompt_tokens,
+        )
+        num_external = num_prompt_tokens - 1
+        state.track_transfer(request, 0, num_external)
+        coord.allocate_new_computed_blocks("d", ([], []), 0, num_external)
+        coord.allocate_new_blocks("d", num_external, num_external)
+
+        blocks = state.req_to_blocks["d"]
+        boundary_slot = boundary // self.BLOCK - 1
+        assert blocks[boundary_slot].is_null is not cached
+        coord.cache_blocks(request, num_external)
+        _, hit_length, _ = coord.find_longest_cache_hit(
+            request.block_hashes, num_external
+        )
+        assert hit_length == (boundary if cached else 0)

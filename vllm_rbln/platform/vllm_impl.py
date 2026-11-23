@@ -261,27 +261,6 @@ def _validate(vllm_config: "VllmConfig") -> None:
             f"num_speculative_tokens={spec.num_speculative_tokens}."
         )
 
-    cache_config = vllm_config.cache_config
-    if cache_config.enable_prefix_caching and _keeps_recurrent_state(vllm_config):
-        if (
-            cache_config.user_specified_mamba_block_size
-            and cache_config.mamba_block_size != cache_config.block_size
-        ):
-            raise ValueError(
-                "Prefix caching keeps a recurrent state a KV block on RBLN; "
-                f"got --mamba-block-size {cache_config.mamba_block_size} and "
-                f"--block-size {cache_config.block_size}."
-            )
-        if (
-            cache_config.prefix_match_unit is not None
-            and cache_config.prefix_match_unit < cache_config.block_size
-        ):
-            raise ValueError(
-                "Prefix caching with a recurrent state hits whole KV blocks only on "
-                f"RBLN; got --prefix-match-unit {cache_config.prefix_match_unit} "
-                f"below --block-size {cache_config.block_size}."
-            )
-
     # Upstream turns chunked prefill off for an engine without a KV cache, such
     # as an encoder-only instance, then validates the config again in EngineCore.
     if not (scheduler_config.enable_chunked_prefill or vllm_config.is_mm_encoder_only):
@@ -372,6 +351,28 @@ def _validate(vllm_config: "VllmConfig") -> None:
     # Resolved here so the scheduler and runner read one value, and compute_hash,
     # which runs after this, keys "unset" and "set to the budget" alike.
     rbln_config.prefill_chunk_size = chunks
+
+    cache_config = vllm_config.cache_config
+    if cache_config.enable_prefix_caching and _keeps_recurrent_state(vllm_config):
+        if (
+            cache_config.user_specified_mamba_block_size
+            and cache_config.mamba_block_size != block_size
+        ):
+            raise ValueError(
+                "Prefix caching keeps a recurrent state a KV block on RBLN; "
+                f"got --mamba-block-size {cache_config.mamba_block_size} and "
+                f"--block-size {block_size}."
+            )
+        # A hit below the block reads the state a step stored at the prompt's
+        # last unit boundary, and a step stores one only where it ends.
+        unit = cache_config.prefix_match_unit
+        if unit is not None and unit < block_size and unit % max(chunks):
+            raise ValueError(
+                "Prefix caching with a recurrent state hits a whole KV block or a "
+                "multiple of the prefill chunk on RBLN; got "
+                f"--prefix-match-unit {unit}, --block-size {block_size}, "
+                f"prefill_chunk_size={chunks}."
+            )
 
     if envs.VLLM_RBLN_COMPILE_ONLY and envs.VLLM_DISABLE_COMPILE_CACHE:
         # Compile-only compiles each graph and writes the .rbln artifact to

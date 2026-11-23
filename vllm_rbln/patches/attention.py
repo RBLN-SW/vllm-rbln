@@ -14,7 +14,7 @@
 from typing import TYPE_CHECKING, Any
 
 import torch
-from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.layers.attention.kv_transfer_utils import (
@@ -37,34 +37,11 @@ from vllm_rbln.v1.attention.backends.flash_attention import (
 from vllm_rbln.v1.attention.backends.gdn_attn import RBLNGDNAttentionMetadata
 from vllm_rbln.v1.attention.kv_cache_bindings import materialize_kv_cache_view
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
-from vllm_rbln.v1.worker.utils import (
-    num_attn_module as rbln_num_attn_module,
-)
-from vllm_rbln.v1.worker.utils import (
-    pipeline_adjusted_layer_index,
-)
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention import MLAAttention
 
-attention_original_init = Attention.__init__
 attention_original_forward = Attention.forward
-
-
-def _record_pipeline_layer_index(self: "Attention | MLAAttention") -> None:
-    vllm_config = get_current_vllm_config()
-    model_config = vllm_config.model_config
-    num_attn_module = (
-        rbln_num_attn_module(model_config, vllm_config.cache_config.cache_dtype)
-        if model_config is not None
-        else 1
-    )
-    self.layer_index = pipeline_adjusted_layer_index(
-        self.layer_name,
-        model_config,
-        vllm_config.parallel_config,
-        num_attn_module,
-    )
 
 
 # NOTE(RBLN) - To represent kv cache as model input,
@@ -74,23 +51,22 @@ def _record_pipeline_layer_index(self: "Attention | MLAAttention") -> None:
 # embedded kv cache.
 def _resolve_kv_cache(
     attn_metadata: RBLNFlashAttentionMetadata | RBLNGDNAttentionMetadata,
-    layer_index: int,
+    cache_name: str,
 ) -> torch.Tensor:
     """Resolve the KV cache for a given layer, either from deduplicated
     base tensors (for torch.export compatibility) or from the direct list."""
+    position = attn_metadata.kv_cache_positions[cache_name]
     kv_cache_view_infos = getattr(attn_metadata, "kv_cache_view_infos", None)
     forward_context = get_forward_context()
     additional_kwargs = getattr(forward_context, "additional_kwargs", {}) or {}
     kv_cache_bases = additional_kwargs.get("kv_cache_bases")
     if kv_cache_bases and kv_cache_view_infos:
-        assert layer_index < len(kv_cache_view_infos)
-        return materialize_kv_cache_view(
-            kv_cache_bases, kv_cache_view_infos[layer_index]
-        )
+        assert position < len(kv_cache_view_infos)
+        return materialize_kv_cache_view(kv_cache_bases, kv_cache_view_infos[position])
 
     assert attn_metadata.kv_caches is not None
-    assert layer_index < len(attn_metadata.kv_caches)
-    return attn_metadata.kv_caches[layer_index]
+    assert position < len(attn_metadata.kv_caches)
+    return attn_metadata.kv_caches[position]
 
 
 @register_patch(
@@ -178,7 +154,7 @@ def _unified_attention_with_output(
     # NOTE(RBLN) - To represent kv cache as model input, resolve it from
     # attention metadata here (a graph input) instead of using the attention
     # layer's embedded kv cache (self.kv_cache, a baked module attribute).
-    kv_cache = _resolve_kv_cache(attn_metadata, attn.layer_index)
+    kv_cache = _resolve_kv_cache(attn_metadata, layer_name)
     attn.impl.forward(
         attn,
         query,
@@ -225,21 +201,6 @@ def patched_attention_forward(
         output = attention_original_forward(self, query, key, value, output_shape)
         return output.view(output_shape)
     return attention_original_forward(self, query, key, value, output_shape)
-
-
-@register_patch(
-    target="vllm.model_executor.layers.attention.attention.Attention.__init__",
-    reason=(
-        "RBLN needs Attention initialization to record a pipeline-adjusted "
-        "layer index so external KV-cache bindings can resolve the matching "
-        "per-layer cache tensor."
-    ),
-)
-def patched_attention_init(self: Attention, *args, **kwargs) -> None:
-    attention_original_init(self, *args, **kwargs)
-
-    # NOTE(RBLN): Layer index is required to use external binding KV cache.
-    _record_pipeline_layer_index(self)
 
 
 @register_patch(

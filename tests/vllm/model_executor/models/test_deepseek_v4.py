@@ -343,6 +343,42 @@ def test_ring_capacity_preserves_history_across_rejected_drafts(history, drafts)
         assert rows == history
 
 
+def test_cache_inputs_use_names_in_the_rank_local_cache_order():
+    from vllm.config import set_current_vllm_config
+
+    from tests.vllm.vllm_config import make_vllm_config
+    from vllm_rbln.forward_context import set_forward_context
+    from vllm_rbln.model_executor.models.deepseek_v4 import (
+        RBLNDeepseekV4AuxCache,
+        RBLNDeepseekV4PagedCache,
+        RBLNDeepseekV4RingCache,
+    )
+    from vllm_rbln.v1.attention.backends.flash_attention import (
+        RBLNFlashAttentionMetadata,
+    )
+
+    config = make_vllm_config()
+    prefix = "model.layers.12.self_attn.attn"
+    with set_current_vllm_config(config):
+        ring = RBLNDeepseekV4RingCache(f"{prefix}.0", 128, 768, torch.uint8)
+        paged = RBLNDeepseekV4PagedCache(f"{prefix}.2", 4, 128, torch.float8_e4m3fn)
+        scale = RBLNDeepseekV4AuxCache(f"{prefix}.3", paged, torch.bfloat16)
+    caches = [torch.zeros(2, 64), torch.zeros(2, 64, 128), torch.zeros(2, 128, 768)]
+    metadata = RBLNFlashAttentionMetadata(
+        seq_lens=torch.tensor([[0]]),
+        block_tables=torch.tensor([[1]]),
+        is_prefill=True,
+        cache_seq_lens=torch.tensor([[0]]),
+        cache_offsets=torch.tensor([[4]]),
+        kv_caches=caches,
+        kv_cache_positions={scale.prefix: 0, paged.prefix: 1, ring.prefix: 2},
+    )
+    with set_forward_context({ring.prefix: metadata, paged.prefix: metadata}, config):
+        assert ring.inputs()[0] is caches[2]
+        assert paged.inputs()[0] is caches[1]
+        assert scale.inputs() is caches[0]
+
+
 @pytest.mark.parametrize("is_prefill", [False, True])
 def test_ring_metadata_keeps_one_slot_past_ring_boundaries(is_prefill):
     from tests.vllm.v1.attention.utils import make_builder, make_common_attn_metadata

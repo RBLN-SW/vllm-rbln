@@ -293,9 +293,7 @@ class RblnPlatform(Platform):
             # TODO(vllm-rbln>=0.14.0): delete the legacy chunk-size alias.
             if model_impl == "optimum" and self.max_num_batched_tokens is not None:
                 from vllm_rbln.config import build_optimum_rbln_config
-                from vllm_rbln.utils.optimum.configuration.runtime_config import (
-                    is_chunked_prefill_arch,
-                )
+                from vllm_rbln.utils.optimum.registry import is_chunked_prefill_arch
 
                 logger.warning_once(
                     "--max-num-batched-tokens (max_num_batched_tokens) on the "
@@ -421,11 +419,14 @@ class RblnPlatform(Platform):
 
     @classmethod
     def register_custom_kv_cache_specs(cls, vllm_config: "VllmConfig") -> None:
+        from vllm.v1.kv_cache_interface import MambaSpec
         from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
         from vllm_rbln.v1.attention.backends.deepseek_v4 import RBLNDeepseekV4StateSpec
         from vllm_rbln.v1.kv_cache import (
             RBLNDeepseekV4StateManager,
+            RBLNMambaManager,
+            RBLNMambaSpec,
             RBLNSlidingWindowManager,
             RBLNSlidingWindowSpec,
         )
@@ -439,6 +440,9 @@ class RblnPlatform(Platform):
             RBLNDeepseekV4StateSpec,
             RBLNDeepseekV4StateManager,
             uniform_type_base_spec=RBLNDeepseekV4StateSpec,
+        )
+        KVCacheSpecRegistry.register(
+            RBLNMambaSpec, RBLNMambaManager, uniform_type_base_spec=MambaSpec
         )
 
     @classmethod

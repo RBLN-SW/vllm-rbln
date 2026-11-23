@@ -22,6 +22,7 @@ from typing import Any
 
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
+from vllm.model_executor.model_loader.utils import get_model_architecture
 from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
@@ -46,7 +47,11 @@ from vllm_rbln.config import RBLNConfig
 from vllm_rbln.distributed.ec_transfer.ec_connector.rbln_ec_cpu_connector import (
     RblnECCPUConnector,
 )
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import iter_kv_connectors
 from vllm_rbln.logger import init_logger
+from vllm_rbln.model_executor.models.interfaces import (
+    supports_rbln_multimodal_embeddings,
+)
 from vllm_rbln.v1.core.rbln_kv_cache_manager import (
     KVCacheCopyOp,
     RBLNKVCacheManager,
@@ -60,7 +65,7 @@ from vllm_rbln.v1.core.utils import (
     should_defer_spec_step,
     sub_block_size_in_use,
 )
-from vllm_rbln.v1.kv_cache import RBLNDeepseekV4StateManager
+from vllm_rbln.v1.kv_cache import RBLNDeepseekV4StateManager, RBLNMambaManager
 
 logger = init_logger(__name__)
 
@@ -119,6 +124,44 @@ class RBLNScheduler(Scheduler):
             self.num_lookahead_tokens, self.num_spec_tokens
         )
 
+        self.mm_prefill_lookahead = 0
+        if (
+            self.num_prefill_lookahead
+            and self.vllm_config.model_config.supports_multimodal_inputs
+        ):
+            spec = self.vllm_config.speculative_config
+            assert spec is not None
+            draft_cls, _ = get_model_architecture(spec.draft_model_config)
+            if supports_rbln_multimodal_embeddings(draft_cls):
+                self.mm_prefill_lookahead = self.num_prefill_lookahead
+
+        if self.mm_prefill_lookahead:
+            if self.mm_prefill_lookahead != 1:
+                raise NotImplementedError(
+                    "Multimodal drafting requires num_prefill_lookahead_tokens=1; "
+                    f"got {self.mm_prefill_lookahead}. Multi-module multimodal "
+                    "MTP is not supported."
+                )
+            # One-token lookahead can add a whole encoder item to the baseline
+            # demand. Each allowance already fits the largest item, so doubling
+            # provides a conservative bound.
+            encoder_compute_budget = self.max_num_encoder_input_tokens
+            self.max_num_encoder_input_tokens *= 2
+            manager = self.encoder_cache_manager
+            self.encoder_cache_manager = manager.create_manager(
+                cache_size=2 * manager.cache_size, vllm_config=self.vllm_config
+            )
+            logger.info(
+                "Multimodal draft prefill lookahead=%d: "
+                "max_num_encoder_input_tokens=%d -> %d, "
+                "encoder_cache_size=%d -> %d (embedding rows).",
+                self.mm_prefill_lookahead,
+                encoder_compute_budget,
+                self.max_num_encoder_input_tokens,
+                manager.cache_size,
+                self.encoder_cache_manager.cache_size,
+            )
+
         rbln_config: RBLNConfig = self.vllm_config.additional_config
 
         prefill_chunk_sizes = rbln_config.prefill_chunk_size
@@ -143,6 +186,7 @@ class RBLNScheduler(Scheduler):
             self.kv_cache_manager = RBLNKVCacheManager(
                 kv_cache_config=self.kv_cache_config,
                 max_model_len=self.max_model_len,
+                max_in_flight_tokens=self.vllm_config.max_in_flight_tokens,
                 scheduler_block_size=self.block_size,
                 hash_block_size=self.hash_block_size,
                 sub_block_size=sub_block_size,
@@ -168,6 +212,13 @@ class RBLNScheduler(Scheduler):
                     "sub_block_size=%d.",
                     sub_block_size,
                 )
+        elif self.hash_block_size < self.block_size:
+            logger.info(
+                "Fine-grained prefix caching enabled: block_size=%d, "
+                "prefix_match_unit=%d",
+                self.block_size,
+                self.hash_block_size,
+            )
         elif (
             self.cache_config.enable_prefix_caching
             and rbln_config.enable_sub_block_cache
@@ -201,6 +252,27 @@ class RBLNScheduler(Scheduler):
 
         self._prefill_chunk_size = rbln_config.max_prefill_chunk_size
         self._is_mm_prefix_lm = self.vllm_config.model_config.is_mm_prefix_lm
+
+        # NOTE(RBLN): a prompt's block-boundary state is kept by a producer and
+        # allocated by a consumer only where the connector scheduler exchanges
+        # it (`sends_state_boundary`). The connector may sit in a MultiConnector.
+        sends_state_boundary = self.connector is not None and any(
+            getattr(
+                getattr(leaf, "connector_scheduler", None),
+                "sends_state_boundary",
+                False,
+            )
+            for leaf in iter_kv_connectors(self.connector)
+        )
+        self._state_transfer_managers = (
+            [
+                manager
+                for manager in self.kv_cache_manager.coordinator.single_type_managers
+                if isinstance(manager, RBLNMambaManager)
+            ]
+            if sends_state_boundary
+            else []
+        )
 
         # NOTE(RBLN): the sparse-attention ops (DSA MLA / indexer, MiniMax-M3
         # MSA / indexer, GLM5 MLA / indexer) and the dense in-memory ones
@@ -450,9 +522,7 @@ class RBLNScheduler(Scheduler):
                     request.num_computed_tokens,
                     num_new_tokens,
                     encoder_compute_budget,
-                    # NOTE(RBLN): the drafter takes no mm embeddings, so EAGLE needs
-                    # no shifted encoder window.
-                    shift_computed_tokens=0,
+                    shift_computed_tokens=self.mm_prefill_lookahead,
                 )
 
             if self.need_mamba_block_aligned_split:
@@ -866,9 +936,7 @@ class RBLNScheduler(Scheduler):
                             num_computed_tokens,
                             num_new_tokens,
                             encoder_compute_budget,
-                            # NOTE(RBLN): the drafter takes no mm
-                            # embeddings, so EAGLE needs no shifted encoder window.
-                            shift_computed_tokens=0,
+                            shift_computed_tokens=self.mm_prefill_lookahead,
                         )
                         if num_new_tokens == 0:
                             # The request cannot be scheduled.
@@ -915,6 +983,16 @@ class RBLNScheduler(Scheduler):
                     num_encoder_tokens = sum(
                         request.get_num_encoder_embeds(i)
                         for i in encoder_inputs_to_schedule
+                    )
+
+                # NOTE(RBLN): before the admission check and allocate_slots,
+                # whose get_num_blocks_to_allocate counts the boundary block
+                # noted here.
+                for manager in self._state_transfer_managers:
+                    manager.track_transfer(
+                        request,
+                        num_new_local_computed_tokens,
+                        num_external_computed_tokens,
                     )
 
                 new_blocks = None
@@ -1196,6 +1274,14 @@ class RBLNScheduler(Scheduler):
             else None
         )
 
+        kv_cache_block_copies, cow_retained_blocks = (
+            self.kv_cache_manager.take_kv_cache_block_copies()
+        )
+        if kv_cache_block_copies:
+            # The copies run with this step, the first non-empty one at or after
+            # it (seq sched_step_seq + 1).
+            self._free_cow_retained_blocks(cow_retained_blocks, self.sched_step_seq + 1)
+
         scheduler_output = RBLNSchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -1213,6 +1299,7 @@ class RBLNScheduler(Scheduler):
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
             has_sync_kv_loads=has_sync_kv_loads,
+            kv_cache_block_copies=kv_cache_block_copies or None,
         )
 
         # Drain pending copy ops from the KV cache manager.
@@ -1390,8 +1477,8 @@ class RBLNScheduler(Scheduler):
         )
 
     def _free_encoder_inputs(self, request: Request) -> None:
-        # NOTE(RBLN): upstream defers the free by the drafter's look-ahead, but
-        # the RBLN drafter reads no mm embeddings.
+        # Drafting finishes before the scheduler processes the step's output;
+        # retain each item until the target has also consumed it.
         if self.is_encoder_decoder:
             super()._free_encoder_inputs(request)
             return

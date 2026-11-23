@@ -32,7 +32,7 @@ from .qwen import (
 )
 
 MULTIMODAL_CONFIG_BUILDERS: dict[
-    str, Callable[[int, int, int, int, float, int | None], dict]
+    str, Callable[[int, int, int, int, dict[str, int | float], int | None], dict]
 ] = {
     "blip2": build_blip2_config,
     "exaone4_5": build_exaone4_5_config,
