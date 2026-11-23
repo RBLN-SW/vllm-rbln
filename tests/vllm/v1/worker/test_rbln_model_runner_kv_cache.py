@@ -33,7 +33,6 @@ from vllm_rbln.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     RBLNGDNBlockAuxCache,
     RBLNQwenGatedDeltaNetAttention,
 )
-from vllm_rbln.patches.attention import _resolve_kv_cache
 from vllm_rbln.v1.attention.backends.flash_attention import RBLNFlashAttentionMetadata
 from vllm_rbln.v1.attention.backends.gdn_attn import RBLNGDNAttentionMetadata
 from vllm_rbln.v1.attention.backends.glm5_next import RBLNGlm5NextIndexerBackend
@@ -41,6 +40,7 @@ from vllm_rbln.v1.attention.backends.mla.indexer import RBLNDeepseekV32IndexerBa
 from vllm_rbln.v1.attention.kv_cache_bindings import (
     kv_cache_tensor_key,
     materialize_kv_cache_view,
+    resolve_kv_cache,
 )
 from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
 
@@ -736,7 +736,7 @@ class TestCacheNameResolution:
         ):
             for name in cls.LAYERS:
                 expected = forward_context[name].kv_cache
-                actual = _resolve_kv_cache(metadata, name)
+                actual = resolve_kv_cache(metadata, name)
                 assert actual.shape == expected.shape
                 assert actual.stride() == expected.stride()
                 assert kv_cache_tensor_key(actual) == kv_cache_tensor_key(expected)

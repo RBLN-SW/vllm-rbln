@@ -95,7 +95,6 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
 import vllm_rbln.utils as rbln_utils
 from vllm_rbln.model_executor.models.interfaces import SupportsRBLNMultiModal
-from vllm_rbln.patches.attention import _resolve_kv_cache
 from vllm_rbln.utils import is_prefill_step
 from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadata,
@@ -109,6 +108,7 @@ from vllm_rbln.v1.attention.backends.glm5_next import (
     RBLNGlm5NextStateMetadata,
     kda_cache_name,
 )
+from vllm_rbln.v1.attention.kv_cache_bindings import resolve_kv_cache
 from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec, RBLNMambaSpec
 
 SLOT_DSA_LATENT, SLOT_DSA_INDEX_KEY, SLOT_DSA_INDEX_SCALE, SLOT_DSA_INDEX_TAIL = range(
@@ -160,7 +160,7 @@ class RBLNGlm5NextStateCache(_RBLNGlm5NextCache):
         metadata = get_forward_context().attn_metadata[self.prefix]
         assert isinstance(metadata, RBLNGlm5NextStateMetadata), type(metadata)
         assert metadata.load_blocks is not None and metadata.store_blocks is not None
-        state = _resolve_kv_cache(metadata, self.prefix)
+        state = resolve_kv_cache(metadata, self.prefix)
         return (
             state,
             metadata.load_blocks.view(-1),
@@ -200,7 +200,7 @@ class RBLNGlm5NextPagedCache(_RBLNGlm5NextCache):
         """(cache, block_table, metadata)."""
         metadata = get_forward_context().attn_metadata[self.prefix]
         return (
-            _resolve_kv_cache(metadata, self.prefix),
+            resolve_kv_cache(metadata, self.prefix),
             metadata.block_tables,
             metadata,
         )
@@ -243,7 +243,7 @@ class RBLNGlm5NextAuxCache(_RBLNGlm5NextCache):
 
     def inputs(self) -> torch.Tensor:
         metadata = get_forward_context().attn_metadata[self.owner]
-        return _resolve_kv_cache(metadata, self.prefix)
+        return resolve_kv_cache(metadata, self.prefix)
 
 
 def _swiglu_clamped(

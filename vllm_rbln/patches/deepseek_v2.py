@@ -26,11 +26,11 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 from vllm_rbln.logger import init_logger
 from vllm_rbln.patches import register_patch
-from vllm_rbln.patches.attention import _resolve_kv_cache
 from vllm_rbln.v1.attention.backends.mla.indexer import (
     RBLNDeepseekV32IndexerBackend,
     RBLNDeepseekV32IndexerScaleBackend,
 )
+from vllm_rbln.v1.attention.kv_cache_bindings import resolve_kv_cache
 
 logger = init_logger(__name__)
 _original_indexer_cache_init = DeepseekV32IndexerCache.__init__
@@ -236,11 +236,11 @@ def rbln_indexer_forward(
     attn_metadata = forward_context.attn_metadata
     if isinstance(attn_metadata, dict):
         attn_metadata = attn_metadata[self.k_cache.prefix]
-    k_cache = _resolve_kv_cache(attn_metadata, self.k_cache.prefix)
+    k_cache = resolve_kv_cache(attn_metadata, self.k_cache.prefix)
 
     scale_cache = None
     if getattr(self.k_cache, "scale_cache", None) is not None:
-        scale_cache = _resolve_kv_cache(attn_metadata, self.k_cache.scale_cache.prefix)
+        scale_cache = resolve_kv_cache(attn_metadata, self.k_cache.scale_cache.prefix)
 
     weights = weights.contiguous()  # [B, T, n_head]
     softmax_scale = torch.tensor(
