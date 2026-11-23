@@ -125,6 +125,20 @@ class EncoderInputBuffers:
         return buffers
 
 
+class BufferedVisionEncoder:
+    """Keep a compiled encoder callable with its device staging buffers."""
+
+    def __init__(
+        self,
+        encoder: Callable[..., torch.Tensor],
+        *,
+        device: torch.device | str,
+        dtype: torch.dtype,
+    ) -> None:
+        self.encoder = encoder
+        self.input_buffers = EncoderInputBuffers(device, dtype)
+
+
 def pad(
     x: torch.Tensor, dim: int, target_len: int, pad_value: Union[int, float] = 0
 ) -> torch.Tensor:

@@ -33,7 +33,7 @@ import vllm_rbln.model_executor.models.gemma4 as gemma4
 from vllm_rbln.compilation.compiler import compile, mark_decoder_regions
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.model_executor.models.gemma4 import RBLNGemma4ForConditionalGeneration
-from vllm_rbln.utils import EncoderInputBuffers
+from vllm_rbln.utils import BufferedVisionEncoder
 from vllm_rbln.v1.attention.backends.flash_attention import RBLNFlashAttentionMetadata
 
 POOL = 3
@@ -50,15 +50,9 @@ def _bare_model(**attrs) -> RBLNGemma4ForConditionalGeneration:
     )
     nn.Module.__init__(model)
     model.mm_prefix_attn_layers = []
-    object.__setattr__(model, "_mm_encoder", None)
+    model._mm_encoder = None
     for key, value in attrs.items():
         setattr(model, key, value)
-    # What compile_mm_encoder would make for a model built with a tower.
-    model._mm_input_buffers = (
-        EncoderInputBuffers("cpu", attrs["model_dtype"])
-        if "vision_tower" in attrs and "model_dtype" in attrs
-        else None
-    )
     return model
 
 
@@ -103,16 +97,26 @@ def test_logits_processor_delegates_to_language_model():
     assert model.logits_processor is processor
 
 
-def test_the_vision_encoder_matches_hfs():
-    # The encoder pads every image to its bucket and runs attention spelled out;
-    # what comes back must be HF's soft tokens for the image alone.
-    tower = _vision_tower()
+def _model_with_vision_encoder(tower):
     model = _bare_model(
         vision_tower=tower,
         embed_vision=_Identity(),
         model_dtype=torch.float32,
         mm_encoder_patch_buckets=[90],
     )
+    model._mm_encoder = BufferedVisionEncoder(
+        gemma4._RBLNGemma4VisionEncoder(tower, model.embed_vision).eval(),
+        device="cpu",
+        dtype=model.model_dtype,
+    )
+    return model
+
+
+def test_the_vision_encoder_matches_hfs():
+    # The encoder pads every image to its bucket and runs attention spelled out;
+    # what comes back must be HF's soft tokens for the image alone.
+    tower = _vision_tower()
+    model = _model_with_vision_encoder(tower)
     pixels, positions = _image(9, 9, num_patches=81)
 
     with torch.no_grad():
@@ -127,12 +131,7 @@ def test_the_vision_encoder_matches_hfs():
 
 def test_a_smaller_image_matches_upstream_when_reusing_vision_buffers(monkeypatch):
     tower = _vision_tower()
-    model = _bare_model(
-        vision_tower=tower,
-        embed_vision=_Identity(),
-        model_dtype=torch.float32,
-        mm_encoder_patch_buckets=[90],
-    )
+    model = _model_with_vision_encoder(tower)
     encode = Mock(wraps=gemma4.rbln_utils.run_mm_encoder)
     monkeypatch.setattr(gemma4.rbln_utils, "run_mm_encoder", encode)
     large_pixels, large_positions = _image(9, 9, num_patches=90)
@@ -156,12 +155,7 @@ def test_the_rotary_tables_are_built_once_not_per_image(monkeypatch):
     # The encoder looks up HF's cos and sin for each patch in the graph, so the
     # host computes none per image and the soft tokens stay HF's.
     tower = _vision_tower()
-    model = _bare_model(
-        vision_tower=tower,
-        embed_vision=_Identity(),
-        model_dtype=torch.float32,
-        mm_encoder_patch_buckets=[90],
-    )
+    model = _model_with_vision_encoder(tower)
     first, second = _image(6, 3, num_patches=81), _image(3, 9, num_patches=81)
     with torch.no_grad():
         model._encode_vision(*first)
@@ -217,7 +211,9 @@ def _recording_model(buckets):
         mm_encoder_patch_buckets=buckets,
         config=SimpleNamespace(vision_config=tower.config),
     )
-    object.__setattr__(model, "_mm_encoder", encoder)
+    model._mm_encoder = BufferedVisionEncoder(
+        encoder, device="cpu", dtype=model.model_dtype
+    )
     return model, calls
 
 
@@ -527,11 +523,18 @@ def test_the_encoder_compiles_only_where_the_tower_lives(
     runtime = Mock()
     compile_fn = Mock(return_value=runtime)
 
+    if compiled:
+        with pytest.raises(RuntimeError, match="requires a compiled encoder"):
+            model.warmup_mm_encoder()
+        with pytest.raises(RuntimeError, match="requires a compiled encoder"):
+            model._encode_vision(*_image(3, 3, num_patches=9))
+    else:
+        model.warmup_mm_encoder()
     model.compile_mm_encoder(compile_fn)
 
     if compiled:
         compile_fn.assert_called_once_with(built)
-        assert model._mm_encoder is runtime
+        assert model._mm_encoder.encoder is runtime
     else:
         compile_fn.assert_not_called()
         assert model._mm_encoder is None

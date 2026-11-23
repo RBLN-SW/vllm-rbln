@@ -717,7 +717,7 @@ class TestMmEncoder:
             types.SimpleNamespace(spatial_merge_size=1, vision_model=vision_model),
         )
         # MiniMax-M3 also passes the modality.
-        model._encoder_inputs = lambda pixels, grid, *modality: [pixels]
+        model._encoder_inputs = lambda encoder, pixels, grid, *modality: [pixels]
         events = []
 
         class PendingOutput:
@@ -745,7 +745,9 @@ class TestMmEncoder:
             clock.advance(1 * MS)
             return PendingOutput(pixels)
 
-        object.__setattr__(model, "_mm_encoder", encoder)
+        model._mm_encoder = utils.BufferedVisionEncoder(
+            encoder, device="cpu", dtype=torch.bfloat16
+        )
         monkeypatch.setattr(utils, "run_mm_encoder", pm.run_mm_encoder)
         monkeypatch.setattr(pm, "_ACTIVE_CTX", ctx)
         pixels = torch.arange(9).view(3, 3)

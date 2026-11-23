@@ -21,7 +21,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from vllm_rbln.utils import EncoderInputBuffers
+from vllm_rbln.utils import BufferedVisionEncoder
 
 
 @pytest.fixture
@@ -131,7 +131,7 @@ def test_a_smaller_image_matches_fresh_padding_when_reusing_vision_buffers(
     model.mm_embeds_dtype = torch.float32
     model.mm_encoder_patch_buckets = [16]
     model.compile_mm_encoder(lambda encoder: Mock(wraps=encoder))
-    encoder = model._mm_encoder
+    encoder = model._mm_encoder.encoder
     large_pixels = torch.randn(16, 24)
     small_image = {
         "pixel_values": torch.randn(8, 24),
@@ -142,9 +142,7 @@ def test_a_smaller_image_matches_fresh_padding_when_reusing_vision_buffers(
         pixel_values=large_pixels, image_grid_thw=torch.tensor([[1, 4, 4]])
     )
     (actual,) = model.embed_multimodal(**small_image)
-    model._mm_input_buffers = EncoderInputBuffers(
-        large_pixels.device, vision_tower.dtype
-    )
+    model.compile_mm_encoder(lambda _: encoder)
     (expected,) = model.embed_multimodal(**small_image)
 
     large, small, fresh = (call.args for call in encoder.call_args_list)
@@ -181,7 +179,8 @@ def test_minimax_m3_encoder_compile_requires_local_tower(monkeypatch, has_tower)
     if has_tower:
         build_encoder.assert_called_once_with(model.vision_tower, torch.bfloat16)
         compile_fn.assert_called_once_with(encoder)
-        assert model._mm_encoder is runtime
+        assert model._mm_encoder is not None
+        assert model._mm_encoder.encoder is runtime
     else:
         build_encoder.assert_not_called()
         compile_fn.assert_not_called()
@@ -350,7 +349,7 @@ def test_minimax_m3_without_a_draft_sends_no_aux(monkeypatch, pp_size):
 
 @pytest.mark.parametrize("compiled", [False, True])
 @pytest.mark.parametrize("out_dtype", [torch.float32, torch.bfloat16])
-def test_image_encoding_reuses_eager_or_compiled_encoder(
+def test_image_encoding_requires_and_reuses_compiled_encoder(
     monkeypatch, compiled, out_dtype
 ):
     import vllm_rbln.model_executor.models.minimax_m3 as m3
@@ -367,10 +366,20 @@ def test_image_encoding_reuses_eager_or_compiled_encoder(
     encoder = torch.nn.Sequential(model.vision_tower)
     build_encoder = Mock(return_value=encoder)
     monkeypatch.setattr(m3, "_RBLNVisionEncoder", build_encoder)
-    object.__setattr__(model, "_mm_encoder", encoder if compiled else None)
-    model._encoder_inputs = Mock(side_effect=lambda pixels, grid, modality: [pixels])
+    model._mm_encoder = None
+    if compiled:
+        model.compile_mm_encoder(lambda module: module)
+    model._encoder_inputs = Mock(
+        side_effect=lambda encoder, pixels, grid, modality: [pixels]
+    )
     pixels = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
     grids = torch.tensor([[1, 1, 1], [1, 1, 2]])
+
+    if not compiled:
+        with pytest.raises(RuntimeError, match="requires a compiled encoder"):
+            model.embed_multimodal(pixel_values=pixels, image_grid_thw=grids)
+        build_encoder.assert_not_called()
+        return
 
     for _ in range(2):
         outputs = model.embed_multimodal(pixel_values=pixels, image_grid_thw=grids)
@@ -383,12 +392,10 @@ def test_image_encoding_reuses_eager_or_compiled_encoder(
         )
         assert model.vision_tower.weight.dtype == torch.float32
 
-    if compiled:
-        build_encoder.assert_not_called()
-    else:
-        build_encoder.assert_called_once_with(model.vision_tower, out_dtype)
-        assert not encoder.training
-    assert model._mm_encoder is encoder
+    build_encoder.assert_called_once_with(model.vision_tower, out_dtype)
+    assert not encoder.training
+    assert model._mm_encoder is not None
+    assert model._mm_encoder.encoder is encoder
     assert "_mm_encoder" not in model._modules
     assert list(model.state_dict()) == ["vision_tower.weight"]
 
@@ -595,11 +602,13 @@ def test_images_and_video_segments_share_buckets(
         limits={"image": 1, "video": 1},
     )
     model.vision_tower = vision_encoder_model.vision_tower
-    model._mm_input_buffers = vision_encoder_model._mm_input_buffers
+    buffered_encoder = BufferedVisionEncoder(
+        Mock(), device="cpu", dtype=model.vision_tower.dtype
+    )
     pixels = torch.ones(math.prod(grid), 6)
 
-    image, *_ = model._encoder_inputs(pixels, grid, "image")
-    video, *_ = model._encoder_inputs(pixels, grid, "video")
+    image, *_ = model._encoder_inputs(buffered_encoder, pixels, grid, "image")
+    video, *_ = model._encoder_inputs(buffered_encoder, pixels, grid, "video")
 
     assert image.shape[0] == video.shape[0] == expected_bucket
 
@@ -767,7 +776,7 @@ def vision_encoder_model():
         vision_segment_max_frames=2,
     )
     model.vision_tower = tower
-    model._mm_input_buffers = EncoderInputBuffers("cpu", tower.dtype)
+    model._mm_encoder = BufferedVisionEncoder(Mock(), device="cpu", dtype=tower.dtype)
     model.mm_embeds_dtype = torch.float32
     model.mm_encoder_patch_buckets = [16, 64]
     return model
@@ -784,7 +793,9 @@ def test_a_video_is_encoded_in_segments_of_temporal_patches(vision_encoder_model
         # One token per 2 x 2 merge: the patch index of its first patch.
         return pixels[::4, :1].clone()
 
-    object.__setattr__(model, "_mm_encoder", encode)
+    model._mm_encoder = BufferedVisionEncoder(
+        encode, device="cpu", dtype=model.vision_tower.dtype
+    )
     pixels = torch.arange(20.0).unsqueeze(1).expand(-1, 6)
 
     (embeds,) = model.embed_multimodal(
@@ -809,7 +820,9 @@ def test_no_frame_limit_keeps_image_output_storage(vision_encoder_model):
         outputs.append(pixels[::4, :1])
         return outputs[-1]
 
-    object.__setattr__(model, "_mm_encoder", encode)
+    model._mm_encoder = BufferedVisionEncoder(
+        encode, device="cpu", dtype=model.vision_tower.dtype
+    )
     pixels = torch.arange(4.0).unsqueeze(1).expand(-1, 6)
     (embeds,) = model.embed_multimodal(
         pixel_values=pixels, image_grid_thw=torch.tensor([[1, 2, 2]])
@@ -824,7 +837,12 @@ def test_shared_bucket_is_warmed_once(vision_encoder_model):
     model = vision_encoder_model
     model.mm_encoder_patch_buckets = [16, 64, 128]
     encoder = Mock()
-    object.__setattr__(model, "_mm_encoder", encoder)
+    model._mm_encoder = None
+    with pytest.raises(RuntimeError, match="requires a compiled encoder"):
+        model.warmup_mm_encoder()
+    model._mm_encoder = BufferedVisionEncoder(
+        encoder, device="cpu", dtype=model.vision_tower.dtype
+    )
 
     model.warmup_mm_encoder()
 
@@ -835,8 +853,10 @@ def test_shared_bucket_is_warmed_once(vision_encoder_model):
 def test_mixed_modalities_preserve_input_order(vision_encoder_model, video_first):
     model = vision_encoder_model
     # A copy: the inputs are staging buffers the next item rewrites.
-    object.__setattr__(
-        model, "_mm_encoder", lambda pixels, *args: pixels[::4, :1].clone()
+    model._mm_encoder = BufferedVisionEncoder(
+        lambda pixels, *args: pixels[::4, :1].clone(),
+        device="cpu",
+        dtype=model.vision_tower.dtype,
     )
     image = {
         "pixel_values": torch.full((4, 6), 3.0),
@@ -864,7 +884,9 @@ def test_an_image_runs_in_the_smallest_bucket_that_holds_it(vision_encoder_model
     for grid, bucket in (([1, 4, 4], 16), ([1, 4, 6], 64)):
         pixels = torch.ones(math.prod(grid), 6)
 
-        padded, cos, sin, key_bias = model._encoder_inputs(pixels, grid, "image")
+        padded, cos, sin, key_bias = model._encoder_inputs(
+            model._mm_encoder, pixels, grid, "image"
+        )
 
         assert padded.shape == (bucket, 6)
         assert cos.shape == sin.shape == (bucket, 16)
@@ -876,8 +898,12 @@ def test_a_bucket_reuses_its_input_buffers_and_masks_the_padding(
     vision_encoder_model,
 ):
     model = vision_encoder_model
-    large = model._encoder_inputs(torch.full((16, 6), 5.0), [1, 4, 4], "image")
-    small = model._encoder_inputs(torch.full((4, 6), 3.0), [1, 2, 2], "image")
+    large = model._encoder_inputs(
+        model._mm_encoder, torch.full((16, 6), 5.0), [1, 4, 4], "image"
+    )
+    small = model._encoder_inputs(
+        model._mm_encoder, torch.full((4, 6), 3.0), [1, 2, 2], "image"
+    )
 
     # Same bucket, same device tensors: no allocation and no padded host copy.
     assert [x.data_ptr() for x in small] == [x.data_ptr() for x in large]
@@ -910,7 +936,6 @@ def test_warmup_runs_every_patch_bucket(
         limits={"image": 1, "video": video_limit},
     )
     model.vision_tower = vision_encoder_model.vision_tower
-    model._mm_input_buffers = vision_encoder_model._mm_input_buffers
     warmed = []
 
     def encode(pixels, cos, sin, bias):
@@ -923,7 +948,9 @@ def test_warmup_runs_every_patch_bucket(
         warmed.append(n)
         return torch.zeros(n // 4, 8)
 
-    object.__setattr__(model, "_mm_encoder", encode)
+    model._mm_encoder = BufferedVisionEncoder(
+        encode, device="cpu", dtype=model.vision_tower.dtype
+    )
     model.warmup_mm_encoder()
 
     assert warmed == buckets
@@ -939,11 +966,14 @@ def test_warmup_runs_every_patch_bucket(
 def test_warmup_without_a_local_vision_tower(vision_encoder_model):
     model = vision_encoder_model
     model.vision_tower = None
-    model._mm_encoder = Mock()
+    encoder = Mock()
+    model._mm_encoder = BufferedVisionEncoder(
+        encoder, device="cpu", dtype=torch.float32
+    )
 
     model.warmup_mm_encoder()
 
-    model._mm_encoder.assert_not_called()
+    encoder.assert_not_called()
 
 
 @pytest.mark.parametrize(

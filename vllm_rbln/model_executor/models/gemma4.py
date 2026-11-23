@@ -16,7 +16,7 @@
 compiled and its image embeddings merged inside the compiled graph."""
 
 import math
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Iterable, Mapping
 from functools import cached_property
 
 import torch
@@ -324,10 +324,7 @@ class RBLNGemma4ForConditionalGeneration(
             )
         pool = self.config.vision_config.pooling_kernel_size
         self.mm_encoder_patch_buckets = [budget * pool**2 for budget in budgets]
-        self._mm_encoder: Callable[..., torch.Tensor] | None
-        object.__setattr__(self, "_mm_encoder", None)
-        # Created after the vision tower is placed on its target device.
-        self._mm_input_buffers: rbln_utils.EncoderInputBuffers | None = None
+        self._mm_encoder: rbln_utils.BufferedVisionEncoder | None = None
 
     @property
     def logits_processor(self) -> nn.Module:
@@ -362,30 +359,26 @@ class RBLNGemma4ForConditionalGeneration(
 
         return super().load_weights(fold(weights)) | split_gate_up_weights(self)
 
+    def _uses_local_vision_encoder(self) -> bool:
+        return get_pp_group().is_first_rank and any(
+            self.multimodal_config.get_limit_per_prompt(m) > 0
+            for m in ("image", "video")
+        )
+
     def compile_mm_encoder(self, compile_fn) -> None:
-        # Without an image or video limit, or off the first PP rank, upstream
-        # leaves the vision tower out.
-        if not (
-            get_pp_group().is_first_rank
-            and any(
-                self.multimodal_config.get_limit_per_prompt(m) > 0
-                for m in ("image", "video")
-            )
-        ):
+        if not self._uses_local_vision_encoder():
             return
         encoder = _RBLNGemma4VisionEncoder(self.vision_tower, self.embed_vision)
-        self._set_mm_encoder(compile_fn(encoder.eval()))
-
-    def _set_mm_encoder(self, encoder: Callable[..., torch.Tensor]) -> None:
-        """Adopt the encoder with the input buffers it is fed from, sized on the
-        tower's device."""
-        object.__setattr__(self, "_mm_encoder", encoder)
-        self._mm_input_buffers = rbln_utils.EncoderInputBuffers(
-            next(self.vision_tower.parameters()).device, self.model_dtype
+        self._mm_encoder = rbln_utils.BufferedVisionEncoder(
+            compile_fn(encoder.eval()),
+            device=next(self.vision_tower.parameters()).device,
+            dtype=self.model_dtype,
         )
 
     def warmup_mm_encoder(self) -> None:
         if self._mm_encoder is None:
+            if self._uses_local_vision_encoder():
+                raise RuntimeError("Vision encoding requires a compiled encoder")
             return
         vision_config = self.config.vision_config
         pool = vision_config.pooling_kernel_size
@@ -409,13 +402,9 @@ class RBLNGemma4ForConditionalGeneration(
         """One image or video frame, `[num_patches, patch_pixels]` with `(-1, -1)`
         positions on its padding, to its soft token embeddings. The encoder's
         inputs are the bucket's staging buffers, rewritten by the next frame."""
-        encoder = self._mm_encoder
-        if encoder is None:
-            # enforce_eager: the runner never calls compile_mm_encoder.
-            encoder = _RBLNGemma4VisionEncoder(
-                self.vision_tower, self.embed_vision
-            ).eval()
-            self._set_mm_encoder(encoder)
+        buffered_encoder = self._mm_encoder
+        if buffered_encoder is None:
+            raise RuntimeError("Vision encoding requires a compiled encoder")
         tower = self.vision_tower
         valid = (pixel_position_ids >= 0).all(dim=-1)
         num_patches = int(valid.sum())
@@ -432,11 +421,7 @@ class RBLNGemma4ForConditionalGeneration(
         key_bias = torch.where(padding, torch.finfo(self.model_dtype).min, 0.0)[
             :, None, None, :
         ]
-        buffers = self._mm_input_buffers
-        assert buffers is not None, (
-            "Encoder input buffers must be initialized before staging"
-        )
-        inputs = buffers.stage(
+        inputs = buffered_encoder.input_buffers.stage(
             bucket_size,
             self._mm_input_specs,
             [pixel_values[valid].unsqueeze(0), positions, padding, key_bias],
@@ -446,7 +431,9 @@ class RBLNGemma4ForConditionalGeneration(
         # pool into the leading cells, in order.
         num_soft_tokens = num_patches // tower.config.pooling_kernel_size**2
         return rbln_utils.run_mm_encoder(
-            lambda *inputs: encoder(*inputs)[0], inputs, num_soft_tokens
+            lambda *inputs: buffered_encoder.encoder(*inputs)[0],
+            inputs,
+            num_soft_tokens,
         )
 
     def _mm_input_specs(self, bucket_size: int) -> list[rbln_utils.EncoderInput]:

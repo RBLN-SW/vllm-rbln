@@ -188,9 +188,7 @@ class RBLNQwen3_5ForConditionalGeneration(
                 "--video-pruning-rate unset."
             )
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-        object.__setattr__(self, "_mm_encoder", None)
-        # Made with the encoder in compile_mm_encoder, once the tower's device is final.
-        self._mm_input_buffers: rbln_utils.EncoderInputBuffers | None = None
+        self._mm_encoder: rbln_utils.BufferedVisionEncoder | None = None
         # Upstream builds no vision tower when images and video are off (a
         # placeholder stands in for it).
         modalities = [
@@ -277,26 +275,23 @@ class RBLNQwen3_5ForConditionalGeneration(
         if not self.has_vision:
             return
         encoder = _RBLNQwen3VisionEncoder(self.visual).eval()
-        object.__setattr__(self, "_mm_encoder", compile_fn(encoder))
-        self._mm_input_buffers = rbln_utils.EncoderInputBuffers(
-            self.visual.device, self.visual.dtype
+        self._mm_encoder = rbln_utils.BufferedVisionEncoder(
+            compile_fn(encoder), device=self.visual.device, dtype=self.visual.dtype
         )
 
     def warmup_mm_encoder(self) -> None:
         if not self.has_vision:
             return
-        encoder = self._mm_encoder
-        if encoder is None:
-            # enforce_eager: the runner never calls compile_mm_encoder.
-            self.compile_mm_encoder(lambda encoder: encoder)
-            encoder = self._mm_encoder
-        assert encoder is not None
+        buffered_encoder = self._mm_encoder
+        if buffered_encoder is None:
+            raise RuntimeError("Vision encoding requires a compiled encoder")
         with torch.inference_mode():
             for bucket_size in self.mm_encoder_patch_buckets:
                 # Every entry valid: the warm-up never masks a key.
-                encoder(
-                    *self._stage_encoder_inputs(bucket_size, bucket_size, [None] * 5)
+                inputs = buffered_encoder.input_buffers.stage(
+                    bucket_size, self._mm_input_specs, [None] * 5, bucket_size
                 )
+                buffered_encoder.encoder(*inputs)
 
     def _mm_input_specs(self, bucket_size: int) -> list[rbln_utils.EncoderInput]:
         """The encoder's inputs at `bucket_size`: patches, position embeddings,
@@ -331,20 +326,11 @@ class RBLNQwen3_5ForConditionalGeneration(
             ),
         ]
 
-    def _stage_encoder_inputs(
-        self,
-        bucket_size: int,
-        num_patches: int,
-        input_tensors: list[torch.Tensor | None],
-    ) -> list[torch.Tensor]:
-        buffers = self._mm_input_buffers
-        assert buffers is not None, "compile_mm_encoder runs before encoding"
-        return buffers.stage(
-            bucket_size, self._mm_input_specs, input_tensors, num_patches
-        )
-
     def _encoder_inputs(
-        self, pixel_values: torch.Tensor, grid_thw: list[int]
+        self,
+        buffered_encoder: rbln_utils.BufferedVisionEncoder,
+        pixel_values: torch.Tensor,
+        grid_thw: list[int],
     ) -> list[torch.Tensor]:
         """Stage one image or video frame into its bucket's device buffers:
         its patches, and the position embeddings and key mask built on the
@@ -376,8 +362,11 @@ class RBLNQwen3_5ForConditionalGeneration(
         sin = sin_table.cpu()[pos_ids].flatten(1)
         key_bias = torch.zeros(1, 1, bucket_size)
         key_bias[..., num_patches:] = -30000.0
-        return self._stage_encoder_inputs(
-            bucket_size, num_patches, [pixel_values, pos_embeds, cos, sin, key_bias]
+        return buffered_encoder.input_buffers.stage(
+            bucket_size,
+            self._mm_input_specs,
+            [pixel_values, pos_embeds, cos, sin, key_bias],
+            num_patches,
         )
 
     def _encode(
@@ -386,12 +375,9 @@ class RBLNQwen3_5ForConditionalGeneration(
         """The embeddings of each image or video, one encoder run per temporal
         patch: upstream's cu_seqlens keeps attention inside each, so a video's
         frames are images of its grid."""
-        encoder = self._mm_encoder
-        if encoder is None:
-            # enforce_eager: the runner never calls compile_mm_encoder.
-            self.compile_mm_encoder(lambda encoder: encoder)
-            encoder = self._mm_encoder
-        assert encoder is not None
+        buffered_encoder = self._mm_encoder
+        if buffered_encoder is None:
+            raise RuntimeError("Vision encoding requires a compiled encoder")
         grids = grid_thw.tolist()
         sizes = [math.prod(g) for g in grids]
         tokens = [h * w // self.visual.spatial_merge_size**2 for _, h, w in grids]
@@ -401,7 +387,9 @@ class RBLNQwen3_5ForConditionalGeneration(
             # embeddings and key mask could be built once per video.
             for pixels, (_, h, w), n in zip(pixel_values.split(sizes), grids, tokens):
                 frames = [
-                    encoder(*self._encoder_inputs(frame, [1, h, w]))[:n].cpu()
+                    buffered_encoder.encoder(
+                        *self._encoder_inputs(buffered_encoder, frame, [1, h, w])
+                    )[:n].cpu()
                     for frame in pixels.split(h * w)
                 ]
                 embeds.append(torch.cat(frames))

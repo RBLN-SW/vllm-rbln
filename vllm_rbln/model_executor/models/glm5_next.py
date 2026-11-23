@@ -1402,9 +1402,7 @@ class RBLNGlm5NextForConditionalGeneration(
         else:
             self.visual = PPMissingLayer()
         self.config.image_token_index = hf_config.image_token_id
-        object.__setattr__(self, "_mm_encoder", None)
-        # Made with the encoder in compile_mm_encoder, once the tower's device is final.
-        self._mm_input_buffers: rbln_utils.EncoderInputBuffers | None = None
+        self._mm_encoder: rbln_utils.BufferedVisionEncoder | None = None
 
     def get_language_model(self) -> nn.Module:
         return self
@@ -1413,24 +1411,24 @@ class RBLNGlm5NextForConditionalGeneration(
         if isinstance(self.visual, PPMissingLayer):
             return
         encoder = _RBLNGlm5NextVisionEncoder(self.visual, self.mm_embeds_dtype).eval()
-        object.__setattr__(self, "_mm_encoder", compile_fn(encoder))
-        self._mm_input_buffers = rbln_utils.EncoderInputBuffers(
-            self.visual.device, self.visual.dtype
+        self._mm_encoder = rbln_utils.BufferedVisionEncoder(
+            compile_fn(encoder), device=self.visual.device, dtype=self.visual.dtype
         )
 
     def warmup_mm_encoder(self) -> None:
         visual = self.visual
         if isinstance(visual, PPMissingLayer):
             return
-        if self._mm_encoder is None:
-            self.compile_mm_encoder(lambda encoder: encoder)
-        assert self._mm_encoder is not None
+        buffered_encoder = self._mm_encoder
+        if buffered_encoder is None:
+            raise RuntimeError("Vision encoding requires a compiled encoder")
         with torch.inference_mode():
             for bucket_size in self.mm_encoder_patch_buckets:
                 # Every entry valid: the warm-up never masks a key.
-                self._mm_encoder(
-                    *self._stage_encoder_inputs(bucket_size, bucket_size, [None] * 4)
+                inputs = buffered_encoder.input_buffers.stage(
+                    bucket_size, self._mm_input_specs, [None] * 4, bucket_size
                 )
+                buffered_encoder.encoder(*inputs)
 
     def _mm_input_specs(self, bucket_size: int) -> list[rbln_utils.EncoderInput]:
         """The encoder's inputs at `bucket_size`: patches, the rotary cos and
@@ -1458,20 +1456,11 @@ class RBLNGlm5NextForConditionalGeneration(
             ),
         ]
 
-    def _stage_encoder_inputs(
-        self,
-        bucket_size: int,
-        num_patches: int,
-        input_tensors: list[torch.Tensor | None],
-    ) -> list[torch.Tensor]:
-        buffers = self._mm_input_buffers
-        assert buffers is not None, "compile_mm_encoder runs before encoding"
-        return buffers.stage(
-            bucket_size, self._mm_input_specs, input_tensors, num_patches
-        )
-
     def _encoder_inputs(
-        self, pixel_values: torch.Tensor, grid_thw: list[int]
+        self,
+        buffered_encoder: rbln_utils.BufferedVisionEncoder,
+        pixel_values: torch.Tensor,
+        grid_thw: list[int],
     ) -> list[torch.Tensor]:
         """Stage one frame into its bucket's device buffers, with the rotary
         tables and key mask built on the host for its valid patches. The tensors
@@ -1500,10 +1489,11 @@ class RBLNGlm5NextForConditionalGeneration(
         angles = torch.cat([freqs_h, freqs_w, freqs_h, freqs_w], dim=-1)
         key_bias = torch.zeros(1, 1, bucket_size)
         key_bias[..., num_patches:] = -30000.0
-        return self._stage_encoder_inputs(
+        return buffered_encoder.input_buffers.stage(
             bucket_size,
-            num_patches,
+            self._mm_input_specs,
             [pixel_values, angles.cos(), angles.sin(), key_bias],
+            num_patches,
         )
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
@@ -1519,9 +1509,9 @@ class RBLNGlm5NextForConditionalGeneration(
                 pixel_values = kwargs[key]
                 if pixel_values is None:
                     continue
-                if self._mm_encoder is None:
-                    self.compile_mm_encoder(lambda encoder: encoder)
-                assert self._mm_encoder is not None
+                buffered_encoder = self._mm_encoder
+                if buffered_encoder is None:
+                    raise RuntimeError("Vision encoding requires a compiled encoder")
                 grid_thw = kwargs[f"{modality}_grid_thw"]
                 assert isinstance(pixel_values, torch.Tensor)
                 assert isinstance(grid_thw, torch.Tensor)
@@ -1533,8 +1523,8 @@ class RBLNGlm5NextForConditionalGeneration(
                     # patch. Encoding these independently preserves that mask.
                     frames = [
                         rbln_utils.run_mm_encoder(
-                            self._mm_encoder,
-                            self._encoder_inputs(frame, [1, h, w]),
+                            buffered_encoder.encoder,
+                            self._encoder_inputs(buffered_encoder, frame, [1, h, w]),
                             h * w // merge2,
                             dtype=self.mm_embeds_dtype,
                         )

@@ -19,7 +19,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from vllm_rbln.utils import EncoderInputBuffers
+from vllm_rbln.utils import BufferedVisionEncoder
 
 
 def _bare(cls):
@@ -123,7 +123,7 @@ def test_a_smaller_image_matches_fresh_padding_when_reusing_vision_buffers(
     model.mm_embeds_dtype = torch.float32
     model.mm_encoder_patch_buckets = [16]
     model.compile_mm_encoder(lambda encoder: Mock(wraps=encoder))
-    encoder = model._mm_encoder
+    encoder = model._mm_encoder.encoder
     large_pixels = torch.randn(16, 24)
     small_image = {
         "pixel_values": torch.randn(8, 24),
@@ -134,9 +134,7 @@ def test_a_smaller_image_matches_fresh_padding_when_reusing_vision_buffers(
         pixel_values=large_pixels, image_grid_thw=torch.tensor([[1, 4, 4]])
     )
     (actual,) = model.embed_multimodal(**small_image)
-    model._mm_input_buffers = EncoderInputBuffers(
-        vision_tower.device, vision_tower.dtype
-    )
+    model.compile_mm_encoder(lambda _: encoder)
     (expected,) = model.embed_multimodal(**small_image)
 
     large, small, fresh = (call.args for call in encoder.call_args_list)
@@ -195,7 +193,7 @@ def test_load_time_transforms_run_once_after_every_weight(monkeypatch):
 
 
 @pytest.mark.parametrize("compiled", [False, True])
-def test_image_encoding_reuses_eager_or_compiled_encoder(monkeypatch, compiled):
+def test_image_encoding_requires_and_reuses_compiled_encoder(monkeypatch, compiled):
     import vllm_rbln.model_executor.models.glm5_next as glm
 
     cls = glm.RBLNGlm5NextForConditionalGeneration
@@ -207,12 +205,18 @@ def test_image_encoding_reuses_eager_or_compiled_encoder(monkeypatch, compiled):
     encoder = torch.nn.Sequential(model.visual)
     build_encoder = Mock(return_value=encoder)
     monkeypatch.setattr(glm, "_RBLNGlm5NextVisionEncoder", build_encoder)
-    object.__setattr__(model, "_mm_encoder", None)
+    model._mm_encoder = None
     if compiled:
         model.compile_mm_encoder(lambda module: module)
-    model._encoder_inputs = Mock(side_effect=lambda pixels, grid: [pixels])
+    model._encoder_inputs = Mock(side_effect=lambda encoder, pixels, grid: [pixels])
     pixels = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
     grids = torch.tensor([[1, 1, 1], [1, 1, 2]])
+
+    if not compiled:
+        with pytest.raises(RuntimeError, match="requires a compiled encoder"):
+            model.embed_multimodal(pixel_values=pixels, image_grid_thw=grids)
+        build_encoder.assert_not_called()
+        return
 
     for _ in range(2):
         outputs = model.embed_multimodal(pixel_values=pixels, image_grid_thw=grids)
@@ -222,7 +226,8 @@ def test_image_encoding_reuses_eager_or_compiled_encoder(monkeypatch, compiled):
 
     build_encoder.assert_called_once_with(model.visual, torch.float32)
     assert not encoder.training
-    assert model._mm_encoder is encoder
+    assert model._mm_encoder is not None
+    assert model._mm_encoder.encoder is encoder
     assert "_mm_encoder" not in model._modules
 
 
@@ -300,6 +305,12 @@ def test_encoder_buckets_are_initialized_and_warmed(
     if compiled:
         model.compile_mm_encoder(compile_fn)
 
+    if is_first_rank and buckets and not compiled:
+        with pytest.raises(RuntimeError, match="requires a compiled encoder"):
+            model.warmup_mm_encoder()
+        build_encoder.assert_not_called()
+        return
+
     model.warmup_mm_encoder()
 
     if not is_first_rank or not buckets:
@@ -310,8 +321,7 @@ def test_encoder_buckets_are_initialized_and_warmed(
         return
     assert model.mm_encoder_patch_buckets == buckets
     build_encoder.assert_called_once_with(model.visual, torch.bfloat16)
-    if compiled:
-        compile_fn.assert_called_once_with(encoder)
+    compile_fn.assert_called_once_with(encoder)
     assert encoder.call_count == len(buckets)
     for call, bucket in zip(encoder.call_args_list, buckets, strict=True):
         for actual, expected in zip(
@@ -349,9 +359,13 @@ def test_vision_encoder_builds_its_inputs_from_upstream_rope(monkeypatch):
 
     model = _bare(glm.RBLNGlm5NextForConditionalGeneration)
     model.visual = visual
-    model._mm_input_buffers = EncoderInputBuffers(visual.device, visual.dtype)
+    buffered_encoder = BufferedVisionEncoder(
+        Mock(), device=visual.device, dtype=visual.dtype
+    )
     model.mm_encoder_patch_buckets = [16]
-    padded, cos, sin, key_bias = model._encoder_inputs(pixels, [1, 2, 4])
+    padded, cos, sin, key_bias = model._encoder_inputs(
+        buffered_encoder, pixels, [1, 2, 4]
+    )
 
     torch.testing.assert_close(padded[:8], pixels)
     assert not padded[8:].any()
@@ -470,9 +484,8 @@ def test_video_frames_reuse_image_buckets_without_cross_frame_attention(video_fi
         weights = (pixels @ pixels.T + bias).softmax(-1)
         return (weights @ pixels).squeeze(0)
 
-    object.__setattr__(model, "_mm_encoder", encoder)
-    model._mm_input_buffers = EncoderInputBuffers(
-        model.visual.device, model.visual.dtype
+    model._mm_encoder = BufferedVisionEncoder(
+        encoder, device=model.visual.device, dtype=model.visual.dtype
     )
     image = torch.arange(8, dtype=torch.float32).reshape(2, 4) / 10
     video = torch.arange(40, dtype=torch.float32).reshape(10, 4) / 10
