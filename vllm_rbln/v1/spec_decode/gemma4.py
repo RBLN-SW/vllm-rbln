@@ -91,18 +91,21 @@ class RBLNGemma4Proposer(RBLNEagleProposer):
             dtype=torch.int32,
             device=self.device,
         )
+        # Positions stay put across steps, so one stage serves all of them and
+        # each step only refills the ids and hidden states it feeds forward.
+        input_ids, staged_positions, staged_hidden_states, _ = self._preprocess(
+            num_reqs,
+            num_reqs_padded,
+            num_reqs,
+            positions,
+            hidden_states,
+            is_prefill=False,
+        )
         draft_ids = None
         for step in range(self.num_speculative_tokens):
-            input_ids, staged_positions, staged_hidden_states, _ = self._preprocess(
-                num_reqs,
-                num_reqs_padded,
-                num_reqs,
-                positions,
-                hidden_states,
-                is_prefill=False,
-            )
             if draft_ids is not None:
                 input_ids[:num_reqs, 0].copy_(draft_ids[:num_reqs])
+                staged_hidden_states[:num_reqs, 0].copy_(hidden_states)
             with set_forward_context(per_layer_attn_metadata, **forward_kwargs):
                 hidden_states, draft_ids = self.model_executable(
                     input_ids=input_ids,
