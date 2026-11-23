@@ -34,6 +34,7 @@ from . import (
     dynamic_kv,
     ec_connector_factory,
     engine_core,
+    fp8_linear_method,
     fp8_moe_method,
     gemma4,
     glm5_next,

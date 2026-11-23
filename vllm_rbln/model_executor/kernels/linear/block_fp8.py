@@ -66,10 +66,12 @@ class RBLNW8A16BlockFp8LinearKernel(Fp8BlockScaledMMLinearKernel):
         if not ok:
             return ok, reason
 
-        from vllm_rbln.config import get_rbln_config
+        from vllm_rbln.model_executor.layers.quantization.activation_override import (
+            linear_w8a8_in_scope,
+        )
 
-        if get_rbln_config().use_w8a8:
-            return False, "RBLN W8A16 block fp8 kernel is off when W8A8 is requested."
+        if linear_w8a8_in_scope():
+            return False, "RBLN W8A16 block fp8 kernel is off for a W8A8 layer."
         return True, None
 
     def apply_block_scaled_mm(
@@ -120,10 +122,15 @@ class RBLNW8A8BlockFp8LinearKernel(RBLNW8A16BlockFp8LinearKernel):
         if not ok:
             return ok, reason
 
-        from vllm_rbln.config import get_rbln_config
+        from vllm_rbln.model_executor.layers.quantization.activation_override import (
+            linear_w8a8_in_scope,
+        )
 
-        if not get_rbln_config().use_w8a8:
-            return False, "RBLN W8A8 block fp8 kernel requires --rbln-use-w8a8."
+        if not linear_w8a8_in_scope():
+            return False, (
+                "RBLN W8A8 block fp8 kernel requires an fp8_per_block_dynamic "
+                "activation in --quantization-config."
+            )
         return True, None
 
     def apply_weights(

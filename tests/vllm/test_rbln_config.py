@@ -139,29 +139,34 @@ def test_encoder_token_budgets_accept_additional_config(budgets):
 def test_coexists_with_additional_config(parser):
     """The dotted form is appended at the end of argv, so it must merge."""
     args = parser.parse_args(
-        ["--rbln-use-w8a8", "--additional-config.decode_batch_bucket_limit", "2"]
+        [
+            "--rbln-use-custom-kernel",
+            "--additional-config.decode_batch_bucket_limit",
+            "2",
+        ]
     )
     assert args.additional_config == {
-        "use_w8a8": True,
+        "use_custom_kernel": True,
         "decode_batch_bucket_limit": 2,
     }
     config = build_rbln_config(args.additional_config)
-    assert (config.use_w8a8, config.decode_batch_bucket_limit) == (True, 2)
+    assert (config.use_custom_kernel, config.decode_batch_bucket_limit) == (True, 2)
 
 
 def test_json_form_is_equivalent(parser):
     """`LLM(additional_config=...)` goes through the same code."""
-    assert resolve(parser, ['--additional-config={"use_w8a8": true}']).use_w8a8 is True
+    config = resolve(parser, ['--additional-config={"use_custom_kernel": true}'])
+    assert config.use_custom_kernel is True
 
 
 def test_an_instance_passes_through(parser):
-    given = RBLNConfig(use_w8a8=True)
+    given = RBLNConfig(use_custom_kernel=True)
     assert build_rbln_config(given) is given
 
 
 def test_env_is_still_honored(parser, monkeypatch):
-    monkeypatch.setenv("VLLM_RBLN_USE_W8A8", "1")
-    assert resolve(parser, []).use_w8a8 is True
+    monkeypatch.setenv("VLLM_RBLN_SPECIALIZE_MOE_DECODE", "0")
+    assert resolve(parser, []).specialize_moe_decode is False
 
 
 def test_unprefixed_custom_kernel_env_is_honored(parser, monkeypatch):
@@ -179,8 +184,9 @@ def test_dynamic_kv_cache_is_tri_state(parser):
 
 
 def test_cli_wins_over_env(parser, monkeypatch):
-    monkeypatch.setenv("VLLM_RBLN_USE_W8A8", "1")
-    assert resolve(parser, ["--no-rbln-use-w8a8"]).use_w8a8 is False
+    monkeypatch.setenv("VLLM_RBLN_SPECIALIZE_MOE_DECODE", "0")
+    config = resolve(parser, ["--rbln-specialize-moe-decode"])
+    assert config.specialize_moe_decode is True
 
 
 def test_unknown_key_is_rejected():
@@ -316,7 +322,7 @@ def test_get_rbln_config_rejects_a_config_that_is_not_ours(other):
 
 def test_json_values_are_coerced():
     """`additional_config` arrives as JSON, so the types need converting."""
-    assert build_rbln_config({"use_w8a8": "false"}).use_w8a8 is False
+    assert build_rbln_config({"use_custom_kernel": "false"}).use_custom_kernel is False
     assert (
         build_rbln_config({"decode_batch_bucket_limit": "8"}).decode_batch_bucket_limit
         == 8
@@ -327,7 +333,7 @@ def test_invalid_value_is_rejected():
     with pytest.raises(ValueError):
         build_rbln_config({"decode_batch_bucket_strategy": "garbage"})
     with pytest.raises(ValueError):
-        build_rbln_config({"use_w8a8": "junk"})
+        build_rbln_config({"use_custom_kernel": "junk"})
 
 
 def test_no_field_is_read_from_the_environment():
@@ -381,7 +387,7 @@ def test_only_compile_fields_change_the_hash():
     # mega_cache keys on the buckets the model resolves from this one.
     encoder_budgets = RBLNConfig(encoder_token_budgets=[256, 576])
     assert encoder_budgets.compute_hash() == base
-    assert RBLNConfig(use_w8a8=True).compute_hash() != base
+    assert RBLNConfig(use_custom_kernel=True).compute_hash() != base
     assert RBLNConfig(compile_dtype="float16").compute_hash() != base
     assert RBLNConfig(decode_batch_bucket_strategy="linear").compute_hash() != base
     buckets = RBLNConfig(decode_batch_bucket_manual_buckets=[1, 2, 4])

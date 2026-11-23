@@ -45,9 +45,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.weight_block_size = self.quant_config.weight_block_size
         self.block_quant = self.weight_block_size is not None
 
-        from vllm_rbln.config import get_rbln_config
+        from vllm_rbln.model_executor.layers.quantization.activation_override import (
+            activation_is_fp8,
+            current_quantization_config,
+        )
 
-        self.use_w8a8 = get_rbln_config().use_w8a8
+        self.use_w8a8 = activation_is_fp8(
+            current_quantization_config(), layer.layer_name, "moe"
+        )
 
     def create_weights(
         self,
