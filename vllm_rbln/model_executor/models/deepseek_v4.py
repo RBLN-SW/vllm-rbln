@@ -568,9 +568,19 @@ class RBLNDeepseekV4Attention(nn.Module):
         else:
             # Per-batch decode positions need token-major rotary lowering at L=1.
             o, _ = self.rope(positions, o.transpose(1, 2), inverse=True)
-        o = o.reshape(batch, seq_len, self.n_local_groups, -1)
-        o = torch.matmul(o.transpose(1, 2), self.wo_a_t.to(o.dtype))
-        out, _ = self.wo_b(o.transpose(1, 2).flatten(2))
+        return self._project_out(o.reshape(batch, seq_len, self.n_local_groups, -1))
+
+    def _project_out(self, o: torch.Tensor) -> torch.Tensor:
+        """wo_b(wo_a per group) of o [B, L, g, d]."""
+        wo_a = self.wo_a_t.to(o.dtype)
+        if o.shape[1] == 1:
+            # Decode: a group's rows are the batch's tokens, [1, g, B, d], as a prefill
+            # chunk's tokens are. [B, g, 1, d] against the [1, g, d, r] weight would be
+            # one row a token, which the device runs as B * g one-row matmuls.
+            o = torch.matmul(o.permute(1, 2, 0, 3), wo_a).permute(2, 0, 1, 3)
+        else:
+            o = torch.matmul(o.transpose(1, 2), wo_a).transpose(1, 2)
+        out, _ = self.wo_b(o.flatten(2))
         return out
 
 

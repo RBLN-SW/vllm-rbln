@@ -666,3 +666,19 @@ def test_the_drafter_returns_the_streams_in_the_input_dtype_after_a_cut_prefill(
     out = layer.forward_mtp(positions, embeds, previous, torch.zeros_like(positions))
 
     assert out.dtype == torch.bfloat16
+
+
+@pytest.mark.parametrize("seq_len", [1, 3])
+def test_the_output_projection_matches_the_per_token_form(seq_len):
+    import vllm_rbln.model_executor.models.deepseek_v4 as dsv4
+
+    attn = object.__new__(dsv4.RBLNDeepseekV4Attention)
+    torch.nn.Module.__init__(attn)
+    batch, groups, dim, rank = 4, 2, 8, 5
+    attn.wo_a_t = torch.randn(1, groups, dim, rank)
+    attn.wo_b = lambda x: (x, None)
+    o = torch.randn(batch, seq_len, groups, dim)
+
+    expected = torch.matmul(o.transpose(1, 2), attn.wo_a_t).transpose(1, 2).flatten(2)
+
+    torch.testing.assert_close(attn._project_out(o), expected)
