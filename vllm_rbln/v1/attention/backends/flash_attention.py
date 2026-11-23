@@ -590,7 +590,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         # overwrites before it reads, and the mask keeps them out.
         reads_shared_kv = key is None
         if reads_shared_kv:
-            assert value is None and attn_metadata.attn_masks is not None
+            assert value is None
             key = query.new_zeros(num_tokens, self.num_kv_heads, self.head_size)
             value = query.new_zeros(num_tokens, self.num_kv_heads, self.head_size)
         b_size = attn_metadata.seq_lens.shape[0]
@@ -638,6 +638,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
             # The write sits one past the query. Include one extra position so
             # the op's block strip retains the query's oldest visible key.
             assert attn_metadata.swa_appends and not attn_metadata.is_prefill
+            assert attn_metadata.attn_masks is not None
             attn_output = sliding_window_attention_v1(
                 query,
                 key,
@@ -655,12 +656,25 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
             # GQA selects the old masked kernel for a one-column table. The
             # explicit flash op retains the target's in-memory cache layout.
             assert not attn_metadata.is_prefill
+            # Built in the graph rather than staged: a host mask spans the whole
+            # block table per request. `seq_lens` is the write position, so
+            # every key below it is visible and the zero K/V at it are not.
+            keys = torch.arange(
+                attn_metadata.block_tables.shape[-1] * kv_cache.shape[-2],
+                device=query.device,
+                dtype=torch.int32,
+            )
+            shared_kv_masks = (
+                (keys < attn_metadata.seq_lens.to(torch.int32))
+                .to(torch.float16 if self.enforce_eager else torch.float32)
+                .view(b_size, 1, 1, 1, -1)
+            )
             attn_output = flash_attention_naive_decode(
                 query,
                 key,
                 value,
                 kv_cache,
-                attn_metadata.attn_masks,
+                shared_kv_masks,
                 self.scale,
                 attn_metadata.seq_lens,
                 attn_metadata.block_tables,
