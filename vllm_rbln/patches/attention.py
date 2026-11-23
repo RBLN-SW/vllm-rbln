@@ -37,7 +37,6 @@ from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention import MLAAttention
 
-attention_original_init = Attention.__init__
 attention_original_forward = Attention.forward
 
 
@@ -126,7 +125,7 @@ def _unified_attention_with_output(
     # NOTE(RBLN) - To represent kv cache as model input, resolve it from
     # attention metadata here (a graph input) instead of using the attention
     # layer's embedded kv cache (self.kv_cache, a baked module attribute).
-    kv_cache = resolve_kv_cache(attn_metadata, attn.layer_index)
+    kv_cache = resolve_kv_cache(attn_metadata, layer_name)
     attn.impl.forward(
         attn,
         query,
@@ -173,19 +172,6 @@ def patched_attention_forward(
         output = attention_original_forward(self, query, key, value, output_shape)
         return output.view(output_shape)
     return attention_original_forward(self, query, key, value, output_shape)
-
-
-@register_patch(
-    target="vllm.model_executor.layers.attention.attention.Attention.__init__",
-    reason=(
-        "RBLN resolves KV caches through indices assigned by the runner after "
-        "allocation; upstream Attention does not declare this binding field."
-    ),
-)
-def patched_attention_init(self: Attention, *args, **kwargs) -> None:
-    attention_original_init(self, *args, **kwargs)
-
-    self.layer_index = None
 
 
 @register_patch(

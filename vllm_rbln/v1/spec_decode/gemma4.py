@@ -21,10 +21,6 @@ from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
 
 from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.model_executor.models.gemma4 import split_gate_up_weights
-from vllm_rbln.v1.attention.kv_cache_bindings import (
-    attach_kv_cache_bindings,
-    build_kv_cache_forward_context_kwargs,
-)
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 
 
@@ -209,12 +205,7 @@ class RBLNGemma4Proposer(RBLNEagleProposer):
                 masks.to(torch.float16 if builder.enforce_eager else torch.float32),
                 "attn_masks",
             )
-            attach_kv_cache_bindings(
-                attn_metadata,
-                self.runner.kv_caches,
-                self.runner.kv_cache_bases,
-                self.runner.kv_cache_view_infos,
-            )
+            self.runner.bind_kv_cache_to_metadata(attn_metadata)
             for layer_name in attn_group.layer_names:
                 per_layer_attn_metadata[layer_name] = attn_metadata
         forward_kwargs = dict(
@@ -222,6 +213,6 @@ class RBLNGemma4Proposer(RBLNEagleProposer):
             num_tokens=num_reqs,
             num_tokens_across_dp=num_tokens_across_dp,
             num_padded_tokens=batch_desc.num_tokens_padded,
-            **build_kv_cache_forward_context_kwargs(self.runner.kv_cache_bases),
+            **self.runner.kv_cache_forward_context_kwargs(),
         )
         return per_layer_attn_metadata, num_reqs_padded, forward_kwargs

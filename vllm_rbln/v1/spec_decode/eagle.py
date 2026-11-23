@@ -37,10 +37,6 @@ from vllm_rbln.model_executor.models.interfaces import (
     supports_rbln_multimodal_embeddings,
 )
 from vllm_rbln.platform import use_device_tensor
-from vllm_rbln.v1.attention.kv_cache_bindings import (
-    attach_kv_cache_bindings,
-    build_kv_cache_forward_context_kwargs,
-)
 from vllm_rbln.v1.spec_decode.utils import (
     eagle_prepare_inputs_padded,
     eagle_prepare_next_token_padded,
@@ -140,12 +136,7 @@ class RBLNEagleProposer(EagleProposer):
                 back_pad=self.runner.decode_back_pad,
                 is_prompt_sorted=self.runner.sort_batch_by_length,
             )
-            attach_kv_cache_bindings(
-                attn_metadata,
-                self.runner.kv_caches,
-                self.runner.kv_cache_bases,
-                self.runner.kv_cache_view_infos,
-            )
+            self.runner.bind_kv_cache_to_metadata(attn_metadata)
             for layer_name in attn_group.layer_names:
                 per_layer_attn_metadata[layer_name] = attn_metadata
 
@@ -171,7 +162,7 @@ class RBLNEagleProposer(EagleProposer):
             num_tokens=num_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
             num_padded_tokens=num_padded_tokens,
-            **build_kv_cache_forward_context_kwargs(self.runner.kv_cache_bases),
+            **self.runner.kv_cache_forward_context_kwargs(),
         ):
             hidden_states, draft_ids = self.model_executable(
                 input_ids=input_ids,
@@ -269,12 +260,7 @@ class RBLNEagleProposer(EagleProposer):
                     batch_pad=num_reqs_padded,
                     is_prompt_sorted=self.runner.sort_batch_by_length,
                 )
-                attach_kv_cache_bindings(
-                    attn_metadata,
-                    self.runner.kv_caches,
-                    self.runner.kv_cache_bases,
-                    self.runner.kv_cache_view_infos,
-                )
+                self.runner.bind_kv_cache_to_metadata(attn_metadata)
                 for layer_name in attn_group.layer_names:
                     per_layer_attn_metadata[layer_name] = attn_metadata
 
@@ -297,7 +283,7 @@ class RBLNEagleProposer(EagleProposer):
                 num_tokens=num_reqs,
                 num_tokens_across_dp=num_tokens_across_dp,
                 num_padded_tokens=num_padded_tokens,
-                **build_kv_cache_forward_context_kwargs(self.runner.kv_cache_bases),
+                **self.runner.kv_cache_forward_context_kwargs(),
             ):
                 hidden_states, draft_ids = self.model_executable(
                     input_ids=staged_input_ids,
@@ -600,12 +586,7 @@ class RBLNEagleProposer(EagleProposer):
                 batch_pad=num_reqs_padded,
                 is_prompt_sorted=self.runner.sort_batch_by_length,
             )
-            attach_kv_cache_bindings(
-                attn_metadata,
-                self.runner.kv_caches,
-                self.runner.kv_cache_bases,
-                self.runner.kv_cache_view_infos,
-            )
+            self.runner.bind_kv_cache_to_metadata(attn_metadata)
             for layer_name in attn_group.layer_names:
                 per_layer_attn_metadata[layer_name] = attn_metadata
 
@@ -636,7 +617,7 @@ class RBLNEagleProposer(EagleProposer):
             num_tokens=num_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
             num_padded_tokens=num_padded_tokens,
-            **build_kv_cache_forward_context_kwargs(self.runner.kv_cache_bases),
+            **self.runner.kv_cache_forward_context_kwargs(),
         ):
             _, _ = self.model_executable(
                 input_ids=input_ids,
@@ -674,12 +655,7 @@ class RBLNEagleProposer(EagleProposer):
                 batch_pad=num_reqs_padded,
                 is_prompt_sorted=self.runner.sort_batch_by_length,
             )
-            attach_kv_cache_bindings(
-                attn_metadata,
-                self.runner.kv_caches,
-                self.runner.kv_cache_bases,
-                self.runner.kv_cache_view_infos,
-            )
+            self.runner.bind_kv_cache_to_metadata(attn_metadata)
             for layer_name in attn_group.layer_names:
                 per_layer_attn_metadata[layer_name] = attn_metadata
 
@@ -704,7 +680,7 @@ class RBLNEagleProposer(EagleProposer):
                 num_tokens=num_reqs,
                 num_tokens_across_dp=num_tokens_across_dp,
                 num_padded_tokens=num_padded_tokens,
-                **build_kv_cache_forward_context_kwargs(self.runner.kv_cache_bases),
+                **self.runner.kv_cache_forward_context_kwargs(),
             ):
                 _, _ = self.model_executable(
                     input_ids=input_ids,

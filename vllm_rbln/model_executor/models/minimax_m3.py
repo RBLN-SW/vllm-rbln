@@ -111,7 +111,7 @@ from vllm_rbln.v1.attention.backends.minimax_m3 import (
     RBLNMiniMaxM3SparseBackend,
 )
 from vllm_rbln.v1.attention.kv_cache_bindings import resolve_kv_cache
-from vllm_rbln.v1.kv_cache import ensure_kv_cache_registration
+from vllm_rbln.v1.kv_cache import register_kv_cache
 from vllm_rbln.v1.spec_decode.eagle3_pp import (
     AUX_COMBINED,
     aux_slots_captured,
@@ -369,9 +369,8 @@ class RBLNMiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
         )
         self.prefix = prefix
         self.cache_config = cache_config
-        self.layer_index: int | None = None
         context = vllm_config.compilation_config.static_forward_context
-        ensure_kv_cache_registration(context, prefix, self, subindex=1)
+        register_kv_cache(context, prefix, self)
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         # Key-only: MLAAttentionSpec budgets one vector per token (not K + V).
@@ -501,7 +500,6 @@ class RBLNMiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             raise ValueError(f"Duplicate layer name: {self.layer_name}")
         compilation_config.static_forward_context[self.layer_name] = self
         self.kv_cache = torch.tensor([])  # replaced by the runner's bind
-        self.layer_index: int | None = None
 
         self.indexer_cache = RBLNMiniMaxM3IndexerCache(
             head_dim=self.idx_head_dim,
@@ -571,8 +569,8 @@ class RBLNMiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             index_metadata = attn_metadata[self.indexer_cache.prefix]
         else:
             main_metadata = index_metadata = attn_metadata
-        kv_cache = resolve_kv_cache(main_metadata, self.layer_index)
-        index_cache = resolve_kv_cache(index_metadata, self.indexer_cache.layer_index)
+        kv_cache = resolve_kv_cache(main_metadata, self.layer_name)
+        index_cache = resolve_kv_cache(index_metadata, self.indexer_cache.prefix)
 
         q5 = q.view(batch, seq_len, num_heads, head_dim).transpose(1, 2)
         q5 = q5.view(batch, num_kv, groups, seq_len, head_dim)

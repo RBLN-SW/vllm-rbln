@@ -73,7 +73,7 @@ def _rbln_indexer_forward(
     attn_metadata = forward_context.attn_metadata
     if isinstance(attn_metadata, dict):
         attn_metadata = attn_metadata[self.k_cache.prefix]
-    k_cache = resolve_kv_cache(attn_metadata, self.k_cache.layer_index)
+    k_cache = resolve_kv_cache(attn_metadata, self.k_cache.prefix)
 
     # fp8 indexer cache is a 2-cache spec: fp8_e4m3 values here plus a companion
     # per-position scale cache in the model dtype. Registered by the
@@ -81,9 +81,7 @@ def _rbln_indexer_forward(
     # stays None on the bf16 path.
     scale_cache = None
     if getattr(self.k_cache, "scale_cache", None) is not None:
-        scale_cache = resolve_kv_cache(
-            attn_metadata, self.k_cache.scale_cache.layer_index
-        )
+        scale_cache = resolve_kv_cache(attn_metadata, self.k_cache.scale_cache.prefix)
 
     softmax_scale = torch.tensor(
         self.softmax_scale, dtype=torch.float32, device=q_indexer.device

@@ -491,34 +491,21 @@ class TestGetKvCacheNames:
         ids=["decoder-layers", "glm-slots"],
     )
     def test_orders_by_numeric_path(self, names):
-        layers = {name: SimpleNamespace() for name in names}
-        assert get_kv_cache_names(reversed(names), layers) == list(names)
+        assert get_kv_cache_names(reversed(names)) == list(names)
 
-    @pytest.mark.parametrize("aux_name", ["indexer", "renamed", "conv_ring"])
-    def test_aux_caches_sort_by_subindex(self, aux_name):
-        main = "model.layers.3.attn"
-        aux = f"{main}.{aux_name}"
-        scale = f"{aux}.scales"
-        layers = {
-            scale: SimpleNamespace(kv_cache_subindex=2),
-            aux: SimpleNamespace(kv_cache_subindex=1),
-            main: SimpleNamespace(),
-            "model.layers.4.attn": SimpleNamespace(),
-        }
-        assert get_kv_cache_names((scale, aux, main), layers) == [main, aux, scale]
+    def test_uses_full_cache_name_to_break_numeric_path_ties(self):
+        names = (
+            "model.layers.3.linear_attn",
+            "model.layers.3.linear_attn.conv_ring",
+            "model.layers.3.linear_attn.drafts",
+            "model.layers.3.self_attn.attn",
+        )
+        assert get_kv_cache_names(reversed(names)) == list(names)
 
-    def test_a_layer_reusing_a_cache_may_repeat_an_owner_path(self):
-        names = ("model.layers.0.attn", "draft.layers.0.attn", "model.layers.1.attn")
-        layers = {name: SimpleNamespace() for name in names}
-        assert get_kv_cache_names(
-            names, layers, shared_kv_cache_layers={"draft.layers.0.attn"}
-        ) == ["model.layers.0.attn", "model.layers.1.attn", "draft.layers.0.attn"]
-
-    def test_duplicate_order_is_an_error(self):
-        names = ("layer.3.main", "layer.3.other")
-        layers = {name: SimpleNamespace() for name in names}
-        with pytest.raises(ValueError, match="main.*other|other.*main"):
-            get_kv_cache_names(names, layers)
+    def test_duplicate_name_is_an_error(self):
+        name = "layer.3.attn"
+        with pytest.raises(ValueError, match="Duplicate KV cache name"):
+            get_kv_cache_names([name, name])
 
 
 class TestPrepareKernelBlockSizes:

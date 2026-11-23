@@ -149,9 +149,11 @@ class TestKvTransferWrap:
             def forward(self, layer, q, k, v, kv_cache, attn_metadata, **kwargs):
                 impl_saw["kv_cache"] = kv_cache
 
-        layer = SimpleNamespace(layer_index=0, impl=_Impl(), kv_cache=embedded)
+        layer = SimpleNamespace(impl=_Impl(), kv_cache=embedded)
         context = SimpleNamespace(
-            attn_metadata=SimpleNamespace(kv_caches=[torch.zeros(1)]),
+            attn_metadata=SimpleNamespace(
+                kv_caches=[torch.zeros(1)], kv_cache_positions={"layer.0": 0}
+            ),
             no_compile_layers={"layer.0": layer},
             slot_mapping={"layer.0": torch.zeros(1)},
             additional_kwargs={},
