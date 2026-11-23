@@ -98,7 +98,7 @@ def main() -> None:
     )
     sampling = SamplingParams(temperature=0, max_tokens=8, ignore_eos=True)
     results = []
-    for side, image_tokens in preset["cases"]:
+    for side, token_setting in preset["cases"]:
         rng = np.random.default_rng(0)
         image = Image.fromarray(rng.integers(0, 256, (side, side, 3), dtype=np.uint8))
         messages = [
@@ -110,9 +110,11 @@ def main() -> None:
                 ],
             }
         ]
-        # Gemma 4 selects the image token budget through the processor.
+        max_soft_tokens = token_setting if args.preset == "gemma4" else None
         processor = (
-            {"max_soft_tokens": image_tokens} if args.preset == "gemma4" else None
+            {"max_soft_tokens": max_soft_tokens}
+            if max_soft_tokens is not None
+            else None
         )
         ttft_ms = []
         for request in range(args.warmup + args.runs):
@@ -124,19 +126,28 @@ def main() -> None:
                 metrics = output.metrics
                 if metrics is None or metrics.first_token_latency <= 0:
                     raise RuntimeError(
-                        f"Missing TTFT for {side}px / {image_tokens} tokens"
+                        f"Missing TTFT for {side}px input (case {token_setting})"
                     )
                 ttft_ms.append(metrics.first_token_latency * 1000)
 
         median_ttft_ms = median(ttft_ms)
-        print(f"{image_tokens:4d} image tokens | median TTFT {median_ttft_ms:.2f} ms")
-        results.append(
-            {
-                "image_side_px": side,
-                "image_tokens": image_tokens,
-                "median_ttft_ms": median_ttft_ms,
-            }
+        image_tokens = token_setting
+        budget_label = ""
+        result = {"image_side_px": side, "median_ttft_ms": median_ttft_ms}
+        if max_soft_tokens is not None:
+            # Gemma inserts one image placeholder per pooled vision embedding.
+            image_token_id = llm.model_config.hf_config.image_token_id
+            image_tokens = (output.prompt_token_ids or []).count(image_token_id)
+            if image_tokens == 0:
+                raise RuntimeError(f"No image tokens in prompt for {max_soft_tokens=}")
+            result["max_soft_tokens"] = max_soft_tokens
+            budget_label = f" (max_soft_tokens={max_soft_tokens})"
+        result["image_tokens"] = image_tokens
+        print(
+            f"{image_tokens:4d} image tokens{budget_label} | "
+            f"median TTFT {median_ttft_ms:.2f} ms"
         )
+        results.append(result)
 
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
