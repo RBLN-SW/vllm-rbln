@@ -153,6 +153,8 @@ def empty_rbln_device_caches() -> bool:
 class RBLNWorker(WorkerBase):
     """A worker class that executes the model on RBLN NPUs."""
 
+    model_runner_cls: type[RBLNModelRunner] = RBLNModelRunner
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -270,7 +272,7 @@ class RBLNWorker(WorkerBase):
         set_random_seed(self.model_config.seed)
 
         # Construct the model runner
-        self.model_runner: RBLNModelRunner = RBLNModelRunner(
+        self.model_runner: RBLNModelRunner = self.model_runner_cls(
             self.vllm_config, self.device
         )
 
