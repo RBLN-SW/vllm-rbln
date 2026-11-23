@@ -20,10 +20,7 @@ import pytest
 import torch
 from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
-from vllm.v1.sample.logits_processor.builtin import (
-    LogitBiasLogitsProcessor,
-    MinPLogitsProcessor,
-)
+from vllm.v1.sample.logits_processor.builtin import MinPLogitsProcessor
 
 import vllm_rbln.compilation.backends as backends
 from vllm_rbln.v1.sample.ops.fused_penalty import (
@@ -31,9 +28,10 @@ from vllm_rbln.v1.sample.ops.fused_penalty import (
     FusedPenaltyState,
     apply_fused_penalty,
     k_buckets,
-    keeps_logit_bias_order,
+    keeps_logits_processor_order,
     row_layout,
 )
+from vllm_rbln.v1.sample.rbln_logits_processor import RBLNMinTokensLogitsProcessor
 from vllm_rbln.v1.sample.rbln_sampler import RBLNSampler
 
 from .test_rbln_sampler import npu_top_k_top_p
@@ -108,6 +106,8 @@ def test_state_matches_dense_across_steps(num_rows, vocab, base):
             {i: r["bias"] for i, r in enumerate(live)},
             vocab,
             num_rows,
+            {},
+            device=torch.device("cpu"),
         )
         assert plan is not None
         rows, row_vocab, k, cidx, lanes = plan
@@ -143,6 +143,8 @@ def _update(state, prompts, vocab, num_rows):
         {},
         vocab,
         num_rows,
+        {},
+        device=torch.device("cpu"),
     )
 
 
@@ -189,6 +191,8 @@ def test_frequency_only_request_takes_no_prompt_slots():
         {},
         vocab,
         2,
+        {},
+        device=torch.device("cpu"),
     )
     assert step is not None
     assert state._reqs["r"].used == 2  # chunks of 3 and 5000 only
@@ -205,6 +209,8 @@ def _one_request(state, *, rep=1.0, freq=0.0, outputs=(), bias=None):
         {0: bias} if bias else {},
         16384,
         2,
+        {},
+        device=torch.device("cpu"),
     )
 
 
@@ -216,16 +222,19 @@ def test_values_past_fp16_keep_the_upstream_path():
     assert _one_request(FusedPenaltyState(), rep=1.05, bias={5: 1e6}) is None
 
 
-def test_logit_bias_with_a_custom_processor_keeps_the_upstream_path():
-    bias = object.__new__(LogitBiasLogitsProcessor)
-    bias.biases = {0: {5: 1.0}}
-    md = SimpleNamespace(
-        thinking_budget_state_holder=None,
-        no_penalties=True,
-        logitsprocs=SimpleNamespace(non_argmax_invariant=[bias, SimpleNamespace()]),
-    )
-    assert not keeps_logit_bias_order(md)
-    assert FusedPenaltyState().plan(md, None, (2, 16384), "cpu") is None
+@pytest.mark.parametrize(
+    "params",
+    [
+        pytest.param(SamplingParams(logit_bias={5: 1.0}), id="logit_bias"),
+        pytest.param(SamplingParams(min_tokens=2, stop_token_ids=[5]), id="min_tokens"),
+    ],
+)
+def test_custom_processor_keeps_the_upstream_path(params):
+    batch = build_input_batch([("r", params)], vocab_size=16384)
+    md = batch.sampling_metadata
+    md.logitsprocs.non_argmax_invariant.append(SimpleNamespace())
+    assert not keeps_logits_processor_order(md)
+    assert FusedPenaltyState().plan(md, batch, (1, 16384), "cpu") is None
 
 
 def test_warm_up_skips_fused_graphs_for_an_unsupported_vocab(monkeypatch):
@@ -249,6 +258,48 @@ def test_request_past_the_cap_keeps_the_upstream_path():
     over = {"r": [c * 64 for c in range(2370)]}
     assert _update(FusedPenaltyState(), fits, vocab, 2)[2] == 2368
     assert _update(FusedPenaltyState(), over, vocab, 2) is None
+
+
+@pytest.mark.parametrize("frequency", [0.0, 0.25])
+def test_plan_reuses_unchanged_inputs(frequency):
+    vocab = 16384
+    params = SamplingParams(
+        repetition_penalty=2.0,
+        presence_penalty=1.0,
+        frequency_penalty=frequency,
+        min_tokens=3,
+        stop_token_ids=[65],
+        logit_bias={65: 2.0},
+    )
+    batch = build_input_batch(
+        [("a", params)],
+        vocab_size=vocab,
+        prompt_token_ids=[5, 130],
+        output_token_ids=[5],
+    )
+    state = FusedPenaltyState()
+    logits = torch.full((2, vocab), 8.0)
+    plan = state.plan(batch.sampling_metadata, batch, logits.shape, logits.device)
+    assert plan is not None
+    original_lanes = plan.lanes.clone()
+    outputs = batch.req_output_token_ids[0]
+    assert outputs is not None
+    for count in (2, 3):
+        outputs.append(5)
+        batch.refresh_metadata()
+        next_plan = state.plan(
+            batch.sampling_metadata, batch, logits.shape, logits.device
+        )
+        assert next_plan is not None
+        assert (next_plan is plan) == (frequency == 0 and count == 2)
+        assert (next_plan.cidx is plan.cidx) == (next_plan is plan)
+        rows, row_vocab, k, cidx, lanes = next_plan
+        result = apply_fused_penalty(logits, cidx, lanes, rows, row_vocab, k)
+        assert result[0, 5] == 3.0 - frequency * count
+        assert result[0, 65] == (-torch.inf if count == 2 else 10.0)
+        assert torch.equal(result[1], logits[1])
+
+    assert torch.equal(plan.lanes, original_lanes)
 
 
 def _run_sampler(params, logits, fused: bool, expect_kinds: set[str]):
@@ -371,6 +422,9 @@ ROWS, LAUNCHES = 256, 40
         SamplingParams(temperature=1.0, top_k=8, logit_bias=BIAS),
         SamplingParams(temperature=1.0, min_p=0.05, repetition_penalty=1.3),
         SamplingParams(temperature=1.2, min_p=0.05, top_k=16, top_p=0.9),
+        SamplingParams(
+            temperature=1.0, top_k=8, min_tokens=4, stop_token_ids=WEIGHTED[30:32]
+        ),
     ],
     ids=[
         "temp_topp_topk_rep_bias",
@@ -378,6 +432,7 @@ ROWS, LAUNCHES = 256, 40
         "topk_bias",
         "min_p_rep",
         "min_p_topk_topp",
+        "min_tokens_topk",
     ],
 )
 @pytest.mark.use_device
@@ -407,6 +462,12 @@ def test_sampled_distribution_matches_upstream(params, monkeypatch):
             raise AssertionError("min_p ran outside the sampling graph")
 
         monkeypatch.setattr(MinPLogitsProcessor, "apply", eager_min_p)
+    if params.min_tokens:
+        monkeypatch.setattr(
+            RBLNMinTokensLogitsProcessor,
+            "apply",
+            MagicMock(side_effect=AssertionError("min_tokens ran outside the graph")),
+        )
     samples = torch.stack(
         [
             sampler(logits.clone(), batch.sampling_metadata, input_batch=batch)
@@ -415,6 +476,10 @@ def test_sampled_distribution_matches_upstream(params, monkeypatch):
             for _ in range(LAUNCHES)
         ]
     )
-    penalized = params.repetition_penalty != 1.0 or bool(params.logit_bias)
+    penalized = (
+        params.repetition_penalty != 1.0
+        or bool(params.logit_bias)
+        or bool(params.min_tokens)
+    )
     assert bool(sampler._fused_graphs) == penalized
     assert_samples_match(samples=samples, probs=expected)

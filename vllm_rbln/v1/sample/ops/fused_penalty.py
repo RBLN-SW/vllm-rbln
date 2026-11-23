@@ -11,11 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Repetition / frequency / presence penalties and logit bias, fused into the
-sampling graph.
+"""Penalties, logit bias and min_tokens, fused into the sampling graph.
 
-The host keeps, per request, the 64-wide vocab chunks of the tokens it has seen
-or biased, with three lane parameters (add, mul, sub). The sampling graph
+The host keeps, per request, the 64-wide vocab chunks of seen, biased or blocked
+tokens, with three lane parameters (add, mul, sub). The sampling graph
 gathers only those chunks, penalizes them, and scatters them back.
 
 Invariants the scatter relies on:
@@ -61,6 +60,14 @@ class FusedPenaltyPlan(NamedTuple):
     lanes: torch.Tensor  # [rows, 3, k, CHUNK] fp16 (add, mul, sub)
 
 
+class _CachedPlan(NamedTuple):
+    # (num_rows, vocab_size, device, k, request (identity, version) pairs).
+    # Request pairs follow the current batch row order.
+    key: tuple[int, int, torch.device, int, tuple[tuple[object, int], ...]]
+    blocked_tokens: dict[int, frozenset[int]]
+    plan: FusedPenaltyPlan
+
+
 def row_layout(num_rows: int, vocab_size: int) -> tuple[int, int]:
     """(rows, row_vocab) of the fused graph for a batch of `num_rows`."""
     # A batch of one is split into two half-vocab rows.
@@ -96,26 +103,25 @@ def active_argmax_invariant(sampling_metadata: SamplingMetadata) -> list[Any]:
     ]
 
 
-def without_penalties_and_logit_bias(
+def without_fused_logits_processors(
     sampling_metadata: SamplingMetadata,
 ) -> SamplingMetadata:
-    """The metadata upstream `apply_logits_processors` should see when penalties
-    and logit bias run in the sampling graph instead."""
+    """Metadata for eager processing when penalties, bias and min_tokens run
+    in the sampling graph."""
     return dataclasses.replace(
         sampling_metadata,
         no_penalties=True,
         logitsprocs=LogitsProcessors(
             p
             for p in sampling_metadata.logitsprocs.all
-            if not isinstance(p, LogitBiasLogitsProcessor)
+            if not isinstance(p, (LogitBiasLogitsProcessor, MinTokensLogitsProcessor))
         ),
     )
 
 
-def keeps_logit_bias_order(sampling_metadata: SamplingMetadata) -> bool:
-    """Whether running logit bias in the graph, after the eager processors, keeps
-    upstream's order. Upstream applies it before custom non-argmax-invariant
-    processors, which may read the biased logits."""
+def keeps_logits_processor_order(sampling_metadata: SamplingMetadata) -> bool:
+    """Custom non-argmax-invariant processors may read biased or masked logits,
+    so bias and min_tokens cannot move past them."""
     return all(
         isinstance(p, (LogitBiasLogitsProcessor, MinTokensLogitsProcessor))
         for p in sampling_metadata.logitsprocs.non_argmax_invariant
@@ -140,6 +146,8 @@ class _Request:
         "num_processed_output_tokens",
         "chunk_indices",
         "lanes",
+        "cache_identity",
+        "version",
     )
 
     def __init__(
@@ -168,6 +176,8 @@ class _Request:
         self.num_processed_output_tokens = 0
         self.chunk_indices = np.zeros((rows, capacity), np.int32)
         self.lanes = np.empty((rows, 3, capacity, CHUNK), np.float16)
+        self.cache_identity = object()
+        self.version = 0
 
     @property
     def used(self) -> int:
@@ -198,20 +208,26 @@ class _Request:
             slots[chunk] = s
             self.chunk_indices[row, s] = chunk
             self.lanes[row, :, s] = _IDENTITY
+            self.version += 1
         return row, s, t % CHUNK
+
+    def _set_lane(self, token: int, parameter: int, value: float) -> None:
+        row, slot, lane = self._lane(token)
+        value_fp16 = np.float16(value)
+        if self.lanes[row, parameter, slot, lane] != value_fp16:
+            self.lanes[row, parameter, slot, lane] = value_fp16
+            self.version += 1
 
     def add_bias(self, token: int, value: float) -> None:
         if abs(value) > _FP16_MAX:
             self.fits = False
             return
-        row, s, lane = self._lane(token)
-        self.lanes[row, ADD, s, lane] = value
+        self._set_lane(token, ADD, value)
 
     def add_prompt(self, token: int) -> None:
         if token not in self.seen_token_ids:
             self.seen_token_ids.add(token)
-            row, s, lane = self._lane(token)
-            self.lanes[row, MUL, s, lane] = self.repetition_penalty
+            self._set_lane(token, MUL, self.repetition_penalty)
 
     def add_output(self, token: int) -> None:
         if self.has_repetition_penalty:
@@ -224,8 +240,7 @@ class _Request:
             if abs(sub) > _FP16_MAX:
                 self.fits = False
                 return
-            row, s, lane = self._lane(token)
-            self.lanes[row, SUB, s, lane] = sub
+            self._set_lane(token, SUB, sub)
 
 
 class FusedPenaltyState:
@@ -236,6 +251,7 @@ class FusedPenaltyState:
         self._reqs: dict[str, _Request] = {}
         self._cidx: np.ndarray | None = None
         self._lanes: np.ndarray | None = None
+        self._cached_plan: _CachedPlan | None = None
 
     def plan(
         self,
@@ -259,9 +275,26 @@ class FusedPenaltyState:
             ),
             {},
         )
-        if sampling_metadata.no_penalties and not biases:
+        min_tokens: dict[int, tuple[int, Sequence[int], set[int], bool]] = next(
+            (
+                p.min_toks
+                for p in sampling_metadata.logitsprocs.non_argmax_invariant
+                if isinstance(p, MinTokensLogitsProcessor)
+            ),
+            {},
+        )
+        # Structured outputs restore stop logits if masking leaves no valid
+        # token. Keep that logits-dependent decision in the existing processor.
+        if any(structured for _, _, _, structured in min_tokens.values()):
             return None
-        if biases and not keeps_logit_bias_order(sampling_metadata):
+        blocked_tokens = {
+            i: stops for i, (_, _, stops, _) in min_tokens.items() if stops
+        }
+        if sampling_metadata.no_penalties and not biases and not blocked_tokens:
+            return None
+        if (biases or blocked_tokens) and not keeps_logits_processor_order(
+            sampling_metadata
+        ):
             return None
 
         n = input_batch.num_reqs
@@ -278,7 +311,7 @@ class FusedPenaltyState:
         def prompt(i: int) -> np.ndarray:
             return input_batch.token_ids_cpu[i, : input_batch.num_prompt_tokens[i]]
 
-        step = self.update(
+        return self.update(
             input_batch.req_ids[:n],
             prompt,
             outputs,
@@ -288,17 +321,17 @@ class FusedPenaltyState:
             biases,
             vocab_size,
             num_rows,
+            blocked_tokens,
+            device=device,
         )
-        if step is None:
-            return None
-        rows, row_vocab, k, cidx, lanes = step
-        return FusedPenaltyPlan(rows, row_vocab, k, cidx.to(device), lanes.to(device))
 
     def forget(self, req_ids: Iterable[str]) -> None:
         """Drop finished requests. A step lists only the requests it schedules,
         so absence from one step does not mean a request is gone."""
         for rid in req_ids:
             self._reqs.pop(rid, None)
+        if not self._reqs:
+            self._cached_plan = None
 
     def k_buckets(self, logits_shape: torch.Size) -> tuple[int, ...]:
         """Every `k` a plan for `logits_shape` can take."""
@@ -309,7 +342,9 @@ class FusedPenaltyState:
     ) -> FusedPenaltyPlan:
         """A plan that changes nothing, at chunk-slot count `k`. Used for warm-up."""
         num_rows, vocab_size = logits_shape
-        rows, row_vocab, k, cidx, lanes = self._copy_out([], vocab_size, num_rows, k)
+        rows, row_vocab, k, cidx, lanes = self._copy_out(
+            [], vocab_size, num_rows, k, {}
+        )
         return FusedPenaltyPlan(rows, row_vocab, k, cidx.to(device), lanes.to(device))
 
     def update(
@@ -323,15 +358,13 @@ class FusedPenaltyState:
         biases: dict[int, dict[int, float]],
         vocab_size: int,
         num_rows: int,
-    ) -> tuple[int, int, int, torch.Tensor, torch.Tensor] | None:
-        """Write this step's new tokens into the lanes. Return
-        (rows, row_vocab, k, cidx, lanes).
-
-        `num_rows` is the padded batch. Rows past `len(req_ids)` are identity.
-        `k` is the smallest bucket that fits the live requests. None when one of
-        them uses more chunks than any bucket holds.
-        """
+        blocked_tokens: dict[int, set[int]],
+        *,
+        device: torch.device,
+    ) -> FusedPenaltyPlan | None:
+        """Update live requests and return a plan in the smallest K bucket that fits."""
         split = num_rows == 1
+        masked_lanes: dict[int, list[tuple[int, int, int]]] = {}
         for i, rid in enumerate(req_ids):
             outs = output_token_ids[i] if i < len(output_token_ids) else ()
             n_out = len(outs)
@@ -376,6 +409,8 @@ class FusedPenaltyState:
                 if 0 <= t < vocab_size:
                     req.add_output(int(t))
             req.num_processed_output_tokens = n_out
+            if stops := blocked_tokens.get(i):
+                masked_lanes[i] = [req._lane(token) for token in stops]
 
         if not all(self._reqs[rid].fits for rid in req_ids):
             return None
@@ -384,9 +419,42 @@ class FusedPenaltyState:
         k = next((b for b in k_buckets(row_vocab, self.base_buckets) if b >= need), 0)
         if not k:
             return None
-        return self._copy_out(req_ids, vocab_size, num_rows, k)
 
-    def _copy_out(self, req_ids, vocab_size, num_rows, k):
+        reqs = tuple(self._reqs[rid] for rid in req_ids)
+        key = (
+            num_rows,
+            vocab_size,
+            device,
+            k,
+            tuple((req.cache_identity, req.version) for req in reqs),
+        )
+        cached = self._cached_plan
+        if (
+            cached is not None
+            and cached.key == key
+            and cached.blocked_tokens == blocked_tokens
+        ):
+            return cached.plan
+
+        rows, row_vocab, _, cidx, lanes = self._copy_out(
+            req_ids, vocab_size, num_rows, k, masked_lanes
+        )
+        # The next step can overwrite the staging buffers while a plan is in use.
+        plan = FusedPenaltyPlan(
+            rows,
+            row_vocab,
+            k,
+            cidx.to(device, copy=True),
+            lanes.to(device, copy=True),
+        )
+        self._cached_plan = _CachedPlan(
+            key,
+            {i: frozenset(stops) for i, stops in blocked_tokens.items()},
+            plan,
+        )
+        return plan
+
+    def _copy_out(self, req_ids, vocab_size, num_rows, k, masked_lanes):
         rows, row_vocab = row_layout(num_rows, vocab_size)
         per_req = rows // num_rows
         if (
@@ -410,7 +478,12 @@ class FusedPenaltyState:
             cidx[out, :n] = req.chunk_indices[r, :n]
             cidx[out, n:] = req.chunk_indices[r, 0]
             lanes[out, :, :n] = req.lanes[r, :, :n]
-            lanes[out, :, n:] = req.lanes[r, :, :1]
+            # Mask only the step buffer, retaining bias for the length boundary.
+            # Do this before duplicating slot 0 so all scatter copies agree.
+            for token_row, slot, lane in masked_lanes.get(i, ()):
+                if token_row == r:
+                    lanes[out, ADD, slot, lane] = -np.inf
+            lanes[out, :, n:] = lanes[out, :, :1]
         return (
             rows,
             row_vocab,

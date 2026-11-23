@@ -2,7 +2,7 @@
 
 `use_fused_sampling` moves the sampling step's logits processing into the
 compiled sampling graph. It covers repetition, frequency and presence penalties,
-`logit_bias` and `min_p`.
+`logit_bias`, `min_tokens` and `min_p`.
 
 ### Fused penalties
 
@@ -22,16 +22,15 @@ Key components:
 - `vllm_rbln.v1.sample.ops.fused_penalty` holds the per-request host state
   (`FusedPenaltyState`), which turns a step's sampling metadata into a
   `FusedPenaltyPlan`, and the device-side math (`apply_fused_penalty`).
-- `RBLNSampler` asks for a plan each step, hands upstream
-  `apply_logits_processors` the metadata without penalties and logit bias, and
-  passes the plan to `sample()`. Its `warm_up()` compiles the fused graphs with
-  the rest of the sampler.
+- `RBLNSampler` asks for a plan each step. When it has one, it skips eager
+  penalties, logit bias and `min_tokens`, then passes the plan to `sample()`.
+  Its `warm_up()` compiles the fused graphs with the rest of the sampler.
 
 ## Enabling
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `--rbln-use-fused-sampling` | `False` | Run penalties, logit bias and min_p inside the sampling graph. Requires `use_custom_sampler`. |
+| `--rbln-use-fused-sampling` | `False` | Run penalties, logit bias, min_tokens and min_p inside the sampling graph. Requires `use_custom_sampler`. |
 
 Fused sampling is disabled by default. Enable it on the vllm model path with
 `--rbln-use-fused-sampling`, or pass
@@ -41,6 +40,10 @@ Penalties and logit bias keep the existing path when a step runs speculative
 decoding or a thinking budget. Upstream vLLM rejects min_p with speculative
 decoding. A step also keeps the existing path when the sampler returns processed
 logprobs, or when the vocab size is not a multiple of 128.
+
+`min_tokens` sets the add lane of blocked stop tokens to `-inf` in the step's
+plan. Active `min_tokens` with structured outputs or a custom
+non-argmax-invariant processor uses the existing logits processor path.
 
 min_p also runs in a graph with this option on. A step with min_p applies the
 penalties in a graph of their own first, since min_p reads the penalized
@@ -78,6 +81,9 @@ with any other argmax-invariant logits processor keeps the existing path.
 
 The host work grows with the number of new tokens per step, not with the vocab
 size. The device work grows with `K`, not with the vocab size.
+
+The sampler reuses the previous plan when the layout, lane values and stop mask
+match. Otherwise, it rebuilds both `cidx` and `lanes`.
 
 ### What each token gets
 
