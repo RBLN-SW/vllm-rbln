@@ -1315,6 +1315,7 @@ class TestGemma4Drafting:
         mlp.gate_up_proj.quant_method = UnquantizedLinearMethod()
         monkeypatch.setattr(gemma4_module, "get_layers_from_vllm_config", lambda *a: {})
         monkeypatch.setattr(proposer, "_setup_gemma4_kv_sharing", lambda *a: None)
+        monkeypatch.setattr(proposer, "_compile_drafter", lambda fn: fn)
         monkeypatch.setattr(
             eagle_module.RBLNEagleProposer,
             "load_model",
@@ -1345,14 +1346,27 @@ class TestGemma4Drafting:
         )
         monkeypatch.setattr(proposer, "_build_draft_step", lambda n, p: ({}, n, {}))
         seen = []
-        static_ids = torch.zeros(2, dtype=torch.long)
 
-        def executable(*, input_ids, positions, hidden_states, **kwargs):
-            seen.append((positions.clone(), hidden_states.clone()))
-            static_ids.copy_(input_ids.view(-1).long() + 1)
-            return hidden_states.view(2, -1) + 1, static_ids
+        class Assistant(torch.nn.Module):
+            # Samples id + 1 and advances the hidden state by one per step.
+            def forward(self, *, input_ids, positions, hidden_states, inputs_embeds):
+                seen.append((positions.clone(), hidden_states.clone()))
+                return input_ids.float().view(-1, 1), hidden_states + 1
 
-        proposer.model_executable = executable
+            def compute_logits(self, sample_hidden_states):
+                ids = sample_hidden_states.view(-1).long() + 1
+                return torch.nn.functional.one_hot(ids, 64).float()
+
+        # The draft graph itself, run eagerly: one call feeds every step forward.
+        monkeypatch.setattr(gemma4_module, "get_layers_from_vllm_config", lambda *a: {})
+        monkeypatch.setattr(proposer, "_setup_gemma4_kv_sharing", lambda *a: None)
+        monkeypatch.setattr(proposer, "_compile_drafter", lambda fn: fn)
+        monkeypatch.setattr(
+            eagle_module.RBLNEagleProposer,
+            "load_model",
+            lambda self, target: setattr(self, "model", Assistant()),
+        )
+        proposer.load_model(torch.nn.Identity())
         result = _call_propose(proposer)
         if strict_producer or intermediate:
             assert seen == []
