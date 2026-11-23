@@ -453,8 +453,11 @@ def test_mtp_loads_own_embedding_on_last_pp_stage(monkeypatch, stages):
 
 
 @pytest.mark.parametrize("sampled_only", [False, True])
-def test_head_relocation_preserves_reduction(sampled_only):
+def test_head_relocation_preserves_reduction(monkeypatch, sampled_only):
+    import vllm_rbln.model_executor.models.deepseek_v4 as dsv4
     from vllm_rbln.model_executor.models.deepseek_v4 import _hc_head_hidden
+
+    monkeypatch.setattr(dsv4, "is_prefill_step", lambda: True)
 
     rng = torch.Generator().manual_seed(7)
     streams = torch.randn(2, 4, 3, 8, generator=rng)
@@ -470,6 +473,41 @@ def test_head_relocation_preserves_reduction(sampled_only):
         flat = flat[:, -1]
         expected = expected[:, -1]
     actual = _hc_head_hidden(flat, 4, fn, scale, base, 1e-5, 1e-6, norm)
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("prefill", [False, True])
+def test_only_decode_reads_the_final_norm_on_the_op(monkeypatch, prefill):
+    import vllm_rbln.model_executor.models.deepseek_v4 as dsv4
+
+    rng = torch.Generator().manual_seed(7)
+    reads = []
+
+    def residual_read(x, weight, eps):
+        reads.append(tuple(x.shape))
+        rows = x.float()
+        normed = rows * torch.rsqrt(rows.pow(2).mean(dim=-1, keepdim=True) + eps)
+        return (normed * weight.float()).to(x.dtype)
+
+    monkeypatch.setattr(dsv4, "is_prefill_step", lambda: prefill)
+    monkeypatch.setattr(
+        torch.ops.rbln_custom_ops, "residual_read", residual_read, raising=False
+    )
+    norm = torch.nn.RMSNorm(8, eps=1e-5)
+    norm.variance_epsilon = norm.eps  # the attribute vLLM's RMSNorm carries
+    norm.weight.data = 1.0 + 0.1 * torch.randn(8, generator=rng)
+    streams = torch.randn(2, 4, 3, 8, generator=rng)
+    fn = torch.randn(4, 32, generator=rng)
+    base = torch.randn(4, generator=rng)
+    scale = torch.tensor([0.25])
+    flat = streams.transpose(1, 2).reshape(2, 3, 32)
+    normalized = flat * torch.rsqrt(flat.square().mean(-1, keepdim=True) + 1e-5)
+    gates = torch.sigmoid(normalized @ fn.T * scale + base) + 1e-6
+    expected = norm((streams * gates.transpose(1, 2).unsqueeze(-1)).sum(1))
+
+    actual = dsv4._hc_head_hidden(flat, 4, fn, scale, base, 1e-5, 1e-6, norm)
+
+    assert reads == ([] if prefill else [(1, 6, 8)])
     torch.testing.assert_close(actual, expected)
 
 

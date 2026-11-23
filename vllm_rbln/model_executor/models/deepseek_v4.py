@@ -69,6 +69,7 @@ from vllm_rbln.model_executor.layers.quantization.deepseek_v4 import (
     e8m0_to_bf16,
 )
 from vllm_rbln.patches.attention import _resolve_kv_cache
+from vllm_rbln.utils import is_prefill_step
 from vllm_rbln.v1.attention.backends.deepseek_v4 import (
     DSV4_INDEX_HEAD_DIM,
     DSV4_KV8_ROW_BYTES,
@@ -863,7 +864,15 @@ def _hc_head_hidden(
     z_pre = F.linear(x, fn) * scale + base
     streams = rows.reshape(1, -1, hc_mult, hidden).transpose(1, 2)  # [1, n, N, H]
     out = torch.ops.rbln_custom_ops.hc_stream_reduce(streams.float(), z_pre, eps=hc_eps)
-    return norm(out.to(flat.dtype)).reshape(*lead, hidden)
+    out = out.to(flat.dtype)
+    if not is_prefill_step():
+        # A read gathers the rows: left cut by the decode mHC kernels, they would reach
+        # lm_head, whose weight takes the layout prefill gives it (as GLM-5.3's head).
+        out = torch.ops.rbln_custom_ops.residual_read(
+            out, norm.weight, norm.variance_epsilon
+        )
+        return out.reshape(*lead, hidden)
+    return norm(out).reshape(*lead, hidden)
 
 
 class RBLNDeepseekV4Model(nn.Module):
