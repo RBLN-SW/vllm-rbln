@@ -361,6 +361,18 @@ class RBLNMiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
         self.head_dim = head_dim
         vllm_config = get_current_vllm_config()
         cache_dtype = cache_config.cache_dtype if cache_config is not None else "auto"
+        # The index cache follows --kv-cache-dtype; a separate indexer_kv_dtype
+        # is not wired for MiniMax M3 on RBLN yet.
+        indexer_kv_dtype = vllm_config.attention_config.indexer_kv_dtype
+        if indexer_kv_dtype not in (
+            "auto",
+            "fp8" if cache_dtype.startswith("fp8") else "bf16",
+        ):
+            raise ValueError(
+                "The MiniMax M3 index cache follows --kv-cache-dtype on RBLN; got "
+                f"indexer_kv_dtype={indexer_kv_dtype!r} with "
+                f"--kv-cache-dtype {cache_dtype}."
+            )
         self.fp8_dtype = _fp8_cache_dtype(cache_dtype)
         self.dtype = (
             kv_cache_dtype_str_to_dtype(cache_dtype, vllm_config.model_config)

@@ -23,6 +23,7 @@ from vllm.utils.torch_utils import get_dtype_size, kv_cache_dtype_str_to_dtype
 
 from vllm_rbln import envs
 from vllm_rbln.platform import use_device_tensor
+from vllm_rbln.v1.attention.indexer_kv_dtype import resolve_rbln_indexer_kv_dtype
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -133,6 +134,23 @@ def _validate(vllm_config: "VllmConfig") -> None:
 
     if vllm_config.lora_config is not None:
         raise ValueError("LoRA is not supported on RBLN.")
+
+    # Upstream would attach its online quantization methods (CUDA/Triton GEMMs)
+    # to the layers the config names; RBLN implements none of them, so refuse
+    # here instead of failing at compile time.
+    if getattr(model_config, "quantization_config", None) is not None:
+        raise ValueError(
+            "--quantization-config (online quantization, or an online "
+            "--quantization shorthand such as fp8_per_channel) is not supported "
+            f"on RBLN; got {model_config.quantization_config}. Use a "
+            "pre-quantized checkpoint whose config.json quantization_config "
+            "RBLN supports."
+        )
+
+    # Refuse an indexer K-cache dtype the RBLN DSA indexer cannot read.
+    resolve_rbln_indexer_kv_dtype(
+        vllm_config.cache_config.cache_dtype, vllm_config.attention_config
+    )
 
     uses_gdn = _runs_gated_delta_net(vllm_config)
     if uses_gdn:

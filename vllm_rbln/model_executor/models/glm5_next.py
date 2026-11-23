@@ -630,7 +630,14 @@ class RBLNGlm5NextIndexer(nn.Module):
             requires_grad=False,
         )
 
-        self.block_size = get_current_vllm_config().cache_config.block_size
+        vllm_config = get_current_vllm_config()
+        indexer_kv_dtype = vllm_config.attention_config.indexer_kv_dtype
+        if indexer_kv_dtype not in ("auto", "fp8"):
+            raise ValueError(
+                "The GLM-5.3 indexer keeps an fp8 key cache on RBLN; got "
+                f"indexer_kv_dtype={indexer_kv_dtype!r}."
+            )
+        self.block_size = vllm_config.cache_config.block_size
         attn_prefix = prefix.rsplit(".indexer", 1)[0]
         self.key_cache = RBLNGlm5NextPagedCache(
             f"{attn_prefix}.attn.{SLOT_DSA_INDEX_KEY}",

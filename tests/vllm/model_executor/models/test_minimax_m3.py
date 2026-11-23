@@ -1091,11 +1091,13 @@ def test_text_config_loads_from_local_checkpoint(tmp_path):
 
 
 def test_minimax_m3_indexer_cache_registers_its_name():
-    from vllm.config import CompilationConfig, set_current_vllm_config
+    from vllm.config import AttentionConfig, CompilationConfig, set_current_vllm_config
 
     from vllm_rbln.model_executor.models.minimax_m3 import RBLNMiniMaxM3IndexerCache
 
-    config = SimpleNamespace(compilation_config=CompilationConfig())
+    config = SimpleNamespace(
+        compilation_config=CompilationConfig(), attention_config=AttentionConfig()
+    )
     with set_current_vllm_config(config):
         cache = RBLNMiniMaxM3IndexerCache(
             head_dim=128, prefix="model.layers.0.self_attn.attn.indexer"

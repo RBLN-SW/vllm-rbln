@@ -143,6 +143,7 @@ from vllm_rbln.v1.attention.backends.gdn_attn import (
     RBLNGDNAttentionMetadataBuilder,
 )
 from vllm_rbln.v1.attention.backends.mla.indexer import RBLNDeepseekV32IndexerBackend
+from vllm_rbln.v1.attention.indexer_kv_dtype import is_fp8_rbln_indexer
 from vllm_rbln.v1.attention.kv_cache_bindings import (
     KVCacheViewInfo,
     attach_kv_cache_bindings,
@@ -3779,7 +3780,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
         self.initialize_attn_backend(kv_cache_config)
         # NOTE(RBLN): FP8 DSA scale stores silently drop writes past a KV block.
-        if self.cache_config.cache_dtype.startswith("fp8"):
+        if is_fp8_rbln_indexer(
+            self.cache_config.cache_dtype, self.vllm_config.attention_config
+        ):
             for group in self._kv_cache_spec_attn_group_iterator():
                 if group.backend is RBLNDeepseekV32IndexerBackend:
                     block_size = group.kv_cache_spec.block_size
@@ -3809,6 +3812,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 model_config=self.model_config,
                 cache_dtype=self.cache_config.cache_dtype,
                 sub_block_size=self.rbln_config.sub_block_size,
+                attention_config=self.vllm_config.attention_config,
             ),
         )
         self._kernel_block_sizes = kernel_block_sizes

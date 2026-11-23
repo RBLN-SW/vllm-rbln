@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from vllm.config import CompilationConfig, set_current_vllm_config
+from vllm.config import AttentionConfig, CompilationConfig, set_current_vllm_config
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
@@ -228,10 +228,11 @@ class TestIndexerCacheBackends:
         assert RBLNDeepseekV32IndexerScaleBackend.get_supported_head_sizes() == [1]
 
     @staticmethod
-    def _indexer_cache(model_dtype, kv_cache_dtype="fp8"):
+    def _indexer_cache(model_dtype, kv_cache_dtype="fp8", indexer_kv_dtype="auto"):
         from vllm_rbln.patches import deepseek_v2 as patch
 
         vllm_config = SimpleNamespace(
+            attention_config=AttentionConfig(indexer_kv_dtype=indexer_kv_dtype),
             model_config=SimpleNamespace(
                 dtype=model_dtype,
                 hf_text_config=SimpleNamespace(index_head_dim=128),
@@ -265,6 +266,27 @@ class TestIndexerCacheBackends:
         cache, _ = self._indexer_cache(torch.bfloat16, kv_cache_dtype="auto")
         assert cache.dtype == torch.bfloat16
         assert cache.scale_cache is None
+
+    def test_indexer_kv_dtype_fp8_under_a_bf16_kv_cache(self):
+        # The MLA latent cache stays bf16; only the indexer keys go fp8.
+        cache, context = self._indexer_cache(
+            torch.bfloat16, kv_cache_dtype="auto", indexer_kv_dtype="fp8"
+        )
+        assert cache.dtype == torch.float8_e4m3fn
+        assert cache.scale_cache.dtype == torch.bfloat16
+        assert context[cache.scale_cache.prefix] is cache.scale_cache
+
+    def test_indexer_kv_dtype_bf16_under_an_fp8_kv_cache(self):
+        cache, _ = self._indexer_cache(
+            torch.bfloat16, kv_cache_dtype="fp8", indexer_kv_dtype="bf16"
+        )
+        assert cache.dtype == torch.bfloat16
+        assert cache.scale_cache is None
+
+    @pytest.mark.parametrize("indexer_kv_dtype", ["mxfp4", "nvfp4"])
+    def test_an_indexer_kv_dtype_without_a_kernel_is_refused(self, indexer_kv_dtype):
+        with pytest.raises(ValueError, match="not supported on RBLN"):
+            self._indexer_cache(torch.bfloat16, indexer_kv_dtype=indexer_kv_dtype)
 
     def test_a_model_dtype_without_an_indexer_kernel_is_refused(self):
         with pytest.raises(ValueError, match="float16 or bfloat16"):
