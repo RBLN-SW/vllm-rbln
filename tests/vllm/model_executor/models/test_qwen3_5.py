@@ -275,12 +275,12 @@ def test_warmup_runs_the_encoder_once_over_each_bucket(visual):
     # Warm-up compiles the shapes a request's image arrives in: the inputs it
     # builds match what _encoder_inputs returns for an image of that bucket.
     for call, grid in zip(encoder.call_args_list, [[1, 8, 8], [1, 8, 16]]):
+        assert not call.args[4].any()
         pixels = torch.zeros(grid[1] * grid[2], 3 * TEMPORAL * PATCH * PATCH)
         request = model._encoder_inputs(model._mm_encoder, pixels, grid)
         assert [(x.shape, x.dtype, x.device) for x in call.args] == [
             (x.shape, x.dtype, x.device) for x in request
         ]
-        assert not call.args[4].any()
 
     model.has_vision = False
     model.warmup_mm_encoder()
