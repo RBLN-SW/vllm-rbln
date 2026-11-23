@@ -113,8 +113,8 @@ class TestRblnTransferTopology:
         assert (shape[topo.kv_head_dim], shape[topo.kv_token_dim]) == (7, 5)
 
     def test_a_gdn_backend_ahead_of_attention_leaves_the_probe_to_attention(self):
-        # Qwen3.5 declares its GDN state as a full-attention page, so the
-        # topology is not Mamba, yet the conv ring's SSM backend can come first.
+        # Qwen3.5's GDN state moves as a block, not as Mamba, so the probe runs,
+        # yet a GDN layer's SSM backend can come first.
         with self._kernel_config(False):
             topo = RblnTransferTopology(
                 tp_rank=0,
@@ -131,6 +131,11 @@ class TestRblnTransferTopology:
             )
 
         assert (shape[topo.kv_head_dim], shape[topo.kv_token_dim]) == (7, 5)
+
+    def test_a_stage_of_only_gdn_layers_is_refused_by_name(self):
+        # A PP stage can hold GDN layers alone, leaving no layout to read.
+        with pytest.raises(AssertionError, match="RBLN_GDN_ATTN"):
+            self._topology(RBLNGDNAttentionBackend)
 
     @pytest.mark.parametrize(
         "backend",
