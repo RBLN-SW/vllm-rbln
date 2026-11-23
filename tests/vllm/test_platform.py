@@ -505,6 +505,12 @@ class TestRejectedConfigs:
         with pytest.raises(ValueError, match="--quantization-config"):
             _build(quantization_config={"linear": "fp8_per_channel"})
 
+    def test_activation_override_needs_an_fp8_checkpoint(self):
+        with pytest.raises(ValueError, match="FP8 block checkpoints"):
+            _build(
+                quantization_config={"linear": {"activation": "fp8_per_block_dynamic"}}
+            )
+
     @pytest.mark.parametrize("indexer_kv_dtype", ["mxfp4", "nvfp4"])
     def test_indexer_kv_dtype_without_an_rbln_kernel(self, indexer_kv_dtype):
         with pytest.raises(ValueError, match="indexer_kv_dtype"):
@@ -1867,12 +1873,12 @@ class TestModelImpl:
         dict, which would drop every other field the caller set. The class is
         what states the path; nothing here says it a second time.
         """
-        given = RBLNConfig(use_w8a8=True)
+        given = RBLNConfig(specialize_moe_decode=False)
 
         config = _build(additional_config=given)
 
         assert config.additional_config is given
-        assert config.additional_config.use_w8a8 is True
+        assert config.additional_config.specialize_moe_decode is False
         assert RblnPlatform.device_type == "rbln"
 
     def test_the_write_back_keeps_the_rest_of_additional_config(
@@ -1883,10 +1889,12 @@ class TestModelImpl:
         The two arrive separately now, so a run that sets both has to end up
         with the path the flag named and every field the dict held.
         """
-        config = _build(model_impl="vllm", additional_config={"use_w8a8": True})
+        config = _build(
+            model_impl="vllm", additional_config={"specialize_moe_decode": False}
+        )
 
         assert isinstance(config.additional_config, RBLNConfig)
-        assert config.additional_config.use_w8a8 is True
+        assert config.additional_config.specialize_moe_decode is False
 
     def test_a_second_engine_does_not_take_the_first_one_s_path(self, monkeypatch):
         """The published path is for the processes this one spawns.

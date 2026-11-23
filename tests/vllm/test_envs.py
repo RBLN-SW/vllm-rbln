@@ -346,7 +346,8 @@ def test_config_fields_are_not_hashed_into_the_bundle_key():
     """`RBLNConfig.compute_hash` already keys the bundle on a field's value.
 
     Hashing the variable too keys it on how the value was supplied instead:
-    `--rbln-use-w8a8` and `VLLM_RBLN_USE_W8A8=1` build the same artifact, so
+    `--no-rbln-specialize-moe-decode` and `VLLM_RBLN_SPECIALIZE_MOE_DECODE=0` build
+    the same artifact, so
     they must not land in different bundle directories. A field `compute_hash`
     ignores does not change the artifact, so it has no claim on the key either.
     """

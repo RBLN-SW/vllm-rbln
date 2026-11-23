@@ -77,7 +77,6 @@ if TYPE_CHECKING:
     VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT: int = 1
     VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS: list[int] = []
     # --- QUANTIZATION ---
-    VLLM_RBLN_USE_W8A8: bool = False
 
 
 def get_num_devices_per_local_rank() -> int:
@@ -365,12 +364,6 @@ environment_variables = {
     ),
     # Decode batch bucket manual buckets
     "VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS": get_decode_batch_bucket_manual_buckets,  # noqa E501
-    # --- QUANTIZATION ---
-    # W8A16 runs on every RBLN NPU, W8A8 only on the ones whose kernels take an
-    # fp8 activation, so W8A8 is opted into rather than derived from the device.
-    "VLLM_RBLN_USE_W8A8": (
-        lambda: os.environ.get("VLLM_RBLN_USE_W8A8", "False").lower() in ("true", "1")
-    ),
 }
 
 # Partition for the mega-cache config signature: COMPILE vars are hashed into
@@ -416,7 +409,6 @@ RBLN_NON_COMPILE_ENV = frozenset(
         "VLLM_RBLN_DECODE_BATCH_BUCKET_STEP",
         "VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT",
         "VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS",
-        "VLLM_RBLN_USE_W8A8",
     }
 )
 

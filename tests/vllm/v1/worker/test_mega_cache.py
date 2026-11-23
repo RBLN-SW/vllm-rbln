@@ -212,12 +212,12 @@ class TestSignatureEnv:
         """
         from vllm_rbln.config import build_rbln_config
 
-        monkeypatch.setenv("VLLM_RBLN_USE_W8A8", "1")
+        monkeypatch.setenv("VLLM_RBLN_SPECIALIZE_MOE_DECODE", "0")
         via_env = build_rbln_config(None)
         env_sig = mega_cache.config_signature(_stub_config(via_env.compute_hash()))
 
-        monkeypatch.delenv("VLLM_RBLN_USE_W8A8")
-        via_flag = build_rbln_config({"use_w8a8": True})
+        monkeypatch.delenv("VLLM_RBLN_SPECIALIZE_MOE_DECODE")
+        via_flag = build_rbln_config({"specialize_moe_decode": False})
         flag_sig = mega_cache.config_signature(_stub_config(via_flag.compute_hash()))
 
         assert via_env == via_flag

@@ -86,7 +86,7 @@ def test_the_overrides_arrive_as_a_mapping(parser):
 
 def test_a_field_of_the_other_path_is_rejected():
     with pytest.raises(ValueError, match="are not fields"):
-        _resolve(OptimumRBLNConfig, {"use_w8a8": True})
+        _resolve(OptimumRBLNConfig, {"use_custom_kernel": True})
 
 
 def test_a_shared_field_is_taken(parser):

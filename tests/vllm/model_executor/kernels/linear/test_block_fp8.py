@@ -22,13 +22,14 @@ from unittest.mock import patch
 
 import pytest
 import torch
-from vllm.config import set_current_vllm_config
 from vllm.model_executor.kernels.linear.scaled_mm import Fp8BlockScaledMMLinearKernel
 
-from vllm_rbln.config import RBLNConfig
 from vllm_rbln.model_executor.kernels.linear.block_fp8 import (
     RBLNW8A8BlockFp8LinearKernel,
     RBLNW8A16BlockFp8LinearKernel,
+)
+from vllm_rbln.model_executor.layers.quantization.activation_override import (
+    linear_w8a8_scope,
 )
 
 FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
@@ -55,11 +56,8 @@ def _base_can_implement_ok():
 
 
 def _w8a8_requested(requested: bool):
-    # Kernel selection reads the section off the config the model is built
-    # under, which is the context upstream opens around model construction.
-    return set_current_vllm_config(
-        SimpleNamespace(additional_config=RBLNConfig(use_w8a8=requested))
-    )
+    # Fp8LinearMethod.create_weights opens this scope around kernel selection.
+    return linear_w8a8_scope(requested)
 
 
 def _w8a16(block_n=2, block_k=2) -> Any:

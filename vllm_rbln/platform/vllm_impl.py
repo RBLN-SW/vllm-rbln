@@ -135,17 +135,16 @@ def _validate(vllm_config: "VllmConfig") -> None:
     if vllm_config.lora_config is not None:
         raise ValueError("LoRA is not supported on RBLN.")
 
-    # Upstream would attach its online quantization methods (CUDA/Triton GEMMs)
-    # to the layers the config names; RBLN implements none of them, so refuse
-    # here instead of failing at compile time.
-    if getattr(model_config, "quantization_config", None) is not None:
-        raise ValueError(
-            "--quantization-config (online quantization, or an online "
-            "--quantization shorthand such as fp8_per_channel) is not supported "
-            f"on RBLN; got {model_config.quantization_config}. Use a "
-            "pre-quantized checkpoint whose config.json quantization_config "
-            "RBLN supports."
-        )
+    from vllm_rbln.model_executor.layers.quantization.activation_override import (
+        validate_activation_override,
+    )
+
+    # RBLN takes --quantization-config only as an activation override of an FP8
+    # block checkpoint; upstream's online quantization methods (CUDA/Triton
+    # GEMMs) have no RBLN implementation.
+    validate_activation_override(
+        model_config.quantization_config, model_config.quantization
+    )
 
     # Refuse an indexer K-cache dtype the RBLN DSA indexer cannot read.
     resolve_rbln_indexer_kv_dtype(

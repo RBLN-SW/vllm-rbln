@@ -164,10 +164,6 @@ class RBLNConfig(RBLNConfigBase):
     chunk (512 at least) and the processor upper bound for an image or a
     video frame."""
 
-    use_w8a8: bool = False
-    """Opt in to W8A8. W8A16 runs on every RBLN NPU, W8A8 only on the ones
-    whose kernels take an fp8 activation."""
-
     compile_dtype: CompileDtype = ""
     """dtype the compiled graphs run in on the device. Empty keeps the
     compiler's per-target default."""
@@ -807,7 +803,8 @@ def add_rbln_cli_args(parser: "FlexibleArgumentParser") -> None:
         description=(
             "RBLN NPU options for both model paths. Each flag is also an "
             "additional_config key, spelled without the --rbln- prefix: "
-            '--rbln-use-w8a8 is additional_config={"use_w8a8": true}.'
+            "--rbln-num-devices-per-local-rank 4 is "
+            'additional_config={"num_devices_per_local_rank": 4}.'
         ),
     )
     seen: set[str] = set()

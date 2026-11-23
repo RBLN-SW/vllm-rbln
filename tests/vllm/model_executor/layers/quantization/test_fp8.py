@@ -17,16 +17,22 @@ from types import SimpleNamespace
 import pytest
 import torch
 from vllm.config import set_current_vllm_config
+from vllm.config.quantization import QuantizationConfigArgs
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 
-from vllm_rbln.config import RBLNConfig
 from vllm_rbln.model_executor.layers.quantization.fp8 import Fp8MoEMethod
 
 EXPERTS, HIDDEN, INTER, TOKENS, BLOCK = 2, 128, 128, 8, 128
 
 
 def _method(layer, use_w8a8: bool = False) -> Fp8MoEMethod:
-    config = SimpleNamespace(additional_config=RBLNConfig(use_w8a8=use_w8a8))
+    args = (
+        QuantizationConfigArgs(moe={"activation": "fp8_per_block_dynamic"})
+        if use_w8a8
+        else None
+    )
+    config = SimpleNamespace(model_config=SimpleNamespace(quantization_config=args))
+    layer.layer_name = "model.layers.0.mlp.experts"
     with set_current_vllm_config(config):
         return Fp8MoEMethod(
             Fp8Config(
