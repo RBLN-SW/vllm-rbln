@@ -111,6 +111,7 @@ from vllm_rbln.v1.attention.backends.minimax_m3 import (
     RBLNMiniMaxM3IndexerBackend,
     RBLNMiniMaxM3SparseBackend,
 )
+from vllm_rbln.v1.attention.indexer_kv_dtype import is_fp8_rbln_indexer
 from vllm_rbln.v1.kv_cache import register_kv_cache
 from vllm_rbln.v1.spec_decode.eagle3_pp import (
     AUX_COMBINED,
@@ -361,18 +362,13 @@ class RBLNMiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
         self.head_dim = head_dim
         vllm_config = get_current_vllm_config()
         cache_dtype = cache_config.cache_dtype if cache_config is not None else "auto"
-        # The index cache follows --kv-cache-dtype; a separate indexer_kv_dtype
-        # is not wired for MiniMax M3 on RBLN yet.
-        indexer_kv_dtype = vllm_config.attention_config.indexer_kv_dtype
-        if indexer_kv_dtype not in (
-            "auto",
-            "fp8" if cache_dtype.startswith("fp8") else "bf16",
-        ):
-            raise ValueError(
-                "The MiniMax M3 index cache follows --kv-cache-dtype on RBLN; got "
-                f"indexer_kv_dtype={indexer_kv_dtype!r} with "
-                f"--kv-cache-dtype {cache_dtype}."
-            )
+        # An fp8 index cache keeps the K/V cache's fp8 format when that is fp8
+        # too, and e4m3 under a bf16 K/V cache.
+        if is_fp8_rbln_indexer(cache_dtype, vllm_config.attention_config):
+            if not cache_dtype.startswith("fp8"):
+                cache_dtype = "fp8"
+        else:
+            cache_dtype = "auto"
         self.fp8_dtype = _fp8_cache_dtype(cache_dtype)
         self.dtype = (
             kv_cache_dtype_str_to_dtype(cache_dtype, vllm_config.model_config)

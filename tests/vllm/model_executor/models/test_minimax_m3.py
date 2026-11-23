@@ -1106,6 +1106,43 @@ def test_minimax_m3_indexer_cache_registers_its_name():
     assert config.compilation_config.static_forward_context[cache.prefix] is cache
 
 
+@pytest.mark.parametrize(
+    "kv_cache_dtype, indexer_kv_dtype, fp8_dtype",
+    [
+        ("auto", "auto", None),
+        ("fp8", "auto", torch.float8_e4m3fn),
+        ("fp8_e5m2", "auto", torch.float8_e5m2),
+        ("auto", "fp8", torch.float8_e4m3fn),
+        ("fp8", "bf16", None),
+        ("fp8_e5m2", "fp8", torch.float8_e5m2),
+    ],
+)
+def test_minimax_m3_index_cache_follows_indexer_kv_dtype(
+    kv_cache_dtype, indexer_kv_dtype, fp8_dtype
+):
+    from vllm.config import AttentionConfig, CompilationConfig, set_current_vllm_config
+
+    from vllm_rbln.model_executor.models.minimax_m3 import RBLNMiniMaxM3IndexerCache
+
+    config = SimpleNamespace(
+        compilation_config=CompilationConfig(),
+        attention_config=AttentionConfig(indexer_kv_dtype=indexer_kv_dtype),
+        model_config=SimpleNamespace(dtype=torch.bfloat16),
+    )
+    with set_current_vllm_config(config):
+        cache = RBLNMiniMaxM3IndexerCache(
+            head_dim=128,
+            prefix="model.layers.0.self_attn.attn.indexer",
+            cache_config=SimpleNamespace(cache_dtype=kv_cache_dtype),
+        )
+
+    assert cache.fp8_dtype == fp8_dtype
+    if fp8_dtype is None:
+        assert cache.dtype == torch.bfloat16
+    else:
+        assert cache.dtype != torch.bfloat16
+
+
 def test_pp_ranks_report_the_same_kv_cache_layouts():
     from vllm.v1.attention.backends.utils import get_supported_kv_cache_layouts
 
