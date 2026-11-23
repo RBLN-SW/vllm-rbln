@@ -16,9 +16,16 @@ import math
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
+from vllm.forward_context import get_forward_context
+
+if TYPE_CHECKING:
+    from vllm_rbln.v1.attention.backends.flash_attention import (
+        RBLNFlashAttentionMetadata,
+    )
+    from vllm_rbln.v1.attention.backends.gdn_attn import RBLNGDNAttentionMetadata
 
 
 def _storage_key(tensor: torch.Tensor) -> tuple[int, int]:
@@ -183,13 +190,40 @@ def materialize_kv_cache_view(
     return tensor
 
 
+# NOTE(RBLN) - To represent kv cache as model input,
+# modify attention instead of using the attention layer's embedded
+# kv cache (self.kv_cache); use attention metadata's kv cache.
+# attention metadata's kv cache must equal the attention layer's
+# embedded kv cache.
+def resolve_kv_cache(
+    attn_metadata: "RBLNFlashAttentionMetadata | RBLNGDNAttentionMetadata",
+    cache_name: str,
+) -> torch.Tensor:
+    """Resolve the KV cache for a given layer, either from deduplicated
+    base tensors (for torch.export compatibility) or from the direct list."""
+    position = attn_metadata.kv_cache_positions[cache_name]
+    kv_cache_view_infos = getattr(attn_metadata, "kv_cache_view_infos", None)
+    forward_context = get_forward_context()
+    additional_kwargs = getattr(forward_context, "additional_kwargs", {}) or {}
+    kv_cache_bases = additional_kwargs.get("kv_cache_bases")
+    if kv_cache_bases and kv_cache_view_infos:
+        assert position < len(kv_cache_view_infos)
+        return materialize_kv_cache_view(kv_cache_bases, kv_cache_view_infos[position])
+
+    assert attn_metadata.kv_caches is not None
+    assert position < len(attn_metadata.kv_caches)
+    return attn_metadata.kv_caches[position]
+
+
 def attach_kv_cache_bindings(
     attn_metadata: Any,
     kv_caches: list[torch.Tensor] | None,
     kv_cache_bases: list[torch.Tensor] | None,
     kv_cache_view_infos: list[KVCacheViewInfo] | None,
+    kv_cache_positions: dict[str, int],
 ) -> None:
     """Attach either per-layer KV views or deduplicated bases to metadata."""
+    attn_metadata.kv_cache_positions = kv_cache_positions
     if kv_cache_bases and kv_cache_view_infos:
         attn_metadata.kv_caches = None
         attn_metadata.kv_cache_view_infos = kv_cache_view_infos

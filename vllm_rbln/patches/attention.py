@@ -30,46 +30,14 @@ from vllm.v1.kv_cache_interface import (
 
 from vllm_rbln.patches import register_patch
 from vllm_rbln.patches.registry import MIN_PATCH_PRIORITY
-from vllm_rbln.v1.attention.backends.flash_attention import (
-    RBLNFlashAttentionBackend,
-    RBLNFlashAttentionMetadata,
-)
-from vllm_rbln.v1.attention.backends.gdn_attn import RBLNGDNAttentionMetadata
-from vllm_rbln.v1.attention.kv_cache_bindings import materialize_kv_cache_view
+from vllm_rbln.v1.attention.backends.flash_attention import RBLNFlashAttentionBackend
+from vllm_rbln.v1.attention.kv_cache_bindings import resolve_kv_cache
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention import MLAAttention
 
-attention_original_init = Attention.__init__
 attention_original_forward = Attention.forward
-
-
-# NOTE(RBLN) - To represent kv cache as model input,
-# modify attention instead of using the attention layer's embedded
-# kv cache (self.kv_cache); use attention metadata's kv cache.
-# attention metadata's kv cache must equal the attention layer's
-# embedded kv cache.
-def _resolve_kv_cache(
-    attn_metadata: RBLNFlashAttentionMetadata | RBLNGDNAttentionMetadata,
-    layer_index: int | None,
-) -> torch.Tensor:
-    """Resolve the KV cache for a given layer, either from deduplicated
-    base tensors (for torch.export compatibility) or from the direct list."""
-    assert layer_index is not None, "KV cache has not been bound by the runner"
-    kv_cache_view_infos = getattr(attn_metadata, "kv_cache_view_infos", None)
-    forward_context = get_forward_context()
-    additional_kwargs = getattr(forward_context, "additional_kwargs", {}) or {}
-    kv_cache_bases = additional_kwargs.get("kv_cache_bases")
-    if kv_cache_bases and kv_cache_view_infos:
-        assert layer_index < len(kv_cache_view_infos)
-        return materialize_kv_cache_view(
-            kv_cache_bases, kv_cache_view_infos[layer_index]
-        )
-
-    assert attn_metadata.kv_caches is not None
-    assert layer_index < len(attn_metadata.kv_caches)
-    return attn_metadata.kv_caches[layer_index]
 
 
 @register_patch(
@@ -103,7 +71,7 @@ def patched_get_attention_context(
 
     Returning None avoids both: the wrapper never touches the KV cache.
     Connectors that do not save per layer ignore the value; the attention op
-    resolves its own KV cache as a graph input via ``_resolve_kv_cache``.
+    resolves its own KV cache as a graph input via ``resolve_kv_cache``.
     """
     assert RBLNFlashAttentionBackend.forward_includes_kv_cache_update, (
         "RBLNFlashAttentionBackend.forward_includes_kv_cache_update must stay "
@@ -157,7 +125,7 @@ def _unified_attention_with_output(
     # NOTE(RBLN) - To represent kv cache as model input, resolve it from
     # attention metadata here (a graph input) instead of using the attention
     # layer's embedded kv cache (self.kv_cache, a baked module attribute).
-    kv_cache = _resolve_kv_cache(attn_metadata, attn.layer_index)
+    kv_cache = resolve_kv_cache(attn_metadata, layer_name)
     attn.impl.forward(
         attn,
         query,
@@ -204,19 +172,6 @@ def patched_attention_forward(
         output = attention_original_forward(self, query, key, value, output_shape)
         return output.view(output_shape)
     return attention_original_forward(self, query, key, value, output_shape)
-
-
-@register_patch(
-    target="vllm.model_executor.layers.attention.attention.Attention.__init__",
-    reason=(
-        "RBLN resolves KV caches through indices assigned by the runner after "
-        "allocation; upstream Attention does not declare this binding field."
-    ),
-)
-def patched_attention_init(self: Attention, *args, **kwargs) -> None:
-    attention_original_init(self, *args, **kwargs)
-
-    self.layer_index = None
 
 
 @register_patch(

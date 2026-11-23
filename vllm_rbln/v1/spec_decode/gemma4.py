@@ -21,10 +21,6 @@ from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
 
 from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.model_executor.models.gemma4 import split_gate_up_weights
-from vllm_rbln.v1.attention.kv_cache_bindings import (
-    attach_kv_cache_bindings,
-    build_kv_cache_forward_context_kwargs,
-)
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 
 
@@ -53,6 +49,34 @@ class RBLNGemma4Proposer(RBLNEagleProposer):
         super().load_model(target_model)
         split_gate_up_weights(self.model)
         self._setup_gemma4_kv_sharing(target_attn_layer_names)
+
+        num_steps = self.num_speculative_tokens
+
+        def draft_steps(
+            input_ids: torch.Tensor,
+            positions: torch.Tensor,
+            hidden_states: torch.Tensor,
+        ) -> torch.Tensor:
+            # Every step queries the same position through the same metadata,
+            # so the whole draft runs as one graph and only the ids leave it.
+            draft_ids = []
+            for _ in range(num_steps):
+                sample_hidden_states, next_hidden_states = self.model(
+                    input_ids=input_ids,
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    inputs_embeds=None,
+                )
+                logits = self.model.compute_logits(
+                    sample_hidden_states.view(-1, sample_hidden_states.shape[-1])
+                )
+                ids = torch.ops.rbln.argmax(logits)
+                draft_ids.append(ids)
+                input_ids = ids.view(input_ids.shape)
+                hidden_states = next_hidden_states.view(hidden_states.shape)
+            return torch.stack(draft_ids, dim=1)
+
+        self.model_executable = self._compile_drafter(draft_steps)
 
     def propose(
         self,
@@ -83,34 +107,25 @@ class RBLNGemma4Proposer(RBLNEagleProposer):
         hidden_states = target_hidden_states.view(-1, self.hidden_size)[
             token_indices_to_sample
         ]
-        draft_token_ids = next_token_ids[:num_reqs]
-
         per_layer_attn_metadata, num_reqs_padded, forward_kwargs = (
             self._build_draft_step(num_reqs, positions)
         )
-        draft_token_ids_list = []
-        for _ in range(self.num_speculative_tokens):
-            self.input_ids[:num_reqs] = draft_token_ids.int()
-            input_ids, staged_positions, staged_hidden_states, _ = self._preprocess(
-                num_reqs,
-                num_reqs_padded,
-                num_reqs,
-                positions,
-                hidden_states,
-                is_prefill=False,
+        self.input_ids[:num_reqs] = next_token_ids[:num_reqs].int()
+        input_ids, staged_positions, staged_hidden_states, _ = self._preprocess(
+            num_reqs,
+            num_reqs_padded,
+            num_reqs,
+            positions,
+            hidden_states,
+            is_prefill=False,
+        )
+        with set_forward_context(per_layer_attn_metadata, **forward_kwargs):
+            draft_ids = self.model_executable(
+                input_ids=input_ids,
+                positions=staged_positions,
+                hidden_states=staged_hidden_states,
             )
-            with set_forward_context(per_layer_attn_metadata, **forward_kwargs):
-                hidden_states, draft_ids = self.model_executable(
-                    input_ids=input_ids,
-                    positions=staged_positions,
-                    hidden_states=staged_hidden_states,
-                    inputs_embeds=None,
-                    token_indices_to_sample=None,
-                )
-            hidden_states = hidden_states[:num_reqs]
-            draft_token_ids = self._to_target_token_ids(draft_ids[:num_reqs])
-            draft_token_ids_list.append(draft_token_ids)
-        return torch.stack(draft_token_ids_list, dim=1)
+        return self._to_target_token_ids(draft_ids[:num_reqs])
 
     @torch.inference_mode()
     def dummy_run(
@@ -138,8 +153,6 @@ class RBLNGemma4Proposer(RBLNEagleProposer):
                 input_ids=input_ids,
                 positions=staged_positions,
                 hidden_states=hidden_states,
-                inputs_embeds=None,
-                token_indices_to_sample=None,
             )
 
     def _build_draft_step(
@@ -209,12 +222,7 @@ class RBLNGemma4Proposer(RBLNEagleProposer):
                 masks.to(torch.float16 if builder.enforce_eager else torch.float32),
                 "attn_masks",
             )
-            attach_kv_cache_bindings(
-                attn_metadata,
-                self.runner.kv_caches,
-                self.runner.kv_cache_bases,
-                self.runner.kv_cache_view_infos,
-            )
+            self.runner.bind_kv_cache_to_metadata(attn_metadata)
             for layer_name in attn_group.layer_names:
                 per_layer_attn_metadata[layer_name] = attn_metadata
         forward_kwargs = dict(
@@ -222,6 +230,6 @@ class RBLNGemma4Proposer(RBLNEagleProposer):
             num_tokens=num_reqs,
             num_tokens_across_dp=num_tokens_across_dp,
             num_padded_tokens=batch_desc.num_tokens_padded,
-            **build_kv_cache_forward_context_kwargs(self.runner.kv_cache_bases),
+            **self.runner.kv_cache_forward_context_kwargs(),
         )
         return per_layer_attn_metadata, num_reqs_padded, forward_kwargs

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, ClassVar
 
 import torch
@@ -156,6 +156,7 @@ class RBLNFlashAttentionMetadata:
     mm_prefix_row_ends: torch.Tensor | None = None
     kv_caches: list[torch.Tensor] | None = None
     kv_cache_view_infos: list[KVCacheViewInfo] | None = None
+    kv_cache_positions: dict[str, int] = field(default_factory=dict, kw_only=True)
 
     swa_appends: bool = False
     cache_seq_lens: torch.Tensor | None = None

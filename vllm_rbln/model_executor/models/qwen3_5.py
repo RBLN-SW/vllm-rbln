@@ -378,9 +378,11 @@ class RBLNQwen3_5ForConditionalGeneration(
             # embeddings and key mask could be built once per video.
             for pixels, (_, h, w), n in zip(pixel_values.split(sizes), grids, tokens):
                 frames = [
-                    buffered_encoder.encoder(
-                        *self._encoder_inputs(buffered_encoder, frame, [1, h, w])
-                    )[:n].cpu()
+                    rbln_utils.run_mm_encoder(
+                        buffered_encoder.encoder,
+                        self._encoder_inputs(buffered_encoder, frame, [1, h, w]),
+                        n,
+                    )
                     for frame in pixels.split(h * w)
                 ]
                 embeds.append(torch.cat(frames))

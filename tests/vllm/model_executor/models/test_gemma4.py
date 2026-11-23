@@ -116,7 +116,7 @@ def _model_with_vision_encoder(tower):
 
 
 def test_the_vision_encoder_matches_hfs():
-    # The encoder pads every image to its bucket and runs attention spelled out;
+    # The encoder pads every image to its bucket and masks the padding keys;
     # what comes back must be HF's soft tokens for the image alone.
     tower = _vision_tower()
     model = _model_with_vision_encoder(tower)
@@ -583,7 +583,6 @@ def test_prefix_mask_is_shared_and_does_not_escape_forward(monkeypatch, compiled
             super().__init__()
             self.attn = nn.Module()
             self.attn.layer_name = f"layer.{index}"
-            self.attn.layer_index = index
             self.attn.sliding_window = 4
             self.attn.impl = SimpleNamespace(scale=torch.tensor(1.0))
 
@@ -617,6 +616,9 @@ def test_prefix_mask_is_shared_and_does_not_escape_forward(monkeypatch, compiled
         swa_appends=True,
         mm_prefix_row_ends=torch.tensor([0, 3, 3, 3]),
         kv_caches=[torch.zeros(4, 2, 1, 1, 4, 32) for _ in model.layers],
+        kv_cache_positions={
+            layer.layer_name: i for i, layer in enumerate(model.mm_prefix_attn_layers)
+        },
     )
     context = SimpleNamespace(
         attn_metadata={
@@ -663,7 +665,7 @@ def test_prefix_mask_is_restored_when_forward_raises(monkeypatch):
         raise RuntimeError("forward failed")
 
     monkeypatch.setattr(Gemma4ForConditionalGeneration, "forward", upstream_forward)
-    attn = SimpleNamespace(layer_name="layer.0", layer_index=0, sliding_window=4)
+    attn = SimpleNamespace(layer_name="layer.0", sliding_window=4)
     model = _bare_model(model_dtype=torch.float32)
     model.mm_prefix_attn_layers = [attn]
     metadata = RBLNFlashAttentionMetadata(
@@ -673,6 +675,7 @@ def test_prefix_mask_is_restored_when_forward_raises(monkeypatch):
         swa_appends=True,
         mm_prefix_row_ends=torch.tensor([0, 3, 3, 3]),
         kv_caches=[torch.zeros(4, 2, 1, 1, 4, 32)],
+        kv_cache_positions={"layer.0": 0},
     )
     context = SimpleNamespace(
         attn_metadata={"layer.0": metadata}, additional_kwargs={}, dp_metadata=None

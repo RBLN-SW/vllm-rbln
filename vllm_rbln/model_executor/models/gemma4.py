@@ -48,7 +48,7 @@ from vllm_rbln.model_executor.models.interfaces import (
     SupportsRBLNMmPrefix,
     SupportsRBLNMultiModal,
 )
-from vllm_rbln.patches.attention import _resolve_kv_cache
+from vllm_rbln.v1.attention.kv_cache_bindings import resolve_kv_cache
 
 
 def _build_mm_prefix_sliding_mask(
@@ -151,9 +151,10 @@ class _RBLNGemma4VisionEncoder(nn.Module):
             q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
             k = k.repeat_interleave(attn.num_key_value_groups, dim=1)
             v = v.repeat_interleave(attn.num_key_value_groups, dim=1)
-            scores = torch.matmul(q, k.transpose(-1, -2)) * attn.scaling + key_bias
-            probs = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
-            out = torch.matmul(probs, v).transpose(1, 2).reshape(residual.shape)
+            out = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=key_bias, scale=attn.scaling
+            )
+            out = out.transpose(1, 2).reshape(residual.shape)
             hidden_states = residual + layer.post_attention_layernorm(attn.o_proj(out))
             residual = hidden_states
             hidden_states = layer.pre_feedforward_layernorm(hidden_states)
@@ -526,7 +527,7 @@ class RBLNGemma4ForConditionalGeneration(
                     metadata.mm_prefix_row_ends,
                     metadata.seq_lens,
                     layer.sliding_window,
-                    _resolve_kv_cache(metadata, layer.layer_index).size(-2),
+                    resolve_kv_cache(metadata, layer.layer_name).size(-2),
                     self.model_dtype,
                 )
                 # Workaround: borrow metadata without mutating Attention modules.

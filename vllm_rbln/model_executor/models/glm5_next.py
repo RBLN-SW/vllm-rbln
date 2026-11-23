@@ -95,7 +95,6 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
 import vllm_rbln.utils as rbln_utils
 from vllm_rbln.model_executor.models.interfaces import SupportsRBLNMultiModal
-from vllm_rbln.patches.attention import _resolve_kv_cache
 from vllm_rbln.utils import is_prefill_step
 from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadata,
@@ -109,6 +108,7 @@ from vllm_rbln.v1.attention.backends.glm5_next import (
     RBLNGlm5NextStateMetadata,
     kda_cache_name,
 )
+from vllm_rbln.v1.attention.kv_cache_bindings import resolve_kv_cache
 from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec, RBLNMambaSpec
 
 SLOT_DSA_LATENT, SLOT_DSA_INDEX_KEY, SLOT_DSA_INDEX_SCALE, SLOT_DSA_INDEX_TAIL = range(
@@ -131,7 +131,6 @@ class _RBLNGlm5NextCache(nn.Module, AttentionLayerBase):
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
-        self.layer_index: int | None = None
 
     def forward(self) -> None: ...
 
@@ -161,7 +160,7 @@ class RBLNGlm5NextStateCache(_RBLNGlm5NextCache):
         metadata = get_forward_context().attn_metadata[self.prefix]
         assert isinstance(metadata, RBLNGlm5NextStateMetadata), type(metadata)
         assert metadata.load_blocks is not None and metadata.store_blocks is not None
-        state = _resolve_kv_cache(metadata, self.layer_index)
+        state = resolve_kv_cache(metadata, self.prefix)
         return (
             state,
             metadata.load_blocks.view(-1),
@@ -201,7 +200,7 @@ class RBLNGlm5NextPagedCache(_RBLNGlm5NextCache):
         """(cache, block_table, metadata)."""
         metadata = get_forward_context().attn_metadata[self.prefix]
         return (
-            _resolve_kv_cache(metadata, self.layer_index),
+            resolve_kv_cache(metadata, self.prefix),
             metadata.block_tables,
             metadata,
         )
@@ -244,7 +243,7 @@ class RBLNGlm5NextAuxCache(_RBLNGlm5NextCache):
 
     def inputs(self) -> torch.Tensor:
         metadata = get_forward_context().attn_metadata[self.owner]
-        return _resolve_kv_cache(metadata, self.layer_index)
+        return resolve_kv_cache(metadata, self.prefix)
 
 
 def _swiglu_clamped(
@@ -1046,11 +1045,10 @@ class RBLNGlm5NextModel(nn.Module):
             batch, tokens, _ = flat.shape
             streams = flat.view(batch, tokens, self.n, -1).transpose(1, 2).contiguous()
         dtype = streams.dtype
-        if is_prefill_step():
-            streams = streams.float()
+        streams = streams.float()
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             streams = layer(streams)
-        # A prefill chunk keeps the streams fp32 between sublayers (bf16 values).
+        # The streams stay fp32 between sublayers (bf16 values).
         streams = streams.to(dtype)
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(

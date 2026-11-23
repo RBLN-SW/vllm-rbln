@@ -135,9 +135,11 @@ from vllm_rbln.model_executor.models.interfaces import (
 )
 from vllm_rbln.platform import use_device_tensor
 from vllm_rbln.v1.attention.backends.flash_attention import (
+    RBLNFlashAttentionMetadata,
     RBLNFlashAttentionMetadataBuilder,
 )
 from vllm_rbln.v1.attention.backends.gdn_attn import (
+    RBLNGDNAttentionMetadata,
     RBLNGDNAttentionMetadataBuilder,
 )
 from vllm_rbln.v1.attention.backends.mla.indexer import RBLNDeepseekV32IndexerBackend
@@ -354,9 +356,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         # Under replays_accepted_drafts, the last position of each request's previous
         # step: the recurrent state's block that step stored, which the next loads.
         self.state_pos_by_req: dict[str, int] = {}
-        # KV cache layer names in layer-index order; the deterministic
-        # ordering the KV connector relies on for region<->layer agreement.
+        # KV cache layer names in the deterministic order
+        # the KV connector relies on for region<->layer agreement.
         self.kv_cache_names: list[str] = []
+        self.kv_cache_positions: dict[str, int] = {}
         self.kv_cache_allocations: dict[tuple, str] = {}
         # Initialize in initialize_kv_cache_tensors
         self.cross_layers_kv_cache: torch.Tensor | None = None
@@ -1262,10 +1265,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     defer_staging=defer_staging,
                 )
 
+                self.bind_kv_cache_to_metadata(attn_metadata_i)
                 for layer_name in attn_group.layer_names:
                     attn_metadata[layer_name] = attn_metadata_i
-
-        self._attach_kv_cache_bindings(attn_metadata)
 
         return attn_metadata, spec_decode_common_attn_metadata
 
@@ -2223,7 +2225,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 num_tokens=num_query_tokens,
                 num_tokens_across_dp=num_tokens_across_dp,
                 num_padded_tokens=batch_desc.num_tokens_padded,
-                **build_kv_cache_forward_context_kwargs(self.kv_cache_bases),
+                **self.kv_cache_forward_context_kwargs(),
             ),
             record_function_or_nullcontext("rbln_model_runner: forward"),
             self.maybe_get_kv_connector_output(
@@ -3077,7 +3079,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             num_tokens=num_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
             num_padded_tokens=batch_desc.num_tokens_padded,
-            **build_kv_cache_forward_context_kwargs(self.kv_cache_bases),
+            **self.kv_cache_forward_context_kwargs(),
         ):
             _ = self.model_executable(
                 **staged_model_input.as_kwargs(), **self._dummy_mm_kwargs(layout)
@@ -3622,9 +3624,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         )
 
         forward_context = self.compilation_config.static_forward_context
-        self.kv_cache_names = get_kv_cache_names(
-            kv_caches, forward_context, self.shared_kv_cache_layers
-        )
+        self.kv_cache_names = get_kv_cache_names(kv_caches)
+        self.kv_cache_positions = {
+            name: position for position, name in enumerate(self.kv_cache_names)
+        }
         self._update_kv_cache_base_bindings(
             kv_cache_bases_by_layer,
             kv_cache_view_infos,
@@ -3650,18 +3653,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         # The runner owns the cache storage until sizing finishes. Rebuild keys
         # on allocation so addresses are never matched across cache generations.
         self.kv_cache_allocations = {}
-        for name, cache in zip(self.kv_cache_names, self.kv_caches):
-            key = kv_cache_tensor_key(cache)
-            self.kv_cache_allocations.setdefault(key, name)
+        for name, cache in zip(self.kv_cache_names, self.kv_caches, strict=True):
+            if name not in self.shared_kv_cache_layers:
+                self.kv_cache_allocations.setdefault(kv_cache_tensor_key(cache), name)
         self.kv_cache_block_axes = block_axes
         for layer_name, kv_cache in kv_caches.items():
             forward_context[layer_name].kv_cache = kv_cache
-        # Cache indices are positions in this rank's actual cache list, including
-        # auxiliary caches and MTP layers, and are assigned only after allocation.
-        for position, layer_name in enumerate(self.kv_cache_names):
-            layer = forward_context[layer_name]
-            assert hasattr(layer, "layer_index"), layer_name
-            layer.layer_index = position
 
         if not use_device_tensor() and not self.model_config.enforce_eager:
             # `mark_static_address` is last-write-wins on storage->name. Pin to
@@ -3980,18 +3977,19 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             and not ec_config.is_ec_producer
         )
 
-    def _attach_kv_cache_bindings(
-        self, attn_metadata: PerLayerAttnMetadata | None
+    def bind_kv_cache_to_metadata(
+        self, attn_metadata: RBLNFlashAttentionMetadata | RBLNGDNAttentionMetadata
     ) -> None:
-        if attn_metadata is None:
-            return
-        for attn_metadatum in attn_metadata.values():
-            attach_kv_cache_bindings(
-                attn_metadatum,
-                self.kv_caches,
-                self.kv_cache_bases,
-                self.kv_cache_view_infos,
-            )
+        attach_kv_cache_bindings(
+            attn_metadata,
+            self.kv_caches,
+            self.kv_cache_bases,
+            self.kv_cache_view_infos,
+            kv_cache_positions=self.kv_cache_positions,
+        )
+
+    def kv_cache_forward_context_kwargs(self) -> dict[str, tuple[torch.Tensor, ...]]:
+        return build_kv_cache_forward_context_kwargs(self.kv_cache_bases)
 
     def _determine_batch_execution_and_padding(
         self,

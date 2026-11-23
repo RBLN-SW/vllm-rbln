@@ -456,14 +456,11 @@ def test_aux_cache_flags_and_an_unallocated_draft(monkeypatch):
         "model.layers.1.self_attn.attn.2": (True, False),
         "model.layers.1.self_attn.attn.3": (False, False),
     }
-    # A strict producer leaves the drafts unallocated, with no layer index.
     draft = context["model.layers.0.self_attn.attn.3"]
-    draft.layer_index = None
+    metadata = SimpleNamespace(kv_cache_positions={draft.owner: 0})
     with (
-        set_forward_context({draft.owner: None}, config),
-        pytest.raises(
-            AssertionError, match="KV cache has not been bound by the runner"
-        ),
+        set_forward_context({draft.owner: metadata}, config),
+        pytest.raises(KeyError, match=draft.prefix),
     ):
         draft.inputs()
 
@@ -826,6 +823,40 @@ def test_the_model_returns_the_streams_in_the_input_dtype_after_a_cut_prefill(
     out = model(None, torch.arange(8), None, torch.randn(1, 8, 64).to(torch.bfloat16))
 
     assert out.dtype == torch.bfloat16
+
+
+@pytest.mark.parametrize("prefill", [True, False])
+@pytest.mark.parametrize("first_rank", [True, False])
+def test_every_layer_gets_fp32_streams(monkeypatch, prefill, first_rank):
+    from vllm.sequence import IntermediateTensors
+
+    import vllm_rbln.model_executor.models.glm5_next as glm
+
+    _mhc_kernels(monkeypatch)
+    monkeypatch.setattr(glm, "is_prefill_step", lambda: prefill)
+    monkeypatch.setattr(
+        glm,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=first_rank, is_last_rank=False),
+    )
+    model = _bare(glm.RBLNGlm5NextModel)
+    model.n = 4
+    model.layers = torch.nn.ModuleList([_mhc_layer(), _mhc_layer()])
+    model.start_layer, model.end_layer = 0, 2
+    seen = []
+    for layer in model.layers:
+        layer.register_forward_pre_hook(lambda m, a: seen.append(a[0].dtype))
+    tokens = 8 if prefill else 1
+    embeds = torch.randn(1, tokens, 64).to(torch.bfloat16)
+    intermediate = IntermediateTensors(
+        {"streams": torch.randn(1, tokens, 4 * 64).to(torch.bfloat16)}
+    )
+
+    out = model(None, torch.arange(tokens), intermediate, embeds)
+
+    assert seen == [torch.float32, torch.float32]
+    assert out["streams"].dtype == torch.bfloat16
+    assert out["streams"].shape == (1, tokens, 4 * 64)
 
 
 @pytest.mark.parametrize("prefill", [False, True])

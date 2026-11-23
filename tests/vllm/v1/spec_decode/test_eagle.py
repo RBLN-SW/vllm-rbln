@@ -23,6 +23,7 @@ Those tests pin the RBLN detour, so do not resolve a divergence from upstream by
 deleting them."""
 
 from contextlib import nullcontext
+from functools import partial
 from types import SimpleNamespace
 from unittest import mock
 
@@ -55,10 +56,6 @@ def _neutralize(monkeypatch):
     monkeypatch.setattr(
         eagle_module, "set_forward_context", lambda *a, **k: nullcontext()
     )
-    monkeypatch.setattr(eagle_module, "attach_kv_cache_bindings", lambda *a, **k: None)
-    monkeypatch.setattr(
-        eagle_module, "build_kv_cache_forward_context_kwargs", lambda *a, **k: {}
-    )
 
 
 def _wire_runner(
@@ -70,9 +67,8 @@ def _wire_runner(
         is_intermediate_chunked_prefill=intermediate_chunk,
         is_strict_kv_producer=strict_kv_producer,
         input_batch=SimpleNamespace(num_reqs=num_reqs),
-        kv_caches=[],
-        kv_cache_bases=[],
-        kv_cache_view_infos=[],
+        bind_kv_cache_to_metadata=lambda metadata: None,
+        kv_cache_forward_context_kwargs=dict,
         shape_config=_shape_config(),
         dp_status=None,
         decode_back_pad=torch.zeros(num_reqs, dtype=torch.int32),
@@ -1105,9 +1101,8 @@ class TestDummyRun:
                     )
                 ],
             ),
-            kv_caches=[],
-            kv_cache_bases=[],
-            kv_cache_view_infos=[],
+            bind_kv_cache_to_metadata=lambda metadata: None,
+            kv_cache_forward_context_kwargs=dict,
             shape_config=_shape_config(specialized=specialized),
             dp_status=dp_status,
             sort_batch_by_length=False,
@@ -1320,6 +1315,7 @@ class TestGemma4Drafting:
         mlp.gate_up_proj.quant_method = UnquantizedLinearMethod()
         monkeypatch.setattr(gemma4_module, "get_layers_from_vllm_config", lambda *a: {})
         monkeypatch.setattr(proposer, "_setup_gemma4_kv_sharing", lambda *a: None)
+        monkeypatch.setattr(proposer, "_compile_drafter", lambda fn: fn)
         monkeypatch.setattr(
             eagle_module.RBLNEagleProposer,
             "load_model",
@@ -1350,14 +1346,27 @@ class TestGemma4Drafting:
         )
         monkeypatch.setattr(proposer, "_build_draft_step", lambda n, p: ({}, n, {}))
         seen = []
-        static_ids = torch.zeros(2, dtype=torch.long)
 
-        def executable(*, input_ids, positions, hidden_states, **kwargs):
-            seen.append((positions.clone(), hidden_states.clone()))
-            static_ids.copy_(input_ids.view(-1).long() + 1)
-            return hidden_states.view(2, -1) + 1, static_ids
+        class Assistant(torch.nn.Module):
+            # Samples id + 1 and advances the hidden state by one per step.
+            def forward(self, *, input_ids, positions, hidden_states, inputs_embeds):
+                seen.append((positions.clone(), hidden_states.clone()))
+                return input_ids.float().view(-1, 1), hidden_states + 1
 
-        proposer.model_executable = executable
+            def compute_logits(self, sample_hidden_states):
+                ids = sample_hidden_states.view(-1).long() + 1
+                return torch.nn.functional.one_hot(ids, 64).float()
+
+        # The draft graph itself, run eagerly: one call feeds every step forward.
+        monkeypatch.setattr(gemma4_module, "get_layers_from_vllm_config", lambda *a: {})
+        monkeypatch.setattr(proposer, "_setup_gemma4_kv_sharing", lambda *a: None)
+        monkeypatch.setattr(proposer, "_compile_drafter", lambda fn: fn)
+        monkeypatch.setattr(
+            eagle_module.RBLNEagleProposer,
+            "load_model",
+            lambda self, target: setattr(self, "model", Assistant()),
+        )
+        proposer.load_model(torch.nn.Identity())
         result = _call_propose(proposer)
         if strict_producer or intermediate:
             assert seen == []
@@ -1371,12 +1380,11 @@ class TestGemma4Drafting:
     # Window 8 over blocks of 4: not yet full, starting mid-block, starting on
     # a block boundary.
     @pytest.mark.parametrize("position", [3, 10, 11])
-    def test_sliding_mask_keeps_the_oldest_key_at_a_block_boundary(
-        self, monkeypatch, position
-    ):
+    def test_sliding_mask_keeps_the_oldest_key_at_a_block_boundary(self, position):
         from tests.vllm.v1.attention.utils import make_attention_spec, make_builder
         from tests.vllm.vllm_config import make_vllm_config
         from vllm_rbln.v1.spec_decode import gemma4 as gemma4_module
+        from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
 
         base = make_eagle_proposer()
         proposer = gemma4_module.RBLNGemma4Proposer(base.vllm_config, base.device, None)
@@ -1398,12 +1406,17 @@ class TestGemma4Drafting:
                 layer_names=["draft.layer"],
             )
         ]
-        monkeypatch.setattr(gemma4_module, "attach_kv_cache_bindings", lambda *a: None)
-        monkeypatch.setattr(
-            gemma4_module, "build_kv_cache_forward_context_kwargs", lambda *a: {}
+        runner = proposer.runner
+        runner.kv_caches = [torch.empty(0)]
+        runner.kv_cache_bases = []
+        runner.kv_cache_view_infos = []
+        runner.kv_cache_positions = {"draft.layer": 0}
+        runner.bind_kv_cache_to_metadata = partial(
+            RBLNModelRunner.bind_kv_cache_to_metadata, runner
         )
         metadata, _, _ = proposer._build_draft_step(1, torch.tensor([position]))
         md = metadata["draft.layer"]
+        assert md.kv_caches[md.kv_cache_positions["draft.layer"]] is runner.kv_caches[0]
         assert md.seq_lens.flatten().tolist() == [position + 1]
         first_key = max(position - 7, 0) // block_size * block_size
         visible = md.attn_masks.flatten().nonzero().flatten() + first_key

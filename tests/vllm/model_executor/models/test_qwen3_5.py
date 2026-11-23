@@ -392,6 +392,42 @@ def test_image_embeddings_match_upstream(visual):
         torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-5)
 
 
+def test_an_image_is_encoded_through_the_shared_metrics_hook(visual, monkeypatch):
+    """ENCODER metrics wrap `run_mm_encoder`; an encoder call outside it is
+    missing from the per-bucket report."""
+    import vllm_rbln.utils as rbln_utils
+
+    grid = [1, 8, 12]
+    pixels = torch.randn(8 * 12, 3 * TEMPORAL * PATCH * PATCH)
+    model = RBLNQwen3_5ForConditionalGeneration.__new__(
+        RBLNQwen3_5ForConditionalGeneration
+    )
+    torch.nn.Module.__init__(model)
+    model.visual = visual
+    model.has_vision = True
+    model.mm_encoder_patch_buckets = [64, 128]
+    model.compile_mm_encoder(lambda encoder: encoder)
+    run_mm_encoder = rbln_utils.run_mm_encoder
+    shapes = []
+
+    def recording(encoder, inputs, num_embeddings, **kwargs):
+        shapes.append(tuple(inputs[0].shape))
+        return run_mm_encoder(encoder, inputs, num_embeddings, **kwargs)
+
+    monkeypatch.setattr(rbln_utils, "run_mm_encoder", recording)
+
+    (embeds,) = model._process_image_input(
+        {
+            "type": "pixel_values",
+            "pixel_values": pixels,
+            "image_grid_thw": torch.tensor([grid]),
+        }
+    )
+
+    assert shapes == [(128, pixels.shape[-1])]
+    assert embeds.shape == (8 * 12 // MERGE**2, 32)
+
+
 def test_video_frames_run_one_at_a_time_and_match_upstream(visual):
     # Two clips, of three and of two temporal patches. Upstream's cu_seqlens
     # keeps attention inside a temporal patch; here each is an encoder run at

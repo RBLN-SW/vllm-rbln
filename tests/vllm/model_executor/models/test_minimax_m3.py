@@ -1227,7 +1227,7 @@ def test_text_config_loads_from_local_checkpoint(tmp_path):
     assert loaded.architectures == ["MiniMaxM3SparseForCausalLM"]
 
 
-def test_minimax_m3_indexer_cache_declares_kv_cache_subindex():
+def test_minimax_m3_indexer_cache_registers_its_name():
     from vllm.config import CompilationConfig, set_current_vllm_config
 
     from vllm_rbln.model_executor.models.minimax_m3 import RBLNMiniMaxM3IndexerCache
@@ -1239,7 +1239,6 @@ def test_minimax_m3_indexer_cache_declares_kv_cache_subindex():
         )
 
     assert config.compilation_config.static_forward_context[cache.prefix] is cache
-    assert cache.kv_cache_subindex == 1
 
 
 def test_pp_ranks_report_the_same_kv_cache_layouts():
