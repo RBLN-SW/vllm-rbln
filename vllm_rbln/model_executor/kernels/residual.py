@@ -16,15 +16,17 @@
 
 A pre-norm layer adds a block's output to the residual and normalizes the sum for
 the next block in one fused_add_rms_norm. The "rbln" implementation splits that
-boundary in two: rbln_custom_ops::residual_write leaves the new residual cut by rows
-(tokens in prefill, batch rows in decode), and residual_read gathers the next
-block's input. The compiler decides whether a step is cut; an uncut step runs both
-whole.
+boundary in two on prefill steps: rbln_custom_ops::residual_write leaves the new
+residual cut by tokens, and residual_read gathers the next block's input.
+Decode steps keep the native op: at decode batch sizes the cut's scatter and
+gather cost more than the norm work it splits across the chiplets.
 """
 
 import torch
 from torch import Tensor
 from vllm import ir
+
+from vllm_rbln.utils import is_prefill_step
 
 # The architectures whose fused_add_rms_norm puts "rbln" first.
 RESIDUAL_CUT_ARCHITECTURES = frozenset(
@@ -51,5 +53,9 @@ def fused_add_rms_norm(
     epsilon: float,
     variance_size: int | None = None,
 ) -> tuple[Tensor, Tensor]:
+    if not is_prefill_step():
+        return ir.ops.fused_add_rms_norm.impls["native"].impl_fn(
+            x, x_residual, weight, epsilon, variance_size
+        )
     residual = torch.ops.rbln_custom_ops.residual_write(x_residual, x)
     return torch.ops.rbln_custom_ops.residual_read(residual, weight, epsilon), residual

@@ -16,7 +16,7 @@ import pytest
 import torch
 from vllm import ir
 
-import vllm_rbln.model_executor.kernels.residual  # noqa: F401
+import vllm_rbln.model_executor.kernels.residual as residual_kernels
 
 
 @pytest.fixture
@@ -39,7 +39,8 @@ def calls(monkeypatch):
     return calls
 
 
-def _fused_add_rms_norm(x, residual, weight):
+def _fused_add_rms_norm(monkeypatch, x, residual, weight, prefill=True):
+    monkeypatch.setattr(residual_kernels, "is_prefill_step", lambda: prefill)
     # The vllm model path traces with torch wrapping off, so the op dispatches here.
     with (
         ir.enable_torch_wrap(False),
@@ -48,24 +49,27 @@ def _fused_add_rms_norm(x, residual, weight):
         return ir.ops.fused_add_rms_norm(x, residual, weight, 1e-6)
 
 
-def test_the_boundary_writes_the_residual_then_reads_the_block_input(calls):
+@pytest.mark.parametrize("prefill, ops", [(True, ["write", "read"]), (False, [])])
+def test_prefill_splits_the_boundary_and_decode_stays_native(
+    calls, monkeypatch, prefill, ops
+):
     x, residual, weight = (
         torch.randn(2, 3, 64),
         torch.randn(2, 3, 64),
         torch.randn(64),
     )
-    out, new_residual = _fused_add_rms_norm(x, residual, weight)
+    out, new_residual = _fused_add_rms_norm(monkeypatch, x, residual, weight, prefill)
 
     native_out, native_residual = ir.ops.fused_add_rms_norm.impls["native"].impl_fn(
         x, residual, weight, 1e-6
     )
-    assert calls == ["write", "read"]
+    assert calls == ops
     torch.testing.assert_close(new_residual, native_residual)
     torch.testing.assert_close(out, native_out)
 
 
-def test_rows_without_a_batch_axis_stay_native(calls):
+def test_rows_without_a_batch_axis_stay_native(calls, monkeypatch):
     x, residual, weight = (torch.randn(3, 64), torch.randn(3, 64), torch.randn(64))
-    _fused_add_rms_norm(x, residual, weight)
+    _fused_add_rms_norm(monkeypatch, x, residual, weight)
 
     assert calls == []
