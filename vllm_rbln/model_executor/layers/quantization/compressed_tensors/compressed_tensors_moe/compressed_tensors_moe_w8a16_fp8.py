@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
-
 import torch
 from compressed_tensors.quantization import QuantizationArgs, QuantizationStrategy
 from torch.nn.parameter import Parameter
@@ -54,12 +52,6 @@ class CompressedTensorsW8A16Fp8MoEMethod(CompressedTensorsMoEMethod):
             raise NotImplementedError("Tensor strategy is not supported yet")
         self.weight_block_size = (
             weight_quant.block_structure
-            if self.strategy == QuantizationStrategy.BLOCK
-            else None
-        )
-        # CHANNEL sets it in process_weights_after_loading, from the shapes.
-        self.group_size = (
-            int(self.weight_block_size[1])
             if self.strategy == QuantizationStrategy.BLOCK
             else None
         )
@@ -171,22 +163,14 @@ class CompressedTensorsW8A16Fp8MoEMethod(CompressedTensorsMoEMethod):
         layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
-        w13_scale = layer.w13_weight_scale.data
-        w2_scale = layer.w2_weight_scale.data
-        if self.strategy == QuantizationStrategy.CHANNEL:
-            # custom_moe takes one group_size for gate/up (hidden_size inputs)
-            # and down (intermediate inputs), and each must be divisible by it,
-            # so split the per-channel scales into groups of their gcd.
-            hidden_size = layer.w13_weight.shape[-1]
-            intermediate_size = layer.w2_weight.shape[-1]
-            self.group_size = math.gcd(hidden_size, intermediate_size)
-            w13_scale = w13_scale.repeat(1, 1, hidden_size // self.group_size)
-            w2_scale = w2_scale.repeat(1, 1, intermediate_size // self.group_size)
-
         layer.w13_weight = Parameter(layer.w13_weight.data, requires_grad=False)
-        layer.w13_weight_scale = Parameter(w13_scale, requires_grad=False)
+        layer.w13_weight_scale = Parameter(
+            layer.w13_weight_scale.data, requires_grad=False
+        )
         layer.w2_weight = Parameter(layer.w2_weight.data, requires_grad=False)
-        layer.w2_weight_scale = Parameter(w2_scale, requires_grad=False)
+        layer.w2_weight_scale = Parameter(
+            layer.w2_weight_scale.data, requires_grad=False
+        )
 
     @property
     def is_monolithic(self) -> bool:
@@ -216,6 +200,13 @@ class CompressedTensorsW8A16Fp8MoEMethod(CompressedTensorsMoEMethod):
         scale_intermediate_size = w13_scale.shape[1] // 2
         gate_proj_weight_scale = w13_scale[:, :scale_intermediate_size, :]
         up_proj_weight_scale = w13_scale[:, scale_intermediate_size:, :]
+        # CHANNEL: custom_moe reads one input group (hidden_size) off
+        # gate_proj_scale; it also covers down's smaller intermediate input.
+        group_size = (
+            self.weight_block_size[1]
+            if self.strategy == QuantizationStrategy.BLOCK
+            else None
+        )
 
         final_hidden_states = torch.ops.rbln_custom_ops.custom_moe(
             hidden_states,
@@ -227,7 +218,7 @@ class CompressedTensorsW8A16Fp8MoEMethod(CompressedTensorsMoEMethod):
             gate_proj_scale=gate_proj_weight_scale,
             up_proj_scale=up_proj_weight_scale,
             down_proj_scale=layer.w2_weight_scale,
-            group_size=self.group_size,
+            group_size=group_size,
             expert_map=layer.expert_map,
         )
 
