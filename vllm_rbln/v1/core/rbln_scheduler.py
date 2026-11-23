@@ -186,6 +186,7 @@ class RBLNScheduler(Scheduler):
             self.kv_cache_manager = RBLNKVCacheManager(
                 kv_cache_config=self.kv_cache_config,
                 max_model_len=self.max_model_len,
+                max_in_flight_tokens=self.vllm_config.max_in_flight_tokens,
                 scheduler_block_size=self.block_size,
                 hash_block_size=self.hash_block_size,
                 sub_block_size=sub_block_size,

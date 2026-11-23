@@ -178,6 +178,24 @@ class TestSchedulerInit:
         )
         assert isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
 
+    def test_sub_block_manager_admits_what_the_sliding_window_recycles(self):
+        # The pool holds the prompt's full-attention blocks plus the few a
+        # sliding window keeps, not a second full-length copy of the prompt.
+        sched = create_rbln_scheduler(
+            enable_prefix_caching=True,
+            block_size=16,
+            sub_block_size=8,
+            max_num_batched_tokens=16,
+            max_model_len=2048,
+            kv_cache_config=make_kv_cache_config(
+                [full_attention_spec(16), sliding_window_spec(16, 16)],
+                num_blocks=32,
+            ),
+        )
+        assert isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
+        sched.add_request(make_request("0", list(range(320)), 16))
+        assert sched.schedule().num_scheduled_tokens == {"0": 16}
+
     def test_disabled_falls_back_to_base_manager(self):
         # prefix caching off -> plain KVCacheManager.
         sched = create_rbln_scheduler(enable_prefix_caching=False)
