@@ -64,19 +64,35 @@ def test_config_rejects_unsupported_ring_transfer():
         MODELS_CONFIG_MAP["DeepseekV4ForCausalLM"].verify_and_update_config(config)
 
 
-def test_prefix_caching_requires_ring_checkpoints():
-    from vllm.model_executor.models.config import MODELS_CONFIG_MAP
+@pytest.mark.parametrize("retention", [None, 0, 8192])
+def test_prefix_caching_supports_prompt_checkpoints_only(monkeypatch, retention):
+    from vllm.model_executor.models.config import (
+        MODELS_CONFIG_MAP,
+        DeepseekV4ForCausalLMConfig,
+    )
+
+    monkeypatch.setattr(
+        DeepseekV4ForCausalLMConfig, "verify_and_update_config", lambda config: None
+    )
 
     config = SimpleNamespace(
         model_config=SimpleNamespace(architecture="DeepseekV4ForCausalLM"),
         cache_config=SimpleNamespace(
             enable_prefix_caching=True,
             block_size=2048,
+            prefix_cache_retention_interval=retention,
+            prefix_match_unit=None,
         ),
         scheduler_config=SimpleNamespace(enable_chunked_prefill=True),
+        speculative_config=None,
+        kv_transfer_config=None,
     )
-    with pytest.raises(ValueError, match="ring-state checkpoint"):
-        MODELS_CONFIG_MAP["DeepseekV4ForCausalLM"].verify_and_update_config(config)
+    adapter = MODELS_CONFIG_MAP["DeepseekV4ForCausalLM"]
+    if retention == 0:
+        adapter.verify_and_update_config(config)
+    else:
+        with pytest.raises(ValueError, match="retention_interval=0"):
+            adapter.verify_and_update_config(config)
 
 
 @pytest.mark.parametrize("drafts", [4, 8])
@@ -147,6 +163,41 @@ def cache_specs():
             dtype=torch.float32,
         ),
     }
+
+
+@pytest.mark.parametrize("prefix_unit", [None, 16])
+@pytest.mark.parametrize("rings_only", [False, True])
+def test_ring_capacity_does_not_lower_prefix_hash_granularity(
+    cache_config, cache_specs, prefix_unit, rings_only
+):
+    from dataclasses import replace
+
+    from vllm.v1.engine.core import resolve_kv_cache_block_sizes
+    from vllm.v1.kv_cache_interface import KVCacheConfig
+
+    cache_config.cache_config.enable_prefix_caching = True
+    cache_config.cache_config.prefix_match_unit = prefix_unit
+    cache_config.cache_config.block_size = 16
+    cache_config.kv_transfer_config = None
+    specs = {
+        name: replace(spec, prefix_caching=True)
+        if isinstance(spec, RBLNDeepseekV4StateSpec)
+        else spec
+        for name, spec in cache_specs.items()
+        if not rings_only or isinstance(spec, RBLNDeepseekV4StateSpec)
+    }
+    kv_config = KVCacheConfig(
+        num_blocks=64,
+        kv_cache_tensors=[],
+        kv_cache_groups=deepseek_v4_kv_cache_groups(cache_config, specs),
+    )
+    assert resolve_kv_cache_block_sizes(kv_config, cache_config) == (
+        16 if rings_only else 64,
+        16,
+    )
+    assert sorted(g.kv_cache_spec.block_size for g in kv_config.kv_cache_groups) == (
+        [4, 8] if rings_only else [4, 8, 16, 64]
+    )
 
 
 @pytest.mark.parametrize("num_blocks", [6, 13])

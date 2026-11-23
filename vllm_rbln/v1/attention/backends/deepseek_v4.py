@@ -16,8 +16,8 @@
 
 Paged caches use MLAAttentionSpec: compressed KV rows are 768 bytes, indexer keys
 are 128 fp8 values, and each block holds block_size / compress_ratio rows. The
-indexer scale is a block auxiliary. SWA and compressor rings use one circular
-buffer per request; prefix checkpoint copies are not supported yet.
+indexer scale is a block auxiliary. SWA and compressor rings use one writable
+buffer per request and immutable prefix checkpoints on a separate state pool.
 """
 
 from dataclasses import dataclass
@@ -45,9 +45,15 @@ class RBLNDeepseekV4StateSpec(CircularBufferSpec):
     """A ring on a bounded state pool, independent of paged attention IDs."""
 
     num_state_slots: int
+    prefix_caching: bool = False
+    is_draft: bool = False
     head_size_v: int = 0
     dcp_sharded: bool = False
     max_tp_shards: int | None = 1
+
+    @property
+    def prefix_cacheable(self) -> bool:
+        return self.prefix_caching
 
 
 class RBLNDeepseekV4MetadataBuilder(RBLNFlashAttentionMetadataBuilder):

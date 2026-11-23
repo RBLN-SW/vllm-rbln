@@ -893,6 +893,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 added[-1] = (index, params, prompt, output_token_ids)
             self.input_batch.update_req_spec_token_ids(request, scheduled_spec_tokens)
 
+        for req_id, updates in scheduler_output.ring_block_updates.items():
+            request = self.requests[req_id]
+            req_index = self.input_batch.req_id_to_index[req_id]
+            for group_id, block_id in updates.items():
+                request.block_ids[group_id][:] = [block_id]
+                self.input_batch.block_table[group_id].add_row([block_id], req_index)
+
         # Condense the batched states if there are gaps left by removed requests
         self.input_batch.condense()
         # Allow attention backend to reorder the batch, potentially
@@ -4292,6 +4299,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         logger.info("Compile and warming up model.")
 
         extra_hash_factors: dict[str, object] = {}
+        if self.fixed_kv_cache_tensors and self.cache_config.enable_prefix_caching:
+            # Prefix caching enlarges these static inputs, but vLLM omits the
+            # flag from its hash. Batch/spec sizes already cover prefix-off rings.
+            extra_hash_factors["fixed_kv_cache_sizes"] = {
+                name: tensor.numel()
+                for name, tensor in self.fixed_kv_cache_tensors.items()
+            }
         if self.supports_mm_inputs:
             buckets = cast(SupportsRBLNMultiModal, self.model).mm_encoder_patch_buckets
             if buckets:

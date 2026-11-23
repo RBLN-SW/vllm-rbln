@@ -54,6 +54,7 @@ from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
+    extract_layer_index,
     is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -134,8 +135,17 @@ class RBLNDeepseekV4RingCache(_RBLNDeepseekV4Cache):
         speculative = vllm_config.speculative_config
         drafts = speculative.num_speculative_tokens if speculative is not None else 0
         capacity = 1 << (self.window + drafts - 1).bit_length()
+        prefix_caching = vllm_config.cache_config.enable_prefix_caching
+        checkpoints = (2 if drafts else 1) if prefix_caching else 0
         return RBLNDeepseekV4StateSpec(
-            num_state_slots=vllm_config.scheduler_config.max_num_seqs + 1,
+            num_state_slots=(1 + checkpoints)
+            * vllm_config.scheduler_config.max_num_seqs
+            + 1,
+            prefix_caching=prefix_caching,
+            is_draft=prefix_caching
+            and extract_layer_index(self.prefix, num_attn_module=DSV4_NUM_CACHE_SLOTS)
+            // DSV4_NUM_CACHE_SLOTS
+            >= vllm_config.model_config.hf_text_config.num_hidden_layers,
             block_size=capacity,
             num_kv_heads=1,
             head_size=self.width,

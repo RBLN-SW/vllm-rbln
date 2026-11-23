@@ -18,6 +18,7 @@ answers, and re-checking that the resized pool can hold one request."""
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 import vllm_rbln.patches.dynamic_kv as dk
 from vllm_rbln.patches.dynamic_kv import (
@@ -41,13 +42,15 @@ class TestOverrideBranch:
     @staticmethod
     def _config(dynamic=None):
         return SimpleNamespace(
-            cache_config=SimpleNamespace(num_gpu_blocks_override=26, num_gpu_blocks=26),
+            cache_config=SimpleNamespace(
+                num_gpu_blocks_override=26, num_gpu_blocks=26, block_size=16
+            ),
             additional_config=SimpleNamespace(use_dynamic_kv_cache=dynamic),
         )
 
     def test_the_override_skips_the_workers(self, monkeypatch):
         calls: list = []
-        kv_cache_config = SimpleNamespace(num_blocks=26)
+        kv_cache_config = SimpleNamespace(num_blocks=26, kv_cache_groups=[])
         monkeypatch.setattr(
             dk,
             "engine_core_original_initialize_kv_caches",
@@ -61,7 +64,7 @@ class TestOverrideBranch:
 
     def test_an_unsupported_config_skips_the_workers(self, monkeypatch):
         calls: list = []
-        kv_cache_config = SimpleNamespace(num_blocks=26)
+        kv_cache_config = SimpleNamespace(num_blocks=26, kv_cache_groups=[])
         monkeypatch.setattr(
             dk,
             "engine_core_original_initialize_kv_caches",
@@ -72,7 +75,7 @@ class TestOverrideBranch:
         )
         config = SimpleNamespace(
             cache_config=SimpleNamespace(
-                num_gpu_blocks_override=None, num_gpu_blocks=26
+                num_gpu_blocks_override=None, num_gpu_blocks=26, block_size=16
             ),
             additional_config=SimpleNamespace(use_dynamic_kv_cache=None),
         )
@@ -83,7 +86,7 @@ class TestOverrideBranch:
 
     def test_off_skips_the_workers_without_a_reason(self, monkeypatch, caplog):
         calls: list = []
-        kv_cache_config = SimpleNamespace(num_blocks=26)
+        kv_cache_config = SimpleNamespace(num_blocks=26, kv_cache_groups=[])
         monkeypatch.setattr(
             dk,
             "engine_core_original_initialize_kv_caches",
@@ -97,6 +100,41 @@ class TestOverrideBranch:
         assert out is kv_cache_config
         assert calls == []
         assert caplog.records == []
+
+
+@pytest.mark.parametrize("with_paged_group", [False, True])
+def test_prefix_rings_do_not_change_frontend_token_block_size(
+    monkeypatch, with_paged_group
+):
+    from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+    state = dk.RBLNDeepseekV4StateSpec(
+        num_state_slots=3,
+        block_size=4,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.float32,
+        prefix_caching=True,
+    )
+    groups = [SimpleNamespace(kv_cache_spec=state)]
+    if with_paged_group:
+        groups.append(
+            SimpleNamespace(
+                kv_cache_spec=FullAttentionSpec(
+                    block_size=16, num_kv_heads=1, head_size=8, dtype=torch.float32
+                )
+            )
+        )
+    kv_config = SimpleNamespace(kv_cache_groups=groups)
+    config = TestOverrideBranch._config(dynamic=False)
+
+    def initialize(engine, config):
+        config.cache_config.block_size = 4
+        return kv_config
+
+    monkeypatch.setattr(dk, "engine_core_original_initialize_kv_caches", initialize)
+    assert dk.patched_initialize_kv_caches(None, config) is kv_config
+    assert config.cache_config.block_size == 16
 
 
 class TestResolveRankNumBlocks:

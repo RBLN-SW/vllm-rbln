@@ -68,7 +68,23 @@ def resolve_rank_num_blocks(num_blocks_per_rank: list[Any]) -> int | None:
 def patched_initialize_kv_caches(
     self: EngineCore, vllm_config: VllmConfig
 ) -> KVCacheConfig:
+    requested_block_size = vllm_config.cache_config.block_size
     kv_cache_config = engine_core_original_initialize_kv_caches(self, vllm_config)
+    groups = kv_cache_config.kv_cache_groups
+    if any(
+        isinstance(g.kv_cache_spec, RBLNDeepseekV4StateSpec)
+        and g.kv_cache_spec.prefix_cacheable
+        for g in groups
+    ):
+        vllm_config.cache_config.block_size = min(
+            (
+                g.kv_cache_spec.block_size
+                for g in groups
+                if not isinstance(g.kv_cache_spec, RBLNDeepseekV4StateSpec)
+                and g.kv_cache_spec.prefix_cacheable
+            ),
+            default=requested_block_size,
+        )
 
     if vllm_config.additional_config.use_dynamic_kv_cache is False:
         return kv_cache_config

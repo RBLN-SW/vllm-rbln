@@ -325,7 +325,7 @@ def test_ring_capacity_preserves_history_across_rejected_drafts(history, drafts)
     torch.nn.Module.__init__(ring)
     ring.window, ring.width, ring.dtype = history, 768, torch.uint8
     config = SimpleNamespace(
-        cache_config=SimpleNamespace(),
+        cache_config=SimpleNamespace(enable_prefix_caching=False),
         scheduler_config=SimpleNamespace(max_num_seqs=2),
         speculative_config=SimpleNamespace(num_speculative_tokens=drafts)
         if drafts
@@ -352,6 +352,7 @@ def test_ring_metadata_keeps_one_slot_past_ring_boundaries(is_prefill):
     ring = RBLNDeepseekV4RingCache.__new__(RBLNDeepseekV4RingCache)
     torch.nn.Module.__init__(ring)
     ring.window, ring.width, ring.dtype = 128, 768, torch.uint8
+    ring.prefix = "model.layers.0.self_attn.attn.0"
     config = make_vllm_config(max_model_len=4096, max_num_batched_tokens=16)
     spec = ring.get_kv_cache_spec(config)
     builder = make_builder(

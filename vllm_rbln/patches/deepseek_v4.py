@@ -54,9 +54,8 @@ def register_rbln_deepseek_v4_fp8_config() -> None:
 
 @add_registration(
     reason=(
-        "RBLN's per-request circular buffers do not support prefix checkpoint "
-        "copies or KV transfer yet, and its compressor limits speculative "
-        "lookahead. Validate these constraints alongside upstream's quantization setup."
+        "RBLN's circular buffers retain whole-block prompt checkpoints only, "
+        "do not support KV transfer, and limit speculative lookahead."
     )
 )
 def register_deepseek_v4_config() -> None:
@@ -68,12 +67,27 @@ def register_deepseek_v4_config() -> None:
     class RBLNDeepseekV4Config(DeepseekV4ForCausalLMConfig):
         @classmethod
         def verify_and_update_config(cls, vllm_config) -> None:
-            if vllm_config.cache_config.enable_prefix_caching:
-                raise ValueError(
-                    "DeepSeek-V4 prefix caching requires ring-state checkpoint "
-                    "copies, which are not supported on RBLN yet. "
-                    "Use --no-enable-prefix-caching."
-                )
+            cache = vllm_config.cache_config
+            if cache.enable_prefix_caching:
+                from vllm_rbln.platform import use_device_tensor
+
+                if not use_device_tensor():
+                    raise ValueError(
+                        "DeepSeek-V4 prefix caching requires device tensors."
+                    )
+                if cache.prefix_cache_retention_interval != 0:
+                    raise ValueError(
+                        "DeepSeek-V4 prefix caching on RBLN supports "
+                        "prefix_cache_retention_interval=0 only."
+                    )
+                if (
+                    cache.prefix_match_unit is not None
+                    and cache.prefix_match_unit < cache.block_size
+                ):
+                    raise ValueError(
+                        "DeepSeek-V4 prefix caching on RBLN uses whole blocks; "
+                        "prefix_match_unit must not be smaller than block_size."
+                    )
             speculative = vllm_config.speculative_config
             if speculative is not None and speculative.num_speculative_tokens > 3:
                 raise ValueError(
@@ -127,7 +141,10 @@ def deepseek_v4_kv_cache_groups(vllm_config, kv_cache_spec):
     by_spec: dict = {}
     for name, spec in states.items():
         by_spec.setdefault(spec, []).append(name)
-    groups.extend(KVCacheGroupSpec(names, spec) for spec, names in by_spec.items())
+    groups.extend(
+        KVCacheGroupSpec(names, spec, is_eagle_group=spec.is_draft)
+        for spec, names in by_spec.items()
+    )
     return groups
 
 
@@ -186,6 +203,63 @@ def _build_deepseek_v4_kv_cache_groups():
         return groups if groups is not None else original(vllm_config, kv_cache_spec)
 
     return get_kv_cache_groups
+
+
+@register_patch(
+    target="vllm.v1.engine.core.resolve_kv_cache_block_sizes",
+    reason=(
+        "CircularBufferSpec.block_size describes ring capacity, not a token "
+        "checkpoint interval. Including it in the hash GCD would hash every "
+        "few tokens and reject valid whole-block prefix_match_unit settings."
+    ),
+    build=True,
+)
+def _build_deepseek_v4_prefix_block_sizes():
+    from dataclasses import replace
+    from math import lcm
+
+    from vllm.v1.core import kv_cache_utils
+    from vllm.v1.engine import core
+
+    from vllm_rbln.v1.attention.backends.deepseek_v4 import RBLNDeepseekV4StateSpec
+
+    original = core.resolve_kv_cache_block_sizes
+
+    @functools.wraps(original)
+    def resolve_kv_cache_block_sizes(kv_cache_config, vllm_config):
+        groups = kv_cache_config.kv_cache_groups
+        if vllm_config.cache_config.enable_prefix_caching and any(
+            isinstance(g.kv_cache_spec, RBLNDeepseekV4StateSpec) for g in groups
+        ):
+            interval = lcm(
+                vllm_config.cache_config.block_size,
+                *(
+                    kv_cache_utils.resolve_dcp_kv_block_size(
+                        g.kv_cache_spec,
+                        vllm_config.parallel_config.decode_context_parallel_size,
+                    )
+                    for g in groups
+                ),
+            )
+            # A temporary logical view for alignment/hash resolution only;
+            # allocation and block tables keep the physical ring capacities.
+            kv_cache_config = replace(
+                kv_cache_config,
+                kv_cache_groups=[
+                    replace(
+                        g,
+                        kv_cache_spec=g.kv_cache_spec.copy_with_new_block_size(
+                            interval
+                        ),
+                    )
+                    if isinstance(g.kv_cache_spec, RBLNDeepseekV4StateSpec)
+                    else g
+                    for g in groups
+                ],
+            )
+        return original(kv_cache_config, vllm_config)
+
+    return resolve_kv_cache_block_sizes
 
 
 @register_patch(

@@ -28,6 +28,7 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.kv_cache_interface import KVCacheSpec
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.request import RequestStatus
@@ -56,6 +57,143 @@ from vllm_rbln.v1.core.rbln_scheduler import (
     RBLNSchedulerOutput,
 )
 from vllm_rbln.v1.core.utils import is_prefill, step_is_prefill
+
+
+@pytest.mark.parametrize("draft", [False, True])
+@pytest.mark.parametrize("chunk", [10, 15])
+@pytest.mark.parametrize("alignment", [16, 64])
+def test_ring_prefix_hit_restores_checkpoint_and_replaces_single_slot(
+    draft, chunk, alignment
+):
+    from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
+
+    from vllm_rbln.platform import RblnPlatform
+    from vllm_rbln.v1.attention.backends.deepseek_v4 import RBLNDeepseekV4StateSpec
+
+    register_all_kvcache_specs(None)
+    RblnPlatform.register_custom_kv_cache_specs(None)
+    state = RBLNDeepseekV4StateSpec(
+        num_state_slots=5,
+        block_size=4,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.float32,
+        prefix_caching=True,
+    )
+    specs: list[KVCacheSpec] = [full_attention_spec(16)]
+    if alignment > 16:
+        specs.append(full_attention_spec(alignment))
+    ring_start = len(specs)
+    specs.append(state)
+    if draft:
+        specs.append(dataclasses.replace(state, is_draft=True))
+    kv_config = make_kv_cache_config(specs, 64)
+    kv_config.kv_cache_groups[-1].is_eagle_group = draft
+    kv_config.prefix_cache_retention_interval = 0
+    scheduler = create_rbln_scheduler(
+        max_num_seqs=2,
+        max_num_batched_tokens=chunk,
+        max_model_len=4 * alignment,
+        block_size=alignment,
+        hash_block_size=16,
+        enable_prefix_caching=True,
+        kv_cache_config=kv_config,
+    )
+    requests = create_requests(
+        2,
+        num_tokens=2 * alignment + 5,
+        max_tokens=1,
+        block_size=16,
+        same_prompt=True,
+    )
+    traces = []
+    for request in requests:
+        scheduler.add_request(request)
+        steps = []
+        while request.request_id in scheduler.requests:
+            output = scheduler.schedule()
+            assert output.num_scheduled_tokens
+            steps.append(output)
+            token = (
+                0 if request.num_computed_tokens >= request.num_prompt_tokens else None
+            )
+            scheduler.update_from_output(
+                output, make_model_runner_output(output, token)
+            )
+            assert len(steps) < 40
+        traces.append(steps)
+    expected_hit = alignment if draft else 2 * alignment
+    prompt_length = requests[0].num_prompt_tokens
+    assert sum(o.total_num_scheduled_tokens for o in traces[0]) == prompt_length
+    assert sum(o.total_num_scheduled_tokens for o in traces[1]) == (
+        prompt_length - expected_hit
+    )
+    assert all(o.total_num_scheduled_tokens > 1 for trace in traces for o in trace[:-1])
+    first = traces[1][0]
+    assert first.scheduled_new_reqs[0].num_computed_tokens == expected_hit
+    assert len(first.kv_cache_copy_ops) == 1 + draft
+    updates = first.ring_block_updates[requests[1].request_id]
+    for op in first.kv_cache_copy_ops:
+        assert op.group_id >= ring_start
+        assert op.num_tokens == state.block_size
+        assert updates[op.group_id] == op.dst_block_id
+        assert len(first.scheduled_new_reqs[0].block_ids[op.group_id]) == 1
+    pools = [manager.block_pool for manager in scheduler._ring_managers.values()]
+    assert all(pool.get_num_free_blocks() == 4 for pool in pools)
+    assert scheduler.kv_cache_manager.reset_prefix_cache()
+    assert all(len(pool.cached_block_hash_to_block) == 0 for pool in pools)
+
+
+def test_single_request_ring_pool_retains_both_mtp_replay_boundaries():
+    from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
+
+    from vllm_rbln.model_executor.models.deepseek_v4 import RBLNDeepseekV4RingCache
+    from vllm_rbln.platform import RblnPlatform
+
+    register_all_kvcache_specs(None)
+    RblnPlatform.register_custom_kv_cache_specs(None)
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(num_speculative_tokens=1),
+        cache_config=SimpleNamespace(enable_prefix_caching=True),
+        scheduler_config=SimpleNamespace(max_num_seqs=1),
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(num_hidden_layers=1)
+        ),
+    )
+    states = [
+        RBLNDeepseekV4RingCache.get_kv_cache_spec(
+            SimpleNamespace(
+                window=4,
+                width=8,
+                dtype=torch.float32,
+                prefix=f"model.layers.{i}.self_attn.swa.0",
+            ),
+            config,
+        )
+        for i in range(2)
+    ]
+    kv = make_kv_cache_config([full_attention_spec(16), *states], 64)
+    kv.kv_cache_groups[-1].is_eagle_group = True
+    kv.prefix_cache_retention_interval = 0
+    scheduler = create_rbln_scheduler(
+        max_num_seqs=1,
+        max_num_batched_tokens=16,
+        max_model_len=128,
+        block_size=16,
+        enable_prefix_caching=True,
+        kv_cache_config=kv,
+    )
+    request = make_request("prime", list(range(48)), 16, max_tokens=1)
+    scheduler.add_request(request)
+    while scheduler.requests:
+        output = scheduler.schedule()
+        token = 0 if request.num_computed_tokens == 48 else None
+        scheduler.update_from_output(output, make_model_runner_output(output, token))
+
+    same = make_request("same", list(range(48)), 16)
+    longer = make_request("longer", list(range(49)), 16)
+    assert scheduler.kv_cache_manager.get_computed_blocks(same)[1] == 16
+    assert scheduler.kv_cache_manager.get_computed_blocks(longer)[1] == 32
 
 
 @pytest.mark.parametrize("interrupt_scheduling", [False, True])

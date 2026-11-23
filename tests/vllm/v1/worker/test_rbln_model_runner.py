@@ -113,6 +113,7 @@ def _make_runner_stub(**attrs):
     runner.mrope_positions = None
     runner.use_async_scheduling = False
     runner._prev_async_output = None
+    runner.fixed_kv_cache_tensors = {}
     for key, value in attrs.items():
         setattr(runner, key, value)
     return runner
@@ -829,11 +830,19 @@ class TestEcConsumer:
     [[1024, 2304, 12288], []],
     ids=["encoder", "no-local-encoder"],
 )
-def test_multimodal_warmup_keys_the_bundle_on_the_encoder_buckets(monkeypatch, buckets):
+@pytest.mark.parametrize("ring_bytes", [0, 24, 48])
+@pytest.mark.parametrize("prefix_caching", [False, True])
+def test_warmup_keys_the_bundle_on_encoder_buckets_and_fixed_cache_sizes(
+    monkeypatch, buckets, ring_bytes, prefix_caching
+):
     from tests.vllm.vllm_config import make_vllm_config
 
-    vllm_config = make_vllm_config()
-    factors = {"mm_encoder_patch_buckets": [1024, 2304, 12288]} if buckets else {}
+    vllm_config = make_vllm_config(enable_prefix_caching=prefix_caching)
+    factors: dict[str, object] = (
+        {"mm_encoder_patch_buckets": [1024, 2304, 12288]} if buckets else {}
+    )
+    if ring_bytes and prefix_caching:
+        factors["fixed_kv_cache_sizes"] = {"ring": ring_bytes}
     expected = mr.mega_cache.config_signature(vllm_config, extra_hash_factors=factors)
     cache = SimpleNamespace(
         config_signature=mr.mega_cache.config_signature, load=Mock(), save=Mock()
@@ -842,6 +851,7 @@ def test_multimodal_warmup_keys_the_bundle_on_the_encoder_buckets(monkeypatch, b
     monkeypatch.setattr(mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=False))
     runner = _make_runner_stub(
         vllm_config=vllm_config,
+        cache_config=vllm_config.cache_config,
         model_config=SimpleNamespace(model="m3"),
         model=SimpleNamespace(mm_encoder_patch_buckets=buckets),
         supports_mm_inputs=True,
@@ -849,6 +859,9 @@ def test_multimodal_warmup_keys_the_bundle_on_the_encoder_buckets(monkeypatch, b
         offload_context=nullcontext,
         drafter=None,
         _warmup_mm_encoder=Mock(),
+        fixed_kv_cache_tensors={"ring": torch.empty(ring_bytes, dtype=torch.int8)}
+        if ring_bytes
+        else {},
     )
 
     runner.warmup_model()
@@ -1817,7 +1830,7 @@ def _new_req(req_id, *, prompt_logprobs=None):
     )
 
 
-def _sched(*, new=(), finished=(), scheduled=None, cached=None, spec=None):
+def _sched(*, new=(), finished=(), scheduled=None, cached=None, spec=None, rings=None):
     return SimpleNamespace(
         finished_req_ids=list(finished),
         free_encoder_mm_hashes=[],
@@ -1825,6 +1838,7 @@ def _sched(*, new=(), finished=(), scheduled=None, cached=None, spec=None):
         scheduled_new_reqs=list(new),
         scheduled_cached_reqs=cached or _empty_cached(),
         scheduled_spec_decode_tokens=spec or {},
+        ring_block_updates=rings or {},
     )
 
 
@@ -1855,6 +1869,32 @@ class TestUpdateStates:
         r._update_states(_sched(new=[_new_req("n0")], scheduled={"n0": 3}))
         assert "n0" in r.requests
         assert "n0" in r.input_batch.req_id_to_index
+
+    @pytest.mark.parametrize("already_running", [False, True])
+    def test_ring_copy_replaces_instead_of_appending_a_slot(
+        self, monkeypatch, already_running
+    ):
+        r = self._runner(monkeypatch, input_batch=_input_batch(0))
+        new = _new_req("n0")
+        new.block_ids = ([1],)
+        output = _sched(new=[new], scheduled={"n0": 3}, rings={"n0": {0: 3}})
+        if already_running:
+            r._update_states(_sched(new=[new], scheduled={"n0": 3}))
+            output.scheduled_new_reqs = []
+            output.scheduled_cached_reqs = SimpleNamespace(
+                req_ids=["n0"],
+                num_computed_tokens=[3],
+                new_block_ids=[None],
+                resumed_req_ids=set(),
+                num_output_tokens=[0],
+                new_token_ids=[],
+            )
+        r._update_states(output)
+        assert r.requests["n0"].block_ids == ([3],)
+        row = r.input_batch.req_id_to_index["n0"]
+        table = r.input_batch.block_table[0]
+        assert table.num_blocks_per_row[row] == 1
+        assert table.block_table.np[row, 0] == 3
 
     def test_new_request_prompt_logprobs_recorded(self, monkeypatch):
         r = self._runner(monkeypatch, input_batch=_input_batch(0))
