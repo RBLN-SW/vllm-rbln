@@ -92,7 +92,10 @@ class RblnTransferTopology(TransferTopology):
             # Upstream skips the shape for the same reason: a Mamba cache is a
             # (conv, ssm) pair, and the connector hands it no tensor shape.
             return
-        backend = self.attn_backends[0]
+        # A GDN state page is declared as a full-attention block, so the
+        # attention backend beside it gives the layout; the SSM backend of the
+        # GDN conv ring has no KV shape to probe.
+        backend = next(b for b in self.attn_backends if not b.is_ssm())
         # Extents no other can collide with, so the shape itself says which
         # axis carries each. Upstream's get_kv_cache_block_dim reads the block
         # axis the same way, but only off an AttentionBackend subclass. The

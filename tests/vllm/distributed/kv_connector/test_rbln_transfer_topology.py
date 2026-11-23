@@ -25,6 +25,7 @@ import pytest
 import torch
 from vllm.config import set_current_vllm_config
 from vllm.distributed.kv_transfer.kv_connector.utils import EngineTransferInfo
+from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
 from tests.vllm.vllm_config import make_vllm_config
@@ -32,6 +33,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_transfer_topology im
     RblnTransferTopology,
 )
 from vllm_rbln.v1.attention.backends.flash_attention import RBLNFlashAttentionBackend
+from vllm_rbln.v1.attention.backends.gdn_attn import RBLNGDNAttentionBackend
 from vllm_rbln.v1.attention.backends.glm5_next import RBLNGlm5NextIndexerBackend
 from vllm_rbln.v1.attention.backends.mla.flashattn_mla import RBLNFlashAttnMLABackend
 from vllm_rbln.v1.attention.backends.mla.indexer import (
@@ -110,6 +112,26 @@ class TestRblnTransferTopology:
 
         assert (shape[topo.kv_head_dim], shape[topo.kv_token_dim]) == (7, 5)
 
+    def test_a_gdn_backend_ahead_of_attention_leaves_the_probe_to_attention(self):
+        # Qwen3.5 declares its GDN state as a full-attention page, so the
+        # topology is not Mamba, yet the conv ring's SSM backend can come first.
+        with self._kernel_config(False):
+            topo = RblnTransferTopology(
+                tp_rank=0,
+                tp_size=2,
+                block_size=64,
+                engine_id="e",
+                is_mla=False,
+                is_mamba=False,
+                total_num_kv_heads=8,
+                attn_backends=[RBLNGDNAttentionBackend, RBLNFlashAttentionBackend],
+            )
+            shape = RBLNFlashAttentionBackend.get_kv_cache_shape(
+                num_blocks=3, block_size=5, num_kv_heads=7, head_size=11
+            )
+
+        assert (shape[topo.kv_head_dim], shape[topo.kv_token_dim]) == (7, 5)
+
     @pytest.mark.parametrize(
         "backend",
         [
@@ -142,7 +164,7 @@ class TestRblnTransferTopology:
     def test_an_mla_cache_the_descriptors_cannot_read_is_rejected(self):
         # The arithmetic reads the blocks off the leading dim, so a latent
         # cache shaped otherwise has to stop here.
-        class Backend:
+        class Backend(AttentionBackend):
             @staticmethod
             def get_kv_cache_shape(num_blocks, block_size, num_kv_heads, head_size):
                 return (block_size, num_blocks, head_size)
