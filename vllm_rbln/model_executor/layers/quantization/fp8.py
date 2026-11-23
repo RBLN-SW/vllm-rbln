@@ -21,6 +21,7 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoeWeightScaleSupported,
     modular_kernel,
 )
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
@@ -315,6 +316,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         masked_routing_weights = router_logits
         intermediate_size = layer.w2_weight.shape[-1]
 
+        if layer.activation == MoEActivation.SWIGLUOAI:
+            # Interleaved gate/up rows share one 128-row block scale, so the
+            # block-quantized w13 cannot be split into gate and up.
+            raise NotImplementedError(
+                "RBLN fp8 block MoE takes gate/up stacked in w13; "
+                f"{layer.activation} interleaves them"
+            )
+
         # w13_weight: merged gate(up) weights, w2_weight: down weights
         gate_proj_weight = layer.w13_weight[:, :intermediate_size, :]
         up_proj_weight = layer.w13_weight[:, intermediate_size:, :]
@@ -367,7 +376,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 hidden_states_scale=hs_scale,
                 out_dtype=compute_dtype,
                 expert_map=layer.expert_map,
+                swiglu_alpha=layer.swiglu_alpha,
                 swiglu_limit=swiglu_limit,
+                swiglu_beta=layer.swiglu_beta,
             )
         else:
             final_hidden_states = torch.ops.rbln_custom_ops.custom_moe(
@@ -382,7 +393,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 down_proj_scale=down_proj_weight_scale,
                 group_size=int(self.weight_block_size[1]),
                 expert_map=layer.expert_map,
+                swiglu_alpha=layer.swiglu_alpha,
                 swiglu_limit=swiglu_limit,
+                swiglu_beta=layer.swiglu_beta,
             )
 
         return final_hidden_states.reshape(orig_shape)

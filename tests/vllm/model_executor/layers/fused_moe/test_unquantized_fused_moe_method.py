@@ -68,7 +68,9 @@ def test_apply_clamps_the_glu_when_the_layer_has_a_limit(activation, act, limit)
         w2_weight=torch.randn(EXPERTS, HIDDEN, INTER, generator=g) * 0.1,
         activation=activation,
         expert_map=None,
+        swiglu_alpha=None,
         swiglu_limit=limit,
+        swiglu_beta=None,
     )
     x = torch.randn(TOKENS, HIDDEN, generator=g)
     routing = torch.softmax(torch.randn(EXPERTS, TOKENS, generator=g), dim=0)
@@ -93,3 +95,43 @@ def test_apply_clamps_the_glu_when_the_layer_has_a_limit(activation, act, limit)
     torch.testing.assert_close(out, reference(limit), atol=1e-4, rtol=1e-4)
     if limit:
         assert not torch.allclose(out, reference(None), atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize(
+    ("activation", "interleaved"),
+    [(MoEActivation.SWIGLUOAI, True), (MoEActivation.SWIGLUOAI_UNINTERLEAVE, False)],
+)
+def test_apply_passes_the_whole_glu(activation, interleaved):
+    """alpha, limit and beta reach the op, and SWIGLUOAI's interleaved w13 is split as
+    such: swish(gate.clamp(max=L), alpha) * (up.clamp(+-L) + beta)."""
+    alpha, limit, beta = 1.702, 7.0, 1.0
+    g = torch.Generator().manual_seed(0)
+    layer = SimpleNamespace(
+        w13_weight=torch.randn(EXPERTS, 2 * INTER, HIDDEN, generator=g) * 0.1,
+        w2_weight=torch.randn(EXPERTS, HIDDEN, INTER, generator=g) * 0.1,
+        activation=activation,
+        expert_map=None,
+        swiglu_alpha=alpha,
+        swiglu_limit=limit,
+        swiglu_beta=beta,
+    )
+    x = torch.randn(TOKENS, HIDDEN, generator=g)
+    routing = torch.softmax(torch.randn(EXPERTS, TOKENS, generator=g), dim=0)
+
+    config = SimpleNamespace(compilation_config=CompilationConfig(custom_ops=["all"]))
+    with set_current_vllm_config(config):
+        method = RBLNUnquantizedFusedMoEMethod(_moe_config(activation, limit))
+    out = method.apply(layer, x, routing)
+
+    expected = torch.zeros(TOKENS, HIDDEN)
+    for e in range(EXPERTS):
+        w13 = layer.w13_weight[e]
+        if interleaved:
+            gate_w, up_w = w13[::2], w13[1::2]
+        else:
+            gate_w, up_w = w13[:INTER], w13[INTER:]
+        gate = (x @ gate_w.T).clamp(max=limit)
+        up = (x @ up_w.T).clamp(min=-limit, max=limit)
+        glu = gate * torch.sigmoid(alpha * gate) * (up + beta)
+        expected += (glu @ layer.w2_weight[e].T) * routing[e, :, None]
+    torch.testing.assert_close(out, expected, atol=1e-4, rtol=1e-4)

@@ -19,7 +19,6 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoEParallelConfig,
     RoutedExperts,
 )
-from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.layers.quantization.mxfp4 import (
     GptOssMxfp4Config,
@@ -29,6 +28,7 @@ from vllm.model_executor.layers.quantization.mxfp4 import (
 
 from vllm_rbln import envs
 from vllm_rbln.logger import init_logger
+from vllm_rbln.model_executor.layers.fused_moe.utils import split_gate_up
 
 logger = init_logger(__name__)
 
@@ -60,10 +60,6 @@ class RBLNGptOssMxfp4MoEMethod(GptOssMxfp4MoEMethod):
         FusedMoEMethodBase.__init__(self, moe)
         self.mxfp4_backend = Mxfp4MoeBackend.NONE
         self.moe_kernel = None
-
-        # GPT-OSS's SwiGLU-OAI alpha / clamp limit.
-        self.swiglu_alpha = 1.702
-        self.swiglu_limit = 7.0
 
     @property
     def is_monolithic(self) -> bool:
@@ -99,16 +95,20 @@ class RBLNGptOssMxfp4MoEMethod(GptOssMxfp4MoEMethod):
         return hidden_size, intermediate_size_per_partition
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
-        self._set_buffer(layer, "gate_proj_blocks", layer.w13_weight.data[:, ::2])
-        self._set_buffer(layer, "gate_proj_scales", layer.w13_weight_scale.data[:, ::2])
-        self._set_buffer(layer, "up_proj_blocks", layer.w13_weight.data[:, 1::2])
-        self._set_buffer(layer, "up_proj_scales", layer.w13_weight_scale.data[:, 1::2])
+        act = layer.activation
+        gate_blocks, up_blocks = split_gate_up(layer.w13_weight.data, act)
+        gate_scales, up_scales = split_gate_up(layer.w13_weight_scale.data, act)
+        self._set_buffer(layer, "gate_proj_blocks", gate_blocks)
+        self._set_buffer(layer, "gate_proj_scales", gate_scales)
+        self._set_buffer(layer, "up_proj_blocks", up_blocks)
+        self._set_buffer(layer, "up_proj_scales", up_scales)
 
         if not hasattr(layer, "w13_bias") or not hasattr(layer, "w2_bias"):
             raise NotImplementedError("RBLN GPT-OSS MXFP4 requires MoE bias tensors")
 
-        self._set_buffer(layer, "gate_proj_bias", layer.w13_bias.data[:, ::2])
-        self._set_buffer(layer, "up_proj_bias", layer.w13_bias.data[:, 1::2])
+        gate_bias, up_bias = split_gate_up(layer.w13_bias.data, act)
+        self._set_buffer(layer, "gate_proj_bias", gate_bias)
+        self._set_buffer(layer, "up_proj_bias", up_bias)
         self._set_buffer(layer, "down_proj_blocks", layer.w2_weight.data)
         self._set_buffer(layer, "down_proj_scales", layer.w2_weight_scale.data)
         self._set_buffer(layer, "down_proj_bias", layer.w2_bias.data)
@@ -129,9 +129,6 @@ class RBLNGptOssMxfp4MoEMethod(GptOssMxfp4MoEMethod):
         x: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor:
-        if layer.activation != MoEActivation.SWIGLUOAI:
-            raise NotImplementedError(layer.activation)
-
         # router_logits is now pre-computed masked_routing_weights
         # (topk + softmax already done in fused_moe_forward_rbln)
         orig_shape = x.shape
@@ -141,12 +138,10 @@ class RBLNGptOssMxfp4MoEMethod(GptOssMxfp4MoEMethod):
 
         if envs.VLLM_RBLN_USE_NESTED_COMPILE_REGION:
             # Pass each shared base into the region once; form its views inside.
-            gate_blocks = layer.w13_weight[:, ::2]
-            up_blocks = layer.w13_weight[:, 1::2]
-            gate_scales = layer.w13_weight_scale[:, ::2]
-            up_scales = layer.w13_weight_scale[:, 1::2]
-            gate_bias = layer.w13_bias[:, ::2]
-            up_bias = layer.w13_bias[:, 1::2]
+            act = layer.activation
+            gate_blocks, up_blocks = split_gate_up(layer.w13_weight, act)
+            gate_scales, up_scales = split_gate_up(layer.w13_weight_scale, act)
+            gate_bias, up_bias = split_gate_up(layer.w13_bias, act)
         else:
             gate_blocks, up_blocks = layer.gate_proj_blocks, layer.up_proj_blocks
             gate_scales, up_scales = layer.gate_proj_scales, layer.up_proj_scales
@@ -158,7 +153,7 @@ class RBLNGptOssMxfp4MoEMethod(GptOssMxfp4MoEMethod):
             up_blocks,
             layer.down_proj_blocks,
             masked_routing_weights,
-            "swigluoai",
+            layer.activation.value,
             gate_proj_scale=gate_scales,
             up_proj_scale=up_scales,
             down_proj_scale=layer.down_proj_scales,
@@ -166,8 +161,10 @@ class RBLNGptOssMxfp4MoEMethod(GptOssMxfp4MoEMethod):
             gate_proj_bias=gate_bias,
             up_proj_bias=up_bias,
             down_proj_bias=layer.down_proj_bias,
-            swiglu_alpha=self.swiglu_alpha,
-            swiglu_limit=self.swiglu_limit,
+            # None reads SwiGLU-OAI's gpt-oss values (1.702 / 7.0 / 1.0) in the op.
+            swiglu_alpha=layer.swiglu_alpha,
+            swiglu_limit=layer.swiglu_limit or None,
+            swiglu_beta=layer.swiglu_beta,
             expert_map=layer.expert_map,
         )
         return out.reshape(orig_shape)
