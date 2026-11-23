@@ -46,6 +46,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.parse import MultiModalDataItems
 from vllm.sequence import IntermediateTensors
 
+import vllm_rbln.utils as rbln_utils
 from vllm_rbln.logger import init_logger
 from vllm_rbln.model_executor.models.interfaces import SupportsRBLNMultiModal
 from vllm_rbln.platform import RBLN_DEFAULT_MAX_NUM_BATCHED_TOKENS
@@ -359,7 +360,9 @@ class RBLNQwen3_5ForConditionalGeneration(
             # embeddings and key mask could be built once per video.
             for pixels, (_, h, w), n in zip(pixel_values.split(sizes), grids, tokens):
                 frames = [
-                    encoder(*self._encoder_inputs(frame, [1, h, w]))[:n].cpu()
+                    rbln_utils.run_mm_encoder(
+                        encoder, self._encoder_inputs(frame, [1, h, w]), n
+                    )
                     for frame in pixels.split(h * w)
                 ]
                 embeds.append(torch.cat(frames))

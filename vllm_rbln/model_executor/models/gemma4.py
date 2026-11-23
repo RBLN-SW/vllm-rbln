@@ -152,9 +152,10 @@ class _RBLNGemma4VisionEncoder(nn.Module):
             q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
             k = k.repeat_interleave(attn.num_key_value_groups, dim=1)
             v = v.repeat_interleave(attn.num_key_value_groups, dim=1)
-            scores = torch.matmul(q, k.transpose(-1, -2)) * attn.scaling + key_bias
-            probs = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
-            out = torch.matmul(probs, v).transpose(1, 2).reshape(residual.shape)
+            out = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=key_bias, scale=attn.scaling
+            )
+            out = out.transpose(1, 2).reshape(residual.shape)
             hidden_states = residual + layer.post_attention_layernorm(attn.o_proj(out))
             residual = hidden_states
             hidden_states = layer.pre_feedforward_layernorm(hidden_states)
