@@ -97,7 +97,7 @@ def test_logits_processor_delegates_to_language_model():
 
 
 def test_the_vision_encoder_matches_hfs():
-    # The encoder pads every image to its bucket and runs attention spelled out;
+    # The encoder pads every image to its bucket and masks the padding keys;
     # what comes back must be HF's soft tokens for the image alone.
     tower = _vision_tower()
     model = _bare_model(
