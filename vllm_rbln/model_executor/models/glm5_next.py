@@ -1437,8 +1437,6 @@ class RBLNGlm5NextForConditionalGeneration(
                 buffered_encoder.encoder(*inputs)
 
     def _mm_input_specs(self, bucket_size: int) -> list[rbln_utils.EncoderInput]:
-        """The encoder's inputs at `bucket_size`: patches, the rotary cos and
-        sin over `head_dim`, and the key bias that masks the padding."""
         visual = self.visual
         patch_dim = math.prod(visual.patch_embed.proj.weight.shape[1:])
         head_dim = visual.blocks[0].attn.head_dim
@@ -1463,10 +1461,10 @@ class RBLNGlm5NextForConditionalGeneration(
         pixel_values: torch.Tensor,
         grid_thw: list[int],
     ) -> list[torch.Tensor]:
-        """Stage one frame into its bucket's device buffers, with the rotary
-        tables and key mask built on the host for its valid patches. The tensors
-        returned are the bucket's buffers, rewritten by the next frame; their
-        padding holds what earlier frames left, masked by the key bias."""
+        """Stage one frame's patches and host-built attention inputs.
+
+        See EncoderInputBuffers for the lifetime of the returned tensors.
+        """
         visual = self.visual
         num_patches = math.prod(grid_thw)
         fits = [b for b in self.mm_encoder_patch_buckets if b >= num_patches]

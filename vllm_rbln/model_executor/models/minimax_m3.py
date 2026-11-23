@@ -1324,8 +1324,6 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
                 buffered_encoder.encoder(*inputs)
 
     def _mm_input_specs(self, bucket_size: int) -> list[rbln_utils.EncoderInput]:
-        """The encoder's inputs at `bucket_size`: patches, the 3D-RoPE cos
-        and sin, and the key bias that masks the padding."""
         tower = self.vision_tower
         assert tower is not None
         vm = tower.vision_model
@@ -1368,11 +1366,10 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         grid_thw: list[int],
         modality: str,
     ) -> list[torch.Tensor]:
-        """Stage an image or a video segment into its bucket's device buffers,
-        with the 3D-RoPE and key mask built on the host for its valid patches.
-        The tensors returned are the bucket's buffers, rewritten by the next
-        segment staged into it; their padding holds what earlier segments
-        left, masked by the key bias."""
+        """Stage patches and host-built attention inputs for one image or segment.
+
+        See EncoderInputBuffers for the lifetime of the returned tensors.
+        """
         tower = self.vision_tower
         assert tower is not None
         vm = tower.vision_model

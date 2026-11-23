@@ -91,8 +91,7 @@ def _build_mm_prefix_sliding_mask(
 
 
 class _RBLNGemma4VisionEncoder(nn.Module):
-    """Gemma4's vision tower and its projection into the text model as one
-    static graph: the host hands in the mask and patches padded to one count."""
+    """Run Gemma4's vision tower and text projection in one static graph."""
 
     def __init__(self, vision_tower: nn.Module, embed_vision: nn.Module):
         super().__init__()
@@ -403,9 +402,10 @@ class RBLNGemma4ForConditionalGeneration(
     def _encode_vision(
         self, pixel_values: torch.Tensor, pixel_position_ids: torch.Tensor
     ) -> torch.Tensor:
-        """One image or video frame, `[num_patches, patch_pixels]` with `(-1, -1)`
-        positions on its padding, to its soft token embeddings. The encoder's
-        inputs are the bucket's staging buffers, rewritten by the next frame."""
+        """Encode one frame with (-1, -1) marking padded patch positions.
+
+        See EncoderInputBuffers for the lifetime of the encoder inputs.
+        """
         buffered_encoder = self._mm_encoder
         if buffered_encoder is None:
             raise RuntimeError("Vision encoding requires a compiled encoder")
@@ -440,9 +440,7 @@ class RBLNGemma4ForConditionalGeneration(
         )
 
     def _mm_input_specs(self, bucket_size: int) -> list[rbln_utils.EncoderInput]:
-        """The encoder's inputs at `bucket_size`: float32 patches, their
-        (x, y) positions, the padding mask, and the key bias that masks padding.
-        Fixed dtypes, so warm-up and serving reach the same compiled graphs."""
+        """Use fixed input dtypes so warmup and serving share compiled graphs."""
         patch_pixels = 3 * self.vision_tower.config.patch_size**2
         return [
             rbln_utils.EncoderInput(

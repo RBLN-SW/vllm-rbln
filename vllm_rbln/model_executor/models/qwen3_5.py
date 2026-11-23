@@ -89,9 +89,7 @@ class _RBLNQwen3VisionBlock(nn.Module):
 
 
 class _RBLNQwen3VisionEncoder(nn.Module):
-    """Qwen3-VL's vision transformer on one padded image, without the cu_seqlens
-    attention: full attention over the bucket with padded keys masked. Each block
-    is a nested compile region, so the compiler can roll the blocks into a loop."""
+    """Run Qwen3-VL's vision transformer on one frame with padded keys masked."""
 
     def __init__(self, visual: nn.Module):
         super().__init__()
@@ -300,8 +298,6 @@ class RBLNQwen3_5ForConditionalGeneration(
                 buffered_encoder.encoder(*inputs)
 
     def _mm_input_specs(self, bucket_size: int) -> list[rbln_utils.EncoderInput]:
-        """The encoder's inputs at `bucket_size`: patches, position embeddings,
-        the rotary cos and sin, and the key bias that masks the padding."""
         visual = self.visual
         patch_dim = math.prod(visual.patch_embed.proj.weight.shape[1:])
         rotary_dim = visual.blocks[0].attn.hidden_size_per_attention_head // 2
@@ -332,12 +328,10 @@ class RBLNQwen3_5ForConditionalGeneration(
         pixel_values: torch.Tensor,
         grid_thw: list[int],
     ) -> list[torch.Tensor]:
-        """Stage one image or video frame into its bucket's device buffers:
-        its patches, and the position embeddings and key mask built on the
-        host for its valid patches; upstream builds them on the tower's
-        device. The tensors returned are the bucket's buffers, rewritten by
-        the next frame staged into it; their padding holds what earlier frames
-        left, masked by the key bias."""
+        """Stage one frame's patches and host-built position and mask tensors.
+
+        See EncoderInputBuffers for the lifetime of the returned tensors.
+        """
         visual = self.visual
         num_patches = math.prod(grid_thw)
         fits = [b for b in self.mm_encoder_patch_buckets if b >= num_patches]
@@ -371,9 +365,7 @@ class RBLNQwen3_5ForConditionalGeneration(
     def _encode(
         self, pixel_values: torch.Tensor, grid_thw: torch.Tensor
     ) -> tuple[torch.Tensor, ...]:
-        """The embeddings of each image or video, one encoder run per temporal
-        patch: upstream's cu_seqlens keeps attention inside each, so a video's
-        frames are images of its grid."""
+        """Encode each temporal patch independently to preserve attention boundaries."""
         buffered_encoder = self._mm_encoder
         if buffered_encoder is None:
             raise RuntimeError("Vision encoding requires a compiled encoder")

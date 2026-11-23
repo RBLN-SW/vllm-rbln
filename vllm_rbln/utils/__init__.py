@@ -42,10 +42,7 @@ def run_mm_encoder(
 
 
 class EncoderInput(NamedTuple):
-    """One named input of a compiled vision encoder at one bucket.
-
-    The buffer starts filled with pad.
-    """
+    """Shape and staging policy for one vision encoder input."""
 
     name: str
     shape: tuple[int, ...]
@@ -56,10 +53,11 @@ class EncoderInput(NamedTuple):
 
 
 class EncoderInputBuffers:
-    """Reuse one set of device input buffers per vision encoder bucket.
+    """Reuse device input buffers by bucket.
 
-    Staging can leave values from previous calls in padding. Callers must
-    refresh the attention mask for the current input before encoding.
+    stage() and warmup_inputs() update tensors returned by earlier calls for
+    the same bucket in place. Prefix copies can leave old padding values, so
+    callers must refresh the attention mask for each input.
     """
 
     def __init__(
