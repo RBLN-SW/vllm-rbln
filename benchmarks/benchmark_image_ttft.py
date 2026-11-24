@@ -51,6 +51,68 @@ PRESETS = {
 }
 
 
+def create_image_llm(preset, **engine_overrides):
+    from vllm import LLM
+
+    from vllm_rbln.config import RBLNConfig
+
+    engine = (
+        {
+            "block_size": 256,
+            "max_model_len": 8192,
+            "max_num_batched_tokens": 256,
+        }
+        | preset.get("engine", {})
+        | engine_overrides
+    )
+    return LLM(
+        model=preset["model"],
+        model_impl="vllm",
+        tensor_parallel_size=1,
+        max_num_seqs=1,
+        enable_prefix_caching=False,
+        async_scheduling=False,
+        limit_mm_per_prompt={"image": 1, "video": 0, "audio": 0},
+        mm_processor_kwargs=preset["processor"],
+        mm_processor_cache_gb=0,
+        disable_log_stats=False,
+        additional_config=RBLNConfig(
+            **preset.get("rbln", {"encoder_token_budgets": IMAGE_BUCKETS})
+        ),
+        **engine,
+    )
+
+
+def image_request(side: int, max_soft_tokens: int | None):
+    import numpy as np
+    from PIL import Image
+
+    rng = np.random.default_rng(0)
+    image = Image.fromarray(rng.integers(0, 256, (side, side, 3), dtype=np.uint8))
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_pil", "image_pil": image},
+                {"type": "text", "text": "What is in this image?"},
+            ],
+        }
+    ]
+    processor = (
+        {"max_soft_tokens": max_soft_tokens} if max_soft_tokens is not None else None
+    )
+    return messages, processor
+
+
+def gemma_image_tokens(llm, output, max_soft_tokens: int) -> int:
+    # Gemma inserts one image placeholder per pooled vision embedding.
+    image_token_id = llm.model_config.hf_config.image_token_id
+    image_tokens = (output.prompt_token_ids or []).count(image_token_id)
+    if image_tokens == 0:
+        raise RuntimeError(f"No image tokens in prompt for {max_soft_tokens=}")
+    return image_tokens
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--preset", choices=sorted(PRESETS), required=True)
@@ -68,54 +130,15 @@ def main() -> None:
 
     os.environ["VLLM_RBLN_NUM_HIDDEN_LAYERS"] = str(args.num_hidden_layers)
 
-    import numpy as np
-    from PIL import Image
-    from vllm import LLM, SamplingParams
-
-    from vllm_rbln.config import RBLNConfig
+    from vllm import SamplingParams
 
     preset = PRESETS[args.preset]
-    engine = {
-        "block_size": 256,
-        "max_model_len": 8192,
-        "max_num_batched_tokens": 256,
-    } | preset.get("engine", {})
-    llm = LLM(
-        model=preset["model"],
-        model_impl="vllm",
-        tensor_parallel_size=1,
-        max_num_seqs=1,
-        enable_prefix_caching=False,
-        async_scheduling=False,
-        limit_mm_per_prompt={"image": 1, "video": 0, "audio": 0},
-        mm_processor_kwargs=preset["processor"],
-        mm_processor_cache_gb=0,
-        disable_log_stats=False,
-        additional_config=RBLNConfig(
-            **preset.get("rbln", {"encoder_token_budgets": IMAGE_BUCKETS})
-        ),
-        **engine,
-    )
+    llm = create_image_llm(preset)
     sampling = SamplingParams(temperature=0, max_tokens=8, ignore_eos=True)
     results = []
     for side, token_setting in preset["cases"]:
-        rng = np.random.default_rng(0)
-        image = Image.fromarray(rng.integers(0, 256, (side, side, 3), dtype=np.uint8))
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image_pil", "image_pil": image},
-                    {"type": "text", "text": "What is in this image?"},
-                ],
-            }
-        ]
         max_soft_tokens = token_setting if args.preset == "gemma4" else None
-        processor = (
-            {"max_soft_tokens": max_soft_tokens}
-            if max_soft_tokens is not None
-            else None
-        )
+        messages, processor = image_request(side, max_soft_tokens)
         ttft_ms = []
         for request in range(args.warmup + args.runs):
             llm.llm_engine.reset_encoder_cache()
@@ -135,11 +158,7 @@ def main() -> None:
         budget_label = ""
         result = {"image_side_px": side, "median_ttft_ms": median_ttft_ms}
         if max_soft_tokens is not None:
-            # Gemma inserts one image placeholder per pooled vision embedding.
-            image_token_id = llm.model_config.hf_config.image_token_id
-            image_tokens = (output.prompt_token_ids or []).count(image_token_id)
-            if image_tokens == 0:
-                raise RuntimeError(f"No image tokens in prompt for {max_soft_tokens=}")
+            image_tokens = gemma_image_tokens(llm, output, max_soft_tokens)
             result["max_soft_tokens"] = max_soft_tokens
             budget_label = f" (max_soft_tokens={max_soft_tokens})"
         result["image_tokens"] = image_tokens
