@@ -16,6 +16,7 @@ import contextlib
 import json
 import tempfile
 from types import MethodType, SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -58,7 +59,7 @@ DEVICE = current_platform.device_type
 
 
 # TODO add tests for both `enable_prefix_caching = True` and `False`
-def get_vllm_config(async_scheduling=False):
+def get_vllm_config(async_scheduling=False, **rbln_options):
     scheduler_config = SchedulerConfig(
         max_num_seqs=10,
         max_num_batched_tokens=128,
@@ -84,6 +85,7 @@ def get_vllm_config(async_scheduling=False):
             "optimum_overrides": {
                 "prefill_chunk_size": 4,
             },
+            **rbln_options,
         },
     )
     return vllm_config
@@ -111,15 +113,27 @@ def model_runner(request):
     return runner
 
 
-def test_custom_sampler_keeps_fused_sampling_disabled(monkeypatch):
+@pytest.mark.parametrize("enabled", [False, True])
+def test_custom_sampler_follows_fused_sampling_flag(monkeypatch, enabled):
     monkeypatch.setattr(
         "vllm_rbln.v1.sample.rbln_sampler.compile_sampler", lambda fn, ctx: fn
     )
-    runner = RBLNOptimumModelRunner(get_vllm_config(), DEVICE)
+    config = get_vllm_config(use_fused_sampling=enabled)
+    runner = RBLNOptimumModelRunner(config, DEVICE)
 
     assert isinstance(runner.sampler, runner_module.RBLNSampler)
-    assert runner.sampler._penalty_state is None
-    assert runner.sampler._compiled_min_p_sample is None
+    assert (runner.sampler._penalty_state is not None) is enabled
+    assert (runner.sampler._compiled_min_p_sample is not None) is enabled
+
+
+def test_sample_passes_input_batch_to_fused_sampler(model_runner, monkeypatch):
+    sampler = MagicMock(spec=runner_module.RBLNSampler)
+    monkeypatch.setattr(model_runner, "sampler", sampler)
+    logits = torch.zeros(1, 8)
+
+    model_runner._sample(logits, spec_decode_metadata=None)
+
+    assert sampler.call_args.kwargs["input_batch"] is model_runner.input_batch
 
 
 def _is_req_scheduled(model_runner, req_id: str) -> bool:
