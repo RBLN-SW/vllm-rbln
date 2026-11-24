@@ -639,7 +639,7 @@ class RBLNDeepseekV4Attention(nn.Module):
                     *common, *compressed
                 )
         else:
-            o = torch.ops.rbln_custom_ops.sparse_attn_deepseek_v4_swa(*common)
+            o = torch.ops.rbln_custom_ops.swa_mla_v1(*common)
         # o [B, H, L, D]
         if seq_len > 1:
             o, _ = self.rope(positions, o, inverse=True, head_major=True)
