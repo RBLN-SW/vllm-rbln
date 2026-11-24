@@ -20,11 +20,13 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 import torch
 from vllm.config import (
     CacheConfig,
+    ECTransferConfig,
     KVEventsConfig,
     KVTransferConfig,
     ModelConfig,
@@ -33,6 +35,12 @@ from vllm.config import (
     SpeculativeConfig,
     VllmConfig,
 )
+from vllm.config.ec_manager_config import EncoderCacheManagerConfig
+from vllm.distributed.ec_transfer.ec_connector.base import (
+    ECConnectorBase,
+    ECConnectorMetadata,
+    ECConnectorRole,
+)
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
@@ -40,6 +48,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorOutput,
 )
 from vllm.lora.request import LoRARequest
+from vllm.multimodal.inputs import (
+    MultiModalFeatureSpec,
+    MultiModalKwargsItem,
+    PlaceholderRange,
+)
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
@@ -78,6 +91,8 @@ class MockKVConfig:
 
     matched_tokens: int = 0
     is_async: bool = False
+    kv_role: str = "kv_both"
+    in_multi_connector: bool = False
 
 
 class _MockKVConnectorMetadata(KVConnectorMetadata):
@@ -133,6 +148,48 @@ if "MockKVConnector" not in KVConnectorFactory._registry:
     )
 
 
+class ECConnectorInTransit(ECConnectorBase):
+    """A scheduler-side EC consumer whose encoder outputs arrive when told to."""
+
+    def __init__(self, *, is_producer: bool = False) -> None:
+        super().__init__(
+            SimpleNamespace(
+                ec_transfer_config=SimpleNamespace(
+                    is_ec_producer=is_producer, is_ec_consumer=True
+                )
+            ),
+            ECConnectorRole.SCHEDULER,
+        )
+        self.arrived = False
+
+    def ensure_cache_available(self, request, num_computed_tokens):
+        return self.arrived
+
+    def has_cache_item(self, identifier):
+        return False
+
+    def update_state_after_alloc(self, request, index):
+        pass
+
+    def build_connector_meta(self, scheduler_output):
+        return ECConnectorMetadata()
+
+    def start_load_caches(self, encoder_cache, **kwargs):
+        raise AssertionError("worker-side only")
+
+    def save_caches(self, encoder_cache, mm_hash, **kwargs):
+        raise AssertionError("worker-side only")
+
+
+def image_at(offset: int, length: int) -> MultiModalFeatureSpec:
+    return MultiModalFeatureSpec(
+        data=MultiModalKwargsItem.dummy(),
+        modality="image",
+        identifier=f"image@{offset}",
+        mm_position=PlaceholderRange(offset=offset, length=length),
+    )
+
+
 def create_rbln_scheduler(
     *,
     model: str = "facebook/opt-125m",
@@ -153,6 +210,10 @@ def create_rbln_scheduler(
     use_kv_connector: MockKVConfig | None = None,
     async_scheduling: bool = False,
     additional_config: dict | None = None,
+    kv_cache_config: KVCacheConfig | None = None,
+    hash_block_size: int | None = None,
+    ec_transfer_config: ECTransferConfig | None = None,
+    ec_manager_config: EncoderCacheManagerConfig | None = None,
 ) -> RBLNScheduler:
     """Build an RBLNScheduler on CPU (ported from upstream tests/v1/core/utils):
     opt-125m config only, num_gpu_blocks set manually, no KV connector."""
@@ -185,13 +246,22 @@ def create_rbln_scheduler(
         )
     kv_transfer_config = None
     if use_kv_connector is not None:
-        kv_transfer_config = KVTransferConfig(
+        mock = dict(
             kv_connector="MockKVConnector",
-            kv_role="kv_both",
+            kv_role=use_kv_connector.kv_role,
             kv_connector_extra_config={
                 "matched_tokens": use_kv_connector.matched_tokens,
                 "is_async": use_kv_connector.is_async,
             },
+        )
+        kv_transfer_config = (
+            KVTransferConfig(
+                kv_connector="MultiConnector",
+                kv_role=use_kv_connector.kv_role,
+                kv_connector_extra_config={"connectors": [mock]},
+            )
+            if use_kv_connector.in_multi_connector
+            else KVTransferConfig(**mock)
         )
     vllm_config = VllmConfig(
         scheduler_config=scheduler_config,
@@ -200,6 +270,8 @@ def create_rbln_scheduler(
         parallel_config=ParallelConfig(pipeline_parallel_size=pipeline_parallel_size),
         speculative_config=speculative_config,
         kv_transfer_config=kv_transfer_config,
+        ec_transfer_config=ec_transfer_config,
+        ec_manager_config=ec_manager_config or EncoderCacheManagerConfig(),
         kv_events_config=KVEventsConfig(
             enable_kv_cache_events=enable_kv_cache_events, publisher="null"
         ),
@@ -209,17 +281,21 @@ def create_rbln_scheduler(
             **(additional_config or {}),
         },
     )
-    kv_cache_config = KVCacheConfig(
-        num_blocks=num_blocks,
-        kv_cache_tensors=[],
-        kv_cache_groups=[KVCacheGroupSpec(["layer"], full_attention_spec(block_size))],
-    )
+    if kv_cache_config is None:
+        kv_cache_config = KVCacheConfig(
+            num_blocks=num_blocks,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(["layer"], full_attention_spec(block_size))
+            ],
+        )
     cache_config.num_gpu_blocks = num_blocks
     scheduler_cls = RBLNAsyncScheduler if async_scheduling else RBLNScheduler
     return scheduler_cls(
         vllm_config=vllm_config,
         kv_cache_config=kv_cache_config,
         block_size=block_size,
+        hash_block_size=hash_block_size,
         log_stats=True,
         structured_output_manager=StructuredOutputManager(vllm_config),
     )

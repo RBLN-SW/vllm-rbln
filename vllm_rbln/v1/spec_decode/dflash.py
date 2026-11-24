@@ -2,7 +2,7 @@
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# You may obtain a copy of the License at:
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 #
@@ -11,18 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""DFlash drafter on RBLN.
+"""Parallel draft execution shared by DFlash and DSpark on RBLN.
 
-One forward drafts every speculative token: the query is the sampled token
-followed by `num_speculative_tokens` mask tokens, each predicting one draft
-token. The drafter never runs over the context -- every draft layer's context
-K/V is projected from the target's hidden states instead.
-
-Upstream's `DFlashQwen3Model.precompute_and_store_context_kv` cannot do that
-here (`ops.rms_norm` and `ops.rotary_embedding` are CUDA extensions, and no
-RBLN attention impl has `do_kv_cache_update`), and the drafter's mixed
-attention -- four sliding layers then one full -- is never declared to vLLM,
-so the window lives in the mask.
+One forward processes the anchor and mask tokens. Every layer's context K/V
+is projected from the target's hidden states using compiled RBLN operations;
+upstream's context writer requires CUDA extensions and `do_kv_cache_update`.
+Each KV group supplies its own block table, with local masks for non-causal SWA.
 """
 
 from copy import copy
@@ -46,11 +40,7 @@ from vllm_rbln.compilation import build_process_group_dict, compile
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.platform import use_device_tensor
-from vllm_rbln.v1.attention.kv_cache_bindings import (
-    attach_kv_cache_bindings,
-    attention_block_axis,
-    build_kv_cache_forward_context_kwargs,
-)
+from vllm_rbln.v1.attention.kv_cache_bindings import attention_block_axis
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.worker.dp_utils import determine_batch_execution_and_padding
@@ -67,6 +57,12 @@ class RBLNDFlashProposer(DFlashProposer):
     # Read by `_determine_batch_execution_and_padding`. `_require_dense_drafter`
     # is what keeps it false.
     draft_has_moe = False
+
+    # Read by the KV estimate. A producer's warm-up still runs the
+    # decode-shaped query pass: it is the only warm-up pass that binds the
+    # draft's KV, and the connector cannot register what has no device memory
+    # behind it.
+    warms_up_decode_graphs_on_a_producer = True
 
     @staticmethod
     def _require_dense_drafter(draft_model) -> None:
@@ -159,6 +155,16 @@ class RBLNDFlashProposer(DFlashProposer):
             num_context,
             valid_ctx_lens,
         )
+
+        if self.runner.is_strict_kv_producer:
+            # The context write above is what the consumer's drafter reads; the
+            # drafts this pass would build are verified by nobody here.
+            return torch.zeros(
+                num_reqs,
+                self.num_speculative_tokens,
+                device=self.device,
+                dtype=torch.int64,
+            )
 
         draft_ids = self._run_query_pass(
             common_attn_metadata,
@@ -521,12 +527,7 @@ class RBLNDFlashProposer(DFlashProposer):
                 # buffer for nothing.
                 skip_attn_masks=True,
             )
-            attach_kv_cache_bindings(
-                attn_metadata,
-                self.runner.kv_caches,
-                self.runner.kv_cache_bases,
-                self.runner.kv_cache_view_infos,
-            )
+            self.runner.bind_kv_cache_to_metadata(attn_metadata)
             assert builder.is_causal == self.dflash_causal
             if self.dflash_causal:
                 if isinstance(builder.kv_cache_spec, RBLNSlidingWindowSpec):
@@ -553,7 +554,7 @@ class RBLNDFlashProposer(DFlashProposer):
                 queries = start + torch.arange(chunk).view(1, -1, 1)
                 visible = ((queries - keys).abs() < window) & (keys < start + chunk)
                 mask = rbln_utils.pad(visible[:, None], 0, num_reqs_padded)
-                attn_metadata.attn_masks = (
+                attn_metadata.swa_attn_masks = (
                     mask.to(mask_dtype).contiguous().to(mask_device)
                 )
                 for layer_name in attn_group.layer_names:
@@ -851,7 +852,7 @@ class RBLNDFlashProposer(DFlashProposer):
             num_padded_tokens=(
                 num_query_total_padded if num_tokens_across_dp is not None else None
             ),
-            **build_kv_cache_forward_context_kwargs(self.runner.kv_cache_bases),
+            **self.runner.kv_cache_forward_context_kwargs(),
         ):
             return self.model_executable(
                 input_ids=self.input_ids[:num_query_total_padded].view(

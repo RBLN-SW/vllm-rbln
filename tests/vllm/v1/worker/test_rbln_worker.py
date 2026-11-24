@@ -16,6 +16,7 @@
 # compile/warmup control flow, reachable on CPU once WorkerBase.__init__ is
 # patched out. Device execution stays in the e2e tier.
 
+import functools
 import inspect
 import json
 import os
@@ -26,12 +27,20 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+import vllm.distributed.ec_transfer.ec_transfer_state as ec_state
 import vllm.platforms.interface as platform_interface
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from torch._dynamo.exc import BackendCompilerFailed
-from vllm.config import ProfilerConfig, get_current_vllm_config
+from vllm.config import (
+    ECTransferConfig,
+    ModelConfig,
+    ProfilerConfig,
+    get_current_vllm_config,
+)
+from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorRole
+from vllm.distributed.ec_transfer.ec_connector.factory import ECConnectorFactory
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
 from vllm.tracing import otel
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
@@ -42,6 +51,7 @@ import vllm_rbln.v1.worker.rbln_worker as wm
 import vllm_rbln.v1.worker.utils as worker_utils
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.platform import RblnPlatform
+from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
 from vllm_rbln.v1.worker.rbln_worker import (
     RBLNWorker,
     init_worker_distributed_environment,
@@ -74,6 +84,8 @@ def _make_vllm_config(
             data_parallel_rank=data_parallel_rank,
             data_parallel_rank_local=data_parallel_rank_local,
             world_size_across_dp=world_size_across_dp,
+            local_world_size=world_size,
+            data_parallel_size_local=data_parallel_size,
             assigned_physical_gpu_ids=assigned_physical_gpu_ids,
             disable_custom_all_reduce=False,
         ),
@@ -92,6 +104,7 @@ def _make_vllm_config(
         scheduler_config=SimpleNamespace(),
         device_config=SimpleNamespace(device=torch.device("cpu"), device_type="cpu"),
         kv_transfer_config=None,
+        is_mm_encoder_only=False,
         additional_config=(
             additional_config if additional_config is not None else RBLNConfig()
         ),
@@ -344,7 +357,12 @@ class TestWorkerFailFast:
         worker = make_worker(vllm_config=_make_vllm_config(backend=backend))
         error = RuntimeError("worker step failed")
         step = Mock(side_effect=error)
-        worker.model_runner = SimpleNamespace(**{runner_method: step})
+        # is_strict_kv_producer is read before the step the failure policy is
+        # about; __init__ always sets it.
+        worker.model_runner = SimpleNamespace(
+            is_strict_kv_producer=False,
+            **{runner_method: step},
+        )
         monkeypatch.setattr(wm, "set_current_vllm_config", lambda _: nullcontext())
         monkeypatch.setenv("VLLM_RBLN_DISABLE_WORKER_FAIL_FAST", disabled)
         exit_process = Mock(side_effect=SystemExit(70))
@@ -361,6 +379,29 @@ class TestWorkerFailFast:
         else:
             exit_process.assert_not_called()
             assert excinfo.value is error
+
+
+def test_shutdown_waits_for_the_last_async_token_copy(monkeypatch):
+    from tests.vllm.v1.worker.test_async_output import _async_output
+
+    previous = _async_output(torch.tensor([[42]], dtype=torch.int32))
+    phases = []
+    wait = Mock(
+        side_effect=lambda: phases.append("copy_complete"),
+    )
+    monkeypatch.setattr(previous, "get_sampled_token_ids_cpu", wait)
+    worker = object.__new__(RBLNWorker)
+    worker.model_runner = SimpleNamespace(_prev_async_output=previous)
+    worker.profiler = None
+    worker._release_offload_temp_storage = Mock(
+        side_effect=lambda: phases.append("release_storage")
+    )
+    monkeypatch.setattr(wm, "ensure_kv_transfer_shutdown", None)
+
+    worker.shutdown()
+
+    assert phases == ["copy_complete", "release_storage"]
+    assert worker.model_runner._prev_async_output is None
 
 
 class TestConformance:
@@ -615,15 +656,23 @@ class TestDetermineAvailableMemory:
         hf_config=None,
         params=None,
         specialized_moe_decode=False,
-        uses_fixed_decode_window=False,
         decode_buckets=3,
+        chunk_sizes=(128,),
+        decode_graph_shapes=((1, 1, None), (2, 1, None), (4, 1, None)),
         drafter=None,
         speculative_config=None,
         dynamic=False,
+        kernel_size=lambda **kw: 111,
     ):
         vcfg = _make_vllm_config(quantization=quantization)
         vcfg.additional_config.use_dynamic_kv_cache = None if dynamic else False
         vcfg.model_config.hf_config = hf_config
+
+        def get_num_layers(parallel_config):
+            assert parallel_config is vcfg.parallel_config
+            return 2
+
+        vcfg.model_config.get_num_layers = get_num_layers
         worker = make_worker(vllm_config=vcfg, device_name=device_name)
         worker.device = torch.device("cpu")
         captured: dict = {}
@@ -636,7 +685,7 @@ class TestDetermineAvailableMemory:
         # The worker hands the kwargs to the sizer, which is where the formula
         # is called from on both the dynamic and the default path.
         monkeypatch.setattr(dks, "estimate_available_memory", record)
-        monkeypatch.setattr(wm, "estimate_model_kernel_size", lambda **kw: 111)
+        monkeypatch.setattr(wm, "estimate_model_kernel_size", kernel_size)
         monkeypatch.setattr(dks, "get_kv_cache_groups", lambda cfg, spec: [])
         # WorkerBase always carries the field; None is what no spec decode means.
         worker.speculative_config = speculative_config
@@ -648,9 +697,10 @@ class TestDetermineAvailableMemory:
             bucketing_manager=SimpleNamespace(
                 decode_batch_buckets_count=decode_buckets
             ),
+            prefill_chunk_sizes=chunk_sizes,
             drafter=drafter,
             get_kv_cache_spec=lambda: {},
-            uses_fixed_decode_window=uses_fixed_decode_window,
+            decode_graph_shapes=lambda: list(decode_graph_shapes),
         )
         _attach_sizer(worker)
         worker.determine_available_memory()
@@ -701,6 +751,8 @@ class TestDetermineAvailableMemory:
             model=SimpleNamespace(named_parameters=lambda: iter(_params().items())),
             specialized_moe_decode=False,
             bucketing_manager=SimpleNamespace(decode_batch_buckets_count=3),
+            prefill_chunk_sizes=(128,),
+            decode_graph_shapes=lambda: [(b, 1, None) for b in (1, 2, 4)],
             drafter=None,
             get_kv_cache_spec=lambda: {"a": spec, "b": spec},
         )
@@ -727,13 +779,32 @@ class TestDetermineAvailableMemory:
         cap = self._capture(make_worker, monkeypatch, device_name="RBLN-CR13")
         assert "chiplet_memory" not in cap
 
-    def test_num_runtimes_from_buckets_and_moe(self, make_worker, monkeypatch):
+    def test_num_runtimes_counts_each_decode_graph_and_the_prefill(
+        self, make_worker, monkeypatch
+    ):
+        # The runner owns which shapes it compiles; the worker reserves one
+        # runtime for each of them and one for the prefill graph.
         cap = self._capture(
-            make_worker, monkeypatch, specialized_moe_decode=True, decode_buckets=3
+            make_worker,
+            monkeypatch,
+            decode_graph_shapes=[(b, 1, None) for b in (1, 2, 4)] + [(4, 1, 512)],
         )
-        # Non-spec: num_decode_query_lens == 1, so 1 + buckets(3)*1 = 4, plus
-        # the specialized-MoE-decode fallback (+1 query length) = 5.
         assert cap["num_runtimes"] == 5
+
+    @pytest.mark.parametrize(
+        ("decode_shapes", "expected"),
+        [([], 3), ([(1, 1, None), (2, 1, None), (4, 1, None)], 6)],
+    )
+    def test_num_runtimes_counts_every_prefill_chunk_size(
+        self, make_worker, monkeypatch, decode_shapes, expected
+    ):
+        cap = self._capture(
+            make_worker,
+            monkeypatch,
+            chunk_sizes=(32, 64, 128),
+            decode_graph_shapes=decode_shapes,
+        )
+        assert cap["num_runtimes"] == expected
 
     def test_no_quant_counts_int_at_16bit(self, make_worker, monkeypatch):
         assert self._capture(make_worker, monkeypatch)["n_model_bytes"] == 300
@@ -794,10 +865,13 @@ class TestDetermineAvailableMemory:
         drafter = SimpleNamespace(
             model=SimpleNamespace(
                 parameters=lambda: iter([torch.zeros(20, dtype=torch.float16)])
-            )
+            ),
+            warms_up_decode_graphs_on_a_producer=False,
         )
         spec = SimpleNamespace(
-            draft_model_config=SimpleNamespace(quantization=None),
+            draft_model_config=SimpleNamespace(
+                quantization=None, get_total_num_hidden_layers=lambda: 1
+            ),
             draft_parallel_config=None,
             method="eagle",
         )
@@ -806,13 +880,126 @@ class TestDetermineAvailableMemory:
             monkeypatch,
             drafter=drafter,
             speculative_config=spec,
-            uses_fixed_decode_window=True,
+            decode_graph_shapes=[(b, 1, None) for b in (1, 2, 4)],
         )
         assert "kernel_size" in cap
         assert "n_model_bytes" not in cap
         # A fixed decode window compiles one decode query length: target =
         # 1 + buckets(3)*1 = 4 (no MoE); draft = 1 + buckets(3) = 4. Total 8.
         assert cap["num_runtimes"] == 8
+
+    def test_drafter_counts_its_own_layers_under_a_pp_layer_partition(
+        self, make_worker, monkeypatch
+    ):
+        # A target partition and a layer truncation are both set; the drafter is
+        # built whole on one stage, so it counts the draft config's five layers.
+        # The target's own count comes from _capture's stub.
+        monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "1,1")
+        monkeypatch.setenv("VLLM_RBLN_NUM_HIDDEN_LAYERS", "2")
+        draft_config = SimpleNamespace(
+            quantization=None,
+            get_total_num_hidden_layers=lambda: 5,
+            get_vocab_size=lambda: 64,
+            get_hidden_size=lambda: 32,
+        )
+        # Upstream's own layer getters, so a count taken through the drafter's
+        # single-stage parallel config reads the partition as upstream does.
+        for name in ("get_layers_start_end_indices", "get_num_layers"):
+            setattr(
+                draft_config,
+                name,
+                functools.partial(getattr(ModelConfig, name), draft_config),
+            )
+        drafter = SimpleNamespace(
+            model=SimpleNamespace(
+                parameters=lambda: iter([torch.zeros(6144, dtype=torch.float16)])
+            ),
+            warms_up_decode_graphs_on_a_producer=False,
+        )
+        spec = SimpleNamespace(
+            draft_model_config=draft_config,
+            draft_parallel_config=SimpleNamespace(
+                tensor_parallel_size=1, pipeline_parallel_size=1, rank=0
+            ),
+            method="mtp",
+        )
+        target_layers = []
+
+        def kernel_size(**kw):
+            if kw["model_config"] is not draft_config:
+                target_layers.append(kw.get("num_layers"))
+                return 111
+            return worker_utils.estimate_model_kernel_size(
+                **kw, default_bits_per_param=16
+            )
+
+        cap = self._capture(
+            make_worker,
+            monkeypatch,
+            drafter=drafter,
+            speculative_config=spec,
+            kernel_size=kernel_size,
+        )
+        # Five layers of 2 MiB-aligned weights plus the lm_head's 2 MiB.
+        assert cap["kernel_size"] == 111 + 6 * 2**21
+        assert target_layers == [2]
+
+    def test_medusa_on_a_producer_reserves_one_draft_runtime(
+        self, make_worker, monkeypatch
+    ):
+        # The stubs above supply the attribute, so they cannot catch a drafter
+        # class that lacks it. On a producer the left operand is empty, so the
+        # real medusa class's attribute is read.
+        drafter = RBLNMedusaProposer.__new__(RBLNMedusaProposer)
+        drafter.model = SimpleNamespace(
+            parameters=lambda: iter([torch.zeros(20, dtype=torch.float16)])
+        )
+        spec = SimpleNamespace(
+            draft_model_config=SimpleNamespace(
+                quantization=None, get_total_num_hidden_layers=lambda: 1
+            ),
+            draft_parallel_config=None,
+            method="medusa",
+        )
+        cap = self._capture(
+            make_worker,
+            monkeypatch,
+            drafter=drafter,
+            speculative_config=spec,
+            decode_graph_shapes=[],
+        )
+        assert cap["num_runtimes"] == 2
+
+    @pytest.mark.parametrize(("warms_up_decode", "expected"), [(False, 2), (True, 3)])
+    def test_a_producer_reserves_only_for_the_drafter_that_warms_decode(
+        self, make_worker, monkeypatch, warms_up_decode, expected
+    ):
+        # A producer compiles no decode graph, so the target holds one runtime and
+        # warm-up issues one drafter dummy. DFlash warms its query pass there and
+        # eagle does not, and only the drafter knows which -- but either way the
+        # bucket axis is gone, so charging the bucket count would eat the win.
+        drafter = SimpleNamespace(
+            model=SimpleNamespace(
+                parameters=lambda: iter([torch.zeros(20, dtype=torch.float16)])
+            ),
+            warms_up_decode_graphs_on_a_producer=warms_up_decode,
+        )
+        spec = SimpleNamespace(
+            draft_model_config=SimpleNamespace(
+                quantization=None, get_total_num_hidden_layers=lambda: 1
+            ),
+            draft_parallel_config=None,
+            method="dflash" if warms_up_decode else "eagle",
+        )
+        cap = self._capture(
+            make_worker,
+            monkeypatch,
+            drafter=drafter,
+            speculative_config=spec,
+            decode_graph_shapes=[],
+        )
+        # target = 1; draft = 1, plus the one shape a warming drafter builds.
+        assert cap["num_runtimes"] == expected
 
     def test_draft_runtime_adds_specialized_moe_fallback(
         self, make_worker, monkeypatch
@@ -825,9 +1012,12 @@ class TestDetermineAvailableMemory:
             model=SimpleNamespace(
                 parameters=lambda: iter([torch.zeros(20, dtype=torch.float16)])
             ),
+            warms_up_decode_graphs_on_a_producer=False,
         )
         spec = SimpleNamespace(
-            draft_model_config=SimpleNamespace(quantization=None),
+            draft_model_config=SimpleNamespace(
+                quantization=None, get_total_num_hidden_layers=lambda: 1
+            ),
             draft_parallel_config=None,
             method="eagle",
         )
@@ -837,7 +1027,7 @@ class TestDetermineAvailableMemory:
             drafter=drafter,
             speculative_config=spec,
             specialized_moe_decode=True,
-            uses_fixed_decode_window=True,
+            decode_graph_shapes=[(b, 1, None) for b in (1, 2, 4)] + [(4, 1, 512)],
         )
         assert cap["num_runtimes"] == 10
 
@@ -845,7 +1035,8 @@ class TestDetermineAvailableMemory:
         drafter = SimpleNamespace(
             model=SimpleNamespace(
                 parameters=lambda: iter([torch.zeros(20, dtype=torch.float16)])
-            )
+            ),
+            warms_up_decode_graphs_on_a_producer=False,
         )
         spec = SimpleNamespace(
             draft_model_config=SimpleNamespace(quantization="fp8"),
@@ -858,7 +1049,6 @@ class TestDetermineAvailableMemory:
                 monkeypatch,
                 drafter=drafter,
                 speculative_config=spec,
-                uses_fixed_decode_window=True,
             )
 
 
@@ -878,8 +1068,6 @@ class TestInitializeFromConfig:
         worker.model_runner = SimpleNamespace(
             initialize_kv_cache=lambda cfg: init_calls.append(cfg),
             register_kv_caches_with_connector=lambda: None,
-            kv_cache_config=SimpleNamespace(num_blocks=0, kv_cache_groups=[]),
-            _kernel_block_sizes=[],
         )
         _attach_sizer(worker)
         worker.initialize_from_config(kv_cfg)
@@ -1072,6 +1260,9 @@ class TestEnsureRblnHostThreadsBeforeCompile:
         monkeypatch.setattr(
             wm, "set_omp_num_threads", lambda r, lr, n: captured.append(n)
         )
+        monkeypatch.setattr(
+            "vllm_rbln.v1.worker.utils.get_cgroup_cpu_quota", lambda: None
+        )
         # Neutralise the numba<->torch thread juggling (global-state side effect).
         monkeypatch.setattr(
             wm,
@@ -1089,6 +1280,16 @@ class TestEnsureRblnHostThreadsBeforeCompile:
         captured = self._prep(monkeypatch, planned)
         worker._ensure_rbln_host_threads_before_compile()
         assert captured == [expected]
+
+    def test_quota_split_across_local_ranks(self, make_worker, monkeypatch):
+        # 4 local ranks share a 64-CPU quota: min(64, 64 // 4) // 2 = 8.
+        worker = make_worker(world_size=4)
+        captured = self._prep(monkeypatch, 64)
+        monkeypatch.setattr(
+            "vllm_rbln.v1.worker.utils.get_cgroup_cpu_quota", lambda: 64.0
+        )
+        worker._ensure_rbln_host_threads_before_compile()
+        assert captured == [8]
 
     def test_idempotent(self, make_worker, monkeypatch):
         # The ready-flag guard makes a second call a no-op.
@@ -1123,6 +1324,7 @@ class TestInitWorkerDistributedEnvironment:
         dp_rank=0,
         world_size_across_dp=1,
         auto_port=False,
+        ec_transfer_config=None,
     ):
         monkeypatch.setattr(wm, "init_distributed_environment", lambda *a, **k: None)
         monkeypatch.setattr(
@@ -1139,7 +1341,8 @@ class TestInitWorkerDistributedEnvironment:
                 tensor_parallel_size=world_size,
                 pipeline_parallel_size=1,
                 disable_custom_all_reduce=False,
-            )
+            ),
+            ec_transfer_config=ec_transfer_config,
         )
         init_worker_distributed_environment(vcfg, rank=rank, local_rank=rank)
         return (
@@ -1169,6 +1372,60 @@ class TestInitWorkerDistributedEnvironment:
     def test_auto_port_sets_rccl_env(self, monkeypatch):
         _, _, rccl = self._run(monkeypatch, auto_port=True)
         assert rccl == "1"
+
+    def test_an_ec_instance_gets_its_worker_connector(self, monkeypatch):
+        monkeypatch.setitem(
+            ECConnectorFactory._registry,
+            "RecordingECConnector",
+            lambda: _RecordingECConnector,
+        )
+        monkeypatch.setattr(ec_state, "_EC_CONNECTOR_AGENT", None)
+
+        self._run(
+            monkeypatch,
+            ec_transfer_config=ECTransferConfig(
+                ec_connector="RecordingECConnector", ec_role="ec_consumer"
+            ),
+        )
+
+        connector = ec_state.get_ec_transfer()
+        assert isinstance(connector, _RecordingECConnector)
+        assert connector.role == ECConnectorRole.WORKER
+
+
+class _RecordingECConnector:
+    """A worker-side EC connector that records the lifecycle calls it gets."""
+
+    def __init__(self, vllm_config, role):
+        self.role = role
+        self.calls: list[str] = []
+
+    def start_worker_services(self) -> None:
+        self.calls.append("start_worker_services")
+
+    def shutdown(self) -> None:
+        self.calls.append("shutdown")
+
+
+class TestEcConnectorLifecycle:
+    def test_services_start_after_the_model_loads_and_shutdown_releases_it(
+        self, make_worker, monkeypatch
+    ):
+        connector = _RecordingECConnector(None, ECConnectorRole.WORKER)
+        monkeypatch.setattr(ec_state, "_EC_CONNECTOR_AGENT", connector)
+        worker = make_worker()
+        worker.model_runner = SimpleNamespace(
+            load_model=lambda: connector.calls.append("load_model"),
+            _prev_async_output=None,
+        )
+        monkeypatch.setattr(wm, "set_current_vllm_config", lambda _: nullcontext())
+        monkeypatch.setattr(worker, "_release_offload_temp_storage", lambda: None)
+
+        worker.load_model()
+        worker.shutdown()
+
+        assert connector.calls == ["load_model", "start_worker_services", "shutdown"]
+        assert not ec_state.has_ec_transfer()
 
 
 class TestHandshakeMetadata:
@@ -1308,7 +1565,6 @@ class TestKvRegistrationOrder:
             ),
             dynamic_kv=SimpleNamespace(
                 shrink_for_compile=lambda cfg: cfg,
-                check_block_ids_fit_int16=lambda: None,
                 apply_num_blocks=lambda n: calls.append("resize"),
                 defers_kv_registration=defers,
             ),
@@ -1408,3 +1664,29 @@ class TestProfile:
 
         assert calls == ["start", "done"]
         assert isinstance(worker.profiler, worker_utils.RblnProfilerWrapper)
+
+
+class TestExecuteDummyBatch:
+    # An idle rank reports the minimal entry either way; only which graph it asks
+    # for differs, and _dummy_run pads a prefill to the width warm-up compiled.
+    @staticmethod
+    def _dummy_run_args(make_worker, *, strict_kv_producer):
+        worker = make_worker()
+        calls = []
+        worker.model_runner = SimpleNamespace(
+            is_strict_kv_producer=strict_kv_producer,
+            _dummy_run=lambda *a, **kw: calls.append((a, kw)),
+        )
+        worker.execute_dummy_batch()
+        assert len(calls) == 1
+        return calls[0]
+
+    def test_a_decoding_engine_runs_the_minimal_decode_dummy(self, make_worker):
+        args, kwargs = self._dummy_run_args(make_worker, strict_kv_producer=False)
+        assert args == (1, 1)
+        assert kwargs == {"is_prefill": False, "warmup": False}
+
+    def test_a_strict_producer_runs_the_prefill_graph(self, make_worker):
+        args, kwargs = self._dummy_run_args(make_worker, strict_kv_producer=True)
+        assert args == (1, 1)
+        assert kwargs == {"is_prefill": True, "warmup": False}

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, ClassVar
 
 import torch
@@ -146,7 +146,7 @@ class RBLNFlashAttentionBackend(AttentionBackend):
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
-        return [32, 64, 80, 96, 112, 128, 160, 192, 224, 256]
+        return [32, 64, 80, 96, 112, 128, 160, 192, 224, 256, 512]
 
 
 @dataclass
@@ -157,17 +157,23 @@ class RBLNFlashAttentionMetadata:
     # For RBLN Attention
     is_prefill: bool
     attn_masks: torch.Tensor | None = None
+    mm_prefix_row_ends: torch.Tensor | None = None
     kv_caches: list[torch.Tensor] | None = None
     kv_cache_view_infos: list[KVCacheViewInfo] | None = None
+    kv_cache_positions: dict[str, int] = field(default_factory=dict, kw_only=True)
 
     swa_appends: bool = False
     cache_seq_lens: torch.Tensor | None = None
     cache_offsets: torch.Tensor | None = None
     local_block_tables: torch.Tensor | None = None
+    # TODO(RBLN): fold into `attn_masks`. A builder serves one KV cache group,
+    # so sliding layers never read `attn_masks`; a sliding group then has to
+    # skip the non-causal full-width mask it builds today.
     swa_attn_masks: torch.Tensor | None = None
 
     use_custom_kernel: bool = False
     is_prompt_sorted: bool = False
+    num_accepted: torch.Tensor | None = None
 
     def __post_init__(self):
         # FIXME(RBLN): to_dynamic_index does not accept int64 inputs.Thus in the
@@ -183,10 +189,14 @@ class RBLNFlashAttentionMetadata:
 
         self.seq_lens = self.seq_lens.to(torch.int32)
         self.cache_seq_lens = (
-            self.cache_seq_lens.to(torch.int32) if self.cache_seq_lens else None
+            self.cache_seq_lens.to(torch.int32)
+            if self.cache_seq_lens is not None
+            else None
         )
         self.cache_offsets = (
-            self.cache_offsets.to(torch.int32) if self.cache_offsets else None
+            self.cache_offsets.to(torch.int32)
+            if self.cache_offsets is not None
+            else None
         )
 
 
@@ -209,7 +219,7 @@ class RBLNFlashAttentionMetadataBuilder(
         self.use_custom_kernel = rbln_config.use_custom_kernel
 
         self.block_size = kv_cache_spec.block_size
-        self.chunked_prefill_size = self.scheduler_config.max_num_batched_tokens
+        self.chunked_prefill_size = rbln_config.max_prefill_chunk_size
         self.enforce_eager = get_current_vllm_config().model_config.enforce_eager
         # Causality is per model, not per process: each model builds its
         # attention under its own config, and upstream sets `use_non_causal` on
@@ -228,29 +238,69 @@ class RBLNFlashAttentionMetadataBuilder(
                 "--rbln-use-custom-kernel: rbln_triton_ops has no "
                 "sliding_window_attention_v1 kernel."
             )
+        if self.model_config.is_mm_prefix_lm and isinstance(
+            kv_cache_spec, RBLNSlidingWindowSpec
+        ):
+            raise NotImplementedError(
+                "Multimodal ranges of an mm prefix LM attend both ways on sliding "
+                "layers, which needs the masked sliding_window_attention_v1 of "
+                "REBEL CR13; this device's sliding-window kernel is causal only. "
+                "Serve it with every --limit-mm-per-prompt modality 0 and without "
+                "--enable-mm-embeds."
+            )
 
         self._staged: dict[tuple, torch.Tensor] = {}
 
-    def _stage(self, t: torch.Tensor | None, slot: str) -> torch.Tensor | None:
+    def _stage(
+        self,
+        t: torch.Tensor | None,
+        slot: str,
+        shared: dict[tuple, torch.Tensor] | None = None,
+    ) -> torch.Tensor | None:
         """Copy a host tensor into this builder's persistent device buffer.
 
         `slot` must be unique per logical tensor: cache_seq_lens and
         cache_offsets share both shape and dtype, so keying on those alone
         would silently make them share one buffer.
 
-        The returned tensor is overwritten by the next build() call, so the
-        caller must run the forward pass before building again. That holds
-        because each AttentionGroup owns its own builder instance and every
-        build() is immediately followed by a forward.
+        The returned tensor is overwritten by the next stage() call, so the
+        caller must run the forward pass before staging again. `shared` takes
+        the buffer instead of this builder, for a slot whose value does not
+        depend on the KV cache group: every group stages the same value into it.
         """
         if t is None:
             return None
         key = (slot, t.shape, t.dtype)
-        if (buf := self._staged.get(key)) is None:
+        staged = self._staged if shared is None else shared
+        if (buf := staged.get(key)) is None:
             buf = torch.empty(t.shape, dtype=t.dtype, device=self.device)
-            self._staged[key] = buf
+            staged[key] = buf
         buf.copy_(t)
         return buf
+
+    def stage(
+        self,
+        metadata: RBLNFlashAttentionMetadata,
+        group_shared: dict[tuple, torch.Tensor] | None = None,
+    ) -> None:
+        """`group_shared` is one staging dict the caller hands every KV cache
+        group of a step, so the slots that do not depend on the group reach the
+        graph as one input each."""
+        metadata.seq_lens = self._stage(metadata.seq_lens, "seq_idx", group_shared)
+        metadata.block_tables = self._stage(metadata.block_tables, "block_tables")
+        metadata.attn_masks = self._stage(metadata.attn_masks, "attn_masks")
+        metadata.mm_prefix_row_ends = self._stage(
+            metadata.mm_prefix_row_ends, "mm_prefix_row_ends", group_shared
+        )
+        metadata.cache_seq_lens = self._stage(metadata.cache_seq_lens, "cache_seq_lens")
+        metadata.cache_offsets = self._stage(metadata.cache_offsets, "cache_offsets")
+        metadata.local_block_tables = self._stage(
+            metadata.local_block_tables, "local_block_tables"
+        )
+        metadata.swa_attn_masks = self._stage(metadata.swa_attn_masks, "swa_attn_masks")
+        metadata.num_accepted = self._stage(
+            metadata.num_accepted, "num_accepted", group_shared
+        )
 
     def reorder_batch(
         self, input_batch: "InputBatch", scheduler_output: "SchedulerOutput"
@@ -266,11 +316,17 @@ class RBLNFlashAttentionMetadataBuilder(
         skip_attn_masks: bool = False,
         back_pad: torch.Tensor | None = None,
         is_prompt_sorted: bool = False,
+        num_accepted: torch.Tensor | None = None,
+        state_load_pos: torch.Tensor | None = None,
+        mm_prefix_row_ends: torch.Tensor | None = None,
+        group_shared: dict[tuple, torch.Tensor] | None = None,
+        defer_staging: bool = False,
     ) -> RBLNFlashAttentionMetadata:
+        """`mm_prefix_row_ends`, on a prefill of an mm prefix LM, holds for each
+        padded row of the step the last step-local row it may read: itself, or
+        its range's last position for an mm row. None on any other step."""
         num_reqs = common_attn_metadata.num_reqs
-        # NOTE(RBLN): vllm-rbln keeps attention metadata on the host and copies
-        # to the device only when constructing RBLNFlashAttentionMetadata below.
-        # See RBLNModelRunner._build_attention_metadata.
+        # The runner can defer staging until its token feedback is ready.
         query_start_loc_cpu = common_attn_metadata.query_start_loc
         seq_lens_cpu = common_attn_metadata.seq_lens
         block_tables_tensor = common_attn_metadata.block_table_tensor
@@ -356,19 +412,27 @@ class RBLNFlashAttentionMetadataBuilder(
             local_block_tables = block_tables_tensor[..., :1]
 
         attn_metadata = RBLNFlashAttentionMetadata(
-            seq_lens=self._stage(seq_idx, "seq_idx"),
-            block_tables=self._stage(block_tables_tensor, "block_tables"),
+            seq_lens=seq_idx,
+            block_tables=block_tables_tensor,
             is_prefill=is_prefill,
-            attn_masks=self._stage(attn_masks, "attn_masks"),
+            attn_masks=attn_masks,
+            mm_prefix_row_ends=mm_prefix_row_ends,
             swa_appends=self.swa_appends,
-            cache_seq_lens=self._stage(cache_seq_lens, "cache_seq_lens"),
-            cache_offsets=self._stage(cache_offsets, "cache_offsets"),
-            local_block_tables=self._stage(local_block_tables, "local_block_tables"),
-            swa_attn_masks=self._stage(swa_attn_masks, "swa_attn_masks"),
+            cache_seq_lens=cache_seq_lens,
+            cache_offsets=cache_offsets,
+            local_block_tables=local_block_tables,
+            swa_attn_masks=swa_attn_masks,
             use_custom_kernel=self.use_custom_kernel,
             is_prompt_sorted=is_prompt_sorted,
+            num_accepted=(
+                None
+                if num_accepted is None
+                else rbln_utils.pad(num_accepted.view(-1, 1), 0, batch_pad)
+            ),
         )
 
+        if not defer_staging:
+            self.stage(attn_metadata, group_shared)
         return attn_metadata
 
     def use_cascade_attention(self, *args, **kwargs) -> bool:
@@ -398,8 +462,6 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         self.block_size = vllm_config.cache_config.block_size
         self.max_model_len = vllm_config.model_config.max_model_len
 
-        if kv_sharing_target_layer_name is not None:
-            raise NotImplementedError("KV sharing is not supported in RBLN.")
         if logits_soft_cap is not None:
             logger.warning_once(
                 "RBLN Attention Backend does not support logits soft cap. "
@@ -456,7 +518,6 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                 self.sinks = self.sinks[:, None]
 
         self.is_causal = not vllm_config.attention_config.use_non_causal
-        self.is_batch_attention_opt = rbln_config.use_batch_attn_opt
         self.is_normal = (self.block_size == self.max_model_len) and (
             self.sinks is None
         )
@@ -530,6 +591,14 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
 
         # 1. query reshape for custom operation
         num_tokens = query.shape[0]
+        # A KV-shared layer reads its target's cache through an op that also
+        # writes: its zero K/V land one slot past the query, which the target
+        # overwrites before it reads, and the mask keeps them out.
+        reads_shared_kv = key is None
+        if reads_shared_kv:
+            assert value is None and attn_metadata.attn_masks is not None
+            key = query.new_zeros(num_tokens, self.num_kv_heads, self.head_size)
+            value = query.new_zeros(num_tokens, self.num_kv_heads, self.head_size)
         b_size = attn_metadata.seq_lens.shape[0]
         q_len = num_tokens // b_size
         query = query.view(b_size, q_len, self.num_heads, self.head_size).transpose(
@@ -571,7 +640,41 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         # ex) tensor[block0 : 0, block1 : 100,
         #  block2: 10, block3: 5, ...]
         # attn_output = [batch,H,4,L,D]
-        if self.sliding_window is not None:
+        if reads_shared_kv and self.sliding_window is not None:
+            # The write sits one past the query. Include one extra position so
+            # the op's block strip retains the query's oldest visible key.
+            assert attn_metadata.swa_appends and not attn_metadata.is_prefill
+            attn_output = sliding_window_attention_v1(
+                query,
+                key,
+                value,
+                kv_cache,
+                attn_metadata.seq_lens,
+                self.scale,
+                attn_metadata.block_tables,
+                self.sliding_window + 1,
+                self.sinks,
+                attn_mask=attn_metadata.attn_masks,
+                is_prompt_sorted=attn_metadata.is_prompt_sorted,
+            )
+        elif reads_shared_kv:
+            # GQA selects the old masked kernel for a one-column table. The
+            # explicit flash op retains the target's in-memory cache layout.
+            assert not attn_metadata.is_prefill
+            attn_output = flash_attention_naive_decode(
+                query,
+                key,
+                value,
+                kv_cache,
+                attn_metadata.attn_masks,
+                self.scale,
+                attn_metadata.seq_lens,
+                attn_metadata.block_tables,
+                self.sinks,
+                use_custom_kernel=self.use_custom_kernel,
+                is_prompt_sorted=attn_metadata.is_prompt_sorted,
+            )
+        elif self.sliding_window is not None:
             if attn_metadata.swa_appends:
                 # `seq_lens` is the absolute position the chunk starts at, not
                 # a length: the op resolves the window's blocks from it and the
@@ -586,8 +689,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     attn_metadata.block_tables,
                     self.sliding_window,
                     self.sinks,
-                    is_causal=self.is_causal,
-                    attn_mask=attn_metadata.attn_masks,
+                    attn_mask=attn_metadata.swa_attn_masks,
                     is_prompt_sorted=attn_metadata.is_prompt_sorted,
                 )
             else:
@@ -622,7 +724,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         self.scale,
                         attn_metadata.local_block_tables,
                         attn_metadata.swa_attn_masks
-                        if self.is_batch_attention_opt and b_size > 1
+                        if attn_metadata.is_prompt_sorted and b_size > 1
                         else None,
                         self.sinks,
                         use_custom_kernel=self.use_custom_kernel,

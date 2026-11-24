@@ -32,7 +32,8 @@ from unittest.mock import patch
 import pytest
 import torch
 from pydantic import ValidationError
-from vllm.config import CompilationMode, VllmConfig
+from vllm.config import CompilationMode, ECTransferConfig, VllmConfig
+from vllm.config.ec_manager_config import EncoderCacheManagerConfig
 from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -411,6 +412,17 @@ class TestPlatformIdentity:
         }
 
 
+def _as_glm5_next(config: VllmConfig) -> None:
+    """GLM-5.3's text config on the test model: its KDA heads and MLA latent."""
+    text_config = config.model_config.hf_text_config
+    text_config.model_type = "glm5_next_text"
+    text_config.linear_num_heads = 64
+    text_config.linear_head_dim = 128
+    text_config.kv_lora_rank = 512
+    config.model_config.dtype = torch.bfloat16
+    config.cache_config.cache_dtype = "fp8"
+
+
 class TestRejectedConfigs:
     @pytest.mark.parametrize(
         ("block_size", "max_num_batched_tokens", "invalid_block_size"),
@@ -455,6 +467,36 @@ class TestRejectedConfigs:
             reconfigure(custom_kernel(True))
         reconfigure(custom_kernel(None))
 
+    def test_an_ec_consumer_without_its_language_model(self, reconfigure):
+        def role(ec_role, mm_encoder_only):
+            def mutate(config):
+                config.ec_transfer_config = ECTransferConfig(
+                    ec_connector="RblnECNixlConnector", ec_role=ec_role
+                )
+                config.model_config.multimodal_config = SimpleNamespace(
+                    mm_encoder_only=mm_encoder_only
+                )
+
+            return mutate
+
+        for refused in (role("ec_consumer", True), role("ec_both", True)):
+            with pytest.raises(ValueError, match="--mm-encoder-only"):
+                reconfigure(refused)
+        reconfigure(role("ec_producer", True))
+        reconfigure(role("ec_consumer", False))
+        reconfigure(role("ec_both", False))
+
+    @pytest.mark.parametrize("field", ["data_parallel_size", "pipeline_parallel_size"])
+    def test_an_encoder_only_instance_across_ranks(self, reconfigure, field):
+        def mutate(config):
+            config.model_config.multimodal_config = SimpleNamespace(
+                mm_encoder_only=True
+            )
+            setattr(config.parallel_config, field, 2)
+
+        with pytest.raises(ValueError, match="encoder-only instance"):
+            reconfigure(mutate)
+
     def test_lora(self, reconfigure):
         with pytest.raises(ValueError, match="LoRA"):
             reconfigure(lambda config: setattr(config, "lora_config", object()))
@@ -474,12 +516,349 @@ class TestRejectedConfigs:
                 reconfigure(msa(dtype))
         reconfigure(msa(torch.bfloat16))
 
+    def test_glm5_next_configs(self, reconfigure):
+        def glm5_next(*, cache_dtype="fp8", spec=None, tp=1, **cache):
+            def mutate(config):
+                _as_glm5_next(config)
+                config.cache_config.cache_dtype = cache_dtype
+                config.speculative_config = spec
+                config.parallel_config.tensor_parallel_size = tp
+                for name, value in cache.items():
+                    setattr(config.cache_config, name, value)
+
+            return mutate
+
+        def spec(method, num_speculative_tokens):
+            return SimpleNamespace(
+                method=method, num_speculative_tokens=num_speculative_tokens
+            )
+
+        reconfigure(glm5_next())
+        reconfigure(glm5_next(spec=spec("mtp", 5)))
+        with pytest.raises(ValueError, match="--kv-cache-dtype fp8"):
+            reconfigure(glm5_next(cache_dtype="auto"))
+        for method, num_speculative_tokens in (("mtp", 6), ("ngram", 1)):
+            with pytest.raises(ValueError, match="MTP head"):
+                reconfigure(glm5_next(spec=spec(method, num_speculative_tokens)))
+        block_size = _build().cache_config.block_size
+        with pytest.raises(ValueError, match="a recurrent state a KV block"):
+            reconfigure(
+                glm5_next(
+                    enable_prefix_caching=True,
+                    user_specified_mamba_block_size=True,
+                    mamba_block_size=2 * block_size,
+                )
+            )
+        chunk = max(_build().additional_config.prefill_chunk_size)
+        # Set by the user, never derived from sub-block caching.
+        assert (
+            reconfigure(
+                glm5_next(enable_prefix_caching=True)
+            ).cache_config.prefix_match_unit
+            is None
+        )
+        for unit in (chunk, 2 * chunk):
+            assert (
+                reconfigure(
+                    glm5_next(enable_prefix_caching=True, prefix_match_unit=unit)
+                ).cache_config.prefix_match_unit
+                == unit
+            )
+        with pytest.raises(ValueError, match="multiple of the prefill chunk"):
+            reconfigure(
+                glm5_next(enable_prefix_caching=True, prefix_match_unit=chunk // 2)
+            )
+
+        reconfigure(glm5_next(tp=4, block_size=1024))
+        for tp, block_size in ((4, 2048), (1, 8192), (1, 192), (1, 160)):
+            with pytest.raises(ValueError, match="whole KDA head states"):
+                reconfigure(glm5_next(tp=tp, block_size=block_size))
+
+        def bf16_forced_to_fp32(config):
+            glm5_next(block_size=8192)(config)
+            config.additional_config = replace(
+                config.additional_config, enforce_model_fp32=True
+            )
+
+        reconfigure(bf16_forced_to_fp32)
+        if platform.USE_DEVICE_TENSOR:
+
+            def fp32_forced_to_fp16(config):
+                glm5_next(block_size=8192)(config)
+                config.model_config.dtype = torch.float32
+                config.model_config.enforce_eager = True
+
+            with pytest.raises(ValueError, match="whole KDA head states"):
+                reconfigure(fp32_forced_to_fp16)
+
+    def test_glm5_next_prefix_caching_with_mtp_needs_retention_0(self, reconfigure):
+        # A KDA verify step leaves no state at the end of a block it crossed, so
+        # only retention 0 (states a prefill stored) keeps prefix caching on.
+        def glm5_next_mtp(retention):
+            def mutate(config):
+                _as_glm5_next(config)
+                config.cache_config.enable_prefix_caching = True
+                # What MambaModelConfig sets up for prefix caching before the hook.
+                config.cache_config.mamba_cache_mode = "align"
+                config.cache_config.prefix_cache_retention_interval = retention
+                config.speculative_config = SimpleNamespace(
+                    method="mtp", num_speculative_tokens=1
+                )
+
+            return mutate
+
+        assert reconfigure(glm5_next_mtp(0)).cache_config.enable_prefix_caching
+        config = reconfigure(glm5_next_mtp(1))
+        assert not config.cache_config.enable_prefix_caching
+        assert config.cache_config.mamba_cache_mode == "none"
+        assert config.cache_config.mamba_block_size == config.model_config.max_model_len
+
+    def test_glm5_next_mtp_takes_16_bit_activations(self, reconfigure):
+        def forced_to_fp32(config):
+            _as_glm5_next(config)
+            config.speculative_config = SimpleNamespace(
+                method="mtp", num_speculative_tokens=1
+            )
+            config.additional_config = replace(
+                config.additional_config, enforce_model_fp32=True
+            )
+
+        with pytest.raises(ValueError, match="16-bit activations"):
+            reconfigure(forced_to_fp32)
+
+    @pytest.fixture
+    def gdn(self, monkeypatch):
+        """The hook sees a GatedDeltaNet model with Qwen3.5-4B's 32 value heads."""
+        from vllm_rbln.platform import vllm_impl
+
+        monkeypatch.setattr(
+            vllm_impl, "_uses_gated_delta_net", lambda model_config: True
+        )
+
+        def mutate(config):
+            model_config = config.model_config
+            text_config = model_config.hf_text_config
+            text_config.linear_num_value_heads = 32
+            # 32 x 8 x a token's K and V: a state fills a full-attention page
+            # at block_size 256.
+            text_config.linear_key_head_dim = 8
+            text_config.linear_value_head_dim = (
+                2
+                * model_config.get_num_kv_heads(config.parallel_config)
+                * model_config.get_head_size()
+            )
+            config.cache_config.block_size = 256
+
+        return mutate
+
+    @pytest.mark.parametrize(
+        "model_type, name",
+        [("qwen3_next", "Qwen3-Next"), ("qwen3_5_moe_text", "Qwen3.5-MoE")],
+    )
+    def test_other_gdn_models_are_refused(self, reconfigure, model_type, name):
+        def other_model(config):
+            config.model_config.hf_text_config.model_type = model_type
+
+        with pytest.raises(ValueError, match=name):
+            reconfigure(other_model)
+
+    def test_gdn_models_need_128_token_prefill_chunks(self, reconfigure, gdn):
+        def chunk_of_192(config):
+            gdn(config)
+            config.scheduler_config.max_num_batched_tokens = 192
+            # Unset, so the prefill chunk is the token budget.
+            config.additional_config = replace(
+                config.additional_config, prefill_chunk_size=None
+            )
+
+        with pytest.raises(ValueError, match="multiple of 128"):
+            reconfigure(chunk_of_192)
+        reconfigure(gdn)
+
+    def test_gdn_models_run_on_a_single_rank(self, reconfigure, gdn):
+        for parallel in (
+            dict(tensor_parallel_size=2),
+            dict(pipeline_parallel_size=2),
+            dict(data_parallel_size=2),
+        ):
+
+            def widened(config, parallel=parallel):
+                gdn(config)
+                _ranks(**parallel)(config)
+
+            with pytest.raises(ValueError, match="single rank"):
+                reconfigure(widened)
+
+    @pytest.mark.parametrize("model", ["gdn", "glm5_next"])
+    def test_recurrent_state_models_speculate_with_their_mtp_head_only(
+        self, reconfigure, request, model
+    ):
+        as_model = request.getfixturevalue("gdn") if model == "gdn" else _as_glm5_next
+
+        def speculative(method, num_speculative_tokens):
+            def mutate(config):
+                as_model(config)
+                config.speculative_config = SimpleNamespace(
+                    method=method, num_speculative_tokens=num_speculative_tokens
+                )
+
+            return mutate
+
+        for method, drafts in (("eagle", 1), ("mtp", 0), ("mtp", 6)):
+            with pytest.raises(ValueError, match="num_speculative_tokens 1 to 5"):
+                reconfigure(speculative(method, drafts))
+        for drafts in (1, 5):
+            reconfigure(speculative("mtp", drafts))
+
+    def test_gdn_mtp_takes_16_bit_activations(self, reconfigure, gdn):
+        def forced_to_fp32(config):
+            gdn(config)
+            config.speculative_config = SimpleNamespace(
+                method="mtp", num_speculative_tokens=1
+            )
+            config.additional_config = replace(
+                config.additional_config, enforce_model_fp32=True
+            )
+
+        with pytest.raises(ValueError, match="16-bit activations"):
+            reconfigure(forced_to_fp32)
+
+    def test_gdn_models_reject_the_custom_kernel_option(self, reconfigure, gdn):
+        def custom_kernel(config):
+            gdn(config)
+            config.additional_config.use_custom_kernel = True
+
+        with pytest.raises(ValueError, match="rbln-use-custom-kernel"):
+            reconfigure(custom_kernel)
+
+    def test_gdn_models_keep_the_kv_cache_in_the_activation_dtype(
+        self, reconfigure, gdn
+    ):
+        def fp8_cache(config):
+            gdn(config)
+            config.cache_config.cache_dtype = "fp8"
+
+        with pytest.raises(ValueError, match="kv-cache-dtype"):
+            reconfigure(fp8_cache)
+
+    def test_every_gdn_prefill_chunk_size_is_a_multiple_of_128(self, reconfigure, gdn):
+        def chunks(sizes):
+            def mutate(config):
+                gdn(config)
+                config.scheduler_config.max_num_batched_tokens = 256
+                _prefill_chunk(sizes)(config)
+
+            return mutate
+
+        with pytest.raises(ValueError, match="multiple of 128"):
+            reconfigure(chunks([64, 256]))
+        config = reconfigure(chunks([128, 256]))
+        assert config.additional_config.prefill_chunk_size == [128, 256]
+
+    @pytest.mark.parametrize("block_size", [256, 512, 1024])
+    def test_gdn_state_fits_a_full_attention_page(self, reconfigure, gdn, block_size):
+        def sized_block(config):
+            gdn(config)
+            config.cache_config.block_size = block_size
+
+        config = reconfigure(sized_block)
+        assert config.cache_config.block_size == block_size
+
+    def test_gdn_state_rejects_an_undersized_attention_page(self, reconfigure, gdn):
+        def smaller_block(config):
+            gdn(config)
+            config.cache_config.block_size //= 2
+
+        with pytest.raises(ValueError, match="must fit in a full-attention"):
+            reconfigure(smaller_block)
+
+    def test_gdn_rules_skip_an_encoder_only_instance(self, reconfigure, gdn):
+        # Neither the state's page, the prefill kernel's chunk nor prefix
+        # caching's state a KV block is met.
+        def encoder_only(config):
+            gdn(config)
+            config.model_config.multimodal_config = SimpleNamespace(
+                mm_encoder_only=True
+            )
+            config.scheduler_config.max_num_batched_tokens = 192
+            config.additional_config = replace(
+                config.additional_config, prefill_chunk_size=None
+            )
+            config.cache_config.block_size = 192
+            config.cache_config.enable_prefix_caching = True
+            config.cache_config.user_specified_mamba_block_size = True
+            config.cache_config.mamba_block_size = 512
+
+        reconfigure(encoder_only)
+
+    def test_gdn_prefix_caching_keeps_a_state_a_kv_block(self, reconfigure, gdn):
+        def cached(**cache):
+            def mutate(config):
+                gdn(config)
+                config.cache_config.enable_prefix_caching = True
+                for name, value in cache.items():
+                    setattr(config.cache_config, name, value)
+
+            return mutate
+
+        assert reconfigure(cached()).cache_config.enable_prefix_caching
+        with pytest.raises(ValueError, match="a recurrent state a KV block"):
+            reconfigure(
+                cached(user_specified_mamba_block_size=True, mamba_block_size=512)
+            )
+        chunk = max(reconfigure(cached()).additional_config.prefill_chunk_size)
+        assert (
+            reconfigure(cached(prefix_match_unit=chunk)).cache_config.prefix_match_unit
+            == chunk
+        )
+        with pytest.raises(ValueError, match="multiple of the prefill chunk"):
+            reconfigure(cached(prefix_match_unit=chunk // 2))
+
+    def test_gdn_prefix_caching_with_mtp_needs_retention_0(self, reconfigure, gdn):
+        # As for GLM-5.3: a verify step leaves no state at the end of a block it
+        # crossed.
+        def gdn_mtp(retention):
+            def mutate(config):
+                gdn(config)
+                config.cache_config.enable_prefix_caching = True
+                config.cache_config.mamba_cache_mode = "align"
+                config.cache_config.prefix_cache_retention_interval = retention
+                config.speculative_config = SimpleNamespace(
+                    method="mtp", num_speculative_tokens=1
+                )
+
+            return mutate
+
+        assert reconfigure(gdn_mtp(0)).cache_config.enable_prefix_caching
+        config = reconfigure(gdn_mtp(1))
+        assert not config.cache_config.enable_prefix_caching
+        assert config.cache_config.mamba_cache_mode == "none"
+
+    def test_gdn_value_heads_split_over_the_chiplets(self, reconfigure, gdn):
+        def six_heads(config):
+            gdn(config)
+            config.model_config.hf_text_config.linear_num_value_heads = 6
+
+        with pytest.raises(ValueError, match="four chiplets"):
+            reconfigure(six_heads)
+
     def test_mrope_models_are_rejected(self, reconfigure, monkeypatch):
         from vllm.config import ModelConfig
 
         monkeypatch.setattr(ModelConfig, "uses_mrope", property(lambda self: True))
         with pytest.raises(ValueError, match="M-RoPE"):
             reconfigure(lambda config: None)
+
+    def test_mrope_is_allowed_for_qwen3_5(self, reconfigure, gdn, monkeypatch):
+        from vllm.config import ModelConfig
+
+        monkeypatch.setattr(ModelConfig, "uses_mrope", property(lambda self: True))
+
+        def qwen3_5(config):
+            gdn(config)
+            config.model_config.hf_text_config.model_type = "qwen3_5_text"
+
+        reconfigure(qwen3_5)
 
     def test_chunked_prefill_off(self, reconfigure):
         with pytest.raises(ValueError, match="chunked prefill"):
@@ -488,6 +867,17 @@ class TestRejectedConfigs:
                     config.scheduler_config, "enable_chunked_prefill", False
                 )
             )
+
+    def test_chunked_prefill_off_on_an_encoder_only_instance(self, reconfigure):
+        # Upstream turns it off once the engine finds no KV cache, then runs
+        # the hook again.
+        def mutate(config):
+            config.model_config.multimodal_config = SimpleNamespace(
+                mm_encoder_only=True
+            )
+            config.scheduler_config.enable_chunked_prefill = False
+
+        reconfigure(mutate)
 
     @pytest.mark.parametrize("method", ["eagle3", "dflash"])
     def test_a_draft_under_pp_needs_a_patched_target(self, reconfigure, method):
@@ -512,6 +902,119 @@ class TestRejectedConfigs:
     def test_dp_needs_a_divisible_token_budget(self, reconfigure):
         with pytest.raises(ValueError, match="divisible"):
             reconfigure(_ranks(data_parallel_size=2, max_num_seqs=5))
+
+    def test_glm5_next_prefill_buckets_without_sub_blocks(self, reconfigure):
+        def mutate(config):
+            _as_glm5_next(config)
+            config.model_config.hf_text_config.index_topk = 2048
+            config.cache_config.enable_prefix_caching = True
+            config.cache_config.block_size = 1024
+            config.additional_config.prefill_chunk_size = [64, 96]
+
+        reconfigure(mutate)
+
+    def test_a_prefill_chunk_above_the_token_budget_is_refused(self, reconfigure):
+        with pytest.raises(ValueError, match="exceeds"):
+            reconfigure(_prefill_chunk(256))
+
+    def test_prefill_chunk_above_max_num_scheduled_tokens_is_refused(self, reconfigure):
+        def mutate(config):
+            _prefill_chunk([32, 64])(config)
+            config.scheduler_config.max_num_scheduled_tokens = 32
+
+        with pytest.raises(ValueError, match="max_num_scheduled_tokens"):
+            reconfigure(mutate)
+
+    def test_an_unset_prefill_chunk_resolves_to_the_token_budget(self, reconfigure):
+        config = reconfigure(lambda config: None)
+        assert config.additional_config.prefill_chunk_size == [
+            config.scheduler_config.max_num_batched_tokens
+        ]
+
+    def test_a_prefill_chunk_below_the_token_budget_is_taken(self, reconfigure):
+        config = reconfigure(_prefill_chunk(64))
+        assert config.additional_config.prefill_chunk_size == [64]
+
+    @pytest.mark.parametrize("sizes", [64, [32, 64]])
+    def test_prefill_chunk_below_the_token_budget_takes_data_parallelism(
+        self, reconfigure, sizes
+    ):
+        def mutate(config):
+            _prefill_chunk(sizes)(config)
+            _ranks(data_parallel_size=2)(config)
+
+        config = reconfigure(mutate)
+        assert config.additional_config.prefill_chunk_size == (
+            sizes if isinstance(sizes, list) else [sizes]
+        )
+
+    def test_several_prefill_chunk_sizes_refuse_non_causal_attention(self, reconfigure):
+        def mutate(config):
+            _prefill_chunk([32, 64])(config)
+            config.attention_config.use_non_causal = True
+
+        with pytest.raises(ValueError, match="non-causal attention"):
+            reconfigure(mutate)
+
+    def test_one_prefill_chunk_size_keeps_non_causal_attention(self, reconfigure):
+        def mutate(config):
+            _prefill_chunk(64)(config)
+            config.attention_config.use_non_causal = True
+
+        reconfigure(mutate)
+
+    @pytest.mark.parametrize(
+        "kv_connector, extra",
+        [
+            ("RblnNixlConnector", {}),
+            ("RblnNixlPushConnector", {}),
+            (
+                "MultiConnector",
+                {"connectors": [{"kv_connector": "RblnNixlPullConnector"}]},
+            ),
+        ],
+    )
+    def test_a_prefill_chunk_below_the_token_budget_refuses_a_nixl_connector(
+        self, reconfigure, kv_connector, extra
+    ):
+        def mutate(config):
+            _prefill_chunk(64)(config)
+            config.kv_transfer_config = SimpleNamespace(
+                kv_connector=kv_connector, kv_connector_extra_config=extra
+            )
+
+        with pytest.raises(ValueError, match="RBLN NIXL KV transfer"):
+            reconfigure(mutate)
+
+    def test_a_prefill_chunk_below_the_token_budget_takes_spec_decode(
+        self, reconfigure
+    ):
+        def mutate(config):
+            _prefill_chunk(64)(config)
+            config.speculative_config = SimpleNamespace(method="ngram")
+
+        reconfigure(mutate)
+
+    def test_a_prefill_chunk_below_the_token_budget_takes_sub_block_caching(
+        self, reconfigure
+    ):
+        def mutate(config):
+            _prefill_chunk(64)(config)
+            config.cache_config.enable_prefix_caching = True
+
+        reconfigure(mutate)
+
+    def test_a_prefill_chunk_below_the_token_budget_takes_other_connectors(
+        self, reconfigure
+    ):
+        # Only the RBLN NIXL connectors read the budget as the prefill chunk.
+        def mutate(config):
+            _prefill_chunk(64)(config)
+            config.kv_transfer_config = SimpleNamespace(
+                kv_connector="RBLNLMCacheConnectorV1", kv_connector_extra_config={}
+            )
+
+        reconfigure(mutate)
 
     @pytest.mark.parametrize("ranks", [dict(data_parallel_size=2), dict(ep=True)])
     def test_dp_and_ep_need_the_moe_tokens_mask(self, reconfigure, ranks):
@@ -590,6 +1093,18 @@ def _ranks(
     return mutate
 
 
+def _prefill_chunk(size: int | list[int]):
+    """A mutator that sets --rbln-prefill-chunk-size, with sub-block caching off."""
+
+    def mutate(config: VllmConfig) -> None:
+        config.additional_config = replace(
+            config.additional_config, prefill_chunk_size=size
+        )
+        config.cache_config.enable_prefix_caching = False
+
+    return mutate
+
+
 class TestModelParallelSideEffect:
     @pytest.mark.parametrize(
         "ranks",
@@ -627,32 +1142,34 @@ class TestDtype:
         assert config.model_config.dtype == torch.float32
 
 
-class TestCompileDtype:
-    @staticmethod
-    def _with_dtype(config):
-        config.additional_config = replace(
-            config.additional_config, compile_dtype="float16"
-        )
-
-    @pytest.fixture
-    def older_rebel(self, monkeypatch):
-        import vllm_rbln.compilation.compiler as compiler
-
-        def legacy_compile(model, *, npu=None):
-            pass
-
-        monkeypatch.setattr(compiler.rebel, "compile", legacy_compile)
-
-    def test_empty_dtype_skips_the_probe(self, reconfigure, older_rebel):
-        config = reconfigure(lambda config: None)
-        assert config.additional_config.compile_dtype == ""
-
-    def test_refused_at_startup_on_an_older_rebel(self, reconfigure, older_rebel):
-        with pytest.raises(ValueError, match="dtype"):
-            reconfigure(self._with_dtype)
-
-
 class TestWorkerAndScheduler:
+    @pytest.mark.parametrize(
+        "encoder_decoder,custom_manager,expected",
+        [
+            (False, None, "vllm_rbln.v1.core.rbln_scheduler.RBLNEncoderCacheManager"),
+            (True, None, None),
+            (
+                False,
+                "vllm.v1.core.encoder_cache_manager.EncoderCacheManager",
+                "vllm.v1.core.encoder_cache_manager.EncoderCacheManager",
+            ),
+        ],
+    )
+    def test_ec_encoder_cache_manager_selection(
+        self, reconfigure, encoder_decoder, custom_manager, expected
+    ):
+        def mutate(config: VllmConfig) -> None:
+            config.ec_transfer_config = ECTransferConfig(
+                ec_connector="RblnECCPUConnector", ec_role="ec_both"
+            )
+            config.model_config.is_encoder_decoder = encoder_decoder
+            config.ec_manager_config = EncoderCacheManagerConfig(
+                encoder_cache_manager_cls=custom_manager
+            )
+
+        config = reconfigure(mutate)
+        assert config.ec_manager_config.encoder_cache_manager_cls == expected
+
     @pytest.mark.parametrize("selection", [None, "0", "1"])
     def test_runner_selection_ignores_upstream_env(self, monkeypatch, selection):
         import vllm.config.vllm as upstream_config
@@ -779,13 +1296,7 @@ class TestSchedulerOverrides:
         assert config.scheduler_config.max_num_batched_tokens == 512
 
     def test_async_scheduling_is_honored(self, monkeypatch):
-        # The platform used to force this off unconditionally. It now follows
-        # vLLM's --async-scheduling, as long as the device-side token path is
-        # available (see below). Both carriers are pinned on because
-        # --device-tensor 0 switches the first one off for the whole session,
-        # which would land this on the negative case below.
-        for name in ("VLLM_RBLN_USE_DEVICE_TENSOR", "VLLM_RBLN_SAMPLER"):
-            monkeypatch.setenv(name, "1")
+        monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
         assert _build(async_scheduling=True).scheduler_config.async_scheduling is True
 
     @pytest.mark.parametrize(
@@ -802,11 +1313,7 @@ class TestSchedulerOverrides:
         sampled and returns wrong text with no error raised, so the platform
         downgrades to sync rather than run the combination.
         """
-        # Both are set before one is switched off: the gate refuses on either,
-        # so leaving the other to the lane lets --device-tensor 0 satisfy this
-        # case with the sampler still on, and the parametrization proves nothing.
-        for name in ("VLLM_RBLN_USE_DEVICE_TENSOR", "VLLM_RBLN_SAMPLER"):
-            monkeypatch.setenv(name, "1")
+        monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
         monkeypatch.setenv(switched_off, "0")
         config = _build(async_scheduling=True)
         assert config.scheduler_config.async_scheduling is False
@@ -1208,6 +1715,53 @@ class TestDflashTokenBudget:
         assert reconfigure(mutate).scheduler_config.max_num_scheduled_tokens == 8
 
 
+class TestStrictProducerRequests:
+    # The config is built right before validating, since the hook keeps the
+    # last config built in this process and reads its role per request.
+    @staticmethod
+    def _validate(kv_role, max_tokens, **engine_kwargs):
+        from vllm.config import KVTransferConfig
+        from vllm.sampling_params import SamplingParams
+
+        _build(
+            kv_transfer_config=KVTransferConfig(
+                kv_connector="RblnNixlConnector", kv_role=kv_role
+            ),
+            **engine_kwargs,
+        )
+        RblnPlatform.validate_request(None, SamplingParams(max_tokens=max_tokens))
+
+    @pytest.mark.parametrize("max_tokens", [2, None])
+    def test_a_producer_refuses_more_than_one_output_token(self, max_tokens):
+        from vllm.exceptions import VLLMValidationError
+
+        # A client error, so the API server returns the message to the caller.
+        with pytest.raises(VLLMValidationError, match=f"got max_tokens={max_tokens}"):
+            self._validate("kv_producer", max_tokens)
+
+    def test_a_producer_accepts_the_prefill_leg(self):
+        self._validate("kv_producer", 1)
+
+    def test_a_producer_leaves_pooling_alone(self):
+        from vllm.config import KVTransferConfig
+        from vllm.pooling_params import PoolingParams
+
+        _build(
+            kv_transfer_config=KVTransferConfig(
+                kv_connector="RblnNixlConnector", kv_role="kv_producer"
+            )
+        )
+        RblnPlatform.validate_request(None, PoolingParams())
+
+    @pytest.mark.parametrize("kv_role", ["kv_both", "kv_consumer"])
+    def test_a_role_that_decodes_accepts_any_length(self, kv_role):
+        self._validate(kv_role, None)
+
+    def test_kv_offloading_turns_a_producer_into_a_role_that_decodes(self):
+        # Upstream rewrites the role to kv_both after the platform hook runs.
+        self._validate("kv_producer", 4, kv_offloading_size=1)
+
+
 # Resolving the vllm path reads the host's device now that RBLN-CA* refuses it,
 # so the chip is named here rather than inherited from whatever card ran this.
 @pytest.mark.usefixtures("cr13")
@@ -1287,7 +1841,7 @@ class TestModelImpl:
         monkeypatch.setenv(platform.envs.RESOLVED_MODEL_IMPL_ENV, _UNTOUCHED)
         platform._apply_model_impl("vllm")
 
-        config = _build()
+        config = _build(max_num_batched_tokens=None)
 
         assert isinstance(config.additional_config, OptimumRBLNConfig)
         assert RblnPlatform.device_type == "cpu"

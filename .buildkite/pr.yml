@@ -47,6 +47,17 @@ steps:
             tests/test_python_support.py \
             -q
 
+  - label: ":shield: security-tooling (diff)"
+    trigger: "standalone-security-tooling"
+    build:
+      message: "[sast-diff] ${BUILDKITE_PIPELINE_SLUG}@${BUILDKITE_COMMIT}"
+      env:
+        TARGET_REPO: "${BUILDKITE_REPO}"
+        TARGET_COMMIT: "${BUILDKITE_COMMIT}"
+        SCANNERS: sast
+        SAST_MODE: diff
+        SAST_BASELINE: dev
+
   # All gates must pass before the heavy test pipelines are even uploaded.
   - wait: ~
 
@@ -67,13 +78,16 @@ steps:
     key: "vllm-rbln"
     steps:
       - label: ":sparkles: upload vllm-rbln-pr"
+        image: "${DEVTOOLS_DOCKER_IMAGE}"
+        secrets: *uv_secrets
         env:
           PYTEST_COMPILER_OVERRIDE_COMMAND: "bash .buildkite/scripts/rebel-compiler-override.sh"
-        checkout:
-          sparse:
-            paths:
-              - .buildkite
+        artifact_paths:
+          - "pytest-plan.json"
         command: |
+          set -euo pipefail
           TARGET_BRANCH=$${BUILDKITE_PULL_REQUEST_BASE_BRANCH:-dev}
-          git fetch origin $$TARGET_BRANCH
-          buildkite-agent pipeline upload .buildkite/pipelines/vllm-rbln/pipeline-pytest.yml --git-diff-base origin/$$TARGET_BRANCH
+          git fetch origin "$$TARGET_BRANCH"
+          uv sync --locked --python 3.12 --extra test --extra dev --extra runtime
+          uv run --no-sync python .buildkite/pipelines/vllm-rbln/scripts/plan_pytest.py pytest-plan.json
+          buildkite-agent pipeline upload pytest-plan.json --git-diff-base "origin/$$TARGET_BRANCH"

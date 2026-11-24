@@ -20,11 +20,16 @@ import pytest
 from vllm.v1.request import RequestStatus
 
 from tests.vllm.v1.core.utils import (
+    ECConnectorInTransit,
     MockKVConfig,
     _drain,
     create_rbln_scheduler,
+    full_attention_spec,
+    image_at,
+    make_kv_cache_config,
     make_model_runner_output,
     make_request,
+    sliding_window_spec,
 )
 
 BLOCK_SIZE = 16
@@ -212,6 +217,37 @@ class TestSubBlockVersusKVConnector:
         assert out.num_scheduled_tokens["1"] == req.num_tokens
 
 
+class TestSubBlockMatchOfADeferredRequest:
+    def test_waiting_for_encoder_outputs_releases_the_match(self):
+        sched = create_rbln_scheduler(
+            block_size=BLOCK_SIZE,
+            num_blocks=100,
+            max_num_batched_tokens=BLOCK_SIZE,
+            max_model_len=BLOCK_SIZE * 4,
+            enable_prefix_caching=True,
+            sub_block_size=SUB_BLOCK_SIZE,
+        )
+        seed = make_request("seed", [0] * BLOCK_SIZE, BLOCK_SIZE, max_tokens=1)
+        sched.add_request(seed)
+        out = sched.schedule()
+        seed_block = sched.kv_cache_manager.block_pool.blocks[
+            out.scheduled_new_reqs[0].block_ids[0][0]
+        ]
+        sched.update_from_output(out, make_model_runner_output(out, 0))
+        sched.ec_connector = ECConnectorInTransit()
+
+        # Shares the seed's first sub-block; the image comes after it.
+        tokens = [0] * SUB_BLOCK_SIZE + [900 + i for i in range(BLOCK_SIZE)]
+        image = image_at(SUB_BLOCK_SIZE + 8, 4)
+        sched.add_request(make_request("1", tokens, BLOCK_SIZE, mm_features=[image]))
+        # Queued behind it, so the same pass moves on to another request.
+        other = [500 + i for i in range(BLOCK_SIZE)]
+        sched.add_request(make_request("2", other, BLOCK_SIZE))
+
+        assert sched.schedule().num_scheduled_tokens == {"2": BLOCK_SIZE}
+        assert seed_block.ref_cnt == 0
+
+
 class TestSubBlockPrefixHitRun:
     # A full run over the sub-block copy path: req1 shares req0's first sub-block
     # (yielding a copy op), and both requests still generate to completion.
@@ -281,3 +317,35 @@ class TestSubBlockIndexingUnderAsyncScheduling:
         out = self._sharer_schedule_after_donor_prefill(async_scheduling)
         assert len(out.kv_cache_copy_ops) == 1
         assert out.kv_cache_copy_ops[0].num_tokens == 8
+
+
+class TestSubBlockHitUnderTheSchedulerBlock:
+    # Gemma4's KV cache groups at a smaller scale: full attention in 16-token
+    # blocks, a sliding window as wide as its 8-token blocks, hashed at the gcd
+    # and scheduled at the lcm. Upstream's hybrid coordinator only caches and
+    # retains blocks a 16-aligned hit can reach, so a request that ends inside
+    # its first scheduler block leaves the sub-block index nothing to serve.
+    def test_donor_shorter_than_a_scheduler_block_serves_a_hit(self):
+        sched = create_rbln_scheduler(
+            enable_prefix_caching=True,
+            block_size=16,
+            hash_block_size=8,
+            sub_block_size=SUB_BLOCK_SIZE,
+            max_num_batched_tokens=16,
+            max_model_len=128,
+            kv_cache_config=make_kv_cache_config(
+                [full_attention_spec(16), sliding_window_spec(8, 8)], num_blocks=64
+            ),
+        )
+        donor = make_request("0", list(range(12)), 8, max_tokens=2)
+        sched.add_request(donor)
+        _drain(sched)
+        assert donor.is_finished()
+
+        sharer = make_request("1", list(range(12)) + [100 + i for i in range(9)], 8)
+        sched.add_request(sharer)
+        out = sched.schedule()
+        assert [(op.group_id, op.num_tokens) for op in out.kv_cache_copy_ops] == [
+            (0, SUB_BLOCK_SIZE),
+            (1, SUB_BLOCK_SIZE),
+        ]

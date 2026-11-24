@@ -26,6 +26,18 @@ if the KV cache tensor has a token dimension that can be sliced for partial copy
       This is not per-token data.
     * `CrossAttentionSpec`: Prefix caching is entirely disabled for this.
 
+A model with a layer of 2 or 3 KV heads (Gemma4 26B-A4B) is ineligible for now.
+
+A model with a `MambaSpec` group (GLM-5.3's KDA layers, Qwen3.5's GatedDeltaNet layers)
+therefore never runs this manager. It can hit below the block through upstream's
+fine-grained prefix hits instead, set with `--prefix-match-unit`, independent of
+`--rbln-enable-sub-block-cache`. On RBLN the unit has to be a multiple of the prefill
+chunk, since a step stores a recurrent state only where it ends.
+Every group then registers one partial entry at the prompt's last unit boundary,
+and a hit copies that block into a new one before the request writes past it.
+A recurrent state is kept at that one boundary per prompt, not at every sub-block.
+A sibling prompt that diverges before that boundary resumes at the latest state kept
+before the divergence, which is a block boundary.
 
 ## Configuration
 
@@ -41,18 +53,20 @@ so each takes a `--rbln-*` flag, an `additional_config` key, or the environment 
 Turning it off while giving a `sub_block_size` is rejected,
 since the two ask for opposite things.
 
-Left unset, the sub-block size is the prefill chunk size (`max_num_batched_tokens`),
+Left unset, the sub-block size is the prefill chunk size (the longest `--rbln-prefill-chunk-size`, which defaults to `max_num_batched_tokens`),
 so each prefill does not span multiple blocks.
 A smaller value decouples the two, so a prefill chunk can span two blocks.
 Storing across that boundary needs the multi-block attention store,
 which REBEL CR13 alone carries — the scheduler rejects the decoupled setting on
 any other device.
-The scheduler also requires `block_size >= max_num_batched_tokens >= sub_block_size`.
+When the longest `--rbln-prefill-chunk-size` does not divide `block_size`, REBEL CR13 takes the
+longest one that does; any other device runs without sub-block caching.
+The scheduler also requires `block_size >= prefill_chunk_size >= sub_block_size`.
 
 For cross-engine prefix-aware routing (e.g., llm-d):
 enable KV events via `--kv-events-config` in vLLM and
 set the router's token processing block size to the sub-block size:
-`--rbln-sub-block-size` when given, otherwise `--max-num-batched-tokens`
+`--rbln-sub-block-size` when given, otherwise the prefill chunk size
 (**not** `--block-size`; see [Using with llm-d](#using-with-llm-d)).
 
 ## Key components
@@ -330,8 +344,9 @@ configured block size, looks those keys up in the index it builds from our
 events, and scores pods by how many consecutive blocks match.  Routing
 works iff the producer's `blockSizeTokens` equals the engine's emitted
 `block_size`, which is our sub-block size:
-`--rbln-sub-block-size` when given, otherwise the prefill chunk size
-(`--max-num-batched-tokens`).
+`--rbln-sub-block-size` when given, otherwise the longest
+`--rbln-prefill-chunk-size` that divides `--block-size`
+(the flag defaults to `--max-num-batched-tokens`).
 
 > **Not** vLLM's `--block-size`.  For stock vLLM those two happen to be
 > the same knob, so generic guides tell you to align `--block-size` with

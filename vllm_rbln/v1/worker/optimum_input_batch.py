@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -18,8 +18,6 @@ import torch
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.utils import copy_slice
 from vllm.v1.worker.gpu_input_batch import InputBatch
-
-from vllm_rbln.v1.sample.ops.top_k_top_p import TOP_P_CLAMP
 
 
 class RBLNInputBatch(InputBatch):
@@ -45,10 +43,9 @@ class RBLNInputBatch(InputBatch):
             #   - failure site:    https://github.com/vllm-project/vllm/blob/01efc7ef781391e744ed08c3292817a773d654e6/vllm/v1/sample/ops/topk_topp_sampler.py#L151
             self.top_k.fill_(self.vocab_size)
             self.top_k_cpu_tensor.fill_(self.vocab_size)
-            # FIXME(huijong.jeong): default to 1.0 once our rbln.top_k_top_p
-            # gets revised.
-            self.top_p.fill_(TOP_P_CLAMP)
-            self.top_p_cpu_tensor.fill_(TOP_P_CLAMP)
+            # Default top_p to 1.0
+            self.top_p.fill_(1.0)
+            self.top_p_cpu_tensor.fill_(1.0)
             # Default temperature to 1.0 to guard against NaN logits.
             #
             # Why: top_k / top_p applied to unscaled logits can produce NaNs,

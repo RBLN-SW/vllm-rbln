@@ -16,15 +16,96 @@
 # and the per-group attention metadata over it. test_kv_cache_bindings.py covers
 # the consumer of those recipes; this is the producer.
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
 import torch
+from transformers import LlamaConfig
+from vllm.config import set_current_vllm_config
+from vllm.engine.arg_utils import EngineArgs
+from vllm.v1.kv_cache_interface import MambaSpec, MLAAttentionSpec
 
 import vllm_rbln.v1.worker.rbln_model_runner as mr
 from tests.vllm.v1.worker.utils import make_kv_cache_config, schedule_new
+from vllm_rbln.forward_context import set_forward_context
+from vllm_rbln.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+    RBLNGDNBlockAuxCache,
+    RBLNQwenGatedDeltaNetAttention,
+)
+from vllm_rbln.patches.attention import _resolve_kv_cache
+from vllm_rbln.v1.attention.backends.flash_attention import RBLNFlashAttentionMetadata
+from vllm_rbln.v1.attention.backends.gdn_attn import RBLNGDNAttentionMetadata
+from vllm_rbln.v1.attention.backends.glm5_next import RBLNGlm5NextIndexerBackend
+from vllm_rbln.v1.attention.backends.mla.indexer import RBLNDeepseekV32IndexerBackend
+from vllm_rbln.v1.attention.kv_cache_bindings import (
+    kv_cache_tensor_key,
+    materialize_kv_cache_view,
+)
+from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
 
-pytestmark = pytest.mark.maybe_use_device
+pytestmark = pytest.mark.use_device
+
+
+@pytest.mark.usefixtures("cr13")
+@pytest.mark.parametrize("prefix_caching", [False, True])
+@pytest.mark.parametrize("sub_block_cache", [False, True])
+@pytest.mark.parametrize(
+    "backend, cache_dtype, chunks, rejected",
+    [
+        (RBLNDeepseekV32IndexerBackend, "fp8", [96], True),
+        (RBLNDeepseekV32IndexerBackend, "fp8", [64, 96], True),
+        (RBLNDeepseekV32IndexerBackend, "fp8", [96, 128], True),
+        (RBLNDeepseekV32IndexerBackend, "fp8", [64, 96, 128], True),
+        (RBLNDeepseekV32IndexerBackend, "fp8_e4m3", [96], True),
+        (RBLNDeepseekV32IndexerBackend, "fp8", [128], False),
+        (RBLNDeepseekV32IndexerBackend, "fp8", [64, 128], False),
+        (RBLNDeepseekV32IndexerBackend, "auto", [96], False),
+        (RBLNGlm5NextIndexerBackend, "fp8", [64, 96], False),
+        (RBLNGlm5NextIndexerBackend, "fp8", [96, 128], False),
+    ],
+)
+def test_indexer_prefill_block_alignment(
+    make_model_runner,
+    monkeypatch,
+    backend,
+    cache_dtype,
+    chunks,
+    rejected,
+    prefix_caching,
+    sub_block_cache,
+):
+    runner = make_model_runner(
+        init_kv_cache=False,
+        kv_cache_dtype=cache_dtype,
+        enable_prefix_caching=prefix_caching,
+        additional_config={
+            "prefill_chunk_size": chunks,
+            "enable_sub_block_cache": sub_block_cache,
+        },
+    )
+    layer = runner.compilation_config.static_forward_context["layer.0"]
+    monkeypatch.setattr(layer, "get_attn_backend", lambda: backend)
+    glm = backend is RBLNGlm5NextIndexerBackend
+    spec = MLAAttentionSpec(
+        block_size=1024,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=(
+            torch.float8_e4m3fn
+            if cache_dtype.startswith("fp8") and not glm
+            else torch.bfloat16
+        ),
+        tokens_per_state=4 if glm else 1,
+    )
+    config = make_kv_cache_config(runner, spec=spec)
+    with (
+        pytest.raises(ValueError, match="FP8 DSA indexer scale cache")
+        if rejected
+        else nullcontext()
+    ):
+        runner.initialize_kv_cache(config)
+        assert runner._kernel_block_sizes == [1024]
 
 
 def _one_group_two_layers(make_model_runner):
@@ -37,7 +118,66 @@ def _one_group_two_layers(make_model_runner):
     return runner
 
 
+def _attention_and_gdn(make_model_runner, tmp_path, block_size, attention, gdn):
+    """A runner with a full-attention layer and a GatedDeltaNet layer, a group
+    each, the state declared as that attention's KV block. Returns it with the
+    cache config to initialize it from."""
+    LlamaConfig(
+        hidden_size=1024,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        max_position_embeddings=8192,
+        architectures=["LlamaForCausalLM"],
+    ).save_pretrained(tmp_path)
+    config = EngineArgs(
+        model=str(tmp_path),
+        dtype="bfloat16",
+        block_size=block_size,
+        max_model_len=8192,
+        max_num_batched_tokens=128,
+        max_num_seqs=4,
+        enable_chunked_prefill=True,
+    ).create_engine_config()
+    runner = make_model_runner(
+        vllm_config=config, layers=(attention, gdn), init_kv_cache=False
+    )
+    layer = object.__new__(RBLNQwenGatedDeltaNetAttention)
+    runner.compilation_config.static_forward_context[gdn] = layer
+    cache_config = make_kv_cache_config(
+        runner, groups=[(attention,), (gdn,)], num_blocks=4, block_size=block_size
+    )
+    attention_spec = cache_config.kv_cache_groups[0].kv_cache_spec
+    cache_config.kv_cache_groups[1].kv_cache_spec = MambaSpec(
+        block_size=config.model_config.max_model_len,
+        shapes=((2, 4, 1, block_size, 256),),
+        dtypes=(torch.bfloat16,),
+        page_size_padded=attention_spec.page_size_bytes,
+        mamba_type=layer.mamba_type,
+    )
+    return runner, cache_config
+
+
 class TestReshapeKVCacheTensors:
+    @pytest.mark.parametrize("block_size", [256, 384, 1024])
+    def test_padded_gdn_keeps_shared_kv_view(
+        self, make_model_runner, tmp_path, block_size
+    ):
+        runner, cache_config = _attention_and_gdn(
+            make_model_runner, tmp_path, block_size, "layer.0", "layer.1"
+        )
+        runner.initialize_kv_cache(cache_config)
+        context = runner.compilation_config.static_forward_context
+        state_spec = cache_config.kv_cache_groups[1].kv_cache_spec
+        assert len(runner.kv_cache_bases) == 1
+        info = runner.kv_cache_view_infos[runner.kv_cache_positions["layer.1"]]
+        state = materialize_kv_cache_view(runner.kv_cache_bases, info)
+        assert tuple(state.shape) == (4, *state_spec.shapes[0])
+        assert kv_cache_tensor_key(state) == kv_cache_tensor_key(
+            context["layer.0"].kv_cache
+        )
+        assert state.stride(0) * state.element_size() == state_spec.page_size_bytes
+        assert state_spec.real_page_size_bytes == state_spec.page_size_bytes
+
     # Technique from upstream's test_kv_cache_stride_order: drive the real
     # backend rather than a fake, so the assertions hold for the backend in use.
     def test_backend_stride_order_permutes_base_but_not_the_view(
@@ -95,77 +235,73 @@ class TestKVCacheBaseBindings:
         assert runner.kv_cache_view_infos == []
 
 
-class TestLayerIndexFollowsCacheOrder:
-    """`initialize_kv_cache_tensors` gives every layer the position of its cache
-    in `kv_cache_names`. The construction-time index assumes `num_attn_module`
-    caches per decoder layer, which a layer owning fewer breaks for every
-    layer after it."""
+class TestCachePositionsFollowCacheOrder:
+    """Lookup uses the rank-local order even with variable cache counts."""
 
     @staticmethod
-    def _bind(make_model_runner, monkeypatch, names, **text_config):
+    def _bind(make_model_runner, names):
         runner = make_model_runner(layers=names, init_kv_cache=False)
-        # The test config is memoized, so put the attributes back afterwards.
-        for key, value in text_config.items():
-            monkeypatch.setattr(
-                runner.model_config.hf_text_config, key, value, raising=False
-            )
         ctx = runner.compilation_config.static_forward_context
-        before = {name: ctx[name].layer_index for name in names}
 
         runner.initialize_kv_cache(make_kv_cache_config(runner, groups=[names]))
 
-        after = {name: ctx[name].layer_index for name in names}
+        positions = runner.kv_cache_positions
         # Whatever the index, it must reach the layer's own bound cache.
         for name in names:
-            assert runner.kv_caches[after[name]] is ctx[name].kv_cache
-        return runner, before, after
+            assert runner.kv_caches[positions[name]] is ctx[name].kv_cache
+        return runner
 
-    def test_minimax_m3_dense_layers_own_no_indexer_cache(
-        self, make_model_runner, monkeypatch
-    ):
+    def test_minimax_m3_dense_layers_own_no_indexer_cache(self, make_model_runner):
         names = (
             "model.layers.0.self_attn.attn",  # dense: K/V only
             "model.layers.1.self_attn.attn",  # sparse: K/V ...
             "model.layers.1.self_attn.attn.indexer",  # ... and the indexer keys
             "model.layers.2.self_attn.attn",  # dense again
         )
-        runner, before, after = self._bind(
-            make_model_runner,
-            monkeypatch,
-            names,
-            sparse_attention_config={"sparse_attention_freq": [0, 1, 0]},
-        )
-        # Construction indexed by decoder layer, so two caches collided.
-        assert (
-            before["model.layers.1.self_attn.attn"]
-            == before["model.layers.1.self_attn.attn.indexer"]
-        )
+        runner = self._bind(make_model_runner, names)
         assert runner.kv_cache_names == list(names)
-        assert after == {name: i for i, name in enumerate(names)}
+        assert runner.kv_cache_positions == {name: i for i, name in enumerate(names)}
 
-    def test_dsa_fp8_keeps_three_caches_per_layer_in_order(
-        self, make_model_runner, monkeypatch
-    ):
+    def test_draft_alias_uses_the_target_allocation(self, make_model_runner):
+        target = "model.layers.12.self_attn.attn"
+        draft = "draft.layers.0.self_attn.attn"
+        runner = make_model_runner(layers=(target, draft), init_kv_cache=False)
+        context = runner.compilation_config.static_forward_context
+        context[draft].kv_sharing_target_layer_name = target
+        assert draft not in runner.get_kv_cache_spec()
+
+        runner.initialize_kv_cache(make_kv_cache_config(runner, groups=[(target,)]))
+
+        cache = context[target].kv_cache
+        assert context[draft].kv_cache is cache
+        assert runner.kv_cache_names == [draft, target]
+        assert runner.kv_caches[runner.kv_cache_positions[draft]] is cache
+        assert runner.kv_cache_allocations == {kv_cache_tensor_key(cache): target}
+
+    def test_dsa_fp8_keeps_three_caches_per_layer_in_order(self, make_model_runner):
         # DeepSeek-V3.2 / A.X-K3 under KV8: MLA latent, indexer keys, and the
-        # indexer's fp16 scale cache, so `num_attn_module` is 3.
-        monkeypatch.setattr(mr, "rbln_num_attn_module", lambda *args, **kwargs: 3)
+        # indexer's fp16 scale cache.
         names = tuple(
             f"model.layers.{layer}.self_attn.{module}"
             for layer in (0, 1)
             for module in ("attn", "indexer.k_cache", "indexer.k_cache.scale_cache")
         )
-        runner, _, after = self._bind(make_model_runner, monkeypatch, names)
+        runner = self._bind(make_model_runner, names)
         assert runner.kv_cache_names == list(names)
-        assert after == {name: i for i, name in enumerate(names)}
+        assert runner.kv_cache_positions == {name: i for i, name in enumerate(names)}
 
-    def test_mtp_layer_sits_after_the_target_layers(self, make_model_runner):
+    @pytest.mark.parametrize("last_stage", [False, True])
+    def test_mtp_layer_sits_after_the_target_layers(
+        self, make_model_runner, last_stage
+    ):
         from tests.vllm.v1.worker.utils import make_runner_config
 
         config = make_runner_config()
         num_layers = config.model_config.get_total_num_hidden_layers()
+        start = num_layers - 2 if last_stage else 0
         names = (
-            "model.layers.0.self_attn.attn",
-            "model.layers.1.self_attn.attn",
+            f"model.layers.{start}.self_attn.attn",
+            f"model.layers.{start + 1}.self_attn.attn",
             # An MTP / nextn layer is named past the target's layer count.
             f"model.layers.{num_layers}.self_attn.attn",
         )
@@ -175,8 +311,156 @@ class TestLayerIndexFollowsCacheOrder:
         ctx = runner.compilation_config.static_forward_context
         runner.initialize_kv_cache(make_kv_cache_config(runner, groups=[names]))
         assert runner.kv_cache_names == list(names)
-        assert [ctx[name].layer_index for name in names] == [0, 1, 2]
+        assert runner.kv_cache_positions == {name: i for i, name in enumerate(names)}
         assert runner.kv_caches[2] is ctx[names[-1]].kv_cache
+
+
+class TestBlockAuxKVCaches:
+    def test_initialization_inventories_shared_main_and_aux_allocations(
+        self, make_model_runner, monkeypatch
+    ):
+        runner = make_model_runner(layers=("layer.0", "layer.1"), init_kv_cache=False)
+        context = runner.compilation_config.static_forward_context
+        for i, owner in ((2, "layer.0"), (3, "layer.1")):
+            monkeypatch.setitem(context, f"layer.{i}", self._aux(owner))
+        config = make_kv_cache_config(runner, groups=[("layer.0",), ("layer.1",)])
+        runner.initialize_kv_cache(config)
+        assert runner.kv_cache_allocations == {
+            kv_cache_tensor_key(runner.kv_caches[0]): "layer.0",
+            kv_cache_tensor_key(runner.kv_caches[2]): "layer.2",
+        }
+
+        old_allocations = runner.kv_cache_allocations.copy()
+        replacement = make_kv_cache_config(
+            runner, groups=[("layer.0",), ("layer.1",)], num_blocks=20
+        )
+        runner.initialize_kv_cache_tensors(replacement, runner._kernel_block_sizes)
+        assert list(runner.kv_cache_allocations.values()) == list(
+            old_allocations.values()
+        )
+        assert runner.kv_cache_allocations.keys().isdisjoint(old_allocations)
+        for key, name in runner.kv_cache_allocations.items():
+            assert key == kv_cache_tensor_key(context[name].kv_cache)
+
+    def test_connectors_register_only_the_transferred_aux_specs(
+        self, make_model_runner, monkeypatch
+    ):
+        # The GLM-5.3 kinds: a conv ring, a tail ring that is not prefix-cacheable
+        # but must still move, and a KDA draft only this engine's verify reads.
+        aux_specs: list = []
+        connector = SimpleNamespace(register_block_aux_kv_caches=aux_specs.append)
+        monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: True)
+        monkeypatch.setattr(mr, "get_kv_transfer_group", lambda: connector)
+        runner = self._runner_with_aux(
+            make_model_runner,
+            monkeypatch,
+            [
+                self._aux("layer.0"),
+                self._aux("layer.0", prefix_cacheable=False),
+                self._aux("layer.0", prefix_cacheable=False, verify_only=True),
+            ],
+        )
+        assert set(runner.aux_kv_cache_specs) == {"layer.1", "layer.2", "layer.3"}
+        assert [set(specs) for specs in aux_specs] == [{"layer.1", "layer.2"}]
+
+    @pytest.mark.parametrize("strict_producer", [False, True])
+    def test_a_strict_producer_does_not_allocate_a_verify_only_aux(
+        self, make_model_runner, monkeypatch, strict_producer
+    ):
+        draft = self._aux("layer.0", verify_only=True)
+        runner = self._runner_with_aux(
+            make_model_runner,
+            monkeypatch,
+            [self._aux("layer.0"), draft],
+            strict_producer=strict_producer,
+        )
+        if strict_producer:
+            assert set(runner.aux_kv_cache_specs) == {"layer.1"}
+            assert "layer.2" not in runner.kv_cache_names
+            assert "layer.2" not in runner.kv_cache_positions
+        else:
+            assert set(runner.aux_kv_cache_specs) == {"layer.1", "layer.2"}
+            assert runner.kv_cache_positions["layer.2"] == 2
+
+    def _runner_with_aux(
+        self, make_model_runner, monkeypatch, auxes, strict_producer=False
+    ):
+        """A runner whose `layer.{1..}` are `auxes`, KV cache initialized."""
+        runner = make_model_runner(init_kv_cache=False)
+        runner.is_strict_kv_producer = strict_producer
+        context = runner.compilation_config.static_forward_context
+        for i, module in enumerate(auxes, start=1):
+            monkeypatch.setitem(context, f"layer.{i}", module)
+        runner.initialize_kv_cache(make_kv_cache_config(runner, groups=[("layer.0",)]))
+        return runner
+
+    @staticmethod
+    def _aux(
+        owner,
+        shape=(4, 64),
+        dtype=torch.bfloat16,
+        prefix_cacheable=True,
+        verify_only=False,
+    ):
+        spec = RBLNBlockAuxSpec(
+            owner,
+            shape,
+            dtype,
+            prefix_cacheable=prefix_cacheable,
+            verify_only=verify_only,
+        )
+        return SimpleNamespace(get_aux_cache_spec=lambda _config: spec)
+
+    def _allocate(self, runner, config, monkeypatch, auxes):
+        # GLM-5.3, the one model with aux caches, runs a static KV cache.
+        monkeypatch.setattr(mr, "dynamic_kv_enabled", lambda _config: False)
+        context = runner.compilation_config.static_forward_context
+        for name, module in auxes.items():
+            monkeypatch.setitem(context, name, module)
+        caches: dict = {}
+        bases: dict = {}
+        infos: dict = {}
+        axes: dict = {}
+        runner._allocate_aux_kv_caches(config, caches, bases, infos, axes)
+        return caches, infos, axes
+
+    def test_owners_on_one_extent_share_by_ordinal(
+        self, make_model_runner, monkeypatch
+    ):
+        # Two groups overlay one extent: their layers never hold one block at
+        # once, so an owner's k-th aux cache of a kind shares the other's k-th.
+        runner = make_model_runner(layers=("layer.0", "layer.1"), init_kv_cache=False)
+        config = make_kv_cache_config(runner, groups=[("layer.0",), ("layer.1",)])
+        caches, infos, axes = self._allocate(
+            runner,
+            config,
+            monkeypatch,
+            {
+                "aux.0.a": self._aux("layer.0"),
+                "aux.0.b": self._aux("layer.0"),
+                "aux.1.a": self._aux("layer.1"),
+                "aux.1.f": self._aux("layer.1", dtype=torch.float16),
+            },
+        )
+        assert tuple(caches["aux.0.a"].shape) == (config.num_blocks, 4, 64)
+        assert caches["aux.0.a"] is not caches["aux.0.b"]
+        assert caches["aux.1.a"] is caches["aux.0.a"]
+        assert caches["aux.1.f"].dtype == torch.float16
+        assert infos["aux.1.f"].view_shape == (config.num_blocks, 4, 64)
+        assert set(axes.values()) == {0}
+
+    def test_owners_on_distinct_extents_do_not_share(
+        self, make_model_runner, monkeypatch
+    ):
+        runner = make_model_runner(layers=("layer.0", "layer.1"), init_kv_cache=False)
+        config = make_kv_cache_config(runner, groups=[("layer.0", "layer.1")])
+        caches, _, _ = self._allocate(
+            runner,
+            config,
+            monkeypatch,
+            {"aux.0": self._aux("layer.0"), "aux.1": self._aux("layer.1")},
+        )
+        assert caches["aux.0"] is not caches["aux.1"]
 
 
 class TestHostBufferCopyOp:
@@ -212,10 +496,12 @@ class TestHostBufferCopyOp:
 
 
 class TestRegisterKvCachesWithConnector:
-    """The connector is handed whatever the runner holds when it is called.
+    """The connector is handed the storage the runner holds when it is called.
 
-    The worker calls it after `initialize_kv_cache` on a run that keeps that
-    cache, and again after a dynamic-KV resize has rebuilt every tensor.
+    Each cache goes out as the runner's own tensor, or as a view of it where
+    connectors need another shape. The worker registers after
+    `initialize_kv_cache` on a run that keeps that cache, and again after a
+    dynamic-KV resize has rebuilt every tensor.
     """
 
     @staticmethod
@@ -280,6 +566,33 @@ class TestRegisterKvCachesWithConnector:
             id(t) for t in runner.kv_caches
         ]
 
+    def test_a_flat_cache_is_registered_with_a_unit_trailing_dim(
+        self, make_model_runner, monkeypatch
+    ):
+        # The DSA indexer's fp16 scale cache is allocated [num_blocks,
+        # block_size]. Connectors read every per-token cache with a trailing
+        # width, so they get a [num_blocks, block_size, 1] view of it; the
+        # kernels keep the flat tensor, and every other cache goes out as is.
+        registered = self._registrations(monkeypatch)
+        runner = make_model_runner(
+            layers=("layer.0", "layer.1"),
+            init_kv_cache=False,
+            additional_config={"enable_sub_block_cache": False},
+        )
+        runner.initialize_kv_cache(
+            make_kv_cache_config(runner, groups=[("layer.0", "layer.1")])
+        )
+        flat = torch.zeros(4, 16, dtype=torch.float16)
+        runner.kv_caches[1] = flat
+
+        runner.register_kv_caches_with_connector()
+
+        attn, scale = registered[0].values()
+        assert attn is runner.kv_caches[0]
+        assert tuple(scale.shape) == (4, 16, 1)
+        assert scale.data_ptr() == flat.data_ptr()
+        assert runner.kv_caches[1] is flat
+
     def test_a_rebuilt_cache_is_what_the_second_call_registers(
         self, make_model_runner, monkeypatch
     ):
@@ -332,14 +645,69 @@ class TestBuildAttentionMetadata:
         assert metadata.kv_cache_view_infos is None
 
 
-class TestLayerIndexFollowsCachePosition:
-    """A layer reads its cache by `layer_index` into the runner's cache list.
+class TestGatedDeltaNetOnTheAttentionPool:
+    """A GatedDeltaNet state on the pool of a full-attention cache, with its
+    conv ring beside it: the caches in decoder order, and a step built from
+    each group's own block table over the one base both views share."""
 
-    Construction numbers the layers as if every decoder layer owned
-    `num_attn_module` caches. A layer that owns fewer -- an index-share skip
-    layer with no indexer cache -- shifts every later one, so after binding the
-    runner gives each layer the position the bound list actually has for it.
-    """
+    GDN = "model.layers.0.linear_attn"
+    RING = "model.layers.0.linear_attn.conv_ring"
+    ATTN = "model.layers.1.self_attn.attn"
+
+    @pytest.fixture
+    def runner(self, make_model_runner, tmp_path):
+        # The attention layer is created first; the decoder runs it second.
+        runner, cache_config = _attention_and_gdn(
+            make_model_runner, tmp_path, 256, self.ATTN, self.GDN
+        )
+        with set_current_vllm_config(runner.vllm_config):
+            RBLNGDNBlockAuxCache(
+                self.RING,
+                owner=self.GDN,
+                block_shape=(3, 1, 2, 64),
+                dtype=torch.bfloat16,
+            )
+        runner.initialize_kv_cache(cache_config)
+        return runner
+
+    def test_caches_follow_the_decoder_order(self, runner):
+        names = [self.GDN, self.RING, self.ATTN]
+        assert runner.kv_cache_names == names
+        context = runner.compilation_config.static_forward_context
+        for position, name in enumerate(names):
+            assert runner.kv_cache_positions[name] == position
+            assert runner.kv_caches[position] is context[name].kv_cache
+
+    def test_each_group_builds_from_its_own_block_table(self, runner, monkeypatch):
+        monkeypatch.setattr(
+            mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+        )
+        # A request's (attention blocks, state blocks).
+        runner._update_states(
+            schedule_new("a", "b", block_ids=[([1], [2]), ([3], [1])])
+        )
+        runner.query_start_loc[:3] = torch.tensor([0, 1, 2], dtype=torch.int32)
+        runner.seq_lens[:2] = torch.tensor([4, 4], dtype=torch.int32)
+
+        attn_metadata, _ = runner._build_attention_metadata(
+            num_tokens=2, num_reqs=2, max_query_len=1, num_reqs_padded=4
+        )
+
+        attention, state = attn_metadata[self.ATTN], attn_metadata[self.GDN]
+        assert attention.block_tables[:2, 0].tolist() == [1, 3]
+        assert isinstance(state, RBLNGDNAttentionMetadata)
+        assert state.load_blocks.tolist() == [2, 1, 0, 0]
+        # The two views are recipes over one base, which reaches the graph once.
+        infos = runner.kv_cache_view_infos
+        assert state.kv_cache_view_infos is attention.kv_cache_view_infos is infos
+        state_info, ring_info, attention_info = infos
+        assert state_info.base_index == attention_info.base_index
+        assert state_info.view_shape == attention_info.view_shape
+        assert ring_info.base_index != state_info.base_index
+
+
+class TestCacheNameResolution:
+    """Index-share skip layers own no indexer cache, including after a resize."""
 
     # The fp8 DSA layout, three caches per decoder layer: the attention cache,
     # the indexer's key cache and its fp16 scale cache. Decoder layer 1 shares
@@ -357,24 +725,29 @@ class TestLayerIndexFollowsCachePosition:
     @classmethod
     def _assert_each_layer_reads_its_own_cache(cls, runner) -> None:
         forward_context = runner.compilation_config.static_forward_context
-        positions = []
-        for name in cls.LAYERS:
-            layer = forward_context[name]
-            positions.append(layer.layer_index)
-            assert runner.kv_cache_names[layer.layer_index] == name
-            assert runner.kv_caches[layer.layer_index] is layer.kv_cache
-        # One slot each: no two layers resolve to the same cache.
-        assert sorted(positions) == list(range(len(cls.LAYERS)))
+        metadata = RBLNFlashAttentionMetadata(
+            seq_lens=torch.empty(0), block_tables=torch.empty(0), is_prefill=False
+        )
+        runner.bind_kv_cache_to_metadata(metadata)
+        with set_forward_context(
+            None,
+            runner.vllm_config,
+            **runner.kv_cache_forward_context_kwargs(),
+        ):
+            for name in cls.LAYERS:
+                expected = forward_context[name].kv_cache
+                actual = _resolve_kv_cache(metadata, name)
+                assert actual.shape == expected.shape
+                assert actual.stride() == expected.stride()
+                assert kv_cache_tensor_key(actual) == kv_cache_tensor_key(expected)
 
-    def test_after_initialization_and_after_a_rebind(
-        self, make_model_runner, monkeypatch
-    ):
-        monkeypatch.setattr(mr, "rbln_num_attn_module", lambda *args, **kwargs: 3)
+    @pytest.mark.parametrize("shared", [False, True])
+    def test_after_initialization_and_after_a_rebind(self, make_model_runner, shared):
         runner = make_model_runner(layers=self.LAYERS, init_kv_cache=False)
 
-        runner.initialize_kv_cache(
-            make_kv_cache_config(runner, groups=[(name,) for name in self.LAYERS])
-        )
+        groups = [self.LAYERS[::2], self.LAYERS[1::2]] if shared else [self.LAYERS]
+        runner.initialize_kv_cache(make_kv_cache_config(runner, groups=groups))
+        assert bool(runner.kv_cache_bases) == shared
         self._assert_each_layer_reads_its_own_cache(runner)
 
         # A dynamic-KV resize rebuilds every tensor and binds them again.

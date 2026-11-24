@@ -11,6 +11,7 @@ declare -A group_paths=(
   [dp]=tests/vllm/distributed
   [specdec]=tests/vllm/v1/spec_decode
   [core]=tests/vllm/v1/core
+  [sample]=tests/vllm/v1/sample
 )
 
 paths=(tests/vllm)
@@ -33,6 +34,16 @@ if [ "${1:-}" = "--group" ]; then
   fi
   LANE_NAME="${LANE_NAME}-$group"
   shift 2
+fi
+
+# Generated jobs pass pytest node IDs after -- in place of the group directory.
+if [ "${1:-}" = "--" ]; then
+  shift
+  if [ "$#" -eq 0 ] || [[ "$1" = -* ]]; then
+    echo "-- requires at least one test node ID" >&2
+    exit 2
+  fi
+  paths=()
 fi
 
 args=(

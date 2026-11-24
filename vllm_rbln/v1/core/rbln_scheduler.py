@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -15,12 +15,18 @@
 import itertools
 import time
 from collections import deque
+from collections.abc import Iterator
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any
 
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
+from vllm.model_executor.model_loader.utils import get_model_architecture
 from vllm.utils.hashing import get_hash_fn_by_name
+from vllm.utils.math_utils import cdiv
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import init_none_hash
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
@@ -38,7 +44,14 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_rbln.config import RBLNConfig
+from vllm_rbln.distributed.ec_transfer.ec_connector.rbln_ec_cpu_connector import (
+    RblnECCPUConnector,
+)
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import iter_kv_connectors
 from vllm_rbln.logger import init_logger
+from vllm_rbln.model_executor.models.interfaces import (
+    supports_rbln_multimodal_embeddings,
+)
 from vllm_rbln.v1.core.rbln_kv_cache_manager import (
     KVCacheCopyOp,
     RBLNKVCacheManager,
@@ -47,12 +60,50 @@ from vllm_rbln.v1.core.rbln_kv_cache_manager import (
 from vllm_rbln.v1.core.utils import (
     DecodeBatchBudget,
     is_prefill,
+    is_strict_kv_producer,
     num_base_tokens,
     should_defer_spec_step,
     sub_block_size_in_use,
 )
+from vllm_rbln.v1.kv_cache import RBLNMambaManager
 
 logger = init_logger(__name__)
+
+
+class RBLNEncoderCacheManager(EncoderCacheManager):
+    """Defers runner hits evicted by an earlier input in the scheduling pass."""
+
+    def __init__(self, cache_size: int) -> None:
+        super().__init__(cache_size)
+        self._initial_cache_hits: set[str] = set()
+
+    @contextmanager
+    def eviction_snapshot(self, request: Request) -> Iterator[None]:
+        # Hits remain evictable; an evicted hit must wait for transfer admission
+        # on the next step instead of being re-encoded during this pass.
+        self._initial_cache_hits = {
+            feature.identifier
+            for i, feature in enumerate(request.mm_features)
+            if self.get_cached_num_encoder_embeds(request, i) is not None
+        }
+        try:
+            yield
+        finally:
+            self._initial_cache_hits.clear()
+
+    def can_allocate(
+        self,
+        request: Request,
+        input_id: int,
+        encoder_compute_budget: int,
+        num_embeds_to_schedule: int,
+    ) -> bool:
+        mm_hash = request.mm_features[input_id].identifier
+        if mm_hash in self._initial_cache_hits and mm_hash not in self.cached:
+            return False
+        return super().can_allocate(
+            request, input_id, encoder_compute_budget, num_embeds_to_schedule
+        )
 
 
 @dataclass
@@ -64,6 +115,8 @@ class RBLNSchedulerOutput(SchedulerOutput):
 
 
 class RBLNScheduler(Scheduler):
+    encoder_cache_manager: EncoderCacheManager
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
 
@@ -71,7 +124,48 @@ class RBLNScheduler(Scheduler):
             self.num_lookahead_tokens, self.num_spec_tokens
         )
 
+        self.mm_prefill_lookahead = 0
+        if (
+            self.num_prefill_lookahead
+            and self.vllm_config.model_config.supports_multimodal_inputs
+        ):
+            spec = self.vllm_config.speculative_config
+            assert spec is not None
+            draft_cls, _ = get_model_architecture(spec.draft_model_config)
+            if supports_rbln_multimodal_embeddings(draft_cls):
+                self.mm_prefill_lookahead = self.num_prefill_lookahead
+
+        if self.mm_prefill_lookahead:
+            if self.mm_prefill_lookahead != 1:
+                raise NotImplementedError(
+                    "Multimodal drafting requires num_prefill_lookahead_tokens=1; "
+                    f"got {self.mm_prefill_lookahead}. Multi-module multimodal "
+                    "MTP is not supported."
+                )
+            # One-token lookahead can add a whole encoder item to the baseline
+            # demand. Each allowance already fits the largest item, so doubling
+            # provides a conservative bound.
+            encoder_compute_budget = self.max_num_encoder_input_tokens
+            self.max_num_encoder_input_tokens *= 2
+            manager = self.encoder_cache_manager
+            self.encoder_cache_manager = manager.create_manager(
+                cache_size=2 * manager.cache_size, vllm_config=self.vllm_config
+            )
+            logger.info(
+                "Multimodal draft prefill lookahead=%d: "
+                "max_num_encoder_input_tokens=%d -> %d, "
+                "encoder_cache_size=%d -> %d (embedding rows).",
+                self.mm_prefill_lookahead,
+                encoder_compute_budget,
+                self.max_num_encoder_input_tokens,
+                manager.cache_size,
+                self.encoder_cache_manager.cache_size,
+            )
+
         rbln_config: RBLNConfig = self.vllm_config.additional_config
+
+        prefill_chunk_sizes = rbln_config.prefill_chunk_size
+        assert prefill_chunk_sizes is not None  # resolved at start-up
 
         # Replace the upstream KVCacheManager with RBLNKVCacheManager
         # when sub-block prefix caching is enabled.
@@ -79,8 +173,10 @@ class RBLNScheduler(Scheduler):
             enable_prefix_caching=self.cache_config.enable_prefix_caching,
             sub_block_cache=rbln_config.enable_sub_block_cache,
             block_size=self.block_size,
-            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+            prefill_chunk_sizes=prefill_chunk_sizes,
             kv_cache_config=self.kv_cache_config,
+            model_config=self.vllm_config.model_config,
+            cache_dtype=self.cache_config.cache_dtype,
             sub_block_size=rbln_config.sub_block_size,
         )
         if sub_block_size is not None:
@@ -90,8 +186,9 @@ class RBLNScheduler(Scheduler):
             self.kv_cache_manager = RBLNKVCacheManager(
                 kv_cache_config=self.kv_cache_config,
                 max_model_len=self.max_model_len,
+                max_in_flight_tokens=self.vllm_config.max_in_flight_tokens,
                 scheduler_block_size=self.block_size,
-                hash_block_size=self.block_size,
+                hash_block_size=self.hash_block_size,
                 sub_block_size=sub_block_size,
                 hash_fn=hash_fn,
                 use_eagle=self.use_eagle,
@@ -115,6 +212,22 @@ class RBLNScheduler(Scheduler):
                     "sub_block_size=%d.",
                     sub_block_size,
                 )
+        elif self.hash_block_size < self.block_size:
+            logger.info(
+                "Fine-grained prefix caching enabled: block_size=%d, "
+                "prefix_match_unit=%d",
+                self.block_size,
+                self.hash_block_size,
+            )
+        elif (
+            self.cache_config.enable_prefix_caching
+            and rbln_config.enable_sub_block_cache
+        ):
+            logger.warning(
+                "Sub-block prefix caching off: block_size=%d, prefill_chunk_size=%s",
+                self.block_size,
+                prefill_chunk_sizes,
+            )
 
         # NOTE(RBLN): Block deltas already committed in the KV cache manager
         # but not yet delivered to the model runner because the request was
@@ -129,6 +242,81 @@ class RBLNScheduler(Scheduler):
         # ceil(demand / pp) to spread decodes across microbatches. pp == 1 makes
         # the soft cap a no-op. See v1/core/utils.py.
         self._pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
+        self._strict_kv_producer = is_strict_kv_producer(self.vllm_config)
+
+        self._prefill_chunk_size = rbln_config.max_prefill_chunk_size
+        self._is_mm_prefix_lm = self.vllm_config.model_config.is_mm_prefix_lm
+
+        # NOTE(RBLN): a prompt's block-boundary state is kept by a producer and
+        # allocated by a consumer only where the connector scheduler exchanges
+        # it (`sends_state_boundary`). The connector may sit in a MultiConnector.
+        sends_state_boundary = self.connector is not None and any(
+            getattr(
+                getattr(leaf, "connector_scheduler", None),
+                "sends_state_boundary",
+                False,
+            )
+            for leaf in iter_kv_connectors(self.connector)
+        )
+        self._state_transfer_managers = (
+            [
+                manager
+                for manager in self.kv_cache_manager.coordinator.single_type_managers
+                if isinstance(manager, RBLNMambaManager)
+            ]
+            if sends_state_boundary
+            else []
+        )
+
+        # NOTE(RBLN): the sparse-attention ops (DSA MLA / indexer, MiniMax-M3
+        # MSA / indexer, GLM5 MLA / indexer) and the dense in-memory ones
+        # (flash_causal_attention_naive, flash_attention_naive,
+        # paged_flash_causal_mla_naive) get NULL_BLOCK_ID as null_block_id and
+        # write their context-parallel cache store's unowned rows there, so the
+        # block the pool reserves has to be that one. Checked once the KV cache
+        # manager is final (it may be swapped above).
+        null_block_id = self.kv_cache_manager.block_pool.null_block.block_id
+        if null_block_id != NULL_BLOCK_ID:
+            raise RuntimeError(
+                f"vLLM's null block is {null_block_id}, not NULL_BLOCK_ID "
+                f"({NULL_BLOCK_ID}); the RBLN attention cache store writes "
+                "to NULL_BLOCK_ID and would corrupt a live block."
+            )
+
+    def _mm_prefix_split(
+        self, request: Request, num_computed_tokens: int, num_new_tokens: int
+    ) -> int:
+        """Tokens to schedule so that no image or video-frame range straddles two
+        steps: the chunk ends before a range it would cut, and a chunk resuming
+        inside a range runs past its end, since a one-token step reads as a decode.
+        """
+        end = num_computed_tokens + num_new_tokens
+        resumed_last = None
+        for feature in request.mm_features:
+            if feature.modality not in ("image", "video"):
+                continue
+            for first, last in feature.mm_position.extract_embeds_range():
+                if first < num_computed_tokens <= last:
+                    resumed_last = last
+                elif num_computed_tokens <= first < end <= last:
+                    assert first > num_computed_tokens, (
+                        f"an mm prefix range of {last + 1 - first} tokens does not "
+                        f"fit the {num_new_tokens}-token step"
+                    )
+                    end = first
+        assert resumed_last is None or end > resumed_last + 1, (
+            "a step resuming inside an mm prefix range must run past it"
+        )
+        return end - num_computed_tokens
+
+    def _splits_on_mm_prefix(self, request: Request) -> bool:
+        # Past the prompt, every range is behind the cursor; a preempted request
+        # recomputes from 0 and is cut again.
+        return (
+            self._is_mm_prefix_lm
+            and request.has_encoder_inputs
+            and request.num_computed_tokens < request.num_prompt_tokens
+        )
 
     def _decode_demand(self) -> int:
         """Total decode demand for this step's soft (ceil(demand/pp)) cap.
@@ -141,7 +329,11 @@ class RBLNScheduler(Scheduler):
         running), so this snapshot is exact even as the running/ready split
         shifts during the waiting loop.
         """
-        num_running_decodes = sum(1 for r in self.running if not is_prefill(r))
+        num_running_decodes = sum(
+            1
+            for r in self.running
+            if not is_prefill(r, strict_kv_producer=self._strict_kv_producer)
+        )
         num_ready_remote_kv = len(self.finished_recving_kv_req_ids)
         return num_running_decodes + num_ready_remote_kv
 
@@ -245,7 +437,10 @@ class RBLNScheduler(Scheduler):
         # section in v1/core/utils.py.
         req_index = (
             len(self.running) - 1
-            if self.running and is_prefill(self.running[-1])
+            if self.running
+            and is_prefill(
+                self.running[-1], strict_kv_producer=self._strict_kv_producer
+            )
             else 0
         )
         while req_index < len(self.running) and token_budget > 0:
@@ -267,6 +462,12 @@ class RBLNScheduler(Scheduler):
                 req_index += 1
                 continue
 
+            if self._ec_transfer_pending(
+                request, request.num_computed_tokens - request.num_output_placeholders
+            ):
+                req_index += 1
+                continue
+
             num_new_tokens = (
                 request.num_tokens_with_spec
                 + request.num_output_placeholders
@@ -285,13 +486,20 @@ class RBLNScheduler(Scheduler):
                 continue
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
-            num_new_tokens = min(num_new_tokens, token_budget)
+            num_new_tokens = min(num_new_tokens, self._prefill_chunk_size, token_budget)
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
             num_new_tokens = min(
                 num_new_tokens, self.max_model_len - 1 - request.num_computed_tokens
             )
+
+            # Cut before scheduling encoder inputs, so that only the items this
+            # chunk overlaps are scheduled.
+            if self._splits_on_mm_prefix(request):
+                num_new_tokens = self._mm_prefix_split(
+                    request, request.num_computed_tokens, num_new_tokens
+                )
 
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
@@ -308,7 +516,7 @@ class RBLNScheduler(Scheduler):
                     request.num_computed_tokens,
                     num_new_tokens,
                     encoder_compute_budget,
-                    shift_computed_tokens=1 if self.use_eagle else 0,
+                    shift_computed_tokens=self.mm_prefill_lookahead,
                 )
 
             if self.need_mamba_block_aligned_split:
@@ -461,7 +669,13 @@ class RBLNScheduler(Scheduler):
         if (
             not preempted_reqs
             and self._pause_state == PauseState.UNPAUSED
-            and not (scheduled_running_reqs and is_prefill(scheduled_running_reqs[0]))
+            and not (
+                scheduled_running_reqs
+                and is_prefill(
+                    scheduled_running_reqs[0],
+                    strict_kv_producer=self._strict_kv_producer,
+                )
+            )
         ):
             # NOTE(RBLN): refresh the token budget to determine whether we can schedule
             # new prefill requests into the running batch.
@@ -596,6 +810,19 @@ class RBLNScheduler(Scheduler):
                     )
                     assert num_computed_tokens <= request.num_tokens
 
+                    # Skip request with pending mm encoding prefetches
+                    if self._ec_transfer_pending(request, num_computed_tokens):
+                        # NOTE(RBLN): the next request overwrites the match, so
+                        # release it here.
+                        if sub_block_match is not None:
+                            assert isinstance(self.kv_cache_manager, RBLNKVCacheManager)
+                            self.kv_cache_manager.release_sub_block_match(
+                                sub_block_match
+                            )
+                            sub_block_match = None
+                        skip_request(request_queue)
+                        continue
+
                     # Track first scheduled prefill, not post-preemption repeat prefills
                     if request.prefill_stats is not None:
                         assert num_computed_tokens <= request.num_prompt_tokens
@@ -615,6 +842,10 @@ class RBLNScheduler(Scheduler):
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
 
+                    if self._ec_transfer_pending(request, num_computed_tokens):
+                        skip_request(request_queue)
+                        continue
+
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
                 new_encoder_compute_budget = encoder_compute_budget
@@ -632,6 +863,7 @@ class RBLNScheduler(Scheduler):
                     threshold = self.scheduler_config.long_prefill_token_threshold
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
+                    num_new_tokens = min(num_new_tokens, self._prefill_chunk_size)
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
@@ -653,7 +885,9 @@ class RBLNScheduler(Scheduler):
                     num_new_tokens = min(num_new_tokens, prefill_token_budget)
                     assert num_new_tokens > 0
 
-                    if is_prefill(request) and (
+                    if is_prefill(
+                        request, strict_kv_producer=self._strict_kv_producer
+                    ) and (
                         len(scheduled_new_reqs) > 0 or len(scheduled_resumed_reqs) > 0
                     ):
                         # NOTE(RBLN): Only a request that will run as a LOCAL prefill
@@ -671,6 +905,11 @@ class RBLNScheduler(Scheduler):
                         # (see the step-phase section in v1/core/utils.py).
                         break
 
+                    if self._splits_on_mm_prefix(request):
+                        num_new_tokens = self._mm_prefix_split(
+                            request, num_computed_tokens, num_new_tokens
+                        )
+
                     # Schedule encoder inputs.
                     if request.has_encoder_inputs:
                         (
@@ -683,13 +922,16 @@ class RBLNScheduler(Scheduler):
                             num_computed_tokens,
                             num_new_tokens,
                             encoder_compute_budget,
-                            shift_computed_tokens=1 if self.use_eagle else 0,
+                            shift_computed_tokens=self.mm_prefill_lookahead,
                         )
                         if num_new_tokens == 0:
                             # The request cannot be scheduled.
                             break
 
-                if self.need_mamba_block_aligned_split:
+                # NOTE(RBLN): an async remote load computes no chunk this step, so
+                # the split would clip its 0 tokens to 0 and break before
+                # allocation, leaving the request in WAITING forever.
+                if self.need_mamba_block_aligned_split and not load_kv_async:
                     num_new_tokens = self._mamba_block_aligned_split(
                         request,
                         num_new_tokens,
@@ -721,27 +963,49 @@ class RBLNScheduler(Scheduler):
                         for i in encoder_inputs_to_schedule
                     )
 
-                new_blocks = self.kv_cache_manager.allocate_slots(
+                # NOTE(RBLN): before the admission check and allocate_slots,
+                # whose get_num_blocks_to_allocate counts the boundary block
+                # noted here.
+                for manager in self._state_transfer_managers:
+                    manager.track_transfer(
+                        request,
+                        num_new_local_computed_tokens,
+                        num_external_computed_tokens,
+                    )
+
+                new_blocks = None
+                if self._fits_first_decode_step(
                     request,
-                    # Sub-block tokens count as tokens to compute, never as
-                    # computed: upstream contracts the computed count to
-                    # len(new_computed_blocks) * block_size, and a count that is
-                    # not block-aligned tells it the tail block is shared, so it
-                    # CoWs a block we never handed it. Only the sum is used.
-                    num_new_tokens + num_sub_block_tokens,
-                    num_new_computed_tokens=num_new_local_computed_tokens,
-                    new_computed_blocks=new_computed_blocks,
-                    num_lookahead_tokens=effective_lookahead_tokens,
+                    new_computed_blocks,
+                    num_new_local_computed_tokens=num_new_local_computed_tokens,
                     num_external_computed_tokens=num_external_computed_tokens,
                     num_encoder_tokens=num_encoder_tokens,
-                    # NOTE(RBLN): Cache blocks only after scheduling is finalized.
-                    delay_cache_blocks=True,
-                    has_scheduled_reqs=bool(self.running),
-                    # NOTE(RBLN): Even when chunked prefill is enabled, we should
-                    # schedule a new prefill request only if there is enough
-                    # KV cache space to accommodate the full token count.
-                    full_sequence_must_fit=True,
-                )
+                    num_lookahead_tokens=effective_lookahead_tokens,
+                ):
+                    new_blocks = self.kv_cache_manager.allocate_slots(
+                        request,
+                        # Sub-block tokens count as tokens to compute, never as
+                        # computed: upstream contracts the computed count to
+                        # len(new_computed_blocks) * block_size, and a count that
+                        # is not block-aligned tells it the tail block is shared,
+                        # so it CoWs a block we never handed it. Only the sum is
+                        # used.
+                        num_new_tokens + num_sub_block_tokens,
+                        num_new_computed_tokens=num_new_local_computed_tokens,
+                        new_computed_blocks=new_computed_blocks,
+                        num_lookahead_tokens=effective_lookahead_tokens,
+                        num_external_computed_tokens=num_external_computed_tokens,
+                        num_encoder_tokens=num_encoder_tokens,
+                        # NOTE(RBLN): Cache blocks only after scheduling is
+                        # finalized.
+                        delay_cache_blocks=True,
+                        has_scheduled_reqs=bool(self.running),
+                        # NOTE(RBLN): Even when chunked prefill is enabled, we
+                        # should schedule a new prefill request only if there is
+                        # enough KV cache space to accommodate the full token
+                        # count.
+                        full_sequence_must_fit=True,
+                    )
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
@@ -847,7 +1111,7 @@ class RBLNScheduler(Scheduler):
                         if self.ec_connector is not None:
                             self.ec_connector.update_state_after_alloc(request, i)
 
-                if not is_prefill(request):
+                if not is_prefill(request, strict_kv_producer=self._strict_kv_producer):
                     # NOTE(RBLN): A decode-ready request joins the decode batch
                     # here, regardless of how it became decode-ready -- a FULL
                     # remote-KV match promoted from WAITING_FOR_REMOTE_KVS, a full
@@ -856,10 +1120,10 @@ class RBLNScheduler(Scheduler):
                     # the no-mixed-batching eviction block below and runs as a lone
                     # prefill, reaching decode via the running loop on a later step.)
                     #
-                    # is_prefill is False here, so num_computed == num_tokens - 1
-                    # and (given the earlier `assert num_new_tokens > 0`)
-                    # num_new_tokens == 1 -- the single-token decode precondition.
-                    # Kept as a sanity check.
+                    # On a decoding role is_prefill is False only at
+                    # num_computed == num_tokens - 1, so num_new_tokens == 1 given
+                    # the earlier `assert num_new_tokens > 0`. A producer widens
+                    # is_prefill past this branch and never arrives. Sanity check.
                     assert num_new_tokens == 1, (
                         f"decode-ready request {request_id} has "
                         f"num_new_tokens={num_new_tokens} (expected 1)."
@@ -988,6 +1252,14 @@ class RBLNScheduler(Scheduler):
             else None
         )
 
+        kv_cache_block_copies, cow_retained_blocks = (
+            self.kv_cache_manager.take_kv_cache_block_copies()
+        )
+        if kv_cache_block_copies:
+            # The copies run with this step, the first non-empty one at or after
+            # it (seq sched_step_seq + 1).
+            self._free_cow_retained_blocks(cow_retained_blocks, self.sched_step_seq + 1)
+
         scheduler_output = RBLNSchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -1005,6 +1277,7 @@ class RBLNScheduler(Scheduler):
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
             has_sync_kv_loads=has_sync_kv_loads,
+            kv_cache_block_copies=kv_cache_block_copies or None,
         )
 
         # Drain pending copy ops from the KV cache manager.
@@ -1122,6 +1395,175 @@ class RBLNScheduler(Scheduler):
                 )
 
         return result
+
+    def _ec_transfer_pending(self, request: Request, num_computed_tokens: int) -> bool:
+        connector = self.ec_connector
+        if (
+            not isinstance(connector, RblnECCPUConnector)
+            or not isinstance(self.encoder_cache_manager, RBLNEncoderCacheManager)
+            or not request.mm_features
+        ):
+            return super()._ec_transfer_pending(request, num_computed_tokens)
+        # NOTE(RBLN): local_cache_hashes identifies inputs already in the runner
+        # cache so the connector skips their transfers even if its cache lacks them.
+        local_cache_hashes = set()
+        if not self.is_encoder_decoder:
+            for i, feature in enumerate(request.mm_features):
+                pos = feature.mm_position
+                if pos.offset + pos.length <= num_computed_tokens:
+                    continue
+                cached_num_embeds = (
+                    self.encoder_cache_manager.get_cached_num_encoder_embeds(request, i)
+                )
+                if cached_num_embeds == request.get_num_encoder_embeds(i):
+                    local_cache_hashes.add(feature.identifier)
+        return not connector.ensure_cache_available(
+            request, num_computed_tokens, local_cache_hashes=local_cache_hashes
+        )
+
+    def _free_encoder_inputs(self, request: Request) -> None:
+        # Drafting finishes before the scheduler processes the step's output;
+        # retain each item until the target has also consumed it.
+        if self.is_encoder_decoder:
+            super()._free_encoder_inputs(request)
+            return
+        num_computed = request.num_computed_tokens - request.num_output_placeholders
+        for input_id in list(self.encoder_cache_manager.get_cached_input_ids(request)):
+            pos = request.mm_features[input_id].mm_position
+            if pos.offset + pos.length <= num_computed:
+                self._free_encoder_input(request, input_id)
+
+    def _try_schedule_encoder_inputs(
+        self,
+        request: Request,
+        num_computed_tokens: int,
+        num_new_tokens: int,
+        encoder_compute_budget: int,
+        shift_computed_tokens: int = 0,
+    ) -> tuple[list[int], int, int, list[int]]:
+        cache_manager = self.encoder_cache_manager
+        connector = self.ec_connector
+        eviction_snapshot: AbstractContextManager[None] = nullcontext()
+        if (
+            isinstance(cache_manager, RBLNEncoderCacheManager)
+            and isinstance(connector, RblnECCPUConnector)
+            and request.ec_transfer_params
+        ):
+            eviction_snapshot = cache_manager.eviction_snapshot(request)
+        with eviction_snapshot:
+            (
+                encoder_inputs_to_schedule,
+                adjusted_num_new_tokens,
+                adjusted_encoder_compute_budget,
+                external_load_encoder_input,
+            ) = super()._try_schedule_encoder_inputs(
+                request,
+                num_computed_tokens,
+                num_new_tokens,
+                encoder_compute_budget,
+                shift_computed_tokens,
+            )
+        # NOTE(RBLN): upstream skips EC saves on runner-cache hits.
+        # Reserve saves for outputs missing from the shared-memory cache.
+        if (
+            isinstance(connector, RblnECCPUConnector)
+            and connector.is_producer
+            and not self.is_encoder_decoder
+            and adjusted_num_new_tokens > 0
+        ):
+            window_end = (
+                num_computed_tokens + adjusted_num_new_tokens + shift_computed_tokens
+            )
+            for i, feature in enumerate(request.mm_features):
+                pos = feature.mm_position
+                if (
+                    pos.offset >= window_end
+                    or pos.offset + pos.length <= num_computed_tokens
+                ):
+                    continue
+                cached_num_embeds = (
+                    self.encoder_cache_manager.get_cached_num_encoder_embeds(request, i)
+                )
+                if cached_num_embeds == request.get_num_encoder_embeds(i):
+                    connector.update_state_after_cache_hit(request, i)
+        if not (
+            encoder_inputs_to_schedule
+            and connector is not None
+            and connector.is_consumer
+            and not connector.is_producer
+        ):
+            return (
+                encoder_inputs_to_schedule,
+                adjusted_num_new_tokens,
+                adjusted_encoder_compute_budget,
+                external_load_encoder_input,
+            )
+        # NOTE(RBLN): an EC consumer compiles no vision encoder, so an image the
+        # connector cannot supply fails the request; upstream encodes it locally.
+        # update_from_output() fails every request in encoder_cache_mismatch_reqs.
+        logger.error(
+            "EC consumer: request %s has an image the EC connector cannot supply, "
+            "and this instance compiles no vision encoder; failing the request.",
+            request.request_id,
+        )
+        self.encoder_cache_mismatch_reqs.add(request.request_id)
+        return [], 0, encoder_compute_budget, []
+
+    def _fits_first_decode_step(
+        self,
+        request: Request,
+        new_computed_blocks: KVCacheBlocks,
+        *,
+        num_new_local_computed_tokens: int,
+        num_external_computed_tokens: int,
+        num_encoder_tokens: int,
+        num_lookahead_tokens: int,
+    ) -> bool:
+        """Whether the free blocks hold ``request`` through its first spec
+        decode step: the sampled and draft tokens after the prompt, plus the
+        lookahead.
+
+        An admitted prefill runs alone to completion (no mixed batching), so it
+        must not be admitted short of that step: it would preempt itself there
+        and its re-admission would evict the decodes again. The full-sequence
+        gate in ``allocate_slots`` counts the prompt alone; this is the same
+        count carried through that step.
+        """
+        if not self.num_spec_tokens:
+            return True
+        manager = self.kv_cache_manager
+        hit_blocks = list(new_computed_blocks.blocks)
+        for group_id in manager.retained_hit_group_ids:
+            hit_blocks[group_id] = hit_blocks[group_id][
+                : cdiv(
+                    num_new_local_computed_tokens + num_external_computed_tokens,
+                    manager.coordinator.single_type_managers[group_id].block_size,
+                )
+            ]
+        num_local_computed_tokens = (
+            request.num_computed_tokens + num_new_local_computed_tokens
+        )
+        num_tokens_main_model = min(
+            request.num_tokens + 1 + self.num_spec_tokens, self.max_model_len
+        )
+        num_blocks = manager.coordinator.get_num_blocks_to_allocate(
+            request_id=request.request_id,
+            num_tokens=min(
+                num_tokens_main_model + num_lookahead_tokens, self.max_model_len
+            ),
+            new_computed_blocks=tuple(hit_blocks),
+            num_encoder_tokens=num_encoder_tokens,
+            total_computed_tokens=min(
+                num_local_computed_tokens + num_external_computed_tokens,
+                self.max_model_len,
+            ),
+            num_local_computed_tokens=num_local_computed_tokens,
+            num_tokens_main_model=num_tokens_main_model,
+            apply_admission_cap=True,
+            prefill_end=max(request.num_prompt_tokens, request.num_tokens - 1),
+        )
+        watermark_blocks = manager.watermark_blocks if self.running else 0
+        return num_blocks + watermark_blocks <= manager.block_pool.get_num_free_blocks()
 
     def _try_sub_block_match(
         self,

@@ -1,0 +1,200 @@
+# Copyright 2026 Rebellions Inc. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at:
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from itertools import islice
+
+import torch
+import torch.nn.functional as F
+from vllm.config import VllmConfig
+from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.models.gemma4 import (
+    Gemma4DecoderLayer,
+    Gemma4MLP,
+    Gemma4Model,
+)
+
+from vllm_rbln.patches import register_patch
+from vllm_rbln.patches.registry import add_registration
+from vllm_rbln.utils import is_prefill_step
+
+
+@register_patch(
+    target="vllm.model_executor.models.config.Gemma4Config.verify_and_update_config",
+    reason=(
+        "Upstream picks a CUDA attention backend for Gemma4's mixed head sizes "
+        "(256 sliding, 512 full) and falls back to TRITON_ATTN when FA4 is "
+        "missing, which RBLN refuses. RBLN's one backend serves both sizes, and "
+        "the hook runs inside VllmConfig.__post_init__, before any platform hook "
+        "could undo the choice."
+    ),
+)
+def keep_the_rbln_attention_backend(vllm_config: VllmConfig) -> None:
+    """Leave the attention backend to the RBLN platform."""
+
+
+def _read(norm, residual: torch.Tensor, cut: bool) -> torch.Tensor:
+    """The next block's input: RMSNorm(residual), on the cut op when `cut`."""
+    if cut:
+        return torch.ops.rbln_custom_ops.residual_read(
+            residual, norm.weight, norm.variance_epsilon
+        )
+    return norm(residual)
+
+
+def _write(norm, residual: torch.Tensor, y: torch.Tensor, cut: bool) -> torch.Tensor:
+    """residual + RMSNorm(y), on the cut op when `cut`; each norm passes its own eps."""
+    if cut:
+        return torch.ops.rbln_custom_ops.gemma4_dense_residual_write(
+            residual, y, norm.weight, norm.variance_epsilon
+        )
+    return norm(y) + residual
+
+
+@register_patch(
+    target="vllm.model_executor.models.gemma4.Gemma4DecoderLayer.forward",
+    reason=(
+        "Gemma4 routes on the residual and hands upstream's MoE runner precomputed "
+        "logits; RBLNMoERunner takes a router callable, as the patched "
+        "qwen/deepseek/minimax/gpt-oss MoE blocks pass it. Upstream also cannot keep "
+        "a dense layer's residual split across chiplets: its adds and norms run as "
+        "rbln_custom_ops::{residual_read,gemma4_dense_residual_write}, which the "
+        "compiler cuts by tokens or by batch rows."
+    ),
+)
+def patched_gemma4_decoder_layer_forward(
+    self: Gemma4DecoderLayer,
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor | None,
+    per_layer_input: torch.Tensor | None = None,
+    **kwargs,
+) -> tuple[torch.Tensor, None]:
+    # The two dense ops cover one read and one write per block; a MoE layer reads
+    # the residual again for the router and a per-layer input adds to it before
+    # the scalar. The layer scalar stays upstream's multiply, so it runs on each
+    # chiplet's token slice and remains a constant the decode graph shares.
+    cut = not self.enable_moe_block and per_layer_input is None
+    residual = hidden_states
+    hidden_states = _read(self.input_layernorm, residual, cut)
+    hidden_states = self.self_attn(
+        positions=positions, hidden_states=hidden_states, **kwargs
+    )
+    hidden_states = _write(self.post_attention_layernorm, residual, hidden_states, cut)
+    residual = hidden_states
+
+    hidden_states = _read(self.pre_feedforward_layernorm, hidden_states, cut)
+    hidden_states = self.mlp(hidden_states)
+
+    if self.enable_moe_block:
+        hidden_states_1 = self.post_feedforward_layernorm_1(hidden_states)
+        hidden_states_2 = self.pre_feedforward_layernorm_2(residual)
+        router_logits = self.router(residual)
+        # The logits ignore the runner's input, so they would miss its DP
+        # multicast; RBLNGemma4ForConditionalGeneration refuses DP.
+        hidden_states_2 = self.experts(
+            hidden_states=hidden_states_2, router=lambda _: router_logits
+        )
+        hidden_states_2 = self.post_feedforward_layernorm_2(hidden_states_2)
+        hidden_states = hidden_states_1 + hidden_states_2
+
+    hidden_states = _write(
+        self.post_feedforward_layernorm, residual, hidden_states, cut
+    )
+
+    if per_layer_input is not None and self.per_layer_input_gate is not None:
+        gate = self.per_layer_input_gate(hidden_states)
+        gate = torch.nn.functional.gelu(gate, approximate="tanh")
+        per_layer_contribution = self.per_layer_projection(gate * per_layer_input)
+        hidden_states = hidden_states + self.post_per_layer_input_norm(
+            per_layer_contribution
+        )
+
+    return hidden_states * self.layer_scalar, None
+
+
+class ResidualReadNorm(RMSNorm):
+    """Gemma4's final norm, as rbln_custom_ops::residual_read in decode, where
+    the compiler cuts the residual by batch rows. The read gathers the rows;
+    left cut, they would reach lm_head, whose weight is embed_tokens' and takes
+    the layout prefill gives it."""
+
+    def forward(
+        self, x: torch.Tensor, residual: torch.Tensor | None = None
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if not is_prefill_step():
+            # The patched layers carry the residual in hidden_states.
+            assert residual is None
+            return torch.ops.rbln_custom_ops.residual_read(
+                x, self.weight, self.variance_epsilon
+            )
+        return super().forward(x, residual)
+
+
+_original_gemma4_model_init = Gemma4Model.__init__
+
+
+@register_patch(
+    target="vllm.model_executor.models.gemma4.Gemma4Model.__init__",
+    reason=(
+        "Upstream's final norm takes the layout the last layer leaves. A dense "
+        "layer without per-layer inputs leaves the decode residual cut by batch "
+        "rows, which must be gathered before lm_head shares embed_tokens' weight "
+        "with prefill, so a model with such a layer reads its final norm on "
+        "rbln_custom_ops::residual_read."
+    ),
+)
+def patched_gemma4_model_init(
+    self: Gemma4Model, *, vllm_config: VllmConfig, prefix: str = ""
+) -> None:
+    _original_gemma4_model_init(self, vllm_config=vllm_config, prefix=prefix)
+    layers = islice(self.layers, self.start_layer, self.end_layer)
+    if any(
+        not layer.enable_moe_block and not layer.hidden_size_per_layer_input
+        for layer in layers
+    ):
+        self.norm = ResidualReadNorm(
+            self.norm.hidden_size, eps=self.norm.variance_epsilon
+        )
+
+
+@add_registration(
+    reason=(
+        "Upstream's Gemma4ForConditionalGeneration merges image embeddings "
+        "outside forward() and runs its vision tower through HF's dynamic "
+        "attention dispatch. The RBLN subclass merges them in the compiled "
+        "graph and compiles the tower at one patch count."
+    )
+)
+def register_gemma4() -> None:
+    from vllm.model_executor.models import ModelRegistry
+
+    ModelRegistry.register_model(
+        "Gemma4ForConditionalGeneration",
+        "vllm_rbln.model_executor.models.gemma4:RBLNGemma4ForConditionalGeneration",
+    )
+
+
+@register_patch(
+    target="vllm.model_executor.models.gemma4.Gemma4MLP.forward",
+    reason=(
+        "Upstream halves one merged gate_up matmul; separate gate and up "
+        "matmuls compile better on RBLN. RBLNGemma4 splits the weight at load "
+        "(split_gate_up_weights) and this forward runs the two halves."
+    ),
+)
+def split_gate_up_mlp_forward(self: Gemma4MLP, x: torch.Tensor) -> torch.Tensor:
+    gate = F.linear(x, self.gate_weight)
+    up = F.linear(x, self.up_weight)
+    x, _ = self.down_proj(F.gelu(gate, approximate=self.act_fn.approximate) * up)
+    return x

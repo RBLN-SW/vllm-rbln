@@ -1,22 +1,32 @@
 env:
-  UV_CACHE_DIR: "/root/.cache/uv"
+  UV_CACHE_DIR: "/mnt/uv_cache"
   UV_LINK_MODE: "symlink"
   UV_INDEX_STRATEGY: "unsafe-best-match"
   # Only the cron schedule sets this, so a manual or re-run build exercises the
   # lanes without publishing. Declared here so build.env sees the name either way.
   NIGHTLY_DEPLOY: "${NIGHTLY_DEPLOY:-}"
+  NIGHTLY_REPORT: "${NIGHTLY_REPORT:-}"
+  SLACK_REPORT_CHANNEL: "${SLACK_REPORT_CHANNEL:-}"
 
-_secrets: &secrets
+_uv_secrets: &uv_secrets
   UV_INDEX_RBLN_NEXUS_NIGHTLY_USERNAME: MGMT_NEXUS_USERNAME
   UV_INDEX_RBLN_NEXUS_NIGHTLY_PASSWORD: MGMT_NEXUS_PASSWORD
   UV_INDEX_REBELLIONS_USERNAME: REBEL_SW_DEV_USERNAME
   UV_INDEX_REBELLIONS_PASSWORD: REBEL_SW_DEV_PASSWORD
+
+_secrets: &secrets
+  <<: *uv_secrets
   HF_TOKEN: FSW_HF_TOKEN
   HF_HOME: FSW_HF_HOME
 
 _dshm: &dshm
   - kubernetes:
       podSpecPatch:
+        tolerations:
+          - key: rebellions.ai/dedicated
+            operator: Equal
+            value: framework.sw
+            effect: NoSchedule
         containers:
           - name: container-0
             volumeMounts:
@@ -28,7 +38,7 @@ _dshm: &dshm
               medium: Memory
               sizeLimit: 4Gi
 
-_sync: &sync "echo '--- :package: uv sync' && uv sync --locked --python 3.12 --extra test --extra dev --extra runtime"
+_sync: &sync "echo '--- :package: uv sync' && uv sync --locked --python 3.12 --extra test --extra dev --extra runtime --extra kv_connectors"
 
 _measured: &measured
   soft_fail: true
@@ -69,15 +79,19 @@ _examples: &examples
 steps:
   - label: ":sparkles: upload pytest"
     key: "nightly-pytest"
-    checkout:
-      sparse:
-        paths:
-          - .buildkite
+    image: "${DEVTOOLS_DOCKER_IMAGE}"
+    secrets: *uv_secrets
     env:
       PYTEST_COMPILER_OVERRIDE_COMMAND: ""
       PYTEST_E2E_ARGS: "--num-hidden-layers 0 --maxfail=0"
       PYTEST_E2E_TIMEOUT: "120"
-    command: "buildkite-agent pipeline upload .buildkite/pipelines/vllm-rbln/pipeline-pytest.yml --apply-if-changed=false"
+    artifact_paths:
+      - "pytest-plan.json"
+    command: |
+      set -euo pipefail
+      uv sync --locked --python 3.12 --extra test --extra dev --extra runtime
+      uv run --no-sync python .buildkite/pipelines/vllm-rbln/scripts/plan_pytest.py pytest-plan.json
+      buildkite-agent pipeline upload pytest-plan.json --apply-if-changed=false
 
   - group: "[CR13] examples (vllm)"
     key: "nightly-examples-vllm"
@@ -136,33 +150,98 @@ steps:
           - *sync
           - "uv run --no-sync python .buildkite/pipelines/vllm-rbln/scripts/run_examples.py pooling"
 
+      - <<: *examples
+        label: "ec_disagg"
+        key: "nightly-examples-vllm-ec_disagg"
+        resources:
+          npu:
+            count: 8
+            product: "RBLN-CR13"
+        command:
+          - *sync
+          - "uv run --no-sync python .buildkite/pipelines/vllm-rbln/scripts/run_examples.py ec_disagg"
+
   # Measured, not gated: soft_fail keeps the build green and no measured lane
   # appears in the deploy step's depends_on.
+
+  - label: ":package: prepare CI targets"
+    key: "nightly-targets-prepare"
+    soft_fail: true
+    image: "${DEVTOOLS_DOCKER_IMAGE}"
+    secrets:
+      - GIT_PAT
+    artifact_paths:
+      - "ci-targets/*/snapshot.tar.gz"
+    command: |
+      uv run --no-project --python 3.12 --with pyyaml python \
+        .buildkite/pipelines/vllm-rbln/scripts/lane.py prepare --chip RBLN-CR13
 
   - group: "[CR13] perf"
     key: "nightly-perf"
     steps:
       - label: ":sparkles: upload perf"
         key: "nightly-perf-upload"
+        depends_on: "nightly-targets-prepare"
         soft_fail: true
         image: "${DEVTOOLS_DOCKER_IMAGE}"
         command: |
           set -euo pipefail
           uv run --no-project --python 3.12 --with pyyaml python \
-            .buildkite/pipelines/vllm-rbln/scripts/perf/run_perf.py pipeline --chip RBLN-CR13 \
+            .buildkite/pipelines/vllm-rbln/scripts/lane.py restore --run-id "$${BUILDKITE_BUILD_ID}"
+          uv run --no-project --python 3.12 --with pyyaml python \
+            .buildkite/pipelines/vllm-rbln/scripts/perf/run_perf.py pipeline --chip RBLN-CR13 --snapshot \
             | buildkite-agent pipeline upload
+
+  - <<: *measured
+    label: "[CR13] Sampler Perf"
+    key: "nightly-sampler-perf"
+    depends_on: "nightly-targets-prepare"
+    resources:
+      npu:
+        count: 1
+        product: "RBLN-CR13"
+    timeout_in_minutes: 60
+    artifact_paths:
+      - "sampler-perf-results/**/*"
+    command:
+      - *sync
+      - |
+        set -euo pipefail
+        sampler_output="sampler-perf-results/$${BUILDKITE_BUILD_ID}/RBLN-CR13"
+        mkdir -p "$${sampler_output}"
+        rm -f "$${sampler_output}/manifest.json" "$${sampler_output}/summary.md"
+        uv run --no-project --python 3.12 --with pyyaml python \
+          .buildkite/pipelines/vllm-rbln/scripts/lane.py restore --run-id "$${BUILDKITE_BUILD_ID}"
+        sampler_status=0
+        uv run --no-sync python \
+          .buildkite/pipelines/vllm-rbln/scripts/sampler-perf/run_benchmarks.py \
+          --config "ci-targets/$${BUILDKITE_BUILD_ID}/sampler-perf/benchmark-configs.yaml" \
+          --use-fused-sampling 0 1 \
+          --output-dir "$${sampler_output}" || sampler_status=$$?
+        if [[ -f "$${sampler_output}/summary.md" ]]; then
+          sampler_style=info
+          [[ "$${sampler_status}" == 0 ]] || sampler_style=warning
+          if ! buildkite-agent annotate --context sampler-perf-RBLN-CR13 \
+            --style "$${sampler_style}" < "$${sampler_output}/summary.md"; then
+            echo "Sampler Perf annotation failed; results remain in artifacts" >&2
+          fi
+        fi
+        exit "$${sampler_status}"
 
   - group: "[CR13] lm-eval"
     key: "nightly-lm-eval"
     steps:
       - label: ":sparkles: upload lm-eval"
         key: "nightly-lm-eval-upload"
+        depends_on: "nightly-targets-prepare"
         soft_fail: true
         image: "${DEVTOOLS_DOCKER_IMAGE}"
         command: |
           set -euo pipefail
           uv run --no-project --python 3.12 --with pyyaml python \
-            .buildkite/pipelines/vllm-rbln/scripts/lm-eval/run_lm_eval.py pipeline --chip RBLN-CR13 \
+            .buildkite/pipelines/vllm-rbln/scripts/lane.py restore --run-id "$${BUILDKITE_BUILD_ID}"
+          uv run --no-project --python 3.12 --with pyyaml python \
+            .buildkite/pipelines/vllm-rbln/scripts/lm-eval/run_lm_eval.py pipeline --chip RBLN-CR13 --snapshot \
             | buildkite-agent pipeline upload
 
   # Depending on the upload also waits for every uploaded pytest job.
@@ -185,3 +264,27 @@ steps:
     timeout_in_minutes: 30
     command:
       - "bash .buildkite/pipelines/vllm-rbln/scripts/publish-nightly-wheel.sh"
+
+  - label: ":slack: nightly report"
+    key: "nightly-report"
+    if: >-
+      (build.source == "schedule" && build.branch == "dev") ||
+      build.env("NIGHTLY_REPORT") == "1"
+    depends_on:
+      - "nightly-pytest"
+      - "nightly-examples-vllm"
+      - "nightly-perf-upload"
+      - "nightly-sampler-perf"
+      - "nightly-lm-eval-upload"
+      - "nightly-publish"
+    allow_dependency_failure: true
+    image: "${DEVTOOLS_DOCKER_IMAGE}"
+    secrets:
+      SLACK_BOT_TOKEN: SLACK_OAUTH_TOKEN
+    timeout_in_minutes: 10
+    artifact_paths:
+      - "nightly-report/*"
+    command: |
+      uv run --no-project --python 3.12 --with pyyaml python \
+        .buildkite/pipelines/vllm-rbln/scripts/report_nightly.py \
+        --chip RBLN-CR13 --download

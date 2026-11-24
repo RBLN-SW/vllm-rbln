@@ -331,6 +331,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             :, scale_intermediate_size:, :
         ]
 
+        # 0 is upstream's "no clamp"; custom_moe clamps whenever a limit is given.
+        swiglu_limit = layer.swiglu_limit or None
+
         if self.use_w8a8:
             # W8A8: dynamically quantize hidden_states to fp8 per (1, block_k)
             # group along K and hand both the fp8 tensor and the per-(token,
@@ -350,42 +353,36 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 .reshape(hs_shape)
             )
             hs_scale = scale.reshape(hs_shape[0], hs_shape[1] // in_block_size)
-            final_hidden_states = torch.ops.rbln_custom_ops.custom_moe_glu_w8a8(
+            final_hidden_states = torch.ops.rbln_custom_ops.custom_moe(
                 hs_q,
-                hs_scale,
                 gate_proj_weight,
-                gate_proj_weight_scale,
                 up_proj_weight,
-                up_proj_weight_scale,
                 down_proj_weight,
-                down_proj_weight_scale,
                 masked_routing_weights,
-                torch.tensor(self.weight_block_size[1], dtype=torch.int32),
                 layer.activation.value,
-                compute_dtype,
-                None,  # gate_proj_bias
-                None,  # up_proj_bias
-                None,  # down_proj_bias
-                layer.expert_map,
+                gate_proj_scale=gate_proj_weight_scale,
+                up_proj_scale=up_proj_weight_scale,
+                down_proj_scale=down_proj_weight_scale,
+                group_size=int(self.weight_block_size[1]),
+                hidden_states_scale=hs_scale,
+                out_dtype=compute_dtype,
+                expert_map=layer.expert_map,
+                swiglu_limit=swiglu_limit,
             )
         else:
-            final_hidden_states = (
-                torch.ops.rbln_custom_ops.custom_moe_glu_group_dequantize(
-                    hidden_states,
-                    gate_proj_weight,
-                    gate_proj_weight_scale,
-                    up_proj_weight,
-                    up_proj_weight_scale,
-                    down_proj_weight,
-                    down_proj_weight_scale,
-                    masked_routing_weights,
-                    torch.tensor(self.weight_block_size[1], dtype=torch.int32),
-                    layer.activation.value,
-                    None,  # gate_proj_bias
-                    None,  # up_proj_bias
-                    None,  # down_proj_bias
-                    layer.expert_map,
-                )
+            final_hidden_states = torch.ops.rbln_custom_ops.custom_moe(
+                hidden_states,
+                gate_proj_weight,
+                up_proj_weight,
+                down_proj_weight,
+                masked_routing_weights,
+                layer.activation.value,
+                gate_proj_scale=gate_proj_weight_scale,
+                up_proj_scale=up_proj_weight_scale,
+                down_proj_scale=down_proj_weight_scale,
+                group_size=int(self.weight_block_size[1]),
+                expert_map=layer.expert_map,
+                swiglu_limit=swiglu_limit,
             )
 
         return final_hidden_states.reshape(orig_shape)

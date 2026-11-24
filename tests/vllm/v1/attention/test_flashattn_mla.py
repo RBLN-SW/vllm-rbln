@@ -16,6 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.config import CompilationConfig, set_current_vllm_config
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
@@ -132,7 +133,7 @@ class TestMlaImplStubs:
         assert impl.process_weights_after_loading(torch.float16) is None
 
 
-@pytest.mark.maybe_use_device
+@pytest.mark.use_device
 class TestMlaImplInit:
     # __init__ validation guards. Valid args (head_size 576, all-None) construct;
     # each override trips one guard.
@@ -223,9 +224,51 @@ class TestIndexerCacheBackends:
             include_num_layers_dimension=True
         ) == (0, 1, 2)
 
-    def test_scale_cache_head_size_and_dtype(self):
+    def test_scale_cache_head_size(self):
         assert RBLNDeepseekV32IndexerScaleBackend.get_supported_head_sizes() == [1]
-        assert RBLNDeepseekV32IndexerScaleBackend.supported_dtypes == [torch.float16]
+
+    @staticmethod
+    def _indexer_cache(model_dtype, kv_cache_dtype="fp8"):
+        from vllm_rbln.patches import deepseek_v2 as patch
+
+        vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                dtype=model_dtype,
+                hf_text_config=SimpleNamespace(index_head_dim=128),
+            ),
+            cache_config=SimpleNamespace(cache_dtype=kv_cache_dtype),
+            compilation_config=CompilationConfig(),
+        )
+        with set_current_vllm_config(vllm_config):
+            cache = patch.DeepseekV32IndexerCache.__new__(patch.DeepseekV32IndexerCache)
+            patch.rbln_indexer_cache_init(
+                cache,
+                head_dim=128,
+                dtype=torch.bfloat16,
+                prefix="model.layers.0.self_attn.indexer.k_cache",
+                cache_config=vllm_config.cache_config,
+            )
+        return cache, vllm_config.compilation_config.static_forward_context
+
+    @pytest.mark.parametrize("model_dtype", [torch.bfloat16, torch.float16])
+    def test_fp8_scale_cache_is_registered_in_the_model_dtype(self, model_dtype):
+        cache, context = self._indexer_cache(model_dtype)
+        assert cache.dtype == torch.float8_e4m3fn
+        assert cache.scale_cache.dtype == model_dtype
+        assert context[cache.prefix] is cache
+        assert context[cache.scale_cache.prefix] is cache.scale_cache
+        assert (
+            cache.scale_cache.get_attn_backend() is RBLNDeepseekV32IndexerScaleBackend
+        )
+
+    def test_a_bf16_key_cache_has_no_scale_cache(self):
+        cache, _ = self._indexer_cache(torch.bfloat16, kv_cache_dtype="auto")
+        assert cache.dtype == torch.bfloat16
+        assert cache.scale_cache is None
+
+    def test_a_model_dtype_without_an_indexer_kernel_is_refused(self):
+        with pytest.raises(ValueError, match="float16 or bfloat16"):
+            self._indexer_cache(torch.float32)
 
     @pytest.mark.parametrize(
         ("backend", "head_size"),

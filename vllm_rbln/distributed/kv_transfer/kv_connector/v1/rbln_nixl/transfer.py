@@ -1,18 +1,19 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections.abc import Sequence
+from collections import defaultdict
+from collections.abc import Iterable, Sequence
 from contextlib import contextmanager
 
 import numpy as np
@@ -30,25 +31,66 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
 )
 
 
+def trim_producer_to_consumer(
+    producer: BlockIds,
+    consumer: BlockIds,
+    pairs: Iterable[tuple[int, int]],
+    *,
+    consumer_name: str,
+    req_id: str,
+) -> BlockIds:
+    """End-trim each producer list to the consumer list its regions pair with.
+
+    `pairs` holds a (producer group, consumer group) per region. A pipelined
+    producer can split the same layers into more groups, so the lists pair
+    through the regions rather than by position. The consumer holds the
+    uncached suffix of the prompt, so each of its lists is the tail of the
+    producer's; a producer group no region pairs is left whole.
+    """
+    lengths: dict[int, set[int]] = defaultdict(set)
+    for producer_group, consumer_group in pairs:
+        lengths[producer_group].add(len(consumer[consumer_group]))
+    trimmed = list(producer)
+    for group, wanted in sorted(lengths.items()):
+        if len(wanted) != 1:
+            raise RuntimeError(
+                f"RBLN NIXL: producer KV group {group} of request {req_id} pairs "
+                f"with {consumer_name}'s lists of {sorted(wanted)} block(s); one "
+                "list cannot be trimmed to both."
+            )
+        (num_consumer,) = wanted
+        have = len(trimmed[group])
+        if num_consumer > have:
+            raise RuntimeError(
+                f"RBLN NIXL: consumer {consumer_name} registered {num_consumer} "
+                f"block(s) for request {req_id} in group {group}, more than the "
+                f"{have} this producer holds; the peer's advertised length "
+                "crosses the handshake, so the pair is refused rather than "
+                "trimmed to it."
+            )
+        trimmed[group] = list(trimmed[group])[have - num_consumer :]
+    return tuple(trimmed)
+
+
 def _chunk_desc_ids(
     *,
     start: int,
     cuts: Sequence[tuple[int, int, int]],
     num_blocks: int,
     block_id: int,
-    per_block: int,
+    per_block: int | Sequence[int],
     chunk_span: tuple[int, int],
     partial_only: bool = False,
 ) -> np.ndarray:
-    """Descriptor ids for chunks `[lo, hi)` of one block, in every region
+    """Descriptor ids for chunks `[lo, hi)` of one block, in every entry
     holding any of them.
 
-    `cuts` is `ChunkGrid.regions` and the span counts chunks of the block, so
-    each region takes the part of it that falls in its own window.
-    `partial_only` leaves out a region the span covers whole, which a
-    whole-block descriptor carried instead. A region of no runs holds at most
-    one chunk, and its whole-block descriptor -- from 0, `per_block` a block --
-    is what names it.
+    `cuts` is `ChunkGrid.entries` and the span counts chunks of the block, so
+    each entry takes the part of it that falls in its own window.
+    `partial_only` leaves out an entry the span covers whole, which a
+    whole-block descriptor carried instead. An entry of no runs holds at most
+    one chunk, named by its whole-block descriptor from 0, `per_block` a block:
+    one count for every entry, or one per entry in the order of `cuts`.
 
     `start` is where the chunk range begins: one whole-block range before it on
     a shard's lists, and a window range as well on the whole-engine lists. The
@@ -58,26 +100,29 @@ def _chunk_desc_ids(
     """
     lo, hi = chunk_span
     first, runs, chunks = np.asarray(cuts, dtype=np.int64).reshape(-1, 3).T
-    per_region = per_block * runs * chunks
-    starts = start + (np.cumsum(per_region) - per_region) * num_blocks
-    starts += block_id * per_region
+    pieces = np.broadcast_to(np.asarray(per_block, dtype=np.int64), first.shape)
+    per_entry = pieces * runs * chunks
+    starts = start + (np.cumsum(per_entry) - per_entry) * num_blocks
+    starts += block_id * per_entry
     whole = runs == 0
-    starts[whole] = (np.flatnonzero(whole) * num_blocks + block_id) * per_block
+    starts[whole] = (np.cumsum(pieces) - pieces)[whole] * num_blocks + (
+        block_id * pieces[whole]
+    )
     begin = np.maximum(lo, first) - first
     end = np.minimum(hi, first + chunks) - first
     take = begin < end
     if partial_only:
         take &= (begin > 0) | (end < chunks)
-    # Regions cut alike share one offset pattern, and an engine has few cuts
-    # however many regions it has. The window leads the key so the ids come
-    # area by area, region by region inside one.
-    keys = np.stack([first, runs, chunks, begin, end], axis=1)[take]
+    # Entries cut alike share one offset pattern, and an engine has few cuts
+    # however many entries it has. The window leads the key so the ids come
+    # area by area, entry by entry inside one.
+    keys = np.stack([first, runs, chunks, begin, end, pieces], axis=1)[take]
     out = []
     for key in np.unique(keys, axis=0):
-        _, k_runs, k_chunks, k_begin, k_end = (int(v) for v in key)
+        _, k_runs, k_chunks, k_begin, k_end, k_pieces = (int(v) for v in key)
         k_runs = max(k_runs, 1)
         within = (
-            np.arange(per_block, dtype=np.int64)[:, None, None] * (k_runs * k_chunks)
+            np.arange(k_pieces, dtype=np.int64)[:, None, None] * (k_runs * k_chunks)
             + np.arange(k_runs, dtype=np.int64)[None, :, None] * k_chunks
             + np.arange(k_begin, k_end, dtype=np.int64)[None, None, :]
         ).ravel()
@@ -232,7 +277,7 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
             # region holds the whole block and every one takes the span.
             return _chunk_desc_ids(
                 start=num_whole_descs * (1 + window_units),
-                cuts=grid.regions,
+                cuts=grid.entries,
                 num_blocks=num_blocks,
                 block_id=block_id,
                 per_block=1,
@@ -291,6 +336,18 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
             all_descs += [chunks_of(block_id, span) for block_id, span in pieces]
         return np.concatenate(all_descs) if all_descs else np.empty(0, dtype=int)
 
+    def _region_group_pairs(
+        self, engine_id: str, ranks: Iterable[int], *, producer_is_peer: bool
+    ) -> list[tuple[int, int]]:
+        """(producer group, consumer group) of every region shared with
+        `engine_id` over `ranks`, as the descriptors pair them."""
+        pairs: list[tuple[int, int]] = []
+        for rank in ranks:
+            ours = self._shard_region_group_ids[(engine_id, rank)]
+            peers = self._shard_peer_region_group_ids[(engine_id, rank)]
+            pairs += zip(peers, ours) if producer_is_peer else zip(ours, peers)
+        return pairs
+
     def _get_block_descs_ids_for_shard(
         self,
         engine_id: str,
@@ -298,48 +355,55 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
         num_blocks: int,
         block_ids: BlockIds,
         needed: int | None = None,
+        *,
+        remote: bool = False,
     ) -> np.ndarray:
         """This shard's whole-block descriptors for `block_ids`.
 
-        `needed` is how many chunks of the last block hold tokens; a region
+        `needed` is how many chunks of the last block hold tokens; an entry
         holding any chunk past them leaves that block to the chunk range.
         """
-        region_group_ids = self._shard_region_group_ids[(engine_id, global_rank)]
+        region_group_ids = (
+            self._shard_peer_region_group_ids
+            if remote
+            else self._shard_region_group_ids
+        )[(engine_id, global_rank)]
         per_block = self._shard_descs_per_block[(engine_id, global_rank)]
-        # `(first chunk, chunks)` of a block each region holds: off the grid
+        # `(first chunk, chunks)` of a block each entry holds: off the grid
         # where the lists carry one, and without one a chunk is a span, so each
-        # region holds the span its area does.
+        # entry holds the span its region's area does.
         windows: list[tuple[int, int]] = []
         if needed is not None:
             grid = self._shard_chunk_grids[(engine_id, global_rank)]
             windows = (
-                [(first, chunks) for first, _, chunks in grid.regions]
+                [(first, chunks) for first, _, chunks in grid.entries]
                 if grid is not None
                 else [
                     (span, 1)
                     for span in self._shard_region_spans[(engine_id, global_rank)]
                 ]
             )
-        # Converted once, not once per region: this runs per request, and every
-        # region of a layer names the same group.
+        offsets = np.cumsum((0, *per_block))
+        # Converted ahead of the loop: this runs per request, and every entry
+        # of a layer names the same group.
         group_arrays = [np.asarray(g, dtype=np.int64) for g in block_ids]
         desc_ids: list[np.ndarray] = []
-        for region_id, group_id in enumerate(region_group_ids):
+        for entry, group_id in enumerate(region_group_ids):
             group_arr = group_arrays[group_id]
-            if needed is not None and sum(windows[region_id]) > needed:
+            if needed is not None and sum(windows[entry]) > needed:
                 group_arr = group_arr[:-1]
             if group_arr.size == 0:
                 continue
-            block_ix = region_id * num_blocks + group_arr
-            if per_block == 1:
-                desc_ids.append(block_ix)
+            # Both dlists are laid out entry-major, then block, then piece, so
+            # one block becomes `pieces` consecutive descriptors on each side,
+            # after every block of the entries before it.
+            pieces = per_block[entry]
+            first = offsets[entry] * num_blocks + group_arr * pieces
+            if pieces == 1:
+                desc_ids.append(first)
                 continue
-            # Both dlists are laid out region-major, then block, then piece, so
-            # one block becomes `per_block` consecutive descriptors on each side.
             desc_ids.append(
-                (
-                    block_ix[:, None] * per_block + np.arange(per_block, dtype=np.int64)
-                ).ravel()
+                (first[:, None] + np.arange(pieces, dtype=np.int64)).ravel()
             )
         if not desc_ids:
             return np.empty(0, dtype=np.int64)
@@ -359,7 +423,8 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
 
         The span counts chunks of the block. A context cut gives each area a
         window of them, so only the areas whose window it reaches take part;
-        a head cut gives every region all of them.
+        a head cut gives every region all of them, and an entry split off a
+        region on the peer's token ranges holds one range of them.
 
         Indexes the second range the shard's lists carry (see
         `_register_shard_local_xfer_handler`), which follows the whole-block
@@ -379,13 +444,13 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
                 f"{grid.chunks_per_block} chunk(s) a block holds"
             )
         region_group_ids = self._shard_region_group_ids[(engine_id, global_rank)]
-        assert len(grid.regions) == len(region_group_ids)
+        assert len(grid.entries) == len(region_group_ids)
         per_block = self._shard_descs_per_block[(engine_id, global_rank)]
         return _chunk_desc_ids(
             # Where the chunk range starts: the whole-block range covers every
-            # region, block and piece once.
-            start=len(region_group_ids) * num_blocks * per_block,
-            cuts=grid.regions,
+            # entry, block and piece once.
+            start=sum(per_block) * num_blocks,
+            cuts=grid.entries,
             num_blocks=num_blocks,
             block_id=block_id,
             per_block=per_block,
@@ -432,11 +497,12 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
         *,
         num_valid_tokens: int | None,
         num_prompt_blocks: int,
+        remote: bool = False,
     ) -> np.ndarray:
         """This shard's descriptors for `block_ids`, cut to the tokens held.
 
         The last block goes out as the chunks that hold tokens: whole from the
-        regions whose part of it they fill, and in chunks from every region the
+        entries whose part of it they fill, and in chunks from every entry the
         last of them falls inside. Both sides build this the same way, so the two
         lists still pair by position.
 
@@ -450,7 +516,7 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
             chunk_grid=self._shard_chunk_grids[(engine_id, global_rank)],
         )
         descs = self._get_block_descs_ids_for_shard(
-            engine_id, global_rank, num_blocks, block_ids, needed=needed
+            engine_id, global_rank, num_blocks, block_ids, needed=needed, remote=remote
         )
         if needed is None or not block_ids[0]:
             return descs

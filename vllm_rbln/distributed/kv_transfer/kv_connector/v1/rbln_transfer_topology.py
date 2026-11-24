@@ -1,11 +1,11 @@
 # Copyright 2026 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -20,13 +20,46 @@ that substitutes it upstream can import it without pulling the whole connector
 package in at plugin load.
 """
 
+from dataclasses import dataclass
+
 import torch
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     EngineId,
     EngineTransferInfo,
     TransferTopology,
 )
-from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
+from vllm.v1.kv_cache_interface import (
+    KVCacheSpec,
+    MambaSpec,
+    MLAAttentionSpec,
+    SlidingWindowMLASpec,
+)
+
+
+def is_latent(layer_spec: KVCacheSpec) -> bool:
+    """Whether a layer's cache is one key-only latent rather than K and V."""
+    return isinstance(layer_spec, (MLAAttentionSpec, SlidingWindowMLASpec))
+
+
+@dataclass(frozen=True)
+class RblnBlockTransferSpec(KVCacheSpec):
+    """A blocks-first payload, never cut on tokens: whole where `band_heads` is
+    0, and otherwise cut by the heads it bands across TP degrees.
+
+    Used only by the connector; the scheduler keeps the original state spec.
+    """
+
+    page_bytes: int
+    # Model-wide heads the payload bands over TP ranks; 0 where every rank holds
+    # the same bytes. A block is `runs` runs of the rank's heads, `head_bytes` a
+    # head, or one run holding several ranks' worth of which this rank owns one.
+    band_heads: int = 0
+    head_bytes: int = 0
+    runs: int = 1
+
+    @property
+    def page_size_bytes(self) -> int:
+        return self.page_bytes
 
 
 class RblnTransferTopology(TransferTopology):
@@ -36,7 +69,9 @@ class RblnTransferTopology(TransferTopology):
     its own NIXL region -- the layout upstream standardized away in 0.26. The
     rbln_custom_ops cache puts them inside one block, so that one registers as
     a single region and the descriptor path names the two halves itself.
-    MLA and Mamba caches are upstream's own shapes and stay on its path.
+    MLA and Mamba caches are upstream's own shapes and stay on its path -- and
+    so does a latent beside attention layers (an MSA indexer), whose shape is
+    its own backend's rather than the attention backend's.
 
     ``__post_init__`` reimplements upstream's rather than extending it, since
     upstream's asserts a blocks-first 4-dim shape RBLN never produces. So a
@@ -65,9 +100,12 @@ class RblnTransferTopology(TransferTopology):
         # for a distinctive count to land on.
         mock_blocks, mock_tokens = 1234567, 7907
         mock_heads = 1 if self.is_mla else 7919
+        # A compressing cache (GLM-5.3's indexer, first on a later PP stage)
+        # holds block_size // ratio rows, so ask for a multiple of the ratio.
+        ratio = getattr(backend, "compress_ratio", 1)
         shape = backend.get_kv_cache_shape(
             num_blocks=mock_blocks,
-            block_size=mock_tokens,
+            block_size=mock_tokens * ratio,
             num_kv_heads=mock_heads,
             head_size=1,
         )
@@ -141,11 +179,18 @@ class RblnTransferTopology(TransferTopology):
     def get_transfer_cache_regions(
         self, cache: torch.Tensor, layer_spec: KVCacheSpec
     ) -> list[torch.Tensor] | torch.Tensor:
-        if self.is_mla or self.is_mamba or self._cross_layers_blocks:
+        if isinstance(layer_spec, RblnBlockTransferSpec):
+            return [cache]
+        if (
+            self.is_mla
+            or self.is_mamba
+            or self._cross_layers_blocks
+            or is_latent(layer_spec)
+        ):
             return self._shared_cache_regions(cache, layer_spec)
         if self._kv_shares_a_block:
             # Nothing to iterate: the block is the unit, and the descriptor
-            # path cuts K and V out of it (`RblnNixlWorkerBase._kv_runs`).
+            # path cuts K and V out of it (`pair_area`).
             return [cache]
         # Iterating the tensor yields K and V; the caller divides the page size
         # by how many come back.

@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -20,8 +20,6 @@ from typing import Any
 
 import torch
 
-from vllm_rbln.v1.worker.utils import extract_layer_index
-
 
 def _storage_key(tensor: torch.Tensor) -> tuple[int, int]:
     """Return a hashable key that identifies the tensor's underlying storage.
@@ -33,6 +31,18 @@ def _storage_key(tensor: torch.Tensor) -> tuple[int, int]:
     if tensor.device.type == "meta":
         return (id(storage), storage.nbytes())
     return (storage.data_ptr(), storage.nbytes())
+
+
+def kv_cache_tensor_key(
+    tensor: torch.Tensor,
+) -> tuple[torch.device, int, int, int, int]:
+    """A cache's byte window, independent of its dtype or dense view shape."""
+    return (
+        tensor.device,
+        *_storage_key(tensor),
+        tensor.storage_offset() * tensor.element_size(),
+        tensor.numel() * tensor.element_size(),
+    )
 
 
 @dataclass(frozen=True)
@@ -51,26 +61,25 @@ class KVCacheViewInfo:
 def build_kv_cache_base_bindings(
     kv_cache_bases_by_layer: dict[str, torch.Tensor],
     kv_cache_view_infos_by_layer: dict[str, KVCacheViewInfo],
-    num_attn_module: int = 1,
+    *,
+    layer_names: Sequence[str],
 ) -> tuple[list[torch.Tensor], list[KVCacheViewInfo]]:
     """Deduplicate KV cache inputs by storage and capture per-layer view info."""
+    assert len(layer_names) == len(kv_cache_view_infos_by_layer) and set(
+        layer_names
+    ) == set(kv_cache_view_infos_by_layer), (
+        "KV cache order must name every cache exactly once"
+    )
     base_tensors: list[torch.Tensor] = []
     view_infos: list[KVCacheViewInfo] = []
-    base_index_by_view: dict[tuple[int, int, int, int], int] = {}
+    base_index_by_view: dict[tuple[torch.device, int, int, int, int], int] = {}
 
-    layer_names = _get_ordered_layer_names(
-        kv_cache_view_infos_by_layer, num_attn_module
-    )
     for layer_name in layer_names:
         base_tensor = kv_cache_bases_by_layer[layer_name]
         # The byte window and not just the storage: layers share a buffer only
         # where they are the same cache, and collapsing distinct windows would
         # hand every one of them the first window's bytes.
-        view_key = (
-            *_storage_key(base_tensor),
-            base_tensor.storage_offset() * base_tensor.element_size(),
-            base_tensor.numel() * base_tensor.element_size(),
-        )
+        view_key = kv_cache_tensor_key(base_tensor)
         base_index = base_index_by_view.get(view_key)
         if base_index is None:
             base_index = len(base_tensors)
@@ -78,6 +87,9 @@ def build_kv_cache_base_bindings(
             base_tensors.append(base_tensor)
 
         view_info = kv_cache_view_infos_by_layer[layer_name]
+        if view_info.view_dtype == base_tensors[base_index].dtype:
+            # Only layers of another dtype on the base's extent take a dtype view.
+            view_info = replace(view_info, view_dtype=None)
         if view_info.dynamic_axis is not None and view_info.view_shape is not None:
             axis = view_info.dynamic_axis
             # materialize_kv_cache_view reads the extent after the dtype view.
@@ -176,8 +188,10 @@ def attach_kv_cache_bindings(
     kv_caches: list[torch.Tensor] | None,
     kv_cache_bases: list[torch.Tensor] | None,
     kv_cache_view_infos: list[KVCacheViewInfo] | None,
+    kv_cache_positions: dict[str, int],
 ) -> None:
     """Attach either per-layer KV views or deduplicated bases to metadata."""
+    attn_metadata.kv_cache_positions = kv_cache_positions
     if kv_cache_bases and kv_cache_view_infos:
         attn_metadata.kv_caches = None
         attn_metadata.kv_cache_view_infos = kv_cache_view_infos
@@ -233,17 +247,3 @@ def validate_shared_attention_kv_cache_contiguity(
             "Shared attention KV cache tensors must be contiguous. "
             f"Non-contiguous layers: {layer_summaries}"
         )
-
-
-def _get_ordered_layer_names(
-    kv_caches: dict[str, torch.Tensor], num_attn_module: int
-) -> list[str]:
-    index_to_names: dict[int, list[str]] = defaultdict(list)
-    for layer_name in kv_caches:
-        layer_index = extract_layer_index(layer_name, num_attn_module)
-        index_to_names[layer_index].append(layer_name)
-
-    ordered_layer_names: list[str] = []
-    for layer_index in sorted(index_to_names):
-        ordered_layer_names.extend(index_to_names[layer_index])
-    return ordered_layer_names

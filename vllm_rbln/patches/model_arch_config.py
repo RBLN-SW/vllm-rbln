@@ -2,10 +2,15 @@
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# You may obtain a copy of the License at:
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 #
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Config-time answers for the vendored MLA models.
 
@@ -49,7 +54,7 @@ class EagleDraftConvertor(ModelArchConfigConvertorBase):
         return convertor_cls(target, target, revision=self.revision).is_deepseek_mla()
 
 
-def _register_convertor(
+def register_convertor(
     model_type: str, convertor_cls: type[ModelArchConfigConvertorBase]
 ) -> None:
     existing = MODEL_ARCH_CONFIG_CONVERTORS.get(model_type)
@@ -66,7 +71,7 @@ def _register_convertor(
 def register_mla_convertor(model_type: str) -> None:
     """Make ``model_type`` an MLA model by its ``kv_lora_rank``. Called from the
     model's own registration, next to its ``ModelRegistry.register_model``."""
-    _register_convertor(model_type, KvLoraRankMLAConvertor)
+    register_convertor(model_type, KvLoraRankMLAConvertor)
 
 
 @add_registration(
@@ -78,11 +83,12 @@ def register_mla_convertor(model_type: str) -> None:
     )
 )
 def register_eagle_draft_convertor() -> None:
-    _register_convertor("eagle", EagleDraftConvertor)
+    register_convertor("eagle", EagleDraftConvertor)
 
 
 __all__ = [
     "EagleDraftConvertor",
     "KvLoraRankMLAConvertor",
+    "register_convertor",
     "register_mla_convertor",
 ]

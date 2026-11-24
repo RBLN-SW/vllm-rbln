@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -19,16 +19,25 @@ from typing import TYPE_CHECKING
 
 import torch
 from vllm.logger import init_logger
+from vllm.utils.torch_utils import get_dtype_size, kv_cache_dtype_str_to_dtype
 
 from vllm_rbln import envs
 from vllm_rbln.platform import use_device_tensor
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.pooling_params import PoolingParams
+    from vllm.sampling_params import SamplingParams
 
     from vllm_rbln.config import RBLNConfig
 
 logger = init_logger(__name__)
+
+# validate_request gets no config, so check_and_update keeps this process's --
+# the last one built, so this assumes one engine per process, as a server has.
+# The role is read per request, not here: VllmConfig.__post_init__ can still
+# rewrite it after the hook (KV offloading makes it kv_both).
+_vllm_config: "VllmConfig | None" = None
 
 
 def patch_upstream() -> None:
@@ -48,6 +57,8 @@ def patch_upstream() -> None:
 def check_and_update(vllm_config: "VllmConfig") -> None:
     from vllm_rbln.config import build_rbln_config
 
+    global _vllm_config
+
     # Everything below reads additional_config as an RBLNConfig.
     vllm_config.additional_config = build_rbln_config(vllm_config.additional_config)
 
@@ -55,6 +66,54 @@ def check_and_update(vllm_config: "VllmConfig") -> None:
     _override(vllm_config)
     _wire(vllm_config)
     _setup_runtime_env(vllm_config)
+    _vllm_config = vllm_config
+
+
+def validate_request(params: "SamplingParams | PoolingParams") -> None:
+    from vllm.exceptions import VLLMValidationError
+    from vllm.sampling_params import SamplingParams
+
+    from vllm_rbln.v1.core.utils import is_strict_kv_producer
+
+    if not isinstance(params, SamplingParams):
+        return
+    assert _vllm_config is not None, "validate_request ran before check_and_update"
+    if not is_strict_kv_producer(_vllm_config):
+        return
+    if params.max_tokens is None or params.max_tokens > 1:
+        raise VLLMValidationError(
+            "A strict KV producer (kv_role='kv_producer') compiles no decode "
+            "graph, so a request to it can ask for one output token only; got "
+            f"max_tokens={params.max_tokens}. Generation belongs on the decode "
+            "peer.",
+            parameter="max_tokens",
+            value=params.max_tokens,
+        )
+
+
+def _uses_gated_delta_net(model_config) -> bool:
+    """A GatedDeltaNet model (Qwen3.5) by its HF text model type. GLM-5.3's KDA
+    layers share the `linear_attention` layer type and stay out."""
+    text_config = getattr(model_config, "hf_text_config", model_config.hf_config)
+    return getattr(text_config, "model_type", None) == "qwen3_5_text"
+
+
+def _runs_gated_delta_net(vllm_config: "VllmConfig") -> bool:
+    """Whether this instance builds GatedDeltaNet layers: an encoder-only one
+    builds no language model."""
+    return (
+        _uses_gated_delta_net(vllm_config.model_config)
+        and not vllm_config.is_mm_encoder_only
+    )
+
+
+def _keeps_recurrent_state(vllm_config: "VllmConfig") -> bool:
+    """A language model with a recurrent state a request beside its KV cache:
+    GLM-5.3's KDA layers or GatedDeltaNet ones."""
+    text_config = vllm_config.model_config.hf_text_config
+    return text_config.model_type == "glm5_next_text" or _runs_gated_delta_net(
+        vllm_config
+    )
 
 
 def _uses_model_parallel(parallel_config) -> bool:
@@ -75,16 +134,97 @@ def _validate(vllm_config: "VllmConfig") -> None:
     if vllm_config.lora_config is not None:
         raise ValueError("LoRA is not supported on RBLN.")
 
-    if model_config.uses_mrope:
-        # The RBLN RoPE override covers `RotaryEmbedding` and takes
-        # `[batch, seq]` positions; `MRotaryEmbedding` is a sibling class with
-        # no RBLN forward, and its native one reads a 2-D tensor as `[3, N]`.
+    uses_gdn = _runs_gated_delta_net(vllm_config)
+    if uses_gdn:
+        if rbln_config.use_custom_kernel:
+            raise ValueError(
+                "GatedDeltaNet models do not take --rbln-use-custom-kernel on the "
+                "RBLN vLLM path yet: its attention kernels read the KV cache in "
+                "another layout than the state, which shares that cache's blocks."
+            )
+        if (
+            parallel_config.tensor_parallel_size > 1
+            or parallel_config.pipeline_parallel_size > 1
+            or parallel_config.data_parallel_size > 1
+        ):
+            raise ValueError(
+                "GatedDeltaNet models run on a single rank on the RBLN vLLM path "
+                f"for now; got tensor_parallel_size="
+                f"{parallel_config.tensor_parallel_size}, pipeline_parallel_size="
+                f"{parallel_config.pipeline_parallel_size}, data_parallel_size="
+                f"{parallel_config.data_parallel_size}."
+            )
+        text_config = model_config.hf_text_config
+        num_v_heads = text_config.linear_num_value_heads
+        # Per rank, so the rule holds as it is once TP is supported.
+        if (num_v_heads // parallel_config.tensor_parallel_size) % 4:
+            raise ValueError(
+                "The RBLN GatedDeltaNet core splits a rank's value heads over four "
+                f"chiplets; got {num_v_heads} heads over "
+                f"tensor_parallel_size={parallel_config.tensor_parallel_size}."
+            )
+        # State and attention share a pool page; its physical capacity must
+        # cover the recurrent state, with any remainder as padding.
+        cache_config = vllm_config.cache_config
+        kv_dtype = kv_cache_dtype_str_to_dtype(cache_config.cache_dtype, model_config)
+        if kv_dtype != model_config.dtype:
+            raise ValueError(
+                "A GatedDeltaNet state is declared in the activation dtype as a "
+                "full-attention KV block on RBLN, so the KV cache has to keep "
+                f"that dtype; got --kv-cache-dtype {cache_config.cache_dtype} "
+                f"for dtype {model_config.dtype}."
+            )
+        token_bytes = (
+            2
+            * model_config.get_num_kv_heads(parallel_config)
+            * model_config.get_head_size()
+            * get_dtype_size(kv_dtype)
+        )
+        state_bytes = (
+            num_v_heads
+            * text_config.linear_key_head_dim
+            * text_config.linear_value_head_dim
+            * get_dtype_size(model_config.dtype)
+        )
+        if cache_config.block_size * token_bytes < state_bytes:
+            raise ValueError(
+                "A GatedDeltaNet state takes a block of the attention pool on RBLN, "
+                f"so its {state_bytes} bytes must fit in a full-attention layer's "
+                f"page ({token_bytes} bytes a token): set --block-size to at least "
+                f"{state_bytes / token_bytes:g}; got {cache_config.block_size}."
+            )
+
+    if vllm_config.is_mm_encoder_only and (
+        parallel_config.data_parallel_size > 1
+        or parallel_config.pipeline_parallel_size > 1
+    ):
         raise ValueError(
-            "M-RoPE models (e.g. the Qwen2-VL family) are not supported on the "
-            "RBLN vLLM path yet. Use the optimum path."
+            "An encoder-only instance supports neither data nor pipeline "
+            "parallelism on RBLN."
         )
 
     text_config = getattr(model_config, "hf_text_config", model_config.hf_config)
+    if getattr(text_config, "model_type", None) == "qwen3_next":
+        raise ValueError(
+            "Qwen3-Next is not supported on the RBLN vLLM path yet: its "
+            "GatedDeltaNet projections are interleaved by key head, a layout the "
+            "RBLN layer does not read."
+        )
+    if getattr(text_config, "model_type", None) == "qwen3_5_moe_text":
+        raise ValueError(
+            "Qwen3.5-MoE is not supported on the RBLN vLLM path yet: it builds "
+            "the RBLN GatedDeltaNet layer, whose weight regrouping and platform "
+            "rules cover the dense Qwen3.5 models only."
+        )
+    if (
+        model_config.uses_mrope
+        and getattr(text_config, "model_type", None) != "qwen3_5_text"
+    ):
+        # The RBLN M-RoPE forward has run on Qwen3.5 only.
+        raise ValueError(
+            "M-RoPE models other than Qwen3.5 (e.g. the Qwen2-VL family) are not "
+            "supported on the RBLN vLLM path yet. Use the optimum path."
+        )
     if (
         getattr(text_config, "sparse_attention_config", None)
         and model_config.dtype != torch.bfloat16
@@ -97,12 +237,33 @@ def _validate(vllm_config: "VllmConfig") -> None:
             f"RBLN; got dtype={model_config.dtype}. Pass --dtype bfloat16."
         )
 
-    if rbln_config.compile_dtype:
-        from vllm_rbln.compilation import check_dtype_option_supported
+    if (
+        text_config.model_type == "glm5_next_text"
+        and not vllm_config.cache_config.cache_dtype.startswith("fp8")
+    ):
+        raise ValueError(
+            "GLM-5.3 needs an fp8 KV cache on RBLN; pass --kv-cache-dtype fp8."
+        )
 
-        check_dtype_option_supported()
+    # GLM-5.3's kpool indexer tail ring holds 3 + K positions in at most 8
+    # slots. The GatedDeltaNet verify kernel takes up to 7 drafts; 1 to 5 ran
+    # on a device.
+    spec = vllm_config.speculative_config
+    if (
+        spec is not None
+        and _keeps_recurrent_state(vllm_config)
+        and (spec.method != "mtp" or not 1 <= spec.num_speculative_tokens <= 5)
+    ):
+        raise ValueError(
+            "Speculative decoding over a recurrent state on RBLN runs the model's "
+            "MTP head with num_speculative_tokens 1 to 5 only; got "
+            f"method={spec.method!r}, "
+            f"num_speculative_tokens={spec.num_speculative_tokens}."
+        )
 
-    if not scheduler_config.enable_chunked_prefill:
+    # Upstream turns chunked prefill off for an engine without a KV cache, such
+    # as an encoder-only instance, then validates the config again in EngineCore.
+    if not (scheduler_config.enable_chunked_prefill or vllm_config.is_mm_encoder_only):
         raise ValueError(
             "Disabling chunked prefill is not supported on RBLN. "
             "Please enable chunked prefill by yourself."
@@ -128,6 +289,90 @@ def _validate(vllm_config: "VllmConfig") -> None:
             f"got {max_num_batched_tokens=}, {block_size=}, {max_block_size=}. "
             "Set --block-size within this range."
         )
+
+    chunks = rbln_config.prefill_chunk_size or [max_num_batched_tokens]
+    if max(chunks) > max_num_batched_tokens:
+        raise ValueError(
+            f"prefill_chunk_size={chunks} exceeds {max_num_batched_tokens=}."
+        )
+
+    max_num_scheduled_tokens = scheduler_config.max_num_scheduled_tokens
+    if (
+        max_num_scheduled_tokens is not None
+        and chunks != [max_num_batched_tokens]
+        and max(chunks) > max_num_scheduled_tokens
+    ):
+        raise ValueError(
+            f"prefill_chunk_size={chunks} exceeds {max_num_scheduled_tokens=}."
+        )
+    if uses_gdn and any(chunk % 128 for chunk in chunks):
+        raise ValueError(
+            "The RBLN GatedDeltaNet prefill kernel runs in 128-token chunks; got "
+            f"prefill_chunk_size={chunks}. Each has to be a multiple of 128 "
+            "(--rbln-prefill-chunk-size, or --max-num-batched-tokens without it)."
+        )
+    # TODO(RBLN): The RBLN NIXL connector's resume trim takes
+    # max_num_batched_tokens as the prefill chunk. Lifting the refusal means
+    # pointing its sites at prefill_chunk_size; #1372 lists them.
+    if min(chunks) < max_num_batched_tokens:
+        kv_transfer = vllm_config.kv_transfer_config
+        connectors = [] if kv_transfer is None else [kv_transfer.kv_connector]
+        if connectors == ["MultiConnector"]:
+            children = kv_transfer.kv_connector_extra_config.get("connectors", [])
+            connectors = [child.get("kv_connector") for child in children]
+        unsupported = [
+            name
+            for name, on in (
+                (
+                    "RBLN NIXL KV transfer",
+                    any(
+                        name
+                        in (
+                            "RblnNixlConnector",
+                            "RblnNixlPullConnector",
+                            "RblnNixlPushConnector",
+                        )
+                        for name in connectors
+                    ),
+                ),
+                # The non-causal prefill mask is built at the longest chunk.
+                (
+                    "non-causal attention",
+                    len(chunks) > 1 and vllm_config.attention_config.use_non_causal,
+                ),
+            )
+            if on
+        ]
+        if unsupported:
+            raise ValueError(
+                f"prefill_chunk_size={chunks} below {max_num_batched_tokens=} "
+                f"is not supported with {', '.join(unsupported)} on RBLN yet."
+            )
+    # Resolved here so the scheduler and runner read one value, and compute_hash,
+    # which runs after this, keys "unset" and "set to the budget" alike.
+    rbln_config.prefill_chunk_size = chunks
+
+    cache_config = vllm_config.cache_config
+    if cache_config.enable_prefix_caching and _keeps_recurrent_state(vllm_config):
+        if (
+            cache_config.user_specified_mamba_block_size
+            and cache_config.mamba_block_size != block_size
+        ):
+            raise ValueError(
+                "Prefix caching keeps a recurrent state a KV block on RBLN; "
+                f"got --mamba-block-size {cache_config.mamba_block_size} and "
+                f"--block-size {block_size}."
+            )
+        # A hit below the block reads the state a step stored at the prompt's
+        # last unit boundary, and a step stores one only where it ends.
+        unit = cache_config.prefix_match_unit
+        if unit is not None and unit < block_size and unit % max(chunks):
+            raise ValueError(
+                "Prefix caching with a recurrent state hits a whole KV block or a "
+                "multiple of the prefill chunk on RBLN; got "
+                f"--prefix-match-unit {unit}, --block-size {block_size}, "
+                f"prefill_chunk_size={chunks}."
+            )
 
     if envs.VLLM_RBLN_COMPILE_ONLY and envs.VLLM_DISABLE_COMPILE_CACHE:
         # Compile-only compiles each graph and writes the .rbln artifact to
@@ -264,7 +509,8 @@ def _validate_aux_hidden_states_pp_config(vllm_config: "VllmConfig") -> None:
     raise ValueError(
         f"A {vllm_config.speculative_config.method} draft consumes the target's "
         "auxiliary hidden states, and collecting them across pipeline stages "
-        "needs a per-architecture patch that this target does not have yet. "
+        "needs the target's forward to hand them on as the one combined tensor "
+        "this plugin reads, which this target's forward does not do yet. "
         "pipeline_parallel_size="
         f"{vllm_config.parallel_config.pipeline_parallel_size} is supported on "
         f"RBLN only for target architectures {sorted(AUX_PP_TARGET_ARCHS)}, but "
@@ -311,6 +557,32 @@ def _override(vllm_config: "VllmConfig") -> None:
         # RBLN(NOTE): force dtype into fp16 for eager mode
         model_config.dtype = torch.float16
 
+    if (
+        _keeps_recurrent_state(vllm_config)
+        and vllm_config.speculative_config is not None
+        and model_config.dtype.itemsize != 2
+    ):
+        raise ValueError(
+            "The MTP verify kernel of a recurrent state takes 16-bit activations on "
+            f"RBLN; got dtype {model_config.dtype}."
+        )
+
+    text_config = model_config.hf_text_config
+    if text_config.model_type == "glm5_next_text":
+        tp_size = vllm_config.parallel_config.tensor_parallel_size
+        block_size = vllm_config.cache_config.block_size
+        num_heads = text_config.linear_num_heads // tp_size
+        state_bytes = text_config.linear_head_dim**2 * model_config.dtype.itemsize
+        group_heads, rem = divmod(block_size * text_config.kv_lora_rank, state_bytes)
+        if rem or not group_heads or num_heads % group_heads:
+            head_block_size = state_bytes // text_config.kv_lora_rank
+            raise ValueError(
+                "GLM-5.3 on RBLN fills an fp8 MLA latent block with whole KDA head "
+                f"states, so at TP {tp_size} --block-size must be {head_block_size} "
+                f"times a divisor of the {num_heads} heads a rank holds (at most "
+                f"{head_block_size * num_heads}); got {block_size}."
+            )
+
     if vllm_config.compilation_config.mode != CompilationMode.NONE:
         logger.info(
             "vLLM compilation mode is not used on RBLN because "
@@ -337,11 +609,47 @@ def _override(vllm_config: "VllmConfig") -> None:
         )
         model_config.disable_cascade_attn = True
 
+    cache_config = vllm_config.cache_config
+    if (
+        _keeps_recurrent_state(vllm_config)
+        and cache_config.enable_prefix_caching
+        and vllm_config.speculative_config is not None
+        and cache_config.prefix_cache_retention_interval != 0
+    ):
+        # A verify step stores its first token's state and replays the accepted
+        # drafts next step, so a block it crossed holds no state at its end. Retention
+        # 0 caches only states a prefill stored (prompt end, shared-prefix junction).
+        logger.warning(
+            "Disabling prefix caching: a recurrent state on RBLN runs it with "
+            "speculative decoding only at prefix_cache_retention_interval 0, got %s.",
+            cache_config.prefix_cache_retention_interval,
+        )
+        cache_config.enable_prefix_caching = False
+        # MambaModelConfig set these for prefix caching before this hook; back to
+        # the values it uses without it.
+        cache_config.mamba_cache_mode = "none"
+        if not cache_config.user_specified_mamba_block_size:
+            cache_config.mamba_block_size = model_config.max_model_len
+
 
 def _wire(vllm_config: "VllmConfig") -> None:
     rbln_config: RBLNConfig = vllm_config.additional_config
     parallel_config = vllm_config.parallel_config
     scheduler_config = vllm_config.scheduler_config
+
+    ec_config = vllm_config.ec_transfer_config
+    manager_config = vllm_config.ec_manager_config
+    if (
+        ec_config is not None
+        and ec_config.ec_connector == "RblnECCPUConnector"
+        and not vllm_config.model_config.is_encoder_decoder
+        and manager_config.encoder_cache_manager_cls is None
+    ):
+        # NOTE(RBLN): select eviction protection through the manager factory
+        # so an explicitly configured cache manager is never replaced.
+        manager_config.encoder_cache_manager_cls = (
+            "vllm_rbln.v1.core.rbln_scheduler.RBLNEncoderCacheManager"
+        )
 
     if parallel_config.worker_cls == "auto":
         parallel_config.worker_cls = "vllm_rbln.v1.worker.rbln_worker.RBLNWorker"

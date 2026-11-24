@@ -116,9 +116,7 @@ def _assert_parity(build, activation):
     # 2. rbln-compiled, on whichever tensors the lane selects.
     dev_activation = activation.to(dev)
     assert _agrees(rbln_compile(build().to(dev), fullgraph=True)(dev_activation), ref)
-    # 3. device eager, only when device tensors are on (--device-tensor 1).
-    if dev == "rbln":
-        assert _agrees(build().to(dev)(dev_activation), ref)
+    assert _agrees(build().to(dev)(dev_activation), ref)
 
 
 def _quantized_weight():

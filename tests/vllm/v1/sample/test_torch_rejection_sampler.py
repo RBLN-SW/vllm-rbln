@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -433,17 +433,18 @@ def test_rejection_sampling_approximates_target_distribution():
     much more than the distance improvement between the observed
     distribution and the random distribution.
     """
-    torch.set_default_device(DEVICE)
     vocab_size = 10
     k = 2
     num_reference_probs = 100
 
     # Prepare draft, target, and reference probability distributions
-    draft_probs = F.softmax(torch.rand(vocab_size, dtype=torch.float32), dim=-1)
-    target_logits = torch.rand(vocab_size, dtype=torch.float32)
+    draft_probs = F.softmax(
+        torch.rand(vocab_size, dtype=torch.float32, device=DEVICE), dim=-1
+    )
+    target_logits = torch.rand(vocab_size, dtype=torch.float32, device=DEVICE)
     target_probs = F.softmax(target_logits, dim=-1)
     reference_probs = F.softmax(
-        torch.rand(num_reference_probs, vocab_size, dtype=torch.float32),
+        torch.rand(num_reference_probs, vocab_size, dtype=torch.float32, device=DEVICE),
         dim=-1,
     )
 

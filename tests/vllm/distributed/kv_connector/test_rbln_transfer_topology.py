@@ -19,16 +19,20 @@
 # registration path builds the topology, so every test here constructs one
 # directly.
 
+from unittest.mock import MagicMock
+
 import pytest
 import torch
 from vllm.config import set_current_vllm_config
 from vllm.distributed.kv_transfer.kv_connector.utils import EngineTransferInfo
+from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
 from tests.vllm.vllm_config import make_vllm_config
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_transfer_topology import (
     RblnTransferTopology,
 )
 from vllm_rbln.v1.attention.backends.flash_attention import RBLNFlashAttentionBackend
+from vllm_rbln.v1.attention.backends.glm5_next import RBLNGlm5NextIndexerBackend
 from vllm_rbln.v1.attention.backends.mla.flashattn_mla import RBLNFlashAttnMLABackend
 from vllm_rbln.v1.attention.backends.mla.indexer import (
     RBLNDeepseekV32IndexerBackend,
@@ -76,6 +80,18 @@ class TestRblnTransferTopology:
 
         assert len(topo.get_transfer_cache_regions(cache, object())) == 2
 
+    def test_a_latent_beside_split_attention_stays_one_region(self):
+        # An MSA indexer next to an attention layer laid out K-first: the
+        # attention backend's split is not the latent's, whose leading axis is
+        # its blocks -- iterating it would hand back a block per region.
+        with self._kernel_config(True):
+            topo = self._topology(RBLNFlashAttentionBackend)
+        latent = MagicMock(spec=MLAAttentionSpec)
+
+        regions = topo.get_transfer_cache_regions(torch.zeros(4, 64, 128), latent)
+
+        assert [r.shape for r in regions] == [(4, 64, 128)]
+
     def test_the_mla_layout_builds(self):
         topo = self._topology(RBLNFlashAttnMLABackend, is_mla=True)
 
@@ -108,6 +124,13 @@ class TestRblnTransferTopology:
         topo = self._topology(backend, is_mla=True)
 
         assert topo.kv_head_dim is None
+        assert topo.kv_token_dim == 1
+
+    def test_a_compressing_cache_is_probed_at_a_multiple_of_its_ratio(self):
+        # GLM-5.3's indexer keeps a row per 4 tokens and refuses a block it
+        # cannot divide; it is the first backend on a later PP stage.
+        topo = self._topology(RBLNGlm5NextIndexerBackend, is_mla=True)
+
         assert topo.kv_token_dim == 1
 
     def test_an_mla_layer_stays_one_region(self):

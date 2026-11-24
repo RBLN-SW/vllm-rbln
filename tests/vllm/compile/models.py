@@ -18,10 +18,6 @@ from __future__ import annotations
 
 from tests.vllm.model_specs import REBEL, CompileModelSpec
 
-OPT_ENVS = {
-    "VLLM_RBLN_BATCH_ATTN_OPT": "1",
-}
-
 _MINIMAX_BASE = CompileModelSpec(
     "MiniMaxAI/MiniMax-M2.7",
     {
@@ -31,11 +27,23 @@ _MINIMAX_BASE = CompileModelSpec(
         "max_num_batched_tokens": 512,
         "enable_expert_parallel": True,
     },
-    OPT_ENVS,
     chips=REBEL,
 )
 
 MODELS: list[CompileModelSpec] = [
+    CompileModelSpec(
+        "Qwen/Qwen3.5-9B",
+        # text-only: Qwen3.5 does not start with video on. The runner's block
+        # count does not model a GatedDeltaNet group: under prefix caching a
+        # request holds two state blocks, plus the null block.
+        {
+            "max_num_seqs": 1,
+            "language_model_only": True,
+            "block_size": 1024,
+            "num_gpu_blocks_override": None,
+        },
+        chips=REBEL,
+    ),
     CompileModelSpec(
         "Qwen/Qwen3-30B-A3B",
         {
@@ -45,7 +53,6 @@ MODELS: list[CompileModelSpec] = [
             "tensor_parallel_size": 4,
             "enable_expert_parallel": False,
         },
-        OPT_ENVS,
         chips=REBEL,
     ),
     CompileModelSpec(
@@ -60,7 +67,6 @@ MODELS: list[CompileModelSpec] = [
         },
         {
             "VLLM_RBLN_SUB_BLOCK_CACHE": "0",
-            **OPT_ENVS,
         },
         chips=REBEL,
         num_hidden_layers=4,

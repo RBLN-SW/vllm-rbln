@@ -38,7 +38,7 @@ def _spec_config(method: str, *, num_speculative_tokens: int = 3) -> Speculative
     """
     config = SpeculativeConfig.__new__(SpeculativeConfig)
     config.method = method
-    config.parallel_drafting = method == "dflash"
+    config.parallel_drafting = method in ("dflash", "dspark")
     config.num_speculative_tokens = num_speculative_tokens
     return config
 
@@ -49,8 +49,9 @@ def _reserve(method: str, **kwargs) -> int:
     )
 
 
-def test_dflash_reserves_no_slots():
-    assert _reserve("dflash") == 0
+@pytest.mark.parametrize("method", ["dflash", "dspark"])
+def test_parallel_drafters_reserve_no_slots(method):
+    assert _reserve(method) == 0
 
 
 def test_upstream_still_reserves_for_dflash():
@@ -89,13 +90,14 @@ def _budget_check(method: str, budget: int) -> None:
     )
 
 
-def test_a_zeroed_reservation_keeps_a_tight_budget_legal():
+@pytest.mark.parametrize("method", ["dflash", "dspark"])
+def test_a_zeroed_reservation_keeps_a_tight_budget_legal(method):
     # The payoff: upstream refuses a budget it cannot fit the drafting slots
     # into, and dflash reserves `num_speculative_tokens` of them. Zeroing the
     # reservation is what keeps a budget that tight usable on RBLN.
-    tight = _spec_config("dflash").num_speculative_tokens - 1
+    tight = _spec_config(method).num_speculative_tokens - 1
 
-    _budget_check("dflash", tight)
+    _budget_check(method, tight)
 
     with pytest.raises(ValueError, match="enough slots"):
         VllmConfig._set_max_num_scheduled_tokens(

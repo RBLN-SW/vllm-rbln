@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -56,7 +56,8 @@ if TYPE_CHECKING:
 # hash so an RBLN peer on another schema fails the handshake cleanly; earlier
 # bumps are `git log -L` on this line.
 #   10: per logical region, its cut axis and the slice each chiplet area holds
-RBLN_NIXL_CONNECTOR_VERSION: int = 10
+#   11: indivisible block state and auxiliary regions retain their owner groups
+RBLN_NIXL_CONNECTOR_VERSION: int = 11
 
 # Prefix a push completion notification carries when it names the half-open
 # range this write filled: ``RBLNS:<writer>:<lo>:<hi>:<per_block>:`` ahead of
@@ -71,10 +72,13 @@ class ChipletSplitAxis(Enum):
 
     ``HEAD`` means an area holds some of the shard's KV heads over every token
     of a block; ``TOKEN`` means every head over some of the tokens.
+    ``BLOCK`` is a per-block payload: whole where every rank holds it alike,
+    and otherwise paired across TP degrees by the heads its spec bands.
     """
 
     HEAD = 0
     TOKEN = 1
+    BLOCK = 2
 
 
 @dataclass
@@ -96,9 +100,10 @@ class RblnNixlAgentMetadata(NixlAgentMetadata):
     # Per logical region, in region order: a speculative draft can be cut on
     # another axis than its target.
     kv_split_axes: list[ChipletSplitAxis] = field(default_factory=list)
-    # What a block holds (`_kv_per_block`). A process picks the layout, not the
-    # build, so two peers off one build can differ and the version cannot tell
-    # them apart. The default is the layout every version through 4 had.
+    # How many of K and V an attention region's block holds (`_kv_per_block`);
+    # a latent's holds one. A process picks the layout, not the build, so two
+    # peers off one build can differ and the version cannot tell them apart.
+    # The default is the layout every version through 4 had.
     kv_per_block: int = 1
     # Tokens a block holds in the view the sliding-window kernel reads. 0 where
     # this shard has no single answer to advertise, which `registration.py`
@@ -139,15 +144,18 @@ class RblnNixlConnectorMetadata(NixlConnectorMetadata):
         # window begins can only be found from the total -- and the prefix
         # offered mid-stream is shorter than it.
         self.push_stream_total: dict[ReqId, int] = {}
-        # Tokens of KV the offered prefix holds. Distinct from `valid_tokens`,
-        # which is the request's final count and only exists once it is over:
-        # an offer is a prefix of a request still being computed, and how much
-        # of its last block is filled is what a write smaller than a block
-        # needs to know.
+        # Tokens of KV the offered prefix holds. Distinct from the request's
+        # final count: an offer is a prefix of a request still being computed,
+        # and how much of its last block is filled is what a write smaller than
+        # a block needs to know.
         self.push_stream_tokens: dict[ReqId, int] = {}
-        # Tokens of KV the offered block list holds, so a last block that is not
-        # full can leave the areas above its final token behind. Absent where
-        # the count is unknown, which keeps the whole block.
+        # The final count of a request whose closing chunk this step schedules,
+        # for the offer that carries its whole list. It rides that offer, so it
+        # reaches the writer with the list rather than a step behind it.
+        self.push_stream_valid_tokens: dict[ReqId, int] = {}
+        # The final count for a handover, so a last block that is not full can
+        # leave the areas above its final token behind. Absent where the count
+        # is unknown, which keeps the whole block.
         self.valid_tokens: dict[ReqId, int] = {}
 
     @classmethod
@@ -281,6 +289,11 @@ class TransferShape:
     groups: int
     use_host_buffer: bool
     writes_into_peer: bool
+    #: Whether a write also carries a recurrent group's block-boundary state:
+    #: a writer whose prefix caching runs the recurrent groups in align mode.
+    #: The consumer allocates for it before the producer is known, so the
+    #: compatibility hash keeps two ends that decide it differently apart.
+    push_boundary_state: bool
 
     @property
     def has_window_range(self) -> bool:
@@ -305,7 +318,8 @@ class TransferShape:
         """Whether a write cuts a block into chunks.
 
         Only chunk mode does. A streamed write on its own sends whole blocks:
-        the ones the prefill has closed, and the last one at the handover.
+        the ones the prefill has closed, and the last one with the closing
+        chunk or at the handover.
         """
         return self.chunk_mode
 
@@ -350,6 +364,12 @@ def transfer_shape(
     chunk_mode = connector_option(vllm_config, "chunk_mode", False)
     wants_window = connector_option(vllm_config, "swa_window_mode", False)
     wants_stream = connector_option(vllm_config, "push_stream", False)
+    cache_config = vllm_config.cache_config
+    push_boundary_state = (
+        writes_into_peer
+        and cache_config.enable_prefix_caching
+        and cache_config.mamba_cache_mode == "align"
+    )
 
     # Only the side that originates bytes into a peer sends a prefix early, so
     # the knob is inert on the other -- and a shape that let it through there
@@ -386,6 +406,7 @@ def transfer_shape(
         groups=len(specs),
         use_host_buffer=use_host_buffer,
         writes_into_peer=writes_into_peer,
+        push_boundary_state=push_boundary_state,
     )
 
 
@@ -394,6 +415,8 @@ def rbln_compat_hash(
     *,
     writes_into_peer: bool,
     cross_layers_blocks: bool,
+    push_boundary_state: bool,
+    exchanges_block_state: bool,
     speculative_config: "SpeculativeConfig | None" = None,
 ) -> str:
     """Fold the RBLN schema version and the factors upstream's hash drops into
@@ -404,8 +427,12 @@ def rbln_compat_hash(
     a producer that writes into a consumer expecting to read passes every
     length check; the draft model, because its attention layers are members of
     the KV cache this connector registers while upstream's factors describe the
-    target alone; and ``cross_layers_blocks``, which scales the page by the
-    KV-cache tensor count and which 0.30 dropped from upstream's own factors.
+    target alone; the EAGLE block drop where a single-state SSM layer is
+    exchanged, because it moves the block-boundary state;
+    ``cross_layers_blocks``, which scales the page by the KV-cache tensor count
+    and which 0.30 dropped from upstream's own factors; and
+    ``push_boundary_state``, because a writer's consumer allocates for the
+    boundary state before the producer says whether it sends one.
 
     Model-level values only -- the hash is compared across every shard, so a
     per-rank quantity would differ between PP stages.
@@ -416,6 +443,9 @@ def rbln_compat_hash(
         "rbln_writes_into_peer": writes_into_peer,
         "rbln_cross_layers_blocks": cross_layers_blocks,
     }
+    if push_boundary_state:
+        # Added only when on, so a writer without align-mode state hashes as before.
+        factors["rbln_push_boundary_state"] = True
     if speculative_config is not None and (
         speculative_config.use_eagle() or speculative_config.uses_draft_model()
     ):
@@ -427,4 +457,6 @@ def rbln_compat_hash(
             "rbln_draft_revision": draft_model_config.revision,
             "rbln_draft_code_revision": draft_model_config.code_revision,
         }
+        if exchanges_block_state:
+            factors["rbln_eagle_block_drop"] = speculative_config.use_eagle_block_drop()
     return hash_factors(factors)

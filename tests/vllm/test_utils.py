@@ -18,11 +18,15 @@ env scrub silently makes every other test depend on the developer's shell."""
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
+from . import conftest
 from .test_envs import ENV_SOURCE_ALIASES, RBLN_KEYS
 from .utils import (
+    _SPAWN_CHILD_ENV,
     SCRUBBED_EXTRA,
     VLLM_RBLN_ENV,
     devices_needed,
@@ -33,9 +37,110 @@ from .utils import (
 
 
 @pytest.mark.parametrize(
+    ("keywords", "spawned"),
+    [
+        ({"use_device": True}, False),
+        ({"model_compile": True}, True),
+        ({"use_device": True, "model_compile": True}, True),
+    ],
+    ids=["device-unit", "model-compile", "model-compile-with-device"],
+)
+def test_protocol_only_spawns_model_compiles(monkeypatch, keywords, spawned):
+    monkeypatch.delenv(_SPAWN_CHILD_ENV, raising=False)
+    item = SimpleNamespace(
+        keywords=keywords,
+        nodeid="test_model.py::test_model",
+        location=("test_model.py", 0, "test_model"),
+        ihook=Mock(),
+        session=SimpleNamespace(_setupstate=Mock()),
+    )
+    child = Mock()
+    child.records_for.return_value = []
+    child.take_warnings.return_value = []
+    start = Mock(return_value=child)
+    monkeypatch.setattr(conftest, "_spawn_for", start)
+    monkeypatch.setattr(conftest, "_will_be_skipped", lambda item: False)
+
+    result = conftest.pytest_runtest_protocol(item, nextitem=None)
+
+    assert result is (True if spawned else None)
+    if spawned:
+        start.assert_called_once_with(item)
+    else:
+        start.assert_not_called()
+
+
+@pytest.fixture
+def shard_config(monkeypatch):
+    monkeypatch.delenv(_SPAWN_CHILD_ENV, raising=False)
+
+    def make(index, count=2):
+        options = {
+            "--model-compile": False,
+            "--shard-index": index,
+            "--shard-count": count,
+        }
+        return SimpleNamespace(
+            getoption=options.__getitem__,
+            hook=SimpleNamespace(pytest_deselected=Mock()),
+        )
+
+    return make
+
+
+@pytest.mark.parametrize("count", [2, 3])
+def test_shards_cover_cases_once_and_preserve_assignments(shard_config, count):
+    items = [
+        SimpleNamespace(nodeid=f"sample.py::test_sample[{index}]", keywords={})
+        for index in range(24)
+    ]
+    shards = []
+    new_case_shards = 0
+    for index in range(count):
+        config = shard_config(index, count)
+        selected = items.copy()
+        conftest.pytest_collection_modifyitems(config, selected)
+        assert 0 < len(selected) < len(items)
+        deselected = config.hook.pytest_deselected.call_args.kwargs["items"]
+        assert {id(item) for item in selected}.isdisjoint(map(id, deselected))
+        assert {id(item) for item in selected + deselected} == set(map(id, items))
+        shards.append([item.nodeid for item in selected])
+
+        added = SimpleNamespace(nodeid="sample.py::test_new_case", keywords={})
+        expanded = [added, *reversed(items)]
+        conftest.pytest_collection_modifyitems(config, expanded)
+        new_case_shards += added in expanded
+        assert [item.nodeid for item in expanded if item is not added] == list(
+            reversed(shards[-1])
+        )
+    flattened = [nodeid for shard in shards for nodeid in shard]
+    assert len(flattened) == len(set(flattened)) == len(items)
+    assert set(flattened) == {item.nodeid for item in items}
+    assert new_case_shards == 1
+
+
+def test_spawn_child_does_not_repeat_sharding(shard_config, monkeypatch):
+    items = [
+        SimpleNamespace(nodeid=f"sample.py::test_sample[{index}]", keywords={})
+        for index in range(24)
+    ]
+    selected = items.copy()
+    config = shard_config(0)
+    conftest.pytest_collection_modifyitems(config, selected)
+    assert 0 < len(selected) < len(items)
+
+    monkeypatch.setenv(_SPAWN_CHILD_ENV, "1")
+    child = items.copy()
+    child_config = shard_config(0)
+    conftest.pytest_collection_modifyitems(child_config, child)
+    assert child == items
+    child_config.hook.pytest_deselected.assert_not_called()
+
+
+@pytest.mark.parametrize(
     ("key", "expected"),
     [
-        ("VLLM_RBLN_BATCH_ATTN_OPT", True),
+        ("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", True),
         # Bare RBLN_ names belong to the host and the compiler, not to the
         # package under test, so the shell keeps them.
         ("RBLN_DEVICES", False),
@@ -60,7 +165,7 @@ def test_is_scrubbed_classification(key, expected):
 def test_scrub_env_removes_reports_and_preserves():
     """The three observable halves of the contract, in one pass."""
     environ = {
-        "VLLM_RBLN_BATCH_ATTN_OPT": "1",
+        "VLLM_RBLN_USE_DYNAMIC_KV_CACHE": "1",
         "RBLN_USE_CUSTOM_KERNEL": "1",
         "RBLN_DEVICES": "0,1",
         "PATH": "/usr/bin",
@@ -68,7 +173,10 @@ def test_scrub_env_removes_reports_and_preserves():
     removed = scrub_env(environ)
 
     # Reported with values, so pytest_report_header can show what it took.
-    assert removed == {"VLLM_RBLN_BATCH_ATTN_OPT": "1", "RBLN_USE_CUSTOM_KERNEL": "1"}
+    assert removed == {
+        "VLLM_RBLN_USE_DYNAMIC_KV_CACHE": "1",
+        "RBLN_USE_CUSTOM_KERNEL": "1",
+    }
     # Mutated in place, and nothing else was touched.
     assert environ == {"RBLN_DEVICES": "0,1", "PATH": "/usr/bin"}
 
@@ -125,6 +233,8 @@ class TestDeviceInventory:
     def test_visible_list_wins_over_the_nodes(self, monkeypatch, name):
         # The deprecated name counts too: this helper runs in the parent pytest
         # process, before the platform plugin folds one name into the other.
+        monkeypatch.delenv("RBLN_VISIBLE_DEVICES", raising=False)
+        monkeypatch.delenv("RBLN_DEVICES", raising=False)
         monkeypatch.setenv(name, "3,4")
         assert rbln_device_count() == 2
 

@@ -10,4 +10,5 @@ jobs:
     uses: ./.github/workflows/rbln_deploy.yaml
     with:
       version: ${{ github.ref_name }}
-    secrets: inherit
+    secrets:
+      PKG_ORG_GATE: ${{ secrets.PKG_ORG_GATE }}

@@ -1,5 +1,5 @@
 env:
-  UV_CACHE_DIR: "/root/.cache/uv"
+  UV_CACHE_DIR: "/mnt/uv_cache"
   UV_LINK_MODE: "symlink"
   UV_INDEX_STRATEGY: "unsafe-best-match"
 
@@ -36,6 +36,11 @@ _sync: &sync |
 _dshm: &dshm
   - kubernetes:
       podSpecPatch:
+        tolerations:
+          - key: rebellions.ai/dedicated
+            operator: Equal
+            value: framework.sw
+            effect: NoSchedule
         containers:
           - name: container-0
             volumeMounts:
@@ -53,12 +58,14 @@ _pytest: &pytest
     queue: udc
   resources:
     npu:
-      count: 4
+      count: 1
       product: "RBLN-CR13"
   image: "${DEVTOOLS_DOCKER_IMAGE}"
   secrets: *secrets
   plugins: *dshm
   timeout_in_minutes: 60
+  artifact_paths:
+    - "pytest-results/**/*"
 
 _e2e: &e2e
   <<: *pytest
@@ -67,13 +74,36 @@ _e2e: &e2e
     VLLM_RBLN_TEST_DP_TIMEOUT_S: "3600"
   timeout_in_minutes: "${PYTEST_E2E_TIMEOUT:-60}"
 
-steps:
-  - <<: *pytest
-    label: ":pytest: [CR13] pytest (unit)"
-    key: "vllm-rbln-pytest-cr13"
+_planned_e2e:
+  compile:
+    <<: *e2e
+    key: "vllm-rbln-e2e-compile-cr13"
     command:
       - *sync
-      - "bash .buildkite/pipelines/vllm-rbln/scripts/run-unit.sh"
+  specdec:
+    <<: *e2e
+    key: "vllm-rbln-e2e-specdec-cr13"
+    command:
+      - *sync
+
+steps:
+  - group: ":pytest: [CR13] pytest (unit)"
+    key: "vllm-rbln-pytest-cr13"
+    steps:
+      - <<: *pytest
+        label: "unit-sample %N/%t"
+        key: "vllm-rbln-pytest-unit-sample-cr13"
+        parallelism: 2
+        command:
+          - *sync
+          - "bash .buildkite/pipelines/vllm-rbln/scripts/run-unit.sh --group sample"
+
+      - <<: *pytest
+        label: "unit-others"
+        key: "vllm-rbln-pytest-unit-others-cr13"
+        command:
+          - *sync
+          - "bash .buildkite/pipelines/vllm-rbln/scripts/run-unit.sh --group others"
 
   - group: ":pytest: [CR13] pytest (e2e)"
     key: "vllm-rbln-pytest-e2e-cr13"
@@ -81,49 +111,34 @@ steps:
       - <<: *e2e
         label: "basic_correctness"
         key: "vllm-rbln-e2e-basic-correctness-cr13"
-        resources:
-          npu:
-            count: 1
-            product: "RBLN-CR13"
         command:
           - *sync
           - "bash .buildkite/pipelines/vllm-rbln/scripts/run-e2e.sh --group basic_correctness ${PYTEST_E2E_ARGS:-}"
 
       - <<: *e2e
-        label: "compile"
-        key: "vllm-rbln-e2e-compile-cr13"
-        command:
-          - *sync
-          - "bash .buildkite/pipelines/vllm-rbln/scripts/run-e2e.sh --group compile ${PYTEST_E2E_ARGS:-}"
-
-      - <<: *e2e
         label: "dp"
         key: "vllm-rbln-e2e-dp-cr13"
+        resources:
+          npu:
+            count: 4
+            product: "RBLN-CR13"
         command:
           - *sync
           - "bash .buildkite/pipelines/vllm-rbln/scripts/run-e2e.sh --group dp ${PYTEST_E2E_ARGS:-}"
 
       - <<: *e2e
-        label: "specdec"
-        key: "vllm-rbln-e2e-specdec-cr13"
-        resources:
-          npu:
-            count: 2
-            product: "RBLN-CR13"
-        command:
-          - *sync
-          - "bash .buildkite/pipelines/vllm-rbln/scripts/run-e2e.sh --group specdec ${PYTEST_E2E_ARGS:-}"
-
-      - <<: *e2e
         label: "core"
         key: "vllm-rbln-e2e-core-cr13"
-        resources:
-          npu:
-            count: 1
-            product: "RBLN-CR13"
         command:
           - *sync
           - "bash .buildkite/pipelines/vllm-rbln/scripts/run-e2e.sh --group core ${PYTEST_E2E_ARGS:-}"
+
+      - <<: *e2e
+        label: "sample"
+        key: "vllm-rbln-e2e-sample-cr13"
+        command:
+          - *sync
+          - "bash .buildkite/pipelines/vllm-rbln/scripts/run-e2e.sh --group sample ${PYTEST_E2E_ARGS:-}"
 
       # - <<: *e2e
       #   label: "others"

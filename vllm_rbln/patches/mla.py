@@ -14,7 +14,7 @@
 
 # RBLN overrides for Multi-head Latent Attention (MLA). These mirror the
 # non-MLA Attention overrides in ``patches/attention.py`` (KV cache resolved
-# from attention metadata as a graph input, pipeline-adjusted layer index) and
+# from attention metadata as a graph input, runner-assigned layer index) and
 # reuse its shared helpers.
 
 import torch
@@ -27,12 +27,8 @@ from vllm_rbln.model_executor.layers.quantization.modelopt_fp8 import (
     RBLNModelOptFp8LinearMethod,
 )
 from vllm_rbln.patches import register_patch
-from vllm_rbln.patches.attention import (
-    _record_pipeline_layer_index,
-    _resolve_kv_cache,
-)
+from vllm_rbln.patches.attention import _resolve_kv_cache
 
-mla_attention_original_init = MLAAttention.__init__
 mla_attention_original_process_weights = MLAAttention.process_weights_after_loading
 mla_attention_original_get_kv_cache_spec = MLAAttention.get_kv_cache_spec
 mla_attention_original_get_and_maybe_dequant_weights = (
@@ -95,10 +91,10 @@ def patched_get_mla_prefill_backend(vllm_config) -> type[_RBLNNoOpMLAPrefillBack
         "MLAAttention.get_kv_cache_spec"
     ),
     reason=(
-        "fp8 DSA MLA stores the latent cache as an RBLN-packed 768-byte int8 row "
+        "fp8 DSA MLA stores the latent cache as an RBLN-packed 768-byte uint8 row "
         "(512 fp8 kv_c + fp16 scale + k_pe), quantized/packed in-kernel by the "
         "sparse_attn_deepseek_mla fp8 kernel. The compiler routes fp8 vs bf16 by "
-        "the cache channel width (768 != 576), so allocate head_size=768 int8. "
+        "the cache channel width (768 != 576), so allocate head_size=768 uint8. "
         "cache_dtype_str stays 'auto' so the page size is the plain "
         "head_size*itemsize (768B), not the upstream fp8_ds_mla 656B layout. "
         "Only the sparse (DSA) path packs this way; a dense MLA layer keeps the "
@@ -121,25 +117,10 @@ def patched_mla_get_kv_cache_spec(self: MLAAttention, vllm_config):
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
             head_size=packed_head_size,
-            dtype=torch.int8,
+            dtype=torch.uint8,
             cache_dtype_str="auto",
         )
     return mla_attention_original_get_kv_cache_spec(self, vllm_config)
-
-
-@register_patch(
-    target="vllm.model_executor.layers.attention.mla_attention.MLAAttention.__init__",
-    reason=(
-        "RBLN needs MLAAttention initialization to record a pipeline-adjusted "
-        "layer index so external KV-cache bindings can resolve the matching "
-        "per-layer latent cache tensor (same requirement as `Attention.__init__`)."
-    ),
-)
-def patched_mla_attention_init(self: MLAAttention, *args, **kwargs) -> None:
-    mla_attention_original_init(self, *args, **kwargs)
-
-    # NOTE(RBLN): Layer index is required to use external binding KV cache.
-    _record_pipeline_layer_index(self)
 
 
 @register_patch(
@@ -167,7 +148,7 @@ def patched_mla_attention_forward(
 
         # NOTE(RBLN): Use attn_metadata's KV cache instead of self.kv_cache
         # so that KV caches appear as explicit model inputs for compilation.
-        self_kv_cache = _resolve_kv_cache(attn_metadata, self.layer_index)
+        self_kv_cache = _resolve_kv_cache(attn_metadata, self.layer_name)
 
         if self.attn_backend.accept_output_buffer:
             output = torch.empty(output_shape, dtype=q.dtype, device=q.device)

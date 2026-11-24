@@ -78,8 +78,13 @@ class TestSlidingWindowSpec:
             FullAttentionSpec
         )
 
-    def test_mla_with_a_window_is_rejected(self, cr13):
+    def test_cr13_allows_a_regular_swa_draft_beside_an_mla_target(self, cr13):
         cr13(True)
+        spec = patched_get_kv_cache_spec(_layer(16), _config(use_mla=True))
+        assert type(spec) is SlidingWindowSpec
+
+    def test_other_devices_reject_swa_beside_an_mla_target(self, cr13):
+        cr13(False)
         with pytest.raises(NotImplementedError, match="MLA"):
             patched_get_kv_cache_spec(_layer(16), _config(use_mla=True))
 
@@ -148,9 +153,11 @@ class TestKvTransferWrap:
             def forward(self, layer, q, k, v, kv_cache, attn_metadata, **kwargs):
                 impl_saw["kv_cache"] = kv_cache
 
-        layer = SimpleNamespace(layer_index=0, impl=_Impl(), kv_cache=embedded)
+        layer = SimpleNamespace(impl=_Impl(), kv_cache=embedded)
         context = SimpleNamespace(
-            attn_metadata=SimpleNamespace(kv_caches=[torch.zeros(1)]),
+            attn_metadata=SimpleNamespace(
+                kv_caches=[torch.zeros(1)], kv_cache_positions={"layer.0": 0}
+            ),
             no_compile_layers={"layer.0": layer},
             slot_mapping={"layer.0": torch.zeros(1)},
             additional_kwargs={},

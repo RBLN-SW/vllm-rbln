@@ -58,7 +58,10 @@ from vllm_rbln.v1.worker.utils import (
     estimate_available_memory,
     estimate_model_kernel_size,
     get_autobind_cpu_ids,
+    get_cgroup_cpu_quota,
+    get_default_num_threads,
     get_kv_cache_names,
+    get_num_local_ranks,
     get_rbln_owned_card_indices,
     get_rbln_planned_affinity_cpu_count,
     get_rbln_visible_card_indices,
@@ -399,8 +402,9 @@ class TestEstimateModelKernelSize:
     def test_bytes_path_exact(self):
         # n_model_bytes path, default bits passed explicitly (no platform mock).
         result = estimate_model_kernel_size(
-            _make_model_config(num_layers=2, vocab_size=64, hidden_size=32),
+            _make_model_config(vocab_size=64, hidden_size=32),
             _make_parallel_config(tp_size=1),
+            num_layers=2,
             n_model_bytes=12_288,
             default_bits_per_param=16,
         )
@@ -409,8 +413,9 @@ class TestEstimateModelKernelSize:
     def test_params_path_exact(self):
         # n_model_params + nbits_per_param path.
         result = estimate_model_kernel_size(
-            _make_model_config(num_layers=4, vocab_size=128, hidden_size=64),
+            _make_model_config(vocab_size=128, hidden_size=64),
             _make_parallel_config(tp_size=1),
+            num_layers=4,
             n_model_params=1_000_000,
             nbits_per_param=16,
             default_bits_per_param=16,
@@ -419,8 +424,8 @@ class TestEstimateModelKernelSize:
 
     def test_tp_scaling(self):
         # tp_size changes lm_heads_nbytes (align per-tp, then multiply by tp).
-        mc = _make_model_config(num_layers=2, vocab_size=64, hidden_size=32)
-        common = dict(n_model_bytes=12_288, default_bits_per_param=16)
+        mc = _make_model_config(vocab_size=64, hidden_size=32)
+        common = dict(num_layers=2, n_model_bytes=12_288, default_bits_per_param=16)
         r1 = estimate_model_kernel_size(mc, _make_parallel_config(tp_size=1), **common)
         r2 = estimate_model_kernel_size(mc, _make_parallel_config(tp_size=2), **common)
         assert r1 == 6_291_456
@@ -444,6 +449,7 @@ class TestEstimateModelKernelSize:
             estimate_model_kernel_size(
                 _make_model_config(),
                 _make_parallel_config(),
+                num_layers=32,
                 default_bits_per_param=16,
                 **kwargs,
             )
@@ -451,60 +457,55 @@ class TestEstimateModelKernelSize:
     def test_default_bits_from_platform(self, monkeypatch):
         # With default_bits_per_param=None the bits come from the device name:
         # ATOM/REBEL -> 16, unknown RBLN -> ValueError, non-rbln -> assert.
-        mc = _make_model_config(num_layers=2, vocab_size=64, hidden_size=32)
+        mc = _make_model_config(vocab_size=64, hidden_size=32)
         pc = _make_parallel_config(tp_size=1)
+        kw = dict(num_layers=2, n_model_bytes=12_288)
 
         def _name(name):
             monkeypatch.setattr(current_platform, "get_device_name", lambda: name)
 
         _name("RBLN-CA25")
-        assert estimate_model_kernel_size(mc, pc, n_model_bytes=12_288) == 6_291_456
+        assert estimate_model_kernel_size(mc, pc, **kw) == 6_291_456
         _name("RBLN-CR13")
-        assert estimate_model_kernel_size(mc, pc, n_model_bytes=12_288) == 6_291_456
+        assert estimate_model_kernel_size(mc, pc, **kw) == 6_291_456
         _name("RBLN-XX99")
         with pytest.raises(ValueError, match="invalid RBLN architecture"):
-            estimate_model_kernel_size(mc, pc, n_model_bytes=12_288)
+            estimate_model_kernel_size(mc, pc, **kw)
         _name("cpu")
         with pytest.raises(AssertionError):
-            estimate_model_kernel_size(mc, pc, n_model_bytes=12_288)
+            estimate_model_kernel_size(mc, pc, **kw)
 
 
 class TestGetKvCacheNames:
-    @staticmethod
-    def _caches(*names):
-        return {n: torch.empty(0) for n in names}
+    @pytest.mark.parametrize(
+        "names",
+        [
+            ("model.layers.2.attn", "model.layers.10.attn"),
+            (
+                "model.layers.2.attn.0",
+                "model.layers.2.attn.9",
+                "model.layers.2.attn.10",
+                "model.layers.3.attn.0",
+            ),
+        ],
+        ids=["decoder-layers", "glm-slots"],
+    )
+    def test_orders_by_numeric_path(self, names):
+        assert get_kv_cache_names(reversed(names)) == list(names)
 
-    def test_orders_by_layer_index(self):
-        # Returned ordered by extracted layer index, not dict insertion order.
-        caches = self._caches(
-            "model.layers.2.self_attn",
-            "model.layers.0.self_attn",
-            "model.layers.1.self_attn",
+    def test_uses_full_cache_name_to_break_numeric_path_ties(self):
+        names = (
+            "model.layers.3.linear_attn",
+            "model.layers.3.linear_attn.conv_ring",
+            "model.layers.3.linear_attn.drafts",
+            "model.layers.3.self_attn.attn",
         )
-        assert get_kv_cache_names(caches) == [
-            "model.layers.0.self_attn",
-            "model.layers.1.self_attn",
-            "model.layers.2.self_attn",
-        ]
+        assert get_kv_cache_names(reversed(names)) == list(names)
 
-    def test_multi_layer_same_index_raises(self, monkeypatch):
-        # Two layers at one index on a non-cpu/cuda/xpu platform -> not supported.
-        monkeypatch.setattr(current_platform, "is_cpu", lambda: False)
-        monkeypatch.setattr(current_platform, "is_cuda_alike", lambda: False)
-        monkeypatch.setattr(current_platform, "is_xpu", lambda: False)
-        caches = self._caches("model.layers.0.self_attn", "model.layers.0.cross_attn")
-        with pytest.raises(NotImplementedError):
-            get_kv_cache_names(caches)
-
-    def test_multi_layer_same_index_allowed_on_cpu(self, monkeypatch):
-        # The other side of the branch: on cpu/cuda/xpu both names are returned.
-        monkeypatch.setattr(current_platform, "is_cpu", lambda: True)
-        monkeypatch.setattr(current_platform, "is_cuda_alike", lambda: False)
-        monkeypatch.setattr(current_platform, "is_xpu", lambda: False)
-        caches = self._caches("model.layers.0.self_attn", "model.layers.0.cross_attn")
-        names = get_kv_cache_names(caches)
-        assert set(names) == set(caches)
-        assert len(names) == 2
+    def test_duplicate_name_is_an_error(self):
+        name = "layer.3.attn"
+        with pytest.raises(ValueError, match="Duplicate KV cache name"):
+            get_kv_cache_names([name, name])
 
 
 class TestPrepareKernelBlockSizes:
@@ -986,6 +987,107 @@ class TestGetRblnPlannedAffinityCpuCount:
         )
         monkeypatch.setattr(worker_utils.os, "sched_getaffinity", lambda pid: {0, 1, 2})
         assert get_rbln_planned_affinity_cpu_count(0, 0, _make_parallel_config()) == 3
+
+
+class TestGetCgroupCpuQuota:
+    @staticmethod
+    def _cgroup(tmp_path, rel_path, files):
+        root = tmp_path / "cgroup"
+        for rel, content in files.items():
+            f = root / rel
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(content)
+        root.mkdir(exist_ok=True)
+        proc = tmp_path / "proc_cgroup"
+        proc.write_text(f"0::{rel_path}\n")
+        return str(root), str(proc)
+
+    def test_v2_container_root(self, tmp_path):
+        root, proc = self._cgroup(tmp_path, "/", {"cpu.max": "1400000 100000\n"})
+        assert get_cgroup_cpu_quota(root, proc) == 14.0
+
+    def test_v2_unlimited(self, tmp_path):
+        root, proc = self._cgroup(tmp_path, "/", {"cpu.max": "max 100000\n"})
+        assert get_cgroup_cpu_quota(root, proc) is None
+
+    def test_v2_takes_min_over_ancestors(self, tmp_path):
+        root, proc = self._cgroup(
+            tmp_path,
+            "/pod/ctr",
+            {
+                "pod/cpu.max": "400000 100000\n",
+                "pod/ctr/cpu.max": "max 100000\n",
+            },
+        )
+        assert get_cgroup_cpu_quota(root, proc) == 4.0
+
+    def test_v1(self, tmp_path):
+        root, proc = self._cgroup(
+            tmp_path,
+            "/",
+            {
+                "cpu/cpu.cfs_quota_us": "250000\n",
+                "cpu/cpu.cfs_period_us": "100000\n",
+            },
+        )
+        assert get_cgroup_cpu_quota(root, proc) == 2.5
+
+    def test_v1_unlimited(self, tmp_path):
+        root, proc = self._cgroup(
+            tmp_path,
+            "/",
+            {
+                "cpu/cpu.cfs_quota_us": "-1\n",
+                "cpu/cpu.cfs_period_us": "100000\n",
+            },
+        )
+        assert get_cgroup_cpu_quota(root, proc) is None
+
+    def test_no_cgroup_files(self, tmp_path):
+        assert get_cgroup_cpu_quota(str(tmp_path), str(tmp_path / "missing")) is None
+
+
+class TestGetDefaultNumThreads:
+    @pytest.mark.parametrize(
+        "allocated, quota, expected",
+        [
+            (128, None, 64),
+            (126, 14.0, 7),
+            (126, 2.5, 2),
+            (126, 5.5, 2),
+            (8, 64.0, 4),
+            (1, None, 2),
+        ],
+    )
+    def test_half_of_min_affinity_and_quota(
+        self, monkeypatch, allocated, quota, expected
+    ):
+        monkeypatch.setattr(worker_utils, "get_cgroup_cpu_quota", lambda: quota)
+        assert get_default_num_threads(allocated) == expected
+
+    @pytest.mark.parametrize(
+        "quota, ranks, expected",
+        [
+            (64.0, 4, 8),
+            (14.0, 8, 2),
+            (None, 8, 64),
+        ],
+    )
+    def test_quota_split_across_local_ranks(self, monkeypatch, quota, ranks, expected):
+        monkeypatch.setattr(worker_utils, "get_cgroup_cpu_quota", lambda: quota)
+        assert get_default_num_threads(128, ranks) == expected
+
+
+class TestGetNumLocalRanks:
+    @pytest.mark.parametrize(
+        "local_world_size, dp_local, expected",
+        [(8, 1, 8), (1, 4, 4), (2, 2, 4), (1, 0, 1)],
+    )
+    def test_product_of_tp_pp_and_local_dp(self, local_world_size, dp_local, expected):
+        pc = SimpleNamespace(
+            local_world_size=local_world_size, data_parallel_size_local=dp_local
+        )
+        assert get_num_local_ranks(pc) == expected
 
 
 class TestSetCpuAffinity:
@@ -1602,6 +1704,7 @@ class TestDynamicKvUnsupportedReason:
         block_size=16,
         max_model_len=32,
         kv_transfer_config=None,
+        is_mm_encoder_only=False,
     ):
         return SimpleNamespace(
             additional_config=RBLNConfig(
@@ -1616,6 +1719,7 @@ class TestDynamicKvUnsupportedReason:
             cache_config=SimpleNamespace(block_size=block_size),
             model_config=SimpleNamespace(max_model_len=max_model_len),
             kv_transfer_config=kv_transfer_config,
+            is_mm_encoder_only=is_mm_encoder_only,
         )
 
     @staticmethod
@@ -1643,13 +1747,18 @@ class TestDynamicKvUnsupportedReason:
         reason = dynamic_kv_unsupported_reason(self._cfg(use_custom_kernel=True))
         assert "RBLN_USE_CUSTOM_KERNEL" in reason
 
+    def test_an_encoder_only_instance_is_unsupported(self):
+        reason = dynamic_kv_unsupported_reason(self._cfg(is_mm_encoder_only=True))
+        assert "holds no KV cache" in reason
+
     @pytest.mark.parametrize(
         ("config_overrides", "expected"),
         [
             ({"block_size": 32}, "block_size == max_model_len"),
-            ({"speculative_method": "dflash"}, "DFlash drafter is non-causal"),
+            ({"speculative_method": "dflash"}, "context KV writes"),
+            ({"speculative_method": "dspark"}, "context KV writes"),
         ],
-        ids=["normal-attention", "dflash-drafter"],
+        ids=["normal-attention", "dflash-drafter", "dspark-drafter"],
     )
     def test_non_paged_attention_is_unsupported(self, config_overrides, expected):
         reason = dynamic_kv_unsupported_reason(self._cfg(**config_overrides))

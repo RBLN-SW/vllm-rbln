@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -21,7 +21,7 @@ import platform
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from datetime import datetime, timezone
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Literal, NoReturn, TypeVar
@@ -202,72 +202,6 @@ RBLN_DEV_DIR = "/dev"
 
 # 144 GiB of quad-chiplet DRAM minus the 4 GiB system region
 REBEL_DRAM_NBYTES = 144 * 2**30 - 4 * 2**30
-
-
-def extract_layer_index(layer_name: str, num_attn_module: int = 1) -> int:
-    int_vals: list[int] = []
-    for subname in layer_name.split("."):
-        try:
-            int_vals.append(int(subname))
-        except ValueError:
-            continue
-    if num_attn_module <= 1 or "attn" not in layer_name:
-        assert len(int_vals) == 1, (
-            f"layer name {layer_name} should only contain one integer"
-        )
-        return int_vals[0]
-    assert int_vals, f"layer name {layer_name} has no integer layer index"
-    base = int_vals[0]
-    if len(int_vals) >= 2:
-        sub = int_vals[1]
-    elif "scale" in layer_name:
-        sub = 2
-    elif "indexer" in layer_name:
-        sub = 1
-    else:
-        sub = 0
-    return base * num_attn_module + sub
-
-
-def pipeline_adjusted_layer_index(
-    layer_name: str,
-    model_config,
-    parallel_config,
-    num_attn_module: int,
-) -> int:
-    raw_layer_index = extract_layer_index(layer_name, num_attn_module)
-    if model_config is None:
-        return raw_layer_index
-
-    start, end = model_config.get_layers_start_end_indices(parallel_config)
-    total_num_hidden_layers = model_config.get_total_num_hidden_layers()
-    if raw_layer_index >= total_num_hidden_layers * num_attn_module:
-        # MTP/nextn layers are named past the target's layer count
-        # (mtp_start_layer_idx == num_hidden_layers), so their KV cache sits
-        # right after the target layers in the compacted per-rank cache list.
-        return (end - start) * num_attn_module + (
-            raw_layer_index - total_num_hidden_layers * num_attn_module
-        )
-    return raw_layer_index - start * num_attn_module
-
-
-def num_attn_module(model_config, cache_dtype) -> int:
-    hf_config = model_config.hf_config
-    if getattr(hf_config, "model_type", None) == "longcat_flash":
-        return 2
-    text_config = getattr(model_config, "hf_text_config", hf_config)
-    # A DSA model puts the lightning-indexer key cache next to MLA: 2 modules,
-    # or 3 when the indexer cache is fp8 (a companion fp16 scale cache).
-    if hasattr(text_config, "index_topk") or hasattr(hf_config, "index_topk"):
-        is_fp8 = bool(cache_dtype) and cache_dtype.startswith("fp8")
-        return 3 if is_fp8 else 2
-    # MiniMax-M3 MSA: the indexer key cache next to the GQA K/V cache. Dense
-    # layers own only K/V; the runner re-indexes layers by bound position.
-    if getattr(text_config, "sparse_attention_config", None) or getattr(
-        hf_config, "sparse_attention_config", None
-    ):
-        return 2
-    return 1
 
 
 def get_rbln_visible_card_indices() -> list[int]:
@@ -474,6 +408,8 @@ def dynamic_kv_unsupported_reason(vllm_config: VllmConfig) -> str | None:
                 "among the connectors the dynamic-KV resize is open for "
                 f"({', '.join(DYNAMIC_KV_SUPPORTED_CONNECTORS)})"
             )
+    if vllm_config.is_mm_encoder_only:
+        return "this instance runs the multimodal encoder only and holds no KV cache"
     return None
 
 
@@ -582,6 +518,7 @@ def estimate_model_kernel_size(
     model_config: ModelConfig,
     parallel_config: ParallelConfig,
     *,
+    num_layers: int,
     nbits_per_param: int | None = None,
     n_model_params: int | float | None = None,
     n_model_bytes: int | float | None = None,
@@ -593,7 +530,6 @@ def estimate_model_kernel_size(
     def align_2MB(x: int | float) -> int:
         return align(x, 2**21)
 
-    num_layers = model_config.get_num_layers(parallel_config)
     vocab_size = model_config.get_vocab_size()
     hidden_size = model_config.get_hidden_size()
     tp_size = parallel_config.tensor_parallel_size
@@ -784,6 +720,7 @@ def estimate_available_memory(
         kernel_size = estimate_model_kernel_size(
             model_config=model_config,
             parallel_config=parallel_config,
+            num_layers=model_config.get_num_layers(parallel_config),
             nbits_per_param=nbits_per_param,
             n_model_params=n_model_params,
             n_model_bytes=n_model_bytes,
@@ -1006,6 +943,77 @@ def get_rbln_planned_affinity_cpu_count(
         cpu_ids = [int(x.strip()) for x in local_omp_cpuid.split(",") if x.strip()]
         return max(1, len(cpu_ids))
     return max(1, len(os.sched_getaffinity(0)))
+
+
+def _read_cgroup_v2_quota(path: str) -> float | None:
+    try:
+        with open(os.path.join(path, "cpu.max")) as f:
+            quota, period = f.read().split()[:2]
+    except OSError:
+        return None
+    if quota == "max":
+        return None
+    return int(quota) / int(period)
+
+
+def _read_cgroup_v1_quota(path: str) -> float | None:
+    try:
+        with open(os.path.join(path, "cpu.cfs_quota_us")) as f:
+            quota = int(f.read())
+        with open(os.path.join(path, "cpu.cfs_period_us")) as f:
+            period = int(f.read())
+    except OSError:
+        return None
+    if quota <= 0 or period <= 0:
+        return None
+    return quota / period
+
+
+def get_cgroup_cpu_quota(
+    cgroup_root: str = "/sys/fs/cgroup", proc_cgroup: str = "/proc/self/cgroup"
+) -> float | None:
+    """CPUs this process may use under its cgroup CPU limit, or None if
+    unlimited.
+
+    A Kubernetes CPU limit is a CFS quota, not a cpuset, so it does not show
+    up in ``sched_getaffinity``.
+    """
+    quotas: list[float | None] = []
+    try:
+        with open(proc_cgroup) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        hierarchy_id, controllers, rel_path = line.split(":", 2)
+        if hierarchy_id == "0" and controllers == "":
+            path = os.path.normpath(cgroup_root + rel_path)
+            while path.startswith(cgroup_root):
+                quotas.append(_read_cgroup_v2_quota(path))
+                if path == cgroup_root:
+                    break
+                path = os.path.dirname(path)
+    for v1_dir in ("cpu", "cpu,cpuacct"):
+        quotas.append(_read_cgroup_v1_quota(os.path.join(cgroup_root, v1_dir)))
+    limits = [q for q in quotas if q is not None]
+    return min(limits) if limits else None
+
+
+def get_num_local_ranks(parallel_config: ParallelConfig) -> int:
+    """Worker processes on this node, which share the container's cgroup."""
+    return max(
+        1, parallel_config.local_world_size * parallel_config.data_parallel_size_local
+    )
+
+
+def get_default_num_threads(allocated_cpus: int, num_local_ranks: int = 1) -> int:
+    """Default torch/OpenMP thread count: half the usable CPUs (physical cores,
+    excluding HT siblings), capped by this rank's share of the cgroup CPU
+    quota."""
+    quota = get_cgroup_cpu_quota()
+    if quota is not None:
+        allocated_cpus = min(allocated_cpus, math.floor(quota / num_local_ranks))
+    return max(2, allocated_cpus // 2)
 
 
 def set_cpu_affinity(
@@ -1272,34 +1280,18 @@ def reorder_input_batch(input_batch: "InputBatch", perm: np.ndarray) -> None:
         ]
 
 
-def get_kv_cache_names(
-    kv_caches: dict[str, torch.Tensor],
-    num_attn_module: int = 1,
-) -> list[str]:
-    """Return KV cache layer names ordered by layer index.
-
-    A deterministic, hash-seed-independent ordering is required by the KV
-    connector: NIXL assigns transfer region indices in iteration order, so the
-    P/D region <-> layer agreement breaks if the order varies between runs.
-    Adapted from ``vllm.v1.worker.utils.bind_kv_cache``.
-    """
-    index2name: dict[int, list[str]] = defaultdict(list)
-    for layer_name in kv_caches:
-        index2name[extract_layer_index(layer_name, num_attn_module)].append(layer_name)
-
-    kv_cache_names: list[str] = []
-    for layer_index in sorted(index2name.keys()):
-        layer_names = index2name[layer_index]
-        if len(layer_names) > 1 and not (
-            current_platform.is_cuda_alike()
-            or current_platform.is_xpu()
-            or current_platform.is_cpu()
-        ):
-            # Multiple layers sharing one index (e.g. encoder-decoder cross +
-            # self attention) is only known-safe on GPU/CPU runners.
-            raise NotImplementedError
-        kv_cache_names.extend(layer_names)
-    return kv_cache_names
+def get_kv_cache_names(cache_names: Iterable[str]) -> list[str]:
+    """Order caches by numeric module path, breaking ties by full name."""
+    sort_keys: set[tuple[tuple[int, ...], str]] = set()
+    for name in cache_names:
+        numeric_path = tuple(int(part) for part in name.split(".") if part.isdecimal())
+        if not numeric_path:
+            raise ValueError(f"KV cache {name} has no numeric layer path")
+        sort_key = (numeric_path, name)
+        if sort_key in sort_keys:
+            raise ValueError(f"Duplicate KV cache name: {name}")
+        sort_keys.add(sort_key)
+    return [name for _, name in sorted(sort_keys)]
 
 
 def copy_host_device_kv_blocks(
