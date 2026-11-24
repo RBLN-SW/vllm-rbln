@@ -39,6 +39,7 @@ from vllm.v1.core.sched.output import (
 from vllm.v1.core.sched.request_queue import RequestQueue, SchedulingPolicy
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutputs
+from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.utils import record_function_or_nullcontext
@@ -1523,15 +1524,18 @@ class RBLNScheduler(Scheduler):
     ) -> bool:
         """Whether the free blocks hold ``request`` through its first spec
         decode step: the sampled and draft tokens after the prompt, plus the
-        lookahead.
+        lookahead. Without spec decode, through the prompt.
 
         An admitted prefill runs alone to completion (no mixed batching), so it
         must not be admitted short of that step: it would preempt itself there
         and its re-admission would evict the decodes again. The full-sequence
         gate in ``allocate_slots`` counts the prompt alone; this is the same
-        count carried through that step.
+        count carried through that step, plus the block an align-mode Mamba
+        group holds on top of that count while a chunk crosses its block
+        boundary: the chunk reads the previous block's state into a new block,
+        and the previous one is released only on the next chunk.
         """
-        if not self.num_spec_tokens:
+        if not (self.num_spec_tokens or self.need_mamba_block_aligned_split):
             return True
         manager = self.kv_cache_manager
         hit_blocks = list(new_computed_blocks.blocks)
@@ -1545,8 +1549,14 @@ class RBLNScheduler(Scheduler):
         num_local_computed_tokens = (
             request.num_computed_tokens + num_new_local_computed_tokens
         )
-        num_tokens_main_model = min(
-            request.num_tokens + 1 + self.num_spec_tokens, self.max_model_len
+        num_tokens_main_model = (
+            min(request.num_tokens + 1 + self.num_spec_tokens, self.max_model_len)
+            if self.num_spec_tokens
+            else request.num_tokens
+        )
+        total_computed_tokens = min(
+            num_local_computed_tokens + num_external_computed_tokens,
+            self.max_model_len,
         )
         num_blocks = manager.coordinator.get_num_blocks_to_allocate(
             request_id=request.request_id,
@@ -1555,15 +1565,19 @@ class RBLNScheduler(Scheduler):
             ),
             new_computed_blocks=tuple(hit_blocks),
             num_encoder_tokens=num_encoder_tokens,
-            total_computed_tokens=min(
-                num_local_computed_tokens + num_external_computed_tokens,
-                self.max_model_len,
-            ),
+            total_computed_tokens=total_computed_tokens,
             num_local_computed_tokens=num_local_computed_tokens,
             num_tokens_main_model=num_tokens_main_model,
             apply_admission_cap=True,
             prefill_end=max(request.num_prompt_tokens, request.num_tokens - 1),
         )
+        if self.need_mamba_block_aligned_split:
+            num_blocks += sum(
+                isinstance(group.kv_cache_spec, MambaSpec)
+                and total_computed_tokens // group.kv_cache_spec.block_size
+                != (num_tokens_main_model - 1) // group.kv_cache_spec.block_size
+                for group in self.kv_cache_config.kv_cache_groups
+            )
         watermark_blocks = manager.watermark_blocks if self.running else 0
         return num_blocks + watermark_blocks <= manager.block_pool.get_num_free_blocks()
 

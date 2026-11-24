@@ -212,6 +212,7 @@ def create_rbln_scheduler(
     additional_config: dict | None = None,
     kv_cache_config: KVCacheConfig | None = None,
     hash_block_size: int | None = None,
+    mamba_cache_mode: str = "none",
     ec_transfer_config: ECTransferConfig | None = None,
     ec_manager_config: EncoderCacheManagerConfig | None = None,
 ) -> RBLNScheduler:
@@ -238,6 +239,7 @@ def create_rbln_scheduler(
         gpu_memory_utilization=0.9,
         cache_dtype="auto",
         enable_prefix_caching=enable_prefix_caching,
+        mamba_cache_mode=mamba_cache_mode,
     )
     speculative_config: SpeculativeConfig | None = None
     if num_speculative_tokens is not None:
