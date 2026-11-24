@@ -108,7 +108,9 @@ def test_prefix_rings_do_not_change_frontend_token_block_size(
 ):
     from vllm.v1.kv_cache_interface import FullAttentionSpec
 
-    state = dk.RBLNDeepseekV4StateSpec(
+    from vllm_rbln.v1.attention.backends.deepseek_v4 import RBLNDeepseekV4StateSpec
+
+    state = RBLNDeepseekV4StateSpec(
         num_state_slots=3,
         block_size=4,
         num_kv_heads=1,

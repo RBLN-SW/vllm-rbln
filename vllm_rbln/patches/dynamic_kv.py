@@ -28,7 +28,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from vllm_rbln.logger import init_logger
 from vllm_rbln.patches.registry import register_patch
-from vllm_rbln.v1.attention.backends.deepseek_v4 import RBLNDeepseekV4StateSpec
+from vllm_rbln.v1.attention.backends.deepseek_v4 import DSV4_FIXED_POOL_SPECS
 from vllm_rbln.v1.worker.utils import (
     dynamic_kv_unsupported_reason,
     rescale_kv_cache_config,
@@ -72,7 +72,7 @@ def patched_initialize_kv_caches(
     kv_cache_config = engine_core_original_initialize_kv_caches(self, vllm_config)
     groups = kv_cache_config.kv_cache_groups
     if any(
-        isinstance(g.kv_cache_spec, RBLNDeepseekV4StateSpec)
+        isinstance(g.kv_cache_spec, DSV4_FIXED_POOL_SPECS)
         and g.kv_cache_spec.prefix_cacheable
         for g in groups
     ):
@@ -80,7 +80,7 @@ def patched_initialize_kv_caches(
             (
                 g.kv_cache_spec.block_size
                 for g in groups
-                if not isinstance(g.kv_cache_spec, RBLNDeepseekV4StateSpec)
+                if not isinstance(g.kv_cache_spec, DSV4_FIXED_POOL_SPECS)
                 and g.kv_cache_spec.prefix_cacheable
             ),
             default=requested_block_size,
@@ -163,7 +163,7 @@ def check_enough_kv_cache_blocks_after_resize(
             group.kv_cache_spec.page_size_bytes,
         )
         for group in kv_cache_config.kv_cache_groups
-        if not isinstance(group.kv_cache_spec, RBLNDeepseekV4StateSpec)
+        if not isinstance(group.kv_cache_spec, DSV4_FIXED_POOL_SPECS)
     )
     # +1: the block pool keeps block 0 as the null block.
     if kv_cache_config.num_blocks > one_request:

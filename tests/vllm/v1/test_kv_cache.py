@@ -36,6 +36,82 @@ from vllm_rbln.v1.kv_cache import (
 )
 
 
+class TestDeepseekV4Window:
+    """The paged SWA / compressor caches: upstream's sliding-window manager on a pool
+    of their own."""
+
+    def _spec(self, *, slots=9, block_size=4, window=8):
+        from vllm_rbln.v1.attention.backends.deepseek_v4 import RBLNDeepseekV4WindowSpec
+
+        return RBLNDeepseekV4WindowSpec(
+            num_state_slots=slots,
+            blocks_per_request=4,
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=8,
+            dtype=torch.float32,
+            sliding_window=window,
+        )
+
+    def _manager(self, *, slots=9, attention_blocks=64):
+        from vllm_rbln.v1.kv_cache import RBLNDeepseekV4WindowManager
+
+        attention = BlockPool(attention_blocks, False, 4)
+        manager = RBLNDeepseekV4WindowManager(
+            self._spec(slots=slots),
+            block_pool=attention,
+            enable_caching=False,
+            kv_cache_group_id=0,
+            scheduler_block_size=4,
+        )
+        return manager, attention
+
+    def test_spec_is_a_single_latent_window(self):
+        spec = self._spec()
+        assert spec.page_size_bytes == 4 * 8 * 4  # block_size * head_size * f32, no V
+        assert spec.max_requests == 2  # (9 - 1 null) // 4
+        assert spec.max_memory_usage_bytes(None) == 4 * spec.page_size_bytes
+
+    def test_blocks_come_from_the_own_pool(self):
+        manager, attention = self._manager()
+        assert manager.block_pool is not attention
+        free = attention.get_num_free_blocks()
+        blocks = manager.allocate_new_blocks("a", 12, 12)
+        assert len(blocks) == 3
+        assert attention.get_num_free_blocks() == free
+        assert manager.block_pool.get_num_free_blocks() == 8 - 3
+
+    def test_blocks_out_of_the_window_return_to_the_pool(self):
+        manager, _ = self._manager()
+        manager.allocate_new_blocks("a", 20, 20)
+        assert manager.block_pool.get_num_free_blocks() == 8 - 5
+        # 20 tokens computed, window 8: positions >= 13 stay, blocks 0-2 go back
+        manager.remove_skipped_blocks("a", 20)
+        assert manager.block_pool.get_num_free_blocks() == 8 - 2
+        null = manager.block_pool.null_block
+        assert manager.req_to_blocks["a"][:3] == [null] * 3
+
+    def test_a_full_pool_reports_the_attention_pool_full(self):
+        manager, attention = self._manager(slots=3)
+        args = ("a", 8, [], 0, 0, 8)
+        assert manager.get_num_blocks_to_allocate(*args) == 0
+        manager.allocate_new_blocks("b", 8, 8)
+        free = attention.get_num_free_blocks()
+        assert manager.get_num_blocks_to_allocate(*args) > free
+
+    def test_platform_registers_the_window_manager(self):
+        from vllm_rbln.platform import RblnPlatform
+        from vllm_rbln.v1.attention.backends.deepseek_v4 import RBLNDeepseekV4WindowSpec
+        from vllm_rbln.v1.kv_cache import RBLNDeepseekV4WindowManager
+
+        RblnPlatform.register_custom_kv_cache_specs(None)
+        assert (
+            KVCacheSpecRegistry.get_manager_class(self._spec())
+            is RBLNDeepseekV4WindowManager
+        )
+        assert isinstance(self._spec(), RBLNDeepseekV4WindowSpec)
+
+
 class TestDeepseekV4PrefixState:
     def _manager(self, *, draft=False, slots=5):
         from vllm_rbln.v1.attention.backends.deepseek_v4 import RBLNDeepseekV4StateSpec

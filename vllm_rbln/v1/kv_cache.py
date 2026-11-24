@@ -27,6 +27,7 @@ from vllm.v1.core.single_type_kv_cache_manager import (
     CircularBufferManager,
     MambaManager,
     SingleTypeKVCacheManager,
+    SlidingWindowManager,
 )
 from vllm.v1.kv_cache_interface import (
     KVCacheTensor,
@@ -57,6 +58,31 @@ def register_kv_cache(
 
 class RBLNFixedKVCacheTensor(KVCacheTensor):
     """A cache allocation whose capacity does not grow with the attention pool."""
+
+
+class RBLNDeepseekV4WindowManager(SlidingWindowManager):
+    """Upstream's sliding-window manager on the spec's own bounded pool.
+
+    The DeepSeek-V4 SWA cache and compressor states keep blocks of their own size
+    on a pool sized from the request limit (RBLNDeepseekV4WindowSpec), outside the
+    paged attention IDs and dynamic KV sizing. The coordinator charges every
+    group's new blocks to the attention pool, so this manager checks its own pool
+    and reports the attention pool full when it is not."""
+
+    def __init__(self, kv_cache_spec, *, block_pool, **kwargs):
+        self.attention_pool = block_pool
+        pool = BlockPool(
+            num_gpu_blocks=kv_cache_spec.num_state_slots,
+            enable_caching=kwargs["enable_caching"],
+            hash_block_size=block_pool.hash_block_size,
+        )
+        super().__init__(kv_cache_spec, block_pool=pool, **kwargs)
+
+    def get_num_blocks_to_allocate(self, *args, **kwargs) -> int:
+        needed = super().get_num_blocks_to_allocate(*args, **kwargs)
+        if needed > self.block_pool.get_num_free_blocks():
+            return self.attention_pool.get_num_free_blocks() + 1
+        return 0
 
 
 class RBLNDeepseekV4StateManager(CircularBufferManager):

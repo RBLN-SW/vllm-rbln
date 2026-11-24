@@ -75,6 +75,7 @@ from vllm_rbln.v1.attention.backends.deepseek_v4 import (
     DSV4_KV8_ROW_BYTES,
     RBLNDeepseekV4RingBackend,
     RBLNDeepseekV4StateSpec,
+    RBLNDeepseekV4WindowSpec,
     dsv4_paged_backend,
 )
 from vllm_rbln.v1.attention.backends.flash_attention import (
@@ -155,6 +156,81 @@ class RBLNDeepseekV4RingCache(_RBLNDeepseekV4Cache):
         slots = metadata.block_tables.reshape(-1, 1).to(torch.int32)
         query_len = metadata.cache_offsets - metadata.cache_seq_lens
         return ring, slots, query_len.to(torch.int32), metadata
+
+
+class RBLNDeepseekV4WindowCache(_RBLNDeepseekV4Cache):
+    """A sliding-window row cache: ``[blocks, block_size, width]``, token p's row in
+    block block_table[p // block_size] (the SWA cache or a compressor state).
+
+    A step reads the two `segment`-row segments before it, so the spec's sliding
+    window is 2 * segment and a request holds the blocks of its last 2 * segment
+    tokens plus the step's. The blocks come from a bounded pool of the cache's own
+    (RBLNDeepseekV4WindowSpec), sized for max_num_seqs decoding requests and one
+    prefill chunk (plus as much again to retain prefix blocks)."""
+
+    def __init__(
+        self,
+        prefix: str,
+        segment: int,
+        width: int,
+        dtype: torch.dtype,
+        block_size: int,
+    ) -> None:
+        super().__init__(prefix)
+        assert block_size % segment == 0 and block_size % 64 == 0
+        self.segment = segment
+        self.width = width
+        self.dtype = dtype
+        self.block_size = block_size
+
+    def _blocks(self, tokens: int) -> int:
+        """Blocks a request holds while `tokens` are in flight (SlidingWindowSpec's
+        admission bound)."""
+        return -(-(2 * self.segment - 1 + tokens) // self.block_size) + 1
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        speculative = vllm_config.speculative_config
+        drafts = speculative.num_speculative_tokens if speculative is not None else 0
+        scheduler = vllm_config.scheduler_config
+        decode = self._blocks(drafts + 1)
+        prefill = self._blocks(scheduler.max_num_batched_tokens)
+        pool = scheduler.max_num_seqs * decode + prefill
+        if vllm_config.cache_config.enable_prefix_caching:
+            pool *= 2
+        return RBLNDeepseekV4WindowSpec(
+            num_state_slots=pool + 1,
+            blocks_per_request=decode,
+            block_size=self.block_size,
+            num_kv_heads=1,
+            head_size=self.width,
+            dtype=self.dtype,
+            sliding_window=2 * self.segment,
+        )
+
+    def get_attn_backend(self) -> type[RBLNDeepseekV4RingBackend]:
+        return RBLNDeepseekV4RingBackend
+
+    def inputs(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, RBLNFlashAttentionMetadata]:
+        """(cache, block_table [B, P], query_len, metadata)."""
+        metadata = get_forward_context().attn_metadata[self.prefix]
+        cache = _resolve_kv_cache(metadata, self.prefix)
+        query_len = metadata.cache_offsets - metadata.cache_seq_lens
+        return (
+            cache,
+            metadata.block_tables.to(torch.int32),
+            query_len.to(torch.int32),
+            metadata,
+        )
+
+
+# Block sizes of the sliding-window caches: a multiple of their segment and of 64.
+DSV4_SWA_BLOCK_SIZE = 256
+
+
+def _state_block_size(segment: int) -> int:
+    return max(64, 2 * segment)
 
 
 def _paged_block_size(vllm_config: VllmConfig, compress_ratio: int) -> int:
@@ -262,19 +338,20 @@ class RBLNDeepseekV4Compressor(nn.Module):
         )
         self.norm = RMSNorm(head_dim, config.rms_norm_eps)
         self.rope = rope
-        self.state_cache = RBLNDeepseekV4RingCache(
+        self.state_cache = RBLNDeepseekV4WindowCache(
             prefix=f"{prefix}.state.{state_slot}",
-            window=self.coff * compress_ratio,
+            segment=self.coff * compress_ratio,
             width=2 * width,
             # Preserve projection values across partial compression groups.
             dtype=torch.float32,
+            block_size=_state_block_size(self.coff * compress_ratio),
         )
 
     def forward(self, x: torch.Tensor, seq_idx: torch.Tensor) -> torch.Tensor:
         """x [B, L, H] -> [B, ceil(L / r), head_dim] candidates (normed, RoPE'd)."""
         kv_score, _ = self.fused_wkv_wgate(x.float())
         kv, score = kv_score.chunk(2, dim=-1)
-        state, slot, query_len, _ = self.state_cache.inputs()
+        state, state_block_table, query_len, _ = self.state_cache.inputs()
         pooled = torch.ops.rbln_custom_ops.deepseek_v4_compressor(
             kv.float().contiguous(),
             score.float().contiguous(),
@@ -282,7 +359,7 @@ class RBLNDeepseekV4Compressor(nn.Module):
             state,
             seq_idx,
             query_len,
-            slot,
+            state_block_table,
             self.compress_ratio,
         )
         entries = self.norm(pooled.to(x.dtype))
@@ -466,11 +543,12 @@ class RBLNDeepseekV4Attention(nn.Module):
             max_position_embeddings=vllm_config.model_config.max_model_len,
             compress_ratio=self.compress_ratio,
         )
-        self.swa_cache = RBLNDeepseekV4RingCache(
+        self.swa_cache = RBLNDeepseekV4WindowCache(
             prefix=f"{prefix}.swa_cache.{SLOT_SWA}",
-            window=self.window,
+            segment=self.window,
             width=DSV4_KV8_ROW_BYTES,
             dtype=torch.uint8,
+            block_size=DSV4_SWA_BLOCK_SIZE,
         )
         self.compressor = None
         self.cmp_cache = None
@@ -534,13 +612,13 @@ class RBLNDeepseekV4Attention(nn.Module):
         q, _ = self.rope(positions, q)
         kv, _ = self.rope(positions, self.kv_norm(kv))  # [B, L, 512]
 
-        swa, swa_slot, query_len, metadata = self.swa_cache.inputs()
+        swa, swa_block_table, query_len, metadata = self.swa_cache.inputs()
         seq_idx = metadata.cache_seq_lens.to(torch.int32)
         common = (
             q.transpose(1, 2).contiguous(),
             kv.contiguous(),
             swa,
-            swa_slot,
+            swa_block_table,
             self.attn_sink,
             self.scale,
             seq_idx,

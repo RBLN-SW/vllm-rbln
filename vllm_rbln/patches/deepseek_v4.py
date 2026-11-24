@@ -121,11 +121,11 @@ def deepseek_v4_kv_cache_groups(vllm_config, kv_cache_spec):
 
     if not _is_deepseek_v4(vllm_config):
         return None
-    from vllm_rbln.v1.attention.backends.deepseek_v4 import RBLNDeepseekV4StateSpec
+    from vllm_rbln.v1.attention.backends.deepseek_v4 import DSV4_FIXED_POOL_SPECS
 
     attn = {n: s for n, s in kv_cache_spec.items() if type(s) is MLAAttentionSpec}
     states = {
-        n: s for n, s in kv_cache_spec.items() if isinstance(s, RBLNDeepseekV4StateSpec)
+        n: s for n, s in kv_cache_spec.items() if isinstance(s, DSV4_FIXED_POOL_SPECS)
     }
     if not kv_cache_spec or len(attn) + len(states) != len(kv_cache_spec):
         return None
@@ -142,7 +142,7 @@ def deepseek_v4_kv_cache_groups(vllm_config, kv_cache_spec):
     for name, spec in states.items():
         by_spec.setdefault(spec, []).append(name)
     groups.extend(
-        KVCacheGroupSpec(names, spec, is_eagle_group=spec.is_draft)
+        KVCacheGroupSpec(names, spec, is_eagle_group=getattr(spec, "is_draft", False))
         for spec, names in by_spec.items()
     )
     return groups
@@ -155,10 +155,10 @@ def _deepseek_v4_pages(kv_cache_groups):
         UniformTypeKVCacheSpecs,
     )
 
-    from vllm_rbln.v1.attention.backends.deepseek_v4 import RBLNDeepseekV4StateSpec
+    from vllm_rbln.v1.attention.backends.deepseek_v4 import DSV4_FIXED_POOL_SPECS
 
     if not any(
-        isinstance(g.kv_cache_spec, RBLNDeepseekV4StateSpec) for g in kv_cache_groups
+        isinstance(g.kv_cache_spec, DSV4_FIXED_POOL_SPECS) for g in kv_cache_groups
     ):
         return None
     pages: list[tuple[str, int, int | None]] = []
@@ -173,7 +173,7 @@ def _deepseek_v4_pages(kv_cache_groups):
                 (n, spec.kv_cache_specs[n].page_size_bytes, None)
                 for n in group.layer_names
             )
-        elif isinstance(spec, RBLNDeepseekV4StateSpec):
+        elif isinstance(spec, DSV4_FIXED_POOL_SPECS):
             pages.extend(
                 (n, spec.page_size_bytes, spec.num_state_slots)
                 for n in group.layer_names
@@ -369,7 +369,7 @@ def _build_deepseek_v4_memory_usage():
     from vllm.utils.math_utils import cdiv
     from vllm.v1.core import kv_cache_utils
 
-    from vllm_rbln.v1.attention.backends.deepseek_v4 import RBLNDeepseekV4StateSpec
+    from vllm_rbln.v1.attention.backends.deepseek_v4 import DSV4_FIXED_POOL_SPECS
 
     original = kv_cache_utils._max_memory_usage_bytes_from_groups
 
@@ -387,7 +387,7 @@ def _build_deepseek_v4_memory_usage():
                 g.kv_cache_spec.page_size_bytes,
             )
             for g in groups
-            if not isinstance(g.kv_cache_spec, RBLNDeepseekV4StateSpec)
+            if not isinstance(g.kv_cache_spec, DSV4_FIXED_POOL_SPECS)
         )
         return fixed + page * blocks
 
@@ -493,7 +493,7 @@ def _build_deepseek_v4_max_concurrency():
     from vllm.utils.math_utils import cdiv
     from vllm.v1.core import kv_cache_utils
 
-    from vllm_rbln.v1.attention.backends.deepseek_v4 import RBLNDeepseekV4StateSpec
+    from vllm_rbln.v1.attention.backends.deepseek_v4 import DSV4_FIXED_POOL_SPECS
 
     original = kv_cache_utils.get_max_concurrency_for_kv_cache_config
 
@@ -502,18 +502,18 @@ def _build_deepseek_v4_max_concurrency():
         rings = [
             g.kv_cache_spec
             for g in cfg.kv_cache_groups
-            if isinstance(g.kv_cache_spec, RBLNDeepseekV4StateSpec)
+            if isinstance(g.kv_cache_spec, DSV4_FIXED_POOL_SPECS)
         ]
         if not rings:
             return original(vllm_config, cfg)
-        limits = [float(spec.num_state_slots - 1) for spec in rings]
+        limits = [float(spec.max_requests) for spec in rings]
         blocks = sum(
             cdiv(
                 g.kv_cache_spec.max_memory_usage_bytes(vllm_config),
                 g.kv_cache_spec.page_size_bytes,
             )
             for g in cfg.kv_cache_groups
-            if not isinstance(g.kv_cache_spec, RBLNDeepseekV4StateSpec)
+            if not isinstance(g.kv_cache_spec, DSV4_FIXED_POOL_SPECS)
         )
         if blocks:
             limits.append((cfg.num_blocks - 1) / blocks)

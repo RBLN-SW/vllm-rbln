@@ -16,8 +16,15 @@
 
 Paged caches use MLAAttentionSpec: compressed KV rows are 768 bytes, indexer keys
 are 128 fp8 values, and each block holds block_size / compress_ratio rows. The
-indexer scale is a block auxiliary. SWA and compressor rings use one writable
-buffer per request and immutable prefix checkpoints on a separate state pool.
+indexer scale is a block auxiliary.
+
+The SWA cache and the compressor states are sliding-window caches
+(RBLNDeepseekV4WindowSpec): rows at the token's absolute position in blocks of
+their own size, on a bounded pool of their own (independent of the paged
+attention IDs), managed by upstream's SlidingWindowManager. A step reads the two
+W-row segments before it (W = 128 for SWA, coff * r for a compressor), so a
+request keeps the blocks of its last 2 W tokens. RBLNDeepseekV4StateSpec (one
+ring slot per request) is the earlier layout, kept for its prefix checkpoints.
 """
 
 from dataclasses import dataclass
@@ -26,7 +33,7 @@ from typing import ClassVar
 import torch
 from vllm.v1.attention.backend import AttentionBackend, MultipleOf
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
-from vllm.v1.kv_cache_interface import CircularBufferSpec
+from vllm.v1.kv_cache_interface import CircularBufferSpec, SlidingWindowSpec
 
 import vllm_rbln.utils as rbln_utils
 
@@ -54,6 +61,39 @@ class RBLNDeepseekV4StateSpec(CircularBufferSpec):
     @property
     def prefix_cacheable(self) -> bool:
         return self.prefix_caching
+
+    @property
+    def max_requests(self) -> int:
+        """Requests the pool holds at once (slot 0 is its null block)."""
+        return self.num_state_slots - 1
+
+
+@dataclass(frozen=True, kw_only=True)
+class RBLNDeepseekV4WindowSpec(SlidingWindowSpec):
+    """A sliding-window cache on a bounded pool of its own (num_state_slots blocks,
+    block 0 its null block), independent of the paged attention IDs.
+
+    sliding_window is 2 W, the rows a step reads before it (two W-row segments),
+    so SlidingWindowManager keeps exactly the blocks the kernels read; the
+    attention window itself (128 tokens) is the kernels'. blocks_per_request is
+    what one request holds at most (its window plus the largest step)."""
+
+    num_state_slots: int
+    blocks_per_request: int
+    head_size_v: int = 0
+    dcp_sharded: bool = False
+    max_tp_shards: int | None = 1
+
+    @property
+    def max_requests(self) -> int:
+        return (self.num_state_slots - 1) // self.blocks_per_request
+
+    def max_memory_usage_bytes(self, vllm_config) -> int:
+        return self.blocks_per_request * self.page_size_bytes
+
+
+# The caches on a fixed pool of their own (outside dynamic KV sizing).
+DSV4_FIXED_POOL_SPECS = (RBLNDeepseekV4StateSpec, RBLNDeepseekV4WindowSpec)
 
 
 class RBLNDeepseekV4MetadataBuilder(RBLNFlashAttentionMetadataBuilder):
@@ -129,7 +169,8 @@ class _RBLNDeepseekV4CacheBackend(AttentionBackend):
 
 
 class RBLNDeepseekV4RingBackend(_RBLNDeepseekV4CacheBackend):
-    """One [capacity, width] circular buffer per request, addressed by its slot."""
+    """[blocks, rows, width] row caches: the sliding-window caches (a row a token)
+    and the earlier one-slot rings."""
 
     @staticmethod
     def get_name() -> str:

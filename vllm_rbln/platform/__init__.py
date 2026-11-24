@@ -422,9 +422,13 @@ class RblnPlatform(Platform):
         from vllm.v1.kv_cache_interface import MambaSpec
         from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
-        from vllm_rbln.v1.attention.backends.deepseek_v4 import RBLNDeepseekV4StateSpec
+        from vllm_rbln.v1.attention.backends.deepseek_v4 import (
+            RBLNDeepseekV4StateSpec,
+            RBLNDeepseekV4WindowSpec,
+        )
         from vllm_rbln.v1.kv_cache import (
             RBLNDeepseekV4StateManager,
+            RBLNDeepseekV4WindowManager,
             RBLNMambaManager,
             RBLNMambaSpec,
             RBLNSlidingWindowManager,
@@ -440,6 +444,11 @@ class RblnPlatform(Platform):
             RBLNDeepseekV4StateSpec,
             RBLNDeepseekV4StateManager,
             uniform_type_base_spec=RBLNDeepseekV4StateSpec,
+        )
+        KVCacheSpecRegistry.register(
+            RBLNDeepseekV4WindowSpec,
+            RBLNDeepseekV4WindowManager,
+            uniform_type_base_spec=RBLNDeepseekV4WindowSpec,
         )
         KVCacheSpecRegistry.register(
             RBLNMambaSpec, RBLNMambaManager, uniform_type_base_spec=MambaSpec

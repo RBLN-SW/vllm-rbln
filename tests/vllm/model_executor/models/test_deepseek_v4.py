@@ -104,11 +104,12 @@ def test_compressor_preserves_state_across_prefill_chunks(monkeypatch, chunked):
         1, keepdim=True
     )
     expected = compressor.norm(pooled.to(x.dtype))
-    state = torch.empty(1, 8, 256, dtype=compressor.state_cache.dtype)
-    slot = torch.zeros(1, 1, dtype=torch.int32)
+    # block 1 of a [2, 64, 2C] paged state (block 0 the null block)
+    state = torch.empty(2, 64, 256, dtype=compressor.state_cache.dtype)
+    slot = torch.ones(1, 1, dtype=torch.int32)
     query_len = torch.tensor([[3 if chunked else 4]], dtype=torch.int32)
     monkeypatch.setattr(
-        dsv4.RBLNDeepseekV4RingCache,
+        dsv4.RBLNDeepseekV4WindowCache,
         "inputs",
         lambda self: (state, slot, query_len, None),
     )
@@ -184,11 +185,11 @@ def test_compressor_padding_does_not_index_past_the_rope_table(monkeypatch, quer
         compressor.fused_wkv_wgate.weight.copy_(torch.randn(256, 4, generator=rng))
         compressor.ape.copy_(torch.randn(4, 128, generator=rng))
     monkeypatch.setattr(
-        dsv4.RBLNDeepseekV4RingCache,
+        dsv4.RBLNDeepseekV4WindowCache,
         "inputs",
         lambda self: (
-            torch.zeros(1, 8, 256),
-            torch.zeros(1, 1, dtype=torch.int32),
+            torch.zeros(2, 64, 256),
+            torch.ones(1, 2, dtype=torch.int32),
             torch.tensor([[query_len]], dtype=torch.int32),
             None,
         ),
