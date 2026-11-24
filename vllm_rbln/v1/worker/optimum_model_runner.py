@@ -197,7 +197,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             sampler = RBLNSampler(
                 logprobs_mode=self.model_config.logprobs_mode,
                 use_fp64_gumbel=False,
-                fused_sampling=False,
+                fused_sampling=rbln_config.use_fused_sampling,
             )
         else:
             logger.info("Using default vLLM sampler.")
@@ -961,6 +961,8 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         # and handling the second as a new request.
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
+        if isinstance(self.sampler, RBLNSampler):
+            self.sampler.forget_requests(scheduler_output.finished_req_ids)
 
         # Free cached encoder outputs signalled by the scheduler.
         # Without this, encoder_cache grows unboundedly on the EC consumer
@@ -1293,7 +1295,14 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                         input_batch.vocab_size,
                         dtype=self.dtype,
                     )
-                    _ = self.sampler(logits=empty_logits, sampling_metadata=metadata)
+                    if isinstance(self.sampler, RBLNSampler):
+                        self.sampler.warm_up(
+                            logits=empty_logits, sampling_metadata=metadata
+                        )
+                    else:
+                        _ = self.sampler(
+                            logits=empty_logits, sampling_metadata=metadata
+                        )
 
                 clear_reqs(input_batch)
 
@@ -1686,9 +1695,13 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         # Update output token ids with tokens sampled in last step
         # if async scheduling and required by current sampling params.
         self.input_batch.update_async_output_token_ids()
+        extra: dict[str, Any] = {}
+        if isinstance(self.sampler, RBLNSampler):
+            extra["input_batch"] = self.input_batch
         return self.sampler(
             logits=logits,
             sampling_metadata=sampling_metadata,
+            **extra,
         )
 
     def _get_prompt_logprobs_dict(

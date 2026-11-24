@@ -79,6 +79,11 @@ class RBLNConfigBase:
     use_custom_sampler: bool = True
     """Use the customized RBLN sampler."""
 
+    use_fused_sampling: bool = False
+    """Run the sampling step's logits processing inside the compiled sampling
+    graph: repetition / frequency / presence penalties and logit bias, on the
+    vocab chunks they touch, and min_p. Needs `use_custom_sampler`."""
+
     sub_block_size: int | None = Field(default=None, gt=0)
     """Token granularity for prefix cache hit calculation.
     If None, uses prefill_chunk_size.
@@ -106,11 +111,6 @@ class RBLNConfig(RBLNConfigBase):
 
     enable_sub_block_cache: bool = True
     """Enable sub-block prefix caching, at `sub_block_size` granularity."""
-
-    use_fused_sampling: bool = False
-    """Run the sampling step's logits processing inside the compiled sampling
-    graph: repetition / frequency / presence penalties and logit bias, on the
-    vocab chunks they touch, and min_p. Needs `use_custom_sampler`."""
 
     specialize_moe_decode: bool = True
     """Specialize the case where every instance is at the decode stage."""
@@ -234,6 +234,7 @@ class OptimumRBLNConfig(RBLNConfigBase):
             # Sampler graphs compile with use_cache=False, so they never enter
             # the bundle.
             "use_custom_sampler",
+            "use_fused_sampling",
         }
         return hash_factors(get_hash_factors(self, ignored_factors))
 
