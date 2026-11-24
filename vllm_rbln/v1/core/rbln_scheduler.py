@@ -1228,7 +1228,9 @@ class RBLNScheduler(Scheduler):
         # Construct the scheduler output.
         new_reqs_data = [
             NewRequestData.from_request(
-                req, req_to_new_blocks[req.request_id].get_block_ids()
+                req,
+                req_to_new_blocks[req.request_id].get_block_ids(),
+                uses_mrope=self.model_uses_mrope,
             )
             for req in scheduled_new_reqs
         ]
