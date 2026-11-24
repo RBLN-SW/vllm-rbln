@@ -168,7 +168,7 @@ class _RBLNGemma4VisionEncoder(nn.Module):
             q, k, v = q[0].transpose(0, 1), k[0].transpose(0, 1), v[0].transpose(0, 1)
             k = k.repeat_interleave(attn.num_key_value_groups, dim=0)
             v = v.repeat_interleave(attn.num_key_value_groups, dim=0)
-            scores = torch.matmul(q, k.transpose(1, 2)) * attn.scaling + key_bias[0]
+            scores = torch.matmul(q, k.transpose(1, 2)) * attn.scaling + key_bias
             out = torch.matmul(torch.softmax(scores, dim=-1), v)
             out = out.transpose(0, 1).reshape(residual.shape)
             hidden_states = residual + layer.post_attention_layernorm(attn.o_proj(out))
@@ -436,7 +436,7 @@ class RBLNGemma4ForConditionalGeneration(
         patches[0, :num_patches] = pixel_values[valid]
         padding = ~(positions >= 0).all(dim=-1)
         key_bias = torch.where(padding, torch.finfo(self.model_dtype).min, 0.0)[
-            :, None, None, :
+            :, None, :
         ]
         device = next(tower.parameters()).device
         # The patches of a grid whose sides are multiples of the pooling kernel
