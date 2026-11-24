@@ -115,6 +115,47 @@ def _model_with_vision_encoder(tower):
     return model
 
 
+@pytest.mark.parametrize("valid_rows", [[0, 1, 2], [0, 2, 5]])
+def test_vision_encoder_stages_valid_patches_in_order(monkeypatch, valid_rows):
+    pixels = torch.arange(18, dtype=torch.bfloat16).view(6, 3)
+    positions = torch.full((6, 2), -1)
+    positions[valid_rows] = torch.tensor([[2, 0], [1, 0], [0, 0]])
+    expected = pixels[valid_rows]
+    stage = Mock(side_effect=lambda bucket, inputs, num_valid: inputs)
+
+    encoder = BufferedVisionEncoder(
+        lambda patches, *_: (patches[0].clone(),),
+        specs_by_bucket={
+            6: [
+                gemma4.rbln_utils.EncoderInput(
+                    "pixel_values",
+                    (1, 6, 3),
+                    axis=1,
+                    pad=0.0,
+                    dtype=torch.float32,
+                    register_host=True,
+                )
+            ]
+        },
+        device="cpu",
+        dtype=pixels.dtype,
+    )
+    monkeypatch.setattr(encoder.input_buffers, "stage", stage)
+    model = _bare_model(
+        vision_tower=SimpleNamespace(config=SimpleNamespace(pooling_kernel_size=1)),
+        model_dtype=pixels.dtype,
+        mm_encoder_patch_buckets=[6],
+        _mm_encoder=encoder,
+    )
+
+    torch.testing.assert_close(model._encode_vision(pixels, positions), expected)
+    bucket, inputs, num_valid = stage.call_args.args
+    assert bucket == 6 and num_valid == len(valid_rows)
+    patches, staged_positions, *_ = inputs
+    assert (patches.data_ptr() == pixels.data_ptr()) == (valid_rows == [0, 1, 2])
+    torch.testing.assert_close(staged_positions[0, :num_valid], positions[valid_rows])
+
+
 def test_the_vision_encoder_matches_hfs():
     # The encoder pads every image to its bucket and masks the padding keys;
     # what comes back must be HF's soft tokens for the image alone.

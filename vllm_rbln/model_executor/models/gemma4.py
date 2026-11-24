@@ -50,6 +50,8 @@ from vllm_rbln.model_executor.models.interfaces import (
 )
 from vllm_rbln.v1.attention.kv_cache_bindings import resolve_kv_cache
 
+_PATCH_DTYPE = torch.float32
+
 
 def _build_mm_prefix_sliding_mask(
     row_end_offsets: torch.Tensor,
@@ -398,7 +400,8 @@ class RBLNGemma4ForConditionalGeneration(
                     indexing="ij",
                 )
                 positions = torch.stack([xs, ys], dim=-1).reshape(-1, 2)
-                self._encode_vision(torch.zeros(bucket_size, patch_pixels), positions)
+                pixels = torch.zeros(bucket_size, patch_pixels, dtype=_PATCH_DTYPE)
+                self._encode_vision(pixels, positions)
 
     def _encode_vision(
         self, pixel_values: torch.Tensor, pixel_position_ids: torch.Tensor
@@ -418,17 +421,19 @@ class RBLNGemma4ForConditionalGeneration(
             f"{self.mm_encoder_patch_buckets[-1]}-patch bucket"
         )
         bucket_size = next(b for b in self.mm_encoder_patch_buckets if b >= num_patches)
+        valid_rows = slice(num_patches) if valid[:num_patches].all() else valid
         # The positions, padding mask and key bias span the bucket, so the
         # padding is masked whatever an earlier frame left in its patches.
         positions = torch.full((1, bucket_size, 2), -1, dtype=torch.long)
-        positions[0, :num_patches] = pixel_position_ids[valid]
+        positions[0, :num_patches] = pixel_position_ids[valid_rows]
         padding = ~(positions >= 0).all(dim=-1)
         key_bias = torch.where(padding, torch.finfo(self.model_dtype).min, 0.0)[
             :, None, None, :
         ]
+        patches = pixel_values[valid_rows]
         inputs = buffered_encoder.input_buffers.stage(
             bucket_size,
-            [pixel_values[valid].unsqueeze(0), positions, padding, key_bias],
+            [patches.unsqueeze(0), positions, padding, key_bias],
             num_patches,
         )
         # The patches of a grid whose sides are multiples of the pooling kernel
@@ -449,7 +454,8 @@ class RBLNGemma4ForConditionalGeneration(
                 (1, bucket_size, patch_pixels),
                 axis=1,
                 pad=0.0,
-                dtype=torch.float32,
+                dtype=_PATCH_DTYPE,
+                register_host=True,
             ),
             rbln_utils.EncoderInput(
                 "pixel_position_ids",

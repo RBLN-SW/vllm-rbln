@@ -13,10 +13,14 @@
 # limitations under the License.
 
 from collections.abc import Callable, Mapping, Sequence
-from typing import NamedTuple, Union
+from math import prod
+from typing import TYPE_CHECKING, NamedTuple, Union
 
 import torch
 from vllm.forward_context import get_forward_context
+
+if TYPE_CHECKING:
+    from torch_rbln.memory import HostMemoryRegistration
 
 
 def is_prefill_step() -> bool:
@@ -50,6 +54,7 @@ class EncoderInput(NamedTuple):
     pad: float
     dtype: torch.dtype | None = None
     allow_prefix_copy: bool = True
+    register_host: bool = False
 
 
 class EncoderInputBuffers:
@@ -71,6 +76,32 @@ class EncoderInputBuffers:
         self.dtype = dtype
         self._specs_by_bucket = dict(specs_by_bucket)
         self._buffers_by_bucket: dict[int, list[torch.Tensor]] = {}
+        self._registered_host_buffers: dict[
+            tuple[int, str], tuple[torch.Tensor, HostMemoryRegistration] | None
+        ] = {}
+
+    def _registered_host_buffer(
+        self, bucket_size: int, spec: EncoderInput
+    ) -> torch.Tensor | None:
+        if self.device.type != "rbln":
+            return None
+        key = (bucket_size, spec.name)
+        if key in self._registered_host_buffers:
+            cached = self._registered_host_buffers[key]
+            return cached[0] if cached is not None else None
+
+        dtype = spec.dtype or self.dtype
+        nbytes = prod(spec.shape) * dtype.itemsize
+        with torch.inference_mode(False):
+            host = torch.rbln.huge_host_empty(nbytes).view(dtype).view(spec.shape)
+        registration = torch.rbln.host_register_memory(host, device=self.device)
+        if registration.covers(host.data_ptr(), nbytes):
+            self._registered_host_buffers[key] = (host, registration)
+            return host
+
+        registration.close()
+        self._registered_host_buffers[key] = None
+        return None
 
     def _get_or_create_bucket(
         self,
@@ -129,19 +160,26 @@ class EncoderInputBuffers:
                         f"along axis {spec.axis}, got {length} entries"
                     )
         for buffer, spec, tensor in zip(buffers, specs, input_tensors, strict=True):
-            if tensor.shape[spec.axis] == bucket_size:
-                buffer.copy_(tensor)
-            else:
-                assert tensor.shape[spec.axis] == num_valid, (
-                    f"{spec.name!r} received {tensor.shape[spec.axis]} entries for "
+            length = tensor.shape[spec.axis]
+            full = length == bucket_size
+            if not full:
+                assert length == num_valid, (
+                    f"{spec.name!r} received {length} entries for "
                     f"{num_valid} valid entries in a {bucket_size}-entry bucket"
                 )
-                buffer.narrow(spec.axis, 0, num_valid).copy_(tensor)
+            dst = buffer if full else buffer.narrow(spec.axis, 0, length)
+            if spec.register_host and length and tensor.device.type == "cpu":
+                host = self._registered_host_buffer(bucket_size, spec)
+                if host is not None:
+                    host = host if full else host.narrow(spec.axis, 0, length)
+                    host.copy_(tensor)
+                    tensor = host
+            dst.copy_(tensor)
         return buffers
 
 
 class BufferedVisionEncoder:
-    """Keep a compiled encoder callable with its device staging buffers."""
+    """Keep a compiled encoder callable with its input staging buffers."""
 
     def __init__(
         self,

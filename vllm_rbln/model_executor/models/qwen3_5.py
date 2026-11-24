@@ -303,7 +303,11 @@ class RBLNQwen3_5ForConditionalGeneration(
         rotary_dim = visual.blocks[0].attn.hidden_size_per_attention_head // 2
         return [
             rbln_utils.EncoderInput(
-                "patches", (bucket_size, patch_dim), axis=0, pad=0.0
+                "patches",
+                (bucket_size, patch_dim),
+                axis=0,
+                pad=0.0,
+                register_host=True,
             ),
             rbln_utils.EncoderInput(
                 "pos_embeds",

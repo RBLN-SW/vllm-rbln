@@ -1329,7 +1329,11 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         head_dim = vm.encoder.layers[0].self_attn.head_dim
         return [
             rbln_utils.EncoderInput(
-                "pixel_values", (bucket_size, patch_dim), axis=0, pad=0.0
+                "pixel_values",
+                (bucket_size, patch_dim),
+                axis=0,
+                pad=0.0,
+                register_host=True,
             ),
             rbln_utils.EncoderInput("cos", (bucket_size, head_dim), axis=0, pad=1.0),
             rbln_utils.EncoderInput("sin", (bucket_size, head_dim), axis=0, pad=0.0),

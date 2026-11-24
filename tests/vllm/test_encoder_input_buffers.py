@@ -13,6 +13,8 @@
 # limitations under the License.
 """The per-bucket staging buffers a vision encoder's inputs are copied into."""
 
+from unittest.mock import Mock
+
 import pytest
 import torch
 
@@ -48,6 +50,45 @@ def test_a_bucket_allocates_once_and_is_reused():
     assert [x.data_ptr() for x in first] == [x.data_ptr() for x in second]
     assert [x.shape for x in second] == [(8, 4), (8, 2), (1, 1, 8)]
     assert all(x.dtype == torch.bfloat16 for x in second)
+
+
+@pytest.mark.parametrize("registered", [True, False])
+def test_staging_converts_selected_inputs_in_the_registered_buffer(
+    monkeypatch, registered
+):
+    spec = EncoderInput("patches", (8, 4), axis=0, pad=0.0, register_host=True)
+    device = torch.device("rbln:0")
+    buffers = EncoderInputBuffers(device, torch.bfloat16, specs_by_bucket={8: [spec]})
+    destination = Mock()
+    monkeypatch.setattr(
+        buffers, "_get_or_create_bucket", lambda _: ([spec], [destination])
+    )
+    host = torch.empty((8, 4), dtype=torch.bfloat16)
+    allocation = Mock(return_value=host.view(torch.uint8).flatten())
+    registration = Mock(**{"covers.return_value": registered})
+    register = Mock(return_value=registration)
+    monkeypatch.setattr(torch.rbln, "huge_host_empty", allocation)
+    monkeypatch.setattr(torch.rbln, "host_register_memory", register)
+
+    full = torch.arange(32, dtype=torch.float32).view(8, 4)
+    buffers.stage(8, [full], 8)
+    (staged,) = destination.copy_.call_args.args
+    assert staged.data_ptr() == (host if registered else full).data_ptr()
+    torch.testing.assert_close(staged, full.to(staged.dtype))
+
+    prefix = torch.ones((3, 4), dtype=torch.float32)
+    buffers.stage(8, [prefix], 3)
+    (staged,) = destination.narrow.return_value.copy_.call_args.args
+    assert staged.data_ptr() == (host if registered else prefix).data_ptr()
+    torch.testing.assert_close(staged, prefix.to(staged.dtype))
+    if registered:
+        assert staged.dtype == torch.bfloat16
+        torch.testing.assert_close(host[3:], full[3:].to(torch.bfloat16))
+    else:
+        registration.close.assert_called_once_with()
+    allocation.assert_called_once_with(host.nbytes)
+    assert register.call_count == 1
+    assert register.call_args.kwargs["device"] == device
 
 
 def test_new_buffers_start_padded():
