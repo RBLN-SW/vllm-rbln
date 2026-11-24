@@ -14,20 +14,20 @@
 """E2E check that encoder models end up with the right sequence pooling.
 
 For each real encoder architecture supported by the RBLN optimum path a real
-``VllmConfig`` is built, so vLLM's own ``ModelConfig`` resolves ``pooler_config``
-exactly as it would in production. The model is built through ``load_model``;
-only the optimum-rbln model compilation/loading (``init_model``) is faked,
+`VllmConfig` is built, so vLLM's own `ModelConfig` resolves `pooler_config`
+exactly as it would in production. The model is built through `load_model`;
+only the optimum-rbln model compilation/loading (`init_model`) is faked,
 since that requires an NPU.
 
 Encoder-only models (BertModel / RobertaModel / XLMRobertaModel and their
-``*ForSequenceClassification`` variants) are forced to CLS pooling. Decoder-based
+`*ForSequenceClassification` variants) are forced to CLS pooling. Decoder-based
 pooling models (Qwen3 embedding) keep their native LAST-token pooling — CLS
 (token 0) would be wrong for a causal model.
 
 We assert that:
   * the pooling type comes out as expected per architecture, and
-  * the right pooler is selected per task — ``DispatchPooler`` (embed) for the
-    plain encoders and ``RBLNClassifierPooler`` for the classification ones.
+  * the right pooler is selected per task — `DispatchPooler` (embed) for the
+    plain encoders and `RBLNClassifierPooler` for the classification ones.
 """
 
 from types import SimpleNamespace

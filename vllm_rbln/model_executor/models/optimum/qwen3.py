@@ -34,10 +34,10 @@ logger = init_logger(__name__)
 
 
 def resolve_label_token_ids(model_config: ModelConfig) -> tuple[int, int]:
-    """Return the ``(false_id, true_id)`` vocabulary ids to score against.
+    """Return the `(false_id, true_id)` vocabulary ids to score against.
 
-    The two label tokens come from ``classifier_from_token``, false label first,
-    matching vLLM's ``from_2_way_softmax`` convention.
+    The two label tokens come from `classifier_from_token`, false label first,
+    matching vLLM's `from_2_way_softmax` convention.
     """
     hf_config = model_config.hf_config
     text_config = hf_config.get_text_config()
@@ -71,11 +71,11 @@ def resolve_label_token_ids(model_config: ModelConfig) -> tuple[int, int]:
 class RBLNQwen3RerankerPooler(Pooler):
     """Turn the logit difference from the model into a relevance score.
 
-    ``forward`` has already reduced the vocabulary down to a single logit per
+    `forward` has already reduced the vocabulary down to a single logit per
     request, so there is nothing left to pool -- only the activation, gated by
-    ``PoolingParams.use_activation`` the same way vLLM's classifier pooler does
-    it. ``PoolerClassify`` reads num_labels off the logits, which are
-    ``[batch, 1]``, and so applies sigmoid: the 2-way softmax.
+    `PoolingParams.use_activation` the same way vLLM's classifier pooler does
+    it. `PoolerClassify` reads num_labels off the logits, which are
+    `[batch, 1]`, and so applies sigmoid: the 2-way softmax.
     """
 
     def __init__(self) -> None:
@@ -102,7 +102,7 @@ class RBLNQwen3RerankerPooler(Pooler):
 class RBLNOptimumQwen3ForSequenceClassification(
     RBLNOptimumModelBase, VllmModelForPooling
 ):
-    """Score Qwen3-Reranker through vLLM's ``score()`` API.
+    """Score Qwen3-Reranker through vLLM's `score()` API.
 
     The reranker is a causal LM that answers "yes" or "no". Its relevance
     score is the two-way softmax over the answer logits::
@@ -111,7 +111,7 @@ class RBLNOptimumQwen3ForSequenceClassification(
 
     Reusing the generation graph with its lm_head lets the same compiled
     artifact serve both generation and scoring. The graph keeps only the
-    final position (``logits_to_keep == 1``), where the answer would be sampled.
+    final position (`logits_to_keep == 1`), where the answer would be sampled.
     """
 
     is_pooling_model = True
@@ -133,7 +133,7 @@ class RBLNOptimumQwen3ForSequenceClassification(
         """Re-pad each request to the left, which the generation graph requires.
 
         Requests arrive right padded to a common width, their real lengths
-        recoverable from ``positions``. The generation graph keeps a KV cache, so
+        recoverable from `positions`. The generation graph keeps a KV cache, so
         optimum-rbln rejects a right-padded mask.
 
         The batch is left as-is: padding it out to the compiled batch size would
