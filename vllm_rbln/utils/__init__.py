@@ -56,6 +56,22 @@ class EncoderInput(NamedTuple):
     allow_prefix_copy: bool = True
     register_host: bool = False
 
+    def nbytes(self, default_dtype: torch.dtype) -> int:
+        return prod(self.shape) * (self.dtype or default_dtype).itemsize
+
+
+def encoder_input_buffer_sizes(
+    buckets: Sequence[int],
+    specs_for_bucket: Callable[[int], Sequence[EncoderInput]],
+    default_dtype: torch.dtype,
+) -> list[int]:
+    """Return the byte size of each device tensor allocated across the buckets."""
+    return [
+        spec.nbytes(default_dtype)
+        for bucket in dict.fromkeys(buckets)
+        for spec in specs_for_bucket(bucket)
+    ]
+
 
 class EncoderInputBuffers:
     """Reuse device input buffers by bucket.
@@ -91,7 +107,7 @@ class EncoderInputBuffers:
             return cached[0] if cached is not None else None
 
         dtype = spec.dtype or self.dtype
-        nbytes = prod(spec.shape) * dtype.itemsize
+        nbytes = spec.nbytes(self.dtype)
         with torch.inference_mode(False):
             host = torch.rbln.huge_host_empty(nbytes).view(dtype).view(spec.shape)
         registration = torch.rbln.host_register_memory(host, device=self.device)
@@ -113,17 +129,17 @@ class EncoderInputBuffers:
             # Plain tensors, not inference tensors: staging writes them in place
             # inside and outside inference mode alike.
             with torch.inference_mode(False):
-                buffers = [
-                    torch.full(
-                        spec.shape,
-                        spec.pad,
-                        dtype=spec.dtype or self.dtype,
-                        device=self.device,
-                    )
-                    for spec in specs
-                ]
+                buffers = [self._allocate_input(spec) for spec in specs]
             self._buffers_by_bucket[bucket_size] = buffers
         return specs, buffers
+
+    def _allocate_input(self, spec: EncoderInput) -> torch.Tensor:
+        dtype = spec.dtype or self.dtype
+        buffer = torch.full(spec.shape, spec.pad, dtype=dtype, device=self.device)
+        if self.device.type == "rbln" and spec.register_host:
+            # Streamed patches start in flat device memory on node 0, chiplet 0.
+            torch.rbln.bind_device_memory(buffer)
+        return buffer
 
     def warmup_inputs(
         self,

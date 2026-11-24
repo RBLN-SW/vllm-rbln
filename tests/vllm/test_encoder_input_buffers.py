@@ -18,7 +18,11 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from vllm_rbln.utils import EncoderInput, EncoderInputBuffers
+from vllm_rbln.utils import (
+    EncoderInput,
+    EncoderInputBuffers,
+    encoder_input_buffer_sizes,
+)
 
 
 def _specs(bucket_size):
@@ -39,6 +43,56 @@ def _key_bias(num_valid):
     bias = torch.zeros(1, 1, 8)
     bias[..., num_valid:] = -30000.0
     return bias
+
+
+def test_estimated_input_sizes_match_allocations():
+    def specs(bucket):
+        return [
+            EncoderInput(
+                "patches",
+                (bucket, 4),
+                axis=0,
+                pad=0.0,
+                dtype=torch.float32,
+                register_host=True,
+            ),
+            EncoderInput("key_bias", (1, 1, bucket), axis=2, pad=0.0),
+        ]
+
+    buckets = (8, 16)
+    dtype = torch.bfloat16
+    buffers = EncoderInputBuffers(
+        "cpu", dtype, specs_by_bucket={bucket: specs(bucket) for bucket in buckets}
+    )
+    assert encoder_input_buffer_sizes(buckets, specs, dtype) == [
+        tensor.nbytes
+        for bucket in buckets
+        for tensor in buffers.warmup_inputs(bucket, fill_overrides={})
+    ]
+
+
+def test_rbln_patch_buffer_is_placed_on_chiplet_zero_once(monkeypatch):
+    specs = [
+        EncoderInput("patches", (8, 4), axis=0, pad=2.0, register_host=True),
+        EncoderInput("key_bias", (1, 1, 8), axis=2, pad=0.0),
+    ]
+    patches = torch.empty(8, 4)
+    key_bias = torch.empty(1, 1, 8)
+    full = Mock(side_effect=[patches, key_bias])
+    bind = Mock()
+    monkeypatch.setattr(torch, "full", full)
+    monkeypatch.setattr(torch.rbln, "bind_device_memory", bind)
+
+    device = torch.device("rbln:0")
+    buffers = EncoderInputBuffers(device, torch.float32, specs_by_bucket={8: specs})
+    first = buffers.warmup_inputs(8, fill_overrides={})
+    second = buffers.warmup_inputs(8, fill_overrides={})
+
+    assert first is second
+    assert first[0] is patches and first[1] is key_bias
+    assert torch.all(patches == 2)
+    assert full.call_count == 2
+    bind.assert_called_once_with(patches)
 
 
 def test_a_bucket_allocates_once_and_is_reused():

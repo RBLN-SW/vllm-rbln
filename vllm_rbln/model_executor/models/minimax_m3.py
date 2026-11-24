@@ -1346,6 +1346,13 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
             ),
         ]
 
+    def get_mm_encoder_input_buffer_sizes(self) -> list[int]:
+        if self.vision_tower is None:
+            return []
+        return rbln_utils.encoder_input_buffer_sizes(
+            self.mm_encoder_patch_buckets, self._mm_input_specs, self.vision_tower.dtype
+        )
+
     def compile_mm_encoder(self, compile_fn) -> None:
         # Non-first PP ranks and zero image/video limits own no vision tower.
         if self.vision_tower is None:

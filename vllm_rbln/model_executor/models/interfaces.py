@@ -43,6 +43,10 @@ class SupportsRBLNMultiModal(Protocol):
     mm_encoder_patch_buckets: list[int]
     """Resolved, sorted, unique patch counts used by encoder warmup."""
 
+    def get_mm_encoder_input_buffer_sizes(self) -> list[int]:
+        """Device tensor sizes in bytes for the locally owned encoder buckets."""
+        ...
+
     def compile_mm_encoder(self, compile_fn: Callable[[nn.Module], nn.Module]) -> None:
         """Compile the multimodal encoder with the runner's compile wrapper. A
         rank that owns no encoder returns without calling ``compile_fn``."""

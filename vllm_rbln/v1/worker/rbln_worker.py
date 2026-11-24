@@ -16,7 +16,7 @@
 import os
 import time
 from types import NoneType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numba
 import torch
@@ -72,7 +72,9 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import (
     finalize_kv_cache_registrations,
 )
 from vllm_rbln.logger import init_logger
-from vllm_rbln.v1.worker.dynamic_kv_sizer import DynamicKvSizer
+from vllm_rbln.model_executor.models.interfaces import SupportsRBLNMultiModal
+from vllm_rbln.v1.worker.dynamic_kv_sizer import DynamicKvMode, DynamicKvSizer
+from vllm_rbln.v1.worker.kv_placement import allocator_reserved
 from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
 from vllm_rbln.v1.worker.utils import (
     RblnProfilerWrapper,
@@ -229,7 +231,8 @@ class RBLNWorker(WorkerBase):
         at runtime; the draft's share can still fall short of what a drafter
         compiles.
         """
-        params_dict = dict(self.model_runner.model.named_parameters())
+        model = self.model_runner.model
+        params_dict = dict(model.named_parameters())
         device_name = current_platform.get_device_name().lower()
         assert "rbln" in device_name
 
@@ -349,6 +352,25 @@ class RBLNWorker(WorkerBase):
             num_runtimes=num_runtimes,
             gpu_memory_utilization=self.cache_config.gpu_memory_utilization,
         )
+
+        if (
+            self.dynamic_kv.mode is not DynamicKvMode.ACTIVE
+            and self.device.type == "rbln"
+            and not self.model_config.enforce_eager
+            and self.model_runner.supports_mm_inputs
+            and get_pp_group().is_first_rank
+            and not self.model_runner.is_ec_consumer_only
+        ):
+            mm_model = cast(SupportsRBLNMultiModal, model)
+            sizes = mm_model.get_mm_encoder_input_buffer_sizes()
+            if sizes:
+                reserve = allocator_reserved(sizes)
+                estimate_kwargs["encoder_input_reserve_bytes"] = reserve
+                logger.info(
+                    "Reserving %.2f MiB for %d encoder input buffers",
+                    reserve / 2**20,
+                    len(sizes),
+                )
 
         speculative_config = self.speculative_config
         drafter = getattr(self.model_runner, "drafter", None)
