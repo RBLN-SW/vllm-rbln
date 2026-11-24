@@ -441,21 +441,27 @@ def make_hybrid_manager(
     num_blocks: int,
     sliding_window: int,
     *,
+    sliding_block_size: int | None = None,
     max_model_len: int = 8192,
     enable_kv_cache_events: bool = False,
 ) -> RBLNKVCacheManager:
-    """A two-group manager: full attention + sliding window (same block_size)."""
+    """A two-group manager: full attention + sliding window.
+
+    The sliding-window group takes ``block_size`` unless ``sliding_block_size``
+    names a divisor of it, as when the page size is unified over unequal specs.
+    """
+    swa_block_size = sliding_block_size or block_size
     return RBLNKVCacheManager(
         kv_cache_config=make_kv_cache_config(
             [
                 full_attention_spec(block_size),
-                sliding_window_spec(block_size, sliding_window),
+                sliding_window_spec(swa_block_size, sliding_window),
             ],
             num_blocks,
         ),
         max_model_len=max_model_len,
         scheduler_block_size=block_size,
-        hash_block_size=block_size,
+        hash_block_size=swa_block_size,
         sub_block_size=sub_block_size,
         hash_fn=sha256,
         enable_kv_cache_events=enable_kv_cache_events,

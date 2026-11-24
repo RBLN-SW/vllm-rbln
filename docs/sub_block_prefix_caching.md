@@ -190,20 +190,26 @@ so upstream's LRU preserves it for potential reuse.
 
 `get_computed_blocks_sub_block(request, num_computed_tokens)`
 1.  Compute sub-block hashes for the request
-2.  For each group:
-    1. Starting after the last full-block boundary,
-       query the group's index with up to `sub_blocks_per_block − 1` hashes
-    2. Record the match length
+2.  For each group, starting after the last full-block boundary and stopping
+    one sub-block short of the next scheduler block boundary:
+    1. Match whole blocks while the index holds every sub-block of one
+       (only a group with blocks smaller than the scheduler block has room)
+    2. Match sub-blocks in the block it stops in
+    3. Record the match length
 3.  Extension = min match length across all groups
 4.  If match found → return a `SubBlockMatch` handle
-    (with per-group `_GroupPartialMatch`),
+    (with one `_GroupPartialMatch` per block to copy),
     bump `src_block`s' ref counts to prevent eviction
 5.  Return the sub-block extension in tokens (0 if no match),
     capped at `request.num_tokens − 1` to preserve the upstream
     "must recompute last token" invariant.
 
-The query is limited to `sub_blocks_per_block - 1` because a match of all
-sub-blocks would be a full-block match, which upstream handles already. The
+The query stops short of the next scheduler block boundary because upstream
+aligns a hybrid hit to the scheduler block, so a match reaching it would be a
+full-block match, which upstream handles already. When the page size is unified
+over unequal specs, a group's block can be smaller than the scheduler block
+(Gemma4 26B at block 2048: FA 4096, SWA 2048), and without step 2.1 the hit
+would end within the first SWA block past the upstream hit. The
 cap at `num_tokens - 1` ensures the scheduler always schedules at least one
 token for computation (upstream requires the last token to be recomputed to
 produce logits).
@@ -211,9 +217,10 @@ produce logits).
 ### Step 4: Copy op scheduling
 
 After `allocate_slots` succeeds, the scheduler calls
-`apply_sub_block_match(match)` which, for each group:
-1.  Looks up the destination block (newly allocated at the match boundary)
-2.  Appends `KVCacheCopyOp(group_id, src_block_id, dst_block_id, num_tokens)`
+`apply_sub_block_match(match)` which, for each block of the match:
+1.  Looks up the destination block (newly allocated past the full-block hit)
+2.  Appends `KVCacheCopyOp(group_id, src_block_id, dst_block_id, num_tokens)`,
+    where `num_tokens` is the whole block for a block the match passes over
 
 ### Step 5: Copy execution (model runner)
 

@@ -421,6 +421,25 @@ class TestGetComputedBlocksSubBlock:
         assert match.num_tokens == 4
         manager.release_sub_block_match(match)
 
+    def test_smaller_blocks_extend_over_whole_blocks_first(self):
+        # FA blocks of 16 make the scheduler block 16; the SWA group's blocks of
+        # 8 match one whole block past the hit, then a sub-block in the next.
+        manager = make_hybrid_manager(16, 4, 20, sliding_window=4, sliding_block_size=8)
+        req0 = make_request("0", list(range(32)), 8)
+        prefill_request(manager, req0)
+        manager.free(req0)
+        req1 = make_request("1", list(range(28)) + [999] * 4, 8)
+        _, num_computed, new_blocks = prefill_request(manager, req1)
+        assert num_computed == 28
+        assert new_blocks is not None
+        ops = manager.drain_pending_copy_ops()
+        assert sorted((op.group_id, op.num_tokens) for op in ops) == [
+            (0, 12),
+            (1, 4),
+            (1, 8),
+        ]
+        manager.release_copy_ops(ops)
+
     def test_no_partial_match_when_full_block_matches(self):
         # When upstream already matched the full block there is no partial match
         # (no double counting).

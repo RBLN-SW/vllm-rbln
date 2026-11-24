@@ -78,7 +78,7 @@ class KVCacheCopyOp:
     # NOTE: While pending, it holds a ref count of the source block to prevent eviction.
     src_block_id: int
     dst_block_id: int
-    # Number of tokens to copy (= num_matched_sub_blocks * sub_block_size).
+    # Number of tokens to copy: a multiple of sub_block_size, up to the block.
     num_tokens: int
 
 
@@ -269,12 +269,14 @@ class SubBlockMatch:
 
 @dataclass(slots=True)
 class _GroupPartialMatch:
-    """Per-group partial match info."""
+    """One block copy of a match: a whole block, or the sub-blocks it ends on."""
 
+    group_id: int
     src_block: KVCacheBlock
     # Index of the block (in the request's block list) that will receive
     # the copied sub-blocks.
     dst_req_block_index: int
+    num_tokens: int
 
 
 @dataclass(slots=True)
@@ -392,9 +394,10 @@ class RBLNKVCacheManager(KVCacheManager):
     ) -> SubBlockMatch | None:
         """Discover a sub-block partial match after full-block matching.
 
-        Looks for sub-block prefix matches in the block immediately after the
-        full-block boundary.  Returns a ``SubBlockMatch`` handle if found, or
-        ``None``.
+        Searches up to the next scheduler block boundary. A group whose blocks
+        are smaller than the scheduler block first extends over whole cached
+        blocks, then matches sub-blocks in the block it stops in. Returns a
+        ``SubBlockMatch`` handle if found, or ``None``.
 
         The caller must pass the result to ``apply_sub_block_match`` (to
         create copy ops) or ``release_sub_block_match`` (to free the
@@ -404,53 +407,65 @@ class RBLNKVCacheManager(KVCacheManager):
             return None
 
         sub_hashes = self._get_or_compute_sub_hashes(request).hashes
+        # Upstream aligns a hit to the scheduler block and stopped short of the
+        # next one, so the match stops one sub-block before it.
+        end_sub = (
+            num_computed_tokens + self.coordinator.scheduler_block_size
+        ) // self.sub_block_size - 1
 
         min_matched: int | None = None
-        group_matches: list[_GroupPartialMatch] = []
+        group_srcs: list[list[KVCacheBlock]] = []
 
         for gi in self._group_infos:
-            num_full_blocks = num_computed_tokens // gi.block_size
             sbpb = gi.sub_blocks_per_block
-            next_sub_start = num_full_blocks * sbpb
-
-            # We need at least one sub-block hash beyond the full-block matches
-            # AND fewer than a full block (otherwise upstream would have matched).
-            query = sub_hashes[next_sub_start : next_sub_start + sbpb - 1]
-            if not query:
-                min_matched = 0
-                break
-
-            src_block_id, num_matched = gi.sub_block_index.longest_match(query)
-            if src_block_id is None:
-                min_matched = 0
-                break
+            next_sub_start = num_computed_tokens // gi.block_size * sbpb
+            query = sub_hashes[next_sub_start:end_sub]
+            srcs: list[KVCacheBlock] = []
+            num_matched = 0
+            for i in range(0, len(query), sbpb):
+                src_block_id, depth = gi.sub_block_index.longest_match(
+                    query[i : i + sbpb]
+                )
+                if src_block_id is None:
+                    break
+                srcs.append(self.block_pool.blocks[src_block_id])
+                num_matched += depth
+                if depth < sbpb:
+                    break
+            if not num_matched:
+                return None
 
             if min_matched is None or num_matched < min_matched:
                 min_matched = num_matched
+            group_srcs.append(srcs)
 
-            group_matches.append(
-                _GroupPartialMatch(
-                    src_block=self.block_pool.blocks[src_block_id],
-                    dst_req_block_index=num_full_blocks,
-                )
-            )
-
-        if not min_matched:
-            return None
-
-        # We have a partial match!
-        num_matched = min_matched
-        extra_tokens = num_matched * self.sub_block_size
+        assert min_matched is not None
 
         # NOTE: Upstream guarantees num_computed_tokens <= num_tokens - 1,
         # because at least the last token must be recomputed for logits.
         # We enforce the same condition here.
         max_allowed_extra_tokens = (request.num_tokens - 1) - num_computed_tokens
         max_allowed_sub_blocks = max_allowed_extra_tokens // self.sub_block_size
-        num_matched = min(num_matched, max_allowed_sub_blocks)
+        num_matched = min(min_matched, max_allowed_sub_blocks)
         if num_matched == 0:
             return None
         extra_tokens = num_matched * self.sub_block_size
+
+        group_matches: list[_GroupPartialMatch] = []
+        for gid, (gi, srcs) in enumerate(zip(self._group_infos, group_srcs)):
+            num_full_blocks = num_computed_tokens // gi.block_size
+            whole, rest = divmod(num_matched, gi.sub_blocks_per_block)
+            for j in range(whole + bool(rest)):
+                group_matches.append(
+                    _GroupPartialMatch(
+                        group_id=gid,
+                        src_block=srcs[j],
+                        dst_req_block_index=num_full_blocks + j,
+                        num_tokens=(
+                            gi.block_size if j < whole else rest * self.sub_block_size
+                        ),
+                    )
+                )
 
         # Touch source blocks to prevent eviction during allocate_slots.
         # The SubBlockMatch owns these references until apply or release.
@@ -468,8 +483,9 @@ class RBLNKVCacheManager(KVCacheManager):
                 num_matched,
                 extra_tokens,
                 ", ".join(
-                    f"group {i} from block {gm.src_block.block_id}"
-                    for i, gm in enumerate(group_matches)
+                    f"group {gm.group_id} block {gm.dst_req_block_index} from block "
+                    f"{gm.src_block.block_id} ({gm.num_tokens} tokens)"
+                    for gm in group_matches
                 ),
             )
 
@@ -485,16 +501,15 @@ class RBLNKVCacheManager(KVCacheManager):
         request = match.request
         blocks = self.coordinator.get_blocks(request.request_id)
 
-        for i, gm in enumerate(match.group_matches):
-            block_list = blocks[i]
+        for gm in match.group_matches:
             # By this point, the destination block must have been allocated.
-            dst_block = block_list[gm.dst_req_block_index]
+            dst_block = blocks[gm.group_id][gm.dst_req_block_index]
             self.pending_copy_ops.append(
                 KVCacheCopyOp(
-                    group_id=i,
+                    group_id=gm.group_id,
                     src_block_id=gm.src_block.block_id,
                     dst_block_id=dst_block.block_id,
-                    num_tokens=match.num_tokens,
+                    num_tokens=gm.num_tokens,
                 )
             )
 
