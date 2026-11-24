@@ -28,6 +28,7 @@ from vllm_rbln.model_executor.layers.quantization.modelopt_mxfp8 import (
     RBLNModelOptMxFp8LinearMethod,
 )
 from vllm_rbln.model_executor.layers.quantization.nvfp4 import (
+    RBLNModelOptNvFp4Config,
     RBLNModelOptNvFp4FusedMoE,
 )
 from vllm_rbln.patches import add_registration
@@ -59,6 +60,17 @@ class RBLNModelOptMixedPrecisionConfig(ModelOptMixedPrecisionConfig):
 )
 def register_rbln_modelopt_mixed_config() -> None:
     register_quantization_config("modelopt_mixed")(RBLNModelOptMixedPrecisionConfig)
+
+
+@add_registration(
+    reason=(
+        "Override the built-in ModelOpt NVFP4 (modelopt_fp4) config so the "
+        "routed experts it quantizes dequantise through the RBLN "
+        "group-dequantise custom op instead of the upstream CUDA kernels."
+    )
+)
+def register_rbln_modelopt_fp4_config() -> None:
+    register_quantization_config("modelopt_fp4")(RBLNModelOptNvFp4Config)
 
 
 @add_registration(

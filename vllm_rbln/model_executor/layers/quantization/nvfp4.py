@@ -30,8 +30,10 @@ _PACKED_FP4_WEIGHT_DTYPE = "float4_e2m1fn"
 class RBLNModelOptNvFp4FusedMoE(ModelOptNvFp4FusedMoE):
     """NVFP4 MoE that dequantises through the RBLN group-dequantise custom op."""
 
-    def __init__(self, quant_config: ModelOptNvFp4Config, moe: FusedMoEConfig) -> None:
-        FusedMoEMethodBase.__init__(self, moe)
+    def __init__(
+        self, quant_config: ModelOptNvFp4Config, moe_config: FusedMoEConfig
+    ) -> None:
+        FusedMoEMethodBase.__init__(self, moe_config)
         self.quant_config = quant_config
         self.nvfp4_backend = None
         self.experts_cls = None
@@ -112,3 +114,7 @@ class RBLNModelOptNvFp4FusedMoE(ModelOptNvFp4FusedMoE):
 
     def apply_monolithic(self, layer, x, router_logits, input_ids=None):
         raise RuntimeError
+
+
+class RBLNModelOptNvFp4Config(ModelOptNvFp4Config):
+    FusedMoEMethodCls = RBLNModelOptNvFp4FusedMoE
