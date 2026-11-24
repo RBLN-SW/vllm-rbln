@@ -136,6 +136,26 @@ def test_sample_passes_input_batch_to_fused_sampler(model_runner, monkeypatch):
     assert sampler.call_args.kwargs["input_batch"] is model_runner.input_batch
 
 
+def test_finished_request_forgets_fused_penalty_state(model_runner, monkeypatch):
+    sampler = MagicMock(spec=runner_module.RBLNSampler)
+    monkeypatch.setattr(model_runner, "sampler", sampler)
+    finished = RBLNSchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={},
+        total_num_scheduled_tokens=0,
+        scheduled_spec_decode_tokens={},
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=0,
+        finished_req_ids={"r0"},
+        free_encoder_mm_hashes=[],
+    )
+
+    model_runner._update_states(finished)
+
+    sampler.forget_requests.assert_called_once_with({"r0"})
+
+
 def _is_req_scheduled(model_runner, req_id: str) -> bool:
     return req_id in model_runner.input_batch.req_id_to_index
 

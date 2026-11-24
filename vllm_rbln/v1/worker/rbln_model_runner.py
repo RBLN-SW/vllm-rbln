@@ -3126,6 +3126,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
     def _dummy_sampler_run(self, num_reqs: int) -> None:
         from vllm_rbln.v1.sample import WARM_UP_CONFIGS
 
+        sampler = self.sampler
+        if not isinstance(sampler, RBLNSampler):
+            return
+
         logits = torch.randn(
             (num_reqs, self.model_config.get_vocab_size()),
             device=self.device,
@@ -3175,10 +3179,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 spec_token_ids=[[] for _ in range(num_reqs)],
             )
 
-            if isinstance(self.sampler, RBLNSampler):
-                self.sampler.warm_up(logits=logits, sampling_metadata=dummy_metadata)
-            else:
-                _ = self.sampler(logits=logits, sampling_metadata=dummy_metadata)
+            sampler.warm_up(logits=logits, sampling_metadata=dummy_metadata)
 
             if num_reqs > 1:
                 # A batch smaller than the bucket takes `_pad_rows`'s `torch.cat`
@@ -3192,7 +3193,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     top_p=shorter(dummy_metadata.top_p),
                     top_k=shorter(dummy_metadata.top_k),
                 )
-                _ = self.sampler(
+                _ = sampler(
                     logits=logits,
                     sampling_metadata=_pad_sampling_metadata(short_metadata, num_reqs),
                 )

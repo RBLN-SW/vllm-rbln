@@ -1170,6 +1170,8 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                 "Skip dummy sampler run since --rbln-use-custom-sampler is disabled"
             )
             return
+        sampler = self.sampler
+        assert isinstance(sampler, RBLNSampler)
 
         def set_sampling_tensors(input_batch, **params):
             input_batch.temperature_cpu_tensor.fill_(params["temperature"])
@@ -1261,14 +1263,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                         input_batch.vocab_size,
                         dtype=self.dtype,
                     )
-                    if isinstance(self.sampler, RBLNSampler):
-                        self.sampler.warm_up(
-                            logits=empty_logits, sampling_metadata=metadata
-                        )
-                    else:
-                        _ = self.sampler(
-                            logits=empty_logits, sampling_metadata=metadata
-                        )
+                    sampler.warm_up(logits=empty_logits, sampling_metadata=metadata)
 
                 clear_reqs(input_batch)
 
