@@ -30,7 +30,7 @@ from vllm_rbln.utils import is_prefill_step
 
 # The architectures whose fused_add_rms_norm puts "rbln" first.
 RESIDUAL_CUT_ARCHITECTURES = frozenset(
-    {"DeepseekV3ForCausalLM", "DeepseekV32ForCausalLM"}
+    {"AXK2ForCausalLM", "DeepseekV3ForCausalLM", "DeepseekV32ForCausalLM"}
 )
 
 
