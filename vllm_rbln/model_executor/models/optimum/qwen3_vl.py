@@ -18,12 +18,6 @@ import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.pooler import Pooler
-from vllm.model_executor.layers.pooler.activations import PoolerNormalize
-from vllm.model_executor.layers.pooler.seqwise import (
-    EmbeddingPoolerHead,
-    SequencePooler,
-    get_seq_pooling_method,
-)
 from vllm.model_executor.models import VllmModelForPooling
 from vllm.model_executor.models.qwen2_5_vl import (
     Qwen2_5_VLVideoPixelInputs,
@@ -31,12 +25,12 @@ from vllm.model_executor.models.qwen2_5_vl import (
 from vllm.model_executor.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 
-from .base import ModelInputForRBLN
+from .base import ModelInputForRBLN, build_embedding_pooler
 from .qwen2_vl import (
     RBLNOptimumQwen2_5_VLForConditionalGeneration,
     split_by_grid_thw,
 )
-from .qwen3_reranker import RBLNQwen3RerankerPooler, resolve_label_token_ids
+from .qwen3 import RBLNQwen3RerankerPooler, resolve_label_token_ids
 
 logger = init_logger(__name__)
 
@@ -170,8 +164,7 @@ class RBLNOptimumQwen3VLForConditionalGeneration(
 class RBLNOptimumQwen3VLForSequenceClassification(
     RBLNOptimumQwen3VLForConditionalGeneration, VllmModelForPooling
 ):
-    """Qwen3-VL-Reranker, scored like Qwen3-Reranker (see qwen3_reranker.py)
-    from the "yes" and "no" logits at the last prompt position."""
+    """Score Qwen3-VL-Reranker using the final position of the generation graph."""
 
     is_pooling_model = True
     pooler: Pooler
@@ -191,26 +184,14 @@ class RBLNOptimumQwen3VLForSequenceClassification(
 class RBLNOptimumQwen3VLModel(
     RBLNOptimumQwen3VLForConditionalGeneration, VllmModelForPooling
 ):
-    """Qwen3-VL-Embedding on optimum-rbln's ``RBLNQwen3VLModel``, whose prefill
-    graph has no lm_head and returns the normed hidden state of every position."""
+    """Qwen3-VL-Embedding on the decoder graph that returns hidden states."""
 
     is_pooling_model = True
     pooler: Pooler
 
     def __init__(self, vllm_config: VllmConfig) -> None:
         super().__init__(vllm_config=vllm_config)
-        pooler_config = vllm_config.model_config.pooler_config
-        assert pooler_config is not None
-        # The checkpoint ships no sentence-transformers Dense layer, so there is
-        # no projector to load.
-        self.pooler = SequencePooler(
-            pooling=get_seq_pooling_method(pooler_config.get_seq_pooling_type()),
-            head=EmbeddingPoolerHead(
-                head_dtype=vllm_config.model_config.head_dtype,
-                projector=None,
-                activation=PoolerNormalize(),
-            ),
-        )
+        self.pooler = build_embedding_pooler(self.model_config)
 
     def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
         # [1, num_tokens, hidden] -> [num_tokens, hidden] for the pooling cursor.

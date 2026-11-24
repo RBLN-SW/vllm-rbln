@@ -81,8 +81,8 @@ from vllm_rbln.model_executor.model_loader.rbln_model_loader import get_optimum_
 from vllm_rbln.model_executor.models.optimum import ModelInputForRBLN
 from vllm_rbln.model_executor.models.optimum.model_base import (
     KVCacheCopyError,
-    RBLNOptimumDecoderMixin,
     RBLNOptimumMultimodalMixin,
+    RBLNOptimumPrefixCacheMixin,
 )
 from vllm_rbln.platform.optimum_impl import patch_upstream
 from vllm_rbln.utils.optimum.bucket import select_bucket_size
@@ -293,7 +293,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         with set_current_vllm_config(self.vllm_config, check_compile=False):
             self.model = get_optimum_model(vllm_config=self.vllm_config)
         if (
-            isinstance(self.model, RBLNOptimumDecoderMixin)
+            isinstance(self.model, RBLNOptimumPrefixCacheMixin)
             and not self.is_ec_producer_only
         ):
             assert self.model.kv_block_adapter is not None
@@ -412,6 +412,11 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
 
         with record_function_or_nullcontext("rbln_model_runner: postprocess"):
             if self.is_pooling_model:
+                # The scheduler counts the whole prompt even on a cache hit.
+                # The pooling cursor indexes only the hidden states we computed.
+                if model_input.is_prompt:
+                    num_scheduled_tokens = model_input.input_tokens.shape[1]
+                    num_scheduled_tokens_np[0] = num_scheduled_tokens
                 output = self._pool(
                     hidden_states, num_scheduled_tokens, num_scheduled_tokens_np
                 )
@@ -436,7 +441,8 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         scheduler_output: "SchedulerOutput",
     ) -> bool:
         if not (
-            model_input.is_prompt and isinstance(self.model, RBLNOptimumDecoderMixin)
+            model_input.is_prompt
+            and isinstance(self.model, RBLNOptimumPrefixCacheMixin)
         ):
             return True
         try:
