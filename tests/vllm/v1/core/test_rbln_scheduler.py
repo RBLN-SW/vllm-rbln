@@ -34,6 +34,7 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.request import RequestStatus
@@ -2320,6 +2321,106 @@ class TestAdmissionCoversFirstDecodeStep:
 
         assert not sched.requests
         assert request.num_preemptions == 0
+
+
+class TestAdmissionCoversMambaBoundaryBlock:
+    """A chunk crossing an align-mode Mamba block boundary holds the previous
+    state block beside the new one until the next chunk. Admitted on the
+    full-sequence count alone, a three-block prompt preempted itself on its
+    last boundary while decodes held the rest of the pool. Prefix caching is
+    off: a resume's prefix hit raises the count and hides the loop."""
+
+    BLOCK = 16
+
+    def _scheduler(self, num_speculative_tokens, num_blocks=11, **config):
+        full = full_attention_spec(self.BLOCK)
+        state = MambaSpec(
+            block_size=self.BLOCK,
+            shapes=((full.page_size_bytes,),),
+            dtypes=(torch.uint8,),
+            mamba_cache_mode="align",
+        )
+        # By default the decodes leave exactly the prompt's count free: three
+        # attention blocks and one state block.
+        return create_rbln_scheduler(
+            block_size=self.BLOCK,
+            max_num_batched_tokens=self.BLOCK,
+            max_model_len=5 * self.BLOCK,
+            num_blocks=num_blocks,
+            max_num_seqs=4,
+            num_speculative_tokens=num_speculative_tokens,
+            mamba_cache_mode="align",
+            kv_cache_config=make_kv_cache_config([full, state], num_blocks),
+            **config,
+        )
+
+    @staticmethod
+    def _step(sched, num_speculative_tokens):
+        out = sched.schedule()
+        output = make_model_runner_output(out)
+        sampled = [
+            sched.requests[rid].num_computed_tokens >= sched.requests[rid].num_tokens
+            for rid in output.req_ids
+        ]
+        output.sampled_token_ids = [[7] if s else [] for s in sampled]
+        sched.update_from_output(out, output)
+        if num_speculative_tokens:
+            sched.update_draft_token_ids(
+                DraftTokenIds(
+                    output.req_ids,
+                    [[7] * num_speculative_tokens if s else [] for s in sampled],
+                )
+            )
+
+    @pytest.mark.parametrize("num_speculative_tokens", [None, 3])
+    def test_prompt_waits_for_the_decodes_instead_of_preempting_itself(
+        self, num_speculative_tokens
+    ):
+        sched = self._scheduler(num_speculative_tokens)
+        for n in range(2):
+            prompt = [100 * (n + 1) + i for i in range(self.BLOCK + 1)]
+            sched.add_request(make_request(f"d{n}", prompt, self.BLOCK, max_tokens=8))
+        while any(
+            r.num_computed_tokens < r.num_prompt_tokens for r in sched.requests.values()
+        ):
+            self._step(sched, num_speculative_tokens)
+        request = make_request(
+            "v", [900 + i for i in range(2 * self.BLOCK + 8)], self.BLOCK, max_tokens=4
+        )
+        sched.add_request(request)
+
+        for _ in range(100):
+            if not sched.requests:
+                break
+            self._step(sched, num_speculative_tokens)
+
+        assert not sched.requests
+        assert request.num_preemptions == 0
+
+    def test_resume_from_a_free_hit_block_is_admitted(self):
+        # The first chunk reads the hit's state block, which the count already
+        # holds as an evictable hit, so it is not the boundary block on top.
+        # Seven usable blocks hold the peak: five attention, two state.
+        sched = self._scheduler(None, num_blocks=8, enable_prefix_caching=True)
+        donor = [100 + i for i in range(3 * self.BLOCK + 1)]
+        sched.add_request(make_request("d", donor, self.BLOCK, max_tokens=2))
+        for _ in range(100):
+            if not sched.requests:
+                break
+            self._step(sched, None)
+        request = make_request(
+            "h",
+            donor[: 3 * self.BLOCK] + [900 + i for i in range(self.BLOCK + 11)],
+            self.BLOCK,
+            max_tokens=2,
+        )
+        sched.add_request(request)
+
+        out = sched.schedule()
+
+        assert request.num_computed_tokens - out.num_scheduled_tokens["h"] == (
+            3 * self.BLOCK
+        )
 
 
 class TestSyncKVLoads:
