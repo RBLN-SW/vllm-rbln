@@ -18,6 +18,7 @@ KVCacheConfig). On-device KV copy is a model-runner concern, left to e2e."""
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -448,7 +449,8 @@ def make_hybrid_manager(
     """A two-group manager: full attention + sliding window.
 
     The sliding-window group takes ``block_size`` unless ``sliding_block_size``
-    names a divisor of it, as when the page size is unified over unequal specs.
+    differs, as when the page size is unified over unequal specs. The scheduler
+    and hash block sizes then follow upstream: the lcm and gcd of the two.
     """
     swa_block_size = sliding_block_size or block_size
     return RBLNKVCacheManager(
@@ -460,8 +462,8 @@ def make_hybrid_manager(
             num_blocks,
         ),
         max_model_len=max_model_len,
-        scheduler_block_size=block_size,
-        hash_block_size=swa_block_size,
+        scheduler_block_size=math.lcm(block_size, swa_block_size),
+        hash_block_size=math.gcd(block_size, swa_block_size),
         sub_block_size=sub_block_size,
         hash_fn=sha256,
         enable_kv_cache_events=enable_kv_cache_events,

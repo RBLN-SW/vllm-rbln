@@ -407,10 +407,13 @@ class RBLNKVCacheManager(KVCacheManager):
             return None
 
         sub_hashes = self._get_or_compute_sub_hashes(request).hashes
-        # Upstream aligns a hit to the scheduler block and stopped short of the
-        # next one, so the match stops one sub-block before it.
+        # Upstream aligns a hit to the scheduler block (its finer hash-block hits
+        # need a Mamba group, which this manager never has) and stopped short of
+        # the next one, so the match stops one sub-block before it.
+        scheduler_block_size = self.coordinator.scheduler_block_size
+        assert num_computed_tokens % scheduler_block_size == 0
         end_sub = (
-            num_computed_tokens + self.coordinator.scheduler_block_size
+            num_computed_tokens + scheduler_block_size
         ) // self.sub_block_size - 1
 
         min_matched: int | None = None

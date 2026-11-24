@@ -207,9 +207,10 @@ so upstream's LRU preserves it for potential reuse.
 The query stops short of the next scheduler block boundary because upstream
 aligns a hybrid hit to the scheduler block, so a match reaching it would be a
 full-block match, which upstream handles already. When the page size is unified
-over unequal specs, a group's block can be smaller than the scheduler block
-(Gemma4 26B at block 2048: FA 4096, SWA 2048), and without step 2.1 the hit
-would end within the first SWA block past the upstream hit. The
+over specs with unequal per-token KV bytes, a group's block can be smaller than
+the scheduler block (full attention 4096 next to sliding window 2048 when the
+former stores half the bytes per token), and without step 2.1 the hit would end
+within that group's first block past the upstream hit. The
 cap at `num_tokens - 1` ensures the scheduler always schedules at least one
 token for computation (upstream requires the last token to be recomputed to
 produce logits).

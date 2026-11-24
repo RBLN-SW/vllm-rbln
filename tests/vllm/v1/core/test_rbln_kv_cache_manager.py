@@ -421,10 +421,21 @@ class TestGetComputedBlocksSubBlock:
         assert match.num_tokens == 4
         manager.release_sub_block_match(match)
 
-    def test_smaller_blocks_extend_over_whole_blocks_first(self):
-        # FA blocks of 16 make the scheduler block 16; the SWA group's blocks of
-        # 8 match one whole block past the hit, then a sub-block in the next.
-        manager = make_hybrid_manager(16, 4, 20, sliding_window=4, sliding_block_size=8)
+    @pytest.mark.parametrize(
+        ("fa_block", "swa_block", "copies"),
+        [
+            (16, 8, [(0, 12), (1, 4), (1, 8)]),
+            (8, 16, [(0, 4), (0, 8), (1, 12)]),
+        ],
+    )
+    def test_smaller_blocks_extend_over_whole_blocks_first(
+        self, fa_block, swa_block, copies
+    ):
+        # The scheduler block is 16. The group with blocks of 8 matches one whole
+        # block past the hit, then a sub-block in the next.
+        manager = make_hybrid_manager(
+            fa_block, 4, 20, sliding_window=4, sliding_block_size=swa_block
+        )
         req0 = make_request("0", list(range(32)), 8)
         prefill_request(manager, req0)
         manager.free(req0)
@@ -433,11 +444,7 @@ class TestGetComputedBlocksSubBlock:
         assert num_computed == 28
         assert new_blocks is not None
         ops = manager.drain_pending_copy_ops()
-        assert sorted((op.group_id, op.num_tokens) for op in ops) == [
-            (0, 12),
-            (1, 4),
-            (1, 8),
-        ]
+        assert sorted((op.group_id, op.num_tokens) for op in ops) == copies
         manager.release_copy_ops(ops)
 
     def test_no_partial_match_when_full_block_matches(self):
