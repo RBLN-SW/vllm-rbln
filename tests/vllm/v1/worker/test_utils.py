@@ -837,6 +837,13 @@ class TestEstimateAvailableMemory:
             snapshot, encoder_input_reserve_bytes=3 * _GB
         ) == self._measured(self._snapshot([4 * _GB, 3 * _GB, _GB, _GB]))
 
+    def test_encoder_input_reserve_requires_primary_chiplet_in_snapshot(self, rbln):
+        rbln("RBLN-CR13")
+        snapshot = self._snapshot([_GB] * 4)
+        snapshot[(1, 0)] = snapshot.pop((0, 0))
+        with pytest.raises(ValueError, match=r"has no entry for .*\(0, 0\)"):
+            self._measured(snapshot, encoder_input_reserve_bytes=_GB)
+
     def test_chiplet_memory_still_charges_kernel_size(self, rbln):
         rbln("RBLN-CR13")
         snapshot = self._snapshot([_GB] * 4)

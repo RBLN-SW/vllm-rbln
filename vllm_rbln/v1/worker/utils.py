@@ -678,11 +678,13 @@ def estimate_available_memory(
             for unit, memory in chiplet_memory.items()
         }
         if encoder_input_reserve_bytes:
-            # Vision encoder inputs are bound on node 0, chiplet 0. If the
-            # snapshot does not label that unit, reserve on the tightest one.
+            # Vision encoder inputs are initially bound on node 0, chiplet 0.
             encoder_unit = (0, 0)
             if encoder_unit not in budgets:
-                encoder_unit = min(budgets, key=budgets.__getitem__)
+                raise ValueError(
+                    f"the memory snapshot has no entry for (node, chiplet) "
+                    f"{encoder_unit}, the encoder input allocation target."
+                )
             budgets[encoder_unit] -= encoder_input_reserve_bytes
         tightest = min(budgets, key=budgets.__getitem__)
         if len(budgets) != rsd_size:
