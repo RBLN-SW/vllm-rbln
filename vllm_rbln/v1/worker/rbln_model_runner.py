@@ -3398,8 +3398,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         """Pick one layer to stand for each KV cache buffer.
 
         Layers that share a buffer (`kv_cache_extents`) must be named once
-        for `mark_static_address`. A `KVCacheTensor` is not a buffer: it
-        lists many layers, each with its own.
+        for `mark_static_address` and bound once as a graph input, in that
+        layer's shape. A `KVCacheTensor` is not a buffer: it lists many
+        layers, each with its own.
         """
         layer_to_spec: dict[str, KVCacheSpec] = {
             layer_name: attn_group.kv_cache_spec
@@ -3628,9 +3629,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         self.kv_cache_positions = {
             name: position for position, name in enumerate(self.kv_cache_names)
         }
+        canonical = self._select_canonical_kv_layers_per_pool(kv_cache_config)
+        # A block-aux cache is outside the KV cache config, so no canonical layer
+        # names its storage; the aux layers on it all view it in one shape.
         self._update_kv_cache_base_bindings(
             kv_cache_bases_by_layer,
             kv_cache_view_infos,
+            canonical | set(self.aux_kv_cache_specs),
         )
         if dynamic_kv_enabled(self.vllm_config) and self.kv_cache_bases:
             # With shared bases these are the graph inputs and the per-layer
@@ -3665,11 +3670,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             # one canonical layer per pool so the runtime, the connector's host
             # buffers, and the runtime copy path address the same name (and the
             # same logical block_id space).
-            layers_to_register = self._select_canonical_kv_layers_per_pool(
-                kv_cache_config
-            )
             for name, kv_cache in kv_caches.items():
-                if name not in layers_to_register:
+                if name not in canonical:
                     continue
                 self.compile_context.mark_static_address(kv_cache, name)
 
@@ -4057,6 +4059,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         self,
         kv_cache_bases_by_layer: dict[str, torch.Tensor],
         kv_cache_view_infos_by_layer: dict[str, KVCacheViewInfo],
+        canonical_layers: set[str],
     ) -> None:
         if not kv_cache_view_infos_by_layer:
             self.kv_cache_bases = []
@@ -4066,6 +4069,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         kv_cache_bases, kv_cache_view_infos = build_kv_cache_base_bindings(
             kv_cache_bases_by_layer,
             kv_cache_view_infos_by_layer,
+            canonical_layers,
             layer_names=self.kv_cache_names,
         )
         # If no deduplication occurred (each layer has its own unique base),
