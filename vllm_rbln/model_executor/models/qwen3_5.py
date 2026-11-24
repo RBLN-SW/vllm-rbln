@@ -269,10 +269,10 @@ class RBLNQwen3_5ForConditionalGeneration(
             ),
         )
 
-    def get_mm_encoder_input_buffer_sizes(self) -> list[int]:
+    def mm_encoder_input_sizes(self) -> list[int]:
         if not self.has_vision:
             return []
-        return rbln_utils.encoder_input_buffer_sizes(
+        return rbln_utils.encoder_input_sizes(
             self.mm_encoder_patch_buckets, self._mm_input_specs, self.visual.dtype
         )
 

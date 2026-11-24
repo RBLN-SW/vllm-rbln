@@ -21,7 +21,7 @@ import torch
 from vllm_rbln.utils import (
     EncoderInput,
     EncoderInputBuffers,
-    encoder_input_buffer_sizes,
+    encoder_input_sizes,
 )
 
 
@@ -64,7 +64,7 @@ def test_estimated_input_sizes_match_allocations():
     buffers = EncoderInputBuffers(
         "cpu", dtype, specs_by_bucket={bucket: specs(bucket) for bucket in buckets}
     )
-    assert encoder_input_buffer_sizes(buckets, specs, dtype) == [
+    assert encoder_input_sizes(buckets, specs, dtype) == [
         tensor.nbytes
         for bucket in buckets
         for tensor in buffers.warmup_inputs(bucket, fill_overrides={})

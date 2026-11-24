@@ -662,7 +662,7 @@ class TestDetermineAvailableMemory:
         drafter=None,
         speculative_config=None,
         dynamic=False,
-        encoder_input_sizes=None,
+        encoder_input_sizes_bytes=None,
         tensor_device="cpu",
         encoder_consumer_only=False,
         first_pp_rank=True,
@@ -705,12 +705,12 @@ class TestDetermineAvailableMemory:
             drafter=drafter,
             get_kv_cache_spec=lambda: {},
             decode_graph_shapes=lambda: list(decode_graph_shapes),
-            supports_mm_inputs=encoder_input_sizes is not None,
+            supports_mm_inputs=encoder_input_sizes_bytes is not None,
             is_ec_consumer_only=encoder_consumer_only,
         )
-        if encoder_input_sizes is not None:
+        if encoder_input_sizes_bytes is not None:
             runner_model = worker.model_runner.model
-            runner_model.get_mm_encoder_input_buffer_sizes = lambda: encoder_input_sizes
+            runner_model.mm_encoder_input_sizes = lambda: encoder_input_sizes_bytes
             monkeypatch.setattr(
                 wm, "get_pp_group", lambda: SimpleNamespace(is_first_rank=first_pp_rank)
             )
@@ -746,7 +746,7 @@ class TestDetermineAvailableMemory:
             monkeypatch,
             device_name="RBLN-CR13",
             dynamic=dynamic,
-            encoder_input_sizes=[128, 4 << 20, 16 << 20],
+            encoder_input_sizes_bytes=[128, 4 << 20, 16 << 20],
             tensor_device=tensor_device,
             encoder_consumer_only=consumer_only,
             first_pp_rank=first_pp_rank,

@@ -1346,10 +1346,10 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
             ),
         ]
 
-    def get_mm_encoder_input_buffer_sizes(self) -> list[int]:
+    def mm_encoder_input_sizes(self) -> list[int]:
         if self.vision_tower is None:
             return []
-        return rbln_utils.encoder_input_buffer_sizes(
+        return rbln_utils.encoder_input_sizes(
             self.mm_encoder_patch_buckets, self._mm_input_specs, self.vision_tower.dtype
         )
 

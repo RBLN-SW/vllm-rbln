@@ -60,7 +60,7 @@ class EncoderInput(NamedTuple):
         return prod(self.shape) * (self.dtype or default_dtype).itemsize
 
 
-def encoder_input_buffer_sizes(
+def encoder_input_sizes(
     buckets: Sequence[int],
     specs_for_bucket: Callable[[int], Sequence[EncoderInput]],
     default_dtype: torch.dtype,

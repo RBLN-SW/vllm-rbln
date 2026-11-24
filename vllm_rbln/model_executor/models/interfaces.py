@@ -43,7 +43,7 @@ class SupportsRBLNMultiModal(Protocol):
     mm_encoder_patch_buckets: list[int]
     """Resolved, sorted, unique patch counts used by encoder warmup."""
 
-    def get_mm_encoder_input_buffer_sizes(self) -> list[int]:
+    def mm_encoder_input_sizes(self) -> list[int]:
         """Device tensor sizes in bytes for the locally owned encoder buckets."""
         ...
 

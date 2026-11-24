@@ -362,14 +362,14 @@ class RBLNWorker(WorkerBase):
             and not self.model_runner.is_ec_consumer_only
         ):
             mm_model = cast(SupportsRBLNMultiModal, model)
-            sizes = mm_model.get_mm_encoder_input_buffer_sizes()
-            if sizes:
-                reserve = allocator_reserved(sizes)
+            buffer_sizes_bytes = mm_model.mm_encoder_input_sizes()
+            if buffer_sizes_bytes:
+                reserve = allocator_reserved(buffer_sizes_bytes)
                 estimate_kwargs["encoder_input_reserve_bytes"] = reserve
                 logger.info(
                     "Reserving %.2f MiB for %d encoder input buffers",
                     reserve / 2**20,
-                    len(sizes),
+                    len(buffer_sizes_bytes),
                 )
 
         speculative_config = self.speculative_config
