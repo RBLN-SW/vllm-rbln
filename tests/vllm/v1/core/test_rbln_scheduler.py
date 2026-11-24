@@ -23,7 +23,13 @@ import pytest
 import torch
 from vllm.config.ec_manager_config import EncoderCacheManagerConfig
 from vllm.distributed.kv_events import BlockStored, KVEventBatch
-from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
+from vllm.multimodal.inputs import (
+    MultiModalBatchedField,
+    MultiModalFeatureSpec,
+    MultiModalFieldElem,
+    MultiModalKwargsItem,
+    PlaceholderRange,
+)
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -2403,6 +2409,52 @@ class TestEcConsumerEncodesNothing:
 
         assert out.scheduled_encoder_inputs == {"0": [0]}
         assert request.status == RequestStatus.RUNNING
+
+
+class TestPrefixCoveredImage:
+    """An image a prefix hit covers needs no encoder run, so its payload is dropped on
+    the way to the worker; an M-RoPE model still reads the grid to place the tokens
+    after it."""
+
+    @staticmethod
+    def _image():
+        def elem(data, keep_on_cpu):
+            return MultiModalFieldElem(
+                data=data, field=MultiModalBatchedField(keep_on_cpu=keep_on_cpu)
+            )
+
+        return MultiModalFeatureSpec(
+            data=MultiModalKwargsItem(
+                {
+                    "pixel_values": elem(torch.zeros(4), keep_on_cpu=False),
+                    "image_grid_thw": elem(torch.tensor([1, 2, 2]), keep_on_cpu=True),
+                }
+            ),
+            modality="image",
+            identifier="image@0",
+            mm_position=PlaceholderRange(offset=0, length=4),
+        )
+
+    @pytest.mark.parametrize("uses_mrope", [True, False])
+    def test_the_worker_gets_what_upstream_sends(self, uses_mrope):
+        sched = create_rbln_scheduler(
+            enable_prefix_caching=True, max_num_batched_tokens=16, max_model_len=64
+        )
+        sched.model_uses_mrope = uses_mrope
+        sched.max_num_encoder_input_tokens = 16
+        sched.encoder_cache_manager = EncoderCacheManager(cache_size=16)
+        prompt = list(range(33))
+        sched.add_request(make_request("a", prompt, 16, mm_features=[self._image()]))
+        _drain(sched)
+        sched.add_request(make_request("b", prompt, 16, mm_features=[self._image()]))
+        (new_req,) = sched.schedule().scheduled_new_reqs
+
+        assert new_req.num_computed_tokens >= 4
+        data = new_req.mm_features[0].data
+        if uses_mrope:
+            assert data is not None and set(data) == {"image_grid_thw"}
+        else:
+            assert data is None
 
 
 class TestMultimodalDraftEncoderLookahead:
