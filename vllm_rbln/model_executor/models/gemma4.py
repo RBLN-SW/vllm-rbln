@@ -43,11 +43,12 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.parse import MultiModalDataItems
 from vllm.sequence import IntermediateTensors
 
+import vllm_rbln.utils as rbln_utils
 from vllm_rbln.model_executor.models.interfaces import (
     SupportsRBLNMmPrefix,
     SupportsRBLNMultiModal,
 )
-from vllm_rbln.patches.attention import _resolve_kv_cache
+from vllm_rbln.v1.attention.kv_cache_bindings import resolve_kv_cache
 
 
 def _build_mm_prefix_sliding_mask(
@@ -151,9 +152,10 @@ class _RBLNGemma4VisionEncoder(nn.Module):
             q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
             k = k.repeat_interleave(attn.num_key_value_groups, dim=1)
             v = v.repeat_interleave(attn.num_key_value_groups, dim=1)
-            scores = torch.matmul(q, k.transpose(-1, -2)) * attn.scaling + key_bias
-            probs = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
-            out = torch.matmul(probs, v).transpose(1, 2).reshape(residual.shape)
+            out = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=key_bias, scale=attn.scaling
+            )
+            out = out.transpose(1, 2).reshape(residual.shape)
             hidden_states = residual + layer.post_attention_layernorm(attn.o_proj(out))
             residual = hidden_states
             hidden_states = layer.pre_feedforward_layernorm(hidden_states)
@@ -266,9 +268,16 @@ class RBLNGemma4ForConditionalGeneration(
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         if vllm_config.parallel_config.data_parallel_size > 1:
             raise ValueError("Gemma4 does not support data parallel on RBLN.")
-        if vllm_config.speculative_config is not None:
+        spec = vllm_config.speculative_config
+        if spec is not None and not spec.use_gemma4_mtp():
             raise ValueError(
-                "Gemma4 does not support speculative decoding on RBLN yet."
+                "Gemma4 supports speculative decoding only with its MTP assistant."
+            )
+        # Off the first stage the target shares no embedding, so the assistant
+        # keeps its narrower one and its first projection mismatches.
+        if spec is not None and vllm_config.parallel_config.pipeline_parallel_size > 1:
+            raise ValueError(
+                "Gemma4 MTP on RBLN supports pipeline_parallel_size=1 only."
             )
         # Upstream fills per-layer inputs in its own embed_input_ids, which the
         # in-graph merge of mm embeddings (forward) bypasses.
@@ -294,10 +303,13 @@ class RBLNGemma4ForConditionalGeneration(
         # longest range.
         self.max_mm_prefix_range_len = cap
         # One compiled encoder shape per budget; an image or frame is padded to
-        # the smallest that holds its patches.
+        # the smallest that holds its patches. Unset, every budget a prefill
+        # chunk holds, so raising max_soft_tokens keeps the compiled graphs.
         rbln_config = vllm_config.additional_config
         budgets = sorted(rbln_config.encoder_token_budgets) or [
-            budget for budget in _SUPPORTED_SOFT_TOKENS if budget <= cap
+            budget
+            for budget in _SUPPORTED_SOFT_TOKENS
+            if budget <= rbln_config.max_prefill_chunk_size
         ]
         if unsupported := sorted(set(budgets) - set(_SUPPORTED_SOFT_TOKENS)):
             raise ValueError(
@@ -315,6 +327,10 @@ class RBLNGemma4ForConditionalGeneration(
         self.mm_encoder_patch_buckets = [budget * pool**2 for budget in budgets]
         self._mm_encoder: Callable[..., torch.Tensor] | None
         object.__setattr__(self, "_mm_encoder", None)
+
+    @property
+    def logits_processor(self) -> nn.Module:
+        return self.language_model.logits_processor
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # Scale each expert's down projection instead of its routing weight:
@@ -408,16 +424,19 @@ class RBLNGemma4ForConditionalGeneration(
             :, None, None, :
         ]
         device = next(tower.parameters()).device
-        embeds = encoder(
-            patches.to(device),
-            positions.to(device),
-            padding.to(device),
-            key_bias.to(device=device, dtype=self.model_dtype),
-        )
         # The patches of a grid whose sides are multiples of the pooling kernel
         # pool into the leading cells, in order.
         num_soft_tokens = num_patches // tower.config.pooling_kernel_size**2
-        return embeds[0, :num_soft_tokens].cpu()
+        return rbln_utils.run_mm_encoder(
+            lambda *inputs: encoder(*inputs)[0],
+            [
+                patches.to(device),
+                positions.to(device),
+                padding.to(device),
+                key_bias.to(device=device, dtype=self.model_dtype),
+            ],
+            num_soft_tokens,
+        )
 
     def _process_image_input(
         self, image_input: Gemma4ImageInputs
@@ -470,7 +489,7 @@ class RBLNGemma4ForConditionalGeneration(
                     metadata.mm_prefix_row_ends,
                     metadata.seq_lens,
                     layer.sliding_window,
-                    _resolve_kv_cache(metadata, layer.layer_index).size(-2),
+                    resolve_kv_cache(metadata, layer.layer_name).size(-2),
                     self.model_dtype,
                 )
                 # Workaround: borrow metadata without mutating Attention modules.

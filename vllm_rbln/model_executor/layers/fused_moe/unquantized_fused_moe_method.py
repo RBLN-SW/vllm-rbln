@@ -14,7 +14,6 @@
 
 import torch
 from vllm.model_executor.layers.fused_moe import UnquantizedFusedMoEMethod
-from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 
 
@@ -25,15 +24,6 @@ class RBLNUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     is provided. Registering this OOT implementation preserves that selection
     path while routing execution through the RBLN MoE custom op.
     """
-
-    def __init__(self, moe: FusedMoEConfig):
-        if moe.swiglu_limit is not None:
-            raise NotImplementedError(
-                "RBLN unquantized MoE does not support "
-                f"swiglu_limit={moe.swiglu_limit}: custom_moe has no SwiGLU clamp "
-                "on 16-bit weights"
-            )
-        super().__init__(moe)
 
     def apply(
         self,
@@ -65,5 +55,6 @@ class RBLNUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             masked_routing_weights,
             layer.activation.value,
             expert_map=layer.expert_map,
+            swiglu_limit=layer.swiglu_limit or None,
         )
         return final_hidden_states.reshape(orig_shape)

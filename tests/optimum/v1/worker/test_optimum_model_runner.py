@@ -16,7 +16,7 @@ import contextlib
 import json
 import tempfile
 from types import MethodType, SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
@@ -68,7 +68,7 @@ DEVICE = current_platform.device_type
 
 
 # TODO add tests for both `enable_prefix_caching = True` and `False`
-def get_vllm_config(async_scheduling=False):
+def get_vllm_config(async_scheduling=False, **rbln_options):
     scheduler_config = SchedulerConfig(
         max_num_seqs=10,
         max_num_batched_tokens=128,
@@ -94,6 +94,7 @@ def get_vllm_config(async_scheduling=False):
             "optimum_overrides": {
                 "prefill_chunk_size": 4,
             },
+            **rbln_options,
         },
     )
     return vllm_config
@@ -119,6 +120,49 @@ def model_runner(request):
     runner = RBLNOptimumModelRunner(vllm_config, DEVICE)
     fake_load_model(runner)
     return runner
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_custom_sampler_follows_fused_sampling_flag(monkeypatch, enabled):
+    monkeypatch.setattr(
+        "vllm_rbln.v1.sample.rbln_sampler.compile_sampler", lambda fn, ctx: fn
+    )
+    config = get_vllm_config(use_fused_sampling=enabled)
+    runner = RBLNOptimumModelRunner(config, DEVICE)
+
+    assert isinstance(runner.sampler, runner_module.RBLNSampler)
+    assert (runner.sampler._penalty_state is not None) is enabled
+    assert (runner.sampler._compiled_min_p_sample is not None) is enabled
+
+
+def test_sample_passes_input_batch_to_fused_sampler(model_runner, monkeypatch):
+    sampler = MagicMock(spec=runner_module.RBLNSampler)
+    monkeypatch.setattr(model_runner, "sampler", sampler)
+    logits = torch.zeros(1, 8)
+
+    model_runner._sample(logits, spec_decode_metadata=None)
+
+    assert sampler.call_args.kwargs["input_batch"] is model_runner.input_batch
+
+
+def test_finished_request_forgets_fused_penalty_state(model_runner, monkeypatch):
+    sampler = MagicMock(spec=runner_module.RBLNSampler)
+    monkeypatch.setattr(model_runner, "sampler", sampler)
+    finished = RBLNSchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={},
+        total_num_scheduled_tokens=0,
+        scheduled_spec_decode_tokens={},
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=0,
+        finished_req_ids={"r0"},
+        free_encoder_mm_hashes=[],
+    )
+
+    model_runner._update_states(finished)
+
+    sampler.forget_requests.assert_called_once_with({"r0"})
 
 
 def _is_req_scheduled(model_runner, req_id: str) -> bool:

@@ -477,41 +477,35 @@ class TestEstimateModelKernelSize:
 
 
 class TestGetKvCacheNames:
-    @staticmethod
-    def _caches(*names):
-        return {n: torch.empty(0) for n in names}
+    @pytest.mark.parametrize(
+        "names",
+        [
+            ("model.layers.2.attn", "model.layers.10.attn"),
+            (
+                "model.layers.2.attn.0",
+                "model.layers.2.attn.9",
+                "model.layers.2.attn.10",
+                "model.layers.3.attn.0",
+            ),
+        ],
+        ids=["decoder-layers", "glm-slots"],
+    )
+    def test_orders_by_numeric_path(self, names):
+        assert get_kv_cache_names(reversed(names)) == list(names)
 
-    def test_orders_by_layer_index(self):
-        # Returned ordered by extracted layer index, not dict insertion order.
-        caches = self._caches(
-            "model.layers.2.self_attn",
-            "model.layers.0.self_attn",
-            "model.layers.1.self_attn",
+    def test_uses_full_cache_name_to_break_numeric_path_ties(self):
+        names = (
+            "model.layers.3.linear_attn",
+            "model.layers.3.linear_attn.conv_ring",
+            "model.layers.3.linear_attn.drafts",
+            "model.layers.3.self_attn.attn",
         )
-        assert get_kv_cache_names(caches) == [
-            "model.layers.0.self_attn",
-            "model.layers.1.self_attn",
-            "model.layers.2.self_attn",
-        ]
+        assert get_kv_cache_names(reversed(names)) == list(names)
 
-    def test_multi_layer_same_index_raises(self, monkeypatch):
-        # Two layers at one index on a non-cpu/cuda/xpu platform -> not supported.
-        monkeypatch.setattr(current_platform, "is_cpu", lambda: False)
-        monkeypatch.setattr(current_platform, "is_cuda_alike", lambda: False)
-        monkeypatch.setattr(current_platform, "is_xpu", lambda: False)
-        caches = self._caches("model.layers.0.self_attn", "model.layers.0.cross_attn")
-        with pytest.raises(NotImplementedError):
-            get_kv_cache_names(caches)
-
-    def test_multi_layer_same_index_allowed_on_cpu(self, monkeypatch):
-        # The other side of the branch: on cpu/cuda/xpu both names are returned.
-        monkeypatch.setattr(current_platform, "is_cpu", lambda: True)
-        monkeypatch.setattr(current_platform, "is_cuda_alike", lambda: False)
-        monkeypatch.setattr(current_platform, "is_xpu", lambda: False)
-        caches = self._caches("model.layers.0.self_attn", "model.layers.0.cross_attn")
-        names = get_kv_cache_names(caches)
-        assert set(names) == set(caches)
-        assert len(names) == 2
+    def test_duplicate_name_is_an_error(self):
+        name = "layer.3.attn"
+        with pytest.raises(ValueError, match="Duplicate KV cache name"):
+            get_kv_cache_names([name, name])
 
 
 class TestPrepareKernelBlockSizes:
@@ -1922,17 +1916,3 @@ class TestRescaleKvCacheConfig:
     def test_a_zero_block_config_is_refused(self):
         with pytest.raises(ValueError, match="cannot rescale"):
             rescale_kv_cache_config(self._cfg(0), 5)
-
-
-class TestGatedDeltaNetCacheIndices:
-    def test_a_layer_owns_a_state_and_a_conv_ring_slot(self):
-        # Two cache slots a layer: the recurrent state at the layer's own slot,
-        # its conv ring at the next, and an attention layer's cache at the first.
-        config = SimpleNamespace(hf_config=SimpleNamespace(model_type="qwen3_5_text"))
-        assert worker_utils.num_attn_module(config, "auto") == 2
-        assert worker_utils.extract_layer_index("model.layers.3.linear_attn", 2) == 6
-        assert (
-            worker_utils.extract_layer_index("model.layers.3.linear_attn.conv_ring", 2)
-            == 7
-        )
-        assert worker_utils.extract_layer_index("model.layers.3.self_attn.attn", 2) == 6

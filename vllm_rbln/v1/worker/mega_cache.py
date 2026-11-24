@@ -66,6 +66,8 @@ def _compile_env_factors() -> str:
         name: normalize_value(getattr(rbln_envs, name, None))
         for name in rbln_envs.RBLN_COMPILE_ENV
     }
+    nested_region = "VLLM_RBLN_USE_NESTED_COMPILE_REGION"
+    factors[nested_region] = factors[nested_region] is not False
     return hash_factors(factors)
 
 

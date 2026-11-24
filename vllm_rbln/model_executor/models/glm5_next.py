@@ -91,11 +91,10 @@ from vllm.multimodal.processing import (
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import set_default_torch_dtype
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
-from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec, MLAAttentionSpec
+from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
 import vllm_rbln.utils as rbln_utils
 from vllm_rbln.model_executor.models.interfaces import SupportsRBLNMultiModal
-from vllm_rbln.patches.attention import _resolve_kv_cache
 from vllm_rbln.utils import is_prefill_step
 from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadata,
@@ -109,11 +108,8 @@ from vllm_rbln.v1.attention.backends.glm5_next import (
     RBLNGlm5NextStateMetadata,
     kda_cache_name,
 )
-from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
-from vllm_rbln.v1.worker.utils import (
-    num_attn_module as rbln_num_attn_module,
-)
-from vllm_rbln.v1.worker.utils import pipeline_adjusted_layer_index
+from vllm_rbln.v1.attention.kv_cache_bindings import resolve_kv_cache
+from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec, RBLNMambaSpec
 
 SLOT_DSA_LATENT, SLOT_DSA_INDEX_KEY, SLOT_DSA_INDEX_SCALE, SLOT_DSA_INDEX_TAIL = range(
     4
@@ -135,13 +131,6 @@ class _RBLNGlm5NextCache(nn.Module, AttentionLayerBase):
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
-        model_config = vllm_config.model_config
-        self.layer_index = pipeline_adjusted_layer_index(
-            prefix,
-            model_config,
-            vllm_config.parallel_config,
-            rbln_num_attn_module(model_config, vllm_config.cache_config.cache_dtype),
-        )
 
     def forward(self) -> None: ...
 
@@ -155,7 +144,7 @@ class RBLNGlm5NextStateCache(_RBLNGlm5NextCache):
             vllm_config.cache_config.block_size,
             vllm_config.model_config.hf_text_config.kv_lora_rank,
         )
-        return MambaSpec(
+        return RBLNMambaSpec(
             block_size=vllm_config.cache_config.mamba_block_size,
             shapes=(latent_block,),
             dtypes=(torch.uint8,),
@@ -171,7 +160,7 @@ class RBLNGlm5NextStateCache(_RBLNGlm5NextCache):
         metadata = get_forward_context().attn_metadata[self.prefix]
         assert isinstance(metadata, RBLNGlm5NextStateMetadata), type(metadata)
         assert metadata.load_blocks is not None and metadata.store_blocks is not None
-        state = _resolve_kv_cache(metadata, self.layer_index)
+        state = resolve_kv_cache(metadata, self.prefix)
         return (
             state,
             metadata.load_blocks.view(-1),
@@ -211,7 +200,7 @@ class RBLNGlm5NextPagedCache(_RBLNGlm5NextCache):
         """(cache, block_table, metadata)."""
         metadata = get_forward_context().attn_metadata[self.prefix]
         return (
-            _resolve_kv_cache(metadata, self.layer_index),
+            resolve_kv_cache(metadata, self.prefix),
             metadata.block_tables,
             metadata,
         )
@@ -253,9 +242,8 @@ class RBLNGlm5NextAuxCache(_RBLNGlm5NextCache):
         return RBLNGlm5NextCacheBackend
 
     def inputs(self) -> torch.Tensor:
-        assert self.layer_index is not None, f"{self.prefix} was not allocated"
         metadata = get_forward_context().attn_metadata[self.owner]
-        return _resolve_kv_cache(metadata, self.layer_index)
+        return resolve_kv_cache(metadata, self.prefix)
 
 
 def _swiglu_clamped(
@@ -560,6 +548,12 @@ class RBLNGlm5NextKDA(nn.Module):
         for j, ((state, load, store, _), (qj, kj, vj)) in enumerate(
             zip(group_states, group_qkv)
         ):
+            state = state.view(
+                state.shape[0],
+                self.group_heads,
+                state.shape[1] // self.group_heads,
+                state.shape[2],
+            )
             channels = slice(j * group_channels, (j + 1) * group_channels)
             heads = slice(j * self.group_heads, (j + 1) * self.group_heads)
             gj, bj = g[:, heads], beta[:, heads]
@@ -895,36 +889,23 @@ class RBLNGlm5NextDecoderLayer(nn.Module):
             )
 
     def _sublayer(self, streams, fn, scale, base, norm, sublayer) -> torch.Tensor:
+        # The compiler cuts the mhc_* kernels over the chiplets, by tokens in
+        # prefill and by batch rows in decode, so the streams stay split between
+        # sublayers (fp32 holding bf16 values) and only the sublayer input is
+        # gathered.
         ops = torch.ops.rbln_custom_ops
         streams_f32 = streams.float()
-        if is_prefill_step():
-            # The compiler cuts the mhc_* kernels by tokens over the chiplets, so
-            # the streams stay split between sublayers (fp32 holding bf16 values)
-            # and only the sublayer input is gathered.
-            logits = ops.mhc_mix(streams_f32, fn, scale, base, eps=self.rms_eps)
-            x = ops.mhc_read(streams_f32, logits, eps=self.hc_eps).to(norm.weight.dtype)
-            y = sublayer(norm(x))
-            return ops.mhc_write(
-                y.float(),
-                streams_f32,
-                logits,
-                post_mult=self.post_mult,
-                iters=self.sinkhorn_iters,
-                eps=self.hc_eps,
-            )
-        batch, n, tokens, hidden = streams.shape
-        flat = streams.transpose(1, 2).reshape(batch, tokens, n * hidden).float()
-        flat = flat * torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.rms_eps)
-        z = F.linear(flat, fn) * scale + base
-        z_pre, z_post = z[..., :n], z[..., n : 2 * n]
-        comb = ops.sinkhorn_normalize(
-            z[..., 2 * n :], iters=self.sinkhorn_iters, eps=self.hc_eps
+        logits = ops.mhc_mix(streams_f32, fn, scale, base, eps=self.rms_eps)
+        x = ops.mhc_read(streams_f32, logits, eps=self.hc_eps).to(norm.weight.dtype)
+        y = sublayer(norm(x))
+        return ops.mhc_write(
+            y.float(),
+            streams_f32,
+            logits,
+            post_mult=self.post_mult,
+            iters=self.sinkhorn_iters,
+            eps=self.hc_eps,
         )
-        x = ops.hc_stream_reduce(streams_f32, z_pre, eps=self.hc_eps).to(streams.dtype)
-        x = sublayer(norm(x))
-        return ops.hc_residual_add(
-            x.float(), streams_f32, z_post, comb, post_mult=self.post_mult
-        ).to(streams.dtype)
 
     def forward(self, streams: torch.Tensor) -> torch.Tensor:
         """streams [B, n, T, H] -> [B, n, T, H]."""
@@ -1064,15 +1045,23 @@ class RBLNGlm5NextModel(nn.Module):
             batch, tokens, _ = flat.shape
             streams = flat.view(batch, tokens, self.n, -1).transpose(1, 2).contiguous()
         dtype = streams.dtype
+        streams = streams.float()
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             streams = layer(streams)
-        # A prefill chunk keeps the streams fp32 between sublayers (bf16 values).
+        # The streams stay fp32 between sublayers (bf16 values).
         streams = streams.to(dtype)
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
                 {"streams": streams.transpose(1, 2).reshape(batch, tokens, -1)}
             )
-        return self.norm(streams.mean(dim=1))
+        hidden = streams.mean(dim=1)
+        if not is_prefill_step():
+            # A read gathers the rows; left cut, they would reach lm_head, whose
+            # weight takes the layout prefill gives it.
+            return torch.ops.rbln_custom_ops.residual_read(
+                hidden, self.norm.weight, self.norm.variance_epsilon
+            )
+        return self.norm(hidden)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         return _load_glm5_next_weights(
@@ -1146,6 +1135,34 @@ class RBLNGlm5NextForCausalLM(nn.Module, SupportsPP):
         return loaded_params
 
 
+class _RBLNGlm5NextVisionBlock(nn.Module):
+    def __init__(self, block, num_heads, head_dim, swiglu_limit) -> None:
+        super().__init__()
+        self.block = block
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.swiglu_limit = swiglu_limit
+
+    @torch.compiler.nested_compile_region
+    def forward(self, x, cos, sin, key_bias, rot):
+        n = x.shape[0]
+        block, attn = self.block, self.block.attn
+        qkv = attn.qkv(block.norm1(x))[0]
+        qkv = qkv.view(n, 3, self.num_heads, self.head_dim)
+        q = attn.q_norm(qkv[:, 0])
+        k = attn.k_norm(qkv[:, 1])
+        v = qkv[:, 2]
+        q = q * cos + torch.matmul(q, rot) * sin
+        k = k * cos + torch.matmul(k, rot) * sin
+        q, k, v = q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1)
+        scores = torch.matmul(q, k.transpose(1, 2)) * self.head_dim**-0.5 + key_bias
+        out = torch.matmul(torch.softmax(scores, dim=-1), v)
+        x = x + attn.proj(out.transpose(0, 1).reshape(n, -1))[0]
+        mlp = block.mlp
+        gate, up = mlp.gate_up_proj(block.norm2(x))[0].chunk(2, dim=-1)
+        return x + mlp.down_proj(_swiglu_clamped(gate, up, self.swiglu_limit))[0]
+
+
 class _RBLNGlm5NextVisionEncoder(nn.Module):
     def __init__(self, tower: nn.Module, out_dtype: torch.dtype) -> None:
         super().__init__()
@@ -1155,6 +1172,12 @@ class _RBLNGlm5NextVisionEncoder(nn.Module):
         self.num_heads = attn.num_attention_heads_per_partition
         self.head_dim = attn.head_dim
         self.swiglu_limit = tower.blocks[0].mlp.act_fn.swiglu_limit
+        self.blocks = nn.ModuleList(
+            _RBLNGlm5NextVisionBlock(
+                block, self.num_heads, self.head_dim, self.swiglu_limit
+            )
+            for block in tower.blocks
+        )
         half = self.head_dim // 2
         rot = torch.zeros(self.head_dim, self.head_dim)
         for j in range(half):
@@ -1177,23 +1200,8 @@ class _RBLNGlm5NextVisionEncoder(nn.Module):
         )
         cos = cos.unsqueeze(1)
         sin = sin.unsqueeze(1)
-        scale = self.head_dim**-0.5
-        for block in tower.blocks:
-            attn = block.attn
-            qkv = attn.qkv(block.norm1(x))[0]
-            qkv = qkv.view(n, 3, self.num_heads, self.head_dim)
-            q = attn.q_norm(qkv[:, 0])
-            k = attn.k_norm(qkv[:, 1])
-            v = qkv[:, 2]  # [N, heads, D]
-            q = q * cos + torch.matmul(q, self.rot) * sin
-            k = k * cos + torch.matmul(k, self.rot) * sin
-            q, k, v = q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1)
-            scores = torch.matmul(q, k.transpose(1, 2)) * scale + key_bias
-            out = torch.matmul(torch.softmax(scores, dim=-1), v)
-            x = x + attn.proj(out.transpose(0, 1).reshape(n, -1))[0]
-            mlp = block.mlp
-            gate, up = mlp.gate_up_proj(block.norm2(x))[0].chunk(2, dim=-1)
-            x = x + mlp.down_proj(_swiglu_clamped(gate, up, self.swiglu_limit))[0]
+        for block in self.blocks:
+            x = block(x, cos, sin, key_bias, self.rot)
         x = tower.post_layernorm(x)
         merge2 = tower.spatial_merge_size**2
         d = tower.downsample.weight

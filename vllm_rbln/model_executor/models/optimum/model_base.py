@@ -234,23 +234,31 @@ class RBLNOptimumModelBase(nn.Module):
             # classes may be incompatible with optimum-rbln, so pass layer kwargs.
             # FIXME(optimum-rbln): RBLNGptOssForCausalLM.get_pytorch_model
             # currently discards these config kwargs.
+            load_kwargs: dict[str, Any]
             if type(hf_config).__module__.startswith("transformers."):
-                config_override = {"config": hf_config}
+                load_kwargs = {"config": hf_config}
             else:
                 text_config = hf_config.get_text_config()
                 layer_override = {"num_hidden_layers": text_config.num_hidden_layers}
                 if hasattr(text_config, "layer_types"):
                     layer_override["layer_types"] = text_config.layer_types
-                config_override = (
+                load_kwargs = (
                     layer_override
                     if text_config is hf_config
                     else {"text_config": layer_override}
                 )
+            weights_identity = compile_config.weights_identity
+            if weights_identity is not None and weights_identity.source == "hub":
+                commit = weights_identity.value
+                load_kwargs.update(revision=commit, token=self.model_config.hf_token)
+                if "config" in load_kwargs:
+                    # Transformers can resolve weights using the config's commit.
+                    hf_config._commit_hash = commit
             model = model_cls.from_pretrained(
                 compile_config.model,
                 rbln_config=deepcopy(compile_config.rbln_config),
                 dtype=compile_config.dtype,
-                **config_override,
+                **load_kwargs,
             )
             model.save_pretrained(artifact_path)  # type: ignore[attr-defined]
 

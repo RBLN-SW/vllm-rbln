@@ -23,7 +23,7 @@ jobs:
           # Above the default of 30, so one run covers the whole backlog.
           operations-per-run: 1000
 
-          exempt-draft-pr: true
+          exempt-draft-pr: false
           exempt-issue-labels: 'keep-open'
           exempt-pr-labels: 'keep-open'
 

@@ -160,6 +160,11 @@ def is_enc_dec_arch(config: PretrainedConfig) -> bool:
     return is_arch_supported(config, _RBLN_ENCODER_DECODER_MODELS)
 
 
+def is_chunked_prefill_arch(config: PretrainedConfig) -> bool:
+    """Whether the compiled model supports chunked prefill."""
+    return not (is_enc_dec_arch(config) or is_encoder_pooling_arch(config))
+
+
 def is_arch_supported(
     config: PretrainedConfig, model_set: dict[str, tuple[str, str]] | None = None
 ) -> bool:

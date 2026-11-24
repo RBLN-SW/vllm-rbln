@@ -31,6 +31,7 @@ from vllm.distributed.kv_events import (
     BlockStored,
     KVCacheEvent,
 )
+from vllm.v1.core.kv_cache_coordinator import KVCacheCoordinator
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -210,24 +211,31 @@ class SubBlockIndex:
         return block_id in self._block_hashes
 
     def longest_match(
-        self, sub_block_hashes: Sequence[BlockHash]
+        self,
+        sub_block_hashes: Sequence[BlockHash],
+        is_held: Callable[[int], bool],
     ) -> tuple[int | None, int]:
         """Find a block with the longest prefix match.
 
+        Among the blocks matching that prefix, prefers one for which
+        ``is_held`` returns True.
+
         Returns:
-            ``(block_id, num_matched)`` where ``block_id`` is any block
+            ``(block_id, num_matched)`` where ``block_id`` is a block
             matching that prefix, or ``(None, 0)`` if no match.
         """
-        best_block_id: int | None = None
+        best_blocks: set[int] | None = None
         best_depth = 0
         for depth, h in enumerate(sub_block_hashes, start=1):
             blocks = self._hash_to_blocks.get(h)
             if not blocks:
                 break
-            # Pick an arbitrary block_id from the set.
-            best_block_id = next(iter(blocks))
+            best_blocks = blocks
             best_depth = depth
-        return best_block_id, best_depth
+        if best_blocks is None:
+            return None, 0
+        held = (b for b in best_blocks if is_held(b))
+        return next(held, next(iter(best_blocks))), best_depth
 
 
 # ---------------------------------------------------------------------------
@@ -319,6 +327,10 @@ class RBLNKVCacheManager(KVCacheManager):
                 bs = spec.block_size
                 if bs <= sub_block_size or bs % sub_block_size != 0:
                     return False
+                # TODO: 2 or 3 KV heads are cut across the 4 chiplets by tokens,
+                # which the sub-block copy does not follow.
+                if 1 < spec.num_kv_heads < 4:
+                    return False
         return True
 
     def __init__(
@@ -339,6 +351,10 @@ class RBLNKVCacheManager(KVCacheManager):
             enable_caching=True,
             **kwargs,
         )
+        # Sliding-window retention keeps only the blocks a hit at this alignment
+        # can reach, and a sub-block hit ends at any sub-block boundary.
+        for manager in self.coordinator.single_type_managers:
+            manager.cache_hit_alignment_tokens = sub_block_size
 
         self.sub_block_size = sub_block_size
 
@@ -411,7 +427,11 @@ class RBLNKVCacheManager(KVCacheManager):
                 min_matched = 0
                 break
 
-            src_block_id, num_matched = gi.sub_block_index.longest_match(query)
+            # Prefer a source another request holds: touching a free one takes
+            # it out of the free queue for the allocation that follows.
+            src_block_id, num_matched = gi.sub_block_index.longest_match(
+                query, is_held=lambda b: self.block_pool.blocks[b].ref_cnt > 0
+            )
             if src_block_id is None:
                 min_matched = 0
                 break
@@ -531,6 +551,15 @@ class RBLNKVCacheManager(KVCacheManager):
             self.schedule_sub_block_indexing(request)
 
         return result
+
+    def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
+        # The hybrid coordinator rounds down to its block-aligned hit length,
+        # which leaves a group with smaller blocks nothing to index for a
+        # sub-block hit; the base coordinator caches every full block.
+        if self.enable_caching:
+            KVCacheCoordinator.cache_blocks(
+                self.coordinator, request, num_computed_tokens
+            )
 
     def schedule_sub_block_indexing(self, request: Request) -> None:
         """Record that *request* needs sub-block indexing in the next
@@ -734,7 +763,9 @@ class RBLNKVCacheManager(KVCacheManager):
                 request, state, sub_start, sub_end, first_fresh_idx, gi
             )
 
-            if mark_cached:
+            # A block upstream already keyed (its partial-tail entry, when
+            # hash_block_size < block_size) stays in the LRU cache on its own.
+            if mark_cached and blk.block_hash is None:
                 # Give the block a synthetic block_hash so the upstream block pool
                 # keeps it in the LRU cache instead of immediately reusing it.
                 # The actual value doesn't matter as long as it' unique so that it
