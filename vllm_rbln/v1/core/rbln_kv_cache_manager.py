@@ -327,10 +327,6 @@ class RBLNKVCacheManager(KVCacheManager):
                 bs = spec.block_size
                 if bs <= sub_block_size or bs % sub_block_size != 0:
                     return False
-                # TODO: 2 or 3 KV heads are cut across the 4 chiplets by tokens,
-                # which the sub-block copy does not follow.
-                if 1 < spec.num_kv_heads < 4:
-                    return False
         return True
 
     def __init__(
