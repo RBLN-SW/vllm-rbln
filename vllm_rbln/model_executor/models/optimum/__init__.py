@@ -95,7 +95,7 @@ def load_model(vllm_config: VllmConfig) -> nn.Module:
         # Scored through the generation graph, so Qwen3ForSequenceClassification
         # is a generation arch and the pooling dispatch below would miss it.
         assert vllm_config.cache_config.enable_prefix_caching in (False, None), (
-            "Prefix caching is not supported with pooling models. Please set "
+            "Prefix caching is not supported with Qwen3 reranker models. Please set "
             "`enable_prefix_caching` to False."
         )
         rbln_model = RBLNOptimumQwen3ForSequenceClassification(vllm_config)

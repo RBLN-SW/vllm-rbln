@@ -37,14 +37,7 @@ def patch_upstream() -> None:
 
 
 def validate_request(params: "SamplingParams | PoolingParams") -> None:
-    from vllm.pooling_params import PoolingParams
-
-    # KV-cache hits do not provide the hidden states for skipped tokens.
-    if isinstance(params, PoolingParams) and params.task in (
-        "token_embed",
-        "token_classify",
-    ):
-        params.skip_reading_prefix_cache = True
+    pass
 
 
 def check_and_update(vllm_config: "VllmConfig") -> None:
@@ -182,10 +175,7 @@ def _uses_sliding_window(hf_config) -> bool:
 
 
 def disable_unsupported_prefix_caching(vllm_config: "VllmConfig") -> None:
-    from vllm_rbln.utils.optimum.predicates import (
-        is_qwen3_embedding,
-        is_qwen3_reranker,
-    )
+    from vllm_rbln.utils.optimum.predicates import is_qwen3_reranker
     from vllm_rbln.utils.optimum.registry import (
         is_decoder_pooling_arch,
         is_enc_dec_arch,
@@ -212,8 +202,9 @@ def disable_unsupported_prefix_caching(vllm_config: "VllmConfig") -> None:
     elif is_encoder_pooling_arch(hf_config):
         _disable_prefix_caching(vllm_config, "encoder pooling models")
     elif (
-        is_decoder_pooling_arch(hf_config) or is_qwen3_embedding(model_config)
-    ) and model_config.pooler_config.seq_pooling_type != "LAST":
+        is_decoder_pooling_arch(hf_config)
+        and model_config.pooler_config.seq_pooling_type != "LAST"
+    ):
         _disable_prefix_caching(vllm_config, "decoder pooling without LAST pooling")
     elif _uses_sliding_window(hf_config):
         _disable_prefix_caching(vllm_config, "sliding window models")

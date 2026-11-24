@@ -22,6 +22,7 @@ from vllm.utils.print_utils import print_embeddings
 
 image_url = "https://vllm-public-assets.s3.us-west-2.amazonaws.com/multimodal_asset/cat_snow.jpg"
 text = "A cat standing in the snow."
+multi_modal_data = {"image": fetch_image(image_url)}
 
 default_instruction = "Represent the user's input."
 image_placeholder = "<|vision_start|><|image_pad|><|vision_end|>"
@@ -44,7 +45,6 @@ def main(
     vit_max_seq_len: int = 16384,
     model: str = "Qwen/Qwen3-VL-Embedding-2B",
 ):
-    multi_modal_data = {"image": fetch_image(image_url)}
     # Unlike upstream, images are not pre-resized with qwen-vl-utils: the
     # processor's own max_pixels keeps each image within vit_max_seq_len.
     llm = LLM(

@@ -26,10 +26,9 @@ from vllm.v1.outputs import PoolerOutput
 from vllm.v1.pool.metadata import PoolingMetadata
 
 from vllm_rbln.logger import init_logger
-from vllm_rbln.utils.optimum.configuration.rbln_config import has_packed_kv_cache
 
 from .base import ModelInputForRBLN, build_embedding_pooler, version_error
-from .model_base import RBLNOptimumDecoderMixin, RBLNOptimumModelBase
+from .model_base import RBLNOptimumModelBase, RBLNOptimumPrefixCacheMixin
 
 logger = init_logger(__name__)
 
@@ -103,7 +102,17 @@ class RBLNQwen3RerankerPooler(Pooler):
 class RBLNOptimumQwen3ForSequenceClassification(
     RBLNOptimumModelBase, VllmModelForPooling
 ):
-    """Score Qwen3-Reranker using the final position of the generation graph."""
+    """Score Qwen3-Reranker through vLLM's ``score()`` API.
+
+    The reranker is a causal LM that answers "yes" or "no". Its relevance
+    score is the two-way softmax over the answer logits::
+
+        p_yes / (p_yes + p_no) = sigmoid(logit_yes - logit_no)
+
+    Reusing the generation graph with its lm_head lets the same compiled
+    artifact serve both generation and scoring. The graph keeps only the
+    final position (``logits_to_keep == 1``), where the answer would be sampled.
+    """
 
     is_pooling_model = True
     pooler: Pooler
@@ -160,16 +169,13 @@ class RBLNOptimumQwen3ForSequenceClassification(
         # "yes"/"no" answer would have been sampled.
         logits = outputs.logits.reshape(num_requests, -1)
 
-        # sigmoid(logit_yes - logit_no) == p_yes / (p_yes + p_no), so reduce to
-        # one logit here and let the pooler apply the activation. Hand it over in
-        # head_dtype -- fp32 for pooling models -- because sigmoid in bfloat16
-        # cannot represent a score like 0.9995 and rounds it to 1.0.
+        # The fp32 head dtype keeps sigmoid scores near 1 distinguishable.
         score_logits = logits[:, self.true_id] - logits[:, self.false_id]
         return score_logits.unsqueeze(-1).to(self.model_config.head_dtype)
 
 
 class RBLNOptimumQwen3Model(
-    RBLNOptimumModelBase, RBLNOptimumDecoderMixin, VllmModelForPooling
+    RBLNOptimumModelBase, RBLNOptimumPrefixCacheMixin, VllmModelForPooling
 ):
     """Qwen3-Embedding on the decoder graph that returns hidden states."""
 
@@ -178,7 +184,6 @@ class RBLNOptimumQwen3Model(
 
     def __init__(self, vllm_config: VllmConfig) -> None:
         super().__init__(vllm_config=vllm_config)
-        self.packed_kv_cache = has_packed_kv_cache(self.rbln_model_config)
         pooler_config = self.model_config.pooler_config
         assert pooler_config is not None
         self.pooler = DispatchPooler(

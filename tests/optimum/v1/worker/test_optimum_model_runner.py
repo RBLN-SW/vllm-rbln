@@ -35,7 +35,13 @@ from vllm.distributed import (
 from vllm.engine.arg_utils import EngineArgs
 from vllm.model_executor.layers.pooler.special import IdentityPooler
 from vllm.model_executor.models.interfaces import SupportsMultiModal
-from vllm.multimodal.inputs import PlaceholderRange
+from vllm.multimodal.inputs import (
+    MultiModalFeatureSpec,
+    MultiModalFieldConfig,
+    MultiModalFieldElem,
+    MultiModalKwargsItem,
+    PlaceholderRange,
+)
 from vllm.platforms import current_platform
 from vllm.pooling_params import PoolingParams
 from vllm.v1.core.sched.output import CachedRequestData
@@ -981,14 +987,22 @@ def test_metrics_finish_with_pooling_output(model_runner, monkeypatch, tmp_path)
     assert all(section["call_count"] == 1 for section in sections.values())
 
 
-@pytest.mark.parametrize("copy_fails", [False, True])
-def test_decoder_pooling_with_a_cached_prefix(monkeypatch, copy_fails):
+@pytest.mark.parametrize(
+    ("model_id", "copy_fails"),
+    [
+        ("Qwen/Qwen3-Embedding-0.6B", False),
+        ("Qwen/Qwen3-Embedding-0.6B", True),
+        ("Qwen/Qwen3-VL-Embedding-2B", False),
+    ],
+    ids=["text-hit", "text-copy-failure", "image-hit"],
+)
+def test_decoder_pooling_with_a_cached_prefix(monkeypatch, model_id, copy_fails):
     monkeypatch.setenv("RBLN_FORCE_NPU_NAME", "RBLN-CA25")
     monkeypatch.setattr(
         runner_module, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
     )
     config = EngineArgs(
-        model="Qwen/Qwen3-Embedding-0.6B",
+        model=model_id,
         model_impl="optimum",
         max_model_len=1024,
         max_num_seqs=1,
@@ -996,6 +1010,8 @@ def test_decoder_pooling_with_a_cached_prefix(monkeypatch, copy_fails):
         enable_prefix_caching=True,
     ).create_engine_config()
     model_runner = RBLNOptimumModelRunner(config, torch.device("cpu"))
+    hf_config = config.model_config.hf_config
+    is_multimodal = config.model_config.is_multimodal_model
 
     def prefill(**kwargs):
         return SimpleNamespace(logits=kwargs["cache_position"].float().unsqueeze(-1))
@@ -1006,23 +1022,57 @@ def test_decoder_pooling_with_a_cached_prefix(monkeypatch, copy_fails):
         copy_kv_cache.side_effect = RuntimeError("KV copy failed")
 
     def init_model(model):
-        model.rbln_model_config = SimpleNamespace()
+        model.rbln_model_config = SimpleNamespace(
+            dtype=torch.float32, use_multiple_decoder=False, decoder_batch_sizes=None
+        )
+        model.attn_impl = None
         model.model = SimpleNamespace(
-            prefill_decoder=prefill_decoder, get_kvcache_num_blocks=lambda: 8
+            rbln_config=model.rbln_model_config,
+            config=hf_config,
+            prefill_decoder=prefill_decoder,
+            get_kvcache_num_blocks=lambda: 8,
+            embed_tokens=lambda token_ids: token_ids.float().unsqueeze(-1),
+            _get_position_embeddings=lambda _, positions: positions.transpose(
+                0, 1
+            ).unsqueeze(0),
         )
 
     monkeypatch.setattr(RBLNOptimumModelBase, "init_model", init_model)
     with set_current_vllm_config(config):
         model_runner.model = load_model(config)
+    token_ids = list(range(129))
+    if is_multimodal:
+        token_ids[31:37] = [
+            hf_config.vision_start_token_id,
+            *([hf_config.image_token_id] * 4),
+            hf_config.vision_end_token_id,
+        ]
     scheduler_output = _schedule_new_request(
         "r0",
         block_ids=([1, 2],),
         outer_block_ids=[1],
-        token_ids=list(range(129)),
+        token_ids=token_ids,
         cached_block_table=[0],
         cached_length=[128],
         pooling_params=PoolingParams(task="embed", use_activation=False),
     )
+    if is_multimodal:
+        grid_size = 2 * hf_config.vision_config.spatial_merge_size
+        scheduler_output.scheduled_new_reqs[0].mm_features = [
+            MultiModalFeatureSpec(
+                data=MultiModalKwargsItem(
+                    {
+                        "image_grid_thw": MultiModalFieldElem(
+                            data=torch.tensor([1, grid_size, grid_size]),
+                            field=MultiModalFieldConfig.batched("image").field,
+                        ),
+                    }
+                ),
+                modality="image",
+                identifier="cached-image",
+                mm_position=PlaceholderRange(offset=32, length=4),
+            )
+        ]
 
     output = model_runner.execute_model(scheduler_output)
 
@@ -1031,6 +1081,10 @@ def test_decoder_pooling_with_a_cached_prefix(monkeypatch, copy_fails):
     assert prefill_args["block_tables"].tolist() == [1]
     expected_positions = list(range(129)) if copy_fails else [128]
     assert prefill_args["cache_position"].tolist() == [expected_positions]
+    if is_multimodal:
+        assert prefill_args["inputs_embeds"].tolist() == [[[128.0]]]
+        assert prefill_args["position_embed"][0, 0, :, 0].tolist() == [126, 126, 126]
+        assert "deepstack_embeds" not in prefill_args
     torch.testing.assert_close(output.pooler_output[0], torch.tensor([128.0]))
 
 

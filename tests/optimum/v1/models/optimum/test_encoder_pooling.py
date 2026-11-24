@@ -11,11 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Check how the Optimum model wrappers configure pooling.
+"""E2E check that encoder models end up with the right sequence pooling.
 
-These tests build ``VllmConfig`` with real checkpoints so ``ModelConfig``
-resolves ``pooler_config`` as it would in production. Only optimum-rbln model
-compilation and loading (``init_model``) are faked, since they require an NPU.
+For each real encoder architecture supported by the RBLN optimum path a real
+``VllmConfig`` is built, so vLLM's own ``ModelConfig`` resolves ``pooler_config``
+exactly as it would in production. The model is built through ``load_model``;
+only the optimum-rbln model compilation/loading (``init_model``) is faked,
+since that requires an NPU.
 
 Encoder-only models (BertModel / RobertaModel / XLMRobertaModel and their
 ``*ForSequenceClassification`` variants) are forced to CLS pooling. Decoder-based
@@ -71,7 +73,7 @@ ENCODER_MODELS = [
 ]
 
 
-def _build_pooling_model(model_id: str):
+def _build_encoder(model_id: str):
     model_config = ModelConfig(model=model_id, dtype=torch.float32, seed=42)
     # Mirror the platform's architecture remap before model loading.
     if is_qwen3_embedding(model_config):
@@ -89,6 +91,8 @@ def _build_pooling_model(model_id: str):
         ),
     )
 
+    # Fake ONLY the optimum-rbln compile/load step (the only part that needs an
+    # NPU); everything else runs the real model __init__ / pooler setup.
     def fake_init_model(self):
         self.model = MagicMock()
         self.model.get_kvcache_num_blocks.return_value = 1
@@ -102,8 +106,8 @@ def _build_pooling_model(model_id: str):
 
 
 @pytest.mark.parametrize("model_id, expected_seq_pool, expected_pooler", ENCODER_MODELS)
-def test_sequence_pooling(model_id, expected_seq_pool, expected_pooler):
-    model = _build_pooling_model(model_id)
+def test_encoder_pooling(model_id, expected_seq_pool, expected_pooler):
+    model = _build_encoder(model_id)
 
     pooler_config = model.vllm_config.model_config.pooler_config
     assert pooler_config.seq_pooling_type == expected_seq_pool
