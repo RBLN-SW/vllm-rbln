@@ -89,6 +89,8 @@ def register_deepseek_v4_config() -> None:
                         "prefix_match_unit must not be smaller than block_size."
                     )
             speculative = vllm_config.speculative_config
+            if cache.enable_prefix_caching and speculative is not None:
+                speculative.disable_eagle_block_drop = True
             if speculative is not None and speculative.num_speculative_tokens > 3:
                 raise ValueError(
                     "DeepSeek-V4 on RBLN supports at most 3 speculative tokens; "
@@ -141,11 +143,71 @@ def deepseek_v4_kv_cache_groups(vllm_config, kv_cache_spec):
     by_spec: dict = {}
     for name, spec in states.items():
         by_spec.setdefault(spec, []).append(name)
-    groups.extend(
-        KVCacheGroupSpec(names, spec, is_eagle_group=getattr(spec, "is_draft", False))
-        for spec, names in by_spec.items()
-    )
+    groups.extend(KVCacheGroupSpec(names, spec) for spec, names in by_spec.items())
     return groups
+
+
+@register_patch(
+    target="vllm.v1.core.kv_cache_manager.get_kv_cache_coordinator",
+    reason=(
+        "vLLM 0.31 has no coordinator registration or lookahead-hash replay "
+        "boundaries. Use them for RBLN rings. Remove this backport when upgrading "
+        "past vllm-project/vllm@da8a505684e6."
+    ),
+    build=True,
+)
+def _build_deepseek_v4_cache_coordinator():
+    from vllm.v1.core import kv_cache_manager
+
+    from vllm_rbln.v1.attention.backends.deepseek_v4 import RBLNDeepseekV4StateSpec
+    from vllm_rbln.v1.kv_cache import RBLNDeepseekV4CacheCoordinator
+
+    original = kv_cache_manager.get_kv_cache_coordinator
+
+    @functools.wraps(original)
+    def get_kv_cache_coordinator(kv_cache_config, *args, **kwargs):
+        if kwargs["enable_caching"] and any(
+            isinstance(g.kv_cache_spec, RBLNDeepseekV4StateSpec)
+            for g in kv_cache_config.kv_cache_groups
+        ):
+            return RBLNDeepseekV4CacheCoordinator(kv_cache_config, *args, **kwargs)
+        return original(kv_cache_config, *args, **kwargs)
+
+    return get_kv_cache_coordinator
+
+
+@register_patch(
+    target="vllm.v1.engine.core.EngineCore.__init__",
+    reason=(
+        "vLLM 0.31 cannot configure the Request hasher's MTP lookahead. Install "
+        "it before requests are created for the ring coordinator. Remove this "
+        "backport when upgrading past vllm-project/vllm@da8a505684e6."
+    ),
+    build=True,
+)
+def _build_deepseek_v4_request_hasher():
+    from vllm.utils.hashing import get_hash_fn_by_name
+    from vllm.v1.engine.core import EngineCore
+
+    from vllm_rbln.v1.core.rbln_kv_cache_manager import get_request_block_hasher
+    from vllm_rbln.v1.kv_cache import RBLNDeepseekV4CacheCoordinator
+
+    original = EngineCore.__init__
+
+    @functools.wraps(original)
+    def initialize(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        coordinator = self.scheduler.kv_cache_manager.coordinator
+        if isinstance(coordinator, RBLNDeepseekV4CacheCoordinator):
+            self.request_block_hasher = get_request_block_hasher(
+                self.scheduler.hash_block_size,
+                get_hash_fn_by_name(
+                    self.vllm_config.cache_config.prefix_caching_hash_algo
+                ),
+                coordinator.num_hash_lookahead_tokens,
+            )
+
+    return initialize
 
 
 def _deepseek_v4_pages(kv_cache_groups):

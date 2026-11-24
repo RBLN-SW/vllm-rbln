@@ -204,6 +204,7 @@ def create_rbln_scheduler(
     block_size: int = 16,
     max_model_len: int | None = None,
     num_speculative_tokens: int | None = None,
+    speculative_method: str = "ngram",
     pipeline_parallel_size: int = 1,
     sub_block_size: int | None = None,
     policy: str = "fcfs",
@@ -290,6 +291,10 @@ def create_rbln_scheduler(
             ],
         )
     cache_config.num_gpu_blocks = num_blocks
+    if speculative_config is not None:
+        speculative_config.method = speculative_method
+        if speculative_method == "mtp":
+            speculative_config.disable_eagle_block_drop = True
     scheduler_cls = RBLNAsyncScheduler if async_scheduling else RBLNScheduler
     return scheduler_cls(
         vllm_config=vllm_config,
@@ -473,8 +478,16 @@ def make_request(
     prompt_logprobs: int | None = None,
     mm_features: Any = None,
     prompt_embeds: torch.Tensor | None = None,
+    num_hash_lookahead_tokens: int = 0,
 ) -> Request:
     _ensure_none_hash()
+    hasher = get_request_block_hasher(block_size, sha256)
+    if num_hash_lookahead_tokens:
+        from vllm_rbln.v1.core.rbln_kv_cache_manager import (
+            get_request_block_hasher as get_lookahead_hasher,
+        )
+
+        hasher = get_lookahead_hasher(block_size, sha256, num_hash_lookahead_tokens)
     return Request(
         request_id=request_id,
         prompt_token_ids=prompt_token_ids,
@@ -486,7 +499,7 @@ def make_request(
         cache_salt=cache_salt,
         lora_request=lora_request,
         prompt_embeds=prompt_embeds,
-        block_hasher=get_request_block_hasher(block_size, sha256),
+        block_hasher=hasher,
     )
 
 
