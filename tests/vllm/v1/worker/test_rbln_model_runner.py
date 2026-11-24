@@ -935,13 +935,12 @@ def test_a_producer_warms_the_sampler_at_one_request(
     assert runner._warmup_sampler_decode_batches.called is verifies
 
 
-@pytest.mark.parametrize("num_reqs", [1, 2])
-def test_reference_sampler_warmup_finishes(num_reqs):
-    runner = _make_runner_stub(
+def _sampler_warmup_runner(sampler, num_reqs):
+    return _make_runner_stub(
         device=torch.device("cpu"),
         dtype=torch.float32,
         model_config=SimpleNamespace(get_vocab_size=lambda: 32),
-        sampler=mr.Sampler(),
+        sampler=sampler,
         input_batch=SimpleNamespace(
             temperature=torch.ones(num_reqs),
             top_p=torch.ones(num_reqs),
@@ -952,7 +951,24 @@ def test_reference_sampler_warmup_finishes(num_reqs):
         ),
     )
 
-    runner._dummy_sampler_run(num_reqs)
+
+def test_reference_sampler_skips_warmup():
+    sampler = MagicMock(spec=mr.Sampler)
+
+    _sampler_warmup_runner(sampler, 2)._dummy_sampler_run(2)
+
+    sampler.assert_not_called()
+
+
+@pytest.mark.parametrize("num_reqs", [1, 2])
+def test_rbln_sampler_warms_up_every_config(num_reqs):
+    from vllm_rbln.v1.sample import WARM_UP_CONFIGS
+
+    sampler = MagicMock(spec=mr.RBLNSampler)
+
+    _sampler_warmup_runner(sampler, num_reqs)._dummy_sampler_run(num_reqs)
+
+    assert sampler.warm_up.call_count == len(WARM_UP_CONFIGS)
 
 
 def test_rejection_sampler_warmup_asks_for_the_synthetic_variant():

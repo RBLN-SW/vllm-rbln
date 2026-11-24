@@ -33,7 +33,7 @@ Key components:
 | --- | --- | --- |
 | `--rbln-use-fused-sampling` | `False` | Run penalties, logit bias and min_p inside the sampling graph. Requires `use_custom_sampler`. |
 
-Fused sampling is disabled by default. Enable it on the vllm model path with
+Fused sampling is disabled by default. Enable it on either model path with
 `--rbln-use-fused-sampling`, or pass
 `additional_config={"use_fused_sampling": True}` to `LLM(...)`.
 

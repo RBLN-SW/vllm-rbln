@@ -168,7 +168,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             sampler = RBLNSampler(
                 logprobs_mode=self.model_config.logprobs_mode,
                 use_fp64_gumbel=False,
-                fused_sampling=False,
+                fused_sampling=rbln_config.use_fused_sampling,
             )
         else:
             logger.info("Using default vLLM sampler.")
@@ -928,6 +928,8 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         # and handling the second as a new request.
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
+        if isinstance(self.sampler, RBLNSampler):
+            self.sampler.forget_requests(scheduler_output.finished_req_ids)
 
         # Free cached encoder outputs signalled by the scheduler.
         # Without this, encoder_cache grows unboundedly on the EC consumer
@@ -1168,6 +1170,8 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                 "Skip dummy sampler run since --rbln-use-custom-sampler is disabled"
             )
             return
+        sampler = self.sampler
+        assert isinstance(sampler, RBLNSampler)
 
         def set_sampling_tensors(input_batch, **params):
             input_batch.temperature_cpu_tensor.fill_(params["temperature"])
@@ -1259,7 +1263,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                         input_batch.vocab_size,
                         dtype=self.dtype,
                     )
-                    _ = self.sampler(logits=empty_logits, sampling_metadata=metadata)
+                    sampler.warm_up(logits=empty_logits, sampling_metadata=metadata)
 
                 clear_reqs(input_batch)
 
@@ -1508,7 +1512,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             self.model.model.rbln_config, "use_multiple_decoder", False
         )
         if use_multiple_decoder:
-            self.bucket_sizes = self.model.decoder_batch_sizes
+            self.bucket_sizes = tuple(sorted({1, *self.model.decoder_batch_sizes}))
         else:
             batch_size = self.vllm_config.scheduler_config.max_num_seqs
             self.bucket_sizes = tuple(self.get_bucket_sizes(batch_size))
@@ -1629,9 +1633,13 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         # Update output token ids with tokens sampled in last step
         # if async scheduling and required by current sampling params.
         self.input_batch.update_async_output_token_ids()
+        extra: dict[str, Any] = {}
+        if isinstance(self.sampler, RBLNSampler):
+            extra["input_batch"] = self.input_batch
         return self.sampler(
             logits=logits,
             sampling_metadata=sampling_metadata,
+            **extra,
         )
 
     def postprocess_sampler_output(
