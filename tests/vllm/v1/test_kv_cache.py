@@ -93,7 +93,7 @@ class TestDeepseekV4Window:
 
     def test_a_full_pool_reports_the_attention_pool_full(self):
         manager, attention = self._manager(slots=3)
-        args = ("a", 8, [], 0, 0, 8)
+        args: tuple = ("a", 8, [], 0, 0, 8)
         assert manager.get_num_blocks_to_allocate(*args) == 0
         manager.allocate_new_blocks("b", 8, 8)
         free = attention.get_num_free_blocks()
