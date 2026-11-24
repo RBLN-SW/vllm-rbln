@@ -154,6 +154,13 @@ def test_get_bucket_sizes(monkeypatch, num_seqs: int, expected_bucket_sizes: lis
     assert len(runner.pooled_tensors) == len(expected_bucket_sizes)
 
 
+def test_multiple_decoder_buckets_include_batch_one():
+    """A single request samples unpadded, so warm-up must cover batch 1."""
+    runner = create_model_runner(max_num_seqs=8, decoder_batch_sizes=(8, 4))
+    assert runner.bucket_sizes == (1, 4, 8)
+    assert set(runner.pooled_tensors) == {1, 4, 8}
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
 def test_min_p_with_padded_bucket(make_runner, dtype):
     """min_p's dense tensor must match the padded (bucket_size) logits,

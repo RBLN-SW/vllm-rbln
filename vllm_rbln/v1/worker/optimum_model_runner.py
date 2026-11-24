@@ -1517,7 +1517,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             self.model.model.rbln_config, "use_multiple_decoder", False
         )
         if use_multiple_decoder:
-            self.bucket_sizes = self.model.decoder_batch_sizes
+            self.bucket_sizes = tuple(sorted({1, *self.model.decoder_batch_sizes}))
         else:
             batch_size = self.vllm_config.scheduler_config.max_num_seqs
             self.bucket_sizes = tuple(self.get_bucket_sizes(batch_size))
