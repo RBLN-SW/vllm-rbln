@@ -23,7 +23,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import BatchFeature
-from transformers.models.gemma4.modeling_gemma4 import apply_multidimensional_rope
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
 from vllm.forward_context import get_forward_context
@@ -114,6 +113,20 @@ class _RBLNGemma4VisionEncoder(nn.Module):
             ),
             persistent=False,
         )
+        # HF's rope rotates the x and the y halves of a head apart and joins
+        # them back; on a large image those slices and joins round-trip DRAM.
+        # Its rotate_half of both halves is one signed channel permutation, so
+        # the rope becomes q * cos + (q @ rope_rot) * sin.
+        head_dim = vision_tower.config.head_dim
+        part = 2 * (head_dim // 4)
+        rot = torch.zeros(head_dim, head_dim)
+        for base in (0, part):
+            for i in range(part // 2):
+                rot[base + part // 2 + i, base + i] = -1.0
+                rot[base + i, base + part // 2 + i] = 1.0
+        self.register_buffer(
+            "rope_rot", rot.to(patch_embedder.input_proj.weight), persistent=False
+        )
 
     def forward(
         self,
@@ -138,7 +151,8 @@ class _RBLNGemma4VisionEncoder(nn.Module):
         )
         rope = F.embedding(pixel_position_ids.clamp(min=0), self.rope_table)
         half = rope.shape[-1] // 2
-        cos, sin = rope[..., :half].flatten(-2), rope[..., half:].flatten(-2)
+        cos = rope[..., :half].flatten(-2).unsqueeze(2)
+        sin = rope[..., half:].flatten(-2).unsqueeze(2)
         for layer in tower.encoder.layers:
             residual = hidden_states
             hidden_states = layer.input_layernorm(hidden_states)
@@ -147,15 +161,17 @@ class _RBLNGemma4VisionEncoder(nn.Module):
             q = attn.q_norm(attn.q_proj(hidden_states).view(shape))
             k = attn.k_norm(attn.k_proj(hidden_states).view(shape))
             v = attn.v_norm(attn.v_proj(hidden_states).view(shape))
-            q = apply_multidimensional_rope(q, cos, sin, pixel_position_ids)
-            k = apply_multidimensional_rope(k, cos, sin, pixel_position_ids)
-            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-            k = k.repeat_interleave(attn.num_key_value_groups, dim=1)
-            v = v.repeat_interleave(attn.num_key_value_groups, dim=1)
-            out = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=key_bias, scale=attn.scaling
-            )
-            out = out.transpose(1, 2).reshape(residual.shape)
+            q = q * cos + torch.matmul(q, self.rope_rot) * sin
+            k = k * cos + torch.matmul(k, self.rope_rot) * sin
+            # [heads, patches, head_dim] of the one image: 3D matmuls lower to
+            # batched matmuls; the 4D form, which SDPA also falls back to for an
+            # off-64 head_dim, does not and runs slower.
+            q, k, v = q[0].transpose(0, 1), k[0].transpose(0, 1), v[0].transpose(0, 1)
+            k = k.repeat_interleave(attn.num_key_value_groups, dim=0)
+            v = v.repeat_interleave(attn.num_key_value_groups, dim=0)
+            scores = torch.matmul(q, k.transpose(1, 2)) * attn.scaling + key_bias[0]
+            out = torch.matmul(torch.softmax(scores, dim=-1), v)
+            out = out.transpose(0, 1).reshape(residual.shape)
             hidden_states = residual + layer.post_attention_layernorm(attn.o_proj(out))
             residual = hidden_states
             hidden_states = layer.pre_feedforward_layernorm(hidden_states)
