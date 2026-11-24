@@ -2668,7 +2668,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             install_aux_handoff_slots(self.model)
 
         self._make_weights_contiguous()
-        if envs.VLLM_RBLN_USE_NESTED_COMPILE_REGION:
+        if envs.VLLM_RBLN_USE_NESTED_COMPILE_REGION is not False:
             mark_decoder_regions(self.model)
 
         # NOTE(RBLN): This wrapper is designed to be compiled by torch.compile.
