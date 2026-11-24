@@ -64,6 +64,9 @@ _NO_FLAG = {"no_flag": True}
 # something derived from the artifact the key is looking for.
 _DERIVED = {"no_flag": True, "derived": True}
 
+# Sampler graphs compile with use_cache=False, so they never enter the bundle.
+_UNHASHED_SAMPLER_FIELDS = frozenset({"use_custom_sampler", "use_fused_sampling"})
+
 ModelImpl = Literal["vllm", "optimum"]
 
 DecodeBatchBucketStrategy = Literal["exponential", "linear", "manual"]
@@ -181,11 +184,8 @@ class RBLNConfig(RBLNConfigBase):
         """
         from vllm.config.utils import get_hash_factors, hash_factors
 
-        ignored_factors = {
-            # Sampler graphs compile with use_cache=False, so they never enter
-            # the bundle. Sub-block caching changes what runs, not what is built.
-            "use_custom_sampler",
-            "use_fused_sampling",
+        ignored_factors = _UNHASHED_SAMPLER_FIELDS | {
+            # Sub-block caching changes what runs, not what is built.
             "enable_sub_block_cache",
             "sub_block_size",
             "encoder_token_budgets",
@@ -320,13 +320,8 @@ class OptimumRBLNConfig(RBLNConfigBase):
         """
         from vllm.config.utils import get_hash_factors, hash_factors
 
-        ignored_factors = {
+        ignored_factors = _UNHASHED_SAMPLER_FIELDS | {
             f.name for f in _fields_of(type(self)) if f.metadata.get("derived")
-        } | {
-            # Sampler graphs compile with use_cache=False, so they never enter
-            # the bundle.
-            "use_custom_sampler",
-            "use_fused_sampling",
         }
         return hash_factors(get_hash_factors(self, ignored_factors))
 
