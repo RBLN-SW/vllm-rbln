@@ -314,7 +314,7 @@ class RBLNQwen3_5ForConditionalGeneration(
                 (bucket_size, patch_dim),
                 axis=0,
                 pad=0.0,
-                register_host=True,
+                use_registered_host_buffer=True,
             ),
             rbln_utils.EncoderInput(
                 "pos_embeds",

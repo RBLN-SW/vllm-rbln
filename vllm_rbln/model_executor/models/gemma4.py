@@ -462,7 +462,7 @@ class RBLNGemma4ForConditionalGeneration(
                 axis=1,
                 pad=0.0,
                 dtype=_PATCH_DTYPE,
-                register_host=True,
+                use_registered_host_buffer=True,
             ),
             rbln_utils.EncoderInput(
                 "pixel_position_ids",

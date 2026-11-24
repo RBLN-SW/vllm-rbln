@@ -54,7 +54,7 @@ def test_estimated_input_sizes_match_allocations():
                 axis=0,
                 pad=0.0,
                 dtype=torch.float32,
-                register_host=True,
+                use_registered_host_buffer=True,
             ),
             EncoderInput("key_bias", (1, 1, bucket), axis=2, pad=0.0),
         ]
@@ -73,7 +73,9 @@ def test_estimated_input_sizes_match_allocations():
 
 def test_rbln_patch_buffer_is_placed_on_chiplet_zero_once(monkeypatch):
     specs = [
-        EncoderInput("patches", (8, 4), axis=0, pad=2.0, register_host=True),
+        EncoderInput(
+            "patches", (8, 4), axis=0, pad=2.0, use_registered_host_buffer=True
+        ),
         EncoderInput("key_bias", (1, 1, 8), axis=2, pad=0.0),
     ]
     patches = torch.empty(8, 4)
@@ -110,7 +112,9 @@ def test_a_bucket_allocates_once_and_is_reused():
 def test_staging_converts_selected_inputs_in_the_registered_buffer(
     monkeypatch, registered
 ):
-    spec = EncoderInput("patches", (8, 4), axis=0, pad=0.0, register_host=True)
+    spec = EncoderInput(
+        "patches", (8, 4), axis=0, pad=0.0, use_registered_host_buffer=True
+    )
     device = torch.device("rbln:0")
     buffers = EncoderInputBuffers(device, torch.bfloat16, specs_by_bucket={8: [spec]})
     destination = Mock()

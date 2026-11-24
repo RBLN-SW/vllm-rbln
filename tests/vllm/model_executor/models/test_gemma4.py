@@ -133,7 +133,7 @@ def test_vision_encoder_stages_valid_patches_in_order(monkeypatch, valid_rows):
                     axis=1,
                     pad=0.0,
                     dtype=torch.float32,
-                    register_host=True,
+                    use_registered_host_buffer=True,
                 )
             ]
         },

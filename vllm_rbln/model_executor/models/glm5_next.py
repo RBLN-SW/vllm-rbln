@@ -1451,7 +1451,7 @@ class RBLNGlm5NextForConditionalGeneration(
                 (bucket_size, patch_dim),
                 axis=0,
                 pad=0.0,
-                register_host=True,
+                use_registered_host_buffer=True,
             ),
             rbln_utils.EncoderInput("cos", (bucket_size, head_dim), axis=0, pad=1.0),
             rbln_utils.EncoderInput("sin", (bucket_size, head_dim), axis=0, pad=0.0),

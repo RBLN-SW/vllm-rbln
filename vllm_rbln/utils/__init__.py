@@ -54,7 +54,7 @@ class EncoderInput(NamedTuple):
     pad: float
     dtype: torch.dtype | None = None
     allow_prefix_copy: bool = True
-    register_host: bool = False
+    use_registered_host_buffer: bool = False
 
     def nbytes(self, default_dtype: torch.dtype) -> int:
         return prod(self.shape) * (self.dtype or default_dtype).itemsize
@@ -136,7 +136,7 @@ class EncoderInputBuffers:
     def _allocate_input(self, spec: EncoderInput) -> torch.Tensor:
         dtype = spec.dtype or self.dtype
         buffer = torch.full(spec.shape, spec.pad, dtype=dtype, device=self.device)
-        if self.device.type == "rbln" and spec.register_host:
+        if self.device.type == "rbln" and spec.use_registered_host_buffer:
             # Streamed patches start in flat device memory on node 0, chiplet 0.
             torch.rbln.bind_device_memory(buffer)
         return buffer
@@ -184,7 +184,11 @@ class EncoderInputBuffers:
                     f"{num_valid} valid entries in a {bucket_size}-entry bucket"
                 )
             dst = buffer if full else buffer.narrow(spec.axis, 0, length)
-            if spec.register_host and length and tensor.device.type == "cpu":
+            if (
+                spec.use_registered_host_buffer
+                and length
+                and tensor.device.type == "cpu"
+            ):
                 host = self._registered_host_buffer(bucket_size, spec)
                 if host is not None:
                     host = host if full else host.narrow(spec.axis, 0, length)
