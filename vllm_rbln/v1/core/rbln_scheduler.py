@@ -1596,7 +1596,12 @@ class RBLNScheduler(Scheduler):
                 isinstance(group.kv_cache_spec, MambaSpec)
                 and total_computed_tokens // group.kv_cache_spec.block_size
                 != (num_tokens_main_model - 1) // group.kv_cache_spec.block_size
-                for group in self.kv_cache_config.kv_cache_groups
+                # A free hit block is the previous block, already counted above
+                # as an evictable hit.
+                and not (hit and hit[-1].ref_cnt == 0 and not hit[-1].is_null)
+                for group, hit in zip(
+                    self.kv_cache_config.kv_cache_groups, hit_blocks, strict=True
+                )
             )
         watermark_blocks = manager.watermark_blocks if self.running else 0
         return num_blocks + watermark_blocks <= manager.block_pool.get_num_free_blocks()

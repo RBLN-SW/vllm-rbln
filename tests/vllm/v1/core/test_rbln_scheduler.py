@@ -2332,7 +2332,7 @@ class TestAdmissionCoversMambaBoundaryBlock:
 
     BLOCK = 16
 
-    def _scheduler(self, num_speculative_tokens):
+    def _scheduler(self, num_speculative_tokens, num_blocks=11, **config):
         full = full_attention_spec(self.BLOCK)
         state = MambaSpec(
             block_size=self.BLOCK,
@@ -2340,18 +2340,18 @@ class TestAdmissionCoversMambaBoundaryBlock:
             dtypes=(torch.uint8,),
             mamba_cache_mode="align",
         )
-        # The decodes leave exactly the prompt's count free: three attention
-        # blocks and one state block.
-        num_blocks = 11
+        # By default the decodes leave exactly the prompt's count free: three
+        # attention blocks and one state block.
         return create_rbln_scheduler(
             block_size=self.BLOCK,
             max_num_batched_tokens=self.BLOCK,
-            max_model_len=4 * self.BLOCK,
+            max_model_len=5 * self.BLOCK,
             num_blocks=num_blocks,
             max_num_seqs=4,
             num_speculative_tokens=num_speculative_tokens,
             mamba_cache_mode="align",
             kv_cache_config=make_kv_cache_config([full, state], num_blocks),
+            **config,
         )
 
     @staticmethod
@@ -2396,6 +2396,31 @@ class TestAdmissionCoversMambaBoundaryBlock:
 
         assert not sched.requests
         assert request.num_preemptions == 0
+
+    def test_resume_from_a_free_hit_block_is_admitted(self):
+        # The first chunk reads the hit's state block, which the count already
+        # holds as an evictable hit, so it is not the boundary block on top.
+        # Seven usable blocks hold the peak: five attention, two state.
+        sched = self._scheduler(None, num_blocks=8, enable_prefix_caching=True)
+        donor = [100 + i for i in range(3 * self.BLOCK + 1)]
+        sched.add_request(make_request("d", donor, self.BLOCK, max_tokens=2))
+        for _ in range(100):
+            if not sched.requests:
+                break
+            self._step(sched, None)
+        request = make_request(
+            "h",
+            donor[: 3 * self.BLOCK] + [900 + i for i in range(self.BLOCK + 11)],
+            self.BLOCK,
+            max_tokens=2,
+        )
+        sched.add_request(request)
+
+        out = sched.schedule()
+
+        assert request.num_computed_tokens - out.num_scheduled_tokens["h"] == (
+            3 * self.BLOCK
+        )
 
 
 class TestSyncKVLoads:
