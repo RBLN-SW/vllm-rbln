@@ -57,21 +57,24 @@ class TestDeepseekV4PrefixState:
             scheduler_block_size=8,
         )
 
-    def _request(self, request_id="a", tokens=None):
+    def _request(self, request_id="a", tokens=None, lookahead=0):
         from tests.vllm.v1.core.utils import make_request
 
         return make_request(
-            request_id, list(range(25)) if tokens is None else tokens, block_size=8
+            request_id,
+            list(range(25)) if tokens is None else tokens,
+            block_size=8,
+            num_hash_lookahead_tokens=lookahead,
         )
 
-    def _hit(self, manager, request, length, *, drop=False):
+    def _hit(self, manager, request, length):
         return manager.find_longest_cache_hit(
             request.block_hashes,
             length,
             [0],
             manager.block_pool,
             manager.kv_cache_spec,
-            drop,
+            False,
             8,
         )
 
@@ -116,23 +119,25 @@ class TestDeepseekV4PrefixState:
         request = self._request()
         manager.allocate_new_blocks("a", 17, 17)
         manager.cache_blocks(request, 16, 0, replay_boundaries=(16,))
-        assert self._hit(manager, request, 24, drop=draft)[1] == 0
+        assert self._hit(manager, request, 24)[1] == 0
 
-    def test_draft_checkpoint_requires_matching_lookahead_block(self):
+    def test_draft_checkpoint_requires_only_the_consumed_lookahead_token(self):
         manager = self._manager(draft=True)
-        request = self._request()
+        request = self._request(lookahead=1)
         block = manager.allocate_new_blocks("a", 16, 16)[0]
         manager.cache_blocks(request, 16, 0, replay_boundaries=(16,))
-        assert self._hit(manager, request, 24, drop=True) == (([block],), 16)
-        assert self._hit(manager, request, 16, drop=False) == (([block],), 16)
-        sibling = self._request("b", list(range(16)) + [99] * 9)
-        assert sibling.block_hashes[:2] == request.block_hashes[:2]
-        assert self._hit(manager, sibling, 24, drop=True)[1] == 0
+        assert self._hit(manager, request, 24) == (([block],), 16)
+        assert self._hit(manager, request, 16) == (([block],), 16)
+        sibling = self._request("b", list(range(16)) + [99] * 9, lookahead=1)
+        assert sibling.block_hashes[:1] == request.block_hashes[:1]
+        assert self._hit(manager, sibling, 24)[1] == 0
+        sibling = self._request("c", list(range(17)) + [99] * 8, lookahead=1)
+        assert self._hit(manager, sibling, 24)[1] == 16
 
-    def test_draft_lookahead_uses_hash_blocks_not_the_larger_hca_interval(self):
+    def test_draft_hash_lookahead_is_independent_of_the_hca_interval(self):
         manager = self._manager(draft=True)
         manager.block_size = manager.scheduler_block_size = 16
-        request = self._request()
+        request = self._request(lookahead=1)
         checkpoint = manager.allocate_new_blocks("a", 16, 16)[0]
         manager.cache_blocks(request, 16, 0, replay_boundaries=(16,))
         hits, length = manager.find_longest_cache_hit(
@@ -141,11 +146,26 @@ class TestDeepseekV4PrefixState:
             [0],
             manager.block_pool,
             manager.kv_cache_spec,
-            True,
+            False,
             16,
         )
         assert hits == ([checkpoint],)
         assert length == 16
+
+    @pytest.mark.parametrize("draft", [False, True])
+    def test_prompt_end_checkpoint_waits_for_the_confirmed_lookahead(self, draft):
+        manager = self._manager(draft=draft)
+        request = self._request(tokens=list(range(16)), lookahead=1)
+        checkpoint = manager.allocate_new_blocks("a", 16, 16)[0]
+        manager.cache_blocks(request, 16, 0, replay_boundaries=(15, 16))
+        assert checkpoint.block_hash is None
+        request.spec_token_ids = [16, 17, 18]
+        request.update_block_hashes()
+        manager.cache_blocks(request, 16, 0, replay_boundaries=(15, 16))
+        assert checkpoint.block_hash is None
+        request.append_output_token_ids(16)
+        manager.cache_blocks(request, 16, 0, replay_boundaries=(15, 16))
+        assert self._hit(manager, request, 16) == (([checkpoint],), 16)
 
     def test_decode_reuses_writable_ring_without_copies(self):
         manager = self._manager()

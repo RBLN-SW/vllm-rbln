@@ -17,6 +17,7 @@
 # eviction. Pure pieces need no manager; the rest drive one on CPU.
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -39,6 +40,7 @@ from vllm.v1.request import Request
 
 from tests.vllm.v1.core.utils import (
     full_attention_spec,
+    image_at,
     make_hybrid_manager,
     make_kv_cache_config,
     make_manager,
@@ -51,6 +53,7 @@ from vllm_rbln.v1.core.rbln_kv_cache_manager import (
     RBLNKVCacheManager,
     SubBlockHasher,
     SubBlockIndex,
+    get_request_block_hasher,
 )
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 
@@ -62,6 +65,54 @@ SUB_BLOCK_SIZE = 4
 def _init_none_hash():
     # hash_block_tokens reads a module-global NONE_HASH seeded from the hash fn.
     init_none_hash(sha256)
+
+
+@pytest.mark.parametrize("lookahead", [0, 1, 3])
+@pytest.mark.parametrize("extra", ["plain", "salt", "lora", "image", "embeds"])
+def test_lookahead_hashes_are_incremental_and_include_extra_keys(lookahead, extra):
+    tokens = list(range(25))
+    kwargs: dict[str, Any] = {}
+    if extra == "salt":
+        kwargs["cache_salt"] = "tenant-a"
+    elif extra == "lora":
+        kwargs["lora_request"] = LoRARequest("adapter-a", 1, "/adapter-a")
+    elif extra == "image":
+        kwargs["mm_features"] = [image_at(8, 9)]
+    elif extra == "embeds":
+        kwargs["prompt_embeds"] = torch.arange(34, dtype=torch.float32).view(17, 2)
+    bulk = make_request("bulk", tokens[:17], 8, **kwargs)
+    bulk.append_output_token_ids(tokens[17:])
+    legacy = list(bulk.block_hashes)
+    incremental = make_request("incremental", tokens[:17], 8, **kwargs)
+    hasher = get_request_block_hasher(8, sha256, lookahead)
+    for request in (bulk, incremental):
+        request.block_hashes.clear()
+        request._block_hasher = hasher
+        request.update_block_hashes()
+    incremental.append_output_token_ids(tokens[17:])
+    assert incremental.block_hashes == bulk.block_hashes
+    if lookahead == 0:
+        assert bulk.block_hashes == legacy
+    if extra != "plain":
+        plain = make_request("plain", tokens, 8, num_hash_lookahead_tokens=lookahead)
+        assert bulk.block_hashes[-1] != plain.block_hashes[-1]
+
+
+def test_lookahead_hash_waits_for_confirmed_token_and_ignores_later_tokens():
+    request = make_request("a", list(range(16)), 8, num_hash_lookahead_tokens=1)
+    assert len(request.block_hashes) == 1
+    request.spec_token_ids = [16, 17, 18]
+    request.update_block_hashes()
+    assert len(request.block_hashes) == 1
+    request.append_output_token_ids(16)
+    assert len(request.block_hashes) == 2
+    matches = make_request("b", list(range(17)) + [99], 8, num_hash_lookahead_tokens=1)
+    misses = make_request(
+        "c", list(range(16)) + [99, 17], 8, num_hash_lookahead_tokens=1
+    )
+    assert matches.block_hashes == request.block_hashes
+    assert misses.block_hashes[0] == request.block_hashes[0]
+    assert misses.block_hashes[1] != request.block_hashes[1]
 
 
 def _hasher(sub_block_size: int = SUB_BLOCK_SIZE) -> SubBlockHasher:

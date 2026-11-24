@@ -128,7 +128,7 @@ class RBLNDeepseekV4RingCache(_RBLNDeepseekV4Cache):
         drafts = speculative.num_speculative_tokens if speculative is not None else 0
         capacity = 1 << (self.window + drafts - 1).bit_length()
         prefix_caching = vllm_config.cache_config.enable_prefix_caching
-        checkpoints = (2 if drafts else 1) if prefix_caching else 0
+        checkpoints = 2 if prefix_caching else 0
         return RBLNDeepseekV4StateSpec(
             num_state_slots=(1 + checkpoints)
             * vllm_config.scheduler_config.max_num_seqs

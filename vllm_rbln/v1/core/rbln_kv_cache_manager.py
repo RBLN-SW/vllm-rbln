@@ -36,6 +36,7 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     generate_block_hash_extra_keys,
+    get_mm_features_in_window,
     hash_block_tokens,
     make_block_hash_with_group_id,
     maybe_convert_block_hash,
@@ -68,6 +69,51 @@ _SUB_BLOCK_ELIGIBLE_SPECS: tuple[type[KVCacheSpec], ...] = (
 )
 
 logger = init_logger(__name__)
+
+
+def get_request_block_hasher(
+    hash_block_size: int,
+    hash_fn: Callable[[Any], bytes],
+    num_hash_lookahead_tokens: int,
+) -> Callable[[Request], list[BlockHash]]:
+    """Hash finalized blocks including the tokens consumed by the drafter."""
+
+    # TODO: Remove when vLLM provides num_hash_lookahead_tokens in its hasher.
+    # Backport: vllm-project/vllm@da8a505684e6 (kv_cache_utils.py).
+    def request_block_hasher(request: Request) -> list[BlockHash]:
+        start = len(request.block_hashes) * hash_block_size
+        num_tokens = request.num_tokens - num_hash_lookahead_tokens
+        if start + hash_block_size > num_tokens:
+            return []
+        mm_idx = 0
+        if start and request.mm_features:
+            last = request.mm_features[-1].mm_position
+            if last.offset + last.length > start:
+                mm_idx, _ = get_mm_features_in_window(
+                    request.mm_features, start, start + hash_block_size
+                )
+        parent = request.block_hashes[-1] if request.block_hashes else None
+        hashes = []
+        for end in range(start + hash_block_size, num_tokens + 1, hash_block_size):
+            hash_end = end + num_hash_lookahead_tokens
+            extra, mm_idx = generate_block_hash_extra_keys(
+                request, start, hash_end, mm_idx
+            )
+            if num_hash_lookahead_tokens:
+                while mm_idx > 0:
+                    position = request.mm_features[mm_idx - 1].mm_position
+                    if position.offset + position.length <= end:
+                        break
+                    mm_idx -= 1
+                extra = (extra, *request.all_token_ids[end:hash_end])
+            parent = hash_block_tokens(
+                hash_fn, parent, request.all_token_ids[start:end], extra
+            )
+            hashes.append(parent)
+            start = end
+        return hashes
+
+    return request_block_hasher
 
 
 @dataclass

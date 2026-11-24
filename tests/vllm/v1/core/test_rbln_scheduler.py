@@ -62,8 +62,9 @@ from vllm_rbln.v1.core.utils import is_prefill, step_is_prefill
 @pytest.mark.parametrize("draft", [False, True])
 @pytest.mark.parametrize("chunk", [10, 15])
 @pytest.mark.parametrize("alignment", [16, 64])
+@pytest.mark.parametrize("pipeline_parallel_size", [1, 2])
 def test_ring_prefix_hit_restores_checkpoint_and_replaces_single_slot(
-    draft, chunk, alignment
+    draft, chunk, alignment, pipeline_parallel_size
 ):
     from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 
@@ -88,7 +89,6 @@ def test_ring_prefix_hit_restores_checkpoint_and_replaces_single_slot(
     if draft:
         specs.append(dataclasses.replace(state, is_draft=True))
     kv_config = make_kv_cache_config(specs, 64)
-    kv_config.kv_cache_groups[-1].is_eagle_group = draft
     kv_config.prefix_cache_retention_interval = 0
     scheduler = create_rbln_scheduler(
         max_num_seqs=2,
@@ -98,14 +98,20 @@ def test_ring_prefix_hit_restores_checkpoint_and_replaces_single_slot(
         hash_block_size=16,
         enable_prefix_caching=True,
         kv_cache_config=kv_config,
+        num_speculative_tokens=1 if draft else None,
+        speculative_method="mtp",
+        pipeline_parallel_size=pipeline_parallel_size,
     )
-    requests = create_requests(
-        2,
-        num_tokens=2 * alignment + 5,
-        max_tokens=1,
-        block_size=16,
-        same_prompt=True,
-    )
+    requests = [
+        make_request(
+            str(i),
+            list(range(2 * alignment + 5)),
+            16,
+            max_tokens=1,
+            num_hash_lookahead_tokens=int(draft),
+        )
+        for i in range(2)
+    ]
     traces = []
     for request in requests:
         scheduler.add_request(request)
@@ -122,7 +128,7 @@ def test_ring_prefix_hit_restores_checkpoint_and_replaces_single_slot(
             )
             assert len(steps) < 40
         traces.append(steps)
-    expected_hit = alignment if draft else 2 * alignment
+    expected_hit = 2 * alignment
     prompt_length = requests[0].num_prompt_tokens
     assert sum(o.total_num_scheduled_tokens for o in traces[0]) == prompt_length
     assert sum(o.total_num_scheduled_tokens for o in traces[1]) == (
@@ -144,7 +150,11 @@ def test_ring_prefix_hit_restores_checkpoint_and_replaces_single_slot(
     assert all(len(pool.cached_block_hash_to_block) == 0 for pool in pools)
 
 
-def test_single_request_ring_pool_retains_both_mtp_replay_boundaries():
+@pytest.mark.parametrize("drafts", [0, 1, 3])
+@pytest.mark.parametrize("max_tokens", [1, 2])
+def test_single_request_ring_pool_retains_both_mtp_replay_boundaries(
+    drafts, max_tokens
+):
     from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 
     from vllm_rbln.model_executor.models.deepseek_v4 import RBLNDeepseekV4RingCache
@@ -153,7 +163,9 @@ def test_single_request_ring_pool_retains_both_mtp_replay_boundaries():
     register_all_kvcache_specs(None)
     RblnPlatform.register_custom_kv_cache_specs(None)
     config = SimpleNamespace(
-        speculative_config=SimpleNamespace(num_speculative_tokens=1),
+        speculative_config=SimpleNamespace(num_speculative_tokens=drafts)
+        if drafts
+        else None,
         cache_config=SimpleNamespace(enable_prefix_caching=True),
         scheduler_config=SimpleNamespace(max_num_seqs=1),
         model_config=SimpleNamespace(
@@ -170,10 +182,9 @@ def test_single_request_ring_pool_retains_both_mtp_replay_boundaries():
             ),
             config,
         )
-        for i in range(2)
+        for i in range(2 if drafts else 1)
     ]
     kv = make_kv_cache_config([full_attention_spec(16), *states], 64)
-    kv.kv_cache_groups[-1].is_eagle_group = True
     kv.prefix_cache_retention_interval = 0
     scheduler = create_rbln_scheduler(
         max_num_seqs=1,
@@ -182,18 +193,39 @@ def test_single_request_ring_pool_retains_both_mtp_replay_boundaries():
         block_size=16,
         enable_prefix_caching=True,
         kv_cache_config=kv,
+        num_speculative_tokens=drafts or None,
+        speculative_method="mtp",
     )
-    request = make_request("prime", list(range(48)), 16, max_tokens=1)
+    request = make_request(
+        "prime",
+        list(range(48)),
+        16,
+        max_tokens=max_tokens,
+        num_hash_lookahead_tokens=int(bool(drafts)),
+    )
     scheduler.add_request(request)
     while scheduler.requests:
         output = scheduler.schedule()
-        token = 0 if request.num_computed_tokens == 48 else None
+        token = 48 if request.num_computed_tokens >= 48 else None
         scheduler.update_from_output(output, make_model_runner_output(output, token))
 
-    same = make_request("same", list(range(48)), 16)
-    longer = make_request("longer", list(range(49)), 16)
-    assert scheduler.kv_cache_manager.get_computed_blocks(same)[1] == 16
-    assert scheduler.kv_cache_manager.get_computed_blocks(longer)[1] == 32
+    same = make_request(
+        "same", list(range(48)), 16, num_hash_lookahead_tokens=int(bool(drafts))
+    )
+    longer = make_request(
+        "longer", list(range(49)), 16, num_hash_lookahead_tokens=int(bool(drafts))
+    )
+    assert scheduler.kv_cache_manager.get_computed_blocks(same)[1] == 32
+    assert scheduler.kv_cache_manager.get_computed_blocks(longer)[1] == 48
+    different = make_request(
+        "different",
+        list(range(48)) + [99],
+        16,
+        num_hash_lookahead_tokens=int(bool(drafts)),
+    )
+    assert scheduler.kv_cache_manager.get_computed_blocks(different)[1] == (
+        32 if drafts else 48
+    )
 
 
 @pytest.mark.parametrize("interrupt_scheduling", [False, True])

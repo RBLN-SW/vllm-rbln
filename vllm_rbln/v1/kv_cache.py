@@ -22,6 +22,7 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.single_type_kv_cache_manager import (
     CircularBufferManager,
@@ -57,6 +58,26 @@ def register_kv_cache(
 
 class RBLNFixedKVCacheTensor(KVCacheTensor):
     """A cache allocation whose capacity does not grow with the attention pool."""
+
+
+class RBLNDeepseekV4CacheCoordinator(HybridKVCacheCoordinator):
+    """Use lookahead hashes instead of dropping a whole replay block."""
+
+    def __init__(self, *args, num_prefill_lookahead=0, **kwargs):
+        self.num_hash_lookahead_tokens = num_prefill_lookahead
+        super().__init__(*args, num_prefill_lookahead=num_prefill_lookahead, **kwargs)
+
+    def get_replay_boundaries(self, request: Request) -> tuple[int, int]:
+        return (
+            max(0, request.num_prompt_tokens - max(1, self.num_hash_lookahead_tokens)),
+            request.num_prompt_tokens,
+        )
+
+    def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
+        super().cache_blocks(
+            request,
+            min(num_computed_tokens, len(request.block_hashes) * self.hash_block_size),
+        )
 
 
 class RBLNDeepseekV4StateManager(CircularBufferManager):
@@ -159,7 +180,7 @@ class RBLNDeepseekV4StateManager(CircularBufferManager):
             return
         assert retention_interval == 0
         end = self._scheduled_ends[request.request_id]
-        if end == 0 or end > request.num_prompt_tokens:
+        if end == 0 or end > min(num_tokens, request.num_prompt_tokens):
             return
         boundaries = (*replay_boundaries, request.shared_prefix_boundary)
         if not any(
@@ -170,13 +191,10 @@ class RBLNDeepseekV4StateManager(CircularBufferManager):
         block = self.req_to_blocks[request.request_id][0]
         if block.block_hash is not None:
             return
-        # An MTP row consumes the next input token. Its hash must include the
-        # following paged block, even when HCA imposes a larger hit interval.
         hash_size = self.block_pool.hash_block_size
-        hash_end = end + hash_size * self.kv_cache_spec.is_draft
-        if hash_end > request.num_prompt_tokens:
+        count = end // hash_size
+        if count > len(request.block_hashes):
             return
-        count = hash_end // hash_size
         self.block_pool.cache_full_blocks(
             request,
             [self._null_block] * (count - 1) + [block],
@@ -200,14 +218,13 @@ class RBLNDeepseekV4StateManager(CircularBufferManager):
         pcp_world_size=1,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
         hash_size = block_pool.hash_block_size
-        lookahead = hash_size if kv_cache_spec.is_draft else 0
         last = min(
-            (max_length - (lookahead if drop_eagle_block else 0)) // alignment_tokens,
-            (len(block_hashes) * hash_size - lookahead) // alignment_tokens,
+            max_length // alignment_tokens,
+            len(block_hashes) * hash_size // alignment_tokens,
         )
         for count in range(last, 0, -1):
             blocks = block_pool.get_cached_block(
-                block_hashes[(count * alignment_tokens + lookahead) // hash_size - 1],
+                block_hashes[count * alignment_tokens // hash_size - 1],
                 kv_cache_group_ids,
             )
             if blocks is not None:

@@ -1401,6 +1401,21 @@ class RBLNScheduler(Scheduler):
         data.all_token_ids.clear()
         return data
 
+    def _update_request_with_output(
+        self, request: Request, new_token_ids: list[int], is_stale: bool = False
+    ) -> tuple[list[int], bool]:
+        result = super()._update_request_with_output(request, new_token_ids, is_stale)
+        if (
+            self._ring_managers
+            and self.num_prefill_lookahead
+            and not is_stale
+            and request.num_computed_tokens - request.num_in_flight_tokens
+            == request.num_prompt_tokens
+        ):
+            # The final prompt hash needs the first confirmed generated token.
+            self.kv_cache_manager.cache_blocks(request, request.num_prompt_tokens)
+        return result
+
     def _free_request(
         self, request: Request, delay_free_blocks: bool = False
     ) -> dict[str, Any] | None:
