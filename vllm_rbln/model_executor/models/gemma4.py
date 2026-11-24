@@ -113,19 +113,18 @@ class _RBLNGemma4VisionEncoder(nn.Module):
             ),
             persistent=False,
         )
-        # HF's rope rotates the x and the y halves of a head apart and joins
-        # them back; on a large image those slices and joins round-trip DRAM.
-        # Its rotate_half of both halves is one signed channel permutation, so
-        # the rope becomes q * cos + (q @ rope_rot) * sin.
-        head_dim = vision_tower.config.head_dim
-        part = 2 * (head_dim // 4)
-        rot = torch.zeros(head_dim, head_dim)
-        for base in (0, part):
-            for i in range(part // 2):
-                rot[base + part // 2 + i, base + i] = -1.0
-                rot[base + i, base + part // 2 + i] = 1.0
+        # HF's rope slices a head into its x and y halves and joins them back,
+        # which round-trips DRAM on a large image. rotate_half on each half is
+        # a block of one signed channel permutation, so the rope is a matmul.
+        half = vision_tower.config.head_dim // 4
+        rot = torch.zeros(2 * half, 2 * half)
+        for j in range(half):
+            rot[j + half, j] = -1.0
+            rot[j, j + half] = 1.0
         self.register_buffer(
-            "rope_rot", rot.to(patch_embedder.input_proj.weight), persistent=False
+            "rope_rot",
+            torch.block_diag(rot, rot).to(patch_embedder.input_proj.weight),
+            persistent=False,
         )
 
     def forward(
