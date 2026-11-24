@@ -384,6 +384,36 @@ class TestSubBlockMatchAgainstFullPool:
 
         assert "1" in sched.schedule().num_scheduled_tokens
 
+    def test_retry_without_the_match_takes_the_connector_hit_back(self):
+        # The match won a tie against the connector, so the connector's offer
+        # was cancelled; admitted without the match, the request loads it.
+        sched = create_rbln_scheduler(
+            enable_prefix_caching=True,
+            block_size=BLOCK_SIZE,
+            sub_block_size=SUB_BLOCK_SIZE,
+            max_num_batched_tokens=BLOCK_SIZE,
+            max_model_len=BLOCK_SIZE * self.NUM_BLOCKS,
+            num_blocks=self.NUM_BLOCKS,
+            use_kv_connector=MockKVConfig(matched_tokens=SUB_BLOCK_SIZE),
+        )
+        donor = make_request("0", [0] * BLOCK_SIZE, BLOCK_SIZE, max_tokens=1)
+        sched.add_request(donor)
+        _drain(sched)
+
+        num_tokens = sched.kv_cache_manager.block_pool.get_num_free_blocks()
+        num_tokens *= BLOCK_SIZE
+        tokens = [0] * SUB_BLOCK_SIZE + [
+            900 + i for i in range(num_tokens - SUB_BLOCK_SIZE)
+        ]
+        request = make_request("1", tokens, BLOCK_SIZE, max_tokens=1)
+        request.kv_transfer_params = {"do_remote_prefill": True}
+        sched.add_request(request)
+        out = sched.schedule()
+
+        assert "1" in out.num_scheduled_tokens
+        assert out.kv_cache_copy_ops == []
+        assert request.num_external_computed_tokens == SUB_BLOCK_SIZE
+
     def test_match_on_a_held_source_is_not_retried(self, monkeypatch):
         # Releasing a match whose source a running request holds frees no block,
         # so the request still does not fit and is not looked up again.
