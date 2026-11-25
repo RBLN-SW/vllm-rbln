@@ -1995,6 +1995,23 @@ class TestUpdateStates:
         assert "n0" in r.requests
         assert "n0" in r.input_batch.req_id_to_index
 
+    def test_sampling_inputs_are_invalidated_after_batch_changes(self, monkeypatch):
+        r = self._runner(monkeypatch, input_batch=_input_batch(0))
+        r.rejection_sampler = Mock()
+        invalidate = r.rejection_sampler.invalidate_sampling_inputs
+        scheduled = {"n0": 3, "n1": 3}
+        r._update_states(
+            _sched(new=[_new_req("n0"), _new_req("n1")], scheduled=scheduled)
+        )
+        invalidate.assert_called_once_with()
+        r._update_states(_sched(scheduled=scheduled))
+        invalidate.assert_called_once_with()
+
+        r._may_reorder_batch = lambda _: r.input_batch.swap_states(0, 1)
+        r._update_states(_sched(scheduled=scheduled))
+        assert r.input_batch.req_ids == ["n1", "n0"]
+        assert invalidate.call_count == 2
+
     def test_new_request_prompt_logprobs_recorded(self, monkeypatch):
         r = self._runner(monkeypatch, input_batch=_input_batch(0))
         r._update_states(

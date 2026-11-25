@@ -410,6 +410,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 self.speculative_config,
                 self.device,
                 use_rbln_sampler=self.rbln_config.use_custom_sampler,
+                reuse_sampling_inputs=self.rbln_config.use_custom_sampler,
             )
             if self.rbln_config.use_custom_sampler:
                 self._rejection_logits_dtype = model_config.head_dtype
@@ -906,7 +907,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         # Allow attention backend to reorder the batch, potentially
         self._may_reorder_batch(scheduler_output)
         # Refresh batch metadata with any pending updates.
+        sampling_metadata = self.input_batch.sampling_metadata
         self.input_batch.refresh_metadata()
+        if (
+            self.input_batch.sampling_metadata is not sampling_metadata
+            and (rejection_sampler := getattr(self, "rejection_sampler", None))
+            is not None
+        ):
+            rejection_sampler.invalidate_sampling_inputs()
 
     def _update_streaming_request(
         self, req_id: str, new_req_data: NewRequestData

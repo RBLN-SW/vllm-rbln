@@ -62,8 +62,11 @@ class RBLNRejectionSampler(RejectionSampler):
         device: torch.device | None = None,
         *,
         use_rbln_sampler: bool,
+        reuse_sampling_inputs: bool = False,
     ):
         super().__init__(sampler, spec_config, device)
+        # The runner invalidates cached arguments when its batch metadata changes.
+        self._reuse_sampling_inputs = reuse_sampling_inputs
 
         # NOTE(RBLN): Config-fixed spec length. The compiled rejection-sample op
         # is dynamic=False, so padding its inputs to the per-step actual
@@ -83,6 +86,10 @@ class RBLNRejectionSampler(RejectionSampler):
             if use_rbln_sampler
             else TorchRejectionSamplerImpl()
         )
+
+    def invalidate_sampling_inputs(self) -> None:
+        if isinstance(self.impl, RBLNRejectionSamplerImpl):
+            self.impl.invalidate_sampling_inputs()
 
     def forward(
         self,
@@ -177,6 +184,7 @@ class RBLNRejectionSampler(RejectionSampler):
             synthetic_mode=self.synthetic_mode,
             synthetic_conditional_rates=self.synthetic_conditional_rates,
             bonus_logits=bonus_logits,
+            reuse_sampling_inputs=self._reuse_sampling_inputs,
         )
 
         logprobs_tensors = None
@@ -214,6 +222,7 @@ class RejectionSamplerImpl:
         synthetic_mode: bool = False,
         synthetic_conditional_rates: torch.Tensor | None = None,
         bonus_logits: torch.Tensor | None = None,
+        reuse_sampling_inputs: bool = False,
     ) -> torch.Tensor:
         raise NotImplementedError
 
@@ -242,6 +251,7 @@ class TorchRejectionSamplerImpl(RejectionSamplerImpl):
         synthetic_mode: bool = False,
         synthetic_conditional_rates: torch.Tensor | None = None,
         bonus_logits: torch.Tensor | None = None,
+        reuse_sampling_inputs: bool = False,
     ) -> torch.Tensor:
         assert bonus_token_ids is not None
         draft_token_ids = draft_token_ids.to(target_logits.device)
@@ -356,9 +366,15 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
             # with the sampler off misses this op and forces a partial compile.
             use_cache=False,
         )
-        # The graph's small inputs, one set per shape. The same tensors every
-        # step keep the runtime's bindings; a fresh address is re-bound.
-        self._graph_input_buffers: dict[tuple, dict[str, torch.Tensor]] = {}
+        # Stable tensor addresses let successive steps reuse runtime bindings.
+        self._graph_input_buffers: dict[str, torch.Tensor] | None = None
+        self._buffer_signature: tuple[int, int, torch.dtype, torch.device] | None = None
+        # Bonus sampling mode and the graph arguments that reference the input buffers.
+        self._prepared_sampling_args: tuple[bool, tuple] | None = None
+        self._full_draft_counts = False
+
+    def invalidate_sampling_inputs(self) -> None:
+        self._prepared_sampling_args = None
 
     def rejection_sample(
         self,
@@ -373,6 +389,7 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         synthetic_mode: bool = False,
         synthetic_conditional_rates: torch.Tensor | None = None,
         bonus_logits: torch.Tensor | None = None,
+        reuse_sampling_inputs: bool = False,
     ) -> torch.Tensor:
         target_logits = self.apply_sampling_constraints(
             target_logits,
@@ -415,10 +432,12 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
 
         device = target_logits.device
         dtype = target_logits.dtype
-        key = (batch_size, vocab_size, dtype, device)
-        if (bufs := self._graph_input_buffers.get(key)) is None:
+        signature = (batch_size, vocab_size, dtype, device)
+        bufs = self._graph_input_buffers
+        if bufs is None:
             buf_len = batch_size * self.num_spec_tokens
-            bufs = self._graph_input_buffers[key] = {
+            host_counts = torch.empty(batch_size, dtype=torch.int32, device="cpu")
+            bufs = {
                 "draft_token_ids": torch.zeros(
                     buf_len, dtype=torch.int32, device=device
                 ),
@@ -436,7 +455,10 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
                 "cu_num_draft_tokens": torch.zeros(
                     batch_size, dtype=torch.int32, device=device
                 ),
-                "counts": torch.zeros(batch_size, dtype=torch.int32, device=device),
+                "counts": host_counts
+                if device.type == "cpu"
+                else torch.empty_like(host_counts, device=device),
+                "host_counts": host_counts,
                 "bonus_temperature": torch.ones(batch_size, dtype=dtype, device=device),
                 "top_k": torch.zeros(batch_size, dtype=torch.int32, device=device),
                 "top_p": torch.ones(batch_size, dtype=torch.float32, device=device),
@@ -444,15 +466,24 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
                     batch_size, dtype=torch.int32, device=device
                 ),
             }
+            self._graph_input_buffers = bufs
+            self._buffer_signature = signature
+        else:
+            assert signature == self._buffer_signature, (
+                "Rejection sampler input signature changed for an existing instance "
+                f"(batch_size, vocab_size, dtype, device): expected "
+                f"{self._buffer_signature}, got {signature}."
+            )
 
         # Pad the packed inputs to the fixed [B*K] length the op wants. Rows past
         # N keep an earlier step's values: the op reads them only into slots
         # its acceptance count clips.
         N = num_tokens  # = sum(num_draft_tokens)
         padded_len = batch_size * max_spec_len
+        full_drafts = padded_len == N
         reshaped_draft_token_ids = bufs["draft_token_ids"]
         draft_per_batch = bufs["draft_per_batch"]
-        if padded_len == N:
+        if full_drafts:
             # A copy, not a view: two graph inputs must not alias one buffer.
             reshaped_draft_token_ids.copy_(draft_token_ids)
             reshaped_target_logits = target_logits
@@ -473,55 +504,87 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
                 draft_per_batch[i, :n] = draft_token_ids[src_offset : src_offset + n]
                 src_offset += n
 
-        if sampling_metadata.all_greedy:
-            top_k, top_p = bufs["greedy_top_k"], None
+        # The per-token temperature depends on draft counts unless every row is full.
+        all_greedy = sampling_metadata.all_greedy
+        can_reuse = reuse_sampling_inputs and full_drafts and not all_greedy
+        bonus_in_graph = bonus_logits is not None
+        cached = self._prepared_sampling_args if can_reuse else None
+        if cached is not None and cached[0] == bonus_in_graph:
+            top_k, top_p, reshaped_temperature, bonus_temperature = cached[1]
         else:
-            top_k, top_p = build_op_top_k_top_p(
-                sampling_metadata,
-                batch_size,
-                vocab_size,
-                device,
-            )
-
-            if top_k is not None:
-                top_k = bufs["top_k"].copy_(top_k)
-            if top_p is not None:
-                top_p = bufs["top_p"].copy_(top_p)
-
-        # NOTE(RBLN): Per-row temperature for the divide inside the graph. Padding
-        # and greedy rows must carry 1.0 -- a 0 would divide by zero.
-        reshaped_temperature = bufs["ones"]
-        bonus_temperature = None
-        temperature = sampling_metadata.temperature
-        if not sampling_metadata.all_greedy and temperature is not None:
-            reshaped_temperature = bufs["temperature"]
-            if not sampling_metadata.all_random:
-                temperature = torch.where(
-                    temperature == GREEDY_TEMPERATURE,
-                    temperature.new_ones(()),
-                    temperature,
-                )
-            if bonus_logits is not None:
-                bonus_temperature = bufs["bonus_temperature"]
-                bonus_temperature.copy_(temperature)
-            if padded_len == N:
-                # Full K drafts everywhere, so request r's draft c sits at
-                # r * K + c. The input must stay directly allocated: an
-                # `expand(...).reshape(-1)` view is rejected in `prepare_inputs`.
-                reshaped_temperature.view(batch_size, max_spec_len).copy_(
-                    temperature.unsqueeze(1)
-                )
+            if all_greedy:
+                top_k, top_p = bufs["greedy_top_k"], None
             else:
-                reshaped_temperature.fill_(1)
-                reshaped_temperature[:N] = expand_batch_to_tokens(
-                    temperature, cu_num_draft_tokens, num_tokens
+                self.invalidate_sampling_inputs()
+                top_k, top_p = build_op_top_k_top_p(
+                    sampling_metadata,
+                    batch_size,
+                    vocab_size,
+                    device,
+                )
+
+                if top_k is not None:
+                    top_k = bufs["top_k"].copy_(top_k)
+                if top_p is not None:
+                    top_p = bufs["top_p"].copy_(top_p)
+
+            # NOTE(RBLN): Per-row temperature for the divide inside the graph.
+            # Padding and greedy rows must carry 1.0 -- a 0 would divide by zero.
+            reshaped_temperature = bufs["ones"]
+            bonus_temperature = None
+            temperature = sampling_metadata.temperature
+            if not all_greedy and temperature is not None:
+                reshaped_temperature = bufs["temperature"]
+                if not sampling_metadata.all_random:
+                    temperature = torch.where(
+                        temperature == GREEDY_TEMPERATURE,
+                        temperature.new_ones(()),
+                        temperature,
+                    )
+                if bonus_logits is not None:
+                    bonus_temperature = bufs["bonus_temperature"]
+                    bonus_temperature.copy_(temperature)
+                if full_drafts:
+                    # Full K drafts everywhere, so request r's draft c sits at
+                    # r * K + c. The input must stay directly allocated: an
+                    # `expand(...).reshape(-1)` view is rejected in `prepare_inputs`.
+                    reshaped_temperature.view(batch_size, max_spec_len).copy_(
+                        temperature.unsqueeze(1)
+                    )
+                else:
+                    reshaped_temperature.fill_(1)
+                    reshaped_temperature[:N] = expand_batch_to_tokens(
+                        temperature, cu_num_draft_tokens, num_tokens
+                    )
+            if can_reuse:
+                self._prepared_sampling_args = (
+                    bonus_in_graph,
+                    (top_k, top_p, reshaped_temperature, bonus_temperature),
                 )
 
         cu_num_draft_tokens_t = bufs["cu_num_draft_tokens"]
-        cu_num_draft_tokens_t.copy_(cu_num_draft_tokens)
         num_draft_tokens_t = bufs["counts"]
-        counts = torch.tensor(num_draft_tokens, dtype=torch.int32)
-        num_draft_tokens_t.copy_(counts)
+        host_counts = bufs["host_counts"]
+        # A full step has K drafts per request regardless of its sampling settings.
+        if not full_drafts or not self._full_draft_counts:
+            self._full_draft_counts = False
+            cu_num_draft_tokens_t.copy_(cu_num_draft_tokens)
+            if full_drafts:
+                host_counts.fill_(max_spec_len)
+            else:
+                # Keep the prefix sum differences on the host for the synthetic draw.
+                cumulative = cu_num_draft_tokens
+                if cumulative.device.type != "cpu":
+                    if (host_cumulative := bufs.get("host_cumulative")) is None:
+                        host_cumulative = bufs["host_cumulative"] = torch.empty_like(
+                            host_counts
+                        )
+                    cumulative = host_cumulative.copy_(cumulative)
+                host_counts[:1].copy_(cumulative[:1])
+                torch.sub(cumulative[1:], cumulative[:-1], out=host_counts[1:])
+            if num_draft_tokens_t is not host_counts:
+                num_draft_tokens_t.copy_(host_counts)
+            self._full_draft_counts = full_drafts
 
         synthetic_num_accepted = None
         if synthetic_mode:
@@ -531,7 +594,7 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
             accepted = torch.rand(batch_size, width) < synthetic_conditional_rates
             drawn = accepted.to(torch.int32).cumprod(dim=1).sum(dim=1)
             synthetic_num_accepted = bufs["synthetic_num_accepted"]
-            synthetic_num_accepted.copy_(torch.minimum(drawn, counts))
+            synthetic_num_accepted.copy_(torch.minimum(drawn, host_counts))
 
         return self._compiled_rejection_sample(
             reshaped_draft_token_ids,

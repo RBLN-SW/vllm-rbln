@@ -348,6 +348,7 @@ def run_rejection_sample(
     num_draft_tokens: list[int] | None = None,
     bonus_from_logits: bool = False,
     synthetic_conditional_rates: torch.Tensor | None = None,
+    reuse_sampling_inputs: bool = False,
 ) -> torch.Tensor:
     """Run the impl on a batch of drafts packed in `draft_token_ids` order.
 
@@ -373,6 +374,7 @@ def run_rejection_sample(
         synthetic_mode=synthetic_conditional_rates is not None,
         synthetic_conditional_rates=synthetic_conditional_rates,
         bonus_logits=make_target_probs(bonus_token_ids) if bonus_from_logits else None,
+        reuse_sampling_inputs=reuse_sampling_inputs,
     )
 
 
@@ -624,3 +626,189 @@ def test_synthetic_acceptance_stops_at_an_out_of_range_draft_id(impl):
         synthetic_conditional_rates=torch.ones(NUM_SPEC_TOKENS),
     )
     assert output.tolist() == [[3, 6, PLACEHOLDER_TOKEN_ID]]
+
+
+# ---------------------------------------------------------------------------
+# Staged sampling inputs
+# ---------------------------------------------------------------------------
+
+
+def _recording(impl, monkeypatch):
+    """Count top_k/top_p builds and record the temperature the graph reads."""
+    builds: list[int] = []
+    seen: list[list[float]] = []
+    real_build = module.build_op_top_k_top_p
+
+    def build(*args, **kwargs):
+        builds.append(1)
+        return real_build(*args, **kwargs)
+
+    monkeypatch.setattr(module, "build_op_top_k_top_p", build)
+    graph = impl._compiled_rejection_sample
+
+    def record(*args):
+        seen.append(args[5].tolist())
+        return graph(*args)
+
+    impl._compiled_rejection_sample = record
+    return builds, seen
+
+
+def _random_metadata():
+    return make_sampling_metadata(
+        temperature=torch.tensor([0.5, 2.0]),
+        all_greedy=False,
+        all_random=True,
+        top_k=torch.tensor([4, 4], dtype=torch.int32),
+    )
+
+
+@pytest.mark.parametrize("inference_tensors", [False, True])
+def test_sampling_inputs_are_staged_once_until_invalidated(
+    impl, monkeypatch, inference_tensors
+):
+    builds, seen = _recording(impl, monkeypatch)
+    with torch.inference_mode(inference_tensors):
+        metadata = _random_metadata()
+        for _ in range(3):
+            run_rejection_sample(
+                impl,
+                [3, 5, 2, 4],
+                [3, 5, 2, 4],
+                [1, 1],
+                metadata,
+                reuse_sampling_inputs=True,
+            )
+        assert len(builds) == 1
+        assert seen[-1] == [0.5, 0.5, 2.0, 2.0]
+
+        metadata.temperature[1] = 3.0
+        impl.invalidate_sampling_inputs()
+        run_rejection_sample(
+            impl,
+            [3, 5, 2, 4],
+            [3, 5, 2, 4],
+            [1, 1],
+            metadata,
+            reuse_sampling_inputs=True,
+        )
+    assert len(builds) == 2
+    assert seen[-1] == [0.5, 0.5, 3.0, 3.0]
+
+
+def test_a_partial_step_drops_the_staged_inputs(impl, monkeypatch):
+    # A step with fewer drafts writes per-token values into the same buffers,
+    # so the next full step stages again instead of reading them.
+    builds, seen = _recording(impl, monkeypatch)
+    metadata = _random_metadata()
+    run_rejection_sample(
+        impl,
+        [3, 5, 2, 4],
+        [3, 5, 2, 4],
+        [1, 1],
+        metadata,
+        reuse_sampling_inputs=True,
+    )
+    run_rejection_sample(
+        impl,
+        [3, 5, 2],
+        [3, 5, 2],
+        [1, 1],
+        metadata,
+        num_draft_tokens=[2, 1],
+        reuse_sampling_inputs=True,
+    )
+    run_rejection_sample(
+        impl,
+        [3, 5, 2, 4],
+        [3, 5, 2, 4],
+        [1, 1],
+        metadata,
+        reuse_sampling_inputs=True,
+    )
+    assert len(builds) == 3
+    assert seen[-1] == [0.5, 0.5, 2.0, 2.0]
+
+
+def test_direct_calls_prepare_sampling_inputs_every_time(impl, monkeypatch):
+    builds, seen = _recording(impl, monkeypatch)
+    metadata = _random_metadata()
+    run_rejection_sample(impl, [3, 5, 2, 4], [3, 5, 2, 4], [1, 1], metadata)
+    run_rejection_sample(impl, [3, 5, 2, 4], [3, 5, 2, 4], [1, 1], metadata)
+    assert len(builds) == 2
+    assert seen[-1] == [0.5, 0.5, 2.0, 2.0]
+
+
+def test_a_new_batch_size_is_rejected_without_replacing_buffers(impl, monkeypatch):
+    builds, seen = _recording(impl, monkeypatch)
+    large_batch = _random_metadata()
+    small_batch = make_sampling_metadata(
+        temperature=torch.tensor([3.0]), all_greedy=False, all_random=True
+    )
+    run_rejection_sample(
+        impl,
+        [3, 5, 2, 4],
+        [3, 5, 2, 4],
+        [1, 1],
+        large_batch,
+        reuse_sampling_inputs=True,
+    )
+    buffers = impl._graph_input_buffers
+
+    with pytest.raises(AssertionError, match="Rejection sampler input signature"):
+        run_rejection_sample(
+            impl,
+            [3, 5],
+            [3, 5],
+            [1],
+            small_batch,
+        )
+
+    run_rejection_sample(
+        impl,
+        [3, 5, 2, 4],
+        [3, 5, 2, 4],
+        [1, 1],
+        large_batch,
+        reuse_sampling_inputs=True,
+    )
+    assert impl._graph_input_buffers is buffers
+    assert len(builds) == 1
+    assert seen == [[0.5, 0.5, 2.0, 2.0], [0.5, 0.5, 2.0, 2.0]]
+
+
+def test_draft_count_buffers_are_reused_across_full_and_partial_steps(
+    impl, monkeypatch
+):
+    graph = impl._compiled_rejection_sample
+    addresses = []
+    versions = []
+    values = []
+
+    def record(*args):
+        counts = (args[8], args[2])
+        addresses.append(tuple(t.data_ptr() for t in counts))
+        versions.append(tuple(t._version for t in counts))
+        values.append([t.tolist() for t in counts])
+        return graph(*args)
+
+    monkeypatch.setattr(impl, "_compiled_rejection_sample", record)
+    metadata = make_sampling_metadata(
+        temperature=None, all_greedy=True, all_random=False
+    )
+    for _ in range(2):
+        run_rejection_sample(impl, [3, 5, 2, 4], [3, 5, 2, 4], [1, 1], metadata)
+    run_rejection_sample(
+        impl, [3, 5, 2], [3, 5, 2], [1, 1], metadata, num_draft_tokens=[2, 1]
+    )
+    run_rejection_sample(
+        impl, [2, 4], [2, 4], [1, 1], metadata, num_draft_tokens=[0, 2]
+    )
+    for _ in range(2):
+        run_rejection_sample(impl, [3, 5, 2, 4], [3, 5, 2, 4], [1, 1], metadata)
+
+    full = [[2, 2], [2, 4]]
+    assert values == [full, full, [[2, 1], [2, 3]], [[0, 2], [0, 2]], full, full]
+    assert len(set(addresses)) == 1
+    assert versions[0] == versions[1]
+    assert versions[4] == versions[5]
