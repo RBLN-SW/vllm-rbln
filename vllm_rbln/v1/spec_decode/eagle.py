@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -55,8 +54,6 @@ logger = init_logger(__name__)
 
 
 class RBLNEagleProposer(EagleProposer):
-    model_executable: Callable[..., tuple[torch.Tensor, torch.Tensor]]
-
     # A producer's warm-up stops after the first pass, which is prefill-shaped.
     warms_up_decode_graphs_on_a_producer = False
 
