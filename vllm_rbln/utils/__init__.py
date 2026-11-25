@@ -13,10 +13,16 @@
 # limitations under the License.
 
 from collections.abc import Callable
+from time import perf_counter_ns
 from typing import Union
 
 import torch
 from vllm.forward_context import get_forward_context
+
+from vllm_rbln import envs
+from vllm_rbln.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 def is_prefill_step() -> bool:
@@ -39,6 +45,40 @@ def run_mm_encoder(
     if dtype is None:
         return embeds.cpu()
     return embeds.to(device="cpu", dtype=dtype)
+
+
+def start_mm_encoder_timing() -> int | None:
+    return perf_counter_ns() if envs.VLLM_RBLN_METRICS else None
+
+
+def run_mm_encoder_with_timing(
+    encoder: Callable[..., torch.Tensor],
+    inputs: list[torch.Tensor],
+    num_embeddings: int,
+    *,
+    model: str,
+    num_patches: int,
+    start_ns: int | None,
+    patch_axis: int = 0,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    if start_ns is None:
+        return run_mm_encoder(encoder, inputs, num_embeddings, dtype=dtype)
+
+    inputs_ready = perf_counter_ns()
+    output = run_mm_encoder(encoder, inputs, num_embeddings, dtype=dtype)
+    done = perf_counter_ns()
+    logger.info(
+        "VISION_TIMING model=%s patches=%d bucket=%d inputs_ms=%.3f "
+        "encoder_ms=%.3f total_ms=%.3f",
+        model,
+        num_patches,
+        inputs[0].shape[patch_axis],
+        (inputs_ready - start_ns) / 1e6,
+        (done - inputs_ready) / 1e6,
+        (done - start_ns) / 1e6,
+    )
+    return output
 
 
 def pad(

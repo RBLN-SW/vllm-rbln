@@ -407,10 +407,16 @@ class RBLNGemma4ForConditionalGeneration(
                     indexing="ij",
                 )
                 positions = torch.stack([xs, ys], dim=-1).reshape(-1, 2)
-                self._encode_vision(torch.zeros(bucket, patch_pixels), positions)
+                self._encode_vision(
+                    torch.zeros(bucket, patch_pixels), positions, warmup=True
+                )
 
     def _encode_vision(
-        self, pixel_values: torch.Tensor, pixel_position_ids: torch.Tensor
+        self,
+        pixel_values: torch.Tensor,
+        pixel_position_ids: torch.Tensor,
+        *,
+        warmup: bool = False,
     ) -> torch.Tensor:
         """One image or video frame, `[num_patches, patch_pixels]` with `(-1, -1)`
         positions on its padding, to its soft token embeddings."""
@@ -422,6 +428,7 @@ class RBLNGemma4ForConditionalGeneration(
             ).eval()
             object.__setattr__(self, "_mm_encoder", encoder)
         tower = self.vision_tower
+        start_ns = None if warmup else rbln_utils.start_mm_encoder_timing()
         valid = (pixel_position_ids >= 0).all(dim=-1)
         num_patches = int(valid.sum())
         assert num_patches <= self.mm_encoder_patch_buckets[-1], (
@@ -442,7 +449,7 @@ class RBLNGemma4ForConditionalGeneration(
         # The patches of a grid whose sides are multiples of the pooling kernel
         # pool into the leading cells, in order.
         num_soft_tokens = num_patches // tower.config.pooling_kernel_size**2
-        return rbln_utils.run_mm_encoder(
+        return rbln_utils.run_mm_encoder_with_timing(
             lambda *inputs: encoder(*inputs)[0],
             [
                 patches.to(device),
@@ -451,6 +458,10 @@ class RBLNGemma4ForConditionalGeneration(
                 key_bias.to(device=device, dtype=self.model_dtype),
             ],
             num_soft_tokens,
+            model="gemma4",
+            num_patches=num_patches,
+            start_ns=start_ns,
+            patch_axis=1,
         )
 
     def _process_image_input(

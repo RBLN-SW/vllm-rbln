@@ -359,12 +359,20 @@ class RBLNQwen3_5ForConditionalGeneration(
             # TODO: a video's temporal patches share h and w, so their position
             # embeddings and key mask could be built once per video.
             for pixels, (_, h, w), n in zip(pixel_values.split(sizes), grids, tokens):
-                frames = [
-                    rbln_utils.run_mm_encoder(
-                        encoder, self._encoder_inputs(frame, [1, h, w]), n
+                frames = []
+                for frame in pixels.split(h * w):
+                    start_ns = rbln_utils.start_mm_encoder_timing()
+                    inputs = self._encoder_inputs(frame, [1, h, w])
+                    frames.append(
+                        rbln_utils.run_mm_encoder_with_timing(
+                            encoder,
+                            inputs,
+                            n,
+                            model="qwen3_5",
+                            num_patches=h * w,
+                            start_ns=start_ns,
+                        )
                     )
-                    for frame in pixels.split(h * w)
-                ]
                 embeds.append(torch.cat(frames))
         return tuple(embeds)
 

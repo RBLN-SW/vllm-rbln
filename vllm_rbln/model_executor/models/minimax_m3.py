@@ -1399,11 +1399,16 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         for start in range(0, t, frames):
             seg_t = min(frames, t - start)
             seg_pixels = pixel_values[start * h * w : (start + seg_t) * h * w]
+            start_ns = rbln_utils.start_mm_encoder_timing()
+            inputs = self._encoder_inputs(seg_pixels, [seg_t, h, w], modality)
             segments.append(
-                rbln_utils.run_mm_encoder(
+                rbln_utils.run_mm_encoder_with_timing(
                     self._mm_encoder,
-                    self._encoder_inputs(seg_pixels, [seg_t, h, w], modality),
+                    inputs,
                     seg_t * h * w // (merge * merge),
+                    model="minimax_m3",
+                    num_patches=seg_t * h * w,
+                    start_ns=start_ns,
                     dtype=self.mm_embeds_dtype,
                 )
             )

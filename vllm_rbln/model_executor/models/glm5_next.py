@@ -1500,15 +1500,21 @@ class RBLNGlm5NextForConditionalGeneration(
                 for pixels, (_, h, w) in zip(pixel_values.split(sizes), grids):
                     # Upstream cu_seqlens splits attention at every temporal
                     # patch. Encoding these independently preserves that mask.
-                    frames = [
-                        rbln_utils.run_mm_encoder(
-                            self._mm_encoder,
-                            self._encoder_inputs(frame, [1, h, w]),
-                            h * w // merge2,
-                            dtype=self.mm_embeds_dtype,
+                    frames = []
+                    for frame in pixels.split(h * w):
+                        start_ns = rbln_utils.start_mm_encoder_timing()
+                        inputs = self._encoder_inputs(frame, [1, h, w])
+                        frames.append(
+                            rbln_utils.run_mm_encoder_with_timing(
+                                self._mm_encoder,
+                                inputs,
+                                h * w // merge2,
+                                model="glm5_next",
+                                num_patches=h * w,
+                                start_ns=start_ns,
+                                dtype=self.mm_embeds_dtype,
+                            )
                         )
-                        for frame in pixels.split(h * w)
-                    ]
                     outputs.append(frames[0] if len(frames) == 1 else torch.cat(frames))
         return tuple(outputs)
 
