@@ -262,6 +262,38 @@ class TestKVCacheBaseBindings:
         assert window_info.view_shape != full_info.view_shape
         assert [tuple(b.shape) for b in runner.kv_cache_bases] == [full_info.view_shape]
 
+    def test_a_gemma4_buffer_is_bound_in_the_sliding_window_shape(
+        self, make_model_runner, monkeypatch
+    ):
+        # The same buffer under Gemma4: bound as the sliding-window layer views
+        # it, so the full-attention layer is the one copied whole on a hit.
+        runner = make_model_runner(
+            layers=("layer.0", "layer.1"),
+            init_kv_cache=False,
+        )
+        monkeypatch.setattr(
+            runner.model_config.hf_text_config, "model_type", "gemma4_text"
+        )
+        full = make_kv_cache_config(runner).kv_cache_groups[0].kv_cache_spec
+        sliding = SlidingWindowSpec(
+            block_size=full.block_size,
+            num_kv_heads=full.num_kv_heads,
+            head_size=full.head_size,
+            dtype=full.dtype,
+            sliding_window=BLOCK_SIZE // 4,
+        )
+        runner.initialize_kv_cache(
+            make_kv_cache_config(
+                groups=[("layer.0",), ("layer.1",)], specs=[sliding, full]
+            )
+        )
+        window_info, full_info = runner.kv_cache_view_infos
+        assert window_info.view_shape != full_info.view_shape
+        assert [tuple(b.shape) for b in runner.kv_cache_bases] == [
+            window_info.view_shape
+        ]
+        assert runner.kv_cache_whole_block_copy == {"layer.1"}
+
 
 class TestSubBlockSettingAtKvInit:
     def test_a_sub_block_setting_is_refused_before_warm_up(self, make_model_runner):
