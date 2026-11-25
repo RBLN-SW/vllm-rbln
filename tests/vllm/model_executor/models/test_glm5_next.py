@@ -187,7 +187,11 @@ def test_image_encoding_reuses_eager_or_compiled_encoder(monkeypatch, compiled):
     assert "_mm_encoder" not in model._modules
 
 
-def _build_with_token_budgets(monkeypatch, budgets, limits, is_first_rank=True):
+def _build_with_token_budgets(
+    monkeypatch, budgets, limits, is_first_rank=True, resolve=True
+):
+    """The model as start-up builds it: the platform hook resolves the budgets
+    into the config, then construction reads them."""
     import vllm_rbln.model_executor.models.glm5_next as glm
     from vllm_rbln.config import RBLNConfig
 
@@ -232,6 +236,10 @@ def _build_with_token_budgets(monkeypatch, budgets, limits, is_first_rank=True):
         ),
         additional_config=RBLNConfig(encoder_token_budgets=budgets),
     )
+    if resolve and (limits["image"] or limits["video"]):
+        config.additional_config.encoder_token_budgets = (
+            cls.resolve_encoder_token_budgets(config)
+        )
     return cls(vllm_config=config)
 
 
@@ -293,6 +301,14 @@ def test_encoder_budgets_must_cover_the_processor_bound(monkeypatch, modality, l
     limits = {"image": int(modality == "image"), "video": int(modality == "video")}
     with pytest.raises(ValueError, match=f"must reach {limit} output tokens"):
         _build_with_token_budgets(monkeypatch, [limit - 1], limits)
+
+
+def test_construction_reads_the_budgets_resolved_at_startup(monkeypatch):
+    limits = {"image": 1, "video": 0}
+    model = _build_with_token_budgets(monkeypatch, [2], limits, resolve=False)
+    assert model.mm_encoder_patch_buckets == [8]
+    with pytest.raises(AssertionError, match="resolved at start-up"):
+        _build_with_token_budgets(monkeypatch, [], limits, resolve=False)
 
 
 def test_vision_encoder_builds_its_inputs_from_upstream_rope(monkeypatch):

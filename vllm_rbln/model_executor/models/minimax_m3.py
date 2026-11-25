@@ -1227,6 +1227,39 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
             return _mm_preprocess.MiniMaxM3VLProcessingInfo.VIDEO_TOKEN
         raise ValueError(f"Unsupported modality: {modality!r}")
 
+    @classmethod
+    def resolve_encoder_token_budgets(cls, vllm_config: VllmConfig) -> list[int]:
+        """Unset, the processor upper bounds of the enabled modalities: an image,
+        and a video segment of `vision_segment_max_frames` temporal patches."""
+        mm_config = vllm_config.model_config.multimodal_config
+        info = MULTIMODAL_REGISTRY.create_processor(vllm_config.model_config).info
+        bounds = []
+        if mm_config.get_limit_per_prompt("image") > 0:
+            bounds.append(info.get_max_image_tokens())
+        if mm_config.get_limit_per_prompt("video") > 0:
+            vision_config = vllm_config.model_config.hf_config.vision_config
+            frames = vision_config.get("vision_segment_max_frames")
+            if frames is None:
+                raise ValueError(
+                    "RBLN MiniMax-M3 video encoding does not support "
+                    "vision_segment_max_frames=None. Disable video with "
+                    "--limit-mm-per-prompt '{\"video\": 0}' to serve images or text."
+                )
+            bounds.append(frames * info.get_max_video_frame_tokens())
+
+        budgets = sorted(vllm_config.additional_config.encoder_token_budgets) or sorted(
+            set(bounds)
+        )
+        max_tokens = max(bounds)
+        if budgets[-1] < max_tokens:
+            raise ValueError(
+                f"encoder_token_budgets {budgets} must reach "
+                f"{max_tokens} output tokens, the processor's upper bound for "
+                "an image or video segment. Add a budget that large, or lower "
+                "the resize limits in --mm-processor-kwargs."
+            )
+        return budgets
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_config
@@ -1236,15 +1269,6 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         self.mm_encoder_patch_buckets: list[int] = []
         self.mm_embeds_dtype = vllm_config.model_config.dtype
         mm_config = vllm_config.model_config.multimodal_config
-        if (
-            mm_config.get_limit_per_prompt("video") > 0
-            and config.vision_config.get("vision_segment_max_frames") is None
-        ):
-            raise ValueError(
-                "RBLN MiniMax-M3 video encoding does not support "
-                "vision_segment_max_frames=None. Disable video with "
-                "--limit-mm-per-prompt '{\"video\": 0}' to serve images or text."
-            )
         if get_pp_group().is_first_rank and any(
             mm_config.get_limit_per_prompt(m) > 0 for m in ("image", "video")
         ):
@@ -1261,24 +1285,8 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
 
             info = MULTIMODAL_REGISTRY.create_processor(vllm_config.model_config).info
             merge = info.get_image_processor().merge_size
-            bounds = []
-            if mm_config.get_limit_per_prompt("image") > 0:
-                bounds.append(info.get_max_image_tokens())
-            if mm_config.get_limit_per_prompt("video") > 0:
-                frames = self.vision_tower.vision_model.vision_segment_max_frames
-                bounds.append(frames * info.get_max_video_frame_tokens())
-
-            budgets = sorted(
-                vllm_config.additional_config.encoder_token_budgets
-            ) or sorted(set(bounds))
-            max_tokens = max(bounds)
-            if budgets[-1] < max_tokens:
-                raise ValueError(
-                    f"encoder_token_budgets {budgets} must reach "
-                    f"{max_tokens} output tokens, the processor's upper bound for "
-                    "an image or video segment. Add a budget that large, or lower "
-                    "the resize limits in --mm-processor-kwargs."
-                )
+            budgets = vllm_config.additional_config.encoder_token_budgets
+            assert budgets, "encoder_token_budgets is resolved at start-up"
             self.mm_encoder_patch_buckets = [b * merge**2 for b in budgets]
 
         object.__setattr__(self, "_mm_encoder", None)

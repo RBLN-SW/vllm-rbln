@@ -161,11 +161,13 @@ class RBLNConfig(RBLNConfigBase):
 
     encoder_token_budgets: list[int] = field(default_factory=list)
     """Output-token capacities of compiled encoder graphs, shared across modalities.
-    Empty lets the model choose: MiniMax-M3 takes the processor upper bounds of
-    the enabled modalities, Gemma4 every supported soft token budget one prefill
-    step holds (the largest is the most a request's image may take), Qwen3.5
-    powers of two from 128 up to the longest prefill chunk (512 at least) and
-    the processor upper bound for an image or a video frame."""
+    Empty lets the model choose: MiniMax-M3 and GLM-5.3 take the processor upper
+    bounds of the enabled modalities, Gemma4 every supported soft token budget
+    one prefill step holds (the largest is the most a request's image may take),
+    Qwen3.5 powers of two from 128 up to the longest prefill chunk (512 at least)
+    and the processor upper bound for an image or a video frame. On the vllm
+    model path the platform hook resolves it at start-up to the sorted list the
+    model compiles, whenever image or video is on."""
 
     use_w8a8: bool = False
     """Opt in to W8A8. W8A16 runs on every RBLN NPU, W8A8 only on the ones

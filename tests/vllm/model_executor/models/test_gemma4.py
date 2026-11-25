@@ -258,8 +258,9 @@ def _vllm_config(
     )
 
 
-def _built_model(monkeypatch, *, default, attention_layers=(), **config):
-    """The model as construction resolves it, upstream's model left out."""
+def _built_model(monkeypatch, *, default, attention_layers=(), resolve=True, **config):
+    """The model as start-up builds it, upstream's model left out: the platform
+    hook resolves the budgets into the config, then construction reads them."""
 
     def upstream_init(self, **kwargs):
         nn.Module.__init__(self)
@@ -282,7 +283,15 @@ def _built_model(monkeypatch, *, default, attention_layers=(), **config):
         RBLNGemma4ForConditionalGeneration
     )
     model.config = SimpleNamespace(vision_config=SimpleNamespace(pooling_kernel_size=3))
-    model.__init__(vllm_config=_vllm_config(**config))
+    vllm_config = _vllm_config(**config)
+    mm_config = vllm_config.model_config.get_multimodal_config()
+    if resolve and any(mm_config.get_limit_per_prompt(m) for m in ("image", "video")):
+        vllm_config.additional_config.encoder_token_budgets = (
+            RBLNGemma4ForConditionalGeneration.resolve_encoder_token_budgets(
+                vllm_config
+            )
+        )
+    model.__init__(vllm_config=vllm_config)
     return model
 
 
@@ -359,6 +368,22 @@ def test_the_longest_range_is_the_largest_budget_not_the_default():
     assert (
         RBLNGemma4ForConditionalGeneration.max_mm_prefix_range_len(vllm_config) == 560
     )
+
+
+def test_the_longest_range_holds_with_image_and_video_off():
+    # Start-up stores no budgets then, but embeds keep the model mm-prefix.
+    vllm_config = _vllm_config(budgets=[], chunk=4096, limits={"image": 0, "video": 0})
+    assert (
+        RBLNGemma4ForConditionalGeneration.max_mm_prefix_range_len(vllm_config) == 1120
+    )
+
+
+def test_construction_reads_the_budgets_resolved_at_startup(monkeypatch):
+    # Not supported soft token counts, so only an unresolved list passes them.
+    model = _built_model(monkeypatch, default=100, budgets=[100, 300], resolve=False)
+    assert model.mm_encoder_patch_buckets == [100 * 9, 300 * 9]
+    with pytest.raises(AssertionError, match="resolved at start-up"):
+        _built_model(monkeypatch, default=280, budgets=[], resolve=False)
 
 
 def test_budgets_the_processor_never_emits_are_refused(monkeypatch):

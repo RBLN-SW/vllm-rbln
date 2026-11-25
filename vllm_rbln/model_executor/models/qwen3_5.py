@@ -178,6 +178,45 @@ class RBLNQwen3_5MultiModalProcessor(Qwen3VLMultiModalProcessor):
 class RBLNQwen3_5ForConditionalGeneration(
     Qwen3_5ForConditionalGeneration, SupportsRBLNMultiModal
 ):
+    @classmethod
+    def resolve_encoder_token_budgets(cls, vllm_config: VllmConfig) -> list[int]:
+        """One compiled encoder shape per budget; an image is padded to the
+        smallest that holds its patches."""
+        model_config = vllm_config.model_config
+        mm_config = model_config.get_multimodal_config()
+        modalities = [
+            m for m in ("image", "video") if mm_config.get_limit_per_prompt(m) > 0
+        ]
+        info = MULTIMODAL_REGISTRY.get_processing_info(model_config)
+        merge = model_config.hf_config.vision_config.spatial_merge_size
+        max_tokens_per_item = info.get_mm_max_tokens_per_item(
+            seq_len=model_config.max_model_len,
+            mm_counts=dict.fromkeys(modalities, 1),
+        )
+        max_tokens = max(max_tokens_per_item[m] for m in modalities)
+        rbln_config = vllm_config.additional_config
+        budgets = sorted(rbln_config.encoder_token_budgets)
+        if not budgets:
+            # Unset: powers of two from the default prefill chunk counted in
+            # patches up to the longest prefill chunk in output tokens (the
+            # default one at least).
+            default_chunk = RBLN_DEFAULT_MAX_NUM_BATCHED_TOKENS
+            top = max(default_chunk, rbln_config.max_prefill_chunk_size)
+            budgets = [default_chunk // merge**2]
+            while budgets[-1] * 2 < top:
+                budgets.append(budgets[-1] * 2)
+            budgets.append(top)
+            # No budget above the largest frame, which is the last one.
+            budgets = [b for b in budgets if b < max_tokens] + [max_tokens]
+        if budgets[-1] < max_tokens:
+            raise ValueError(
+                f"encoder_token_budgets {budgets} must reach {max_tokens} output "
+                "tokens, the processor's upper bound for an image or a video "
+                "frame. Add a budget that large, or lower max_pixels in "
+                "--mm-processor-kwargs."
+            )
+        return budgets
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "model"):
         # Pruning changes the embeddings' width and a video's token count and
         # positions after the encoder, none of which the RBLN runner follows.
@@ -197,36 +236,9 @@ class RBLNQwen3_5ForConditionalGeneration(
         self.has_vision = bool(modalities)
         self.mm_encoder_patch_buckets: list[int] = []
         if self.has_vision:
-            info = MULTIMODAL_REGISTRY.get_processing_info(vllm_config.model_config)
             merge = self.visual.spatial_merge_size
-            max_tokens_per_item = info.get_mm_max_tokens_per_item(
-                seq_len=vllm_config.model_config.max_model_len,
-                mm_counts=dict.fromkeys(modalities, 1),
-            )
-            max_tokens = max(max_tokens_per_item[m] for m in modalities)
-            rbln_config = vllm_config.additional_config
-            # One compiled encoder shape per budget; an image is padded to the
-            # smallest that holds its patches.
-            budgets = sorted(rbln_config.encoder_token_budgets)
-            if not budgets:
-                # Unset: powers of two from the default prefill chunk counted in
-                # patches up to the longest prefill chunk in output tokens (the
-                # default one at least).
-                default_chunk = RBLN_DEFAULT_MAX_NUM_BATCHED_TOKENS
-                top = max(default_chunk, rbln_config.max_prefill_chunk_size)
-                budgets = [default_chunk // merge**2]
-                while budgets[-1] * 2 < top:
-                    budgets.append(budgets[-1] * 2)
-                budgets.append(top)
-                # No budget above the largest frame, which is the last one.
-                budgets = [b for b in budgets if b < max_tokens] + [max_tokens]
-            if budgets[-1] < max_tokens:
-                raise ValueError(
-                    f"encoder_token_budgets {budgets} must reach {max_tokens} output "
-                    "tokens, the processor's upper bound for an image or a video "
-                    "frame. Add a budget that large, or lower max_pixels in "
-                    "--mm-processor-kwargs."
-                )
+            budgets = vllm_config.additional_config.encoder_token_budgets
+            assert budgets, "encoder_token_budgets is resolved at start-up"
             self.mm_encoder_patch_buckets = [b * merge**2 for b in budgets]
             logger.info(
                 "Vision encoder buckets: patches=%s",

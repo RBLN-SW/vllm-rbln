@@ -256,7 +256,7 @@ class RBLNGemma4ForConditionalGeneration(
     Gemma4ForConditionalGeneration, SupportsRBLNMultiModal, SupportsRBLNMmPrefix
 ):
     @classmethod
-    def encoder_token_budgets(cls, vllm_config: VllmConfig) -> list[int]:
+    def resolve_encoder_token_budgets(cls, vllm_config: VllmConfig) -> list[int]:
         """The soft token budgets the vision encoder compiles one graph each for;
         an image or frame is padded to the smallest that holds it. Unset, every
         budget the longest prefill chunk holds. Compile flags alone decide them,
@@ -284,8 +284,10 @@ class RBLNGemma4ForConditionalGeneration(
     @classmethod
     def max_mm_prefix_range_len(cls, vllm_config: VllmConfig) -> int:
         # A request may ask for any compiled budget, and a video frame takes the
-        # smallest, so an image at the largest is the longest range.
-        return cls.encoder_token_budgets(vllm_config)[-1]
+        # smallest, so an image at the largest is the longest range. Resolved
+        # here too: start-up stores none with image and video off, yet
+        # --enable-mm-embeds keeps the model an mm-prefix LM.
+        return cls.resolve_encoder_token_budgets(vllm_config)[-1]
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         if vllm_config.parallel_config.data_parallel_size > 1:
@@ -325,7 +327,8 @@ class RBLNGemma4ForConditionalGeneration(
         # Upstream builds no vision tower when images and video are off.
         if not any(mm_config.get_limit_per_prompt(m) > 0 for m in ("image", "video")):
             return
-        budgets = self.encoder_token_budgets(vllm_config)
+        budgets = vllm_config.additional_config.encoder_token_budgets
+        assert budgets, "encoder_token_budgets is resolved at start-up"
         if mm_config.get_limit_per_prompt("image") > 0:
             default = mm_soft_token_default(
                 MULTIMODAL_REGISTRY.create_processor(vllm_config.model_config).info
