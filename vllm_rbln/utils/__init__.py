@@ -163,28 +163,39 @@ class EncoderInputBuffers:
     ) -> list[torch.Tensor]:
         """Copy each tensor over the whole buffer or its valid prefix.
 
-        If allow_prefix_copy is False, the input length along the bucket axis
-        must equal bucket_size.
+        The shape must match the spec outside the bucket axis. If
+        allow_prefix_copy is False, the bucket axis must also match in full.
         """
         specs, buffers = self._get_or_create_bucket(bucket_size)
-        # Reject incomplete masks before writing any reused buffers.
+        # Validate every input before writing any reused buffers.
         for spec, tensor in zip(specs, input_tensors, strict=True):
+            axis = spec.axis if spec.axis >= 0 else len(spec.shape) + spec.axis
+            if (
+                tensor.ndim != len(spec.shape)
+                or tensor.shape[:axis] != spec.shape[:axis]
+                or tensor.shape[axis + 1 :] != spec.shape[axis + 1 :]
+            ):
+                raise ValueError(
+                    f"Encoder input {spec.name!r} has shape {tuple(tensor.shape)}, "
+                    f"expected {spec.shape} with only bucket axis {spec.axis} "
+                    "allowed to vary"
+                )
+            length = tensor.shape[spec.axis]
+            if length == bucket_size:
+                continue
             if not spec.allow_prefix_copy:
-                length = tensor.size(spec.axis)
-                if length != bucket_size:
-                    raise ValueError(
-                        f"Encoder input {spec.name!r} requires a full "
-                        f"{bucket_size}-entry tensor "
-                        f"along axis {spec.axis}, got {length} entries"
-                    )
+                raise ValueError(
+                    f"Encoder input {spec.name!r} requires a full "
+                    f"{bucket_size}-entry tensor "
+                    f"along axis {spec.axis}, got {length} entries"
+                )
+            assert length == num_valid, (
+                f"{spec.name!r} received {length} entries for "
+                f"{num_valid} valid entries in a {bucket_size}-entry bucket"
+            )
         for buffer, spec, tensor in zip(buffers, specs, input_tensors, strict=True):
             length = tensor.shape[spec.axis]
             full = length == bucket_size
-            if not full:
-                assert length == num_valid, (
-                    f"{spec.name!r} received {length} entries for "
-                    f"{num_valid} valid entries in a {bucket_size}-entry bucket"
-                )
             dst = buffer if full else buffer.narrow(spec.axis, 0, length)
             if (
                 spec.use_registered_host_buffer

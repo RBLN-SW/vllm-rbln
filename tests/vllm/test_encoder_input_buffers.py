@@ -223,6 +223,19 @@ def test_a_value_of_the_wrong_length_is_refused():
         buffers.stage(8, [torch.ones(4, 4), torch.ones(3, 2), _key_bias(3)], 3)
 
 
+@pytest.mark.parametrize("cos_shape", [(3, 1), (2,)])
+def test_staging_rejects_broadcastable_shapes_before_copying(cos_shape):
+    buffers = EncoderInputBuffers("cpu", torch.float32, specs_by_bucket={8: _specs(8)})
+    staged = buffers.stage(8, [torch.ones(8, 4), torch.ones(8, 2), _key_bias(8)], 8)
+    before = [tensor.clone() for tensor in staged]
+
+    with pytest.raises(ValueError, match="Encoder input 'cos'.*shape"):
+        buffers.stage(8, [torch.zeros(3, 4), torch.zeros(cos_shape), _key_bias(3)], 3)
+
+    for tensor, expected in zip(staged, before, strict=True):
+        torch.testing.assert_close(tensor, expected)
+
+
 def test_the_value_is_converted_to_the_buffer_dtype():
     buffers = EncoderInputBuffers("cpu", torch.bfloat16, specs_by_bucket={8: _specs(8)})
 
