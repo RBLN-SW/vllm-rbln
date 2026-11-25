@@ -50,6 +50,8 @@ from vllm_rbln.model_executor.models.interfaces import (
 )
 from vllm_rbln.v1.attention.kv_cache_bindings import resolve_kv_cache
 
+# fp32 like upstream: the patch embedder scales by 2 * (x - 0.5) before
+# casting to the weight dtype, which keeps precision near mid-gray.
 _PATCH_DTYPE = torch.float32
 
 
