@@ -323,9 +323,20 @@ def test_unset_budgets_follow_the_prefill_chunk_not_the_default(monkeypatch):
 
 @pytest.mark.parametrize("cap", [{"long_prefill": 512}, {"scheduled": 512}])
 def test_unset_budgets_stop_at_the_shortest_step_cap(monkeypatch, cap):
-    # The runner refuses a range either cap would split.
+    # The runner refuses a range either cap would split, and the lower ceiling
+    # is announced rather than left for a refused request to reveal.
+    logger = Mock()
+    monkeypatch.setattr(gemma4, "logger", logger)
     model = _built_model(monkeypatch, default=280, budgets=[], chunk=2048, **cap)
     assert model.mm_encoder_patch_buckets == [70 * 9, 140 * 9, 280 * 9]
+    assert logger.warning.call_args.args[1:] == (280, 1120)
+
+
+def test_a_ceiling_the_chunk_sets_is_not_warned_about(monkeypatch):
+    logger = Mock()
+    monkeypatch.setattr(gemma4, "logger", logger)
+    _built_model(monkeypatch, default=280, budgets=[], chunk=2048)
+    logger.warning.assert_not_called()
 
 
 def test_a_step_holding_no_budget_is_refused(monkeypatch):
