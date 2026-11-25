@@ -52,6 +52,7 @@ from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 from vllm_rbln import envs
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.attention.backends.deepseek_v4 import RBLNDeepseekV4WindowSpec
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 from vllm_rbln.v1.worker.kv_placement import ChipletMemory, Unit
 
@@ -1152,7 +1153,10 @@ def prepare_kernel_block_sizes(
             kv_cache_spec = next(iter(kv_cache_spec.kv_cache_specs.values()))
         if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
             continue
-        if isinstance(kv_cache_spec, SlidingWindowSpec):
+        if isinstance(kv_cache_spec, RBLNDeepseekV4WindowSpec):
+            # Independent window pools retain the manager's physical pages.
+            kernel_block_sizes.append(kv_cache_spec.block_size)
+        elif isinstance(kv_cache_spec, SlidingWindowSpec):
             if sub_block_size is None or isinstance(
                 kv_cache_spec, RBLNSlidingWindowSpec
             ):

@@ -12,21 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""DeepSeek-V4 KV8 cache backends for CSA, HCA and SWA.
-
-Paged caches use MLAAttentionSpec: compressed KV rows are 768 bytes, indexer keys
-are 128 fp8 values, and each block holds block_size / compress_ratio rows. The
-indexer scale is a block auxiliary. SWA and compressor rings use one writable
-buffer per request and immutable prefix checkpoints on a separate state pool.
-"""
-
 from dataclasses import dataclass
 from typing import ClassVar
 
 import torch
 from vllm.v1.attention.backend import AttentionBackend, MultipleOf
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
-from vllm.v1.kv_cache_interface import CircularBufferSpec
+from vllm.v1.kv_cache_interface import SlidingWindowSpec
 
 import vllm_rbln.utils as rbln_utils
 
@@ -35,25 +27,25 @@ from .flash_attention import (
     RBLNFlashAttentionMetadataBuilder,
 )
 
-# The packed KV8 row: 448 fp8 nope | 64 pad | 64 f16 scale lanes | 64 bf16 rope.
 DSV4_KV8_ROW_BYTES = 768
 DSV4_INDEX_HEAD_DIM = 128
 
 
 @dataclass(frozen=True, kw_only=True)
-class RBLNDeepseekV4StateSpec(CircularBufferSpec):
-    """A ring on a bounded state pool, independent of paged attention IDs."""
-
+class RBLNDeepseekV4WindowSpec(SlidingWindowSpec):
     num_state_slots: int
-    prefix_caching: bool = False
-    is_draft: bool = False
+    blocks_per_request: int
+    prefix_match_unit: int | None = None
     head_size_v: int = 0
     dcp_sharded: bool = False
     max_tp_shards: int | None = 1
 
     @property
-    def prefix_cacheable(self) -> bool:
-        return self.prefix_caching
+    def max_requests(self) -> int:
+        return (self.num_state_slots - 1) // self.blocks_per_request
+
+    def max_memory_usage_bytes(self, vllm_config) -> int:
+        return self.blocks_per_request * self.page_size_bytes
 
 
 class RBLNDeepseekV4MetadataBuilder(RBLNFlashAttentionMetadataBuilder):
@@ -87,7 +79,6 @@ class _RBLNDeepseekV4CacheBackend(AttentionBackend):
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
     supported_kv_cache_dtypes: ClassVar[list[str]] = ["fp8", "fp8_e4m3"]
     accept_output_buffer: bool = False
-    # Entries a paged block stores per `block_size` tokens (1 for the ring caches).
     compress_ratio: ClassVar[int] = 1
 
     @staticmethod
@@ -128,24 +119,10 @@ class _RBLNDeepseekV4CacheBackend(AttentionBackend):
         return (0, 1, 2)
 
 
-class RBLNDeepseekV4RingBackend(_RBLNDeepseekV4CacheBackend):
-    """One [capacity, width] circular buffer per request, addressed by its slot."""
-
+class RBLNDeepseekV4WindowBackend(_RBLNDeepseekV4CacheBackend):
     @staticmethod
     def get_name() -> str:
-        return "RBLN_DEEPSEEK_V4_RING"
-
-    @classmethod
-    def get_kv_cache_shape(
-        cls,
-        num_blocks: int,
-        block_size: int,
-        num_kv_heads: int,
-        head_size: int,
-        cache_dtype_str: str = "auto",
-    ) -> tuple[int, ...]:
-        assert num_kv_heads == 1
-        return (num_blocks, block_size, head_size)
+        return "RBLN_DEEPSEEK_V4_WINDOW"
 
 
 class RBLNDeepseekV4CSABackend(_RBLNDeepseekV4CacheBackend):

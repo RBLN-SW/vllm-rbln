@@ -70,6 +70,7 @@ from vllm.v1.kv_cache_interface import (
     EncoderOnlyAttentionSpec,
     KVCacheConfig,
     MambaSpec,
+    MLAAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import (
@@ -896,13 +897,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 index, params, _, output_token_ids = added[-1]
                 added[-1] = (index, params, prompt, output_token_ids)
             self.input_batch.update_req_spec_token_ids(request, scheduled_spec_tokens)
-
-        for req_id, updates in scheduler_output.ring_block_updates.items():
-            request = self.requests[req_id]
-            req_index = self.input_batch.req_id_to_index[req_id]
-            for group_id, block_id in updates.items():
-                request.block_ids[group_id][:] = [block_id]
-                self.input_batch.block_table[group_id].add_row([block_id], req_index)
 
         # Condense the batched states if there are gaps left by removed requests
         self.input_batch.condense()
@@ -4427,14 +4421,26 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 self._kernel_block_sizes[op.group_id] == group.kv_cache_spec.block_size
             )
             layer_names = set(group.layer_names)
+            layer_names.update(
+                name
+                for name, spec in self.aux_kv_cache_specs.items()
+                if spec.owner in group.layer_names and spec.prefix_cacheable
+            )
             src = op.src_block_id
             dst = op.dst_block_id
-            nt = op.num_tokens
             for layer_name, kv_cache in zip(
                 self.kv_cache_names, self.kv_caches, strict=True
             ):
                 if layer_name not in layer_names:
                     continue
+                spec = group.kv_cache_spec
+                if isinstance(spec, UniformTypeKVCacheSpecs):
+                    aux = self.aux_kv_cache_specs.get(layer_name)
+                    spec = spec.kv_cache_specs[aux.owner if aux else layer_name]
+                nt = op.num_tokens
+                if isinstance(spec, MLAAttentionSpec):
+                    assert nt % spec.tokens_per_state == 0
+                    nt //= spec.tokens_per_state
                 # An MLA-family cache is blocks-first whatever the kernel, and
                 # the indexer scale one has no axis after its tokens.
                 if self.model_config.use_mla:

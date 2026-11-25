@@ -65,7 +65,10 @@ from vllm_rbln.v1.core.utils import (
     should_defer_spec_step,
     sub_block_size_in_use,
 )
-from vllm_rbln.v1.kv_cache import RBLNDeepseekV4StateManager, RBLNMambaManager
+from vllm_rbln.v1.kv_cache import (
+    RBLNDeepseekV4CacheCoordinator,
+    RBLNMambaManager,
+)
 
 logger = init_logger(__name__)
 
@@ -108,10 +111,9 @@ class RBLNEncoderCacheManager(EncoderCacheManager):
 
 @dataclass
 class RBLNSchedulerOutput(SchedulerOutput):
-    """KV copies and ring-slot replacements applied before the forward pass."""
+    """KV copies applied before the forward pass."""
 
     kv_cache_copy_ops: list[KVCacheCopyOp] = field(default_factory=list)
-    ring_block_updates: dict[str, dict[int, int]] = field(default_factory=dict)
 
 
 class RBLNScheduler(Scheduler):
@@ -236,12 +238,6 @@ class RBLNScheduler(Scheduler):
         # lifecycle hooks clear its pending delta before it can resume with
         # a full block table.
         self._pending_runner_block_deltas: dict[str, KVCacheBlocks] = {}
-        self._ring_managers = {
-            manager.kv_cache_group_id: manager
-            for manager in self.kv_cache_manager.coordinator.single_type_managers
-            if isinstance(manager, RBLNDeepseekV4StateManager)
-            and manager.enable_caching
-        }
 
         # NOTE(RBLN): PP degree for the per-step decode-admission budget
         # (DecodeBatchBudget.for_step): hard cap = max_num_seqs // pp, soft cap =
@@ -528,14 +524,6 @@ class RBLNScheduler(Scheduler):
             if self.need_mamba_block_aligned_split:
                 num_new_tokens = self._mamba_block_aligned_split(
                     request, num_new_tokens
-                )
-
-            if (
-                self._ring_managers
-                and request.num_computed_tokens < request.num_prompt_tokens
-            ):
-                num_new_tokens = self._ring_checkpoint_split(
-                    request, request.num_computed_tokens, num_new_tokens
                 )
 
             if num_new_tokens == 0:
@@ -955,14 +943,6 @@ class RBLNScheduler(Scheduler):
                     if num_new_tokens == 0:
                         break
 
-                if (
-                    self._ring_managers
-                    and num_computed_tokens < request.num_prompt_tokens
-                ):
-                    num_new_tokens = self._ring_checkpoint_split(
-                        request, num_computed_tokens, num_new_tokens
-                    )
-
                 # Handles an edge case when P/D Disaggregation
                 # is used with Spec Decoding where an
                 # extra block gets allocated which
@@ -1277,7 +1257,20 @@ class RBLNScheduler(Scheduler):
         kv_cache_block_copies, cow_retained_blocks = (
             self.kv_cache_manager.take_kv_cache_block_copies()
         )
-        if kv_cache_block_copies:
+        paged_copy_ops = []
+        coordinator = self.kv_cache_manager.coordinator
+        if isinstance(coordinator, RBLNDeepseekV4CacheCoordinator):
+            for copy in kv_cache_block_copies:
+                group_id, num_tokens = coordinator.partial_block_copies.pop(
+                    copy.dst_block_id
+                )
+                paged_copy_ops.append(
+                    KVCacheCopyOp(
+                        group_id, copy.src_block_id, copy.dst_block_id, num_tokens
+                    )
+                )
+            kv_cache_block_copies = []
+        elif kv_cache_block_copies:
             # The copies run with this step, the first non-empty one at or after
             # it (seq sched_step_seq + 1).
             self._free_cow_retained_blocks(cow_retained_blocks, self.sched_step_seq + 1)
@@ -1303,25 +1296,14 @@ class RBLNScheduler(Scheduler):
         )
 
         # Drain pending copy ops from the KV cache manager.
-        # Source-block refs are kept alive until update_from_output(),
+        # Copy endpoint refs are kept alive until update_from_output(),
         # which runs after the model runner finishes (safe for async
         # scheduling / pipeline parallelism).
         if isinstance(self.kv_cache_manager, RBLNKVCacheManager):
             scheduler_output.kv_cache_copy_ops = (
                 self.kv_cache_manager.drain_pending_copy_ops()
             )
-        for group_id, manager in self._ring_managers.items():
-            for req_id, (source, destination) in manager.drain_pending_copies(
-                num_scheduled_tokens
-            ).items():
-                scheduler_output.kv_cache_copy_ops.append(
-                    KVCacheCopyOp(
-                        group_id, source, destination, manager.kv_cache_spec.block_size
-                    )
-                )
-                scheduler_output.ring_block_updates.setdefault(req_id, {})[group_id] = (
-                    destination
-                )
+        scheduler_output.kv_cache_copy_ops.extend(paged_copy_ops)
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
@@ -1406,7 +1388,9 @@ class RBLNScheduler(Scheduler):
     ) -> tuple[list[int], bool]:
         result = super()._update_request_with_output(request, new_token_ids, is_stale)
         if (
-            self._ring_managers
+            isinstance(
+                self.kv_cache_manager.coordinator, RBLNDeepseekV4CacheCoordinator
+            )
             and self.num_prefill_lookahead
             and not is_stale
             and request.num_computed_tokens - request.num_in_flight_tokens
@@ -1443,28 +1427,16 @@ class RBLNScheduler(Scheduler):
                     scheduler_output.kv_cache_copy_ops
                 )
 
-        for op in scheduler_output.kv_cache_copy_ops:
-            if op.group_id in self._ring_managers:
-                pool = self._ring_managers[op.group_id].block_pool
-                pool.free_blocks([pool.blocks[op.src_block_id]])
+        if isinstance(
+            self.kv_cache_manager.coordinator, RBLNDeepseekV4CacheCoordinator
+        ):
+            pool = self.kv_cache_manager.block_pool
+            for op in scheduler_output.kv_cache_copy_ops:
+                pool.free_blocks(
+                    [pool.blocks[op.src_block_id], pool.blocks[op.dst_block_id]]
+                )
 
         return result
-
-    def _ring_checkpoint_split(
-        self, request: Request, computed: int, num_tokens: int
-    ) -> int:
-        coordinator = self.kv_cache_manager.coordinator
-        boundaries = (
-            *coordinator.get_replay_boundaries(request),
-            request.shared_prefix_boundary,
-        )
-        for boundary in boundaries:
-            boundary = boundary // self.block_size * self.block_size
-            if computed < boundary < computed + num_tokens:
-                num_tokens = boundary - computed
-            elif computed + num_tokens == boundary - 1 and num_tokens > 1:
-                num_tokens -= 1
-        return num_tokens
 
     def _ec_transfer_pending(self, request: Request, num_computed_tokens: int) -> bool:
         connector = self.ec_connector

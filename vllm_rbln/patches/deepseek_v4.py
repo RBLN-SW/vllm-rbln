@@ -54,7 +54,7 @@ def register_rbln_deepseek_v4_fp8_config() -> None:
 
 @add_registration(
     reason=(
-        "RBLN's circular buffers retain whole-block prompt checkpoints only, "
+        "RBLN's paged windows retain selected prompt boundaries only, "
         "do not support KV transfer, and limit speculative lookahead."
     )
 )
@@ -80,26 +80,18 @@ def register_deepseek_v4_config() -> None:
                         "DeepSeek-V4 prefix caching on RBLN supports "
                         "prefix_cache_retention_interval=0 only."
                     )
-                if (
-                    cache.prefix_match_unit is not None
-                    and cache.prefix_match_unit < cache.block_size
-                ):
-                    raise ValueError(
-                        "DeepSeek-V4 prefix caching on RBLN uses whole blocks; "
-                        "prefix_match_unit must not be smaller than block_size."
-                    )
             speculative = vllm_config.speculative_config
             if cache.enable_prefix_caching and speculative is not None:
                 speculative.disable_eagle_block_drop = True
             if speculative is not None and speculative.num_speculative_tokens > 3:
                 raise ValueError(
                     "DeepSeek-V4 on RBLN supports at most 3 speculative tokens; "
-                    "longer verification needs unaligned multi-block compression."
+                    "longer verification windows are not supported yet."
                 )
             if vllm_config.kv_transfer_config is not None:
                 raise ValueError(
                     "DeepSeek-V4 KV transfer requires separate capacities and slot "
-                    "IDs for paged caches and ring states; this is not supported "
+                    "IDs for compressed and window caches; this is not supported "
                     "by the RBLN connectors yet."
                 )
             super().verify_and_update_config(vllm_config)
@@ -123,11 +115,13 @@ def deepseek_v4_kv_cache_groups(vllm_config, kv_cache_spec):
 
     if not _is_deepseek_v4(vllm_config):
         return None
-    from vllm_rbln.v1.attention.backends.deepseek_v4 import RBLNDeepseekV4StateSpec
+    from vllm_rbln.v1.attention.backends.deepseek_v4 import RBLNDeepseekV4WindowSpec
 
     attn = {n: s for n, s in kv_cache_spec.items() if type(s) is MLAAttentionSpec}
     states = {
-        n: s for n, s in kv_cache_spec.items() if isinstance(s, RBLNDeepseekV4StateSpec)
+        n: s
+        for n, s in kv_cache_spec.items()
+        if isinstance(s, RBLNDeepseekV4WindowSpec)
     }
     if not kv_cache_spec or len(attn) + len(states) != len(kv_cache_spec):
         return None
@@ -151,15 +145,15 @@ def deepseek_v4_kv_cache_groups(vllm_config, kv_cache_spec):
     target="vllm.v1.core.kv_cache_manager.get_kv_cache_coordinator",
     reason=(
         "vLLM 0.31 has no coordinator registration or lookahead-hash replay "
-        "boundaries. Use them for RBLN rings. Remove this backport when upgrading "
-        "past vllm-project/vllm@da8a505684e6."
+        "boundaries. Use them for RBLN paged caches. Remove this backport "
+        "when upgrading past vllm-project/vllm@da8a505684e6."
     ),
     build=True,
 )
 def _build_deepseek_v4_cache_coordinator():
     from vllm.v1.core import kv_cache_manager
 
-    from vllm_rbln.v1.attention.backends.deepseek_v4 import RBLNDeepseekV4StateSpec
+    from vllm_rbln.v1.attention.backends.deepseek_v4 import RBLNDeepseekV4WindowSpec
     from vllm_rbln.v1.kv_cache import RBLNDeepseekV4CacheCoordinator
 
     original = kv_cache_manager.get_kv_cache_coordinator
@@ -167,7 +161,7 @@ def _build_deepseek_v4_cache_coordinator():
     @functools.wraps(original)
     def get_kv_cache_coordinator(kv_cache_config, *args, **kwargs):
         if kwargs["enable_caching"] and any(
-            isinstance(g.kv_cache_spec, RBLNDeepseekV4StateSpec)
+            isinstance(g.kv_cache_spec, RBLNDeepseekV4WindowSpec)
             for g in kv_cache_config.kv_cache_groups
         ):
             return RBLNDeepseekV4CacheCoordinator(kv_cache_config, *args, **kwargs)
@@ -180,7 +174,7 @@ def _build_deepseek_v4_cache_coordinator():
     target="vllm.v1.engine.core.EngineCore.__init__",
     reason=(
         "vLLM 0.31 cannot configure the Request hasher's MTP lookahead. Install "
-        "it before requests are created for the ring coordinator. Remove this "
+        "it before requests are created for the DSV4 coordinator. Remove this "
         "backport when upgrading past vllm-project/vllm@da8a505684e6."
     ),
     build=True,
@@ -217,10 +211,10 @@ def _deepseek_v4_pages(kv_cache_groups):
         UniformTypeKVCacheSpecs,
     )
 
-    from vllm_rbln.v1.attention.backends.deepseek_v4 import RBLNDeepseekV4StateSpec
+    from vllm_rbln.v1.attention.backends.deepseek_v4 import RBLNDeepseekV4WindowSpec
 
     if not any(
-        isinstance(g.kv_cache_spec, RBLNDeepseekV4StateSpec) for g in kv_cache_groups
+        isinstance(g.kv_cache_spec, RBLNDeepseekV4WindowSpec) for g in kv_cache_groups
     ):
         return None
     pages: list[tuple[str, int, int | None]] = []
@@ -235,7 +229,7 @@ def _deepseek_v4_pages(kv_cache_groups):
                 (n, spec.kv_cache_specs[n].page_size_bytes, None)
                 for n in group.layer_names
             )
-        elif isinstance(spec, RBLNDeepseekV4StateSpec):
+        elif isinstance(spec, RBLNDeepseekV4WindowSpec):
             pages.extend(
                 (n, spec.page_size_bytes, spec.num_state_slots)
                 for n in group.layer_names
@@ -250,7 +244,7 @@ def _deepseek_v4_pages(kv_cache_groups):
     reason=(
         "Upstream groups DeepSeek-V4 for FlashMLA's packed block-outermost "
         "layout. RBLN kernels require whole per-layer tensors, grouped by token "
-        "block size, with separate circular-buffer pools for per-request rings."
+        "block size, with separate bounded pools for sliding windows."
     ),
     build=True,
 )
@@ -270,56 +264,48 @@ def _build_deepseek_v4_kv_cache_groups():
 @register_patch(
     target="vllm.v1.engine.core.resolve_kv_cache_block_sizes",
     reason=(
-        "CircularBufferSpec.block_size describes ring capacity, not a token "
-        "checkpoint interval. Including it in the hash GCD would hash every "
-        "few tokens and reject valid whole-block prefix_match_unit settings."
+        "DSV4 window pages can be smaller than prefix_match_unit. Hash at the "
+        "physical page GCD and reconcile hits at whole-window/compression "
+        "boundaries; compressed pages alone need partial copies."
     ),
     build=True,
 )
 def _build_deepseek_v4_prefix_block_sizes():
-    from dataclasses import replace
+    from copy import copy
     from math import lcm
 
-    from vllm.v1.core import kv_cache_utils
     from vllm.v1.engine import core
+    from vllm.v1.kv_cache_interface import iter_layer_specs
 
-    from vllm_rbln.v1.attention.backends.deepseek_v4 import RBLNDeepseekV4StateSpec
+    from vllm_rbln.v1.attention.backends.deepseek_v4 import RBLNDeepseekV4WindowSpec
 
     original = core.resolve_kv_cache_block_sizes
 
     @functools.wraps(original)
     def resolve_kv_cache_block_sizes(kv_cache_config, vllm_config):
-        groups = kv_cache_config.kv_cache_groups
-        if vllm_config.cache_config.enable_prefix_caching and any(
-            isinstance(g.kv_cache_spec, RBLNDeepseekV4StateSpec) for g in groups
-        ):
-            interval = lcm(
-                vllm_config.cache_config.block_size,
-                *(
-                    kv_cache_utils.resolve_dcp_kv_block_size(
-                        g.kv_cache_spec,
-                        vllm_config.parallel_config.decode_context_parallel_size,
-                    )
-                    for g in groups
-                ),
+        specs = [
+            spec
+            for group in kv_cache_config.kv_cache_groups
+            for spec in iter_layer_specs(group.kv_cache_spec)
+        ]
+        windows = [s for s in specs if isinstance(s, RBLNDeepseekV4WindowSpec)]
+        if not windows or not vllm_config.cache_config.enable_prefix_caching:
+            return original(kv_cache_config, vllm_config)
+        minimum = lcm(
+            *(s.block_size for s in windows),
+            *(s.tokens_per_state for s in specs if isinstance(s.tokens_per_state, int)),
+        )
+        requested = vllm_config.cache_config.prefix_match_unit or minimum
+        config = copy(vllm_config)
+        config.cache_config = copy(vllm_config.cache_config)
+        config.cache_config.prefix_match_unit = None
+        scheduler_size, hash_size = original(kv_cache_config, config)
+        if requested % minimum or scheduler_size % requested:
+            raise ValueError(
+                f"DeepSeek-V4 prefix_match_unit={requested} must be a multiple "
+                f"of {minimum} and divide the {scheduler_size}-token cache alignment."
             )
-            # A temporary logical view for alignment/hash resolution only;
-            # allocation and block tables keep the physical ring capacities.
-            kv_cache_config = replace(
-                kv_cache_config,
-                kv_cache_groups=[
-                    replace(
-                        g,
-                        kv_cache_spec=g.kv_cache_spec.copy_with_new_block_size(
-                            interval
-                        ),
-                    )
-                    if isinstance(g.kv_cache_spec, RBLNDeepseekV4StateSpec)
-                    else g
-                    for g in groups
-                ],
-            )
-        return original(kv_cache_config, vllm_config)
+        return scheduler_size, hash_size
 
     return resolve_kv_cache_block_sizes
 
@@ -328,7 +314,7 @@ def _build_deepseek_v4_prefix_block_sizes():
     target="vllm.v1.core.kv_cache_utils._get_kv_cache_bytes_per_block",
     reason=(
         "Upstream's largest-group estimate cannot represent DeepSeek-V4's "
-        "separate per-layer regions. Fixed ring slots do not grow with the "
+        "separate per-layer regions. Fixed window pools do not grow with the "
         "paged block pool."
     ),
     build=True,
@@ -353,7 +339,7 @@ def _build_deepseek_v4_bytes_per_block():
     reason=(
         "The RBLN DeepSeek-V4 groups (deepseek_v4_kv_cache_groups) give "
         "every layer its own "
-        "layer-outermost region: the paged caches' and the rings' pages "
+        "layer-outermost region: the paged caches' and the windows' pages "
         "differ in size and in "
         "how the compiler cuts them over the chiplets, so no two layers alias."
     ),
@@ -378,7 +364,6 @@ def _build_deepseek_v4_kv_cache_config():
             return original(vllm_config, kv_cache_groups, available_memory)
         fixed_bytes = sum(page * slots for _, page, slots in pages if slots is not None)
         bytes_per_block = sum(page for _, page, slots in pages if slots is None)
-        # A ring-only PP stage does not constrain the shared paged pool's count.
         num_blocks = kv_cache_utils.may_override_num_blocks(
             vllm_config,
             (available_memory - fixed_bytes) // bytes_per_block
@@ -423,7 +408,7 @@ def _build_deepseek_v4_kv_cache_config():
     target="vllm.v1.core.kv_cache_utils._max_memory_usage_bytes_from_groups",
     reason=(
         "Upstream charges every device group to one shared block pool. RBLN V4 "
-        "rings have fixed, separate pools, including their own null slots."
+        "windows have fixed, separate pools, including their own null slots."
     ),
     build=True,
 )
@@ -431,7 +416,7 @@ def _build_deepseek_v4_memory_usage():
     from vllm.utils.math_utils import cdiv
     from vllm.v1.core import kv_cache_utils
 
-    from vllm_rbln.v1.attention.backends.deepseek_v4 import RBLNDeepseekV4StateSpec
+    from vllm_rbln.v1.attention.backends.deepseek_v4 import RBLNDeepseekV4WindowSpec
 
     original = kv_cache_utils._max_memory_usage_bytes_from_groups
 
@@ -449,7 +434,7 @@ def _build_deepseek_v4_memory_usage():
                 g.kv_cache_spec.page_size_bytes,
             )
             for g in groups
-            if not isinstance(g.kv_cache_spec, RBLNDeepseekV4StateSpec)
+            if not isinstance(g.kv_cache_spec, RBLNDeepseekV4WindowSpec)
         )
         return fixed + page * blocks
 
@@ -460,8 +445,8 @@ def _build_deepseek_v4_memory_usage():
     target="vllm.v1.engine.core.get_kv_cache_configs",
     reason=(
         "Upstream reconciles PP ranks by replanning with N * page_bytes. RBLN V4 "
-        "requires fixed_ring_bytes + N * page_bytes; auto-fit, overrides and PP "
-        "resizing must preserve the independent ring pools."
+        "requires fixed_window_bytes + N * page_bytes; auto-fit, overrides and PP "
+        "resizing must preserve the independent window pools."
     ),
     build=True,
 )
@@ -545,7 +530,7 @@ def _build_deepseek_v4_kv_cache_configs():
 @register_patch(
     target="vllm.v1.core.kv_cache_utils.get_max_concurrency_for_kv_cache_config",
     reason=(
-        "RBLN V4 ring IDs come from bounded pools separate from paged blocks. "
+        "RBLN V4 window IDs come from bounded pools separate from paged blocks. "
         "Upstream's single-pool concurrency estimate counts them as paged blocks "
         "and does not enforce their independent capacity."
     ),
@@ -555,27 +540,27 @@ def _build_deepseek_v4_max_concurrency():
     from vllm.utils.math_utils import cdiv
     from vllm.v1.core import kv_cache_utils
 
-    from vllm_rbln.v1.attention.backends.deepseek_v4 import RBLNDeepseekV4StateSpec
+    from vllm_rbln.v1.attention.backends.deepseek_v4 import RBLNDeepseekV4WindowSpec
 
     original = kv_cache_utils.get_max_concurrency_for_kv_cache_config
 
     @functools.wraps(original)
     def get_max_concurrency(vllm_config, cfg):
-        rings = [
+        windows = [
             g.kv_cache_spec
             for g in cfg.kv_cache_groups
-            if isinstance(g.kv_cache_spec, RBLNDeepseekV4StateSpec)
+            if isinstance(g.kv_cache_spec, RBLNDeepseekV4WindowSpec)
         ]
-        if not rings:
+        if not windows:
             return original(vllm_config, cfg)
-        limits = [float(spec.num_state_slots - 1) for spec in rings]
+        limits = [float(spec.max_requests) for spec in windows]
         blocks = sum(
             cdiv(
                 g.kv_cache_spec.max_memory_usage_bytes(vllm_config),
                 g.kv_cache_spec.page_size_bytes,
             )
             for g in cfg.kv_cache_groups
-            if not isinstance(g.kv_cache_spec, RBLNDeepseekV4StateSpec)
+            if not isinstance(g.kv_cache_spec, RBLNDeepseekV4WindowSpec)
         )
         if blocks:
             limits.append((cfg.num_blocks - 1) / blocks)
