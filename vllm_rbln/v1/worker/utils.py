@@ -594,7 +594,6 @@ def estimate_available_memory(
     num_devices_per_local_rank: int = 1,
     chiplet_memory: Mapping[Unit, ChipletMemory] | None = None,
     exact_dram: bool = False,
-    encoder_input_reserve_bytes: int = 0,
 ) -> int:
     # We are finding max_num_blocks(x) that satisfies the following equation:
 
@@ -669,7 +668,6 @@ def estimate_available_memory(
     num_runtimes = num_runtimes * rsd_size
     if chiplet_memory is None:
         available_dram_bytes = int(available_dram_bytes * gpu_memory_utilization)
-        available_dram_bytes -= encoder_input_reserve_bytes
     else:
         # Budget the tightest chiplet and let every chiplet carry that much,
         # since a block costs each the same. The weights are not resident yet.
@@ -677,15 +675,6 @@ def estimate_available_memory(
             unit: int(memory.total * gpu_memory_utilization) - memory.used
             for unit, memory in chiplet_memory.items()
         }
-        if encoder_input_reserve_bytes:
-            # Vision encoder inputs are initially bound on node 0, chiplet 0.
-            encoder_unit = (0, 0)
-            if encoder_unit not in budgets:
-                raise ValueError(
-                    f"the memory snapshot has no entry for (node, chiplet) "
-                    f"{encoder_unit}, the encoder input allocation target."
-                )
-            budgets[encoder_unit] -= encoder_input_reserve_bytes
         tightest = min(budgets, key=budgets.__getitem__)
         if len(budgets) != rsd_size:
             raise ValueError(

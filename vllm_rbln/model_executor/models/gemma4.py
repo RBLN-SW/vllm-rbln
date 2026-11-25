@@ -369,13 +369,6 @@ class RBLNGemma4ForConditionalGeneration(
             for m in ("image", "video")
         )
 
-    def mm_encoder_input_sizes(self) -> list[int]:
-        if not self._uses_local_vision_encoder():
-            return []
-        return rbln_utils.encoder_input_sizes(
-            self.mm_encoder_patch_buckets, self._mm_input_specs, self.model_dtype
-        )
-
     def compile_mm_encoder(self, compile_fn) -> None:
         if not self._uses_local_vision_encoder():
             return

@@ -776,17 +776,6 @@ class TestEstimateAvailableMemory:
         # Default buffer = 256MB/runtime * num_runtimes (2 * rsd = 2) = 2**29.
         assert no_buffer - default == 2**29
 
-    def test_encoder_input_reserve_is_applied_once_to_card_budget(self, rbln):
-        rbln("RBLN-CR13")
-        mc, pc = _make_model_config(num_kv_heads=2), _make_parallel_config()
-        baseline = estimate_available_memory(mc, pc, kernel_size=_GB)
-        reserve = 64 << 20
-        reduced = estimate_available_memory(
-            mc, pc, kernel_size=_GB, encoder_input_reserve_bytes=reserve
-        )
-        # The card pays once, and the KV estimate is replicated twice.
-        assert baseline - reduced == reserve // 2
-
     def test_validation_combinations(self, rbln):
         rbln("RBLN-CA25")
         mc, pc = _make_model_config(), _make_parallel_config()
@@ -827,22 +816,6 @@ class TestEstimateAvailableMemory:
         all_tight = self._measured(self._snapshot([3 * _GB] * 4))
         all_loose = self._measured(self._snapshot([_GB] * 4))
         assert one_tight == all_tight < all_loose
-
-    def test_encoder_input_reserve_is_charged_to_primary_chiplet(self, rbln):
-        rbln("RBLN-CR13")
-        snapshot = self._snapshot([_GB, 3 * _GB, _GB, _GB])
-        baseline = self._measured(snapshot)
-        assert baseline == self._measured(snapshot, encoder_input_reserve_bytes=_GB)
-        assert self._measured(
-            snapshot, encoder_input_reserve_bytes=3 * _GB
-        ) == self._measured(self._snapshot([4 * _GB, 3 * _GB, _GB, _GB]))
-
-    def test_encoder_input_reserve_requires_primary_chiplet_in_snapshot(self, rbln):
-        rbln("RBLN-CR13")
-        snapshot = self._snapshot([_GB] * 4)
-        snapshot[(1, 0)] = snapshot.pop((0, 0))
-        with pytest.raises(ValueError, match=r"has no entry for .*\(0, 0\)"):
-            self._measured(snapshot, encoder_input_reserve_bytes=_GB)
 
     def test_chiplet_memory_still_charges_kernel_size(self, rbln):
         rbln("RBLN-CR13")

@@ -60,19 +60,6 @@ class EncoderInput(NamedTuple):
         return prod(self.shape) * (self.dtype or default_dtype).itemsize
 
 
-def encoder_input_sizes(
-    buckets: Sequence[int],
-    specs_for_bucket: Callable[[int], Sequence[EncoderInput]],
-    default_dtype: torch.dtype,
-) -> list[int]:
-    """Return the byte size of each device tensor allocated across the buckets."""
-    return [
-        spec.nbytes(default_dtype)
-        for bucket in dict.fromkeys(buckets)
-        for spec in specs_for_bucket(bucket)
-    ]
-
-
 class EncoderInputBuffers:
     """Reuse device input buffers by bucket.
 

@@ -1405,13 +1405,6 @@ class RBLNGlm5NextForConditionalGeneration(
     def get_language_model(self) -> nn.Module:
         return self
 
-    def mm_encoder_input_sizes(self) -> list[int]:
-        if isinstance(self.visual, PPMissingLayer):
-            return []
-        return rbln_utils.encoder_input_sizes(
-            self.mm_encoder_patch_buckets, self._mm_input_specs, self.visual.dtype
-        )
-
     def compile_mm_encoder(self, compile_fn) -> None:
         if isinstance(self.visual, PPMissingLayer):
             return

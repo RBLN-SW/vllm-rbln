@@ -18,11 +18,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from vllm_rbln.utils import (
-    EncoderInput,
-    EncoderInputBuffers,
-    encoder_input_sizes,
-)
+from vllm_rbln.utils import EncoderInput, EncoderInputBuffers
 
 
 def _specs(bucket_size):
@@ -43,32 +39,6 @@ def _key_bias(num_valid):
     bias = torch.zeros(1, 1, 8)
     bias[..., num_valid:] = -30000.0
     return bias
-
-
-def test_estimated_input_sizes_match_allocations():
-    def specs(bucket):
-        return [
-            EncoderInput(
-                "patches",
-                (bucket, 4),
-                axis=0,
-                pad=0.0,
-                dtype=torch.float32,
-                use_registered_host_buffer=True,
-            ),
-            EncoderInput("key_bias", (1, 1, bucket), axis=2, pad=0.0),
-        ]
-
-    buckets = (8, 16)
-    dtype = torch.bfloat16
-    buffers = EncoderInputBuffers(
-        "cpu", dtype, specs_by_bucket={bucket: specs(bucket) for bucket in buckets}
-    )
-    assert encoder_input_sizes(buckets, specs, dtype) == [
-        tensor.nbytes
-        for bucket in buckets
-        for tensor in buffers.warmup_inputs(bucket, fill_overrides={})
-    ]
 
 
 def test_rbln_warmup_binds_device_buffer_and_registers_host_buffer_once(monkeypatch):

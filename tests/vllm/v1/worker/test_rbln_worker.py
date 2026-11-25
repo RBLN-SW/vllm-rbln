@@ -662,10 +662,6 @@ class TestDetermineAvailableMemory:
         drafter=None,
         speculative_config=None,
         dynamic=False,
-        encoder_input_sizes_bytes=None,
-        tensor_device="cpu",
-        encoder_consumer_only=False,
-        first_pp_rank=True,
         kernel_size=lambda **kw: 111,
     ):
         vcfg = _make_vllm_config(quantization=quantization)
@@ -678,7 +674,7 @@ class TestDetermineAvailableMemory:
 
         vcfg.model_config.get_num_layers = get_num_layers
         worker = make_worker(vllm_config=vcfg, device_name=device_name)
-        worker.device = torch.device(tensor_device)
+        worker.device = torch.device("cpu")
         captured: dict = {}
 
         def record(**kw):
@@ -705,53 +701,10 @@ class TestDetermineAvailableMemory:
             drafter=drafter,
             get_kv_cache_spec=lambda: {},
             decode_graph_shapes=lambda: list(decode_graph_shapes),
-            supports_mm_inputs=encoder_input_sizes_bytes is not None,
-            is_ec_consumer_only=encoder_consumer_only,
         )
-        if encoder_input_sizes_bytes is not None:
-            runner_model = worker.model_runner.model
-            runner_model.mm_encoder_input_sizes = lambda: encoder_input_sizes_bytes
-            monkeypatch.setattr(
-                wm, "get_pp_group", lambda: SimpleNamespace(is_first_rank=first_pp_rank)
-            )
         _attach_sizer(worker)
         worker.determine_available_memory()
         return captured
-
-    @pytest.mark.parametrize(
-        ("dynamic", "tensor_device", "first_pp_rank", "consumer_only", "expected"),
-        [
-            (False, "rbln", True, False, 22 << 20),
-            (False, "cpu", True, False, None),
-            (False, "rbln", False, False, None),
-            (False, "rbln", True, True, None),
-            (True, "rbln", True, False, None),
-        ],
-    )
-    def test_reserves_encoder_inputs_for_static_kv_only(
-        self,
-        make_worker,
-        monkeypatch,
-        dynamic,
-        tensor_device,
-        first_pp_rank,
-        consumer_only,
-        expected,
-    ):
-        monkeypatch.setattr(
-            wm.torch, "rbln", SimpleNamespace(is_dummy_device=lambda: True)
-        )
-        cap = self._capture(
-            make_worker,
-            monkeypatch,
-            device_name="RBLN-CR13",
-            dynamic=dynamic,
-            encoder_input_sizes_bytes=[128, 4 << 20, 16 << 20],
-            tensor_device=tensor_device,
-            encoder_consumer_only=consumer_only,
-            first_pp_rank=first_pp_rank,
-        )
-        assert cap.get("encoder_input_reserve_bytes") == expected
 
     def test_dynamic_kv_feeds_the_chiplet_snapshot(self, make_worker, monkeypatch):
         snapshot = {(0, 0): dks.ChipletMemory(total=100, used=40)}
