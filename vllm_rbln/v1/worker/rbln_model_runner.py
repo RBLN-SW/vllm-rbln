@@ -1581,14 +1581,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 small = min(chunks)
                 example = (
                     f"--max-num-batched-tokens {fit} "
-                    f"--rbln-prefill-chunk-size {small},{fit}"
+                    f"--rbln-prefill-chunk-size {small} {fit}"
                     + (f" --block-size {fit}" if fit > block_size else "")
                 )
                 if block_size % small == 0:
                     tight = -(-longest // 128) * 128
                     example += (
                         f", or --max-num-batched-tokens {tight} "
-                        f"--rbln-prefill-chunk-size {small},{tight}"
+                        f"--rbln-prefill-chunk-size {small} {tight}"
                     )
                 raise ValueError(
                     f"--rbln-prefill-chunk-size {chunks} cannot serve "

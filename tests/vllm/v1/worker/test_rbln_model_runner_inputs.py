@@ -314,10 +314,10 @@ class TestResolveMmPrefixSupport:
             runner._resolve_mm_support()
         message = str(refused.value)
         assert (
-            "--max-num-batched-tokens 2048 --rbln-prefill-chunk-size 512,2048"
+            "--max-num-batched-tokens 2048 --rbln-prefill-chunk-size 512 2048"
             in message
         )
-        assert "--rbln-prefill-chunk-size 512,1152" in message
+        assert "--rbln-prefill-chunk-size 512 1152" in message
         assert (
             "max_soft_tokens (1120)" in message
             and "divides --block-size (8192)" in message
