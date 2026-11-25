@@ -1424,8 +1424,7 @@ class RBLNGlm5NextForConditionalGeneration(
         if isinstance(visual, PPMissingLayer):
             return
         buffered_encoder = self._mm_encoder
-        if buffered_encoder is None:
-            raise RuntimeError("Vision encoding requires a compiled encoder")
+        assert buffered_encoder is not None
         with torch.inference_mode():
             for bucket_size in self.mm_encoder_patch_buckets:
                 # Every entry valid: the warm-up never masks a key.
@@ -1510,8 +1509,7 @@ class RBLNGlm5NextForConditionalGeneration(
                 if pixel_values is None:
                     continue
                 buffered_encoder = self._mm_encoder
-                if buffered_encoder is None:
-                    raise RuntimeError("Vision encoding requires a compiled encoder")
+                assert buffered_encoder is not None
                 grid_thw = kwargs[f"{modality}_grid_thw"]
                 assert isinstance(pixel_values, torch.Tensor)
                 assert isinstance(grid_thw, torch.Tensor)

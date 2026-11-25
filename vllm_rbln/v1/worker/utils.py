@@ -52,7 +52,7 @@ from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 from vllm_rbln import envs
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.logger import init_logger
-from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
+from vllm_rbln.v1.kv_cache import window_splits_block
 from vllm_rbln.v1.worker.kv_placement import ChipletMemory, Unit
 
 if TYPE_CHECKING:
@@ -327,10 +327,8 @@ def read_rbln_card_dram_used_bytes() -> int:
     return max(used, default=0)
 
 
-def compile_and_warmup_skip_reason(vllm_config: VllmConfig) -> str | None:
+def compile_and_warmup_skip_reason() -> str | None:
     """Why the compile and warm-up will be skipped, or None if they will run."""
-    if vllm_config.model_config.enforce_eager:
-        return "enforce_eager is set"
     if not envs.VLLM_RBLN_ENABLE_WARM_UP:
         return "VLLM_RBLN_ENABLE_WARM_UP is off"
     return None
@@ -1113,7 +1111,6 @@ def set_omp_num_threads(
 def prepare_kernel_block_sizes(
     kv_cache_config: KVCacheConfig,
     attn_groups: list[list[AttentionGroup]],
-    sub_block_size: int | None = None,
 ) -> list[int]:
     """
     Generate kernel_block_sizes that matches each block_size.
@@ -1125,7 +1122,6 @@ def prepare_kernel_block_sizes(
     Args:
         kv_cache_config: The KV cache configuration.
         attn_groups: Attention groups indexed by KV cache group id.
-        sub_block_size: Sub-block prefix caching granularity, None when off.
 
     Returns:
         List of kernel block sizes for each cache group.
@@ -1140,17 +1136,13 @@ def prepare_kernel_block_sizes(
         if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
             continue
         if isinstance(kv_cache_spec, SlidingWindowSpec):
-            if sub_block_size is None or isinstance(
-                kv_cache_spec, RBLNSlidingWindowSpec
-            ):
-                # The shift kernel holds one window per block; the append kernel
-                # gathers whole blocks around the window, whatever their size.
+            # The shift kernel holds one window per block; the append kernel
+            # gathers whole blocks around the window, whatever their size, so
+            # it takes the block where upstream's block table refuses a window
+            # that does not divide it.
+            if window_splits_block(kv_cache_spec):
                 kernel_block_sizes.append(kv_cache_spec.sliding_window)
             else:
-                # A sub-block copy slices the buffer the compiled graph reads,
-                # and this layer shares it with a full-attention layer on the
-                # manager block: the append kernel takes the same block, so the
-                # slice is one geometry for both.
                 kernel_block_sizes.append(kv_cache_group.kv_cache_spec.block_size)
         elif isinstance(kv_cache_spec, AttentionSpec):
             # This is an attention backend that supports virtual block splitting.

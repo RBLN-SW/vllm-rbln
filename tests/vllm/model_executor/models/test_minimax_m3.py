@@ -348,11 +348,8 @@ def test_minimax_m3_without_a_draft_sends_no_aux(monkeypatch, pp_size):
     assert keys == {"hidden_states", "residual"}
 
 
-@pytest.mark.parametrize("compiled", [False, True])
 @pytest.mark.parametrize("out_dtype", [torch.float32, torch.bfloat16])
-def test_image_encoding_requires_and_reuses_compiled_encoder(
-    monkeypatch, compiled, out_dtype
-):
+def test_image_encoding_reuses_the_compiled_encoder(monkeypatch, out_dtype):
     import vllm_rbln.model_executor.models.minimax_m3 as m3
 
     model = m3.RBLNMiniMaxM3SparseForConditionalGeneration.__new__(
@@ -368,20 +365,12 @@ def test_image_encoding_requires_and_reuses_compiled_encoder(
     encoder = torch.nn.Sequential(model.vision_tower)
     build_encoder = Mock(return_value=encoder)
     monkeypatch.setattr(m3, "_RBLNVisionEncoder", build_encoder)
-    model._mm_encoder = None
-    if compiled:
-        model.compile_mm_encoder(lambda module: module)
+    model.compile_mm_encoder(lambda module: module)
     model._encoder_inputs = Mock(
         side_effect=lambda encoder, pixels, grid, modality: [pixels]
     )
     pixels = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
     grids = torch.tensor([[1, 1, 1], [1, 1, 2]])
-
-    if not compiled:
-        with pytest.raises(RuntimeError, match="requires a compiled encoder"):
-            model.embed_multimodal(pixel_values=pixels, image_grid_thw=grids)
-        build_encoder.assert_not_called()
-        return
 
     for _ in range(2):
         outputs = model.embed_multimodal(pixel_values=pixels, image_grid_thw=grids)
@@ -861,9 +850,6 @@ def test_shared_bucket_is_warmed_once(vision_encoder_model):
     model = vision_encoder_model
     model.mm_encoder_patch_buckets = [16, 64, 128]
     encoder = Mock()
-    model._mm_encoder = None
-    with pytest.raises(RuntimeError, match="requires a compiled encoder"):
-        model.warmup_mm_encoder()
     model._mm_encoder = BufferedVisionEncoder(
         encoder,
         specs_by_bucket={

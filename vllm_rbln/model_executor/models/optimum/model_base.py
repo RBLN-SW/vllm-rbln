@@ -292,45 +292,9 @@ class RBLNOptimumModelBase(nn.Module):
         return self.model.rbln_config.dtype
 
 
-class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
-    attn_impl: str | None
-    packed_kv_cache: bool
-
-    def setup_decoder_mixin(
-        self,
-        attn_impl: str | None,
-        vocab_size: int,
-        use_multiple_decoder: bool,
-        default_batch_size: int,
-        decoder_batch_sizes: list[int],
-    ):
-        self.attn_impl = attn_impl
-        self.packed_kv_cache = has_packed_kv_cache(self.model.rbln_config)
-        self.use_multiple_decoder = use_multiple_decoder
-        # FIXME: self.batch_size != self.decoder_batch_size ?
-        self.decoder_batch_size = default_batch_size
-        if self.use_multiple_decoder:
-            self.decoder_batch_sizes = tuple(reversed(decoder_batch_sizes))
-
-        self.logits_processor = LogitsProcessor(vocab_size, logits_as_input=True)
-
-    def decode_layout(
-        self, cache_slot_ids: torch.Tensor, block_tables: torch.Tensor
-    ) -> tuple[int, slice | torch.Tensor]:
-        """Padded decode batch size and the row of each running request in it.
-
-        By default the requests sit in running order at rows [0, num_reqs) of
-        the smallest decoder bucket that fits. A model whose graph keeps
-        per-row on-device state overrides this to pin each request to its row
-        of the decoder's full batch.
-        """
-        num_reqs = cache_slot_ids.shape[0]
-        padded_batch_size = (
-            select_bucket_size(num_reqs, self.decoder_batch_sizes)
-            if self.use_multiple_decoder
-            else self.decoder_batch_size
-        )
-        return padded_batch_size, slice(0, num_reqs)
+class RBLNOptimumPrefixCacheMixin:
+    model: Any
+    kv_block_adapter: KVCacheBlockAdapter | None
 
     def get_prefill_decoder(self) -> runtime_utils.RBLNRuntimeModel:
         return self.model.prefill_decoder
@@ -369,6 +333,7 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
             )
 
         runtime = self.get_prefill_decoder().runtime
+        packed_kv_cache = has_packed_kv_cache(self.model.rbln_config)
         # Convert to list once for efficiency
         dst_blocks = block_tables.tolist()
 
@@ -379,9 +344,7 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
                 # A split cache leaves packing out, so that a rebel-compiler
                 # from before the packed KV cache still copies it.
                 packing = (
-                    {"packing": rebel.KVCachePacking.PACKED}
-                    if self.packed_kv_cache
-                    else {}
+                    {"packing": rebel.KVCachePacking.PACKED} if packed_kv_cache else {}
                 )
                 runtime._copy_kv_cache(
                     src_block, dst_block, cached_lengths[block_idx], **packing
@@ -396,6 +359,45 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
                     f"Failed to copy KV cache from block {src_block} to block "
                     f"{dst_block} at index {block_idx}: {e}"
                 ) from e
+
+
+class RBLNOptimumDecoderMixin(RBLNOptimumPrefixCacheMixin, VllmModelForTextGeneration):
+    attn_impl: str | None
+
+    def setup_decoder_mixin(
+        self,
+        attn_impl: str | None,
+        vocab_size: int,
+        use_multiple_decoder: bool,
+        default_batch_size: int,
+        decoder_batch_sizes: list[int],
+    ):
+        self.attn_impl = attn_impl
+        self.use_multiple_decoder = use_multiple_decoder
+        # FIXME: self.batch_size != self.decoder_batch_size ?
+        self.decoder_batch_size = default_batch_size
+        if self.use_multiple_decoder:
+            self.decoder_batch_sizes = tuple(reversed(decoder_batch_sizes))
+
+        self.logits_processor = LogitsProcessor(vocab_size, logits_as_input=True)
+
+    def decode_layout(
+        self, cache_slot_ids: torch.Tensor, block_tables: torch.Tensor
+    ) -> tuple[int, slice | torch.Tensor]:
+        """Padded decode batch size and the row of each running request in it.
+
+        By default the requests sit in running order at rows [0, num_reqs) of
+        the smallest decoder bucket that fits. A model whose graph keeps
+        per-row on-device state overrides this to pin each request to its row
+        of the decoder's full batch.
+        """
+        num_reqs = cache_slot_ids.shape[0]
+        padded_batch_size = (
+            select_bucket_size(num_reqs, self.decoder_batch_sizes)
+            if self.use_multiple_decoder
+            else self.decoder_batch_size
+        )
+        return padded_batch_size, slice(0, num_reqs)
 
     # It is required for decoder models in openai api server
     def compute_logits(

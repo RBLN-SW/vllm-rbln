@@ -192,8 +192,7 @@ def test_load_time_transforms_run_once_after_every_weight(monkeypatch):
     ]
 
 
-@pytest.mark.parametrize("compiled", [False, True])
-def test_image_encoding_requires_and_reuses_compiled_encoder(monkeypatch, compiled):
+def test_image_encoding_reuses_the_compiled_encoder(monkeypatch):
     import vllm_rbln.model_executor.models.glm5_next as glm
 
     cls = glm.RBLNGlm5NextForConditionalGeneration
@@ -206,18 +205,10 @@ def test_image_encoding_requires_and_reuses_compiled_encoder(monkeypatch, compil
     encoder = torch.nn.Sequential(model.visual)
     build_encoder = Mock(return_value=encoder)
     monkeypatch.setattr(glm, "_RBLNGlm5NextVisionEncoder", build_encoder)
-    model._mm_encoder = None
-    if compiled:
-        model.compile_mm_encoder(lambda module: module)
+    model.compile_mm_encoder(lambda module: module)
     model._encoder_inputs = Mock(side_effect=lambda encoder, pixels, grid: [pixels])
     pixels = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
     grids = torch.tensor([[1, 1, 1], [1, 1, 2]])
-
-    if not compiled:
-        with pytest.raises(RuntimeError, match="requires a compiled encoder"):
-            model.embed_multimodal(pixel_values=pixels, image_grid_thw=grids)
-        build_encoder.assert_not_called()
-        return
 
     for _ in range(2):
         outputs = model.embed_multimodal(pixel_values=pixels, image_grid_thw=grids)
@@ -281,7 +272,6 @@ def _build_with_token_budgets(monkeypatch, budgets, limits, is_first_rank=True):
 
 
 @pytest.mark.parametrize("is_first_rank", [False, True])
-@pytest.mark.parametrize("compiled", [False, True])
 @pytest.mark.parametrize(
     "limits,budgets,buckets",
     [
@@ -293,7 +283,7 @@ def _build_with_token_budgets(monkeypatch, budgets, limits, is_first_rank=True):
     ],
 )
 def test_encoder_buckets_are_initialized_and_warmed(
-    monkeypatch, is_first_rank, compiled, limits, budgets, buckets
+    monkeypatch, is_first_rank, limits, budgets, buckets
 ):
     import vllm_rbln.model_executor.models.glm5_next as glm
 
@@ -303,14 +293,7 @@ def test_encoder_buckets_are_initialized_and_warmed(
     build_encoder = Mock(return_value=encoder)
     monkeypatch.setattr(glm, "_RBLNGlm5NextVisionEncoder", build_encoder)
     compile_fn = Mock(side_effect=lambda module: module)
-    if compiled:
-        model.compile_mm_encoder(compile_fn)
-
-    if is_first_rank and buckets and not compiled:
-        with pytest.raises(RuntimeError, match="requires a compiled encoder"):
-            model.warmup_mm_encoder()
-        build_encoder.assert_not_called()
-        return
+    model.compile_mm_encoder(compile_fn)
 
     model.warmup_mm_encoder()
 

@@ -2668,7 +2668,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             install_aux_handoff_slots(self.model)
 
         self._make_weights_contiguous()
-        if envs.VLLM_RBLN_USE_NESTED_COMPILE_REGION:
+        if envs.VLLM_RBLN_USE_NESTED_COMPILE_REGION is not False:
             mark_decoder_regions(self.model)
 
         # NOTE(RBLN): This wrapper is designed to be compiled by torch.compile.
@@ -2733,43 +2733,40 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
 
             return hidden_states, logits, combined_hidden_states
 
-        if self.model_config.enforce_eager:
-            self.model_executable = model_wrapper
-        else:
-            process_group_dict = build_process_group_dict()
-            self.model_executable = compile(
-                model_wrapper,
-                dynamic=False,
-                fullgraph=True,
-                compile_context=self.compile_context,
-                num_devices=1,
-                model_trace_method="export" if use_device_tensor() else "",
-                process_group_dict=process_group_dict,
-                guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
-                runtime_holder=self.runtime_holder,
-                mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
-                # Logits are consumed by sampling within the same step, so the
-                # output buffer can be reused across steps even under async scheduling.
-                use_static_output=True,
-                use_direct_dispatch=True,
-                dtype=self.rbln_config.compile_dtype,
-            )
-            if self.supports_mm_inputs and not self.is_ec_consumer_only:
-                cast(SupportsRBLNMultiModal, self.model).compile_mm_encoder(
-                    lambda encoder: compile(
-                        encoder,
-                        dynamic=False,
-                        fullgraph=True,
-                        compile_context=self.compile_context,
-                        num_devices=1,
-                        model_trace_method="export" if use_device_tensor() else "",
-                        process_group_dict=process_group_dict,
-                        guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
-                        runtime_holder=self.runtime_holder,
-                        mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
-                        use_static_output=True,
-                    )
+        process_group_dict = build_process_group_dict()
+        self.model_executable = compile(
+            model_wrapper,
+            dynamic=False,
+            fullgraph=True,
+            compile_context=self.compile_context,
+            num_devices=1,
+            model_trace_method="export" if use_device_tensor() else "",
+            process_group_dict=process_group_dict,
+            guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
+            runtime_holder=self.runtime_holder,
+            mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
+            # Logits are consumed by sampling within the same step, so the
+            # output buffer can be reused across steps even under async scheduling.
+            use_static_output=True,
+            use_direct_dispatch=True,
+            dtype=self.rbln_config.compile_dtype,
+        )
+        if self.supports_mm_inputs and not self.is_ec_consumer_only:
+            cast(SupportsRBLNMultiModal, self.model).compile_mm_encoder(
+                lambda encoder: compile(
+                    encoder,
+                    dynamic=False,
+                    fullgraph=True,
+                    compile_context=self.compile_context,
+                    num_devices=1,
+                    model_trace_method="export" if use_device_tensor() else "",
+                    process_group_dict=process_group_dict,
+                    guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
+                    runtime_holder=self.runtime_holder,
+                    mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
+                    use_static_output=True,
                 )
+            )
 
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
         """Extract Eagle3 auxiliary layer indices from speculative config.
@@ -3126,6 +3123,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
     def _dummy_sampler_run(self, num_reqs: int) -> None:
         from vllm_rbln.v1.sample import WARM_UP_CONFIGS
 
+        sampler = self.sampler
+        if not isinstance(sampler, RBLNSampler):
+            return
+
         logits = torch.randn(
             (num_reqs, self.model_config.get_vocab_size()),
             device=self.device,
@@ -3175,10 +3176,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 spec_token_ids=[[] for _ in range(num_reqs)],
             )
 
-            if isinstance(self.sampler, RBLNSampler):
-                self.sampler.warm_up(logits=logits, sampling_metadata=dummy_metadata)
-            else:
-                _ = self.sampler(logits=logits, sampling_metadata=dummy_metadata)
+            sampler.warm_up(logits=logits, sampling_metadata=dummy_metadata)
 
             if num_reqs > 1:
                 # A batch smaller than the bucket takes `_pad_rows`'s `torch.cat`
@@ -3192,7 +3190,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     top_p=shorter(dummy_metadata.top_p),
                     top_k=shorter(dummy_metadata.top_k),
                 )
-                _ = self.sampler(
+                _ = sampler(
                     logits=logits,
                     sampling_metadata=_pad_sampling_metadata(short_metadata, num_reqs),
                 )
@@ -3398,8 +3396,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         """Pick one layer to stand for each KV cache buffer.
 
         Layers that share a buffer (`kv_cache_extents`) must be named once
-        for `mark_static_address`. A `KVCacheTensor` is not a buffer: it
-        lists many layers, each with its own.
+        for `mark_static_address` and bound once as a graph input, in that
+        layer's shape. A `KVCacheTensor` is not a buffer: it lists many
+        layers, each with its own.
         """
         layer_to_spec: dict[str, KVCacheSpec] = {
             layer_name: attn_group.kv_cache_spec
@@ -3628,9 +3627,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         self.kv_cache_positions = {
             name: position for position, name in enumerate(self.kv_cache_names)
         }
+        canonical = self._select_canonical_kv_layers_per_pool(kv_cache_config)
+        # A block-aux cache is outside the KV cache config, so no canonical layer
+        # names its storage; the aux layers on it all view it in one shape.
         self._update_kv_cache_base_bindings(
             kv_cache_bases_by_layer,
             kv_cache_view_infos,
+            canonical | set(self.aux_kv_cache_specs),
         )
         if dynamic_kv_enabled(self.vllm_config) and self.kv_cache_bases:
             # With shared bases these are the graph inputs and the per-layer
@@ -3660,16 +3663,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         for layer_name, kv_cache in kv_caches.items():
             forward_context[layer_name].kv_cache = kv_cache
 
-        if not use_device_tensor() and not self.model_config.enforce_eager:
+        if not use_device_tensor():
             # `mark_static_address` is last-write-wins on storage->name. Pin to
             # one canonical layer per pool so the runtime, the connector's host
             # buffers, and the runtime copy path address the same name (and the
             # same logical block_id space).
-            layers_to_register = self._select_canonical_kv_layers_per_pool(
-                kv_cache_config
-            )
             for name, kv_cache in kv_caches.items():
-                if name not in layers_to_register:
+                if name not in canonical:
                     continue
                 self.compile_context.mark_static_address(kv_cache, name)
 
@@ -3798,20 +3798,20 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         # kernel_block_size 64 and split the 256-token-block to 4 blocks with 64
         # tokens each.
         kernel_block_sizes = prepare_kernel_block_sizes(
-            kv_cache_config,
-            self.attn_groups,
-            sub_block_size_in_use(
-                enable_prefix_caching=self.cache_config.enable_prefix_caching,
-                sub_block_cache=self.rbln_config.enable_sub_block_cache,
-                block_size=self.cache_config.block_size,
-                prefill_chunk_sizes=self.prefill_chunk_sizes,
-                kv_cache_config=kv_cache_config,
-                model_config=self.model_config,
-                cache_dtype=self.cache_config.cache_dtype,
-                sub_block_size=self.rbln_config.sub_block_size,
-            ),
+            kv_cache_config, self.attn_groups
         )
         self._kernel_block_sizes = kernel_block_sizes
+        # Refuses a sub-block setting here rather than once warm-up is done.
+        sub_block_size_in_use(
+            enable_prefix_caching=self.cache_config.enable_prefix_caching,
+            sub_block_cache=self.rbln_config.enable_sub_block_cache,
+            block_size=self.cache_config.block_size,
+            prefill_chunk_sizes=self.prefill_chunk_sizes,
+            kv_cache_config=kv_cache_config,
+            model_config=self.model_config,
+            cache_dtype=self.cache_config.cache_dtype,
+            sub_block_size=self.rbln_config.sub_block_size,
+        )
 
         # create metadata builders
         self.initialize_metadata_builders(kv_cache_config, kernel_block_sizes)
@@ -4057,6 +4057,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         self,
         kv_cache_bases_by_layer: dict[str, torch.Tensor],
         kv_cache_view_infos_by_layer: dict[str, KVCacheViewInfo],
+        canonical_layers: set[str],
     ) -> None:
         if not kv_cache_view_infos_by_layer:
             self.kv_cache_bases = []
@@ -4066,6 +4067,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         kv_cache_bases, kv_cache_view_infos = build_kv_cache_base_bindings(
             kv_cache_bases_by_layer,
             kv_cache_view_infos_by_layer,
+            canonical_layers,
             layer_names=self.kv_cache_names,
         )
         # If no deduplication occurred (each layer has its own unique base),
@@ -4342,7 +4344,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         block pool, so each cache copies the page; a page another group owns is
         unused by its own group there.
         """
-        assert use_device_tensor() or self.model_config.enforce_eager
+        assert use_device_tensor()
         dsts: list[torch.Tensor] = []
         srcs: list[torch.Tensor] = []
         seen: set[int] = set()
@@ -4362,7 +4364,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         self,
         copy_ops: list[KVCacheCopyOp],
     ) -> None:
-        if not use_device_tensor() and not self.model_config.enforce_eager:
+        if not use_device_tensor():
             # NOTE(RBLN): The runtime KV-copy interface is no longer actively maintained
             # in this path (--model-impl vllm).
             for op in copy_ops:
@@ -4374,19 +4376,27 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         srcs: list[torch.Tensor] = []
         for op in copy_ops:
             group = self.kv_cache_config.kv_cache_groups[op.group_id]
-            # The op names manager blocks; the cache is addressed in kernel
-            # blocks, so the two must coincide for the group.
-            assert (
-                self._kernel_block_sizes[op.group_id] == group.kv_cache_spec.block_size
-            )
             layer_names = set(group.layer_names)
             src = op.src_block_id
             dst = op.dst_block_id
             nt = op.num_tokens
+            per_block = (
+                group.kv_cache_spec.block_size // self._kernel_block_sizes[op.group_id]
+            )
             for layer_name, kv_cache in zip(
                 self.kv_cache_names, self.kv_caches, strict=True
             ):
                 if layer_name not in layer_names:
+                    continue
+                if per_block > 1:
+                    # The op names a manager block, which this view holds as
+                    # per_block kernel blocks: copy all of them. An eager copy is
+                    # placed in the bound view's layout, which need not be the one
+                    # the window kernel writes; only a whole block is the same
+                    # bytes in both. Rows past the prefix are rewritten before use.
+                    axis = self.kv_cache_block_axes[layer_name]
+                    dsts.append(kv_cache.narrow(axis, dst * per_block, per_block))
+                    srcs.append(kv_cache.narrow(axis, src * per_block, per_block))
                     continue
                 # An MLA-family cache is blocks-first whatever the kernel, and
                 # the indexer scale one has no axis after its tokens.

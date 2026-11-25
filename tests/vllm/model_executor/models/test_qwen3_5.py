@@ -262,9 +262,6 @@ def test_warmup_runs_the_encoder_once_over_each_bucket(visual):
     model.has_vision = True
     model.mm_encoder_patch_buckets = [64, 128]
     encoder = Mock(return_value=torch.zeros(1, 32))
-    model._mm_encoder = None
-    with pytest.raises(RuntimeError, match="requires a compiled encoder"):
-        model.warmup_mm_encoder()
     model._mm_encoder = BufferedVisionEncoder(
         encoder,
         specs_by_bucket={
@@ -370,9 +367,6 @@ def test_image_embeddings_match_upstream(visual):
     model.visual = visual
     model.has_vision = True
     model.mm_encoder_patch_buckets = [64, 128]
-    model._mm_encoder = None
-    with pytest.raises(RuntimeError, match="requires a compiled encoder"):
-        model._encode(pixels, torch.tensor(grids))
     model.compile_mm_encoder(lambda encoder: encoder)
 
     with torch.inference_mode():

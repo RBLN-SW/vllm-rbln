@@ -542,7 +542,7 @@ def test_video_frames_are_regrouped_per_video(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "first_rank, limits, compiled",
+    "first_rank, limits, has_encoder",
     [
         (True, {"image": 1, "video": 0}, True),
         (True, {"image": 0, "video": 1}, True),
@@ -551,7 +551,7 @@ def test_video_frames_are_regrouped_per_video(monkeypatch):
     ],
 )
 def test_the_encoder_compiles_only_where_the_tower_lives(
-    monkeypatch, first_rank, limits, compiled
+    monkeypatch, first_rank, limits, has_encoder
 ):
     monkeypatch.setattr(
         gemma4, "get_pp_group", lambda: SimpleNamespace(is_first_rank=first_rank)
@@ -573,19 +573,13 @@ def test_the_encoder_compiles_only_where_the_tower_lives(
     runtime = Mock()
     compile_fn = Mock(return_value=runtime)
 
-    if compiled:
-        with pytest.raises(RuntimeError, match="requires a compiled encoder"):
-            model.warmup_mm_encoder()
-        with pytest.raises(RuntimeError, match="requires a compiled encoder"):
-            model._encode_vision(*_image(3, 3, num_patches=9))
-    else:
-        model.warmup_mm_encoder()
     model.compile_mm_encoder(compile_fn)
 
-    if compiled:
+    if has_encoder:
         compile_fn.assert_called_once_with(built)
         assert model._mm_encoder.encoder is runtime
     else:
+        model.warmup_mm_encoder()
         compile_fn.assert_not_called()
         assert model._mm_encoder is None
 

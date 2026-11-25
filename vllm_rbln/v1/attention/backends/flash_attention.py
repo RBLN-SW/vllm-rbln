@@ -216,7 +216,6 @@ class RBLNFlashAttentionMetadataBuilder(
 
         self.block_size = kv_cache_spec.block_size
         self.chunked_prefill_size = rbln_config.max_prefill_chunk_size
-        self.enforce_eager = get_current_vllm_config().model_config.enforce_eager
         # Causality is per model, not per process: each model builds its
         # attention under its own config, and upstream sets `use_non_causal` on
         # the draft config only, so a non-causal drafter and a causal target
@@ -347,7 +346,7 @@ class RBLNFlashAttentionMetadataBuilder(
                     1,
                     prefill_chunk_size,
                     max_seq_len,
-                    dtype=torch.float16 if self.enforce_eager else torch.float32,
+                    dtype=torch.float32,
                 )
                 causal_mask = 1 - torch.triu(
                     torch.ones(1, 1, prefill_chunk_size, prefill_chunk_size),
@@ -370,7 +369,7 @@ class RBLNFlashAttentionMetadataBuilder(
                     1,
                     1,
                     max_seq_len,
-                    dtype=torch.float16 if self.enforce_eager else torch.float32,
+                    dtype=torch.float32,
                 )
                 for batch_index, batch_step in enumerate(seq_lens_cpu):
                     decode_attention_mask[batch_index, :, :, :, : batch_step + 1] = 1
@@ -451,7 +450,6 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         vllm_config = get_current_vllm_config()
         rbln_config: RBLNConfig = vllm_config.additional_config
         self.use_custom_kernel = rbln_config.use_custom_kernel
-        self.enforce_eager = vllm_config.model_config.enforce_eager
         self.device = vllm_config.device_config.device
         self.block_size = vllm_config.cache_config.block_size
         self.max_model_len = vllm_config.model_config.max_model_len
@@ -855,19 +853,9 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
 
         # 2. attention output reshape for attention backend return
         # attn_output = [batch,H*4,L,D] -> [batch,L,H*4,D] -> [batch*L,H*4,D]
-        if self.enforce_eager:
-            attn_output = attn_output.reshape(
-                b_size, self.num_heads, q_len, self.head_size
-            ).transpose(1, 2)
-            attn_output = attn_output.reshape(
-                b_size * q_len, self.num_heads, self.head_size
-            )
-        else:
-            attn_output = attn_output.view(
-                b_size, self.num_heads, q_len, self.head_size
-            ).transpose(1, 2)
-            attn_output = attn_output.view(
-                b_size * q_len, self.num_heads, self.head_size
-            )
+        attn_output = attn_output.view(
+            b_size, self.num_heads, q_len, self.head_size
+        ).transpose(1, 2)
+        attn_output = attn_output.view(b_size * q_len, self.num_heads, self.head_size)
 
         output.copy_(attn_output)

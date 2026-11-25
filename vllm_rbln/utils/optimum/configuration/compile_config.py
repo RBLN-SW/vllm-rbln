@@ -37,7 +37,7 @@ from vllm_rbln.utils.optimum.registry import (
     is_enc_dec_arch,
     is_generation_arch,
     is_multi_modal,
-    is_pooling_arch,
+    is_text_pooling_arch,
 )
 
 from .multimodal import MULTIMODAL_CONFIG_BUILDERS
@@ -364,8 +364,8 @@ def prepare_compile_config(vllm_config: VllmConfig) -> OptimumRBLNCompileConfig:
         model_cls, rbln_config = _for_decoder(
             vllm_config, optimum_overrides, kv_cache_capacity_fields
         )
-    elif is_pooling_arch(hf_config):
-        model_cls, rbln_config = _for_pooling(vllm_config, optimum_overrides)
+    elif is_text_pooling_arch(hf_config):
+        model_cls, rbln_config = _for_text_pooling(vllm_config, optimum_overrides)
     elif is_multi_modal(hf_config):
         model_cls, rbln_config = _for_multimodal(
             vllm_config, optimum_overrides, kv_cache_capacity_fields
@@ -449,7 +449,7 @@ def _for_decoder(
     return RBLNAutoModelForCausalLM, rbln_config
 
 
-def _for_pooling(
+def _for_text_pooling(
     vllm_config: VllmConfig,
     optimum_overrides: dict[str, Any],
 ) -> tuple[Any, dict[str, Any]]:

@@ -336,25 +336,9 @@ class TestBuildPrefillNonCausal:
         expected[..., CHUNK : 2 * CHUNK] = _lower_triangular(CHUNK)
         assert torch.equal(mask.float(), expected)
 
-    @pytest.mark.parametrize(
-        "eager, expected_dtype",
-        [(False, torch.float32), (True, torch.float16)],
-    )
-    def test_mask_dtype_follows_enforce_eager(
-        self, cfg_noncausal, eager, expected_dtype
-    ):
-        config = (
-            make_vllm_config(
-                max_model_len=MAX_LEN,
-                max_num_batched_tokens=CHUNK,
-                enforce_eager=True,
-                attention_config={"use_non_causal": True},
-            )
-            if eager
-            else cfg_noncausal
-        )
-        mask = self._mask(config, positions=torch.arange(4))
-        assert mask.dtype == expected_dtype
+    def test_noncausal_mask_dtype(self, cfg_noncausal):
+        mask = self._mask(cfg_noncausal, positions=torch.arange(4))
+        assert mask.dtype == torch.float32
 
 
 class TestBuildDecodeCausal:

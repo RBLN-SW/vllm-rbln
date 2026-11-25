@@ -287,8 +287,7 @@ class RBLNQwen3_5ForConditionalGeneration(
         if not self.has_vision:
             return
         buffered_encoder = self._mm_encoder
-        if buffered_encoder is None:
-            raise RuntimeError("Vision encoding requires a compiled encoder")
+        assert buffered_encoder is not None
         with torch.inference_mode():
             for bucket_size in self.mm_encoder_patch_buckets:
                 # Every entry valid: the warm-up never masks a key.
@@ -371,8 +370,7 @@ class RBLNQwen3_5ForConditionalGeneration(
     ) -> tuple[torch.Tensor, ...]:
         """Encode each temporal patch independently to preserve attention boundaries."""
         buffered_encoder = self._mm_encoder
-        if buffered_encoder is None:
-            raise RuntimeError("Vision encoding requires a compiled encoder")
+        assert buffered_encoder is not None
         grids = grid_thw.tolist()
         sizes = [math.prod(g) for g in grids]
         tokens = [h * w // self.visual.spatial_merge_size**2 for _, h, w in grids]

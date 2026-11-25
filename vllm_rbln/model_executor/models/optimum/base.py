@@ -14,6 +14,13 @@
 from dataclasses import dataclass
 
 import torch
+from vllm.config import ModelConfig
+from vllm.model_executor.layers.pooler.activations import PoolerNormalize
+from vllm.model_executor.layers.pooler.seqwise import (
+    EmbeddingPoolerHead,
+    SequencePooler,
+    get_seq_pooling_method,
+)
 from vllm.multimodal.inputs import BatchedTensorInputs
 
 
@@ -69,6 +76,20 @@ class ModelInputForRBLN:
     # MRoPE models: the (t, h, w) positions of the tokens above as
     # [3, padded_batch_size, seq_len], 0 in the padding rows. None otherwise.
     mrope_positions: torch.Tensor | None = None
+
+
+def build_embedding_pooler(model_config: ModelConfig) -> SequencePooler:
+    """Pool Optimum hidden states without a sentence-transformers projector."""
+    pooler_config = model_config.pooler_config
+    assert pooler_config is not None
+    return SequencePooler(
+        pooling=get_seq_pooling_method(pooler_config.get_seq_pooling_type()),
+        head=EmbeddingPoolerHead(
+            head_dtype=model_config.head_dtype,
+            projector=None,
+            activation=PoolerNormalize(),
+        ),
+    )
 
 
 version_error = RuntimeError(

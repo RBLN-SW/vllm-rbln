@@ -1311,8 +1311,7 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         if tower is None:
             return
         buffered_encoder = self._mm_encoder
-        if buffered_encoder is None:
-            raise RuntimeError("Vision encoding requires a compiled encoder")
+        assert buffered_encoder is not None
         with torch.inference_mode():
             for bucket_size in self.mm_encoder_patch_buckets:
                 # Every entry valid: the warm-up never masks a key.
@@ -1423,8 +1422,7 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         tower = self.vision_tower
         assert tower is not None
         buffered_encoder = self._mm_encoder
-        if buffered_encoder is None:
-            raise RuntimeError("Vision encoding requires a compiled encoder")
+        assert buffered_encoder is not None
         t, h, w = grid_thw
         frames = tower.vision_model.vision_segment_max_frames
         if frames is None:
