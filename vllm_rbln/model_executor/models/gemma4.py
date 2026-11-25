@@ -170,7 +170,9 @@ class _RBLNGemma4VisionEncoder(nn.Module):
             v = v.repeat_interleave(attn.num_key_value_groups, dim=0)
             scores = torch.matmul(q, k.transpose(1, 2)) * attn.scaling + key_bias
             out = torch.matmul(torch.softmax(scores, dim=-1), v)
-            out = out.transpose(0, 1).reshape(residual.shape)
+            # Merge the heads from the 4D layout: the 3D merge leaves a transpose
+            # the following layernorm then runs behind.
+            out = out.unsqueeze(0).transpose(1, 2).reshape(residual.shape)
             hidden_states = residual + layer.post_attention_layernorm(attn.o_proj(out))
             residual = hidden_states
             hidden_states = layer.pre_feedforward_layernorm(hidden_states)
