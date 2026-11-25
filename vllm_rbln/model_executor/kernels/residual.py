@@ -12,26 +12,45 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""fused_add_rms_norm on the residual ops the compiler cuts across the chiplets.
+"""A pre-norm block boundary on the residual ops the compiler cuts across chiplets.
 
 A pre-norm layer adds a block's output to the residual and normalizes the sum for
-the next block in one fused_add_rms_norm. The "rbln" implementation splits that
-boundary in two on prefill steps: rbln_custom_ops::residual_write leaves the new
-residual cut by tokens, and residual_read gathers the next block's input.
-Decode steps keep the native op: at decode batch sizes the cut's scatter and
-gather cost more than the norm work it splits across the chiplets.
+the next block in one call. On prefill steps that call runs on two ops:
+rbln_custom_ops::residual_write leaves the new residual cut by tokens, and a read
+gathers the next block's input. Decode steps do not cut: at decode batch sizes the
+cut's scatter and gather cost more than the norm work it splits across the chiplets.
+
+- RMSNorm: the "rbln" implementation of the fused_add_rms_norm IR op, read with
+  residual_read; decode steps keep the native op.
+- GemmaRMSNorm (weight stored zero-centered, scaled by 1 + w): RBLNGemmaRMSNorm,
+  read with zero_centered_residual_read, which takes w as stored.
 """
 
 import torch
 from torch import Tensor
 from vllm import ir
+from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 
 from vllm_rbln.utils import is_prefill_step
 
-# The architectures whose fused_add_rms_norm puts "rbln" first.
+# The architectures whose block boundaries run on the residual ops.
 RESIDUAL_CUT_ARCHITECTURES = frozenset(
-    {"AXK2ForCausalLM", "DeepseekV3ForCausalLM", "DeepseekV32ForCausalLM"}
+    {
+        "AXK2ForCausalLM",
+        "DeepseekV3ForCausalLM",
+        "DeepseekV32ForCausalLM",
+        "MiniMaxM3SparseForCausalLM",
+        "MiniMaxM3SparseForConditionalGeneration",
+    }
 )
+
+
+def cuts_residual(vllm_config: VllmConfig) -> bool:
+    model_config = vllm_config.model_config
+    return model_config is not None and bool(
+        RESIDUAL_CUT_ARCHITECTURES.intersection(model_config.architectures)
+    )
 
 
 def _supports_args(
@@ -59,3 +78,33 @@ def fused_add_rms_norm(
         )
     residual = torch.ops.rbln_custom_ops.residual_write(x_residual, x)
     return torch.ops.rbln_custom_ops.residual_read(residual, weight, epsilon), residual
+
+
+class RBLNGemmaRMSNorm(GemmaRMSNorm):
+    """GemmaRMSNorm whose block-boundary call runs on the residual ops.
+
+    Upstream hands the IR op the computed 1 + w: a constant the decode graph cannot
+    share once prefill feeds it to a kernel, and one the runtime cannot load by the
+    weight's name. So both steps read with zero_centered_residual_read(w); the
+    compiler cuts it on prefill chunks only, and decode adds the residual as the
+    native op does.
+    """
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+        super().__init__(hidden_size, eps)
+        self.cuts_residual = cuts_residual(get_current_vllm_config())
+
+    def forward(
+        self, x: Tensor, residual: Tensor | None = None
+    ) -> Tensor | tuple[Tensor, Tensor]:
+        if residual is None or not self.cuts_residual or x.dim() != 3:
+            return super().forward(x, residual)
+        ops = torch.ops.rbln_custom_ops
+        if is_prefill_step():
+            residual = ops.residual_write(residual, x)
+        else:
+            residual = x + residual
+        x = ops.zero_centered_residual_read(
+            residual, self.weight, self.variance_epsilon
+        )
+        return x, residual

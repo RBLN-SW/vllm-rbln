@@ -78,12 +78,9 @@ def prioritize_ir_ops(
     vllm_config: "VllmConfig", priority: "IrOpPriorityConfig"
 ) -> None:
     """Put the residual-cut fused_add_rms_norm first for the models that run it."""
-    from vllm_rbln.model_executor.kernels.residual import RESIDUAL_CUT_ARCHITECTURES
+    from vllm_rbln.model_executor.kernels.residual import cuts_residual
 
-    model_config = vllm_config.model_config
-    if model_config is not None and RESIDUAL_CUT_ARCHITECTURES.intersection(
-        model_config.architectures
-    ):
+    if cuts_residual(vllm_config):
         priority.fused_add_rms_norm = ["rbln", *priority.fused_add_rms_norm]
 
 
