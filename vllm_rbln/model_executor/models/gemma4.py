@@ -24,7 +24,6 @@ from torch import nn
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
 from vllm.forward_context import get_forward_context
-from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.models.gemma4 import Gemma4Attention, Gemma4MLP
 from vllm.model_executor.models.gemma4_mm import (
@@ -46,8 +45,6 @@ from vllm_rbln.model_executor.models.interfaces import (
     SupportsRBLNMultiModal,
 )
 from vllm_rbln.v1.attention.kv_cache_bindings import resolve_kv_cache
-
-logger = init_logger(__name__)
 
 
 def _build_mm_prefix_sliding_mask(
@@ -338,24 +335,6 @@ class RBLNGemma4ForConditionalGeneration(
         if not any(mm_config.get_limit_per_prompt(m) > 0 for m in ("image", "video")):
             return
         budgets = self.encoder_token_budgets(vllm_config)
-        rbln_config = vllm_config.additional_config
-        chunk_ceiling = max(
-            (
-                b
-                for b in _SUPPORTED_SOFT_TOKENS
-                if b <= rbln_config.max_prefill_chunk_size
-            ),
-            default=0,
-        )
-        if not rbln_config.encoder_token_budgets and budgets[-1] < chunk_ceiling:
-            logger.warning(
-                "Gemma4 compiles vision encoder budgets up to %d soft tokens, not "
-                "the %d the longest prefill chunk holds: "
-                "--long-prefill-token-threshold or --max-num-scheduled-tokens "
-                "shortens the prefill step, and a request's image may not exceed it.",
-                budgets[-1],
-                chunk_ceiling,
-            )
         if mm_config.get_limit_per_prompt("image") > 0:
             default = mm_soft_token_default(
                 MULTIMODAL_REGISTRY.create_processor(vllm_config.model_config).info
@@ -370,13 +349,6 @@ class RBLNGemma4ForConditionalGeneration(
                     "(--rbln-prefill-chunk-size, and --long-prefill-token-threshold "
                     "or --max-num-scheduled-tokens where set)."
                 )
-            logger.info(
-                "Gemma4 vision encoder budgets %s: an image takes %d soft tokens "
-                "by default and up to %d when a request asks.",
-                budgets,
-                default,
-                budgets[-1],
-            )
         pool = self.config.vision_config.pooling_kernel_size
         self.mm_encoder_patch_buckets = [budget * pool**2 for budget in budgets]
 
