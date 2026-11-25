@@ -347,9 +347,11 @@ class TestSubBlockHitUnderTheSchedulerBlock:
         sharer = make_request("1", list(range(12)) + [100 + i for i in range(9)], 8)
         sched.add_request(sharer)
         out = sched.schedule()
+        assert sharer.num_computed_tokens - out.num_scheduled_tokens["1"] == 12
         assert [(op.group_id, op.num_tokens) for op in out.kv_cache_copy_ops] == [
-            (0, SUB_BLOCK_SIZE),
-            (1, SUB_BLOCK_SIZE),
+            (0, 12),
+            (1, 8),
+            (1, 4),
         ]
 
 
