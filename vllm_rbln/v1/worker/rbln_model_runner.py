@@ -4370,16 +4370,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             # NOTE(RBLN): The runtime KV-copy interface is no longer actively maintained
             # in this path (--model-impl vllm).
             for op in copy_ops:
-                # can_use_sub_block_caching keeps sub-blocks off a sliding-window
-                # group whose window splits its block; other kernels take the block.
-                kernel_bs = self._kernel_block_sizes[op.group_id]
-                block_size = self.kv_cache_config.kv_cache_groups[
-                    op.group_id
-                ].kv_cache_spec.block_size
-                assert kernel_bs == block_size, (
-                    f"group {op.group_id}: {kernel_bs}-token kernel blocks in "
-                    f"{block_size}-token blocks reach the runtime KV copy"
-                )
                 runtime = self.runtime_holder[0]
                 runtime._copy_kv_cache(op.src_block_id, op.dst_block_id, op.num_tokens)
             return

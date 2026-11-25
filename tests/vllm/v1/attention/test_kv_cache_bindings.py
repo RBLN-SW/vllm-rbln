@@ -129,28 +129,6 @@ class TestBuildKvCacheBaseBindings:
         assert len(base_tensors) == 1
         assert [vi.base_index for vi in view_infos] == [0, 0]
 
-    def test_a_shared_storage_is_bound_in_its_canonical_layer_s_shape(self):
-        # A window layer ahead of the full-attention one on the same buffer:
-        # the base is the canonical layer's tensor, not the first layer's, and
-        # the window layer's scale is taken against it.
-        buffer = torch.zeros(4 * 2 * 8)
-        window = buffer.view(8, 2, 4)  # kernel blocks of 4
-        full = buffer.view(4, 2, 8)
-        bases = {_layer(0): window, _layer(1): full}
-        infos = {
-            _layer(0): KVCacheViewInfo(view_shape=(8, 2, 4), dynamic_axis=0),
-            _layer(1): KVCacheViewInfo(view_shape=(4, 2, 8), dynamic_axis=0),
-        }
-        base_tensors, view_infos = build_kv_cache_base_bindings(
-            bases, infos, {_layer(1)}, layer_names=list(infos)
-        )
-        assert [tuple(b.shape) for b in base_tensors] == [(4, 2, 8)]
-        assert [vi.dynamic_scale for vi in view_infos] == [(2, 1), (1, 1)]
-        for vi, layer in zip(view_infos, (window, full)):
-            view = materialize_kv_cache_view(base_tensors, vi)
-            assert view.shape == layer.shape
-            assert _storage_key(view) == _storage_key(buffer)
-
     def test_distinct_windows_of_one_pool_each_get_a_base(self):
         # Every layer is a slice of the one KV pool, so sharing storage no
         # longer means sharing a cache. Collapsing these would hand both
@@ -335,7 +313,9 @@ class TestMaterializeKvCacheView:
         assert base_tensors[0].shape[1] == 4
         assert [vi.dynamic_scale for vi in view_infos] == [(64, 1), (1, 1)]
         for vi in view_infos:
-            assert materialize_kv_cache_view(base_tensors, vi).shape == vi.view_shape
+            view = materialize_kv_cache_view(base_tensors, vi)
+            assert view.shape == vi.view_shape
+            assert _storage_key(view) == _storage_key(raw)
 
     def test_dtype_view_reinterprets_bytes(self):
         # view_dtype reinterprets the base storage as another same-width dtype

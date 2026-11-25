@@ -1807,8 +1807,6 @@ class TestProcessKvCacheCopyOps:
             kv_caches=[],
             kv_cache_names=[],
             kv_cache_block_axes={},
-            kv_cache_config=_copy_groups(["l0"]),
-            _kernel_block_sizes=[8],
             model_config=SimpleNamespace(use_mla=False, enforce_eager=False),
             runtime_holder=[runtime],
             rbln_config=RBLNConfig(),

@@ -99,6 +99,7 @@ def make_kv_cache_config(
     # from byte 0 and the backing allocation is sized by the widest one, so
     # every tensor reports the same total size.
     specs = specs or [spec] * len(groups)
+    assert len({s.page_size_bytes for s in specs}) == 1, "one page size per config"
     page = specs[0].page_size_bytes
     layer_stride = page * num_blocks
     size = max(len(layer_names) for layer_names in groups) * layer_stride

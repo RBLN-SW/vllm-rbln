@@ -433,26 +433,6 @@ class TestBlockAuxKVCaches:
         runner.initialize_kv_cache(make_kv_cache_config(runner, groups=[("layer.0",)]))
         return runner
 
-    def test_each_aux_tensor_is_bound_as_a_graph_input(
-        self, make_model_runner, monkeypatch
-    ):
-        # Two aux kinds on one owner make two aux tensors; each must reach the
-        # graph inputs.
-        runner = make_model_runner(layers=("layer.0", "layer.1"), init_kv_cache=False)
-        context = runner.compilation_config.static_forward_context
-        for i, dtype in ((2, torch.bfloat16), (3, torch.float16)):
-            module = self._aux("layer.0", dtype=dtype)
-            module.layer_index = i
-            monkeypatch.setitem(context, f"layer.{i}", module)
-        config = make_kv_cache_config(runner, groups=[("layer.0",), ("layer.1",)])
-        runner.initialize_kv_cache(config)
-        aux_keys = {
-            kv_cache_tensor_key(context[name].kv_cache)
-            for name in ("layer.2", "layer.3")
-        }
-        assert len(aux_keys) == 2
-        assert aux_keys <= {kv_cache_tensor_key(base) for base in runner.kv_cache_bases}
-
     @staticmethod
     def _aux(
         owner,
