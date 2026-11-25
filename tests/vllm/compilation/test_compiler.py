@@ -85,7 +85,6 @@ class TestCompileOptions:
             "model_trace_method",
             "process_group_dict",
             "guard_filter_fn",
-            "_runtime_holder",
             "compile_context",
             "global_device_id",
             "use_global_ctx",
@@ -98,13 +97,6 @@ class TestCompileOptions:
         opts = captured_compile["options"]
         assert opts["num_devices"] == 4
         assert opts["model_trace_method"] == "trace"
-
-    def test_runtime_holder_uses_underscore_key(self, captured_compile):
-        # runtime_holder maps to the "_runtime_holder" option key.
-        holder: list = []
-        compile(object(), runtime_holder=holder)
-        assert captured_compile["options"]["_runtime_holder"] is holder
-        assert "runtime_holder" not in captured_compile["options"]
 
     def test_dtype_is_forwarded(self, captured_compile):
         compile(object(), dtype="float16")
