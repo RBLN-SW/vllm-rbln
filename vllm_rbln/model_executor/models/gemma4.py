@@ -284,7 +284,7 @@ def mm_encoder_token_budgets(
 
 
 class RBLNGemma4ProcessingInfo(Gemma4ProcessingInfo):
-    """Upstream's info, sizing an image by the compiled encoder budgets."""
+    """Upstream's info, with the soft token budgets the encoder is compiled for."""
 
     @cached_property
     def mm_encoder_token_budgets(self) -> list[int]:
@@ -292,13 +292,6 @@ class RBLNGemma4ProcessingInfo(Gemma4ProcessingInfo):
         rbln_config = getattr(self.ctx.model_config, "_rbln_config", None)
         assert rbln_config is not None, "the vllm model path hook did not run"
         return mm_encoder_token_budgets(self, rbln_config)
-
-    def get_mm_max_tokens_per_item(
-        self, seq_len: int, mm_counts: Mapping[str, int]
-    ) -> Mapping[str, int] | None:
-        tokens = super().get_mm_max_tokens_per_item(seq_len, mm_counts)
-        assert tokens is not None
-        return {**tokens, "image": self.mm_encoder_token_budgets[-1]}
 
 
 class RBLNGemma4MultiModalProcessor(Gemma4MultiModalProcessor):

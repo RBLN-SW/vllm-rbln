@@ -403,41 +403,18 @@ def test_an_unsupported_default_is_refused():
         gemma4.mm_soft_token_default(info)
 
 
-def _rbln_info(monkeypatch, *, chunk, upstream_tokens=None):
-    """RBLN's info over a model config the platform hook has seen."""
+@pytest.mark.parametrize("chunk, largest", [(512, 280), (2048, 1120)])
+def test_the_info_reads_the_budgets_from_the_hooked_model_config(
+    monkeypatch, chunk, largest
+):
     monkeypatch.setattr(gemma4, "mm_soft_token_default", lambda info: 280)
-    monkeypatch.setattr(
-        gemma4.Gemma4ProcessingInfo,
-        "get_mm_max_tokens_per_item",
-        lambda self, seq_len, mm_counts: upstream_tokens,
-    )
     info = gemma4.RBLNGemma4ProcessingInfo.__new__(gemma4.RBLNGemma4ProcessingInfo)
     info.ctx = SimpleNamespace(
         model_config=SimpleNamespace(
             _rbln_config=RBLNConfig(prefill_chunk_size=[chunk])
         )
     )
-    return info
-
-
-@pytest.mark.parametrize("chunk, largest", [(512, 280), (2048, 1120)])
-def test_the_info_reads_the_budgets_from_the_hooked_model_config(
-    monkeypatch, chunk, largest
-):
-    info = _rbln_info(monkeypatch, chunk=chunk)
     assert info.mm_encoder_token_budgets[-1] == largest
-
-
-def test_the_encoder_cache_is_sized_by_the_largest_budget_not_the_default(
-    monkeypatch,
-):
-    info = _rbln_info(
-        monkeypatch, chunk=2048, upstream_tokens={"image": 280, "video": 9}
-    )
-    assert info.get_mm_max_tokens_per_item(32768, {"image": 1}) == {
-        "image": 1120,
-        "video": 9,
-    }
 
 
 @pytest.mark.parametrize(
