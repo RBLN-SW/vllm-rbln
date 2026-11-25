@@ -417,6 +417,7 @@ class TestSamplePadding:
             ),
             max_num_reqs=8,
             rejection_sampler=rejection_sampler,
+            _rejection_logits_dtype=torch.float32,
         )
         return runner, rejection_sampler
 
@@ -431,6 +432,23 @@ class TestSamplePadding:
 
         padded_metadata = rejection_sampler.call_args.args[0]
         assert len(padded_metadata.num_draft_tokens) == 4
+
+    @pytest.mark.parametrize("logits_dtype", [torch.bfloat16, torch.float32])
+    def test_compiled_rejection_sampler_uses_head_dtype(self, logits_dtype):
+        output = SamplerOutput(
+            sampled_token_ids=torch.zeros((4, 3), dtype=torch.int32),
+            logprobs_tensors=None,
+        )
+        runner, rejection_sampler = self._runner(output, sampler=True)
+        logits = torch.ones((4, 10), dtype=logits_dtype)
+
+        runner._sample(logits, _spec_decode_metadata([1, 1]))
+
+        sampler_logits = rejection_sampler.call_args.args[2]
+        assert sampler_logits.dtype == torch.float32
+        assert torch.equal(sampler_logits, logits)
+        if logits_dtype == torch.float32:
+            assert sampler_logits is logits
 
     def test_torch_rejection_sampler_keeps_live_batch_metadata(self):
         output = SamplerOutput(
@@ -1019,6 +1037,7 @@ def test_rejection_sampler_warmup_asks_for_the_synthetic_variant():
         model_config=SimpleNamespace(get_vocab_size=lambda: 10),
         device=torch.device("cpu"),
         dtype=torch.bfloat16,
+        _rejection_logits_dtype=torch.bfloat16,
         bucketing_manager=SimpleNamespace(
             decode_batch_buckets=[2, 4], max_batch_size=4
         ),
@@ -1041,7 +1060,8 @@ def test_rejection_sampler_warmup_asks_for_the_synthetic_variant():
         assert call.kwargs["synthetic_conditional_rates"] is rates
 
 
-def test_rejection_sampler_warmup_uses_per_stage_batch_bound():
+@pytest.mark.parametrize("logits_dtype", [torch.bfloat16, torch.float32])
+def test_rejection_sampler_warmup_uses_per_stage_batch_bound(logits_dtype):
     rejection_sample = MagicMock()
     runner = _make_runner_stub(
         rbln_config=RBLNConfig(use_custom_sampler=True),
@@ -1051,6 +1071,7 @@ def test_rejection_sampler_warmup_uses_per_stage_batch_bound():
         model_config=SimpleNamespace(get_vocab_size=lambda: 10),
         device=torch.device("cpu"),
         dtype=torch.bfloat16,
+        _rejection_logits_dtype=torch.float32,
         bucketing_manager=SimpleNamespace(
             decode_batch_buckets=[2, 4], max_batch_size=4
         ),
@@ -1065,7 +1086,7 @@ def test_rejection_sampler_warmup_uses_per_stage_batch_bound():
         ),
     )
 
-    decode_logits = torch.zeros(12, 10, dtype=torch.float32)
+    decode_logits = torch.zeros(12, 10, dtype=logits_dtype)
     runner._warmup_sampler_decode_batches(decode_logits)
 
     assert rejection_sample.call_args_list[0].args[7].all_random

@@ -411,6 +411,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 self.device,
                 use_rbln_sampler=self.rbln_config.use_custom_sampler,
             )
+            if self.rbln_config.use_custom_sampler:
+                self._rejection_logits_dtype = model_config.head_dtype
 
         self.num_spec_tokens = 0
         if self.speculative_config:
@@ -1767,6 +1769,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             )
         else:
             if self.rbln_config.use_custom_sampler:
+                # Keep the sampler's input dtype tied to the configured head.
+                if logits.dtype != self._rejection_logits_dtype:
+                    logits = logits.to(dtype=self._rejection_logits_dtype)
                 bucket = self.bucketing_manager.max_batch_size
                 spec_decode_metadata = _pad_spec_decode_metadata(
                     spec_decode_metadata, bucket
@@ -4142,6 +4147,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         """Warm the device rejection-sample op at the decode batch size it will see."""
         num_spec = self.num_spec_tokens
         vocab_size = logits.size(-1)
+        logits_dtype = self._rejection_logits_dtype
         # _sample pins the request axis to the per-PP-stage decode bound.
         batch_size = self.bucketing_manager.max_batch_size
         num_tokens = batch_size * num_spec
@@ -4149,7 +4155,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         draft_token_ids = torch.zeros(
             num_tokens, dtype=torch.int32, device=logits.device
         )
-        target_logits = logits.new_zeros((num_tokens, vocab_size))
+        target_logits = logits.new_zeros((num_tokens, vocab_size), dtype=logits_dtype)
         cu_num_draft_tokens = torch.arange(
             num_spec,
             num_tokens + 1,
@@ -4157,7 +4163,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             dtype=torch.int32,
             device=logits.device,
         )
-        bonus_logits = logits.new_zeros((batch_size, vocab_size))
+        bonus_logits = logits.new_zeros((batch_size, vocab_size), dtype=logits_dtype)
         dummy_sampling_metadata = SamplingMetadata(
             temperature=None,
             all_greedy=True,
