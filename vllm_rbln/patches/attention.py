@@ -33,6 +33,7 @@ from vllm_rbln.patches.registry import MIN_PATCH_PRIORITY
 from vllm_rbln.v1.attention.backends.flash_attention import RBLNFlashAttentionBackend
 from vllm_rbln.v1.attention.kv_cache_bindings import resolve_kv_cache
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
+from vllm_rbln.v1.spec_decode import pass_state
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention import MLAAttention
@@ -81,12 +82,9 @@ def patched_get_attention_context(
     forward_context = get_forward_context()
     attn_metadata_raw = forward_context.attn_metadata
     attn_metadata: AttentionMetadata
+    attn_metadata_raw = pass_state.select(attn_metadata_raw)
     if isinstance(attn_metadata_raw, dict):
         attn_metadata = attn_metadata_raw[layer_name]
-    elif isinstance(attn_metadata_raw, list):
-        # list[dict[str, AttentionMetadata]]: used in speculative decoding
-        # where [0] is the base-model (non-speculative) metadata dict.
-        attn_metadata = attn_metadata_raw[0][layer_name]
     else:
         attn_metadata = attn_metadata_raw
     attn_layer: Attention | MLAAttention = forward_context.no_compile_layers[layer_name]

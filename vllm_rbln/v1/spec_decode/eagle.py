@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -37,6 +39,7 @@ from vllm_rbln.model_executor.models.interfaces import (
     supports_rbln_multimodal_embeddings,
 )
 from vllm_rbln.platform import use_device_tensor
+from vllm_rbln.v1.spec_decode import pass_state
 from vllm_rbln.v1.spec_decode.utils import (
     eagle_prepare_inputs_padded,
     eagle_prepare_next_token_padded,
@@ -51,6 +54,15 @@ if TYPE_CHECKING:
     from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class _TailInputs:
+    attn_metadata: list[dict[str, object]]
+    positions: torch.Tensor
+    num_reqs_padded: int
+    num_padded_tokens: int | None
+    num_tokens_across_dp: torch.Tensor | None
 
 
 class RBLNEagleProposer(EagleProposer):
@@ -92,6 +104,8 @@ class RBLNEagleProposer(EagleProposer):
         self.draft_id_to_target_id: torch.Tensor | None = None
         # Whether a draft forward joins the DP all-gather; see `load_model`.
         self.draft_has_moe = False
+        self.tail_executable: Callable[..., torch.Tensor] | None = None
+        self._tail_buffers: dict[tuple, torch.Tensor] = {}
 
     def propose(
         self,
@@ -156,6 +170,49 @@ class RBLNEagleProposer(EagleProposer):
         )
         inputs_embeds = None
 
+        # A strict producer never verifies a draft, and has no decoding peer to
+        # wait for. An intermediate chunk's drafts are discarded, but under DP a
+        # MoE drafter still runs every pass for possible decoding peers.
+        run_tail = (
+            self.num_speculative_tokens > 1
+            and not self.runner.is_strict_kv_producer
+            and not (
+                self.runner.is_intermediate_chunked_prefill
+                and not (
+                    self.vllm_config.parallel_config.data_parallel_size > 1
+                    and self.draft_has_moe
+                )
+            )
+        )
+        if (
+            run_tail
+            and self.allowed_attn_types is not None
+            and not isinstance(attn_metadata, self.allowed_attn_types)
+        ):
+            raise ValueError(
+                f"Unsupported attention metadata type for speculative "
+                "decoding with num_speculative_tokens > 1: "
+                f"{type(attn_metadata)}. Supported types are: "
+                f"{self.allowed_attn_types}"
+            )
+        # Everything the tail reads from the host is staged before the first
+        # pass launches, so nothing between the two launches waits on it.
+        tail = (
+            self._prepare_tail(
+                common_attn_metadata,
+                target_positions[token_indices_to_sample],
+                num_reqs,
+                num_rejected_tokens,
+                mrope_positions=(
+                    target_mrope_positions[:, token_indices_to_sample]
+                    if target_mrope_positions is not None
+                    else None
+                ),
+            )
+            if run_tail
+            else None
+        )
+
         with set_forward_context(
             per_layer_attn_metadata,
             self.vllm_config,
@@ -173,52 +230,25 @@ class RBLNEagleProposer(EagleProposer):
                 **self._stage_mm_inputs(input_ids, is_prefill, mm_embed_inputs),
             )
 
-        # A strict producer never verifies a draft, and has no decoding peer to
-        # wait for.
         if self.runner.is_strict_kv_producer:
             return draft_ids.new_zeros((num_reqs, self.num_speculative_tokens))
-
-        # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1:
             draft_tokens_ids = self._to_target_token_ids(draft_ids[:num_reqs])
             return draft_tokens_ids.view(-1, 1)
-
-        # Early exit if it's an intermediate chunked prefill,
-        # since the draft tokens are discarded anyway.
-        # Under DP with MoE drafters, we still need to run the full
-        # drafter steps for possible decoding peers.
-        if self.runner.is_intermediate_chunked_prefill and not (
-            self.vllm_config.parallel_config.data_parallel_size > 1
-            and self.draft_has_moe
-        ):
+        if tail is None:
             return draft_ids.new_zeros((num_reqs, self.num_speculative_tokens))
+        return self._run_tail(tail, draft_ids, hidden_states, num_reqs)
 
-        positions = target_positions[token_indices_to_sample]
-        mrope_positions = (
-            target_mrope_positions[:, token_indices_to_sample]
-            if target_mrope_positions is not None
-            else None
-        )
-
-        # `hidden_states` is deliberately not gathered here -- #821 moved
-        # that gather inside `model_wrapper`. Doing it again would index an
-        # already (num_reqs_padded, hidden_size) tensor with token-space
-        # indices and raise on the first decode.
-        draft_token_ids = self._to_target_token_ids(draft_ids[:num_reqs])
-
-        if self.allowed_attn_types is not None and not isinstance(
-            attn_metadata, self.allowed_attn_types
-        ):
-            raise ValueError(
-                f"Unsupported attention metadata type for speculative "
-                "decoding with num_speculative_tokens > 1: "
-                f"{type(attn_metadata)}. Supported types are: "
-                f"{self.allowed_attn_types}"
-            )
-
-        # Generate the remaining draft tokens.
-        draft_token_ids_list = [draft_token_ids]
-
+    def _prepare_tail(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        positions: torch.Tensor,
+        num_reqs: int,
+        num_rejected_tokens: torch.Tensor | None,
+        pinned_num_tokens_padded: int | None = None,
+        mrope_positions: torch.Tensor | None = None,
+    ) -> _TailInputs:
+        """Per-pass attention metadata and the first tail position, staged."""
         # it mutates seq_lens in place; detach from the runner's persistent buffer.
         common_attn_metadata.seq_lens = common_attn_metadata.seq_lens.clone()
         common_attn_metadata.num_actual_tokens = num_reqs
@@ -228,9 +258,7 @@ class RBLNEagleProposer(EagleProposer):
 
         # In padded drafter batch, we need to adjust the sequence lengths
         # to remove the "padding" (i.e. rejected tokens).
-        # Only apply this adjustment when we have rejected tokens
-        # (i.e., not the first proposal).
-        if self.num_speculative_tokens > 1 and num_rejected_tokens is not None:
+        if num_rejected_tokens is not None:
             common_attn_metadata.seq_lens -= num_rejected_tokens
 
         batch_desc, num_tokens_across_dp = self._determine_batch_execution_and_padding(
@@ -238,68 +266,118 @@ class RBLNEagleProposer(EagleProposer):
             num_reqs,
             False,
             first_pass=False,
+            pinned_num_tokens_padded=pinned_num_tokens_padded,
         )
         num_reqs_padded = batch_desc.num_reqs_padded
-        num_padded_tokens = batch_desc.num_tokens_padded
-        for token_index in range(self.num_speculative_tokens - 1):
-            self.input_ids[:num_reqs] = draft_token_ids_list[-1].int()
-            positions = positions.view(-1) + 1
-            if mrope_positions is not None:
-                mrope_positions = (mrope_positions[:1] + 1).expand_as(mrope_positions)
 
+        positions = positions.view(-1)
+        first_positions = positions + 1
+        per_pass: list[dict[str, object]] = []
+        for pass_idx in range(self.num_speculative_tokens - 1):
+            positions = positions + 1
             exceeds_max_model_len = positions[:num_reqs] >= self.max_model_len
             common_attn_metadata.seq_lens += 1
             common_attn_metadata.seq_lens.masked_fill_(exceeds_max_model_len, 1)
-
-            per_layer_attn_metadata.clear()
-            for attn_group in self.draft_attn_groups:
-                attn_metadata = attn_group.get_metadata_builder().build(
-                    common_attn_metadata=common_attn_metadata,
-                    positions=positions,
+            per_pass.append(
+                self._build_attn_metadata(
+                    common_attn_metadata,
+                    positions,
                     is_prefill=False,
                     batch_pad=num_reqs_padded,
-                    is_prompt_sorted=self.runner.sort_batch_by_length,
-                )
-                self.runner.bind_kv_cache_to_metadata(attn_metadata)
-                for layer_name in attn_group.layer_names:
-                    per_layer_attn_metadata[layer_name] = attn_metadata
-
-            staged_input_ids, staged_positions, staged_hidden_states, _ = (
-                self._preprocess(
-                    num_reqs,
-                    num_reqs_padded,
-                    num_reqs,
-                    positions[:num_reqs],
-                    hidden_states[:num_reqs],
-                    is_prefill=False,
-                    mrope_positions=mrope_positions,
+                    staging_slot=pass_idx + 1,
                 )
             )
 
-            # Run the model.
-            with set_forward_context(
-                per_layer_attn_metadata,
-                self.vllm_config,
-                num_tokens=num_reqs,
-                num_tokens_across_dp=num_tokens_across_dp,
-                num_padded_tokens=num_padded_tokens,
-                **self.runner.kv_cache_forward_context_kwargs(),
-            ):
-                hidden_states, draft_ids = self.model_executable(
-                    input_ids=staged_input_ids,
-                    positions=staged_positions,
-                    hidden_states=staged_hidden_states,
-                    inputs_embeds=inputs_embeds,
-                    token_indices_to_sample=None,
-                )
-            # Mapped before the feed-back above: the draft head's input
-            # embedding is in target space even when its output head is not.
-            draft_token_ids = self._to_target_token_ids(draft_ids[:num_reqs])
-            draft_token_ids_list.append(draft_token_ids)
+        if mrope_positions is None:
+            host = torch.zeros((num_reqs_padded, 1), dtype=first_positions.dtype)
+            host[:num_reqs, 0] = first_positions[:num_reqs]
+        else:
+            first_mrope = mrope_positions[:1, :num_reqs] + 1
+            host = torch.zeros((3, num_reqs_padded, 1), dtype=first_mrope.dtype)
+            host[:, :num_reqs, 0] = first_mrope
+        staged_positions = self._tail_buffer("positions", host.shape, host.dtype)
+        staged_positions.copy_(host)
+        return _TailInputs(
+            attn_metadata=per_pass,
+            positions=staged_positions,
+            num_reqs_padded=num_reqs_padded,
+            num_padded_tokens=batch_desc.num_tokens_padded,
+            num_tokens_across_dp=num_tokens_across_dp,
+        )
 
-        # [batch_size, num_speculative_tokens]
-        draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
-        return draft_token_ids
+    def _run_tail(
+        self,
+        tail: _TailInputs,
+        draft_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        num_reqs: int,
+    ) -> torch.Tensor:
+        """Passes 2..k in one region, fed by the first pass's device outputs."""
+        rows = tail.num_reqs_padded
+        if draft_ids.shape[0] != rows:
+            # The first pass ran a different batch (prefill, or a DP peer's
+            # bucket), so its outputs are re-padded to the tail's.
+            n = min(draft_ids.shape[0], rows)
+            ids = self._tail_buffer("ids", (rows,), draft_ids.dtype)
+            ids.zero_()
+            ids[:n].copy_(draft_ids[:n])
+            hidden = self._tail_buffer(
+                "hidden", (rows, self.hidden_size), hidden_states.dtype
+            )
+            hidden.zero_()
+            hidden[:n].copy_(hidden_states.view(-1, self.hidden_size)[:n])
+            draft_ids, hidden_states = ids, hidden
+
+        assert self.tail_executable is not None
+        with set_forward_context(
+            tail.attn_metadata,
+            self.vllm_config,
+            num_tokens=num_reqs,
+            num_tokens_across_dp=tail.num_tokens_across_dp,
+            num_padded_tokens=tail.num_padded_tokens,
+            **self.runner.kv_cache_forward_context_kwargs(),
+        ):
+            all_ids = self.tail_executable(
+                draft_ids=draft_ids,
+                hidden_states=hidden_states,
+                positions=tail.positions,
+            )
+        # [batch_size, num_speculative_tokens], already in target space: the one
+        # D2H of the whole draft.
+        return all_ids[:num_reqs].cpu().long()
+
+    def _tail_buffer(
+        self, name: str, shape: tuple[int, ...], dtype: torch.dtype
+    ) -> torch.Tensor:
+        key = (name, tuple(shape), dtype)
+        if (buf := self._tail_buffers.get(key)) is None:
+            buf = torch.empty(shape, dtype=dtype, device=self.device)
+            self._tail_buffers[key] = buf
+        return buf
+
+    def _build_attn_metadata(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        positions: torch.Tensor,
+        *,
+        is_prefill: bool,
+        batch_pad: int,
+        staging_slot: int = 0,
+    ) -> dict[str, object]:
+        per_layer: dict[str, object] = {}
+        for attn_group in self.draft_attn_groups:
+            attn_metadata = attn_group.get_metadata_builder().build(
+                common_attn_metadata=common_attn_metadata,
+                positions=positions,
+                is_prefill=is_prefill,
+                batch_pad=batch_pad,
+                is_prompt_sorted=self.runner.sort_batch_by_length,
+                staging_slot=staging_slot,
+            )
+            self.runner.bind_kv_cache_to_metadata(attn_metadata)
+            for layer_name in attn_group.layer_names:
+                per_layer[layer_name] = attn_metadata
+        return per_layer
 
     def _to_target_token_ids(self, draft_token_ids: torch.Tensor) -> torch.Tensor:
         """Map draft-vocabulary ids to target-vocabulary ids.
@@ -468,6 +546,14 @@ class RBLNEagleProposer(EagleProposer):
                 hidden_states = hidden_states[token_indices_to_sample]
                 sample_hidden_states = sample_hidden_states[token_indices_to_sample]
 
+            logits = compute_draft_logits(sample_hidden_states)
+
+            # NOTE(RBLN): the greedy pick belongs in the graph.
+            # To support probabilistic sampling, we need to return
+            # the logits too.
+            return hidden_states, torch.ops.rbln.argmax(logits)
+
+        def compute_draft_logits(sample_hidden_states: torch.Tensor) -> torch.Tensor:
             if self.draft_id_to_target_id is not None:
                 # NOTE(RBLN): upstream's `compute_logits` widens draft-vocab
                 # logits to the target vocabulary by scattering into an `-inf`
@@ -480,18 +566,62 @@ class RBLNEagleProposer(EagleProposer):
                 assert isinstance(
                     self.model, (Eagle3LlamaForCausalLM, Eagle3DeepseekV2ForCausalLM)
                 )
-                logits = self.model.logits_processor(
+                return self.model.logits_processor(
                     self.model.lm_head, sample_hidden_states
                 )
-            else:
-                logits = self.model.compute_logits(sample_hidden_states)
+            return self.model.compute_logits(sample_hidden_states)
 
-            # NOTE(RBLN): the greedy pick belongs in the graph.
-            # To support probabilistic sampling, we need to return
-            # the logits too.
-            return hidden_states, torch.ops.rbln.argmax(logits)
+        def tail_wrapper(
+            draft_ids: torch.Tensor,
+            hidden_states: torch.Tensor,
+            positions: torch.Tensor,
+        ):
+            # d2t is reached through the module so it stays a named weight in the
+            # graph: weight-free apply cannot fill an anonymous constant.
+            d2t = (
+                None
+                if self.draft_id_to_target_id is None
+                else self.model.draft_id_to_target_id
+            )
+
+            def to_target(ids: torch.Tensor) -> torch.Tensor:
+                ids = ids.reshape(-1)
+                if d2t is not None:
+                    ids = ids + d2t.index_select(0, ids)
+                return ids.to(torch.int32)
+
+            rows = draft_ids.shape[0]
+            # The draft head's input embedding is in target space.
+            ids = to_target(draft_ids)
+            hidden = hidden_states.view(rows, 1, self.hidden_size)
+            outs = [ids]
+            for pass_idx in range(self.num_speculative_tokens - 1):
+                pass_state.PASS_IDX = pass_idx
+                ret = self.model(
+                    input_ids=ids.view(rows, 1),
+                    positions=positions + pass_idx,
+                    hidden_states=hidden,
+                    inputs_embeds=None,
+                )
+                if not self.model_returns_tuple():
+                    last_hidden_states = next_hidden_states = ret
+                else:
+                    last_hidden_states, next_hidden_states = ret
+                ids = to_target(
+                    torch.ops.rbln.argmax(
+                        compute_draft_logits(
+                            last_hidden_states.view(-1, self.hidden_size)
+                        )
+                    )
+                )
+                outs.append(ids)
+                hidden = next_hidden_states.view(rows, 1, self.hidden_size)
+            pass_state.PASS_IDX = 0
+            return torch.stack(outs, dim=1)
 
         self.model_executable = self._compile_drafter(model_wrapper)
+        if self.num_speculative_tokens > 1:
+            self.tail_executable = self._compile_drafter(tail_wrapper)
 
     def _compile_drafter(self, fn):
         rbln_config: RBLNConfig = self.vllm_config.additional_config
@@ -619,7 +749,7 @@ class RBLNEagleProposer(EagleProposer):
             num_padded_tokens=num_padded_tokens,
             **self.runner.kv_cache_forward_context_kwargs(),
         ):
-            _, _ = self.model_executable(
+            hidden_states, draft_ids = self.model_executable(
                 input_ids=input_ids,
                 positions=positions,
                 hidden_states=hidden_states,
@@ -631,64 +761,19 @@ class RBLNEagleProposer(EagleProposer):
         if self.num_speculative_tokens == 1 or self.runner.is_strict_kv_producer:
             return
 
-        common_attn_metadata.num_actual_tokens = num_reqs
-        common_attn_metadata.max_query_len = 1
-        common_attn_metadata.query_start_loc = self.arange[: num_reqs + 1]
-        common_attn_metadata.query_start_loc_cpu = self.arange[: num_reqs + 1]
-        common_attn_metadata.seq_lens += 1
-
-        batch_desc, num_tokens_across_dp = self._determine_batch_execution_and_padding(
-            num_reqs,
-            num_reqs,
-            False,
-            first_pass=False,
-            pinned_num_tokens_padded=override_padded,
-        )
-        num_reqs_padded = batch_desc.num_reqs_padded
-        num_padded_tokens = batch_desc.num_tokens_padded
-        per_layer_attn_metadata.clear()
-        for attn_group in self.draft_attn_groups:
-            attn_metadata = attn_group.get_metadata_builder().build(
-                common_attn_metadata=common_attn_metadata,
-                positions=self.positions[:num_reqs],
-                is_prefill=False,
-                batch_pad=num_reqs_padded,
-                is_prompt_sorted=self.runner.sort_batch_by_length,
-            )
-            self.runner.bind_kv_cache_to_metadata(attn_metadata)
-            for layer_name in attn_group.layer_names:
-                per_layer_attn_metadata[layer_name] = attn_metadata
-
-        input_ids, positions, hidden_states, _ = self._preprocess(
-            num_reqs,
-            num_reqs_padded,
-            num_reqs,
+        tail = self._prepare_tail(
+            common_attn_metadata,
             self.positions[:num_reqs],
-            self.hidden_states[:num_reqs],
-            is_prefill=False,
+            num_reqs,
+            None,
+            pinned_num_tokens_padded=override_padded,
             mrope_positions=(
                 self.mrope_positions[:, :num_reqs]
                 if self.supports_mm_inputs and self.uses_mrope
                 else None
             ),
         )
-
-        for _ in range(self.num_speculative_tokens - 1):
-            with set_forward_context(
-                per_layer_attn_metadata,
-                self.vllm_config,
-                num_tokens=num_reqs,
-                num_tokens_across_dp=num_tokens_across_dp,
-                num_padded_tokens=num_padded_tokens,
-                **self.runner.kv_cache_forward_context_kwargs(),
-            ):
-                _, _ = self.model_executable(
-                    input_ids=input_ids,
-                    positions=positions,
-                    hidden_states=hidden_states,
-                    inputs_embeds=inputs_embeds,
-                    token_indices_to_sample=None,
-                )
+        self._run_tail(tail, draft_ids, hidden_states, num_reqs)
 
     def _determine_batch_execution_and_padding(
         self,

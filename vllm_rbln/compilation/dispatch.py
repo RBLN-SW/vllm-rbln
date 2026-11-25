@@ -85,6 +85,8 @@ def _forward_context_key() -> tuple[Any, ...]:
     max_pad = None if max_pads is None else max_pads.shape[0]
 
     attn_metadata = ctx.attn_metadata
+    if isinstance(attn_metadata, list):
+        attn_metadata = attn_metadata[0] if attn_metadata else None
     if isinstance(attn_metadata, dict):
         attn_metadata = next(iter(attn_metadata.values()), None)
 

@@ -23,6 +23,7 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm_rbln.patches.axk2.loader import load_frozen_module
 from vllm_rbln.patches.deepseek_v2 import patched_deepseek_v2_moe_forward
 from vllm_rbln.v1.attention.kv_cache_bindings import resolve_kv_cache
+from vllm_rbln.v1.spec_decode import pass_state
 from vllm_rbln.v1.spec_decode.eagle3_pp import (
     AUX_COMBINED,
     aux_slots_captured,
@@ -70,7 +71,7 @@ def _rbln_indexer_forward(
     weights = (weights * (self.n_head**-0.5)).contiguous()  # [B, S, n_head]
 
     forward_context = get_forward_context()
-    attn_metadata = forward_context.attn_metadata
+    attn_metadata = pass_state.select(forward_context.attn_metadata)
     if isinstance(attn_metadata, dict):
         attn_metadata = attn_metadata[self.k_cache.prefix]
     k_cache = resolve_kv_cache(attn_metadata, self.k_cache.prefix)

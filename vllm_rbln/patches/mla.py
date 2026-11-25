@@ -28,6 +28,7 @@ from vllm_rbln.model_executor.layers.quantization.modelopt_fp8 import (
 )
 from vllm_rbln.patches import register_patch
 from vllm_rbln.v1.attention.kv_cache_bindings import resolve_kv_cache
+from vllm_rbln.v1.spec_decode import pass_state
 
 mla_attention_original_process_weights = MLAAttention.process_weights_after_loading
 mla_attention_original_get_kv_cache_spec = MLAAttention.get_kv_cache_spec
@@ -142,7 +143,7 @@ def patched_mla_attention_forward(
 ) -> torch.Tensor:
     if self.use_direct_call:
         forward_context: ForwardContext = get_forward_context()
-        attn_metadata = forward_context.attn_metadata
+        attn_metadata = pass_state.select(forward_context.attn_metadata)
         if isinstance(attn_metadata, dict):
             attn_metadata = attn_metadata[self.layer_name]
 

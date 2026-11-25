@@ -243,6 +243,7 @@ class RBLNFlashAttentionMetadataBuilder(
             )
 
         self._staged: dict[tuple, torch.Tensor] = {}
+        self._staging_slot = 0
 
     def _stage(
         self,
@@ -256,14 +257,15 @@ class RBLNFlashAttentionMetadataBuilder(
         cache_offsets share both shape and dtype, so keying on those alone
         would silently make them share one buffer.
 
-        The returned tensor is overwritten by the next stage() call, so the
-        caller must run the forward pass before staging again. `shared` takes
-        the buffer instead of this builder, for a slot whose value does not
-        depend on the KV cache group: every group stages the same value into it.
+        The returned tensor is overwritten by the next stage() call with the
+        same `staging_slot`, so the caller must run the forward pass before
+        staging again with that slot. `shared` takes the buffer instead of this
+        builder, for a slot whose value does not depend on the KV cache group:
+        every group stages the same value into it.
         """
         if t is None:
             return None
-        key = (slot, t.shape, t.dtype)
+        key = (slot, self._staging_slot, t.shape, t.dtype)
         staged = self._staged if shared is None else shared
         if (buf := staged.get(key)) is None:
             buf = torch.empty(t.shape, dtype=t.dtype, device=self.device)
@@ -314,10 +316,15 @@ class RBLNFlashAttentionMetadataBuilder(
         mm_prefix_row_ends: torch.Tensor | None = None,
         group_shared: dict[tuple, torch.Tensor] | None = None,
         defer_staging: bool = False,
+        staging_slot: int = 0,
     ) -> RBLNFlashAttentionMetadata:
         """`mm_prefix_row_ends`, on a prefill of an mm prefix LM, holds for each
         padded row of the step the last step-local row it may read: itself, or
-        its range's last position for an mm row. None on any other step."""
+        its range's last position for an mm row. None on any other step.
+
+        Builds sharing a `staging_slot` share device buffers; distinct slots let
+        several builds feed one forward."""
+        self._staging_slot = staging_slot
         num_reqs = common_attn_metadata.num_reqs
         # The runner can defer staging until its token feedback is ready.
         query_start_loc_cpu = common_attn_metadata.query_start_loc
