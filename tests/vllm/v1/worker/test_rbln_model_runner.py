@@ -116,7 +116,6 @@ def _make_runner_stub(**attrs):
     runner.mrope_positions = None
     runner.use_async_scheduling = False
     runner._prev_async_output = None
-    runner.kv_cache_whole_block_copy = set()
     for key, value in attrs.items():
         setattr(runner, key, value)
     return runner
@@ -1749,25 +1748,6 @@ class TestProcessKvCacheCopyOps:
         r._process_kv_cache_copy_ops([KVCacheCopyOp(0, 1, 2, 5)])
         assert torch.equal(kv[8:12], before[4:8])
         assert torch.equal(kv[:8], before[:8]) and torch.equal(kv[12:], before[12:])
-
-    def test_a_layer_bound_in_another_shape_copies_the_whole_block(self, monkeypatch):
-        monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", True)
-        kv = torch.zeros(4, 2, 1, 1, 8, 2)
-        kv[1] = 5.0
-        r = _make_runner_stub(
-            kv_caches=[kv],
-            kv_cache_names=["full"],
-            kv_cache_whole_block_copy={"full"},
-            kv_cache_block_axes={"full": 0},
-            kv_cache_config=_copy_groups(["full"]),
-            _kernel_block_sizes=[8],
-            model_config=SimpleNamespace(use_mla=False),
-            runtime_holder=[None],
-        )
-        r._process_kv_cache_copy_ops([KVCacheCopyOp(0, 1, 2, 3)])
-        # Three tokens hit, yet all eight rows of block 2 take block 1's.
-        assert (kv[2] == 5.0).all()
-        assert (kv[0] == 0.0).all() and (kv[3] == 0.0).all()
 
     def test_device_tensor_copy_mla(self, monkeypatch):
         monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", True)

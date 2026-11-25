@@ -266,7 +266,7 @@ class TestKVCacheBaseBindings:
         self, make_model_runner
     ):
         # The same buffer, read by a drafter layer too: bound as the sliding-window
-        # layer views it, so the full-attention layer is copied whole on a hit.
+        # layer views it.
         runner = make_model_runner(
             layers=("layer.0", "layer.1", "draft.0"),
             init_kv_cache=False,
@@ -295,7 +295,6 @@ class TestKVCacheBaseBindings:
         window_shape = infos["layer.0"].view_shape
         assert window_shape != infos["layer.1"].view_shape
         assert [tuple(b.shape) for b in runner.kv_cache_bases] == [window_shape]
-        assert runner.kv_cache_whole_block_copy == {"layer.1"}
 
 
 class TestSubBlockSettingAtKvInit:

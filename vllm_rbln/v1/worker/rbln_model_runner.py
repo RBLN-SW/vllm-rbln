@@ -363,8 +363,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         self.kv_cache_names: list[str] = []
         self.kv_cache_positions: dict[str, int] = {}
         self.kv_cache_allocations: dict[tuple, str] = {}
-        # Layers a sub-block hit copies as whole blocks, not just the hit rows.
-        self.kv_cache_whole_block_copy: set[str] = set()
         # Initialize in initialize_kv_cache_tensors
         self.cross_layers_kv_cache: torch.Tensor | None = None
         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
@@ -3634,11 +3632,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             name: position for position, name in enumerate(self.kv_cache_names)
         }
         canonical = self._select_canonical_kv_layers_per_pool(kv_cache_config)
-        # A drafter layer sharing the target's KV puts the buffers in two graphs,
-        # and bound in a full-attention shape rebel-compiler places them apart in
-        # each. They bind the sliding-window shape then; a sub-block hit copies the
-        # layers viewed otherwise as whole blocks, the only bytes both layouts
-        # place alike.
+        # A drafter layer sharing the target's KV puts the buffers in two graphs.
+        # Bound in the full-attention shape, rebel-compiler sees a buffer in two
+        # shapes across them and refuses the drafter graph; bound in the
+        # sliding-window shape, it compiles.
         drafter_shares_kv = isinstance(
             self.drafter, DRAFT_MODEL_PROPOSERS
         ) and not self.drafter._draft_attn_layer_names.isdisjoint(
@@ -3658,13 +3655,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             kv_cache_view_infos,
             bound | set(self.aux_kv_cache_specs),
         )
-        # Empty where no buffer is shared and every layer is its own input.
-        self.kv_cache_whole_block_copy = {
-            name
-            for name, info in zip(self.kv_cache_names, self.kv_cache_view_infos)
-            if drafter_shares_kv
-            and info.view_shape != tuple(self.kv_cache_bases[info.base_index].shape)
-        }
         if dynamic_kv_enabled(self.vllm_config) and self.kv_cache_bases:
             # With shared bases these are the graph inputs and the per-layer
             # views are built inside the graph.
@@ -4435,13 +4425,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     srcs.append(kv_cache[src, :nt])
                 else:
                     axis = self.kv_cache_block_axes[layer_name]
-                    rows = (
-                        slice(None)
-                        if layer_name in self.kv_cache_whole_block_copy
-                        else slice(nt)
-                    )
-                    dsts.append(kv_cache.select(axis, dst)[..., rows, :])
-                    srcs.append(kv_cache.select(axis, src)[..., rows, :])
+                    dsts.append(kv_cache.select(axis, dst)[..., :nt, :])
+                    srcs.append(kv_cache.select(axis, src)[..., :nt, :])
         torch._foreach_copy_(dsts, srcs)
 
 
