@@ -1400,7 +1400,7 @@ class RBLNGlm5NextForConditionalGeneration(
         else:
             self.visual = PPMissingLayer()
         self.config.image_token_index = hf_config.image_token_id
-        object.__setattr__(self, "_mm_encoder", None)
+        self._mm_encoder: rbln_utils.BufferedVisionEncoder | None = None
 
     def get_language_model(self) -> nn.Module:
         return self
@@ -1409,42 +1409,68 @@ class RBLNGlm5NextForConditionalGeneration(
         if isinstance(self.visual, PPMissingLayer):
             return
         encoder = _RBLNGlm5NextVisionEncoder(self.visual, self.mm_embeds_dtype).eval()
-        object.__setattr__(self, "_mm_encoder", compile_fn(encoder))
+        self._mm_encoder = rbln_utils.BufferedVisionEncoder(
+            compile_fn(encoder),
+            specs_by_bucket={
+                size: self._mm_input_specs(size)
+                for size in self.mm_encoder_patch_buckets
+            },
+            device=self.visual.device,
+            dtype=self.visual.dtype,
+        )
 
     def warmup_mm_encoder(self) -> None:
         visual = self.visual
         if isinstance(visual, PPMissingLayer):
             return
-        assert self._mm_encoder is not None
-        patch_dim = visual.patch_embed.proj.weight[0].numel()
-        head_dim = visual.blocks[0].attn.head_dim
+        buffered_encoder = self._mm_encoder
+        assert buffered_encoder is not None
         with torch.inference_mode():
-            for bucket in self.mm_encoder_patch_buckets:
-                self._mm_encoder(
-                    torch.zeros(
-                        bucket, patch_dim, dtype=visual.dtype, device=visual.device
-                    ),
-                    torch.ones(
-                        bucket, head_dim, dtype=visual.dtype, device=visual.device
-                    ),
-                    torch.zeros(
-                        bucket, head_dim, dtype=visual.dtype, device=visual.device
-                    ),
-                    torch.zeros(1, 1, bucket, dtype=visual.dtype, device=visual.device),
+            for bucket_size in self.mm_encoder_patch_buckets:
+                # Every entry valid: the warm-up never masks a key.
+                inputs = buffered_encoder.input_buffers.warmup_inputs(
+                    bucket_size, fill_overrides={"key_bias": 0.0}
                 )
+                buffered_encoder.encoder(*inputs)
+
+    def _mm_input_specs(self, bucket_size: int) -> list[rbln_utils.EncoderInput]:
+        visual = self.visual
+        patch_dim = math.prod(visual.patch_embed.proj.weight.shape[1:])
+        head_dim = visual.blocks[0].attn.head_dim
+        return [
+            rbln_utils.EncoderInput(
+                "pixel_values",
+                (bucket_size, patch_dim),
+                axis=0,
+                pad=0.0,
+                use_registered_host_buffer=True,
+            ),
+            rbln_utils.EncoderInput("cos", (bucket_size, head_dim), axis=0, pad=1.0),
+            rbln_utils.EncoderInput("sin", (bucket_size, head_dim), axis=0, pad=0.0),
+            rbln_utils.EncoderInput(
+                "key_bias",
+                (1, 1, bucket_size),
+                axis=2,
+                pad=-30000.0,
+                allow_prefix_copy=False,
+            ),
+        ]
 
     def _encoder_inputs(
-        self, pixel_values: torch.Tensor, grid_thw: list[int]
+        self,
+        buffered_encoder: rbln_utils.BufferedVisionEncoder,
+        pixel_values: torch.Tensor,
+        grid_thw: list[int],
     ) -> list[torch.Tensor]:
+        """Stage one frame's patches and host-built attention inputs.
+
+        See EncoderInputBuffers for the lifetime of the returned tensors.
+        """
         visual = self.visual
         num_patches = math.prod(grid_thw)
         fits = [b for b in self.mm_encoder_patch_buckets if b >= num_patches]
         assert fits, f"a frame of {num_patches} patches (grid {grid_thw})"
-        bucket = fits[0]
-        dtype = visual.dtype
-        patch_dim = visual.patch_embed.proj.weight[0].numel()
-        padded = torch.zeros(bucket, patch_dim, dtype=dtype)
-        padded[:num_patches] = pixel_values.to(dtype)
+        bucket_size = fits[0]
 
         t, h, w = grid_thw
         merge = visual.spatial_merge_size
@@ -1461,17 +1487,13 @@ class RBLNGlm5NextForConditionalGeneration(
         freqs_h = torch.outer((order // w).float(), inv_freq)
         freqs_w = torch.outer((order % w).float(), inv_freq)
         angles = torch.cat([freqs_h, freqs_w, freqs_h, freqs_w], dim=-1)
-        head_dim = angles.shape[-1]
-        cos = torch.ones(bucket, head_dim)
-        sin = torch.zeros(bucket, head_dim)
-        cos[:num_patches], sin[:num_patches] = angles.cos(), angles.sin()
-
-        key_bias = torch.zeros(1, 1, bucket)
+        key_bias = torch.zeros(1, 1, bucket_size)
         key_bias[..., num_patches:] = -30000.0
-        return [
-            x.to(device=visual.device, dtype=dtype)
-            for x in (padded, cos, sin, key_bias)
-        ]
+        return buffered_encoder.input_buffers.stage(
+            bucket_size,
+            [pixel_values, angles.cos(), angles.sin(), key_bias],
+            num_patches,
+        )
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
         outputs: list[torch.Tensor] = []
@@ -1486,7 +1508,8 @@ class RBLNGlm5NextForConditionalGeneration(
                 pixel_values = kwargs[key]
                 if pixel_values is None:
                     continue
-                assert self._mm_encoder is not None
+                buffered_encoder = self._mm_encoder
+                assert buffered_encoder is not None
                 grid_thw = kwargs[f"{modality}_grid_thw"]
                 assert isinstance(pixel_values, torch.Tensor)
                 assert isinstance(grid_thw, torch.Tensor)
@@ -1498,8 +1521,8 @@ class RBLNGlm5NextForConditionalGeneration(
                     # patch. Encoding these independently preserves that mask.
                     frames = [
                         rbln_utils.run_mm_encoder(
-                            self._mm_encoder,
-                            self._encoder_inputs(frame, [1, h, w]),
+                            buffered_encoder.encoder,
+                            self._encoder_inputs(buffered_encoder, frame, [1, h, w]),
                             h * w // merge2,
                             dtype=self.mm_embeds_dtype,
                         )
