@@ -2736,43 +2736,40 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
 
             return hidden_states, logits, combined_hidden_states
 
-        if self.model_config.enforce_eager:
-            self.model_executable = model_wrapper
-        else:
-            process_group_dict = build_process_group_dict()
-            self.model_executable = compile(
-                model_wrapper,
-                dynamic=False,
-                fullgraph=True,
-                compile_context=self.compile_context,
-                num_devices=1,
-                model_trace_method="export" if use_device_tensor() else "",
-                process_group_dict=process_group_dict,
-                guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
-                runtime_holder=self.runtime_holder,
-                mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
-                # Logits are consumed by sampling within the same step, so the
-                # output buffer can be reused across steps even under async scheduling.
-                use_static_output=True,
-                use_direct_dispatch=True,
-                dtype=self.rbln_config.compile_dtype,
-            )
-            if self.supports_mm_inputs and not self.is_ec_consumer_only:
-                cast(SupportsRBLNMultiModal, self.model).compile_mm_encoder(
-                    lambda encoder: compile(
-                        encoder,
-                        dynamic=False,
-                        fullgraph=True,
-                        compile_context=self.compile_context,
-                        num_devices=1,
-                        model_trace_method="export" if use_device_tensor() else "",
-                        process_group_dict=process_group_dict,
-                        guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
-                        runtime_holder=self.runtime_holder,
-                        mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
-                        use_static_output=True,
-                    )
+        process_group_dict = build_process_group_dict()
+        self.model_executable = compile(
+            model_wrapper,
+            dynamic=False,
+            fullgraph=True,
+            compile_context=self.compile_context,
+            num_devices=1,
+            model_trace_method="export" if use_device_tensor() else "",
+            process_group_dict=process_group_dict,
+            guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
+            runtime_holder=self.runtime_holder,
+            mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
+            # Logits are consumed by sampling within the same step, so the
+            # output buffer can be reused across steps even under async scheduling.
+            use_static_output=True,
+            use_direct_dispatch=True,
+            dtype=self.rbln_config.compile_dtype,
+        )
+        if self.supports_mm_inputs and not self.is_ec_consumer_only:
+            cast(SupportsRBLNMultiModal, self.model).compile_mm_encoder(
+                lambda encoder: compile(
+                    encoder,
+                    dynamic=False,
+                    fullgraph=True,
+                    compile_context=self.compile_context,
+                    num_devices=1,
+                    model_trace_method="export" if use_device_tensor() else "",
+                    process_group_dict=process_group_dict,
+                    guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
+                    runtime_holder=self.runtime_holder,
+                    mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
+                    use_static_output=True,
                 )
+            )
 
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
         """Extract Eagle3 auxiliary layer indices from speculative config.
@@ -3669,7 +3666,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         for layer_name, kv_cache in kv_caches.items():
             forward_context[layer_name].kv_cache = kv_cache
 
-        if not use_device_tensor() and not self.model_config.enforce_eager:
+        if not use_device_tensor():
             # `mark_static_address` is last-write-wins on storage->name. Pin to
             # one canonical layer per pool so the runtime, the connector's host
             # buffers, and the runtime copy path address the same name (and the
@@ -4350,7 +4347,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         block pool, so each cache copies the page; a page another group owns is
         unused by its own group there.
         """
-        assert use_device_tensor() or self.model_config.enforce_eager
+        assert use_device_tensor()
         dsts: list[torch.Tensor] = []
         srcs: list[torch.Tensor] = []
         seen: set[int] = set()
@@ -4370,7 +4367,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         self,
         copy_ops: list[KVCacheCopyOp],
     ) -> None:
-        if not use_device_tensor() and not self.model_config.enforce_eager:
+        if not use_device_tensor():
             # NOTE(RBLN): The runtime KV-copy interface is no longer actively maintained
             # in this path (--model-impl vllm).
             for op in copy_ops:

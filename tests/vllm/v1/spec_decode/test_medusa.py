@@ -70,16 +70,7 @@ class TestLoadModel:
             lambda self, target_model: setattr(self, "model", SimpleNamespace()),
         )
 
-    def test_eager_wrapper_when_enforce_eager(self, monkeypatch):
-        self._stub_super_load_model(monkeypatch)
-        proposer = make_medusa_proposer()
-        monkeypatch.setattr(
-            proposer.vllm_config.speculative_config, "enforce_eager", True
-        )
-        proposer.load_model(target_model=object())
-        assert proposer.model_executable.__name__ == "model_wrapper"
-
-    def test_compiles_wrapper_when_not_eager(self, monkeypatch):
+    def test_compiles_wrapper(self, monkeypatch):
         self._stub_super_load_model(monkeypatch)
         sentinel = object()
         captured: dict = {}
@@ -88,16 +79,13 @@ class TestLoadModel:
         )
         monkeypatch.setattr(medusa_module, "build_process_group_dict", lambda: {})
         proposer = make_medusa_proposer()
-        monkeypatch.setattr(
-            proposer.vllm_config.speculative_config, "enforce_eager", False
-        )
         proposer.load_model(target_model=object())
         assert proposer.model_executable is sentinel
         assert captured["fullgraph"] is True
         assert "compile_context" in captured
 
-    def test_eager_wrapper_composes_forward(self, monkeypatch):
-        # The eager wrapper runs the draft model then returns its compute_logits.
+    def test_wrapper_composes_forward(self, monkeypatch):
+        # The wrapper runs the draft model then returns its compute_logits.
         from vllm.v1.spec_decode.medusa import MedusaProposer
 
         class _FakeModel:
@@ -113,9 +101,8 @@ class TestLoadModel:
             lambda self, target_model: setattr(self, "model", _FakeModel()),
         )
         proposer = make_medusa_proposer()
-        monkeypatch.setattr(
-            proposer.vllm_config.speculative_config, "enforce_eager", True
-        )
+        monkeypatch.setattr(medusa_module, "compile", lambda fn, **kwargs: fn)
+        monkeypatch.setattr(medusa_module, "build_process_group_dict", lambda: {})
         proposer.load_model(target_model=object())
 
         out = proposer.model_executable(torch.tensor([[1.0, 2.0]]))

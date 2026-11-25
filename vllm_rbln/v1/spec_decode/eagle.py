@@ -494,8 +494,6 @@ class RBLNEagleProposer(EagleProposer):
         self.model_executable = self._compile_drafter(model_wrapper)
 
     def _compile_drafter(self, fn):
-        if self.vllm_config.speculative_config.enforce_eager:
-            return fn
         rbln_config: RBLNConfig = self.vllm_config.additional_config
         return compile(
             fn,

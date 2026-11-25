@@ -33,6 +33,7 @@ import vllm_rbln.model_executor.models.gemma4 as gemma4
 from vllm_rbln.compilation.compiler import compile, mark_decoder_regions
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.model_executor.models.gemma4 import RBLNGemma4ForConditionalGeneration
+from vllm_rbln.utils import BufferedVisionEncoder
 from vllm_rbln.v1.attention.backends.flash_attention import RBLNFlashAttentionMetadata
 
 POOL = 3
@@ -49,7 +50,7 @@ def _bare_model(**attrs) -> RBLNGemma4ForConditionalGeneration:
     )
     nn.Module.__init__(model)
     model.mm_prefix_attn_layers = []
-    object.__setattr__(model, "_mm_encoder", None)
+    model._mm_encoder = None
     for key, value in attrs.items():
         setattr(model, key, value)
     return model
@@ -96,16 +97,70 @@ def test_logits_processor_delegates_to_language_model():
     assert model.logits_processor is processor
 
 
-def test_the_vision_encoder_matches_hfs():
-    # The encoder pads every image to its bucket and masks the padding keys;
-    # what comes back must be HF's soft tokens for the image alone.
-    tower = _vision_tower()
+def _model_with_vision_encoder(tower):
     model = _bare_model(
         vision_tower=tower,
         embed_vision=_Identity(),
         model_dtype=torch.float32,
         mm_encoder_patch_buckets=[90],
     )
+    model._mm_encoder = BufferedVisionEncoder(
+        gemma4._RBLNGemma4VisionEncoder(tower, model.embed_vision).eval(),
+        specs_by_bucket={
+            size: model._mm_input_specs(size) for size in model.mm_encoder_patch_buckets
+        },
+        device="cpu",
+        dtype=model.model_dtype,
+    )
+    return model
+
+
+@pytest.mark.parametrize("valid_rows", [[0, 1, 2], [0, 2, 5]])
+def test_vision_encoder_stages_valid_patches_in_order(monkeypatch, valid_rows):
+    pixels = torch.arange(18, dtype=torch.bfloat16).view(6, 3)
+    positions = torch.full((6, 2), -1)
+    positions[valid_rows] = torch.tensor([[2, 0], [1, 0], [0, 0]])
+    expected = pixels[valid_rows]
+    stage = Mock(side_effect=lambda bucket, inputs, num_valid: inputs)
+
+    encoder = BufferedVisionEncoder(
+        lambda patches, *_: (patches[0].clone(),),
+        specs_by_bucket={
+            6: [
+                gemma4.rbln_utils.EncoderInput(
+                    "pixel_values",
+                    (1, 6, 3),
+                    axis=1,
+                    pad=0.0,
+                    dtype=torch.float32,
+                    use_registered_host_buffer=True,
+                )
+            ]
+        },
+        device="cpu",
+        dtype=pixels.dtype,
+    )
+    monkeypatch.setattr(encoder.input_buffers, "stage", stage)
+    model = _bare_model(
+        vision_tower=SimpleNamespace(config=SimpleNamespace(pooling_kernel_size=1)),
+        model_dtype=pixels.dtype,
+        mm_encoder_patch_buckets=[6],
+        _mm_encoder=encoder,
+    )
+
+    torch.testing.assert_close(model._encode_vision(pixels, positions), expected)
+    bucket, inputs, num_valid = stage.call_args.args
+    assert bucket == 6 and num_valid == len(valid_rows)
+    patches, staged_positions, *_ = inputs
+    assert (patches.data_ptr() == pixels.data_ptr()) == (valid_rows == [0, 1, 2])
+    torch.testing.assert_close(staged_positions[0, :num_valid], positions[valid_rows])
+
+
+def test_the_vision_encoder_matches_hfs():
+    # The encoder pads every image to its bucket and masks the padding keys;
+    # what comes back must be HF's soft tokens for the image alone.
+    tower = _vision_tower()
+    model = _model_with_vision_encoder(tower)
     pixels, positions = _image(9, 9, num_patches=81)
 
     with torch.no_grad():
@@ -118,16 +173,33 @@ def test_the_vision_encoder_matches_hfs():
     torch.testing.assert_close(got, expected, rtol=1e-4, atol=1e-4)
 
 
+def test_a_smaller_image_matches_upstream_when_reusing_vision_buffers(monkeypatch):
+    tower = _vision_tower()
+    model = _model_with_vision_encoder(tower)
+    encode = Mock(wraps=gemma4.rbln_utils.run_mm_encoder)
+    monkeypatch.setattr(gemma4.rbln_utils, "run_mm_encoder", encode)
+    large_pixels, large_positions = _image(9, 9, num_patches=90)
+    small_pixels, small_positions = _image(6, 3, num_patches=90)
+
+    with torch.inference_mode():
+        model._encode_vision(large_pixels, large_positions)
+        actual = model._encode_vision(small_pixels, small_positions)
+        expected = tower(
+            pixel_values=small_pixels[None], pixel_position_ids=small_positions[None]
+        ).last_hidden_state
+
+    large_inputs, small_inputs = (call.args[1] for call in encode.call_args_list)
+    assert [x.data_ptr() for x in small_inputs] == [x.data_ptr() for x in large_inputs]
+    torch.testing.assert_close(small_inputs[0][0, 18:81], large_pixels[18:81])
+    assert actual.shape == (2, 32)
+    torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
+
+
 def test_the_rotary_tables_are_built_once_not_per_image(monkeypatch):
     # The encoder looks up HF's cos and sin for each patch in the graph, so the
     # host computes none per image and the soft tokens stay HF's.
     tower = _vision_tower()
-    model = _bare_model(
-        vision_tower=tower,
-        embed_vision=_Identity(),
-        model_dtype=torch.float32,
-        mm_encoder_patch_buckets=[90],
-    )
+    model = _model_with_vision_encoder(tower)
     first, second = _image(6, 3, num_patches=81), _image(3, 9, num_patches=81)
     with torch.no_grad():
         model._encode_vision(*first)
@@ -183,7 +255,14 @@ def _recording_model(buckets):
         mm_encoder_patch_buckets=buckets,
         config=SimpleNamespace(vision_config=tower.config),
     )
-    object.__setattr__(model, "_mm_encoder", encoder)
+    model._mm_encoder = BufferedVisionEncoder(
+        encoder,
+        specs_by_bucket={
+            size: model._mm_input_specs(size) for size in model.mm_encoder_patch_buckets
+        },
+        device="cpu",
+        dtype=model.model_dtype,
+    )
     return model, calls
 
 
@@ -476,7 +555,7 @@ def test_video_frames_are_regrouped_per_video(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "first_rank, limits, compiled",
+    "first_rank, limits, has_encoder",
     [
         (True, {"image": 1, "video": 0}, True),
         (True, {"image": 0, "video": 1}, True),
@@ -485,7 +564,7 @@ def test_video_frames_are_regrouped_per_video(monkeypatch):
     ],
 )
 def test_the_encoder_compiles_only_where_the_tower_lives(
-    monkeypatch, first_rank, limits, compiled
+    monkeypatch, first_rank, limits, has_encoder
 ):
     monkeypatch.setattr(
         gemma4, "get_pp_group", lambda: SimpleNamespace(is_first_rank=first_rank)
@@ -495,8 +574,11 @@ def test_the_encoder_compiles_only_where_the_tower_lives(
         gemma4, "_RBLNGemma4VisionEncoder", lambda tower, embed_vision: built
     )
     model = _bare_model(
-        vision_tower=nn.Identity(),
+        # A tower with a parameter: the input buffers take its device.
+        vision_tower=nn.Linear(1, 1),
         embed_vision=nn.Identity(),
+        model_dtype=torch.float32,
+        mm_encoder_patch_buckets=[],
         multimodal_config=SimpleNamespace(
             get_limit_per_prompt=lambda modality: limits.get(modality, 0)
         ),
@@ -506,10 +588,11 @@ def test_the_encoder_compiles_only_where_the_tower_lives(
 
     model.compile_mm_encoder(compile_fn)
 
-    if compiled:
+    if has_encoder:
         compile_fn.assert_called_once_with(built)
-        assert model._mm_encoder is runtime
+        assert model._mm_encoder.encoder is runtime
     else:
+        model.warmup_mm_encoder()
         compile_fn.assert_not_called()
         assert model._mm_encoder is None
 

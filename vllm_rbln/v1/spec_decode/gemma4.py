@@ -219,7 +219,7 @@ class RBLNGemma4Proposer(RBLNEagleProposer):
                 masks = torch.zeros(num_reqs_padded, 1, 1, 1, keys.numel())
                 masks[:num_reqs, 0, 0, 0] = visible.to(masks.dtype)
             attn_metadata.attn_masks = builder._stage(
-                masks.to(torch.float16 if builder.enforce_eager else torch.float32),
+                masks.to(torch.float32),
                 "attn_masks",
             )
             self.runner.bind_kv_cache_to_metadata(attn_metadata)
