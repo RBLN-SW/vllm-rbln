@@ -228,7 +228,7 @@ def test_warm_up_runs_every_bucket_once_full():
 
 
 def _built_model(
-    monkeypatch, *, cap, budgets, chunk=512, per_layer_input=0, attention_layers=()
+    monkeypatch, *, default, budgets, chunk=512, per_layer_input=0, attention_layers=()
 ):
     """The model as construction resolves it, upstream's model left out."""
 
@@ -241,7 +241,7 @@ def _built_model(
         "__init__",
         upstream_init,
     )
-    monkeypatch.setattr(gemma4, "mm_soft_token_cap", lambda info: cap)
+    monkeypatch.setattr(gemma4, "mm_soft_token_default", lambda info: default)
     monkeypatch.setattr(
         gemma4,
         "MULTIMODAL_REGISTRY",
@@ -283,7 +283,7 @@ def test_mm_prefix_mask_selects_only_sliding_layers(monkeypatch, use_mm_prefix):
         layer.attn = SimpleNamespace(use_mm_prefix=use_mm_prefix)
         layers.append(layer)
 
-    model = _built_model(monkeypatch, cap=280, budgets=[], attention_layers=layers)
+    model = _built_model(monkeypatch, default=280, budgets=[], attention_layers=layers)
 
     assert model.layers[0].attn.use_mm_prefix == use_mm_prefix
     assert model.layers[1].attn.use_mm_prefix == use_mm_prefix
@@ -291,46 +291,55 @@ def test_mm_prefix_mask_selects_only_sliding_layers(monkeypatch, use_mm_prefix):
 
 
 @pytest.mark.parametrize(
-    "budgets, buckets",
-    [([], [70 * 9, 140 * 9, 280 * 9]), ([560, 70], [70 * 9, 560 * 9])],
+    "budgets, chunk, buckets",
+    [([], 512, [70 * 9, 140 * 9, 280 * 9]), ([560, 70], 1024, [70 * 9, 560 * 9])],
 )
 def test_the_encoder_buckets_follow_encoder_token_budgets(
-    monkeypatch, budgets, buckets
+    monkeypatch, budgets, chunk, buckets
 ):
-    model = _built_model(monkeypatch, cap=280, budgets=budgets)
+    model = _built_model(monkeypatch, default=280, budgets=budgets, chunk=chunk)
     assert model.mm_encoder_patch_buckets == buckets
 
 
-def test_unset_budgets_follow_the_prefill_chunk_not_the_cap(monkeypatch):
-    model = _built_model(monkeypatch, cap=280, budgets=[], chunk=2048)
+@pytest.mark.parametrize("default", [280, 1120])
+def test_unset_budgets_follow_the_prefill_chunk_not_the_default(monkeypatch, default):
+    # A compiled engine restarted with another max_soft_tokens keeps its graphs.
+    model = _built_model(monkeypatch, default=default, budgets=[], chunk=2048)
     assert model.mm_encoder_patch_buckets == [
         budget * 9 for budget in (70, 140, 280, 560, 1120)
     ]
 
 
-def test_a_cap_above_the_prefill_chunk_is_refused_with_unset_budgets(monkeypatch):
-    with pytest.raises(ValueError, match="must reach max_soft_tokens=560"):
-        _built_model(monkeypatch, cap=560, budgets=[], chunk=512)
+def test_a_default_above_the_compiled_budgets_is_refused(monkeypatch):
+    with pytest.raises(ValueError, match="max_soft_tokens=560 is above 280"):
+        _built_model(monkeypatch, default=560, budgets=[], chunk=512)
+    with pytest.raises(ValueError, match="max_soft_tokens=280 is above 140"):
+        _built_model(monkeypatch, default=280, budgets=[70, 140])
 
 
-def test_the_longest_range_is_the_cap_not_the_largest_budget(monkeypatch):
-    model = _built_model(monkeypatch, cap=280, budgets=[560, 70])
-    assert model.max_mm_prefix_range_len == 280
+def test_the_longest_range_is_the_largest_budget_not_the_default(monkeypatch):
+    model = _built_model(monkeypatch, default=280, budgets=[560, 70], chunk=1024)
+    assert model.max_mm_prefix_range_len == 560
 
 
-def test_budgets_that_cannot_encode_an_image_at_the_cap_are_refused(monkeypatch):
-    with pytest.raises(ValueError, match="must reach max_soft_tokens=280"):
-        _built_model(monkeypatch, cap=280, budgets=[70, 140])
+def test_a_budget_above_the_longest_prefill_chunk_is_refused(monkeypatch):
+    with pytest.raises(ValueError, match="above the longest prefill chunk"):
+        _built_model(monkeypatch, default=280, budgets=[280, 1120], chunk=512)
+
+
+def test_a_prefill_chunk_holding_no_image_is_refused(monkeypatch):
+    with pytest.raises(ValueError, match="holds no Gemma4 image"):
+        _built_model(monkeypatch, default=280, budgets=[], chunk=64)
 
 
 def test_budgets_the_processor_never_emits_are_refused(monkeypatch):
     with pytest.raises(ValueError, match=r"\[100, 300\] are not Gemma4"):
-        _built_model(monkeypatch, cap=280, budgets=[300, 100, 280])
+        _built_model(monkeypatch, default=280, budgets=[300, 100, 280])
 
 
 def test_variants_with_per_layer_inputs_are_refused(monkeypatch):
     with pytest.raises(ValueError, match="per-layer inputs"):
-        _built_model(monkeypatch, cap=280, budgets=[], per_layer_input=256)
+        _built_model(monkeypatch, default=280, budgets=[], per_layer_input=256)
 
 
 @pytest.mark.parametrize("scale_first", [True, False])
@@ -356,7 +365,9 @@ def test_each_expert_down_projection_is_scaled_once(monkeypatch, scale_first):
     assert set(loaded) == {scale[0], down[0], other[0]}
 
 
-def _processing_info(engine_kwargs, processor_default, default_output_length):
+def _processing_info(
+    engine_kwargs, processor_default, default_output_length, budgets=(70, 140, 280)
+):
     """Upstream's merge: the request's kwargs over the engine's."""
     image_processor = SimpleNamespace(max_soft_tokens=processor_default)
     vision_config = SimpleNamespace(default_output_length=default_output_length)
@@ -368,41 +379,81 @@ def _processing_info(engine_kwargs, processor_default, default_output_length):
             get_merged_mm_kwargs=lambda kwargs: {**engine_kwargs, **kwargs},
         ),
         get_hf_processor=lambda: SimpleNamespace(image_processor=image_processor),
+        mm_encoder_token_budgets=list(budgets),
     )
 
 
-def test_the_engines_budget_overrides_the_processors():
+def test_the_engines_default_overrides_the_processors():
     info = _processing_info({"images_kwargs": {"max_soft_tokens": 1120}}, 280, 280)
-    assert gemma4.mm_soft_token_cap(info) == 1120
+    assert gemma4.mm_soft_token_default(info) == 1120
 
 
 def test_a_default_output_length_the_processor_ignores_is_refused():
     # HF would cut a 280-token image that upstream counts as 70.
     info = _processing_info({}, 280, 70)
     with pytest.raises(ValueError, match="--mm-processor-kwargs"):
-        gemma4.mm_soft_token_cap(info)
+        gemma4.mm_soft_token_default(info)
     info = _processing_info({"max_soft_tokens": 70}, 280, 70)
-    assert gemma4.mm_soft_token_cap(info) == 70
+    assert gemma4.mm_soft_token_default(info) == 70
 
 
-def test_an_unsupported_budget_is_refused():
+def test_an_unsupported_default_is_refused():
     info = _processing_info({"max_soft_tokens": 100}, 280, 280)
     with pytest.raises(ValueError, match="not one of"):
-        gemma4.mm_soft_token_cap(info)
+        gemma4.mm_soft_token_default(info)
+
+
+def _rbln_info(monkeypatch, *, chunk, upstream_tokens=None):
+    """RBLN's info over a model config the platform hook has seen."""
+    monkeypatch.setattr(gemma4, "mm_soft_token_default", lambda info: 280)
+    monkeypatch.setattr(
+        gemma4.Gemma4ProcessingInfo,
+        "get_mm_max_tokens_per_item",
+        lambda self, seq_len, mm_counts: upstream_tokens,
+    )
+    info = gemma4.RBLNGemma4ProcessingInfo.__new__(gemma4.RBLNGemma4ProcessingInfo)
+    info.ctx = SimpleNamespace(
+        model_config=SimpleNamespace(
+            _rbln_config=RBLNConfig(prefill_chunk_size=[chunk])
+        )
+    )
+    return info
+
+
+@pytest.mark.parametrize("chunk, largest", [(512, 280), (2048, 1120)])
+def test_the_info_reads_the_budgets_from_the_hooked_model_config(
+    monkeypatch, chunk, largest
+):
+    info = _rbln_info(monkeypatch, chunk=chunk)
+    assert info.mm_encoder_token_budgets[-1] == largest
+
+
+def test_the_encoder_cache_is_sized_by_the_largest_budget_not_the_default(
+    monkeypatch,
+):
+    info = _rbln_info(
+        monkeypatch, chunk=2048, upstream_tokens={"image": 280, "video": 9}
+    )
+    assert info.get_mm_max_tokens_per_item(32768, {"image": 1}) == {
+        "image": 1120,
+        "video": 9,
+    }
 
 
 @pytest.mark.parametrize(
-    "num_images, request_kwargs, refused",
+    "num_images, budgets, request_kwargs, refused",
     [
-        (1, {"max_soft_tokens": 560}, True),
-        (1, {"max_soft_tokens": 280}, False),
-        (1, {}, False),
+        (1, (70, 140, 280), {"max_soft_tokens": 560}, True),
+        (1, (70, 140, 280), {"max_soft_tokens": 280}, False),
+        (1, (70, 140, 280), {}, False),
+        # A chunk of 2048 compiles up to 1120 whatever the engine default.
+        (1, (70, 140, 280, 560, 1120), {"max_soft_tokens": 1120}, False),
         # Video frames take their own budget whatever the request says.
-        (0, {"max_soft_tokens": 560}, False),
+        (0, (70, 140, 280), {"max_soft_tokens": 560}, False),
     ],
 )
-def test_a_request_budget_above_the_cap_is_refused(
-    monkeypatch, num_images, request_kwargs, refused
+def test_a_request_budget_above_the_compiled_budgets_is_refused(
+    monkeypatch, num_images, budgets, request_kwargs, refused
 ):
     upstream = Mock(return_value="processed")
     monkeypatch.setattr(
@@ -411,21 +462,26 @@ def test_a_request_budget_above_the_cap_is_refused(
     processor = gemma4.RBLNGemma4MultiModalProcessor.__new__(
         gemma4.RBLNGemma4MultiModalProcessor
     )
-    processor.info = _processing_info({}, 280, 280)
+    processor.info = _processing_info({}, 280, 280, budgets)
     items = SimpleNamespace(get_count=lambda modality, strict: num_images)
 
     if refused:
-        with pytest.raises(ValueError, match="--mm-processor-kwargs"):
+        with pytest.raises(ValueError, match="--rbln-prefill-chunk-size"):
             processor._apply_hf_processor_main(items, request_kwargs)
         upstream.assert_not_called()
     else:
         assert processor._apply_hf_processor_main(items, request_kwargs) == "processed"
 
 
-def test_construction_builds_the_hf_processor_of_every_allowed_budget(monkeypatch):
+@pytest.mark.parametrize(
+    "budgets", [(70, 140, 280), (70, 140, 280, 560, 1120), (280, 1120)]
+)
+def test_construction_builds_the_hf_processor_of_every_allowed_budget(
+    monkeypatch, budgets
+):
     # Upstream caches the HF processor per max_soft_tokens; building each one
     # up front keeps a request's first use of a budget from paying for it.
-    info = _processing_info({}, 280, 280)
+    info = _processing_info({}, 280, 280, budgets)
     built = []
     plain = info.get_hf_processor
 
@@ -441,7 +497,9 @@ def test_construction_builds_the_hf_processor_of_every_allowed_budget(monkeypatc
     monkeypatch.setattr(gemma4.Gemma4MultiModalProcessor, "__init__", upstream_init)
     gemma4.RBLNGemma4MultiModalProcessor()
 
-    assert [kwargs["max_soft_tokens"] for kwargs in built if kwargs] == [70, 140, 280]
+    assert [kwargs["max_soft_tokens"] for kwargs in built if kwargs] == [
+        budget for budget in (70, 140, 280, 560, 1120) if budget <= budgets[-1]
+    ]
 
 
 def test_video_frames_are_regrouped_per_video(monkeypatch):

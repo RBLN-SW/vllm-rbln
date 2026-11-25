@@ -637,6 +637,12 @@ def _wire(vllm_config: "VllmConfig") -> None:
     parallel_config = vllm_config.parallel_config
     scheduler_config = vllm_config.scheduler_config
 
+    # A multimodal processor is handed only the model config, in every process,
+    # yet may have to bound a request by the graphs this config compiles.
+    # Attached after _validate resolves prefill_chunk_size; it pickles with the
+    # model config and stays out of its hash.
+    vllm_config.model_config._rbln_config = rbln_config
+
     ec_config = vllm_config.ec_transfer_config
     manager_config = vllm_config.ec_manager_config
     if (

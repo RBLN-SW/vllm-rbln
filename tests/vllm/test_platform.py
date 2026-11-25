@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import copy
 import os
+import pickle
 import subprocess
 import sys
 import textwrap
@@ -1634,6 +1635,16 @@ def test_running_the_hook_twice_changes_nothing(configured, reconfigure):
         again.cache_config.enable_prefix_caching
         == configured.cache_config.enable_prefix_caching
     )
+
+
+def test_the_model_config_carries_the_resolved_rbln_config(configured):
+    # A multimodal processor sees only the model config; Gemma4's sizes a
+    # request by the encoder graphs the resolved prefill chunks compile.
+    rbln_config = pickle.loads(pickle.dumps(configured.model_config))._rbln_config
+    assert rbln_config.prefill_chunk_size == [
+        configured.scheduler_config.max_num_batched_tokens
+    ]
+    assert configured.model_config._rbln_config is configured.additional_config
 
 
 def test_default_single_worker_uses_uni_without_warning(caplog):
