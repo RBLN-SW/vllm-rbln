@@ -30,8 +30,6 @@ if the KV cache tensor has a token dimension that can be sliced for partial copy
       This is not per-token data.
     * `CrossAttentionSpec`: Prefix caching is entirely disabled for this.
 
-A model with a layer of 2 or 3 KV heads (Gemma4 26B-A4B) is ineligible for now.
-
 A model with a `MambaSpec` group (GLM-5.3's KDA layers, Qwen3.5's GatedDeltaNet layers)
 therefore never runs this manager. It can hit below the block through upstream's
 fine-grained prefix hits instead, set with `--prefix-match-unit`, independent of

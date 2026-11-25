@@ -34,11 +34,7 @@ from vllm.v1.core.kv_cache_utils import (
     init_none_hash,
     maybe_convert_block_hash,
 )
-from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
-    SlidingWindowSpec,
-    UniformTypeKVCacheSpecs,
-)
+from vllm.v1.kv_cache_interface import SlidingWindowSpec, UniformTypeKVCacheSpecs
 from vllm.v1.request import Request
 
 import vllm_rbln.platform as platform
@@ -346,16 +342,6 @@ class TestCanUseSubBlockCaching:
             sliding_window=8,
         )
         assert not RBLNKVCacheManager.can_use_sub_block_caching(cfg, 4)
-
-    @pytest.mark.parametrize(
-        ("num_kv_heads", "eligible"), [(1, True), (2, False), (3, False), (4, True)]
-    )
-    def test_heads_fewer_than_chiplets_are_ineligible(self, num_kv_heads, eligible):
-        spec = FullAttentionSpec(
-            block_size=8, num_kv_heads=num_kv_heads, head_size=4, dtype=torch.bfloat16
-        )
-        cfg = make_kv_cache_config([spec])
-        assert RBLNKVCacheManager.can_use_sub_block_caching(cfg, 4) is eligible
 
     def test_multi_group_all_must_be_eligible(self):
         # Every group must be eligible; one ineligible group flips it to False.
