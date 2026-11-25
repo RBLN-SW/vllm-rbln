@@ -34,7 +34,6 @@ from vllm.model_executor.models.gemma4_mm import (
     Gemma4MultiModalProcessor,
     Gemma4ProcessingInfo,
     Gemma4VideoInputs,
-    _get_max_soft_tokens,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
@@ -211,30 +210,6 @@ def split_gate_up_weights(model: nn.Module) -> set[str]:
     return names
 
 
-def mm_soft_token_default(info: Gemma4ProcessingInfo) -> int:
-    """The soft tokens an image takes when its request names none: the engine's
-    max_soft_tokens, else the HF image processor's own."""
-    model_config = info.ctx.model_config
-    default, _ = _get_max_soft_tokens(info.ctx.get_merged_mm_kwargs({}))
-    if default is None:
-        default = info.get_hf_processor().image_processor.max_soft_tokens
-        # Upstream counts an image without max_soft_tokens at
-        # default_output_length, while HF sizes it by its processor.
-        output_length = model_config.hf_config.vision_config.default_output_length
-        if default != output_length:
-            raise ValueError(
-                f"vision_config.default_output_length={output_length} differs "
-                f"from the image processor's max_soft_tokens={default}; set the "
-                "budget with --mm-processor-kwargs '{\"max_soft_tokens\": N}' "
-                "instead."
-            )
-    if default not in _SUPPORTED_SOFT_TOKENS:
-        raise ValueError(
-            f"max_soft_tokens={default} is not one of {_SUPPORTED_SOFT_TOKENS}."
-        )
-    return default
-
-
 class RBLNGemma4MultiModalProcessor(Gemma4MultiModalProcessor):
     """Upstream's processor, with every budget's HF processor built up front."""
 
@@ -335,20 +310,6 @@ class RBLNGemma4ForConditionalGeneration(
         if not any(mm_config.get_limit_per_prompt(m) > 0 for m in ("image", "video")):
             return
         budgets = self.encoder_token_budgets(vllm_config)
-        if mm_config.get_limit_per_prompt("image") > 0:
-            default = mm_soft_token_default(
-                MULTIMODAL_REGISTRY.create_processor(vllm_config.model_config).info
-            )
-            if default > budgets[-1]:
-                raise ValueError(
-                    f"max_soft_tokens={default}, the soft tokens an image takes "
-                    f"by default, is above {budgets[-1]}, the largest encoder "
-                    f"budget compiled ({budgets}). Lower it in "
-                    "--mm-processor-kwargs, or compile a larger budget: name it in "
-                    "--rbln-encoder-token-budgets, or lengthen the prefill step "
-                    "(--rbln-prefill-chunk-size, and --long-prefill-token-threshold "
-                    "or --max-num-scheduled-tokens where set)."
-                )
         pool = self.config.vision_config.pooling_kernel_size
         self.mm_encoder_patch_buckets = [budget * pool**2 for budget in budgets]
 

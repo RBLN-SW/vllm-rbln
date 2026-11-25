@@ -258,7 +258,7 @@ def _vllm_config(
     )
 
 
-def _built_model(monkeypatch, *, default, attention_layers=(), **config):
+def _built_model(monkeypatch, *, attention_layers=(), **config):
     """The model as construction resolves it, upstream's model left out."""
 
     def upstream_init(self, **kwargs):
@@ -269,14 +269,6 @@ def _built_model(monkeypatch, *, default, attention_layers=(), **config):
         Gemma4ForConditionalGeneration,
         "__init__",
         upstream_init,
-    )
-    monkeypatch.setattr(gemma4, "mm_soft_token_default", lambda info: default)
-    monkeypatch.setattr(
-        gemma4,
-        "MULTIMODAL_REGISTRY",
-        SimpleNamespace(
-            create_processor=lambda model_config: SimpleNamespace(info=None)
-        ),
     )
     model = RBLNGemma4ForConditionalGeneration.__new__(
         RBLNGemma4ForConditionalGeneration
@@ -296,7 +288,7 @@ def test_mm_prefix_mask_selects_only_sliding_layers(monkeypatch, use_mm_prefix):
         layer.attn = SimpleNamespace(use_mm_prefix=use_mm_prefix)
         layers.append(layer)
 
-    model = _built_model(monkeypatch, default=280, budgets=[], attention_layers=layers)
+    model = _built_model(monkeypatch, budgets=[], attention_layers=layers)
 
     assert model.layers[0].attn.use_mm_prefix == use_mm_prefix
     assert model.layers[1].attn.use_mm_prefix == use_mm_prefix
@@ -310,12 +302,12 @@ def test_mm_prefix_mask_selects_only_sliding_layers(monkeypatch, use_mm_prefix):
 def test_the_encoder_buckets_follow_encoder_token_budgets(
     monkeypatch, budgets, buckets
 ):
-    model = _built_model(monkeypatch, default=280, budgets=budgets)
+    model = _built_model(monkeypatch, budgets=budgets)
     assert model.mm_encoder_patch_buckets == buckets
 
 
-def test_unset_budgets_follow_the_prefill_chunk_not_the_default(monkeypatch):
-    model = _built_model(monkeypatch, default=280, budgets=[], chunk=2048)
+def test_unset_budgets_follow_the_prefill_chunk(monkeypatch):
+    model = _built_model(monkeypatch, budgets=[], chunk=2048)
     assert model.mm_encoder_patch_buckets == [
         budget * 9 for budget in (70, 140, 280, 560, 1120)
     ]
@@ -324,32 +316,19 @@ def test_unset_budgets_follow_the_prefill_chunk_not_the_default(monkeypatch):
 @pytest.mark.parametrize("cap", [{"long_prefill": 512}, {"scheduled": 512}])
 def test_unset_budgets_stop_at_the_shortest_step_cap(monkeypatch, cap):
     # The runner refuses a range either cap would split.
-    model = _built_model(monkeypatch, default=280, budgets=[], chunk=2048, **cap)
+    model = _built_model(monkeypatch, budgets=[], chunk=2048, **cap)
     assert model.mm_encoder_patch_buckets == [70 * 9, 140 * 9, 280 * 9]
 
 
 def test_a_step_holding_no_budget_is_refused(monkeypatch):
     with pytest.raises(ValueError, match="step of 64 tokens holds no Gemma4"):
-        _built_model(monkeypatch, default=280, budgets=[], long_prefill=64)
+        _built_model(monkeypatch, budgets=[], long_prefill=64)
 
 
 def test_text_only_serving_resolves_no_budgets(monkeypatch):
-    # No image can arrive, so neither a short step nor the default matters.
-    model = _built_model(
-        monkeypatch, default=280, budgets=[], long_prefill=64, limits={}
-    )
+    # No image can arrive, so a step too short for any budget does not matter.
+    model = _built_model(monkeypatch, budgets=[], long_prefill=64, limits={})
     assert model.mm_encoder_patch_buckets == []
-
-
-def test_video_only_serving_skips_the_image_default(monkeypatch):
-    model = _built_model(monkeypatch, default=560, budgets=[70], limits={"video": 1})
-    assert model.mm_encoder_patch_buckets == [70 * 9]
-
-
-@pytest.mark.parametrize("budgets, chunk", [([], 512), ([70, 140], 2048)])
-def test_a_default_above_the_largest_budget_is_refused(monkeypatch, budgets, chunk):
-    with pytest.raises(ValueError, match=r"max_soft_tokens=560, .* above (280|140)"):
-        _built_model(monkeypatch, default=560, budgets=budgets, chunk=chunk)
 
 
 def test_the_longest_range_is_the_largest_budget_not_the_default():
@@ -362,12 +341,12 @@ def test_the_longest_range_is_the_largest_budget_not_the_default():
 
 def test_budgets_the_processor_never_emits_are_refused(monkeypatch):
     with pytest.raises(ValueError, match=r"\[100, 300\] are not Gemma4"):
-        _built_model(monkeypatch, default=280, budgets=[300, 100, 280])
+        _built_model(monkeypatch, budgets=[300, 100, 280])
 
 
 def test_variants_with_per_layer_inputs_are_refused(monkeypatch):
     with pytest.raises(ValueError, match="per-layer inputs"):
-        _built_model(monkeypatch, default=280, budgets=[], per_layer_input=256)
+        _built_model(monkeypatch, budgets=[], per_layer_input=256)
 
 
 @pytest.mark.parametrize("scale_first", [True, False])
@@ -406,26 +385,6 @@ def _processing_info(engine_kwargs, processor_default, default_output_length):
         ),
         get_hf_processor=lambda: SimpleNamespace(image_processor=image_processor),
     )
-
-
-def test_the_engines_budget_overrides_the_processors():
-    info = _processing_info({"images_kwargs": {"max_soft_tokens": 1120}}, 280, 280)
-    assert gemma4.mm_soft_token_default(info) == 1120
-
-
-def test_a_default_output_length_the_processor_ignores_is_refused():
-    # HF would cut a 280-token image that upstream counts as 70.
-    info = _processing_info({}, 280, 70)
-    with pytest.raises(ValueError, match="--mm-processor-kwargs"):
-        gemma4.mm_soft_token_default(info)
-    info = _processing_info({"max_soft_tokens": 70}, 280, 70)
-    assert gemma4.mm_soft_token_default(info) == 70
-
-
-def test_an_unsupported_budget_is_refused():
-    info = _processing_info({"max_soft_tokens": 100}, 280, 280)
-    with pytest.raises(ValueError, match="not one of"):
-        gemma4.mm_soft_token_default(info)
 
 
 def test_construction_builds_the_hf_processor_of_every_budget(monkeypatch):
