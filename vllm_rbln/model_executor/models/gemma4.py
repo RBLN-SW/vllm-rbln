@@ -403,10 +403,14 @@ class RBLNGemma4ForConditionalGeneration(
                 )
                 positions = torch.stack([xs, ys], dim=-1).reshape(-1, 2)
                 pixels = torch.zeros(bucket_size, patch_pixels, dtype=_PATCH_DTYPE)
-                self._encode_vision(pixels, positions)
+                self._encode_vision(pixels, positions, warmup=True)
 
     def _encode_vision(
-        self, pixel_values: torch.Tensor, pixel_position_ids: torch.Tensor
+        self,
+        pixel_values: torch.Tensor,
+        pixel_position_ids: torch.Tensor,
+        *,
+        warmup: bool = False,
     ) -> torch.Tensor:
         """Encode one frame with (-1, -1) marking padded patch positions.
 
@@ -416,6 +420,7 @@ class RBLNGemma4ForConditionalGeneration(
         if buffered_encoder is None:
             raise RuntimeError("Vision encoding requires a compiled encoder")
         tower = self.vision_tower
+        start_ns = None if warmup else rbln_utils.start_mm_encoder_timing()
         valid = (pixel_position_ids >= 0).all(dim=-1)
         num_patches = int(valid.sum())
         assert num_patches <= self.mm_encoder_patch_buckets[-1], (
@@ -441,10 +446,14 @@ class RBLNGemma4ForConditionalGeneration(
         # The patches of a grid whose sides are multiples of the pooling kernel
         # pool into the leading cells, in order.
         num_soft_tokens = num_patches // tower.config.pooling_kernel_size**2
-        return rbln_utils.run_mm_encoder(
+        return rbln_utils.run_mm_encoder_with_timing(
             lambda *inputs: buffered_encoder.encoder(*inputs)[0],
             inputs,
             num_soft_tokens,
+            model="gemma4",
+            num_patches=num_patches,
+            start_ns=start_ns,
+            patch_axis=1,
         )
 
     def _mm_input_specs(self, bucket_size: int) -> list[rbln_utils.EncoderInput]:
