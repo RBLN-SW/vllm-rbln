@@ -617,6 +617,18 @@ def _override(vllm_config: "VllmConfig") -> None:
         if not cache_config.user_specified_mamba_block_size:
             cache_config.mamba_block_size = model_config.max_model_len
 
+    spec = vllm_config.speculative_config
+    if (
+        model_config.hf_text_config.model_type == "gemma4_text"
+        and spec is not None
+        and spec.use_gemma4_mtp()
+        and not spec.disable_eagle_block_drop
+    ):
+        # The assistant reads the target's KV and writes none, so the EAGLE block
+        # drop protects nothing. TODO(vllm>=0.34.1): delete with vllm#66234.
+        logger.info("Gemma4 MTP: keeping the last block of a prefix hit.")
+        spec.disable_eagle_block_drop = True
+
 
 def _wire(vllm_config: "VllmConfig") -> None:
     rbln_config: RBLNConfig = vllm_config.additional_config

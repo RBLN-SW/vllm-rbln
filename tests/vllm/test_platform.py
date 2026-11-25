@@ -604,6 +604,24 @@ class TestRejectedConfigs:
         assert config.cache_config.mamba_cache_mode == "none"
         assert config.cache_config.mamba_block_size == config.model_config.max_model_len
 
+    @pytest.mark.parametrize("gemma4_mtp", [True, False])
+    def test_gemma4_mtp_keeps_the_last_block_of_a_prefix_hit(
+        self, reconfigure, gemma4_mtp
+    ):
+        # Only the Gemma4 MTP assistant writes no KV of its own; another Gemma4
+        # drafter keeps the EAGLE block drop.
+        def gemma4(config):
+            config.model_config.hf_text_config.model_type = "gemma4_text"
+            config.speculative_config = SimpleNamespace(
+                method="mtp",
+                num_speculative_tokens=4,
+                use_gemma4_mtp=lambda: gemma4_mtp,
+                disable_eagle_block_drop=False,
+            )
+
+        config = reconfigure(gemma4)
+        assert config.speculative_config.disable_eagle_block_drop is gemma4_mtp
+
     def test_glm5_next_mtp_takes_16_bit_activations(self, reconfigure):
         def forced_to_fp32(config):
             _as_glm5_next(config)
