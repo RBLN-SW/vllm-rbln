@@ -25,6 +25,7 @@ from vllm_rbln import envs
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.inputs.engine import EngineInput
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
 
@@ -68,15 +69,38 @@ def check_and_update(vllm_config: "VllmConfig") -> None:
     _vllm_config = vllm_config
 
 
-def validate_request(params: "SamplingParams | PoolingParams") -> None:
+def validate_request(
+    processed_inputs: "EngineInput", params: "SamplingParams | PoolingParams"
+) -> None:
     from vllm.exceptions import VLLMValidationError
+    from vllm.model_executor.model_loader import get_model_architecture
     from vllm.sampling_params import SamplingParams
 
     from vllm_rbln.v1.core.utils import is_strict_kv_producer
 
+    assert _vllm_config is not None, "validate_request ran before check_and_update"
+    model_config = _vllm_config.model_config
+    # A range longer than the model's longest has no encoder graph or would be
+    # split by a step; either is an engine assert, so refuse the request here.
+    # Image and video ranges only, the ones the scheduler keeps whole.
+    if model_config.is_mm_prefix_lm and processed_inputs.get("mm_placeholders"):
+        model_cls, _ = get_model_architecture(model_config)
+        longest = model_cls.max_mm_prefix_range_len(_vllm_config)
+        for modality in ("image", "video"):
+            for placeholder in processed_inputs["mm_placeholders"].get(modality, []):
+                for first, last in placeholder.extract_embeds_range():
+                    if last + 1 - first > longest:
+                        raise VLLMValidationError(
+                            f"{modality.capitalize()} range of "
+                            f"{last + 1 - first} tokens is above {longest}, the "
+                            "longest the compiled graphs hold. Request a smaller "
+                            "one, or restart with a larger compiled encoder "
+                            "budget.",
+                            parameter="mm_processor_kwargs",
+                            value=last + 1 - first,
+                        )
     if not isinstance(params, SamplingParams):
         return
-    assert _vllm_config is not None, "validate_request ran before check_and_update"
     if not is_strict_kv_producer(_vllm_config):
         return
     if params.max_tokens is None or params.max_tokens > 1:
