@@ -3658,7 +3658,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             kv_cache_view_infos,
             bound | set(self.aux_kv_cache_specs),
         )
-        # Empty where no buffer is shared and every layer is its own input.
+        # Empty unless a drafter shares the target's KV.
         self.kv_cache_whole_block_copy = {
             name
             for name, info in zip(self.kv_cache_names, self.kv_cache_view_infos)
