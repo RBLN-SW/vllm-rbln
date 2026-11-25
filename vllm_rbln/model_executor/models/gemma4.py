@@ -16,13 +16,11 @@
 compiled and its image embeddings merged inside the compiled graph."""
 
 import math
-from collections.abc import Callable, Iterable, Mapping
-from functools import cached_property
+from collections.abc import Callable, Iterable
 
 import torch
 import torch.nn.functional as F
 from torch import nn
-from transformers import BatchFeature
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
 from vllm.forward_context import get_forward_context
@@ -39,7 +37,6 @@ from vllm.model_executor.models.gemma4_mm import (
     _get_max_soft_tokens,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.multimodal.parse import MultiModalDataItems
 from vllm.sequence import IntermediateTensors
 
 import vllm_rbln.utils as rbln_utils
@@ -214,62 +211,40 @@ def split_gate_up_weights(model: nn.Module) -> set[str]:
     return names
 
 
-def mm_soft_token_cap(info: Gemma4ProcessingInfo) -> int:
-    """The most soft tokens an image may take: the engine's max_soft_tokens,
-    else the HF image processor's own."""
+def mm_soft_token_default(info: Gemma4ProcessingInfo) -> int:
+    """The soft tokens an image takes when its request names none: the engine's
+    max_soft_tokens, else the HF image processor's own."""
     model_config = info.ctx.model_config
-    cap, _ = _get_max_soft_tokens(info.ctx.get_merged_mm_kwargs({}))
-    if cap is None:
-        cap = info.get_hf_processor().image_processor.max_soft_tokens
+    default, _ = _get_max_soft_tokens(info.ctx.get_merged_mm_kwargs({}))
+    if default is None:
+        default = info.get_hf_processor().image_processor.max_soft_tokens
         # Upstream counts an image without max_soft_tokens at
         # default_output_length, while HF sizes it by its processor.
-        default = model_config.hf_config.vision_config.default_output_length
-        if cap != default:
+        output_length = model_config.hf_config.vision_config.default_output_length
+        if default != output_length:
             raise ValueError(
-                f"vision_config.default_output_length={default} differs from "
-                f"the image processor's max_soft_tokens={cap}; set the budget "
-                "with --mm-processor-kwargs '{\"max_soft_tokens\": N}' instead."
+                f"vision_config.default_output_length={output_length} differs "
+                f"from the image processor's max_soft_tokens={default}; set the "
+                "budget with --mm-processor-kwargs '{\"max_soft_tokens\": N}' "
+                "instead."
             )
-    if cap not in _SUPPORTED_SOFT_TOKENS:
+    if default not in _SUPPORTED_SOFT_TOKENS:
         raise ValueError(
-            f"max_soft_tokens={cap} is not one of {_SUPPORTED_SOFT_TOKENS}."
+            f"max_soft_tokens={default} is not one of {_SUPPORTED_SOFT_TOKENS}."
         )
-    return cap
+    return default
 
 
 class RBLNGemma4MultiModalProcessor(Gemma4MultiModalProcessor):
-    """Upstream's processor, refusing per request an image budget above the
-    engine's."""
+    """Upstream's processor, with every budget's HF processor built up front."""
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        # Upstream caches one HF processor per max_soft_tokens; build each
-        # allowed budget's before serving.
+        # Upstream caches one HF processor per max_soft_tokens. A request may
+        # ask for any budget up to the compiled ceiling, which this processor
+        # cannot see; vllm_impl.validate_request refuses the ones above it.
         for budget in _SUPPORTED_SOFT_TOKENS:
-            if budget <= self._mm_soft_token_cap:
-                self.info.get_hf_processor(max_soft_tokens=budget)
-
-    @cached_property
-    def _mm_soft_token_cap(self) -> int:
-        return mm_soft_token_cap(self.info)
-
-    def _apply_hf_processor_main(
-        self,
-        mm_items: MultiModalDataItems,
-        hf_kwargs: Mapping[str, object],
-    ) -> BatchFeature:
-        # Video frames take a fixed budget of their own, below any cap.
-        if mm_items.get_count("image", strict=False):
-            budget, _ = _get_max_soft_tokens(
-                self.info.ctx.get_merged_mm_kwargs(hf_kwargs)
-            )
-            if isinstance(budget, int) and budget > self._mm_soft_token_cap:
-                raise ValueError(
-                    f"max_soft_tokens={budget} is above the engine's image budget "
-                    f"of {self._mm_soft_token_cap}; raise it with "
-                    "--mm-processor-kwargs at start-up."
-                )
-        return super()._apply_hf_processor_main(mm_items, hf_kwargs)
+            self.info.get_hf_processor(max_soft_tokens=budget)
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -280,6 +255,38 @@ class RBLNGemma4MultiModalProcessor(Gemma4MultiModalProcessor):
 class RBLNGemma4ForConditionalGeneration(
     Gemma4ForConditionalGeneration, SupportsRBLNMultiModal, SupportsRBLNMmPrefix
 ):
+    @classmethod
+    def encoder_token_budgets(cls, vllm_config: VllmConfig) -> list[int]:
+        """The soft token budgets the vision encoder compiles one graph each for;
+        an image or frame is padded to the smallest that holds it. Unset, every
+        budget the longest prefill chunk holds. Compile flags alone decide them,
+        so a scheduler cap shorter than the largest is refused by the runner,
+        not met by quietly compiling less."""
+        rbln_config = vllm_config.additional_config
+        longest_chunk = rbln_config.max_prefill_chunk_size
+        budgets = sorted(rbln_config.encoder_token_budgets) or [
+            budget for budget in _SUPPORTED_SOFT_TOKENS if budget <= longest_chunk
+        ]
+        if not budgets:
+            raise ValueError(
+                f"The longest prefill chunk ({longest_chunk}) holds no Gemma4 soft "
+                f"token budget; the smallest is {_SUPPORTED_SOFT_TOKENS[0]}. "
+                "Lengthen --rbln-prefill-chunk-size."
+            )
+        if unsupported := sorted(set(budgets) - set(_SUPPORTED_SOFT_TOKENS)):
+            raise ValueError(
+                f"encoder_token_budgets {unsupported} are not Gemma4 soft token "
+                f"budgets; pick from {list(_SUPPORTED_SOFT_TOKENS)}, the counts "
+                "its image processor emits."
+            )
+        return budgets
+
+    @classmethod
+    def max_mm_prefix_range_len(cls, vllm_config: VllmConfig) -> int:
+        # A request may ask for any compiled budget, and a video frame takes the
+        # smallest, so an image at the largest is the longest range.
+        return cls.encoder_token_budgets(vllm_config)[-1]
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         if vllm_config.parallel_config.data_parallel_size > 1:
             raise ValueError("Gemma4 does not support data parallel on RBLN.")
@@ -311,37 +318,29 @@ class RBLNGemma4ForConditionalGeneration(
                 and module.attn.use_mm_prefix
             ):
                 self.mm_prefix_attn_layers.append(module.attn)
-        cap = mm_soft_token_cap(
-            MULTIMODAL_REGISTRY.create_processor(vllm_config.model_config).info
-        )
-        # Video frames take the smallest budget, so an image at the cap is the
-        # longest range.
-        self.max_mm_prefix_range_len = cap
-        # One compiled encoder shape per budget; an image or frame is padded to
-        # the smallest that holds its patches. Unset, every budget a prefill
-        # chunk holds, so raising max_soft_tokens keeps the compiled graphs.
-        rbln_config = vllm_config.additional_config
-        budgets = sorted(rbln_config.encoder_token_budgets) or [
-            budget
-            for budget in _SUPPORTED_SOFT_TOKENS
-            if budget <= rbln_config.max_prefill_chunk_size
-        ]
-        if unsupported := sorted(set(budgets) - set(_SUPPORTED_SOFT_TOKENS)):
-            raise ValueError(
-                f"encoder_token_budgets {unsupported} are not Gemma4 soft token "
-                f"budgets; pick from {list(_SUPPORTED_SOFT_TOKENS)}, the counts "
-                "its image processor emits."
-            )
-        if budgets[-1] < cap:
-            raise ValueError(
-                f"encoder_token_budgets {budgets} must reach max_soft_tokens={cap}, "
-                "the most soft tokens an image may take; add a budget that large "
-                "or lower max_soft_tokens."
-            )
-        pool = self.config.vision_config.pooling_kernel_size
-        self.mm_encoder_patch_buckets = [budget * pool**2 for budget in budgets]
         self._mm_encoder: Callable[..., torch.Tensor] | None
         object.__setattr__(self, "_mm_encoder", None)
+        self.mm_encoder_patch_buckets: list[int] = []
+        mm_config = vllm_config.model_config.get_multimodal_config()
+        # Upstream builds no vision tower when images and video are off.
+        if not any(mm_config.get_limit_per_prompt(m) > 0 for m in ("image", "video")):
+            return
+        budgets = self.encoder_token_budgets(vllm_config)
+        if mm_config.get_limit_per_prompt("image") > 0:
+            default = mm_soft_token_default(
+                MULTIMODAL_REGISTRY.create_processor(vllm_config.model_config).info
+            )
+            if default > budgets[-1]:
+                raise ValueError(
+                    f"max_soft_tokens={default}, the soft tokens an image takes "
+                    f"by default, is above {budgets[-1]}, the largest encoder "
+                    f"budget compiled ({budgets}). Lower it in "
+                    "--mm-processor-kwargs, or compile a larger budget with a "
+                    "longer --rbln-prefill-chunk-size or with "
+                    "--rbln-encoder-token-budgets."
+                )
+        pool = self.config.vision_config.pooling_kernel_size
+        self.mm_encoder_patch_buckets = [budget * pool**2 for budget in budgets]
 
     @property
     def logits_processor(self) -> nn.Module:

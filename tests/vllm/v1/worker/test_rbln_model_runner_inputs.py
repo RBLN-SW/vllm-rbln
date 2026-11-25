@@ -231,9 +231,12 @@ class TestResolveMultiModalSupport:
 
 
 class _MmPrefixModel(_InGraphMergeModel):
-    def __init__(self, max_mm_prefix_range_len):
+    def __init__(self, longest):
         super().__init__()
-        self.max_mm_prefix_range_len = max_mm_prefix_range_len
+        self.longest = longest
+
+    def max_mm_prefix_range_len(self, vllm_config):
+        return self.longest
 
 
 class TestResolveMmPrefixSupport:
@@ -268,8 +271,9 @@ class TestResolveMmPrefixSupport:
             make_model_runner, monkeypatch, _MmPrefixModel(128), **{flag: 64}
         )
 
-        with pytest.raises(ValueError, match=flag):
+        with pytest.raises(ValueError, match=flag) as refused:
             runner._resolve_mm_support()
+        assert "--rbln-encoder-token-budgets" in str(refused.value)
 
     def test_a_threshold_and_chunk_equal_to_the_longest_range_are_taken(
         self, make_model_runner, monkeypatch
@@ -313,13 +317,14 @@ class TestResolveMmPrefixSupport:
         with pytest.raises(ValueError) as refused:
             runner._resolve_mm_support()
         message = str(refused.value)
+        # The examples have to parse: the flag takes space-separated sizes.
         assert (
-            "--max-num-batched-tokens 2048 --rbln-prefill-chunk-size 512,2048"
+            "--max-num-batched-tokens 2048 --rbln-prefill-chunk-size 512 2048"
             in message
         )
-        assert "--rbln-prefill-chunk-size 512,1152" in message
+        assert "--rbln-prefill-chunk-size 512 1152" in message
         assert (
-            "max_soft_tokens (1120)" in message
+            "range of 1120 tokens" in message
             and "divides --block-size (8192)" in message
         )
 

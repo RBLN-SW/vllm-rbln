@@ -1560,13 +1560,15 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     "(SupportsRBLNMmPrefix). Without it the ranges would run "
                     "causally."
                 )
-            longest = self.model.max_mm_prefix_range_len
+            longest = self.model.max_mm_prefix_range_len(self.vllm_config)
             for flag in ("long_prefill_token_threshold", "max_num_scheduled_tokens"):
                 cap = getattr(self.scheduler_config, flag)
                 if cap and cap < longest:
                     raise ValueError(
                         f"{flag}={cap} would split a multimodal range of up to "
-                        f"{longest} tokens."
+                        f"{longest} tokens. Raise it to at least {longest}, or "
+                        "lower the largest encoder budget with "
+                        "--rbln-encoder-token-budgets."
                     )
             chunks = self.rbln_config.prefill_chunk_size
             assert chunks is not None  # resolved at start-up
@@ -1581,26 +1583,27 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 small = min(chunks)
                 example = (
                     f"--max-num-batched-tokens {fit} "
-                    f"--rbln-prefill-chunk-size {small},{fit}"
+                    f"--rbln-prefill-chunk-size {small} {fit}"
                     + (f" --block-size {fit}" if fit > block_size else "")
                 )
                 if block_size % small == 0:
                     tight = -(-longest // 128) * 128
                     example += (
                         f", or --max-num-batched-tokens {tight} "
-                        f"--rbln-prefill-chunk-size {small},{tight}"
+                        f"--rbln-prefill-chunk-size {small} {tight}"
                     )
                 raise ValueError(
-                    f"--rbln-prefill-chunk-size {chunks} cannot serve "
-                    f"max_soft_tokens={longest}. The prefill chunk sizes need:\n"
+                    f"--rbln-prefill-chunk-size {chunks} cannot hold a multimodal "
+                    f"range of {longest} tokens, the largest encoder budget "
+                    "compiled. The prefill chunk sizes need:\n"
                     f"  1. each at most --max-num-batched-tokens, which is at most "
                     f"--block-size ({block_size});\n"
-                    f"  2. the longest at least max_soft_tokens ({longest}), since "
-                    "an image or video frame runs in one chunk;\n"
+                    f"  2. the longest at least {longest}, since an image or video "
+                    "frame runs in one chunk;\n"
                     f"  3. for sub-block prefix caching, one that divides "
                     f"--block-size ({block_size}).\n"
-                    f"For example {example}. Or lower max_soft_tokens in "
-                    "--mm-processor-kwargs."
+                    f"For example {example}. Or drop the budgets above the longest "
+                    "chunk from --rbln-encoder-token-budgets."
                 )
             # TODO(RBLN): the drafter's builders get no row ends, so its sliding
             # layers would run the ranges causally. A Gemma4 MTP assistant only
