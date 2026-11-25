@@ -310,8 +310,6 @@ def _vllm_config(
     *,
     budgets,
     chunk=512,
-    long_prefill=0,
-    scheduled=None,
     per_layer_input=0,
     limits=None,
 ):
@@ -320,10 +318,6 @@ def _vllm_config(
     return SimpleNamespace(
         parallel_config=SimpleNamespace(data_parallel_size=1),
         speculative_config=None,
-        scheduler_config=SimpleNamespace(
-            long_prefill_token_threshold=long_prefill,
-            max_num_scheduled_tokens=scheduled,
-        ),
         model_config=SimpleNamespace(
             max_model_len=32768,
             get_multimodal_config=lambda: mm_config,
@@ -395,16 +389,6 @@ def test_the_encoder_buckets_follow_encoder_token_budgets(
 
 def test_unset_budgets_follow_the_prefill_chunk_not_the_default(monkeypatch):
     model = _built_model(monkeypatch, default=280, budgets=[], chunk=2048)
-    assert model.mm_encoder_patch_buckets == [
-        budget * 9 for budget in (70, 140, 280, 560, 1120)
-    ]
-
-
-@pytest.mark.parametrize("cap", [{"long_prefill": 512}, {"scheduled": 512}])
-def test_scheduler_caps_leave_the_budgets_alone(monkeypatch, cap):
-    # A scheduler flag must not change what compiles, nor the mega-cache key;
-    # the runner refuses a cap shorter than the largest budget instead.
-    model = _built_model(monkeypatch, default=280, budgets=[], chunk=2048, **cap)
     assert model.mm_encoder_patch_buckets == [
         budget * 9 for budget in (70, 140, 280, 560, 1120)
     ]

@@ -1836,6 +1836,17 @@ class TestMmPrefixRangeRequests:
         )
         self._validate(monkeypatch, {"video": [video]})
 
+    def test_a_video_frame_above_the_ceiling_is_refused(self, monkeypatch):
+        from vllm.exceptions import VLLMValidationError
+        from vllm.multimodal.inputs import PlaceholderRange
+
+        frame = [False, False] + [True] * 140
+        video = PlaceholderRange(
+            offset=4, length=len(frame), is_embed=torch.tensor(frame)
+        )
+        with pytest.raises(VLLMValidationError, match="Video range of 140 tokens"):
+            self._validate(monkeypatch, {"video": [video]})
+
 
 # Resolving the vllm path reads the host's device now that RBLN-CA* refuses it,
 # so the chip is named here rather than inherited from whatever card ran this.
