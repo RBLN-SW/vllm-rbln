@@ -12,13 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from itertools import islice
+
 import torch
 import torch.nn.functional as F
 from vllm.config import VllmConfig
-from vllm.model_executor.models.gemma4 import Gemma4DecoderLayer, Gemma4MLP
+from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.models.gemma4 import (
+    Gemma4DecoderLayer,
+    Gemma4MLP,
+    Gemma4Model,
+)
 
 from vllm_rbln.patches import register_patch
 from vllm_rbln.patches.registry import add_registration
+from vllm_rbln.utils import is_prefill_step
 
 
 @register_patch(
@@ -35,13 +43,33 @@ def keep_the_rbln_attention_backend(vllm_config: VllmConfig) -> None:
     """Leave the attention backend to the RBLN platform."""
 
 
+def _read(norm, residual: torch.Tensor, cut: bool) -> torch.Tensor:
+    """The next block's input: RMSNorm(residual), on the cut op when `cut`."""
+    if cut:
+        return torch.ops.rbln_custom_ops.residual_read(
+            residual, norm.weight, norm.variance_epsilon
+        )
+    return norm(residual)
+
+
+def _write(norm, residual: torch.Tensor, y: torch.Tensor, cut: bool) -> torch.Tensor:
+    """residual + RMSNorm(y), on the cut op when `cut`; each norm passes its own eps."""
+    if cut:
+        return torch.ops.rbln_custom_ops.gemma4_dense_residual_write(
+            residual, y, norm.weight, norm.variance_epsilon
+        )
+    return norm(y) + residual
+
+
 @register_patch(
     target="vllm.model_executor.models.gemma4.Gemma4DecoderLayer.forward",
     reason=(
-        "Gemma4 routes on the residual, not on the experts' input, and hands "
-        "upstream's MoE runner precomputed logits. RBLNMoERunner takes a router "
-        "callable instead, as the patched qwen/deepseek/minimax/gpt-oss MoE "
-        "blocks pass it; this forward is upstream's with that one call changed."
+        "Gemma4 routes on the residual and hands upstream's MoE runner precomputed "
+        "logits; RBLNMoERunner takes a router callable, as the patched "
+        "qwen/deepseek/minimax/gpt-oss MoE blocks pass it. Upstream also cannot keep "
+        "a dense layer's residual split across chiplets: its adds and norms run as "
+        "rbln_custom_ops::{residual_read,gemma4_dense_residual_write}, which the "
+        "compiler cuts by tokens or by batch rows."
     ),
 )
 def patched_gemma4_decoder_layer_forward(
@@ -52,16 +80,20 @@ def patched_gemma4_decoder_layer_forward(
     per_layer_input: torch.Tensor | None = None,
     **kwargs,
 ) -> tuple[torch.Tensor, None]:
+    # The two dense ops cover one read and one write per block; a MoE layer reads
+    # the residual again for the router and a per-layer input adds to it before
+    # the scalar. The layer scalar stays upstream's multiply, so it runs on each
+    # chiplet's token slice and remains a constant the decode graph shares.
+    cut = not self.enable_moe_block and per_layer_input is None
     residual = hidden_states
-    hidden_states = self.input_layernorm(residual)
+    hidden_states = _read(self.input_layernorm, residual, cut)
     hidden_states = self.self_attn(
         positions=positions, hidden_states=hidden_states, **kwargs
     )
-    hidden_states = self.post_attention_layernorm(hidden_states)
-    hidden_states = hidden_states + residual
+    hidden_states = _write(self.post_attention_layernorm, residual, hidden_states, cut)
     residual = hidden_states
 
-    hidden_states = self.pre_feedforward_layernorm(hidden_states)
+    hidden_states = _read(self.pre_feedforward_layernorm, hidden_states, cut)
     hidden_states = self.mlp(hidden_states)
 
     if self.enable_moe_block:
@@ -76,8 +108,9 @@ def patched_gemma4_decoder_layer_forward(
         hidden_states_2 = self.post_feedforward_layernorm_2(hidden_states_2)
         hidden_states = hidden_states_1 + hidden_states_2
 
-    hidden_states = self.post_feedforward_layernorm(hidden_states)
-    hidden_states = hidden_states + residual
+    hidden_states = _write(
+        self.post_feedforward_layernorm, residual, hidden_states, cut
+    )
 
     if per_layer_input is not None and self.per_layer_input_gate is not None:
         gate = self.per_layer_input_gate(hidden_states)
@@ -88,6 +121,51 @@ def patched_gemma4_decoder_layer_forward(
         )
 
     return hidden_states * self.layer_scalar, None
+
+
+class ResidualReadNorm(RMSNorm):
+    """Gemma4's final norm, as rbln_custom_ops::residual_read in decode, where
+    the compiler cuts the residual by batch rows. The read gathers the rows;
+    left cut, they would reach lm_head, whose weight is embed_tokens' and takes
+    the layout prefill gives it."""
+
+    def forward(
+        self, x: torch.Tensor, residual: torch.Tensor | None = None
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if not is_prefill_step():
+            # The patched layers carry the residual in hidden_states.
+            assert residual is None
+            return torch.ops.rbln_custom_ops.residual_read(
+                x, self.weight, self.variance_epsilon
+            )
+        return super().forward(x, residual)
+
+
+_original_gemma4_model_init = Gemma4Model.__init__
+
+
+@register_patch(
+    target="vllm.model_executor.models.gemma4.Gemma4Model.__init__",
+    reason=(
+        "Upstream's final norm takes the layout the last layer leaves. A dense "
+        "layer without per-layer inputs leaves the decode residual cut by batch "
+        "rows, which must be gathered before lm_head shares embed_tokens' weight "
+        "with prefill, so a model with such a layer reads its final norm on "
+        "rbln_custom_ops::residual_read."
+    ),
+)
+def patched_gemma4_model_init(
+    self: Gemma4Model, *, vllm_config: VllmConfig, prefix: str = ""
+) -> None:
+    _original_gemma4_model_init(self, vllm_config=vllm_config, prefix=prefix)
+    layers = islice(self.layers, self.start_layer, self.end_layer)
+    if any(
+        not layer.enable_moe_block and not layer.hidden_size_per_layer_input
+        for layer in layers
+    ):
+        self.norm = ResidualReadNorm(
+            self.norm.hidden_size, eps=self.norm.variance_epsilon
+        )
 
 
 @add_registration(

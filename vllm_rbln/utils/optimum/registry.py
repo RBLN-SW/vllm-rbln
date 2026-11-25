@@ -44,7 +44,7 @@ _RBLN_GENERATION_MODELS: dict[str, tuple[str, str]] = {
     # logits, so it runs the generation graph -- as upstream vLLM does, resolving
     # it to Qwen3ForCausalLM. Classing it as pooling would compile
     # prefill_chunk_size == max_model_len, which the decoder graph cannot use.
-    "Qwen3ForSequenceClassification": ("qwen3", "RBLNQwen3ForCausalLM"),
+    "Qwen3ForSequenceClassification": ("qwen3_reranker", "RBLNQwen3ForCausalLM"),
 }
 
 _RBLN_ENCODER_DECODER_MODELS: dict[str, tuple[str, str]] = {
@@ -75,6 +75,11 @@ _RBLN_MULTIMODAL_MODELS = {
         "qwen3_vl",
         "RBLNQwen3VLForConditionalGeneration",
     ),
+    "Qwen3VLForSequenceClassification": (
+        "qwen3_vl_reranker",
+        "RBLNQwen3VLForConditionalGeneration",
+    ),
+    "Qwen3VLModel": ("qwen3_vl_embedding", "RBLNQwen3VLModel"),
     "Qwen3VLMoeForConditionalGeneration": (
         "qwen3_vl_moe",
         "RBLNQwen3VLMoeForConditionalGeneration",
@@ -105,7 +110,7 @@ _RBLN_MULTIMODAL_MODELS = {
     ),
 }
 
-_RBLN_EMBEDDING_MODELS = {
+_RBLN_TEXT_POOLING_MODELS = {
     "BertModel": ("bert_model", "RBLNBertModel"),
     "RobertaForSequenceClassification": (
         "roberta_classification",
@@ -116,14 +121,14 @@ _RBLN_EMBEDDING_MODELS = {
         "RBLNXLMRobertaForSequenceClassification",
     ),
     "XLMRobertaModel": ("xlm_roberta", "RBLNXLMRobertaModel"),
-    "Qwen3Model": ("qwen3", "RBLNQwen3Model"),
+    "Qwen3Model": ("qwen3_embedding", "RBLNQwen3Model"),
 }
 
 _RBLN_SUPPORTED_MODELS = {
     **_RBLN_GENERATION_MODELS,
     **_RBLN_ENCODER_DECODER_MODELS,
     **_RBLN_MULTIMODAL_MODELS,
-    **_RBLN_EMBEDDING_MODELS,
+    **_RBLN_TEXT_POOLING_MODELS,
 }
 
 
@@ -135,28 +140,29 @@ def is_multi_modal(config: PretrainedConfig) -> bool:
     return is_arch_supported(config, _RBLN_MULTIMODAL_MODELS)
 
 
-def is_pooling_arch(config: PretrainedConfig) -> bool:
-    return is_arch_supported(config, _RBLN_EMBEDDING_MODELS)
+def is_text_pooling_arch(config: PretrainedConfig) -> bool:
+    """Whether the architecture uses the text pooling compilation path."""
+    return is_arch_supported(config, _RBLN_TEXT_POOLING_MODELS)
 
 
-# Qwen3 embeddings are remapped from Qwen3ForCausalLM to Qwen3Model first.
-# These checks classify architecture names. Only Qwen3Model is decoder pooling.
-# Architecture        Decoder pooling  Encoder pooling
-# Qwen3Model          True             False
-# Qwen3ForCausalLM    False            False
 def is_decoder_pooling_arch(config: PretrainedConfig) -> bool:
     """Whether pooling uses a decoder graph with a KV cache."""
     architectures = getattr(config, "architectures", None) or []
-    return bool(architectures) and architectures[0] == "Qwen3Model"
+    return bool(architectures) and architectures[0] in ("Qwen3Model", "Qwen3VLModel")
 
 
 def is_encoder_pooling_arch(config: PretrainedConfig) -> bool:
     """Whether pooling uses an encoder graph without a KV cache."""
-    return is_pooling_arch(config) and not is_decoder_pooling_arch(config)
+    return is_text_pooling_arch(config) and not is_decoder_pooling_arch(config)
 
 
 def is_enc_dec_arch(config: PretrainedConfig) -> bool:
     return is_arch_supported(config, _RBLN_ENCODER_DECODER_MODELS)
+
+
+def is_chunked_prefill_arch(config: PretrainedConfig) -> bool:
+    """Whether the compiled model supports chunked prefill."""
+    return not (is_enc_dec_arch(config) or is_encoder_pooling_arch(config))
 
 
 def is_arch_supported(

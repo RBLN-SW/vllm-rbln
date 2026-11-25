@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import collections
 import dataclasses
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
@@ -33,6 +32,7 @@ from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.models.interfaces import (
+    SupportsMRoPE,
     SupportsMultiModal,
     supports_eagle3,
     supports_realtime,
@@ -59,6 +59,7 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
 )
 from vllm.v1.attention.backends.utils import create_fast_prefill_custom_backend
+from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.core.sched.output import (
     GrammarOutput,
     NewRequestData,
@@ -134,8 +135,14 @@ from vllm_rbln.model_executor.models.interfaces import (
 )
 from vllm_rbln.platform import use_device_tensor
 from vllm_rbln.v1.attention.backends.flash_attention import (
+    RBLNFlashAttentionMetadata,
     RBLNFlashAttentionMetadataBuilder,
 )
+from vllm_rbln.v1.attention.backends.gdn_attn import (
+    RBLNGDNAttentionMetadata,
+    RBLNGDNAttentionMetadataBuilder,
+)
+from vllm_rbln.v1.attention.backends.mla.indexer import RBLNDeepseekV32IndexerBackend
 from vllm_rbln.v1.attention.kv_cache_bindings import (
     KVCacheViewInfo,
     attach_kv_cache_bindings,
@@ -166,12 +173,10 @@ from vllm_rbln.v1.spec_decode.eagle3_pp import (
     aux_hidden_states_enabled,
     install_aux_handoff_slots,
 )
+from vllm_rbln.v1.spec_decode.gemma4 import RBLNGemma4Proposer
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
 from vllm_rbln.v1.worker import mega_cache
-from vllm_rbln.v1.worker.async_output import (
-    AsyncRBLNModelRunnerOutput,
-    PendingTokenWriteback,
-)
+from vllm_rbln.v1.worker.async_output import AsyncRBLNModelRunnerOutput
 from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
 from vllm_rbln.v1.worker.dp_utils import (
     BatchDescriptor,
@@ -190,9 +195,6 @@ from vllm_rbln.v1.worker.utils import (
     kv_cache_extents,
     prepare_kernel_block_sizes,
     reorder_input_batch,
-)
-from vllm_rbln.v1.worker.utils import (
-    num_attn_module as rbln_num_attn_module,
 )
 
 logger = init_logger(__name__)
@@ -307,6 +309,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         self.cascade_attn_enabled = not self.model_config.disable_cascade_attn
         # Set in load_model by _resolve_mm_support.
         self.supports_mm_inputs = False
+        # [3, tokens]: the T / H / W positions of an M-RoPE model that takes
+        # images (load_model); None when the model reads plain positions.
+        self.mrope_positions: torch.Tensor | None = None
 
         self.encoder_cache: dict[str, torch.Tensor] = {}
 
@@ -331,18 +336,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         else:
             self.sampler = Sampler(self.model_config.logprobs_mode)
 
-        # Async scheduling state. The sampled-token buffers live here because
-        # async scheduling is the runner's concern; the copy into them is
-        # enqueued by the sampler, next to the launch that produces the source.
-        self._prev_token_host_buffer: torch.Tensor | None = None
-        # Last step's sampled tokens, as (device, host copy, copy event).
-        self._prev_sampled_host: (
-            tuple[torch.Tensor, torch.Tensor, torch.Event | None] | None
-        ) = None
-        self._sampled_token_ring: list[torch.Tensor] = []
-        self._ring_slot = 0
+        # Async scheduling state.
+        self._prev_async_output: AsyncRBLNModelRunnerOutput | None = None
         self._async_logprobs_tensors: LogprobsTensors | None = None
-        self._pending_token_writeback: PendingTokenWriteback = collections.deque()
         self._placeholder_pos: dict[str, int] = {}
 
         # Lazy initialization
@@ -360,9 +356,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         # Under replays_accepted_drafts, the last position of each request's previous
         # step: the recurrent state's block that step stored, which the next loads.
         self.state_pos_by_req: dict[str, int] = {}
-        # KV cache layer names in layer-index order; the deterministic
-        # ordering the KV connector relies on for region<->layer agreement.
+        # KV cache layer names in the deterministic order
+        # the KV connector relies on for region<->layer agreement.
         self.kv_cache_names: list[str] = []
+        self.kv_cache_positions: dict[str, int] = {}
         self.kv_cache_allocations: dict[tuple, str] = {}
         # Initialize in initialize_kv_cache_tensors
         self.cross_layers_kv_cache: torch.Tensor | None = None
@@ -394,6 +391,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 self.drafter = RBLNMedusaProposer(self.vllm_config, self.device)
             elif self.speculative_config.method == "dflash":
                 self.drafter = RBLNDFlashProposer(self.vllm_config, self.device, self)
+            elif self.speculative_config.use_gemma4_mtp():
+                self.drafter = RBLNGemma4Proposer(self.vllm_config, self.device, self)
             elif self.speculative_config.use_eagle():
                 self.drafter = RBLNEagleProposer(self.vllm_config, self.device, self)
             else:
@@ -477,6 +476,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         self.discard_request_mask = torch.zeros(self.max_num_reqs, dtype=torch.bool)
         self.intermediate_tensors_dict: dict[tuple[int, int], IntermediateTensors] = {}
         self.input_stager = InputStager(self.device)
+        self._group_shared_staging: dict[tuple, torch.Tensor] = {}
 
         # OPTIMIZATION: Cache the tensors rather than creating them every step.
         # Keep in int64 to avoid overflow with long context
@@ -668,6 +668,27 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         cached_req_ids = self.input_batch.req_id_to_index.keys()
         resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
 
+        # Re-added requests and custom logits processor updates consume history.
+        # Repair it before those reads or a streaming update replaces it.
+        if (
+            self.use_async_scheduling
+            and self._prev_async_output is not None
+            and (
+                self.input_batch.logitsprocs_need_output_token_ids
+                or any(
+                    req_id in self._prev_async_output.placeholder_pos
+                    and (req_id not in cached_req_ids or req_id in resumed_req_ids)
+                    for req_id in scheduler_output.scheduled_cached_reqs.req_ids
+                )
+                or any(
+                    req.req_id in self._prev_async_output.placeholder_pos
+                    and req.req_id in self.requests
+                    for req in scheduler_output.scheduled_new_reqs
+                )
+            )
+        ):
+            self._repair_staged_input_ids()
+
         # Remove the unscheduled requests from the persistent batch.
         unscheduled_req_ids = cached_req_ids - (scheduled_req_ids - resumed_req_ids)
         for req_id in unscheduled_req_ids:
@@ -719,6 +740,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 lora_request=new_req_data.lora_request,
             )
             self.requests[req_id] = req_state
+            if self.mrope_positions is not None:
+                self._init_mrope_positions(req_state)
 
             if sampling_params and sampling_params.prompt_logprobs is not None:
                 self.num_prompt_logprobs[req_id] = (
@@ -910,7 +933,21 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         # `prompt_token_ids`.
         req_state.output_token_ids.clear()
 
+        if self.mrope_positions is not None:
+            self._init_mrope_positions(req_state)
+
         return req_state
+
+    def _init_mrope_positions(self, req_state: CachedRequestState) -> None:
+        assert req_state.prompt_token_ids is not None, (
+            "M-RoPE positions need the prompt's token ids"
+        )
+        (
+            req_state.mrope_positions,
+            req_state.mrope_position_delta,
+        ) = cast(SupportsMRoPE, self.model).get_mrope_input_positions(
+            req_state.prompt_token_ids, req_state.mm_features
+        )
 
     def _get_cumsum_and_arange(
         self,
@@ -993,6 +1030,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             arange,
             out=positions_np,
         )
+        if self.mrope_positions is not None:
+            self._fill_mrope_positions(num_reqs, positions_np, cu_num_tokens)
 
         # Get token indices.
         # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
@@ -1097,6 +1136,27 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             total_query_tokens,
         )
 
+    def _fill_mrope_positions(
+        self, num_reqs: int, positions_np: np.ndarray, cu_num_tokens: np.ndarray
+    ) -> None:
+        """The M-RoPE positions of this step's tokens: the request's precomputed
+        ones inside its prompt, the text position + the request's delta after."""
+        assert self.mrope_positions is not None
+        mrope_np = self.mrope_positions.numpy()
+        start = 0
+        for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+            req = self.requests[req_id]
+            assert req.mrope_positions is not None
+            assert req.mrope_position_delta is not None
+            end = int(cu_num_tokens[i])
+            text = positions_np[start:end]
+            in_prompt = text < req.mrope_positions.shape[1]
+            mrope_np[:, start:end] = text + req.mrope_position_delta
+            mrope_np[:, start:end][:, in_prompt] = req.mrope_positions[
+                :, text[in_prompt]
+            ].numpy()
+            start = end
+
     def _build_attention_metadata(
         self,
         num_tokens: int,
@@ -1106,6 +1166,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         logits_indices: torch.Tensor | None = None,
         back_pad: torch.Tensor | None = None,
         mm_prefix_row_ends: torch.Tensor | None = None,
+        defer_staging: bool = False,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -1161,6 +1222,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
 
             if kv_cache_gid > 0:
                 cm.block_table_tensor = _get_block_table(kv_cache_gid)
+            # _group_shared_staging gives every group one buffer for the slots
+            # derived from positions, query_start_loc and seq_lens, so a
+            # per-group value would silently reach every group as the last
+            # group's: only the block table may differ.
+            assert cm.query_start_loc is cm_base.query_start_loc
+            assert cm.seq_lens is cm_base.seq_lens
+            assert cm.num_reqs == cm_base.num_reqs
 
             # NOTE(RBLN): gate on the drafter, not speculative_config (which every
             # rank has): only the last PP rank drafts, and no other rank consumes
@@ -1175,7 +1243,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
                 attn_group = self.attn_groups[kv_cache_gid][attn_gid]
                 builder = attn_group.get_metadata_builder(0)
-                assert isinstance(builder, RBLNFlashAttentionMetadataBuilder)
+                assert isinstance(
+                    builder,
+                    (
+                        RBLNFlashAttentionMetadataBuilder,
+                        RBLNGDNAttentionMetadataBuilder,
+                    ),
+                )
 
                 attn_metadata_i = builder.build(
                     common_attn_metadata=cm,
@@ -1187,12 +1261,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     num_accepted=num_accepted,
                     state_load_pos=state_load_pos,
                     mm_prefix_row_ends=mm_prefix_row_ends,
+                    group_shared=self._group_shared_staging,
+                    defer_staging=defer_staging,
                 )
 
+                self.bind_kv_cache_to_metadata(attn_metadata_i)
                 for layer_name in attn_group.layer_names:
                     attn_metadata[layer_name] = attn_metadata_i
-
-        self._attach_kv_cache_bindings(attn_metadata)
 
         return attn_metadata, spec_decode_common_attn_metadata
 
@@ -1389,18 +1464,15 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
     ) -> tuple[
         StagedModelInputs,
         dict[str, Any],
+        InputLayout,
         ECConnectorOutput | None,
     ]:
-        """
-        :return: tuple[
-            staged_model_inputs,
-            model_kwargs,
-            ec_connector_output,
-        ]
-        """
+        """Prepare CPU inputs and model kwargs before staging graph inputs."""
         # For text-only models
         input_ids = self.input_ids[:num_input_tokens].view(num_reqs, -1)
         positions = self.positions[:num_input_tokens].view(num_reqs, -1)
+        if self.mrope_positions is not None:
+            positions = self.mrope_positions[:, :num_input_tokens].view(3, num_reqs, -1)
         inputs_embeds = None
 
         if get_pp_group().is_first_rank:
@@ -1420,7 +1492,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             query_len=input_ids.shape[1],
             query_len_padded=query_len_padded,
         )
-        staged_model_inputs = self.input_stager.stage(
+        model_inputs = StagedModelInputs(
             input_ids=input_ids,
             positions=positions,
             intermediate_tensors=intermediate_tensors,
@@ -1428,7 +1500,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             token_indices=logits_indices
             if is_prefill and self.use_wrapped_compute_logits
             else None,
-            layout=layout,
         )
 
         model_kwargs = {
@@ -1446,18 +1517,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 mm_rows, mm_mask = self._gather_mm_embeddings(
                     scheduler_output, num_input_tokens
                 )
-            model_kwargs["mm_embeds"], model_kwargs["mm_mask"] = (
-                self.input_stager.stage_mm_embeds(
-                    mm_rows,
-                    mm_mask.view(num_reqs, -1, 1),
-                    self.model_config.get_hidden_size(),
-                    layout,
-                )
-            )
+            model_kwargs["mm_embeds"] = mm_rows
+            model_kwargs["mm_mask"] = mm_mask.view(num_reqs, -1, 1)
 
         return (
-            staged_model_inputs,
+            model_inputs,
             model_kwargs,
+            layout,
             ec_connector_output,
         )
 
@@ -1537,8 +1603,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     "--mm-processor-kwargs."
                 )
             # TODO(RBLN): the drafter's builders get no row ends, so its sliding
-            # layers would run the ranges causally.
-            if self.speculative_config is not None:
+            # layers would run the ranges causally. A Gemma4 MTP assistant only
+            # queries the target's last position, which no range runs past.
+            spec = self.speculative_config
+            if spec is not None and not spec.use_gemma4_mtp():
                 raise ValueError(
                     "Speculative decoding is not supported with multimodal inputs of "
                     "an mm prefix LM on RBLN yet."
@@ -1582,6 +1650,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         self,
         scheduler_output: RBLNSchedulerOutput,
         num_tokens: int,
+        shift_computed_tokens: int = 0,
     ) -> tuple[list[tuple[int, int, torch.Tensor]], torch.Tensor]:
         mm_rows: list[tuple[int, int, torch.Tensor]] = []
         is_mm = torch.zeros(num_tokens, dtype=torch.bool)
@@ -1590,7 +1659,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         for req_index, req_id in enumerate(self.input_batch.req_ids):
             num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
             req_state = self.requests[req_id]
-            num_computed_tokens = req_state.num_computed_tokens
+            num_computed_tokens = req_state.num_computed_tokens + shift_computed_tokens
 
             for mm_feature in req_state.mm_features:
                 pos_info = mm_feature.mm_position
@@ -1674,21 +1743,16 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 logprobs_tensors=None,
             )
 
-        if self.use_async_scheduling:
-            self._repair_async_output_token_ids()
-
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
         num_reqs = self.input_batch.num_reqs
         if spec_decode_metadata is None:
             bucket = logits.shape[0]
-            # Keyed off the installed sampler: only RBLNSampler takes the kwarg,
-            # and the executor's golden validation swaps self.sampler after __init__.
-            extra: dict[str, Any] = {}
-            if isinstance(self.sampler, RBLNSampler):
-                extra["input_batch"] = self.input_batch
-                if self.use_async_scheduling:
-                    extra["staging_owner"] = self
+            extra = (
+                {"input_batch": self.input_batch}
+                if isinstance(self.sampler, RBLNSampler)
+                else {}
+            )
             out = self.sampler(
                 logits=logits,
                 sampling_metadata=_pad_sampling_metadata(sampling_metadata, bucket),
@@ -1710,133 +1774,63 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
 
         return _depad_sampler_output(out, num_reqs)
 
-    def _apply_pending_token_writeback(self) -> None:
-        """Put the real sampled tokens where every reader can see them.
-
-        Repairs CachedRequestState.output_token_ids too: token_ids_cpu is rebuilt
-        from it whenever a request re-enters the persistent batch.
-        """
-        input_batch = self.input_batch
-        while True:
-            try:
-                # Atomic against the output thread's append, so no lock.
-                req_ids, tokens, placeholder_pos = (
-                    self._pending_token_writeback.popleft()
-                )
-            except IndexError:
-                return
-            if not placeholder_pos:
-                continue
-            for i, req_id in enumerate(req_ids):
-                if i >= len(tokens) or not tokens[i]:
-                    continue
-                start = placeholder_pos.get(req_id)
-                if start is None:
-                    continue
-                sampled_ids = tokens[i]
-                req_state = self.requests.get(req_id)
-                if req_state is None:
-                    continue
-                output_offset = start - req_state.num_prompt_tokens
-                if not (
-                    0
-                    <= output_offset
-                    <= len(req_state.output_token_ids) - len(sampled_ids)
-                ):
-                    # The request rolled back past this step, so the tokens are
-                    # stale for token_ids_cpu too: it is rebuilt from
-                    # output_token_ids whenever the request re-enters the batch.
-                    continue
-                req_state.output_token_ids[
-                    output_offset : output_offset + len(sampled_ids)
-                ] = sampled_ids
-                req_index = input_batch.req_id_to_index.get(req_id)
-                if req_index is not None:
-                    input_batch.token_ids_cpu[
-                        req_index, start : start + len(sampled_ids)
-                    ] = sampled_ids
-
     def _repair_staged_input_ids(
-        self, staged_model_inputs: StagedModelInputs, req_ids: list[str]
+        self,
+        staged_model_inputs: StagedModelInputs | None = None,
+        req_ids: list[str] | None = None,
     ) -> None:
-        """Overwrite the scheduler's -1 placeholders with the previous step's tokens.
+        """Apply the previous output snapshot to CPU history and staged inputs.
 
-        Skips requests absent from the previous batch; they are repaired by
-        _apply_pending_token_writeback. Must run before this step's sampling,
-        which overwrites the ring slot prev_sampled_token_ids aliases.
+        Consume on the runner thread so output handling never mutates request
+        state. A request can leave the batch before its token finishes copying.
         """
-        prev_sampled = self.input_batch.prev_sampled_token_ids
-        prev_req_id_to_index = self.input_batch.prev_req_id_to_index
-        if self.is_prefill or prev_sampled is None or prev_req_id_to_index is None:
+        previous = self._prev_async_output
+        if previous is None:
             return
 
+        host = previous.get_sampled_token_ids_cpu()
+        tokens = host.tolist()
+        input_batch = self.input_batch
         prev_rows, cur_rows = [], []
-        any_skipped = False
-        for cur_row, req_id in enumerate(req_ids):
-            prev_row = prev_req_id_to_index.get(req_id)
-            if prev_row is None:
-                any_skipped = True
+        for prev_row, req_id in enumerate(previous.req_ids):
+            start = previous.placeholder_pos.get(req_id)
+            if start is None:
                 continue
-            prev_rows.append(prev_row)
-            cur_rows.append(cur_row)
-        if not prev_rows:
-            return
-
-        # Remap on the host: any eager device op reading the ring makes the copy
-        # that refills it wait, which costs most of a decode step.
-        num_prev = prev_sampled.shape[0]
-        host_buffer = self._prev_token_host_buffer
-        if (
-            host_buffer is None
-            or host_buffer.shape[0] < num_prev
-            or host_buffer.dtype != prev_sampled.dtype
-        ):
-            host_buffer = torch.empty(num_prev, dtype=prev_sampled.dtype)
-            self._prev_token_host_buffer = host_buffer
-        host = host_buffer[:num_prev]
-        host.copy_(prev_sampled[:num_prev, 0])
-
-        input_ids = staged_model_inputs.input_ids
-        # Equal row lists are not the identity prefix: a skipped request leaves a
-        # hole, and [0, 2, 3] written contiguously lands on rows 0, 1, 2.
-        if not any_skipped and cur_rows == prev_rows:
-            input_ids[: len(cur_rows), 0].copy_(host[: len(cur_rows)])
-        else:
-            input_ids[cur_rows, 0] = host[prev_rows].to(input_ids.dtype)
-
-    def _repair_async_output_token_ids(self) -> None:
-        """Replace the -1 tail of output_token_ids before the logits processors read it.
-
-        _apply_pending_token_writeback is a step too late; prev_sampled_token_ids
-        carries the token now.
-        """
-        output_token_ids = self.input_batch.sampling_metadata.output_token_ids
-        prev_sampled = self.input_batch.prev_sampled_token_ids
-        prev_req_id_to_index = self.input_batch.prev_req_id_to_index
-        if not output_token_ids or prev_sampled is None or prev_req_id_to_index is None:
-            return
-
-        sampled: list[int] | None = None
-        for req_index, req_id in enumerate(self.input_batch.req_ids):
-            prev_row = prev_req_id_to_index.get(req_id)
-            if prev_row is None:
+            req_state = self.requests.get(req_id)
+            if req_state is None:
                 continue
-            req_output_token_ids = output_token_ids[req_index]
-            if not req_output_token_ids or req_output_token_ids[-1] != -1:
+            sampled_ids = tokens[prev_row]
+            output_offset = start - req_state.num_prompt_tokens
+            if not (
+                0 <= output_offset <= len(req_state.output_token_ids) - len(sampled_ids)
+            ):
                 continue
-            if sampled is None:
-                sampled = self._prev_sampled_tokens(prev_sampled)
-            req_output_token_ids[-1] = sampled[prev_row]
+            req_state.output_token_ids[
+                output_offset : output_offset + len(sampled_ids)
+            ] = sampled_ids
+            req_index = input_batch.req_id_to_index.get(req_id)
+            if req_index is None:
+                continue
+            input_batch.token_ids_cpu[req_index, start : start + len(sampled_ids)] = (
+                sampled_ids
+            )
+            if staged_model_inputs is not None and not self.is_prefill:
+                assert req_ids is not None
+                assert req_ids[req_index] == req_id
+                prev_rows.append(prev_row)
+                cur_rows.append(req_index)
 
-    def _prev_sampled_tokens(self, prev_sampled: torch.Tensor) -> list[int]:
-        # Read the async output's D2H, which queues ahead of this step's forward.
-        # prev_sampled.tolist() would wait for that forward to finish.
-        host = self._prev_sampled_host
-        if host is not None and host[0] is prev_sampled:
-            if host[2] is not None:
-                host[2].synchronize()
-            return host[1][:, 0].tolist()
-        return prev_sampled[:, 0].tolist()
+        if cur_rows:
+            assert staged_model_inputs is not None and req_ids is not None
+            input_ids = staged_model_inputs.input_ids
+            if cur_rows == list(range(len(req_ids))) and prev_rows == cur_rows:
+                input_ids[: len(cur_rows), 0].copy_(host[: len(cur_rows), 0])
+            else:
+                input_ids[cur_rows, 0] = host[prev_rows, 0].to(input_ids.dtype)
+
+        # The runner owns this reference even on ranks without get_output().
+        # Release only after D2H completes; the output thread keeps its own ref.
+        self._prev_async_output = None
 
     def _bookkeeping_sync(
         self,
@@ -1921,14 +1915,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
             invalid_req_indices_set = set(invalid_req_indices)
             self._placeholder_pos = {}
-            if self.input_batch.prev_sampled_token_ids is None:
-                assert sampled_token_ids.shape[-1] == 1
-                self.input_batch.prev_sampled_token_ids = sampled_token_ids
-            self.input_batch.prev_req_id_to_index = {
-                req_id: i
-                for i, req_id in enumerate(self.input_batch.req_ids)
-                if i not in invalid_req_indices_set
-            }
 
         # Cache the sampled tokens in the model runner, so that the scheduler
         # doesn't need to send them back.
@@ -2072,10 +2058,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             scheduler_output, strict_kv_producer=self.is_strict_kv_producer
         )
 
-        # Before anything reads token_ids_cpu this step.
-        if self.use_async_scheduling:
-            self._apply_pending_token_writeback()
-
         if has_kv_transfer_group():
             kv_connector_metadata = scheduler_output.kv_connector_metadata
             assert kv_connector_metadata is not None
@@ -2104,6 +2086,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             # pass so that partially cached blocks are populated.
             if scheduler_output.kv_cache_copy_ops:
                 self._process_kv_cache_copy_ops(scheduler_output.kv_cache_copy_ops)
+            if scheduler_output.kv_cache_block_copies:
+                self._copy_kv_cache_blocks(scheduler_output.kv_cache_block_copies)
 
             if not num_scheduled_tokens:
                 if not has_kv_transfer_group():
@@ -2181,12 +2165,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     logits_indices=logits_indices,
                     back_pad=self.decode_back_pad,
                     mm_prefix_row_ends=mm_prefix_row_ends,
+                    defer_staging=True,
                 )
             )
 
             (
-                staged_model_inputs,
+                model_inputs,
                 model_kwargs,
+                input_layout,
                 ec_connector_output,
             ) = self._preprocess(
                 scheduler_output,
@@ -2198,8 +2184,31 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             )
 
             if self.use_async_scheduling:
-                self._repair_staged_input_ids(staged_model_inputs, req_ids)
+                self._repair_staged_input_ids(model_inputs, req_ids)
 
+            staged_model_inputs = self.input_stager.stage(
+                **model_inputs.as_kwargs(), layout=input_layout
+            )
+            if (
+                self.supports_mm_inputs
+                and self.is_prefill
+                and get_pp_group().is_first_rank
+            ):
+                model_kwargs["mm_embeds"], model_kwargs["mm_mask"] = (
+                    self.input_stager.stage_mm_embeds(
+                        model_kwargs["mm_embeds"],
+                        model_kwargs["mm_mask"],
+                        self.model_config.get_hidden_size(),
+                        input_layout,
+                    )
+                )
+
+            for groups in self.attn_groups:
+                for group in groups:
+                    builder = group.get_metadata_builder(0)
+                    builder.stage(
+                        attn_metadata[group.layer_names[0]], self._group_shared_staging
+                    )
         # Run the model.
         # With spec decode, defer connector finalization (wait_for_save + clear
         # metadata) until after the draft runs in sample_tokens() so the draft
@@ -2216,7 +2225,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 num_tokens=num_query_tokens,
                 num_tokens_across_dp=num_tokens_across_dp,
                 num_padded_tokens=batch_desc.num_tokens_padded,
-                **build_kv_cache_forward_context_kwargs(self.kv_cache_bases),
+                **self.kv_cache_forward_context_kwargs(),
             ),
             record_function_or_nullcontext("rbln_model_runner: forward"),
             self.maybe_get_kv_connector_output(
@@ -2373,12 +2382,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     1, device=self.device, dtype=torch.int32
                 ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
 
-        # Async scheduling caches this step's sampled tokens in prev_sampled_token_ids
-        # via the `is None` guard in _bookkeeping_sync. Reset here so the guard stores
-        # THIS step's tokens; otherwise it freezes at the first decode token.
-        if self.use_async_scheduling:
-            self.input_batch.prev_sampled_token_ids = None
-
         with record_function_or_nullcontext("rbln_model_runner: bookkeep"):
             (
                 num_nans_in_logits,
@@ -2450,7 +2453,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             model_runner_output=output,
             sampled_token_ids=sampler_output.sampled_token_ids,
             invalid_req_indices=invalid_req_indices,
-            pending_token_writeback=self._pending_token_writeback,
             req_ids=list(self.input_batch.req_ids),
             placeholder_pos=dict(self._placeholder_pos),
             logprobs_tensors=self._async_logprobs_tensors,
@@ -2458,10 +2460,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             rank=self.parallel_config.rank,
             dp_rank=self.parallel_config.data_parallel_rank,
         )
-        self._prev_sampled_host = (
-            sampler_output.sampled_token_ids,
-            *async_output.host_copy(),
-        )
+        assert self._prev_async_output is None
+        self._prev_async_output = async_output
         return async_output
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
@@ -2586,6 +2586,22 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 target_token_ids = self.input_ids[:total_num_tokens]
                 target_positions = self.positions[:total_num_tokens]
 
+            mm_kwargs: dict[str, Any] = {}
+            if self.supports_mm_inputs and self.drafter.supports_mm_inputs:
+                if self.is_prefill:
+                    mm_kwargs["mm_embed_inputs"] = self._gather_mm_embeddings(
+                        scheduler_output,
+                        target_token_ids.shape[0],
+                        shift_computed_tokens=(
+                            self.vllm_config.num_prefill_lookahead_tokens
+                        ),
+                    )
+                if self.drafter.uses_mrope:
+                    assert self.mrope_positions is not None
+                    mm_kwargs["target_mrope_positions"] = self.mrope_positions[
+                        :, : target_token_ids.shape[0]
+                    ]
+
             draft_token_ids = self.drafter.propose(
                 target_token_ids=target_token_ids,
                 target_positions=target_positions,
@@ -2593,8 +2609,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 next_token_ids=next_token_ids,
                 token_indices_to_sample=token_indices_to_sample,
                 common_attn_metadata=common_attn_metadata,
-                mm_embed_inputs=None,
                 num_rejected_tokens=num_rejected_tokens,
+                **mm_kwargs,
             )
 
         return draft_token_ids
@@ -2612,6 +2628,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 vllm_config=self.vllm_config, model_config=self.model_config
             )
         self.supports_mm_inputs = self._resolve_mm_support()
+        if self.supports_mm_inputs and self.model_config.uses_mrope:
+            self.mrope_positions = torch.zeros(
+                3, self.max_num_tokens, dtype=torch.int64
+            )
 
         if hasattr(self.model, "logits_processor"):
             self.logits_processor = self.model.logits_processor
@@ -2648,7 +2668,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             install_aux_handoff_slots(self.model)
 
         self._make_weights_contiguous()
-        if envs.VLLM_RBLN_USE_NESTED_COMPILE_REGION:
+        if envs.VLLM_RBLN_USE_NESTED_COMPILE_REGION is not False:
             mark_decoder_regions(self.model)
 
         # NOTE(RBLN): This wrapper is designed to be compiled by torch.compile.
@@ -3013,7 +3033,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
 
         input_ids = self.input_ids[:num_tokens]
         inputs_embeds = None
-        positions = self.positions[:num_tokens]
+        positions = self.positions[:num_tokens].view(num_reqs, target_query_len)
+        if self.mrope_positions is not None:
+            positions = positions.expand(3, num_reqs, target_query_len)
         token_indices: torch.Tensor | None = None
         if self.use_wrapped_compute_logits and is_prefill:
             token_indices = torch.arange(
@@ -3044,7 +3066,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         # NOTE(RBLN): Clone tensors to make tensors non-view tensors.
         staged_model_input = self.input_stager.stage(
             input_ids=input_ids.view(num_reqs, target_query_len),
-            positions=positions.view(num_reqs, target_query_len),
+            positions=positions,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
             token_indices=token_indices,
@@ -3057,7 +3079,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             num_tokens=num_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
             num_padded_tokens=batch_desc.num_tokens_padded,
-            **build_kv_cache_forward_context_kwargs(self.kv_cache_bases),
+            **self.kv_cache_forward_context_kwargs(),
         ):
             _ = self.model_executable(
                 **staged_model_input.as_kwargs(), **self._dummy_mm_kwargs(layout)
@@ -3103,6 +3125,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
     @torch.inference_mode()
     def _dummy_sampler_run(self, num_reqs: int) -> None:
         from vllm_rbln.v1.sample import WARM_UP_CONFIGS
+
+        sampler = self.sampler
+        if not isinstance(sampler, RBLNSampler):
+            return
 
         logits = torch.randn(
             (num_reqs, self.model_config.get_vocab_size()),
@@ -3153,10 +3179,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 spec_token_ids=[[] for _ in range(num_reqs)],
             )
 
-            if isinstance(self.sampler, RBLNSampler):
-                self.sampler.warm_up(logits=logits, sampling_metadata=dummy_metadata)
-            else:
-                _ = self.sampler(logits=logits, sampling_metadata=dummy_metadata)
+            sampler.warm_up(logits=logits, sampling_metadata=dummy_metadata)
 
             if num_reqs > 1:
                 # A batch smaller than the bucket takes `_pad_rows`'s `torch.cat`
@@ -3170,7 +3193,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     top_p=shorter(dummy_metadata.top_p),
                     top_k=shorter(dummy_metadata.top_k),
                 )
-                _ = self.sampler(
+                _ = sampler(
                     logits=logits,
                     sampling_metadata=_pad_sampling_metadata(short_metadata, num_reqs),
                 )
@@ -3601,13 +3624,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             kv_cache_view_infos,
         )
 
-        num_attn_module = rbln_num_attn_module(
-            self.model_config, self.cache_config.cache_dtype
-        )
+        forward_context = self.compilation_config.static_forward_context
+        self.kv_cache_names = get_kv_cache_names(kv_caches)
+        self.kv_cache_positions = {
+            name: position for position, name in enumerate(self.kv_cache_names)
+        }
         self._update_kv_cache_base_bindings(
             kv_cache_bases_by_layer,
             kv_cache_view_infos,
-            num_attn_module,
         )
         if dynamic_kv_enabled(self.vllm_config) and self.kv_cache_bases:
             # With shared bases these are the graph inputs and the per-layer
@@ -3626,25 +3650,16 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 len(self.kv_cache_bases),
                 tuple(self.kv_cache_bases[0].shape),
             )
-        self.kv_cache_names = get_kv_cache_names(kv_caches, num_attn_module)
         self.kv_caches = [kv_caches[name] for name in self.kv_cache_names]
         # The runner owns the cache storage until sizing finishes. Rebuild keys
         # on allocation so addresses are never matched across cache generations.
         self.kv_cache_allocations = {}
-        for name, cache in zip(self.kv_cache_names, self.kv_caches):
-            key = kv_cache_tensor_key(cache)
-            self.kv_cache_allocations.setdefault(key, name)
+        for name, cache in zip(self.kv_cache_names, self.kv_caches, strict=True):
+            if name not in self.shared_kv_cache_layers:
+                self.kv_cache_allocations.setdefault(kv_cache_tensor_key(cache), name)
         self.kv_cache_block_axes = block_axes
-        forward_context = self.compilation_config.static_forward_context
         for layer_name, kv_cache in kv_caches.items():
             forward_context[layer_name].kv_cache = kv_cache
-        # A layer reads the cache at its position in this list. The index set at
-        # construction assumes `num_attn_module` caches per layer, which a layer
-        # owning fewer (a MiniMax-M3 dense layer has no indexer cache) breaks.
-        for position, layer_name in enumerate(self.kv_cache_names):
-            layer = forward_context[layer_name]
-            assert hasattr(layer, "layer_index"), layer_name
-            layer.layer_index = position
 
         if not use_device_tensor() and not self.model_config.enforce_eager:
             # `mark_static_address` is last-write-wins on storage->name. Pin to
@@ -3686,9 +3701,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             assert isinstance(spec, RBLNBlockAuxSpec), spec
             assert spec.owner in extent_of, f"{layer_name}: no owner {spec.owner}"
             if spec.verify_only and self.is_strict_kv_producer:
-                # No graph a strict producer compiles places it. Its module's
-                # construction-time layer_index could name another layer's cache.
-                module.layer_index = None
+                # Strict KV producers skip allocating verification-only caches.
                 continue
             shape = (num_blocks, *spec.block_shape)
             kind = (spec.owner, shape, spec.dtype)
@@ -3766,6 +3779,20 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         )
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
         self.initialize_attn_backend(kv_cache_config)
+        # NOTE(RBLN): FP8 DSA scale stores silently drop writes past a KV block.
+        if self.cache_config.cache_dtype.startswith("fp8"):
+            for group in self._kv_cache_spec_attn_group_iterator():
+                if group.backend is RBLNDeepseekV32IndexerBackend:
+                    block_size = group.kv_cache_spec.block_size
+                    if any(block_size % c for c in self.prefill_chunk_sizes):
+                        raise ValueError(
+                            "The FP8 DSA indexer scale cache requires block_size "
+                            f"({block_size}) to be a multiple of every prefill "
+                            "bucket; got "
+                            f"prefill_chunk_size={self.prefill_chunk_sizes}. "
+                            "A scale update cannot cross a KV block, even when "
+                            "prefix or sub-block caching is disabled."
+                        )
         # The kernel block size for all KV cache groups. For example, if
         # kv_cache_manager uses block_size 256 for a given group, but the attention
         # backends for that group only supports block_size 64, we will return
@@ -3780,6 +3807,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 block_size=self.cache_config.block_size,
                 prefill_chunk_sizes=self.prefill_chunk_sizes,
                 kv_cache_config=kv_cache_config,
+                model_config=self.model_config,
+                cache_dtype=self.cache_config.cache_dtype,
                 sub_block_size=self.rbln_config.sub_block_size,
             ),
         )
@@ -3949,18 +3978,19 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             and not ec_config.is_ec_producer
         )
 
-    def _attach_kv_cache_bindings(
-        self, attn_metadata: PerLayerAttnMetadata | None
+    def bind_kv_cache_to_metadata(
+        self, attn_metadata: RBLNFlashAttentionMetadata | RBLNGDNAttentionMetadata
     ) -> None:
-        if attn_metadata is None:
-            return
-        for attn_metadatum in attn_metadata.values():
-            attach_kv_cache_bindings(
-                attn_metadatum,
-                self.kv_caches,
-                self.kv_cache_bases,
-                self.kv_cache_view_infos,
-            )
+        attach_kv_cache_bindings(
+            attn_metadata,
+            self.kv_caches,
+            self.kv_cache_bases,
+            self.kv_cache_view_infos,
+            kv_cache_positions=self.kv_cache_positions,
+        )
+
+    def kv_cache_forward_context_kwargs(self) -> dict[str, tuple[torch.Tensor, ...]]:
+        return build_kv_cache_forward_context_kwargs(self.kv_cache_bases)
 
     def _determine_batch_execution_and_padding(
         self,
@@ -4028,7 +4058,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         self,
         kv_cache_bases_by_layer: dict[str, torch.Tensor],
         kv_cache_view_infos_by_layer: dict[str, KVCacheViewInfo],
-        num_attn_module: int,
     ) -> None:
         if not kv_cache_view_infos_by_layer:
             self.kv_cache_bases = []
@@ -4038,7 +4067,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         kv_cache_bases, kv_cache_view_infos = build_kv_cache_base_bindings(
             kv_cache_bases_by_layer,
             kv_cache_view_infos_by_layer,
-            num_attn_module=num_attn_module,
+            layer_names=self.kv_cache_names,
         )
         # If no deduplication occurred (each layer has its own unique base),
         # the new system adds overhead without benefit — disable it.
@@ -4166,6 +4195,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                         ),
                     )
                 )
+        # Random bonus sampling needs the largest workspace. Warm it first for reuse.
+        variants.sort(key=lambda variant: variant[1].all_greedy)
         # Synthetic mode feeds one more input, i.e. a distinct compiled variant.
         for bonus_kwargs, sampling_metadata in variants:
             self.rejection_sampler.impl.rejection_sample(
@@ -4304,6 +4335,29 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             direction,
             block_axes=self.kv_cache_block_axes,
         )
+
+    def _copy_kv_cache_blocks(self, copies: list[KVCacheBlockCopy]) -> None:
+        """Upstream's copy-on-write of a block a partial prefix hit privatizes.
+
+        A copy names a block, not its group, and every group indexes the one
+        block pool, so each cache copies the page; a page another group owns is
+        unused by its own group there.
+        """
+        assert use_device_tensor() or self.model_config.enforce_eager
+        dsts: list[torch.Tensor] = []
+        srcs: list[torch.Tensor] = []
+        seen: set[int] = set()
+        for layer_name, kv_cache in zip(
+            self.kv_cache_names, self.kv_caches, strict=True
+        ):
+            if kv_cache.data_ptr() in seen:
+                continue
+            seen.add(kv_cache.data_ptr())
+            axis = self.kv_cache_block_axes[layer_name]
+            for block_copy in copies:
+                dsts.append(kv_cache.select(axis, block_copy.dst_block_id))
+                srcs.append(kv_cache.select(axis, block_copy.src_block_id))
+        torch._foreach_copy_(dsts, srcs)
 
     def _process_kv_cache_copy_ops(
         self,

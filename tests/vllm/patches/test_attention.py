@@ -26,6 +26,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 
 from vllm_rbln.patches import attention
 from vllm_rbln.patches.attention import patched_get_kv_cache_spec
+from vllm_rbln.v1.attention import kv_cache_bindings
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 
 
@@ -148,14 +149,17 @@ class TestKvTransferWrap:
             def forward(self, layer, q, k, v, kv_cache, attn_metadata, **kwargs):
                 impl_saw["kv_cache"] = kv_cache
 
-        layer = SimpleNamespace(layer_index=0, impl=_Impl(), kv_cache=embedded)
+        layer = SimpleNamespace(impl=_Impl(), kv_cache=embedded)
         context = SimpleNamespace(
-            attn_metadata=SimpleNamespace(kv_caches=[torch.zeros(1)]),
+            attn_metadata=SimpleNamespace(
+                kv_caches=[torch.zeros(1)], kv_cache_positions={"layer.0": 0}
+            ),
             no_compile_layers={"layer.0": layer},
             slot_mapping={"layer.0": torch.zeros(1)},
             additional_kwargs={},
         )
         monkeypatch.setattr(attention, "get_forward_context", lambda: context)
+        monkeypatch.setattr(kv_cache_bindings, "get_forward_context", lambda: context)
         # Upstream's own get_attention_context reads it from its module too, so
         # a wrap that closed over that one runs here rather than raising, and
         # the assertions below show what it hands the connector instead.

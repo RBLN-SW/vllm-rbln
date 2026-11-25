@@ -35,11 +35,10 @@ from vllm_rbln.compilation import (
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.logger import init_logger
-from vllm_rbln.platform import use_device_tensor
-from vllm_rbln.v1.attention.kv_cache_bindings import (
-    attach_kv_cache_bindings,
-    build_kv_cache_forward_context_kwargs,
+from vllm_rbln.model_executor.models.interfaces import (
+    supports_rbln_multimodal_embeddings,
 )
+from vllm_rbln.platform import use_device_tensor
 from vllm_rbln.v1.spec_decode import pass_state
 from vllm_rbln.v1.spec_decode.utils import (
     eagle_prepare_inputs_padded,
@@ -83,6 +82,9 @@ class RBLNEagleProposer(EagleProposer):
         # still gets the NPU, where the draft model itself keeps running.
         super().__init__(vllm_config, torch.device("cpu"), runner)
         self.device = device
+        if self.uses_mrope:
+            # Cache addresses follow token offsets independently of M-RoPE.
+            self.positions = torch.zeros(self.max_positions, dtype=torch.int64)
 
         if self.needs_extra_input_slots:
             raise NotImplementedError(
@@ -113,8 +115,10 @@ class RBLNEagleProposer(EagleProposer):
         next_token_ids: torch.Tensor,
         token_indices_to_sample: torch.Tensor | None,
         common_attn_metadata: CommonAttentionMetadata,
-        mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+        mm_embed_inputs: tuple[list[tuple[int, int, torch.Tensor]], torch.Tensor]
+        | None = None,
         num_rejected_tokens: torch.Tensor | None = None,
+        target_mrope_positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # NOTE(RBLN): combine_hidden_states in eagle3 is fused
         # into the target model graph.
@@ -146,12 +150,7 @@ class RBLNEagleProposer(EagleProposer):
                 back_pad=self.runner.decode_back_pad,
                 is_prompt_sorted=self.runner.sort_batch_by_length,
             )
-            attach_kv_cache_bindings(
-                attn_metadata,
-                self.runner.kv_caches,
-                self.runner.kv_cache_bases,
-                self.runner.kv_cache_view_infos,
-            )
+            self.runner.bind_kv_cache_to_metadata(attn_metadata)
             for layer_name in attn_group.layer_names:
                 per_layer_attn_metadata[layer_name] = attn_metadata
 
@@ -166,6 +165,7 @@ class RBLNEagleProposer(EagleProposer):
                 token_indices_to_sample=token_indices_to_sample,
                 target_token_ids=target_token_ids,
                 next_token_ids=next_token_ids,
+                mrope_positions=target_mrope_positions,
             )
         )
         inputs_embeds = None
@@ -203,6 +203,11 @@ class RBLNEagleProposer(EagleProposer):
                 target_positions[token_indices_to_sample],
                 num_reqs,
                 num_rejected_tokens,
+                mrope_positions=(
+                    target_mrope_positions[:, token_indices_to_sample]
+                    if target_mrope_positions is not None
+                    else None
+                ),
             )
             if run_tail
             else None
@@ -214,7 +219,7 @@ class RBLNEagleProposer(EagleProposer):
             num_tokens=num_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
             num_padded_tokens=num_padded_tokens,
-            **build_kv_cache_forward_context_kwargs(self.runner.kv_cache_bases),
+            **self.runner.kv_cache_forward_context_kwargs(),
         ):
             hidden_states, draft_ids = self.model_executable(
                 input_ids=input_ids,
@@ -222,6 +227,7 @@ class RBLNEagleProposer(EagleProposer):
                 hidden_states=hidden_states,
                 inputs_embeds=inputs_embeds,
                 token_indices_to_sample=token_indices_to_sample_padded,
+                **self._stage_mm_inputs(input_ids, is_prefill, mm_embed_inputs),
             )
 
         if self.runner.is_strict_kv_producer:
@@ -240,6 +246,7 @@ class RBLNEagleProposer(EagleProposer):
         num_reqs: int,
         num_rejected_tokens: torch.Tensor | None,
         pinned_num_tokens_padded: int | None = None,
+        mrope_positions: torch.Tensor | None = None,
     ) -> _TailInputs:
         """Per-pass attention metadata and the first tail position, staged."""
         # it mutates seq_lens in place; detach from the runner's persistent buffer.
@@ -281,8 +288,13 @@ class RBLNEagleProposer(EagleProposer):
                 )
             )
 
-        host = torch.zeros((num_reqs_padded, 1), dtype=first_positions.dtype)
-        host[:num_reqs, 0] = first_positions[:num_reqs]
+        if mrope_positions is None:
+            host = torch.zeros((num_reqs_padded, 1), dtype=first_positions.dtype)
+            host[:num_reqs, 0] = first_positions[:num_reqs]
+        else:
+            first_mrope = mrope_positions[:1, :num_reqs] + 1
+            host = torch.zeros((3, num_reqs_padded, 1), dtype=first_mrope.dtype)
+            host[:, :num_reqs, 0] = first_mrope
         staged_positions = self._tail_buffer("positions", host.shape, host.dtype)
         staged_positions.copy_(host)
         return _TailInputs(
@@ -323,7 +335,7 @@ class RBLNEagleProposer(EagleProposer):
             num_tokens=num_reqs,
             num_tokens_across_dp=tail.num_tokens_across_dp,
             num_padded_tokens=tail.num_padded_tokens,
-            **build_kv_cache_forward_context_kwargs(self.runner.kv_cache_bases),
+            **self.runner.kv_cache_forward_context_kwargs(),
         ):
             all_ids = self.tail_executable(
                 draft_ids=draft_ids,
@@ -362,12 +374,7 @@ class RBLNEagleProposer(EagleProposer):
                 is_prompt_sorted=self.runner.sort_batch_by_length,
                 staging_slot=staging_slot,
             )
-            attach_kv_cache_bindings(
-                attn_metadata,
-                self.runner.kv_caches,
-                self.runner.kv_cache_bases,
-                self.runner.kv_cache_view_infos,
-            )
+            self.runner.bind_kv_cache_to_metadata(attn_metadata)
             for layer_name in attn_group.layer_names:
                 per_layer[layer_name] = attn_metadata
         return per_layer
@@ -466,11 +473,27 @@ class RBLNEagleProposer(EagleProposer):
             num_rejected_tokens,
         )
 
+    def get_model_name(self, model: nn.Module) -> str:
+        # Upstream's load_model picks the target's image-token field by class
+        # name and lists upstream classes only; an RBLN subclass of one goes by
+        # its parent's name.
+        return super().get_model_name(model).removeprefix("RBLN")
+
     def load_model(self, target_model: nn.Module) -> None:
         super().load_model(target_model)
-        if self.supports_mm_inputs:
+        if self.supports_mm_inputs and not supports_rbln_multimodal_embeddings(
+            self.model
+        ):
             raise NotImplementedError(
-                "vllm-rbln does not pass multimodal embeddings to the drafter yet."
+                "The draft model must declare supports_rbln_multimodal_embeddings=True "
+                "to use external multimodal embeddings on RBLN."
+            )
+        if (
+            self.supports_mm_inputs
+            and self.vllm_config.parallel_config.pipeline_parallel_size != 1
+        ):
+            raise NotImplementedError(
+                "Multimodal drafting requires pipeline_parallel_size=1."
             )
 
         self.draft_id_to_target_id = getattr(self.model, "draft_id_to_target_id", None)
@@ -490,7 +513,15 @@ class RBLNEagleProposer(EagleProposer):
             hidden_states: torch.Tensor,
             token_indices_to_sample: torch.Tensor | None = None,
             inputs_embeds: torch.Tensor | None = None,
+            mm_embeds: torch.Tensor | None = None,
+            mm_mask: torch.Tensor | None = None,
         ):
+            if mm_embeds is not None:
+                assert mm_mask is not None
+                inputs_embeds = torch.where(
+                    mm_mask > 0.5, mm_embeds, self.model.embed_input_ids(input_ids)
+                )
+                input_ids = None
             ret_hidden_states = self.model(
                 input_ids=input_ids,
                 positions=positions,
@@ -500,11 +531,16 @@ class RBLNEagleProposer(EagleProposer):
             if not self.model_returns_tuple():
                 last_hidden_states = ret_hidden_states
                 hidden_states = last_hidden_states
+                # Only a tuple-returning drafter (Gemma4 MTP) samples narrower.
+                assert last_hidden_states.shape[-1] == self.hidden_size
             else:
                 last_hidden_states, hidden_states = ret_hidden_states
 
             hidden_states = hidden_states.view(-1, self.hidden_size)
-            sample_hidden_states = last_hidden_states.view(-1, self.hidden_size)
+            # Gemma4 MTP samples from its own, narrower hidden states.
+            sample_hidden_states = last_hidden_states.view(
+                -1, last_hidden_states.shape[-1]
+            )
 
             if token_indices_to_sample is not None:
                 hidden_states = hidden_states[token_indices_to_sample]
@@ -583,16 +619,13 @@ class RBLNEagleProposer(EagleProposer):
             pass_state.PASS_IDX = 0
             return torch.stack(outs, dim=1)
 
-        if self.vllm_config.speculative_config.enforce_eager:
-            self.model_executable = model_wrapper
-            if self.num_speculative_tokens > 1:
-                self.tail_executable = tail_wrapper
-        else:
-            self.model_executable = self._compile(model_wrapper)
-            if self.num_speculative_tokens > 1:
-                self.tail_executable = self._compile(tail_wrapper)
+        self.model_executable = self._compile_drafter(model_wrapper)
+        if self.num_speculative_tokens > 1:
+            self.tail_executable = self._compile_drafter(tail_wrapper)
 
-    def _compile(self, fn):
+    def _compile_drafter(self, fn):
+        if self.vllm_config.speculative_config.enforce_eager:
+            return fn
         rbln_config: RBLNConfig = self.vllm_config.additional_config
         return compile(
             fn,
@@ -685,12 +718,7 @@ class RBLNEagleProposer(EagleProposer):
                 batch_pad=num_reqs_padded,
                 is_prompt_sorted=self.runner.sort_batch_by_length,
             )
-            attach_kv_cache_bindings(
-                attn_metadata,
-                self.runner.kv_caches,
-                self.runner.kv_cache_bases,
-                self.runner.kv_cache_view_infos,
-            )
+            self.runner.bind_kv_cache_to_metadata(attn_metadata)
             for layer_name in attn_group.layer_names:
                 per_layer_attn_metadata[layer_name] = attn_metadata
 
@@ -706,6 +734,11 @@ class RBLNEagleProposer(EagleProposer):
                 self.hidden_states[:num_tokens],
                 is_prefill=is_prefill,
                 token_indices_to_sample=token_indices_to_sample,
+                mrope_positions=(
+                    self.mrope_positions[:, :num_tokens]
+                    if self.supports_mm_inputs and self.uses_mrope
+                    else None
+                ),
             )
         )
         inputs_embeds = None
@@ -716,7 +749,7 @@ class RBLNEagleProposer(EagleProposer):
             num_tokens=num_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
             num_padded_tokens=num_padded_tokens,
-            **build_kv_cache_forward_context_kwargs(self.runner.kv_cache_bases),
+            **self.runner.kv_cache_forward_context_kwargs(),
         ):
             hidden_states, draft_ids = self.model_executable(
                 input_ids=input_ids,
@@ -724,6 +757,7 @@ class RBLNEagleProposer(EagleProposer):
                 hidden_states=hidden_states,
                 inputs_embeds=inputs_embeds,
                 token_indices_to_sample=token_indices_to_sample_padded,
+                **self._stage_mm_inputs(input_ids, is_prefill),
             )
 
         if self.num_speculative_tokens == 1 or self.runner.is_strict_kv_producer:
@@ -735,6 +769,11 @@ class RBLNEagleProposer(EagleProposer):
             num_reqs,
             None,
             pinned_num_tokens_padded=override_padded,
+            mrope_positions=(
+                self.mrope_positions[:, :num_reqs]
+                if self.supports_mm_inputs and self.uses_mrope
+                else None
+            ),
         )
         self._run_tail(tail, draft_ids, hidden_states, num_reqs)
 
@@ -784,6 +823,7 @@ class RBLNEagleProposer(EagleProposer):
         token_indices_to_sample: torch.Tensor | None = None,
         target_token_ids: torch.Tensor | None = None,
         next_token_ids: torch.Tensor | None = None,
+        mrope_positions: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         if target_token_ids is not None:
             assert next_token_ids is not None
@@ -794,7 +834,11 @@ class RBLNEagleProposer(EagleProposer):
             self.input_ids[token_indices_to_sample] = next_token_ids
 
         input_ids = self.input_ids[:num_input_tokens].view(num_reqs, -1)
-        positions = positions.view(-1)[:num_input_tokens].view(num_reqs, -1)
+        positions = (
+            positions.view(-1)[:num_input_tokens].view(num_reqs, -1)
+            if mrope_positions is None
+            else mrope_positions[:, :num_input_tokens].view(3, num_reqs, -1)
+        )
         hidden_states = hidden_states.view(-1, self.hidden_size)[
             :num_input_tokens
         ].view(num_reqs, -1, self.hidden_size)
@@ -824,3 +868,29 @@ class RBLNEagleProposer(EagleProposer):
             staged.hidden_states,
             staged.token_indices,
         )
+
+    def _stage_mm_inputs(
+        self,
+        input_ids: torch.Tensor,
+        is_prefill: bool,
+        mm_embed_inputs: tuple[list[tuple[int, int, torch.Tensor]], torch.Tensor]
+        | None = None,
+    ) -> dict[str, torch.Tensor]:
+        if not (self.supports_mm_inputs and is_prefill):
+            return {}
+        if mm_embed_inputs is None:
+            rows: list[tuple[int, int, torch.Tensor]] = []
+            mask = torch.zeros(*input_ids.shape, 1, dtype=self.dtype)
+        else:
+            rows, mask = mm_embed_inputs
+            mask = mask.view(input_ids.shape[0], -1, 1)
+        layout = InputLayout(
+            num_reqs=input_ids.shape[0],
+            num_reqs_padded=input_ids.shape[0],
+            query_len=mask.shape[1],
+            query_len_padded=input_ids.shape[1],
+        )
+        embeds, mask = self.input_stager.stage_mm_embeds(
+            rows, mask, self.inputs_embeds_size, layout
+        )
+        return {"mm_embeds": embeds, "mm_mask": mask}

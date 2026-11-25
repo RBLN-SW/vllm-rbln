@@ -383,6 +383,7 @@ class RBLNWorker(WorkerBase):
             model_kernel_size = estimate_model_kernel_size(
                 model_config=self.model_config,
                 parallel_config=self.parallel_config,
+                num_layers=self.model_config.get_num_layers(self.parallel_config),
                 n_model_bytes=n_model_bytes,
             )
 
@@ -408,6 +409,10 @@ class RBLNWorker(WorkerBase):
             draft_kernel_size = estimate_model_kernel_size(
                 model_config=draft_model_config,
                 parallel_config=draft_parallel_config,
+                # The drafter builds every layer on the last stage, outside
+                # make_layers, so neither VLLM_PP_LAYER_PARTITION nor the layer
+                # truncation shapes it.
+                num_layers=draft_model_config.get_total_num_hidden_layers(),
                 n_model_bytes=draft_n_model_bytes,
             )
             estimate_kwargs["num_runtimes"] = num_runtimes + num_draft_runtimes
@@ -475,7 +480,6 @@ class RBLNWorker(WorkerBase):
         self.model_runner.initialize_kv_cache(
             self.dynamic_kv.shrink_for_compile(kv_cache_config)
         )
-        self.dynamic_kv.check_block_ids_fit_int16()
         if not self.dynamic_kv.defers_kv_registration:
             self.model_runner.register_kv_caches_with_connector()
 
@@ -725,6 +729,10 @@ class RBLNWorker(WorkerBase):
         return
 
     def shutdown(self) -> None:
+        runner = getattr(self, "model_runner", None)
+        if runner is not None and runner._prev_async_output is not None:
+            runner._prev_async_output.get_sampled_token_ids_cpu()
+            runner._prev_async_output = None
         self._release_offload_temp_storage()
 
         # has_kv_transfer_group can be None during interpreter shutdown.

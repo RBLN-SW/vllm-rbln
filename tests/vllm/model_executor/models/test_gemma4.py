@@ -31,6 +31,7 @@ from vllm.model_executor.models.gemma4_mm import Gemma4ForConditionalGeneration
 
 import vllm_rbln.model_executor.models.gemma4 as gemma4
 from vllm_rbln.compilation.compiler import compile, mark_decoder_regions
+from vllm_rbln.config import RBLNConfig
 from vllm_rbln.model_executor.models.gemma4 import RBLNGemma4ForConditionalGeneration
 from vllm_rbln.v1.attention.backends.flash_attention import RBLNFlashAttentionMetadata
 
@@ -87,8 +88,16 @@ def _image(width: int, height: int, num_patches: int):
     return pixels, positions
 
 
+def test_logits_processor_delegates_to_language_model():
+    processor = nn.Identity()
+    model = _bare_model(language_model=nn.Module())
+    model.language_model.logits_processor = processor
+
+    assert model.logits_processor is processor
+
+
 def test_the_vision_encoder_matches_hfs():
-    # The encoder pads every image to its bucket and runs attention spelled out;
+    # The encoder pads every image to its bucket and masks the padding keys;
     # what comes back must be HF's soft tokens for the image alone.
     tower = _vision_tower()
     model = _bare_model(
@@ -136,13 +145,25 @@ def test_the_rotary_tables_are_built_once_not_per_image(monkeypatch):
     torch.testing.assert_close(got, expected, rtol=1e-4, atol=1e-4)
 
 
-def test_speculative_decoding_is_refused():
+def test_a_drafter_other_than_the_mtp_assistant_is_refused():
     vllm_config = SimpleNamespace(
         parallel_config=SimpleNamespace(data_parallel_size=1),
-        speculative_config=SimpleNamespace(method="mtp"),
+        speculative_config=SimpleNamespace(
+            method="eagle3", use_gemma4_mtp=lambda: False
+        ),
     )
 
-    with pytest.raises(ValueError, match="speculative decoding"):
+    with pytest.raises(ValueError, match="only with its MTP assistant"):
+        RBLNGemma4ForConditionalGeneration(vllm_config=vllm_config)
+
+
+def test_the_mtp_assistant_is_refused_under_pipeline_parallel():
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(data_parallel_size=1, pipeline_parallel_size=2),
+        speculative_config=SimpleNamespace(method="mtp", use_gemma4_mtp=lambda: True),
+    )
+
+    with pytest.raises(ValueError, match="pipeline_parallel_size=1 only"):
         RBLNGemma4ForConditionalGeneration(vllm_config=vllm_config)
 
 
@@ -176,6 +197,28 @@ def test_an_image_takes_the_smallest_bucket_holding_it(width, height, bucket):
     assert calls == [(bucket, width * height)]
 
 
+def test_an_image_is_encoded_through_the_shared_metrics_hook(monkeypatch):
+    """ENCODER metrics wrap `run_mm_encoder`; an encoder call outside it is
+    missing from the per-bucket report."""
+    import vllm_rbln.utils as rbln_utils
+
+    model, _ = _recording_model([18, 45, 90])
+    pixels, positions = _image(9, 3, num_patches=90)
+    run_mm_encoder = rbln_utils.run_mm_encoder
+    shapes = []
+
+    def recording(encoder, inputs, num_embeddings, **kwargs):
+        shapes.append(tuple(inputs[0].shape))
+        return run_mm_encoder(encoder, inputs, num_embeddings, **kwargs)
+
+    monkeypatch.setattr(rbln_utils, "run_mm_encoder", recording)
+
+    embeds = model._encode_vision(pixels, positions)
+
+    assert shapes == [(1, 45, pixels.shape[-1])]
+    assert embeds.shape == (9 * 3 // POOL**2, 32)
+
+
 def test_warm_up_runs_every_bucket_once_full():
     model, calls = _recording_model([18, 45, 90])
 
@@ -184,7 +227,9 @@ def test_warm_up_runs_every_bucket_once_full():
     assert calls == [(18, 18), (45, 45), (90, 90)]
 
 
-def _built_model(monkeypatch, *, cap, budgets, per_layer_input=0, attention_layers=()):
+def _built_model(
+    monkeypatch, *, cap, budgets, chunk=512, per_layer_input=0, attention_layers=()
+):
     """The model as construction resolves it, upstream's model left out."""
 
     def upstream_init(self, **kwargs):
@@ -220,7 +265,9 @@ def _built_model(monkeypatch, *, cap, budgets, per_layer_input=0, attention_laye
                     )
                 ),
             ),
-            additional_config=SimpleNamespace(encoder_token_budgets=budgets),
+            additional_config=RBLNConfig(
+                encoder_token_budgets=budgets, prefill_chunk_size=[chunk]
+            ),
         )
     )
     return model
@@ -252,6 +299,18 @@ def test_the_encoder_buckets_follow_encoder_token_budgets(
 ):
     model = _built_model(monkeypatch, cap=280, budgets=budgets)
     assert model.mm_encoder_patch_buckets == buckets
+
+
+def test_unset_budgets_follow_the_prefill_chunk_not_the_cap(monkeypatch):
+    model = _built_model(monkeypatch, cap=280, budgets=[], chunk=2048)
+    assert model.mm_encoder_patch_buckets == [
+        budget * 9 for budget in (70, 140, 280, 560, 1120)
+    ]
+
+
+def test_a_cap_above_the_prefill_chunk_is_refused_with_unset_budgets(monkeypatch):
+    with pytest.raises(ValueError, match="must reach max_soft_tokens=560"):
+        _built_model(monkeypatch, cap=560, budgets=[], chunk=512)
 
 
 def test_the_longest_range_is_the_cap_not_the_largest_budget(monkeypatch):
@@ -476,7 +535,6 @@ def test_prefix_mask_is_shared_and_does_not_escape_forward(monkeypatch, compiled
             super().__init__()
             self.attn = nn.Module()
             self.attn.layer_name = f"layer.{index}"
-            self.attn.layer_index = index
             self.attn.sliding_window = 4
             self.attn.impl = SimpleNamespace(scale=torch.tensor(1.0))
 
@@ -510,6 +568,9 @@ def test_prefix_mask_is_shared_and_does_not_escape_forward(monkeypatch, compiled
         swa_appends=True,
         mm_prefix_row_ends=torch.tensor([0, 3, 3, 3]),
         kv_caches=[torch.zeros(4, 2, 1, 1, 4, 32) for _ in model.layers],
+        kv_cache_positions={
+            layer.layer_name: i for i, layer in enumerate(model.mm_prefix_attn_layers)
+        },
     )
     context = SimpleNamespace(
         attn_metadata={
@@ -556,7 +617,7 @@ def test_prefix_mask_is_restored_when_forward_raises(monkeypatch):
         raise RuntimeError("forward failed")
 
     monkeypatch.setattr(Gemma4ForConditionalGeneration, "forward", upstream_forward)
-    attn = SimpleNamespace(layer_name="layer.0", layer_index=0, sliding_window=4)
+    attn = SimpleNamespace(layer_name="layer.0", sliding_window=4)
     model = _bare_model(model_dtype=torch.float32)
     model.mm_prefix_attn_layers = [attn]
     metadata = RBLNFlashAttentionMetadata(
@@ -566,6 +627,7 @@ def test_prefix_mask_is_restored_when_forward_raises(monkeypatch):
         swa_appends=True,
         mm_prefix_row_ends=torch.tensor([0, 3, 3, 3]),
         kv_caches=[torch.zeros(4, 2, 1, 1, 4, 32)],
+        kv_cache_positions={"layer.0": 0},
     )
     context = SimpleNamespace(
         attn_metadata={"layer.0": metadata}, additional_kwargs={}, dp_metadata=None

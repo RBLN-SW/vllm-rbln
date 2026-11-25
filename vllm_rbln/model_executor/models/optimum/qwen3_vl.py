@@ -15,18 +15,22 @@ from dataclasses import replace
 from typing import Any
 
 import torch
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.layers.pooler import Pooler
+from vllm.model_executor.models import VllmModelForPooling
 from vllm.model_executor.models.qwen2_5_vl import (
     Qwen2_5_VLVideoPixelInputs,
 )
 from vllm.model_executor.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 
-from .base import ModelInputForRBLN
+from .base import ModelInputForRBLN, build_embedding_pooler
 from .qwen2_vl import (
     RBLNOptimumQwen2_5_VLForConditionalGeneration,
     split_by_grid_thw,
 )
+from .qwen3 import RBLNQwen3RerankerPooler, resolve_label_token_ids
 
 logger = init_logger(__name__)
 
@@ -155,6 +159,43 @@ class RBLNOptimumQwen3VLForConditionalGeneration(
         if model_input.deepstack_embeds is not None:
             prefill_kwargs["deepstack_embeds"] = model_input.deepstack_embeds
         return self.model.prefill_decoder(**prefill_kwargs).logits
+
+
+class RBLNOptimumQwen3VLForSequenceClassification(
+    RBLNOptimumQwen3VLForConditionalGeneration, VllmModelForPooling
+):
+    """Score Qwen3-VL-Reranker using the final position of the generation graph."""
+
+    is_pooling_model = True
+    pooler: Pooler
+
+    def __init__(self, vllm_config: VllmConfig) -> None:
+        super().__init__(vllm_config=vllm_config)
+        self.false_id, self.true_id = resolve_label_token_ids(vllm_config.model_config)
+        self.pooler = RBLNQwen3RerankerPooler()
+
+    def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
+        # [1, 1, vocab_size]: the prefill graph keeps the last position only.
+        logits = super().forward(model_input, **kwargs)[:, -1]
+        score_logits = logits[:, self.true_id] - logits[:, self.false_id]
+        return score_logits.unsqueeze(-1).to(self.model_config.head_dtype)
+
+
+class RBLNOptimumQwen3VLModel(
+    RBLNOptimumQwen3VLForConditionalGeneration, VllmModelForPooling
+):
+    """Qwen3-VL-Embedding on the decoder graph that returns hidden states."""
+
+    is_pooling_model = True
+    pooler: Pooler
+
+    def __init__(self, vllm_config: VllmConfig) -> None:
+        super().__init__(vllm_config=vllm_config)
+        self.pooler = build_embedding_pooler(self.model_config)
+
+    def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
+        # [1, num_tokens, hidden] -> [num_tokens, hidden] for the pooling cursor.
+        return super().forward(model_input, **kwargs)[0]
 
 
 class RBLNOptimumQwen3VLMoeForConditionalGeneration(

@@ -14,20 +14,20 @@
 """E2E check that encoder models end up with the right sequence pooling.
 
 For each real encoder architecture supported by the RBLN optimum path a real
-``VllmConfig`` is built, so vLLM's own ``ModelConfig`` resolves ``pooler_config``
-exactly as it would in production. The model is then built through the real
-``RBLNOptimumForEncoderModel.__init__`` code path; only the optimum-rbln model
-compilation/loading (``init_model``) is faked, since that requires an NPU.
+`VllmConfig` is built, so vLLM's own `ModelConfig` resolves `pooler_config`
+exactly as it would in production. The model is built through `load_model`;
+only the optimum-rbln model compilation/loading (`init_model`) is faked,
+since that requires an NPU.
 
 Encoder-only models (BertModel / RobertaModel / XLMRobertaModel and their
-``*ForSequenceClassification`` variants) are forced to CLS pooling. Decoder-based
+`*ForSequenceClassification` variants) are forced to CLS pooling. Decoder-based
 pooling models (Qwen3 embedding) keep their native LAST-token pooling — CLS
 (token 0) would be wrong for a causal model.
 
 We assert that:
   * the pooling type comes out as expected per architecture, and
-  * the right pooler is selected per task — ``DispatchPooler`` (embed) for the
-    plain encoders and ``RBLNClassifierPooler`` for the classification ones.
+  * the right pooler is selected per task — `DispatchPooler` (embed) for the
+    plain encoders and `RBLNClassifierPooler` for the classification ones.
 """
 
 from types import SimpleNamespace
@@ -43,12 +43,16 @@ from vllm.config import (
     set_current_vllm_config,
 )
 from vllm.model_executor.layers.pooler import DispatchPooler
+from vllm.model_executor.layers.pooler.seqwise import SequencePooler
 
+from vllm_rbln.model_executor.models.optimum import load_model
+from vllm_rbln.model_executor.models.optimum.base import ModelInputForRBLN
 from vllm_rbln.model_executor.models.optimum.encoder import (
     RBLNClassifierPooler,
     RBLNOptimumForEncoderModel,
 )
 from vllm_rbln.model_executor.models.optimum.model_base import RBLNOptimumModelBase
+from vllm_rbln.model_executor.models.optimum.qwen3_vl import RBLNOptimumQwen3VLModel
 from vllm_rbln.utils.optimum.predicates import is_qwen3_embedding
 
 # (model id, expected seq_pooling_type, expected pooler) per architecture.
@@ -71,13 +75,14 @@ ENCODER_MODELS = [
 
 def _build_encoder(model_id: str):
     model_config = ModelConfig(model=model_id, dtype=torch.float32, seed=42)
-    # Mirror RBLNOptimumModelRunner: Qwen3 pooling models have their HF arch
-    # (Qwen3ForCausalLM) remapped to Qwen3Model before the encoder is built.
+    # Mirror the platform's architecture remap before model loading.
     if is_qwen3_embedding(model_config):
         model_config.hf_config.__dict__["architectures"] = ["Qwen3Model"]
     vllm_config = VllmConfig(
         model_config=model_config,
-        cache_config=CacheConfig(block_size=16, cache_dtype="auto"),
+        cache_config=CacheConfig(
+            block_size=16, cache_dtype="auto", enable_prefix_caching=False
+        ),
         scheduler_config=SchedulerConfig(
             max_num_seqs=2,
             max_num_batched_tokens=128,
@@ -87,16 +92,17 @@ def _build_encoder(model_id: str):
     )
 
     # Fake ONLY the optimum-rbln compile/load step (the only part that needs an
-    # NPU); everything else runs the real encoder __init__ / pooler setup.
+    # NPU); everything else runs the real model __init__ / pooler setup.
     def fake_init_model(self):
         self.model = MagicMock()
         self.model.get_kvcache_num_blocks.return_value = 1
+        self.rbln_model_config = SimpleNamespace()
 
     with (
         set_current_vllm_config(vllm_config),
         patch.object(RBLNOptimumModelBase, "init_model", fake_init_model),
     ):
-        return RBLNOptimumForEncoderModel(vllm_config=vllm_config)
+        return load_model(vllm_config)
 
 
 @pytest.mark.parametrize("model_id, expected_seq_pool, expected_pooler", ENCODER_MODELS)
@@ -134,3 +140,73 @@ def test_encoder_forward_removes_padded_requests(classification):
 
     expected = hidden_states[:1].squeeze(-1) if classification else hidden_states[0, :3]
     torch.testing.assert_close(output, expected)
+
+
+VL_EMBEDDING_ID = "Qwen/Qwen3-VL-Embedding-2B"
+
+
+def _build_qwen3_vl_embedding():
+    model_config = ModelConfig(
+        model=VL_EMBEDDING_ID,
+        dtype=torch.float32,
+        seed=42,
+        runner="pooling",
+        max_model_len=128,
+    )
+    # Mirror the remap in platform/optimum_impl.check_and_update.
+    assert is_qwen3_embedding(model_config)
+    model_config.hf_config.__dict__["architectures"] = ["Qwen3VLModel"]
+    vllm_config = VllmConfig(
+        model_config=model_config,
+        cache_config=CacheConfig(
+            block_size=16, cache_dtype="auto", enable_prefix_caching=False
+        ),
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=1,
+            max_num_batched_tokens=128,
+            max_model_len=128,
+            is_encoder_decoder=False,
+        ),
+    )
+
+    def fake_init_model(self):
+        self.model = MagicMock()
+        self.model.get_kvcache_num_blocks.return_value = 1
+        self.model.rbln_config = SimpleNamespace(
+            dtype=torch.float32, use_multiple_decoder=False, decoder_batch_sizes=None
+        )
+        self.rbln_model_config = self.model.rbln_config
+        self.attn_impl = None
+
+    with (
+        set_current_vllm_config(vllm_config),
+        patch.object(RBLNOptimumModelBase, "init_model", fake_init_model),
+    ):
+        return RBLNOptimumQwen3VLModel(vllm_config=vllm_config)
+
+
+def test_qwen3_vl_embedding_builds_an_embed_pooler():
+    model = _build_qwen3_vl_embedding()
+
+    assert isinstance(model.pooler, SequencePooler)
+    assert model.pooler.get_supported_tasks() == {"embed"}
+
+
+def test_qwen3_vl_embedding_forward_returns_every_position():
+    """The pooling cursor indexes a flat [num_tokens, hidden] tensor."""
+    model = _build_qwen3_vl_embedding()
+    hidden_states = torch.randn(1, 5, 8)
+    model.model.prefill_decoder = MagicMock(
+        return_value=SimpleNamespace(logits=hidden_states)
+    )
+    model_input = ModelInputForRBLN(
+        input_tokens=torch.zeros(1, 5, dtype=torch.long),
+        input_positions=torch.arange(5, dtype=torch.int32).unsqueeze(0),
+        block_tables=torch.zeros(8, dtype=torch.int16),
+        running_requests_ids=["r0"],
+        padded_batch_size=1,
+        batch_rows=slice(0, 1),
+        is_prompt=True,
+    )
+
+    torch.testing.assert_close(model(model_input), hidden_states[0])

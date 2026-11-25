@@ -13,7 +13,8 @@
 # limitations under the License.
 
 import math
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import replace
 from itertools import islice
 
 import torch
@@ -23,6 +24,7 @@ from rebel.ops.torch_custom_ops.kda import CONV_LANES
 from rebel.ops.torch_custom_ops.sparse_attn_glm5 import hadamard_128
 from torch import nn
 from transformers import PretrainedConfig
+from transformers.feature_extraction_utils import BatchFeature
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_pp_group,
@@ -79,14 +81,21 @@ from vllm.models.glm5next.common.multimodal import (
     Glm5NextVisionTransformer,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargsItems
+from vllm.multimodal.parse import MultiModalDataItems
+from vllm.multimodal.processing import (
+    PromptReplacement,
+    PromptUpdate,
+    PromptUpdateDetails,
+)
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import set_default_torch_dtype
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
-from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec, MLAAttentionSpec
+from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
 import vllm_rbln.utils as rbln_utils
 from vllm_rbln.model_executor.models.interfaces import SupportsRBLNMultiModal
-from vllm_rbln.patches.attention import _resolve_kv_cache
+from vllm_rbln.utils import is_prefill_step
 from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadata,
 )
@@ -99,11 +108,8 @@ from vllm_rbln.v1.attention.backends.glm5_next import (
     RBLNGlm5NextStateMetadata,
     kda_cache_name,
 )
-from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
-from vllm_rbln.v1.worker.utils import (
-    num_attn_module as rbln_num_attn_module,
-)
-from vllm_rbln.v1.worker.utils import pipeline_adjusted_layer_index
+from vllm_rbln.v1.attention.kv_cache_bindings import resolve_kv_cache
+from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec, RBLNMambaSpec
 
 SLOT_DSA_LATENT, SLOT_DSA_INDEX_KEY, SLOT_DSA_INDEX_SCALE, SLOT_DSA_INDEX_TAIL = range(
     4
@@ -125,13 +131,6 @@ class _RBLNGlm5NextCache(nn.Module, AttentionLayerBase):
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
-        model_config = vllm_config.model_config
-        self.layer_index = pipeline_adjusted_layer_index(
-            prefix,
-            model_config,
-            vllm_config.parallel_config,
-            rbln_num_attn_module(model_config, vllm_config.cache_config.cache_dtype),
-        )
 
     def forward(self) -> None: ...
 
@@ -145,7 +144,7 @@ class RBLNGlm5NextStateCache(_RBLNGlm5NextCache):
             vllm_config.cache_config.block_size,
             vllm_config.model_config.hf_text_config.kv_lora_rank,
         )
-        return MambaSpec(
+        return RBLNMambaSpec(
             block_size=vllm_config.cache_config.mamba_block_size,
             shapes=(latent_block,),
             dtypes=(torch.uint8,),
@@ -161,7 +160,7 @@ class RBLNGlm5NextStateCache(_RBLNGlm5NextCache):
         metadata = get_forward_context().attn_metadata[self.prefix]
         assert isinstance(metadata, RBLNGlm5NextStateMetadata), type(metadata)
         assert metadata.load_blocks is not None and metadata.store_blocks is not None
-        state = _resolve_kv_cache(metadata, self.layer_index)
+        state = resolve_kv_cache(metadata, self.prefix)
         return (
             state,
             metadata.load_blocks.view(-1),
@@ -201,7 +200,7 @@ class RBLNGlm5NextPagedCache(_RBLNGlm5NextCache):
         """(cache, block_table, metadata)."""
         metadata = get_forward_context().attn_metadata[self.prefix]
         return (
-            _resolve_kv_cache(metadata, self.layer_index),
+            resolve_kv_cache(metadata, self.prefix),
             metadata.block_tables,
             metadata,
         )
@@ -243,9 +242,8 @@ class RBLNGlm5NextAuxCache(_RBLNGlm5NextCache):
         return RBLNGlm5NextCacheBackend
 
     def inputs(self) -> torch.Tensor:
-        assert self.layer_index is not None, f"{self.prefix} was not allocated"
         metadata = get_forward_context().attn_metadata[self.owner]
-        return _resolve_kv_cache(metadata, self.layer_index)
+        return resolve_kv_cache(metadata, self.prefix)
 
 
 def _swiglu_clamped(
@@ -550,6 +548,12 @@ class RBLNGlm5NextKDA(nn.Module):
         for j, ((state, load, store, _), (qj, kj, vj)) in enumerate(
             zip(group_states, group_qkv)
         ):
+            state = state.view(
+                state.shape[0],
+                self.group_heads,
+                state.shape[1] // self.group_heads,
+                state.shape[2],
+            )
             channels = slice(j * group_channels, (j + 1) * group_channels)
             heads = slice(j * self.group_heads, (j + 1) * self.group_heads)
             gj, bj = g[:, heads], beta[:, heads]
@@ -885,24 +889,23 @@ class RBLNGlm5NextDecoderLayer(nn.Module):
             )
 
     def _sublayer(self, streams, fn, scale, base, norm, sublayer) -> torch.Tensor:
-        batch, n, tokens, hidden = streams.shape
-        flat = streams.transpose(1, 2).reshape(batch, tokens, n * hidden).float()
-        flat = flat * torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.rms_eps)
-        z = F.linear(flat, fn) * scale + base
-        z_pre, z_post = z[..., :n], z[..., n : 2 * n]
-        comb = torch.ops.rbln_custom_ops.sinkhorn_normalize(
-            z[..., 2 * n :],
+        # The compiler cuts the mhc_* kernels over the chiplets, by tokens in
+        # prefill and by batch rows in decode, so the streams stay split between
+        # sublayers (fp32 holding bf16 values) and only the sublayer input is
+        # gathered.
+        ops = torch.ops.rbln_custom_ops
+        streams_f32 = streams.float()
+        logits = ops.mhc_mix(streams_f32, fn, scale, base, eps=self.rms_eps)
+        x = ops.mhc_read(streams_f32, logits, eps=self.hc_eps).to(norm.weight.dtype)
+        y = sublayer(norm(x))
+        return ops.mhc_write(
+            y.float(),
+            streams_f32,
+            logits,
+            post_mult=self.post_mult,
             iters=self.sinkhorn_iters,
             eps=self.hc_eps,
         )
-        streams_f32 = streams.float()
-        x = torch.ops.rbln_custom_ops.hc_stream_reduce(
-            streams_f32, z_pre, eps=self.hc_eps
-        ).to(streams.dtype)
-        x = sublayer(norm(x))
-        return torch.ops.rbln_custom_ops.hc_residual_add(
-            x.float(), streams_f32, z_post, comb, post_mult=self.post_mult
-        ).to(streams.dtype)
 
     def forward(self, streams: torch.Tensor) -> torch.Tensor:
         """streams [B, n, T, H] -> [B, n, T, H]."""
@@ -1041,13 +1044,24 @@ class RBLNGlm5NextModel(nn.Module):
             flat = intermediate_tensors["streams"]
             batch, tokens, _ = flat.shape
             streams = flat.view(batch, tokens, self.n, -1).transpose(1, 2).contiguous()
+        dtype = streams.dtype
+        streams = streams.float()
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             streams = layer(streams)
+        # The streams stay fp32 between sublayers (bf16 values).
+        streams = streams.to(dtype)
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
                 {"streams": streams.transpose(1, 2).reshape(batch, tokens, -1)}
             )
-        return self.norm(streams.mean(dim=1))
+        hidden = streams.mean(dim=1)
+        if not is_prefill_step():
+            # A read gathers the rows; left cut, they would reach lm_head, whose
+            # weight takes the layout prefill gives it.
+            return torch.ops.rbln_custom_ops.residual_read(
+                hidden, self.norm.weight, self.norm.variance_epsilon
+            )
+        return self.norm(hidden)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         return _load_glm5_next_weights(
@@ -1121,20 +1135,49 @@ class RBLNGlm5NextForCausalLM(nn.Module, SupportsPP):
         return loaded_params
 
 
-# Patches per image the compiled vision encoder takes (64 x 64 grid, 896 x 896 px,
-# 1024 image tokens).
-# TODO(RBLN): image size buckets and video inputs.
-VISION_PATCH_BUCKET = 4096
+class _RBLNGlm5NextVisionBlock(nn.Module):
+    def __init__(self, block, num_heads, head_dim, swiglu_limit) -> None:
+        super().__init__()
+        self.block = block
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.swiglu_limit = swiglu_limit
+
+    @torch.compiler.nested_compile_region
+    def forward(self, x, cos, sin, key_bias, rot):
+        n = x.shape[0]
+        block, attn = self.block, self.block.attn
+        qkv = attn.qkv(block.norm1(x))[0]
+        qkv = qkv.view(n, 3, self.num_heads, self.head_dim)
+        q = attn.q_norm(qkv[:, 0])
+        k = attn.k_norm(qkv[:, 1])
+        v = qkv[:, 2]
+        q = q * cos + torch.matmul(q, rot) * sin
+        k = k * cos + torch.matmul(k, rot) * sin
+        q, k, v = q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1)
+        scores = torch.matmul(q, k.transpose(1, 2)) * self.head_dim**-0.5 + key_bias
+        out = torch.matmul(torch.softmax(scores, dim=-1), v)
+        x = x + attn.proj(out.transpose(0, 1).reshape(n, -1))[0]
+        mlp = block.mlp
+        gate, up = mlp.gate_up_proj(block.norm2(x))[0].chunk(2, dim=-1)
+        return x + mlp.down_proj(_swiglu_clamped(gate, up, self.swiglu_limit))[0]
 
 
 class _RBLNGlm5NextVisionEncoder(nn.Module):
-    def __init__(self, tower: nn.Module) -> None:
+    def __init__(self, tower: nn.Module, out_dtype: torch.dtype) -> None:
         super().__init__()
         self.tower = tower
+        self.out_dtype = out_dtype
         attn = tower.blocks[0].attn
         self.num_heads = attn.num_attention_heads_per_partition
         self.head_dim = attn.head_dim
         self.swiglu_limit = tower.blocks[0].mlp.act_fn.swiglu_limit
+        self.blocks = nn.ModuleList(
+            _RBLNGlm5NextVisionBlock(
+                block, self.num_heads, self.head_dim, self.swiglu_limit
+            )
+            for block in tower.blocks
+        )
         half = self.head_dim // 2
         rot = torch.zeros(self.head_dim, self.head_dim)
         for j in range(half):
@@ -1157,23 +1200,8 @@ class _RBLNGlm5NextVisionEncoder(nn.Module):
         )
         cos = cos.unsqueeze(1)
         sin = sin.unsqueeze(1)
-        scale = self.head_dim**-0.5
-        for block in tower.blocks:
-            attn = block.attn
-            qkv = attn.qkv(block.norm1(x))[0]
-            qkv = qkv.view(n, 3, self.num_heads, self.head_dim)
-            q = attn.q_norm(qkv[:, 0])
-            k = attn.k_norm(qkv[:, 1])
-            v = qkv[:, 2]  # [N, heads, D]
-            q = q * cos + torch.matmul(q, self.rot) * sin
-            k = k * cos + torch.matmul(k, self.rot) * sin
-            q, k, v = q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1)
-            scores = torch.matmul(q, k.transpose(1, 2)) * scale + key_bias
-            out = torch.matmul(torch.softmax(scores, dim=-1), v)
-            x = x + attn.proj(out.transpose(0, 1).reshape(n, -1))[0]
-            mlp = block.mlp
-            gate, up = mlp.gate_up_proj(block.norm2(x))[0].chunk(2, dim=-1)
-            x = x + mlp.down_proj(_swiglu_clamped(gate, up, self.swiglu_limit))[0]
+        for block in self.blocks:
+            x = block(x, cos, sin, key_bias, self.rot)
         x = tower.post_layernorm(x)
         merge2 = tower.spatial_merge_size**2
         d = tower.downsample.weight
@@ -1185,22 +1213,135 @@ class _RBLNGlm5NextVisionEncoder(nn.Module):
         merger = tower.merger
         x = F.gelu(merger.post_projection_norm(merger.proj(x)[0]))
         gate, up = merger.gate_up_proj(x)[0].chunk(2, dim=-1)
-        return merger.down_proj(_swiglu_clamped(gate, up, self.swiglu_limit))[0]
+        return merger.down_proj(_swiglu_clamped(gate, up, self.swiglu_limit))[0].to(
+            self.out_dtype
+        )
 
 
 class RBLNGlm5NextProcessingInfo(Glm5NextProcessingInfo):
-    def get_hf_processor(self, **kwargs: object):
-        processor = super().get_hf_processor(**kwargs)
-        image_processor = processor.image_processor
-        merge = image_processor.merge_size
-        image_processor.max_image_tokens = min(
-            image_processor.max_image_tokens, VISION_PATCH_BUCKET // (merge * merge)
+    def get_max_frame_tokens(self, modality: str) -> int:
+        processor = getattr(self.get_hf_processor(), f"{modality}_processor")
+        kwargs = self.ctx.get_merged_mm_kwargs({}, modality=modality)
+        limit = kwargs.get("max_image_tokens")
+        # The video budget covers the whole clip; a single temporal patch can
+        # use it all. GLM attention never crosses temporal-patch boundaries.
+        return processor.max_image_tokens if limit is None else int(limit)
+
+    def get_max_image_tokens(self) -> int:
+        return self.get_max_frame_tokens("image")
+
+    def _get_image_max_pixels(self) -> int:
+        processor = self.get_image_processor()
+        return (
+            self.get_max_frame_tokens("image")
+            * processor.temporal_patch_size
+            * (processor.patch_size * processor.merge_size) ** 2
         )
-        return processor
+
+    def _get_video_max_pixels(self) -> int:
+        processor = self.get_video_processor()
+        return (
+            self.get_max_frame_tokens("video")
+            * processor.temporal_patch_size
+            * (processor.patch_size * processor.merge_size) ** 2
+        )
+
+
+class _RBLNGlm5NextMultiModalProcessor(Glm5NextMultiModalProcessor):
+    def _apply_hf_processor_main(
+        self,
+        mm_items: MultiModalDataItems,
+        hf_kwargs: Mapping[str, object],
+    ) -> BatchFeature:
+        outputs = super()._apply_hf_processor_main(mm_items, hf_kwargs)
+        if "video_metadata" in outputs:
+            temporal = self.info.get_video_processor().temporal_patch_size
+            # Backport vllm-project/vllm#55647 and #64071: use the actual sampled
+            # frames. Remove timestamp overrides when the minimum vLLM includes both.
+            outputs["timestamps"] = [
+                torch.tensor(
+                    [int(i / meta.fps) for i in meta.frames_indices[::temporal]]
+                )
+                for meta in outputs.pop("video_metadata")
+            ]
+        merge = self.info.get_image_processor().merge_size
+        for modality in ("image", "video"):
+            pixels = "pixel_values" if modality == "image" else "pixel_values_videos"
+            if outputs.get(pixels) is None:
+                continue
+            limit = self.info.get_max_frame_tokens(modality)
+            for _, h, w in outputs[f"{modality}_grid_thw"].tolist():
+                if h * w > limit * merge**2:
+                    raise ValueError(
+                        f"The {modality} has {h * w // merge**2} encoder output "
+                        f"tokens per temporal group, more than the {limit} the "
+                        "RBLN vision encoder is compiled for. "
+                        "Lower the request's max_image_tokens, "
+                        "or raise it at startup in --mm-processor-kwargs."
+                    )
+        return outputs
+
+    def _get_mm_fields_config(
+        self,
+        hf_inputs: BatchFeature,
+        hf_processor_mm_kwargs: Mapping[str, object],
+    ) -> Mapping[str, MultiModalFieldConfig]:
+        return {
+            **super()._get_mm_fields_config(hf_inputs, hf_processor_mm_kwargs),
+            "timestamps": MultiModalFieldConfig.batched("video", keep_on_cpu=True),
+        }
+
+    def _get_prompt_updates(
+        self,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+        out_mm_kwargs: MultiModalKwargsItems,
+    ) -> Sequence[PromptUpdate]:
+        config = self.info.get_hf_config()
+        tokenizer = self.info.get_tokenizer()
+        merge2 = self.info.get_image_processor().merge_size ** 2
+
+        def get_video_replacement(item_idx: int):
+            item = out_mm_kwargs["video"][item_idx]
+            grid = item["video_grid_thw"].data
+            timestamps = item["timestamps"].data
+            assert isinstance(grid, torch.Tensor)
+            assert isinstance(timestamps, torch.Tensor)
+            grid_t = int(grid[0])
+            if len(timestamps) != grid_t:
+                raise ValueError(
+                    "Video timestamp count does not match video_grid_thw[0]: "
+                    f"{len(timestamps)} timestamps for grid_t={grid_t}."
+                )
+            frame = [config.image_start_token_id]
+            frame += [config.image_token_id] * (int(grid[1] * grid[2]) // merge2)
+            frame += [config.image_end_token_id]
+            placeholder = [config.video_start_token_id]
+            for timestamp in timestamps.tolist():
+                placeholder.extend(frame)
+                placeholder.extend(
+                    tokenizer.encode(
+                        f"{timestamp:.1f} seconds", add_special_tokens=False
+                    )
+                )
+            placeholder.append(config.video_end_token_id)
+            return PromptUpdateDetails.select_token_id(
+                placeholder, embed_token_id=config.image_token_id
+            )
+
+        updates = super()._get_prompt_updates(
+            mm_items, hf_processor_mm_kwargs, out_mm_kwargs
+        )
+        return [
+            replace(update, replacement=get_video_replacement)
+            if isinstance(update, PromptReplacement) and update.modality == "video"
+            else update
+            for update in updates
+        ]
 
 
 @MULTIMODAL_REGISTRY.register_processor(
-    Glm5NextMultiModalProcessor,
+    _RBLNGlm5NextMultiModalProcessor,
     info=RBLNGlm5NextProcessingInfo,
     dummy_inputs=Glm4vDummyInputsBuilder,
 )
@@ -1220,7 +1361,12 @@ class RBLNGlm5NextForConditionalGeneration(
         with self._mark_language_model(vllm_config):
             super().__init__(vllm_config=vllm_config, prefix=prefix)
         hf_config = vllm_config.model_config.hf_config
-        if get_pp_group().is_first_rank:
+        self.mm_embeds_dtype = vllm_config.model_config.dtype
+        self.mm_encoder_patch_buckets: list[int] = []
+        mm_config = vllm_config.model_config.multimodal_config
+        if get_pp_group().is_first_rank and any(
+            mm_config.get_limit_per_prompt(m) > 0 for m in ("image", "video")
+        ):
             with (
                 self._mark_tower_model(vllm_config, {"image", "video"}),
                 set_default_torch_dtype(torch.float32),
@@ -1232,11 +1378,27 @@ class RBLNGlm5NextForConditionalGeneration(
                     quant_config=None,
                     prefix=maybe_prefix(prefix, "visual"),
                 )
+            info = MULTIMODAL_REGISTRY.create_processor(vllm_config.model_config).info
+            bounds = [
+                info.get_max_frame_tokens(m)
+                for m in ("image", "video")
+                if mm_config.get_limit_per_prompt(m) > 0
+            ]
+            budgets = sorted(
+                vllm_config.additional_config.encoder_token_budgets
+            ) or sorted(set(bounds))
+            max_tokens = max(bounds)
+            if budgets[-1] < max_tokens:
+                raise ValueError(
+                    f"encoder_token_budgets {budgets} must reach "
+                    f"{max_tokens} output tokens, the processor's upper bound "
+                    "for an image or temporal video frame. Add a budget that "
+                    "large, or lower max_image_tokens in --mm-processor-kwargs."
+                )
+            merge = self.visual.spatial_merge_size
+            self.mm_encoder_patch_buckets = [b * merge**2 for b in budgets]
         else:
             self.visual = PPMissingLayer()
-        self.mm_encoder_patch_buckets = (
-            [] if isinstance(self.visual, PPMissingLayer) else [VISION_PATCH_BUCKET]
-        )
         self.config.image_token_index = hf_config.image_token_id
         object.__setattr__(self, "_mm_encoder", None)
 
@@ -1246,7 +1408,7 @@ class RBLNGlm5NextForConditionalGeneration(
     def compile_mm_encoder(self, compile_fn) -> None:
         if isinstance(self.visual, PPMissingLayer):
             return
-        encoder = _RBLNGlm5NextVisionEncoder(self.visual).eval()
+        encoder = _RBLNGlm5NextVisionEncoder(self.visual, self.mm_embeds_dtype).eval()
         object.__setattr__(self, "_mm_encoder", compile_fn(encoder))
 
     def warmup_mm_encoder(self) -> None:
@@ -1277,12 +1439,10 @@ class RBLNGlm5NextForConditionalGeneration(
         self, pixel_values: torch.Tensor, grid_thw: list[int]
     ) -> list[torch.Tensor]:
         visual = self.visual
-        bucket = VISION_PATCH_BUCKET
         num_patches = math.prod(grid_thw)
-        assert num_patches <= bucket, (
-            f"an image of {num_patches} patches (grid {grid_thw}) exceeds the "
-            f"vision encoder's {bucket}-patch bucket"
-        )
+        fits = [b for b in self.mm_encoder_patch_buckets if b >= num_patches]
+        assert fits, f"a frame of {num_patches} patches (grid {grid_thw})"
+        bucket = fits[0]
         dtype = visual.dtype
         patch_dim = visual.patch_embed.proj.weight[0].numel()
         padded = torch.zeros(bucket, patch_dim, dtype=dtype)
@@ -1316,28 +1476,41 @@ class RBLNGlm5NextForConditionalGeneration(
         ]
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
-        if "pixel_values_videos" in kwargs:
-            raise NotImplementedError("GLM-5.3 video inputs are not supported on RBLN")
-        pixel_values = kwargs.get("pixel_values")
-        if pixel_values is None:
-            return ()
-        encoder = self._mm_encoder
-        if encoder is None:
-            encoder = _RBLNGlm5NextVisionEncoder(self.visual).eval()
-            object.__setattr__(self, "_mm_encoder", encoder)
-        image_grid_thw = kwargs["image_grid_thw"]
-        assert isinstance(pixel_values, torch.Tensor)
-        assert isinstance(image_grid_thw, torch.Tensor)
-        grid_thw = image_grid_thw.tolist()
-        sizes = [math.prod(g) for g in grid_thw]
-        merge2 = self.visual.spatial_merge_size**2
+        outputs: list[torch.Tensor] = []
         with torch.inference_mode():
-            return tuple(
-                rbln_utils.run_mm_encoder(
-                    encoder, self._encoder_inputs(pv, g), n // merge2
-                )
-                for pv, g, n in zip(pixel_values.split(sizes), grid_thw, sizes)
-            )
+            for key in kwargs:
+                if key == "pixel_values":
+                    modality = "image"
+                elif key == "pixel_values_videos":
+                    modality = "video"
+                else:
+                    continue
+                pixel_values = kwargs[key]
+                if pixel_values is None:
+                    continue
+                if self._mm_encoder is None:
+                    self.compile_mm_encoder(lambda encoder: encoder)
+                assert self._mm_encoder is not None
+                grid_thw = kwargs[f"{modality}_grid_thw"]
+                assert isinstance(pixel_values, torch.Tensor)
+                assert isinstance(grid_thw, torch.Tensor)
+                grids = grid_thw.tolist()
+                sizes = [math.prod(g) for g in grids]
+                merge2 = self.visual.spatial_merge_size**2
+                for pixels, (_, h, w) in zip(pixel_values.split(sizes), grids):
+                    # Upstream cu_seqlens splits attention at every temporal
+                    # patch. Encoding these independently preserves that mask.
+                    frames = [
+                        rbln_utils.run_mm_encoder(
+                            self._mm_encoder,
+                            self._encoder_inputs(frame, [1, h, w]),
+                            h * w // merge2,
+                            dtype=self.mm_embeds_dtype,
+                        )
+                        for frame in pixels.split(h * w)
+                    ]
+                    outputs.append(frames[0] if len(frames) == 1 else torch.cat(frames))
+        return tuple(outputs)
 
     def forward(
         self,

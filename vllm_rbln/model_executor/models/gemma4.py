@@ -23,7 +23,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import BatchFeature
-from transformers.models.gemma4.modeling_gemma4 import apply_multidimensional_rope
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
 from vllm.forward_context import get_forward_context
@@ -43,11 +42,12 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.parse import MultiModalDataItems
 from vllm.sequence import IntermediateTensors
 
+import vllm_rbln.utils as rbln_utils
 from vllm_rbln.model_executor.models.interfaces import (
     SupportsRBLNMmPrefix,
     SupportsRBLNMultiModal,
 )
-from vllm_rbln.patches.attention import _resolve_kv_cache
+from vllm_rbln.v1.attention.kv_cache_bindings import resolve_kv_cache
 
 
 def _build_mm_prefix_sliding_mask(
@@ -113,6 +113,19 @@ class _RBLNGemma4VisionEncoder(nn.Module):
             ),
             persistent=False,
         )
+        # HF's rope slices a head into its x and y halves and joins them back,
+        # which round-trips DRAM on a large image. rotate_half on each half is
+        # a block of one signed channel permutation, so the rope is a matmul.
+        half = vision_tower.config.head_dim // 4
+        rot = torch.zeros(2 * half, 2 * half)
+        for j in range(half):
+            rot[j + half, j] = -1.0
+            rot[j, j + half] = 1.0
+        self.register_buffer(
+            "rope_rot",
+            torch.block_diag(rot, rot).to(patch_embedder.input_proj.weight),
+            persistent=False,
+        )
 
     def forward(
         self,
@@ -137,7 +150,8 @@ class _RBLNGemma4VisionEncoder(nn.Module):
         )
         rope = F.embedding(pixel_position_ids.clamp(min=0), self.rope_table)
         half = rope.shape[-1] // 2
-        cos, sin = rope[..., :half].flatten(-2), rope[..., half:].flatten(-2)
+        cos = rope[..., :half].flatten(-2).unsqueeze(2)
+        sin = rope[..., half:].flatten(-2).unsqueeze(2)
         for layer in tower.encoder.layers:
             residual = hidden_states
             hidden_states = layer.input_layernorm(hidden_states)
@@ -146,14 +160,17 @@ class _RBLNGemma4VisionEncoder(nn.Module):
             q = attn.q_norm(attn.q_proj(hidden_states).view(shape))
             k = attn.k_norm(attn.k_proj(hidden_states).view(shape))
             v = attn.v_norm(attn.v_proj(hidden_states).view(shape))
-            q = apply_multidimensional_rope(q, cos, sin, pixel_position_ids)
-            k = apply_multidimensional_rope(k, cos, sin, pixel_position_ids)
-            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-            k = k.repeat_interleave(attn.num_key_value_groups, dim=1)
-            v = v.repeat_interleave(attn.num_key_value_groups, dim=1)
-            scores = torch.matmul(q, k.transpose(-1, -2)) * attn.scaling + key_bias
-            probs = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
-            out = torch.matmul(probs, v).transpose(1, 2).reshape(residual.shape)
+            q = q * cos + torch.matmul(q, self.rope_rot) * sin
+            k = k * cos + torch.matmul(k, self.rope_rot) * sin
+            # [heads, patches, head_dim] of the one image: 3D matmuls lower to
+            # batched matmuls; the 4D form, which SDPA also falls back to for an
+            # off-64 head_dim, does not and runs slower.
+            q, k, v = q[0].transpose(0, 1), k[0].transpose(0, 1), v[0].transpose(0, 1)
+            k = k.repeat_interleave(attn.num_key_value_groups, dim=0)
+            v = v.repeat_interleave(attn.num_key_value_groups, dim=0)
+            scores = torch.matmul(q, k.transpose(1, 2)) * attn.scaling + key_bias
+            out = torch.matmul(torch.softmax(scores, dim=-1), v)
+            out = out.transpose(0, 1).reshape(residual.shape)
             hidden_states = residual + layer.post_attention_layernorm(attn.o_proj(out))
             residual = hidden_states
             hidden_states = layer.pre_feedforward_layernorm(hidden_states)
@@ -266,9 +283,16 @@ class RBLNGemma4ForConditionalGeneration(
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         if vllm_config.parallel_config.data_parallel_size > 1:
             raise ValueError("Gemma4 does not support data parallel on RBLN.")
-        if vllm_config.speculative_config is not None:
+        spec = vllm_config.speculative_config
+        if spec is not None and not spec.use_gemma4_mtp():
             raise ValueError(
-                "Gemma4 does not support speculative decoding on RBLN yet."
+                "Gemma4 supports speculative decoding only with its MTP assistant."
+            )
+        # Off the first stage the target shares no embedding, so the assistant
+        # keeps its narrower one and its first projection mismatches.
+        if spec is not None and vllm_config.parallel_config.pipeline_parallel_size > 1:
+            raise ValueError(
+                "Gemma4 MTP on RBLN supports pipeline_parallel_size=1 only."
             )
         # Upstream fills per-layer inputs in its own embed_input_ids, which the
         # in-graph merge of mm embeddings (forward) bypasses.
@@ -294,10 +318,13 @@ class RBLNGemma4ForConditionalGeneration(
         # longest range.
         self.max_mm_prefix_range_len = cap
         # One compiled encoder shape per budget; an image or frame is padded to
-        # the smallest that holds its patches.
+        # the smallest that holds its patches. Unset, every budget a prefill
+        # chunk holds, so raising max_soft_tokens keeps the compiled graphs.
         rbln_config = vllm_config.additional_config
         budgets = sorted(rbln_config.encoder_token_budgets) or [
-            budget for budget in _SUPPORTED_SOFT_TOKENS if budget <= cap
+            budget
+            for budget in _SUPPORTED_SOFT_TOKENS
+            if budget <= rbln_config.max_prefill_chunk_size
         ]
         if unsupported := sorted(set(budgets) - set(_SUPPORTED_SOFT_TOKENS)):
             raise ValueError(
@@ -315,6 +342,10 @@ class RBLNGemma4ForConditionalGeneration(
         self.mm_encoder_patch_buckets = [budget * pool**2 for budget in budgets]
         self._mm_encoder: Callable[..., torch.Tensor] | None
         object.__setattr__(self, "_mm_encoder", None)
+
+    @property
+    def logits_processor(self) -> nn.Module:
+        return self.language_model.logits_processor
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # Scale each expert's down projection instead of its routing weight:
@@ -405,19 +436,22 @@ class RBLNGemma4ForConditionalGeneration(
         patches[0, :num_patches] = pixel_values[valid]
         padding = ~(positions >= 0).all(dim=-1)
         key_bias = torch.where(padding, torch.finfo(self.model_dtype).min, 0.0)[
-            :, None, None, :
+            :, None, :
         ]
         device = next(tower.parameters()).device
-        embeds = encoder(
-            patches.to(device),
-            positions.to(device),
-            padding.to(device),
-            key_bias.to(device=device, dtype=self.model_dtype),
-        )
         # The patches of a grid whose sides are multiples of the pooling kernel
         # pool into the leading cells, in order.
         num_soft_tokens = num_patches // tower.config.pooling_kernel_size**2
-        return embeds[0, :num_soft_tokens].cpu()
+        return rbln_utils.run_mm_encoder(
+            lambda *inputs: encoder(*inputs)[0],
+            [
+                patches.to(device),
+                positions.to(device),
+                padding.to(device),
+                key_bias.to(device=device, dtype=self.model_dtype),
+            ],
+            num_soft_tokens,
+        )
 
     def _process_image_input(
         self, image_input: Gemma4ImageInputs
@@ -470,7 +504,7 @@ class RBLNGemma4ForConditionalGeneration(
                     metadata.mm_prefix_row_ends,
                     metadata.seq_lens,
                     layer.sliding_window,
-                    _resolve_kv_cache(metadata, layer.layer_index).size(-2),
+                    resolve_kv_cache(metadata, layer.layer_name).size(-2),
                     self.model_dtype,
                 )
                 # Workaround: borrow metadata without mutating Attention modules.

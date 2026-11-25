@@ -17,7 +17,7 @@
 # sampler's output back.
 
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, create_autospec
 
 import numpy as np
 import pytest
@@ -30,22 +30,172 @@ from vllm.multimodal.inputs import (
     MultiModalKwargsItem,
     PlaceholderRange,
 )
+from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
 
 import vllm_rbln.v1.worker.rbln_model_runner as mr
 from tests.vllm.v1.worker.utils import (
     MAX_MODEL_LEN,
+    make_kv_cache_config,
     make_scheduler_output,
     make_speculative_config,
+    schedule_cached,
     schedule_new,
 )
-from vllm_rbln.v1.worker.input_stager import InputLayout
 
-pytestmark = pytest.mark.maybe_use_device
+pytestmark = pytest.mark.use_device
 
 
 class _InGraphMergeModel(torch.nn.Module):
     merges_mm_embeds_in_graph = True
+
+
+class TestPreprocessBeforeStaging:
+    @pytest.mark.parametrize("is_prefill", [False, True])
+    @pytest.mark.parametrize("is_first_rank", [False, True])
+    def test_prepared_inputs_remain_cpu_views(
+        self, make_model_runner, monkeypatch, is_prefill, is_first_rank
+    ):
+        monkeypatch.setattr(
+            mr, "get_pp_group", lambda: SimpleNamespace(is_first_rank=is_first_rank)
+        )
+        runner = make_model_runner()
+        runner.is_prefill = is_prefill
+        runner.input_ids[:3] = torch.tensor([1, 2, 3], dtype=runner.input_ids.dtype)
+        runner.positions[:3] = torch.tensor([0, 1, 2], dtype=runner.positions.dtype)
+
+        intermediate = IntermediateTensors({"hidden_states": torch.ones(1, 3, 4)})
+        prepared = runner._preprocess(
+            schedule_new("a"),
+            1,
+            2,
+            3,
+            torch.tensor([2], dtype=torch.int32),
+            intermediate,
+        )[0]
+        runner.input_ids[0] = 42
+
+        assert prepared.input_ids.tolist() == [[42, 2, 3]]
+        assert prepared.input_ids.device.type == "cpu"
+        assert prepared.positions.tolist() == [[0, 1, 2]]
+        assert (prepared.token_indices is not None) == is_prefill
+        assert prepared.intermediate_tensors is (
+            None if is_first_rank else intermediate
+        )
+
+    @pytest.mark.parametrize(
+        ("num_kv_groups", "use_gdn"), [(1, False), (2, False), (2, True)]
+    )
+    def test_decode_repairs_cpu_input_before_staging(
+        self, make_model_runner, monkeypatch, num_kv_groups, use_gdn
+    ):
+        """Keep CPU preparation ahead of blocking copies in the current pipeline."""
+        from tests.vllm.v1.worker.test_async_output import _async_output
+
+        monkeypatch.setattr(
+            mr,
+            "get_pp_group",
+            lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+        )
+        layers = tuple(f"layer.{index}" for index in range(num_kv_groups))
+        runner = make_model_runner(layers=layers, init_kv_cache=False)
+        runner.initialize_kv_cache(
+            make_kv_cache_config(runner, groups=[(layer,) for layer in layers])
+        )
+        if use_gdn:
+            from vllm.v1.kv_cache_interface import MambaSpec
+
+            group = runner.attn_groups[-1][0]
+            group.metadata_builders = [
+                mr.RBLNGDNAttentionMetadataBuilder(
+                    MambaSpec(
+                        block_size=MAX_MODEL_LEN,
+                        shapes=((4, 128, 128),),
+                        dtypes=(torch.bfloat16,),
+                    ),
+                    group.layer_names,
+                    runner.vllm_config,
+                    runner.device,
+                )
+            ]
+        runner.use_async_scheduling = True
+        runner._update_states(schedule_new("a", block_ids=[tuple([0] for _ in layers)]))
+        state = runner.requests["a"]
+        n = state.num_prompt_tokens
+        state.output_token_ids.append(-1)
+        runner.input_batch.token_ids_cpu[0, n] = -1
+        runner.input_batch.num_tokens_no_spec[0] = n + 1
+        previous = _async_output(
+            torch.tensor([[42]], dtype=torch.int32),
+            req_ids=["a"],
+            placeholder_pos={"a": n},
+        )
+        runner._prev_async_output = previous
+        order = []
+        original_kwargs = runner._init_model_kwargs
+        original_readback = previous.get_sampled_token_ids_cpu
+        original_stage = runner.input_stager.stage
+        original_metadata = runner._build_attention_metadata
+        original_metadata_stage = mr.RBLNFlashAttentionMetadataBuilder.stage
+        original_gdn_stage = mr.RBLNGDNAttentionMetadataBuilder.stage
+
+        def kwargs():
+            order.append("cpu_kwargs")
+            return original_kwargs()
+
+        def readback():
+            order.append("readback")
+            return original_readback()
+
+        def stage(**values):
+            order.append("stage")
+            assert values["input_ids"].tolist() == [[42]]
+            return original_stage(**values)
+
+        def metadata(**values):
+            order.append("metadata")
+            return original_metadata(**values)
+
+        def metadata_stage(builder, values, group_shared):
+            order.append("metadata_stage")
+            assert group_shared is runner._group_shared_staging
+            if isinstance(builder, mr.RBLNGDNAttentionMetadataBuilder):
+                return original_gdn_stage(builder, values, group_shared)
+            return original_metadata_stage(builder, values, group_shared)
+
+        def forward(**values):
+            order.append("forward")
+            assert values["input_ids"][0, 0] == 42
+            return torch.zeros((1, 1, 4)), torch.zeros((1, 1, 1000)), None
+
+        monkeypatch.setattr(runner, "_init_model_kwargs", kwargs)
+        monkeypatch.setattr(previous, "get_sampled_token_ids_cpu", readback)
+        monkeypatch.setattr(runner.input_stager, "stage", stage)
+        monkeypatch.setattr(runner, "_build_attention_metadata", metadata)
+        monkeypatch.setattr(
+            mr.RBLNFlashAttentionMetadataBuilder, "stage", metadata_stage
+        )
+        monkeypatch.setattr(mr.RBLNGDNAttentionMetadataBuilder, "stage", metadata_stage)
+        monkeypatch.setattr(runner, "model_executable", forward, raising=False)
+
+        runner.execute_model(
+            schedule_cached(
+                req_ids=["a"], num_computed_tokens=[n], num_output_tokens=[1]
+            )
+        )
+
+        readback_index = order.index("readback")
+        forward_index = order.index("forward")
+        assert order.index("metadata") < readback_index
+        assert order.index("cpu_kwargs") < readback_index
+        assert readback_index < order.index("stage") < forward_index
+        assert order.count("metadata_stage") == num_kv_groups
+        assert all(
+            readback_index < index < forward_index
+            for index, phase in enumerate(order)
+            if phase == "metadata_stage"
+        )
+        assert state.output_token_ids == [42]
 
 
 class TestResolveMultiModalSupport:
@@ -134,6 +284,19 @@ class TestResolveMmPrefixSupport:
 
         assert runner._resolve_mm_support() is True
 
+    @pytest.mark.parametrize("gemma4_mtp", [False, True])
+    def test_only_the_gemma4_mtp_assistant_drafts_over_ranges(
+        self, make_model_runner, monkeypatch, gemma4_mtp
+    ):
+        runner = self._runner(make_model_runner, monkeypatch, _MmPrefixModel(128))
+        runner.speculative_config = SimpleNamespace(use_gemma4_mtp=lambda: gemma4_mtp)
+
+        if gemma4_mtp:
+            assert runner._resolve_mm_support() is True
+        else:
+            with pytest.raises(ValueError, match="Speculative decoding"):
+                runner._resolve_mm_support()
+
     def test_a_range_longer_than_the_longest_chunk_is_refused_with_a_fix(
         self, make_model_runner, monkeypatch
     ):
@@ -162,6 +325,89 @@ class TestResolveMmPrefixSupport:
 
 
 class TestGatherMultimodalEmbeddings:
+    @pytest.mark.parametrize("draft_type", ["mtp", "dflash"])
+    def test_proposer_receives_shifted_embeddings_and_both_position_views(
+        self, make_model_runner, monkeypatch, draft_type
+    ):
+        from tests.vllm.v1.spec_decode.utils import make_cad
+        from vllm_rbln.v1.spec_decode.dflash import RBLNDFlashProposer
+        from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
+
+        monkeypatch.setattr(
+            mr,
+            "get_pp_group",
+            lambda: SimpleNamespace(is_last_rank=True, is_first_rank=True),
+        )
+        runner = make_model_runner()
+        step = schedule_new(
+            "image", prompt_token_ids=[[1] * 8], num_scheduled_tokens=[3]
+        )
+        step.scheduled_new_reqs[0].mm_features = [
+            MultiModalFeatureSpec(
+                data=None,
+                modality="image",
+                identifier="image",
+                mm_position=PlaceholderRange(offset=0, length=3),
+            )
+        ]
+        runner._update_states(step)
+        hidden_size = runner.model_config.get_hidden_size()
+        runner.encoder_cache["image"] = (
+            torch.tensor([11.0, 22.0, 33.0]).view(3, 1).expand(-1, hidden_size)
+        )
+        runner.is_prefill = True
+        runner.supports_mm_inputs = True
+        speculative_config = SimpleNamespace(
+            method=draft_type,
+            use_eagle=lambda: True,
+            use_multi_module_mtp=lambda: False,
+        )
+        runner.speculative_config = speculative_config
+        runner.vllm_config.speculative_config = speculative_config
+        runner.input_ids[:3] = torch.tensor([10, 11, 12], dtype=runner.input_ids.dtype)
+        runner.positions[:3] = torch.arange(3)
+        runner.decode_back_pad[:1] = 0
+        runner.mrope_positions = torch.tensor([[0, 0, 0], [0, 1, 2], [0, 0, 1]])
+        draft_cls = RBLNEagleProposer if draft_type == "mtp" else RBLNDFlashProposer
+        drafter = Mock(spec=draft_cls)
+        drafter.supports_mm_inputs = draft_type == "mtp"
+        drafter.uses_mrope = True
+        if draft_type == "dflash":
+            drafter.propose = create_autospec(
+                RBLNDFlashProposer.propose.__get__(drafter)
+            )
+        drafter.prepare_next_token_ids_padded.return_value = (
+            torch.tensor([13]),
+            torch.tensor([1]),
+        )
+        runner.drafter = drafter
+        hidden = torch.zeros(3, hidden_size)
+        runner.propose_draft_token_ids(
+            step,
+            torch.tensor([[13]]),
+            runner.input_batch.sampling_metadata,
+            hidden,
+            hidden,
+            None,
+            make_cad([0, 3], [3]),
+            None,
+        )
+
+        inputs = drafter.propose.call_args.kwargs
+        torch.testing.assert_close(inputs["target_positions"], torch.arange(3))
+        if draft_type == "dflash":
+            assert "target_mrope_positions" not in inputs
+            return
+        torch.testing.assert_close(
+            inputs["target_mrope_positions"], runner.mrope_positions
+        )
+        rows, mask = inputs["mm_embed_inputs"]
+        assert mask[:, 0].tolist() == [1, 1, 0]
+        assert rows[0][:2] == (0, 0)
+        torch.testing.assert_close(
+            rows[0][2][:, 0], torch.tensor([22, 33], dtype=runner.dtype)
+        )
+
     def test_scheduled_images_are_encoded_and_cached_by_hash(
         self, make_model_runner, monkeypatch
     ):
@@ -200,21 +446,28 @@ class TestGatherMultimodalEmbeddings:
         torch.testing.assert_close(runner.encoder_cache["image-1"], pixels[1] + 10)
 
     @pytest.mark.parametrize(
-        "computed, with_text_holes, values",
+        "computed, with_text_holes, shift, values",
         [
-            (0, True, [0, 0, 11]),
-            (2, True, [11, 0, 22]),
-            (3, True, [0, 22, 33]),
-            (6, True, [0, 0, 0]),
-            (0, False, [0, 0, 11]),
-            (3, False, [22, 33, 0]),
+            (0, True, 0, [0, 0, 11]),
+            (2, True, 0, [11, 0, 22]),
+            (3, True, 0, [0, 22, 33]),
+            (6, True, 0, [0, 0, 0]),
+            (0, False, 0, [0, 0, 11]),
+            (3, False, 0, [22, 33, 0]),
+            (0, True, 1, [0, 11, 0]),
+            (2, True, 1, [0, 22, 33]),
+            (3, True, 1, [22, 33, 0]),
+            (0, False, 1, [0, 11, 22]),
+            (3, False, 1, [33, 0, 0]),
         ],
     )
     def test_chunk_boundaries_preserve_text_holes_and_request_order(
-        self, make_model_runner, monkeypatch, computed, with_text_holes, values
+        self, make_model_runner, monkeypatch, computed, with_text_holes, shift, values
     ):
         monkeypatch.setattr(
-            mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+            mr,
+            "get_pp_group",
+            lambda: SimpleNamespace(is_last_rank=True, is_first_rank=True),
         )
         runner = make_model_runner()
         step = schedule_new(
@@ -246,19 +499,55 @@ class TestGatherMultimodalEmbeddings:
             torch.tensor([11.0, 22.0, 33.0]).unsqueeze(1).expand(-1, hidden)
         )
 
-        mm_rows, mask = runner._gather_mm_embeddings(step, num_tokens=6)
+        runner.is_prefill = True
+        runner.supports_mm_inputs = True
+        _, model_kwargs, layout, _ = runner._preprocess(
+            step, 2, 2, 6, torch.tensor([2, 5], dtype=torch.int32)
+        )
+        if shift:
+            rows, mask = runner._gather_mm_embeddings(
+                step, 6, shift_computed_tokens=shift
+            )
+            model_kwargs = {"mm_embeds": rows, "mm_mask": mask.view(2, 3, 1)}
+        mask = model_kwargs["mm_mask"].reshape(6, 1)
         embeds, _ = runner.input_stager.stage_mm_embeds(
-            mm_rows,
-            mask.view(2, 3, 1),
+            model_kwargs["mm_embeds"],
+            model_kwargs["mm_mask"],
             hidden,
-            InputLayout(num_reqs=2, num_reqs_padded=2, query_len=3, query_len_padded=3),
+            layout,
         )
 
         expected = torch.tensor([0, 0, 0] + values, dtype=runner.dtype)
         torch.testing.assert_close(
-            embeds.cpu().view(6, hidden), expected[:, None].expand(-1, hidden)
+            embeds.cpu()[:, :3].reshape(6, hidden), expected[:, None].expand(-1, hidden)
         )
         torch.testing.assert_close(mask[:, 0], (expected != 0).to(runner.dtype))
+
+    @pytest.mark.parametrize("offset", [2, 3])
+    def test_shifted_gather_requires_cached_embeddings_for_its_whole_window(
+        self, make_model_runner, monkeypatch, offset
+    ):
+        monkeypatch.setattr(
+            mr,
+            "get_pp_group",
+            lambda: SimpleNamespace(is_last_rank=True, is_first_rank=True),
+        )
+        runner = make_model_runner()
+        step = schedule_new(
+            "image", prompt_token_ids=[[1] * 8], num_scheduled_tokens=[3]
+        )
+        step.scheduled_new_reqs[0].mm_features = [
+            MultiModalFeatureSpec(
+                data=None,
+                modality="image",
+                identifier="missing",
+                mm_position=PlaceholderRange(offset=offset, length=1),
+            )
+        ]
+        runner._update_states(step)
+
+        with pytest.raises(AssertionError, match="Encoder cache miss"):
+            runner._gather_mm_embeddings(step, 3, shift_computed_tokens=1)
 
 
 class TestWarmupMultimodalEncoder:
@@ -313,6 +602,95 @@ class TestWarmupMultimodalEncoder:
         runner._warmup_mm_encoder()
 
         warmup.assert_not_called()
+
+
+class TestMRopePositions:
+    # A prompt whose T / H / W positions differ per axis, with the negative
+    # delta of an image that spans fewer positions than tokens.
+    PROMPT = [5, 6, 7, 8]
+    TABLE = torch.tensor([[0, 1, 1, 2], [0, 1, 2, 2], [0, 2, 1, 2]])
+    DELTA = -1
+
+    def _runner(self, make_model_runner, monkeypatch):
+        monkeypatch.setattr(
+            mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+        )
+        runner = make_model_runner()
+        runner.model = SimpleNamespace(
+            get_mrope_input_positions=lambda ids, features: (
+                self.TABLE[:, : len(ids)],
+                self.DELTA,
+            )
+        )
+        runner.mrope_positions = torch.zeros(3, runner.max_num_tokens, dtype=torch.long)
+        runner._update_states(
+            schedule_new("a", prompt_token_ids=[self.PROMPT], num_scheduled_tokens=[3])
+        )
+        return runner
+
+    def test_a_prompt_chunk_reads_the_requests_table(
+        self, make_model_runner, monkeypatch
+    ):
+        runner = self._runner(make_model_runner, monkeypatch)
+        runner._is_prefill_step = True
+
+        runner._prepare_inputs(
+            make_scheduler_output(num_scheduled_tokens={"a": 3}),
+            np.array([3], dtype=np.int32),
+        )
+
+        assert torch.equal(runner.mrope_positions[:, :3], self.TABLE[:, :3])
+
+    def test_a_token_past_the_prompt_takes_its_position_plus_delta(
+        self, make_model_runner, monkeypatch
+    ):
+        runner = self._runner(make_model_runner, monkeypatch)
+        num_computed = len(self.PROMPT)
+        runner.input_batch.num_computed_tokens_cpu[0] = num_computed
+        runner.input_batch.num_tokens_no_spec[0] = num_computed + 1
+        runner._is_prefill_step = False
+
+        runner._prepare_inputs(
+            make_scheduler_output(num_scheduled_tokens={"a": 1}),
+            np.array([1], dtype=np.int32),
+        )
+
+        assert runner.mrope_positions[:, 0].tolist() == [num_computed + self.DELTA] * 3
+
+    def test_a_step_across_the_prompt_end_takes_both(
+        self, make_model_runner, monkeypatch
+    ):
+        # A preempted request runs its prompt's tail and its outputs again.
+        runner = self._runner(make_model_runner, monkeypatch)
+        runner.input_batch.num_computed_tokens_cpu[0] = 2
+        runner.input_batch.num_tokens_no_spec[0] = len(self.PROMPT) + 2
+        runner._is_prefill_step = True
+
+        runner._prepare_inputs(
+            make_scheduler_output(num_scheduled_tokens={"a": 4}),
+            np.array([4], dtype=np.int32),
+        )
+
+        past_prompt = torch.tensor([4, 5]) + self.DELTA
+        expected = torch.cat([self.TABLE[:, 2:], past_prompt.expand(3, -1)], dim=1)
+        assert torch.equal(runner.mrope_positions[:, :4], expected)
+
+    def test_a_streaming_update_rebuilds_the_requests_table(
+        self, make_model_runner, monkeypatch
+    ):
+        runner = self._runner(make_model_runner, monkeypatch)
+        grown = [*self.PROMPT, 9, 10]
+        runner.model.get_mrope_input_positions = lambda ids, features: (
+            torch.arange(len(ids)).expand(3, -1),
+            len(ids),
+        )
+
+        # The same request id again: a streaming session's longer prompt.
+        runner._update_states(schedule_new("a", prompt_token_ids=[grown]))
+
+        request = runner.requests["a"]
+        assert request.mrope_positions.shape == (3, len(grown))
+        assert request.mrope_position_delta == len(grown)
 
 
 def _decode_ready(

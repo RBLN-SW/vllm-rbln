@@ -26,18 +26,12 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 from vllm_rbln.logger import init_logger
 from vllm_rbln.patches import register_patch
-from vllm_rbln.patches.attention import _resolve_kv_cache
 from vllm_rbln.v1.attention.backends.mla.indexer import (
     RBLNDeepseekV32IndexerBackend,
     RBLNDeepseekV32IndexerScaleBackend,
 )
+from vllm_rbln.v1.attention.kv_cache_bindings import resolve_kv_cache
 from vllm_rbln.v1.spec_decode import pass_state
-from vllm_rbln.v1.worker.utils import (
-    num_attn_module as rbln_num_attn_module,
-)
-from vllm_rbln.v1.worker.utils import (
-    pipeline_adjusted_layer_index,
-)
 
 logger = init_logger(__name__)
 _original_indexer_cache_init = DeepseekV32IndexerCache.__init__
@@ -160,9 +154,8 @@ def patched_deepseek_v2_attention_forward(
 @register_patch(
     target="vllm.model_executor.models.deepseek_v2.DeepseekV32IndexerCache.__init__",
     reason=(
-        "Give the indexer KV cache the RBLN head_dim/dtype "
-        "and a layer_index that accounts for the extra indexer module per decoder "
-        "layer (num_attn_module=2), so the runner binds a distinct cache for it."
+        "Upstream uses a CUDA indexer cache layout and has no companion scale "
+        "cache for RBLN fp8 keys."
     ),
 )
 def rbln_indexer_cache_init(self, *args, **kwargs) -> None:
@@ -176,10 +169,6 @@ def rbln_indexer_cache_init(self, *args, **kwargs) -> None:
     self.dtype = torch.float8_e4m3fn if self.is_fp8_cache else torch.bfloat16
 
     model_config = vllm_config.model_config
-    num_attn_module = rbln_num_attn_module(model_config, cache_dtype)
-    self.layer_index = pipeline_adjusted_layer_index(
-        self.prefix, model_config, vllm_config.parallel_config, num_attn_module
-    )
 
     # register the per-token scale cache (2-cache spec).
     self.scale_cache = None
@@ -193,9 +182,6 @@ def rbln_indexer_cache_init(self, *args, **kwargs) -> None:
             cache_config=self.cache_config,
         )
         scale.get_attn_backend = lambda: RBLNDeepseekV32IndexerScaleBackend
-        scale.layer_index = pipeline_adjusted_layer_index(
-            scale.prefix, model_config, vllm_config.parallel_config, num_attn_module
-        )
         self.scale_cache = scale
 
 
@@ -251,13 +237,11 @@ def rbln_indexer_forward(
     attn_metadata = pass_state.select(forward_context.attn_metadata)
     if isinstance(attn_metadata, dict):
         attn_metadata = attn_metadata[self.k_cache.prefix]
-    k_cache = _resolve_kv_cache(attn_metadata, self.k_cache.layer_index)
+    k_cache = resolve_kv_cache(attn_metadata, self.k_cache.prefix)
 
     scale_cache = None
     if getattr(self.k_cache, "scale_cache", None) is not None:
-        scale_cache = _resolve_kv_cache(
-            attn_metadata, self.k_cache.scale_cache.layer_index
-        )
+        scale_cache = resolve_kv_cache(attn_metadata, self.k_cache.scale_cache.prefix)
 
     weights = weights.contiguous()  # [B, T, n_head]
     softmax_scale = torch.tensor(

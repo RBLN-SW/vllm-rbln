@@ -14,7 +14,7 @@
 
 # RBLN overrides for Multi-head Latent Attention (MLA). These mirror the
 # non-MLA Attention overrides in ``patches/attention.py`` (KV cache resolved
-# from attention metadata as a graph input, pipeline-adjusted layer index) and
+# from attention metadata as a graph input, runner-assigned layer index) and
 # reuse its shared helpers.
 
 import torch
@@ -27,13 +27,9 @@ from vllm_rbln.model_executor.layers.quantization.modelopt_fp8 import (
     RBLNModelOptFp8LinearMethod,
 )
 from vllm_rbln.patches import register_patch
-from vllm_rbln.patches.attention import (
-    _record_pipeline_layer_index,
-    _resolve_kv_cache,
-)
+from vllm_rbln.v1.attention.kv_cache_bindings import resolve_kv_cache
 from vllm_rbln.v1.spec_decode import pass_state
 
-mla_attention_original_init = MLAAttention.__init__
 mla_attention_original_process_weights = MLAAttention.process_weights_after_loading
 mla_attention_original_get_kv_cache_spec = MLAAttention.get_kv_cache_spec
 mla_attention_original_get_and_maybe_dequant_weights = (
@@ -129,21 +125,6 @@ def patched_mla_get_kv_cache_spec(self: MLAAttention, vllm_config):
 
 
 @register_patch(
-    target="vllm.model_executor.layers.attention.mla_attention.MLAAttention.__init__",
-    reason=(
-        "RBLN needs MLAAttention initialization to record a pipeline-adjusted "
-        "layer index so external KV-cache bindings can resolve the matching "
-        "per-layer latent cache tensor (same requirement as `Attention.__init__`)."
-    ),
-)
-def patched_mla_attention_init(self: MLAAttention, *args, **kwargs) -> None:
-    mla_attention_original_init(self, *args, **kwargs)
-
-    # NOTE(RBLN): Layer index is required to use external binding KV cache.
-    _record_pipeline_layer_index(self)
-
-
-@register_patch(
     target="vllm.model_executor.layers.attention.mla_attention.MLAAttention.forward",
     reason=(
         "RBLN resolves the latent KV cache from attention metadata (a graph "
@@ -168,7 +149,7 @@ def patched_mla_attention_forward(
 
         # NOTE(RBLN): Use attn_metadata's KV cache instead of self.kv_cache
         # so that KV caches appear as explicit model inputs for compilation.
-        self_kv_cache = _resolve_kv_cache(attn_metadata, self.layer_index)
+        self_kv_cache = resolve_kv_cache(attn_metadata, self.layer_name)
 
         if self.attn_backend.accept_output_buffer:
             output = torch.empty(output_shape, dtype=q.dtype, device=q.device)

@@ -46,9 +46,12 @@ def check_and_update(vllm_config: "VllmConfig") -> None:
     from vllm_rbln.utils.optimum.predicates import (
         forces_fp32_dtype,
         is_qwen3_embedding,
-        is_qwen3_reranker,
     )
-    from vllm_rbln.utils.optimum.registry import get_rbln_model_info, is_pooling_arch
+    from vllm_rbln.utils.optimum.registry import (
+        get_rbln_model_info,
+        is_encoder_pooling_arch,
+        is_multi_modal,
+    )
 
     # Everything below, and the sync at the end, reads additional_config as an
     # OptimumRBLNConfig. The sync also writes its derived fields back.
@@ -66,17 +69,13 @@ def check_and_update(vllm_config: "VllmConfig") -> None:
     # this only has to cover the RBLN side.
     get_rbln_model_info(model_config)
 
-    if is_qwen3_reranker(model_config):
-        # Callers pass `Qwen3ForSequenceClassification`, which is how vLLM
-        # selects convert=classify; optimum-rbln has no such class. Map it
-        # back to `Qwen3ForCausalLM`: the score comes from two vocabulary
-        # logits, so the graph needs lm_head, which `Qwen3Model` would drop.
-        model_config.hf_config.architectures = ["Qwen3ForCausalLM"]
-    elif is_qwen3_embedding(model_config):
-        # The architecture of Qwen3-Embedding model in huggingface
-        # is `Qwen3ForCausalLM`. But it have to be mapped to `Qwen3Model`
-        # for optimum-rbln.
-        model_config.hf_config.architectures = ["Qwen3Model"]
+    if is_qwen3_embedding(model_config):
+        # Qwen3-Embedding and Qwen3-VL-Embedding ship the generation
+        # architecture, but optimum-rbln compiles an embedder as the bare
+        # backbone, `Qwen3Model` or `Qwen3VLModel`.
+        model_config.hf_config.architectures = [
+            "Qwen3VLModel" if is_multi_modal(model_config.hf_config) else "Qwen3Model"
+        ]
 
     if model_config.multimodal_config is not None:
         # Optimum visual graphs expect pixels normalized by the CPU processor.
@@ -121,7 +120,9 @@ def check_and_update(vllm_config: "VllmConfig") -> None:
     # ModelConfig.is_encoder_decoder is a @cached_property that's
     # already evaluated by this point, so invalidate the cache too.
     hf_config = model_config.hf_config
-    if is_pooling_arch(hf_config) and getattr(hf_config, "is_encoder_decoder", False):
+    if is_encoder_pooling_arch(hf_config) and getattr(
+        hf_config, "is_encoder_decoder", False
+    ):
         hf_config.is_encoder_decoder = False
         with contextlib.suppress(KeyError):
             del model_config.__dict__["is_encoder_decoder"]
@@ -174,13 +175,11 @@ def _uses_sliding_window(hf_config) -> bool:
 
 
 def disable_unsupported_prefix_caching(vllm_config: "VllmConfig") -> None:
-    from vllm_rbln.utils.optimum.predicates import (
-        is_qwen3_embedding,
-        is_qwen3_reranker,
-    )
+    from vllm_rbln.utils.optimum.predicates import is_qwen3_reranker
     from vllm_rbln.utils.optimum.registry import (
+        is_decoder_pooling_arch,
         is_enc_dec_arch,
-        is_pooling_arch,
+        is_encoder_pooling_arch,
     )
 
     if not vllm_config.cache_config.enable_prefix_caching:
@@ -196,13 +195,17 @@ def disable_unsupported_prefix_caching(vllm_config: "VllmConfig") -> None:
     model_config = vllm_config.model_config
     hf_config = model_config.hf_config
 
-    # Prefix caching is supported only for decoder-only models for now.
-    if is_qwen3_embedding(model_config) or is_qwen3_reranker(model_config):
-        _disable_prefix_caching(vllm_config, "Qwen3 pooling models")
+    if is_qwen3_reranker(model_config):
+        _disable_prefix_caching(vllm_config, "Qwen3 reranker models")
     elif is_enc_dec_arch(hf_config):
         _disable_prefix_caching(vllm_config, "encoder-decoder models")
-    elif is_pooling_arch(hf_config):
-        _disable_prefix_caching(vllm_config, "pooling models")
+    elif is_encoder_pooling_arch(hf_config):
+        _disable_prefix_caching(vllm_config, "encoder pooling models")
+    elif (
+        is_decoder_pooling_arch(hf_config)
+        and model_config.pooler_config.seq_pooling_type != "LAST"
+    ):
+        _disable_prefix_caching(vllm_config, "decoder pooling without LAST pooling")
     elif _uses_sliding_window(hf_config):
         _disable_prefix_caching(vllm_config, "sliding window models")
     elif model_config.is_hybrid:

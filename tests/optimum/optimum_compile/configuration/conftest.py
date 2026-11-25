@@ -46,23 +46,26 @@ def vllm_config_factory(compile_environment):
     from vllm_rbln.utils.optimum.configuration import sync
 
     def make_config(
-        user_max_num_batched_tokens=None,
+        prefill_chunk_size=None,
         dtype=torch.bfloat16,
         *,
+        max_num_batched_tokens=2048,
+        max_num_scheduled_tokens=None,
+        sync_config=True,
         prefix_caching=False,
         optimum_overrides=None,
         num_devices_per_local_rank=1,
         mamba_block_size=None,
         hf_config=None,
+        num_gpu_blocks_override=None,
+        gpu_memory_utilization=0.9,
     ):
         additional_config = {
             "optimum_overrides": optimum_overrides or {},
             "num_devices_per_local_rank": num_devices_per_local_rank,
         }
-        if user_max_num_batched_tokens is not None:
-            additional_config["user_max_num_batched_tokens"] = (
-                user_max_num_batched_tokens
-            )
+        if prefill_chunk_size is not None:
+            additional_config["prefill_chunk_size"] = prefill_chunk_size
         cfg = SimpleNamespace(
             model_config=SimpleNamespace(
                 model="meta-llama/Llama-3.1-8B",
@@ -75,21 +78,24 @@ def vllm_config_factory(compile_environment):
                 ),
             ),
             scheduler_config=SimpleNamespace(
-                max_num_seqs=4, max_num_batched_tokens=2048
+                max_num_seqs=4,
+                max_num_batched_tokens=max_num_batched_tokens,
+                max_num_scheduled_tokens=max_num_scheduled_tokens,
             ),
             cache_config=SimpleNamespace(
                 block_size=8192,
-                gpu_memory_utilization=0.9,
+                gpu_memory_utilization=gpu_memory_utilization,
                 user_specified_block_size=True,
                 enable_prefix_caching=prefix_caching,
-                num_gpu_blocks_override=None,
+                num_gpu_blocks_override=num_gpu_blocks_override,
                 user_specified_mamba_block_size=False,
                 mamba_block_size=mamba_block_size,
             ),
             additional_config=build_optimum_rbln_config(additional_config),
         )
 
-        sync.sync_vllm_and_optimum(cfg)
+        if sync_config:
+            sync.sync_vllm_and_optimum(cfg)
         return cfg
 
     return make_config

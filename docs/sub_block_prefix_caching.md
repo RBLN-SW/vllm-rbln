@@ -26,6 +26,18 @@ if the KV cache tensor has a token dimension that can be sliced for partial copy
       This is not per-token data.
     * `CrossAttentionSpec`: Prefix caching is entirely disabled for this.
 
+A model with a layer of 2 or 3 KV heads (Gemma4 26B-A4B) is ineligible for now.
+
+A model with a `MambaSpec` group (GLM-5.3's KDA layers, Qwen3.5's GatedDeltaNet layers)
+therefore never runs this manager. It can hit below the block through upstream's
+fine-grained prefix hits instead, set with `--prefix-match-unit`, independent of
+`--rbln-enable-sub-block-cache`. On RBLN the unit has to be a multiple of the prefill
+chunk, since a step stores a recurrent state only where it ends.
+Every group then registers one partial entry at the prompt's last unit boundary,
+and a hit copies that block into a new one before the request writes past it.
+A recurrent state is kept at that one boundary per prompt, not at every sub-block.
+A sibling prompt that diverges before that boundary resumes at the latest state kept
+before the divergence, which is a block boundary.
 
 ## Configuration
 

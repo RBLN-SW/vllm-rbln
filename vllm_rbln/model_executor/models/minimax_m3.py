@@ -104,36 +104,20 @@ from vllm.v1.kv_cache_interface import (
 
 import vllm_rbln.utils as rbln_utils
 from vllm_rbln.model_executor.models.interfaces import SupportsRBLNMultiModal
-from vllm_rbln.patches.attention import _resolve_kv_cache
 from vllm_rbln.v1.attention.backends.flash_attention import _fp8_cache_dtype
 from vllm_rbln.v1.attention.backends.minimax_m3 import (
     MSA_SPARSE_BLOCK_SIZE,
     RBLNMiniMaxM3IndexerBackend,
     RBLNMiniMaxM3SparseBackend,
 )
+from vllm_rbln.v1.attention.kv_cache_bindings import resolve_kv_cache
+from vllm_rbln.v1.kv_cache import register_kv_cache
 from vllm_rbln.v1.spec_decode import pass_state
 from vllm_rbln.v1.spec_decode.eagle3_pp import (
     AUX_COMBINED,
     aux_slots_captured,
     aux_slots_received,
 )
-from vllm_rbln.v1.worker.utils import (
-    num_attn_module as rbln_num_attn_module,
-)
-from vllm_rbln.v1.worker.utils import (
-    pipeline_adjusted_layer_index,
-)
-
-
-def _layer_index_of(prefix: str) -> int:
-    vllm_config = get_current_vllm_config()
-    model_config = vllm_config.model_config
-    num_attn_module = rbln_num_attn_module(
-        model_config, vllm_config.cache_config.cache_dtype
-    )
-    return pipeline_adjusted_layer_index(
-        prefix, model_config, vllm_config.parallel_config, num_attn_module
-    )
 
 
 def _per_head_norm(
@@ -386,11 +370,8 @@ class RBLNMiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
         )
         self.prefix = prefix
         self.cache_config = cache_config
-        compilation_config = vllm_config.compilation_config
-        if prefix in compilation_config.static_forward_context:
-            raise ValueError(f"Duplicate layer name: {prefix}")
-        compilation_config.static_forward_context[prefix] = self
-        self.layer_index = _layer_index_of(prefix)
+        context = vllm_config.compilation_config.static_forward_context
+        register_kv_cache(context, prefix, self)
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         # Key-only: MLAAttentionSpec budgets one vector per token (not K + V).
@@ -520,7 +501,6 @@ class RBLNMiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             raise ValueError(f"Duplicate layer name: {self.layer_name}")
         compilation_config.static_forward_context[self.layer_name] = self
         self.kv_cache = torch.tensor([])  # replaced by the runner's bind
-        self.layer_index = _layer_index_of(self.layer_name)
 
         self.indexer_cache = RBLNMiniMaxM3IndexerCache(
             head_dim=self.idx_head_dim,
@@ -590,8 +570,8 @@ class RBLNMiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             index_metadata = attn_metadata[self.indexer_cache.prefix]
         else:
             main_metadata = index_metadata = attn_metadata
-        kv_cache = _resolve_kv_cache(main_metadata, self.layer_index)
-        index_cache = _resolve_kv_cache(index_metadata, self.indexer_cache.layer_index)
+        kv_cache = resolve_kv_cache(main_metadata, self.layer_name)
+        index_cache = resolve_kv_cache(index_metadata, self.indexer_cache.prefix)
 
         q5 = q.view(batch, seq_len, num_heads, head_dim).transpose(1, 2)
         q5 = q5.view(batch, num_kv, groups, seq_len, head_dim)
@@ -1106,6 +1086,32 @@ class _RBLNMiniMaxM3VLMultiModalProcessor(MiniMaxM3VLMultiModalProcessor):
         return outputs
 
 
+class _RBLNMiniMaxM3VisionBlock(nn.Module):
+    def __init__(self, layer, num_heads, head_dim) -> None:
+        super().__init__()
+        self.layer = layer
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+
+    @torch.compiler.nested_compile_region
+    def forward(self, hidden, cos, sin, key_bias, rot):
+        n = hidden.shape[0]
+        layer, attn = self.layer, self.layer.self_attn
+        qkv, _ = attn.qkv_proj(layer.layer_norm1(hidden))
+        qkv = qkv.view(n, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
+        q = q * cos + torch.matmul(q, rot) * sin
+        k = k * cos + torch.matmul(k, rot) * sin
+        q, k, v = q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1)
+        scores = torch.matmul(q, k.transpose(1, 2)) * self.head_dim**-0.5 + key_bias[0]
+        out = torch.matmul(torch.softmax(scores, dim=-1), v)
+        out, _ = attn.out_proj(out.transpose(0, 1).reshape(n, -1))
+        hidden = hidden + out
+        mlp, _ = layer.fc1(layer.layer_norm2(hidden))
+        mlp, _ = layer.fc2(layer.act(mlp))
+        return hidden + mlp
+
+
 class _RBLNVisionEncoder(nn.Module):
     def __init__(self, tower: nn.Module, out_dtype: torch.dtype):
         super().__init__()
@@ -1115,6 +1121,10 @@ class _RBLNVisionEncoder(nn.Module):
         self.out_dtype = out_dtype
         self.num_heads = attn.num_heads_per_partition
         self.head_dim = attn.head_dim
+        self.blocks = nn.ModuleList(
+            _RBLNMiniMaxM3VisionBlock(layer, self.num_heads, self.head_dim)
+            for layer in vm.encoder.layers
+        )
         w = vm.embeddings.patch_embedding.weight
         self.patch_weight = w.reshape(w.shape[0], -1)
         half = (vm.t_dim + vm.h_dim + vm.w_dim) // 2
@@ -1132,26 +1142,11 @@ class _RBLNVisionEncoder(nn.Module):
         key_bias: torch.Tensor,
     ) -> torch.Tensor:
         vm = self.tower.vision_model
-        n = pixel_values.shape[0]
         hidden = vm.pre_layrnorm(F.linear(pixel_values, self.patch_weight))
         cos = cos.unsqueeze(1)
         sin = sin.unsqueeze(1)
-        scale = self.head_dim**-0.5
-        for layer in vm.encoder.layers:
-            attn = layer.self_attn
-            qkv, _ = attn.qkv_proj(layer.layer_norm1(hidden))
-            qkv = qkv.view(n, 3, self.num_heads, self.head_dim)
-            q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]  # [N, heads, D]
-            q = q * cos + torch.matmul(q, self.rot) * sin
-            k = k * cos + torch.matmul(k, self.rot) * sin
-            q, k, v = q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1)
-            scores = torch.matmul(q, k.transpose(1, 2)) * scale + key_bias[0]
-            out = torch.matmul(torch.softmax(scores, dim=-1), v)
-            out, _ = attn.out_proj(out.transpose(0, 1).reshape(n, -1))
-            hidden = hidden + out
-            mlp, _ = layer.fc1(layer.layer_norm2(hidden))
-            mlp, _ = layer.fc2(layer.act(mlp))
-            hidden = hidden + mlp
+        for block in self.blocks:
+            hidden = block(hidden, cos, sin, key_bias, self.rot)
         hidden = self.tower.multi_modal_projector(hidden)
         return self.tower.patch_merge_mlp(hidden).to(self.out_dtype)
 

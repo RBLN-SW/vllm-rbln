@@ -20,7 +20,8 @@
 
 import contextlib
 import json
-from collections import deque
+import subprocess
+import sys
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
@@ -38,6 +39,7 @@ from vllm.distributed.ec_transfer.ec_connector.base import (
 from vllm.multimodal.inputs import PlaceholderRange
 from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheTensor
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
@@ -111,6 +113,9 @@ def _make_runner_stub(**attrs):
     runner.is_strict_kv_producer = False
     runner.supports_mm_inputs = False
     runner.model_config = SimpleNamespace(is_mm_prefix_lm=False)
+    runner.mrope_positions = None
+    runner.use_async_scheduling = False
+    runner._prev_async_output = None
     for key, value in attrs.items():
         setattr(runner, key, value)
     return runner
@@ -370,6 +375,31 @@ class TestPadDepad:
 
 
 class TestSamplePadding:
+    def test_custom_sampler_applies_fused_penalties_to_the_live_batch(
+        self, monkeypatch
+    ):
+        import vllm_rbln.v1.sample.rbln_sampler as sampling
+        from tests.vllm.v1.sample.utils import build_input_batch
+
+        monkeypatch.setattr(sampling, "compile_sampler", lambda fn, _: fn)
+        monkeypatch.setattr(sampling, "rbln_greedy_sample", lambda x: x.argmax(dim=-1))
+        batch = build_input_batch(
+            [("a", SamplingParams(temperature=0.0, repetition_penalty=1.2))],
+            vocab_size=16384,
+            output_token_ids=[42],
+        )
+        sampler = sampling.RBLNSampler(fused_sampling=True)
+        runner = _make_runner_stub(
+            sampler=sampler, input_batch=batch, _is_prefill_step=False
+        )
+        logits = torch.zeros(1, 16384)
+        logits[0, 42], logits[0, 43] = 6.0, 5.5
+
+        output = runner._sample(logits, None)
+
+        assert output.sampled_token_ids.tolist() == [[43]]
+        assert {key[0] for key in sampler._fused_graphs} == {"greedy"}
+
     @staticmethod
     def _runner(rejection_output: SamplerOutput, *, sampler: bool):
         rejection_sampler = MagicMock(return_value=rejection_output)
@@ -660,11 +690,14 @@ class TestEcConsumer:
             ec_connector_metadata=ECConnectorMetadata(), finished_req_ids=set()
         )
 
-        _, model_kwargs, ec_output = runner._preprocess(
+        _, model_kwargs, layout, ec_output = runner._preprocess(
             scheduler_output, 1, 1, 4, torch.tensor([3])
         )
 
-        assert torch.equal(model_kwargs["mm_embeds"], received.view(1, 4, 2))
+        embeds, _ = runner.input_stager.stage_mm_embeds(
+            model_kwargs["mm_embeds"], model_kwargs["mm_mask"], 2, layout
+        )
+        assert torch.equal(embeds, received.view(1, 4, 2))
         assert ec_output.finished_recving == {"h0"}
 
     def test_a_stage_that_samples_nothing_still_reports_its_loads(self):
@@ -707,6 +740,7 @@ class TestEcConsumer:
         scheduler_output = SimpleNamespace(
             total_num_scheduled_tokens=0,
             kv_cache_copy_ops=None,
+            kv_cache_block_copies=None,
             ec_connector_metadata=ECConnectorMetadata(),
             finished_req_ids=set(),
         )
@@ -776,7 +810,9 @@ class TestEcConsumer:
         runner = _make_runner_stub(
             load_config=None,
             vllm_config=SimpleNamespace(ec_transfer_config=ec_config),
-            model_config=SimpleNamespace(model="m", enforce_eager=False),
+            model_config=SimpleNamespace(
+                model="m", enforce_eager=False, uses_mrope=False
+            ),
             offload_context=nullcontext,
             _resolve_mm_support=lambda: True,
             drafter=None,
@@ -857,7 +893,7 @@ def test_a_prefill_pads_to_the_shortest_chunk_size_that_holds_it(
         _init_model_kwargs=lambda: {},
     )
 
-    runner._preprocess(
+    _, _, layout, _ = runner._preprocess(
         Mock(),
         num_reqs=1,
         num_reqs_padded=1,
@@ -865,7 +901,6 @@ def test_a_prefill_pads_to_the_shortest_chunk_size_that_holds_it(
         logits_indices=None,
     )
 
-    layout = runner.input_stager.stage.call_args.kwargs["layout"]
     assert (layout.query_len, layout.query_len_padded) == (query_len, padded)
 
 
@@ -900,13 +935,12 @@ def test_a_producer_warms_the_sampler_at_one_request(
     assert runner._warmup_sampler_decode_batches.called is verifies
 
 
-@pytest.mark.parametrize("num_reqs", [1, 2])
-def test_reference_sampler_warmup_finishes(num_reqs):
-    runner = _make_runner_stub(
+def _sampler_warmup_runner(sampler, num_reqs):
+    return _make_runner_stub(
         device=torch.device("cpu"),
         dtype=torch.float32,
         model_config=SimpleNamespace(get_vocab_size=lambda: 32),
-        sampler=mr.Sampler(),
+        sampler=sampler,
         input_batch=SimpleNamespace(
             temperature=torch.ones(num_reqs),
             top_p=torch.ones(num_reqs),
@@ -917,7 +951,24 @@ def test_reference_sampler_warmup_finishes(num_reqs):
         ),
     )
 
-    runner._dummy_sampler_run(num_reqs)
+
+def test_reference_sampler_skips_warmup():
+    sampler = MagicMock(spec=mr.Sampler)
+
+    _sampler_warmup_runner(sampler, 2)._dummy_sampler_run(2)
+
+    sampler.assert_not_called()
+
+
+@pytest.mark.parametrize("num_reqs", [1, 2])
+def test_rbln_sampler_warms_up_every_config(num_reqs):
+    from vllm_rbln.v1.sample import WARM_UP_CONFIGS
+
+    sampler = MagicMock(spec=mr.RBLNSampler)
+
+    _sampler_warmup_runner(sampler, num_reqs)._dummy_sampler_run(num_reqs)
+
+    assert sampler.warm_up.call_count == len(WARM_UP_CONFIGS)
 
 
 def test_rejection_sampler_warmup_asks_for_the_synthetic_variant():
@@ -981,6 +1032,8 @@ def test_rejection_sampler_warmup_uses_per_stage_batch_bound():
     )
 
     runner._warmup_sampler_decode_batches()
+
+    assert rejection_sample.call_args_list[0].args[7].all_random
 
     # One call per graph, all at the batch bound; a filtered random pattern
     # twice, once with buffer views and once with torch.cat metadata.
@@ -1199,7 +1252,7 @@ class TestResolveBatchDescriptor:
         assert across is None
 
 
-@pytest.mark.maybe_use_device
+@pytest.mark.use_device
 @pytest.mark.parametrize(("backend", "should_exit"), [("mp", True), ("uni", False)])
 def test_async_output_inherits_runner_fail_fast_policy(
     make_model_runner, monkeypatch, capfd, backend, should_exit
@@ -1234,7 +1287,7 @@ def test_async_output_inherits_runner_fail_fast_policy(
     )
     output = runner.sample_tokens(None)
     error = RuntimeError("runner output copy failed")
-    monkeypatch.setattr(output._sampled_token_ids_cpu, "copy_", Mock(side_effect=error))
+    monkeypatch.setattr(output, "get_sampled_token_ids_cpu", Mock(side_effect=error))
     monkeypatch.setenv("VLLM_RBLN_DISABLE_WORKER_FAIL_FAST", "0")
     exit_process = Mock(side_effect=SystemExit(70))
     monkeypatch.setattr(worker_utils.os, "_exit", exit_process)
@@ -1264,7 +1317,7 @@ class TestShapeConfigWiring:
     # around here hand-build one, which leaves the construction unpinned: a field
     # wired to the wrong source would keep every one of them green.
 
-    @pytest.mark.maybe_use_device
+    @pytest.mark.use_device
     def test_a_real_runners_shapes_reach_the_decision(self, make_model_runner):
         # Drive the rule with this runner's own config and a two-rank status, so
         # every field shows up in the answer: the bucket rule (3 sits between two
@@ -1291,7 +1344,7 @@ class TestShapeConfigWiring:
         )
         assert desc.num_tokens_padded == runner.max_num_tokens
 
-    @pytest.mark.maybe_use_device
+    @pytest.mark.use_device
     def test_the_bucket_list_reaches_the_routes_that_read_it(self, make_model_runner):
         # decode_batch_buckets is read by the two routes that pick an end of it, and
         # both need data parallelism to specialize at all -- so this runner is built
@@ -1386,6 +1439,7 @@ class TestDummyRunPadding:
 
         def stage(**kwargs):
             captured["layout"] = kwargs["layout"]
+            captured["positions"] = kwargs["positions"]
             return SimpleNamespace(as_kwargs=lambda: {})
 
         # Two buckets, so a padded count can differ from a raw one at all.
@@ -1489,6 +1543,16 @@ class TestDummyRunPadding:
         runner, captured = self._runner(monkeypatch, reqs_across_dp=[1, 1, 1, 1])
         runner._dummy_run(1, 1, is_prefill=False, warmup=False)
         assert captured["layout"].shape != warmed
+
+    def test_an_mrope_model_gets_positions_on_three_axes(self, monkeypatch):
+        # The graph an M-RoPE model warms up takes [3, batch, seq] positions.
+        runner, captured = self._runner(monkeypatch, reqs_across_dp=[1, 1, 1, 1])
+        runner._dummy_run(1, 4, is_prefill=True)
+        assert captured["positions"].shape == (1, 4)
+
+        runner.mrope_positions = torch.zeros(3, 128, dtype=torch.int64)
+        runner._dummy_run(1, 4, is_prefill=True)
+        assert captured["positions"].shape == (3, 1, 4)
 
     def test_warmup_pin_is_the_token_dimension(self, monkeypatch):
         # Warm-up dictates the dimension it wants compiled -- the group agreement
@@ -1687,26 +1751,26 @@ class TestProcessKvCacheCopyOps:
 
     def test_eager_copy_mla_indexer_scale(self, monkeypatch):
         monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", True)
-        # DeepSeek-V3.2 carries three MLA-family caches and the indexer scale
-        # one is (num_blocks, block_tokens) -- no trailing head axis.
-        latent = torch.zeros(4, 8, 2)
-        scale = torch.zeros(4, 8)
-        latent[1] = 7.0
-        scale[1] = 9.0
+        latent = torch.zeros(4, 8, 768, dtype=torch.uint8)
+        indexer = torch.zeros(4, 8, 128, dtype=torch.float8_e4m3fn)
+        scale = torch.zeros(4, 8, dtype=torch.bfloat16)
+        caches = [latent, indexer, scale]
+        for i, cache in enumerate(caches):
+            shape = (8,) + (1,) * (cache.ndim - 2)
+            cache[1].copy_(torch.arange(8).view(shape) + i + 1)
         r = _make_runner_stub(
-            kv_caches=[latent, scale],
-            kv_cache_names=["latent", "scale"],
-            kv_cache_block_axes={"latent": 0, "scale": 0},
-            kv_cache_config=_copy_groups(["latent", "scale"]),
+            kv_caches=caches,
+            kv_cache_names=["latent", "indexer", "scale"],
+            kv_cache_block_axes={"latent": 0, "indexer": 0, "scale": 0},
+            kv_cache_config=_copy_groups(["latent", "indexer", "scale"]),
             _kernel_block_sizes=[8],
             model_config=SimpleNamespace(use_mla=True, enforce_eager=True),
             runtime_holder=[None],
         )
         r._process_kv_cache_copy_ops([KVCacheCopyOp(0, 1, 2, 3)])
-        assert (latent[2, :3, :] == 7.0).all()
-        assert (latent[2, 3:, :] == 0.0).all()
-        assert (scale[2, :3] == 9.0).all()
-        assert (scale[2, 3:] == 0.0).all()
+        for cache in caches:
+            assert torch.equal(cache[2, :3].float(), cache[1, :3].float())
+            assert torch.count_nonzero(cache[2, 3:].float()) == 0
 
     def test_only_the_op_group_is_copied(self, monkeypatch):
         monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", True)
@@ -1744,6 +1808,24 @@ class TestProcessKvCacheCopyOps:
         )
         r._process_kv_cache_copy_ops([KVCacheCopyOp(0, 5, 6, 4)])
         assert calls == [(5, 6, 4)]
+
+    def test_a_block_copy_moves_the_whole_page_of_every_cache(self, monkeypatch):
+        monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", True)
+        latent = torch.zeros(4, 8, 2)
+        state = torch.zeros(3, 4, 5)  # blocks on axis 1
+        latent[1] = 7.0
+        state[:, 1] = 3.0
+        r = _make_runner_stub(
+            kv_caches=[latent, state],
+            kv_cache_names=["latent", "state"],
+            kv_cache_block_axes={"latent": 0, "state": 1},
+            model_config=SimpleNamespace(use_mla=True, enforce_eager=True),
+        )
+        r._copy_kv_cache_blocks([KVCacheBlockCopy(src_block_id=1, dst_block_id=2)])
+        assert (latent[2] == 7.0).all()
+        assert (state[:, 2] == 3.0).all()
+        assert torch.count_nonzero(latent[[0, 3]]) == 0
+        assert torch.count_nonzero(state[:, [0, 3]]) == 0
 
 
 def _empty_cached():
@@ -1999,7 +2081,7 @@ class TestMayReorderBatch:
 
 
 class TestDummyRunDecodeWindowPadding:
-    pytestmark = pytest.mark.maybe_use_device
+    pytestmark = pytest.mark.use_device
 
     NUM_REQS = 2
     NUM_SPEC = 3
@@ -2128,27 +2210,50 @@ class TestAllocateKvCacheTensors:
 
 
 class TestRepairStagedInputIds:
-    # The scheduler stages -1 where this step's input token belongs; the real
-    # token is still on the device in the previous step's ring slot. The repair
-    # has to land each one on the row the request occupies *now*.
     @staticmethod
-    def _runner(*, prev_index, prev_tokens, is_prefill=False):
+    def _runner(
+        *,
+        prev_index,
+        prev_tokens,
+        is_prefill=False,
+        req_ids=None,
+        invalid_req_indices=(),
+        history_required=False,
+    ):
+        from tests.vllm.v1.worker.test_async_output import _async_output
+
+        req_ids = list(prev_index) if req_ids is None else req_ids
+        states = {}
+        for req_id in dict.fromkeys([*prev_index, *req_ids]):
+            state = _cached_state(req_id)
+            if history_required:
+                state.sampling_params.repetition_penalty = 1.2
+            if req_id in prev_index:
+                state.output_token_ids.append(-1)
+            states[req_id] = state
+        batch = _input_batch()
+        for req_id in req_ids:
+            batch.add_request(states[req_id])
+        batch.refresh_metadata()
+        previous = None
+        if prev_tokens is not None:
+            previous = _async_output(
+                torch.tensor(prev_tokens, dtype=torch.int32).unsqueeze(1),
+                req_ids=list(prev_index),
+                placeholder_pos={
+                    r: 3 for r in prev_index if prev_index[r] not in invalid_req_indices
+                },
+                invalid_req_indices=invalid_req_indices,
+            )
         return _make_runner_stub(
             is_prefill=is_prefill,
-            _prev_token_host_buffer=None,
-            input_batch=SimpleNamespace(
-                prev_sampled_token_ids=(
-                    None
-                    if prev_tokens is None
-                    else torch.tensor(prev_tokens, dtype=torch.int32).unsqueeze(1)
-                ),
-                prev_req_id_to_index=prev_index,
-            ),
+            _prev_async_output=previous,
+            input_batch=batch,
+            requests=states,
         )
 
     @staticmethod
     def _staged(num_rows):
-        # -1 is what the scheduler left behind.
         return SimpleNamespace(
             input_ids=torch.full((num_rows, 1), -1, dtype=torch.int32)
         )
@@ -2158,42 +2263,67 @@ class TestRepairStagedInputIds:
         staged = self._staged(2)
         r._repair_staged_input_ids(staged, ["a", "b"])
         assert staged.input_ids[:, 0].tolist() == [10, 11]
+        assert r.requests["a"].output_token_ids == [10]
+        assert r.requests["b"].output_token_ids == [11]
+        assert r.input_batch.token_ids_cpu[:2, 3].tolist() == [10, 11]
+        assert r._prev_async_output is None
+
+    def test_reuses_the_output_snapshot_without_get_output(self):
+        r = self._runner(prev_index={"r0": 0}, prev_tokens=[42])
+        previous = r._prev_async_output
+        r.input_batch.prev_sampled_token_ids = torch.tensor([[99]], dtype=torch.int32)
+        r.input_batch.prev_req_id_to_index = {"r0": 0}
+        staged = self._staged(1)
+
+        r._repair_staged_input_ids(staged, ["r0"])
+
+        assert staged.input_ids.tolist() == [[42]]
+        assert r.requests["r0"].output_token_ids == [42]
+        assert r.input_batch.token_ids_cpu[0, 3] == 42
+        output = previous.get_output()
+        output.sampled_token_ids[0].clear()
+        assert r.requests["r0"].output_token_ids == [42]
 
     def test_follows_the_request_when_rows_are_reordered(self):
-        r = self._runner(prev_index={"a": 0, "b": 1}, prev_tokens=[10, 11])
+        r = self._runner(
+            prev_index={"a": 0, "b": 1}, prev_tokens=[10, 11], req_ids=["b", "a"]
+        )
         staged = self._staged(2)
         r._repair_staged_input_ids(staged, ["b", "a"])
         assert staged.input_ids[:, 0].tolist() == [11, 10]
+        assert r.input_batch.token_ids_cpu[:2, 3].tolist() == [11, 10]
 
     def test_does_not_shift_rows_up_when_a_request_is_skipped(self):
-        # The row-crossing case: "new" has no previous row, so the requests that
-        # do have one sit at rows 1 and 2. Their previous rows are also 1 and 2,
-        # so the row lists match -- but writing contiguously would still start at
-        # row 0 and hand row 1 the token belonging to row 0.
-        r = self._runner(prev_index={"a": 0, "b": 1, "c": 2}, prev_tokens=[10, 11, 12])
+        r = self._runner(
+            prev_index={"a": 0, "b": 1, "c": 2},
+            prev_tokens=[10, 11, 12],
+            req_ids=["new", "b", "c"],
+        )
         staged = self._staged(3)
         r._repair_staged_input_ids(staged, ["new", "b", "c"])
         assert staged.input_ids[:, 0].tolist() == [-1, 11, 12]
+        assert r.requests["a"].output_token_ids == [10]
 
     def test_leaves_a_request_absent_from_the_previous_batch(self):
-        # _apply_pending_token_writeback repairs that one a step later.
-        r = self._runner(prev_index={"a": 0}, prev_tokens=[10])
+        r = self._runner(prev_index={"a": 0}, prev_tokens=[10], req_ids=["a", "new"])
         staged = self._staged(2)
         r._repair_staged_input_ids(staged, ["a", "new"])
         assert staged.input_ids[:, 0].tolist() == [10, -1]
+        assert r.requests["new"].output_token_ids == []
 
-    def test_does_nothing_when_no_request_carries_over(self):
-        r = self._runner(prev_index={"gone": 0}, prev_tokens=[10])
+    def test_repairs_history_when_no_request_carries_over(self):
+        r = self._runner(prev_index={"gone": 0}, prev_tokens=[10], req_ids=["new"])
         staged = self._staged(1)
         r._repair_staged_input_ids(staged, ["new"])
         assert staged.input_ids[:, 0].tolist() == [-1]
+        assert r.requests["gone"].output_token_ids == [10]
 
-    def test_does_nothing_on_a_prefill_step(self):
-        # Prefill has no previous sampled token to feed back.
+    def test_repairs_history_without_changing_prefill_inputs(self):
         r = self._runner(prev_index={"a": 0}, prev_tokens=[10], is_prefill=True)
         staged = self._staged(1)
         r._repair_staged_input_ids(staged, ["a"])
         assert staged.input_ids[:, 0].tolist() == [-1]
+        assert r.requests["a"].output_token_ids == [10]
 
     def test_does_nothing_before_the_first_sampled_token_exists(self):
         r = self._runner(prev_index={"a": 0}, prev_tokens=None)
@@ -2201,143 +2331,92 @@ class TestRepairStagedInputIds:
         r._repair_staged_input_ids(staged, ["a"])
         assert staged.input_ids[:, 0].tolist() == [-1]
 
+    def test_leaves_a_rolled_back_token_unchanged(self):
+        r = self._runner(prev_index={"a": 0}, prev_tokens=[10])
+        r.requests["a"].output_token_ids.clear()
+        staged = self._staged(1)
+        r._repair_staged_input_ids(staged, ["a"])
+        assert staged.input_ids.tolist() == [[-1]]
+        assert r.requests["a"].output_token_ids == []
+        assert r.input_batch.token_ids_cpu[0, 3] == -1
 
-class TestRepairAsyncOutputTokenIds:
-    # The logits processors read output_token_ids in the same step, before
-    # _apply_pending_token_writeback runs, so the -1 tail has to go now.
-    @staticmethod
-    def _runner(*, req_ids, output_token_ids, prev_index, prev_tokens):
-        return _make_runner_stub(
-            input_batch=SimpleNamespace(
-                req_ids=req_ids,
-                sampling_metadata=SimpleNamespace(output_token_ids=output_token_ids),
-                prev_sampled_token_ids=(
-                    None
-                    if prev_tokens is None
-                    else torch.tensor(prev_tokens, dtype=torch.int32).unsqueeze(1)
-                ),
-                prev_req_id_to_index=prev_index,
-            ),
-            _prev_sampled_host=None,
-        )
+    def test_leaves_a_finished_request_unchanged(self):
+        r = self._runner(prev_index={"a": 0}, prev_tokens=[10])
+        r.requests.clear()
+        staged = self._staged(1)
+        r._repair_staged_input_ids(staged, ["a"])
+        assert staged.input_ids.tolist() == [[-1]]
 
-    def test_replaces_the_placeholder_tail(self):
-        ids = [[7, -1], [8, -1]]
+    def test_discards_invalid_sample_rows(self):
         r = self._runner(
-            req_ids=["a", "b"],
-            output_token_ids=ids,
-            prev_index={"a": 0, "b": 1},
-            prev_tokens=[10, 11],
+            prev_index={"a": 0, "b": 1}, prev_tokens=[10, 11], invalid_req_indices=[0]
         )
-        r._repair_async_output_token_ids()
-        assert ids == [[7, 10], [8, 11]]
+        staged = self._staged(2)
+        r._repair_staged_input_ids(staged, ["a", "b"])
+        assert staged.input_ids.tolist() == [[-1], [11]]
+        assert r.requests["a"].output_token_ids == [-1]
+        assert r.requests["b"].output_token_ids == [11]
 
-    def test_reads_the_row_the_request_had_last_step(self):
-        ids = [[7, -1], [8, -1]]
+    def test_repairs_the_history_read_by_logits_processors(self):
+        r = self._runner(prev_index={"a": 0}, prev_tokens=[42], history_required=True)
+        metadata = r.input_batch.sampling_metadata
+        assert metadata.output_token_ids == [[-1]]
+        r._repair_staged_input_ids(self._staged(1), ["a"])
+        assert metadata.output_token_ids == [[42]]
+
+    @pytest.mark.use_device
+    @pytest.mark.parametrize("batch_size", [1, 4])
+    @pytest.mark.parametrize("consume_output", [False, True])
+    def test_device_feedback_shares_one_d2h(
+        self, monkeypatch, batch_size, consume_output
+    ):
+        import weakref
+        from concurrent.futures import ThreadPoolExecutor
+
+        from tests.vllm.v1.worker.test_async_output import _async_output
+        from vllm_rbln.v1.sample.rbln_sampler import compile_sampler, rbln_greedy_sample
+
+        req_ids = [f"r{i}" for i in range(batch_size)]
+        expected = [7 + i for i in range(batch_size)]
+        logits = torch.zeros(batch_size, 201088, dtype=torch.float32)
+        logits[torch.arange(batch_size), expected] = 20
+        greedy = compile_sampler(rbln_greedy_sample, None)
+        source = greedy(logits.to("rbln")).unsqueeze(-1)
         r = self._runner(
-            req_ids=["b", "a"],
-            output_token_ids=ids,
-            prev_index={"a": 0, "b": 1},
-            prev_tokens=[10, 11],
+            prev_index={req_id: i for i, req_id in enumerate(req_ids)},
+            prev_tokens=expected,
         )
-        r._repair_async_output_token_ids()
-        assert ids == [[7, 11], [8, 10]]
+        copies = []
+        original_copy = torch.Tensor.copy_
 
-    def test_leaves_a_tail_that_is_not_a_placeholder(self):
-        ids = [[7, 9]]
-        r = self._runner(
-            req_ids=["a"],
-            output_token_ids=ids,
-            prev_index={"a": 0},
-            prev_tokens=[10],
-        )
-        r._repair_async_output_token_ids()
-        assert ids == [[7, 9]]
+        def copy(dst, src, *args, **kwargs):
+            if dst.is_cpu and src.device.type == "rbln":
+                copies.append((dst, src))
+            return original_copy(dst, src, *args, **kwargs)
 
-    def test_leaves_a_request_absent_from_the_previous_batch(self):
-        ids = [[7, -1]]
-        r = self._runner(
-            req_ids=["new"],
-            output_token_ids=ids,
-            prev_index={"a": 0},
-            prev_tokens=[10],
-        )
-        r._repair_async_output_token_ids()
-        assert ids == [[7, -1]]
+        monkeypatch.setattr(torch.Tensor, "copy_", copy)
+        previous = _async_output(source)
+        r._prev_async_output = previous
+        output_ref = previous if consume_output else None
+        previous_ref = weakref.ref(previous)
+        del previous
+        assert previous_ref() is not None
 
-    def test_leaves_a_request_with_no_output_yet(self):
-        ids = [[], [8, -1]]
-        r = self._runner(
-            req_ids=["a", "b"],
-            output_token_ids=ids,
-            prev_index={"a": 0, "b": 1},
-            prev_tokens=[10, 11],
-        )
-        r._repair_async_output_token_ids()
-        assert ids == [[], [8, 11]]
-
-    def test_reads_the_async_host_copy_of_the_same_step(self):
-        # The device read would queue behind this step's forward.
-        ids = [[7, -1]]
-        r = self._runner(
-            req_ids=["a"], output_token_ids=ids, prev_index={"a": 0}, prev_tokens=[10]
-        )
-        event = SimpleNamespace(synchronize=lambda: None)
-        prev = r.input_batch.prev_sampled_token_ids
-        r._prev_sampled_host = (prev, torch.tensor([[20]]), event)
-        r._repair_async_output_token_ids()
-        assert ids == [[7, 20]]
-
-    def test_ignores_a_host_copy_from_another_step(self):
-        ids = [[7, -1]]
-        r = self._runner(
-            req_ids=["a"], output_token_ids=ids, prev_index={"a": 0}, prev_tokens=[10]
-        )
-        r._prev_sampled_host = (torch.tensor([[10]]), torch.tensor([[20]]), None)
-        r._repair_async_output_token_ids()
-        assert ids == [[7, 10]]
-
-
-class TestApplyPendingTokenWriteback:
-    # The async repair has to move both stores together. token_ids_cpu is rebuilt
-    # from output_token_ids when a request re-enters the batch, so writing the
-    # real token to one and not the other leaves a value that comes back wrong.
-    PROMPT_LEN = 3
-    START = PROMPT_LEN  # where staging put the placeholder
-
-    @classmethod
-    def _runner(cls, *, output_token_ids, keep_request_state=True):
-        ib = _input_batch(0)
-        state = _cached_state("r0", prompt_len=cls.PROMPT_LEN)
-        ib.add_request(state)
-        # What the async path left behind: a -1 in both stores.
-        state.output_token_ids[:] = output_token_ids
-        ib.token_ids_cpu[0, cls.START] = -1
-        runner = _make_runner_stub(
-            input_batch=ib,
-            requests={"r0": state} if keep_request_state else {},
-            _pending_token_writeback=deque([(["r0"], [[42]], {"r0": cls.START})]),
-        )
-        return runner, ib, state
-
-    def test_repairs_both_stores(self):
-        runner, ib, state = self._runner(output_token_ids=[-1])
-        runner._apply_pending_token_writeback()
-        assert state.output_token_ids == [42]
-        assert ib.token_ids_cpu[0, self.START] == 42
-
-    def test_leaves_both_stores_when_the_offset_is_out_of_bounds(self):
-        # The request rolled back past this step, so output_token_ids no longer
-        # has room for the placeholder.
-        runner, ib, state = self._runner(output_token_ids=[])
-        runner._apply_pending_token_writeback()
-        assert state.output_token_ids == []
-        assert ib.token_ids_cpu[0, self.START] == -1
-
-    def test_leaves_both_stores_when_the_request_state_is_gone(self):
-        runner, ib, _ = self._runner(output_token_ids=[-1], keep_request_state=False)
-        runner._apply_pending_token_writeback()
-        assert ib.token_ids_cpu[0, self.START] == -1
+        staged = self._staged(batch_size)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = (
+                pool.submit(output_ref.get_output) if output_ref is not None else None
+            )
+            r._repair_staged_input_ids(staged, req_ids)
+            if future is not None:
+                assert future.result(timeout=30).sampled_token_ids == [
+                    [t] for t in expected
+                ]
+        assert staged.input_ids[:, 0].tolist() == expected
+        assert r.input_batch.token_ids_cpu[:batch_size, 3].tolist() == expected
+        if output_ref is None:
+            assert previous_ref() is None
+        assert len(copies) == 1
 
 
 class TestMixinConformance:
@@ -2611,6 +2690,7 @@ class TestExecuteModelRecoversADeferredLoad:
             total_num_scheduled_tokens=0,
             kv_connector_metadata="META",
             kv_cache_copy_ops=None,
+            kv_cache_block_copies=None,
         )
 
     def test_the_held_read_is_issued_before_the_connector_step(self, monkeypatch):
@@ -2689,10 +2769,15 @@ class TestExecuteModelFlushesAfterTheSubmission:
                 num_reqs_padded=1, query_len=1, num_tokens_padded=1
             ),
             _build_attention_metadata=lambda **kw: ("ATTN", None),
+            attn_groups=[],
             _preprocess=lambda *a, **kw: (
                 SimpleNamespace(as_kwargs=lambda: {}),
                 {},
+                mr.InputLayout(1, 1, 1, 1),
                 None,
+            ),
+            input_stager=SimpleNamespace(
+                stage=lambda **kw: SimpleNamespace(as_kwargs=lambda: {})
             ),
             _bookkeeping_and_output=lambda *a, **kw: "OUTPUT",
             input_batch=SimpleNamespace(num_reqs=1, req_ids=["r0"]),
@@ -2714,6 +2799,7 @@ class TestExecuteModelFlushesAfterTheSubmission:
             num_scheduled_tokens={"r0": 1},
             kv_connector_metadata="META",
             kv_cache_copy_ops=None,
+            kv_cache_block_copies=None,
         )
 
         runner.execute_model(scheduler_output)
@@ -2769,7 +2855,12 @@ class TestExecuteModelMmPrefixRowEnds:
                 SimpleNamespace(as_kwargs=lambda: {}),
                 {},
                 None,
+                None,
             ),
+            input_stager=Mock(
+                stage=Mock(return_value=SimpleNamespace(as_kwargs=lambda: {}))
+            ),
+            attn_groups=[],
             _bookkeeping_and_output=lambda *a, **kw: "OUTPUT",
             input_batch=SimpleNamespace(
                 num_reqs=1,
@@ -2804,6 +2895,7 @@ class TestExecuteModelMmPrefixRowEnds:
                     req_ids=["r0"], num_computed_tokens=[computed]
                 ),
                 kv_cache_copy_ops=None,
+                kv_cache_block_copies=None,
             )
         )
         return seen[0]
@@ -2871,7 +2963,7 @@ class TestExecuteModelMmPrefixRowEnds:
         assert seen is None
 
 
-@pytest.mark.maybe_use_device
+@pytest.mark.use_device
 @pytest.mark.parametrize(
     ("kv_role", "decodes"), [("kv_producer", False), ("kv_both", True)]
 )
@@ -2980,3 +3072,20 @@ class TestDecodeGraphShapes:
         assert mr.RBLNModelRunner.decode_graph_shapes(runner) == []
         calls = self._dummies(runner)
         assert [args for args, _ in calls] == [(1, 128, True), (1, 256, True)]
+
+
+@pytest.mark.parametrize(
+    "module",
+    ["vllm_rbln.v1.worker.rbln_model_runner", "vllm_rbln.v1.worker.rbln_worker"],
+)
+def test_worker_module_imports_before_patches(module):
+    # The runner is imported outside the platform plugin too (out-of-tree
+    # workers subclass it), so it must not depend on `vllm_rbln.patches`,
+    # whose `metrics` module imports the runner back.
+    out = subprocess.run(
+        [sys.executable, "-c", f"import {module}"],
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert out.returncode == 0, out.stderr[-2000:]

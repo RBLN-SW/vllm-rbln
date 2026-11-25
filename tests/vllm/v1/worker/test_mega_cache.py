@@ -204,6 +204,17 @@ class TestSignatureEnv:
         monkeypatch.setenv(name, after)
         assert self._sig() != first
 
+    @pytest.mark.parametrize(
+        ("value", "shared"),
+        [pytest.param("1", True, id="on"), pytest.param("0", False, id="off")],
+    )
+    def test_unset_nested_region_is_on(self, monkeypatch, value, shared):
+        """The vllm path compiles regions unless the variable is 0."""
+        monkeypatch.delenv("VLLM_RBLN_USE_NESTED_COMPILE_REGION", raising=False)
+        unset = self._sig()
+        monkeypatch.setenv("VLLM_RBLN_USE_NESTED_COMPILE_REGION", value)
+        assert (self._sig() == unset) is shared
+
     def test_flag_and_variable_share_one_bundle(self, monkeypatch):
         """A flag and its variable resolve to one config, so to one bundle.
 
@@ -759,7 +770,7 @@ class TestSaveLoad:
         assert bundle.set_dirs == []
 
 
-@pytest.mark.maybe_use_device
+@pytest.mark.use_device
 class TestWarmupWiring:
     """What binds this module into production: the bundle is loaded before
     warm-up compiles anything and written only once warm-up has succeeded."""
