@@ -301,15 +301,16 @@ def sub_block_size_in_use(
     eligible = RBLNKVCacheManager.can_use_sub_block_caching(
         kv_cache_config, sub_block_size
     )
-    fits = block_size >= prefill_chunk_size >= sub_block_size
+    # A chunk may run past a block; the unit a hit is counted in may not.
+    fits = min(block_size, prefill_chunk_size) >= sub_block_size
     if not wanted:
         if not (eligible and fits):
             return None
     elif not fits:
         raise ValueError(
-            "sub-block prefix caching needs block_size >= prefill_chunk_size >= "
-            f"sub_block_size, got {block_size} >= {prefill_chunk_size} >= "
-            f"{sub_block_size}."
+            "sub-block prefix caching needs sub_block_size at most block_size "
+            f"and prefill_chunk_size, got {sub_block_size} with block_size="
+            f"{block_size}, prefill_chunk_size={prefill_chunk_size}."
         )
     elif not eligible:
         raise ValueError(

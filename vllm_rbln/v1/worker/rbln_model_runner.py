@@ -1585,10 +1585,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     fit //= 2
                 fit = max(fit, longest)
                 small = min(chunks)
+                # REBEL CR13 stores a chunk longer than a block across blocks.
+                cr13 = current_platform.is_cr13()
+                within = f", which is at most --block-size ({block_size})"
+                within = "" if cr13 else within
                 example = (
                     f"--max-num-batched-tokens {fit} "
                     f"--rbln-prefill-chunk-size {small} {fit}"
-                    + (f" --block-size {fit}" if fit > block_size else "")
+                    + (f" --block-size {fit}" if fit > block_size and not cr13 else "")
                 )
                 if block_size % small == 0:
                     tight = -(-longest // 128) * 128
@@ -1600,8 +1604,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     f"--rbln-prefill-chunk-size {chunks} cannot hold a multimodal "
                     f"range of {longest} tokens, the largest encoder budget "
                     "compiled. The prefill chunk sizes need:\n"
-                    f"  1. each at most --max-num-batched-tokens, which is at most "
-                    f"--block-size ({block_size});\n"
+                    f"  1. each at most --max-num-batched-tokens{within};\n"
                     f"  2. the longest at least {longest}, since an image or video "
                     "frame runs in one chunk;\n"
                     f"  3. for sub-block prefix caching, one that divides "
