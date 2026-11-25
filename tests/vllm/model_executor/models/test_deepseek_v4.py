@@ -21,9 +21,8 @@ import torch
 @pytest.mark.parametrize(
     "chunks,scheduled,threshold,indexer_dtype,error",
     [
-        ([512], None, 130, "fp8", "prefill.*compression boundary"),
-        ([512], 130, 0, "fp8", "prefill.*compression boundary"),
-        ([130], None, 0, "fp8", "prefill.*compression boundary"),
+        ([512], None, 130, "fp8", None),
+        ([512], 130, 0, "fp8", None),
         ([512], None, 0, "fp8", None),
         ([512], None, 128, "fp8", None),
         ([64], None, 0, "fp8", None),
@@ -68,6 +67,51 @@ def test_model_validates_compression_and_indexer_constraints(
             dsv4.RBLNDeepseekV4ForCausalLM(vllm_config=config)
 
 
+@pytest.mark.parametrize("window", [64, 128, 256])
+def test_attention_rejects_unsupported_window_before_allocating_caches(
+    monkeypatch, window
+):
+    import vllm.distributed.parallel_state as parallel_state
+    from vllm.config import set_current_vllm_config
+
+    import vllm_rbln.model_executor.models.deepseek_v4 as dsv4
+    from tests.vllm.vllm_config import make_vllm_config
+
+    monkeypatch.setattr(
+        parallel_state, "_TP", SimpleNamespace(world_size=1, rank_in_group=0)
+    )
+    monkeypatch.setattr(
+        dsv4, "build_deepseek_v4_rope", lambda *args, **kwargs: torch.nn.Identity()
+    )
+    hf_config = SimpleNamespace(
+        num_attention_heads=2,
+        head_dim=512,
+        qk_rope_head_dim=64,
+        q_lora_rank=16,
+        o_lora_rank=16,
+        o_groups=1,
+        sliding_window=window,
+        rms_norm_eps=1e-6,
+        compress_ratios=[0],
+        num_hidden_layers=1,
+        hidden_size=16,
+    )
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_text_config=hf_config, max_model_len=2048),
+        quant_config=None,
+        cache_config=SimpleNamespace(cache_dtype="fp8"),
+    )
+    context = make_vllm_config()
+    with set_current_vllm_config(context):
+        if window == 128:
+            attention = dsv4.RBLNDeepseekV4Attention(config, 0, "model.layers.0.attn")
+            assert attention.swa_cache.block_size == window
+        else:
+            with pytest.raises(ValueError, match="sliding_window=128"):
+                dsv4.RBLNDeepseekV4Attention(config, 0, "model.layers.0.attn")
+            assert not context.compilation_config.static_forward_context
+
+
 @pytest.mark.parametrize("chunked", [False, True])
 def test_compressor_preserves_state_across_prefill_chunks(monkeypatch, chunked):
     import vllm.distributed.parallel_state as parallel_state
@@ -104,11 +148,11 @@ def test_compressor_preserves_state_across_prefill_chunks(monkeypatch, chunked):
         1, keepdim=True
     )
     expected = compressor.norm(pooled.to(x.dtype))
-    state = torch.empty(1, 8, 256, dtype=compressor.state_cache.dtype)
-    slot = torch.zeros(1, 1, dtype=torch.int32)
+    state = torch.empty(2, 64, 256, dtype=compressor.state_cache.dtype)
+    slot = torch.ones(1, 1, dtype=torch.int32)
     query_len = torch.tensor([[3 if chunked else 4]], dtype=torch.int32)
     monkeypatch.setattr(
-        dsv4.RBLNDeepseekV4RingCache,
+        dsv4.RBLNDeepseekV4WindowCache,
         "inputs",
         lambda self: (state, slot, query_len, None),
     )
@@ -184,11 +228,11 @@ def test_compressor_padding_does_not_index_past_the_rope_table(monkeypatch, quer
         compressor.fused_wkv_wgate.weight.copy_(torch.randn(256, 4, generator=rng))
         compressor.ape.copy_(torch.randn(4, 128, generator=rng))
     monkeypatch.setattr(
-        dsv4.RBLNDeepseekV4RingCache,
+        dsv4.RBLNDeepseekV4WindowCache,
         "inputs",
         lambda self: (
-            torch.zeros(1, 8, 256),
-            torch.zeros(1, 1, dtype=torch.int32),
+            torch.zeros(2, 64, 256),
+            torch.ones(1, 2, dtype=torch.int32),
             torch.tensor([[query_len]], dtype=torch.int32),
             None,
         ),
@@ -316,33 +360,6 @@ def test_paged_block_size_follows_the_cache_shard_contract(block_size, ratio, ex
     assert _paged_block_size(config, ratio) == expected
 
 
-@pytest.mark.parametrize("history", [8, 128])
-@pytest.mark.parametrize("drafts", [0, 1, 3, 8])
-def test_ring_capacity_preserves_history_across_rejected_drafts(history, drafts):
-    from vllm_rbln.model_executor.models.deepseek_v4 import RBLNDeepseekV4RingCache
-
-    ring = RBLNDeepseekV4RingCache.__new__(RBLNDeepseekV4RingCache)
-    torch.nn.Module.__init__(ring)
-    ring.window, ring.width, ring.dtype = history, 768, torch.uint8
-    config = SimpleNamespace(
-        cache_config=SimpleNamespace(enable_prefix_caching=False),
-        scheduler_config=SimpleNamespace(max_num_seqs=2),
-        speculative_config=SimpleNamespace(num_speculative_tokens=drafts)
-        if drafts
-        else None,
-    )
-    rows = ring.get_kv_cache_spec(config).block_size
-    tokens = list(range(rows))
-    start = rows
-    for p in range(start, start + drafts + 1):
-        tokens[p % rows] = p
-    next_query = start + 1
-    for p in range(next_query - history + 1, next_query):
-        assert tokens[p % rows] == p
-    if not drafts:
-        assert rows == history
-
-
 def test_cache_inputs_use_names_in_the_rank_local_cache_order():
     from vllm.config import set_current_vllm_config
 
@@ -351,7 +368,7 @@ def test_cache_inputs_use_names_in_the_rank_local_cache_order():
     from vllm_rbln.model_executor.models.deepseek_v4 import (
         RBLNDeepseekV4AuxCache,
         RBLNDeepseekV4PagedCache,
-        RBLNDeepseekV4RingCache,
+        RBLNDeepseekV4WindowCache,
     )
     from vllm_rbln.v1.attention.backends.flash_attention import (
         RBLNFlashAttentionMetadata,
@@ -360,7 +377,7 @@ def test_cache_inputs_use_names_in_the_rank_local_cache_order():
     config = make_vllm_config()
     prefix = "model.layers.12.self_attn.attn"
     with set_current_vllm_config(config):
-        ring = RBLNDeepseekV4RingCache(f"{prefix}.0", 128, 768, torch.uint8)
+        window = RBLNDeepseekV4WindowCache(f"{prefix}.0", 128, 768, torch.uint8, 128)
         paged = RBLNDeepseekV4PagedCache(f"{prefix}.2", 4, 128, torch.float8_e4m3fn)
         scale = RBLNDeepseekV4AuxCache(f"{prefix}.3", paged, torch.bfloat16)
     caches = [torch.zeros(2, 64), torch.zeros(2, 64, 128), torch.zeros(2, 128, 768)]
@@ -371,28 +388,33 @@ def test_cache_inputs_use_names_in_the_rank_local_cache_order():
         cache_seq_lens=torch.tensor([[0]]),
         cache_offsets=torch.tensor([[4]]),
         kv_caches=caches,
-        kv_cache_positions={scale.prefix: 0, paged.prefix: 1, ring.prefix: 2},
+        kv_cache_positions={scale.prefix: 0, paged.prefix: 1, window.prefix: 2},
     )
-    with set_forward_context({ring.prefix: metadata, paged.prefix: metadata}, config):
-        assert ring.inputs()[0] is caches[2]
+    with set_forward_context({window.prefix: metadata, paged.prefix: metadata}, config):
+        assert window.inputs()[0] is caches[2]
         assert paged.inputs()[0] is caches[1]
         assert scale.inputs() is caches[0]
 
 
 @pytest.mark.parametrize("is_prefill", [False, True])
-def test_ring_metadata_keeps_one_slot_past_ring_boundaries(is_prefill):
+def test_window_metadata_preserves_absolute_positions(is_prefill):
     from tests.vllm.v1.attention.utils import make_builder, make_common_attn_metadata
     from tests.vllm.vllm_config import make_vllm_config
-    from vllm_rbln.model_executor.models.deepseek_v4 import RBLNDeepseekV4RingCache
+    from vllm_rbln.model_executor.models.deepseek_v4 import RBLNDeepseekV4WindowCache
 
-    ring = RBLNDeepseekV4RingCache.__new__(RBLNDeepseekV4RingCache)
-    torch.nn.Module.__init__(ring)
-    ring.window, ring.width, ring.dtype = 128, 768, torch.uint8
-    ring.prefix = "model.layers.0.self_attn.attn.0"
+    window = RBLNDeepseekV4WindowCache.__new__(RBLNDeepseekV4WindowCache)
+    torch.nn.Module.__init__(window)
+    window.segment, window.block_size, window.width, window.dtype = (
+        128,
+        128,
+        768,
+        torch.uint8,
+    )
+    window.prefix = "model.layers.0.self_attn.attn.0"
     config = make_vllm_config(max_model_len=4096, max_num_batched_tokens=16)
-    spec = ring.get_kv_cache_spec(config)
+    spec = window.get_kv_cache_spec(config)
     builder = make_builder(
-        config, spec=spec, builder_cls=ring.get_attn_backend().get_builder_cls()
+        config, spec=spec, builder_cls=window.get_attn_backend().get_builder_cls()
     )
     count = 1 if is_prefill else 2
     metadata = builder.build(

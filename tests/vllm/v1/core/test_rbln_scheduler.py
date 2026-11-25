@@ -63,31 +63,32 @@ from vllm_rbln.v1.core.utils import is_prefill, step_is_prefill
 @pytest.mark.parametrize("chunk", [10, 15])
 @pytest.mark.parametrize("alignment", [16, 64])
 @pytest.mark.parametrize("pipeline_parallel_size", [1, 2])
-def test_ring_prefix_hit_restores_checkpoint_and_replaces_single_slot(
+def test_window_prefix_hit_shares_pages_without_state_copies(
     draft, chunk, alignment, pipeline_parallel_size
 ):
     from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 
     from vllm_rbln.platform import RblnPlatform
-    from vllm_rbln.v1.attention.backends.deepseek_v4 import RBLNDeepseekV4StateSpec
+    from vllm_rbln.v1.attention.backends.deepseek_v4 import RBLNDeepseekV4WindowSpec
 
     register_all_kvcache_specs(None)
     RblnPlatform.register_custom_kv_cache_specs(None)
-    state = RBLNDeepseekV4StateSpec(
-        num_state_slots=5,
-        block_size=4,
+    state = RBLNDeepseekV4WindowSpec(
+        num_state_slots=33,
+        blocks_per_request=4,
+        sliding_window=32,
+        prefix_match_unit=alignment,
+        block_size=16,
         num_kv_heads=1,
         head_size=8,
         dtype=torch.float32,
-        prefix_caching=True,
     )
     specs: list[KVCacheSpec] = [full_attention_spec(16)]
     if alignment > 16:
         specs.append(full_attention_spec(alignment))
-    ring_start = len(specs)
     specs.append(state)
     if draft:
-        specs.append(dataclasses.replace(state, is_draft=True))
+        specs.append(state)
     kv_config = make_kv_cache_config(specs, 64)
     kv_config.prefix_cache_retention_interval = 0
     scheduler = create_rbln_scheduler(
@@ -137,27 +138,145 @@ def test_ring_prefix_hit_restores_checkpoint_and_replaces_single_slot(
     assert all(o.total_num_scheduled_tokens > 1 for trace in traces for o in trace[:-1])
     first = traces[1][0]
     assert first.scheduled_new_reqs[0].num_computed_tokens == expected_hit
-    assert len(first.kv_cache_copy_ops) == 1 + draft
-    updates = first.ring_block_updates[requests[1].request_id]
-    for op in first.kv_cache_copy_ops:
-        assert op.group_id >= ring_start
-        assert op.num_tokens == state.block_size
-        assert updates[op.group_id] == op.dst_block_id
-        assert len(first.scheduled_new_reqs[0].block_ids[op.group_id]) == 1
-    pools = [manager.block_pool for manager in scheduler._ring_managers.values()]
-    assert all(pool.get_num_free_blocks() == 4 for pool in pools)
+    assert not first.kv_cache_copy_ops
+    managers = scheduler.kv_cache_manager.coordinator.single_type_managers
+    pools = [
+        m.block_pool
+        for m in managers
+        if isinstance(m.kv_cache_spec, RBLNDeepseekV4WindowSpec)
+    ]
+    assert all(pool.get_num_free_blocks() == 32 for pool in pools)
     assert scheduler.kv_cache_manager.reset_prefix_cache()
     assert all(len(pool.cached_block_hash_to_block) == 0 for pool in pools)
 
 
 @pytest.mark.parametrize("drafts", [0, 1, 3])
+@pytest.mark.parametrize("prompt_length", [192, 193])
+@pytest.mark.parametrize("pipeline_parallel_size", [1, 2])
+def test_window_prefix_hit_inside_compressed_blocks(
+    drafts, prompt_length, pipeline_parallel_size
+):
+    from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+    from vllm_rbln.platform import RblnPlatform
+    from vllm_rbln.v1.attention.backends.deepseek_v4 import RBLNDeepseekV4WindowSpec
+
+    register_all_kvcache_specs(None)
+    RblnPlatform.register_custom_kv_cache_specs(None)
+    specs = [
+        MLAAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=8,
+            dtype=torch.uint8,
+            tokens_per_state=ratio,
+        )
+        for block_size, ratio in [(64, 4), (256, 16)]
+    ]
+    window = RBLNDeepseekV4WindowSpec(
+        num_state_slots=33,
+        blocks_per_request=4,
+        sliding_window=64,
+        prefix_match_unit=32,
+        block_size=32,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.float32,
+    )
+    specs.append(window)
+    if drafts:
+        specs.append(window)
+    kv = make_kv_cache_config(specs, 64)
+    kv.prefix_cache_retention_interval = 0
+    scheduler = create_rbln_scheduler(
+        max_num_seqs=2,
+        max_num_batched_tokens=64,
+        max_model_len=512,
+        block_size=256,
+        hash_block_size=32,
+        enable_prefix_caching=True,
+        kv_cache_config=kv,
+        num_speculative_tokens=drafts or None,
+        speculative_method="mtp",
+        pipeline_parallel_size=pipeline_parallel_size,
+    )
+    prompt = list(range(prompt_length))
+    traces = []
+    for name in ("prime", "hit", "repeat"):
+        request = make_request(
+            name,
+            prompt,
+            32,
+            max_tokens=80 if name == "prime" else 1,
+            num_hash_lookahead_tokens=int(bool(drafts)),
+        )
+        scheduler.add_request(request)
+        trace = []
+        while request.request_id in scheduler.requests:
+            output = scheduler.schedule()
+            assert output.total_num_scheduled_tokens
+            trace.append(output)
+            if pipeline_parallel_size > 1:
+                pool = scheduler.kv_cache_manager.block_pool
+                for op in output.kv_cache_copy_ops:
+                    if op.group_id < 2:
+                        assert pool.blocks[op.src_block_id].ref_cnt > 0
+                        assert pool.blocks[op.dst_block_id].ref_cnt > 1
+            token = 700 if request.num_computed_tokens >= prompt_length else None
+            if pipeline_parallel_size > 1 and name == "hit":
+                scheduler.finish_requests(
+                    request.request_id, RequestStatus.FINISHED_ABORTED
+                )
+                for op in output.kv_cache_copy_ops:
+                    copy_pool = (
+                        scheduler.kv_cache_manager.coordinator.single_type_managers[
+                            op.group_id
+                        ].block_pool
+                    )
+                    assert copy_pool.blocks[op.src_block_id].ref_cnt > 0
+                    assert copy_pool.blocks[op.dst_block_id].ref_cnt > 0
+            scheduler.update_from_output(
+                output, make_model_runner_output(output, token)
+            )
+            assert len(trace) < 100
+        traces.append(trace)
+    for token in (700, 701):
+        extension = make_request(
+            f"extension-{token}",
+            prompt + [token],
+            32,
+            num_hash_lookahead_tokens=int(bool(drafts)),
+        )
+        expected_extension = prompt_length // 32 * 32
+        if drafts and token != 700 and prompt_length % 32 == 0:
+            expected_extension -= 32
+        assert (
+            scheduler.kv_cache_manager.get_computed_blocks(extension)[1]
+            == expected_extension
+        )
+    expected = (prompt_length - 1) // 32 * 32
+    for trace in traces[1:]:
+        first = trace[0]
+        assert first.scheduled_new_reqs[0].num_computed_tokens == expected
+        assert not first.kv_cache_block_copies
+        by_group = {op.group_id: op for op in first.kv_cache_copy_ops}
+        assert by_group[1].num_tokens == expected % 256
+        if expected % 64:
+            assert by_group[0].num_tokens == expected % 64
+        assert all(gid < 2 for gid in by_group)
+    assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == 63
+    assert scheduler.kv_cache_manager.reset_prefix_cache()
+
+
+@pytest.mark.parametrize("drafts", [0, 1, 3])
 @pytest.mark.parametrize("max_tokens", [1, 2])
-def test_single_request_ring_pool_retains_both_mtp_replay_boundaries(
+def test_single_request_window_pool_retains_both_mtp_replay_boundaries(
     drafts, max_tokens
 ):
     from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 
-    from vllm_rbln.model_executor.models.deepseek_v4 import RBLNDeepseekV4RingCache
+    from vllm_rbln.model_executor.models.deepseek_v4 import RBLNDeepseekV4WindowCache
     from vllm_rbln.platform import RblnPlatform
 
     register_all_kvcache_specs(None)
@@ -166,24 +285,21 @@ def test_single_request_ring_pool_retains_both_mtp_replay_boundaries(
         speculative_config=SimpleNamespace(num_speculative_tokens=drafts)
         if drafts
         else None,
-        cache_config=SimpleNamespace(enable_prefix_caching=True),
-        scheduler_config=SimpleNamespace(max_num_seqs=1),
+        cache_config=SimpleNamespace(enable_prefix_caching=True, prefix_match_unit=16),
+        scheduler_config=SimpleNamespace(max_num_seqs=1, max_num_batched_tokens=16),
         model_config=SimpleNamespace(
             hf_text_config=SimpleNamespace(num_hidden_layers=1)
         ),
     )
-    states = [
-        RBLNDeepseekV4RingCache.get_kv_cache_spec(
-            SimpleNamespace(
-                window=4,
-                width=8,
-                dtype=torch.float32,
-                prefix=f"model.layers.{i}.self_attn.swa.0",
-            ),
-            config,
-        )
-        for i in range(2 if drafts else 1)
-    ]
+    window = RBLNDeepseekV4WindowCache.__new__(RBLNDeepseekV4WindowCache)
+    torch.nn.Module.__init__(window)
+    window.segment, window.block_size, window.width, window.dtype = (
+        8,
+        16,
+        8,
+        torch.float32,
+    )
+    states = [window.get_kv_cache_spec(config)] * (2 if drafts else 1)
     kv = make_kv_cache_config([full_attention_spec(16), *states], 64)
     kv.prefix_cache_retention_interval = 0
     scheduler = create_rbln_scheduler(
@@ -226,6 +342,109 @@ def test_single_request_ring_pool_retains_both_mtp_replay_boundaries(
     assert scheduler.kv_cache_manager.get_computed_blocks(different)[1] == (
         32 if drafts else 48
     )
+
+
+@pytest.mark.parametrize("batch", [1, 8, 32])
+@pytest.mark.parametrize("drafts", [0, 3])
+@pytest.mark.parametrize("chunk", [512, 2048])
+def test_window_pools_admit_full_batches_through_prefill_and_rollback(
+    batch, drafts, chunk
+):
+    from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+    from vllm_rbln.model_executor.models.deepseek_v4 import RBLNDeepseekV4WindowCache
+    from vllm_rbln.platform import RblnPlatform
+    from vllm_rbln.v1.kv_cache import RBLNDeepseekV4WindowManager
+
+    register_all_kvcache_specs(None)
+    RblnPlatform.register_custom_kv_cache_specs(None)
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(num_speculative_tokens=drafts),
+        cache_config=SimpleNamespace(enable_prefix_caching=True, prefix_match_unit=128),
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=batch, max_num_batched_tokens=chunk
+        ),
+    )
+    specs = [
+        MLAAttentionSpec(
+            block_size=size,
+            num_kv_heads=1,
+            head_size=8,
+            dtype=torch.uint8,
+            tokens_per_state=ratio,
+        )
+        for size, ratio in [(2048, 4), (8192, 128)]
+    ]
+    for segment, size in [(8, 64), (128, 128)]:
+        cache = RBLNDeepseekV4WindowCache.__new__(RBLNDeepseekV4WindowCache)
+        torch.nn.Module.__init__(cache)
+        cache.segment, cache.block_size, cache.width, cache.dtype = (
+            segment,
+            size,
+            8,
+            torch.float32,
+        )
+        specs.append(cache.get_kv_cache_spec(config))
+    kv = make_kv_cache_config(specs, batch * 32 + 1)
+    kv.prefix_cache_retention_interval = 0
+    scheduler = create_rbln_scheduler(
+        model="Qwen/Qwen3-0.6B",
+        max_num_seqs=batch,
+        max_num_batched_tokens=chunk,
+        max_model_len=32768,
+        block_size=8192,
+        hash_block_size=64,
+        enable_prefix_caching=True,
+        kv_cache_config=kv,
+        num_speculative_tokens=drafts or None,
+        speculative_method="mtp",
+    )
+    pools = [
+        m.block_pool
+        for m in scheduler.kv_cache_manager.coordinator.single_type_managers
+        if isinstance(m, RBLNDeepseekV4WindowManager)
+    ]
+    for round_id in range(2):
+        for i in range(batch):
+            scheduler.add_request(
+                make_request(
+                    f"{round_id}-{i}",
+                    [i + 1] * 16384,
+                    64,
+                    max_tokens=1024,
+                    num_hash_lookahead_tokens=int(bool(drafts)),
+                )
+            )
+        steps = 0
+        while scheduler.requests:
+            output = scheduler.schedule()
+            assert output.total_num_scheduled_tokens, (
+                steps,
+                scheduler.max_model_len,
+                [
+                    (r.num_computed_tokens, r.num_tokens)
+                    for r in scheduler.requests.values()
+                ],
+                [p.get_num_free_blocks() for p in pools],
+            )
+            result = make_model_runner_output(output)
+            for index, req_id in enumerate(result.req_ids):
+                request = scheduler.requests[req_id]
+                if request.num_computed_tokens >= request.num_prompt_tokens:
+                    accepted = min(
+                        steps % (drafts + 1),
+                        len(output.scheduled_spec_decode_tokens.get(req_id, [])),
+                    )
+                    result.sampled_token_ids[index] = [700] * (accepted + 1)
+            scheduler.update_from_output(output, result)
+            for request in scheduler.requests.values():
+                if request.num_computed_tokens >= request.num_prompt_tokens:
+                    request.spec_token_ids = [700] * drafts
+            steps += 1
+            assert steps < 3000
+        assert all(p.get_num_free_blocks() == len(p.blocks) - 1 for p in pools)
+    assert scheduler.kv_cache_manager.reset_prefix_cache()
 
 
 @pytest.mark.parametrize("interrupt_scheduling", [False, True])

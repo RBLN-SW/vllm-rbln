@@ -103,18 +103,21 @@ class TestOverrideBranch:
 
 
 @pytest.mark.parametrize("with_paged_group", [False, True])
-def test_prefix_rings_do_not_change_frontend_token_block_size(
+def test_prefix_windows_do_not_change_frontend_token_block_size(
     monkeypatch, with_paged_group
 ):
     from vllm.v1.kv_cache_interface import FullAttentionSpec
 
-    state = dk.RBLNDeepseekV4StateSpec(
+    from vllm_rbln.v1.attention.backends.deepseek_v4 import RBLNDeepseekV4WindowSpec
+
+    state = RBLNDeepseekV4WindowSpec(
         num_state_slots=3,
         block_size=4,
         num_kv_heads=1,
         head_size=8,
         dtype=torch.float32,
-        prefix_caching=True,
+        sliding_window=4,
+        blocks_per_request=1,
     )
     groups = [SimpleNamespace(kv_cache_spec=state)]
     if with_paged_group:

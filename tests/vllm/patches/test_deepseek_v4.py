@@ -19,7 +19,6 @@ import torch
 from vllm.v1.core import kv_cache_utils
 from vllm.v1.engine import core as engine_core
 from vllm.v1.kv_cache_interface import (
-    CircularBufferSpec,
     KVCacheGroupSpec,
     MambaSpec,
     MLAAttentionSpec,
@@ -27,7 +26,7 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_rbln.patches.deepseek_v4 import deepseek_v4_kv_cache_groups
-from vllm_rbln.v1.attention.backends.deepseek_v4 import RBLNDeepseekV4StateSpec
+from vllm_rbln.v1.attention.backends.deepseek_v4 import RBLNDeepseekV4WindowSpec
 
 
 def test_config_keeps_upstream_quantization_without_mamba_setup():
@@ -48,7 +47,7 @@ def test_config_keeps_upstream_quantization_without_mamba_setup():
     assert hf_config.quantization_config["quant_method"] == "deepseek_v4_fp8"
 
 
-def test_config_rejects_unsupported_ring_transfer():
+def test_config_rejects_unsupported_window_cache_transfer():
     from vllm.model_executor.models.config import MODELS_CONFIG_MAP
 
     config = SimpleNamespace(
@@ -148,15 +147,19 @@ def cache_specs():
             dtype=torch.uint8,
             tokens_per_state=4,
         ),
-        "swa": RBLNDeepseekV4StateSpec(
+        "swa": RBLNDeepseekV4WindowSpec(
             num_state_slots=3,
+            blocks_per_request=1,
+            sliding_window=8,
             block_size=8,
             num_kv_heads=1,
             head_size=32,
             dtype=torch.uint8,
         ),
-        "compressor": RBLNDeepseekV4StateSpec(
+        "compressor": RBLNDeepseekV4WindowSpec(
             num_state_slots=3,
+            blocks_per_request=1,
+            sliding_window=4,
             block_size=4,
             num_kv_heads=1,
             head_size=64,
@@ -165,10 +168,10 @@ def cache_specs():
     }
 
 
-@pytest.mark.parametrize("prefix_unit", [None, 16])
-@pytest.mark.parametrize("rings_only", [False, True])
-def test_ring_capacity_does_not_lower_prefix_hash_granularity(
-    cache_config, cache_specs, prefix_unit, rings_only
+@pytest.mark.parametrize("prefix_unit", [None, 8])
+@pytest.mark.parametrize("windows_only", [False, True])
+def test_window_pages_hash_finely_without_changing_physical_sizes(
+    cache_config, cache_specs, prefix_unit, windows_only
 ):
     from dataclasses import replace
 
@@ -180,11 +183,11 @@ def test_ring_capacity_does_not_lower_prefix_hash_granularity(
     cache_config.cache_config.block_size = 16
     cache_config.kv_transfer_config = None
     specs = {
-        name: replace(spec, prefix_caching=True)
-        if isinstance(spec, RBLNDeepseekV4StateSpec)
+        name: replace(spec, prefix_match_unit=prefix_unit)
+        if isinstance(spec, RBLNDeepseekV4WindowSpec)
         else spec
         for name, spec in cache_specs.items()
-        if not rings_only or isinstance(spec, RBLNDeepseekV4StateSpec)
+        if not windows_only or isinstance(spec, RBLNDeepseekV4WindowSpec)
     }
     kv_config = KVCacheConfig(
         num_blocks=64,
@@ -192,16 +195,43 @@ def test_ring_capacity_does_not_lower_prefix_hash_granularity(
         kv_cache_groups=deepseek_v4_kv_cache_groups(cache_config, specs),
     )
     assert resolve_kv_cache_block_sizes(kv_config, cache_config) == (
-        16 if rings_only else 64,
-        16,
+        8 if windows_only else 64,
+        4,
     )
     assert sorted(g.kv_cache_spec.block_size for g in kv_config.kv_cache_groups) == (
-        [4, 8] if rings_only else [4, 8, 16, 64]
+        [4, 8] if windows_only else [4, 8, 16, 64]
     )
+
+
+def test_partial_prefix_boundary_must_align_compressed_entries(
+    cache_config, cache_specs
+):
+    from dataclasses import replace
+
+    from vllm.v1.engine.core import resolve_kv_cache_block_sizes
+    from vllm.v1.kv_cache_interface import KVCacheConfig
+
+    cache_config.cache_config.enable_prefix_caching = True
+    cache_config.cache_config.prefix_match_unit = 2
+    cache_config.cache_config.block_size = 16
+    cache_config.kv_transfer_config = None
+    specs = {
+        name: replace(spec, prefix_match_unit=2)
+        if isinstance(spec, RBLNDeepseekV4WindowSpec)
+        else spec
+        for name, spec in cache_specs.items()
+    }
+    kv = KVCacheConfig(
+        num_blocks=64,
+        kv_cache_tensors=[],
+        kv_cache_groups=deepseek_v4_kv_cache_groups(cache_config, specs),
+    )
+    with pytest.raises(ValueError, match="must be a multiple"):
+        resolve_kv_cache_block_sizes(kv, cache_config)
 
 
 @pytest.mark.parametrize("num_blocks", [6, 13])
-def test_fixed_rings_are_reserved_before_paged_sizing(
+def test_fixed_windows_are_reserved_before_paged_sizing(
     cache_config, cache_specs, num_blocks
 ):
     from vllm_rbln.patches.dynamic_kv import check_enough_kv_cache_blocks_after_resize
@@ -228,7 +258,7 @@ def test_fixed_rings_are_reserved_before_paged_sizing(
 
 
 @pytest.mark.parametrize("override", [None, 6])
-def test_pp_reconciliation_keeps_fixed_rings(cache_config, cache_specs, override):
+def test_pp_reconciliation_keeps_fixed_windows(cache_config, cache_specs, override):
     cache_config.cache_config.num_gpu_blocks_override = override
     workers = [
         {"csa": cache_specs["csa"], "swa": cache_specs["swa"]},
@@ -248,12 +278,14 @@ def test_pp_reconciliation_keeps_fixed_rings(cache_config, cache_specs, override
         for tensor in cfg.kv_cache_tensors:
             spec = cache_specs[tensor.layers[0]]
             slots = (
-                spec.num_state_slots if isinstance(spec, RBLNDeepseekV4StateSpec) else 6
+                spec.num_state_slots
+                if isinstance(spec, RBLNDeepseekV4WindowSpec)
+                else 6
             )
             assert tensor.layer_stride == slots * spec.page_size_bytes
 
 
-def test_auto_fit_accounts_for_fixed_rings_and_null_block(cache_config, cache_specs):
+def test_auto_fit_accounts_for_fixed_windows_and_null_block(cache_config, cache_specs):
     cache_config.model_config.original_max_model_len = -1
     page = cache_specs["csa"].page_size_bytes + cache_specs["hca"].page_size_bytes
     fixed = 3 * (
@@ -264,55 +296,6 @@ def test_auto_fit_accounts_for_fixed_rings_and_null_block(cache_config, cache_sp
     )[0]
     assert cache_config.model_config.max_model_len == 48
     assert cfg.num_blocks == 5
-
-
-@pytest.mark.parametrize("deferred", [False, True])
-def test_scheduler_admission_and_free_use_independent_ring_pools(
-    cache_config, cache_specs, deferred
-):
-    from vllm.v1.core.kv_cache_manager import KVCacheManager
-
-    from tests.vllm.v1.core.utils import make_request
-
-    cache_config.cache_config.num_gpu_blocks_override = 64
-    cfg = engine_core.get_kv_cache_configs(cache_config, [cache_specs], [1 << 20])[0]
-    cfg = kv_cache_utils.generate_scheduler_kv_cache_config([cfg])
-    manager = KVCacheManager(cfg, 256, 64, 16, enable_caching=False)
-    requests = [make_request(str(i), list(range(32)), 16) for i in range(3)]
-    a, b, c = requests
-    first = manager.allocate_slots(a, 16)
-    second = manager.allocate_slots(b, 16)
-    assert first is not None and second is not None
-    groups = manager.coordinator.single_type_managers
-    rings = [g for g in groups if isinstance(g.kv_cache_spec, CircularBufferSpec)]
-    assert len(rings) == 2
-    for ring in rings:
-        assert ring.block_pool is not manager.block_pool
-        assert len(ring.req_to_blocks[a.request_id]) == 1
-        assert ring.block_pool.get_num_free_blocks() == 0
-    assert manager.block_pool.get_num_free_blocks() > 0
-    assert manager.allocate_slots(c, 16) is None
-
-    a.num_computed_tokens = 16
-    assert manager.allocate_slots(a, 16) is not None
-    for ring in rings:
-        assert len(ring.req_to_blocks[a.request_id]) == 1
-    if deferred:
-        pending = manager.pop_blocks_for_free(a)
-        assert manager.allocate_slots(c, 16) is None
-        manager.block_pool.free_blocks(reversed(pending))
-    else:
-        manager.free(a)
-    assert manager.allocate_slots(c, 16) is not None
-    manager.free(b)
-    manager.free(c)
-    assert manager.block_pool.get_num_free_blocks() == 63
-    assert all(ring.block_pool.get_num_free_blocks() == 2 for ring in rings)
-    # Preemption returns the old slot before the request restarts its prefill.
-    a.num_computed_tokens = 0
-    assert manager.allocate_slots(a, 16) is not None
-    manager.free(a)
-    assert all(not ring.req_to_blocks for ring in rings)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.uint8])
@@ -354,7 +337,7 @@ def test_glm_states_do_not_add_to_the_shared_attention_pool():
     )
 
 
-def test_ring_allocation_is_bounded_by_running_requests():
+def test_window_allocation_is_bounded_by_running_requests():
     config = SimpleNamespace(
         model_config=SimpleNamespace(
             hf_text_config=SimpleNamespace(model_type="deepseek_v4")
@@ -364,8 +347,10 @@ def test_ring_allocation_is_bounded_by_running_requests():
             num_gpu_blocks_override=64, prefix_cache_retention_interval=None
         ),
     )
-    ring = RBLNDeepseekV4StateSpec(
+    window = RBLNDeepseekV4WindowSpec(
         num_state_slots=3,
+        blocks_per_request=1,
+        sliding_window=128,
         block_size=256,
         num_kv_heads=1,
         head_size=768,
@@ -381,13 +366,13 @@ def test_ring_allocation_is_bounded_by_running_requests():
                 tokens_per_state=4,
                 dtype=torch.uint8,
             ),
-            "layers.0.ring": ring,
+            "layers.0.window": window,
         },
     )
     cfg = kv_cache_utils.get_kv_cache_config_from_groups(config, groups, 1 << 30)
-    state = next(t for t in cfg.kv_cache_tensors if t.layers == ["layers.0.ring"])
+    state = next(t for t in cfg.kv_cache_tensors if t.layers == ["layers.0.window"])
     assert cfg.num_blocks == 64
-    assert state.layer_stride == 3 * ring.page_size_bytes
+    assert state.layer_stride == 3 * window.page_size_bytes
 
     from vllm_rbln.v1.worker.dynamic_kv_sizer import kv_cache_config_at
 
@@ -403,12 +388,14 @@ def test_ring_allocation_is_bounded_by_running_requests():
 def test_state_pool_reuses_finished_requests_without_consuming_attention_ids():
     from vllm.v1.core.block_pool import BlockPool
 
-    from vllm_rbln.v1.kv_cache import RBLNDeepseekV4StateManager
+    from vllm_rbln.v1.kv_cache import RBLNDeepseekV4WindowManager
 
     attention = BlockPool(64, False, 16)
-    state = RBLNDeepseekV4StateManager(
-        RBLNDeepseekV4StateSpec(
+    state = RBLNDeepseekV4WindowManager(
+        RBLNDeepseekV4WindowSpec(
             num_state_slots=3,
+            blocks_per_request=1,
+            sliding_window=128,
             block_size=256,
             num_kv_heads=1,
             head_size=768,

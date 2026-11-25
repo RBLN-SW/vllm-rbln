@@ -511,6 +511,26 @@ class TestGetKvCacheNames:
 
 
 class TestPrepareKernelBlockSizes:
+    @pytest.mark.parametrize("block_size, window", [(64, 16), (128, 256)])
+    @pytest.mark.parametrize("sub_block_size", [None, 512])
+    def test_independent_window_pages_keep_the_physical_block_size(
+        self, block_size, window, sub_block_size
+    ):
+        from vllm_rbln.v1.attention.backends.deepseek_v4 import RBLNDeepseekV4WindowSpec
+
+        spec = RBLNDeepseekV4WindowSpec(
+            num_state_slots=33,
+            blocks_per_request=4,
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=8,
+            dtype=torch.float32,
+            sliding_window=window,
+        )
+        assert prepare_kernel_block_sizes(
+            _kv_config(spec), [[]], sub_block_size=sub_block_size
+        ) == [block_size]
+
     @pytest.mark.parametrize("spec_cls", [SlidingWindowSpec, RBLNSlidingWindowSpec])
     def test_sliding_window_uses_window(self, spec_cls):
         # Either sliding-window spec -> kernel block size is its sliding_window,

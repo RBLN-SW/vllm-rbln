@@ -115,6 +115,7 @@ def _make_runner_stub(**attrs):
     runner.use_async_scheduling = False
     runner._prev_async_output = None
     runner.fixed_kv_cache_tensors = {}
+    runner.aux_kv_cache_specs = {}
     for key, value in attrs.items():
         setattr(runner, key, value)
     return runner
@@ -1787,6 +1788,49 @@ class TestProcessKvCacheCopyOps:
         assert (kv[0, 2] == 0.0).all()
         assert (kv[1, 2] == 6.0).all()
 
+    @pytest.mark.parametrize("ratio", [4, 128])
+    @pytest.mark.parametrize("uniform", [False, True])
+    def test_compressed_copy_uses_entries_and_includes_aux(
+        self, monkeypatch, ratio, uniform
+    ):
+        from vllm.v1.kv_cache_interface import MLAAttentionSpec, UniformTypeKVCacheSpecs
+
+        from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
+
+        monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", True)
+        kv = torch.zeros(4, 8, 16)
+        scale = torch.zeros(4, 8)
+        window = torch.full((2, 4, 8), -1.0)
+        kv[1].fill_(7)
+        scale[1].fill_(9)
+        groups = _copy_groups(["kv"])
+        groups.kv_cache_groups[0].kv_cache_spec = MLAAttentionSpec(
+            block_size=8 * ratio,
+            num_kv_heads=1,
+            head_size=16,
+            dtype=torch.float32,
+            tokens_per_state=ratio,
+        )
+        if uniform:
+            groups.kv_cache_groups[0].kv_cache_spec = UniformTypeKVCacheSpecs(
+                block_size=8 * ratio,
+                kv_cache_specs={"kv": groups.kv_cache_groups[0].kv_cache_spec},
+            )
+        runner = _make_runner_stub(
+            kv_caches=[kv, scale, window],
+            kv_cache_names=["kv", "scale", "window"],
+            kv_cache_block_axes={"kv": 0, "scale": 0, "window": 0},
+            kv_cache_config=groups,
+            _kernel_block_sizes=[8 * ratio],
+            aux_kv_cache_specs={"scale": RBLNBlockAuxSpec("kv", (8,), torch.float32)},
+            model_config=SimpleNamespace(use_mla=True, enforce_eager=True),
+        )
+        runner._process_kv_cache_copy_ops([KVCacheCopyOp(0, 1, 2, 3 * ratio)])
+        for cache in (kv, scale):
+            assert torch.equal(cache[2, :3], cache[1, :3])
+            assert torch.count_nonzero(cache[2, 3:]) == 0
+        assert (window == -1).all()
+
     def test_runtime_copy_when_compiled_non_device_tensor(self, monkeypatch):
         monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", False)
         calls = []
@@ -1850,7 +1894,7 @@ def _new_req(req_id, *, prompt_logprobs=None):
     )
 
 
-def _sched(*, new=(), finished=(), scheduled=None, cached=None, spec=None, rings=None):
+def _sched(*, new=(), finished=(), scheduled=None, cached=None, spec=None):
     return SimpleNamespace(
         finished_req_ids=list(finished),
         free_encoder_mm_hashes=[],
@@ -1858,7 +1902,6 @@ def _sched(*, new=(), finished=(), scheduled=None, cached=None, spec=None, rings
         scheduled_new_reqs=list(new),
         scheduled_cached_reqs=cached or _empty_cached(),
         scheduled_spec_decode_tokens=spec or {},
-        ring_block_updates=rings or {},
     )
 
 
@@ -1889,32 +1932,6 @@ class TestUpdateStates:
         r._update_states(_sched(new=[_new_req("n0")], scheduled={"n0": 3}))
         assert "n0" in r.requests
         assert "n0" in r.input_batch.req_id_to_index
-
-    @pytest.mark.parametrize("already_running", [False, True])
-    def test_ring_copy_replaces_instead_of_appending_a_slot(
-        self, monkeypatch, already_running
-    ):
-        r = self._runner(monkeypatch, input_batch=_input_batch(0))
-        new = _new_req("n0")
-        new.block_ids = ([1],)
-        output = _sched(new=[new], scheduled={"n0": 3}, rings={"n0": {0: 3}})
-        if already_running:
-            r._update_states(_sched(new=[new], scheduled={"n0": 3}))
-            output.scheduled_new_reqs = []
-            output.scheduled_cached_reqs = SimpleNamespace(
-                req_ids=["n0"],
-                num_computed_tokens=[3],
-                new_block_ids=[None],
-                resumed_req_ids=set(),
-                num_output_tokens=[0],
-                new_token_ids=[],
-            )
-        r._update_states(output)
-        assert r.requests["n0"].block_ids == ([3],)
-        row = r.input_batch.req_id_to_index["n0"]
-        table = r.input_batch.block_table[0]
-        assert table.num_blocks_per_row[row] == 1
-        assert table.block_table.np[row, 0] == 3
 
     def test_new_request_prompt_logprobs_recorded(self, monkeypatch):
         r = self._runner(monkeypatch, input_batch=_input_batch(0))

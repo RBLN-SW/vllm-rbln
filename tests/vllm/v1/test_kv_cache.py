@@ -36,173 +36,162 @@ from vllm_rbln.v1.kv_cache import (
 )
 
 
-class TestDeepseekV4PrefixState:
-    def _manager(self, *, draft=False, slots=5):
-        from vllm_rbln.v1.attention.backends.deepseek_v4 import RBLNDeepseekV4StateSpec
-        from vllm_rbln.v1.kv_cache import RBLNDeepseekV4StateManager
+class TestDeepseekV4Window:
+    """The paged SWA / compressor caches: upstream's sliding-window manager on a pool
+    of their own."""
 
-        return RBLNDeepseekV4StateManager(
-            RBLNDeepseekV4StateSpec(
-                num_state_slots=slots,
-                block_size=4,
-                num_kv_heads=1,
-                head_size=8,
-                dtype=torch.float32,
-                prefix_caching=True,
-                is_draft=draft,
-            ),
-            block_pool=BlockPool(64, True, 8),
-            enable_caching=True,
+    def _spec(self, *, slots=9, block_size=4, window=8):
+        from vllm_rbln.v1.attention.backends.deepseek_v4 import RBLNDeepseekV4WindowSpec
+
+        return RBLNDeepseekV4WindowSpec(
+            num_state_slots=slots,
+            blocks_per_request=4,
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=8,
+            dtype=torch.float32,
+            sliding_window=window,
+        )
+
+    def _manager(self, *, slots=9, attention_blocks=64):
+        from vllm_rbln.v1.kv_cache import RBLNDeepseekV4WindowManager
+
+        attention = BlockPool(attention_blocks, False, 4)
+        manager = RBLNDeepseekV4WindowManager(
+            self._spec(slots=slots),
+            block_pool=attention,
+            enable_caching=False,
             kv_cache_group_id=0,
-            scheduler_block_size=8,
+            scheduler_block_size=4,
         )
+        return manager, attention
 
-    def _request(self, request_id="a", tokens=None, lookahead=0):
-        from tests.vllm.v1.core.utils import make_request
+    def test_spec_is_a_single_latent_window(self):
+        spec = self._spec()
+        assert spec.page_size_bytes == 4 * 8 * 4  # block_size * head_size * f32, no V
+        assert spec.max_requests == 2  # (9 - 1 null) // 4
+        assert spec.max_memory_usage_bytes(None) == 4 * spec.page_size_bytes
 
-        return make_request(
-            request_id,
-            list(range(25)) if tokens is None else tokens,
-            block_size=8,
-            num_hash_lookahead_tokens=lookahead,
-        )
+    def test_blocks_come_from_the_own_pool(self):
+        manager, attention = self._manager()
+        assert manager.block_pool is not attention
+        free = attention.get_num_free_blocks()
+        blocks = manager.allocate_new_blocks("a", 12, 12)
+        assert len(blocks) == 3
+        assert attention.get_num_free_blocks() == free
+        assert manager.block_pool.get_num_free_blocks() == 8 - 3
 
-    def _hit(self, manager, request, length):
-        return manager.find_longest_cache_hit(
-            request.block_hashes,
-            length,
-            [0],
-            manager.block_pool,
-            manager.kv_cache_spec,
-            False,
-            8,
-        )
-
-    def test_checkpoint_is_immutable_until_copy_completes(self):
-        manager = self._manager()
-        request = self._request()
-        original = manager.allocate_new_blocks("a", 16, 16)[0]
-        manager.cache_blocks(request, 16, 0, replay_boundaries=(16,))
-        assert self._hit(manager, request, 24) == (([original],), 16)
-
-        assert manager.allocate_new_blocks("a", 20, 20) == []
-        current = manager.req_to_blocks["a"][0]
-        assert current is not original
-        copies = manager.drain_pending_copies({"a"})
-        assert copies == {"a": (original.block_id, current.block_id)}
-        assert original.ref_cnt == 1
-        manager.free("a")
-        assert original.ref_cnt == 1
-        manager.block_pool.free_blocks([original])
-        assert self._hit(manager, request, 24) == (([original],), 16)
-
-    def test_two_hits_get_private_rings_and_do_not_consume_attention_blocks(self):
-        manager = self._manager()
-        request = self._request()
-        checkpoint = manager.allocate_new_blocks("a", 16, 16)[0]
-        manager.cache_blocks(request, 16, 0, replay_boundaries=(16,))
-        manager.free("a")
-        for rid in ("b", "c"):
-            manager.add_local_computed_blocks(rid, [checkpoint], 16, 0)
-            manager.allocate_new_blocks(rid, 20, 20)
-        assert manager.req_to_blocks["b"] != manager.req_to_blocks["c"]
-        assert manager.attention_pool.get_num_free_blocks() == 63
-        assert checkpoint.ref_cnt == 2
-        manager.free("b")  # A canceled, not-yet-submitted copy releases its source.
-        assert checkpoint.ref_cnt == 1
-        manager.free("c")
-        assert manager.block_pool.get_num_free_blocks() == 4
-
-    @pytest.mark.parametrize("draft", [False, True])
-    def test_only_exact_replay_boundary_is_cached(self, draft):
-        manager = self._manager(draft=draft)
-        request = self._request()
-        manager.allocate_new_blocks("a", 17, 17)
-        manager.cache_blocks(request, 16, 0, replay_boundaries=(16,))
-        assert self._hit(manager, request, 24)[1] == 0
-
-    def test_draft_checkpoint_requires_only_the_consumed_lookahead_token(self):
-        manager = self._manager(draft=True)
-        request = self._request(lookahead=1)
-        block = manager.allocate_new_blocks("a", 16, 16)[0]
-        manager.cache_blocks(request, 16, 0, replay_boundaries=(16,))
-        assert self._hit(manager, request, 24) == (([block],), 16)
-        assert self._hit(manager, request, 16) == (([block],), 16)
-        sibling = self._request("b", list(range(16)) + [99] * 9, lookahead=1)
-        assert sibling.block_hashes[:1] == request.block_hashes[:1]
-        assert self._hit(manager, sibling, 24)[1] == 0
-        sibling = self._request("c", list(range(17)) + [99] * 8, lookahead=1)
-        assert self._hit(manager, sibling, 24)[1] == 16
-
-    def test_draft_hash_lookahead_is_independent_of_the_hca_interval(self):
-        manager = self._manager(draft=True)
-        manager.block_size = manager.scheduler_block_size = 16
-        request = self._request(lookahead=1)
-        checkpoint = manager.allocate_new_blocks("a", 16, 16)[0]
-        manager.cache_blocks(request, 16, 0, replay_boundaries=(16,))
-        hits, length = manager.find_longest_cache_hit(
-            request.block_hashes,
-            24,
-            [0],
-            manager.block_pool,
-            manager.kv_cache_spec,
-            False,
-            16,
-        )
-        assert hits == ([checkpoint],)
-        assert length == 16
-
-    @pytest.mark.parametrize("draft", [False, True])
-    def test_prompt_end_checkpoint_waits_for_the_confirmed_lookahead(self, draft):
-        manager = self._manager(draft=draft)
-        request = self._request(tokens=list(range(16)), lookahead=1)
-        checkpoint = manager.allocate_new_blocks("a", 16, 16)[0]
-        manager.cache_blocks(request, 16, 0, replay_boundaries=(15, 16))
-        assert checkpoint.block_hash is None
-        request.spec_token_ids = [16, 17, 18]
-        request.update_block_hashes()
-        manager.cache_blocks(request, 16, 0, replay_boundaries=(15, 16))
-        assert checkpoint.block_hash is None
-        request.append_output_token_ids(16)
-        manager.cache_blocks(request, 16, 0, replay_boundaries=(15, 16))
-        assert self._hit(manager, request, 16) == (([checkpoint],), 16)
-
-    def test_decode_reuses_writable_ring_without_copies(self):
-        manager = self._manager()
-        original = manager.allocate_new_blocks("a", 25, 25)[0]
-        for end in range(26, 40):
-            assert manager.allocate_new_blocks("a", end, end) == []
-        assert manager.req_to_blocks["a"] == [original]
-        assert manager.drain_pending_copies({"a"}) == {}
-
-    def test_admission_reserves_both_the_hit_and_its_private_copy(self):
-        manager = self._manager(slots=3)
-        request = self._request()
-        checkpoint = manager.allocate_new_blocks("a", 16, 16)[0]
-        manager.cache_blocks(request, 16, 0, replay_boundaries=(16,))
-        manager.free("a")
-        manager.allocate_new_blocks("busy", 1, 1)
-        assert manager.block_pool.get_num_free_blocks() == 1
-        assert (
-            manager.get_num_blocks_to_allocate("hit", 20, [checkpoint], 16, 16, 20)
-            > manager.attention_pool.get_num_free_blocks()
-        )
-        manager.free("busy")
-        assert (
-            manager.get_num_blocks_to_allocate("hit", 20, [checkpoint], 16, 16, 20) == 0
-        )
-
-    def test_unscheduled_copy_stays_pending_until_resume_or_preemption(self):
-        manager = self._manager()
-        request = self._request()
-        checkpoint = manager.allocate_new_blocks("a", 16, 16)[0]
-        manager.cache_blocks(request, 16, 0, replay_boundaries=(16,))
+    def test_blocks_out_of_the_window_return_to_the_pool(self):
+        manager, _ = self._manager()
         manager.allocate_new_blocks("a", 20, 20)
-        assert manager.drain_pending_copies({"other"}) == {}
-        assert checkpoint.ref_cnt == 1
-        manager.free("a")
-        assert checkpoint.ref_cnt == 0
-        assert manager.drain_pending_copies({"a"}) == {}
+        assert manager.block_pool.get_num_free_blocks() == 8 - 5
+        # 20 tokens computed, window 8: positions >= 13 stay, blocks 0-2 go back
+        manager.remove_skipped_blocks("a", 20)
+        assert manager.block_pool.get_num_free_blocks() == 8 - 2
+        null = manager.block_pool.null_block
+        assert manager.req_to_blocks["a"][:3] == [null] * 3
+
+    def test_a_full_pool_reports_the_attention_pool_full(self):
+        manager, attention = self._manager(slots=3)
+        args: tuple = ("a", 8, [], 0, 0, 8)
+        assert manager.get_num_blocks_to_allocate(*args) == 0
+        manager.allocate_new_blocks("b", 8, 8)
+        free = attention.get_num_free_blocks()
+        assert manager.get_num_blocks_to_allocate(*args) > free
+
+    def test_platform_registers_the_window_manager(self):
+        from vllm_rbln.platform import RblnPlatform
+        from vllm_rbln.v1.attention.backends.deepseek_v4 import RBLNDeepseekV4WindowSpec
+        from vllm_rbln.v1.kv_cache import RBLNDeepseekV4WindowManager
+
+        RblnPlatform.register_custom_kv_cache_specs(None)
+        assert (
+            KVCacheSpecRegistry.get_manager_class(self._spec())
+            is RBLNDeepseekV4WindowManager
+        )
+        assert isinstance(self._spec(), RBLNDeepseekV4WindowSpec)
+
+    @pytest.mark.parametrize("prefix_unit", [None, 512, 8192])
+    @pytest.mark.parametrize("prompt_length", [129, 8192, 8193, 18001])
+    def test_a_window_hit_reuses_a_partial_compressed_page(
+        self, prefix_unit, prompt_length
+    ):
+        from dataclasses import replace
+
+        from vllm.v1.core.kv_cache_manager import KVCacheManager
+        from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
+        from vllm.v1.kv_cache_interface import (
+            KVCacheConfig,
+            KVCacheGroupSpec,
+            MLAAttentionSpec,
+        )
+
+        from vllm_rbln.platform import RblnPlatform
+
+        register_all_kvcache_specs(None)
+        RblnPlatform.register_custom_kv_cache_specs(None)
+        groups = [
+            KVCacheGroupSpec(
+                [f"compressed-{ratio}"],
+                MLAAttentionSpec(
+                    block_size=size,
+                    num_kv_heads=1,
+                    head_size=8,
+                    dtype=torch.uint8,
+                    tokens_per_state=ratio,
+                ),
+            )
+            for size, ratio in [(2048, 4), (8192, 128)]
+        ]
+        groups.extend(
+            KVCacheGroupSpec(
+                [f"window-{size}"],
+                replace(
+                    self._spec(slots=65, block_size=size, window=window),
+                    prefix_match_unit=prefix_unit,
+                ),
+            )
+            for size, window in [(64, 16), (128, 256)]
+        )
+        config = KVCacheConfig(
+            num_blocks=64,
+            kv_cache_tensors=[],
+            kv_cache_groups=groups,
+            prefix_cache_retention_interval=0,
+        )
+        manager = KVCacheManager(
+            config,
+            32768,
+            8192,
+            64,
+            enable_caching=True,
+            max_in_flight_tokens=512,
+        )
+        prompt = list(range(prompt_length))
+        first = make_request("first", prompt, 64)
+        while first.num_computed_tokens < len(prompt):
+            count = min(512, len(prompt) - first.num_computed_tokens)
+            assert manager.allocate_slots(first, count) is not None
+            first.num_computed_tokens += count
+        manager.free(first)
+
+        sibling = make_request("sibling", prompt, 64)
+        blocks, hit, _ = manager.get_computed_blocks(sibling)
+        unit = prefix_unit or 128
+        assert hit == (prompt_length - 1) // unit * unit
+        assert (
+            manager.allocate_slots(
+                sibling,
+                1,
+                num_new_computed_tokens=hit,
+                new_computed_blocks=blocks,
+            )
+            is not None
+        )
+        copies, retained = manager.take_kv_cache_block_copies()
+        expected_copies = sum(hit % size != 0 for size in (2048, 8192))
+        assert len(copies) == expected_copies
+        assert len(retained) == 2 * expected_copies
 
 
 def _spec(*, block_size=16, sliding_window=16):
