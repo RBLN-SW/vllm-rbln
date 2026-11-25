@@ -53,6 +53,11 @@ def check_and_update(vllm_config: "VllmConfig") -> None:
         is_multi_modal,
     )
 
+    assert vllm_config.speculative_config is None, (
+        "Speculative decoding is not supported on the optimum model path. "
+        "Set --model-impl vllm to use it."
+    )
+
     # Everything below, and the sync at the end, reads additional_config as an
     # OptimumRBLNConfig. The sync also writes its derived fields back.
     vllm_config.additional_config = build_optimum_rbln_config(
@@ -107,10 +112,6 @@ def check_and_update(vllm_config: "VllmConfig") -> None:
     )
     assert parallel_config.pipeline_parallel_size == 1, (
         "Pipeline parallelism is not supported on the optimum model path. "
-        "Set --model-impl vllm to use it."
-    )
-    assert vllm_config.speculative_config is None, (
-        "Speculative decoding is not supported on the optimum model path. "
         "Set --model-impl vllm to use it."
     )
     # T5EncoderModel is encoder-only but inherits T5Config which has

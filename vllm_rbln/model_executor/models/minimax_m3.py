@@ -1310,8 +1310,6 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         tower = self.vision_tower
         if tower is None:
             return
-        if self._mm_encoder is None:
-            self.compile_mm_encoder(lambda encoder: encoder)
         assert self._mm_encoder is not None
         vm = tower.vision_model
         patch_dim = vm.embeddings.patch_embedding.weight[0].numel()
@@ -1422,9 +1420,6 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
                 pixel_values = kwargs[key]
                 if pixel_values is None:
                     continue
-                if self._mm_encoder is None:
-                    # enforce_eager: the runner never calls compile_mm_encoder.
-                    self.compile_mm_encoder(lambda encoder: encoder)
                 grid_thw = kwargs[f"{modality}_grid_thw"]
                 assert isinstance(pixel_values, torch.Tensor)
                 assert isinstance(grid_thw, torch.Tensor)

@@ -327,10 +327,8 @@ def read_rbln_card_dram_used_bytes() -> int:
     return max(used, default=0)
 
 
-def compile_and_warmup_skip_reason(vllm_config: VllmConfig) -> str | None:
+def compile_and_warmup_skip_reason() -> str | None:
     """Why the compile and warm-up will be skipped, or None if they will run."""
-    if vllm_config.model_config.enforce_eager:
-        return "enforce_eager is set"
     if not envs.VLLM_RBLN_ENABLE_WARM_UP:
         return "VLLM_RBLN_ENABLE_WARM_UP is off"
     return None

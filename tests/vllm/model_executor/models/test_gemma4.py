@@ -106,6 +106,11 @@ def test_the_vision_encoder_matches_hfs():
         model_dtype=torch.float32,
         mm_encoder_patch_buckets=[90],
     )
+    object.__setattr__(
+        model,
+        "_mm_encoder",
+        gemma4._RBLNGemma4VisionEncoder(tower, model.embed_vision).eval(),
+    )
     pixels, positions = _image(9, 9, num_patches=81)
 
     with torch.no_grad():
@@ -127,6 +132,11 @@ def test_the_rotary_tables_are_built_once_not_per_image(monkeypatch):
         embed_vision=_Identity(),
         model_dtype=torch.float32,
         mm_encoder_patch_buckets=[90],
+    )
+    object.__setattr__(
+        model,
+        "_mm_encoder",
+        gemma4._RBLNGemma4VisionEncoder(tower, model.embed_vision).eval(),
     )
     first, second = _image(6, 3, num_patches=81), _image(3, 9, num_patches=81)
     with torch.no_grad():

@@ -314,7 +314,7 @@ def test_image_embeddings_match_upstream(visual):
     model.visual = visual
     model.has_vision = True
     model.mm_encoder_patch_buckets = [64, 128]
-    model._mm_encoder = None
+    model.compile_mm_encoder(lambda encoder: encoder)
 
     with torch.inference_mode():
         expected = visual(pixels, grid_thw=grids).split(
@@ -347,7 +347,7 @@ def test_an_image_is_encoded_through_the_shared_metrics_hook(visual, monkeypatch
     model.visual = visual
     model.has_vision = True
     model.mm_encoder_patch_buckets = [64, 128]
-    model._mm_encoder = None
+    model.compile_mm_encoder(lambda encoder: encoder)
     run_mm_encoder = rbln_utils.run_mm_encoder
     shapes = []
 

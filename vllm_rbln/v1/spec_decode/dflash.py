@@ -77,14 +77,6 @@ class RBLNDFlashProposer(DFlashProposer):
             )
 
     def __init__(self, vllm_config, device: torch.device, runner=None):
-        if vllm_config.speculative_config.enforce_eager:
-            # The attention ops are pattern stubs the compiler replaces, so an
-            # eager context write would silently write nothing.
-            raise NotImplementedError(
-                "The DFlash drafter cannot run eager on RBLN: its context K/V "
-                "write goes through an attention op that only exists as a "
-                "compiled kernel."
-            )
         if not use_device_tensor():
             # The cache is allocated on the meta device then, and the context
             # write is a host copy -- which meta accepts and discards.
@@ -496,7 +488,6 @@ class RBLNDFlashProposer(DFlashProposer):
             )
             # What the builder would have produced, without producing it.
             max_seq_len = builder.model_config.max_model_len
-            mask_dtype = torch.float16 if builder.enforce_eager else torch.float32
             mask_device = builder.device
 
             # One attention group covers the whole drafter -- groups are keyed by
@@ -508,7 +499,7 @@ class RBLNDFlashProposer(DFlashProposer):
                 self._draft_block_mask(
                     cad.seq_lens, num_reqs, num_reqs_padded, max_seq_len, None
                 )
-                .to(mask_dtype)
+                .to(torch.float32)
                 .contiguous()
                 .to(mask_device)
             )
@@ -531,7 +522,7 @@ class RBLNDFlashProposer(DFlashProposer):
                     max_seq_len,
                     self.sliding_window,
                 )
-                .to(mask_dtype)
+                .to(torch.float32)
                 .contiguous()
                 .to(mask_device)
             )

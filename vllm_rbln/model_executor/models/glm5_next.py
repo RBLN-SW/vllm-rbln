@@ -1415,8 +1415,6 @@ class RBLNGlm5NextForConditionalGeneration(
         visual = self.visual
         if isinstance(visual, PPMissingLayer):
             return
-        if self._mm_encoder is None:
-            self.compile_mm_encoder(lambda encoder: encoder)
         assert self._mm_encoder is not None
         patch_dim = visual.patch_embed.proj.weight[0].numel()
         head_dim = visual.blocks[0].attn.head_dim
@@ -1488,8 +1486,6 @@ class RBLNGlm5NextForConditionalGeneration(
                 pixel_values = kwargs[key]
                 if pixel_values is None:
                     continue
-                if self._mm_encoder is None:
-                    self.compile_mm_encoder(lambda encoder: encoder)
                 assert self._mm_encoder is not None
                 grid_thw = kwargs[f"{modality}_grid_thw"]
                 assert isinstance(pixel_values, torch.Tensor)

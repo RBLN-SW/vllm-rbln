@@ -67,7 +67,6 @@ def _make_vllm_config(
     world_size_across_dp=1,
     assigned_physical_gpu_ids=None,
     quantization=None,
-    enforce_eager=False,
     profiler=None,
     additional_config=None,
     backend="uni",
@@ -91,7 +90,6 @@ def _make_vllm_config(
         ),
         model_config=SimpleNamespace(
             quantization=quantization,
-            enforce_eager=enforce_eager,
             max_model_len=4096,
         ),
         cache_config=SimpleNamespace(
@@ -260,7 +258,7 @@ class TestWorkerFailFast:
             monkeypatch.setattr(
                 worker, "_ensure_rbln_cpu_affinity_after_warmup", Mock()
             )
-            monkeypatch.setattr(wm, "compile_and_warmup_skip_reason", lambda _: None)
+            monkeypatch.setattr(wm, "compile_and_warmup_skip_reason", lambda: None)
             worker.dynamic_kv = dks.DynamicKvSizer(
                 worker.vllm_config, worker.model_runner, 0
             )
@@ -1111,14 +1109,11 @@ class TestCompileOrWarmUpModel:
         make_worker,
         monkeypatch,
         *,
-        enforce_eager=False,
         warm_up=True,
         warmup_side_effect=None,
         data_parallel_size=1,
     ):
-        vcfg = _make_vllm_config(
-            enforce_eager=enforce_eager, data_parallel_size=data_parallel_size
-        )
+        vcfg = _make_vllm_config(data_parallel_size=data_parallel_size)
         vcfg.model_config.seed = 0
         worker = make_worker(vllm_config=vcfg)
         monkeypatch.setattr(wm.envs, "VLLM_RBLN_ENABLE_WARM_UP", warm_up)
@@ -1188,11 +1183,6 @@ class TestCompileOrWarmUpModel:
         worker.compile_or_warm_up_model()
 
         assert seen == []
-
-    def test_skips_when_enforce_eager(self, make_worker, monkeypatch):
-        worker, calls = self._worker(make_worker, monkeypatch, enforce_eager=True)
-        worker.compile_or_warm_up_model()
-        assert calls == []
 
     def test_skips_when_warmup_disabled(self, make_worker, monkeypatch):
         worker, calls = self._worker(make_worker, monkeypatch, warm_up=False)

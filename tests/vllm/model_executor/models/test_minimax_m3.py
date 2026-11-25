@@ -304,11 +304,8 @@ def test_minimax_m3_without_a_draft_sends_no_aux(monkeypatch, pp_size):
     assert keys == {"hidden_states", "residual"}
 
 
-@pytest.mark.parametrize("compiled", [False, True])
 @pytest.mark.parametrize("out_dtype", [torch.float32, torch.bfloat16])
-def test_image_encoding_reuses_eager_or_compiled_encoder(
-    monkeypatch, compiled, out_dtype
-):
+def test_image_encoding_reuses_the_compiled_encoder(monkeypatch, out_dtype):
     import vllm_rbln.model_executor.models.minimax_m3 as m3
 
     model = m3.RBLNMiniMaxM3SparseForConditionalGeneration.__new__(
@@ -322,7 +319,7 @@ def test_image_encoding_reuses_eager_or_compiled_encoder(
     encoder = torch.nn.Sequential(model.vision_tower)
     build_encoder = Mock(return_value=encoder)
     monkeypatch.setattr(m3, "_RBLNVisionEncoder", build_encoder)
-    object.__setattr__(model, "_mm_encoder", encoder if compiled else None)
+    model.compile_mm_encoder(lambda module: module)
     model._encoder_inputs = Mock(side_effect=lambda pixels, grid, modality: [pixels])
     pixels = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
     grids = torch.tensor([[1, 1, 1], [1, 1, 2]])
@@ -338,11 +335,8 @@ def test_image_encoding_reuses_eager_or_compiled_encoder(
         )
         assert model.vision_tower.weight.dtype == torch.float32
 
-    if compiled:
-        build_encoder.assert_not_called()
-    else:
-        build_encoder.assert_called_once_with(model.vision_tower, out_dtype)
-        assert not encoder.training
+    build_encoder.assert_called_once_with(model.vision_tower, out_dtype)
+    assert not encoder.training
     assert model._mm_encoder is encoder
     assert "_mm_encoder" not in model._modules
     assert list(model.state_dict()) == ["vision_tower.weight"]

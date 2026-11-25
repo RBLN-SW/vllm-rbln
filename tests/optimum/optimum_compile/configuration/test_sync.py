@@ -42,6 +42,32 @@ pytestmark = pytest.mark.usefixtures("compile_environment")
 
 
 class TestSync:
+    def test_platform_rejects_target_eager(self):
+        from vllm_rbln.platform import RblnPlatform
+
+        cfg = SimpleNamespace(
+            model_config=SimpleNamespace(enforce_eager=True),
+            speculative_config=None,
+            ec_transfer_config=None,
+            is_mm_encoder_only=False,
+        )
+        with pytest.raises(
+            ValueError, match="--enforce-eager is not supported on RBLN"
+        ):
+            RblnPlatform.check_and_update_config(cfg)
+
+    def test_platform_rejects_speculative_decoding_with_draft_eager(self):
+        from vllm_rbln.platform.optimum_impl import check_and_update
+
+        cfg = SimpleNamespace(
+            model_config=SimpleNamespace(enforce_eager=False),
+            speculative_config=SimpleNamespace(enforce_eager=True),
+        )
+        with pytest.raises(
+            AssertionError, match="Speculative decoding is not supported"
+        ):
+            check_and_update(cfg)
+
     @pytest.mark.parametrize("block_source", ["vllm", "optimum"])
     @pytest.mark.parametrize(
         "architecture", ["LlamaForCausalLM", "Gemma3ForConditionalGeneration"]
@@ -309,6 +335,7 @@ class TestSync:
         cfg = SimpleNamespace(
             model_config=SimpleNamespace(
                 model="Qwen/Qwen3-0.6B",
+                enforce_eager=False,
                 architectures=hf_config.architectures,
                 runner_type=runner,
                 pooler_config=SimpleNamespace(seq_pooling_type="LAST"),
@@ -396,6 +423,7 @@ class TestSync:
         cfg = SimpleNamespace(
             model_config=SimpleNamespace(
                 model="Qwen/Qwen3-VL-2B",
+                enforce_eager=False,
                 architectures=hf_config.architectures,
                 runner_type="pooling",
                 pooler_config=SimpleNamespace(seq_pooling_type="LAST"),
