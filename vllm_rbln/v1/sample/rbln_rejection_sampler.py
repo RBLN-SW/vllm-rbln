@@ -367,14 +367,14 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
             use_cache=False,
         )
         # Stable tensor addresses let successive steps reuse runtime bindings.
-        self._graph_input_buffers: dict[str, torch.Tensor] | None = None
+        self._rejection_sampling_buffers: dict[str, torch.Tensor] | None = None
         self._buffer_signature: tuple[int, int, torch.dtype, torch.device] | None = None
         # Bonus sampling mode and the graph arguments that reference the input buffers.
-        self._prepared_sampling_args: tuple[bool, tuple] | None = None
+        self._rejection_sampling_args: tuple[bool, tuple] | None = None
         self._full_draft_counts = False
 
     def invalidate_sampling_inputs(self) -> None:
-        self._prepared_sampling_args = None
+        self._rejection_sampling_args = None
 
     def rejection_sample(
         self,
@@ -433,7 +433,7 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         device = target_logits.device
         dtype = target_logits.dtype
         signature = (batch_size, vocab_size, dtype, device)
-        bufs = self._graph_input_buffers
+        bufs = self._rejection_sampling_buffers
         if bufs is None:
             buf_len = batch_size * self.num_spec_tokens
             host_counts = torch.empty(batch_size, dtype=torch.int32, device="cpu")
@@ -466,7 +466,7 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
                     batch_size, dtype=torch.int32, device=device
                 ),
             }
-            self._graph_input_buffers = bufs
+            self._rejection_sampling_buffers = bufs
             self._buffer_signature = signature
         else:
             assert signature == self._buffer_signature, (
@@ -508,7 +508,7 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         all_greedy = sampling_metadata.all_greedy
         can_reuse = reuse_sampling_inputs and full_drafts and not all_greedy
         bonus_in_graph = bonus_logits is not None
-        cached = self._prepared_sampling_args if can_reuse else None
+        cached = self._rejection_sampling_args if can_reuse else None
         if cached is not None and cached[0] == bonus_in_graph:
             top_k, top_p, reshaped_temperature, bonus_temperature = cached[1]
         else:
@@ -557,7 +557,7 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
                         temperature, cu_num_draft_tokens, num_tokens
                     )
             if can_reuse:
-                self._prepared_sampling_args = (
+                self._rejection_sampling_args = (
                     bonus_in_graph,
                     (top_k, top_p, reshaped_temperature, bonus_temperature),
                 )

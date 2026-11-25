@@ -753,7 +753,7 @@ def test_a_new_batch_size_is_rejected_without_replacing_buffers(impl, monkeypatc
         large_batch,
         reuse_sampling_inputs=True,
     )
-    buffers = impl._graph_input_buffers
+    buffers = impl._rejection_sampling_buffers
 
     with pytest.raises(AssertionError, match="Rejection sampler input signature"):
         run_rejection_sample(
@@ -772,7 +772,7 @@ def test_a_new_batch_size_is_rejected_without_replacing_buffers(impl, monkeypatc
         large_batch,
         reuse_sampling_inputs=True,
     )
-    assert impl._graph_input_buffers is buffers
+    assert impl._rejection_sampling_buffers is buffers
     assert len(builds) == 1
     assert seen == [[0.5, 0.5, 2.0, 2.0], [0.5, 0.5, 2.0, 2.0]]
 
