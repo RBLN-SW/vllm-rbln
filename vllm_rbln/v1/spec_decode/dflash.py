@@ -43,11 +43,7 @@ from vllm_rbln.compilation import build_process_group_dict, compile
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.platform import use_device_tensor
-from vllm_rbln.v1.attention.kv_cache_bindings import (
-    attach_kv_cache_bindings,
-    attention_block_axis,
-    build_kv_cache_forward_context_kwargs,
-)
+from vllm_rbln.v1.attention.kv_cache_bindings import attention_block_axis
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.worker.dp_utils import determine_batch_execution_and_padding
 
@@ -81,14 +77,6 @@ class RBLNDFlashProposer(DFlashProposer):
             )
 
     def __init__(self, vllm_config, device: torch.device, runner=None):
-        if vllm_config.speculative_config.enforce_eager:
-            # The attention ops are pattern stubs the compiler replaces, so an
-            # eager context write would silently write nothing.
-            raise NotImplementedError(
-                "The DFlash drafter cannot run eager on RBLN: its context K/V "
-                "write goes through an attention op that only exists as a "
-                "compiled kernel."
-            )
         if not use_device_tensor():
             # The cache is allocated on the meta device then, and the context
             # write is a host copy -- which meta accepts and discards.
@@ -492,12 +480,7 @@ class RBLNDFlashProposer(DFlashProposer):
                 # buffer for nothing.
                 skip_attn_masks=True,
             )
-            attach_kv_cache_bindings(
-                attn_metadata,
-                self.runner.kv_caches,
-                self.runner.kv_cache_bases,
-                self.runner.kv_cache_view_infos,
-            )
+            self.runner.bind_kv_cache_to_metadata(attn_metadata)
             # `initialize_attn_backend` builds under the draft config, so a
             # causal builder here means that scoping came undone.
             assert not builder.is_causal, (
@@ -505,7 +488,6 @@ class RBLNDFlashProposer(DFlashProposer):
             )
             # What the builder would have produced, without producing it.
             max_seq_len = builder.model_config.max_model_len
-            mask_dtype = torch.float16 if builder.enforce_eager else torch.float32
             mask_device = builder.device
 
             # One attention group covers the whole drafter -- groups are keyed by
@@ -517,7 +499,7 @@ class RBLNDFlashProposer(DFlashProposer):
                 self._draft_block_mask(
                     cad.seq_lens, num_reqs, num_reqs_padded, max_seq_len, None
                 )
-                .to(mask_dtype)
+                .to(torch.float32)
                 .contiguous()
                 .to(mask_device)
             )
@@ -540,7 +522,7 @@ class RBLNDFlashProposer(DFlashProposer):
                     max_seq_len,
                     self.sliding_window,
                 )
-                .to(mask_dtype)
+                .to(torch.float32)
                 .contiguous()
                 .to(mask_device)
             )
@@ -797,7 +779,7 @@ class RBLNDFlashProposer(DFlashProposer):
             num_padded_tokens=(
                 num_query_total_padded if num_tokens_across_dp is not None else None
             ),
-            **build_kv_cache_forward_context_kwargs(self.runner.kv_cache_bases),
+            **self.runner.kv_cache_forward_context_kwargs(),
         ):
             return self.model_executable(
                 input_ids=self.input_ids[:num_query_total_padded].view(

@@ -191,7 +191,6 @@ class TestSchedulerCapacity:
             scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
             additional_config=RBLNConfig(),
             speculative_config=SimpleNamespace(
-                enforce_eager=False,
                 draft_model_config=SimpleNamespace(
                     hf_config=SimpleNamespace(layer_types=[], sliding_window=None)
                 ),
@@ -239,7 +238,9 @@ class TestSpanningBlockAllocation:
                 None,
             ),
             runner=SimpleNamespace(
-                dp_status=None, kv_cache_bases=None, is_strict_kv_producer=False
+                dp_status=None,
+                kv_cache_forward_context_kwargs=dict,
+                is_strict_kv_producer=False,
             ),
             dp_rank=0,
             max_num_tokens=n * QUERY_LEN,
@@ -296,35 +297,14 @@ class TestSpanningBlockAllocation:
 
 
 class TestPlatformRefusals:
-    """The two configurations DFlash cannot run on, both refused at
-    construction and before the base class does any work, so neither reaches a
-    device.
-
-    Each fails silently otherwise: an eager context write goes through an
-    attention op that exists only as a compiled kernel, and without device
-    tensors the cache is allocated on `meta`, which accepts a host copy and
-    discards it."""
-
-    @staticmethod
-    def _config(enforce_eager=False):
-        return SimpleNamespace(
-            speculative_config=SimpleNamespace(enforce_eager=enforce_eager),
-            additional_config=RBLNConfig(),
-        )
-
-    def _construct(self):
-        return RBLNDFlashProposer(self._config(), torch.device("cpu"))
-
-    def test_eager_is_refused(self):
-        with pytest.raises(NotImplementedError, match="cannot run eager"):
-            RBLNDFlashProposer(self._config(enforce_eager=True), torch.device("cpu"))
-
     def test_host_visible_cache_is_required(self, monkeypatch):
         """Without device tensors the cache is on `meta` and the context write
         is dropped without an error."""
         monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", False)
         with pytest.raises(NotImplementedError, match="USE_DEVICE_TENSOR"):
-            self._construct()
+            RBLNDFlashProposer(
+                SimpleNamespace(additional_config=RBLNConfig()), torch.device("cpu")
+            )
 
 
 class TestDenseDrafterGuard:
@@ -381,7 +361,7 @@ class TestQueryPassBatch:
                 specialized_moe_decode=specialized_moe_decode,
             ),
             dp_status=dp_status,
-            kv_cache_bases=None,
+            kv_cache_forward_context_kwargs=dict,
             is_strict_kv_producer=strict_kv_producer,
             input_batch=SimpleNamespace(num_reqs=num_reqs),
         )
@@ -423,9 +403,6 @@ class TestQueryPassBatch:
         proposer._build_draft_attn_metadata = build_metadata
         proposer.model_executable = model
         monkeypatch.setattr(dflash_module, "set_forward_context", forward_context)
-        monkeypatch.setattr(
-            dflash_module, "build_kv_cache_forward_context_kwargs", lambda bases: {}
-        )
         return proposer, calls
 
     def _cad(self, num_reqs):

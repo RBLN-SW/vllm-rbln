@@ -27,12 +27,13 @@ from vllm_rbln.utils.optimum.block_size import (
     is_full_block_available,
 )
 from vllm_rbln.utils.optimum.registry import (
+    is_chunked_prefill_arch,
     is_enc_dec_arch,
     is_encoder_pooling_arch,
     is_multi_modal,
-    is_pooling_arch,
 )
 
+from .compile_config import resolve_explicit_num_blocks
 from .rbln_config import (
     RblnConfigLike,
     get_field,
@@ -70,6 +71,8 @@ class OptimumRBLNRuntimeConfig:
     model_num_blocks: int | None
     num_devices_per_local_rank: int
     compiled_dtype: torch.dtype | None
+    gpu_memory_utilization: float
+    explicit_num_blocks: int | None
     precompiled: bool
 
 
@@ -81,6 +84,12 @@ def prepare_runtime_config(
 ) -> OptimumRBLNRuntimeConfig:
     """Read and validate the selected model settings without changing vLLM."""
     hf_config = vllm_config.model_config.hf_config
+    if vllm_config.scheduler_config.max_num_scheduled_tokens is not None:
+        raise ValueError(
+            "max_num_scheduled_tokens cannot be set on the optimum model impl. "
+            "The scheduling budget is determined automatically. "
+            "Leave max_num_scheduled_tokens unset."
+        )
     image_prefill_chunk_size = None
     prefill_chunk_size: int | None
     if is_enc_dec_arch(hf_config):
@@ -121,7 +130,7 @@ def prepare_runtime_config(
 
     assert batch_size is not None
     assert max_seq_len is not None
-    if is_chunked_prefill_arch(hf_config) and prefill_chunk_size is None:
+    if prefill_chunk_size is None and is_chunked_prefill_arch(hf_config):
         raise ValueError(
             "prefill_chunk_size must be specified in the selected rbln_config."
         )
@@ -136,9 +145,7 @@ def prepare_runtime_config(
         )
     if num_devices is None:
         raise ValueError("num_devices must be specified in the selected rbln_config.")
-    if is_chunked_prefill_arch(hf_config):
-        assert prefill_chunk_size is not None
-        validate_user_prefill_chunk_size(vllm_config, prefill_chunk_size)
+    validate_user_prefill_chunk_size(vllm_config, prefill_chunk_size)
 
     cache_config = vllm_config.cache_config
     additional_config = vllm_config.additional_config
@@ -185,6 +192,7 @@ def prepare_runtime_config(
             "RBLN does not support prefix caching for mamba/hybrid models."
         )
         mamba_block_size = max_seq_len
+    explicit_num_blocks = resolve_explicit_num_blocks(vllm_config)
     return OptimumRBLNRuntimeConfig(
         max_num_seqs=batch_size,
         max_model_len=max_seq_len,
@@ -196,6 +204,12 @@ def prepare_runtime_config(
         model_num_blocks=resolve_runtime_num_blocks(vllm_config, rbln_config),
         num_devices_per_local_rank=num_devices,
         compiled_dtype=compiled_dtype,
+        gpu_memory_utilization=(
+            1.0
+            if explicit_num_blocks is not None
+            else cache_config.gpu_memory_utilization
+        ),
+        explicit_num_blocks=explicit_num_blocks,
         precompiled=precompiled,
     )
 
@@ -210,6 +224,17 @@ def apply_runtime_config(
     prefill_chunk_size = runtime_config.prefill_chunk_size
     compiled_dtype = runtime_config.compiled_dtype
     additional_config: OptimumRBLNConfig = vllm_config.additional_config
+    cache_config = vllm_config.cache_config
+    utilization = runtime_config.gpu_memory_utilization
+    if cache_config.gpu_memory_utilization != utilization:
+        logger.info(
+            "Setting gpu_memory_utilization from %s to %s because "
+            "an explicit KV cache block count=%d is set.",
+            cache_config.gpu_memory_utilization,
+            utilization,
+            runtime_config.explicit_num_blocks,
+        )
+        cache_config.gpu_memory_utilization = utilization
     if runtime_config.precompiled:
         additional_config.optimum_overrides = keep_device_overrides(
             additional_config.optimum_overrides
@@ -236,9 +261,10 @@ def apply_runtime_config(
         )
         vllm_config.model_config.max_model_len = max_model_len
 
-    # Set max_num_batched_tokens: the prefill chunk size for decoder/multimodal
-    # models, or a full-prefill-plus-batch budget for enc-dec/pooling models.
-    update_max_num_batched_tokens(vllm_config, prefill_chunk_size)
+    additional_config.prefill_chunk_size = (
+        [prefill_chunk_size] if prefill_chunk_size is not None else None
+    )
+    update_max_num_batched_tokens(vllm_config)
 
     # Persist the image-prefill buckets (gemma3/gemma4) into additional_config.
     store_image_prefill_chunk_size(vllm_config, runtime_config.image_prefill_chunk_size)
@@ -322,65 +348,22 @@ def update_block_size(
         vllm_config.cache_config.block_size = block_size
 
 
-def is_chunked_prefill_arch(hf_config) -> bool:
-    """Whether ``max_num_batched_tokens`` is the prefill chunk size for this model.
+def update_max_num_batched_tokens(vllm_config: VllmConfig) -> None:
+    """Keep the scheduling budget large enough for a full prefill or decode batch.
 
-    True for decoder and (non-enc-dec) multimodal models: they chunk prefill at
-    ``max_num_batched_tokens`` granularity. Encoder-decoder and pooling models
-    don't chunk prefill, so the value there is a full-prefill budget instead.
-    """
-    return not (is_enc_dec_arch(hf_config) or is_pooling_arch(hf_config))
-
-
-def get_user_max_num_batched_tokens(vllm_config: VllmConfig) -> int | None:
-    """Return the user's explicit ``max_num_batched_tokens`` (``None`` if unset).
-
-    Stashed by ``optimum_impl._capture_user_max_num_batched_tokens`` before vLLM
-    fills in its default.
-    """
-    additional_config: OptimumRBLNConfig = vllm_config.additional_config
-    return additional_config.user_max_num_batched_tokens
-
-
-def update_max_num_batched_tokens(
-    vllm_config: VllmConfig, prefill_chunk_size: int | None
-) -> None:
-    """Set ``scheduler_config.max_num_batched_tokens`` from the RBLN config.
-
-    Decoder/multimodal: the prefill chunk size. The scheduler chunks prefill at
-    this granularity, and it is read back to size gemma3/4 block padding and pin
-    the compiled artefact.
-
-    Enc-dec/pooling don't chunk prefill, so it must fit a full prefill plus a full
-    batch; Whisper also needs ``max_source_positions`` for vLLM's MultiModalBudget
+    Chunking happens inside optimum-rbln, so a step must fit a whole prompt.
+    Whisper also needs max_source_positions for vLLM's MultiModalBudget
     check.
     """
     hf_config = vllm_config.model_config.hf_config
-    max_model_len = vllm_config.model_config.max_model_len
-    max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-
-    if is_enc_dec_arch(hf_config):
-        max_source_positions = getattr(hf_config, "max_source_positions", 0)
-        target = max(max_model_len, max_num_seqs, max_source_positions)
-    elif is_pooling_arch(hf_config):
-        target = max(max_model_len, max_num_seqs)
-    else:
-        # decoder / multimodal: max_num_batched_tokens carries the compiled
-        # prefill chunk size. It does not bound the decode batch — the
-        # scheduler's per-step budget (max_num_scheduled_tokens) is decoupled
-        # from max_num_batched_tokens — so it may be smaller than max_num_seqs.
-        assert prefill_chunk_size is not None
-        target = prefill_chunk_size
-
-    cur = vllm_config.scheduler_config.max_num_batched_tokens
-    if cur != target:
-        logger.info(
-            "Updating scheduler_config.max_num_batched_tokens "
-            "from %s to %d based on rbln_config.json",
-            cur,
-            target,
-        )
-        vllm_config.scheduler_config.max_num_batched_tokens = target
+    scheduler_config = vllm_config.scheduler_config
+    scheduler_config.max_num_batched_tokens = max(
+        vllm_config.model_config.max_model_len,
+        scheduler_config.max_num_seqs,
+        getattr(hf_config, "max_source_positions", 0)
+        if is_enc_dec_arch(hf_config)
+        else 0,
+    )
 
 
 def store_image_prefill_chunk_size(
@@ -388,7 +371,7 @@ def store_image_prefill_chunk_size(
     image_prefill_chunk_size: list[int] | None,
 ) -> None:
     # Image-prefill buckets (gemma4 multi-bucket / gemma3 single) don't fit the
-    # scalar max_num_batched_tokens, so they stay in additional_config for
+    # scalar prefill_chunk_size, so they stay in additional_config for
     # RBLNKVCacheManager to size the per-image chunk in its block padding.
     if image_prefill_chunk_size is None:
         return
@@ -397,19 +380,24 @@ def store_image_prefill_chunk_size(
 
 
 def validate_user_prefill_chunk_size(
-    vllm_config: VllmConfig, prefill_chunk_size: int
+    vllm_config: VllmConfig, resolved_prefill_chunk_size: int | None
 ) -> None:
-    """Require an explicit user chunk size to match the selected model config."""
-    if not is_chunked_prefill_arch(vllm_config.model_config.hf_config):
-        return
-    user_chunk = get_user_max_num_batched_tokens(vllm_config)
-    if user_chunk is not None and user_chunk != prefill_chunk_size:
-        raise ValueError(
-            f"max_num_batched_tokens ({user_chunk}) conflicts with the "
-            f"compiled prefill_chunk_size ({prefill_chunk_size}) in "
-            "rbln_config.json. Omit max_num_batched_tokens or recompile the "
-            "model with a matching prefill chunk size."
-        )
+    """Require an explicit chunk size to match the resolved model config."""
+    additional_config: OptimumRBLNConfig = vllm_config.additional_config
+    prefill_chunk_size = additional_config.single_prefill_chunk_size
+    if prefill_chunk_size is not None:
+        if not is_chunked_prefill_arch(vllm_config.model_config.hf_config):
+            raise ValueError(
+                "prefill_chunk_size cannot be specified for a model that does "
+                "not support chunked prefill. Leave --rbln-prefill-chunk-size unset."
+            )
+        if prefill_chunk_size != resolved_prefill_chunk_size:
+            raise ValueError(
+                f"Requested prefill_chunk_size ({prefill_chunk_size}) does not match "
+                f"the resolved model configuration ({resolved_prefill_chunk_size}). "
+                "Leave --rbln-prefill-chunk-size unset to use the model configuration, "
+                "or compile or load a model with a matching prefill chunk size."
+            )
 
 
 def keep_device_overrides(obj: dict) -> dict:

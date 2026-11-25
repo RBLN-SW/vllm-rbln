@@ -289,6 +289,11 @@ class TransferShape:
     groups: int
     use_host_buffer: bool
     writes_into_peer: bool
+    #: Whether a write also carries a recurrent group's block-boundary state:
+    #: a writer whose prefix caching runs the recurrent groups in align mode.
+    #: The consumer allocates for it before the producer is known, so the
+    #: compatibility hash keeps two ends that decide it differently apart.
+    push_boundary_state: bool
 
     @property
     def has_window_range(self) -> bool:
@@ -359,6 +364,12 @@ def transfer_shape(
     chunk_mode = connector_option(vllm_config, "chunk_mode", False)
     wants_window = connector_option(vllm_config, "swa_window_mode", False)
     wants_stream = connector_option(vllm_config, "push_stream", False)
+    cache_config = vllm_config.cache_config
+    push_boundary_state = (
+        writes_into_peer
+        and cache_config.enable_prefix_caching
+        and cache_config.mamba_cache_mode == "align"
+    )
 
     # Only the side that originates bytes into a peer sends a prefix early, so
     # the knob is inert on the other -- and a shape that let it through there
@@ -395,6 +406,7 @@ def transfer_shape(
         groups=len(specs),
         use_host_buffer=use_host_buffer,
         writes_into_peer=writes_into_peer,
+        push_boundary_state=push_boundary_state,
     )
 
 
@@ -403,6 +415,8 @@ def rbln_compat_hash(
     *,
     writes_into_peer: bool,
     cross_layers_blocks: bool,
+    push_boundary_state: bool,
+    exchanges_block_state: bool,
     speculative_config: "SpeculativeConfig | None" = None,
 ) -> str:
     """Fold the RBLN schema version and the factors upstream's hash drops into
@@ -413,8 +427,12 @@ def rbln_compat_hash(
     a producer that writes into a consumer expecting to read passes every
     length check; the draft model, because its attention layers are members of
     the KV cache this connector registers while upstream's factors describe the
-    target alone; and ``cross_layers_blocks``, which scales the page by the
-    KV-cache tensor count and which 0.30 dropped from upstream's own factors.
+    target alone; the EAGLE block drop where a single-state SSM layer is
+    exchanged, because it moves the block-boundary state;
+    ``cross_layers_blocks``, which scales the page by the KV-cache tensor count
+    and which 0.30 dropped from upstream's own factors; and
+    ``push_boundary_state``, because a writer's consumer allocates for the
+    boundary state before the producer says whether it sends one.
 
     Model-level values only -- the hash is compared across every shard, so a
     per-rank quantity would differ between PP stages.
@@ -425,6 +443,9 @@ def rbln_compat_hash(
         "rbln_writes_into_peer": writes_into_peer,
         "rbln_cross_layers_blocks": cross_layers_blocks,
     }
+    if push_boundary_state:
+        # Added only when on, so a writer without align-mode state hashes as before.
+        factors["rbln_push_boundary_state"] = True
     if speculative_config is not None and (
         speculative_config.use_eagle() or speculative_config.uses_draft_model()
     ):
@@ -436,4 +457,6 @@ def rbln_compat_hash(
             "rbln_draft_revision": draft_model_config.revision,
             "rbln_draft_code_revision": draft_model_config.code_revision,
         }
+        if exchanges_block_state:
+            factors["rbln_eagle_block_drop"] = speculative_config.use_eagle_block_drop()
     return hash_factors(factors)

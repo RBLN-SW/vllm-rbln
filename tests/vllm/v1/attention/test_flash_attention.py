@@ -15,13 +15,13 @@
 
 from dataclasses import fields
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 from vllm.config import set_current_vllm_config
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-import vllm_rbln.envs as envs
 import vllm_rbln.v1.attention.backends.flash_attention as flash_attention
 from tests.vllm.v1.attention.utils import (
     make_attention_spec,
@@ -233,6 +233,44 @@ class TestBuildCommonIndices:
         # positions[[0, 3]] = [0, 30]
         assert md.seq_lens.reshape(-1).tolist() == [0, 30]
 
+    def test_group_shared_staging_shares_seq_idx_only(self, cfg):
+        # One tensor object is one graph input: KV cache groups must hand the
+        # graph the same seq_idx, but each keeps its own block table.
+        group_shared: dict = {}
+        builders = [make_builder(cfg), make_builder(cfg)]
+
+        def step(positions, shared):
+            return [
+                builder.build(
+                    _cam(
+                        num_reqs=2,
+                        query_start_loc=[0, 1, 2],
+                        seq_lens=[5, 8],
+                        block_table=table,
+                    ),
+                    torch.tensor(positions),
+                    batch_pad=2,
+                    is_prefill=False,
+                    group_shared=shared,
+                )
+                for builder, table in zip(builders, [[[1], [2]], [[3], [4]]])
+            ]
+
+        mds = step([4, 7], group_shared)
+        assert mds[0].seq_lens is mds[1].seq_lens
+        assert mds[0].block_tables is not mds[1].block_tables
+        assert mds[1].block_tables.reshape(-1).tolist() == [3, 4]
+
+        # The next step overwrites the same buffer rather than allocating one.
+        next_mds = step([5, 8], group_shared)
+        assert next_mds[0].seq_lens is mds[0].seq_lens
+        assert mds[0].seq_lens.reshape(-1).tolist() == [5, 8]
+
+        # A caller without the dict, like a drafter, keeps its own buffer.
+        unshared = step([9, 9], None)
+        assert unshared[0].seq_lens is not mds[0].seq_lens
+        assert mds[0].seq_lens.reshape(-1).tolist() == [5, 8]
+
 
 class TestBuildPrefillCausal:
     def test_no_mask_and_block_tables_flattened(self, cfg):
@@ -298,29 +336,9 @@ class TestBuildPrefillNonCausal:
         expected[..., CHUNK : 2 * CHUNK] = _lower_triangular(CHUNK)
         assert torch.equal(mask.float(), expected)
 
-    @pytest.mark.parametrize(
-        "eager, expected_dtype",
-        [(False, torch.float32), (True, torch.float16)],
-    )
-    def test_mask_dtype_follows_enforce_eager(
-        self, cfg_noncausal, eager, expected_dtype
-    ):
-        # float16 under enforce_eager, float32 otherwise. enforce_eager needs
-        # device tensors, so that case is skipped on the cpu lane.
-        if eager and not envs.VLLM_RBLN_USE_DEVICE_TENSOR:
-            pytest.skip("enforce_eager=True requires VLLM_RBLN_USE_DEVICE_TENSOR=1")
-        config = (
-            make_vllm_config(
-                max_model_len=MAX_LEN,
-                max_num_batched_tokens=CHUNK,
-                enforce_eager=True,
-                attention_config={"use_non_causal": True},
-            )
-            if eager
-            else cfg_noncausal
-        )
-        mask = self._mask(config, positions=torch.arange(4))
-        assert mask.dtype == expected_dtype
+    def test_noncausal_mask_dtype(self, cfg_noncausal):
+        mask = self._mask(cfg_noncausal, positions=torch.arange(4))
+        assert mask.dtype == torch.float32
 
 
 class TestBuildDecodeCausal:
@@ -761,6 +779,70 @@ class TestBuildOutputAssembly:
 
 
 class TestStage:
+    @pytest.mark.use_device
+    @pytest.mark.parametrize("kind", ["full", "shift", "glm"])
+    @pytest.mark.parametrize("is_prefill", [False, True])
+    @pytest.mark.parametrize("use_custom_kernel", [False, True])
+    def test_deferred_build_preserves_tensor_values_after_staging(
+        self, monkeypatch, kind, is_prefill, use_custom_kernel
+    ):
+        from vllm.platforms import current_platform
+        from vllm.v1.kv_cache_interface import MambaSpec
+
+        from vllm_rbln.v1.attention.backends.glm5_next import (
+            RBLNGlm5NextMetadataBuilder,
+        )
+
+        config = make_vllm_config(
+            max_model_len=MAX_LEN,
+            max_num_batched_tokens=CHUNK,
+            additional_config={"use_custom_kernel": use_custom_kernel},
+            attention_config={"use_non_causal": True},
+        )
+        builder = make_builder(
+            config,
+            device=current_platform.device_type,
+            sliding_window=4 if kind == "shift" else None,
+            appends_kv=False,
+            spec=MambaSpec(block_size=4, shapes=((4, 512),), dtypes=(torch.uint8,))
+            if kind == "glm"
+            else None,
+            builder_cls=RBLNGlm5NextMetadataBuilder if kind == "glm" else None,
+        )
+        copy_tensor = Mock(wraps=builder._stage)
+        monkeypatch.setattr(builder, "_stage", copy_tensor)
+        query_len = 2 if is_prefill else 1
+        metadata = builder.build(
+            _cam(
+                num_reqs=1,
+                query_start_loc=[0, query_len],
+                seq_lens=[6],
+                block_table=[[4, 5, 6, 7]],
+            ),
+            torch.arange(query_len) + 6 - query_len,
+            batch_pad=1 if is_prefill else 2,
+            is_prefill=is_prefill,
+            num_accepted=torch.tensor([1], dtype=torch.int32),
+            mm_prefix_row_ends=torch.arange(CHUNK) if is_prefill else None,
+            defer_staging=True,
+        )
+        copy_tensor.assert_not_called()
+        originals = {
+            field.name: value
+            for field in fields(metadata)
+            if isinstance(value := getattr(metadata, field.name), torch.Tensor)
+        }
+        expected = {name: tensor.clone() for name, tensor in originals.items()}
+
+        builder.stage(metadata)
+        for tensor in originals.values():
+            tensor.zero_()
+
+        for name, tensor in expected.items():
+            staged = getattr(metadata, name)
+            assert staged.device.type == current_platform.device_type, name
+            assert torch.equal(staged.cpu(), tensor), name
+
     def test_none_passthrough(self, cfg):
         # None in -> None out; there is nothing to stage.
         assert make_builder(cfg)._stage(None, "x") is None
@@ -819,14 +901,10 @@ class TestStage:
         assert first.reshape(-1).tolist() == [10]
 
 
-@pytest.mark.maybe_use_device
+@pytest.mark.use_device
 class TestFlashImplInit:
     # __init__ validation guards and derived attributes. Each guard test sets the
     # other args valid so the intended check fires (the guards are ordered).
-    def test_kv_sharing_not_supported(self, cfg):
-        with pytest.raises(NotImplementedError, match="KV sharing"):
-            make_impl(cfg, kv_sharing_target_layer_name="model.layers.0.self_attn")
-
     def test_num_heads_must_divide_num_kv_heads(self, cfg):
         with pytest.raises(AssertionError):
             make_impl(cfg, num_heads=8, num_kv_heads=3)
@@ -929,7 +1007,7 @@ class TestFlashImplInit:
         assert make_impl(cfg_square, sinks=torch.zeros(8)).is_normal is False
 
 
-@pytest.mark.maybe_use_device
+@pytest.mark.use_device
 class TestForwardSlidingWindow:
     """Which kernel a sliding-window layer reaches is carried on the metadata
     by the builder, and the two take different inputs."""
@@ -1087,3 +1165,123 @@ class TestForwardSlidingWindow:
             assert mask is md.swa_attn_masks
         else:
             assert mask is None
+
+
+@pytest.mark.use_device
+class TestForwardSharedKV:
+    """A KV-shared layer passes no K/V: it reads its target's cache through the
+    op the target's own layer uses, masked, and writes zeros the mask hides."""
+
+    HEADS, DIM = 8, 128
+
+    def test_sliding_reads_preserve_shared_prefix_blocks(self, cfg):
+        torch.manual_seed(0)
+        impl = make_impl(cfg, sliding_window=8, scale=self.DIM**-0.5)
+        impl.scale = impl.scale.cpu()
+        cache = torch.randn(7, 2, self.HEADS, 1, 4, self.DIM)
+        original = cache.clone()
+        tables = torch.tensor([[1, 2, 3, 5], [1, 2, 4, 6]])
+        query = torch.randn(2, self.HEADS, self.DIM)
+        masks = torch.zeros(2, 1, 1, 16)
+        masks[0, ..., 3:11] = 1
+        masks[1, ..., :8] = 1
+        md = RBLNFlashAttentionMetadata(
+            seq_lens=torch.tensor([[11], [12]]),
+            block_tables=tables,
+            is_prefill=False,
+            swa_appends=True,
+            attn_masks=masks,
+        )
+        output = torch.empty_like(query)
+        impl.forward(None, query, None, None, cache, md, output)
+        for row, end in enumerate((11, 12)):
+            start = end - 8
+            keys, values = [
+                torch.cat([original[b, kv, :, 0] for b in tables[row]], dim=1)
+                for kv in (0, 1)
+            ]
+            logits = (query[row, :, None] * keys[:, start:end]).sum(-1) * impl.scale
+            expected = (logits.softmax(-1)[..., None] * values[:, start:end]).sum(1)
+            torch.testing.assert_close(output[row], expected)
+        original[3, :, :, 0, 3] = 0
+        original[6, :, :, 0, 0] = 0
+        torch.testing.assert_close(cache, original, rtol=0, atol=0)
+
+    def test_full_mask_reads_a_single_partition(self, cfg):
+        torch.manual_seed(0)
+        impl = make_impl(cfg, scale=self.DIM**-0.5)
+        impl.scale = impl.scale.cpu()
+        cache = torch.randn(2, 2, self.HEADS, 1, 16, self.DIM)
+        original = cache.clone()
+        query = torch.randn(1, self.HEADS, self.DIM)
+        mask = torch.zeros(1, 1, 1, 1, 16)
+        mask[..., :11] = 1
+        md = RBLNFlashAttentionMetadata(
+            seq_lens=torch.tensor([[11]]),
+            block_tables=torch.tensor([[1]]),
+            is_prefill=False,
+            attn_masks=mask,
+        )
+        output = torch.empty_like(query)
+        impl.forward(None, query, None, None, cache, md, output)
+        keys, values = original[1, :, :, 0, :11]
+        logits = (query[0, :, None] * keys).sum(-1) * impl.scale
+        expected = (logits.softmax(-1)[..., None] * values).sum(1)
+        torch.testing.assert_close(output[0], expected)
+        original[1, :, :, 0, 11] = 0
+        torch.testing.assert_close(cache, original, atol=0, rtol=0)
+
+    @pytest.mark.parametrize(
+        "sliding_window, target",
+        [(None, "flash_attention_naive_decode"), (4, "sliding_window_attention_v1")],
+    )
+    @pytest.mark.parametrize("num_blocks", [1, 3])
+    def test_reads_through_a_masked_op(
+        self, cfg, monkeypatch, sliding_window, target, num_blocks
+    ):
+        impl = make_impl(cfg, sliding_window=sliding_window)
+        recorded = []
+
+        def record(*args, **kwargs):
+            recorded.append((args, kwargs))
+            return torch.zeros(2, self.HEADS, 1, 1, self.DIM)
+
+        for name in (
+            "flash_attention_naive_decode",
+            "sliding_window_attention_v1",
+            "sliding_window_attention_naive_decode",
+            "flash_causal_attention_naive_decode",
+        ):
+            monkeypatch.setattr(
+                flash_attention, name, record if name == target else _unexpected(name)
+            )
+        monkeypatch.setattr(
+            torch.ops.rbln_custom_ops,
+            "gqa",
+            _unexpected("gqa"),
+            raising=False,
+        )
+        md = RBLNFlashAttentionMetadata(
+            seq_lens=torch.tensor([[6], [0]]),
+            block_tables=torch.tensor([[7, 8, 9], [0, 0, 0]])[:, :num_blocks],
+            is_prefill=False,
+            swa_appends=sliding_window is not None,
+            attn_masks=torch.ones(2, 1, 1, 1, 8),
+        )
+        impl.forward(
+            None,
+            torch.ones(2, self.HEADS, self.DIM),
+            None,
+            None,
+            torch.zeros(1, 1, 1, 1, 4, 1),
+            md,
+            torch.zeros(2, self.HEADS, self.DIM),
+        )
+        args, kwargs = recorded[0]
+        _q, key, value = args[:3]
+        assert not key.any() and not value.any()
+        if sliding_window is None:
+            assert args[4] is md.attn_masks
+        else:
+            assert kwargs["attn_mask"] is md.attn_masks
+            assert args[7] == sliding_window + 1

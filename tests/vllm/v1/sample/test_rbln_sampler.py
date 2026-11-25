@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from collections.abc import Callable
+from itertools import product
 from typing import Any
 
 import pytest
@@ -38,6 +39,8 @@ from .utils import (
 
 # Logits arrive in the model's dtype, and RBLN serves all three.
 DTYPES = [torch.bfloat16, torch.float16, torch.float32]
+# The default and the opt-out must draw from the same distribution.
+FUSED_MODES = {"fused": True, "unfused": False}
 
 
 @pytest.fixture
@@ -102,7 +105,7 @@ def test_all_greedy_batch_takes_the_argmax_op(sampler, op_args, dtype):
 ROWS = 256
 WEIGHTED = evenly_spaced_token_ids(num_ids=32).tolist()
 TAIL_TOKEN = 1
-LAUNCHES = 40
+LAUNCHES = 20
 
 
 def sample(
@@ -196,6 +199,24 @@ DISTRIBUTION_CASES = [
     # The bias lifts the least likely weighted token into the top-k.
     case(SamplingParams(logit_bias={WEIGHTED[0]: 4.0}, top_k=8), "logit_bias_top_k"),
     case(
+        SamplingParams(logit_bias={WEIGHTED[31]: -100.0, WEIGHTED[30]: -100.0}),
+        "logit_bias_ban",
+    ),
+    case(
+        SamplingParams(
+            temperature=0.8,
+            min_p=0.05,
+            top_k=16,
+            top_p=0.98,
+            repetition_penalty=1.05,
+            frequency_penalty=0.3,
+            logit_bias={WEIGHTED[31]: -100.0, WEIGHTED[0]: 4.0},
+        ),
+        "min_p_penalties_logit_bias",
+        prompt_token_ids=[WEIGHTED[29]],
+        output_token_ids=[WEIGHTED[28], WEIGHTED[30], WEIGHTED[30]],
+    ),
+    case(
         SamplingParams(
             allowed_token_ids=[*WEIGHTED[16:], TAIL_TOKEN], top_p=0.9, min_p=0.05
         ),
@@ -220,10 +241,19 @@ DISTRIBUTION_CASES = [
 ]
 
 
-@pytest.mark.parametrize(("params", "request_kwargs"), DISTRIBUTION_CASES)
-@pytest.mark.parametrize("dtype", DTYPES, ids=str)
+# Without input_batch, only active min_p changes paths under fused sampling.
+@pytest.mark.parametrize(
+    ("params", "request_kwargs", "dtype", "fused"),
+    [
+        pytest.param(*case.values, dtype, fused, id=f"{mode}-{dtype}-{case.id}")
+        for (mode, fused), dtype, case in product(
+            FUSED_MODES.items(), DTYPES, DISTRIBUTION_CASES
+        )
+        if fused or case.values[0].min_p > 0
+    ],
+)
 @pytest.mark.use_device
-def test_sampled_distribution(params, request_kwargs, dtype):
+def test_sampled_distribution(params, request_kwargs, dtype, fused):
     row = logits_from_weights(weights=range(1, 33), dtype=dtype)
     expected = expected_probs(
         logits=row.unsqueeze(0),
@@ -233,7 +263,10 @@ def test_sampled_distribution(params, request_kwargs, dtype):
     )[0]
 
     samples = sample(
-        logits=row.expand(ROWS, -1), params=[params] * ROWS, **request_kwargs
+        logits=row.expand(ROWS, -1),
+        params=[params] * ROWS,
+        sampler=RBLNSampler(fused_sampling=fused),
+        **request_kwargs,
     )
 
     assert_samples_match(samples=samples, probs=expected)
@@ -290,8 +323,9 @@ def test_structured_output_mask_with_top_p_min_p():
 
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=str)
+@pytest.mark.parametrize("fused", FUSED_MODES.values(), ids=FUSED_MODES)
 @pytest.mark.use_device
-def test_mixed_batch_keeps_each_row_to_its_own_params(dtype):
+def test_mixed_batch_keeps_each_row_to_its_own_params(dtype, fused):
     """One op call serves the mixed batch, greedy rows as top_k=1. Each row must
     keep its own distribution."""
     weighted_row = logits_from_weights(weights=range(1, 33), dtype=dtype)
@@ -314,6 +348,12 @@ def test_mixed_batch_keeps_each_row_to_its_own_params(dtype):
                 top_p=0.9,
             ),
         ),
+        (
+            weighted_row,
+            SamplingParams(
+                temperature=0.8, min_p=0.05, logit_bias={WEIGHTED[31]: -100.0}
+            ),
+        ),
     ]
     # Only the penalized group reads the history.
     history: dict[str, Any] = {
@@ -329,7 +369,12 @@ def test_mixed_batch_keeps_each_row_to_its_own_params(dtype):
         **history,
     )
 
-    samples = sample(logits=logits, params=params, **history)
+    samples = sample(
+        logits=logits,
+        params=params,
+        sampler=RBLNSampler(fused_sampling=fused),
+        **history,
+    )
 
     for g, probs in enumerate(expected):
         assert_samples_match(

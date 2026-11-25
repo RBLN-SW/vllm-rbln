@@ -14,13 +14,18 @@
 
 import math
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
+from vllm.forward_context import get_forward_context
 
-from vllm_rbln.v1.worker.utils import extract_layer_index
+if TYPE_CHECKING:
+    from vllm_rbln.v1.attention.backends.flash_attention import (
+        RBLNFlashAttentionMetadata,
+    )
+    from vllm_rbln.v1.attention.backends.gdn_attn import RBLNGDNAttentionMetadata
 
 
 def _storage_key(tensor: torch.Tensor) -> tuple[int, int]:
@@ -63,16 +68,31 @@ class KVCacheViewInfo:
 def build_kv_cache_base_bindings(
     kv_cache_bases_by_layer: dict[str, torch.Tensor],
     kv_cache_view_infos_by_layer: dict[str, KVCacheViewInfo],
-    num_attn_module: int = 1,
+    canonical_layers: Collection[str],
+    *,
+    layer_names: Sequence[str],
 ) -> tuple[list[torch.Tensor], list[KVCacheViewInfo]]:
-    """Deduplicate KV cache inputs by storage and capture per-layer view info."""
+    """Deduplicate KV cache inputs by storage and capture per-layer view info.
+
+    Each storage is bound in the shape of its layer in `canonical_layers` rather
+    than the first layer's; every storage needs a layer there, and layers named
+    for one storage must view it in one shape. The other layers view the base.
+    """
+    assert len(layer_names) == len(kv_cache_view_infos_by_layer) and set(
+        layer_names
+    ) == set(kv_cache_view_infos_by_layer), (
+        "KV cache order must name every cache exactly once"
+    )
     base_tensors: list[torch.Tensor] = []
     view_infos: list[KVCacheViewInfo] = []
     base_index_by_view: dict[tuple[torch.device, int, int, int, int], int] = {}
+    canonical_bases = {
+        kv_cache_tensor_key(kv_cache_bases_by_layer[name]): kv_cache_bases_by_layer[
+            name
+        ]
+        for name in canonical_layers
+    }
 
-    layer_names = _get_ordered_layer_names(
-        kv_cache_view_infos_by_layer, num_attn_module
-    )
     for layer_name in layer_names:
         base_tensor = kv_cache_bases_by_layer[layer_name]
         # The byte window and not just the storage: layers share a buffer only
@@ -83,7 +103,10 @@ def build_kv_cache_base_bindings(
         if base_index is None:
             base_index = len(base_tensors)
             base_index_by_view[view_key] = base_index
-            base_tensors.append(base_tensor)
+            assert view_key in canonical_bases, (
+                f"the KV cache storage of {layer_name} has no layer in canonical_layers"
+            )
+            base_tensors.append(canonical_bases[view_key])
 
         view_info = kv_cache_view_infos_by_layer[layer_name]
         if view_info.view_dtype == base_tensors[base_index].dtype:
@@ -182,13 +205,40 @@ def materialize_kv_cache_view(
     return tensor
 
 
+# NOTE(RBLN) - To represent kv cache as model input,
+# modify attention instead of using the attention layer's embedded
+# kv cache (self.kv_cache); use attention metadata's kv cache.
+# attention metadata's kv cache must equal the attention layer's
+# embedded kv cache.
+def resolve_kv_cache(
+    attn_metadata: "RBLNFlashAttentionMetadata | RBLNGDNAttentionMetadata",
+    cache_name: str,
+) -> torch.Tensor:
+    """Resolve the KV cache for a given layer, either from deduplicated
+    base tensors (for torch.export compatibility) or from the direct list."""
+    position = attn_metadata.kv_cache_positions[cache_name]
+    kv_cache_view_infos = getattr(attn_metadata, "kv_cache_view_infos", None)
+    forward_context = get_forward_context()
+    additional_kwargs = getattr(forward_context, "additional_kwargs", {}) or {}
+    kv_cache_bases = additional_kwargs.get("kv_cache_bases")
+    if kv_cache_bases and kv_cache_view_infos:
+        assert position < len(kv_cache_view_infos)
+        return materialize_kv_cache_view(kv_cache_bases, kv_cache_view_infos[position])
+
+    assert attn_metadata.kv_caches is not None
+    assert position < len(attn_metadata.kv_caches)
+    return attn_metadata.kv_caches[position]
+
+
 def attach_kv_cache_bindings(
     attn_metadata: Any,
     kv_caches: list[torch.Tensor] | None,
     kv_cache_bases: list[torch.Tensor] | None,
     kv_cache_view_infos: list[KVCacheViewInfo] | None,
+    kv_cache_positions: dict[str, int],
 ) -> None:
     """Attach either per-layer KV views or deduplicated bases to metadata."""
+    attn_metadata.kv_cache_positions = kv_cache_positions
     if kv_cache_bases and kv_cache_view_infos:
         attn_metadata.kv_caches = None
         attn_metadata.kv_cache_view_infos = kv_cache_view_infos
@@ -244,17 +294,3 @@ def validate_shared_attention_kv_cache_contiguity(
             "Shared attention KV cache tensors must be contiguous. "
             f"Non-contiguous layers: {layer_summaries}"
         )
-
-
-def _get_ordered_layer_names(
-    kv_caches: dict[str, torch.Tensor], num_attn_module: int
-) -> list[str]:
-    index_to_names: dict[int, list[str]] = defaultdict(list)
-    for layer_name in kv_caches:
-        layer_index = extract_layer_index(layer_name, num_attn_module)
-        index_to_names[layer_index].append(layer_name)
-
-    ordered_layer_names: list[str] = []
-    for layer_index in sorted(index_to_names):
-        ordered_layer_names.extend(index_to_names[layer_index])
-    return ordered_layer_names

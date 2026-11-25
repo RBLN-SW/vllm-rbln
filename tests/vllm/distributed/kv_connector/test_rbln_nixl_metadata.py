@@ -200,14 +200,30 @@ class TestRblnNixlAgentMetadata:
 class TestRblnCompatHash:
     def test_deterministic(self):
         assert rbln_compat_hash(
-            "BASE", writes_into_peer=False, cross_layers_blocks=False
-        ) == rbln_compat_hash("BASE", writes_into_peer=False, cross_layers_blocks=False)
+            "BASE",
+            writes_into_peer=False,
+            cross_layers_blocks=False,
+            push_boundary_state=False,
+            exchanges_block_state=False,
+        ) == rbln_compat_hash(
+            "BASE",
+            writes_into_peer=False,
+            cross_layers_blocks=False,
+            push_boundary_state=False,
+            exchanges_block_state=False,
+        )
 
     def test_differs_from_base(self):
         # Folding our version in must move the hash, or a peer that speaks only
         # upstream's schema would match one that speaks ours.
         assert (
-            rbln_compat_hash("BASE", writes_into_peer=False, cross_layers_blocks=False)
+            rbln_compat_hash(
+                "BASE",
+                writes_into_peer=False,
+                cross_layers_blocks=False,
+                push_boundary_state=False,
+                exchanges_block_state=False,
+            )
             != "BASE"
         )
 
@@ -216,14 +232,32 @@ class TestRblnCompatHash:
         # from describe the same bytes, so every length check on the handshake
         # passes and only this separates them.
         assert rbln_compat_hash(
-            "BASE", writes_into_peer=True, cross_layers_blocks=False
-        ) != rbln_compat_hash("BASE", writes_into_peer=False, cross_layers_blocks=False)
+            "BASE",
+            writes_into_peer=True,
+            cross_layers_blocks=False,
+            push_boundary_state=False,
+            exchanges_block_state=False,
+        ) != rbln_compat_hash(
+            "BASE",
+            writes_into_peer=False,
+            cross_layers_blocks=False,
+            push_boundary_state=False,
+            exchanges_block_state=False,
+        )
 
     def test_distinguishes_base_hashes(self):
         assert rbln_compat_hash(
-            "hash-a", writes_into_peer=False, cross_layers_blocks=False
+            "hash-a",
+            writes_into_peer=False,
+            cross_layers_blocks=False,
+            push_boundary_state=False,
+            exchanges_block_state=False,
         ) != rbln_compat_hash(
-            "hash-b", writes_into_peer=False, cross_layers_blocks=False
+            "hash-b",
+            writes_into_peer=False,
+            cross_layers_blocks=False,
+            push_boundary_state=False,
+            exchanges_block_state=False,
         )
 
     def test_cross_layer_blocks_do_not_share_a_hash(self):
@@ -231,20 +265,69 @@ class TestRblnCompatHash:
         # that disagree describe different block lengths. Upstream dropped it
         # from its own factors in 0.30, leaving this the only place it is hashed.
         assert rbln_compat_hash(
-            "BASE", writes_into_peer=False, cross_layers_blocks=True
-        ) != rbln_compat_hash("BASE", writes_into_peer=False, cross_layers_blocks=False)
+            "BASE",
+            writes_into_peer=False,
+            cross_layers_blocks=True,
+            push_boundary_state=False,
+            exchanges_block_state=False,
+        ) != rbln_compat_hash(
+            "BASE",
+            writes_into_peer=False,
+            cross_layers_blocks=False,
+            push_boundary_state=False,
+            exchanges_block_state=False,
+        )
+
+    def test_a_one_sided_push_boundary_state_does_not_pair(self):
+        # The consumer allocates the boundary block before it knows the
+        # producer; a producer that does not push it would leave it unwritten.
+        def hashed(push_boundary_state):
+            return rbln_compat_hash(
+                "BASE",
+                writes_into_peer=True,
+                cross_layers_blocks=False,
+                push_boundary_state=push_boundary_state,
+                exchanges_block_state=False,
+            )
+
+        assert hashed(True) != hashed(False)
+
+    @pytest.mark.parametrize(
+        ("writes_into_peer", "caching", "mode", "expected"),
+        [
+            (True, True, "align", True),
+            (False, True, "align", False),
+            (True, False, "align", False),
+            (True, True, "all", False),
+        ],
+    )
+    def test_a_writer_with_align_mode_prefix_caching_pushes_the_boundary(
+        self, writes_into_peer, caching, mode, expected
+    ):
+        config = mock_vllm_config()
+        config.cache_config.enable_prefix_caching = caching
+        config.cache_config.mamba_cache_mode = mode
+        result = transfer_shape(config, [], writes_into_peer=writes_into_peer)
+        assert result.push_boundary_state is expected
 
     @staticmethod
-    def _spec_config(*, method="eagle3", model="draft-a", revision=None):
+    def _spec_config(
+        *, method="eagle3", model="draft-a", revision=None, disable_block_drop=False
+    ):
         draft_model_config = MagicMock()
         draft_model_config.model = model
         draft_model_config.revision = revision
         draft_model_config.code_revision = None
-        spec = MagicMock(method=method, draft_model_config=draft_model_config)
+        spec = MagicMock(
+            method=method,
+            draft_model_config=draft_model_config,
+            disable_eagle_block_drop=disable_block_drop,
+        )
         # Upstream's own predicates, not a copy of the method names they read:
         # a method moving between them has to show up here.
         spec.use_eagle = lambda: SpeculativeConfig.use_eagle(spec)
         spec.uses_draft_model = lambda: SpeculativeConfig.uses_draft_model(spec)
+        spec.use_eagle_block_drop = lambda: SpeculativeConfig.use_eagle_block_drop(spec)
         return spec
 
     def test_no_speculation_leaves_the_factors_alone(self):
@@ -253,8 +336,16 @@ class TestRblnCompatHash:
             "BASE",
             writes_into_peer=False,
             cross_layers_blocks=False,
+            exchanges_block_state=False,
             speculative_config=None,
-        ) == rbln_compat_hash("BASE", writes_into_peer=False, cross_layers_blocks=False)
+            push_boundary_state=False,
+        ) == rbln_compat_hash(
+            "BASE",
+            writes_into_peer=False,
+            cross_layers_blocks=False,
+            push_boundary_state=False,
+            exchanges_block_state=False,
+        )
 
     def test_a_draft_moves_the_hash(self):
         # Without this, P with a draft and D without it pair.
@@ -262,8 +353,16 @@ class TestRblnCompatHash:
             "BASE",
             writes_into_peer=False,
             cross_layers_blocks=False,
+            exchanges_block_state=False,
             speculative_config=self._spec_config(),
-        ) != rbln_compat_hash("BASE", writes_into_peer=False, cross_layers_blocks=False)
+            push_boundary_state=False,
+        ) != rbln_compat_hash(
+            "BASE",
+            writes_into_peer=False,
+            cross_layers_blocks=False,
+            push_boundary_state=False,
+            exchanges_block_state=False,
+        )
 
     def test_two_drafts_do_not_share_a_hash(self):
         # Two drafts register regions of different sizes past the target's depth.
@@ -271,13 +370,36 @@ class TestRblnCompatHash:
             "BASE",
             writes_into_peer=False,
             cross_layers_blocks=False,
+            exchanges_block_state=False,
             speculative_config=self._spec_config(model="draft-a"),
+            push_boundary_state=False,
         ) != rbln_compat_hash(
             "BASE",
             writes_into_peer=False,
             cross_layers_blocks=False,
+            exchanges_block_state=False,
             speculative_config=self._spec_config(model="draft-b"),
+            push_boundary_state=False,
         )
+
+    @pytest.mark.parametrize("exchanges_block_state", [True, False])
+    def test_the_block_drop_separates_a_draft_only_with_block_state(
+        self, exchanges_block_state
+    ):
+        # The drop moves the single-state SSM boundary both ends place; without
+        # one, it changes only the consumer's local hit, not what it pulls.
+        hashes = {
+            rbln_compat_hash(
+                "BASE",
+                writes_into_peer=False,
+                cross_layers_blocks=False,
+                push_boundary_state=False,
+                exchanges_block_state=exchanges_block_state,
+                speculative_config=self._spec_config(disable_block_drop=disable),
+            )
+            for disable in (False, True)
+        }
+        assert len(hashes) == (2 if exchanges_block_state else 1)
 
     def test_a_revision_separates_one_name(self):
         # What the name resolves to is the rest of the answer: every geometry
@@ -286,19 +408,27 @@ class TestRblnCompatHash:
             "BASE",
             writes_into_peer=False,
             cross_layers_blocks=False,
+            exchanges_block_state=False,
             speculative_config=self._spec_config(revision="r1"),
+            push_boundary_state=False,
         ) != rbln_compat_hash(
             "BASE",
             writes_into_peer=False,
             cross_layers_blocks=False,
+            exchanges_block_state=False,
             speculative_config=self._spec_config(revision="r2"),
+            push_boundary_state=False,
         )
 
     def test_a_method_without_a_draft_model_leaves_the_factors_alone(self):
         # Upstream hands n-gram the target's own config, so a hash keyed on a
         # draft config's presence would refuse a decode-only n-gram pairing.
         plain = rbln_compat_hash(
-            "BASE", writes_into_peer=False, cross_layers_blocks=False
+            "BASE",
+            writes_into_peer=False,
+            cross_layers_blocks=False,
+            push_boundary_state=False,
+            exchanges_block_state=False,
         )
         for method in ("ngram", "suffix"):
             assert (
@@ -306,7 +436,9 @@ class TestRblnCompatHash:
                     "BASE",
                     writes_into_peer=False,
                     cross_layers_blocks=False,
+                    exchanges_block_state=False,
                     speculative_config=self._spec_config(method=method),
+                    push_boundary_state=False,
                 )
                 == plain
             )
@@ -317,20 +449,36 @@ class TestRblnCompatHash:
             "BASE",
             writes_into_peer=False,
             cross_layers_blocks=False,
+            exchanges_block_state=False,
             speculative_config=self._spec_config(method="draft_model"),
-        ) != rbln_compat_hash("BASE", writes_into_peer=False, cross_layers_blocks=False)
+            push_boundary_state=False,
+        ) != rbln_compat_hash(
+            "BASE",
+            writes_into_peer=False,
+            cross_layers_blocks=False,
+            push_boundary_state=False,
+            exchanges_block_state=False,
+        )
 
     def test_version_is_folded(self, monkeypatch):
         # Bumping RBLN_NIXL_CONNECTOR_VERSION changes the hash (gates schema drift).
         h1 = md.rbln_compat_hash(
-            "BASE", writes_into_peer=False, cross_layers_blocks=False
+            "BASE",
+            writes_into_peer=False,
+            cross_layers_blocks=False,
+            push_boundary_state=False,
+            exchanges_block_state=False,
         )
         setattr_in_package(
             monkeypatch, RBLN_NIXL_CONNECTOR_VERSION=RBLN_NIXL_CONNECTOR_VERSION + 1
         )
         assert (
             md.rbln_compat_hash(
-                "BASE", writes_into_peer=False, cross_layers_blocks=False
+                "BASE",
+                writes_into_peer=False,
+                cross_layers_blocks=False,
+                push_boundary_state=False,
+                exchanges_block_state=False,
             )
             != h1
         )

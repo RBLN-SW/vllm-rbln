@@ -129,6 +129,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="P in (0, 1]; omitted means None, P=1 remains a tensor.",
     )
     parser.add_argument(
+        "--logit-bias",
+        help="JSON object mapping token IDs to biases in [-100, 100]; "
+        "the same fixed mapping applies to every row before penalties.",
+    )
+    parser.add_argument(
         "--repetition-penalty",
         type=float,
         default=1.0,
@@ -168,6 +173,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "does not change the saved input or grow history across calls.",
     )
     parser.add_argument(
+        "--use-fused-sampling",
+        type=int,
+        choices=(0, 1),
+        default=0,
+        help="Enable fused penalties and sampling using request histories.",
+    )
+    parser.add_argument(
         "--warmup",
         type=int,
         default=2,
@@ -194,6 +206,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "replaces an existing file with mode 0600.",
     )
     args = parser.parse_args(argv)
+    if args.logit_bias is not None:
+        try:
+            biases = json.loads(args.logit_bias)
+        except json.JSONDecodeError as error:
+            parser.error(f"--logit-bias must be a JSON object: {error}")
+        if not isinstance(biases, dict):
+            parser.error("--logit-bias must be a JSON object")
+        args.logit_bias = {}
+        for token, bias in biases.items():
+            try:
+                token_id = int(token)
+            except ValueError:
+                parser.error("--logit-bias keys must be integer token IDs")
+            if token_id < 0 or token_id in args.logit_bias:
+                parser.error("--logit-bias requires unique nonnegative token IDs")
+            if (
+                type(bias) not in (int, float)
+                or not -100 <= bias <= 100
+                or not math.isfinite(bias)
+            ):
+                parser.error(
+                    "--logit-bias values must be finite numbers in [-100, 100]"
+                )
+            args.logit_bias[token_id] = float(bias)
     for name in (
         "batch_size",
         "vocab_size",
@@ -314,12 +350,14 @@ def main() -> None:
         batch, vocab = original.shape
         if vocab < 2 or (args.top_k is not None and args.top_k > vocab):
             raise ValueError("V must be >= 2 and --top-k must be <= V")
+        if args.logit_bias and any(token >= vocab for token in args.logit_bias):
+            raise ValueError("logit bias contains a token ID outside the vocabulary")
         has_penalty = (
             args.repetition_penalty != 1.0
             or args.presence_penalty != 0
             or args.frequency_penalty != 0
         )
-        reference = original
+        reference = original.clone() if has_penalty or args.logit_bias else original
         prompt_ids = [[] for _ in range(batch)]
         output_ids = [[] for _ in range(batch)]
         stop_ids = [[] for _ in range(batch)]
@@ -396,6 +434,10 @@ def main() -> None:
                 "stop_token_ids": stop_ids,
                 "fixed_across_calls": True,
             }
+        if args.logit_bias:
+            reference[:, list(args.logit_bias)] += torch.tensor(
+                list(args.logit_bias.values()), dtype=original.dtype
+            )
         if has_penalty:
             from vllm._custom_ops import apply_repetition_penalties_torch
 
@@ -407,7 +449,6 @@ def main() -> None:
                     torch.tensor(output_ids[row], dtype=torch.int64), minlength=vocab
                 )
             output_mask = output_counts > 0
-            reference = original.clone()
             apply_repetition_penalties_torch(
                 reference,
                 prompt_mask,
@@ -433,10 +474,12 @@ def main() -> None:
             "row_slice": [0, batch],
         }
         result["sampling"] = {
+            "use_fused_sampling": bool(args.use_fused_sampling),
             "greedy": greedy,
             "temperature": temperature,
             "top_k": args.top_k,
             "top_p": args.top_p,
+            "logit_bias": args.logit_bias,
             "max_num_logprobs": None,
             "no_penalties": not has_penalty,
             "repetition_penalty": args.repetition_penalty,
@@ -454,9 +497,17 @@ def main() -> None:
             top_p=args.top_p if args.top_p is not None else 0.95,
         )
         result["input"]["summary"]["greedy_reference_at_temperature_one"] = greedy
+        processing = " and ".join(
+            name
+            for name, enabled in (
+                ("logit bias", args.logit_bias),
+                ("penalties", has_penalty),
+            )
+            if enabled
+        )
         result["input"]["summary"]["logits_stage"] = (
-            "after penalties, before min-tokens/min-p/top-k/top-p"
-            if has_penalty
+            f"after {processing}, before min-tokens/min-p/top-k/top-p"
+            if processing
             else "input logits, before min-tokens/min-p/top-k/top-p"
         )
         if args.min_tokens:
@@ -559,7 +610,7 @@ def main() -> None:
             pristine = original.to(device)
             work = torch.empty_like(pristine)
             logitsprocs = LogitsProcessors()
-            if args.min_p or args.min_tokens:
+            if args.min_p or args.min_tokens or args.logit_bias:
                 from vllm import SamplingParams
                 from vllm.v1.sample.logits_processor import BatchUpdate
 
@@ -588,6 +639,7 @@ def main() -> None:
                             index,
                             SamplingParams(
                                 temperature=temperature,
+                                logit_bias=args.logit_bias,
                                 min_p=args.min_p,
                                 min_tokens=args.min_tokens,
                                 max_tokens=max(16, args.min_tokens),
@@ -694,14 +746,55 @@ def main() -> None:
                     for processor in logitsprocs.all
                 ],
             }
-            sampler = RBLNSampler()
+            from vllm import SamplingParams
+            from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
+
+            max_history = max(
+                1,
+                max(
+                    len(prompt) + len(output)
+                    for prompt, output in zip(prompt_ids, output_ids)
+                ),
+            )
+            input_batch = InputBatch(
+                max_num_reqs=batch,
+                max_model_len=max_history,
+                max_num_batched_tokens=batch,
+                device=device,
+                vocab_size=vocab,
+                block_sizes=[16],
+                kernel_block_sizes=[16],
+                max_num_blocks_per_req=[math.ceil(max_history / 16)],
+                logitsprocs=logitsprocs,
+            )
+            for index in range(batch):
+                input_batch.add_request(
+                    CachedRequestState(
+                        req_id=str(index),
+                        prompt_token_ids=prompt_ids[index],
+                        mm_features=None,
+                        sampling_params=SamplingParams(
+                            temperature=temperature,
+                            logit_bias=args.logit_bias,
+                            repetition_penalty=args.repetition_penalty,
+                            presence_penalty=args.presence_penalty,
+                            frequency_penalty=args.frequency_penalty,
+                        ),
+                        pooling_params=None,
+                        generator=None,
+                        block_ids=([0],),
+                        num_computed_tokens=0,
+                        output_token_ids=output_ids[index],
+                    )
+                )
+            sampler = RBLNSampler(fused_sampling=bool(args.use_fused_sampling))
 
             def restore() -> None:
                 work.copy_(pristine)
                 torch.rbln.synchronize(device)
 
             def invoke():
-                output = sampler(work, metadata)
+                output = sampler(work, metadata, input_batch=input_batch)
                 tokens = output.sampled_token_ids.to("cpu")
                 torch.rbln.synchronize(device)
                 return output, tokens
@@ -776,6 +869,14 @@ def main() -> None:
             ]
             result["stage"] = "output_validation"
             validate(output, tokens)
+            result["sampling"]["fused_graphs"] = sorted(
+                {key[0] for key in sampler._fused_graphs}
+            )
+            result["sampling"]["fused_sampling_active"] = bool(sampler._fused_graphs)
+            result["sampling"]["fused_graph_keys"] = [
+                {"kind": kind, "rows": rows, "row_vocab": row_vocab, "k": k}
+                for kind, rows, row_vocab, k in sampler._fused_graphs
+            ]
             result["stage"] = "warmup"
             with (
                 set_compile_stage("warmup"),

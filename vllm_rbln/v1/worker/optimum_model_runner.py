@@ -81,8 +81,8 @@ from vllm_rbln.model_executor.model_loader.rbln_model_loader import get_optimum_
 from vllm_rbln.model_executor.models.optimum import ModelInputForRBLN
 from vllm_rbln.model_executor.models.optimum.model_base import (
     KVCacheCopyError,
-    RBLNOptimumDecoderMixin,
     RBLNOptimumMultimodalMixin,
+    RBLNOptimumPrefixCacheMixin,
 )
 from vllm_rbln.platform.optimum_impl import patch_upstream
 from vllm_rbln.utils.optimum.bucket import select_bucket_size
@@ -149,7 +149,6 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         self.is_pooling_model = model_config.runner_type == "pooling"
         self.vocab_size = self.model_config.get_vocab_size()
         self.max_model_len = self.model_config.max_model_len
-        self.max_num_tokens = self.scheduler_config.max_num_batched_tokens
         self.max_num_reqs = self.scheduler_config.max_num_seqs
         self.inputs_embeds_size = self.model_config.get_inputs_embeds_size()
 
@@ -169,6 +168,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             sampler = RBLNSampler(
                 logprobs_mode=self.model_config.logprobs_mode,
                 use_fp64_gumbel=False,
+                fused_sampling=rbln_config.use_fused_sampling,
             )
         else:
             logger.info("Using default vLLM sampler.")
@@ -210,7 +210,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         self.input_batch = RBLNInputBatch(
             max_num_reqs=self.max_num_reqs,
             max_model_len=self.max_model_len,
-            max_num_batched_tokens=self.max_num_tokens,
+            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
             device=self.device,
             vocab_size=self.model_config.get_vocab_size(),
             block_sizes=[cache_config.block_size],
@@ -293,7 +293,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         with set_current_vllm_config(self.vllm_config, check_compile=False):
             self.model = get_optimum_model(vllm_config=self.vllm_config)
         if (
-            isinstance(self.model, RBLNOptimumDecoderMixin)
+            isinstance(self.model, RBLNOptimumPrefixCacheMixin)
             and not self.is_ec_producer_only
         ):
             assert self.model.kv_block_adapter is not None
@@ -412,6 +412,11 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
 
         with record_function_or_nullcontext("rbln_model_runner: postprocess"):
             if self.is_pooling_model:
+                # The scheduler counts the whole prompt even on a cache hit.
+                # The pooling cursor indexes only the hidden states we computed.
+                if model_input.is_prompt:
+                    num_scheduled_tokens = model_input.input_tokens.shape[1]
+                    num_scheduled_tokens_np[0] = num_scheduled_tokens
                 output = self._pool(
                     hidden_states, num_scheduled_tokens, num_scheduled_tokens_np
                 )
@@ -436,7 +441,8 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         scheduler_output: "SchedulerOutput",
     ) -> bool:
         if not (
-            model_input.is_prompt and isinstance(self.model, RBLNOptimumDecoderMixin)
+            model_input.is_prompt
+            and isinstance(self.model, RBLNOptimumPrefixCacheMixin)
         ):
             return True
         try:
@@ -928,6 +934,8 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         # and handling the second as a new request.
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
+        if isinstance(self.sampler, RBLNSampler):
+            self.sampler.forget_requests(scheduler_output.finished_req_ids)
 
         # Free cached encoder outputs signalled by the scheduler.
         # Without this, encoder_cache grows unboundedly on the EC consumer
@@ -1168,6 +1176,8 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                 "Skip dummy sampler run since --rbln-use-custom-sampler is disabled"
             )
             return
+        sampler = self.sampler
+        assert isinstance(sampler, RBLNSampler)
 
         def set_sampling_tensors(input_batch, **params):
             input_batch.temperature_cpu_tensor.fill_(params["temperature"])
@@ -1259,7 +1269,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                         input_batch.vocab_size,
                         dtype=self.dtype,
                     )
-                    _ = self.sampler(logits=empty_logits, sampling_metadata=metadata)
+                    sampler.warm_up(logits=empty_logits, sampling_metadata=metadata)
 
                 clear_reqs(input_batch)
 
@@ -1508,7 +1518,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             self.model.model.rbln_config, "use_multiple_decoder", False
         )
         if use_multiple_decoder:
-            self.bucket_sizes = self.model.decoder_batch_sizes
+            self.bucket_sizes = tuple(sorted({1, *self.model.decoder_batch_sizes}))
         else:
             batch_size = self.vllm_config.scheduler_config.max_num_seqs
             self.bucket_sizes = tuple(self.get_bucket_sizes(batch_size))
@@ -1629,9 +1639,13 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         # Update output token ids with tokens sampled in last step
         # if async scheduling and required by current sampling params.
         self.input_batch.update_async_output_token_ids()
+        extra: dict[str, Any] = {}
+        if isinstance(self.sampler, RBLNSampler):
+            extra["input_batch"] = self.input_batch
         return self.sampler(
             logits=logits,
             sampling_metadata=sampling_metadata,
+            **extra,
         )
 
     def postprocess_sampler_output(

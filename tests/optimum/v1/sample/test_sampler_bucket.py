@@ -43,15 +43,16 @@ def make_runner(request):
     compiled decoder_batch_sizes (use_multiple_decoder=True).
     """
 
-    def _make(max_num_seqs, dtype=torch.float32):
+    def _make(max_num_seqs, dtype=torch.float32, **options):
         if request.param == "multiple_decoder":
             decoder_batch_sizes = tuple(b for b in (1, 4, 8) if b <= max_num_seqs)
             return create_model_runner(
                 max_num_seqs=max_num_seqs,
                 dtype=dtype,
                 decoder_batch_sizes=decoder_batch_sizes,
+                **options,
             )
-        return create_model_runner(max_num_seqs=max_num_seqs, dtype=dtype)
+        return create_model_runner(max_num_seqs=max_num_seqs, dtype=dtype, **options)
 
     return _make
 
@@ -152,6 +153,13 @@ def test_get_bucket_sizes(monkeypatch, num_seqs: int, expected_bucket_sizes: lis
     bucket_sizes = runner.get_bucket_sizes(num_seqs)
     assert bucket_sizes == expected_bucket_sizes
     assert len(runner.pooled_tensors) == len(expected_bucket_sizes)
+
+
+def test_multiple_decoder_buckets_include_batch_one():
+    """A single request samples unpadded, so warm-up must cover batch 1."""
+    runner = create_model_runner(max_num_seqs=8, decoder_batch_sizes=(8, 4))
+    assert runner.bucket_sizes == (1, 4, 8)
+    assert set(runner.pooled_tensors) == {1, 4, 8}
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
@@ -408,6 +416,47 @@ def test_mixed_sampling_params_with_padded_bucket(make_runner, dtype):
         output = _decode(runner, reqs)
         _assert_padded_bucket(runner, num_live=3)
         assert _sampled_by_req(output) == expected
+
+
+@pytest.mark.parametrize("fused", [False, True], ids=["unfused", "fused"])
+def test_penalties_and_logit_bias_with_padded_bucket(make_runner, fused):
+    """Fused and unfused sampling pick the same tokens for a batch that mixes
+    penalties and logit_bias per request, padding rows included."""
+    # opt-125m's vocab is not a multiple of 2 * CHUNK, which fused sampling needs.
+    runner = make_runner(4, vocab_size=50304, use_fused_sampling=fused)
+    _rig_forward(runner, {TOP_TOKEN_ID: 10.0, RUNNER_UP_TOKEN_ID: 9.5}, base=-10.0)
+
+    reqs = [
+        make_request("rep", [1, 2, 3], temperature=0.0, repetition_penalty=2.0),
+        make_request(
+            "bias", [1, 2, 3], temperature=0.0, logit_bias={TOP_TOKEN_ID: -100.0}
+        ),
+        make_request(
+            "freq_pres",
+            [1, 2, 3],
+            temperature=0.0,
+            frequency_penalty=1.0,
+            presence_penalty=1.0,
+        ),
+    ]
+    sampled: dict[str, list[int]] = {req.request_id: [] for req in reqs}
+    for i, req in enumerate(reqs):
+        sampled[req.request_id] += _prefill(runner, req, i).sampled_token_ids[0]
+    for _ in range(3):
+        output = _decode(runner, reqs)
+        _assert_padded_bucket(runner, num_live=3)
+        for req_id, token in _sampled_by_req(output).items():
+            sampled[req_id].append(token)
+
+    top, runner_up = TOP_TOKEN_ID, RUNNER_UP_TOKEN_ID
+    assert sampled == {
+        # 10 / 2 = 5 drops TOP under 9.5 once; then 5 beats 9.5 / 2.
+        "rep": [top, runner_up, top, top],
+        "bias": [runner_up] * 4,
+        # Each pick costs its token 1 (presence) + 1 per use (frequency).
+        "freq_pres": [top, runner_up, top, runner_up],
+    }
+    assert bool(runner.sampler._fused_graphs) is fused
 
 
 def test_logprobs_with_padded_bucket(make_runner):

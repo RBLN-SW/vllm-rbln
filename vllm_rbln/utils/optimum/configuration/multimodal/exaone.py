@@ -19,7 +19,7 @@ def build_exaone4_5_config(
     max_model_len: int,
     block_size: int,
     num_devices: int,
-    memory_budget: float,
+    kv_cache_capacity_fields: dict[str, int | float],
     prefill_chunk_size: int | None = None,
 ) -> dict:
     rbln_config: dict = {
@@ -27,7 +27,7 @@ def build_exaone4_5_config(
         "max_seq_len": max_model_len,
         "batch_size": batch_size,
         "use_inputs_embeds": True,
-        "memory_budget": memory_budget,
+        **kv_cache_capacity_fields,
     }
     if block_size != max_model_len:
         attn_impl = "flash_attn" if block_size != max_model_len else "eager"

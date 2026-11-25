@@ -23,6 +23,7 @@ Those tests pin the RBLN detour, so do not resolve a divergence from upstream by
 deleting them."""
 
 from contextlib import nullcontext
+from functools import partial
 from types import SimpleNamespace
 from unittest import mock
 
@@ -35,7 +36,7 @@ import vllm_rbln.v1.spec_decode.eagle as eagle_module
 from tests.vllm.v1.spec_decode.utils import make_cad, make_eagle_proposer
 from vllm_rbln.v1.worker.dp_utils import DPStatus, ShapeConfig
 
-pytestmark = pytest.mark.maybe_use_device
+pytestmark = pytest.mark.use_device
 
 
 def _shape_config(*, specialized=False, max_num_tokens=64):
@@ -55,10 +56,6 @@ def _neutralize(monkeypatch):
     monkeypatch.setattr(
         eagle_module, "set_forward_context", lambda *a, **k: nullcontext()
     )
-    monkeypatch.setattr(eagle_module, "attach_kv_cache_bindings", lambda *a, **k: None)
-    monkeypatch.setattr(
-        eagle_module, "build_kv_cache_forward_context_kwargs", lambda *a, **k: {}
-    )
 
 
 def _wire_runner(
@@ -70,9 +67,8 @@ def _wire_runner(
         is_intermediate_chunked_prefill=intermediate_chunk,
         is_strict_kv_producer=strict_kv_producer,
         input_batch=SimpleNamespace(num_reqs=num_reqs),
-        kv_caches=[],
-        kv_cache_bases=[],
-        kv_cache_view_infos=[],
+        bind_kv_cache_to_metadata=lambda metadata: None,
+        kv_cache_forward_context_kwargs=dict,
         shape_config=_shape_config(),
         dp_status=None,
         decode_back_pad=torch.zeros(num_reqs, dtype=torch.int32),
@@ -299,6 +295,16 @@ class TestInitGuards:
         proposer = make_eagle_proposer()
         assert proposer.supports_mm_inputs
 
+    def test_an_mrope_draft_keeps_one_row_of_positions(self, monkeypatch):
+        from vllm.config import ModelConfig
+
+        # Upstream allocates the M-RoPE rows only for such a draft (Qwen3.5's
+        # MTP head); a text-only draft step reads one row.
+        monkeypatch.setattr(ModelConfig, "uses_mrope", property(lambda self: True))
+        monkeypatch.setattr(ModelConfig, "mrope_num_dims", property(lambda self: 3))
+        proposer = make_eagle_proposer()
+        assert proposer.positions.shape == (proposer.max_positions,)
+
     def test_rejects_extra_input_slots(self, monkeypatch):
         # Parallel drafting / draft-model spec decode needs input slots the
         # staged drafter inputs have no room for; construction, not the first
@@ -372,6 +378,92 @@ class TestToTargetTokenIds:
 
 
 class TestPropose:
+    def test_prefill_passes_multimodal_rows_and_zeroes_the_padded_mask(
+        self, monkeypatch
+    ):
+        _neutralize(monkeypatch)
+        proposer = make_eagle_proposer(num_speculative_tokens=1)
+        _wire_runner(proposer, num_reqs=1)
+        proposer.runner.is_prefill = True
+        proposer.supports_mm_inputs = True
+        calls = []
+
+        def execute(**kwargs):
+            calls.append(kwargs)
+            return kwargs["hidden_states"], torch.zeros(1, dtype=torch.long)
+
+        proposer.model_executable = execute
+        rows = torch.full((1, proposer.inputs_embeds_size), 42.0, dtype=proposer.dtype)
+        proposer.propose(
+            target_token_ids=torch.tensor([10, 11, 12], dtype=torch.int32),
+            target_positions=torch.arange(3),
+            target_hidden_states=torch.zeros(3, proposer.hidden_size),
+            next_token_ids=torch.tensor([13], dtype=torch.int32),
+            token_indices_to_sample=torch.tensor([2], dtype=torch.int32),
+            common_attn_metadata=make_cad([0, 3], [3]),
+            mm_embed_inputs=(
+                [(0, 1, rows)],
+                torch.tensor([[0], [1], [0]], dtype=proposer.dtype),
+            ),
+        )
+
+        mask = calls[0]["mm_mask"].cpu()
+        embeds = calls[0]["mm_embeds"].cpu()
+        assert mask[0, :3, 0].tolist() == [0, 1, 0]
+        assert not mask[0, 3:].any()
+        torch.testing.assert_close(embeds[0, 1], rows[0])
+
+    def test_mrope_and_cache_positions_advance_independently(self, monkeypatch):
+        _neutralize(monkeypatch)
+        proposer = make_eagle_proposer(num_speculative_tokens=3)
+        _wire_runner(proposer, num_reqs=2)
+        proposer.supports_mm_inputs = True
+        proposer.uses_mrope = True
+        proposer.max_model_len = 200
+        model_positions = []
+        cache_positions = []
+        echo = _echo_model_exec(proposer.hidden_size)
+
+        def execute(**kwargs):
+            model_positions.append(kwargs["positions"].cpu().clone())
+            return echo(**kwargs)
+
+        def build(**kwargs):
+            cache_positions.append(kwargs["positions"].clone())
+            return object()
+
+        proposer.model_executable = execute
+        proposer.draft_attn_groups[0].get_metadata_builder = lambda: SimpleNamespace(
+            build=build
+        )
+        cad = make_cad([0, 2, 4], [100, 200])
+        mrope = torch.tensor(
+            [[10, 11, 30, 31], [110, 111, 130, 131], [210, 211, 230, 231]]
+        )
+        proposer.propose(
+            target_token_ids=torch.tensor([10, 11, 20, 21], dtype=torch.int32),
+            target_positions=torch.tensor([98, 99, 198, 199]),
+            target_mrope_positions=mrope,
+            target_hidden_states=torch.zeros(4, proposer.hidden_size),
+            next_token_ids=torch.tensor([50, 60], dtype=torch.int32),
+            token_indices_to_sample=torch.tensor([1, 3], dtype=torch.int32),
+            common_attn_metadata=cad,
+        )
+
+        torch.testing.assert_close(model_positions[0], mrope.view(3, 2, 2))
+        torch.testing.assert_close(
+            model_positions[1], torch.tensor([12, 32]).view(1, 2, 1).expand(3, -1, -1)
+        )
+        torch.testing.assert_close(
+            model_positions[2], torch.tensor([13, 33]).view(1, 2, 1).expand(3, -1, -1)
+        )
+        assert [p.tolist() for p in cache_positions] == [
+            [98, 99, 198, 199],
+            [100, 200],
+            [101, 201],
+        ]
+        assert cad.seq_lens.tolist() == [102, 1]
+
     @pytest.mark.parametrize("is_prompt_sorted", [False, True])
     def test_prompt_sorting_reaches_every_draft_step(
         self, monkeypatch, is_prompt_sorted
@@ -629,6 +721,101 @@ class TestPropose:
 
 
 class TestLoadModel:
+    def test_wrapper_keeps_the_assistants_hidden_width(self, monkeypatch):
+        proposer = make_eagle_proposer(num_speculative_tokens=1)
+        width = proposer.hidden_size // 2
+
+        class Assistant(torch.nn.Module):
+            def forward(self, *, input_ids, positions, hidden_states, inputs_embeds):
+                return hidden_states[:, :width].contiguous(), hidden_states + 1
+
+            def compute_logits(self, hidden_states):
+                assert hidden_states.shape == (2, width)
+                return hidden_states
+
+        self._stub_super_load_model(monkeypatch, Assistant())
+        monkeypatch.setattr(proposer, "model_returns_tuple", lambda: True)
+        monkeypatch.setattr(proposer, "_compile_drafter", lambda fn: fn)
+        proposer.load_model(target_model=object())
+        hidden = torch.zeros(4, proposer.hidden_size)
+        hidden[torch.arange(4), torch.arange(4) + 1] = 1
+        output, ids = proposer.model_executable(
+            input_ids=torch.zeros(4, dtype=torch.int32),
+            positions=torch.arange(4),
+            hidden_states=hidden,
+            token_indices_to_sample=torch.tensor([0, 2]),
+        )
+        torch.testing.assert_close(output, hidden[[0, 2]] + 1)
+        assert ids.tolist() == [1, 3]
+
+    @pytest.mark.parametrize("pp_size", [1, 2])
+    def test_multimodal_wrapper_accepts_an_opted_in_draft(self, monkeypatch, pp_size):
+        class Draft(torch.nn.Module):
+            supports_multimodal_embeddings = True
+            supports_rbln_multimodal_embeddings = True
+
+            def __init__(self):
+                torch.nn.Module.__init__(self)
+                self.seen = None
+
+            def embed_input_ids(self, input_ids):
+                return input_ids[..., None].float().expand(-1, -1, 4)
+
+            def __call__(self, *, input_ids, positions, hidden_states, inputs_embeds):
+                assert input_ids is None
+                self.seen = inputs_embeds.clone()
+                return inputs_embeds
+
+            def compute_logits(self, hidden_states):
+                return hidden_states
+
+        draft = Draft()
+        self._stub_super_load_model(monkeypatch, draft)
+        proposer = make_eagle_proposer(num_speculative_tokens=1)
+        proposer.supports_mm_inputs = True
+        proposer.hidden_size = 4
+        monkeypatch.setattr(proposer, "model_returns_tuple", lambda: False)
+        monkeypatch.setattr(proposer, "_compile_drafter", lambda fn: fn)
+        monkeypatch.setattr(
+            proposer.vllm_config.parallel_config, "pipeline_parallel_size", pp_size
+        )
+        if pp_size != 1:
+            with pytest.raises(NotImplementedError, match="pipeline_parallel_size=1"):
+                proposer.load_model(target_model=object())
+            return
+        proposer.load_model(target_model=object())
+        embeds = torch.full((1, 3, 4), 99.0)
+        proposer.model_executable(
+            input_ids=torch.tensor([[1, 2, 3]], dtype=torch.int32),
+            positions=torch.zeros(3, 1, 3, dtype=torch.long),
+            hidden_states=torch.zeros(1, 3, 4),
+            mm_embeds=embeds,
+            mm_mask=torch.tensor([[[0.0], [1.0], [0.0]]]),
+        )
+        torch.testing.assert_close(
+            draft.seen, torch.tensor([[[1.0] * 4, [99.0] * 4, [3.0] * 4]])
+        )
+
+    def test_an_rbln_target_goes_by_its_upstream_class_name(self):
+        # Upstream's load_model picks the target's image-token field by class
+        # name and lists upstream classes only, so the RBLN subclass of a listed
+        # class has to answer with its parent's name.
+        from vllm.model_executor.models.qwen3_5 import (
+            Qwen3_5ForConditionalGeneration,
+        )
+
+        from vllm_rbln.model_executor.models.qwen3_5 import (
+            RBLNQwen3_5ForConditionalGeneration,
+        )
+
+        target = RBLNQwen3_5ForConditionalGeneration.__new__(
+            RBLNQwen3_5ForConditionalGeneration
+        )
+        proposer = make_eagle_proposer()
+        assert (
+            proposer.get_model_name(target) == Qwen3_5ForConditionalGeneration.__name__
+        )
+
     @pytest.mark.parametrize("draft_needs_mm_inputs", [False, True])
     def test_multimodal_guard_uses_loaded_draft_capability(
         self, monkeypatch, draft_needs_mm_inputs
@@ -645,9 +832,9 @@ class TestLoadModel:
             ModelConfig, "supports_multimodal_inputs", property(lambda self: True)
         )
         proposer = make_eagle_proposer()
-        monkeypatch.setattr(
-            proposer.vllm_config.speculative_config, "enforce_eager", True
-        )
+        monkeypatch.setattr(eagle_module, "compile", lambda fn, **kwargs: fn)
+        monkeypatch.setattr(eagle_module, "build_process_group_dict", lambda: {})
+        proposer.runner = SimpleNamespace(compile_context=None, runtime_holder=None)
 
         def load_draft(self, target_model):
             assert self.supports_mm_inputs
@@ -720,9 +907,9 @@ class TestLoadModel:
         # is what lets an idle rank skip drafting altogether.
         self._stub_super_load_model(monkeypatch)
         proposer = make_eagle_proposer(num_speculative_tokens=1)
-        monkeypatch.setattr(
-            proposer.vllm_config.speculative_config, "enforce_eager", True
-        )
+        monkeypatch.setattr(eagle_module, "compile", lambda fn, **kwargs: fn)
+        monkeypatch.setattr(eagle_module, "build_process_group_dict", lambda: {})
+        proposer.runner = SimpleNamespace(compile_context=None, runtime_holder=None)
         proposer.load_model(target_model=object())
         assert proposer.draft_has_moe is False
 
@@ -733,23 +920,13 @@ class TestLoadModel:
         moe = mock.Mock(spec=eagle_module.MoERunner)
         self._stub_super_load_model(monkeypatch, modules=(object(), moe))
         proposer = make_eagle_proposer(num_speculative_tokens=1)
-        monkeypatch.setattr(
-            proposer.vllm_config.speculative_config, "enforce_eager", True
-        )
+        monkeypatch.setattr(eagle_module, "compile", lambda fn, **kwargs: fn)
+        monkeypatch.setattr(eagle_module, "build_process_group_dict", lambda: {})
+        proposer.runner = SimpleNamespace(compile_context=None, runtime_holder=None)
         proposer.load_model(target_model=object())
         assert proposer.draft_has_moe is True
 
-    def test_eager_wrapper_when_enforce_eager(self, monkeypatch):
-        self._stub_super_load_model(monkeypatch)
-        proposer = make_eagle_proposer(num_speculative_tokens=1)
-        monkeypatch.setattr(
-            proposer.vllm_config.speculative_config, "enforce_eager", True
-        )
-        proposer.load_model(target_model=object())
-        # eager path leaves the executable as the uncompiled wrapper closure.
-        assert proposer.model_executable.__name__ == "model_wrapper"
-
-    def test_compiles_wrapper_when_not_eager(self, monkeypatch):
+    def test_compiles_wrapper(self, monkeypatch):
         self._stub_super_load_model(monkeypatch)
         sentinel = object()
         captured: dict = {}
@@ -758,9 +935,6 @@ class TestLoadModel:
         )
         monkeypatch.setattr(eagle_module, "build_process_group_dict", lambda: {})
         proposer = make_eagle_proposer(num_speculative_tokens=1)
-        monkeypatch.setattr(
-            proposer.vllm_config.speculative_config, "enforce_eager", False
-        )
         proposer.runner = SimpleNamespace(
             compile_context=object(), runtime_holder=[None]
         )
@@ -770,8 +944,8 @@ class TestLoadModel:
         assert captured["fullgraph"] is True
         assert "compile_context" in captured
 
-    def test_eager_wrapper_composes_model_forward(self, monkeypatch):
-        # The eager wrapper runs the draft model, reshapes the hidden states,
+    def test_wrapper_composes_model_forward(self, monkeypatch):
+        # The wrapper runs the draft model, reshapes the hidden states,
         # keeps the sampled positions, and returns (hidden, in-graph argmax).
         from vllm.v1.spec_decode.eagle import EagleProposer
 
@@ -792,9 +966,9 @@ class TestLoadModel:
         )
         proposer = make_eagle_proposer(num_speculative_tokens=1)
         monkeypatch.setattr(proposer, "model_returns_tuple", lambda: False)
-        monkeypatch.setattr(
-            proposer.vllm_config.speculative_config, "enforce_eager", True
-        )
+        monkeypatch.setattr(eagle_module, "compile", lambda fn, **kwargs: fn)
+        monkeypatch.setattr(eagle_module, "build_process_group_dict", lambda: {})
+        proposer.runner = SimpleNamespace(compile_context=None, runtime_holder=None)
         proposer.load_model(target_model=object())
 
         h = proposer.hidden_size
@@ -823,9 +997,9 @@ class TestLoadModel:
         d2t = torch.tensor([0, 2, 3], dtype=torch.long, device=proposer.device)
         model = self._FakeMappedDraft(d2t)
         self._stub_super_load_model(monkeypatch, model)
-        monkeypatch.setattr(
-            proposer.vllm_config.speculative_config, "enforce_eager", True
-        )
+        monkeypatch.setattr(eagle_module, "compile", lambda fn, **kwargs: fn)
+        monkeypatch.setattr(eagle_module, "build_process_group_dict", lambda: {})
+        proposer.runner = SimpleNamespace(compile_context=None, runtime_holder=None)
         proposer.load_model(target_model=object())
 
         # Taking that branch at all depends on load_model lifting d2t off the
@@ -857,6 +1031,30 @@ class TestLoadModel:
 
 
 class TestDummyRun:
+    def test_multimodal_prefill_warms_the_mask_and_three_position_rows(
+        self, monkeypatch
+    ):
+        proposer, _ = self._proposer(monkeypatch, num_spec=1)
+        proposer.supports_mm_inputs = True
+        proposer.uses_mrope = True
+        proposer.mrope_positions = torch.zeros(
+            3, proposer.max_positions + 1, dtype=torch.long
+        )
+        calls = []
+
+        def execute(**kwargs):
+            calls.append(kwargs)
+            return kwargs["hidden_states"], torch.zeros(1, dtype=torch.long)
+
+        proposer.model_executable = execute
+        proposer.dummy_run(1, 4, True)
+        assert calls[0]["positions"].shape == (3, *calls[0]["input_ids"].shape)
+        assert calls[0]["mm_embeds"].shape == (
+            *calls[0]["input_ids"].shape,
+            proposer.inputs_embeds_size,
+        )
+        assert not calls[0]["mm_mask"].any()
+
     @staticmethod
     def _proposer(
         monkeypatch,
@@ -886,9 +1084,8 @@ class TestDummyRun:
                     )
                 ],
             ),
-            kv_caches=[],
-            kv_cache_bases=[],
-            kv_cache_view_infos=[],
+            bind_kv_cache_to_metadata=lambda metadata: None,
+            kv_cache_forward_context_kwargs=dict,
             shape_config=_shape_config(specialized=specialized),
             dp_status=dp_status,
             sort_batch_by_length=False,
@@ -1080,3 +1277,133 @@ class TestBuildDummyAttnMetadata:
         )
         cad = proposer._build_dummy_attn_metadata(num_reqs=3, num_tokens_per_req=2)
         assert cad.block_table_tensor.shape == (3, 128)
+
+
+class TestGemma4Drafting:
+    def test_loading_prepares_the_assistant_mlp_for_its_patched_forward(
+        self, monkeypatch
+    ):
+        from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+        from vllm.model_executor.models.gemma4 import Gemma4MLP
+
+        from vllm_rbln.v1.spec_decode import gemma4 as gemma4_module
+
+        base = make_eagle_proposer()
+        proposer = gemma4_module.RBLNGemma4Proposer(base.vllm_config, base.device, None)
+        mlp = Gemma4MLP.__new__(Gemma4MLP)
+        torch.nn.Module.__init__(mlp)
+        mlp.gate_up_proj = torch.nn.Module()
+        weight = torch.arange(64, dtype=torch.float32).view(16, 4)
+        mlp.gate_up_proj.weight = torch.nn.Parameter(weight)
+        mlp.gate_up_proj.quant_method = UnquantizedLinearMethod()
+        monkeypatch.setattr(gemma4_module, "get_layers_from_vllm_config", lambda *a: {})
+        monkeypatch.setattr(proposer, "_setup_gemma4_kv_sharing", lambda *a: None)
+        monkeypatch.setattr(proposer, "_compile_drafter", lambda fn: fn)
+        monkeypatch.setattr(
+            eagle_module.RBLNEagleProposer,
+            "load_model",
+            lambda self, target: setattr(self, "model", mlp),
+        )
+        proposer.load_model(torch.nn.Identity())
+        torch.testing.assert_close(mlp.gate_weight, weight[:8])
+        torch.testing.assert_close(mlp.up_weight, weight[8:])
+
+    @pytest.mark.parametrize(
+        "strict_producer, intermediate", [(False, False), (True, False), (False, True)]
+    )
+    def test_steps_keep_positions_and_feed_back_tokens_and_hidden_states(
+        self, monkeypatch, strict_producer, intermediate
+    ):
+        from vllm_rbln.v1.spec_decode import gemma4 as gemma4_module
+
+        base = make_eagle_proposer(num_speculative_tokens=3)
+        proposer = gemma4_module.RBLNGemma4Proposer(base.vllm_config, base.device, None)
+        _wire_runner(
+            proposer,
+            num_reqs=2,
+            intermediate_chunk=intermediate,
+            strict_kv_producer=strict_producer,
+        )
+        monkeypatch.setattr(
+            gemma4_module, "set_forward_context", lambda *a, **k: nullcontext()
+        )
+        monkeypatch.setattr(proposer, "_build_draft_step", lambda n, p: ({}, n, {}))
+        seen = []
+
+        class Assistant(torch.nn.Module):
+            # Samples id + 1 and advances the hidden state by one per step.
+            def forward(self, *, input_ids, positions, hidden_states, inputs_embeds):
+                seen.append((positions.clone(), hidden_states.clone()))
+                return input_ids.float().view(-1, 1), hidden_states + 1
+
+            def compute_logits(self, sample_hidden_states):
+                ids = sample_hidden_states.view(-1).long() + 1
+                return torch.nn.functional.one_hot(ids, 64).float()
+
+        # The draft graph itself, run eagerly: one call feeds every step forward.
+        monkeypatch.setattr(gemma4_module, "get_layers_from_vllm_config", lambda *a: {})
+        monkeypatch.setattr(proposer, "_setup_gemma4_kv_sharing", lambda *a: None)
+        monkeypatch.setattr(proposer, "_compile_drafter", lambda fn: fn)
+        monkeypatch.setattr(
+            eagle_module.RBLNEagleProposer,
+            "load_model",
+            lambda self, target: setattr(self, "model", Assistant()),
+        )
+        proposer.load_model(torch.nn.Identity())
+        result = _call_propose(proposer)
+        if strict_producer or intermediate:
+            assert seen == []
+            assert result.tolist() == [[0, 0, 0], [0, 0, 0]]
+        else:
+            assert result.tolist() == [[31, 32, 33], [32, 33, 34]]
+            for step, (positions, hidden) in enumerate(seen):
+                assert positions.flatten().tolist() == [1, 3]
+                torch.testing.assert_close(hidden, torch.full_like(hidden, step))
+
+    # Window 8 over blocks of 4: not yet full, starting mid-block, starting on
+    # a block boundary.
+    @pytest.mark.parametrize("position", [3, 10, 11])
+    def test_sliding_mask_keeps_the_oldest_key_at_a_block_boundary(self, position):
+        from tests.vllm.v1.attention.utils import make_attention_spec, make_builder
+        from tests.vllm.vllm_config import make_vllm_config
+        from vllm_rbln.v1.spec_decode import gemma4 as gemma4_module
+        from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
+
+        base = make_eagle_proposer()
+        proposer = gemma4_module.RBLNGemma4Proposer(base.vllm_config, base.device, None)
+        _wire_runner(proposer, num_reqs=1)
+        proposer.max_model_len = 32
+        cfg = make_vllm_config(max_model_len=32, max_num_batched_tokens=8)
+        builder = make_builder(
+            cfg, spec=make_attention_spec(block_size=4, sliding_window=8)
+        )
+        block_size = builder.block_size
+        table = torch.arange((32 + block_size - 1) // block_size).view(1, -1)
+        proposer.runner.input_batch.block_table = [
+            SimpleNamespace(get_cpu_tensor=lambda: table)
+        ]
+        proposer.draft_attn_groups = [
+            SimpleNamespace(
+                get_metadata_builder=lambda: builder,
+                kv_cache_group_id=0,
+                layer_names=["draft.layer"],
+            )
+        ]
+        runner = proposer.runner
+        runner.kv_caches = [torch.empty(0)]
+        runner.kv_cache_bases = []
+        runner.kv_cache_view_infos = []
+        runner.kv_cache_positions = {"draft.layer": 0}
+        runner.bind_kv_cache_to_metadata = partial(
+            RBLNModelRunner.bind_kv_cache_to_metadata, runner
+        )
+        metadata, _, _ = proposer._build_draft_step(1, torch.tensor([position]))
+        md = metadata["draft.layer"]
+        assert md.kv_caches[md.kv_cache_positions["draft.layer"]] is runner.kv_caches[0]
+        assert md.seq_lens.flatten().tolist() == [position + 1]
+        first_key = max(position - 7, 0) // block_size * block_size
+        visible = md.attn_masks.flatten().nonzero().flatten() + first_key
+        assert visible.tolist() == list(range(max(position - 7, 0), position + 1))
+        assert (
+            md.attn_masks.numel() == ((8 + block_size) // block_size + 1) * block_size
+        )

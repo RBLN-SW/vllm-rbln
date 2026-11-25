@@ -104,35 +104,19 @@ from vllm.v1.kv_cache_interface import (
 
 import vllm_rbln.utils as rbln_utils
 from vllm_rbln.model_executor.models.interfaces import SupportsRBLNMultiModal
-from vllm_rbln.patches.attention import _resolve_kv_cache
 from vllm_rbln.v1.attention.backends.flash_attention import _fp8_cache_dtype
 from vllm_rbln.v1.attention.backends.minimax_m3 import (
     MSA_SPARSE_BLOCK_SIZE,
     RBLNMiniMaxM3IndexerBackend,
     RBLNMiniMaxM3SparseBackend,
 )
+from vllm_rbln.v1.attention.kv_cache_bindings import resolve_kv_cache
+from vllm_rbln.v1.kv_cache import register_kv_cache
 from vllm_rbln.v1.spec_decode.eagle3_pp import (
     AUX_COMBINED,
     aux_slots_captured,
     aux_slots_received,
 )
-from vllm_rbln.v1.worker.utils import (
-    num_attn_module as rbln_num_attn_module,
-)
-from vllm_rbln.v1.worker.utils import (
-    pipeline_adjusted_layer_index,
-)
-
-
-def _layer_index_of(prefix: str) -> int:
-    vllm_config = get_current_vllm_config()
-    model_config = vllm_config.model_config
-    num_attn_module = rbln_num_attn_module(
-        model_config, vllm_config.cache_config.cache_dtype
-    )
-    return pipeline_adjusted_layer_index(
-        prefix, model_config, vllm_config.parallel_config, num_attn_module
-    )
 
 
 def _per_head_norm(
@@ -385,11 +369,8 @@ class RBLNMiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
         )
         self.prefix = prefix
         self.cache_config = cache_config
-        compilation_config = vllm_config.compilation_config
-        if prefix in compilation_config.static_forward_context:
-            raise ValueError(f"Duplicate layer name: {prefix}")
-        compilation_config.static_forward_context[prefix] = self
-        self.layer_index = _layer_index_of(prefix)
+        context = vllm_config.compilation_config.static_forward_context
+        register_kv_cache(context, prefix, self)
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         # Key-only: MLAAttentionSpec budgets one vector per token (not K + V).
@@ -519,7 +500,6 @@ class RBLNMiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             raise ValueError(f"Duplicate layer name: {self.layer_name}")
         compilation_config.static_forward_context[self.layer_name] = self
         self.kv_cache = torch.tensor([])  # replaced by the runner's bind
-        self.layer_index = _layer_index_of(self.layer_name)
 
         self.indexer_cache = RBLNMiniMaxM3IndexerCache(
             head_dim=self.idx_head_dim,
@@ -589,8 +569,8 @@ class RBLNMiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             index_metadata = attn_metadata[self.indexer_cache.prefix]
         else:
             main_metadata = index_metadata = attn_metadata
-        kv_cache = _resolve_kv_cache(main_metadata, self.layer_index)
-        index_cache = _resolve_kv_cache(index_metadata, self.indexer_cache.layer_index)
+        kv_cache = resolve_kv_cache(main_metadata, self.layer_name)
+        index_cache = resolve_kv_cache(index_metadata, self.indexer_cache.prefix)
 
         q5 = q.view(batch, seq_len, num_heads, head_dim).transpose(1, 2)
         q5 = q5.view(batch, num_kv, groups, seq_len, head_dim)
@@ -1105,6 +1085,32 @@ class _RBLNMiniMaxM3VLMultiModalProcessor(MiniMaxM3VLMultiModalProcessor):
         return outputs
 
 
+class _RBLNMiniMaxM3VisionBlock(nn.Module):
+    def __init__(self, layer, num_heads, head_dim) -> None:
+        super().__init__()
+        self.layer = layer
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+
+    @torch.compiler.nested_compile_region
+    def forward(self, hidden, cos, sin, key_bias, rot):
+        n = hidden.shape[0]
+        layer, attn = self.layer, self.layer.self_attn
+        qkv, _ = attn.qkv_proj(layer.layer_norm1(hidden))
+        qkv = qkv.view(n, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
+        q = q * cos + torch.matmul(q, rot) * sin
+        k = k * cos + torch.matmul(k, rot) * sin
+        q, k, v = q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1)
+        scores = torch.matmul(q, k.transpose(1, 2)) * self.head_dim**-0.5 + key_bias[0]
+        out = torch.matmul(torch.softmax(scores, dim=-1), v)
+        out, _ = attn.out_proj(out.transpose(0, 1).reshape(n, -1))
+        hidden = hidden + out
+        mlp, _ = layer.fc1(layer.layer_norm2(hidden))
+        mlp, _ = layer.fc2(layer.act(mlp))
+        return hidden + mlp
+
+
 class _RBLNVisionEncoder(nn.Module):
     def __init__(self, tower: nn.Module, out_dtype: torch.dtype):
         super().__init__()
@@ -1114,6 +1120,10 @@ class _RBLNVisionEncoder(nn.Module):
         self.out_dtype = out_dtype
         self.num_heads = attn.num_heads_per_partition
         self.head_dim = attn.head_dim
+        self.blocks = nn.ModuleList(
+            _RBLNMiniMaxM3VisionBlock(layer, self.num_heads, self.head_dim)
+            for layer in vm.encoder.layers
+        )
         w = vm.embeddings.patch_embedding.weight
         self.patch_weight = w.reshape(w.shape[0], -1)
         half = (vm.t_dim + vm.h_dim + vm.w_dim) // 2
@@ -1131,26 +1141,11 @@ class _RBLNVisionEncoder(nn.Module):
         key_bias: torch.Tensor,
     ) -> torch.Tensor:
         vm = self.tower.vision_model
-        n = pixel_values.shape[0]
         hidden = vm.pre_layrnorm(F.linear(pixel_values, self.patch_weight))
         cos = cos.unsqueeze(1)
         sin = sin.unsqueeze(1)
-        scale = self.head_dim**-0.5
-        for layer in vm.encoder.layers:
-            attn = layer.self_attn
-            qkv, _ = attn.qkv_proj(layer.layer_norm1(hidden))
-            qkv = qkv.view(n, 3, self.num_heads, self.head_dim)
-            q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]  # [N, heads, D]
-            q = q * cos + torch.matmul(q, self.rot) * sin
-            k = k * cos + torch.matmul(k, self.rot) * sin
-            q, k, v = q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1)
-            scores = torch.matmul(q, k.transpose(1, 2)) * scale + key_bias[0]
-            out = torch.matmul(torch.softmax(scores, dim=-1), v)
-            out, _ = attn.out_proj(out.transpose(0, 1).reshape(n, -1))
-            hidden = hidden + out
-            mlp, _ = layer.fc1(layer.layer_norm2(hidden))
-            mlp, _ = layer.fc2(layer.act(mlp))
-            hidden = hidden + mlp
+        for block in self.blocks:
+            hidden = block(hidden, cos, sin, key_bias, self.rot)
         hidden = self.tower.multi_modal_projector(hidden)
         return self.tower.patch_merge_mlp(hidden).to(self.out_dtype)
 
@@ -1286,7 +1281,7 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
                 )
             self.mm_encoder_patch_buckets = [b * merge**2 for b in budgets]
 
-        object.__setattr__(self, "_mm_encoder", None)
+        self._mm_encoder: rbln_utils.BufferedVisionEncoder | None = None
 
         with self._mark_language_model(vllm_config):
             self.language_model = init_vllm_registered_model(
@@ -1315,46 +1310,74 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         tower = self.vision_tower
         if tower is None:
             return
-        if self._mm_encoder is None:
-            self.compile_mm_encoder(lambda encoder: encoder)
-        assert self._mm_encoder is not None
-        vm = tower.vision_model
-        patch_dim = vm.embeddings.patch_embedding.weight[0].numel()
-        head_dim = vm.encoder.layers[0].self_attn.head_dim
-        device = next(tower.parameters()).device
+        buffered_encoder = self._mm_encoder
+        assert buffered_encoder is not None
         with torch.inference_mode():
-            for bucket in self.mm_encoder_patch_buckets:
-                self._mm_encoder(
-                    torch.zeros(bucket, patch_dim, dtype=tower.dtype, device=device),
-                    torch.ones(bucket, head_dim, dtype=tower.dtype, device=device),
-                    torch.zeros(bucket, head_dim, dtype=tower.dtype, device=device),
-                    torch.zeros(1, 1, 1, bucket, dtype=tower.dtype, device=device),
+            for bucket_size in self.mm_encoder_patch_buckets:
+                # Every entry valid: the warm-up never masks a key.
+                inputs = buffered_encoder.input_buffers.warmup_inputs(
+                    bucket_size, fill_overrides={"key_bias": 0.0}
                 )
+                buffered_encoder.encoder(*inputs)
+
+    def _mm_input_specs(self, bucket_size: int) -> list[rbln_utils.EncoderInput]:
+        tower = self.vision_tower
+        assert tower is not None
+        vm = tower.vision_model
+        patch_dim = math.prod(vm.embeddings.patch_embedding.weight.shape[1:])
+        head_dim = vm.encoder.layers[0].self_attn.head_dim
+        return [
+            rbln_utils.EncoderInput(
+                "pixel_values",
+                (bucket_size, patch_dim),
+                axis=0,
+                pad=0.0,
+                use_registered_host_buffer=True,
+            ),
+            rbln_utils.EncoderInput("cos", (bucket_size, head_dim), axis=0, pad=1.0),
+            rbln_utils.EncoderInput("sin", (bucket_size, head_dim), axis=0, pad=0.0),
+            rbln_utils.EncoderInput(
+                "key_bias",
+                (1, 1, 1, bucket_size),
+                axis=3,
+                pad=-30000.0,
+                allow_prefix_copy=False,
+            ),
+        ]
 
     def compile_mm_encoder(self, compile_fn) -> None:
         # Non-first PP ranks and zero image/video limits own no vision tower.
         if self.vision_tower is None:
             return
         encoder = _RBLNVisionEncoder(self.vision_tower, self.mm_embeds_dtype).eval()
-        object.__setattr__(self, "_mm_encoder", compile_fn(encoder))
+        self._mm_encoder = rbln_utils.BufferedVisionEncoder(
+            compile_fn(encoder),
+            specs_by_bucket={
+                size: self._mm_input_specs(size)
+                for size in self.mm_encoder_patch_buckets
+            },
+            device=next(self.vision_tower.parameters()).device,
+            dtype=self.vision_tower.dtype,
+        )
 
     def _encoder_inputs(
-        self, pixel_values: torch.Tensor, grid_thw: list[int], modality: str
+        self,
+        buffered_encoder: rbln_utils.BufferedVisionEncoder,
+        pixel_values: torch.Tensor,
+        grid_thw: list[int],
+        modality: str,
     ) -> list[torch.Tensor]:
-        """Pad an image or a video segment to the bucket, and build its host
-        3D-RoPE and key mask."""
+        """Stage patches and host-built attention inputs for one image or segment.
+
+        See EncoderInputBuffers for the lifetime of the returned tensors.
+        """
         tower = self.vision_tower
         assert tower is not None
         vm = tower.vision_model
         num_patches = math.prod(grid_thw)
         fits = [b for b in self.mm_encoder_patch_buckets if b >= num_patches]
         assert fits, f"a {modality} of {num_patches} patches (grid {grid_thw})"
-        bucket = fits[0]
-        dtype = tower.dtype
-        device = next(tower.parameters()).device
-        patch_dim = vm.embeddings.patch_embedding.weight[0].numel()
-        padded = torch.zeros(bucket, patch_dim, dtype=dtype)
-        padded[:num_patches] = pixel_values.to(dtype)
+        bucket_size = fits[0]
 
         t, h, w = grid_thw
         merge = tower.spatial_merge_size
@@ -1381,20 +1404,25 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         )
         half = freqs.shape[-1]
         head_dim = vm.encoder.layers[0].self_attn.head_dim
-        cos = torch.ones(bucket, head_dim)
-        sin = torch.zeros(bucket, head_dim)
-        cos[:num_patches, :half] = cos[:num_patches, half : 2 * half] = freqs.cos()
-        sin[:num_patches, :half] = sin[:num_patches, half : 2 * half] = freqs.sin()
-
-        key_bias = torch.zeros(1, 1, 1, bucket)
+        cos = torch.ones(num_patches, head_dim)
+        sin = torch.zeros(num_patches, head_dim)
+        cos[:, :half] = cos[:, half : 2 * half] = freqs.cos()
+        sin[:, :half] = sin[:, half : 2 * half] = freqs.sin()
+        key_bias = torch.zeros(1, 1, 1, bucket_size)
         key_bias[..., num_patches:] = -30000.0
-        return [x.to(device=device, dtype=dtype) for x in (padded, cos, sin, key_bias)]
+        return buffered_encoder.input_buffers.stage(
+            bucket_size,
+            [pixel_values, cos, sin, key_bias],
+            num_patches,
+        )
 
     def _encode_item(
         self, pixel_values: torch.Tensor, grid_thw: list[int], modality: str
     ) -> torch.Tensor:
         tower = self.vision_tower
-        assert tower is not None and self._mm_encoder is not None
+        assert tower is not None
+        buffered_encoder = self._mm_encoder
+        assert buffered_encoder is not None
         t, h, w = grid_thw
         frames = tower.vision_model.vision_segment_max_frames
         if frames is None:
@@ -1406,8 +1434,10 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
             seg_pixels = pixel_values[start * h * w : (start + seg_t) * h * w]
             segments.append(
                 rbln_utils.run_mm_encoder(
-                    self._mm_encoder,
-                    self._encoder_inputs(seg_pixels, [seg_t, h, w], modality),
+                    buffered_encoder.encoder,
+                    self._encoder_inputs(
+                        buffered_encoder, seg_pixels, [seg_t, h, w], modality
+                    ),
                     seg_t * h * w // (merge * merge),
                     dtype=self.mm_embeds_dtype,
                 )
@@ -1427,9 +1457,6 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
                 pixel_values = kwargs[key]
                 if pixel_values is None:
                     continue
-                if self._mm_encoder is None:
-                    # enforce_eager: the runner never calls compile_mm_encoder.
-                    self.compile_mm_encoder(lambda encoder: encoder)
                 grid_thw = kwargs[f"{modality}_grid_thw"]
                 assert isinstance(pixel_values, torch.Tensor)
                 assert isinstance(grid_thw, torch.Tensor)

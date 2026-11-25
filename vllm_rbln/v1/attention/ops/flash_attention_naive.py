@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import torch
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 from . import triton_flash_attention_naive  # noqa: F401
 
@@ -56,6 +57,7 @@ def flash_attention_naive_prefill(
             scale,  # dummy
             sinks,
             is_prompt_sorted=is_prompt_sorted,
+            null_block_id=NULL_BLOCK_ID,
         )
 
 
@@ -98,4 +100,5 @@ def flash_attention_naive_decode(
             scale,  # dummy
             sinks,
             is_prompt_sorted=is_prompt_sorted,
+            null_block_id=NULL_BLOCK_ID,
         )

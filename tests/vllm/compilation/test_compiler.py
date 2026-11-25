@@ -211,8 +211,15 @@ class TestCompileOptions:
 
 
 class TestEnsureTorchDynamoConfigured:
-    @pytest.mark.parametrize("nested", [False, True])
-    def test_sets_rbln_flags(self, monkeypatch, nested):
+    @pytest.mark.parametrize(
+        ("nested", "regions"),
+        [
+            pytest.param(None, True, id="unset"),
+            pytest.param(False, False, id="off"),
+            pytest.param(True, True, id="on"),
+        ],
+    )
+    def test_sets_rbln_flags(self, monkeypatch, nested, regions):
         # Applies the RBLN dynamo settings (nn.Module params must not become
         # graph inputs; larger cache size limit). Nested compile regions also
         # keep single-use regions and reject side effects inside a region.
@@ -227,8 +234,8 @@ class TestEnsureTorchDynamoConfigured:
         compiler._ensure_torch_dynamo_configured()
         assert torch._dynamo.config.inline_inbuilt_nn_modules is False
         assert torch._dynamo.config.cache_size_limit == 64
-        assert torch._dynamo.config.inline_single_use_invoke_subgraph is not nested
-        assert InvokeSubgraphHigherOrderVariable.allow_side_effects is not nested
+        assert torch._dynamo.config.inline_single_use_invoke_subgraph is not regions
+        assert InvokeSubgraphHigherOrderVariable.allow_side_effects is not regions
 
     def test_idempotent(self):
         # After the first call the guard makes further calls no-ops.

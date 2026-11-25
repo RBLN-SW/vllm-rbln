@@ -34,8 +34,10 @@ from vllm.v1.core.kv_cache_utils import (
     init_none_hash,
     maybe_convert_block_hash,
 )
+from vllm.v1.kv_cache_interface import SlidingWindowSpec, UniformTypeKVCacheSpecs
 from vllm.v1.request import Request
 
+import vllm_rbln.platform as platform
 from tests.vllm.v1.core.utils import (
     full_attention_spec,
     make_hybrid_manager,
@@ -51,6 +53,7 @@ from vllm_rbln.v1.core.rbln_kv_cache_manager import (
     SubBlockHasher,
     SubBlockIndex,
 )
+from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 
 BLOCK_SIZE = 8
 SUB_BLOCK_SIZE = 4
@@ -189,7 +192,7 @@ class TestSubBlockHasher:
 class TestSubBlockIndex:
     def test_empty_index_no_match(self):
         # longest_match on an empty index -> (None, 0).
-        assert SubBlockIndex().longest_match(_hashes(2)) == (None, 0)
+        assert SubBlockIndex().longest_match(_hashes(2), lambda b: False) == (None, 0)
 
     def test_update_returns_first_fresh_idx(self):
         # Inserting all-new hashes returns the first globally-fresh index (0).
@@ -219,15 +222,15 @@ class TestSubBlockIndex:
         idx.update(1, h)
         assert idx.update(2, h) == len(h)
 
-    def test_multiple_blocks_same_prefix(self):
-        # Two blocks sharing a prefix are both indexed; longest_match returns one.
+    @pytest.mark.parametrize("held", [1, 2])
+    def test_multiple_blocks_same_prefix_prefers_the_held_one(self, held):
+        # Two blocks sharing a prefix are both indexed; longest_match returns
+        # the one ``is_held`` picks out.
         idx = SubBlockIndex()
         h = _hashes(2)
         idx.update(1, h)
         idx.update(2, h)
-        block_id, depth = idx.longest_match(h)
-        assert block_id in (1, 2)
-        assert depth == 2
+        assert idx.longest_match(h, lambda b: b == held) == (held, 2)
 
     def test_pop_single_holder_returns_fully_removed(self):
         # Popping the sole holder returns its hashes as fully-removed.
@@ -235,7 +238,7 @@ class TestSubBlockIndex:
         h = _hashes(2)
         idx.update(1, h)
         assert set(idx.pop(1)) == set(h)
-        assert idx.longest_match(h) == (None, 0)
+        assert idx.longest_match(h, lambda b: False) == (None, 0)
 
     def test_pop_shared_holder_not_removed(self):
         # When another block still holds the hashes, pop removes nothing.
@@ -244,7 +247,7 @@ class TestSubBlockIndex:
         idx.update(1, h)
         idx.update(2, h)
         assert idx.pop(1) == []
-        assert idx.longest_match(h) == (2, 2)
+        assert idx.longest_match(h, lambda b: False) == (2, 2)
 
     def test_pop_unknown_block_returns_empty(self):
         # Popping a block that was never indexed -> [].
@@ -255,7 +258,7 @@ class TestSubBlockIndex:
         idx = SubBlockIndex()
         h = _hashes(3)
         idx.update(1, h)
-        assert idx.longest_match(h) == (1, 3)
+        assert idx.longest_match(h, lambda b: False) == (1, 3)
 
     def test_longest_match_partial_breaks_on_first_miss(self):
         # Matching stops at the first hash not in the index, returning the
@@ -263,11 +266,11 @@ class TestSubBlockIndex:
         idx = SubBlockIndex()
         h = _hashes(3)
         idx.update(1, h[:2])
-        assert idx.longest_match(h) == (1, 2)
+        assert idx.longest_match(h, lambda b: False) == (1, 2)
 
     def test_longest_match_empty_query(self):
         # An empty query -> (None, 0).
-        assert SubBlockIndex().longest_match([]) == (None, 0)
+        assert SubBlockIndex().longest_match([], lambda b: False) == (None, 0)
 
     def test_contains_and_all_hashes(self):
         # contains() is exact; all_hashes() returns every currently-indexed hash.
@@ -315,6 +318,31 @@ class TestCanUseSubBlockCaching:
         cfg = make_kv_cache_config([full_attention_spec(8)])
         assert RBLNKVCacheManager.can_use_sub_block_caching(cfg, 4)
 
+    @pytest.mark.parametrize("recycling_layer", ["first", "second"])
+    def test_grouped_sliding_windows_check_every_layer(self, recycling_layer):
+        specs = {
+            name: SlidingWindowSpec(
+                block_size=16,
+                num_kv_heads=1,
+                head_size=head_size,
+                dtype=torch.bfloat16,
+                sliding_window=8,
+            )
+            for name, head_size in (("first", 1), ("second", 2))
+        }
+        cfg = make_kv_cache_config(
+            [UniformTypeKVCacheSpecs(block_size=16, kv_cache_specs=specs)]
+        )
+        assert RBLNKVCacheManager.can_use_sub_block_caching(cfg, 4)
+        specs[recycling_layer] = RBLNSlidingWindowSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.bfloat16,
+            sliding_window=8,
+        )
+        assert not RBLNKVCacheManager.can_use_sub_block_caching(cfg, 4)
+
     def test_multi_group_all_must_be_eligible(self):
         # Every group must be eligible; one ineligible group flips it to False.
         cfg_ok = make_kv_cache_config(
@@ -328,6 +356,25 @@ class TestCanUseSubBlockCaching:
             ]
         )
         assert not RBLNKVCacheManager.can_use_sub_block_caching(cfg_bad, 4)
+
+    @pytest.mark.parametrize(
+        "device_tensor, window, eligible",
+        [(False, 4, False), (False, 8, True), (False, 3, True), (True, 4, True)],
+        ids=[
+            "runtime-window-kernel",
+            "runtime-block-kernel",
+            "runtime-non-dividing",
+            "device-tensor",
+        ],
+    )
+    def test_the_runtime_copy_takes_no_window_kernel_blocks(
+        self, monkeypatch, device_tensor, window, eligible
+    ):
+        # The runtime KV copy moves a block's first rows, where a window smaller
+        # than the block that divides it does not hold the prefix.
+        monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", device_tensor)
+        cfg = make_kv_cache_config([sliding_window_spec(8, window)])
+        assert RBLNKVCacheManager.can_use_sub_block_caching(cfg, 4) is eligible
 
 
 class TestManagerInit:
@@ -378,6 +425,26 @@ class TestGetComputedBlocksSubBlock:
         match = manager.get_computed_blocks_sub_block(req1, num_computed)
         assert match is not None
         assert match.num_tokens == 4
+        manager.release_sub_block_match(match)
+
+    def test_prefers_source_held_by_a_running_request(self):
+        # Two indexed blocks share the first sub-block: one free and cached, one
+        # held by a running request. Touching the held one takes nothing from
+        # the free queue.
+        manager = make_manager(8, 4, 10)
+        finished = make_request("finished", list(range(8)), 8)
+        prefill_request(manager, finished)
+        running = make_request("running", list(range(4)) + [700] * 8, 8)
+        prefill_request(manager, running)
+        manager.release_copy_ops(manager.drain_pending_copy_ops())
+        manager.free(finished)
+        held_block_id = manager.get_block_ids("running")[0][0]
+
+        req = make_request("1", list(range(4)) + [900] * 8, 8)
+        _, num_computed, _ = manager.get_computed_blocks(req)
+        match = manager.get_computed_blocks_sub_block(req, num_computed)
+        assert match is not None
+        assert match.group_matches[0].src_block.block_id == held_block_id
         manager.release_sub_block_match(match)
 
     def test_no_partial_match_when_full_block_matches(self):
