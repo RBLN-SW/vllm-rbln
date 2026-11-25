@@ -322,22 +322,23 @@ def test_unset_budgets_follow_the_prefill_chunk_not_the_default(monkeypatch):
 
 
 @pytest.mark.parametrize("cap", [{"long_prefill": 512}, {"scheduled": 512}])
-def test_unset_budgets_stop_at_the_shortest_step_cap(monkeypatch, cap):
-    # The runner refuses a range either cap would split.
+def test_scheduler_caps_leave_the_budgets_alone(monkeypatch, cap):
+    # A scheduler flag must not change what compiles, nor the mega-cache key;
+    # the runner refuses a cap shorter than the largest budget instead.
     model = _built_model(monkeypatch, default=280, budgets=[], chunk=2048, **cap)
-    assert model.mm_encoder_patch_buckets == [70 * 9, 140 * 9, 280 * 9]
+    assert model.mm_encoder_patch_buckets == [
+        budget * 9 for budget in (70, 140, 280, 560, 1120)
+    ]
 
 
-def test_a_step_holding_no_budget_is_refused(monkeypatch):
-    with pytest.raises(ValueError, match="step of 64 tokens holds no Gemma4"):
-        _built_model(monkeypatch, default=280, budgets=[], long_prefill=64)
+def test_a_chunk_holding_no_budget_is_refused(monkeypatch):
+    with pytest.raises(ValueError, match=r"chunk \(64\) holds no Gemma4"):
+        _built_model(monkeypatch, default=280, budgets=[], chunk=64)
 
 
 def test_text_only_serving_resolves_no_budgets(monkeypatch):
-    # No image can arrive, so neither a short step nor the default matters.
-    model = _built_model(
-        monkeypatch, default=280, budgets=[], long_prefill=64, limits={}
-    )
+    # No image can arrive, so neither a short chunk nor the default matters.
+    model = _built_model(monkeypatch, default=280, budgets=[], chunk=64, limits={})
     assert model.mm_encoder_patch_buckets == []
 
 

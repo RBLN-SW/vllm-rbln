@@ -259,28 +259,19 @@ class RBLNGemma4ForConditionalGeneration(
     def encoder_token_budgets(cls, vllm_config: VllmConfig) -> list[int]:
         """The soft token budgets the vision encoder compiles one graph each for;
         an image or frame is padded to the smallest that holds it. Unset, every
-        budget one prefill step holds, so the compile flags alone decide them."""
+        budget the longest prefill chunk holds. Compile flags alone decide them,
+        so a scheduler cap shorter than the largest is refused by the runner,
+        not met by quietly compiling less."""
         rbln_config = vllm_config.additional_config
-        scheduler_config = vllm_config.scheduler_config
-        # The caps the runner checks a range against; a step never splits one.
-        step = min(
-            cap
-            for cap in (
-                rbln_config.max_prefill_chunk_size,
-                scheduler_config.long_prefill_token_threshold,
-                scheduler_config.max_num_scheduled_tokens,
-            )
-            if cap
-        )
+        longest_chunk = rbln_config.max_prefill_chunk_size
         budgets = sorted(rbln_config.encoder_token_budgets) or [
-            budget for budget in _SUPPORTED_SOFT_TOKENS if budget <= step
+            budget for budget in _SUPPORTED_SOFT_TOKENS if budget <= longest_chunk
         ]
         if not budgets:
             raise ValueError(
-                f"A prefill step of {step} tokens holds no Gemma4 soft token "
-                f"budget; the smallest is {_SUPPORTED_SOFT_TOKENS[0]}. Lengthen "
-                "--rbln-prefill-chunk-size, --long-prefill-token-threshold or "
-                "--max-num-scheduled-tokens, whichever is shortest."
+                f"The longest prefill chunk ({longest_chunk}) holds no Gemma4 soft "
+                f"token budget; the smallest is {_SUPPORTED_SOFT_TOKENS[0]}. "
+                "Lengthen --rbln-prefill-chunk-size."
             )
         if unsupported := sorted(set(budgets) - set(_SUPPORTED_SOFT_TOKENS)):
             raise ValueError(
@@ -344,10 +335,9 @@ class RBLNGemma4ForConditionalGeneration(
                     f"max_soft_tokens={default}, the soft tokens an image takes "
                     f"by default, is above {budgets[-1]}, the largest encoder "
                     f"budget compiled ({budgets}). Lower it in "
-                    "--mm-processor-kwargs, or compile a larger budget: name it in "
-                    "--rbln-encoder-token-budgets, or lengthen the prefill step "
-                    "(--rbln-prefill-chunk-size, and --long-prefill-token-threshold "
-                    "or --max-num-scheduled-tokens where set)."
+                    "--mm-processor-kwargs, or compile a larger budget with a "
+                    "longer --rbln-prefill-chunk-size or with "
+                    "--rbln-encoder-token-budgets."
                 )
         pool = self.config.vision_config.pooling_kernel_size
         self.mm_encoder_patch_buckets = [budget * pool**2 for budget in budgets]

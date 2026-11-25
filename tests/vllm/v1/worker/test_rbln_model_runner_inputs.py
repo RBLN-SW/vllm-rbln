@@ -271,8 +271,9 @@ class TestResolveMmPrefixSupport:
             make_model_runner, monkeypatch, _MmPrefixModel(128), **{flag: 64}
         )
 
-        with pytest.raises(ValueError, match=flag):
+        with pytest.raises(ValueError, match=flag) as refused:
             runner._resolve_mm_support()
+        assert "--rbln-encoder-token-budgets" in str(refused.value)
 
     def test_a_threshold_and_chunk_equal_to_the_longest_range_are_taken(
         self, make_model_runner, monkeypatch

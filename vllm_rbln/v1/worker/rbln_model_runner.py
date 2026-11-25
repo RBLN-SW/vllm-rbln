@@ -1566,7 +1566,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 if cap and cap < longest:
                     raise ValueError(
                         f"{flag}={cap} would split a multimodal range of up to "
-                        f"{longest} tokens."
+                        f"{longest} tokens. Raise it to at least {longest}, or "
+                        "lower the largest encoder budget with "
+                        "--rbln-encoder-token-budgets."
                     )
             chunks = self.rbln_config.prefill_chunk_size
             assert chunks is not None  # resolved at start-up
