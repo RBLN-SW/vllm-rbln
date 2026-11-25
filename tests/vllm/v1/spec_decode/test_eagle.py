@@ -834,7 +834,6 @@ class TestLoadModel:
         proposer = make_eagle_proposer()
         monkeypatch.setattr(eagle_module, "compile", lambda fn, **kwargs: fn)
         monkeypatch.setattr(eagle_module, "build_process_group_dict", lambda: {})
-        proposer.runner = SimpleNamespace(compile_context=None, runtime_holder=None)
 
         def load_draft(self, target_model):
             assert self.supports_mm_inputs
@@ -909,7 +908,6 @@ class TestLoadModel:
         proposer = make_eagle_proposer(num_speculative_tokens=1)
         monkeypatch.setattr(eagle_module, "compile", lambda fn, **kwargs: fn)
         monkeypatch.setattr(eagle_module, "build_process_group_dict", lambda: {})
-        proposer.runner = SimpleNamespace(compile_context=None, runtime_holder=None)
         proposer.load_model(target_model=object())
         assert proposer.draft_has_moe is False
 
@@ -922,7 +920,6 @@ class TestLoadModel:
         proposer = make_eagle_proposer(num_speculative_tokens=1)
         monkeypatch.setattr(eagle_module, "compile", lambda fn, **kwargs: fn)
         monkeypatch.setattr(eagle_module, "build_process_group_dict", lambda: {})
-        proposer.runner = SimpleNamespace(compile_context=None, runtime_holder=None)
         proposer.load_model(target_model=object())
         assert proposer.draft_has_moe is True
 
@@ -935,14 +932,11 @@ class TestLoadModel:
         )
         monkeypatch.setattr(eagle_module, "build_process_group_dict", lambda: {})
         proposer = make_eagle_proposer(num_speculative_tokens=1)
-        proposer.runner = SimpleNamespace(
-            compile_context=object(), runtime_holder=[None]
-        )
 
         proposer.load_model(target_model=object())
         assert proposer.model_executable is sentinel
         assert captured["fullgraph"] is True
-        assert "compile_context" in captured
+        assert captured["model_trace_method"] == "export"
 
     def test_wrapper_composes_model_forward(self, monkeypatch):
         # The wrapper runs the draft model, reshapes the hidden states,
@@ -968,7 +962,6 @@ class TestLoadModel:
         monkeypatch.setattr(proposer, "model_returns_tuple", lambda: False)
         monkeypatch.setattr(eagle_module, "compile", lambda fn, **kwargs: fn)
         monkeypatch.setattr(eagle_module, "build_process_group_dict", lambda: {})
-        proposer.runner = SimpleNamespace(compile_context=None, runtime_holder=None)
         proposer.load_model(target_model=object())
 
         h = proposer.hidden_size
@@ -999,7 +992,6 @@ class TestLoadModel:
         self._stub_super_load_model(monkeypatch, model)
         monkeypatch.setattr(eagle_module, "compile", lambda fn, **kwargs: fn)
         monkeypatch.setattr(eagle_module, "build_process_group_dict", lambda: {})
-        proposer.runner = SimpleNamespace(compile_context=None, runtime_holder=None)
         proposer.load_model(target_model=object())
 
         # Taking that branch at all depends on load_model lifting d2t off the

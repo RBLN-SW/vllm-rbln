@@ -642,17 +642,11 @@ def _wire(vllm_config: "VllmConfig") -> None:
 
     # The async refusals have to precede the scheduler_cls assignment below,
     # which reads the flag they clear.
-    if scheduler_config.async_scheduling and not (
-        envs.VLLM_RBLN_USE_DEVICE_TENSOR and rbln_config.use_custom_sampler
-    ):
+    if scheduler_config.async_scheduling and not rbln_config.use_custom_sampler:
         logger.warning(
-            "Disabling asynchronous scheduling: it requires "
-            "VLLM_RBLN_USE_DEVICE_TENSOR=1 (got %s), which carries the "
-            "in-flight sampled tokens, and --rbln-use-custom-sampler (got %s), "
-            "which puts the sampler on the device so those tokens never "
-            "reach the host mid-step. Running synchronously.",
-            int(envs.VLLM_RBLN_USE_DEVICE_TENSOR),
-            int(rbln_config.use_custom_sampler),
+            "Disabling asynchronous scheduling: --rbln-use-custom-sampler is "
+            "required to keep in-flight sampled tokens on the device. "
+            "Running synchronously."
         )
         scheduler_config.async_scheduling = False
 

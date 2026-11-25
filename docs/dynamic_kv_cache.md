@@ -73,9 +73,8 @@ from their shape rather than caching one. Nothing is registered
 early, so nothing has to be unregistered. Every other mode keeps the start-up
 order.
 
-> The dynamic path needs `--model-impl vllm` and `VLLM_RBLN_USE_DEVICE_TENSOR=1`,
-> and turns itself off without them. Only `DynamoRuntime` applies adaptive buffer
-> sizes; the other runtimes ignore them silently.
+> Dynamic KV sizing is available on the vllm model path.
+> `DynamoRuntime` applies the adaptive buffer sizes.
 
 Key components:
 
@@ -97,7 +96,6 @@ Key components:
 | `--rbln-use-dynamic-kv-cache` (`additional_config={"use_dynamic_kv_cache": ...}`) | unset | Size the KV cache from the compiled placement and the device. `--no-rbln-use-dynamic-kv-cache` goes back to the pre-compile estimate. Unset, a configuration the path cannot size turns it off on its own; set, such a configuration is refused at start-up. `VLLM_RBLN_USE_DYNAMIC_KV_CACHE` still sets it, with a deprecation warning, until 0.14.0. |
 
 ```bash
-export VLLM_RBLN_USE_DEVICE_TENSOR=1
 export VLLM_CACHE_ROOT=<a fresh directory>
 ```
 
@@ -135,7 +133,6 @@ feature is absent there rather than disabled.
 
 | Configuration | Why |
 | --- | --- |
-| `VLLM_RBLN_USE_DEVICE_TENSOR=0` | The artifact carries no dynamic KV dimension. |
 | `RBLN_USE_CUSTOM_KERNEL=1` | The `rbln_triton_ops` kernels go through the compiler's triton converter, so the KV input never reaches a whitelisted `paged_*` custom op. |
 | A DFlash drafter (`--speculative-config '{"method": "dflash", ...}'`) | The drafter is non-causal on RBLN, and its attention kernel does not accept a dynamic KV input. `use_non_causal` lives on the draft config only, so the method is the signal. |
 | `block_size == max_model_len` | This selects the normal-attention kernels, which do not accept a dynamic KV input. |

@@ -546,13 +546,9 @@ def main() -> None:
         from vllm_rbln import envs
         from vllm_rbln.compilation import set_compile_stage
         from vllm_rbln.config import resolve_model_impl
-        from vllm_rbln.platform import _apply_model_impl, use_device_tensor
+        from vllm_rbln.platform import _apply_model_impl
 
         _apply_model_impl(resolve_model_impl(model_impl="vllm"))
-        if not use_device_tensor():
-            raise ValueError(
-                "device tensors are required; check VLLM_RBLN_USE_DEVICE_TENSOR"
-            )
         if envs.VLLM_RBLN_COMPILE_ONLY or torch.rbln.is_dummy_device():
             raise ValueError(
                 "compile-only and dummy-device execution cannot measure NPU performance"

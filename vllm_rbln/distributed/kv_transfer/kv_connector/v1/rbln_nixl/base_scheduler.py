@@ -63,11 +63,6 @@ class RblnNixlSchedulerBase(NixlBaseConnectorScheduler):
             kv_cache_config.transfer_groups,
             writes_into_peer=self._writes_into_peer,
         )
-        # NOTE(RBLN): the platform reports device_type "cpu" when device tensors
-        # are off, which upstream reads as "no host staging" -- the very setup
-        # that needs it. Decide from the requested buffer device instead.
-        self.use_host_buffer = self._shape.use_host_buffer
-
         # Blocks collected so far for a prefill that is still being chunked.
         self._block_ids_need_save: dict[ReqId, BlockIds] = {}
 

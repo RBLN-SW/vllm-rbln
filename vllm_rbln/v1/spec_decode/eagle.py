@@ -36,7 +36,6 @@ from vllm_rbln.logger import init_logger
 from vllm_rbln.model_executor.models.interfaces import (
     supports_rbln_multimodal_embeddings,
 )
-from vllm_rbln.platform import use_device_tensor
 from vllm_rbln.v1.spec_decode.utils import (
     eagle_prepare_inputs_padded,
     eagle_prepare_next_token_padded,
@@ -499,12 +498,10 @@ class RBLNEagleProposer(EagleProposer):
             fn,
             dynamic=False,
             fullgraph=True,
-            compile_context=self.runner.compile_context,
             num_devices=1,
-            model_trace_method="export" if use_device_tensor() else "",
+            model_trace_method="export",
             process_group_dict=build_process_group_dict(),
             guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
-            runtime_holder=self.runner.runtime_holder,
             mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
             use_static_output=True,
             use_direct_dispatch=True,

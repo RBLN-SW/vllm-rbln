@@ -92,8 +92,6 @@ def make_eagle_proposer(
 MEDUSA_TARGET = "JackFram/llama-68m"
 MEDUSA_DRAFT = "abhigoyal/vllm-medusa-llama-68m-random"
 
-_DEFAULT_COMPILE_CONTEXT = object()
-
 
 @functools.cache
 def _medusa_vllm_config(num_speculative_tokens: int) -> Any:
@@ -113,13 +111,10 @@ def _medusa_vllm_config(num_speculative_tokens: int) -> Any:
 def make_medusa_proposer(
     *,
     num_speculative_tokens: int = 3,
-    compile_context: Any = _DEFAULT_COMPILE_CONTEXT,
 ) -> Any:
-    """A real RBLNMedusaProposer. compile_context defaults to a sentinel so
-    construction never calls create_compile_context; pass None for that branch."""
+    """A real RBLNMedusaProposer built through its device constructor."""
     from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
 
     vllm_config = _medusa_vllm_config(num_speculative_tokens)
     device = torch.device(current_platform.device_type)
-    cc = object() if compile_context is _DEFAULT_COMPILE_CONTEXT else compile_context
-    return RBLNMedusaProposer(vllm_config, device, compile_context=cc)
+    return RBLNMedusaProposer(vllm_config, device)

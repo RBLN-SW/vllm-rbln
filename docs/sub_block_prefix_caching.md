@@ -16,10 +16,7 @@ Sub-block prefix caching is automatically enabled when
 `enable_prefix_caching=True` and `--rbln-enable-sub-block-cache` (default)
 and all KV cache groups have an *eligible spec type* with
 `block_size > sub_block_size` and `block_size % sub_block_size == 0`.
-Without device tensors (`VLLM_RBLN_USE_DEVICE_TENSOR=0`), a sliding-window group
-whose window is smaller than its block and divides it also turns it off; see
-Step 5. A `sub_block_size` given for a configuration that turns it off is
-refused at startup.
+An explicit `sub_block_size` for an unsupported configuration is refused at startup.
 
 A KV cache spec is *eligible* if it stores per-token KV data, i.e.,
 if the KV cache tensor has a token dimension that can be sliced for partial copying.
@@ -232,8 +229,7 @@ kv_cache.select(block_axis, dst_block_id)[..., :num_tokens, :] = \
 
 A sliding-window layer whose kernel stays on the window views its buffer in
 kernel blocks, several to a manager block, so its copy takes all of the manager
-block's kernel blocks. Without device tensors the copy goes through the runtime,
-which cannot address them, so sub-block prefix caching is off for that model.
+block's kernel blocks.
 
 ### Block lifecycle
 

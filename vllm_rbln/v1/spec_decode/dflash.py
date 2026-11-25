@@ -42,7 +42,6 @@ import vllm_rbln.utils as rbln_utils
 from vllm_rbln.compilation import build_process_group_dict, compile
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.forward_context import set_forward_context
-from vllm_rbln.platform import use_device_tensor
 from vllm_rbln.v1.attention.kv_cache_bindings import attention_block_axis
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.worker.dp_utils import determine_batch_execution_and_padding
@@ -77,14 +76,6 @@ class RBLNDFlashProposer(DFlashProposer):
             )
 
     def __init__(self, vllm_config, device: torch.device, runner=None):
-        if not use_device_tensor():
-            # The cache is allocated on the meta device then, and the context
-            # write is a host copy -- which meta accepts and discards.
-            raise NotImplementedError(
-                "The DFlash drafter requires VLLM_RBLN_USE_DEVICE_TENSOR=1 on "
-                "RBLN: without it the KV cache has no host-visible storage and "
-                "the drafter's context K/V write is silently dropped."
-            )
         super().__init__(vllm_config=vllm_config, device=device, runner=runner)
         if self.dflash_causal:
             # `_create_draft_vllm_config` turns this into
@@ -299,12 +290,10 @@ class RBLNDFlashProposer(DFlashProposer):
         compile_kwargs = dict(
             dynamic=False,
             fullgraph=True,
-            compile_context=self.runner.compile_context,
             num_devices=1,
-            model_trace_method="export" if use_device_tensor() else "",
+            model_trace_method="export",
             process_group_dict=build_process_group_dict(),
             guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
-            runtime_holder=self.runner.runtime_holder,
             mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
             use_static_output=True,
             dtype=rbln_config.compile_dtype,

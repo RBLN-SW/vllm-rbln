@@ -55,7 +55,6 @@ from vllm.v1.worker.kv_connector_model_runner_mixin import (
     KVConnectorModelRunnerMixin,
 )
 
-import vllm_rbln.platform as platform
 import vllm_rbln.v1.worker.dp_utils as dp_utils
 import vllm_rbln.v1.worker.rbln_model_runner as mr
 import vllm_rbln.v1.worker.utils as worker_utils
@@ -816,8 +815,6 @@ class TestEcConsumer:
             drafter=None,
             use_aux_hidden_state_outputs=False,
             _make_weights_contiguous=lambda: None,
-            compile_context=None,
-            runtime_holder=None,
             rbln_config=SimpleNamespace(compile_dtype=None),
         )
 
@@ -1258,8 +1255,7 @@ def test_async_output_inherits_runner_fail_fast_policy(
     monkeypatch.setattr(mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True))
     config = make_runner_config(distributed_executor_backend=backend)
     config.parallel_config.rank = 2
-    # The CPU lane disables async scheduling at platform setup. Exercise the
-    # deferred output path with CPU tensors after that setup has completed.
+    # Exercise the deferred output path with CPU tensors.
     config.scheduler_config.async_scheduling = True
     runner = make_model_runner(vllm_config=config)
     scheduler_output = schedule_new("a")
@@ -1706,8 +1702,7 @@ class TestProcessKvCacheCopyOps:
         [(0, (4, 2, 1, 1, 8, 2)), (1, (2, 4, 1, 1, 8, 2))],
         ids=["blocks_first", "kv_first"],
     )
-    def test_device_tensor_copy_non_mla(self, monkeypatch, block_axis, shape):
-        monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", True)
+    def test_device_tensor_copy_non_mla(self, block_axis, shape):
         # The rbln_custom_ops and rbln_triton_ops layouts, in that order.
         kv = torch.zeros(shape)
         kv.select(block_axis, 1).fill_(5.0)  # source = block 1
@@ -1718,7 +1713,6 @@ class TestProcessKvCacheCopyOps:
             kv_cache_config=_copy_groups(["l0"]),
             _kernel_block_sizes=[8],
             model_config=SimpleNamespace(use_mla=False),
-            runtime_holder=[None],
         )
         r._process_kv_cache_copy_ops([KVCacheCopyOp(0, 1, 2, 3)])
         # First 3 token slots of dst block 2 now match src; the rest stay 0.
@@ -1728,8 +1722,7 @@ class TestProcessKvCacheCopyOps:
         assert (dst[..., :3, :] == 5.0).all()
         assert (dst[..., 3:, :] == 0.0).all()
 
-    def test_a_window_group_copies_the_whole_manager_block(self, monkeypatch):
-        monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", True)
+    def test_a_window_group_copies_the_whole_manager_block(self):
         # Kernel blocks of 2, four to a manager block of 8: manager block 1 is
         # kernel blocks 4..7, and five tokens still take all four.
         kv = torch.zeros(16, 2, 1, 1, 2, 2)
@@ -1743,14 +1736,12 @@ class TestProcessKvCacheCopyOps:
             kv_cache_config=_copy_groups(["sw"]),
             _kernel_block_sizes=[2],
             model_config=SimpleNamespace(use_mla=False),
-            runtime_holder=[None],
         )
         r._process_kv_cache_copy_ops([KVCacheCopyOp(0, 1, 2, 5)])
         assert torch.equal(kv[8:12], before[4:8])
         assert torch.equal(kv[:8], before[:8]) and torch.equal(kv[12:], before[12:])
 
-    def test_device_tensor_copy_mla(self, monkeypatch):
-        monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", True)
+    def test_device_tensor_copy_mla(self):
         kv = torch.zeros(4, 8, 2)  # (num_blocks, block_tokens, dim)
         kv[1] = 7.0
         r = _make_runner_stub(
@@ -1760,14 +1751,12 @@ class TestProcessKvCacheCopyOps:
             kv_cache_config=_copy_groups(["l0"]),
             _kernel_block_sizes=[8],
             model_config=SimpleNamespace(use_mla=True),
-            runtime_holder=[None],
         )
         r._process_kv_cache_copy_ops([KVCacheCopyOp(0, 1, 2, 3)])
         assert (kv[2, :3, :] == 7.0).all()
         assert (kv[2, 3:, :] == 0.0).all()
 
-    def test_device_tensor_copy_mla_indexer_scale(self, monkeypatch):
-        monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", True)
+    def test_device_tensor_copy_mla_indexer_scale(self):
         latent = torch.zeros(4, 8, 768, dtype=torch.uint8)
         indexer = torch.zeros(4, 8, 128, dtype=torch.float8_e4m3fn)
         scale = torch.zeros(4, 8, dtype=torch.bfloat16)
@@ -1782,15 +1771,13 @@ class TestProcessKvCacheCopyOps:
             kv_cache_config=_copy_groups(["latent", "indexer", "scale"]),
             _kernel_block_sizes=[8],
             model_config=SimpleNamespace(use_mla=True),
-            runtime_holder=[None],
         )
         r._process_kv_cache_copy_ops([KVCacheCopyOp(0, 1, 2, 3)])
         for cache in caches:
             assert torch.equal(cache[2, :3].float(), cache[1, :3].float())
             assert torch.count_nonzero(cache[2, 3:].float()) == 0
 
-    def test_only_the_op_group_is_copied(self, monkeypatch):
-        monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", True)
+    def test_only_the_op_group_is_copied(self):
         # Two groups sharing a buffer keep their blocks apart by block id, so a
         # copy for one group must not touch the other group's layer.
         kv = torch.zeros(2, 4, 2, 1, 1, 8, 2)
@@ -1803,31 +1790,12 @@ class TestProcessKvCacheCopyOps:
             kv_cache_config=_copy_groups(["a"], ["b"]),
             _kernel_block_sizes=[8, 8],
             model_config=SimpleNamespace(use_mla=False),
-            runtime_holder=[None],
         )
         r._process_kv_cache_copy_ops([KVCacheCopyOp(1, 1, 2, 8)])
         assert (kv[0, 2] == 0.0).all()
         assert (kv[1, 2] == 6.0).all()
 
-    def test_runtime_copy_when_compiled_non_device_tensor(self, monkeypatch):
-        monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", False)
-        calls = []
-        runtime = SimpleNamespace(
-            _copy_kv_cache=lambda src, dst, nt: calls.append((src, dst, nt))
-        )
-        r = _make_runner_stub(
-            kv_caches=[],
-            kv_cache_names=[],
-            kv_cache_block_axes={},
-            model_config=SimpleNamespace(use_mla=False),
-            runtime_holder=[runtime],
-            rbln_config=RBLNConfig(),
-        )
-        r._process_kv_cache_copy_ops([KVCacheCopyOp(0, 5, 6, 4)])
-        assert calls == [(5, 6, 4)]
-
-    def test_a_block_copy_moves_the_whole_page_of_every_cache(self, monkeypatch):
-        monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", True)
+    def test_a_block_copy_moves_the_whole_page_of_every_cache(self):
         latent = torch.zeros(4, 8, 2)
         state = torch.zeros(3, 4, 5)  # blocks on axis 1
         latent[1] = 7.0
@@ -2190,38 +2158,26 @@ class TestAllocateKvCacheTensors:
             device=torch.device("cpu"), runner_only_attn_layers=set()
         )
 
-    def test_meta_without_device_tensor(self, monkeypatch):
-        monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", False)
-        raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
-        assert set(raw) == {"l0", "l1", "l2"}
-        assert raw["l0"].device.type == "meta"
-
-    def test_each_layer_gets_one_layers_worth(self, monkeypatch):
-        monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", False)
+    def test_each_layer_gets_one_layers_worth(self):
         raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
         assert all(t.numel() == self.LAYER_STRIDE for t in raw.values())
 
-    def test_groups_share_the_buffer_at_a_layer_position(self, monkeypatch):
+    def test_groups_share_the_buffer_at_a_layer_position(self):
         # A block costs the widest group, not the sum of them. l0 and l2 are
         # the first layer of their group, so they overlay.
-        # meta tensors all report data_ptr()==0, so compare identity.
-        monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", False)
         raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
         assert id(raw["l0"].untyped_storage()) == id(raw["l2"].untyped_storage())
 
-    def test_layer_positions_do_not_share(self, monkeypatch):
-        monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", False)
+    def test_layer_positions_do_not_share(self):
         raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
         assert id(raw["l0"].untyped_storage()) != id(raw["l1"].untyped_storage())
 
-    def test_every_layer_starts_at_byte_zero(self, monkeypatch):
+    def test_every_layer_starts_at_byte_zero(self):
         # The compiler refuses a graph input that carries a storage offset.
-        monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", False)
         raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
         assert all(t.storage_offset() == 0 for t in raw.values())
 
-    def test_self_device_with_device_tensor(self, monkeypatch):
-        monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", True)
+    def test_allocates_on_the_runner_device(self):
         raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
         assert raw["l0"].device.type == "cpu"  # self.device is cpu here
 

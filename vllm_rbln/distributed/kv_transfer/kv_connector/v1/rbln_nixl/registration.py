@@ -254,8 +254,7 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         sample_kv_cache = next(iter(kv_caches.values()))
         device_id = sample_kv_cache.get_device()
         assert device_id >= 0, (
-            "RBLN NIXL (D2D): KV cache is not an 'rbln' "
-            "device tensor (is VLLM_RBLN_USE_DEVICE_TENSOR=1 set?)."
+            "RBLN NIXL (D2D): KV cache is not an 'rbln' device tensor."
         )
 
         # Direct path never stages through a host buffer.
