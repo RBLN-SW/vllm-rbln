@@ -96,7 +96,7 @@ class EncoderInputBuffers:
             tuple[int, str], tuple[torch.Tensor, HostMemoryRegistration] | None
         ] = {}
 
-    def _registered_host_buffer(
+    def _get_or_create_registered_host_buffer(
         self, bucket_size: int, spec: EncoderInput
     ) -> torch.Tensor | None:
         if self.device.type != "rbln":
@@ -147,9 +147,11 @@ class EncoderInputBuffers:
         *,
         fill_overrides: Mapping[str, float],
     ) -> list[torch.Tensor]:
-        """Fill the whole bucket with pad defaults and named warmup overrides."""
+        """Fill the bucket for warmup and prepare its host staging buffers."""
         specs, buffers = self._get_or_create_bucket(bucket_size)
         for spec, buffer in zip(specs, buffers, strict=True):
+            if spec.use_registered_host_buffer:
+                self._get_or_create_registered_host_buffer(bucket_size, spec)
             buffer.fill_(fill_overrides.get(spec.name, spec.pad))
         return buffers
 
@@ -189,7 +191,7 @@ class EncoderInputBuffers:
                 and length
                 and tensor.device.type == "cpu"
             ):
-                host = self._registered_host_buffer(bucket_size, spec)
+                host = self._get_or_create_registered_host_buffer(bucket_size, spec)
                 if host is not None:
                     host = host if full else host.narrow(spec.axis, 0, length)
                     host.copy_(tensor)

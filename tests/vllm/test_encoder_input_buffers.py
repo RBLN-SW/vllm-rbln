@@ -71,7 +71,7 @@ def test_estimated_input_sizes_match_allocations():
     ]
 
 
-def test_rbln_patch_buffer_is_placed_on_chiplet_zero_once(monkeypatch):
+def test_rbln_warmup_binds_device_buffer_and_registers_host_buffer_once(monkeypatch):
     specs = [
         EncoderInput(
             "patches", (8, 4), axis=0, pad=2.0, use_registered_host_buffer=True
@@ -82,8 +82,14 @@ def test_rbln_patch_buffer_is_placed_on_chiplet_zero_once(monkeypatch):
     key_bias = torch.empty(1, 1, 8)
     full = Mock(side_effect=[patches, key_bias])
     bind = Mock()
+    host = torch.empty_like(patches)
+    allocate_host = Mock(return_value=host.view(torch.uint8).flatten())
+    registration = Mock(**{"covers.return_value": True})
+    register_host = Mock(return_value=registration)
     monkeypatch.setattr(torch, "full", full)
     monkeypatch.setattr(torch.rbln, "bind_device_memory", bind)
+    monkeypatch.setattr(torch.rbln, "huge_host_empty", allocate_host)
+    monkeypatch.setattr(torch.rbln, "host_register_memory", register_host)
 
     device = torch.device("rbln:0")
     buffers = EncoderInputBuffers(device, torch.float32, specs_by_bucket={8: specs})
@@ -95,6 +101,15 @@ def test_rbln_patch_buffer_is_placed_on_chiplet_zero_once(monkeypatch):
     assert torch.all(patches == 2)
     assert full.call_count == 2
     bind.assert_called_once_with(patches)
+    allocate_host.assert_called_once_with(host.nbytes)
+    register_host.assert_called_once()
+    assert register_host.call_args.kwargs["device"] == device
+
+    pixels = torch.ones(3, 4)
+    assert buffers.stage(8, [pixels, _key_bias(3)], 3) is first
+    torch.testing.assert_close(host[:3], pixels)
+    allocate_host.assert_called_once_with(host.nbytes)
+    register_host.assert_called_once()
 
 
 def test_a_bucket_allocates_once_and_is_reused():
