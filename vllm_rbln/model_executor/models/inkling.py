@@ -381,11 +381,15 @@ class RBLNInklingMoE(nn.Module):
         shape = hidden_states.shape
         tokens = hidden_states.reshape(-1, shape[-1])
         scores = torch.sigmoid(self.gate(tokens.float())[0])
-        routed_scores = scores[:, : self.num_routed]
+        # Expert-major, as the MoE runner selects: a token-major gather over
+        # 256 experts does not compile for one token.
+        routed_scores = scores[:, : self.num_routed].transpose(0, 1)
         _, selected = torch.topk(
-            routed_scores + self.gate.e_score_correction_bias, self.top_k, dim=-1
+            routed_scores + self.gate.e_score_correction_bias[:, None],
+            self.top_k,
+            dim=0,
         )
-        topk_sum = routed_scores.gather(-1, selected).sum(-1, keepdim=True)
+        topk_sum = routed_scores.gather(0, selected).sum(0)[:, None]
         shared_scores = scores[:, self.num_routed :]
         scale = (
             self.route_scale
