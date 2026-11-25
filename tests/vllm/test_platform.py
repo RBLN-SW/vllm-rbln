@@ -1382,7 +1382,7 @@ class TestEnforceEager:
 
         with pytest.raises(
             ValueError,
-            match="--enforce-eager is not supported with the 'vllm' model impl",
+            match="--enforce-eager is not supported on RBLN",
         ):
             reconfigure(mutate)
 

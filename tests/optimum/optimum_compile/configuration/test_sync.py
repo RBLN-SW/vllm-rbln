@@ -42,28 +42,30 @@ pytestmark = pytest.mark.usefixtures("compile_environment")
 
 
 class TestSync:
-    @pytest.mark.parametrize(
-        ("target_eager", "message"),
-        [
-            (True, "--enforce-eager is not supported with the 'optimum' model impl"),
-            (
-                False,
-                r"speculative_config\.enforce_eager is not supported "
-                "with the 'optimum' model impl",
-            ),
-        ],
-        ids=["target", "draft"],
-    )
-    def test_platform_rejects_eager_before_compile_setup(self, target_eager, message):
+    def test_platform_rejects_target_eager(self):
+        from vllm_rbln.platform import RblnPlatform
+
+        cfg = SimpleNamespace(
+            model_config=SimpleNamespace(enforce_eager=True),
+            speculative_config=None,
+            ec_transfer_config=None,
+            is_mm_encoder_only=False,
+        )
+        with pytest.raises(
+            ValueError, match="--enforce-eager is not supported on RBLN"
+        ):
+            RblnPlatform.check_and_update_config(cfg)
+
+    def test_platform_rejects_speculative_decoding_with_draft_eager(self):
         from vllm_rbln.platform.optimum_impl import check_and_update
 
         cfg = SimpleNamespace(
-            model_config=SimpleNamespace(enforce_eager=target_eager),
-            speculative_config=(
-                None if target_eager else SimpleNamespace(enforce_eager=True)
-            ),
+            model_config=SimpleNamespace(enforce_eager=False),
+            speculative_config=SimpleNamespace(enforce_eager=True),
         )
-        with pytest.raises(ValueError, match=message):
+        with pytest.raises(
+            AssertionError, match="Speculative decoding is not supported"
+        ):
             check_and_update(cfg)
 
     @pytest.mark.parametrize("block_source", ["vllm", "optimum"])

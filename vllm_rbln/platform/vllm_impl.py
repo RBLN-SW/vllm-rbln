@@ -130,8 +130,6 @@ def _validate(vllm_config: "VllmConfig") -> None:
     parallel_config = vllm_config.parallel_config
     scheduler_config = vllm_config.scheduler_config
 
-    if model_config.enforce_eager:
-        raise ValueError("--enforce-eager is not supported with the 'vllm' model impl.")
     if getattr(vllm_config.speculative_config, "enforce_eager", False):
         raise ValueError(
             "speculative_config.enforce_eager is not supported "
