@@ -46,6 +46,15 @@ class SupportsRBLNMultiModal(Protocol):
     mm_encoder_patch_buckets: list[int]
     """Resolved, sorted, unique patch counts used by encoder warmup."""
 
+    @classmethod
+    def resolve_encoder_token_budgets(cls, vllm_config: "VllmConfig") -> list[int]:
+        """The sorted encoder token budgets to compile: the configured ones, or
+        the model's own choice when none are, refused if they cannot hold what
+        the processor emits. The platform calls this once at start-up with image
+        or video on and stores the result as ``encoder_token_budgets``, so given
+        that stored list it must return it unchanged."""
+        ...
+
     def compile_mm_encoder(self, compile_fn: Callable[[nn.Module], nn.Module]) -> None:
         """Compile the multimodal encoder with the runner's compile wrapper. A
         rank that owns no encoder returns without calling ``compile_fn``."""

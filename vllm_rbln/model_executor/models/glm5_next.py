@@ -1357,6 +1357,30 @@ class RBLNGlm5NextForConditionalGeneration(
 
     get_placeholder_str = Glm4vForConditionalGeneration.get_placeholder_str
 
+    @classmethod
+    def resolve_encoder_token_budgets(cls, vllm_config: VllmConfig) -> list[int]:
+        """Unset, the processor upper bounds of the enabled modalities: an image,
+        and a temporal video frame."""
+        mm_config = vllm_config.model_config.multimodal_config
+        info = MULTIMODAL_REGISTRY.create_processor(vllm_config.model_config).info
+        bounds = [
+            info.get_max_frame_tokens(m)
+            for m in ("image", "video")
+            if mm_config.get_limit_per_prompt(m) > 0
+        ]
+        budgets = sorted(vllm_config.additional_config.encoder_token_budgets) or sorted(
+            set(bounds)
+        )
+        max_tokens = max(bounds)
+        if budgets[-1] < max_tokens:
+            raise ValueError(
+                f"encoder_token_budgets {budgets} must reach "
+                f"{max_tokens} output tokens, the processor's upper bound "
+                "for an image or temporal video frame. Add a budget that "
+                "large, or lower max_image_tokens in --mm-processor-kwargs."
+            )
+        return budgets
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         with self._mark_language_model(vllm_config):
             super().__init__(vllm_config=vllm_config, prefix=prefix)
@@ -1378,23 +1402,8 @@ class RBLNGlm5NextForConditionalGeneration(
                     quant_config=None,
                     prefix=maybe_prefix(prefix, "visual"),
                 )
-            info = MULTIMODAL_REGISTRY.create_processor(vllm_config.model_config).info
-            bounds = [
-                info.get_max_frame_tokens(m)
-                for m in ("image", "video")
-                if mm_config.get_limit_per_prompt(m) > 0
-            ]
-            budgets = sorted(
-                vllm_config.additional_config.encoder_token_budgets
-            ) or sorted(set(bounds))
-            max_tokens = max(bounds)
-            if budgets[-1] < max_tokens:
-                raise ValueError(
-                    f"encoder_token_budgets {budgets} must reach "
-                    f"{max_tokens} output tokens, the processor's upper bound "
-                    "for an image or temporal video frame. Add a budget that "
-                    "large, or lower max_image_tokens in --mm-processor-kwargs."
-                )
+            budgets = vllm_config.additional_config.encoder_token_budgets
+            assert budgets, "encoder_token_budgets is resolved at start-up"
             merge = self.visual.spatial_merge_size
             self.mm_encoder_patch_buckets = [b * merge**2 for b in budgets]
         else:

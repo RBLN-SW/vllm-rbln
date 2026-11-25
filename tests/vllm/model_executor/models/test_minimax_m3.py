@@ -452,7 +452,10 @@ def _build_with_token_budgets(
     limits=None,
     segment_frames=4,
     is_first_rank=True,
+    resolve=True,
 ):
+    """The model as start-up builds it: the platform hook resolves the budgets
+    into the config, then construction reads them."""
     import vllm_rbln.model_executor.models.minimax_m3 as m3
     from vllm_rbln.config import RBLNConfig
 
@@ -494,6 +497,10 @@ def _build_with_token_budgets(
         quant_config=None,
         additional_config=RBLNConfig(encoder_token_budgets=budgets),
     )
+    if resolve and (limits["image"] or limits["video"]):
+        vllm_config.additional_config.encoder_token_budgets = (
+            cls.resolve_encoder_token_budgets(vllm_config)
+        )
     return cls(vllm_config=vllm_config)
 
 
@@ -694,6 +701,13 @@ def test_video_budget_preserves_upstream_estimate(
 def test_token_budgets_must_hold_an_image(monkeypatch):
     with pytest.raises(ValueError, match="must reach 576 output tokens"):
         _build_with_token_budgets(monkeypatch, [256])
+
+
+def test_construction_reads_the_budgets_resolved_at_startup(monkeypatch):
+    model = _build_with_token_budgets(monkeypatch, [256], resolve=False)
+    assert model.mm_encoder_patch_buckets == [1024]
+    with pytest.raises(AssertionError, match="resolved at start-up"):
+        _build_with_token_budgets(monkeypatch, [], resolve=False)
 
 
 @pytest.fixture

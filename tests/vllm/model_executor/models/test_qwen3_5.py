@@ -116,11 +116,12 @@ def test_video_buckets_follow_upstream_encoder_budget(monkeypatch, mm_processor_
 
 
 def _build_with_token_budgets(
-    monkeypatch, budgets, *, max_tokens=256, prefill_chunk_size=512
+    monkeypatch, budgets, *, max_tokens=256, prefill_chunk_size=512, resolve=True
 ):
     """The model with upstream's construction stubbed out: a largest image of
-    `max_tokens` output tokens (1024 patches unless given) and the given budgets.
-    As a dict, `max_tokens` is the largest frame of each modality that is on."""
+    `max_tokens` output tokens (1024 patches unless given) and the given budgets,
+    resolved into the config as the platform hook does at start-up. As a dict,
+    `max_tokens` is the largest frame of each modality that is on."""
     bounds = max_tokens if isinstance(max_tokens, dict) else {"image": max_tokens}
 
     def init(self, *, vllm_config, prefix="model"):
@@ -139,12 +140,22 @@ def _build_with_token_budgets(
     )
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(
-            get_multimodal_config=lambda: mm_config, max_model_len=8192
+            get_multimodal_config=lambda: mm_config,
+            max_model_len=8192,
+            hf_config=SimpleNamespace(
+                vision_config=SimpleNamespace(spatial_merge_size=MERGE)
+            ),
         ),
         additional_config=RBLNConfig(
             encoder_token_budgets=budgets, prefill_chunk_size=prefill_chunk_size
         ),
     )
+    if resolve:
+        vllm_config.additional_config.encoder_token_budgets = (
+            RBLNQwen3_5ForConditionalGeneration.resolve_encoder_token_budgets(
+                vllm_config
+            )
+        )
     return RBLNQwen3_5ForConditionalGeneration(vllm_config=vllm_config)
 
 
@@ -205,6 +216,13 @@ def test_token_budgets_below_the_largest_image_are_refused(monkeypatch):
     # No bucket would hold the processor's largest image.
     with pytest.raises(ValueError, match="must reach 256 output tokens"):
         _build_with_token_budgets(monkeypatch, [64])
+
+
+def test_construction_reads_the_budgets_resolved_at_startup(monkeypatch):
+    model = _build_with_token_budgets(monkeypatch, [64], resolve=False)
+    assert model.mm_encoder_patch_buckets == [256]
+    with pytest.raises(AssertionError, match="resolved at start-up"):
+        _build_with_token_budgets(monkeypatch, [], resolve=False)
 
 
 def test_a_request_frame_above_the_start_up_limit_is_refused(monkeypatch):

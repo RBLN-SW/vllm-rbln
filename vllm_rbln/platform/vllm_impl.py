@@ -376,6 +376,24 @@ def _validate(vllm_config: "VllmConfig") -> None:
     # which runs after this, keys "unset" and "set to the budget" alike.
     rbln_config.prefill_chunk_size = chunks
 
+    mm_config = model_config.multimodal_config
+    if mm_config is not None:
+        from vllm.model_executor.model_loader import get_model_architecture
+
+        from vllm_rbln.model_executor.models.interfaces import (
+            supports_rbln_multimodal,
+        )
+
+        model_cls, _ = get_model_architecture(model_config)
+        if supports_rbln_multimodal(model_cls) and any(
+            mm_config.get_limit_per_prompt(m) > 0 for m in ("image", "video")
+        ):
+            # Resolved once, after the prefill chunks it may read, so the API
+            # server's request checks and every worker read one value.
+            rbln_config.encoder_token_budgets = model_cls.resolve_encoder_token_budgets(
+                vllm_config
+            )
+
     cache_config = vllm_config.cache_config
     if cache_config.enable_prefix_caching and _keeps_recurrent_state(vllm_config):
         if (

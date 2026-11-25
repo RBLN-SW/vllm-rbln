@@ -1105,6 +1105,52 @@ def _prefill_chunk(size: int | list[int]):
     return mutate
 
 
+class TestEncoderTokenBudgets:
+    @pytest.fixture
+    def rbln_mm_model(self, monkeypatch):
+        """Resolve calls of an RBLN multimodal model the architecture names."""
+        calls = []
+
+        class Model:
+            merges_mm_embeds_in_graph = True
+
+            @classmethod
+            def resolve_encoder_token_budgets(cls, vllm_config):
+                rbln_config = vllm_config.additional_config
+                calls.append(
+                    (
+                        rbln_config.max_prefill_chunk_size,
+                        rbln_config.encoder_token_budgets,
+                    )
+                )
+                return [256, 576]
+
+        monkeypatch.setattr(
+            "vllm.model_executor.model_loader.get_model_architecture",
+            lambda model_config: (Model, "Model"),
+        )
+        return calls
+
+    @staticmethod
+    def _limits(image, video):
+        def mutate(config):
+            config.model_config.multimodal_config = SimpleNamespace(
+                mm_encoder_only=False,
+                get_limit_per_prompt={"image": image, "video": video}.get,
+            )
+
+        return mutate
+
+    @pytest.mark.parametrize("image, video", [(1, 0), (0, 1)])
+    def test_the_hook_stores_the_model_resolution(
+        self, reconfigure, rbln_mm_model, image, video
+    ):
+        config = reconfigure(self._limits(image, video))
+        # The prefill chunks are resolved before the model reads them.
+        assert rbln_mm_model == [(config.scheduler_config.max_num_batched_tokens, [])]
+        assert config.additional_config.encoder_token_budgets == [256, 576]
+
+
 class TestModelParallelSideEffect:
     @pytest.mark.parametrize(
         "ranks",
@@ -1776,13 +1822,18 @@ class TestMmPrefixRangeRequests:
             RBLNGemma4ForConditionalGeneration,
         )
 
-        _build(**engine_kwargs)
-        monkeypatch.setattr(ModelConfig, "is_mm_prefix_lm", property(lambda self: True))
+        config = _build(**engine_kwargs)
         monkeypatch.setattr(
             model_loader,
             "get_model_architecture",
             lambda model_config: (RBLNGemma4ForConditionalGeneration, "Gemma4"),
         )
+        # Serving images, so the hook resolves the budgets the request is held to.
+        config.model_config.multimodal_config = SimpleNamespace(
+            mm_encoder_only=False, get_limit_per_prompt=lambda m: int(m == "image")
+        )
+        RblnPlatform.check_and_update_config(config)
+        monkeypatch.setattr(ModelConfig, "is_mm_prefix_lm", property(lambda self: True))
         RblnPlatform.validate_request(
             {"mm_placeholders": placeholders}, SamplingParams()
         )
