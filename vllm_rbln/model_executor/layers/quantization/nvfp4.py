@@ -24,6 +24,8 @@ from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptNvFp4FusedMoE,
 )
 
+from vllm_rbln.model_executor.layers.fused_moe.utils import split_gate_up
+
 _PACKED_FP4_WEIGHT_DTYPE = "float4_e2m1fn"
 
 
@@ -81,12 +83,9 @@ class RBLNModelOptNvFp4FusedMoE(ModelOptNvFp4FusedMoE):
         hidden_states = x.reshape(num_tokens, -1)
         masked_routing_weights = router_logits
 
-        # w13 stacks gate (w1) then up (w3) along the output dim.
-        intermediate_size = layer.w13_weight.shape[1] // 2
-        gate_proj_weight = layer.w13_weight[:, :intermediate_size, :]
-        up_proj_weight = layer.w13_weight[:, intermediate_size:, :]
-        gate_proj_scale = layer.w13_weight_scale[:, :intermediate_size, :]
-        up_proj_scale = layer.w13_weight_scale[:, intermediate_size:, :]
+        act = layer.activation
+        gate_proj_weight, up_proj_weight = split_gate_up(layer.w13_weight, act)
+        gate_proj_scale, up_proj_scale = split_gate_up(layer.w13_weight_scale, act)
 
         out = torch.ops.rbln_custom_ops.custom_moe(
             hidden_states,
@@ -105,7 +104,8 @@ class RBLNModelOptNvFp4FusedMoE(ModelOptNvFp4FusedMoE):
             down_proj_scale_2=layer.w2_weight_scale_2,
             weight_dtype=_PACKED_FP4_WEIGHT_DTYPE,
             swiglu_alpha=layer.swiglu_alpha,
-            swiglu_limit=layer.swiglu_limit,
+            # 0 is upstream's "no clamp"; custom_moe clamps whenever a limit is given.
+            swiglu_limit=layer.swiglu_limit or None,
             swiglu_beta=layer.swiglu_beta,
         )
         return out.reshape(orig_shape)

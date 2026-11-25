@@ -16,6 +16,8 @@ import torch
 from vllm.model_executor.layers.fused_moe import UnquantizedFusedMoEMethod
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 
+from vllm_rbln.model_executor.layers.fused_moe.utils import split_gate_up
+
 
 class RBLNUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     """Unquantized MoE method for the RBLNMoERunner forward path.
@@ -36,10 +38,8 @@ class RBLNUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         # instead of upstream MoERunner's topk_weights/topk_ids interface.
         assert isinstance(w13 := layer.w13_weight, torch.Tensor)
         assert isinstance(w2 := layer.w2_weight, torch.Tensor)
-        intermediate_size = w2.shape[-1]
 
-        gate_proj_weight = w13[:, :intermediate_size, :]
-        up_proj_weight = w13[:, intermediate_size:, :]
+        gate_proj_weight, up_proj_weight = split_gate_up(w13, layer.activation)
         down_proj_weight = w2
 
         orig_shape = x.shape
@@ -55,6 +55,9 @@ class RBLNUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             masked_routing_weights,
             layer.activation.value,
             expert_map=layer.expert_map,
+            swiglu_alpha=layer.swiglu_alpha,
+            # 0 is upstream's "no clamp"; custom_moe clamps whenever a limit is given.
             swiglu_limit=layer.swiglu_limit or None,
+            swiglu_beta=layer.swiglu_beta,
         )
         return final_hidden_states.reshape(orig_shape)

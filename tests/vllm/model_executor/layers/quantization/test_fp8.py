@@ -17,6 +17,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from vllm.config import set_current_vllm_config
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 
 from vllm_rbln.config import RBLNConfig
@@ -53,11 +54,13 @@ def _layer(swiglu_limit, activation="silu"):
         w2_weight_scale_inv=scale(EXPERTS, HIDDEN // BLOCK, INTER // BLOCK),
         activation=SimpleNamespace(value=activation),
         expert_map=None,
+        swiglu_alpha=None,
         swiglu_limit=swiglu_limit,
+        swiglu_beta=None,
     )
 
 
-def _reference(layer, x, routing, limit, act=torch.nn.functional.silu):
+def _reference(layer, x, routing, limit, act=torch.nn.functional.silu, beta=0.0):
     def deq(w, s):
         s = s.repeat_interleave(BLOCK, 1).repeat_interleave(BLOCK, 2)
         return w.float() * s
@@ -71,7 +74,7 @@ def _reference(layer, x, routing, limit, act=torch.nn.functional.silu):
         if limit:
             gate = gate.clamp(max=limit)
             up = up.clamp(min=-limit, max=limit)
-        out += (act(gate) * up @ w2[e].T) * routing[e, :, None]
+        out += (act(gate) * (up + beta) @ w2[e].T) * routing[e, :, None]
     return out
 
 
@@ -110,3 +113,25 @@ def test_w8a8_apply_clamps_the_swiglu():
     unclamped = _reference(layer, x, routing, None)
     # fp8 activations: closer to the clamped reference than to the unclamped one
     assert (out - clamped).norm() < 0.2 * (out - unclamped).norm()
+
+
+def test_apply_adds_the_beta_on_up():
+    """swiglu_beta reaches the op: act(gate.clamp(max=L)) * (up.clamp(+-L) + beta)."""
+    layer = _layer(0.25)
+    layer.swiglu_beta = 0.5
+    g = torch.Generator().manual_seed(1)
+    x = torch.randn(TOKENS, HIDDEN, generator=g)
+    routing = torch.softmax(torch.randn(EXPERTS, TOKENS, generator=g), dim=0)
+    out = _method(layer).apply(layer, x, routing).float()
+    expected = _reference(layer, x, routing, 0.25, beta=0.5)
+    torch.testing.assert_close(out, expected, atol=1e-3, rtol=1e-3)
+    assert not torch.allclose(out, _reference(layer, x, routing, 0.25))
+
+
+def test_apply_refuses_an_interleaved_w13():
+    layer = _layer(None)
+    layer.activation = MoEActivation.SWIGLUOAI
+    x = torch.randn(TOKENS, HIDDEN)
+    routing = torch.softmax(torch.randn(EXPERTS, TOKENS), dim=0)
+    with pytest.raises(NotImplementedError, match="interleaves"):
+        _method(layer).apply(layer, x, routing)

@@ -14,6 +14,7 @@
 
 import torch
 from vllm.forward_context import get_forward_context
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 
 
 def get_tokens_mask(
@@ -78,3 +79,17 @@ def get_tokens_mask(
     if device is not None:
         tokens_mask = tokens_mask.to(device)
     return tokens_mask
+
+
+def split_gate_up(
+    w13: torch.Tensor, activation: MoEActivation
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gate and up rows of a w13 tensor (weight, bias or row-wise scale), axis 1.
+
+    SWIGLUOAI checkpoints (gpt-oss) interleave them ([gate0, up0, gate1, ...]);
+    every other activation, SWIGLUOAI_UNINTERLEAVE included, stacks gate then up.
+    """
+    if activation == MoEActivation.SWIGLUOAI:
+        return w13[:, ::2], w13[:, 1::2]
+    half = w13.shape[1] // 2
+    return w13[:, :half], w13[:, half:]
