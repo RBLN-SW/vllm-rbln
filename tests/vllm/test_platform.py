@@ -426,22 +426,26 @@ def _as_glm5_next(config: VllmConfig) -> None:
 class TestRejectedConfigs:
     @pytest.mark.parametrize(
         ("block_size", "max_num_batched_tokens", "invalid_block_size"),
-        [(128, 128, 127), (16384, 128, 16385), (16384, 16384, 16385)],
+        [(16384, 128, 16385), (16384, 16384, 16385)],
     )
     def test_block_size_range(
         self, block_size, max_num_batched_tokens, invalid_block_size
     ):
         _build(block_size=block_size, max_num_batched_tokens=max_num_batched_tokens)
-        with pytest.raises(
-            ValidationError,
-            match=(
-                "RBLN requires max_num_batched_tokens <= block_size <= max_block_size"
-            ),
-        ):
+        with pytest.raises(ValidationError, match="block_size <= max_block_size"):
             _build(
                 block_size=invalid_block_size,
                 max_num_batched_tokens=max_num_batched_tokens,
             )
+
+    @pytest.mark.parametrize("npu", ["RBLN-CR03", "RBLN-CR13"])
+    def test_only_cr13_takes_a_step_longer_than_a_block(self, monkeypatch, npu):
+        monkeypatch.setattr(platform.rebel, "get_npu_name", lambda *a, **kw: npu)
+        if npu == "RBLN-CR13":
+            _build(block_size=127, max_num_batched_tokens=128)
+            return
+        with pytest.raises(ValidationError, match="max_num_batched_tokens <= block"):
+            _build(block_size=127, max_num_batched_tokens=128)
 
     @pytest.mark.parametrize("max_num_batched_tokens", [16, 128, None])
     def test_block_size_must_be_explicit(self, max_num_batched_tokens):

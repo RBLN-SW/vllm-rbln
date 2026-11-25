@@ -305,10 +305,21 @@ class TestSubBlockSizeInUse:
         with pytest.raises(ValueError, match=named):
             self._call(sub_block_size=128, **off)
 
-    def test_a_chunk_outside_the_block_bounds_is_rejected(self, eligible):
+    @pytest.mark.parametrize(("block_size", "chunk"), [(256, 512), (1024, 256)])
+    def test_a_size_above_the_block_or_the_chunk_is_rejected(
+        self, eligible, block_size, chunk
+    ):
         eligible(True)
-        with pytest.raises(ValueError, match="block_size >="):
-            self._call(block_size=256, prefill_chunk_sizes=[512], sub_block_size=256)
+        with pytest.raises(ValueError, match="at most block_size"):
+            self._call(
+                block_size=block_size, prefill_chunk_sizes=[chunk], sub_block_size=512
+            )
+
+    def test_a_chunk_longer_than_the_block_keeps_its_sub_blocks(self, cr13):
+        # An image of 1120 tokens runs in one chunk over 1024-token blocks.
+        kv = make_kv_cache_config([full_attention_spec(1024)])
+        sizes = [256, 1120]
+        assert self._call(prefill_chunk_sizes=sizes, kv_cache_config=kv) == 256
 
     def test_a_size_the_kv_cache_cannot_hold_is_rejected(self, eligible):
         # A size that is not a divisor of block_size, or a spec with no token
