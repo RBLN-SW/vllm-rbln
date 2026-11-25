@@ -353,6 +353,12 @@ class RBLNInklingMoE(nn.Module):
         self.gate.global_scale = nn.Parameter(
             torch.ones(1, dtype=torch.float32), requires_grad=False
         )
+        num_scores = config.n_routed_experts + config.n_shared_experts
+        self.register_buffer(
+            "shared_mask",
+            (torch.arange(num_scores) >= config.n_routed_experts).float(),
+            persistent=False,
+        )
         self.shared_experts = nn.ModuleList(
             RBLNInklingMLP(
                 config.hidden_size,
@@ -381,21 +387,28 @@ class RBLNInklingMoE(nn.Module):
         shape = hidden_states.shape
         tokens = hidden_states.reshape(-1, shape[-1])
         scores = torch.sigmoid(self.gate(tokens.float())[0])
-        # Expert-major, as the MoE runner selects: a token-major gather over
-        # 256 experts does not compile for one token.
         routed_scores = scores[:, : self.num_routed].transpose(0, 1)
         _, selected = torch.topk(
-            routed_scores + self.gate.e_score_correction_bias[:, None],
+            routed_scores + self.gate.e_score_correction_bias.unsqueeze(1),
             self.top_k,
             dim=0,
         )
-        topk_sum = routed_scores.gather(0, selected).sum(0)[:, None]
+        weights = routed_scores.gather(0, selected)
+        weights = weights / weights.sum(dim=0, keepdim=True).clamp_min(1e-20)
+        masked = torch.zeros_like(routed_scores)
+        masked.scatter_(0, selected, weights)
+        # masked is score / topk_sum on the selected experts, zero elsewhere.
+        # Reduced token-major: a sum over the expert axis of [E, 1] leaves the
+        # device for one token.
+        masked = masked.transpose(0, 1)
+        topk_sum = (masked * scores[:, : self.num_routed]).sum(-1, keepdim=True) / (
+            masked * masked
+        ).sum(-1, keepdim=True)
         shared_scores = scores[:, self.num_routed :]
-        scale = (
-            self.route_scale
-            * self.gate.global_scale
-            / (topk_sum + shared_scores.sum(-1, keepdim=True))
-        )
+        # Masked rather than summed over the two shared columns: an op on a
+        # 2-wide last axis leaves the device.
+        shared_sum = (scores * self.shared_mask).sum(-1, keepdim=True)
+        scale = self.route_scale * self.gate.global_scale / (topk_sum + shared_sum)
 
         routed = self.experts(
             hidden_states=hidden_states,
