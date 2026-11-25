@@ -3634,16 +3634,21 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             name: position for position, name in enumerate(self.kv_cache_names)
         }
         canonical = self._select_canonical_kv_layers_per_pool(kv_cache_config)
-        # Bound in a full-attention shape, a Gemma4 buffer is placed apart in the
-        # target and MTP drafter graphs, which rebel-compiler refuses. It binds
-        # the sliding-window shape; a sub-block hit then copies the layers viewed
-        # otherwise as whole blocks, the only bytes both layouts place alike.
-        gemma4 = self.model_config.hf_text_config.model_type == "gemma4_text"
+        # A drafter layer sharing the target's KV puts the buffers in two graphs,
+        # and bound in a full-attention shape rebel-compiler places them apart in
+        # each. They bind the sliding-window shape then; a sub-block hit copies the
+        # layers viewed otherwise as whole blocks, the only bytes both layouts
+        # place alike.
+        drafter_shares_kv = isinstance(
+            self.drafter, DRAFT_MODEL_PROPOSERS
+        ) and not self.drafter._draft_attn_layer_names.isdisjoint(
+            self.shared_kv_cache_layers
+        )
         bound = (
             self._select_canonical_kv_layers_per_pool(
                 kv_cache_config, prefer=SlidingWindowSpec
             )
-            if gemma4
+            if drafter_shares_kv
             else canonical
         )
         # A block-aux cache is outside the KV cache config, so no canonical layer
@@ -3657,7 +3662,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         self.kv_cache_whole_block_copy = {
             name
             for name, info in zip(self.kv_cache_names, self.kv_cache_view_infos)
-            if gemma4
+            if drafter_shares_kv
             and info.view_shape != tuple(self.kv_cache_bases[info.base_index].shape)
         }
         if dynamic_kv_enabled(self.vllm_config) and self.kv_cache_bases:
