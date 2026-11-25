@@ -262,6 +262,41 @@ class TestKVCacheBaseBindings:
         assert window_info.view_shape != full_info.view_shape
         assert [tuple(b.shape) for b in runner.kv_cache_bases] == [full_info.view_shape]
 
+    def test_a_buffer_a_drafter_shares_is_bound_in_the_sliding_window_shape(
+        self, make_model_runner
+    ):
+        # The same buffer, read by a drafter layer too: bound as the sliding-window
+        # layer views it, so the full-attention layer is copied whole on a hit.
+        runner = make_model_runner(
+            layers=("layer.0", "layer.1", "draft.0"),
+            init_kv_cache=False,
+        )
+        context = runner.compilation_config.static_forward_context
+        context["draft.0"].kv_sharing_target_layer_name = "layer.0"
+        runner.drafter = object.__new__(mr.RBLNEagleProposer)
+        runner.drafter._draft_attn_layer_names = {"draft.0"}
+        # Only its layer names matter here, not its attention metadata.
+        runner.drafter.initialize_attn_backend = lambda *args: None
+        assert "draft.0" not in runner.get_kv_cache_spec()
+        full = runner.get_kv_cache_spec()["layer.1"]
+        sliding = SlidingWindowSpec(
+            block_size=full.block_size,
+            num_kv_heads=full.num_kv_heads,
+            head_size=full.head_size,
+            dtype=full.dtype,
+            sliding_window=BLOCK_SIZE // 4,
+        )
+        runner.initialize_kv_cache(
+            make_kv_cache_config(
+                groups=[("layer.0",), ("layer.1",)], specs=[sliding, full]
+            )
+        )
+        infos = dict(zip(runner.kv_cache_names, runner.kv_cache_view_infos))
+        window_shape = infos["layer.0"].view_shape
+        assert window_shape != infos["layer.1"].view_shape
+        assert [tuple(b.shape) for b in runner.kv_cache_bases] == [window_shape]
+        assert runner.kv_cache_whole_block_copy == {"layer.1"}
+
 
 class TestSubBlockSettingAtKvInit:
     def test_a_sub_block_setting_is_refused_before_warm_up(self, make_model_runner):
