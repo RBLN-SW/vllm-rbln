@@ -21,7 +21,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import vllm_rbln.platform as platform
 import vllm_rbln.v1.spec_decode.medusa as medusa_module
 from tests.vllm.v1.spec_decode.utils import make_medusa_proposer
 
@@ -35,28 +34,6 @@ class TestInit:
             proposer.max_num_seqs,
             proposer.hidden_size,
         )
-
-    def test_no_compile_context_when_device_tensors_on(self, monkeypatch):
-        # With device tensors the model runs on-device, so no compile context.
-        monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", True)
-        proposer = make_medusa_proposer(compile_context=object())
-        assert proposer.compile_context is None
-
-    def test_uses_injected_compile_context_when_device_tensors_off(self, monkeypatch):
-        monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", False)
-        sentinel = object()
-        proposer = make_medusa_proposer(compile_context=sentinel)
-        assert proposer.compile_context is sentinel
-
-    def test_creates_compile_context_when_absent(self, monkeypatch):
-        # Without device tensors and no injected context, one is created.
-        monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", False)
-        marker = object()
-        monkeypatch.setattr(
-            medusa_module, "create_compile_context", lambda **kwargs: marker
-        )
-        proposer = make_medusa_proposer(compile_context=None)
-        assert proposer.compile_context is marker
 
 
 class TestLoadModel:
@@ -82,7 +59,7 @@ class TestLoadModel:
         proposer.load_model(target_model=object())
         assert proposer.model_executable is sentinel
         assert captured["fullgraph"] is True
-        assert "compile_context" in captured
+        assert captured["model_trace_method"] == "export"
 
     def test_wrapper_composes_forward(self, monkeypatch):
         # The wrapper runs the draft model then returns its compute_logits.

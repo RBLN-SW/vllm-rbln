@@ -116,7 +116,6 @@ from vllm_rbln import envs
 from vllm_rbln.compilation import (
     build_process_group_dict,
     compile,
-    create_compile_context,
     mark_decoder_regions,
     set_compile_stage,
 )
@@ -133,7 +132,6 @@ from vllm_rbln.model_executor.models.interfaces import (
     supports_rbln_mm_prefix,
     supports_rbln_multimodal,
 )
-from vllm_rbln.platform import use_device_tensor
 from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadata,
     RBLNFlashAttentionMetadataBuilder,
@@ -315,21 +313,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
 
         self.encoder_cache: dict[str, torch.Tensor] = {}
 
-        # NOTE(RBLN): Compilation context for marking the KV cache address as static.
-        self.compile_context = (
-            create_compile_context(use_weight_sharing=True, use_global_ctx=True)
-            if not use_device_tensor()
-            else None
-        )
-        self.runtime_holder: list = []
-
         self.use_async_scheduling = self.scheduler_config.async_scheduling
 
         # Sampler
         if self.rbln_config.use_custom_sampler:
             self.sampler = RBLNSampler(
                 logprobs_mode=self.model_config.logprobs_mode,
-                compile_context=self.compile_context,
                 fused_sampling=self.rbln_config.use_fused_sampling,
             )
             logger.info("Using RBLN sampler.")
@@ -402,9 +391,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 )
             self.rejection_sampler = RBLNRejectionSampler(
                 self.sampler,
-                self.compile_context,
-                self.speculative_config,
-                self.device,
+                spec_config=self.speculative_config,
+                device=self.device,
                 use_rbln_sampler=self.rbln_config.use_custom_sampler,
             )
 
@@ -553,7 +541,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         )
 
         self.offload_context = nullcontext
-        if use_device_tensor() and not envs.VLLM_RBLN_DISABLE_OFFLOAD:
+        if not envs.VLLM_RBLN_DISABLE_OFFLOAD:
             self.offload_context = torch.rbln.offload
 
         # What this step's ranks reported. The draft decides its own shapes from
@@ -2738,12 +2726,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             model_wrapper,
             dynamic=False,
             fullgraph=True,
-            compile_context=self.compile_context,
             num_devices=1,
-            model_trace_method="export" if use_device_tensor() else "",
+            model_trace_method="export",
             process_group_dict=process_group_dict,
             guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
-            runtime_holder=self.runtime_holder,
             mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
             # Logits are consumed by sampling within the same step, so the
             # output buffer can be reused across steps even under async scheduling.
@@ -2757,12 +2743,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     encoder,
                     dynamic=False,
                     fullgraph=True,
-                    compile_context=self.compile_context,
                     num_devices=1,
-                    model_trace_method="export" if use_device_tensor() else "",
+                    model_trace_method="export",
                     process_group_dict=process_group_dict,
                     guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
-                    runtime_holder=self.runtime_holder,
                     mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
                     use_static_output=True,
                 )
@@ -3363,7 +3347,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         # One buffer per extent, so the layers that alias one cache get one
         # tensor and the rest get their own. Not one pool the layers slice: a
         # graph input is a whole tensor, and dynamo refuses a slice's offset.
-        device = self.device if use_device_tensor() else "meta"
+        device = self.device
         extent_of = kv_cache_extents(kv_cache_config)
         buffers = {
             extent: torch.empty(extent[1], dtype=torch.int8, device=device)
@@ -3663,16 +3647,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         for layer_name, kv_cache in kv_caches.items():
             forward_context[layer_name].kv_cache = kv_cache
 
-        if not use_device_tensor():
-            # `mark_static_address` is last-write-wins on storage->name. Pin to
-            # one canonical layer per pool so the runtime, the connector's host
-            # buffers, and the runtime copy path address the same name (and the
-            # same logical block_id space).
-            for name, kv_cache in kv_caches.items():
-                if name not in canonical:
-                    continue
-                self.compile_context.mark_static_address(kv_cache, name)
-
         return kv_caches
 
     def _allocate_aux_kv_caches(
@@ -3683,7 +3657,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         kv_cache_view_infos: dict[str, KVCacheViewInfo],
         block_axes: dict[str, int],
     ) -> None:
-        device = self.device if use_device_tensor() else "meta"
+        device = self.device
         num_blocks = kv_cache_config.num_blocks
         extent_of = kv_cache_extents(kv_cache_config)
         # Sized with the KV cache: the dynamic-KV resize reads their growth from
@@ -4344,7 +4318,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         block pool, so each cache copies the page; a page another group owns is
         unused by its own group there.
         """
-        assert use_device_tensor()
         dsts: list[torch.Tensor] = []
         srcs: list[torch.Tensor] = []
         seen: set[int] = set()
@@ -4364,14 +4337,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         self,
         copy_ops: list[KVCacheCopyOp],
     ) -> None:
-        if not use_device_tensor():
-            # NOTE(RBLN): The runtime KV-copy interface is no longer actively maintained
-            # in this path (--model-impl vllm).
-            for op in copy_ops:
-                runtime = self.runtime_holder[0]
-                runtime._copy_kv_cache(op.src_block_id, op.dst_block_id, op.num_tokens)
-            return
-
         dsts: list[torch.Tensor] = []
         srcs: list[torch.Tensor] = []
         for op in copy_ops:

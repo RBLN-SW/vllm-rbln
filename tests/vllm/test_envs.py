@@ -135,28 +135,13 @@ def test_num_devices_precedence(monkeypatch, new, legacy, expected):
     assert envs.get_num_devices_per_local_rank() == expected
 
 
-@pytest.mark.parametrize(
-    ("auto_port", "device_tensor", "expected"),
-    [
-        (None, None, True),  # follows the device-tensor default, which is on
-        (None, "1", True),
-        (None, "0", False),  # the coupling: no explicit auto-port, tensors off
-        ("1", "0", True),  # explicit setting overrides the coupling
-        ("0", "1", False),
-    ],
-)
-def test_auto_port_follows_device_tensor(
-    monkeypatch, auto_port, device_tensor, expected
-):
-    for name, value in (
-        ("VLLM_RBLN_AUTO_PORT", auto_port),
-        ("VLLM_RBLN_USE_DEVICE_TENSOR", device_tensor),
-    ):
-        if value is None:
-            monkeypatch.delenv(name, raising=False)
-        else:
-            monkeypatch.setenv(name, value)
-    assert envs.use_auto_port() is expected
+@pytest.mark.parametrize(("raw", "expected"), [(None, True), ("1", True), ("0", False)])
+def test_auto_port_defaults_on_and_can_be_disabled(monkeypatch, raw, expected):
+    if raw is None:
+        monkeypatch.delenv("VLLM_RBLN_AUTO_PORT", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_RBLN_AUTO_PORT", raw)
+    assert envs.VLLM_RBLN_AUTO_PORT is expected
 
 
 # The bool lambdas come in two shapes differing only in their default; an
@@ -289,8 +274,7 @@ def test_type_checking_block_lists_every_variable():
 @pytest.mark.parametrize("name", RBLN_KEYS)
 def test_declared_default_matches_resolved(monkeypatch, name):
     """A clean environment resolves to the declared default. All RBLN vars are
-    cleared, since some derive from a neighbour (use_auto_port falls back to
-    VLLM_RBLN_USE_DEVICE_TENSOR) rather than a literal."""
+    cleared so defaults are checked independently of the caller's environment."""
     annotation, declared_default = _declared_in_type_checking()[name]
     for key in (
         set(RBLN_KEYS) | set(ENV_SOURCE_ALIASES.values()) | {"VLLM_RBLN_TP_SIZE"}
@@ -322,7 +306,7 @@ def test_rbln_variables_are_registered_with_vllm():
     )
     # Registered *and* resolvable: ray_env only needs the name, but collect_env
     # and any direct reader go through vllm.envs' own attribute lookup.
-    assert getattr(upstream_envs, "VLLM_RBLN_USE_DEVICE_TENSOR") is True  # noqa: B009
+    assert getattr(upstream_envs, "VLLM_RBLN_AUTO_PORT") is True  # noqa: B009
 
 
 def test_compile_env_partition_covers_every_variable():

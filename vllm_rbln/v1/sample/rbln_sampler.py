@@ -19,6 +19,7 @@ import rebel
 import torch
 import torch.nn as nn
 from vllm.config.model import LogprobsMode
+from vllm.platforms import current_platform
 from vllm.sampling_params import _SAMPLING_EPS
 from vllm.v1.outputs import LogprobsTensors, SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -29,7 +30,6 @@ from vllm.v1.worker.gpu_input_batch import InputBatch
 import vllm_rbln.envs as envs
 from vllm_rbln.compilation import compile, create_compile_context
 from vllm_rbln.logger import init_logger
-from vllm_rbln.platform import use_device_tensor
 from vllm_rbln.v1.sample.ops.fused_penalty import (
     FusedPenaltyPlan,
     FusedPenaltyState,
@@ -120,12 +120,13 @@ def compile_sampler(
     op: Callable[..., torch.Tensor],
     compile_context: rebel.CompileContext | None,
 ) -> Callable[..., torch.Tensor]:
+    device_tensor = current_platform.device_type == "rbln"
     compile_context = (
         compile_context
         or create_compile_context(
             use_global_ctx=True,
         )
-        if not use_device_tensor()
+        if not device_tensor
         else None
     )
     return compile(
@@ -133,11 +134,11 @@ def compile_sampler(
         dynamic=False,
         fullgraph=True,
         compile_context=compile_context,
-        num_devices=1 if use_device_tensor() else None,
-        model_trace_method="export" if use_device_tensor() else "",
+        num_devices=1 if device_tensor else None,
+        model_trace_method="export" if device_tensor else "",
         mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
-        use_global_ctx=True if not use_device_tensor() else None,
-        global_device_id=0 if not use_device_tensor() else None,
+        use_global_ctx=True if not device_tensor else None,
+        global_device_id=0 if not device_tensor else None,
         # FIXME: Currently, sampler ops do not support caching.
         # Reusing seed buffer is not supported when the compiled sampler is loaded.
         use_cache=False,
@@ -203,7 +204,7 @@ class RBLNSampler(VLLMSampler):
             or create_compile_context(
                 use_global_ctx=True,
             )
-            if not use_device_tensor()
+            if current_platform.device_type == "cpu"
             else None
         )
         if logprobs_mode in ("raw_logprobs", "raw_logits"):

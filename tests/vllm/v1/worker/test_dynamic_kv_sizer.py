@@ -424,7 +424,6 @@ class TestModeResolution:
     the sizer branches on the mode instead of re-reading them."""
 
     def test_explicit_off_is_silent_in_the_worker(self, monkeypatch, caplog):
-        monkeypatch.setenv("VLLM_RBLN_USE_DEVICE_TENSOR", "1")
         config = SimpleNamespace(
             cache_config=SimpleNamespace(
                 num_gpu_blocks_override=None,

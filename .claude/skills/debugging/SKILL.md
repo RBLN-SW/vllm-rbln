@@ -16,7 +16,7 @@ Get a reproducer before changing anything, and narrow it to the smallest input a
 Check these before concluding anything, because each one makes a reproduction silently exercise something other than what you think:
 
 - **`tests/vllm/` scrubs `VLLM_RBLN_*`.** Exported values do not reach it; the session options are the only way in. A knob you "set" may never have applied.
-- **The vllm suite always uses device tensors.** Its common environment pins `VLLM_RBLN_USE_DEVICE_TENSOR=1` before the platform is imported.
+- **The vllm suite always uses device tensors.** The suite selects the vllm model path before the platform is imported.
 - **Marks decide the process.** `model_compile` items run in a spawned child. `use_device` alone runs in this process, so check for global state left by earlier tests when a unit test fails only in a combined run.
 
 ## 2. Make the evidence discriminate

@@ -57,16 +57,6 @@ def _configure_logging(config: "LoggingConfig | None" = None) -> None:
 # argument parsing and cover both model paths, before the patch registry runs.
 vllm_logger._configure_vllm_root_logger = _configure_logging
 
-# Assigned by `_apply_model_impl`, which this module calls once at the bottom
-# and `register_ops` calls again once the arguments name the model path. Read it
-# through `use_device_tensor()`: a copy bound at import keeps the import-time guess.
-USE_DEVICE_TENSOR: bool = False
-
-
-def use_device_tensor() -> bool:
-    return USE_DEVICE_TENSOR
-
-
 # RBLN default for an unset max_num_seqs (upstream vLLM defaults to 256).
 RBLN_DEFAULT_MAX_NUM_SEQS = 1
 RBLN_DEFAULT_MAX_NUM_BATCHED_TOKENS = 512
@@ -467,8 +457,7 @@ class RblnPlatform(Platform):
         # kv_buffer_device "cpu" is the host-bounce path; "rbln" is the D2D
         # path (upstream NixlConnectorWorker.__init__ rejects kv_buffer_device
         # values not listed here). Listed under both device_types because
-        # device_type is "rbln" only on the vllm model path, and only
-        # with VLLM_RBLN_USE_DEVICE_TENSOR set.
+        # device_type is "rbln" on the vllm model path.
         return {
             "cpu": ("cpu", "rbln"),
             "rbln": ("rbln", "cpu"),
@@ -509,15 +498,15 @@ def _apply_model_impl(model_impl: "ModelImpl", *, publish: bool = True) -> None:
     a guess while the deprecated variable still selects the path, and
     `register_ops` reads the variable as proof that someone resolved it.
     """
-    global USE_DEVICE_TENSOR, _MODEL_IMPL
+    global _MODEL_IMPL
 
     _MODEL_IMPL = model_impl
     if publish:
         os.environ[envs.RESOLVED_MODEL_IMPL_ENV] = model_impl
-    USE_DEVICE_TENSOR = model_impl == "vllm" and envs.VLLM_RBLN_USE_DEVICE_TENSOR
-    RblnPlatform.device_name = "rbln" if USE_DEVICE_TENSOR else "cpu"
-    RblnPlatform.device_type = "rbln" if USE_DEVICE_TENSOR else "cpu"
-    RblnPlatform.dist_backend = "rbln-ccl" if USE_DEVICE_TENSOR else ""
+    on_rbln = model_impl == "vllm"
+    RblnPlatform.device_name = "rbln" if on_rbln else "cpu"
+    RblnPlatform.device_type = "rbln" if on_rbln else "cpu"
+    RblnPlatform.dist_backend = "rbln-ccl" if on_rbln else ""
 
 
 _apply_model_impl(envs.model_impl_from_env(), publish=False)  # type: ignore[arg-type]

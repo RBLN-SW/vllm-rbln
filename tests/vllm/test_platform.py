@@ -60,19 +60,6 @@ _ENGINE_ARGS = dict(
 
 # Modules that read the device flag. The DP launcher of vllm-rbln-executor
 # imports them before the model path is resolved.
-_DEVICE_FLAG_READERS = frozenset(
-    {
-        "vllm_rbln.patches.deepseek_mtp",
-        "vllm_rbln.platform.vllm_impl",
-        "vllm_rbln.v1.sample.rbln_rejection_sampler",
-        "vllm_rbln.v1.sample.rbln_sampler",
-        "vllm_rbln.v1.spec_decode.dflash",
-        "vllm_rbln.v1.spec_decode.eagle",
-        "vllm_rbln.v1.spec_decode.medusa",
-        "vllm_rbln.v1.worker.rbln_model_runner",
-    }
-)
-
 _STANDALONE = "RBLN_CTX_STANDALONE"
 # Means "the platform did not touch it". Set rather than deleted so monkeypatch
 # has recorded the key and can roll back the platform's direct os.environ write.
@@ -358,16 +345,7 @@ class TestPlatformIdentity:
             RblnPlatform.device_type,
             RblnPlatform.dist_backend,
         )
-        if platform.USE_DEVICE_TENSOR:
-            assert triple == ("rbln", "rbln", "rbln-ccl")
-        else:
-            assert triple == ("cpu", "cpu", "")
-
-    def test_device_tensor_needs_both_switches(self):
-        assert platform.USE_DEVICE_TENSOR is (
-            platform.envs.model_impl_from_env() == "vllm"
-            and platform.envs.VLLM_RBLN_USE_DEVICE_TENSOR
-        )
+        assert triple == ("rbln", "rbln", "rbln-ccl")
 
     @pytest.mark.parametrize(
         ("attribute", "expected"),
@@ -1225,11 +1203,10 @@ class TestWorkerAndScheduler:
 
     def test_a_plain_build_lands_on_the_async_scheduler(self, monkeypatch):
         # Nobody passes --async-scheduling here: vLLM resolves the unset flag to
-        # True before this platform hook, and with both carriers on nothing
+        # True before this platform hook, and with the custom sampler on nothing
         # refuses it, so the vllm model path selects the async scheduler. This is
         # what the async support changed, and it went unasserted.
-        for name in ("VLLM_RBLN_USE_DEVICE_TENSOR", "VLLM_RBLN_SAMPLER"):
-            monkeypatch.setenv(name, "1")
+        monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
         config = _build()
         assert config.scheduler_config.async_scheduling is True
         assert (
@@ -1290,22 +1267,8 @@ class TestSchedulerOverrides:
         monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
         assert _build(async_scheduling=True).scheduler_config.async_scheduling is True
 
-    @pytest.mark.parametrize(
-        "switched_off", ["VLLM_RBLN_USE_DEVICE_TENSOR", "VLLM_RBLN_SAMPLER"]
-    )
-    def test_async_scheduling_needs_the_device_token_carriers(
-        self, monkeypatch, switched_off
-    ):
-        """Either env var off means async has no way to carry its in-flight tokens.
-
-        VLLM_RBLN_USE_DEVICE_TENSOR gates the feedback scatter that replaces the
-        scheduler's -1 placeholders; VLLM_RBLN_SAMPLER gates the ring the output
-        thread reads. Without them the runner decodes from a token that was never
-        sampled and returns wrong text with no error raised, so the platform
-        downgrades to sync rather than run the combination.
-        """
-        monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
-        monkeypatch.setenv(switched_off, "0")
+    def test_async_scheduling_needs_the_custom_sampler(self, monkeypatch):
+        monkeypatch.setenv("VLLM_RBLN_SAMPLER", "0")
         config = _build(async_scheduling=True)
         assert config.scheduler_config.async_scheduling is False
         assert config.scheduler_config.scheduler_cls.endswith("RBLNScheduler")
@@ -1815,7 +1778,7 @@ class TestModelImpl:
         platform._apply_model_impl("optimum")
 
     def test_building_a_config_from_the_flag_alone_reaches_the_device(
-        self, on_the_other_path
+        self, on_the_other_path, monkeypatch
     ):
         """`LLM(...)` builds its config without ever parsing a command line.
 
@@ -1824,12 +1787,12 @@ class TestModelImpl:
         stay on the optimum path.
         """
         assert RblnPlatform.device_type == "cpu"
+        monkeypatch.setenv("VLLM_RBLN_USE_DEVICE_TENSOR", "0")
 
         config = _build(model_impl="vllm")
 
         assert isinstance(config.additional_config, RBLNConfig)
         assert RblnPlatform.device_type == "rbln"
-        assert platform.USE_DEVICE_TENSOR is True
         assert os.environ[platform.envs.RESOLVED_MODEL_IMPL_ENV] == "vllm"
 
     def test_auto_reads_the_model_off_the_engine_args(self, monkeypatch):
@@ -2025,30 +1988,3 @@ class TestModelImpl:
         )
         assert out.returncode == 0, out.stderr[-2000:]
         assert out.stdout.strip().endswith("None"), out.stdout
-
-    def test_a_module_imported_before_resolution_reads_the_resolved_flag(self):
-        import subprocess
-        import sys
-
-        probe = (
-            "import importlib, sys;"
-            "from vllm.platforms import current_platform;"
-            "from vllm_rbln import platform;"
-            "mods = [importlib.import_module(m) for m in sorted(READERS)];"
-            "platform._apply_model_impl('vllm');"
-            "print(platform.USE_DEVICE_TENSOR,"
-            " [m.__name__ for m in mods if hasattr(m, 'USE_DEVICE_TENSOR')])"
-        ).replace("READERS", repr(_DEVICE_FLAG_READERS))
-        out = subprocess.run(
-            [sys.executable, "-c", probe],
-            capture_output=True,
-            text=True,
-            env={
-                k: v
-                for k, v in os.environ.items()
-                if not k.startswith("VLLM_RBLN")
-                and k != platform.envs.RESOLVED_MODEL_IMPL_ENV
-            },
-        )
-        assert out.returncode == 0, out.stderr[-2000:]
-        assert out.stdout.strip().endswith("True []"), out.stdout

@@ -51,11 +51,8 @@ if TYPE_CHECKING:
     VLLM_RBLN_COMPILE_STRICT_MODE: bool = True
     VLLM_RBLN_COMPILE_ONLY: bool = False
     VLLM_RBLN_NUM_HIDDEN_LAYERS: int = 0
-    VLLM_RBLN_USE_DEVICE_TENSOR: bool = True
     VLLM_RBLN_DISABLE_OFFLOAD: bool = True
     VLLM_RBLN_DISABLE_WORKER_FAIL_FAST: bool = False
-    # Default follows VLLM_RBLN_USE_DEVICE_TENSOR (see use_auto_port), so it is
-    # True unless device-tensor mode is explicitly disabled.
     VLLM_RBLN_AUTO_PORT: bool = True
     VLLM_RBLN_ENFORCE_MODEL_FP32: bool = False
     # --- DYNAMIC KV CACHE ---
@@ -143,18 +140,6 @@ def get_decode_batch_bucket_manual_buckets() -> list[int]:
             f"Invalid VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS: "
             f"{manual_buckets}, {e}"
         ) from e
-
-
-def use_auto_port() -> bool:
-    raw = os.environ.get("VLLM_RBLN_AUTO_PORT")
-    if raw is not None:
-        return raw.lower() in ("true", "1")
-    # Default follows device-tensor mode: auto port is on when
-    # VLLM_RBLN_USE_DEVICE_TENSOR is enabled.
-    return os.environ.get("VLLM_RBLN_USE_DEVICE_TENSOR", "True").lower() in (
-        "true",
-        "1",
-    )
 
 
 # Not a knob, so it is a plain constant and has no entry below: the frontend
@@ -263,19 +248,8 @@ environment_variables = {
     "VLLM_RBLN_NUM_HIDDEN_LAYERS": lambda: int(
         os.environ.get("VLLM_RBLN_NUM_HIDDEN_LAYERS", 0)
     ),
-    # Use RBLN device tensors end-to-end (platform device_type="rbln",
-    # KV cache / inputs on device, CPU-first attention metadata, padded
-    # sampling metadata, no CompileContext). Enabled by default; set to False
-    # to fall back to the host-tensor path.
-    "VLLM_RBLN_USE_DEVICE_TENSOR": (
-        lambda: (
-            os.environ.get("VLLM_RBLN_USE_DEVICE_TENSOR", "True").lower()
-            in ("true", "1")
-        )
-    ),
     # Disable RBLN file offloading during model loading and warm-up by default.
-    # Set to 0 to allow host-side weight data to be paged to disk
-    # when VLLM_RBLN_USE_DEVICE_TENSOR is enabled.
+    # Set to 0 to allow host-side weight data to be paged to disk.
     "VLLM_RBLN_DISABLE_OFFLOAD": (
         lambda: (
             os.environ.get("VLLM_RBLN_DISABLE_OFFLOAD", "True").lower() in ("true", "1")
@@ -287,7 +261,9 @@ environment_variables = {
         in ("true", "1")
     ),
     # Auto port
-    "VLLM_RBLN_AUTO_PORT": use_auto_port,
+    "VLLM_RBLN_AUTO_PORT": lambda: (
+        os.environ.get("VLLM_RBLN_AUTO_PORT", "True").lower() in ("true", "1")
+    ),
     # enforce model data type into fp32 not model_config.dtype
     "VLLM_RBLN_ENFORCE_MODEL_FP32": (
         lambda: (
@@ -384,7 +360,6 @@ RBLN_COMPILE_ENV = frozenset(
         "VLLM_RBLN_USE_VLLM_MODEL",
         "VLLM_RBLN_NUM_HIDDEN_LAYERS",
         "VLLM_RBLN_USE_NESTED_COMPILE_REGION",
-        "VLLM_RBLN_USE_DEVICE_TENSOR",
     }
 )
 
