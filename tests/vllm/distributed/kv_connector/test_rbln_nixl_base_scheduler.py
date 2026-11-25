@@ -30,8 +30,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
 from vllm.v1.kv_cache_interface import SlidingWindowSpec
 from vllm.v1.request import RequestStatus
 
-import vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_scheduler as sm
 from tests.vllm.distributed.kv_connector.utils import (
+    KvGeometry,
+    engine_config,
     fake_sysfs_net,
     mock_vllm_config,
     set_shape,
@@ -201,23 +202,24 @@ def _scheduler(*, use_host_buffer=False, cls=RblnNixlPullConnectorScheduler):
 
 class TestInit:
     @pytest.mark.parametrize(
-        ("kv_buffer_device", "expected"),
+        "scheduler_cls",
+        [RblnNixlPullConnectorScheduler, RblnNixlPushConnectorScheduler],
+    )
+    @pytest.mark.parametrize(
+        ("kv_buffer_device", "stages_on_host"),
         [("cpu", True), ("rbln", False)],
     )
-    def test_use_host_buffer_follows_kv_buffer_device(
-        self, monkeypatch, kv_buffer_device, expected
+    def test_schedules_host_saves_only_for_cpu_buffers(
+        self, scheduler_cls, kv_buffer_device, stages_on_host
     ):
-        # host-bounce ("cpu") stages through host DRAM; D2D ("rbln") does not.
-        monkeypatch.setattr(
-            sm.NixlPullConnectorScheduler, "__init__", lambda self, *a, **k: None
-        )
-        vllm_config = mock_vllm_config()
-        vllm_config.kv_transfer_config.kv_buffer_device = kv_buffer_device
-        sched = object.__new__(RblnNixlPullConnectorScheduler)
-        RblnNixlPullConnectorScheduler.__init__(
-            sched, vllm_config, "eng", _kv_config([MagicMock()])
-        )
-        assert sched.use_host_buffer is expected
+        config = engine_config(kv_buffer_device=kv_buffer_device)
+        sched = scheduler_cls(config, "eng", KvGeometry().kv_cache_config())
+        block_size = config.cache_config.block_size
+        sched._reqs_need_save["prefill"] = _Request("prefill", block_size)
+
+        meta = sched.build_connector_meta(_sched_output("prefill", ([1],), block_size))
+
+        assert ("prefill" in meta.reqs_to_save) is stages_on_host
         assert sched._block_ids_need_save == {}
 
 
