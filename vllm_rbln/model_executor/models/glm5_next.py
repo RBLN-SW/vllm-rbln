@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import math
+import time
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
 from itertools import islice
@@ -1523,7 +1524,7 @@ class RBLNGlm5NextForConditionalGeneration(
                     # patch. Encoding these independently preserves that mask.
                     frames = []
                     for frame in pixels.split(h * w):
-                        start_ns = rbln_utils.start_mm_encoder_timing()
+                        start_ns = time.perf_counter_ns()
                         inputs = self._encoder_inputs(
                             buffered_encoder, frame, [1, h, w]
                         )

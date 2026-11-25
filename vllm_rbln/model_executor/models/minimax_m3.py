@@ -16,6 +16,7 @@ import importlib.util
 import inspect
 import math
 import sys
+import time
 from collections.abc import Iterable, Mapping
 from itertools import islice
 from pathlib import Path
@@ -1434,7 +1435,7 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         for start in range(0, t, frames):
             seg_t = min(frames, t - start)
             seg_pixels = pixel_values[start * h * w : (start + seg_t) * h * w]
-            start_ns = rbln_utils.start_mm_encoder_timing()
+            start_ns = time.perf_counter_ns()
             inputs = self._encoder_inputs(
                 buffered_encoder, seg_pixels, [seg_t, h, w], modality
             )
