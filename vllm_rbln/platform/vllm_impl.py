@@ -97,6 +97,24 @@ def _uses_gated_delta_net(model_config) -> bool:
     return getattr(text_config, "model_type", None) == "qwen3_5_text"
 
 
+def _runs_gated_delta_net(vllm_config: "VllmConfig") -> bool:
+    """Whether this instance builds GatedDeltaNet layers: an encoder-only one
+    builds no language model."""
+    return (
+        _uses_gated_delta_net(vllm_config.model_config)
+        and not vllm_config.is_mm_encoder_only
+    )
+
+
+def _keeps_recurrent_state(vllm_config: "VllmConfig") -> bool:
+    """A language model with a recurrent state a request beside its KV cache:
+    GLM-5.3's KDA layers or GatedDeltaNet ones."""
+    text_config = vllm_config.model_config.hf_text_config
+    return text_config.model_type == "glm5_next_text" or _runs_gated_delta_net(
+        vllm_config
+    )
+
+
 def _uses_model_parallel(parallel_config) -> bool:
     return (
         parallel_config.tensor_parallel_size > 1
@@ -123,10 +141,7 @@ def _validate(vllm_config: "VllmConfig") -> None:
     if vllm_config.lora_config is not None:
         raise ValueError("LoRA is not supported on RBLN.")
 
-    # An encoder-only instance builds no language model, so no GDN layer.
-    uses_gdn = (
-        _uses_gated_delta_net(model_config) and not vllm_config.is_mm_encoder_only
-    )
+    uses_gdn = _runs_gated_delta_net(vllm_config)
     if uses_gdn:
         if rbln_config.use_custom_kernel:
             raise ValueError(
@@ -145,11 +160,6 @@ def _validate(vllm_config: "VllmConfig") -> None:
                 f"{parallel_config.tensor_parallel_size}, pipeline_parallel_size="
                 f"{parallel_config.pipeline_parallel_size}, data_parallel_size="
                 f"{parallel_config.data_parallel_size}."
-            )
-        if vllm_config.speculative_config is not None:
-            raise ValueError(
-                "Speculative decoding is not supported for GatedDeltaNet models on "
-                "the RBLN vLLM path yet: the decode kernel takes one token per request."
             )
         text_config = model_config.hf_text_config
         num_v_heads = text_config.linear_num_value_heads
@@ -234,44 +244,29 @@ def _validate(vllm_config: "VllmConfig") -> None:
             f"RBLN; got dtype={model_config.dtype}. Pass --dtype bfloat16."
         )
 
-    if text_config.model_type == "glm5_next_text":
-        if not vllm_config.cache_config.cache_dtype.startswith("fp8"):
-            raise ValueError(
-                "GLM-5.3 needs an fp8 KV cache on RBLN; pass --kv-cache-dtype fp8."
-            )
-        # The kpool indexer's tail ring holds 3 + K positions in at most 8 slots.
-        spec = vllm_config.speculative_config
-        if spec is not None and (
-            spec.method != "mtp" or not 1 <= spec.num_speculative_tokens <= 5
-        ):
-            raise ValueError(
-                "GLM-5.3 speculative decoding on RBLN runs its MTP head with "
-                f"num_speculative_tokens 1 to 5 only; got method={spec.method!r}, "
-                f"num_speculative_tokens={spec.num_speculative_tokens}."
-            )
-
-    cache_config = vllm_config.cache_config
-    if cache_config.enable_prefix_caching and (
-        text_config.model_type == "glm5_next_text" or uses_gdn
+    if (
+        text_config.model_type == "glm5_next_text"
+        and not vllm_config.cache_config.cache_dtype.startswith("fp8")
     ):
-        if (
-            cache_config.user_specified_mamba_block_size
-            and cache_config.mamba_block_size != cache_config.block_size
-        ):
-            raise ValueError(
-                "Prefix caching keeps a recurrent state a KV block on RBLN; "
-                f"got --mamba-block-size {cache_config.mamba_block_size} and "
-                f"--block-size {cache_config.block_size}."
-            )
-        if (
-            cache_config.prefix_match_unit is not None
-            and cache_config.prefix_match_unit < cache_config.block_size
-        ):
-            raise ValueError(
-                "Prefix caching with a recurrent state hits whole KV blocks only on "
-                f"RBLN; got --prefix-match-unit {cache_config.prefix_match_unit} "
-                f"below --block-size {cache_config.block_size}."
-            )
+        raise ValueError(
+            "GLM-5.3 needs an fp8 KV cache on RBLN; pass --kv-cache-dtype fp8."
+        )
+
+    # GLM-5.3's kpool indexer tail ring holds 3 + K positions in at most 8
+    # slots. The GatedDeltaNet verify kernel takes up to 7 drafts; 1 to 5 ran
+    # on a device.
+    spec = vllm_config.speculative_config
+    if (
+        spec is not None
+        and _keeps_recurrent_state(vllm_config)
+        and (spec.method != "mtp" or not 1 <= spec.num_speculative_tokens <= 5)
+    ):
+        raise ValueError(
+            "Speculative decoding over a recurrent state on RBLN runs the model's "
+            "MTP head with num_speculative_tokens 1 to 5 only; got "
+            f"method={spec.method!r}, "
+            f"num_speculative_tokens={spec.num_speculative_tokens}."
+        )
 
     # Upstream turns chunked prefill off for an engine without a KV cache, such
     # as an encoder-only instance, then validates the config again in EngineCore.
@@ -363,6 +358,28 @@ def _validate(vllm_config: "VllmConfig") -> None:
     # Resolved here so the scheduler and runner read one value, and compute_hash,
     # which runs after this, keys "unset" and "set to the budget" alike.
     rbln_config.prefill_chunk_size = chunks
+
+    cache_config = vllm_config.cache_config
+    if cache_config.enable_prefix_caching and _keeps_recurrent_state(vllm_config):
+        if (
+            cache_config.user_specified_mamba_block_size
+            and cache_config.mamba_block_size != block_size
+        ):
+            raise ValueError(
+                "Prefix caching keeps a recurrent state a KV block on RBLN; "
+                f"got --mamba-block-size {cache_config.mamba_block_size} and "
+                f"--block-size {block_size}."
+            )
+        # A hit below the block reads the state a step stored at the prompt's
+        # last unit boundary, and a step stores one only where it ends.
+        unit = cache_config.prefix_match_unit
+        if unit is not None and unit < block_size and unit % max(chunks):
+            raise ValueError(
+                "Prefix caching with a recurrent state hits a whole KV block or a "
+                "multiple of the prefill chunk on RBLN; got "
+                f"--prefix-match-unit {unit}, --block-size {block_size}, "
+                f"prefill_chunk_size={chunks}."
+            )
 
     if envs.VLLM_RBLN_COMPILE_ONLY and envs.VLLM_DISABLE_COMPILE_CACHE:
         # Compile-only compiles each graph and writes the .rbln artifact to
@@ -528,6 +545,16 @@ def _override(vllm_config: "VllmConfig") -> None:
 
     logger.info("Using model_config.dtype for RBLN: %s", model_config.dtype)
 
+    if (
+        _keeps_recurrent_state(vllm_config)
+        and vllm_config.speculative_config is not None
+        and model_config.dtype.itemsize != 2
+    ):
+        raise ValueError(
+            "The MTP verify kernel of a recurrent state takes 16-bit activations on "
+            f"RBLN; got dtype {model_config.dtype}."
+        )
+
     text_config = model_config.hf_text_config
     if text_config.model_type == "glm5_next_text":
         tp_size = vllm_config.parallel_config.tensor_parallel_size
@@ -572,17 +599,17 @@ def _override(vllm_config: "VllmConfig") -> None:
 
     cache_config = vllm_config.cache_config
     if (
-        model_config.hf_text_config.model_type == "glm5_next_text"
+        _keeps_recurrent_state(vllm_config)
         and cache_config.enable_prefix_caching
         and vllm_config.speculative_config is not None
         and cache_config.prefix_cache_retention_interval != 0
     ):
-        # A KDA verify step stores its first token's state and replays the accepted
+        # A verify step stores its first token's state and replays the accepted
         # drafts next step, so a block it crossed holds no state at its end. Retention
         # 0 caches only states a prefill stored (prompt end, shared-prefix junction).
         logger.warning(
-            "Disabling prefix caching: GLM-5.3 on RBLN runs it with speculative "
-            "decoding only at prefix_cache_retention_interval 0, got %s.",
+            "Disabling prefix caching: a recurrent state on RBLN runs it with "
+            "speculative decoding only at prefix_cache_retention_interval 0, got %s.",
             cache_config.prefix_cache_retention_interval,
         )
         cache_config.enable_prefix_caching = False

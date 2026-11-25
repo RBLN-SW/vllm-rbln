@@ -20,6 +20,8 @@
 
 import contextlib
 import json
+import subprocess
+import sys
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
@@ -37,6 +39,7 @@ from vllm.distributed.ec_transfer.ec_connector.base import (
 from vllm.multimodal.inputs import PlaceholderRange
 from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheTensor
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
@@ -737,6 +740,7 @@ class TestEcConsumer:
         scheduler_output = SimpleNamespace(
             total_num_scheduled_tokens=0,
             kv_cache_copy_ops=None,
+            kv_cache_block_copies=None,
             ec_connector_metadata=ECConnectorMetadata(),
             finished_req_ids=set(),
         )
@@ -929,13 +933,12 @@ def test_a_producer_warms_the_sampler_at_one_request(
     assert runner._warmup_sampler_decode_batches.called is verifies
 
 
-@pytest.mark.parametrize("num_reqs", [1, 2])
-def test_reference_sampler_warmup_finishes(num_reqs):
-    runner = _make_runner_stub(
+def _sampler_warmup_runner(sampler, num_reqs):
+    return _make_runner_stub(
         device=torch.device("cpu"),
         dtype=torch.float32,
         model_config=SimpleNamespace(get_vocab_size=lambda: 32),
-        sampler=mr.Sampler(),
+        sampler=sampler,
         input_batch=SimpleNamespace(
             temperature=torch.ones(num_reqs),
             top_p=torch.ones(num_reqs),
@@ -946,7 +949,24 @@ def test_reference_sampler_warmup_finishes(num_reqs):
         ),
     )
 
-    runner._dummy_sampler_run(num_reqs)
+
+def test_reference_sampler_skips_warmup():
+    sampler = MagicMock(spec=mr.Sampler)
+
+    _sampler_warmup_runner(sampler, 2)._dummy_sampler_run(2)
+
+    sampler.assert_not_called()
+
+
+@pytest.mark.parametrize("num_reqs", [1, 2])
+def test_rbln_sampler_warms_up_every_config(num_reqs):
+    from vllm_rbln.v1.sample import WARM_UP_CONFIGS
+
+    sampler = MagicMock(spec=mr.RBLNSampler)
+
+    _sampler_warmup_runner(sampler, num_reqs)._dummy_sampler_run(num_reqs)
+
+    assert sampler.warm_up.call_count == len(WARM_UP_CONFIGS)
 
 
 def test_rejection_sampler_warmup_asks_for_the_synthetic_variant():
@@ -1708,6 +1728,27 @@ class TestProcessKvCacheCopyOps:
         assert (dst[..., :3, :] == 5.0).all()
         assert (dst[..., 3:, :] == 0.0).all()
 
+    def test_a_window_group_copies_the_whole_manager_block(self, monkeypatch):
+        monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", True)
+        # Kernel blocks of 2, four to a manager block of 8: manager block 1 is
+        # kernel blocks 4..7, and five tokens still take all four.
+        kv = torch.zeros(16, 2, 1, 1, 2, 2)
+        for kb in range(16):
+            kv[kb] = float(kb)
+        before = kv.clone()
+        r = _make_runner_stub(
+            kv_caches=[kv],
+            kv_cache_names=["sw"],
+            kv_cache_block_axes={"sw": 0},
+            kv_cache_config=_copy_groups(["sw"]),
+            _kernel_block_sizes=[2],
+            model_config=SimpleNamespace(use_mla=False),
+            runtime_holder=[None],
+        )
+        r._process_kv_cache_copy_ops([KVCacheCopyOp(0, 1, 2, 5)])
+        assert torch.equal(kv[8:12], before[4:8])
+        assert torch.equal(kv[:8], before[:8]) and torch.equal(kv[12:], before[12:])
+
     def test_device_tensor_copy_mla(self, monkeypatch):
         monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", True)
         kv = torch.zeros(4, 8, 2)  # (num_blocks, block_tokens, dim)
@@ -1784,6 +1825,24 @@ class TestProcessKvCacheCopyOps:
         )
         r._process_kv_cache_copy_ops([KVCacheCopyOp(0, 5, 6, 4)])
         assert calls == [(5, 6, 4)]
+
+    def test_a_block_copy_moves_the_whole_page_of_every_cache(self, monkeypatch):
+        monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", True)
+        latent = torch.zeros(4, 8, 2)
+        state = torch.zeros(3, 4, 5)  # blocks on axis 1
+        latent[1] = 7.0
+        state[:, 1] = 3.0
+        r = _make_runner_stub(
+            kv_caches=[latent, state],
+            kv_cache_names=["latent", "state"],
+            kv_cache_block_axes={"latent": 0, "state": 1},
+            model_config=SimpleNamespace(use_mla=True),
+        )
+        r._copy_kv_cache_blocks([KVCacheBlockCopy(src_block_id=1, dst_block_id=2)])
+        assert (latent[2] == 7.0).all()
+        assert (state[:, 2] == 3.0).all()
+        assert torch.count_nonzero(latent[[0, 3]]) == 0
+        assert torch.count_nonzero(state[:, [0, 3]]) == 0
 
 
 def _empty_cached():
@@ -2648,6 +2707,7 @@ class TestExecuteModelRecoversADeferredLoad:
             total_num_scheduled_tokens=0,
             kv_connector_metadata="META",
             kv_cache_copy_ops=None,
+            kv_cache_block_copies=None,
         )
 
     def test_the_held_read_is_issued_before_the_connector_step(self, monkeypatch):
@@ -2756,6 +2816,7 @@ class TestExecuteModelFlushesAfterTheSubmission:
             num_scheduled_tokens={"r0": 1},
             kv_connector_metadata="META",
             kv_cache_copy_ops=None,
+            kv_cache_block_copies=None,
         )
 
         runner.execute_model(scheduler_output)
@@ -2851,6 +2912,7 @@ class TestExecuteModelMmPrefixRowEnds:
                     req_ids=["r0"], num_computed_tokens=[computed]
                 ),
                 kv_cache_copy_ops=None,
+                kv_cache_block_copies=None,
             )
         )
         return seen[0]
@@ -3027,3 +3089,20 @@ class TestDecodeGraphShapes:
         assert mr.RBLNModelRunner.decode_graph_shapes(runner) == []
         calls = self._dummies(runner)
         assert [args for args, _ in calls] == [(1, 128, True), (1, 256, True)]
+
+
+@pytest.mark.parametrize(
+    "module",
+    ["vllm_rbln.v1.worker.rbln_model_runner", "vllm_rbln.v1.worker.rbln_worker"],
+)
+def test_worker_module_imports_before_patches(module):
+    # The runner is imported outside the platform plugin too (out-of-tree
+    # workers subclass it), so it must not depend on `vllm_rbln.patches`,
+    # whose `metrics` module imports the runner back.
+    out = subprocess.run(
+        [sys.executable, "-c", f"import {module}"],
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert out.returncode == 0, out.stderr[-2000:]

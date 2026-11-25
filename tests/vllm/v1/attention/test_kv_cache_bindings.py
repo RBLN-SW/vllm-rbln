@@ -36,8 +36,6 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
 
 
 def _layer(i: int) -> str:
-    # A layer name extract_layer_index() parses to `i` (single integer, has
-    # "attn"). Used as the dict keys the helpers order and group by.
     return f"model.layers.{i}.self_attn"
 
 
@@ -125,7 +123,9 @@ class TestBuildKvCacheBaseBindings:
         shared = torch.zeros(4, 8)
         bases = {_layer(0): shared, _layer(1): shared}
         infos = {_layer(0): KVCacheViewInfo(), _layer(1): KVCacheViewInfo()}
-        base_tensors, view_infos = build_kv_cache_base_bindings(bases, infos)
+        base_tensors, view_infos = build_kv_cache_base_bindings(
+            bases, infos, {_layer(0)}, layer_names=list(infos)
+        )
         assert len(base_tensors) == 1
         assert [vi.base_index for vi in view_infos] == [0, 0]
 
@@ -136,7 +136,9 @@ class TestBuildKvCacheBaseBindings:
         pool = torch.zeros(2, 4, 8)
         bases = {_layer(0): pool[0], _layer(1): pool[1]}
         infos = {_layer(0): KVCacheViewInfo(), _layer(1): KVCacheViewInfo()}
-        base_tensors, view_infos = build_kv_cache_base_bindings(bases, infos)
+        base_tensors, view_infos = build_kv_cache_base_bindings(
+            bases, infos, bases, layer_names=list(infos)
+        )
         assert len(base_tensors) == 2
         assert [vi.base_index for vi in view_infos] == [0, 1]
 
@@ -144,7 +146,9 @@ class TestBuildKvCacheBaseBindings:
         # Independent buffers each become their own base, indexed in order.
         bases = {_layer(0): torch.zeros(4, 8), _layer(1): torch.zeros(4, 8)}
         infos = {_layer(0): KVCacheViewInfo(), _layer(1): KVCacheViewInfo()}
-        base_tensors, view_infos = build_kv_cache_base_bindings(bases, infos)
+        base_tensors, view_infos = build_kv_cache_base_bindings(
+            bases, infos, bases, layer_names=list(infos)
+        )
         assert len(base_tensors) == 2
         assert [vi.base_index for vi in view_infos] == [0, 1]
 
@@ -153,7 +157,10 @@ class TestBuildKvCacheBaseBindings:
         # (dtype/shape/permute/select) is left intact.
         info = KVCacheViewInfo(view_shape=(4, 8), permute_order=(1, 0), select_index=2)
         _, view_infos = build_kv_cache_base_bindings(
-            {_layer(0): torch.zeros(4, 8)}, {_layer(0): info}
+            {_layer(0): torch.zeros(4, 8)},
+            {_layer(0): info},
+            {_layer(0)},
+            layer_names=[_layer(0)],
         )
         got = view_infos[0]
         assert got.base_index == 0
@@ -170,7 +177,7 @@ class TestBuildKvCacheBaseBindings:
             view_shape=(4, 8), view_dtype=torch.bfloat16, dynamic_axis=1
         )
         _, view_infos = build_kv_cache_base_bindings(
-            {_layer(0): base}, {_layer(0): info}
+            {_layer(0): base}, {_layer(0): info}, {_layer(0)}, layer_names=[_layer(0)]
         )
         assert view_infos[0].dynamic_scale == (1, 1)
         assert materialize_kv_cache_view([base], view_infos[0]).shape == (4, 8)
@@ -184,7 +191,10 @@ class TestBuildKvCacheBaseBindings:
             ),
         }
         _, view_infos = build_kv_cache_base_bindings(
-            {_layer(0): base, _layer(1): base}, infos
+            {_layer(0): base, _layer(1): base},
+            infos,
+            {_layer(0)},
+            layer_names=list(infos),
         )
         assert [vi.view_dtype for vi in view_infos] == [None, torch.float8_e4m3fn]
 
@@ -195,17 +205,20 @@ class TestBuildKvCacheBaseBindings:
         other = torch.zeros(4, 8)
         bases = {_layer(0): shared, _layer(1): shared, _layer(2): other}
         infos = {name: KVCacheViewInfo() for name in bases}
-        base_tensors, view_infos = build_kv_cache_base_bindings(bases, infos)
+        base_tensors, view_infos = build_kv_cache_base_bindings(
+            bases, infos, {_layer(0), _layer(2)}, layer_names=list(infos)
+        )
         assert len(base_tensors) == 2
         assert [vi.base_index for vi in view_infos] == [0, 0, 1]
 
-    def test_processing_order_follows_layer_index(self):
-        # Bases are appended in layer-index order regardless of dict insertion
-        # order, so kv_cache_view_infos[layer_index] lines up in the forward.
+    def test_processing_order_follows_the_supplied_layer_order(self):
+        # The caller supplies the cache order independently of dict insertion.
         b0, b2, b10 = torch.zeros(1), torch.zeros(1), torch.zeros(1)
         bases = {_layer(10): b10, _layer(2): b2, _layer(0): b0}  # scrambled
         infos = {name: KVCacheViewInfo() for name in bases}
-        base_tensors, _ = build_kv_cache_base_bindings(bases, infos)
+        base_tensors, _ = build_kv_cache_base_bindings(
+            bases, infos, bases, layer_names=[_layer(0), _layer(2), _layer(10)]
+        )
         assert base_tensors[0] is b0
         assert base_tensors[1] is b2
         assert base_tensors[2] is b10
@@ -215,8 +228,31 @@ class TestBuildKvCacheBaseBindings:
         # with its layer in layer-index order.
         bases = {_layer(i): torch.zeros(1) for i in (2, 0, 1)}  # scrambled
         infos = {_layer(i): KVCacheViewInfo(select_index=i) for i in (2, 0, 1)}
-        _, view_infos = build_kv_cache_base_bindings(bases, infos)
+        _, view_infos = build_kv_cache_base_bindings(
+            bases, infos, bases, layer_names=[_layer(0), _layer(1), _layer(2)]
+        )
         assert [vi.select_index for vi in view_infos] == [0, 1, 2]
+
+    def test_view_infos_follow_the_supplied_cache_order(self):
+        names = [_layer(2), _layer(0), _layer(1)]
+        shared = torch.zeros(1)
+        bases = {name: shared for name in reversed(names)}
+        infos = {name: KVCacheViewInfo(select_index=i) for i, name in enumerate(names)}
+        base_tensors, view_infos = build_kv_cache_base_bindings(
+            bases, infos, {names[0]}, layer_names=names
+        )
+        assert len(base_tensors) == 1 and base_tensors[0] is shared
+        assert [vi.select_index for vi in view_infos] == [0, 1, 2]
+        assert [vi.base_index for vi in view_infos] == [0, 0, 0]
+
+    @pytest.mark.parametrize(
+        "names", [[], ["first"], ["first", "first"], ["first", "unknown"]]
+    )
+    def test_cache_order_must_cover_each_view_once(self, names):
+        bases = {name: torch.zeros(1) for name in ("first", "second")}
+        infos = {name: KVCacheViewInfo() for name in bases}
+        with pytest.raises(AssertionError, match="every cache exactly once"):
+            build_kv_cache_base_bindings(bases, infos, bases, layer_names=names)
 
 
 class TestMaterializeKvCacheView:
@@ -257,8 +293,8 @@ class TestMaterializeKvCacheView:
         assert materialize_kv_cache_view([base], coarser).shape == (2, 1, 8, 1, 64, 4)
 
     def test_bindings_record_the_view_to_base_scale(self):
-        # gpt-oss: layer 0 (windowed, 64 kernel blocks per block) types the base;
-        # the full layer's view is 1/64 of it, the windowed layer's is 1:1.
+        # gpt-oss: layer 0 is windowed (64 kernel blocks per block), and the base
+        # is the full layer's; the windowed view is 64 times it, the full 1:1.
         raw = torch.zeros(2 * 4 * 8 * 1 * 8192 * 4, dtype=torch.float16)
         windowed = raw.view(2, 256, 8, 1, 128, 4)
         full = raw.view(2, 4, 8, 1, 8192, 4)
@@ -271,11 +307,15 @@ class TestMaterializeKvCacheView:
                 view_shape=(2, 4, 8, 1, 8192, 4), dynamic_axis=1
             ),
         }
-        base_tensors, view_infos = build_kv_cache_base_bindings(bases, infos)
-        assert base_tensors[0].shape[1] == 256
-        assert [vi.dynamic_scale for vi in view_infos] == [(1, 1), (1, 64)]
+        base_tensors, view_infos = build_kv_cache_base_bindings(
+            bases, infos, {_layer(1)}, layer_names=list(infos)
+        )
+        assert base_tensors[0].shape[1] == 4
+        assert [vi.dynamic_scale for vi in view_infos] == [(64, 1), (1, 1)]
         for vi in view_infos:
-            assert materialize_kv_cache_view(base_tensors, vi).shape == vi.view_shape
+            view = materialize_kv_cache_view(base_tensors, vi)
+            assert view.shape == vi.view_shape
+            assert _storage_key(view) == _storage_key(raw)
 
     def test_dtype_view_reinterprets_bytes(self):
         # view_dtype reinterprets the base storage as another same-width dtype
@@ -365,6 +405,7 @@ class TestAttachKvCacheBindings:
             kv_caches=[torch.zeros(1)],
             kv_cache_bases=[torch.zeros(1)],
             kv_cache_view_infos=infos,
+            kv_cache_positions={_layer(0): 0},
         )
         assert md.kv_caches is None
         assert md.kv_cache_view_infos is infos
@@ -374,7 +415,11 @@ class TestAttachKvCacheBindings:
         md = types.SimpleNamespace()
         caches = [torch.zeros(1)]
         attach_kv_cache_bindings(
-            md, kv_caches=caches, kv_cache_bases=None, kv_cache_view_infos=None
+            md,
+            kv_caches=caches,
+            kv_cache_bases=None,
+            kv_cache_view_infos=None,
+            kv_cache_positions={_layer(0): 0},
         )
         assert md.kv_caches is caches
         assert md.kv_cache_view_infos is None
@@ -389,6 +434,7 @@ class TestAttachKvCacheBindings:
             kv_caches=caches,
             kv_cache_bases=[torch.zeros(1)],
             kv_cache_view_infos=None,
+            kv_cache_positions={_layer(0): 0},
         )
         assert md.kv_caches is caches
         assert md.kv_cache_view_infos is None

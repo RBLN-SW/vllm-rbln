@@ -25,9 +25,10 @@ compile-time cache, and after warm-up sizes the real cache from two measurements
   the physical shape, dtype and one shard per `(node, chiplet)`, with the dynamic
   dim left symbolic. The KV caches are the only dynamic inputs, so summing the
   shards' extents gives the per-chiplet slope exactly. A layer's dynamic dim is
-  its *kernel* block count -- a sliding-window layer splits each manager block
-  into `block_size / sliding_window` kernel blocks -- so each input's symbol is
-  scaled by its compiled extent over the compile hint. Programs that bind a
+  its *kernel* block count -- a sliding-window layer whose window divides its
+  block splits each manager block into `block_size / sliding_window` kernel
+  blocks -- so each input's symbol is scaled by its compiled extent over the
+  compile hint. Programs that bind a
   different set of KV tensors (a speculative drafter's) contribute their own
   slope on top of the target's. The fit counts the shards at what the runtime's
   caching allocator reserves for them, replayed the way it allocates: requests
@@ -166,19 +167,8 @@ would serve from the pre-compile estimate this feature exists to replace.
 - **No KV block fits.** On some chiplet the non-KV base already exceeds
   `total * gpu_memory_utilization`. Raise `--gpu-memory-utilization`, or give the
   model more devices.
-- **The pool's kernel block ids overflow int16.** The compiled attention ops take
-  kernel block ids as int16, and a sliding-window group maps each block to
-  `block_size / sliding_window` kernel blocks. A pool can therefore hold at most
-  `32767 // (block_size / sliding_window)` blocks, taken over the tightest KV
-  cache group. The resize caps its own count there (see Known Limitations). A
-  count the resize does not set is refused instead: `--num-gpu-blocks-override`,
-  a skipped compile, or vllm's estimate with the feature off. Set
-  `--num-gpu-blocks-override` at or below the cap, or leave it unset with the
-  feature on.
-
 Three more cases warn and continue on the pre-compile estimate, because each is
-an explicit request from the caller. The first two still go through the int16
-check above, so a count over the cap fails at start-up rather than being served:
+an explicit request from the caller:
 
 - Compile and warm-up are skipped (`VLLM_RBLN_ENABLE_WARM_UP=0`).
   Nothing compiles, so no program carries a placement.
@@ -205,12 +195,6 @@ is not evidence that the block count came from the device.
   own reserved size; blocks the allocator keeps cached for later reuse show up
   in the snapshot's `used`, not in the growth, and the fit check line after the
   reallocation is where a mismatch shows.
-- **The resized pool is capped by int16 kernel block ids.** When the device fits
-  more blocks than the cap above, the resize logs a warning and serves the cap,
-  and the rest of the memory goes unused. For GPT-OSS (`sliding_window` 128) at
-  `--block-size 16384` the cap is 255 blocks, about 4.18M tokens per layer. The
-  cap goes away once the compiled ops take int32 block ids
-  (`MAX_KERNEL_BLOCK_ID` in `dynamic_kv_sizer.py`).
 - **The block count is not perfectly deterministic.** Repeated runs of the same
   configuration occasionally retain an extra arena per chiplet and land above the
   requested budget.

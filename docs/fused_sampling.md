@@ -31,11 +31,11 @@ Key components:
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `--rbln-use-fused-sampling` | `True` | Run penalties, logit bias and min_p inside the sampling graph. Requires `use_custom_sampler`. |
+| `--rbln-use-fused-sampling` | `False` | Run penalties, logit bias and min_p inside the sampling graph. Requires `use_custom_sampler`. |
 
-Fused sampling is enabled by default on the vllm model path. Disable it with
-`--no-rbln-use-fused-sampling`, or pass
-`additional_config={"use_fused_sampling": False}` to `LLM(...)`.
+Fused sampling is disabled by default. Enable it on either model path with
+`--rbln-use-fused-sampling`, or pass
+`additional_config={"use_fused_sampling": True}` to `LLM(...)`.
 
 Penalties and logit bias keep the existing path when a step runs speculative
 decoding or a thinking budget. Upstream vLLM rejects min_p with speculative

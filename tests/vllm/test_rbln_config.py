@@ -98,8 +98,8 @@ def test_defaults_when_nothing_is_passed(parser):
 @pytest.mark.parametrize(
     "argv, enabled",
     [
-        ([], True),
-        (["--no-rbln-use-fused-sampling"], False),
+        ([], False),
+        (["--rbln-use-fused-sampling"], True),
         (["--additional-config", '{"use_fused_sampling": false}'], False),
     ],
 )
@@ -365,6 +365,8 @@ def test_the_model_path_keys_the_compile_cache():
     run the other path's artifact is what this prevents.
     """
     assert RBLNConfig().compute_hash() != OptimumRBLNConfig().compute_hash()
+    optimum = OptimumRBLNConfig().compute_hash()
+    assert OptimumRBLNConfig(use_fused_sampling=True).compute_hash() == optimum
 
 
 def test_only_compile_fields_change_the_hash():

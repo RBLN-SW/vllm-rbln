@@ -21,7 +21,7 @@ import platform
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from datetime import datetime, timezone
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Literal, NoReturn, TypeVar
@@ -52,7 +52,7 @@ from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 from vllm_rbln import envs
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.logger import init_logger
-from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
+from vllm_rbln.v1.kv_cache import window_splits_block
 from vllm_rbln.v1.worker.kv_placement import ChipletMemory, Unit
 
 if TYPE_CHECKING:
@@ -202,81 +202,6 @@ RBLN_DEV_DIR = "/dev"
 
 # 144 GiB of quad-chiplet DRAM minus the 4 GiB system region
 REBEL_DRAM_NBYTES = 144 * 2**30 - 4 * 2**30
-
-
-def extract_layer_index(layer_name: str, num_attn_module: int = 1) -> int:
-    int_vals: list[int] = []
-    for subname in layer_name.split("."):
-        try:
-            int_vals.append(int(subname))
-        except ValueError:
-            continue
-    if num_attn_module <= 1 or "attn" not in layer_name:
-        assert len(int_vals) == 1, (
-            f"layer name {layer_name} should only contain one integer"
-        )
-        return int_vals[0]
-    assert int_vals, f"layer name {layer_name} has no integer layer index"
-    base = int_vals[0]
-    if len(int_vals) >= 2:
-        sub = int_vals[1]
-    elif "scale" in layer_name:
-        sub = 2
-    elif "indexer" in layer_name or "conv_ring" in layer_name:
-        sub = 1
-    else:
-        sub = 0
-    return base * num_attn_module + sub
-
-
-def pipeline_adjusted_layer_index(
-    layer_name: str,
-    model_config,
-    parallel_config,
-    num_attn_module: int,
-) -> int:
-    raw_layer_index = extract_layer_index(layer_name, num_attn_module)
-    if model_config is None:
-        return raw_layer_index
-
-    start, end = model_config.get_layers_start_end_indices(parallel_config)
-    total_num_hidden_layers = model_config.get_total_num_hidden_layers()
-    if raw_layer_index >= total_num_hidden_layers * num_attn_module:
-        # MTP/nextn layers are named past the target's layer count
-        # (mtp_start_layer_idx == num_hidden_layers), so their KV cache sits
-        # right after the target layers in the compacted per-rank cache list.
-        return (end - start) * num_attn_module + (
-            raw_layer_index - total_num_hidden_layers * num_attn_module
-        )
-    return raw_layer_index - start * num_attn_module
-
-
-def num_attn_module(model_config, cache_dtype) -> int:
-    hf_config = model_config.hf_config
-    if getattr(hf_config, "model_type", None) == "longcat_flash":
-        return 2
-    text_config = getattr(model_config, "hf_text_config", hf_config)
-    # GLM uses an upper bound for per-layer index spacing, not a cache count.
-    # KDA needs up to 2 * num_groups + 1 slots; num_groups <= linear_num_heads.
-    # MTP uses the same bound although its DSA layers have only four slots.
-    # Cache binding compacts the actual entries into consecutive indices.
-    if getattr(text_config, "model_type", None) in ("glm5_next_text", "glm5_next_mtp"):
-        return 2 * text_config.linear_num_heads + 1
-    # A DSA model puts the lightning-indexer key cache next to MLA: 2 modules,
-    # or 3 when the indexer cache is fp8 (a companion scale cache).
-    if hasattr(text_config, "index_topk") or hasattr(hf_config, "index_topk"):
-        is_fp8 = bool(cache_dtype) and cache_dtype.startswith("fp8")
-        return 3 if is_fp8 else 2
-    # A GatedDeltaNet layer (Qwen3.5) keeps its recurrent state and its conv ring.
-    if getattr(text_config, "model_type", None) == "qwen3_5_text":
-        return 2
-    # MiniMax-M3 MSA: the indexer key cache next to the GQA K/V cache. Dense
-    # layers own only K/V; the runner re-indexes layers by bound position.
-    if getattr(text_config, "sparse_attention_config", None) or getattr(
-        hf_config, "sparse_attention_config", None
-    ):
-        return 2
-    return 1
 
 
 def get_rbln_visible_card_indices() -> list[int]:
@@ -1186,7 +1111,6 @@ def set_omp_num_threads(
 def prepare_kernel_block_sizes(
     kv_cache_config: KVCacheConfig,
     attn_groups: list[list[AttentionGroup]],
-    sub_block_size: int | None = None,
 ) -> list[int]:
     """
     Generate kernel_block_sizes that matches each block_size.
@@ -1198,7 +1122,6 @@ def prepare_kernel_block_sizes(
     Args:
         kv_cache_config: The KV cache configuration.
         attn_groups: Attention groups indexed by KV cache group id.
-        sub_block_size: Sub-block prefix caching granularity, None when off.
 
     Returns:
         List of kernel block sizes for each cache group.
@@ -1213,17 +1136,13 @@ def prepare_kernel_block_sizes(
         if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
             continue
         if isinstance(kv_cache_spec, SlidingWindowSpec):
-            if sub_block_size is None or isinstance(
-                kv_cache_spec, RBLNSlidingWindowSpec
-            ):
-                # The shift kernel holds one window per block; the append kernel
-                # gathers whole blocks around the window, whatever their size.
+            # The shift kernel holds one window per block; the append kernel
+            # gathers whole blocks around the window, whatever their size, so
+            # it takes the block where upstream's block table refuses a window
+            # that does not divide it.
+            if window_splits_block(kv_cache_spec):
                 kernel_block_sizes.append(kv_cache_spec.sliding_window)
             else:
-                # A sub-block copy slices the buffer the compiled graph reads,
-                # and this layer shares it with a full-attention layer on the
-                # manager block: the append kernel takes the same block, so the
-                # slice is one geometry for both.
                 kernel_block_sizes.append(kv_cache_group.kv_cache_spec.block_size)
         elif isinstance(kv_cache_spec, AttentionSpec):
             # This is an attention backend that supports virtual block splitting.
@@ -1332,34 +1251,18 @@ def reorder_input_batch(input_batch: "InputBatch", perm: np.ndarray) -> None:
         ]
 
 
-def get_kv_cache_names(
-    kv_caches: dict[str, torch.Tensor],
-    num_attn_module: int = 1,
-) -> list[str]:
-    """Return KV cache layer names ordered by layer index.
-
-    A deterministic, hash-seed-independent ordering is required by the KV
-    connector: NIXL assigns transfer region indices in iteration order, so the
-    P/D region <-> layer agreement breaks if the order varies between runs.
-    Adapted from ``vllm.v1.worker.utils.bind_kv_cache``.
-    """
-    index2name: dict[int, list[str]] = defaultdict(list)
-    for layer_name in kv_caches:
-        index2name[extract_layer_index(layer_name, num_attn_module)].append(layer_name)
-
-    kv_cache_names: list[str] = []
-    for layer_index in sorted(index2name.keys()):
-        layer_names = index2name[layer_index]
-        if len(layer_names) > 1 and not (
-            current_platform.is_cuda_alike()
-            or current_platform.is_xpu()
-            or current_platform.is_cpu()
-        ):
-            # Multiple layers sharing one index (e.g. encoder-decoder cross +
-            # self attention) is only known-safe on GPU/CPU runners.
-            raise NotImplementedError
-        kv_cache_names.extend(layer_names)
-    return kv_cache_names
+def get_kv_cache_names(cache_names: Iterable[str]) -> list[str]:
+    """Order caches by numeric module path, breaking ties by full name."""
+    sort_keys: set[tuple[tuple[int, ...], str]] = set()
+    for name in cache_names:
+        numeric_path = tuple(int(part) for part in name.split(".") if part.isdecimal())
+        if not numeric_path:
+            raise ValueError(f"KV cache {name} has no numeric layer path")
+        sort_key = (numeric_path, name)
+        if sort_key in sort_keys:
+            raise ValueError(f"Duplicate KV cache name: {name}")
+        sort_keys.add(sort_key)
+    return [name for _, name in sorted(sort_keys)]
 
 
 def copy_host_device_kv_blocks(

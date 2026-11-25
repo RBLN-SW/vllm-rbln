@@ -8,11 +8,14 @@ env:
   NIGHTLY_REPORT: "${NIGHTLY_REPORT:-}"
   SLACK_REPORT_CHANNEL: "${SLACK_REPORT_CHANNEL:-}"
 
-_secrets: &secrets
+_uv_secrets: &uv_secrets
   UV_INDEX_RBLN_NEXUS_NIGHTLY_USERNAME: MGMT_NEXUS_USERNAME
   UV_INDEX_RBLN_NEXUS_NIGHTLY_PASSWORD: MGMT_NEXUS_PASSWORD
   UV_INDEX_REBELLIONS_USERNAME: REBEL_SW_DEV_USERNAME
   UV_INDEX_REBELLIONS_PASSWORD: REBEL_SW_DEV_PASSWORD
+
+_secrets: &secrets
+  <<: *uv_secrets
   HF_TOKEN: FSW_HF_TOKEN
   HF_HOME: FSW_HF_HOME
 
@@ -76,15 +79,19 @@ _examples: &examples
 steps:
   - label: ":sparkles: upload pytest"
     key: "nightly-pytest"
-    checkout:
-      sparse:
-        paths:
-          - .buildkite
+    image: "${DEVTOOLS_DOCKER_IMAGE}"
+    secrets: *uv_secrets
     env:
       PYTEST_COMPILER_OVERRIDE_COMMAND: ""
       PYTEST_E2E_ARGS: "--num-hidden-layers 0 --maxfail=0"
       PYTEST_E2E_TIMEOUT: "120"
-    command: "buildkite-agent pipeline upload .buildkite/pipelines/vllm-rbln/pipeline-pytest.yml --apply-if-changed=false"
+    artifact_paths:
+      - "pytest-plan.json"
+    command: |
+      set -euo pipefail
+      uv sync --locked --python 3.12 --extra test --extra dev --extra runtime
+      uv run --no-sync python .buildkite/pipelines/vllm-rbln/scripts/plan_pytest.py pytest-plan.json
+      buildkite-agent pipeline upload pytest-plan.json --apply-if-changed=false
 
   - group: "[CR13] examples (vllm)"
     key: "nightly-examples-vllm"

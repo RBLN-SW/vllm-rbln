@@ -549,9 +549,24 @@ class TestRejectedConfigs:
                     mamba_block_size=2 * block_size,
                 )
             )
-        with pytest.raises(ValueError, match="whole KV blocks"):
+        chunk = max(_build().additional_config.prefill_chunk_size)
+        # Set by the user, never derived from sub-block caching.
+        assert (
             reconfigure(
-                glm5_next(enable_prefix_caching=True, prefix_match_unit=block_size // 2)
+                glm5_next(enable_prefix_caching=True)
+            ).cache_config.prefix_match_unit
+            is None
+        )
+        for unit in (chunk, 2 * chunk):
+            assert (
+                reconfigure(
+                    glm5_next(enable_prefix_caching=True, prefix_match_unit=unit)
+                ).cache_config.prefix_match_unit
+                == unit
+            )
+        with pytest.raises(ValueError, match="multiple of the prefill chunk"):
+            reconfigure(
+                glm5_next(enable_prefix_caching=True, prefix_match_unit=chunk // 2)
             )
 
         reconfigure(glm5_next(tp=4, block_size=1024))
@@ -588,6 +603,19 @@ class TestRejectedConfigs:
         assert not config.cache_config.enable_prefix_caching
         assert config.cache_config.mamba_cache_mode == "none"
         assert config.cache_config.mamba_block_size == config.model_config.max_model_len
+
+    def test_glm5_next_mtp_takes_16_bit_activations(self, reconfigure):
+        def forced_to_fp32(config):
+            _as_glm5_next(config)
+            config.speculative_config = SimpleNamespace(
+                method="mtp", num_speculative_tokens=1
+            )
+            config.additional_config = replace(
+                config.additional_config, enforce_model_fp32=True
+            )
+
+        with pytest.raises(ValueError, match="16-bit activations"):
+            reconfigure(forced_to_fp32)
 
     @pytest.fixture
     def gdn(self, monkeypatch):
@@ -652,13 +680,39 @@ class TestRejectedConfigs:
             with pytest.raises(ValueError, match="single rank"):
                 reconfigure(widened)
 
-    def test_gdn_models_reject_speculative_decoding(self, reconfigure, gdn):
-        def speculative(config):
-            gdn(config)
-            config.speculative_config = object()
+    @pytest.mark.parametrize("model", ["gdn", "glm5_next"])
+    def test_recurrent_state_models_speculate_with_their_mtp_head_only(
+        self, reconfigure, request, model
+    ):
+        as_model = request.getfixturevalue("gdn") if model == "gdn" else _as_glm5_next
 
-        with pytest.raises(ValueError, match="Speculative decoding"):
-            reconfigure(speculative)
+        def speculative(method, num_speculative_tokens):
+            def mutate(config):
+                as_model(config)
+                config.speculative_config = SimpleNamespace(
+                    method=method, num_speculative_tokens=num_speculative_tokens
+                )
+
+            return mutate
+
+        for method, drafts in (("eagle", 1), ("mtp", 0), ("mtp", 6)):
+            with pytest.raises(ValueError, match="num_speculative_tokens 1 to 5"):
+                reconfigure(speculative(method, drafts))
+        for drafts in (1, 5):
+            reconfigure(speculative("mtp", drafts))
+
+    def test_gdn_mtp_takes_16_bit_activations(self, reconfigure, gdn):
+        def forced_to_fp32(config):
+            gdn(config)
+            config.speculative_config = SimpleNamespace(
+                method="mtp", num_speculative_tokens=1
+            )
+            config.additional_config = replace(
+                config.additional_config, enforce_model_fp32=True
+            )
+
+        with pytest.raises(ValueError, match="16-bit activations"):
+            reconfigure(forced_to_fp32)
 
     def test_gdn_models_reject_the_custom_kernel_option(self, reconfigure, gdn):
         def custom_kernel(config):
@@ -743,8 +797,33 @@ class TestRejectedConfigs:
             reconfigure(
                 cached(user_specified_mamba_block_size=True, mamba_block_size=512)
             )
-        with pytest.raises(ValueError, match="whole KV blocks"):
-            reconfigure(cached(prefix_match_unit=128))
+        chunk = max(reconfigure(cached()).additional_config.prefill_chunk_size)
+        assert (
+            reconfigure(cached(prefix_match_unit=chunk)).cache_config.prefix_match_unit
+            == chunk
+        )
+        with pytest.raises(ValueError, match="multiple of the prefill chunk"):
+            reconfigure(cached(prefix_match_unit=chunk // 2))
+
+    def test_gdn_prefix_caching_with_mtp_needs_retention_0(self, reconfigure, gdn):
+        # As for GLM-5.3: a verify step leaves no state at the end of a block it
+        # crossed.
+        def gdn_mtp(retention):
+            def mutate(config):
+                gdn(config)
+                config.cache_config.enable_prefix_caching = True
+                config.cache_config.mamba_cache_mode = "align"
+                config.cache_config.prefix_cache_retention_interval = retention
+                config.speculative_config = SimpleNamespace(
+                    method="mtp", num_speculative_tokens=1
+                )
+
+            return mutate
+
+        assert reconfigure(gdn_mtp(0)).cache_config.enable_prefix_caching
+        config = reconfigure(gdn_mtp(1))
+        assert not config.cache_config.enable_prefix_caching
+        assert config.cache_config.mamba_cache_mode == "none"
 
     def test_gdn_value_heads_split_over_the_chiplets(self, reconfigure, gdn):
         def six_heads(config):

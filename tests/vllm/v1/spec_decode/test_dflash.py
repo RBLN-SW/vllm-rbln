@@ -238,7 +238,9 @@ class TestSpanningBlockAllocation:
                 None,
             ),
             runner=SimpleNamespace(
-                dp_status=None, kv_cache_bases=None, is_strict_kv_producer=False
+                dp_status=None,
+                kv_cache_forward_context_kwargs=dict,
+                is_strict_kv_producer=False,
             ),
             dp_rank=0,
             max_num_tokens=n * QUERY_LEN,
@@ -359,7 +361,7 @@ class TestQueryPassBatch:
                 specialized_moe_decode=specialized_moe_decode,
             ),
             dp_status=dp_status,
-            kv_cache_bases=None,
+            kv_cache_forward_context_kwargs=dict,
             is_strict_kv_producer=strict_kv_producer,
             input_batch=SimpleNamespace(num_reqs=num_reqs),
         )
@@ -401,9 +403,6 @@ class TestQueryPassBatch:
         proposer._build_draft_attn_metadata = build_metadata
         proposer.model_executable = model
         monkeypatch.setattr(dflash_module, "set_forward_context", forward_context)
-        monkeypatch.setattr(
-            dflash_module, "build_kv_cache_forward_context_kwargs", lambda bases: {}
-        )
         return proposer, calls
 
     def _cad(self, num_reqs):

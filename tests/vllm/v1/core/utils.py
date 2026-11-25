@@ -92,6 +92,7 @@ class MockKVConfig:
     matched_tokens: int = 0
     is_async: bool = False
     kv_role: str = "kv_both"
+    in_multi_connector: bool = False
 
 
 class _MockKVConnectorMetadata(KVConnectorMetadata):
@@ -211,6 +212,7 @@ def create_rbln_scheduler(
     additional_config: dict | None = None,
     kv_cache_config: KVCacheConfig | None = None,
     hash_block_size: int | None = None,
+    mamba_cache_mode: str = "none",
     ec_transfer_config: ECTransferConfig | None = None,
     ec_manager_config: EncoderCacheManagerConfig | None = None,
 ) -> RBLNScheduler:
@@ -237,6 +239,7 @@ def create_rbln_scheduler(
         gpu_memory_utilization=0.9,
         cache_dtype="auto",
         enable_prefix_caching=enable_prefix_caching,
+        mamba_cache_mode=mamba_cache_mode,
     )
     speculative_config: SpeculativeConfig | None = None
     if num_speculative_tokens is not None:
@@ -245,13 +248,22 @@ def create_rbln_scheduler(
         )
     kv_transfer_config = None
     if use_kv_connector is not None:
-        kv_transfer_config = KVTransferConfig(
+        mock = dict(
             kv_connector="MockKVConnector",
             kv_role=use_kv_connector.kv_role,
             kv_connector_extra_config={
                 "matched_tokens": use_kv_connector.matched_tokens,
                 "is_async": use_kv_connector.is_async,
             },
+        )
+        kv_transfer_config = (
+            KVTransferConfig(
+                kv_connector="MultiConnector",
+                kv_role=use_kv_connector.kv_role,
+                kv_connector_extra_config={"connectors": [mock]},
+            )
+            if use_kv_connector.in_multi_connector
+            else KVTransferConfig(**mock)
         )
     vllm_config = VllmConfig(
         scheduler_config=scheduler_config,

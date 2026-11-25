@@ -25,6 +25,7 @@ from vllm import SamplingParams
 from vllm.inputs import TokensPrompt
 
 from tests.vllm.model_specs import CompileModelSpec, apply_spec_envs, spec_params
+from vllm_rbln import envs
 
 BLOCK_SIZE = 256
 
@@ -100,4 +101,78 @@ def test_prefix_cache_matches_baseline(
     # A request resumed from the stored state and conv ring runs the uncached
     # one's arithmetic, so the logprobs are equal, not merely close. The tokens
     # alone say little: a truncated model repeats one.
+    assert cached_outputs == baseline_outputs
+
+
+# A hit inside a block: --prefix-match-unit at the prefill chunk keeps one
+# partial entry at the prompt's last unit boundary, and a hit copies that block
+# (KV, state and conv ring) before the request writes past it.
+CHUNK = 128
+MTP = {"method": "mtp", "num_speculative_tokens": 1}
+
+
+def _prompts_sharing(prefix_len: int) -> list[TokensPrompt]:
+    prefix = random.Random(0).sample(range(2000, 100000), prefix_len)
+    return [
+        TokensPrompt(
+            prompt_token_ids=prefix
+            + random.Random(i + 1).sample(range(2000, 100000), 10)
+        )
+        for i in range(4)
+    ]
+
+
+@pytest.mark.model_compile
+@pytest.mark.parametrize(
+    "speculative_config, prefix_len, hit",
+    [
+        # The first prompt's last unit boundary, 710 // 128 * 128. A whole-block
+        # hit stops at 512.
+        (None, 700, 640),
+        # An MTP lookup drops one unit, as the block drop does a block: one
+        # unit below 838 // 128 * 128. A whole-block hit stops at 512.
+        (MTP, 828, 640),
+    ],
+    ids=["mtp-off", "mtp-on"],
+)
+@pytest.mark.parametrize("spec", spec_params(MODELS))
+def test_fine_grained_prefix_hit_matches_baseline(
+    vllm_runner,
+    spec: CompileModelSpec,
+    monkeypatch,
+    speculative_config,
+    prefix_len,
+    hit,
+) -> None:
+    apply_spec_envs(spec, monkeypatch)
+    if 0 < envs.VLLM_RBLN_NUM_HIDDEN_LAYERS < 8:
+        # Below four layers Qwen3.5 has no attention group, and a single group
+        # hashes whole blocks; the compiler's layer rolling rejects one period
+        # of four (see test_spec_decode_e2e). Two periods roll.
+        monkeypatch.setenv("VLLM_RBLN_NUM_HIDDEN_LAYERS", "8")
+    prompts = _prompts_sharing(prefix_len)
+    engine_kwargs = {
+        **spec.engine_kwargs,
+        "max_num_batched_tokens": CHUNK,
+        "speculative_config": speculative_config,
+    }
+    with vllm_runner(
+        spec.model, enable_prefix_caching=False, **engine_kwargs
+    ) as baseline:
+        baseline_outputs = _tokens_and_logprobs(
+            baseline.llm.generate(prompts, SAMPLING_PARAMS)
+        )
+
+    with vllm_runner(
+        spec.model,
+        enable_prefix_caching=True,
+        prefix_match_unit=CHUNK,
+        **engine_kwargs,
+    ) as cached:
+        cached.llm.generate(prompts[0], SAMPLING_PARAMS)
+        outputs = cached.llm.generate(prompts, SAMPLING_PARAMS)
+        cached_outputs = _tokens_and_logprobs(outputs)
+        num_cached = [o.num_cached_tokens for o in outputs]
+
+    assert num_cached == [hit] * len(prompts)
     assert cached_outputs == baseline_outputs
