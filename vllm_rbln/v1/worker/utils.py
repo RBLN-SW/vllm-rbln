@@ -451,20 +451,22 @@ def kv_cache_extents(cfg: KVCacheConfig) -> dict[str, tuple[int, int]]:
 
 
 def canonical_kv_layers(
-    cfg: KVCacheConfig, layer_specs: Mapping[str, KVCacheSpec]
+    cfg: KVCacheConfig,
+    layer_specs: Mapping[str, KVCacheSpec],
+    prefer: type[KVCacheSpec] = FullAttentionSpec,
 ) -> set[str]:
     """Pick one layer to stand for each KV cache buffer.
 
     Layers on one extent (`kv_cache_extents`) alias one buffer. Prefer a
     full-attention layer: its view counts blocks the way the scheduler does,
-    and a sliding-window view does not.
+    and a sliding-window view does not. `prefer` names another spec to pick.
     """
     pools: defaultdict[tuple[int, int], list[str]] = defaultdict(list)
     for layer_name, extent in kv_cache_extents(cfg).items():
         pools[extent].append(layer_name)
     return {
         next(
-            (ln for ln in layers if isinstance(layer_specs.get(ln), FullAttentionSpec)),
+            (ln for ln in layers if isinstance(layer_specs.get(ln), prefer)),
             layers[0],
         )
         for layers in pools.values()

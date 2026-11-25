@@ -68,8 +68,10 @@ from vllm.v1.executor.abstract import Executor
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.v1.kv_cache_interface import (
     EncoderOnlyAttentionSpec,
+    FullAttentionSpec,
     KVCacheConfig,
     MambaSpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import (
@@ -361,6 +363,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         self.kv_cache_names: list[str] = []
         self.kv_cache_positions: dict[str, int] = {}
         self.kv_cache_allocations: dict[tuple, str] = {}
+        # Layers a sub-block hit copies as whole blocks, not just the hit rows.
+        self.kv_cache_whole_block_copy: set[str] = set()
         # Initialize in initialize_kv_cache_tensors
         self.cross_layers_kv_cache: torch.Tensor | None = None
         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
@@ -3391,7 +3395,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             yield from attn_groups
 
     def _select_canonical_kv_layers_per_pool(
-        self, kv_cache_config: KVCacheConfig
+        self,
+        kv_cache_config: KVCacheConfig,
+        prefer: type[KVCacheSpec] = FullAttentionSpec,
     ) -> set[str]:
         """Pick one layer to stand for each KV cache buffer.
 
@@ -3405,7 +3411,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             for attn_group in self._kv_cache_spec_attn_group_iterator()
             for layer_name in attn_group.layer_names
         }
-        return canonical_kv_layers(kv_cache_config, layer_to_spec)
+        return canonical_kv_layers(kv_cache_config, layer_to_spec, prefer)
 
     def _reshape_kv_cache_tensors(
         self,
@@ -3628,13 +3634,37 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             name: position for position, name in enumerate(self.kv_cache_names)
         }
         canonical = self._select_canonical_kv_layers_per_pool(kv_cache_config)
+        # A drafter layer sharing the target's KV puts the buffers in two graphs,
+        # and bound in a full-attention shape rebel-compiler places them apart in
+        # each. They bind the sliding-window shape then; a sub-block hit copies the
+        # layers viewed otherwise as whole blocks, the only bytes both layouts
+        # place alike.
+        drafter_shares_kv = isinstance(
+            self.drafter, DRAFT_MODEL_PROPOSERS
+        ) and not self.drafter._draft_attn_layer_names.isdisjoint(
+            self.shared_kv_cache_layers
+        )
+        bound = (
+            self._select_canonical_kv_layers_per_pool(
+                kv_cache_config, prefer=SlidingWindowSpec
+            )
+            if drafter_shares_kv
+            else canonical
+        )
         # A block-aux cache is outside the KV cache config, so no canonical layer
         # names its storage; the aux layers on it all view it in one shape.
         self._update_kv_cache_base_bindings(
             kv_cache_bases_by_layer,
             kv_cache_view_infos,
-            canonical | set(self.aux_kv_cache_specs),
+            bound | set(self.aux_kv_cache_specs),
         )
+        # Empty unless a drafter shares the target's KV.
+        self.kv_cache_whole_block_copy = {
+            name
+            for name, info in zip(self.kv_cache_names, self.kv_cache_view_infos)
+            if drafter_shares_kv
+            and info.view_shape != tuple(self.kv_cache_bases[info.base_index].shape)
+        }
         if dynamic_kv_enabled(self.vllm_config) and self.kv_cache_bases:
             # With shared bases these are the graph inputs and the per-layer
             # views are built inside the graph.
@@ -4405,8 +4435,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     srcs.append(kv_cache[src, :nt])
                 else:
                     axis = self.kv_cache_block_axes[layer_name]
-                    dsts.append(kv_cache.select(axis, dst)[..., :nt, :])
-                    srcs.append(kv_cache.select(axis, src)[..., :nt, :])
+                    rows = (
+                        slice(None)
+                        if layer_name in self.kv_cache_whole_block_copy
+                        else slice(nt)
+                    )
+                    dsts.append(kv_cache.select(axis, dst)[..., rows, :])
+                    srcs.append(kv_cache.select(axis, src)[..., rows, :])
         torch._foreach_copy_(dsts, srcs)
 
 
