@@ -24,6 +24,7 @@ compiled graph.
 """
 
 import math
+import time
 from collections.abc import Callable, Iterable, Mapping
 from typing import ClassVar
 
@@ -361,7 +362,7 @@ class RBLNQwen3_5ForConditionalGeneration(
             for pixels, (_, h, w), n in zip(pixel_values.split(sizes), grids, tokens):
                 frames = []
                 for frame in pixels.split(h * w):
-                    start_ns = rbln_utils.start_mm_encoder_timing()
+                    start_ns = time.perf_counter_ns()
                     inputs = self._encoder_inputs(frame, [1, h, w])
                     frames.append(
                         rbln_utils.run_mm_encoder_with_timing(

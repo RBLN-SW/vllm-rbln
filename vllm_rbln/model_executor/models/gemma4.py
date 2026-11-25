@@ -16,6 +16,7 @@
 compiled and its image embeddings merged inside the compiled graph."""
 
 import math
+import time
 from collections.abc import Callable, Iterable, Mapping
 from functools import cached_property
 
@@ -428,7 +429,7 @@ class RBLNGemma4ForConditionalGeneration(
             ).eval()
             object.__setattr__(self, "_mm_encoder", encoder)
         tower = self.vision_tower
-        start_ns = None if warmup else rbln_utils.start_mm_encoder_timing()
+        start_ns = None if warmup else time.perf_counter_ns()
         valid = (pixel_position_ids >= 0).all(dim=-1)
         num_patches = int(valid.sum())
         assert num_patches <= self.mm_encoder_patch_buckets[-1], (

@@ -19,7 +19,6 @@ from typing import Union
 import torch
 from vllm.forward_context import get_forward_context
 
-from vllm_rbln import envs
 from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
@@ -45,10 +44,6 @@ def run_mm_encoder(
     if dtype is None:
         return embeds.cpu()
     return embeds.to(device="cpu", dtype=dtype)
-
-
-def start_mm_encoder_timing() -> int | None:
-    return perf_counter_ns() if envs.VLLM_RBLN_METRICS else None
 
 
 def run_mm_encoder_with_timing(
