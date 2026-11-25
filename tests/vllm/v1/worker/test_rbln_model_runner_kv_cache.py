@@ -263,7 +263,7 @@ class TestKVCacheBaseBindings:
         assert [tuple(b.shape) for b in runner.kv_cache_bases] == [full_info.view_shape]
 
     @pytest.mark.parametrize("drafter_shares", [True, False])
-    def test_a_buffer_a_drafter_shares_is_bound_in_the_sliding_window_shape(
+    def test_the_bound_shape_follows_whether_a_drafter_shares_the_kv(
         self, make_model_runner, drafter_shares
     ):
         # The same buffer, read by a drafter layer too: bound as the sliding-window
