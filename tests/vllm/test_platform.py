@@ -1762,6 +1762,78 @@ class TestStrictProducerRequests:
         self._validate("kv_producer", 4, kv_offloading_size=1)
 
 
+class TestMmPrefixRangeRequests:
+    """The frontend refuses an mm prefix range longer than the compiled graphs
+    hold, which the scheduler would otherwise assert on."""
+
+    @staticmethod
+    def _validate(monkeypatch, placeholders, **engine_kwargs):
+        from vllm.config import ModelConfig
+        from vllm.model_executor import model_loader
+        from vllm.sampling_params import SamplingParams
+
+        from vllm_rbln.model_executor.models.gemma4 import (
+            RBLNGemma4ForConditionalGeneration,
+        )
+
+        _build(**engine_kwargs)
+        monkeypatch.setattr(ModelConfig, "is_mm_prefix_lm", property(lambda self: True))
+        monkeypatch.setattr(
+            model_loader,
+            "get_model_architecture",
+            lambda model_config: (RBLNGemma4ForConditionalGeneration, "Gemma4"),
+        )
+        RblnPlatform.validate_request(
+            {"mm_placeholders": placeholders}, SamplingParams()
+        )
+
+    @staticmethod
+    def _image(length):
+        from vllm.multimodal.inputs import PlaceholderRange
+
+        return {"image": [PlaceholderRange(offset=4, length=length)]}
+
+    def test_an_image_at_the_largest_compiled_budget_is_taken(self, monkeypatch):
+        # A 128-token chunk compiles the 70 budget only.
+        self._validate(monkeypatch, self._image(70))
+
+    def test_an_image_above_the_largest_compiled_budget_is_refused(self, monkeypatch):
+        from vllm.exceptions import VLLMValidationError
+
+        with pytest.raises(VLLMValidationError, match="140 tokens is above 70"):
+            self._validate(monkeypatch, self._image(140))
+
+    @pytest.mark.parametrize("length, refused", [(560, False), (1120, True)])
+    def test_the_ceiling_follows_the_longest_chunk(self, monkeypatch, length, refused):
+        from vllm.exceptions import VLLMValidationError
+
+        # A 1024-token chunk compiles budgets up to 560; the check reads the
+        # compiled ceiling, never the engine's max_soft_tokens default.
+        def validate():
+            self._validate(
+                monkeypatch,
+                self._image(length),
+                max_num_batched_tokens=1024,
+                additional_config={"prefill_chunk_size": [128, 1024]},
+            )
+
+        if refused:
+            with pytest.raises(VLLMValidationError, match="1120 tokens is above 560"):
+                validate()
+        else:
+            validate()
+
+    def test_video_frames_are_checked_one_by_one(self, monkeypatch):
+        from vllm.multimodal.inputs import PlaceholderRange
+
+        # Three 70-token frames, each behind two timestamp tokens.
+        frame = [False, False] + [True] * 70
+        video = PlaceholderRange(
+            offset=4, length=3 * len(frame), is_embed=torch.tensor(frame * 3)
+        )
+        self._validate(monkeypatch, {"video": [video]})
+
+
 # Resolving the vllm path reads the host's device now that RBLN-CA* refuses it,
 # so the chip is named here rather than inherited from whatever card ran this.
 @pytest.mark.usefixtures("cr13")

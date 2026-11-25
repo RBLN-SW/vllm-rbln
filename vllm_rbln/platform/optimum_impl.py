@@ -22,6 +22,7 @@ from vllm.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.inputs.engine import EngineInput
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
 
@@ -36,7 +37,9 @@ def patch_upstream() -> None:
     topk_topp_sampler.apply_top_k_top_p = topk_topp_sampler.apply_top_k_top_p_pytorch
 
 
-def validate_request(params: "SamplingParams | PoolingParams") -> None:
+def validate_request(
+    processed_inputs: "EngineInput", params: "SamplingParams | PoolingParams"
+) -> None:
     pass
 
 

@@ -15,11 +15,14 @@
 """Model capabilities the RBLN vLLM path needs beyond upstream's interfaces."""
 
 from collections.abc import Callable
-from typing import ClassVar, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, runtime_checkable
 
 from torch import nn
 from typing_extensions import TypeIs
 from vllm.model_executor.models.interfaces import supports_multimodal_embeddings
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
 
 
 @runtime_checkable
@@ -73,9 +76,12 @@ class SupportsRBLNMmPrefix(Protocol):
     end.
     """
 
-    max_mm_prefix_range_len: int
-    """The most positions one embeds range can span; the longest prefill chunk
-    must hold it."""
+    @classmethod
+    def max_mm_prefix_range_len(cls, vllm_config: "VllmConfig") -> int:
+        """The most positions one embeds range can span; the longest prefill chunk
+        must hold it. A function of config alone, so the frontend, which has no
+        model, refuses a request whose range the compiled graphs cannot run."""
+        ...
 
 
 def supports_rbln_mm_prefix(model: object) -> TypeIs[SupportsRBLNMmPrefix]:
