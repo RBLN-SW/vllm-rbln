@@ -23,7 +23,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import BatchFeature
-from transformers.models.gemma4.modeling_gemma4 import apply_multidimensional_rope
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
 from vllm.forward_context import get_forward_context
@@ -117,6 +116,19 @@ class _RBLNGemma4VisionEncoder(nn.Module):
             ),
             persistent=False,
         )
+        # HF's rope slices a head into its x and y halves and joins them back,
+        # which round-trips DRAM on a large image. rotate_half on each half is
+        # a block of one signed channel permutation, so the rope is a matmul.
+        half = vision_tower.config.head_dim // 4
+        rot = torch.zeros(2 * half, 2 * half)
+        for j in range(half):
+            rot[j + half, j] = -1.0
+            rot[j, j + half] = 1.0
+        self.register_buffer(
+            "rope_rot",
+            torch.block_diag(rot, rot).to(patch_embedder.input_proj.weight),
+            persistent=False,
+        )
 
     def forward(
         self,
@@ -141,7 +153,8 @@ class _RBLNGemma4VisionEncoder(nn.Module):
         )
         rope = F.embedding(pixel_position_ids.clamp(min=0), self.rope_table)
         half = rope.shape[-1] // 2
-        cos, sin = rope[..., :half].flatten(-2), rope[..., half:].flatten(-2)
+        cos = rope[..., :half].flatten(-2).unsqueeze(2)
+        sin = rope[..., half:].flatten(-2).unsqueeze(2)
         for layer in tower.encoder.layers:
             residual = hidden_states
             hidden_states = layer.input_layernorm(hidden_states)
@@ -150,15 +163,17 @@ class _RBLNGemma4VisionEncoder(nn.Module):
             q = attn.q_norm(attn.q_proj(hidden_states).view(shape))
             k = attn.k_norm(attn.k_proj(hidden_states).view(shape))
             v = attn.v_norm(attn.v_proj(hidden_states).view(shape))
-            q = apply_multidimensional_rope(q, cos, sin, pixel_position_ids)
-            k = apply_multidimensional_rope(k, cos, sin, pixel_position_ids)
-            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-            k = k.repeat_interleave(attn.num_key_value_groups, dim=1)
-            v = v.repeat_interleave(attn.num_key_value_groups, dim=1)
-            out = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=key_bias, scale=attn.scaling
-            )
-            out = out.transpose(1, 2).reshape(residual.shape)
+            q = q * cos + torch.matmul(q, self.rope_rot) * sin
+            k = k * cos + torch.matmul(k, self.rope_rot) * sin
+            # [heads, patches, head_dim] of the one image: 3D matmuls lower to
+            # batched matmuls; the 4D form, which SDPA also falls back to for an
+            # off-64 head_dim, does not and runs slower.
+            q, k, v = q[0].transpose(0, 1), k[0].transpose(0, 1), v[0].transpose(0, 1)
+            k = k.repeat_interleave(attn.num_key_value_groups, dim=0)
+            v = v.repeat_interleave(attn.num_key_value_groups, dim=0)
+            scores = torch.matmul(q, k.transpose(1, 2)) * attn.scaling + key_bias
+            out = torch.matmul(torch.softmax(scores, dim=-1), v)
+            out = out.transpose(0, 1).reshape(residual.shape)
             hidden_states = residual + layer.post_attention_layernorm(attn.o_proj(out))
             residual = hidden_states
             hidden_states = layer.pre_feedforward_layernorm(hidden_states)
@@ -435,7 +450,7 @@ class RBLNGemma4ForConditionalGeneration(
         positions[0, :num_patches] = pixel_position_ids[valid_rows]
         padding = ~(positions >= 0).all(dim=-1)
         key_bias = torch.where(padding, torch.finfo(self.model_dtype).min, 0.0)[
-            :, None, None, :
+            :, None, :
         ]
         patches = pixel_values[valid_rows]
         inputs = buffered_encoder.input_buffers.stage(
@@ -486,8 +501,8 @@ class RBLNGemma4ForConditionalGeneration(
             ),
             rbln_utils.EncoderInput(
                 "key_bias",
-                (1, 1, 1, bucket_size),
-                axis=3,
+                (1, 1, bucket_size),
+                axis=2,
                 pad=torch.finfo(self.model_dtype).min,
                 allow_prefix_copy=False,
             ),

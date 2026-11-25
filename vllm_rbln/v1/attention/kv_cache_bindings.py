@@ -14,7 +14,7 @@
 
 import math
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
@@ -68,10 +68,16 @@ class KVCacheViewInfo:
 def build_kv_cache_base_bindings(
     kv_cache_bases_by_layer: dict[str, torch.Tensor],
     kv_cache_view_infos_by_layer: dict[str, KVCacheViewInfo],
+    canonical_layers: Collection[str],
     *,
     layer_names: Sequence[str],
 ) -> tuple[list[torch.Tensor], list[KVCacheViewInfo]]:
-    """Deduplicate KV cache inputs by storage and capture per-layer view info."""
+    """Deduplicate KV cache inputs by storage and capture per-layer view info.
+
+    Each storage is bound in the shape of its layer in `canonical_layers` rather
+    than the first layer's; every storage needs a layer there, and layers named
+    for one storage must view it in one shape. The other layers view the base.
+    """
     assert len(layer_names) == len(kv_cache_view_infos_by_layer) and set(
         layer_names
     ) == set(kv_cache_view_infos_by_layer), (
@@ -80,6 +86,12 @@ def build_kv_cache_base_bindings(
     base_tensors: list[torch.Tensor] = []
     view_infos: list[KVCacheViewInfo] = []
     base_index_by_view: dict[tuple[torch.device, int, int, int, int], int] = {}
+    canonical_bases = {
+        kv_cache_tensor_key(kv_cache_bases_by_layer[name]): kv_cache_bases_by_layer[
+            name
+        ]
+        for name in canonical_layers
+    }
 
     for layer_name in layer_names:
         base_tensor = kv_cache_bases_by_layer[layer_name]
@@ -91,7 +103,10 @@ def build_kv_cache_base_bindings(
         if base_index is None:
             base_index = len(base_tensors)
             base_index_by_view[view_key] = base_index
-            base_tensors.append(base_tensor)
+            assert view_key in canonical_bases, (
+                f"the KV cache storage of {layer_name} has no layer in canonical_layers"
+            )
+            base_tensors.append(canonical_bases[view_key])
 
         view_info = kv_cache_view_infos_by_layer[layer_name]
         if view_info.view_dtype == base_tensors[base_index].dtype:

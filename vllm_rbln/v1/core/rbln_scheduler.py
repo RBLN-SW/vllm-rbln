@@ -39,6 +39,7 @@ from vllm.v1.core.sched.output import (
 from vllm.v1.core.sched.request_queue import RequestQueue, SchedulingPolicy
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutputs
+from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.utils import record_function_or_nullcontext
@@ -693,6 +694,7 @@ class RBLNScheduler(Scheduler):
                     step_skipped_waiting.appendleft(request_to_skip)
 
             sub_block_match = None
+            no_sub_block_req_id: str | None = None
 
             while token_budget > 0:
                 num_running = len(self.running) + self.num_waiting_for_streaming_input
@@ -787,7 +789,10 @@ class RBLNScheduler(Scheduler):
                         self.connector is not None
                         and request.status == RequestStatus.PREEMPTED
                     )
-                    if not resuming_with_connector:
+                    if (
+                        not resuming_with_connector
+                        and request_id != no_sub_block_req_id
+                    ):
                         sub_block_match, num_sub_block_tokens = (
                             self._try_sub_block_match(
                                 request,
@@ -1014,6 +1019,22 @@ class RBLNScheduler(Scheduler):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
+
+                    # NOTE(RBLN): a match pins its source block from the lookup
+                    # on. When only the match holds it, the pin took it out of
+                    # the free queue, so the request may fit without the match;
+                    # retry it, since dropping the match also reopens the
+                    # connector arbitration above.
+                    if sub_block_match is not None:
+                        frees_a_block = any(
+                            gm.src_block.ref_cnt == 1
+                            for gm in sub_block_match.group_matches
+                        )
+                        self.kv_cache_manager.release_sub_block_match(sub_block_match)
+                        sub_block_match = None
+                        if frees_a_block:
+                            no_sub_block_req_id = request_id
+                            continue
                     break
 
                 # NOTE(RBLN): Apply sub-block match now that blocks are
@@ -1228,7 +1249,9 @@ class RBLNScheduler(Scheduler):
         # Construct the scheduler output.
         new_reqs_data = [
             NewRequestData.from_request(
-                req, req_to_new_blocks[req.request_id].get_block_ids()
+                req,
+                req_to_new_blocks[req.request_id].get_block_ids(),
+                uses_mrope=self.model_uses_mrope,
             )
             for req in scheduled_new_reqs
         ]
@@ -1521,15 +1544,18 @@ class RBLNScheduler(Scheduler):
     ) -> bool:
         """Whether the free blocks hold ``request`` through its first spec
         decode step: the sampled and draft tokens after the prompt, plus the
-        lookahead.
+        lookahead. Without spec decode, through the prompt.
 
         An admitted prefill runs alone to completion (no mixed batching), so it
         must not be admitted short of that step: it would preempt itself there
         and its re-admission would evict the decodes again. The full-sequence
         gate in ``allocate_slots`` counts the prompt alone; this is the same
-        count carried through that step.
+        count carried through that step, plus the block an align-mode Mamba
+        group holds on top of that count while a chunk crosses its block
+        boundary: the chunk reads the previous block's state into a new block,
+        and the previous one is released only on the next chunk.
         """
-        if not self.num_spec_tokens:
+        if not (self.num_spec_tokens or self.need_mamba_block_aligned_split):
             return True
         manager = self.kv_cache_manager
         hit_blocks = list(new_computed_blocks.blocks)
@@ -1543,8 +1569,14 @@ class RBLNScheduler(Scheduler):
         num_local_computed_tokens = (
             request.num_computed_tokens + num_new_local_computed_tokens
         )
-        num_tokens_main_model = min(
-            request.num_tokens + 1 + self.num_spec_tokens, self.max_model_len
+        num_tokens_main_model = (
+            min(request.num_tokens + 1 + self.num_spec_tokens, self.max_model_len)
+            if self.num_spec_tokens
+            else request.num_tokens
+        )
+        total_computed_tokens = min(
+            num_local_computed_tokens + num_external_computed_tokens,
+            self.max_model_len,
         )
         num_blocks = manager.coordinator.get_num_blocks_to_allocate(
             request_id=request.request_id,
@@ -1553,15 +1585,24 @@ class RBLNScheduler(Scheduler):
             ),
             new_computed_blocks=tuple(hit_blocks),
             num_encoder_tokens=num_encoder_tokens,
-            total_computed_tokens=min(
-                num_local_computed_tokens + num_external_computed_tokens,
-                self.max_model_len,
-            ),
+            total_computed_tokens=total_computed_tokens,
             num_local_computed_tokens=num_local_computed_tokens,
             num_tokens_main_model=num_tokens_main_model,
             apply_admission_cap=True,
             prefill_end=max(request.num_prompt_tokens, request.num_tokens - 1),
         )
+        if self.need_mamba_block_aligned_split:
+            num_blocks += sum(
+                isinstance(group.kv_cache_spec, MambaSpec)
+                and total_computed_tokens // group.kv_cache_spec.block_size
+                != (num_tokens_main_model - 1) // group.kv_cache_spec.block_size
+                # A free hit block is the previous block, already counted above
+                # as an evictable hit.
+                and not (hit and hit[-1].ref_cnt == 0 and not hit[-1].is_null)
+                for group, hit in zip(
+                    self.kv_cache_config.kv_cache_groups, hit_blocks, strict=True
+                )
+            )
         watermark_blocks = manager.watermark_blocks if self.running else 0
         return num_blocks + watermark_blocks <= manager.block_pool.get_num_free_blocks()
 

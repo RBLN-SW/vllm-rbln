@@ -25,9 +25,10 @@ compile-time cache, and after warm-up sizes the real cache from two measurements
   the physical shape, dtype and one shard per `(node, chiplet)`, with the dynamic
   dim left symbolic. The KV caches are the only dynamic inputs, so summing the
   shards' extents gives the per-chiplet slope exactly. A layer's dynamic dim is
-  its *kernel* block count -- a sliding-window layer splits each manager block
-  into `block_size / sliding_window` kernel blocks -- so each input's symbol is
-  scaled by its compiled extent over the compile hint. Programs that bind a
+  its *kernel* block count -- a sliding-window layer whose window divides its
+  block splits each manager block into `block_size / sliding_window` kernel
+  blocks -- so each input's symbol is scaled by its compiled extent over the
+  compile hint. Programs that bind a
   different set of KV tensors (a speculative drafter's) contribute their own
   slope on top of the target's. The fit counts the shards at what the runtime's
   caching allocator reserves for them, replayed the way it allocates: requests

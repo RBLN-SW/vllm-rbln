@@ -311,6 +311,8 @@ class TestSync:
                 model="Qwen/Qwen3-0.6B",
                 architectures=hf_config.architectures,
                 runner_type=runner,
+                pooler_config=SimpleNamespace(seq_pooling_type="LAST"),
+                is_hybrid=False,
                 hf_config=hf_config,
                 hf_text_config=hf_config,
                 multimodal_config=None,
@@ -330,7 +332,7 @@ class TestSync:
                 block_size=1024,
                 gpu_memory_utilization=0.9,
                 user_specified_block_size=True,
-                enable_prefix_caching=False,
+                enable_prefix_caching=runner == "pooling",
                 num_gpu_blocks_override=None,
                 user_specified_mamba_block_size=False,
                 mamba_block_size=None,
@@ -357,6 +359,12 @@ class TestSync:
             ([expected_arch], expected_cls, expected_chunk_size, expected_phases)
         ]
         assert cfg.additional_config.single_prefill_chunk_size == expected_chunk_size
+        assert cfg.cache_config.enable_prefix_caching is (
+            runner == "pooling" and not reranker
+        )
+        if cfg.cache_config.enable_prefix_caching:
+            assert cfg.cache_config.block_size == expected_chunk_size
+            assert cfg.additional_config.attn_block_size == 1024
 
     @pytest.mark.parametrize(
         ("reranker", "expected_arch", "expected_cls", "expected_phases"),
@@ -390,6 +398,8 @@ class TestSync:
                 model="Qwen/Qwen3-VL-2B",
                 architectures=hf_config.architectures,
                 runner_type="pooling",
+                pooler_config=SimpleNamespace(seq_pooling_type="LAST"),
+                is_hybrid=False,
                 hf_config=hf_config,
                 hf_text_config=hf_config.text_config,
                 multimodal_config=None,
@@ -409,7 +419,7 @@ class TestSync:
                 block_size=1024,
                 gpu_memory_utilization=0.9,
                 user_specified_block_size=True,
-                enable_prefix_caching=False,
+                enable_prefix_caching=True,
                 num_gpu_blocks_override=None,
                 user_specified_mamba_block_size=False,
                 mamba_block_size=None,
@@ -432,6 +442,7 @@ class TestSync:
         monkeypatch.setattr(sync, "compile_cache_name", generate_name)
         check_and_update(cfg)
         assert observed == [([expected_arch], expected_cls, expected_phases)]
+        assert cfg.cache_config.enable_prefix_caching is not reranker
 
     def test_repeated_sync_preserves_the_compile_config(self, vllm_config_factory):
         cfg = vllm_config_factory()

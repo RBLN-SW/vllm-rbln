@@ -935,13 +935,12 @@ def test_a_producer_warms_the_sampler_at_one_request(
     assert runner._warmup_sampler_decode_batches.called is verifies
 
 
-@pytest.mark.parametrize("num_reqs", [1, 2])
-def test_reference_sampler_warmup_finishes(num_reqs):
-    runner = _make_runner_stub(
+def _sampler_warmup_runner(sampler, num_reqs):
+    return _make_runner_stub(
         device=torch.device("cpu"),
         dtype=torch.float32,
         model_config=SimpleNamespace(get_vocab_size=lambda: 32),
-        sampler=mr.Sampler(),
+        sampler=sampler,
         input_batch=SimpleNamespace(
             temperature=torch.ones(num_reqs),
             top_p=torch.ones(num_reqs),
@@ -952,7 +951,24 @@ def test_reference_sampler_warmup_finishes(num_reqs):
         ),
     )
 
-    runner._dummy_sampler_run(num_reqs)
+
+def test_reference_sampler_skips_warmup():
+    sampler = MagicMock(spec=mr.Sampler)
+
+    _sampler_warmup_runner(sampler, 2)._dummy_sampler_run(2)
+
+    sampler.assert_not_called()
+
+
+@pytest.mark.parametrize("num_reqs", [1, 2])
+def test_rbln_sampler_warms_up_every_config(num_reqs):
+    from vllm_rbln.v1.sample import WARM_UP_CONFIGS
+
+    sampler = MagicMock(spec=mr.RBLNSampler)
+
+    _sampler_warmup_runner(sampler, num_reqs)._dummy_sampler_run(num_reqs)
+
+    assert sampler.warm_up.call_count == len(WARM_UP_CONFIGS)
 
 
 def test_rejection_sampler_warmup_asks_for_the_synthetic_variant():
@@ -1715,6 +1731,27 @@ class TestProcessKvCacheCopyOps:
         assert torch.equal(dst[..., :3, :].cpu(), src[..., :3, :].cpu())
         assert (dst[..., :3, :] == 5.0).all()
         assert (dst[..., 3:, :] == 0.0).all()
+
+    def test_a_window_group_copies_the_whole_manager_block(self, monkeypatch):
+        monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", True)
+        # Kernel blocks of 2, four to a manager block of 8: manager block 1 is
+        # kernel blocks 4..7, and five tokens still take all four.
+        kv = torch.zeros(16, 2, 1, 1, 2, 2)
+        for kb in range(16):
+            kv[kb] = float(kb)
+        before = kv.clone()
+        r = _make_runner_stub(
+            kv_caches=[kv],
+            kv_cache_names=["sw"],
+            kv_cache_block_axes={"sw": 0},
+            kv_cache_config=_copy_groups(["sw"]),
+            _kernel_block_sizes=[2],
+            model_config=SimpleNamespace(use_mla=False, enforce_eager=True),
+            runtime_holder=[None],
+        )
+        r._process_kv_cache_copy_ops([KVCacheCopyOp(0, 1, 2, 5)])
+        assert torch.equal(kv[8:12], before[4:8])
+        assert torch.equal(kv[:8], before[:8]) and torch.equal(kv[12:], before[12:])
 
     def test_eager_copy_mla(self, monkeypatch):
         monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", True)

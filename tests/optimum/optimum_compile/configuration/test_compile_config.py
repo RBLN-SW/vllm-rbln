@@ -67,13 +67,25 @@ def _vllm_config(hf_config, *, optimum_overrides=None, prefill_chunk_size=None):
     )
 
 
-@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize(
+    ("env", "enabled"),
+    [
+        pytest.param(None, False, id="unset"),
+        pytest.param("0", False, id="off"),
+        pytest.param("1", True, id="on"),
+    ],
+)
 @pytest.mark.parametrize(
     "config_cls, architecture",
     [(GptOssConfig, "GptOssForCausalLM"), (Qwen3Config, "Qwen3ForCausalLM")],
 )
-def test_decoder_region_model_selection(monkeypatch, enabled, config_cls, architecture):
-    monkeypatch.setenv("VLLM_RBLN_USE_NESTED_COMPILE_REGION", str(int(enabled)))
+def test_decoder_region_model_selection(
+    monkeypatch, env, enabled, config_cls, architecture
+):
+    if env is None:
+        monkeypatch.delenv("VLLM_RBLN_USE_NESTED_COMPILE_REGION", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_RBLN_USE_NESTED_COMPILE_REGION", env)
     config = config_cls(architectures=[architecture])
     inputs = prepare_compile_config(_vllm_config(config))
     assert inputs.model_cls == RBLNAutoModelForCausalLM.__name__
@@ -474,12 +486,12 @@ class TestCompileCacheName:
         default = compile_cache_name(
             vllm_config_factory().additional_config.compile_config
         )
-        monkeypatch.setenv("VLLM_RBLN_USE_NESTED_COMPILE_REGION", "1")
+        monkeypatch.setenv("VLLM_RBLN_USE_NESTED_COMPILE_REGION", "0")
         assert (
             compile_cache_name(vllm_config_factory().additional_config.compile_config)
             == default
         )
-        monkeypatch.setenv("VLLM_RBLN_USE_NESTED_COMPILE_REGION", "0")
+        monkeypatch.setenv("VLLM_RBLN_USE_NESTED_COMPILE_REGION", "1")
         assert (
             compile_cache_name(vllm_config_factory().additional_config.compile_config)
             != default
