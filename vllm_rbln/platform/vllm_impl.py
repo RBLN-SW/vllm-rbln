@@ -318,9 +318,13 @@ def _validate(vllm_config: "VllmConfig") -> None:
             f"{max_block_size}."
         )
 
-    if not max_num_batched_tokens <= block_size <= max_block_size:
+    from vllm.platforms import current_platform
+
+    # REBEL CR13 stores a step longer than a block across blocks.
+    lower = "" if current_platform.is_cr13() else "max_num_batched_tokens <= "
+    if (lower and max_num_batched_tokens > block_size) or block_size > max_block_size:
         raise ValueError(
-            "RBLN requires max_num_batched_tokens <= block_size <= max_block_size, "
+            f"RBLN requires {lower}block_size <= max_block_size, "
             f"got {max_num_batched_tokens=}, {block_size=}, {max_block_size=}. "
             "Set --block-size within this range."
         )
