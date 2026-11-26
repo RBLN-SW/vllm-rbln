@@ -464,9 +464,11 @@ class TestStateSpec:
     """State specs describe the physical KV page used by the runner."""
 
     @staticmethod
-    def _layer():
+    def _layer(num_kv_heads: int = 4):
         layer = object.__new__(RBLNQwenGatedDeltaNetAttention)
-        layer.num_kv_heads = 4
+        layer.num_k_heads = 16
+        layer.tp_size = 1
+        layer.num_kv_heads = num_kv_heads
         layer.kv_head_size = 256
         layer.model_config = SimpleNamespace(dtype=torch.bfloat16)
         layer.cache_config = SimpleNamespace(
@@ -478,15 +480,19 @@ class TestStateSpec:
         )
         return layer
 
-    def test_spec_uses_full_attention_page(self):
-        layer = self._layer()
+    @pytest.mark.parametrize("num_kv_heads, rows", [(4, 256), (2, 128)])
+    def test_spec_uses_full_attention_page(self, num_kv_heads, rows):
+        # The page's bytes, [2, num_kv_heads, 1, 1024, 256], viewed by the 16 key
+        # heads: the same page for 4 KV heads (Qwen3.5-4B and up) and 2 (0.8B, 2B).
+        layer = self._layer(num_kv_heads)
         config = SimpleNamespace(
             cache_config=layer.cache_config,
             num_speculative_tokens=0,
             additional_config=RBLNConfig(),
         )
         spec = layer.get_kv_cache_spec(config)
-        assert spec.shapes == ((2, 4, 1, 1024, 256),)
+        assert spec.shapes == ((2, 16, 1, rows, 256),)
+        assert spec.page_size_bytes == 2 * num_kv_heads * 1024 * 256 * 2
         assert spec.real_page_size_bytes == spec.page_size_bytes
 
     def test_the_state_takes_no_block_a_draft(self):

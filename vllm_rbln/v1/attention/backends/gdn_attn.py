@@ -14,8 +14,9 @@
 
 """GatedDeltaNet (Qwen3.5 `linear_attention`) state on RBLN.
 
-A layer's state is a `MambaSpec` block declared as a full-attention KV page, so
-the layers sharing a buffer are one graph input with one chiplet cut. The
+A layer's state is a `MambaSpec` block declared as a full-attention KV page's
+bytes viewed by key head, so the layers sharing a buffer are one graph input
+and the compiler reads the state view from the attention's chiplet cut. The
 kernels read a state prefix of each local page and preserve the trailing
 padding. A padding row uses null block 0.
 
