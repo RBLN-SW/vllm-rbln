@@ -115,8 +115,31 @@ def sliding_window_attention_v1(
     sinks: torch.Tensor | None = None,
     *,
     attn_mask: torch.Tensor | None = None,
+    k_quantize_scale: torch.Tensor | None = None,
+    v_quantize_scale: torch.Tensor | None = None,
+    cache_dtype: torch.dtype | None = None,
     is_prompt_sorted: bool = False,
 ) -> torch.Tensor:
+    # Experiment (VLLM_RBLN_SWA_FP8=1): an fp8 cache hands its dequant scales
+    # and real dtype.
+    if cache_dtype is not None:
+        return torch.ops.rbln_custom_ops.sliding_window_attention_v1(
+            q,
+            k,
+            v,
+            kv_cache,
+            seq_idx,
+            scale,
+            block_tables,
+            window_size,
+            attn_mask is None,  # is_causal
+            attn_mask,
+            sinks,
+            k_quantize_scale,
+            v_quantize_scale,
+            cache_dtype,
+            is_prompt_sorted=is_prompt_sorted,
+        )
     # Without a mask the converter derives the causal window.
     return torch.ops.rbln_custom_ops.sliding_window_attention_v1(
         q,

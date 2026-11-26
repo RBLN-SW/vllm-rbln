@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, ClassVar
 
@@ -528,7 +529,14 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     "--rbln-use-custom-kernel: the rbln_triton_ops "
                     "attention kernels take no dequant scales."
                 )
-            if self.sliding_window is not None or not self.is_causal or self.is_normal:
+            # Experiment: VLLM_RBLN_SWA_FP8=1 lets the sliding layers take an
+            # fp8 cache too (sliding_window_attention_v1 with the dequant scales).
+            swa_fp8 = os.environ.get("VLLM_RBLN_SWA_FP8", "0") == "1"
+            if (
+                (self.sliding_window is not None and not swa_fp8)
+                or not self.is_causal
+                or self.is_normal
+            ):
                 raise NotImplementedError(
                     "fp8 KV cache is only supported by the flash causal "
                     "attention path (causal attention, "
@@ -647,6 +655,10 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                 self.sliding_window + 1,
                 self.sinks,
                 attn_mask=attn_metadata.attn_masks,
+                # The shared cache is the target layer's: same dtype and dequant scales.
+                k_quantize_scale=layer._k_scale,
+                v_quantize_scale=layer._v_scale,
+                cache_dtype=_fp8_cache_dtype(self.kv_cache_dtype),
                 is_prompt_sorted=attn_metadata.is_prompt_sorted,
             )
         elif reads_shared_kv:
@@ -682,6 +694,9 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     self.sliding_window,
                     self.sinks,
                     attn_mask=attn_metadata.swa_attn_masks,
+                    k_quantize_scale=layer._k_scale,
+                    v_quantize_scale=layer._v_scale,
+                    cache_dtype=_fp8_cache_dtype(self.kv_cache_dtype),
                     is_prompt_sorted=attn_metadata.is_prompt_sorted,
                 )
             else:
