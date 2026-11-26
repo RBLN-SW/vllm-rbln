@@ -42,6 +42,8 @@ RESIDUAL_CUT_ARCHITECTURES = frozenset(
         "DeepseekV32ForCausalLM",
         "MiniMaxM3SparseForCausalLM",
         "MiniMaxM3SparseForConditionalGeneration",
+        "Qwen3_5ForCausalLM",
+        "Qwen3_5ForConditionalGeneration",
     }
 )
 
