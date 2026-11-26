@@ -1360,8 +1360,6 @@ class TestGemma4Drafting:
                 assert positions.flatten().tolist() == [1, 3]
                 torch.testing.assert_close(hidden, torch.full_like(hidden, step))
 
-    # Window 8 over blocks of 4: not yet full, starting mid-block, starting on
-    # a block boundary.
     @pytest.mark.parametrize("position", [3, 10, 11])
     def test_draft_step_reads_at_the_query_position(self, position):
         from tests.vllm.v1.attention.utils import make_attention_spec, make_builder
