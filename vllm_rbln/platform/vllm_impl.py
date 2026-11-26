@@ -183,6 +183,11 @@ def _validate(vllm_config: "VllmConfig") -> None:
                 f"{parallel_config.pipeline_parallel_size}, data_parallel_size="
                 f"{parallel_config.data_parallel_size}."
             )
+        if model_config.quantization is not None:
+            raise ValueError(
+                "GatedDeltaNet models run unquantized on the RBLN vLLM path for "
+                f"now; got quantization={model_config.quantization}."
+            )
         text_config = model_config.hf_text_config
         num_v_heads = text_config.linear_num_value_heads
         # Per rank, so the rule holds as it is once TP is supported.
