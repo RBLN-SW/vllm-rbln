@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import tomllib
 from pathlib import Path
 from urllib.parse import unquote
 
 import pytest
-import tomllib
 from packaging.markers import Marker
 from packaging.specifiers import SpecifierSet
 from packaging.tags import compatible_tags, cpython_tags

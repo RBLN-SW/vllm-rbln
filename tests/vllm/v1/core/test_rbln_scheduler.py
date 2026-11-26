@@ -514,6 +514,37 @@ class TestSubBlockIndexAfterSpecDecodeStop:
         sched.kv_cache_manager.release_sub_block_match(match)
 
 
+# The `False` row is `disable_eagle_block_drop`; n-gram stands in for EAGLE/MTP.
+@pytest.mark.usefixtures("cr13")
+@pytest.mark.parametrize(("drops_eagle_block", "hit"), [(True, 16), (False, 32)])
+def test_sub_block_manager_drops_the_last_hit_block_only_with_the_eagle_drop(
+    monkeypatch, drops_eagle_block, hit
+):
+    from vllm.config import SpeculativeConfig
+
+    monkeypatch.setattr(SpeculativeConfig, "use_eagle", lambda self: True)
+    monkeypatch.setattr(
+        SpeculativeConfig, "use_eagle_block_drop", lambda self: drops_eagle_block
+    )
+    sched = create_rbln_scheduler(
+        enable_prefix_caching=True,
+        block_size=16,
+        max_num_batched_tokens=16,
+        sub_block_size=4,
+        max_model_len=128,
+        num_speculative_tokens=1,
+    )
+    assert isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
+    sched.add_request(make_request("a", list(range(1000, 1040)), 16, max_tokens=1))
+    step = TestSubBlockIndexAfterSpecDecodeStop._step
+    step(sched)
+    step(sched)
+    step(sched, sampled={"a": [7]})
+    query = make_request("b", list(range(1000, 1032)) + [3000] * 8, 16)
+    _, num_computed, _ = sched.kv_cache_manager.get_computed_blocks(query)
+    assert num_computed == hit
+
+
 @pytest.mark.usefixtures("cr13")
 class TestTrySubBlockMatch:
     @staticmethod

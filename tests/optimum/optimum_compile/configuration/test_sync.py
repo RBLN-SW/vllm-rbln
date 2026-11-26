@@ -859,6 +859,83 @@ def test_image_buckets_do_not_mutate_the_compile_config(vllm_config_factory):
     assert compile_cache_name(cfg.additional_config.compile_config) == original_key
 
 
+@pytest.mark.parametrize(
+    ("runner", "head_dtype", "compiled_dtype", "rejects"),
+    [
+        pytest.param("generate", "float32", None, True, id="separate-head"),
+        pytest.param("generate", None, None, False, id="default-head"),
+        pytest.param("generate", "model", None, False, id="model-head"),
+        pytest.param("generate", "bfloat16", None, False, id="matching-head"),
+        pytest.param("generate", "float32", "float32", False, id="matching-artifact"),
+        pytest.param("generate", "bfloat16", "float32", True, id="mismatched-artifact"),
+        pytest.param("pooling", "float32", None, False, id="pooling"),
+    ],
+)
+def test_optimum_head_dtype(
+    tmp_path, monkeypatch, runner, head_dtype, compiled_dtype, rejects
+):
+    from vllm.engine.arg_utils import EngineArgs
+
+    model_dir = tmp_path / "model"
+    Qwen3Config(
+        architectures=["Qwen3ForCausalLM"], max_position_embeddings=1024
+    ).save_pretrained(model_dir)
+    additional_config: dict[str, object] = {"prefill_chunk_size": [128]}
+    if compiled_dtype is not None:
+        artifact = tmp_path / "artifact"
+        artifact.mkdir()
+        (artifact / "rbln_config.json").write_text(
+            json.dumps(
+                {
+                    "batch_size": 1,
+                    "max_seq_len": 1024,
+                    "kvcache_block_size": 1024,
+                    "kvcache_num_blocks": 2,
+                    "prefill_chunk_size": 128,
+                    "dtype": compiled_dtype,
+                    "num_devices": 1,
+                }
+            )
+        )
+        monkeypatch.setattr(
+            sync, "load_compiled_rbln_config", load_compiled_rbln_config
+        )
+        monkeypatch.setattr(
+            sync, "resolve_compiled_model_path", resolve_compiled_model_path
+        )
+        additional_config["artifact_path"] = str(artifact)
+    engine_args = EngineArgs(
+        model=str(model_dir),
+        model_impl="optimum",
+        runner=runner,
+        max_model_len=1024,
+        max_num_seqs=1,
+        block_size=1024,
+        dtype="bfloat16",
+        skip_tokenizer_init=True,
+        hf_overrides={"head_dtype": head_dtype} if head_dtype is not None else {},
+        additional_config=additional_config,
+    )
+
+    if rejects:
+        with pytest.raises(
+            ValueError,
+            match=(
+                r"A separate head_dtype is unsupported for generation with "
+                r"--model-impl optimum.*--model-impl vllm"
+            ),
+        ):
+            engine_args.create_engine_config()
+        return
+
+    config = engine_args.create_engine_config()
+    assert config.model_config.dtype == getattr(torch, compiled_dtype or "bfloat16")
+    if runner == "pooling":
+        assert config.model_config.head_dtype == torch.float32
+    else:
+        assert config.model_config.head_dtype == config.model_config.dtype
+
+
 @pytest.mark.parametrize("model_impl", ["optimum", "transformers"])
 @pytest.mark.parametrize("built", [False, True])
 def test_engine_args_resolve_legacy_and_explicit_chunks_identically(

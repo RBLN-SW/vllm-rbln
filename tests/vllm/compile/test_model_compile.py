@@ -16,6 +16,7 @@
 # generates tokens.
 
 import os
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -23,6 +24,9 @@ from tests.vllm.compile.models import MODELS
 from tests.vllm.model_specs import CompileModelSpec, apply_spec_envs, spec_params
 from tests.vllm.runners import DPRequest
 from tests.vllm.utils import devices_needed, rbln_device_count
+
+if TYPE_CHECKING:
+    from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
 
 PROMPT = "The quick brown fox jumps over the lazy dog."
 MAX_TOKENS = 8
@@ -147,3 +151,189 @@ def test_minimax_m3_small_config_compiles_and_generates(
 
     assert len(outputs) == 2
     assert all(len(output.outputs[0].token_ids) == MAX_TOKENS for output in outputs)
+
+
+class SamplerDtypeProbe:
+    model_runner: "RBLNModelRunner"
+
+    def collect_logits_dtypes(self):
+        from unittest.mock import patch
+
+        runner = self.model_runner
+        model_executable = runner.model_executable
+        sampler_warmup = runner.sampler.warm_up
+        rejection_sampler = runner.rejection_sampler.impl
+        rejection_sample = rejection_sampler.rejection_sample
+        compiled_regular_dtypes = set()
+        compiled_spec_dtypes = set()
+        sampler_warmup_dtypes = set()
+        target_warmup_dtypes = set()
+        bonus_warmup_dtypes = set()
+
+        def record_output(**kwargs):
+            output = model_executable(**kwargs)
+            dtype = str(output[1].dtype)
+            query_len = kwargs["input_ids"].size(1)
+            if runner.is_prefill or query_len == 1:
+                compiled_regular_dtypes.add(dtype)
+            elif query_len == runner.num_spec_tokens + 1:
+                compiled_spec_dtypes.add(dtype)
+            return output
+
+        def record_sampler_inputs(logits, sampling_metadata):
+            sampler_warmup_dtypes.add(str(logits.dtype))
+            return sampler_warmup(logits, sampling_metadata)
+
+        def record_rejection_inputs(*args, **kwargs):
+            target_warmup_dtypes.add(str(args[5].dtype))
+            if (bonus_logits := kwargs["bonus_logits"]) is not None:
+                bonus_warmup_dtypes.add(str(bonus_logits.dtype))
+            return rejection_sample(*args, **kwargs)
+
+        with (
+            patch.object(runner, "model_executable", record_output),
+            patch.object(runner.sampler, "warm_up", record_sampler_inputs),
+            patch.object(
+                rejection_sampler, "rejection_sample", record_rejection_inputs
+            ),
+        ):
+            runner.warmup_model()
+
+        return (
+            sorted(compiled_regular_dtypes),
+            sorted(compiled_spec_dtypes),
+            sorted(sampler_warmup_dtypes),
+            sorted(target_warmup_dtypes),
+            sorted(bonus_warmup_dtypes),
+        )
+
+
+@pytest.mark.model_compile(npu_count=1)
+@pytest.mark.timeout(_TIMEOUT_S, method="thread")
+@pytest.mark.parametrize(
+    ("model_type", "architecture"),
+    [
+        ("llama", "LlamaForCausalLM"),
+        ("qwen3", "Qwen3ForCausalLM"),
+        ("qwen3_5", "Qwen3_5ForConditionalGeneration"),
+    ],
+)
+@pytest.mark.parametrize("head_dtype", [None, "float32"], ids=["default", "fp32-head"])
+def test_sampler_warmups_match_compiled_logits(
+    vllm_runner, tmp_path, monkeypatch, model_type, architecture, head_dtype
+):
+    from transformers import AutoConfig
+
+    text_config = dict(
+        vocab_size=256,
+        hidden_size=256,
+        intermediate_size=512,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=64,
+        max_position_embeddings=1024,
+    )
+    multimodal = model_type == "qwen3_5"
+    if multimodal:
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+        from transformers import (
+            PreTrainedTokenizerFast,
+            Qwen2VLImageProcessor,
+            Qwen3VLProcessor,
+            Qwen3VLVideoProcessor,
+        )
+
+        model_config = AutoConfig.for_model(
+            model_type,
+            architectures=[architecture],
+            text_config=text_config
+            | {
+                "layer_types": ["full_attention"],
+                "mtp_num_hidden_layers": 1,
+                "linear_num_key_heads": 2,
+                "linear_num_value_heads": 4,
+                "rope_parameters": {
+                    "rope_type": "default",
+                    "rope_theta": 10000.0,
+                    "partial_rotary_factor": 0.25,
+                    "mrope_interleaved": True,
+                    "mrope_section": [3, 3, 2],
+                },
+            },
+            vision_config={
+                "depth": 1,
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "num_heads": 4,
+                "num_position_embeddings": 64,
+                "out_hidden_size": text_config["hidden_size"],
+            },
+            image_token_id=1,
+            video_token_id=2,
+            vision_start_token_id=3,
+            vision_end_token_id=4,
+        )
+        vocab = {
+            token: i
+            for i, token in enumerate(
+                [
+                    "<unk>",
+                    "<|image_pad|>",
+                    "<|video_pad|>",
+                    "<|vision_start|>",
+                    "<|vision_end|>",
+                ]
+            )
+        }
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=Tokenizer(WordLevel(vocab, unk_token="<unk>")),
+            unk_token="<unk>",
+        )
+        Qwen3VLProcessor(
+            image_processor=Qwen2VLImageProcessor(
+                patch_size=16, size={"shortest_edge": 1024, "longest_edge": 1024}
+            ),
+            tokenizer=tokenizer,
+            video_processor=Qwen3VLVideoProcessor(),
+        ).save_pretrained(tmp_path)
+    else:
+        model_config = AutoConfig.for_model(
+            model_type, architectures=[architecture], **text_config
+        )
+    model_config.save_pretrained(tmp_path)
+
+    prefill_chunk_size = 128 if multimodal else 64
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "1")
+    with vllm_runner(
+        str(tmp_path),
+        load_format="dummy",
+        skip_tokenizer_init=not multimodal,
+        dtype="bfloat16",
+        hf_overrides={"head_dtype": head_dtype} if head_dtype else {},
+        max_model_len=1024,
+        max_num_batched_tokens=prefill_chunk_size,
+        max_num_seqs=1,
+        block_size=1024,
+        num_gpu_blocks_override=2,
+        additional_config={
+            "prefill_chunk_size": [prefill_chunk_size],
+            "use_custom_sampler": True,
+        },
+        speculative_config={
+            "method": "mtp" if multimodal else "ngram",
+            "num_speculative_tokens": 2,
+        },
+        worker_extension_cls=f"{__name__}.SamplerDtypeProbe",
+        **({"limit_mm_per_prompt": {"image": 1, "video": 0}} if multimodal else {}),
+    ) as model:
+        (dtypes,) = model.llm.collective_rpc("collect_logits_dtypes")
+
+    regular_dtypes, spec_dtypes, sampler_dtypes, target_dtypes, bonus_dtypes = dtypes
+    expected_dtypes = ["torch.float32" if head_dtype else "torch.bfloat16"]
+    assert regular_dtypes == expected_dtypes
+    assert spec_dtypes == expected_dtypes
+    assert sampler_dtypes == regular_dtypes
+    assert target_dtypes == spec_dtypes
+    assert bonus_dtypes == spec_dtypes
