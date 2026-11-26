@@ -34,14 +34,13 @@ from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 
 from vllm_rbln.utils import is_prefill_step
 
-# The architectures whose block boundaries run on the residual ops.
+# The architectures whose block boundaries run on the residual ops: the ones that
+# ran faster with the cut at the depth the perf CI runs them. A.X-K2's decode steps
+# ran slower although they do not cut, and DeepSeek-V3 and MiniMax-M3 showed no
+# gain beyond run-to-run noise, so they keep upstream's path.
 RESIDUAL_CUT_ARCHITECTURES = frozenset(
     {
-        "AXK2ForCausalLM",
-        "DeepseekV3ForCausalLM",
         "DeepseekV32ForCausalLM",
-        "MiniMaxM3SparseForCausalLM",
-        "MiniMaxM3SparseForConditionalGeneration",
         "Qwen3_5ForCausalLM",
         "Qwen3_5ForConditionalGeneration",
     }

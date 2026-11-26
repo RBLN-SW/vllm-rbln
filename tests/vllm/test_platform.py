@@ -2157,7 +2157,11 @@ class TestModelImpl:
 
 @pytest.mark.parametrize(
     "architecture, fused_add_rms_norm",
-    [("DeepseekV3ForCausalLM", ["rbln", "native"]), ("LlamaForCausalLM", ["native"])],
+    [
+        ("DeepseekV32ForCausalLM", ["rbln", "native"]),
+        ("DeepseekV3ForCausalLM", ["native"]),
+        ("LlamaForCausalLM", ["native"]),
+    ],
 )
 def test_residual_cut_models_put_the_rbln_fused_add_rms_norm_first(
     configured, architecture, fused_add_rms_norm
