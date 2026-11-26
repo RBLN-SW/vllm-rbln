@@ -16,14 +16,11 @@
 compiled and its image embeddings merged inside the compiled graph."""
 
 import math
-from collections.abc import Callable, Iterable, Mapping
-from functools import cached_property
+from collections.abc import Iterable
 
 import torch
 import torch.nn.functional as F
 from torch import nn
-from transformers import BatchFeature
-from transformers.models.gemma4.modeling_gemma4 import apply_multidimensional_rope
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
 from vllm.forward_context import get_forward_context
@@ -40,7 +37,6 @@ from vllm.model_executor.models.gemma4_mm import (
     _get_max_soft_tokens,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.multimodal.parse import MultiModalDataItems
 from vllm.sequence import IntermediateTensors
 
 import vllm_rbln.utils as rbln_utils
@@ -48,7 +44,11 @@ from vllm_rbln.model_executor.models.interfaces import (
     SupportsRBLNMmPrefix,
     SupportsRBLNMultiModal,
 )
-from vllm_rbln.patches.attention import _resolve_kv_cache
+from vllm_rbln.v1.attention.kv_cache_bindings import resolve_kv_cache
+
+# fp32 like upstream: the patch embedder scales by 2 * (x - 0.5) before
+# casting to the weight dtype, which keeps precision near mid-gray.
+_PATCH_DTYPE = torch.float32
 
 
 def _build_mm_prefix_sliding_mask(
@@ -91,8 +91,7 @@ def _build_mm_prefix_sliding_mask(
 
 
 class _RBLNGemma4VisionEncoder(nn.Module):
-    """Gemma4's vision tower and its projection into the text model as one
-    static graph: the host hands in the mask and patches padded to one count."""
+    """Run Gemma4's vision tower and text projection in one static graph."""
 
     def __init__(self, vision_tower: nn.Module, embed_vision: nn.Module):
         super().__init__()
@@ -112,6 +111,19 @@ class _RBLNGemma4VisionEncoder(nn.Module):
             torch.cat([cos[0, :, :half], sin[0, :, :half]], dim=-1).to(
                 patch_embedder.input_proj.weight.device
             ),
+            persistent=False,
+        )
+        # HF's rope slices a head into its x and y halves and joins them back,
+        # which round-trips DRAM on a large image. rotate_half on each half is
+        # a block of one signed channel permutation, so the rope is a matmul.
+        half = vision_tower.config.head_dim // 4
+        rot = torch.zeros(2 * half, 2 * half)
+        for j in range(half):
+            rot[j + half, j] = -1.0
+            rot[j, j + half] = 1.0
+        self.register_buffer(
+            "rope_rot",
+            torch.block_diag(rot, rot).to(patch_embedder.input_proj.weight),
             persistent=False,
         )
 
@@ -138,7 +150,8 @@ class _RBLNGemma4VisionEncoder(nn.Module):
         )
         rope = F.embedding(pixel_position_ids.clamp(min=0), self.rope_table)
         half = rope.shape[-1] // 2
-        cos, sin = rope[..., :half].flatten(-2), rope[..., half:].flatten(-2)
+        cos = rope[..., :half].flatten(-2).unsqueeze(2)
+        sin = rope[..., half:].flatten(-2).unsqueeze(2)
         for layer in tower.encoder.layers:
             residual = hidden_states
             hidden_states = layer.input_layernorm(hidden_states)
@@ -147,15 +160,17 @@ class _RBLNGemma4VisionEncoder(nn.Module):
             q = attn.q_norm(attn.q_proj(hidden_states).view(shape))
             k = attn.k_norm(attn.k_proj(hidden_states).view(shape))
             v = attn.v_norm(attn.v_proj(hidden_states).view(shape))
-            q = apply_multidimensional_rope(q, cos, sin, pixel_position_ids)
-            k = apply_multidimensional_rope(k, cos, sin, pixel_position_ids)
-            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-            k = k.repeat_interleave(attn.num_key_value_groups, dim=1)
-            v = v.repeat_interleave(attn.num_key_value_groups, dim=1)
-            out = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=key_bias, scale=attn.scaling
-            )
-            out = out.transpose(1, 2).reshape(residual.shape)
+            q = q * cos + torch.matmul(q, self.rope_rot) * sin
+            k = k * cos + torch.matmul(k, self.rope_rot) * sin
+            # [heads, patches, head_dim] of the one image: 3D matmuls lower to
+            # batched matmuls; the 4D form, which SDPA also falls back to for an
+            # off-64 head_dim, does not and runs slower.
+            q, k, v = q[0].transpose(0, 1), k[0].transpose(0, 1), v[0].transpose(0, 1)
+            k = k.repeat_interleave(attn.num_key_value_groups, dim=0)
+            v = v.repeat_interleave(attn.num_key_value_groups, dim=0)
+            scores = torch.matmul(q, k.transpose(1, 2)) * attn.scaling + key_bias
+            out = torch.matmul(torch.softmax(scores, dim=-1), v)
+            out = out.transpose(0, 1).reshape(residual.shape)
             hidden_states = residual + layer.post_attention_layernorm(attn.o_proj(out))
             residual = hidden_states
             hidden_states = layer.pre_feedforward_layernorm(hidden_states)
@@ -199,62 +214,40 @@ def split_gate_up_weights(model: nn.Module) -> set[str]:
     return names
 
 
-def mm_soft_token_cap(info: Gemma4ProcessingInfo) -> int:
-    """The most soft tokens an image may take: the engine's max_soft_tokens,
-    else the HF image processor's own."""
+def mm_soft_token_default(info: Gemma4ProcessingInfo) -> int:
+    """The soft tokens an image takes when its request names none: the engine's
+    max_soft_tokens, else the HF image processor's own."""
     model_config = info.ctx.model_config
-    cap, _ = _get_max_soft_tokens(info.ctx.get_merged_mm_kwargs({}))
-    if cap is None:
-        cap = info.get_hf_processor().image_processor.max_soft_tokens
+    default, _ = _get_max_soft_tokens(info.ctx.get_merged_mm_kwargs({}))
+    if default is None:
+        default = info.get_hf_processor().image_processor.max_soft_tokens
         # Upstream counts an image without max_soft_tokens at
         # default_output_length, while HF sizes it by its processor.
-        default = model_config.hf_config.vision_config.default_output_length
-        if cap != default:
+        output_length = model_config.hf_config.vision_config.default_output_length
+        if default != output_length:
             raise ValueError(
-                f"vision_config.default_output_length={default} differs from "
-                f"the image processor's max_soft_tokens={cap}; set the budget "
-                "with --mm-processor-kwargs '{\"max_soft_tokens\": N}' instead."
+                f"vision_config.default_output_length={output_length} differs "
+                f"from the image processor's max_soft_tokens={default}; set the "
+                "budget with --mm-processor-kwargs '{\"max_soft_tokens\": N}' "
+                "instead."
             )
-    if cap not in _SUPPORTED_SOFT_TOKENS:
+    if default not in _SUPPORTED_SOFT_TOKENS:
         raise ValueError(
-            f"max_soft_tokens={cap} is not one of {_SUPPORTED_SOFT_TOKENS}."
+            f"max_soft_tokens={default} is not one of {_SUPPORTED_SOFT_TOKENS}."
         )
-    return cap
+    return default
 
 
 class RBLNGemma4MultiModalProcessor(Gemma4MultiModalProcessor):
-    """Upstream's processor, refusing per request an image budget above the
-    engine's."""
+    """Upstream's processor, with every budget's HF processor built up front."""
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        # Upstream caches one HF processor per max_soft_tokens; build each
-        # allowed budget's before serving.
+        # Upstream caches one HF processor per max_soft_tokens. A request may
+        # ask for any budget up to the compiled ceiling, which this processor
+        # cannot see; vllm_impl.validate_request refuses the ones above it.
         for budget in _SUPPORTED_SOFT_TOKENS:
-            if budget <= self._mm_soft_token_cap:
-                self.info.get_hf_processor(max_soft_tokens=budget)
-
-    @cached_property
-    def _mm_soft_token_cap(self) -> int:
-        return mm_soft_token_cap(self.info)
-
-    def _apply_hf_processor_main(
-        self,
-        mm_items: MultiModalDataItems,
-        hf_kwargs: Mapping[str, object],
-    ) -> BatchFeature:
-        # Video frames take a fixed budget of their own, below any cap.
-        if mm_items.get_count("image", strict=False):
-            budget, _ = _get_max_soft_tokens(
-                self.info.ctx.get_merged_mm_kwargs(hf_kwargs)
-            )
-            if isinstance(budget, int) and budget > self._mm_soft_token_cap:
-                raise ValueError(
-                    f"max_soft_tokens={budget} is above the engine's image budget "
-                    f"of {self._mm_soft_token_cap}; raise it with "
-                    "--mm-processor-kwargs at start-up."
-                )
-        return super()._apply_hf_processor_main(mm_items, hf_kwargs)
+            self.info.get_hf_processor(max_soft_tokens=budget)
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -265,6 +258,38 @@ class RBLNGemma4MultiModalProcessor(Gemma4MultiModalProcessor):
 class RBLNGemma4ForConditionalGeneration(
     Gemma4ForConditionalGeneration, SupportsRBLNMultiModal, SupportsRBLNMmPrefix
 ):
+    @classmethod
+    def encoder_token_budgets(cls, vllm_config: VllmConfig) -> list[int]:
+        """The soft token budgets the vision encoder compiles one graph each for;
+        an image or frame is padded to the smallest that holds it. Unset, every
+        budget the longest prefill chunk holds. Compile flags alone decide them,
+        so a scheduler cap shorter than the largest is refused by the runner,
+        not met by quietly compiling less."""
+        rbln_config = vllm_config.additional_config
+        longest_chunk = rbln_config.max_prefill_chunk_size
+        budgets = sorted(rbln_config.encoder_token_budgets) or [
+            budget for budget in _SUPPORTED_SOFT_TOKENS if budget <= longest_chunk
+        ]
+        if not budgets:
+            raise ValueError(
+                f"The longest prefill chunk ({longest_chunk}) holds no Gemma4 soft "
+                f"token budget; the smallest is {_SUPPORTED_SOFT_TOKENS[0]}. "
+                "Lengthen --rbln-prefill-chunk-size."
+            )
+        if unsupported := sorted(set(budgets) - set(_SUPPORTED_SOFT_TOKENS)):
+            raise ValueError(
+                f"encoder_token_budgets {unsupported} are not Gemma4 soft token "
+                f"budgets; pick from {list(_SUPPORTED_SOFT_TOKENS)}, the counts "
+                "its image processor emits."
+            )
+        return budgets
+
+    @classmethod
+    def max_mm_prefix_range_len(cls, vllm_config: VllmConfig) -> int:
+        # A request may ask for any compiled budget, and a video frame takes the
+        # smallest, so an image at the largest is the longest range.
+        return cls.encoder_token_budgets(vllm_config)[-1]
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         if vllm_config.parallel_config.data_parallel_size > 1:
             raise ValueError("Gemma4 does not support data parallel on RBLN.")
@@ -296,37 +321,28 @@ class RBLNGemma4ForConditionalGeneration(
                 and module.attn.use_mm_prefix
             ):
                 self.mm_prefix_attn_layers.append(module.attn)
-        cap = mm_soft_token_cap(
-            MULTIMODAL_REGISTRY.create_processor(vllm_config.model_config).info
-        )
-        # Video frames take the smallest budget, so an image at the cap is the
-        # longest range.
-        self.max_mm_prefix_range_len = cap
-        # One compiled encoder shape per budget; an image or frame is padded to
-        # the smallest that holds its patches. Unset, every budget a prefill
-        # chunk holds, so raising max_soft_tokens keeps the compiled graphs.
-        rbln_config = vllm_config.additional_config
-        budgets = sorted(rbln_config.encoder_token_budgets) or [
-            budget
-            for budget in _SUPPORTED_SOFT_TOKENS
-            if budget <= rbln_config.max_prefill_chunk_size
-        ]
-        if unsupported := sorted(set(budgets) - set(_SUPPORTED_SOFT_TOKENS)):
-            raise ValueError(
-                f"encoder_token_budgets {unsupported} are not Gemma4 soft token "
-                f"budgets; pick from {list(_SUPPORTED_SOFT_TOKENS)}, the counts "
-                "its image processor emits."
+        self._mm_encoder: rbln_utils.BufferedVisionEncoder | None = None
+        self.mm_encoder_patch_buckets: list[int] = []
+        mm_config = vllm_config.model_config.get_multimodal_config()
+        # Upstream builds no vision tower when images and video are off.
+        if not any(mm_config.get_limit_per_prompt(m) > 0 for m in ("image", "video")):
+            return
+        budgets = self.encoder_token_budgets(vllm_config)
+        if mm_config.get_limit_per_prompt("image") > 0:
+            default = mm_soft_token_default(
+                MULTIMODAL_REGISTRY.create_processor(vllm_config.model_config).info
             )
-        if budgets[-1] < cap:
-            raise ValueError(
-                f"encoder_token_budgets {budgets} must reach max_soft_tokens={cap}, "
-                "the most soft tokens an image may take; add a budget that large "
-                "or lower max_soft_tokens."
-            )
+            if default > budgets[-1]:
+                raise ValueError(
+                    f"max_soft_tokens={default}, the soft tokens an image takes "
+                    f"by default, is above {budgets[-1]}, the largest encoder "
+                    f"budget compiled ({budgets}). Lower it in "
+                    "--mm-processor-kwargs, or compile a larger budget with a "
+                    "longer --rbln-prefill-chunk-size or with "
+                    "--rbln-encoder-token-budgets."
+                )
         pool = self.config.vision_config.pooling_kernel_size
         self.mm_encoder_patch_buckets = [budget * pool**2 for budget in budgets]
-        self._mm_encoder: Callable[..., torch.Tensor] | None
-        object.__setattr__(self, "_mm_encoder", None)
 
     @property
     def logits_processor(self) -> nn.Module:
@@ -373,7 +389,15 @@ class RBLNGemma4ForConditionalGeneration(
         ):
             return
         encoder = _RBLNGemma4VisionEncoder(self.vision_tower, self.embed_vision)
-        object.__setattr__(self, "_mm_encoder", compile_fn(encoder.eval()))
+        self._mm_encoder = rbln_utils.BufferedVisionEncoder(
+            compile_fn(encoder.eval()),
+            specs_by_bucket={
+                size: self._mm_input_specs(size)
+                for size in self.mm_encoder_patch_buckets
+            },
+            device=next(self.vision_tower.parameters()).device,
+            dtype=self.model_dtype,
+        )
 
     def warmup_mm_encoder(self) -> None:
         if self._mm_encoder is None:
@@ -382,9 +406,9 @@ class RBLNGemma4ForConditionalGeneration(
         pool = vision_config.pooling_kernel_size
         patch_pixels = 3 * vision_config.patch_size**2
         with torch.inference_mode():
-            for bucket in self.mm_encoder_patch_buckets:
+            for bucket_size in self.mm_encoder_patch_buckets:
                 # A full grid whose sides are multiples of the pooling kernel.
-                cells = bucket // pool**2
+                cells = bucket_size // pool**2
                 rows = max(d for d in range(1, math.isqrt(cells) + 1) if cells % d == 0)
                 ys, xs = torch.meshgrid(
                     torch.arange(rows * pool),
@@ -392,20 +416,18 @@ class RBLNGemma4ForConditionalGeneration(
                     indexing="ij",
                 )
                 positions = torch.stack([xs, ys], dim=-1).reshape(-1, 2)
-                self._encode_vision(torch.zeros(bucket, patch_pixels), positions)
+                pixels = torch.zeros(bucket_size, patch_pixels, dtype=_PATCH_DTYPE)
+                self._encode_vision(pixels, positions)
 
     def _encode_vision(
         self, pixel_values: torch.Tensor, pixel_position_ids: torch.Tensor
     ) -> torch.Tensor:
-        """One image or video frame, `[num_patches, patch_pixels]` with `(-1, -1)`
-        positions on its padding, to its soft token embeddings."""
-        encoder = self._mm_encoder
-        if encoder is None:
-            # enforce_eager: the runner never calls compile_mm_encoder.
-            encoder = _RBLNGemma4VisionEncoder(
-                self.vision_tower, self.embed_vision
-            ).eval()
-            object.__setattr__(self, "_mm_encoder", encoder)
+        """Encode one frame with (-1, -1) marking padded patch positions.
+
+        See EncoderInputBuffers for the lifetime of the encoder inputs.
+        """
+        buffered_encoder = self._mm_encoder
+        assert buffered_encoder is not None
         tower = self.vision_tower
         valid = (pixel_position_ids >= 0).all(dim=-1)
         num_patches = int(valid.sum())
@@ -413,30 +435,67 @@ class RBLNGemma4ForConditionalGeneration(
             f"an image of {num_patches} patches exceeds the vision encoder's "
             f"{self.mm_encoder_patch_buckets[-1]}-patch bucket"
         )
-        bucket = next(b for b in self.mm_encoder_patch_buckets if b >= num_patches)
-        # Fixed dtypes, so warm-up and serving reach the same compiled graphs.
-        positions = torch.full((1, bucket, 2), -1, dtype=torch.long)
-        positions[0, :num_patches] = pixel_position_ids[valid]
-        patches = torch.zeros(1, bucket, pixel_values.shape[-1])
-        patches[0, :num_patches] = pixel_values[valid]
+        bucket_size = next(b for b in self.mm_encoder_patch_buckets if b >= num_patches)
+        valid_rows = slice(num_patches) if valid[:num_patches].all() else valid
+        # The positions, padding mask and key bias span the bucket, so the
+        # padding is masked whatever an earlier frame left in its patches.
+        positions = torch.full((1, bucket_size, 2), -1, dtype=torch.long)
+        positions[0, :num_patches] = pixel_position_ids[valid_rows]
         padding = ~(positions >= 0).all(dim=-1)
         key_bias = torch.where(padding, torch.finfo(self.model_dtype).min, 0.0)[
-            :, None, None, :
+            :, None, :
         ]
-        device = next(tower.parameters()).device
+        patches = pixel_values[valid_rows]
+        inputs = buffered_encoder.input_buffers.stage(
+            bucket_size,
+            [patches.unsqueeze(0), positions, padding, key_bias],
+            num_patches,
+        )
         # The patches of a grid whose sides are multiples of the pooling kernel
         # pool into the leading cells, in order.
         num_soft_tokens = num_patches // tower.config.pooling_kernel_size**2
         return rbln_utils.run_mm_encoder(
-            lambda *inputs: encoder(*inputs)[0],
-            [
-                patches.to(device),
-                positions.to(device),
-                padding.to(device),
-                key_bias.to(device=device, dtype=self.model_dtype),
-            ],
+            lambda *inputs: buffered_encoder.encoder(*inputs)[0],
+            inputs,
             num_soft_tokens,
         )
+
+    def _mm_input_specs(self, bucket_size: int) -> list[rbln_utils.EncoderInput]:
+        """Use fixed input dtypes so warmup and serving share compiled graphs."""
+        patch_pixels = 3 * self.vision_tower.config.patch_size**2
+        return [
+            rbln_utils.EncoderInput(
+                "pixel_values",
+                (1, bucket_size, patch_pixels),
+                axis=1,
+                pad=0.0,
+                dtype=_PATCH_DTYPE,
+                use_registered_host_buffer=True,
+            ),
+            rbln_utils.EncoderInput(
+                "pixel_position_ids",
+                (1, bucket_size, 2),
+                axis=1,
+                pad=-1.0,
+                dtype=torch.long,
+                allow_prefix_copy=False,
+            ),
+            rbln_utils.EncoderInput(
+                "padding_positions",
+                (1, bucket_size),
+                axis=1,
+                pad=1.0,
+                dtype=torch.bool,
+                allow_prefix_copy=False,
+            ),
+            rbln_utils.EncoderInput(
+                "key_bias",
+                (1, 1, bucket_size),
+                axis=2,
+                pad=torch.finfo(self.model_dtype).min,
+                allow_prefix_copy=False,
+            ),
+        ]
 
     def _process_image_input(
         self, image_input: Gemma4ImageInputs
@@ -489,7 +548,7 @@ class RBLNGemma4ForConditionalGeneration(
                     metadata.mm_prefix_row_ends,
                     metadata.seq_lens,
                     layer.sliding_window,
-                    _resolve_kv_cache(metadata, layer.layer_name).size(-2),
+                    resolve_kv_cache(metadata, layer.layer_name).size(-2),
                     self.model_dtype,
                 )
                 # Workaround: borrow metadata without mutating Attention modules.

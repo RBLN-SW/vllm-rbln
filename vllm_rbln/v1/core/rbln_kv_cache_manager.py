@@ -51,7 +51,8 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_rbln.logger import init_logger
-from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
+from vllm_rbln.platform import use_device_tensor
+from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec, window_splits_block
 
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_utils import KVCacheBlock
@@ -257,24 +258,31 @@ class SubBlockIndex:
         return block_id in self._block_hashes
 
     def longest_match(
-        self, sub_block_hashes: Sequence[BlockHash]
+        self,
+        sub_block_hashes: Sequence[BlockHash],
+        is_held: Callable[[int], bool],
     ) -> tuple[int | None, int]:
         """Find a block with the longest prefix match.
 
+        Among the blocks matching that prefix, prefers one for which
+        ``is_held`` returns True.
+
         Returns:
-            ``(block_id, num_matched)`` where ``block_id`` is any block
+            ``(block_id, num_matched)`` where ``block_id`` is a block
             matching that prefix, or ``(None, 0)`` if no match.
         """
-        best_block_id: int | None = None
+        best_blocks: set[int] | None = None
         best_depth = 0
         for depth, h in enumerate(sub_block_hashes, start=1):
             blocks = self._hash_to_blocks.get(h)
             if not blocks:
                 break
-            # Pick an arbitrary block_id from the set.
-            best_block_id = next(iter(blocks))
+            best_blocks = blocks
             best_depth = depth
-        return best_block_id, best_depth
+        if best_blocks is None:
+            return None, 0
+        held = (b for b in best_blocks if is_held(b))
+        return next(held, next(iter(best_blocks))), best_depth
 
 
 # ---------------------------------------------------------------------------
@@ -353,6 +361,9 @@ class RBLNKVCacheManager(KVCacheManager):
            in ``_SUB_BLOCK_ELIGIBLE_SPECS``).
         2. Every group must have block_size > sub_block_size and
            block_size % sub_block_size == 0.
+        3. Without device tensors, no sliding-window group may hold a window
+           smaller than its block that divides it, since the runtime KV copy
+           cannot address that group's window-sized kernel blocks.
         """
         if sub_block_size <= 0:
             return False
@@ -360,6 +371,12 @@ class RBLNKVCacheManager(KVCacheManager):
             for spec in iter_layer_specs(group.kv_cache_spec):
                 # The shift kernel overwrites the prefix with the latest window.
                 if isinstance(spec, RBLNSlidingWindowSpec):
+                    return False
+                if (
+                    not use_device_tensor()
+                    and isinstance(spec, SlidingWindowSpec)
+                    and window_splits_block(spec)
+                ):
                     return False
                 if not isinstance(spec, _SUB_BLOCK_ELIGIBLE_SPECS):
                     return False
@@ -462,7 +479,11 @@ class RBLNKVCacheManager(KVCacheManager):
                 min_matched = 0
                 break
 
-            src_block_id, num_matched = gi.sub_block_index.longest_match(query)
+            # Prefer a source another request holds: touching a free one takes
+            # it out of the free queue for the allocation that follows.
+            src_block_id, num_matched = gi.sub_block_index.longest_match(
+                query, is_held=lambda b: self.block_pool.blocks[b].ref_cnt > 0
+            )
             if src_block_id is None:
                 min_matched = 0
                 break

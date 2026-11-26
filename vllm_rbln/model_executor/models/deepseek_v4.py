@@ -68,7 +68,6 @@ from vllm_rbln.model_executor.layers.quantization.deepseek_v4 import (
     RBLNDeepseekV4BlockFp8LinearMethod,
     e8m0_to_bf16,
 )
-from vllm_rbln.patches.attention import _resolve_kv_cache
 from vllm_rbln.utils import is_prefill_step
 from vllm_rbln.v1.attention.backends.deepseek_v4 import (
     DSV4_INDEX_HEAD_DIM,
@@ -80,6 +79,7 @@ from vllm_rbln.v1.attention.backends.deepseek_v4 import (
 from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadata,
 )
+from vllm_rbln.v1.attention.kv_cache_bindings import resolve_kv_cache
 from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
 
 # Cache names distinguish the six possible buffers in each decoder layer.
@@ -167,7 +167,7 @@ class RBLNDeepseekV4WindowCache(_RBLNDeepseekV4Cache):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, RBLNFlashAttentionMetadata]:
         """(cache, block_table [B, P], query_len, metadata)."""
         metadata = get_forward_context().attn_metadata[self.prefix]
-        cache = _resolve_kv_cache(metadata, self.prefix)
+        cache = resolve_kv_cache(metadata, self.prefix)
         query_len = metadata.cache_offsets - metadata.cache_seq_lens
         return (
             cache,
@@ -219,7 +219,7 @@ class RBLNDeepseekV4PagedCache(_RBLNDeepseekV4Cache):
     def inputs(self) -> tuple[torch.Tensor, torch.Tensor]:
         """(cache, block_table)."""
         metadata = get_forward_context().attn_metadata[self.prefix]
-        return _resolve_kv_cache(metadata, self.prefix), metadata.block_tables
+        return resolve_kv_cache(metadata, self.prefix), metadata.block_tables
 
 
 class RBLNDeepseekV4AuxCache(_RBLNDeepseekV4Cache):
@@ -243,7 +243,7 @@ class RBLNDeepseekV4AuxCache(_RBLNDeepseekV4Cache):
 
     def inputs(self) -> torch.Tensor:
         metadata = get_forward_context().attn_metadata[self.owner_prefix]
-        return _resolve_kv_cache(metadata, self.prefix)
+        return resolve_kv_cache(metadata, self.prefix)
 
 
 _TID2EID_LANES = 64

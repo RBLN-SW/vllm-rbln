@@ -248,6 +248,15 @@ class RBLNDeepseekV4CacheCoordinator(HybridKVCacheCoordinator):
         return result
 
 
+def window_splits_block(spec: SlidingWindowSpec) -> bool:
+    """Whether the window kernel holds each block as several window-sized
+    kernel blocks: the window is smaller than the block and divides it."""
+    return (
+        spec.sliding_window < spec.block_size
+        and spec.block_size % spec.sliding_window == 0
+    )
+
+
 @dataclass(frozen=True)
 class RBLNBlockAuxSpec:
     """A per-block cache region beside a scheduled KV layer's cache.

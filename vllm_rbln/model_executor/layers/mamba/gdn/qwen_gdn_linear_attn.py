@@ -27,11 +27,11 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec
 
-from vllm_rbln.patches.attention import _resolve_kv_cache
 from vllm_rbln.v1.attention.backends.gdn_attn import (
     RBLNGDNAttentionBackend,
     RBLNGDNAttentionMetadata,
 )
+from vllm_rbln.v1.attention.kv_cache_bindings import resolve_kv_cache
 from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec, register_kv_cache
 
 
@@ -79,7 +79,7 @@ class RBLNGDNBlockAuxCache(nn.Module, AttentionLayerBase):
 
     def inputs(self) -> torch.Tensor:
         metadata = get_forward_context().attn_metadata[self.owner]
-        return _resolve_kv_cache(metadata, self.prefix)
+        return resolve_kv_cache(metadata, self.prefix)
 
 
 class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
@@ -174,7 +174,7 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             f"the step's batch {batch}"
         )
         seq_len = num_tokens // batch
-        state = _resolve_kv_cache(metadata, self.prefix)
+        state = resolve_kv_cache(metadata, self.prefix)
         ring = self.conv_ring.inputs()
         tp_size = self.tp_size
         num_k_heads = self.num_k_heads // tp_size

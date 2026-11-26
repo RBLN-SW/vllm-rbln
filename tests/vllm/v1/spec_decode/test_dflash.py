@@ -191,7 +191,6 @@ class TestSchedulerCapacity:
             scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
             additional_config=RBLNConfig(),
             speculative_config=SimpleNamespace(
-                enforce_eager=False,
                 draft_model_config=SimpleNamespace(
                     hf_config=SimpleNamespace(layer_types=[], sliding_window=None)
                 ),
@@ -298,35 +297,14 @@ class TestSpanningBlockAllocation:
 
 
 class TestPlatformRefusals:
-    """The two configurations DFlash cannot run on, both refused at
-    construction and before the base class does any work, so neither reaches a
-    device.
-
-    Each fails silently otherwise: an eager context write goes through an
-    attention op that exists only as a compiled kernel, and without device
-    tensors the cache is allocated on `meta`, which accepts a host copy and
-    discards it."""
-
-    @staticmethod
-    def _config(enforce_eager=False):
-        return SimpleNamespace(
-            speculative_config=SimpleNamespace(enforce_eager=enforce_eager),
-            additional_config=RBLNConfig(),
-        )
-
-    def _construct(self):
-        return RBLNDFlashProposer(self._config(), torch.device("cpu"))
-
-    def test_eager_is_refused(self):
-        with pytest.raises(NotImplementedError, match="cannot run eager"):
-            RBLNDFlashProposer(self._config(enforce_eager=True), torch.device("cpu"))
-
     def test_host_visible_cache_is_required(self, monkeypatch):
         """Without device tensors the cache is on `meta` and the context write
         is dropped without an error."""
         monkeypatch.setattr(platform, "USE_DEVICE_TENSOR", False)
         with pytest.raises(NotImplementedError, match="USE_DEVICE_TENSOR"):
-            self._construct()
+            RBLNDFlashProposer(
+                SimpleNamespace(additional_config=RBLNConfig()), torch.device("cpu")
+            )
 
 
 class TestDenseDrafterGuard:

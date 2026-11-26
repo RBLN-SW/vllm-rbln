@@ -433,7 +433,7 @@ class TestModeResolution:
             scheduler_config=SimpleNamespace(),
             device_config=SimpleNamespace(device=torch.device("cpu")),
             parallel_config=SimpleNamespace(rank=0),
-            model_config=SimpleNamespace(enforce_eager=False, max_model_len=32),
+            model_config=SimpleNamespace(max_model_len=32),
             additional_config=SimpleNamespace(
                 compile_model=True,
                 use_custom_kernel=False,
@@ -477,15 +477,15 @@ class TestModeResolution:
     def test_unsupported_wins_over_a_skipped_compile_and_the_override(self):
         assert self._mode(
             unsupported_reason="the optimum path",
-            compile_skip_reason="enforce_eager is set",
+            compile_skip_reason="VLLM_RBLN_ENABLE_WARM_UP is off",
             num_gpu_blocks_override=64,
         ) == (dks.DynamicKvMode.DISABLED, "the optimum path")
 
     def test_a_skipped_compile_wins_over_the_override(self):
         assert self._mode(
-            compile_skip_reason="enforce_eager is set",
+            compile_skip_reason="VLLM_RBLN_ENABLE_WARM_UP is off",
             num_gpu_blocks_override=64,
-        ) == (dks.DynamicKvMode.INERT, "enforce_eager is set")
+        ) == (dks.DynamicKvMode.INERT, "VLLM_RBLN_ENABLE_WARM_UP is off")
 
     def test_an_override_pins_the_count(self):
         assert self._mode(num_gpu_blocks_override=64) == (
@@ -629,7 +629,9 @@ class TestMaybeShrinkKvCacheForCompile:
             use_dynamic_kv=dynamic,
             unsupported_reason=None,
             num_gpu_blocks_override=override,
-            compile_skip_reason="enforce_eager is set" if warmup_skipped else None,
+            compile_skip_reason="VLLM_RBLN_ENABLE_WARM_UP is off"
+            if warmup_skipped
+            else None,
         )
         sizer = SimpleNamespace(
             mode=mode,
@@ -852,7 +854,9 @@ class TestDynamicKvFailuresRaise:
             use_dynamic_kv=True,
             unsupported_reason=None,
             num_gpu_blocks_override=override,
-            compile_skip_reason=None if shrunk or override else "enforce_eager is set",
+            compile_skip_reason=None
+            if shrunk or override
+            else "VLLM_RBLN_ENABLE_WARM_UP is off",
         )
         sizer = SimpleNamespace(
             rank=0,

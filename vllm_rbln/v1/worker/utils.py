@@ -22,7 +22,7 @@ import threading
 import time
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Literal, NoReturn, TypeVar
 
@@ -53,7 +53,7 @@ from vllm_rbln import envs
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.attention.backends.deepseek_v4 import RBLNDeepseekV4WindowSpec
-from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
+from vllm_rbln.v1.kv_cache import window_splits_block
 from vllm_rbln.v1.worker.kv_placement import ChipletMemory, Unit
 
 if TYPE_CHECKING:
@@ -85,7 +85,7 @@ def _write_event_line(line: str) -> None:
 def _fatal_event(
     exc: Exception, *, where: str, rank: int | None, dp_rank: int | None
 ) -> str:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     record = {
         "event": _FATAL_EVENT,
         "schema_version": _EVENT_SCHEMA_VERSION,
@@ -328,10 +328,8 @@ def read_rbln_card_dram_used_bytes() -> int:
     return max(used, default=0)
 
 
-def compile_and_warmup_skip_reason(vllm_config: VllmConfig) -> str | None:
+def compile_and_warmup_skip_reason() -> str | None:
     """Why the compile and warm-up will be skipped, or None if they will run."""
-    if vllm_config.model_config.enforce_eager:
-        return "enforce_eager is set"
     if not envs.VLLM_RBLN_ENABLE_WARM_UP:
         return "VLLM_RBLN_ENABLE_WARM_UP is off"
     return None
@@ -454,20 +452,22 @@ def kv_cache_extents(cfg: KVCacheConfig) -> dict[str, tuple[int, int]]:
 
 
 def canonical_kv_layers(
-    cfg: KVCacheConfig, layer_specs: Mapping[str, KVCacheSpec]
+    cfg: KVCacheConfig,
+    layer_specs: Mapping[str, KVCacheSpec],
+    prefer: type[KVCacheSpec] = FullAttentionSpec,
 ) -> set[str]:
     """Pick one layer to stand for each KV cache buffer.
 
     Layers on one extent (`kv_cache_extents`) alias one buffer. Prefer a
     full-attention layer: its view counts blocks the way the scheduler does,
-    and a sliding-window view does not.
+    and a sliding-window view does not. `prefer` names another spec to pick.
     """
     pools: defaultdict[tuple[int, int], list[str]] = defaultdict(list)
     for layer_name, extent in kv_cache_extents(cfg).items():
         pools[extent].append(layer_name)
     return {
         next(
-            (ln for ln in layers if isinstance(layer_specs.get(ln), FullAttentionSpec)),
+            (ln for ln in layers if isinstance(layer_specs.get(ln), prefer)),
             layers[0],
         )
         for layers in pools.values()
@@ -1127,7 +1127,6 @@ def set_omp_num_threads(
 def prepare_kernel_block_sizes(
     kv_cache_config: KVCacheConfig,
     attn_groups: list[list[AttentionGroup]],
-    sub_block_size: int | None = None,
 ) -> list[int]:
     """
     Generate kernel_block_sizes that matches each block_size.
@@ -1139,7 +1138,6 @@ def prepare_kernel_block_sizes(
     Args:
         kv_cache_config: The KV cache configuration.
         attn_groups: Attention groups indexed by KV cache group id.
-        sub_block_size: Sub-block prefix caching granularity, None when off.
 
     Returns:
         List of kernel block sizes for each cache group.
@@ -1157,17 +1155,13 @@ def prepare_kernel_block_sizes(
             # Independent window pools retain the manager's physical pages.
             kernel_block_sizes.append(kv_cache_spec.block_size)
         elif isinstance(kv_cache_spec, SlidingWindowSpec):
-            if sub_block_size is None or isinstance(
-                kv_cache_spec, RBLNSlidingWindowSpec
-            ):
-                # The shift kernel holds one window per block; the append kernel
-                # gathers whole blocks around the window, whatever their size.
+            # The shift kernel holds one window per block; the append kernel
+            # gathers whole blocks around the window, whatever their size, so
+            # it takes the block where upstream's block table refuses a window
+            # that does not divide it.
+            if window_splits_block(kv_cache_spec):
                 kernel_block_sizes.append(kv_cache_spec.sliding_window)
             else:
-                # A sub-block copy slices the buffer the compiled graph reads,
-                # and this layer shares it with a full-attention layer on the
-                # manager block: the append kernel takes the same block, so the
-                # slice is one geometry for both.
                 kernel_block_sizes.append(kv_cache_group.kv_cache_spec.block_size)
         elif isinstance(kv_cache_spec, AttentionSpec):
             # This is an attention backend that supports virtual block splitting.

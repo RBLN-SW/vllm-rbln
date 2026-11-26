@@ -23,12 +23,18 @@ import pytest
 import torch
 from vllm.config.ec_manager_config import EncoderCacheManagerConfig
 from vllm.distributed.kv_events import BlockStored, KVEventBatch
-from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
+from vllm.multimodal.inputs import (
+    MultiModalBatchedField,
+    MultiModalFeatureSpec,
+    MultiModalFieldElem,
+    MultiModalKwargsItem,
+    PlaceholderRange,
+)
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
-from vllm.v1.kv_cache_interface import KVCacheSpec
+from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.request import RequestStatus
@@ -923,6 +929,37 @@ class TestSubBlockIndexAfterSpecDecodeStop:
         match = sched.kv_cache_manager.get_computed_blocks_sub_block(repeat, 0)
         assert match is not None and match.num_tokens == 2 * self._SUB
         sched.kv_cache_manager.release_sub_block_match(match)
+
+
+# The `False` row is `disable_eagle_block_drop`; n-gram stands in for EAGLE/MTP.
+@pytest.mark.usefixtures("cr13")
+@pytest.mark.parametrize(("drops_eagle_block", "hit"), [(True, 16), (False, 32)])
+def test_sub_block_manager_drops_the_last_hit_block_only_with_the_eagle_drop(
+    monkeypatch, drops_eagle_block, hit
+):
+    from vllm.config import SpeculativeConfig
+
+    monkeypatch.setattr(SpeculativeConfig, "use_eagle", lambda self: True)
+    monkeypatch.setattr(
+        SpeculativeConfig, "use_eagle_block_drop", lambda self: drops_eagle_block
+    )
+    sched = create_rbln_scheduler(
+        enable_prefix_caching=True,
+        block_size=16,
+        max_num_batched_tokens=16,
+        sub_block_size=4,
+        max_model_len=128,
+        num_speculative_tokens=1,
+    )
+    assert isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
+    sched.add_request(make_request("a", list(range(1000, 1040)), 16, max_tokens=1))
+    step = TestSubBlockIndexAfterSpecDecodeStop._step
+    step(sched)
+    step(sched)
+    step(sched, sampled={"a": [7]})
+    query = make_request("b", list(range(1000, 1032)) + [3000] * 8, 16)
+    _, num_computed, _ = sched.kv_cache_manager.get_computed_blocks(query)
+    assert num_computed == hit
 
 
 @pytest.mark.usefixtures("cr13")
@@ -2734,6 +2771,106 @@ class TestAdmissionCoversFirstDecodeStep:
         assert request.num_preemptions == 0
 
 
+class TestAdmissionCoversMambaBoundaryBlock:
+    """A chunk crossing an align-mode Mamba block boundary holds the previous
+    state block beside the new one until the next chunk. Admitted on the
+    full-sequence count alone, a three-block prompt preempted itself on its
+    last boundary while decodes held the rest of the pool. Prefix caching is
+    off: a resume's prefix hit raises the count and hides the loop."""
+
+    BLOCK = 16
+
+    def _scheduler(self, num_speculative_tokens, num_blocks=11, **config):
+        full = full_attention_spec(self.BLOCK)
+        state = MambaSpec(
+            block_size=self.BLOCK,
+            shapes=((full.page_size_bytes,),),
+            dtypes=(torch.uint8,),
+            mamba_cache_mode="align",
+        )
+        # By default the decodes leave exactly the prompt's count free: three
+        # attention blocks and one state block.
+        return create_rbln_scheduler(
+            block_size=self.BLOCK,
+            max_num_batched_tokens=self.BLOCK,
+            max_model_len=5 * self.BLOCK,
+            num_blocks=num_blocks,
+            max_num_seqs=4,
+            num_speculative_tokens=num_speculative_tokens,
+            mamba_cache_mode="align",
+            kv_cache_config=make_kv_cache_config([full, state], num_blocks),
+            **config,
+        )
+
+    @staticmethod
+    def _step(sched, num_speculative_tokens):
+        out = sched.schedule()
+        output = make_model_runner_output(out)
+        sampled = [
+            sched.requests[rid].num_computed_tokens >= sched.requests[rid].num_tokens
+            for rid in output.req_ids
+        ]
+        output.sampled_token_ids = [[7] if s else [] for s in sampled]
+        sched.update_from_output(out, output)
+        if num_speculative_tokens:
+            sched.update_draft_token_ids(
+                DraftTokenIds(
+                    output.req_ids,
+                    [[7] * num_speculative_tokens if s else [] for s in sampled],
+                )
+            )
+
+    @pytest.mark.parametrize("num_speculative_tokens", [None, 3])
+    def test_prompt_waits_for_the_decodes_instead_of_preempting_itself(
+        self, num_speculative_tokens
+    ):
+        sched = self._scheduler(num_speculative_tokens)
+        for n in range(2):
+            prompt = [100 * (n + 1) + i for i in range(self.BLOCK + 1)]
+            sched.add_request(make_request(f"d{n}", prompt, self.BLOCK, max_tokens=8))
+        while any(
+            r.num_computed_tokens < r.num_prompt_tokens for r in sched.requests.values()
+        ):
+            self._step(sched, num_speculative_tokens)
+        request = make_request(
+            "v", [900 + i for i in range(2 * self.BLOCK + 8)], self.BLOCK, max_tokens=4
+        )
+        sched.add_request(request)
+
+        for _ in range(100):
+            if not sched.requests:
+                break
+            self._step(sched, num_speculative_tokens)
+
+        assert not sched.requests
+        assert request.num_preemptions == 0
+
+    def test_resume_from_a_free_hit_block_is_admitted(self):
+        # The first chunk reads the hit's state block, which the count already
+        # holds as an evictable hit, so it is not the boundary block on top.
+        # Seven usable blocks hold the peak: five attention, two state.
+        sched = self._scheduler(None, num_blocks=8, enable_prefix_caching=True)
+        donor = [100 + i for i in range(3 * self.BLOCK + 1)]
+        sched.add_request(make_request("d", donor, self.BLOCK, max_tokens=2))
+        for _ in range(100):
+            if not sched.requests:
+                break
+            self._step(sched, None)
+        request = make_request(
+            "h",
+            donor[: 3 * self.BLOCK] + [900 + i for i in range(self.BLOCK + 11)],
+            self.BLOCK,
+            max_tokens=2,
+        )
+        sched.add_request(request)
+
+        out = sched.schedule()
+
+        assert request.num_computed_tokens - out.num_scheduled_tokens["h"] == (
+            3 * self.BLOCK
+        )
+
+
 class TestSyncKVLoads:
     """The model runner starts a connector's loads after the forward unless the
     step says it holds a synchronous one, so a step that admits a synchronous
@@ -2821,6 +2958,52 @@ class TestEcConsumerEncodesNothing:
 
         assert out.scheduled_encoder_inputs == {"0": [0]}
         assert request.status == RequestStatus.RUNNING
+
+
+class TestPrefixCoveredImage:
+    """An image a prefix hit covers needs no encoder run, so its payload is dropped on
+    the way to the worker; an M-RoPE model still reads the grid to place the tokens
+    after it."""
+
+    @staticmethod
+    def _image():
+        def elem(data, keep_on_cpu):
+            return MultiModalFieldElem(
+                data=data, field=MultiModalBatchedField(keep_on_cpu=keep_on_cpu)
+            )
+
+        return MultiModalFeatureSpec(
+            data=MultiModalKwargsItem(
+                {
+                    "pixel_values": elem(torch.zeros(4), keep_on_cpu=False),
+                    "image_grid_thw": elem(torch.tensor([1, 2, 2]), keep_on_cpu=True),
+                }
+            ),
+            modality="image",
+            identifier="image@0",
+            mm_position=PlaceholderRange(offset=0, length=4),
+        )
+
+    @pytest.mark.parametrize("uses_mrope", [True, False])
+    def test_the_worker_gets_what_upstream_sends(self, uses_mrope):
+        sched = create_rbln_scheduler(
+            enable_prefix_caching=True, max_num_batched_tokens=16, max_model_len=64
+        )
+        sched.model_uses_mrope = uses_mrope
+        sched.max_num_encoder_input_tokens = 16
+        sched.encoder_cache_manager = EncoderCacheManager(cache_size=16)
+        prompt = list(range(33))
+        sched.add_request(make_request("a", prompt, 16, mm_features=[self._image()]))
+        _drain(sched)
+        sched.add_request(make_request("b", prompt, 16, mm_features=[self._image()]))
+        (new_req,) = sched.schedule().scheduled_new_reqs
+
+        assert new_req.num_computed_tokens >= 4
+        data = new_req.mm_features[0].data
+        if uses_mrope:
+            assert data is not None and set(data) == {"image_grid_thw"}
+        else:
+            assert data is None
 
 
 class TestMultimodalDraftEncoderLookahead:
