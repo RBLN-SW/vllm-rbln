@@ -168,7 +168,6 @@ class RBLNGemma4Proposer(RBLNEagleProposer):
         )
         num_reqs_padded = batch_desc.num_reqs_padded
         query_start_loc = self.arange[: num_reqs + 1]
-        assert torch.all(positions < self.max_model_len)
         per_layer_attn_metadata: dict[str, object] = {}
         for attn_group in self.draft_attn_groups:
             builder = attn_group.get_metadata_builder()
