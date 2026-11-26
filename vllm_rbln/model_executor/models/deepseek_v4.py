@@ -886,11 +886,15 @@ def _hc_head_hidden(
     """Reduce flat pre-hc-head streams [..., n * H] and normalize to [..., H]."""
     lead = flat.shape[:-1]
     hidden = flat.shape[-1] // hc_mult
-    rows = flat.reshape(1, -1, hc_mult * hidden)  # [1, N, n * H]
+    # Keep the batch rows through the kernel, as mhc_read does: merged into [1, N],
+    # they are packed across the batch cut and gathered to one chiplet.
+    rows = flat if flat.dim() == 3 else flat.reshape(-1, 1, hc_mult * hidden)
+    batch, tokens, _ = rows.shape  # [B, T, n * H]
     x = rows.float()
     x = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + norm_eps)
-    z_pre = F.linear(x, fn) * scale + base
-    streams = rows.reshape(1, -1, hc_mult, hidden).transpose(1, 2)  # [1, n, N, H]
+    z_pre = F.linear(x, fn) * scale + base  # [B, T, n]
+    # [B, n, T, H]
+    streams = rows.reshape(batch, tokens, hc_mult, hidden).transpose(1, 2)
     out = torch.ops.rbln_custom_ops.hc_stream_reduce(streams.float(), z_pre, eps=hc_eps)
     out = out.to(flat.dtype)
     if not is_prefill_step():

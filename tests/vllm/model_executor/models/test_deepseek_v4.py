@@ -576,7 +576,7 @@ def test_head_relocation_preserves_reduction(monkeypatch, sampled_only, prefill,
         flat = flat[:, -1]
         expected = expected[:, -1]
     actual = _hc_head_hidden(flat, 4, fn, scale, base, 1e-5, 1e-6, norm)
-    assert reads == ([] if prefill else [(1, 2 if sampled_only else 6, 8)])
+    assert reads == ([] if prefill else [(2, 1 if sampled_only else 3, 8)])
     assert actual.dtype == dtype
     torch.testing.assert_close(actual, expected)
 
