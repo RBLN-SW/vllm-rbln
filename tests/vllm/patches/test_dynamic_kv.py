@@ -139,7 +139,7 @@ class TestKvCacheReadyNotification:
                 ["compute_dynamic_kv_num_blocks", "apply_dynamic_kv_num_blocks"],
             ),
         ],
-        ids=["off", "override", "resized"],
+        ids=["off", "override", "resize-fallback"],
     )
     def test_the_connector_hears_after_the_resize(
         self, monkeypatch, dynamic, override, resize_rpcs

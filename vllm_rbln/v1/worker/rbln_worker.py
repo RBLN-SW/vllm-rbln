@@ -506,6 +506,7 @@ class RBLNWorker(WorkerBase):
                 finalize_kv_cache_registrations(get_kv_transfer_group())
             return applied
 
+    @worker_fail_fast
     def notify_kv_cache_ready(self) -> None:
         """RPC target of the engine's KV-cache-ready call; backports
         `WorkerBase.notify_kv_cache_ready` from vllm-project/vllm#66574."""

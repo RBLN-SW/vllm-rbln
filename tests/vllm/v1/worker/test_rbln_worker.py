@@ -233,6 +233,7 @@ class TestWorkerFailFast:
             "determine_available_memory",
             "initialize_from_config",
             "compile_or_warm_up_model",
+            "notify_kv_cache_ready",
         ],
     )
     def test_startup_failure_records_exception_before_exit(
@@ -250,6 +251,14 @@ class TestWorkerFailFast:
         elif phase == "initialize_from_config":
             monkeypatch.setattr(wm, "ensure_kv_transfer_initialized", operation)
             args = (SimpleNamespace(num_blocks=1),)
+        elif phase == "notify_kv_cache_ready":
+            monkeypatch.setattr(worker, "synchronize_device", Mock())
+            monkeypatch.setattr(wm, "has_kv_transfer_group", lambda: True)
+            monkeypatch.setattr(
+                wm,
+                "get_kv_transfer_group",
+                lambda: SimpleNamespace(on_kv_cache_ready=operation),
+            )
         else:
             assert phase == "compile_or_warm_up_model"
             monkeypatch.setattr(
@@ -270,7 +279,8 @@ class TestWorkerFailFast:
         monkeypatch.setattr(otel.trace, "get_tracer", provider.get_tracer)
 
         def exit_after_span(code):
-            if phase != "determine_available_memory":
+            # Only the instrumented phases open a span to record the error on.
+            if phase not in ("determine_available_memory", "notify_kv_cache_ready"):
                 (span,) = exporter.get_finished_spans()
                 assert span.attributes["code.filepath"] == wm.__file__
                 assert span.events[0].attributes["exception.message"] == str(error)
@@ -1595,6 +1605,7 @@ class TestNotifyKvCacheReady:
         vllm_config = _make_vllm_config()
         calls: list = []
         worker = SimpleNamespace(
+            fail_fast=False,
             vllm_config=vllm_config,
             synchronize_device=lambda: calls.append("synchronize"),
         )
@@ -1610,7 +1621,9 @@ class TestNotifyKvCacheReady:
 
     def test_a_worker_without_a_connector_does_nothing(self, monkeypatch):
         calls: list = []
-        worker = SimpleNamespace(synchronize_device=lambda: calls.append("sync"))
+        worker = SimpleNamespace(
+            fail_fast=False, synchronize_device=lambda: calls.append("sync")
+        )
         monkeypatch.setattr(wm, "has_kv_transfer_group", lambda: False)
 
         RBLNWorker.notify_kv_cache_ready(worker)

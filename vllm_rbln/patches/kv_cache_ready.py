@@ -29,12 +29,14 @@ from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
 
 from vllm_rbln.patches import register_patch
 
-# The engine call has to move after the dynamic-KV resize, which upstream's
-# position precedes, so an upgrade must revisit it rather than stack two calls.
+# Upstream notifies before the dynamic-KV resize, whose reallocation a deferring
+# connector has not registered yet; an upgrade must keep the notification after
+# the resize rather than stack a second call onto upstream's.
 if hasattr(KVConnectorBase_V1, "on_kv_cache_ready"):
     raise RuntimeError(
-        "vLLM ships KVConnectorBase_V1.on_kv_cache_ready (vllm-project/vllm#66574); "
-        "delete vllm_rbln/patches/kv_cache_ready.py and its engine and worker halves."
+        "vLLM ships KVConnectorBase_V1.on_kv_cache_ready (vllm-project/vllm#66574). "
+        "Delete vllm_rbln/patches/kv_cache_ready.py, and make connectors hear it "
+        "once, after the dynamic-KV resize in vllm_rbln/patches/dynamic_kv.py."
     )
 
 _REASON = (
