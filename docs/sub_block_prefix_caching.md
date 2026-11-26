@@ -185,6 +185,8 @@ so upstream's LRU preserves it for potential reuse.
 `do_pending_indexing` processes each remaining running request:
 1. Indexes newly cached full blocks' sub-block hashes into the per-group `SubBlockIndex`.
    Each hash at depth *k* maps to the set of physical blocks whose first *k* sub-blocks match.
+   A block is full once the request has computed all of it: with groups of different
+   block sizes, upstream can key a larger block at the prompt's last hash boundary inside it.
 2. Indexes complete sub-blocks within the request's current partial block,
    making them visible for matching by new requests.
 
@@ -193,19 +195,25 @@ so upstream's LRU preserves it for potential reuse.
 `get_computed_blocks_sub_block(request, num_computed_tokens)`
 1.  Compute sub-block hashes for the request
 2.  For each group:
-    1. Starting after the last full-block boundary,
-       query the group's index with up to `sub_blocks_per_block − 1` hashes
+    1. Starting after the last full-block boundary, query the group's index
+       one block at a time, moving on while every sub-block of a block matches
     2. Record the match length
 3.  Extension = min match length across all groups
 4.  If match found → return a `SubBlockMatch` handle
-    (with per-group `_GroupPartialMatch`),
+    (with one `_GroupPartialMatch` per block to copy),
     bump `src_block`s' ref counts to prevent eviction
 5.  Return the sub-block extension in tokens (0 if no match),
     capped at `request.num_tokens − 1` to preserve the upstream
     "must recompute last token" invariant.
 
-The query is limited to `sub_blocks_per_block - 1` because a match of all
-sub-blocks would be a full-block match, which upstream handles already. The
+When every group has the same block size, the extension is limited to
+`sub_blocks_per_block - 1` sub-blocks because a match of all
+sub-blocks would be a full-block match, which upstream handles already.
+Groups of different block sizes (Gemma4's full attention next to its sliding
+window, once the page size is unified) have no such limit: upstream aligns their
+hit to the scheduler block, their least common multiple, which can leave the
+group with the smaller blocks several whole blocks short of what is cached.
+While upstream's EAGLE block drop is on, the extension keeps the limit. The
 cap at `num_tokens - 1` ensures the scheduler always schedules at least one
 token for computation (upstream requires the last token to be recomputed to
 produce logits).
@@ -213,9 +221,10 @@ produce logits).
 ### Step 4: Copy op scheduling
 
 After `allocate_slots` succeeds, the scheduler calls
-`apply_sub_block_match(match)` which, for each group:
-1.  Looks up the destination block (newly allocated at the match boundary)
-2.  Appends `KVCacheCopyOp(group_id, src_block_id, dst_block_id, num_tokens)`
+`apply_sub_block_match(match)` which, for each block of the match:
+1.  Looks up the destination block (newly allocated past the full-block hit)
+2.  Appends `KVCacheCopyOp(group_id, src_block_id, dst_block_id, num_tokens)`,
+    where `num_tokens` is the whole block for a block the match passes over
 
 ### Step 5: Copy execution (model runner)
 
