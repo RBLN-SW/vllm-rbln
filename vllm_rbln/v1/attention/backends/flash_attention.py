@@ -637,21 +637,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         # ex) tensor[block0 : 0, block1 : 100,
         #  block2: 10, block3: 5, ...]
         # attn_output = [batch,H,4,L,D]
-        if reads_shared_kv and self.sliding_window is not None:
-            assert attn_metadata.swa_appends and not attn_metadata.is_prefill
-            attn_output = sliding_window_attention_v1(
-                query,
-                key,
-                value,
-                kv_cache,
-                attn_metadata.seq_lens,
-                self.scale,
-                attn_metadata.block_tables,
-                self.sliding_window,
-                self.sinks,
-                is_prompt_sorted=attn_metadata.is_prompt_sorted,
-            )
-        elif reads_shared_kv:
+        if reads_shared_kv and self.sliding_window is None:
             assert not attn_metadata.is_prefill
             attn_output = torch.ops.rbln_custom_ops.gqa(
                 query,

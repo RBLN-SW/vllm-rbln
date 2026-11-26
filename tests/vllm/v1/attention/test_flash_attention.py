@@ -1253,5 +1253,5 @@ class TestForwardSharedKV:
             assert len(args) == 7  # no mask, causal: the op's defaults
             assert set(kwargs) == {"sinks", "is_prompt_sorted", "null_block_id"}
         else:
-            assert "attn_mask" not in kwargs
+            assert kwargs["attn_mask"] is None
             assert args[7] == sliding_window
