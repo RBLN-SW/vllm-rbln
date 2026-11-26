@@ -584,13 +584,11 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
 
         # 1. query reshape for custom operation
         num_tokens = query.shape[0]
-        # A KV-shared layer reads its target's cache with skip_cache_write: the
-        # zero K/V only carry the shape.
+        # A KV-shared layer has no K/V: the ops take None for them and read
+        # its target's cache without writing it.
         reads_shared_kv = key is None
         if reads_shared_kv:
             assert value is None
-            key = query.new_zeros(num_tokens, self.num_kv_heads, self.head_size)
-            value = query.new_zeros(num_tokens, self.num_kv_heads, self.head_size)
         b_size = attn_metadata.seq_lens.shape[0]
         q_len = num_tokens // b_size
         query = query.view(b_size, q_len, self.num_heads, self.head_size).transpose(
@@ -599,12 +597,15 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         query = query.view(
             b_size, self.num_kv_heads, self.num_queries_per_kv, q_len, self.head_size
         )
-        key = key.view(b_size, q_len, self.num_kv_heads, self.head_size).transpose(1, 2)
-        key = key.view(b_size, self.num_kv_heads, 1, q_len, self.head_size)
-        value = value.view(b_size, q_len, self.num_kv_heads, self.head_size).transpose(
-            1, 2
-        )
-        value = value.view(b_size, self.num_kv_heads, 1, q_len, self.head_size)
+        if not reads_shared_kv:
+            key = key.view(b_size, q_len, self.num_kv_heads, self.head_size)
+            key = key.transpose(1, 2).view(
+                b_size, self.num_kv_heads, 1, q_len, self.head_size
+            )
+            value = value.view(b_size, q_len, self.num_kv_heads, self.head_size)
+            value = value.transpose(1, 2).view(
+                b_size, self.num_kv_heads, 1, q_len, self.head_size
+            )
 
         # NOTE - for cache update,
         # slot mapping will be necessary from sequence index
@@ -644,7 +645,6 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                 attn_metadata.block_tables,
                 self.sliding_window,
                 self.sinks,
-                skip_cache_write=True,
                 is_prompt_sorted=attn_metadata.is_prompt_sorted,
             )
         elif reads_shared_kv:
@@ -663,7 +663,6 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                 None,  # k_quantize_scale
                 None,  # v_quantize_scale
                 None,  # cache_dtype
-                skip_cache_write=True,
                 is_prompt_sorted=attn_metadata.is_prompt_sorted,
                 null_block_id=NULL_BLOCK_ID,
             )

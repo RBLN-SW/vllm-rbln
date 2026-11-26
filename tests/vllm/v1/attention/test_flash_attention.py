@@ -1170,7 +1170,7 @@ class TestForwardSlidingWindow:
 @pytest.mark.use_device
 class TestForwardSharedKV:
     """A KV-shared layer passes no K/V: it reads its target's cache at the
-    query's own position with skip_cache_write, unmasked, and writes nothing."""
+    query's own position with k / v None, unmasked, and writes nothing."""
 
     HEADS, DIM = 8, 128
 
@@ -1206,7 +1206,7 @@ class TestForwardSharedKV:
         [(None, "gqa"), (4, "sliding_window_attention_v1")],
     )
     @pytest.mark.parametrize("num_blocks", [1, 3])
-    def test_reads_with_skip_cache_write(
+    def test_reads_with_no_k_v(
         self, cfg, monkeypatch, sliding_window, target, num_blocks
     ):
         impl = make_impl(cfg, sliding_window=sliding_window)
@@ -1247,9 +1247,7 @@ class TestForwardSharedKV:
             torch.zeros(2, self.HEADS, self.DIM),
         )
         args, kwargs = recorded[0]
-        _q, key, value = args[:3]
-        assert not key.any() and not value.any()
-        assert kwargs["skip_cache_write"] is True
+        assert args[1] is None and args[2] is None
         assert args[4] is md.seq_lens
         if sliding_window is None:
             assert args[8] is None and args[9] is True  # no mask, causal
