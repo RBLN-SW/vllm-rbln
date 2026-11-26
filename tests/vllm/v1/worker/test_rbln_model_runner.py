@@ -1016,17 +1016,17 @@ def test_rejection_sampler_warmup_asks_for_the_synthetic_variant():
 
     runner._warmup_sampler_decode_batches()
 
-    impl.initialize_sampling_inputs.assert_called_once()
     assert impl.rejection_sample.call_args_list
     for call in impl.rejection_sample.call_args_list:
         assert call.kwargs["synthetic_mode"] is True
         assert call.kwargs["synthetic_conditional_rates"] is rates
 
 
-def test_load_model_initializes_rejection_buffers_when_warmup_is_disabled(monkeypatch):
+@pytest.mark.parametrize("warmup_enabled", [True, False])
+def test_load_model_initializes_rejection_buffers(monkeypatch, warmup_enabled):
     model = torch.nn.Module()
     model.logits_processor = SimpleNamespace(org_vocab_size=10)
-    monkeypatch.setattr(mr.envs, "VLLM_RBLN_ENABLE_WARM_UP", False)
+    monkeypatch.setattr(mr.envs, "VLLM_RBLN_ENABLE_WARM_UP", warmup_enabled)
     loader = Mock()
     loader.load_model.return_value = model
     monkeypatch.setattr(mr, "get_model_loader", lambda _: loader)
@@ -1041,6 +1041,7 @@ def test_load_model_initializes_rejection_buffers_when_warmup_is_disabled(monkey
         offload_context=nullcontext,
         _resolve_mm_support=lambda: False,
         drafter=Mock(),
+        is_pooling_model=False,
         use_aux_hidden_state_outputs=False,
         _make_weights_contiguous=lambda: None,
         compile_context=None,
@@ -1083,10 +1084,7 @@ def test_rejection_sampler_warmup_uses_per_stage_batch_bound(head_dtype):
     runner._warmup_sampler_decode_batches()
 
     device = runner.input_batch.temperature.device
-    sampler.initialize_sampling_inputs.assert_called_once_with(
-        4, 10, head_dtype, device
-    )
-    assert sampler.mock_calls[0][0] == "initialize_sampling_inputs"
+    sampler.initialize_sampling_inputs.assert_not_called()
     assert sampler.warm_up.call_args_list[0].args[4].all_random
 
     # One call per graph, all at the batch bound; a filtered random pattern

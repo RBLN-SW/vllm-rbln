@@ -2657,10 +2657,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         else:
             self.logits_processor = None
         if (
-            not envs.VLLM_RBLN_ENABLE_WARM_UP
-            and self.drafter is not None
+            self.drafter is not None
             and self.rbln_config.use_custom_sampler
             and not self.is_strict_kv_producer
+            and not self.is_pooling_model
             and self.logits_processor is not None
         ):
             self.rejection_sampler.initialize_sampling_inputs(
@@ -4166,9 +4166,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         device = self.input_batch.temperature.device
         # _sample pins the request axis to the per-PP-stage decode bound.
         batch_size = self.bucketing_manager.max_batch_size
-        self.rejection_sampler.initialize_sampling_inputs(
-            batch_size, vocab_size, dtype, device
-        )
         num_tokens = batch_size * num_spec
         num_draft_tokens = [num_spec] * batch_size
         draft_token_ids = torch.zeros(num_tokens, dtype=torch.int32, device=device)
