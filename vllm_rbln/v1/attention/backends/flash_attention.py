@@ -27,6 +27,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 from vllm.v1.attention.backends.utils import (
+    NULL_BLOCK_ID,
     CommonAttentionMetadata,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec, SlidingWindowSpec
@@ -536,6 +537,12 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     f"sliding_window={self.sliding_window}, "
                     f"is_causal={self.is_causal}, is_normal={self.is_normal}."
                 )
+            # A KV-shared layer reads with no K/V, and so without the writing
+            # layer's dequant scales.
+            if kv_sharing_target_layer_name is not None:
+                raise NotImplementedError(
+                    "fp8 KV cache is not supported on a KV-shared layer."
+                )
 
     def forward(
         self,
@@ -583,14 +590,9 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
 
         # 1. query reshape for custom operation
         num_tokens = query.shape[0]
-        # A KV-shared layer reads its target's cache through an op that also
-        # writes: its zero K/V land one slot past the query, which the target
-        # overwrites before it reads, and the mask keeps them out.
+        # A KV-shared layer has no K/V: the ops take None for them and read
+        # its target's cache without writing it.
         reads_shared_kv = key is None
-        if reads_shared_kv:
-            assert value is None and attn_metadata.attn_masks is not None
-            key = query.new_zeros(num_tokens, self.num_kv_heads, self.head_size)
-            value = query.new_zeros(num_tokens, self.num_kv_heads, self.head_size)
         b_size = attn_metadata.seq_lens.shape[0]
         q_len = num_tokens // b_size
         query = query.view(b_size, q_len, self.num_heads, self.head_size).transpose(
@@ -599,12 +601,15 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         query = query.view(
             b_size, self.num_kv_heads, self.num_queries_per_kv, q_len, self.head_size
         )
-        key = key.view(b_size, q_len, self.num_kv_heads, self.head_size).transpose(1, 2)
-        key = key.view(b_size, self.num_kv_heads, 1, q_len, self.head_size)
-        value = value.view(b_size, q_len, self.num_kv_heads, self.head_size).transpose(
-            1, 2
-        )
-        value = value.view(b_size, self.num_kv_heads, 1, q_len, self.head_size)
+        if not reads_shared_kv:
+            key = key.view(b_size, q_len, self.num_kv_heads, self.head_size)
+            key = key.transpose(1, 2).view(
+                b_size, self.num_kv_heads, 1, q_len, self.head_size
+            )
+            value = value.view(b_size, q_len, self.num_kv_heads, self.head_size)
+            value = value.transpose(1, 2).view(
+                b_size, self.num_kv_heads, 1, q_len, self.head_size
+            )
 
         # NOTE - for cache update,
         # slot mapping will be necessary from sequence index
@@ -632,39 +637,22 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         # ex) tensor[block0 : 0, block1 : 100,
         #  block2: 10, block3: 5, ...]
         # attn_output = [batch,H,4,L,D]
-        if reads_shared_kv and self.sliding_window is not None:
-            # The write sits one past the query. Include one extra position so
-            # the op's block strip retains the query's oldest visible key.
-            assert attn_metadata.swa_appends and not attn_metadata.is_prefill
-            attn_output = sliding_window_attention_v1(
-                query,
-                key,
-                value,
-                kv_cache,
-                attn_metadata.seq_lens,
-                self.scale,
-                attn_metadata.block_tables,
-                self.sliding_window + 1,
-                self.sinks,
-                attn_mask=attn_metadata.attn_masks,
-                is_prompt_sorted=attn_metadata.is_prompt_sorted,
-            )
-        elif reads_shared_kv:
-            # GQA selects the old masked kernel for a one-column table. The
-            # explicit flash op retains the target's in-memory cache layout.
+        # TODO(post-GA): the torch custom ops narrow to mla, gqa, swa_v1 and
+        # swa_v0. The full-layer path then calls gqa too and this branch folds
+        # into it; until then only gqa takes None k / v for a full layer.
+        if reads_shared_kv and self.sliding_window is None:
             assert not attn_metadata.is_prefill
-            attn_output = flash_attention_naive_decode(
+            attn_output = torch.ops.rbln_custom_ops.gqa(
                 query,
                 key,
                 value,
                 kv_cache,
-                attn_metadata.attn_masks,
-                self.scale,
                 attn_metadata.seq_lens,
+                self.scale,
                 attn_metadata.block_tables,
-                self.sinks,
-                use_custom_kernel=self.use_custom_kernel,
+                sinks=self.sinks,
                 is_prompt_sorted=attn_metadata.is_prompt_sorted,
+                null_block_id=NULL_BLOCK_ID,
             )
         elif self.sliding_window is not None:
             if attn_metadata.swa_appends:

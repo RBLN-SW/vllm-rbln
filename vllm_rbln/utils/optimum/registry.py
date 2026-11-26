@@ -111,7 +111,12 @@ _RBLN_MULTIMODAL_MODELS = {
 }
 
 _RBLN_TEXT_POOLING_MODELS = {
+    "BertForMaskedLM": ("bert_masked_lm", "RBLNBertForMaskedLM"),
     "BertModel": ("bert_model", "RBLNBertModel"),
+    "ModernBertModel": ("modernbert", "RBLNModernBertModel"),
+    # Upstream serves RobertaForMaskedLM as an embedder, dropping the LM head.
+    "RobertaForMaskedLM": ("roberta", "RBLNRobertaModel"),
+    "RobertaModel": ("roberta", "RBLNRobertaModel"),
     "RobertaForSequenceClassification": (
         "roberta_classification",
         "RBLNRobertaForSequenceClassification",
