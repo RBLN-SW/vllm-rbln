@@ -474,3 +474,14 @@ def test_draft_plan_matches_upstream_target_and_bonus_rows():
         for outputs, drafts in zip(batch.req_output_token_ids, batch.spec_token_ids):
             accepted = rng.randrange(len(drafts) + 1)
             outputs.extend([*drafts[:accepted], rng.randrange(vocab)])
+
+    # A state that never saw a draft holds the same slots.
+    for drafts in batch.spec_token_ids:
+        drafts.clear()
+    md = batch._make_sampling_metadata()
+    fresh = FusedPenaltyState()
+    for s in (state, fresh):
+        s.plan_with_drafts(md, batch, [0] * len(params), num_spec, vocab, "cpu")
+    assert [r.chunk_to_slot_by_row for r in state._reqs.values()] == [
+        r.chunk_to_slot_by_row for r in fresh._reqs.values()
+    ]

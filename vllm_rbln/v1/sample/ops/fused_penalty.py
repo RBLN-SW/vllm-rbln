@@ -123,7 +123,8 @@ def keeps_logit_bias_order(sampling_metadata: SamplingMetadata) -> bool:
 
 
 class _Request:
-    """Append-only lane store of one request. Slots fill in first-seen order."""
+    """Lane store of one request. Slots fill in first-seen order, and only a
+    step's draft slots are ever taken back."""
 
     __slots__ = (
         "is_vocab_split",
@@ -349,35 +350,43 @@ class FusedPenaltyState:
         rows: list[_Request | None] = [None] * (num_targets + len(num_draft_tokens))
         edits: dict[int, list[tuple[int, int, int, int, float]]] = {}
         first_target = 0
-        for i, req in enumerate(reqs):
-            count = num_draft_tokens[i]
-            rows[num_targets + i] = req
-            if req.has_penalties:
-                if drafts is None or len(drafts[i]) != count:
-                    return None
-                # Not an output yet: edit the step buffer only.
-                row_edits: list[tuple[int, int, int, int, float]] = []
-                draft_token_counts: dict[int, int] = {}
-                for pos, t in enumerate(drafts[i]):
-                    if not 0 <= t < vocab_size:
+        # A draft takes a slot for this step only. Its slots are the newest.
+        num_slots = [req.used for req in reqs]
+        try:
+            for i, req in enumerate(reqs):
+                count = num_draft_tokens[i]
+                rows[num_targets + i] = req
+                if req.has_penalties:
+                    if drafts is None or len(drafts[i]) != count:
                         return None
-                    rows[first_target + pos] = req
-                    edits[first_target + pos] = list(row_edits)
-                    lane_pos = req._lane(t)
-                    if req.has_repetition_penalty:
-                        row_edits.append(
-                            (*lane_pos, MUL, float(req.repetition_penalty))
-                        )
-                    if req.frequency_penalty or req.presence_penalty:
-                        c = draft_token_counts[t] = draft_token_counts.get(t, 0) + 1
-                        c += req.output_token_counts.get(t, 0)
-                        sub = req.frequency_penalty * c + req.presence_penalty
-                        if abs(sub) > _FP16_MAX:
+                    # Not an output yet: edit the step buffer only.
+                    row_edits: list[tuple[int, int, int, int, float]] = []
+                    draft_token_counts: dict[int, int] = {}
+                    for pos, t in enumerate(drafts[i]):
+                        if not 0 <= t < vocab_size:
                             return None
-                        row_edits.append((*lane_pos, SUB, sub))
-                edits[num_targets + i] = row_edits
-            first_target += count
-        step = self._fit_and_copy_out(rows, vocab_size, len(rows), edits)
+                        rows[first_target + pos] = req
+                        edits[first_target + pos] = list(row_edits)
+                        lane_pos = req._lane(t)
+                        if req.has_repetition_penalty:
+                            row_edits.append(
+                                (*lane_pos, MUL, float(req.repetition_penalty))
+                            )
+                        if req.frequency_penalty or req.presence_penalty:
+                            c = draft_token_counts[t] = draft_token_counts.get(t, 0) + 1
+                            c += req.output_token_counts.get(t, 0)
+                            sub = req.frequency_penalty * c + req.presence_penalty
+                            if abs(sub) > _FP16_MAX:
+                                return None
+                            row_edits.append((*lane_pos, SUB, sub))
+                    edits[num_targets + i] = row_edits
+                first_target += count
+            step = self._fit_and_copy_out(rows, vocab_size, len(rows), edits)
+        finally:
+            for req, n in zip(reqs, num_slots):
+                slots = req.chunk_to_slot_by_row[0]
+                for chunk in list(slots)[n:]:
+                    del slots[chunk]
         if step is None:
             return None
         num_rows, row_vocab, k, cidx, lanes = step
