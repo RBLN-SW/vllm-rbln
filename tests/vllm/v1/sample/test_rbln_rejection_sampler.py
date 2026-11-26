@@ -538,12 +538,14 @@ def test_random_step_draws_the_bonus_token_in_the_graph(impl):
     ],
     ids=["standard", "synthetic"],
 )
-def test_fused_penalties_follow_the_drafts(method):
+# 0.01 is sharp enough that a random draw always lands on the argmax.
+@pytest.mark.parametrize("temperature", [0.0, 0.01], ids=["greedy", "random"])
+def test_fused_penalties_follow_the_drafts(method, temperature):
     """The graph penalizes each row for the drafts it follows."""
     device = current_platform.device_type
     params = [
-        SamplingParams(temperature=0.0, repetition_penalty=1.3),
-        SamplingParams(temperature=0.0, frequency_penalty=2.0),
+        SamplingParams(temperature=temperature, repetition_penalty=1.3),
+        SamplingParams(temperature=temperature, frequency_penalty=2.0),
     ]
     batch = build_input_batch(
         [(str(i), p) for i, p in enumerate(params)],
