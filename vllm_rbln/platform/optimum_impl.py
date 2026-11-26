@@ -146,6 +146,17 @@ def check_and_update(vllm_config: "VllmConfig") -> None:
     disable_unsupported_prefix_caching(vllm_config)
     sync_vllm_and_optimum(vllm_config)
 
+    if (
+        model_config.runner_type == "generate"
+        and getattr(hf_config, "head_dtype", None) is not None
+        and model_config.head_dtype != model_config.dtype
+    ):
+        raise ValueError(
+            "A separate head_dtype is unsupported for generation with "
+            "--model-impl optimum. "
+            "For a separate LM head dtype, use --model-impl vllm."
+        )
+
 
 def _disable_prefix_caching(vllm_config: "VllmConfig", reason: str) -> None:
     """Disable prefix caching with warning message."""
