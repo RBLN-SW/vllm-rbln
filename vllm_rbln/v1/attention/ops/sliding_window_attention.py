@@ -105,8 +105,8 @@ def sliding_window_attention_naive_decode(
 
 def sliding_window_attention_v1(
     q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
+    k: torch.Tensor | None,
+    v: torch.Tensor | None,
     kv_cache: torch.Tensor,
     seq_idx: torch.Tensor,
     scale: torch.Tensor,
