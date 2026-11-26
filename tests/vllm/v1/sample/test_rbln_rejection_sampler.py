@@ -79,7 +79,7 @@ def make_sampling_metadata(
 
 @pytest.fixture
 def impl(monkeypatch) -> RBLNRejectionSamplerImpl:
-    monkeypatch.setattr(module, "compile", lambda target, **kwargs: target)
+    monkeypatch.setattr(module, "compile_sampler", lambda target, _: target)
     return RBLNRejectionSamplerImpl(
         compile_context=Mock(),
         num_spec_tokens=NUM_SPEC_TOKENS,

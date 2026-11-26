@@ -24,10 +24,7 @@ from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.worker.gpu_input_batch import InputBatch
 
-from vllm_rbln import envs
-from vllm_rbln.compilation import compile, create_compile_context
 from vllm_rbln.logger import init_logger
-from vllm_rbln.platform import use_device_tensor
 from vllm_rbln.v1.sample.ops.fused_penalty import (
     FusedPenaltyPlan,
     active_argmax_invariant,
@@ -39,7 +36,7 @@ from vllm_rbln.v1.sample.ops.top_k_top_p import (
     GREEDY_TOP_K,
     build_op_top_k_top_p,
 )
-from vllm_rbln.v1.sample.rbln_sampler import RBLNSampler
+from vllm_rbln.v1.sample.rbln_sampler import RBLNSampler, compile_sampler
 
 if TYPE_CHECKING:
     from rebel import CompileContext
@@ -367,25 +364,8 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         super().__init__()
         self.num_spec_tokens = num_spec_tokens or self.max_spec_len
 
-        compile_context = (
-            compile_context or create_compile_context(use_global_ctx=True)
-            if not use_device_tensor()
-            else None
-        )
-
-        self._compiled_rejection_sample = compile(
-            rbln_rejection_sample,
-            dynamic=False,
-            fullgraph=True,
-            compile_context=compile_context,
-            num_devices=1 if use_device_tensor() else None,
-            model_trace_method="export" if use_device_tensor() else "",
-            mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
-            use_global_ctx=True if not use_device_tensor() else None,
-            global_device_id=0 if not use_device_tensor() else None,
-            # Built only under --rbln-use-custom-sampler, so a bundle saved
-            # with the sampler off misses this op and forces a partial compile.
-            use_cache=False,
+        self._compiled_rejection_sample = compile_sampler(
+            rbln_rejection_sample, compile_context
         )
         # The graph's small inputs, one set per shape. The same tensors every
         # step keep the runtime's bindings; a fresh address is re-bound.
