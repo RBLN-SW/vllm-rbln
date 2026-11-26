@@ -589,6 +589,10 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         reads_shared_kv = key is None
         if reads_shared_kv:
             assert value is None
+            # An fp8 cache needs the writing layer's dequant scales, not wired.
+            assert not self.kv_cache_dtype.startswith("fp8"), (
+                "a KV-shared layer does not read an fp8 KV cache yet"
+            )
         b_size = attn_metadata.seq_lens.shape[0]
         q_len = num_tokens // b_size
         query = query.view(b_size, q_len, self.num_heads, self.head_size).transpose(
