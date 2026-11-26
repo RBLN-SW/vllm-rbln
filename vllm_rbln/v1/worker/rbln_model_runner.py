@@ -2962,8 +2962,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         *,
         num_tokens_padded_override: int | None = None,
         warmup: bool = True,
-        capture_logits: bool = False,
-    ) -> torch.Tensor | None:
+    ) -> None:
         """Run a dummy forward pass, in one of two modes.
 
         warmup=True (default, compile-time): trigger compilation of the graph
@@ -3111,7 +3110,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             num_padded_tokens=batch_desc.num_tokens_padded,
             **self.kv_cache_forward_context_kwargs(),
         ):
-            model_output = self.model_executable(
+            self.model_executable(
                 **staged_model_input.as_kwargs(), **self._dummy_mm_kwargs(layout)
             )
             # The submission a step with no forward of its own was waiting for.
@@ -3137,7 +3136,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 self.drafter.dummy_run(num_reqs, draft_query_len, is_prefill)
 
         self.input_batch.num_tokens_no_spec[:num_reqs] = 0
-        return model_output[1] if capture_logits else None
 
     def _dummy_mm_kwargs(self, layout: InputLayout) -> dict[str, torch.Tensor]:
         """All-text ``mm_embeds`` / ``mm_mask`` for a dummy prefill"""
@@ -4163,30 +4161,29 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     t.data = t.data.contiguous()
 
     @torch.inference_mode()
-    def _warmup_sampler_decode_batches(self, logits: torch.Tensor) -> None:
+    def _warmup_sampler_decode_batches(self) -> None:
         """Warm the device rejection-sample op at the decode batch size it will see."""
         num_spec = self.num_spec_tokens
-        vocab_size = logits.size(-1)
+        assert self.logits_processor is not None
+        vocab_size = self.logits_processor.org_vocab_size
+        dtype = self.model_config.head_dtype
+        device = self.input_batch.temperature.device
         # _sample pins the request axis to the per-PP-stage decode bound.
         batch_size = self.bucketing_manager.max_batch_size
         impl = cast(RBLNRejectionSamplerImpl, self.rejection_sampler.impl)
-        impl.initialize_sampling_inputs(
-            batch_size, vocab_size, logits.dtype, logits.device
-        )
+        impl.initialize_sampling_inputs(batch_size, vocab_size, dtype, device)
         num_tokens = batch_size * num_spec
         num_draft_tokens = [num_spec] * batch_size
-        draft_token_ids = torch.zeros(
-            num_tokens, dtype=torch.int32, device=logits.device
-        )
-        target_logits = logits.new_zeros((num_tokens, vocab_size))
+        draft_token_ids = torch.zeros(num_tokens, dtype=torch.int32, device=device)
+        target_logits = torch.zeros(num_tokens, vocab_size, dtype=dtype, device=device)
         cu_num_draft_tokens = torch.arange(
             num_spec,
             num_tokens + 1,
             num_spec,
             dtype=torch.int32,
-            device=logits.device,
+            device=device,
         )
-        bonus_logits = logits.new_zeros((batch_size, vocab_size))
+        bonus_logits = torch.zeros(batch_size, vocab_size, dtype=dtype, device=device)
         dummy_sampling_metadata = SamplingMetadata(
             temperature=None,
             all_greedy=True,
@@ -4209,9 +4206,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
 
         variants: list[tuple[dict, SamplingMetadata]] = []
         # int32, as the bonus sampler's ops return it.
-        bonus_token_ids = torch.zeros(
-            batch_size, 1, dtype=torch.int32, device=logits.device
-        )
+        bonus_token_ids = torch.zeros(batch_size, 1, dtype=torch.int32, device=device)
 
         logger.info("Warm-up: rejection sampler (decode_batch=%d)", batch_size)
         # One graph per top_k/top_p None-pattern (the sampler's WARM_UP_CONFIGS)
@@ -4224,7 +4219,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 all_random=config["all_random"],
                 temperature=None
                 if config["all_greedy"]
-                else torch.ones(batch_size, dtype=torch.float32, device=logits.device),
+                else torch.ones(batch_size, dtype=torch.float32, device=device),
                 top_p=_dummy_tensor_view(
                     self.input_batch.top_p, batch_size, config.get("top_p")
                 ),
@@ -4313,28 +4308,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 shapes.append((num_req, 1, num_req * spec_query_len))
         return shapes
 
-    def run_model_graphs(
-        self, *, capture_spec_logits: bool = False
-    ) -> torch.Tensor | None:
+    def run_model_graphs(self) -> None:
         """Every model graph once, at the shapes serving will ask for."""
-        spec_logits = None
         for chunk in self.prefill_chunk_sizes:
             self._dummy_run(1, chunk, True)
         for num_reqs, query_len, override in self.decode_graph_shapes():
-            if (
-                capture_spec_logits
-                and num_reqs == self.bucketing_manager.max_batch_size
-                and query_len == self.num_spec_tokens + 1
-                and override is None
-            ):
-                spec_logits = self._dummy_run(
-                    num_reqs, query_len, False, capture_logits=True
-                )
-            else:
-                self._dummy_run(
-                    num_reqs, query_len, False, num_tokens_padded_override=override
-                )
-        return spec_logits
+            self._dummy_run(
+                num_reqs, query_len, False, num_tokens_padded_override=override
+            )
 
     def warmup_model(self) -> None:
         # NOTE(RBLN): Warm-up must not route through execute_model() while a
@@ -4364,11 +4345,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     and self.num_spec_tokens > 0
                     and self.rbln_config.use_custom_sampler
                 )
-                if warm_rejection_sampler:
-                    spec_logits = self.run_model_graphs(capture_spec_logits=True)
-                    assert spec_logits is not None
-                else:
-                    self.run_model_graphs()
+                self.run_model_graphs()
 
                 # NOTE(RBLN): the sampler and the rejection sampler are built on
                 # the last PP rank only, so no other rank has anything to warm up here.
@@ -4386,7 +4363,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                             self._dummy_sampler_run(size)
 
                 if warm_rejection_sampler:
-                    self._warmup_sampler_decode_batches(spec_logits)
+                    self._warmup_sampler_decode_batches()
 
                 # 5. specdec (medusa)
                 if isinstance(self.drafter, RBLNMedusaProposer):

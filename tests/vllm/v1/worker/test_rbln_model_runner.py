@@ -919,7 +919,6 @@ def test_a_producer_warms_the_sampler_at_one_request(
     cache = SimpleNamespace(config_signature=Mock(), load=Mock(), save=Mock())
     monkeypatch.setattr(mr, "mega_cache", cache)
     monkeypatch.setattr(mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True))
-    decode_logits = torch.zeros(12, 10, dtype=torch.float32)
     runner = _make_runner_stub(
         is_strict_kv_producer=strict_kv_producer,
         vllm_config=SimpleNamespace(is_mm_encoder_only=False),
@@ -928,7 +927,7 @@ def test_a_producer_warms_the_sampler_at_one_request(
         speculative_config=SimpleNamespace(num_speculative_tokens=2),
         num_spec_tokens=2,
         rbln_config=RBLNConfig(use_custom_sampler=True),
-        run_model_graphs=Mock(return_value=decode_logits),
+        run_model_graphs=Mock(),
         offload_context=nullcontext,
         bucketing_manager=SimpleNamespace(batch_buckets=[1, 2, 4]),
         drafter=None,
@@ -939,38 +938,11 @@ def test_a_producer_warms_the_sampler_at_one_request(
     runner.warmup_model()
 
     assert [c.args[0] for c in runner._dummy_sampler_run.call_args_list] == sampled
+    runner.run_model_graphs.assert_called_once_with()
     if verifies:
-        runner.run_model_graphs.assert_called_once_with(capture_spec_logits=True)
-        runner._warmup_sampler_decode_batches.assert_called_once_with(decode_logits)
+        runner._warmup_sampler_decode_batches.assert_called_once_with()
     else:
-        runner.run_model_graphs.assert_called_once_with()
         runner._warmup_sampler_decode_batches.assert_not_called()
-
-
-def test_run_model_graphs_captures_the_full_speculative_decode_logits():
-    logits = torch.zeros(12, 10, dtype=torch.float32)
-    runner = _make_runner_stub(
-        prefill_chunk_sizes=[32],
-        num_spec_tokens=2,
-        bucketing_manager=SimpleNamespace(max_batch_size=4),
-        decode_graph_shapes=lambda: [
-            (2, 3, None),
-            (4, 1, None),
-            (4, 3, None),
-            (4, 3, 64),
-        ],
-        _dummy_run=Mock(
-            side_effect=lambda *args, **kw: logits if kw.get("capture_logits") else None
-        ),
-    )
-
-    assert runner.run_model_graphs(capture_spec_logits=True) is logits
-    captures = [
-        c.args
-        for c in runner._dummy_run.call_args_list
-        if c.kwargs.get("capture_logits")
-    ]
-    assert captures == [(4, 3, False)]
 
 
 def _sampler_warmup_runner(sampler, num_reqs):
@@ -1020,15 +992,16 @@ def test_rejection_sampler_warmup_asks_for_the_synthetic_variant():
         speculative_config=object(),
         num_spec_tokens=2,
         is_pooling_model=False,
-        model_config=SimpleNamespace(get_vocab_size=lambda: 10),
-        device=torch.device("cpu"),
-        dtype=torch.bfloat16,
+        model_config=SimpleNamespace(head_dtype=torch.bfloat16),
+        logits_processor=SimpleNamespace(org_vocab_size=10),
         bucketing_manager=SimpleNamespace(
             decode_batch_buckets=[2, 4], max_batch_size=4
         ),
         max_num_reqs=8,
         input_batch=SimpleNamespace(
-            top_p=torch.ones(8), top_k=torch.ones(8, dtype=torch.int32)
+            temperature=torch.ones(8),
+            top_p=torch.ones(8),
+            top_k=torch.ones(8, dtype=torch.int32),
         ),
         rejection_sampler=SimpleNamespace(
             impl=impl,
@@ -1037,7 +1010,7 @@ def test_rejection_sampler_warmup_asks_for_the_synthetic_variant():
         ),
     )
 
-    runner._warmup_sampler_decode_batches(torch.zeros(12, 10, dtype=torch.bfloat16))
+    runner._warmup_sampler_decode_batches()
 
     assert impl.rejection_sample.call_args_list
     for call in impl.rejection_sample.call_args_list:
@@ -1080,8 +1053,8 @@ def test_load_model_initializes_rejection_buffers_when_warmup_is_disabled(monkey
     )
 
 
-@pytest.mark.parametrize("logits_dtype", [torch.bfloat16, torch.float32])
-def test_rejection_sampler_warmup_uses_per_stage_batch_bound(logits_dtype):
+@pytest.mark.parametrize("head_dtype", [torch.bfloat16, torch.float32])
+def test_rejection_sampler_warmup_uses_per_stage_batch_bound(head_dtype):
     impl = Mock()
     rejection_sample = impl.rejection_sample
     runner = _make_runner_stub(
@@ -1089,15 +1062,16 @@ def test_rejection_sampler_warmup_uses_per_stage_batch_bound(logits_dtype):
         speculative_config=object(),
         num_spec_tokens=2,
         is_pooling_model=False,
-        model_config=SimpleNamespace(get_vocab_size=lambda: 10),
-        device=torch.device("cpu"),
-        dtype=torch.bfloat16,
+        model_config=SimpleNamespace(dtype=torch.bfloat16, head_dtype=head_dtype),
+        logits_processor=SimpleNamespace(org_vocab_size=10),
         bucketing_manager=SimpleNamespace(
             decode_batch_buckets=[2, 4], max_batch_size=4
         ),
         max_num_reqs=8,
         input_batch=SimpleNamespace(
-            top_p=torch.ones(8), top_k=torch.ones(8, dtype=torch.int32)
+            temperature=torch.ones(8),
+            top_p=torch.ones(8),
+            top_k=torch.ones(8, dtype=torch.int32),
         ),
         rejection_sampler=SimpleNamespace(
             impl=impl,
@@ -1106,12 +1080,10 @@ def test_rejection_sampler_warmup_uses_per_stage_batch_bound(logits_dtype):
         ),
     )
 
-    decode_logits = torch.zeros(12, 10, dtype=logits_dtype)
-    runner._warmup_sampler_decode_batches(decode_logits)
+    runner._warmup_sampler_decode_batches()
 
-    impl.initialize_sampling_inputs.assert_called_once_with(
-        4, 10, logits_dtype, decode_logits.device
-    )
+    device = runner.input_batch.temperature.device
+    impl.initialize_sampling_inputs.assert_called_once_with(4, 10, head_dtype, device)
     assert impl.mock_calls[0][0] == "initialize_sampling_inputs"
     assert rejection_sample.call_args_list[0].args[7].all_random
 
@@ -1122,12 +1094,12 @@ def test_rejection_sampler_warmup_uses_per_stage_batch_bound(logits_dtype):
     for call in rejection_sample.call_args_list:
         assert len(call.args[1]) == 4
         assert call.args[5].shape == (8, 10)
-        assert call.args[5].dtype == logits_dtype
-        assert call.args[5].device == decode_logits.device
+        assert call.args[5].dtype == head_dtype
+        assert call.args[5].device == device
         if (bonus_logits := call.kwargs["bonus_logits"]) is not None:
             assert bonus_logits.shape == (4, 10)
-            assert bonus_logits.dtype == logits_dtype
-            assert bonus_logits.device == decode_logits.device
+            assert bonus_logits.dtype == head_dtype
+            assert bonus_logits.device == device
         metadata = call.args[7]
         filters = [t for t in (metadata.top_k, metadata.top_p) if t is not None]
         variants.append(
