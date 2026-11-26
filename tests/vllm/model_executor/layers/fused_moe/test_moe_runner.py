@@ -23,6 +23,7 @@ import torch
 from vllm.model_executor.custom_op import maybe_get_oot_by_class
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
+import vllm_rbln.model_executor.layers.fused_moe.runner.moe_runner as moe_runner
 import vllm_rbln.model_executor.layers.fused_moe.utils as fused_moe_utils
 from vllm_rbln.model_executor.layers.fused_moe.runner.moe_runner import RBLNMoERunner
 from vllm_rbln.model_executor.layers.fused_moe.runner.moe_runner import (
@@ -228,45 +229,56 @@ class TestApplyGroupedTopkTorch:
         assert pre.sum().item() < 1.0
 
 
-def _routed_logits_dtype(
+def _hand_built_runner(
     monkeypatch,
     *,
-    logits_dtype,
     bias_dtype,
     scoring_func="sigmoid",
     num_expert_group=2,
     use_moe_tokens_mask=True,
+    dp_size=1,
+    max_pad=None,
 ):
-    """Dtype of the weights ``forward`` hands the quant method, mask included.
+    """A runner over 3 tokens per DP rank, and what ``forward`` hands the quant
+    method.
 
     Building a real RBLNMoERunner needs a MoEConfig, a quant method and an
     initialized DP group, so the instance is assembled by hand -- but ``forward``
-    itself is the real one, which is what the mask dtype has to come out of.
+    itself is the real one, which is what the routed weights have to come out of.
+    With ``dp_size > 1`` every rank holds the same tokens.
     """
+    forward_context = SimpleNamespace(
+        dp_metadata=SimpleNamespace(
+            num_tokens_across_dp_cpu=torch.tensor([3] * dp_size),
+            max_pads_across_dp=None if dp_size == 1 else torch.empty(max_pad),
+        )
+    )
+    monkeypatch.setattr(fused_moe_utils, "get_forward_context", lambda: forward_context)
+    monkeypatch.setattr(moe_runner, "get_forward_context", lambda: forward_context)
     monkeypatch.setattr(
-        fused_moe_utils,
-        "get_forward_context",
+        moe_runner,
+        "get_dp_group",
         lambda: SimpleNamespace(
-            dp_metadata=SimpleNamespace(
-                num_tokens_across_dp_cpu=torch.tensor([3]),
-                max_pads_across_dp=None,  # DP=1
-            )
+            all_gather=lambda x, dim: torch.cat([x] * dp_size, dim),
+            reduce_scatter=lambda x, dim: x.chunk(dp_size, dim)[0],
         ),
     )
 
-    routed: dict[str, torch.dtype] = {}
+    routed: dict[str, torch.Tensor] = {}
 
     class _CaptureQuantMethod:
         def apply(self, layer, x, router_logits):
-            routed["dtype"] = router_logits.dtype
+            routed["weights"] = router_logits
             return x
 
     runner = object.__new__(RBLNMoERunner)
     torch.nn.Module.__init__(runner)
     runner.use_moe_tokens_mask = use_moe_tokens_mask
+    runner.use_dispatch_all2all = False
+    runner.use_combine_all2all = False
     runner.routed_experts = SimpleNamespace(quant_method=_CaptureQuantMethod())
     runner.top_k = 2
-    runner.moe_parallel_config = SimpleNamespace(dp_size=1, dp_rank=0)
+    runner.moe_parallel_config = SimpleNamespace(dp_size=dp_size, dp_rank=0)
     runner.router = SimpleNamespace(
         scoring_func=scoring_func,
         renormalize=False,
@@ -274,12 +286,17 @@ def _routed_logits_dtype(
         num_expert_group=num_expert_group,
         topk_group=num_expert_group,
     )
+    return runner, routed
 
+
+def _routed_logits_dtype(monkeypatch, *, logits_dtype, bias_dtype, **kwargs):
+    """Dtype of the weights ``forward`` hands the quant method, mask included."""
+    runner, routed = _hand_built_runner(monkeypatch, bias_dtype=bias_dtype, **kwargs)
     logits = torch.randn(1, 3, 4, dtype=logits_dtype)
     RBLNMoERunner.forward(
         runner, torch.zeros(1, 3, 8, dtype=logits_dtype), lambda _: logits
     )
-    return routed["dtype"]
+    return routed["weights"].dtype
 
 
 class TestRoutingMaskDtype:
@@ -330,6 +347,25 @@ class TestRoutingMaskDtype:
             )
             is torch.bfloat16
         )
+
+
+class TestModelRoutedWeights:
+    # A model whose routing the runner cannot express routes its own tokens and
+    # hands over the [E, t] weights; the experts must run on exactly those.
+    def test_the_experts_run_on_the_models_weights(self, monkeypatch):
+        runner, routed = _hand_built_runner(monkeypatch, bias_dtype=torch.float32)
+        weights = torch.rand(4, 3)
+        RBLNMoERunner.forward(runner, torch.zeros(1, 3, 8), routing_weights=weights)
+        assert torch.equal(routed["weights"], weights)
+
+    def test_dp_gathers_each_ranks_weights_into_its_padded_slot(self, monkeypatch):
+        runner, routed = _hand_built_runner(
+            monkeypatch, bias_dtype=torch.float32, dp_size=2, max_pad=4
+        )
+        weights = torch.rand(4, 3)
+        RBLNMoERunner.forward(runner, torch.zeros(1, 3, 8), routing_weights=weights)
+        slot = torch.cat([weights, torch.zeros(4, 1)], dim=1)  # [E, max_pad]
+        assert torch.equal(routed["weights"], torch.cat([slot, slot], dim=1))
 
 
 class TestRegistration:

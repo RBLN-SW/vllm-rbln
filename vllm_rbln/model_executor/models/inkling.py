@@ -388,6 +388,8 @@ class RBLNInklingMoE(nn.Module):
         tokens = hidden_states.reshape(-1, shape[-1])
         scores = torch.sigmoid(self.gate(tokens.float())[0])
         routed_scores = scores[:, : self.num_routed].transpose(0, 1)
+        # Routed here and handed to the runner, which cannot put the sink scores
+        # in the normalizer.
         _, selected = torch.topk(
             routed_scores + self.gate.e_score_correction_bias.unsqueeze(1),
             self.top_k,
@@ -400,9 +402,9 @@ class RBLNInklingMoE(nn.Module):
         # masked is score / topk_sum on the selected experts, zero elsewhere.
         # Reduced token-major: a sum over the expert axis of [E, 1] leaves the
         # device for one token.
-        masked = masked.transpose(0, 1)
-        topk_sum = (masked * scores[:, : self.num_routed]).sum(-1, keepdim=True) / (
-            masked * masked
+        masked_t = masked.transpose(0, 1)
+        topk_sum = (masked_t * scores[:, : self.num_routed]).sum(-1, keepdim=True) / (
+            masked_t * masked_t
         ).sum(-1, keepdim=True)
         shared_scores = scores[:, self.num_routed :]
         # Masked rather than summed over the two shared columns: an op on a
@@ -411,8 +413,7 @@ class RBLNInklingMoE(nn.Module):
         scale = self.route_scale * self.gate.global_scale / (topk_sum + shared_sum)
 
         routed = self.experts(
-            hidden_states=hidden_states,
-            router=lambda x: self.gate(x.float())[0][..., : self.num_routed],
+            hidden_states=hidden_states, routing_weights=masked
         ).reshape(tokens.shape)
         out = routed * (topk_sum * scale).to(routed.dtype)
         for i, expert in enumerate(self.shared_experts):

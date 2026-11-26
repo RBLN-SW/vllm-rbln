@@ -135,8 +135,11 @@ class RBLNMoERunner(MoERunner):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        router: Callable[[torch.Tensor], torch.Tensor],
+        router: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        routing_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
+
+        assert (router is None) != (routing_weights is None)
         assert self._quant_method is not None
 
         if self.moe_parallel_config.dp_size > 1:
@@ -154,10 +157,14 @@ class RBLNMoERunner(MoERunner):
                     hidden_flat, (0, 0, 0, max_pad - t), value=0.0
                 )  # [max_pad, H]
 
-            if self.use_dispatch_all2all:
+            if self.use_dispatch_all2all or routing_weights is not None:
                 # --- Router DP path: local routing → all_gather logits ---
-                router_logits = router(hidden_states)
-                router_logits_2d = router_logits.reshape(t, -1)  # [t, E]
+                # The model's own weights are gathered the same way.
+                if router is not None:
+                    router_logits = router(hidden_states)
+                    router_logits_2d = router_logits.reshape(t, -1)  # [t, E]
+                if routing_weights is not None:
+                    router_logits_2d = routing_weights.transpose(0, 1)  # [t, E]
                 E = router_logits_2d.shape[-1]
 
                 if t < max_pad:
@@ -173,7 +180,7 @@ class RBLNMoERunner(MoERunner):
                 all_router_logits = all_rl_flat.reshape(
                     R * max_pad, E
                 )  # [R*max_pad, E]
-            else:
+            if not self.use_dispatch_all2all:
                 # -- origin/dev path: all-gather hidden first → router on full tokens --
                 # all-gather hidden_states across DP ranks (also serves as dispatch)
                 hidden_for_gather = hidden_flat.unsqueeze(0)  # [1, max_pad, H]
@@ -182,10 +189,11 @@ class RBLNMoERunner(MoERunner):
                 )  # [R, max_pad, H]
                 gathered_hidden = all_hidden.reshape(R * max_pad, H_dim)
 
-                # Router on all gathered tokens (no Router DP)
-                all_router_logits = router(gathered_hidden)  # [R*max_pad, E]
-                all_router_logits = all_router_logits.reshape(R * max_pad, -1)
-                E = all_router_logits.shape[-1]
+                if router is not None:
+                    # Router on all gathered tokens (no Router DP)
+                    all_router_logits = router(gathered_hidden)  # [R*max_pad, E]
+                    all_router_logits = all_router_logits.reshape(R * max_pad, -1)
+                    E = all_router_logits.shape[-1]
 
             # --- topk + softmax on all gathered tokens ---
             # [E, R*max_pad] for dim=0 topk (select top_k experts per token)
@@ -200,7 +208,9 @@ class RBLNMoERunner(MoERunner):
             topk_group = getattr(self.router, "topk_group", None)
             use_grouped_topk = num_expert_group is not None
 
-            if scoring_func == "sigmoid":
+            if routing_weights is not None:
+                masked_routing_weights = all_router_logits_t  # [E, R*max_pad]
+            elif scoring_func == "sigmoid":
                 if use_grouped_topk:
                     masked_routing_weights = _apply_grouped_topk_torch(
                         all_router_logits,
@@ -421,13 +431,13 @@ class RBLNMoERunner(MoERunner):
             return final_hidden_states
 
         # --- DP == 1 path ---
-        router_logits = router(hidden_states)
-
-        # topk + softmax → masked_routing_weights
         orig_shape = hidden_states.shape
         num_tokens = orig_shape[:-1].numel()
-        router_logits_2d = router_logits.reshape(num_tokens, -1)
+        if router is not None:
+            router_logits = router(hidden_states)
+            router_logits_2d = router_logits.reshape(num_tokens, -1)
 
+        # topk + softmax → masked_routing_weights
         # transpose to [E, t] for dim=0 topk (matching detach_topk branch)
         scoring_func = getattr(self.router, "scoring_func", "softmax")
         renormalize = getattr(self.router, "renormalize", False)
@@ -436,7 +446,9 @@ class RBLNMoERunner(MoERunner):
         topk_group = getattr(self.router, "topk_group", None)
         use_grouped_topk = num_expert_group is not None
 
-        if scoring_func == "sigmoid":
+        if routing_weights is not None:
+            masked_routing_weights = routing_weights  # [E, t]
+        elif scoring_func == "sigmoid":
             if use_grouped_topk:
                 masked_routing_weights = _apply_grouped_topk_torch(
                     router_logits_2d,
