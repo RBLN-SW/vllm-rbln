@@ -1169,12 +1169,12 @@ class TestForwardSlidingWindow:
 
 @pytest.mark.use_device
 class TestForwardSharedKV:
-    """A KV-shared layer passes no K/V: it reads its target's cache through the
-    op the target's own layer uses, masked, and writes zeros the mask hides."""
+    """A KV-shared layer passes no K/V: it reads its target's cache at the
+    query's own position with skip_cache_write, unmasked, and writes nothing."""
 
     HEADS, DIM = 8, 128
 
-    def test_sliding_reads_preserve_shared_prefix_blocks(self, cfg):
+    def test_sliding_reads_leave_the_cache_untouched(self, cfg):
         torch.manual_seed(0)
         impl = make_impl(cfg, sliding_window=8, scale=self.DIM**-0.5)
         impl.scale = impl.scale.cpu()
@@ -1182,15 +1182,11 @@ class TestForwardSharedKV:
         original = cache.clone()
         tables = torch.tensor([[1, 2, 3, 5], [1, 2, 4, 6]])
         query = torch.randn(2, self.HEADS, self.DIM)
-        masks = torch.zeros(2, 1, 1, 16)
-        masks[0, ..., 3:11] = 1
-        masks[1, ..., :8] = 1
         md = RBLNFlashAttentionMetadata(
-            seq_lens=torch.tensor([[11], [12]]),
+            seq_lens=torch.tensor([[10], [11]]),
             block_tables=tables,
             is_prefill=False,
             swa_appends=True,
-            attn_masks=masks,
         )
         output = torch.empty_like(query)
         impl.forward(None, query, None, None, cache, md, output)
@@ -1203,40 +1199,14 @@ class TestForwardSharedKV:
             logits = (query[row, :, None] * keys[:, start:end]).sum(-1) * impl.scale
             expected = (logits.softmax(-1)[..., None] * values[:, start:end]).sum(1)
             torch.testing.assert_close(output[row], expected)
-        original[3, :, :, 0, 3] = 0
-        original[6, :, :, 0, 0] = 0
         torch.testing.assert_close(cache, original, rtol=0, atol=0)
-
-    def test_full_mask_reads_a_single_partition(self, cfg):
-        torch.manual_seed(0)
-        impl = make_impl(cfg, scale=self.DIM**-0.5)
-        impl.scale = impl.scale.cpu()
-        cache = torch.randn(2, 2, self.HEADS, 1, 16, self.DIM)
-        original = cache.clone()
-        query = torch.randn(1, self.HEADS, self.DIM)
-        mask = torch.zeros(1, 1, 1, 1, 16)
-        mask[..., :11] = 1
-        md = RBLNFlashAttentionMetadata(
-            seq_lens=torch.tensor([[11]]),
-            block_tables=torch.tensor([[1]]),
-            is_prefill=False,
-            attn_masks=mask,
-        )
-        output = torch.empty_like(query)
-        impl.forward(None, query, None, None, cache, md, output)
-        keys, values = original[1, :, :, 0, :11]
-        logits = (query[0, :, None] * keys).sum(-1) * impl.scale
-        expected = (logits.softmax(-1)[..., None] * values).sum(1)
-        torch.testing.assert_close(output[0], expected)
-        original[1, :, :, 0, 11] = 0
-        torch.testing.assert_close(cache, original, atol=0, rtol=0)
 
     @pytest.mark.parametrize(
         "sliding_window, target",
-        [(None, "flash_attention_naive_decode"), (4, "sliding_window_attention_v1")],
+        [(None, "gqa"), (4, "sliding_window_attention_v1")],
     )
     @pytest.mark.parametrize("num_blocks", [1, 3])
-    def test_reads_through_a_masked_op(
+    def test_reads_with_skip_cache_write(
         self, cfg, monkeypatch, sliding_window, target, num_blocks
     ):
         impl = make_impl(cfg, sliding_window=sliding_window)
@@ -1258,7 +1228,7 @@ class TestForwardSharedKV:
         monkeypatch.setattr(
             torch.ops.rbln_custom_ops,
             "gqa",
-            _unexpected("gqa"),
+            record if target == "gqa" else _unexpected("gqa"),
             raising=False,
         )
         md = RBLNFlashAttentionMetadata(
@@ -1266,7 +1236,6 @@ class TestForwardSharedKV:
             block_tables=torch.tensor([[7, 8, 9], [0, 0, 0]])[:, :num_blocks],
             is_prefill=False,
             swa_appends=sliding_window is not None,
-            attn_masks=torch.ones(2, 1, 1, 1, 8),
         )
         impl.forward(
             None,
@@ -1280,8 +1249,10 @@ class TestForwardSharedKV:
         args, kwargs = recorded[0]
         _q, key, value = args[:3]
         assert not key.any() and not value.any()
+        assert kwargs["skip_cache_write"] is True
+        assert args[4] is md.seq_lens
         if sliding_window is None:
-            assert args[4] is md.attn_masks
+            assert args[8] is None and args[9] is True  # no mask, causal
         else:
-            assert kwargs["attn_mask"] is md.attn_masks
-            assert args[7] == sliding_window + 1
+            assert "attn_mask" not in kwargs
+            assert args[7] == sliding_window

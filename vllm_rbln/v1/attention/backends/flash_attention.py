@@ -27,6 +27,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 from vllm.v1.attention.backends.utils import (
+    NULL_BLOCK_ID,
     CommonAttentionMetadata,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec, SlidingWindowSpec
@@ -583,12 +584,11 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
 
         # 1. query reshape for custom operation
         num_tokens = query.shape[0]
-        # A KV-shared layer reads its target's cache through an op that also
-        # writes: its zero K/V land one slot past the query, which the target
-        # overwrites before it reads, and the mask keeps them out.
+        # A KV-shared layer reads its target's cache with skip_cache_write: the
+        # zero K/V only carry the shape.
         reads_shared_kv = key is None
         if reads_shared_kv:
-            assert value is None and attn_metadata.attn_masks is not None
+            assert value is None
             key = query.new_zeros(num_tokens, self.num_kv_heads, self.head_size)
             value = query.new_zeros(num_tokens, self.num_kv_heads, self.head_size)
         b_size = attn_metadata.seq_lens.shape[0]
@@ -633,8 +633,6 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         #  block2: 10, block3: 5, ...]
         # attn_output = [batch,H,4,L,D]
         if reads_shared_kv and self.sliding_window is not None:
-            # The write sits one past the query. Include one extra position so
-            # the op's block strip retains the query's oldest visible key.
             assert attn_metadata.swa_appends and not attn_metadata.is_prefill
             attn_output = sliding_window_attention_v1(
                 query,
@@ -644,27 +642,30 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                 attn_metadata.seq_lens,
                 self.scale,
                 attn_metadata.block_tables,
-                self.sliding_window + 1,
+                self.sliding_window,
                 self.sinks,
-                attn_mask=attn_metadata.attn_masks,
+                skip_cache_write=True,
                 is_prompt_sorted=attn_metadata.is_prompt_sorted,
             )
         elif reads_shared_kv:
-            # GQA selects the old masked kernel for a one-column table. The
-            # explicit flash op retains the target's in-memory cache layout.
             assert not attn_metadata.is_prefill
-            attn_output = flash_attention_naive_decode(
+            attn_output = torch.ops.rbln_custom_ops.gqa(
                 query,
                 key,
                 value,
                 kv_cache,
-                attn_metadata.attn_masks,
-                self.scale,
                 attn_metadata.seq_lens,
+                self.scale,
                 attn_metadata.block_tables,
                 self.sinks,
-                use_custom_kernel=self.use_custom_kernel,
+                None,  # attn_mask
+                True,  # is_causal
+                None,  # k_quantize_scale
+                None,  # v_quantize_scale
+                None,  # cache_dtype
+                skip_cache_write=True,
                 is_prompt_sorted=attn_metadata.is_prompt_sorted,
+                null_block_id=NULL_BLOCK_ID,
             )
         elif self.sliding_window is not None:
             if attn_metadata.swa_appends:

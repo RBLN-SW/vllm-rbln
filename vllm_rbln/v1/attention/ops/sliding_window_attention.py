@@ -115,8 +115,25 @@ def sliding_window_attention_v1(
     sinks: torch.Tensor | None = None,
     *,
     attn_mask: torch.Tensor | None = None,
+    skip_cache_write: bool = False,
     is_prompt_sorted: bool = False,
 ) -> torch.Tensor:
+    if skip_cache_write:
+        return torch.ops.rbln_custom_ops.sliding_window_attention_v1(
+            q,
+            k,
+            v,
+            kv_cache,
+            seq_idx,
+            scale,
+            block_tables,
+            window_size,
+            attn_mask is None,  # is_causal
+            attn_mask,
+            sinks,
+            skip_cache_write=True,
+            is_prompt_sorted=is_prompt_sorted,
+        )
     # Without a mask the converter derives the causal window.
     return torch.ops.rbln_custom_ops.sliding_window_attention_v1(
         q,

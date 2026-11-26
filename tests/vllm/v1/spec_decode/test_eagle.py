@@ -1363,7 +1363,7 @@ class TestGemma4Drafting:
     # Window 8 over blocks of 4: not yet full, starting mid-block, starting on
     # a block boundary.
     @pytest.mark.parametrize("position", [3, 10, 11])
-    def test_sliding_mask_keeps_the_oldest_key_at_a_block_boundary(self, position):
+    def test_draft_step_reads_at_the_query_position(self, position):
         from tests.vllm.v1.attention.utils import make_attention_spec, make_builder
         from tests.vllm.vllm_config import make_vllm_config
         from vllm_rbln.v1.spec_decode import gemma4 as gemma4_module
@@ -1400,10 +1400,5 @@ class TestGemma4Drafting:
         metadata, _, _ = proposer._build_draft_step(1, torch.tensor([position]))
         md = metadata["draft.layer"]
         assert md.kv_caches[md.kv_cache_positions["draft.layer"]] is runner.kv_caches[0]
-        assert md.seq_lens.flatten().tolist() == [position + 1]
-        first_key = max(position - 7, 0) // block_size * block_size
-        visible = md.attn_masks.flatten().nonzero().flatten() + first_key
-        assert visible.tolist() == list(range(max(position - 7, 0), position + 1))
-        assert (
-            md.attn_masks.numel() == ((8 + block_size) // block_size + 1) * block_size
-        )
+        assert md.seq_lens.flatten().tolist() == [position]
+        assert md.attn_masks is None
