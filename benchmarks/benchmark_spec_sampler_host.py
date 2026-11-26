@@ -69,7 +69,6 @@ def measure(
     draft = torch.zeros(batch * width, dtype=torch.int32)
     logits = torch.zeros(batch * width, vocab)
     bonus_logits = torch.zeros(batch, vocab)
-    impl.initialize_sampling_inputs(batch, vocab, logits.dtype, logits.device)
     full_cumulative = torch.tensor(full_counts, dtype=torch.int32).cumsum(
         dim=0, dtype=torch.int32
     )
@@ -142,6 +141,13 @@ def main() -> None:
 
     torch.set_num_threads(1)
     impl = RBLNRejectionSamplerImpl(num_spec_tokens=args.spec_tokens)
+    with torch.inference_mode():
+        impl.initialize_sampling_inputs(
+            args.batch_size,
+            args.vocab_size,
+            torch.get_default_dtype(),
+            torch.get_default_device(),
+        )
     cases = [
         ("stable full batch", 0, 0, False),
         ("params change every 16 steps", 16, 0, False),

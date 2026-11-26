@@ -384,15 +384,16 @@ class _RejectionSamplingInputs:
         signature: tuple[int, int, torch.dtype, torch.device],
         max_spec_len: int,
     ) -> None:
-        self.signature = signature
         self._max_spec_len = max_spec_len
-        batch_size, _, dtype, device = signature
+        batch_size, vocab_size, dtype, device = signature
         self._padded_len = batch_size * max_spec_len
 
         # Keep the graph's storage addresses stable across steps.
         self.draft_token_ids = torch.zeros(
             self._padded_len, dtype=torch.int32, device=device
         )
+        device = self.draft_token_ids.device
+        self.signature = (batch_size, vocab_size, dtype, device)
         self.draft_per_batch = torch.full(
             (batch_size, max_spec_len),
             PLACEHOLDER_TOKEN_ID,
@@ -616,14 +617,13 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
 
     def initialize_sampling_inputs(
         self, batch_size: int, vocab_size: int, dtype: torch.dtype, device: torch.device
-    ) -> _RejectionSamplingInputs:
-        if (inputs := self._rejection_sampling_inputs) is None:
-            inputs = self._rejection_sampling_inputs = _RejectionSamplingInputs(
-                (batch_size, vocab_size, dtype, device), self.num_spec_tokens
-            )
-        else:
-            inputs.assert_input_signature(batch_size, vocab_size, dtype, device)
-        return inputs
+    ) -> None:
+        assert self._rejection_sampling_inputs is None, (
+            "Rejection sampling inputs are already initialized."
+        )
+        self._rejection_sampling_inputs = _RejectionSamplingInputs(
+            (batch_size, vocab_size, dtype, device), self.num_spec_tokens
+        )
 
     def invalidate_sampling_inputs(self) -> None:
         if self._rejection_sampling_inputs is not None:

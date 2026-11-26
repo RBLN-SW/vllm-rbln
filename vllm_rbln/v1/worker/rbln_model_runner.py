@@ -2667,7 +2667,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 self.bucketing_manager.max_batch_size,
                 self.model_config.get_vocab_size(),
                 self.model_config.head_dtype,
-                self.input_batch.temperature.device,
+                self.device,
             )
         # TODO(RBLN): load lora
         if self.drafter is not None:
@@ -4162,24 +4162,23 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         num_spec = self.num_spec_tokens
         vocab_size = self.model_config.get_vocab_size()
         head_dtype = self.model_config.head_dtype
-        device = self.input_batch.temperature.device
         # _sample pins the request axis to the per-PP-stage decode bound.
         batch_size = self.bucketing_manager.max_batch_size
         num_tokens = batch_size * num_spec
         num_draft_tokens = [num_spec] * batch_size
-        draft_token_ids = torch.zeros(num_tokens, dtype=torch.int32, device=device)
+        draft_token_ids = torch.zeros(num_tokens, dtype=torch.int32, device=self.device)
         target_logits = torch.zeros(
-            num_tokens, vocab_size, dtype=head_dtype, device=device
+            num_tokens, vocab_size, dtype=head_dtype, device=self.device
         )
         cu_num_draft_tokens = torch.arange(
             num_spec,
             num_tokens + 1,
             num_spec,
             dtype=torch.int32,
-            device=device,
+            device=self.device,
         )
         bonus_logits = torch.zeros(
-            batch_size, vocab_size, dtype=head_dtype, device=device
+            batch_size, vocab_size, dtype=head_dtype, device=self.device
         )
         dummy_sampling_metadata = SamplingMetadata(
             temperature=None,
@@ -4203,7 +4202,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
 
         variants: list[tuple[dict, SamplingMetadata]] = []
         # int32, as the bonus sampler's ops return it.
-        bonus_token_ids = torch.zeros(batch_size, 1, dtype=torch.int32, device=device)
+        bonus_token_ids = torch.zeros(
+            batch_size, 1, dtype=torch.int32, device=self.device
+        )
 
         logger.info("Warm-up: rejection sampler (decode_batch=%d)", batch_size)
         # One graph per top_k/top_p None-pattern (the sampler's WARM_UP_CONFIGS)
@@ -4216,7 +4217,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 all_random=config["all_random"],
                 temperature=None
                 if config["all_greedy"]
-                else torch.ones(batch_size, dtype=torch.float32, device=device),
+                else torch.ones(batch_size, dtype=torch.float32, device=self.device),
                 top_p=_dummy_tensor_view(
                     self.input_batch.top_p, batch_size, config.get("top_p")
                 ),

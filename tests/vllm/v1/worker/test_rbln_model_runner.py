@@ -1007,12 +1007,12 @@ def test_rejection_sampler_warmup_asks_for_the_synthetic_variant():
         model_config=SimpleNamespace(
             get_vocab_size=lambda: 10, head_dtype=torch.bfloat16
         ),
+        device=torch.device("cpu"),
         bucketing_manager=SimpleNamespace(
             decode_batch_buckets=[2, 4], max_batch_size=4
         ),
         max_num_reqs=8,
         input_batch=SimpleNamespace(
-            temperature=torch.ones(8),
             top_p=torch.ones(8),
             top_k=torch.ones(8, dtype=torch.int32),
         ),
@@ -1038,13 +1038,14 @@ def test_load_model_initializes_rejection_buffers(monkeypatch, warmup_enabled):
     monkeypatch.setattr(mr, "build_process_group_dict", lambda: {})
     monkeypatch.setattr(mr, "compile", lambda fn, **kw: fn)
     sampler = Mock(spec=mr.RBLNRejectionSampler)
-    temperature = torch.empty(4)
+    device = torch.device("cpu", 0)
     runner = _make_runner_stub(
         load_config=None,
         vllm_config=None,
         model_config=SimpleNamespace(
             model="m", get_vocab_size=lambda: 10, head_dtype=torch.bfloat16
         ),
+        device=device,
         offload_context=nullcontext,
         _resolve_mm_support=lambda: False,
         drafter=Mock(),
@@ -1055,14 +1056,13 @@ def test_load_model_initializes_rejection_buffers(monkeypatch, warmup_enabled):
         runtime_holder=None,
         rbln_config=RBLNConfig(use_custom_sampler=True),
         bucketing_manager=SimpleNamespace(max_batch_size=4),
-        input_batch=SimpleNamespace(temperature=temperature),
         rejection_sampler=sampler,
     )
 
     runner.load_model()
 
     sampler.initialize_sampling_inputs.assert_called_once_with(
-        4, 10, torch.bfloat16, temperature.device
+        4, 10, torch.bfloat16, device
     )
 
 
@@ -1075,13 +1075,13 @@ def test_rejection_sampler_warmup_uses_per_stage_batch_bound(head_dtype):
         num_spec_tokens=2,
         is_pooling_model=False,
         model_config=SimpleNamespace(get_vocab_size=lambda: 10, head_dtype=head_dtype),
+        device=torch.device("cpu", 0),
         dtype=torch.bfloat16,
         bucketing_manager=SimpleNamespace(
             decode_batch_buckets=[2, 4], max_batch_size=4
         ),
         max_num_reqs=8,
         input_batch=SimpleNamespace(
-            temperature=torch.ones(8),
             top_p=torch.ones(8),
             top_k=torch.ones(8, dtype=torch.int32),
         ),
@@ -1090,7 +1090,7 @@ def test_rejection_sampler_warmup_uses_per_stage_batch_bound(head_dtype):
 
     runner._warmup_sampler_decode_batches()
 
-    device = runner.input_batch.temperature.device
+    device = torch.device("cpu")
     sampler.initialize_sampling_inputs.assert_not_called()
     assert sampler.warm_up.call_args_list[0].args[4].all_random
 

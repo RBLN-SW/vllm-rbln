@@ -757,6 +757,16 @@ def test_sampling_requires_initialized_inputs(impl):
         )
 
 
+@pytest.mark.parametrize("impl", [None], indirect=True)
+def test_sampling_validates_the_allocated_device(impl):
+    requested_device = torch.device("cpu", 0)
+    impl.initialize_sampling_inputs(2, VOCAB_SIZE, torch.float32, requested_device)
+    run_rejection_sample(impl, [3, 5, 2, 4], [3, 5, 2, 4], [1, 1], _random_metadata())
+
+    with pytest.raises(AssertionError, match="already initialized"):
+        impl.initialize_sampling_inputs(2, VOCAB_SIZE, torch.float32, requested_device)
+
+
 def test_a_new_batch_size_is_rejected_without_replacing_buffers(impl, monkeypatch):
     builds, seen = _recording(impl, monkeypatch)
     large_batch = _random_metadata()
