@@ -64,6 +64,12 @@ ENCODER_MODELS = [
     ("sentence-transformers/all-MiniLM-L6-v2", "CLS", DispatchPooler),
     # arch: XLMRobertaModel
     ("intfloat/multilingual-e5-base", "CLS", DispatchPooler),
+    # arch: ModernBertModel
+    ("Alibaba-NLP/gte-modernbert-base", "CLS", DispatchPooler),
+    # arch: RobertaForMaskedLM, which upstream serves as an embedder
+    ("ehsanaghaei/SecureBERT", "CLS", DispatchPooler),
+    # arch: RobertaModel
+    ("princeton-nlp/sup-simcse-roberta-base", "CLS", DispatchPooler),
     # arch: RobertaForSequenceClassification
     ("cross-encoder/stsb-roberta-base", "CLS", RBLNClassifierPooler),
     # arch: XLMRobertaForSequenceClassification
@@ -112,6 +118,12 @@ def test_encoder_pooling(model_id, expected_seq_pool, expected_pooler):
     pooler_config = model.vllm_config.model_config.pooler_config
     assert pooler_config.seq_pooling_type == expected_seq_pool
     assert isinstance(model.pooler, expected_pooler)
+
+
+def test_bert_masked_lm_builds_a_token_classify_pooler():
+    model = _build_encoder("google-bert/bert-base-uncased")
+
+    assert model.pooler.get_supported_tasks() == {"token_classify"}
 
 
 @pytest.mark.parametrize("classification", [False, True])
