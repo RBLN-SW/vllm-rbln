@@ -417,38 +417,24 @@ class TestSamplePadding:
             ),
             max_num_reqs=8,
             rejection_sampler=rejection_sampler,
-            _rejection_logits_dtype=torch.float32,
         )
         return runner, rejection_sampler
 
-    def test_compiled_rejection_sampler_uses_per_stage_batch_bound(self):
+    @pytest.mark.parametrize("logits_dtype", [torch.bfloat16, torch.float32])
+    def test_compiled_rejection_sampler_uses_per_stage_batch_bound(self, logits_dtype):
         output = SamplerOutput(
             sampled_token_ids=torch.zeros((4, 3), dtype=torch.int32),
             logprobs_tensors=None,
         )
         runner, rejection_sampler = self._runner(output, sampler=True)
 
-        runner._sample(torch.zeros((4, 10)), _spec_decode_metadata([1, 1]))
+        logits = torch.zeros((4, 10), dtype=logits_dtype)
+        runner._sample(logits, _spec_decode_metadata([1, 1]))
 
         padded_metadata = rejection_sampler.call_args.args[0]
         assert len(padded_metadata.num_draft_tokens) == 4
 
-    @pytest.mark.parametrize("logits_dtype", [torch.bfloat16, torch.float32])
-    def test_compiled_rejection_sampler_uses_head_dtype(self, logits_dtype):
-        output = SamplerOutput(
-            sampled_token_ids=torch.zeros((4, 3), dtype=torch.int32),
-            logprobs_tensors=None,
-        )
-        runner, rejection_sampler = self._runner(output, sampler=True)
-        logits = torch.ones((4, 10), dtype=logits_dtype)
-
-        runner._sample(logits, _spec_decode_metadata([1, 1]))
-
-        sampler_logits = rejection_sampler.call_args.args[2]
-        assert sampler_logits.dtype == torch.float32
-        assert torch.equal(sampler_logits, logits)
-        if logits_dtype == torch.float32:
-            assert sampler_logits is logits
+        assert rejection_sampler.call_args.args[2] is logits
 
     def test_torch_rejection_sampler_keeps_live_batch_metadata(self):
         output = SamplerOutput(
@@ -1037,7 +1023,6 @@ def test_rejection_sampler_warmup_asks_for_the_synthetic_variant():
         model_config=SimpleNamespace(get_vocab_size=lambda: 10),
         device=torch.device("cpu"),
         dtype=torch.bfloat16,
-        _rejection_logits_dtype=torch.bfloat16,
         bucketing_manager=SimpleNamespace(
             decode_batch_buckets=[2, 4], max_batch_size=4
         ),
@@ -1074,7 +1059,7 @@ def test_load_model_initializes_rejection_buffers_when_warmup_is_disabled(monkey
     runner = _make_runner_stub(
         load_config=None,
         vllm_config=None,
-        model_config=SimpleNamespace(model="m"),
+        model_config=SimpleNamespace(model="m", head_dtype=torch.bfloat16),
         offload_context=nullcontext,
         _resolve_mm_support=lambda: False,
         drafter=Mock(),
@@ -1086,7 +1071,6 @@ def test_load_model_initializes_rejection_buffers_when_warmup_is_disabled(monkey
         bucketing_manager=SimpleNamespace(max_batch_size=4),
         input_batch=SimpleNamespace(temperature=temperature),
         rejection_sampler=SimpleNamespace(impl=impl),
-        _rejection_logits_dtype=torch.bfloat16,
     )
 
     runner.load_model()
@@ -1108,7 +1092,6 @@ def test_rejection_sampler_warmup_uses_per_stage_batch_bound(logits_dtype):
         model_config=SimpleNamespace(get_vocab_size=lambda: 10),
         device=torch.device("cpu"),
         dtype=torch.bfloat16,
-        _rejection_logits_dtype=torch.float32,
         bucketing_manager=SimpleNamespace(
             decode_batch_buckets=[2, 4], max_batch_size=4
         ),
@@ -1127,7 +1110,7 @@ def test_rejection_sampler_warmup_uses_per_stage_batch_bound(logits_dtype):
     runner._warmup_sampler_decode_batches(decode_logits)
 
     impl.initialize_sampling_inputs.assert_called_once_with(
-        4, 10, torch.float32, decode_logits.device
+        4, 10, logits_dtype, decode_logits.device
     )
     assert impl.mock_calls[0][0] == "initialize_sampling_inputs"
     assert rejection_sample.call_args_list[0].args[7].all_random
@@ -1139,11 +1122,11 @@ def test_rejection_sampler_warmup_uses_per_stage_batch_bound(logits_dtype):
     for call in rejection_sample.call_args_list:
         assert len(call.args[1]) == 4
         assert call.args[5].shape == (8, 10)
-        assert call.args[5].dtype == torch.float32
+        assert call.args[5].dtype == logits_dtype
         assert call.args[5].device == decode_logits.device
         if (bonus_logits := call.kwargs["bonus_logits"]) is not None:
             assert bonus_logits.shape == (4, 10)
-            assert bonus_logits.dtype == torch.float32
+            assert bonus_logits.dtype == logits_dtype
             assert bonus_logits.device == decode_logits.device
         metadata = call.args[7]
         filters = [t for t in (metadata.top_k, metadata.top_p) if t is not None]

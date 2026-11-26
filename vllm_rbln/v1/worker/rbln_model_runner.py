@@ -415,8 +415,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 use_rbln_sampler=self.rbln_config.use_custom_sampler,
                 reuse_sampling_inputs=self.rbln_config.use_custom_sampler,
             )
-            if self.rbln_config.use_custom_sampler:
-                self._rejection_logits_dtype = model_config.head_dtype
 
         self.num_spec_tokens = 0
         if self.speculative_config:
@@ -1780,9 +1778,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             )
         else:
             if self.rbln_config.use_custom_sampler:
-                # Keep the sampler's input dtype tied to the configured head.
-                if logits.dtype != self._rejection_logits_dtype:
-                    logits = logits.to(dtype=self._rejection_logits_dtype)
                 bucket = self.bucketing_manager.max_batch_size
                 spec_decode_metadata = _pad_spec_decode_metadata(
                     spec_decode_metadata, bucket
@@ -2675,7 +2670,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             impl.initialize_sampling_inputs(
                 self.bucketing_manager.max_batch_size,
                 self.logits_processor.org_vocab_size,
-                self._rejection_logits_dtype,
+                self.model_config.head_dtype,
                 self.input_batch.temperature.device,
             )
         # TODO(RBLN): load lora
@@ -4172,19 +4167,18 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         """Warm the device rejection-sample op at the decode batch size it will see."""
         num_spec = self.num_spec_tokens
         vocab_size = logits.size(-1)
-        logits_dtype = self._rejection_logits_dtype
         # _sample pins the request axis to the per-PP-stage decode bound.
         batch_size = self.bucketing_manager.max_batch_size
         impl = cast(RBLNRejectionSamplerImpl, self.rejection_sampler.impl)
         impl.initialize_sampling_inputs(
-            batch_size, vocab_size, logits_dtype, logits.device
+            batch_size, vocab_size, logits.dtype, logits.device
         )
         num_tokens = batch_size * num_spec
         num_draft_tokens = [num_spec] * batch_size
         draft_token_ids = torch.zeros(
             num_tokens, dtype=torch.int32, device=logits.device
         )
-        target_logits = logits.new_zeros((num_tokens, vocab_size), dtype=logits_dtype)
+        target_logits = logits.new_zeros((num_tokens, vocab_size))
         cu_num_draft_tokens = torch.arange(
             num_spec,
             num_tokens + 1,
@@ -4192,7 +4186,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             dtype=torch.int32,
             device=logits.device,
         )
-        bonus_logits = logits.new_zeros((batch_size, vocab_size), dtype=logits_dtype)
+        bonus_logits = logits.new_zeros((batch_size, vocab_size))
         dummy_sampling_metadata = SamplingMetadata(
             temperature=None,
             all_greedy=True,
