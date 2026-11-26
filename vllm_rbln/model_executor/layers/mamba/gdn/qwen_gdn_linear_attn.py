@@ -141,9 +141,10 @@ class RBLNQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
     def get_state_shape(self) -> tuple[tuple[int, ...]]:
         # A full-attention KV block's bytes (the flash backend's block without
-        # the custom kernel, which the platform refuses for a GDN model) with
-        # the key heads on its KV head axis: the delta-rule kernels split the
-        # key heads over the chiplets, and a model's KV heads can be fewer.
+        # the custom kernel, which the platform refuses for a GDN model), the
+        # key heads on its KV head axis as the delta-rule kernels split them.
+        # TODO(RBLN): return upstream's (Hv, Dv, Dk) state once the compiler
+        # takes the state view in its own shape and pads the page.
         num_k_heads = self.num_k_heads // self.tp_size
         rows, rest = divmod(
             self.num_kv_heads * self.cache_config.block_size, num_k_heads
