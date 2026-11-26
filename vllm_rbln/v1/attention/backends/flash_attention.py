@@ -641,8 +641,8 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
             assert attn_metadata.swa_appends and not attn_metadata.is_prefill
             attn_output = sliding_window_attention_v1(
                 query,
-                None,  # k
-                None,  # v
+                key,
+                value,
                 kv_cache,
                 attn_metadata.seq_lens,
                 self.scale,
@@ -655,8 +655,8 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
             assert not attn_metadata.is_prefill
             attn_output = torch.ops.rbln_custom_ops.gqa(
                 query,
-                None,  # k
-                None,  # v
+                key,
+                value,
                 kv_cache,
                 attn_metadata.seq_lens,
                 self.scale,
