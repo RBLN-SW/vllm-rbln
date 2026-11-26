@@ -111,7 +111,6 @@ _RBLN_MULTIMODAL_MODELS = {
 }
 
 _RBLN_TEXT_POOLING_MODELS = {
-    # Served as upstream serves it: per-token vocabulary logits, not an embedding.
     "BertForMaskedLM": ("bert_masked_lm", "RBLNBertForMaskedLM"),
     "BertModel": ("bert_model", "RBLNBertModel"),
     "ModernBertModel": ("modernbert", "RBLNModernBertModel"),

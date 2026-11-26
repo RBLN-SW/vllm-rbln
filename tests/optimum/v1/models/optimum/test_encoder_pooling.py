@@ -66,7 +66,7 @@ ENCODER_MODELS = [
     ("intfloat/multilingual-e5-base", "CLS", DispatchPooler),
     # arch: ModernBertModel
     ("Alibaba-NLP/gte-modernbert-base", "CLS", DispatchPooler),
-    # arch: RobertaForMaskedLM, which upstream serves as an embedder
+    # arch: RobertaForMaskedLM
     ("ehsanaghaei/SecureBERT", "CLS", DispatchPooler),
     # arch: RobertaModel
     ("princeton-nlp/sup-simcse-roberta-base", "CLS", DispatchPooler),
