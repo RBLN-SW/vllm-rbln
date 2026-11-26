@@ -29,6 +29,7 @@ from vllm.distributed import (
     ensure_model_parallel_initialized,
     init_distributed_environment,
 )
+from vllm.model_executor.models.qwen3_5 import Qwen3_5ForConditionalGeneration
 from vllm.model_executor.models.qwen3_vl import Qwen3_VisionTransformer
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.encoder_budget import MultiModalBudget
@@ -41,8 +42,55 @@ from vllm_rbln.model_executor.models.qwen3_5 import (
     RBLNQwen3_5MultiModalProcessor,
 )
 from vllm_rbln.utils import BufferedVisionEncoder
+from vllm_rbln.v1.attention.backends.gdn_attn import grouped_qkv_rows
 
 PATCH, MERGE, TEMPORAL = 16, 2, 2
+
+
+def test_load_weights_moves_the_block_scales_with_the_qkv_rows(monkeypatch):
+    # Two key heads of 4 rows, one value head each: [q0 q1 | k0 k1 | v0 v1 | z],
+    # block-FP8 with a scale for every 2 x 4 block, so two scale rows a head.
+    heads_k, ratio, head_dim, hidden, block = 2, 1, 4, 4, 2
+    qkv_rows = (2 * heads_k + heads_k * ratio) * head_dim
+    torch.manual_seed(0)
+    weight = torch.randn(qkv_rows + heads_k * ratio * head_dim, hidden)
+    weight = weight.to(torch.float8_e4m3fn)
+    scale = torch.rand(weight.shape[0] // block, hidden // block) + 0.5
+    conv = torch.randn(qkv_rows, 1, 4)
+    attn = SimpleNamespace(
+        num_k_heads=heads_k,
+        num_v_heads=heads_k * ratio,
+        tp_size=1,
+        head_k_dim=head_dim,
+        in_proj_qkvz=SimpleNamespace(
+            weight=weight.clone(),
+            weight_scale_inv=scale.clone(),
+            weight_block_size=[block, block],
+        ),
+        conv1d=SimpleNamespace(weight=conv.clone()),
+    )
+    model = object.__new__(RBLNQwen3_5ForConditionalGeneration)
+    model.language_model = SimpleNamespace(
+        model=SimpleNamespace(
+            layers=[SimpleNamespace(linear_attn=attn), SimpleNamespace()]
+        )
+    )
+    monkeypatch.setattr(
+        Qwen3_5ForConditionalGeneration, "load_weights", lambda self, weights: set()
+    )
+    model.load_weights([])
+
+    def dequantize(w, s):
+        n, k = w.shape
+        blocks = w.float().view(n // block, block, k // block, block)
+        return (blocks * s[:, None, :, None]).reshape(n, k)
+
+    rows = grouped_qkv_rows(heads_k, ratio, head_dim)
+    expected = dequantize(weight, scale)
+    expected[:qkv_rows] = expected[rows]
+    proj = attn.in_proj_qkvz
+    torch.testing.assert_close(dequantize(proj.weight, proj.weight_scale_inv), expected)
+    torch.testing.assert_close(attn.conv1d.weight[:qkv_rows], conv[rows])
 
 
 @pytest.fixture
