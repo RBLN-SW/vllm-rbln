@@ -546,3 +546,102 @@ class TestRBLNMambaManager:
             request.block_hashes, num_external
         )
         assert hit_length == (boundary if cached else 0)
+
+
+class TestRBLNRingSlidingWindowManager:
+    def _manager(self, num_blocks=6, sliding_window=16):
+        from vllm.v1.core.single_type_kv_cache_manager import (
+            register_all_kvcache_specs,
+        )
+
+        from vllm_rbln.platform import RblnPlatform
+        from vllm_rbln.v1.kv_cache import RBLNRingSlidingWindowSpec
+
+        register_all_kvcache_specs(None)
+        RblnPlatform.register_custom_kv_cache_specs(None)
+        spec = RBLNRingSlidingWindowSpec(
+            block_size=16,
+            num_kv_heads=2,
+            head_size=8,
+            dtype=torch.float16,
+            sliding_window=sliding_window,
+        )
+        pool = BlockPool(
+            num_gpu_blocks=num_blocks, enable_caching=True, hash_block_size=16
+        )
+        return KVCacheSpecRegistry.get_manager_class(spec)(
+            spec,
+            block_pool=pool,
+            enable_caching=True,
+            kv_cache_group_id=0,
+            scheduler_block_size=16,
+        )
+
+    def _step(self, m, num_computed, num_new, num_prompt=20, resumable=False):
+        # allocate_slots' order: free what left the window, count, allocate, cache.
+        from tests.vllm.v1.core.utils import make_request
+
+        m.remove_skipped_blocks("r", num_computed)
+        n = num_computed + num_new
+        m.get_num_blocks_to_allocate("r", n, [], num_computed, num_computed, n)
+        m.allocate_new_blocks("r", n, n)
+        request = make_request("r", list(range(max(n, num_prompt))), 16)
+        request.num_prompt_tokens = num_prompt
+        request.resumable = resumable
+        m.cache_blocks(request, n, replay_boundaries=[])
+        copies, m.pending_copies = m.pending_copies, []
+        return copies
+
+    def test_a_step_entering_a_block_copies_the_rows_it_has_yet_to_write(self):
+        m = self._manager()
+        # A prefill chunk that stays in the first block has nothing to copy.
+        assert self._step(m, 0, 16) == []
+        first = m.req_to_blocks["r"][0]
+        # The last chunk enters the second block at its row 0, the first decode
+        # step stays in it, and a later one enters the third.
+        assert self._step(m, 16, 4) == [
+            (first.block_id, m.req_to_blocks["r"][1].block_id, 0)
+        ]
+        assert first.ref_cnt == 2
+        assert self._step(m, 20, 1) == []
+        for pos in range(21, 32):
+            self._step(m, pos, 1)
+        second = m.req_to_blocks["r"][1]
+        assert self._step(m, 32, 1) == [
+            (second.block_id, m.req_to_blocks["r"][2].block_id, 0)
+        ]
+
+    def test_a_first_step_at_the_start_of_a_block_copies_too(self):
+        # A resumed request: cache hits up to a block boundary, then one token,
+        # before the manager has cached anything for it.
+        m = self._manager()
+        m.get_num_blocks_to_allocate("r", 33, [], 32, 32, 33)
+        m.allocate_new_blocks("r", 33, 33)
+        blocks = m.req_to_blocks["r"]
+        assert m.pending_copies == [(blocks[1].block_id, blocks[2].block_id, 0)]
+
+    def test_the_blocks_before_the_window_are_freed_once_the_request_decodes(self):
+        m = self._manager()
+        self._step(m, 0, 16, num_prompt=24)
+        first = m.req_to_blocks["r"][0]
+        # Prefill enters the second block and goes on reading the first.
+        self._step(m, 16, 4, num_prompt=24)
+        m.block_pool.free_blocks([first])  # the copy's ref
+        self._step(m, 20, 4, num_prompt=24)
+        assert m.req_to_blocks["r"][0] is first
+        self._step(m, 24, 1, num_prompt=24)
+        assert m.req_to_blocks["r"][0].is_null
+        assert first.ref_cnt == 0
+
+    def test_a_streaming_session_keeps_the_blocks_it_prefills_over_again(self):
+        m = self._manager()
+        self._step(m, 0, 16, resumable=True)
+        first = m.req_to_blocks["r"][0]
+        for pos, num_new in ((16, 4), (20, 1), (21, 1)):
+            self._step(m, pos, num_new, resumable=True)
+        assert m.req_to_blocks["r"][0] is first
+
+    @pytest.mark.parametrize("sliding_window", [8, 17])
+    def test_a_window_not_as_wide_as_the_block_is_refused(self, sliding_window):
+        with pytest.raises(NotImplementedError, match="use_swa_ring"):
+            self._manager(sliding_window=sliding_window)
