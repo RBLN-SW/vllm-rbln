@@ -637,6 +637,9 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         # ex) tensor[block0 : 0, block1 : 100,
         #  block2: 10, block3: 5, ...]
         # attn_output = [batch,H,4,L,D]
+        # TODO(post-GA): the torch custom ops narrow to mla, gqa, swa_v1 and
+        # swa_v0. The full-layer path then calls gqa too and this branch folds
+        # into it; until then only gqa takes None k / v for a full layer.
         if reads_shared_kv and self.sliding_window is None:
             assert not attn_metadata.is_prefill
             attn_output = torch.ops.rbln_custom_ops.gqa(
