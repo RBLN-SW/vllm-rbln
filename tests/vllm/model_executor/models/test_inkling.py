@@ -99,3 +99,47 @@ def test_speculative_decoding_is_refused():
         pytest.raises(NotImplementedError, match="speculative decoding"),
     ):
         RBLNInklingForCausalLM(vllm_config=vllm_config)
+
+
+def _attention_layers(monkeypatch):
+    import vllm.distributed.parallel_state as parallel_state
+    from vllm.config import set_current_vllm_config
+
+    from tests.vllm.vllm_config import make_vllm_config
+
+    config = make_vllm_config(block_size=128)
+    text = SimpleNamespace(
+        hidden_size=128,
+        rms_norm_eps=1e-6,
+        sconv_kernel_size=4,
+        d_rel=16,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=64,
+        swa_num_attention_heads=4,
+        swa_num_key_value_heads=2,
+        swa_head_dim=64,
+        sliding_window_size=64,
+        rel_extent=128,
+        log_scaling_n_floor=128,
+        log_scaling_alpha=0.1,
+    )
+    monkeypatch.setattr(
+        parallel_state, "_TP", SimpleNamespace(world_size=1, rank_in_group=0)
+    )
+    with set_current_vllm_config(config):
+        for i, is_local in enumerate((True, False)):
+            inkling.RBLNInklingAttention(text, is_local, None, f"model.layers.{i}.attn")
+    return config
+
+
+def test_local_layers_keep_only_their_window(monkeypatch):
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+
+    config = _attention_layers(monkeypatch)
+    context = config.compilation_config.static_forward_context
+    local = context["model.layers.0.attn"].get_kv_cache_spec(config)
+    full = context["model.layers.1.attn"].get_kv_cache_spec(config)
+    assert type(local) is SlidingWindowSpec
+    assert local.sliding_window == 64
+    assert type(full) is FullAttentionSpec

@@ -52,7 +52,11 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheSpec,
+    SlidingWindowSpec,
+)
 
 from vllm_rbln.v1.attention.backends.inkling import (
     RBLNInklingAttentionBackend,
@@ -81,14 +85,30 @@ class _RBLNInklingCache(nn.Module, AttentionLayerBase):
 
 
 class RBLNInklingKVCache(_RBLNInklingCache):
-    def __init__(self, prefix: str, num_kv_heads: int, head_size: int) -> None:
+    def __init__(
+        self,
+        prefix: str,
+        num_kv_heads: int,
+        head_size: int,
+        sliding_window: int | None,
+    ) -> None:
         super().__init__(prefix)
         self.num_kv_heads = num_kv_heads
         self.head_size = head_size
+        self.sliding_window = sliding_window
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        block_size = vllm_config.cache_config.block_size
+        if self.sliding_window is not None:
+            return SlidingWindowSpec(
+                block_size=block_size,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                dtype=torch.bfloat16,
+                sliding_window=self.sliding_window,
+            )
         return FullAttentionSpec(
-            block_size=vllm_config.cache_config.block_size,
+            block_size=block_size,
             num_kv_heads=self.num_kv_heads,
             head_size=self.head_size,
             dtype=torch.bfloat16,
@@ -210,7 +230,12 @@ class RBLNInklingAttention(nn.Module):
         # Reversed along the distance at load time, the order rel_bias takes.
         self.rel_proj = nn.Parameter(torch.empty(config.d_rel, self.extent))
 
-        self.kv_cache = RBLNInklingKVCache(prefix, self.num_kv_heads, head_dim)
+        self.kv_cache = RBLNInklingKVCache(
+            prefix,
+            self.num_kv_heads,
+            head_dim,
+            sliding_window=self.extent if is_local else None,
+        )
         self.kv_ring = RBLNInklingConvRing(
             f"{prefix}.kv_ring", prefix, 2, kv_size, kernel_size
         )
