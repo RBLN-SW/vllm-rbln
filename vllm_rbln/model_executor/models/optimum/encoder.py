@@ -19,7 +19,10 @@ from vllm.config import ModelConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.pooler import DispatchPooler, Pooler
 from vllm.model_executor.layers.pooler.activations import resolve_classifier_act_fn
-from vllm.model_executor.layers.pooler.tokwise import pooler_for_token_embed
+from vllm.model_executor.layers.pooler.tokwise import (
+    pooler_for_token_classify,
+    pooler_for_token_embed,
+)
 from vllm.model_executor.models import VllmModelForPooling
 from vllm.tasks import PoolingTask
 from vllm.v1.outputs import PoolerOutput
@@ -90,6 +93,10 @@ class RBLNOptimumForEncoderModel(RBLNOptimumModelBase, VllmModelForPooling):
         # activation (RBLNClassifierPooler); others use the embed/token_embed pooler.
         if self.is_classification_arch():
             self.pooler = RBLNClassifierPooler(vllm_config.model_config)
+        elif self.model_config.hf_config.architectures[0] == "BertForMaskedLM":
+            # The compiled graph ends in the MLM head, so its output is already
+            # the per-token vocabulary logits upstream's BertForMaskedLM pools.
+            self.pooler = pooler_for_token_classify(pooler_config)
         else:
             self.pooler = DispatchPooler(
                 {
