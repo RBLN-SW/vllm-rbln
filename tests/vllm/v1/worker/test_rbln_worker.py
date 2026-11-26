@@ -859,6 +859,23 @@ class TestDetermineAvailableMemory:
                 hf_config=hf,
             )
 
+    def test_compressed_tensors_nvfp4_with_fp8_as_modelopt_mixed(
+        self, make_worker, monkeypatch
+    ):
+        # skt/A.X-K2-NVFP4: NVFP4 experts next to block-fp8 linears.
+        hf = SimpleNamespace(
+            quantization_config={
+                "config_groups": {
+                    "a": {"weights": {"num_bits": 4, "type": "float"}},
+                    "b": {"weights": {"num_bits": 8, "type": "float"}},
+                }
+            }
+        )
+        cap = self._capture(
+            make_worker, monkeypatch, quantization="compressed-tensors", hf_config=hf
+        )
+        assert cap["n_model_bytes"] == 250  # 4-bit, packed 2
+
     def test_draft_model_adds_kernel_size(self, make_worker, monkeypatch):
         drafter = SimpleNamespace(
             model=SimpleNamespace(

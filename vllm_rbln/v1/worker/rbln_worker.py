@@ -279,13 +279,20 @@ class RBLNWorker(WorkerBase):
                     num_bits = 8
                 elif len(num_bits_set) == 1:
                     (num_bits,) = num_bits_set
+                elif num_bits_set == {4, 8} and all(
+                    g.get("weights", {}).get("type") == "float" for g in groups.values()
+                ):
+                    # NVFP4 experts next to fp8 linears: modelopt_mixed's layout.
+                    num_bits = None
                 else:
                     raise RuntimeError(
                         f"compressed-tensors config has mixed bit-widths "
                         f"{num_bits_set}; not supported."
                     )
 
-                if num_bits == 8:
+                if num_bits is None:
+                    quantization = "modelopt_mixed"
+                elif num_bits == 8:
                     quantization = "fp8"
                 elif num_bits == 4:
                     quantization = "int4"
