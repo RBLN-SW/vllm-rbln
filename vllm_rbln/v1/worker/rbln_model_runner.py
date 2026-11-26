@@ -166,10 +166,7 @@ from vllm_rbln.v1.core.utils import (
 )
 from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
 from vllm_rbln.v1.sample.rbln_logits_processor import build_rbln_logitsprocs
-from vllm_rbln.v1.sample.rbln_rejection_sampler import (
-    RBLNRejectionSampler,
-    RBLNRejectionSamplerImpl,
-)
+from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
 from vllm_rbln.v1.sample.rbln_sampler import WARM_UP_CONFIGS, RBLNSampler
 from vllm_rbln.v1.spec_decode import DRAFT_MODEL_PROPOSERS
 from vllm_rbln.v1.spec_decode.dflash import RBLNDFlashProposer
@@ -2666,8 +2663,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             and not self.is_strict_kv_producer
             and self.logits_processor is not None
         ):
-            impl = cast(RBLNRejectionSamplerImpl, self.rejection_sampler.impl)
-            impl.initialize_sampling_inputs(
+            self.rejection_sampler.initialize_sampling_inputs(
                 self.bucketing_manager.max_batch_size,
                 self.logits_processor.org_vocab_size,
                 self.model_config.head_dtype,
@@ -4170,8 +4166,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         device = self.input_batch.temperature.device
         # _sample pins the request axis to the per-PP-stage decode bound.
         batch_size = self.bucketing_manager.max_batch_size
-        impl = cast(RBLNRejectionSamplerImpl, self.rejection_sampler.impl)
-        impl.initialize_sampling_inputs(batch_size, vocab_size, dtype, device)
+        self.rejection_sampler.initialize_sampling_inputs(
+            batch_size, vocab_size, dtype, device
+        )
         num_tokens = batch_size * num_spec
         num_draft_tokens = [num_spec] * batch_size
         draft_token_ids = torch.zeros(num_tokens, dtype=torch.int32, device=device)
@@ -4247,22 +4244,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 )
         # Random bonus sampling needs the largest workspace. Warm it first for reuse.
         variants.sort(key=lambda variant: variant[1].all_greedy)
-        # Synthetic mode feeds one more input, i.e. a distinct compiled variant.
         for bonus_kwargs, sampling_metadata in variants:
-            impl.rejection_sample(
+            self.rejection_sampler.warm_up(
                 draft_token_ids,
                 num_draft_tokens,
-                num_spec,
                 cu_num_draft_tokens,
-                None,
                 target_logits,
-                bonus_kwargs.get("bonus_token_ids"),
                 sampling_metadata,
-                synthetic_mode=self.rejection_sampler.synthetic_mode,
-                synthetic_conditional_rates=(
-                    self.rejection_sampler.synthetic_conditional_rates
-                ),
-                bonus_logits=bonus_kwargs.get("bonus_logits"),
+                **bonus_kwargs,
             )
 
     def decode_graph_shapes(self) -> list[tuple[int, int, int | None]]:

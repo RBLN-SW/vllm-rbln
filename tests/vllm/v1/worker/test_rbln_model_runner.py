@@ -985,8 +985,16 @@ def test_rejection_sampler_warmup_asks_for_the_synthetic_variant():
     """Synthetic mode feeds the graph one more input and dynamo specializes on
     it, so a warm-up forced to `synthetic_mode=False` would compile a variant the
     real steps never ask for -- and the first of them would recompile."""
-    impl = Mock()
+    from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSamplerImpl
+
+    impl = Mock(spec=RBLNRejectionSamplerImpl, num_spec_tokens=2)
     rates = torch.tensor([0.9, 0.8])
+    sampler = mr.RBLNRejectionSampler(
+        Mock(logprobs_mode="raw_logprobs"), use_rbln_sampler=False
+    )
+    sampler.impl = impl
+    sampler.synthetic_mode = True
+    sampler.synthetic_conditional_rates = rates
     runner = _make_runner_stub(
         rbln_config=RBLNConfig(use_custom_sampler=True),
         speculative_config=object(),
@@ -1003,15 +1011,12 @@ def test_rejection_sampler_warmup_asks_for_the_synthetic_variant():
             top_p=torch.ones(8),
             top_k=torch.ones(8, dtype=torch.int32),
         ),
-        rejection_sampler=SimpleNamespace(
-            impl=impl,
-            synthetic_mode=True,
-            synthetic_conditional_rates=rates,
-        ),
+        rejection_sampler=sampler,
     )
 
     runner._warmup_sampler_decode_batches()
 
+    impl.initialize_sampling_inputs.assert_called_once()
     assert impl.rejection_sample.call_args_list
     for call in impl.rejection_sample.call_args_list:
         assert call.kwargs["synthetic_mode"] is True
@@ -1027,7 +1032,7 @@ def test_load_model_initializes_rejection_buffers_when_warmup_is_disabled(monkey
     monkeypatch.setattr(mr, "get_model_loader", lambda _: loader)
     monkeypatch.setattr(mr, "build_process_group_dict", lambda: {})
     monkeypatch.setattr(mr, "compile", lambda fn, **kw: fn)
-    impl = Mock()
+    sampler = Mock(spec=mr.RBLNRejectionSampler)
     temperature = torch.empty(4)
     runner = _make_runner_stub(
         load_config=None,
@@ -1043,20 +1048,19 @@ def test_load_model_initializes_rejection_buffers_when_warmup_is_disabled(monkey
         rbln_config=RBLNConfig(use_custom_sampler=True),
         bucketing_manager=SimpleNamespace(max_batch_size=4),
         input_batch=SimpleNamespace(temperature=temperature),
-        rejection_sampler=SimpleNamespace(impl=impl),
+        rejection_sampler=sampler,
     )
 
     runner.load_model()
 
-    impl.initialize_sampling_inputs.assert_called_once_with(
+    sampler.initialize_sampling_inputs.assert_called_once_with(
         4, 10, torch.bfloat16, temperature.device
     )
 
 
 @pytest.mark.parametrize("head_dtype", [torch.bfloat16, torch.float32])
 def test_rejection_sampler_warmup_uses_per_stage_batch_bound(head_dtype):
-    impl = Mock()
-    rejection_sample = impl.rejection_sample
+    sampler = Mock(spec=mr.RBLNRejectionSampler)
     runner = _make_runner_stub(
         rbln_config=RBLNConfig(use_custom_sampler=True),
         speculative_config=object(),
@@ -1073,39 +1077,37 @@ def test_rejection_sampler_warmup_uses_per_stage_batch_bound(head_dtype):
             top_p=torch.ones(8),
             top_k=torch.ones(8, dtype=torch.int32),
         ),
-        rejection_sampler=SimpleNamespace(
-            impl=impl,
-            synthetic_mode=False,
-            synthetic_conditional_rates=None,
-        ),
+        rejection_sampler=sampler,
     )
 
     runner._warmup_sampler_decode_batches()
 
     device = runner.input_batch.temperature.device
-    impl.initialize_sampling_inputs.assert_called_once_with(4, 10, head_dtype, device)
-    assert impl.mock_calls[0][0] == "initialize_sampling_inputs"
-    assert rejection_sample.call_args_list[0].args[7].all_random
+    sampler.initialize_sampling_inputs.assert_called_once_with(
+        4, 10, head_dtype, device
+    )
+    assert sampler.mock_calls[0][0] == "initialize_sampling_inputs"
+    assert sampler.warm_up.call_args_list[0].args[4].all_random
 
     # One call per graph, all at the batch bound; a filtered random pattern
     # twice, once with buffer views and once with torch.cat metadata.
     buffers = {runner.input_batch.top_k.data_ptr(), runner.input_batch.top_p.data_ptr()}
     variants = []
-    for call in rejection_sample.call_args_list:
+    for call in sampler.warm_up.call_args_list:
         assert len(call.args[1]) == 4
-        assert call.args[5].shape == (8, 10)
-        assert call.args[5].dtype == head_dtype
-        assert call.args[5].device == device
-        if (bonus_logits := call.kwargs["bonus_logits"]) is not None:
+        assert call.args[3].shape == (8, 10)
+        assert call.args[3].dtype == head_dtype
+        assert call.args[3].device == device
+        if (bonus_logits := call.kwargs.get("bonus_logits")) is not None:
             assert bonus_logits.shape == (4, 10)
             assert bonus_logits.dtype == head_dtype
             assert bonus_logits.device == device
-        metadata = call.args[7]
+        metadata = call.args[4]
         filters = [t for t in (metadata.top_k, metadata.top_p) if t is not None]
         variants.append(
             (
-                call.args[6] is None,
-                call.kwargs["bonus_logits"] is None,
+                call.kwargs.get("bonus_token_ids") is None,
+                bonus_logits is None,
                 metadata.all_greedy,
                 metadata.top_k is None,
                 metadata.top_p is None,

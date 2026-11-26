@@ -87,6 +87,41 @@ class RBLNRejectionSampler(RejectionSampler):
             else TorchRejectionSamplerImpl()
         )
 
+    def initialize_sampling_inputs(
+        self, batch_size: int, vocab_size: int, dtype: torch.dtype, device: torch.device
+    ) -> None:
+        """Prepare buffers for the fixed input shape of the compiled sampler."""
+        if isinstance(impl := self.impl, RBLNRejectionSamplerImpl):
+            impl.initialize_sampling_inputs(batch_size, vocab_size, dtype, device)
+
+    def warm_up(
+        self,
+        draft_token_ids: torch.Tensor,
+        num_draft_tokens: list[int],
+        cu_num_draft_tokens: torch.Tensor,
+        target_logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+        *,
+        bonus_token_ids: torch.Tensor | None = None,
+        bonus_logits: torch.Tensor | None = None,
+    ) -> None:
+        """Compile one rejection graph variant using the prepared buffers."""
+        if isinstance(impl := self.impl, RBLNRejectionSamplerImpl):
+            # Synthetic mode compiles a graph with an extra input.
+            impl.rejection_sample(
+                draft_token_ids,
+                num_draft_tokens,
+                impl.num_spec_tokens,
+                cu_num_draft_tokens,
+                None,
+                target_logits,
+                bonus_token_ids,
+                sampling_metadata,
+                synthetic_mode=self.synthetic_mode,
+                synthetic_conditional_rates=self.synthetic_conditional_rates,
+                bonus_logits=bonus_logits,
+            )
+
     def invalidate_sampling_inputs(self) -> None:
         if isinstance(self.impl, RBLNRejectionSamplerImpl):
             self.impl.invalidate_sampling_inputs()
