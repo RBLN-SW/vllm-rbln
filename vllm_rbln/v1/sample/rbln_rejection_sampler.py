@@ -85,12 +85,9 @@ class RBLNRejectionSampler(RejectionSampler):
             if use_rbln_sampler
             else TorchRejectionSamplerImpl()
         )
-        # No graph is warmed up for a plan with synthetic acceptance.
         self.penalty_state = (
             sampler._penalty_state
-            if use_rbln_sampler
-            and isinstance(sampler, RBLNSampler)
-            and not self.synthetic_mode
+            if use_rbln_sampler and isinstance(sampler, RBLNSampler)
             else None
         )
 

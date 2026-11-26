@@ -42,8 +42,8 @@ budget. A step also keeps the existing path when the sampler returns processed
 logprobs, or when the vocab size is not a multiple of 128.
 
 Under [speculative decoding](#speculative-decoding) the penalties run in the
-rejection-sample graph, unless the step returns logprobs or uses synthetic
-acceptance. Upstream vLLM rejects logit bias and min_p there.
+rejection-sample graph, unless the step returns logprobs. Upstream vLLM rejects
+logit bias and min_p there.
 
 min_p also runs in a graph with this option on. A step with min_p applies the
 penalties in a graph of their own first, since min_p reads the penalized

@@ -527,7 +527,18 @@ def test_random_step_draws_the_bonus_token_in_the_graph(impl):
 
 
 @pytest.mark.use_device
-def test_fused_penalties_follow_the_drafts():
+@pytest.mark.parametrize(
+    "method",
+    [
+        {"rejection_sample_method": "standard"},
+        {
+            "rejection_sample_method": "synthetic",
+            "synthetic_acceptance_rates": [1.0] * NUM_SPEC_TOKENS,
+        },
+    ],
+    ids=["standard", "synthetic"],
+)
+def test_fused_penalties_follow_the_drafts(method):
     """The graph penalizes each row for the drafts it follows."""
     device = current_platform.device_type
     params = [
@@ -555,9 +566,7 @@ def test_fused_penalties_follow_the_drafts():
 
     sampler = RBLNRejectionSampler(
         RBLNSampler(fused_sampling=True),
-        spec_config=SimpleNamespace(
-            num_speculative_tokens=NUM_SPEC_TOKENS, rejection_sample_method="standard"
-        ),
+        spec_config=SimpleNamespace(num_speculative_tokens=NUM_SPEC_TOKENS, **method),
         use_rbln_sampler=True,
     )
     graph = Mock(wraps=sampler.impl._compiled_rejection_sample)
