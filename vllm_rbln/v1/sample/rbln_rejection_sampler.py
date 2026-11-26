@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import torch
@@ -335,6 +335,217 @@ class TorchRejectionSamplerImpl(RejectionSamplerImpl):
         return topk_topp_sampler.apply_top_k_top_p(logits, top_k, top_p)
 
 
+@dataclass(slots=True, eq=False)
+class _SamplingParameterTensors:
+    top_k: torch.Tensor | None
+    top_p: torch.Tensor | None
+    draft_temperature: torch.Tensor
+    bonus_temperature: torch.Tensor | None
+
+
+class _RejectionSamplingInputs:
+    def __init__(
+        self,
+        signature: tuple[int, int, torch.dtype, torch.device],
+        max_spec_len: int,
+    ) -> None:
+        self.signature = signature
+        self._max_spec_len = max_spec_len
+        batch_size, _, dtype, device = signature
+        self._padded_len = batch_size * max_spec_len
+
+        # Keep the graph's storage addresses stable across steps.
+        self.draft_token_ids = torch.zeros(
+            self._padded_len, dtype=torch.int32, device=device
+        )
+        self.draft_per_batch = torch.full(
+            (batch_size, max_spec_len),
+            PLACEHOLDER_TOKEN_ID,
+            dtype=torch.int32,
+            device=device,
+        )
+        self.cu_num_draft_tokens = torch.zeros(
+            batch_size, dtype=torch.int32, device=device
+        )
+        self._host_counts = torch.empty(batch_size, dtype=torch.int32, device="cpu")
+        self.counts = (
+            self._host_counts
+            if device.type == "cpu"
+            else torch.empty_like(self._host_counts, device=device)
+        )
+        self._temperature = torch.ones(self._padded_len, dtype=dtype, device=device)
+        self._unit_temperature = torch.ones(
+            self._padded_len, dtype=dtype, device=device
+        )
+        self._bonus_temperature = torch.ones(batch_size, dtype=dtype, device=device)
+        self._top_k = torch.zeros(batch_size, dtype=torch.int32, device=device)
+        self._top_p = torch.ones(batch_size, dtype=torch.float32, device=device)
+        self._greedy_sampling_args = _SamplingParameterTensors(
+            top_k=torch.full(
+                (batch_size,), GREEDY_TOP_K, dtype=torch.int32, device=device
+            ),
+            top_p=None,
+            draft_temperature=self._unit_temperature,
+            bonus_temperature=None,
+        )
+        self._synthetic_num_accepted = torch.zeros(
+            batch_size, dtype=torch.int32, device=device
+        )
+        self._padded_target_logits: torch.Tensor | None = None
+        self._host_cumulative: torch.Tensor | None = None
+        self._prepared_sampling_args: tuple[bool, _SamplingParameterTensors] | None = (
+            None
+        )
+        self._prev_step_had_full_drafts = False
+
+    def assert_input_signature(
+        self, batch_size: int, vocab_size: int, dtype: torch.dtype, device: torch.device
+    ) -> None:
+        signature = (batch_size, vocab_size, dtype, device)
+        assert signature == self.signature, (
+            "Rejection sampler input signature changed for an existing instance "
+            f"(batch_size, vocab_size, dtype, device): expected "
+            f"{self.signature}, got {signature}."
+        )
+
+    def invalidate_sampling_args(self) -> None:
+        self._prepared_sampling_args = None
+
+    def prepare_drafts(
+        self,
+        draft_token_ids: torch.Tensor,
+        num_draft_tokens: list[int],
+        target_logits: torch.Tensor,
+        full_drafts: bool,
+    ) -> torch.Tensor:
+        batch_size, vocab_size, dtype, device = self.signature
+        if full_drafts:
+            # A copy, not a view: two graph inputs must not alias one buffer.
+            self.draft_token_ids.copy_(draft_token_ids)
+            self.draft_per_batch.copy_(
+                draft_token_ids.view(batch_size, self._max_spec_len)
+            )
+            return target_logits
+
+        if (padded_logits := self._padded_target_logits) is None:
+            padded_logits = self._padded_target_logits = torch.zeros(
+                self._padded_len, vocab_size, dtype=dtype, device=device
+            )
+        # The op clips acceptance to the real draft count in the packed input.
+        num_tokens = draft_token_ids.shape[0]
+        self.draft_token_ids[:num_tokens] = draft_token_ids
+        padded_logits[:num_tokens] = target_logits
+
+        self.draft_per_batch.fill_(PLACEHOLDER_TOKEN_ID)
+        src_offset = 0
+        for i, n in enumerate(num_draft_tokens):
+            if n == 0:
+                continue
+            self.draft_per_batch[i, :n] = draft_token_ids[src_offset : src_offset + n]
+            src_offset += n
+        return padded_logits
+
+    def prepare_sampling_args(
+        self,
+        metadata: SamplingMetadata,
+        cu_num_draft_tokens: torch.Tensor,
+        num_tokens: int,
+        full_drafts: bool,
+        bonus_in_graph: bool,
+        reuse_sampling_inputs: bool,
+    ) -> _SamplingParameterTensors:
+        if metadata.all_greedy:
+            return self._greedy_sampling_args
+
+        # With partial drafts, the temperature layout depends on draft counts.
+        can_reuse = reuse_sampling_inputs and full_drafts
+        prepared = self._prepared_sampling_args if can_reuse else None
+        if prepared is not None and prepared[0] == bonus_in_graph:
+            return prepared[1]
+
+        self.invalidate_sampling_args()
+        batch_size, vocab_size, _, device = self.signature
+        top_k, top_p = build_op_top_k_top_p(metadata, batch_size, vocab_size, device)
+        if top_k is not None:
+            top_k = self._top_k.copy_(top_k)
+        if top_p is not None:
+            top_p = self._top_p.copy_(top_p)
+
+        # Padding and greedy rows divide by 1.0 inside the graph.
+        draft_temperature = self._unit_temperature
+        bonus_temperature = None
+        temperature = metadata.temperature
+        if temperature is not None:
+            draft_temperature = self._temperature
+            if not metadata.all_random:
+                temperature = torch.where(
+                    temperature == GREEDY_TEMPERATURE,
+                    temperature.new_ones(()),
+                    temperature,
+                )
+            if bonus_in_graph:
+                bonus_temperature = self._bonus_temperature.copy_(temperature)
+            if full_drafts:
+                # The graph input must be a directly allocated tensor.
+                draft_temperature.view(batch_size, self._max_spec_len).copy_(
+                    temperature.unsqueeze(1)
+                )
+            else:
+                draft_temperature.fill_(1)
+                draft_temperature[:num_tokens] = expand_batch_to_tokens(
+                    temperature, cu_num_draft_tokens, num_tokens
+                )
+
+        sampling_param_tensors = _SamplingParameterTensors(
+            top_k=top_k,
+            top_p=top_p,
+            draft_temperature=draft_temperature,
+            bonus_temperature=bonus_temperature,
+        )
+        if can_reuse:
+            self._prepared_sampling_args = (bonus_in_graph, sampling_param_tensors)
+        return sampling_param_tensors
+
+    def prepare_draft_counts(
+        self,
+        cumulative: torch.Tensor,
+        full_drafts: bool,
+        synthetic_mode: bool,
+        synthetic_conditional_rates: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        # A full step has K drafts per request regardless of its sampling settings.
+        if not (full_drafts and self._prev_step_had_full_drafts):
+            self._prev_step_had_full_drafts = False
+            self.cu_num_draft_tokens.copy_(cumulative)
+            if full_drafts:
+                self._host_counts.fill_(self._max_spec_len)
+            else:
+                # Keep the prefix sum differences on the host for the synthetic draw.
+                if cumulative.device.type != "cpu":
+                    if (host_cumulative := self._host_cumulative) is None:
+                        host_cumulative = self._host_cumulative = torch.empty_like(
+                            self._host_counts
+                        )
+                    cumulative = host_cumulative.copy_(cumulative)
+                self._host_counts[:1].copy_(cumulative[:1])
+                torch.sub(cumulative[1:], cumulative[:-1], out=self._host_counts[1:])
+            if self.counts is not self._host_counts:
+                self.counts.copy_(self._host_counts)
+            self._prev_step_had_full_drafts = full_drafts
+
+        if not synthetic_mode:
+            return None
+        assert synthetic_conditional_rates is not None
+        # `cumprod` stops the count at the first rejection.
+        batch_size = self.signature[0]
+        width = synthetic_conditional_rates.shape[0]
+        accepted = torch.rand(batch_size, width) < synthetic_conditional_rates
+        drawn = accepted.to(torch.int32).cumprod(dim=1).sum(dim=1)
+        return self._synthetic_num_accepted.copy_(
+            torch.minimum(drawn, self._host_counts)
+        )
+
+
 class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
     max_spec_len = 32
 
@@ -366,15 +577,22 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
             # with the sampler off misses this op and forces a partial compile.
             use_cache=False,
         )
-        # Stable tensor addresses let successive steps reuse runtime bindings.
-        self._rejection_sampling_buffers: dict[str, torch.Tensor] | None = None
-        self._buffer_signature: tuple[int, int, torch.dtype, torch.device] | None = None
-        # Bonus sampling mode and the graph arguments that reference the input buffers.
-        self._rejection_sampling_args: tuple[bool, tuple] | None = None
-        self._full_draft_counts = False
+        self._rejection_sampling_inputs: _RejectionSamplingInputs | None = None
+
+    def initialize_sampling_inputs(
+        self, batch_size: int, vocab_size: int, dtype: torch.dtype, device: torch.device
+    ) -> _RejectionSamplingInputs:
+        if (inputs := self._rejection_sampling_inputs) is None:
+            inputs = self._rejection_sampling_inputs = _RejectionSamplingInputs(
+                (batch_size, vocab_size, dtype, device), self.num_spec_tokens
+            )
+        else:
+            inputs.assert_input_signature(batch_size, vocab_size, dtype, device)
+        return inputs
 
     def invalidate_sampling_inputs(self) -> None:
-        self._rejection_sampling_args = None
+        if self._rejection_sampling_inputs is not None:
+            self._rejection_sampling_inputs.invalidate_sampling_args()
 
     def rejection_sample(
         self,
@@ -402,10 +620,7 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         assert cu_num_draft_tokens.ndim == 1
         assert target_logits.ndim == 2
 
-        # NOTE(RBLN): Ignore the per-step actual `max_spec_len` and pad the op
-        # inputs to the config-fixed length.
         assert max_spec_len <= self.num_spec_tokens
-        max_spec_len = self.num_spec_tokens
 
         batch_size = len(num_draft_tokens)
         num_tokens = draft_token_ids.shape[0]
@@ -430,184 +645,43 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         assert bonus_logits is None or bonus_logits.is_contiguous()
         assert target_logits.shape == (num_tokens, vocab_size)
 
-        device = target_logits.device
-        dtype = target_logits.dtype
-        signature = (batch_size, vocab_size, dtype, device)
-        bufs = self._rejection_sampling_buffers
-        if bufs is None:
-            buf_len = batch_size * self.num_spec_tokens
-            host_counts = torch.empty(batch_size, dtype=torch.int32, device="cpu")
-            bufs = {
-                "draft_token_ids": torch.zeros(
-                    buf_len, dtype=torch.int32, device=device
-                ),
-                "draft_per_batch": torch.full(
-                    (batch_size, self.num_spec_tokens),
-                    PLACEHOLDER_TOKEN_ID,
-                    dtype=torch.int32,
-                    device=device,
-                ),
-                "temperature": torch.ones(buf_len, dtype=dtype, device=device),
-                "ones": torch.ones(buf_len, dtype=dtype, device=device),
-                "greedy_top_k": torch.full(
-                    (batch_size,), GREEDY_TOP_K, dtype=torch.int32, device=device
-                ),
-                "cu_num_draft_tokens": torch.zeros(
-                    batch_size, dtype=torch.int32, device=device
-                ),
-                "counts": host_counts
-                if device.type == "cpu"
-                else torch.empty_like(host_counts, device=device),
-                "host_counts": host_counts,
-                "bonus_temperature": torch.ones(batch_size, dtype=dtype, device=device),
-                "top_k": torch.zeros(batch_size, dtype=torch.int32, device=device),
-                "top_p": torch.ones(batch_size, dtype=torch.float32, device=device),
-                "synthetic_num_accepted": torch.zeros(
-                    batch_size, dtype=torch.int32, device=device
-                ),
-            }
-            self._rejection_sampling_buffers = bufs
-            self._buffer_signature = signature
-        else:
-            assert signature == self._buffer_signature, (
-                "Rejection sampler input signature changed for an existing instance "
-                f"(batch_size, vocab_size, dtype, device): expected "
-                f"{self._buffer_signature}, got {signature}."
-            )
+        inputs = self._rejection_sampling_inputs
+        assert inputs is not None, "Call initialize_sampling_inputs before sampling."
+        inputs.assert_input_signature(
+            batch_size, vocab_size, target_logits.dtype, target_logits.device
+        )
 
-        # Pad the packed inputs to the fixed [B*K] length the op wants. Rows past
-        # N keep an earlier step's values: the op reads them only into slots
-        # its acceptance count clips.
-        N = num_tokens  # = sum(num_draft_tokens)
-        padded_len = batch_size * max_spec_len
-        full_drafts = padded_len == N
-        reshaped_draft_token_ids = bufs["draft_token_ids"]
-        draft_per_batch = bufs["draft_per_batch"]
-        if full_drafts:
-            # A copy, not a view: two graph inputs must not alias one buffer.
-            reshaped_draft_token_ids.copy_(draft_token_ids)
-            reshaped_target_logits = target_logits
-            draft_per_batch.copy_(draft_token_ids.view(batch_size, max_spec_len))
-        else:
-            if (reshaped_target_logits := bufs.get("target_logits")) is None:
-                reshaped_target_logits = bufs["target_logits"] = torch.zeros(
-                    padded_len, vocab_size, dtype=dtype, device=device
-                )
-            reshaped_draft_token_ids[:N] = draft_token_ids
-            reshaped_target_logits[:N] = target_logits
-
-            draft_per_batch.fill_(PLACEHOLDER_TOKEN_ID)
-            src_offset = 0
-            for i, n in enumerate(num_draft_tokens):
-                if n == 0:
-                    continue
-                draft_per_batch[i, :n] = draft_token_ids[src_offset : src_offset + n]
-                src_offset += n
-
-        # The per-token temperature depends on draft counts unless every row is full.
-        all_greedy = sampling_metadata.all_greedy
-        can_reuse = reuse_sampling_inputs and full_drafts and not all_greedy
-        bonus_in_graph = bonus_logits is not None
-        cached = self._rejection_sampling_args if can_reuse else None
-        if cached is not None and cached[0] == bonus_in_graph:
-            top_k, top_p, reshaped_temperature, bonus_temperature = cached[1]
-        else:
-            if all_greedy:
-                top_k, top_p = bufs["greedy_top_k"], None
-            else:
-                self.invalidate_sampling_inputs()
-                top_k, top_p = build_op_top_k_top_p(
-                    sampling_metadata,
-                    batch_size,
-                    vocab_size,
-                    device,
-                )
-
-                if top_k is not None:
-                    top_k = bufs["top_k"].copy_(top_k)
-                if top_p is not None:
-                    top_p = bufs["top_p"].copy_(top_p)
-
-            # NOTE(RBLN): Per-row temperature for the divide inside the graph.
-            # Padding and greedy rows must carry 1.0 -- a 0 would divide by zero.
-            reshaped_temperature = bufs["ones"]
-            bonus_temperature = None
-            temperature = sampling_metadata.temperature
-            if not all_greedy and temperature is not None:
-                reshaped_temperature = bufs["temperature"]
-                if not sampling_metadata.all_random:
-                    temperature = torch.where(
-                        temperature == GREEDY_TEMPERATURE,
-                        temperature.new_ones(()),
-                        temperature,
-                    )
-                if bonus_logits is not None:
-                    bonus_temperature = bufs["bonus_temperature"]
-                    bonus_temperature.copy_(temperature)
-                if full_drafts:
-                    # Full K drafts everywhere, so request r's draft c sits at
-                    # r * K + c. The input must stay directly allocated: an
-                    # `expand(...).reshape(-1)` view is rejected in `prepare_inputs`.
-                    reshaped_temperature.view(batch_size, max_spec_len).copy_(
-                        temperature.unsqueeze(1)
-                    )
-                else:
-                    reshaped_temperature.fill_(1)
-                    reshaped_temperature[:N] = expand_batch_to_tokens(
-                        temperature, cu_num_draft_tokens, num_tokens
-                    )
-            if can_reuse:
-                self._rejection_sampling_args = (
-                    bonus_in_graph,
-                    (top_k, top_p, reshaped_temperature, bonus_temperature),
-                )
-
-        cu_num_draft_tokens_t = bufs["cu_num_draft_tokens"]
-        num_draft_tokens_t = bufs["counts"]
-        host_counts = bufs["host_counts"]
-        # A full step has K drafts per request regardless of its sampling settings.
-        if not full_drafts or not self._full_draft_counts:
-            self._full_draft_counts = False
-            cu_num_draft_tokens_t.copy_(cu_num_draft_tokens)
-            if full_drafts:
-                host_counts.fill_(max_spec_len)
-            else:
-                # Keep the prefix sum differences on the host for the synthetic draw.
-                cumulative = cu_num_draft_tokens
-                if cumulative.device.type != "cpu":
-                    if (host_cumulative := bufs.get("host_cumulative")) is None:
-                        host_cumulative = bufs["host_cumulative"] = torch.empty_like(
-                            host_counts
-                        )
-                    cumulative = host_cumulative.copy_(cumulative)
-                host_counts[:1].copy_(cumulative[:1])
-                torch.sub(cumulative[1:], cumulative[:-1], out=host_counts[1:])
-            if num_draft_tokens_t is not host_counts:
-                num_draft_tokens_t.copy_(host_counts)
-            self._full_draft_counts = full_drafts
-
-        synthetic_num_accepted = None
-        if synthetic_mode:
-            assert synthetic_conditional_rates is not None
-            # `cumprod` stops the count at the first rejection.
-            width = synthetic_conditional_rates.shape[0]
-            accepted = torch.rand(batch_size, width) < synthetic_conditional_rates
-            drawn = accepted.to(torch.int32).cumprod(dim=1).sum(dim=1)
-            synthetic_num_accepted = bufs["synthetic_num_accepted"]
-            synthetic_num_accepted.copy_(torch.minimum(drawn, host_counts))
+        full_drafts = num_tokens == batch_size * self.num_spec_tokens
+        target_logits = inputs.prepare_drafts(
+            draft_token_ids, num_draft_tokens, target_logits, full_drafts
+        )
+        sampling_param_tensors = inputs.prepare_sampling_args(
+            sampling_metadata,
+            cu_num_draft_tokens,
+            num_tokens,
+            full_drafts,
+            bonus_logits is not None,
+            reuse_sampling_inputs,
+        )
+        synthetic_num_accepted = inputs.prepare_draft_counts(
+            cu_num_draft_tokens,
+            full_drafts,
+            synthetic_mode,
+            synthetic_conditional_rates,
+        )
 
         return self._compiled_rejection_sample(
-            reshaped_draft_token_ids,
-            reshaped_target_logits,
-            cu_num_draft_tokens_t,
-            top_k,
-            top_p,
-            reshaped_temperature,
-            draft_per_batch,
+            inputs.draft_token_ids,
+            target_logits,
+            inputs.cu_num_draft_tokens,
+            sampling_param_tensors.top_k,
+            sampling_param_tensors.top_p,
+            sampling_param_tensors.draft_temperature,
+            inputs.draft_per_batch,
             bonus_token_ids,
-            num_draft_tokens_t,
+            inputs.counts,
             bonus_logits,
-            bonus_temperature,
+            sampling_param_tensors.bonus_temperature,
             synthetic_num_accepted,
         )
 

@@ -72,12 +72,18 @@ def make_sampling_metadata(
 
 
 @pytest.fixture
-def impl(monkeypatch) -> RBLNRejectionSamplerImpl:
+def impl(monkeypatch, request) -> RBLNRejectionSamplerImpl:
     monkeypatch.setattr(module, "compile", lambda target, **kwargs: target)
-    return RBLNRejectionSamplerImpl(
+    sampler = RBLNRejectionSamplerImpl(
         compile_context=Mock(),
         num_spec_tokens=NUM_SPEC_TOKENS,
     )
+    batch_size = getattr(request, "param", 2)
+    if batch_size is not None:
+        sampler.initialize_sampling_inputs(
+            batch_size, VOCAB_SIZE, torch.float32, DEVICE
+        )
+    return sampler
 
 
 ########################### build_op_top_k_top_p ###########################
@@ -378,6 +384,7 @@ def run_rejection_sample(
     )
 
 
+@pytest.mark.parametrize("impl", [3], indirect=True)
 @pytest.mark.parametrize("trial", range(10))
 def test_greedy_rows_accept_exactly_the_target_argmax(impl, trial):
     """A greedy row accepts iff its draft is the target argmax, and recovers the
@@ -571,10 +578,12 @@ def run_synthetic(impl, rates: list[float]) -> torch.Tensor:
     ],
     ids=["accepts_every_position", "stops_after_the_op", "rejection_ends_the_run"],
 )
+@pytest.mark.parametrize("impl", [1], indirect=True)
 def test_synthetic_rates_decide_the_row(impl, rates, expected, rule):
     assert run_synthetic(impl, rates).tolist() == expected, rule
 
 
+@pytest.mark.parametrize("impl", [1], indirect=True)
 def test_synthetic_rejection_reuses_the_bonus_when_the_op_accepted_everything(impl):
     """An op that accepted every draft recovered nothing, so the only token it
     drew is its bonus; a synthetic rejection has to carry that one."""
@@ -612,6 +621,7 @@ def test_synthetic_acceptance_is_capped_by_the_drafted_count(impl):
     ]
 
 
+@pytest.mark.parametrize("impl", [1], indirect=True)
 def test_synthetic_acceptance_stops_at_an_out_of_range_draft_id(impl):
     """An id at or past the vocabulary counts as a rejection, as in the Torch
     kernels: the row stops there and carries the op's token."""
@@ -739,6 +749,14 @@ def test_direct_calls_prepare_sampling_inputs_every_time(impl, monkeypatch):
     assert seen[-1] == [0.5, 0.5, 2.0, 2.0]
 
 
+@pytest.mark.parametrize("impl", [None], indirect=True)
+def test_sampling_requires_initialized_inputs(impl):
+    with pytest.raises(AssertionError, match="Call initialize_sampling_inputs"):
+        run_rejection_sample(
+            impl, [3, 5, 2, 4], [3, 5, 2, 4], [1, 1], _random_metadata()
+        )
+
+
 def test_a_new_batch_size_is_rejected_without_replacing_buffers(impl, monkeypatch):
     builds, seen = _recording(impl, monkeypatch)
     large_batch = _random_metadata()
@@ -753,7 +771,7 @@ def test_a_new_batch_size_is_rejected_without_replacing_buffers(impl, monkeypatc
         large_batch,
         reuse_sampling_inputs=True,
     )
-    buffers = impl._rejection_sampling_buffers
+    inputs = impl._rejection_sampling_inputs
 
     with pytest.raises(AssertionError, match="Rejection sampler input signature"):
         run_rejection_sample(
@@ -772,7 +790,7 @@ def test_a_new_batch_size_is_rejected_without_replacing_buffers(impl, monkeypatc
         large_batch,
         reuse_sampling_inputs=True,
     )
-    assert impl._rejection_sampling_buffers is buffers
+    assert impl._rejection_sampling_inputs is inputs
     assert len(builds) == 1
     assert seen == [[0.5, 0.5, 2.0, 2.0], [0.5, 0.5, 2.0, 2.0]]
 

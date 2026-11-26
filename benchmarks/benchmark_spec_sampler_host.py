@@ -69,6 +69,7 @@ def measure(
     draft = torch.zeros(batch * width, dtype=torch.int32)
     logits = torch.zeros(batch * width, vocab)
     bonus_logits = torch.zeros(batch, vocab)
+    impl.initialize_sampling_inputs(batch, vocab, logits.dtype, logits.device)
     full_cumulative = torch.tensor(full_counts, dtype=torch.int32).cumsum(
         dim=0, dtype=torch.int32
     )

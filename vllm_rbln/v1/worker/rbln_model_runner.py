@@ -166,7 +166,10 @@ from vllm_rbln.v1.core.utils import (
 )
 from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
 from vllm_rbln.v1.sample.rbln_logits_processor import build_rbln_logitsprocs
-from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
+from vllm_rbln.v1.sample.rbln_rejection_sampler import (
+    RBLNRejectionSampler,
+    RBLNRejectionSamplerImpl,
+)
 from vllm_rbln.v1.sample.rbln_sampler import WARM_UP_CONFIGS, RBLNSampler
 from vllm_rbln.v1.spec_decode import DRAFT_MODEL_PROPOSERS
 from vllm_rbln.v1.spec_decode.dflash import RBLNDFlashProposer
@@ -2661,6 +2664,20 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             self.logits_processor = self.model.get_language_model().logits_processor
         else:
             self.logits_processor = None
+        if (
+            not envs.VLLM_RBLN_ENABLE_WARM_UP
+            and self.drafter is not None
+            and self.rbln_config.use_custom_sampler
+            and not self.is_strict_kv_producer
+            and self.logits_processor is not None
+        ):
+            impl = cast(RBLNRejectionSamplerImpl, self.rejection_sampler.impl)
+            impl.initialize_sampling_inputs(
+                self.bucketing_manager.max_batch_size,
+                self.logits_processor.org_vocab_size,
+                self._rejection_logits_dtype,
+                self.input_batch.temperature.device,
+            )
         # TODO(RBLN): load lora
         if self.drafter is not None:
             logger.info_once("Loading drafter model...")
@@ -4158,6 +4175,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         logits_dtype = self._rejection_logits_dtype
         # _sample pins the request axis to the per-PP-stage decode bound.
         batch_size = self.bucketing_manager.max_batch_size
+        impl = cast(RBLNRejectionSamplerImpl, self.rejection_sampler.impl)
+        impl.initialize_sampling_inputs(
+            batch_size, vocab_size, logits_dtype, logits.device
+        )
         num_tokens = batch_size * num_spec
         num_draft_tokens = [num_spec] * batch_size
         draft_token_ids = torch.zeros(
@@ -4239,7 +4260,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         variants.sort(key=lambda variant: variant[1].all_greedy)
         # Synthetic mode feeds one more input, i.e. a distinct compiled variant.
         for bonus_kwargs, sampling_metadata in variants:
-            self.rejection_sampler.impl.rejection_sample(
+            impl.rejection_sample(
                 draft_token_ids,
                 num_draft_tokens,
                 num_spec,

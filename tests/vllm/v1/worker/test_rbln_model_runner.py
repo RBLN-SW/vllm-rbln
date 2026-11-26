@@ -1027,7 +1027,7 @@ def test_rejection_sampler_warmup_asks_for_the_synthetic_variant():
     """Synthetic mode feeds the graph one more input and dynamo specializes on
     it, so a warm-up forced to `synthetic_mode=False` would compile a variant the
     real steps never ask for -- and the first of them would recompile."""
-    rejection_sample = MagicMock()
+    impl = Mock()
     rates = torch.tensor([0.9, 0.8])
     runner = _make_runner_stub(
         rbln_config=RBLNConfig(use_custom_sampler=True),
@@ -1046,7 +1046,7 @@ def test_rejection_sampler_warmup_asks_for_the_synthetic_variant():
             top_p=torch.ones(8), top_k=torch.ones(8, dtype=torch.int32)
         ),
         rejection_sampler=SimpleNamespace(
-            impl=SimpleNamespace(rejection_sample=rejection_sample),
+            impl=impl,
             synthetic_mode=True,
             synthetic_conditional_rates=rates,
         ),
@@ -1054,15 +1054,52 @@ def test_rejection_sampler_warmup_asks_for_the_synthetic_variant():
 
     runner._warmup_sampler_decode_batches(torch.zeros(12, 10, dtype=torch.bfloat16))
 
-    assert rejection_sample.call_args_list
-    for call in rejection_sample.call_args_list:
+    assert impl.rejection_sample.call_args_list
+    for call in impl.rejection_sample.call_args_list:
         assert call.kwargs["synthetic_mode"] is True
         assert call.kwargs["synthetic_conditional_rates"] is rates
 
 
+def test_load_model_initializes_rejection_buffers_when_warmup_is_disabled(monkeypatch):
+    model = torch.nn.Module()
+    model.logits_processor = SimpleNamespace(org_vocab_size=10)
+    monkeypatch.setattr(mr.envs, "VLLM_RBLN_ENABLE_WARM_UP", False)
+    loader = Mock()
+    loader.load_model.return_value = model
+    monkeypatch.setattr(mr, "get_model_loader", lambda _: loader)
+    monkeypatch.setattr(mr, "build_process_group_dict", lambda: {})
+    monkeypatch.setattr(mr, "compile", lambda fn, **kw: fn)
+    impl = Mock()
+    temperature = torch.empty(4)
+    runner = _make_runner_stub(
+        load_config=None,
+        vllm_config=None,
+        model_config=SimpleNamespace(model="m"),
+        offload_context=nullcontext,
+        _resolve_mm_support=lambda: False,
+        drafter=Mock(),
+        use_aux_hidden_state_outputs=False,
+        _make_weights_contiguous=lambda: None,
+        compile_context=None,
+        runtime_holder=None,
+        rbln_config=RBLNConfig(use_custom_sampler=True),
+        bucketing_manager=SimpleNamespace(max_batch_size=4),
+        input_batch=SimpleNamespace(temperature=temperature),
+        rejection_sampler=SimpleNamespace(impl=impl),
+        _rejection_logits_dtype=torch.bfloat16,
+    )
+
+    runner.load_model()
+
+    impl.initialize_sampling_inputs.assert_called_once_with(
+        4, 10, torch.bfloat16, temperature.device
+    )
+
+
 @pytest.mark.parametrize("logits_dtype", [torch.bfloat16, torch.float32])
 def test_rejection_sampler_warmup_uses_per_stage_batch_bound(logits_dtype):
-    rejection_sample = MagicMock()
+    impl = Mock()
+    rejection_sample = impl.rejection_sample
     runner = _make_runner_stub(
         rbln_config=RBLNConfig(use_custom_sampler=True),
         speculative_config=object(),
@@ -1080,7 +1117,7 @@ def test_rejection_sampler_warmup_uses_per_stage_batch_bound(logits_dtype):
             top_p=torch.ones(8), top_k=torch.ones(8, dtype=torch.int32)
         ),
         rejection_sampler=SimpleNamespace(
-            impl=SimpleNamespace(rejection_sample=rejection_sample),
+            impl=impl,
             synthetic_mode=False,
             synthetic_conditional_rates=None,
         ),
@@ -1089,6 +1126,10 @@ def test_rejection_sampler_warmup_uses_per_stage_batch_bound(logits_dtype):
     decode_logits = torch.zeros(12, 10, dtype=logits_dtype)
     runner._warmup_sampler_decode_batches(decode_logits)
 
+    impl.initialize_sampling_inputs.assert_called_once_with(
+        4, 10, torch.float32, decode_logits.device
+    )
+    assert impl.mock_calls[0][0] == "initialize_sampling_inputs"
     assert rejection_sample.call_args_list[0].args[7].all_random
 
     # One call per graph, all at the batch bound; a filtered random pattern
