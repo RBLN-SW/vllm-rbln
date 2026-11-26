@@ -107,8 +107,11 @@ class RBLNGemma4Proposer(RBLNEagleProposer):
         hidden_states = target_hidden_states.view(-1, self.hidden_size)[
             token_indices_to_sample
         ]
+        step_starts = target_positions[
+            common_attn_metadata.query_start_loc[:num_reqs].long()
+        ]
         per_layer_attn_metadata, num_reqs_padded, forward_kwargs = (
-            self._build_draft_step(num_reqs, positions)
+            self._build_draft_step(num_reqs, positions, step_starts)
         )
         self.input_ids[:num_reqs] = next_token_ids[:num_reqs].int()
         input_ids, staged_positions, staged_hidden_states, _ = self._preprocess(
@@ -138,7 +141,7 @@ class RBLNGemma4Proposer(RBLNEagleProposer):
     ) -> None:
         positions = self.positions[:num_reqs]
         per_layer_attn_metadata, num_reqs_padded, forward_kwargs = (
-            self._build_draft_step(num_reqs, positions)
+            self._build_draft_step(num_reqs, positions, positions)
         )
         input_ids, staged_positions, hidden_states, _ = self._preprocess(
             num_reqs,
@@ -156,13 +159,14 @@ class RBLNGemma4Proposer(RBLNEagleProposer):
             )
 
     def _build_draft_step(
-        self, num_reqs: int, positions: torch.Tensor
+        self, num_reqs: int, positions: torch.Tensor, step_starts: torch.Tensor
     ) -> tuple[dict[str, object], int, dict]:
         """The attention metadata every draft step of this batch shares.
 
         Each query sits at its request's last target position and sees the
         keys up to it, within the window on a sliding layer. The op's write
-        position is one past it, where the zero K/V do no harm.
+        position is one past it, where the zero K/V do no harm. `step_starts`
+        is where the target step began, which places a ring's window.
         """
         batch_desc, num_tokens_across_dp = self._determine_batch_execution_and_padding(
             num_reqs, num_reqs, False, first_pass=False
@@ -194,6 +198,7 @@ class RBLNGemma4Proposer(RBLNEagleProposer):
                 batch_pad=num_reqs_padded,
                 skip_attn_masks=True,
                 is_prompt_sorted=self.runner.sort_batch_by_length,
+                ring_start=step_starts,
             )
             if isinstance(builder.kv_cache_spec, SlidingWindowSpec):
                 # sliding_window_attention_v1's key frame: the strip of

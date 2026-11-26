@@ -314,10 +314,14 @@ class RBLNFlashAttentionMetadataBuilder(
         mm_prefix_row_ends: torch.Tensor | None = None,
         group_shared: dict[tuple, torch.Tensor] | None = None,
         defer_staging: bool = False,
+        ring_start: torch.Tensor | None = None,
     ) -> RBLNFlashAttentionMetadata:
         """`mm_prefix_row_ends`, on a prefill of an mm prefix LM, holds for each
         padded row of the step the last step-local row it may read: itself, or
-        its range's last position for an mm row. None on any other step."""
+        its range's last position for an mm row. None on any other step.
+
+        `ring_start`, on a ring group, is the first position of the target step
+        whose ring this step reads, one per request; None takes this step's."""
         num_reqs = common_attn_metadata.num_reqs
         # The runner can defer staging until its token feedback is ready.
         query_start_loc_cpu = common_attn_metadata.query_start_loc
@@ -378,6 +382,8 @@ class RBLNFlashAttentionMetadataBuilder(
         if isinstance(self.kv_cache_spec, RBLNRingSlidingWindowSpec) and not is_prefill:
             # The kernel also reads the column before, whose block is freed.
             column = seq_idx[:, 0] // self.block_size
+            if ring_start is not None:
+                column[:num_reqs] = ring_start // self.block_size
             rows = torch.nonzero(column).view(-1)
             block_tables_tensor = block_tables_tensor.clone()
             block_tables_tensor[rows, column[rows] - 1] = block_tables_tensor[

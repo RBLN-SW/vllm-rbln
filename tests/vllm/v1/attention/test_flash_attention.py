@@ -596,6 +596,198 @@ class TestBuildRingSlidingWindowDecode:
         ring = [10, 11, 13, 13, 14, 15, 16, 17]
         assert md.block_tables[:3].tolist() == [ring, ring, list(range(10, 18))]
 
+    def test_a_draft_takes_the_column_from_the_target_step(self, cfg):
+        from vllm_rbln.v1.kv_cache import RBLNRingSlidingWindowSpec
+
+        spec = RBLNRingSlidingWindowSpec(
+            block_size=64,
+            num_kv_heads=4,
+            head_size=64,
+            dtype=torch.float16,
+            sliding_window=60,
+        )
+        # The draft writes at 192, column 3; the target step began at 190, so
+        # its ring is still column 2.
+        cam = _cam(
+            num_reqs=1,
+            query_start_loc=[0, 1],
+            seq_lens=[193],
+            block_table=[list(range(10, 18))],
+        )
+        md = make_builder(cfg, spec=spec).build(
+            cam,
+            torch.tensor([192]),
+            batch_pad=1,
+            is_prefill=False,
+            ring_start=torch.tensor([190]),
+        )
+        assert md.block_tables[0].tolist() == [10, 12, 12, 13, 14, 15, 16, 17]
+
+
+class TestRingUnderGemma4Mtp:
+    """A ring block of BLOCK rows holding a WINDOW-wide window, driven through the
+    ring manager, the builder and sliding_window_attention_v1's eager reference:
+    chunked prefill, then verify steps of DRAFTS + 1 tokens that keep a random
+    number of drafts, each followed by the MTP drafter's read. Freed blocks are
+    overwritten as if reallocated. Every kept row matches dense attention."""
+
+    BLOCK, WINDOW, DRAFTS, DIM, CHUNK = 12, 8, 4, 4, 5
+
+    @pytest.mark.parametrize("seed", range(4))
+    def test_kept_rows_and_drafts_match_dense_attention(self, seed):
+        from vllm.v1.core.block_pool import BlockPool
+        from vllm.v1.core.single_type_kv_cache_manager import (
+            register_all_kvcache_specs,
+        )
+        from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+
+        from tests.vllm.v1.core.utils import make_request
+        from vllm_rbln.platform import RblnPlatform
+        from vllm_rbln.v1.attention.ops.sliding_window_attention import (
+            sliding_window_attention_v1,
+        )
+        from vllm_rbln.v1.kv_cache import RBLNRingSlidingWindowSpec
+
+        B, W, K, D = self.BLOCK, self.WINDOW, self.DRAFTS, self.DIM
+        gen = torch.Generator().manual_seed(seed)
+        register_all_kvcache_specs(None)
+        RblnPlatform.register_custom_kv_cache_specs(None)
+        spec = RBLNRingSlidingWindowSpec(
+            block_size=B,
+            num_kv_heads=1,
+            head_size=D,
+            dtype=torch.float32,
+            sliding_window=W,
+        )
+        pool = BlockPool(num_gpu_blocks=32, enable_caching=True, hash_block_size=B)
+        manager = KVCacheSpecRegistry.get_manager_class(spec)(
+            spec,
+            block_pool=pool,
+            enable_caching=True,
+            kv_cache_group_id=0,
+            scheduler_block_size=B,
+        )
+        max_len = 20 * B
+        builder = make_builder(
+            make_vllm_config(
+                max_model_len=max_len, block_size=B, max_num_batched_tokens=self.CHUNK
+            ),
+            spec=spec,
+        )
+        keys, values, queries = torch.randn(3, max_len, D, generator=gen)
+        scale = torch.tensor(D**-0.5)
+        kv_cache = torch.zeros(32, 2, 1, 1, B, D)
+        # The runner's table keeps the ids of blocks the manager has freed.
+        table: list[int] = []
+        prompt = int(torch.randint(1, 3 * B, (1,), generator=gen))
+        tokens = list(range(max_len))
+
+        def schedule(computed, num_new, lookahead):
+            manager.remove_skipped_blocks("r", computed, prompt)
+            end = computed + num_new + lookahead
+            manager.get_num_blocks_to_allocate("r", end, [], computed, computed, end)
+            manager.allocate_new_blocks("r", end, computed + num_new)
+            known = computed + min(num_new, 1 if lookahead else num_new)
+            request = make_request("r", tokens[: max(known, prompt)], B)
+            request.num_prompt_tokens = prompt
+            request.resumable = False
+            manager.cache_blocks(request, known, replay_boundaries=[])
+            table.extend(b.block_id for b in manager.req_to_blocks["r"][len(table) :])
+            for block in pool.blocks:
+                if block.ref_cnt == 0:
+                    kv_cache[block.block_id].normal_(0, 1e3, generator=gen)
+            for src, dst, start in manager.pending_copies:
+                kv_cache[dst][..., start:, :] = kv_cache[src][..., start:, :]
+                pool.free_blocks([pool.blocks[src]])
+            manager.pending_copies = []
+
+        def attend(start, q, k, v, block_tables, window, mask=None):
+            shape = (1, 1, 1, -1, D)
+            return sliding_window_attention_v1(
+                q.view(shape),
+                k.view(shape),
+                v.view(shape),
+                kv_cache,
+                torch.tensor([[start]]),
+                scale,
+                block_tables,
+                window,
+                attn_mask=mask,
+            ).view(-1, D)
+
+        def dense(q, pos):
+            lo = max(pos - W + 1, 0)
+            weights = (keys[lo : pos + 1] @ q * scale).softmax(0)
+            return weights @ values[lo : pos + 1]
+
+        def decode_table(start, num_tokens, ring_start=None):
+            cam = _cam(
+                num_reqs=1,
+                query_start_loc=[0, num_tokens],
+                seq_lens=[start + num_tokens],
+                block_table=[table + [0] * 4],
+            )
+            positions = torch.arange(start, start + num_tokens)
+            md = builder.build(
+                cam, positions, batch_pad=1, is_prefill=False, ring_start=ring_start
+            )
+            return md.block_tables.long()
+
+        for start in range(0, prompt, self.CHUNK):
+            end = min(start + self.CHUNK, prompt)
+            schedule(start, end - start, 0)
+            out = attend(
+                start,
+                queries[start:end],
+                keys[start:end],
+                values[start:end],
+                torch.tensor([table + [0] * 4]),
+                W,
+            )
+            for row, pos in enumerate(range(start, end)):
+                torch.testing.assert_close(out[row], dense(queries[pos], pos))
+
+        start = prompt
+        while start + 2 * K + 1 < max_len:
+            schedule(start, K + 1, K)
+            kept = int(torch.randint(0, K + 1, (1,), generator=gen))
+            k, v = (
+                keys[start : start + K + 1].clone(),
+                values[start : start + K + 1].clone(),
+            )
+            k[kept + 1 :].normal_(0, 50, generator=gen)
+            v[kept + 1 :].normal_(0, 50, generator=gen)
+            out = attend(
+                start,
+                queries[start : start + K + 1],
+                k,
+                v,
+                decode_table(start, K + 1),
+                W,
+            )
+            for row in range(kept + 1):
+                torch.testing.assert_close(
+                    out[row], dense(queries[start + row], start + row)
+                )
+
+            # The drafter's read, as RBLNGemma4Proposer._build_draft_step sets it up.
+            last = start + kept
+            first_key = max(last - W + 1, 0) // B * B
+            key_pos = first_key + torch.arange(((W + B) // B + 1) * B)
+            mask = ((key_pos <= last) & (key_pos > last - W)).float().view(1, 1, 1, -1)
+            query, zero = torch.randn(D, generator=gen), torch.zeros(1, D)
+            out = attend(
+                last + 1,
+                query,
+                zero,
+                zero,
+                decode_table(last + 1, 1, ring_start=torch.tensor([start])),
+                W + 1,
+                mask,
+            )
+            torch.testing.assert_close(out[0], dense(query, last))
+            start = last + 1
+
 
 class TestBuildMmPrefixSlidingWindow:
     """The sliding-window mask of an mm prefix LM's prefill, checked by running

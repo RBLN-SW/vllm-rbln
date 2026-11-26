@@ -233,21 +233,6 @@ def _validate(vllm_config: "VllmConfig") -> None:
             "parallelism on RBLN."
         )
 
-    if rbln_config.use_swa_ring:
-        from vllm.platforms import current_platform
-
-        if (
-            not current_platform.is_cr13()
-            or not use_device_tensor()
-            or vllm_config.kv_transfer_config
-            # A verify step writes more rows than a window's block has spare.
-            or vllm_config.speculative_config is not None
-        ):
-            raise NotImplementedError(
-                "use_swa_ring needs REBEL CR13 with device tensors and supports "
-                "neither KV connectors nor speculative decoding."
-            )
-
     text_config = getattr(model_config, "hf_text_config", model_config.hf_config)
     if getattr(text_config, "model_type", None) == "qwen3_next":
         raise ValueError(
@@ -334,6 +319,36 @@ def _validate(vllm_config: "VllmConfig") -> None:
             f"got {max_num_batched_tokens=}, {block_size=}, {max_block_size=}. "
             "Set --block-size within this range."
         )
+
+    if rbln_config.use_swa_ring:
+        from vllm.platforms import current_platform
+
+        if (
+            not current_platform.is_cr13()
+            or not use_device_tensor()
+            or vllm_config.kv_transfer_config
+        ):
+            raise NotImplementedError(
+                "use_swa_ring needs REBEL CR13 with device tensors and supports "
+                "no KV connector."
+            )
+        spec = vllm_config.speculative_config
+        # A rejected draft's row then held a key past every later window. The
+        # Gemma4 MTP drafter only reads the target's KV; another drafter's own
+        # KV would need the same guarantee.
+        window = getattr(text_config, "sliding_window", None)
+        if (
+            spec is not None
+            and window is not None
+            and (
+                not spec.use_gemma4_mtp()
+                or window + spec.num_speculative_tokens > block_size
+            )
+        ):
+            raise NotImplementedError(
+                "use_swa_ring with speculative decoding needs the Gemma4 MTP and "
+                "a block at least sliding_window + num_speculative_tokens wide."
+            )
 
     chunks = rbln_config.prefill_chunk_size or [max_num_batched_tokens]
     if max(chunks) > max_num_batched_tokens:

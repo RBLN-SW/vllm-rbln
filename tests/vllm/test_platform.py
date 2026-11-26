@@ -511,14 +511,8 @@ class TestRejectedConfigs:
         def ring(config):
             config.additional_config.use_swa_ring = True
 
-        def speculative(config):
-            ring(config)
-            config.speculative_config = SimpleNamespace(method="mtp")
-
         monkeypatch.setattr(vllm_impl, "use_device_tensor", lambda: True)
         reconfigure(ring)
-        with pytest.raises(NotImplementedError, match="use_swa_ring"):
-            reconfigure(speculative)
         monkeypatch.setattr(vllm_impl, "use_device_tensor", lambda: False)
         with pytest.raises(NotImplementedError, match="use_swa_ring"):
             reconfigure(ring)
@@ -526,6 +520,36 @@ class TestRejectedConfigs:
         monkeypatch.setattr(current_platform, "is_cr13", lambda: False)
         with pytest.raises(NotImplementedError, match="use_swa_ring"):
             reconfigure(ring)
+
+    # A window of 1000 in the 1024-row block leaves room for 24 drafts.
+    @pytest.mark.parametrize(
+        ("gemma4_mtp", "num_drafts", "refused"),
+        [(True, 24, False), (True, 25, True), (False, 1, True)],
+    )
+    def test_swa_ring_takes_drafts_the_block_has_room_for(
+        self, reconfigure, monkeypatch, gemma4_mtp, num_drafts, refused
+    ):
+        from vllm.platforms import current_platform
+
+        from vllm_rbln.platform import vllm_impl
+
+        monkeypatch.setattr(current_platform, "is_cr13", lambda: True)
+        monkeypatch.setattr(vllm_impl, "use_device_tensor", lambda: True)
+
+        def speculative(config):
+            config.additional_config.use_swa_ring = True
+            config.model_config.hf_text_config.sliding_window = 1000
+            config.speculative_config = SimpleNamespace(
+                method="mtp",
+                num_speculative_tokens=num_drafts,
+                use_gemma4_mtp=lambda: gemma4_mtp,
+            )
+
+        if refused:
+            with pytest.raises(NotImplementedError, match="use_swa_ring"):
+                reconfigure(speculative)
+        else:
+            reconfigure(speculative)
 
     def test_msa_models_need_bfloat16(self, reconfigure):
         def msa(dtype):
