@@ -1250,7 +1250,8 @@ class TestForwardSharedKV:
         assert args[1] is None and args[2] is None
         assert args[4] is md.seq_lens
         if sliding_window is None:
-            assert args[8] is None and args[9] is True  # no mask, causal
+            assert len(args) == 7  # no mask, causal: the op's defaults
+            assert set(kwargs) == {"sinks", "is_prompt_sorted", "null_block_id"}
         else:
             assert "attn_mask" not in kwargs
             assert args[7] == sliding_window

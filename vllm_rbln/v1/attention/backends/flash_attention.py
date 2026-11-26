@@ -637,8 +637,8 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
             assert attn_metadata.swa_appends and not attn_metadata.is_prefill
             attn_output = sliding_window_attention_v1(
                 query,
-                key,
-                value,
+                None,  # k
+                None,  # v
                 kv_cache,
                 attn_metadata.seq_lens,
                 self.scale,
@@ -651,18 +651,13 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
             assert not attn_metadata.is_prefill
             attn_output = torch.ops.rbln_custom_ops.gqa(
                 query,
-                key,
-                value,
+                None,  # k
+                None,  # v
                 kv_cache,
                 attn_metadata.seq_lens,
                 self.scale,
                 attn_metadata.block_tables,
-                self.sinks,
-                None,  # attn_mask
-                True,  # is_causal
-                None,  # k_quantize_scale
-                None,  # v_quantize_scale
-                None,  # cache_dtype
+                sinks=self.sinks,
                 is_prompt_sorted=attn_metadata.is_prompt_sorted,
                 null_block_id=NULL_BLOCK_ID,
             )
