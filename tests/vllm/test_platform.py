@@ -698,6 +698,14 @@ class TestRejectedConfigs:
             with pytest.raises(ValueError, match="single rank"):
                 reconfigure(widened)
 
+    def test_gdn_models_run_unquantized(self, reconfigure, gdn):
+        def fp8(config):
+            gdn(config)
+            config.model_config.quantization = "fp8"
+
+        with pytest.raises(ValueError, match="unquantized"):
+            reconfigure(fp8)
+
     @pytest.mark.parametrize("model", ["gdn", "glm5_next"])
     def test_recurrent_state_models_speculate_with_their_mtp_head_only(
         self, reconfigure, request, model
