@@ -18,11 +18,11 @@ A floor alone lets a published wheel resolve to whatever is newest at install ti
 which is how old vllm-rbln releases came to install today's optimum-rbln.
 """
 
+import tomllib
 from itertools import chain
 from pathlib import Path
 
 import pytest
-import tomllib
 from packaging.requirements import Requirement
 from packaging.version import Version
 

@@ -948,8 +948,10 @@ def test_a_producer_warms_the_sampler_at_one_request(
 def _sampler_warmup_runner(sampler, num_reqs):
     return _make_runner_stub(
         device=torch.device("cpu"),
-        dtype=torch.float32,
-        model_config=SimpleNamespace(get_vocab_size=lambda: 32),
+        dtype=torch.bfloat16,
+        model_config=SimpleNamespace(
+            get_vocab_size=lambda: 32, head_dtype=torch.float32
+        ),
         sampler=sampler,
         input_batch=SimpleNamespace(
             temperature=torch.ones(num_reqs),
@@ -979,6 +981,8 @@ def test_rbln_sampler_warms_up_every_config(num_reqs):
     _sampler_warmup_runner(sampler, num_reqs)._dummy_sampler_run(num_reqs)
 
     assert sampler.warm_up.call_count == len(WARM_UP_CONFIGS)
+    for call in sampler.warm_up.call_args_list + sampler.call_args_list:
+        assert call.kwargs["logits"].dtype == torch.float32
 
 
 def test_rejection_sampler_warmup_asks_for_the_synthetic_variant():
@@ -1000,7 +1004,7 @@ def test_rejection_sampler_warmup_asks_for_the_synthetic_variant():
         speculative_config=object(),
         num_spec_tokens=2,
         is_pooling_model=False,
-        dtype=torch.bfloat16,
+        model_config=SimpleNamespace(head_dtype=torch.bfloat16),
         logits_processor=SimpleNamespace(org_vocab_size=10),
         bucketing_manager=SimpleNamespace(
             decode_batch_buckets=[2, 4], max_batch_size=4
@@ -1059,13 +1063,15 @@ def test_load_model_initializes_rejection_buffers(monkeypatch, warmup_enabled):
     )
 
 
-def test_rejection_sampler_warmup_uses_per_stage_batch_bound():
+@pytest.mark.parametrize("head_dtype", [torch.bfloat16, torch.float32])
+def test_rejection_sampler_warmup_uses_per_stage_batch_bound(head_dtype):
     sampler = Mock(spec=mr.RBLNRejectionSampler)
     runner = _make_runner_stub(
         rbln_config=RBLNConfig(use_custom_sampler=True),
         speculative_config=object(),
         num_spec_tokens=2,
         is_pooling_model=False,
+        model_config=SimpleNamespace(head_dtype=head_dtype),
         dtype=torch.bfloat16,
         logits_processor=SimpleNamespace(org_vocab_size=10),
         bucketing_manager=SimpleNamespace(
@@ -1093,9 +1099,11 @@ def test_rejection_sampler_warmup_uses_per_stage_batch_bound():
     for call in sampler.warm_up.call_args_list:
         assert len(call.args[1]) == 4
         assert call.args[3].shape == (8, 10)
+        assert call.args[3].dtype == head_dtype
         assert call.args[3].device == device
         if (bonus_logits := call.kwargs.get("bonus_logits")) is not None:
             assert bonus_logits.shape == (4, 10)
+            assert bonus_logits.dtype == head_dtype
             assert bonus_logits.device == device
         metadata = call.args[4]
         filters = [t for t in (metadata.top_k, metadata.top_p) if t is not None]

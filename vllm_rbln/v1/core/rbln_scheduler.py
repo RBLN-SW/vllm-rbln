@@ -192,7 +192,7 @@ class RBLNScheduler(Scheduler):
                 hash_block_size=self.hash_block_size,
                 sub_block_size=sub_block_size,
                 hash_fn=hash_fn,
-                use_eagle=self.use_eagle,
+                use_eagle=self.use_eagle_block_drop,
                 log_stats=self.log_stats,
                 enable_kv_cache_events=self.enable_kv_cache_events,
                 dcp_world_size=self.dcp_world_size,

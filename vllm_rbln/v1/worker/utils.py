@@ -22,7 +22,7 @@ import threading
 import time
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Literal, NoReturn, TypeVar
 
@@ -84,7 +84,7 @@ def _write_event_line(line: str) -> None:
 def _fatal_event(
     exc: Exception, *, where: str, rank: int | None, dp_rank: int | None
 ) -> str:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     record = {
         "event": _FATAL_EVENT,
         "schema_version": _EVENT_SCHEMA_VERSION,
