@@ -1008,6 +1008,7 @@ def test_rejection_sampler_warmup_asks_for_the_synthetic_variant():
             get_vocab_size=lambda: 10, head_dtype=torch.bfloat16
         ),
         device=torch.device("cpu"),
+        dtype=torch.bfloat16,
         bucketing_manager=SimpleNamespace(
             decode_batch_buckets=[2, 4], max_batch_size=4
         ),

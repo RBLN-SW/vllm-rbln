@@ -4217,7 +4217,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 all_random=config["all_random"],
                 temperature=None
                 if config["all_greedy"]
-                else torch.ones(batch_size, dtype=torch.float32, device=self.device),
+                else torch.ones(batch_size, dtype=self.dtype, device=self.device),
                 top_p=_dummy_tensor_view(
                     self.input_batch.top_p, batch_size, config.get("top_p")
                 ),
