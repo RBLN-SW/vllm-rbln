@@ -22,6 +22,7 @@ from vllm.logger import init_logger
 from vllm.utils.torch_utils import get_dtype_size, kv_cache_dtype_str_to_dtype
 
 from vllm_rbln import envs
+from vllm_rbln.platform import use_device_tensor
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -231,6 +232,21 @@ def _validate(vllm_config: "VllmConfig") -> None:
             "An encoder-only instance supports neither data nor pipeline "
             "parallelism on RBLN."
         )
+
+    if rbln_config.use_swa_ring:
+        from vllm.platforms import current_platform
+
+        if (
+            not current_platform.is_cr13()
+            or not use_device_tensor()
+            or vllm_config.kv_transfer_config
+            # A verify step writes more rows than a window's block has spare.
+            or vllm_config.speculative_config is not None
+        ):
+            raise NotImplementedError(
+                "use_swa_ring needs REBEL CR13 with device tensors and supports "
+                "neither KV connectors nor speculative decoding."
+            )
 
     text_config = getattr(model_config, "hf_text_config", model_config.hf_config)
     if getattr(text_config, "model_type", None) == "qwen3_next":

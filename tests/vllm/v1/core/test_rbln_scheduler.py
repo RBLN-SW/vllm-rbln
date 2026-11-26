@@ -104,6 +104,14 @@ class TestSchedulerInit:
         sched = create_rbln_scheduler(ec_manager_config=config)
         assert type(sched.encoder_cache_manager) is EncoderCacheManager
 
+    @pytest.mark.usefixtures("cr13")
+    def test_a_ring_without_sub_block_caching_is_refused(self, monkeypatch):
+        from vllm_rbln.platform import vllm_impl
+
+        monkeypatch.setattr(vllm_impl, "use_device_tensor", lambda: True)
+        with pytest.raises(NotImplementedError, match="sub-block"):
+            create_rbln_scheduler(additional_config={"use_swa_ring": True})
+
     def test_null_block_off_null_block_id_is_refused(self, monkeypatch):
         # The sparse-attention ops write to NULL_BLOCK_ID; a pool that reserves
         # another block must stop the scheduler from starting.

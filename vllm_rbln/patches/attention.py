@@ -32,7 +32,7 @@ from vllm_rbln.patches import register_patch
 from vllm_rbln.patches.registry import MIN_PATCH_PRIORITY
 from vllm_rbln.v1.attention.backends.flash_attention import RBLNFlashAttentionBackend
 from vllm_rbln.v1.attention.kv_cache_bindings import resolve_kv_cache
-from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
+from vllm_rbln.v1.kv_cache import RBLNRingSlidingWindowSpec, RBLNSlidingWindowSpec
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention import MLAAttention
@@ -198,6 +198,8 @@ def patched_get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         spec_cls = (
             SlidingWindowSpec if current_platform.is_cr13() else RBLNSlidingWindowSpec
         )
+        if vllm_config.additional_config.use_swa_ring:
+            spec_cls = RBLNRingSlidingWindowSpec
         return spec_cls(
             block_size=block_size,
             num_kv_heads=self.num_kv_heads,

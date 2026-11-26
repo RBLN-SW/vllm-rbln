@@ -25,6 +25,7 @@ from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.single_type_kv_cache_manager import (
     MambaManager,
     SingleTypeKVCacheManager,
+    SlidingWindowManager,
 )
 from vllm.v1.kv_cache_interface import (
     MambaSpec,
@@ -412,4 +413,106 @@ class RBLNMambaManager(MambaManager):
     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
         self._kept_boundary.pop(request_id, None)
         self._received_boundary.pop(request_id, None)
+        return super().pop_blocks_for_free(request_id)
+
+
+@dataclass(frozen=True)
+class RBLNRingSlidingWindowSpec(SlidingWindowSpec):
+    pass
+
+
+class RBLNRingSlidingWindowManager(SlidingWindowManager):
+    """Keeps a decoding request's window in one block.
+
+    A step whose first token lands in a block new to the request first has the
+    rows it has yet to write copied from the block before (`pending_copies`), so
+    row r of that block holds the latest position congruent to r. Once the
+    request decodes, the blocks before it are freed; they stay cached.
+    """
+
+    def __init__(self, kv_cache_spec: SlidingWindowSpec, **kwargs) -> None:
+        super().__init__(kv_cache_spec, **kwargs)
+        if self.sliding_window != self.block_size:
+            raise NotImplementedError(
+                "use_swa_ring needs a sliding window as wide as the block."
+            )
+        self._step_start: dict[str, int] = {}
+        self._window_column: dict[str, int] = {}
+        self._decode_from: dict[str, int] = {}
+        # (source block, destination block, first row), sources held by a ref.
+        self.pending_copies: list[tuple[int, int, int]] = []
+
+    def get_num_blocks_to_allocate(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        total_computed_tokens: int,
+        *args,
+        **kwargs,
+    ) -> int:
+        self._step_start[request_id] = total_computed_tokens
+        return super().get_num_blocks_to_allocate(
+            request_id,
+            num_tokens,
+            new_computed_blocks,
+            total_computed_tokens,
+            *args,
+            **kwargs,
+        )
+
+    def allocate_new_blocks(
+        self, request_id: str, num_tokens: int, num_tokens_main_model: int
+    ) -> list[KVCacheBlock]:
+        new_blocks = super().allocate_new_blocks(
+            request_id, num_tokens, num_tokens_main_model
+        )
+        start = self._step_start[request_id]
+        column = start // self.block_size
+        if self._window_column.get(request_id) != column:
+            self._window_column[request_id] = column
+            blocks = self.req_to_blocks[request_id]
+            if column and not blocks[column - 1].is_null:
+                self.block_pool.touch([blocks[column - 1]])
+                self.pending_copies.append(
+                    (
+                        blocks[column - 1].block_id,
+                        blocks[column].block_id,
+                        start % self.block_size,
+                    )
+                )
+        return new_blocks
+
+    def remove_skipped_blocks(
+        self,
+        request_id: str,
+        processed_computed_tokens: int,
+        num_prompt_tokens: int | None = None,
+    ) -> None:
+        super().remove_skipped_blocks(
+            request_id, processed_computed_tokens, num_prompt_tokens
+        )
+        # A prefill chunk reads the block before its own, and a step still in
+        # flight may; a request that has not cached yet may be either.
+        column = self._window_column.get(request_id, 0)
+        if (
+            request_id in self._decode_from
+            and processed_computed_tokens > column * self.block_size
+            and processed_computed_tokens >= self._decode_from[request_id]
+        ):
+            self._remove_blocks_in_range(request_id, 0, column)
+
+    def cache_blocks(self, request: Request, *args, **kwargs) -> None:
+        # A streaming session prefills again after it decodes.
+        if not request.resumable:
+            self._decode_from.setdefault(
+                request.request_id,
+                max(request.num_prompt_tokens, request.num_tokens - 1),
+            )
+        super().cache_blocks(request, *args, **kwargs)
+
+    def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
+        self._step_start.pop(request_id, None)
+        self._window_column.pop(request_id, None)
+        self._decode_from.pop(request_id, None)
         return super().pop_blocks_for_free(request_id)

@@ -572,6 +572,31 @@ class TestMmPrefixOnTheShiftKernel:
         assert make_builder(cfg, sliding_window=4).swa_appends
 
 
+class TestBuildRingSlidingWindowDecode:
+    def test_the_column_before_the_ring_names_the_ring(self, cfg):
+        from vllm_rbln.v1.kv_cache import RBLNRingSlidingWindowSpec
+
+        spec = RBLNRingSlidingWindowSpec(
+            block_size=64,
+            num_kv_heads=4,
+            head_size=64,
+            dtype=torch.float16,
+            sliding_window=64,
+        )
+        positions = [200, 192, 50]  # columns 3, 3 and 0
+        cam = _cam(
+            num_reqs=3,
+            query_start_loc=[0, 1, 2, 3],
+            seq_lens=[p + 1 for p in positions],
+            block_table=[list(range(10, 18))] * 3,
+        )
+        md = make_builder(cfg, spec=spec).build(
+            cam, torch.tensor(positions + [0] * 8), batch_pad=4, is_prefill=False
+        )
+        ring = [10, 11, 13, 13, 14, 15, 16, 17]
+        assert md.block_tables[:3].tolist() == [ring, ring, list(range(10, 18))]
+
+
 class TestBuildMmPrefixSlidingWindow:
     """The sliding-window mask of an mm prefix LM's prefill, checked by running
     sliding_window_attention_v1's eager reference over a whole prompt chunk by

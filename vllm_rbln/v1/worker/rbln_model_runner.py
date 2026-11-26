@@ -4422,6 +4422,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                 if layer_name not in layer_names:
                     continue
                 if per_block > 1:
+                    assert op.start == 0, layer_name
                     # The op names a manager block, which this view holds as
                     # per_block kernel blocks: copy all of them. An eager copy is
                     # placed in the bound view's layout, which need not be the one
@@ -4438,11 +4439,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
                     srcs.append(kv_cache[src, :nt])
                 else:
                     axis = self.kv_cache_block_axes[layer_name]
-                    rows = (
-                        slice(None)
-                        if layer_name in self.kv_cache_whole_block_copy
-                        else slice(nt)
-                    )
+                    if layer_name in self.kv_cache_whole_block_copy:
+                        # A ring's destination already holds the rows before it.
+                        assert op.start == 0, layer_name
+                        rows = slice(None)
+                    else:
+                        rows = slice(op.start, op.start + nt)
                     dsts.append(kv_cache.select(axis, dst)[..., rows, :])
                     srcs.append(kv_cache.select(axis, src)[..., rows, :])
         torch._foreach_copy_(dsts, srcs)
