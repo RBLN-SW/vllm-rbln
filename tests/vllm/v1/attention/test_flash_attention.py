@@ -749,6 +749,21 @@ class TestRingUnderGemma4Mtp:
             for row, pos in enumerate(range(start, end)):
                 torch.testing.assert_close(out[row], dense(queries[pos], pos))
 
+        def draft(last, ring_start):
+            # The drafter's read, as RBLNGemma4Proposer._build_draft_step sets it up.
+            query = torch.randn(D, generator=gen)
+            out = attend(
+                last,
+                query,
+                None,
+                None,
+                decode_table(last, 1, ring_start=torch.tensor([ring_start])),
+                W,
+            )
+            torch.testing.assert_close(out[0], dense(query, last))
+
+        # After the last prefill chunk the ring is not filled yet.
+        draft(prompt - 1, 0)
         start = prompt
         while start + 2 * K + 1 < max_len:
             schedule(start, K + 1, K)
@@ -772,18 +787,8 @@ class TestRingUnderGemma4Mtp:
                     out[row], dense(queries[start + row], start + row)
                 )
 
-            # The drafter's read, as RBLNGemma4Proposer._build_draft_step sets it up.
             last = start + kept
-            query = torch.randn(D, generator=gen)
-            out = attend(
-                last,
-                query,
-                None,
-                None,
-                decode_table(last, 1, ring_start=torch.tensor([start])),
-                W,
-            )
-            torch.testing.assert_close(out[0], dense(query, last))
+            draft(last, start)
             start = last + 1
 
 

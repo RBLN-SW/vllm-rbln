@@ -1364,9 +1364,28 @@ class TestGemma4Drafting:
             assert result.tolist() == [[31, 32, 33], [32, 33, 34]]
             # Each request's first position in the target step.
             assert step_starts == [[0, 2]]
+
             for step, (positions, hidden) in enumerate(seen):
                 assert positions.flatten().tolist() == [1, 3]
                 torch.testing.assert_close(hidden, torch.full_like(hidden, step))
+
+    def test_a_draft_after_prefill_reads_the_block_before_as_it_is(self, monkeypatch):
+        from vllm_rbln.v1.spec_decode import gemma4 as gemma4_module
+
+        base = make_eagle_proposer(num_speculative_tokens=3)
+        proposer = gemma4_module.RBLNGemma4Proposer(base.vllm_config, base.device, None)
+        _wire_runner(proposer, num_reqs=2)
+        proposer.runner.is_prefill = True
+        step_starts = []
+
+        def build_draft_step(num_reqs, positions, starts):
+            step_starts.append(starts.tolist())
+            raise RuntimeError("stop after the draft step is built")
+
+        monkeypatch.setattr(proposer, "_build_draft_step", build_draft_step)
+        with pytest.raises(RuntimeError, match="stop after"):
+            _call_propose(proposer)
+        assert step_starts == [[0, 0]]
 
     @staticmethod
     def _draft_metadata(spec, position, step_start):

@@ -109,6 +109,10 @@ class RBLNGemma4Proposer(RBLNEagleProposer):
         step_starts = target_positions[
             common_attn_metadata.query_start_loc[:num_reqs].long()
         ]
+        if self.runner.is_prefill:
+            # The ring fills on the first decode step; until then the block
+            # before is held and read as it is.
+            step_starts = torch.zeros_like(step_starts)
         per_layer_attn_metadata, num_reqs_padded, forward_kwargs = (
             self._build_draft_step(num_reqs, positions, step_starts)
         )
