@@ -69,6 +69,7 @@ from vllm_rbln.model_executor.layers.quantization.deepseek_v4 import (
     e8m0_to_bf16,
 )
 from vllm_rbln.patches.attention import _resolve_kv_cache
+from vllm_rbln.utils import is_prefill_step
 from vllm_rbln.v1.attention.backends.deepseek_v4 import (
     DSV4_INDEX_HEAD_DIM,
     DSV4_KV8_ROW_BYTES,
@@ -138,6 +139,14 @@ class RBLNDeepseekV4WindowCache(_RBLNDeepseekV4Cache):
         pool = scheduler.max_num_seqs * decode + prefill
         if vllm_config.cache_config.enable_prefix_caching:
             pool *= 2
+            retention = vllm_config.cache_config.prefix_cache_retention_interval
+            if retention:
+                length = vllm_config.model_config.max_model_len
+                tail = -(-(2 * self.segment - 1) // self.block_size)
+                retained = min(
+                    length // retention * tail, -(-length // self.block_size)
+                )
+                pool += scheduler.max_num_seqs * retained
         return RBLNDeepseekV4WindowSpec(
             num_state_slots=pool + 1,
             blocks_per_request=decode,
@@ -883,7 +892,14 @@ def _hc_head_hidden(
     z_pre = F.linear(x, fn) * scale + base
     streams = rows.reshape(1, -1, hc_mult, hidden).transpose(1, 2)  # [1, n, N, H]
     out = torch.ops.rbln_custom_ops.hc_stream_reduce(streams.float(), z_pre, eps=hc_eps)
-    return norm(out.to(flat.dtype)).reshape(*lead, hidden)
+    out = out.to(flat.dtype)
+    if not is_prefill_step():
+        out = torch.ops.rbln_custom_ops.residual_read(
+            out, norm.weight, norm.variance_epsilon
+        )
+    else:
+        out = norm(out)
+    return out.reshape(*lead, hidden)
 
 
 class RBLNDeepseekV4Model(nn.Module):

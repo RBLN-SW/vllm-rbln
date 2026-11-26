@@ -111,11 +111,7 @@ class TestDeepseekV4Window:
         )
         assert isinstance(self._spec(), RBLNDeepseekV4WindowSpec)
 
-    @pytest.mark.parametrize("prefix_unit", [None, 512, 8192])
-    @pytest.mark.parametrize("prompt_length", [129, 8192, 8193, 18001])
-    def test_a_window_hit_reuses_a_partial_compressed_page(
-        self, prefix_unit, prompt_length
-    ):
+    def _cache_manager(self, *, prefix_unit=None, retention=0, slots=1025, lookahead=0):
         from dataclasses import replace
 
         from vllm.v1.core.kv_cache_manager import KVCacheManager
@@ -147,7 +143,7 @@ class TestDeepseekV4Window:
             KVCacheGroupSpec(
                 [f"window-{size}"],
                 replace(
-                    self._spec(slots=65, block_size=size, window=window),
+                    self._spec(slots=slots, block_size=size, window=window),
                     prefix_match_unit=prefix_unit,
                 ),
             )
@@ -157,16 +153,24 @@ class TestDeepseekV4Window:
             num_blocks=64,
             kv_cache_tensors=[],
             kv_cache_groups=groups,
-            prefix_cache_retention_interval=0,
+            prefix_cache_retention_interval=retention,
         )
-        manager = KVCacheManager(
+        return KVCacheManager(
             config,
             32768,
             8192,
             64,
             enable_caching=True,
             max_in_flight_tokens=512,
+            num_prefill_lookahead=lookahead,
         )
+
+    @pytest.mark.parametrize("prefix_unit", [None, 512, 8192])
+    @pytest.mark.parametrize("prompt_length", [129, 8192, 8193, 18001])
+    def test_a_window_hit_reuses_a_partial_compressed_page(
+        self, prefix_unit, prompt_length
+    ):
+        manager = self._cache_manager(prefix_unit=prefix_unit)
         prompt = list(range(prompt_length))
         first = make_request("first", prompt, 64)
         while first.num_computed_tokens < len(prompt):
@@ -192,6 +196,54 @@ class TestDeepseekV4Window:
         expected_copies = sum(hit % size != 0 for size in (2048, 8192))
         assert len(copies) == expected_copies
         assert len(retained) == 2 * expected_copies
+
+    @pytest.mark.parametrize("retention", [128, 512, 1024, 2048, 8192])
+    @pytest.mark.parametrize("decode", [False, True])
+    @pytest.mark.parametrize("lookahead", [0, 1])
+    def test_retention_preserves_interior_and_generated_prefixes(
+        self, retention, decode, lookahead
+    ):
+        manager = self._cache_manager(retention=retention, lookahead=lookahead)
+        tokens = list(range(20001))
+        first = make_request(
+            "first",
+            tokens[:17001] if decode else tokens,
+            64,
+            num_hash_lookahead_tokens=lookahead,
+        )
+        while first.num_computed_tokens < first.num_tokens:
+            count = min(512, first.num_tokens - first.num_computed_tokens)
+            assert manager.allocate_slots(first, count) is not None
+            first.num_computed_tokens += count
+        if decode:
+            for token in tokens[17001:]:
+                first.append_output_token_ids(token)
+                assert manager.allocate_slots(first, 1) is not None
+                first.num_computed_tokens += 1
+        manager.free(first)
+
+        for boundary in range(retention, len(tokens) - 1, retention):
+            sibling = make_request(
+                "sibling",
+                tokens[: boundary + lookahead] + [-1] * 129,
+                64,
+                num_hash_lookahead_tokens=lookahead,
+            )
+            _, hit, _ = manager.get_computed_blocks(sibling)
+            assert hit == boundary
+            if lookahead:
+                changed = make_request(
+                    "changed",
+                    tokens[:boundary] + [-1] * 129,
+                    64,
+                    num_hash_lookahead_tokens=lookahead,
+                )
+                assert manager.get_computed_blocks(changed)[1] < boundary
+
+    @pytest.mark.parametrize("retention", [64, 192, -128])
+    def test_retention_must_align_with_window_hits(self, retention):
+        with pytest.raises(ValueError, match="retention"):
+            self._cache_manager(retention=retention)
 
 
 def _spec(*, block_size=16, sliding_window=16):

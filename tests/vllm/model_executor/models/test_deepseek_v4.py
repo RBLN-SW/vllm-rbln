@@ -396,6 +396,33 @@ def test_cache_inputs_use_names_in_the_rank_local_cache_order():
         assert scale.inputs() is caches[0]
 
 
+@pytest.mark.parametrize("segment,block_size", [(128, 128), (8, 64)])
+@pytest.mark.parametrize("retention", [128, 512, 2048])
+def test_window_pool_reserves_periodic_prefixes(segment, block_size, retention):
+    from tests.vllm.vllm_config import make_vllm_config
+    from vllm_rbln.model_executor.models.deepseek_v4 import RBLNDeepseekV4WindowCache
+
+    window = RBLNDeepseekV4WindowCache.__new__(RBLNDeepseekV4WindowCache)
+    torch.nn.Module.__init__(window)
+    window.segment, window.block_size = segment, block_size
+    window.width, window.dtype = 768, torch.uint8
+    config = make_vllm_config(max_model_len=17408, max_num_batched_tokens=512)
+    config.scheduler_config.max_num_seqs = 16
+    config.cache_config.enable_prefix_caching = True
+    config.cache_config.prefix_cache_retention_interval = 0
+    baseline = window.get_kv_cache_spec(config).num_state_slots
+    config.cache_config.prefix_cache_retention_interval = retention
+    spec = window.get_kv_cache_spec(config)
+    pages = {
+        token // block_size
+        for boundary in range(
+            retention, config.model_config.max_model_len + 1, retention
+        )
+        for token in range(max(0, boundary - (2 * segment - 1)), boundary)
+    }
+    assert spec.num_state_slots >= baseline + len(pages) * 16
+
+
 @pytest.mark.parametrize("is_prefill", [False, True])
 def test_window_metadata_preserves_absolute_positions(is_prefill):
     from tests.vllm.v1.attention.utils import make_builder, make_common_attn_metadata
@@ -512,23 +539,45 @@ def test_mtp_loads_own_embedding_on_last_pp_stage(monkeypatch, stages):
 
 
 @pytest.mark.parametrize("sampled_only", [False, True])
-def test_head_relocation_preserves_reduction(sampled_only):
+@pytest.mark.parametrize("prefill", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_head_relocation_preserves_reduction(monkeypatch, sampled_only, prefill, dtype):
+    from vllm.config import set_current_vllm_config
+    from vllm.model_executor.layers.layernorm import RMSNorm
+
+    import vllm_rbln.model_executor.models.deepseek_v4 as dsv4
+    from tests.vllm.vllm_config import make_vllm_config
     from vllm_rbln.model_executor.models.deepseek_v4 import _hc_head_hidden
 
+    reads = []
+    residual_read = torch.ops.rbln_custom_ops.residual_read
+
+    def read(x, weight, eps):
+        reads.append(tuple(x.shape))
+        return residual_read(x, weight, eps)
+
+    monkeypatch.setattr(dsv4, "is_prefill_step", lambda: prefill)
+    monkeypatch.setattr(torch.ops.rbln_custom_ops, "residual_read", read)
     rng = torch.Generator().manual_seed(7)
-    streams = torch.randn(2, 4, 3, 8, generator=rng)
+    streams = torch.randn(2, 4, 3, 8, generator=rng).to(dtype)
     fn = torch.randn(4, 32, generator=rng)
     base = torch.randn(4, generator=rng)
     scale = torch.tensor([0.25])
-    norm = torch.nn.RMSNorm(8, eps=1e-5)
+    with set_current_vllm_config(make_vllm_config()):
+        norm = RMSNorm(8, eps=1e-5, dtype=dtype)
+    norm.weight.data = (1.0 + 0.1 * torch.randn(8, generator=rng)).to(dtype)
     flat = streams.transpose(1, 2).reshape(2, 3, 32)
-    normalized = flat * torch.rsqrt(flat.square().mean(-1, keepdim=True) + 1e-5)
+    normalized = flat.float() * torch.rsqrt(
+        flat.float().square().mean(-1, keepdim=True) + 1e-5
+    )
     gates = torch.sigmoid(normalized @ fn.T * scale + base) + 1e-6
-    expected = norm((streams * gates.transpose(1, 2).unsqueeze(-1)).sum(1))
+    expected = norm((streams * gates.transpose(1, 2).unsqueeze(-1)).sum(1).to(dtype))
     if sampled_only:
         flat = flat[:, -1]
         expected = expected[:, -1]
     actual = _hc_head_hidden(flat, 4, fn, scale, base, 1e-5, 1e-6, norm)
+    assert reads == ([] if prefill else [(1, 2 if sampled_only else 6, 8)])
+    assert actual.dtype == dtype
     torch.testing.assert_close(actual, expected)
 
 

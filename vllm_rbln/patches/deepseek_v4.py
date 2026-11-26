@@ -54,7 +54,7 @@ def register_rbln_deepseek_v4_fp8_config() -> None:
 
 @add_registration(
     reason=(
-        "RBLN's paged windows retain selected prompt boundaries only, "
+        "RBLN's paged windows require bounded prefix retention, "
         "do not support KV transfer, and limit speculative lookahead."
     )
 )
@@ -75,10 +75,11 @@ def register_deepseek_v4_config() -> None:
                     raise ValueError(
                         "DeepSeek-V4 prefix caching requires device tensors."
                     )
-                if cache.prefix_cache_retention_interval != 0:
+                if cache.prefix_cache_retention_interval is None:
                     raise ValueError(
-                        "DeepSeek-V4 prefix caching on RBLN supports "
-                        "prefix_cache_retention_interval=0 only."
+                        "DeepSeek-V4 prefix_cache_retention_interval must be 0 "
+                        "or a positive interval; dense retention (None) is "
+                        "not supported."
                     )
             speculative = vllm_config.speculative_config
             if cache.enable_prefix_caching and speculative is not None:

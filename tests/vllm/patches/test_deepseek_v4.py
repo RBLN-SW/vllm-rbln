@@ -63,8 +63,8 @@ def test_config_rejects_unsupported_window_cache_transfer():
         MODELS_CONFIG_MAP["DeepseekV4ForCausalLM"].verify_and_update_config(config)
 
 
-@pytest.mark.parametrize("retention", [None, 0, 8192])
-def test_prefix_caching_supports_prompt_checkpoints_only(monkeypatch, retention):
+@pytest.mark.parametrize("retention", [None, 0, 512, 8192])
+def test_prefix_caching_supports_bounded_retention(monkeypatch, retention):
     from vllm.model_executor.models.config import (
         MODELS_CONFIG_MAP,
         DeepseekV4ForCausalLMConfig,
@@ -87,10 +87,10 @@ def test_prefix_caching_supports_prompt_checkpoints_only(monkeypatch, retention)
         kv_transfer_config=None,
     )
     adapter = MODELS_CONFIG_MAP["DeepseekV4ForCausalLM"]
-    if retention == 0:
+    if retention is not None:
         adapter.verify_and_update_config(config)
     else:
-        with pytest.raises(ValueError, match="retention_interval=0"):
+        with pytest.raises(ValueError, match="retention"):
             adapter.verify_and_update_config(config)
 
 

@@ -285,7 +285,11 @@ def test_single_request_window_pool_retains_both_mtp_replay_boundaries(
         speculative_config=SimpleNamespace(num_speculative_tokens=drafts)
         if drafts
         else None,
-        cache_config=SimpleNamespace(enable_prefix_caching=True, prefix_match_unit=16),
+        cache_config=SimpleNamespace(
+            enable_prefix_caching=True,
+            prefix_match_unit=16,
+            prefix_cache_retention_interval=0,
+        ),
         scheduler_config=SimpleNamespace(max_num_seqs=1, max_num_batched_tokens=16),
         model_config=SimpleNamespace(
             hf_text_config=SimpleNamespace(num_hidden_layers=1)
@@ -344,11 +348,12 @@ def test_single_request_window_pool_retains_both_mtp_replay_boundaries(
     )
 
 
-@pytest.mark.parametrize("batch", [1, 8, 32])
+@pytest.mark.parametrize("batch", [1, 16, 32])
 @pytest.mark.parametrize("drafts", [0, 3])
 @pytest.mark.parametrize("chunk", [512, 2048])
+@pytest.mark.parametrize("retention", [0, 512, 2048])
 def test_window_pools_admit_full_batches_through_prefill_and_rollback(
-    batch, drafts, chunk
+    batch, drafts, chunk, retention
 ):
     from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
     from vllm.v1.kv_cache_interface import MLAAttentionSpec
@@ -360,8 +365,13 @@ def test_window_pools_admit_full_batches_through_prefill_and_rollback(
     register_all_kvcache_specs(None)
     RblnPlatform.register_custom_kv_cache_specs(None)
     config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=18432),
         speculative_config=SimpleNamespace(num_speculative_tokens=drafts),
-        cache_config=SimpleNamespace(enable_prefix_caching=True, prefix_match_unit=128),
+        cache_config=SimpleNamespace(
+            enable_prefix_caching=True,
+            prefix_match_unit=128,
+            prefix_cache_retention_interval=retention,
+        ),
         scheduler_config=SimpleNamespace(
             max_num_seqs=batch, max_num_batched_tokens=chunk
         ),
@@ -387,12 +397,12 @@ def test_window_pools_admit_full_batches_through_prefill_and_rollback(
         )
         specs.append(cache.get_kv_cache_spec(config))
     kv = make_kv_cache_config(specs, batch * 32 + 1)
-    kv.prefix_cache_retention_interval = 0
+    kv.prefix_cache_retention_interval = retention
     scheduler = create_rbln_scheduler(
         model="Qwen/Qwen3-0.6B",
         max_num_seqs=batch,
         max_num_batched_tokens=chunk,
-        max_model_len=32768,
+        max_model_len=18432,
         block_size=8192,
         hash_block_size=64,
         enable_prefix_caching=True,
@@ -444,6 +454,25 @@ def test_window_pools_admit_full_batches_through_prefill_and_rollback(
             steps += 1
             assert steps < 3000
         assert all(p.get_num_free_blocks() == len(p.blocks) - 1 for p in pools)
+        if retention:
+            for i in range(batch):
+                boundaries = (
+                    range(retention, 17408 - 1, retention)
+                    if (batch, drafts, chunk) == (16, 3, 512)
+                    else [16384 - retention]
+                )
+                history = [i + 1] * 16384 + [700] * 1024
+                for boundary in boundaries:
+                    sibling = make_request(
+                        f"interior-{round_id}-{i}",
+                        history[: boundary + int(bool(drafts))] + [701] * 129,
+                        64,
+                        num_hash_lookahead_tokens=int(bool(drafts)),
+                    )
+                    assert (
+                        scheduler.kv_cache_manager.get_computed_blocks(sibling)[1]
+                        == boundary
+                    )
     assert scheduler.kv_cache_manager.reset_prefix_cache()
 
 

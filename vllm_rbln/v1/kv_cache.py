@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import prod
 from typing import Any
 
@@ -107,9 +107,17 @@ class RBLNDeepseekV4WindowManager(SlidingWindowManager):
 class RBLNDeepseekV4CacheCoordinator(HybridKVCacheCoordinator):
     """Use lookahead hashes instead of dropping a whole replay block."""
 
-    def __init__(self, *args, num_prefill_lookahead=0, **kwargs):
+    def __init__(self, kv_cache_config, *args, num_prefill_lookahead=0, **kwargs):
         self.num_hash_lookahead_tokens = num_prefill_lookahead
-        super().__init__(*args, num_prefill_lookahead=num_prefill_lookahead, **kwargs)
+        # Upstream validates retention against the compressed-page LCM. DSV4
+        # can resume at whole-window boundaries inside those pages instead.
+        super().__init__(
+            replace(kv_cache_config, prefix_cache_retention_interval=0),
+            *args,
+            num_prefill_lookahead=num_prefill_lookahead,
+            **kwargs,
+        )
+        self.kv_cache_config = kv_cache_config
         self.enable_partial_hash_hits = (
             kwargs.get("allow_partial_hash_hits", True)
             and self.hash_block_size < self.scheduler_block_size
@@ -121,6 +129,13 @@ class RBLNDeepseekV4CacheCoordinator(HybridKVCacheCoordinator):
         )
         if not self.enable_partial_hash_hits:
             self.prefix_match_unit = self.scheduler_block_size
+        retention = kv_cache_config.prefix_cache_retention_interval
+        if retention is None or retention < 0 or retention % self.prefix_match_unit:
+            raise ValueError(
+                f"DeepSeek-V4 prefix_cache_retention_interval ({retention}) must "
+                f"be non-negative and a multiple of {self.prefix_match_unit}."
+            )
+        self.retention_interval = retention
         for manager in self.single_type_managers:
             manager.cache_hit_alignment_tokens = self.prefix_match_unit
         self._partial_hit_tokens: dict[str, int] = {}
@@ -140,6 +155,14 @@ class RBLNDeepseekV4CacheCoordinator(HybridKVCacheCoordinator):
         num_tokens = min(
             num_computed_tokens, len(request.block_hashes) * self.hash_block_size
         )
+        previous_full_blocks = {
+            manager.kv_cache_group_id: manager.num_cached_block.get(
+                request.request_id, 0
+            )
+            for manager in self.single_type_managers
+            if self.retention_interval
+            and not isinstance(manager, RBLNDeepseekV4WindowManager)
+        }
         super().cache_blocks(request, num_tokens)
         if not self.enable_partial_hash_hits:
             return
@@ -160,7 +183,20 @@ class RBLNDeepseekV4CacheCoordinator(HybridKVCacheCoordinator):
             if isinstance(manager, RBLNDeepseekV4WindowManager):
                 continue
             blocks = manager.req_to_blocks[request.request_id]
-            for boundary in boundaries:
+            retained_boundaries = boundaries
+            if self.retention_interval:
+                start = (
+                    previous_full_blocks[manager.kv_cache_group_id] * manager.block_size
+                )
+                periodic = range(
+                    (start // self.retention_interval + 1) * self.retention_interval,
+                    num_tokens + 1,
+                    self.retention_interval,
+                )
+                retained_boundaries = sorted(
+                    set(boundaries).union(periodic), reverse=True
+                )
+            for boundary in retained_boundaries:
                 if 0 < boundary <= num_tokens and boundary % manager.block_size:
                     self.block_pool.cache_partial_block(
                         request,
