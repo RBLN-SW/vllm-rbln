@@ -1588,6 +1588,36 @@ class TestKvRegistrationOrder:
         assert calls == ["initialize_kv_cache", "register", "resize"]
 
 
+class TestNotifyKvCacheReady:
+    def test_the_connector_hears_after_the_device_drains(self, monkeypatch):
+        # A connector that defers registration here (LMCache's multiprocess
+        # connector) must see the config `register_kv_caches` used to run under.
+        vllm_config = _make_vllm_config()
+        calls: list = []
+        worker = SimpleNamespace(
+            vllm_config=vllm_config,
+            synchronize_device=lambda: calls.append("synchronize"),
+        )
+        connector = SimpleNamespace(
+            on_kv_cache_ready=lambda: calls.append(get_current_vllm_config())
+        )
+        monkeypatch.setattr(wm, "has_kv_transfer_group", lambda: True)
+        monkeypatch.setattr(wm, "get_kv_transfer_group", lambda: connector)
+
+        RBLNWorker.notify_kv_cache_ready(worker)
+
+        assert calls == ["synchronize", vllm_config]
+
+    def test_a_worker_without_a_connector_does_nothing(self, monkeypatch):
+        calls: list = []
+        worker = SimpleNamespace(synchronize_device=lambda: calls.append("sync"))
+        monkeypatch.setattr(wm, "has_kv_transfer_group", lambda: False)
+
+        RBLNWorker.notify_kv_cache_ready(worker)
+
+        assert calls == []
+
+
 class TestProfile:
     # With RBLN_PROFILER on, kineto's bridge opens and flushes the RBLN session for
     # the torch profile, so the RBLN wrapper has to stay out of it. The flag is

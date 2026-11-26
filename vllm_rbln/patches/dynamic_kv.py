@@ -11,7 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Hand the dynamic-KV block count to the scheduler after warm-up."""
+"""Hand the dynamic-KV block count to the scheduler after warm-up, then tell
+the KV connectors the cache is final."""
 
 # NOTE(RBLN): `EngineCore._initialize_kv_caches` is the only hook that works for
 # both single-process and TP>1 -- it warms the workers up before returning, and
@@ -60,16 +61,30 @@ def resolve_rank_num_blocks(num_blocks_per_rank: list[Any]) -> int | None:
     reason=(
         "upstream offers no extension point between warm-up and Scheduler "
         "construction, and the true block count exists only after warm-up, "
-        "when the compiled artifact reports its memory profile."
+        "when the compiled artifact reports its memory profile. Connectors "
+        "learn the cache is final only after that resize (backported "
+        "vllm-project/vllm#66574)."
     ),
 )
 def patched_initialize_kv_caches(
     self: EngineCore, vllm_config: VllmConfig
 ) -> KVCacheConfig:
     kv_cache_config = engine_core_original_initialize_kv_caches(self, vllm_config)
+    resize_to_dynamic_kv(self, vllm_config, kv_cache_config)
 
+    kv_transfer_config = vllm_config.kv_transfer_config
+    if kv_transfer_config is not None and kv_transfer_config.is_kv_transfer_instance:
+        self.model_executor.collective_rpc("notify_kv_cache_ready")
+    return kv_cache_config
+
+
+def resize_to_dynamic_kv(
+    self: EngineCore, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
+) -> None:
+    """Resize the workers' caches and ``kv_cache_config`` in place to the block
+    count the compiled artifacts report, when the dynamic KV cache is on."""
     if vllm_config.additional_config.use_dynamic_kv_cache is False:
-        return kv_cache_config
+        return
     # The workers resolve this independently and stay on the estimate too.
     if (reason := dynamic_kv_unsupported_reason(vllm_config)) is not None:
         logger.warning(
@@ -78,7 +93,7 @@ def patched_initialize_kv_caches(
             reason,
             kv_cache_config.num_blocks,
         )
-        return kv_cache_config
+        return
 
     # The worker gates on the override too, so nothing has been resized here.
     override = vllm_config.cache_config.num_gpu_blocks_override
@@ -90,7 +105,7 @@ def patched_initialize_kv_caches(
             override,
             kv_cache_config.num_blocks,
         )
-        return kv_cache_config
+        return
 
     num_blocks_per_rank = self.model_executor.collective_rpc(
         "compute_dynamic_kv_num_blocks"
@@ -105,7 +120,7 @@ def patched_initialize_kv_caches(
     if num_blocks is None:
         # Nothing usable: tell the workers to put the pre-shrink count back.
         self.model_executor.collective_rpc("apply_dynamic_kv_num_blocks", args=(None,))
-        return kv_cache_config
+        return
 
     self.model_executor.collective_rpc(
         "apply_dynamic_kv_num_blocks", args=(num_blocks,)
@@ -129,7 +144,6 @@ def patched_initialize_kv_caches(
     )
     check_enough_kv_cache_blocks_after_resize(vllm_config, kv_cache_config)
     _log_gpu_kv_cache_size(vllm_config, kv_cache_config)
-    return kv_cache_config
 
 
 def check_enough_kv_cache_blocks_after_resize(

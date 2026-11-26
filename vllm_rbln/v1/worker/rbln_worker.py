@@ -506,6 +506,18 @@ class RBLNWorker(WorkerBase):
                 finalize_kv_cache_registrations(get_kv_transfer_group())
             return applied
 
+    def notify_kv_cache_ready(self) -> None:
+        """RPC target of the engine's KV-cache-ready call; backports
+        `WorkerBase.notify_kv_cache_ready` from vllm-project/vllm#66574."""
+        if not has_kv_transfer_group():
+            return
+        self.synchronize_device()
+        # Registration deferred to this hook may resolve the KV layout through
+        # `get_current_vllm_config()`; this RPC arrives outside the scope that
+        # WorkerWrapperBase opens around `initialize_from_config`.
+        with set_current_vllm_config(self.vllm_config, check_compile=False):
+            get_kv_transfer_group().on_kv_cache_ready()
+
     @worker_fail_fast
     @instrument(span_name="Warmup (NPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
