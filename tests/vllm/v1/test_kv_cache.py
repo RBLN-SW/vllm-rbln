@@ -592,33 +592,52 @@ class TestRBLNRingSlidingWindowManager:
         copies, m.pending_copies = m.pending_copies, []
         return copies
 
-    def test_a_step_entering_a_block_copies_the_rows_it_has_yet_to_write(self):
+    def test_a_decode_step_entering_a_block_copies_the_rows_it_has_yet_to_write(
+        self,
+    ):
         m = self._manager()
-        # A prefill chunk that stays in the first block has nothing to copy.
+        # Prefill reads the block before as it is, even entering a new block.
         assert self._step(m, 0, 16) == []
-        first = m.req_to_blocks["r"][0]
-        # The last chunk enters the second block at its row 0, the first decode
-        # step stays in it, and a later one enters the third.
-        assert self._step(m, 16, 4) == [
-            (first.block_id, m.req_to_blocks["r"][1].block_id, 0)
-        ]
+        assert self._step(m, 16, 4) == []
+        first, second = m.req_to_blocks["r"][:2]
+        # The first decode step fills the ring from its row on, and a later one
+        # entering the third block does the same.
+        assert self._step(m, 20, 1) == [(first.block_id, second.block_id, 4)]
         assert first.ref_cnt == 2
-        assert self._step(m, 20, 1) == []
-        for pos in range(21, 32):
+        assert self._step(m, 21, 1) == []
+        for pos in range(22, 32):
             self._step(m, pos, 1)
-        second = m.req_to_blocks["r"][1]
         assert self._step(m, 32, 1) == [
             (second.block_id, m.req_to_blocks["r"][2].block_id, 0)
         ]
 
-    def test_a_first_step_at_the_start_of_a_block_copies_too(self):
-        # A resumed request: cache hits up to a block boundary, then one token,
-        # before the manager has cached anything for it.
+    def test_a_request_resumed_at_a_block_boundary_copies_once_it_decodes(self):
         m = self._manager()
-        m.get_num_blocks_to_allocate("r", 33, [], 32, 32, 33)
-        m.allocate_new_blocks("r", 33, 33)
+        assert self._step(m, 32, 1, num_prompt=33) == []
         blocks = m.req_to_blocks["r"]
-        assert m.pending_copies == [(blocks[1].block_id, blocks[2].block_id, 0)]
+        assert self._step(m, 33, 1, num_prompt=33) == [
+            (blocks[1].block_id, blocks[2].block_id, 1)
+        ]
+
+    def test_a_recompute_past_the_prompt_is_still_prefill(self):
+        # Preempted with 20 tokens out of a 4-token prompt: recomputing them is
+        # prefill, and only the step after the last of them decodes.
+        from tests.vllm.v1.core.utils import make_request
+
+        m = self._manager()
+        request = make_request("r", list(range(21)), 16)
+        request.num_prompt_tokens = 4
+        for start, end in ((0, 16), (16, 20)):
+            m.remove_skipped_blocks("r", start)
+            m.get_num_blocks_to_allocate("r", end, [], start, start, end)
+            m.allocate_new_blocks("r", end, end)
+            m.cache_blocks(request, end, replay_boundaries=[])
+        assert m.pending_copies == []
+        m.get_num_blocks_to_allocate("r", 21, [], 20, 20, 21)
+        m.allocate_new_blocks("r", 21, 21)
+        m.cache_blocks(request, 21, replay_boundaries=[])
+        blocks = m.req_to_blocks["r"]
+        assert m.pending_copies == [(blocks[0].block_id, blocks[1].block_id, 4)]
 
     def test_the_blocks_before_the_window_are_freed_once_the_request_decodes(self):
         m = self._manager()
@@ -626,10 +645,13 @@ class TestRBLNRingSlidingWindowManager:
         first = m.req_to_blocks["r"][0]
         # Prefill enters the second block and goes on reading the first.
         self._step(m, 16, 4, num_prompt=24)
-        m.block_pool.free_blocks([first])  # the copy's ref
         self._step(m, 20, 4, num_prompt=24)
         assert m.req_to_blocks["r"][0] is first
+        # The first decode step copies from it; the next one frees it.
         self._step(m, 24, 1, num_prompt=24)
+        assert m.req_to_blocks["r"][0] is first
+        m.block_pool.free_blocks([first])  # the copy's ref
+        self._step(m, 25, 1, num_prompt=24)
         assert m.req_to_blocks["r"][0].is_null
         assert first.ref_cnt == 0
 

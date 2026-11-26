@@ -424,11 +424,13 @@ class RBLNRingSlidingWindowSpec(SlidingWindowSpec):
 class RBLNRingSlidingWindowManager(SlidingWindowManager):
     """Keeps a decoding request's window in one block.
 
-    A step whose first token lands in a block new to the request first has the
-    rows it has yet to write copied from the block before (`pending_copies`), so
-    row r of that block holds the latest key congruent to r that a query can
-    still reach. Once the request decodes, the blocks before it are freed; they
-    stay cached.
+    A decode step whose first token lands in a block the ring does not hold yet
+    first has the rows it has yet to write copied from the block before
+    (`pending_copies`), so row r of that block holds the latest key congruent to
+    r that a query can still reach. Prefill reads the block before as it is, and
+    its padded chunk writes past the prompt into those rows, so the ring is only
+    filled once decoding starts. The blocks before it are freed then; they stay
+    cached.
     """
 
     def __init__(self, kv_cache_spec: SlidingWindowSpec, **kwargs) -> None:
@@ -465,28 +467,6 @@ class RBLNRingSlidingWindowManager(SlidingWindowManager):
             **kwargs,
         )
 
-    def allocate_new_blocks(
-        self, request_id: str, num_tokens: int, num_tokens_main_model: int
-    ) -> list[KVCacheBlock]:
-        new_blocks = super().allocate_new_blocks(
-            request_id, num_tokens, num_tokens_main_model
-        )
-        start = self._step_start[request_id]
-        column = start // self.block_size
-        if self._window_column.get(request_id) != column:
-            self._window_column[request_id] = column
-            blocks = self.req_to_blocks[request_id]
-            if column and not blocks[column - 1].is_null:
-                self.block_pool.touch([blocks[column - 1]])
-                self.pending_copies.append(
-                    (
-                        blocks[column - 1].block_id,
-                        blocks[column].block_id,
-                        start % self.block_size,
-                    )
-                )
-        return new_blocks
-
     def remove_skipped_blocks(
         self,
         request_id: str,
@@ -507,12 +487,28 @@ class RBLNRingSlidingWindowManager(SlidingWindowManager):
             self._remove_blocks_in_range(request_id, 0, column)
 
     def cache_blocks(self, request: Request, *args, **kwargs) -> None:
+        request_id = request.request_id
         # A streaming session prefills again after it decodes.
         if not request.resumable:
             self._decode_from.setdefault(
-                request.request_id,
-                max(request.num_prompt_tokens, request.num_tokens - 1),
+                request_id, max(request.num_prompt_tokens, request.num_tokens - 1)
             )
+        start = self._step_start[request_id]
+        if start < max(request.num_prompt_tokens, request.num_tokens - 1):
+            self._window_column.pop(request_id, None)
+        elif self._window_column.get(request_id) != start // self.block_size:
+            column = start // self.block_size
+            self._window_column[request_id] = column
+            blocks = self.req_to_blocks[request_id]
+            if column and not blocks[column - 1].is_null:
+                self.block_pool.touch([blocks[column - 1]])
+                self.pending_copies.append(
+                    (
+                        blocks[column - 1].block_id,
+                        blocks[column].block_id,
+                        start % self.block_size,
+                    )
+                )
         super().cache_blocks(request, *args, **kwargs)
 
     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:

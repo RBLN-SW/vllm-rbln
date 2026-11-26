@@ -627,13 +627,14 @@ class TestBuildRingSlidingWindowDecode:
 class TestRingUnderGemma4Mtp:
     """A ring block of BLOCK rows holding a WINDOW-wide window, driven through the
     ring manager, the builder and sliding_window_attention_v1's eager reference:
-    chunked prefill, then verify steps of DRAFTS + 1 tokens that keep a random
-    number of drafts, each followed by the MTP drafter's read. Freed blocks are
-    overwritten as if reallocated. Every kept row matches dense attention."""
+    chunked prefill padded to CHUNK rows, then verify steps of DRAFTS + 1 tokens
+    that keep a random number of drafts, each followed by the MTP drafter's read.
+    Freed blocks are overwritten as if reallocated. Every kept row matches dense
+    attention."""
 
-    BLOCK, WINDOW, DRAFTS, DIM, CHUNK = 12, 8, 4, 4, 5
+    BLOCK, WINDOW, DRAFTS, DIM, CHUNK = 12, 8, 4, 4, 8
 
-    @pytest.mark.parametrize("seed", range(4))
+    @pytest.mark.parametrize("seed", range(8))
     def test_kept_rows_and_drafts_match_dense_attention(self, seed):
         from vllm.v1.core.block_pool import BlockPool
         from vllm.v1.core.single_type_kv_cache_manager import (
@@ -735,11 +736,13 @@ class TestRingUnderGemma4Mtp:
         for start in range(0, prompt, self.CHUNK):
             end = min(start + self.CHUNK, prompt)
             schedule(start, end - start, 0)
+            # The compiled chunk writes its padding rows past the prompt too.
+            pad = torch.randn(3, start + self.CHUNK - end, D, generator=gen) * 50
             out = attend(
                 start,
-                queries[start:end],
-                keys[start:end],
-                values[start:end],
+                torch.cat([queries[start:end], pad[0]]),
+                torch.cat([keys[start:end], pad[1]]),
+                torch.cat([values[start:end], pad[2]]),
                 torch.tensor([table + [0] * 4]),
                 W,
             )
