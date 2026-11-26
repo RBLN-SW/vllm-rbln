@@ -77,7 +77,6 @@ class RBLNOptimumForEncoderModel(RBLNOptimumModelBase, VllmModelForPooling):
         super().__init__(vllm_config=vllm_config)
         pooler_config = vllm_config.model_config.pooler_config
         assert pooler_config is not None
-        pooler_config.seq_pooling_type = "CLS"
         # https://github.com/vllm-project/vllm/blob/v0.22.0/docs/models/pooling_models/scoring.md
         # vLLM groups score()-capable models into three "score types"
         # (docs/models/pooling_models, score_types.svg). Which pooler we build
