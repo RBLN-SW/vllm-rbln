@@ -641,13 +641,11 @@ class TestRBLNRingSlidingWindowManager:
             self._step(m, pos, num_new, resumable=True)
         assert m.req_to_blocks["r"][0] is first
 
-    # The block is 16: a window dividing it or wider than it is refused.
-    @pytest.mark.parametrize(
-        ("sliding_window", "refused"), [(8, True), (17, True), (12, False)]
-    )
-    def test_a_window_the_ring_cannot_address_is_refused(self, sliding_window, refused):
-        if refused:
-            with pytest.raises(NotImplementedError, match="use_swa_ring"):
-                self._manager(sliding_window=sliding_window)
-        else:
-            self._manager(sliding_window=sliding_window)
+    def test_a_window_wider_than_the_block_is_refused(self):
+        with pytest.raises(NotImplementedError, match="use_swa_ring"):
+            self._manager(sliding_window=17)
+
+    # The block is 16: as wide, narrower, and dividing it.
+    @pytest.mark.parametrize("sliding_window", [16, 12, 8])
+    def test_a_window_within_the_block_is_taken(self, sliding_window):
+        self._manager(sliding_window=sliding_window)

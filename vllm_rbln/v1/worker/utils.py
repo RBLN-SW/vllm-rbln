@@ -52,7 +52,7 @@ from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 from vllm_rbln import envs
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.logger import init_logger
-from vllm_rbln.v1.kv_cache import window_splits_block
+from vllm_rbln.v1.kv_cache import RBLNRingSlidingWindowSpec, window_splits_block
 from vllm_rbln.v1.worker.kv_placement import ChipletMemory, Unit
 
 if TYPE_CHECKING:
@@ -1141,8 +1141,10 @@ def prepare_kernel_block_sizes(
             # The shift kernel holds one window per block; the append kernel
             # gathers whole blocks around the window, whatever their size, so
             # it takes the block where upstream's block table refuses a window
-            # that does not divide it.
-            if window_splits_block(kv_cache_spec):
+            # that does not divide it. The ring addresses whole manager blocks.
+            if window_splits_block(kv_cache_spec) and not isinstance(
+                kv_cache_spec, RBLNRingSlidingWindowSpec
+            ):
                 kernel_block_sizes.append(kv_cache_spec.sliding_window)
             else:
                 kernel_block_sizes.append(kv_cache_group.kv_cache_spec.block_size)

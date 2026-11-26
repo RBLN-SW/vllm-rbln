@@ -625,16 +625,18 @@ class TestBuildRingSlidingWindowDecode:
 
 
 class TestRingUnderGemma4Mtp:
-    """A ring block of BLOCK rows holding a WINDOW-wide window, driven through the
+    """A ring block of `block` rows holding a WINDOW-wide window, driven through the
     ring manager, the builder and sliding_window_attention_v1's eager reference:
     chunked prefill, then verify steps of DRAFTS + 1 tokens that keep a random
     number of drafts, each followed by the MTP drafter's read. Freed blocks are
     overwritten as if reallocated. Every kept row matches dense attention."""
 
-    BLOCK, WINDOW, DRAFTS, DIM, CHUNK = 12, 8, 4, 4, 5
+    WINDOW, DRAFTS, DIM, CHUNK = 8, 4, 4, 5
 
+    # WINDOW + DRAFTS rows exactly, and a block the window divides.
+    @pytest.mark.parametrize("block", [12, 16])
     @pytest.mark.parametrize("seed", range(4))
-    def test_kept_rows_and_drafts_match_dense_attention(self, seed):
+    def test_kept_rows_and_drafts_match_dense_attention(self, block, seed):
         from vllm.v1.core.block_pool import BlockPool
         from vllm.v1.core.single_type_kv_cache_manager import (
             register_all_kvcache_specs,
@@ -648,7 +650,7 @@ class TestRingUnderGemma4Mtp:
         )
         from vllm_rbln.v1.kv_cache import RBLNRingSlidingWindowSpec
 
-        B, W, K, D = self.BLOCK, self.WINDOW, self.DRAFTS, self.DIM
+        B, W, K, D = block, self.WINDOW, self.DRAFTS, self.DIM
         gen = torch.Generator().manual_seed(seed)
         register_all_kvcache_specs(None)
         RblnPlatform.register_custom_kv_cache_specs(None)

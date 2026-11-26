@@ -526,6 +526,18 @@ class TestPrepareKernelBlockSizes:
         )
         assert prepare_kernel_block_sizes(_kv_config(sw), [[]]) == [32]
 
+    def test_a_ring_keeps_the_block_a_window_divides(self):
+        from vllm_rbln.v1.kv_cache import RBLNRingSlidingWindowSpec
+
+        sw = RBLNRingSlidingWindowSpec(
+            block_size=32,
+            num_kv_heads=1,
+            head_size=8,
+            dtype=torch.float16,
+            sliding_window=16,
+        )
+        assert prepare_kernel_block_sizes(_kv_config(sw), [[]]) == [32]
+
     def test_attention_uses_select_common_block_size(self):
         # AttentionSpec group -> select_common_block_size splits 32 to a backend-
         # supported 16.

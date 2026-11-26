@@ -433,12 +433,10 @@ class RBLNRingSlidingWindowManager(SlidingWindowManager):
 
     def __init__(self, kv_cache_spec: SlidingWindowSpec, **kwargs) -> None:
         super().__init__(kv_cache_spec, **kwargs)
-        # A wider window spans a third block, and one the window divides is held
-        # as several kernel blocks, which the ring does not address.
-        if self.sliding_window > self.block_size or window_splits_block(kv_cache_spec):
+        # A wider window spans a third block.
+        if self.sliding_window > self.block_size:
             raise NotImplementedError(
-                "use_swa_ring needs a block at least as wide as the sliding "
-                "window, and not a multiple of it."
+                "use_swa_ring needs a block at least as wide as the sliding window."
             )
         self._step_start: dict[str, int] = {}
         self._window_column: dict[str, int] = {}
