@@ -1051,6 +1051,9 @@ def test_rejection_sampler_warmup_uses_per_stage_batch_bound(head_dtype):
         if (bonus_logits := call.kwargs["bonus_logits"]) is not None:
             assert bonus_logits.dtype == head_dtype
         metadata = call.args[7]
+        if not metadata.all_greedy:
+            assert metadata.temperature is not None
+            assert metadata.temperature.dtype == torch.float32
         filters = [t for t in (metadata.top_k, metadata.top_p) if t is not None]
         variants.append(
             (
