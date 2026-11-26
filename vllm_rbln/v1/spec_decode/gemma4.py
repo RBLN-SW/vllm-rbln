@@ -189,7 +189,6 @@ class RBLNGemma4Proposer(RBLNEagleProposer):
                 positions=positions,
                 is_prefill=False,
                 batch_pad=num_reqs_padded,
-                skip_attn_masks=True,
                 is_prompt_sorted=self.runner.sort_batch_by_length,
             )
             self.runner.bind_kv_cache_to_metadata(attn_metadata)
