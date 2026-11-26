@@ -2996,7 +2996,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         if batch_desc is None:
             # A drained group: every rank read the same status, so they all stop
             # here and no collective inside the forward is left half-done.
-            return None
+            return
         query_len = batch_desc.query_len
         target_query_len = query_len
         if not is_prefill and self.uses_fixed_decode_window:
@@ -3106,7 +3106,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             num_padded_tokens=batch_desc.num_tokens_padded,
             **self.kv_cache_forward_context_kwargs(),
         ):
-            self.model_executable(
+            _ = self.model_executable(
                 **staged_model_input.as_kwargs(), **self._dummy_mm_kwargs(layout)
             )
             # The submission a step with no forward of its own was waiting for.
@@ -4162,14 +4162,15 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         num_spec = self.num_spec_tokens
         assert self.logits_processor is not None
         vocab_size = self.logits_processor.org_vocab_size
-        dtype = self.model_config.head_dtype
         device = self.input_batch.temperature.device
         # _sample pins the request axis to the per-PP-stage decode bound.
         batch_size = self.bucketing_manager.max_batch_size
         num_tokens = batch_size * num_spec
         num_draft_tokens = [num_spec] * batch_size
         draft_token_ids = torch.zeros(num_tokens, dtype=torch.int32, device=device)
-        target_logits = torch.zeros(num_tokens, vocab_size, dtype=dtype, device=device)
+        target_logits = torch.zeros(
+            num_tokens, vocab_size, dtype=self.dtype, device=device
+        )
         cu_num_draft_tokens = torch.arange(
             num_spec,
             num_tokens + 1,
@@ -4177,7 +4178,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
             dtype=torch.int32,
             device=device,
         )
-        bonus_logits = torch.zeros(batch_size, vocab_size, dtype=dtype, device=device)
+        bonus_logits = torch.zeros(
+            batch_size, vocab_size, dtype=self.dtype, device=device
+        )
         dummy_sampling_metadata = SamplingMetadata(
             temperature=None,
             all_greedy=True,
