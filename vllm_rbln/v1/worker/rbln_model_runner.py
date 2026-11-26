@@ -2665,7 +2665,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
         ):
             self.rejection_sampler.initialize_sampling_inputs(
                 self.bucketing_manager.max_batch_size,
-                self.logits_processor.org_vocab_size,
+                self.model_config.get_vocab_size(),
                 self.model_config.head_dtype,
                 self.input_batch.temperature.device,
             )
@@ -4160,8 +4160,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
     def _warmup_sampler_decode_batches(self) -> None:
         """Warm the device rejection-sample op at the decode batch size it will see."""
         num_spec = self.num_spec_tokens
-        assert self.logits_processor is not None
-        vocab_size = self.logits_processor.org_vocab_size
+        vocab_size = self.model_config.get_vocab_size()
         head_dtype = self.model_config.head_dtype
         device = self.input_batch.temperature.device
         # _sample pins the request axis to the per-PP-stage decode bound.

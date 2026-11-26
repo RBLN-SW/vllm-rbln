@@ -1004,8 +1004,9 @@ def test_rejection_sampler_warmup_asks_for_the_synthetic_variant():
         speculative_config=object(),
         num_spec_tokens=2,
         is_pooling_model=False,
-        model_config=SimpleNamespace(head_dtype=torch.bfloat16),
-        logits_processor=SimpleNamespace(org_vocab_size=10),
+        model_config=SimpleNamespace(
+            get_vocab_size=lambda: 10, head_dtype=torch.bfloat16
+        ),
         bucketing_manager=SimpleNamespace(
             decode_batch_buckets=[2, 4], max_batch_size=4
         ),
@@ -1029,7 +1030,7 @@ def test_rejection_sampler_warmup_asks_for_the_synthetic_variant():
 @pytest.mark.parametrize("warmup_enabled", [True, False])
 def test_load_model_initializes_rejection_buffers(monkeypatch, warmup_enabled):
     model = torch.nn.Module()
-    model.logits_processor = SimpleNamespace(org_vocab_size=10)
+    model.logits_processor = object()
     monkeypatch.setattr(mr.envs, "VLLM_RBLN_ENABLE_WARM_UP", warmup_enabled)
     loader = Mock()
     loader.load_model.return_value = model
@@ -1041,7 +1042,9 @@ def test_load_model_initializes_rejection_buffers(monkeypatch, warmup_enabled):
     runner = _make_runner_stub(
         load_config=None,
         vllm_config=None,
-        model_config=SimpleNamespace(model="m", head_dtype=torch.bfloat16),
+        model_config=SimpleNamespace(
+            model="m", get_vocab_size=lambda: 10, head_dtype=torch.bfloat16
+        ),
         offload_context=nullcontext,
         _resolve_mm_support=lambda: False,
         drafter=Mock(),
@@ -1071,9 +1074,8 @@ def test_rejection_sampler_warmup_uses_per_stage_batch_bound(head_dtype):
         speculative_config=object(),
         num_spec_tokens=2,
         is_pooling_model=False,
-        model_config=SimpleNamespace(head_dtype=head_dtype),
+        model_config=SimpleNamespace(get_vocab_size=lambda: 10, head_dtype=head_dtype),
         dtype=torch.bfloat16,
-        logits_processor=SimpleNamespace(org_vocab_size=10),
         bucketing_manager=SimpleNamespace(
             decode_batch_buckets=[2, 4], max_batch_size=4
         ),
