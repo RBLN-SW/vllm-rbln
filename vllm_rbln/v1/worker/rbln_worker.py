@@ -285,8 +285,15 @@ class RBLNWorker(WorkerBase):
                         f"{num_bits_set}; not supported."
                     )
 
+                weight_types = {
+                    group_cfg.get("weights", {}).get("type")
+                    for group_cfg in groups.values()
+                }
                 if num_bits == 8:
                     quantization = "fp8"
+                elif num_bits == 4 and weight_types == {"float"}:
+                    # NVFP4: two fp4 values a uint8, like modelopt's.
+                    quantization = "nvfp4"
                 elif num_bits == 4:
                     quantization = "int4"
                 else:
@@ -298,7 +305,7 @@ class RBLNWorker(WorkerBase):
             if quantization == "fp8":
                 nbits_per_param = 8
                 packed_num_elems = 1
-            elif quantization == "modelopt_mixed":
+            elif quantization in ("modelopt_mixed", "nvfp4"):
                 # The fp8 weights and both NVFP4 scales are float dtypes and are
                 # counted by element_size() below
                 nbits_per_param = 4

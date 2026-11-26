@@ -29,6 +29,7 @@ from . import (
     attention,
     axk2,
     axk3,
+    compressed_tensors_config,
     deepseek_mtp,
     deepseek_v2,
     distributed_utils,
