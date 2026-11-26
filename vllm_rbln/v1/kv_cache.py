@@ -426,15 +426,19 @@ class RBLNRingSlidingWindowManager(SlidingWindowManager):
 
     A step whose first token lands in a block new to the request first has the
     rows it has yet to write copied from the block before (`pending_copies`), so
-    row r of that block holds the latest position congruent to r. Once the
-    request decodes, the blocks before it are freed; they stay cached.
+    row r of that block holds the latest key congruent to r that a query can
+    still reach. Once the request decodes, the blocks before it are freed; they
+    stay cached.
     """
 
     def __init__(self, kv_cache_spec: SlidingWindowSpec, **kwargs) -> None:
         super().__init__(kv_cache_spec, **kwargs)
-        if self.sliding_window != self.block_size:
+        # A wider window spans a third block, and one the window divides is held
+        # as several kernel blocks, which the ring does not address.
+        if self.sliding_window > self.block_size or window_splits_block(kv_cache_spec):
             raise NotImplementedError(
-                "use_swa_ring needs a sliding window as wide as the block."
+                "use_swa_ring needs a block at least as wide as the sliding "
+                "window, and not a multiple of it."
             )
         self._step_start: dict[str, int] = {}
         self._window_column: dict[str, int] = {}
