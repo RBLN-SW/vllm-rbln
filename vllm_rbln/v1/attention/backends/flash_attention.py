@@ -537,6 +537,12 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     f"sliding_window={self.sliding_window}, "
                     f"is_causal={self.is_causal}, is_normal={self.is_normal}."
                 )
+            # A KV-shared layer reads with no K/V, and so without the writing
+            # layer's dequant scales.
+            if kv_sharing_target_layer_name is not None:
+                raise NotImplementedError(
+                    "fp8 KV cache is not supported on a KV-shared layer."
+                )
 
     def forward(
         self,
@@ -587,12 +593,6 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         # A KV-shared layer has no K/V: the ops take None for them and read
         # its target's cache without writing it.
         reads_shared_kv = key is None
-        if reads_shared_kv:
-            assert value is None
-            # An fp8 cache needs the writing layer's dequant scales, not wired.
-            assert not self.kv_cache_dtype.startswith("fp8"), (
-                "a KV-shared layer does not read an fp8 KV cache yet"
-            )
         b_size = attn_metadata.seq_lens.shape[0]
         q_len = num_tokens // b_size
         query = query.view(b_size, q_len, self.num_heads, self.head_size).transpose(

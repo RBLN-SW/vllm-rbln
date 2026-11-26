@@ -949,6 +949,11 @@ class TestFlashImplInit:
         with pytest.raises(NotImplementedError, match="flash causal"):
             make_impl(cfg, kv_cache_dtype="fp8", sliding_window=16)
 
+    def test_fp8_kv_shared_layer_raises(self, cfg):
+        # The KV-shared read passes no K/V and so no dequant scales.
+        with pytest.raises(NotImplementedError, match="KV-shared"):
+            make_impl(cfg, kv_cache_dtype="fp8", kv_sharing_target_layer_name="t")
+
     def test_fp8_normal_attention_raises(self, cfg_square):
         # cfg_square makes is_normal True, routing to the scale-less
         # causal_attention_naive ops.
