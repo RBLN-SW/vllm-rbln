@@ -19,10 +19,10 @@ exactly as it would in production. The model is built through `load_model`;
 only the optimum-rbln model compilation/loading (`init_model`) is faked,
 since that requires an NPU.
 
-Encoder-only models (BertModel / RobertaModel / XLMRobertaModel and their
-`*ForSequenceClassification` variants) are forced to CLS pooling. Decoder-based
-pooling models (Qwen3 embedding) keep their native LAST-token pooling — CLS
-(token 0) would be wrong for a causal model.
+Every model keeps the pooling vLLM resolved for it: the sentence-transformers
+config the repository ships where there is one (MEAN for E5 and MiniLM, CLS for
+BGE), and the upstream class default otherwise. Decoder-based pooling models
+(Qwen3 embedding) come out as LAST.
 
 We assert that:
   * the pooling type comes out as expected per architecture, and
@@ -38,6 +38,7 @@ import torch
 from vllm.config import (
     CacheConfig,
     ModelConfig,
+    PoolerConfig,
     SchedulerConfig,
     VllmConfig,
     set_current_vllm_config,
@@ -56,14 +57,14 @@ from vllm_rbln.model_executor.models.optimum.qwen3_vl import RBLNOptimumQwen3VLM
 from vllm_rbln.utils.optimum.predicates import is_qwen3_embedding
 
 # (model id, expected seq_pooling_type, expected pooler) per architecture.
-# Encoder-only models are forced to CLS; the *ForSequenceClassification ones use
-# the passthrough classifier pooler. Qwen3 embedding is decoder-based and keeps
-# its native LAST-token pooling.
+# The *ForSequenceClassification ones use the passthrough classifier pooler.
 ENCODER_MODELS = [
-    # arch: BertModel
-    ("sentence-transformers/all-MiniLM-L6-v2", "CLS", DispatchPooler),
-    # arch: XLMRobertaModel
-    ("intfloat/multilingual-e5-base", "CLS", DispatchPooler),
+    # arch: BertModel, sentence-transformers config says mean
+    ("sentence-transformers/all-MiniLM-L6-v2", "MEAN", DispatchPooler),
+    # arch: BertModel, sentence-transformers config says cls
+    ("BAAI/bge-small-en-v1.5", "CLS", DispatchPooler),
+    # arch: XLMRobertaModel, sentence-transformers config says mean
+    ("intfloat/multilingual-e5-base", "MEAN", DispatchPooler),
     # arch: ModernBertModel
     ("Alibaba-NLP/gte-modernbert-base", "CLS", DispatchPooler),
     # arch: RobertaForMaskedLM
@@ -79,8 +80,10 @@ ENCODER_MODELS = [
 ]
 
 
-def _build_encoder(model_id: str):
-    model_config = ModelConfig(model=model_id, dtype=torch.float32, seed=42)
+def _build_encoder(model_id: str, pooler_config: PoolerConfig | None = None):
+    model_config = ModelConfig(
+        model=model_id, dtype=torch.float32, seed=42, pooler_config=pooler_config
+    )
     # Mirror the platform's architecture remap before model loading.
     if is_qwen3_embedding(model_config):
         model_config.hf_config.__dict__["architectures"] = ["Qwen3Model"]
@@ -124,6 +127,15 @@ def test_bert_masked_lm_builds_a_token_classify_pooler():
     model = _build_encoder("google-bert/bert-base-uncased")
 
     assert model.pooler.get_supported_tasks() == {"token_classify"}
+
+
+def test_encoder_keeps_a_user_pooler_config():
+    # bge-small ships a CLS sentence-transformers config; the user's choice wins.
+    model = _build_encoder(
+        "BAAI/bge-small-en-v1.5", PoolerConfig(seq_pooling_type="MEAN")
+    )
+
+    assert model.vllm_config.model_config.pooler_config.seq_pooling_type == "MEAN"
 
 
 @pytest.mark.parametrize("classification", [False, True])
