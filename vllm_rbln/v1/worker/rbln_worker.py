@@ -83,6 +83,7 @@ from vllm_rbln.v1.worker.utils import (
     get_num_local_ranks,
     get_rbln_planned_affinity_cpu_count,
     read_rbln_card_dram_used_bytes,
+    rescale_kv_cache_config,
     set_cpu_affinity,
     set_omp_num_threads,
     worker_fail_fast,
@@ -476,6 +477,7 @@ class RBLNWorker(WorkerBase):
         # because `initialize_kv_cache` will inject kv cache groups not
         # related to kv cache connector (e.g. kv cache sharing layers).
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
+        self.connector_kv_cache_config = kv_cache_config
 
         self.model_runner.initialize_kv_cache(
             self.dynamic_kv.shrink_for_compile(kv_cache_config)
@@ -513,6 +515,12 @@ class RBLNWorker(WorkerBase):
         if not has_kv_transfer_group():
             return
         self.synchronize_device()
+        # The connector holds the config `initialize_from_config` handed it, and
+        # the dynamic-KV resize reallocates from a copy of it.
+        rescale_kv_cache_config(
+            self.connector_kv_cache_config,
+            self.model_runner.kv_cache_config.num_blocks,
+        )
         # Registration deferred to this hook may resolve the KV layout through
         # `get_current_vllm_config()`; this RPC arrives outside the scope that
         # WorkerWrapperBase opens around `initialize_from_config`.
