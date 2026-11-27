@@ -314,9 +314,11 @@ def _validate(vllm_config: "VllmConfig") -> None:
 
     from vllm.platforms import current_platform
 
+    from vllm_rbln.v1.core.utils import has_dsa_indexer
+
     # REBEL CR13 stores a step longer than a block across blocks, except in its
     # sparse attention kernels (DeepSeek-V3.2, GLM-5.3, MiniMax-M3).
-    sparse = hasattr(text_config, "index_topk") or getattr(
+    sparse = has_dsa_indexer(model_config) or getattr(
         text_config, "sparse_attention_config", None
     )
     spans = current_platform.is_cr13() and not sparse

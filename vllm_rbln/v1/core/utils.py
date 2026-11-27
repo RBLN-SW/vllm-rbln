@@ -252,6 +252,12 @@ class DecodeBatchBudget:
         return self._count
 
 
+def has_dsa_indexer(model_config) -> bool:
+    return hasattr(model_config.hf_text_config, "index_topk") or hasattr(
+        model_config.hf_config, "index_topk"
+    )
+
+
 def sub_block_size_in_use(
     *,
     enable_prefix_caching: bool,
@@ -336,10 +342,7 @@ def sub_block_size_in_use(
     # cannot span blocks; apply this limit only after sub-blocks are in use.
     if (
         cache_dtype.startswith("fp8")
-        and (
-            hasattr(model_config.hf_text_config, "index_topk")
-            or hasattr(model_config.hf_config, "index_topk")
-        )
+        and has_dsa_indexer(model_config)
         and sub_block_size < prefill_chunk_size
     ):
         raise ValueError(

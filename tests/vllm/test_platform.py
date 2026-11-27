@@ -448,18 +448,24 @@ class TestRejectedConfigs:
             _build(block_size=127, max_num_batched_tokens=128)
 
     @pytest.mark.parametrize(
-        ("field", "value"),
-        [("index_topk", 2048), ("sparse_attention_config", {"freq": [0, 1]})],
+        ("where", "field", "value"),
+        [
+            ("hf_text_config", "index_topk", 2048),
+            ("hf_config", "index_topk", 2048),
+            ("hf_text_config", "sparse_attention_config", {"freq": [0, 1]}),
+        ],
     )
     def test_sparse_attention_keeps_a_step_within_a_block_on_cr13(
-        self, monkeypatch, reconfigure, field, value
+        self, monkeypatch, reconfigure, where, field, value
     ):
         monkeypatch.setattr(
             platform.rebel, "get_npu_name", lambda *a, **kw: "RBLN-CR13"
         )
 
         def mutate(config):
-            setattr(config.model_config.hf_text_config, field, value)
+            model_config = config.model_config
+            model_config.hf_config = copy.copy(model_config.hf_text_config)
+            setattr(getattr(model_config, where), field, value)
             config.model_config.dtype = torch.bfloat16
             config.cache_config.block_size = 64
 
