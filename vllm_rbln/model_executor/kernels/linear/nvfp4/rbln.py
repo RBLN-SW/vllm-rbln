@@ -21,15 +21,9 @@ from vllm.model_executor.kernels.linear.nvfp4.base import (
 # group_quant_linear's name for the packed e2m1 weight: uint8 alone cannot tell
 # it from INT4.
 _PACKED_FP4_WEIGHT_DTYPE = "float4_e2m1fn"
-_NVFP4_GROUP_SIZE = 16
 
 
 class RBLNNvFp4LinearKernel(NvFp4LinearKernel):
-    """NVFP4 linear for RBLN, W4A16: the packed weight and its group scales go
-    to the compiled graph as loaded and are dequantized there (one packed dense
-    on RBLN-CR13). The checkpoint's activation scale is not applied, as the
-    RBLN NVFP4 MoE does not apply it either."""
-
     @classmethod
     def is_supported(
         cls, compute_capability: int | None = None
@@ -49,12 +43,13 @@ class RBLNNvFp4LinearKernel(NvFp4LinearKernel):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        in_features = layer.weight.shape[1] * 2
         return torch.ops.rbln_custom_ops.group_quant_linear(
             x,
             layer.weight,
             layer.weight_scale,
             layer.weight_global_scale,
             bias,
-            group_size=_NVFP4_GROUP_SIZE,
+            group_size=in_features // layer.weight_scale.shape[1],
             weight_dtype=_PACKED_FP4_WEIGHT_DTYPE,
         )

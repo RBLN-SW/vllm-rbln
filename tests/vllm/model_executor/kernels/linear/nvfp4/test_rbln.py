@@ -18,6 +18,7 @@ upstream's own dequantization does. The op runs its CPU body here."""
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
     dequantize_to_dtype,
@@ -25,18 +26,19 @@ from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import 
 
 from vllm_rbln.model_executor.kernels.linear.nvfp4.rbln import RBLNNvFp4LinearKernel
 
-OUT_FEATURES, IN_FEATURES, GROUP = 96, 128, 16
+OUT_FEATURES, IN_FEATURES = 96, 128
 
 
-def test_matches_upstream_dequantization():
+@pytest.mark.parametrize("group_size", [16, 32])
+def test_matches_upstream_dequantization(group_size):
     torch.manual_seed(0)
     layer = SimpleNamespace(
         weight=torch.randint(
             0, 256, (OUT_FEATURES, IN_FEATURES // 2), dtype=torch.uint8
         ),
-        weight_scale=(torch.rand(OUT_FEATURES, IN_FEATURES // GROUP) * 4 + 0.25).to(
-            torch.float8_e4m3fn
-        ),
+        weight_scale=(
+            torch.rand(OUT_FEATURES, IN_FEATURES // group_size) * 4 + 0.25
+        ).to(torch.float8_e4m3fn),
         weight_global_scale=torch.tensor(0.03, dtype=torch.float32),
     )
     x = torch.randn(2, 3, IN_FEATURES, dtype=torch.bfloat16)
@@ -50,7 +52,7 @@ def test_matches_upstream_dequantization():
         layer.weight_scale,
         layer.weight_global_scale,
         torch.float32,
-        GROUP,
+        group_size,
         swizzle=False,
     )
     expected = torch.nn.functional.linear(x.float(), weight, bias.float())
