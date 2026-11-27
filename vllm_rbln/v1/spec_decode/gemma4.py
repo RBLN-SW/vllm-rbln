@@ -106,8 +106,15 @@ class RBLNGemma4Proposer(RBLNEagleProposer):
         hidden_states = target_hidden_states.view(-1, self.hidden_size)[
             token_indices_to_sample
         ]
+        step_starts = target_positions[
+            common_attn_metadata.query_start_loc[:num_reqs].long()
+        ]
+        if self.runner.is_prefill:
+            # The ring fills on the first decode step; until then the block
+            # before is held and read as it is.
+            step_starts = torch.zeros_like(step_starts)
         per_layer_attn_metadata, num_reqs_padded, forward_kwargs = (
-            self._build_draft_step(num_reqs, positions)
+            self._build_draft_step(num_reqs, positions, step_starts)
         )
         self.input_ids[:num_reqs] = next_token_ids[:num_reqs].int()
         input_ids, staged_positions, staged_hidden_states, _ = self._preprocess(
@@ -137,7 +144,7 @@ class RBLNGemma4Proposer(RBLNEagleProposer):
     ) -> None:
         positions = self.positions[:num_reqs]
         per_layer_attn_metadata, num_reqs_padded, forward_kwargs = (
-            self._build_draft_step(num_reqs, positions)
+            self._build_draft_step(num_reqs, positions, positions)
         )
         input_ids, staged_positions, hidden_states, _ = self._preprocess(
             num_reqs,
@@ -155,13 +162,14 @@ class RBLNGemma4Proposer(RBLNEagleProposer):
             )
 
     def _build_draft_step(
-        self, num_reqs: int, positions: torch.Tensor
+        self, num_reqs: int, positions: torch.Tensor, step_starts: torch.Tensor
     ) -> tuple[dict[str, object], int, dict]:
         """The attention metadata every draft step of this batch shares.
 
         Each query sits at its request's last target position and sees the
         keys up to it, within the window on a sliding layer. The KV-shared
-        layers read the target's cache there and write nothing.
+        layers read the target's cache there and write nothing. `step_starts`
+        is where the target step began, which places a ring's window.
         """
         batch_desc, num_tokens_across_dp = self._determine_batch_execution_and_padding(
             num_reqs, num_reqs, False, first_pass=False
@@ -190,6 +198,7 @@ class RBLNGemma4Proposer(RBLNEagleProposer):
                 is_prefill=False,
                 batch_pad=num_reqs_padded,
                 is_prompt_sorted=self.runner.sort_batch_by_length,
+                ring_start=step_starts,
             )
             self.runner.bind_kv_cache_to_metadata(attn_metadata)
             for layer_name in attn_group.layer_names:

@@ -426,22 +426,45 @@ def _as_glm5_next(config: VllmConfig) -> None:
 class TestRejectedConfigs:
     @pytest.mark.parametrize(
         ("block_size", "max_num_batched_tokens", "invalid_block_size"),
-        [(128, 128, 127), (16384, 128, 16385), (16384, 16384, 16385)],
+        [(16384, 128, 16385), (16384, 16384, 16385)],
     )
     def test_block_size_range(
         self, block_size, max_num_batched_tokens, invalid_block_size
     ):
         _build(block_size=block_size, max_num_batched_tokens=max_num_batched_tokens)
-        with pytest.raises(
-            ValidationError,
-            match=(
-                "RBLN requires max_num_batched_tokens <= block_size <= max_block_size"
-            ),
-        ):
+        with pytest.raises(ValidationError, match="block_size <= max_block_size"):
             _build(
                 block_size=invalid_block_size,
                 max_num_batched_tokens=max_num_batched_tokens,
             )
+
+    @pytest.mark.parametrize("npu", ["RBLN-CR03", "RBLN-CR13"])
+    def test_only_cr13_takes_a_step_longer_than_a_block(self, monkeypatch, npu):
+        monkeypatch.setattr(platform.rebel, "get_npu_name", lambda *a, **kw: npu)
+        if npu == "RBLN-CR13":
+            _build(block_size=127, max_num_batched_tokens=128)
+            return
+        with pytest.raises(ValidationError, match="max_num_batched_tokens <= block"):
+            _build(block_size=127, max_num_batched_tokens=128)
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [("index_topk", 2048), ("sparse_attention_config", {"freq": [0, 1]})],
+    )
+    def test_sparse_attention_keeps_a_step_within_a_block_on_cr13(
+        self, monkeypatch, reconfigure, field, value
+    ):
+        monkeypatch.setattr(
+            platform.rebel, "get_npu_name", lambda *a, **kw: "RBLN-CR13"
+        )
+
+        def mutate(config):
+            setattr(config.model_config.hf_text_config, field, value)
+            config.model_config.dtype = torch.bfloat16
+            config.cache_config.block_size = 64
+
+        with pytest.raises(ValueError, match="max_num_batched_tokens <= block"):
+            reconfigure(mutate)
 
     @pytest.mark.parametrize("max_num_batched_tokens", [16, 128, None])
     def test_block_size_must_be_explicit(self, max_num_batched_tokens):
@@ -500,6 +523,56 @@ class TestRejectedConfigs:
     def test_lora(self, reconfigure):
         with pytest.raises(ValueError, match="LoRA"):
             reconfigure(lambda config: setattr(config, "lora_config", object()))
+
+    def test_swa_ring_refuses_what_it_cannot_serve(self, reconfigure, monkeypatch):
+        from vllm.platforms import current_platform
+
+        from vllm_rbln.platform import vllm_impl
+
+        monkeypatch.setattr(current_platform, "is_cr13", lambda: True)
+
+        def ring(config):
+            config.additional_config.use_swa_ring = True
+
+        monkeypatch.setattr(vllm_impl, "use_device_tensor", lambda: True)
+        reconfigure(ring)
+        monkeypatch.setattr(vllm_impl, "use_device_tensor", lambda: False)
+        with pytest.raises(NotImplementedError, match="use_swa_ring"):
+            reconfigure(ring)
+        monkeypatch.setattr(vllm_impl, "use_device_tensor", lambda: True)
+        monkeypatch.setattr(current_platform, "is_cr13", lambda: False)
+        with pytest.raises(NotImplementedError, match="use_swa_ring"):
+            reconfigure(ring)
+
+    # A window of 1000 in the 1024-row block leaves room for 24 drafts.
+    @pytest.mark.parametrize(
+        ("gemma4_mtp", "num_drafts", "refused"),
+        [(True, 24, False), (True, 25, True), (False, 1, True)],
+    )
+    def test_swa_ring_takes_drafts_the_block_has_room_for(
+        self, reconfigure, monkeypatch, gemma4_mtp, num_drafts, refused
+    ):
+        from vllm.platforms import current_platform
+
+        from vllm_rbln.platform import vllm_impl
+
+        monkeypatch.setattr(current_platform, "is_cr13", lambda: True)
+        monkeypatch.setattr(vllm_impl, "use_device_tensor", lambda: True)
+
+        def speculative(config):
+            config.additional_config.use_swa_ring = True
+            config.model_config.hf_text_config.sliding_window = 1000
+            config.speculative_config = SimpleNamespace(
+                method="mtp",
+                num_speculative_tokens=num_drafts,
+                use_gemma4_mtp=lambda: gemma4_mtp,
+            )
+
+        if refused:
+            with pytest.raises(NotImplementedError, match="use_swa_ring"):
+                reconfigure(speculative)
+        else:
+            reconfigure(speculative)
 
     def test_msa_models_need_bfloat16(self, reconfigure):
         def msa(dtype):

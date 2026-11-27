@@ -1327,7 +1327,13 @@ class TestGemma4Drafting:
         monkeypatch.setattr(
             gemma4_module, "set_forward_context", lambda *a, **k: nullcontext()
         )
-        monkeypatch.setattr(proposer, "_build_draft_step", lambda n, p: ({}, n, {}))
+        step_starts = []
+
+        def build_draft_step(num_reqs, positions, starts):
+            step_starts.append(starts.tolist())
+            return {}, num_reqs, {}
+
+        monkeypatch.setattr(proposer, "_build_draft_step", build_draft_step)
         seen = []
 
         class Assistant(torch.nn.Module):
@@ -1356,13 +1362,34 @@ class TestGemma4Drafting:
             assert result.tolist() == [[0, 0, 0], [0, 0, 0]]
         else:
             assert result.tolist() == [[31, 32, 33], [32, 33, 34]]
+            # Each request's first position in the target step.
+            assert step_starts == [[0, 2]]
+
             for step, (positions, hidden) in enumerate(seen):
                 assert positions.flatten().tolist() == [1, 3]
                 torch.testing.assert_close(hidden, torch.full_like(hidden, step))
 
-    @pytest.mark.parametrize("position", [3, 10, 11])
-    def test_draft_step_reads_at_the_query_position(self, position):
-        from tests.vllm.v1.attention.utils import make_attention_spec, make_builder
+    def test_a_draft_after_prefill_reads_the_block_before_as_it_is(self, monkeypatch):
+        from vllm_rbln.v1.spec_decode import gemma4 as gemma4_module
+
+        base = make_eagle_proposer(num_speculative_tokens=3)
+        proposer = gemma4_module.RBLNGemma4Proposer(base.vllm_config, base.device, None)
+        _wire_runner(proposer, num_reqs=2)
+        proposer.runner.is_prefill = True
+        step_starts = []
+
+        def build_draft_step(num_reqs, positions, starts):
+            step_starts.append(starts.tolist())
+            raise RuntimeError("stop after the draft step is built")
+
+        monkeypatch.setattr(proposer, "_build_draft_step", build_draft_step)
+        with pytest.raises(RuntimeError, match="stop after"):
+            _call_propose(proposer)
+        assert step_starts == [[0, 0]]
+
+    @staticmethod
+    def _draft_metadata(spec, position, step_start):
+        from tests.vllm.v1.attention.utils import make_builder
         from tests.vllm.vllm_config import make_vllm_config
         from vllm_rbln.v1.spec_decode import gemma4 as gemma4_module
         from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
@@ -1372,9 +1399,7 @@ class TestGemma4Drafting:
         _wire_runner(proposer, num_reqs=1)
         proposer.max_model_len = 32
         cfg = make_vllm_config(max_model_len=32, max_num_batched_tokens=8)
-        builder = make_builder(
-            cfg, spec=make_attention_spec(block_size=4, sliding_window=8)
-        )
+        builder = make_builder(cfg, spec=spec)
         block_size = builder.block_size
         table = torch.arange((32 + block_size - 1) // block_size).view(1, -1)
         proposer.runner.input_batch.block_table = [
@@ -1395,8 +1420,34 @@ class TestGemma4Drafting:
         runner.bind_kv_cache_to_metadata = partial(
             RBLNModelRunner.bind_kv_cache_to_metadata, runner
         )
-        metadata, _, _ = proposer._build_draft_step(1, torch.tensor([position]))
+        metadata, _, _ = proposer._build_draft_step(
+            1, torch.tensor([position]), torch.tensor([step_start])
+        )
         md = metadata["draft.layer"]
         assert md.kv_caches[md.kv_cache_positions["draft.layer"]] is runner.kv_caches[0]
+        return md
+
+    @pytest.mark.parametrize("position", [3, 10, 11])
+    def test_draft_step_reads_at_the_query_position(self, position):
+        from tests.vllm.v1.attention.utils import make_attention_spec
+
+        md = self._draft_metadata(
+            make_attention_spec(block_size=4, sliding_window=8), position, position
+        )
         assert md.seq_lens.flatten().tolist() == [position]
         assert md.attn_masks is None
+
+    def test_a_ring_follows_the_target_step_not_the_draft_query(self):
+        from vllm_rbln.v1.kv_cache import RBLNRingSlidingWindowSpec
+
+        spec = RBLNRingSlidingWindowSpec(
+            block_size=12,
+            num_kv_heads=1,
+            head_size=8,
+            dtype=torch.float16,
+            sliding_window=8,
+        )
+        # The draft reads at 24, column 2; the target step began at 22, in
+        # column 1, so the ring is column 1's block.
+        md = self._draft_metadata(spec, 24, 22)
+        assert md.block_tables[0].tolist() == [1, 1, 2]
