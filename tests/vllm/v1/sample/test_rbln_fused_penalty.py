@@ -24,6 +24,8 @@ from vllm.v1.sample.logits_processor.builtin import (
     LogitBiasLogitsProcessor,
     MinPLogitsProcessor,
 )
+from vllm.v1.sample.rejection_sampler import RejectionSampler
+from vllm.v1.sample.sampler import Sampler
 
 import vllm_rbln.compilation.backends as backends
 from vllm_rbln.v1.sample.ops.fused_penalty import (
@@ -167,12 +169,12 @@ def test_a_prefill_step_keeps_the_decoding_requests():
     vocab = 16384
     decode = {"a": [1, 2, 3], "b": [4, 5, 6]}
     _update(state, decode, vocab, 2)
-    kept = {rid: state._reqs[rid] for rid in decode}
+    kept = {rid: state._reqs[rid, False] for rid in decode}
     _update(state, {"c": [7, 8]}, vocab, 1)
     _update(state, decode, vocab, 2)
-    assert all(state._reqs[rid] is req for rid, req in kept.items())
+    assert all(state._reqs[rid, False] is req for rid, req in kept.items())
     state.forget(["a", "c"])
-    assert set(state._reqs) == {"b"}
+    assert set(state._reqs) == {("b", False)}
 
 
 def test_frequency_only_request_takes_no_prompt_slots():
@@ -191,7 +193,7 @@ def test_frequency_only_request_takes_no_prompt_slots():
         2,
     )
     assert step is not None
-    assert state._reqs["r"].used == 2  # chunks of 3 and 5000 only
+    assert state._reqs["r", False].used == 2  # chunks of 3 and 5000 only
 
 
 def _one_request(state, *, rep=1.0, freq=0.0, outputs=(), bias=None):
@@ -418,3 +420,68 @@ def test_sampled_distribution_matches_upstream(params, monkeypatch):
     penalized = params.repetition_penalty != 1.0 or bool(params.logit_bias)
     assert bool(sampler._fused_graphs) == penalized
     assert_samples_match(samples=samples, probs=expected)
+
+
+def test_draft_plan_matches_upstream_target_and_bonus_rows():
+    """A target row counts the drafts before it, the bonus row all of them,
+    and a rejected draft leaves no trace."""
+    vocab, num_spec = 16384, 3
+    rng = random.Random(0)
+    torch.manual_seed(0)
+    params = [
+        SamplingParams(repetition_penalty=1.2),
+        SamplingParams(
+            repetition_penalty=1.1, frequency_penalty=0.5, presence_penalty=0.3
+        ),
+        SamplingParams(),
+        SamplingParams(presence_penalty=0.4),
+    ]
+    num_targets = len(params) * num_spec
+    prompt = [rng.randrange(vocab) for _ in range(60)]
+    batch = build_input_batch(
+        [(str(i), p) for i, p in enumerate(params)],
+        vocab_size=vocab,
+        prompt_token_ids=prompt,
+        output_token_ids=[prompt[0], 77],
+    )
+    state = FusedPenaltyState()
+    upstream = RejectionSampler(Sampler())
+    for _ in range(6):
+        counts = [rng.randrange(num_spec + 1) for _ in params]
+        for drafts, count in zip(batch.spec_token_ids, counts):
+            drafts[:] = [rng.choice(prompt + [7, 77, 123]) for _ in range(count)]
+        md = batch._make_sampling_metadata()
+        num_tokens = sum(counts)
+
+        plan = state.plan_with_drafts(md, batch, counts, num_spec, vocab, "cpu")
+        assert plan is not None
+        logits = torch.randn(plan.rows, vocab) * 3
+        got = apply_fused_penalty(
+            logits.clone(), plan.cidx, plan.lanes.float(), plan.rows, vocab, plan.k
+        )
+
+        want_target = upstream.apply_logits_processors(
+            logits[:num_tokens].clone(), md, SimpleNamespace(num_draft_tokens=counts)
+        )
+        want_bonus = upstream.sampler.apply_logits_processors(
+            logits[num_targets:].clone(), md, predict_bonus_token=True
+        )
+        torch.testing.assert_close(got[:num_tokens], want_target, atol=2e-2, rtol=0)
+        torch.testing.assert_close(got[num_targets:], want_bonus, atol=2e-2, rtol=0)
+        # Rows no request owns stay untouched.
+        assert torch.equal(got[num_tokens:num_targets], logits[num_tokens:num_targets])
+
+        for outputs, drafts in zip(batch.req_output_token_ids, batch.spec_token_ids):
+            accepted = rng.randrange(len(drafts) + 1)
+            outputs.extend([*drafts[:accepted], rng.randrange(vocab)])
+
+    # A state that never saw a draft holds the same slots.
+    for drafts in batch.spec_token_ids:
+        drafts.clear()
+    md = batch._make_sampling_metadata()
+    fresh = FusedPenaltyState()
+    for s in (state, fresh):
+        s.plan_with_drafts(md, batch, [0] * len(params), num_spec, vocab, "cpu")
+    assert [r.chunk_to_slot_by_row for r in state._reqs.values()] == [
+        r.chunk_to_slot_by_row for r in fresh._reqs.values()
+    ]

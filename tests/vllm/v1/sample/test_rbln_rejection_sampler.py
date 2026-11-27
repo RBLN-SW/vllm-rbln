@@ -12,13 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 import torch
+from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 from vllm_rbln.v1.sample import rbln_rejection_sampler as module
 from vllm_rbln.v1.sample.ops.top_k_top_p import (
@@ -29,9 +32,12 @@ from vllm_rbln.v1.sample.ops.top_k_top_p import (
 from vllm_rbln.v1.sample.rbln_rejection_sampler import (
     GREEDY_TEMPERATURE,
     PLACEHOLDER_TOKEN_ID,
+    RBLNRejectionSampler,
     RBLNRejectionSamplerImpl,
 )
+from vllm_rbln.v1.sample.rbln_sampler import RBLNSampler
 
+from .utils import VOCAB_SIZE as LARGE_VOCAB_SIZE
 from .utils import build_input_batch
 
 DEVICE = torch.device("cpu")
@@ -73,7 +79,7 @@ def make_sampling_metadata(
 
 @pytest.fixture
 def impl(monkeypatch, request) -> RBLNRejectionSamplerImpl:
-    monkeypatch.setattr(module, "compile", lambda target, **kwargs: target)
+    monkeypatch.setattr(module, "compile_sampler", lambda target, _: target)
     sampler = RBLNRejectionSamplerImpl(
         compile_context=Mock(),
         num_spec_tokens=NUM_SPEC_TOKENS,
@@ -529,6 +535,73 @@ def test_random_step_draws_the_bonus_token_in_the_graph(impl):
     assert drawn == {2, 5}
 
 
+@pytest.mark.use_device
+@pytest.mark.parametrize(
+    "method",
+    [
+        {"rejection_sample_method": "standard"},
+        {
+            "rejection_sample_method": "synthetic",
+            "synthetic_acceptance_rates": [1.0] * NUM_SPEC_TOKENS,
+        },
+    ],
+    ids=["standard", "synthetic"],
+)
+# 0.01 is sharp enough that a random draw always lands on the argmax.
+@pytest.mark.parametrize("temperature", [0.0, 0.01], ids=["greedy", "random"])
+def test_fused_penalties_follow_the_drafts(method, temperature):
+    """The graph penalizes each row for the drafts it follows."""
+    device = current_platform.device_type
+    params = [
+        SamplingParams(temperature=temperature, repetition_penalty=1.3),
+        SamplingParams(temperature=temperature, frequency_penalty=2.0),
+    ]
+    batch = build_input_batch(
+        [(str(i), p) for i, p in enumerate(params)],
+        device=device,
+        prompt_token_ids=[11, 4000, 9000],
+        output_token_ids=[4000, 77],
+    )
+    drafts = [[555, 600], [800]]
+    for spec_token_ids, ids in zip(batch.spec_token_ids, drafts):
+        spec_token_ids.extend(ids)
+    # Per row: the argmax, then the token left once it is penalized.
+    rows = [(4000, 555), (555, 600), (4000, 800), (600, 700), (800, 900)]
+    logits = torch.full((len(rows), LARGE_VOCAB_SIZE), -2.0)
+    for row, (first, second) in enumerate(rows):
+        logits[row, first] = 5.0
+        logits[row, second] = 4.5
+    metadata = SpecDecodeMetadata.make_dummy(drafts, torch.device(device))
+    metadata.target_logits_indices = torch.arange(3, device=device)
+    metadata.bonus_logits_indices = torch.arange(3, 5, device=device)
+
+    sampler = RBLNRejectionSampler(
+        RBLNSampler(fused_sampling=True),
+        spec_config=SimpleNamespace(num_speculative_tokens=NUM_SPEC_TOKENS, **method),
+        use_rbln_sampler=True,
+    )
+    logits = logits.to(device, torch.bfloat16)
+    sampler.initialize_sampling_inputs(
+        len(drafts), logits.shape[-1], logits.dtype, logits.device
+    )
+    graph = Mock(wraps=sampler.impl._compiled_rejection_sample)
+    sampler.impl._compiled_rejection_sample = graph
+    output = sampler(
+        metadata,
+        None,
+        logits,
+        batch.sampling_metadata,
+        input_batch=batch,
+    )
+
+    # Twelve op inputs, then the plan's cidx and lanes.
+    assert len(graph.call_args.args) == 14
+    assert output.sampled_token_ids.cpu().tolist() == [
+        [555, 600, 700],
+        [800, 900, PLACEHOLDER_TOKEN_ID],
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Synthetic acceptance (rejection_sample_method="synthetic")
 # ---------------------------------------------------------------------------
@@ -671,6 +744,29 @@ def _random_metadata():
         all_random=True,
         top_k=torch.tensor([4, 4], dtype=torch.int32),
     )
+
+
+def test_sampling_inputs_follow_fused_penalty_mode(impl):
+    inputs = impl._rejection_sampling_inputs
+    assert inputs is not None
+    metadata = make_sampling_metadata(torch.ones(2), all_greedy=False, all_random=True)
+    cumulative = torch.tensor([2, 4], dtype=torch.int32)
+
+    for has_penalty in (False, True, True, False):
+        args = inputs.prepare_sampling_args(
+            metadata,
+            cumulative,
+            4,
+            full_drafts=True,
+            bonus_in_graph=True,
+            has_penalty=has_penalty,
+            reuse_sampling_inputs=True,
+        )
+        if has_penalty:
+            assert args.top_k is not None and args.top_k.tolist() == [VOCAB_SIZE] * 2
+            assert args.top_p is not None and args.top_p.tolist() == [1.0] * 2
+        else:
+            assert args.top_k is None and args.top_p is None
 
 
 @pytest.mark.parametrize("inference_tensors", [False, True])

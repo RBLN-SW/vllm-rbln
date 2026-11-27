@@ -22,17 +22,21 @@ from vllm.v1.sample.ops import topk_topp_sampler
 from vllm.v1.sample.rejection_sampler import RejectionSampler, generate_uniform_probs
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.worker.gpu_input_batch import InputBatch
 
-from vllm_rbln import envs
-from vllm_rbln.compilation import compile, create_compile_context
 from vllm_rbln.logger import init_logger
-from vllm_rbln.platform import use_device_tensor
-from vllm_rbln.v1.sample.ops.fused_penalty import active_argmax_invariant
+from vllm_rbln.v1.sample.ops.fused_penalty import (
+    FusedPenaltyPlan,
+    active_argmax_invariant,
+    apply_fused_penalty,
+    without_penalties_and_logit_bias,
+)
 from vllm_rbln.v1.sample.ops.top_k_top_p import (
     GREEDY_TEMPERATURE,
     GREEDY_TOP_K,
     build_op_top_k_top_p,
 )
+from vllm_rbln.v1.sample.rbln_sampler import RBLNSampler, compile_sampler
 
 if TYPE_CHECKING:
     from rebel import CompileContext
@@ -42,11 +46,6 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 PLACEHOLDER_TOKEN_ID = -1
-
-
-# TODO(RBLN): Enable RBLNSampler for
-# - apply_bad_words_with_drafts
-# - apply_all_penalties
 
 
 class RBLNRejectionSampler(RejectionSampler):
@@ -86,6 +85,11 @@ class RBLNRejectionSampler(RejectionSampler):
             if use_rbln_sampler
             else TorchRejectionSamplerImpl()
         )
+        self.penalty_state = (
+            sampler._penalty_state
+            if use_rbln_sampler and isinstance(sampler, RBLNSampler)
+            else None
+        )
 
     def initialize_sampling_inputs(
         self, batch_size: int, vocab_size: int, dtype: torch.dtype, device: torch.device
@@ -104,6 +108,7 @@ class RBLNRejectionSampler(RejectionSampler):
         *,
         bonus_token_ids: torch.Tensor | None = None,
         bonus_logits: torch.Tensor | None = None,
+        penalty: FusedPenaltyPlan | None = None,
     ) -> None:
         """Compile one rejection graph variant using the prepared buffers."""
         if isinstance(impl := self.impl, RBLNRejectionSamplerImpl):
@@ -120,6 +125,7 @@ class RBLNRejectionSampler(RejectionSampler):
                 synthetic_mode=self.synthetic_mode,
                 synthetic_conditional_rates=self.synthetic_conditional_rates,
                 bonus_logits=bonus_logits,
+                penalty=penalty,
             )
 
     def invalidate_sampling_inputs(self) -> None:
@@ -134,6 +140,7 @@ class RBLNRejectionSampler(RejectionSampler):
         # [num_tokens + batch_size, vocab_size]
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
+        input_batch: InputBatch | None = None,
     ) -> SamplerOutput:
         """
         Args:
@@ -151,6 +158,8 @@ class RBLNRejectionSampler(RejectionSampler):
             sampling_metadata (vllm.v1.sample.metadata.SamplingMetadata):
                 Additional metadata needed for sampling, such as temperature,
                 top-k/top-p parameters, or other relevant information.
+            input_batch:
+                The step's batch, for penalties in the graph.
 
         Returns:
             SamplerOutput:
@@ -180,6 +189,24 @@ class RBLNRejectionSampler(RejectionSampler):
                 or not active_argmax_invariant(sampling_metadata)
             )
         )
+        penalty = None
+        if (
+            self.penalty_state is not None
+            and input_batch is not None
+            and bonus_in_graph
+        ):
+            assert isinstance(self.impl, RBLNRejectionSamplerImpl)
+            penalty = self.penalty_state.plan_with_drafts(
+                sampling_metadata,
+                input_batch,
+                metadata.num_draft_tokens,
+                self.impl.num_spec_tokens,
+                logits.shape[-1],
+                logits.device,
+            )
+        if penalty is not None:
+            # The graph applies them, on top of the eager processors' masks.
+            sampling_metadata = without_penalties_and_logit_bias(sampling_metadata)
         if bonus_in_graph:
             bonus_logits = self.sampler.apply_logits_processors(
                 bonus_logits, sampling_metadata, predict_bonus_token=True
@@ -220,6 +247,7 @@ class RBLNRejectionSampler(RejectionSampler):
             synthetic_conditional_rates=self.synthetic_conditional_rates,
             bonus_logits=bonus_logits,
             reuse_sampling_inputs=self._reuse_sampling_inputs,
+            penalty=penalty,
         )
 
         logprobs_tensors = None
@@ -258,6 +286,7 @@ class RejectionSamplerImpl:
         synthetic_conditional_rates: torch.Tensor | None = None,
         bonus_logits: torch.Tensor | None = None,
         reuse_sampling_inputs: bool = False,
+        penalty: FusedPenaltyPlan | None = None,
     ) -> torch.Tensor:
         raise NotImplementedError
 
@@ -287,8 +316,9 @@ class TorchRejectionSamplerImpl(RejectionSamplerImpl):
         synthetic_conditional_rates: torch.Tensor | None = None,
         bonus_logits: torch.Tensor | None = None,
         reuse_sampling_inputs: bool = False,
+        penalty: FusedPenaltyPlan | None = None,
     ) -> torch.Tensor:
-        assert bonus_token_ids is not None
+        assert bonus_token_ids is not None and penalty is None
         draft_token_ids = draft_token_ids.to(target_logits.device)
         target_logits = self.apply_sampling_constraints(
             target_logits,
@@ -429,9 +459,9 @@ class _RejectionSamplingInputs:
         )
         self._padded_target_logits: torch.Tensor | None = None
         self._host_cumulative: torch.Tensor | None = None
-        self._prepared_sampling_args: tuple[bool, _SamplingParameterTensors] | None = (
-            None
-        )
+        self._prepared_sampling_args: (
+            tuple[bool, bool, _SamplingParameterTensors] | None
+        ) = None
         self._prev_step_had_full_drafts = False
 
     def assert_input_signature(
@@ -488,6 +518,7 @@ class _RejectionSamplingInputs:
         num_tokens: int,
         full_drafts: bool,
         bonus_in_graph: bool,
+        has_penalty: bool,
         reuse_sampling_inputs: bool,
     ) -> _SamplingParameterTensors:
         if metadata.all_greedy:
@@ -496,8 +527,13 @@ class _RejectionSamplingInputs:
         # With partial drafts, the temperature layout depends on draft counts.
         can_reuse = reuse_sampling_inputs and full_drafts
         prepared = self._prepared_sampling_args if can_reuse else None
-        if prepared is not None and prepared[0] == bonus_in_graph:
-            return prepared[1]
+        if prepared is not None:
+            prepared_bonus_in_graph, prepared_has_penalty, args = prepared
+            if (
+                prepared_bonus_in_graph == bonus_in_graph
+                and prepared_has_penalty == has_penalty
+            ):
+                return args
 
         self.invalidate_sampling_args()
         batch_size, vocab_size, _, device = self.signature
@@ -506,6 +542,10 @@ class _RejectionSamplingInputs:
             top_k = self._top_k.copy_(top_k)
         if top_p is not None:
             top_p = self._top_p.copy_(top_p)
+        if has_penalty:
+            # Use the same graph for every filter combination.
+            top_k = self._top_k.fill_(vocab_size) if top_k is None else top_k
+            top_p = self._top_p.fill_(1.0) if top_p is None else top_p
 
         # Padding and greedy rows divide by 1.0 inside the graph.
         draft_temperature = self._unit_temperature
@@ -539,7 +579,11 @@ class _RejectionSamplingInputs:
             bonus_temperature=bonus_temperature,
         )
         if can_reuse:
-            self._prepared_sampling_args = (bonus_in_graph, sampling_param_tensors)
+            self._prepared_sampling_args = (
+                bonus_in_graph,
+                has_penalty,
+                sampling_param_tensors,
+            )
         return sampling_param_tensors
 
     def prepare_draft_counts(
@@ -593,25 +637,8 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         super().__init__()
         self.num_spec_tokens = num_spec_tokens or self.max_spec_len
 
-        compile_context = (
-            compile_context or create_compile_context(use_global_ctx=True)
-            if not use_device_tensor()
-            else None
-        )
-
-        self._compiled_rejection_sample = compile(
-            rbln_rejection_sample,
-            dynamic=False,
-            fullgraph=True,
-            compile_context=compile_context,
-            num_devices=1 if use_device_tensor() else None,
-            model_trace_method="export" if use_device_tensor() else "",
-            mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
-            use_global_ctx=True if not use_device_tensor() else None,
-            global_device_id=0 if not use_device_tensor() else None,
-            # Built only under --rbln-use-custom-sampler, so a bundle saved
-            # with the sampler off misses this op and forces a partial compile.
-            use_cache=False,
+        self._compiled_rejection_sample = compile_sampler(
+            rbln_rejection_sample, compile_context
         )
         self._rejection_sampling_inputs: _RejectionSamplingInputs | None = None
 
@@ -643,6 +670,7 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         synthetic_conditional_rates: torch.Tensor | None = None,
         bonus_logits: torch.Tensor | None = None,
         reuse_sampling_inputs: bool = False,
+        penalty: FusedPenaltyPlan | None = None,
     ) -> torch.Tensor:
         target_logits = self.apply_sampling_constraints(
             target_logits,
@@ -696,6 +724,7 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
             num_tokens,
             full_drafts,
             bonus_logits is not None,
+            penalty is not None,
             reuse_sampling_inputs,
         )
         synthetic_num_accepted = inputs.prepare_draft_counts(
@@ -718,6 +747,7 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
             bonus_logits,
             sampling_param_tensors.bonus_temperature,
             synthetic_num_accepted,
+            *((penalty.cidx, penalty.lanes) if penalty is not None else ()),
         )
 
     def apply_sampling_constraints(
@@ -749,6 +779,8 @@ def rbln_rejection_sample(
     bonus_logits: torch.Tensor | None = None,
     bonus_temperature: torch.Tensor | None = None,
     synthetic_num_accepted: torch.Tensor | None = None,
+    cidx: torch.Tensor | None = None,
+    lanes: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sample, then build the output token ids.
 
@@ -775,11 +807,22 @@ def rbln_rejection_sample(
             measured -- and only its count is replaced. The boundary token stays
             the one it drew, so it is real but drawn for its own position.
             Shape is [B], int32.
+        cidx, lanes: A `FusedPenaltyPlan` over target then bonus rows.
 
     Returns:
         The sampled token ids, `PLACEHOLDER_TOKEN_ID` in unfilled slots. Shape
         is [B, K+1], int32.
     """
+    if cidx is not None:
+        assert lanes is not None and bonus_logits is not None
+        # Joined, so a single request still has more than one row.
+        logits = torch.cat([target_logits, bonus_logits])
+        rows, vocab_size = logits.shape
+        logits = apply_fused_penalty(
+            logits, cidx, lanes, rows, vocab_size, cidx.shape[1]
+        )
+        num_targets = target_logits.shape[0]
+        target_logits, bonus_logits = logits[:num_targets], logits[num_targets:]
     target_logits = target_logits / temperature.unsqueeze(-1)
     target_probs = target_logits.softmax(dim=-1)
 

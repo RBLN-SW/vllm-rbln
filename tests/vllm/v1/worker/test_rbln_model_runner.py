@@ -1070,6 +1070,7 @@ def test_load_model_initializes_rejection_buffers(monkeypatch, warmup_enabled):
 @pytest.mark.parametrize("head_dtype", [torch.bfloat16, torch.float32])
 def test_rejection_sampler_warmup_uses_per_stage_batch_bound(head_dtype):
     sampler = Mock(spec=mr.RBLNRejectionSampler)
+    sampler.penalty_state = None
     runner = _make_runner_stub(
         rbln_config=RBLNConfig(use_custom_sampler=True),
         speculative_config=object(),
