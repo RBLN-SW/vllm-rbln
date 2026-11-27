@@ -590,9 +590,7 @@ class _RejectionSamplingInputs:
         self,
         cumulative: torch.Tensor,
         full_drafts: bool,
-        synthetic_mode: bool,
-        synthetic_conditional_rates: torch.Tensor | None,
-    ) -> torch.Tensor | None:
+    ) -> None:
         # A full step has K drafts per request regardless of its sampling settings.
         if not (full_drafts and self._prev_step_had_full_drafts):
             self._prev_step_had_full_drafts = False
@@ -613,9 +611,9 @@ class _RejectionSamplingInputs:
                 self.counts.copy_(self._host_counts)
             self._prev_step_had_full_drafts = full_drafts
 
-        if not synthetic_mode:
-            return None
-        assert synthetic_conditional_rates is not None
+    def sample_synthetic_acceptance_counts(
+        self, synthetic_conditional_rates: torch.Tensor
+    ) -> torch.Tensor:
         # `cumprod` stops the count at the first rejection.
         batch_size = self.signature[0]
         width = synthetic_conditional_rates.shape[0]
@@ -727,12 +725,13 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
             penalty is not None,
             reuse_sampling_inputs,
         )
-        synthetic_num_accepted = inputs.prepare_draft_counts(
-            cu_num_draft_tokens,
-            full_drafts,
-            synthetic_mode,
-            synthetic_conditional_rates,
-        )
+        inputs.prepare_draft_counts(cu_num_draft_tokens, full_drafts)
+        synthetic_num_accepted = None
+        if synthetic_mode:
+            assert synthetic_conditional_rates is not None
+            synthetic_num_accepted = inputs.sample_synthetic_acceptance_counts(
+                synthetic_conditional_rates
+            )
 
         return self._compiled_rejection_sample(
             inputs.draft_token_ids,
