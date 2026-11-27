@@ -619,9 +619,8 @@ def rbln_rejection_sample(
             token under the same `top_k`/`top_p`. Shape is [B].
         synthetic_num_accepted: Simulates an acceptance rate:
             `rbln::rejection_sample` runs unchanged -- that is the cost being
-            measured -- and only its count is replaced. The boundary token stays
-            the one it drew, so it is real but drawn for its own position.
-            Shape is [B], int32.
+            measured -- and only its count is replaced. The row then ends on
+            the draft at that count. Shape is [B], int32.
         cidx, lanes: A `FusedPenaltyPlan` over target then bonus rows.
 
     Returns:
@@ -683,20 +682,22 @@ def rbln_rejection_sample(
         drawn_token = recovered_token_ids.gather(
             1, num_accepted.clamp(max=max_spec_len - 1).to(torch.int64).unsqueeze(1)
         )
-        recovered_token_ids = torch.where(
-            (num_accepted == num_draft_tokens).unsqueeze(1),  # nothing recovered
-            bonus.to(dtype=recovered_token_ids.dtype),
-            drawn_token,
-        )
-        # Stop `num_accepted` at the first id outside [0, vocab).
         valid = (draft_per_batch >= 0) & (draft_per_batch < target_logits.shape[-1])
+        # The token of `rbln::rejection_sample` is only valid where it stopped.
+        # Reading it keeps `rbln::rejection_sample` in the graph.
+        recovered_token_ids = torch.where(valid, draft_per_batch, drawn_token)
         still_valid = torch.ones_like(valid[:, 0])
         leading_valid = torch.zeros_like(synthetic_num_accepted.reshape(batch_size))
         for position in range(max_spec_len):
             still_valid = still_valid & valid[:, position]
             leading_valid = leading_valid + still_valid.to(leading_valid.dtype)
         num_accepted = torch.minimum(
-            synthetic_num_accepted.reshape(batch_size), leading_valid
+            synthetic_num_accepted.reshape(batch_size),
+            torch.where(
+                leading_valid < num_draft_tokens,
+                (leading_valid - 1).clamp(min=0),
+                leading_valid,
+            ),
         )
     # `all_accepted` is True for inactive rows too (0 == 0), which is what the
     # bonus placement wants; recovery needs `num_draft_tokens > 0` to exclude them.
