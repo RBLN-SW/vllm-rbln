@@ -803,38 +803,41 @@ def test_sampling_param_tensors_are_reused_until_invalidated(
     assert seen[-1] == [0.5, 0.5, 3.0, 3.0]
 
 
-def test_a_partial_step_invalidates_cached_sampling_param_tensors(impl, monkeypatch):
-    # A step with fewer drafts writes per-token values into the same buffers,
-    # so the next full step stages again instead of reading them.
+def test_sampling_param_tensors_follow_partial_draft_counts(impl, monkeypatch):
     builds, seen = _recording(impl, monkeypatch)
     metadata = _random_metadata()
-    run_rejection_sample(
-        impl,
-        [3, 5, 2, 4],
-        [3, 5, 2, 4],
-        [1, 1],
-        metadata,
-        reuse_sampling_param_tensors=True,
-    )
-    run_rejection_sample(
-        impl,
-        [3, 5, 2],
-        [3, 5, 2],
-        [1, 1],
-        metadata,
-        num_draft_tokens=[2, 1],
-        reuse_sampling_param_tensors=True,
-    )
-    run_rejection_sample(
-        impl,
-        [3, 5, 2, 4],
-        [3, 5, 2, 4],
-        [1, 1],
-        metadata,
-        reuse_sampling_param_tensors=True,
-    )
-    assert len(builds) == 3
-    assert seen[-1] == [0.5, 0.5, 2.0, 2.0]
+    for step, (counts, ids) in enumerate(
+        [
+            ([2, 2], [3, 5, 2, 4]),
+            ([2, 1], [3, 5, 2]),
+            ([2, 1], [5, 2, 3]),
+            ([2, 1], [3, 5, 2]),
+            ([1, 2], [3, 5, 2]),
+            ([2, 2], [3, 5, 2, 4]),
+        ]
+    ):
+        if step == 3:
+            metadata.temperature[1] = 3.0
+            impl.invalidate_sampling_param_cache()
+        run_rejection_sample(
+            impl,
+            ids,
+            ids,
+            [1, 1],
+            metadata,
+            num_draft_tokens=counts,
+            reuse_sampling_param_tensors=True,
+        )
+
+    assert len(builds) == 5
+    assert seen == [
+        [0.5, 0.5, 2.0, 2.0],
+        [0.5, 0.5, 2.0, 1.0],
+        [0.5, 0.5, 2.0, 1.0],
+        [0.5, 0.5, 3.0, 1.0],
+        [0.5, 3.0, 3.0, 1.0],
+        [0.5, 0.5, 3.0, 3.0],
+    ]
 
 
 def test_direct_calls_prepare_sampling_param_tensors_every_time(impl, monkeypatch):
@@ -926,6 +929,10 @@ def test_draft_count_buffers_are_reused_across_full_and_partial_steps(
     run_rejection_sample(
         impl, [3, 5, 2], [3, 5, 2], [1, 1], metadata, num_draft_tokens=[2, 1]
     )
+    impl.invalidate_sampling_param_cache()
+    run_rejection_sample(
+        impl, [5, 2, 3], [5, 2, 3], [1, 1], metadata, num_draft_tokens=[2, 1]
+    )
     run_rejection_sample(
         impl, [2, 4], [2, 4], [1, 1], metadata, num_draft_tokens=[0, 2]
     )
@@ -933,7 +940,9 @@ def test_draft_count_buffers_are_reused_across_full_and_partial_steps(
         run_rejection_sample(impl, [3, 5, 2, 4], [3, 5, 2, 4], [1, 1], metadata)
 
     full = [[2, 2], [2, 4]]
-    assert values == [full, full, [[2, 1], [2, 3]], [[0, 2], [0, 2]], full, full]
+    partial = [[2, 1], [2, 3]]
+    assert values == [full, full, partial, partial, [[0, 2], [0, 2]], full, full]
     assert len(set(addresses)) == 1
     assert versions[0] == versions[1]
-    assert versions[4] == versions[5]
+    assert versions[2] == versions[3]
+    assert versions[5] == versions[6]
